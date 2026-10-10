@@ -4,19 +4,19 @@ use super::{InitialWords, anonymous};
 use crate::rust_alloc::{boxed::Box, sync::Arc, vec::Vec};
 use carrick_core::mm::fork::{ForkCensus, ForkScratch, census_table};
 use carrick_core::mm::transaction::{MmPortal, OwnerVenue, SelectionVenues, TransferStep};
-use carrick_el1::lock::SpinLock;
 use carrick_el1::memory::reservations::{
     X86Cpl0ReservationGeometry, X86Cpl0Zone, shared_x86_cpl0_guest,
 };
 use carrick_el1::personality::mm_portal::production::GuestMetadataPin;
 use carrick_el1::personality::mm_portal::{LinuxForkPolicy, NativeForkPortal, UnpublishedEl1Child};
+use carrick_el1::personality::retired_spaces::{RetiredSpace, RetiredSpaces};
 use carrick_el1::personality::native_process_runtime::{
     NativeForkPreparation, NativeLifecycleResources, NativeProcessError, NativeProcessRegistry,
     NativeProcessRuntime, NativeProcessService,
 };
 use carrick_el1_abi::{
     BornInZoneSource, CurrentTask, KernelFaultVenues, Lifecycle, MmPortalSlots, PortalForkCustody,
-    PortalOperation, ReservationMm, ThreadControlSlot, ThreadLifecyclePage, FORK_STOCK_PORT,
+    PortalOperation, ReservationMm, ThreadControlSlot, ThreadLifecyclePage, FORK_STOCK_PORT, NATIVE_CHILD_RETIRE_PORT, NativeChildRetire,
     ForkStockExchange, ForkStockLoan, ForkStockRequest, ForkStockSettlement,
 };
 use carrick_guest_arch::{
@@ -32,7 +32,20 @@ pub(super) type Mm = AddressContext<RootGpa>;
 type Runtime = NativeProcessRuntime<'static, Mm, ParkedContextWords>;
 static REGISTRY: NativeProcessRegistry<'static, Mm, ParkedContextWords> =
     NativeProcessRegistry::new();
-static RETIRED: SpinLock<Vec<Mm>> = SpinLock::new(Vec::new());
+
+/// Closed child spaces awaiting retirement (the protocol shared with the
+/// AArch64 owner).
+static RETIRED_SPACES: RetiredSpaces = RetiredSpaces::new();
+
+fn drain_retired_spaces(owner: &Portal, worker: u32) -> Result<(), NativeProcessError> {
+    let zone = owner.zone.ok_or(NativeProcessError::Stale)?;
+    RETIRED_SPACES.drain_portal(
+        owner,
+        zone,
+        carrick_el1::isa::x86::context::native::CPL0_CPU_COUNT,
+        worker,
+    )
+}
 
 pub(super) fn registry() -> &'static NativeProcessRegistry<'static, Mm, ParkedContextWords> {
     &REGISTRY
@@ -197,6 +210,120 @@ impl Service {
         u32::from(self.slot.raw())
     }
 
+    /// The part of `prepare_mm_start` after the stock crossing granted
+    /// `loan`. Every error frees the space index it took and returns the
+    /// loan ([`abandon_loan`]), so a failed fork never strands this CPU's
+    /// pending loan (each later fork on the CPU would be refused).
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_loaned(
+        &self,
+        owner: &Portal,
+        loan: ForkStockLoan,
+        live: &InitialWords,
+        layout: carrick_el1_abi::Layout,
+        mapping_count: usize,
+        count: ForkCensus,
+        child_mm: MmGeneration,
+    ) -> Result<(UnpublishedEl1Child<X86Mmu>, Mm, Vec<PortalForkCustody>), NativeProcessError> {
+        let abandon = |error| abandon_loan(&loan, None, error);
+        // SAFETY: the physical owner loaned zero exclusive cold metadata.
+        // Guest shared records alone initialize census and issue identities.
+        unsafe {
+            (loan.lifecycle.page.raw() as *mut ThreadLifecyclePage)
+                .write(ThreadLifecyclePage::new());
+            let controls = loan.lifecycle.controls.raw() as *mut ThreadControlSlot;
+            for index in 0..=carrick_el1_abi::THREAD_POOL_ENTRIES {
+                controls.add(index).write(ThreadControlSlot::new());
+            }
+        }
+        let root = RootGpa::page_aligned(FrameGpa::new(loan.request.child_tables.base))
+            .ok_or_else(|| abandon(NativeProcessError::Stale))?;
+        let index = owner
+            .spaces
+            .publish_closed(child_mm.raw().get(), loan.request.child_tables.base, 0)
+            .ok_or_else(|| abandon(NativeProcessError::Exhausted))?;
+        let free = |error| {
+            owner.spaces.free(index);
+            abandon(error)
+        };
+        owner
+            .roots
+            .publish(index.index(), loan.request.child_mm, layout)
+            .map_err(|e| free(error(e)))?;
+        let scratch = ForkScratch::bounded(
+            loan.request,
+            mapping_count,
+            count.child,
+            count.parent,
+            count.live,
+            count.custody,
+        )
+        .map_err(|e| free(error(e)))?;
+        let plan = owner
+            .prepare_fork(loan.request, scratch, live, self.worker())
+            .map_err(|e| free(error(e)))?;
+        let mut custody = Vec::new();
+        custody
+            .try_reserve_exact(plan.custody().len())
+            .map_err(|_| free(NativeProcessError::Exhausted))?;
+        custody.extend_from_slice(plan.custody());
+        let child = match owner.publish_fork(plan, live, self.worker()) {
+            Ok(child) => child,
+            Err(e) => {
+                owner.spaces.free(index);
+                // A refused publish may have stored into the loaned tables;
+                // it rolled its parent edits back, so they are unlinked and
+                // are scrubbed before the abort. `Core` means that rollback
+                // itself failed: the parent may still link a loaned page, so
+                // the loan stays pending rather than be scrubbed or reused.
+                if matches!(e, carrick_core::mm::transaction::MmError::Core) {
+                    return Err(NativeProcessError::Quarantined);
+                }
+                return Err(abandon_loan(&loan, Some(live), error(e)));
+            }
+        };
+        let address = AddressContext {
+            mm: child_mm,
+            root,
+            generation: ContextGeneration::new(child.completion().child.incarnation()),
+        };
+        Ok((child, address, custody))
+    }
+}
+
+/// Clear a never-committed loan's lifecycle record and abort it over the
+/// stock port. True when the carrier accepted the abort.
+fn abort_loan(loan: &ForkStockLoan) -> bool {
+    // SAFETY: the loan never published a birth; no reader remains.
+    unsafe { carrick_el1::personality::fork_loan::clear_lifecycle(loan) };
+    let mut settlement = carrick_el1_abi::ForkStockSettlement::abort(*loan);
+    // SAFETY: the aborted loan is still exclusively owned across this
+    // stopped crossing; the host authenticates its exact execution key.
+    unsafe {
+        core::arch::asm!("out dx, eax", in("dx") FORK_STOCK_PORT, in("rax") &raw mut settlement, options(nostack));
+    }
+    matches!(settlement.take(*loan), Some(Ok(())))
+}
+
+/// Return a granted loan after a failed fork; see the AArch64 owner's
+/// `abandon_loan` for the shared contract. `scrub` names the words of a
+/// refused publish that may have stored into the loaned tables. Returns
+/// `error`, or `Quarantined` when the loan stays pending.
+fn abandon_loan(
+    loan: &ForkStockLoan,
+    scrub: Option<&InitialWords>,
+    error: NativeProcessError,
+) -> NativeProcessError {
+    if let Some(words) = scrub
+        && !carrick_el1::personality::fork_loan::scrub_tables(words, loan)
+    {
+        return NativeProcessError::Quarantined;
+    }
+    if abort_loan(loan) {
+        error
+    } else {
+        NativeProcessError::Quarantined
+    }
 }
 
 impl NativeProcessService<'static, ParkedContextWords> for Service {
@@ -213,6 +340,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             return Err(NativeProcessError::Stale);
         }
         let owner = portal()?;
+        drain_retired_spaces(&owner, self.worker())?;
         let mm = ReservationMm::new(parent.mm.raw().get()).ok_or(NativeProcessError::Stale)?;
         let live = anonymous::live_words(mm).ok_or(NativeProcessError::Stale)?;
         let capacity = owner.fork_mapping_count(mm, self.worker()).map_err(error)?;
@@ -308,65 +436,15 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             .take(request)
             .ok_or(NativeProcessError::Stale)?
             .map_err(|_| NativeProcessError::Exhausted)?;
+        // The carrier never loans a record a live MM uses (the parent's is
+        // charged to it), so this refusal is a carrier custody fault. It is
+        // the one post-crossing error that keeps the loan: an abort would
+        // have the carrier clear this task's live record.
         if loan.lifecycle.page.raw() == self.task.metadata.lifecycle_page.load(Ordering::Acquire) {
             return Err(NativeProcessError::Stale);
         }
-        // SAFETY: the physical owner loaned zero exclusive cold metadata.
-        // Guest shared records alone initialize census and issue identities.
-        unsafe {
-            (loan.lifecycle.page.raw() as *mut ThreadLifecyclePage)
-                .write(ThreadLifecyclePage::new());
-            let controls = loan.lifecycle.controls.raw() as *mut ThreadControlSlot;
-            for index in 0..=carrick_el1_abi::THREAD_POOL_ENTRIES {
-                controls.add(index).write(ThreadControlSlot::new());
-            }
-        }
-        let index = owner
-            .spaces
-            .publish_closed(child_mm.raw().get(), loan.request.child_tables.base, 0)
-            .ok_or(NativeProcessError::Exhausted)?;
-        if let Err(e) = owner
-            .roots
-            .publish(index.index(), loan.request.child_mm, layout)
-        {
-            owner.spaces.free(index);
-            return Err(error(e));
-        }
-        let scratch = ForkScratch::bounded(
-            loan.request,
-            mappings.len(),
-            count.child,
-            count.parent,
-            count.live,
-            count.custody,
-        )
-        .map_err(error)?;
-        let plan = match owner.prepare_fork(loan.request, scratch, &live, self.worker()) {
-            Ok(plan) => plan,
-            Err(e) => {
-                owner.spaces.free(index);
-                return Err(error(e));
-            }
-        };
-        let mut custody = Vec::new();
-        custody
-            .try_reserve_exact(plan.custody().len())
-            .map_err(|_| NativeProcessError::Exhausted)?;
-        custody.extend_from_slice(plan.custody());
-        let child = match owner.publish_fork(plan, &live, self.worker()) {
-            Ok(child) => child,
-            Err(e) => {
-                owner.spaces.free(index);
-                return Err(error(e));
-            }
-        };
-        let completion = child.completion();
-        let address = AddressContext {
-            mm: child_mm,
-            root: RootGpa::page_aligned(FrameGpa::new(loan.request.child_tables.base))
-                .ok_or(NativeProcessError::Stale)?,
-            generation: ContextGeneration::new(completion.child.incarnation()),
-        };
+        let (child, address, custody) =
+            self.prepare_loaned(&owner, loan, &live, layout, mappings.len(), count, child_mm)?;
         Ok(Prepared {
             loan,
             child,
@@ -415,10 +493,14 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
                 .abort(&owner, &p.words, self.worker())
                 .map_err(error)
         });
-        match result {
-            Ok(()) => Ok(()),
-            Err(e) => Err((e, p)),
+        if let Err(e) = result {
+            return Err((e, p));
         }
+        // The graph rollback has removed the record's only readers.
+        if !abort_loan(&p.loan) {
+            return Err((NativeProcessError::Quarantined, p));
+        }
+        Ok(())
     }
     fn settle_mm(&mut self, born: Box<Born>) -> Result<(), (NativeProcessError, Box<Born>)> {
         settle(born, self.worker())
@@ -545,7 +627,66 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         fatal();
     }
     fn retire_mm(&mut self, mm: Mm) {
-        RETIRED.lock().push(mm);
+        // The runtime calls this only for a fork-born process's final exit.
+        let source = super::native_execution::source(self.slot);
+        // Fork stock is only ever loaned by a carrier that also published
+        // its maintenance root; a child cannot exist without both.
+        if mm.mm.raw().get() != self.task.mm.key.load(Ordering::Acquire)
+            || carrick_el1::isa::x86::hardware_live_root().ok() != Some(mm.root)
+            || source.zone.spaces.idle_ttbr() == 0
+        {
+            fatal();
+        }
+        // Close the child's gate first: nothing installs this MM again.
+        let owner = portal().unwrap_or_else(|_| fatal());
+        let index = owner
+            .spaces
+            .find(mm.mm.raw().get())
+            .unwrap_or_else(|| fatal());
+        owner.spaces.close(index);
+        let binding = carrick_el1::personality::common_entry::execution_binding(self.task);
+        let Some(mut retire) = NativeChildRetire::new(binding, mm) else {
+            fatal();
+        };
+        // SAFETY: the aligned record stays on this CPU's supervisor stack
+        // through the stopped host crossing, which authenticates the live
+        // binding and root and writes its typed reply into the record.
+        unsafe {
+            core::arch::asm!("out dx, eax", in("dx") NATIVE_CHILD_RETIRE_PORT, in("rax") &raw mut retire, options(nostack));
+        }
+        // A refusal fails only this process's stock return: the stock stays
+        // charged and is never reissued, and the exit still completes. A
+        // missing reply is a crossing integrity fault.
+        match retire.take(binding, mm) {
+            Some(Ok(())) => {}
+            Some(Err(_)) => carrick_el1_abi::record_native_fork_failure(
+                carrick_el1_abi::NativeForkFailureStage::ChildRetireRefused,
+            ),
+            None => fatal(),
+        }
+        // Absence is published only after CR3 left the retired root; the
+        // host drains this MM's quarantine on a later stopped crossing.
+        if !super::native_execution::leave_space(source) {
+            fatal();
+        }
+        // The MM never runs again (its gate is closed and this CPU left its
+        // root): forget its live context so the root page, which the carrier
+        // reclaims into fork stock, can be admitted for the next child.
+        if !anonymous::retire_context(mm) {
+            fatal();
+        }
+        let roots = core::ptr::from_ref(owner.roots).addr();
+        RETIRED_SPACES.push(RetiredSpace {
+            carrier: owner.carrier,
+            zone: core::ptr::from_ref(source.zone).addr(),
+            roots,
+            mm: ReservationMm::new(mm.mm.raw().get()).unwrap_or_else(|| fatal()),
+        });
+        // A refused drain is not fatal: the failed entry and every entry
+        // after it stay queued (`RetiredSpaces::drain`), and the next drain
+        // (the next fork's `prepare_mm_start`, or the next child exit)
+        // retries them, as on the AArch64 owner.
+        let _retry_at_next_drain = drain_retired_spaces(&owner, self.worker());
     }
     fn copy_siginfo(&mut self, mm: &Self::Mm, address: UserVa, info: &carrick_abi::LinuxSiginfo) -> Result<(), NativeProcessError> {
         // SAFETY: the canonical ABI record has a fully initialized wire image.
@@ -592,7 +733,13 @@ fn settle(born: Box<Born>, worker: u32) -> Result<(), (NativeProcessError, Box<B
     if !matches!(exchange.take(p.loan), Some(Ok(()))) {
         return Err((NativeProcessError::Quarantined, born));
     }
-    anonymous::admit_context(p.address);
+    // The child's first syscall capture authenticates this context. A root
+    // reissued from fork stock is free here because the retired child that
+    // held it left `LIVE_CONTEXTS` in `retire_mm`; a refusal is an owner
+    // custody fault, reported rather than discovered at that capture.
+    if !anonymous::admit_context(p.address) {
+        return Err((NativeProcessError::Stale, born));
+    }
     let owner = match portal() {
         Ok(owner) => owner,
         Err(error) => return Err((error, born)),

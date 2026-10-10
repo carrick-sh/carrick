@@ -96,6 +96,54 @@ pub(crate) fn install_address_context(context: AddressContext<RootGpa>) -> Resul
     Ok(())
 }
 
+/// A root page through its retained supervisor alias (direct window or
+/// initial-extent alias), bounds-checked by the shared table-alias rule.
+fn direct_root(root: RootGpa) -> Result<&'static [u64; 512], ArchError> {
+    let alias = carrick_el1_abi::x86_cpl0_table_alias(root.address()).ok_or(ArchError::Unbound)?;
+    // SAFETY: boot retains this alias over the aligned page; root pages are
+    // only read here, and shared supervisor entries never move.
+    Ok(unsafe { &*(alias.raw() as *const [u64; 512]) })
+}
+
+/// Leave every process root for the carrier's maintenance root, which holds
+/// only the shared supervisor branches. The caller then releases the slot's
+/// installed space: from that point this CPU caches and walks no table of
+/// any MM, so a retired MM's tables may be cleared and reissued.
+pub fn install_maintenance_root(maintenance: RootGpa) -> Result<(), ArchError> {
+    let live = super::mmu::hardware_live_root()?;
+    // The maintenance root is a copy of the shared supervisor entries taken
+    // when fork stock was installed; refuse it if they changed since.
+    if !carrick_mmu_core::x86::owner_mmu::maintenance_root_matches(
+        direct_root(live)?,
+        direct_root(maintenance)?,
+    ) {
+        return Err(ArchError::Unbound);
+    }
+    let binding = super::context::current_cpu_binding().ok_or(ArchError::Unbound)?;
+    let table = shootdown_table(binding)?;
+    let member = table
+        .members
+        .get(binding.cpu_slot as usize)
+        .ok_or(ArchError::Unbound)?;
+    member.revision.fetch_add(1, Ordering::AcqRel);
+    // SAFETY: the carrier retains the maintenance root's shared supervisor
+    // branches for the VM lifetime; PCID/PGE were rejected above, so MOV CR3
+    // drains every local translation of the previous root.
+    unsafe {
+        core::arch::asm!(
+            "mov cr3, {}",
+            in(reg) maintenance.address().raw(),
+            options(nostack, preserves_flags)
+        )
+    };
+    // No MM is installed: no shootdown sender waits for this CPU.
+    member.root.store(0, Ordering::Relaxed);
+    member.mm_key.store(0, Ordering::Relaxed);
+    member.owner_generation.store(0, Ordering::Relaxed);
+    member.revision.fetch_add(1, Ordering::Release);
+    Ok(())
+}
+
 fn publish_root_request(
     context: AddressContext<RootGpa>,
     table: &super::context::native::ShootdownTable,
