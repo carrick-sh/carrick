@@ -30,6 +30,13 @@ static LIVE_CONTEXTS: carrick_el1::lock::SpinLock<carrick_el1::isa::x86::live_co
 pub(super) fn live_context(mm: carrick_guest_arch::MmGeneration, root: RootGpa) -> Option<carrick_guest_arch::AddressContext<RootGpa>> {
     LIVE_CONTEXTS.lock().authenticate(mm, root)
 }
+pub(super) fn cow_scope(task: &CurrentTask) -> Option<carrick_el1_abi::CowGrantScope> {
+    let binding = carrick_core::entry::binding(&task.execution, &task.mm);
+    let mm = carrick_guest_arch::MmGeneration::new(core::num::NonZeroU64::new(binding.mm.raw())?);
+    let root = carrick_el1::isa::x86::hardware_live_root().ok()?;
+    carrick_el1_abi::CowGrantScope::checked(binding, live_context(mm, root)?)
+}
+
 pub(super) fn admit_context(context: carrick_guest_arch::AddressContext<RootGpa>) -> bool {
     LIVE_CONTEXTS.lock().admit(context)
 }

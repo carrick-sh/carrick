@@ -778,8 +778,37 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             self.zone.free_record(record);
             return refused();
         };
+        // The bounded fixture declares one address incarnation per root.
+        let scope = |identity: ThreadIdentity, root| {
+            carrick_el1_abi::CowGrantScope::checked(
+                carrick_core_abi::ExecutionBinding {
+                    task: carrick_core_abi::EntryTaskKey::from_raw(identity.tid),
+                    generation: carrick_core_abi::EntryGeneration::from_raw(identity.generation),
+                    mm: carrick_core_abi::EntryMmKey::from_raw(identity.mm),
+                    thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(
+                        identity.serial,
+                    ),
+                },
+                carrick_guest_arch::AddressContext {
+                    mm: carrick_guest_arch::MmGeneration::new(core::num::NonZeroU64::new(
+                        identity.mm,
+                    )?),
+                    root,
+                    generation: carrick_guest_arch::ContextGeneration::new(
+                        core::num::NonZeroU64::MIN,
+                    ),
+                },
+            )
+        };
+        let Some(parent_scope) = scope(self.lane.parent, parent_root) else {
+            return refused();
+        };
+        let Some(child_scope) = scope(child, crate::process::child_root()) else {
+            return refused();
+        };
         committed(
-            crate::process::publish_child_stack(residency, parent_root).then_some(()),
+            crate::process::publish_child_stack(residency, parent_root, parent_scope, child_scope)
+                .then_some(()),
             LifecycleInvariant::ForkBacking,
         );
         let (child_root, publication) = committed(

@@ -109,7 +109,12 @@ impl BackingMaintenance<'_> {
             return Ok(BackingMaintenanceProgress::Complete { next });
         };
         let mm = self.request.handle().mm().raw();
-        let Some(grant) = venue.pool.claim(mm) else {
+        if venue.scope.address.mm.raw().get() != mm
+            || venue.scope.address.root.address().raw() != venue.root.raw()
+        {
+            return Err(MmError::Stale);
+        }
+        let Some(grant) = venue.pool.claim(venue.scope) else {
             return Ok(BackingMaintenanceProgress::Supply);
         };
         // Keep the old compound offset for the existing exact COW settlement.
@@ -222,7 +227,12 @@ impl BackingMaintenance<'_> {
             return Ok(BackingMaintenanceProgress::Complete { next });
         };
         let mm = self.request.handle().mm().raw();
-        let Some(grant) = venue.pool.claim(mm) else {
+        if venue.scope.address.mm.raw().get() != mm
+            || venue.scope.address.root.address().raw() != venue.root.raw()
+        {
+            return Err(MmError::Stale);
+        }
+        let Some(grant) = venue.pool.claim(venue.scope) else {
             return Ok(BackingMaintenanceProgress::Supply);
         };
         let new_ipa = grant.physical_ipa + (old_ipa & (carrick_el1_abi::COW_GRANT_SIZE - 1));
@@ -397,15 +407,20 @@ pub fn serve_backing_maintenance_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         };
         let operation = portal.begin_backing_maintenance(request, frame.slot as u32)?;
         #[cfg(target_arch = "aarch64")]
-        let progress =
-            crate::fault::with_hardware_cow_venue(operation.ttbr0(), Some(slot), None, |venue| {
+        let progress = crate::fault::with_hardware_cow_venue(
+            operation.ttbr0(),
+            request.handle().mm().raw(),
+            Some(slot),
+            None,
+            |venue| {
                 operation.scrub(venue, |_, destination| {
                     // SAFETY: the existing copy window maps one retained private
                     // grant page RW; the owner authenticated the invalid predecessor.
                     unsafe { core::ptr::write_bytes(destination as *mut u8, 0, 4096) };
                 })
-            })
-            .map_err(|_| MmError::Core)?;
+            },
+        )
+        .map_err(|_| MmError::Core)?;
         #[cfg(target_arch = "x86_64")]
         let progress = with_x86_backing_venue(operation.ttbr0(), |venue| {
             operation.scrub_x86(venue, |_, destination| {

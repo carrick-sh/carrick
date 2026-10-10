@@ -92,8 +92,25 @@ mod tests {
     fn publication_is_bounded_and_acknowledges_cancellation_before_reuse() {
         let nz = |n| NonZeroU64::new(n).unwrap();
         let pool = crate::CowGrantPool::new();
+        let scope = crate::CowGrantScope::checked(
+            crate::ExecutionBinding {
+                task: crate::EntryTaskKey::from_raw(1),
+                generation: crate::EntryGeneration::from_raw(2),
+                mm: crate::EntryMmKey::from_raw(7),
+                thread_generation: crate::EntryThreadGeneration::from_raw(3),
+            },
+            carrick_guest_arch::AddressContext {
+                root: carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(
+                    0x8000,
+                ))
+                .unwrap(),
+                mm: carrick_guest_arch::MmGeneration::new(nz(7)),
+                generation: carrick_guest_arch::ContextGeneration::new(nz(4)),
+            },
+        )
+        .unwrap();
         pool.publish(
-            7,
+            scope,
             0x90000000,
             carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
                 frame_id: nz(1),
@@ -103,7 +120,7 @@ mod tests {
             },
         )
         .unwrap();
-        let grant = pool.claim(7).unwrap();
+        let grant = pool.claim(scope).unwrap();
         assert!(pool.authenticates_claimed(&grant));
         let slot = PortalExecutableSlot::new();
         let request = PortalExecutablePublication {

@@ -373,6 +373,21 @@ type NativeIdentityTask<'a, M, C> =
     GuestTask<VisibleNamespace, carrick_sched_core::process::TaskUid, Custody<'a, M, C>>;
 type Owner<'a, M, C> =
     GuestProcessOwner<VisibleNamespace, carrick_sched_core::process::TaskUid, Custody<'a, M, C>>;
+/// Owned admission survives MM preparation without retaining allocator
+/// temporaries on the guest stack.
+struct NativeForkBirthAdmission<M> {
+    snapshot: carrick_sched_core::process::birth::BirthSnapshot,
+    permit: carrick_sched_core::process::exit::ReservedTaskSet<NonZeroU64>,
+    child_key: TaskKey,
+    thread_serial: NonZeroU64,
+    child_mm: MmGeneration,
+    visible: VisibleIdentity,
+    claim: NativeClaim,
+    thread_claim: NativeClaim,
+    parent_mm: M,
+    signals: NativeProcessSignals<()>,
+    attributes: Box<GuestForkAttributes<VisibleNamespace>>,
+}
 struct PendingWait {
     caller: TaskKey,
     query: WaitQuery,
@@ -685,6 +700,30 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .records
             .get(&Self::record_key(zone, record))
             .map(|(runtime, _)| runtime.clone())
+    }
+
+    /// Resolve the retained address incarnation through the existing group
+    /// index. The exact carrier/MM/root prefix bounds this lookup.
+    pub fn registered_address(
+        &self,
+        zone: &ZoneTables<C>,
+        mm: carrick_guest_arch::MmGeneration,
+        root: RootGpa,
+    ) -> Option<AddressContext<RootGpa>> {
+        let carrier = core::ptr::from_ref(zone).addr();
+        let prefix = (carrier, mm.raw().get(), root.address().raw());
+        let (runtime, process) = self
+            .state
+            .lock()
+            .groups
+            .range(
+                (prefix.0, prefix.1, prefix.2, 0, 0)
+                    ..=(prefix.0, prefix.1, prefix.2, usize::MAX, u32::MAX),
+            )
+            .next()
+            .map(|(_, owner)| owner.clone())?;
+        let address = runtime.task_address(process)?;
+        (address.mm == mm && address.root == root).then_some(address)
     }
 
     /// The exact admitted process address for a published thread-group
@@ -1569,6 +1608,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             words,
             record,
         })
+    }
+    /// Read address custody without copying the task's saved register image.
+    pub fn task_address(&self, key: TaskKey) -> Option<AddressContext<RootGpa>> {
+        let graph = self.graph.lock();
+        Some(graph.owner.task(key).ok()?.native().resources().address)
     }
     pub fn task_binding(&self, key: TaskKey) -> Option<NativeRecordBinding<M, C>> {
         let graph = self.graph.lock();
@@ -2951,8 +2995,142 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         })
     }
     #[inline(never)]
-    fn fork_owned(&mut self) -> Result<u32, NativeProcessError> {
-        let (
+    fn publish_fork_contexts(
+        &self,
+        record: carrick_sched_core::RecordId,
+        child_words: &C,
+    ) -> Result<(), NativeProcessError> {
+        // SAFETY: this exact newly allocated record remains Free and unpublished.
+        unsafe {
+            *self.source.zone.record(record).ctx_mut() = *child_words;
+            // The parent still owns its running record. Publish the exact
+            // admitted image before either record can be scheduled again.
+            let parent_record = self
+                .source
+                .zone
+                .slot(self.source.slot)
+                .current()
+                .or_else(|| self.source.zone.slot(self.source.slot).host_record())
+                .ok_or(NativeProcessError::Stale)?;
+            *self.source.zone.record(parent_record).ctx_mut() = self.words;
+        };
+        Ok(())
+    }
+
+    // Child-row construction follows MM preparation. Keep its owned
+    // metadata and custody temporaries in this publication phase's frame.
+    #[inline(never)]
+    fn build_fork_child(
+        &self,
+        resources: NativeResources<'a, M, C>,
+        child_key: TaskKey,
+        visible: VisibleIdentity,
+        attributes: Box<GuestForkAttributes<VisibleNamespace>>,
+        claim: NativeClaim,
+        words: Box<C>,
+    ) -> Box<NativeIdentityTask<'a, M, C>> {
+        let mut child = GuestTask::new_with_boxed_context(
+            GuestTaskMetadata {
+                key: child_key,
+                container: attributes.container,
+                namespace_pid: visible.get(),
+                identity: attributes.identity,
+                namespace_process_group: attributes.group,
+                namespace_session: attributes.session,
+                receipt_uid: |uid| uid,
+                exit_signal: ChildExitSignal::SIGCHLD,
+                diagnostic_name: String::from("native-child"),
+            },
+            Some(self.key),
+            words,
+            custody(resources),
+            claim,
+        );
+        child.init_leader(
+            visible.get(),
+            attributes.credentials.clone(),
+            attributes.comm,
+        );
+        child.rlimits = attributes.rlimits;
+        child.umask = attributes.umask;
+        child.personality = attributes.personality;
+        child.dumpable = attributes.dumpable;
+        child.no_new_privs = attributes.no_new_privs;
+        child
+    }
+
+    #[inline(never)]
+    fn reserve_fork_birth(&self) -> Result<Box<NativeForkBirthAdmission<M>>, NativeProcessError> {
+        let mut graph = self.runtime.graph.lock();
+        let row = graph
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeProcessError::Stale)?;
+        if row.native().resources().page.gate() != carrick_el1_abi::GateState::Open {
+            return Err(NativeProcessError::Busy);
+        }
+        let parent_mm = row.native().resources().mm.clone();
+        let signals = row.native().resources().signals.clone();
+        let attributes = row
+            .fork_attributes(self.calling_tid)
+            .map_err(|_| NativeProcessError::Stale)?;
+        let snapshot = graph
+            .owner
+            .capture_parent(self.key)
+            .map_err(|_| NativeProcessError::Stale)?;
+        let serial = graph
+            .serials
+            .allocate()
+            .ok_or(NativeProcessError::Exhausted)?;
+        let thread_serial = graph
+            .serials
+            .allocate()
+            .ok_or(NativeProcessError::Exhausted)?;
+        let child_mm = MmGeneration::new(
+            graph
+                .serials
+                .allocate()
+                .ok_or(NativeProcessError::Exhausted)?,
+        );
+        let transaction = graph
+            .serials
+            .allocate()
+            .ok_or(NativeProcessError::Exhausted)?;
+        let namespace = graph.namespace.clone();
+        let visible_namespace = graph.visible_namespace;
+        let (number, visible) = {
+            let mut ns = namespace.lock();
+            let number = ns
+                .reserve_next(ClaimKind::Task)
+                .map_err(|_| NativeProcessError::Exhausted)?;
+            if ns.claim_related(number.get(), ClaimKind::Thread).is_err() {
+                ns.release(number, ClaimKind::Task);
+                return Err(NativeProcessError::Exhausted);
+            }
+            let Some(visible) = ns.reserve_visible(visible_namespace) else {
+                ns.release(number, ClaimKind::Thread);
+                ns.release(number, ClaimKind::Task);
+                return Err(NativeProcessError::Exhausted);
+            };
+            (number, visible)
+        };
+        let child_key = TaskKey {
+            id: TaskId::from_abi_positive(number.get()).map_err(|_| NativeProcessError::Invalid)?,
+            serial: TaskSerial::from_raw_u64(serial.get()).ok_or(NativeProcessError::Invalid)?,
+        };
+        let claim = NativeClaim {
+            namespace: namespace.clone(),
+            claims: vec![(number, ClaimKind::Task)],
+        };
+        let thread_claim = NativeClaim {
+            namespace,
+            claims: vec![(number, ClaimKind::Thread)],
+        };
+        let permit = graph
+            .owner
+            .reserve_birth(snapshot, snapshot, transaction)
+            .map_err(|_| NativeProcessError::Busy)?;
+        Ok(Box::new(NativeForkBirthAdmission {
             snapshot,
             permit,
             child_key,
@@ -2964,96 +3142,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             parent_mm,
             signals,
             attributes,
-        ) = {
-            let mut graph = self.runtime.graph.lock();
-            let row = graph
-                .owner
-                .task(self.key)
-                .map_err(|_| NativeProcessError::Stale)?;
-            if row.native().resources().page.gate() != carrick_el1_abi::GateState::Open {
-                return Err(NativeProcessError::Busy);
-            }
-            let parent_mm = row.native().resources().mm.clone();
-            let signals = row.native().resources().signals.clone();
-            let attributes = row
-                .fork_attributes(self.calling_tid)
-                .map_err(|_| NativeProcessError::Stale)?;
-            let snapshot = graph
-                .owner
-                .capture_parent(self.key)
-                .map_err(|_| NativeProcessError::Stale)?;
-            let serial = graph
-                .serials
-                .allocate()
-                .ok_or(NativeProcessError::Exhausted)?;
-            let thread_serial = graph
-                .serials
-                .allocate()
-                .ok_or(NativeProcessError::Exhausted)?;
-            let child_mm = MmGeneration::new(
-                graph
-                    .serials
-                    .allocate()
-                    .ok_or(NativeProcessError::Exhausted)?,
-            );
-            let transaction = graph
-                .serials
-                .allocate()
-                .ok_or(NativeProcessError::Exhausted)?;
-            let namespace = graph.namespace.clone();
-            let visible_namespace = graph.visible_namespace;
-            let (number, visible) = {
-                let mut ns = namespace.lock();
-                let number = ns
-                    .reserve_next(ClaimKind::Task)
-                    .map_err(|_| NativeProcessError::Exhausted)?;
-                if ns.claim_related(number.get(), ClaimKind::Thread).is_err() {
-                    ns.release(number, ClaimKind::Task);
-                    return Err(NativeProcessError::Exhausted);
-                }
-                let Some(visible) = ns.reserve_visible(visible_namespace) else {
-                    ns.release(number, ClaimKind::Thread);
-                    ns.release(number, ClaimKind::Task);
-                    return Err(NativeProcessError::Exhausted);
-                };
-                (number, visible)
-            };
-            let child_key = TaskKey {
-                id: TaskId::from_abi_positive(number.get())
-                    .map_err(|_| NativeProcessError::Invalid)?,
-                serial: TaskSerial::from_raw_u64(serial.get())
-                    .ok_or(NativeProcessError::Invalid)?,
-            };
-            let claim = NativeClaim {
-                namespace: namespace.clone(),
-                claims: vec![(number, ClaimKind::Task)],
-            };
-            let thread_claim = NativeClaim {
-                namespace,
-                claims: vec![(number, ClaimKind::Thread)],
-            };
-            let permit = graph
-                .owner
-                .reserve_birth(snapshot, snapshot, transaction)
-                .map_err(|_| NativeProcessError::Busy)?;
-            (
-                snapshot,
-                permit,
-                child_key,
-                thread_serial,
-                child_mm,
-                visible,
-                claim,
-                thread_claim,
-                parent_mm,
-                signals,
-                attributes,
-            )
-        };
-        let signals = match signals.for_fork(child_key) {
+        }))
+    }
+
+    #[inline(never)]
+    fn fork_owned(&mut self) -> Result<u32, NativeProcessError> {
+        let mut admission = self.reserve_fork_birth()?;
+        admission.signals = match admission.signals.for_fork(admission.child_key) {
             Some(signals) => signals,
             None => {
-                self.runtime.graph.lock().owner.rollback_birth(&permit);
+                self.runtime
+                    .graph
+                    .lock()
+                    .owner
+                    .rollback_birth(&admission.permit);
                 return Err(NativeProcessError::Invalid);
             }
         };
@@ -3073,33 +3175,72 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             )
         };
         let parent_identity = Box::new(parent_identity);
-        let prepared_start = match self
-            .service
-            .prepare_mm_start(&parent_mm, &self.words, child_mm)
-        {
+        let prepared_start = match self.service.prepare_mm_start(
+            &admission.parent_mm,
+            &self.words,
+            admission.child_mm,
+        ) {
             Ok(p) => p,
             Err(error) => {
-                self.runtime.graph.lock().owner.rollback_birth(&permit);
+                self.runtime
+                    .graph
+                    .lock()
+                    .owner
+                    .rollback_birth(&admission.permit);
                 return Err(error);
             }
         };
         let prepared_published = match self.service.prepare_mm_publish(prepared_start) {
             Ok(p) => p,
             Err(error) => {
-                self.runtime.graph.lock().owner.rollback_birth(&permit);
+                self.runtime
+                    .graph
+                    .lock()
+                    .owner
+                    .rollback_birth(&admission.permit);
                 return Err(error);
             }
         };
         let prepared = match self.service.prepare_mm_finish(prepared_published) {
             Ok(p) => p,
             Err(error) => {
-                self.runtime.graph.lock().owner.rollback_birth(&permit);
+                self.runtime
+                    .graph
+                    .lock()
+                    .owner
+                    .rollback_birth(&admission.permit);
                 return Err(error);
             }
         };
+        self.publish_fork_birth(
+            admission,
+            prepared,
+            &parent_identity,
+            blocked,
+            parent_page,
+            parent_file_table,
+        )
+    }
+
+    // MM preparation and birth publication own separate bounded stack frames.
+    #[inline(never)]
+    #[allow(clippy::boxed_local)] // Admission stays off the measured 8 KiB guest stack.
+    fn publish_fork_birth(
+        &mut self,
+        admission: Box<NativeForkBirthAdmission<M>>,
+        prepared: S::PreparedMm,
+        parent_identity: &ThreadIdentity,
+        blocked: carrick_el1_abi::BlockedMask,
+        parent_page: &ThreadLifecyclePage,
+        parent_file_table: u64,
+    ) -> Result<u32, NativeProcessError> {
         let address = self.service.prepared_context(&prepared);
-        if address.mm != child_mm {
-            self.runtime.graph.lock().owner.rollback_birth(&permit);
+        if address.mm != admission.child_mm {
+            self.runtime
+                .graph
+                .lock()
+                .owner
+                .rollback_birth(&admission.permit);
             if let Err((_, p)) = self.service.abort_mm(prepared) {
                 self.service.quarantine_prepared(p)
             };
@@ -3125,9 +3266,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     page.stock(
                         index,
                         EntryIdentity {
-                            tid: child_key.id.raw() as u32,
-                            visible_tid: visible.get(),
-                            thread_serial: thread_serial.get(),
+                            tid: admission.child_key.id.raw() as u32,
+                            visible_tid: admission.visible.get(),
+                            thread_serial: admission.thread_serial.get(),
                             uid_credit: 0,
                         },
                     )
@@ -3143,7 +3284,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .claim(lifecycle_entry)
                 .map_err(|_| NativeProcessError::Busy)?;
             control.reset_for_birth(blocked, 0, lifecycle_entry);
-            if !control.publish_visible_tid(visible.get()) {
+            if !control.publish_visible_tid(admission.visible.get()) {
                 page.unclaim(claim)
                     .map_err(|_| NativeProcessError::Quarantined)?;
                 return Err(NativeProcessError::Invalid);
@@ -3173,7 +3314,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let control = match metadata {
             Ok(control) => control,
             Err(error) => {
-                self.runtime.graph.lock().owner.rollback_birth(&permit);
+                self.runtime
+                    .graph
+                    .lock()
+                    .owner
+                    .rollback_birth(&admission.permit);
                 // The exact prepared MM retains potentially partially admitted
                 // metadata. It must never be published or reused after refusal.
                 self.service.quarantine_prepared(prepared);
@@ -3182,13 +3327,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         };
         let child_file_table = self
             .service
-            .child_file_table(parent_file_table, child_key.serial.raw());
+            .child_file_table(parent_file_table, admission.child_key.serial.raw());
         let thread = ThreadIdentity {
-            tid: child_key.id.raw() as u64,
-            serial: thread_serial.get(),
-            mm: child_mm.raw().get(),
+            tid: admission.child_key.id.raw() as u64,
+            serial: admission.thread_serial.get(),
+            mm: admission.child_mm.raw().get(),
             file_table: child_file_table,
-            generation: child_key.serial.raw(),
+            generation: admission.child_key.serial.raw(),
             affinity: parent_identity.affinity,
             lifecycle_page: page as *const _ as u64,
             control_slot: control as *const _ as u64,
@@ -3196,7 +3341,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let record = match self.source.zone.alloc_record(thread) {
             Ok(r) => r,
             Err(_) => {
-                self.runtime.graph.lock().owner.rollback_birth(&permit);
+                self.runtime
+                    .graph
+                    .lock()
+                    .owner
+                    .rollback_birth(&admission.permit);
                 if let Err((_, p)) = self.service.abort_mm(prepared) {
                     self.service.quarantine_prepared(p)
                 };
@@ -3208,81 +3357,55 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .fork_fd_table(parent_file_table, child_file_table)
         {
             self.source.zone.free_record(record);
-            self.runtime.graph.lock().owner.rollback_birth(&permit);
+            self.runtime
+                .graph
+                .lock()
+                .owner
+                .rollback_birth(&admission.permit);
             if let Err((_, p)) = self.service.abort_mm(prepared) {
                 self.service.quarantine_prepared(p)
             };
             return Err(error);
         }
-        let child_words = self.service.fork_child_context_boxed(self.words, &prepared);
-        // SAFETY: this exact newly allocated record remains Free and unpublished.
-        unsafe {
-            *self.source.zone.record(record).ctx_mut() = *child_words;
-            // The parent still owns its running record. Publish the exact
-            // admitted image before either record can be scheduled again.
-            let parent_record = self
-                .source
-                .zone
-                .slot(self.source.slot)
-                .current()
-                .or_else(|| self.source.zone.slot(self.source.slot).host_record())
-                .ok_or(NativeProcessError::Stale)?;
-            *self.source.zone.record(parent_record).ctx_mut() = self.words;
-        };
+        let child_words = self
+            .service
+            .fork_child_context_boxed(&self.words, &prepared);
+        self.publish_fork_contexts(record, &child_words)?;
         let resources = NativeResources {
             zone: self.source.zone,
             record: self.source.zone.record_ref(record),
             control,
             page,
             members: vec![NativeMember {
-                thread: child_key,
-                process: child_key,
+                thread: admission.child_key,
+                process: admission.child_key,
                 zone: self.source.zone,
                 record: self.source.zone.record_ref(record),
                 control,
             }],
             mm: self.service.prepared_mm(&prepared),
             address,
-            signals,
-            _thread_claim: thread_claim,
+            signals: admission.signals,
+            _thread_claim: admission.thread_claim,
             channel: None,
             usage: TaskRusage::default(),
             file_table: child_file_table,
         };
-        let mut child = GuestTask::new_with_boxed_context(
-            GuestTaskMetadata {
-                key: child_key,
-                container: attributes.container,
-                namespace_pid: visible.get(),
-                identity: attributes.identity,
-                namespace_process_group: attributes.group,
-                namespace_session: attributes.session,
-                receipt_uid: |uid| uid,
-                exit_signal: ChildExitSignal::SIGCHLD,
-                diagnostic_name: String::from("native-child"),
-            },
-            Some(self.key),
+        let child = self.build_fork_child(
+            resources,
+            admission.child_key,
+            admission.visible,
+            admission.attributes,
+            admission.claim,
             child_words,
-            custody(resources),
-            claim,
         );
-        child.init_leader(
-            visible.get(),
-            attributes.credentials.clone(),
-            attributes.comm,
-        );
-        child.rlimits = attributes.rlimits;
-        child.umask = attributes.umask;
-        child.personality = attributes.personality;
-        child.dumpable = attributes.dumpable;
-        child.no_new_privs = attributes.no_new_privs;
         let prep = Box::new(PreparedFork::from_reserved(
-            snapshot,
-            snapshot,
+            admission.snapshot,
+            admission.snapshot,
             child,
             prepared,
             BirthAttachment::Parent,
-            permit,
+            admission.permit,
         ));
         let result = {
             let mut graph = self.runtime.graph.lock();
@@ -3341,8 +3464,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     NativeChildRegistration {
                         parent_binding: self.binding,
                         parent_address: self.caller_address,
-                        child: child_key,
-                        thread_generation: thread_serial.get(),
+                        child: admission.child_key,
+                        thread_generation: admission.thread_serial.get(),
                         address,
                         record: self.source.zone.record_ref(record),
                     },
@@ -3355,7 +3478,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         arm_fork_progress(carrick_el1_abi::NativeForkProgress::ChildRegistered);
         self.source.zone.requeue_preempted(self.source.slot, record);
         arm_fork_progress(carrick_el1_abi::NativeForkProgress::ParentResumed);
-        Ok(visible.get())
+        Ok(admission.visible.get())
     }
 }
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> ProcessNative<C>

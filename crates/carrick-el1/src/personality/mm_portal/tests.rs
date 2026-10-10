@@ -7,6 +7,7 @@ use carrick_el1_abi::{
 };
 use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
 use carrick_sched_core::AddressSpaces;
+use carrick_test_support::cow_grant_scope as cow_scope;
 use core::sync::atomic::Ordering;
 #[test]
 fn transfer_fence_bounds_remap_to_one_chunk() {
@@ -1343,6 +1344,7 @@ fn imported_private_empty_cow_pool_returns_owned_exact_target_supply() {
         ) -> crate::fault::CowResolution {
             let result = crate::cow::resolve_guest_cow(
                 &crate::cow::GuestCowVenue {
+                    scope: cow_scope(mm, ttbr),
                     words: &self.0.live(&CallerInvalidatesAsid),
                     root: carrick_mmu_core::aarch64::SubstrateGpa(ttbr),
                     pool: self.1,
@@ -2393,7 +2395,7 @@ fn owner_fork_resident_child_cow_copies_with_production_classifier() {
     let nz = |v| NonZeroU64::new(v).unwrap();
     let replacement_ipa = IPA + 0x100000;
     pool.publish(
-        78,
+        cow_scope(78, child.base),
         replacement_ipa,
         BackingIdentity {
             frame_id: nz(11),
@@ -2409,6 +2411,7 @@ fn owner_fork_resident_child_cow_copies_with_production_classifier() {
         .unwrap();
     let outcome = crate::cow::resolve_guest_cow(
         &crate::cow::GuestCowVenue {
+            scope: cow_scope(receipt.child.mm().raw(), child.base),
             words: &words,
             root: carrick_mmu_core::aarch64::SubstrateGpa(child.base),
             pool: &pool,
@@ -2619,7 +2622,7 @@ fn owner_parent_copyout_rollback(mixed_block: bool) {
     let nz = |v| NonZeroU64::new(v).unwrap();
     let replacement_ipa = IPA + 0x100000;
     pool.publish(
-        77,
+        cow_scope(77, ROOT),
         replacement_ipa,
         BackingIdentity {
             frame_id: nz(11),
@@ -2635,6 +2638,7 @@ fn owner_parent_copyout_rollback(mixed_block: bool) {
         .unwrap();
     let outcome = crate::cow::resolve_guest_cow(
         &crate::cow::GuestCowVenue {
+            scope: cow_scope(parent.raw(), ROOT),
             words: &words,
             root: carrick_mmu_core::aarch64::SubstrateGpa(ROOT),
             pool: &pool,
@@ -4294,6 +4298,7 @@ fn pending_brk_scrub_must_not_wait_for_its_own_gate() {
         loads: core::cell::Cell::new(0),
     };
     let venue = crate::cow::GuestCowVenue {
+        scope: cow_scope(mm.raw(), ROOT),
         words: &words,
         root: carrick_mmu_core::aarch64::SubstrateGpa(ROOT),
         pool: &pool,
@@ -4318,7 +4323,7 @@ fn pending_brk_scrub_must_not_wait_for_its_own_gate() {
     // A supplied alias of the predecessor is not private replacement custody.
     let aliased = pool
         .publish(
-            mm.raw(),
+            cow_scope(mm.raw(), ROOT),
             IPA,
             carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
                 frame_id: nz(20),
@@ -4345,7 +4350,7 @@ fn pending_brk_scrub_must_not_wait_for_its_own_gate() {
     access.lower(index);
     let grant = pool
         .publish(
-            mm.raw(),
+            cow_scope(mm.raw(), ROOT),
             0xa000_0000,
             carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
                 frame_id: nz(10),

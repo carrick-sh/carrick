@@ -5,6 +5,7 @@ use crate::fault::{NoopCowResolver, NoopPreparedResolver};
 use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
 use carrick_mmu_core::x86::descriptor_txn::{NX, PRESENT, USER, WRITE};
 use carrick_sched_core::AddressSpaces;
+use carrick_test_support::cow_grant_scope as cow_scope;
 use core::sync::atomic::Ordering;
 
 struct X86ForkWords<'a> {
@@ -253,6 +254,7 @@ fn x86_pending_brk_maintenance_scrubs_private_grant_and_keeps_leaf_invalid() {
     let pool = carrick_el1_abi::CowGrantPool::new();
     let resident = residency();
     let venue = GuestCowVenue::<X86RetiredOwner, _> {
+        scope: cow_scope(mm.raw(), ROOT),
         words: &words,
         root: SubstrateGpa(ROOT),
         pool: &pool,
@@ -275,7 +277,7 @@ fn x86_pending_brk_maintenance_scrubs_private_grant_and_keeps_leaf_invalid() {
     let nz = |value| NonZeroU64::new(value).unwrap();
     let aliased = pool
         .publish(
-            mm.raw(),
+            cow_scope(mm.raw(), ROOT),
             IPA,
             carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
                 frame_id: nz(20),
@@ -303,7 +305,7 @@ fn x86_pending_brk_maintenance_scrubs_private_grant_and_keeps_leaf_invalid() {
     access.lower(index);
     let grant = pool
         .publish(
-            mm.raw(),
+            cow_scope(mm.raw(), ROOT),
             IPA + 0x100000,
             carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
                 frame_id: nz(10),

@@ -407,10 +407,14 @@ impl HostCowStats {
 
 impl HvfAarch64Vmm {
     /// Retained physical adapter for the production EL1 UserTransfer service.
-    pub fn user_transfer_custody(&self) -> crate::trap::UserTransferCustody {
+    pub fn user_transfer_custody(
+        &self,
+        slot: Option<carrick_guest_arch::SlotId>,
+    ) -> crate::trap::UserTransferCustody {
         crate::trap::UserTransferCustody::from_transport(
             std::sync::Arc::clone(&self.state.carrier_foreign_mm_transport),
             self.state.carrier_mappings.clone(),
+            slot,
         )
     }
 
@@ -2632,10 +2636,11 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         syndrome: u64,
         far: u64,
         ttbr0: u64,
+        slot: Option<carrick_guest_arch::SlotId>,
         flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<carrick_hal::CowFaultResolution, TrapError> {
         self.state
-            .resolve_frame_cow_fault(syndrome, far, ttbr0, flush_stage1)
+            .resolve_frame_cow_fault(syndrome, far, ttbr0, slot, flush_stage1)
     }
 
     fn refresh_vcpu_after_frame_cow(&self, vcpu: &mut Self::Vcpu) -> Result<(), TrapError> {
@@ -2905,9 +2910,10 @@ impl Aarch64Vmm for HvfAarch64Vmm {
 
     fn owner_transfer_custody(
         &self,
+        slot: Option<carrick_guest_arch::SlotId>,
     ) -> Option<Box<carrick_aarch64::user_transfer::ErasedPhysicalCustody>> {
         Some(Box::new(
-            carrick_aarch64::user_transfer::ErasedTransferCustody(self.user_transfer_custody()),
+            carrick_aarch64::user_transfer::ErasedTransferCustody(self.user_transfer_custody(slot)),
         ))
     }
 
@@ -2917,7 +2923,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         window: carrick_el1_abi::PortalGrantWindow,
     ) -> Result<carrick_aarch64::user_transfer::TransferPreparation, TrapError> {
         carrick_aarch64::user_transfer::TransferCustody::prepare(
-            &self.user_transfer_custody(),
+            &self.user_transfer_custody(None),
             target,
             window,
         )

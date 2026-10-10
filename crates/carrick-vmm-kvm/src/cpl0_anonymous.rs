@@ -1124,6 +1124,8 @@ impl Cpl0HostCustody {
         window: PortalGrantWindow,
     ) -> Result<(), TrapError> {
         let mm = execution.context.mm.raw();
+        let scope = carrick_el1_abi::CowGrantScope::checked(execution.binding, execution.context)
+            .ok_or_else(|| fail("owner COW scope"))?;
         if !window.valid()
             || self.grant_portal()?.carrier() != Some(window.operation.carrier)
             || window.operation.mm.raw() != mm.get()
@@ -1233,7 +1235,7 @@ impl Cpl0HostCustody {
             )
             .map_err(|error| fail(error.to_string()))?;
         let handle = handles[0];
-        let Some(grant) = self.cow_pool()?.publish(mm.get(), physical, backing) else {
+        let Some(grant) = self.cow_pool()?.publish(scope, physical, backing) else {
             // SAFETY: no grant exposed this fresh physical extent to the guest.
             unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }
                 .map_err(|error| fail(error.to_string()))?;

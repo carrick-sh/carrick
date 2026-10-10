@@ -42,6 +42,40 @@ pub(crate) fn live_fork_execution(
     )
 }
 
+/// Scope a stopped CPU's replacement stock to its issued task and target root.
+pub(crate) fn live_cow_scope(
+    slot: carrick_guest_arch::SlotId,
+    target: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
+) -> Option<carrick_el1_abi::CowGrantScope> {
+    let ptr = carrick_el1_abi::get_el1_region_host_ptr();
+    let index = usize::from(slot.raw());
+    if ptr == 0 || index >= carrick_el1_abi::EL1_STACK_SLOTS as usize {
+        return None;
+    }
+    // SAFETY: the synchronous owner crossing stops this slot and retains the
+    // mapped ABI region and current context throughout authentication.
+    let task = unsafe {
+        &*((ptr
+            + carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize
+            + index * core::mem::size_of::<carrick_el1_abi::CurrentTask>())
+            as *const carrick_el1_abi::CurrentTask)
+    };
+    let binding = carrick_core::entry::binding(&task.execution, &task.mm);
+    let zone = carrick_el1_abi::zone_tables()?;
+    let record = zone
+        .slot(slot)
+        .current()
+        .or_else(|| zone.slot(slot).host_record())?;
+    // SAFETY: the stopped CPU retains its context through this crossing.
+    let ttbr = unsafe { zone.record(record).ctx_mut().root() };
+    let execution =
+        live_fork_execution(carrick_guest_arch::CpuId::new(u32::from(slot.raw())), ttbr)?;
+    if binding != execution.binding {
+        return None;
+    }
+    carrick_el1_abi::CowGrantScope::checked(binding, target)
+}
+
 fn fork_execution_from_snapshot(
     cpu: carrick_guest_arch::CpuId,
     ttbr0: u64,

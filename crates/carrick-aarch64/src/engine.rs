@@ -3389,7 +3389,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         let length = transfer.len();
         let custody = self
             .vm
-            .owner_transfer_custody()
+            .owner_transfer_custody(
+                self.mailbox_slot()
+                    .and_then(carrick_sched_core::SlotId::from_index),
+            )
             .ok_or(MemoryError::Unsupported)?;
         let region = carrick_el1_abi::get_el1_region_host_ptr();
         if region == 0 {
@@ -3547,12 +3550,18 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 "current task differs from admitted memory authority"
             );
         }
-        let custody = self.vm.owner_transfer_custody().unwrap_or_else(|| {
-            carrick_fatal::carrick_fatal!(
-                "aarch64::prepared_copy",
-                "admitted task lacks physical custody"
+        let custody = self
+            .vm
+            .owner_transfer_custody(
+                self.mailbox_slot()
+                    .and_then(carrick_sched_core::SlotId::from_index),
             )
-        });
+            .unwrap_or_else(|| {
+                carrick_fatal::carrick_fatal!(
+                    "aarch64::prepared_copy",
+                    "admitted task lacks physical custody"
+                )
+            });
         let ttbr0 = self
             .transfer_service_loan()
             .and_then(|loan| loan.target_ttbr0())
@@ -3647,7 +3656,10 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         let handle = self.protections.owner().ok_or(MemoryError::Unsupported)?;
         let custody = self
             .vm
-            .owner_transfer_custody()
+            .owner_transfer_custody(
+                self.mailbox_slot()
+                    .and_then(carrick_sched_core::SlotId::from_index),
+            )
             .ok_or(MemoryError::Unsupported)?;
         let ttbr0 = self
             .transfer_service_loan()
@@ -5650,13 +5662,19 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     }
 
     fn user_memory_admission_authority(&self) -> Option<UserMemoryAuthority> {
-        self.vm.owner_transfer_custody()?;
+        self.vm.owner_transfer_custody(
+            self.mailbox_slot()
+                .and_then(carrick_sched_core::SlotId::from_index),
+        )?;
         Some(self.protections.clone())
     }
 
     fn owner_transfer_carrier(&self) -> Option<std::num::NonZeroU64> {
         self.vm
-            .owner_transfer_custody()
+            .owner_transfer_custody(
+                self.mailbox_slot()
+                    .and_then(carrick_sched_core::SlotId::from_index),
+            )
             .map(|custody| custody.carrier())
     }
 
@@ -5689,7 +5707,10 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             ));
         }
         if owner == LiveDescriptorOwner::Guest {
-            let Some(custody) = self.vm.owner_transfer_custody() else {
+            let Some(custody) = self.vm.owner_transfer_custody(
+                self.mailbox_slot()
+                    .and_then(carrick_sched_core::SlotId::from_index),
+            ) else {
                 return Ok(false);
             };
             let mm = carrick_el1_abi::ReservationMm::new(self.mm_generation)
@@ -5987,7 +6008,13 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             required_invalidation: None,
         };
         let ttbr0 = fault_page_tables.map_or(0, |(ttbr, _)| ttbr);
-        let resolution = vm.resolve_frame_cow_fault(syndrome, far, ttbr0, &mut flush)?;
+        let resolution = vm.resolve_frame_cow_fault(
+            syndrome,
+            far,
+            ttbr0,
+            slot.and_then(carrick_sched_core::SlotId::from_index),
+            &mut flush,
+        )?;
         drop(flush);
         if matches!(resolution, carrick_hal::CowFaultResolution::Resolved { .. }) {
             vm.refresh_vcpu_after_frame_cow(vcpu)?;
@@ -8681,7 +8708,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         let operation = self.pending_owner_fork_operation();
         let custody = self
             .vm
-            .owner_transfer_custody()
+            .owner_transfer_custody(
+                self.mailbox_slot()
+                    .and_then(carrick_sched_core::SlotId::from_index),
+            )
             .ok_or(TrapError::UnsupportedPlatform)?;
         let ttbr0 = self.vcpu.get_mut().get_sys_reg(SysReg::Ttbr0)?;
         let region = carrick_el1_abi::get_el1_region_host_ptr();

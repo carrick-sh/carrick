@@ -164,6 +164,7 @@ impl<'a, B: OwnerCowMmu> CowCopyWindow<'a, B> {
 }
 
 pub struct GuestCowVenue<'a, B: OwnerCowMmu, W: ?Sized> {
+    pub scope: carrick_core_abi::CowGrantScope,
     pub words: &'a W,
     pub root: SubstrateGpa,
     pub pool: &'a dyn CowGrantVenue,
@@ -190,6 +191,7 @@ where
     I: FnMut(),
 {
     let GuestCowVenue {
+        scope,
         words,
         root,
         pool,
@@ -197,6 +199,14 @@ where
         copy_window,
         publish_executable,
     } = *venue;
+
+    if !scope.is_valid()
+        || scope.address.mm.raw().get() != mm_key
+        || scope.address.root.address().raw() != root.raw()
+    {
+        pool.note_declined(CowDecline::Refused);
+        return Ok(GuestCowOutcome::Declined(CowDecline::Refused));
+    }
 
     let run = match B::classify_cow_write(words, root.raw(), far, publish_executable.is_some()) {
         CowClassifyOutcome::Armed(run) => run,
@@ -210,7 +220,7 @@ where
         }
     };
 
-    let Some(grant) = pool.claim(mm_key) else {
+    let Some(grant) = pool.claim(scope) else {
         pool.note_declined(CowDecline::PoolEmpty);
         return Ok(GuestCowOutcome::Declined(CowDecline::PoolEmpty));
     };

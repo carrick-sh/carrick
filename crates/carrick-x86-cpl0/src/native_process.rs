@@ -596,6 +596,8 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
                 carrick_el1::fault::X86PreparedResolver::under_editor(mm.mm.raw(), &words)
             };
             let mut cow = carrick_el1::fault::X86CowResolver {
+                scope: carrick_el1_abi::CowGrantScope::checked(
+                    carrick_core::entry::binding(&self.task.execution, &self.task.mm), *mm),
                 words: &words,
                 pool,
                 residency,

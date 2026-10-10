@@ -395,6 +395,7 @@ mod tests {
     use carrick_el1_abi::{CowDecline, CowGrantCompletion, CowGrantPool, FrameGrantResidencyTable};
     use carrick_mmu_core::aarch64::SubstrateGpa;
     use carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords;
+    use carrick_test_support::cow_grant_scope as cow_scope;
 
     const PAGE: u64 = 4096;
 
@@ -589,6 +590,7 @@ mod tests {
     ) -> GuestCowOutcome {
         resolve_guest_cow(
             &GuestCowVenue {
+                scope: cow_scope(MM, ROOT),
                 publish_executable: None,
                 words: &arena.words(),
                 root: SubstrateGpa(ROOT),
@@ -670,9 +672,10 @@ mod tests {
         };
         let (target, _) = forked(false);
         let pool = CowGrantPool::new();
-        pool.publish(MM, GRANT, backing()).unwrap();
+        pool.publish(cow_scope(MM, ROOT), GRANT, backing()).unwrap();
         let outcome = resolve_guest_cow(
             &GuestCowVenue {
+                scope: cow_scope(MM, ROOT),
                 words: &target.words(),
                 root: SubstrateGpa(ROOT),
                 pool: &pool,
@@ -690,7 +693,7 @@ mod tests {
         drop(lease);
         drop(table.try_claim(slot).unwrap());
         assert!(
-            pool.claim(MM).is_some(),
+            pool.claim(cow_scope(MM, ROOT)).is_some(),
             "failed copy returns its physical grant"
         );
     }
@@ -728,7 +731,8 @@ mod tests {
                             .insert(source_ipa + page * PAGE, vec![index + 11; 4096]);
                     }
                     let pool = CowGrantPool::new();
-                    pool.publish(mm, replacement_ipa, backing()).unwrap();
+                    pool.publish(cow_scope(mm, ROOT), replacement_ipa, backing())
+                        .unwrap();
                     let slot = SlotId::new(index);
                     let lease = table.try_claim(slot).unwrap();
                     let service_words = unsafe {
@@ -754,6 +758,7 @@ mod tests {
                         CowCopyWindow::maintenance(&service_words, SERVICE_ROOT, &lease).unwrap();
                     let outcome = resolve_guest_cow(
                         &GuestCowVenue {
+                            scope: cow_scope(mm, ROOT),
                             words: &target.words(),
                             root: SubstrateGpa(ROOT),
                             pool: &pool,
@@ -806,9 +811,10 @@ mod tests {
         let service = Arena::new(true);
         let before = service.image();
         let pool = CowGrantPool::new();
-        pool.publish(MM, GRANT, backing()).unwrap();
+        pool.publish(cow_scope(MM, ROOT), GRANT, backing()).unwrap();
         let outcome = resolve_guest_cow(
             &GuestCowVenue {
+                scope: cow_scope(MM, ROOT),
                 publish_executable: None,
                 words: &target.words(),
                 root: SubstrateGpa(ROOT),
@@ -840,7 +846,7 @@ mod tests {
     fn cow_replaces_the_residency_identity_with_the_granted_owner() {
         let (arena, memory) = forked(true);
         let pool = CowGrantPool::new();
-        let grant = pool.publish(MM, GRANT, backing()).unwrap();
+        let grant = pool.publish(cow_scope(MM, ROOT), GRANT, backing()).unwrap();
         let residency = residency_table();
         let old = carrick_el1_abi::FrameGrantResidencyIdentity {
             mm_key: MM,
@@ -857,6 +863,7 @@ mod tests {
         assert!(residency.record_commit(stale));
         let outcome = resolve_guest_cow(
             &GuestCowVenue {
+                scope: cow_scope(MM, ROOT),
                 publish_executable: None,
                 words: &arena.words(),
                 root: SubstrateGpa(ROOT),
@@ -887,7 +894,7 @@ mod tests {
     fn cow_defers_before_copying_a_leased_grant_window() {
         let (arena, memory) = forked(true);
         let pool = CowGrantPool::new();
-        pool.publish(MM, GRANT, backing()).unwrap();
+        pool.publish(cow_scope(MM, ROOT), GRANT, backing()).unwrap();
         let residency = residency_table();
         let identity = carrick_el1_abi::FrameGrantResidencyIdentity {
             mm_key: MM,
@@ -904,6 +911,7 @@ mod tests {
         let lease = residency.pin_transfer(page).unwrap();
         let words = arena.words();
         let venue = GuestCowVenue {
+            scope: cow_scope(MM, ROOT),
             publish_executable: None,
             words: &arena.words(),
             root: SubstrateGpa(ROOT),
@@ -944,7 +952,7 @@ mod tests {
             arena.leaf(EL1_COW_COPY_BASE + 4096),
         ];
         let pool = CowGrantPool::new();
-        let grant = pool.publish(MM, GRANT, backing()).unwrap();
+        let grant = pool.publish(cow_scope(MM, ROOT), GRANT, backing()).unwrap();
         let invalidations = Cell::new(0);
 
         let outcome = resolve(&arena, &memory, &pool, VA + 0x1abc, &invalidations);
@@ -1009,7 +1017,7 @@ mod tests {
             (0x0077_0000_0000 | 3 | AF | SH | NG | XN | PRIVATE | MAY_WRITE) | AP_RW_EL0,
         );
         let pool = CowGrantPool::new();
-        let grant = pool.publish(MM, GRANT, backing()).unwrap();
+        let grant = pool.publish(cow_scope(MM, ROOT), GRANT, backing()).unwrap();
         let outcome = resolve(&arena, &memory, &pool, VA + 2 * 4096, &Cell::new(0));
         assert_eq!(
             outcome,
@@ -1034,7 +1042,8 @@ mod tests {
         let (arena, memory) = forked(true);
         let before = arena.image();
         let pool = CowGrantPool::new();
-        pool.publish(MM + 1, GRANT, backing()).unwrap();
+        pool.publish(cow_scope(MM + 1, ROOT), GRANT, backing())
+            .unwrap();
         assert_eq!(
             resolve(&arena, &memory, &pool, VA, &Cell::new(0)),
             GuestCowOutcome::Declined(CowDecline::PoolEmpty)
@@ -1055,7 +1064,7 @@ mod tests {
         // intent is a SIGSEGV for the host to deliver, never a copy.
         arena.set_leaf(VA, armed(OLD, false));
         let pool = CowGrantPool::new();
-        pool.publish(MM, GRANT, backing()).unwrap();
+        pool.publish(cow_scope(MM, ROOT), GRANT, backing()).unwrap();
         let before = arena.image();
         assert_eq!(
             resolve(&arena, &memory, &pool, VA, &Cell::new(0)),
@@ -1078,7 +1087,7 @@ mod tests {
         let (arena, memory) = forked(false);
         let before = arena.image();
         let pool = CowGrantPool::new();
-        let grant = pool.publish(MM, GRANT, backing()).unwrap();
+        let grant = pool.publish(cow_scope(MM, ROOT), GRANT, backing()).unwrap();
         assert_eq!(
             resolve(&arena, &memory, &pool, VA, &Cell::new(0)),
             GuestCowOutcome::Declined(CowDecline::Refused)
@@ -1099,7 +1108,7 @@ mod tests {
             (OLD | 3 | AF | SH | NG | XN | PRIVATE | MAY_WRITE) | AP_RW_EL0,
         );
         let pool = CowGrantPool::new();
-        pool.publish(MM, GRANT, backing()).unwrap();
+        pool.publish(cow_scope(MM, ROOT), GRANT, backing()).unwrap();
         let invalidations = Cell::new(0);
         assert_eq!(
             resolve(&arena, &memory, &pool, VA, &invalidations),
@@ -1121,6 +1130,7 @@ mod tests {
             assert_eq!(ttbr0 & PA, ROOT);
             let outcome = resolve_guest_cow(
                 &GuestCowVenue {
+                    scope: cow_scope(mm_key, ttbr0 & PA),
                     publish_executable: None,
                     words: &self.arena.words(),
                     root: SubstrateGpa(ttbr0 & PA),
@@ -1168,7 +1178,7 @@ mod tests {
     fn a_guest_cow_fault_is_served_in_el1_unless_the_host_holds_the_mm() {
         let (arena, memory) = forked(true);
         let pool = CowGrantPool::new();
-        pool.publish(MM, GRANT, backing()).unwrap();
+        pool.publish(cow_scope(MM, ROOT), GRANT, backing()).unwrap();
         let mut resolver = ArenaResolver {
             arena: &arena,
             memory: &memory,
@@ -1245,7 +1255,7 @@ mod tests {
         let source = memory.page(OLD + 4096);
         let adjacent = memory.page(OLD);
         let pool = CowGrantPool::new();
-        pool.publish(MM, GRANT, backing()).unwrap();
+        pool.publish(cow_scope(MM, ROOT), GRANT, backing()).unwrap();
         assert!(matches!(
             resolve(&arena, &memory, &pool, VA + 4096, &Cell::new(0)),
             GuestCowOutcome::Resolved(_)
@@ -1262,7 +1272,7 @@ mod tests {
     fn a_failed_copy_window_restore_panics_and_does_not_forward() {
         let (arena, memory) = forked(true);
         let pool = CowGrantPool::new();
-        pool.publish(MM, GRANT, backing()).unwrap();
+        pool.publish(cow_scope(MM, ROOT), GRANT, backing()).unwrap();
 
         let open = AddressSpaces::new();
         let index = open.publish_closed(MM, ROOT | ASID, ROOT | ASID).unwrap();
@@ -1279,6 +1289,7 @@ mod tests {
                 assert_eq!(ttbr0 & PA, ROOT);
                 let outcome = resolve_guest_cow(
                     &GuestCowVenue {
+                        scope: cow_scope(mm_key, ttbr0 & PA),
                         publish_executable: None,
                         words: &self.arena.words(),
                         root: SubstrateGpa(ttbr0 & PA),
