@@ -420,7 +420,7 @@ mod kernel {
         fn restore_signal_frame(
             &mut self,
             copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
-        ) -> Result<carrick_signal_core::policy::SigBlockMask, carrick_abi::LinuxErrno> {
+        ) -> Result<carrick_personality_linux::signal::policy::SigBlockMask, carrick_abi::LinuxErrno> {
             let mut backend = carrick_el1::isa::x86::X86Backend;
             carrick_guest_arch::SignalBackend::restore_signal_frame(
                 &mut backend,
