@@ -190,7 +190,7 @@ pub fn run_prepared_kvm_pool(
         max_traps,
         Arc::clone(&stats),
         Arc::clone(&scheduler),
-    ));
+    )?);
     let pool = executor::ExecutorPool::start(
         executor::ExecutorPoolConfig {
             bound_workers: 2,
