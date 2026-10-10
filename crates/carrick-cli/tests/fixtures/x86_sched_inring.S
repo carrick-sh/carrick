@@ -1,7 +1,9 @@
 # In-ring scheduling calls and deterministic error paths.
 # Tests sched_get_priority_min/max with valid and invalid policies,
 # and sched_rr_get_interval with negative pid (-EINVAL), null pointer (-EFAULT),
-# unknown pid (-ESRCH), and valid self pid (success, tv_sec=0, tv_nsec>0).
+# unknown pid (-ESRCH), and valid self/child pids (success, tv_sec=0, 0 <= tv_nsec < 1 s).
+# The slice is scheduler-dependent: Linux 6.12 EEVDF can report zero;
+# Carrick reports the Docker reference oracle's 2 ms slice.
 # Expected stdout: S\n; expected exit: 7.
 .global _start
 .text
@@ -72,7 +74,7 @@ _start:
     cmp $-3, %rax
     jne fail
 
-    # 10. sched_rr_get_interval(0, &ts) -> 0, tv_sec=0, tv_nsec>0
+    # 10. sched_rr_get_interval(0, &ts) -> 0, tv_sec=0, 0 <= tv_nsec < 1 s
     xor %rdi, %rdi
     lea ts(%rip), %rsi
     mov $148, %rax
@@ -82,7 +84,9 @@ _start:
     cmpq $0, ts(%rip)
     jne fail
     cmpq $0, ts+8(%rip)
-    jle fail
+    jl fail
+    cmpq $1000000000, ts+8(%rip)
+    jge fail
 
     # Fork leaves a visible child (including an unreaped zombie).
     mov $57, %rax
@@ -101,7 +105,11 @@ _start:
     test %rax, %rax
     jnz fail
     cmpq $0, ts+8(%rip)
-    jle fail
+    jl fail
+    cmpq $1000000000, ts+8(%rip)
+    jge fail
+    cmpq $0, ts(%rip)
+    jne fail
     mov %r12, %rdi
     xor %rsi, %rsi
     xor %rdx, %rdx
