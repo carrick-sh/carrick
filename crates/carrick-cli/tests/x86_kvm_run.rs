@@ -301,6 +301,35 @@ fn mounted_static_x86_startup_sequence_matches_native() {
 }
 
 #[test]
+fn mounted_static_x86_set_tid_address_names_the_exit_custody_dependency() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("clear-tid-dependency");
+    compile_assembly("x86_clear_tid_dependency.S", &elf);
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .expect("run native set_tid_address oracle");
+    assert_eq!(native.status.code(), Some(7));
+    assert_eq!(native.stdout, b"T\n");
+    assert!(native.stderr.is_empty());
+    let run = run_mounted_binary(&elf, "clear-tid-dependency", false);
+    assert_eq!(
+        run.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        run.stdout, b"F\n",
+        "CPL0 must return ENOSYS until shared-cpl0-thread-exit-clear-tid closes"
+    );
+    assert!(run.stderr.is_empty());
+}
+
+#[test]
 fn mounted_static_x86_identity_eperm_matches_native() {
     compare_mounted_assembly_with_native("x86_identity_eperm.S", b"P\n");
 }
