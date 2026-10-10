@@ -127,7 +127,8 @@ impl carrick_hal::NativeFrameInventoryAdmission for NativeRootFrameAdmission {
         context: carrick_hal::guest_arch_binding::core_arch::AddressContext<
             carrick_hal::guest_arch_binding::core_arch::RootGpa,
         >,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<carrick_hal::NativeRootFrameSnapshot, Box<dyn std::error::Error + Send + Sync>>
+    {
         if context.root != self.root {
             return Err(Box::new(std::io::Error::other(
                 "native root admission physical root mismatch",
@@ -141,10 +142,9 @@ impl carrick_hal::NativeFrameInventoryAdmission for NativeRootFrameAdmission {
             .mm
             .upgrade()
             .ok_or_else(|| std::io::Error::other("native root admission MM retired"))?;
-        kernel
+        Ok(kernel
             .frame_inventory()
-            .transfer_mm_to_guest(&mm, context.into())?;
-        Ok(())
+            .transfer_mm_to_guest(&mm, context.into())?)
     }
 }
 
@@ -482,11 +482,11 @@ impl FrameInventoryAuthority {
         &self,
         mm: &super::objects::Mm,
         guest: carrick_hal::GuestFrameOwner,
-    ) -> Result<(), FrameInventoryError> {
+    ) -> Result<carrick_hal::NativeRootFrameSnapshot, FrameInventoryError> {
         let mut owner = mm.transfer_frame_owner();
         let target = FrameOwner::GuestMm(guest);
         if *owner == target {
-            return Ok(());
+            return project_guest_root_rows(&self.state.lock(), guest);
         }
         if *owner != FrameOwner::HostMm(mm.id()) {
             return Err(FrameInventoryError::FrameOwnerTransferDenied {
@@ -520,7 +520,7 @@ impl FrameInventoryAuthority {
         state.revision = next_revision;
         *owner = target;
         mm.publish_frame_owner();
-        Ok(())
+        project_guest_root_rows(&state, guest)
     }
 
     pub fn new() -> Self {
@@ -1440,6 +1440,34 @@ fn generation_error(
     }
 }
 
+fn project_guest_root_rows(
+    state: &InventoryState,
+    owner: carrick_hal::GuestFrameOwner,
+) -> Result<carrick_hal::NativeRootFrameSnapshot, FrameInventoryError> {
+    let revision =
+        NonZeroU64::new(state.revision).ok_or(FrameInventoryError::UnadmittedOwnerRevision)?;
+    let mappings = state
+        .mappings
+        .iter()
+        .filter(|(_, entry)| {
+            entry.mm == FrameOwner::GuestMm(owner) && entry.state == MappingState::Published
+        })
+        .map(|(mapping, entry)| carrick_hal::PhysicalMappingRow {
+            mapping: *mapping,
+            frame: entry.frame,
+            generation: entry.generation,
+            gpa: entry.gpa,
+            length: entry.length,
+            permissions: entry.permissions,
+        })
+        .collect();
+    Ok(carrick_hal::NativeRootFrameSnapshot {
+        owner,
+        revision,
+        mappings,
+    })
+}
+
 fn snapshot_state(state: &InventoryState, mm_filter: Option<FrameOwner>) -> FrameInventorySnapshot {
     let mut frames = Vec::with_capacity(state.frames.len());
     let mut frame_indexes = HashMap::with_capacity(state.frames.len());
@@ -1572,6 +1600,8 @@ pub enum FrameInventoryError {
     FrameOwnerTargetOccupied(FrameOwner),
     #[error("frame owner transfer context belongs to another kernel")]
     ForeignFrameOwnerContext,
+    #[error("frame owner projection has no admitted inventory revision")]
+    UnadmittedOwnerRevision,
 
     #[error("frame inventory batch is empty")]
     EmptyBatch,
@@ -3773,7 +3803,19 @@ mod physical_projection_tests {
                 .live_mapping_row(mm.id(), mapping)
                 .is_some()
         );
-        admission.admit_root(address).unwrap();
+        let admitted = admission.admit_root(address).unwrap();
+        assert_eq!(admitted.owner, address.into());
+        assert_eq!(admitted.mappings.len(), 1);
+        let selected = &admitted.mappings[0];
+        assert_eq!(selected.mapping, mapping);
+        assert_eq!(selected.frame, frame);
+        assert_eq!(selected.generation, generation);
+        assert_eq!(selected.gpa, Gpa(0x4000));
+        assert_eq!(selected.length.raw(), 4096);
+        assert_eq!(
+            admitted.revision.get(),
+            kernel.frame_inventory().snapshot().revision
+        );
         assert!(
             source
                 .bind(address.into())

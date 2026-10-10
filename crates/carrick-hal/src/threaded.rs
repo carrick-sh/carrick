@@ -2616,7 +2616,16 @@ pub trait NativeFrameInventoryAdmission: Send + Sync {
         context: crate::guest_arch_binding::core_arch::AddressContext<
             crate::guest_arch_binding::core_arch::RootGpa,
         >,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    ) -> Result<NativeRootFrameSnapshot, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// A projection of published physical rows captured with initial root custody.
+/// The canonical inventory remains the authority for subsequent point checks.
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
+pub struct NativeRootFrameSnapshot {
+    pub owner: GuestFrameOwner,
+    pub revision: std::num::NonZeroU64,
+    pub mappings: Vec<PhysicalMappingRow>,
 }
 
 pub trait PhysicalFrameInventory: Send + Sync {

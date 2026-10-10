@@ -118,6 +118,12 @@ pub fn take_fork_table_stock(
 }
 
 /// Host custody of physical table stock and pending loans for an AArch64 carrier.
+#[derive(::core::fmt::Debug)]
+struct NativeRootCustody {
+    context: AddressContext<RootGpa>,
+    frames: Option<carrick_hal::NativeRootFrameSnapshot>,
+}
+
 #[derive(Debug)]
 pub struct ForkStockHostCustody {
     pub grant_tables: Vec<RootGpa>,
@@ -128,7 +134,7 @@ pub struct ForkStockHostCustody {
     pub committed_tables: BTreeMap<u64, Vec<RootGpa>>,
     /// Address authority of committed guest-only MMs. Record rehoming does
     /// not change this generation or manufacture a host MM binding.
-    native_roots: BTreeMap<NonZeroU64, AddressContext<RootGpa>>,
+    native_roots: BTreeMap<NonZeroU64, NativeRootCustody>,
     pub retired_mms: BTreeSet<u64>,
     pub kernel_region_gpa: u64,
     pub carrier: NonZeroU64,
@@ -173,18 +179,40 @@ impl ForkStockHostCustody {
     }
 
     pub fn root(&self, mm: NonZeroU64) -> Option<AddressContext<RootGpa>> {
-        self.native_roots.get(&mm).copied()
+        self.native_roots.get(&mm).map(|root| root.context)
+    }
+
+    /// Captured row identities are a root-owned projection, not an inventory.
+    /// A physical service must recheck every selected row in the canonical source.
+    pub fn root_frames(
+        &self,
+        context: AddressContext<RootGpa>,
+    ) -> Option<&carrick_hal::NativeRootFrameSnapshot> {
+        let root = self.native_roots.get(&context.mm.raw())?;
+        (root.context == context)
+            .then_some(root.frames.as_ref())
+            .flatten()
     }
 
     pub(crate) fn register_native_root(
         &mut self,
         context: AddressContext<RootGpa>,
+        frames: carrick_hal::NativeRootFrameSnapshot,
     ) -> Result<(), ForkStockRefusal> {
+        if frames.owner != context.into() {
+            return Err(ForkStockRefusal::Stale);
+        }
         match self.native_roots.get(&context.mm.raw()) {
-            Some(current) if *current != context => Err(ForkStockRefusal::Stale),
+            Some(current) if current.context != context => Err(ForkStockRefusal::Stale),
             Some(_) => Ok(()),
             None => {
-                self.native_roots.insert(context.mm.raw(), context);
+                self.native_roots.insert(
+                    context.mm.raw(),
+                    NativeRootCustody {
+                        context,
+                        frames: Some(frames),
+                    },
+                );
                 Ok(())
             }
         }
@@ -532,7 +560,13 @@ impl ForkStockHostCustody {
                 .insert(pending.loan.request.child_mm.raw(), pending.asid_gen);
             self.committed_lifecycle
                 .insert(pending.loan.request.child_mm.raw(), pending.lifecycle);
-            self.native_roots.insert(native_mm, native_context);
+            self.native_roots.insert(
+                native_mm,
+                NativeRootCustody {
+                    context: native_context,
+                    frames: None,
+                },
+            );
 
             let unused_child: Vec<_> = pending.child_tables.drain(child_used..).collect();
             let unused_parent: Vec<_> = pending.parent_tables.drain(parent_used..).collect();
