@@ -8,6 +8,7 @@ mod aarch64_process_tests;
 pub mod common_entry;
 pub mod dispatch;
 pub mod file;
+pub mod fork_loan;
 pub mod inotify;
 pub mod ipc;
 pub mod lifecycle;

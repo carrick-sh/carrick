@@ -727,3 +727,57 @@ fn test_abort_after_stock_loan_returns_every_page_once() {
     );
     assert_eq!(crossing.total_returned_pages.load(Ordering::Acquire), 5);
 }
+
+/// A prepare that fails after the stock crossing aborts its loan, so the
+/// CPU's pending loan never strands: with the address-space table full the
+/// fork is refused, the loan returns, and the next fork after a space is
+/// released succeeds.
+#[test]
+fn failed_prepare_after_the_loan_aborts_it_and_a_later_fork_succeeds() {
+    let fixture = Fixture::new(0x10000, asid(1));
+    let words = fixture.tables.live(&fixture.maintenance);
+    let initial_stock = [
+        0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+    ];
+    let crossing = TestStockCrossing::new(&initial_stock);
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::new(1).unwrap(),
+        &crossing,
+    )
+    .with_words(&words);
+    let mut taken = Vec::new();
+    let mut mm = 100;
+    while let Some(index) = fixture.zone.spaces.publish_closed(mm, 0x4000, 0x4000) {
+        taken.push(index);
+        mm += 1;
+    }
+    let child_mm = MmGeneration::new(NonZeroU64::new(2).unwrap());
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+
+    let refused = service.prepare_mm_start(&fixture.address, parked, child_mm);
+    assert!(matches!(refused, Err(NativeProcessError::Exhausted)));
+    assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 1);
+    assert_eq!(crossing.settlements_aborted.load(Ordering::Acquire), 1);
+    assert!(crossing.pending_loan.lock().unwrap().is_none());
+    assert_eq!(
+        crossing.grant_tables.lock().unwrap().len(),
+        initial_stock.len()
+    );
+
+    fixture.zone.spaces.free(taken.pop().unwrap());
+    let start = service
+        .prepare_mm_start(&fixture.address, parked, child_mm)
+        .expect("a fork after a released space must be loaned again");
+    let published = service.prepare_mm_publish(start).expect("publish");
+    let prepared = service.prepare_mm_finish(published).expect("finish");
+    assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 2);
+    service.abort_mm(prepared).expect("abort");
+    assert_eq!(
+        crossing.grant_tables.lock().unwrap().len(),
+        initial_stock.len()
+    );
+}
