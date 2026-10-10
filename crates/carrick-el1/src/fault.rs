@@ -746,13 +746,13 @@ pub fn serve_descriptor_txns<X: DescriptorTxnApplier>(
 /// [`dispatch_fault_with_prepared`] after serving host descriptor
 /// transactions for the faulting MM.
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_fault_with_descriptor_txns<P, C, X>(
+pub fn dispatch_fault_with_descriptor_txns<'supply, P, C, X>(
     frame: &mut TrapFrame,
     counters: &Counters,
     current_tasks: &[CurrentTask],
     spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     mut txns: Option<DescriptorTxnPath<'_, X>>,
-    mailboxes: GrantMailboxes<'_>,
+    supply: impl Into<FaultSupply<'supply>>,
     prepared: Option<PreparedFaultPath<'_, P>>,
     cow_resolver: &mut C,
 ) -> Action
@@ -773,7 +773,7 @@ where
         counters,
         current_tasks,
         spaces,
-        mailboxes,
+        supply,
         prepared,
         cow_resolver,
     )
@@ -1335,12 +1335,12 @@ fn consume_served_refusals(mailboxes: GrantMailboxes<'_>, mm_key: u64, far: u64,
     }
 }
 
-pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
+pub fn dispatch_fault_with_prepared<'supply, P: PreparedPageResolver, C: CowResolver>(
     frame: &mut TrapFrame,
     counters: &Counters,
     current_tasks: &[CurrentTask],
     spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
-    mailboxes: GrantMailboxes<'_>,
+    supply: impl Into<FaultSupply<'supply>>,
     prepared: Option<PreparedFaultPath<'_, P>>,
     cow_resolver: &mut C,
 ) -> Action {
@@ -1351,7 +1351,7 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         counters,
         current_tasks.get(frame.slot as usize),
         spaces,
-        mailboxes.into(),
+        supply.into(),
         prepared,
         cow_resolver,
     )
@@ -2535,6 +2535,15 @@ mod tests {
 
     #[test]
     fn owner_cow_fault_preserves_validated_empty_pool_supply() {
+        owner_cow_fault_supply(false);
+    }
+
+    #[test]
+    fn arm_fault_adapter_preserves_native_child_cow_supply_selection() {
+        owner_cow_fault_supply(true);
+    }
+
+    fn owner_cow_fault_supply(arm_adapter: bool) {
         use crate::personality::mm_portal::test_support::{IPA, ROOT, RW, Tables, VA};
         use carrick_el1_abi::FrameGrantResidencyTable;
         use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
@@ -2602,22 +2611,39 @@ mod tests {
         let task = CurrentTask::new();
         task.mm.key.store(mm, Ordering::Release);
         assert_eq!(
-            dispatch_classified_fault(
-                0,
-                VA + 3,
-                FaultClass::WritePermission,
-                &Counters::default(),
-                Some(&task),
-                SpaceAccess::source_free(&spaces),
-                FaultSupply::Owner(&supply),
-                Some(PreparedFaultPath::<_> {
-                    residency: &residency,
-                    resolver: &mut NoopPreparedResolver,
-                    roots: Some(&roots),
-                    file_slots: None
-                }),
-                &mut EmptyCow(&tables, &pool, &residency)
-            ),
+            if arm_adapter {
+                dispatch_fault_with_prepared(
+                    &mut write_permission_fault(0, VA + 3),
+                    &Counters::default(),
+                    core::slice::from_ref(&task),
+                    SpaceAccess::source_free(&spaces),
+                    FaultSupply::Owner(&supply),
+                    Some(PreparedFaultPath::<_> {
+                        residency: &residency,
+                        resolver: &mut NoopPreparedResolver,
+                        roots: Some(&roots),
+                        file_slots: None,
+                    }),
+                    &mut EmptyCow(&tables, &pool, &residency),
+                )
+            } else {
+                dispatch_classified_fault(
+                    0,
+                    VA + 3,
+                    FaultClass::WritePermission,
+                    &Counters::default(),
+                    Some(&task),
+                    SpaceAccess::source_free(&spaces),
+                    FaultSupply::Owner(&supply),
+                    Some(PreparedFaultPath::<_> {
+                        residency: &residency,
+                        resolver: &mut NoopPreparedResolver,
+                        roots: Some(&roots),
+                        file_slots: None,
+                    }),
+                    &mut EmptyCow(&tables, &pool, &residency),
+                )
+            },
             Action::Forward
         );
         assert_eq!(supply.outcome(), OwnerFaultSupplyOutcome::CowSelected);
