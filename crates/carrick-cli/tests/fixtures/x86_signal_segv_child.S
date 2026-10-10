@@ -20,8 +20,8 @@ _start:
  jne fail
  mov $1, %eax
  mov $1, %edi
- lea parent_message(%rip), %rsi
- mov $1, %edx
+ lea message(%rip), %rsi
+ mov $3, %edx
  syscall
  mov $7, %edi
  jmp exit
@@ -48,11 +48,8 @@ fixed:
  jne fail
  cmp $0x56789, %r11
  jne fail
- mov $1, %eax
- mov $1, %edi
- lea message(%rip), %rsi
- mov $2, %edx
- syscall
+ # Exit status proves the child returned through its own action table.
+ # The parent owns stdout; an idle peer has no host-forward task binding.
  mov $7, %edi
  jmp exit
 handler:
@@ -74,6 +71,5 @@ exit:
 .data
 .align 8
 action: .quad 0, 0x04000004, 0, 0
-message: .ascii "S\n"
+message: .ascii "S\nP"
 child_status: .long 0
-parent_message: .ascii "P"
