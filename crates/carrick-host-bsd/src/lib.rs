@@ -30,5 +30,7 @@ pub mod native_glue;
 pub mod futex;
 pub use futex::{BsdFutex, make_bsd_futex};
 
+#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
 pub mod signal_backend;
+#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
 pub use signal_backend::BsdSignalGlue;
