@@ -245,7 +245,6 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                             ) {
                                 Ok(service) => service,
                                 Err(_) => {
-                                    counters.record_first_process_service_failure(ttbr0);
                                     return refuse_owner_process_call(
                                         frame,
                                         counters,
@@ -329,6 +328,20 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                     }
                 }
             }
+            let (current_record, host_record) = slot.map_or((false, false), |slot| {
+                (
+                    zone.slot(slot).current().is_some(),
+                    zone.slot(slot).host_record().is_some(),
+                )
+            });
+            counters.record_first_process_missing_entry(
+                frame.slot,
+                frame.x[8],
+                slot.is_some(),
+                current_tasks.get(frame.slot as usize).is_some(),
+                current_record,
+                host_record,
+            );
             return refuse_owner_process_call(
                 frame,
                 counters,

@@ -2509,9 +2509,10 @@ pub struct Counters {
     pub process_refusals: [AtomicU64; ProcessRefusal::COUNT],
     /// First typed ARM fork service failure, retained across a carrier run.
     pub first_native_fork_failure: AtomicU64,
-    /// First live TTBR0 root that could not read the retained process portal.
-    /// Bit zero marks a recorded failure, including a zero root.
-    pub first_process_service_root: AtomicU64,
+    /// First owner process call without an authenticated slot entry: bit 0
+    /// marks presence, bits 1-4 mark slot/task/current/host presence, bits
+    /// 16-31 hold the raw slot, and bits 32-47 the native syscall ordinal.
+    pub first_process_missing_entry: AtomicU64,
     /// First live TTBR0 root rejected by owner process admission. Bit zero
     /// marks a recorded refusal, including a zero root.
     pub first_process_admission_root: AtomicU64,
@@ -2533,7 +2534,7 @@ impl Counters {
             refused: [const { AtomicU64::new(0) }; 513],
             process_refusals: [const { AtomicU64::new(0) }; ProcessRefusal::COUNT],
             first_native_fork_failure: AtomicU64::new(0),
-            first_process_service_root: AtomicU64::new(0),
+            first_process_missing_entry: AtomicU64::new(0),
             first_process_admission_root: AtomicU64::new(0),
             native_fork_progress: [const { AtomicU64::new(0) }; NativeForkProgress::COUNT],
         }
@@ -2591,8 +2592,8 @@ impl Counters {
             self.first_native_fork_failure.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
-        snapshot.first_process_service_root.store(
-            self.first_process_service_root.load(Ordering::Relaxed),
+        snapshot.first_process_missing_entry.store(
+            self.first_process_missing_entry.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
         snapshot.first_process_admission_root.store(
@@ -2622,10 +2623,25 @@ impl Counters {
         );
     }
 
-    pub fn record_first_process_service_failure(&self, ttbr0: u64) {
-        let _ = self.first_process_service_root.compare_exchange(
+    pub fn record_first_process_missing_entry(
+        &self,
+        slot: u64,
+        ordinal: u64,
+        slot_valid: bool,
+        task_present: bool,
+        current_record: bool,
+        host_record: bool,
+    ) {
+        let packed = 1
+            | (u64::from(slot_valid) << 1)
+            | (u64::from(task_present) << 2)
+            | (u64::from(current_record) << 3)
+            | (u64::from(host_record) << 4)
+            | ((slot & 0xffff) << 16)
+            | ((ordinal & 0xffff) << 32);
+        let _ = self.first_process_missing_entry.compare_exchange(
             0,
-            ttbr0 | 1,
+            packed,
             Ordering::AcqRel,
             Ordering::Acquire,
         );
@@ -4002,16 +4018,30 @@ mod tests {
     }
 
     #[test]
-    fn first_process_service_failure_keeps_live_root() {
+    fn first_process_missing_entry_keeps_exact_call_and_slot() {
         let counters = Counters::new();
-        counters.record_first_process_service_failure(0x1000);
-        counters.record_first_process_service_failure(0x2000);
+        counters.record_first_process_missing_entry(7, 260, true, true, false, false);
+        counters.record_first_process_missing_entry(8, 94, true, true, true, false);
         assert_eq!(
             counters
                 .copy_snapshot()
-                .first_process_service_root
+                .first_process_missing_entry
                 .load(Ordering::Acquire),
-            0x1001
+            1 | (1 << 1) | (1 << 2) | (7 << 16) | (260 << 32)
+        );
+    }
+
+    #[test]
+    fn first_process_missing_entry_keeps_first_failure() {
+        let counters = Counters::new();
+        counters.record_first_process_missing_entry(1, 220, true, true, false, true);
+        counters.record_first_process_missing_entry(2, 260, true, false, false, false);
+        assert_eq!(
+            counters
+                .copy_snapshot()
+                .first_process_missing_entry
+                .load(Ordering::Acquire),
+            1 | (1 << 1) | (1 << 2) | (1 << 4) | (1 << 16) | (220 << 32)
         );
     }
 
