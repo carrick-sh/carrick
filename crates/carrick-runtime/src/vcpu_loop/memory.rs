@@ -1144,7 +1144,7 @@ mod tests {
                 0x3000,
                 0x4000,
             );
-        backend.bind_inventory(kernel, mm);
+        backend.bind_inventory(kernel, child.shared().mm().frame_owner_authority());
         backend.bind_vma_source(dispatch_mm);
         let physical_base = Gpa(0xb000);
         let physical_len = 0x4000;
@@ -1250,7 +1250,7 @@ mod tests {
                 semantic_data.start,
                 semantic_data.end,
             );
-        backend.bind_inventory(kernel, mm);
+        backend.bind_inventory(kernel, child.shared().mm().frame_owner_authority());
         let vma_source: carrick_kernel::kernel::SharedVmaSnapshotSource = dispatch_mm.clone();
         backend.bind_vma_source(vma_source);
         let (root_mapping, root_frame, _) =

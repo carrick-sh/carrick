@@ -220,6 +220,10 @@ impl PreparedExec {
     /// Exact unpublished replacement address-space identity allocated by the
     /// Kernel transaction. Replacement mappings must be applied here before
     /// authoritative exec publication.
+    pub fn replacement_frame_owner(&self) -> super::FrameOwnerAuthority {
+        self.shared.mm().frame_owner_authority()
+    }
+
     pub fn replacement_mm_id(&self) -> MmId {
         self.shared.mm().id()
     }
