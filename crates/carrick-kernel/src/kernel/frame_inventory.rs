@@ -415,6 +415,52 @@ impl<'a> InventoryOverlay<'a> {
 }
 
 impl FrameInventoryAuthority {
+    /// Transfer every mapping while retaining the same physical frame references.
+    pub(in crate::kernel) fn transfer_mm_to_guest(
+        &self,
+        mm: &super::objects::Mm,
+        guest: carrick_hal::GuestFrameOwner,
+    ) -> Result<(), FrameInventoryError> {
+        let mut owner = mm.transfer_frame_owner();
+        let target = FrameOwner::GuestMm(guest);
+        if *owner == target {
+            return Ok(());
+        }
+        if *owner != FrameOwner::HostMm(mm.id()) {
+            return Err(FrameInventoryError::FrameOwnerTransferDenied {
+                from: *owner,
+                to: target,
+            });
+        }
+        let mut state = self.state.lock();
+        if state.mm_mapping_counts.get(&target).copied().unwrap_or(0) != 0 {
+            return Err(FrameInventoryError::FrameOwnerTargetOccupied(target));
+        }
+        for entry in state.mappings.values().filter(|entry| entry.mm == *owner) {
+            if entry.state != MappingState::Published {
+                return Err(FrameInventoryError::UnpublishedMapping);
+            }
+        }
+        let next_revision = state
+            .revision
+            .checked_add(1)
+            .ok_or(FrameInventoryError::RevisionExhausted)?;
+        for entry in state
+            .mappings
+            .values_mut()
+            .filter(|entry| entry.mm == *owner)
+        {
+            entry.mm = target;
+        }
+        if let Some(count) = state.mm_mapping_counts.remove(&*owner) {
+            state.mm_mapping_counts.insert(target, count);
+        }
+        state.revision = next_revision;
+        *owner = target;
+        mm.publish_frame_owner();
+        Ok(())
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -1458,6 +1504,13 @@ pub enum FrameInventoryReserveError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum FrameInventoryError {
+    #[error("frame owner transfer from {from:?} to {to:?} is refused")]
+    FrameOwnerTransferDenied { from: FrameOwner, to: FrameOwner },
+    #[error("frame owner transfer target {0:?} already has mappings")]
+    FrameOwnerTargetOccupied(FrameOwner),
+    #[error("frame owner transfer context belongs to another kernel")]
+    ForeignFrameOwnerContext,
+
     #[error("frame inventory batch is empty")]
     EmptyBatch,
     #[error("frame inventory transaction {0:?} was not reserved by this authority")]
@@ -1726,6 +1779,82 @@ mod tests {
                 generation: generation(1),
             })
             .expect("publish");
+    }
+
+    #[test]
+    fn guest_transfer_moves_rows_and_preserves_frame_references() {
+        let fixture = Fixture::new();
+        let mm = super::super::objects::Mm::new_reference(fixture.mm1);
+        let batch = fixture.batch(4, |transaction, reservation| {
+            for address in [0x1000, 0x2000] {
+                let frame = reservation.claim_frame().unwrap();
+                let mapping = reservation.claim_mapping().unwrap();
+                prepare_publish(reservation, transaction, frame, mapping, address, 4096);
+            }
+        });
+        fixture.authority.apply(fixture.mm1, batch).unwrap();
+        let before = fixture.authority.snapshot();
+        let guest = carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::MmGeneration::new(nz(91001)),
+            root_generation: carrick_guest_arch::ContextGeneration::new(nz(7)),
+        };
+        fixture.authority.transfer_mm_to_guest(&mm, guest).unwrap();
+        assert_eq!(mm.id(), fixture.mm1);
+        assert_eq!(*mm.frame_owner(), FrameOwner::GuestMm(guest));
+        assert!(
+            fixture
+                .authority
+                .snapshot_for_mm(fixture.mm1)
+                .mappings
+                .is_empty()
+        );
+        let after = fixture
+            .authority
+            .snapshot_for_mm(FrameOwner::GuestMm(guest));
+        assert_eq!(before.frames, after.frames);
+        assert_eq!(after.mappings.len(), 2);
+        for row in &after.mappings {
+            assert_eq!(row.mm, FrameOwner::GuestMm(guest));
+            assert_eq!(fixture.authority.frame_mapping_count(row.frame), Some(1));
+            assert!(
+                before
+                    .mappings
+                    .iter()
+                    .any(|old| old.mapping == row.mapping && old.frame == row.frame)
+            );
+        }
+        let stable = fixture.authority.snapshot();
+        fixture.authority.transfer_mm_to_guest(&mm, guest).unwrap();
+        assert_eq!(fixture.authority.snapshot(), stable);
+        let stale = carrick_hal::GuestFrameOwner {
+            root_generation: carrick_guest_arch::ContextGeneration::new(nz(8)),
+            ..guest
+        };
+        assert!(fixture.authority.transfer_mm_to_guest(&mm, stale).is_err());
+        assert_eq!(fixture.authority.snapshot(), stable);
+    }
+
+    #[test]
+    fn guest_transfer_refuses_an_occupied_target_without_moving_rows() {
+        let fixture = Fixture::new();
+        let mm = super::super::objects::Mm::new_reference(fixture.mm1);
+        let guest = carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::MmGeneration::new(nz(91001)),
+            root_generation: carrick_guest_arch::ContextGeneration::new(nz(7)),
+        };
+        let batch = fixture.batch(2, |transaction, reservation| {
+            let frame = reservation.claim_frame().unwrap();
+            let mapping = reservation.claim_mapping().unwrap();
+            prepare_publish(reservation, transaction, frame, mapping, 0x1000, 4096);
+        });
+        fixture
+            .authority
+            .apply(FrameOwner::GuestMm(guest), batch)
+            .unwrap();
+        let before = fixture.authority.snapshot();
+        assert!(fixture.authority.transfer_mm_to_guest(&mm, guest).is_err());
+        assert_eq!(*mm.frame_owner(), FrameOwner::HostMm(fixture.mm1));
+        assert_eq!(fixture.authority.snapshot(), before);
     }
 
     #[test]

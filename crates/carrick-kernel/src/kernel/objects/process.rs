@@ -50,6 +50,7 @@ pub(in crate::kernel) struct MmIoStateSnapshot {
 /// ```
 pub struct Mm {
     id: MmId,
+    frame_owner: RwLock<crate::kernel::FrameOwner>,
     backend: Option<Arc<dyn MmBackend>>,
     foreign_mm_endpoint: RwLock<Option<carrick_hal::ForeignMmEndpoint>>,
     foreign_mm_mutation: RwLock<Option<crate::dispatch::mm_mutation::ForeignMmMutationAuthority>>,
@@ -69,6 +70,7 @@ impl Mm {
     pub(in crate::kernel) fn new_reference(id: MmId) -> Self {
         Self {
             id,
+            frame_owner: RwLock::new(crate::kernel::FrameOwner::HostMm(id)),
             backend: None,
             foreign_mm_endpoint: RwLock::new(None),
             foreign_mm_mutation: RwLock::new(None),
@@ -84,6 +86,7 @@ impl Mm {
     pub fn with_backend(id: MmId, backend: Arc<dyn MmBackend>) -> Self {
         Self {
             id,
+            frame_owner: RwLock::new(crate::kernel::FrameOwner::HostMm(id)),
             backend: Some(backend),
             foreign_mm_endpoint: RwLock::new(None),
             foreign_mm_mutation: RwLock::new(None),
@@ -100,6 +103,7 @@ impl Mm {
     pub(in crate::kernel) fn new_reference_for_fork(id: MmId, parent: &Self) -> Self {
         Self {
             id,
+            frame_owner: RwLock::new(crate::kernel::FrameOwner::HostMm(id)),
             backend: None,
             foreign_mm_endpoint: RwLock::new(None),
             foreign_mm_mutation: RwLock::new(None),
@@ -115,6 +119,7 @@ impl Mm {
     pub fn with_backend_for_fork(id: MmId, backend: Arc<dyn MmBackend>, parent: &Self) -> Self {
         Self {
             id,
+            frame_owner: RwLock::new(crate::kernel::FrameOwner::HostMm(id)),
             backend: Some(backend),
             foreign_mm_endpoint: RwLock::new(None),
             foreign_mm_mutation: RwLock::new(None),
@@ -251,6 +256,21 @@ impl Mm {
             legacy_aio_context_count: contexts.len(),
             next_legacy_aio_context: self.next_legacy_aio_context.load(Ordering::Relaxed),
         })
+    }
+
+    /// Hold the exact physical inventory owner across an inventory operation.
+    pub fn frame_owner(&self) -> RwLockReadGuard<'_, crate::kernel::FrameOwner> {
+        self.frame_owner.read()
+    }
+
+    pub(in crate::kernel) fn transfer_frame_owner(
+        &self,
+    ) -> RwLockWriteGuard<'_, crate::kernel::FrameOwner> {
+        self.frame_owner.write()
+    }
+
+    pub(in crate::kernel) fn publish_frame_owner(&self) {
+        self.revision.publish();
     }
 
     pub const fn id(&self) -> MmId {

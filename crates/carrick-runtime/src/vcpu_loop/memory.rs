@@ -30,10 +30,12 @@ pub(crate) fn apply_alias_frame_inventory(
     context: &carrick_kernel::kernel::KernelContext,
     commit: carrick_hal::FrameInventoryCommit<()>,
 ) -> Result<(), carrick_kernel::kernel::FrameInventoryError> {
+    let mm = context.shared().mm();
+    let owner = mm.frame_owner();
     context
         .kernel()
         .frame_inventory()
-        .apply(context.shared().mm().id(), commit)
+        .apply(*owner, commit)
         .map(|_| ())
 }
 

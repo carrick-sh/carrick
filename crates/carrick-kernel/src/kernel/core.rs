@@ -2394,6 +2394,19 @@ impl Kernel {
         &self.frame_inventory
     }
 
+    /// Change physical custody for the admitted MM without changing Linux identity.
+    pub fn transfer_frame_inventory_to_guest(
+        &self,
+        context: &KernelContext,
+        owner: carrick_hal::GuestFrameOwner,
+    ) -> Result<(), super::FrameInventoryError> {
+        if !std::ptr::eq(self, context.kernel().as_ref()) {
+            return Err(super::FrameInventoryError::ForeignFrameOwnerContext);
+        }
+        self.frame_inventory
+            .transfer_mm_to_guest(&context.shared().mm(), owner)
+    }
+
     /// Project this carrier's sole physical inventory and ID source.
     pub fn physical_frame_inventory(&self) -> Arc<dyn carrick_hal::PhysicalFrameInventory> {
         self.frame_inventory
