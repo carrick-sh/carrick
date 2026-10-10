@@ -807,3 +807,51 @@ transaction, live-descriptor or inventory authentication.
 This changes no population or work budget: one frame initialization,
 descriptor edit and publication per initial page. A forked signal wait found
 the defect when a COW write correctly refused an unowned source descriptor.
+
+## Fork live-children limit (`kernel.fork.live-children-limit`)
+
+Surface: `fork`/`vfork`/`clone` without `CLONE_VM` on the in-kernel fork
+path (HVPATCH), on both carriers. Linux authority: fork(2) fails with
+`EAGAIN` when a system-imposed limit is reached (`RLIMIT_NPROC`,
+`threads-max`, `pid_max`). Carrick adds a narrower limit, a candid
+divergence: each live fork child holds one carrier lifecycle record until
+its MM is retired and reclaimed, and the stock is fixed at boot. x86 CPL0
+has 8 records, AArch64 31 (see the
+[fork stock design](design/arm-fork-stock-crossing.md)). A workload with
+more concurrently live children than that (`make -j16`, a long shell
+pipeline) sees `EAGAIN` from the extra forks where Linux would succeed.
+Zombies do not count: a child's record returns once it has exited and left
+every slot, whether or not it was reaped.
+
+Invariant: a fork beyond the limit is refused with a counted `Capacity`
+refusal and returns `EAGAIN` (-11). It never hangs, never faults the
+carrier, never strands a loan, and never returns another errno. The limit
+counts live children, not forks: retiring one child admits the next fork.
+Every refusal is attributable in the run report's
+`execution_witness.fork_stock_families` (`capacity_refusal`, and for a
+withdrawn dirty record `inventory_refusal` with `withdrawn_lifecycle`).
+
+VM-free bindings:
+- `fork_stock::tests::kvm_live_children_beyond_lifecycle_records_are_counted_refusals`
+  (carrick-hal): eight live children, the ninth loan is one counted
+  `Capacity` refusal, and after one child is retired and reclaimed the
+  ninth loan is granted.
+- `aarch64_process_tests::capacity_refused_loan_is_eagain_with_nothing_to_settle`
+  (carrick-el1): the guest lowers the carrier's typed refusal to
+  `Exhausted`, errno -11, with no loan to settle. It was red (`EFAULT`)
+  while the guest trusted x0 over the typed reply.
+- `aarch64_process_tests::failed_prepare_after_the_loan_aborts_it_and_a_later_fork_succeeds`:
+  a refusal after the loan was granted aborts it, so later forks on the
+  CPU are not refused for capacity.
+
+KVM binding:
+`mounted_static_x86_fork_rounds_beyond_lifecycle_stock_reuse_retired_children`
+(12 sequential fork/exit rounds, each child first-touching fresh private
+pages that must read zero; native output and exit; `loan` 12,
+`returned_child` at least 4, no refusal family). The live-concurrency
+refusal itself has no mounted binding yet.
+
+Budget: a refusal does one loan crossing and no reclaim retry; reclaim
+visits each quarantined child once per loan. Signed HVF execution and
+Docker timing are not claimed by these bindings; the signed ARM fork gate
+records `withdrawn_lifecycle` and `retire_refusal` as zero.

@@ -262,7 +262,8 @@ only mechanics (address tags, grant ledger, physical page access).
   16 KiB per record, first slot unused). x86 CPL0 has **8 records** at
   metadata offset `0x88000`. A fork beyond the limit while children are
   alive is refused with a counted `Capacity` refusal (`EAGAIN`), never a
-  hang. Eight covers sequential fork/wait loops and small pipelines; it
+  hang; this divergence from Linux is the conformance contract
+  `kernel.fork.live-children-limit`. Eight covers sequential fork/wait loops and small pipelines; it
   should grow (the mapped x86 metadata window has room for about 30 records
   above the reservations table) once a workload is measured to need it.
 - **Not yet verified on KVM.** The x86 path type-checks for
