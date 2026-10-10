@@ -142,8 +142,10 @@ pub fn invoke<'a>(
     match call {
         IdentityCall::SetTidAddress => {
             let addr = args[0];
-            let tid = native.visible_tid().unwrap_or(1);
-            native.set_clear_child_tid(addr);
+            let tid = native.visible_tid()?;
+            if !native.set_clear_child_tid(addr) {
+                return None;
+            }
             Some(SyscallResult::new(i64::from(tid)))
         }
         IdentityCall::GetRobustList => {
