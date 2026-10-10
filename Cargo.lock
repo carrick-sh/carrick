@@ -895,6 +895,7 @@ dependencies = [
  "carrick-sched-core",
  "carrick-signal-linux",
  "carrick-spec",
+ "carrick-syscall-abi",
  "carrick-test-support",
  "carrick-thread",
  "carrick-timer-core",

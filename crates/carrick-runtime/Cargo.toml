@@ -66,6 +66,7 @@ platform-netbsd = ["dep:carrick-vmm-nvmm", "dep:carrick-host-bsd"]
 [dependencies]
 carrick-fatal.workspace = true
 carrick-abi = { path = "../carrick-abi" }
+carrick-syscall-abi = { path = "../carrick-syscall-abi" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-el1 = { path = "../carrick-el1" }
 carrick-personality-linux = { path = "../carrick-personality-linux" }

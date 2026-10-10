@@ -3757,7 +3757,8 @@ impl From<NsGid> for u32 {
 
 pub use carrick_syscall_abi::PollEvents;
 pub use carrick_syscall_abi::{
-    LINUX_EAGAIN, LINUX_ECHILD, LINUX_EFAULT, LINUX_EINVAL, LINUX_ENOSYS, LinuxErrno,
+    LINUX_EAGAIN, LINUX_EBADF, LINUX_ECHILD, LINUX_EFAULT, LINUX_EINVAL, LINUX_EIO, LINUX_EMFILE,
+    LINUX_ENOSYS, LinuxErrno,
 };
 
 // ===== ABI constants moved from dispatch.rs (Goal #3, pub set) =====
@@ -3766,7 +3767,6 @@ pub const LINUX_ENOENT: LinuxErrno = LinuxErrno::new(2);
 pub const LINUX_ESRCH: LinuxErrno = LinuxErrno::new(3);
 /// No such device or address — e.g. `open("/dev/tty")` with no controlling tty.
 pub const LINUX_ENXIO: LinuxErrno = LinuxErrno::new(6);
-pub const LINUX_EBADF: LinuxErrno = LinuxErrno::new(9);
 pub const LINUX_EINTR: LinuxErrno = LinuxErrno::new(4);
 /// Non-blocking `connect(2)` in progress / already in progress / completed.
 pub const LINUX_EINPROGRESS: LinuxErrno = LinuxErrno::new(115);
@@ -3814,7 +3814,6 @@ pub const LINUX_ENODATA: LinuxErrno = LinuxErrno::new(61);
 pub const LINUX_E2BIG: LinuxErrno = LinuxErrno::new(7);
 // Remaining Linux UAPI errno values (asm-generic/errno-base.h + errno.h),
 // canonical home for the `linux_errno` re-export table in dispatch/mod.rs.
-pub const LINUX_EIO: LinuxErrno = LinuxErrno::new(5);
 pub const LINUX_ENOEXEC: LinuxErrno = LinuxErrno::new(8);
 pub const LINUX_ELIBBAD: LinuxErrno = LinuxErrno::new(80);
 pub const LINUX_ENOTBLK: LinuxErrno = LinuxErrno::new(15);
@@ -3822,7 +3821,6 @@ pub const LINUX_EBUSY: LinuxErrno = LinuxErrno::new(16);
 pub const LINUX_EXDEV: LinuxErrno = LinuxErrno::new(18);
 pub const LINUX_ENODEV: LinuxErrno = LinuxErrno::new(19);
 pub const LINUX_ENFILE: LinuxErrno = LinuxErrno::new(23);
-pub const LINUX_EMFILE: LinuxErrno = LinuxErrno::new(24);
 pub const LINUX_ETXTBSY: LinuxErrno = LinuxErrno::new(26);
 pub const LINUX_ENOSPC: LinuxErrno = LinuxErrno::new(28);
 pub const LINUX_EMLINK: LinuxErrno = LinuxErrno::new(31);

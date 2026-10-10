@@ -125,9 +125,6 @@ pub trait SyscallFrame {
         self.slot().map_or(usize::MAX, SlotId::index)
     }
     fn user_sp(&self) -> Option<UserVa>;
-    fn native_ordinal(&self) -> Option<u64> {
-        None
-    }
 }
 
 /// Supervisor addresses selected by the image ISA. Offsets within the kernel

@@ -72,26 +72,18 @@ impl InitialForwardClass {
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
 pub(crate) fn classify_initial_x86_forward(
     native: carrick_abi::NativeNr,
-    args: [u64; 6],
+    _args: [u64; 6],
 ) -> InitialForwardClass {
     use InitialForwardClass::{Host, Refuse};
-    // x86_64 Linux UAPI ordinals. The native-number type prevents a
-    // canonical/aarch64 ordinal from being classified at this boundary.
-    match native.0 {
-        0 if args[0] == 0 => Host("terminal"), // read(stdin)
-        1 | 20 if args[0] == 1 || args[0] == 2 => Host("terminal"), // write/writev
-        3 if args[0] <= 2 => Host("terminal"), // close(stdio)
-        60 | 231 => Host("exit"),
-        63 => Host("system_query"), // uname
-        96 | 228 => Host("clock"),  // gettimeofday/clock_gettime
-        318 => Host("entropy"),     // getrandom
-        9 | 10 | 11 | 12 | 25 | 28 => Refuse("memory"),
-        39 | 110 | 186 | 218 => Refuse("identity"),
-        13 | 14 | 15 | 62 | 200 | 234 => Refuse("signal"),
-        56 | 57 | 58 | 61 | 202 | 247 => Refuse("task_wait"),
-        97 | 160 | 302 => Refuse("limits"),
-        _ => Refuse("unclassified"),
+    let canonical = carrick_syscall_abi::syscall_x86_64::canonical_x86_64(
+        carrick_syscall_abi::NativeNr(native.0),
+    );
+    if !canonical
+        .is_some_and(|nr| carrick_personality_linux::crossing::HostCrossingSet::X86.is_allowed(nr))
+    {
+        return Refuse("unclassified");
     }
+    Host("host_crossing")
 }
 
 #[cfg(all(test, feature = "platform-linux", target_arch = "x86_64"))]
@@ -102,22 +94,25 @@ mod initial_x86_forward_tests {
     #[test]
     fn only_explicit_host_crossings_reach_host_semantics() {
         let classify = |nr, fd| classify_initial_x86_forward(NativeNr(nr), [fd, 0, 0, 0, 0, 0]);
-        assert_eq!(classify(1, 1), InitialForwardClass::Host("terminal"));
-        assert_eq!(classify(1, 2), InitialForwardClass::Host("terminal"));
-        assert_eq!(classify(1, 3), InitialForwardClass::Refuse("unclassified"));
-        assert_eq!(classify(9, 0), InitialForwardClass::Refuse("memory"));
-        assert_eq!(classify(10, 0), InitialForwardClass::Refuse("memory"));
-        assert_eq!(classify(11, 0), InitialForwardClass::Refuse("memory"));
-        assert_eq!(classify(39, 0), InitialForwardClass::Refuse("identity"));
-        assert_eq!(classify(13, 0), InitialForwardClass::Refuse("signal"));
+        assert_eq!(classify(1, 1), InitialForwardClass::Host("host_crossing"));
+        assert_eq!(classify(1, 2), InitialForwardClass::Host("host_crossing"));
+        assert_eq!(classify(1, 3), InitialForwardClass::Host("host_crossing"));
+        assert_eq!(classify(9, 0), InitialForwardClass::Refuse("unclassified"));
+        assert_eq!(classify(10, 0), InitialForwardClass::Refuse("unclassified"));
+        assert_eq!(classify(11, 0), InitialForwardClass::Refuse("unclassified"));
+        assert_eq!(classify(39, 0), InitialForwardClass::Refuse("unclassified"));
+        assert_eq!(classify(13, 0), InitialForwardClass::Refuse("unclassified"));
         assert_eq!(classify(7, 0), InitialForwardClass::Refuse("unclassified"));
         assert_eq!(
             classify_initial_x86_forward(NativeNr(7), [0, 3, 0, 0, 0, 0]),
             InitialForwardClass::Refuse("unclassified")
         );
-        assert_eq!(classify(62, 0), InitialForwardClass::Refuse("signal"));
-        assert_eq!(classify(57, 0), InitialForwardClass::Refuse("task_wait"));
-        assert_eq!(classify(160, 0), InitialForwardClass::Refuse("limits"));
+        assert_eq!(classify(62, 0), InitialForwardClass::Refuse("unclassified"));
+        assert_eq!(classify(57, 0), InitialForwardClass::Refuse("unclassified"));
+        assert_eq!(
+            classify(160, 0),
+            InitialForwardClass::Refuse("unclassified")
+        );
         assert_eq!(
             classify(999, 0),
             InitialForwardClass::Refuse("unclassified")
@@ -1191,7 +1186,7 @@ impl PreparedRun {
         // (`.semgrep/typed-domains.yml::no-cfg-not-platform-macos`).
         #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
         let run = if backend == ExecutionBackend::KvmX86Cpl0 {
-            let mut dispatcher = dispatcher;
+            let dispatcher = dispatcher;
             let _ = (
                 &debug_state_path,
                 &root,

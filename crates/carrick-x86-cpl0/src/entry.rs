@@ -379,6 +379,7 @@ mod kernel {
         call: carrick_personality_linux::entry::CanonicalCall,
         publications: &'a core::sync::atomic::AtomicU64,
         slot: Option<carrick_guest_arch::SlotId>,
+        file_table: u64,
     }
 
     impl SyscallFrame for NativeDispatch<'_> {
@@ -391,7 +392,6 @@ mod kernel {
         // this call projects only the authenticated current task as a slice.
         fn task_index(&self) -> usize { if self.slot.is_some() { 0 } else { usize::MAX } }
         fn user_sp(&self) -> Option<UserVa> { Some(self.call.stack) }
-        fn native_ordinal(&self) -> Option<u64> { Some(self.call.native.raw()) }
     }
     impl dispatch::GuestDispatchFrame for NativeDispatch<'_> {
         fn native_number(&self) -> carrick_guest_arch::NativeOrdinal { self.call.native }
@@ -400,7 +400,35 @@ mod kernel {
         }
 
         fn may_serve_descriptor(&self) -> bool {
-            matches!(self.call.native.raw(), 3 | 32 | 33 | 292)
+            [
+                carrick_personality_linux::crossing::nr::CLOSE,
+                carrick_personality_linux::crossing::nr::DUP,
+                carrick_personality_linux::crossing::nr::DUP3,
+            ]
+            .contains(&carrick_syscall_abi::CanonicalNr(self.call.canonical.raw()))
+                || self.call.canonical.raw() == carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2
+        }
+        fn preflight_host_crossing(&mut self, ordinal: u64) -> bool {
+            let read = ordinal == carrick_personality_linux::crossing::nr::READ.raw();
+            let stdio_call = read || [
+                carrick_personality_linux::crossing::nr::WRITE,
+                carrick_personality_linux::crossing::nr::LSEEK,
+                carrick_personality_linux::crossing::nr::PREAD64,
+                carrick_personality_linux::crossing::nr::PWRITE64,
+            ].iter().any(|nr| nr.raw() == ordinal);
+            let guest_fd = self.call.args[0] as i32;
+            if !stdio_call || !(0..=2).contains(&guest_fd) {
+                return true;
+            }
+            let binding = carrick_el1_abi::fd_map_lookup(fd_map(), self.file_table, guest_fd)
+                .and_then(|(handle, _)| handle.checked_sub(1))
+                .and_then(|index| OPEN_TABLE.get(index as usize))
+                .and_then(DelegatedOpenFile::host_object);
+            if binding.is_none() || (read && binding.is_some_and(|binding| binding.stdio_fd() != Some(guest_fd))) {
+                self.frame.rax = carrick_syscall_abi::LINUX_EBADF.guest_retval() as u64;
+                return false;
+            }
+            true
         }
         fn release_host_object(&mut self, binding: carrick_el1_abi::HostObjectBinding, handle: u32, incarnation: u64) -> bool {
             let saved = (self.frame.rax, self.frame.rdi, self.frame.rsi, self.frame.rdx, self.frame.rcx);
@@ -1944,6 +1972,7 @@ mod kernel {
                 let mut native = NativeDispatch {
                     frame, call, publications: &binding.publications,
                     slot: carrick_guest_arch::SlotId::from_index(binding.cpu_slot as usize),
+                    file_table: task.linux.file_table.load(Ordering::Acquire).max(1),
                 };
                 match carrick_x86_cpl0::production_boundary(dispatch::dispatch_syscall_with_lifecycle(
                     &mut native, counters, core::slice::from_ref(task),
@@ -1978,6 +2007,7 @@ mod kernel {
                     let mut native = NativeDispatch {
                         frame, call, publications: &binding.publications,
                         slot: carrick_guest_arch::SlotId::from_index(binding.cpu_slot as usize),
+                        file_table,
                     };
                     let route = dispatch::dispatch_syscall_with_native(
                         &mut native, counters, core::slice::from_ref(task),
@@ -2019,14 +2049,21 @@ mod kernel {
                 }
                 CompletionRoute::Forward => {
                     let mut handled_in_ring = false;
-                    if matches!(call.native.raw(), 0 | 1 | 8 | 17 | 18) {
+                    if [
+                        carrick_personality_linux::crossing::nr::READ,
+                        carrick_personality_linux::crossing::nr::WRITE,
+                        carrick_personality_linux::crossing::nr::LSEEK,
+                        carrick_personality_linux::crossing::nr::PREAD64,
+                        carrick_personality_linux::crossing::nr::PWRITE64,
+                    ]
+                    .contains(&carrick_syscall_abi::CanonicalNr(call.canonical.raw())) {
                         let table = task.linux.file_table.load(Ordering::Acquire).max(1);
                         let guest_fd = call.args[0] as i32;
                         let binding = carrick_el1_abi::fd_map_lookup(fd_map(), table, guest_fd)
                             .and_then(|(handle, _)| handle.checked_sub(1))
                             .and_then(|index| OPEN_TABLE.get(index as usize))
                             .and_then(DelegatedOpenFile::host_object);
-                        if call.native.raw() == 1 && let Some(binding) = binding
+                        if call.canonical.raw() == carrick_personality_linux::crossing::nr::WRITE.raw() && let Some(binding) = binding
                             && binding.stdio_fd() != Some(guest_fd) {
                             let saved = (frame.rax, frame.rdi, frame.rcx);
                             frame.rax = carrick_el1_abi::HostObjectWriteCrossing::NUMBER;
@@ -2036,6 +2073,23 @@ mod kernel {
                             let result = frame.rax;
                             (frame.rdi, frame.rcx) = (saved.1, saved.2);
                             frame.rax = result;
+                            handled_in_ring = true;
+                        }
+                        let positional = [
+                            carrick_personality_linux::crossing::nr::LSEEK,
+                            carrick_personality_linux::crossing::nr::PREAD64,
+                            carrick_personality_linux::crossing::nr::PWRITE64,
+                        ]
+                        .contains(&carrick_syscall_abi::CanonicalNr(call.canonical.raw()));
+                        if !handled_in_ring && positional && (0..=2).contains(&guest_fd)
+                            && let Some(host_fd) = binding.and_then(|binding| {
+                                binding.stdio_fd().or_else(|| binding.host_fd().map(|fd| fd.raw()))
+                            })
+                            && host_fd != guest_fd {
+                            let saved_fd = frame.rdi;
+                            frame.rdi = host_fd as u64;
+                            doorbell(FORWARD_PORT, frame);
+                            frame.rdi = saved_fd;
                             handled_in_ring = true;
                         }
                         if !handled_in_ring && (0..=2).contains(&guest_fd)

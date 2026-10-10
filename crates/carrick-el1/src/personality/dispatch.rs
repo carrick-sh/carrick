@@ -61,6 +61,7 @@ pub trait GuestDispatchFrame: SyscallFrame {
             carrick_personality_linux::crossing::HostCrossingSet::X86 => true,
             carrick_personality_linux::crossing::HostCrossingSet::Aarch64 => arm_policy(),
         }
+    }
     /// Whether this native call has the poll argument contract.
     fn may_serve_poll(&self) -> bool {
         false
@@ -70,6 +71,9 @@ pub trait GuestDispatchFrame: SyscallFrame {
     }
     fn may_serve_descriptor(&self) -> bool {
         false
+    }
+    fn preflight_host_crossing(&mut self, _ordinal: u64) -> bool {
+        true
     }
     fn release_host_object(
         &mut self,
@@ -884,15 +888,17 @@ impl<
         let ordinal = self.frame.canonical_ordinal().raw();
         let old = self.frame.argument(0).unwrap_or(0) as i32;
         let result = match ordinal {
-            23 => super::file_table::dup_host_binding(
-                self.fd_map,
-                file_table,
-                old,
-                0,
-                super::file_table::GUEST_FD_LIMIT,
-                false,
-            ),
-            24 => {
+            nr if nr == carrick_personality_linux::crossing::nr::DUP.raw() => {
+                super::file_table::dup_host_binding(
+                    self.fd_map,
+                    file_table,
+                    old,
+                    0,
+                    super::file_table::GUEST_FD_LIMIT,
+                    false,
+                )
+            }
+            nr if nr == carrick_personality_linux::crossing::nr::DUP3.raw() => {
                 let new = self.frame.argument(1).unwrap_or(0) as i32;
                 let flags = self.frame.argument(2).unwrap_or(0);
                 if flags & !carrick_syscall_abi::LINUX_O_CLOEXEC != 0 || old == new {
@@ -906,11 +912,15 @@ impl<
                 let new = self.frame.argument(1).unwrap_or(0) as i32;
                 super::file_table::dup2_host_binding(self.fd_map, file_table, old, new, false)
             }
-            57 => super::file_table::close_host_binding(self.fd_map, file_table, old),
+            nr if nr == carrick_personality_linux::crossing::nr::CLOSE.raw() => {
+                super::file_table::close_host_binding(self.fd_map, file_table, old)
+            }
             _ => return FamilyCompletion::Forward,
         };
         let Some(change) = result else {
-            let errno = if ordinal == 23 && fd_map_lookup(self.fd_map, file_table, old).is_some() {
+            let errno = if ordinal == carrick_personality_linux::crossing::nr::DUP.raw()
+                && fd_map_lookup(self.fd_map, file_table, old).is_some()
+            {
                 carrick_syscall_abi::LINUX_EMFILE
             } else {
                 carrick_syscall_abi::LINUX_EBADF
@@ -929,11 +939,13 @@ impl<
                 return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EIO.guest_retval());
             }
         }
-        FamilyCompletion::Complete(if ordinal == 57 {
-            0
-        } else {
-            i64::from(change.fd)
-        })
+        FamilyCompletion::Complete(
+            if ordinal == carrick_personality_linux::crossing::nr::CLOSE.raw() {
+                0
+            } else {
+                i64::from(change.fd)
+            },
+        )
     }
     fn original_argument0(&self) -> u64 {
         self.frame.argument(0).unwrap_or(0)
@@ -965,6 +977,9 @@ impl<
         Some(carrick_personality_linux::crossing::NativeNr(
             self.frame.native_number().raw(),
         ))
+    }
+    fn preflight_host_crossing(&mut self, ordinal: u64) -> bool {
+        self.frame.preflight_host_crossing(ordinal)
     }
     fn refused_counters(&self) -> Option<&'a [core::sync::atomic::AtomicU64]> {
         Some(&self.counters.refused)
