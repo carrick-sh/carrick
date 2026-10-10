@@ -381,6 +381,8 @@ struct Graph<'a, M: Clone, C: ProcessContext> {
 pub struct NativeProcessRuntime<'a, M: Clone, C: ProcessContext> {
     graph: SpinLock<Graph<'a, M, C>>,
     zone: &'a ZoneTables<C>,
+    #[cfg(test)]
+    signal_check_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
 }
 pub struct NativeRecordBinding<M, C: ProcessContext> {
     pub key: TaskKey,
@@ -614,6 +616,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 uts,
             }),
             zone: source.zone,
+            #[cfg(test)]
+            signal_check_hook: SpinLock::new(None),
         })
     }
     pub fn enter<'r, S: NativeProcessService<'a, C, Mm = M>>(
@@ -3190,6 +3194,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .map_err(|_| carrick_personality_linux::abi::signal::LINUX_ESRCH)?;
             let resources = row.native().resources();
             let signals = resources.signals();
+            let channel = resources
+                .channel
+                .clone()
+                .ok_or(carrick_personality_linux::abi::signal::LINUX_ESRCH)?;
+            let generation = channel.generation.generation();
             if let Some((signal, payload)) = signals.take_timedwait(self.record, set) {
                 return Ok(SignalWaitOutcome::Ready(signal, payload));
             }
@@ -3202,11 +3211,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             if signals.has_deliverable(self.record, blocked) {
                 return Err(carrick_personality_linux::abi::signal::LINUX_EINTR);
             }
-            let channel = resources
-                .channel
-                .clone()
-                .ok_or(carrick_personality_linux::abi::signal::LINUX_ESRCH)?;
-            let generation = channel.generation.generation();
+            #[cfg(test)]
+            if let Some(hook) = self.runtime.signal_check_hook.lock().take() {
+                hook();
+            }
             drop(graph);
             if deadline.is_none() {
                 deadline = timeout_ns
@@ -3254,7 +3262,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .task(self.key)
                 .map_err(|_| carrick_personality_linux::abi::signal::LINUX_ESRCH)?;
             let signals = row.native().resources().signals();
-            let available = signals.has_deliverable(self.record, mask);
             let channel = row
                 .native()
                 .resources()
@@ -3262,6 +3269,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .clone()
                 .ok_or(carrick_personality_linux::abi::signal::LINUX_ESRCH)?;
             let generation = channel.generation.generation();
+            let available = signals.has_deliverable(self.record, mask);
+            #[cfg(test)]
+            if let Some(hook) = self.runtime.signal_check_hook.lock().take() {
+                hook();
+            }
             drop(graph);
             if available {
                 return Ok(false);
@@ -3780,6 +3792,72 @@ mod tests {
         assert!(
             matches!(result, LifecycleOutcome::Returned { result, .. } if result.raw() == 10),
             "a signal published after the queue check must prevent re-parking"
+        );
+        drop(entry);
+        let (signals, channel, key) = {
+            let graph = runtime.graph.lock();
+            let row = graph.owner.task(graph.root_key).unwrap();
+            (
+                row.native().resources().signals().clone(),
+                row.native().resources().channel.clone().unwrap(),
+                row.key(),
+            )
+        };
+        *runtime.signal_check_hook.lock() = Some(Box::new(move || {
+            signals
+                .enqueue(
+                    key,
+                    carrick_signal_core::policy::Signal::from_number(10).unwrap(),
+                    None,
+                )
+                .unwrap();
+            channel.generation.publish().unwrap();
+        }));
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        assert!(
+            matches!(entry.rt_sigtimedwait(set, Some(1000), UserVa::new(0)),
+            Ok(SignalWaitOutcome::Ready(signal, _)) if signal.number() == 10),
+            "publication after the initial pending check must not become the park generation"
+        );
+        drop(entry);
+        let (signals, channel, key) = {
+            let graph = runtime.graph.lock();
+            let row = graph.owner.task(graph.root_key).unwrap();
+            (
+                row.native().resources().signals().clone(),
+                row.native().resources().channel.clone().unwrap(),
+                row.key(),
+            )
+        };
+        let usr1 = carrick_signal_core::policy::Signal::from_number(10).unwrap();
+        signals
+            .install_action(
+                key,
+                usr1,
+                carrick_signal_core::policy::Action {
+                    disposition: carrick_signal_core::policy::Disposition::Handler(
+                        carrick_signal_core::policy::HandlerAddress(0x4000),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        *runtime.signal_check_hook.lock() = Some(Box::new(move || {
+            signals.enqueue(key, usr1, None).unwrap();
+            channel.generation.publish().unwrap();
+        }));
+        let mut entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        assert_eq!(
+            entry.rt_sigsuspend(
+                carrick_signal_core::policy::SigBlockMask::NONE,
+                carrick_signal_core::policy::SigBlockMask::NONE
+            ),
+            Ok(false),
+            "suspend must also retry a publication after its initial pending check"
         );
     }
 
