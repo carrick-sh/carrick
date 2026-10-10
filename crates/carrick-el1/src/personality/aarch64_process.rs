@@ -39,6 +39,25 @@ use crate::memory::reservations::{NativeReservationGeometry, SharedReservations}
 
 pub type Mm = AddressContext<RootGpa>;
 
+#[repr(u64)]
+enum AdmissionStage {
+    Lifecycle = 1,
+    ObservedAddress = 2,
+    Group = 3,
+    Thread = 4,
+    FreshRoot = 5,
+    RootRegistry = 6,
+}
+
+fn admission_error(
+    counters: &carrick_el1_abi::Counters,
+    stage: AdmissionStage,
+    error: NativeProcessError,
+) -> NativeProcessError {
+    counters.record_first_process_admission_stage(stage as u64);
+    error
+}
+
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 struct CurrentMmMaintenance;
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -150,18 +169,43 @@ pub fn admit_entry(
     native: &carrick_sched_core::ThreadCtx,
     ttbr0: u64,
     record_incarnation: u64,
+    counters: &carrick_el1_abi::Counters,
 ) -> Result<(Arc<Runtime>, Mm, Box<Aarch64ParkedContext>), NativeProcessError> {
-    let (page, control) = task.lifecycle_refs().ok_or(NativeProcessError::Stale)?;
+    let (page, control) = task.lifecycle_refs().ok_or_else(|| {
+        admission_error(
+            counters,
+            AdmissionStage::Lifecycle,
+            NativeProcessError::Stale,
+        )
+    })?;
     let observed = Mm {
-        root: RootGpa::page_aligned(FrameGpa::new(ttbr0 & AARCH64_ROOT_ADDRESS_MASK))
-            .ok_or(NativeProcessError::Stale)?,
+        root: RootGpa::page_aligned(FrameGpa::new(ttbr0 & AARCH64_ROOT_ADDRESS_MASK)).ok_or_else(
+            || {
+                admission_error(
+                    counters,
+                    AdmissionStage::ObservedAddress,
+                    NativeProcessError::Stale,
+                )
+            },
+        )?,
         mm: MmGeneration::new(
-            NonZeroU64::new(task.mm.key.load(Ordering::Acquire))
-                .ok_or(NativeProcessError::Stale)?,
+            NonZeroU64::new(task.mm.key.load(Ordering::Acquire)).ok_or_else(|| {
+                admission_error(
+                    counters,
+                    AdmissionStage::ObservedAddress,
+                    NativeProcessError::Stale,
+                )
+            })?,
         ),
-        generation: ContextGeneration::new(
-            NonZeroU64::new(record_incarnation).ok_or(NativeProcessError::Stale)?,
-        ),
+        generation: ContextGeneration::new(NonZeroU64::new(record_incarnation).ok_or_else(
+            || {
+                admission_error(
+                    counters,
+                    AdmissionStage::ObservedAddress,
+                    NativeProcessError::Stale,
+                )
+            },
+        )?),
     };
     let address = if control.entry().is_some() {
         REGISTRY
@@ -169,9 +213,13 @@ pub fn admit_entry(
                 source.zone,
                 observed,
                 page,
-                task.visible_pid().ok_or(NativeProcessError::Stale)?,
+                task.visible_pid().ok_or_else(|| {
+                    admission_error(counters, AdmissionStage::Group, NativeProcessError::Stale)
+                })?,
             )
-            .ok_or(NativeProcessError::Stale)?
+            .ok_or_else(|| {
+                admission_error(counters, AdmissionStage::Group, NativeProcessError::Stale)
+            })?
     } else {
         observed
     };
@@ -188,13 +236,20 @@ pub fn admit_entry(
         return Ok((runtime, address, words));
     }
     if control.entry().is_some() {
-        let runtime = REGISTRY.register_thread(source, task, address, page, control)?;
+        let runtime = REGISTRY
+            .register_thread(source, task, address, page, control)
+            .map_err(|error| admission_error(counters, AdmissionStage::Thread, error))?;
         return Ok((runtime, address, words));
     }
-    let runtime = Arc::new(NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
-        source, task, page, control, address, address, *words,
-    )?);
-    REGISTRY.register_root(runtime.clone(), source, task, address)?;
+    let runtime = Arc::new(
+        NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+            source, task, page, control, address, address, *words,
+        )
+        .map_err(|error| admission_error(counters, AdmissionStage::FreshRoot, error))?,
+    );
+    REGISTRY
+        .register_root(runtime.clone(), source, task, address)
+        .map_err(|error| admission_error(counters, AdmissionStage::RootRegistry, error))?;
     Ok((runtime, address, words))
 }
 

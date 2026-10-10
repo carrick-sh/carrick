@@ -2516,6 +2516,8 @@ pub struct Counters {
     /// First live TTBR0 root rejected by owner process admission. Bit zero
     /// marks a recorded refusal, including a zero root.
     pub first_process_admission_root: AtomicU64,
+    /// First ARM admission stage that actually failed (see `admit_entry`).
+    pub first_process_admission_stage: AtomicU64,
     /// Completed milestones of owner-served ARM forks.
     pub native_fork_progress: [AtomicU64; NativeForkProgress::COUNT],
 }
@@ -2536,6 +2538,7 @@ impl Counters {
             first_native_fork_failure: AtomicU64::new(0),
             first_process_missing_entry: AtomicU64::new(0),
             first_process_admission_root: AtomicU64::new(0),
+            first_process_admission_stage: AtomicU64::new(0),
             native_fork_progress: [const { AtomicU64::new(0) }; NativeForkProgress::COUNT],
         }
     }
@@ -2600,6 +2603,10 @@ impl Counters {
             self.first_process_admission_root.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
+        snapshot.first_process_admission_stage.store(
+            self.first_process_admission_stage.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         for (target, source) in snapshot
             .native_fork_progress
             .iter()
@@ -2651,6 +2658,15 @@ impl Counters {
         let _ = self.first_process_admission_root.compare_exchange(
             0,
             ttbr0 | 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    pub fn record_first_process_admission_stage(&self, stage: u64) {
+        let _ = self.first_process_admission_stage.compare_exchange(
+            0,
+            stage,
             Ordering::AcqRel,
             Ordering::Acquire,
         );
@@ -3997,9 +4013,9 @@ const _: () = {
     );
 };
 #[cfg(target_arch = "aarch64")]
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0xdd5b_c4e6_6a12_434e);
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0xf80e_a375_83e4_ba96);
 #[cfg(not(target_arch = "aarch64"))]
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x5599_5d93_e755_db32);
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x088b_6e7e_d7d1_e8da);
 
 #[cfg(test)]
 mod tests {
@@ -4014,6 +4030,20 @@ mod tests {
                 .first_process_admission_root
                 .load(Ordering::Acquire),
             1
+        );
+    }
+
+    #[test]
+    fn first_process_admission_stage_keeps_first_failure() {
+        let counters = Counters::new();
+        counters.record_first_process_admission_stage(5);
+        counters.record_first_process_admission_stage(6);
+        let snapshot = counters.copy_snapshot();
+        assert_eq!(
+            snapshot
+                .first_process_admission_stage
+                .load(Ordering::Relaxed),
+            5
         );
     }
 
@@ -4227,13 +4257,13 @@ mod tests {
                 + AnonymousLeave::COUNT
                 + 513
                 + ProcessRefusal::COUNT
-                + 3
+                + 4
                 + NativeForkProgress::COUNT)
                 * 8
         );
         assert_eq!(
             core::mem::offset_of!(Counters, first_native_fork_failure),
-            core::mem::size_of::<Counters>() - (NativeForkProgress::COUNT + 3) * 8
+            core::mem::size_of::<Counters>() - (NativeForkProgress::COUNT + 4) * 8
         );
         assert_eq!(core::mem::offset_of!(Counters, served), 0);
         assert_eq!(core::mem::offset_of!(Counters, forwarded), 512 * 8);

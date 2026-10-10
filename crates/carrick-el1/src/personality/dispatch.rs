@@ -237,6 +237,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                         &saved.native,
                         ttbr0,
                         zone.record(record).incarnation(),
+                        counters,
                     );
                     if let Ok((runtime, address, words)) = admission {
                         let mut service =
