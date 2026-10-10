@@ -9,6 +9,7 @@ use carrick_el1::memory::reservations::{
 };
 use carrick_el1::personality::mm_portal::production::GuestMetadataPin;
 use carrick_el1::personality::mm_portal::{LinuxForkPolicy, NativeForkPortal, UnpublishedEl1Child};
+use carrick_el1::personality::retired_spaces::{RetiredSpace, RetiredSpaces};
 use carrick_el1::personality::native_process_runtime::{
     NativeForkPreparation, NativeLifecycleResources, NativeProcessError, NativeProcessRegistry,
     NativeProcessRuntime, NativeProcessService,
@@ -32,48 +33,18 @@ type Runtime = NativeProcessRuntime<'static, Mm, ParkedContextWords>;
 static REGISTRY: NativeProcessRegistry<'static, Mm, ParkedContextWords> =
     NativeProcessRegistry::new();
 
-/// Retired child MMs whose space entry and reservation root still wait for
-/// every zone slot to leave them (the same protocol as the AArch64 owner).
-static RETIRED_SPACES: carrick_el1::lock::SpinLock<Vec<Mm>> =
-    carrick_el1::lock::SpinLock::new(Vec::new());
-
-fn space_has_resident_slot(zone: &ZoneTables<ParkedContextWords>, mm: Mm) -> bool {
-    (0..carrick_el1::isa::x86::context::native::CPL0_CPU_COUNT).any(|slot| {
-        SlotId::from_index(slot).is_some_and(|slot| zone.installed_space(slot) == mm.mm.raw().get())
-    })
-}
-
-/// Retire the closed child's reservation root (tree nodes, notifications)
-/// and free its exact space entry so both indices can be reused.
-fn retire_closed_space(owner: &Portal, mm: Mm, worker: u32) -> Result<(), NativeProcessError> {
-    let key = ReservationMm::new(mm.mm.raw().get()).ok_or(NativeProcessError::Stale)?;
-    let index = owner
-        .spaces
-        .find(key.raw())
-        .ok_or(NativeProcessError::Stale)?;
-    owner.spaces.close(index);
-    owner
-        .root_any(key, worker)
-        .map_err(|_| NativeProcessError::Stale)?
-        .retire()
-        .map_err(|_| NativeProcessError::Busy)?;
-    owner.spaces.free(index);
-    Ok(())
-}
+/// Closed child spaces awaiting retirement (the protocol shared with the
+/// AArch64 owner).
+static RETIRED_SPACES: RetiredSpaces = RetiredSpaces::new();
 
 fn drain_retired_spaces(owner: &Portal, worker: u32) -> Result<(), NativeProcessError> {
     let zone = owner.zone.ok_or(NativeProcessError::Stale)?;
-    let pending = core::mem::take(&mut *RETIRED_SPACES.lock());
-    let mut deferred = Vec::new();
-    for mm in pending {
-        if space_has_resident_slot(zone, mm) {
-            deferred.push(mm);
-        } else {
-            retire_closed_space(owner, mm, worker)?;
-        }
-    }
-    RETIRED_SPACES.lock().extend(deferred);
-    Ok(())
+    RETIRED_SPACES.drain_portal(
+        owner,
+        zone,
+        carrick_el1::isa::x86::context::native::CPL0_CPU_COUNT,
+        worker,
+    )
 }
 
 pub(super) fn registry() -> &'static NativeProcessRegistry<'static, Mm, ParkedContextWords> {
@@ -652,7 +623,13 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         if !super::native_execution::leave_space(source) {
             fatal();
         }
-        RETIRED_SPACES.lock().push(mm);
+        let roots = core::ptr::from_ref(owner.roots).addr();
+        RETIRED_SPACES.push(RetiredSpace {
+            carrier: owner.carrier,
+            zone: core::ptr::from_ref(source.zone).addr(),
+            roots,
+            mm: ReservationMm::new(mm.mm.raw().get()).unwrap_or_else(|| fatal()),
+        });
         if drain_retired_spaces(&owner, self.worker()).is_err() {
             fatal();
         }
