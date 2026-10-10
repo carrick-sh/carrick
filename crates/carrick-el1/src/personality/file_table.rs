@@ -629,11 +629,19 @@ mod tests {
                 .expect("host binding");
             let mut pfd = libc::pollfd {
                 fd,
-                events: entry.events,
+                // macOS reports HUP on a closed pipe only when the host poll
+                // requests read interest. Keep the guest's zero events when
+                // copying the host observation back into the Linux resolver.
+                events: if entry.events == 0 {
+                    libc::POLLIN
+                } else {
+                    entry.events
+                },
                 revents: 0,
             };
             assert!(unsafe { libc::poll(&mut pfd, 1, 0) } >= 0);
-            entry.revents = pfd.revents;
+            entry.revents =
+                pfd.revents & (entry.events | LINUX_POLLERR | LINUX_POLLHUP | LINUX_POLLNVAL);
         }
         resolve_poll_with_host_readiness(
             fd_map,
