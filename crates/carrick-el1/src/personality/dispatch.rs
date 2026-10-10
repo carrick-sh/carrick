@@ -980,6 +980,17 @@ impl<
             .get(self.frame.task_index())
             .and_then(|t| t.visible_pid())
     }
+    fn pid_exists(&self, pid: u32) -> Option<bool> {
+        if self.current_pid() == Some(pid) {
+            return Some(true);
+        }
+        let binding = carrick_personality_linux::lifecycle::LifecycleNative::binding(self)?;
+        let process = self.process.as_deref()?;
+        if process.binding() != binding {
+            return None;
+        }
+        process.pid_exists(pid)
+    }
     fn copy_out(&mut self, dst: carrick_guest_arch::UserVa, src: &[u8]) -> bool {
         #[cfg(test)]
         if let Some(user) = &mut self.lifecycle_user {
