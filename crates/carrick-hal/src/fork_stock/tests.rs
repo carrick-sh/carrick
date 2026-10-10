@@ -699,7 +699,7 @@ impl ChildAddressTags for FlakyTags {
             Ok(())
         }
     }
-    fn retire(&mut self, (): (), _: SlotAbsence) -> Result<(), ForkStockServiceError> {
+    fn retire(&mut self, _: ChildTag<()>, _: SlotAbsence) -> Result<(), ForkStockServiceError> {
         if self.fail_retire_once.replace(false) {
             Err(ForkStockServiceError::InvalidRecord)
         } else {

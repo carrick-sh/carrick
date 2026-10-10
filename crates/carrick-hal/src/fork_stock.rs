@@ -85,8 +85,39 @@ pub trait ChildAddressTags {
     /// Retire a published tag. `absence` proves no slot still has the MM
     /// installed, which (installers invalidate before publishing absence)
     /// is the TLB-invalidation acknowledgement for its tag.
-    fn retire(&mut self, tag: Self::Tag, absence: SlotAbsence)
-    -> Result<(), ForkStockServiceError>;
+    fn retire(
+        &mut self,
+        tag: ChildTag<Self::Tag>,
+        absence: SlotAbsence,
+    ) -> Result<(), ForkStockServiceError>;
+}
+
+/// A child's address tag bound to the MM it was committed for. Only the
+/// stock mints one (at commit), so an absence proof for one MM can never
+/// retire the tag of another.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChildTag<T> {
+    tag: T,
+    mm: ReservationMm,
+}
+
+impl<T: Copy> ChildTag<T> {
+    pub(crate) fn bind(tag: T, mm: ReservationMm) -> Self {
+        Self { tag, mm }
+    }
+
+    pub fn tag(&self) -> T {
+        self.tag
+    }
+
+    pub fn mm(&self) -> ReservationMm {
+        self.mm
+    }
+
+    /// The tag, when `absence` proves this tag's own MM absent.
+    pub fn discharged_by(&self, absence: &SlotAbsence) -> Option<T> {
+        (absence.mm() == self.mm).then_some(self.tag)
+    }
 }
 
 impl ChildAddressTags for AsidAllocator {
@@ -106,7 +137,7 @@ impl ChildAddressTags for AsidAllocator {
 
     fn retire(
         &mut self,
-        tag: AsidGeneration,
+        tag: ChildTag<AsidGeneration>,
         absence: SlotAbsence,
     ) -> Result<(), ForkStockServiceError> {
         self.retire_absent(tag, absence)
@@ -134,8 +165,13 @@ impl ChildAddressTags for UntaggedRoots {
         Ok(())
     }
 
-    fn retire(&mut self, (): (), _: SlotAbsence) -> Result<(), ForkStockServiceError> {
-        Ok(())
+    fn retire(
+        &mut self,
+        tag: ChildTag<()>,
+        absence: SlotAbsence,
+    ) -> Result<(), ForkStockServiceError> {
+        tag.discharged_by(&absence)
+            .ok_or(ForkStockServiceError::InvalidRecord)
     }
 }
 
@@ -333,7 +369,7 @@ pub struct PendingForkLoan<T> {
 struct CommittedChild<T> {
     root: RootGpa,
     lifecycle: ForkLifecycleLoan,
-    tag: T,
+    tag: ChildTag<T>,
 }
 
 /// Monotonic counters for diagnostics and the counted-`EAGAIN` contract.
@@ -505,7 +541,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
     }
 
     pub fn child_tag(&self, mm: ReservationMm) -> Option<T::Tag> {
-        Some(self.children.get(&MmKey::of(mm)?)?.tag)
+        Some(self.children.get(&MmKey::of(mm)?)?.tag.tag())
     }
 
     pub fn child_lifecycle(&self, mm: ReservationMm) -> Option<ForkLifecycleLoan> {
@@ -874,7 +910,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
                 CommittedChild {
                     root: pending.child_tables[0],
                     lifecycle: pending.lifecycle,
-                    tag: pending.tag,
+                    tag: ChildTag::bind(pending.tag, loan.request.child_mm),
                 },
             );
             self.committed_tables
