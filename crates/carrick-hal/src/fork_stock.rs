@@ -17,7 +17,7 @@
 //! accounting of loaned table pages ([`ForkTableLedger`]), and the physical
 //! closures that check, clear and observe guest memory.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
 use carrick_el1_abi::{
@@ -389,7 +389,9 @@ pub struct ForkStock<T: ChildAddressTags> {
     children: BTreeMap<MmKey, CommittedChild<T::Tag>>,
     /// Table pages each live MM consumed, as a child or as a fork parent.
     committed_tables: BTreeMap<MmKey, Vec<RootGpa>>,
-    quarantine: BTreeSet<MmKey>,
+    /// Quarantined children; `true` once their carrier release succeeded,
+    /// so a later reclaim never releases the same MM twice.
+    quarantine: BTreeMap<MmKey, bool>,
     tags: T,
     counters: ForkStockCounters,
 }
@@ -405,7 +407,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
             next_loan: NonZeroU64::MIN,
             children: BTreeMap::new(),
             committed_tables: BTreeMap::new(),
-            quarantine: BTreeSet::new(),
+            quarantine: BTreeMap::new(),
             tags,
             counters: ForkStockCounters::default(),
         }
@@ -421,6 +423,11 @@ impl<T: ChildAddressTags> ForkStock<T> {
 
     pub fn tags(&self) -> &T {
         &self.tags
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tags_mut_for_tests(&mut self) -> &mut T {
+        &mut self.tags
     }
 
     pub fn counters(&self) -> ForkStockCounters {
@@ -465,13 +472,13 @@ impl<T: ChildAddressTags> ForkStock<T> {
     }
 
     pub fn is_quarantined(&self, mm: ReservationMm) -> bool {
-        MmKey::of(mm).is_some_and(|key| self.quarantine.contains(&key))
+        MmKey::of(mm).is_some_and(|key| self.quarantine.contains_key(&key))
     }
 
     /// Pages held by quarantined children (never in the reusable stock).
     pub fn quarantined_tables(&self) -> Vec<RootGpa> {
         self.quarantine
-            .iter()
+            .keys()
             .filter_map(|key| self.committed_tables.get(key))
             .flatten()
             .copied()
@@ -564,10 +571,10 @@ impl<T: ChildAddressTags> ForkStock<T> {
         let Some(lifecycle) = self.lifecycles.pop() else {
             self.tables.extend(child_tables);
             self.tables.extend(parent_tables);
-            self.tags
-                .release_unpublished(tag)
-                .map_err(|_| ForkStockRefusal::Capacity)?;
-            return self.refuse(exchange, ForkStockRefusal::Capacity);
+            // A failed tag release still answers the guest with a refusal.
+            let released = self.tags.release_unpublished(tag);
+            let refused = self.refuse(exchange, ForkStockRefusal::Capacity);
+            return released.map_err(|_| ForkStockRefusal::Invalid).and(refused);
         };
         let id = self.next_loan;
         let child_base = child_tables[0].address().raw();
@@ -592,20 +599,24 @@ impl<T: ChildAddressTags> ForkStock<T> {
             )
             .filter(|_| fresh);
         let Some(loan) = admitted else {
-            self.restore(ledger, reserved, 0)?;
             let refusal = if fresh {
                 ForkStockRefusal::Invalid
             } else {
                 ForkStockRefusal::Inventory
             };
-            return self.refuse(exchange, refusal);
+            return self.restore_and_refuse(ledger, exchange, reserved, 0, refusal);
         };
         let charges: Vec<_> = reserved.charges().collect();
         let mut charged = 0;
         for (page, mm) in charges {
             if !ledger.grant(page, mm) {
-                self.restore(ledger, reserved, charged)?;
-                return self.refuse(exchange, ForkStockRefusal::Capacity);
+                return self.restore_and_refuse(
+                    ledger,
+                    exchange,
+                    reserved,
+                    charged,
+                    ForkStockRefusal::Capacity,
+                );
             }
             charged += 1;
         }
@@ -617,8 +628,13 @@ impl<T: ChildAddressTags> ForkStock<T> {
             lifecycle,
             T::wire(tag),
         ) {
-            self.restore(ledger, reserved, charged)?;
-            return self.refuse(exchange, ForkStockRefusal::Invalid);
+            return self.restore_and_refuse(
+                ledger,
+                exchange,
+                reserved,
+                charged,
+                ForkStockRefusal::Invalid,
+            );
         }
         let ReservedLoan {
             child_tables,
@@ -636,6 +652,21 @@ impl<T: ChildAddressTags> ForkStock<T> {
             tag,
         });
         Ok(loan)
+    }
+
+    /// Undo a reservation and always answer the exchange with a refusal; a
+    /// failed restore reports `Invalid` after the guest has its refusal.
+    fn restore_and_refuse(
+        &mut self,
+        ledger: &mut impl ForkTableLedger,
+        exchange: &mut ForkStockExchange,
+        reserved: ReservedLoan<T::Tag>,
+        charged: usize,
+        refusal: ForkStockRefusal,
+    ) -> Result<ForkStockLoan, ForkStockRefusal> {
+        let restored = self.restore(ledger, reserved, charged);
+        let refused = self.refuse(exchange, refusal);
+        restored.and(refused)
     }
 
     /// Undo a reservation whose first `charged` ledger grants were made.
@@ -794,7 +825,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
                     .children
                     .get(key)
                     .is_some_and(|child| child.root == execution.context.root)
-                && !self.quarantine.contains(key)
+                && !self.quarantine.contains_key(key)
         });
         let Some(key) = admitted else {
             retire.refuse(ChildRetireRefusal::Stale);
@@ -804,7 +835,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
         if !retire.accept() {
             return Err(ForkStockServiceError::InvalidRecord);
         }
-        self.quarantine.insert(key);
+        self.quarantine.insert(key, false);
         self.counters.quarantined_children = self.counters.quarantined_children.saturating_add(1);
         Ok(())
     }
@@ -825,7 +856,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
         let active = MmKey::of(active);
         let candidates: Vec<(MmKey, SlotAbsence)> = self
             .quarantine
-            .iter()
+            .keys()
             .copied()
             .filter(|key| Some(*key) != active)
             .filter_map(|key| {
@@ -847,8 +878,11 @@ impl<T: ChildAddressTags> ForkStock<T> {
                 .unwrap_or(&[]);
             // Carrier per-MM state (root registry, inventory, residency) is
             // released before any of the child's stock can be reissued.
-            if !release(mm) {
-                return Err(ForkStockServiceError::ReleaseRefused);
+            if self.quarantine.get(&key) == Some(&false) {
+                if !release(mm) {
+                    return Err(ForkStockServiceError::ReleaseRefused);
+                }
+                self.quarantine.insert(key, true);
             }
             if !clear_tables(pages) || !clear_lifecycle(child.lifecycle) {
                 return Err(ForkStockServiceError::MemoryAccessFailed);

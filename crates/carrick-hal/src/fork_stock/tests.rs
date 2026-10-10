@@ -667,3 +667,83 @@ fn slot_absence_is_minted_only_when_no_slot_installs_the_mm() {
     assert_eq!(foreign, Ok(0));
     assert!(stock.is_quarantined(mm(302)));
 }
+
+/// Tags whose release/retire can be made to fail once.
+#[derive(Default)]
+struct FlakyTags {
+    fail_release: bool,
+    fail_retire_once: core::cell::Cell<bool>,
+}
+
+impl ChildAddressTags for FlakyTags {
+    type Tag = ();
+    fn allocate(&mut self) -> Option<()> {
+        Some(())
+    }
+    fn wire((): ()) -> Option<Asid> {
+        None
+    }
+    fn release_unpublished(&mut self, (): ()) -> Result<(), ForkStockServiceError> {
+        if self.fail_release {
+            Err(ForkStockServiceError::InvalidRecord)
+        } else {
+            Ok(())
+        }
+    }
+    fn retire(&mut self, (): (), _: SlotAbsence) -> Result<(), ForkStockServiceError> {
+        if self.fail_retire_once.replace(false) {
+            Err(ForkStockServiceError::InvalidRecord)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn loan_refuses_the_exchange_even_when_restore_fails() {
+    let mut stock = stock(
+        FlakyTags {
+            fail_release: true,
+            ..FlakyTags::default()
+        },
+        4,
+        1,
+    );
+    let exec = parent();
+    let request = request(exec, 302, 1, 1);
+    let mut exchange = ForkStockExchange::new(request).unwrap();
+    assert!(
+        stock
+            .loan(&mut NoTableLedger, exec, &mut exchange, |_| false)
+            .is_err()
+    );
+    // The guest always receives a typed refusal, never a silent record.
+    assert!(matches!(exchange.take(request), Some(Err(_))));
+}
+
+#[test]
+fn reclaim_releases_each_child_once_across_a_retire_failure() {
+    let mut stock = stock(FlakyTags::default(), 4, 1);
+    let granted = loan(&mut stock, parent(), 302, 1, 1).unwrap();
+    commit(&mut stock, parent(), granted, 1, 0).unwrap();
+    retire(&mut stock, child_of(granted, 900)).unwrap();
+    stock.tags_mut_for_tests().fail_retire_once.set(true);
+    let releases = core::cell::Cell::new(0);
+    let attempt = |stock: &mut ForkStock<FlakyTags>| {
+        stock.reclaim(
+            &mut NoTableLedger,
+            mm(PARENT_MM),
+            absent,
+            |_| true,
+            |_| true,
+            |_| {
+                releases.set(releases.get() + 1);
+                true
+            },
+        )
+    };
+    assert!(attempt(&mut stock).is_err());
+    assert!(stock.is_quarantined(mm(302)));
+    assert_eq!(attempt(&mut stock), Ok(1));
+    assert_eq!(releases.get(), 1, "release ran exactly once");
+}
