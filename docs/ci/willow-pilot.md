@@ -59,18 +59,46 @@ gh workflow run willow-pilot.yml --ref work/willow-pilot
 `kvm-tests` job: merge groups into main, pushes to main and dispatches on
 main (`Admission::Standing`; see the
 [security review](willow-pilot-security-review.md#standing-admission-surface)).
-It writes `standing` to the guest's root-owned `/etc/carrick-ci/policy`
-instead of a pilot SHA, and admits at most `--max-concurrency` clones (1 by
-default, never more than 2):
+Before minting each runner it re-vets the reserved run (same admission and
+attempt; for a merge group, every pull request in the group must have its
+head in `carrick-sh/carrick`) and writes the guest's root-owned
+`/etc/carrick-ci/policy` as `standing run=<id> attempt=<n> sha=<sha>`. The
+hook admits only that run. It admits at most `--max-concurrency` clones (1
+by default, never more than 2). Demand lists only this workflow's runs;
+assignment reads only the reserved job and the runner list. GitHub/PVE
+failures back off (30 s doubling to 10 min) and never end the loop; the 80%
+CPU ceiling still stops it. A job whose clone closed without running it is
+served again, at most three times per job key.
+
+### GitHub credential for standing mode
+
+Use a **fine-grained personal access token** limited to this repository and
+to the single permission the controller needs to register and remove JIT
+runners. The owner creates it:
+
+1. GitHub, Settings, Developer settings, Personal access tokens,
+   Fine-grained tokens, Generate new token.
+2. Resource owner `carrick-sh`; Repository access "Only select
+   repositories": `carrick-sh/carrick`.
+3. Repository permissions: **Administration: Read and write** (required by
+   `generate-jitconfig` and runner removal) and **Actions: Read-only** (run
+   and job status for demand and assignment). Metadata read-only is implied.
+   Grant nothing else.
+4. Set a short expiry and keep the token in the director's password manager;
+   never write it on Willow. If the organization requires approval for
+   fine-grained tokens, approve it for this repository only.
+
+Forward it only through SSH stdin, exactly like the pilot:
 
 ```sh
-gh auth token | ssh root@willow 'IFS= read -r GH_TOKEN; export GH_TOKEN; export PATH=/root/carrick-ci/bin:$PATH; exec /root/carrick-ci/bin/carrick-xtask ci-scaler standing --runner-group-id 1'
+read -rs WILLOW_GH_TOKEN   # paste the fine-grained token
+printf '%s\n' "$WILLOW_GH_TOKEN" | ssh root@willow 'IFS= read -r GH_TOKEN; export GH_TOKEN; export PATH=/root/carrick-ci/bin:$PATH; exec /root/carrick-ci/bin/carrick-xtask ci-scaler standing --runner-group-id 1'
 ```
 
-The pilot (`ci-scaler pilot`) writes `pilot <sha>` to the same file and keeps
-its one-clone, one-job contract. Every budget, ownership, recovery and hook
-rule below applies to both modes; with two clones each active row is
-reconciled every pass, and any reconcile error freezes new admission.
+The guest needs `gh` on its `PATH` for the merge-queue gate step (it uses
+only the job's `GITHUB_TOKEN`). The pilot (`ci-scaler pilot`) writes `pilot
+<sha>` to the same file and keeps its one-clone, one-job contract. Every
+budget, ownership, recovery and hook rule below applies to both modes.
 
 ## Authority and recovery
 

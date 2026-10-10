@@ -99,62 +99,71 @@ are in `/tmp/willow-pilot-review/`.
 ## Standing admission surface
 
 The pilot admitted one workflow (`willow-pilot.yml`, `workflow_dispatch`,
-`work/willow-pilot`, one approved SHA). The merge-queue gate adds a second,
-bounded policy for Willow (`ci-scaler standing`) and cloudmac
-(`ci-scaler mac-jit`). Both are one `Admission::Standing` value in
-`crates/carrick-xtask/src/ci_scaler.rs`, used for demand detection and in the
-job-start hook; there is no second copy of the rules.
+`work/willow-pilot`, one approved SHA). The merge-queue gate adds a bounded
+standing policy for Willow (`ci-scaler standing`) and cloudmac
+(`ci-scaler mac-jit`). Demand uses `Admission::Standing`; each runner is then
+bound by `JobPolicy::Bound` to the one run the controller re-vetted. Both are
+in `crates/carrick-xtask/src/ci_scaler.rs`; there is no second copy.
 
 | Check | Pilot | Standing |
 |---|---|---|
 | Repository (run and head repository) | `carrick-sh/carrick` | `carrick-sh/carrick` |
 | Workflow file | `willow-pilot.yml` | `kernel-runtime.yml`, at the ref being run |
 | Events and refs | `workflow_dispatch` on `work/willow-pilot` | `merge_group` on `gh-readonly-queue/main/*`; `push` or `workflow_dispatch` on `main` |
-| SHA | one approved SHA | any full SHA reachable by those refs |
-| Labels | `ci_scaler::LABELS` | `LABELS` (Willow), `HVF_LABELS` (cloudmac) |
+| Merge group content | n/a | every PR in the group has its head in `carrick-sh/carrick` (GraphQL `mergeQueue`, vetted before minting) |
+| Hook binding | one approved SHA | the vetted run id, attempt and SHA |
+| Labels | `ci_scaler::LABELS` | `LABELS` (Willow), `HVF_LABELS` (cloudmac); closure uses `HVF_CLOSURE_LABELS`, never served |
 | Concurrency | one clone | Willow 1 by default, `--max-concurrency 2` at most; cloudmac 1 |
 
-Not admitted, by test (`tests/ci_scaler.rs`): `pull_request` (including a
-`pull_request` event claiming `refs/heads/main`), `pull_request_target`,
-`schedule`, other branches and tags, an empty or foreign merge-queue prefix,
-a foreign workflow file (`ci.yml`, `willow-pilot.yml`), a workflow file read
-at a different ref, a fork repository, and a short SHA. The pilot policy and
-the standing policy do not admit each other's runs or jobs.
-`kernel-runtime.yml` has no `pull_request` trigger; a test fails if one is
-added.
+Not admitted, by test (`tests/ci_scaler.rs`): `pull_request` (including one
+claiming `refs/heads/main`), `pull_request_target`, `schedule`, other branches
+and tags, an empty or foreign merge-queue prefix, a foreign workflow file, a
+workflow file read at another ref, a fork repository, a short SHA, a merge
+group containing (or queued behind) a fork pull request, and, for a bound
+runner, any other run id, attempt or SHA. `kernel-runtime.yml` has no
+`pull_request` trigger; a test fails if one is added.
 
-Unchanged properties, retained by construction and tests:
+Retained properties:
 
-- **JIT one-use registration.** Each runner is minted by
-  `generate-jitconfig` for one ledger name; Willow runners consume a
-  `mkdir` marker in the guest, cloudmac runners a `mkdir`'d per-name state
-  directory. The JIT never enters a ledger, log or disk file.
-- **Willow budget.** Clone range 308-349 (typed `CloneId`), pool
-  `carrick-ci`, the protected-VM permission census, the 80% projected CPU
-  ceiling, 10 GiB available memory, 150 GiB thin-pool data headroom and
-  metadata below 80% apply before every clone. With two clones, every
-  non-template pool member must be an active ledger clone; any unknown object
-  blocks all admission. A reconcile error or ambiguous clone freezes new
-  admission until a clean pass; the CPU ceiling still stops the controller.
-- **Job-start hook.** Repository, event, workflow file and ref are verified
-  before any step; rejection runs `exec /bin/kill -KILL 0` on the runner's
-  dedicated session (`setsid --wait` on Willow, `setsid()` in
-  `mac-run-once`). `tests/ci_scaler_hook.rs` proves process death for both
-  hook variants against `always()`/`failure()` steps. The policy is read from
-  a controller-written file that must be a regular file writable only by its
-  owner (`/etc/carrick-ci/policy`, root 0644, on Willow; `run/<name>/policy`,
-  0600, on cloudmac); the hook reads no environment variable a workflow could
-  set.
-- **Secrets.** The PVE token stays in `/root/carrick-ci-token.json` on Willow.
-  The GitHub credential stays in `gh` on the director's Mac for cloudmac and
-  is forwarded over SSH stdin to the Willow controller's memory as before;
-  cloudmac receives only JIT material. External command output is parsed in
-  memory and never logged (`ScalerError::External` carries static text only).
+- **JIT one-use registration**, never in a ledger, log, disk file or argv:
+  Willow and cloudmac runners read it from `ACTIONS_RUNNER_INPUT_JITCONFIG`.
+- **Willow budget**: clone range 308-349 (typed `CloneId`), pool
+  `carrick-ci`, the protected-VM census, the 80% projected CPU ceiling,
+  10 GiB memory, 150 GiB thin-pool data and metadata below 80% before every
+  clone. With two clones every non-template pool member must be an active
+  ledger clone; any unknown object, reconcile error or ambiguous clone
+  freezes admission. A clone whose registration is gone and whose reserved
+  job never ran on it is destroyed only after its guest reports the
+  runner's exit file.
+- **Job-start hook**: rejection runs `exec /bin/kill -KILL 0` on the
+  runner's own session; `tests/ci_scaler_hook.rs` proves process death for
+  both hook variants. The policy file must be root-owned, a regular file, not
+  group/other writable; the hook reads no job-settable environment.
+- **Secrets**: the PVE token stays on Willow; the standing controller's
+  GitHub credential is a fine-grained, single-repository token with
+  Administration (runner registration) and Actions read only
+  ([creation steps](willow-pilot.md#github-credential-for-standing-mode)),
+  forwarded through SSH stdin. cloudmac receives only JIT material.
+- **Bounded API use**: demand lists one workflow's runs; assignment reads
+  the reserved job and the runner list; transient failures back off and
+  never end either controller loop.
 
-Residual risk, stated plainly: standing mode admits any commit that reaches
-main or the merge queue. Those jobs run as the runner user; on cloudmac that
-user persists between jobs and can modify the runner directory and future
-state directories, so an admitted job is trusted code. The cloudmac hook
-binary must be root-owned (`mac-run-once` refuses otherwise) so the admission
-decision cannot be replaced from a job. No live Willow, cloudmac or GitHub
-operation was performed for this review; the director qualifies it live.
+cloudmac isolation (`docs/ci/mac-jit.md`): the SSH login runs only
+`mac-run-once`/`mac-quiesce` of one root-owned binary through sudoers; the
+runner tree is root-owned and verified against a manifest pinned by the
+controller before every launch; jobs run as the unprivileged `carrick-ci`
+account, which cannot write the tree, the binary, the policy or the hook;
+reaping needs no sudo target a job could write.
+
+Merge-queue gate integrity: the gate binary is built from the merge group's
+base commit in a separate worktree, so a pull request cannot change how its
+receipt is judged. The candidate receipt itself is still produced by the
+candidate's code; a pull request that rewrote `xtask accept` to emit a clean
+receipt would pass the gate. Review of `crates/carrick-xtask` changes remains
+the control for that.
+
+Residual risk, stated plainly: standing mode admits commits from this
+repository's branches that reach main or the merge queue, i.e. trusted code.
+`carrick-ci`'s home, `_work` and `_diag` persist across cloudmac jobs. No live
+Willow, cloudmac or GitHub operation was performed for this review; the
+director qualifies it live.

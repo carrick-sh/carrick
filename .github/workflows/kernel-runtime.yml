@@ -132,18 +132,30 @@ jobs:
         if: ${{ !cancelled() && hashFiles('target/ci-receipts/receipt.json') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: receipt-hvf-${{ github.sha }}
+          # The attempt keeps a re-run from colliding with an earlier upload;
+          # the gate picks the newest attempt.
+          name: receipt-hvf-${{ github.sha }}-${{ github.run_attempt }}
           path: target/ci-receipts/receipt.json
           if-no-files-found: error
 
+      # The gate binary is built from the BASE commit, in its own worktree
+      # and target dir, so a pull request cannot change the gate it is judged
+      # by. The base SHA comes through env, never interpolated into the shell.
       - name: Gate on NEW failures against the merge group base
         if: ${{ github.event_name == 'merge_group' }}
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          cargo run -q --locked -p carrick-xtask -- ci-receipt gate --lane hvf
-          --base-sha "${{ github.event.merge_group.base_sha }}"
-          --candidate target/ci-receipts/receipt.json
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          set -euo pipefail
+          base="$RUNNER_TEMP/gate-base"
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          git worktree add --detach "$base" "$BASE_SHA"
+          trap 'git worktree remove --force "$base"' EXIT
+          cargo build --locked --release -p carrick-xtask \
+            --manifest-path "$base/Cargo.toml" --target-dir "$RUNNER_TEMP/gate-target"
+          "$RUNNER_TEMP/gate-target/release/carrick-xtask" ci-receipt gate --lane hvf \
+            --base-sha "$BASE_SHA" --candidate target/ci-receipts/receipt.json
 
       # After the receipt is published, so a red absolute gate cannot prevent
       # the per-SHA baseline from existing. Not on the merge queue: main is not
@@ -196,7 +208,9 @@ jobs:
           vars.CARRICK_SELF_HOSTED_FULL_CONFORMANCE == 'true' &&
           github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     needs: hvf-kernel
-    runs-on: [self-hosted, macOS, ARM64, carrick-hvf]
+    # Its own label (`ci_scaler::HVF_CLOSURE_LABELS`): `mac-jit` never serves
+    # it, so the 24-hour closure can never occupy the merge-queue runner.
+    runs-on: [self-hosted, macOS, ARM64, carrick-hvf-closure]
     timeout-minutes: 1440
     steps:
       - uses: actions/checkout@v4
@@ -292,15 +306,46 @@ jobs:
         if: ${{ !cancelled() && hashFiles('target/ci-receipts/receipt.json') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: receipt-kvm-${{ github.sha }}
+          # The attempt keeps a re-run from colliding with an earlier upload;
+          # the gate picks the newest attempt.
+          name: receipt-kvm-${{ github.sha }}-${{ github.run_attempt }}
           path: target/ci-receipts/receipt.json
           if-no-files-found: error
 
+      # The gate binary is built from the BASE commit, in its own worktree
+      # and target dir, so a pull request cannot change the gate it is judged
+      # by. The base SHA comes through env, never interpolated into the shell.
       - name: Gate on NEW failures against the merge group base
         if: ${{ github.event_name == 'merge_group' }}
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          cargo run -q --locked -p carrick-xtask -- ci-receipt gate --lane kvm
-          --base-sha "${{ github.event.merge_group.base_sha }}"
-          --candidate target/ci-receipts/receipt.json
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          set -euo pipefail
+          base="$RUNNER_TEMP/gate-base"
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          git worktree add --detach "$base" "$BASE_SHA"
+          trap 'git worktree remove --force "$base"' EXIT
+          cargo build --locked --release -p carrick-xtask \
+            --manifest-path "$base/Cargo.toml" --target-dir "$RUNNER_TEMP/gate-target"
+          "$RUNNER_TEMP/gate-target/release/carrick-xtask" ci-receipt gate --lane kvm \
+            --base-sha "$BASE_SHA" --candidate target/ci-receipts/receipt.json
+
+  # The single required check. `if: always()` so a skipped or cancelled lane
+  # reports a failure here instead of letting a required check pass by
+  # being skipped.
+  trusted-hardware-ok:
+    name: Trusted hardware OK
+    if: ${{ always() }}
+    needs: [signed-fixtures, hvf-kernel, kvm-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require both trusted-hardware lanes
+        env:
+          HVF: ${{ needs.hvf-kernel.result }}
+          KVM: ${{ needs.kvm-tests.result }}
+        run: |
+          echo "hvf-kernel=$HVF kvm-tests=$KVM"
+          test "$HVF" = success
+          test "$KVM" = success

@@ -134,7 +134,10 @@ fn serial_host_rejected_hook_kills_worker_before_always_and_failure_steps() {
 #[test]
 fn launch_isolates_the_runner_group_before_it_can_receive_a_job() {
     let source = include_str!("../../../scripts/ci/runner-once.sh");
-    assert!(source.contains("setsid --wait ./run.sh --jitconfig"));
+    assert!(
+        source.contains("ACTIONS_RUNNER_INPUT_JITCONFIG=\"$jit\" /usr/bin/setsid --wait ./run.sh")
+    );
+    assert!(!source.contains("--jitconfig \"$jit\""));
 }
 
 #[test]
@@ -168,4 +171,7 @@ fn cloudmac_launch_isolates_the_runner_session_before_it_can_receive_a_job() {
     let source = include_str!("../src/ci_scaler/mac.rs");
     assert!(source.contains("libc::setsid()"));
     assert!(source.contains("ACTIONS_RUNNER_HOOK_JOB_STARTED"));
+    assert!(source.contains(".env(\"ACTIONS_RUNNER_INPUT_JITCONFIG\", &jit)"));
+    assert!(!source.contains(".arg(\"--jitconfig\")"));
+    assert!(source.contains("libc::setuid(uid)"));
 }

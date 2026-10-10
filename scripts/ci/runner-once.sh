@@ -21,7 +21,9 @@ rm -f /home/runner/.ssh/authorized_keys
   set +e
   # The hook must be able to kill listener and worker without reaching this
   # SSH launch wrapper. No workflow-controlled step precedes that hook.
-  /usr/bin/setsid --wait ./run.sh --jitconfig "$jit"
+  # The runner reads --jitconfig from ACTIONS_RUNNER_INPUT_JITCONFIG; argv
+  # is visible to every local user, the environment is not.
+  ACTIONS_RUNNER_INPUT_JITCONFIG="$jit" /usr/bin/setsid --wait ./run.sh
   result=$?
   printf '%s\n' "$result" > /home/runner/runner.exit
 ) </dev/null > /home/runner/runner.log 2>&1 &
