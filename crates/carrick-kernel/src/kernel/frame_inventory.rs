@@ -21,6 +21,26 @@ use parking_lot::Mutex;
 
 use super::{MmId, ObjectIdError, ObjectIdRegistry};
 
+/// A physical mapping's exact owner in the shared carrier inventory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum FrameOwner {
+    HostMm(MmId),
+    GuestMm(carrick_hal::GuestFrameOwner),
+}
+impl From<MmId> for FrameOwner {
+    fn from(mm: MmId) -> Self {
+        Self::HostMm(mm)
+    }
+}
+impl FrameOwner {
+    fn wire_key(self) -> NonZeroU64 {
+        match self {
+            Self::HostMm(mm) => mm.nonzero(),
+            Self::GuestMm(owner) => owner.native_mm.raw(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FrameRow {
     pub frame: FrameId,
@@ -32,7 +52,7 @@ pub struct FrameRow {
 pub struct MappingRow {
     pub mapping: MappingId,
     pub frame: FrameId,
-    pub mm: MmId,
+    pub mm: FrameOwner,
     pub generation: MappingGeneration,
     pub gpa: Gpa,
     pub length: FrameLength,
@@ -75,7 +95,7 @@ struct PhysicalInventoryProjection {
 struct PhysicalInventoryBinding {
     inventory: std::sync::Arc<FrameInventoryAuthority>,
     ids: std::sync::Arc<ObjectIdRegistry>,
-    mm: MmId,
+    mm: FrameOwner,
 }
 impl FrameInventoryAuthority {
     pub fn physical_projection(
@@ -91,12 +111,12 @@ impl FrameInventoryAuthority {
 impl carrick_hal::PhysicalFrameInventory for PhysicalInventoryProjection {
     fn bind(
         &self,
-        mm: carrick_hal::MmGeneration,
+        owner: carrick_hal::GuestFrameOwner,
     ) -> std::sync::Arc<dyn carrick_hal::FrameCowAuthority> {
         std::sync::Arc::new(PhysicalInventoryBinding {
             inventory: std::sync::Arc::clone(&self.inventory),
             ids: std::sync::Arc::clone(&self.ids),
-            mm: MmId::for_owner_binding(mm),
+            mm: FrameOwner::GuestMm(owner),
         })
     }
     fn allocate_backing_ids(
@@ -156,7 +176,12 @@ impl carrick_hal::FrameCowAuthority for PhysicalInventoryBinding {
         &self,
         receipt: &FrameInventoryApplyReceipt,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if receipt.mm().get() != self.mm.raw() {
+        if receipt.mm().get() != self.mm.wire_key().get()
+            || receipt
+                .mapping_set()
+                .iter()
+                .any(|(mapping, _)| self.inventory.live_mapping_row(self.mm, *mapping).is_none())
+        {
             return Err(Box::new(std::io::Error::other(
                 "inventory rollback MM mismatch",
             )));
@@ -241,7 +266,7 @@ struct InventoryState {
     /// `FrameInventoryAuthority::apply_inner` at 8.3% of carrier CPU in the
     /// 2026-08-30 fork/exit sweep. `mappings` is mutated in exactly one place,
     /// so this stays exact by construction.
-    mm_mapping_counts: BTreeMap<MmId, usize>,
+    mm_mapping_counts: BTreeMap<FrameOwner, usize>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -260,7 +285,7 @@ struct FrameEntry {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MappingEntry {
     frame: FrameId,
-    mm: MmId,
+    mm: FrameOwner,
     generation: MappingGeneration,
     gpa: Gpa,
     length: FrameLength,
@@ -285,7 +310,7 @@ enum MappingState {
 /// mapping table. Production reads the maintained counter; this is what proves
 /// the two agree.
 #[cfg(test)]
-fn recomputed_mm_mapping_counts(state: &InventoryState) -> BTreeMap<MmId, usize> {
+fn recomputed_mm_mapping_counts(state: &InventoryState) -> BTreeMap<FrameOwner, usize> {
     let mut counts = BTreeMap::new();
     for mapping in state.mappings.values() {
         *counts.entry(mapping.mm).or_insert(0) += 1;
@@ -293,7 +318,7 @@ fn recomputed_mm_mapping_counts(state: &InventoryState) -> BTreeMap<MmId, usize>
     counts
 }
 
-fn decrement_mm_mapping_count(counts: &mut BTreeMap<MmId, usize>, mm: MmId) {
+fn decrement_mm_mapping_count(counts: &mut BTreeMap<FrameOwner, usize>, mm: FrameOwner) {
     if let Some(count) = counts.get_mut(&mm) {
         *count = count.saturating_sub(1);
         if *count == 0 {
@@ -428,9 +453,10 @@ impl FrameInventoryAuthority {
     /// Apply one backend commit atomically after backend locks are released.
     pub fn apply<T>(
         &self,
-        mm: MmId,
+        mm: impl Into<FrameOwner>,
         commit: FrameInventoryCommit<T>,
     ) -> Result<(T, u64), FrameInventoryError> {
+        let mm = mm.into();
         let (outcome, revision, _) = self.apply_inner(mm, commit, None, None)?;
         Ok((outcome, revision))
     }
@@ -440,9 +466,10 @@ impl FrameInventoryAuthority {
     /// cannot fabricate this receipt from a dropped/unapplied commit.
     pub fn apply_with_receipt<T>(
         &self,
-        mm: MmId,
+        mm: impl Into<FrameOwner>,
         commit: FrameInventoryCommit<T>,
     ) -> Result<(T, FrameInventoryApplyReceipt), FrameInventoryError> {
+        let mm = mm.into();
         self.apply_with_receipt_inner(mm, commit, None)
     }
 
@@ -453,16 +480,17 @@ impl FrameInventoryAuthority {
     /// independent of any sibling commit that follows.
     pub fn apply_grant_with_receipt<T>(
         &self,
-        mm: MmId,
+        mm: impl Into<FrameOwner>,
         commit: FrameInventoryCommit<T>,
         grant: ExactMappingRow,
     ) -> Result<(T, FrameInventoryApplyReceipt), FrameInventoryError> {
+        let mm = mm.into();
         self.apply_with_receipt_inner(mm, commit, Some(grant))
     }
 
     fn apply_with_receipt_inner<T>(
         &self,
-        mm: MmId,
+        mm: FrameOwner,
         commit: FrameInventoryCommit<T>,
         grant: Option<ExactMappingRow>,
     ) -> Result<(T, FrameInventoryApplyReceipt), FrameInventoryError> {
@@ -484,7 +512,7 @@ impl FrameInventoryAuthority {
         mappings.dedup();
         let mm_id = mm;
         let (outcome, revision, _) = self.apply_inner(mm_id, commit, None, grant)?;
-        let mm = NonZeroU64::new(mm.raw()).unwrap_or_else(|| {
+        let mm = NonZeroU64::new(mm.wire_key().get()).unwrap_or_else(|| {
             carrick_fatal!(
                 "kernel::frame_inventory",
                 "zero mm ID encountered in apply_with_receipt"
@@ -514,9 +542,18 @@ impl FrameInventoryAuthority {
         if !receipt.issued_by(&self.origin) {
             return Err(FrameInventoryError::RollbackReceiptOriginMismatch);
         }
-        let mm = MmId::from_raw_u64(receipt.mm().get())
-            .ok_or(FrameInventoryError::RollbackReceiptMmInvalid)?;
         let mut state = self.state.lock();
+        let Some(&(first_mapping, _)) = receipt.mapping_set().first() else {
+            return Ok(());
+        };
+        let mm = state
+            .mappings
+            .get(&first_mapping)
+            .ok_or(FrameInventoryError::RollbackReceiptMismatch(first_mapping))?
+            .mm;
+        if mm.wire_key() != receipt.mm() {
+            return Err(FrameInventoryError::RollbackReceiptMmInvalid);
+        }
         let next_revision = state
             .revision
             .checked_add(1)
@@ -569,9 +606,10 @@ impl FrameInventoryAuthority {
 
     pub fn apply_retirement_with_receipt<T>(
         &self,
-        mm: MmId,
+        mm: impl Into<FrameOwner>,
         commit: FrameInventoryCommit<T>,
     ) -> Result<(T, FrameInventoryRetirementReceipt), FrameInventoryError> {
+        let mm = mm.into();
         let transaction = commit.batch().transaction();
         let state = self.state.lock();
         let provenance = state
@@ -598,7 +636,7 @@ impl FrameInventoryAuthority {
         let mm_id = mm;
         let (outcome, revision, mm_empty_at_revision) =
             self.apply_inner(mm_id, commit, None, None)?;
-        let mm = NonZeroU64::new(mm.raw()).unwrap_or_else(|| {
+        let mm = NonZeroU64::new(mm.wire_key().get()).unwrap_or_else(|| {
             carrick_fatal!(
                 "kernel::frame_inventory",
                 "zero mm ID encountered in apply_retirement_with_receipt"
@@ -620,7 +658,7 @@ impl FrameInventoryAuthority {
 
     fn apply_inner<T>(
         &self,
-        mm: MmId,
+        mm: FrameOwner,
         commit: FrameInventoryCommit<T>,
         fail_before_event: Option<usize>,
         grant: Option<ExactMappingRow>,
@@ -720,7 +758,12 @@ impl FrameInventoryAuthority {
     }
 
     /// One published row of the exact MM, read under its inventory owner lock.
-    pub fn live_mapping_row(&self, mm: MmId, mapping: MappingId) -> Option<MappingRow> {
+    pub fn live_mapping_row(
+        &self,
+        mm: impl Into<FrameOwner>,
+        mapping: MappingId,
+    ) -> Option<MappingRow> {
+        let mm = mm.into();
         let state = self.state.lock();
         let entry = state
             .mappings
@@ -741,7 +784,8 @@ impl FrameInventoryAuthority {
         snapshot_state(&self.state.lock(), None)
     }
 
-    pub fn snapshot_for_mm(&self, mm: MmId) -> FrameInventorySnapshot {
+    pub fn snapshot_for_mm(&self, mm: impl Into<FrameOwner>) -> FrameInventorySnapshot {
+        let mm = mm.into();
         snapshot_state(&self.state.lock(), Some(mm))
     }
 
@@ -754,12 +798,13 @@ impl FrameInventoryAuthority {
     /// 1000; LTP futex_cmp_requeue01's 1000-waiter phase starved on it).
     pub fn mapping_is_live_exact(
         &self,
-        mm: MmId,
+        mm: impl Into<FrameOwner>,
         mapping: MappingId,
         frame: FrameId,
         gpa: Gpa,
         length: FrameLength,
     ) -> bool {
+        let mm = mm.into();
         self.mapping_live_revision(mm, mapping, frame, gpa, length)
             .is_some()
     }
@@ -768,12 +813,13 @@ impl FrameInventoryAuthority {
     /// lock. Existing COW replacement lanes need no new inventory publication.
     pub fn mapping_live_revision(
         &self,
-        mm: MmId,
+        mm: impl Into<FrameOwner>,
         mapping: MappingId,
         frame: FrameId,
         gpa: Gpa,
         length: FrameLength,
     ) -> Option<u64> {
+        let mm = mm.into();
         let state = self.state.lock();
         state
             .mappings
@@ -793,13 +839,14 @@ impl FrameInventoryAuthority {
     /// makes the proof stale even if the mapping row itself is unchanged.
     pub fn mapping_is_live_exact_at_revision(
         &self,
-        mm: MmId,
+        mm: impl Into<FrameOwner>,
         revision: u64,
         mapping: MappingId,
         frame: FrameId,
         gpa: Gpa,
         length: FrameLength,
     ) -> bool {
+        let mm = mm.into();
         self.mapping_live_revision(mm, mapping, frame, gpa, length) == Some(revision)
     }
 
@@ -838,10 +885,11 @@ impl FrameInventoryAuthority {
     /// counts for a batch of frames under a single inventory mutex acquisition.
     pub fn retirement_batch_query(
         &self,
-        mm: MmId,
+        mm: impl Into<FrameOwner>,
         extents: &[(MappingId, FrameId, Gpa, FrameLength)],
         frames: &[FrameId],
     ) -> (Vec<bool>, Vec<Option<usize>>) {
+        let mm = mm.into();
         let state = self.state.lock();
         let extent_liveness = extents
             .iter()
@@ -875,9 +923,10 @@ impl FrameInventoryAuthority {
 
     pub fn snapshot_for_mm_until(
         &self,
-        mm: MmId,
+        mm: impl Into<FrameOwner>,
         deadline: Instant,
     ) -> Option<FrameInventorySnapshot> {
+        let mm = mm.into();
         self.state
             .try_lock_until(deadline)
             .map(|state| snapshot_state(&state, Some(mm)))
@@ -894,7 +943,7 @@ impl FrameInventoryAuthority {
     #[cfg(test)]
     fn apply_with_failpoint<T>(
         &self,
-        mm: MmId,
+        mm: FrameOwner,
         commit: FrameInventoryCommit<T>,
         fail_before_event: usize,
     ) -> Result<(T, u64), FrameInventoryError> {
@@ -906,7 +955,7 @@ impl FrameInventoryAuthority {
 fn apply_event(
     state: &mut InventoryOverlay<'_>,
     reservation: &ReservationRecord,
-    mm: MmId,
+    mm: FrameOwner,
     transaction: KernelTransactionId,
     event: FrameInventoryEvent,
 ) -> Result<(), FrameInventoryError> {
@@ -1158,7 +1207,7 @@ enum ConditionalRetirement {
 
 fn live_mapping_mut<'a>(
     state: &'a mut InventoryOverlay<'_>,
-    mm: MmId,
+    mm: FrameOwner,
     mapping: MappingId,
 ) -> Result<&'a mut MappingEntry, FrameInventoryError> {
     let entry = state
@@ -1212,7 +1261,7 @@ fn generation_error(
     }
 }
 
-fn snapshot_state(state: &InventoryState, mm_filter: Option<MmId>) -> FrameInventorySnapshot {
+fn snapshot_state(state: &InventoryState, mm_filter: Option<FrameOwner>) -> FrameInventorySnapshot {
     let mut frames = Vec::with_capacity(state.frames.len());
     let mut frame_indexes = HashMap::with_capacity(state.frames.len());
     for (index, (frame, entry)) in state.frames.iter().enumerate() {
@@ -1340,8 +1389,8 @@ pub enum FrameInventoryError {
     #[error("mapping {mapping:?} belongs to mm {owner:?}, not {attempted:?}")]
     CrossMmMappingReuse {
         mapping: MappingId,
-        owner: MmId,
-        attempted: MmId,
+        owner: FrameOwner,
+        attempted: FrameOwner,
     },
     #[error("mapping {0:?} is not live")]
     NonliveMapping(MappingId),
@@ -1427,13 +1476,14 @@ impl FrameInventoryAuthority {
     /// mapping is republished under a new generation.
     pub fn mapping_is_live_exact_generation(
         &self,
-        mm: MmId,
+        mm: impl Into<FrameOwner>,
         mapping: MappingId,
         frame: FrameId,
         generation: MappingGeneration,
         gpa: Gpa,
         length: FrameLength,
     ) -> bool {
+        let mm = mm.into();
         self.state
             .lock()
             .mappings
@@ -2051,7 +2101,7 @@ mod tests {
                 .state
                 .lock()
                 .mm_mapping_counts
-                .contains_key(&fixture.mm1),
+                .contains_key(&FrameOwner::HostMm(fixture.mm1)),
             "an emptied address space must drop out of the counter entirely"
         );
     }
@@ -2751,9 +2801,11 @@ mod tests {
             });
             let before = fixture.authority.snapshot();
             assert_eq!(
-                fixture
-                    .authority
-                    .apply_with_failpoint(fixture.mm1, batch, failpoint),
+                fixture.authority.apply_with_failpoint(
+                    FrameOwner::HostMm(fixture.mm1),
+                    batch,
+                    failpoint
+                ),
                 Err(FrameInventoryError::InjectedFailure(failpoint))
             );
             assert_eq!(fixture.authority.snapshot(), before);
@@ -3012,7 +3064,10 @@ mod physical_projection_tests {
     fn publish_fixture(
         source: &dyn carrick_hal::PhysicalFrameInventory,
     ) -> carrick_hal::UnpublishedFrameInventoryApply<dyn carrick_hal::FrameCowAuthority> {
-        let bound = source.bind(carrick_hal::MmGeneration::new(NonZeroU64::new(41).unwrap()));
+        let bound = source.bind(carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::MmGeneration::new(NonZeroU64::new(41).unwrap()),
+            root_generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::MIN),
+        });
         let mut reservation = bound.reserve(1, 1, 2).unwrap();
         let transaction = reservation.transaction();
         let frame = reservation.claim_frame().unwrap();
@@ -3054,7 +3109,10 @@ mod physical_projection_tests {
         assert_eq!(first_receipt.mm(), second_receipt.mm());
         assert_eq!(first_receipt.mapping_set(), second_receipt.mapping_set());
         let mapping = first_receipt.mapping_set()[0].0;
-        let mm = MmId::from_raw_u64(first_receipt.mm().get()).unwrap();
+        let mm = FrameOwner::GuestMm(carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::MmGeneration::new(first_receipt.mm()),
+            root_generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::MIN),
+        });
         first_receipt.rollback().unwrap();
         assert!(first.live_mapping_row(mm, mapping).is_none());
         assert!(
@@ -3072,8 +3130,100 @@ mod physical_projection_tests {
         let source = inventory.physical_projection(ids);
         let mm = NonZeroU64::new(41).unwrap();
         let sibling_mm = NonZeroU64::new(42).unwrap();
-        let owner = source.bind(carrick_hal::MmGeneration::new(mm));
-        let sibling = source.bind(carrick_hal::MmGeneration::new(sibling_mm));
+        let owner = source.bind(carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::MmGeneration::new(mm),
+            root_generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::MIN),
+        });
+        let sibling = source.bind(carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::MmGeneration::new(sibling_mm),
+            root_generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::MIN),
+        });
+        let mut reservation = owner.reserve(1, 1, 2).unwrap();
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().unwrap();
+        let mapping = reservation.claim_mapping().unwrap();
+        let generation = MappingGeneration::from_backend_counter(NonZeroU64::MIN);
+        let gpa = Gpa(0x1000);
+        let length = FrameLength::from_mapping_extent(NonZeroU64::new(4096).unwrap());
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa,
+                length,
+                permissions: MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+        let stale_root = source.bind(carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::MmGeneration::new(mm),
+            root_generation: carrick_guest_arch::ContextGeneration::new(
+                NonZeroU64::new(2).unwrap(),
+            ),
+        });
+        let commit = reservation.commit(());
+        let challenge = commit.receipt_challenge();
+        let receipt = owner.apply_with_receipt(commit).unwrap();
+        assert!(challenge.authenticate_apply(&receipt, mm));
+        assert_eq!(receipt.mm(), mm);
+        assert!(owner.mapping_is_live_exact_generation(mapping, frame, generation, gpa, length));
+        assert!(!owner.mapping_is_live_exact_generation(
+            mapping,
+            frame,
+            MappingGeneration::from_backend_counter(NonZeroU64::new(2).unwrap()),
+            gpa,
+            length
+        ));
+        assert!(sibling.live_mapping_row(mapping).is_none());
+        assert!(stale_root.live_mapping_row(mapping).is_none());
+        assert!(stale_root.rollback_unpublished_apply(&receipt).is_err());
+        assert!(sibling.rollback_unpublished_apply(&receipt).is_err());
+        assert!(
+            inventory
+                .live_mapping_row(
+                    FrameOwner::GuestMm(carrick_hal::GuestFrameOwner {
+                        native_mm: carrick_hal::MmGeneration::new(mm),
+                        root_generation: carrick_guest_arch::ContextGeneration::new(
+                            NonZeroU64::MIN
+                        )
+                    }),
+                    mapping
+                )
+                .is_some(),
+            "the projection must publish into the original inventory"
+        );
+        owner.rollback_unpublished_apply(&receipt).unwrap();
+        assert!(owner.live_mapping_row(mapping).is_none());
+        assert_eq!(inventory.frame_mapping_count(frame), None);
+    }
+
+    #[test]
+    fn physical_projection_does_not_adopt_equal_numbered_host_mm() {
+        let inventory = Arc::new(FrameInventoryAuthority::new());
+        let ids = Arc::new(ObjectIdRegistry::new());
+        let source = inventory.physical_projection(ids);
+        let mm = NonZeroU64::new(41).unwrap();
+        let sibling_mm = NonZeroU64::new(42).unwrap();
+        let owner = source.bind(carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::MmGeneration::new(mm),
+            root_generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::MIN),
+        });
+        let sibling = source.bind(carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::MmGeneration::new(sibling_mm),
+            root_generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::MIN),
+        });
         let mut reservation = owner.reserve(1, 1, 2).unwrap();
         let transaction = reservation.transaction();
         let frame = reservation.claim_frame().unwrap();
@@ -3121,8 +3271,8 @@ mod physical_projection_tests {
         assert!(
             inventory
                 .live_mapping_row(MmId::from_raw_u64(mm.get()).unwrap(), mapping)
-                .is_some(),
-            "the projection must publish into the original inventory"
+                .is_none(),
+            "a guest-MM projection must not publish into an equal-numbered host MM"
         );
         owner.rollback_unpublished_apply(&receipt).unwrap();
         assert!(owner.live_mapping_row(mapping).is_none());

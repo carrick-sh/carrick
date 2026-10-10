@@ -33,11 +33,11 @@ fn inherited_leaf_names(entry: u64, size: u64, gpa: FrameGpa) -> bool {
 
 fn inventory_page_live(
     authority: &dyn carrick_hal::PhysicalFrameInventory,
-    mm: NonZeroU64,
+    owner: carrick_hal::GuestFrameOwner,
     identity: BackingIdentity,
     gpa: FrameGpa,
 ) -> bool {
-    let bound = authority.bind(carrick_guest_arch::MmGeneration::new(mm));
+    let bound = authority.bind(owner);
     let Some(row) = bound.live_mapping_row(carrick_hal::MappingId::from_kernel_allocation(
         identity.mapping_id,
     )) else {
@@ -751,7 +751,7 @@ impl CarrierMemory {
             let resident = self
                 .named_leaf_resident(parent, span, gpa)
                 .ok_or_else(|| error("selected source does not name retained storage"))?;
-            if !inventory_page_live(authority, parent.mm.raw(), identity, gpa) {
+            if !inventory_page_live(authority, parent.into(), identity, gpa) {
                 return Err(error("selected source is not a live inventoried page"));
             }
             edges.push(InheritedFrameEdge {
@@ -793,8 +793,8 @@ impl CarrierMemory {
             || receipt.revision() != identity.inventory_revision.get()
             || !receipt.authorizes(mapping, frame)
             || self.frame_identity(edge.parent.mm.raw(), edge.gpa)? != edge.identity
-            || !inventory_page_live(authority, edge.parent.mm.raw(), edge.identity, edge.gpa)
-            || !inventory_page_live(authority, child.mm.raw(), identity, edge.gpa)
+            || !inventory_page_live(authority, edge.parent.into(), edge.identity, edge.gpa)
+            || !inventory_page_live(authority, child.into(), identity, edge.gpa)
             || !self.leaf_names(edge.parent, edge.span, edge.gpa)
             || !self.leaf_names(child, edge.span, edge.gpa)
             || (!edge.shared

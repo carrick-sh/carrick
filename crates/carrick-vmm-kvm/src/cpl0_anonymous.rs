@@ -814,8 +814,8 @@ impl Cpl0HostCustody {
                     edges.push(edge);
                 }
             }
-            let parent_inventory = self.frame_inventory.bind(execution.context.mm);
-            let child_inventory = self.frame_inventory.bind(child.mm);
+            let parent_inventory = self.frame_inventory.bind(execution.context.into());
+            let child_inventory = self.frame_inventory.bind(child.into());
             let mut rows = std::collections::BTreeMap::new();
             for edge in &edges {
                 let identity = edge.identity();
@@ -1088,7 +1088,7 @@ impl Cpl0HostCustody {
             0,
             size,
             NonZeroU64::MIN,
-            MmGeneration::new(mm),
+            execution.context.into(),
         )?;
         let backing = inventory
             .frames
@@ -1388,7 +1388,7 @@ impl Cpl0HostCustody {
             // A newly allocated physical mapping starts at generation one;
             // the guest operation sequence belongs to the descriptor txn.
             NonZeroU64::MIN,
-            MmGeneration::new(mm),
+            execution.context.into(),
         )?;
         let identity = inventory
             .frames

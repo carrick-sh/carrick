@@ -413,9 +413,10 @@ impl InitialInventory {
         table_grants: usize,
         frame_len: u64,
         owner_generation: NonZeroU64,
-        mm: MmGeneration,
+        owner: carrick_hal::GuestFrameOwner,
     ) -> Result<(Self, Vec<X86InitialBootGrant>), TrapError> {
-        let authority = source.bind(mm);
+        let mm = owner.native_mm;
+        let authority = source.bind(owner);
         let gpas: Vec<_> = gpas.into_iter().collect();
         if table_grants >= gpas.len() {
             return Err(fail("initial inventory grant partition"));
@@ -2517,10 +2518,13 @@ impl Cpl0Carrier {
             table_grants,
             4096,
             NonZeroU64::MIN,
-            MmGeneration::new(
-                NonZeroU64::new(self.initial_mm_key())
-                    .ok_or_else(|| fail("initial inventory MM"))?,
-            ),
+            carrick_hal::GuestFrameOwner {
+                native_mm: MmGeneration::new(
+                    NonZeroU64::new(self.initial_mm_key())
+                        .ok_or_else(|| fail("initial inventory MM"))?,
+                ),
+                root_generation: ContextGeneration::new(NonZeroU64::MIN),
+            },
         )?;
         self.custody.initial_rollback_fault = Some(Arc::clone(&inventory.rollback_fault));
         let outcome = (|| -> Result<(), TrapError> {
@@ -5061,9 +5065,6 @@ impl ForwardVenue<'_> {
     ) -> Result<(), MemoryError> {
         let page = output.raw() & !4095;
         let mm_key = self.execution.binding.mm.raw();
-        let mm = carrick_guest_arch::MmGeneration::new(
-            NonZeroU64::new(mm_key).ok_or(MemoryError::Unsupported)?,
-        );
         let identity = self
             .custody
             ._vm
@@ -5075,7 +5076,7 @@ impl ForwardVenue<'_> {
         let row = self
             .custody
             .frame_inventory
-            .bind(mm)
+            .bind(self.execution.context.into())
             .live_mapping_row(MappingId::from_kernel_allocation(identity.mapping_id))
             .ok_or(MemoryError::OutOfBounds { address, length: 1 })?;
         if row.frame != FrameId::from_kernel_allocation(identity.frame_id)
@@ -5329,7 +5330,10 @@ mod initial_reply_tests {
             0,
             4096,
             NonZeroU64::MIN,
-            MmGeneration::new(NonZeroU64::new(INITIAL_MM_KEY).unwrap()),
+            carrick_hal::GuestFrameOwner {
+                native_mm: MmGeneration::new(NonZeroU64::new(INITIAL_MM_KEY).unwrap()),
+                root_generation: ContextGeneration::new(NonZeroU64::MIN),
+            },
         )
         .unwrap();
         authority
@@ -5352,7 +5356,10 @@ mod initial_reply_tests {
             0,
             4096,
             NonZeroU64::MIN,
-            MmGeneration::new(NonZeroU64::new(INITIAL_MM_KEY).unwrap()),
+            carrick_hal::GuestFrameOwner {
+                native_mm: MmGeneration::new(NonZeroU64::new(INITIAL_MM_KEY).unwrap()),
+                root_generation: ContextGeneration::new(NonZeroU64::MIN),
+            },
         )
         .unwrap();
         // Another exact retirement makes this rollback refuse; failure must
@@ -5384,7 +5391,10 @@ mod initial_reply_tests {
                 0,
                 4096,
                 NonZeroU64::MIN,
-                MmGeneration::new(NonZeroU64::new(mm.raw()).unwrap()),
+                carrick_hal::GuestFrameOwner {
+                    native_mm: MmGeneration::new(NonZeroU64::new(mm.raw()).unwrap()),
+                    root_generation: ContextGeneration::new(NonZeroU64::MIN),
+                },
             )
             .expect("owner-selected inventory");
             assert_eq!(
@@ -5415,7 +5425,12 @@ mod initial_reply_tests {
             0,
             4096,
             NonZeroU64::MIN,
-            MmGeneration::new(NonZeroU64::new(INITIAL_MM_KEY).expect("initial inventory MM")),
+            carrick_hal::GuestFrameOwner {
+                native_mm: MmGeneration::new(
+                    NonZeroU64::new(INITIAL_MM_KEY).expect("initial inventory MM"),
+                ),
+                root_generation: ContextGeneration::new(NonZeroU64::MIN),
+            },
         )
         .expect("initial MM inventory");
         inventory.rollback().expect("original custody rollback");
@@ -5449,9 +5464,12 @@ mod initial_reply_tests {
             })
             .unwrap();
         let foreign = carrick_hal::UnpublishedFrameInventoryApply::apply(
-            authority.physical_projection(Arc::clone(&ids)).bind(
-                carrick_guest_arch::MmGeneration::new(NonZeroU64::new(INITIAL_MM_KEY + 1).unwrap()),
-            ),
+            authority
+                .physical_projection(Arc::clone(&ids))
+                .bind(carrick_hal::GuestFrameOwner {
+                    native_mm: MmGeneration::new(NonZeroU64::new(INITIAL_MM_KEY + 1).unwrap()),
+                    root_generation: ContextGeneration::new(NonZeroU64::MIN),
+                }),
             reservation.commit(()),
         )
         .expect("foreign MM receipt");
@@ -5470,7 +5488,12 @@ mod initial_reply_tests {
             0,
             4096,
             NonZeroU64::MIN,
-            MmGeneration::new(NonZeroU64::new(INITIAL_MM_KEY).expect("initial inventory MM")),
+            carrick_hal::GuestFrameOwner {
+                native_mm: MmGeneration::new(
+                    NonZeroU64::new(INITIAL_MM_KEY).expect("initial inventory MM"),
+                ),
+                root_generation: ContextGeneration::new(NonZeroU64::MIN),
+            },
         )
         .expect("fresh exact inventory grant");
         inventory.frames[0].0 = FrameGpa::new(0x2_0000_1000);
@@ -5490,7 +5513,12 @@ mod initial_reply_tests {
                 0,
                 4096,
                 NonZeroU64::MIN,
-                MmGeneration::new(NonZeroU64::new(INITIAL_MM_KEY).expect("initial inventory MM")),
+                carrick_hal::GuestFrameOwner {
+                    native_mm: MmGeneration::new(
+                        NonZeroU64::new(INITIAL_MM_KEY).expect("initial inventory MM"),
+                    ),
+                    root_generation: ContextGeneration::new(NonZeroU64::MIN),
+                },
             )
             .expect("fresh physical grant");
             inventory.guest_exposed = exposed;
@@ -5515,7 +5543,12 @@ mod initial_reply_tests {
             2,
             4096,
             NonZeroU64::MIN,
-            MmGeneration::new(NonZeroU64::new(INITIAL_MM_KEY).expect("initial inventory MM")),
+            carrick_hal::GuestFrameOwner {
+                native_mm: MmGeneration::new(
+                    NonZeroU64::new(INITIAL_MM_KEY).expect("initial inventory MM"),
+                ),
+                root_generation: ContextGeneration::new(NonZeroU64::MIN),
+            },
         )
         .expect("staged exact grants");
         assert_eq!(grants.len(), 4);

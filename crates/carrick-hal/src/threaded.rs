@@ -2495,8 +2495,35 @@ pub enum OwnerFileFaultOutcome {
 /// Physical publication service over the existing kernel inventory and ID
 /// source. Binding retains one exact owner-selected MM; it grants no Linux
 /// process, VMA, permission or MM identity allocation policy to a backend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuestFrameOwner {
+    pub native_mm: carrick_guest_arch::MmGeneration,
+    pub root_generation: carrick_guest_arch::ContextGeneration,
+}
+
+impl From<carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>> for GuestFrameOwner {
+    fn from(context: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>) -> Self {
+        Self {
+            native_mm: context.mm,
+            root_generation: context.generation,
+        }
+    }
+}
+
+impl Ord for GuestFrameOwner {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        (self.native_mm.raw(), self.root_generation.raw())
+            .cmp(&(other.native_mm.raw(), other.root_generation.raw()))
+    }
+}
+impl PartialOrd for GuestFrameOwner {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 pub trait PhysicalFrameInventory: Send + Sync {
-    fn bind(&self, mm: carrick_guest_arch::MmGeneration) -> Arc<dyn FrameCowAuthority>;
+    fn bind(&self, owner: GuestFrameOwner) -> Arc<dyn FrameCowAuthority>;
     fn allocate_backing_ids(
         &self,
     ) -> Result<(crate::FrameId, crate::MappingId), Box<dyn std::error::Error + Send + Sync>>;
