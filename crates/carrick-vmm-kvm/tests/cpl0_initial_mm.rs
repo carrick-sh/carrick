@@ -314,22 +314,15 @@ fn production_initial_mm_admits_one_shared_reservation_root() {
 }
 
 #[test]
-fn production_user_page_fault_forwards_the_original_user_frame() {
+fn production_user_page_fault_terminates_with_sigsegv_in_ring() {
     let elf = production_fault_elf();
     let outcome = run_pool_fixture(&elf, 32);
-    let record = outcome.fault_record.expect("typed user fault");
+    assert!(outcome.fault_record.is_none(), "SIGSEGV stays in-ring");
     let exits = outcome.run.traps;
     assert_eq!(outcome.run.terminating_signal, Some(libc::SIGSEGV));
-    assert_eq!(record.vector, 14);
-    assert_eq!(record.cs & 3, 3);
-    assert_eq!(record.error_code & 7, 6);
-    assert_eq!(record.cr2, 0xdead000);
-    assert_eq!(record.rip, 0x4000b0 + 16 + 10);
-    assert_eq!(record.saved_rax, 0xdead000);
-    assert_eq!(record.linux_signal(), Some((libc::SIGSEGV, 1)));
     assert_eq!(
         outcome.physical.user_fault_state(0).expect("fault custody"),
-        (1, 0xdead000, 6, 0x4000b0 + 26, 6)
+        (1, 0xdead000, 6, 0x4000b0 + 26, 0)
     );
     assert_eq!(exits, 2);
 }
