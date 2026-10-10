@@ -103,6 +103,7 @@ pub enum NativeProcessError {
     Exhausted,
     Fault,
     Unsupported,
+    GroupExitCustody,
     Busy,
     Quarantined,
     NoChild,
@@ -126,7 +127,7 @@ impl NativeProcessError {
             Self::Invalid | Self::Stale => -22,
             Self::Exhausted | Self::Busy => -11,
             Self::Fault => -14,
-            Self::Unsupported => -38,
+            Self::Unsupported | Self::GroupExitCustody => -38,
             Self::Quarantined => -5,
             Self::NoChild => -10,
         }
@@ -959,6 +960,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         Ok(())
     }
 
+    // Dependency: owned interrupt cancellation. Parked futex/object operations
+    // retain their pending signals until their owner resumes; an IPI does not
+    // cancel their operation or release its queue/timer custody.
     fn interrupt_signal_record(&mut self, record: RecordRef) {
         if !signal_record_exists(self.source.zone, record) {
             return;
@@ -1473,7 +1477,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         self.exit_with_status(LinuxWaitStatus::from_wait_encoding(i32::from(status) << 8))
     }
     pub fn exit_with_signal(&mut self, sig: u8) -> Result<LifecycleOutcome, NativeProcessError> {
-        self.exit_with_status(LinuxWaitStatus::signaled(sig, false))
+        if self
+            .runtime
+            .graph
+            .lock()
+            .owner
+            .task(self.key)
+            .map_err(|_| NativeProcessError::Stale)?
+            .native()
+            .resources()
+            .page
+            .live()
+            != 1
+        {
+            return Err(NativeProcessError::GroupExitCustody);
+        }
+        let wait_status = LinuxWaitStatus::signaled(sig, false);
+        self.exit_with_status(wait_status)
     }
     pub fn exit_with_status(
         &mut self,
@@ -3949,6 +3969,20 @@ mod tests {
         let mut entry = runtime
             .enter(source, &task, words(address), &mut service)
             .unwrap();
+        assert_eq!(page.thread_born(), Some(2));
+        assert!(
+            matches!(
+                entry.exit_with_signal(15),
+                Err(NativeProcessError::GroupExitCustody)
+            ),
+            "two-live-member signal termination must name its custody dependency"
+        );
+        assert_eq!(
+            page.live(),
+            2,
+            "a refused group exit cannot retire shared memory"
+        );
+        page.release_live(1).unwrap();
         assert!(matches!(
             entry.exit_group(9),
             LifecycleOutcome::Transferred {

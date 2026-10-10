@@ -1,7 +1,7 @@
 # Shared in-ring signals: review scope and remaining owners
 
-The ARM host still owns signal delivery and rt_sigreturn. ARM syscall 139
-must remain unported; its dormant native frame builder/restorer is checked
+The ARM host still owns signal delivery and rt_sigreturn. ARM syscalls
+129 through 139 and 240 must remain unported; its dormant native frame builder/restorer is checked
 against canonical ABI records in VM-free tests. No signed ARM runtime
 verification was possible on the Linux worker.
 
@@ -25,8 +25,8 @@ These are named integration dependencies, not completed signal semantics:
 | M5 reset_for_exec | Identity/exec lane must admit a real x86 exec successor and call the existing reset hook | No new exec host crossing introduced |
 | M7 production WithWork runtime | x86 fd-table executor lane must own the production WORK_PORT handler | `signal_delivery_waits_for_the_owned_completion_ledger` proves ordering only |
 
-The director accepted these owner boundaries for review. The full KVM
-suite must still report each red explicitly. The three reds named in the brief (anonymous ELF, adjacent page journal,
+These owner boundaries do not waive new failing KVM tests. The full KVM
+suite must still report each red or explicitly named dependency. The three reds named in the brief (anonymous ELF, adjacent page journal,
 and arch_prctl) remain separate baseline failures. Full verification also
 found stdout poll and the authority-refusal witness red on the preserved
 origin/main plus private-ELF prerequisite artifact. Poll belongs to the
@@ -71,14 +71,43 @@ these unchanged witnesses when each mechanism lands.
 
 | Witness | Exact dependency / ignore reason | Green on `ab7caeb05`? |
 | --- | --- | --- |
-| `fork_reuses_retired_stock_matches_native` | x86 fork child-MM retirement returning reusable stock | No: exit 11 |
+| `fork_reuses_retired_stock_matches_native` | x86 child-MM retirement (work/fork-shared-retire) | No: exit 11 |
 | `signal_kills_reading_child_matches_native` | x86 in-ring pipe2/read fd-table continuations | No: exit 38 |
-| `signal_sigsuspend_loop_matches_native` | x86 fork child-MM retirement returning reusable stock | No: exit 11 |
+| `signal_sigsuspend_loop_matches_native` | x86 child-MM retirement (work/fork-shared-retire) | No: exit 11 |
 | `signal_stop_continue_matches_native` | shared process-owner stop/continue wait events | No: exit 99 |
-| `signal_wait_child_matches_native` | x86 fork child-MM retirement returning reusable stock | No: exit 11 |
+| `signal_wait_child_matches_native` | x86 child-MM retirement (work/fork-shared-retire) | No: exit 11 |
 
 The pre-ignore full run is recorded at
 `/tmp/ring-on-identity-full-kvm-red.log` (38 passed, 10 failed, 5 originally
 ignored). Identity's fixture table grant derived from shared image GPA plus
 size remains present. The obsolete cancellation revert was omitted during
 rebase, so it cannot remove identity's landed boundary correction.
+
+## Review dependency guards
+
+`x86 group exit custody` owns multi-member signal termination. Until it
+lands, default-fatal signals and forced SIGSEGV with `page.live() != 1`
+end the run through an authenticated `NativeRunFailure` crossing: exit 125,
+stderr naming `x86 group exit custody`, and the execution report's
+`run_failure` physical crossing count. This is a guard, not a reachable
+path today: x86 `CLONE_THREAD` is not admitted. The VM-free two-live-member
+SIGTERM contract checks this guard without retiring shared memory. The KVM
+two-thread witness carries `#[ignore = "x86 CLONE_THREAD admission"]`.
+Once admission lands, remove that ignore; the witness expects the named
+failure and must turn red when group exit custody lands, requiring a native
+SIGTERM comparison instead.
+
+`owned interrupt cancellation` owns signal interruption of zone-parked
+futex/object waits. An IPI currently only reaches OnCpu/home-Free records;
+it does not claim a parked operation. Signals remain queued and are checked
+at the next actual return to userspace after the wait owner resumes it.
+There is no bound for an indefinite wait without its natural wake; no
+polling or timer was added to hide that limitation. Native child waits and
+signal waits have their own owned interruption paths.
+
+The x86 timer interrupt currently expires only admitted signal waits, so
+its EAGAIN result is specific to that family. The x86 futex and object
+adapters require an ARM frame and forward today; nanosleep has no in-ring
+route. Before those waits move into CPL0, their timer completion must own
+its operation-specific result (ETIMEDOUT for futex, or object continuation
+expiry), rather than reusing the signal-wait errno.

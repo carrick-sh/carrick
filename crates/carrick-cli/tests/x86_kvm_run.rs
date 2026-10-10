@@ -691,13 +691,13 @@ fn mounted_static_x86_signal_resethand_matches_native() {
 }
 
 #[test]
-#[ignore = "x86 fork child-MM retirement returning reusable stock"]
+#[ignore = "x86 child-MM retirement (work/fork-shared-retire)"]
 fn mounted_static_x86_signal_sigsuspend_loop_matches_native() {
     // Three fork rounds also expose the shared child-MM stock retirement debt.
     compare_mounted_assembly_with_native("x86_signal_sigsuspend.S", b"S\n");
 }
 #[test]
-#[ignore = "x86 fork child-MM retirement returning reusable stock"]
+#[ignore = "x86 child-MM retirement (work/fork-shared-retire)"]
 fn mounted_static_x86_signal_wait_child_matches_native() {
     // Repeated child creation depends on shared child-MM stock retirement.
     compare_mounted_assembly_with_native("x86_signal_wait_child.S", b"W\n");
@@ -718,7 +718,7 @@ fn mounted_static_x86_signal_wait_pingpong_matches_native() {
 }
 
 #[test]
-#[ignore = "x86 fork child-MM retirement returning reusable stock"]
+#[ignore = "x86 child-MM retirement (work/fork-shared-retire)"]
 fn mounted_static_x86_fork_reuses_retired_stock_matches_native() {
     compare_mounted_assembly_with_native("x86_fork_stock_reuse.S", b"R\n");
 }
@@ -808,4 +808,35 @@ fn mounted_static_x86_signal_abort_without_core_matches_native() {
 fn mounted_static_x86_signal_noncanonical_handler_matches_native() {
     compare_mounted_fault_with_native("x86_signal_bad_handler.S");
     compare_mounted_fault_with_native("x86_signal_bad_fault_handler.S");
+}
+
+#[test]
+#[ignore = "x86 CLONE_THREAD admission"]
+fn mounted_static_x86_signal_group_exit_names_its_custody_dependency() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("group-exit");
+    let fixture = "x86_signal_group_exit_dependency.S";
+    compile_assembly(fixture, &elf);
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(5))
+        .output()
+        .unwrap();
+    assert_eq!(native.status.signal(), Some(libc::SIGTERM));
+    let run = run_mounted_binary(&elf, fixture, false);
+    assert_eq!(run.status.code(), Some(125));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stderr.contains("x86 group exit custody"), "{stderr}");
+    assert!(!stderr.contains("unexpected initial process port"));
+    let run = run_mounted_binary(&elf, fixture, true);
+    let json: serde_json::Value = serde_json::from_slice(&run.stdout).unwrap();
+    assert!(
+        json["report"]["execution_witness"]["physical_crossing_families"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["family"] == "run_failure" && row["count"] == 1)
+    );
 }
