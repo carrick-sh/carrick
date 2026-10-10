@@ -8408,10 +8408,14 @@ impl HvfInner {
                     // SAFETY: stopped lane retains the aligned initialized record;
                     // exact mapped physical custody was resolved above.
                     let record = unsafe { &*record_ptr };
+                    let ttbr = vcpu.get_sys_reg(SysReg::TTBR0_EL1).map_err(hvf_error)?;
+                    let binding = crate::metadata_grant::live_fork_execution(cpu, ttbr)
+                        .map(|execution| execution.binding)
+                        .or_else(|| crate::metadata_grant::terminal_root_binding(custody, cpu));
                     let (reason, crossings) = custody
                         .fork_stock
                         .lock()
-                        .service_run_failure(cpu, record)
+                        .service_run_failure(binding, record)
                         .map_err(|_| {
                             TrapError::Hypervisor(
                                 "native run failure record has stale execution binding".into(),

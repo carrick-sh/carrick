@@ -155,7 +155,7 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     fn prepare_mm_start(
         &mut self,
         parent: &Self::Mm,
-        words: C,
+        words: &C,
         child: MmGeneration,
     ) -> Result<Self::PreparedMmStart, NativeProcessError>;
     fn prepare_mm_publish(
@@ -1013,7 +1013,35 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             {
                 return Err(NativeProcessError::Stale);
             }
-            resources.members.push(NativeMember {
+            let child_tid = control.visible_tid().ok_or(NativeProcessError::Stale)?;
+            if !row.has_thread(child_tid) {
+                let born = control
+                    .entry()
+                    .and_then(|entry| page.born_record(entry))
+                    .ok_or(NativeProcessError::Stale)?;
+                let caller = state
+                    .members
+                    .iter()
+                    .find(|(caller, member)| {
+                        caller.task.id.raw() as u64 == born.caller_task
+                            && caller.thread_generation == born.caller_serial
+                            && member.process == process
+                            && Arc::ptr_eq(&member.runtime, &runtime)
+                    })
+                    .map(|(caller, _)| caller.task)
+                    .ok_or(NativeProcessError::Stale)?;
+                let caller_tid = row
+                    .native()
+                    .resources()
+                    .members
+                    .iter()
+                    .find(|member| member.thread == caller)
+                    .and_then(|member| member.control.visible_tid())
+                    .ok_or(NativeProcessError::Stale)?;
+                row.spawn_thread(caller_tid, child_tid)
+                    .map_err(|_| NativeProcessError::Stale)?;
+            }
+            row.native_mut().resources_mut().members.push(NativeMember {
                 thread: key.task,
                 process,
                 zone: source.zone,
@@ -2935,18 +2963,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             claim,
             thread_claim,
             parent_mm,
-            identity,
-            group,
-            session,
             signals,
-            parent_creds,
-            parent_rlimits,
-            parent_umask,
-            parent_personality,
-            parent_dumpable,
-            parent_no_new_privs,
-            parent_comm,
-            parent_container,
+            attributes,
         ) = {
             let mut graph = self.runtime.graph.lock();
             let row = graph
@@ -2957,23 +2975,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Err(NativeProcessError::Busy);
             }
             let parent_mm = row.native().resources().mm.clone();
-            let identity = row.identity();
-            let group = row.metadata().namespace_process_group;
-            let session = row.metadata().namespace_session;
             let signals = row.native().resources().signals.clone();
-            let caller_tid = self.calling_tid;
-            let parent_container = row.metadata().container;
-            let parent_creds = row
-                .credentials_for(caller_tid)
-                .map_err(|_| NativeProcessError::Stale)?
-                .clone();
-            let parent_rlimits = row.rlimits;
-            let parent_umask = row.umask;
-            let parent_personality = row.personality;
-            let parent_dumpable = row.dumpable;
-            let parent_no_new_privs = row.no_new_privs;
-            let parent_comm = *row
-                .comm_for(caller_tid)
+            let attributes = row
+                .fork_attributes(self.calling_tid)
                 .map_err(|_| NativeProcessError::Stale)?;
             let snapshot = graph
                 .owner
@@ -3043,18 +3047,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 claim,
                 thread_claim,
                 parent_mm,
-                identity,
-                group,
-                session,
                 signals,
-                parent_creds,
-                parent_rlimits,
-                parent_umask,
-                parent_personality,
-                parent_dumpable,
-                parent_no_new_privs,
-                parent_comm,
-                parent_container,
+                attributes,
             )
         };
         let signals = match signals.for_fork(child_key) {
@@ -3082,7 +3076,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let parent_identity = Box::new(parent_identity);
         let prepared_start = match self
             .service
-            .prepare_mm_start(&parent_mm, self.words, child_mm)
+            .prepare_mm_start(&parent_mm, &self.words, child_mm)
         {
             Ok(p) => p,
             Err(error) => {
@@ -3256,14 +3250,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             usage: TaskRusage::default(),
             file_table: child_file_table,
         };
-        let mut child = Box::new(GuestTask::new_with_boxed_context(
+        let mut child = GuestTask::new_with_boxed_context(
             GuestTaskMetadata {
                 key: child_key,
-                container: parent_container,
+                container: attributes.container,
                 namespace_pid: visible.get(),
-                identity,
-                namespace_process_group: group,
-                namespace_session: session,
+                identity: attributes.identity,
+                namespace_process_group: attributes.group,
+                namespace_session: attributes.session,
                 receipt_uid: |uid| uid,
                 exit_signal: ChildExitSignal::SIGCHLD,
                 diagnostic_name: String::from("native-child"),
@@ -3272,13 +3266,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             child_words,
             custody(resources),
             claim,
-        ));
-        child.init_leader(visible.get(), parent_creds, parent_comm);
-        child.rlimits = parent_rlimits;
-        child.umask = parent_umask;
-        child.personality = parent_personality;
-        child.dumpable = parent_dumpable;
-        child.no_new_privs = parent_no_new_privs;
+        );
+        child.init_leader(
+            visible.get(),
+            attributes.credentials.clone(),
+            attributes.comm,
+        );
+        child.rlimits = attributes.rlimits;
+        child.umask = attributes.umask;
+        child.personality = attributes.personality;
+        child.dumpable = attributes.dumpable;
+        child.no_new_privs = attributes.no_new_privs;
         let prep = Box::new(PreparedFork::from_reserved(
             snapshot,
             snapshot,
@@ -5110,7 +5108,7 @@ mod tests {
         fn prepare_mm_start(
             &mut self,
             _: &Self::Mm,
-            _: ParkedContextWords,
+            _: &ParkedContextWords,
             child: MmGeneration,
         ) -> Result<Self::PreparedMm, NativeProcessError> {
             let address = AddressContext {

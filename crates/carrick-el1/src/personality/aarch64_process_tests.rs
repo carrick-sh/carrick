@@ -674,7 +674,7 @@ fn test_abort_after_stock_loan_returns_every_page_once() {
     let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
 
     let start = service
-        .prepare_mm_start(&fixture.address, parked, child_mm)
+        .prepare_mm_start(&fixture.address, &parked, child_mm)
         .expect("prepare_mm_start should succeed");
     let published = service
         .prepare_mm_publish(start)
