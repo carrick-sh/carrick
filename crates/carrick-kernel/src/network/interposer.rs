@@ -107,31 +107,6 @@ impl HttpMock {
         self
     }
 
-    /// Add a route matching "METHOD /path" with custom headers, status code, and body.
-    pub fn route_with_headers(
-        mut self,
-        method_and_path: &str,
-        status_code: u16,
-        headers: Vec<(impl Into<String>, impl Into<String>)>,
-        body: impl AsRef<[u8]>,
-    ) -> Self {
-        let (method, path) = parse_method_and_path(method_and_path);
-        let status_text = status_code_text(status_code).to_string();
-        let headers = headers
-            .into_iter()
-            .map(|(k, v)| (k.into(), v.into()))
-            .collect();
-        self.routes.push(HttpRoute {
-            method,
-            path,
-            status_code,
-            status_text,
-            headers,
-            body: body.as_ref().to_vec(),
-        });
-        self
-    }
-
     /// Set the fallback response when no configured route matches.
     pub fn fallback(mut self, status_code: u16, body: impl AsRef<[u8]>) -> Self {
         let status_text = status_code_text(status_code).to_string();
