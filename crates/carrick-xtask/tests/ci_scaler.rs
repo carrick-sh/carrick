@@ -203,9 +203,29 @@ fn completed_job_remains_deduplicated_after_cleanup_and_restart() {
     let mut ledger = Ledger::default();
     ledger.reserve(job(1), &[], 10, Concurrency::ONE).unwrap();
     ledger.rows[0].state = State::Destroyed;
+    ledger.rows[0].assigned = Some(JobId(1));
     let mut ledger: Ledger = serde_json::from_slice(&serde_json::to_vec(&ledger).unwrap()).unwrap();
     assert!(ledger.reserve(job(1), &[], 20, Concurrency::ONE).is_err());
     assert!(ledger.reserve(job(2), &[], 20, Concurrency::ONE).is_ok());
+}
+
+#[test]
+fn a_job_whose_clone_closed_without_running_it_is_served_again_up_to_a_cap() {
+    let mut ledger = Ledger::default();
+    for serve in 0..MAX_SERVES_PER_JOB {
+        let row = ledger
+            .reserve(job(1), &[], 10 + serve as u64, Concurrency::ONE)
+            .unwrap();
+        // Still active: never served twice at once.
+        assert!(ledger.served(job(1)));
+        let last = ledger.rows.len() - 1;
+        ledger.rows[last].state = State::Destroyed;
+        // Assigned to some other job, or never assigned: not consumed.
+        ledger.rows[last].assigned = if serve == 0 { Some(JobId(99)) } else { None };
+        assert_eq!(ledger.rows[last].name, row.name);
+    }
+    assert!(ledger.served(job(1)), "cap reached");
+    assert!(ledger.reserve(job(1), &[], 99, Concurrency::ONE).is_err());
 }
 
 #[test]
@@ -311,6 +331,8 @@ fn pilot_job_start_rejects_wrong_repository_event_ref_and_sha() {
                 .into(),
         git_ref: "refs/heads/work/willow-pilot".into(),
         sha: sha.clone(),
+        run_id: 1,
+        run_attempt: 1,
     };
     assert!(pilot.authorize(&context).is_ok());
     assert!(
@@ -338,7 +360,76 @@ fn standing_context(event: &str, git_ref: &str) -> JobContext {
         workflow_ref: format!("{REPOSITORY}/{KERNEL_RUNTIME_WORKFLOW}@{git_ref}"),
         git_ref: git_ref.into(),
         sha: "c".repeat(40),
+        run_id: 77,
+        run_attempt: 2,
     }
+}
+
+fn bound() -> JobPolicy {
+    JobPolicy::Bound(RunBinding {
+        run: RunId(77),
+        attempt: 2,
+        sha: "c".repeat(40),
+    })
+}
+
+#[test]
+fn bound_hook_admits_only_the_vetted_run_attempt_and_sha() {
+    let push = standing_context("push", "refs/heads/main");
+    assert!(bound().authorize(&push).is_ok());
+    let mut other = standing_context("push", "refs/heads/main");
+    other.run_id = 78;
+    assert!(bound().authorize(&other).is_err(), "another run");
+    let mut other = standing_context("push", "refs/heads/main");
+    other.run_attempt = 3;
+    assert!(bound().authorize(&other).is_err(), "another attempt");
+    let mut other = standing_context("push", "refs/heads/main");
+    other.sha = "d".repeat(40);
+    assert!(bound().authorize(&other).is_err(), "another SHA");
+    // The binding never widens the standing policy.
+    assert!(
+        bound()
+            .authorize(&standing_context("pull_request", "refs/heads/main"))
+            .is_err()
+    );
+    let mut foreign = standing_context("push", "refs/heads/main");
+    foreign.workflow_ref = format!("{REPOSITORY}/.github/workflows/ci.yml@refs/heads/main");
+    assert!(bound().authorize(&foreign).is_err());
+}
+
+fn queue(entries: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"data":{"repository":{"mergeQueue":{"entries":{"nodes": entries}}}}})
+}
+fn entry(position: u64, oid: &str, head: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"position": position, "headCommit": {"oid": oid},
+        "pullRequest": {"number": position, "headRepository": head}})
+}
+
+#[test]
+fn merge_group_with_a_fork_pull_request_is_refused() {
+    let ours = serde_json::json!({"nameWithOwner": REPOSITORY});
+    let fork = serde_json::json!({"nameWithOwner": "fork/carrick"});
+    let (a, b, c) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+    let trusted = queue(serde_json::json!([
+        entry(1, &a, ours.clone()),
+        entry(2, &b, ours.clone()),
+        entry(3, &c, fork.clone()),
+    ]));
+    assert!(merge_group_heads_trusted(&trusted, &a));
+    assert!(merge_group_heads_trusted(&trusted, &b));
+    // The group ending at c contains the fork PR.
+    assert!(!merge_group_heads_trusted(&trusted, &c));
+    // A fork entry ahead taints every later group.
+    let ahead = queue(serde_json::json!([
+        entry(1, &a, fork),
+        entry(2, &b, ours.clone())
+    ]));
+    assert!(!merge_group_heads_trusted(&ahead, &b));
+    // A deleted head repository is not trusted; an unqueued SHA is refused.
+    let deleted = queue(serde_json::json!([entry(1, &a, serde_json::Value::Null)]));
+    assert!(!merge_group_heads_trusted(&deleted, &a));
+    assert!(!merge_group_heads_trusted(&trusted, &"d".repeat(40)));
+    assert!(!merge_group_heads_trusted(&serde_json::json!({}), &a));
 }
 
 #[test]
@@ -445,15 +536,27 @@ fn standing_demand_serves_only_trusted_kernel_runtime_runs() {
 }
 
 #[test]
-fn admission_policy_file_round_trips_and_rejects_unknown_text() {
+fn job_policy_file_round_trips_and_rejects_unknown_text() {
     for policy in [
-        Admission::Standing,
-        Admission::pilot(&"e".repeat(40)).unwrap(),
+        bound(),
+        JobPolicy::Pilot {
+            sha: "e".repeat(40),
+        },
     ] {
-        assert_eq!(Admission::parse(&policy.render()).unwrap(), policy);
+        assert_eq!(JobPolicy::parse(&policy.render()).unwrap(), policy);
     }
-    for text in ["", "standing extra", "pilot", "pilot short", "anything"] {
-        assert!(Admission::parse(text).is_err(), "{text:?}");
+    let sha = "e".repeat(40);
+    for text in [
+        "".to_owned(),
+        "standing".to_owned(),
+        "pilot".to_owned(),
+        "pilot short".to_owned(),
+        format!("standing run=x attempt=1 sha={sha}"),
+        format!("standing run=1 attempt=0 sha={sha}"),
+        "standing run=1 attempt=1 sha=short".to_owned(),
+        format!("standing attempt=1 run=1 sha={sha}"),
+    ] {
+        assert!(JobPolicy::parse(&text).is_err(), "{text:?}");
     }
 }
 
@@ -462,14 +565,17 @@ fn serial_host_policy_file_must_be_owner_writable_only() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("policy");
-    std::fs::write(&path, "standing\n").unwrap();
+    std::fs::write(&path, format!("{}\n", bound().render())).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    assert_eq!(read_policy(&path).unwrap(), Admission::Standing);
+    let uid = unsafe { libc::geteuid() };
+    assert_eq!(read_policy(&path, Some(uid)).unwrap(), bound());
+    // Production requires root ownership.
+    assert!(read_policy(&path, Some(uid.wrapping_add(1))).is_err());
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
-    assert!(read_policy(&path).is_err());
+    assert!(read_policy(&path, None).is_err());
     let link = dir.path().join("link");
     std::os::unix::fs::symlink(&path, &link).unwrap();
-    assert!(read_policy(&link).is_err());
+    assert!(read_policy(&link, None).is_err());
 }
 
 #[test]
@@ -526,7 +632,9 @@ fn workflow_runner_labels_are_the_controller_label_constants() {
     assert_eq!(runs_on(kernel, "kvm-tests"), LABELS);
     assert_eq!(runs_on(pilot, "kvm"), LABELS);
     assert_eq!(runs_on(kernel, "hvf-kernel"), HVF_LABELS);
-    assert_eq!(runs_on(kernel, "hvf-closure"), HVF_LABELS);
+    // The closure job never takes the merge-queue runner.
+    assert_eq!(runs_on(kernel, "hvf-closure"), HVF_CLOSURE_LABELS);
+    assert_ne!(HVF_CLOSURE_LABELS, HVF_LABELS);
 }
 
 #[test]
@@ -542,6 +650,32 @@ fn self_hosted_jobs_never_run_on_pull_request_events() {
         );
     }
     assert_eq!(docs[0]["on"]["push"]["branches"][0].as_str(), Some("main"));
+}
+
+#[test]
+fn one_always_job_requires_both_trusted_hardware_lanes() {
+    let kernel = include_str!("../../../.github/workflows/kernel-runtime.yml");
+    let docs = yaml_rust2::YamlLoader::load_from_str(kernel).unwrap();
+    let ok = &docs[0]["jobs"]["trusted-hardware-ok"];
+    assert_eq!(ok["if"].as_str(), Some("${{ always() }}"));
+    let needs: Vec<_> = ok["needs"]
+        .as_vec()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap())
+        .collect();
+    assert!(needs.contains(&"hvf-kernel") && needs.contains(&"kvm-tests"));
+    let script = ok["steps"][0]["run"].as_str().unwrap();
+    assert!(script.contains("test \"$HVF\" = success"));
+    assert!(script.contains("test \"$KVM\" = success"));
+    // No step interpolates the merge-group base SHA into a shell script.
+    for job in docs[0]["jobs"].as_hash().unwrap().values() {
+        for step in job["steps"].as_vec().into_iter().flatten() {
+            if let Some(run) = step["run"].as_str() {
+                assert!(!run.contains("github.event.merge_group"), "{run}");
+            }
+        }
+    }
 }
 
 #[test]
