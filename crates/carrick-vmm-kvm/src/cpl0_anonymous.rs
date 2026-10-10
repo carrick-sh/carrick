@@ -584,6 +584,16 @@ impl Cpl0HostCustody {
             return Err(fail("no initial table grant for the maintenance root"));
         }
         let maintenance = unused.remove(0);
+        // The guest reads both roots through its direct window to verify
+        // the shared supervisor entries before every maintenance install.
+        if maintenance
+            .address()
+            .raw()
+            .checked_add(4096)
+            .is_none_or(|end| end > carrick_el1_abi::X86_CPL0_DIRECT_WINDOW_BYTES)
+        {
+            return Err(fail("maintenance root outside the CPL0 direct window"));
+        }
         let source = self
             ._vm
             .read(initial_root.address(), 4096)
