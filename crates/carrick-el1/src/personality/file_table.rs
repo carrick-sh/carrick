@@ -625,7 +625,6 @@ mod tests {
             let fd = entry
                 .binding
                 .stdio_fd()
-                .map(i32::from)
                 .or_else(|| entry.binding.host_fd().map(HostBoundFd::raw))
                 .expect("host binding");
             let mut pfd = libc::pollfd {
