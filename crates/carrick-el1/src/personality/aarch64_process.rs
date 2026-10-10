@@ -345,12 +345,31 @@ impl core::fmt::Debug for Born<'_> {
 }
 
 pub trait ForkStockCrossing {
+    /// The carrier's shared descriptor metadata, owned by the guest kernel.
+    fn fd_map(&self) -> &[carrick_el1_abi::FdMapSlot] {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            unsafe {
+                &*(carrick_el1_abi::EL1_FD_MAP_BASE
+                    as *const [carrick_el1_abi::FdMapSlot; carrick_el1_abi::FD_MAP_CAPACITY])
+            }
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        {
+            &[]
+        }
+    }
+
     fn cross_fork_stock(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError>;
     fn cross_root_exit(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError>;
     fn cross_child_retire(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError>;
 }
 
 impl<T: ForkStockCrossing> ForkStockCrossing for &T {
+    fn fd_map(&self) -> &[carrick_el1_abi::FdMapSlot] {
+        (**self).fd_map()
+    }
+
     fn cross_fork_stock(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
         (**self).cross_fork_stock(record_gpa, cpu)
     }
@@ -1171,6 +1190,18 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     }
     fn wake_effects(&mut self, effects: WakeEffects) {
         deliver_wakes(effects);
+    }
+    fn fork_fd_table(
+        &mut self,
+        parent_table: u64,
+        child_table: u64,
+    ) -> Result<(), NativeProcessError> {
+        super::file_table::fork_fd_map(self.crossing.fd_map(), parent_table, child_table)
+            .then_some(())
+            .ok_or(NativeProcessError::Exhausted)
+    }
+    fn retire_fd_table(&mut self, table: u64) {
+        super::file_table::retire_fd_map(self.crossing.fd_map(), table);
     }
 }
 
