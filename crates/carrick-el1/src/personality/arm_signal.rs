@@ -239,7 +239,7 @@ impl carrick_guest_arch::SignalBackend for crate::isa::aarch64::Aarch64Backend {
 
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         unsafe {
-            core::arch::asm!("msr sp_el0, {}", in(reg) new_sp, options(nomem, nostack));
+            crate::isa::aarch64::set_signal_stack(UserVa::new(new_sp));
         }
 
         Ok(UserVa::new(new_sp))
@@ -252,13 +252,7 @@ impl carrick_guest_arch::SignalBackend for crate::isa::aarch64::Aarch64Backend {
         copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool,
     ) -> Result<carrick_signal_core::policy::SigBlockMask, Self::Error> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-        let sp_val = {
-            let sp: u64;
-            unsafe {
-                core::arch::asm!("mrs {}, sp_el0", out(reg) sp, options(nomem, nostack));
-            }
-            sp
-        };
+        let sp_val = { unsafe { crate::isa::aarch64::signal_stack().raw() } };
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         let sp_val = 0u64;
 
@@ -275,7 +269,7 @@ impl carrick_guest_arch::SignalBackend for crate::isa::aarch64::Aarch64Backend {
 
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         unsafe {
-            core::arch::asm!("msr sp_el0, {}", in(reg) saved_sp, options(nomem, nostack));
+            crate::isa::aarch64::set_signal_stack(UserVa::new(saved_sp));
         }
 
         Ok(carrick_signal_core::policy::SigBlockMask::blocking_all_of(
