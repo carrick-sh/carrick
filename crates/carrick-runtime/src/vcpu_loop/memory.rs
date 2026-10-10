@@ -597,6 +597,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         // Kernel COW authority is constructed. It seals the transport's exact
         // semantic and physical publication tuple while independently choosing
         // the retained owner incarnation and generation that will be signed.
+        let inventory_owner = self.inventory_owner.owner();
         let owner = self.owner_inventory.retain_current(gpa, length)?;
         let owner_generation = owner.generation();
         // Row exactness is proven inside the apply (see `apply_frame_grant`);
@@ -605,7 +606,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
             .kernel
             .frame_inventory()
             .apply_grant_with_receipt(
-                self.mm(),
+                *inventory_owner,
                 commit,
                 carrick_kernel::kernel::ExactMappingRow {
                     mapping,
@@ -615,12 +616,7 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
                 },
             )
             .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?;
-        let expected_mm = std::num::NonZeroU64::new(self.mm().raw()).unwrap_or_else(|| {
-            carrick_fatal!(
-                "kernel::mm_identity",
-                "KernelFrameCowAuthority target MmId is zero"
-            )
-        });
+        let expected_mm = inventory_owner.receipt_mm();
         if receipt.mm() != expected_mm || !receipt.authorizes(mapping, frame) || !owner.is_current()
         {
             carrick_fatal!(
@@ -630,7 +626,8 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         }
         let proof = KernelForeignCowProof::new(
             Arc::clone(&self.kernel),
-            self.mm(),
+            self.inventory_owner.clone(),
+            *inventory_owner,
             semantic_start,
             semantic_len,
             receipt.revision(),
@@ -669,13 +666,14 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         // transport retries. The owner retention pins the current host
         // incarnation for the duration of the mint, and its generation is the
         // one the prepared write will re-verify against the extent ledger.
+        let inventory_owner = self.inventory_owner.owner();
         let owner = self.owner_inventory.retain_current(gpa, length)?;
         let owner_generation = owner.generation();
         if !self
             .kernel
             .frame_inventory()
             .mapping_is_live_exact_at_revision(
-                self.mm(),
+                *inventory_owner,
                 inventory_revision,
                 mapping,
                 frame,
@@ -690,7 +688,8 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         }
         let proof = KernelForeignCowProof::new(
             Arc::clone(&self.kernel),
-            self.mm(),
+            self.inventory_owner.clone(),
+            *inventory_owner,
             semantic_start,
             semantic_len,
             inventory_revision,
@@ -1166,7 +1165,8 @@ mod tests {
             carrick_hal::ForeignOwnerGeneration::from_backend_counter(NonZeroU64::new(61).unwrap());
         let proof = carrick_kernel::kernel::KernelForeignCowProof::new(
             Arc::clone(kernel),
-            mm,
+            child.shared().mm().frame_owner_authority(),
+            *child.shared().mm().frame_owner(),
             GuestVa(0x3000),
             std::num::NonZeroUsize::new(physical_len as usize).unwrap(),
             inventory_revision,
@@ -3790,6 +3790,180 @@ mod tests {
                 transport_chosen_owner,
             ),
             "transport-selected owner generation was accepted by the kernel proof issuer"
+        );
+    }
+
+    #[test]
+    fn foreign_cow_proof_authenticates_transferred_guest_owner() {
+        let (kernel, root) = bootstrap(31_128);
+        let mm = root.shared().mm().id();
+        let tid = ThreadId::synthetic_for_tests(31_128);
+        let capacity = carrick_hal::FrameEventCapacity::for_event_count(2).unwrap();
+        let mut reservation = kernel.reserve_frame_inventory(1, 1, capacity).unwrap();
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().unwrap();
+        let mapping = reservation.claim_mapping().unwrap();
+        let generation =
+            carrick_hal::MappingGeneration::from_backend_counter(NonZeroU64::new(1).unwrap());
+        let gpa = Gpa(0xd000);
+        let length =
+            carrick_hal::FrameLength::from_mapping_extent(NonZeroU64::new(0x4000).unwrap());
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa,
+                length,
+                permissions: carrick_hal::MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+        let current_owner =
+            carrick_hal::ForeignOwnerGeneration::from_backend_counter(NonZeroU64::new(61).unwrap());
+        let transport_chosen_owner =
+            carrick_hal::ForeignOwnerGeneration::from_backend_counter(NonZeroU64::new(62).unwrap());
+        let authority = crate::vcpu_loop::kernel_frame_cow_authority_for_test(
+            Arc::clone(&kernel),
+            root.shared().mm(),
+            tid,
+            7,
+            crate::vcpu_loop::fixed_frame_cow_owner_inventory_for_test(current_owner),
+        );
+
+        let guest = carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::guest_arch_binding::core_arch::MmGeneration::new(
+                NonZeroU64::new(91002).unwrap(),
+            ),
+            root_generation: carrick_hal::guest_arch_binding::core_arch::ContextGeneration::new(
+                NonZeroU64::new(7).unwrap(),
+            ),
+        };
+        kernel
+            .transfer_frame_inventory_to_guest(&root, guest)
+            .unwrap();
+        let (receipt, proof, authenticated_owner) = authority
+            .apply_foreign_cow(
+                reservation.commit(()),
+                GuestVa(0x3000),
+                std::num::NonZeroUsize::new(0x4000).unwrap(),
+                mapping,
+                frame,
+                gpa,
+                length,
+            )
+            .expect("apply foreign COW inventory transaction");
+        assert_eq!(receipt.mm(), guest.native_mm.raw());
+        let proof = proof
+            .downcast_ref::<carrick_kernel::kernel::KernelForeignCowProof>()
+            .expect("runtime-private kernel proof");
+
+        assert!(
+            authenticated_owner == current_owner,
+            "proof issuer returned a transport-selected owner generation"
+        );
+        assert!(
+            proof.authenticates(
+                &kernel,
+                mm,
+                GuestVa(0x3000),
+                0x4000,
+                receipt.revision(),
+                mapping,
+                frame,
+                gpa,
+                length.raw(),
+                current_owner,
+            ),
+            "proof issuer signed a transport-chosen owner instead of the independent current owner"
+        );
+        assert!(
+            !proof.authenticates(
+                &kernel,
+                mm,
+                GuestVa(0x3000),
+                0x4000,
+                receipt.revision(),
+                mapping,
+                frame,
+                gpa,
+                length.raw(),
+                transport_chosen_owner,
+            ),
+            "transport-selected owner generation was accepted by the kernel proof issuer"
+        );
+        let (identity_proof, identity_owner) = authority
+            .attest_foreign_identity_write(
+                GuestVa(0x3000),
+                std::num::NonZeroUsize::new(0x4000).unwrap(),
+                receipt.revision(),
+                mapping,
+                frame,
+                gpa,
+                length,
+            )
+            .expect("identity write through guest owner");
+        assert!(
+            identity_proof
+                .downcast_ref::<KernelForeignCowProof>()
+                .unwrap()
+                .authenticates(
+                    &kernel,
+                    mm,
+                    GuestVa(0x3000),
+                    0x4000,
+                    receipt.revision(),
+                    mapping,
+                    frame,
+                    gpa,
+                    length.raw(),
+                    identity_owner,
+                )
+        );
+        let stale_root = carrick_hal::GuestFrameOwner {
+            root_generation: carrick_hal::guest_arch_binding::core_arch::ContextGeneration::new(
+                NonZeroU64::new(8).unwrap(),
+            ),
+            ..guest
+        };
+        let wrong_root_proof = KernelForeignCowProof::new(
+            Arc::clone(&kernel),
+            root.shared().mm().frame_owner_authority(),
+            carrick_kernel::kernel::FrameOwner::GuestMm(stale_root),
+            GuestVa(0x3000),
+            std::num::NonZeroUsize::new(0x4000).unwrap(),
+            receipt.revision(),
+            mapping,
+            frame,
+            gpa,
+            length,
+            current_owner,
+        );
+        assert!(
+            !wrong_root_proof.authenticates(
+                &kernel,
+                mm,
+                GuestVa(0x3000),
+                0x4000,
+                receipt.revision(),
+                mapping,
+                frame,
+                gpa,
+                length.raw(),
+                current_owner,
+            ),
+            "the same native MM number must not authorize another root generation"
         );
     }
 

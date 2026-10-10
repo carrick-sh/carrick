@@ -1,7 +1,7 @@
 //! Kernel-minted proof that a foreign copy-on-write break was authorized.
 //!
 //! The proof names only kernel identities (the exact `Kernel`, the target
-//! `MmId`, the semantic range, the frame-inventory revision, the `MappingId`
+//! semantic `MmId`, the exact typed frame owner, the semantic range, the frame-inventory revision, the `MappingId`
 //! and `FrameId`, the physical extent and the owner generation). A transport
 //! carries it opaquely through the HAL receipt and can only hand back a
 //! proof this kernel minted; it never learns how to forge one.
@@ -15,7 +15,8 @@ use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub struct KernelForeignCowProof {
     kernel: Arc<crate::kernel::Kernel>,
-    mm: crate::kernel::MmId,
+    owner_authority: crate::kernel::FrameOwnerAuthority,
+    inventory_owner: crate::kernel::FrameOwner,
     semantic_start: carrick_guest_mem::GuestVa,
     semantic_len: std::num::NonZeroUsize,
     inventory_revision: u64,
@@ -30,7 +31,8 @@ impl KernelForeignCowProof {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         kernel: Arc<crate::kernel::Kernel>,
-        mm: crate::kernel::MmId,
+        owner_authority: crate::kernel::FrameOwnerAuthority,
+        inventory_owner: crate::kernel::FrameOwner,
         semantic_start: carrick_guest_mem::GuestVa,
         semantic_len: std::num::NonZeroUsize,
         inventory_revision: u64,
@@ -42,7 +44,8 @@ impl KernelForeignCowProof {
     ) -> Self {
         Self {
             kernel,
-            mm,
+            owner_authority,
+            inventory_owner,
             semantic_start,
             semantic_len,
             inventory_revision,
@@ -76,8 +79,10 @@ impl KernelForeignCowProof {
         else {
             return false;
         };
+        let current_owner = self.owner_authority.owner();
         Arc::ptr_eq(&self.kernel, kernel)
-            && self.mm == mm
+            && self.owner_authority.semantic_mm() == mm
+            && *current_owner == self.inventory_owner
             && self.semantic_start == semantic_start
             && self.semantic_len == semantic_len
             && self.inventory_revision == inventory_revision
@@ -87,7 +92,7 @@ impl KernelForeignCowProof {
             && self.physical_len == physical_len
             && self.owner_generation == owner_generation
             && kernel.frame_inventory().mapping_is_live_exact_at_revision(
-                mm,
+                self.inventory_owner,
                 inventory_revision,
                 mapping,
                 frame,

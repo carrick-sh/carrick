@@ -960,7 +960,8 @@ pub fn cow_fixture(
     );
     let proof = crate::kernel::KernelForeignCowProof::new(
         Arc::clone(kernel),
-        mm,
+        child.shared().mm().frame_owner_authority(),
+        *child.shared().mm().frame_owner(),
         GuestVa(0x3000),
         std::num::NonZeroUsize::new(physical_len as usize).unwrap(),
         inventory_revision,
@@ -972,7 +973,8 @@ pub fn cow_fixture(
     );
     let ptrace_proof = crate::kernel::KernelForeignCowProof::new(
         Arc::clone(kernel),
-        mm,
+        child.shared().mm().frame_owner_authority(),
+        *child.shared().mm().frame_owner(),
         GuestVa(0x3000),
         std::num::NonZeroUsize::new(0x1000).unwrap(),
         inventory_revision,
