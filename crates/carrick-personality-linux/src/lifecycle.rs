@@ -1,6 +1,7 @@
 //! Linux lifecycle policy over neutral pool transitions and native context hooks.
 use crate::abi::entry::SyscallResult;
 use crate::abi::thread::*;
+use crate::native_run_failure::NativeRunFailureReason;
 pub use carrick_syscall_abi::LinuxWaitOptions;
 
 /// Linux `pid_t` selector carried by wait4 (including negative selectors).
@@ -91,7 +92,7 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     fn take_handoff_receipt(&mut self) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
         None
     }
-    fn take_run_failure(&mut self) -> Option<crate::native_run_failure::NativeRunFailureReason> {
+    fn take_run_failure(&mut self) -> Option<NativeRunFailureReason> {
         None
     }
     fn binding(&self) -> ExecutionBinding;
@@ -193,6 +194,8 @@ pub struct ExitRecord {
 /// ISA hooks acquire retained metadata and move real native context. They do
 /// not route, validate clone flags, lower errno or publish entry completion.
 pub trait LifecycleNative<'a>: UserCopy {
+    /// Terminal custody loss must never become a guest errno or leave exit parked.
+    fn fail_lifecycle(&mut self, reason: NativeRunFailureReason) -> !;
     fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
         Ok(())
     }
@@ -667,8 +670,8 @@ fn serve_clone<'a>(
         Err(TransitionError::GateClosed(_)) => {
             // A speculative claim may have been observed by an exit before
             // the gate check backed it out. That rollback also owes a wake.
-            if let Err(error) = native.lifecycle_admission_settled() {
-                return Some(error);
+            if native.lifecycle_admission_settled().is_err() {
+                native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
             }
             return Some(-11);
         }
@@ -680,8 +683,8 @@ fn serve_clone<'a>(
         }
     };
     // This exact owned claim is the sole authority for Claimed -> Reserved.
-    // Refusal below is an invariant failure (EIO); do not publish settlement
-    // as though the rollback succeeded.
+    // A refused rollback is terminal; a parked exit must not be stranded, and
+    // settlement must never be published as though the rollback succeeded.
     let entry = claimed.entry();
     // Bound at the clone instant (director ruling 2): the caller's mask and
     // affinity as they are now.
@@ -689,28 +692,28 @@ fn serve_clone<'a>(
     let (Some(identity), Some(child_slot)) = (page.identity(entry), native.born_slot(page, entry))
     else {
         if page.unclaim(claimed).is_err() {
-            return Some(-5);
+            native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
         }
-        if let Err(error) = native.lifecycle_admission_settled() {
-            return Some(error);
+        if native.lifecycle_admission_settled().is_err() {
+            native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
         return None;
     };
     let Ok(visible) = i32::try_from(identity.visible_tid) else {
         if page.unclaim(claimed).is_err() {
-            return Some(-5);
+            native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
         }
-        if let Err(error) = native.lifecycle_admission_settled() {
-            return Some(error);
+        if native.lifecycle_admission_settled().is_err() {
+            native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
         return None;
     };
     if !child_slot.publish_visible_tid(identity.visible_tid) {
         if page.unclaim(claimed).is_err() {
-            return Some(-5);
+            native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
         }
-        if let Err(error) = native.lifecycle_admission_settled() {
-            return Some(error);
+        if native.lifecycle_admission_settled().is_err() {
+            native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
         return None;
     }
@@ -727,20 +730,20 @@ fn serve_clone<'a>(
     }) else {
         // Exhausted: the identity goes back to the pool, the host clones.
         if page.unclaim(claimed).is_err() {
-            return Some(-5);
+            native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
         }
-        if let Err(error) = native.lifecycle_admission_settled() {
-            return Some(error);
+        if native.lifecycle_admission_settled().is_err() {
+            native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
         return None;
     };
     if !outputs.publish(identity.visible_tid, native) {
         native.free_record(record);
         if page.unclaim(claimed).is_err() {
-            return Some(-5);
+            native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
         }
-        if let Err(error) = native.lifecycle_admission_settled() {
-            return Some(error);
+        if native.lifecycle_admission_settled().is_err() {
+            native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
         return None;
     }
@@ -749,10 +752,10 @@ fn serve_clone<'a>(
         outputs.rollback(native);
         native.free_record(record);
         if page.unclaim(claimed).is_err() {
-            return Some(-5);
+            native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
         }
-        if let Err(error) = native.lifecycle_admission_settled() {
-            return Some(error);
+        if native.lifecycle_admission_settled().is_err() {
+            native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
         return None;
     }
@@ -790,15 +793,15 @@ fn serve_clone<'a>(
         if let Some(claimed) = claim
             && page.unclaim(claimed).is_err()
         {
-            return Some(-5);
+            native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
         }
-        if let Err(error) = native.lifecycle_admission_settled() {
-            return Some(error);
+        if native.lifecycle_admission_settled().is_err() {
+            native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
         }
         return Some(error);
     }
-    if let Err(error) = native.lifecycle_admission_settled() {
-        return Some(error);
+    if native.lifecycle_admission_settled().is_err() {
+        native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
     }
     Some(visible as i64)
 }

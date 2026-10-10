@@ -78,6 +78,12 @@ impl<
     Context: super::dispatch::DispatchContext,
 > LifecycleNative<'a> for El1PendingFamilies<'a, F, C, U, G, Context>
 {
+    fn fail_lifecycle(&mut self, reason: carrick_el1_abi::NativeRunFailureReason) -> ! {
+        let binding = LifecycleNative::binding(self).unwrap_or_else(|| {
+            super::dispatch::invalid_completion(super::dispatch::NativeInvariant::EntryBinding)
+        });
+        super::native_run_failure::complete_native_run_failure(binding, reason)
+    }
     fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
         if let Some(venue) = self.process_venue() {
             venue.lifecycle_admission_settled()?;

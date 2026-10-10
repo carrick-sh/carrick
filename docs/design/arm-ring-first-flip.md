@@ -547,15 +547,15 @@ Production shared CPL0 thread exit needs native lifecycle scheduler/context
 integration, owned by the x86 executor-pool lane. It is not implemented by this
 identity port. Production dispatch supplies no ARM scheduler zone
 (`crates/carrick-x86-cpl0/src/entry.rs:1924`), and the common adapter requires
-`arm_scheduler()` plus a zone (`crates/carrick-el1/src/personality/lifecycle.rs:191`).
-Its wake hook requires an ARM frame (`lifecycle.rs:306`). The x86 wake adapter at
+`arm_scheduler()` plus a zone (`crates/carrick-el1/src/personality/lifecycle.rs:197`).
+Its wake hook requires an ARM frame (`lifecycle.rs:312`). The x86 wake adapter at
 `crates/carrick-x86/src/cpl0_lifecycle.rs:615` is included by the fixture lane
 (`crates/carrick-x86-cpl0/src/fixture.rs:24`); that is not a production binding.
 
 ARM's existing reference clears the four-byte user word at
-`crates/carrick-personality-linux/src/lifecycle.rs:886` and invokes the single
-futex wake at `lifecycle.rs:888`. The real ARM adapter selects the MM-scoped
-scheduler wake at `crates/carrick-el1/src/personality/lifecycle.rs:294`, using
+`crates/carrick-personality-linux/src/lifecycle.rs:892` and invokes the single
+futex wake at `lifecycle.rs:894`. The real ARM adapter selects the MM-scoped
+scheduler wake at `crates/carrick-el1/src/personality/lifecycle.rs:300`, using
 `crates/carrick-el1/src/sched.rs:151`. The VM-free production-dispatch test
 `exit_of_a_born_thread_clears_cleartid_wakes_the_joiner_and_runs_it`
 (`crates/carrick-el1/src/personality/lifecycle/tests.rs:969`) starts a thread,
@@ -602,6 +602,21 @@ signals lane. This is a typed authenticated `NativeRunFailure`, ending the run
 with exit 125 and a named diagnostic, never a guest-visible exit_group errno.
 The live>1 guard is unreachable in production x86 while CPL0 does not admit
 CLONE_THREAD. It does not pretend to perform group-wide cancellation.
+
+ARM native dispatch consumes retained run failures before returning any action.
+Its HVC fatal transport authenticates the retained supervisor record against
+that CPU's active execution, counts the crossing once, and propagates the named
+failure through carrier cleanup with exit 125. The ARM owner-admission lane
+can therefore reuse the shared lifecycle owner without stranding a retired
+lane. Signed ARM transport validation remains director-owned.
+
+Only live sibling custody uses the group-exit dependency reason. Stale,
+quarantined, exhausted and other process failures retain distinct typed causes,
+including resumed exit failures. A failed claim rollback or settlement stops
+the run through the same authenticated terminal transport: clone never returns
+an errno for a child already queued, and a parked exit is never left waiting
+for a settlement that cannot be published. The real serve_clone witnesses cover
+both terminal paths.
 
 ### Known strict identity refusals and owed work
 
