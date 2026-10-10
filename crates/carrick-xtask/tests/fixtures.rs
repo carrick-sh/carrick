@@ -447,13 +447,13 @@ fn roundtrip_restores_exact_paths_and_verifies_installed_bytes() {
     let f = Fixture::new();
     fixtures::verify_bundle(f.repo.path(), &f.path, None).unwrap();
     fixtures::restore(f.repo.path(), &f.path, None).unwrap();
-    assert_eq!(
-        fixtures::verify_installed(f.repo.path())
-            .unwrap()
-            .executables
-            .len(),
-        10
-    );
+    let installed = fixtures::verify_installed(f.repo.path()).unwrap();
+    // Four probe ELFs, one raw fixture, five embed fixtures and GNU startup.
+    assert_eq!(installed.executables.len(), 11);
+    assert!(installed.executables.iter().any(|executable| {
+        executable.path == "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-gnu/release/carrick-linux-aarch64-ring-first-glibc"
+            && executable.target == GuestTarget::Gnu
+    }));
     for e in &f.manifest.executables {
         assert_eq!(
             hash(&fs::read(f.repo.path().join(&e.path)).unwrap()),
