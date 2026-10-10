@@ -366,6 +366,7 @@ mod macos_helper_stubs {
     feature = "platform-freebsd",
     feature = "platform-netbsd"
 ))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
 use macos_helper_stubs::{
     forked_child_die_by_signal, hardware_tso_for_debug, stop_after_traced_exec, stop_by_signal,
 };

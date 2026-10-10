@@ -1441,6 +1441,7 @@ fn destroy_vm() -> Result<(), RuntimeError> {
     feature = "platform-freebsd",
     feature = "platform-netbsd"
 ))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
 fn destroy_vm() -> Result<(), RuntimeError> {
     Ok(())
 }
