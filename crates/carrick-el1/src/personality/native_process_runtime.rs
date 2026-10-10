@@ -826,7 +826,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     ) -> Result<(), carrick_syscall_abi::LinuxErrno> {
         use carrick_personality_linux::abi::signal::LINUX_ESRCH;
         let sig = request.number();
-        let visible = selector.positive().ok_or(LINUX_ESRCH)?;
+        let visible = selector
+            .positive()
+            .ok_or(carrick_syscall_abi::LINUX_EINVAL)?;
         let graph = self.runtime.graph.lock();
         let mut selected = None;
         for row in graph.owner.tasks().values() {
