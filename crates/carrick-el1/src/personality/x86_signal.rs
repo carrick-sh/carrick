@@ -45,6 +45,16 @@ impl X86Backend {
             & !15)
             .checked_sub(8)
             .ok_or(ArchError::InvalidFrame)?;
+        // Both syscall and page-fault delivery use this codec. Reject a guest
+        // target before copying or publishing return words: the final return
+        // validator protects supervisor invariants and must never see this fault.
+        if !carrick_sched_core::valid_user_return_words(
+            params.handler.raw(),
+            new_sp,
+            resume.flags.raw() & !((1 << 10) | (1 << 8)),
+        ) {
+            return Err(ArchError::InvalidFrame);
+        }
         let mut fp_image = [0u8; FP_BYTES + 4];
         fp_image[..FP_BYTES].copy_from_slice(fpstate);
         fp_image[5] = 0; // reserved high byte of abridged x87 tag word
