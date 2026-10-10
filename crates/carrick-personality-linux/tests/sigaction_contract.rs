@@ -250,3 +250,69 @@ fn suspend_restore_rechecks_delivery_at_the_same_user_return() {
     );
     assert_eq!(native.calls, 1, "unchanged masks need no second pass");
 }
+
+#[test]
+fn invalid_signal_requests_are_served_without_owner_fallback() {
+    for number in [0, 65, u64::MAX, i32::MIN as u64] {
+        for (call, args) in [
+            (SignalCall::RtSigaction, [number, 0, 0, 8, 0, 0]),
+            (SignalCall::Kill, [1, number, 0, 0, 0, 0]),
+            (SignalCall::Tkill, [1, number, 0, 0, 0, 0]),
+            (SignalCall::Tgkill, [1, 1, number, 0, 0, 0]),
+            (SignalCall::RtSigqueueinfo, [1, number, 1, 0, 0, 0]),
+            (SignalCall::RtTgsigqueueinfo, [1, 1, number, 1, 0, 0]),
+        ] {
+            // Signal zero is an existence probe for send calls, not sigaction.
+            if number == 0 && call != SignalCall::RtSigaction {
+                continue;
+            }
+            let mut native = Native {
+                args,
+                calls: 0,
+                fail: false,
+            };
+            assert_eq!(
+                result(invoke(call, &mut native)),
+                Some(-22),
+                "{call:?}: {number}"
+            );
+            assert_eq!(native.calls, 0, "invalid input must not enter the owner");
+        }
+    }
+}
+
+#[test]
+fn installing_kill_and_stop_is_served_einval() {
+    for number in [9, 19] {
+        let mut native = Native {
+            args: [number, 1, 0, 8, 0, 0],
+            calls: 0,
+            fail: false,
+        };
+        assert_eq!(
+            result(invoke(SignalCall::RtSigaction, &mut native)),
+            Some(-22)
+        );
+        assert_eq!(native.calls, 0);
+    }
+}
+
+#[test]
+fn malformed_signal_sizes_and_thread_groups_are_served_einval() {
+    for (call, args) in [
+        (SignalCall::RtSigaction, [10, 0, 0, 0, 0, 0]),
+        (SignalCall::RtSigpending, [1, 0, 0, 0, 0, 0]),
+        (SignalCall::RtSigsuspend, [1, 0, 0, 0, 0, 0]),
+        (SignalCall::RtSigtimedwait, [1, 0, 0, 0, 0, 0]),
+        (SignalCall::Tgkill, [0, 1, 10, 0, 0, 0]),
+        (SignalCall::RtTgsigqueueinfo, [u64::MAX, 1, 10, 1, 0, 0]),
+    ] {
+        let mut native = Native {
+            args,
+            calls: 0,
+            fail: false,
+        };
+        assert_eq!(result(invoke(call, &mut native)), Some(-22), "{call:?}");
+        assert_eq!(native.calls, 0);
+    }
+}
