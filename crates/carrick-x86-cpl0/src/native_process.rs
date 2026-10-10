@@ -340,7 +340,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             return Err(NativeProcessError::Stale);
         }
         let owner = portal()?;
-        drain_retired_spaces(&owner, self.worker())?;
+        let _ = drain_retired_spaces(&owner, self.worker());
         let mm = ReservationMm::new(parent.mm.raw().get()).ok_or(NativeProcessError::Stale)?;
         let live = anonymous::live_words(mm).ok_or(NativeProcessError::Stale)?;
         let capacity = owner.fork_mapping_count(mm, self.worker()).map_err(error)?;
@@ -493,14 +493,21 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
                 .abort(&owner, &p.words, self.worker())
                 .map_err(error)
         });
-        if let Err(e) = result {
-            return Err((e, p));
+        if let Ok(owner) = portal()
+            && let Some(index) = owner.spaces.find(p.child.completion().child.mm().raw())
+        {
+            owner.spaces.free(index);
         }
-        // The graph rollback has removed the record's only readers.
+        if !carrick_el1::personality::fork_loan::scrub_tables(&p.words, &p.loan) {
+            return Err((NativeProcessError::Quarantined, p));
+        }
         if !abort_loan(&p.loan) {
             return Err((NativeProcessError::Quarantined, p));
         }
-        Ok(())
+        match result {
+            Ok(()) => Ok(()),
+            Err(e) => Err((e, p)),
+        }
     }
     fn settle_mm(&mut self, born: Box<Born>) -> Result<(), (NativeProcessError, Box<Born>)> {
         settle(born, self.worker())
@@ -659,9 +666,16 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         // missing reply is a crossing integrity fault.
         match retire.take(binding, mm) {
             Some(Ok(())) => {}
-            Some(Err(_)) => carrick_el1_abi::record_native_fork_failure(
-                carrick_el1_abi::NativeForkFailureStage::ChildRetireRefused,
-            ),
+            Some(Err(carrick_el1_abi::ChildRetireRefusal::Stale)) => {
+                carrick_el1_abi::record_native_fork_failure(
+                    carrick_el1_abi::NativeForkFailureStage::ChildRetireRefusedStale,
+                );
+            }
+            Some(Err(carrick_el1_abi::ChildRetireRefusal::Invalid)) => {
+                carrick_el1_abi::record_native_fork_failure(
+                    carrick_el1_abi::NativeForkFailureStage::ChildRetireRefusedInvalid,
+                );
+            }
             None => fatal(),
         }
         // Absence is published only after CR3 left the retired root; the

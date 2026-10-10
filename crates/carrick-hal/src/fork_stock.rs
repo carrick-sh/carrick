@@ -878,6 +878,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
             if !clear_lifecycle(pending.lifecycle) {
                 return Err(ForkStockServiceError::MemoryAccessFailed);
             }
+            self.tags.release_unpublished(pending.tag)?;
             let pending = self.pending[index]
                 .take()
                 .ok_or(ForkStockServiceError::NoPendingLoan)?;
@@ -890,7 +891,6 @@ impl<T: ChildAddressTags> ForkStock<T> {
             self.tables.extend(pending.child_tables);
             self.tables.extend(pending.parent_tables);
             self.lifecycles.push(pending.lifecycle);
-            self.tags.release_unpublished(pending.tag)?;
         } else {
             let completion =
                 self.validate_commit(execution, settlement, &is_resolvable, &is_clean)?;

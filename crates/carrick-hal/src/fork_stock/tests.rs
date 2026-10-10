@@ -362,6 +362,94 @@ fn abort_returns_cleared_lifecycle_and_untouched_tables() {
 }
 
 #[test]
+fn abort_settle_is_atomic_on_tag_release_failure() {
+    struct FailingReleaseTags;
+    impl ChildAddressTags for FailingReleaseTags {
+        type Tag = ();
+        fn allocate(&mut self) -> Option<()> {
+            Some(())
+        }
+        fn wire((): ()) -> Option<carrick_guest_arch::Asid> {
+            None
+        }
+        fn release_unpublished(&mut self, (): ()) -> Result<(), ForkStockServiceError> {
+            Err(ForkStockServiceError::InvalidRecord)
+        }
+        fn retire(
+            &mut self,
+            _tag: ChildTag<()>,
+            _absence: SlotAbsence,
+        ) -> Result<(), ForkStockServiceError> {
+            Ok(())
+        }
+    }
+
+    let mut stock = stock(FailingReleaseTags, 4, 1);
+    let granted = loan(&mut stock, parent(), 302, 2, 1).unwrap();
+    assert_eq!(stock.table_stock().len(), 1);
+    assert!(!stock.lifecycle_available());
+
+    let mut abort = ForkStockSettlement::abort(granted);
+    let result = stock.settle(
+        &mut NoTableLedger,
+        parent(),
+        &mut abort,
+        |_| true,
+        |_| true,
+        |_| true,
+    );
+    assert_eq!(result, Err(ForkStockServiceError::InvalidRecord));
+    assert_eq!(stock.table_stock().len(), 1);
+    assert!(!stock.lifecycle_available());
+    assert!(stock.pending(CpuId::new(0)).is_some());
+}
+
+#[test]
+fn abort_refuses_dirty_tables_and_subsequent_loan_refuses_until_scrubbed_and_aborted() {
+    let mut stock = stock(UntaggedRoots, 4, 1);
+    let exec = parent();
+    let granted = loan(&mut stock, exec, 302, 2, 1).unwrap();
+    let mut abort = ForkStockSettlement::abort(granted);
+    let is_clean = std::cell::Cell::new(false);
+
+    let result = stock.settle(
+        &mut NoTableLedger,
+        exec,
+        &mut abort,
+        |_| true,
+        |_| is_clean.get(),
+        |_| true,
+    );
+    assert_eq!(result, Err(ForkStockServiceError::ExposedDirtyTable));
+    assert!(stock.pending(CpuId::new(0)).is_some());
+
+    let mut exchange = ForkStockExchange::new(request(exec, 302, 1, 1)).unwrap();
+    assert_eq!(
+        stock.loan(&mut NoTableLedger, exec, &mut exchange, |_| true),
+        Err(ForkStockRefusal::Capacity)
+    );
+
+    is_clean.set(true);
+    let result = stock.settle(
+        &mut NoTableLedger,
+        exec,
+        &mut abort,
+        |_| true,
+        |_| is_clean.get(),
+        |_| true,
+    );
+    assert_eq!(result, Ok(()));
+    assert!(stock.pending(CpuId::new(0)).is_none());
+
+    let mut second_exchange = ForkStockExchange::new(request(exec, 302, 1, 1)).unwrap();
+    assert!(
+        stock
+            .loan(&mut NoTableLedger, exec, &mut second_exchange, |_| true)
+            .is_ok()
+    );
+}
+
+#[test]
 fn commit_refuses_dirty_unused_tables() {
     let mut stock = stock(UntaggedRoots, 4, 1);
     let granted = loan(&mut stock, parent(), 302, 2, 1).unwrap();

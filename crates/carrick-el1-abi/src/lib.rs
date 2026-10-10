@@ -5184,8 +5184,10 @@ mod layout_manifest {
 )]
 #[repr(u64)]
 pub enum NativeForkFailureStage {
-    /// The carrier refused a fork child's retirement; its stock stays held.
-    ChildRetireRefused = 62,
+    /// The carrier refused a fork child's retirement because the record was stale.
+    ChildRetireRefusedStale = 62,
+    /// The carrier refused a fork child's retirement because the record was invalid.
+    ChildRetireRefusedInvalid = 63,
 }
 
 #[cfg(target_os = "none")]
