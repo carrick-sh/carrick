@@ -2620,3 +2620,19 @@ mod ipc_wait {
         assert_eq!(zone.record(record).claim(), Claim::Free);
     }
 }
+
+#[test]
+fn contended_timer_expiry_rearms_without_consuming_the_park() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    let record = el1_park(&zone, SLOT, 1, 0x1000, 500);
+    let guard = zone
+        .lock(ZoneTables::bucket_of(MM, 0x1000), &HostWait)
+        .unwrap();
+    assert_eq!(zone.expire_timer_and_rearm(SLOT, 500, 123, 10), Some(510));
+    assert_eq!(zone.timer_deadline(SLOT), Some(500));
+    assert_eq!(zone.record(record).claim(), Claim::Parked { seq: 1 });
+    drop(guard);
+    assert_eq!(zone.expire_timer_and_rearm(SLOT, 510, 123, 10), None);
+    assert_eq!(zone.switch_in_full(SLOT).unwrap().result, Some(123));
+}
