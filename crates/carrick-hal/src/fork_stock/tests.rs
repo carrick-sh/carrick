@@ -557,10 +557,12 @@ fn kvm_live_children_beyond_lifecycle_records_are_counted_refusals() {
             x86_lifecycles(8),
         )
         .unwrap();
+    let mut granted = Vec::new();
     for child_mm in 302..310 {
-        let granted = x86_loan(&mut stock, window, child_mm).unwrap();
-        guest_initializes(window, granted.lifecycle);
-        commit(&mut stock, parent(), granted, 1, 0).unwrap();
+        let loan = x86_loan(&mut stock, window, child_mm).unwrap();
+        guest_initializes(window, loan.lifecycle);
+        commit(&mut stock, parent(), loan, 1, 0).unwrap();
+        granted.push(loan);
     }
     assert_eq!(
         x86_loan(&mut stock, window, 310),
@@ -568,6 +570,28 @@ fn kvm_live_children_beyond_lifecycle_records_are_counted_refusals() {
     );
     assert_eq!(stock.counters().capacity_refusals, 1);
     assert_eq!(stock.live_children(), 8);
+    // The limit counts live children, not forks: once one child is retired
+    // and reclaimed, the refused fork is admitted.
+    retire(&mut stock, child_of(granted[0], 900)).unwrap();
+    let returned = stock
+        .reclaim(
+            &mut NoTableLedger,
+            mm(PARENT_MM),
+            absent,
+            |_| true,
+            |life| window.clear(life),
+            |_| true,
+        )
+        .unwrap();
+    assert_eq!(returned, 1);
+    assert!(x86_loan(&mut stock, window, 310).is_ok());
+    assert_eq!(stock.counters().capacity_refusals, 1);
+    assert!(
+        stock
+            .counters()
+            .families()
+            .contains(&("capacity_refusal", 1))
+    );
 }
 
 #[test]
