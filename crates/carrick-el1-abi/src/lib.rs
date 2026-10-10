@@ -2518,6 +2518,10 @@ pub struct Counters {
     pub first_process_admission_root: AtomicU64,
     /// First ARM admission stage that actually failed (see `admit_entry`).
     pub first_process_admission_stage: AtomicU64,
+    /// First root-registry refusal: publication tag, then observed and registered
+    /// task, execution generation, MM, thread generation, address generation,
+    /// record id and record incarnation (seven words per identity).
+    pub first_process_registry_refusal: [AtomicU64; 15],
     /// Completed milestones of owner-served ARM forks.
     pub native_fork_progress: [AtomicU64; NativeForkProgress::COUNT],
 }
@@ -2539,6 +2543,7 @@ impl Counters {
             first_process_missing_entry: AtomicU64::new(0),
             first_process_admission_root: AtomicU64::new(0),
             first_process_admission_stage: AtomicU64::new(0),
+            first_process_registry_refusal: [const { AtomicU64::new(0) }; 15],
             native_fork_progress: [const { AtomicU64::new(0) }; NativeForkProgress::COUNT],
         }
     }
@@ -2608,6 +2613,13 @@ impl Counters {
             Ordering::Relaxed,
         );
         for (target, source) in snapshot
+            .first_process_registry_refusal
+            .iter()
+            .zip(&self.first_process_registry_refusal)
+        {
+            target.store(source.load(Ordering::Acquire), Ordering::Relaxed);
+        }
+        for (target, source) in snapshot
             .native_fork_progress
             .iter()
             .zip(&self.native_fork_progress)
@@ -2670,6 +2682,21 @@ impl Counters {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
+    }
+
+    pub fn record_first_process_registry_refusal(&self, observed: [u64; 7], registered: [u64; 7]) {
+        if self.first_process_registry_refusal[0]
+            .compare_exchange(0, u64::MAX, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            for (target, value) in self.first_process_registry_refusal[1..]
+                .iter()
+                .zip(observed.into_iter().chain(registered))
+            {
+                target.store(value, Ordering::Relaxed);
+            }
+            self.first_process_registry_refusal[0].store(1, Ordering::Release);
+        }
     }
 
     pub fn record_native_fork_progress(&self, stage: NativeForkProgress) {
@@ -4013,9 +4040,9 @@ const _: () = {
     );
 };
 #[cfg(target_arch = "aarch64")]
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0xf80e_a375_83e4_ba96);
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x9cdc6e5153bc05c7);
 #[cfg(not(target_arch = "aarch64"))]
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x088b_6e7e_d7d1_e8da);
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x872a389c195ace73);
 
 #[cfg(test)]
 mod tests {
@@ -4030,6 +4057,23 @@ mod tests {
                 .first_process_admission_root
                 .load(Ordering::Acquire),
             1
+        );
+    }
+
+    #[test]
+    fn first_registry_refusal_keeps_both_identity_domains() {
+        let counters = Counters::new();
+        counters.record_first_process_registry_refusal(
+            [11, 12, 13, 14, 15, 16, 17],
+            [21, 22, 23, 24, 25, 26, 27],
+        );
+        counters.record_first_process_registry_refusal([0; 7], [0; 7]);
+        let snapshot = counters.copy_snapshot();
+        assert_eq!(
+            snapshot
+                .first_process_registry_refusal
+                .map(|word| word.load(Ordering::Acquire)),
+            [1, 11, 12, 13, 14, 15, 16, 17, 21, 22, 23, 24, 25, 26, 27]
         );
     }
 
@@ -4258,12 +4302,13 @@ mod tests {
                 + 513
                 + ProcessRefusal::COUNT
                 + 4
+                + 15
                 + NativeForkProgress::COUNT)
                 * 8
         );
         assert_eq!(
             core::mem::offset_of!(Counters, first_native_fork_failure),
-            core::mem::size_of::<Counters>() - (NativeForkProgress::COUNT + 4) * 8
+            core::mem::size_of::<Counters>() - (NativeForkProgress::COUNT + 4 + 15) * 8
         );
         assert_eq!(core::mem::offset_of!(Counters, served), 0);
         assert_eq!(core::mem::offset_of!(Counters, forwarded), 512 * 8);

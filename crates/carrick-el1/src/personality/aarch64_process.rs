@@ -249,8 +249,41 @@ pub fn admit_entry(
     );
     REGISTRY
         .register_root(runtime.clone(), source, task, address)
-        .map_err(|error| admission_error(counters, AdmissionStage::RootRegistry, error))?;
+        .map_err(|error| {
+            record_registry_refusal(source, task, address, page, counters);
+            admission_error(counters, AdmissionStage::RootRegistry, error)
+        })?;
     Ok((runtime, address, words))
+}
+
+// Keep diagnostic scratch out of the successful, nearly full fork stack.
+#[inline(never)]
+fn record_registry_refusal(
+    source: BornInZoneSource<'static, Aarch64ParkedContext>,
+    task: &CurrentTask,
+    address: Mm,
+    page: &ThreadLifecyclePage,
+    counters: &carrick_el1_abi::Counters,
+) {
+    let record = source
+        .zone
+        .slot(source.slot)
+        .current()
+        .or_else(|| source.zone.slot(source.slot).host_record());
+    let observed = [
+        task.execution.task.load(Ordering::Acquire),
+        task.execution.generation.load(Ordering::Acquire),
+        task.mm.key.load(Ordering::Acquire),
+        task.mm.thread_generation.load(Ordering::Acquire),
+        address.generation.raw().get(),
+        record.map_or(0, |id| u64::from(id.raw())),
+        record.map_or(0, |id| source.zone.record(id).incarnation()),
+    ];
+    let registered = task
+        .visible_pid()
+        .and_then(|pid| REGISTRY.registered_group_identity(source.zone, address, page, pid))
+        .unwrap_or([0; 7]);
+    counters.record_first_process_registry_refusal(observed, registered);
 }
 
 pub struct Prepared<'a> {
