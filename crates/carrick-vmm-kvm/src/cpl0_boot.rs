@@ -214,7 +214,10 @@ pub enum PhysicalProcessExit {
 impl PhysicalProcessExit {
     pub fn into_initial_process_exit(self, exits: usize) -> InitialProcessExit {
         match self {
-            Self::Exited(status) => InitialProcessExit::Exited { code: status.code(), exits },
+            Self::Exited(status) => InitialProcessExit::Exited {
+                code: status.code(),
+                exits,
+            },
             Self::RunFailed(reason) => InitialProcessExit::RunFailed { reason, exits },
         }
     }
@@ -1302,7 +1305,8 @@ impl ProductionCpuLease {
                 }
                 carrick_el1_abi::NATIVE_RUN_FAILURE_PORT => {
                     let reason = custody.service_run_failure(&lease)?;
-                    custody.run_failure_crossings = custody.run_failure_crossings
+                    custody.run_failure_crossings = custody
+                        .run_failure_crossings
                         .checked_add(1)
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
                     Ok(Some(PhysicalProcessExit::RunFailed(reason)))
@@ -1312,7 +1316,9 @@ impl ProductionCpuLease {
                         .root_exit_crossings
                         .checked_add(1)
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
-                    custody.service_root_exit(&lease).map(|status| Some(PhysicalProcessExit::Exited(status)))
+                    custody
+                        .service_root_exit(&lease)
+                        .map(|status| Some(PhysicalProcessExit::Exited(status)))
                 }
                 _ => Err(fail("unexpected idle peer physical doorbell")),
             }
@@ -1664,7 +1670,10 @@ impl ProductionCpuFactory {
                 PhysicalCrossingFamily::RootExit,
                 custody.root_exit_crossings,
             ),
-            (PhysicalCrossingFamily::RunFailure, custody.run_failure_crossings),
+            (
+                PhysicalCrossingFamily::RunFailure,
+                custody.run_failure_crossings,
+            ),
         ])
     }
 
