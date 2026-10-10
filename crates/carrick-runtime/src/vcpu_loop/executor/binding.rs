@@ -610,20 +610,28 @@ pub(crate) struct ExecBindingReplacement<B> {
     pub(crate) authority: Option<SubmissionAuthority>,
 }
 
-#[derive(Default)]
-pub(crate) struct HvpatchTaskBindingDirectory {
+pub(crate) struct TaskBindingDirectory<B> {
     pub(crate) bindings:
-        Mutex<std::collections::BTreeMap<(ThreadKey, ExecutionGeneration), HvpatchTaskRecord>>,
+        Mutex<std::collections::BTreeMap<(ThreadKey, ExecutionGeneration), TaskBindingRecord<B>>>,
     scheduler: Mutex<std::sync::Weak<Scheduler>>,
 }
 
-pub(crate) struct HvpatchTaskRecord {
-    pub(crate) binding: Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
+impl<B> Default for TaskBindingDirectory<B> {
+    fn default() -> Self {
+        Self {
+            bindings: Mutex::new(std::collections::BTreeMap::new()),
+            scheduler: Mutex::new(std::sync::Weak::new()),
+        }
+    }
+}
+
+pub(crate) struct TaskBindingRecord<B> {
+    pub(crate) binding: Arc<B>,
     pub(crate) authority: Option<SubmissionAuthority>,
     pub(crate) active: bool,
 }
 
-impl HvpatchTaskBindingDirectory {
+impl<B: PersistentTaskBinding + Send + Sync + 'static> TaskBindingDirectory<B> {
     pub(crate) fn install_scheduler(
         self: &Arc<Self>,
         scheduler: &Arc<Scheduler>,
@@ -645,14 +653,14 @@ impl HvpatchTaskBindingDirectory {
         &self,
         thread: ThreadKey,
         generation: ExecutionGeneration,
-        binding: Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
+        binding: Arc<B>,
     ) -> Result<(), TrapError> {
         if self
             .bindings
             .lock()
             .insert(
                 (thread, generation),
-                HvpatchTaskRecord {
+                TaskBindingRecord {
                     binding,
                     authority: None,
                     active: true,
@@ -671,6 +679,49 @@ impl HvpatchTaskBindingDirectory {
         self.bindings.lock().remove(&(thread, generation));
     }
 
+    pub(crate) fn resolve_active(
+        &self,
+        thread: ThreadKey,
+        generation: ExecutionGeneration,
+    ) -> Result<Arc<B>, TrapError> {
+        let bindings = self.bindings.lock();
+        match bindings.get(&(thread, generation)) {
+            Some(record) if record.active => Ok(Arc::clone(&record.binding)),
+            Some(_) => Err(TrapError::Hypervisor(
+                "exact HVPatch task binding is still dormant".to_owned(),
+            )),
+            None => Err(TrapError::Hypervisor(
+                "missing exact HVPatch task binding".to_owned(),
+            )),
+        }
+    }
+
+    pub(crate) fn take_authority(
+        &self,
+        thread: ThreadKey,
+        generation: ExecutionGeneration,
+    ) -> Option<SubmissionAuthority> {
+        let mut bindings = self.bindings.lock();
+        let record = bindings.get_mut(&(thread, generation))?;
+        record.active.then(|| record.authority.take()).flatten()
+    }
+
+    pub(crate) fn restore_authority(
+        &self,
+        authority: SubmissionAuthority,
+    ) -> Result<(), SubmissionAuthority> {
+        let key = (authority.thread_key(), authority.generation());
+        let mut bindings = self.bindings.lock();
+        let Some(record) = bindings.get_mut(&key) else {
+            return Err(authority);
+        };
+        if !record.active || record.authority.is_some() {
+            return Err(authority);
+        }
+        record.authority = Some(authority);
+        Ok(())
+    }
+
     pub(crate) fn prepare_submission(
         self: &Arc<Self>,
         scheduler: &Scheduler,
@@ -678,8 +729,8 @@ impl HvpatchTaskBindingDirectory {
         grant_authority: Option<&SubmissionAuthority>,
         thread: Arc<carrick_kernel::kernel::Thread>,
         generation: ExecutionGeneration,
-        binding: Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>,
-    ) -> Result<PreparedHvpatchSubmission, TrapError> {
+        binding: Arc<B>,
+    ) -> Result<PreparedTaskSubmission<B>, TrapError> {
         let key = (thread.key(), generation);
         let mut bindings = self.bindings.lock();
         if bindings.contains_key(&key) {
@@ -727,13 +778,13 @@ impl HvpatchTaskBindingDirectory {
         };
         bindings.insert(
             key,
-            HvpatchTaskRecord {
+            TaskBindingRecord {
                 binding,
                 authority: Some(authority),
                 active: false,
             },
         );
-        Ok(PreparedHvpatchSubmission {
+        Ok(PreparedTaskSubmission {
             directory: Arc::clone(self),
             key,
             armed: true,
@@ -865,13 +916,13 @@ impl TaskActivationProof {
     }
 }
 
-pub(crate) struct PreparedHvpatchSubmission {
-    directory: Arc<HvpatchTaskBindingDirectory>,
+pub(crate) struct PreparedTaskSubmission<B> {
+    directory: Arc<TaskBindingDirectory<B>>,
     key: (ThreadKey, ExecutionGeneration),
     armed: bool,
 }
 
-impl PreparedHvpatchSubmission {
+impl<B: PersistentTaskBinding + Send + Sync + 'static> PreparedTaskSubmission<B> {
     pub(crate) fn activate(
         mut self,
         scheduler: &Scheduler,
@@ -902,7 +953,7 @@ impl PreparedHvpatchSubmission {
             let record = bindings.get_mut(&self.key).ok_or_else(|| {
                 TrapError::Hypervisor("missing dormant HVPatch submission".to_owned())
             })?;
-            if record.active || record.binding.identity() != proof.identity {
+            if record.active || record.binding.load_identity() != proof.identity {
                 return Err(TrapError::Hypervisor(
                     "HVPatch dormant binding identity changed before activation".to_owned(),
                 ));
@@ -930,7 +981,7 @@ impl PreparedHvpatchSubmission {
     }
 }
 
-impl Drop for PreparedHvpatchSubmission {
+impl<B> Drop for PreparedTaskSubmission<B> {
     fn drop(&mut self) {
         if self.armed {
             let mut bindings = self.directory.bindings.lock();
@@ -1068,8 +1119,8 @@ impl std::fmt::Debug for PreparedVforkChildActivation {
     }
 }
 
-impl carrick_kernel::kernel::scheduler::SchedulerGenerationObserver
-    for HvpatchTaskBindingDirectory
+impl<B: PersistentTaskBinding + Send + Sync + 'static>
+    carrick_kernel::kernel::scheduler::SchedulerGenerationObserver for TaskBindingDirectory<B>
 {
     fn transition(
         &self,
@@ -1130,7 +1181,7 @@ impl carrick_kernel::kernel::scheduler::SchedulerGenerationObserver
         // nothing will ever ask for this pair again. Dropping it releases the
         // `SubmissionAuthority` it holds, which is what lets the run queue
         // drain and the container finish closing.
-        HvpatchTaskBindingDirectory::retire(self, thread, predecessor);
+        TaskBindingDirectory::retire(self, thread, predecessor);
     }
 }
 
@@ -1146,48 +1197,21 @@ impl TaskBindingResolver<crate::vcpu_loop::continuation::HvpatchTaskBinding>
         thread: ThreadKey,
         generation: ExecutionGeneration,
     ) -> Result<Arc<crate::vcpu_loop::continuation::HvpatchTaskBinding>, TrapError> {
-        let bindings = self.bindings.lock();
-        // Two different defects wear one message otherwise, and telling them
-        // apart is the whole diagnosis when an executor claims a row it
-        // cannot service: a record that is PRESENT but dormant means the row
-        // became claimable before its submission activated (a claimability
-        // gate hole), while an ABSENT record means the row outlived the
-        // binding it named -- or predated any binding at all, which is what
-        // named the pre-publication window.
-        match bindings.get(&(thread, generation)) {
-            Some(record) if record.active => Ok(Arc::clone(&record.binding)),
-            Some(_) => Err(TrapError::Hypervisor(
-                "exact HVPatch task binding is still dormant".to_owned(),
-            )),
-            None => Err(TrapError::Hypervisor(
-                "missing exact HVPatch task binding".to_owned(),
-            )),
-        }
+        self.resolve_active(thread, generation)
     }
     fn take_submission_authority(
         &self,
         thread: ThreadKey,
         generation: ExecutionGeneration,
     ) -> Option<SubmissionAuthority> {
-        let mut bindings = self.bindings.lock();
-        let record = bindings.get_mut(&(thread, generation))?;
-        record.active.then(|| record.authority.take()).flatten()
+        self.take_authority(thread, generation)
     }
 
     fn restore_submission_authority(
         &self,
         authority: SubmissionAuthority,
     ) -> Result<(), SubmissionAuthority> {
-        let key = (authority.thread_key(), authority.generation());
-        let mut bindings = self.bindings.lock();
-        let Some(record) = bindings.get_mut(&key) else {
-            return Err(authority);
-        };
-        if !record.active || record.authority.is_some() {
-            return Err(authority);
-        }
-        record.authority = Some(authority);
-        Ok(())
+        self.restore_authority(authority)
     }
 
     fn retire(&self, thread: ThreadKey, generation: ExecutionGeneration) {

@@ -617,7 +617,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     fn prepare_mm_start(
         &mut self,
         parent: &Self::Mm,
-        words: Aarch64ParkedContext,
+        words: &Aarch64ParkedContext,
         child_mm: MmGeneration,
     ) -> Result<Self::PreparedMmStart, NativeProcessError> {
         if !words.authenticates(*parent) {

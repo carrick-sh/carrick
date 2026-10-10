@@ -205,7 +205,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
     fn prepare_mm_start(
         &mut self,
         parent: &Mm,
-        words: ParkedContextWords,
+        words: &ParkedContextWords,
         child_mm: MmGeneration,
     ) -> Result<Prepared, NativeProcessError> {
         if !words.authenticates(*parent) {
