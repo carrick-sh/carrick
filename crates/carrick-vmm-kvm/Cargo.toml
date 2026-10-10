@@ -23,13 +23,18 @@ workspace = true
 toml.workspace = true
 
 [dev-dependencies]
-carrick-runtime = { path = "../carrick-runtime", default-features = false, features = ["platform-linux", "syscall-shim", "test-support"] }
 carrick-kernel = { path = "../carrick-kernel", features = ["test-support"] }
 static_assertions = "1"
 tempfile.workspace = true
 toml.workspace = true
 serde_json.workspace = true
 goblin.workspace = true
+
+# Live KVM integration tests need the Linux runtime. The host-lane
+# cpl0_image_inputs test only reads source files; pulling platform-linux into
+# macOS test feature unification would compile a KVM runtime on a non-KVM host.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+carrick-runtime = { path = "../carrick-runtime", default-features = false, features = ["platform-linux", "syscall-shim", "test-support"] }
 
 [dependencies]
 carrick-guest-arch = { path = "../carrick-guest-arch" }
