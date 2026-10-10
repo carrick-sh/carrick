@@ -513,12 +513,23 @@ impl UserCopy for NativeLane<'_> {
 }
 impl<'a> LifecycleNative<'a> for NativeLane<'a> {
     fn fail_lifecycle(&mut self, reason: carrick_el1_abi::NativeRunFailureReason) -> ! {
-        let binding = LifecycleNative::binding(self).unwrap_or_else(|| {
-            carrick_el1::personality::dispatch::invalid_completion(
-                carrick_el1::personality::dispatch::NativeInvariant::EntryBinding,
+        #[cfg(target_os = "none")]
+        {
+            let binding = LifecycleNative::binding(self).unwrap_or_else(|| {
+                carrick_el1::personality::dispatch::invalid_completion(
+                    carrick_el1::personality::dispatch::NativeInvariant::EntryBinding,
+                )
+            });
+            carrick_el1::personality::native_run_failure::complete_native_run_failure(
+                binding, reason,
             )
-        });
-        carrick_el1::personality::native_run_failure::complete_native_run_failure(binding, reason)
+        }
+        #[cfg(not(target_os = "none"))]
+        carrick_fatal::carrick_fatal!(
+            "x86::fixture_lifecycle",
+            "native run failed: {}",
+            reason.as_str()
+        )
     }
 
     fn arguments(&self) -> [u64; 6] {
