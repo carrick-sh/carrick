@@ -25,7 +25,7 @@ pub enum Commands {
     #[command(about = "Display repository information as JSON")]
     Info,
 
-    #[command(about = "Owner-approved, one-job Willow ephemeral runner pilot")]
+    #[command(about = "Owner-approved JIT ephemeral runners: Willow KVM clones and cloudmac HVF")]
     CiScaler(crate::ci_scaler::ScalerArgs),
     #[command(about = "Census clean landed worktrees; dry-run unless --apply")]
     WorktreeGc(crate::worktree_gc::WorktreeGcArgs),

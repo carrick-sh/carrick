@@ -247,6 +247,7 @@ fn teardown_fixture(dir: &Path) -> (Ledger, Record, MockTeardown, PathBuf) {
             },
             &[],
             0,
+            Concurrency::ONE,
         )
         .unwrap();
     row.state = State::Reaping;

@@ -1,4 +1,6 @@
-//! The owner-approved, one-clone Willow pilot. No general-purpose VM authority.
+//! Owner-approved JIT ephemeral runners: the Willow KVM clone controller
+//! (one-job pilot or bounded standing mode) and the cloudmac HVF controller.
+//! No general-purpose VM authority; every runner is one-use JIT material.
 
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -9,11 +11,25 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+mod github;
 mod live;
+mod mac;
+
+pub use mac::{
+    MacLedger, MacRecord, MacState, MacStep, MacTarget, mac_hook_script, mac_step, prepare_run_once,
+};
 
 pub const POOL: &str = "carrick-ci";
 pub const REPOSITORY: &str = "carrick-sh/carrick";
+/// The one KVM runner label set: Willow clones register with exactly these,
+/// and every workflow job they serve names exactly these in `runs-on`.
 pub const LABELS: [&str; 4] = ["self-hosted", "Linux", "X64", "willow-kvm"];
+/// The one HVF runner label set for cloudmac JIT runners.
+pub const HVF_LABELS: [&str; 4] = ["self-hosted", "macOS", "ARM64", "carrick-hvf"];
+pub const KERNEL_RUNTIME_WORKFLOW: &str = ".github/workflows/kernel-runtime.yml";
+pub const PILOT_WORKFLOW: &str = ".github/workflows/willow-pilot.yml";
+const PILOT_BRANCH: &str = "work/willow-pilot";
+const MERGE_QUEUE_PREFIX: &str = "gh-readonly-queue/main/";
 
 #[derive(Debug, Error)]
 pub enum ScalerError {
@@ -25,6 +41,8 @@ pub enum ScalerError {
     Kvm { version: i32, errno: i32 },
     #[error("{0}")]
     Guard(&'static str),
+    #[error("{0}")]
+    Usage(String),
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON: {0}")]
@@ -131,21 +149,35 @@ impl Ledger {
         key: JobKey,
         inventory: &[PoolMember],
         now: u64,
+        limit: Concurrency,
     ) -> Result<Record, ScalerError> {
         if self.rows.iter().any(|r| r.key == key) {
             return Err(ScalerError::Guard("job already reserved"));
         }
-        if self.rows.iter().any(|r| r.state != State::Destroyed)
-            || inventory
-                .iter()
-                .any(|v| v.pool == POOL && !(v.template && (300..=307).contains(&v.id)))
-        {
+        let active: Vec<&Record> = self
+            .rows
+            .iter()
+            .filter(|r| r.state != State::Destroyed)
+            .collect();
+        // Every non-template pool member must be an active ledger clone. An
+        // unknown object occupies the whole budget: it is never adopted.
+        let unknown = inventory.iter().any(|v| {
+            v.pool == POOL
+                && !(v.template && (300..=307).contains(&v.id))
+                && !active.iter().any(|r| r.vm.get() == v.id)
+        });
+        if unknown {
             return Err(ScalerError::Guard(
-                "one-clone budget occupied (including unknown objects)",
+                "clone budget occupied by an unknown pool object",
             ));
         }
+        if active.len() >= usize::from(limit.get()) {
+            return Err(ScalerError::Guard("clone concurrency budget occupied"));
+        }
         let vm = (308..=349)
-            .find(|id| !inventory.iter().any(|v| v.id == *id))
+            .find(|id| {
+                !inventory.iter().any(|v| v.id == *id) && !active.iter().any(|r| r.vm.get() == *id)
+            })
             .ok_or(ScalerError::Guard("no free reserved VMID"))?;
         let row = Record {
             key,
@@ -173,22 +205,192 @@ impl Ledger {
         }
     }
     pub fn save(&self, path: &Path) -> Result<(), ScalerError> {
-        let parent = path
-            .parent()
-            .ok_or(ScalerError::Guard("ledger requires parent directory"))?;
-        let mut file = tempfile::NamedTempFile::new_in(parent)?;
-        file.as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        serde_json::to_writer_pretty(&mut file, self)?;
-        file.as_file().sync_all()?;
-        file.persist(path).map_err(|e| ScalerError::Io(e.error))?;
-        File::open(parent)?.sync_all()?;
-        Ok(())
+        save_json(self, path)
+    }
+}
+/// Durable owner-only ledger publication: fsynced file, rename, fsynced dir.
+fn save_json(value: &impl Serialize, path: &Path) -> Result<(), ScalerError> {
+    let parent = path
+        .parent()
+        .ok_or(ScalerError::Guard("ledger requires parent directory"))?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    file.as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    serde_json::to_writer_pretty(&mut file, value)?;
+    file.as_file().sync_all()?;
+    file.persist(path).map_err(|e| ScalerError::Io(e.error))?;
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+/// Concurrent clone (or Mac runner) budget: 1 by default, never above 2.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct Concurrency(u8);
+impl Concurrency {
+    pub const ONE: Self = Self(1);
+    pub fn get(self) -> u8 {
+        self.0
+    }
+}
+impl TryFrom<u8> for Concurrency {
+    type Error = ScalerError;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if (1..=2).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(ScalerError::Guard("max concurrency must be 1 or 2"))
+        }
+    }
+}
+impl std::str::FromStr for Concurrency {
+    type Err = ScalerError;
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let value = text
+            .parse::<u8>()
+            .map_err(|_| ScalerError::Guard("max concurrency must be 1 or 2"))?;
+        Self::try_from(value)
     }
 }
 
+/// Exact label-set equality against one of the label constants.
+pub fn labels_match(expected: &[&str], labels: &[&str]) -> bool {
+    labels.len() == expected.len() && expected.iter().all(|l| labels.contains(l))
+}
 pub fn eligible_labels(labels: &[&str]) -> bool {
-    labels.len() == LABELS.len() && LABELS.iter().all(|l| labels.contains(l))
+    labels_match(&LABELS, labels)
+}
+
+/// Which workflow runs a controller serves and which jobs a runner's
+/// job-start hook admits. The guest/runner reads it from a root- or
+/// runner-owned policy file written by the controller, never from the job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admission {
+    /// The historical one-job pilot: `willow-pilot.yml`, dispatched from
+    /// `work/willow-pilot` at one approved SHA.
+    Pilot { sha: String },
+    /// `kernel-runtime.yml` on this repository for a merge group into main,
+    /// a push to main, or a workflow_dispatch on main. Never pull_request.
+    Standing,
+}
+fn full_sha(sha: &str) -> bool {
+    sha.len() == 40 && sha.bytes().all(|c| c.is_ascii_hexdigit())
+}
+impl Admission {
+    pub fn pilot(sha: &str) -> Result<Self, ScalerError> {
+        if !full_sha(sha) {
+            return Err(ScalerError::Guard("approved SHA must be full commit hash"));
+        }
+        Ok(Self::Pilot {
+            sha: sha.to_ascii_lowercase(),
+        })
+    }
+    pub fn parse(text: &str) -> Result<Self, ScalerError> {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        match words.as_slice() {
+            ["standing"] => Ok(Self::Standing),
+            ["pilot", sha] => Self::pilot(sha),
+            _ => Err(ScalerError::Guard("unrecognized runner admission policy")),
+        }
+    }
+    pub fn render(&self) -> String {
+        match self {
+            Self::Pilot { sha } => format!("pilot {sha}"),
+            Self::Standing => "standing".into(),
+        }
+    }
+    /// Demand side: may a controller create a runner for this workflow run?
+    pub fn admits_run(&self, run: &serde_json::Value) -> bool {
+        let branch = run["head_branch"].as_str().unwrap_or_default();
+        let event = run["event"].as_str().unwrap_or_default();
+        if run["repository"]["full_name"] != REPOSITORY {
+            return false;
+        }
+        match self {
+            Self::Pilot { sha } => {
+                event == "workflow_dispatch"
+                    && run["head_sha"] == sha.as_str()
+                    && branch == PILOT_BRANCH
+                    && run["path"] == PILOT_WORKFLOW
+            }
+            Self::Standing => {
+                run["head_repository"]["full_name"] == REPOSITORY
+                    && run["path"] == KERNEL_RUNTIME_WORKFLOW
+                    && run["head_sha"].as_str().is_some_and(full_sha)
+                    && standing_event_ref(event, branch)
+            }
+        }
+    }
+    /// Job-start side: runs in the hook before any workflow step.
+    pub fn authorize(&self, context: &JobContext) -> Result<(), ScalerError> {
+        let branch = context.git_ref.strip_prefix("refs/heads/").unwrap_or("");
+        let admitted = full_sha(&context.sha)
+            && context.repository == REPOSITORY
+            && !context.git_ref.contains('@')
+            && match self {
+                Self::Pilot { sha } => {
+                    context.sha == *sha
+                        && context.event == "workflow_dispatch"
+                        && branch == PILOT_BRANCH
+                        && context.workflow_ref
+                            == format!("{REPOSITORY}/{PILOT_WORKFLOW}@refs/heads/{PILOT_BRANCH}")
+                }
+                Self::Standing => {
+                    standing_event_ref(&context.event, branch)
+                        && context.workflow_ref
+                            == format!("{REPOSITORY}/{KERNEL_RUNTIME_WORKFLOW}@{}", context.git_ref)
+                }
+            };
+        if admitted {
+            Ok(())
+        } else {
+            Err(ScalerError::Guard(
+                "job-start authorization rejected workflow/repository/event/ref/SHA",
+            ))
+        }
+    }
+}
+fn standing_event_ref(event: &str, branch: &str) -> bool {
+    match event {
+        "merge_group" => branch.strip_prefix(MERGE_QUEUE_PREFIX).is_some_and(|rest| {
+            !rest.is_empty()
+                && rest
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+        }),
+        "push" | "workflow_dispatch" => branch == "main",
+        _ => false,
+    }
+}
+
+/// The GitHub runner registration a controller owns, shared by the Willow
+/// clone ledger and the cloudmac ledger for assignment and removal.
+pub trait RunnerRegistration {
+    fn key(&self) -> JobKey;
+    fn name(&self) -> &str;
+    fn runner(&self) -> Option<RunnerId>;
+    fn set_runner(&mut self, runner: Option<RunnerId>);
+    fn assigned(&self) -> Option<JobId>;
+    fn set_assigned(&mut self, job: JobId);
+}
+impl RunnerRegistration for Record {
+    fn key(&self) -> JobKey {
+        self.key
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn runner(&self) -> Option<RunnerId> {
+        self.runner
+    }
+    fn set_runner(&mut self, runner: Option<RunnerId>) {
+        self.runner = runner;
+    }
+    fn assigned(&self) -> Option<JobId> {
+        self.assigned
+    }
+    fn set_assigned(&mut self, job: JobId) {
+        self.assigned = Some(job);
+    }
 }
 pub fn admit_resources(cpu_busy: f64, threads: u32, available: u64) -> bool {
     cpu_busy.is_finite()
@@ -255,21 +457,8 @@ pub struct JobContext {
     pub repository: String,
     pub event: String,
     pub workflow_ref: String,
+    pub git_ref: String,
     pub sha: String,
-}
-pub fn authorize_job(context: &JobContext, sha: &str) -> Result<(), ScalerError> {
-    if sha.len() != 40
-        || context.sha != sha
-        || context.repository != REPOSITORY
-        || context.event != "workflow_dispatch"
-        || context.workflow_ref
-            != "carrick-sh/carrick/.github/workflows/willow-pilot.yml@refs/heads/work/willow-pilot"
-    {
-        return Err(ScalerError::Guard(
-            "job-start authorization rejected workflow/repository/event/SHA",
-        ));
-    }
-    Ok(())
 }
 fn admission_lock(dir: &Path) -> Result<File, ScalerError> {
     use std::os::fd::AsRawFd;
@@ -348,17 +537,85 @@ pub enum ScalerAction {
         #[arg(long)]
         one_job: bool,
     },
+    /// Standing Willow mode ON Willow: serve kernel-runtime.yml KVM jobs for
+    /// merge groups into main, pushes to main and dispatches on main.
+    Standing {
+        #[arg(long, default_value = "/root/carrick-ci/state")]
+        state_dir: PathBuf,
+        #[arg(long, default_value_t = 1)]
+        runner_group_id: u64,
+        /// Concurrent clones, 1 (default) or 2.
+        #[arg(long, default_value = "1")]
+        max_concurrency: Concurrency,
+    },
+    /// Director-Mac controller for cloudmac: mint one JIT config per queued
+    /// carrick-hvf job and feed it to one runner over SSH stdin.
+    MacJit {
+        /// SSH destination of the gate Mac.
+        #[arg(long, default_value = "rentamac@cloudmac")]
+        host: String,
+        /// carrick-xtask installed on cloudmac (provides mac-run-once).
+        #[arg(
+            long,
+            default_value = "/Volumes/carrick-build/carrick-ci/bin/carrick-xtask"
+        )]
+        remote_xtask: String,
+        /// Per-runner state root on cloudmac.
+        #[arg(long, default_value = "/Volumes/carrick-build/carrick-ci/run")]
+        remote_state_root: String,
+        /// Local ledger directory on the director's Mac.
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long, default_value_t = 1)]
+        runner_group_id: u64,
+        /// Exit after one runner lifecycle has been cleaned up.
+        #[arg(long)]
+        one_job: bool,
+    },
+    /// ON cloudmac, via the mac-jit controller's SSH: read one JIT config
+    /// from stdin and run one ephemeral runner in a fresh session.
+    MacRunOnce {
+        /// Ledger-generated runner name (also the per-runner state directory).
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "/Volumes/carrick-build/actions-runner")]
+        runner_dir: PathBuf,
+        #[arg(long, default_value = "/Volumes/carrick-build/carrick-ci/run")]
+        state_root: PathBuf,
+    },
     /// Fail unless the calling (non-root runner) user can open KVM API 12.
     VerifyKvm,
     /// Runner job-start hook: authorize before any workflow step executes.
-    AdmitJob,
-    /// Guest-agent-only stale-runner boundary, serialized against job admission.
-    Quiesce,
+    AdmitJob {
+        #[arg(long, default_value = "/etc/carrick-ci/policy")]
+        policy_file: PathBuf,
+        #[arg(long, default_value = "/run/carrick-ci")]
+        state_dir: PathBuf,
+    },
+    /// Stale-runner boundary, serialized against job admission.
+    Quiesce {
+        #[arg(long, default_value = "/run/carrick-ci")]
+        state_dir: PathBuf,
+    },
+}
+/// The policy file is written by the controller before the runner starts.
+/// A symlink or a group/other-writable file could be swapped by a job.
+pub fn read_policy(path: &Path) -> Result<Admission, ScalerError> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.is_file() || meta.permissions().mode() & 0o022 != 0 {
+        return Err(ScalerError::Guard(
+            "runner policy must be a regular file writable only by its owner",
+        ));
+    }
+    Admission::parse(&std::fs::read_to_string(path)?)
 }
 pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
     match args.action {
         ScalerAction::VerifyKvm => verify_kvm(),
-        ScalerAction::AdmitJob => {
+        ScalerAction::AdmitJob {
+            policy_file,
+            state_dir,
+        } => {
             let get = |name| {
                 std::env::var(name).map_err(|_| ScalerError::Guard("missing GitHub job context"))
             };
@@ -366,16 +623,16 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
                 repository: get("GITHUB_REPOSITORY")?,
                 event: get("GITHUB_EVENT_NAME")?,
                 workflow_ref: get("GITHUB_WORKFLOW_REF")?,
+                git_ref: get("GITHUB_REF")?,
                 sha: get("GITHUB_SHA")?,
             };
-            let sha = std::fs::read_to_string("/etc/carrick-ci/approved-sha")?;
-            authorize_job(&context, sha.trim())?;
-            mark_job_started(Path::new("/run/carrick-ci"))?;
-            println!("approved pilot workflow and SHA admitted");
+            read_policy(&policy_file)?.authorize(&context)?;
+            mark_job_started(&state_dir)?;
+            println!("admitted workflow, event and ref");
             Ok(())
         }
-        ScalerAction::Quiesce => {
-            println!("{:?}", quiesce_guest(Path::new("/run/carrick-ci"))?);
+        ScalerAction::Quiesce { state_dir } => {
+            println!("{:?}", quiesce_guest(&state_dir)?);
             Ok(())
         }
         ScalerAction::Pilot {
@@ -383,7 +640,42 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
             state_dir,
             runner_group_id,
             one_job,
-        } => live::pilot(&approved_sha, &state_dir, runner_group_id, one_job),
+        } => live::controller(
+            &Admission::pilot(&approved_sha)?,
+            &state_dir,
+            runner_group_id,
+            one_job,
+            Concurrency::ONE,
+        ),
+        ScalerAction::Standing {
+            state_dir,
+            runner_group_id,
+            max_concurrency,
+        } => live::controller(
+            &Admission::Standing,
+            &state_dir,
+            runner_group_id,
+            false,
+            max_concurrency,
+        ),
+        ScalerAction::MacJit {
+            host,
+            remote_xtask,
+            remote_state_root,
+            state_dir,
+            runner_group_id,
+            one_job,
+        } => mac::controller(
+            &mac::MacTarget::new(host, remote_xtask, remote_state_root)?,
+            &state_dir,
+            runner_group_id,
+            one_job,
+        ),
+        ScalerAction::MacRunOnce {
+            name,
+            runner_dir,
+            state_root,
+        } => mac::run_once(&name, &runner_dir, &state_root),
     }
 }
 fn verify_kvm() -> Result<(), ScalerError> {

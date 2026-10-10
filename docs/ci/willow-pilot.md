@@ -53,6 +53,25 @@ is performed by the controller. Dispatch exactly:
 gh workflow run willow-pilot.yml --ref work/willow-pilot
 ```
 
+## Standing mode (merge queue)
+
+`ci-scaler standing` reuses this controller for `kernel-runtime.yml`'s
+`kvm-tests` job: merge groups into main, pushes to main and dispatches on
+main (`Admission::Standing`; see the
+[security review](willow-pilot-security-review.md#standing-admission-surface)).
+It writes `standing` to the guest's root-owned `/etc/carrick-ci/policy`
+instead of a pilot SHA, and admits at most `--max-concurrency` clones (1 by
+default, never more than 2):
+
+```sh
+gh auth token | ssh root@willow 'IFS= read -r GH_TOKEN; export GH_TOKEN; export PATH=/root/carrick-ci/bin:$PATH; exec /root/carrick-ci/bin/carrick-xtask ci-scaler standing --runner-group-id 1'
+```
+
+The pilot (`ci-scaler pilot`) writes `pilot <sha>` to the same file and keeps
+its one-clone, one-job contract. Every budget, ownership, recovery and hook
+rule below applies to both modes; with two clones each active row is
+reconciled every pass, and any reconcile error freezes new admission.
+
 ## Authority and recovery
 
 Demand requires the complete four-label set, `workflow_dispatch`, this
