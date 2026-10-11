@@ -24,6 +24,8 @@ pub enum Commands {
     AsmDiff(crate::asm_diff::AsmDiffArgs),
     #[command(about = "Display repository information as JSON")]
     Info,
+    #[command(about = "Package a guest carrier image for an arbitrary composition root")]
+    PackageGuestImage(crate::guest_image::PackageGuestImageArgs),
 
     #[command(about = "Owner-approved JIT ephemeral runners: Willow KVM clones and cloudmac HVF")]
     CiScaler(crate::ci_scaler::ScalerArgs),
@@ -212,6 +214,8 @@ pub enum CliError {
     TestLanes(#[from] crate::test_lanes::TestLanesError),
     #[error("probe emitters: {0}")]
     ProbeEmitters(#[from] crate::probe_emitters::ProbeEmittersError),
+    #[error("guest image: {0}")]
+    GuestImage(#[from] crate::guest_image::GuestImageError),
 }
 
 pub fn resolve_repo_info(root: Option<&Path>) -> Result<RepoInfo, CliError> {
@@ -488,6 +492,10 @@ where
         Commands::TestLanes(args) => {
             let info = resolve_repo_info(cli.root.as_deref())?;
             crate::test_lanes::run(&info.repository_root, args, writer)?;
+            Ok(())
+        }
+        Commands::PackageGuestImage(args) => {
+            crate::guest_image::run_package_guest_image(&args)?;
             Ok(())
         }
     }
