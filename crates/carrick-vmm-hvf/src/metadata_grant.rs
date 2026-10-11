@@ -1128,7 +1128,7 @@ pub(crate) fn service_metadata_operation(
                         return Err(error);
                     }
                     if let Some(publication) = publication {
-                        publication.publish(&mut fork_stock)?;
+                        publication.publish(&mut fork_stock, custody)?;
                     }
                     Ok(())
                 });
