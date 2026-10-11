@@ -1085,6 +1085,7 @@ dependencies = [
  "carrick-hal",
  "carrick-host",
  "carrick-host-bsd",
+ "carrick-kernel",
  "carrick-kernel-arena",
  "carrick-mem",
  "carrick-mmu-core",

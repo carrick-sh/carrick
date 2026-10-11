@@ -197,7 +197,7 @@ impl ForkStockHostCustody {
     pub(crate) fn register_native_root(
         &mut self,
         context: AddressContext<RootGpa>,
-        frames: carrick_hal::NativeRootFrameSnapshot,
+        mut frames: carrick_hal::NativeRootFrameSnapshot,
     ) -> Result<(), ForkStockRefusal> {
         if frames.owner != context.into() {
             return Err(ForkStockRefusal::Stale);
@@ -206,6 +206,9 @@ impl ForkStockHostCustody {
             Some(current) if current.context != context => Err(ForkStockRefusal::Stale),
             Some(_) => Ok(()),
             None => {
+                frames
+                    .mappings
+                    .sort_unstable_by_key(|row| (row.gpa.0, row.mapping));
                 self.native_roots.insert(
                     context.mm.raw(),
                     NativeRootCustody {
@@ -216,6 +219,26 @@ impl ForkStockHostCustody {
                 Ok(())
             }
         }
+    }
+
+    pub(crate) fn publish_child_frame_snapshot(
+        &mut self,
+        context: AddressContext<RootGpa>,
+        mut frames: carrick_hal::NativeRootFrameSnapshot,
+    ) -> Result<(), ForkStockServiceError> {
+        let root = self
+            .native_roots
+            .get_mut(&context.mm.raw())
+            .filter(|root| root.context == context && root.frames.is_none())
+            .ok_or(ForkStockServiceError::StaleExecution)?;
+        if frames.owner != context.into() {
+            return Err(ForkStockServiceError::StaleExecution);
+        }
+        frames
+            .mappings
+            .sort_unstable_by_key(|row| (row.gpa.0, row.mapping));
+        root.frames = Some(frames);
+        Ok(())
     }
 
     /// Seed the same bounded stock in production and VM-free witnesses. Both
@@ -1535,6 +1558,305 @@ mod tests {
             assert_eq!(child_stats.bytes_returned, 3 * 4096);
         }
         assert_eq!(custody.fork_stock.lock().grant_tables.len(), 6);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn dispatcher_fork_commit_publishes_native_child_frame_custody() {
+        use carrick_hal::PhysicalFrameInventory;
+        use std::sync::Arc;
+
+        struct Admission {
+            source: Arc<dyn PhysicalFrameInventory>,
+            snapshot: carrick_hal::NativeRootFrameSnapshot,
+            context: AddressContext<RootGpa>,
+        }
+        impl carrick_hal::NativeFrameInventoryAdmission for Admission {
+            fn inventory(&self) -> Arc<dyn PhysicalFrameInventory> {
+                Arc::clone(&self.source)
+            }
+            fn admit_root(
+                &self,
+                context: AddressContext<RootGpa>,
+            ) -> Result<
+                carrick_hal::NativeRootFrameSnapshot,
+                Box<dyn std::error::Error + Send + Sync>,
+            > {
+                if context != self.context {
+                    return Err(Box::new(std::io::Error::other("foreign fixture root")));
+                }
+                Ok(self.snapshot.clone())
+            }
+        }
+        let custody = CarrierVmCustody::new();
+        let vm_generation = custody.begin_create().unwrap();
+        custody.commit_create(vm_generation).unwrap();
+        let mut execution = test_execution(41, 0, 301);
+        execution.context.generation = ContextGeneration::new(NonZeroU64::new(7).unwrap());
+        let inventory = Arc::new(carrick_kernel::kernel::FrameInventoryAuthority::new());
+        let source = inventory
+            .physical_projection(Arc::new(carrick_kernel::kernel::ObjectIdRegistry::new()));
+        let parent = source.bind(execution.context.into());
+        let mut reservation = parent.reserve(1, 1, 2).unwrap();
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().unwrap();
+        let mapping = reservation.claim_mapping().unwrap();
+        // All generation domains deliberately differ in this witness.
+        let mapping_generation =
+            carrick_hal::MappingGeneration::from_backend_counter(NonZeroU64::MIN);
+        let length = carrick_hal::FrameLength::from_mapping_extent(NonZeroU64::new(16384).unwrap());
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation: mapping_generation,
+                gpa: carrick_guest_mem::Gpa(0x50000),
+                length,
+                permissions: carrick_hal::MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(carrick_hal::FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation: mapping_generation,
+            })
+            .unwrap();
+        let receipt = parent.apply_with_receipt(reservation.commit(())).unwrap();
+        custody
+            .bind_native_frame_inventory(Arc::new(Admission {
+                source: Arc::clone(&source),
+                context: execution.context,
+                snapshot: carrick_hal::NativeRootFrameSnapshot {
+                    owner: execution.context.into(),
+                    revision: NonZeroU64::new(receipt.revision()).unwrap(),
+                    mappings: vec![parent.live_mapping_row(mapping).unwrap()],
+                },
+            }))
+            .unwrap();
+
+        let mut records = Box::new(AlignedPage([0; 4096]));
+        let record_ipa = 0x2000_0000;
+        let mut tables: Vec<_> = (0..8).map(|_| Box::new(AlignedPage([0; 4096]))).collect();
+        let mut parent_tables: Vec<_> = (0..4).map(|_| Box::new(AlignedPage([0; 4096]))).collect();
+        let mut data: Vec<_> = (0..4).map(|_| Box::new(AlignedPage([0; 4096]))).collect();
+        let publish = |ipa, host_addr, generation| {
+            custody
+                .publish_stage2_record_using(
+                    crate::trap::CarrierStage2RecordSpec {
+                        vm_generation,
+                        ipa,
+                        len: 4096,
+                        host_addr,
+                        mapped: true,
+                        backend_map_installed: true,
+                        release_ipa: false,
+                        perms: 3,
+                        logical_owner: Some(crate::trap::CarrierLogicalOwner {
+                            id: ipa,
+                            generation,
+                        }),
+                    },
+                    || 0,
+                )
+                .unwrap();
+        };
+        publish(record_ipa, records.0.as_mut_ptr() as usize, 5);
+        for (index, page) in tables.iter_mut().enumerate() {
+            publish(
+                0x2001_0000 + index as u64 * 4096,
+                page.0.as_mut_ptr() as usize,
+                13,
+            );
+        }
+        for (index, page) in parent_tables.iter_mut().enumerate() {
+            publish(
+                0x1000 + index as u64 * 4096,
+                page.0.as_mut_ptr() as usize,
+                17,
+            );
+        }
+        for (index, page) in data.iter_mut().enumerate() {
+            publish(
+                0x50000 + index as u64 * 4096,
+                page.0.as_mut_ptr() as usize,
+                73,
+            );
+        }
+        {
+            let mut stock = custody.fork_stock.lock();
+            stock.carrier = NonZeroU64::new(7).unwrap();
+            stock.grant_tables = (0..8)
+                .map(|index| page(0x2001_0000 + index * 4096))
+                .collect();
+        }
+        let request = test_request(execution, 302, 4, 1);
+        // SAFETY: aligned retained fixture record; the dispatcher owns it while stopped.
+        unsafe {
+            records
+                .0
+                .as_mut_ptr()
+                .cast::<ForkStockExchange>()
+                .write(ForkStockExchange::new(request).unwrap());
+        }
+        let dispatch = || {
+            crate::metadata_grant::service_metadata_operation(
+                &custody,
+                Some(vm_generation),
+                execution.cpu,
+                Some(execution),
+                carrick_el1_abi::GRANT_OP_FORK_STOCK,
+                record_ipa,
+                0,
+                0,
+            )
+            .unwrap()
+        };
+        assert_eq!(dispatch()[0], carrick_el1_abi::METADATA_GRANT_SUCCESS);
+        let loan = unsafe { &mut *records.0.as_mut_ptr().cast::<ForkStockExchange>() }
+            .take(request)
+            .unwrap()
+            .unwrap();
+        // Four levels, one inherited private data page, no table stores at commit.
+        let leaf: u64 = 0x50000
+            | 3
+            | (1 << 10)
+            | (3 << 6)
+            | (1 << 11)
+            | (1 << 54)
+            | (1 << 55)
+            | (1 << 56)
+            | (1 << 57);
+        for index in 0..3 {
+            let parent_next = 0x1000 + (index as u64 + 1) * 4096;
+            parent_tables[index].0[..8].copy_from_slice(&(parent_next | 3).to_ne_bytes());
+            let child_next = loan.request.child_tables.base + (index as u64 + 1) * 4096;
+            tables[index].0[..8].copy_from_slice(&(child_next | 3).to_ne_bytes());
+        }
+        // The settlement custody pointer is a kernel VA, resolved through
+        // the stopped parent's live root rather than treated as an IPA.
+        let kernel_block: u64 = 0x2000_0000 | 1 | (1 << 10) | (1 << 54);
+        parent_tables[2].0[2048..2056].copy_from_slice(&kernel_block.to_ne_bytes());
+        parent_tables[3].0[32..40].copy_from_slice(&leaf.to_ne_bytes());
+        tables[3].0[32..40].copy_from_slice(&leaf.to_ne_bytes());
+        let words = carrick_el1_abi::PortalForkCustody::Frame {
+            va: 0x4000,
+            ipa: 0x50000,
+            len: 4096,
+            shared: false,
+        }
+        .words();
+        for (index, word) in words.iter().enumerate() {
+            records.0[512 + index * 8..520 + index * 8].copy_from_slice(&word.to_ne_bytes());
+        }
+        let child_handle = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                request.operation.carrier,
+                request.child_mm,
+                NonZeroU64::new(19).unwrap(),
+            )
+        };
+        let completion = PortalForkCompletion {
+            request: loan.request,
+            child: child_handle,
+            parent_generation: ReservationGeneration::INITIAL,
+            child_tables_used: 4 * 4096,
+            parent_tables_used: 4096,
+        };
+        let settlement =
+            ForkStockSettlement::new(loan, completion, KernelVa::new(record_ipa + 512), 1).unwrap();
+        unsafe {
+            records
+                .0
+                .as_mut_ptr()
+                .cast::<ForkStockSettlement>()
+                .write(settlement);
+        }
+        // A custody selection must name the actual output of both roots.
+        records.0[528..536].copy_from_slice(&0x51000u64.to_ne_bytes());
+        assert_eq!(dispatch()[0], carrick_el1_abi::METADATA_GRANT_ERR_DENIED);
+        assert_eq!(parent.frame_mapping_count(frame).unwrap(), Some(1));
+        records.0[528..536].copy_from_slice(&0x50000u64.to_ne_bytes());
+        // Alias staging must roll back if table settlement subsequently
+        // refuses a dirty page advertised as unused.
+        let parent_stock_index = ((loan.request.parent_tables.base - 0x2001_0000) / 4096) as usize;
+        tables[parent_stock_index].0[0] = 1;
+        let refused_completion = PortalForkCompletion {
+            parent_tables_used: 0,
+            ..completion
+        };
+        let refused =
+            ForkStockSettlement::new(loan, refused_completion, KernelVa::new(record_ipa + 512), 1)
+                .unwrap();
+        unsafe {
+            records
+                .0
+                .as_mut_ptr()
+                .cast::<ForkStockSettlement>()
+                .write(refused);
+        }
+        assert_eq!(dispatch()[0], carrick_el1_abi::METADATA_GRANT_ERR_DENIED);
+        assert_eq!(parent.frame_mapping_count(frame).unwrap(), Some(1));
+        tables[parent_stock_index].0[0] = 0;
+        let settlement =
+            ForkStockSettlement::new(loan, completion, KernelVa::new(record_ipa + 512), 1).unwrap();
+        unsafe {
+            records
+                .0
+                .as_mut_ptr()
+                .cast::<ForkStockSettlement>()
+                .write(settlement);
+        }
+        assert_eq!(dispatch()[0], carrick_el1_abi::METADATA_GRANT_SUCCESS);
+        assert_eq!(
+            parent.frame_mapping_count(frame).unwrap(),
+            Some(2),
+            "fork commit must publish the native child's reference before it can enter"
+        );
+        let child = custody
+            .fork_stock
+            .lock()
+            .root(NonZeroU64::new(302).unwrap())
+            .unwrap();
+        let child_rows = custody
+            .fork_stock
+            .lock()
+            .root_frames(child)
+            .unwrap()
+            .clone();
+        assert_eq!(child_rows.owner, child.into());
+        assert_eq!(child_rows.mappings.len(), 1);
+        let child_row = child_rows.mappings[0];
+        assert_eq!(child_row.frame, frame);
+        assert_ne!(child_row.mapping, mapping);
+        assert_eq!(child_row.generation.raw(), 1);
+        assert_eq!(
+            source
+                .bind(child.into())
+                .live_mapping_row(child_row.mapping),
+            Some(child_row)
+        );
+        let wrong_owner = carrick_hal::GuestFrameOwner {
+            root_generation: ContextGeneration::new(NonZeroU64::new(20).unwrap()),
+            ..child.into()
+        };
+        assert!(
+            source
+                .bind(wrong_owner)
+                .live_mapping_row(child_row.mapping)
+                .is_none()
+        );
+        assert!(
+            source
+                .bind(execution.context.into())
+                .live_mapping_row(child_row.mapping)
+                .is_none()
+        );
     }
 
     #[test]

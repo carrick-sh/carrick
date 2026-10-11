@@ -1108,13 +1108,31 @@ pub(crate) fn service_metadata_operation(
                 };
                 let mut fork_stock = custody.fork_stock.lock();
                 let mut ledger = custody.el1_frame_grants.lock();
-                match fork_stock.service_settlement(
-                    &mut ledger,
+                let result = crate::trap::native_frame_custody::stage_native_child_frames(
+                    custody,
+                    &fork_stock,
                     execution,
                     settlement,
-                    is_resolvable,
-                    is_clean,
-                ) {
+                )
+                .and_then(|mut publication| {
+                    if let Err(error) = fork_stock.service_settlement(
+                        &mut ledger,
+                        execution,
+                        settlement,
+                        is_resolvable,
+                        is_clean,
+                    ) {
+                        if let Some(publication) = publication.as_mut() {
+                            publication.rollback()?;
+                        }
+                        return Err(error);
+                    }
+                    if let Some(publication) = publication {
+                        publication.publish(&mut fork_stock)?;
+                    }
+                    Ok(())
+                });
+                match result {
                     Ok(()) => Ok([METADATA_GRANT_SUCCESS, 0, 0, 0]),
                     Err(e) => {
                         let refusal = match e {
