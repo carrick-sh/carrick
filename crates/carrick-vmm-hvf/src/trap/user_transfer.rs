@@ -28,21 +28,19 @@ impl UserTransferCustody {
             );
             refused()
         })?;
-        let mm = target.handle().mm().raw();
-        let address = self
-            .custody
-            .fork_stock
-            .lock()
-            .root(NonZeroU64::new(mm).ok_or_else(refused)?)
-            .ok_or_else(|| {
-                carrick_observability::probes::guest_internal_write_fault(
-                    0,
-                    0,
-                    26,
-                    "COW scope: missing fork-stock root",
-                );
-                refused()
-            })?;
+        // The first carrier root uses boot tables and has no fork-stock row.
+        // EL1 BIND authenticated this exact root and incarnation; physical
+        // publication separately checks the live descriptor owner and ASID.
+        let address = carrick_guest_arch::AddressContext {
+            root: carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(
+                target.ttbr0() & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK,
+            ))
+            .ok_or_else(refused)?,
+            mm: carrick_guest_arch::MmGeneration::new(
+                core::num::NonZeroU64::new(target.handle().mm().raw()).ok_or_else(refused)?,
+            ),
+            generation: carrick_guest_arch::ContextGeneration::new(target.handle().incarnation()),
+        };
         let live = crate::metadata_grant::live_cow_scope(slot, address);
         let terminal = live
             .or_else(|| crate::metadata_grant::terminal_cow_scope(&self.custody, slot, address));
@@ -60,7 +58,7 @@ impl UserTransferCustody {
                 &format!(
                     "COW scope: slot={} mm={} owner_gen={} lane_mm={:?} current={:?} host={:?} installed={:?} terminal_binding={binding:?}",
                     slot.raw(),
-                    mm,
+                    target.handle().mm().raw(),
                     address.generation.raw().get(),
                     lane.map(|lane| lane.mm()),
                     lane.and_then(|lane| lane.current()),
