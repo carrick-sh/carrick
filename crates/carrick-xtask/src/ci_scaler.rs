@@ -16,10 +16,11 @@ mod live;
 mod mac;
 
 pub use mac::{
-    EXEMPT_AGENTS, MacLedger, MacRecord, MacState, MacStep, MacTarget, ProcessFacts,
-    clone_runner_tree, denies_user, exempt_agent, hand_clone_to_run_user, listener_command,
-    mac_hook_script, mac_step, prepare_run_once, process_facts, remove_run_root, reset_job_area,
-    run_root_path, runner_manifest_for, verify_runner_tree, verify_toolchain,
+    EXEMPT_AGENTS, JOB_HOME, MacLedger, MacRecord, MacState, MacStep, MacTarget, ProcessFacts,
+    SCCACHE_CACHE_SIZE, SCCACHE_DIR, SCCACHE_SOCKET, apply_job_env, clone_runner_tree, denies_user,
+    ensure_run_user_dir, exempt_agent, hand_clone_to_run_user, listener_command, mac_hook_script,
+    mac_step, prepare_run_once, process_facts, remove_run_root, reset_job_area, run_root_path,
+    runner_manifest_for, verify_runner_tree, verify_toolchain,
 };
 
 pub const POOL: &str = "carrick-ci";

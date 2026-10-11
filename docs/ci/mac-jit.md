@@ -82,6 +82,15 @@ Not performed by the repository change.
    (read-only) and a fresh writable `CARGO_HOME` in the job home; tools a
    workflow installs (`just`, `cargo-deny`) land there and are wiped.
 
+   **Private sccache per run.** `mac-run-once` sets `SCCACHE_SERVER_UDS` to a
+   socket in the wiped job home, `SCCACHE_DIR` to
+   `/Volumes/carrick-build/carrick-ci/sccache` (owned by `carrick-ci`, 0700)
+   and `SCCACHE_CACHE_SIZE=20G`. Without it the client used the default TCP
+   server on `127.0.0.1:4226`, which was another local user's sccache: it
+   tried to spawn rustc inside the 0700 job home (`Permission denied`) and
+   would have run CI compiles as that user against its cache. The server
+   dies with the run (`kill_all_as` reaps every `carrick-ci` process).
+
    **Toolchain bumps need the owner first.** Jobs cannot install a
    toolchain, so a change to `rust-toolchain.toml` (version, component or
    target) fails `hvf-kernel` until the owner has installed the new

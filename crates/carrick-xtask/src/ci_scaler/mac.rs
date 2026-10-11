@@ -37,6 +37,14 @@ pub const JOB_HOME: &str = "/Volumes/carrick-build/carrick-ci/job-home";
 pub const SKELETON: &str = "/Volumes/carrick-build/carrick-ci/skel";
 /// Root-owned, read-only toolchain: `rustup/` (RUSTUP_HOME) and `cargo/bin`.
 pub const TOOLCHAIN: &str = "/Volumes/carrick-build/carrick-ci/toolchain";
+/// Persistent sccache directory owned by the run user (survives the job-home
+/// wipe; never shared with another local account's cache).
+pub const SCCACHE_DIR: &str = "/Volumes/carrick-build/carrick-ci/sccache";
+/// Size bound for [`SCCACHE_DIR`].
+pub const SCCACHE_CACHE_SIZE: &str = "20G";
+/// Per-run sccache server socket, inside the wiped job home. A unix socket
+/// cannot collide with another user's server on the default TCP port 4226.
+pub const SCCACHE_SOCKET: &str = "/Volumes/carrick-build/carrick-ci/job-home/.sccache.sock";
 /// macOS cron and at deny lists; both must name [`RUN_USER`].
 const SCHEDULER_DENY: [&str; 2] = ["/usr/lib/cron/cron.deny", "/usr/lib/cron/at.deny"];
 /// Runner-tree entries the runner user writes (in the per-run clone);
@@ -1016,6 +1024,51 @@ pub fn hand_clone_to_run_user(clone: &Path, uid: u32, gid: u32) -> Result<(), Sc
     lchown(clone, uid, gid)
 }
 
+/// Create [`SCCACHE_DIR`] (or any persistent run-user directory) as an
+/// owner-only directory handed to the run user. An existing real directory
+/// that already matches is kept so the cache persists; anything else (a
+/// symlink, a wrong owner or mode) is replaced without following links.
+pub fn ensure_run_user_dir(dir: &Path, uid: u32, gid: u32) -> Result<(), ScalerError> {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(meta) = std::fs::symlink_metadata(dir)
+        && meta.is_dir()
+        && meta.uid() == uid
+        && meta.mode() & 0o777 == 0o700
+    {
+        return Ok(());
+    }
+    wipe(dir)?;
+    std::fs::DirBuilder::new().mode(0o700).create(dir)?;
+    lchown(dir, uid, gid)
+}
+
+/// The complete environment of the one-job runner: nothing is inherited, so
+/// no parent `SCCACHE_*` (or any other) variable leaks in. sccache gets a
+/// private per-run server socket and a run-user-owned cache.
+pub fn apply_job_env(command: &mut std::process::Command, state: &Path) {
+    // Read-only rustup toolchain; per-job writable CARGO_HOME in the wiped
+    // home. Jobs cannot install into, or persist anything through, PATH.
+    let path = format!(
+        "{JOB_HOME}/.cargo/bin:{TOOLCHAIN}/cargo/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    );
+    command
+        .env_clear()
+        .env("PATH", path)
+        .env("HOME", JOB_HOME)
+        .env("RUSTUP_HOME", format!("{TOOLCHAIN}/rustup"))
+        .env("CARGO_HOME", format!("{JOB_HOME}/.cargo"))
+        .env("SCCACHE_SERVER_UDS", SCCACHE_SOCKET)
+        .env("SCCACHE_DIR", SCCACHE_DIR)
+        .env("SCCACHE_CACHE_SIZE", SCCACHE_CACHE_SIZE)
+        .env("USER", RUN_USER)
+        .env("LOGNAME", RUN_USER)
+        .env("LANG", "en_US.UTF-8")
+        .env(
+            "ACTIONS_RUNNER_HOOK_JOB_STARTED",
+            state.join("admit-job.sh"),
+        );
+}
+
 /// Remove a per-run clone without following symlinks planted inside it.
 pub fn remove_run_root(clone: &Path) -> Result<(), ScalerError> {
     wipe(clone)
@@ -1082,6 +1135,7 @@ pub(super) fn run_once(name: &str, binding: &RunBinding, pin: &str) -> Result<()
         user.uid,
         user.gid,
     )?;
+    ensure_run_user_dir(Path::new(SCCACHE_DIR), user.uid, user.gid)?;
     let exe = std::env::current_exe()?;
     let state = prepare_run_once(name, &exe, Path::new(STATE_ROOT), binding, 0, user.uid)?;
     // The shared tree stays read-only: the listener runs from a private
@@ -1099,26 +1153,10 @@ pub(super) fn run_once(name: &str, binding: &RunBinding, pin: &str) -> Result<()
         .write(true)
         .mode(0o600)
         .open(state.join("runner.log"))?;
-    // Read-only rustup toolchain; per-job writable CARGO_HOME in the wiped
-    // home. Jobs cannot install into, or persist anything through, PATH.
-    let path = format!(
-        "{JOB_HOME}/.cargo/bin:{TOOLCHAIN}/cargo/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-    );
     let mut command = listener_command(&root.path);
+    command.current_dir(&root.path);
+    apply_job_env(&mut command, &state);
     command
-        .current_dir(&root.path)
-        .env_clear()
-        .env("PATH", path)
-        .env("HOME", JOB_HOME)
-        .env("RUSTUP_HOME", format!("{TOOLCHAIN}/rustup"))
-        .env("CARGO_HOME", format!("{JOB_HOME}/.cargo"))
-        .env("USER", RUN_USER)
-        .env("LOGNAME", RUN_USER)
-        .env("LANG", "en_US.UTF-8")
-        .env(
-            "ACTIONS_RUNNER_HOOK_JOB_STARTED",
-            state.join("admit-job.sh"),
-        )
         // Never argv: process arguments are visible to every local user.
         .env("ACTIONS_RUNNER_INPUT_JITCONFIG", &jit)
         .stdin(Stdio::null())
