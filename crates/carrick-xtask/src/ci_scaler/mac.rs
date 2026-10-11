@@ -31,7 +31,7 @@ pub const STATE_ROOT: &str = "/Volumes/carrick-build/carrick-ci/run";
 pub const MANIFEST: &str = "/Volumes/carrick-build/carrick-ci/runner-manifest.txt";
 /// The unprivileged account jobs run as.
 pub const RUN_USER: &str = "carrick-ci";
-/// The job home, recreated from [`SKELETON`] before every job.
+/// The job home, recreated from the root-owned skeleton (`SKELETON`) before every job.
 pub const JOB_HOME: &str = "/Volumes/carrick-build/carrick-ci/job-home";
 /// Root-owned skeleton for [`JOB_HOME`] (dotfiles only; no toolchains).
 pub const SKELETON: &str = "/Volumes/carrick-build/carrick-ci/skel";
