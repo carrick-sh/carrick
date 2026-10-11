@@ -970,6 +970,17 @@ pub(super) fn quiesce(name: &str) -> Result<(), ScalerError> {
     Ok(())
 }
 
+/// The runner is launched through `bin/Runner.Listener run`, not `run.sh`:
+/// the stock `run.sh` copies `run-helper.sh.template` into the runner
+/// directory, which is root-owned and read-only here. A one-job ephemeral JIT
+/// runner needs no restart loop. The JIT config arrives via
+/// `ACTIONS_RUNNER_INPUT_JITCONFIG`, never argv.
+pub fn listener_command(runner_dir: &Path) -> Command {
+    let mut command = Command::new(runner_dir.join("bin/Runner.Listener"));
+    command.arg("run");
+    command
+}
+
 pub(super) fn run_once(name: &str, binding: &RunBinding, pin: &str) -> Result<(), ScalerError> {
     use std::os::unix::process::CommandExt;
     if unsafe { libc::geteuid() } != 0 {
@@ -1017,7 +1028,7 @@ pub(super) fn run_once(name: &str, binding: &RunBinding, pin: &str) -> Result<()
     let path = format!(
         "{JOB_HOME}/.cargo/bin:{TOOLCHAIN}/cargo/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
     );
-    let mut command = Command::new(runner_dir.join("run.sh"));
+    let mut command = listener_command(runner_dir);
     command
         .current_dir(runner_dir)
         .env_clear()
