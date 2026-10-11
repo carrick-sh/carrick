@@ -1,5 +1,7 @@
-//! Stopped CPU custody and one running boundary for the carrier.
-use carrick_hal::guest_arch_binding::{GuestArchBinding, core_arch::TaskIdentity};
+use carrick_hal::guest_arch_binding::{
+    GuestArchBinding,
+    core_arch::{FrameGpa, RootGpa, TaskIdentity},
+};
 use carrick_hal::threaded::X86_TASK_RESUME_PAYLOAD_LEN;
 use carrick_hal::{HvVcpu, HvVm, TrapError, VcpuExit};
 use carrick_x86::{BringupLayout, X86Vcpu, X86VcpuSnapshot, arch_context::X86ArchContext};
@@ -149,6 +151,7 @@ pub struct KvmCarrierCpu<I: CarrierCpuIo = KvmCpuIo> {
     io: I,
     neutral: X86VcpuSnapshot,
     custody: Custody,
+    child_bindings: std::collections::BTreeMap<RootGpa, GuestArchBinding>,
 }
 impl KvmCarrierCpu<KvmCpuIo> {
     pub(crate) fn arm_idle_kick(&mut self, kick: &crate::KvmKickHandle) -> Result<(), TrapError> {
@@ -267,7 +270,17 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
             io,
             neutral,
             custody: Custody::Idle,
+            child_bindings: std::collections::BTreeMap::new(),
         })
+    }
+    pub fn register_child_binding(&mut self, binding: GuestArchBinding) {
+        self.child_bindings.insert(binding.context().root, binding);
+    }
+    pub fn unregister_child_binding(&mut self, root: RootGpa) -> Option<GuestArchBinding> {
+        self.child_bindings.remove(&root)
+    }
+    pub fn clear_child_bindings(&mut self) {
+        self.child_bindings.clear();
     }
     /// Read-only template, never a task or MM owner capability.
     pub fn neutral_image(&self) -> &X86VcpuSnapshot {
@@ -321,9 +334,39 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
             } => (binding, resume),
             _ => return Err(boundary_error("carrier run lost loaded task custody")),
         };
+        let target_binding = match &exit {
+            CarrierRunExit::PhysicalDoorbell {
+                port: carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT,
+                ..
+            } => {
+                let image = match self.io.read_image() {
+                    Ok(img) => img,
+                    Err(error) => {
+                        self.custody = Custody::Poisoned;
+                        return Err(error);
+                    }
+                };
+                let root_gpa = RootGpa::page_aligned(FrameGpa::new(image.cr3 & !0xfff))
+                    .ok_or_else(|| {
+                        self.custody = Custody::Poisoned;
+                        boundary_error("unaligned child retire CR3")
+                    })?;
+                match self.child_bindings.get(&root_gpa).copied() {
+                    Some(child) => child,
+                    None => {
+                        self.custody = Custody::Poisoned;
+                        return Err(boundary_error(&format!(
+                            "unregistered child retire CR3: root {:#x}",
+                            root_gpa.address().raw()
+                        )));
+                    }
+                }
+            }
+            _ => binding,
+        };
         let state = match self.io.read_image().and_then(|image| {
-            X86ArchContext::capture(binding, &image, resume).map_err(|error| {
-                let context = binding.context();
+            X86ArchContext::capture(target_binding, &image, resume).map_err(|error| {
+                let context = target_binding.context();
                 boundary_error(&format!(
                     "stopped CPU image after {exit:?}: {error}; expected root {:#x}, actual CR3 {:#x}, RSP {:#x}, saved GPR7 {:#x}, expected MM {}, context {}",
                     context.root.address().raw(), image.cr3, image.rsp, image.gprs[7],
@@ -360,6 +403,7 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
         // Until the read/save/reset/audit transaction completes the CPU is
         // poisoned, even if a read or a checked snapshot fails before a write.
         self.custody = Custody::Poisoned;
+        self.child_bindings.clear();
         if pending_io {
             self.io.complete_pending_io()?;
         }
@@ -373,6 +417,11 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
         if !matches!(self.custody, Custody::Idle) {
             return Err(boundary_error(
                 "carrier CPU still owns a task or failed detach",
+            ));
+        }
+        if !self.child_bindings.is_empty() {
+            return Err(boundary_error(
+                "carrier CPU still owns child bindings while idle",
             ));
         }
         audit_image(&self.io.read_image()?, &self.neutral)
@@ -434,9 +483,8 @@ mod tests {
             Ok(())
         }
     }
-    fn context(tag: u64) -> X86ArchContext {
+    fn context_with_root(tag: u64, root: RootGpa) -> X86ArchContext {
         let nz = |v| NonZeroU64::new(v).unwrap();
-        let root = RootGpa::page_aligned(FrameGpa::new(tag << 12)).unwrap();
         let binding = GuestArchBinding::x86(
             TaskIdentity {
                 carrier: CarrierGeneration::new(nz(1)),
@@ -487,6 +535,10 @@ mod tests {
         .unwrap();
         X86ArchContext::new(binding, state).unwrap()
     }
+    fn context(tag: u64) -> X86ArchContext {
+        let root = RootGpa::page_aligned(FrameGpa::new(tag << 12)).unwrap();
+        context_with_root(tag, root)
+    }
 
     #[test]
     fn two_task_contexts_preserve_registers_tls_xsave_and_resume() {
@@ -531,6 +583,128 @@ mod tests {
         let detached = cpu.save_and_detach(a.binding().task()).unwrap();
         assert_eq!(detached.state().gprs()[0], 0xabc);
         cpu.audit_idle().unwrap();
+    }
+    struct ChildRetireIo {
+        image: X86VcpuSnapshot,
+        child_image: X86VcpuSnapshot,
+    }
+    impl sealed::Sealed for ChildRetireIo {}
+    impl CarrierCpuIo for ChildRetireIo {
+        fn read_image(&self) -> Result<X86VcpuSnapshot, TrapError> {
+            Ok(self.image.clone())
+        }
+        fn write_image(&mut self, image: &X86VcpuSnapshot) -> Result<(), TrapError> {
+            self.image = image.clone();
+            Ok(())
+        }
+        fn run(&mut self) -> Result<VcpuExit, TrapError> {
+            self.image = self.child_image.clone();
+            Ok(VcpuExit::IoOut {
+                port: carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT,
+                data: vec![0, 0, 0, 0],
+            })
+        }
+        fn complete_pending_io(&mut self) -> Result<(), TrapError> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn child_retiring_on_vcpu_loaded_with_root_succeeds() {
+        let root = context(1);
+        let child = context(2);
+        let child_root = child.binding().context().root;
+        let mut cpu = KvmCarrierCpu::new(ChildRetireIo {
+            image: context(1).hardware_image(),
+            child_image: child.hardware_image(),
+        })
+        .unwrap();
+        cpu.load(root.clone()).unwrap();
+        cpu.register_child_binding(child.binding());
+        let stopped = cpu.run_loaded(root.binding().task()).unwrap();
+        assert_eq!(
+            stopped.exit,
+            CarrierRunExit::PhysicalDoorbell {
+                port: carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT,
+                data: vec![0, 0, 0, 0],
+            }
+        );
+        assert_eq!(stopped.state.binding(), child.binding());
+        assert_eq!(
+            stopped.state.state().cr3(),
+            child.binding().context().root.address().raw()
+        );
+    }
+    #[test]
+    fn unregistered_child_retire_cr3_refuses_with_typed_error() {
+        let root = context(1);
+        let unregistered_child = context(2);
+        let mut cpu = KvmCarrierCpu::new(ChildRetireIo {
+            image: context(1).hardware_image(),
+            child_image: unregistered_child.hardware_image(),
+        })
+        .unwrap();
+        // Do NOT register unregistered_child
+        cpu.load(root.clone()).unwrap();
+        let err = cpu.run_loaded(root.binding().task()).unwrap_err();
+        assert!(
+            err.to_string().contains("unregistered child retire CR3"),
+            "unexpected error: {err:?}"
+        );
+        assert!(matches!(cpu.custody, Custody::Poisoned));
+    }
+    #[test]
+    fn retired_child_root_reuse_rejects_stale_binding() {
+        let root = context(1);
+        let child1 = context(2);
+        let child1_root = child1.binding().context().root;
+        let mut cpu = KvmCarrierCpu::new(ChildRetireIo {
+            image: context(1).hardware_image(),
+            child_image: child1.hardware_image(),
+        })
+        .unwrap();
+        cpu.load(root.clone()).unwrap();
+        cpu.register_child_binding(child1.binding());
+        let stopped = cpu.run_loaded(root.binding().task()).unwrap();
+        assert_eq!(stopped.state.binding(), child1.binding());
+
+        // Unregister retired child1
+        let unregistered = cpu.unregister_child_binding(child1_root);
+        assert_eq!(unregistered, Some(child1.binding()));
+
+        // Subsequent retire with child1's root must be refused as unregistered
+        let err = cpu.run_loaded(root.binding().task()).unwrap_err();
+        assert!(
+            err.to_string().contains("unregistered child retire CR3"),
+            "unexpected error: {err:?}"
+        );
+
+        // Register child2 reusing child1_root with distinct task identity
+        let child2 = context_with_root(3, child1_root);
+        let mut cpu2 = KvmCarrierCpu::new(ChildRetireIo {
+            image: context(1).hardware_image(),
+            child_image: child2.hardware_image(),
+        })
+        .unwrap();
+        cpu2.load(root.clone()).unwrap();
+        cpu2.register_child_binding(child2.binding());
+        let stopped = cpu2.run_loaded(root.binding().task()).unwrap();
+        assert_eq!(stopped.state.binding(), child2.binding());
+        assert_ne!(stopped.state.binding(), child1.binding());
+    }
+    #[test]
+    fn save_and_detach_clears_child_bindings() {
+        let root = context(1);
+        let child = context(2);
+        let mut cpu = KvmCarrierCpu::new(TestIo {
+            image: root.hardware_image(),
+        })
+        .unwrap();
+        cpu.load(root.clone()).unwrap();
+        cpu.register_child_binding(child.binding());
+        assert!(!cpu.child_bindings.is_empty());
+        cpu.save_and_detach(root.binding().task()).unwrap();
+        cpu.audit_idle().unwrap();
+        assert!(cpu.child_bindings.is_empty());
     }
     struct PendingIo {
         image: X86VcpuSnapshot,

@@ -169,6 +169,15 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
         &mut self,
         prepared: Self::PreparedMm,
     ) -> Result<Self::Born, (NativeProcessError, Self::PreparedMm)>;
+    fn commit_child(
+        &mut self,
+        prepared: Self::PreparedMm,
+        child_task: core::num::NonZeroU64,
+        child_execution: core::num::NonZeroU64,
+    ) -> Result<Self::Born, (NativeProcessError, Self::PreparedMm)> {
+        let _ = (child_task, child_execution);
+        self.commit_mm(prepared)
+    }
     fn abort_mm(
         &mut self,
         prepared: Self::PreparedMm,
@@ -3056,10 +3065,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             BirthAttachment::Parent,
             permit,
         );
+        let child_task = child_key.serial.nonzero();
+        let child_execution = child_key.serial.nonzero();
         let result = {
             let mut graph = self.runtime.graph.lock();
             prep.try_publish_with(&mut graph.owner, |prepared| {
-                self.service.commit_mm(prepared)
+                self.service
+                    .commit_child(prepared, child_task, child_execution)
             })
         };
         let published = match result {
