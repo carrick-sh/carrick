@@ -6,7 +6,9 @@ use super::{
     native_process_custody::{ProcessResources, ProcessWake, RetainedProcessCustody},
     native_process_entry::{self, CopiedWaitOutcome, ForkTryError, PreparedFork, WaitWork},
     native_process_signals::{NativeExitSignals, NativeProcessSignals},
-    process_owner::{GuestProcessOwner, GuestTask, GuestTaskMetadata, NativeProcessCustody},
+    process_owner::{
+        GuestForkAttributes, GuestProcessOwner, GuestTask, GuestTaskMetadata, NativeProcessCustody,
+    },
 };
 use crate::lock::SpinLock;
 use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec, vec::Vec};
@@ -48,6 +50,19 @@ use core::{
     time::Duration,
 };
 const LOCK_SPINS: u32 = 100_000;
+
+fn arm_fork_progress(stage: carrick_el1_abi::NativeForkProgress) {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    carrick_el1_abi::record_native_fork_progress(stage);
+    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    let _ = stage;
+}
+fn arm_fork_failure(stage: carrick_el1_abi::NativeForkFailureStage) {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    carrick_el1_abi::record_native_fork_failure(stage);
+    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    let _ = stage;
+}
 
 fn signal_record_exists<C: ProcessContext>(zone: &ZoneTables<C>, record: RecordRef) -> bool {
     if zone.live(record).is_some() {
@@ -171,8 +186,8 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     fn fork_child_context(&self, parent: C, prepared: &Self::PreparedMm) -> C {
         parent.fork_child(self.prepared_context(prepared))
     }
-    fn fork_child_context_boxed(&self, parent: C, prepared: &Self::PreparedMm) -> Box<C> {
-        Box::new(self.fork_child_context(parent, prepared))
+    fn fork_child_context_boxed(&self, parent: &C, prepared: &Self::PreparedMm) -> Box<C> {
+        Box::new(self.fork_child_context(*parent, prepared))
     }
     fn child_lifecycle(&self, prepared: &Self::PreparedMm) -> NativeLifecycleResources<'a>;
     fn commit_mm(
@@ -385,7 +400,7 @@ struct NativeForkBirthAdmission<M> {
     claim: NativeClaim,
     thread_claim: NativeClaim,
     parent_mm: M,
-    signals: NativeProcessSignals<()>,
+    signals: NativeProcessSignals<carrick_personality_linux::abi::signal::LinuxSiginfo>,
     attributes: Box<GuestForkAttributes<VisibleNamespace>>,
 }
 struct PendingWait {
@@ -1536,7 +1551,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         let member_control = resources
             .members
             .iter()
-            .find(|m| m.thread == member_key.task)
+            .find(|m| m.record == member.record)
             .map(|m| m.control)
             .ok_or(NativeProcessError::Stale)?;
         if current.metadata.control_slot.load(Ordering::Acquire)
@@ -1545,7 +1560,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             return Err(NativeProcessError::Stale);
         }
         member_control.bind_zone_record(source.zone.record_ref(record));
-        if member.process == member_key.task {
+        if resources.record == member.record {
             if resources.record != source.zone.record_ref(record) {
                 return Err(NativeProcessError::Stale);
             }
@@ -1582,7 +1597,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             calling_tid,
             slot,
             interrupted_child_wait: None,
-        })
+        }))
     }
     pub fn namespace_child_key(&self, caller: TaskKey, visible: u32) -> Option<TaskKey> {
         self.graph
@@ -5445,7 +5460,15 @@ mod tests {
         registry
             .register_root(runtime.clone(), source, &task, address)
             .unwrap();
-        let parent = runtime.record_binding(zone.record_ref(old)).unwrap().key;
+        let parent = runtime
+            .graph
+            .lock()
+            .owner
+            .tasks()
+            .values()
+            .next()
+            .unwrap()
+            .key();
         assert!(zone.release_host_home(slot, old));
         let identity = ThreadIdentity {
             generation: 19,
@@ -5480,6 +5503,7 @@ mod tests {
             controls: &child_controls,
             copies: Vec::new(),
             refuse_copy: false,
+            on_signal_clock: None,
         };
         let child;
         {
@@ -5708,7 +5732,7 @@ mod tests {
                     source,
                     task,
                     addresses[index],
-                    words(addresses[index]),
+                    Box::new(words(addresses[index])),
                     &mut services[index],
                 )
                 .unwrap();
@@ -5731,7 +5755,7 @@ mod tests {
                     source,
                     task,
                     addresses[index],
-                    words(addresses[index]),
+                    Box::new(words(addresses[index])),
                     &mut services[index],
                 )
                 .unwrap();
@@ -9299,15 +9323,17 @@ mod tests {
 
     impl<'a> NativeProcessService<'a, ParkedContextWords> for FaultyPhysical<'a> {
         type Mm = AddressContext<RootGpa>;
+        type PreparedMmStart = AddressContext<RootGpa>;
+        type PreparedMmPublished = AddressContext<RootGpa>;
         type PreparedMm = AddressContext<RootGpa>;
         type Born = AddressContext<RootGpa>;
 
-        fn prepare_mm(
+        fn prepare_mm_start(
             &mut self,
             _: &Self::Mm,
-            _: ParkedContextWords,
+            _: &ParkedContextWords,
             child: MmGeneration,
-        ) -> Result<Self::PreparedMm, NativeProcessError> {
+        ) -> Result<Self::PreparedMmStart, NativeProcessError> {
             assert!(
                 !self.loan_in_flight,
                 "refusing loan: previous loan is still pending on this vCPU"
@@ -9329,6 +9355,18 @@ mod tests {
             self.next_page += 1;
             self.active_loan = Some(idx);
             Ok(address)
+        }
+        fn prepare_mm_publish(
+            &mut self,
+            start: Self::PreparedMmStart,
+        ) -> Result<Self::PreparedMmPublished, NativeProcessError> {
+            Ok(start)
+        }
+        fn prepare_mm_finish(
+            &mut self,
+            published: Self::PreparedMmPublished,
+        ) -> Result<Self::PreparedMm, NativeProcessError> {
+            Ok(published)
         }
 
         fn prepared_mm(&self, p: &Self::PreparedMm) -> Self::Mm {

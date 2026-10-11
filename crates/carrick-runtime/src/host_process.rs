@@ -15,7 +15,6 @@ static PREPARE_ONCE: Once = Once::new();
 ///    HVF call, avoiding fork-safety crashes in `hv_vcpu_create`.
 pub fn prepare() {
     PREPARE_ONCE.call_once(|| {
-        arm_fatal_debugger_hold_from_env();
         unsafe {
             libc::signal(libc::SIGPIPE, libc::SIG_IGN);
         }
@@ -28,19 +27,6 @@ pub fn prepare() {
             libc::setenv(key.as_ptr(), val.as_ptr(), 1);
         }
     });
-}
-
-/// `CARRICK_FATAL_HOLD_SECS=<n>`: keep the carrier alive `n` seconds on a
-/// `carrick_fatal!` so `sudo lldb -p <pid>` can save a core of the failing
-/// graph (`carrick debug lldb-run` only attaches at its deadline). Diagnostic
-/// only; unset or `0` leaves the fatal path unchanged.
-pub fn arm_fatal_debugger_hold_from_env() {
-    if let Ok(value) = std::env::var("CARRICK_FATAL_HOLD_SECS")
-        && let Ok(secs) = value.trim().parse::<u32>()
-        && secs > 0
-    {
-        carrick_fatal::arm_debugger_hold(secs);
-    }
 }
 
 #[cfg(test)]

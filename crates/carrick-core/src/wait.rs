@@ -30,7 +30,10 @@ pub fn observe_object<C: carrick_core_abi::EntryContext>(
 
 /// Whether a park of the running thread on `slot` may carry a deadline:
 /// admitted records each own capacity in the shared deadline index.
-pub fn may_time_park(zone: &ZoneTables, slot: SlotId) -> bool {
+pub fn may_time_park<C: carrick_core_abi::EntryContext>(
+    zone: &ZoneTables<C>,
+    slot: SlotId,
+) -> bool {
     zone.timer_admission_available(slot)
 }
 

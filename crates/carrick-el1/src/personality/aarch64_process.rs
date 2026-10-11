@@ -1113,21 +1113,15 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         if mm.mm.raw().get() != self.task.mm.key.load(Ordering::Acquire) {
             fatal();
         }
-        let owner = self.portal().unwrap_or_else(|_| fatal());
-        let index = owner
-            .spaces
-            .find(mm.mm.raw().get())
-            .unwrap_or_else(|| fatal());
-        owner.spaces.close(index);
         let binding = common_entry::execution_binding(self.task);
-        let Some(retire) = carrick_el1_abi::NativeChildRetire::new(binding, mm) else {
+        let Some(mut retire) = carrick_el1_abi::NativeChildRetire::new(binding, mm) else {
             fatal();
         };
-        if self
+        let crossing = self
             .crossing
             .cross_child_retire(&retire as *const _ as u64, u64::from(self.worker()))
-            .is_err()
-        {
+            .is_ok();
+        if !crossing || !matches!(retire.take(binding, mm), Some(Ok(()))) {
             fatal();
         }
         fork_progress(carrick_el1_abi::NativeForkProgress::ChildRetired);
@@ -1153,41 +1147,8 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             roots: core::ptr::from_ref(self.roots).addr(),
             mm,
         });
-        if drain_retired_spaces(&owner, self.zone, self.worker()).is_err() {
-            fatal();
-        }
     }
 
-    fn copy_signal_bytes(
-        &mut self,
-        mm: &Self::Mm,
-        address: UserVa,
-        bytes: &[u8],
-    ) -> Result<(), NativeProcessError> {
-        if self.task.mm.key.load(Ordering::Acquire) != mm.mm.raw().get() {
-            return Err(NativeProcessError::Stale);
-        }
-        let mut copy = crate::file::ValidatedCopy {
-            task: self.task,
-            validator: &crate::file::HardwareValidator,
-        };
-        if !carrick_personality_linux::lifecycle::UserCopy::copy_out(&mut copy, address, bytes) {
-            return Err(NativeProcessError::Fault);
-        }
-        Ok(())
-    }
-    fn copy_siginfo(
-        &mut self,
-        mm: &Self::Mm,
-        address: UserVa,
-        info: &carrick_syscall_abi::LinuxSiginfo,
-    ) -> Result<(), NativeProcessError> {
-        // SAFETY: this canonical initialized ABI record owns all wire bytes.
-        let bytes = unsafe {
-            core::slice::from_raw_parts(info as *const _ as *const u8, core::mem::size_of_val(info))
-        };
-        self.copy_signal_bytes(mm, address, bytes)
-    }
     fn wake_effects(&mut self, effects: WakeEffects) {
         deliver_wakes(effects);
     }
@@ -1235,7 +1196,9 @@ mod retirement_tests {
         fn cross_root_exit(&self, _: u64, _: u64) -> Result<(), NativeProcessError> {
             Ok(())
         }
-        fn cross_child_retire(&self, _: u64, _: u64) -> Result<(), NativeProcessError> {
+        fn cross_child_retire(&self, record: u64, _: u64) -> Result<(), NativeProcessError> {
+            // SAFETY: this fixture passes its owned, aligned stack record.
+            assert!(unsafe { &mut *(record as *mut carrick_el1_abi::NativeChildRetire) }.accept());
             Ok(())
         }
     }
@@ -1300,15 +1263,19 @@ mod retirement_tests {
                 ));
             }
             service.retire_mm(context);
+            assert!(
+                zone.spaces.find(mm).is_some(),
+                "terminal owner retains the root"
+            );
             if cycle == 1 {
                 assert!(
                     zone.spaces.find(mm).is_some(),
                     "resident MM stays quarantined"
                 );
                 zone.release_space(slot);
-                let owner = service.portal().unwrap();
-                drain_retired_spaces(&owner, zone, u32::from(slot.raw())).unwrap();
             }
+            let owner = service.portal().unwrap();
+            drain_retired_spaces(&owner, zone, u32::from(slot.raw())).unwrap();
             assert!(zone.spaces.find(mm).is_none());
         }
     }

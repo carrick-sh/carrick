@@ -177,7 +177,9 @@ impl ForkStockCrossing for TestStockCrossing {
         Ok(())
     }
 
-    fn cross_child_retire(&self, _record_gpa: u64, _cpu: u64) -> Result<(), NativeProcessError> {
+    fn cross_child_retire(&self, record_gpa: u64, _cpu: u64) -> Result<(), NativeProcessError> {
+        // SAFETY: the fixture receives its owned, aligned retire record.
+        assert!(unsafe { &mut *(record_gpa as *mut carrick_el1_abi::NativeChildRetire) }.accept());
         Ok(())
     }
 }

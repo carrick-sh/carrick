@@ -1263,7 +1263,7 @@ pub(crate) fn service_metadata_operation(
         let Some(execution) = execution else {
             return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
         };
-        let retire = unsafe { &*record_ptr };
+        let retire = unsafe { &mut *record_ptr };
         match custody
             .fork_stock
             .lock()

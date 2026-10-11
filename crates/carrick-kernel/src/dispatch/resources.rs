@@ -12,6 +12,7 @@ use carrick_fatal::carrick_fatal;
 pub(super) struct CapturedResources {
     file_lease: Option<crate::kernel::objects::FileTableFunctionalLease>,
     files_finished: bool,
+    mm_only: bool,
     io_rearm: Option<super::net::IoRearm>,
     resources: Arc<crate::kernel::ThreadResources>,
     /// A table published by unshare/close_range inside this exact scope.
@@ -33,6 +34,7 @@ impl CapturedResources {
         Self {
             file_lease: None,
             files_finished: false,
+            mm_only: false,
             io_rearm: None,
             resources: Arc::clone(context.resources()),
             files_override: None,
@@ -141,8 +143,6 @@ impl CapturedResourcesStack {
 thread_local! {
     static CAPTURED_RESOURCES: RefCell<CapturedResourcesStack> =
         const { RefCell::new(CapturedResourcesStack::new()) };
-    static CAPTURED_MM_ONLY: RefCell<Option<Arc<crate::kernel::Mm>>> =
-        const { RefCell::new(None) };
     static ACTIVE_CONTEXT: Cell<*const crate::kernel::KernelContext> =
         const { Cell::new(std::ptr::null()) };
     static RETIRING_FILE_TABLES: RefCell<Vec<Arc<crate::kernel::FileTable>>> =
@@ -154,7 +154,6 @@ thread_local! {
 pub fn executor_boundary_is_clear() -> bool {
     ACTIVE_CONTEXT.with(|active| active.get().is_null())
         && CAPTURED_RESOURCES.with(|stack| stack.borrow().is_empty())
-        && CAPTURED_MM_ONLY.with(|current| current.borrow().is_none())
         && RETIRING_FILE_TABLES.with(|stack| stack.borrow().is_empty())
 }
 
@@ -164,16 +163,19 @@ pub(super) fn with_captured_mm<R>(
     context: &crate::kernel::KernelContext,
     operation: impl FnOnce() -> R,
 ) -> R {
-    struct Restore(Option<Arc<crate::kernel::Mm>>);
+    struct Restore;
     impl Drop for Restore {
         fn drop(&mut self) {
-            CAPTURED_MM_ONLY.with(|current| {
-                *current.borrow_mut() = self.0.take();
+            CAPTURED_RESOURCES.with(|stack| {
+                stack.borrow_mut().pop();
             });
         }
     }
-    let previous = CAPTURED_MM_ONLY.with(|current| current.replace(Some(context.shared().mm())));
-    let _restore = Restore(previous);
+    let mut captured = CapturedResources::from_context(context);
+    captured.files_finished = true;
+    captured.mm_only = true;
+    CAPTURED_RESOURCES.with(|stack| stack.borrow_mut().push(captured));
+    let _restore = Restore;
     operation()
 }
 
@@ -456,23 +458,45 @@ pub(crate) fn rlimits() -> Option<crate::kernel::RlimitSet> {
         stack
             .borrow()
             .last()
+            .filter(|resources| !resources.mm_only)
             .map(|resources| resources.task().rlimits())
     })
 }
 
 pub(super) fn task() -> Option<crate::kernel::TaskRef> {
-    CAPTURED_RESOURCES.with(|stack| stack.borrow().last().map(CapturedResources::task))
+    CAPTURED_RESOURCES.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .filter(|r| !r.mm_only)
+            .map(CapturedResources::task)
+    })
 }
 
 pub(super) fn credentials() -> Option<Arc<crate::kernel::Credentials>> {
-    CAPTURED_RESOURCES.with(|stack| stack.borrow().last().map(CapturedResources::credentials))
+    CAPTURED_RESOURCES.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .filter(|r| !r.mm_only)
+            .map(CapturedResources::credentials)
+    })
 }
 
 pub(super) fn fs_context() -> Option<Arc<crate::kernel::FsContext>> {
-    CAPTURED_RESOURCES.with(|stack| stack.borrow().last().map(CapturedResources::fs_context))
+    CAPTURED_RESOURCES.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .filter(|r| !r.mm_only)
+            .map(CapturedResources::fs_context)
+    })
 }
 
 pub(super) fn files() -> Option<Arc<crate::kernel::FileTable>> {
+    if CAPTURED_RESOURCES.with(|stack| stack.borrow().last().is_some_and(|r| r.mm_only)) {
+        return None;
+    }
     RETIRING_FILE_TABLES
         .with(|stack| stack.borrow().last().cloned())
         .or_else(|| {
@@ -481,9 +505,6 @@ pub(super) fn files() -> Option<Arc<crate::kernel::FileTable>> {
 }
 
 pub(super) fn mm() -> Option<Arc<crate::kernel::Mm>> {
-    if let Some(mm) = CAPTURED_MM_ONLY.with(|current| current.borrow().clone()) {
-        return Some(mm);
-    }
     CAPTURED_RESOURCES.with(|stack| stack.borrow().last().map(CapturedResources::mm))
 }
 
@@ -506,6 +527,9 @@ mod tests {
                 super::files().is_none(),
                 "MM scope must not expose file authority"
             );
+            assert!(super::task().is_none());
+            assert!(super::credentials().is_none());
+            assert!(super::fs_context().is_none());
         });
         assert!(super::mm().is_none());
     }
