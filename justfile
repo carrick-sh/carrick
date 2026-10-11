@@ -195,6 +195,10 @@ clippy *ARGS:
     # --workspace --features is rejected on a virtual workspace).
     exec {{_admit}} {{_cargo}} clippy -p carrick-cli {{_platform_features}} --all-targets --keep-going {{ARGS}} -- -D warnings
 
+# Lint all GitHub Actions workflow files with actionlint.
+actionlint *ARGS:
+    actionlint {{ARGS}} .github/workflows/*.yml
+
 # Typed-domain semgrep gate: blocks the bug SHAPES the newtypes exist to kill
 # (raw wait-set complements, bit=signum masks, host pids in NsPid, hand-numbered
 # private syscall numbers, function-local LINUX_* consts, inline errno
@@ -1179,43 +1183,58 @@ ci-changes:
     #!/usr/bin/env bash
     set -euo pipefail
     heavy=true
+    macos=true
+    workflows=true
     if [[ "${CI_EVENT:?}" == pull_request ]]; then
+        macos=false
         paths="$(mktemp)"
         trap 'rm -f "$paths"' EXIT
         git diff --no-renames --name-only -z "${CI_BASE:?}...HEAD" > "$paths"
         if [[ -s "$paths" ]]; then
-            heavy=false
+            has_code=false
+            has_workflows=false
             while IFS= read -r -d '' path; do
-                case "$path" in docs/*|*.md) ;; *) heavy=true; break ;; esac
+                case "$path" in
+                    crates/*|Cargo.*|justfile|scripts/*|rust-toolchain*|conformance*|fixtures/*)
+                        has_code=true
+                        ;;
+                    docs/*|*.md|LICENSE*)
+                        ;;
+                    .github/*)
+                        has_workflows=true
+                        ;;
+                    *)
+                        has_code=true
+                        ;;
+                esac
             done < "$paths"
+            heavy="$has_code"
+            workflows="$has_workflows"
         fi
-    fi
-    # Pull requests defer the hosted macOS jobs to merge_group, workflow_dispatch,
-    # and the nightly schedule: the hosted macOS runner pool is small and shared
-    # with the merge queue.
-    macos=true
-    if [[ "${CI_EVENT}" == pull_request ]]; then
-        macos=false
     fi
     echo "heavy=$heavy" >> "${GITHUB_OUTPUT:?}"
     echo "macos=$macos" >> "${GITHUB_OUTPUT:?}"
-    echo "Run hosted checks: $heavy (macOS: $macos)"
+    echo "workflows=$workflows" >> "${GITHUB_OUTPUT:?}"
+    echo "Run hosted checks: heavy=$heavy macos=$macos workflows=$workflows"
 
 # Fail closed: GitHub considers skipped required jobs successful on their own.
-# ci-ok depends on every job; only the filter can license a docs-only PR skip.
+# ci-ok depends on every job; only the filter can license a docs-only or workflow-only PR skip.
 ci-results:
     #!/usr/bin/env bash
     set -euo pipefail
     jq -e --arg event "${CI_EVENT:?}" '
       .changes.result == "success" and
       (length > 1) and
-      (if .changes.outputs.heavy == "true" and .changes.outputs.macos == "true" then
+      (. as $root |
+       if $root.changes.outputs.heavy == "true" and $root.changes.outputs.macos == "true" then
          del(.changes) | all(.[]; .result == "success")
-       elif .changes.outputs.heavy == "true" and .changes.outputs.macos == "false" and $event == "pull_request" then
-         del(.changes)
-         | (with_entries(select(.key | startswith("macos-"))) | all(.[]; .result == "skipped"))
-           and (with_entries(select(.key | startswith("macos-") | not)) | all(.[]; .result == "success"))
-       elif .changes.outputs.heavy == "false" and $event == "pull_request" then
-         del(.changes) | all(.[]; .result == "skipped")
+       elif $event == "pull_request" then
+         (del(.changes) | with_entries(select(.key | startswith("macos-"))) | all(.[]; .result == "skipped")) and
+         (del(.changes) | with_entries(select((.key | startswith("macos-") | not) and .key != "actionlint"))
+           | if ($root.changes.outputs.heavy // "true") == "true" then all(.[]; .result == "success")
+             else all(.[]; .result == "skipped") end) and
+         (del(.changes).actionlint
+           | if ($root.changes.outputs.workflows // "false") == "true" then .result == "success"
+             else .result == "skipped" end)
        else false end)
     ' <<< "${CI_NEEDS:?}"
