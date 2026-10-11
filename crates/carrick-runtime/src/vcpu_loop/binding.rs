@@ -32,6 +32,27 @@ use super::threads::{VcpuThreadRegistry, publish_unexpected_executor_failure_ret
 use super::wait_wake::*;
 use super::*;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct TerminalNativeWaitWake;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl std::fmt::Debug for TerminalNativeWaitWake {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TerminalNativeWaitWake")
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl carrick_vmm_hvf::metadata_grant::NativeWaitChannelWake for TerminalNativeWaitWake {
+    fn wake(&self, mm: carrick_el1_abi::EntryMmKey, address: std::num::NonZeroU64) -> Option<u32> {
+        let zone = carrick_kernel::el1_zone::zone()?;
+        let wake =
+            carrick_kernel::el1_zone::wake(zone, mm.raw(), address.get(), u32::MAX, u32::MAX);
+        carrick_kernel::el1_zone::hand_back(&wake.handed);
+        Some(wake.count)
+    }
+}
+
 /// Exact execution authority is task-local in the compatibility loop and is
 /// lent by the Task 4 worker in the persistent loop. Both modes expose the
 /// same narrow slot API so exec/continuation helpers cannot accidentally grow
@@ -6290,6 +6311,14 @@ where
                 prepared.fail_exact();
                 return VcpuLoopLaunch::Direct(Err(RuntimeError::Configuration(format!(
                     "native space completion registration failed: {error:?}"
+                ))));
+            }
+            if let Err(error) =
+                access.install_native_wait_channel_wake(Arc::new(TerminalNativeWaitWake))
+            {
+                prepared.fail_exact();
+                return VcpuLoopLaunch::Direct(Err(RuntimeError::Configuration(format!(
+                    "native wait-channel wake registration failed: {error:?}"
                 ))));
             }
             if let Err(error) = kernel.dispatcher.install_reservation_provider(Arc::new(

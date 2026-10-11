@@ -4,10 +4,10 @@ use crate::host_mapping::{HostMappingKind, OwnedHostMapping};
 use carrick_el1_abi::{
     EL1_DYNAMIC_METADATA_BASE, EL1_DYNAMIC_METADATA_EXTENT_SIZE, EL1_DYNAMIC_METADATA_SIZE,
     ForkStockExchange, ForkStockKind, ForkStockRefusal, ForkStockSettlement, GRANT_OP_CHILD_RETIRE,
-    GRANT_OP_FORK_STOCK, GRANT_OP_OWNER_SUPPLY, GRANT_OP_ROOT_EXIT, METADATA_GRANT_ERR_ALIGNMENT,
-    METADATA_GRANT_ERR_DENIED, METADATA_GRANT_ERR_INVALID, METADATA_GRANT_ERR_NOT_FOUND,
-    METADATA_GRANT_OP_ALLOC, METADATA_GRANT_OP_FREE, METADATA_GRANT_SUCCESS, NativeChildRetire,
-    NativeRootExit,
+    GRANT_OP_FORK_STOCK, GRANT_OP_OWNER_SUPPLY, GRANT_OP_ROOT_EXIT, GRANT_OP_WAIT_CHANNEL_WAKE,
+    METADATA_GRANT_ERR_ALIGNMENT, METADATA_GRANT_ERR_DENIED, METADATA_GRANT_ERR_INVALID,
+    METADATA_GRANT_ERR_NOT_FOUND, METADATA_GRANT_OP_ALLOC, METADATA_GRANT_OP_FREE,
+    METADATA_GRANT_SUCCESS, NativeChildRetire, NativeRootExit,
 };
 use carrick_el1_abi::{
     MetadataExtent, MetadataExtentResolver, MetadataResolutionError, PinnedMetadataExtent,
@@ -177,16 +177,14 @@ pub(crate) fn terminal_root_binding(
     (binding.issued() && binding.mm.raw() == lane.mm() && home_matches).then_some(binding)
 }
 
-/// A child has left the zone graph before it returns its fork stock. The
-/// stopped CPU still holds the child's hardware root and current-task slot;
-/// authenticate those against the host's committed root before accepting the
-/// terminal retirement crossing.
+/// A child has left the zone graph before it returns its fork stock. Its
+/// fixed current-task slot still names the committed child MM. This binding
+/// also authenticates a terminal failure after the child switched to idle.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn terminal_child_execution(
+pub(crate) fn terminal_child_binding(
     custody: &crate::trap::CarrierVmCustody,
     cpu: carrick_guest_arch::CpuId,
-    ttbr0: u64,
-) -> Option<crate::fork_stock::GrantExecution> {
+) -> Option<carrick_el1_abi::ExecutionBinding> {
     let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
     let zone = carrick_el1_abi::zone_tables()?;
     let lane = zone.slot(slot);
@@ -220,13 +218,44 @@ fn terminal_child_execution(
     }
     let mm = std::num::NonZeroU64::new(binding.mm.raw())?;
     let stock = custody.fork_stock.lock();
-    let context = stock.root(mm)?;
+    stock.root(mm)?;
     if !stock.committed_asids.contains_key(&binding.mm.raw())
         || !stock.committed_lifecycle.contains_key(&binding.mm.raw())
-        || context.root.address().raw() != ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK
     {
         return None;
     }
+    Some(binding)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+/// Retirement additionally requires the child's hardware root on this CPU.
+fn terminal_child_execution(
+    custody: &crate::trap::CarrierVmCustody,
+    cpu: carrick_guest_arch::CpuId,
+    ttbr0: u64,
+) -> Option<crate::fork_stock::GrantExecution> {
+    let binding = terminal_child_binding(custody, cpu)?;
+    let mm = std::num::NonZeroU64::new(binding.mm.raw())?;
+    let context = custody.fork_stock.lock().root(mm)?;
+    if context.root.address().raw() != ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK {
+        return None;
+    }
+    Some(crate::fork_stock::GrantExecution::new(
+        cpu, binding, context,
+    ))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retired_child_execution(
+    custody: &crate::trap::CarrierVmCustody,
+    cpu: carrick_guest_arch::CpuId,
+) -> Option<crate::fork_stock::GrantExecution> {
+    let binding = terminal_child_binding(custody, cpu)?;
+    let stock = custody.fork_stock.lock();
+    if !stock.retired_mms.contains(&binding.mm.raw()) {
+        return None;
+    }
+    let context = stock.root(std::num::NonZeroU64::new(binding.mm.raw())?)?;
     Some(crate::fork_stock::GrantExecution::new(
         cpu, binding, context,
     ))
@@ -241,6 +270,13 @@ fn native_record_on_cpu_stack(record_gpa: u64, cpu: carrick_guest_arch::CpuId) -
 }
 
 pub const MAX_DYNAMIC_EXTENT_SLOTS: usize = 128;
+
+/// Runtime-owned handback for a native child's parent wait after EL1 can no
+/// longer place the parent on a guest CPU. The VMM retains only this venue;
+/// the kernel owns the wait and its continuation.
+pub trait NativeWaitChannelWake: std::fmt::Debug + Send + Sync {
+    fn wake(&self, mm: carrick_el1_abi::EntryMmKey, address: std::num::NonZeroU64) -> Option<u32>;
+}
 
 #[derive(
     ::core::fmt::Debug,
@@ -420,6 +456,15 @@ impl CarrierMetadataAccess {
     ) -> Result<(), MetadataResolutionError> {
         self.region()?;
         *self.carrier.custody.native_space_completion.lock() = Some(wake);
+        Ok(())
+    }
+
+    pub fn install_native_wait_channel_wake(
+        &self,
+        wake: Arc<dyn NativeWaitChannelWake>,
+    ) -> Result<(), MetadataResolutionError> {
+        self.region()?;
+        *self.carrier.custody.native_wait_channel_wake.lock() = Some(wake);
         Ok(())
     }
 
@@ -1345,6 +1390,33 @@ pub(crate) fn service_metadata_operation(
             Ok(()) => Ok([METADATA_GRANT_SUCCESS, 0, 0, 0]),
             Err(_) => Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]),
         }
+    } else if op == GRANT_OP_WAIT_CHANNEL_WAKE {
+        let Some(_execution) = execution.filter(|execution| {
+            arg1 != 0
+                && arg2 != 0
+                && arg3 == u64::from(cpu.raw())
+                && custody
+                    .fork_stock
+                    .lock()
+                    .retired_mms
+                    .contains(&execution.binding.mm.raw())
+        }) else {
+            return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+        };
+        let Some(_) = std::num::NonZeroU64::new(arg1) else {
+            return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+        };
+        let mm = carrick_el1_abi::EntryMmKey::from_raw(arg1);
+        let Some(address) = std::num::NonZeroU64::new(arg2) else {
+            return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+        };
+        let Some(wake) = custody.native_wait_channel_wake.lock().clone() else {
+            return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+        };
+        let Some(count) = wake.wake(mm, address) else {
+            return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+        };
+        Ok([METADATA_GRANT_SUCCESS, u64::from(count), 0, 0])
     } else {
         Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0])
     }
@@ -1577,7 +1649,11 @@ pub(crate) fn handle_metadata_grant_trap(
         .map_err(|e| TrapError::Hypervisor(format!("failed to read X3 for metadata grant: {e}")))?;
     let process_crossing = matches!(
         op,
-        GRANT_OP_FORK_STOCK | GRANT_OP_ROOT_EXIT | GRANT_OP_CHILD_RETIRE | GRANT_OP_OWNER_SUPPLY
+        GRANT_OP_FORK_STOCK
+            | GRANT_OP_ROOT_EXIT
+            | GRANT_OP_CHILD_RETIRE
+            | GRANT_OP_OWNER_SUPPLY
+            | GRANT_OP_WAIT_CHANNEL_WAKE
     );
     let active = if process_crossing {
         let ttbr0 = vcpu.get_sys_reg(SysReg::TTBR0_EL1).map_err(|e| {
@@ -1587,6 +1663,11 @@ pub(crate) fn handle_metadata_grant_trap(
             .or_else(|| {
                 (op == GRANT_OP_CHILD_RETIRE)
                     .then(|| terminal_child_execution(custody, cpu, ttbr0))
+                    .flatten()
+            })
+            .or_else(|| {
+                (op == GRANT_OP_WAIT_CHANNEL_WAKE)
+                    .then(|| retired_child_execution(custody, cpu))
                     .flatten()
             })
             .filter(|execution| {

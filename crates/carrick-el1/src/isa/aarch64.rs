@@ -162,6 +162,31 @@ impl Aarch64UserTransfer {
     }
 }
 
+pub(crate) fn cross_hvc_wait_channel_wake(mm: u64, address: u64, cpu: u64) -> Result<(), ()> {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    {
+        let mut status = carrick_el1_abi::GRANT_OP_WAIT_CHANNEL_WAKE;
+        unsafe {
+            core::arch::asm!(
+                "hvc #6",
+                inout("x0") status,
+                inlateout("x1") mm => _,
+                inlateout("x2") address => _,
+                inlateout("x3") cpu => _,
+                options(nostack)
+            );
+        }
+        (status == carrick_el1_abi::METADATA_GRANT_SUCCESS)
+            .then_some(())
+            .ok_or(())
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    {
+        let _ = (mm, address, cpu);
+        Err(())
+    }
+}
+
 impl ArchTypes for Aarch64Backend {
     type Error = ArchError;
     type NativeFrame = TrapFrame;

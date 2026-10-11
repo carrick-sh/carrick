@@ -214,6 +214,12 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     fn quarantine_born(&mut self, born: Self::Born);
     fn retire_mm(&mut self, mm: Self::Mm);
     fn wake_effects(&mut self, effects: WakeEffects);
+    fn wake_unplaceable_wait(
+        &mut self,
+        _channel: ProcessWaitChannel,
+    ) -> Result<(), NativeProcessError> {
+        Err(NativeProcessError::Quarantined)
+    }
     /// Plain fork copies descriptors into a graph-issued table identity.
     fn child_file_table(&self, _parent_table: u64, issued: u64) -> u64 {
         issued
@@ -317,6 +323,13 @@ impl Drop for NativeClaim {
 struct WaitChannel {
     generation: ProcessWake,
     mm: u64,
+}
+/// Exact in-zone wait key for a terminal child that cannot place its parent
+/// on a guest CPU after the child's record has retired.
+#[derive(Clone, Copy)]
+pub struct ProcessWaitChannel {
+    pub mm: carrick_el1_abi::EntryMmKey,
+    pub address: core::num::NonZeroU64,
 }
 impl WaitChannel {
     fn address(this: &Arc<Self>) -> u64 {
@@ -2675,7 +2688,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .publish()
             .map_err(|_| NativeProcessError::Exhausted)?;
         let mut effects = WakeEffects::default();
-        zone.wake_placed(
+        let wake = zone.wake_placed(
             &guard,
             channel.mm,
             address,
@@ -2686,9 +2699,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             },
             &mut [],
             &mut effects,
-        )
-        .map_err(|_| NativeProcessError::Quarantined)?;
+        );
         drop(guard);
+        if matches!(wake, Err(carrick_sched_core::WakeRefusal::Unplaceable)) {
+            let address =
+                core::num::NonZeroU64::new(address).ok_or(NativeProcessError::Quarantined)?;
+            return self.service.wake_unplaceable_wait(ProcessWaitChannel {
+                mm: carrick_el1_abi::EntryMmKey::from_raw(channel.mm),
+                address,
+            });
+        }
+        wake.map_err(|_| NativeProcessError::Quarantined)?;
         self.service.wake_effects(effects);
         Ok(())
     }

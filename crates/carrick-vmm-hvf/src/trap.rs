@@ -8415,7 +8415,8 @@ impl HvfInner {
                     let ttbr = vcpu.get_sys_reg(SysReg::TTBR0_EL1).map_err(hvf_error)?;
                     let binding = crate::metadata_grant::live_fork_execution(cpu, ttbr)
                         .map(|execution| execution.binding)
-                        .or_else(|| crate::metadata_grant::terminal_root_binding(custody, cpu));
+                        .or_else(|| crate::metadata_grant::terminal_root_binding(custody, cpu))
+                        .or_else(|| crate::metadata_grant::terminal_child_binding(custody, cpu));
                     let (reason, crossings) = custody
                         .fork_stock
                         .lock()
