@@ -789,9 +789,15 @@ fn drain_fork_quarantine(
         let Some(zone) = carrick_el1_abi::zone_tables() else {
             return false;
         };
+        // ARM leaves the child's space open for terminal clear-child-tid.
+        // Stage-1 occupancy alone is insufficient: the stopped lane can run
+        // its maintenance root while still servicing that child's MM.
+        if zone.spaces.is_open(mm) {
+            return false;
+        }
         (0..carrick_el1_abi::EL1_STACK_SLOTS as usize).all(|index| {
             carrick_guest_arch::SlotId::from_index(index)
-                .is_some_and(|slot| zone.installed_space(slot) != mm)
+                .is_some_and(|slot| zone.installed_space(slot) != mm && zone.slot(slot).mm() != mm)
         })
     };
     let clear_tables = |pages: &[carrick_guest_arch::RootGpa]| {
