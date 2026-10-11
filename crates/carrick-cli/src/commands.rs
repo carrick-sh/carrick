@@ -278,7 +278,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             if let Some(dir) = &exec_args.post_mortem_dir {
                 carrick_kernel::kernel::debug::PostMortem::install_dir(dir.clone());
             }
-            arm_fatal_debugger_hold_from_env();
+            carrick_runtime::host_process::arm_fatal_debugger_hold_from_env();
 
             let utf8_path = camino::Utf8PathBuf::from_path_buf(path.clone())
                 .map_err(|p| anyhow::anyhow!("invalid non-UTF-8 ELF path: {}", p.display()))?;
@@ -551,7 +551,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             if let Some(dir) = &exec_args.post_mortem_dir {
                 carrick_kernel::kernel::debug::PostMortem::install_dir(dir.clone());
             }
-            arm_fatal_debugger_hold_from_env();
+            carrick_runtime::host_process::arm_fatal_debugger_hold_from_env();
 
             let req = build_launch_request(
                 carrick_spec::ImageSource::Oci(image),
@@ -3203,17 +3203,4 @@ fn build_launch_request(
         stop_timeout: run_args.stop_timeout,
         volumes_from: run_args.volumes_from.clone(),
     })
-}
-
-/// `CARRICK_FATAL_HOLD_SECS=<n>`: keep the carrier alive `n` seconds on a
-/// `carrick_fatal!` so `sudo lldb -p <pid>` can save a core of the failing
-/// graph (`carrick debug lldb-run` only attaches at its deadline). Diagnostic
-/// only; unset or `0` leaves the fatal path unchanged.
-fn arm_fatal_debugger_hold_from_env() {
-    if let Ok(value) = std::env::var("CARRICK_FATAL_HOLD_SECS")
-        && let Ok(secs) = value.trim().parse::<u32>()
-        && secs > 0
-    {
-        carrick_fatal::arm_debugger_hold(secs);
-    }
 }
