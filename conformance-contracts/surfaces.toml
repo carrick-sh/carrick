@@ -823,6 +823,10 @@ path = "crates/carrick-personality-linux/src/entry.rs"
 contracts = ["core.entry.completion"]
 
 [[surfaces]]
+path = "crates/carrick-personality-linux/src/arch_prctl.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
 path = "crates/carrick-syscall-abi/src/lib.rs"
 contracts = ["core.entry.completion"]
 

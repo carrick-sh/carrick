@@ -2315,7 +2315,69 @@ mod kernel {
             .captured_stack
             .store(call.stack.raw(), Ordering::Release);
         let handled_by_fixture = fixture_expr!(crate::fixture_handled(frame, _early_xstate, binding, task, counters, &call));
-        if !handled_by_fixture {
+        struct Cpl0ArchPrctl<'a> {
+            task: &'a CurrentTask,
+        }
+
+        impl carrick_guest_arch::SegmentBaseRegs for Cpl0ArchPrctl<'_> {
+            type Error = core::convert::Infallible;
+
+            fn seg_set_fs_base(&mut self, addr: u64) -> Result<(), Self::Error> {
+                use carrick_el1::isa::x86::context::scheduler::{NativeTlsRegister, write_tls};
+                write_tls(NativeTlsRegister::Fs, addr);
+                Ok(())
+            }
+
+            fn seg_get_fs_base(&self) -> Result<u64, Self::Error> {
+                use carrick_el1::isa::x86::context::scheduler::{NativeTlsRegister, read_tls};
+                Ok(read_tls(NativeTlsRegister::Fs))
+            }
+
+            fn seg_set_gs_base(&mut self, addr: u64) -> Result<(), Self::Error> {
+                use carrick_el1::isa::x86::context::scheduler::{NativeTlsRegister, write_tls};
+                write_tls(NativeTlsRegister::UserGs, addr);
+                Ok(())
+            }
+
+            fn seg_get_gs_base(&self) -> Result<u64, Self::Error> {
+                use carrick_el1::isa::x86::context::scheduler::{NativeTlsRegister, read_tls};
+                Ok(read_tls(NativeTlsRegister::UserGs))
+            }
+        }
+
+        impl carrick_guest_arch::CurrentMmMemory for Cpl0ArchPrctl<'_> {
+            fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), carrick_guest_arch::UserMemoryFault> {
+                // SAFETY: `task` is the currently executing task whose #PF recovery gate
+                // is installed on this CPU. Source buffer `bytes` is in kernel memory and
+                // disjoint from the user target `address`.
+                let copied = unsafe {
+                    carrick_el1::isa::x86::user_access::copy(
+                        self.task,
+                        address as *mut u8,
+                        bytes.as_ptr(),
+                        bytes.len(),
+                        address,
+                        true,
+                    )
+                };
+                if copied {
+                    Ok(())
+                } else {
+                    Err(carrick_guest_arch::UserMemoryFault)
+                }
+            }
+        }
+
+        let handled_by_native = if call.native.raw() == carrick_syscall_abi::syscall_x86_64::ARCH_PRCTL_NR {
+            let mut ctx = Cpl0ArchPrctl { task };
+            let ret = carrick_personality_linux::arch_prctl::service_arch_prctl(&mut ctx, call.args[0], call.args[1])
+                .unwrap_or_else(|inf| match inf {});
+            frame.rax = ret as u64;
+            true
+        } else {
+            false
+        };
+        if !handled_by_fixture && !handled_by_native {
             use carrick_personality_linux::dispatch::CompletionRoute;
             let layout = <carrick_el1::isa::x86::X86Backend as LayoutBackend>::KERNEL_LAYOUT;
             let cache_lookup = |handle: u32| {

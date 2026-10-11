@@ -873,9 +873,10 @@ impl PersistentExecutor for KvmPersistentExecutor {
                             let raw = match X8664GuestArch::normalize_syscall(&syscall) {
                                 SyscallNorm::Plain(raw) => raw,
                                 SyscallNorm::ArchPrctl { code, addr } => {
-                                    let value = carrick_hal::x8664_arch::service_arch_prctl(
-                                        venue, code, addr,
-                                    )?;
+                                    let value =
+                                        carrick_personality_linux::arch_prctl::service_arch_prctl(
+                                            venue, code, addr,
+                                        )?;
                                     return Ok(ForwardDecision::Immediate(
                                         InitialSyscallDisposition::Return(value),
                                     ));
