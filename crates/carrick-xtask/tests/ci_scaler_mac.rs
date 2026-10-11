@@ -516,6 +516,7 @@ fn runner_is_launched_through_the_listener_not_run_sh() {
     assert_eq!(args, ["run"]);
 }
 
+#[cfg(target_os = "macos")]
 fn runner_fixture(base: &std::path::Path) -> std::path::PathBuf {
     let dir = base.join("actions-runner");
     std::fs::create_dir_all(dir.join("bin")).unwrap();
