@@ -615,21 +615,22 @@ fn persist_terminal_receipt(id: &str, receipt: &CarrierTerminalReceipt) -> std::
 
 fn ensure_private_aux_directory(directory: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(registry_root())?;
-    match std::fs::symlink_metadata(directory) {
-        Ok(metadata) => {
-            // SAFETY: geteuid has no preconditions.
-            let uid = unsafe { libc::geteuid() };
-            if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata.uid() != uid {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!("{} is not an owned directory", directory.display()),
-                ));
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir(directory)?;
-        }
+    // Create first, then validate whatever is there. A stat-then-create
+    // sequence races a concurrent creator (another CLI, or a parallel test)
+    // into a spurious EEXIST; validation alone decides acceptance.
+    match std::fs::create_dir(directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error),
+    }
+    let metadata = std::fs::symlink_metadata(directory)?;
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata.uid() != uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is not an owned directory", directory.display()),
+        ));
     }
     std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
 }
@@ -1152,6 +1153,30 @@ mod tests {
             })
         );
         let _ = clear_terminal_receipt(&auto_id);
+    }
+
+    #[test]
+    fn private_aux_directory_tolerates_concurrent_creators() {
+        let directory = registry_root().join(format!(".aux-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir(&directory);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let directory = directory.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ensure_private_aux_directory(&directory)
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle
+                .join()
+                .expect("creator thread")
+                .expect("concurrent create");
+        }
+        let _ = std::fs::remove_dir(&directory);
     }
 
     #[test]
