@@ -622,3 +622,66 @@ fn removing_the_run_root_does_not_follow_planted_symlinks() {
     assert!(shared.join("bin/Runner.Listener").exists());
     remove_run_root(&clone).unwrap();
 }
+
+#[test]
+fn job_env_gives_each_run_a_private_sccache_server_and_cache() {
+    let mut command = std::process::Command::new("/usr/bin/env");
+    // Anything the launcher inherited or set earlier must not survive.
+    command
+        .env("SCCACHE_BUCKET", "leaked")
+        .env("SCCACHE_SERVER_PORT", "4226")
+        .env("SCCACHE_DIR", "/Volumes/carrick/dev/.sccache");
+    apply_job_env(&mut command, std::path::Path::new("/state/run"));
+    let out = command.output().unwrap();
+    let env: std::collections::BTreeMap<String, String> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|l| l.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned())))
+        .collect();
+    let uds = &env["SCCACHE_SERVER_UDS"];
+    assert!(
+        std::path::Path::new(uds).starts_with(JOB_HOME),
+        "socket must live in the wiped job home: {uds}"
+    );
+    assert!(uds.len() < 104, "sun_path limit on macOS");
+    assert_eq!(env["SCCACHE_DIR"], SCCACHE_DIR);
+    assert_eq!(env["SCCACHE_CACHE_SIZE"], SCCACHE_CACHE_SIZE);
+    assert!(!env.contains_key("SCCACHE_BUCKET"));
+    assert!(!env.contains_key("SCCACHE_SERVER_PORT"));
+    let mut sccache: Vec<&str> = env
+        .keys()
+        .filter(|k| k.starts_with("SCCACHE_"))
+        .map(String::as_str)
+        .collect();
+    sccache.sort_unstable();
+    assert_eq!(
+        sccache,
+        ["SCCACHE_CACHE_SIZE", "SCCACHE_DIR", "SCCACHE_SERVER_UDS"]
+    );
+}
+
+#[test]
+fn run_user_dir_is_private_persistent_and_never_follows_a_symlink() {
+    let root = tempfile::tempdir().unwrap();
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    let dir = root.path().join("sccache");
+    ensure_run_user_dir(&dir, uid, gid).unwrap();
+    assert_eq!(
+        std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    // Cache contents persist across runs.
+    std::fs::write(dir.join("entry"), "x").unwrap();
+    ensure_run_user_dir(&dir, uid, gid).unwrap();
+    assert!(dir.join("entry").exists());
+    // A planted symlink is replaced, its target untouched.
+    std::fs::remove_dir_all(&dir).unwrap();
+    let outside = root.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("keep"), "x").unwrap();
+    std::os::unix::fs::symlink(&outside, &dir).unwrap();
+    ensure_run_user_dir(&dir, uid, gid).unwrap();
+    assert!(std::fs::symlink_metadata(&dir).unwrap().is_dir());
+    assert!(outside.join("keep").exists());
+}
