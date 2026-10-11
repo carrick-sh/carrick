@@ -43,10 +43,12 @@ fn inventory_page_live(
     )) else {
         return false;
     };
+    // Physical identity (including physical owner generation) is authenticated
+    // against the physical frame authority (CarrierMemory::frame_identity).
+    // MappingGeneration tracks virtual mapping mutations/protections in the
+    // inventory and must never be conflated with the physical owner generation.
     gpa.raw().is_multiple_of(PAGE)
         && row.frame == carrick_hal::FrameId::from_kernel_allocation(identity.frame_id)
-        && row.generation
-            == carrick_hal::MappingGeneration::from_backend_counter(identity.owner_generation)
         && gpa.raw() >= row.gpa.0
         && gpa.raw().checked_add(PAGE).is_some_and(|end| {
             row.gpa
@@ -137,6 +139,33 @@ pub struct PreparedBacking {
     ::core::cmp::Eq,
 )]
 pub struct KvmSlotGeneration(NonZeroU64);
+/// The physical backing owner generation in the carrier memory domain.
+/// This typed generation represents physical backing ownership and must
+/// not be conflated or cross-fed with [`carrick_hal::MappingGeneration`],
+/// which tracks virtual mapping protections/mutations.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialOrd,
+    ::core::cmp::Ord,
+    ::core::hash::Hash,
+)]
+pub struct PhysicalOwnerGeneration(NonZeroU64);
+
+impl PhysicalOwnerGeneration {
+    pub const INITIAL: Self = Self(NonZeroU64::MIN);
+
+    pub const fn from_counter(counter: NonZeroU64) -> Self {
+        Self(counter)
+    }
+
+    pub const fn raw(self) -> NonZeroU64 {
+        self.0
+    }
+}
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,
@@ -958,7 +987,8 @@ impl CarrierMemory {
             || self.root(edge.parent.mm.raw()) != Some(edge.parent)
             || identity.frame_id != edge.identity.frame_id
             || identity.mapping_id == edge.identity.mapping_id
-            || identity.owner_generation != NonZeroU64::MIN
+            || PhysicalOwnerGeneration::from_counter(identity.owner_generation)
+                != PhysicalOwnerGeneration::INITIAL
             || receipt.mm() != child.mm.raw()
             || receipt.revision() != identity.inventory_revision.get()
             || !receipt.authorizes(mapping, frame)
