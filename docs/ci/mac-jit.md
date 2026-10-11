@@ -91,8 +91,9 @@ Not performed by the repository change.
 
 2. **Runner tree, root-owned.** Download the macOS ARM64 runner from
    <https://github.com/actions/runner/releases>, verify the SHA-256 from that
-   release's notes, extract as root, and give only `_work` and `_diag` to the
-   runner account. Do not run `config.sh`:
+   release's notes, extract as root. The tree is never run directly or written by the runner
+   account: every run gets a private APFS clone (below). Do not run
+   `config.sh`:
 
    ```sh
    VERSION=2.xxx.y
@@ -103,7 +104,6 @@ Not performed by the repository change.
    sudo tar -xzf "actions-runner-osx-arm64-$VERSION.tar.gz" -C /Volumes/carrick-build/actions-runner
    sudo chown -R root:wheel /Volumes/carrick-build/actions-runner
    sudo chmod -R go-w /Volumes/carrick-build/actions-runner
-   sudo install -d -o carrick-ci -m 700 /Volumes/carrick-build/actions-runner/_work /Volumes/carrick-build/actions-runner/_diag
    ```
 
    A root-owned tree cannot self-update; to move to a new runner release,
@@ -207,9 +207,15 @@ receipt fails closed and names this reseed command.
   account's launchd user domain is not relied on.
 - **Per-job reset.** Before every launch `mac-run-once` kills every
   `carrick-ci` process, then deletes and recreates the job home from the
-  skeleton and empties `_work` and `_diag` (symlinks are removed, never
-  followed). Nothing a previous job wrote (caches, launch agents, rc files,
+  skeleton (symlinks are removed, never followed). Nothing a previous job wrote (caches, launch agents, rc files,
   cargo installs) reaches the next job.
+- **Per-run runner root.** The listener writes its registration files
+  (`.runner`, `.credentials`, ...) into its root directory, so
+  `mac-run-once` clones the pinned tree (`clonefile`, copy-on-write) to
+  `run/<name>/runner`, re-verifies the clone against the manifest, hands only
+  the clone's root directory plus fresh `_work` and `_diag` to `carrick-ci`
+  (`bin/` and `externals/` stay root-owned), and runs the listener from it.
+  The clone is deleted on every exit path, without following symlinks.
 - **Completion.** After `mac-run-once` returns (runner exited, its session and
   every `carrick-ci` process killed), the registration is removed if it
   still exists and is not busy.
@@ -223,7 +229,7 @@ This is trusted-workflow infrastructure, not an adversarial isolation
 boundary. Admitted jobs are code on main or in the merge queue from this
 repository's branches. They run as `carrick-ci`, which cannot write the
 runner tree, the toolchain, the hook binary, the policy or the hook script;
-its home, `_work` and `_diag` are recreated before every job.
+its home and per-run runner root are recreated before every job.
 The JIT config is passed in the runner's environment; whether the runner
 removes it before starting job steps is the runner's behaviour, not a
 property this repository verifies. See
