@@ -146,6 +146,9 @@ impl EntryBackend for Aarch64Backend {
     fn prepare_user_return(&mut self, _frame: &TrapFrame) -> Result<UserReturn, Self::Error> {
         Err(ArchError::Unbound)
     }
+    fn user_stack_pointer(&mut self, frame: &TrapFrame) -> Result<UserVa, Self::Error> {
+        crate::isa::aarch64_user_stack_pointer(frame)
+    }
 }
 
 impl MmuBackend for Aarch64Backend {

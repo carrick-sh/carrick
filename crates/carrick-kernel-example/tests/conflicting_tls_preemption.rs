@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use carrick_abi::LinuxCloneFlags;
-use carrick_core::Personality;
+use carrick_core::{Personality, TaskId, TaskKey, TaskSerial, ThreadKey};
 use carrick_guest_arch::{
     AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa, ThreadContext,
     ThreadPointerRegister,
@@ -254,23 +254,33 @@ fn test_personality_configured_thread_pointer_registers() {
 
     // Verify per-thread and per-task overrides on the non-Linux test personality
     let custom_personality = ExamplePersonality::with_default_register(ThreadPointerRegister::GS);
-    custom_personality.configure_thread(42, ThreadPointerRegister::FS);
-    custom_personality.configure_task(100, ThreadPointerRegister::FS);
+    let thread_42 = ThreadKey::new(42, 1);
+    let thread_43 = ThreadKey::new(43, 1);
+    let task_100 = TaskKey {
+        id: TaskId::from_abi_positive(100).unwrap(),
+        serial: TaskSerial::from_registry_allocation(core::num::NonZeroU64::new(1).unwrap()),
+    };
+    let task_101 = TaskKey {
+        id: TaskId::from_abi_positive(101).unwrap(),
+        serial: TaskSerial::from_registry_allocation(core::num::NonZeroU64::new(1).unwrap()),
+    };
+    custom_personality.configure_thread(thread_42, ThreadPointerRegister::FS);
+    custom_personality.configure_task(task_100, ThreadPointerRegister::FS);
 
     assert_eq!(
-        custom_personality.thread_pointer_register_for_thread(42),
+        custom_personality.thread_pointer_register_for_thread(thread_42),
         ThreadPointerRegister::FS
     );
     assert_eq!(
-        custom_personality.thread_pointer_register_for_thread(43),
+        custom_personality.thread_pointer_register_for_thread(thread_43),
         ThreadPointerRegister::GS
     );
     assert_eq!(
-        custom_personality.thread_pointer_register_for_task(100),
+        custom_personality.thread_pointer_register_for_task(task_100),
         ThreadPointerRegister::FS
     );
     assert_eq!(
-        custom_personality.thread_pointer_register_for_task(101),
+        custom_personality.thread_pointer_register_for_task(task_101),
         ThreadPointerRegister::GS
     );
 }

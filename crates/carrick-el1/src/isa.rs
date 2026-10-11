@@ -1,6 +1,5 @@
 //! Native guest instruction leaves selected by the image architecture.
 
-/// A projection that has not yet acquired the required native owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArchError {
     Unbound,
@@ -8,6 +7,34 @@ pub enum ArchError {
     InvalidFrame,
     InvalidContext,
     Busy,
+    Fault,
+    OutOfBounds,
+}
+
+impl From<ArchError> for carrick_guest_arch::EntryDecodeError {
+    fn from(err: ArchError) -> Self {
+        match err {
+            ArchError::Fault => carrick_guest_arch::EntryDecodeError::Fault,
+            ArchError::InvalidFrame => carrick_guest_arch::EntryDecodeError::InvalidFrame,
+            ArchError::InvalidWidth => carrick_guest_arch::EntryDecodeError::InvalidWidth,
+            ArchError::OutOfBounds => carrick_guest_arch::EntryDecodeError::OutOfBounds,
+            ArchError::Unbound => carrick_guest_arch::EntryDecodeError::Unbound,
+            ArchError::InvalidContext => carrick_guest_arch::EntryDecodeError::InvalidFrame,
+            ArchError::Busy => carrick_guest_arch::EntryDecodeError::Busy,
+        }
+    }
+}
+
+pub const USER_CEILING: u64 = 0x0000_8000_0000_0000;
+
+/// A user operand must be wholly within the canonical lower half. The
+/// checked end also excludes wraparound into the supervisor address space.
+pub const fn lower_half_range(address: u64, len: u64) -> bool {
+    address < USER_CEILING
+        && match address.checked_add(len) {
+            Some(end) => end <= USER_CEILING,
+            None => false,
+        }
 }
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -85,25 +112,120 @@ pub mod arm_edit;
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub mod aarch64;
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 pub mod x86;
+
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+pub use x86::context::native;
 
 #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
 #[path = "isa/x86/user_tables.rs"]
 pub mod x86_user_tables;
 
-#[cfg(all(test, not(target_os = "none")))]
-#[path = "isa/x86/live_context.rs"]
-mod x86_live_context;
 // The carrier and CPL0 share one pure initial-MM module. Host tests exercise
 // that same module on every host; native hardware leaves stay gated.
 #[cfg(any(target_arch = "x86_64", test))]
 #[path = "isa/x86/initial_mm.rs"]
 pub mod x86_initial_mm;
 
+/// Architectural user stack pointer for AArch64.
+///
+/// When an EL0 guest takes a synchronous exception (SVC) into EL1, ARM hardware
+/// automatically selects SP_EL1 for kernel execution while preserving the
+/// interrupted EL0 user stack pointer in the SP_EL0 system register.
+/// `signal_stack()` reads this register via `mrs <reg>, sp_el0`.
+/// Off-target builds have no CPU registers or live hardware state, and return
+/// `ArchError::Unbound`.
+pub fn aarch64_user_stack_pointer(
+    _frame: &carrick_el1_abi::TrapFrame,
+) -> Result<carrick_guest_arch::UserVa, ArchError> {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    {
+        Ok(unsafe { aarch64::signal_stack() })
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    {
+        Err(ArchError::Unbound)
+    }
+}
+
+/// Architectural user stack pointer for x86_64 (rsp).
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+pub fn x86_user_stack_pointer(
+    frame: &native::NativeFrame,
+) -> Result<carrick_guest_arch::UserVa, ArchError> {
+    Ok(carrick_guest_arch::UserVa::new(frame.rsp))
+}
+
 /// Validate guest-controlled ARM signal resume state before register publication.
 pub const fn signal_resume_is_el0(pstate: u64) -> bool {
     pstate & !carrick_syscall_abi::AARCH64_EL0_USER_PSTATE_MASK == 0
+}
+
+#[cfg(test)]
+mod frame_mapping_tests {
+    use super::*;
+    use carrick_el1_abi::TrapFrame;
+    use carrick_guest_arch::{
+        Aarch64Register, Aarch64Registers, UserVa, X86Register, X86Registers,
+    };
+
+    #[test]
+    fn aarch64_frame_mapping_registers_and_stack_pointer() {
+        let mut x = [0u64; 31];
+        x[0] = 10;
+        x[1] = 20;
+        x[2] = 30;
+        x[3] = 40;
+        x[4] = 50;
+        x[5] = 60;
+        x[6] = 70;
+        x[8] = 93; // Syscall ordinal (e.g. exit)
+        let frame = TrapFrame {
+            x,
+            ..Default::default()
+        };
+
+        assert_eq!(frame.read(Aarch64Register::X0), 10);
+        assert_eq!(frame.read(Aarch64Register::X1), 20);
+        assert_eq!(frame.read(Aarch64Register::X2), 30);
+        assert_eq!(frame.read(Aarch64Register::X3), 40);
+        assert_eq!(frame.read(Aarch64Register::X4), 50);
+        assert_eq!(frame.read(Aarch64Register::X5), 60);
+        assert_eq!(frame.read(Aarch64Register::X6), 70);
+        assert_eq!(frame.read(Aarch64Register::X8), 93);
+
+        // Off-target builds must return ArchError::Unbound instead of a fake slot index or panicking.
+        assert_eq!(aarch64_user_stack_pointer(&frame), Err(ArchError::Unbound));
+    }
+
+    #[test]
+    fn x86_frame_mapping_registers_and_stack_pointer() {
+        let frame = native::NativeFrame {
+            rdi: 100,
+            rsi: 200,
+            rdx: 300,
+            r10: 400,
+            r8: 500,
+            r9: 600,
+            rax: 231, // Syscall ordinal (e.g. exit_group)
+            rsp: 0x7fff_5678_0000,
+            ..Default::default()
+        };
+
+        assert_eq!(frame.read(X86Register::Rdi), 100);
+        assert_eq!(frame.read(X86Register::Rsi), 200);
+        assert_eq!(frame.read(X86Register::Rdx), 300);
+        assert_eq!(frame.read(X86Register::R10), 400);
+        assert_eq!(frame.read(X86Register::R8), 500);
+        assert_eq!(frame.read(X86Register::R9), 600);
+        assert_eq!(frame.read(X86Register::Rax), 231);
+
+        assert_eq!(
+            x86_user_stack_pointer(&frame),
+            Ok(UserVa::new(0x7fff_5678_0000))
+        );
+    }
 }
 
 #[cfg(test)]

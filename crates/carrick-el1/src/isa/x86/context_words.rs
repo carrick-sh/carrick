@@ -7,9 +7,7 @@ pub use carrick_sched_core::ParkedContextWords;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 use super::{native, scheduler};
 #[cfg(all(test, not(target_os = "none")))]
-#[path = "../../../../carrick-x86/src/cpl0_entry.rs"]
-#[allow(dead_code)]
-mod native;
+use crate::isa::x86::context::native;
 #[cfg(all(test, not(target_os = "none")))]
 #[path = "../../../../carrick-x86/src/cpl0_scheduler.rs"]
 #[allow(dead_code)] // Host unit tests use only native context records.

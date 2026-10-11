@@ -64,7 +64,9 @@ pub use operand::{
     Step, Syscall, alloc_buffer, alloc_word, await_parked, in_out, last_child, negated, slot,
     tagged_in_out, tagged_out, write_buffer, write_word,
 };
-pub use personality::ExamplePersonality;
+pub use personality::{
+    ExampleCall, ExampleEntryBackend, ExampleFrame, ExampleFrameSnapshot, ExamplePersonality,
+};
 pub use process::{
     AddressSpace, AddressSpaceError, AsidAllocator, ExampleInstallPermit, ExampleMmBackend,
     ExampleProcess, ExampleStage1Projection,

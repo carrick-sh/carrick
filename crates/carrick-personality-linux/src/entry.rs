@@ -2,7 +2,8 @@
 pub use crate::abi::entry::{CanonicalCall, CanonicalOrdinal, SyscallResult};
 pub use carrick_core_abi::ExecutionBinding;
 use carrick_guest_arch::{
-    GuestIsa, NativeAbi, NativeEntrySnapshot, NativeOrdinal, UserVa, X86Register, X86Registers,
+    Aarch64Register, Aarch64Registers, GuestIsa, NativeAbi, NativeEntrySnapshot, NativeOrdinal,
+    UserVa, X86Register, X86Registers,
 };
 
 pub const SYS_SET_ROBUST_LIST: usize = 99;
@@ -80,6 +81,34 @@ pub fn decode_aarch64(native: u64, args: [u64; 6], stack: u64) -> CanonicalCall 
     }
 }
 
+/// Decode Linux registers from an AArch64 native snapshot and user stack pointer.
+pub fn decode_aarch64_snapshot<F: Aarch64Registers>(
+    snapshot: NativeEntrySnapshot<'_, F>,
+    stack: u64,
+) -> Option<CanonicalCall> {
+    if snapshot.isa != GuestIsa::Aarch64 || snapshot.abi != NativeAbi::Aarch64El0 {
+        return None;
+    }
+    let frame = snapshot.frame;
+    let effective_stack = if stack != 0 {
+        stack
+    } else {
+        frame.read(Aarch64Register::Sp)
+    };
+    Some(decode_aarch64(
+        frame.read(Aarch64Register::X8),
+        [
+            frame.read(Aarch64Register::X0),
+            frame.read(Aarch64Register::X1),
+            frame.read(Aarch64Register::X2),
+            frame.read(Aarch64Register::X3),
+            frame.read(Aarch64Register::X4),
+            frame.read(Aarch64Register::X5),
+        ],
+        effective_stack,
+    ))
+}
+
 /// AArch64 Linux vDSO wire identity: preserve the process half and replace
 /// the thread's visible tid only when that native vDSO binding is present.
 pub const fn aarch64_child_vdso_identity(parent: u64, visible_tid: u32) -> u64 {
@@ -92,7 +121,7 @@ pub const fn aarch64_child_vdso_identity(parent: u64, visible_tid: u32) -> u64 {
 
 #[cfg(test)]
 mod decode_tests {
-    use super::decode_x86_64;
+    use super::*;
 
     #[test]
     fn x86_fork_normalizes_to_the_shared_clone_shape() {
@@ -119,5 +148,46 @@ mod decode_tests {
         );
         assert_eq!(call.native.raw(), 33);
         assert_eq!(call.args, [1, 5, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn aarch64_snapshot_decode_maps_linux_registers() {
+        struct TestAarch64Frame {
+            x: [u64; 31],
+        }
+        impl Aarch64Registers for TestAarch64Frame {
+            fn read(&self, reg: Aarch64Register) -> u64 {
+                match reg {
+                    Aarch64Register::X0 => self.x[0],
+                    Aarch64Register::X1 => self.x[1],
+                    Aarch64Register::X2 => self.x[2],
+                    Aarch64Register::X3 => self.x[3],
+                    Aarch64Register::X4 => self.x[4],
+                    Aarch64Register::X5 => self.x[5],
+                    Aarch64Register::X8 => self.x[8],
+                    _ => 0,
+                }
+            }
+        }
+
+        let mut x = [0u64; 31];
+        x[0] = 1;
+        x[1] = 2;
+        x[2] = 3;
+        x[3] = 4;
+        x[4] = 5;
+        x[5] = 6;
+        x[8] = 93; // exit
+        let frame = TestAarch64Frame { x };
+        let snapshot = NativeEntrySnapshot {
+            isa: GuestIsa::Aarch64,
+            abi: NativeAbi::Aarch64El0,
+            frame: &frame,
+        };
+        let call = decode_aarch64_snapshot(snapshot, 0x7000).expect("aarch64 snapshot");
+        assert_eq!(call.canonical.raw(), 93);
+        assert_eq!(call.native.raw(), 93);
+        assert_eq!(call.args, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(call.stack.raw(), 0x7000);
     }
 }
