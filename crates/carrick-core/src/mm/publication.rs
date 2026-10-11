@@ -86,6 +86,15 @@ pub struct AdmissionTicket {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AliasGeneration(NonZeroU64);
 
+impl AliasGeneration {
+    pub const fn new(raw: NonZeroU64) -> Self {
+        Self(raw)
+    }
+    pub const fn raw(self) -> NonZeroU64 {
+        self.0
+    }
+}
+
 /// One alias of an exact (mm, incarnation) at one VA span.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Alias {
@@ -101,6 +110,34 @@ pub struct Alias {
     pub generation: AliasGeneration,
     /// This alias's entry in the frame-use index.
     use_seq: u64,
+}
+
+impl Alias {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        frame: Stage1Ipa,
+        len: GuestLen,
+        leaf: EditLeafSize,
+        owner_generation: OwnerGeneration,
+        access: ExtentAccess,
+        permissions: EditPermissions,
+        ceiling: EditPermissions,
+        present: bool,
+        generation: AliasGeneration,
+    ) -> Self {
+        Self {
+            frame,
+            len,
+            leaf,
+            owner_generation,
+            access,
+            permissions,
+            ceiling,
+            present,
+            generation,
+            use_seq: 0,
+        }
+    }
 }
 
 /// Why a share edge exists. Shared edges carry MAP_SHARED / attach_shared
@@ -468,6 +505,14 @@ impl PublicationBook {
     }
     pub fn alias_count(&self) -> usize {
         self.aliases.len()
+    }
+    /// Register an alias directly in the publication book.
+    pub fn add_alias(&mut self, key: MmIncarnationKey, va: UserVa, alias: Alias) -> Option<()> {
+        new_alias(self, key, va, alias)
+    }
+    /// Drop an alias directly from the publication book and release its frame use.
+    pub fn drop_alias(&mut self, key: MmIncarnationKey, va: UserVa) {
+        drop_alias(self, key, va);
     }
 
     fn seq(&mut self) -> Option<u64> {

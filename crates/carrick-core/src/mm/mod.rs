@@ -10,3 +10,5 @@ pub mod reservation;
 pub mod retirement;
 pub mod transaction;
 pub mod transfer;
+
+pub use transaction::{MmAuthority, RangeAuthority};
