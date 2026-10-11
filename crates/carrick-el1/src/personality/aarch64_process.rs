@@ -1212,6 +1212,7 @@ mod retirement_tests {
             roots
                 .publish(index.index(), ReservationMm::new(mm).unwrap(), layout)
                 .unwrap();
+            zone.publish_slot(slot, mm, None, 0);
             if cycle == 1 {
                 assert!(zone.occupancy.replace(
                     carrick_sched_core::ExecutionSlot::zone(slot),
@@ -1232,6 +1233,12 @@ mod retirement_tests {
                 zone.release_space(slot);
             }
             let owner = service.portal().unwrap();
+            drain_retired_spaces(&owner, zone, u32::from(slot.raw())).unwrap();
+            assert!(
+                zone.spaces.find(mm).is_some(),
+                "terminal lane retains the root after stage-1 release"
+            );
+            zone.publish_slot(slot, 0, None, 0);
             drain_retired_spaces(&owner, zone, u32::from(slot.raw())).unwrap();
             assert!(zone.spaces.find(mm).is_none());
         }

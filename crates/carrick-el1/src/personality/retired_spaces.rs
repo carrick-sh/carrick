@@ -1,11 +1,13 @@
 //! One retirement queue for fork children's address-space entries, shared
 //! by every guest ISA's native process service.
 //!
-//! A fork child's final exit closes its space gate, crosses to the carrier
-//! (child retire), leaves its root and releases its slot. Its closed
-//! `AddressSpaces` entry and reservation root are then queued here and
-//! retired once no zone slot still has the MM installed. A failed retirement
-//! never drops a queued entry: it and every entry after it stay queued.
+//! A fork child's final exit crosses to the carrier (child retire), leaves
+//! its root and releases stage-1 occupancy. Its `AddressSpaces` entry and
+//! reservation root are then queued here and retired once no zone slot still
+//! names the MM. ARM keeps the space gate open through terminal clear-child-tid;
+//! the drain closes it after the terminal lane has moved on. A failed
+//! retirement never drops a queued entry: it and every entry after it stay
+//! queued.
 
 extern crate alloc;
 
@@ -21,7 +23,7 @@ use core::num::NonZeroU64;
 use super::native_process_runtime::NativeProcessError;
 use crate::lock::SpinLock;
 
-/// A closed child space awaiting retirement, keyed by the exact carrier,
+/// A child space awaiting retirement, keyed by the exact carrier,
 /// zone and reservation table it was published in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetiredSpace {
@@ -131,14 +133,16 @@ impl Default for RetiredSpaces {
     }
 }
 
-/// True when any of the zone's first `slots` slots has `mm` installed.
+/// True while a slot has `mm` installed or still owns its terminal crossing.
 pub fn space_has_resident_slot<C: Copy + Send + Sync + zerocopy::FromZeros>(
     zone: &ZoneTables<C>,
     slots: usize,
     mm: ReservationMm,
 ) -> bool {
     (0..slots).any(|slot| {
-        SlotId::from_index(slot).is_some_and(|slot| zone.installed_space(slot) == mm.raw())
+        SlotId::from_index(slot).is_some_and(|slot| {
+            zone.installed_space(slot) == mm.raw() || zone.slot(slot).mm() == mm.raw()
+        })
     })
 }
 
