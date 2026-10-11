@@ -1453,6 +1453,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         row.credentials_for(calling_tid)
             .map_err(|_| NativeProcessError::Stale)?;
         drop(graph);
+        // SAFETY: prepare_handoff authenticated this CPU's current/host record;
+        // all entry, registry and address checks succeeded before publication.
+        // A first owner crossing precedes fork/wait context saves, so its
+        // retained architectural identity must already describe this caller.
+        unsafe { *source.zone.record(record).ctx_mut() = words };
         Ok(NativeProcessEntry {
             runtime: self,
             source,
@@ -1553,6 +1558,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         row.credentials_for(calling_tid)
             .map_err(|_| NativeProcessError::Stale)?;
         drop(graph);
+        // SAFETY: prepare_handoff authenticated this CPU's current/host record;
+        // all entry, registry and address checks succeeded before publication.
+        // A first owner crossing precedes fork/wait context saves, so its
+        // retained architectural identity must already describe this caller.
+        unsafe { *source.zone.record(record).ctx_mut() = *words };
         Ok(Box::new(NativeProcessEntry {
             runtime: self,
             source,

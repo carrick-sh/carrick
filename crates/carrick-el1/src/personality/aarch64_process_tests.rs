@@ -317,6 +317,7 @@ fn test_fork_child_gets_distinct_root_and_x0_zero() {
         fixture.address.mm.raw().get(),
         fixture.address.generation.raw().get(),
     );
+    let registry = super::native_process_runtime::NativeProcessRegistry::new();
     let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
         source,
         &fixture.task,
@@ -327,6 +328,11 @@ fn test_fork_child_gets_distinct_root_and_x0_zero() {
         parked,
     )
     .unwrap();
+
+    let runtime = std::sync::Arc::new(runtime);
+    registry
+        .register_root(runtime.clone(), source, &fixture.task, fixture.address)
+        .unwrap();
 
     let words = fixture.tables.live(&fixture.maintenance);
     let crossing = TestStockCrossing::new(&[
@@ -343,8 +349,35 @@ fn test_fork_child_gets_distinct_root_and_x0_zero() {
     .with_words(&words);
 
     let mut entry = runtime
-        .enter(source, &fixture.task, parked, &mut service)
+        .enter_registered(
+            &registry,
+            source,
+            &fixture.task,
+            fixture.address,
+            Box::new(parked),
+            &mut service,
+        )
         .unwrap();
+    let record = fixture
+        .zone
+        .slot(fixture.slot)
+        .current()
+        .or_else(|| fixture.zone.slot(fixture.slot).host_record())
+        .unwrap();
+    // The first stock crossing reads this retained context while the CPU is
+    // stopped, before fork publication ever saves a parent return context.
+    let published = unsafe { fixture.zone.record(record).ctx_mut() };
+    assert_eq!(
+        published.root(),
+        parent_ttbr,
+        "entry must publish root before its first crossing"
+    );
+    assert_eq!(published.mm(), fixture.address.mm.raw().get());
+    assert_eq!(
+        published.generation(),
+        fixture.address.generation.raw().get()
+    );
+    assert_eq!(published.native.x[0], 99);
     let outcome = entry.fork();
     let LifecycleOutcome::Returned { result, .. } = outcome else {
         panic!("expected fork to return child pid");
