@@ -218,6 +218,10 @@ const _: () = {
     assert!(X86_CPL0_SUPERVISOR_IMAGE_SIZE.is_power_of_two());
     assert!(X86_CPL0_SUPERVISOR_IMAGE_SIZE.is_multiple_of(4096));
 };
+#[cfg(target_arch = "aarch64")]
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x1353a66bc1fa8311);
+#[cfg(not(target_arch = "aarch64"))]
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x0640832f8bb07475);
 /// CPL0's one upper-half supervisor window for retained physical pages.
 pub const X86_CPL0_DIRECT_VA: u64 = 0xffff_ffff_9000_0000;
 /// Bytes of guest-physical space (from GPA 0) the direct window maps.
@@ -2472,6 +2476,8 @@ pub enum NativeForkFailureStage {
     SettlePortal = 59,
     SettleSpace = 60,
     RegisterChild = 61,
+    ChildRetireRefusedStale = 62,
+    ChildRetireRefusedInvalid = 63,
 }
 
 impl NativeForkFailureStage {
@@ -2538,6 +2544,8 @@ impl NativeForkFailureStage {
             59 => Self::SettlePortal,
             60 => Self::SettleSpace,
             61 => Self::RegisterChild,
+            62 => Self::ChildRetireRefusedStale,
+            63 => Self::ChildRetireRefusedInvalid,
             _ => return None,
         })
     }
@@ -4123,7 +4131,6 @@ impl Default for InotifyNameCache {
 const _: () = {
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
-    assert!(EL1_ABI_LAYOUT_HASH == 0xd22014eee50dbddb);
     assert!(
         EL1_APERTURE_CONTROL_OFFSET.is_multiple_of(core::mem::align_of::<ApertureControl>() as u64)
     );
@@ -4132,10 +4139,6 @@ const _: () = {
             <= EL1_MM_PORTAL_OFFSET
     );
 };
-#[cfg(target_arch = "aarch64")]
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0xf6faf21e6ada22af);
-#[cfg(not(target_arch = "aarch64"))]
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x9e93477f69d16743);
 
 #[cfg(test)]
 mod tests {
@@ -5728,25 +5731,6 @@ mod layout_manifest {
         );
     }
 }
-
-/// First failing stage of a native fork attempt. Zero means no error.
-#[derive(
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::fmt::Debug,
-    ::core::cmp::PartialEq,
-    ::core::cmp::Eq,
-)]
-#[repr(u64)]
-pub enum NativeForkFailureStage {
-    /// The carrier refused a fork child's retirement because the record was stale.
-    ChildRetireRefusedStale = 62,
-    /// The carrier refused a fork child's retirement because the record was invalid.
-    ChildRetireRefusedInvalid = 63,
-}
-
-#[cfg(target_os = "none")]
-pub fn record_native_fork_failure(_stage: NativeForkFailureStage) {}
 
 #[cfg(test)]
 mod x86_table_alias_tests {

@@ -278,7 +278,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             if let Some(dir) = &exec_args.post_mortem_dir {
                 carrick_kernel::kernel::debug::PostMortem::install_dir(dir.clone());
             }
-            carrick_runtime::host_process::arm_fatal_debugger_hold_from_env();
 
             let utf8_path = camino::Utf8PathBuf::from_path_buf(path.clone())
                 .map_err(|p| anyhow::anyhow!("invalid non-UTF-8 ELF path: {}", p.display()))?;
@@ -551,7 +550,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             if let Some(dir) = &exec_args.post_mortem_dir {
                 carrick_kernel::kernel::debug::PostMortem::install_dir(dir.clone());
             }
-            carrick_runtime::host_process::arm_fatal_debugger_hold_from_env();
 
             let req = build_launch_request(
                 carrick_spec::ImageSource::Oci(image),

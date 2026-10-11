@@ -190,9 +190,21 @@ impl carrick_hal::PhysicalFrameInventory for PhysicalInventoryProjection {
         &self,
         mm: carrick_hal::MmGeneration,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self
-            .inventory
-            .retire_mm(&self.ids, MmId::for_owner_binding(mm))?)
+        let owner = {
+            let state = self.inventory.state.lock();
+            let mut matching = state.mm_mapping_counts.keys().copied().filter(|owner| {
+                matches!(owner, FrameOwner::GuestMm(guest) if guest.native_mm.raw() == mm.raw())
+            });
+            let first = matching.next();
+            if matching.next().is_some() {
+                return Err(Box::new(std::io::Error::other(
+                    "ambiguous guest frame owner",
+                )));
+            }
+            first
+        };
+        let Some(owner) = owner else { return Ok(0) };
+        Ok(self.inventory.retire_mm(&self.ids, owner)?)
     }
 }
 impl carrick_hal::FrameCowAuthority for PhysicalInventoryBinding {
@@ -735,8 +747,9 @@ impl FrameInventoryAuthority {
     pub fn retire_mm(
         &self,
         ids: &ObjectIdRegistry,
-        mm: MmId,
+        mm: impl Into<FrameOwner>,
     ) -> Result<usize, FrameInventoryRetireMmError> {
+        let mm = mm.into();
         let rows: Vec<(MappingId, FrameId, MappingGeneration)> = {
             let state = self.state.lock();
             if state.mm_mapping_counts.get(&mm).copied().unwrap_or(0) == 0 {
@@ -3171,12 +3184,16 @@ mod tests {
         const PARENT: u64 = 301;
         let mm_generation =
             |raw: u64| carrick_hal::MmGeneration::new(NonZeroU64::new(raw).expect("nonzero mm"));
+        let frame_owner = |raw: u64| carrick_hal::GuestFrameOwner {
+            native_mm: mm_generation(raw),
+            root_generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::MIN),
+        };
         let authority = Arc::new(FrameInventoryAuthority::new());
         let ids = Arc::new(ObjectIdRegistry::new());
         let inventory = authority.physical_projection(Arc::clone(&ids));
 
         // The parent maps one frame every child inherits.
-        let parent = inventory.bind(mm_generation(PARENT));
+        let parent = inventory.bind(frame_owner(PARENT));
         let mut reservation = parent.reserve(1, 1, 2).expect("parent reserve");
         let transaction = reservation.transaction();
         let shared = reservation.claim_frame().expect("shared frame");
@@ -3301,7 +3318,7 @@ mod tests {
                 .expect("commit");
 
             // Carrier per-child state as the KVM settle publishes it.
-            let child = inventory.bind(mm_generation(child_mm));
+            let child = inventory.bind(frame_owner(child_mm));
             let mut reservation = child.reserve(1, 2, 4).expect("child reserve");
             let transaction = reservation.transaction();
             let own = reservation.claim_frame().expect("child frame");

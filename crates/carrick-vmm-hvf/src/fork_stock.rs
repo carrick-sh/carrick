@@ -705,9 +705,9 @@ impl ForkStockHostCustody {
     pub(crate) fn service_child_retire(
         &mut self,
         execution: GrantExecution,
-        retire: &NativeChildRetire,
+        retire: &mut NativeChildRetire,
     ) -> Result<(), ForkStockServiceError> {
-        if !retire.matches(execution.binding, execution.context)
+        if !retire.request_matches(execution.binding, execution.context)
             || !self
                 .committed_asids
                 .contains_key(&execution.binding.mm.raw())
@@ -715,7 +715,11 @@ impl ForkStockHostCustody {
                 .committed_lifecycle
                 .contains_key(&execution.binding.mm.raw())
         {
+            retire.refuse(carrick_el1_abi::ChildRetireRefusal::Stale);
             return Err(ForkStockServiceError::StaleExecution);
+        }
+        if !retire.accept() {
+            return Err(ForkStockServiceError::InvalidRecord);
         }
         self.retired_mms.insert(execution.binding.mm.raw());
         Ok(())
@@ -1256,9 +1260,9 @@ mod tests {
 
         // Child exit marks the MM retired while its TTBR0 may still be live.
         let child_exec = test_execution(42, 0, 303);
-        let retire = NativeChildRetire::new(child_exec.binding, child_exec.context).unwrap();
+        let mut retire = NativeChildRetire::new(child_exec.binding, child_exec.context).unwrap();
         custody
-            .service_child_retire(child_exec, &retire)
+            .service_child_retire(child_exec, &mut retire)
             .expect("child quarantine");
 
         assert!(custody.committed_asids.contains_key(&303));
@@ -1332,9 +1336,9 @@ mod tests {
                 .service_settlement(&mut ledger, parent, &mut commit, |_| true, |_| true)
                 .expect("settle child and return unused parent page");
             let child = test_execution(42 + cycle, 0, child_mm);
-            let retire = NativeChildRetire::new(child.binding, child.context).unwrap();
+            let mut retire = NativeChildRetire::new(child.binding, child.context).unwrap();
             custody
-                .service_child_retire(child, &retire)
+                .service_child_retire(child, &mut retire)
                 .expect("child quarantine");
             assert_eq!(
                 custody
@@ -1432,9 +1436,9 @@ mod tests {
             .service_settlement(&mut ledger, parent, &mut commit, |_| true, |_| true)
             .expect("commit first child");
         let child = test_execution(42, 0, 302);
-        let retire = NativeChildRetire::new(child.binding, child.context).unwrap();
+        let mut retire = NativeChildRetire::new(child.binding, child.context).unwrap();
         custody
-            .service_child_retire(child, &retire)
+            .service_child_retire(child, &mut retire)
             .expect("quarantine child tables");
         assert_eq!(
             custody

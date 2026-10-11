@@ -749,6 +749,21 @@ pub const fn route_x86(ordinal: u64, allocator_control: u64) -> Family {
     }
 }
 
+/// Calls whose process semantics belong to the in-kernel process registry.
+pub const fn aarch64_owner_process_call(ordinal: u64, flags: u64) -> bool {
+    match route_aarch64(ordinal, u64::MAX) {
+        Family::Lifecycle(LifecycleCall::Clone) => crate::lifecycle::is_process_clone(flags),
+        Family::Lifecycle(
+            LifecycleCall::Fork
+            | LifecycleCall::Wait4
+            | LifecycleCall::WaitId
+            | LifecycleCall::Clone3
+            | LifecycleCall::ExitGroup,
+        ) => true,
+        _ => false,
+    }
+}
+
 /// Return transport selected by the Linux completion owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompletionRoute {

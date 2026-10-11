@@ -1695,6 +1695,12 @@ mod carrier_vm_custody_tests {
             > {
                 panic!("root admission cannot allocate a second inventory")
             }
+            fn retire_mm(
+                &self,
+                _: carrick_hal::MmGeneration,
+            ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+                panic!("root admission cannot retire an MM")
+            }
         }
         struct Admission {
             address: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
