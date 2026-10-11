@@ -24,6 +24,8 @@ pub enum Commands {
     AsmDiff(crate::asm_diff::AsmDiffArgs),
     #[command(about = "Display repository information as JSON")]
     Info,
+    #[command(about = "Prove unit shards preserve every unsharded Cargo test selection")]
+    CheckTestShards,
     #[command(about = "Package a guest carrier image for an arbitrary composition root")]
     PackageGuestImage(crate::guest_image::PackageGuestImageArgs),
 
@@ -169,6 +171,8 @@ pub enum CliError {
     AuthorityDebt(#[from] crate::authority_debt::DebtError),
     #[error("impact: {0}")]
     Impact(String),
+    #[error("test shards: {0}")]
+    TestShards(String),
     #[error("{0}")]
     Clap(#[from] clap::Error),
 
@@ -324,6 +328,15 @@ where
         }
     }
     match cli.command {
+        Commands::CheckTestShards => {
+            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
+            let report = crate::test_shards::check(&root)
+                .map_err(|e| CliError::TestShards(e.to_string()))?;
+            writeln!(writer, "{report}").map_err(|source| CliError::Io {
+                path: PathBuf::from("stdout"),
+                source,
+            })
+        }
         Commands::AsmDiff(args) => {
             let info = resolve_repo_info(cli.root.as_deref())?;
             crate::asm_diff::run(&info.repository_root, args, writer)?;

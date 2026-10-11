@@ -1,10 +1,7 @@
 name: Hosted CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
-    # ready_for_review reruns a draft's CI with the macOS jobs it deferred.
     types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
     types: [checks_requested]
@@ -51,7 +48,6 @@ jobs:
         env:
           CI_EVENT: ${{ github.event_name }}
           CI_BASE: ${{ github.event.pull_request.base.sha }}
-          CI_DRAFT: ${{ github.event.pull_request.draft }}
         run: just ci-changes
 
   # Independent checks keep reporting after an earlier check fails. No
@@ -77,6 +73,8 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -85,6 +83,10 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 12
         run: just ci-install-semgrep
+      - name: Exact unit shard coverage
+        if: ${{ !cancelled() }}
+        run: just check-test-shards
+
       - name: Formatting
         if: ${{ !cancelled() }}
         run: just fmt-check
@@ -121,6 +123,8 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Compiler cache fallback without sccache
         run: cargo test -p carrick-xtask --test build_cache
       - name: Install per-user compiler cache
@@ -156,6 +160,8 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -186,6 +192,7 @@ jobs:
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: macos-host
+          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -193,6 +200,9 @@ jobs:
       - name: Clippy (no-panic gate)
         if: ${{ !cancelled() }}
         run: just clippy
+      - name: Verify test shard coverage matches unsharded test
+        if: ${{ !cancelled() }}
+        run: just check-test-shards
       - name: Live host-authority compiler census
         if: ${{ !cancelled() }}
         run: cargo run --locked -p carrick-xtask -- authority-debt
@@ -214,6 +224,7 @@ jobs:
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: macos-host
+          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -228,7 +239,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: just check-fuzz
 
-  macos-unit:
+  macos-unit-a:
     needs: changes
     if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
     runs-on: macos-15
@@ -245,13 +256,92 @@ jobs:
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: macos-host
+          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
-      - name: Unit tests (host fd headroom)
+      - name: Unit tests shard A (workspace + test lanes)
         if: ${{ !cancelled() }}
-        run: just ci-macos-test test
+        run: just ci-macos-test test-shard-a
+
+  macos-unit-b:
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: just
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: macos-host
+          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
+      - name: Install per-user compiler cache
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
+      - name: Unit tests shard B (mm-owner + CLI + host + VFS)
+        if: ${{ !cancelled() }}
+        run: just ci-macos-test test-shard-b
+
+  macos-unit-c:
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: just
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: macos-host
+          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
+      - name: Install per-user compiler cache
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
+      - name: Unit tests shard C (kernel)
+        if: ${{ !cancelled() }}
+        run: just ci-macos-test test-shard-c
+
+  macos-unit-d:
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: just
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: macos-host
+          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
+      - name: Install per-user compiler cache
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
+      - name: Unit tests shard D (runtime + HVF)
+        if: ${{ !cancelled() }}
+        run: just ci-macos-test test-shard-d
 
   macos-integration:
     needs: changes
@@ -270,6 +360,7 @@ jobs:
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: macos-host
+          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -293,6 +384,8 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -341,6 +434,8 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -369,6 +464,8 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -418,6 +515,8 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
@@ -454,7 +553,10 @@ jobs:
       - linux-doc
       - macos-clippy
       - macos-build
-      - macos-unit
+      - macos-unit-a
+      - macos-unit-b
+      - macos-unit-c
+      - macos-unit-d
       - macos-integration
       - cross-check-linux
       - kernel-linux-native
