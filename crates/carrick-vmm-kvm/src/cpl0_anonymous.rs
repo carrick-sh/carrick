@@ -6,6 +6,10 @@ use carrick_hal::fork_stock::{
     ForkStockServiceError, GrantExecution, LifecycleWindow, NoTableLedger, SlotAbsence,
     lifecycle_slots,
 };
+use carrick_hal::guest_arch_binding::{
+    GuestArchBinding,
+    core_arch::{ExecutionGeneration, TaskIdentity, TaskSerial},
+};
 use carrick_mmu_core::aarch64::descriptor_txn::{
     DescriptorOp as WireOp, DescriptorTxn as WireTxn, TableGrants,
 };
@@ -788,15 +792,34 @@ impl Cpl0HostCustody {
         &mut self,
         lease: &StoppedCpuLease<'_>,
     ) -> Result<(), TrapError> {
-        let execution = self.physical_execution(lease)?;
+        let live_root = RootGpa::page_aligned(FrameGpa::new(lease.vcpu.get_gpr(X86Reg::Cr3)?))
+            .ok_or_else(|| fail("physical child retire root alignment"))?;
+        let context = self
+            ._vm
+            .context_by_root(live_root)
+            .ok_or_else(|| fail("physical child retire unbacked root"))?;
         // SAFETY: the retire record consists of eight fully initialized u64s.
         let (physical, mut record) = unsafe {
             self.read_stack_record::<carrick_el1_abi::NativeChildRetire>(
                 lease,
-                execution.context,
+                context,
                 lease.vcpu.get_gpr(X86Reg::Rax)?,
             )
         }?;
+        if record.words[0] != carrick_el1_abi::NativeChildRetire::MAGIC
+            || record.words[5] != context.root.address().raw()
+            || record.words[3] != context.mm.raw().get()
+            || record.words[6] != context.generation.raw().get()
+        {
+            return Err(fail("physical child retire record mismatch"));
+        }
+        let binding = carrick_el1_abi::ExecutionBinding {
+            task: carrick_el1_abi::EntryTaskKey::from_raw(record.words[1]),
+            generation: carrick_el1_abi::EntryGeneration::from_raw(record.words[2]),
+            mm: carrick_el1_abi::EntryMmKey::from_raw(record.words[3]),
+            thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(record.words[4]),
+        };
+        let execution = GrantExecution::new(lease.cpu, binding, context);
         // Refusal is recorded in the reply word and counted by the stock.
         let _ = self.fork_stock.retire_child(execution, &mut record);
         // SAFETY: the record is a fully initialized array of eight u64 words.
@@ -819,7 +842,7 @@ impl Cpl0HostCustody {
     pub(super) fn service_fork_stock(
         &mut self,
         lease: &StoppedCpuLease<'_>,
-    ) -> Result<(), TrapError> {
+    ) -> Result<Option<GuestArchBinding>, TrapError> {
         use carrick_el1_abi::ForkStockExchange;
         let execution = self.physical_execution(lease)?;
         self.drain_fork_quarantine(execution)?;
@@ -873,7 +896,8 @@ impl Cpl0HostCustody {
         };
         self._vm
             .write(physical, bytes)
-            .map_err(|error| fail(error.to_string()))
+            .map_err(|error| fail(error.to_string()))?;
+        Ok(None)
     }
 
     fn settle_fork_stock(
@@ -881,7 +905,7 @@ impl Cpl0HostCustody {
         lease: &StoppedCpuLease<'_>,
         execution: GrantExecution,
         address: u64,
-    ) -> Result<(), TrapError> {
+    ) -> Result<Option<GuestArchBinding>, TrapError> {
         use carrick_el1_abi::{ForkStockSettlement, PortalForkCustody};
         let loan = self
             .fork_stock
@@ -894,6 +918,7 @@ impl Cpl0HostCustody {
         // shared settlement proves zero; a restored descriptor tree would
         // need its own exact guest receipt. A commit first attaches the
         // child's inherited frames and residency.
+        let mut committed_child = None;
         if !record.abort_matches(loan) {
             // Validate the whole commit before attaching any inherited
             // frame, so nothing is published for a refused commit.
@@ -919,6 +944,7 @@ impl Cpl0HostCustody {
                     completion.child.incarnation(),
                 ),
             };
+            committed_child = Some(child);
             let len = count
                 .checked_mul(32)
                 .and_then(|n| usize::try_from(n).ok())
@@ -1094,7 +1120,24 @@ impl Cpl0HostCustody {
         };
         self._vm
             .write(physical, bytes)
-            .map_err(|e| fail(e.to_string()))
+            .map_err(|e| fail(e.to_string()))?;
+        let child_binding = if let Some(child) = committed_child {
+            let carrier = self._vm.identity().nonzero();
+            let (child_task, child_execution) = record
+                .child_task_identity()
+                .ok_or_else(|| fail("physical child task identity missing from settlement"))?;
+            Some(GuestArchBinding::x86(
+                TaskIdentity {
+                    carrier: carrick_guest_arch::CarrierGeneration::new(carrier),
+                    task: TaskSerial::new(child_task),
+                    execution: ExecutionGeneration::new(child_execution),
+                },
+                child,
+            ))
+        } else {
+            None
+        };
+        Ok(child_binding)
     }
 
     fn cow_pool(&self) -> Result<&carrick_el1_abi::CowGrantPool, TrapError> {

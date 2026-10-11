@@ -621,6 +621,17 @@ impl ForkStockSettlement {
         custody: KernelVa,
         count: u64,
     ) -> Option<Self> {
+        Self::with_child_identity(loan, completion, custody, count, 0, 0)
+    }
+
+    pub fn with_child_identity(
+        loan: ForkStockLoan,
+        completion: crate::PortalForkCompletion,
+        custody: KernelVa,
+        count: u64,
+        child_task: u64,
+        child_execution: u64,
+    ) -> Option<Self> {
         if completion.request != loan.request
             || count.checked_mul(32).is_none()
             || !custody.raw().is_multiple_of(8)
@@ -639,9 +650,17 @@ impl ForkStockSettlement {
             custody.raw(),
             count,
         ]);
+        words[10] = child_task;
+        words[11] = child_execution;
         let result = Self { words };
         result.request(loan)?;
         Some(result)
+    }
+
+    pub fn child_task_identity(&self) -> Option<(NonZeroU64, NonZeroU64)> {
+        let task = NonZeroU64::new(self.words[10])?;
+        let execution = NonZeroU64::new(self.words[11])?;
+        Some((task, execution))
     }
 
     pub fn abort(loan: ForkStockLoan) -> Self {

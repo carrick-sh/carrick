@@ -1372,7 +1372,7 @@ impl ProductionCpuLease {
             ._custody
             .lock()
             .map_err(|_| fail("physical custody poisoned"))?;
-        self.cpu.with_idle_peer_vcpu(|vcpu| {
+        let (exit, register_child, unregister_child) = self.cpu.with_idle_peer_vcpu(|vcpu| {
             let lease = StoppedCpuLease {
                 cpu: carrick_guest_arch::CpuId::new(1),
                 vcpu,
@@ -1384,23 +1384,26 @@ impl ProductionCpuLease {
                         .checked_add(1)
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
                     custody.service_anonymous_grant(&lease)?;
-                    Ok(None)
+                    Ok((None, None, None))
                 }
                 carrick_el1_abi::FORK_STOCK_PORT => {
                     custody.owner_grant_crossings = custody
                         .owner_grant_crossings
                         .checked_add(1)
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
-                    custody.service_fork_stock(&lease)?;
-                    Ok(None)
+                    let child_binding = custody.service_fork_stock(&lease)?;
+                    Ok((None, child_binding, None))
                 }
                 carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT => {
                     custody.child_retire_crossings = custody
                         .child_retire_crossings
                         .checked_add(1)
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
-                    custody.service_child_retire(&lease)?;
-                    Ok(None)
+                    let live_root = lease.vcpu.get_gpr(X86Reg::Cr3)? & !0xfff;
+                    let root_gpa = RootGpa::page_aligned(FrameGpa::new(live_root))
+                        .ok_or_else(|| fail("unaligned child retire CR3"))?;
+                    let retire_result = custody.service_child_retire(&lease);
+                    Ok((None, None, Some((root_gpa, retire_result))))
                 }
                 carrick_el1_abi::NATIVE_RUN_FAILURE_PORT => {
                     let reason = custody.service_run_failure(&lease)?;
@@ -1408,7 +1411,7 @@ impl ProductionCpuLease {
                         .run_failure_crossings
                         .checked_add(1)
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
-                    Ok(Some(PhysicalProcessExit::RunFailed(reason)))
+                    Ok((Some(PhysicalProcessExit::RunFailed(reason)), None, None))
                 }
                 carrick_el1_abi::NATIVE_ROOT_EXIT_PORT => {
                     custody.root_exit_crossings = custody
@@ -1417,11 +1420,22 @@ impl ProductionCpuLease {
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
                     custody
                         .service_root_exit(&lease)
-                        .map(|status| Some(PhysicalProcessExit::Exited(status)))
+                        .map(|status| (Some(PhysicalProcessExit::Exited(status)), None, None))
                 }
                 _ => Err(fail("unexpected idle peer physical doorbell")),
             }
-        })
+        })?;
+        if let Some(child_binding) = register_child {
+            self.cpu.register_child_binding(child_binding);
+        }
+        if let Some((live_root, retire_result)) = unregister_child {
+            self.cpu.unregister_child_binding(live_root);
+            retire_result?;
+        }
+        if let Some(PhysicalProcessExit::Exited(_) | PhysicalProcessExit::RunFailed(_)) = exit {
+            self.cpu.clear_child_bindings();
+        }
+        Ok(exit)
     }
 
     pub fn cpu_mut(&mut self) -> &mut KvmCarrierCpu {
@@ -1574,7 +1588,7 @@ impl ProductionCpuLease {
             ._custody
             .lock()
             .map_err(|_| fail("physical custody poisoned"))?;
-        self.cpu.with_stopped_vcpu(task, |vcpu| {
+        let (exit, register_child, unregister_child) = self.cpu.with_stopped_vcpu(task, |vcpu| {
             let lease = StoppedCpuLease { cpu: slot, vcpu };
             match *port {
                 OWNER_GRANT_PORT => {
@@ -1583,37 +1597,40 @@ impl ProductionCpuLease {
                         .checked_add(1)
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
                     custody.service_anonymous_grant(&lease)?;
-                    Ok(None)
+                    Ok((None, None, None))
                 }
                 carrick_el1_abi::FORK_STOCK_PORT => {
                     custody.owner_grant_crossings = custody
                         .owner_grant_crossings
                         .checked_add(1)
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
-                    custody.service_fork_stock(&lease)?;
-                    Ok(None)
+                    let child_binding = custody.service_fork_stock(&lease)?;
+                    Ok((None, child_binding, None))
                 }
                 carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT => {
                     custody.child_retire_crossings = custody
                         .child_retire_crossings
                         .checked_add(1)
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
-                    custody.service_child_retire(&lease)?;
-                    Ok(None)
+                    let live_root = lease.vcpu.get_gpr(X86Reg::Cr3)? & !0xfff;
+                    let root_gpa = RootGpa::page_aligned(FrameGpa::new(live_root))
+                        .ok_or_else(|| fail("unaligned child retire CR3"))?;
+                    let retire_result = custody.service_child_retire(&lease);
+                    Ok((None, None, Some((root_gpa, retire_result))))
                 }
                 carrick_el1_abi::NATIVE_RUN_FAILURE_PORT => {
                     let reason = custody.service_run_failure(&lease)?;
                     custody.run_failure_crossings = custody.run_failure_crossings
                         .checked_add(1)
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
-                    Ok(Some(PhysicalProcessExit::RunFailed(reason)))
+                    Ok((Some(PhysicalProcessExit::RunFailed(reason)), None, None))
                 }
                 carrick_el1_abi::NATIVE_ROOT_EXIT_PORT => {
                     custody.root_exit_crossings = custody
                         .root_exit_crossings
                         .checked_add(1)
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
-                    custody.service_root_exit(&lease).map(|status| Some(PhysicalProcessExit::Exited(status)))
+                    custody.service_root_exit(&lease).map(|status| (Some(PhysicalProcessExit::Exited(status)), None, None))
                 }
                 _ => {
                     let binding = custody.binding(slot);
@@ -1625,7 +1642,18 @@ impl ProductionCpuLease {
                     )))
                 }
             }
-        })
+        })?;
+        if let Some(child_binding) = register_child {
+            self.cpu.register_child_binding(child_binding);
+        }
+        if let Some((live_root, retire_result)) = unregister_child {
+            self.cpu.unregister_child_binding(live_root);
+            retire_result?;
+        }
+        if let Some(PhysicalProcessExit::Exited(_) | PhysicalProcessExit::RunFailed(_)) = exit {
+            self.cpu.clear_child_bindings();
+        }
+        Ok(exit)
     }
 }
 
@@ -5326,7 +5354,19 @@ impl GuestMemory for ForwardVenue<'_> {
 
 impl CurrentMmMemory for ForwardVenue<'_> {}
 
+impl carrick_guest_arch::CurrentMmMemory for ForwardVenue<'_> {
+    fn write_bytes(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+    ) -> Result<(), carrick_guest_arch::UserMemoryFault> {
+        carrick_guest_mem::GuestMemory::write_bytes(self, address, bytes)
+            .map_err(|_| carrick_guest_arch::UserMemoryFault)
+    }
+}
+
 impl carrick_hal::x8664_arch::SegmentBaseRegs for ForwardVenue<'_> {
+    type Error = TrapError;
     fn seg_set_fs_base(&mut self, address: u64) -> Result<(), TrapError> {
         let mut sregs = self
             .lease

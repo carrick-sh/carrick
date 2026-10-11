@@ -197,6 +197,8 @@ pub(super) struct Prepared {
 }
 pub(super) struct Born {
     prepared: Prepared,
+    child_task: u64,
+    child_execution: u64,
 }
 pub(super) struct Service {
     task: &'static CurrentTask,
@@ -479,11 +481,29 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             }
         }
     }
-    fn commit_mm(&mut self, mut p: Prepared) -> Result<Box<Born>, (NativeProcessError, Prepared)> {
+    fn commit_mm(&mut self, p: Prepared) -> Result<Box<Born>, (NativeProcessError, Prepared)> {
+        let child_task = p.address.mm.raw().get();
+        let child_execution = child_task;
+        self.commit_child(
+            p,
+            NonZeroU64::new(child_task).unwrap_or(NonZeroU64::MIN),
+            NonZeroU64::new(child_execution).unwrap_or(NonZeroU64::MIN),
+        )
+    }
+    fn commit_child(
+        &mut self,
+        mut p: Prepared,
+        child_task: core::num::NonZeroU64,
+        child_execution: core::num::NonZeroU64,
+    ) -> Result<Box<Born>, (NativeProcessError, Prepared)> {
         let result =
             portal().and_then(|owner| p.child.commit(&owner, self.worker()).map_err(error));
         match result {
-            Ok(_) => Ok(Box::new(Born { prepared: p })),
+            Ok(_) => Ok(Box::new(Born {
+                prepared: p,
+                child_task: child_task.get(),
+                child_execution: child_execution.get(),
+            })),
             Err(e) => Err((e, p)),
         }
     }
@@ -731,11 +751,13 @@ fn settle(born: Box<Born>, worker: u32) -> Result<(), (NativeProcessError, Box<B
         return Err((NativeProcessError::Exhausted, born));
     }
     custody.extend(p.custody.iter().copied().map(PortalForkCustody::words));
-    let Some(mut exchange) = ForkStockSettlement::new(
+    let Some(mut exchange) = ForkStockSettlement::with_child_identity(
         p.loan,
         p.child.completion(),
         KernelVa::new(custody.as_ptr() as u64),
         custody.len() as u64,
+        born.child_task,
+        born.child_execution,
     ) else {
         return Err((NativeProcessError::Stale, born));
     };
