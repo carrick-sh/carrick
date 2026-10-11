@@ -226,6 +226,16 @@ impl SyscallDispatcher {
         resources::with_captured_resources(context, operation)
     }
 
+    /// Run an MM-only terminal operation under the captured task's MM. The
+    /// file table may already be draining at this point.
+    pub fn with_kernel_mm<R>(
+        &self,
+        context: &crate::kernel::KernelContext,
+        operation: impl FnOnce() -> R,
+    ) -> R {
+        resources::with_captured_mm(context, operation)
+    }
+
     pub fn prepare_one_task_kernel_exec(
         &self,
         context: &crate::kernel::KernelContext,

@@ -321,7 +321,10 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             )
             .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))
         }
-        .map_err(|_| MmError::Core)?;
+        .map_err(|_| {
+            frame.x[18] = 100;
+            MmError::Core
+        })?;
         #[cfg(target_arch = "aarch64")]
         let prepared = &mut crate::fault::HardwarePreparedResolver;
         #[cfg(target_arch = "x86_64")]
@@ -335,8 +338,9 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             publication: slots.executable(frame.slot as usize),
             completion: None,
             service_slot: Some(executor_slot),
+            venue_refusal: None,
         };
-        match portal.select(
+        let selection = portal.select(
             &continuation,
             &words,
             carrick_core::mm::transaction::SelectionVenues {
@@ -345,7 +349,14 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
                 residency: crate::isa::frame_grant_residency_guest(),
                 slot: frame.slot as u32,
             },
-        )? {
+        );
+        #[cfg(target_arch = "aarch64")]
+        if let Some(refusal) = cow.venue_refusal {
+            frame.x[18] = refusal.reason as u64;
+            frame.x[20] = refusal.claim_generation;
+            frame.x[21] = refusal.owner_generation;
+        }
+        match selection? {
             TransferStep::Selected(selected) => {
                 frame.x[8] = selected.sequence().get();
                 frame.x[9] = selected.generation();

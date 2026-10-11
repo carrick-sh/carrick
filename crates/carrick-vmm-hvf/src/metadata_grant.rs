@@ -76,6 +76,28 @@ pub(crate) fn live_cow_scope(
     carrick_el1_abi::CowGrantScope::checked(binding, target)
 }
 
+/// Authenticate COW stock for the terminal service interval after the EL1
+/// record retires. The stopped slot may already run the maintenance root;
+/// its published MM and open space grant still identify the target root.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn terminal_cow_scope(
+    custody: &crate::trap::CarrierVmCustody,
+    slot: carrick_guest_arch::SlotId,
+    target: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
+) -> Option<carrick_el1_abi::CowGrantScope> {
+    let zone = carrick_el1_abi::zone_tables()?;
+    let mm = target.mm.raw().get();
+    let grant = zone.spaces.grant(zone.spaces.find(mm)?, mm)?;
+    if grant.ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK != target.root.address().raw() {
+        return None;
+    }
+    let binding = terminal_root_binding(
+        custody,
+        carrick_guest_arch::CpuId::new(u32::from(slot.raw())),
+    )?;
+    carrick_el1_abi::CowGrantScope::checked(binding, target)
+}
+
 fn fork_execution_from_snapshot(
     cpu: carrick_guest_arch::CpuId,
     ttbr0: u64,

@@ -339,6 +339,48 @@ pub struct HardwareCowResolver {
     pub service_slot: Option<carrick_el1_abi::SlotId>,
     pub completion: Option<carrick_el1_abi::CowGrantCompletion>,
     pub publication: Option<&'static carrick_el1_abi::PortalExecutableSlot>,
+    pub venue_refusal: Option<HardwareCowVenueFailure>,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(u64)]
+pub enum HardwareCowVenueRefusal {
+    TargetTable = 1,
+    TargetWords = 2,
+    MissingSlot = 3,
+    ServiceCopyClaim = 4,
+    ServiceWords = 5,
+    ServiceWindow = 6,
+    ScopeRecord = 7,
+    ScopeAddress = 8,
+    ScopeTask = 9,
+    ScopeExecutionGeneration = 10,
+    ScopeThreadGeneration = 11,
+    ScopeMm = 12,
+    ScopeSourceMm = 13,
+    ScopeLaneMm = 14,
+    ScopeRegisteredAddress = 15,
+    ScopeRootIncarnation = 16,
+    ScopeInvalid = 17,
+}
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug)]
+pub struct HardwareCowVenueFailure {
+    pub reason: HardwareCowVenueRefusal,
+    pub claim_generation: u64,
+    pub owner_generation: u64,
+}
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+impl HardwareCowVenueFailure {
+    fn new(reason: HardwareCowVenueRefusal) -> Self {
+        Self {
+            reason,
+            claim_generation: 0,
+            owner_generation: 0,
+        }
+    }
 }
 
 /// Authenticate the stopped executor and the independently retained target
@@ -355,26 +397,96 @@ pub unsafe fn cow_scope_for_record(
     root: carrick_guest_arch::RootGpa,
     registered: Option<carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>>,
 ) -> Option<carrick_el1_abi::CowGrantScope> {
+    // SAFETY: the checked variant has the same stopped-record precondition.
+    unsafe { cow_scope_for_record_checked(zone, task, slot, mm, root, registered) }.ok()
+}
+
+/// Checked form used by the hardware diagnostic receipt.
+///
+/// # Safety
+/// The caller owns this slot's stopped execution or guest entry claim.
+unsafe fn cow_scope_for_record_checked(
+    zone: &carrick_sched_core::ZoneTables<carrick_sched_core::Aarch64ParkedContext>,
+    task: &CurrentTask,
+    slot: carrick_sched_core::SlotId,
+    mm: carrick_guest_arch::MmGeneration,
+    root: carrick_guest_arch::RootGpa,
+    registered: Option<carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>>,
+) -> Result<carrick_el1_abi::CowGrantScope, HardwareCowVenueRefusal> {
     let binding = carrick_core::entry::binding(&task.execution, &task.mm);
     let lane = zone.slot(slot);
-    let record = zone.record(lane.current().or_else(|| lane.host_record())?);
+    let Some(record_id) = lane.current().or_else(|| lane.host_record()) else {
+        // Terminal memory work runs after retire_current has removed the
+        // record, while the stopped service slot still owns its MM. It may
+        // already run the maintenance root; the open space grant and registry
+        // supply the target root and its exact incarnation in that interval.
+        if lane.mm() != binding.mm.raw() {
+            return Err(HardwareCowVenueRefusal::ScopeLaneMm);
+        }
+        let address = registered.ok_or(HardwareCowVenueRefusal::ScopeRegisteredAddress)?;
+        if address.mm != mm || address.root != root {
+            return Err(HardwareCowVenueRefusal::ScopeRootIncarnation);
+        }
+        let grant = zone
+            .spaces
+            .find(mm.raw().get())
+            .and_then(|index| zone.spaces.grant(index, mm.raw().get()))
+            .ok_or(HardwareCowVenueRefusal::ScopeRecord)?;
+        if grant.ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK != root.address().raw() {
+            return Err(HardwareCowVenueRefusal::ScopeRootIncarnation);
+        }
+        return carrick_el1_abi::CowGrantScope::checked(binding, address)
+            .ok_or(HardwareCowVenueRefusal::ScopeInvalid);
+    };
+    let record = zone.record(record_id);
     let identity = record.identity();
     // SAFETY: the caller retains the stopped record across this snapshot.
-    let source = unsafe { record.ctx_mut() }.address_context()?;
-    if identity.tid != binding.task.raw()
-        || identity.generation != binding.generation.raw()
-        || identity.serial != binding.thread_generation.raw()
-        || identity.mm != binding.mm.raw()
-        || source.mm.raw().get() != binding.mm.raw()
-        || lane.mm() != binding.mm.raw()
-    {
-        return None;
+    let source = unsafe { record.ctx_mut() }.address_context();
+    if identity.tid != binding.task.raw() {
+        return Err(HardwareCowVenueRefusal::ScopeTask);
     }
-    let address =
-        registered.or_else(|| (source.mm == mm && source.root == root).then_some(source))?;
-    (address.mm == mm && address.root == root && (source.mm != address.mm || source == address))
-        .then(|| carrick_el1_abi::CowGrantScope::checked(binding, address))
-        .flatten()
+    if identity.generation != binding.generation.raw() {
+        return Err(HardwareCowVenueRefusal::ScopeExecutionGeneration);
+    }
+    if identity.serial != binding.thread_generation.raw() {
+        return Err(HardwareCowVenueRefusal::ScopeThreadGeneration);
+    }
+    if identity.mm != binding.mm.raw() {
+        return Err(HardwareCowVenueRefusal::ScopeMm);
+    }
+    if lane.mm() != binding.mm.raw() {
+        return Err(HardwareCowVenueRefusal::ScopeLaneMm);
+    }
+    let Some(source) = source else {
+        // A terminal service can retain its exact record after its parked
+        // address context is cleared. Authenticate the retained root against
+        // the registry and the still-open space grant in that interval.
+        let address = registered.ok_or(HardwareCowVenueRefusal::ScopeRegisteredAddress)?;
+        if address.mm != mm || address.root != root {
+            return Err(HardwareCowVenueRefusal::ScopeRootIncarnation);
+        }
+        let grant = zone
+            .spaces
+            .find(mm.raw().get())
+            .and_then(|index| zone.spaces.grant(index, mm.raw().get()))
+            .ok_or(HardwareCowVenueRefusal::ScopeRecord)?;
+        if grant.ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK != root.address().raw() {
+            return Err(HardwareCowVenueRefusal::ScopeRootIncarnation);
+        }
+        return carrick_el1_abi::CowGrantScope::checked(binding, address)
+            .ok_or(HardwareCowVenueRefusal::ScopeInvalid);
+    };
+    if source.mm.raw().get() != binding.mm.raw() {
+        return Err(HardwareCowVenueRefusal::ScopeSourceMm);
+    }
+    let address = registered
+        .or_else(|| (source.mm == mm && source.root == root).then_some(source))
+        .ok_or(HardwareCowVenueRefusal::ScopeRegisteredAddress)?;
+    if address.mm != mm || address.root != root || (source.mm == address.mm && source != address) {
+        return Err(HardwareCowVenueRefusal::ScopeRootIncarnation);
+    }
+    carrick_el1_abi::CowGrantScope::checked(binding, address)
+        .ok_or(HardwareCowVenueRefusal::ScopeInvalid)
 }
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -382,10 +494,11 @@ fn hardware_cow_scope(
     slot: carrick_el1_abi::SlotId,
     mm_key: u64,
     ttbr0: u64,
-) -> Option<carrick_el1_abi::CowGrantScope> {
+) -> Result<carrick_el1_abi::CowGrantScope, HardwareCowVenueFailure> {
     use carrick_guest_arch::{FrameGpa, MmGeneration, RootGpa};
-    let mm = MmGeneration::new(NonZeroU64::new(mm_key)?);
-    let root = RootGpa::page_aligned(FrameGpa::new(ttbr0 & TTBR_BADDR_MASK))?;
+    let invalid = || HardwareCowVenueFailure::new(HardwareCowVenueRefusal::ScopeInvalid);
+    let mm = MmGeneration::new(NonZeroU64::new(mm_key).ok_or_else(invalid)?);
+    let root = RootGpa::page_aligned(FrameGpa::new(ttbr0 & TTBR_BADDR_MASK)).ok_or_else(invalid)?;
     // SAFETY: hardware guest dispatch retains the installed shared region.
     let zone = unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
     let tasks = unsafe {
@@ -394,16 +507,22 @@ fn hardware_cow_scope(
     };
     let address =
         crate::personality::aarch64_process::registry().registered_address(zone, mm, root);
+    let task = tasks.get(slot.raw() as usize).ok_or_else(invalid)?;
+    let claim_generation = carrick_core::entry::binding(&task.execution, &task.mm)
+        .generation
+        .raw();
+    let owner_generation = address
+        .as_ref()
+        .map_or(0, |address| address.generation.raw().get());
     // SAFETY: dispatch and the service portal run on this owned executor slot.
     unsafe {
-        cow_scope_for_record(
-            zone,
-            tasks.get(slot.raw() as usize)?,
-            slot,
-            mm,
-            root,
-            address,
-        )
+        cow_scope_for_record_checked(zone, task, slot, mm, root, address).map_err(|reason| {
+            HardwareCowVenueFailure {
+                reason,
+                claim_generation,
+                owner_generation,
+            }
+        })
     }
 }
 
@@ -467,8 +586,12 @@ impl CowResolver for HardwareCowResolver {
                 )
             },
         );
-        let Ok(outcome) = outcome else {
-            return CowResolution::Refused;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(refusal) => {
+                self.venue_refusal = Some(refusal);
+                return CowResolution::Refused;
+            }
         };
         let resolution = handle_cow_outcome(outcome, &mut self.completion);
         self.needs_supply = matches!(resolution, CowResolution::NeedsSupply);
@@ -805,10 +928,12 @@ pub(crate) fn with_hardware_cow_venue<R>(
             dyn carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + 'a,
         >,
     ) -> R,
-) -> Result<R, ()> {
+) -> Result<R, HardwareCowVenueFailure> {
     use carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords;
     let Some(table) = hardware_target_table_window(ttbr0) else {
-        return Err(());
+        return Err(HardwareCowVenueFailure::new(
+            HardwareCowVenueRefusal::TargetTable,
+        ));
     };
     let maintenance = El1TableMaintenance { ttbr0 };
     // SAFETY: the alias maps this MM's primary arena, the pool window
@@ -822,12 +947,16 @@ pub(crate) fn with_hardware_cow_venue<R>(
         )
         .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))
     }) else {
-        return Err(());
+        return Err(HardwareCowVenueFailure::new(
+            HardwareCowVenueRefusal::TargetWords,
+        ));
     };
     let live = hardware_live_ttbr();
     let service_lease = if live == carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE {
         let Some(slot) = service_slot else {
-            return Err(());
+            return Err(HardwareCowVenueFailure::new(
+                HardwareCowVenueRefusal::MissingSlot,
+            ));
         };
         // SAFETY: the carrier owns this ABI region for its whole lifetime;
         // only a successful exact-slot claim can touch this pair of leaves.
@@ -836,7 +965,9 @@ pub(crate) fn with_hardware_cow_venue<R>(
                 as *const carrick_el1_abi::ServiceCopyTable)
         };
         let Some(lease) = table.try_claim(slot) else {
-            return Err(());
+            return Err(HardwareCowVenueFailure::new(
+                HardwareCowVenueRefusal::ServiceCopyClaim,
+            ));
         };
         Some(lease)
     } else {
@@ -860,7 +991,9 @@ pub(crate) fn with_hardware_cow_venue<R>(
             })
         };
         let Ok(words) = words else {
-            return Err(());
+            return Err(HardwareCowVenueFailure::new(
+                HardwareCowVenueRefusal::ServiceWords,
+            ));
         };
         Some(words)
     } else {
@@ -870,7 +1003,9 @@ pub(crate) fn with_hardware_cow_venue<R>(
         (Some(lease), Some(copy_words)) => {
             let Some(window) = crate::cow::CowCopyWindow::maintenance(copy_words, live, lease)
             else {
-                return Err(());
+                return Err(HardwareCowVenueFailure::new(
+                    HardwareCowVenueRefusal::ServiceWindow,
+                ));
             };
             window
         }
@@ -895,7 +1030,12 @@ pub(crate) fn with_hardware_cow_venue<R>(
             )
         })
     };
-    let scope = hardware_cow_scope(service_slot.ok_or(())?, mm_key_for_cow, ttbr0).ok_or(())?;
+    let scope = hardware_cow_scope(
+        service_slot
+            .ok_or_else(|| HardwareCowVenueFailure::new(HardwareCowVenueRefusal::MissingSlot))?,
+        mm_key_for_cow,
+        ttbr0,
+    )?;
     Ok(run(&crate::cow::GuestCowVenue {
         scope,
         publish_executable: publication.map(|_| &publish as &dyn Fn(_, _, _) -> bool),
@@ -1173,6 +1313,7 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
             publication: None,
             completion: None,
             needs_supply: false,
+            venue_refusal: None,
         };
         let dispatch =
             |frame: &mut TrapFrame, supply: FaultSupply<'_>, cow: &mut HardwareCowResolver| {
@@ -1239,6 +1380,7 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 publication: None,
                 completion: None,
                 needs_supply: false,
+                venue_refusal: None,
             };
             let action = dispatch(frame, FaultSupply::Owner(&supply), &mut cow);
             if action != Action::Served
@@ -1816,6 +1958,100 @@ mod tests {
             .is_none(),
             "a new registry incarnation cannot license an old stopped context"
         );
+    }
+
+    #[test]
+    fn arm_terminal_cow_scope_retains_registered_root_after_record_retirement() {
+        use carrick_guest_arch::{
+            AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa,
+        };
+        use carrick_sched_core::{Aarch64ParkedContext, SlotId, ZoneTables};
+        let region = carrick_test_support::TestEl1Region::zeroed();
+        // SAFETY: typed fixture storage retains the aligned shared ABI zone.
+        let zone = unsafe {
+            &*((region.as_ptr() as usize + carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+                as *const ZoneTables<Aarch64ParkedContext>)
+        };
+        let slot = SlotId::new(0);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 9, Some(0), 1);
+        let space = zone.spaces.publish_closed(9, 0x9000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.enter_guest(slot);
+        assert!(zone.install_space(slot, 9).is_some());
+        zone.release_space(slot);
+        assert_eq!(
+            zone.installed_space(slot),
+            0,
+            "terminal service uses maintenance root"
+        );
+        assert!(zone.slot(slot).current().is_none());
+        assert!(zone.slot(slot).host_record().is_none());
+        let address = AddressContext {
+            mm: MmGeneration::new(NonZeroU64::new(9).unwrap()),
+            root: RootGpa::page_aligned(FrameGpa::new(0x9000)).unwrap(),
+            generation: ContextGeneration::new(NonZeroU64::new(4).unwrap()),
+        };
+        let task = CurrentTask::new();
+        task.execution.task.store(2, Ordering::Release);
+        task.execution.generation.store(7, Ordering::Release);
+        task.mm.key.store(9, Ordering::Release);
+        task.mm.thread_generation.store(3, Ordering::Release);
+        // SAFETY: this fixture owns the stopped slot and installed root.
+        let scope = unsafe {
+            cow_scope_for_record(zone, &task, slot, address.mm, address.root, Some(address))
+        };
+        assert_eq!(scope.expect("terminal scope").address, address);
+    }
+
+    #[test]
+    fn arm_terminal_cow_scope_uses_registered_root_with_empty_record_context() {
+        use carrick_guest_arch::{
+            AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa,
+        };
+        use carrick_sched_core::{Aarch64ParkedContext, SlotId, ThreadIdentity, ZoneTables};
+        let region = carrick_test_support::TestEl1Region::zeroed();
+        // SAFETY: typed fixture storage retains the aligned shared ABI zone.
+        let zone = unsafe {
+            &*((region.as_ptr() as usize + carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+                as *const ZoneTables<Aarch64ParkedContext>)
+        };
+        let slot = SlotId::new(0);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 9, Some(0), 1);
+        let space = zone.spaces.publish_closed(9, 0x9000, 0).unwrap();
+        zone.spaces.open(space);
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                tid: 2,
+                serial: 3,
+                mm: 9,
+                generation: 7,
+                affinity: 1,
+                file_table: 0,
+                lifecycle_page: 0,
+                control_slot: 0,
+            })
+            .unwrap();
+        assert!(zone.authorize_guest_execution(zone.record_ref(record)));
+        zone.requeue_preempted(slot, record);
+        zone.enter_guest(slot);
+        assert_eq!(zone.switch_in_full(slot).unwrap().record, record);
+        let address = AddressContext {
+            mm: MmGeneration::new(NonZeroU64::new(9).unwrap()),
+            root: RootGpa::page_aligned(FrameGpa::new(0x9000)).unwrap(),
+            generation: ContextGeneration::new(NonZeroU64::new(4).unwrap()),
+        };
+        let task = CurrentTask::new();
+        task.execution.task.store(2, Ordering::Release);
+        task.execution.generation.store(7, Ordering::Release);
+        task.mm.key.store(9, Ordering::Release);
+        task.mm.thread_generation.store(3, Ordering::Release);
+        // SAFETY: this fixture retains the stopped slot and save area.
+        let scope = unsafe {
+            cow_scope_for_record(zone, &task, slot, address.mm, address.root, Some(address))
+        };
+        assert_eq!(scope.expect("registered terminal root").address, address);
     }
 
     #[test]
