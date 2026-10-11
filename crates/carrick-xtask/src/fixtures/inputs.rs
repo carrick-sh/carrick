@@ -86,6 +86,60 @@ fn relative(root: &Path, path: &Path) -> Result<String> {
     Ok(relative.to_owned())
 }
 
+/// Every fixture manifest whose lockfile pins dependencies the offline
+/// resolution and builds need in the Cargo cache. A missing lockfile is an
+/// error: fixtures are always `--locked`.
+pub fn fetch_plan(root: &Path) -> Result<Vec<PathBuf>> {
+    FIXTURES
+        .iter()
+        .map(|fixture| {
+            let directory = safe_path(root, fixture)?;
+            let manifest = directory.join("Cargo.toml");
+            if !manifest.is_file() || !directory.join("Cargo.lock").is_file() {
+                return Err(fail(format!(
+                    "missing fixture manifest or lockfile: {fixture}"
+                )));
+            }
+            Ok(manifest)
+        })
+        .collect()
+}
+
+/// Explicit network preparation, separate from the offline resolution and
+/// builds: `cargo fetch --locked` every fixture lockfile into the host Cargo
+/// cache, which the controlled build environment then shares read-only by
+/// symlink. Contents are pinned by each lockfile's checksums; a warm cache
+/// is used offline first and needs no network. Returns the fetch count.
+pub fn fetch_dependencies(root: &Path) -> Result<usize> {
+    let manifests = fetch_plan(root)?;
+    for manifest in &manifests {
+        let directory = manifest
+            .parent()
+            .ok_or_else(|| fail("fixture manifest without directory"))?;
+        let fetch = |offline: bool| -> Result<std::process::Output> {
+            let mut command = Command::new("cargo");
+            command.current_dir(directory).args(["fetch", "--locked"]);
+            if offline {
+                command.arg("--offline");
+            }
+            Ok(command.arg("--manifest-path").arg(manifest).output()?)
+        };
+        if fetch(true)?.status.success() {
+            continue;
+        }
+        let output = fetch(false)?;
+        if !output.status.success() {
+            return Err(fail(format!(
+                "cargo fetch --locked failed for {} ({}): {}",
+                manifest.display(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+    }
+    Ok(manifests.len())
+}
+
 fn resolved_inputs(root: &Path) -> Result<BTreeSet<String>> {
     let (inputs, found) = resolve_graph(root)?;
     build_code::check(root, &found)?;
