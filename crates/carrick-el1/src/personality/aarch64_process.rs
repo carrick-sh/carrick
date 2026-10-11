@@ -320,6 +320,13 @@ pub trait ForkStockCrossing {
     fn cross_fork_stock(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError>;
     fn cross_root_exit(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError>;
     fn cross_child_retire(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError>;
+    fn cross_wait_channel_wake(
+        &self,
+        _channel: super::native_process_runtime::ProcessWaitChannel,
+        _cpu: u64,
+    ) -> Result<(), NativeProcessError> {
+        Err(NativeProcessError::Unsupported)
+    }
 }
 
 impl<T: ForkStockCrossing> ForkStockCrossing for &T {
@@ -338,12 +345,40 @@ impl<T: ForkStockCrossing> ForkStockCrossing for &T {
     fn cross_child_retire(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
         (**self).cross_child_retire(record_gpa, cpu)
     }
+
+    fn cross_wait_channel_wake(
+        &self,
+        channel: super::native_process_runtime::ProcessWaitChannel,
+        cpu: u64,
+    ) -> Result<(), NativeProcessError> {
+        (**self).cross_wait_channel_wake(channel, cpu)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HvcForkStockCrossing;
 
 impl ForkStockCrossing for HvcForkStockCrossing {
+    fn cross_wait_channel_wake(
+        &self,
+        channel: super::native_process_runtime::ProcessWaitChannel,
+        cpu: u64,
+    ) -> Result<(), NativeProcessError> {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            crate::isa::aarch64::cross_hvc_wait_channel_wake(
+                channel.mm.raw(),
+                channel.address.get(),
+                cpu,
+            )
+            .map_err(|_| NativeProcessError::Fault)
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        {
+            let _ = (channel, cpu);
+            Err(NativeProcessError::Unsupported)
+        }
+    }
     fn cross_fork_stock(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
@@ -1108,6 +1143,13 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
 
     fn wake_effects(&mut self, effects: WakeEffects) {
         deliver_wakes(effects);
+    }
+    fn wake_unplaceable_wait(
+        &mut self,
+        channel: super::native_process_runtime::ProcessWaitChannel,
+    ) -> Result<(), NativeProcessError> {
+        self.crossing
+            .cross_wait_channel_wake(channel, u64::from(self.worker()))
     }
     fn fork_fd_table(
         &mut self,

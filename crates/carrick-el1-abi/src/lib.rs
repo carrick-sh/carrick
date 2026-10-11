@@ -355,6 +355,8 @@ pub const GRANT_OP_CHILD_RETIRE: u64 = 5;
 
 /// Owner-selected native physical stock supply and completion (HVC #6).
 pub const GRANT_OP_OWNER_SUPPLY: u64 = 6;
+/// Hand a terminal native child's unplaceable parent wait to the host.
+pub const GRANT_OP_WAIT_CHANNEL_WAKE: u64 = 7;
 
 /// Metadata grant hypercall outcome: successful extent allocation or return.
 pub const METADATA_GRANT_SUCCESS: u64 = 0;

@@ -328,6 +328,10 @@ waits under the harness deadline and verifies its original mapping. No
 child timer, signal, pipe, thread or exec service is required. TLB-fork and
 clone-storm coverage of native-child signals, timers and exec belongs to
 carrick#217. The exit budgets and three page scales below remain unchanged.
+After child graph exit and stock quarantine, a parent wait that cannot be
+placed on a guest CPU is handed back through the existing host zone wake
+venue. This is an internal retirement boundary, not a child Linux syscall;
+the child's COW writes and exit remain in the guest.
 
 Formal acceptance stays unchanged: 20x16 <=144 exits (=7.2/fork including
 fixed cost), <=64 syscall exits/window (=3.2/fork), 16/64/256 scales and

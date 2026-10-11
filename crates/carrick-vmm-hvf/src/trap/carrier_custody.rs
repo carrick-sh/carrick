@@ -430,6 +430,9 @@ pub struct CarrierVmCustody {
         parking_lot::Mutex<Option<std::sync::Arc<dyn carrick_el1_abi::MetadataCompletionWake>>>,
     pub(crate) native_space_completion:
         parking_lot::Mutex<Option<std::sync::Arc<dyn carrick_el1_abi::NativeSpaceCompletionWake>>>,
+    pub(crate) native_wait_channel_wake: parking_lot::Mutex<
+        Option<std::sync::Arc<dyn crate::metadata_grant::NativeWaitChannelWake>>,
+    >,
     pub(crate) native_cow_pending: [parking_lot::Mutex<Option<super::native_cow::PendingNativeCow>>;
         carrick_el1_abi::EL1_STACK_SLOTS as usize],
     pub(crate) metadata_aperture: parking_lot::Mutex<crate::metadata_grant::HostApertureState>,
@@ -646,6 +649,7 @@ impl CarrierVmCustody {
             host_cow_ledger: crate::hvf_aarch64_engine::HostCowLedger::default(),
             metadata_completion: parking_lot::Mutex::new(None),
             native_space_completion: parking_lot::Mutex::new(None),
+            native_wait_channel_wake: parking_lot::Mutex::new(None),
             native_cow_pending: std::array::from_fn(|_| parking_lot::Mutex::new(None)),
             metadata_aperture: parking_lot::Mutex::new(
                 crate::metadata_grant::HostApertureState::new(),
