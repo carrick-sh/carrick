@@ -1,8 +1,10 @@
 #pragma D option quiet
 /*
- * WHY DOES A NATIVE FORK CHILD EXHAUST ITS EL1 COW GRANTS?
- * Measures host owner-grant supply phases, host frame-COW triggers and
- * refusal text from start of the signed child-status fixture. The source ABI
+ * WHICH EXISTING HOST PATHS FIRE AFTER EL1 FORK-COW POOL EXHAUSTION?
+ * Measures generic owner-grant supply phases, host frame-COW triggers and
+ * refusal text from start of the signed child-status fixture. It does not
+ * instrument trap::native_cow::supply, so zero generic-supply events cannot
+ * rule out native COW supply. The source ABI
  * is hvpatch-el1-owner-grant-supply(address,len,phase,detail),
  * hvpatch-frame-cow-trigger(va,syndrome,far,ttbr0), and
  * guest-internal-write-fault(address,len,phase,error). The provider wildcard
