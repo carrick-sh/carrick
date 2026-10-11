@@ -54,6 +54,7 @@ carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-kernel = { path = "../carrick-kernel", features = ["conformance-metrics"] }
 carrick-observability = { path = "../carrick-observability", features = ["conformance-metrics"] }
 carrick-vfs = { path = "../carrick-vfs", features = ["test-support"] }
+carrick-xtask = { path = "../carrick-xtask" }
 libc.workspace = true
 tempfile.workspace = true
 

@@ -24,6 +24,7 @@ toml.workspace = true
 
 [dev-dependencies]
 carrick-kernel = { path = "../carrick-kernel", features = ["test-support"] }
+carrick-xtask = { path = "../carrick-xtask" }
 static_assertions = "1"
 tempfile.workspace = true
 toml.workspace = true

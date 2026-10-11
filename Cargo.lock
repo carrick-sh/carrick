@@ -784,6 +784,7 @@ dependencies = [
  "carrick-observability",
  "carrick-sched-core",
  "carrick-vfs",
+ "carrick-xtask",
  "libc",
  "parking_lot",
  "serde",
@@ -1124,6 +1125,7 @@ dependencies = [
  "carrick-thread",
  "carrick-timer-core",
  "carrick-x86",
+ "carrick-xtask",
  "getrandom 0.3.4",
  "goblin",
  "kvm-bindings",
@@ -1195,6 +1197,7 @@ name = "carrick-xtask"
 version = "0.1.0"
 dependencies = [
  "carrick-conformance",
+ "carrick-guest-arch",
  "carrick-portable",
  "clap",
  "flate2",
