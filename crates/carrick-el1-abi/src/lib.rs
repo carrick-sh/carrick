@@ -219,9 +219,9 @@ const _: () = {
     assert!(X86_CPL0_SUPERVISOR_IMAGE_SIZE.is_multiple_of(4096));
 };
 #[cfg(target_arch = "aarch64")]
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x1353a66bc1fa8311);
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x17334d085bf833b1);
 #[cfg(not(target_arch = "aarch64"))]
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x0640832f8bb07475);
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x62eac16429bba955);
 /// CPL0's one upper-half supervisor window for retained physical pages.
 pub const X86_CPL0_DIRECT_VA: u64 = 0xffff_ffff_9000_0000;
 /// Bytes of guest-physical space (from GPA 0) the direct window maps.
@@ -2579,6 +2579,24 @@ impl NativeForkProgress {
     pub const COUNT: usize = 11;
 }
 
+/// First refusal while converting an empty EL1 COW pool into owner supply.
+#[repr(u64)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CowSupplyRefusal {
+    RootDeclined = 1,
+    RootUnavailable = 2,
+    RootNotDelegated = 3,
+    PreparedPathAbsent = 4,
+    ReservationMmInvalid = 5,
+    RootLock = 6,
+    CarrierAbsent = 7,
+    IncarnationInvalid = 8,
+    SequenceRefused = 9,
+    WindowRefused = 10,
+    PortalSlotAbsent = 11,
+    PortalPublishRefused = 12,
+}
+
 /// Per-syscall accounting counters maintained by the EL1 kernel in the shared aperture.
 #[repr(C)]
 pub struct Counters {
@@ -2622,6 +2640,9 @@ pub struct Counters {
     /// task, execution generation, MM, thread generation, address generation,
     /// record id and record incarnation (seven words per identity).
     pub first_process_registry_refusal: [AtomicU64; 15],
+    /// First owner COW supply refusal: stage, MM key, page VA, root
+    /// incarnation. Stage is published last; zero means no refusal.
+    pub first_cow_supply_refusal: [AtomicU64; 4],
     /// Completed milestones of owner-served ARM forks.
     pub native_fork_progress: [AtomicU64; NativeForkProgress::COUNT],
 }
@@ -2644,6 +2665,7 @@ impl Counters {
             first_process_admission_root: AtomicU64::new(0),
             first_process_admission_stage: AtomicU64::new(0),
             first_process_registry_refusal: [const { AtomicU64::new(0) }; 15],
+            first_cow_supply_refusal: [const { AtomicU64::new(0) }; 4],
             native_fork_progress: [const { AtomicU64::new(0) }; NativeForkProgress::COUNT],
         }
     }
@@ -2716,6 +2738,13 @@ impl Counters {
             .first_process_registry_refusal
             .iter()
             .zip(&self.first_process_registry_refusal)
+        {
+            target.store(source.load(Ordering::Acquire), Ordering::Relaxed);
+        }
+        for (target, source) in snapshot
+            .first_cow_supply_refusal
+            .iter()
+            .zip(&self.first_cow_supply_refusal)
         {
             target.store(source.load(Ordering::Acquire), Ordering::Relaxed);
         }
@@ -2796,6 +2825,28 @@ impl Counters {
                 target.store(value, Ordering::Relaxed);
             }
             self.first_process_registry_refusal[0].store(1, Ordering::Release);
+        }
+    }
+
+    pub fn record_first_cow_supply_refusal(
+        &self,
+        stage: CowSupplyRefusal,
+        mm_key: u64,
+        page: u64,
+        root_incarnation: u64,
+    ) {
+        if self.first_cow_supply_refusal[0]
+            .compare_exchange(0, u64::MAX, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            for (target, value) in
+                self.first_cow_supply_refusal[1..]
+                    .iter()
+                    .zip([mm_key, page, root_incarnation])
+            {
+                target.store(value, Ordering::Relaxed);
+            }
+            self.first_cow_supply_refusal[0].store(stage as u64, Ordering::Release);
         }
     }
 
@@ -4188,6 +4239,19 @@ mod tests {
     }
 
     #[test]
+    fn cow_supply_refusal_keeps_first_exact_context() {
+        let counters = Counters::new();
+        counters.record_first_cow_supply_refusal(CowSupplyRefusal::RootLock, 9, 0x1000, 13);
+        counters.record_first_cow_supply_refusal(CowSupplyRefusal::WindowRefused, 10, 0x2000, 14);
+        assert_eq!(
+            counters
+                .first_cow_supply_refusal
+                .map(|word| word.load(Ordering::Acquire)),
+            [CowSupplyRefusal::RootLock as u64, 9, 0x1000, 13]
+        );
+    }
+
+    #[test]
     fn first_process_missing_entry_keeps_exact_call_and_slot() {
         let counters = Counters::new();
         counters.record_first_process_missing_entry(7, 260, true, true, false, false);
@@ -4399,12 +4463,13 @@ mod tests {
                 + ProcessRefusal::COUNT
                 + 4
                 + 15
+                + 4
                 + NativeForkProgress::COUNT)
                 * 8
         );
         assert_eq!(
             core::mem::offset_of!(Counters, first_native_fork_failure),
-            core::mem::size_of::<Counters>() - (NativeForkProgress::COUNT + 4 + 15) * 8
+            core::mem::size_of::<Counters>() - (NativeForkProgress::COUNT + 4 + 15 + 4) * 8
         );
         assert_eq!(core::mem::offset_of!(Counters, served), 0);
         assert_eq!(core::mem::offset_of!(Counters, forwarded), 512 * 8);

@@ -393,8 +393,12 @@ fn run_fixture_with_policy(
                 .native_fork_progress
                 .map(|count| count.load(std::sync::atomic::Ordering::Relaxed))
         });
+        let cow_supply_refusal = read_el1_counters().map(|counters| {
+            counters.first_cow_supply_refusal
+                .map(|word| word.load(std::sync::atomic::Ordering::Acquire))
+        });
         panic!(
-            "EL1 fixture failed before result publication: {error}; process_refusals={refusals:?}; process_calls[clone,wait4,exit,exit_group]={process_calls:?}; first_fork_failure={first_fork_failure:?}; fork_progress={fork_progress:?}; metadata={:?}",
+            "EL1 fixture failed before result publication: {error}; process_refusals={refusals:?}; process_calls[clone,wait4,exit,exit_group]={process_calls:?}; first_fork_failure={first_fork_failure:?}; fork_progress={fork_progress:?}; cow_supply_refusal[stage,mm,page,root_incarnation]={cow_supply_refusal:?}; metadata={:?}",
             carrick_runtime::metadata_grant_stats()
         )
     }));
