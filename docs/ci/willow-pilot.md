@@ -12,15 +12,24 @@ artifact digest, scoped API teardown and unchanged protected VM census.
 
 ## Build and supervise
 
-Build `carrick-xtask` for x86 Linux away from the hypervisor. On the Mac, the
-installed musl target can link this pure-Rust tool with:
+Build `carrick-xtask` for x86 Linux away from the hypervisor, on the x86
+Linux worker (carrick-vm), with its native glibc toolchain:
 
 ```sh
-RUSTFLAGS='-C force-frame-pointers=yes -C linker=rust-lld -C linker-flavor=ld.lld -C relocation-model=static -C link-arg=--no-pie' cargo build --locked --release -p carrick-xtask --target x86_64-unknown-linux-musl
+cargo build --locked --release -p carrick-xtask
 ```
 
-This linker setting is scoped to the **Linux tool**, never the macOS Carrick
-binary/USDT path. Transfer the binary plus a committed archive of `scripts/ci`,
+Both consumers are Debian 13 (glibc 2.41): the Willow host (PVE 9) runs the
+controller and every clone guest runs the job-start hook. A glibc build that
+needs at most `GLIBC_2.41` runs on both; `build-template-debian.sh` refuses a
+non-x86-64 or newer-glibc binary before creating VM 300, and provisioning
+executes it (`verify-kvm`). A static musl build is not required: it is not
+currently buildable (`carrick-portable` does not compile for musl and `ring`
+needs a C cross-compiler on the Mac), and it would buy nothing while the guest
+is pinned to Debian 13. Build on a host whose glibc is no newer than the
+guest's.
+
+Transfer the binary plus a committed archive of `scripts/ci`,
 `Cargo.lock` and `rust-toolchain.toml` to `/root/carrick-ci` on Willow. Run:
 
 ```sh
