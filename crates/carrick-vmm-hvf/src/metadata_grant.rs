@@ -138,9 +138,9 @@ fn fork_execution_from_snapshot(
         .then(|| crate::fork_stock::GrantExecution::new(cpu, binding, context))
 }
 
-/// Terminal root exit runs after `retire_current` has removed the zone
-/// record. Authenticate that final crossing against the still host-published
-/// per-vCPU task binding and the address space still installed on this slot.
+/// Terminal service can run with a free host-home record or after that record
+/// retires. Authenticate the host-published task against the slot and, when
+/// present, the exact unpublished host-home identity.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn terminal_root_binding(
     custody: &crate::trap::CarrierVmCustody,
@@ -149,7 +149,7 @@ pub(crate) fn terminal_root_binding(
     let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
     let zone = carrick_el1_abi::zone_tables()?;
     let lane = zone.slot(slot);
-    if lane.current().is_some() || lane.host_record().is_some() {
+    if lane.current().is_some() {
         return None;
     }
     let task_gpa = carrick_el1_abi::EL1_CURRENT_TASKS_BASE.checked_add(
@@ -162,7 +162,16 @@ pub(crate) fn terminal_root_binding(
     // SAFETY: the live carrier stage-2 record covers this fixed ABI slot.
     let task = unsafe { &*task_ptr };
     let binding = carrick_core::entry::binding(&task.execution, &task.mm);
-    (binding.issued() && binding.mm.raw() == lane.mm()).then_some(binding)
+    let home_matches = lane.host_record().is_none_or(|record| {
+        let row = zone.record(record);
+        let identity = row.identity();
+        row.claim() == carrick_sched_core::Claim::Free
+            && identity.tid == binding.task.raw()
+            && identity.generation == binding.generation.raw()
+            && identity.mm == binding.mm.raw()
+            && identity.serial == binding.thread_generation.raw()
+    });
+    (binding.issued() && binding.mm.raw() == lane.mm() && home_matches).then_some(binding)
 }
 
 fn native_record_on_cpu_stack(record_gpa: u64, cpu: carrick_guest_arch::CpuId) -> bool {
