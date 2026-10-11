@@ -4,6 +4,7 @@
 extern crate alloc;
 
 pub mod abi;
+pub mod arch_prctl;
 pub mod crossing;
 pub mod dispatch;
 pub mod entry;
