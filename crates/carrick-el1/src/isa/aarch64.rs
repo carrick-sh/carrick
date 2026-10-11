@@ -47,9 +47,11 @@ fn cross_hvc_process(op: u64, record_gpa: u64, cpu: u64) -> Result<(), ()> {
             core::arch::asm!(
                 "hvc #6",
                 inout("x0") status,
-                in("x1") record_gpa,
-                in("x2") cpu,
-                in("x3") 0u64,
+                // The crossing returns a four-word response; argument
+                // registers cannot retain Rust values across it.
+                inlateout("x1") record_gpa => _,
+                inlateout("x2") cpu => _,
+                inlateout("x3") 0u64 => _,
                 options(nostack)
             );
         }
@@ -63,6 +65,10 @@ fn cross_hvc_process(op: u64, record_gpa: u64, cpu: u64) -> Result<(), ()> {
         let _ = (op, record_gpa, cpu);
         Ok(())
     }
+}
+
+pub(crate) fn cross_owner_grant(cpu: u64, address: UserVa) -> Result<(), ()> {
+    cross_hvc_process(carrick_el1_abi::GRANT_OP_OWNER_SUPPLY, address.raw(), cpu)
 }
 
 pub(crate) fn cross_hvc_fork_stock(record_gpa: u64, cpu: u64) -> Result<(), ()> {

@@ -335,6 +335,7 @@ impl<W: carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords> PreparedPage
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub struct HardwareCowResolver {
+    pub needs_supply: bool,
     pub service_slot: Option<carrick_el1_abi::SlotId>,
     pub completion: Option<carrick_el1_abi::CowGrantCompletion>,
     pub publication: Option<&'static carrick_el1_abi::PortalExecutableSlot>,
@@ -469,7 +470,9 @@ impl CowResolver for HardwareCowResolver {
         let Ok(outcome) = outcome else {
             return CowResolution::Refused;
         };
-        handle_cow_outcome(outcome, &mut self.completion)
+        let resolution = handle_cow_outcome(outcome, &mut self.completion);
+        self.needs_supply = matches!(resolution, CowResolution::NeedsSupply);
+        resolution
     }
 
     fn editor_busy(&mut self) {
@@ -1160,36 +1163,97 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
             counters.fault_taken.fetch_add(1, Ordering::Relaxed);
             return Action::Forward;
         };
-        dispatch_fault_with_descriptor_txns(
+        let portal = unsafe {
+            &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
+        };
+        let slot = carrick_el1_abi::SlotId::new(frame.slot as u8);
+        let supply = OwnerFaultSupply::new(portal);
+        let mut cow = HardwareCowResolver {
+            service_slot: Some(slot),
+            publication: None,
+            completion: None,
+            needs_supply: false,
+        };
+        let dispatch =
+            |frame: &mut TrapFrame, supply: FaultSupply<'_>, cow: &mut HardwareCowResolver| {
+                dispatch_fault_with_descriptor_txns(
+                    frame,
+                    counters,
+                    current_tasks,
+                    crate::substrate::sched::object_wait::space_access(zone, slot),
+                    Some(DescriptorTxnPath {
+                        slots: carrick_el1_abi::descriptor_txn_slots_guest(),
+                        applier: &mut HardwareDescriptorTxnApplier,
+                    }),
+                    supply,
+                    Some(PreparedFaultPath::<_> {
+                        residency: crate::isa::frame_grant_residency_guest(),
+                        resolver: &mut HardwarePreparedResolver,
+                        roots: Some(crate::memory::reservations::shared_guest()),
+                        file_slots: Some(portal),
+                    }),
+                    cow,
+                )
+            };
+        let action = dispatch(
             frame,
-            counters,
-            current_tasks,
-            crate::substrate::sched::object_wait::space_access(
-                zone,
-                carrick_sched_core::SlotId::new(frame.slot as u8),
-            ),
-            Some(DescriptorTxnPath {
-                slots: carrick_el1_abi::descriptor_txn_slots_guest(),
-                applier: &mut HardwareDescriptorTxnApplier,
-            }),
             GrantMailboxes {
                 own: mailbox,
                 peers: Some(carrick_el1_abi::frame_grant_mailboxes_guest()),
-            },
-            Some(PreparedFaultPath::<_> {
-                residency: crate::isa::frame_grant_residency_guest(),
-                resolver: &mut HardwarePreparedResolver,
-                roots: Some(crate::memory::reservations::shared_guest()),
-                file_slots: Some(unsafe {
-                    &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
-                }),
-            }),
-            &mut HardwareCowResolver {
-                service_slot: Some(carrick_el1_abi::SlotId::new(frame.slot as u8)),
+            }
+            .into(),
+            &mut cow,
+        );
+        if action == Action::Served {
+            if cow.completion.is_some()
+                && crate::isa::aarch64::cross_owner_grant(
+                    frame.slot,
+                    carrick_guest_arch::UserVa::new(frame.far),
+                )
+                .is_err()
+            {
+                return Action::Forward;
+            }
+            return action;
+        }
+        if !cow.needs_supply {
+            return action;
+        }
+        let action = dispatch(frame, FaultSupply::Owner(&supply), &mut cow);
+        if action == Action::Served {
+            return action;
+        }
+        if supply.outcome() == OwnerFaultSupplyOutcome::CowSelected {
+            // Selection returned its editor before physical stock service.
+            if crate::isa::aarch64::cross_owner_grant(
+                frame.slot,
+                carrick_guest_arch::UserVa::new(frame.far),
+            )
+            .is_err()
+            {
+                return Action::Forward;
+            }
+            let supply = OwnerFaultSupply::new(portal);
+            let mut cow = HardwareCowResolver {
+                service_slot: Some(slot),
                 publication: None,
                 completion: None,
-            },
-        )
+                needs_supply: false,
+            };
+            let action = dispatch(frame, FaultSupply::Owner(&supply), &mut cow);
+            if action != Action::Served
+                || cow.completion.is_none()
+                || crate::isa::aarch64::cross_owner_grant(
+                    frame.slot,
+                    carrick_guest_arch::UserVa::new(frame.far),
+                )
+                .is_err()
+            {
+                return Action::Forward;
+            }
+            return Action::Served;
+        }
+        action
     }
     #[cfg(all(target_os = "none", target_arch = "x86_64"))]
     {

@@ -241,6 +241,47 @@ impl ForkStockHostCustody {
         Ok(())
     }
 
+    /// Publish a verified native COW replacement without changing retained
+    /// source identities. Shared MM retirement owns both physical rows.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn publish_native_cow_frame(
+        &mut self,
+        context: AddressContext<RootGpa>,
+        source: carrick_hal::PhysicalMappingRow,
+        replacement: carrick_hal::PhysicalMappingRow,
+        revision: NonZeroU64,
+    ) -> Result<(), ForkStockServiceError> {
+        let frames = self
+            .native_roots
+            .get_mut(&context.mm.raw())
+            .filter(|root| root.context == context)
+            .and_then(|root| root.frames.as_mut())
+            .ok_or(ForkStockServiceError::StaleExecution)?;
+        if super::trap::native_frame_custody::selected_row(
+            frames,
+            FrameGpa::new(source.gpa.0),
+            source.length.raw(),
+        )? != source
+        {
+            return Err(ForkStockServiceError::StaleExecution);
+        }
+        let index = frames
+            .mappings
+            .partition_point(|row| row.gpa.0 < replacement.gpa.0);
+        if let Some(current) = frames.mappings.get(index)
+            && current.gpa.0 == replacement.gpa.0
+        {
+            return if *current == replacement {
+                Ok(())
+            } else {
+                Err(ForkStockServiceError::StaleExecution)
+            };
+        }
+        frames.mappings.insert(index, replacement);
+        frames.revision = revision;
+        Ok(())
+    }
+
     /// Seed the same bounded stock in production and VM-free witnesses. Both
     /// extents are carrier-owned, live stage-2 mappings admitted before guest
     /// entry by the metadata aperture; lifecycle and table pages are disjoint.
@@ -1423,7 +1464,7 @@ mod tests {
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn dispatcher_fork_stock_round_trip_and_settlement() {
-        let custody = CarrierVmCustody::new();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new());
         let generation = custody.begin_create().unwrap();
         custody.commit_create(generation).unwrap();
 
@@ -1588,7 +1629,7 @@ mod tests {
                 Ok(self.snapshot.clone())
             }
         }
-        let custody = CarrierVmCustody::new();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new());
         let vm_generation = custody.begin_create().unwrap();
         custody.commit_create(vm_generation).unwrap();
         let mut execution = test_execution(41, 0, 301);
@@ -1881,6 +1922,194 @@ mod tests {
                 .live_mapping_row(child_row.mapping),
             Some(child_row)
         );
+        // This child has no host KernelContext or MmAccessState. Its COW
+        // source must be admitted through the same canonical guest custody.
+        let mut child_execution = execution;
+        child_execution.context = child;
+        child_execution.binding.mm = carrick_el1_abi::EntryMmKey::from_raw(302);
+        assert_eq!(
+            crate::trap::native_cow::selected_source(
+                &custody,
+                child_execution,
+                carrick_guest_arch::UserVa::new(0x4000)
+            )
+            .expect("guest-only child COW source must be admitted"),
+            child_row
+        );
+        let mut stale_execution = child_execution;
+        stale_execution.context.generation = ContextGeneration::new(NonZeroU64::new(20).unwrap());
+        assert!(
+            crate::trap::native_cow::selected_source(
+                &custody,
+                stale_execution,
+                carrick_guest_arch::UserVa::new(0x4000)
+            )
+            .is_err()
+        );
+        let mut wrong_execution = child_execution;
+        wrong_execution.binding.mm = execution.binding.mm;
+        assert!(
+            crate::trap::native_cow::selected_source(
+                &custody,
+                wrong_execution,
+                carrick_guest_arch::UserVa::new(0x4000)
+            )
+            .is_err()
+        );
+        // Exercise the production owner supply crossing with no host MM row.
+        // Atomic ABI records have a valid all-zero empty state and are heap
+        // allocated with their type alignment, never through byte vectors.
+        fn empty_record<T>() -> Box<T> {
+            let layout = std::alloc::Layout::new::<T>();
+            unsafe {
+                let pointer = std::alloc::alloc_zeroed(layout).cast::<T>();
+                assert!(!pointer.is_null());
+                Box::from_raw(pointer)
+            }
+        }
+        let pool = empty_record::<carrick_el1_abi::CowGrantPool>();
+        let portal = empty_record::<carrick_el1_abi::MmPortalSlots>();
+        let zone = empty_record::<carrick_el1_abi::ZoneTables>();
+        for (ipa, host_addr, len) in [
+            (
+                carrick_el1_abi::EL1_COW_GRANT_POOL_BASE,
+                &*pool as *const _ as usize,
+                core::mem::size_of::<carrick_el1_abi::CowGrantPool>(),
+            ),
+            (
+                carrick_el1_abi::EL1_MM_PORTAL_BASE,
+                &*portal as *const _ as usize,
+                core::mem::size_of::<carrick_el1_abi::MmPortalSlots>(),
+            ),
+            (
+                carrick_el1_abi::EL1_ZONE_BASE,
+                &*zone as *const _ as usize,
+                core::mem::size_of::<carrick_el1_abi::ZoneTables>(),
+            ),
+        ] {
+            custody
+                .publish_stage2_record_using(
+                    crate::trap::CarrierStage2RecordSpec {
+                        vm_generation,
+                        ipa,
+                        host_addr,
+                        len,
+                        mapped: true,
+                        backend_map_installed: true,
+                        release_ipa: false,
+                        perms: 3,
+                        logical_owner: Some(crate::trap::CarrierLogicalOwner {
+                            id: ipa,
+                            generation: 91,
+                        }),
+                    },
+                    || 0,
+                )
+                .unwrap();
+        }
+        *custody.native_space_completion.lock() = Some(Arc::new(
+            carrick_kernel::el1_zone::NativeSpaceCompletionWake,
+        ));
+        let space = zone
+            .spaces
+            .publish_closed(302, child.root.address().raw(), 0)
+            .unwrap();
+        zone.spaces.open(space);
+        assert!(portal.bind_carrier(custody.transfer_carrier));
+        let window = carrick_el1_abi::PortalGrantWindow::decode([
+            custody.transfer_carrier.get(),
+            302,
+            2,
+            3,
+            4,
+            0x4000,
+            0x5000,
+            3,
+            0x4000,
+            0,
+            0,
+            0,
+            0,
+        ])
+        .unwrap();
+        assert!(
+            portal
+                .grant(0)
+                .unwrap()
+                .publish_cow_fault_selection(3, window)
+        );
+        let owner_crossing = |active| {
+            crate::metadata_grant::service_metadata_operation(
+                &custody,
+                Some(vm_generation),
+                child_execution.cpu,
+                Some(active),
+                carrick_el1_abi::GRANT_OP_OWNER_SUPPLY,
+                0x4000,
+                u64::from(child_execution.cpu.raw()),
+                0,
+            )
+        };
+        assert_eq!(
+            owner_crossing(child_execution).unwrap()[0],
+            carrick_el1_abi::METADATA_GRANT_SUCCESS
+        );
+        assert_eq!(custody.host_cow_ledger.snapshot().guest_cow_provisioned, 1);
+        let scope =
+            carrick_el1_abi::CowGrantScope::checked(child_execution.binding, child).unwrap();
+        let mut foreign_scope = scope;
+        foreign_scope.execution.generation = EntryGeneration::from_raw(99);
+        assert!(pool.claim(foreign_scope).is_none());
+        let grant = pool
+            .claim(scope)
+            .expect("native replacement is ready for the exact child");
+        assert!(owner_crossing(stale_execution).is_err());
+        assert!(custody.native_cow_pending[0].lock().is_some());
+        // The guest resolver owns copy and stores. This fixture performs its
+        // exact final projection and receipt against real retained leaf words.
+        assert!(residency.retire_small_span(302, 0x4000, 4096));
+        let replacement_leaf = (leaf & !0x0000_ffff_ffff_f000 & !(3 << 6) & !(1 << 55))
+            | grant.physical_ipa
+            | (1 << 6);
+        tables[3].0[32..40].copy_from_slice(&replacement_leaf.to_ne_bytes());
+        let replacement_residency = carrick_el1_abi::FrameGrantResidencyIdentity {
+            mm_key: 302,
+            semantic_base: 0x4000,
+            physical_ipa: grant.physical_ipa,
+            len: 4096,
+            frame_id: grant.backing.frame_id.get(),
+            mapping_id: grant.backing.mapping_id.get(),
+            owner_generation: grant.backing.owner_generation.get(),
+            inventory_revision: grant.backing.inventory_revision.get(),
+        };
+        assert!(residency.publish(replacement_residency).is_some());
+        assert!(residency.record_commit(residency.lookup(302, 0x4000).unwrap()));
+        let completion = carrick_el1_abi::CowGrantCompletion {
+            purpose: carrick_el1_abi::CowGrantPurpose::UserWrite,
+            grant,
+            span_va: 0x4000,
+            span_len: 4096,
+            old_ipa: 0x50000,
+            new_ipa: grant.physical_ipa,
+        };
+        assert!(pool.complete(&completion));
+        assert_eq!(
+            owner_crossing(child_execution).unwrap()[0],
+            carrick_el1_abi::METADATA_GRANT_SUCCESS
+        );
+        assert!(custody.native_cow_pending[0].lock().is_none());
+        assert!(!pool.any_completed());
+        assert_eq!(custody.host_cow_ledger.snapshot().guest_cow_settled, 1);
+        assert_eq!(
+            custody
+                .fork_stock
+                .lock()
+                .root_frames(child)
+                .unwrap()
+                .mappings
+                .len(),
+            2
+        );
         let wrong_owner = carrick_hal::GuestFrameOwner {
             root_generation: ContextGeneration::new(NonZeroU64::new(20).unwrap()),
             ..child.into()
@@ -1902,7 +2131,7 @@ mod tests {
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn dispatcher_fork_stock_refusal_on_stale_custody_and_malformed() {
-        let custody = CarrierVmCustody::new();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new());
         let generation = custody.begin_create().unwrap();
         custody.commit_create(generation).unwrap();
 
@@ -2052,7 +2281,7 @@ mod tests {
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn dispatcher_root_exit_success_and_stale_refusal() {
-        let custody = CarrierVmCustody::new();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new());
         let generation = custody.begin_create().unwrap();
         custody.commit_create(generation).unwrap();
 
@@ -2129,7 +2358,7 @@ mod tests {
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn dispatcher_refuses_foreign_or_out_of_range_guest_cpu_index() {
-        let custody = CarrierVmCustody::new();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new());
         let generation = custody.begin_create().unwrap();
         custody.commit_create(generation).unwrap();
 
@@ -2285,7 +2514,7 @@ mod tests {
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn dispatcher_commit_with_unresolvable_page_refuses_and_preserves_ledger() {
-        let custody = CarrierVmCustody::new();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new());
         let generation = custody.begin_create().unwrap();
         custody.commit_create(generation).unwrap();
 

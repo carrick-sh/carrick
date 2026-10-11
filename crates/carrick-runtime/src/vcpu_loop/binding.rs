@@ -6277,6 +6277,14 @@ where
                     "metadata completion registration failed: {error:?}"
                 ))));
             }
+            if let Err(error) = access.install_native_space_completion(Arc::new(
+                carrick_kernel::el1_zone::NativeSpaceCompletionWake,
+            )) {
+                prepared.fail_exact();
+                return VcpuLoopLaunch::Direct(Err(RuntimeError::Configuration(format!(
+                    "native space completion registration failed: {error:?}"
+                ))));
+            }
             if let Err(error) = kernel.dispatcher.install_reservation_provider(Arc::new(
                 super::reservations::CarrierReservations::new(access),
             )) {

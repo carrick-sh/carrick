@@ -246,10 +246,11 @@ pub(crate) fn require_guest_cow_settled(mm: u64, site: &'static str) {
 
 /// One replacement compound, stage-2 mapped and registered as a live global
 /// frame owner: its host pointer, IPA and owner generation.
-fn allocate_grant_compound(
+pub(super) fn allocate_grant_compound(
     custody: &std::sync::Arc<CarrierVmCustody>,
     stage2_perms: applevisor::memory::MemPerms,
 ) -> Result<(*mut u8, u64, u64), TrapError> {
+    #[cfg(not(any(test, feature = "foreign-cow-test-support")))]
     if let Some(handle) = custody
         .frame_pool()
         .and_then(|pool| pool.allocate_compound())
