@@ -13,7 +13,10 @@ pub mod ipc;
 pub mod registry;
 pub mod wait;
 
-pub use context::ProcessContext;
+pub use context::{
+    Aarch64ThreadPointerRegister, ProcessContext, ThreadContext, ThreadPointerRegister,
+    X86ThreadPointerRegister,
+};
 
 #[cfg(test)]
 mod exit_tests;

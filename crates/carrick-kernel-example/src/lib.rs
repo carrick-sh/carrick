@@ -41,6 +41,7 @@ pub mod contracts;
 pub mod driver;
 pub mod memory;
 pub mod operand;
+pub mod personality;
 pub mod process;
 pub mod report;
 pub mod schedule;
@@ -63,6 +64,7 @@ pub use operand::{
     Step, Syscall, alloc_buffer, alloc_word, await_parked, in_out, last_child, negated, slot,
     tagged_in_out, tagged_out, write_buffer, write_word,
 };
+pub use personality::ExamplePersonality;
 pub use process::{
     AddressSpace, AddressSpaceError, AsidAllocator, ExampleInstallPermit, ExampleMmBackend,
     ExampleProcess, ExampleStage1Projection,
