@@ -694,23 +694,123 @@ fn run_user() -> Result<RunUser, ScalerError> {
     })
 }
 
-/// Kill every process of `user` as that user, repeatedly, until none
-/// remains (`kill(-1)` from a child that dropped to the account; it fails
-/// with ESRCH once nothing is left to signal, and never signals itself).
-/// Reaping needs no sudo target a job could write. A fork loop that keeps
-/// processes alive past the ten-second bound fails the launch.
+/// launchd-managed Apple agents that launchd respawns for any uid with
+/// processes, so they can never be killed away (observed live: a per-user
+/// `distnoted agent`, ppid 1, under `carrick-ci`). Matched by the kernel's
+/// real executable path, never argv. Add a path only when observed.
+pub const EXEMPT_AGENTS: [&str; 1] = ["/usr/sbin/distnoted"];
+
+/// Whether a surviving runner-account process is an exempt Apple agent: its
+/// REAL executable path (from the kernel, not argv) is exactly on the
+/// allowlist, launchd (pid 1) is its parent, and that binary is a root-owned
+/// regular file nobody else can write. A job cannot qualify by rewriting its
+/// argv (the path is the kernel's), by copying a binary elsewhere (exact
+/// path), or by planting a binary at an allowlisted path (root-owned,
+/// SIP-protected system directories).
+pub fn exempt_agent(path: Option<&Path>, ppid: u32, allowlist: &[&str]) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    ppid == 1
+        && allowlist.iter().any(|agent| Path::new(agent) == path)
+        && std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file() && owner_only(&meta, 0))
+}
+
+/// Kernel facts of one process: parent pid, effective and real uid, and the
+/// real executable path (`proc_pidpath`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessFacts {
+    pub ppid: u32,
+    pub uid: u32,
+    pub ruid: u32,
+    pub path: Option<PathBuf>,
+}
+
+#[cfg(target_os = "macos")]
+pub fn process_facts(pid: i32) -> Option<ProcessFacts> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if got != size {
+        return None;
+    }
+    let mut buf = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let len = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    let path = (len > 0).then(|| {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len as usize]))
+    });
+    Some(ProcessFacts {
+        ppid: info.pbi_ppid,
+        uid: info.pbi_uid,
+        ruid: info.pbi_ruid,
+        path,
+    })
+}
+#[cfg(not(target_os = "macos"))]
+pub fn process_facts(_pid: i32) -> Option<ProcessFacts> {
+    None
+}
+
+/// Every pid whose effective or real uid is `uid`, except `own` and the
+/// exempt Apple agents.
+#[cfg(target_os = "macos")]
+fn reap_targets(uid: u32, own: i32) -> Vec<i32> {
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if count <= 0 {
+        return Vec::new();
+    }
+    let mut pids = vec![0 as libc::pid_t; count as usize * 2 + 64];
+    let bytes = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+    let listed = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    pids.truncate(listed.max(0) as usize);
+    pids.into_iter()
+        .filter(|pid| *pid > 0 && *pid != own)
+        .filter(|pid| {
+            process_facts(*pid).is_some_and(|facts| {
+                (facts.uid == uid || facts.ruid == uid)
+                    && !exempt_agent(facts.path.as_deref(), facts.ppid, &EXEMPT_AGENTS)
+            })
+        })
+        .collect()
+}
+#[cfg(not(target_os = "macos"))]
+fn reap_targets(_uid: u32, _own: i32) -> Vec<i32> {
+    Vec::new()
+}
+
+/// Kill every non-exempt process of `user` repeatedly until none remains,
+/// from a child that dropped to the account: `kill(pid)` then only reaches
+/// that account's processes even if a pid is recycled, and reaping needs no
+/// sudo target a job could write. Exempt Apple agents (see [`exempt_agent`])
+/// are left to launchd. A fork loop or any other non-exempt process alive
+/// past the ten-second bound fails the launch.
 fn kill_all_as(user: &RunUser) -> Result<(), ScalerError> {
+    if !cfg!(target_os = "macos") {
+        return Err(ScalerError::Guard("mac-run-once reaping requires macOS"));
+    }
     let pid = unsafe { libc::fork() };
     if pid == 0 {
         unsafe {
             if libc::setgid(user.gid) != 0 || libc::setuid(user.uid) != 0 {
                 libc::_exit(2);
             }
+            let own = libc::getpid();
             for _ in 0..200 {
-                if libc::kill(-1, libc::SIGKILL) != 0
-                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-                {
+                let targets = reap_targets(user.uid, own);
+                if targets.is_empty() {
                     libc::_exit(0);
+                }
+                for target in targets {
+                    libc::kill(target, libc::SIGKILL);
                 }
                 libc::usleep(50_000);
             }
@@ -726,7 +826,7 @@ fn kill_all_as(user: &RunUser) -> Result<(), ScalerError> {
         || libc::WEXITSTATUS(status) != 0
     {
         return Err(ScalerError::Guard(
-            "runner-account processes survived ten seconds of SIGKILL; launch refused",
+            "non-exempt runner-account processes survived ten seconds of SIGKILL; launch refused",
         ));
     }
     Ok(())

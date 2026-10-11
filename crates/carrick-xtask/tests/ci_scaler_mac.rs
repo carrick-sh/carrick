@@ -425,3 +425,82 @@ fn reset_never_writes_through_a_symlink_planted_in_the_job_home() {
     assert!(std::fs::symlink_metadata(&home).unwrap().is_dir());
     assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
 }
+
+#[test]
+fn exempt_agents_are_real_root_owned_apple_paths_with_launchd_parent() {
+    for agent in EXEMPT_AGENTS {
+        assert!(
+            agent.starts_with("/usr/sbin/") || agent.starts_with("/usr/libexec/"),
+            "{agent}"
+        );
+    }
+    // A real-path match of a root-owned, non-writable binary under launchd.
+    let real = std::path::Path::new("/bin/sleep");
+    assert!(exempt_agent(Some(real), 1, &["/bin/sleep"]));
+    // Not launchd's child, unknown path, or no path: not exempt.
+    assert!(!exempt_agent(Some(real), 4242, &["/bin/sleep"]));
+    assert!(!exempt_agent(Some(real), 1, &EXEMPT_AGENTS));
+    assert!(!exempt_agent(None, 1, &["/bin/sleep"]));
+    // A look-alike copy the job owns, even if someone allowlisted its path.
+    let dir = tempfile::tempdir().unwrap();
+    let copy = dir.path().join("distnoted");
+    std::fs::copy(real, &copy).unwrap();
+    let copy_text = copy.to_str().unwrap();
+    if unsafe { libc::geteuid() } != 0 {
+        assert!(!exempt_agent(Some(&copy), 1, &[copy_text]));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn serial_host_argv_spoofed_process_is_classified_by_its_real_path() {
+    use std::os::unix::process::CommandExt;
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg0("/usr/sbin/distnoted")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = i32::try_from(child.id()).unwrap();
+    let facts = process_facts(pid);
+    let _ = child.kill();
+    let _ = child.wait();
+    let facts = facts.expect("own child is inspectable");
+    assert_eq!(
+        facts.path.as_deref(),
+        Some(std::path::Path::new("/bin/sleep"))
+    );
+    assert_eq!(facts.uid, unsafe { libc::geteuid() });
+    // argv says distnoted; the kernel path does not. Even a forged launchd
+    // parent would not exempt it.
+    assert!(!exempt_agent(
+        facts.path.as_deref(),
+        facts.ppid,
+        &EXEMPT_AGENTS
+    ));
+    assert!(!exempt_agent(facts.path.as_deref(), 1, &EXEMPT_AGENTS));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_live_distnoted_agent_if_present_is_exempt_by_real_path() {
+    // Read-only: classify any running distnoted agent owned by launchd.
+    let output = std::process::Command::new("/usr/bin/pgrep")
+        .args(["-x", "distnoted"])
+        .output()
+        .unwrap();
+    for pid in String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<i32>().ok())
+    {
+        if let Some(facts) = process_facts(pid)
+            && facts.ppid == 1
+            && facts.path.is_some()
+        {
+            assert!(exempt_agent(
+                facts.path.as_deref(),
+                facts.ppid,
+                &EXEMPT_AGENTS
+            ));
+        }
+    }
+}
