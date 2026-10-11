@@ -829,7 +829,7 @@ pub fn serve_delegated_anonymous<
         [(start, end)] => Some((*start, *end - *start)),
         _ => return refuse(pending, &mut model, Leave::BackingMultiRun),
     };
-    use carrick_el1_abi::ReservationOperation::{Prepare, Protect, Retire};
+    use carrick_el1_abi::ReservationOperation::{Decommit, Prepare, Protect, Retire};
     // A fresh mapping into a root hole over this MM's first-touch stock
     // adopts it: zero backing EL1 never exposed, re-permissioned for the
     // mapping and committed on first touch; any rest of the range has no
@@ -891,7 +891,7 @@ pub fn serve_delegated_anonymous<
             }
         }
         (
-            Retire | Prepare,
+            Retire | Prepare | Decommit,
             RangeBacking::Private | RangeBacking::Prepared,
             Some((start, run_len)),
         ) => {

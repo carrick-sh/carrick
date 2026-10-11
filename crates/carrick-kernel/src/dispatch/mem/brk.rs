@@ -218,7 +218,9 @@ impl<'a> MemView<'a> {
         let (old_page_end, new_page_end) = match request.operation {
             ReservationOperation::Prepare => (range.start(), range.end()),
             ReservationOperation::Retire => (range.end(), range.start()),
-            ReservationOperation::Protect | ReservationOperation::Move => {
+            ReservationOperation::Protect
+            | ReservationOperation::Move
+            | ReservationOperation::Decommit => {
                 // Not a break proposal: leave the root as it was.
                 root.with_root(|model| model.refuse(request))
                     .map_err(super::anonymous::root_refusal)?;
