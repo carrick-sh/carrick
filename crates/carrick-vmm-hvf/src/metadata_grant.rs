@@ -1512,8 +1512,25 @@ pub(crate) fn handle_metadata_grant_trap(
                 *offset < carrick_el1_abi::EL1_STACK_SIZE * carrick_el1_abi::EL1_STACK_SLOTS
             })
             .map(|offset| offset / carrick_el1_abi::EL1_STACK_SIZE);
+        let live_ttbr0 = vcpu
+            .get_sys_reg(SysReg::TTBR0_EL1)
+            .map_err(|e| TrapError::Hypervisor(format!("read denied process TTBR0: {e}")))?;
+        let zone_address = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)
+            .zip(carrick_el1_abi::zone_tables())
+            .map(|(slot, zone)| {
+                let lane = zone.slot(slot);
+                let record = lane.current().or_else(|| lane.host_record());
+                let parked = record.map(|record| {
+                    let identity = zone.record(record).identity();
+                    // SAFETY: the synchronous crossing stops this slot's CPU;
+                    // its current/host record remains retained until return.
+                    let context = unsafe { zone.record(record).ctx_mut() };
+                    (identity, context.root(), context.mm(), context.generation())
+                });
+                (lane.mm(), lane.current(), lane.host_record(), parked)
+            });
         return Err(TrapError::Hypervisor(format!(
-            "native process crossing denied: op={op} status={} detail={} cpu={cpu:?} record_slot={record_slot:?} hvc_elr={elr:#x} sp_el1={sp:#x} arg1={arg1:#x} arg2={arg2:#x} arg3={arg3:#x} execution={active:?}",
+            "native process crossing denied: op={op} status={} detail={} cpu={cpu:?} record_slot={record_slot:?} hvc_elr={elr:#x} sp_el1={sp:#x} arg1={arg1:#x} arg2={arg2:#x} arg3={arg3:#x} execution={active:?} live_ttbr0={live_ttbr0:#x} zone_address={zone_address:?}",
             result[0], result[1],
         )));
     }
