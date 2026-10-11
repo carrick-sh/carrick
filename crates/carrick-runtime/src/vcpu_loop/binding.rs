@@ -511,7 +511,7 @@ pub(crate) struct ProductionHvpatchLoopJob<E: ThreadedEngine> {
     pub(super) pending_terminal_retirement: Option<crate::hvpatch::PendingAddressSpaceRetirement>,
     pub(super) pending_terminal_inventory: Option<(
         Arc<carrick_kernel::kernel::Kernel>,
-        carrick_kernel::kernel::MmId,
+        carrick_kernel::kernel::FrameOwner,
     )>,
     pub(super) external_exec: Option<carrick_kernel::kernel::control::ExecWork>,
 }
@@ -726,7 +726,7 @@ where
     ) -> Result<
         (
             Arc<carrick_kernel::kernel::Kernel>,
-            carrick_kernel::kernel::MmId,
+            carrick_kernel::kernel::FrameOwner,
         ),
         TrapError,
     > {
@@ -1342,9 +1342,13 @@ where
         }
         self.kernel.unregister_hvpatch_runtime_endpoint();
         if owns_final_mm {
+            // The guest may have taken inventory custody while the kernel MM
+            // identity stayed the same. Retirement must name the owner that
+            // published the mappings, including its root generation.
+            let inventory_owner = *terminal_context.shared().mm().frame_owner();
             if self
                 .pending_terminal_inventory
-                .replace((Arc::clone(terminal_context.kernel()), terminal_mm))
+                .replace((Arc::clone(terminal_context.kernel()), inventory_owner))
                 .is_some()
             {
                 carrick_fatal!(
@@ -6535,7 +6539,7 @@ pub(crate) fn prepare_initial_runner_handoff<E: ThreadedEngine + 'static>(
             },
         );
     }
-    if engine.el1_switchable_roots().is_some() {
+    if engine.native_frame_inventory_venue() {
         let admission = context
             .kernel()
             .native_frame_inventory_admission(

@@ -26,14 +26,16 @@ pub(crate) fn live_fork_execution(
 ) -> Option<crate::fork_stock::GrantExecution> {
     let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
     let zone = carrick_el1_abi::zone_tables()?;
-    let record = zone
-        .slot(slot)
-        .current()
-        .or_else(|| zone.slot(slot).host_record())?;
+    let lane = zone.slot(slot);
+    let record = lane.current().or_else(|| lane.host_record())?;
+    let native_idle = lane.mm() == 0
+        && lane.current() == Some(record)
+        && zone.record(record).has_guest_execution();
     fork_execution_from_snapshot(
         cpu,
         ttbr0,
-        zone.slot(slot).mm(),
+        lane.mm(),
+        native_idle,
         zone.record(record).identity(),
         // SAFETY: this synchronous crossing stops the exact CPU that owns
         // this slot's current/host record; its parked address identity stays
@@ -102,6 +104,7 @@ fn fork_execution_from_snapshot(
     cpu: carrick_guest_arch::CpuId,
     ttbr0: u64,
     installed_mm: u64,
+    native_idle: bool,
     identity: carrick_sched_core::ThreadIdentity,
     parked: &carrick_sched_core::Aarch64ParkedContext,
 ) -> Option<crate::fork_stock::GrantExecution> {
@@ -113,7 +116,7 @@ fn fork_execution_from_snapshot(
 
     if identity.tid == 0
         || identity.mm == 0
-        || installed_mm != identity.mm
+        || (installed_mm != identity.mm && !(installed_mm == 0 && native_idle))
         || parked.mm() != identity.mm
         || parked.root() != ttbr0
     {
@@ -1634,16 +1637,21 @@ mod tests {
             identity.mm,
             3,
         );
-        let execution = fork_execution_from_snapshot(cpu, parked.root(), 2, identity, &parked)
-            .expect("live crossing");
+        let execution =
+            fork_execution_from_snapshot(cpu, parked.root(), 2, false, identity, &parked)
+                .expect("live crossing");
         assert_eq!(parked.root(), tagged_root);
         assert_eq!(execution.context.root.address().raw(), physical_root);
         assert_eq!(execution.context.mm.raw().get(), 2);
         assert_eq!(execution.context.generation.raw().get(), 3);
         assert_eq!(execution.binding.thread_generation.raw(), identity.serial);
-        assert!(fork_execution_from_snapshot(cpu, tagged_root, 9, identity, &parked).is_none());
+        assert!(
+            fork_execution_from_snapshot(cpu, tagged_root, 9, false, identity, &parked).is_none()
+        );
         let foreign_root = tagged_root + 0x1000;
-        assert!(fork_execution_from_snapshot(cpu, foreign_root, 2, identity, &parked).is_none());
+        assert!(
+            fork_execution_from_snapshot(cpu, foreign_root, 2, false, identity, &parked).is_none()
+        );
     }
 
     #[test]
@@ -1668,6 +1676,7 @@ mod tests {
             carrick_guest_arch::CpuId::new(2),
             parked.root(),
             9,
+            false,
             identity,
             &parked,
         )
@@ -1678,6 +1687,29 @@ mod tests {
         );
         assert_eq!(execution.binding.generation.raw(), 11);
         assert_eq!(execution.binding.thread_generation.raw(), 13);
+        assert!(
+            fork_execution_from_snapshot(
+                carrick_guest_arch::CpuId::new(2),
+                parked.root(),
+                0,
+                true,
+                identity,
+                &parked
+            )
+            .is_some(),
+            "native child on idle carrier has exact record authority"
+        );
+        assert!(
+            fork_execution_from_snapshot(
+                carrick_guest_arch::CpuId::new(2),
+                parked.root(),
+                0,
+                false,
+                identity,
+                &parked
+            )
+            .is_none()
+        );
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

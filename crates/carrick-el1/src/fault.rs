@@ -454,7 +454,11 @@ unsafe fn cow_scope_for_record_checked(
     if identity.mm != binding.mm.raw() {
         return Err(HardwareCowVenueRefusal::ScopeMm);
     }
-    if lane.mm() != binding.mm.raw() {
+    // A native guest child may run directly on an idle carrier. Its host
+    // lane has no MM; the exact current record and live root own the MM.
+    if lane.mm() != binding.mm.raw()
+        && !(lane.mm() == 0 && lane.current() == Some(record_id) && record.has_guest_execution())
+    {
         return Err(HardwareCowVenueRefusal::ScopeLaneMm);
     }
     let Some(source) = source else {
@@ -1946,6 +1950,23 @@ mod tests {
             cow_scope_for_record(zone, &task, slot, address.mm, address.root, Some(address))
         };
         assert_eq!(observed.unwrap().address, address);
+        zone.publish_slot(slot, 0, Some(0), 1);
+        let native_idle = unsafe {
+            cow_scope_for_record(zone, &task, slot, address.mm, address.root, Some(address))
+        };
+        assert_eq!(
+            native_idle.expect("native child on idle carrier").address,
+            address
+        );
+        zone.publish_slot(slot, 10, Some(0), 1);
+        assert!(
+            unsafe {
+                cow_scope_for_record(zone, &task, slot, address.mm, address.root, Some(address))
+            }
+            .is_none(),
+            "a foreign host MM must refuse the native child"
+        );
+        zone.publish_slot(slot, 9, Some(0), 1);
         let recycled = AddressContext {
             generation: ContextGeneration::new(NonZeroU64::new(5).unwrap()),
             ..address
