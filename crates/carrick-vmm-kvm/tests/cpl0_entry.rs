@@ -225,7 +225,8 @@ fn cpl0_supervisor_stub_is_rx_while_tables_and_idt_are_rw_nx() {
 
 #[test]
 fn cpl0_forward_port_returns_host_result_through_shared_entry() {
-    let mut program = vec![0x48, 0xb8];
+    let mut program = vec![0x48, 0xc7, 0xc7, 0x03, 0x00, 0x00, 0x00]; // mov rdi, 3 (non-stdio fd)
+    program.extend_from_slice(&[0x48, 0xb8]);
     program.extend_from_slice(&8u64.to_le_bytes()); // lseek, forwarded
     program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
     program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
@@ -246,7 +247,8 @@ fn cpl0_forward_port_returns_host_result_through_shared_entry() {
 
 #[test]
 fn cpl0_rechecks_host_modified_return_frame_before_iret() {
-    let mut program = vec![0x48, 0xb8];
+    let mut program = vec![0x48, 0xc7, 0xc7, 0x03, 0x00, 0x00, 0x00]; // mov rdi, 3 (non-stdio fd)
+    program.extend_from_slice(&[0x48, 0xb8]);
     program.extend_from_slice(&8_u64.to_le_bytes()); // forwarded lseek
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
     let mut carrier =
