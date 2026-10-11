@@ -32,6 +32,9 @@
 //! shared guest kernel routes fork(57) through a private canonical number;
 //! host backends still lower fork/vfork to clone before table lookup.
 
+/// The raw x86_64 `arch_prctl` syscall number (man7.org syscalls(2)).
+pub const ARCH_PRCTL_NR: u64 = 158;
+
 /// How a guest-ISA syscall number reaches the canonical (aarch64/asm-generic)
 /// dispatcher. Defined in the guest-safe syscall ABI leaf and re-exported by
 /// `carrick-abi` for host backends.

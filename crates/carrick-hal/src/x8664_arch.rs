@@ -126,72 +126,9 @@ impl SyscallTable for X8664SyscallTable {
 // engine call [`service_arch_prctl`] from their syscall path. Source:
 // arch_prctl(2) man7.org.
 
-/// The raw x86_64 `arch_prctl` syscall number (man7.org syscalls(2)).
-pub const ARCH_PRCTL_X86_NR: u64 = 158;
+pub const ARCH_PRCTL_X86_NR: u64 = carrick_abi::syscall_x86_64::ARCH_PRCTL_NR;
 
-/// Per-backend FS/GS segment-base register access — the only ISA-mechanism part
-/// of `arch_prctl`. KVM implements it via `KVM_GET/SET_SREGS`; bhyve via
-/// `vm_get/set_desc`. (Distinct method names avoid clashing with any inherent
-/// `set_fs_base`/etc. the engines also expose.)
-pub trait SegmentBaseRegs {
-    fn seg_set_fs_base(&mut self, addr: u64) -> Result<(), TrapError>;
-    fn seg_get_fs_base(&self) -> Result<u64, TrapError>;
-    fn seg_set_gs_base(&mut self, addr: u64) -> Result<(), TrapError>;
-    fn seg_get_gs_base(&self) -> Result<u64, TrapError>;
-}
-
-/// Service `arch_prctl(code, addr)` — the shared policy both x86_64 backends run
-/// before surfacing a syscall to the dispatcher. Returns the Linux return value
-/// (`0` on success, `-EINVAL` for an unknown subfunction). The GET subfunctions
-/// write the base to the user pointer; a bad pointer is swallowed (ret 0) — the
-/// same behavior the per-backend standalone loops had (a `-EFAULT` fidelity gap
-/// tracked separately, not introduced here). Source: arch_prctl(2) man7.org.
-pub fn service_arch_prctl<E>(engine: &mut E, code: u64, addr: u64) -> Result<i64, TrapError>
-where
-    E: SegmentBaseRegs + carrick_guest_mem::CurrentMmMemory,
-{
-    /// `ARCH_SET_GS` (arch_prctl(2)).
-    const ARCH_SET_GS: u64 = 0x1001;
-    /// `ARCH_SET_FS` — the musl/glibc TLS pointer.
-    const ARCH_SET_FS: u64 = 0x1002;
-    /// `ARCH_GET_FS`.
-    const ARCH_GET_FS: u64 = 0x1003;
-    /// `ARCH_GET_GS`.
-    const ARCH_GET_GS: u64 = 0x1004;
-    /// `ARCH_GET_CPUID` / `ARCH_SET_CPUID` (arch_prctl(2)) — read/toggle the
-    /// CPUID-faulting bit. carrick runs guest `CPUID` natively and cannot
-    /// intercept it, so the feature is genuinely unavailable. The kernel returns
-    /// `ENODEV` for these when CPUID faulting is unsupported (arch_prctl01
-    /// asserts exactly this), NOT the `EINVAL` an unknown subfunction gets.
-    const ARCH_GET_CPUID: u64 = 0x1011;
-    const ARCH_SET_CPUID: u64 = 0x1012;
-    /// `-EINVAL` (asm-generic errno 22) for an unknown subfunction.
-    const NEG_EINVAL: i64 = -22;
-    /// `-ENODEV` (asm-generic errno 19) — feature present but unavailable.
-    const NEG_ENODEV: i64 = -19;
-    Ok(match code {
-        ARCH_SET_FS => {
-            engine.seg_set_fs_base(addr)?;
-            0
-        }
-        ARCH_GET_FS => {
-            let v = engine.seg_get_fs_base()?;
-            let _ = engine.write_bytes(addr, &v.to_le_bytes());
-            0
-        }
-        ARCH_SET_GS => {
-            engine.seg_set_gs_base(addr)?;
-            0
-        }
-        ARCH_GET_GS => {
-            let v = engine.seg_get_gs_base()?;
-            let _ = engine.write_bytes(addr, &v.to_le_bytes());
-            0
-        }
-        ARCH_GET_CPUID | ARCH_SET_CPUID => NEG_ENODEV,
-        _ => NEG_EINVAL,
-    })
-}
+pub use carrick_guest_arch::SegmentBaseRegs;
 
 // ─── X8664BootSysregs ─────────────────────────────────────────────────────────
 

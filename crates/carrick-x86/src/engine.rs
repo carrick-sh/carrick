@@ -26,12 +26,13 @@ use carrick_hal::guest_arch::GuestArch as _;
 use carrick_hal::threaded::{
     GuestCpuState, X86_TASK_RESUME_MAGIC, X86_TASK_RESUME_PAYLOAD_LEN, X86TaskCpuStateV1,
 };
-use carrick_hal::x8664_arch::{SegmentBaseRegs, SyscallNorm, X8664GuestArch, service_arch_prctl};
+use carrick_hal::x8664_arch::{SegmentBaseRegs, SyscallNorm, X8664GuestArch};
 use carrick_hal::{
     GuestEntryRegs, HostAliasBacking, OsError, RawSyscall, Reg, SysReg, SyscallTrap,
     ThreadedEngine, TrapError, X86SignalXstate, X86XstateCapabilities,
 };
 use carrick_mem::memory::{AddressSpace, LINUX_NULL_GUARD_END};
+use carrick_personality_linux::arch_prctl::service_arch_prctl;
 
 use crate::bringup_fns::{self, BringupLayout, X86VcpuSnapshot};
 use crate::vmm::{X86_PML4_CAPACITY, X86Exit, X86FaultKind, X86Reg, X86Vcpu, X86Vmm};
@@ -377,6 +378,8 @@ impl<V: X86Vmm> X86EngineCore<V> {
 // ─── SegmentBaseRegs (arch_prctl FS/GS base) ─────────────────────────────────
 
 impl<V: X86Vmm> SegmentBaseRegs for X86EngineCore<V> {
+    type Error = TrapError;
+
     fn seg_set_fs_base(&mut self, addr: u64) -> Result<(), TrapError> {
         self.vcpu.set_fs_base(addr)
     }
@@ -388,6 +391,17 @@ impl<V: X86Vmm> SegmentBaseRegs for X86EngineCore<V> {
     }
     fn seg_get_gs_base(&self) -> Result<u64, TrapError> {
         self.vcpu.get_gs_base()
+    }
+}
+
+impl<V: X86Vmm> carrick_guest_arch::CurrentMmMemory for X86EngineCore<V> {
+    fn write_bytes(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+    ) -> Result<(), carrick_guest_arch::UserMemoryFault> {
+        carrick_guest_mem::GuestMemory::write_bytes(self, address, bytes)
+            .map_err(|_| carrick_guest_arch::UserMemoryFault)
     }
 }
 

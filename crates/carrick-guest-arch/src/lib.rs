@@ -9,13 +9,31 @@
 
 use core::num::NonZeroU64;
 
+/// An error indicating that user memory could not be accessed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UserMemoryFault;
+
+/// Per-backend FS/GS segment-base register access — the ISA-mechanism part of segment base addressing.
+pub trait SegmentBaseRegs {
+    type Error;
+    fn seg_set_fs_base(&mut self, addr: u64) -> Result<(), Self::Error>;
+    fn seg_get_fs_base(&self) -> Result<u64, Self::Error>;
+    fn seg_set_gs_base(&mut self, addr: u64) -> Result<(), Self::Error>;
+    fn seg_get_gs_base(&self) -> Result<u64, Self::Error>;
+}
+
+/// User memory access for writing register bases during GET subfunctions or user access.
+pub trait CurrentMmMemory {
+    fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), UserMemoryFault>;
+}
+
 mod sealed {
     pub trait Sealed {}
 }
 
 macro_rules! ordinal {
     ($($name:ident),+ $(,)?) => {$ (
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
         #[repr(transparent)]
         pub struct $name(u64);
         impl $name {
@@ -154,7 +172,7 @@ pub struct TaskIdentity {
 }
 
 /// A root's physical address, never a user virtual address or PCID.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RootGpa(FrameGpa);
 impl RootGpa {
     pub const fn page_aligned(address: FrameGpa) -> Option<Self> {
