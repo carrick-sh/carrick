@@ -139,6 +139,9 @@ mod poll_timeout_tests {
 }
 
 impl GuestDispatchFrame for TrapFrame {
+    fn may_serve_descriptor(&self) -> bool {
+        true
+    }
     fn native_number(&self) -> carrick_guest_arch::NativeOrdinal {
         carrick_guest_arch::NativeOrdinal::new(self.x[8])
     }
@@ -156,6 +159,16 @@ impl GuestDispatchFrame for TrapFrame {
     }
     fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
         None
+    }
+}
+
+#[cfg(test)]
+mod arm_descriptor_tests {
+    use super::{GuestDispatchFrame, TrapFrame};
+
+    #[test]
+    fn native_arm_child_can_close_a_shared_guest_descriptor() {
+        assert!(TrapFrame::default().may_serve_descriptor());
     }
 }
 
@@ -1095,6 +1108,21 @@ impl<
         let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
         let ordinal = self.frame.canonical_ordinal().raw();
         let old = self.frame.argument(0).unwrap_or(0) as i32;
+        if self.frame.arm_scheduler() {
+            if ordinal != carrick_personality_linux::crossing::nr::CLOSE.raw() {
+                return FamilyCompletion::Forward;
+            }
+            return match super::file_table::close_shared_host_binding(self.fd_map, file_table, old)
+            {
+                Ok(_) => FamilyCompletion::Complete(0),
+                Err(super::file_table::GuestCloseRefusal::Missing) => {
+                    FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EBADF.guest_retval())
+                }
+                Err(super::file_table::GuestCloseRefusal::HostReleaseRequired) => {
+                    FamilyCompletion::Forward
+                }
+            };
+        }
         let result = match ordinal {
             nr if nr == carrick_personality_linux::crossing::nr::DUP.raw() => {
                 super::file_table::dup_host_binding(
