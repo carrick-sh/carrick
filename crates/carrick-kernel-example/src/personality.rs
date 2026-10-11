@@ -49,6 +49,17 @@ impl ExamplePersonality {
     pub fn configure_task(&self, task_id: u64, register: ThreadPointerRegister) {
         self.task_overrides.write().insert(task_id, register);
     }
+
+    /// Create a shared MM authority for explicit address-space reservation,
+    /// commit, and decommit primitives under this personality.
+    pub fn create_mm_authority(
+        &self,
+        pt_manager: carrick_mmu_core::aarch64::PageTableManager,
+        frame_pool_base: carrick_guest_arch::FrameGpa,
+        frame_pool_total: usize,
+    ) -> carrick_core::mm::RangeAuthority {
+        carrick_core::mm::RangeAuthority::new(pt_manager, frame_pool_base, frame_pool_total)
+    }
 }
 
 impl Default for ExamplePersonality {

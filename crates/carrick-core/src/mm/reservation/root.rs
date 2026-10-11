@@ -410,6 +410,15 @@ impl<
 impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
     SharedReservations<Policy, Geometry>
 {
+    /// Allocate and initialize a zeroed shared reservations table on the heap.
+    pub fn new() -> alloc::boxed::Box<Self> {
+        let ptr = unsafe { alloc::alloc::alloc_zeroed(core::alloc::Layout::new::<Self>()) };
+        assert!(!ptr.is_null());
+        let this: alloc::boxed::Box<Self> = unsafe { alloc::boxed::Box::from_raw(ptr.cast()) };
+        this.layout_hash.store(Self::LAYOUT_HASH, Ordering::Release);
+        this
+    }
+
     /// Install in the slot of the matching closed AddressSpaces entry. The
     /// region must initially be zeroed. A published MM key is never reused.
     pub fn publish(
@@ -533,7 +542,6 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
     }
 
     /// A host thread's single attempt (final settlement, model fixtures).
-    #[cfg(any(test, feature = "host-test"))]
     pub fn lock(
         &self,
         index: usize,
@@ -544,7 +552,6 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
 
     /// A host thread's acquisition, `wait` deciding whether to retry a held
     /// root.
-    #[cfg(any(test, feature = "host-test"))]
     pub fn lock_waiting(
         &self,
         index: usize,
@@ -2092,6 +2099,76 @@ impl<
             source: None,
             flags: ReservationNodeFlags::EMPTY,
         })
+    }
+
+    /// Reserve an address-space range without allocating physical backing frames.
+    ///
+    /// The virtual address span `range` is tracked in the reservation tree with
+    /// `ReservationProtection::NONE` and zero physical backing frames.
+    pub fn reserve_range(&mut self, range: ReservationRange) -> Result<Decision, Refusal> {
+        self.proposal(ReservationProposal {
+            range,
+            protection: ReservationProtection::NONE,
+            operation: ReservationOperation::Prepare,
+            result: UserVa::new(range.start()),
+            policy_value: UserVa::new(self.brk_current()),
+            require_coverage: false,
+            source: None,
+            flags: ReservationNodeFlags::ANONYMOUS_PRIVATE,
+        })
+    }
+
+    /// Commit a sub-range within an address-space reservation, granting access permissions.
+    ///
+    /// Reuses `mprotect` (`ReservationOperation::Protect`) over `range` with `prot`.
+    pub fn commit_range(
+        &mut self,
+        range: ReservationRange,
+        prot: ReservationProtection,
+    ) -> Result<Decision, Refusal> {
+        self.mprotect(range, prot)
+    }
+
+    /// Decommit a sub-range within an address-space reservation, revoking access
+    /// while retaining the reservation node in the tree.
+    ///
+    /// Reuses `mprotect` (`ReservationOperation::Protect`) over `range` to
+    /// `ReservationProtection::NONE`.
+    pub fn decommit_range(&mut self, range: ReservationRange) -> Result<Decision, Refusal> {
+        self.mprotect(range, ReservationProtection::NONE)
+    }
+
+    /// Check whether `range` is fully covered by contiguous reservation nodes.
+    pub fn is_reserved(&mut self, range: ReservationRange) -> bool {
+        let mut cursor = range.start();
+        while let Some(n) = self.next(cursor) {
+            if n.start > cursor {
+                return false;
+            }
+            cursor = n.end;
+            if cursor >= range.end() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check whether `range` is fully committed with at least read access.
+    pub fn is_committed(&mut self, range: ReservationRange) -> bool {
+        let mut cursor = range.start();
+        while let Some(n) = self.next(cursor) {
+            if n.start > cursor {
+                return false;
+            }
+            if !Policy::protection(&n).permits(ReservationProtection::READ) {
+                return false;
+            }
+            cursor = n.end;
+            if cursor >= range.end() {
+                return true;
+            }
+        }
+        false
     }
     /// `mremap(2)` of an anonymous range as one proposal. `source` must lie in
     /// one root-editable node (`Hole` otherwise: the decoder's EFAULT); a
@@ -4775,6 +4852,38 @@ mod tests {
         g.retire_opaque(range(0x200000, 0x204000)).unwrap();
         assert_eq!(g.host_reserve(), HOST_RESERVE);
         g.secure_host_nodes(HOST_RESERVE).unwrap();
+    }
+
+    #[test]
+    fn reserve_commit_decommit_range_lifecycle() {
+        let table = table();
+        let mm = ReservationMm::new(88).unwrap();
+        table.publish(0, mm, layout()).unwrap();
+        let mut g = table.lock(0, mm).unwrap();
+        g.finish_import().unwrap();
+
+        let reserve_span = range(0x200000, 0x300000);
+        let decision = g.reserve_range(reserve_span).unwrap();
+        complete(&mut g, decision);
+
+        assert!(g.is_reserved(reserve_span));
+        assert!(!g.is_committed(reserve_span));
+
+        let commit_span = range(0x200000, 0x201000);
+        let decision = g
+            .commit_range(commit_span, ReservationProtection::READ_WRITE)
+            .unwrap();
+        complete(&mut g, decision);
+
+        assert!(g.is_reserved(reserve_span));
+        assert!(g.is_committed(commit_span));
+        assert!(!g.is_committed(reserve_span));
+
+        let decision = g.decommit_range(commit_span).unwrap();
+        complete(&mut g, decision);
+
+        assert!(g.is_reserved(reserve_span));
+        assert!(!g.is_committed(commit_span));
     }
 }
 
