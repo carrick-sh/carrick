@@ -85,6 +85,7 @@ fn carrick_x86_cpl0_sources_and_build_config_are_inputs() {
         "carrick-sched-core",
         "carrick-signal-core",
         "carrick-syscall-abi",
+        "carrick-x86-carrier",
         "carrick-x86-cpl0",
     ];
     assert_eq!(inputs.package_dirs.len(), packages.len());

@@ -1189,6 +1189,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-x86-carrier"
+version = "0.1.0"
+dependencies = [
+ "carrick-core",
+ "carrick-core-abi",
+ "carrick-el1",
+ "carrick-el1-abi",
+ "carrick-guest-arch",
+ "carrick-mmu-core",
+ "carrick-personality-api",
+ "carrick-personality-linux",
+ "carrick-sched-core",
+]
+
+[[package]]
 name = "carrick-x86-cpl0"
 version = "0.1.0"
 dependencies = [
@@ -1202,6 +1217,7 @@ dependencies = [
  "carrick-personality-linux",
  "carrick-sched-core",
  "carrick-syscall-abi",
+ "carrick-x86-carrier",
 ]
 
 [[package]]
