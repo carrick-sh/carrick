@@ -18,7 +18,7 @@ use carrick_el1_abi::{
 };
 use carrick_guest_arch::{AddressContext, CpuId, RootGpa};
 use carrick_hal::asid::{AsidAllocator, AsidError, AsidGeneration};
-use carrick_sched_core::process::LinuxWaitStatus;
+use carrick_personality_linux::lifecycle::LinuxWaitStatus;
 use core::num::NonZeroU64;
 
 use crate::trap::{CarrierVmCustody, El1FrameGrantLedger, El1FrameGrantMm};

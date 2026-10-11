@@ -34,7 +34,7 @@ pub(crate) fn restore(
 
 pub(crate) fn build(
     frame: &TrapFrame,
-    params: carrick_guest_arch::SignalFrameParams,
+    params: carrick_personality_linux::signal::SignalFrameParams,
     siginfo: Option<&[u8]>,
     fpstate: &[u8],
 ) -> Result<(carrick_guest_arch::UserVa, CarrickSigframe), ArchError> {
@@ -100,7 +100,8 @@ mod tests {
     }
     #[test]
     fn built_frame_carries_ucontext_fpsimd_stack_and_frame_record() {
-        use carrick_guest_arch::{SignalFrameParams, UserVa};
+        use carrick_guest_arch::UserVa;
+        use carrick_personality_linux::signal::SignalFrameParams;
         let mut frame = TrapFrame::default();
         frame.x[0] = 42;
         frame.x[29] = 0x8000;
@@ -210,11 +211,11 @@ use carrick_syscall_abi::CarrickSigframe as Arm64Sigframe;
 use zerocopy::{FromBytes, IntoBytes};
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-impl carrick_guest_arch::SignalBackend for crate::isa::aarch64::Aarch64Backend {
+impl carrick_personality_linux::signal::SignalBackend for crate::isa::aarch64::Aarch64Backend {
     fn setup_signal_frame<'a>(
         &mut self,
         frame: &mut TrapFrame,
-        params: carrick_guest_arch::SignalFrameParams,
+        params: carrick_personality_linux::signal::SignalFrameParams,
         siginfo: Option<&'a [u8]>,
         _fpstate: &[u8],
         copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,

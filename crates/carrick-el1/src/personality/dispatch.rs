@@ -17,8 +17,8 @@ use carrick_el1_abi::{
     EL1_OBJECT_TABLE_BASE, EL1_OPEN_FILE_TABLE_BASE, EL1_STACK_SLOTS, EL1_ZONE_BASE,
     FD_MAP_CAPACITY, MAX_DELEGATED_INOTIFY,
 };
-use carrick_guest_arch::SyscallFrame;
 use carrick_personality_linux::abi::entry::{LinuxTaskState, SyscallResult};
+use carrick_personality_linux::dispatch::SyscallFrame;
 use carrick_personality_linux::dispatch::{EntryCounters, LifecycleWorkCounters};
 use carrick_personality_linux::dispatch::{FamilyCompletion, PendingFamilies};
 #[cfg(target_os = "none")]
@@ -98,7 +98,7 @@ pub trait GuestDispatchFrame: SyscallFrame {
     }
     fn setup_signal_frame(
         &mut self,
-        params: carrick_guest_arch::SignalFrameParams,
+        params: carrick_personality_linux::signal::SignalFrameParams,
         siginfo: Option<&[u8]>,
         copy_out: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
     ) -> Result<carrick_guest_arch::UserVa, carrick_syscall_abi::LinuxErrno> {

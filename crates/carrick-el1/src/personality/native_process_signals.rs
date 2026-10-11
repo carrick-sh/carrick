@@ -4,7 +4,9 @@ extern crate alloc;
 use crate::lock::SpinLock;
 use alloc::sync::Arc;
 use carrick_personality_linux::signal::{EnqueueOutcome, SignalInbox, StaleTarget};
-use carrick_sched_core::process::exit::{ExitSignalDisposition, ExitSignalSource, ExitSignalState};
+use carrick_sched_core::process::exit::{
+    DefaultSignalDisposition, ExitSignalDisposition, ExitSignalSource, ExitSignalState,
+};
 use carrick_sched_core::process::{LinuxSignal, TaskKey};
 use carrick_signal_core::SignalSet;
 use carrick_signal_core::policy::{
@@ -359,8 +361,13 @@ impl<T, M: BlockedMaskSource> ExitSignalSource for NativeExitSignals<T, M> {
             Disposition::Ignore => ExitSignalDisposition::Ignore,
             Disposition::Handler(_) => ExitSignalDisposition::Caught,
         };
+        let default_disposition = match carrick_signal_core::policy::default_delivery(signal) {
+            carrick_signal_core::policy::Delivery::Ignore => DefaultSignalDisposition::Ignore,
+            _ => DefaultSignalDisposition::Deliver,
+        };
         ExitSignalState {
             disposition,
+            default_disposition,
             blocked: self.mask.blocked_mask().contains(signal),
         }
     }
@@ -546,6 +553,7 @@ mod tests {
             retained.exit_signal_state(LinuxSignal::SIGCHLD),
             ExitSignalState {
                 disposition: ExitSignalDisposition::Caught,
+                default_disposition: DefaultSignalDisposition::Ignore,
                 blocked: true
             }
         );
@@ -602,13 +610,13 @@ mod tests {
         assert!(
             !retained
                 .exit_signal_state(LinuxSignal::SIGCHLD)
-                .needs_notification(LinuxSignal::SIGCHLD)
+                .needs_notification()
         );
         control.init_blocked(carrick_el1_abi::BlockedMask(Signal::CHLD.bit()));
         assert!(
             retained
                 .exit_signal_state(LinuxSignal::SIGCHLD)
-                .needs_notification(LinuxSignal::SIGCHLD)
+                .needs_notification()
         );
         signals
             .install_action(
@@ -624,7 +632,7 @@ mod tests {
         assert!(
             !retained
                 .exit_signal_state(LinuxSignal::SIGCHLD)
-                .needs_notification(LinuxSignal::SIGCHLD)
+                .needs_notification()
         );
         let mut no_child_wait = Action::default();
         no_child_wait.flags.no_child_wait = true;
@@ -642,7 +650,7 @@ mod tests {
         assert!(
             retained
                 .exit_signal_state(LinuxSignal::SIGCHLD)
-                .needs_notification(LinuxSignal::SIGCHLD)
+                .needs_notification()
         );
         signals
             .install_action(

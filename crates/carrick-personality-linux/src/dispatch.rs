@@ -5,6 +5,24 @@ use crate::ipc::IpcCall;
 use crate::lifecycle::{LifecycleCall, LifecycleOutcome};
 use crate::sysinfo::SysinfoCall;
 use carrick_core_abi::EntryContext;
+use carrick_guest_arch::{NativeReturnWord, SlotId, UserVa};
+use carrick_syscall_abi::CanonicalNr;
+
+/// Registers needed by the shared Linux syscall families. Native frames
+/// implement this directly; no ISA-shaped substitute frame is constructed.
+pub trait SyscallFrame {
+    fn canonical_ordinal(&self) -> CanonicalNr;
+    fn argument(&self, index: usize) -> Option<u64>;
+    fn result(&self) -> NativeReturnWord;
+    fn set_result(&mut self, result: NativeReturnWord);
+    fn slot(&self) -> Option<SlotId>;
+    /// Index within the supplied task slice. A projected one-task x86 slice
+    /// uses index zero while retaining its real CPU slot in `slot()`.
+    fn task_index(&self) -> usize {
+        self.slot().map_or(usize::MAX, SlotId::index)
+    }
+    fn user_sp(&self) -> Option<UserVa>;
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AnonymousCall {

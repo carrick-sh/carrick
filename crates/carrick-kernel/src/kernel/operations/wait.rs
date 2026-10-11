@@ -12,7 +12,7 @@ use carrick_fatal::carrick_fatal;
 use super::{KernelOperationError, next_revision};
 use crate::kernel::core::{Kernel, RetiringTaskRecord, TaskRecord, TaskRevision, ZombieRecord};
 use crate::kernel::ids::{LinuxSignal, ProcessGroupId, TaskId};
-use crate::kernel::objects::{TaskJobControlEvent, TaskKey, Zombie};
+use crate::kernel::objects::{LinuxWaitStatus, TaskJobControlEvent, TaskKey, Zombie};
 
 use carrick_sched_core::process::WaitTarget;
 pub use carrick_sched_core::process::{WaitChildClass, WaitMode};
@@ -328,6 +328,7 @@ impl WaitLive for TaskRecord {
     }
 }
 impl WaitZombie<crate::kernel::container::ContainerId, NsUid> for ZombieRecord {
+    type Status = LinuxWaitStatus;
     fn wait_zombie(&self) -> &Zombie {
         &self.zombie
     }
@@ -536,15 +537,17 @@ mod tests {
     #[test]
     fn wait_child_class_follows_wait_options() {
         assert_eq!(
-            WaitChildClass::from_wait_options(LinuxWaitOptions::WNOHANG),
+            carrick_personality_linux::lifecycle::wait_child_class(LinuxWaitOptions::WNOHANG),
             WaitChildClass::Sigchld
         );
         assert_eq!(
-            WaitChildClass::from_wait_options(LinuxWaitOptions::WCLONE),
+            carrick_personality_linux::lifecycle::wait_child_class(LinuxWaitOptions::WCLONE),
             WaitChildClass::Clone
         );
         assert_eq!(
-            WaitChildClass::from_wait_options(LinuxWaitOptions::WALL | LinuxWaitOptions::WCLONE),
+            carrick_personality_linux::lifecycle::wait_child_class(
+                LinuxWaitOptions::WALL | LinuxWaitOptions::WCLONE
+            ),
             WaitChildClass::All
         );
         assert_eq!(ChildExitSignal::for_clone_request(0), ChildExitSignal::None);

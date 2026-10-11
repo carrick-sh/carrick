@@ -368,7 +368,9 @@ mod kernel {
     use carrick_el1_abi::{
         Counters, CurrentTask, DelegatedFile, DelegatedOpenFile, FdMapSlot, InotifyNameCache,
     };
-    use carrick_guest_arch::{CanonicalNr, InterruptArch, LayoutBackend, NativeReturnWord, SyscallFrame, UserVa};
+    use carrick_guest_arch::{InterruptArch, LayoutBackend, NativeReturnWord, UserVa};
+    use carrick_personality_linux::dispatch::SyscallFrame;
+    use carrick_syscall_abi::CanonicalNr;
     use carrick_x86_cpl0::ProductionBoundary;
     fixture_items! { use carrick_guest_arch::EntryArch; }
     fixture_items! { use core::sync::atomic::AtomicU64; }
@@ -510,7 +512,7 @@ mod kernel {
             copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
         ) -> Result<carrick_personality_linux::signal::policy::SigBlockMask, carrick_abi::LinuxErrno> {
             let mut backend = carrick_el1::isa::x86::X86Backend;
-            carrick_guest_arch::SignalBackend::restore_signal_frame(
+            carrick_personality_linux::signal::SignalBackend::restore_signal_frame(
                 &mut backend,
                 self.frame,
                 &mut self.fpstate.0,
@@ -520,12 +522,12 @@ mod kernel {
         }
         fn setup_signal_frame(
             &mut self,
-            params: carrick_guest_arch::SignalFrameParams,
+            params: carrick_personality_linux::signal::SignalFrameParams,
             siginfo: Option<&[u8]>,
             copy_out: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
         ) -> Result<carrick_guest_arch::UserVa, carrick_abi::LinuxErrno> {
             let mut backend = carrick_el1::isa::x86::X86Backend;
-            carrick_guest_arch::SignalBackend::setup_signal_frame(
+            carrick_personality_linux::signal::SignalBackend::setup_signal_frame(
                 &mut backend,
                 self.frame,
                 params,
@@ -1321,7 +1323,7 @@ mod kernel {
                 let Some((sp, stack)) = selected_stack else {
                     return force_delivery_fault(task, process, frame, fpstate, sig, thread_blocked);
                 };
-                let params = carrick_guest_arch::SignalFrameParams {
+                let params = carrick_personality_linux::signal::SignalFrameParams {
                     stack,
                     signal: sig,
                     sigcode: info.as_ref().map_or(0, |i| i.si_code),
@@ -1338,7 +1340,7 @@ mod kernel {
                         core::mem::size_of_val(i),
                     )
                 });
-                let setup = carrick_guest_arch::SignalBackend::setup_signal_frame(
+                let setup = carrick_personality_linux::signal::SignalBackend::setup_signal_frame(
                     &mut backend,
                     frame,
                     params,
@@ -1364,7 +1366,7 @@ mod kernel {
         )
     }
 
-    pub(super) fn complete_root_exit(task: &CurrentTask, status: carrick_sched_core::process::LinuxWaitStatus) -> ! {
+    pub(super) fn complete_root_exit(task: &CurrentTask, status: carrick_personality_linux::lifecycle::LinuxWaitStatus) -> ! {
         let exit = carrick_el1_abi::NativeRootExit::new(
             carrick_el1::personality::common_entry::execution_binding(task), status,
         ).unwrap_or_else(|| initial_boot::fatal_boot());

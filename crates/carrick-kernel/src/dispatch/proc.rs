@@ -3091,7 +3091,7 @@ impl<'a> ProcView<'a> {
                 let include_stopped = options.contains(LinuxWaitOptions::WSTOPPED);
                 let include_continued = options.contains(LinuxWaitOptions::WCONTINUED);
                 let nowait = options.contains(LinuxWaitOptions::WNOWAIT);
-                let class = crate::kernel::WaitChildClass::from_wait_options(options);
+                let class = carrick_personality_linux::lifecycle::wait_child_class(options);
                 let mut pidfd_target = None;
                 let mut group_target = None;
                 let target = match idtype {
@@ -3249,7 +3249,7 @@ impl<'a> ProcView<'a> {
                 // `clone(CLONE_VM|0)` helper, say -- is a "clone child" that a
                 // plain wait ignores (ECHILD when only such children exist);
                 // `__WCLONE` selects only those and `__WALL` every child.
-                let class = crate::kernel::WaitChildClass::from_wait_options(options);
+                let class = carrick_personality_linux::lifecycle::wait_child_class(options);
                 // The guest names its child by the pid `fork` returned — an
                 // ns-pid — while the kernel graph waits by task id. An ns-pid
                 // that names no member is ECHILD (no such child), exactly as

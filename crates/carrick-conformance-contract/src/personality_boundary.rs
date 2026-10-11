@@ -42,6 +42,8 @@ pub const DEFAULT_SUBSTRATE_ALLOWLIST: &[&str] = &[
     "carrick-timer-core",
     "carrick-fd-core",
     "carrick-pipe-core",
+    "carrick-guest-arch",
+    "carrick-personality-api",
     "carrick-el1",
 ];
 
@@ -52,6 +54,7 @@ pub const FORBIDDEN_PERSONALITY_CRATES: &[&str] = &[
     "carrick-el1-abi",
     "carrick-signal-linux",
     "carrick-kernel",
+    "carrick-syscall-abi",
 ];
 
 /// Designated host or std-only platform crates forbidden in substrate dependency closures.
@@ -418,7 +421,7 @@ pub fn check_substrate_boundary(
             .filter(|name| {
                 !matches!(
                     name.as_str(),
-                    "carrick-el1-abi" | "carrick-personality-linux"
+                    "carrick-el1-abi" | "carrick-personality-linux" | "carrick-syscall-abi"
                 )
             })
             .cloned()
@@ -1605,13 +1608,19 @@ mod tests {
 
     #[test]
     fn neutral_mm_crates_are_subject_to_the_personality_boundary() {
-        for name in ["carrick-core", "carrick-core-abi"] {
+        for name in [
+            "carrick-core",
+            "carrick-core-abi",
+            "carrick-guest-arch",
+            "carrick-personality-api",
+        ] {
             assert!(
                 DEFAULT_SUBSTRATE_ALLOWLIST.contains(&name),
                 "{name} must be audited"
             );
         }
         assert!(FORBIDDEN_PERSONALITY_CRATES.contains(&"carrick-personality-linux"));
+        assert!(FORBIDDEN_PERSONALITY_CRATES.contains(&"carrick-syscall-abi"));
     }
 
     #[test]
@@ -1690,31 +1699,40 @@ mod tests {
     }
     impl Fixture {
         fn new(path: &str, code: &str) -> Self {
+            Self::new_for_crate("carrick-sched-core", path, code)
+        }
+        fn new_for_crate(crate_name: &str, path: &str, code: &str) -> Self {
             let root = tempfile::tempdir().unwrap();
-            let dir = root.path().join("crates/carrick-sched-core");
+            let dir = root.path().join("crates").join(crate_name);
             let source = dir.join(path);
             fs::create_dir_all(source.parent().unwrap()).unwrap();
             fs::write(&source, code).unwrap();
             fs::write(
                 dir.join("Cargo.toml"),
-                "[package]\nname='carrick-sched-core'\nversion='0.1.0'\n",
+                format!("[package]\nname='{crate_name}'\nversion='0.1.0'\n"),
             )
             .unwrap();
             let metadata = json!({
                 "workspace_root": root.path(),
-                "packages": [{"id":"core", "name":"carrick-sched-core", "version":"0.1.0",
-                    "manifest_path":dir.join("Cargo.toml"),
-                    "targets":[{"kind":["lib"],"src_path":source}],"dependencies":[]}],
-                "resolve":{"nodes":[{"id":"core","deps":[]}]}
+                "packages": [{"id": crate_name, "name": crate_name, "version": "0.1.0",
+                    "manifest_path": dir.join("Cargo.toml"),
+                    "targets": [{"kind": ["lib"], "src_path": source}], "dependencies": []}],
+                "resolve": {"nodes": [{"id": crate_name, "deps": []}]}
             });
             Self { root, metadata }
         }
         fn check(&self) -> Result<Vec<CrateAuditReport>, BoundaryError> {
+            self.check_for_crate("carrick-sched-core")
+        }
+        fn check_for_crate(
+            &self,
+            crate_name: &str,
+        ) -> Result<Vec<CrateAuditReport>, BoundaryError> {
             check_substrate_boundary(
                 self.root.path(),
                 &BoundaryConfig {
                     metadata_json: Some(self.metadata.to_string()),
-                    substrate_allowlist: vec!["carrick-sched-core".to_string()],
+                    substrate_allowlist: vec![crate_name.to_string()],
                     ..Default::default()
                 },
             )
@@ -1745,6 +1763,51 @@ mod tests {
                 .push(json!({
                     "name":alias,"pkg":to,"dep_kinds":[{"kind":kind,"target":target}]
                 }));
+        }
+    }
+
+    #[test]
+    fn personality_api_substrate_boundary_rejects_syscall_abi_mutant() {
+        let mut f = Fixture::new_for_crate(
+            "carrick-personality-api",
+            "src/lib.rs",
+            "pub fn neutral() {}\n",
+        );
+        f.package("syscall_abi", "carrick-syscall-abi");
+        f.edge(0, "syscall_abi", "carrick_syscall_abi", None, None);
+        f.metadata["packages"][0]["dependencies"] =
+            json!([{"name": "carrick-syscall-abi", "optional": false}]);
+        let err = f.check_for_crate("carrick-personality-api").unwrap_err();
+        match err {
+            BoundaryError::Violations { count, report } => {
+                assert!(count >= 1);
+                assert!(
+                    report.contains("crate `carrick-personality-api` reaches forbidden personality crate `carrick-syscall-abi`"),
+                    "unexpected report: {report}"
+                );
+            }
+            other => panic!("expected boundary violation for syscall-abi mutant, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn guest_arch_substrate_boundary_rejects_syscall_abi_mutant() {
+        let mut f =
+            Fixture::new_for_crate("carrick-guest-arch", "src/lib.rs", "pub fn neutral() {}\n");
+        f.package("syscall_abi", "carrick-syscall-abi");
+        f.edge(0, "syscall_abi", "carrick_syscall_abi", None, None);
+        f.metadata["packages"][0]["dependencies"] =
+            json!([{"name": "carrick-syscall-abi", "optional": false}]);
+        let err = f.check_for_crate("carrick-guest-arch").unwrap_err();
+        match err {
+            BoundaryError::Violations { count, report } => {
+                assert!(count >= 1);
+                assert!(
+                    report.contains("crate `carrick-guest-arch` reaches forbidden personality crate `carrick-syscall-abi`"),
+                    "unexpected report: {report}"
+                );
+            }
+            other => panic!("expected boundary violation for syscall-abi mutant, got: {other:?}"),
         }
     }
 

@@ -442,7 +442,7 @@ impl NativeRootExit {
 
     pub fn new(
         binding: ExecutionBinding,
-        status: carrick_sched_core::process::LinuxWaitStatus,
+        status: carrick_personality_linux::lifecycle::LinuxWaitStatus,
     ) -> Option<Self> {
         if !binding.issued()
             || binding.mm.raw() == 0
@@ -469,7 +469,7 @@ impl NativeRootExit {
     pub fn status_for(
         &self,
         expected: ExecutionBinding,
-    ) -> Option<carrick_sched_core::process::LinuxWaitStatus> {
+    ) -> Option<carrick_personality_linux::lifecycle::LinuxWaitStatus> {
         if self.words[..5]
             != [
                 0x4352_524f_4f54_4558,
@@ -484,7 +484,7 @@ impl NativeRootExit {
             return None;
         }
         Some(
-            carrick_sched_core::process::LinuxWaitStatus::from_wait_encoding(
+            carrick_personality_linux::lifecycle::LinuxWaitStatus::from_wait_encoding(
                 i32::try_from(self.words[5]).ok()?,
             ),
         )
@@ -876,7 +876,7 @@ mod tests {
 
     #[test]
     fn native_root_exit_refuses_foreign_execution_and_nonterminal_status() {
-        use carrick_sched_core::process::LinuxWaitStatus;
+        use carrick_personality_linux::lifecycle::LinuxWaitStatus;
         let binding = request().binding;
         let status = LinuxWaitStatus::from_wait_encoding(37 << 8);
         let record = NativeRootExit::new(binding, status).unwrap();
@@ -1066,7 +1066,8 @@ mod tests {
         assert_eq!(restored.request(), Some(request));
 
         let binding = request.binding;
-        let status = carrick_sched_core::process::LinuxWaitStatus::from_wait_encoding(12 << 8);
+        let status =
+            carrick_personality_linux::lifecycle::LinuxWaitStatus::from_wait_encoding(12 << 8);
         let root_exit = NativeRootExit::new(binding, status).unwrap();
         let exit_words = root_exit.raw_words();
         let restored_exit = NativeRootExit::from_raw_words(exit_words);
@@ -1290,7 +1291,8 @@ mod tests {
         assert_eq!(u64::from_ne_bytes(s_bytes[56..64].try_into().unwrap()), 2);
 
         // 4. NativeRootExit wire layout
-        let exit_status = carrick_sched_core::process::LinuxWaitStatus::from_wait_encoding(12 << 8);
+        let exit_status =
+            carrick_personality_linux::lifecycle::LinuxWaitStatus::from_wait_encoding(12 << 8);
         let root_exit = NativeRootExit::new(req.binding, exit_status).unwrap();
         let re_bytes = unsafe {
             core::slice::from_raw_parts(

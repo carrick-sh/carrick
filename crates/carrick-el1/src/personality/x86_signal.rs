@@ -1,7 +1,6 @@
 //! x86_64 signal frame setup and restoration for in-guest Linux personality.
-use carrick_guest_arch::{
-    ReturnKind, SignalBackend, SignalFrameParams, UserFlags, UserReturn, UserVa,
-};
+use carrick_guest_arch::{ReturnKind, UserFlags, UserReturn, UserVa};
+use carrick_personality_linux::signal::{SignalBackend, SignalFrameParams};
 
 use crate::isa::ArchError;
 use crate::isa::x86::X86Backend;

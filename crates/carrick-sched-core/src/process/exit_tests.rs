@@ -127,6 +127,7 @@ fn exit_topology_owner_refuses_recycled_adopter_before_selecting_children() {
         fn exit_signal_state(&self, _: super::LinuxSignal) -> super::exit::ExitSignalState {
             super::exit::ExitSignalState {
                 disposition: super::exit::ExitSignalDisposition::Default,
+                default_disposition: super::exit::DefaultSignalDisposition::Ignore,
                 blocked: false,
             }
         }
@@ -266,16 +267,18 @@ fn exit_topology_owner_refuses_recycled_adopter_before_selecting_children() {
     assert!(
         super::exit::ExitSignalState {
             disposition: super::exit::ExitSignalDisposition::Default,
+            default_disposition: super::exit::DefaultSignalDisposition::Ignore,
             blocked: true
         }
-        .needs_notification(super::LinuxSignal::SIGCHLD)
+        .needs_notification()
     );
     assert!(
         !super::exit::ExitSignalState {
             disposition: super::exit::ExitSignalDisposition::Ignore,
+            default_disposition: super::exit::DefaultSignalDisposition::Ignore,
             blocked: true
         }
-        .needs_notification(super::LinuxSignal::SIGCHLD)
+        .needs_notification()
     );
 
     let stale = TaskKey {

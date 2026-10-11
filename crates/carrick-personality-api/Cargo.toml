@@ -1,0 +1,16 @@
+[package]
+name = "carrick-personality-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Neutral operating system personality API and re-exports for Carrick."
+
+[dependencies]
+carrick-core = { path = "../carrick-core" }
+carrick-core-abi = { path = "../carrick-core-abi" }
+carrick-guest-arch = { path = "../carrick-guest-arch" }
+carrick-sched-core = { path = "../carrick-sched-core" }
+
+[lints]
+workspace = true

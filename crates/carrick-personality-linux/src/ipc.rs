@@ -4,6 +4,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::time::Duration;
 
+pub mod namespace;
+
 use crate::abi::entry::SyscallResult;
 use crate::lifecycle::UserCopy;
 use carrick_guest_arch::UserVa;
