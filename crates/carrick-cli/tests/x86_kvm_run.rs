@@ -193,12 +193,13 @@ fn mounted_static_x86_elf_matches_native_anonymous_memory() {
     assert_eq!(
         witness["physical_crossing_families"],
         serde_json::json!([
-            { "family": "owner_grant", "count": 2 }
+            { "family": "owner_grant", "count": 2 },
+            { "family": "root_exit", "count": 1 }
         ])
     );
     assert_eq!(
-        witness["host_forwards"], 2,
-        "only write and exit cross host dispatch"
+        witness["host_forwards"], 1,
+        "only write crosses host dispatch"
     );
     assert!(
         witness["guest_refusal_families"]
@@ -230,10 +231,11 @@ fn mounted_static_x86_adjacent_anonymous_memory_keeps_existing_leaf() {
     assert_eq!(
         witness["physical_crossing_families"],
         serde_json::json!([
-            { "family": "owner_grant", "count": 4 }
+            { "family": "owner_grant", "count": 4 },
+            { "family": "root_exit", "count": 1 }
         ])
     );
-    assert_eq!(witness["host_forwards"], 2);
+    assert_eq!(witness["host_forwards"], 1);
     assert_eq!(witness["portal_exits"], 6);
 }
 
