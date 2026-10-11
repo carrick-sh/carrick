@@ -1642,6 +1642,33 @@ mod tests {
 
         let mut records = Box::new(AlignedPage([0; 4096]));
         let record_ipa = 0x2000_0000;
+        let mut residency = Box::<carrick_el1_abi::FrameGrantResidencyTable>::new_uninit();
+        // SAFETY: Box provides the ABI table's alignment and complete writable
+        // storage; initialization avoids a large stack temporary.
+        unsafe {
+            carrick_el1_abi::FrameGrantResidencyTable::init_in_place(residency.as_mut_ptr());
+        }
+        let residency = unsafe { residency.assume_init() };
+        custody
+            .publish_stage2_record_using(
+                crate::trap::CarrierStage2RecordSpec {
+                    vm_generation,
+                    ipa: carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_BASE,
+                    len: core::mem::size_of::<carrick_el1_abi::FrameGrantResidencyTable>(),
+                    host_addr: (&*residency as *const carrick_el1_abi::FrameGrantResidencyTable)
+                        as usize,
+                    mapped: true,
+                    backend_map_installed: true,
+                    release_ipa: false,
+                    perms: 3,
+                    logical_owner: Some(crate::trap::CarrierLogicalOwner {
+                        id: 98,
+                        generation: 83,
+                    }),
+                },
+                || 0,
+            )
+            .unwrap();
         let mut tables: Vec<_> = (0..8).map(|_| Box::new(AlignedPage([0; 4096]))).collect();
         let mut parent_tables: Vec<_> = (0..4).map(|_| Box::new(AlignedPage([0; 4096]))).collect();
         let mut data: Vec<_> = (0..4).map(|_| Box::new(AlignedPage([0; 4096]))).collect();
@@ -1835,6 +1862,19 @@ mod tests {
         assert_eq!(child_row.frame, frame);
         assert_ne!(child_row.mapping, mapping);
         assert_eq!(child_row.generation.raw(), 1);
+        let child_page = residency
+            .lookup(child.mm.raw().get(), 0x4000)
+            .expect("fork commit must publish the child's inherited residency before entry");
+        assert_eq!(child_page.expected_ipa, 0x50000);
+        assert_eq!(child_page.identity.frame_id, child_row.frame.raw());
+        assert_eq!(child_page.identity.mapping_id, child_row.mapping.raw());
+        assert_eq!(child_page.identity.owner_generation, 73);
+        assert_eq!(
+            child_page.identity.inventory_revision,
+            child_rows.revision.get()
+        );
+        assert!(residency.is_guest_committed(child.mm.raw().get(), 0x4000));
+        assert!(residency.is_guest_committed(execution.context.mm.raw().get(), 0x4000));
         assert_eq!(
             source
                 .bind(child.into())

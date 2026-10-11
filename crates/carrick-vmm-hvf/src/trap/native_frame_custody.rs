@@ -120,16 +120,113 @@ pub(crate) fn selected_row(
     Ok(row)
 }
 
+struct InheritedResidencyPage {
+    va: u64,
+    physical: FrameGpa,
+    source: PhysicalMappingRow,
+    source_record: super::CarrierStage2RecordIdentity,
+    resident: bool,
+}
+
 pub(crate) struct NativeInheritedFramePublication {
     context: AddressContext<RootGpa>,
+    parent: AddressContext<RootGpa>,
+    parent_revision: NonZeroU64,
     frames: NativeRootFrameSnapshot,
+    child_mappings: BTreeMap<carrick_hal::MappingId, carrick_hal::MappingId>,
+    residency: Vec<InheritedResidencyPage>,
     receipt: UnpublishedFrameInventoryApply<dyn FrameCowAuthority>,
 }
 impl NativeInheritedFramePublication {
     pub(crate) fn publish(
         self,
         stock: &mut ForkStockHostCustody,
+        custody: &CarrierVmCustody,
     ) -> Result<(), ForkStockServiceError> {
+        let table_identity = custody
+            .stage2_record_covering(
+                carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_BASE,
+                core::mem::size_of::<carrick_el1_abi::FrameGrantResidencyTable>(),
+            )
+            .ok_or(ForkStockServiceError::MemoryAccessFailed)?;
+        // Keep the exact physical ABI record and selected source incarnations
+        // live through atomic residency publication. No inventory operation
+        // or descriptor write executes while this lock is held.
+        let state = custody.state.lock();
+        let record = state
+            .stage2_records
+            .get(&table_identity.record_id)
+            .filter(|record| {
+                CarrierVmCustody::stage2_identity_mismatch(record, table_identity).is_none()
+                    && record.snapshot.mapped
+            })
+            .ok_or(ForkStockServiceError::StaleExecution)?;
+        let offset =
+            usize::try_from(carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_BASE - record.snapshot.ipa)
+                .map_err(|_| ForkStockServiceError::InvalidRecord)?;
+        let host = record
+            .snapshot
+            .host_addr
+            .checked_add(offset)
+            .filter(|host| {
+                *host != 0
+                    && host.is_multiple_of(core::mem::align_of::<
+                        carrick_el1_abi::FrameGrantResidencyTable,
+                    >())
+            })
+            .ok_or(ForkStockServiceError::InvalidRecord)?;
+        // SAFETY: this is the initialized residency ABI in the carrier's
+        // retained kernel region. Exact record coverage and alignment were
+        // checked; the state lock excludes retirement throughout these calls.
+        let table = unsafe { &*(host as *const carrick_el1_abi::FrameGrantResidencyTable) };
+        for page in &self.residency {
+            let source = state
+                .stage2_records
+                .get(&page.source_record.record_id)
+                .filter(|record| {
+                    CarrierVmCustody::stage2_identity_mismatch(record, page.source_record).is_none()
+                        && record.snapshot.mapped
+                })
+                .ok_or(ForkStockServiceError::StaleExecution)?;
+            let owner = source
+                .snapshot
+                .logical_owner
+                .filter(|owner| owner.generation != 0)
+                .ok_or(ForkStockServiceError::StaleExecution)?;
+            let parent = carrick_el1_abi::FrameGrantResidencyIdentity {
+                mm_key: self.parent.mm.raw().get(),
+                semantic_base: page.va,
+                physical_ipa: page.physical.raw(),
+                len: 4096,
+                frame_id: page.source.frame.raw(),
+                mapping_id: page.source.mapping.raw(),
+                owner_generation: owner.generation,
+                inventory_revision: self.parent_revision.get(),
+            };
+            if let Some(existing) = table.lookup(parent.mm_key, page.va) {
+                if existing.expected_ipa != parent.physical_ipa
+                    || existing.identity.frame_id != parent.frame_id
+                    || existing.identity.mapping_id != parent.mapping_id
+                    || existing.identity.owner_generation != parent.owner_generation
+                {
+                    return Err(ForkStockServiceError::StaleExecution);
+                }
+            } else {
+                publish_residency_page(table, parent, page.resident)?;
+            }
+            let child = carrick_el1_abi::FrameGrantResidencyIdentity {
+                mm_key: self.context.mm.raw().get(),
+                mapping_id: self
+                    .child_mappings
+                    .get(&page.source.mapping)
+                    .ok_or(ForkStockServiceError::InvalidRecord)?
+                    .raw(),
+                inventory_revision: self.frames.revision.get(),
+                ..parent
+            };
+            publish_residency_page(table, child, page.resident)?;
+        }
+        drop(state);
         stock.publish_child_frame_snapshot(self.context, self.frames)
     }
     pub(crate) fn rollback(&mut self) -> Result<(), ForkStockServiceError> {
@@ -137,6 +234,24 @@ impl NativeInheritedFramePublication {
             .rollback()
             .map_err(|_| ForkStockServiceError::MemoryAccessFailed)
     }
+}
+
+fn publish_residency_page(
+    table: &carrick_el1_abi::FrameGrantResidencyTable,
+    identity: carrick_el1_abi::FrameGrantResidencyIdentity,
+    resident: bool,
+) -> Result<(), ForkStockServiceError> {
+    table
+        .publish(identity)
+        .ok_or(ForkStockServiceError::MemoryAccessFailed)?;
+    let page = table
+        .lookup(identity.mm_key, identity.semantic_base)
+        .filter(|page| page.identity == identity && page.expected_ipa == identity.physical_ipa)
+        .ok_or(ForkStockServiceError::MemoryAccessFailed)?;
+    if resident && !table.record_commit(page) {
+        return Err(ForkStockServiceError::MemoryAccessFailed);
+    }
+    Ok(())
 }
 
 /// Stage aliases before accepting fork settlement. The stopped parent retains
@@ -190,6 +305,7 @@ pub(crate) fn stage_native_child_frames(
     let words = NativeRootWords { custody };
     let mut rows = BTreeMap::new();
     let mut pages = BTreeSet::new();
+    let mut residency = Vec::new();
     for index in 0..count {
         let va = records
             .raw()
@@ -248,6 +364,17 @@ pub(crate) fn stage_native_child_frames(
             {
                 return Err(ForkStockServiceError::InvalidRecord);
             }
+            let source_record = custody
+                .stage2_record_covering(physical.raw(), 4096)
+                .filter(|identity| identity.logical_owner.is_some())
+                .ok_or(ForkStockServiceError::MemoryAccessFailed)?;
+            residency.push(InheritedResidencyPage {
+                va: va + offset,
+                physical,
+                source: row,
+                source_record,
+                resident: child_leaf & 1 != 0,
+            });
             rows.insert(row.mapping, row);
         }
     }
@@ -264,6 +391,7 @@ pub(crate) fn stage_native_child_frames(
     let transaction = reservation.transaction();
     let generation = carrick_hal::MappingGeneration::from_backend_counter(NonZeroU64::MIN);
     let mut child_rows = Vec::with_capacity(rows.len());
+    let mut child_mappings = BTreeMap::new();
     for row in rows.into_values() {
         let mapping = reservation
             .claim_mapping()
@@ -286,6 +414,7 @@ pub(crate) fn stage_native_child_frames(
                 generation,
             })
             .map_err(|_| ForkStockServiceError::MemoryAccessFailed)?;
+        child_mappings.insert(row.mapping, mapping);
         child_rows.push(PhysicalMappingRow {
             mapping,
             generation,
@@ -298,6 +427,10 @@ pub(crate) fn stage_native_child_frames(
         NonZeroU64::new(receipt.revision()).ok_or(ForkStockServiceError::InvalidRecord)?;
     Ok(Some(NativeInheritedFramePublication {
         context: child,
+        parent: execution.context,
+        parent_revision: parent_frames.revision,
+        child_mappings,
+        residency,
         frames: NativeRootFrameSnapshot {
             owner: child.into(),
             revision,
