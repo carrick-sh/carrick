@@ -470,6 +470,18 @@ runtime maintenance need their own signed adoption evidence.
   just test-embed el1_fork_cow_resolves_in_guest
   ```
 
+#### Step 5 narrowed signed contract (2026-10-11)
+
+PR #186 proves native fork and guest COW with a child that only reads and
+writes its inherited anonymous mapping, then exits in-guest with a status.
+The parent waits under the embed harness deadline, checks the child status,
+and verifies that every word of its own mapping remains unchanged. The
+fixture makes no timer, signal, pipe, thread or exec call in the child.
+The signed witness retains 20 forks at 16, 64 and 256 pages, the carrier
+COW ledger, fault and frame accounting, exit slope, distinct run IDs and
+zero-survivor scoped cleanup. Native-child timers, signals and exec, including
+the TLB-fork and clone-storm controls, are deferred to carrick#217.
+
 #### Step 5 signed checkpoint (2026-10-09; incomplete)
 
 At `c67964b7bfed262dec92a0910ccea6863497d618`, the focused signed

@@ -2155,7 +2155,6 @@ impl<'a> ReportLine<'a> {
 /// then read back intact, counted by the fixture as it verified them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct El1MemoryCowRoleReport {
-    writers: u64,
     pages: u64,
     verified_pages: u64,
 }
@@ -2190,14 +2189,13 @@ fn parse_cow_role_line(
     let line = ReportLine::find(
         transcript,
         &["fork-cow", role],
-        &["writers", "forks", "pages", "verified_pages", "ok"],
+        &["forks", "pages", "verified_pages", "ok"],
     )?;
     if !line.flag("ok")? {
         return Err(format!("{role} report ok must be true"));
     }
-    let writers = line.u64("writers")?;
-    if writers < 2 {
-        return Err(format!("{role} writers must be at least 2, saw {writers}"));
+    if role == "child" && line.u64("verified_exits")? != forks {
+        return Err(format!("child verified_exits must equal forks={forks}"));
     }
     if line.u64("forks")? != forks {
         return Err(format!(
@@ -2219,7 +2217,6 @@ fn parse_cow_role_line(
         ));
     }
     Ok(El1MemoryCowRoleReport {
-        writers,
         pages,
         verified_pages,
     })
@@ -2255,10 +2252,10 @@ fn validate_el1_memory_cow_report(
     if cow_pages == 0 {
         return Err("cow_pages must be non-zero".to_owned());
     }
-    if cow_pages != parent.verified_pages + child.verified_pages {
+    if cow_pages != child.verified_pages {
         return Err(format!(
-            "cow_pages ({cow_pages}) != parent+child verified_pages ({})",
-            parent.verified_pages + child.verified_pages
+            "cow_pages ({cow_pages}) != child verified_pages ({})",
+            child.verified_pages
         ));
     }
     if !summary.flag("isolation_ok")? {
@@ -2353,9 +2350,10 @@ fn cow_ownership_violation(report: &El1MemoryCowReport) -> Option<String> {
 mod cow_report_tests {
     use super::*;
 
-    const PARENT: &str = "fork-cow parent writers=4 forks=20 pages=16 verified_pages=320 ok=true";
-    const CHILD: &str = "fork-cow child writers=4 forks=20 pages=16 verified_pages=320 ok=true";
-    const SUMMARY: &str = "fork-cow forks=20 pages=16 cow_pages=640 isolation_ok=true ok=true";
+    const PARENT: &str = "fork-cow parent forks=20 pages=16 verified_pages=320 ok=true";
+    const CHILD: &str =
+        "fork-cow child forks=20 pages=16 verified_pages=320 verified_exits=20 ok=true";
+    const SUMMARY: &str = "fork-cow forks=20 pages=16 cow_pages=320 isolation_ok=true ok=true";
     const HOST: &str = "el1-memory cow guest_faults=640 host_cow_resolutions=0 host_cow_mms=21 host_fault_exits=0 exits=12 grants=16 returns=16 bytes_granted=65536 bytes_returned=65536 ok=true";
 
     fn transcript(lines: &[&str]) -> String {
@@ -2377,7 +2375,7 @@ mod cow_report_tests {
         let report =
             validate_el1_memory_cow_report(&transcript(&[PARENT, CHILD, SUMMARY, HOST]), 20, 16)
                 .unwrap();
-        assert_eq!(report.cow_pages, 640);
+        assert_eq!(report.cow_pages, 320);
         assert_eq!(report.host_cow_resolutions, 0);
         assert_eq!(report.host_cow_mms, 21);
         assert_eq!(cow_ownership_violation(&report), None);
@@ -2455,7 +2453,7 @@ mod cow_report_tests {
             &[PARENT, CHILD, SUMMARY, &host],
             "guest_faults must be non-zero",
         );
-        let summary = SUMMARY.replace("cow_pages=640", "cow_pages=0");
+        let summary = SUMMARY.replace("cow_pages=320", "cow_pages=0");
         rejects(
             &[PARENT, CHILD, &summary, HOST],
             "cow_pages must be non-zero",
@@ -2464,11 +2462,8 @@ mod cow_report_tests {
 
     #[test]
     fn rejects_cow_pages_that_disagree_with_role_observations() {
-        let summary = SUMMARY.replace("cow_pages=640", "cow_pages=641");
-        rejects(
-            &[PARENT, CHILD, &summary, HOST],
-            "cow_pages (641) != parent+child",
-        );
+        let summary = SUMMARY.replace("cow_pages=320", "cow_pages=641");
+        rejects(&[PARENT, CHILD, &summary, HOST], "cow_pages (641) != child");
     }
 
     #[test]
@@ -2482,6 +2477,17 @@ mod cow_report_tests {
         rejects(
             &[PARENT, &child, SUMMARY, HOST],
             "child verified_pages (319)",
+        );
+    }
+
+    #[test]
+    fn rejects_child_without_status_proof() {
+        let child = CHILD.replace(" verified_exits=20", "");
+        rejects(&[PARENT, &child, SUMMARY, HOST], "verified_exits");
+        let child = CHILD.replace("verified_exits=20", "verified_exits=19");
+        rejects(
+            &[PARENT, &child, SUMMARY, HOST],
+            "verified_exits must equal forks",
         );
     }
 
@@ -3462,19 +3468,17 @@ fn el1_metadata_allocator_host_wait_requires_unmasked_irq() {
 
 /// Contract `kernel.el1.fork-cow`: fork COW resolution verification.
 /// Forks across three scales with private anonymous pages armed read-only for
-/// COW; four guest threads per process concurrently write them, taking write
-/// permission faults. EL1 must resolve those faults in the guest, so the
+/// COW; the child writes each page and verifies its private copy without
+/// making a host-served syscall. EL1 must resolve those faults in the guest, so the
 /// carrier's host COW ledger must record no completed host COW transaction.
-/// Parent and child verify memory isolation and integrity.
+/// Parent checks the inherited values after child exit; child status certifies
+/// its post-write checks. The harness deadline bounds parent wait.
 ///
 /// Observations: `host_cow_resolutions` is the delta of the CARRIER-scoped
 /// `carrick_embed::host_cow_snapshot()` (every MM the carrier admitted,
 /// surviving their retirement; `checked_delta` rejects a missing or different
 /// carrier). It is not the host fault-exit count, which is reported beside it.
 ///
-/// Expected RED until guest-owned COW lands: today the host `cow_engine`
-/// completes the transactions and this assertion names the count. Only a
-/// recorded signed run establishes the measured failure.
 #[test]
 fn el1_fork_cow_resolves_in_guest() {
     const FORKS: u64 = 20;

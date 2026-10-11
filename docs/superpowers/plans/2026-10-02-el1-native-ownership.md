@@ -322,6 +322,13 @@ measured result or a replacement threshold. It requires cancellation/kick/
 maintenance plumbing to disappear with owner cutover; the current report
 cannot prove that forecast.
 
+For PR #186 the child-status fork-COW witness is intentionally narrower:
+the child reads and writes private pages and exits in-guest, while the parent
+waits under the harness deadline and verifies its original mapping. No
+child timer, signal, pipe, thread or exec service is required. TLB-fork and
+clone-storm coverage of native-child signals, timers and exec belongs to
+carrick#217. The exit budgets and three page scales below remain unchanged.
+
 Formal acceptance stays unchanged: 20x16 <=144 exits (=7.2/fork including
 fixed cost), <=64 syscall exits/window (=3.2/fork), 16/64/256 scales and
 incremental slope <0.125 per added page in
