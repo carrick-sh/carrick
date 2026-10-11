@@ -3458,16 +3458,14 @@ impl Cpl0Carrier {
                 exec: false,
             });
         }
-        if initial_extent_bytes.is_some() {
-            maps.push(Pml4MapSpec {
-                va: X86_CPL0_REGION_BASE,
-                gpa: KERNEL_REGION_GPA,
-                len: carrick_el1_abi::EL1_REGION_SIZE,
-                user: false,
-                write: true,
-                exec: false,
-            });
-        }
+        maps.push(Pml4MapSpec {
+            va: X86_CPL0_REGION_BASE,
+            gpa: KERNEL_REGION_GPA,
+            len: carrick_el1_abi::EL1_REGION_SIZE,
+            user: false,
+            write: true,
+            exec: false,
+        });
 
         for (index, program) in programs.iter().enumerate() {
             if program.is_empty() {
@@ -3768,23 +3766,19 @@ impl Cpl0Carrier {
                 .map_err(|reason| fail(format!("fixture private copy branch: {reason:?}")))?;
             }
         }
-        let kernel_region = if initial_extent_bytes.is_some() {
-            let identity = backing_identity(&*frame_inventory)?;
-            let extent = BackingExtent::private(
-                FrameGpa::new(KERNEL_REGION_GPA),
-                carrick_el1_abi::EL1_REGION_SIZE as usize,
-            )
+        let identity = backing_identity(&*frame_inventory)?;
+        let extent = BackingExtent::private(
+            FrameGpa::new(KERNEL_REGION_GPA),
+            carrick_el1_abi::EL1_REGION_SIZE as usize,
+        )
+        .map_err(|e| fail(e.to_string()))?;
+        let handles = memory
+            .install(&[PreparedBacking {
+                extent: Arc::new(extent),
+                identity,
+            }])
             .map_err(|e| fail(e.to_string()))?;
-            let handles = memory
-                .install(&[PreparedBacking {
-                    extent: Arc::new(extent),
-                    identity,
-                }])
-                .map_err(|e| fail(e.to_string()))?;
-            Some(handles[0])
-        } else {
-            None
-        };
+        let kernel_region = Some(handles[0]);
         let initial_extent = if let Some(len) = initial_extent_bytes {
             let identity = backing_identity(&*frame_inventory)?;
             let extent = BackingExtent::private(FrameGpa::new(INITIAL_EXTENT_GPA), len)
@@ -3799,11 +3793,9 @@ impl Cpl0Carrier {
         } else {
             None
         };
-        if kernel_region.is_some() {
-            memory
-                .initialize_fault_records(FrameGpa::new(KERNEL_REGION_GPA))
-                .map_err(|error| fail(error.to_string()))?;
-        }
+        memory
+            .initialize_fault_records(FrameGpa::new(KERNEL_REGION_GPA))
+            .map_err(|error| fail(error.to_string()))?;
         let machine = CarrierMachine::from_memory(memory, 2).map_err(|e| fail(e.to_string()))?;
         let (cpus, vm) = machine.into_parts();
         let [mut a, mut b]: [KvmVcpu; 2] =
