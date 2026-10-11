@@ -78,23 +78,27 @@ ASSEMBLY_BOUNDARIES = frozenset(
         PurePosixPath("crates/carrick-el1/src/isa/x86/mmu.rs"),
         PurePosixPath("crates/carrick-el1/src/isa/x86/transport.rs"),
         PurePosixPath("crates/carrick-el1/src/isa/x86/user_access.rs"),
-        # Reviewed x86 CPL0 hardware boundary: entry/return, port I/O and halt; no host operation.
-        PurePosixPath("crates/carrick-x86-cpl0/src/entry.rs"),
-        # Native IRQ entry saves registers and xstate, validates the local
-        # xAPIC vector, then IRETs or uses the declared guest fatal port.
-        PurePosixPath("crates/carrick-x86-cpl0/src/native_irq.rs"),
-        # CPL0 initial-image IRET and the declared KVM carrier completion
-        # port execute only in the guest; no host syscall or other port.
-        PurePosixPath("crates/carrick-x86-cpl0/src/initial_boot.rs"),
+        # Carrier common entry and return: saves/restores state, reads CR2/CR3,
+        # issues privileged doorbells and halts; purely guest CPL0 CPU effects.
+        PurePosixPath("crates/carrick-x86-carrier/src/entry.rs"),
+        # CPL0 initial boot trampoline: IRET to EL0 and runner-ready completion
+        # port notification; runs strictly inside guest CPL0 before execution starts.
+        PurePosixPath("crates/carrick-x86-carrier/src/initial_boot.rs"),
+        # Carrier FS/GS base MSR programming (RDMSR/WRMSR) for context switches.
+        PurePosixPath("crates/carrick-x86-carrier/src/native_execution.rs"),
+        # Native IRQ entry assembly stubs: saves/restores GPR and XSAVE state,
+        # handles SWAPGS and IRET; handles vector without host operations.
+        PurePosixPath("crates/carrick-x86-carrier/src/native_irq.rs"),
+        # Root exit notification port I/O to publish termination to KVM carrier.
+        PurePosixPath("crates/carrick-x86-cpl0/src/linux_personality.rs"),
+        # Fixture error reporting: issues declared fatal port on invariant failure.
+        PurePosixPath("crates/carrick-x86-cpl0/src/fixture_personality.rs"),
         # Native execution reads guest FS/GS MSRs and sleeps under the shared
         # scheduler's queue admission; neither instruction is a host crossing.
         PurePosixPath("crates/carrick-x86-cpl0/src/native_execution.rs"),
         # Two declared fork-stock port crossings carry typed request/settlement
         # records under stopped carrier custody, with graph/MM guards released.
         PurePosixPath("crates/carrick-x86-cpl0/src/native_process.rs"),
-        # CPL0-only native IRQ/IRET, XSAVE, FS/GS MSRs, CR3 and IF/HLT
-        # leaves. Their target_os=none guards exclude all host execution.
-        PurePosixPath("crates/carrick-x86-cpl0/src/native_irq.rs"),
         PurePosixPath("crates/carrick-x86-cpl0/src/progress.rs"),
         PurePosixPath("crates/carrick-x86/src/cpl0_scheduler.rs"),
         PurePosixPath("crates/carrick-x86/src/interrupts.rs"),

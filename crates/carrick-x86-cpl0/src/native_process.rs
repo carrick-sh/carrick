@@ -1,6 +1,6 @@
 // Machine custody for the sole shared native process owner. Physical OUTs
 // happen after guest MM editors and process admission guards are released.
-use super::{InitialWords, anonymous};
+use super::anonymous;
 use crate::rust_alloc::{boxed::Box, sync::Arc, vec::Vec};
 use carrick_core::mm::fork::{ForkCensus, ForkScratch, census_table};
 use carrick_core::mm::transaction::{MmPortal, OwnerVenue, SelectionVenues, TransferStep};
@@ -9,15 +9,16 @@ use carrick_el1::memory::reservations::{
 };
 use carrick_el1::personality::mm_portal::production::GuestMetadataPin;
 use carrick_el1::personality::mm_portal::{LinuxForkPolicy, NativeForkPortal, UnpublishedEl1Child};
-use carrick_el1::personality::retired_spaces::{RetiredSpace, RetiredSpaces};
 use carrick_el1::personality::native_process_runtime::{
     NativeForkPreparation, NativeLifecycleResources, NativeProcessError, NativeProcessRegistry,
     NativeProcessRuntime, NativeProcessService,
 };
+use carrick_el1::personality::retired_spaces::{RetiredSpace, RetiredSpaces};
 use carrick_el1_abi::{
-    BornInZoneSource, CurrentTask, KernelFaultVenues, Lifecycle, MmPortalSlots, PortalForkCustody,
-    PortalOperation, ReservationMm, ThreadControlSlot, ThreadLifecyclePage, FORK_STOCK_PORT, NATIVE_CHILD_RETIRE_PORT, NativeChildRetire,
-    ForkStockExchange, ForkStockLoan, ForkStockRequest, ForkStockSettlement,
+    BornInZoneSource, CurrentTask, FORK_STOCK_PORT, ForkStockExchange, ForkStockLoan,
+    ForkStockRequest, ForkStockSettlement, KernelFaultVenues, Lifecycle, MmPortalSlots,
+    NATIVE_CHILD_RETIRE_PORT, NativeChildRetire, PortalForkCustody, PortalOperation, ReservationMm,
+    ThreadControlSlot, ThreadLifecyclePage,
 };
 use carrick_guest_arch::{
     AddressContext, ContextGeneration, FrameGpa, KernelVa, MmGeneration, RootGpa, UserVa,
@@ -26,6 +27,7 @@ use carrick_mmu_core::x86::owner_mmu::X86Mmu;
 use carrick_personality_linux::lifecycle::LinuxWaitStatus;
 use carrick_personality_linux::mm::{LinuxReservationPolicy, MmErrorLinux};
 use carrick_sched_core::{ParkedContextWords, SlotId, WakeEffects, ZoneTables};
+use carrick_x86_carrier::entry::InitialWords;
 use core::{marker::PhantomData, num::NonZeroU64, sync::atomic::Ordering};
 
 pub(super) type Mm = AddressContext<RootGpa>;
@@ -54,7 +56,8 @@ pub(super) fn runtime(
     source: BornInZoneSource<'static, ParkedContextWords>,
     task: &'static CurrentTask,
 ) -> Result<(Arc<Runtime>, Mm), NativeProcessError> {
-    let root = carrick_el1::isa::x86::hardware_live_root().map_err(|_| NativeProcessError::Stale)?;
+    let root =
+        carrick_el1::isa::x86::hardware_live_root().map_err(|_| NativeProcessError::Stale)?;
     let mm = MmGeneration::new(
         NonZeroU64::new(task.mm.key.load(Ordering::Acquire)).ok_or(NativeProcessError::Stale)?,
     );
@@ -102,7 +105,8 @@ pub(super) fn admit_root(
     match page.live() {
         1 => {}
         2 => {
-            page.release_live(1).map_err(|_| NativeProcessError::Stale)?;
+            page.release_live(1)
+                .map_err(|_| NativeProcessError::Stale)?;
         }
         _ => return Err(NativeProcessError::Invalid),
     }
@@ -112,9 +116,9 @@ pub(super) fn admit_root(
     REGISTRY.register_root(Arc::new(owner), source, task, address)?;
     let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
     carrick_el1::personality::file_table::admit_stdio(
-        super::fd_map(),
-        &super::OPEN_TABLE,
-        &super::OBJECT_TABLE,
+        crate::linux_personality::fd_map(),
+        &crate::linux_personality::OPEN_TABLE,
+        &crate::linux_personality::OBJECT_TABLE,
         file_table,
         [true, true, true],
     );
@@ -174,7 +178,8 @@ fn portal() -> Result<Portal, NativeProcessError> {
     let layout = carrick_el1::isa::x86_kernel_layout();
     // SAFETY: the boot owner retains the one compact native portal region.
     let slots = unsafe { &*(layout.portal.raw() as *const MmPortalSlots) };
-    let zone = super::native_execution::source(carrick_guest_arch::SlotId::new(0)).zone;
+    let zone =
+        carrick_x86_carrier::native_execution::source(carrick_guest_arch::SlotId::new(0)).zone;
     Ok(Portal {
         backend: PhantomData,
         carrier: slots.carrier().ok_or(NativeProcessError::Stale)?,
@@ -532,7 +537,12 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
     fn settle_mm(&mut self, born: Box<Born>) -> Result<(), (NativeProcessError, Box<Born>)> {
         settle(born, self.worker())
     }
-    fn copy_status(&mut self, mm: &Mm, address: UserVa, status: LinuxWaitStatus) -> Result<(), NativeProcessError> {
+    fn copy_status(
+        &mut self,
+        mm: &Mm,
+        address: UserVa,
+        status: LinuxWaitStatus,
+    ) -> Result<(), NativeProcessError> {
         self.copy_signal_bytes(mm, address, &status.raw().to_ne_bytes())
     }
     fn copy_signal_bytes(
@@ -595,7 +605,10 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
                 )
                 .map_err(error)?;
             if pool.has_completions_for(mm.mm.raw().get()) {
-                super::cross_owner_grant(carrick_guest_arch::CpuId::new(self.worker()), address);
+                carrick_x86_carrier::entry::cross_owner_grant(
+                    carrick_guest_arch::CpuId::new(self.worker()),
+                    address,
+                );
             }
             match step {
                 TransferStep::CowSupply(window) => {
@@ -606,7 +619,10 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
                     {
                         return Err(NativeProcessError::Busy);
                     }
-                    super::cross_owner_grant(carrick_guest_arch::CpuId::new(self.worker()), address);
+                    carrick_x86_carrier::entry::cross_owner_grant(
+                        carrick_guest_arch::CpuId::new(self.worker()),
+                        address,
+                    );
                 }
                 TransferStep::Selected(selected) => {
                     let fence = owner
@@ -645,7 +661,10 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         core::mem::forget(p);
         fatal();
     }
-    fn quarantine_fork(&mut self, p: NativeForkPreparation<'static, Mm, Prepared, ParkedContextWords>) {
+    fn quarantine_fork(
+        &mut self,
+        p: NativeForkPreparation<'static, Mm, Prepared, ParkedContextWords>,
+    ) {
         core::mem::forget(p);
         fatal();
     }
@@ -655,7 +674,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
     }
     fn retire_mm(&mut self, mm: Mm) {
         // The runtime calls this only for a fork-born process's final exit.
-        let source = super::native_execution::source(self.slot);
+        let source = carrick_x86_carrier::native_execution::source(self.slot);
         // Fork stock is only ever loaned by a carrier that also published
         // its maintenance root; a child cannot exist without both.
         if mm.mm.raw().get() != self.task.mm.key.load(Ordering::Acquire)
@@ -700,7 +719,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         }
         // Absence is published only after CR3 left the retired root; the
         // host drains this MM's quarantine on a later stopped crossing.
-        if !super::native_execution::leave_space(source) {
+        if !carrick_x86_carrier::native_execution::leave_space(source) {
             fatal();
         }
         // The MM never runs again (its gate is closed and this CPU left its
@@ -722,25 +741,45 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         // retries them, as on the AArch64 owner.
         let _retry_at_next_drain = drain_retired_spaces(&owner, self.worker());
     }
-    fn copy_siginfo(&mut self, mm: &Self::Mm, address: UserVa, info: &carrick_abi::LinuxSiginfo) -> Result<(), NativeProcessError> {
+    fn copy_siginfo(
+        &mut self,
+        mm: &Self::Mm,
+        address: UserVa,
+        info: &carrick_abi::LinuxSiginfo,
+    ) -> Result<(), NativeProcessError> {
         // SAFETY: the canonical ABI record has a fully initialized wire image.
-        let bytes = unsafe { core::slice::from_raw_parts(info as *const _ as *const u8, core::mem::size_of_val(info)) };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(info as *const _ as *const u8, core::mem::size_of_val(info))
+        };
         self.copy_signal_bytes(mm, address, bytes)
     }
     fn wake_effects(&mut self, mut effects: WakeEffects) {
-        if effects.queued_own { effects.request_reschedule(self.slot); }
+        if effects.queued_own {
+            effects.request_reschedule(self.slot);
+        }
         deliver_wakes(effects);
     }
     fn child_file_table(&self, _parent_table: u64, issued: u64) -> u64 {
         issued
     }
-    fn fork_fd_table(&mut self, parent_table: u64, child_table: u64) -> Result<(), NativeProcessError> {
-        carrick_el1::personality::file_table::fork_fd_map(super::fd_map(), parent_table, child_table)
-            .then_some(())
-            .ok_or(NativeProcessError::Exhausted)
+    fn fork_fd_table(
+        &mut self,
+        parent_table: u64,
+        child_table: u64,
+    ) -> Result<(), NativeProcessError> {
+        carrick_el1::personality::file_table::fork_fd_map(
+            crate::linux_personality::fd_map(),
+            parent_table,
+            child_table,
+        )
+        .then_some(())
+        .ok_or(NativeProcessError::Exhausted)
     }
     fn retire_fd_table(&mut self, table: u64) {
-        carrick_el1::personality::file_table::retire_fd_map(super::fd_map(), table);
+        carrick_el1::personality::file_table::retire_fd_map(
+            crate::linux_personality::fd_map(),
+            table,
+        );
     }
 }
 
@@ -791,5 +830,5 @@ fn settle(born: Box<Born>, worker: u32) -> Result<(), (NativeProcessError, Box<B
     Ok(())
 }
 fn fatal() -> ! {
-    super::initial_boot::fatal_boot()
+    carrick_x86_carrier::entry::fatal_boot()
 }

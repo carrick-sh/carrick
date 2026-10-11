@@ -448,7 +448,7 @@ impl NativeRootExit {
             || binding.mm.raw() == 0
             || binding.thread_generation.raw() == 0
             || status.raw() < 0
-            || !Self::terminal_status(status.raw() as u64)
+            || !Self::terminal_status(status.raw() as u32 as u64)
         {
             return None;
         }
@@ -459,7 +459,7 @@ impl NativeRootExit {
                 binding.generation.raw(),
                 binding.mm.raw(),
                 binding.thread_generation.raw(),
-                status.raw() as u64,
+                status.raw() as u32 as u64,
                 0,
                 0,
             ],

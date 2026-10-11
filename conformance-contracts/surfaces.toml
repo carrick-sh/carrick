@@ -745,7 +745,7 @@ contracts = ["x86.mm.initial-image"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-kvm/tests/cpl0_initial_mm.rs"
-contracts = ["x86.mm.initial-image"]
+contracts = ["x86.mm.initial-image", "core.entry.completion"]
 
 # Fixture-only injection ownership for executor activation and rollback tests.
 [[surfaces]]
@@ -896,6 +896,34 @@ contracts = ["core.entry.completion", "kernel.el1.files", "kernel.el1.inotify", 
 
 [[surfaces]]
 path = "crates/carrick-x86-cpl0/src/lib.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-x86-carrier/src/lib.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-x86-carrier/src/entry.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-x86-carrier/src/native_execution.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-x86-carrier/src/personality.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-x86-carrier/src/table_span.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-x86-cpl0/src/linux_personality.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-x86-cpl0/src/fixture_personality.rs"
 contracts = ["core.entry.completion"]
 
 [[surfaces]]

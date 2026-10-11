@@ -15,6 +15,7 @@ carrick-personality-linux = { path = "../carrick-personality-linux" }
 carrick-core = { path = "../carrick-core" }
 carrick-mmu-core = { path = "../carrick-mmu-core" }
 carrick-syscall-abi = { path = "../carrick-syscall-abi" }
+carrick-x86-carrier = { path = "../carrick-x86-carrier" }
 
 [[bin]]
 name = "carrick-x86-cpl0"
