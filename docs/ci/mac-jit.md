@@ -195,6 +195,16 @@ receipt fails closed and names this reseed command.
   `mac-quiesce` under the hook's flock. If no job started, further job starts
   are refused (and killed), the registration is removed, and `mac-run-once`
   kills the runner's session.
+- **Launchd agents.** launchd starts per-user Apple agents for any uid
+  with processes and respawns them when killed (observed: `/usr/sbin/distnoted
+  agent`, ppid 1, under `carrick-ci`), so "no runner-account process left"
+  is unattainable on macOS. The reap exempts only processes whose real
+  executable path (kernel `proc_pidpath`, never argv) is exactly on
+  `EXEMPT_AGENTS`, whose parent is launchd, and whose binary is root-owned
+  and not writable; every other `carrick-ci` process is still SIGKILLed and
+  any survivor still refuses the launch. A job cannot qualify by renaming
+  its argv or copying a binary to a look-alike path. Booting out the
+  account's launchd user domain is not relied on.
 - **Per-job reset.** Before every launch `mac-run-once` kills every
   `carrick-ci` process, then deletes and recreates the job home from the
   skeleton and empties `_work` and `_diag` (symlinks are removed, never
