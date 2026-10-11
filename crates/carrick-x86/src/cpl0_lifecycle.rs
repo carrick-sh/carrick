@@ -815,7 +815,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         pid: carrick_personality_linux::lifecycle::ProcessWaitPid,
         status: UserVa,
         options: carrick_syscall_abi::LinuxWaitOptions,
-        _rusage: UserVa,
+        rusage: UserVa,
     ) -> Option<LifecycleOutcome> {
         use carrick_syscall_abi::LinuxWaitOptions;
         if !crate::process::process_mode()
@@ -829,9 +829,6 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
                 work: false,
             })
         };
-        if _rusage.raw() != 0 {
-            return returned(carrick_syscall_abi::LinuxErrno::new(38).guest_retval());
-        }
         if options.bits() & !LinuxWaitOptions::WAIT4_SUPPORTED.bits() != 0 {
             return returned(carrick_syscall_abi::LINUX_EINVAL.guest_retval()); // EINVAL
         }
@@ -854,9 +851,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         if code.is_none() && options.contains(LinuxWaitOptions::WNOHANG) {
             return returned(0);
         }
-        let Some(outputs) =
-            crate::process::prepare_wait_outputs(self, status, UserVa::new(self.args[3]))
-        else {
+        let Some(outputs) = crate::process::prepare_wait_outputs(self, status, rusage) else {
             return returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval());
         };
         if let Some(code) = code {
