@@ -25,17 +25,21 @@ impl From<ArchError> for carrick_guest_arch::EntryDecodeError {
     }
 }
 
-pub const USER_CEILING: u64 = 0x0000_8000_0000_0000;
-
-/// A user operand must be wholly within the canonical lower half. The
-/// checked end also excludes wraparound into the supervisor address space.
-pub const fn lower_half_range(address: u64, len: u64) -> bool {
-    address < USER_CEILING
-        && match address.checked_add(len) {
-            Some(end) => end <= USER_CEILING,
-            None => false,
+impl From<ArchError> for carrick_guest_arch::ServiceError {
+    fn from(err: ArchError) -> Self {
+        match err {
+            ArchError::Fault => carrick_guest_arch::ServiceError::Fault,
+            ArchError::OutOfBounds => carrick_guest_arch::ServiceError::RangeOverflow,
+            ArchError::Unbound => carrick_guest_arch::ServiceError::Refused,
+            ArchError::InvalidFrame => carrick_guest_arch::ServiceError::Fault,
+            ArchError::InvalidWidth => carrick_guest_arch::ServiceError::Fault,
+            ArchError::InvalidContext => carrick_guest_arch::ServiceError::Fault,
+            ArchError::Busy => carrick_guest_arch::ServiceError::Refused,
         }
+    }
 }
+
+pub use carrick_guest_arch::{USER_CEILING, lower_half_range};
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl carrick_guest_arch::LayoutBackend for aarch64::Aarch64Backend {

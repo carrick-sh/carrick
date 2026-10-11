@@ -23,6 +23,8 @@ fn test_personality_decode_x86_snapshot() {
     // Map a valid stack page.
     let stack_va = 0x1000_8000u64;
     backend.map_page(stack_va, true /* readable */);
+    backend.write_u64(stack_va, 70);
+    backend.write_u64(stack_va + 8, 80);
 
     let frame = backend.create_frame(
         42,                       // syscall ordinal
@@ -38,7 +40,7 @@ fn test_personality_decode_x86_snapshot() {
         .expect("decode should succeed for valid stack");
 
     assert_eq!(decoded.ordinal, CallOrdinal::from_raw(42));
-    assert_eq!(decoded.args, [10, 20, 30, 40, 50, 60]);
+    assert_eq!(decoded.args, [10, 20, 30, 40, 50, 60, 70, 80]);
     assert_eq!(decoded.stack, UserVa::new(stack_va));
 }
 
@@ -50,6 +52,8 @@ fn test_personality_decode_aarch64_snapshot() {
     // Map a valid stack page.
     let stack_va = 0x2000_8000u64;
     backend.map_page(stack_va, true /* readable */);
+    backend.write_u64(stack_va, 7);
+    backend.write_u64(stack_va + 8, 8);
 
     let frame = backend.create_frame(
         93,                 // syscall ordinal (exit on AArch64)
@@ -65,7 +69,7 @@ fn test_personality_decode_aarch64_snapshot() {
         .expect("decode should succeed for valid AArch64 snapshot");
 
     assert_eq!(decoded.ordinal, CallOrdinal::from_raw(93));
-    assert_eq!(decoded.args, [1, 2, 3, 4, 5, 6]);
+    assert_eq!(decoded.args, [1, 2, 3, 4, 5, 6, 7, 8]);
     assert_eq!(decoded.stack, UserVa::new(stack_va));
 }
 
@@ -152,4 +156,33 @@ fn test_entry_decode_error_variants_and_user_stack_offset() {
     assert_ne!(busy, unbound);
     assert!(format!("{}", busy).contains("carrier"));
     assert!(format!("{}", unbound).contains("unbound"));
+}
+
+#[test]
+fn test_personality_decode_stack_copy_boundary_without_overread() {
+    let mut backend = ExampleEntryBackend::new();
+    let page_base = 0x1000_5000u64;
+    // Map only page_base, leaving page_base + 0x1000 unmapped.
+    backend.map_page(page_base, true /* readable */);
+
+    // Place 4 bytes at the very end of the page (offset 4092..4096).
+    backend.write_bytes(page_base + 4092, &[0xaa, 0xbb, 0xcc, 0xdd]);
+
+    // Stack pointer points 4 bytes before the end of the mapped page.
+    let frame = backend.create_frame(1, [0; 6], page_base + 4092);
+    let mut arch = Arch::new(backend);
+    let mut cx = CallContext::new(&mut arch, &frame);
+
+    // Copying 4 bytes must succeed because they are within the mapped page,
+    // and must not over-read into the unmapped next page.
+    let mut buf = [0u8; 4];
+    cx.user()
+        .copy_in(UserVa::new(page_base + 4092), &mut buf)
+        .expect("copy within mapped boundary must succeed without over-reading");
+    assert_eq!(buf, [0xaa, 0xbb, 0xcc, 0xdd]);
+
+    // Attempting to copy 5 bytes crosses into the unmapped page and must fault.
+    let mut buf5 = [0u8; 5];
+    let err = cx.user().copy_in(UserVa::new(page_base + 4092), &mut buf5);
+    assert_eq!(err, Err(carrick_core::personality::ServiceError::Fault));
 }
