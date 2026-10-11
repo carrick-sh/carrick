@@ -1,8 +1,6 @@
-//! Thin hardware witness: native context leaves around the existing shared
-//! scheduler's public claims/queues. No Linux wait or scheduling policy here.
-use crate::{interrupts, scheduler};
+use carrick_el1::isa::x86::context::scheduler::*;
+use carrick_el1::isa::x86::interrupts;
 use carrick_sched_core::{BoundedSpin, ParkedContextWords, SlotId, WakeRecord, Waker, ZoneTables};
-use scheduler::*;
 
 const SLOT: SlotId = SlotId::new(0);
 
@@ -83,7 +81,7 @@ fn stop(code: u64) -> ! {
     state().failure = code;
     unsafe { interrupts::hardware::arm_timer(None) };
     control(PROGRESS_DONE_PORT);
-    crate::kernel::halt()
+    carrick_x86_carrier::entry::halt()
 }
 
 fn install(task: &ContextBinding, maintenance: carrick_guest_arch::RootGpa) -> NativeContext {
@@ -209,7 +207,7 @@ extern "C" fn carrick_progress_interrupt(
     if state.turns as usize == PROGRESS_TURNS {
         unsafe { interrupts::hardware::arm_timer(None) };
         control(PROGRESS_DONE_PORT);
-        crate::kernel::halt();
+        carrick_x86_carrier::entry::halt();
     }
     // Shared FIFO/claims decide the next task; there is no x86 run queue.
     zone().requeue_preempted(SLOT, record);

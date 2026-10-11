@@ -56,25 +56,26 @@ rules:
         - /crates/carrick-el1/src/isa/x86/mmu.rs
         - /crates/carrick-el1/src/isa/x86/transport.rs
         - /crates/carrick-el1/src/isa/x86/user_access.rs
-        # Reviewed x86 CPL0 hardware boundary: entry/return, port I/O and halt; no host operation.
-        - /crates/carrick-x86-cpl0/src/entry.rs
-        # Native CPL0 IRQ gates save/restore GPR and XSAVE state, authenticate
-        # the xAPIC vector, then IRET or use the declared fatal port. These
-        # are guest CPU effects and cannot call a host operation.
-        - /crates/carrick-x86-cpl0/src/native_irq.rs
-        # CPL0 initial-image return uses IRET to enter EL0; the declared
-        # boot-completion port reports to the retained KVM carrier. No host
-        # syscall or undeclared port is reachable from this guest module.
-        - /crates/carrick-x86-cpl0/src/initial_boot.rs
+        # Carrier common entry and return: saves/restores state, reads CR2/CR3,
+        # issues privileged doorbells and halts; purely guest CPL0 CPU effects.
+        - /crates/carrick-x86-carrier/src/entry.rs
+        # CPL0 initial boot trampoline: IRET to EL0 and runner-ready completion
+        # port notification; runs strictly inside guest CPL0 before execution starts.
+        - /crates/carrick-x86-carrier/src/initial_boot.rs
+        # Carrier FS/GS base MSR programming (RDMSR/WRMSR) for context switches.
+        - /crates/carrick-x86-carrier/src/native_execution.rs
+        # Native IRQ entry assembly stubs: saves/restores GPR and XSAVE state,
+        # handles SWAPGS and IRET; handles vector without host operations.
+        - /crates/carrick-x86-carrier/src/native_irq.rs
+        # Root exit notification port I/O to publish termination to KVM carrier.
+        - /crates/carrick-x86-cpl0/src/linux_personality.rs
+        # Fixture error reporting: issues declared fatal port on invariant failure.
+        - /crates/carrick-x86-cpl0/src/fixture_personality.rs
         # Guest FS/GS RDMSR and STI/HLT under shared queue admission.
         - /crates/carrick-x86-cpl0/src/native_execution.rs
         # Two declared fork-stock port crossings use typed supervisor records;
         # stopped carrier authentication runs with graph/MM guards released.
         - /crates/carrick-x86-cpl0/src/native_process.rs
-        # Reviewed target_os=none CPL0 hardware leaves: native IRQ/IRET and
-        # XSAVE, FS/GS MSRs, CR3, IF/HLT, declared fixture control port I/O.
-        # No host instruction path or host semantic syscall dispatch.
-        - /crates/carrick-x86-cpl0/src/native_irq.rs
         - /crates/carrick-x86-cpl0/src/progress.rs
         - /crates/carrick-x86/src/cpl0_scheduler.rs
         - /crates/carrick-x86/src/interrupts.rs

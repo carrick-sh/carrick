@@ -327,6 +327,32 @@ fn production_user_page_fault_terminates_with_sigsegv_in_ring() {
     assert_eq!(exits, 2);
 }
 
+#[test]
+fn block_then_user_page_fault_terminates_with_sigsegv_in_ring() {
+    let elf = block_then_fault_elf();
+    let outcome = run_pool_fixture(&elf, 32);
+    assert!(outcome.fault_record.is_none(), "SIGSEGV stays in-ring");
+    let exits = outcome.run.traps;
+    assert_eq!(outcome.run.terminating_signal, Some(libc::SIGSEGV));
+    assert_eq!(
+        outcome.physical.user_fault_state(0).expect("fault custody"),
+        (1, 0xdead000, 6, 0x4000b0 + 17, 0)
+    );
+    assert_eq!(exits, 1);
+}
+
+fn block_then_fault_elf() -> Vec<u8> {
+    let mut elf = tiny_elf();
+    let mut code = vec![0xb8, 24, 0, 0, 0, 0x0f, 0x05, 0x48, 0xb8];
+    code.extend_from_slice(&0xdead000u64.to_le_bytes());
+    code.extend_from_slice(&[0xc6, 0x00, 1, 0x0f, 0x0b]);
+    elf.truncate(0xb0);
+    elf.extend_from_slice(&code);
+    let size = elf.len() as u64;
+    elf[96..104].copy_from_slice(&size.to_le_bytes());
+    elf
+}
+
 fn production_fault_elf() -> Vec<u8> {
     let mut elf = tiny_elf();
     let mut code = vec![

@@ -1,5 +1,17 @@
 #![cfg_attr(target_os = "none", no_std)]
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+extern crate alloc as rust_alloc;
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub mod anonymous;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub mod linux_personality;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub mod native_execution;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub mod native_process;
+
 use carrick_el1_abi::Action;
 
 /// The production CPL0 transport owed by a completed shared dispatch.

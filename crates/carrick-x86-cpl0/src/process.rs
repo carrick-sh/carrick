@@ -1,7 +1,8 @@
 // Guest-owned process MM custody for the stopped KVM lifecycle fixture. The
 // descriptor transaction is the shared generic fork owner; this module only
 // supplies the x86 physical window and the fixture's two admitted roots.
-use crate::kernel::{FORK_RESIDENCY_ADDRESS, InitialWords, SHARED_COW_POOL};
+use crate::fixture_personality::fixture_initial_words;
+use crate::fixture_personality::{FORK_RESIDENCY_ADDRESS, SHARED_COW_POOL};
 use carrick_core::mm::fork::{
     ForkChildRoot, ForkError, ForkParentRoot, Mapping, MappingInheritancePolicy, Policy,
 };
@@ -176,7 +177,7 @@ pub(crate) fn residency() -> Option<&'static FrameGrantResidencyTable> {
 }
 
 pub(super) fn admit_initial(
-    binding: &crate::adapter::CpuBinding,
+    binding: &carrick_el1::isa::x86::context::native::CpuBinding,
     stack_pointer: u64,
     root: u64,
 ) -> bool {
@@ -187,15 +188,15 @@ pub(super) fn admit_initial(
     {
         return false;
     }
-    let Some(slot) =
-        crate::adapter::checked_scheduler_slot(carrick_guest_arch::CpuId::new(binding.cpu_slot))
-    else {
+    let Some(slot) = carrick_el1::isa::x86::context::native::checked_scheduler_slot(
+        carrick_guest_arch::CpuId::new(binding.cpu_slot),
+    ) else {
         return false;
     };
     let layout = core::alloc::Layout::new::<FrameGrantResidencyTable>();
     // SAFETY: the guest allocator returns storage with the table's alignment
     // and size; ownership stays with this one stopped-carrier fixture.
-    let pointer = unsafe { crate::rust_alloc::alloc::alloc(layout) };
+    let pointer = unsafe { rust_alloc::alloc::alloc(layout) };
     if pointer.is_null() {
         return false;
     }
@@ -210,7 +211,7 @@ pub(super) fn admit_initial(
     };
     let stack_va = stack_pointer & !4095;
     let Ok(leaf) = translate_leaf(
-        &InitialWords::fixture(),
+        &fixture_initial_words(),
         root,
         UserVa::new(stack_va),
         Access::Read,
@@ -267,7 +268,7 @@ pub(crate) fn fork_mm(parent_root: RootGpa) -> Option<(RootGpa, GuestMmuPublicat
     // The fixture grants an unused physical extent, but its KVM RAM backing
     // is not an allocation contract until CPL0 zeroes every unlinked table.
     for pa in (CHILD_ROOT..PARENT_TABLE_BASE + PARENT_TABLE_BYTES).step_by(4096) {
-        crate::kernel::InitialFrames::zeroed(pa);
+        crate::fixture_personality::InitialFrames::zeroed(pa);
     }
     let one = NonZeroU64::MIN;
     let request = PortalForkRequest {
@@ -288,7 +289,7 @@ pub(crate) fn fork_mm(parent_root: RootGpa) -> Option<(RootGpa, GuestMmuPublicat
         mapping(STACK_BASE, STACK_TOP, ReservationProtection::READ_WRITE)?,
     ];
     let plan = carrick_el1::isa::x86::fork_mm::prepare_owner_fork(
-        &InitialWords::fixture(),
+        &fixture_initial_words(),
         request,
         parent_root,
         &mappings,
@@ -300,13 +301,13 @@ pub(crate) fn fork_mm(parent_root: RootGpa) -> Option<(RootGpa, GuestMmuPublicat
     // carrier before the guest publishes it; no host descriptor author runs.
     let handle = unsafe { El1MmHandle::from_admitted_owner(one, request.child_mm, one) };
     let mut child = plan
-        .publish(&InitialWords::fixture(), Parent, Child, handle)
+        .publish(&fixture_initial_words(), Parent, Child, handle)
         .ok()?;
     let completion = child.commit(Parent, Child).ok()?;
     let publication =
         GuestMmuPublication::from_x86_fork(parent_root.address().raw(), completion, parent_stores)
             .unwrap_or_else(|| {
-                crate::kernel::lifecycle_invariant_error(
+                crate::fixture_personality::lifecycle_invariant_error(
                     crate::lifecycle::LifecycleInvariant::ForkPublication,
                 )
             });
@@ -319,7 +320,7 @@ pub(crate) fn publish_child_stack(
     parent_root: RootGpa,
 ) -> bool {
     let Ok(leaf) = translate_leaf(
-        &InitialWords::fixture(),
+        &fixture_initial_words(),
         parent_root,
         UserVa::new(STACK_TOP - 4096),
         Access::Read,
@@ -372,7 +373,7 @@ pub(crate) fn publish_child_stack(
 
 pub(crate) fn child_root() -> RootGpa {
     RootGpa::page_aligned(FrameGpa::new(CHILD_ROOT)).unwrap_or_else(|| {
-        crate::kernel::lifecycle_invariant_error(
+        crate::fixture_personality::lifecycle_invariant_error(
             crate::lifecycle::LifecycleInvariant::ForkPublication,
         )
     })
@@ -402,7 +403,7 @@ pub(crate) struct PreparedWaitOutputs {
 impl PreparedWaitOutputs {
     pub(crate) fn complete(self, child: crate::lifecycle::ReapedChild) {
         if child.parent_mm().raw() != PARENT_MM {
-            crate::kernel::lifecycle_invariant_error(
+            crate::fixture_personality::lifecycle_invariant_error(
                 crate::lifecycle::LifecycleInvariant::ExitReap,
             );
         }
@@ -429,7 +430,7 @@ impl PreparedWaitOutputs {
 pub(crate) fn publish_wait_outputs(outputs: PreparedWaitOutputs) {
     let mut pending = WAIT_OUTPUTS.lock();
     if pending.is_some() {
-        crate::kernel::lifecycle_invariant_error(
+        crate::fixture_personality::lifecycle_invariant_error(
             crate::lifecycle::LifecycleInvariant::WaitPublication,
         );
     }
@@ -437,7 +438,9 @@ pub(crate) fn publish_wait_outputs(outputs: PreparedWaitOutputs) {
 }
 pub(crate) fn complete_published_wait_outputs(child: crate::lifecycle::ReapedChild) {
     let outputs = WAIT_OUTPUTS.lock().take().unwrap_or_else(|| {
-        crate::kernel::lifecycle_invariant_error(crate::lifecycle::LifecycleInvariant::ExitReap)
+        crate::fixture_personality::lifecycle_invariant_error(
+            crate::lifecycle::LifecycleInvariant::ExitReap,
+        )
     });
     outputs.complete(child);
 }
@@ -481,7 +484,7 @@ fn prepare_parent_output(
         return None;
     }
     let root = carrick_el1::isa::x86::hardware_live_root().ok()?;
-    let words = InitialWords::fixture();
+    let words = fixture_initial_words();
     if translate_leaf(&words, root, address, Access::Write, true).is_err() {
         let mut cow = X86CowResolver {
             words: &words,
@@ -499,7 +502,7 @@ fn prepare_parent_output(
             lane.counters,
             lane.task,
             carrick_el1::substrate::sched::object_wait::space_access(lane.zone, lane.lane.slot),
-            GrantMailboxes::own(&crate::kernel::SHARED_FAULT_MAILBOX),
+            GrantMailboxes::own(&crate::fixture_personality::SHARED_FAULT_MAILBOX),
             None::<carrick_el1::fault::PreparedFaultPath<'_, NoopPreparedResolver>>,
             &mut cow,
         );
