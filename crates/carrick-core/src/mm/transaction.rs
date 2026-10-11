@@ -33,5 +33,11 @@ mod error;
 pub use error::MmError;
 pub mod owner;
 pub use owner::*;
+pub mod range;
+pub use range::RangeAuthority;
+pub type MmAuthority<
+    P = crate::mm::reservation::NeutralReservationPolicy,
+    G = crate::mm::reservation::NeutralReservationGeometry,
+> = RangeAuthority<P, G>;
 
 pub use crate::mm::frames::{GrantTarget, grant_target};
