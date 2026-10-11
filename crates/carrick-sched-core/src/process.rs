@@ -55,6 +55,10 @@ macro_rules! serial_id {
                 self.0.get()
             }
 
+            pub const fn nonzero(self) -> NonZeroU64 {
+                self.0
+            }
+
             #[allow(dead_code)]
             pub const fn from_raw_u64(raw: u64) -> Option<Self> {
                 match NonZeroU64::new(raw) {

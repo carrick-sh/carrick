@@ -747,6 +747,9 @@ impl CarrierMemory {
     pub fn root(&self, mm: NonZeroU64) -> Option<AddressContext<RootGpa>> {
         self.roots.get(&mm).copied()
     }
+    pub fn context_by_root(&self, root: RootGpa) -> Option<AddressContext<RootGpa>> {
+        self.roots.values().find(|c| c.root == root).copied()
+    }
     /// Bind independently inventoried physical frames inside one KVM extent.
     /// The memslot remains coarse; descriptor outputs authenticate one page.
     pub fn bind_frame_identities(
