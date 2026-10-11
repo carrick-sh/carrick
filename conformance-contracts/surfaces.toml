@@ -1180,3 +1180,11 @@ contracts = ["kernel.el1.signal-delivery-owner"]
 [[surfaces]]
 path = "crates/carrick-sched-core/src/timer_index.rs"
 contracts = ["kernel.el1.guest-run-queue"]
+
+[[surfaces]]
+path = "crates/carrick-core/src/personality.rs"
+contracts = []
+
+[[surfaces]]
+path = "crates/carrick-kernel-example/src/personality.rs"
+contracts = []

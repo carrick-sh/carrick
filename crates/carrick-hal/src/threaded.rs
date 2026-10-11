@@ -2389,6 +2389,66 @@ impl X86TaskCpuStateV1 {
     }
 }
 
+impl carrick_guest_arch::ThreadContext for Aarch64TaskCpuStateV1 {
+    fn thread_pointer(&self, register: carrick_guest_arch::ThreadPointerRegister) -> u64 {
+        match register {
+            carrick_guest_arch::ThreadPointerRegister::Aarch64(
+                carrick_guest_arch::Aarch64ThreadPointerRegister::TpidrEl0,
+            ) => self.tpidr_el0,
+            carrick_guest_arch::ThreadPointerRegister::Aarch64(
+                carrick_guest_arch::Aarch64ThreadPointerRegister::X18,
+            ) => self.gprs[18],
+            _ => 0,
+        }
+    }
+
+    fn set_thread_pointer(
+        &mut self,
+        register: carrick_guest_arch::ThreadPointerRegister,
+        value: u64,
+    ) {
+        match register {
+            carrick_guest_arch::ThreadPointerRegister::Aarch64(
+                carrick_guest_arch::Aarch64ThreadPointerRegister::TpidrEl0,
+            ) => self.tpidr_el0 = value,
+            carrick_guest_arch::ThreadPointerRegister::Aarch64(
+                carrick_guest_arch::Aarch64ThreadPointerRegister::X18,
+            ) => self.gprs[18] = value,
+            _ => {}
+        }
+    }
+}
+
+impl carrick_guest_arch::ThreadContext for X86TaskCpuStateV1 {
+    fn thread_pointer(&self, register: carrick_guest_arch::ThreadPointerRegister) -> u64 {
+        match register {
+            carrick_guest_arch::ThreadPointerRegister::X86(
+                carrick_guest_arch::X86ThreadPointerRegister::Fs,
+            ) => self.fs_base,
+            carrick_guest_arch::ThreadPointerRegister::X86(
+                carrick_guest_arch::X86ThreadPointerRegister::Gs,
+            ) => self.gs_base,
+            _ => 0,
+        }
+    }
+
+    fn set_thread_pointer(
+        &mut self,
+        register: carrick_guest_arch::ThreadPointerRegister,
+        value: u64,
+    ) {
+        match register {
+            carrick_guest_arch::ThreadPointerRegister::X86(
+                carrick_guest_arch::X86ThreadPointerRegister::Fs,
+            ) => self.fs_base = value,
+            carrick_guest_arch::ThreadPointerRegister::X86(
+                carrick_guest_arch::X86ThreadPointerRegister::Gs,
+            ) => self.gs_base = value,
+            _ => {}
+        }
+    }
+}
+
 /// Architecture- and version-typed task CPU state accepted by the Kernel.
 ///
 /// There is intentionally no raw-byte variant or same-ABI byte constructor.
@@ -2428,6 +2488,30 @@ impl GuestCpuState {
         match self {
             Self::Aarch64V1(state) => (state.mm_generation, state.asid_generation),
             Self::X86_64V1(state) => (state.mm_generation(), state.asid_generation()),
+        }
+    }
+}
+
+impl carrick_guest_arch::ThreadContext for GuestCpuState {
+    fn thread_pointer(&self, register: carrick_guest_arch::ThreadPointerRegister) -> u64 {
+        match self {
+            Self::Aarch64V1(state) => state.thread_pointer(register),
+            Self::X86_64V1(state) => state.thread_pointer(register),
+        }
+    }
+
+    fn set_thread_pointer(
+        &mut self,
+        register: carrick_guest_arch::ThreadPointerRegister,
+        value: u64,
+    ) {
+        match self {
+            Self::Aarch64V1(state) => {
+                std::sync::Arc::make_mut(state).set_thread_pointer(register, value);
+            }
+            Self::X86_64V1(state) => {
+                std::sync::Arc::make_mut(state).set_thread_pointer(register, value);
+            }
         }
     }
 }

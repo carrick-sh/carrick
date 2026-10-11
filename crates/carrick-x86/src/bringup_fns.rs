@@ -458,6 +458,36 @@ pub struct X86VcpuSnapshot {
     pub xsave: Option<[u8; crate::vmm::XSAVE_LEN]>,
 }
 
+impl carrick_guest_arch::ThreadContext for X86VcpuSnapshot {
+    fn thread_pointer(&self, register: carrick_guest_arch::ThreadPointerRegister) -> u64 {
+        match register {
+            carrick_guest_arch::ThreadPointerRegister::X86(
+                carrick_guest_arch::X86ThreadPointerRegister::Fs,
+            ) => self.fs_base,
+            carrick_guest_arch::ThreadPointerRegister::X86(
+                carrick_guest_arch::X86ThreadPointerRegister::Gs,
+            ) => self.gs_base,
+            _ => 0,
+        }
+    }
+
+    fn set_thread_pointer(
+        &mut self,
+        register: carrick_guest_arch::ThreadPointerRegister,
+        value: u64,
+    ) {
+        match register {
+            carrick_guest_arch::ThreadPointerRegister::X86(
+                carrick_guest_arch::X86ThreadPointerRegister::Fs,
+            ) => self.fs_base = value,
+            carrick_guest_arch::ThreadPointerRegister::X86(
+                carrick_guest_arch::X86ThreadPointerRegister::Gs,
+            ) => self.gs_base = value,
+            _ => {}
+        }
+    }
+}
+
 /// The 16 GPRs in canonical order (matches [`X86VcpuSnapshot::gprs`]).
 const GPR_ORDER: [X86Reg; 16] = [
     X86Reg::Rax,
@@ -569,7 +599,11 @@ pub fn restore<C: X86Vcpu>(
 ///   - `rflags = parent.r11`          — the user RFLAGS saved by SYSCALL.
 ///
 /// FP is carried verbatim (correct for fork; harmless for a new thread).
-pub fn seed_entry(parent: &X86VcpuSnapshot, entry: GuestEntryRegs) -> X86VcpuSnapshot {
+pub fn seed_entry_with_register(
+    parent: &X86VcpuSnapshot,
+    entry: GuestEntryRegs,
+    reg: carrick_guest_arch::X86ThreadPointerRegister,
+) -> X86VcpuSnapshot {
     let mut snap = parent.clone();
     snap.gprs[GPR_RAX] = entry.return_value;
     if let Some(stack) = entry.stack {
@@ -577,11 +611,22 @@ pub fn seed_entry(parent: &X86VcpuSnapshot, entry: GuestEntryRegs) -> X86VcpuSna
         snap.gprs[GPR_RSP] = stack;
     }
     if let Some(tls) = entry.tls {
-        snap.fs_base = tls;
+        match reg {
+            carrick_guest_arch::X86ThreadPointerRegister::Fs => snap.fs_base = tls,
+            carrick_guest_arch::X86ThreadPointerRegister::Gs => snap.gs_base = tls,
+        }
     }
     snap.rip = parent.gprs[GPR_RCX];
     snap.rflags = parent.gprs[GPR_R11] | RFLAGS_RESERVED_BIT;
     snap
+}
+
+pub fn seed_entry(parent: &X86VcpuSnapshot, entry: GuestEntryRegs) -> X86VcpuSnapshot {
+    seed_entry_with_register(
+        parent,
+        entry,
+        carrick_guest_arch::X86ThreadPointerRegister::Fs,
+    )
 }
 
 // ─── run_elf_service_loop ────────────────────────────────────────────────────

@@ -116,6 +116,36 @@ pub fn restore_native_context(
     })
 }
 
+impl carrick_guest_arch::ThreadContext for NativeContext {
+    fn thread_pointer(&self, register: carrick_guest_arch::ThreadPointerRegister) -> u64 {
+        match register {
+            carrick_guest_arch::ThreadPointerRegister::X86(
+                carrick_guest_arch::X86ThreadPointerRegister::Fs,
+            ) => self.fs_base,
+            carrick_guest_arch::ThreadPointerRegister::X86(
+                carrick_guest_arch::X86ThreadPointerRegister::Gs,
+            ) => self.gs_base,
+            _ => 0,
+        }
+    }
+
+    fn set_thread_pointer(
+        &mut self,
+        register: carrick_guest_arch::ThreadPointerRegister,
+        value: u64,
+    ) {
+        match register {
+            carrick_guest_arch::ThreadPointerRegister::X86(
+                carrick_guest_arch::X86ThreadPointerRegister::Fs,
+            ) => self.fs_base = value,
+            carrick_guest_arch::ThreadPointerRegister::X86(
+                carrick_guest_arch::X86ThreadPointerRegister::Gs,
+            ) => self.gs_base = value,
+            _ => {}
+        }
+    }
+}
+
 /// Exact shared-record identity and its expected address owner. Machine state
 /// lives only in `ZoneRecord<ParkedContextWords>`, never in this witness.
 #[repr(C)]
