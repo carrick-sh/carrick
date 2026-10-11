@@ -903,10 +903,18 @@ fn inherited_compound_inventory_authenticates_only_exact_live_owner_pages() {
     use carrick_kernel::kernel::{FrameInventoryAuthority, ObjectIdRegistry};
     let authority = Arc::new(FrameInventoryAuthority::new());
     let ids = Arc::new(ObjectIdRegistry::new());
-    let mm = ids.mm_id().unwrap();
-    let other_mm = ids.mm_id().unwrap();
-    let mut reservation = authority
-        .reserve(&ids, 1, 1, FrameEventCapacity::for_event_count(2).unwrap())
+    let mm = carrick_hal::GuestFrameOwner {
+        native_mm: MmGeneration::new(nz(41)),
+        root_generation: ContextGeneration::new(nz(7)),
+    };
+    let other_mm = carrick_hal::GuestFrameOwner {
+        native_mm: MmGeneration::new(nz(42)),
+        ..mm
+    };
+    let source = authority.physical_projection(Arc::clone(&ids));
+    let bound = source.bind(mm);
+    let mut reservation = bound
+        .reserve(1, 1, FrameEventCapacity::for_event_count(2).unwrap().get())
         .unwrap();
     let transaction = reservation.transaction();
     let frame = reservation.claim_frame().unwrap();
@@ -934,9 +942,7 @@ fn inherited_compound_inventory_authenticates_only_exact_live_owner_pages() {
             generation,
         })
         .unwrap();
-    let (_, receipt) = authority
-        .apply_with_receipt(mm, reservation.commit(()))
-        .unwrap();
+    let receipt = bound.apply_with_receipt(reservation.commit(())).unwrap();
     let identity = BackingIdentity {
         frame_id: nz(frame.raw()),
         mapping_id: nz(mapping.raw()),
@@ -944,20 +950,29 @@ fn inherited_compound_inventory_authenticates_only_exact_live_owner_pages() {
         inventory_revision: nz(receipt.revision()),
     };
     assert!(inventory_page_live(
-        &*authority.physical_projection(Arc::clone(&ids)),
-        nz(mm.raw()),
+        &*source,
+        mm,
         identity,
         FrameGpa::new(0x801000)
     ));
     assert!(!inventory_page_live(
-        &*authority.physical_projection(Arc::clone(&ids)),
-        nz(other_mm.raw()),
+        &*source,
+        other_mm,
         identity,
         FrameGpa::new(0x801000)
     ));
     assert!(!inventory_page_live(
-        &*authority.physical_projection(Arc::clone(&ids)),
-        nz(mm.raw()),
+        &*source,
+        carrick_hal::GuestFrameOwner {
+            root_generation: ContextGeneration::new(nz(8)),
+            ..mm
+        },
+        identity,
+        FrameGpa::new(0x801000)
+    ));
+    assert!(!inventory_page_live(
+        &*source,
+        mm,
         BackingIdentity {
             frame_id: nz(frame.raw() + 1),
             ..identity
@@ -974,14 +989,14 @@ fn inherited_compound_inventory_authenticates_only_exact_live_owner_pages() {
         FrameGpa::new(0x801000)
     ));
     assert!(!inventory_page_live(
-        &*authority.physical_projection(Arc::clone(&ids)),
-        nz(mm.raw()),
+        &*source,
+        mm,
         identity,
         FrameGpa::new(0x804000)
     ));
     assert!(!inventory_page_live(
-        &*authority.physical_projection(Arc::clone(&ids)),
-        nz(mm.raw()),
+        &*source,
+        mm,
         identity,
         FrameGpa::new(0x801001)
     ));
