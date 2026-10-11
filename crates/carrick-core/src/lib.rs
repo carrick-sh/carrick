@@ -8,7 +8,10 @@ pub mod lifecycle;
 pub mod mm;
 pub mod personality;
 pub mod wait;
-pub use personality::Personality;
+pub use personality::{
+    CallContext, CallOrdinal, EntryDecodeError, Personality, PersonalityAbi, TaskId, TaskKey,
+    TaskSerial, ThreadKey, UserStackOffset,
+};
 
 #[cfg(test)]
 extern crate std;

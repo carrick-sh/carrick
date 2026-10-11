@@ -1,6 +1,10 @@
 //! Native stack and saved-context binding pending the CPL0 context owner.
 
-use super::{ArchError, X86Backend};
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+use super::ArchError;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+use super::X86Backend;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 use carrick_guest_arch::{
     EntryBackend, EntryEvent, KernelStackPointer, NativeEntrySnapshot, NativeReturnWord,
     ReturnKind, UserFlags, UserReturn, UserVa,
@@ -8,12 +12,14 @@ use carrick_guest_arch::{
 
 #[path = "../../../../carrick-x86/src/cpl0_entry.rs"]
 pub mod native;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[path = "../../../../carrick-x86/src/cpl0_scheduler.rs"]
 #[allow(dead_code)] // Linked CPL0 callers use the public TLS and XSAVE leaves.
 pub mod scheduler;
 
 /// Native syscall-return state. The caller keeps its task and MM custody;
 /// this value owns only machine registers captured on the current CPL0 CPU.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub struct SavedSyscallContext {
     frame: native::NativeFrame,
     fs_base: u64,
@@ -21,16 +27,22 @@ pub struct SavedSyscallContext {
     xsave: scheduler::XsaveArea,
 }
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 const _: () = assert!(core::mem::align_of::<scheduler::XsaveArea>() == 64);
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[path = "context_words.rs"]
 pub mod context_words;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub use context_words::ParkedContextWords;
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[path = "context_resume.rs"]
 pub mod resume;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub use resume::{prepare_parked_resume, resume_parked};
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 impl EntryBackend for X86Backend {
     fn current_stack_pointer(&mut self) -> Result<KernelStackPointer, Self::Error> {
         let sp: u64;
@@ -108,8 +120,12 @@ impl EntryBackend for X86Backend {
             kind: ReturnKind::ExceptionReturn,
         })
     }
+    fn user_stack_pointer(&mut self, frame: &Self::NativeFrame) -> Result<UserVa, Self::Error> {
+        crate::isa::x86_user_stack_pointer(frame)
+    }
 }
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 /// Read the current CPU binding published through GS:[16].
 #[inline(always)]
 pub fn current_cpu_binding() -> Option<&'static native::CpuBinding> {
@@ -131,6 +147,7 @@ pub fn current_cpu_binding() -> Option<&'static native::CpuBinding> {
     Some(unsafe { &*(binding_address as *const native::CpuBinding) })
 }
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 /// The current CPU's supervisor stack slot index.
 pub fn current_stack_slot() -> Option<usize> {
     let binding = current_cpu_binding()?;
@@ -146,14 +163,17 @@ pub fn current_stack_slot() -> Option<usize> {
     Some(binding.cpu_slot as usize)
 }
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 /// The current CPU's thread CPU identifier.
 pub fn current_thread_cpu() -> Option<u64> {
     current_cpu_binding().map(|b| b.cpu_slot as u64)
 }
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 /// A CPL0-only fixture syscall that exercises this shared kernel context module.
 pub const CONTEXT_WITNESS: u64 = 0xffff_ffff_ffff_ff30;
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub fn witness(op: u64) -> u64 {
     match op {
         0 => current_stack_slot().map_or(u64::MAX, |s| s as u64),

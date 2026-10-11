@@ -971,6 +971,48 @@ impl carrick_guest_arch::SyscallFrame for TrapFrame {
         None
     }
 }
+
+impl carrick_guest_arch::Aarch64Registers for TrapFrame {
+    fn read(&self, register: carrick_guest_arch::Aarch64Register) -> u64 {
+        use carrick_guest_arch::Aarch64Register::*;
+        match register {
+            X0 => self.x[0],
+            X1 => self.x[1],
+            X2 => self.x[2],
+            X3 => self.x[3],
+            X4 => self.x[4],
+            X5 => self.x[5],
+            X6 => self.x[6],
+            X7 => self.x[7],
+            X8 => self.x[8],
+            X9 => self.x[9],
+            X10 => self.x[10],
+            X11 => self.x[11],
+            X12 => self.x[12],
+            X13 => self.x[13],
+            X14 => self.x[14],
+            X15 => self.x[15],
+            X16 => self.x[16],
+            X17 => self.x[17],
+            X18 => self.x[18],
+            X19 => self.x[19],
+            X20 => self.x[20],
+            X21 => self.x[21],
+            X22 => self.x[22],
+            X23 => self.x[23],
+            X24 => self.x[24],
+            X25 => self.x[25],
+            X26 => self.x[26],
+            X27 => self.x[27],
+            X28 => self.x[28],
+            X29 => self.x[29],
+            X30 => self.x[30],
+            Sp => 0,
+            Pc => self.elr,
+            Pstate => self.spsr,
+        }
+    }
+}
 const _: () = {
     assert!(core::mem::offset_of!(TrapFrame, x) == 0);
     assert!(core::mem::offset_of!(TrapFrame, elr) == 248);
