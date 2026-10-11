@@ -44,6 +44,12 @@ pub struct GuestDescriptorChange {
     pub release: Option<ReleasedDescription>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuestCloseRefusal {
+    Missing,
+    HostReleaseRequired,
+}
+
 pub const GUEST_FD_CLOEXEC: u32 = 1;
 pub const GUEST_FD_LIMIT: i32 = 1024;
 
@@ -78,12 +84,46 @@ pub fn close_host_binding(
     file_table: u64,
     fd: i32,
 ) -> Option<GuestDescriptorChange> {
+    close_host_binding_checked(fd_map, file_table, fd, true).ok()
+}
+
+/// Close a descriptor that still has another guest reference to its host
+/// description. A native guest child has no host continuation for the final
+/// release, so leave that descriptor untouched for an explicit host handoff.
+pub fn close_shared_host_binding(
+    fd_map: &[FdMapSlot],
+    file_table: u64,
+    fd: i32,
+) -> Result<GuestDescriptorChange, GuestCloseRefusal> {
+    close_host_binding_checked(fd_map, file_table, fd, false)
+}
+
+fn close_host_binding_checked(
+    fd_map: &[FdMapSlot],
+    file_table: u64,
+    fd: i32,
+    allow_last_release: bool,
+) -> Result<GuestDescriptorChange, GuestCloseRefusal> {
     let _guard = FD_MAP_LOCK.lock();
-    let (handle, index) = fd_map_lookup(fd_map, file_table, fd)?;
+    let (handle, index) =
+        fd_map_lookup(fd_map, file_table, fd).ok_or(GuestCloseRefusal::Missing)?;
     if handle == 0 {
-        return None;
+        return Err(GuestCloseRefusal::Missing);
     }
     let incarnation = fd_map[index].incarnation.load(Ordering::Acquire);
+    if !allow_last_release
+        && !fd_map
+            .iter()
+            .take(FD_MAP_CAPACITY)
+            .enumerate()
+            .any(|(other, slot)| {
+                other != index
+                    && slot.incarnation.load(Ordering::Acquire) == incarnation
+                    && slot.handle.load(Ordering::Relaxed) == handle
+            })
+    {
+        return Err(GuestCloseRefusal::HostReleaseRequired);
+    }
     fd_map[index].clear();
     if (0..=2).contains(&fd) {
         // Preserve an explicit close of bare stdio. A later descriptor lookup
@@ -96,7 +136,7 @@ pub fn close_host_binding(
         handle,
         incarnation,
     };
-    Some(GuestDescriptorChange {
+    Ok(GuestDescriptorChange {
         fd,
         release: last_reference(fd_map, description).then_some(description),
     })
@@ -807,6 +847,34 @@ mod tests {
                 }),
             })
         );
+    }
+
+    #[test]
+    fn native_close_keeps_final_host_release_for_an_explicit_handoff() {
+        let (fd_map, open_table, object_table) = setup_tables();
+        admit_stdio(
+            &fd_map,
+            &open_table,
+            &object_table,
+            10,
+            [false, true, false],
+        );
+        let handle = fd_map_lookup(&fd_map, 10, 1).unwrap().0;
+        dup2_host_binding(&fd_map, 10, 1, 5, false).unwrap();
+
+        assert_eq!(
+            close_shared_host_binding(&fd_map, 10, 5),
+            Ok(GuestDescriptorChange {
+                fd: 5,
+                release: None
+            })
+        );
+        assert_eq!(fd_map_lookup(&fd_map, 10, 5), None);
+        assert_eq!(
+            close_shared_host_binding(&fd_map, 10, 1),
+            Err(GuestCloseRefusal::HostReleaseRequired)
+        );
+        assert_eq!(fd_map_lookup(&fd_map, 10, 1).unwrap().0, handle);
     }
 
     #[test]
