@@ -32,6 +32,7 @@ quote = "1.0"
 toml.workspace = true
 
 carrick-conformance = { path = "../carrick-conformance" }
+carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-portable = { path = "../carrick-portable" }
 
 [dev-dependencies]
