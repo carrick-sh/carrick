@@ -19,7 +19,7 @@ mod inputs;
 pub mod linker;
 use environment::BuildEnvironment;
 pub use environment::BuildPolicy;
-pub use inputs::{current_build_code, source_hashes};
+pub use inputs::{current_build_code, fetch_dependencies, fetch_plan, source_hashes};
 
 const SCHEMA: &str = "carrick.fixtures.v3";
 pub const INSTALLED_MANIFEST: &str = "target/fixtures/installed.json";
@@ -82,6 +82,10 @@ pub enum FixturesAction {
         #[arg(long, value_enum)]
         source: crate::remote_accept::FixtureBundleSource,
     },
+    /// Fetch every fixture lockfile's dependencies into the host Cargo cache
+    /// (publish and build do this first; offline verification on a cold
+    /// machine needs it too).
+    Fetch,
     /// Print the build scripts and proc-macros in the fixture graphs in the
     /// reviewed-list format, for review before updating the committed list.
     BuildCode,
@@ -817,6 +821,10 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
         return Err(fail("fixtures build requires Linux; restore on cloudmac"));
     }
     let expected = expected_head(root, Some(sha))?;
+    // The only network step: populate the host Cargo cache from every fixture
+    // lockfile. Resolution and builds below stay offline, and the controlled
+    // environment shares that cache only if it exists when it is created.
+    fetch_dependencies(root)?;
     source_hashes(root, &[])?;
     let environment = BuildEnvironment::new(root)?;
     let snapshot = tempfile::tempdir_in(environment.scratch_root())?;
@@ -1035,6 +1043,10 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
                 provenance.captured_path, provenance.identity, provenance.archive_sha256
             )?;
             archive::restore(root, Path::new(&provenance.captured_path), None)?;
+        }
+        FixturesAction::Fetch => {
+            let count = fetch_dependencies(root)?;
+            writeln!(writer, "fixtures: fetched {count} fixture lockfiles")?;
         }
         FixturesAction::BuildCode => {
             write!(
