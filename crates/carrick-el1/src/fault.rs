@@ -1617,6 +1617,7 @@ fn dispatch_classified_fault<
     cow_resolver: &mut C,
 ) -> Action {
     use carrick_core::mm::fault::RootFaultAdmission;
+    use carrick_el1_abi::CowSupplyRefusal;
     counters.fault_taken.fetch_add(1, Ordering::Relaxed);
     if fault == FaultClass::WritePermission {
         let Some(task) = current_task else {
@@ -1643,10 +1644,33 @@ fn dispatch_classified_fault<
             ) {
                 RootFaultAdmission::Allowed => {}
                 RootFaultAdmission::Declined => {
+                    counters.record_first_cow_supply_refusal(
+                        CowSupplyRefusal::RootDeclined,
+                        mm_key,
+                        far & !4095,
+                        0,
+                    );
                     supply.decline();
                     return Action::Forward;
                 }
-                _ => return Action::Forward,
+                RootFaultAdmission::Unavailable => {
+                    counters.record_first_cow_supply_refusal(
+                        CowSupplyRefusal::RootUnavailable,
+                        mm_key,
+                        far & !4095,
+                        0,
+                    );
+                    return Action::Forward;
+                }
+                RootFaultAdmission::NotDelegated => {
+                    counters.record_first_cow_supply_refusal(
+                        CowSupplyRefusal::RootNotDelegated,
+                        mm_key,
+                        far & !4095,
+                        0,
+                    );
+                    return Action::Forward;
+                }
             }
         }
         // A closed gate (host pause or retirement) or another EL1 editor:
@@ -1673,29 +1697,59 @@ fn dispatch_classified_fault<
             CowResolution::NeedsSupply => {
                 if let FaultSupply::Owner(owner) = supply {
                     let selected = (|| {
-                        let roots = prepared.as_ref()?.roots?;
-                        let mm = carrick_el1_abi::ReservationMm::new(mm_key)?;
-                        let mut root =
-                            roots.lock_in(spaces, index.index(), mm, slot as u32).ok()?;
-                        let operation = carrick_el1_abi::PortalOperation {
-                            carrier: owner.slots.carrier()?,
-                            mm,
-                            incarnation: NonZeroU64::new(root.incarnation().raw())?,
-                            sequence: root.next_transfer_sequence().ok()?,
+                        macro_rules! refuse {
+                            ($stage:expr, $incarnation:expr) => {{
+                                counters.record_first_cow_supply_refusal(
+                                    $stage,
+                                    mm_key,
+                                    far & !4095,
+                                    $incarnation,
+                                );
+                                return None;
+                            }};
+                        }
+                        let Some(roots) = prepared.as_ref().and_then(|path| path.roots) else {
+                            refuse!(CowSupplyRefusal::PreparedPathAbsent, 0);
                         };
-                        let window = carrick_core::mm::fault::select_cow_supply_window(
+                        let Some(mm) = carrick_el1_abi::ReservationMm::new(mm_key) else {
+                            refuse!(CowSupplyRefusal::ReservationMmInvalid, 0);
+                        };
+                        let Ok(mut root) = roots.lock_in(spaces, index.index(), mm, slot as u32)
+                        else {
+                            refuse!(CowSupplyRefusal::RootLock, 0);
+                        };
+                        let incarnation = root.incarnation().raw();
+                        let Some(carrier) = owner.slots.carrier() else {
+                            refuse!(CowSupplyRefusal::CarrierAbsent, incarnation);
+                        };
+                        let Some(incarnation_id) = NonZeroU64::new(incarnation) else {
+                            refuse!(CowSupplyRefusal::IncarnationInvalid, incarnation);
+                        };
+                        let Ok(sequence) = root.next_transfer_sequence() else {
+                            refuse!(CowSupplyRefusal::SequenceRefused, incarnation);
+                        };
+                        let operation = carrick_el1_abi::PortalOperation {
+                            carrier,
+                            mm,
+                            incarnation: incarnation_id,
+                            sequence,
+                        };
+                        let Ok(window) = carrick_core::mm::fault::select_cow_supply_window(
                             &mut root,
                             operation,
                             carrick_guest_arch::UserVa::new(far),
                             None,
-                        )
-                        .ok()?;
+                        ) else {
+                            refuse!(CowSupplyRefusal::WindowRefused, incarnation);
+                        };
                         drop(root);
-                        owner
-                            .slots
-                            .grant(slot as usize)?
-                            .publish_cow_fault_selection(operation.sequence.get(), window)
-                            .then_some(())
+                        let Some(grant) = owner.slots.grant(slot as usize) else {
+                            refuse!(CowSupplyRefusal::PortalSlotAbsent, incarnation);
+                        };
+                        if !grant.publish_cow_fault_selection(operation.sequence.get(), window) {
+                            refuse!(CowSupplyRefusal::PortalPublishRefused, incarnation);
+                        }
+                        Some(())
                     })();
                     if selected.is_some() {
                         owner.outcome.set(OwnerFaultSupplyOutcome::CowSelected);
