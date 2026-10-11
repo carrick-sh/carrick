@@ -193,6 +193,18 @@ pub struct AddressContext<R> {
     pub generation: ContextGeneration,
 }
 
+pub const USER_CEILING: u64 = 0x0000_8000_0000_0000;
+
+/// A user operand must be wholly within the canonical lower half. The
+/// checked end also excludes wraparound into the supervisor address space.
+pub const fn lower_half_range(address: u64, len: u64) -> bool {
+    address < USER_CEILING
+        && match address.checked_add(len) {
+            Some(end) => end <= USER_CEILING,
+            None => false,
+        }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UserRange {
     start: UserVa,
@@ -205,6 +217,9 @@ impl UserRange {
         } else {
             None
         }
+    }
+    pub const fn in_lower_half(self) -> bool {
+        lower_half_range(self.start.raw(), self.len.raw())
     }
     pub const fn start(self) -> UserVa {
         self.start
@@ -459,6 +474,57 @@ impl core::fmt::Display for EntryDecodeError {
     }
 }
 
+/// Direction of a user memory transfer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransferDirection {
+    FromUser,
+    ToUser,
+}
+
+/// A service-time error during personality memory operations or call servicing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceError {
+    /// A user memory access faulted on an unmapped or invalid address.
+    Fault,
+    /// A user memory write was refused due to access permission violation (e.g. read-only mapping).
+    AccessDenied,
+    /// Address arithmetic overflow or address outside the canonical user range.
+    RangeOverflow,
+    /// Operation was refused (e.g. off-target build or unbound execution state).
+    Refused,
+}
+
+impl core::fmt::Display for ServiceError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Fault => write!(f, "fault: unmapped or invalid user address"),
+            Self::AccessDenied => write!(f, "access denied: permission violation"),
+            Self::RangeOverflow => write!(f, "range overflow: invalid address or bounds"),
+            Self::Refused => write!(f, "service refused: off-target or unbound execution"),
+        }
+    }
+}
+
+impl From<ServiceError> for EntryDecodeError {
+    fn from(_err: ServiceError) -> Self {
+        EntryDecodeError::Fault
+    }
+}
+
+impl From<EntryDecodeError> for ServiceError {
+    fn from(err: EntryDecodeError) -> Self {
+        match err {
+            EntryDecodeError::Fault => ServiceError::Fault,
+            EntryDecodeError::OutOfBounds => ServiceError::RangeOverflow,
+            EntryDecodeError::InvalidFrame => ServiceError::Fault,
+            EntryDecodeError::InvalidWidth => ServiceError::Fault,
+            EntryDecodeError::UnsupportedAbi => ServiceError::Refused,
+            EntryDecodeError::Busy => ServiceError::Refused,
+            EntryDecodeError::Unbound => ServiceError::Refused,
+        }
+    }
+}
+
 /// Retains the complete ISA-native frame; six Linux arguments are decoded only
 /// after crossing into the Linux personality.
 #[derive(Clone, Copy, Debug)]
@@ -695,7 +761,7 @@ pub trait ArchTypes {
     /// live native context that may contain nonzero ownership generations.
     type Context: Copy + Send + Sync + zerocopy::FromZeros;
     type Root: Copy + Eq;
-    type MmOwner;
+    type MmOwner: 'static;
     type DrainTicket;
     type DrainReceipt;
     type UserTransfer;
@@ -768,6 +834,26 @@ macro_rules! arch_trait {
     };
 }
 
+/// Provider for a default MM owner capability, allowing testing backends or
+/// implicit-task backends to supply an MM owner when one is not explicitly passed.
+pub trait DefaultMmOwner: ArchTypes
+where
+    Self::MmOwner: 'static,
+{
+    fn default_owner() -> Option<&'static Self::MmOwner> {
+        None
+    }
+}
+
+impl<B: DefaultMmOwner> DefaultMmOwner for Arch<B>
+where
+    Self::MmOwner: 'static,
+{
+    fn default_owner() -> Option<&'static Self::MmOwner> {
+        B::default_owner()
+    }
+}
+
 arch_trait!(EntryArch, EntryBackend {
     fn current_stack_pointer() -> Result<KernelStackPointer, Self::Error>;
     fn decode_entry(frame: &Self::NativeFrame) -> Result<EntryEvent, Self::Error>;
@@ -785,6 +871,7 @@ arch_trait!(MmuArch, MmuBackend {
     fn install_context(context: AddressContext<Self::Root>) -> Result<(), Self::Error>;
     fn request_invalidation(context: AddressContext<Self::Root>, range: UserRange) -> Result<Self::DrainTicket, Self::Error>;
     fn ack_drain(ticket: Self::DrainTicket) -> Result<Self::DrainReceipt, Self::Error>;
+    fn open_user_transfer(owner: &Self::MmOwner, user: UserVa, kernel: core::ptr::NonNull<u8>, len: GuestLen, direction: TransferDirection) -> Result<Self::UserTransfer, Self::Error>;
     fn copy_user_chunk(transfer: &mut Self::UserTransfer, limit: GuestLen) -> Result<CopyProgress, Self::Error>;
 });
 

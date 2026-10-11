@@ -34,11 +34,7 @@ const _: () = {
     assert!(!lower_half_range(u64::MAX - 3, 8));
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TransferDirection {
-    FromUser,
-    ToUser,
-}
+pub use carrick_guest_arch::TransferDirection;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MmKey(NonZeroU64);
@@ -85,6 +81,24 @@ fn current_task(owner: &CurrentTask) -> bool {
             options(nostack, readonly, preserves_flags));
     }
     current == owner as *const CurrentTask as u64
+}
+
+/// Retrieve the executing CPU's published CurrentTask pointer from GS:[24].
+pub fn live_current_task() -> Option<&'static CurrentTask> {
+    let current: u64;
+    // SAFETY: SWAPGS selected the executing CPU's retained CpuBinding before
+    // this kernel path. Offset 24 is its published task pointer.
+    unsafe {
+        core::arch::asm!("mov {}, qword ptr gs:[24]", out(reg) current,
+            options(nostack, readonly, preserves_flags));
+    }
+    if current == 0 {
+        None
+    } else {
+        // SAFETY: SWAPGS loaded the executing CPU's retained CpuBinding on exception entry;
+        // offset 24 contains the NonNull CurrentTask reference published for this CPU epoch.
+        Some(unsafe { &*(current as *const CurrentTask) })
+    }
 }
 
 impl UserTransfer {

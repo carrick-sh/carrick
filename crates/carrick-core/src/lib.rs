@@ -9,8 +9,8 @@ pub mod mm;
 pub mod personality;
 pub mod wait;
 pub use personality::{
-    CallContext, CallOrdinal, EntryDecodeError, Personality, PersonalityAbi, TaskId, TaskKey,
-    TaskSerial, ThreadKey, UserStackOffset,
+    CallContext, CallOrdinal, EntryDecodeError, Personality, PersonalityAbi, ServiceError, TaskId,
+    TaskKey, TaskSerial, ThreadKey, UserCopy, UserMemory, UserStackOffset,
 };
 
 #[cfg(test)]
