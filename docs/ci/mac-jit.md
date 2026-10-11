@@ -14,7 +14,7 @@ carrick-xtask ci-scaler mac-jit               rentamac (SSH login, no privileges
       with exactly HVF_LABELS                     verify runner tree == pinned manifest
   gh: re-vet the run; merge group PR heads        write root-owned run/<name>/{policy,admit-job.sh}
       must all be carrick-sh/carrick              policy = "standing run=R attempt=A sha=S"
-  gh: generate-jitconfig (one-use) --stdin-->     setsid; drop to carrick-ci; run.sh
+  gh: generate-jitconfig (one-use) --stdin-->     setsid; drop to carrick-ci; Runner.Listener run
   ledger: ~/.carrick-ci/mac-jit                   JIT via ACTIONS_RUNNER_INPUT_JITCONFIG (never argv)
                                                   hook: admit-job (bound run), else kill -KILL 0
                                                   after exit: kill every carrick-ci process
