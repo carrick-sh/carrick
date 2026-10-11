@@ -177,6 +177,61 @@ pub(crate) fn terminal_root_binding(
     (binding.issued() && binding.mm.raw() == lane.mm() && home_matches).then_some(binding)
 }
 
+/// A child has left the zone graph before it returns its fork stock. The
+/// stopped CPU still holds the child's hardware root and current-task slot;
+/// authenticate those against the host's committed root before accepting the
+/// terminal retirement crossing.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn terminal_child_execution(
+    custody: &crate::trap::CarrierVmCustody,
+    cpu: carrick_guest_arch::CpuId,
+    ttbr0: u64,
+) -> Option<crate::fork_stock::GrantExecution> {
+    let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
+    let zone = carrick_el1_abi::zone_tables()?;
+    let lane = zone.slot(slot);
+    if lane.current().is_some() || lane.mm() != 0 {
+        return None;
+    }
+    let task_gpa = carrick_el1_abi::EL1_CURRENT_TASKS_BASE.checked_add(
+        u64::from(cpu.raw()) * core::mem::size_of::<carrick_el1_abi::CurrentTask>() as u64,
+    )?;
+    let task_ptr = crate::fork_stock::ForkStockHostCustody::resolve_record_ptr::<
+        carrick_el1_abi::CurrentTask,
+    >(custody, task_gpa)
+    .ok()?;
+    // SAFETY: this synchronous crossing stops the CPU owning the fixed slot.
+    let task = unsafe { &*task_ptr };
+    let binding = carrick_core::entry::binding(&task.execution, &task.mm);
+    if !binding.issued() {
+        return None;
+    }
+    let home_matches = lane.host_record().is_none_or(|record| {
+        let row = zone.record(record);
+        let identity = row.identity();
+        row.claim() == carrick_sched_core::Claim::Free
+            && identity.tid == binding.task.raw()
+            && identity.generation == binding.generation.raw()
+            && identity.mm == binding.mm.raw()
+            && identity.serial == binding.thread_generation.raw()
+    });
+    if !home_matches {
+        return None;
+    }
+    let mm = std::num::NonZeroU64::new(binding.mm.raw())?;
+    let stock = custody.fork_stock.lock();
+    let context = stock.root(mm)?;
+    if !stock.committed_asids.contains_key(&binding.mm.raw())
+        || !stock.committed_lifecycle.contains_key(&binding.mm.raw())
+        || context.root.address().raw() != ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK
+    {
+        return None;
+    }
+    Some(crate::fork_stock::GrantExecution::new(
+        cpu, binding, context,
+    ))
+}
+
 fn native_record_on_cpu_stack(record_gpa: u64, cpu: carrick_guest_arch::CpuId) -> bool {
     let Some(offset) = record_gpa.checked_sub(carrick_el1_abi::EL1_STACKS_BASE) else {
         return true;
@@ -1528,12 +1583,18 @@ pub(crate) fn handle_metadata_grant_trap(
         let ttbr0 = vcpu.get_sys_reg(SysReg::TTBR0_EL1).map_err(|e| {
             TrapError::Hypervisor(format!("failed to read TTBR0 for fork-stock grant: {e}"))
         })?;
-        live_fork_execution(cpu, ttbr0).filter(|execution| {
-            op != GRANT_OP_OWNER_SUPPLY
-                || carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)
-                    .and_then(|slot| live_cow_scope(slot, execution.context))
-                    .is_some_and(|scope| scope.execution == execution.binding)
-        })
+        live_fork_execution(cpu, ttbr0)
+            .or_else(|| {
+                (op == GRANT_OP_CHILD_RETIRE)
+                    .then(|| terminal_child_execution(custody, cpu, ttbr0))
+                    .flatten()
+            })
+            .filter(|execution| {
+                op != GRANT_OP_OWNER_SUPPLY
+                    || carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)
+                        .and_then(|slot| live_cow_scope(slot, execution.context))
+                        .is_some_and(|scope| scope.execution == execution.binding)
+            })
     } else {
         None
     };
