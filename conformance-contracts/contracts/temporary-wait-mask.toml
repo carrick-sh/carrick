@@ -1,0 +1,39 @@
+schema_version = 1
+id = "kernel.signal.temporary-wait-mask"
+title = "A blocked syscall's temporary signal mask is installed for the duration of the wait and restored after, on every carrier"
+guest_surfaces = [
+  "syscall:pselect6",
+  "syscall:ppoll",
+  "syscall:sigsuspend",
+  "scheduler:continuation",
+]
+semantic_authority = [
+  "man 2 pselect: A signal that is blocked by sigmask will not interrupt pselect(); instead, it remains pending until the original signal mask is restored.",
+  "man 2 ppoll: The sigmask argument specifies a mask of signals to be blocked while waiting.",
+  "man 2 sigsuspend: sigsuspend() temporarily replaces the signal mask of the calling thread with the mask given by mask and then suspends the thread until delivery of a signal.",
+]
+fixture = "unit:kvm_block_forward_temporary_mask"
+scale_points = [1]
+structural_budgets = []
+rationale = """
+Blocked syscalls that accept a temporary signal mask (such as pselect6, ppoll,
+and sigsuspend) must install the replacement mask into the thread's active signal
+authority for the duration of the wait and arm the previous mask for restoration
+upon return. This behavior must hold across all execution backends (HVF and KVM).
+Signals blocked by the temporary mask must not interrupt the wait and must remain
+pending after the original mask is restored. Private product futex tables must
+also remain bound on the blocked continuation across all carriers.
+"""
+
+[bindings]
+vm_free = "carrick-kernel::kernel::continuation::tests::red_until_step3_m3_cancel_leaves_temporary_wait_mask_installed"
+
+[bindings.unresolved]
+embed_structural = "Signed embed binding remains open for batch acceptance."
+docker = "Docker oracle comparison remains open."
+kvm = "KVM executor unit tests in carrick-runtime::vcpu_loop::executor::kvm::tests::{kvm_block_forward_pselect6_installs_temporary_signal_mask_and_binds_futex,kvm_block_forward_ppoll_host_readiness_installs_temporary_signal_mask_and_binds_futex} provide live x86 KVM witness evidence."
+
+[runtime_ratio]
+maximum = 2.0
+statistic = "p50"
+minimum_samples = 20
