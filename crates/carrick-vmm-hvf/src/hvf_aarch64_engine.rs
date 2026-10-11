@@ -2146,6 +2146,9 @@ fn hvpatch_discard_admits(persistent: bool, va: u64, len: usize) -> bool {
 }
 
 impl Aarch64Vmm for HvfAarch64Vmm {
+    fn native_frame_inventory_venue(&self) -> bool {
+        true
+    }
     fn publish_user_executable(
         &self,
         output: u64,

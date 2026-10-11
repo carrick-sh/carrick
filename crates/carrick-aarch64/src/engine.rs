@@ -5287,6 +5287,9 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     fn el1_switchable_roots(&self) -> Option<(u64, u64)> {
         self.vcpu.borrow_mut().el1_switchable_roots()
     }
+    fn native_frame_inventory_venue(&self) -> bool {
+        self.vm.native_frame_inventory_venue()
+    }
 
     fn fd_ceiling_publisher(&self) -> Option<std::sync::Arc<dyn carrick_hal::FdCeilingPublisher>> {
         self.vm.fd_ceiling_publisher()

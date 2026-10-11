@@ -2617,6 +2617,17 @@ pub trait NativeFrameInventoryAdmission: Send + Sync {
             crate::guest_arch_binding::core_arch::RootGpa,
         >,
     ) -> Result<NativeRootFrameSnapshot, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Admit the root authenticated against a stopped native CPU. The initial
+    /// host root may differ after EL1 has installed its own address space.
+    fn admit_live_root(
+        &self,
+        context: crate::guest_arch_binding::core_arch::AddressContext<
+            crate::guest_arch_binding::core_arch::RootGpa,
+        >,
+    ) -> Result<NativeRootFrameSnapshot, Box<dyn std::error::Error + Send + Sync>> {
+        self.admit_root(context)
+    }
 }
 
 /// A projection of published physical rows captured with initial root custody.
@@ -3270,6 +3281,12 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     /// every engine without an in-guest scheduler.
     fn el1_switchable_roots(&self) -> Option<(u64, u64)> {
         None
+    }
+
+    /// The backend can retain the native root frame inventory independently
+    /// of whether a vCPU currently has switchable TTBRs installed.
+    fn native_frame_inventory_venue(&self) -> bool {
+        false
     }
 
     /// Optional backend-owned sink for the carrier-global descriptor ceiling.

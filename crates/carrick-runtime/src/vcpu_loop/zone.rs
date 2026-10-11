@@ -110,10 +110,15 @@ fn parked_context(
     native: ThreadCtx,
     state: &GuestCpuState,
     identity: ThreadIdentity,
+    address: Option<
+        carrick_hal::guest_arch_binding::core_arch::AddressContext<
+            carrick_hal::guest_arch_binding::core_arch::RootGpa,
+        >,
+    >,
 ) -> Result<ZoneContext, RuntimeError> {
     #[cfg(not(target_arch = "aarch64"))]
     {
-        let _ = (state, identity);
+        let _ = (state, identity, address);
         return Ok(native);
     }
     #[cfg(target_arch = "aarch64")]
@@ -123,11 +128,22 @@ fn parked_context(
                 "zone parked a non-AArch64 task".to_owned(),
             ));
         };
+        if address.is_some_and(|address| {
+            address.mm.raw().get() != identity.mm
+                || address.root.address().raw()
+                    != cpu.ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK
+        }) {
+            return Err(RuntimeError::Configuration(
+                "zone capture changed native child address root".to_owned(),
+            ));
+        }
         Ok(ZoneContext::from_register(
             native,
             cpu.ttbr0,
             identity.mm,
-            identity.generation,
+            address.map_or(identity.generation, |address| {
+                address.generation.raw().get()
+            }),
         ))
     }
 }
@@ -367,9 +383,10 @@ where
                 // SAFETY: `current` is OnCpu on this slot and the vCPU is
                 // stopped: this executor is its only owner until the
                 // handback below.
+                let address = unsafe { zone.record(current).ctx_mut().address_context() };
                 unsafe {
                     *zone.record(current).ctx_mut() =
-                        parked_context(ctx, &ctx_state, zone.record(current).identity())?
+                        parked_context(ctx, &ctx_state, zone.record(current).identity(), address)?
                 };
                 let current_ref = zone.record_ref(current);
                 match zone.handback_current(slot, current) {
@@ -633,7 +650,8 @@ where
                     Ok(record) => {
                         // SAFETY: freshly allocated and not yet published.
                         unsafe {
-                            *zone.record(record).ctx_mut() = parked_context(ctx, &state, identity)?
+                            *zone.record(record).ctx_mut() =
+                                parked_context(ctx, &state, identity, None)?
                         };
                         let seq = zone.next_seq(record);
                         if zone
@@ -775,7 +793,9 @@ where
         })?;
         // SAFETY: this freshly allocated record has not been published.
         if let Some((state, ctx, _)) = &syscall_state {
-            unsafe { *zone.record(record).ctx_mut() = parked_context(*ctx, state, identity)? };
+            unsafe {
+                *zone.record(record).ctx_mut() = parked_context(*ctx, state, identity, None)?
+            };
         }
         let seq = zone.next_seq(record);
         let complete =
@@ -1320,7 +1340,9 @@ where
                 .alloc_record(identity)
                 .map_err(|error| ipc_error("park record", error))?;
             // SAFETY: freshly allocated and not yet published.
-            unsafe { *zone.record(record).ctx_mut() = parked_context(ctx, &state, identity)? };
+            unsafe {
+                *zone.record(record).ctx_mut() = parked_context(ctx, &state, identity, None)?
+            };
             let token = host_ipc::to_sched_token(park.token)
                 .map_err(|_| RuntimeError::Configuration("IPC token conversion".to_owned()))?;
             // The park's sequence (the same one `park` publishes).
@@ -1611,6 +1633,43 @@ mod ipc_tests {
     use carrick_el1_abi::ipc::{EventMode, IpcOperation, IpcRegion};
     use carrick_kernel::dispatch::SyscallDispatcher;
     use std::alloc::Layout;
+
+    #[test]
+    fn native_child_zone_capture_retains_address_generation() {
+        use carrick_hal::guest_arch_binding::core_arch::{
+            AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa,
+        };
+        let GuestCpuState::Aarch64V1(cpu) =
+            crate::vcpu_loop::executor::tests::test_guest_cpu_state(0x100)
+        else {
+            unreachable!()
+        };
+        let mut cpu = (*cpu).clone();
+        cpu.ttbr0 = 0x9000;
+        let state = GuestCpuState::from_aarch64_v1(cpu);
+        let identity = ThreadIdentity {
+            tid: 2,
+            serial: 3,
+            mm: 9,
+            generation: 7,
+            affinity: 1,
+            file_table: 0,
+            lifecycle_page: 0,
+            control_slot: 0,
+        };
+        let address = AddressContext {
+            mm: MmGeneration::new(std::num::NonZeroU64::new(9).unwrap()),
+            root: RootGpa::page_aligned(FrameGpa::new(0x9000)).unwrap(),
+            generation: ContextGeneration::new(std::num::NonZeroU64::new(1).unwrap()),
+        };
+        let saved = parked_context(ThreadCtx::ZERO, &state, identity, Some(address)).unwrap();
+        assert_eq!(saved.address_context(), Some(address));
+        let foreign = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0xa000)).unwrap(),
+            ..address
+        };
+        assert!(parked_context(ThreadCtx::ZERO, &state, identity, Some(foreign)).is_err());
+    }
 
     #[test]
     fn zone_save_restores_lease_roots_from_zero_ttbr() {

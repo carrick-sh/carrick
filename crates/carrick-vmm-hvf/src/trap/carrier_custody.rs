@@ -735,7 +735,7 @@ impl CarrierVmCustody {
         }
         let frames = retained
             .admission
-            .admit_root(execution.context)
+            .admit_live_root(execution.context)
             .map_err(|error| {
                 TrapError::Hypervisor(format!("native frame root admission: {error}"))
             })?;

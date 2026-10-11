@@ -130,9 +130,10 @@ impl carrick_hal::NativeFrameInventoryAdmission for NativeRootFrameAdmission {
     ) -> Result<carrick_hal::NativeRootFrameSnapshot, Box<dyn std::error::Error + Send + Sync>>
     {
         if context.root != self.root {
-            return Err(Box::new(std::io::Error::other(
-                "native root admission physical root mismatch",
-            )));
+            return Err(Box::new(std::io::Error::other(format!(
+                "native root admission physical root mismatch: expected={:?} actual={:?} mm={:?}",
+                self.root, context.root, context.mm
+            ))));
         }
         let kernel = self
             .kernel
@@ -142,6 +143,31 @@ impl carrick_hal::NativeFrameInventoryAdmission for NativeRootFrameAdmission {
             .mm
             .upgrade()
             .ok_or_else(|| std::io::Error::other("native root admission MM retired"))?;
+        Ok(kernel
+            .frame_inventory()
+            .transfer_mm_to_guest(&mm, context.into())?)
+    }
+
+    fn admit_live_root(
+        &self,
+        context: carrick_hal::guest_arch_binding::core_arch::AddressContext<
+            carrick_hal::guest_arch_binding::core_arch::RootGpa,
+        >,
+    ) -> Result<carrick_hal::NativeRootFrameSnapshot, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let kernel = self
+            .kernel
+            .upgrade()
+            .ok_or_else(|| std::io::Error::other("native root admission kernel retired"))?;
+        let mm = self
+            .mm
+            .upgrade()
+            .ok_or_else(|| std::io::Error::other("native root admission MM retired"))?;
+        if context.mm.raw() != mm.id().nonzero() {
+            return Err(Box::new(std::io::Error::other(
+                "native root admission MM mismatch",
+            )));
+        }
         Ok(kernel
             .frame_inventory()
             .transfer_mm_to_guest(&mm, context.into())?)

@@ -987,6 +987,10 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         ))
     }
 
+    fn native_frame_inventory_venue(&self) -> bool {
+        false
+    }
+
     fn prepare_el1_frame_grant(
         &mut self,
         _request: carrick_hal::El1FrameGrantRequest,

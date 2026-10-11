@@ -760,6 +760,7 @@ pub const fn aarch64_owner_process_call(ordinal: u64, flags: u64) -> bool {
             | LifecycleCall::Clone3
             | LifecycleCall::ExitGroup,
         ) => true,
+        Family::Identity(IdentityCall::SetTidAddress) => true,
         _ => false,
     }
 }
@@ -1392,6 +1393,7 @@ mod owner_process_call_tests {
         ));
         assert!(aarch64_owner_process_call(nr::WAIT4.raw(), 0));
         assert!(aarch64_owner_process_call(nr::EXIT_GROUP.raw(), 0));
+        assert!(aarch64_owner_process_call(nr::SET_TID_ADDRESS.raw(), 0));
         assert!(aarch64_owner_process_call(nr::WAITID.raw(), 0));
         assert!(aarch64_owner_process_call(nr::CLONE3.raw(), 0));
         assert!(!aarch64_owner_process_call(clone, LINUX_CLONE_THREAD));
