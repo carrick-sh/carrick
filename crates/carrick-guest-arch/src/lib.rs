@@ -34,7 +34,8 @@ ordinal!(
     CounterTick,
     NativeOrdinal,
     UserFlags,
-    FatalCode
+    FatalCode,
+    UserStackOffset,
 );
 
 /// Native address-space register bits, including ARM ASID or x86 control
@@ -424,6 +425,40 @@ pub enum NativeAbi {
     X86_64Syscall,
 }
 
+/// An entry frame decode error during personality dispatch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntryDecodeError {
+    /// A stack or memory argument access faulted on an unmapped or protected address.
+    Fault,
+    /// An entry frame was invalid for this architecture or profile.
+    InvalidFrame,
+    /// The ABI or requested convention is unsupported.
+    UnsupportedAbi,
+    /// Requested argument or operand width is invalid.
+    InvalidWidth,
+    /// Argument or stack access offset is out of bounds.
+    OutOfBounds,
+    /// A transient busy state prevents decoding; the carrier resolves this on
+    /// re-entry after the busy owner settles (not a caller retry loop).
+    Busy,
+    /// An architectural register or execution context is unbound on this host or target.
+    Unbound,
+}
+
+impl core::fmt::Display for EntryDecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Fault => write!(f, "fault: unmapped or protected address"),
+            Self::InvalidFrame => write!(f, "invalid entry frame"),
+            Self::UnsupportedAbi => write!(f, "unsupported ABI"),
+            Self::InvalidWidth => write!(f, "invalid argument width"),
+            Self::OutOfBounds => write!(f, "argument offset out of bounds"),
+            Self::Busy => write!(f, "transient busy state; carrier re-enters when settled"),
+            Self::Unbound => write!(f, "unbound architectural context"),
+        }
+    }
+}
+
 /// Retains the complete ISA-native frame; six Linux arguments are decoded only
 /// after crossing into the Linux personality.
 #[derive(Clone, Copy, Debug)]
@@ -454,6 +489,48 @@ pub enum X86Register {
 }
 pub trait X86Registers {
     fn read(&self, register: X86Register) -> u64;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Aarch64Register {
+    X0,
+    X1,
+    X2,
+    X3,
+    X4,
+    X5,
+    X6,
+    X7,
+    X8,
+    X9,
+    X10,
+    X11,
+    X12,
+    X13,
+    X14,
+    X15,
+    X16,
+    X17,
+    X18,
+    X19,
+    X20,
+    X21,
+    X22,
+    X23,
+    X24,
+    X25,
+    X26,
+    X27,
+    X28,
+    X29,
+    X30,
+    Sp,
+    Pc,
+    Pstate,
+}
+
+pub trait Aarch64Registers {
+    fn read(&self, register: Aarch64Register) -> u64;
 }
 
 /// Opaque native return-register bits. No errno or Linux result in hardware.
@@ -699,6 +776,7 @@ arch_trait!(EntryArch, EntryBackend {
     fn save_context(frame: &Self::NativeFrame) -> Result<Self::SavedContext, Self::Error>;
     fn load_context(frame: &mut Self::NativeFrame, saved: &Self::SavedContext) -> Result<(), Self::Error>;
     fn prepare_user_return(frame: &Self::NativeFrame) -> Result<UserReturn, Self::Error>;
+    fn user_stack_pointer(frame: &Self::NativeFrame) -> Result<UserVa, Self::Error>;
 });
 arch_trait!(MmuArch, MmuBackend {
     fn live_root() -> Result<Self::Root, Self::Error>;

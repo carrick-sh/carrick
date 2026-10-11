@@ -1208,3 +1208,7 @@ contracts = []
 [[surfaces]]
 path = "crates/carrick-kernel-example/tests/seam_reserve_commit.rs"
 contracts = ["kernel.el1.anonymous-reservations", "kernel.el1.anonymous-munmap"]
+
+[[surfaces]]
+path = "crates/carrick-kernel-example/tests/personality_stack_arguments.rs"
+contracts = []
