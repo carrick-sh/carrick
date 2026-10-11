@@ -19,9 +19,10 @@ rationale = "Blocking futex operations must park without redispatch and wake wit
 # zero parked waiters before the nonzero window's exact deadline, then exactly
 # one registration and one counted wake at expiry, with no host sleep or
 # elapsed-time threshold. Production still supplies Instant::now.
-# This single-waiter witness does not prove contention scaling, continuation
-# budgets, guest execution, or Docker runtime ratios; the bindings below retain
-# those obligations.
+# Non-regression witness for continuation.rs blocked continuation extraction:
+# carrick-kernel-example::futex_contention_contract and unit tests in
+# crates/carrick-thread/src/thread.rs confirm contention scaling, continuation
+# budgets, and waiter enrollment invariants remain intact.
 vm_free = "carrick-kernel-example::futex_contention_contract"
 embed = "carrick-embed::futex_contention_contract"
 docker = "probe:futexpingpong"

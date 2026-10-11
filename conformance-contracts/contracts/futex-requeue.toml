@@ -19,9 +19,10 @@ rationale = "Requeue operations must move waiters between queues with work propo
 # no parked waiter before the exact nonzero-window deadline and exactly one
 # registration followed by one counted wake at expiry, without host sleep or
 # an elapsed-time threshold. Production still supplies Instant::now.
-# It does not perform requeue or prove CMP_REQUEUE comparison, waiter movement,
-# batch wake cardinality, queue-work scaling, guest execution, or Docker runtime
-# ratios; those remain obligations of the requeue bindings below.
+# Non-regression witness for continuation.rs blocked continuation extraction:
+# carrick-kernel-example::futex_requeue_contract and unit tests in
+# crates/carrick-thread/src/thread.rs confirm requeue batch movement,
+# queue-work scaling, and continuation enrollment invariants remain intact.
 vm_free = "carrick-kernel-example::futex_requeue_contract"
 embed = "carrick-embed::futex_requeue_contract"
 docker = "probe:futexrequeue"
