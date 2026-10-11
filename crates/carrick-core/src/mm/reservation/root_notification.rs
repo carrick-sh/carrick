@@ -13,6 +13,7 @@ pub(super) enum RootAuthority<
     C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx,
 > {
     Bound(RootReleaseVenue<'a, Policy, Geometry, C>),
+    #[cfg(any(test, feature = "host-test"))]
     SourceFree(SourceFreeReservations<'a, Policy, Geometry>),
 }
 impl<
@@ -25,6 +26,7 @@ impl<
     pub fn release(self) -> Option<RootReleaseVenue<'a, Policy, Geometry, C>> {
         match self {
             Self::Bound(venue) => Some(venue),
+            #[cfg(any(test, feature = "host-test"))]
             Self::SourceFree(fixture) => {
                 let _ = fixture.0;
                 None
@@ -32,11 +34,11 @@ impl<
         }
     }
 }
-
+#[cfg(any(test, feature = "host-test"))]
 pub struct SourceFreeReservations<'a, Policy: ReservationPolicy, Geometry: ReservationGeometry>(
     &'a SharedReservations<Policy, Geometry>,
 );
-
+#[cfg(any(test, feature = "host-test"))]
 impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
     SharedReservations<Policy, Geometry>
 {
@@ -286,11 +288,12 @@ impl<
     }
 }
 
+#[cfg(any(test, feature = "host-test"))]
 impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Copy
     for SourceFreeReservations<'_, Policy, Geometry>
 {
 }
-
+#[cfg(any(test, feature = "host-test"))]
 impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Clone
     for SourceFreeReservations<'_, Policy, Geometry>
 {

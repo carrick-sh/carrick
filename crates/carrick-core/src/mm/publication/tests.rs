@@ -1348,3 +1348,115 @@ fn visits_bounded_by_records_and_touched_edges() {
     // prior; refused: ticket, custody; unmap: prior.
     assert_eq!(small.0, 11);
 }
+
+#[test]
+fn reservation_decommit_returns_published_backing() {
+    use crate::mm::reservation::SharedReservations;
+    use carrick_core_abi::{
+        Decision, ReservationBackingReceipt, ReservationCompletion, ReservationMm,
+        ReservationProtection, ReservationRange,
+    };
+    use carrick_personality_linux::mm::{LinuxReservationLayout, LinuxReservationPolicy};
+    type Geometry = carrick_el1::memory::reservations::NativeReservationGeometry;
+    let table = SharedReservations::<LinuxReservationPolicy, Geometry>::new();
+    let mm = ReservationMm::new(A).unwrap();
+    let range = |start, end| ReservationRange::new(start, end).unwrap();
+    table
+        .publish(
+            0,
+            mm,
+            LinuxReservationLayout {
+                heap: range(0x1000, 0x100000),
+                arena: range(0x100000, 0x8000000),
+                brk: 0x1000,
+                address_limit: u64::MAX,
+                data_limit: u64::MAX,
+                external_address_bytes: 0,
+                external_data_bytes: 0,
+            },
+        )
+        .unwrap();
+    let mut root = table.lock(0, mm).unwrap();
+    root.finish_import().unwrap();
+    let span = range(VA, VA + 64 * 1024 * 1024);
+    let page = range(VA, VA + PAGE);
+    let mut ledger = two_mms();
+    let complete =
+        |root: &mut crate::mm::reservation::Reservations<'_, LinuxReservationPolicy, Geometry>,
+         decision,
+         granted_bytes,
+         returned_bytes| {
+            let Decision::Work(request) = decision else {
+                panic!("expected transaction")
+            };
+            // SAFETY: this existing publication harness owns the exact root and
+            // descriptor/backing ledger; the caller completed its publication first.
+            let receipt = unsafe {
+                ReservationCompletion::after_descriptor_and_backing_commit(
+                    request,
+                    ReservationBackingReceipt {
+                        receipt: request.sequence.raw(),
+                        granted_bytes,
+                        returned_bytes,
+                    },
+                )
+            }
+            .unwrap();
+            root.complete(receipt).unwrap();
+        };
+    let decision = root.reserve_range(span).unwrap();
+    complete(&mut root, decision, 0, 0);
+    assert_eq!(ledger.book.alias_count(), 0);
+    assert_eq!(ledger.book.uses.len(), 0);
+    let decision = root
+        .commit_range(page, ReservationProtection::READ_WRITE)
+        .unwrap();
+    let map = a_map(&mut ledger, 1, A_FRAME);
+    clean(&run(&mut ledger, &[map]));
+    complete(&mut root, decision, PAGE, 0);
+    assert_eq!(ledger.book.alias_count(), 1);
+    assert!(!ledger.reusable(A_FRAME));
+    assert!(root.is_committed(page));
+    let Decision::Work(request) = root.decommit_range(page).unwrap() else {
+        panic!("expected decommit")
+    };
+    let slot = root.reserve_return(page).unwrap();
+    let unmap = Edit::unmap(2, A_FRAME);
+    clean(&run(&mut ledger, &[unmap]));
+    assert_eq!(ledger.book.alias_count(), 0);
+    assert!(ledger.reusable(A_FRAME));
+    assert_eq!(ledger.released.len(), 1);
+    // SAFETY: descriptor retirement published above; root journals the host
+    // return until the already completed publication drain is acknowledged.
+    let receipt = unsafe {
+        ReservationCompletion::after_descriptor_and_backing_commit(
+            request,
+            ReservationBackingReceipt {
+                receipt: request.sequence.raw(),
+                granted_bytes: 0,
+                returned_bytes: 0,
+            },
+        )
+    }
+    .unwrap();
+    root.complete_deferring_return(receipt, slot).unwrap();
+    root.acknowledge_deferred_returns(request.sequence).unwrap();
+    assert_eq!(ledger.book.uses.len(), 0);
+    assert!(root.is_reserved(span));
+    assert!(!root.is_committed(page));
+    let decision = root
+        .commit_range(page, ReservationProtection::READ_WRITE)
+        .unwrap();
+    let map = a_map(&mut ledger, 3, A_FRAME);
+    clean(&run(&mut ledger, &[map]));
+    complete(&mut root, decision, PAGE, 0);
+    assert!(root.is_committed(page));
+    assert_eq!(ledger.book.alias_count(), 1);
+    assert_eq!(
+        root.commit_range(
+            range(0x5000000, 0x5001000),
+            ReservationProtection::READ_WRITE
+        ),
+        Err(carrick_core_abi::Refusal::Hole)
+    );
+}

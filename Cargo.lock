@@ -783,8 +783,6 @@ dependencies = [
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-kernel",
- "carrick-mem",
- "carrick-mmu-core",
  "carrick-observability",
  "carrick-personality-linux",
  "carrick-sched-core",
