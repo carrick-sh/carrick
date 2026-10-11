@@ -411,6 +411,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
     SharedReservations<Policy, Geometry>
 {
     /// Allocate and initialize a zeroed shared reservations table on the heap.
+    #[cfg(any(test, feature = "host-test"))]
     pub fn new() -> alloc::boxed::Box<Self> {
         let ptr = unsafe { alloc::alloc::alloc_zeroed(core::alloc::Layout::new::<Self>()) };
         assert!(!ptr.is_null());
@@ -542,6 +543,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
     }
 
     /// A host thread's single attempt (final settlement, model fixtures).
+    #[cfg(any(test, feature = "host-test"))]
     pub fn lock(
         &self,
         index: usize,
@@ -552,6 +554,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
 
     /// A host thread's acquisition, `wait` deciding whether to retry a held
     /// root.
+    #[cfg(any(test, feature = "host-test"))]
     pub fn lock_waiting(
         &self,
         index: usize,
@@ -1744,7 +1747,10 @@ impl<
         // host's inventory receipt: its VA is not handed out again first.
         if matches!(
             operation,
-            ReservationOperation::Prepare | ReservationOperation::Move
+            ReservationOperation::Prepare
+                | ReservationOperation::Move
+                | ReservationOperation::Protect
+                | ReservationOperation::Decommit
         ) && self.return_owed_within(range)
         {
             return Err(Refusal::Busy);
@@ -2132,10 +2138,19 @@ impl<
     /// Decommit a sub-range within an address-space reservation, revoking access
     /// while retaining the reservation node in the tree.
     ///
-    /// Reuses `mprotect` (`ReservationOperation::Protect`) over `range` to
-    /// `ReservationProtection::NONE`.
+    /// The descriptor/backing owner retires backing through the same return
+    /// transaction as munmap; completion preserves each node's attributes.
     pub fn decommit_range(&mut self, range: ReservationRange) -> Result<Decision, Refusal> {
-        self.mprotect(range, ReservationProtection::NONE)
+        self.proposal(ReservationProposal {
+            range,
+            protection: ReservationProtection::NONE,
+            operation: ReservationOperation::Decommit,
+            result: UserVa::new(0),
+            policy_value: UserVa::new(self.brk_current()),
+            require_coverage: true,
+            source: None,
+            flags: ReservationNodeFlags::EMPTY,
+        })
     }
 
     /// Check whether `range` is fully covered by contiguous reservation nodes.
@@ -2335,13 +2350,21 @@ impl<
         if let Some(source) = pending.request.source {
             self.remove_range(source, &mut spares)?;
         }
-        if pending.request.operation == ReservationOperation::Protect {
+        if matches!(
+            pending.request.operation,
+            ReservationOperation::Protect | ReservationOperation::Decommit
+        ) {
             // Each covered node keeps its own carried attributes.
             self.reprotect_range(range, pending.request.protection, &mut spares)?;
         } else {
             self.remove_range(range, &mut spares)?;
         }
-        if creates && pending.request.operation != ReservationOperation::Protect {
+        if creates
+            && !matches!(
+                pending.request.operation,
+                ReservationOperation::Protect | ReservationOperation::Decommit
+            )
+        {
             let id = spares.take()?;
             let mut node = NodeData {
                 start: range.start(),
@@ -2485,7 +2508,7 @@ impl<
         }
         Ok(released)
     }
-    /// Complete a pending `Retire` (or a `Prepare` replacing resident memory)
+    /// Complete a pending `Retire`, `Decommit` (or a `Prepare` replacing resident memory)
     /// whose stage-1 terminals the guest venue retired, and journal the
     /// range as an owed return in `slot` ([`Self::reserve_return`]).
     /// `completion.backing()` returned nothing yet: the frames stay in the
@@ -2500,7 +2523,9 @@ impl<
             Some(request)
                 if matches!(
                     request.operation,
-                    ReservationOperation::Retire | ReservationOperation::Prepare
+                    ReservationOperation::Retire
+                        | ReservationOperation::Prepare
+                        | ReservationOperation::Decommit
                 ) && completion.backing().returned_bytes == 0 =>
             {
                 request
@@ -4858,11 +4883,13 @@ mod tests {
     fn reserve_commit_decommit_range_lifecycle() {
         let table = table();
         let mm = ReservationMm::new(88).unwrap();
-        table.publish(0, mm, layout()).unwrap();
+        let mut layout = layout();
+        layout.arena = range(0x100000, 0x8000000);
+        table.publish(0, mm, layout).unwrap();
         let mut g = table.lock(0, mm).unwrap();
         g.finish_import().unwrap();
 
-        let reserve_span = range(0x200000, 0x300000);
+        let reserve_span = range(0x200000, 0x4200000);
         let decision = g.reserve_range(reserve_span).unwrap();
         complete(&mut g, decision);
 
@@ -4879,6 +4906,40 @@ mod tests {
         assert!(g.is_committed(commit_span));
         assert!(!g.is_committed(reserve_span));
 
+        let Decision::Work(request) = g.decommit_range(commit_span).unwrap() else {
+            panic!("expected decommit transaction");
+        };
+        let slot = g.reserve_return(commit_span).unwrap();
+        // SAFETY: this root fixture models a completed descriptor retirement;
+        // inventory return remains owed until the host acknowledgement below.
+        let completion = unsafe {
+            ReservationCompletion::after_descriptor_and_backing_commit(
+                request,
+                ReservationBackingReceipt {
+                    receipt: request.sequence.raw(),
+                    granted_bytes: 0,
+                    returned_bytes: 0,
+                },
+            )
+        }
+        .unwrap();
+        g.complete_deferring_return(completion, slot).unwrap();
+        let mut owed = Vec::new();
+        g.observe_deferred_returns(&mut |extent| owed.push(extent));
+        assert_eq!(owed.len(), 1);
+        assert!(g.is_reserved(reserve_span));
+        assert!(!g.is_committed(commit_span));
+        assert_eq!(
+            g.commit_range(commit_span, ReservationProtection::READ_WRITE),
+            Err(Refusal::Busy)
+        );
+        assert_eq!(g.acknowledge_deferred_returns(request.sequence).unwrap(), 1);
+        assert!(g.is_reserved(reserve_span));
+        let decision = g
+            .commit_range(commit_span, ReservationProtection::READ_WRITE)
+            .unwrap();
+        complete(&mut g, decision);
+        assert!(g.is_committed(commit_span));
         let decision = g.decommit_range(commit_span).unwrap();
         complete(&mut g, decision);
 

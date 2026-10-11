@@ -122,6 +122,8 @@ pub enum ReservationOperation {
     /// `protection`, and move the first `min(source, range)` bytes of
     /// contents (residency) from the source to the destination.
     Move = 4,
+    /// Revoke access and return backing while preserving the reservation.
+    Decommit = 5,
 }
 
 /// The generation is the *current* committed root revision. The pending
