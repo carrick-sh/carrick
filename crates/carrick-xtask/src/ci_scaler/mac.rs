@@ -999,15 +999,19 @@ pub fn clone_runner_tree(shared: &Path, clone: &Path) -> Result<(), ScalerError>
     };
     let (src, dst) = (cstr(shared)?, cstr(clone)?);
     #[cfg(target_os = "macos")]
-    if unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), 0) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
+    {
+        // SAFETY: both pointers are valid NUL-terminated paths owned by
+        // `src`/`dst` for the duration of the call.
+        if unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (src, dst);
-        return Err(ScalerError::Guard("runner clones require macOS clonefile"));
+        Err(ScalerError::Guard("runner clones require macOS clonefile"))
     }
-    Ok(())
 }
 
 /// Hand a verified clone to the run user: fresh private `_work`/`_diag`
