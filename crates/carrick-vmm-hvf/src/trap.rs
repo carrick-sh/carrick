@@ -398,6 +398,8 @@ mod frame_inventory;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod guest_cow;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) mod native_cow;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) mod native_frame_custody;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use guest_cow::CarrierGuestCowSettlement;
@@ -8111,7 +8113,7 @@ impl HvfInner {
     pub(crate) fn run_to_exit(
         vcpu: &mut applevisor::vcpu::Vcpu,
         mailbox: &mut MailboxBinding,
-        custody: &CarrierVmCustody,
+        custody: &std::sync::Arc<CarrierVmCustody>,
         vm_generation: Option<CarrierVmGeneration>,
     ) -> Result<carrick_aarch64::Aarch64Exit, TrapError> {
         // The slot runs (odd sequence) for exactly this call: a host thread
@@ -8136,7 +8138,7 @@ impl HvfInner {
     fn run_to_exit_inner(
         vcpu: &mut applevisor::vcpu::Vcpu,
         mailbox: &mut MailboxBinding,
-        custody: &CarrierVmCustody,
+        custody: &std::sync::Arc<CarrierVmCustody>,
         vm_generation: Option<CarrierVmGeneration>,
         kick_armed: &mut bool,
     ) -> Result<carrick_aarch64::Aarch64Exit, TrapError> {

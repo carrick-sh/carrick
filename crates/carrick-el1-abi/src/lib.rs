@@ -349,6 +349,9 @@ pub const GRANT_OP_ROOT_EXIT: u64 = 4;
 /// Operation code for child retirement notification (HVC #6).
 pub const GRANT_OP_CHILD_RETIRE: u64 = 5;
 
+/// Owner-selected native physical stock supply and completion (HVC #6).
+pub const GRANT_OP_OWNER_SUPPLY: u64 = 6;
+
 /// Metadata grant hypercall outcome: successful extent allocation or return.
 pub const METADATA_GRANT_SUCCESS: u64 = 0;
 
@@ -1409,6 +1412,16 @@ impl MetadataGrantMailbox {
 /// The implementation delivers record wakes only after that lock is released.
 pub trait MetadataCompletionWake: Send + Sync + core::fmt::Debug {
     fn publish_and_wake(&self, mailbox: &MetadataGrantMailbox, generation: u64, response: [u64; 4]);
+}
+
+/// Native MM editor release delivers owned zone wakes through the kernel
+/// graph. It requires no host thread or host MM access row for the owner.
+pub trait NativeSpaceCompletionWake: Send + Sync + core::fmt::Debug {
+    fn complete(
+        &self,
+        zone: &ZoneTables,
+        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, ZoneContext>,
+    );
 }
 
 impl Default for MetadataGrantMailbox {

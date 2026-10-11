@@ -4,7 +4,7 @@ use crate::host_mapping::{HostMappingKind, OwnedHostMapping};
 use carrick_el1_abi::{
     EL1_DYNAMIC_METADATA_BASE, EL1_DYNAMIC_METADATA_EXTENT_SIZE, EL1_DYNAMIC_METADATA_SIZE,
     ForkStockExchange, ForkStockKind, ForkStockRefusal, ForkStockSettlement, GRANT_OP_CHILD_RETIRE,
-    GRANT_OP_FORK_STOCK, GRANT_OP_ROOT_EXIT, METADATA_GRANT_ERR_ALIGNMENT,
+    GRANT_OP_FORK_STOCK, GRANT_OP_OWNER_SUPPLY, GRANT_OP_ROOT_EXIT, METADATA_GRANT_ERR_ALIGNMENT,
     METADATA_GRANT_ERR_DENIED, METADATA_GRANT_ERR_INVALID, METADATA_GRANT_ERR_NOT_FOUND,
     METADATA_GRANT_OP_ALLOC, METADATA_GRANT_OP_FREE, METADATA_GRANT_SUCCESS, NativeChildRetire,
     NativeRootExit,
@@ -322,6 +322,15 @@ impl CarrierMetadataAccess {
     ) -> Result<(), MetadataResolutionError> {
         self.region()?;
         *self.carrier.custody.metadata_completion.lock() = Some(wake);
+        Ok(())
+    }
+
+    pub fn install_native_space_completion(
+        &self,
+        wake: Arc<dyn carrick_el1_abi::NativeSpaceCompletionWake>,
+    ) -> Result<(), MetadataResolutionError> {
+        self.region()?;
+        *self.carrier.custody.native_space_completion.lock() = Some(wake);
         Ok(())
     }
 
@@ -798,7 +807,7 @@ fn drain_fork_quarantine(
 /// fork stock. Lifecycle records and physical table pages have disjoint stock.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn provision_boot_fork_stock(
-    custody: &crate::trap::CarrierVmCustody,
+    custody: &Arc<crate::trap::CarrierVmCustody>,
 ) -> Result<(), TrapError> {
     let generation = custody.live_generation().ok_or_else(|| {
         TrapError::Hypervisor("fork stock has no live carrier generation".to_owned())
@@ -850,7 +859,7 @@ pub(crate) fn provision_boot_fork_stock(
 // and its authenticated execution; combining them would hide wire polarity.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn service_metadata_operation(
-    custody: &crate::trap::CarrierVmCustody,
+    custody: &Arc<crate::trap::CarrierVmCustody>,
     generation: Option<crate::trap::CarrierVmGeneration>,
     cpu: carrick_guest_arch::CpuId,
     execution: Option<crate::fork_stock::GrantExecution>,
@@ -865,6 +874,33 @@ pub(crate) fn service_metadata_operation(
         .0;
     let aperture = metadata_aperture(custody);
 
+    if op == GRANT_OP_OWNER_SUPPLY {
+        let Some(execution) = execution
+            .filter(|execution| execution.cpu == cpu && arg2 == u64::from(cpu.raw()) && arg3 == 0)
+        else {
+            return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+        };
+        let pending = custody
+            .native_cow_pending
+            .get(cpu.raw() as usize)
+            .ok_or_else(|| TrapError::Hypervisor("native owner supply CPU index".into()))?;
+        let has_pending = pending.lock().is_some();
+        let result = if has_pending {
+            crate::trap::native_cow::settle(
+                custody,
+                execution,
+                carrick_guest_arch::UserVa::new(arg1),
+            )
+        } else {
+            crate::trap::native_cow::supply(
+                custody,
+                execution,
+                carrick_guest_arch::UserVa::new(arg1),
+            )
+        };
+        result?;
+        return Ok([METADATA_GRANT_SUCCESS, 0, 0, 0]);
+    }
     if op == METADATA_GRANT_OP_ALLOC {
         GRANTS_REQUESTED.fetch_add(1, Ordering::Relaxed);
 
@@ -1362,7 +1398,7 @@ pub use delayed_owner::{
 /// pending-host-work boundary. Returns whether this boundary claimed work.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn service_pending_metadata_request(
-    custody: &crate::trap::CarrierVmCustody,
+    custody: &Arc<crate::trap::CarrierVmCustody>,
     generation: Option<crate::trap::CarrierVmGeneration>,
 ) -> Result<bool, TrapError> {
     let Some(mailbox) = carrick_el1_abi::metadata_mailbox_host() else {
@@ -1389,7 +1425,7 @@ pub(crate) fn service_pending_metadata_request(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn complete_metadata_request(
-    custody: &crate::trap::CarrierVmCustody,
+    custody: &Arc<crate::trap::CarrierVmCustody>,
     generation: Option<crate::trap::CarrierVmGeneration>,
     mailbox: &carrick_el1_abi::MetadataGrantMailbox,
     request_generation: u64,
@@ -1427,7 +1463,7 @@ fn complete_metadata_request(
 pub(crate) fn handle_metadata_grant_trap(
     vcpu: &mut applevisor::vcpu::Vcpu,
     cpu: carrick_guest_arch::CpuId,
-    custody: &crate::trap::CarrierVmCustody,
+    custody: &Arc<crate::trap::CarrierVmCustody>,
     generation: Option<crate::trap::CarrierVmGeneration>,
 ) -> Result<MetadataTrapOutcome, TrapError> {
     use applevisor::vcpu::{Reg, SysReg};
@@ -1446,13 +1482,18 @@ pub(crate) fn handle_metadata_grant_trap(
         .map_err(|e| TrapError::Hypervisor(format!("failed to read X3 for metadata grant: {e}")))?;
     let process_crossing = matches!(
         op,
-        GRANT_OP_FORK_STOCK | GRANT_OP_ROOT_EXIT | GRANT_OP_CHILD_RETIRE
+        GRANT_OP_FORK_STOCK | GRANT_OP_ROOT_EXIT | GRANT_OP_CHILD_RETIRE | GRANT_OP_OWNER_SUPPLY
     );
     let active = if process_crossing {
         let ttbr0 = vcpu.get_sys_reg(SysReg::TTBR0_EL1).map_err(|e| {
             TrapError::Hypervisor(format!("failed to read TTBR0 for fork-stock grant: {e}"))
         })?;
-        live_fork_execution(cpu, ttbr0)
+        live_fork_execution(cpu, ttbr0).filter(|execution| {
+            op != GRANT_OP_OWNER_SUPPLY
+                || carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)
+                    .and_then(|slot| live_cow_scope(slot, execution.context))
+                    .is_some_and(|scope| scope.execution == execution.binding)
+        })
     } else {
         None
     };
@@ -1693,7 +1734,7 @@ mod tests {
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn metadata_extent_pin_authenticates_owner_and_blocks_return() {
-        let custody = crate::trap::CarrierVmCustody::new();
+        let custody = Arc::new(crate::trap::CarrierVmCustody::new());
         let generation = custody.begin_create().unwrap();
         custody.commit_create(generation).unwrap();
         let size = EL1_DYNAMIC_METADATA_EXTENT_SIZE;
@@ -1740,7 +1781,7 @@ mod tests {
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn metadata_publication_has_an_exact_stage2_record() {
-        let custody = crate::trap::CarrierVmCustody::new();
+        let custody = Arc::new(crate::trap::CarrierVmCustody::new());
         let generation = custody.begin_create().expect("create");
         custody.commit_create(generation).expect("live");
         let spec = crate::trap::CarrierStage2RecordSpec {
@@ -1789,7 +1830,7 @@ mod tests {
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn metadata_backing_follows_exact_vm_terminal_transition() {
-        let custody = crate::trap::CarrierVmCustody::new();
+        let custody = Arc::new(crate::trap::CarrierVmCustody::new());
         let first = custody.begin_create().expect("create first");
         custody.commit_create(first).expect("publish first");
         assert!(request_has_live_vm(&custody, Some(first)));
@@ -1854,7 +1895,7 @@ mod tests {
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn failed_return_keeps_backing_and_aperture_reserved() {
-        let custody = crate::trap::CarrierVmCustody::new();
+        let custody = Arc::new(crate::trap::CarrierVmCustody::new());
         let generation = custody.begin_create().expect("create");
         custody.commit_create(generation).expect("live");
         let mut state = HostApertureState::new();
@@ -1962,7 +2003,7 @@ mod tests {
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn oversized_metadata_request_is_invalid_without_reserving_aperture() {
-        let custody = crate::trap::CarrierVmCustody::new();
+        let custody = Arc::new(crate::trap::CarrierVmCustody::new());
         let generation = custody.begin_create().expect("create");
         custody.commit_create(generation).expect("live");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1992,7 +2033,7 @@ mod tests {
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn retained_slab_exhaustion_refuses_without_backend_work() {
-        let custody = crate::trap::CarrierVmCustody::new();
+        let custody = Arc::new(crate::trap::CarrierVmCustody::new());
         let generation = custody.begin_create().unwrap();
         custody.commit_create(generation).unwrap();
         let mut aperture = metadata_aperture(&custody).lock();
@@ -2113,7 +2154,7 @@ mod tests {
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn deferred_metadata_service_reauthenticates_retired_generation() {
-        let custody = crate::trap::CarrierVmCustody::new();
+        let custody = Arc::new(crate::trap::CarrierVmCustody::new());
         let generation = custody.begin_create().unwrap();
         custody.commit_create(generation).unwrap();
         let mailbox = carrick_el1_abi::MetadataGrantMailbox::new();

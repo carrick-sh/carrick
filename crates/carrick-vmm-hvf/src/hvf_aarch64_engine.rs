@@ -248,6 +248,20 @@ impl HostCowStats {
 }
 
 impl HostCowLedger {
+    /// Credit carrier-owned native stock without creating a host MM row.
+    pub(crate) fn record_guest_cow_provisioned(&self, grants: u64) {
+        self.inner
+            .guest_cow_provisioned
+            .fetch_add(grants, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Credit a verified native completion after its pool record is released.
+    pub(crate) fn record_guest_cow_settled(&self) {
+        self.inner
+            .guest_cow_settled
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> HostCowSnapshot {
         use std::sync::atomic::Ordering;
         HostCowSnapshot {
@@ -341,10 +355,7 @@ impl HostCowStats {
     /// A guest EL1 COW completion of this MM was settled (not a host COW).
     pub(crate) fn record_guest_cow_settled(&self) {
         if let Some(ledger) = &self.ledger {
-            ledger
-                .inner
-                .guest_cow_settled
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ledger.record_guest_cow_settled();
         }
     }
 
@@ -358,10 +369,7 @@ impl HostCowStats {
 
     pub(crate) fn record_guest_cow_provisioned(&self, grants: u64) {
         if let Some(ledger) = &self.ledger {
-            ledger
-                .inner
-                .guest_cow_provisioned
-                .fetch_add(grants, std::sync::atomic::Ordering::Relaxed);
+            ledger.record_guest_cow_provisioned(grants);
         }
     }
 

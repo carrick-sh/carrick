@@ -116,6 +116,23 @@ impl ObjectWakeDelivery {
 #[derive(Debug)]
 pub struct MetadataCompletionWake;
 
+/// Guest-only MM editor releases use the existing kernel handback and kick
+/// venue; a native child never needs a host MM object to publish these wakes.
+#[derive(::core::fmt::Debug)]
+pub struct NativeSpaceCompletionWake;
+impl carrick_el1_abi::NativeSpaceCompletionWake for NativeSpaceCompletionWake {
+    fn complete(
+        &self,
+        zone: &carrick_el1_abi::ZoneTables,
+        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_el1_abi::ZoneContext,
+        >,
+    ) {
+        complete_object_wake(zone, effects);
+    }
+}
+
 impl carrick_el1_abi::MetadataCompletionWake for MetadataCompletionWake {
     fn publish_and_wake(
         &self,

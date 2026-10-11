@@ -331,6 +331,7 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         let mut cow = carrick_core::mm::transfer::resolver::NoopCowResolver;
         #[cfg(target_arch = "aarch64")]
         let mut cow = crate::fault::HardwareCowResolver {
+            needs_supply: false,
             publication: slots.executable(frame.slot as usize),
             completion: None,
             service_slot: Some(executor_slot),
