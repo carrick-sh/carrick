@@ -60,9 +60,17 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: actionlint@1.7.12
+      # install-action's pinned manifest lacks actionlint and falls back to
+      # cargo-binstall (not a crate); fetch the official release, pinned.
+      - name: Install actionlint 1.7.12 (checksum-pinned)
+        run: |
+          set -euo pipefail
+          v=1.7.12
+          f="actionlint_${v}_linux_amd64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$f" "https://github.com/rhysd/actionlint/releases/download/v${v}/$f"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/$f" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP" actionlint
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - name: Lint GitHub Actions workflows
         run: actionlint .github/workflows/*.yml
 
