@@ -67,12 +67,18 @@ impl<T: ControlRecord> Deref for RetainedControl<T> {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct SelectedNativeCowSource {
+    pub(crate) rows: Vec<carrick_hal::PhysicalMappingRow>,
+    run: carrick_mmu_core::aarch64::descriptor_txn::guest_cow::GuestCowRun,
+}
+
 /// Authenticate a selected native COW source without a host MM row.
 pub(crate) fn selected_source(
     custody: &Arc<CarrierVmCustody>,
     execution: crate::fork_stock::GrantExecution,
     fault: UserVa,
-) -> Result<carrick_hal::PhysicalMappingRow, TrapError> {
+) -> Result<SelectedNativeCowSource, TrapError> {
     use super::native_frame_custody::{NativeRootWords, selected_row};
     let fail = || TrapError::Hypervisor("native COW source custody mismatch".into());
     let source = custody.admit_native_frame_execution(execution)?;
@@ -83,26 +89,20 @@ pub(crate) fn selected_source(
         false,
     )
     .map_err(|_| fail())?;
-    let row = {
-        let stock = custody.fork_stock.lock();
-        let frames = stock.root_frames(execution.context).ok_or_else(fail)?;
-        selected_row(
-            frames,
-            carrick_guest_arch::FrameGpa::new(run.old_ipa.0),
-            run.len,
-        )
-        .map_err(|_| fail())?
-    };
-    if source
-        .bind(execution.context.into())
-        .live_mapping_row(row.mapping)
-        != Some(row)
-    {
-        return Err(fail());
-    }
+    let authority = source.bind(execution.context.into());
+    let stock = custody.fork_stock.lock();
+    let frames = stock.root_frames(execution.context).ok_or_else(fail)?;
+    let mut rows = Vec::with_capacity((run.len / 4096) as usize);
     let residency = RetainedControl::<carrick_el1_abi::FrameGrantResidencyTable>::new(custody)?;
     for offset in (0..run.len).step_by(4096) {
         let physical = run.old_ipa.0 + offset;
+        let row = selected_row(frames, FrameGpa::new(physical), 4096).map_err(|_| fail())?;
+        if authority.live_mapping_row(row.mapping) != Some(row) {
+            return Err(fail());
+        }
+        if rows.last() != Some(&row) {
+            rows.push(row);
+        }
         let identity = custody
             .stage2_record_covering(physical, 4096)
             .ok_or_else(fail)?;
@@ -122,7 +122,7 @@ pub(crate) fn selected_source(
             return Err(fail());
         }
     }
-    Ok(row)
+    Ok(SelectedNativeCowSource { rows, run })
 }
 
 /// The physical stock exposed to one stopped CPU. Completion retains this
@@ -130,7 +130,7 @@ pub(crate) fn selected_source(
 pub(crate) struct PendingNativeCow {
     execution: crate::fork_stock::GrantExecution,
     window: carrick_el1_abi::PortalGrantWindow,
-    source: carrick_hal::PhysicalMappingRow,
+    sources: Vec<carrick_hal::PhysicalMappingRow>,
     run: carrick_mmu_core::aarch64::descriptor_txn::guest_cow::GuestCowRun,
     source_records: Vec<super::CarrierStage2RecordIdentity>,
     grant: carrick_el1_abi::CowGrant,
@@ -208,14 +208,8 @@ pub(crate) fn supply(
     let _pause = access
         .try_exclude_editor(space, mm)
         .map_err(|_| failure("editor exclusion"))?;
-    let source_row = selected_source(custody, execution, fault)?;
-    let run = carrick_mmu_core::aarch64::descriptor_txn::guest_cow::classify_guest_cow_write(
-        &super::native_frame_custody::NativeRootWords { custody },
-        carrick_mmu_core::aarch64::SubstrateGpa(execution.context.root.address().raw()),
-        fault.raw(),
-        false,
-    )
-    .map_err(|_| failure("source changed under editor exclusion"))?;
+    let selected = selected_source(custody, execution, fault)?;
+    let run = selected.run;
     let source_records = (0..run.len)
         .step_by(4096)
         .map(|offset| {
@@ -295,7 +289,7 @@ pub(crate) fn supply(
     *pending = Some(PendingNativeCow {
         execution,
         window,
-        source: source_row,
+        sources: selected.rows,
         run,
         source_records,
         grant,
@@ -348,7 +342,10 @@ pub(crate) fn settle(
         .ok_or_else(|| failure("pending execution/root mismatch"))?;
     let source = custody.admit_native_frame_execution(execution)?;
     let authority = source.bind(execution.context.into());
-    if authority.live_mapping_row(pending.source.mapping) != Some(pending.source)
+    if pending
+        .sources
+        .iter()
+        .any(|row| authority.live_mapping_row(row.mapping) != Some(*row))
         || authority.live_mapping_row(pending.replacement.mapping) != Some(pending.replacement)
         || !pending
             .receipt
@@ -476,7 +473,7 @@ pub(crate) fn settle(
         .lock()
         .publish_native_cow_frame(
             execution.context,
-            pending.source,
+            &pending.sources,
             pending.replacement,
             NonZeroU64::new(pending.receipt.revision())
                 .ok_or_else(|| failure("inventory revision"))?,

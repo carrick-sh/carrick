@@ -247,7 +247,7 @@ impl ForkStockHostCustody {
     pub(crate) fn publish_native_cow_frame(
         &mut self,
         context: AddressContext<RootGpa>,
-        source: carrick_hal::PhysicalMappingRow,
+        sources: &[carrick_hal::PhysicalMappingRow],
         replacement: carrick_hal::PhysicalMappingRow,
         revision: NonZeroU64,
     ) -> Result<(), ForkStockServiceError> {
@@ -257,13 +257,15 @@ impl ForkStockHostCustody {
             .filter(|root| root.context == context)
             .and_then(|root| root.frames.as_mut())
             .ok_or(ForkStockServiceError::StaleExecution)?;
-        if super::trap::native_frame_custody::selected_row(
-            frames,
-            FrameGpa::new(source.gpa.0),
-            source.length.raw(),
-        )? != source
-        {
-            return Err(ForkStockServiceError::StaleExecution);
+        for source in sources {
+            if super::trap::native_frame_custody::selected_row(
+                frames,
+                FrameGpa::new(source.gpa.0),
+                source.length.raw(),
+            )? != *source
+            {
+                return Err(ForkStockServiceError::StaleExecution);
+            }
         }
         let index = frames
             .mappings
@@ -1604,6 +1606,19 @@ mod tests {
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn dispatcher_fork_commit_publishes_native_child_frame_custody() {
+        native_child_cow_fixture(false);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn native_child_cow_run_crosses_four_canonical_rows() {
+        native_child_cow_fixture(true);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn native_child_cow_fixture(split: bool) {
+        let pages = if split { 4 } else { 1 };
+        let run_len = pages * 4096;
         use carrick_hal::PhysicalFrameInventory;
         use std::sync::Arc;
 
@@ -1638,36 +1653,43 @@ mod tests {
         let source = inventory
             .physical_projection(Arc::new(carrick_kernel::kernel::ObjectIdRegistry::new()));
         let parent = source.bind(execution.context.into());
-        let mut reservation = parent.reserve(1, 1, 2).unwrap();
+        let mut reservation = parent
+            .reserve(1, pages as usize, 2 * pages as usize)
+            .unwrap();
         let transaction = reservation.transaction();
         let frame = reservation.claim_frame().unwrap();
-        let mapping = reservation.claim_mapping().unwrap();
-        // All generation domains deliberately differ in this witness.
-        let mapping_generation =
-            carrick_hal::MappingGeneration::from_backend_counter(NonZeroU64::MIN);
-        let length = carrick_hal::FrameLength::from_mapping_extent(NonZeroU64::new(16384).unwrap());
-        reservation
-            .push(carrick_hal::FrameInventoryEvent::PrepareMapping {
-                transaction,
-                frame,
-                mapping,
-                generation: mapping_generation,
-                gpa: carrick_guest_mem::Gpa(0x50000),
-                length,
-                permissions: carrick_hal::MemPerms {
-                    read: true,
-                    write: true,
-                    exec: false,
-                },
-            })
-            .unwrap();
-        reservation
-            .push(carrick_hal::FrameInventoryEvent::PublishMapping {
-                transaction,
-                mapping,
-                generation: mapping_generation,
-            })
-            .unwrap();
+        let mut mappings = Vec::new();
+        for index in 0..pages {
+            let mapping = reservation.claim_mapping().unwrap();
+            mappings.push(mapping);
+            let generation = carrick_hal::MappingGeneration::from_backend_counter(NonZeroU64::MIN);
+            let length = carrick_hal::FrameLength::from_mapping_extent(
+                NonZeroU64::new(if split { 4096 } else { 16384 }).unwrap(),
+            );
+            reservation
+                .push(carrick_hal::FrameInventoryEvent::PrepareMapping {
+                    transaction,
+                    frame,
+                    mapping,
+                    generation,
+                    gpa: carrick_guest_mem::Gpa(0x50000 + index * 4096),
+                    length,
+                    permissions: carrick_hal::MemPerms {
+                        read: true,
+                        write: true,
+                        exec: false,
+                    },
+                })
+                .unwrap();
+            reservation
+                .push(carrick_hal::FrameInventoryEvent::PublishMapping {
+                    transaction,
+                    mapping,
+                    generation,
+                })
+                .unwrap();
+        }
+        let mapping = mappings[0];
         let receipt = parent.apply_with_receipt(reservation.commit(())).unwrap();
         custody
             .bind_native_frame_inventory(Arc::new(Admission {
@@ -1676,7 +1698,10 @@ mod tests {
                 snapshot: carrick_hal::NativeRootFrameSnapshot {
                     owner: execution.context.into(),
                     revision: NonZeroU64::new(receipt.revision()).unwrap(),
-                    mappings: vec![parent.live_mapping_row(mapping).unwrap()],
+                    mappings: mappings
+                        .iter()
+                        .map(|mapping| parent.live_mapping_row(*mapping).unwrap())
+                        .collect(),
                 },
             }))
             .unwrap();
@@ -1810,17 +1835,22 @@ mod tests {
         // the stopped parent's live root rather than treated as an IPA.
         let kernel_block: u64 = 0x2000_0000 | 1 | (1 << 10) | (1 << 54);
         parent_tables[2].0[2048..2056].copy_from_slice(&kernel_block.to_ne_bytes());
-        parent_tables[3].0[32..40].copy_from_slice(&leaf.to_ne_bytes());
-        tables[3].0[32..40].copy_from_slice(&leaf.to_ne_bytes());
-        let words = carrick_el1_abi::PortalForkCustody::Frame {
-            va: 0x4000,
-            ipa: 0x50000,
-            len: 4096,
-            shared: false,
-        }
-        .words();
-        for (index, word) in words.iter().enumerate() {
-            records.0[512 + index * 8..520 + index * 8].copy_from_slice(&word.to_ne_bytes());
+        for index in 0..pages {
+            let offset = (4 + index as usize) * 8;
+            let page_leaf = leaf + index * 4096;
+            parent_tables[3].0[offset..offset + 8].copy_from_slice(&page_leaf.to_ne_bytes());
+            tables[3].0[offset..offset + 8].copy_from_slice(&page_leaf.to_ne_bytes());
+            let words = carrick_el1_abi::PortalForkCustody::Frame {
+                va: 0x4000 + index * 4096,
+                ipa: 0x50000 + index * 4096,
+                len: 4096,
+                shared: false,
+            }
+            .words();
+            for (word_index, word) in words.iter().enumerate() {
+                let offset = 512 + index as usize * words.len() * 8 + word_index * 8;
+                records.0[offset..offset + 8].copy_from_slice(&word.to_ne_bytes());
+            }
         }
         let child_handle = unsafe {
             carrick_el1_abi::El1MmHandle::from_admitted_owner(
@@ -1837,7 +1867,8 @@ mod tests {
             parent_tables_used: 4096,
         };
         let settlement =
-            ForkStockSettlement::new(loan, completion, KernelVa::new(record_ipa + 512), 1).unwrap();
+            ForkStockSettlement::new(loan, completion, KernelVa::new(record_ipa + 512), pages)
+                .unwrap();
         unsafe {
             records
                 .0
@@ -1848,7 +1879,10 @@ mod tests {
         // A custody selection must name the actual output of both roots.
         records.0[528..536].copy_from_slice(&0x51000u64.to_ne_bytes());
         assert_eq!(dispatch()[0], carrick_el1_abi::METADATA_GRANT_ERR_DENIED);
-        assert_eq!(parent.frame_mapping_count(frame).unwrap(), Some(1));
+        assert_eq!(
+            parent.frame_mapping_count(frame).unwrap(),
+            Some(pages as usize)
+        );
         records.0[528..536].copy_from_slice(&0x50000u64.to_ne_bytes());
         // Alias staging must roll back if table settlement subsequently
         // refuses a dirty page advertised as unused.
@@ -1858,9 +1892,13 @@ mod tests {
             parent_tables_used: 0,
             ..completion
         };
-        let refused =
-            ForkStockSettlement::new(loan, refused_completion, KernelVa::new(record_ipa + 512), 1)
-                .unwrap();
+        let refused = ForkStockSettlement::new(
+            loan,
+            refused_completion,
+            KernelVa::new(record_ipa + 512),
+            pages,
+        )
+        .unwrap();
         unsafe {
             records
                 .0
@@ -1869,10 +1907,14 @@ mod tests {
                 .write(refused);
         }
         assert_eq!(dispatch()[0], carrick_el1_abi::METADATA_GRANT_ERR_DENIED);
-        assert_eq!(parent.frame_mapping_count(frame).unwrap(), Some(1));
+        assert_eq!(
+            parent.frame_mapping_count(frame).unwrap(),
+            Some(pages as usize)
+        );
         tables[parent_stock_index].0[0] = 0;
         let settlement =
-            ForkStockSettlement::new(loan, completion, KernelVa::new(record_ipa + 512), 1).unwrap();
+            ForkStockSettlement::new(loan, completion, KernelVa::new(record_ipa + 512), pages)
+                .unwrap();
         unsafe {
             records
                 .0
@@ -1883,7 +1925,7 @@ mod tests {
         assert_eq!(dispatch()[0], carrick_el1_abi::METADATA_GRANT_SUCCESS);
         assert_eq!(
             parent.frame_mapping_count(frame).unwrap(),
-            Some(2),
+            Some(2 * pages as usize),
             "fork commit must publish the native child's reference before it can enter"
         );
         let child = custody
@@ -1898,7 +1940,7 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(child_rows.owner, child.into());
-        assert_eq!(child_rows.mappings.len(), 1);
+        assert_eq!(child_rows.mappings.len(), pages as usize);
         let child_row = child_rows.mappings[0];
         assert_eq!(child_row.frame, frame);
         assert_ne!(child_row.mapping, mapping);
@@ -1933,7 +1975,8 @@ mod tests {
                 child_execution,
                 carrick_guest_arch::UserVa::new(0x4000)
             )
-            .expect("guest-only child COW source must be admitted"),
+            .expect("guest-only child COW source must be admitted")
+            .rows[0],
             child_row
         );
         let mut stale_execution = child_execution;
@@ -2067,28 +2110,34 @@ mod tests {
         assert!(custody.native_cow_pending[0].lock().is_some());
         // The guest resolver owns copy and stores. This fixture performs its
         // exact final projection and receipt against real retained leaf words.
-        assert!(residency.retire_small_span(302, 0x4000, 4096));
+        assert!(residency.retire_small_span(302, 0x4000, run_len));
         let replacement_leaf = (leaf & !0x0000_ffff_ffff_f000 & !(3 << 6) & !(1 << 55))
             | grant.physical_ipa
             | (1 << 6);
-        tables[3].0[32..40].copy_from_slice(&replacement_leaf.to_ne_bytes());
+        for index in 0..pages {
+            let offset = (4 + index as usize) * 8;
+            tables[3].0[offset..offset + 8]
+                .copy_from_slice(&(replacement_leaf + index * 4096).to_ne_bytes());
+        }
         let replacement_residency = carrick_el1_abi::FrameGrantResidencyIdentity {
             mm_key: 302,
             semantic_base: 0x4000,
             physical_ipa: grant.physical_ipa,
-            len: 4096,
+            len: run_len,
             frame_id: grant.backing.frame_id.get(),
             mapping_id: grant.backing.mapping_id.get(),
             owner_generation: grant.backing.owner_generation.get(),
             inventory_revision: grant.backing.inventory_revision.get(),
         };
         assert!(residency.publish(replacement_residency).is_some());
-        assert!(residency.record_commit(residency.lookup(302, 0x4000).unwrap()));
+        for index in 0..pages {
+            assert!(residency.record_commit(residency.lookup(302, 0x4000 + index * 4096).unwrap()));
+        }
         let completion = carrick_el1_abi::CowGrantCompletion {
             purpose: carrick_el1_abi::CowGrantPurpose::UserWrite,
             grant,
             span_va: 0x4000,
-            span_len: 4096,
+            span_len: run_len,
             old_ipa: 0x50000,
             new_ipa: grant.physical_ipa,
         };
@@ -2108,7 +2157,7 @@ mod tests {
                 .unwrap()
                 .mappings
                 .len(),
-            2
+            pages as usize + 1
         );
         let wrong_owner = carrick_hal::GuestFrameOwner {
             root_generation: ContextGeneration::new(NonZeroU64::new(20).unwrap()),
