@@ -110,6 +110,18 @@ impl ParkedContextWords {
     pub fn syscall_return(&self) -> u64 {
         self.frame[10]
     }
+
+    pub fn thread_pointer(&self, register: carrick_guest_arch::ThreadPointerRegister) -> u64 {
+        <Self as carrick_guest_arch::ThreadContext>::thread_pointer(self, register)
+    }
+
+    pub fn set_thread_pointer(
+        &mut self,
+        register: carrick_guest_arch::ThreadPointerRegister,
+        value: u64,
+    ) {
+        <Self as carrick_guest_arch::ThreadContext>::set_thread_pointer(self, register, value);
+    }
 }
 
 impl carrick_guest_arch::ProcessContext for ParkedContextWords {
@@ -124,6 +136,36 @@ impl carrick_guest_arch::ProcessContext for ParkedContextWords {
     }
     fn syscall_return(&self) -> u64 {
         ParkedContextWords::syscall_return(self)
+    }
+}
+
+impl carrick_guest_arch::ThreadContext for ParkedContextWords {
+    fn thread_pointer(&self, register: carrick_guest_arch::ThreadPointerRegister) -> u64 {
+        match register {
+            carrick_guest_arch::ThreadPointerRegister::X86(
+                carrick_guest_arch::X86ThreadPointerRegister::Fs,
+            ) => self.fs_base,
+            carrick_guest_arch::ThreadPointerRegister::X86(
+                carrick_guest_arch::X86ThreadPointerRegister::Gs,
+            ) => self.gs_base,
+            _ => 0,
+        }
+    }
+
+    fn set_thread_pointer(
+        &mut self,
+        register: carrick_guest_arch::ThreadPointerRegister,
+        value: u64,
+    ) {
+        match register {
+            carrick_guest_arch::ThreadPointerRegister::X86(
+                carrick_guest_arch::X86ThreadPointerRegister::Fs,
+            ) => self.fs_base = value,
+            carrick_guest_arch::ThreadPointerRegister::X86(
+                carrick_guest_arch::X86ThreadPointerRegister::Gs,
+            ) => self.gs_base = value,
+            _ => {}
+        }
     }
 }
 

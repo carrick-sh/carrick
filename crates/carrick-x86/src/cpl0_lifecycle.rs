@@ -353,6 +353,36 @@ impl NativeBirthContext {
         xsave: XsaveArea::ZERO,
     };
 }
+
+impl carrick_guest_arch::ThreadContext for NativeBirthContext {
+    fn thread_pointer(&self, register: carrick_guest_arch::ThreadPointerRegister) -> u64 {
+        match register {
+            carrick_guest_arch::ThreadPointerRegister::X86(
+                carrick_guest_arch::X86ThreadPointerRegister::Fs,
+            ) => self.fs_base,
+            carrick_guest_arch::ThreadPointerRegister::X86(
+                carrick_guest_arch::X86ThreadPointerRegister::Gs,
+            ) => self.gs_base,
+            _ => 0,
+        }
+    }
+
+    fn set_thread_pointer(
+        &mut self,
+        register: carrick_guest_arch::ThreadPointerRegister,
+        value: u64,
+    ) {
+        match register {
+            carrick_guest_arch::ThreadPointerRegister::X86(
+                carrick_guest_arch::X86ThreadPointerRegister::Fs,
+            ) => self.fs_base = value,
+            carrick_guest_arch::ThreadPointerRegister::X86(
+                carrick_guest_arch::X86ThreadPointerRegister::Gs,
+            ) => self.gs_base = value,
+            _ => {}
+        }
+    }
+}
 #[repr(C)]
 pub struct LifecycleLane {
     pub contexts: [NativeBirthContext; 2],
@@ -504,6 +534,41 @@ impl NativeLane<'_> {
         }
         Some(carrick_core::Served::Returned { switched: true })
     }
+
+    pub fn prepare_child_with_register(
+        &mut self,
+        record: RecordRef,
+        context: ChildContext,
+        reg: carrick_guest_arch::X86ThreadPointerRegister,
+    ) {
+        let mut frame = *self.frame;
+        frame.rax = context.result.raw() as u64;
+        frame.rsp = context.stack.raw();
+        #[cfg(target_os = "none")]
+        let inherited_fs = read_tls(NativeTlsRegister::Fs);
+        #[cfg(not(target_os = "none"))]
+        let inherited_fs = self.lane.contexts[self.current_index()].fs_base;
+        #[cfg(target_os = "none")]
+        let inherited_gs = read_tls(NativeTlsRegister::UserGs);
+        #[cfg(not(target_os = "none"))]
+        let inherited_gs = self.lane.contexts[self.current_index()].gs_base;
+        let xsave = self.xsave.clone();
+        let (fs_base, gs_base) = match reg {
+            carrick_guest_arch::X86ThreadPointerRegister::Fs => {
+                (context.tls.map_or(inherited_fs, UserVa::raw), inherited_gs)
+            }
+            carrick_guest_arch::X86ThreadPointerRegister::Gs => {
+                (inherited_fs, context.tls.map_or(inherited_gs, UserVa::raw))
+            }
+        };
+        self.lane.contexts[1] = NativeBirthContext {
+            record: Some(record),
+            frame,
+            fs_base,
+            gs_base,
+            xsave,
+        };
+    }
 }
 impl UserCopy for NativeLane<'_> {
     fn copy_in(&mut self, dst: &mut [u8], address: UserVa) -> bool {
@@ -593,25 +658,11 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         child_context_supported(stack, tls)
     }
     fn prepare_child(&mut self, record: RecordRef, context: ChildContext) {
-        let mut frame = *self.frame;
-        frame.rax = context.result.raw() as u64;
-        frame.rsp = context.stack.raw();
-        #[cfg(target_os = "none")]
-        let inherited_tls = read_tls(NativeTlsRegister::Fs);
-        #[cfg(not(target_os = "none"))]
-        let inherited_tls = self.lane.contexts[self.current_index()].fs_base;
-        #[cfg(target_os = "none")]
-        let gs_base = read_tls(NativeTlsRegister::UserGs);
-        #[cfg(not(target_os = "none"))]
-        let gs_base = self.lane.contexts[self.current_index()].gs_base;
-        let xsave = self.xsave.clone();
-        self.lane.contexts[1] = NativeBirthContext {
-            record: Some(record),
-            frame,
-            fs_base: context.tls.map_or(inherited_tls, UserVa::raw),
-            gs_base,
-            xsave,
-        };
+        self.prepare_child_with_register(
+            record,
+            context,
+            carrick_guest_arch::X86ThreadPointerRegister::Fs,
+        );
     }
     fn enqueue_born(&mut self, record: RecordRef) {
         self.zone.requeue_preempted(self.lane.slot, record.id);

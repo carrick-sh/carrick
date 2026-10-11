@@ -117,6 +117,20 @@ impl carrick_guest_arch::ProcessContext for Aarch64ParkedContext {
     }
 }
 
+impl carrick_guest_arch::ThreadContext for Aarch64ParkedContext {
+    fn thread_pointer(&self, register: carrick_guest_arch::ThreadPointerRegister) -> u64 {
+        self.native.thread_pointer(register)
+    }
+
+    fn set_thread_pointer(
+        &mut self,
+        register: carrick_guest_arch::ThreadPointerRegister,
+        value: u64,
+    ) {
+        self.native.set_thread_pointer(register, value);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

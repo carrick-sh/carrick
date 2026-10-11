@@ -36,6 +36,8 @@ carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-abi = { path = "../carrick-abi" }
 carrick-observability = { path = "../carrick-observability" }
 carrick-conformance-contract = { path = "../carrick-conformance-contract" }
+carrick-core = { path = "../carrick-core" }
+carrick-guest-arch = { path = "../carrick-guest-arch" }
 parking_lot.workspace = true
 serde_json.workspace = true
 serde.workspace = true
@@ -50,6 +52,7 @@ conformance-metrics = ["carrick-kernel/conformance-metrics", "carrick-observabil
 
 [dev-dependencies]
 carrick-sched-core = { path = "../carrick-sched-core" }
+carrick-personality-linux = { path = "../carrick-personality-linux" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-kernel = { path = "../carrick-kernel", features = ["conformance-metrics"] }
 carrick-observability = { path = "../carrick-observability", features = ["conformance-metrics"] }

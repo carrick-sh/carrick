@@ -97,6 +97,10 @@ pub mod occupancy;
 pub mod spaces;
 mod x86_context;
 pub use aarch64_context::{AARCH64_ROOT_ADDRESS_MASK, Aarch64ParkedContext};
+pub use process::{
+    Aarch64ThreadPointerRegister, ProcessContext, ThreadContext, ThreadPointerRegister,
+    X86ThreadPointerRegister,
+};
 pub use x86_context::{
     ParkedContextWords, X86_XSAVE_BYTES, signal_return_flags, valid_user_return_words,
 };
@@ -448,6 +452,30 @@ impl ThreadCtx {
         fpsr: 0,
         fpcr: 0,
     };
+}
+
+impl ThreadContext for ThreadCtx {
+    fn thread_pointer(&self, register: ThreadPointerRegister) -> u64 {
+        match register {
+            ThreadPointerRegister::Aarch64(Aarch64ThreadPointerRegister::TpidrEl0) => {
+                self.tpidr_el0
+            }
+            ThreadPointerRegister::Aarch64(Aarch64ThreadPointerRegister::X18) => self.x[18],
+            _ => 0,
+        }
+    }
+
+    fn set_thread_pointer(&mut self, register: ThreadPointerRegister, value: u64) {
+        match register {
+            ThreadPointerRegister::Aarch64(Aarch64ThreadPointerRegister::TpidrEl0) => {
+                self.tpidr_el0 = value;
+            }
+            ThreadPointerRegister::Aarch64(Aarch64ThreadPointerRegister::X18) => {
+                self.x[18] = value;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Outcome of [`ZoneTables::read_parked_context`]: a thread's EL1 save area

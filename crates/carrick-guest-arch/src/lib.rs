@@ -552,6 +552,62 @@ pub trait ProcessContext: Copy + Send + Sync + zerocopy::FromZeros {
     fn syscall_return(&self) -> u64;
 }
 
+/// Architectural register selection for thread-local storage / thread context on x86_64.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum X86ThreadPointerRegister {
+    Fs,
+    Gs,
+}
+
+/// Architectural register selection for thread-local storage / thread context on AArch64.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum Aarch64ThreadPointerRegister {
+    TpidrEl0,
+    X18,
+}
+
+/// Personality-configurable architectural register that serves as the thread context pointer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum ThreadPointerRegister {
+    X86(X86ThreadPointerRegister),
+    Aarch64(Aarch64ThreadPointerRegister),
+}
+
+impl ThreadPointerRegister {
+    pub const FS: Self = Self::X86(X86ThreadPointerRegister::Fs);
+    pub const GS: Self = Self::X86(X86ThreadPointerRegister::Gs);
+    pub const TPIDR_EL0: Self = Self::Aarch64(Aarch64ThreadPointerRegister::TpidrEl0);
+    pub const X18: Self = Self::Aarch64(Aarch64ThreadPointerRegister::X18);
+}
+
+impl From<X86ThreadPointerRegister> for ThreadPointerRegister {
+    fn from(register: X86ThreadPointerRegister) -> Self {
+        Self::X86(register)
+    }
+}
+
+impl From<Aarch64ThreadPointerRegister> for ThreadPointerRegister {
+    fn from(register: Aarch64ThreadPointerRegister) -> Self {
+        Self::Aarch64(register)
+    }
+}
+
+/// Hardware-neutral access to the thread pointer / TLS base register in saved thread contexts.
+pub trait ThreadContext {
+    /// Read the thread pointer value stored for `register`.
+    fn thread_pointer(&self, register: ThreadPointerRegister) -> u64;
+    /// Write the thread pointer value stored for `register`.
+    fn set_thread_pointer(&mut self, register: ThreadPointerRegister, value: u64);
+
+    fn with_thread_pointer(mut self, register: ThreadPointerRegister, value: u64) -> Self
+    where
+        Self: Sized,
+    {
+        self.set_thread_pointer(register, value);
+        self
+    }
+}
+
 /// Native frames and owner capabilities are supplied by the respective owner.
 /// No defaults manufacture permissions, completion receipts or saved state.
 pub trait ArchTypes {
