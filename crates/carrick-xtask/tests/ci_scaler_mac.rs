@@ -504,3 +504,14 @@ fn a_live_distnoted_agent_if_present_is_exempt_by_real_path() {
         }
     }
 }
+
+#[test]
+fn runner_is_launched_through_the_listener_not_run_sh() {
+    let command = listener_command(std::path::Path::new("/runner"));
+    assert_eq!(
+        command.get_program(),
+        std::path::Path::new("/runner/bin/Runner.Listener")
+    );
+    let args: Vec<_> = command.get_args().collect();
+    assert_eq!(args, ["run"]);
+}

@@ -17,8 +17,8 @@ mod mac;
 
 pub use mac::{
     EXEMPT_AGENTS, MacLedger, MacRecord, MacState, MacStep, MacTarget, ProcessFacts, denies_user,
-    exempt_agent, mac_hook_script, mac_step, prepare_run_once, process_facts, reset_job_area,
-    runner_manifest_for, verify_runner_tree, verify_toolchain,
+    exempt_agent, listener_command, mac_hook_script, mac_step, prepare_run_once, process_facts,
+    reset_job_area, runner_manifest_for, verify_runner_tree, verify_toolchain,
 };
 
 pub const POOL: &str = "carrick-ci";
