@@ -2,8 +2,8 @@
 //! registry. Consumers supply resource access, never a population selector.
 use super::registry::{ProcessRegistry, RegistryFailure};
 use super::{
-    ChildExitSignal, ProcessGroupId, TaskId, TaskKey, TaskRusage, WaitChildClass, WaitTarget,
-    Zombie,
+    ChildExitSignal, ProcessGroupId, TaskId, TaskKey, TaskRusage, TerminationStatus,
+    WaitChildClass, WaitTarget, Zombie,
 };
 use alloc::vec::Vec;
 
@@ -36,7 +36,8 @@ pub trait WaitLive: WaitIdentitySource {
 }
 
 pub trait WaitZombie<C, U> {
-    fn wait_zombie(&self) -> &Zombie<C, U>;
+    type Status: Clone;
+    fn wait_zombie(&self) -> &Zombie<C, U, Self::Status>;
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -108,10 +109,12 @@ pub enum WaitError<E> {
     Revision(E),
 }
 
-pub type ObservedWait<C, U, L> =
-    Result<WaitSelection<Zombie<C, U>, <L as WaitLive>::Event>, WaitError<<L as WaitLive>::Error>>;
-pub type ConsumingWait<C, U, L, Z> = Result<
-    ConsumedWait<Zombie<C, U>, <L as WaitLive>::Event, Z>,
+pub type ObservedWait<C, U, L, S = TerminationStatus> = Result<
+    WaitSelection<Zombie<C, U, S>, <L as WaitLive>::Event>,
+    WaitError<<L as WaitLive>::Error>,
+>;
+pub type ConsumingWait<C, U, L, Z, S = TerminationStatus> = Result<
+    ConsumedWait<Zombie<C, U, S>, <L as WaitLive>::Event, Z>,
     WaitError<<L as WaitLive>::Error>,
 >;
 
@@ -137,11 +140,15 @@ impl<
     /// Observe without consuming any event or CPU charge. A consuming caller
     /// may use this as its read-lock fast path, but must rescan under write if
     /// it finds an event; this result does not authorize subsequent removal.
-    pub fn scan_wait<U: Clone>(&self, parent: TaskId, query: WaitQuery) -> ObservedWait<C, U, L>
+    pub fn scan_wait<U: Clone>(
+        &self,
+        parent: TaskId,
+        query: WaitQuery,
+    ) -> ObservedWait<C, U, L, Z::Status>
     where
         Z: WaitZombie<C, U>,
     {
-        let selected = self.select_wait(parent, query, false)?;
+        let selected = self.select_wait::<U>(parent, query, false)?;
         self.wait_receipt(selected)
     }
 
@@ -163,7 +170,7 @@ impl<
     fn wait_receipt<U: Clone>(
         &self,
         selected: WaitSelection<TaskKey, L::Event>,
-    ) -> ObservedWait<C, U, L>
+    ) -> ObservedWait<C, U, L, Z::Status>
     where
         Z: WaitZombie<C, U>,
     {
@@ -187,12 +194,12 @@ impl<
         &mut self,
         parent_id: TaskId,
         query: WaitQuery,
-    ) -> ConsumingWait<C, U, L, Z>
+    ) -> ConsumingWait<C, U, L, Z, Z::Status>
     where
         Z: WaitZombie<C, U>,
     {
         self.admit_wait(parent_id)?;
-        let selected = self.select_wait(parent_id, query, true)?;
+        let selected = self.select_wait::<U>(parent_id, query, true)?;
         let selection = self.wait_receipt(selected)?;
         let mut reaped_parent = None;
         let mut reaped_record = None;

@@ -10,6 +10,8 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use carrick_personality_linux::identity::TaskCredentials;
+use carrick_personality_linux::lifecycle::LinuxWaitStatus;
 use carrick_sched_core::process::birth::{
     AdmittedProcessBirth, BirthAttachment, BirthError, BirthLive, BirthSnapshot,
 };
@@ -28,8 +30,8 @@ use carrick_sched_core::process::wait::{
     WaitLive, WaitQuery, WaitReadiness, WaitSelection, WaitZombie,
 };
 use carrick_sched_core::process::{
-    ChildExitSignal, LinuxWaitStatus, ProcessContext, ProcessRelations, RlimitSet, SessionId,
-    TaskCredentials, TaskId, TaskIdentity, TaskKey, TaskLifecycle, TaskRusage, Zombie,
+    ChildExitSignal, ProcessContext, ProcessRelations, RlimitSet, SessionId, TaskId, TaskIdentity,
+    TaskKey, TaskLifecycle, TaskRusage, Zombie,
 };
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -434,11 +436,12 @@ impl<C, U, N: NativeProcessCustody> ExitNotificationSource for GuestTask<C, U, N
 
 /// Owned numeric/resource custody is never cloned with the semantic receipt.
 pub struct GuestZombie<C, U, Claim> {
-    pub receipt: Zombie<C, U>,
+    pub receipt: Zombie<C, U, LinuxWaitStatus>,
     pub claim: Claim,
 }
 impl<C, U, Claim> WaitZombie<C, U> for GuestZombie<C, U, Claim> {
-    fn wait_zombie(&self) -> &Zombie<C, U> {
+    type Status = LinuxWaitStatus;
+    fn wait_zombie(&self) -> &Zombie<C, U, LinuxWaitStatus> {
         &self.receipt
     }
 }
@@ -540,10 +543,10 @@ type SharedGuestBirth<'a, C, U, N, F> = AdmittedProcessBirth<
     F,
 >;
 pub type GuestWaitSelection<C, U, N> =
-    WaitSelection<Zombie<C, U>, <N as NativeProcessCustody>::Event>;
+    WaitSelection<Zombie<C, U, LinuxWaitStatus>, <N as NativeProcessCustody>::Event>;
 
 pub type GuestConsumedWait<C, U, N> = ConsumedWait<
-    Zombie<C, U>,
+    Zombie<C, U, LinuxWaitStatus>,
     <N as NativeProcessCustody>::Event,
     GuestZombie<C, U, <N as NativeProcessCustody>::Claim>,
 >;

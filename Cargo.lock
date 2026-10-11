@@ -515,6 +515,7 @@ dependencies = [
  "carrick-personality-linux",
  "carrick-pipe-core",
  "carrick-sched-core",
+ "carrick-syscall-abi",
 ]
 
 [[package]]
@@ -596,8 +597,6 @@ dependencies = [
 name = "carrick-guest-arch"
 version = "0.1.0"
 dependencies = [
- "carrick-signal-core",
- "carrick-syscall-abi",
  "zerocopy",
 ]
 
@@ -843,6 +842,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-personality-api"
+version = "0.1.0"
+dependencies = [
+ "carrick-core",
+ "carrick-core-abi",
+ "carrick-guest-arch",
+ "carrick-sched-core",
+]
+
+[[package]]
 name = "carrick-personality-linux"
 version = "0.1.0"
 dependencies = [
@@ -948,8 +957,6 @@ name = "carrick-sched-core"
 version = "0.1.0"
 dependencies = [
  "carrick-guest-arch",
- "carrick-signal-core",
- "carrick-syscall-abi",
  "zerocopy",
 ]
 
@@ -1086,6 +1093,7 @@ dependencies = [
  "carrick-mem",
  "carrick-mmu-core",
  "carrick-observability",
+ "carrick-personality-linux",
  "carrick-sched-core",
  "carrick-signal-linux",
  "carrick-test-support",
@@ -1122,6 +1130,7 @@ dependencies = [
  "carrick-kernel",
  "carrick-mem",
  "carrick-mmu-core",
+ "carrick-personality-linux",
  "carrick-runtime",
  "carrick-sched-core",
  "carrick-signal-linux",

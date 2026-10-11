@@ -15,6 +15,10 @@ use carrick_el1_abi::{
     Lifecycle, ThreadControlSlot, ThreadLifecyclePage,
 };
 use carrick_guest_arch::{AddressContext, MmGeneration, ProcessContext, RootGpa, UserVa};
+use carrick_personality_linux::ipc::namespace::{
+    IpcError, IpcNamespace, MsgrcvOutcome, MsgsndOutcome, SemopOutcome,
+};
+use carrick_personality_linux::lifecycle::LinuxWaitStatus;
 use carrick_personality_linux::{
     abi::entry::SyscallResult,
     ipc::{
@@ -23,12 +27,8 @@ use carrick_personality_linux::{
     },
     lifecycle::{LifecycleOutcome, LinuxWaitOptions, ProcessNative, ProcessWaitPid},
 };
-use carrick_sched_core::process::ipc::{
-    IpcError, IpcNamespace, MsgrcvOutcome, MsgsndOutcome, SemopOutcome,
-};
 use carrick_sched_core::process::{
-    ChildExitSignal, LinuxWaitStatus, TaskId, TaskIdentity, TaskKey, TaskRusage, TaskSerial,
-    WaitChildClass, WaitTarget,
+    ChildExitSignal, TaskId, TaskIdentity, TaskKey, TaskRusage, TaskSerial, WaitTarget,
 };
 use carrick_sched_core::process::{
     birth::BirthAttachment,
@@ -1677,7 +1677,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         };
         Ok(WaitQuery {
             target,
-            class: WaitChildClass::from_wait_options(options),
+            class: carrick_personality_linux::lifecycle::wait_child_class(options),
             job_control: WaitJobControl::NONE,
         })
     }
@@ -2051,7 +2051,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &self,
     ) -> Result<
         (
-            carrick_sched_core::process::TaskCredentials,
+            carrick_personality_linux::identity::TaskCredentials,
             u32,
             Arc<SpinLock<IpcNamespace>>,
         ),
@@ -3310,8 +3310,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         owner: &'g Owner<'a, M, C>,
         tid: u32,
     ) -> Result<&'g NativeIdentityTask<'a, M, C>, i64> {
-        use carrick_personality_linux::identity::{EPERM, ESRCH};
-        use carrick_sched_core::process::LinuxCapabilitySet;
+        use carrick_personality_linux::identity::{EPERM, ESRCH, LinuxCapabilitySet};
         let caller = owner.task(self.key).map_err(|_| ESRCH)?;
         let credentials = caller.credentials_for(self.calling_tid)?;
         let target = owner
@@ -3348,7 +3347,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     #[inline(never)]
     fn update_calling_creds(
         &mut self,
-        f: &mut dyn FnMut(&mut carrick_sched_core::process::TaskCredentials) -> Result<(), i64>,
+        f: &mut dyn FnMut(
+            &mut carrick_personality_linux::identity::TaskCredentials,
+        ) -> Result<(), i64>,
     ) -> Result<(), i64> {
         let mut graph = self.runtime.graph.lock();
         let task = graph
@@ -8325,7 +8326,7 @@ mod tests {
                 .unwrap();
             peer.dumpable = 1;
             peer.credentials_for_mut(987).unwrap().cap_permitted =
-                carrick_sched_core::process::LinuxCapabilitySet::CAP_SETUID;
+                carrick_personality_linux::identity::LinuxCapabilitySet::CAP_SETUID;
         }
         assert_eq!(
             entry.read_robust_list(987, &mut |_, _| Some((0xcafe, 24))),
@@ -8342,7 +8343,7 @@ mod tests {
                 .unwrap()
                 .credentials_for_mut(987)
                 .unwrap()
-                .cap_permitted = carrick_sched_core::process::LinuxCapabilitySet::empty();
+                .cap_permitted = carrick_personality_linux::identity::LinuxCapabilitySet::empty();
         }
         // A matching real uid cannot bypass mismatched filesystem credentials.
         entry
@@ -8368,11 +8369,12 @@ mod tests {
                 .and_then(|key| graph.owner.task_mut(key).ok())
                 .unwrap();
             *peer.credentials_for_mut(child_pid).unwrap() =
-                carrick_sched_core::process::TaskCredentials::ROOT;
+                carrick_personality_linux::identity::TaskCredentials::ROOT;
         }
         entry
             .update_calling_creds(&mut |c| {
-                c.cap_effective = carrick_sched_core::process::LinuxCapabilitySet::CAP_SETUID;
+                c.cap_effective =
+                    carrick_personality_linux::identity::LinuxCapabilitySet::CAP_SETUID;
                 Ok(())
             })
             .unwrap();
@@ -8384,7 +8386,8 @@ mod tests {
         );
         entry
             .update_calling_creds(&mut |c| {
-                c.cap_effective = carrick_sched_core::process::LinuxCapabilitySet::CAP_SYS_PTRACE;
+                c.cap_effective =
+                    carrick_personality_linux::identity::LinuxCapabilitySet::CAP_SYS_PTRACE;
                 Ok(())
             })
             .unwrap();

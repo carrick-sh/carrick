@@ -284,7 +284,7 @@ pub enum InitialSyscallDisposition {
     ::core::cmp::PartialEq,
 )]
 pub enum PhysicalProcessExit {
-    Exited(carrick_sched_core::process::LinuxWaitStatus),
+    Exited(carrick_personality_linux::lifecycle::LinuxWaitStatus),
     RunFailed(carrick_el1_abi::NativeRunFailureReason),
 }
 impl PhysicalProcessExit {
@@ -6128,7 +6128,7 @@ impl Cpl0Carrier {
 #[derive(::core::fmt::Debug)]
 pub enum InitialProcessExit {
     OwnedExit {
-        status: carrick_sched_core::process::LinuxWaitStatus,
+        status: carrick_personality_linux::lifecycle::LinuxWaitStatus,
         exits: usize,
     },
     RunFailed {

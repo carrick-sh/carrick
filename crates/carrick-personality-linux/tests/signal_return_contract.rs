@@ -146,14 +146,14 @@ fn signal_delivery_waits_for_the_owned_completion_ledger() {
 
 #[test]
 fn frame_masks_cross_as_blocked_domains() {
-    fn frame_mask(params: carrick_guest_arch::SignalFrameParams) -> SigBlockMask {
+    fn frame_mask(params: carrick_personality_linux::signal::SignalFrameParams) -> SigBlockMask {
         params.mask
     }
     fn restored_mask(native: &mut Native) -> Result<SigBlockMask, carrick_syscall_abi::LinuxErrno> {
         native.restore_signal_frame()
     }
     let mask = SigBlockMask::blocking_all_of(carrick_signal_core::SignalSet::from_bits(1 << 9));
-    let params = carrick_guest_arch::SignalFrameParams {
+    let params = carrick_personality_linux::signal::SignalFrameParams {
         stack: carrick_syscall_abi::LinuxSignalStack::empty(),
         signal: carrick_signal_core::policy::Signal::from_number(10).unwrap(),
         sigcode: 0,

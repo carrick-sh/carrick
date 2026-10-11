@@ -115,7 +115,7 @@ impl carrick_sched_core::process::exit::ExitSignalSource for HostExitParent {
                     .active_wait_set()
                     .is_some_and(|set| set.contains(signal.raw()))
         });
-        crate::kernel::objects::signal::child_exit_signal_state(action, blocked)
+        crate::kernel::objects::signal::child_exit_signal_state(signal, action, blocked)
     }
 }
 impl carrick_sched_core::process::exit::ExitNotificationSource for TaskRecord {

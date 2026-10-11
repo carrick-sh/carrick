@@ -4,8 +4,10 @@
 
 use carrick_el1::personality::{dispatch, sched};
 use carrick_el1_abi::{Action, Counters, CurrentTask, El1TaskId, InotifyNameCache, TrapFrame};
-use carrick_guest_arch::{CanonicalNr, NativeReturnWord, SlotId, SyscallFrame, UserVa};
+use carrick_guest_arch::{NativeReturnWord, SlotId, UserVa};
+use carrick_personality_linux::dispatch::SyscallFrame;
 use carrick_personality_linux::entry::decode_x86_64;
+use carrick_syscall_abi::CanonicalNr;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 struct X86Frame<'a> {

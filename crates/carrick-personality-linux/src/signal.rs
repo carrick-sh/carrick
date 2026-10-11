@@ -891,3 +891,33 @@ pub fn delivery_stack(
     };
     Some((selected, record))
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SignalFrameParams {
+    pub stack: carrick_syscall_abi::LinuxSignalStack,
+    pub signal: Signal,
+    pub sigcode: i32,
+    pub fault_addr: u64,
+    pub sp: carrick_guest_arch::UserVa,
+    pub handler: carrick_guest_arch::UserVa,
+    pub restorer: Option<carrick_guest_arch::UserVa>,
+    pub mask: carrick_signal_core::policy::SigBlockMask,
+}
+
+pub trait SignalBackend: carrick_guest_arch::ArchTypes {
+    fn setup_signal_frame<'a>(
+        &mut self,
+        frame: &mut Self::NativeFrame,
+        params: SignalFrameParams,
+        siginfo: Option<&'a [u8]>,
+        fpstate: &[u8],
+        copy_out: &mut dyn FnMut(carrick_guest_arch::UserVa, &[u8]) -> bool,
+    ) -> Result<carrick_guest_arch::UserVa, Self::Error>;
+
+    fn restore_signal_frame(
+        &mut self,
+        frame: &mut Self::NativeFrame,
+        fpstate: &mut [u8],
+        copy_in: &mut dyn FnMut(&mut [u8], carrick_guest_arch::UserVa) -> bool,
+    ) -> Result<carrick_signal_core::policy::SigBlockMask, Self::Error>;
+}
