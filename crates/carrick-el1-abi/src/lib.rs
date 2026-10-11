@@ -2581,7 +2581,6 @@ impl NativeForkProgress {
 
 /// First refusal while converting an empty EL1 COW pool into owner supply.
 #[repr(u64)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CowSupplyRefusal {
     RootDeclined = 1,
     RootUnavailable = 2,
