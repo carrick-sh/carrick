@@ -398,6 +398,8 @@ mod frame_inventory;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod guest_cow;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) mod native_frame_custody;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use guest_cow::CarrierGuestCowSettlement;
 mod memory_protection;
 pub(crate) use self::memory_protection::*;
