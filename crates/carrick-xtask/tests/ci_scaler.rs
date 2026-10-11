@@ -776,3 +776,33 @@ fn hardware_lanes_never_wait_and_hosted_gates_run_only_base_code() {
         );
     }
 }
+
+#[test]
+fn template_sets_and_verifies_disk_boot_order_after_attaching_the_disk() {
+    let source = include_str!("../../../scripts/ci/build-template-debian.sh");
+    let lines: Vec<&str> = source.lines().collect();
+    let attach = lines
+        .iter()
+        .position(|l| l.starts_with("qm set 300 --scsi0 "))
+        .unwrap();
+    // Combined with the attach, PVE 9 kept `order=net0;ide2` (live failure).
+    assert!(!lines[attach].contains("--boot"));
+    let boot = lines
+        .iter()
+        .position(|l| *l == "qm set 300 --boot order=scsi0")
+        .unwrap();
+    assert!(boot > attach);
+    assert!(lines[boot + 1].contains("grep -qx 'boot: order=scsi0'"));
+    let start = lines
+        .iter()
+        .position(|l| l.contains("/status/start"))
+        .unwrap();
+    assert!(start > boot + 1, "verified before the VM starts");
+    // The xtask compatibility guard runs before any VM exists.
+    let guard = lines.iter().position(|l| l.contains("glibc_max=")).unwrap();
+    let create = lines
+        .iter()
+        .position(|l| l.starts_with("qm create 300"))
+        .unwrap();
+    assert!(guard < create);
+}
