@@ -47,6 +47,10 @@ impl UserTransferCustody {
         terminal.ok_or_else(|| {
             let zone = carrick_el1_abi::zone_tables();
             let lane = zone.map(|zone| zone.slot(slot));
+            let host_record = lane.and_then(|lane| lane.host_record());
+            let host_state = zone.zip(host_record).map(|(zone, record)| {
+                (zone.record(record).claim(), zone.record(record).identity())
+            });
             let binding = crate::metadata_grant::terminal_root_binding(
                 &self.custody,
                 carrick_guest_arch::CpuId::new(u32::from(slot.raw())),
@@ -56,7 +60,7 @@ impl UserTransferCustody {
                 0,
                 26,
                 &format!(
-                    "COW scope: slot={} mm={} owner_gen={} lane_mm={:?} current={:?} host={:?} installed={:?} terminal_binding={binding:?}",
+                    "COW scope: slot={} mm={} owner_gen={} lane_mm={:?} current={:?} host={:?} host_state={host_state:?} installed={:?} terminal_binding={binding:?}",
                     slot.raw(),
                     target.handle().mm().raw(),
                     address.generation.raw().get(),
