@@ -388,14 +388,52 @@ test-mm-owner *ARGS:
 test *ARGS: _test-stdio
     #!/usr/bin/env bash
     set -euo pipefail
+    just --justfile {{justfile()}} _test-unit-mm-owner {{ARGS}}
+    just --justfile {{justfile()}} _test-unit-workspace {{ARGS}}
     if [ "{{os()}}" = "macos" ]; then
-        groups=(mm-owner workspace lanes cli host vfs kernel runtime hvf)
+        # Integration targets (`tests/*.rs`) are invisible to `--lib --bins`;
+        # a test moved out of `src/` used to leave every gate silently. The
+        # host-lane selection is DERIVED from Cargo metadata: every test target
+        # not declared in another lane under `[package.metadata.carrick.test-lanes]`
+        # (carrick-xtask `test_lanes.rs`) runs here, and `lint-domains-source`
+        # runs `test-lanes check`, which fails on any target no gate runs.
+        selections="$({{_admit}} {{_cargo}} run -q --locked -p carrick-xtask -- test-lanes args --lane host)"
+        # Every selection runs; the recipe fails after the last one, naming each red.
+        red=()
+        while IFS= read -r selection; do
+            [ -n "$selection" ] || continue
+            {{_admit}} {{_cargo}} test --no-fail-fast $selection {{ARGS}} -- --skip serial_host </dev/null || red+=("$selection")
+            env RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test --no-fail-fast $selection {{ARGS}} serial_host </dev/null || red+=("$selection (serial_host)")
+        done <<< "$selections"
+        if [ "${#red[@]}" -ne 0 ]; then
+            printf 'test: red host-lane selection: %s\n' "${red[@]}" >&2
+            exit 1
+        fi
+        just --justfile {{justfile()}} _test-unit-cli {{ARGS}}
+        just --justfile {{justfile()}} _test-unit-host {{ARGS}}
+        just --justfile {{justfile()}} _test-unit-vfs {{ARGS}}
+        just --justfile {{justfile()}} _test-unit-kernel {{ARGS}}
+        just --justfile {{justfile()}} _test-unit-runtime {{ARGS}}
+        just --justfile {{justfile()}} _test-unit-hvf {{ARGS}}
     else
-        groups=(mm-owner workspace cli host runtime lanes)
+        just --justfile {{justfile()}} _test-unit-cli {{ARGS}}
+        just --justfile {{justfile()}} _test-unit-host {{ARGS}}
+        just --justfile {{justfile()}} _test-unit-runtime {{ARGS}}
+        # Derived host-lane integration targets, as on macOS; packages whose
+        # default features select platform-macos get this host's backend features.
+        selections="$({{_admit}} {{_cargo}} run -q --locked -p carrick-xtask -- test-lanes args --lane host --platform-features "{{_platform_features}}")"
+        # Every selection runs; the recipe fails after the last one, naming each red.
+        red=()
+        while IFS= read -r selection; do
+            [ -n "$selection" ] || continue
+            {{_admit}} {{_cargo}} test --no-fail-fast $selection {{ARGS}} -- --skip serial_host </dev/null || red+=("$selection")
+            env RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test --no-fail-fast $selection {{ARGS}} serial_host </dev/null || red+=("$selection (serial_host)")
+        done <<< "$selections"
+        if [ "${#red[@]}" -ne 0 ]; then
+            printf 'test: red host-lane selection: %s\n' "${red[@]}" >&2
+            exit 1
+        fi
     fi
-    for group in "${groups[@]}"; do
-        just --justfile {{justfile()}} "_test-unit-$group" {{ARGS}}
-    done
 
 # Unit groups are whole Cargo selections: newly added tests stay selected.
 test-shard-a *ARGS: _test-stdio
