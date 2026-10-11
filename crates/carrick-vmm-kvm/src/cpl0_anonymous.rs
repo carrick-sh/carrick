@@ -646,7 +646,7 @@ impl Cpl0HostCustody {
     pub(super) fn service_root_exit(
         &self,
         lease: &StoppedCpuLease<'_>,
-    ) -> Result<carrick_sched_core::process::LinuxWaitStatus, TrapError> {
+    ) -> Result<carrick_personality_linux::lifecycle::LinuxWaitStatus, TrapError> {
         let execution = self.physical_execution(lease)?;
         // SAFETY: the root exit record consists of eight fully initialized u64s.
         let (_, record) = unsafe {

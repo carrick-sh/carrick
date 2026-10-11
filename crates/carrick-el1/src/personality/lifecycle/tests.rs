@@ -1253,7 +1253,9 @@ fn process_native_hooks_require_every_execution_identity_component() {
 #[test]
 fn x86_split_result_does_not_read_argument_zero() {
     use crate::personality::dispatch::{El1PendingFamilies, GuestDispatchFrame};
-    use carrick_guest_arch::{CanonicalNr, NativeReturnWord, SyscallFrame};
+    use carrick_guest_arch::NativeReturnWord;
+    use carrick_personality_linux::dispatch::SyscallFrame;
+    use carrick_syscall_abi::CanonicalNr;
     use core::sync::atomic::AtomicU64;
 
     struct SplitFrame {
@@ -1337,7 +1339,7 @@ fn x86_split_result_does_not_read_argument_zero() {
 
 #[test]
 fn arm_frame_rejects_slot_outside_mailbox_capacity() {
-    use carrick_guest_arch::SyscallFrame;
+    use carrick_personality_linux::dispatch::SyscallFrame;
     let frame = TrapFrame {
         slot: 256,
         ..Default::default()
@@ -1696,24 +1698,24 @@ impl ProcessNative for IdentityOwner {
 }
 /// Host-test frame with the production CPL0 scheduler capability boundary.
 struct Cpl0IdentityFrame(TrapFrame);
-impl carrick_guest_arch::SyscallFrame for Cpl0IdentityFrame {
-    fn canonical_ordinal(&self) -> carrick_guest_arch::CanonicalNr {
-        carrick_guest_arch::SyscallFrame::canonical_ordinal(&self.0)
+impl carrick_personality_linux::dispatch::SyscallFrame for Cpl0IdentityFrame {
+    fn canonical_ordinal(&self) -> carrick_syscall_abi::CanonicalNr {
+        carrick_personality_linux::dispatch::SyscallFrame::canonical_ordinal(&self.0)
     }
     fn argument(&self, index: usize) -> Option<u64> {
-        carrick_guest_arch::SyscallFrame::argument(&self.0, index)
+        carrick_personality_linux::dispatch::SyscallFrame::argument(&self.0, index)
     }
     fn result(&self) -> carrick_guest_arch::NativeReturnWord {
-        carrick_guest_arch::SyscallFrame::result(&self.0)
+        carrick_personality_linux::dispatch::SyscallFrame::result(&self.0)
     }
     fn set_result(&mut self, result: carrick_guest_arch::NativeReturnWord) {
-        carrick_guest_arch::SyscallFrame::set_result(&mut self.0, result);
+        carrick_personality_linux::dispatch::SyscallFrame::set_result(&mut self.0, result);
     }
     fn slot(&self) -> Option<carrick_guest_arch::SlotId> {
-        carrick_guest_arch::SyscallFrame::slot(&self.0)
+        carrick_personality_linux::dispatch::SyscallFrame::slot(&self.0)
     }
     fn user_sp(&self) -> Option<UserVa> {
-        carrick_guest_arch::SyscallFrame::user_sp(&self.0)
+        carrick_personality_linux::dispatch::SyscallFrame::user_sp(&self.0)
     }
 }
 impl crate::personality::dispatch::GuestDispatchFrame for Cpl0IdentityFrame {

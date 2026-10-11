@@ -67,13 +67,14 @@ impl WaitLive for Live {
         self.revision = revision;
     }
 }
-impl<U> WaitZombie<u32, U> for Zombie<u32, U> {
-    fn wait_zombie(&self) -> &Zombie<u32, U> {
+impl<U> WaitZombie<u32, U> for Zombie<u32, U, TerminationStatus> {
+    type Status = TerminationStatus;
+    fn wait_zombie(&self) -> &Zombie<u32, U, TerminationStatus> {
         self
     }
 }
 type GenericRegistry<Z> = ProcessRegistry<u32, Live, Z, Live, (), (), (), (), Failure>;
-type Registry = GenericRegistry<Zombie<u32, u32>>;
+type Registry = GenericRegistry<Zombie<u32, u32, TerminationStatus>>;
 fn key(id: i32, serial: u64) -> TaskKey {
     TaskKey {
         id: TaskId::from_abi_positive(id).unwrap(),
@@ -126,10 +127,13 @@ fn query() -> WaitQuery {
         job_control: WaitJobControl::NONE,
     }
 }
-fn zombie(child: TaskKey, parent: TaskKey) -> Zombie<u32, u32> {
+fn zombie(child: TaskKey, parent: TaskKey) -> Zombie<u32, u32, TerminationStatus> {
     zombie_with_uid(child, parent)
 }
-fn zombie_with_uid<U: Default>(child: TaskKey, parent: TaskKey) -> Zombie<u32, U> {
+fn zombie_with_uid<U: Default>(
+    child: TaskKey,
+    parent: TaskKey,
+) -> Zombie<u32, U, TerminationStatus> {
     Zombie {
         key: child,
         namespace_pid: child.id.raw() as u32,
@@ -139,7 +143,7 @@ fn zombie_with_uid<U: Default>(child: TaskKey, parent: TaskKey) -> Zombie<u32, U
         session: SessionId::from_abi_positive(1).unwrap(),
         namespace_process_group: 1,
         namespace_session: 1,
-        status: LinuxWaitStatus::from_wait_encoding(0),
+        status: TerminationStatus::SUCCESS,
         ruid: U::default(),
         euid: U::default(),
         rusage: TaskRusage {
@@ -364,7 +368,7 @@ fn shared_wait_two_children_rescan_and_parent_reservation_keep_events() {
 fn shared_wait_consuming_precheck_does_not_require_cloning_receipts() {
     #[derive(Default)]
     struct NonCloneUid;
-    let mut owner = empty_registry::<Zombie<u32, NonCloneUid>>();
+    let mut owner = empty_registry::<Zombie<u32, NonCloneUid, TerminationStatus>>();
     let parent = key(1, 1);
     let child = key(2, 2);
     let mut p = live(parent, None);
@@ -386,11 +390,12 @@ fn shared_wait_consuming_precheck_does_not_require_cloning_receipts() {
 #[test]
 fn consuming_wait_retains_only_selected_owned_claim_until_result_release() {
     struct OwnedZombie {
-        receipt: Zombie<u32, u32>,
+        receipt: Zombie<u32, u32, TerminationStatus>,
         releases: alloc::rc::Rc<Cell<usize>>,
     }
     impl WaitZombie<u32, u32> for OwnedZombie {
-        fn wait_zombie(&self) -> &Zombie<u32, u32> {
+        type Status = TerminationStatus;
+        fn wait_zombie(&self) -> &Zombie<u32, u32, TerminationStatus> {
             &self.receipt
         }
     }

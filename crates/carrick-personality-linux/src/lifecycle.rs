@@ -1,8 +1,86 @@
 //! Linux lifecycle policy over neutral pool transitions and native context hooks.
 use crate::abi::entry::SyscallResult;
-use crate::abi::thread::*;
+use crate::abi::thread::{
+    AltStack, BlockedMask, BornRecord, EntryRef, EntryState, GateState, Lifecycle,
+    LifecycleDecline, ThreadControlSlot, ThreadLifecyclePage, TransitionError,
+};
 use crate::native_run_failure::NativeRunFailureReason;
+use carrick_sched_core::process::{TerminationKind, TerminationStatus};
 pub use carrick_syscall_abi::LinuxWaitOptions;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct LinuxWaitStatus(i32);
+
+impl LinuxWaitStatus {
+    pub const fn from_wait_encoding(raw: i32) -> Self {
+        Self(raw)
+    }
+
+    pub const fn from_termination_status(status: TerminationStatus) -> Self {
+        match status.kind() {
+            TerminationKind::Exited => Self::exited(status.code() as u8),
+            TerminationKind::Signaled { core_dump } => {
+                Self::signaled(status.code() as u8, core_dump)
+            }
+        }
+    }
+
+    pub const fn to_termination_status(self) -> TerminationStatus {
+        if self.is_signaled() {
+            let sig = (self.0 & 0x7f) as u32;
+            let core_dump = (self.0 & 0x80) != 0;
+            TerminationStatus::signaled(sig, core_dump)
+        } else {
+            let code = ((self.0 >> 8) & 0xff) as u32;
+            TerminationStatus::exited(code)
+        }
+    }
+
+    pub const fn signaled(sig: u8, core_dumped: bool) -> Self {
+        let core_bit = if core_dumped { 0x80 } else { 0 };
+        Self((sig as i32 & 0x7f) | core_bit)
+    }
+
+    pub const fn exited(status: u8) -> Self {
+        Self((status as i32) << 8)
+    }
+
+    pub const fn stopped(sig: u8) -> Self {
+        Self(((sig as i32) << 8) | 0x7f)
+    }
+
+    pub const fn continued() -> Self {
+        Self(0xffff)
+    }
+
+    pub const fn is_signaled(self) -> bool {
+        (self.0 & 0x7f) != 0 && (self.0 & 0x7f) != 0x7f
+    }
+
+    pub const fn term_signal(self) -> Option<u8> {
+        if self.is_signaled() {
+            Some((self.0 & 0x7f) as u8)
+        } else {
+            None
+        }
+    }
+
+    pub const fn raw(self) -> i32 {
+        self.0
+    }
+}
+
+pub fn wait_child_class(options: LinuxWaitOptions) -> carrick_sched_core::process::WaitChildClass {
+    use carrick_sched_core::process::WaitChildClass;
+    if options.contains(LinuxWaitOptions::WALL) {
+        WaitChildClass::All
+    } else if options.contains(LinuxWaitOptions::WCLONE) {
+        WaitChildClass::Clone
+    } else {
+        WaitChildClass::Sigchld
+    }
+}
 
 /// Linux `pid_t` selector carried by wait4 (including negative selectors).
 #[derive(
@@ -74,7 +152,10 @@ pub fn lifecycle_effect(outcome: &LifecycleOutcome) -> crate::dispatch::FamilyCo
     }
 }
 
-use crate::thread::*;
+use crate::thread::{
+    CHILD_TID_CLEAR, LifecycleThread, RobustListHead, RobustListLen, RobustListSlot,
+    SYS_SET_ROBUST_LIST, set_robust_list, setup_open,
+};
 use carrick_core::Served;
 use carrick_core_abi::EntryMmKey;
 use carrick_core_abi::ExecutionBinding;

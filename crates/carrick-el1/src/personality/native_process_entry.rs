@@ -3,28 +3,29 @@
 extern crate alloc;
 use super::process_owner::*;
 use alloc::boxed::Box;
+use carrick_personality_linux::lifecycle::LinuxWaitStatus;
 use carrick_sched_core::process::birth::{BirthAttachment, BirthSnapshot};
 use carrick_sched_core::process::exit::ReservedTaskSet;
 use carrick_sched_core::process::wait::{WaitQuery, WaitSelection};
-use carrick_sched_core::process::{LinuxWaitStatus, TaskKey, WaitTarget, Zombie};
+use carrick_sched_core::process::{TaskKey, WaitTarget, Zombie};
 
 /// Snapshot ready for external status copying. No numeric claim is removed.
 #[must_use]
 pub struct WaitStatusCopy<C, U> {
     caller: TaskKey,
     query: WaitQuery,
-    zombie: Zombie<C, U>,
+    zombie: Zombie<C, U, LinuxWaitStatus>,
 }
 /// Only a successful external copy can construct this reap authorization.
 #[must_use]
 pub struct CopiedWaitStatus<C, U>(WaitStatusCopy<C, U>);
 impl<C, U> WaitStatusCopy<C, U> {
-    pub fn zombie(&self) -> &Zombie<C, U> {
+    pub fn zombie(&self) -> &Zombie<C, U, LinuxWaitStatus> {
         &self.zombie
     }
     pub fn copy_with<E>(
         self,
-        copy: impl FnOnce(&Zombie<C, U>) -> Result<(), E>,
+        copy: impl FnOnce(&Zombie<C, U, LinuxWaitStatus>) -> Result<(), E>,
     ) -> Result<CopiedWaitStatus<C, U>, E> {
         copy(&self.zombie)?;
         Ok(CopiedWaitStatus(self))

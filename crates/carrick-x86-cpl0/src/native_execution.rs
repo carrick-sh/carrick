@@ -65,7 +65,7 @@ pub(super) fn migrate(slot: SlotId) {
 /// Publish the same terminal completion for direct and resumed root exits.
 pub(super) fn publish_root_exit(
     current: &CurrentTask,
-    status: carrick_sched_core::process::LinuxWaitStatus,
+    status: carrick_personality_linux::lifecycle::LinuxWaitStatus,
 ) -> ! {
     let exit = carrick_el1_abi::NativeRootExit::new(
         carrick_el1::personality::common_entry::execution_binding(current), status,

@@ -8,14 +8,15 @@ use carrick_el1_abi::{
     Action, BlockedMask, Counters, CurrentTask, EntryRef, InotifyNameCache, LifecycleHatches,
     PendingSignals, ThreadControlSlot, ThreadLifecyclePage, TrapFrame,
 };
-use carrick_guest_arch::{CanonicalNr, GuestIsa, NativeReturnWord, SyscallFrame, UserVa};
-use carrick_personality_linux::dispatch::FamilyCompletion;
+use carrick_guest_arch::{GuestIsa, NativeReturnWord, UserVa};
+use carrick_personality_linux::dispatch::{FamilyCompletion, SyscallFrame};
 use carrick_personality_linux::entry::{
     CanonicalCall, SyscallResult, decode_aarch64, decode_x86_snapshot,
 };
 use carrick_personality_linux::pending_anonymous::{
     DelegatedStep, PendingAnonymousVenue, PermissionStep, RetirementStep,
 };
+use carrick_syscall_abi::CanonicalNr;
 use carrick_x86::cpl0_entry::NativeFrame;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::boxed::Box;

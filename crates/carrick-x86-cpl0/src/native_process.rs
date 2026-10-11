@@ -23,8 +23,8 @@ use carrick_guest_arch::{
     AddressContext, ContextGeneration, FrameGpa, KernelVa, MmGeneration, RootGpa, UserVa,
 };
 use carrick_mmu_core::x86::owner_mmu::X86Mmu;
+use carrick_personality_linux::lifecycle::LinuxWaitStatus;
 use carrick_personality_linux::mm::{LinuxReservationPolicy, MmErrorLinux};
-use carrick_sched_core::process::LinuxWaitStatus;
 use carrick_sched_core::{ParkedContextWords, SlotId, WakeEffects, ZoneTables};
 use core::{marker::PhantomData, num::NonZeroU64, sync::atomic::Ordering};
 

@@ -3,7 +3,9 @@
 use super::*;
 use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
 use carrick_sched_core::ParkedContextWords;
-use carrick_sched_core::process::exit::{ExitSignalDisposition, ExitSignalState};
+use carrick_sched_core::process::exit::{
+    DefaultSignalDisposition, ExitSignalDisposition, ExitSignalState,
+};
 use carrick_sched_core::process::{LinuxSignal, TaskSerial, WaitChildClass, WaitTarget};
 use core::cell::{Cell, RefCell};
 use core::num::NonZeroU64;
@@ -190,6 +192,7 @@ fn task(
     let signals = Signals {
         state: Rc::new(Cell::new(ExitSignalState {
             disposition: ExitSignalDisposition::Caught,
+            default_disposition: DefaultSignalDisposition::Deliver,
             blocked: false,
         })),
         order,
@@ -1397,6 +1400,7 @@ fn owner_instantiated_with_aarch64_context_checks_fork_child_and_syscall_return(
         signals: Signals {
             state: Rc::new(Cell::new(ExitSignalState {
                 disposition: ExitSignalDisposition::Caught,
+                default_disposition: DefaultSignalDisposition::Deliver,
                 blocked: false,
             })),
             order: Rc::new(RefCell::new(Vec::new())),

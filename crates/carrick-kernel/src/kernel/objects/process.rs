@@ -456,9 +456,10 @@ impl TaskShared {
     }
 }
 
-pub use carrick_sched_core::process::{LinuxWaitStatus, TaskRusage};
+pub use carrick_personality_linux::lifecycle::LinuxWaitStatus;
+pub use carrick_sched_core::process::TaskRusage;
 
-pub type Zombie = carrick_sched_core::process::Zombie<ContainerId, NsUid>;
+pub type Zombie = carrick_sched_core::process::Zombie<ContainerId, NsUid, LinuxWaitStatus>;
 
 pub fn capture_zombie(
     task: &Task,

@@ -16,10 +16,10 @@ use carrick_guest_arch::{
 use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
 use carrick_mmu_core::owner_mmu::Aarch64Mmu;
 use carrick_personality_linux::lifecycle::{
-    LifecycleOutcome, LinuxWaitOptions, ProcessNative, ProcessWaitPid,
+    LifecycleOutcome, LinuxWaitOptions, LinuxWaitStatus, ProcessNative, ProcessWaitPid,
 };
 use carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK;
-use carrick_sched_core::process::{LinuxWaitStatus, TaskId, TaskKey, TaskSerial};
+use carrick_sched_core::process::{TaskId, TaskKey, TaskSerial};
 use carrick_sched_core::{Aarch64ParkedContext, ThreadCtx, ZoneTables};
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

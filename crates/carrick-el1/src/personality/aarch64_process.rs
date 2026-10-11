@@ -16,8 +16,8 @@ use carrick_guest_arch::{
 };
 use carrick_mmu_core::live_descriptor_words::LiveDescriptorWords;
 use carrick_mmu_core::owner_mmu::Aarch64Mmu;
+use carrick_personality_linux::lifecycle::LinuxWaitStatus;
 use carrick_personality_linux::mm::{LinuxReservationPolicy, MmErrorLinux};
-use carrick_sched_core::process::LinuxWaitStatus;
 use carrick_sched_core::{
     AARCH64_ROOT_ADDRESS_MASK, Aarch64ParkedContext, WakeEffects, ZoneTables,
 };

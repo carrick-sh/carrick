@@ -39,6 +39,7 @@ carrick-runtime = { path = "../carrick-runtime", default-features = false, featu
 
 [dependencies]
 carrick-guest-arch = { path = "../carrick-guest-arch" }
+carrick-personality-linux = { path = "../carrick-personality-linux" }
 carrick-sched-core = { path = "../carrick-sched-core" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-fatal.workspace = true

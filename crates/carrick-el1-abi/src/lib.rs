@@ -949,9 +949,9 @@ pub struct TrapFrame {
     /// Fault Address Register (FAR_EL1) for data/instruction aborts.
     pub far: u64,
 }
-impl carrick_guest_arch::SyscallFrame for TrapFrame {
-    fn canonical_ordinal(&self) -> carrick_guest_arch::CanonicalNr {
-        carrick_guest_arch::CanonicalNr::new(self.x[8])
+impl carrick_personality_linux::dispatch::SyscallFrame for TrapFrame {
+    fn canonical_ordinal(&self) -> carrick_syscall_abi::CanonicalNr {
+        carrick_syscall_abi::CanonicalNr::new(self.x[8])
     }
     fn argument(&self, index: usize) -> Option<u64> {
         self.x.get(index).copied()

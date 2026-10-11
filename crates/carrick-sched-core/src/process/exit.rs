@@ -904,24 +904,29 @@ pub enum ExitSignalDisposition {
     Ignore,
     Caught,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DefaultSignalDisposition {
+    Deliver,
+    Ignore,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExitSignalState {
     pub disposition: ExitSignalDisposition,
+    pub default_disposition: DefaultSignalDisposition,
     pub blocked: bool,
 }
+
 impl ExitSignalState {
-    pub fn needs_notification(self, signal: super::LinuxSignal) -> bool {
+    pub fn needs_notification(self) -> bool {
         match self.disposition {
             ExitSignalDisposition::Ignore => false,
             ExitSignalDisposition::Caught => true,
-            ExitSignalDisposition::Default => {
-                self.blocked
-                    || !matches!(
-                        carrick_signal_core::policy::Signal::from_number(signal.raw())
-                            .map(carrick_signal_core::policy::default_delivery),
-                        Some(carrick_signal_core::policy::Delivery::Ignore)
-                    )
-            }
+            ExitSignalDisposition::Default => match self.default_disposition {
+                DefaultSignalDisposition::Deliver => true,
+                DefaultSignalDisposition::Ignore => self.blocked,
+            },
         }
     }
 }
@@ -948,10 +953,7 @@ impl<Target: ExitSignalSource> ExitParentTarget<Target> {
     pub fn prepare(self) -> ExitParentNotification<Target> {
         let signal = match self.signal {
             ChildExitSignal::Signal(signal)
-                if self
-                    .payload
-                    .exit_signal_state(signal)
-                    .needs_notification(signal) =>
+                if self.payload.exit_signal_state(signal).needs_notification() =>
             {
                 Some(signal)
             }

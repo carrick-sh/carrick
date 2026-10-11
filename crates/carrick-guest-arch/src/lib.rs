@@ -7,7 +7,6 @@
 //! This crate contains no Linux syscall policy, task allocator or memory ledger.
 #![no_std]
 
-pub use carrick_syscall_abi::CanonicalNr;
 use core::num::NonZeroU64;
 
 mod sealed {
@@ -110,22 +109,6 @@ impl SlotId {
     pub const fn index(self) -> usize {
         self.0 as usize
     }
-}
-
-/// Registers needed by the shared Linux syscall families. Native frames
-/// implement this directly; no ISA-shaped substitute frame is constructed.
-pub trait SyscallFrame {
-    fn canonical_ordinal(&self) -> CanonicalNr;
-    fn argument(&self, index: usize) -> Option<u64>;
-    fn result(&self) -> NativeReturnWord;
-    fn set_result(&mut self, result: NativeReturnWord);
-    fn slot(&self) -> Option<SlotId>;
-    /// Index within the supplied task slice. A projected one-task x86 slice
-    /// uses index zero while retaining its real CPU slot in `slot()`.
-    fn task_index(&self) -> usize {
-        self.slot().map_or(usize::MAX, SlotId::index)
-    }
-    fn user_sp(&self) -> Option<UserVa>;
 }
 
 /// Supervisor addresses selected by the image ISA. Offsets within the kernel
@@ -932,53 +915,12 @@ arch_trait!(CrossingArch, CrossingBackend {
     fn report_fatal(report: FatalReport) -> !;
 });
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SignalFrameParams {
-    pub stack: carrick_syscall_abi::LinuxSignalStack,
-    pub signal: carrick_signal_core::policy::Signal,
-    pub sigcode: i32,
-    pub fault_addr: u64,
-    pub sp: UserVa,
-    pub handler: UserVa,
-    pub restorer: Option<UserVa>,
-    pub mask: carrick_signal_core::policy::SigBlockMask,
-}
-
-arch_trait!(SignalArch, SignalBackend {
-    fn setup_signal_frame<'a>(
-        frame: &mut Self::NativeFrame,
-        params: SignalFrameParams,
-        siginfo: Option<&'a [u8]>,
-        fpstate: &[u8],
-        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool
-    ) -> Result<UserVa, Self::Error>;
-
-    fn restore_signal_frame(
-        frame: &mut Self::NativeFrame,
-        fpstate: &mut [u8],
-        copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool
-    ) -> Result<carrick_signal_core::policy::SigBlockMask, Self::Error>;
-});
-
 pub trait KernelArch:
-    sealed::Sealed
-    + LayoutArch
-    + EntryArch
-    + MmuArch
-    + MmuEditArch
-    + InterruptArch
-    + CrossingArch
-    + SignalArch
+    sealed::Sealed + LayoutArch + EntryArch + MmuArch + MmuEditArch + InterruptArch + CrossingArch
 {
 }
 impl<
-    B: LayoutBackend
-        + EntryBackend
-        + MmuBackend
-        + MmuEditBackend
-        + InterruptBackend
-        + CrossingBackend
-        + SignalBackend,
+    B: LayoutBackend + EntryBackend + MmuBackend + MmuEditBackend + InterruptBackend + CrossingBackend,
 > KernelArch for Arch<B>
 {
 }

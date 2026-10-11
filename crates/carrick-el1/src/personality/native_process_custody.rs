@@ -174,13 +174,14 @@ mod tests {
     }
     use super::super::process_owner::{GuestProcessOwner, GuestTask, GuestTaskMetadata};
     use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
+    use carrick_personality_linux::lifecycle::LinuxWaitStatus;
     use carrick_sched_core::{
         ParkedContextWords,
         process::{
-            ChildExitSignal, LinuxSignal, LinuxWaitStatus, TaskId, TaskIdentity, TaskKey,
-            TaskSerial, WaitChildClass, WaitTarget,
+            ChildExitSignal, LinuxSignal, TaskId, TaskIdentity, TaskKey, TaskSerial,
+            WaitChildClass, WaitTarget,
             birth::BirthAttachment,
-            exit::{ExitSignalDisposition, ExitSignalState},
+            exit::{DefaultSignalDisposition, ExitSignalDisposition, ExitSignalState},
             wait::{WaitQuery, WaitReadiness, WaitSelection},
         },
     };
@@ -198,6 +199,7 @@ mod tests {
         fn exit_signal_state(&self, _: LinuxSignal) -> ExitSignalState {
             ExitSignalState {
                 disposition: ExitSignalDisposition::Default,
+                default_disposition: DefaultSignalDisposition::Ignore,
                 blocked: false,
             }
         }
