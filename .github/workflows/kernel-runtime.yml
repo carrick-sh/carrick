@@ -110,6 +110,12 @@ jobs:
         with:
           tool: just,cargo-deny
 
+      # The job's CARGO_HOME is fresh per run. Restore verifies fixture
+      # input identity offline, so populate the cache from every fixture
+      # lockfile first; this is the job's only network step for fixtures.
+      - name: Fetch fixture lockfile dependencies
+        run: just xtask fixtures fetch
+
       # The landing gate's signed phase (`xtask accept`): build + artifact
       # identity, el1 embed, fresh executable page, probe shards and cases,
       # with scoped cleanup per step. Its receipt is the lane's per-SHA
