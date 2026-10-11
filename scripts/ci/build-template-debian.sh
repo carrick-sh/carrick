@@ -10,7 +10,16 @@ commit=$2
 xtask=$(realpath "$3")
 [[ $commit =~ ^[0-9a-f]{40}$ ]] || exit 1
 [[ -f $inputs/rust-toolchain.toml && -f $inputs/Cargo.lock ]] || exit 1
-for tool in qm pvesh curl jq genisoimage sha512sum; do command -v "$tool" >/dev/null; done
+for tool in qm pvesh curl jq genisoimage sha512sum objdump; do command -v "$tool" >/dev/null; done
+# The guest is Debian 13 (glibc 2.41). A static (musl) xtask or a glibc build
+# needing at most GLIBC_2.41 runs there; provisioning also executes it
+# (verify-kvm). Refuse an incompatible binary before creating any VM.
+file_type=$(od -An -tx1 -N20 "$xtask" | tr -d ' \n')
+[[ ${file_type:0:8} == 7f454c46 && ${file_type:36:4} == 3e00 ]] || { echo 'xtask is not an x86-64 ELF' >&2; exit 1; }
+glibc_max=$(objdump -T "$xtask" 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1 || true)
+if [[ -n $glibc_max ]] && [[ $(printf '%s\n2.41\n' "$glibc_max" | sort -V | tail -1) != 2.41 ]]; then
+  echo "xtask needs GLIBC_$glibc_max; Debian 13 guests provide 2.41" >&2; exit 1
+fi
 pve_call() {
   # The credential exists only in this on-host pipe, never argv or output.
   jq -r '"header = \"Authorization: PVEAPIToken=" + .["full-tokenid"] + "=" + .value + "\""' /root/carrick-ci-token.json |
@@ -138,7 +147,12 @@ genisoimage -quiet -output /var/lib/vz/template/iso/carrick-template-300-seed.is
 qm create 300 --name carrick-debian13-kvm --pool carrick-ci --cores 2 --memory 4096 --balloon 0 --cpulimit 2 --cpu host \
   --net0 virtio,bridge=vmbr0 --scsihw virtio-scsi-pci --serial0 socket --vga serial0 --agent enabled=1
 qm importdisk 300 "$image" local-lvm
-qm set 300 --scsi0 local-lvm:vm-300-disk-0 --boot order=scsi0 --ide2 local:iso/carrick-template-300-seed.iso,media=cdrom
+qm set 300 --scsi0 local-lvm:vm-300-disk-0 --ide2 local:iso/carrick-template-300-seed.iso,media=cdrom
+# Boot order only after the disk exists: combined with the attach in one
+# `qm set`, PVE 9 kept `order=net0;ide2` and the guest PXE/CD-looped with
+# "No bootable device" until the provisioning deadline.
+qm set 300 --boot order=scsi0
+qm config 300 | grep -qx 'boot: order=scsi0' || { echo 'VM 300 boot order is not scsi0' >&2; exit 1; }
 qm disk resize 300 scsi0 64G
 # Measure current CPU utilization AND load average, conservatively reserve two threads.
 read -ra before < /proc/stat
@@ -158,7 +172,11 @@ for ((attempt=0; attempt<180; attempt++)); do
   if qm guest exec 300 -- /bin/test -s /var/lib/carrick-ci/qualification.json 2>/dev/null | jq -e '.exitcode == 0' >/dev/null; then qualified=true; break; fi
   sleep 10
 done
-[[ $qualified == true ]] || { echo 'Template provisioning failed; preserve VM 300 for diagnosis' >&2; exit 1; }
+[[ $qualified == true ]] || {
+  echo 'Template provisioning failed; preserve VM 300 for diagnosis.' >&2
+  echo 'Console: (printf "\r"; sleep 8) | timeout 15 socat -T 10 - UNIX-CONNECT:/var/run/qemu-server/300.serial0' >&2
+  exit 1
+}
 qm guest exec 300 -- /bin/cat /var/lib/carrick-ci/qualification.json | jq -r '."out-data"' > qualification.json
 qm guest exec 300 -- /bin/cat /var/lib/carrick-ci/packages.txt | jq -r '."out-data"' > packages.txt
 # Clean clone identities/SSH credentials and shut down from inside the template.
