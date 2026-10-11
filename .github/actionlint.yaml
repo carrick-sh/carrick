@@ -3,6 +3,7 @@
 self-hosted-runner:
   labels:
     - carrick-hvf
+    - carrick-hvf-closure
     - carrick-kvm
     - kvm
     - willow-kvm
