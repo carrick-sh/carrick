@@ -131,6 +131,7 @@ fn stage_with_loan<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
     frame.x[6] = intent.encode();
     frame.x[7] = offset as u64;
     frame.x[19] = fork_sequence.map_or(0, NonZeroU64::get);
+    let cow_declines_before = carrick_el1_abi::cow_grant_pool_host().map(|pool| pool.declined());
     let frame = run_selected_service(&mut service, frame, target, fork_sequence, &mut || {
         executable.handle(|request| custody.publish_executable(target, request))
     })
@@ -214,11 +215,28 @@ fn stage_with_loan<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
         }));
     }
     if frame.x[0] != 0 && intent == PortalTransferIntent::UserWrite {
+        let cow_decline_delta = cow_declines_before.and_then(|before| {
+            carrick_el1_abi::cow_grant_pool_host().map(|pool| {
+                let after = pool.declined();
+                core::array::from_fn::<u64, { carrick_el1_abi::COW_DECLINE_REASONS }, _>(|i| {
+                    after[i].saturating_sub(before[i])
+                })
+            })
+        });
         carrick_observability::probes::guest_internal_write_fault(
             va,
             len as u64,
             25,
-            &format!("owner SELECT errno={} tag={}", frame.x[0], frame.x[14]),
+            &format!(
+                "owner SELECT errno={} tag={} venue_refusal={} claim_gen={} owner_gen={} mm={} root_incarnation={} cow_declines={cow_decline_delta:?}",
+                frame.x[0],
+                frame.x[14],
+                frame.x[18],
+                frame.x[20],
+                frame.x[21],
+                target.handle.mm().raw(),
+                target.handle.incarnation().get()
+            ),
         );
     }
     if frame.x[0] == 3 {

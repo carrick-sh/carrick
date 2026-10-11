@@ -141,6 +141,8 @@ impl CapturedResourcesStack {
 thread_local! {
     static CAPTURED_RESOURCES: RefCell<CapturedResourcesStack> =
         const { RefCell::new(CapturedResourcesStack::new()) };
+    static CAPTURED_MM_ONLY: RefCell<Option<Arc<crate::kernel::Mm>>> =
+        const { RefCell::new(None) };
     static ACTIVE_CONTEXT: Cell<*const crate::kernel::KernelContext> =
         const { Cell::new(std::ptr::null()) };
     static RETIRING_FILE_TABLES: RefCell<Vec<Arc<crate::kernel::FileTable>>> =
@@ -152,7 +154,27 @@ thread_local! {
 pub fn executor_boundary_is_clear() -> bool {
     ACTIVE_CONTEXT.with(|active| active.get().is_null())
         && CAPTURED_RESOURCES.with(|stack| stack.borrow().is_empty())
+        && CAPTURED_MM_ONLY.with(|current| current.borrow().is_none())
         && RETIRING_FILE_TABLES.with(|stack| stack.borrow().is_empty())
+}
+
+/// Bind only the retained MM for terminal memory work. No file table or task
+/// resources become visible, and no functional file lease is acquired.
+pub(super) fn with_captured_mm<R>(
+    context: &crate::kernel::KernelContext,
+    operation: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<Arc<crate::kernel::Mm>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CAPTURED_MM_ONLY.with(|current| {
+                *current.borrow_mut() = self.0.take();
+            });
+        }
+    }
+    let previous = CAPTURED_MM_ONLY.with(|current| current.replace(Some(context.shared().mm())));
+    let _restore = Restore(previous);
+    operation()
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -459,12 +481,34 @@ pub(super) fn files() -> Option<Arc<crate::kernel::FileTable>> {
 }
 
 pub(super) fn mm() -> Option<Arc<crate::kernel::Mm>> {
+    if let Some(mm) = CAPTURED_MM_ONLY.with(|current| current.borrow().clone()) {
+        return Some(mm);
+    }
     CAPTURED_RESOURCES.with(|stack| stack.borrow().last().map(CapturedResources::mm))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_mm_scope_survives_file_table_drain_without_file_authority() {
+        let dispatcher = crate::dispatch::SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().expect("context");
+        let mm = context.shared().mm();
+        let files = context.resources().files();
+        files.drain_functional_refs();
+        assert!(files.acquire_functional_lease().is_none());
+
+        with_captured_mm(&context, || {
+            assert!(Arc::ptr_eq(&super::mm().expect("captured mm"), &mm));
+            assert!(
+                super::files().is_none(),
+                "MM scope must not expose file authority"
+            );
+        });
+        assert!(super::mm().is_none());
+    }
 
     #[test]
     fn ordinary_scope_retains_bundles_without_cloning_each_resource() {

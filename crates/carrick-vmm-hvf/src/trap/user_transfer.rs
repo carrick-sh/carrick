@@ -19,15 +19,57 @@ impl UserTransferCustody {
         target: carrick_aarch64::user_transfer::TransferTarget,
     ) -> Result<carrick_el1_abi::CowGrantScope, TrapError> {
         let refused = || TrapError::Hypervisor("stale owner COW scope".into());
-        let slot = self.slot.ok_or_else(refused)?;
+        let slot = self.slot.ok_or_else(|| {
+            carrick_observability::probes::guest_internal_write_fault(
+                0,
+                0,
+                26,
+                "COW scope: missing service slot",
+            );
+            refused()
+        })?;
         let mm = target.handle().mm().raw();
         let address = self
             .custody
             .fork_stock
             .lock()
             .root(NonZeroU64::new(mm).ok_or_else(refused)?)
-            .ok_or_else(refused)?;
-        crate::metadata_grant::live_cow_scope(slot, address).ok_or_else(refused)
+            .ok_or_else(|| {
+                carrick_observability::probes::guest_internal_write_fault(
+                    0,
+                    0,
+                    26,
+                    "COW scope: missing fork-stock root",
+                );
+                refused()
+            })?;
+        let live = crate::metadata_grant::live_cow_scope(slot, address);
+        let terminal = live
+            .or_else(|| crate::metadata_grant::terminal_cow_scope(&self.custody, slot, address));
+        terminal.ok_or_else(|| {
+            let zone = carrick_el1_abi::zone_tables();
+            let lane = zone.map(|zone| zone.slot(slot));
+            let binding = crate::metadata_grant::terminal_root_binding(
+                &self.custody,
+                carrick_guest_arch::CpuId::new(u32::from(slot.raw())),
+            );
+            carrick_observability::probes::guest_internal_write_fault(
+                0,
+                0,
+                26,
+                &format!(
+                    "COW scope: slot={} mm={} owner_gen={} lane_mm={:?} current={:?} host={:?} installed={:?} terminal_binding={binding:?}",
+                    slot.raw(),
+                    mm,
+                    address.generation.raw().get(),
+                    lane.map(|lane| lane.mm()),
+                    lane.and_then(|lane| lane.current()),
+                    lane.and_then(|lane| lane.host_record()),
+                    zone.map(|zone| zone.installed_space(slot)),
+                ),
+            );
+            refused()
+        })
     }
     /// Retain an exact external physical source for pre-admission copying.
     /// This never transfers its source frame or directory into the target.

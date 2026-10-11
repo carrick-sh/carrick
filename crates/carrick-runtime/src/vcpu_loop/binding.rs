@@ -3102,9 +3102,12 @@ where
                         "owner supply MM differs from saved syscall".to_owned(),
                     ));
                 }
+                // Deferred MM returns use the captured MM binding and this
+                // alias permit. Terminal settlement can run after its file
+                // table has begun draining, so no file-table lease is needed.
                 self.kernel
                     .dispatcher
-                    .with_kernel_resources(&context, || {
+                    .with_kernel_mm(&context, || {
                         self.kernel
                             .dispatcher
                             .reconcile_el1_deferred_returns(&permit, engine)
