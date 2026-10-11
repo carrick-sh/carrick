@@ -28,19 +28,39 @@ impl UserTransferCustody {
             );
             refused()
         })?;
-        // The first carrier root uses boot tables and has no fork-stock row.
-        // EL1 BIND authenticated this exact root and incarnation; physical
-        // publication separately checks the live descriptor owner and ASID.
-        let address = carrick_guest_arch::AddressContext {
-            root: carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(
-                target.ttbr0() & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK,
-            ))
-            .ok_or_else(refused)?,
-            mm: carrick_guest_arch::MmGeneration::new(
-                core::num::NonZeroU64::new(target.handle().mm().raw()).ok_or_else(refused)?,
-            ),
-            generation: carrick_guest_arch::ContextGeneration::new(target.handle().incarnation()),
-        };
+        let mm = NonZeroU64::new(target.handle().mm().raw()).ok_or_else(refused)?;
+        let selected_root = target.ttbr0() & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK;
+        let address = self
+            .custody
+            .fork_stock
+            .lock()
+            .root(mm)
+            .or_else(|| {
+                // The boot root has no fork-stock row. Its stopped home record
+                // retains the hardware root generation, which is distinct from
+                // the EL1 BIND handle's reservation incarnation.
+                let zone = carrick_el1_abi::zone_tables()?;
+                let lane = zone.slot(slot);
+                let record = lane.current().or_else(|| lane.host_record())?;
+                // SAFETY: this synchronous transfer stops the CPU owning the
+                // current or host-home record until scope authentication ends.
+                let parked = unsafe { zone.record(record).ctx_mut() };
+                Some(carrick_guest_arch::AddressContext {
+                    root: carrick_guest_arch::RootGpa::page_aligned(
+                        carrick_guest_arch::FrameGpa::new(
+                            parked.root() & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK,
+                        ),
+                    )?,
+                    mm: carrick_guest_arch::MmGeneration::new(NonZeroU64::new(parked.mm())?),
+                    generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::new(
+                        parked.generation(),
+                    )?),
+                })
+            })
+            .ok_or_else(refused)?;
+        if address.mm.raw() != mm || address.root.address().raw() != selected_root {
+            return Err(refused());
+        }
         let live = crate::metadata_grant::live_cow_scope(slot, address);
         let terminal = live
             .or_else(|| crate::metadata_grant::terminal_cow_scope(&self.custody, slot, address));
@@ -49,7 +69,17 @@ impl UserTransferCustody {
             let lane = zone.map(|zone| zone.slot(slot));
             let host_record = lane.and_then(|lane| lane.host_record());
             let host_state = zone.zip(host_record).map(|(zone, record)| {
-                (zone.record(record).claim(), zone.record(record).identity())
+                let row = zone.record(record);
+                // SAFETY: this synchronous service stops the CPU that owns
+                // the home record until the transfer returns.
+                let parked = unsafe { row.ctx_mut() };
+                (
+                    row.claim(),
+                    row.identity(),
+                    parked.root(),
+                    parked.mm(),
+                    parked.generation(),
+                )
             });
             let binding = crate::metadata_grant::terminal_root_binding(
                 &self.custody,
