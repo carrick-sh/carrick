@@ -153,10 +153,7 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     }
 }
 
-pub trait UserCopy {
-    fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool;
-    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool;
-}
+pub use carrick_core::personality::UserCopy;
 
 pub struct ChildContext {
     pub result: SyscallResult,

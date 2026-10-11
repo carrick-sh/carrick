@@ -51,6 +51,13 @@ impl carrick_guest_arch::ArchTypes for X86Backend {
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+impl carrick_guest_arch::DefaultMmOwner for X86Backend {
+    fn default_owner() -> Option<&'static Self::MmOwner> {
+        user_access::live_current_task()
+    }
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub use context::{current_stack_slot, current_thread_cpu};
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub use mmu::ForkDescriptorWords;

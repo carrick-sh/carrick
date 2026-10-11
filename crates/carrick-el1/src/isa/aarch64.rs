@@ -91,6 +91,85 @@ pub(crate) fn cross_hvc_root_exit(record_gpa: u64, cpu: u64) -> Result<(), ()> {
     }
 }
 
+/// An exact running task's bounded EL1 transfer.
+pub struct Aarch64UserTransfer {
+    owner: core::ptr::NonNull<CurrentTask>,
+    user: UserVa,
+    kernel: core::ptr::NonNull<u8>,
+    total: GuestLen,
+    completed: GuestLen,
+    direction: carrick_guest_arch::TransferDirection,
+}
+
+impl Aarch64UserTransfer {
+    pub fn advance(&mut self, limit: GuestLen) -> Result<CopyProgress, ArchError> {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            let remaining = self.total.raw() - self.completed.raw();
+            if remaining == 0 || limit.raw() == 0 {
+                return Ok(CopyProgress {
+                    completed: GuestLen::new(0),
+                    remaining: GuestLen::new(remaining),
+                });
+            }
+            let cur_user = self.user.raw() + self.completed.raw();
+            let page_offset = cur_user & 4095;
+            let page_remaining = 4096 - page_offset;
+            let chunk_len = (limit.raw().min(remaining).min(page_remaining)) as usize;
+
+            // SAFETY: the caller of `open_user_transfer` authenticates the typed MM owner
+            // reference and guarantees it remains valid and bound to this task across
+            // the transfer's progression.
+            let task = unsafe { self.owner.as_ref() };
+
+            let success = match self.direction {
+                carrick_guest_arch::TransferDirection::FromUser => {
+                    // SAFETY: `task` is authenticated above. `cur_user` was checked against
+                    // the canonical lower-half range; EL1 exception fixup safely catches any
+                    // unmapped or invalid user memory page fault.
+                    unsafe {
+                        let kptr = self.kernel.as_ptr().add(self.completed.raw() as usize);
+                        crate::substrate::file::copy_from_user_guarded(
+                            task,
+                            kptr,
+                            cur_user as *const u8,
+                            chunk_len,
+                        )
+                    }
+                }
+                carrick_guest_arch::TransferDirection::ToUser => {
+                    // SAFETY: `task` is authenticated above. `cur_user` was checked against
+                    // the canonical lower-half range; EL1 exception fixup safely catches any
+                    // unmapped or read-only user memory page fault.
+                    unsafe {
+                        let kptr = self.kernel.as_ptr().add(self.completed.raw() as usize);
+                        crate::substrate::file::copy_to_user_guarded(
+                            task,
+                            cur_user as *mut u8,
+                            kptr,
+                            chunk_len,
+                        )
+                    }
+                }
+            };
+            if !success {
+                return Err(ArchError::Fault);
+            }
+            self.completed = GuestLen::new(self.completed.raw() + chunk_len as u64);
+            let new_remaining = self.total.raw() - self.completed.raw();
+            Ok(CopyProgress {
+                completed: GuestLen::new(chunk_len as u64),
+                remaining: GuestLen::new(new_remaining),
+            })
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        {
+            let _ = limit;
+            Err(ArchError::Unbound)
+        }
+    }
+}
+
 impl ArchTypes for Aarch64Backend {
     type Error = ArchError;
     type NativeFrame = TrapFrame;
@@ -100,10 +179,12 @@ impl ArchTypes for Aarch64Backend {
     type MmOwner = CurrentTask;
     type DrainTicket = ();
     type DrainReceipt = ();
-    type UserTransfer = ();
+    type UserTransfer = Aarch64UserTransfer;
     type HardwareInterrupt = u32;
     type InterruptMask = hw::IrqGuard;
 }
+
+impl carrick_guest_arch::DefaultMmOwner for Aarch64Backend {}
 
 impl EntryBackend for Aarch64Backend {
     fn current_stack_pointer(&mut self) -> Result<KernelStackPointer, Self::Error> {
@@ -202,12 +283,40 @@ impl MmuBackend for Aarch64Backend {
     fn ack_drain(&mut self, _ticket: ()) -> Result<(), Self::Error> {
         Err(ArchError::Unbound)
     }
+    fn open_user_transfer(
+        &mut self,
+        owner: &Self::MmOwner,
+        user: UserVa,
+        kernel: core::ptr::NonNull<u8>,
+        len: GuestLen,
+        direction: carrick_guest_arch::TransferDirection,
+    ) -> Result<Self::UserTransfer, Self::Error> {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            if !crate::isa::lower_half_range(user.raw(), len.raw()) {
+                return Err(ArchError::OutOfBounds);
+            }
+            Ok(Aarch64UserTransfer {
+                owner: core::ptr::NonNull::from(owner),
+                user,
+                kernel,
+                total: len,
+                completed: GuestLen::new(0),
+                direction,
+            })
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        {
+            let _ = (owner, user, kernel, len, direction);
+            Err(ArchError::Unbound)
+        }
+    }
     fn copy_user_chunk(
         &mut self,
-        _transfer: &mut (),
-        _limit: GuestLen,
+        transfer: &mut Self::UserTransfer,
+        limit: GuestLen,
     ) -> Result<CopyProgress, Self::Error> {
-        Err(ArchError::Unbound)
+        transfer.advance(limit)
     }
 }
 

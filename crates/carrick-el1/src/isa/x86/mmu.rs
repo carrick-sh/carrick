@@ -575,6 +575,19 @@ impl MmuBackend for X86Backend {
             context: ticket.context,
         })
     }
+    fn open_user_transfer(
+        &mut self,
+        owner: &Self::MmOwner,
+        user: carrick_guest_arch::UserVa,
+        kernel: core::ptr::NonNull<u8>,
+        len: carrick_guest_arch::GuestLen,
+        direction: carrick_guest_arch::TransferDirection,
+    ) -> Result<Self::UserTransfer, Self::Error> {
+        // SAFETY: `owner` is authenticated by the caller as the live CurrentTask
+        // reference for the transfer's progression; `kernel` points to a live supervisor
+        // buffer allocated for `len` bytes and does not alias user virtual memory.
+        unsafe { user_access::UserTransfer::new(owner, user, kernel, len, direction) }
+    }
     fn copy_user_chunk(
         &mut self,
         transfer: &mut Self::UserTransfer,
