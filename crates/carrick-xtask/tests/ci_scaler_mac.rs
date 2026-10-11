@@ -515,3 +515,110 @@ fn runner_is_launched_through_the_listener_not_run_sh() {
     let args: Vec<_> = command.get_args().collect();
     assert_eq!(args, ["run"]);
 }
+
+fn runner_fixture(base: &std::path::Path) -> std::path::PathBuf {
+    let dir = base.join("actions-runner");
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    std::fs::create_dir_all(dir.join("externals")).unwrap();
+    std::fs::write(dir.join("bin/Runner.Listener"), "listener").unwrap();
+    std::fs::write(dir.join("externals/node"), "node").unwrap();
+    for d in [".", "bin", "externals"] {
+        std::fs::set_permissions(dir.join(d), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    for f in ["bin/Runner.Listener", "externals/node"] {
+        std::fs::set_permissions(dir.join(f), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn run_root_is_private_to_the_run_state_directory() {
+    let state = std::path::Path::new("/Volumes/carrick-build/carrick-ci/run/carrick-hvf-1");
+    let root = run_root_path(state);
+    assert_eq!(root, state.join("runner"));
+    assert_ne!(
+        root,
+        std::path::Path::new("/Volumes/carrick-build/actions-runner")
+    );
+    assert!(root.starts_with(state));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn clone_is_handed_over_at_the_root_only_and_refuses_tampered_bin() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    let shared = runner_fixture(tmp.path());
+    // Stale writable dirs in the shared tree must not leak into the clone.
+    std::fs::create_dir_all(shared.join("_work/old")).unwrap();
+    let manifest_text = runner_manifest_for(&shared, Some(uid)).unwrap();
+    let manifest = tmp.path().join("manifest.txt");
+    std::fs::write(&manifest, &manifest_text).unwrap();
+    std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let pin = sha256_hex(manifest_text.as_bytes());
+
+    let state = tmp.path().join("run-1");
+    std::fs::create_dir(&state).unwrap();
+    let clone = run_root_path(&state);
+    clone_runner_tree(&shared, &clone).unwrap();
+    assert!(clone_runner_tree(&shared, &clone).is_err(), "no overwrite");
+    verify_runner_tree(&clone, &manifest, &pin, Some(uid)).unwrap();
+
+    // The clone is private: writing it never touches the shared tree.
+    std::fs::set_permissions(
+        clone.join("bin/Runner.Listener"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::write(clone.join("bin/Runner.Listener"), "evil").unwrap();
+    assert!(verify_runner_tree(&clone, &manifest, &pin, Some(uid)).is_err());
+    assert_eq!(
+        std::fs::read(shared.join("bin/Runner.Listener")).unwrap(),
+        b"listener"
+    );
+    verify_runner_tree(&shared, &manifest, &pin, Some(uid)).unwrap();
+    std::fs::write(clone.join("bin/Runner.Listener"), "listener").unwrap();
+    verify_runner_tree(&clone, &manifest, &pin, Some(uid)).unwrap();
+
+    hand_clone_to_run_user(&clone, uid, gid).unwrap();
+    let mode = |p: &str| {
+        std::fs::metadata(clone.join(p))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
+    };
+    assert_eq!(std::fs::metadata(&clone).unwrap().uid(), uid);
+    assert_eq!(mode("."), 0o755, "root dir: listener writes dot-files");
+    assert_eq!(mode("bin") & 0o022, 0, "bin not group/other writable");
+    assert_eq!(mode("externals") & 0o022, 0);
+    assert_eq!(mode("_work"), 0o700);
+    assert_eq!(mode("_diag"), 0o700);
+    assert!(
+        !clone.join("_work/old").exists(),
+        "cloned job output discarded"
+    );
+    // Handing over does not change what the manifest covers.
+    verify_runner_tree(&clone, &manifest, &pin, Some(uid)).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn removing_the_run_root_does_not_follow_planted_symlinks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let shared = runner_fixture(tmp.path());
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep"), "x").unwrap();
+    let clone = tmp.path().join("clone");
+    clone_runner_tree(&shared, &clone).unwrap();
+    std::os::unix::fs::symlink(&outside, clone.join("planted")).unwrap();
+    std::os::unix::fs::symlink(outside.join("keep"), clone.join(".runner")).unwrap();
+    remove_run_root(&clone).unwrap();
+    assert!(std::fs::symlink_metadata(&clone).is_err());
+    assert!(outside.join("keep").exists());
+    assert!(shared.join("bin/Runner.Listener").exists());
+    remove_run_root(&clone).unwrap();
+}

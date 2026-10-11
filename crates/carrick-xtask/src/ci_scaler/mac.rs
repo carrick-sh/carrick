@@ -22,7 +22,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 const NAME_PREFIX: &str = "carrick-hvf-";
 /// Root-owned xtask on cloudmac; the only binary in the sudoers entry.
 pub const REMOTE_XTASK: &str = "/Volumes/carrick-build/carrick-ci/bin/carrick-xtask";
-/// Root-owned runner tree (`_work` and `_diag` belong to the runner user).
+/// Root-owned, immutable runner tree. Never run from directly: each run gets
+/// an APFS clone of it (see [`run_root_path`]).
 pub const RUNNER_DIR: &str = "/Volumes/carrick-build/actions-runner";
 /// Root-owned per-runner state root.
 pub const STATE_ROOT: &str = "/Volumes/carrick-build/carrick-ci/run";
@@ -38,7 +39,8 @@ pub const SKELETON: &str = "/Volumes/carrick-build/carrick-ci/skel";
 pub const TOOLCHAIN: &str = "/Volumes/carrick-build/carrick-ci/toolchain";
 /// macOS cron and at deny lists; both must name [`RUN_USER`].
 const SCHEDULER_DENY: [&str; 2] = ["/usr/lib/cron/cron.deny", "/usr/lib/cron/at.deny"];
-/// Runner-tree entries the runner user writes; excluded from the manifest.
+/// Runner-tree entries the runner user writes (in the per-run clone);
+/// excluded from the manifest.
 const RUNNER_WRITABLE: [&str; 2] = ["_work", "_diag"];
 /// Literal hook command in `scripts/ci/admit-job.sh` (the Willow guest path).
 const HOOK_COMMAND: &str = "/usr/local/bin/carrick-xtask ci-scaler admit-job";
@@ -659,6 +661,7 @@ pub fn prepare_run_once(
     Ok(state)
 }
 
+#[derive(Clone)]
 struct RunUser {
     uid: u32,
     gid: u32,
@@ -970,6 +973,70 @@ pub(super) fn quiesce(name: &str) -> Result<(), ScalerError> {
     Ok(())
 }
 
+/// The per-run runner root: `runner` inside the run's root-owned state
+/// directory, never the shared pinned tree. The listener writes its
+/// registration files (`.runner`, `.credentials`, ...) into its root, so each
+/// run owns a private clone and nothing persists between jobs.
+pub fn run_root_path(state: &Path) -> PathBuf {
+    state.join("runner")
+}
+
+/// APFS copy-on-write clone of the pinned runner tree (no space, no copy).
+/// Fails if `clone` already exists. Clones as root keep root ownership.
+pub fn clone_runner_tree(shared: &Path, clone: &Path) -> Result<(), ScalerError> {
+    use std::os::unix::ffi::OsStrExt;
+    let cstr = |p: &Path| {
+        std::ffi::CString::new(p.as_os_str().as_bytes())
+            .map_err(|_| ScalerError::Guard("path contains NUL"))
+    };
+    let (src, dst) = (cstr(shared)?, cstr(clone)?);
+    #[cfg(target_os = "macos")]
+    if unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (src, dst);
+        return Err(ScalerError::Guard("runner clones require macOS clonefile"));
+    }
+    Ok(())
+}
+
+/// Hand a verified clone to the run user: fresh private `_work`/`_diag`
+/// (anything cloned under those names is discarded without following links),
+/// then the clone's root itself, last. Everything else, `bin/` and
+/// `externals/` included, stays as cloned (root-owned, not run-user-writable).
+pub fn hand_clone_to_run_user(clone: &Path, uid: u32, gid: u32) -> Result<(), ScalerError> {
+    for name in RUNNER_WRITABLE {
+        let dir = clone.join(name);
+        wipe(&dir)?;
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+        lchown(&dir, uid, gid)?;
+    }
+    lchown(clone, uid, gid)
+}
+
+/// Remove a per-run clone without following symlinks planted inside it.
+pub fn remove_run_root(clone: &Path) -> Result<(), ScalerError> {
+    wipe(clone)
+}
+
+/// Removes the run's clone on every exit path (after reaping its processes).
+struct RunRoot {
+    path: PathBuf,
+    user: RunUser,
+}
+impl Drop for RunRoot {
+    fn drop(&mut self) {
+        if let Err(error) = kill_all_as(&self.user) {
+            eprintln!("run-root reap: {error}");
+        }
+        if let Err(error) = remove_run_root(&self.path) {
+            eprintln!("run-root removal: {error}");
+        }
+    }
+}
+
 /// The runner is launched through `bin/Runner.Listener run`, not `run.sh`:
 /// the stock `run.sh` copies `run-helper.sh.template` into the runner
 /// directory, which is root-owned and read-only here. A one-job ephemeral JIT
@@ -1010,13 +1077,22 @@ pub(super) fn run_once(name: &str, binding: &RunBinding, pin: &str) -> Result<()
     reset_job_area(
         Path::new(SKELETON),
         Path::new(JOB_HOME),
-        &RUNNER_WRITABLE.map(|dir| runner_dir.join(dir)),
+        &[],
         0,
         user.uid,
         user.gid,
     )?;
     let exe = std::env::current_exe()?;
     let state = prepare_run_once(name, &exe, Path::new(STATE_ROOT), binding, 0, user.uid)?;
+    // The shared tree stays read-only: the listener runs from a private
+    // clone, verified against the pinned manifest before the run user gets it.
+    let root = RunRoot {
+        path: run_root_path(&state),
+        user: user.clone(),
+    };
+    clone_runner_tree(runner_dir, &root.path)?;
+    verify_runner_tree(&root.path, Path::new(MANIFEST), pin, Some(0))?;
+    hand_clone_to_run_user(&root.path, user.uid, user.gid)?;
     let jit = read_jit(&mut std::io::stdin().lock())?;
     let log = OpenOptions::new()
         .create_new(true)
@@ -1028,9 +1104,9 @@ pub(super) fn run_once(name: &str, binding: &RunBinding, pin: &str) -> Result<()
     let path = format!(
         "{JOB_HOME}/.cargo/bin:{TOOLCHAIN}/cargo/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
     );
-    let mut command = listener_command(runner_dir);
+    let mut command = listener_command(&root.path);
     command
-        .current_dir(runner_dir)
+        .current_dir(&root.path)
         .env_clear()
         .env("PATH", path)
         .env("HOME", JOB_HOME)
