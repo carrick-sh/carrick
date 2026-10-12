@@ -115,3 +115,15 @@ self-contained workspaces with resolved graph inputs, so missing scratch files
 cannot silently skip regression coverage. The public recipe regenerates locked,
 offline, all-feature metadata immediately before checking. Standalone use must
 likewise provide freshly generated metadata.
+
+## Terminal execution transport
+
+`carrick-core-abi` owns `NativeRunFailureReason`, `NativeRunFailure` and
+`NativeRunFailureConsumer`, including the terminal port/sentinel constants.
+The Linux personality supplies lifecycle decisions; the transport authenticates
+an exact execution binding and consumes a terminal crossing once. Reason values,
+record bytes and refusal behavior are preserved across the ownership move.
+The boundary checker rejects fd-core, pipe-core and inotify-core transitively
+for core-abi, in addition to its existing forbidden personality dependencies.
+The mixed Linux EL1 image and shared-record ABI are not certified neutral by
+this extraction; their remaining dependency closure is tracked in #237.

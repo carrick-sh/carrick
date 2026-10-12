@@ -195,7 +195,7 @@ impl UserCopy for Turn<'_> {
 }
 impl<'a> LifecycleNative<'a> for Turn<'a> {
     #[allow(clippy::panic)]
-    fn fail_lifecycle(&mut self, reason: carrick_el1_abi::NativeRunFailureReason) -> ! {
+    fn fail_lifecycle(&mut self, reason: carrick_core_abi::NativeRunFailureReason) -> ! {
         std::panic::panic_any(reason)
     }
 

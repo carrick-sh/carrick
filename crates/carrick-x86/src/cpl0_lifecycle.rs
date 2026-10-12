@@ -262,7 +262,7 @@ mod process_exit_tests {
         #[allow(clippy::panic)]
         fn terminal_failure(
             _: carrick_core_abi::ExecutionBinding,
-            reason: carrick_el1_abi::NativeRunFailureReason,
+            reason: carrick_core_abi::NativeRunFailureReason,
         ) -> ! {
             std::panic::panic_any(reason)
         }
@@ -398,7 +398,7 @@ pub struct LifecycleLane {
 
 /// The image owner supplies the terminal transport with its retained custody.
 pub type TerminalFailure =
-    fn(carrick_core_abi::ExecutionBinding, carrick_el1_abi::NativeRunFailureReason) -> !;
+    fn(carrick_core_abi::ExecutionBinding, carrick_core_abi::NativeRunFailureReason) -> !;
 
 pub struct NativeLane<'a> {
     terminal_failure: TerminalFailure,
@@ -595,7 +595,7 @@ impl UserCopy for NativeLane<'_> {
     }
 }
 impl<'a> LifecycleNative<'a> for NativeLane<'a> {
-    fn fail_lifecycle(&mut self, reason: carrick_el1_abi::NativeRunFailureReason) -> ! {
+    fn fail_lifecycle(&mut self, reason: carrick_core_abi::NativeRunFailureReason) -> ! {
         (self.terminal_failure)(
             carrick_core::entry::binding(&self.task.execution, &self.task.mm),
             reason,

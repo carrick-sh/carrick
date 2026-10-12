@@ -4,7 +4,7 @@ use crate::abi::thread::{
     AltStack, BlockedMask, BornRecord, EntryRef, EntryState, GateState, Lifecycle,
     LifecycleDecline, ThreadControlSlot, ThreadLifecyclePage, TransitionError,
 };
-use crate::native_run_failure::NativeRunFailureReason;
+use carrick_core_abi::NativeRunFailureReason;
 use carrick_sched_core::process::{TerminationKind, TerminationStatus};
 pub use carrick_syscall_abi::LinuxWaitOptions;
 

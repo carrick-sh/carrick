@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-syscall-abi = { path = "../carrick-syscall-abi" }
 carrick-personality-linux = { path = "../carrick-personality-linux" }
 carrick-core = { path = "../carrick-core" }

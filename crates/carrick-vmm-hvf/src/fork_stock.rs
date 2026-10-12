@@ -129,7 +129,7 @@ pub struct ForkStockHostCustody {
     pub carrier: NonZeroU64,
     pub asids: AsidAllocator,
     pub committed_asids: BTreeMap<u64, AsidGeneration>,
-    run_failure: carrick_el1_abi::NativeRunFailureConsumer,
+    run_failure: carrick_core_abi::NativeRunFailureConsumer,
 }
 
 #[allow(dead_code)]
@@ -154,7 +154,7 @@ impl ForkStockHostCustody {
             carrier,
             asids,
             committed_asids: BTreeMap::new(),
-            run_failure: carrick_el1_abi::NativeRunFailureConsumer::default(),
+            run_failure: carrick_core_abi::NativeRunFailureConsumer::default(),
         }
     }
 
@@ -468,8 +468,8 @@ impl ForkStockHostCustody {
     pub(crate) fn service_run_failure(
         &mut self,
         cpu: CpuId,
-        record: &carrick_el1_abi::NativeRunFailure,
-    ) -> Result<(carrick_el1_abi::NativeRunFailureReason, u64), ForkStockServiceError> {
+        record: &carrick_core_abi::NativeRunFailure,
+    ) -> Result<(carrick_core_abi::NativeRunFailureReason, u64), ForkStockServiceError> {
         let execution = self
             .active_execution_for_cpu(cpu)
             .ok_or(ForkStockServiceError::StaleExecution)?;
@@ -594,8 +594,8 @@ mod tests {
     fn native_run_failure_authenticates_arm_lane_and_counts_only_terminal_crossing() {
         let mut custody = ForkStockHostCustody::new(NonZeroU64::new(7).unwrap());
         let execution = test_execution(41, 0, 301);
-        let reason = carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody;
-        let record = carrick_el1_abi::NativeRunFailure::new(execution.binding, reason);
+        let reason = carrick_core_abi::NativeRunFailureReason::X86GroupExitCustody;
+        let record = carrick_core_abi::NativeRunFailure::new(execution.binding, reason);
         custody.set_active_execution(execution);
         assert_eq!(
             custody.service_run_failure(CpuId::new(1), &record),
