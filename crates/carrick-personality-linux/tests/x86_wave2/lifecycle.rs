@@ -292,7 +292,6 @@ impl<'a> LifecycleNative<'a> for Turn<'a> {
                 slot: SLOT,
             },
             record.id,
-            1024,
         );
         self.handoff.is_some()
     }

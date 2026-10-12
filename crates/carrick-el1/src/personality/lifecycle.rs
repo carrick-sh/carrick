@@ -352,7 +352,6 @@ impl<
                 slot,
             },
             record.id,
-            carrick_el1_abi::EL1_GUEST_LOCK_SPINS,
         );
         self.handoff.is_some()
     }

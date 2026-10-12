@@ -5,9 +5,7 @@
 //! Re-entering resumes that owned operation, including its byte progress. It
 //! must never replay the operation from its original numeric descriptor.
 
-use crate::substrate::sched::{
-    EL1_ZONE_LOCK_SPINS, Sched, Served, ThreadCpu, UserWord, identity_of,
-};
+use crate::substrate::sched::{Sched, Served, ThreadCpu, UserWord, identity_of};
 use carrick_el1_abi::{SlotId, TrapFrame};
 use carrick_sched_core::object_wait::{
     ObjectWaitError, ObjectWaitKey, ObjectWaitSnapshot, ObjectWakeReport, OperationToken,
@@ -108,26 +106,19 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
         };
         let request =
             carrick_core::wait::ObjectParkRequest::new(key, snapshot, operation, deadline);
-        carrick_core::wait::park_object_record(
-            zone,
-            slot,
-            request,
-            EL1_ZONE_LOCK_SPINS,
-            &completion,
-            || {
-                let fresh = zone.slot(slot).current().is_none();
-                let record = match self.current_record() {
-                    Ok(record) => record,
-                    Err(_) => return Err(ObjectWaitError::Exhausted),
-                };
-                // SAFETY: this is the slot's current record or its newly allocated
-                // home record. Only this CPU owns its context until publish below.
-                let ctx = unsafe { zone.record(record).ctx_mut() };
-                self.cpu.save(frame, ctx);
-                ctx.pc = resume.raw();
-                Ok((record, fresh))
-            },
-        )
+        carrick_core::wait::park_object_record(zone, slot, request, &completion, || {
+            let fresh = zone.slot(slot).current().is_none();
+            let record = match self.current_record() {
+                Ok(record) => record,
+                Err(_) => return Err(ObjectWaitError::Exhausted),
+            };
+            // SAFETY: this is the slot's current record or its newly allocated
+            // home record. Only this CPU owns its context until publish below.
+            let ctx = unsafe { zone.record(record).ctx_mut() };
+            self.cpu.save(frame, ctx);
+            ctx.pc = resume.raw();
+            Ok((record, fresh))
+        })
     }
 
     /// Consume the park ticket by leaving for the host at once, running
@@ -180,7 +171,7 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
         &self,
         key: ObjectWaitKey,
     ) -> Result<(ObjectWakeReport, WakeEffects), ObjectWaitError> {
-        carrick_core::wait::notify_object(self.zone, self.slot, key, EL1_ZONE_LOCK_SPINS)
+        carrick_core::wait::notify_object(self.zone, self.slot, key)
     }
 
     /// Send the same targeted SGIs and program the same queue timer as futex

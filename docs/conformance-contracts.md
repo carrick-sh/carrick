@@ -996,5 +996,7 @@ The structural invariant is zero contention-to-errno or contention-to-run-
 failure transitions and one enrollment/retirement per operation. The tests
 retain the owned handoff, queue registration, terminal status and wake
 assertions; the probe measures contention, not a runtime ratio. Native KVM
-mounted wait/IPC fixtures supply execution binding. Signed HVF and Docker
-ratio evidence require their respective hosts and remain outstanding here.
+mounted wait/IPC fixtures are the CPU execution bindings; the #231 owner
+decision requires their receipt from the merge queue. No local KVM result
+is claimed. Signed HVF and Docker ratio evidence require their respective
+hosts and remain outstanding here.

@@ -305,7 +305,6 @@ pub fn retire_current<C: EntryContext>(
     binding: ExecutionBinding,
     source: BornInZoneSource<'_, C>,
     record: carrick_sched_core::RecordId,
-    spins: u32,
 ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
     let start = prepare_handoff(binding, source, record)?;
     if source.zone.slot(source.slot).current().is_none() {
@@ -316,7 +315,7 @@ pub fn retire_current<C: EntryContext>(
     }
     if source
         .zone
-        .release_current(source.slot, record, &carrick_sched_core::BoundedSpin(spins))
+        .release_current(source.slot, record, &carrick_sched_core::ShortLockSpin)
         != carrick_sched_core::CurrentRelease::Released
     {
         return None;

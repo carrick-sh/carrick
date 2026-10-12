@@ -27,6 +27,8 @@ use carrick_personality_linux::{
     },
     lifecycle::{LifecycleOutcome, LinuxWaitOptions, ProcessNative, ProcessWaitPid},
 };
+#[cfg(test)]
+use carrick_sched_core::BoundedSpin;
 use carrick_sched_core::process::{
     ChildExitSignal, TaskId, TaskIdentity, TaskKey, TaskRusage, TaskSerial, WaitTarget,
 };
@@ -39,14 +41,13 @@ use carrick_sched_core::process::{
     },
     wait::{TaskWakeGeneration, WaitJobControl, WaitPrecheck, WaitQuery, WaitSelection},
 };
-use carrick_sched_core::{
-    BoundedSpin, Handback, RecordRef, ThreadIdentity, WakeEffects, Waker, ZoneTables,
-};
+use carrick_sched_core::{Handback, RecordRef, ThreadIdentity, WakeEffects, Waker, ZoneTables};
 use core::{
     num::{NonZeroU32, NonZeroU64},
     sync::atomic::Ordering,
     time::Duration,
 };
+#[cfg(test)]
 const LOCK_SPINS: u32 = 100_000;
 
 fn signal_record_exists<C: ProcessContext>(zone: &ZoneTables<C>, record: RecordRef) -> bool {
@@ -1397,37 +1398,20 @@ pub struct NativeProcessEntry<
     slot: Option<&'a ThreadControlSlot>,
     interrupted_child_wait: Option<Box<C>>,
 }
-// A committed exit/settlement owes its wake. Acquire the short bucket lock
-// unconditionally, as scheduler wake placement does, after releasing the graph.
-// Contention is not a guest admission failure and cannot terminate the run.
-struct CommittedWakeWait<'a> {
-    lifetime: core::marker::PhantomData<&'a ()>,
-    #[cfg(test)]
-    probe: Option<&'a (dyn Fn(u32) + Sync)>,
-}
-impl<C: ProcessContext> carrick_sched_core::LockWait<C> for CommittedWakeWait<'_> {
-    fn wait(&self, _attempt: u32) -> bool {
-        #[cfg(test)]
-        if let Some(probe) = self.probe {
-            probe(_attempt);
-        }
-        core::hint::spin_loop();
-        true
-    }
-}
-// Test-observable form of the existing bounded admission policy.
+// Enrollment and committed settlement wait only for another party's short
+// bucket section. No graph guard is retained while acquiring this lock.
 struct NativeBucketWait<'a> {
     lifetime: core::marker::PhantomData<&'a ()>,
     #[cfg(test)]
     probe: Option<&'a (dyn Fn(u32) + Sync)>,
 }
-impl<C: ProcessContext> carrick_sched_core::LockWait<C> for NativeBucketWait<'_> {
-    fn wait(&self, attempt: u32) -> bool {
+impl carrick_sched_core::ShortLockWait for NativeBucketWait<'_> {
+    fn wait_short(&self, _attempt: u32) {
         #[cfg(test)]
         if let Some(probe) = self.probe {
-            probe(attempt);
+            probe(_attempt);
         }
-        <BoundedSpin as carrick_sched_core::LockWait<C>>::wait(&BoundedSpin(LOCK_SPINS), attempt)
+        core::hint::spin_loop();
     }
 }
 fn returned(value: i64) -> LifecycleOutcome {
@@ -1460,8 +1444,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .current()
             .or_else(|| self.source.zone.slot(self.source.slot).host_record())
         {
-            self.handoff =
-                carrick_core::entry::retire_current(self.binding, self.source, record, LOCK_SPINS);
+            self.handoff = carrick_core::entry::retire_current(self.binding, self.source, record);
         }
         // No graph exit or MM retirement is claimed. Even if lane retirement
         // refuses, the authenticated carrier report stops this incomplete run.
@@ -1851,16 +1834,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let start = carrick_core::entry::prepare_handoff(self.binding, self.source, record)
             .ok_or(NativeProcessError::Stale)?;
         let address = WaitChannel::address(&channel);
-        let guard = zone
-            .lock(
-                ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
-                &NativeBucketWait {
-                    lifetime: core::marker::PhantomData,
-                    #[cfg(test)]
-                    probe: self.publication_wait_probe,
-                },
-            )
-            .ok_or(NativeProcessError::Busy)?;
+        let guard = zone.short_lock(
+            ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
+            &NativeBucketWait {
+                lifetime: core::marker::PhantomData,
+                #[cfg(test)]
+                probe: self.publication_wait_probe,
+            },
+        );
         if channel.generation.generation() != observed {
             return Ok(false);
         }
@@ -2017,16 +1998,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let start = carrick_core::entry::prepare_handoff(self.binding, self.source, record)
             .ok_or(NativeProcessError::Stale)?;
         let address = WaitChannel::address(channel);
-        let guard = zone
-            .lock(
-                ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
-                &NativeBucketWait {
-                    lifetime: core::marker::PhantomData,
-                    #[cfg(test)]
-                    probe: self.publication_wait_probe,
-                },
-            )
-            .ok_or(NativeProcessError::Busy)?;
+        let guard = zone.short_lock(
+            ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
+            &NativeBucketWait {
+                lifetime: core::marker::PhantomData,
+                #[cfg(test)]
+                probe: self.publication_wait_probe,
+            },
+        );
         if channel.generation.generation() != precheck_gen {
             drop(guard);
             return Ok(ContinuationPark::Rescan);
@@ -2180,17 +2159,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .ok_or(NativeProcessError::Stale)
             .map_err(|e| e.errno())?;
         let address = WaitChannel::address(&ch);
-        let guard = zone
-            .lock(
-                ZoneTables::<C>::bucket_of_with_context(ch.mm, address),
-                &NativeBucketWait {
-                    lifetime: core::marker::PhantomData,
-                    #[cfg(test)]
-                    probe: self.publication_wait_probe,
-                },
-            )
-            .ok_or(NativeProcessError::Busy)
-            .map_err(|e| e.errno())?;
+        let guard = zone.short_lock(
+            ZoneTables::<C>::bucket_of_with_context(ch.mm, address),
+            &NativeBucketWait {
+                lifetime: core::marker::PhantomData,
+                #[cfg(test)]
+                probe: self.publication_wait_probe,
+            },
+        );
         if ch.generation.generation() != precheck_gen {
             drop(guard);
             return Ok(false);
@@ -2399,16 +2375,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     fn publish_channel(&mut self, channel: &Arc<WaitChannel>) -> Result<(), NativeProcessError> {
         let zone = self.source.zone;
         let address = WaitChannel::address(channel);
-        let guard = zone
-            .lock(
-                ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
-                &CommittedWakeWait {
-                    lifetime: core::marker::PhantomData,
-                    #[cfg(test)]
-                    probe: self.publication_wait_probe,
-                },
-            )
-            .ok_or(NativeProcessError::Quarantined)?;
+        let guard = zone.short_lock(
+            ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
+            &NativeBucketWait {
+                lifetime: core::marker::PhantomData,
+                #[cfg(test)]
+                probe: self.publication_wait_probe,
+            },
+        );
         channel
             .generation
             .publish()
@@ -2464,16 +2438,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let start = carrick_core::entry::prepare_handoff(self.binding, self.source, record)
             .ok_or(NativeProcessError::Quarantined)?;
         let address = WaitChannel::address(channel);
-        let guard = zone
-            .lock(
-                ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
-                &NativeBucketWait {
-                    lifetime: core::marker::PhantomData,
-                    #[cfg(test)]
-                    probe: self.publication_wait_probe,
-                },
-            )
-            .ok_or(NativeProcessError::Quarantined)?;
+        let guard = zone.short_lock(
+            ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
+            &NativeBucketWait {
+                lifetime: core::marker::PhantomData,
+                #[cfg(test)]
+                probe: self.publication_wait_probe,
+            },
+        );
         // Settlement publishes under this same bucket. A claim which settled
         // before enrollment needs no wake; a later settlement owns our wake.
         if page.claimed_count() == 0 {
@@ -2649,8 +2621,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .current()
             .or_else(|| self.source.zone.slot(self.source.slot).host_record())
             .ok_or(NativeProcessError::Quarantined)?;
-        self.handoff =
-            carrick_core::entry::retire_current(self.binding, self.source, record, LOCK_SPINS);
+        self.handoff = carrick_core::entry::retire_current(self.binding, self.source, record);
         if self.handoff.is_none() {
             return Err(NativeProcessError::Quarantined);
         }
@@ -6643,6 +6614,12 @@ mod tests {
                 )
             });
             entry.publication_wait_probe = None;
+            if default_stop {
+                assert!(
+                    waiting.load(Ordering::Acquire),
+                    "wait4 must reach the held bucket"
+                );
+            }
             if let LifecycleOutcome::Returned { result, .. } = outcome {
                 panic!("wait4 contention returned {}", result.raw());
             }
@@ -6843,6 +6820,10 @@ mod tests {
                             }
                         });
                     child_entry.publication_wait_probe = None;
+                    assert!(
+                        waiting.load(Ordering::Acquire),
+                        "exit must reach a held bucket"
+                    );
                     result.unwrap()
                 } else {
                     child_entry.exit_group(7)
@@ -8744,6 +8725,17 @@ mod tests {
             }
         });
         entry.publication_wait_probe = None;
+        if contended {
+            assert!(
+                waiting.load(Ordering::Acquire),
+                "IPC must reach the held bucket"
+            );
+        }
+        assert_eq!(
+            runtime.graph.lock().pending.len(),
+            1,
+            "one owned enrollment"
+        );
         assert!(entry.take_handoff_receipt().is_some());
         assert!(zone.slot(slot).current().is_none());
         // Publish through the signal owner while execution capacity is released.

@@ -3,11 +3,8 @@ use carrick_el1_abi::{
     Counters, CurrentTask, El1ExitReason, GIC_KICK_INTID, GIC_RESCHED_INTID, GIC_SPURIOUS_INTID,
     GIC_VTIMER_INTID, SlotId, ThreadCtx, ThreadIdentity, TrapFrame, Waker, ZoneTables,
 };
-use carrick_sched_core::{BoundedSpin, IDLE_SPIN_NS, PREEMPT_SLICE_NS, SwitchedIn, WakeEffects};
+use carrick_sched_core::{IDLE_SPIN_NS, PREEMPT_SLICE_NS, ShortLockSpin, SwitchedIn, WakeEffects};
 use core::sync::atomic::Ordering;
-
-/// Bucket-lock spins before EL1 gives up and forwards.
-pub(crate) const EL1_ZONE_LOCK_SPINS: u32 = 1024;
 
 /// The earliest the virtual timer is armed from now: a deadline that could
 /// not be served (a busy lock, a full run queue) is retried after this.
@@ -158,10 +155,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     ) -> Option<Served> {
         let (zone, slot) = (self.zone, self.slot);
         let was_empty = zone.slot(slot).queued() == 0;
-        let guard = zone.lock(
-            ZoneTables::bucket_of(mm, uaddr),
-            &BoundedSpin(EL1_ZONE_LOCK_SPINS),
-        )?;
+        let guard = zone.short_lock(ZoneTables::bucket_of(mm, uaddr), &ShortLockSpin);
         let mut effects = WakeEffects::default();
         let n = zone
             .wake_placed(
@@ -205,10 +199,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         timeout_result: u64,
     ) -> Option<Served> {
         let (zone, slot) = (self.zone, self.slot);
-        let guard = zone.lock(
-            ZoneTables::bucket_of(mm, uaddr),
-            &BoundedSpin(EL1_ZONE_LOCK_SPINS),
-        )?;
+        let guard = zone.short_lock(ZoneTables::bucket_of(mm, uaddr), &ShortLockSpin);
         let Some(word) = self.user.read_u32(self.task, uaddr) else {
             drop(guard);
             return None;

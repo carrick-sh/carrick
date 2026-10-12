@@ -8,7 +8,7 @@ use carrick_sched_core::object_wait::{
 };
 use carrick_sched_core::spaces::notification::{SpaceAccess, SpaceReleaseVenue};
 use carrick_sched_core::{
-    BoundedSpin, Claim, RecordId, SlotId, ThreadIdentity, WakeEffects, Waker, ZoneTables,
+    Claim, RecordId, ShortLockSpin, SlotId, ThreadIdentity, WakeEffects, Waker, ZoneTables,
 };
 use core::sync::atomic::Ordering;
 
@@ -21,9 +21,9 @@ pub fn observe_object(
 ) -> Result<ObjectWaitSnapshot, ObjectWaitError> {
     let _ = slot;
     let guard = if zone.completion_enabled(key) {
-        zone.object_wait_with_completion(key, &BoundedSpin(1024), completion)?
+        zone.object_wait_with_completion(key, &ShortLockSpin, completion)?
     } else {
-        zone.object_wait(key, &BoundedSpin(1024))?
+        zone.object_wait(key, &ShortLockSpin)?
     };
     Ok(guard.snapshot())
 }
@@ -47,7 +47,6 @@ pub fn park_object_record<'a, S>(
     zone: &'a ZoneTables,
     slot: SlotId,
     request: ObjectParkRequest,
-    spins: u32,
     completion: &dyn Fn(OwnedObjectWakeEffects<'_>),
     save_context: S,
 ) -> Result<ObjectParked<'a>, (ObjectWaitError, OperationToken)>
@@ -58,9 +57,9 @@ where
         return Err((ObjectWaitError::Occupied, request.operation));
     }
     let result = if zone.completion_enabled(request.key) {
-        zone.object_wait_with_completion(request.key, &BoundedSpin(spins), completion)
+        zone.object_wait_with_completion(request.key, &ShortLockSpin, completion)
     } else {
-        zone.object_wait(request.key, &BoundedSpin(spins))
+        zone.object_wait(request.key, &ShortLockSpin)
     };
     let guard = match result {
         Ok(guard) => guard,
@@ -141,9 +140,8 @@ pub fn notify_object(
     zone: &ZoneTables,
     slot: SlotId,
     key: ObjectWaitKey,
-    spins: u32,
 ) -> Result<(ObjectWakeReport, WakeEffects), ObjectWaitError> {
-    let guard = zone.object_wait(key, &BoundedSpin(spins))?;
+    let guard = zone.object_wait(key, &ShortLockSpin)?;
     let mut effects = WakeEffects::default();
     let report = guard.notify_object(slot, &mut effects)?;
     Ok((report, effects))

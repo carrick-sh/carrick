@@ -1129,8 +1129,9 @@ pub struct ZoneTables<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     timers: timer_index::Index,
 }
 
-/// How a bucket lock waits: EL1 gives up after a bounded spin (and forwards
-/// the syscall); the host keeps trying, yielding its CPU.
+/// A fallible acquisition policy for callers that retain work on refusal.
+/// Syscall short sections use [`ShortLockWait`] instead: contention alone
+/// cannot publish a guest errno or terminate a committed operation.
 pub trait LockWait<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     /// Called after the `attempt`-th failed acquisition; false gives up.
     fn wait(&self, attempt: u32) -> bool;
@@ -1145,7 +1146,34 @@ pub trait LockWait<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     }
 }
 
-/// Spin at most `0` times, then give up.
+/// A short-lock wait that cannot refuse contention. Callers must release
+/// guards before switching, crossing to a waiter, or dispatching nested work.
+pub trait ShortLockWait {
+    /// Observe contention and wait for the short holder to finish.
+    fn wait_short(&self, attempt: u32);
+}
+
+impl<C, W> LockWait<C> for W
+where
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+    W: ShortLockWait,
+{
+    fn wait(&self, attempt: u32) -> bool {
+        self.wait_short(attempt);
+        true
+    }
+}
+
+/// Wait for a short critical section, without a contention refusal.
+pub struct ShortLockSpin;
+impl ShortLockWait for ShortLockSpin {
+    fn wait_short(&self, _attempt: u32) {
+        core::hint::spin_loop();
+    }
+}
+
+/// Decline acquisition after the requested spin budget (zero declines immediately).
+/// The caller must retain owned work or choose another placement on refusal.
 pub struct BoundedSpin(pub u32);
 
 impl<C: Copy + Send + Sync + zerocopy::FromZeros> LockWait<C> for BoundedSpin {
@@ -1594,6 +1622,23 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             if !wait.wait(attempt) {
                 return None;
             }
+        }
+    }
+
+    /// Acquire a short bucket lock with no contention failure state.
+    pub fn short_lock(&self, bucket: usize, wait: &impl ShortLockWait) -> BucketGuard<'_, C> {
+        let bucket = bucket % ZONE_BUCKETS;
+        let lock = &self.buckets[bucket].lock;
+        let mut attempt = 0u32;
+        loop {
+            if lock
+                .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return BucketGuard { zone: self, bucket };
+            }
+            attempt = attempt.saturating_add(1);
+            wait.wait_short(attempt);
         }
     }
 
