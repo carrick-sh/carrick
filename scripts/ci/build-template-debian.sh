@@ -29,14 +29,15 @@ while IFS='=' read -r name value; do
   [[ $name =~ ^SITE_[A-Z_]+$ && $value =~ ^[A-Za-z0-9._=/,-]+$ ]] || { echo "bad site line: $name" >&2; exit 1; }
   site[$name]=$value
 done < <("$xtask" ci-scaler site)
-for name in SITE_NODE SITE_API_HOST SITE_STORAGE SITE_DISK_FORMAT SITE_BRIDGE SITE_CORES SITE_MEMORY_MIB SITE_DISK_GIB SITE_TEMPLATE_IPCONFIG SITE_NAMESERVER; do
+for name in SITE_NODE SITE_API_HOST SITE_STORAGE SITE_DISK_FORMAT SITE_BRIDGE SITE_CORES SITE_MEMORY_MIB SITE_DISK_GIB SITE_TEMPLATE_IPCONFIG SITE_NAMESERVER SITE_VM_FIREWALL; do
   [[ -n ${site[$name]:-} ]] || { echo "site lacks $name" >&2; exit 1; }
 done
 [[ ${site[SITE_NODE]} == $(hostname -s) ]] || { echo 'site node is not this host' >&2; exit 1; }
 node=${site[SITE_NODE]} api_host=${site[SITE_API_HOST]} storage=${site[SITE_STORAGE]}
 disk_format=${site[SITE_DISK_FORMAT]} bridge=${site[SITE_BRIDGE]}
 cores=${site[SITE_CORES]} memory_mib=${site[SITE_MEMORY_MIB]} disk_gib=${site[SITE_DISK_GIB]}
-ipconfig=${site[SITE_TEMPLATE_IPCONFIG]} nameserver=${site[SITE_NAMESERVER]}
+ipconfig=${site[SITE_TEMPLATE_IPCONFIG]} nameserver=${site[SITE_NAMESERVER]} vm_firewall=${site[SITE_VM_FIREWALL]}
+[[ $vm_firewall == 0 || $vm_firewall == 1 ]] || { echo 'bad site firewall flag' >&2; exit 1; }
 pve_call() {
   # The credential exists only in this on-host pipe, never argv or output.
   jq -r '"header = \"Authorization: PVEAPIToken=" + .["full-tokenid"] + "=" + .value + "\""' /root/carrick-ci-token.json |
@@ -175,8 +176,29 @@ rm -rf /tmp/rustup-init /tmp/sccache-extract
 PROVISION
 genisoimage -quiet -output /var/lib/vz/template/iso/carrick-template-300-seed.iso -volid cidata -joliet -rock seed
 # Root qm operations below apply ONLY to the approved template build.
+# A shared private bridge gets the PVE VM firewall on net0; PVE copies
+# 300.fw to every clone, so a job that undoes the guest firewall still
+# cannot reach other VMs on the subnet (only the gateway is admitted).
+net0="virtio,bridge=$bridge"
+if [[ $vm_firewall == 1 ]]; then
+  [[ $ipconfig =~ gw=([0-9]+\.[0-9]+\.[0-9]+)\.([0-9]+)$ ]] || { echo 'firewall site lacks a static gateway' >&2; exit 1; }
+  gateway="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}" subnet="${BASH_REMATCH[1]}.0/24"
+  [[ ! -e /etc/pve/firewall/300.fw ]] || { echo 'stale 300.fw; owner inspection needed' >&2; exit 1; }
+  cat > /etc/pve/firewall/300.fw <<FW
+[OPTIONS]
+enable: 1
+policy_in: DROP
+policy_out: ACCEPT
+
+[RULES]
+IN ACCEPT -source $gateway -log nolog # controller SSH from the host
+OUT ACCEPT -dest $gateway -log nolog # gateway (NAT to the internet)
+OUT DROP -dest $subnet -log nolog # never agent workers or other clones
+FW
+  net0="$net0,firewall=1"
+fi
 qm create 300 --name carrick-debian13-kvm --pool carrick-ci --cores "$cores" --memory "$memory_mib" --balloon 0 --cpulimit "$cores" --cpu host \
-  --net0 "virtio,bridge=$bridge" --scsihw virtio-scsi-pci --serial0 socket --vga serial0 --agent enabled=1
+  --net0 "$net0" --scsihw virtio-scsi-pci --serial0 socket --vga serial0 --agent enabled=1
 qm importdisk 300 "$image" "$storage" --format "$disk_format"
 # The imported volume's name depends on the storage type; attach exactly it.
 disk=$(qm config 300 | sed -n 's/^unused0: //p')
