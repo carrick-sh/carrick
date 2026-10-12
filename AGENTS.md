@@ -531,7 +531,8 @@ Chat, worker mailboxes, scratch notes and agent memory are not.
   scarce.
 - **Lanes:** hosted Linux/macOS jobs in `ci.yml`; `kernel-runtime.yml` adds
   the self-hosted HVF lane (cloudmac, merge queue only) and the KVM lane
-  (ephemeral GCP nested-KVM VMs, Willow fallback: `docs/ci/gcp-kvm.md`). The
+  (self-hosted JIT clones on the Contabo host, `docs/ci/contabo-kvm.md`;
+  GCP nested-KVM VMs as fallback, `docs/ci/gcp-kvm.md`). The
   signed gate stays on cloudmac. Land on a failure-set diff against main
   (`NEW=[]`), not an absolute zero.
 - **KVM evidence comes from the merge queue.** The `kvm-tests` lane produces

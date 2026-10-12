@@ -185,3 +185,34 @@ allow; a killed process cannot persist, but a cloudmac kernel or setuid
 vulnerability is out of scope. No live
 Willow, cloudmac or GitHub operation was performed for this review; the
 director qualifies it live.
+
+## Contabo standing credential
+
+The standing controller also runs on the dedicated Contabo host (issue #287,
+[contabo-kvm.md](contabo-kvm.md)). Admission, JIT handling, the job-start
+hook and teardown are the same code. Site placement comes from the typed
+table in `ci_scaler/site.rs`, which fails closed on an unknown host. The
+protected-VM proof covers every VM in the site's list (Contabo: the agent
+workers 101-104 and their template 9000), and Willow's row is pinned to its
+previous constants by test.
+
+Departures from the Willow procedure, and their reasons:
+
+- **The GitHub token is stored on the host.** A standing service must
+  survive reboots, which a token forwarded over SSH stdin cannot. It is a
+  systemd encrypted credential (`/etc/credstore.encrypted/carrick-ci-gh-token`,
+  root 0600), loaded with `LoadCredentialEncrypted=` into the unit's private
+  credential directory and exported only into the controller's environment.
+  Contabo has no TPM, so the credential is encrypted with the host key
+  (`/var/lib/systemd/credential.secret`) alone, on unencrypted media; root
+  on the host can decrypt it. The token is the owner's existing one rather
+  than the minimal fine-grained token described in willow-pilot.md. Replace
+  it with that token (Administration read/write and Actions read on
+  `carrick-sh/carrick` only) when convenient; the unit needs no other change.
+- **Clones use static addresses on a private NAT bridge.** The host runs no
+  DHCP or DNS service for them and opens no host firewall port. The guest
+  firewall still rejects private destinations, which on this bridge includes
+  the agent workers and the host's own address.
+- **The host is shared with four agent-worker VMs.** They are outside the
+  `carrick-ci` pool, so the scoped token has no rights over them, and the
+  controller verifies that before serving.
