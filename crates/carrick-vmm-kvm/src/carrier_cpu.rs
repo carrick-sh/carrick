@@ -338,46 +338,56 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
             } => (binding, resume),
             _ => return Err(boundary_error("carrier run lost loaded task custody")),
         };
+        let image = match self.io.read_image() {
+            Ok(image) => image,
+            Err(error) => {
+                self.custody = Custody::Poisoned;
+                return Err(error);
+            }
+        };
         let target_binding = match &exit {
-            CarrierRunExit::PhysicalDoorbell {
-                port: carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT,
-                ..
-            } => {
-                let image = match self.io.read_image() {
-                    Ok(img) => img,
-                    Err(error) => {
-                        self.custody = Custody::Poisoned;
-                        return Err(error);
-                    }
-                };
+            // CPL0 schedules descendants in-zone without changing the
+            // executor's loaded task. Every physical crossing uses the
+            // registered live root, not just child retirement. The service
+            // independently authenticates its CPL0 binding and generation.
+            CarrierRunExit::PhysicalDoorbell { port, .. } => {
                 let root_gpa = RootGpa::page_aligned(FrameGpa::new(image.cr3 & !0xfff))
                     .ok_or_else(|| {
                         self.custody = Custody::Poisoned;
-                        boundary_error("unaligned child retire CR3")
+                        boundary_error("unaligned physical crossing CR3")
                     })?;
-                match self.child_bindings.get(&root_gpa).copied() {
-                    Some(child) => child,
-                    None => {
-                        self.custody = Custody::Poisoned;
-                        return Err(boundary_error(&format!(
-                            "unregistered child retire CR3: root {:#x}",
-                            root_gpa.address().raw()
-                        )));
+                if root_gpa == binding.context().root
+                    && *port != carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT
+                {
+                    binding
+                } else {
+                    match self.child_bindings.get(&root_gpa).copied() {
+                        Some(child) => child,
+                        None => {
+                            self.custody = Custody::Poisoned;
+                            return Err(boundary_error(&format!(
+                                "unregistered {} CR3: root {:#x}",
+                                if *port == carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT {
+                                    "child retire"
+                                } else {
+                                    "physical crossing"
+                                },
+                                root_gpa.address().raw()
+                            )));
+                        }
                     }
                 }
             }
             _ => binding,
         };
-        let state = match self.io.read_image().and_then(|image| {
-            X86ArchContext::capture(target_binding, &image, resume).map_err(|error| {
+        let state = match X86ArchContext::capture(target_binding, &image, resume).map_err(|error| {
                 let context = target_binding.context();
                 boundary_error(&format!(
                     "stopped CPU image after {exit:?}: {error}; expected root {:#x}, actual CR3 {:#x}, RSP {:#x}, saved GPR7 {:#x}, expected MM {}, context {}",
                     context.root.address().raw(), image.cr3, image.rsp, image.gprs[7],
                     context.mm.raw(), context.generation.raw()
                 ))
-            })
-        }) {
+            }) {
             Ok(state) => state,
             Err(error) => {
                 self.custody = Custody::Poisoned;
@@ -591,6 +601,7 @@ mod tests {
     struct ChildRetireIo {
         image: X86VcpuSnapshot,
         child_image: X86VcpuSnapshot,
+        port: u16,
     }
     impl sealed::Sealed for ChildRetireIo {}
     impl CarrierCpuIo for ChildRetireIo {
@@ -604,7 +615,7 @@ mod tests {
         fn run(&mut self) -> Result<VcpuExit, TrapError> {
             self.image = self.child_image.clone();
             Ok(VcpuExit::IoOut {
-                port: carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT,
+                port: self.port,
                 data: vec![0, 0, 0, 0],
             })
         }
@@ -613,6 +624,47 @@ mod tests {
         }
     }
     #[test]
+    fn child_owner_grant_on_root_executor_is_a_physical_boundary() {
+        let root = context(1);
+        let child = context(2);
+        let mut cpu = KvmCarrierCpu::new(ChildRetireIo {
+            image: root.hardware_image(),
+            child_image: child.hardware_image(),
+            port: carrick_x86::cpl0_entry::OWNER_GRANT_PORT,
+        })
+        .unwrap();
+        cpu.load(root.clone()).unwrap();
+        cpu.register_child_binding(child.binding());
+        // CPL0 may schedule the child without a host task handoff. This is
+        // physical service, not a trap belonging to the executor's root MM.
+        let stopped = cpu.run_loaded(root.binding().task()).unwrap();
+        assert_eq!(stopped.state.binding(), child.binding());
+        assert_eq!(
+            stopped.state.state().cr3(),
+            child.binding().context().root.address().raw()
+        );
+    }
+
+    #[test]
+    fn unregistered_owner_grant_root_is_not_an_execution_authority() {
+        let root = context(1);
+        let child = context(2);
+        let mut cpu = KvmCarrierCpu::new(ChildRetireIo {
+            image: root.hardware_image(),
+            child_image: child.hardware_image(),
+            port: carrick_x86::cpl0_entry::OWNER_GRANT_PORT,
+        })
+        .unwrap();
+        cpu.load(root.clone()).unwrap();
+        assert!(
+            cpu.run_loaded(root.binding().task())
+                .unwrap_err()
+                .to_string()
+                .contains("unregistered physical crossing CR3")
+        );
+    }
+
+    #[test]
     fn child_retiring_on_vcpu_loaded_with_root_succeeds() {
         let root = context(1);
         let child = context(2);
@@ -620,6 +672,7 @@ mod tests {
         let mut cpu = KvmCarrierCpu::new(ChildRetireIo {
             image: context(1).hardware_image(),
             child_image: child.hardware_image(),
+            port: carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT,
         })
         .unwrap();
         cpu.load(root.clone()).unwrap();
@@ -645,6 +698,7 @@ mod tests {
         let mut cpu = KvmCarrierCpu::new(ChildRetireIo {
             image: context(1).hardware_image(),
             child_image: unregistered_child.hardware_image(),
+            port: carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT,
         })
         .unwrap();
         // Do NOT register unregistered_child
@@ -664,6 +718,7 @@ mod tests {
         let mut cpu = KvmCarrierCpu::new(ChildRetireIo {
             image: context(1).hardware_image(),
             child_image: child1.hardware_image(),
+            port: carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT,
         })
         .unwrap();
         cpu.load(root.clone()).unwrap();
@@ -687,6 +742,7 @@ mod tests {
         let mut cpu2 = KvmCarrierCpu::new(ChildRetireIo {
             image: context(1).hardware_image(),
             child_image: child2.hardware_image(),
+            port: carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT,
         })
         .unwrap();
         cpu2.load(root.clone()).unwrap();

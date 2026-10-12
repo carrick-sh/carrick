@@ -69,6 +69,9 @@ impl WaitLive for Live {
 }
 impl<U> WaitZombie<u32, U> for Zombie<u32, U, TerminationStatus> {
     type Status = TerminationStatus;
+    fn exit_wait_phase(&self) -> crate::process::wait::ExitWaitPhase {
+        crate::process::wait::ExitWaitPhase::Waitable
+    }
     fn wait_zombie(&self) -> &Zombie<u32, U, TerminationStatus> {
         self
     }
@@ -395,6 +398,9 @@ fn consuming_wait_retains_only_selected_owned_claim_until_result_release() {
     }
     impl WaitZombie<u32, u32> for OwnedZombie {
         type Status = TerminationStatus;
+        fn exit_wait_phase(&self) -> crate::process::wait::ExitWaitPhase {
+            crate::process::wait::ExitWaitPhase::Waitable
+        }
         fn wait_zombie(&self) -> &Zombie<u32, u32, TerminationStatus> {
             &self.receipt
         }
