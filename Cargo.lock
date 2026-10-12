@@ -861,6 +861,7 @@ dependencies = [
  "carrick-el1",
  "carrick-el1-abi",
  "carrick-guest-arch",
+ "carrick-personality-api",
  "carrick-sched-core",
  "carrick-signal-core",
  "carrick-syscall-abi",

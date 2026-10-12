@@ -409,7 +409,10 @@ pub fn check_substrate_boundary(
         // Execution transport must not acquire Linux-shaped object owners,
         // even through a renamed or transitive dependency.
         let mut root_forbidden = forbidden_crates.clone();
-        if crate_name == "carrick-core-abi" {
+        if matches!(
+            crate_name.as_str(),
+            "carrick-core-abi" | "carrick-personality-api"
+        ) {
             root_forbidden.extend([
                 "carrick-fd-core".to_string(),
                 "carrick-pipe-core".to_string(),
@@ -1520,6 +1523,12 @@ mod tests {
             );
         }
         assert!(DEFAULT_SUBSTRATE_ALLOWLIST.contains(&"carrick-core-abi"));
+        let api =
+            fs::read_to_string(repo.join("crates/carrick-personality-api/src/lib.rs")).unwrap();
+        assert!(
+            api.contains("NativeRunFailureReason"),
+            "personality API must expose the neutral lifecycle reason"
+        );
     }
 
     #[test]
@@ -1867,34 +1876,26 @@ mod tests {
     }
 
     #[test]
-    fn core_abi_rejects_linux_object_cores_transitively() {
-        for name in [
-            "carrick-fd-core",
-            "carrick-pipe-core",
-            "carrick-inotify-core",
-        ] {
-            let mut f = Fixture::new("src/lib.rs", "");
-            let dir = f.root.path().join("crates/carrick-core-abi");
-            fs::rename(f.root.path().join("crates/carrick-sched-core"), &dir).unwrap();
-            f.metadata["packages"][0]["name"] = json!("carrick-core-abi");
-            f.metadata["packages"][0]["manifest_path"] = json!(dir.join("Cargo.toml"));
-            f.metadata["packages"][0]["targets"][0]["src_path"] = json!(dir.join("src/lib.rs"));
-            f.package("bridge", "neutral-bridge");
-            f.package("object", name);
-            f.edge(0, "bridge", "neutral_bridge", None, None);
-            f.edge(1, "object", "renamed_object", None, None);
-            let result = check_substrate_boundary(
-                f.root.path(),
-                &BoundaryConfig {
-                    metadata_json: Some(f.metadata.to_string()),
-                    substrate_allowlist: vec!["carrick-core-abi".to_string()],
-                    ..Default::default()
-                },
-            );
-            assert!(
-                matches!(result, Err(BoundaryError::Violations { .. })),
-                "neutral ABI reached {name}"
-            );
+    fn neutral_execution_roots_reject_linux_object_cores_transitively() {
+        for root in ["carrick-core-abi", "carrick-personality-api"] {
+            for name in [
+                "carrick-fd-core",
+                "carrick-pipe-core",
+                "carrick-inotify-core",
+            ] {
+                let mut f = Fixture::new_for_crate(root, "src/lib.rs", "");
+                f.package("bridge", "neutral-bridge");
+                f.package("object", name);
+                f.edge(0, "bridge", "neutral_bridge", None, None);
+                f.edge(1, "object", "renamed_object", None, None);
+                assert!(
+                    matches!(
+                        f.check_for_crate(root),
+                        Err(BoundaryError::Violations { .. })
+                    ),
+                    "{root} reached {name}"
+                );
+            }
         }
     }
 

@@ -29,4 +29,6 @@ pub use carrick_sched_core::process::{
 };
 
 // 5. Neutral lifecycle authority and entry tokens from carrick-core-abi
-pub use carrick_core_abi::{EntryRef, EntryState, GateState, Served, ThreadLedgerActivity};
+pub use carrick_core_abi::{
+    EntryRef, EntryState, GateState, NativeRunFailureReason, Served, ThreadLedgerActivity,
+};
