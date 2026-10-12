@@ -639,7 +639,11 @@ impl<T: ChildAddressTags> ForkStock<T> {
                     })
                     .collect(),
             };
+            carrick_observability::probes::fork_admission_identity(&record);
             carrick_observability::probes::fork_admission_refusal(&record);
+            for child in &record.quarantine {
+                carrick_observability::probes::fork_quarantine_state(&record, child);
+            }
             self.last_refusal = Some(record);
         }
     }
