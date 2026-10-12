@@ -71,7 +71,10 @@ Contabo clone.
 2. Build `carrick-xtask` on a Debian 13 x86 worker (glibc at most 2.41), and
    copy it with a `git archive` of `scripts/ci`, `Cargo.lock` and
    `rust-toolchain.toml` to `/root/carrick-ci`. Install `genisoimage`, `jq`
-   and `binutils`.
+   and `binutils`, and put the official `gh` (2.102.0, the same as Willow,
+   SHA-256 checked) at `/root/carrick-ci/bin/gh`: the controller calls it
+   for JIT registration. Run one template build at a time; two builders
+   on VM 300 race and the manifest records the wrong commit.
 3. Because VM firewalls sit behind the host's NAT on `vmbr1`, add Proxmox's
    documented conntrack-zone rule to the `vmbr1` stanza in
    `/etc/network/interfaces`, then `ifreload -a`:
