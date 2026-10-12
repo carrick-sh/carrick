@@ -5,8 +5,10 @@ receipt (`xtask accept --profile kvm`, i.e. `just test-kvm` with
 `CARRICK_REQUIRE_KVM=1`) on one **ephemeral GCP VM with nested
 virtualization** per run. The job itself runs on a hosted `ubuntu-latest`
 runner and drives the VM keylessly; there is no self-hosted runner
-registration, no PAT and no service-account key. The Willow JIT runner
-([willow-pilot.md](willow-pilot.md)) remains as a fallback backend.
+registration, no PAT and no service-account key. The self-hosted
+JIT runner, now served from the Contabo host
+([contabo-kvm.md](contabo-kvm.md), design in [willow-pilot.md](willow-pilot.md)),
+is the primary backend once selected; GCP stays as the fallback.
 
 This is trusted-ref CI infrastructure for an experimental project, not an
 adversarial isolation boundary.
