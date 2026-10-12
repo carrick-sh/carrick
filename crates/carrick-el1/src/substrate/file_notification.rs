@@ -1,20 +1,27 @@
 //! The EL1 venue of authenticated delegated-inode release.
-use carrick_el1_abi::{DelegatedFile, DelegatedFileAuthority, DelegatedFileGuard, SlotId};
+use carrick_el1_abi::{
+    Aarch64ParkedContext, DelegatedFile, DelegatedFileAuthority, DelegatedFileGuard, SlotId,
+    ZoneTables,
+};
+use carrick_sched_core::Waker;
 use carrick_sched_core::object_wait::{
     DelegatedFileWaitIndex, DelegatedReleaseVenue, OwnedObjectWakeEffects,
 };
-use carrick_sched_core::{Waker, ZoneTables};
 
 #[derive(Clone, Copy)]
 pub enum FileAccess<'a> {
-    Notified(DelegatedReleaseVenue<'a>),
+    Notified(DelegatedReleaseVenue<'a, Aarch64ParkedContext>),
     Unavailable,
     #[cfg(any(test, feature = "host-test"))]
     SourceFreeModel,
 }
 impl<'a> FileAccess<'a> {
     pub fn notified(zone: &'a ZoneTables, slot: SlotId) -> Self {
-        fn deliver(zone: &ZoneTables, waker: Waker, effects: OwnedObjectWakeEffects<'_>) {
+        fn deliver(
+            zone: &ZoneTables,
+            waker: Waker,
+            effects: OwnedObjectWakeEffects<'_, Aarch64ParkedContext>,
+        ) {
             let Waker::El1 { slot } = waker else {
                 unreachable!("EL1 delegated release has an exact execution slot")
             };
@@ -60,7 +67,7 @@ impl<'a> FileAccess<'a> {
 }
 #[must_use = "retain the inode guard through all protected effects"]
 pub enum FileGuard<'a> {
-    Notified(DelegatedFileGuard<'a>),
+    Notified(DelegatedFileGuard<'a, Aarch64ParkedContext>),
     #[cfg(any(test, feature = "host-test"))]
     SourceFreeModel(&'a DelegatedFile),
 }

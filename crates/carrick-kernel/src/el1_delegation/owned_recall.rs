@@ -64,7 +64,7 @@ fn driver() -> &'static Driver {
 
 /// A producer only nudges the carrier driver; it never performs storage or
 /// acquires an owner/description guard in a completion callback.
-pub(super) fn notify(_: &carrick_sched_core::ZoneTables, _: carrick_sched_core::Waker) {
+pub(super) fn notify(_: &carrick_el1_abi::ZoneTables, _: carrick_sched_core::Waker) {
     if let Some(driver) = DRIVER.get() {
         driver.state.lock().external_ready = true;
         driver.changed.notify_one();
@@ -137,7 +137,8 @@ impl Driver {
 enum Phase {
     Waiting {
         binding: Option<GuestBinding>,
-        subscription: Option<HostRecallSubscription<'static>>,
+        subscription:
+            Option<HostRecallSubscription<'static, carrick_el1_abi::Aarch64ParkedContext>>,
     },
     Storage,
     Done,

@@ -1,13 +1,13 @@
 //! Neutral wait records and enrollment authority.
 
-use crate::ReservationMm;
+use crate::{EntryContext, ReservationMm};
 use carrick_sched_core::object_wait::{
     ObjectWaitError, ObjectWaitKey, ObjectWaitSnapshot, OperationToken, OwnedObjectWakeEffects,
 };
 use carrick_sched_core::spaces::notification::{
     SpaceAccess, SpaceNotificationLease, SpaceWaitCause,
 };
-use carrick_sched_core::{RecordId, SlotId, ZoneTables};
+use carrick_sched_core::{RecordId, SlotId, ThreadCtx, ZoneTables};
 
 /// Adapter-selected guest re-entry PC, distinct from a syscall return value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,17 +34,17 @@ impl OperationResumePc {
 /// A published park. Consuming this ticket switches only after all object
 /// and queue guards have been released by the caller.
 #[must_use = "a published park must be followed by scheduling another thread"]
-pub struct ObjectParked<'a> {
-    zone: &'a ZoneTables,
+pub struct ObjectParked<'a, C: crate::EntryContext = ThreadCtx> {
+    zone: &'a ZoneTables<C>,
     slot: SlotId,
-    receipt: Option<crate::EntryHandoffReceipt>,
+    receipt: Option<crate::EntryHandoffReceipt<C>>,
 }
 
-impl<'a> ObjectParked<'a> {
+impl<'a, C: crate::EntryContext> ObjectParked<'a, C> {
     pub const fn new(
-        zone: &'a ZoneTables,
+        zone: &'a ZoneTables<C>,
         slot: SlotId,
-        receipt: Option<crate::EntryHandoffReceipt>,
+        receipt: Option<crate::EntryHandoffReceipt<C>>,
     ) -> Self {
         Self {
             zone,
@@ -53,11 +53,11 @@ impl<'a> ObjectParked<'a> {
         }
     }
 
-    pub fn take_receipt(&mut self) -> Option<crate::EntryHandoffReceipt> {
+    pub fn take_receipt(&mut self) -> Option<crate::EntryHandoffReceipt<C>> {
         self.receipt.take()
     }
 
-    pub const fn zone(&self) -> &'a ZoneTables {
+    pub const fn zone(&self) -> &'a ZoneTables<C> {
         self.zone
     }
 
@@ -65,22 +65,22 @@ impl<'a> ObjectParked<'a> {
         self.slot
     }
 
-    pub fn matches(&self, zone: &ZoneTables, slot: SlotId) -> bool {
+    pub fn matches(&self, zone: &ZoneTables<C>, slot: SlotId) -> bool {
         self.slot == slot && core::ptr::eq(self.zone, zone)
     }
 }
 
 /// Enrollment authority joined from one retained carrier region and its exact
 /// live MM source. It cannot be paired with another zone or recycled MM.
-pub struct PortalWaitEnrollment<'a> {
-    source: SpaceNotificationLease<'a>,
+pub struct PortalWaitEnrollment<'a, C: EntryContext = ThreadCtx> {
+    source: SpaceNotificationLease<'a, C>,
     cause: SpaceWaitCause,
     revision: u64,
 }
 
-impl<'a> PortalWaitEnrollment<'a> {
+impl<'a, C: EntryContext> PortalWaitEnrollment<'a, C> {
     pub const fn new(
-        source: SpaceNotificationLease<'a>,
+        source: SpaceNotificationLease<'a, C>,
         cause: SpaceWaitCause,
         revision: u64,
     ) -> Self {
@@ -103,7 +103,7 @@ impl<'a> PortalWaitEnrollment<'a> {
         self,
         record: RecordId,
         operation: OperationToken,
-        completion: &dyn Fn(OwnedObjectWakeEffects<'_>),
+        completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
     ) -> Result<(), (ObjectWaitError, OperationToken)> {
         self.source.reserve(self.cause).park_host_rechecked(
             self.source.observed_revision(self.cause, self.revision),
@@ -155,16 +155,16 @@ impl ObjectParkRequest {
 
 /// Target venue for coordinating an edit wait against the reservation table.
 #[derive(Clone, Copy)]
-pub struct EditWaitTarget<'a> {
-    pub space_access: SpaceAccess<'a>,
+pub struct EditWaitTarget<'a, C: crate::EntryContext = ThreadCtx> {
+    pub space_access: SpaceAccess<'a, C>,
     pub space_index: usize,
     pub mm: ReservationMm,
     pub slot: SlotId,
 }
 
-impl<'a> EditWaitTarget<'a> {
+impl<'a, C: crate::EntryContext> EditWaitTarget<'a, C> {
     pub const fn new(
-        space_access: SpaceAccess<'a>,
+        space_access: SpaceAccess<'a, C>,
         space_index: usize,
         mm: ReservationMm,
         slot: SlotId,

@@ -5035,7 +5035,7 @@ mod tests {
         for (mm, address) in [(1, 0), (104, 0xffff_ffff_a800_0000), (u64::MAX, u64::MAX)] {
             assert_eq!(
                 ZoneTables::<ParkedContextWords>::bucket_of_with_context(mm, address),
-                ZoneTables::bucket_of(mm, address)
+                ZoneTables::<carrick_sched_core::ThreadCtx>::bucket_of(mm, address)
             );
         }
     }

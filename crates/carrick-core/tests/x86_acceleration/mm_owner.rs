@@ -13,8 +13,15 @@ use carrick_sched_core::AddressSpaces;
 use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
 
-type FixturePortal<'a> =
-    MmPortal<'a, NoPin, LinuxReservationPolicy, NativeReservationGeometry, NativeOwnerVenue>;
+type FixturePortal<'a> = MmPortal<
+    'a,
+    NoPin,
+    LinuxReservationPolicy,
+    NativeReservationGeometry,
+    NativeOwnerVenue,
+    carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    carrick_el1_abi::Aarch64ParkedContext,
+>;
 
 fn retained() -> carrick_core_abi::PortalRetainedData {
     carrick_core_abi::PortalRetainedData {
