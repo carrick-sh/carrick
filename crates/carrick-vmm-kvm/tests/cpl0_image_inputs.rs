@@ -80,6 +80,7 @@ fn carrick_x86_cpl0_sources_and_build_config_are_inputs() {
         "carrick-guest-arch",
         "carrick-inotify-core",
         "carrick-mmu-core",
+        "carrick-personality-api",
         "carrick-personality-linux",
         "carrick-pipe-core",
         "carrick-sched-core",
