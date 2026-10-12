@@ -79,12 +79,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-personality-api"
+version = "0.1.0"
+dependencies = [
+ "carrick-core",
+ "carrick-core-abi",
+ "carrick-guest-arch",
+ "carrick-sched-core",
+]
+
+[[package]]
 name = "carrick-personality-linux"
 version = "0.1.0"
 dependencies = [
  "carrick-core",
  "carrick-core-abi",
  "carrick-guest-arch",
+ "carrick-personality-api",
  "carrick-sched-core",
  "carrick-signal-core",
  "carrick-syscall-abi",

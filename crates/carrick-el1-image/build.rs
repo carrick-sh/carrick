@@ -266,6 +266,8 @@ fn main() {
     println!("cargo:rerun-if-changed=../carrick-core/Cargo.toml");
     println!("cargo:rerun-if-changed=../carrick-core-abi/src");
     println!("cargo:rerun-if-changed=../carrick-core-abi/Cargo.toml");
+    println!("cargo:rerun-if-changed=../carrick-personality-api/src");
+    println!("cargo:rerun-if-changed=../carrick-personality-api/Cargo.toml");
     println!("cargo:rerun-if-changed=../carrick-personality-linux/src");
     println!("cargo:rerun-if-changed=../carrick-personality-linux/Cargo.toml");
 }

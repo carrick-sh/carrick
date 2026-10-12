@@ -2330,6 +2330,7 @@ mod tests {
         for dependency in [
             "carrick-core",
             "carrick-core-abi",
+            "carrick-personality-api",
             "carrick-personality-linux",
         ] {
             for input in ["src", "Cargo.toml"] {
