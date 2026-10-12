@@ -127,7 +127,7 @@ pub use carrick_core_abi::PortalWaitEnrollment;
 #[repr(C, align(64))]
 pub struct MmPortalSlots {
     carrier: AtomicU64,
-    executable: [crate::PortalExecutableSlot; crate::EL1_STACK_SLOTS as usize],
+    executable: [carrick_core_abi::PortalExecutableSlot; crate::EL1_STACK_SLOTS as usize],
     forks: [crate::PortalForkSlot; crate::EL1_STACK_SLOTS as usize],
     grants: [crate::PortalGrantSlot; crate::EL1_STACK_SLOTS as usize],
     slots: [PortalTransferSlot; crate::EL1_STACK_SLOTS as usize],
@@ -141,7 +141,7 @@ impl MmPortalSlots {
     pub const fn new() -> Self {
         Self {
             carrier: AtomicU64::new(0),
-            executable: [const { crate::PortalExecutableSlot::new() };
+            executable: [const { carrick_core_abi::PortalExecutableSlot::new() };
                 crate::EL1_STACK_SLOTS as usize],
             forks: [const { crate::PortalForkSlot::new() }; crate::EL1_STACK_SLOTS as usize],
             grants: [const { crate::PortalGrantSlot::new() }; crate::EL1_STACK_SLOTS as usize],
@@ -202,7 +202,7 @@ impl MmPortalSlots {
     pub fn carrier(&self) -> Option<NonZeroU64> {
         NonZeroU64::new(self.carrier.load(Ordering::Acquire))
     }
-    pub fn executable(&self, slot: usize) -> Option<&crate::PortalExecutableSlot> {
+    pub fn executable(&self, slot: usize) -> Option<&carrick_core_abi::PortalExecutableSlot> {
         self.executable.get(slot)
     }
     pub fn grant(&self, slot: usize) -> Option<&crate::PortalGrantSlot> {
@@ -270,7 +270,7 @@ mod layout_manifest {
         field!(
             MmPortalSlots,
             executable,
-            [crate::PortalExecutableSlot; crate::EL1_STACK_SLOTS as usize],
+            [carrick_core_abi::PortalExecutableSlot; crate::EL1_STACK_SLOTS as usize],
             8,
             22528,
             8

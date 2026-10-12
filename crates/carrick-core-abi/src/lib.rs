@@ -26,3 +26,6 @@ pub use initial_boot::*;
 
 mod prepare_stock;
 pub use prepare_stock::*;
+
+mod executable_publication;
+pub use executable_publication::*;
