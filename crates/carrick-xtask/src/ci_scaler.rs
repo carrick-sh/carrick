@@ -14,6 +14,7 @@ use thiserror::Error;
 mod github;
 mod live;
 mod mac;
+mod site;
 
 pub use mac::{
     EXEMPT_AGENTS, JOB_HOME, MacLedger, MacRecord, MacState, MacStep, MacTarget, ProcessFacts,
@@ -739,6 +740,9 @@ pub enum ScalerAction {
         #[arg(long, default_value = mac::RUNNER_DIR)]
         runner_dir: PathBuf,
     },
+    /// Print this host's KVM clone site as `SITE_*=value` lines for
+    /// `build-template-debian.sh`; fails closed on an unknown host.
+    Site,
     /// Fail unless the calling (non-root runner) user can open KVM API 12.
     VerifyKvm,
     /// Runner job-start hook: authorize before any workflow step executes.
@@ -775,6 +779,10 @@ pub fn read_policy(path: &Path, owner: Option<u32>) -> Result<JobPolicy, ScalerE
 }
 pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
     match args.action {
+        ScalerAction::Site => {
+            print!("{}", site::Site::local()?.shell_env());
+            Ok(())
+        }
         ScalerAction::VerifyKvm => verify_kvm(),
         ScalerAction::AdmitJob {
             policy_file,

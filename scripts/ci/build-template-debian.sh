@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Root on Willow only. Builds VM 300; never allocates or operates a clone.
+# Root on a known KVM clone site (Willow or the Contabo host, issue #287)
+# only. Builds VM 300; never allocates or operates a clone. The site's node,
+# storage, bridge and template size come from `carrick-xtask ci-scaler site`,
+# the same typed table the controller authenticates the template against.
 # Dependencies are existing PVE tools; no host package/service/network changes.
 set -euo pipefail
 umask 077
-[[ ${EUID} == 0 && $(hostname -s) == willow ]] || { echo 'Run as root on Willow' >&2; exit 1; }
+[[ ${EUID} == 0 ]] || { echo 'Run as root on a KVM clone site' >&2; exit 1; }
 [[ $# == 3 ]] || { echo 'Usage: build-template-debian.sh INPUT_DIR SCRIPT_COMMIT X86_LINUX_XTASK' >&2; exit 1; }
 inputs=$(realpath "$1")
 commit=$2
@@ -20,12 +23,25 @@ glibc_max=$(objdump -T "$xtask" 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sed 's/G
 if [[ -n $glibc_max ]] && [[ $(printf '%s\n2.41\n' "$glibc_max" | sort -V | tail -1) != 2.41 ]]; then
   echo "xtask needs GLIBC_$glibc_max; Debian 13 guests provide 2.41" >&2; exit 1
 fi
+# Unknown hosts fail inside xtask; every value is re-validated here.
+declare -A site=()
+while IFS='=' read -r name value; do
+  [[ $name =~ ^SITE_[A-Z_]+$ && $value =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad site line: $name" >&2; exit 1; }
+  site[$name]=$value
+done < <("$xtask" ci-scaler site)
+for name in SITE_NODE SITE_API_HOST SITE_STORAGE SITE_DISK_FORMAT SITE_BRIDGE SITE_CORES SITE_MEMORY_MIB SITE_DISK_GIB; do
+  [[ -n ${site[$name]:-} ]] || { echo "site lacks $name" >&2; exit 1; }
+done
+[[ ${site[SITE_NODE]} == $(hostname -s) ]] || { echo 'site node is not this host' >&2; exit 1; }
+node=${site[SITE_NODE]} api_host=${site[SITE_API_HOST]} storage=${site[SITE_STORAGE]}
+disk_format=${site[SITE_DISK_FORMAT]} bridge=${site[SITE_BRIDGE]}
+cores=${site[SITE_CORES]} memory_mib=${site[SITE_MEMORY_MIB]} disk_gib=${site[SITE_DISK_GIB]}
 pve_call() {
   # The credential exists only in this on-host pipe, never argv or output.
   jq -r '"header = \"Authorization: PVEAPIToken=" + .["full-tokenid"] + "=" + .value + "\""' /root/carrick-ci-token.json |
     curl --disable --fail --silent --show-error --max-time 40 --config - \
-      --resolve willow.atxconsulting.com:8006:127.0.0.1 --request "$1" \
-      "https://willow.atxconsulting.com:8006/api2/json$2"
+      --resolve "$api_host:8006:127.0.0.1" --request "$1" \
+      "https://$api_host:8006/api2/json$2"
 }
 ! qm status 300 >/dev/null 2>&1 || { echo 'VM 300 already exists; refusing replacement' >&2; exit 1; }
 pvesh get /pools/carrick-ci --output-format json | jq -e '.poolid == "carrick-ci"' >/dev/null
@@ -114,7 +130,7 @@ systemctl enable --now nftables
 # Proxmox cloud-init can otherwise grant its selected user passwordless sudo.
 # This unit is started by the controller after cloud-final, before JIT.
 # Enabling it under multi-user.target would cycle with cloud-final's After.
-# No service is installed on Willow.
+# No service is installed on the PVE host by this builder.
 cat > /etc/systemd/system/carrick-ci-ready.service <<'READY'
 [Unit]
 Description=Remove cloud-init administrative authority from CI runner
@@ -144,16 +160,19 @@ rm -rf /tmp/rustup-init /tmp/sccache-extract
 PROVISION
 genisoimage -quiet -output /var/lib/vz/template/iso/carrick-template-300-seed.iso -volid cidata -joliet -rock seed
 # Root qm operations below apply ONLY to the approved template build.
-qm create 300 --name carrick-debian13-kvm --pool carrick-ci --cores 2 --memory 4096 --balloon 0 --cpulimit 2 --cpu host \
-  --net0 virtio,bridge=vmbr0 --scsihw virtio-scsi-pci --serial0 socket --vga serial0 --agent enabled=1
-qm importdisk 300 "$image" local-lvm
-qm set 300 --scsi0 local-lvm:vm-300-disk-0 --ide2 local:iso/carrick-template-300-seed.iso,media=cdrom
+qm create 300 --name carrick-debian13-kvm --pool carrick-ci --cores "$cores" --memory "$memory_mib" --balloon 0 --cpulimit "$cores" --cpu host \
+  --net0 "virtio,bridge=$bridge" --scsihw virtio-scsi-pci --serial0 socket --vga serial0 --agent enabled=1
+qm importdisk 300 "$image" "$storage" --format "$disk_format"
+# The imported volume's name depends on the storage type; attach exactly it.
+disk=$(qm config 300 | sed -n 's/^unused0: //p')
+[[ $disk == "$storage:"* ]] || { echo 'imported disk is not on the site storage' >&2; exit 1; }
+qm set 300 --scsi0 "$disk" --ide2 local:iso/carrick-template-300-seed.iso,media=cdrom
 # Boot order only after the disk exists: combined with the attach in one
 # `qm set`, PVE 9 kept `order=net0;ide2` and the guest PXE/CD-looped with
 # "No bootable device" until the provisioning deadline.
 qm set 300 --boot order=scsi0
 qm config 300 | grep -qx 'boot: order=scsi0' || { echo 'VM 300 boot order is not scsi0' >&2; exit 1; }
-qm disk resize 300 scsi0 64G
+qm disk resize 300 scsi0 "${disk_gib}G"
 # Measure current CPU utilization AND load average, conservatively reserve two threads.
 read -ra before < /proc/stat
 sleep 5
@@ -165,7 +184,7 @@ busy=$(awk -v a="${before[*]}" -v b="${after[*]}" -v n="$(nproc)" -v load="$(cut
 }')
 awk -v projected="$busy" 'BEGIN { print "template projected CPU=" projected; exit !(projected<=0.80) }'
 awk '/MemAvailable:/ {exit !($2 >= 10485760)}' /proc/meminfo
-pve_call POST /nodes/willow/qemu/300/status/start
+pve_call POST "/nodes/$node/qemu/300/status/start"
 # Provisioning is bounded; the clone readiness deadline is separately five minutes.
 qualified=false
 for ((attempt=0; attempt<180; attempt++)); do
@@ -181,21 +200,23 @@ qm guest exec 300 -- /bin/cat /var/lib/carrick-ci/qualification.json | jq -r '."
 qm guest exec 300 -- /bin/cat /var/lib/carrick-ci/packages.txt | jq -r '."out-data"' > packages.txt
 # Clean clone identities/SSH credentials and shut down from inside the template.
 qm guest exec 300 -- /bin/bash -c 'cloud-init clean --logs --machine-id; rm -f /etc/ssh/ssh_host_* /home/runner/.ssh/authorized_keys; rm -rf /var/lib/cloud/instances /home/runner/.cache; sync'
-pve_call POST /nodes/willow/qemu/300/status/stop
+pve_call POST "/nodes/$node/qemu/300/status/stop"
 for ((attempt=0; attempt<60; attempt++)); do
   [[ $(qm status 300) == 'status: stopped' ]] && break
   sleep 2
 done
 [[ $(qm status 300) == 'status: stopped' ]] || { echo 'Template did not stop' >&2; exit 1; }
-qm set 300 --ide2 local-lvm:cloudinit --ciuser runner --ipconfig0 ip=dhcp
+qm set 300 --ide2 "$storage:cloudinit" --ciuser runner --ipconfig0 ip=dhcp
 qm template 300
 jq -n --arg commit "$commit" --arg script_hash "$(sha256sum "$inputs/scripts/ci/build-template-debian.sh" | cut -d' ' -f1)" \
   --arg image_url "$image_url" --arg image_sha512 "$image_sha512" --arg runner_version "$runner_version" --arg runner_sha256 "$runner_sha256" \
   --arg sccache_sha256 "$sccache_sha256" --arg rustup_sha256 "$rustup_sha256" --arg toolchain_hash "$(sha256sum seed/rust-toolchain.toml | cut -d' ' -f1)" \
   --arg lock_hash "$(sha256sum seed/Cargo.lock | cut -d' ' -f1)" --arg xtask_hash "$(sha256sum seed/carrick-xtask | cut -d' ' -f1)" \
   --arg packages_hash "$(sha256sum packages.txt | cut -d' ' -f1)" --slurpfile qualification qualification.json \
+  --arg node "$node" --arg storage "$storage" --arg bridge "$bridge" \
+  --argjson cores "$cores" --argjson memory_mib "$memory_mib" --argjson disk_gib "$disk_gib" \
   --arg bootstrap_hash "$(sha256sum seed/runner-once.sh | cut -d' ' -f1)" --arg hook_hash "$(sha256sum seed/admit-job.sh | cut -d' ' -f1)" \
-  '{vmid:300,pool:"carrick-ci",cpu:"host",vcpus:2,memory_mib:4096,disk_gib:64,storage:"local-lvm",bridge:"vmbr0",script_commit:$commit,
+  '{vmid:300,node:$node,pool:"carrick-ci",cpu:"host",vcpus:$cores,memory_mib:$memory_mib,disk_gib:$disk_gib,storage:$storage,bridge:$bridge,script_commit:$commit,
     script_sha256:$script_hash,image_url:$image_url,image_sha512:$image_sha512,runner_version:$runner_version,runner_sha256:$runner_sha256,
     sccache_sha256:$sccache_sha256,rustup_sha256:$rustup_sha256,toolchain_sha256:$toolchain_hash,cargo_lock_sha256:$lock_hash,
     xtask_sha256:$xtask_hash,bootstrap_sha256:$bootstrap_hash,hook_sha256:$hook_hash,packages_sha256:$packages_hash,qualification:$qualification[0]}' > manifest.json
