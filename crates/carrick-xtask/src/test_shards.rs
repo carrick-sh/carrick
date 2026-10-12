@@ -36,11 +36,23 @@ for arg in "$@"; do
 done
 
 case "$subcmd" in
-    tree|run)
+    run)
+        if [ -n "${CARRICK_TEST_XTASK-}" ]; then
+            while [ "$1" != "--" ]; do shift; done
+            shift
+            exec "$CARRICK_TEST_XTASK" "$@"
+        fi
+        exec "$CARRICK_REAL_CARGO" "$@"
+        ;;
+    tree)
         exec "$CARRICK_REAL_CARGO" "$@"
         ;;
     test)
         { printf '%q ' "RUST_TEST_THREADS=${RUST_TEST_THREADS-}" "RUST_MIN_STACK=${RUST_MIN_STACK-}" "$PWD" "$@"; printf '\n'; } >> "$CARRICK_TEST_CAPTURE"
+        if [ -n "${CARRICK_TEST_RECORDS-}" ]; then
+            printf '%s\0' "${RUST_TEST_THREADS-}" "${RUST_MIN_STACK-}" "$PWD" "$@" >> "$CARRICK_TEST_RECORDS"
+            printf '\0' >> "$CARRICK_TEST_RECORDS"
+        fi
         ;;
     *)
         echo "unexpected cargo command during shard capture: $subcmd (args: $*)" >&2
@@ -48,6 +60,53 @@ case "$subcmd" in
         ;;
 esac
 "#;
+
+/// Capture the existing recipe as structured argv, without compiling its tests.
+pub fn records(root: &Path, recipe: &str, args: &[String]) -> Result<Vec<Vec<String>>> {
+    let temp = tempfile::tempdir()?;
+    let stub = temp.path().join("cargo");
+    std::fs::write(&stub, CAPTURE)?;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))?;
+    let path = std::env::var_os("PATH").ok_or("PATH is unset")?;
+    let real_cargo = std::env::split_paths(&path)
+        .map(|p| p.join("cargo"))
+        .find(|p| p.is_file())
+        .ok_or("cargo is unavailable")?;
+    let capture_path = std::env::join_paths(
+        std::iter::once(temp.path().to_path_buf()).chain(std::env::split_paths(&path)),
+    )?;
+    let log = temp.path().join("records");
+    let status = Command::new("just")
+        .arg(recipe)
+        .args(args)
+        .current_dir(root)
+        .env("PATH", capture_path)
+        .env("CARRICK_REAL_CARGO", real_cargo)
+        .env("CARRICK_TEST_CAPTURE", temp.path().join("commands"))
+        .env("CARRICK_TEST_RECORDS", &log)
+        .env("CARRICK_TEST_XTASK", std::env::current_exe()?)
+        .status()?;
+    if !status.success() {
+        return Err(format!("capture {recipe} failed").into());
+    }
+    let data = std::fs::read(log)?;
+    let fields: Vec<_> = data.split(|b| *b == 0).collect();
+    let mut records = Vec::new();
+    let mut offset = 0;
+    while offset + 3 < fields.len() {
+        let end = (offset + 3..fields.len())
+            .find(|i| fields[*i].is_empty())
+            .ok_or("unterminated Cargo record")?;
+        records.push(
+            fields[offset..end]
+                .iter()
+                .map(|f| String::from_utf8(f.to_vec()))
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        );
+        offset = end + 1;
+    }
+    Ok(records)
+}
 
 type Inventory = BTreeMap<String, usize>;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
