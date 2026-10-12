@@ -109,7 +109,7 @@ Not performed by the repository change.
    **Private sccache per run.** `mac-run-once` sets `SCCACHE_SERVER_UDS` to a
    socket in the wiped job home, `SCCACHE_DIR` to
    `/Volumes/carrick-build/carrick-ci/sccache` (owned by `carrick-ci`, 0700)
-   and `SCCACHE_CACHE_SIZE=20G`. Without it the client used the default TCP
+   and `SCCACHE_CACHE_SIZE=8G`. Without it the client used the default TCP
    server on `127.0.0.1:4226`, which was another local user's sccache: it
    tried to spawn rustc inside the 0700 job home (`Permission denied`) and
    would have run CI compiles as that user against its cache. The server
