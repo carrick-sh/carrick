@@ -2642,7 +2642,9 @@ pub struct Counters {
     /// record id and record incarnation (seven words per identity).
     pub first_process_registry_refusal: [AtomicU64; 15],
     /// First owner COW supply refusal: stage, MM key, page VA, root
-    /// incarnation. Stage is published last; zero means no refusal.
+    /// incarnation. Hardware venue refusals use stage 64 + reason and the
+    /// remaining words hold page VA, execution claim generation, registered
+    /// address-owner generation. Stage is published last; zero means none.
     pub first_cow_supply_refusal: [AtomicU64; 4],
     /// Completed milestones of owner-served ARM forks.
     pub native_fork_progress: [AtomicU64; NativeForkProgress::COUNT],
@@ -2848,6 +2850,28 @@ impl Counters {
                 target.store(value, Ordering::Relaxed);
             }
             self.first_cow_supply_refusal[0].store(stage as u64, Ordering::Release);
+        }
+    }
+
+    pub fn record_first_cow_venue_refusal(
+        &self,
+        reason: u64,
+        fault_page: u64,
+        claim_generation: u64,
+        owner_generation: u64,
+    ) {
+        if self.first_cow_supply_refusal[0]
+            .compare_exchange(0, u64::MAX, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            for (target, value) in self.first_cow_supply_refusal[1..].iter().zip([
+                fault_page,
+                claim_generation,
+                owner_generation,
+            ]) {
+                target.store(value, Ordering::Relaxed);
+            }
+            self.first_cow_supply_refusal[0].store(64 + reason, Ordering::Release);
         }
     }
 

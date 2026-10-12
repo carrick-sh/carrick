@@ -35,7 +35,10 @@
  *     conflicts, not syscalls. No events is failure, never absence evidence.
  *     Run through carrick trace --require-script-exit -- --external against
  *     a retained signed embed executable. Owner-bind events are controls;
- *     no control, a probe error or the 30-second bound rejects the capture.
+ *     no control, a probe error or the 300-second bound rejects the capture.
+ *     The signed embed launcher verifies fixtures, builds and signs its test
+ *     binaries before entering the guest; 30 seconds expired before the witness
+ *     began and a cold release rebuild may take longer than 90 seconds.
  *     Consumer drop counters are checked by carrick trace, not a D probe.
  */
 dtrace:::BEGIN { failures = 0; controls = 0; errors = 0; bounded = 0; }
@@ -74,5 +77,5 @@ carrick*:::hvpatch-thread-terminal
         timestamp, pid, tid, arg0, arg1, arg2, arg3, arg4);
     ustack(24);
 }
-tick-1s /seconds >= 30/ { bounded = 1; exit(4); }
+tick-1s /seconds >= 300/ { bounded = 1; exit(4); }
 END { printf("GRANT1|failure_rows=%d|controls=%d|errors=%d|bounded=%d\n", failures, controls, errors, bounded); }
