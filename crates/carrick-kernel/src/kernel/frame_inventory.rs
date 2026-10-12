@@ -128,9 +128,20 @@ impl carrick_hal::PhysicalFrameInventory for PhysicalInventoryProjection {
         &self,
         mm: carrick_hal::MmGeneration,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self
+        let owners: BTreeSet<_> = self
             .inventory
-            .retire_mm(&self.ids, MmId::for_owner_binding(mm))?)
+            .state
+            .lock()
+            .mm_mapping_counts
+            .keys()
+            .filter(|owner| matches!(owner, FrameOwner::GuestMm(guest) if guest.native_mm == mm))
+            .copied()
+            .collect();
+        let mut retired = 0;
+        for owner in owners {
+            retired += self.inventory.retire_mm(&self.ids, owner)?;
+        }
+        Ok(retired)
     }
 }
 impl carrick_hal::FrameCowAuthority for PhysicalInventoryBinding {
@@ -627,8 +638,9 @@ impl FrameInventoryAuthority {
     pub fn retire_mm(
         &self,
         ids: &ObjectIdRegistry,
-        mm: MmId,
+        mm: impl Into<FrameOwner>,
     ) -> Result<usize, FrameInventoryRetireMmError> {
+        let mm = mm.into();
         let rows: Vec<(MappingId, FrameId, MappingGeneration)> = {
             let state = self.state.lock();
             if state.mm_mapping_counts.get(&mm).copied().unwrap_or(0) == 0 {
@@ -2948,8 +2960,10 @@ mod tests {
 
         const CYCLES: u64 = carrick_sched_core::spaces::ADDRESS_SPACES as u64 + 76;
         const PARENT: u64 = 301;
-        let mm_generation =
-            |raw: u64| carrick_hal::MmGeneration::new(NonZeroU64::new(raw).expect("nonzero mm"));
+        let mm_generation = |raw: u64| carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::MmGeneration::new(NonZeroU64::new(raw).expect("nonzero mm")),
+            root_generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::MIN),
+        };
         let authority = Arc::new(FrameInventoryAuthority::new());
         let ids = Arc::new(ObjectIdRegistry::new());
         let inventory = authority.physical_projection(Arc::clone(&ids));
