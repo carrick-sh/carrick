@@ -72,7 +72,7 @@ pub const fn sgi_target_of(mpidr: u64) -> u64 {
 
 /// The running thread's identity, as the host published it (for the
 /// host-loaded thread) or EL1 did after a switch.
-fn identity_of(task: &CurrentTask, affinity: u64) -> ThreadIdentity {
+pub(crate) fn identity_of(task: &CurrentTask, affinity: u64) -> ThreadIdentity {
     ThreadIdentity {
         tid: task.execution.task.load(Ordering::Relaxed),
         serial: task.mm.thread_generation.load(Ordering::Relaxed),

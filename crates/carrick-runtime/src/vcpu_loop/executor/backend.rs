@@ -833,6 +833,11 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         let generation = task.generation().raw();
         let file_table = task.lease().file_table_id().map_or(0, |id| id.raw());
         let visible_pid = task.lease().visible_pid().unwrap_or(0);
+        let root_generation = carrick_el1_abi::ContextGeneration::new(
+            std::num::NonZeroU64::new(task.binding().identity().asid_generation).ok_or_else(
+                || TrapError::Hypervisor("loaded task has zero root generation".into()),
+            )?,
+        );
         if let Some(slot) = self.live_mailbox_slot() {
             carrick_kernel::el1_delegation::publish_current_task(
                 slot,
@@ -840,6 +845,7 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 generation,
                 file_table,
                 visible_pid,
+                root_generation,
             );
             if let Some(mappings) = &self.lifecycle_mappings {
                 let control = task.lease().control_lease().ok_or_else(|| {
