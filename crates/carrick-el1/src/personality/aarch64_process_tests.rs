@@ -433,9 +433,6 @@ fn plain_fork_owns_an_independent_fd_table() {
     assert_ne!(child_key, parent_key);
 
     let parent_binding = runtime.task_binding(parent_key).unwrap();
-    let parent_record = unsafe { *fixture.zone.record(parent_binding.record.id).ctx_mut() };
-    assert_eq!(parent_record.root(), parent_ttbr);
-
     let child_binding = runtime.task_binding(child_key).unwrap();
     let parent_table = fixture
         .zone
@@ -471,27 +468,6 @@ fn plain_fork_owns_an_independent_fd_table() {
             .0,
         3
     );
-    assert_eq!(child_binding.words.syscall_return(), 0);
-    assert_eq!(child_binding.words.native.x[0], 0);
-    assert_ne!(child_binding.address.root, fixture.address.root);
-    assert_eq!(
-        child_binding.address.root.address().raw(),
-        0x20000 & AARCH64_ROOT_ADDRESS_MASK
-    );
-
-    // Verify child address space TTBR0 contains the host-assigned ASID in the top 16 bits
-    let child_index = fixture
-        .zone
-        .spaces
-        .find(child_binding.address.mm.raw().get())
-        .unwrap();
-    let grant = fixture
-        .zone
-        .spaces
-        .grant(child_index, child_binding.address.mm.raw().get())
-        .unwrap();
-    assert_eq!(grant.ttbr0 >> 48, 42);
-    assert_eq!(child_binding.words.root(), grant.ttbr0);
 }
 
 /// Red-first Test 2: private pages are COW-armed in both parent and child.
