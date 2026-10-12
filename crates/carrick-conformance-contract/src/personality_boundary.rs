@@ -1491,6 +1491,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn prepare_table_stock_has_one_neutral_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let source = fs::read_to_string(repo.join("crates/carrick-core-abi/src/prepare_stock.rs"))
+            .expect("prepare table stock must be owned by core-abi");
+        let items = syn::parse_file(&source).unwrap();
+        assert_eq!(
+            items.items.iter().filter(|item| matches!(item, syn::Item::Struct(item) if item.ident == "X86PrepareTableSpan")).count(),
+            1
+        );
+        let boot =
+            fs::read_to_string(repo.join("crates/carrick-core-abi/src/initial_boot.rs")).unwrap();
+        let items = syn::parse_file(&boot).unwrap();
+        for name in [
+            "X86_CPL0_INITIAL_EXTENT_VA",
+            "X86_CPL0_INITIAL_EXTENT_GPA",
+            "X86_CPL0_INITIAL_EXTENT_MAX_SIZE",
+        ] {
+            assert_eq!(
+                items
+                    .items
+                    .iter()
+                    .filter(|item| matches!(item, syn::Item::Const(item) if item.ident == name))
+                    .count(),
+                1
+            );
+        }
+        assert!(
+            !repo
+                .join("crates/carrick-el1-abi/src/x86_prepare_stock.rs")
+                .exists()
+        );
+        let old = fs::read_to_string(repo.join("crates/carrick-el1-abi/src/lib.rs")).unwrap();
+        assert!(!old.contains("X86PrepareTableSpan"), "no old-owner facade");
+        assert!(!old.contains("pub const X86_CPL0_INITIAL_EXTENT_"));
+    }
+
+    #[test]
     fn initial_boot_transport_has_one_neutral_owner() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let source = fs::read_to_string(repo.join("crates/carrick-core-abi/src/initial_boot.rs"))
