@@ -93,7 +93,10 @@ impl Site {
         let hostname = hostname.trim();
         SITES
             .into_iter()
-            .find(|site| site.node == hostname)
+            // `/etc/hostname` holds the short node name (Willow) or the
+            // node's FQDN, which is its certificate name (Contabo). Nothing
+            // else matches: no prefix or suffix comparison.
+            .find(|site| site.node == hostname || site.api_host == hostname)
             .ok_or(ScalerError::Guard(
                 "controller host is not a known KVM clone site",
             ))
@@ -397,12 +400,19 @@ OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n
     fn site_selection_fails_closed_on_an_unknown_host() {
         assert_eq!(Site::for_hostname("willow\n").unwrap(), WILLOW);
         assert_eq!(Site::for_hostname("m28112").unwrap(), CONTABO);
+        // Contabo's /etc/hostname is the FQDN.
+        assert_eq!(
+            Site::for_hostname("m28112.contaboserver.net\n").unwrap(),
+            CONTABO
+        );
         for host in [
             "",
             "Willow",
             "willow2",
             "carrick-ctb-w1",
-            "m28112.contaboserver.net",
+            "m28112.evil.example",
+            "contaboserver.net",
+            "m28112.contaboserver.net.evil",
         ] {
             assert!(
                 matches!(Site::for_hostname(host), Err(ScalerError::Guard(_))),
