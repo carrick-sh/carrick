@@ -317,6 +317,7 @@ fn scheduler_deny_lists_must_name_the_runner_account_exactly() {
 #[test]
 fn job_home_and_work_are_recreated_from_the_skeleton_before_every_job() {
     let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     let uid = unsafe { libc::geteuid() };
     let gid = unsafe { libc::getegid() };
     let skel = root.path().join("skel");
@@ -685,4 +686,147 @@ fn run_user_dir_is_private_persistent_and_never_follows_a_symlink() {
     ensure_run_user_dir(&dir, uid, gid).unwrap();
     assert!(std::fs::symlink_metadata(&dir).unwrap().is_dir());
     assert!(outside.join("keep").exists());
+}
+
+#[test]
+fn admitted_a_serves_re_vetted_b_but_refuses_untrusted_assignment() {
+    let context = JobContext {
+        repository: "carrick-sh/carrick".into(),
+        event: "push".into(),
+        workflow_ref: "carrick-sh/carrick/.github/workflows/kernel-runtime.yml@refs/heads/main"
+            .into(),
+        git_ref: "refs/heads/main".into(),
+        sha: "b".repeat(40),
+        run_id: 20,
+        run_attempt: 1,
+    };
+    let (root, exe, uid) = fixture();
+    let state = prepare_run_once(
+        "carrick-hvf-10-1-1-100",
+        &exe,
+        &root.path().join("run"),
+        &binding(),
+        uid,
+        uid,
+    )
+    .unwrap();
+    assert!(
+        read_policy(&state.join("policy"), Some(uid))
+            .unwrap()
+            .authorize(&context)
+            .is_err()
+    );
+    let approved = JobPolicy::Bound(RunBinding {
+        run: RunId(20),
+        attempt: 1,
+        sha: context.sha.clone(),
+    });
+    let hook_state = state.clone();
+    let hook_context = context.clone();
+    let hook = std::thread::spawn(move || {
+        admit_assigned(
+            &hook_state,
+            &hook_context,
+            uid,
+            std::time::Duration::from_secs(5),
+        )
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while pending_assignment(&state).unwrap().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "hook never published its assignment"
+        );
+        std::thread::yield_now();
+    }
+    publish_assignment(&state, &approved).unwrap();
+    hook.join().unwrap().unwrap();
+    publish_assignment(&state, &approved).unwrap(); // restart is idempotent
+    assert!(publish_assignment(&state, &JobPolicy::Bound(binding())).is_err());
+    assert_eq!(pending_assignment(&state).unwrap().unwrap().run_id, 20);
+    let mut untrusted = context.clone();
+    untrusted.event = "pull_request".into();
+    assert!(admit_assigned(&state, &untrusted, uid, std::time::Duration::ZERO).is_err());
+    untrusted = context.clone();
+    untrusted.repository = "fork/carrick".into();
+    assert!(admit_assigned(&state, &untrusted, uid, std::time::Duration::ZERO).is_err());
+    untrusted = context.clone();
+    untrusted.sha = "c".repeat(40);
+    assert!(admit_assigned(&state, &untrusted, uid, std::time::Duration::ZERO).is_err());
+}
+
+#[test]
+fn alternate_assignment_is_durable_and_deduplicated_without_consuming_reservation() {
+    let mut ledger = MacLedger::default();
+    let mut row = ledger.reserve(job(1), 100).unwrap();
+    let actual = JobKey {
+        run: RunId(20),
+        attempt: 2,
+        job: JobId(22),
+    };
+    row.assigned = Some(actual.job);
+    row.assigned_key = Some(actual);
+    row.state = MacState::Done;
+    ledger.rows[0] = row;
+    let ledger: MacLedger = serde_json::from_slice(&serde_json::to_vec(&ledger).unwrap()).unwrap();
+    assert!(ledger.served(actual));
+    assert!(!ledger.served(job(1)), "A remains demand when B ran");
+    assert_eq!(ledger.rows[0].assigned_key, Some(actual));
+}
+
+#[test]
+fn actual_assignment_requires_unique_runner_identity_and_exact_hvf_labels() {
+    let context = JobContext {
+        repository: "carrick-sh/carrick".into(),
+        event: "push".into(),
+        workflow_ref: "carrick-sh/carrick/.github/workflows/kernel-runtime.yml@refs/heads/main"
+            .into(),
+        git_ref: "refs/heads/main".into(),
+        sha: "b".repeat(40),
+        run_id: 20,
+        run_attempt: 2,
+    };
+    let actual = serde_json::json!({"id":22,"runner_id":100,"labels":HVF_LABELS});
+    let key = assigned_job_key(&context, RunnerId(100), &[actual.clone()]).unwrap();
+    assert_eq!(
+        key,
+        JobKey {
+            run: RunId(20),
+            attempt: 2,
+            job: JobId(22)
+        }
+    );
+    assert!(assigned_job_key(&context, RunnerId(101), &[actual.clone()]).is_err());
+    assert!(assigned_job_key(&context, RunnerId(100), &[actual.clone(), actual.clone()]).is_err());
+    let mut closure = actual;
+    closure["labels"] = serde_json::json!(HVF_CLOSURE_LABELS);
+    assert!(assigned_job_key(&context, RunnerId(100), &[closure]).is_err());
+}
+
+#[test]
+fn assignment_without_approval_or_during_drain_fails_closed() {
+    let (root, exe, uid) = fixture();
+    let state = prepare_run_once(
+        "carrick-hvf-10-1-1-100",
+        &exe,
+        &root.path().join("run"),
+        &binding(),
+        uid,
+        uid,
+    )
+    .unwrap();
+    let context = JobContext {
+        repository: "carrick-sh/carrick".into(),
+        event: "push".into(),
+        workflow_ref: "carrick-sh/carrick/.github/workflows/kernel-runtime.yml@refs/heads/main"
+            .into(),
+        git_ref: "refs/heads/main".into(),
+        sha: "b".repeat(40),
+        run_id: 20,
+        run_attempt: 1,
+    };
+    assert!(admit_assigned(&state, &context, uid, std::time::Duration::ZERO).is_err());
+    assert_eq!(quiesce_guest(&state).unwrap(), Assignment::Unassigned);
+    assert!(publish_assignment(&state, &JobPolicy::Bound(binding())).is_err());
+    assert!(admit_assigned(&state, &context, uid, std::time::Duration::ZERO).is_err());
 }

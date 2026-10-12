@@ -17,9 +17,10 @@ mod mac;
 
 pub use mac::{
     EXEMPT_AGENTS, JOB_HOME, MacLedger, MacRecord, MacState, MacStep, MacTarget, ProcessFacts,
-    SCCACHE_CACHE_SIZE, SCCACHE_DIR, SCCACHE_SOCKET, apply_job_env, clone_runner_tree, denies_user,
-    ensure_run_user_dir, exempt_agent, hand_clone_to_run_user, listener_command, mac_hook_script,
-    mac_step, prepare_run_once, process_facts, remove_run_root, reset_job_area, run_root_path,
+    SCCACHE_CACHE_SIZE, SCCACHE_DIR, SCCACHE_SOCKET, admit_assigned, apply_job_env, assigned_job_key,
+    clone_runner_tree, denies_user, ensure_run_user_dir, exempt_agent, hand_clone_to_run_user,
+    listener_command, mac_hook_script, mac_step, pending_assignment, prepare_run_once,
+    process_facts, publish_assignment, remove_run_root, reset_job_area, run_root_path,
     runner_manifest_for, verify_runner_tree, verify_toolchain,
 };
 
@@ -486,6 +487,7 @@ pub fn recovery_decision(row: &Record, present: bool, task: TaskState, now: u64)
         Recovery::Quarantine
     }
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobContext {
     pub repository: String,
     pub event: String,
@@ -725,6 +727,11 @@ pub enum ScalerAction {
     MacQuiesce {
         #[arg(long)]
         name: String,
+        /// Read the pending hook request, or publish controller-vetted approval.
+        #[arg(long)]
+        assignment: bool,
+        #[arg(long, requires = "assignment")]
+        approve: Option<String>,
     },
     /// Print the runner-tree manifest (run once by the owner after a
     /// checksum-verified runner install; its SHA-256 is the controller pin).
@@ -736,6 +743,9 @@ pub enum ScalerAction {
     VerifyKvm,
     /// Runner job-start hook: authorize before any workflow step executes.
     AdmitJob {
+        /// Ask the credential-holding controller to re-vet the assigned run.
+        #[arg(long)]
+        controller: bool,
         #[arg(long, default_value = "/etc/carrick-ci/policy")]
         policy_file: PathBuf,
         #[arg(long, default_value = "/run/carrick-ci")]
@@ -769,6 +779,7 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
         ScalerAction::AdmitJob {
             policy_file,
             state_dir,
+            controller,
         } => {
             let get = |name| {
                 std::env::var(name).map_err(|_| ScalerError::Guard("missing GitHub job context"))
@@ -788,7 +799,11 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
                 run_attempt: u32::try_from(number("GITHUB_RUN_ATTEMPT")?)
                     .map_err(|_| ScalerError::Guard("malformed GitHub run context"))?,
             };
-            read_policy(&policy_file, Some(0))?.authorize(&context)?;
+            if controller {
+                mac::admit_assigned(&state_dir, &context, 0, Duration::from_secs(240))?;
+            } else {
+                read_policy(&policy_file, Some(0))?.authorize(&context)?;
+            }
             mark_job_started(&state_dir)?;
             println!("admitted workflow, event and ref");
             Ok(())
@@ -848,7 +863,17 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
             },
             &manifest_sha256,
         ),
-        ScalerAction::MacQuiesce { name } => mac::quiesce(&name),
+        ScalerAction::MacQuiesce {
+            name,
+            assignment,
+            approve,
+        } => {
+            if assignment {
+                mac::assignment_exchange(&name, approve.as_deref())
+            } else {
+                mac::quiesce(&name)
+            }
+        }
         ScalerAction::MacRunnerManifest { runner_dir } => {
             print!("{}", mac::runner_manifest(&runner_dir)?);
             Ok(())
