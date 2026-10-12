@@ -64,8 +64,10 @@ gh workflow run willow-pilot.yml --ref work/willow-pilot
 
 ## Standing mode (merge queue)
 
-Willow is now the **fallback** KVM backend; the default is an ephemeral GCP
-nested-KVM VM ([gcp-kvm.md](gcp-kvm.md), which also covers switching).
+The standing controller now runs on the Contabo host
+([contabo-kvm.md](contabo-kvm.md)); Willow's stays stopped, because only one
+controller may serve the `willow-kvm` labels. GCP ([gcp-kvm.md](gcp-kvm.md),
+which also covers switching) is the fallback.
 `ci-scaler standing` reuses this controller for `kernel-runtime.yml`'s
 `kvm-tests-willow` job (selected when `CARRICK_GCP_KVM` is not `true` or
 `CARRICK_KVM_BACKEND` is `willow`): merge groups into main, pushes to main and dispatches on
