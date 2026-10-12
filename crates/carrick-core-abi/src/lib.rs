@@ -23,3 +23,6 @@ pub use native_run_failure::*;
 
 mod initial_boot;
 pub use initial_boot::*;
+
+mod prepare_stock;
+pub use prepare_stock::*;

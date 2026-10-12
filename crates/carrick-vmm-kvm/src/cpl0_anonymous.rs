@@ -133,7 +133,7 @@ fn kernel_pod_physical(
     ))
 }
 
-pub(super) type PrepareTableSpan = carrick_el1_abi::X86PrepareTableSpan;
+pub(super) type PrepareTableSpan = carrick_core_abi::X86PrepareTableSpan;
 
 pub(super) fn prepare_table_working_bytes() -> Option<usize> {
     let lanes = core::num::NonZeroUsize::new(carrick_x86::cpl0_entry::CPL0_CPU_COUNT)?;
@@ -1919,8 +1919,8 @@ mod custody_tests {
             );
         }
         let outside = RootGpa::page_aligned(FrameGpa::new(
-            carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_GPA
-                + carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_MAX_SIZE,
+            carrick_core_abi::X86_CPL0_INITIAL_EXTENT_GPA
+                + carrick_core_abi::X86_CPL0_INITIAL_EXTENT_MAX_SIZE,
         ))
         .unwrap();
         assert!(!maintenance_root_admitted(outside));

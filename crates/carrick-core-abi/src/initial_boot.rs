@@ -112,3 +112,9 @@ const _: () = {
     assert!(core::mem::size_of::<X86InitialBootGrant>() == 40);
     assert!(core::mem::offset_of!(X86InitialBootGrant, inventory_revision) == 32);
 };
+
+/// Retained initial-image frames use their own supervisor alias, never the
+/// short bootstrap direct window. The full 512 MiB budget fits here.
+pub const X86_CPL0_INITIAL_EXTENT_VA: u64 = 0xffff_fffe_0000_0000;
+pub const X86_CPL0_INITIAL_EXTENT_GPA: u64 = 0x40_00000;
+pub const X86_CPL0_INITIAL_EXTENT_MAX_SIZE: u64 = 0x2000_0000;
