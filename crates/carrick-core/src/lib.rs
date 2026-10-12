@@ -4,6 +4,7 @@
 extern crate alloc;
 pub use carrick_core_abi::Served;
 pub mod entry;
+pub mod file;
 pub mod lifecycle;
 pub mod mm;
 pub mod personality;

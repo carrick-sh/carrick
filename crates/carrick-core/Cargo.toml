@@ -11,6 +11,7 @@ default = []
 host-test = ["carrick-sched-core/host-test"]
 
 [dependencies]
+bitflags.workspace = true
 carrick-mmu-core = { path = "../carrick-mmu-core" }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-core-abi = { path = "../carrick-core-abi" }
