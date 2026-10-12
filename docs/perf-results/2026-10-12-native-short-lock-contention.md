@@ -104,3 +104,44 @@ duplicate and orphaned compiler trees were explicitly terminated (143).
 This is infrastructure interruption, not a semantic red witness. CI runs
 the same gate in isolation, without changing budgets or concurrency.
 Signed HVF and Docker ratio measurements are unavailable on this host.
+
+
+## Final local results
+
+The red commit was rebased as `5a3ddce39`; the implementation as
+`13a745c38`, on GitHub main `34391e677`. Intervening main changes
+are instructions, acceptance tooling and comments; no guest source or
+effective compiler pin changed. All fix hunks were kept unchanged.
+
+| Foreground command | Exit | Evidence |
+|---|---:|---|
+| `cargo check --workspace` | 101 | Eight unchanged HVF import errors on Linux (E0432/E0433); not a portable platform-selected build |
+| `just clippy` | 0 | Linux product closure and all CLI targets |
+| `CARRICK_AUTHORITY_BASE=503874839abdc2cc288590f57f4d35efca2a154e just lint-domains` | 0 | Live Linux CLI/runtime discovery and source/delta ceilings pass; other host profiles explicitly pending |
+| `cargo test -p carrick-el1 --lib bucket_contention -- --nocapture` | 0 | Four deterministic contention witnesses green |
+| `cargo test -p carrick-el1 --lib pending_default_stop_does_not_interrupt_wait4 -- --nocapture` | 0 | Deterministic wait4 witness green |
+| `cargo test -p carrick-el1 --lib` | 0 | 401 passed |
+| `cargo test -p carrick-core --test entry_completion --test x86_acceleration` | 0 | Both touched suites pass |
+| `cargo test -p carrick-sched-core -p carrick-core -p carrick-x86 -p carrick-personality-linux --lib` | 0 | 437 passed (102 + 84 + 188 + 63) |
+| `cargo test -p carrick-personality-linux --test x86_wave2` | 0 | 28 passed |
+| `just test-kernel` | 0 | 2468 kernel tests plus kernel-semantics suites; existing signed-only ignored case retained |
+| `CARRICK_AUTHORITY_BASE=b97e124c17b4ce0dd9a60d2ed22f81e8fa6c86d1 just ci` | 101 | Formatting, Clippy and full domain lint passed; unchanged debug-feature recipe selects platform-macos on Linux |
+| `just check-contract-change 503874839abdc2cc288590f57f4d35efca2a154e HEAD` | 0 | Changed surfaces covered |
+| `cargo run -q -p carrick-conformance-contract --bin check-contracts -- --root .` | 0 | 107 contracts, 17 claims, 297 surfaces checked |
+| `CARRICK_AUTHORITY_BASE=34391e6773a4206118977981f49f1dbefccf3fa7 cargo run --locked -p carrick-xtask -- authority-debt --source-only` | 0 | Latest-main delta and absolute source ceilings pass |
+| `just check-contract-change 34391e6773a4206118977981f49f1dbefccf3fa7 HEAD` | 0 | Latest-main changed surfaces covered |
+
+
+The CI recipe defect is tracked as [#249](https://github.com/carrick-sh/carrick/issues/249),
+a follow-up to #157, attributed by unchanged code on main. This report
+does not claim a clean-main full CI A/B run or acceptance from that
+attribution. Full CI stops there, so later CI steps are not reported green.
+
+The initial standalone lint exits (137, and duplicate cancellation 143)
+are retained above rather than treated as passes. The isolated final
+lint is green. No load generator was used.
+
+KVM integration, mounted-row stability against #236 and signed HVF remain
+unproved here; #231 assigns the KVM receipt to the merge queue. No retries,
+deadline increases, concurrency reduction or host-fallback row changes
+were used to make a runtime verdict green.
