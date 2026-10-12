@@ -24,6 +24,8 @@
 #   GCP_KVM_LOGS_OUT       directory for downloaded logs, default target/ci-logs/gcp-kvm
 #   GCP_KVM_RUSTUP_SHA256  rustup-init checksum (default: the Willow template's pin)
 #   GCP_KVM_DRY_RUN=1      print the gcloud commands and startup script; run nothing
+#   GCP_ACCEPT_PROFILE     xtask accept profile: kvm (default, the CI lane) or
+#                          linux-portable (the director's x86 portable gate)
 #
 # Exit status: 0 when a receipt was collected (test failures are recorded in
 # the receipt, never in this exit status); non-zero on a FAILED marker, a
@@ -58,6 +60,8 @@ MACHINE_TYPE=${GCP_KVM_MACHINE_TYPE:-n2-standard-16}
 ZONES=${GCP_KVM_ZONES:-us-central1-a,us-central1-b,us-central1-c,us-central1-f}
 WAIT_MINUTES=${GCP_KVM_WAIT_MINUTES:-150}
 POLL_SECONDS=${GCP_KVM_POLL_SECONDS:-30}
+ACCEPT_PROFILE=${GCP_ACCEPT_PROFILE:-kvm}
+case "$ACCEPT_PROFILE" in kvm|linux-portable) ;; *) echo "gcp-kvm: unsupported GCP_ACCEPT_PROFILE=$ACCEPT_PROFILE (kvm|linux-portable)" >&2; exit 2 ;; esac
 RECEIPT_OUT=${GCP_KVM_RECEIPT_OUT:-target/ci-receipts/receipt.json}
 LOGS_OUT=${GCP_KVM_LOGS_OUT:-target/ci-logs/gcp-kvm}
 RUSTUP_SHA256=${GCP_KVM_RUSTUP_SHA256:-dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71}
@@ -105,6 +109,7 @@ startup_script() {
     printf 'readonly CARRICK_REPO_URL=%q\n' "$REPO_URL"
     printf 'readonly CARRICK_PREFIX=%q\n' "$PREFIX"
     printf 'readonly CARRICK_RUSTUP_SHA256=%q\n' "$RUSTUP_SHA256"
+    printf 'readonly CARRICK_ACCEPT_PROFILE=%q\n' "$ACCEPT_PROFILE"
     cat <<'BODY'
 set -euo pipefail
 readonly LOG=/var/log/carrick-kvm.log
@@ -176,7 +181,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
 apt-get install -y -q --no-install-recommends \
     build-essential clang git curl ca-certificates jq just util-linux procps \
-    pkg-config libssl-dev nftables
+    pkg-config libssl-dev nftables python3 python3-venv
 
 # Test code runs as $USER_NAME. It reaches crates.io/GitHub (and the metadata
 # DNS resolver) but not the metadata HTTP endpoint, so it cannot mint the VM
@@ -231,14 +236,14 @@ rustc --version
 cargo --version
 just --version"
 
-say "running: just accept --profile kvm"
+say "running: just accept --profile $CARRICK_ACCEPT_PROFILE"
 set +e
 runuser -l "$USER_NAME" -c "set -euo pipefail
 . \"\$HOME/.cargo/env\"
 cd '$REPO'
 rm -rf target/ci-receipts
 mkdir -p target/ci-receipts
-just accept --profile kvm --receipt target/ci-receipts/receipt.json"
+just accept --profile $CARRICK_ACCEPT_PROFILE --receipt target/ci-receipts/receipt.json"
 status=$?
 set -e
 say "xtask accept exited $status"
