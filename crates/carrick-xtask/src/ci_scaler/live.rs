@@ -713,7 +713,9 @@ fn boot_and_register(
         return Err(ScalerError::Guard("host admission denied before boot"));
     }
     pve.guard(row)?;
-    // The clone inherits 300.fw; prove it before the guest can send a packet.
+    // The clone inherits 300.fw; give it its own ipfilter address, then
+    // prove the whole firewall before the guest can send a packet.
+    pve.set_clone_ipfilter(row.vm.get())?;
     pve.verify_vm_firewall(row.vm.get())?;
     let deadline = Instant::now() + Duration::from_secs(300);
     pve.deadline.set(Some(deadline));
@@ -1213,7 +1215,60 @@ fn vm_firewall_matches(site: &Site, options: &Value, rules: &Value) -> bool {
                 && rule.get("sport").is_none()
         })
 }
+/// The VM's `ipfilter-net0` ipset must hold exactly its own address.
+fn ipfilter_matches(set: &Value, address: &str) -> bool {
+    let host = format!("{address}/32");
+    set.as_array().is_some_and(|entries| {
+        entries.len() == 1
+            && entries.iter().all(|entry| {
+                matches!(entry["cidr"].as_str(), Some(cidr) if cidr == address || cidr == host)
+                    && entry.get("nomatch").is_none_or(|v| v.as_u64() == Some(0))
+            })
+    })
+}
 impl Pve {
+    /// A linked clone inherits the template's `ipfilter-net0` (its
+    /// address); replace it with exactly the clone's own address. Fails if
+    /// the inherited set is missing, so a clone without the template's
+    /// firewall never gets one invented here.
+    fn set_clone_ipfilter(&self, vmid: u16) -> Result<(), ScalerError> {
+        let Some(address) = self.site.static_address(vmid)? else {
+            return Ok(());
+        };
+        let path = format!(
+            "{}/firewall/ipset/{}",
+            self.site.qemu(vmid),
+            super::site::IPFILTER_SET
+        );
+        let entries = self.request(PveCall::Get, &path)?;
+        let entries = entries
+            .as_array()
+            .ok_or(ScalerError::External("ipfilter ipset entries"))?;
+        let mut present = false;
+        for entry in entries {
+            let cidr = entry["cidr"]
+                .as_str()
+                .ok_or(ScalerError::External("ipfilter ipset cidr"))?;
+            if cidr == address || cidr == format!("{address}/32") {
+                present = true;
+                continue;
+            }
+            if !cidr
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b == b'.' || b == b'/')
+            {
+                return Err(ScalerError::Guard("unexpected ipfilter entry"));
+            }
+            self.request(
+                PveCall::Delete,
+                &format!("{path}/{}", cidr.replace('/', "%2F")),
+            )?;
+        }
+        if !present {
+            self.request(PveCall::Post(json!({ "cidr": address })), &path)?;
+        }
+        Ok(())
+    }
     /// On an isolating site, refuse a VM (template or clone, before boot)
     /// whose PVE firewall is not exactly the site's, or a host whose
     /// datacenter firewall is off. A no-op on other sites.
@@ -1227,7 +1282,14 @@ impl Pve {
         let base = self.site.qemu(vmid);
         let options = self.request(PveCall::Get, &format!("{base}/firewall/options"))?;
         let rules = self.request(PveCall::Get, &format!("{base}/firewall/rules"))?;
-        if vm_firewall_matches(&self.site, &options, &rules) {
+        let ipset = self.request(
+            PveCall::Get,
+            &format!("{base}/firewall/ipset/{}", super::site::IPFILTER_SET),
+        )?;
+        let address = self.site.static_address(vmid)?.ok_or(ScalerError::Guard(
+            "isolating site without a static address",
+        ))?;
+        if vm_firewall_matches(&self.site, &options, &rules) && ipfilter_matches(&ipset, &address) {
             Ok(())
         } else {
             Err(ScalerError::Guard(
@@ -1766,6 +1828,25 @@ mod tests {
             {"pos":2,"type":"out","action":"DROP","dest":blocked,"enable":1}
         ]);
         assert!(!vm_firewall_matches(site, &options, &reordered));
+    }
+    #[test]
+    fn ipfilter_holds_exactly_the_vms_own_address() {
+        let ip = "10.77.0.108";
+        assert!(ipfilter_matches(&json!([{"cidr":ip}]), ip));
+        assert!(ipfilter_matches(
+            &json!([{"cidr":"10.77.0.108/32","nomatch":0}]),
+            ip
+        ));
+        for set in [
+            json!([]),
+            json!([{"cidr":"10.77.0.100"}]),
+            json!([{"cidr":ip},{"cidr":"10.77.0.11"}]),
+            json!([{"cidr":"10.77.0.0/24"}]),
+            json!([{"cidr":ip,"nomatch":1}]),
+            json!(null),
+        ] {
+            assert!(!ipfilter_matches(&set, ip), "{set}");
+        }
     }
     #[test]
     fn cluster_firewall_must_be_enabled_in_options() {

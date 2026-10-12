@@ -205,18 +205,42 @@ impl Site {
         }
     }
     /// `/etc/pve/firewall/<vmid>.fw` for an isolating site.
-    pub(super) fn vm_firewall_file(&self) -> Option<String> {
-        let rules = self.vm_firewall()?;
-        let gateway = self.gateway()?;
-        let blocked = self.blocked()?;
-        let mut file = String::from(
-            "[OPTIONS]\nenable: 1\npolicy_in: DROP\npolicy_out: DROP\nipfilter: 1\nmacfilter: 1\n\n[RULES]\n",
+    /// The static IPv4 address of VMID `vmid` on a static site.
+    pub(super) fn static_address(&self, vmid: u16) -> Result<Option<String>, ScalerError> {
+        match self.network {
+            Network::Dhcp => Ok(None),
+            Network::Static {
+                subnet: [a, b, c], ..
+            } => {
+                if !(300..=349).contains(&vmid) {
+                    return Err(ScalerError::Guard("static address outside CI VMIDs"));
+                }
+                Ok(Some(format!("{a}.{b}.{c}.{}", vmid - 200)))
+            }
+        }
+    }
+    /// `/etc/pve/firewall/<vmid>.fw` for VMID `vmid` on an isolating site.
+    /// PVE fills a VM's `ipfilter` set only from an explicit
+    /// `ipfilter-net0` ipset (cloud-init addresses are added only for
+    /// containers), so the file names the VM's own address; the controller
+    /// rewrites it for each clone, which inherits the template's.
+    pub(super) fn vm_firewall_file(&self, vmid: u16) -> Result<Option<String>, ScalerError> {
+        let (Some(rules), Some(gateway), Some(blocked), Some(address)) = (
+            self.vm_firewall(),
+            self.gateway(),
+            self.blocked(),
+            self.static_address(vmid)?,
+        ) else {
+            return Ok(None);
+        };
+        let mut file = format!(
+            "[OPTIONS]\nenable: 1\npolicy_in: DROP\npolicy_out: DROP\nipfilter: 1\nmacfilter: 1\n\n[IPSET {IPFILTER_SET}]\n{address}\n\n[RULES]\n"
         );
         for rule in rules {
             file.push_str(&rule.render(&gateway, &blocked));
             file.push('\n');
         }
-        Some(file)
+        Ok(Some(file))
     }
     /// Cloud-init `nameserver`, only where the bridge does not provide one.
     pub(super) fn nameserver(&self) -> Option<&'static str> {
@@ -251,6 +275,8 @@ impl Site {
 
 /// `source` value meaning "this site's gateway address".
 pub(super) const GATEWAY_PLACEHOLDER: &str = "gateway";
+/// The ipset PVE consults for `net0`'s `ipfilter`.
+pub(super) const IPFILTER_SET: &str = "ipfilter-net0";
 /// `dest` value meaning "this site's blocked destination set".
 pub(super) const BLOCKED_PLACEHOLDER: &str = "blocked";
 /// Every RFC 1918 and IPv4 link-local range: covers the bridge subnet, the
@@ -375,10 +401,12 @@ mod tests {
         assert!(CONTABO.ipconfig(299).is_err() && CONTABO.ipconfig(350).is_err());
         assert_eq!(CONTABO.nameserver(), Some("1.1.1.1"));
         assert!(CONTABO.isolates_bridge() && !WILLOW.isolates_bridge());
-        assert_eq!(WILLOW.vm_firewall_file(), None);
+        assert_eq!(WILLOW.vm_firewall_file(300).unwrap(), None);
+        assert_eq!(CONTABO.static_address(308).unwrap().unwrap(), "10.77.0.108");
+        assert!(CONTABO.vm_firewall_file(350).is_err());
         assert_eq!(
-            CONTABO.vm_firewall_file().unwrap(),
-            "[OPTIONS]\nenable: 1\npolicy_in: DROP\npolicy_out: DROP\nipfilter: 1\nmacfilter: 1\n\n[RULES]\n\
+            CONTABO.vm_firewall_file(300).unwrap().unwrap(),
+            "[OPTIONS]\nenable: 1\npolicy_in: DROP\npolicy_out: DROP\nipfilter: 1\nmacfilter: 1\n\n[IPSET ipfilter-net0]\n10.77.0.100\n\n[RULES]\n\
 IN ACCEPT -source 10.77.0.1 -p tcp -dport 22 -log nolog # controller SSH from the host\n\
 OUT DROP -dest 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10,154.38.161.112 -log nolog # no private, shared, link-local or host destination\n\
 OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n"
