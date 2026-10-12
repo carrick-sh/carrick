@@ -126,6 +126,13 @@ impl Site {
             }
         }
     }
+    /// A private bridge shared with other VMs: the template's `net0` must
+    /// carry the PVE VM firewall (inherited by every linked clone) that
+    /// admits only the gateway on that subnet. The in-guest firewall alone
+    /// is not enough, because a job could undo it.
+    pub(super) fn isolates_bridge(&self) -> bool {
+        matches!(self.network, Network::Static { .. })
+    }
     /// Cloud-init `nameserver`, only where the bridge does not provide one.
     pub(super) fn nameserver(&self) -> Option<&'static str> {
         match self.network {
@@ -141,7 +148,7 @@ impl Site {
             Headroom::Directory => "qcow2",
         };
         Ok(format!(
-            "SITE_NODE={}\nSITE_API_HOST={}\nSITE_STORAGE={}\nSITE_DISK_FORMAT={disk_format}\nSITE_BRIDGE={}\nSITE_CORES={}\nSITE_MEMORY_MIB={}\nSITE_DISK_GIB={}\nSITE_TEMPLATE_IPCONFIG={}\nSITE_NAMESERVER={}\n",
+            "SITE_NODE={}\nSITE_API_HOST={}\nSITE_STORAGE={}\nSITE_DISK_FORMAT={disk_format}\nSITE_BRIDGE={}\nSITE_CORES={}\nSITE_MEMORY_MIB={}\nSITE_DISK_GIB={}\nSITE_TEMPLATE_IPCONFIG={}\nSITE_NAMESERVER={}\nSITE_VM_FIREWALL={}\n",
             self.node,
             self.api_host,
             self.storage,
@@ -151,6 +158,7 @@ impl Site {
             self.disk_gib,
             self.ipconfig(300)?,
             self.nameserver().unwrap_or("none"),
+            u8::from(self.isolates_bridge()),
         ))
     }
 }
@@ -223,13 +231,14 @@ mod tests {
         // the CI VMID range.
         assert!(CONTABO.ipconfig(299).is_err() && CONTABO.ipconfig(350).is_err());
         assert_eq!(CONTABO.nameserver(), Some("1.1.1.1"));
+        assert!(CONTABO.isolates_bridge() && !WILLOW.isolates_bridge());
         assert_eq!(CONTABO.qemu(308), "/nodes/m28112/qemu/308");
     }
     #[test]
     fn template_builder_inputs_are_bare_tokens() {
         assert_eq!(
             WILLOW.shell_env().unwrap(),
-            "SITE_NODE=willow\nSITE_API_HOST=willow.atxconsulting.com\nSITE_STORAGE=local-lvm\nSITE_DISK_FORMAT=raw\nSITE_BRIDGE=vmbr0\nSITE_CORES=2\nSITE_MEMORY_MIB=4096\nSITE_DISK_GIB=64\nSITE_TEMPLATE_IPCONFIG=ip=dhcp\nSITE_NAMESERVER=none\n"
+            "SITE_NODE=willow\nSITE_API_HOST=willow.atxconsulting.com\nSITE_STORAGE=local-lvm\nSITE_DISK_FORMAT=raw\nSITE_BRIDGE=vmbr0\nSITE_CORES=2\nSITE_MEMORY_MIB=4096\nSITE_DISK_GIB=64\nSITE_TEMPLATE_IPCONFIG=ip=dhcp\nSITE_NAMESERVER=none\nSITE_VM_FIREWALL=0\n"
         );
         for site in SITES {
             for line in site.shell_env().unwrap().lines() {

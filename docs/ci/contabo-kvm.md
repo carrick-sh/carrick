@@ -26,10 +26,20 @@ and clone VMIDs 308-349. `--max-concurrency` stays 1. Contabo has 48 threads,
 and the agent workers already hold 40 vCPU and 96 GiB; the 80% CPU admission
 ceiling stops new clones while they are busy.
 
-On Contabo, clones sit on the private NAT bridge. There is no DHCP server and
-no host firewall opening. The guest firewall from the template still rejects
-private destinations, so a job cannot reach the agent workers or the host's
-services; DNS to the public resolver is allowed.
+On Contabo, clones sit on the private NAT bridge, which they share with the
+agent workers 10.77.0.11-14 (which hold codex and gh credentials). There is no
+DHCP server and no host firewall opening. Two layers keep a job off that
+subnet:
+
+- The guest firewall from the template rejects private destinations. A job
+  that gained root inside the clone could undo it.
+- The PVE VM firewall on the template's `net0` (`firewall=1`,
+  `/etc/pve/firewall/300.fw`) admits only the gateway 10.77.0.1, inbound
+  (controller SSH) and outbound, and drops the rest of 10.77.0.0/24. PVE
+  copies the VM firewall file to every clone, and the controller refuses a
+  template whose `net0` lacks it on this site.
+
+DNS to the public resolver and NAT to the internet still work.
 
 ## Backend selection
 
@@ -55,9 +65,14 @@ Contabo clone.
    copy it with a `git archive` of `scripts/ci`, `Cargo.lock` and
    `rust-toolchain.toml` to `/root/carrick-ci`. Install `genisoimage`, `jq`
    and `binutils`.
-3. `scripts/ci/build-template-debian.sh INPUT_DIR FULL_COMMIT XTASK` builds
+3. Because VM firewalls sit behind the host's NAT on `vmbr1`, add Proxmox's
+   documented conntrack-zone rule to the `vmbr1` stanza in
+   `/etc/network/interfaces`, then `ifreload -a`:
+   `post-up iptables -t raw -I PREROUTING -i fwbr+ -j CT --zone 1` (and the
+   matching `post-down ... -D ...`).
+4. `scripts/ci/build-template-debian.sh INPUT_DIR FULL_COMMIT XTASK` builds
    and qualifies template 300 from the site row (`carrick-xtask ci-scaler site`).
-4. Run the controller as a systemd unit, so it survives reboots and session
+5. Run the controller as a systemd unit, so it survives reboots and session
    exits:
 
 ```ini
