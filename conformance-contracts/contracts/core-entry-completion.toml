@@ -25,10 +25,15 @@ authentication in the Linux owner. Pending
 return work marks the admitted call complete exactly once; it cannot send the
 same syscall through a semantic host dispatcher. Unknown native ordinals are
 counted refusals with zero Linux-side publication.
+The syscall-ABI root also reexports signal wire records. Retiring the ARM
+private wire exports preserves native completion: a valid public frame
+restores its accumulator and blocked mask without a syscall result; a malformed
+frame forces SIGSEGV without publishing either, and both retain the same-entry
+return-work route. This binding does not change ARM production routing.
 """
 
 [bindings]
-vm_free = "carrick-personality-linux::x86_wave2::x4_linux_common_entry"
+vm_free = "carrick-personality-linux::x86_wave2::x4_linux_common_entry; carrick-personality-linux::signal_return_contract::public_arm_frame_preserves_same_entry_completion"
 
 [bindings.unresolved]
 embed_structural = "The x86 production binding is carrick-vmm-kvm::cpl0_entry::x4_linux_common_entry; the unchanged-ARM signed embed binding is director-owned."

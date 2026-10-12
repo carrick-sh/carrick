@@ -9,6 +9,7 @@ struct Native {
     invalid: bool,
     forced: bool,
     blocked: SigBlockMask,
+    arm_frame: Option<arm::RtSigframe>,
 }
 impl UserCopy for Native {
     fn copy_in(&mut self, _: &mut [u8], _: UserVa) -> bool {
@@ -44,6 +45,13 @@ impl<'a> SignalNative<'a> for Native {
     fn restore_signal_frame(
         &mut self,
     ) -> Result<carrick_signal_core::policy::SigBlockMask, carrick_syscall_abi::LinuxErrno> {
+        if let Some(frame) = &self.arm_frame {
+            use zerocopy::IntoBytes;
+            let resume = arm::decode(frame.as_bytes(), UserVa::new(0x40000), true)
+                .map_err(|_| carrick_syscall_abi::LinuxErrno::new(14))?;
+            self.accumulator = resume.regs[0];
+            return Ok(resume.mask);
+        }
         if self.invalid {
             return Err(carrick_syscall_abi::LinuxErrno::new(14));
         }
@@ -60,6 +68,7 @@ fn restored_context_has_no_syscall_result() {
         invalid: false,
         forced: false,
         blocked: SigBlockMask::blocking_all_of(SignalSet::default()),
+        arm_frame: None,
     };
     let outcome = invoke(SignalCall::RtSigreturn, &mut native).unwrap();
     assert!(!matches!(outcome, SignalOutcome::Returned { .. }));
@@ -93,6 +102,7 @@ fn invalid_signal_frame_is_not_an_errno_return() {
         invalid: true,
         forced: false,
         blocked: SigBlockMask::NONE,
+        arm_frame: None,
     };
     let outcome = invoke(SignalCall::RtSigreturn, &mut native);
     assert_eq!(outcome, Some(SignalOutcome::Restored));
@@ -106,6 +116,7 @@ fn pidfd_send_signal_retains_host_owner() {
         invalid: false,
         forced: false,
         blocked: SigBlockMask::NONE,
+        arm_frame: None,
     };
     assert_eq!(invoke(SignalCall::PidfdSendSignal, &mut native), None);
 }
@@ -168,6 +179,65 @@ fn frame_masks_cross_as_blocked_domains() {
         invalid: false,
         forced: false,
         blocked: SigBlockMask::NONE,
+        arm_frame: None,
     };
     assert_eq!(frame_mask(params), restored_mask(&mut native).unwrap());
+}
+
+#[test]
+fn public_arm_frame_preserves_same_entry_completion() {
+    use carrick_personality_linux::dispatch::{
+        CompletionRoute, FamilyCompletion, completion_route,
+    };
+    use carrick_syscall_abi::{
+        LinuxFpsimdContext, LinuxSiginfo, LinuxSignalContext, LinuxSignalStack,
+    };
+    let mut context = LinuxSignalContext::empty();
+    context.regs[0] = 0x1234_5678;
+    context.pc = 0x10000;
+    context.sp = 0x20000;
+    let mask = SigBlockMask::blocking_all_of(SignalSet::from_bits(1 << 9));
+    let frame = arm::encode(
+        context,
+        LinuxSignalStack::empty(),
+        mask,
+        LinuxSiginfo::empty(),
+        Some(LinuxFpsimdContext::empty()),
+        None,
+    )
+    .unwrap()
+    .rt;
+    for malformed in [false, true] {
+        let mut public = frame;
+        if malformed {
+            public
+                .ucontext
+                .uc_mcontext
+                .__reserved
+                .copy_within(0..528, 528);
+        }
+        let mut native = Native {
+            accumulator: 139,
+            invalid: false,
+            forced: false,
+            blocked: SigBlockMask::NONE,
+            arm_frame: Some(public),
+        };
+        let outcome = invoke(SignalCall::RtSigreturn, &mut native).unwrap();
+        assert_eq!(outcome, SignalOutcome::Restored);
+        assert_eq!(native.forced, malformed);
+        assert_eq!(
+            native.accumulator,
+            if malformed { 139 } else { 0x1234_5678 }
+        );
+        assert_eq!(
+            native.blocked,
+            if malformed { SigBlockMask::NONE } else { mask }
+        );
+        assert_eq!(signal_effect(&outcome), FamilyCompletion::FrameRestored);
+        assert_eq!(
+            completion_route(signal_effect(&outcome), true),
+            CompletionRoute::WithWork
+        );
+    }
 }
