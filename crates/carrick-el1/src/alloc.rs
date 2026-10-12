@@ -6,6 +6,12 @@
 use crate::lock::SpinLock;
 use core::alloc::Layout;
 
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+unsafe fn metadata_zone_at<'a>(base: *const u8) -> &'a carrick_el1_abi::ZoneTables {
+    // SAFETY: the caller supplies the mapped, aligned zone for this lifetime.
+    unsafe { &*base.cast::<carrick_el1_abi::ZoneTables>() }
+}
+
 pub use carrick_core::mm::capacity::*;
 
 pub use crate::substrate::sched::hw::{IrqGuard, disable_irq_save, restore_irq};
@@ -114,9 +120,7 @@ impl MetadataStorage {
             request,
             |generation| {
                 // SAFETY: the carrier maps the zone for the complete EL1 lifetime.
-                let zone = unsafe {
-                    &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_sched_core::ZoneTables)
-                };
+                let zone = unsafe { metadata_zone_at(carrick_el1_abi::EL1_ZONE_BASE as *const u8) };
                 let Some(key) =
                     carrick_sched_core::object_wait::ObjectWaitKey::metadata_request(generation)
                 else {
@@ -597,6 +601,25 @@ unsafe impl carrick_core::mm::reservation::ReservationMetadataAllocator for Meta
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_wait_view_reaches_arm_zone_tables_after_parked_records() {
+        let layout = std::alloc::Layout::new::<carrick_el1_abi::ZoneTables>();
+        // SAFETY: this owns an aligned, zero-valid zone for the whole test.
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<carrick_el1_abi::ZoneTables>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        // SAFETY: the allocated zone is live and aligned throughout this read.
+        let metadata =
+            unsafe { metadata_zone_at((&*zone as *const carrick_el1_abi::ZoneTables).cast()) };
+        assert_eq!(
+            core::ptr::addr_of!(zone.spaces) as usize,
+            core::ptr::addr_of!(metadata.spaces) as usize,
+            "metadata waits must use the ARM parked-record layout"
+        );
+    }
 
     #[test]
     fn allocation_receipt_identifies_exact_extent_without_transferring_ownership() {
