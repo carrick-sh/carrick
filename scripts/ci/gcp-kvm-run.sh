@@ -17,7 +17,8 @@
 # Optional:
 #   GITHUB_SERVER_URL, GITHUB_REPOSITORY   clone source (default carrick-sh/carrick)
 #   GCP_KVM_MACHINE_TYPE   default n2-standard-16
-#   GCP_KVM_ZONES          comma list, default us-central1-a,us-central1-b,us-central1-c,us-central1-f
+#   GCP_KVM_ZONES          comma list, default us-central1-a,b,c,f then us-east1-b,c,d
+#                          (regional quota exhaustion moves to the next region)
 #   GCP_KVM_WAIT_MINUTES   bound on the wait for DONE/FAILED, default 150
 #   GCP_KVM_POLL_SECONDS   poll interval, default 30
 #   GCP_KVM_RECEIPT_OUT    default target/ci-receipts/receipt.json
@@ -57,7 +58,7 @@ ATTEMPT=${GITHUB_RUN_ATTEMPT:-1}
 SHA=${GITHUB_SHA:?GITHUB_SHA is required}
 REPO_URL="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-carrick-sh/carrick}"
 MACHINE_TYPE=${GCP_KVM_MACHINE_TYPE:-n2-standard-16}
-ZONES=${GCP_KVM_ZONES:-us-central1-a,us-central1-b,us-central1-c,us-central1-f}
+ZONES=${GCP_KVM_ZONES:-us-central1-a,us-central1-b,us-central1-c,us-central1-f,us-east1-b,us-east1-c,us-east1-d}
 WAIT_MINUTES=${GCP_KVM_WAIT_MINUTES:-150}
 POLL_SECONDS=${GCP_KVM_POLL_SECONDS:-30}
 ACCEPT_PROFILE=${GCP_ACCEPT_PROFILE:-kvm}
@@ -359,9 +360,10 @@ create_args=(
     --metadata-from-file "startup-script=$workdir/startup.sh"
 )
 
-# Capacity is zonal: try the next zone. Anything else (quota, permissions,
-# bad flags) is not going to improve elsewhere.
-capacity_re='ZONE_RESOURCE_POOL_EXHAUSTED|STOCKOUT|does not have enough resources|resource_availability|currently unavailable in the .* zone'
+# Capacity is zonal and regional quotas are per region: either moves on to the
+# next zone in the list (which crosses into the next region). Anything else
+# (permissions, bad flags, global quota) is not going to improve elsewhere.
+capacity_re='ZONE_RESOURCE_POOL_EXHAUSTED|STOCKOUT|does not have enough resources|resource_availability|currently unavailable in the .* zone|Quota .* exceeded\.  Limit: .* in region'
 for zone in "${ZONE_LIST[@]}"; do
     ZONE=$zone
     log "creating $NAME ($MACHINE_TYPE) in $zone"
@@ -378,7 +380,7 @@ for zone in "${ZONE_LIST[@]}"; do
         # The request may still have left an instance record; clear it.
         delete_instance "$zone"
         ZONE=""
-        log "no capacity in $zone; trying the next zone"
+        log "no capacity or regional quota in $zone; trying the next zone"
         continue
     fi
     die "instance creation failed in $zone (not a capacity error)"
