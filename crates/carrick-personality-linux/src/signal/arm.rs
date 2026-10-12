@@ -14,11 +14,20 @@ use carrick_syscall_abi::{
     AARCH64_EL0_USER_PSTATE_MASK, LINUX_AARCH64_ESR_MAGIC, LINUX_FPSIMD_MAGIC, LinuxFpsimdContext,
     LinuxSiginfo, LinuxSignalContext, LinuxSignalStack, LinuxUcontext,
 };
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
+use zerocopy::{FromBytes, IntoBytes};
 
 /// Public Linux rt_sigframe prefix. There is no Carrick authentication trailer.
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
+)]
 pub struct RtSigframe {
     pub siginfo: LinuxSiginfo,
     pub ucontext: LinuxUcontext,
@@ -26,7 +35,16 @@ pub struct RtSigframe {
 
 /// The public frame followed by an ordinary AAPCS64 FP/LR unwind record.
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
+)]
 pub struct SignalFrame {
     pub rt: RtSigframe,
     pub frame_record: [u64; 2],
