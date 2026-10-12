@@ -1,6 +1,6 @@
 //! Live KVM witness: a static x86 ELF enters through the shared CPL0 MM owner.
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#![allow(clippy::expect_used)]
+#![allow(clippy::expect_used, clippy::panic)]
 
 #[path = "common/physical_inventory.rs"]
 mod physical_inventory;
@@ -18,6 +18,426 @@ const ELF_X86_64_MACHINE: u16 = 62;
 const ELF_LOAD_VA: u64 = 0x400000;
 const X86_SYS_WRITE: u8 = 1;
 const X86_SYS_EXIT_GROUP: u8 = 231;
+
+fn native_exit_fixture(name: &str) -> Vec<u8> {
+    let dir = tempfile::tempdir().expect("fixture directory");
+    let output = dir.path().join("guest");
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    let compiled = std::process::Command::new("timeout")
+        .args([
+            "10",
+            "cc",
+            "-nostdlib",
+            "-static",
+            "-no-pie",
+            "-Wl,--build-id=none",
+        ])
+        .arg(source)
+        .arg("-o")
+        .arg(&output)
+        .output()
+        .expect("assemble native witness");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    std::fs::read(output).expect("fixture ELF")
+}
+
+fn native_exit_workers(
+    elf: &[u8],
+) -> (
+    carrick_vmm_kvm::cpl0_boot::ProductionWorkerParts,
+    carrick_el1_abi::El1TaskId,
+) {
+    let image = prepare_static_x86_elf(elf).expect("static ELF");
+    let extent = Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("extent");
+    let mut carrier = Cpl0Carrier::boot_production(physical_inventory(), extent).expect("real KVM");
+    let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
+    let issued = dispatcher.capture_one_task_context().expect("issued root");
+    carrier
+        .bind_initial_task_identity(InitialTaskBinding {
+            task: issued.task().key(),
+            mm: carrick_guest_arch::MmGeneration::new(issued.shared().mm().id().nonzero()),
+            thread: carrick_sched_core::ThreadIdentity {
+                tid: issued.thread().key().tid.raw() as u64,
+                serial: issued.thread().key().serial.raw(),
+                mm: 0,
+                file_table: issued.resources().files().id().raw(),
+                generation: 1,
+                affinity: 3,
+                lifecycle_page: 0,
+                control_slot: 0,
+            },
+        })
+        .expect("issued root binding");
+    carrier
+        .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
+        .expect("guest MM");
+    assert!(
+        carrier.initial_thread_custody(),
+        "actual initial native record"
+    );
+    (
+        carrier.into_worker_parts(128).expect("physical workers"),
+        carrick_el1_abi::El1TaskId::from_linux_tid(issued.thread().key().tid.raw()),
+    )
+}
+
+fn run_to_marker(
+    cpu: &mut carrick_vmm_kvm::cpl0_boot::ProductionCpuLease,
+    task: carrick_guest_arch::TaskIdentity,
+    expected: u8,
+    factory: &carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory,
+) {
+    use carrick_guest_mem::GuestMemory;
+    use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
+    for _ in 0..128 {
+        let exit = cpu
+            .fixture_run_loaded(task)
+            .expect("native runtime progress")
+            .exit;
+        match exit {
+            CarrierRunExit::SyscallTrap => {
+                let ((bytes, fork_result), token) = cpu
+                    .capture_forward(task, |venue, frame| {
+                        assert_eq!(frame.rax, 1, "only the rendezvous write may cross");
+                        assert_eq!((frame.rdi, frame.rdx), (1, 1));
+                        Ok((
+                            venue.read_bytes_raw(frame.rsi, 1).expect("marker byte"),
+                            frame.r12 as i32,
+                        ))
+                    })
+                    .expect("real write crossing");
+                assert!(
+                    fork_result > 0,
+                    "guest fork result: {fork_result}; refusal {:?}; stock {:?}",
+                    factory.fork_admission_refusal(),
+                    factory.fork_stock_counters()
+                );
+                assert_eq!(
+                    bytes,
+                    [expected],
+                    "guest assertions must reach the next marker"
+                );
+                cpu.complete_forward(task, token, 1)
+                    .expect("write completion");
+                return;
+            }
+            CarrierRunExit::PhysicalDoorbell { .. } => {
+                let outcome = cpu
+                    .service_physical_doorbell(task, &exit)
+                    .expect("physical service");
+                assert!(
+                    outcome.is_none(),
+                    "guest exited before marker {expected}: {outcome:?}"
+                );
+            }
+            CarrierRunExit::Kick => {}
+            other => panic!("unexpected native exit: {other:?}"),
+        }
+    }
+    panic!("marker exit budget");
+}
+
+fn run_until_wait_enrolled(
+    cpu: &mut carrick_vmm_kvm::cpl0_boot::ProductionCpuLease,
+    task: carrick_guest_arch::TaskIdentity,
+    factory: &carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory,
+    tid: carrick_el1_abi::El1TaskId,
+    peer: bool,
+) {
+    use carrick_hal::VcpuKick;
+    use carrick_sched_core::Claim;
+    use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
+    let kick = carrick_vmm_kvm::KvmKickHandle::for_current_thread();
+    let stopped = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let watcher = scope.spawn(|| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let claim = factory
+                    .fixture_native_wait_state(tid)
+                    .expect("native enrollment")
+                    .0;
+                if matches!(claim, Claim::Parked { .. }) {
+                    kick.kick();
+                    return true;
+                }
+                if stopped.load(std::sync::atomic::Ordering::Acquire)
+                    || std::time::Instant::now() >= deadline
+                {
+                    kick.kick();
+                    return false;
+                }
+                std::thread::yield_now();
+            }
+        });
+        let exit = if peer {
+            cpu.fixture_run_idle_peer().expect("enroll peer wait")
+        } else {
+            cpu.fixture_run_until_native_kick(task)
+                .expect("enroll actual wait")
+        };
+        stopped.store(true, std::sync::atomic::Ordering::Release);
+        assert!(
+            watcher.join().expect("bounded enrollment watcher"),
+            "wait must enroll before retirement completes"
+        );
+        assert_eq!(exit, CarrierRunExit::Kick);
+    });
+}
+
+#[test]
+fn native_runtime_wait_wakes_once_only_after_real_mm_retirement() {
+    use carrick_sched_core::Claim;
+    use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
+    let elf = native_exit_fixture("native_exit_order.S");
+    let (parts, root_tid) = native_exit_workers(&elf);
+    let (root, factory) = parts.into_factory();
+    let child_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
+    let newborn_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 2);
+    let mut parent = factory.claim(0).expect("root executor");
+    let mut child = factory.claim(1).expect("idle peer executor");
+    let task = root.binding().task();
+    parent.cpu_mut().load(root).expect("load root");
+    run_to_marker(&mut parent, task, 1, &factory);
+    factory
+        .fixture_place_native_thread(child_tid, carrick_guest_arch::CpuId::new(1))
+        .expect("place child on peer");
+    let retiring = (0..128)
+        .find_map(|_| {
+            let exit = child.fixture_run_idle_peer().expect("child on idle peer");
+            if matches!(
+                exit,
+                CarrierRunExit::PhysicalDoorbell {
+                    port: carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT,
+                    ..
+                }
+            ) {
+                Some(exit)
+            } else {
+                assert!(
+                    child
+                        .service_idle_peer_doorbell(&exit)
+                        .expect("peer physical service")
+                        .is_none()
+                );
+                None
+            }
+        })
+        .expect("real retire_mm must cross before exit notification");
+    let (_, _, wakes_before) = factory
+        .fixture_native_wait_state(root_tid)
+        .expect("parent record");
+    // This marker follows actual wait4(WNOHANG)==0 and a successful fork.
+    // Retirement is still held at its stopped physical crossing.
+    run_to_marker(&mut parent, task, 2, &factory);
+    factory
+        .fixture_place_native_thread(newborn_tid, carrick_guest_arch::CpuId::new(1))
+        .expect("place sibling on peer");
+    assert!(
+        factory
+            .fork_admission_refusal()
+            .expect("admission evidence")
+            .is_none()
+    );
+    run_until_wait_enrolled(&mut parent, task, &factory, root_tid, false);
+    let (claim, _, wakes) = factory
+        .fixture_native_wait_state(root_tid)
+        .expect("pending wait");
+    assert!(matches!(claim, Claim::Parked { .. }));
+    assert!(
+        matches!(claim, Claim::Parked { seq: 1 }),
+        "one wait enrollment: {claim:?}"
+    );
+    assert_eq!(
+        wakes, wakes_before,
+        "pending retirement cannot wake the waiter"
+    );
+    assert!(
+        child
+            .service_idle_peer_doorbell(&retiring)
+            .expect("retire physical MM")
+            .is_none()
+    );
+    // Resume retire_mm to publish slot absence, then runtime readiness/channel.
+    // Stop at the next sibling retirement, which has not published a wake.
+    let next_retire = (0..128)
+        .find_map(|_| {
+            let exit = child.fixture_run_idle_peer().expect("finish child exit");
+            if matches!(
+                exit,
+                CarrierRunExit::PhysicalDoorbell {
+                    port: carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT,
+                    ..
+                }
+            ) {
+                Some(exit)
+            } else {
+                assert!(
+                    child
+                        .service_idle_peer_doorbell(&exit)
+                        .expect("peer completion")
+                        .is_none()
+                );
+                None
+            }
+        })
+        .expect("sibling remains stopped at retirement");
+    let (claim, _, wakes) = factory
+        .fixture_native_wait_state(root_tid)
+        .expect("completed wait");
+    assert!(
+        matches!(claim, Claim::Queued { .. }),
+        "real waiter must be runnable: {claim:?}"
+    );
+    assert_eq!(
+        wakes,
+        wakes_before + 1,
+        "one exit publishes exactly one wake"
+    );
+    run_to_marker(&mut parent, task, 3, &factory);
+    assert_eq!(
+        factory
+            .fixture_native_wait_state(root_tid)
+            .expect("resumed wait")
+            .2,
+        wakes_before + 1
+    );
+    drop(next_retire);
+}
+
+#[test]
+fn child_born_on_idle_peer_can_fault_and_retire_on_root_executor() {
+    use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
+    let elf = native_exit_fixture("native_peer_birth.S");
+    let (parts, root_tid) = native_exit_workers(&elf);
+    let (root, factory) = parts.into_factory();
+    let child_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
+    let newborn_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 2);
+    let mut parent = factory.claim(0).expect("root executor");
+    let mut peer = factory.claim(1).expect("idle peer");
+    let task = root.binding().task();
+    parent.cpu_mut().load(root).expect("load root");
+    run_to_marker(&mut parent, task, 1, &factory);
+    factory
+        .fixture_place_native_thread(child_tid, carrick_guest_arch::CpuId::new(1))
+        .expect("place child on peer");
+    // CPU 1 runs the first child and performs the grandchild's real fork
+    // loan and commit. CPU 0 stays stopped at the parent's marker.
+    let mut stock_crossings = 0;
+    for _ in 0..128 {
+        let exit = peer.fixture_run_idle_peer().expect("fork on idle peer");
+        if matches!(
+            exit,
+            CarrierRunExit::PhysicalDoorbell {
+                port: carrick_el1_abi::FORK_STOCK_PORT,
+                ..
+            }
+        ) {
+            stock_crossings += 1;
+        }
+        assert!(
+            peer.service_idle_peer_doorbell(&exit)
+                .expect("peer fork service")
+                .is_none()
+        );
+        if stock_crossings == 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        stock_crossings, 2,
+        "loan and commit must both occur on CPU 1"
+    );
+    let peer_marker = (0..128)
+        .find_map(|_| {
+            let exit = peer.fixture_run_idle_peer().expect("peer fork completion");
+            if exit == CarrierRunExit::SyscallTrap {
+                Some(exit)
+            } else {
+                assert!(
+                    peer.service_idle_peer_doorbell(&exit)
+                        .expect("peer physical completion")
+                        .is_none()
+                );
+                None
+            }
+        })
+        .expect("peer parent marker");
+    assert_eq!(
+        peer.fixture_idle_peer_write(&peer_marker)
+            .expect("peer stdout"),
+        [2]
+    );
+    factory
+        .fixture_place_native_thread(newborn_tid, carrick_guest_arch::CpuId::new(0))
+        .expect("migrate peer-born child to root executor");
+    run_until_wait_enrolled(&mut peer, task, &factory, child_tid, true);
+    // The newborn is queued on CPU 0; its parent enrolled wait4 on CPU 1.
+    // CPU 0 retains its root task lease as it schedules the grandchild.
+    let mut root_grants = 0;
+    let grandchild_retire = (0..128)
+        .find_map(|_| {
+            let stopped = parent
+                .fixture_run_loaded(task)
+                .expect("peer-born child on root executor");
+            let exit = stopped.exit;
+            if matches!(
+                exit,
+                CarrierRunExit::PhysicalDoorbell {
+                    port: carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT,
+                    ..
+                }
+            ) {
+                assert_ne!(
+                    stopped.state.binding().task(),
+                    task,
+                    "physical image must belong to the grandchild"
+                );
+                Some(exit)
+            } else {
+                if matches!(
+                    exit,
+                    CarrierRunExit::PhysicalDoorbell {
+                        port: carrick_x86::cpl0_entry::OWNER_GRANT_PORT,
+                        ..
+                    }
+                ) {
+                    root_grants += 1;
+                }
+                assert!(
+                    parent
+                        .service_physical_doorbell(task, &exit)
+                        .expect("registered migrated MM physical service")
+                        .is_none()
+                );
+                None
+            }
+        })
+        .expect("grandchild retirement on CPU 0");
+    assert!(
+        root_grants > 0,
+        "grandchild private first-touch requires physical grant"
+    );
+    assert!(
+        parent
+            .service_physical_doorbell(task, &grandchild_retire)
+            .expect("grandchild MM retirement")
+            .is_none()
+    );
+    let stock = factory
+        .fork_stock_counters()
+        .expect("retired grandchild stock");
+    assert_eq!(stock.quarantined_children, 1);
+    assert_eq!(stock.retire_refusals, 0);
+    // The binding witness ends at the authenticated physical retirement.
+    // Both vCPUs are stopped; dropping the carrier reclaims the remaining graph.
+}
 
 #[test]
 fn initial_root_uses_issued_thread_and_file_table_identity() {

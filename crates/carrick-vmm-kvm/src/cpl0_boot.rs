@@ -1312,6 +1312,81 @@ impl KernelStackSnapshot {
 }
 
 impl ProductionCpuLease {
+    /// Observe native wait enrollment after the kernel may have left the MM.
+    /// This stopped scheduler boundary produces no resumable task image.
+    pub fn fixture_run_until_native_kick(
+        &mut self,
+        task: carrick_guest_arch::TaskIdentity,
+    ) -> Result<CarrierRunExit, TrapError> {
+        let watchdog = Watchdog::start();
+        let result = watchdog.during_guest(|| self.cpu.fixture_run_until_kick(task));
+        if watchdog.expired() {
+            return Err(fail("native wait fixture guest interval deadline"));
+        }
+        result
+    }
+
+    /// Run a live native fixture with the carrier's existing safety watchdog.
+    pub fn fixture_run_loaded(
+        &mut self,
+        task: carrick_guest_arch::TaskIdentity,
+    ) -> Result<crate::carrier_cpu::StoppedTaskExit, TrapError> {
+        let watchdog = Watchdog::start();
+        let result = watchdog.during_guest(|| self.cpu.run_loaded(task));
+        if watchdog.expired() {
+            return Err(fail("native fixture guest interval deadline"));
+        }
+        result
+    }
+
+    /// Run the real idle peer with the same bounded fixture interval.
+    pub fn fixture_run_idle_peer(&mut self) -> Result<CarrierRunExit, TrapError> {
+        let watchdog = Watchdog::start();
+        let result = watchdog.during_guest(|| self.run_idle_peer());
+        if watchdog.expired() {
+            return Err(fail("native peer fixture guest interval deadline"));
+        }
+        result
+    }
+
+    /// Receive a fixture stdout byte from the real idle peer's stopped frame.
+    /// MM and execution identity still come from the authenticated live venue.
+    pub fn fixture_idle_peer_write(&mut self, exit: &CarrierRunExit) -> Result<Vec<u8>, TrapError> {
+        if *exit != CarrierRunExit::SyscallTrap {
+            return Err(fail("idle peer fixture requires write crossing"));
+        }
+        let mut custody = self
+            ._custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        self.cpu.with_idle_peer_vcpu(|vcpu| {
+            let slot = carrick_guest_arch::CpuId::new(1);
+            let address = vcpu.get_gpr(X86Reg::Rax)?;
+            let stack_end = checked_stack_end(custody.binding(slot).kernel_stack)
+                .ok_or_else(|| fail("peer fixture stack overflow"))?;
+            let gpa = checked_private_stack_frame_gpa(stack_end, address, size_of::<NativeFrame>())
+                .ok_or_else(|| fail("peer fixture frame outside stack"))?;
+            let ptr = custody
+                .ram
+                .host_ptr(gpa, size_of::<NativeFrame>())
+                .ok_or_else(|| fail("peer fixture frame backing"))?
+                .cast::<NativeFrame>();
+            // SAFETY: this exclusive stopped CPU owns its retained private stack.
+            let mut frame = unsafe { *ptr };
+            if (frame.rax, frame.rdi, frame.rdx) != (1, 1, 1) {
+                return Err(fail("peer fixture only receives one stdout byte"));
+            }
+            let venue = ForwardVenue::new(&mut custody, StoppedCpuLease { cpu: slot, vcpu })?;
+            let bytes = venue
+                .read_bytes_raw(frame.rsi, 1)
+                .map_err(|error| fail(error.to_string()))?;
+            frame.rax = 1;
+            // SAFETY: the same stopped CPU still exclusively owns this frame.
+            unsafe { ptr.write(frame) };
+            Ok(bytes)
+        })
+    }
+
     pub fn save_kernel_stack(
         &mut self,
         task: carrick_guest_arch::TaskIdentity,
@@ -1485,14 +1560,14 @@ impl ProductionCpuLease {
             }
         })?;
         if let Some(child_binding) = register_child {
-            self.cpu.register_child_binding(child_binding);
+            self.cpu.register_child_binding(child_binding)?;
         }
         if let Some((live_root, retire_result)) = unregister_child {
-            self.cpu.unregister_child_binding(live_root);
+            self.cpu.unregister_child_binding(live_root)?;
             retire_result?;
         }
         if let Some(PhysicalProcessExit::Exited(_) | PhysicalProcessExit::RunFailed(_)) = exit {
-            self.cpu.clear_child_bindings();
+            self.cpu.clear_child_bindings()?;
         }
         Ok(exit)
     }
@@ -1703,20 +1778,115 @@ impl ProductionCpuLease {
             }
         })?;
         if let Some(child_binding) = register_child {
-            self.cpu.register_child_binding(child_binding);
+            self.cpu.register_child_binding(child_binding)?;
         }
         if let Some((live_root, retire_result)) = unregister_child {
-            self.cpu.unregister_child_binding(live_root);
+            self.cpu.unregister_child_binding(live_root)?;
             retire_result?;
         }
         if let Some(PhysicalProcessExit::Exited(_) | PhysicalProcessExit::RunFailed(_)) = exit {
-            self.cpu.clear_child_bindings();
+            self.cpu.clear_child_bindings()?;
         }
         Ok(exit)
     }
 }
 
 impl ProductionCpuFactory {
+    /// Place an already runnable fixture task using the real claim/run queues.
+    /// Both CPUs must be stopped. Parked waiters are deliberately refused.
+    pub fn fixture_place_native_thread(
+        &self,
+        tid: El1TaskId,
+        cpu: carrick_guest_arch::CpuId,
+    ) -> Result<(), TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        let pointer = custody
+            .ram
+            .host_ptr(
+                META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
+                size_of::<X86Cpl0Zone>(),
+            )
+            .ok_or_else(|| fail("fixture native zone backing"))?;
+        // SAFETY: boot initialized the aligned zone in this retained window.
+        let zone = unsafe { &*pointer.cast::<X86Cpl0Zone>() };
+        let record = (1..carrick_sched_core::ZONE_RECORDS as u32)
+            .filter_map(carrick_sched_core::RecordId::from_raw)
+            .find(|id| {
+                zone.record(*id).identity().tid == tid.raw()
+                    && matches!(
+                        zone.record(*id).claim(),
+                        carrick_sched_core::Claim::Queued { .. }
+                    )
+            })
+            .ok_or_else(|| {
+                let live: Vec<_> = (1..carrick_sched_core::ZONE_RECORDS as u32)
+                    .filter_map(carrick_sched_core::RecordId::from_raw)
+                    .filter_map(|id| {
+                        let row = zone.record(id);
+                        (row.claim() != carrick_sched_core::Claim::Free)
+                            .then_some((row.identity(), row.claim()))
+                    })
+                    .collect();
+                fail(format!(
+                    "fixture task {} is not queued: {live:?}",
+                    tid.raw()
+                ))
+            })?;
+        if zone.record(record).home().is_some() || cpu.raw() >= 2 {
+            return Err(fail(
+                "fixture placement requires an unhomed task and live CPU",
+            ));
+        }
+        if zone.claim_for_host(
+            zone.record_ref(record),
+            None,
+            carrick_sched_core::Handback::Resumed,
+            &carrick_sched_core::BoundedSpin(0),
+        ) != carrick_sched_core::HostClaim::Claimed
+            || !zone.requeue_on(SlotId::new(cpu.raw() as u8), record)
+        {
+            return Err(fail("fixture queue placement refused"));
+        }
+        Ok(())
+    }
+
+    /// Atomic fixture census of the actual native wait enrollment.
+    /// The fixture retains this task generation; no lifecycle is completed here.
+    pub fn fixture_native_wait_state(
+        &self,
+        tid: El1TaskId,
+    ) -> Result<(carrick_sched_core::Claim, u64, u64), TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        let pointer = custody
+            .ram
+            .host_ptr(
+                META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
+                size_of::<X86Cpl0Zone>(),
+            )
+            .ok_or_else(|| fail("fixture native zone backing"))?;
+        // SAFETY: boot initialized the aligned zone in this retained window.
+        let zone = unsafe { &*pointer.cast::<X86Cpl0Zone>() };
+        let record = (1..carrick_sched_core::ZONE_RECORDS as u32)
+            .filter_map(carrick_sched_core::RecordId::from_raw)
+            .map(|id| zone.record(id))
+            .find(|row| {
+                row.identity().tid == tid.raw()
+                    && (row.claim() != carrick_sched_core::Claim::Free || row.home().is_some())
+            })
+            .ok_or_else(|| fail("native wait record absent"))?;
+        Ok((
+            record.claim(),
+            zone.counters.el1_parks.load(Ordering::Acquire),
+            zone.counters.el1_wakes.load(Ordering::Acquire),
+        ))
+    }
+
     pub fn refusal_count(&self, nr: carrick_abi::NativeNr) -> Result<u64, TrapError> {
         let custody = self
             .custody
@@ -2600,17 +2770,20 @@ impl Cpl0Carrier {
             cpus: [first, second],
             custody,
         } = self;
+        let children = crate::carrier_cpu::CarrierChildBindings::default();
         let first = KvmCarrierCpu::from_production(
             first,
             crate::KvmVm::from_shared_vm(shared_vm.clone()),
             LAYOUT,
             runs[0].clone(),
+            children.clone(),
         )?;
         let second = KvmCarrierCpu::from_production(
             second,
             crate::KvmVm::from_shared_vm(shared_vm),
             LAYOUT,
             runs[1].clone(),
+            children,
         )?;
         Ok(ProductionWorkerParts {
             cpus: [first, second],
