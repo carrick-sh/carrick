@@ -1415,6 +1415,21 @@ impl<C: ProcessContext> carrick_sched_core::LockWait<C> for CommittedWakeWait<'_
         true
     }
 }
+// Test-observable form of the existing bounded admission policy.
+struct NativeBucketWait<'a> {
+    lifetime: core::marker::PhantomData<&'a ()>,
+    #[cfg(test)]
+    probe: Option<&'a (dyn Fn(u32) + Sync)>,
+}
+impl<C: ProcessContext> carrick_sched_core::LockWait<C> for NativeBucketWait<'_> {
+    fn wait(&self, attempt: u32) -> bool {
+        #[cfg(test)]
+        if let Some(probe) = self.probe {
+            probe(attempt);
+        }
+        <BoundedSpin as carrick_sched_core::LockWait<C>>::wait(&BoundedSpin(LOCK_SPINS), attempt)
+    }
+}
 fn returned(value: i64) -> LifecycleOutcome {
     LifecycleOutcome::Returned {
         result: SyscallResult::new(value),
@@ -1839,7 +1854,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let guard = zone
             .lock(
                 ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
-                &BoundedSpin(LOCK_SPINS),
+                &NativeBucketWait {
+                    lifetime: core::marker::PhantomData,
+                    #[cfg(test)]
+                    probe: self.publication_wait_probe,
+                },
             )
             .ok_or(NativeProcessError::Busy)?;
         if channel.generation.generation() != observed {
@@ -2001,7 +2020,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let guard = zone
             .lock(
                 ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
-                &BoundedSpin(LOCK_SPINS),
+                &NativeBucketWait {
+                    lifetime: core::marker::PhantomData,
+                    #[cfg(test)]
+                    probe: self.publication_wait_probe,
+                },
             )
             .ok_or(NativeProcessError::Busy)?;
         if channel.generation.generation() != precheck_gen {
@@ -2160,7 +2183,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let guard = zone
             .lock(
                 ZoneTables::<C>::bucket_of_with_context(ch.mm, address),
-                &BoundedSpin(LOCK_SPINS),
+                &NativeBucketWait {
+                    lifetime: core::marker::PhantomData,
+                    #[cfg(test)]
+                    probe: self.publication_wait_probe,
+                },
             )
             .ok_or(NativeProcessError::Busy)
             .map_err(|e| e.errno())?;
@@ -2440,7 +2467,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let guard = zone
             .lock(
                 ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
-                &BoundedSpin(LOCK_SPINS),
+                &NativeBucketWait {
+                    lifetime: core::marker::PhantomData,
+                    #[cfg(test)]
+                    probe: self.publication_wait_probe,
+                },
             )
             .ok_or(NativeProcessError::Quarantined)?;
         // Settlement publishes under this same bucket. A claim which settled
@@ -2637,7 +2668,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     member.record,
                     None,
                     Handback::Cancelled,
-                    &BoundedSpin(LOCK_SPINS),
+                    &NativeBucketWait {
+                        lifetime: core::marker::PhantomData,
+                        #[cfg(test)]
+                        probe: self.publication_wait_probe,
+                    },
                 );
             }
         });
@@ -6013,7 +6048,7 @@ mod tests {
     // publisher reports contention. The completion flag releases it on the red
     // implementation's refusal, without sleeps or retrying the guest operation.
     fn release_bucket_when_publisher_waits<T>(
-        guard: carrick_sched_core::BucketGuard<'_, ParkedContextWords>,
+        guard: impl Send,
         waiting: &core::sync::atomic::AtomicBool,
         publish: impl FnOnce() -> T,
     ) -> T {
@@ -6021,18 +6056,20 @@ mod tests {
         std::thread::scope(|scope| {
             let attempted = &attempted;
             let release = scope.spawn(move || {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 while !waiting.load(Ordering::Acquire) && !attempted.load(Ordering::Acquire) {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "exit publication must reach the contended bucket"
-                    );
                     core::hint::spin_loop();
                 }
                 drop(guard);
             });
+            struct Finished<'a>(&'a core::sync::atomic::AtomicBool);
+            impl Drop for Finished<'_> {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Release);
+                }
+            }
+            let finished = Finished(attempted);
             let result = publish();
-            attempted.store(true, Ordering::Release);
+            drop(finished);
             release.join().unwrap();
             result
         })
@@ -6585,18 +6622,40 @@ mod tests {
                     )
                     .unwrap();
             }
-            assert!(matches!(
+            let waiting = core::sync::atomic::AtomicBool::new(false);
+            let probe = |attempt| {
+                if attempt == LOCK_SPINS {
+                    waiting.store(true, Ordering::Release);
+                }
+            };
+            let guards = default_stop.then(|| {
+                (0..carrick_sched_core::ZONE_BUCKETS)
+                    .map(|bucket| zone.lock(bucket, &BoundedSpin(0)).unwrap())
+                    .collect::<Vec<_>>()
+            });
+            entry.publication_wait_probe = Some(&probe);
+            let outcome = release_bucket_when_publisher_waits(guards, &waiting, || {
                 entry.wait4(
                     ProcessWaitPid::from_syscall_argument(u64::MAX),
                     UserVa::new(0x8000),
                     LinuxWaitOptions::empty(),
-                    UserVa::new(0)
+                    UserVa::new(0),
+                )
+            });
+            entry.publication_wait_probe = None;
+            if let LifecycleOutcome::Returned { result, .. } = outcome {
+                panic!("wait4 contention returned {}", result.raw());
+            }
+            assert!(
+                matches!(
+                    outcome,
+                    LifecycleOutcome::Transferred {
+                        progress: carrick_core::Served::Idle,
+                        ..
+                    }
                 ),
-                LifecycleOutcome::Transferred {
-                    progress: carrick_core::Served::Idle,
-                    ..
-                }
-            ));
+                "wait4 contention must not return errno"
+            );
             assert!(entry.take_handoff_receipt().is_some());
         }
         let (child_address, child_words, child_record) = {
@@ -6631,7 +6690,11 @@ mod tests {
         task.publish_lifecycle(child_identity.lifecycle_page, child_identity.control_slot);
         {
             let waiting = core::sync::atomic::AtomicBool::new(false);
-            let probe = |_| waiting.store(true, Ordering::Release);
+            let probe = |attempt| {
+                if attempt == LOCK_SPINS {
+                    waiting.store(true, Ordering::Release);
+                }
+            };
             let mut child_entry = runtime
                 .enter(source, &task, child_words, &mut service)
                 .unwrap();
@@ -6729,27 +6792,10 @@ mod tests {
                 );
                 return;
             }
-            let parent_channel = runtime
-                .graph
-                .lock()
-                .owner
-                .task(parent)
-                .unwrap()
-                .native()
-                .resources()
-                .channel
-                .as_ref()
-                .unwrap()
-                .clone();
             let parent_bucket = exit_wake_contended.map(|_| {
-                zone.lock(
-                    ZoneTables::<ParkedContextWords>::bucket_of_with_context(
-                        parent_channel.mm,
-                        WaitChannel::address(&parent_channel),
-                    ),
-                    &BoundedSpin(LOCK_SPINS),
-                )
-                .unwrap()
+                (0..carrick_sched_core::ZONE_BUCKETS)
+                    .map(|bucket| zone.lock(bucket, &BoundedSpin(0)).unwrap())
+                    .collect::<Vec<_>>()
             });
             if signal_exit_continuation {
                 child_page
@@ -8542,10 +8588,18 @@ mod tests {
     #[test]
     fn test_blocked_ipc_returns_eintr_on_signal() {
         for operation in 0..4 {
-            blocked_ipc_signal_contract(operation);
+            blocked_ipc_signal_contract(operation, false);
         }
     }
-    fn blocked_ipc_signal_contract(operation: u8) {
+    #[test]
+    fn bucket_contention_msgrcv() {
+        blocked_ipc_signal_contract(0, true);
+    }
+    #[test]
+    fn bucket_contention_semtimedop() {
+        blocked_ipc_signal_contract(3, true);
+    }
+    fn blocked_ipc_signal_contract(operation: u8, contended: bool) {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
         let zone = unsafe {
@@ -8636,11 +8690,26 @@ mod tests {
             .unwrap();
         let queue = entry.msgget(0, 0o600).unwrap();
         let sem = entry.semget(0, 1, 0o600).unwrap();
-        match operation {
-            0 => assert!(matches!(
-                entry.msgrcv(queue, UserVa::new(0), 0, 0, 8),
-                Ok((IpcOutcome::Suspended, None))
-            )),
+        let waiting = core::sync::atomic::AtomicBool::new(false);
+        let probe = |attempt| {
+            if attempt == LOCK_SPINS {
+                waiting.store(true, Ordering::Release);
+            }
+        };
+        let guards = contended.then(|| {
+            (0..carrick_sched_core::ZONE_BUCKETS)
+                .map(|bucket| zone.lock(bucket, &BoundedSpin(0)).unwrap())
+                .collect::<Vec<_>>()
+        });
+        entry.publication_wait_probe = Some(&probe);
+        release_bucket_when_publisher_waits(guards, &waiting, || match operation {
+            0 => {
+                let result = entry.msgrcv(queue, UserVa::new(0), 0, 0, 8);
+                assert!(
+                    matches!(result, Ok((IpcOutcome::Suspended, None))),
+                    "msgrcv: {result:?}"
+                );
+            }
             1 => {
                 let mut ds = carrick_syscall_abi::ipc::LinuxMsqidDs::default();
                 entry
@@ -8666,13 +8735,15 @@ mod tests {
                     sem_flg: 0,
                 }];
                 let timeout = (operation == 3).then_some(core::time::Duration::from_secs(1));
-                assert!(matches!(
-                    entry.semop(sem, &ops, timeout),
-                    Ok(IpcOutcome::Suspended)
-                ));
+                let result = entry.semop(sem, &ops, timeout);
+                assert!(
+                    matches!(result, Ok(IpcOutcome::Suspended)),
+                    "semop: {result:?}"
+                );
                 assert_eq!(entry.semctl_getncnt(sem, 0), Ok(1));
             }
-        }
+        });
+        entry.publication_wait_probe = None;
         assert!(entry.take_handoff_receipt().is_some());
         assert!(zone.slot(slot).current().is_none());
         // Publish through the signal owner while execution capacity is released.
