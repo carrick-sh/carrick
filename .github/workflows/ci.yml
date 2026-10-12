@@ -127,7 +127,7 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 12
         run: just ci-install-semgrep
-      - name: Exact unit shard coverage
+      - name: Exact Linux and macOS unit shard coverage
         if: ${{ !cancelled() }}
         run: just check-test-shards
 
@@ -213,6 +213,9 @@ jobs:
       - name: Linux crate rustdoc (including Linux host and KVM modules)
         if: ${{ !cancelled() }}
         run: just doc
+      - name: Fuzz harness compile-check
+        if: ${{ !cancelled() }}
+        run: just check-fuzz
 
   macos-clippy:
     needs: changes
@@ -244,9 +247,6 @@ jobs:
       - name: Clippy (no-panic gate)
         if: ${{ !cancelled() }}
         run: just clippy
-      - name: Verify test shard coverage matches unsharded test
-        if: ${{ !cancelled() }}
-        run: just check-test-shards
       - name: Live host-authority compiler census
         if: ${{ !cancelled() }}
         run: cargo run --locked -p carrick-xtask -- authority-debt
@@ -276,12 +276,11 @@ jobs:
       - name: Workspace build
         if: ${{ !cancelled() }}
         run: just check --workspace
+      # The live census and rustdoc retain macOS cfg/backend coverage.
+      # Linux runs source-only authority checks and its own rustdoc separately.
       - name: Workspace rustdoc
         if: ${{ !cancelled() }}
         run: just doc
-      - name: Fuzz harness compile-check
-        if: ${{ !cancelled() }}
-        run: just check-fuzz
 
   macos-unit-a:
     needs: changes

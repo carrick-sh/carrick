@@ -10,8 +10,15 @@ edition = "2024"
 cargo-fuzz = true
 
 [dependencies]
-carrick-runtime = { path = "../crates/carrick-runtime" }
 libfuzzer-sys = "0.4"
+
+# Only ELF parsing is exercised. Select the native runtime backend so the
+# compile-only gate works on Linux without enabling Hypervisor.framework.
+[target.'cfg(target_os = "linux")'.dependencies]
+carrick-runtime = { path = "../crates/carrick-runtime", default-features = false, features = ["platform-linux"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+carrick-runtime = { path = "../crates/carrick-runtime" }
 
 [[bin]]
 name = "elf_load_plan"

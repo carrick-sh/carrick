@@ -138,6 +138,18 @@ pub fn shard_recipes(root: &Path) -> Result<Vec<String>> {
 }
 
 pub fn check(root: &Path) -> Result<String> {
+    let mut hosts = vec![std::env::consts::OS];
+    if std::env::consts::OS != "macos" {
+        hosts.push("macos");
+    }
+    hosts
+        .into_iter()
+        .map(|host| check_host(root, host))
+        .collect::<Result<Vec<_>>>()
+        .map(|reports| reports.join("\n"))
+}
+
+fn check_host(root: &Path, host: &str) -> Result<String> {
     let root = root.canonicalize()?;
     let shards = shard_recipes(&root)?;
     let temp = tempfile::tempdir()?;
@@ -161,6 +173,8 @@ pub fn check(root: &Path) -> Result<String> {
             .env("PATH", &capture_path)
             .env("CARRICK_REAL_CARGO", &real_cargo)
             .env("CARRICK_TEST_CAPTURE", &log)
+            .env("CARRICK_TEST_CAPTURE_HOST", host)
+            .env("CARRICK_TEST_XTASK", std::env::current_exe()?)
             .env_remove("RUST_TEST_THREADS")
             .env_remove("RUST_MIN_STACK")
             .output()?;
@@ -206,6 +220,6 @@ pub fn check(root: &Path) -> Result<String> {
         "{}: {} Cargo selections match just test exactly on {} (filters, features, serial threads and stack budgets included)",
         shards.join(", "),
         expected.values().sum::<usize>(),
-        std::env::consts::OS
+        host
     ))
 }
