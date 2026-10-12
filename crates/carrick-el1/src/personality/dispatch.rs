@@ -235,85 +235,94 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
         if process_call {
             if let (Some(slot), Some(task)) = (slot, current_tasks.get(frame.slot as usize)) {
                 let source = carrick_el1_abi::BornInZoneSource { zone, slot };
-                let record = zone
-                    .slot(slot)
-                    .current()
-                    .or_else(|| zone.slot(slot).host_record());
-                if let Some(record) = record {
-                    let mut saved = carrick_el1_abi::Aarch64ParkedContext::ZERO;
-                    sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
-                    let ttbr0 = crate::isa::aarch64::hardware_live_ttbr();
-                    if let Ok((runtime, address, words)) = super::aarch64_process::admit_entry(
+                let mut saved = carrick_el1_abi::Aarch64ParkedContext::ZERO;
+                sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
+                let ttbr0 = crate::isa::aarch64::hardware_live_ttbr();
+                let record = super::aarch64_process::process_record_for_call(
+                    source,
+                    task,
+                    saved.native,
+                    ttbr0,
+                );
+                if let Ok(record) = record
+                    && let Ok((runtime, address, words)) = super::aarch64_process::admit_entry(
                         source,
                         task,
                         saved.native,
                         ttbr0,
                         record,
+                    )
+                {
+                    let mut service = match super::aarch64_process::Aarch64NativeProcessService::new(
+                        task, slot,
                     ) {
-                        let mut service =
-                            match super::aarch64_process::Aarch64NativeProcessService::new(
-                                task, slot,
-                            ) {
-                                Ok(service) => service,
-                                Err(_) => return refuse_owner_process_call(frame, counters),
-                            };
-                        let action = {
-                            let mut process = match runtime.enter_registered(
-                                super::aarch64_process::registry(),
-                                source,
-                                task,
-                                address,
-                                words,
-                                &mut service,
-                            ) {
-                                Ok(process) => process,
-                                Err(_) => return refuse_owner_process_call(frame, counters),
-                            };
-                            let route = dispatch_syscall_with_native(
-                                frame,
-                                counters,
-                                current_tasks,
-                                fd_map,
-                                object_table,
-                                open_table,
-                                inotify_table,
-                                name_cache,
-                                Some(Zone {
-                                    tables: zone,
-                                    cpu: &mut sched::HardwareCpu,
-                                    user: &sched::HardwareUserWord,
-                                }),
-                                ipc::guest_venue(frame.slot as u32).as_ref(),
-                                lifecycle::guest_venue(),
-                                Some(&mut process),
-                                Some(source),
-                                None,
-                                |handle| {
-                                    carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8
-                                },
-                            );
-                            let root_exit = process.take_root_exit();
-                            (route, root_exit)
+                        Ok(service) => service,
+                        Err(_) => return refuse_owner_process_call(frame, counters),
+                    };
+                    let action = {
+                        let mut process = match runtime.enter_registered(
+                            super::aarch64_process::registry(),
+                            source,
+                            task,
+                            address,
+                            words,
+                            &mut service,
+                        ) {
+                            Ok(process) => process,
+                            Err(_) => return refuse_owner_process_call(frame, counters),
                         };
-                        if let Some(status) = action.1
-                            && super::aarch64_process::cross_root_exit(
-                                &mut service.crossing,
-                                task,
-                                status,
-                                u32::from(slot.raw()),
-                            )
-                            .is_err()
-                        {
-                            return refuse_owner_process_call(frame, counters);
-                        }
-                        return match action.0 {
-                            carrick_personality_linux::dispatch::CompletionRoute::Served => Action::Served,
-                            carrick_personality_linux::dispatch::CompletionRoute::WithWork => Action::ServedWithWork,
-                            carrick_personality_linux::dispatch::CompletionRoute::Suspended => Action::Idle,
-                            carrick_personality_linux::dispatch::CompletionRoute::Forward => refuse_owner_process_call(frame, counters),
-                            carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion => invalid_completion(NativeInvariant::EntryBinding),
-                        };
+                        let route = dispatch_syscall_with_native(
+                            frame,
+                            counters,
+                            current_tasks,
+                            fd_map,
+                            object_table,
+                            open_table,
+                            inotify_table,
+                            name_cache,
+                            Some(Zone {
+                                tables: zone,
+                                cpu: &mut sched::HardwareCpu,
+                                user: &sched::HardwareUserWord,
+                            }),
+                            ipc::guest_venue(frame.slot as u32).as_ref(),
+                            lifecycle::guest_venue(),
+                            Some(&mut process),
+                            Some(source),
+                            None,
+                            |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
+                        );
+                        let root_exit = process.take_root_exit();
+                        (route, root_exit)
+                    };
+                    if let Some(status) = action.1
+                        && super::aarch64_process::cross_root_exit(
+                            &mut service.crossing,
+                            task,
+                            status,
+                            u32::from(slot.raw()),
+                        )
+                        .is_err()
+                    {
+                        return refuse_owner_process_call(frame, counters);
                     }
+                    return match action.0 {
+                        carrick_personality_linux::dispatch::CompletionRoute::Served => {
+                            Action::Served
+                        }
+                        carrick_personality_linux::dispatch::CompletionRoute::WithWork => {
+                            Action::ServedWithWork
+                        }
+                        carrick_personality_linux::dispatch::CompletionRoute::Suspended => {
+                            Action::Idle
+                        }
+                        carrick_personality_linux::dispatch::CompletionRoute::Forward => {
+                            refuse_owner_process_call(frame, counters)
+                        }
+                        carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion => {
+                            invalid_completion(NativeInvariant::EntryBinding)
+                        }
+                    };
                 }
             }
             return refuse_owner_process_call(frame, counters);
