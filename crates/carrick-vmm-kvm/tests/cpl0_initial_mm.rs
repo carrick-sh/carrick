@@ -216,6 +216,18 @@ fn shared_guest_owner_loads_static_elf_and_exits_seven() {
 }
 
 #[test]
+fn production_static_pie_loads_above_low_stack_and_exits_seven() {
+    let mut elf = tiny_elf();
+    elf[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN without PT_INTERP
+    elf[24..32].copy_from_slice(&0xb0u64.to_le_bytes());
+    elf[80..88].copy_from_slice(&0u64.to_le_bytes());
+    let plan = prepare_static_x86_elf(&elf).expect("static PIE parser");
+    assert_eq!(plan.entry, carrick_mem::elf::LINUX_PIE_DEFAULT_BASE + 0xb0);
+    let outcome = run_pool_fixture(&elf, 8);
+    assert_eq!(outcome.run.exit_code, 7);
+}
+
+#[test]
 fn production_extent_cannot_alias_kernel_metadata() {
     use carrick_el1_abi::{EL1_DYNAMIC_METADATA_SIZE, X86_CPL0_DYNAMIC_METADATA_BASE};
 
