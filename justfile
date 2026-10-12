@@ -172,8 +172,13 @@ check-fuzz:
     {{_admit}} {{_cargo}} check --manifest-path fuzz/Cargo.toml
 
 # Compile-check debug and diagnostic features that are off by default.
+# macOS enables `debug-all` (which includes HVF tracing); off-macOS compiles the
+# platform-agnostic debug features so macOS-only HVF is not pulled in.
+_debug_features := if os() == "macos" { "debug-all,alloc-census,fs-memory" \
+} else { "trace-tty,trace-io,trace-traps,watchpoint,event-ring-dump,trace-syscalls,trace-elf,trace-dtrace,alloc-census,fs-memory" }
+
 check-debug-features:
-    {{_admit}} {{_cargo}} check -p carrick-cli --features debug-all,alloc-census,fs-memory
+    {{_admit}} {{_cargo}} check -p carrick-cli {{_platform_features}} --features {{_debug_features}}
     {{_admit}} {{_cargo}} check -p carrick-kernel-example --features allocation-metrics
 
 
