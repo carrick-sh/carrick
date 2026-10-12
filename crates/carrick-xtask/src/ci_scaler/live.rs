@@ -170,7 +170,7 @@ struct Pve {
     token: Token,
     deadline: std::cell::Cell<Option<Instant>>,
 }
-fn pve_curl(call: &PveCall, resolve: &str, url: &str) -> Command {
+fn pve_curl(call: &PveCall, resolve: &str, ca: Option<&str>, url: &str) -> Command {
     let mut command = Command::new("curl");
     command.args([
         "--disable",
@@ -182,12 +182,11 @@ fn pve_curl(call: &PveCall, resolve: &str, url: &str) -> Command {
         "40",
         "--resolve",
         resolve,
-        "--config",
-        "-",
-        "--request",
-        call.method(),
-        url,
     ]);
+    if let Some(ca) = ca {
+        command.args(["--cacert", ca]);
+    }
+    command.args(["--config", "-", "--request", call.method(), url]);
     command
 }
 impl Pve {
@@ -220,7 +219,12 @@ impl Pve {
         let limit = remaining(self.deadline.get(), Duration::from_secs(45))?;
         let config = request_config(&self.token, &call)?;
         let bytes = execute(
-            &mut pve_curl(&call, &self.site.api_resolve(), &self.site.api_url(path)),
+            &mut pve_curl(
+                &call,
+                &self.site.api_resolve(),
+                self.site.api_ca,
+                &self.site.api_url(path),
+            ),
             config.as_bytes(),
             limit,
         )?;
