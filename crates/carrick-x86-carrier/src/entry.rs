@@ -34,7 +34,7 @@ core::arch::global_asm!(
     ".long 0",
     ".quad carrick_x86_initial_boot",
     ".quad carrick_x86_peer_boot",
-    version = const carrick_el1_abi::X86_INITIAL_BOOT_VERSION,
+    version = const carrick_core_abi::X86_INITIAL_BOOT_VERSION,
 );
 
 #[cfg(target_os = "none")]

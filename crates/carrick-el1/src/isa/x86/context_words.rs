@@ -388,11 +388,11 @@ mod tests {
             (
                 &*region
                     .as_ptr()
-                    .add(carrick_el1_abi::X86_CPL0_RESERVATIONS_OFFSET as usize)
+                    .add(carrick_core_abi::X86_CPL0_RESERVATIONS_OFFSET as usize)
                     .cast::<X86Cpl0Reservations>(),
                 &*region
                     .as_ptr()
-                    .add(carrick_el1_abi::X86_CPL0_ZONE_OFFSET as usize)
+                    .add(carrick_core_abi::X86_CPL0_ZONE_OFFSET as usize)
                     .cast::<ZoneTables<ParkedContextWords>>(),
             )
         };

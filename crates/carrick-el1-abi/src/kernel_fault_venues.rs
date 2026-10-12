@@ -73,7 +73,7 @@ mod tests {
         let layout = KernelLayout {
             region: KernelVa::new(crate::X86_CPL0_REGION_BASE),
             zone: KernelVa::new(
-                crate::X86_CPL0_DYNAMIC_METADATA_BASE + crate::X86_CPL0_ZONE_OFFSET,
+                crate::X86_CPL0_DYNAMIC_METADATA_BASE + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
             ),
             portal: KernelVa::new(crate::X86_CPL0_REGION_BASE + crate::EL1_MM_PORTAL_OFFSET),
             dynamic_metadata: KernelVa::new(crate::X86_CPL0_DYNAMIC_METADATA_BASE),

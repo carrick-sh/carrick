@@ -20,3 +20,6 @@ pub use entry::Served;
 
 mod native_run_failure;
 pub use native_run_failure::*;
+
+mod initial_boot;
+pub use initial_boot::*;

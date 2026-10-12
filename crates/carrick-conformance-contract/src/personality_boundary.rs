@@ -1491,6 +1491,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn initial_boot_transport_has_one_neutral_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let source = fs::read_to_string(repo.join("crates/carrick-core-abi/src/initial_boot.rs"))
+            .expect("initial boot transport must be owned by core-abi");
+        let items = syn::parse_file(&source).unwrap();
+        for name in [
+            "X86InitialBootHeader",
+            "X86InitialBootRequest",
+            "X86InitialBootRegion",
+            "X86InitialBootString",
+            "X86InitialBootGrant",
+        ] {
+            assert_eq!(
+                items
+                    .items
+                    .iter()
+                    .filter(|item| matches!(item, syn::Item::Struct(item) if item.ident == name))
+                    .count(),
+                1,
+                "one neutral definition required for {name}"
+            );
+        }
+        assert!(
+            !repo
+                .join("crates/carrick-el1-abi/src/x86_initial_boot.rs")
+                .exists()
+        );
+        let old = fs::read_to_string(repo.join("crates/carrick-el1-abi/src/lib.rs")).unwrap();
+        assert!(!old.contains("mod x86_initial_boot"));
+        assert!(!old.contains("X86InitialBoot"), "no old-owner facade");
+    }
+
+    #[test]
     fn terminal_run_transport_has_one_neutral_owner() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let source =
