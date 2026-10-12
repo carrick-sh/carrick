@@ -214,8 +214,8 @@ Departures from the Willow procedure, and their reasons:
   host firewall port. Besides the guest firewall, which a job with root in
   the clone could undo, template 300 carries a PVE VM firewall on `net0`:
   default deny in and out, `ipfilter` on, SSH in from the gateway only,
-  and out to public IPv4 only (all private and link-local ranges dropped
-  first; no IPv6). Clones inherit it. The controller fails closed: it checks
+  and out to IPv4 except RFC 1918, link-local, 100.64/10 and the host's
+  own public address (dropped first; no IPv6). Clones inherit it. The controller fails closed: it checks
   the exact options and ordered rules on the template and on each clone
   before boot, and that the datacenter firewall is enabled.
 - **The host is shared with four agent-worker VMs.** They are outside the

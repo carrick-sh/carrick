@@ -37,9 +37,10 @@ subnet:
   `/etc/pve/firewall/300.fw`, written by `carrick-xtask ci-scaler vm-firewall`
   from the site table) denies by default in both directions, with `ipfilter`
   and `macfilter` on. Inbound, it admits only SSH from the gateway (the
-  controller). Outbound, it drops every RFC 1918 and link-local range (the
-  agent workers, other clones, the gateway itself) and then admits public
-  IPv4; IPv6 falls to the DROP policy. PVE copies the file to every linked
+  controller). Outbound, it drops every RFC 1918, link-local and RFC 6598
+  (100.64/10) range and the host's own public address 154.38.161.112 (so the
+  agent workers, other clones, the gateway and every host service), then
+  admits the remaining IPv4; IPv6 falls to the DROP policy. PVE copies the file to every linked
   clone. The controller checks the exact options and ordered rules over the
   API, on the template at startup and on each clone before it boots, and
   requires the datacenter firewall to be enabled. Any difference refuses
