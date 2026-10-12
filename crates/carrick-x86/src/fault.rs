@@ -427,18 +427,16 @@ pub fn program_fault_segments<C: X86Vcpu>(
     layout: BringupLayout,
     slot: u64,
 ) -> Result<(), TrapError> {
-    let segs = crate::long_mode_segment_state();
     vcpu.set_segment(
         X86Seg::Idtr,
-        fault_slot_gpa(fault_idt_base(layout), slot)?,
-        (X86_IDT_BYTES - 1) as u32,
-        0,
+        crate::SegmentDescriptor::table(
+            fault_slot_gpa(fault_idt_base(layout), slot)?,
+            (X86_IDT_BYTES - 1) as u16,
+        ),
     )?;
     vcpu.set_segment(
         X86Seg::Tr,
-        fault_slot_gpa(fault_tss_base(layout), slot)?,
-        X86_TSS64_LIMIT,
-        segs.tr_ar,
+        crate::SegmentDescriptor::tss64_busy(fault_slot_gpa(fault_tss_base(layout), slot)?),
     )
 }
 

@@ -26,66 +26,7 @@ use carrick_mem::pml4::{Pml4MapSpec, pml4_tables};
 
 use crate::vmm::{MsrInstall, WindowPlan, WindowRegion, X86Reg, X86Seg, X86Vcpu};
 
-// ─── Segment access-rights (VMX/long-mode packed encoding) ───────────────────
-//
-// The shared bring-up programs each segment as `(base, limit, ar)` where `ar`
-// is the standard packed access-rights word. The backend's `set_segment`
-// unpacks it into its native descriptor struct (KVM `kvm_segment`, bhyve
-// `seg_desc`, NVMM `NvmmX64StateSeg`). Bit layout (Intel SDM vol. 3 §24.4.1
-// "Guest Register State" / VMX segment access-rights):
-//   bits  3:0  = type
-//   bit   4    = S   (1 = code/data, 0 = system)
-//   bits  6:5  = DPL
-//   bit   7    = P   (present)
-//   bit  12    = AVL
-//   bit  13    = L   (64-bit code segment)
-//   bit  14    = D/B
-//   bit  15    = G   (granularity)
-//   bit  16    = unusable (1 = segment is not usable)
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SegArFields {
-    pub(crate) type_: u32,
-    pub(crate) s: u32,
-    pub(crate) dpl: u32,
-    pub(crate) present: u32,
-    pub(crate) l: u32,
-    pub(crate) db: u32,
-    pub(crate) g: u32,
-    pub(crate) unusable: u32,
-}
-
-/// Pack a long-mode segment access-rights word from its descriptor fields
-/// (Intel SDM vol. 3 §24.4.1).
-const fn seg_ar(fields: SegArFields) -> u32 {
-    let SegArFields {
-        type_,
-        s,
-        dpl,
-        present,
-        l,
-        db,
-        g,
-        unusable,
-    } = fields;
-    (type_ & 0xF)
-        | (s << 4)
-        | (dpl << 5)
-        | (present << 7)
-        | (l << 13)
-        | (db << 14)
-        | (g << 15)
-        | (unusable << 16)
-}
-
-/// Code segment type nibble: 0xB = execute/read/ACCESSED. The accessed bit MUST
-/// be set; KVM validates segment access-rights on entry and rejects an unset
-/// accessed bit with EINVAL on some kernels (same lesson as the bhyve M1 VT-x
-/// accessed-bit blocker). Source: Intel SDM vol. 3 §3.4.5.1.
-const CODE_SEG_TYPE: u32 = 11;
-/// Data segment type nibble: 0x3 = read/write/ACCESSED.
-const DATA_SEG_TYPE: u32 = 3;
-
+/// Packed rights derived from the shared typed descriptors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LongModeSegmentState {
     pub cs_ar: u32,
@@ -96,74 +37,15 @@ pub struct LongModeSegmentState {
     pub ldtr_ar: u32,
     pub gdt_limit: u32,
 }
-
 pub fn long_mode_segment_state() -> LongModeSegmentState {
+    use crate::{SegmentDescriptor as D, SegmentDpl as P};
     LongModeSegmentState {
-        // User CS64: GDT[4] sel 0x23, DPL3, L=1, exec/read/accessed.
-        cs_ar: seg_ar(SegArFields {
-            type_: CODE_SEG_TYPE,
-            s: 1,
-            dpl: 3,
-            present: 1,
-            l: 1,
-            db: 0,
-            g: 1,
-            unusable: 0,
-        }),
-        // User SS/DS/ES/FS/GS: GDT[3] sel 0x1B, DPL3, data/write/accessed, db=1.
-        data_ar: seg_ar(SegArFields {
-            type_: DATA_SEG_TYPE,
-            s: 1,
-            dpl: 3,
-            present: 1,
-            l: 0,
-            db: 1,
-            g: 1,
-            unusable: 0,
-        }),
-        // Kernel CS64/SS used while parked in the LSTAR stub before SYSRETQ.
-        kernel_cs_ar: seg_ar(SegArFields {
-            type_: CODE_SEG_TYPE,
-            s: 1,
-            dpl: 0,
-            present: 1,
-            l: 1,
-            db: 0,
-            g: 1,
-            unusable: 0,
-        }),
-        kernel_data_ar: seg_ar(SegArFields {
-            type_: DATA_SEG_TYPE,
-            s: 1,
-            dpl: 0,
-            present: 1,
-            l: 0,
-            db: 1,
-            g: 1,
-            unusable: 0,
-        }),
-        // TR: minimal valid 32-bit busy TSS (type 11, system, DPL0, present, g=1).
-        tr_ar: seg_ar(SegArFields {
-            type_: 11,
-            s: 0,
-            dpl: 0,
-            present: 1,
-            l: 0,
-            db: 0,
-            g: 1,
-            unusable: 0,
-        }),
-        // LDTR: unusable.
-        ldtr_ar: seg_ar(SegArFields {
-            type_: 0,
-            s: 0,
-            dpl: 0,
-            present: 0,
-            l: 0,
-            db: 0,
-            g: 0,
-            unusable: 1,
-        }),
+        cs_ar: D::code64(P::User).access_rights(),
+        data_ar: D::flat_data(P::User, 0).access_rights(),
+        kernel_cs_ar: D::code64(P::Kernel).access_rights(),
+        kernel_data_ar: D::flat_data(P::Kernel, 0).access_rights(),
+        tr_ar: D::tss64_busy(0).access_rights(),
+        ldtr_ar: D::unusable_ldt().access_rights(),
         gdt_limit: (X8664GuestArch::bootstrap_sysregs().gdt.len() as u32) * 8 - 1,
     }
 }
@@ -348,19 +230,39 @@ pub fn program_longmode_entry<C: X86Vcpu>(
     // ── Long-mode segments (must match CR0/EFER long-mode state) ──────────────
     //
     let segs = long_mode_segment_state();
-    vcpu.set_segment(X86Seg::Cs, 0, 0xFFFF_FFFF, segs.cs_ar)?;
-    vcpu.set_segment(X86Seg::Ss, 0, 0xFFFF_FFFF, segs.data_ar)?;
-    vcpu.set_segment(X86Seg::Ds, 0, 0xFFFF_FFFF, segs.data_ar)?;
-    vcpu.set_segment(X86Seg::Es, 0, 0xFFFF_FFFF, segs.data_ar)?;
+    vcpu.set_segment(
+        X86Seg::Cs,
+        crate::SegmentDescriptor::code64(crate::SegmentDpl::User),
+    )?;
+    vcpu.set_segment(
+        X86Seg::Ss,
+        crate::SegmentDescriptor::flat_data(crate::SegmentDpl::User, 0),
+    )?;
+    vcpu.set_segment(
+        X86Seg::Ds,
+        crate::SegmentDescriptor::flat_data(crate::SegmentDpl::User, 0),
+    )?;
+    vcpu.set_segment(
+        X86Seg::Es,
+        crate::SegmentDescriptor::flat_data(crate::SegmentDpl::User, 0),
+    )?;
     // FS/GS: base only is significant in 64-bit mode; arch_prctl sets the base.
-    vcpu.set_segment(X86Seg::Fs, 0, 0xFFFF_FFFF, segs.data_ar)?;
-    vcpu.set_segment(X86Seg::Gs, 0, 0xFFFF_FFFF, segs.data_ar)?;
-    vcpu.set_segment(X86Seg::Tr, 0, 0xFFFF_FFFF, segs.tr_ar)?;
-    vcpu.set_segment(X86Seg::Ldtr, 0, 0, segs.ldtr_ar)?;
+    vcpu.set_segment(
+        X86Seg::Fs,
+        crate::SegmentDescriptor::flat_data(crate::SegmentDpl::User, 0).with_selector(0),
+    )?;
+    vcpu.set_segment(
+        X86Seg::Gs,
+        crate::SegmentDescriptor::flat_data(crate::SegmentDpl::User, 0).with_selector(0),
+    )?;
+    vcpu.set_segment(X86Seg::Ldtr, crate::SegmentDescriptor::unusable_ldt())?;
 
     // GDT / fault IDT + TSS. Slot 0 is the initial vCPU; backends with sibling
     // vCPUs reprogram IDTR/TR to that vCPU's private slot on restore.
-    vcpu.set_segment(X86Seg::Gdtr, layout.gdt_base, segs.gdt_limit, 0)?;
+    vcpu.set_segment(
+        X86Seg::Gdtr,
+        crate::SegmentDescriptor::table(layout.gdt_base, segs.gdt_limit as u16),
+    )?;
     crate::fault::program_fault_segments(vcpu, layout, 0)?;
 
     // ── Entry GPRs ────────────────────────────────────────────────────────────
@@ -399,11 +301,22 @@ pub fn program_longmode_entry<C: X86Vcpu>(
 }
 
 pub fn program_user_segments<C: X86Vcpu>(vcpu: &mut C) -> Result<(), TrapError> {
-    let segs = long_mode_segment_state();
-    vcpu.set_segment(X86Seg::Cs, 0, 0xFFFF_FFFF, segs.cs_ar)?;
-    vcpu.set_segment(X86Seg::Ss, 0, 0xFFFF_FFFF, segs.data_ar)?;
-    vcpu.set_segment(X86Seg::Ds, 0, 0xFFFF_FFFF, segs.data_ar)?;
-    vcpu.set_segment(X86Seg::Es, 0, 0xFFFF_FFFF, segs.data_ar)
+    vcpu.set_segment(
+        X86Seg::Cs,
+        crate::SegmentDescriptor::code64(crate::SegmentDpl::User),
+    )?;
+    vcpu.set_segment(
+        X86Seg::Ss,
+        crate::SegmentDescriptor::flat_data(crate::SegmentDpl::User, 0),
+    )?;
+    vcpu.set_segment(
+        X86Seg::Ds,
+        crate::SegmentDescriptor::flat_data(crate::SegmentDpl::User, 0),
+    )?;
+    vcpu.set_segment(
+        X86Seg::Es,
+        crate::SegmentDescriptor::flat_data(crate::SegmentDpl::User, 0),
+    )
 }
 
 /// Write the bring-up byte images (LSTAR trampoline, GDT, PML4, fault tables)
@@ -554,14 +467,35 @@ pub fn restore<C: X86Vcpu>(
 
     // Long-mode segments (same encoding as program_longmode_entry).
     let segs = long_mode_segment_state();
-    c.set_segment(X86Seg::Cs, 0, 0xFFFF_FFFF, segs.cs_ar)?;
-    c.set_segment(X86Seg::Ss, 0, 0xFFFF_FFFF, segs.data_ar)?;
-    c.set_segment(X86Seg::Ds, 0, 0xFFFF_FFFF, segs.data_ar)?;
-    c.set_segment(X86Seg::Es, 0, 0xFFFF_FFFF, segs.data_ar)?;
-    c.set_segment(X86Seg::Fs, 0, 0xFFFF_FFFF, segs.data_ar)?;
-    c.set_segment(X86Seg::Gs, 0, 0xFFFF_FFFF, segs.data_ar)?;
-    c.set_segment(X86Seg::Ldtr, 0, 0, segs.ldtr_ar)?;
-    c.set_segment(X86Seg::Gdtr, layout.gdt_base, segs.gdt_limit, 0)?;
+    c.set_segment(
+        X86Seg::Cs,
+        crate::SegmentDescriptor::code64(crate::SegmentDpl::User),
+    )?;
+    c.set_segment(
+        X86Seg::Ss,
+        crate::SegmentDescriptor::flat_data(crate::SegmentDpl::User, 0),
+    )?;
+    c.set_segment(
+        X86Seg::Ds,
+        crate::SegmentDescriptor::flat_data(crate::SegmentDpl::User, 0),
+    )?;
+    c.set_segment(
+        X86Seg::Es,
+        crate::SegmentDescriptor::flat_data(crate::SegmentDpl::User, 0),
+    )?;
+    c.set_segment(
+        X86Seg::Fs,
+        crate::SegmentDescriptor::flat_data(crate::SegmentDpl::User, 0).with_selector(0),
+    )?;
+    c.set_segment(
+        X86Seg::Gs,
+        crate::SegmentDescriptor::flat_data(crate::SegmentDpl::User, 0).with_selector(0),
+    )?;
+    c.set_segment(X86Seg::Ldtr, crate::SegmentDescriptor::unusable_ldt())?;
+    c.set_segment(
+        X86Seg::Gdtr,
+        crate::SegmentDescriptor::table(layout.gdt_base, segs.gdt_limit as u16),
+    )?;
     crate::fault::program_fault_segments(c, layout, 0)?;
 
     // GPRs.
@@ -1025,23 +959,10 @@ mod tests {
 
     #[test]
     fn seg_ar_packs_user_cs() {
-        // type=0xB, S=1, DPL=3, P=1, L=1, G=1 → 0x0000_A0FB
-        let ar = seg_ar(SegArFields {
-            type_: CODE_SEG_TYPE,
-            s: 1,
-            dpl: 3,
-            present: 1,
-            l: 1,
-            db: 0,
-            g: 1,
-            unusable: 0,
-        });
-        assert_eq!(ar & 0xF, 0xB, "type");
-        assert_ne!(ar & (1 << 4), 0, "S");
-        assert_eq!((ar >> 5) & 0x3, 3, "DPL");
-        assert_ne!(ar & (1 << 7), 0, "P");
-        assert_ne!(ar & (1 << 13), 0, "L");
-        assert_ne!(ar & (1 << 15), 0, "G");
+        assert_eq!(
+            crate::SegmentDescriptor::code64(crate::SegmentDpl::User).access_rights(),
+            0xa0fb
+        );
     }
 
     #[test]
@@ -1166,24 +1087,9 @@ mod tests {
         fn set_segment(
             &mut self,
             seg: X86Seg,
-            base: u64,
-            limit: u32,
-            ar: u32,
+            descriptor: crate::SegmentDescriptor,
         ) -> Result<(), TrapError> {
-            let selector = match seg {
-                X86Seg::Cs => 0x23,
-                X86Seg::Ss | X86Seg::Ds | X86Seg::Es => 0x1b,
-                _ => 0,
-            };
-            self.segments.push((
-                seg,
-                crate::GuestSegment {
-                    base,
-                    limit,
-                    ar,
-                    selector,
-                },
-            ));
+            self.segments.push((seg, descriptor.into()));
             Ok(())
         }
         fn get_fs_base(&self) -> Result<u64, TrapError> {

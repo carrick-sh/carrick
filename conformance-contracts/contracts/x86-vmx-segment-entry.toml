@@ -1,0 +1,31 @@
+schema_version = 1
+id = "x86.vmx.segment-entry"
+title = "Long-mode hidden descriptors satisfy Intel VMX segment entry checks"
+guest_surfaces = ["vmm:kvm", "vmm:nvmm", "vmm:bhyve", "exec:x86-long-mode", "task:x86-restore"]
+semantic_authority = ["Intel SDM volume 3, order 325384, sections 26.3.1.1 through 26.3.1.4; clean-room architectural rules, without Linux, KVM or QEMU implementation source"]
+fixture = "carrick-x86::segments::tests; carrick-x86::bringup_fns::tests::vmx_programmed_entry_segments_are_valid; carrick-vmm-kvm::kvm_x86_engine::vmx_segment_tests"
+scale_points = [8]
+structural_budgets = []
+rationale = """
+Every entry and restore publishes representable hidden segment limits and
+consistent G bits. The busy 64-bit TR has limit 0x67, access rights 0x8B
+and G=0, including after CPL0 rebasing. Constructors derive G from the
+byte limit and refuse limits that cannot be encoded. The validator visits
+one fixed array of eight descriptors exactly once, with no I/O, waits or
+retries. Typed programming adds no runtime validation pass or allocation.
+Red-first shared user/kernel and actual entry witnesses, plus the grouped
+KVM restore builder, fail on the old TR with only Granularity violations.
+Green negative controls exercise independent descriptor and control defects.
+The validator is scoped to four-level IA-32e entry; capability-dependent
+CR fixed masks and injected-interrupt state remain backend responsibilities.
+"""
+
+[bindings]
+vm_free = "carrick-x86::segments::tests; carrick-x86::bringup_fns::tests::vmx_programmed_entry_segments_are_valid; carrick-vmm-kvm::kvm_x86_engine::vmx_segment_tests::vmx_restore_user_and_cpl0_segments_are_valid"
+
+[bindings.unresolved]
+embed_structural = "Live Intel and AMD KVM bindings are director-owned acceptance; this worker binds architectural state only, with no runtime work observation."
+kvm_intel = "Issue #253: director-owned GCP Intel KVM gate must prove the exact candidate no longer fails VM entry; VM-free evidence is not live acceptance."
+kvm_amd = "Merge-queue KVM receipt must show no new failures against main; local just test-kvm is prohibited by the lane policy."
+signed = "Linux worker cannot run signed HVF tests; no signed runtime acceptance is claimed."
+docker = "Architectural VM-entry contract uses Intel SDM authority; this host has no Docker and no workload ratio is claimed."

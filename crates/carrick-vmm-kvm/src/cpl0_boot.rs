@@ -2764,10 +2764,14 @@ impl Cpl0Carrier {
                 .fd()
                 .get_sregs()
                 .map_err(|error| fail(error.to_string()))?;
-            sregs.cs.selector = 8;
-            sregs.cs.dpl = 0;
-            sregs.ss.selector = 0x10;
-            sregs.ss.dpl = 0;
+            sregs.cs = crate::kvm_x86_engine::KvmSegment::from(
+                carrick_x86::SegmentDescriptor::code64(carrick_x86::SegmentDpl::Kernel),
+            )
+            .0;
+            sregs.ss = crate::kvm_x86_engine::KvmSegment::from(
+                carrick_x86::SegmentDescriptor::flat_data(carrick_x86::SegmentDpl::Kernel, 0),
+            )
+            .0;
             sregs.gs.base = METADATA_VA + BINDING_OFFSET;
             cpu.fd()
                 .set_sregs(&sregs)
@@ -3227,10 +3231,14 @@ impl Cpl0Carrier {
         let cpu = &mut self.cpus[1];
         let mut sregs = cpu.fd().get_sregs().map_err(|e| fail(e.to_string()))?;
         sregs.cr3 = initial.root.address().raw();
-        sregs.cs.selector = 8;
-        sregs.cs.dpl = 0;
-        sregs.ss.selector = 0x10;
-        sregs.ss.dpl = 0;
+        sregs.cs = crate::kvm_x86_engine::KvmSegment::from(carrick_x86::SegmentDescriptor::code64(
+            carrick_x86::SegmentDpl::Kernel,
+        ))
+        .0;
+        sregs.ss = crate::kvm_x86_engine::KvmSegment::from(
+            carrick_x86::SegmentDescriptor::flat_data(carrick_x86::SegmentDpl::Kernel, 0),
+        )
+        .0;
         sregs.gs.base = METADATA_VA + BINDING_OFFSET + STRIDE;
         cpu.fd()
             .set_sregs(&sregs)
@@ -3866,8 +3874,16 @@ impl Cpl0Carrier {
             system.gdt.base = DIRECT_VA + LAYOUT.gdt_base;
             system.idt.base = DIRECT_VA
                 + carrick_x86::fault_slot_gpa(carrick_x86::fault_idt_base(LAYOUT), index as u64)?;
-            system.tr.base = DIRECT_VA
-                + carrick_x86::fault_slot_gpa(carrick_x86::fault_tss_base(LAYOUT), index as u64)?;
+            system.tr = crate::kvm_x86_engine::KvmSegment::from(
+                carrick_x86::SegmentDescriptor::tss64_busy(
+                    DIRECT_VA
+                        + carrick_x86::fault_slot_gpa(
+                            carrick_x86::fault_tss_base(LAYOUT),
+                            index as u64,
+                        )?,
+                ),
+            )
+            .0;
             if hardware_interrupts {
                 system.apic_base = carrick_x86::interrupts::LAPIC_BASE
                     | 0x800

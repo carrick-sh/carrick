@@ -216,7 +216,7 @@ const ACCESS_UNUSABLE: u32 = 0x0001_0000; // Intel SDM vol. 3 §21.5.1
 pub const ACCESS_LDT_UNUSABLE: u32 = 0x0001_0082; // system + unusable
 /// TSS64 available: P=1 S=0 type=0x9 (64-bit TSS available).
 /// Required by VT-x — a valid TSS must be present (Intel SDM vol. 3 §21.2.5).
-pub const ACCESS_TSS64: u32 = 0x008B; // P|system|type=9 (TSS available)
+pub const ACCESS_TSS64: u32 = carrick_x86::SegmentDescriptor::tss64_busy(0).access_rights();
 /// Ring-3 data segment for DS/ES/FS/GS (= `ACCESS_RING3_SS`); latched by the
 /// iretq from the GDT on the ring-3 transition. Kept for the (blocked) ring-3
 /// entry work — see the M1 iretq blocker note.

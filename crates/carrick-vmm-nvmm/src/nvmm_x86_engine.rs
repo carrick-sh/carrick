@@ -1057,7 +1057,13 @@ impl NvmmX86Vcpu {
 /// g[11]. The low byte (type/s/dpl/p) is identical; the high flags move, so we
 /// repack avl/l/db(def)/g into NVMM's positions. (Getting this wrong leaves CS
 /// without its 64-bit `l` bit → the guest never runs long-mode ring-3 → spin.)
-fn seg_to_nvmm(selector: u16, base: u64, limit: u32, ar: u32) -> NvmmX64StateSeg {
+fn seg_to_nvmm(descriptor: carrick_x86::SegmentDescriptor) -> NvmmX64StateSeg {
+    let (selector, base, limit, ar) = (
+        descriptor.selector(),
+        descriptor.base(),
+        descriptor.limit(),
+        descriptor.access_rights(),
+    );
     let bit = |n: u32| (ar >> n) & 1;
     let attrib = (ar & 0xFF) as u16            // type/s/dpl/p (identical low byte)
         | (bit(12) << 8) as u16                // AVL: VMX 12 → NVMM 8
@@ -1210,19 +1216,10 @@ impl X86Vcpu for NvmmX86Vcpu {
     fn set_segment(
         &mut self,
         seg: X86Seg,
-        base: u64,
-        limit: u32,
-        ar: u32,
+        descriptor: carrick_x86::SegmentDescriptor,
     ) -> Result<(), TrapError> {
         let mut st = self.inner.get_state(NVMM_X64_STATE_SEGS).map_err(map_err)?;
-        // Selector is cosmetic in long mode (hidden base/limit/ar drive it);
-        // keep CS=0x23, SS/DS/ES=0x1B self-describing, others 0.
-        let sel = match seg {
-            X86Seg::Cs => 0x23,
-            X86Seg::Ss | X86Seg::Ds | X86Seg::Es => 0x1B,
-            _ => 0,
-        };
-        st.segs[seg_index(seg)] = seg_to_nvmm(sel, base, limit, ar);
+        st.segs[seg_index(seg)] = seg_to_nvmm(descriptor);
         self.inner
             .set_state(&st, NVMM_X64_STATE_SEGS)
             .map_err(map_err)
@@ -1520,13 +1517,15 @@ fn install_iretq_ring3_entry(
     // SS=GDT[2] kSS sel 0x10, at the stub, RSP = the frame. The VMX-packed
     // access-rights (the shared `seg_ar` layout): ring-0 CS64 type=0xB|S|P|L|G,
     // ring-0 SS type=3|S|P|D/B|G. The selector must be the ring-0 (RPL0)
-    // selector, so write the segs directly (the generic set_segment hardcodes the
-    // ring-3 selectors).
-    let cs0_ar = 0xB | (1 << 4) | (1 << 7) | (1 << 13) | (1 << 15);
-    let ss0_ar = 0x3 | (1 << 4) | (1 << 7) | (1 << 14) | (1 << 15);
+    // selector. Typed descriptors carry these selectors into the direct write.
     let mut st = vcpu.inner.get_state(NVMM_X64_STATE_SEGS).map_err(map_err)?;
-    st.segs[NVMM_X64_SEG_CS] = seg_to_nvmm(0x08, 0, 0xFFFF_FFFF, cs0_ar);
-    st.segs[NVMM_X64_SEG_SS] = seg_to_nvmm(0x10, 0, 0xFFFF_FFFF, ss0_ar);
+    st.segs[NVMM_X64_SEG_CS] = seg_to_nvmm(carrick_x86::SegmentDescriptor::code64(
+        carrick_x86::SegmentDpl::Kernel,
+    ));
+    st.segs[NVMM_X64_SEG_SS] = seg_to_nvmm(carrick_x86::SegmentDescriptor::flat_data(
+        carrick_x86::SegmentDpl::Kernel,
+        0,
+    ));
     vcpu.inner
         .set_state(&st, NVMM_X64_STATE_SEGS)
         .map_err(map_err)?;
