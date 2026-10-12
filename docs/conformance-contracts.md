@@ -951,7 +951,8 @@ A terminal receipt remains `Retiring` until exact member cancellation and
 MM retirement have completed. A parent entering wait in that interval
 parks through the existing wait continuation; it cannot reap and issue a
 new fork against the retiring child's charged tables. Completion publishes
-readiness before the existing parent notification/wakeup. This adds one
+readiness and selects the current receipt parent in one graph projection
+before notification/wakeup; an adopter owns the wake after reparenting. This adds one
 acquire read per examined terminal receipt and no polling, retries, wider
 stock, or wall-clock deadline. Admission itself drains reclaimable stock
 once through the existing stopped crossing.
@@ -969,6 +970,9 @@ VM-free bindings:
   (carrick-el1): pause at owner publication, assert wait remains running,
   complete retirement and assert the same status is available. Red before
   the readiness publication gate, without load.
+- `process_owner::tests::retirement_completion_notifies_the_adopter_of_a_pending_zombie`
+  (carrick-el1): reparent while retirement is pending, then complete it;
+  notification targets the adopter, not the exited original parent.
 - `carrier_cpu::tests::child_owner_grant_on_root_executor_is_a_physical_boundary`
   (carrick-vmm-kvm): a registered child crosses for physical service while
   the executor retains its root-task custody. Select the live registered

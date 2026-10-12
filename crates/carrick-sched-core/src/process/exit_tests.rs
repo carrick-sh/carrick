@@ -154,6 +154,9 @@ fn exit_topology_owner_refuses_recycled_adopter_before_selecting_children() {
         parent: Option<TaskKey>,
     }
     impl ExitZombie for Dead {
+        fn exit_parent(&self) -> Option<TaskKey> {
+            self.parent
+        }
         fn exit_key(&self) -> TaskKey {
             self.key
         }
@@ -434,6 +437,9 @@ fn exit_effect_work_visits_only_own_members_at_all_scales() {
     }
     struct Dead;
     impl ExitZombie for Dead {
+        fn exit_parent(&self) -> Option<TaskKey> {
+            None
+        }
         fn exit_key(&self) -> TaskKey {
             panic!("no zombie")
         }
@@ -603,6 +609,9 @@ fn prepared_exit_effects_reject_stale_membership_snapshot() {
     }
     struct Dead;
     impl ExitZombie for Dead {
+        fn exit_parent(&self) -> Option<TaskKey> {
+            None
+        }
         fn exit_key(&self) -> TaskKey {
             panic!("no zombie")
         }
