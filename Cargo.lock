@@ -458,6 +458,7 @@ dependencies = [
 name = "carrick-core"
 version = "0.1.0"
 dependencies = [
+ "bitflags 2.11.1",
  "carrick-conformance-contract",
  "carrick-core-abi",
  "carrick-el1",
