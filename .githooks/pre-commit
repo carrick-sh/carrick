@@ -5,7 +5,7 @@
 # gate runs at push time (see .githooks/pre-push) to keep commits fast.
 # Install with `just install-hooks` (sets core.hooksPath to .githooks).
 #
-# Bypass in an emergency with `git commit --no-verify`.
+# `git commit --no-verify` only with owner approval recorded on the PR (AGENTS.md).
 
 set -eu
 

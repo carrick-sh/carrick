@@ -12,7 +12,7 @@
 # so a freshly released stable can flag lints your local toolchain doesn't.
 # Keep local in sync with `rustup update stable`.
 #
-# Bypass in an emergency with `git push --no-verify`.
+# `git push --no-verify` only with owner approval recorded on the PR (AGENTS.md).
 
 set -eu
 
