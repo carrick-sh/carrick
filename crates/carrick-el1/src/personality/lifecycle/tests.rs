@@ -11,6 +11,7 @@ use carrick_el1_abi::{
 use core::sync::atomic::Ordering;
 
 const CLONE_VM: u64 = 0x0000_0100;
+const CLONE_FILES: u64 = 0x0000_0400;
 const CLONE_SYSVSEM: u64 = 0x0004_0000;
 const CLONE_SETTLS: u64 = 0x0008_0000;
 const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
@@ -1218,6 +1219,17 @@ fn process_native_hooks_require_every_execution_identity_component() {
             if index == 0 { Some(41) } else { None },
             "native process identity requires the exact execution binding"
         );
+        // CLONE_FILES without CLONE_VM must never enter the native process
+        // fork hook: that hook copies the descriptor table for plain fork.
+        native.frame.x[0] = CLONE_FILES | 0x11;
+        assert!(
+            carrick_personality_linux::lifecycle::invoke(
+                carrick_personality_linux::lifecycle::LifecycleCall::Clone,
+                &mut native,
+            )
+            .is_none()
+        );
+        native.frame.x[0] = 0;
         let results = [
             LifecycleNative::process_fork(&mut native),
             LifecycleNative::process_wait4(
