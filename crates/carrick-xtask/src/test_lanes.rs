@@ -109,6 +109,10 @@ pub enum TestLanesAction {
             help = "Feature flags appended for packages whose default features select platform-macos"
         )]
         platform_features: String,
+        #[arg(long, conflicts_with = "exclude_package")]
+        package: Option<String>,
+        #[arg(long)]
+        exclude_package: Option<String>,
     },
     #[command(about = "Fail unless every test target is covered by a gate recipe")]
     Check {
@@ -566,11 +570,22 @@ pub fn run(
         TestLanesAction::Args {
             lane,
             platform_features,
+            package,
+            exclude_package,
         } => {
             if !errors.is_empty() {
                 return Err(TestLanesError::Check(errors.join("\n")));
             }
-            for line in lane_args(&targets, &lane, &platform_features)? {
+            let selected: Vec<_> = targets
+                .into_iter()
+                .filter(|target| {
+                    package.as_ref().is_none_or(|p| p == &target.package)
+                        && exclude_package
+                            .as_ref()
+                            .is_none_or(|p| p != &target.package)
+                })
+                .collect();
+            for line in lane_args(&selected, &lane, &platform_features)? {
                 writeln!(writer, "{line}").map_err(io)?;
             }
         }

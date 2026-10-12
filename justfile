@@ -437,7 +437,7 @@ test *ARGS: _test-stdio
 
 # Unit groups are whole Cargo selections: newly added tests stay selected.
 test-shard-a *ARGS: _test-stdio
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-lanes -- {{ARGS}}
+    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-lanes -- --exclude-package=carrick-el1 {{ARGS}}
 
 # Workspace compilation no longer shares the critical-path job with host lanes.
 test-shard-e *ARGS: _test-stdio
@@ -448,6 +448,9 @@ test-shard-b *ARGS: _test-stdio
     just --justfile {{justfile()}} _test-unit-cli {{ARGS}}
     just --justfile {{justfile()}} _test-unit-host {{ARGS}}
     just --justfile {{justfile()}} _test-unit-vfs {{ARGS}}
+    # EL1 production-routing witnesses must not inherit kernel-example's
+    # carrick-el1/host-test feature. Keep their original package selection.
+    just --justfile {{justfile()}} _test-unit-lanes --package=carrick-el1 {{ARGS}}
 
 test-shard-c *ARGS: _test-stdio
     just --justfile {{justfile()}} _test-unit-kernel {{ARGS}}
@@ -511,7 +514,7 @@ _test-unit-workspace *ARGS:
     fi
 
 [private]
-_test-unit-lanes *ARGS:
+_test-unit-lanes FILTER="" *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
     if [ "{{os()}}" = "macos" ]; then
@@ -521,7 +524,7 @@ _test-unit-lanes *ARGS:
         # not declared in another lane under `[package.metadata.carrick.test-lanes]`
         # (carrick-xtask `test_lanes.rs`) runs here, and `lint-domains-source`
         # runs `test-lanes check`, which fails on any target no gate runs.
-        selections="$({{_admit}} {{_cargo}} run -q --locked -p carrick-xtask -- test-lanes args --lane host)"
+        selections="$({{_admit}} {{_cargo}} run -q --locked -p carrick-xtask -- test-lanes args --lane host {{FILTER}})"
         # Every selection runs; the recipe fails after the last one, naming each red.
         red=()
         while IFS= read -r selection; do
@@ -536,7 +539,7 @@ _test-unit-lanes *ARGS:
     else
         # Derived host-lane integration targets, as on macOS; packages whose
         # default features select platform-macos get this host's backend features.
-        selections="$({{_admit}} {{_cargo}} run -q --locked -p carrick-xtask -- test-lanes args --lane host --platform-features "{{_platform_features}}")"
+        selections="$({{_admit}} {{_cargo}} run -q --locked -p carrick-xtask -- test-lanes args --lane host {{FILTER}} --platform-features "{{_platform_features}}")"
         # Every selection runs; the recipe fails after the last one, naming each red.
         red=()
         while IFS= read -r selection; do
