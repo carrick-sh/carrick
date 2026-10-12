@@ -1525,6 +1525,32 @@ mod tests {
         let old = fs::read_to_string(repo.join("crates/carrick-el1-abi/src/lib.rs")).unwrap();
         assert!(!old.contains("X86PrepareTableSpan"), "no old-owner facade");
         assert!(!old.contains("pub const X86_CPL0_INITIAL_EXTENT_"));
+        fn root_glob(tree: &syn::UseTree) -> bool {
+            match tree {
+                syn::UseTree::Glob(_) => true,
+                syn::UseTree::Group(group) => group.items.iter().any(root_glob),
+                _ => false,
+            }
+        }
+        fn core_root_glob(tree: &syn::UseTree) -> bool {
+            match tree {
+                syn::UseTree::Path(root) if root.ident == "carrick_core_abi" => {
+                    root_glob(&root.tree)
+                }
+                syn::UseTree::Group(group) => group.items.iter().any(core_root_glob),
+                _ => false,
+            }
+        }
+        let items = syn::parse_file(&old).unwrap();
+        assert!(
+            items.items.iter().all(|item| {
+                let syn::Item::Use(item) = item else {
+                    return true;
+                };
+                !core_root_glob(&item.tree)
+            }),
+            "a wildcard export retains the moved stock and extent facade"
+        );
     }
 
     #[test]
