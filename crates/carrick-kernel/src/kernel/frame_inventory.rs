@@ -9,13 +9,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroU64;
 use std::time::Instant;
 
-use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::Gpa;
 use carrick_hal::{
     FrameEventCapacity, FrameId, FrameInventoryApplyReceipt, FrameInventoryBatch,
     FrameInventoryBatchError, FrameInventoryCommit, FrameInventoryEvent, FrameInventoryOrigin,
-    FrameInventoryProvenance, FrameInventoryReservation, FrameInventoryRetirementReceipt,
-    FrameLength, KernelTransactionId, MappingGeneration, MappingId, MemPerms,
+    FrameInventoryProvenance, FrameInventoryReceiptOwner, FrameInventoryReservation,
+    FrameInventoryRetirementReceipt, FrameLength, KernelTransactionId, MappingGeneration,
+    MappingId, MemPerms,
 };
 use parking_lot::Mutex;
 
@@ -33,10 +33,28 @@ impl From<MmId> for FrameOwner {
     }
 }
 impl FrameOwner {
-    fn wire_key(self) -> NonZeroU64 {
+    fn from_receipt_owner(owner: FrameInventoryReceiptOwner) -> Self {
+        match owner {
+            FrameInventoryReceiptOwner::HostMm(mm) => {
+                Self::HostMm(MmId::from_registry_allocation(mm))
+            }
+            FrameInventoryReceiptOwner::GuestMm {
+                native_mm,
+                root_generation,
+            } => Self::GuestMm(carrick_hal::GuestFrameOwner {
+                native_mm,
+                root_generation,
+            }),
+        }
+    }
+
+    fn receipt_owner(self) -> FrameInventoryReceiptOwner {
         match self {
-            Self::HostMm(mm) => mm.nonzero(),
-            Self::GuestMm(owner) => owner.native_mm.raw(),
+            Self::HostMm(mm) => FrameInventoryReceiptOwner::HostMm(mm.nonzero()),
+            Self::GuestMm(owner) => FrameInventoryReceiptOwner::GuestMm {
+                native_mm: owner.native_mm,
+                root_generation: owner.root_generation,
+            },
         }
     }
 }
@@ -195,7 +213,7 @@ impl carrick_hal::FrameCowAuthority for PhysicalInventoryBinding {
         &self,
         receipt: &FrameInventoryApplyReceipt,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if receipt.mm().get() != self.mm.wire_key().get()
+        if receipt.owner() != self.mm.receipt_owner()
             || receipt
                 .mapping_set()
                 .iter()
@@ -531,19 +549,13 @@ impl FrameInventoryAuthority {
         mappings.dedup();
         let mm_id = mm;
         let (outcome, revision, _) = self.apply_inner(mm_id, commit, None, grant)?;
-        let mm = NonZeroU64::new(mm.wire_key().get()).unwrap_or_else(|| {
-            carrick_fatal!(
-                "kernel::frame_inventory",
-                "zero mm ID encountered in apply_with_receipt"
-            );
-        });
         Ok((
             outcome,
             FrameInventoryApplyReceipt::from_kernel_authority(
                 self.origin.clone(),
                 provenance,
                 transaction,
-                mm,
+                mm.receipt_owner(),
                 revision,
                 mappings,
             ),
@@ -561,18 +573,8 @@ impl FrameInventoryAuthority {
         if !receipt.issued_by(&self.origin) {
             return Err(FrameInventoryError::RollbackReceiptOriginMismatch);
         }
+        let mm = FrameOwner::from_receipt_owner(receipt.owner());
         let mut state = self.state.lock();
-        let Some(&(first_mapping, _)) = receipt.mapping_set().first() else {
-            return Ok(());
-        };
-        let mm = state
-            .mappings
-            .get(&first_mapping)
-            .ok_or(FrameInventoryError::RollbackReceiptMismatch(first_mapping))?
-            .mm;
-        if mm.wire_key() != receipt.mm() {
-            return Err(FrameInventoryError::RollbackReceiptMmInvalid);
-        }
         let next_revision = state
             .revision
             .checked_add(1)
@@ -719,17 +721,11 @@ impl FrameInventoryAuthority {
         let mm_id = mm;
         let (outcome, revision, mm_empty_at_revision) =
             self.apply_inner(mm_id, commit, None, None)?;
-        let mm = NonZeroU64::new(mm.wire_key().get()).unwrap_or_else(|| {
-            carrick_fatal!(
-                "kernel::frame_inventory",
-                "zero mm ID encountered in apply_retirement_with_receipt"
-            );
-        });
         let receipt = FrameInventoryApplyReceipt::from_kernel_authority(
             self.origin.clone(),
             provenance,
             transaction,
-            mm,
+            mm.receipt_owner(),
             revision,
             mappings,
         );
@@ -3488,6 +3484,42 @@ mod tests {
 mod physical_projection_tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn empty_receipt_refuses_equal_number_foreign_owner_and_reincarnated_root() {
+        let inventory = Arc::new(FrameInventoryAuthority::new());
+        let ids = Arc::new(ObjectIdRegistry::new());
+        let source = inventory.physical_projection(Arc::clone(&ids));
+        let mm = NonZeroU64::new(41).unwrap();
+        let guest = |generation| carrick_hal::GuestFrameOwner {
+            native_mm: carrick_hal::MmGeneration::new(mm),
+            root_generation: carrick_guest_arch::ContextGeneration::new(generation),
+        };
+        let first = source.bind(guest(NonZeroU64::MIN));
+        let reincarnated = source.bind(guest(NonZeroU64::new(2).unwrap()));
+
+        let receipt = |owner| {
+            FrameInventoryApplyReceipt::from_kernel_authority(
+                inventory.origin.clone(),
+                FrameInventoryProvenance::from_kernel_entropy([1; 32]),
+                KernelTransactionId::from_kernel_allocation(NonZeroU64::MIN),
+                owner,
+                1,
+                Vec::new(),
+            )
+        };
+        let host_receipt = receipt(FrameInventoryReceiptOwner::HostMm(mm));
+        assert!(first.rollback_unpublished_apply(&host_receipt).is_err());
+
+        let guest_receipt = receipt(FrameOwner::GuestMm(guest(NonZeroU64::MIN)).receipt_owner());
+        assert!(
+            reincarnated
+                .rollback_unpublished_apply(&guest_receipt)
+                .is_err()
+        );
+        first.rollback_unpublished_apply(&guest_receipt).unwrap();
+        assert_eq!(inventory.snapshot().revision, 1);
+    }
 
     fn publish_fixture(
         source: &dyn carrick_hal::PhysicalFrameInventory,

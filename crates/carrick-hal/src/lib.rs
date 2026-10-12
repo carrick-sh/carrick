@@ -51,9 +51,9 @@ pub use kernel::{
     ForeignBackendRevision, ForeignFrameInventoryRevision, ForeignVmaRevision, FrameEventCapacity,
     FrameId, FrameInventoryApplyReceipt, FrameInventoryBatch, FrameInventoryBatchError,
     FrameInventoryCommit, FrameInventoryEvent, FrameInventoryOrigin, FrameInventoryProvenance,
-    FrameInventoryReceiptChallenge, FrameInventoryReservation, FrameInventoryReservationError,
-    FrameInventoryRetirementReceipt, FrameLength, KernelTransactionId,
-    MAX_FRAME_INVENTORY_EVENTS_PER_BATCH, MappingGeneration, MappingId,
+    FrameInventoryReceiptChallenge, FrameInventoryReceiptOwner, FrameInventoryReservation,
+    FrameInventoryReservationError, FrameInventoryRetirementReceipt, FrameLength,
+    KernelTransactionId, MAX_FRAME_INVENTORY_EVENTS_PER_BATCH, MappingGeneration, MappingId,
 };
 pub mod event;
 pub use event::{EventMultiplexer, Interest, PollEvent, Readiness, TriggerMode, VnodeEvents};
