@@ -26,16 +26,17 @@ fi
 # Unknown hosts fail inside xtask; every value is re-validated here.
 declare -A site=()
 while IFS='=' read -r name value; do
-  [[ $name =~ ^SITE_[A-Z_]+$ && $value =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad site line: $name" >&2; exit 1; }
+  [[ $name =~ ^SITE_[A-Z_]+$ && $value =~ ^[A-Za-z0-9._=/,-]+$ ]] || { echo "bad site line: $name" >&2; exit 1; }
   site[$name]=$value
 done < <("$xtask" ci-scaler site)
-for name in SITE_NODE SITE_API_HOST SITE_STORAGE SITE_DISK_FORMAT SITE_BRIDGE SITE_CORES SITE_MEMORY_MIB SITE_DISK_GIB; do
+for name in SITE_NODE SITE_API_HOST SITE_STORAGE SITE_DISK_FORMAT SITE_BRIDGE SITE_CORES SITE_MEMORY_MIB SITE_DISK_GIB SITE_TEMPLATE_IPCONFIG SITE_NAMESERVER; do
   [[ -n ${site[$name]:-} ]] || { echo "site lacks $name" >&2; exit 1; }
 done
 [[ ${site[SITE_NODE]} == $(hostname -s) ]] || { echo 'site node is not this host' >&2; exit 1; }
 node=${site[SITE_NODE]} api_host=${site[SITE_API_HOST]} storage=${site[SITE_STORAGE]}
 disk_format=${site[SITE_DISK_FORMAT]} bridge=${site[SITE_BRIDGE]}
 cores=${site[SITE_CORES]} memory_mib=${site[SITE_MEMORY_MIB]} disk_gib=${site[SITE_DISK_GIB]}
+ipconfig=${site[SITE_TEMPLATE_IPCONFIG]} nameserver=${site[SITE_NAMESERVER]}
 pve_call() {
   # The credential exists only in this on-host pipe, never argv or output.
   jq -r '"header = \"Authorization: PVEAPIToken=" + .["full-tokenid"] + "=" + .value + "\""' /root/carrick-ci-token.json |
@@ -73,6 +74,20 @@ cat > seed/meta-data <<'DATA'
 instance-id: carrick-template-300
 local-hostname: carrick-template-300
 DATA
+# A bridge without DHCP gets the template's static address in the seed
+# (NoCloud network-config v2); a DHCP site keeps the image default.
+if [[ $ipconfig != ip=dhcp ]]; then
+  [[ $ipconfig =~ ^ip=([0-9.]+/24),gw=([0-9.]+)$ && $nameserver =~ ^[0-9.]+$ ]] || { echo 'bad static site network' >&2; exit 1; }
+  cat > seed/network-config <<NET
+version: 2
+ethernets:
+  primary:
+    match: {name: "e*"}
+    addresses: [${BASH_REMATCH[1]}]
+    routes: [{to: default, via: ${BASH_REMATCH[2]}}]
+    nameservers: {addresses: [$nameserver]}
+NET
+fi
 cat > seed/user-data <<'DATA'
 #cloud-config
 users:
@@ -206,7 +221,8 @@ for ((attempt=0; attempt<60; attempt++)); do
   sleep 2
 done
 [[ $(qm status 300) == 'status: stopped' ]] || { echo 'Template did not stop' >&2; exit 1; }
-qm set 300 --ide2 "$storage:cloudinit" --ciuser runner --ipconfig0 ip=dhcp
+qm set 300 --ide2 "$storage:cloudinit" --ciuser runner --ipconfig0 "$ipconfig"
+if [[ $nameserver != none ]]; then qm set 300 --nameserver "$nameserver"; fi
 qm template 300
 jq -n --arg commit "$commit" --arg script_hash "$(sha256sum "$inputs/scripts/ci/build-template-debian.sh" | cut -d' ' -f1)" \
   --arg image_url "$image_url" --arg image_sha512 "$image_sha512" --arg runner_version "$runner_version" --arg runner_sha256 "$runner_sha256" \
