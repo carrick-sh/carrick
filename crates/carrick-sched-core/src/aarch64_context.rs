@@ -1,7 +1,8 @@
 //! Shared AArch64 parked-context ABI. Machine conversion belongs to the ISA leaf.
 
 use crate::ThreadCtx;
-use carrick_guest_arch::{AddressContext, RootGpa};
+use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
+use core::num::NonZeroU64;
 
 /// Mask extracting the physical base address from an ARM TTBR0_EL1 register value
 /// (bits \[47:12\], page-aligned). Upper bits \[63:48\] store the ASID.
@@ -37,6 +38,15 @@ const _: () = {
 };
 
 impl Aarch64ParkedContext {
+    /// The exact root incarnation saved with this parked execution context.
+    pub fn address_context(&self) -> Option<AddressContext<RootGpa>> {
+        Some(AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(self.root & AARCH64_ROOT_ADDRESS_MASK))?,
+            mm: MmGeneration::new(NonZeroU64::new(self.mm)?),
+            generation: ContextGeneration::new(NonZeroU64::new(self.generation)?),
+        })
+    }
+
     pub const ZERO: Self = Self {
         native: ThreadCtx::ZERO,
         root: 0,

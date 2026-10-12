@@ -340,6 +340,38 @@ pub struct HardwareCowResolver {
     pub publication: Option<&'static carrick_core_abi::PortalExecutableSlot>,
 }
 
+/// Read the COW caller's exact root incarnation from its retained record.
+/// A reused root GPA does not authorize an older or newer incarnation.
+///
+/// # Safety
+/// The caller owns this stopped slot and its record for the entire snapshot.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub unsafe fn cow_address_for_record(
+    zone: &carrick_sched_core::ZoneTables<carrick_sched_core::Aarch64ParkedContext>,
+    task: &CurrentTask,
+    slot: carrick_sched_core::SlotId,
+    target: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
+) -> Option<(
+    carrick_el1_abi::ExecutionBinding,
+    carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
+)> {
+    let binding = carrick_core::entry::binding(&task.execution, &task.mm);
+    let lane = zone.slot(slot);
+    let record = zone.record(lane.current().or_else(|| lane.host_record())?);
+    let identity = record.identity();
+    // SAFETY: the caller retains exclusive custody of this stopped record.
+    let source = unsafe { record.ctx_mut() }.address_context()?;
+    (binding.issued()
+        && identity.tid == binding.task.raw()
+        && identity.generation == binding.generation.raw()
+        && identity.serial == binding.thread_generation.raw()
+        && identity.mm == binding.mm.raw()
+        && lane.mm() == binding.mm.raw()
+        && source.mm.raw().get() == binding.mm.raw()
+        && source == target)
+        .then_some((binding, source))
+}
+
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl CowResolver for HardwareCowResolver {
     fn reconcile_parent_write<
@@ -640,7 +672,7 @@ impl DescriptorTxnApplier for HardwareDescriptorTxnApplier {
 pub fn serve_descriptor_txns<X: DescriptorTxnApplier>(
     frame: &TrapFrame,
     current_tasks: &[CurrentTask],
-    spaces: SpaceAccess<'_>,
+    spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     path: &mut DescriptorTxnPath<'_, X>,
 ) -> Option<Action> {
     let mm_key = current_tasks
@@ -674,7 +706,7 @@ pub fn dispatch_fault_with_descriptor_txns<P, C, X>(
     frame: &mut TrapFrame,
     counters: &Counters,
     current_tasks: &[CurrentTask],
-    spaces: SpaceAccess<'_>,
+    spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     mut txns: Option<DescriptorTxnPath<'_, X>>,
     mailboxes: GrantMailboxes<'_>,
     prepared: Option<PreparedFaultPath<'_, P>>,
@@ -831,7 +863,7 @@ pub(crate) fn with_hardware_cow_venue<R>(
 pub fn copy_granted_cow_page<W, C>(
     words: &W,
     grant: carrick_mmu_core::aarch64::descriptor_txn::CowCopyGrant,
-    spaces: SpaceAccess<'_>,
+    spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     owner: NonZeroU64,
     window: &mut C,
 ) -> Result<
@@ -892,7 +924,7 @@ pub enum DrainOutcome {
 /// settled or resumed EL0 on the report would run against stale
 /// translations.
 pub fn drain_mm_descriptor_txns<X: DescriptorTxnApplier>(
-    spaces: SpaceAccess<'_>,
+    spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     slots: &carrick_el1_abi::DescriptorTxnSlots,
     mm_key: u64,
     ttbr0: u64,
@@ -916,7 +948,7 @@ pub fn drain_mm_descriptor_txns<X: DescriptorTxnApplier>(
 /// One attempt of [`drain_mm_descriptor_txns`]. `None`: another EL1 editor
 /// holds the MM while some of its submissions are still in flight; retry.
 fn try_drain_mm_descriptor_txns<X: DescriptorTxnApplier>(
-    spaces: SpaceAccess<'_>,
+    spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     slots: &carrick_el1_abi::DescriptorTxnSlots,
     mm_key: u64,
     ttbr0: u64,
@@ -968,7 +1000,7 @@ pub fn drain_before_el0<X: DescriptorTxnApplier>(
     frame: &TrapFrame,
     action: Action,
     current_tasks: &[CurrentTask],
-    spaces: SpaceAccess<'_>,
+    spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     slots: &carrick_el1_abi::DescriptorTxnSlots,
     applier: &mut X,
 ) -> Action {
@@ -1007,7 +1039,7 @@ pub fn drain_before_el0<X: DescriptorTxnApplier>(
 /// Answers in `frame.x[0]`: applied count, plus the blocked bit.
 pub fn serve_host_drain<X: DescriptorTxnApplier>(
     frame: &mut TrapFrame,
-    spaces: SpaceAccess<'_>,
+    spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     slots: &carrick_el1_abi::DescriptorTxnSlots,
     applier: &mut X,
 ) {
@@ -1192,7 +1224,7 @@ pub fn dispatch_fault_with_regions<C: CowResolver>(
     frame: &mut TrapFrame,
     counters: &Counters,
     current_tasks: &[CurrentTask],
-    spaces: SpaceAccess<'_>,
+    spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     mailboxes: GrantMailboxes<'_>,
     cow_resolver: &mut C,
 ) -> Action {
@@ -1260,7 +1292,7 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
     frame: &mut TrapFrame,
     counters: &Counters,
     current_tasks: &[CurrentTask],
-    spaces: SpaceAccess<'_>,
+    spaces: SpaceAccess<'_, impl Copy + Send + Sync + zerocopy::FromZeros>,
     mailboxes: GrantMailboxes<'_>,
     prepared: Option<PreparedFaultPath<'_, P>>,
     cow_resolver: &mut C,
@@ -1607,6 +1639,78 @@ mod tests {
         EL1_FRAME_GRANT_TARGET_SIZE, FRAME_GRANT_ERR_DENIED, FrameGrantMailbox, FrameGrantReady,
     };
     use carrick_sched_core::AddressSpaces;
+
+    #[test]
+    fn cow_caller_receives_exact_parked_root_incarnation() {
+        use carrick_el1_abi::{El1TaskId, ThreadControlSlot, ThreadLifecyclePage};
+        use carrick_guest_arch::{
+            AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa,
+        };
+        use carrick_sched_core::{
+            Aarch64ParkedContext, SlotId, ThreadCtx, ThreadIdentity, ZoneTables,
+        };
+
+        let layout = std::alloc::Layout::new::<ZoneTables<Aarch64ParkedContext>>();
+        // SAFETY: the allocation is aligned and owns the complete zero-valid zone.
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<Aarch64ParkedContext>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = ThreadLifecyclePage::new();
+        let control = ThreadControlSlot::new();
+        let task = CurrentTask::new();
+        task.set(El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        let slot = SlotId::new(0);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        let record = zone
+            .current_or_new(
+                slot,
+                ThreadIdentity {
+                    tid: 41,
+                    serial: 101,
+                    mm: 1,
+                    file_table: 5,
+                    generation: 11,
+                    affinity: 1,
+                    lifecycle_page: &page as *const _ as u64,
+                    control_slot: &control as *const _ as u64,
+                },
+            )
+            .unwrap();
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::new(7).unwrap()),
+        };
+        // SAFETY: this test owns the unpublished record and no other reader exists.
+        unsafe {
+            *zone.record(record).ctx_mut() =
+                Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, address);
+        }
+        let got = unsafe { cow_address_for_record(&zone, &task, slot, address) };
+        assert_eq!(got.map(|(_, address)| address), Some(address));
+        let stale = AddressContext {
+            generation: ContextGeneration::new(NonZeroU64::new(8).unwrap()),
+            ..address
+        };
+        assert!(unsafe { cow_address_for_record(&zone, &task, slot, stale) }.is_none());
+        // Reincarnate the same root GPA and MM in the retained slot. The old
+        // address must now be refused, even though its numeric root matches.
+        unsafe {
+            *zone.record(record).ctx_mut() =
+                Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, stale);
+        }
+        assert!(unsafe { cow_address_for_record(&zone, &task, slot, address) }.is_none());
+        assert_eq!(
+            unsafe { cow_address_for_record(&zone, &task, slot, stale) }
+                .map(|(_, address)| address),
+            Some(stale)
+        );
+    }
 
     #[test]
     fn instruction_translation_fault_can_request_owner_file_grant() {

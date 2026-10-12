@@ -1,5 +1,7 @@
 //! Region-authenticated release custody for delegated inode locks.
 use crate::{DelegatedFile, EL1_OBJECT_TABLE_OFFSET, EL1_ZONE_OFFSET, LOCK_HOST};
+use carrick_core_abi::EntryContext;
+use carrick_sched_core::ThreadCtx;
 use carrick_sched_core::object_wait::{
     DelegatedFileWaitIndex, DelegatedLockRelease, DelegatedReleaseVenue, ObjectWaitError,
     ObjectWaitKey, OwnedObjectWakeEffects,
@@ -9,16 +11,16 @@ use core::sync::atomic::Ordering;
 
 /// One inode in the exact carrier region that owns its notification queue.
 #[derive(Clone, Copy)]
-pub struct DelegatedFileAuthority<'a> {
+pub struct DelegatedFileAuthority<'a, C: EntryContext = ThreadCtx> {
     file: &'a DelegatedFile,
     index: DelegatedFileWaitIndex,
-    venue: DelegatedReleaseVenue<'a>,
+    venue: DelegatedReleaseVenue<'a, C>,
 }
-impl<'a> DelegatedFileAuthority<'a> {
+impl<'a, C: EntryContext> DelegatedFileAuthority<'a, C> {
     pub fn new(
         file: &'a DelegatedFile,
         index: DelegatedFileWaitIndex,
-        venue: DelegatedReleaseVenue<'a>,
+        venue: DelegatedReleaseVenue<'a, C>,
     ) -> Result<Self, ObjectWaitError> {
         let file_region = (file as *const _ as usize)
             .checked_sub(index.index() * core::mem::size_of::<DelegatedFile>())
@@ -32,7 +34,7 @@ impl<'a> DelegatedFileAuthority<'a> {
 
     /// One strong attempt. The caller suspends on contention without retaining
     /// a borrowed guard or an execution slot.
-    pub fn try_host(self) -> Result<Option<DelegatedFileGuard<'a>>, ObjectWaitError> {
+    pub fn try_host(self) -> Result<Option<DelegatedFileGuard<'a, C>>, ObjectWaitError> {
         if self
             .file
             .lock
@@ -55,7 +57,7 @@ impl<'a> DelegatedFileAuthority<'a> {
     pub unsafe fn subscribe_host_recall(
         self,
         generation: NonZeroU64,
-    ) -> Result<HostRecallSubscription<'a>, ObjectWaitError> {
+    ) -> Result<HostRecallSubscription<'a, C>, ObjectWaitError> {
         let exact = || {
             self.file.notification_generation.load(Ordering::Acquire) == generation.get()
                 && self.file.generation.load(Ordering::Acquire) == generation.get()
@@ -90,7 +92,7 @@ impl<'a> DelegatedFileAuthority<'a> {
     /// # Safety
     /// The caller exclusively owns this inode's lock and must never unlock it
     /// or access its protected state after the returned guard is released.
-    pub unsafe fn from_locked(self) -> Result<DelegatedFileGuard<'a>, ObjectWaitError> {
+    pub unsafe fn from_locked(self) -> Result<DelegatedFileGuard<'a, C>, ObjectWaitError> {
         let mut guard = DelegatedFileGuard {
             authority: self,
             release: None,
@@ -112,11 +114,11 @@ impl<'a> DelegatedFileAuthority<'a> {
 /// Holds actual inode exclusion. A live source advances before unlock and
 /// delivers only afterward; unpublished inodes have no enrolled consumers.
 #[must_use = "retain inode exclusion until its protected operation finishes"]
-pub struct DelegatedFileGuard<'a> {
-    authority: DelegatedFileAuthority<'a>,
-    release: Option<DelegatedLockRelease<'a, 'a>>,
+pub struct DelegatedFileGuard<'a, C: EntryContext = ThreadCtx> {
+    authority: DelegatedFileAuthority<'a, C>,
+    release: Option<DelegatedLockRelease<'a, 'a, C>>,
 }
-impl DelegatedFileGuard<'_> {
+impl<C: EntryContext> DelegatedFileGuard<'_, C> {
     pub fn file(&self) -> &DelegatedFile {
         self.authority.file
     }
@@ -130,7 +132,7 @@ impl DelegatedFileGuard<'_> {
         }
         let authority = self.authority;
         let key = ObjectWaitKey::delegated_file(authority.index, generation);
-        let completion = |effects: OwnedObjectWakeEffects<'_>| {
+        let completion = |effects: OwnedObjectWakeEffects<'_, C>| {
             (authority.venue.deliver)(authority.venue.zone, authority.venue.waker, effects)
         };
         authority.venue.zone.bind_object_wait_with_completion(
@@ -201,7 +203,7 @@ impl DelegatedFileGuard<'_> {
         }
     }
 }
-impl Drop for DelegatedFileGuard<'_> {
+impl<C: EntryContext> Drop for DelegatedFileGuard<'_, C> {
     fn drop(&mut self) {
         if let Some(release) = self.release.take() {
             let authority = self.authority;
@@ -232,16 +234,16 @@ impl Drop for DelegatedFileGuard<'_> {
 }
 
 /// Owner-held subscription; it is not tied to a requesting Task or fd number.
-pub struct HostRecallSubscription<'a> {
-    authority: DelegatedFileAuthority<'a>,
+pub struct HostRecallSubscription<'a, C: EntryContext = ThreadCtx> {
+    authority: DelegatedFileAuthority<'a, C>,
     generation: NonZeroU64,
 }
-impl HostRecallSubscription<'_> {
+impl<C: EntryContext> HostRecallSubscription<'_, C> {
     pub fn generation(&self) -> NonZeroU64 {
         self.generation
     }
 }
-impl Drop for HostRecallSubscription<'_> {
+impl<C: EntryContext> Drop for HostRecallSubscription<'_, C> {
     fn drop(&mut self) {
         let _ = self.authority.file.host_recall_generation.compare_exchange(
             self.generation.get(),

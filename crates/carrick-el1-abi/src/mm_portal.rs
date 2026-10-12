@@ -150,11 +150,11 @@ impl MmPortalSlots {
     }
     /// Authenticate the service receipt using the bound carrier and both
     /// actual retained-region views; no container dereference or global lookup.
-    pub fn authenticate_wait<'a>(
+    pub fn authenticate_wait<'a, C: crate::EntryContext>(
         &'a self,
-        zone: &'a carrick_sched_core::ZoneTables,
+        zone: &'a carrick_sched_core::ZoneTables<C>,
         receipt: PortalOwnerWait,
-    ) -> Result<PortalWaitEnrollment<'a>, carrick_sched_core::object_wait::ObjectWaitError> {
+    ) -> Result<PortalWaitEnrollment<'a, C>, carrick_sched_core::object_wait::ObjectWaitError> {
         use carrick_sched_core::object_wait::ObjectWaitError;
         use carrick_sched_core::spaces::notification::SpaceWaitCause;
         let portal_region =
