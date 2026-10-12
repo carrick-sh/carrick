@@ -2388,15 +2388,22 @@ mod kernel {
                 }).map_or(core::ptr::null_mut(), |address| address as *mut u8)
             };
             let mut root_exit = None;
+            let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
+            if binding.stdio_table_admitted.load(Ordering::Acquire) != file_table {
+                carrick_el1::personality::file_table::admit_stdio(
+                    fd_map(), &OPEN_TABLE, &OBJECT_TABLE, file_table, [true; 3],
+                );
+                binding.stdio_table_admitted.store(file_table, Ordering::Release);
+            }
             let route = if fixture_dispatch_enabled!() {
                 let mut native = NativeDispatch {
                     frame, fpstate: _early_xstate, call, publications: &binding.publications,
                     slot: carrick_guest_arch::SlotId::from_index(binding.cpu_slot as usize),
-                    file_table: task.linux.file_table.load(Ordering::Acquire).max(1),
+                    file_table,
                 };
                 match carrick_x86_cpl0::production_boundary(dispatch::dispatch_syscall_with_lifecycle(
                     &mut native, counters, core::slice::from_ref(task),
-                    &[], &[], &[], &[], &EMPTY_NAME_CACHE,
+                    fd_map(), &OBJECT_TABLE, &OPEN_TABLE, &[], &EMPTY_NAME_CACHE,
                     None::<dispatch::Zone<'_, sched::HardwareCpu, sched::HardwareUserWord>>,
                     None, Some(&GuestLifecycleVenue), None, cache_lookup,
                 )) {
@@ -2413,13 +2420,6 @@ mod kernel {
                 let words = native_execution::capture(frame, _early_xstate);
                 native_process::admit_root(words, source, task)
                     .unwrap_or_else(|_| initial_boot::fatal_boot());
-                let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
-                if binding.stdio_table_admitted.load(Ordering::Acquire) != file_table {
-                    carrick_el1::personality::file_table::admit_stdio(
-                        fd_map(), &OPEN_TABLE, &OBJECT_TABLE, file_table, [true; 3],
-                    );
-                    binding.stdio_table_admitted.store(file_table, Ordering::Release);
-                }
                 let mut service = native_process::Service::new(task, slot);
                 let route = {
                     let (runtime, address) = native_process::runtime(source, task)
