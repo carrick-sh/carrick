@@ -182,7 +182,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
 apt-get install -y -q --no-install-recommends \
     build-essential clang git curl ca-certificates jq just util-linux procps \
-    pkg-config libssl-dev nftables python3 python3-venv lsof rsync openssh-client
+    pkg-config libssl-dev nftables python3 python3-venv lsof sudo rsync openssh-client
 
 # Test code runs as $USER_NAME. It reaches crates.io/GitHub (and the metadata
 # DNS resolver) but not the metadata HTTP endpoint, so it cannot mint the VM
@@ -190,6 +190,13 @@ apt-get install -y -q --no-install-recommends \
 # script uploads.
 getent group kvm >/dev/null || groupadd --system kvm
 id "$USER_NAME" >/dev/null 2>&1 || useradd -m -s /bin/bash -G kvm "$USER_NAME"
+# Maintenance tests require a privileged, read-only process census. An
+# unprivileged lsof can hide other users' descriptors; the pruner deliberately
+# fails closed when sudo -n is denied. Do not grant general root access: the
+# metadata guard below must still prevent test code from minting VM tokens.
+printf '%s ALL=(root) NOPASSWD: /usr/bin/lsof ^-F (pfn|pf|p) (\\+D )?/[-a-zA-Z0-9_./]+$\n' "$USER_NAME" > /etc/sudoers.d/carrick-lsof
+chmod 0440 /etc/sudoers.d/carrick-lsof
+visudo -cf /etc/sudoers.d/carrick-lsof
 nft -f - <<'NFT'
 table inet carrick_kvm_guard {
   chain output {
