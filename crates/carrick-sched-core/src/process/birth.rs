@@ -257,6 +257,9 @@ mod tests {
         }
     }
     impl crate::process::exit::ExitZombie for TaskKey {
+        fn exit_parent(&self) -> Option<TaskKey> {
+            None
+        }
         fn exit_key(&self) -> TaskKey {
             *self
         }

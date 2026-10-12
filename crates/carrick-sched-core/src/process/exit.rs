@@ -127,6 +127,7 @@ pub trait ExitLive<C>: WaitIdentitySource {
 }
 pub trait ExitZombie {
     fn exit_key(&self) -> TaskKey;
+    fn exit_parent(&self) -> Option<TaskKey>;
 }
 
 #[derive(Debug)]
@@ -715,11 +716,13 @@ pub type PreparedExitEffectAdmission<C, L, Transaction> = Result<
     ExitError<<L as ExitLive<C>>::Error>,
 >;
 pub struct ReadyExitEffects<Member> {
+    task: TaskKey,
     members: Vec<Member>,
     parent: Option<TaskKey>,
     signal: ChildExitSignal,
 }
 pub struct ExitParentPermit {
+    task: TaskKey,
     parent: Option<TaskKey>,
     signal: ChildExitSignal,
 }
@@ -738,6 +741,7 @@ impl<Member, Resources, Transaction: Eq> PendingExitEffects<Member, Resources, T
             return Err(ExitTopologyChanged(self.task));
         }
         Ok(ReadyExitEffects {
+            task: self.task,
             members: self.members,
             parent: self.parent,
             signal: self.signal,
@@ -751,6 +755,7 @@ impl<Member> ReadyExitEffects<Member> {
             cancel(member);
         }
         ExitParentPermit {
+            task: self.task,
             parent: self.parent,
             signal: self.signal,
         }
@@ -969,7 +974,7 @@ impl<Target: ExitSignalSource> ExitParentTarget<Target> {
 impl<
     C: Copy + Ord,
     L: WaitIdentitySource + ExitNotificationSource,
-    Z,
+    Z: ExitZombie,
     R,
     Reservation,
     Retired,
@@ -978,11 +983,21 @@ impl<
     Failure: RegistryFailure,
 > ProcessRegistry<C, L, Z, R, Reservation, Retired, Group, Session, Failure>
 {
+    /// A delayed retirement follows the owned receipt across reparenting.
+    /// Once a receipt was consumed, the retained original target remains
+    /// valid only if that exact parent generation is still live.
+    pub fn exit_notification_parent(&self, permit: &ExitParentPermit) -> Option<TaskKey> {
+        self.zombies
+            .get(&permit.task.id)
+            .filter(|record| record.exit_key() == permit.task)
+            .map_or(permit.parent, ExitZombie::exit_parent)
+    }
+
     pub fn select_exit_parent(
         &self,
         permit: &ExitParentPermit,
     ) -> Option<ExitParentTarget<L::Target>> {
-        let parent = permit.parent?;
+        let parent = self.exit_notification_parent(permit)?;
         let record = self
             .tasks
             .get(&parent.id)
