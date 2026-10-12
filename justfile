@@ -23,6 +23,10 @@ export CARRICK_SCCACHE_SEARCH_PATH := replace_regex(_build_env, _build_env_field
 _cargo := "cargo --config " + quote(CARRICK_CARGO_CACHE_CONFIG)
 _admit := _cargo + " run --locked -p carrick-xtask -- worktree-run --"
 
+# Only the command-capture coverage gate may select another host's test recipes.
+# Test execution always uses the actual host; captured Cargo test calls never run.
+_test_host := if env("CARRICK_TEST_CAPTURE", "") != "" { env("CARRICK_TEST_CAPTURE_HOST", os()) } else { os() }
+
 # Per-host backend feature flags for `cargo build`/`cargo test` of carrick-cli.
 # macOS uses the default features (+ codesign via build-signed.sh), so it is empty.
 _platform_features := if os() == "macos" { "" \
@@ -390,7 +394,7 @@ test *ARGS: _test-stdio
     set -euo pipefail
     just --justfile {{justfile()}} _test-unit-mm-owner {{ARGS}}
     just --justfile {{justfile()}} _test-unit-workspace {{ARGS}}
-    if [ "{{os()}}" = "macos" ]; then
+    if [ "{{_test_host}}" = "macos" ]; then
         # Integration targets (`tests/*.rs`) are invisible to `--lib --bins`;
         # a test moved out of `src/` used to leave every gate silently. The
         # host-lane selection is DERIVED from Cargo metadata: every test target
@@ -479,7 +483,7 @@ _test-unit-mm-owner *ARGS:
 _test-unit-workspace *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ "{{os()}}" = "macos" ]; then
+    if [ "{{_test_host}}" = "macos" ]; then
         # Runtime tests exercise process-wide signal dispositions, custom-x18
         # transitions, and fork from the test harness. Running those cases on
         # parallel harness threads lets one oracle's temporary process state
@@ -517,7 +521,7 @@ _test-unit-workspace *ARGS:
 _test-unit-lanes FILTER="" *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ "{{os()}}" = "macos" ]; then
+    if [ "{{_test_host}}" = "macos" ]; then
         # Integration targets (`tests/*.rs`) are invisible to `--lib --bins`;
         # a test moved out of `src/` used to leave every gate silently. The
         # host-lane selection is DERIVED from Cargo metadata: every test target
@@ -557,7 +561,7 @@ _test-unit-lanes FILTER="" *ARGS:
 _test-unit-cli *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ "{{os()}}" = "macos" ]; then
+    if [ "{{_test_host}}" = "macos" ]; then
         # The authenticated jit-shape builders/parsers have measured >1 MiB
         # debug frames. Several tests need two in one body; libtest's ~2 MiB
         # default has repeatedly been tipped over by unrelated additions. Keep
@@ -575,7 +579,7 @@ _test-unit-cli *ARGS:
 _test-unit-host *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ "{{os()}}" = "macos" ]; then
+    if [ "{{_test_host}}" = "macos" ]; then
         # carrick-host needs the same serial treatment, for the same reason and
         # one more. Its `guest_cpu` tests `libc::fork()` from the harness and
         # drive a real SIGSTOP/waitpid handshake with the child; its
@@ -597,7 +601,7 @@ _test-unit-host *ARGS:
 _test-unit-vfs *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ "{{os()}}" = "macos" ]; then
+    if [ "{{_test_host}}" = "macos" ]; then
         # Parallel cache churn previously measured 47 host opens against an
         # expected 15; exact budgets and process-wide state stay serial.
         # carrick-vfs runs parallel tests with --skip serial_host, followed by
@@ -612,7 +616,7 @@ _test-unit-vfs *ARGS:
 _test-unit-kernel *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ "{{os()}}" = "macos" ]; then
+    if [ "{{_test_host}}" = "macos" ]; then
         # carrick-kernel runs parallel tests with --skip serial_host, followed by
         # its harness-fork and shared-state tests serially under RUST_TEST_THREADS=1.
         {{_admit}} {{_cargo}} test -p carrick-kernel --lib --features test-support {{ARGS}} -- --skip serial_host
@@ -625,7 +629,7 @@ _test-unit-kernel *ARGS:
 _test-unit-runtime *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ "{{os()}}" = "macos" ]; then
+    if [ "{{_test_host}}" = "macos" ]; then
         # Runtime's test injections are fixture-owned, but carrier/prepare tests
         # still share process-wide VM lifecycle windows. Artifact/preemption
         # tests mutate env, signal tests fork/reap host children, and owner-boundary
@@ -646,7 +650,7 @@ _test-unit-runtime *ARGS:
 _test-unit-hvf *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ "{{os()}}" = "macos" ]; then
+    if [ "{{_test_host}}" = "macos" ]; then
         # carrick-vmm-hvf is serial for a THIRD reason, and it is structural
         # rather than a test-hygiene lapse: the carrier is process-global by
         # design, so its alias registry, replay mappings, global-frame owner
