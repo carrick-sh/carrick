@@ -41,7 +41,7 @@ pub const TOOLCHAIN: &str = "/Volumes/carrick-build/carrick-ci/toolchain";
 /// wipe; never shared with another local account's cache).
 pub const SCCACHE_DIR: &str = "/Volumes/carrick-build/carrick-ci/sccache";
 /// Size bound for [`SCCACHE_DIR`].
-pub const SCCACHE_CACHE_SIZE: &str = "20G";
+pub const SCCACHE_CACHE_SIZE: &str = "8G";
 /// Per-run sccache server socket, inside the wiped job home. A unix socket
 /// cannot collide with another user's server on the default TCP port 4226.
 pub const SCCACHE_SOCKET: &str = "/Volumes/carrick-build/carrick-ci/job-home/.sccache.sock";
