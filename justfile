@@ -176,7 +176,7 @@ check-debug-features:
 # Install git hooks (.githooks/): fmt-check at commit, clippy gate at push.
 install-hooks:
     git config core.hooksPath .githooks
-    @echo "Installed hooks: pre-commit (fmt-check), pre-push (clippy). Bypass with --no-verify."
+    @echo "Installed hooks: pre-commit (fmt-check), pre-push (clippy). --no-verify needs owner approval recorded on the PR."
 
 # No-panic lint gate (unwrap/expect/panic/todo denied) — matches CI.
 # `--keep-going` reports clippy errors across ALL crates in one pass instead of
