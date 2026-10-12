@@ -385,7 +385,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
 fn arm_process_call_claimed(nr: u64, flags: u64, registered: impl FnOnce() -> bool) -> bool {
     nr == 435
         || (nr == 220 && flags & 0x0001_0000 == 0)
-        || (matches!(nr, 260 | 94 | 95 | 58) && registered())
+        || (matches!(nr, 260 | 93 | 94 | 95 | 58) && registered())
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
@@ -1884,11 +1884,16 @@ mod tests {
     #[test]
     fn host_loaded_arm_task_keeps_terminal_calls_on_legacy_route() {
         assert!(!arm_process_call_claimed(94, 0, || false), "exit_group");
+        assert!(!arm_process_call_claimed(93, 0, || false), "exit");
         assert!(!arm_process_call_claimed(95, 0, || false), "waitid");
         assert!(arm_process_call_claimed(220, 0, || false), "first fork");
         assert!(
             arm_process_call_claimed(94, 0, || true),
             "native child exit"
+        );
+        assert!(
+            arm_process_call_claimed(93, 0, || true),
+            "native thread exit"
         );
         assert!(!arm_process_call_claimed(62, 0, || panic!(
             "ordinary lseek queried registry"
