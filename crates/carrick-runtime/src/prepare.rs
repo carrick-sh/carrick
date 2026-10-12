@@ -1226,7 +1226,11 @@ impl PreparedRun {
             let bytes = dispatcher.read_exec_file(&executable).ok_or_else(|| {
                 RuntimeError::Unsupported(format!("guest executable not found: {executable}"))
             })?;
-            let image = carrick_mem::x86_initial_image::prepare_static_x86_elf(&bytes)
+            let program = carrick_mem::elf::ElfProgram::load(&bytes, 62, &|path| {
+                dispatcher.read_exec_file(path)
+            })
+            .map_err(|error| RuntimeError::Unsupported(format!("ELF program load: {error}")))?;
+            let image = carrick_mem::x86_initial_image::prepare_x86_elf(&program)
                 .map_err(|error| RuntimeError::Unsupported(format!("x86 ELF load: {error}")))?;
             let extent_bytes = carrick_vmm_kvm::cpl0_boot::Cpl0Carrier::initial_extent_bytes_for(
                 &image, &argv, &env,

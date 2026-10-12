@@ -1587,40 +1587,41 @@ impl AddressSpace {
         include_runtime_regions: bool,
         shape: LoadRegionShape,
     ) -> Result<Self, AddressSpaceError> {
-        let mut file_mappings = file_mappings_from_load_plan(&plan, "");
-        let mut regions = regions_from_load_plan_with_shape(file, &plan, shape)?;
-        let mut entry = plan.entry;
-        let mut interpreter_base = None;
-        let mut ro_spans = crate::elf::ro_page_spans(&plan);
-        let mut rw_spans = crate::elf::rw_page_spans(&plan);
+        let program =
+            crate::elf::ElfProgram::resolve(file, plan, machine, read_interp).map_err(|error| {
+                match error {
+                    ElfInspectError::Interpreter(cause) => {
+                        AddressSpaceError::Interpreter(Box::new(AddressSpaceError::Elf(*cause)))
+                    }
+                    ElfInspectError::Io(cause) => AddressSpaceError::Io(cause),
+                    cause => AddressSpaceError::Elf(cause),
+                }
+            })?;
+        let plan = &program.executable;
+        let mut file_mappings = file_mappings_from_load_plan(plan, "");
+        let mut regions = regions_from_load_plan_with_shape(file, plan, shape)?;
+        let mut ro_spans = crate::elf::ro_page_spans(plan);
+        let mut rw_spans = crate::elf::rw_page_spans(plan);
 
-        if let Some(interpreter_path) = plan.interpreter.as_deref() {
-            let interpreter_path = std::str::from_utf8(interpreter_path)
-                .map_err(ElfInspectError::InterpreterPathEncoding)?;
-            let interpreter = read_interp(interpreter_path)
-                .ok_or_else(|| AddressSpaceError::Io(std::io::ErrorKind::NotFound.into()))?;
-            let interpreter_plan = plan_elf_load_bytes_for(&interpreter, machine)
-                .map_err(|error| AddressSpaceError::Interpreter(Box::new(error.into())))?
-                .with_load_bias(LINUX_INTERPRETER_BASE);
+        if let Some(interpreter) = &program.interpreter {
+            let interpreter_plan = &interpreter.plan;
             file_mappings.extend(file_mappings_from_load_plan(
-                &interpreter_plan,
-                interpreter_path,
+                interpreter_plan,
+                &interpreter.path,
             ));
-            ro_spans.extend(crate::elf::ro_page_spans(&interpreter_plan));
-            rw_spans.extend(crate::elf::rw_page_spans(&interpreter_plan));
+            ro_spans.extend(crate::elf::ro_page_spans(interpreter_plan));
+            rw_spans.extend(crate::elf::rw_page_spans(interpreter_plan));
             regions.extend(
-                regions_from_load_plan_with_shape(&interpreter, &interpreter_plan, shape)
+                regions_from_load_plan_with_shape(&interpreter.bytes, interpreter_plan, shape)
                     .map_err(|error| AddressSpaceError::Interpreter(Box::new(error)))?,
             );
-            entry = interpreter_plan.entry;
-            interpreter_base = Some(LINUX_INTERPRETER_BASE);
         }
         if include_runtime_regions {
             regions.extend(linux_runtime_regions()?);
         }
 
-        let linux_auxv = linux_auxv_from_load_plan(&plan, interpreter_base);
-        let mut image = Self::from_regions(entry, regions)?;
+        let linux_auxv = linux_auxv_from_load_plan(plan, program.interpreter_base());
+        let mut image = Self::from_regions(program.entry(), regions)?;
         image.linux_auxv = linux_auxv;
         image.ro_spans = ro_spans;
         image.rw_spans = rw_spans;
@@ -6652,6 +6653,7 @@ mod loader_tests {
     #[test]
     fn core_file_mappings_preserve_nonzero_page_offset_and_exact_path() {
         let plan = LoadPlan {
+            machine: crate::elf::Machine::Aarch64,
             entry: 0x401000,
             program_header_address: None,
             program_header_entry_size: 56,
@@ -6738,6 +6740,7 @@ mod loader_tests {
         file[0x8000..0x9000].fill(0x33);
 
         let plan = LoadPlan {
+            machine: crate::elf::Machine::Aarch64,
             entry: 0x1ff000,
             interpreter: None,
             program_header_address: None,
@@ -6801,6 +6804,7 @@ mod loader_tests {
     #[test]
     fn rejects_load_segment_end_overflow_before_region_merge() {
         let plan = LoadPlan {
+            machine: crate::elf::Machine::Aarch64,
             entry: 0,
             interpreter: None,
             program_header_address: None,
@@ -6992,6 +6996,7 @@ mod loader_tests {
     #[test]
     fn linux_auxv_can_omit_sysinfo_ehdr_for_vdso_debug_control() {
         let plan = LoadPlan {
+            machine: crate::elf::Machine::Aarch64,
             entry: 0x400000,
             interpreter: None,
             program_header_address: None,
@@ -7190,6 +7195,7 @@ mod loader_tests {
         // One PT_LOAD whose memsz (0x2e88) is not a page multiple, at a
         // page-aligned vaddr — the exact shape observed in the guest.
         let plan = LoadPlan {
+            machine: crate::elf::Machine::Aarch64,
             entry: 0x0088_0003_0000,
             interpreter: None,
             program_header_address: None,
@@ -7241,6 +7247,7 @@ mod loader_tests {
         file[0x1000..0x1004].copy_from_slice(&[1, 2, 3, 4]);
         file[0x2000..0x2004].copy_from_slice(&[5, 6, 7, 8]);
         let plan = LoadPlan {
+            machine: crate::elf::Machine::Aarch64,
             entry: 0x4_0000_1234,
             interpreter: None,
             program_header_address: None,

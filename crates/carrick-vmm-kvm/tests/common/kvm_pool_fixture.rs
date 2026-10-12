@@ -1,4 +1,4 @@
-use carrick_mem::x86_initial_image::prepare_static_x86_elf;
+use carrick_mem::x86_initial_image::prepare_x86_elf;
 use carrick_vmm_kvm::cpl0_boot::{Cpl0Carrier, InitialReservationLimits, InitialTaskBinding};
 
 #[path = "physical_inventory.rs"]
@@ -28,7 +28,19 @@ pub fn try_run_pool_fixture_with(
     carrick_runtime::prepare::PreparedKvmPoolOutcome,
     carrick_kernel::run_result::RuntimeError,
 > {
-    let image = prepare_static_x86_elf(elf).expect("static x86 ELF");
+    let program = carrick_mem::elf::ElfProgram::load(elf, 62, &|_| None).expect("ELF program");
+    try_run_program_with(&program, max_exits, configure)
+}
+
+pub fn try_run_program_with(
+    program: &carrick_mem::elf::ElfProgram<'_>,
+    max_exits: usize,
+    configure: impl FnOnce(&mut Cpl0Carrier),
+) -> Result<
+    carrick_runtime::prepare::PreparedKvmPoolOutcome,
+    carrick_kernel::run_result::RuntimeError,
+> {
+    let image = prepare_x86_elf(program).expect("x86 ELF program");
     let extent =
         Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("bounded initial extent");
     let mut carrier =
