@@ -1268,9 +1268,10 @@ ci-results:
          del(.changes) | all(.[]; .result == "success")
        elif $event == "pull_request" then
          (del(.changes) | with_entries(select(.key | startswith("macos-"))) | all(.[]; .result == "skipped")) and
-         (del(.changes) | with_entries(select((.key | startswith("macos-") | not) and .key != "actionlint"))
+         (del(.changes) | with_entries(select((.key | startswith("macos-") | not) and .key != "actionlint" and .key != "linked-issue"))
            | if ($root.changes.outputs.heavy // "true") == "true" then all(.[]; .result == "success")
              else all(.[]; .result == "skipped") end) and
+         (.["linked-issue"].result == "success") and
          (del(.changes).actionlint
            | if ($root.changes.outputs.workflows // "false") == "true" then .result == "success"
              else .result == "skipped" end)

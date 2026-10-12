@@ -1,5 +1,9 @@
 <!-- Title: type(scope): subject (imperative, lowercase, no period). -->
 
+<!-- Required for any non-docs PR (enforced by the linked-issue check):
+     `Closes #N`, `Fixes #N`, `Resolves #N` or `Part of #N`; cross-repo
+     `Closes carrick-sh/carrick-nt#N` works. Docs-only PRs and the
+     `no-issue` label are exempt. Edit this line, then re-run the check. -->
 Closes #
 
 ## Why
