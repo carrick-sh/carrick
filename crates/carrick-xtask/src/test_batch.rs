@@ -13,6 +13,9 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub struct TestBatchArgs {
     /// Recipe whose Cargo test commands define the lanes.
     pub recipe: String,
+    /// Compile the unified selection without executing binaries or rustdoc.
+    #[arg(long)]
+    pub no_run: bool,
     /// Extra arguments passed to the source recipe (for example --no-run).
     #[arg(last = true)]
     pub args: Vec<String>,
@@ -28,6 +31,7 @@ struct Lane {
     implicit_doc: bool,
     no_run: bool,
     no_default: bool,
+    target_dir: Option<String>,
 }
 
 fn metadata(root: &Path) -> Result<Value> {
@@ -58,6 +62,7 @@ fn parse(record: Vec<String>, meta: &Value) -> Result<Lane> {
         implicit_doc: false,
         no_run: false,
         no_default: false,
+        target_dir: None,
     };
     let mut excludes = BTreeSet::new();
     let mut kinds = BTreeSet::new();
@@ -71,7 +76,8 @@ fn parse(record: Vec<String>, meta: &Value) -> Result<Lane> {
                 lane.harness.extend_from_slice(&record[i + 1..]);
                 break;
             }
-            "-p" | "--package" | "--exclude" | "--test" | "--bin" | "--features" => {
+            "-p" | "--package" | "--exclude" | "--test" | "--bin" | "--features"
+            | "--target-dir" => {
                 i += 1;
                 let value = record.get(i).ok_or("missing option value")?;
                 match arg.as_str() {
@@ -87,6 +93,7 @@ fn parse(record: Vec<String>, meta: &Value) -> Result<Lane> {
                     "--bin" => {
                         tests.insert(("bin".to_owned(), value.clone()));
                     }
+                    "--target-dir" => lane.target_dir = Some(value.clone()),
                     _ => {
                         lane.features.extend(
                             value
@@ -236,6 +243,9 @@ pub fn run(root: &Path, args: TestBatchArgs) -> Result<()> {
         if lane.record[3..index] != first.record[3..test_index] {
             return Err("batch lanes must share their Cargo configuration".into());
         }
+        if lane.target_dir != first.target_dir {
+            return Err("batch lanes must share their target directory".into());
+        }
     }
     cmd.current_dir(&root).args([
         "test",
@@ -245,6 +255,9 @@ pub fn run(root: &Path, args: TestBatchArgs) -> Result<()> {
     ]);
     if lanes.iter().any(|l| l.no_default) {
         cmd.arg("--no-default-features");
+    }
+    if let Some(dir) = &first.target_dir {
+        cmd.args(["--target-dir", dir]);
     }
     for package in packages {
         cmd.args(["-p", &package]);
@@ -317,6 +330,9 @@ pub fn run(root: &Path, args: TestBatchArgs) -> Result<()> {
     if !child.wait()?.success() {
         return Err("batch compilation failed".into());
     }
+    if args.no_run {
+        return Ok(());
+    }
     let mut red = Vec::new();
     for lane in &lanes {
         if lane.no_run {
@@ -361,8 +377,9 @@ pub fn run(root: &Path, args: TestBatchArgs) -> Result<()> {
                 }
             }
             eprintln!("test-batch: run {test:?}");
-            if !test.status()?.success() {
-                red.push(format!("{} {:?}", exe.display(), lane.harness));
+            let status = test.status()?;
+            if !status.success() {
+                red.push(format!("{} {:?}: {status}", exe.display(), lane.harness));
             }
         }
         if lane.implicit_doc {
