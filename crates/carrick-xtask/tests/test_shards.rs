@@ -161,3 +161,23 @@ test-shard-a:
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("shard coverage differs"));
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn capture_owns_its_helper_when_a_build_replaces_the_running_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let executable = dir.path().join("xtask");
+    std::fs::copy(env!("CARGO_BIN_EXE_carrick-xtask"), &executable).unwrap();
+    std::fs::write(dir.path().join("justfile"), "test:\n    rm -f \"$CARRICK_TEST_EXECUTABLE\"\n    cargo test -p one --lib\nlanes:\n    cargo test -p one --lib\ntest-shard-a:\n    cargo run -p carrick-xtask -- test-batch lanes\n").unwrap();
+    let output = Command::new(&executable)
+        .current_dir(dir.path())
+        .args(["check-test-shards"])
+        .env("CARRICK_TEST_EXECUTABLE", &executable)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
