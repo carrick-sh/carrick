@@ -658,12 +658,12 @@ impl CarrierMemory {
     ) -> Result<RetiredChild, MemoryError> {
         self.admit()?;
         let mm = NonZeroU64::new(absence.mm().raw()).ok_or_else(|| error("retired MM key"))?;
-        let generation = carrick_guest_arch::MmGeneration::new(mm);
-        let authority = inventory.bind(generation);
         let context = *self
             .roots
             .get(&mm)
             .ok_or_else(|| error("retired MM has no carrier CR3 root"))?;
+        // Bind to the exact retired root incarnation, not just the MM number.
+        let authority = inventory.bind(context.into());
         // Phase 1: validate, mutating nothing.
         let mut held: BTreeMap<u32, usize> = BTreeMap::new();
         for alias in self.aliases.get(&mm).into_iter().flat_map(BTreeMap::values) {
