@@ -74,6 +74,26 @@ jobs:
       - name: Lint GitHub Actions workflows
         run: actionlint .github/workflows/*.yml
 
+  # GitHub-first rule: a non-docs PR must link an issue. Runs on every event so
+  # ci-ok can require plain success; it passes trivially in the merge queue.
+  linked-issue:
+    name: linked-issue
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Self-test the gate
+        run: scripts/ci/test-require-linked-issue.sh
+      - name: Require a linked issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/require-linked-issue.sh
+
   # Independent checks keep reporting after an earlier check fails. No
   # continue-on-error: every failure still makes its job (and ci-ok) fail.
 
@@ -573,6 +593,7 @@ jobs:
     needs:
       - changes
       - actionlint
+      - linked-issue
       - lint
       - portable
       - linux-doc
