@@ -3,6 +3,33 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::{fmt, num::NonZeroU64};
 
+/// Exact owner of a frame-inventory receipt. The host and guest numeric MM
+/// spaces overlap; a guest root incarnation is part of its custody identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameInventoryReceiptOwner {
+    HostMm(NonZeroU64),
+    GuestMm {
+        native_mm: carrick_guest_arch::MmGeneration,
+        root_generation: carrick_guest_arch::ContextGeneration,
+    },
+}
+
+impl From<NonZeroU64> for FrameInventoryReceiptOwner {
+    fn from(mm: NonZeroU64) -> Self {
+        Self::HostMm(mm)
+    }
+}
+
+impl FrameInventoryReceiptOwner {
+    /// Scalar compatibility for ABI and diagnostic projections only.
+    pub const fn wire_mm(self) -> NonZeroU64 {
+        match self {
+            Self::HostMm(mm) => mm,
+            Self::GuestMm { native_mm, .. } => native_mm.raw(),
+        }
+    }
+}
+
 macro_rules! inventory_id {
     ($name:ident) => {
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -97,7 +124,7 @@ pub struct FrameInventoryApplyReceipt {
     origin: FrameInventoryOrigin,
     provenance: FrameInventoryProvenance,
     transaction: KernelTransactionId,
-    mm: NonZeroU64,
+    owner: FrameInventoryReceiptOwner,
     revision: u64,
     mappings: Vec<(MappingId, FrameId)>,
 }
@@ -115,7 +142,7 @@ impl FrameInventoryApplyReceipt {
         origin: FrameInventoryOrigin,
         provenance: FrameInventoryProvenance,
         transaction: KernelTransactionId,
-        mm: NonZeroU64,
+        owner: impl Into<FrameInventoryReceiptOwner>,
         revision: u64,
         mut mappings: Vec<(MappingId, FrameId)>,
     ) -> Self {
@@ -124,7 +151,7 @@ impl FrameInventoryApplyReceipt {
             origin,
             provenance,
             transaction,
-            mm,
+            owner: owner.into(),
             revision,
             mappings,
         }
@@ -139,7 +166,11 @@ impl FrameInventoryApplyReceipt {
     }
 
     pub const fn mm(&self) -> NonZeroU64 {
-        self.mm
+        self.owner.wire_mm()
+    }
+
+    pub const fn owner(&self) -> FrameInventoryReceiptOwner {
+        self.owner
     }
 
     pub const fn revision(&self) -> u64 {
@@ -182,6 +213,10 @@ impl FrameInventoryRetirementReceipt {
         self.apply.mm()
     }
 
+    pub const fn owner(&self) -> FrameInventoryReceiptOwner {
+        self.apply.owner()
+    }
+
     pub const fn revision(&self) -> u64 {
         self.apply.revision()
     }
@@ -218,7 +253,7 @@ impl FrameInventoryReceiptChallenge {
     ) -> bool {
         self.provenance == receipt.provenance
             && self.transaction == receipt.transaction
-            && receipt.mm == expected_mm
+            && receipt.mm() == expected_mm
             && receipt.revision != 0
     }
 
@@ -229,7 +264,7 @@ impl FrameInventoryReceiptChallenge {
     ) -> bool {
         self.provenance == receipt.apply.provenance
             && self.transaction == receipt.apply.transaction
-            && receipt.apply.mm == expected_mm
+            && receipt.apply.mm() == expected_mm
             && receipt.apply.revision != 0
     }
 }
