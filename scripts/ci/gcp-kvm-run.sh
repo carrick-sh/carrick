@@ -181,7 +181,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
 apt-get install -y -q --no-install-recommends \
     build-essential clang git curl ca-certificates jq just util-linux procps \
-    pkg-config libssl-dev nftables python3 python3-venv
+    pkg-config libssl-dev nftables python3 python3-venv lsof rsync openssh-client
 
 # Test code runs as $USER_NAME. It reaches crates.io/GitHub (and the metadata
 # DNS resolver) but not the metadata HTTP endpoint, so it cannot mint the VM
