@@ -832,9 +832,14 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         let task_id = carrick_el1_abi::El1TaskId::from_linux_tid(task.thread_key().tid.raw());
         let generation = task.generation().raw();
         let file_table = task.lease().file_table_id().map_or(0, |id| id.raw());
+        let visible_pid = task.lease().visible_pid().unwrap_or(0);
         if let Some(slot) = self.live_mailbox_slot() {
             carrick_kernel::el1_delegation::publish_current_task(
-                slot, task_id, generation, file_table,
+                slot,
+                task_id,
+                generation,
+                file_table,
+                visible_pid,
             );
             if let Some(mappings) = &self.lifecycle_mappings {
                 let control = task.lease().control_lease().ok_or_else(|| {

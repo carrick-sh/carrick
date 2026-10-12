@@ -411,6 +411,7 @@ fn clone_serves_libc_and_go_thread_flag_sets_and_queues_the_child() {
         assert_eq!(rec.home(), None);
         // SAFETY: queued, owned by this vCPU; the test only reads.
         let ctx = unsafe { *rec.ctx_mut() };
+        let ctx = ctx.native;
         assert_eq!(ctx.x[0], 0);
         assert_eq!(&ctx.x[1..5], &frame.x[1..5]);
         assert_eq!(ctx.pc, CLONE_PC);
@@ -1676,7 +1677,7 @@ fn clone_stamped_nonleader_inherits_the_calling_thread() {
     assert_eq!(w.zone.slot(SLOT).queued(), 1);
 }
 struct IdentityOwner(carrick_el1_abi::ExecutionBinding);
-impl ProcessNative for IdentityOwner {
+impl<C: carrick_el1_abi::EntryContext> ProcessNative<C> for IdentityOwner {
     fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
         self.0
     }
@@ -1763,7 +1764,7 @@ fn set_tid_address_cpl0_records_word_and_returns_the_exact_tid() {
             FakeCpu,
             HardwareUserWord,
             _,
-            ThreadCtx,
+            carrick_sched_core::Aarch64ParkedContext,
         >(
             &mut frame,
             &w.counters,
@@ -1825,7 +1826,13 @@ fn set_tid_address_arm_child_registers_the_word_that_exit_clears_and_wakes() {
     frame.x[0] = addr(&*word);
     frame.x[8] = carrick_syscall_abi::nr::SET_TID_ADDRESS.raw();
     let names = InotifyNameCache::new();
-    let route = crate::personality::dispatch::dispatch_syscall_with_native(
+    let route = crate::personality::dispatch::dispatch_syscall_with_native::<
+        _,
+        FakeCpu,
+        HardwareUserWord,
+        _,
+        carrick_sched_core::Aarch64ParkedContext,
+    >(
         &mut frame,
         &w.counters,
         &w.tasks,
@@ -1863,10 +1870,10 @@ struct QueueLockProbeCpu<'a> {
     probe: &'a dyn Fn(),
 }
 impl crate::sched::ThreadCpu for QueueLockProbeCpu<'_> {
-    fn save(&mut self, f: &TrapFrame, c: &mut carrick_sched_core::ThreadCtx) {
+    fn save(&mut self, f: &TrapFrame, c: &mut carrick_sched_core::Aarch64ParkedContext) {
         self.inner.save(f, c);
     }
-    fn load(&mut self, f: &mut TrapFrame, c: &carrick_sched_core::ThreadCtx) {
+    fn load(&mut self, f: &mut TrapFrame, c: &carrick_sched_core::Aarch64ParkedContext) {
         self.inner.load(f, c);
     }
     fn set_translation(&mut self, a: u64, b: u64) {
@@ -2341,7 +2348,7 @@ fn clone_terminal_failure_witness(mode: u8) {
         let guard = w
             .zone
             .lock(
-                ZoneTables::bucket_of(MM, 0xfe00),
+                ZoneTables::bucket_of_with_context(MM, 0xfe00),
                 &carrick_sched_core::BoundedSpin(100),
             )
             .unwrap();

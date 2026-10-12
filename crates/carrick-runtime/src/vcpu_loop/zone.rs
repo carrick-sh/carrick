@@ -23,8 +23,8 @@ use super::exec::ProductionHvpatchPollError;
 use super::outcome::HvpatchLoopSuspension;
 use super::*;
 use carrick_el1_abi::{
-    CurrentHandback, CurrentRelease, Handback, RecordRef, SlotId, ThreadCtx, ThreadIdentity,
-    ZoneTables,
+    Aarch64ParkedContext, CurrentHandback, CurrentRelease, Handback, RecordRef, SlotId, ThreadCtx,
+    ThreadIdentity, ZoneTables,
 };
 use carrick_hal::threaded::GuestCpuState;
 use carrick_kernel::el1_zone::HostLockWait;
@@ -104,6 +104,24 @@ pub(super) fn zone_ctx_from_state(
         exit,
     )?;
     Ok(ctx)
+}
+
+fn parked_context(
+    native: ThreadCtx,
+    state: &GuestCpuState,
+    identity: ThreadIdentity,
+) -> Result<Aarch64ParkedContext, RuntimeError> {
+    let GuestCpuState::Aarch64V1(cpu) = state else {
+        return Err(RuntimeError::Configuration(
+            "zone parked a non-AArch64 task".to_owned(),
+        ));
+    };
+    Ok(Aarch64ParkedContext::from_register(
+        native,
+        cpu.ttbr0,
+        identity.mm,
+        identity.generation,
+    ))
 }
 
 /// `state` with argument 0 restored to `x0`, so re-issuing its syscall runs
@@ -321,7 +339,10 @@ where
                 // SAFETY: `current` is OnCpu on this slot and the vCPU is
                 // stopped: this executor is its only owner until the
                 // handback below.
-                unsafe { *zone.record(current).ctx_mut() = ctx };
+                unsafe {
+                    *zone.record(current).ctx_mut() =
+                        parked_context(ctx, &ctx_state, zone.record(current).identity())?
+                };
                 let current_ref = zone.record_ref(current);
                 match zone.handback_current(slot, current) {
                     CurrentHandback::HandedBack => {
@@ -555,7 +576,9 @@ where
             control_slot: 0,
         };
         let parked = {
-            let Some(guard) = zone.lock(ZoneTables::bucket_of(mm, uaddr), &HostLockWait) else {
+            let Some(guard) =
+                zone.lock(ZoneTables::bucket_of_with_context(mm, uaddr), &HostLockWait)
+            else {
                 return Err(RuntimeError::Configuration(
                     "zone park: host bucket lock gave up".to_owned(),
                 )
@@ -573,7 +596,9 @@ where
                     Err(_) => Err(crate::linux_abi::LINUX_EAGAIN),
                     Ok(record) => {
                         // SAFETY: freshly allocated and not yet published.
-                        unsafe { *zone.record(record).ctx_mut() = ctx };
+                        unsafe {
+                            *zone.record(record).ctx_mut() = parked_context(ctx, &state, identity)?
+                        };
                         let seq = zone.next_seq(record);
                         if zone
                             .enqueue(&guard, record, seq, mm, uaddr, bitset, index)
@@ -697,11 +722,14 @@ where
             RuntimeError::Configuration(format!("owner wait record unavailable: {error:?}"))
         })?;
         // SAFETY: this freshly allocated record has not been published.
-        if let Some((_, ctx, _)) = &syscall_state {
-            unsafe { *zone.record(record).ctx_mut() = *ctx };
+        if let Some((state, ctx, _)) = &syscall_state {
+            unsafe { *zone.record(record).ctx_mut() = parked_context(*ctx, state, identity)? };
         }
         let seq = zone.next_seq(record);
-        let complete = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
+        let complete = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            Aarch64ParkedContext,
+        >| {
             carrick_sched_core::LockWait::complete_object_wake(&HostLockWait, zone, effects)
         };
         match enrollment.park_host(record, token, &complete) {
@@ -1242,7 +1270,7 @@ where
                 .alloc_record(identity)
                 .map_err(|error| ipc_error("park record", error))?;
             // SAFETY: freshly allocated and not yet published.
-            unsafe { *zone.record(record).ctx_mut() = ctx };
+            unsafe { *zone.record(record).ctx_mut() = parked_context(ctx, &state, identity)? };
             let token = host_ipc::to_sched_token(park.token)
                 .map_err(|_| RuntimeError::Configuration("IPC token conversion".to_owned()))?;
             // The park's sequence (the same one `park` publishes).

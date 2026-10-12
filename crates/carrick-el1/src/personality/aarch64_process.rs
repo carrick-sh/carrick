@@ -4,12 +4,14 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use carrick_core::mm::fork::{ForkCensus, ForkScratch, census_table};
 use carrick_core::mm::transaction::OwnerVenue;
 use carrick_el1_abi::{
-    CurrentTask, ForkStockExchange, ForkStockLoan, ForkStockRequest, ForkStockSettlement,
-    PortalForkCustody, PortalOperation, ReservationMm, ThreadControlSlot, ThreadLifecyclePage,
+    BornInZoneSource, CurrentTask, ForkStockExchange, ForkStockLoan, ForkStockRequest,
+    ForkStockSettlement, PortalForkCustody, PortalOperation, ReservationMm, ThreadControlSlot,
+    ThreadLifecyclePage,
 };
 use carrick_guest_arch::{
     AddressContext, ContextGeneration, FrameGpa, KernelVa, MmGeneration, RootGpa, SlotId, UserVa,
@@ -27,7 +29,8 @@ use core::sync::atomic::Ordering;
 use super::common_entry;
 use super::mm_portal::{LinuxForkPolicy, NativeForkPortal, UnpublishedEl1Child};
 use super::native_process_runtime::{
-    NativeForkPreparation, NativeLifecycleResources, NativeProcessError, NativeProcessService,
+    NativeForkPreparation, NativeLifecycleResources, NativeProcessError, NativeProcessRegistry,
+    NativeProcessRuntime, NativeProcessService,
 };
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 use crate::memory::reservations;
@@ -35,10 +38,100 @@ use crate::memory::reservations::{NativeReservationGeometry, SharedReservations}
 
 pub type Mm = AddressContext<RootGpa>;
 
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+struct CurrentMmMaintenance;
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for CurrentMmMaintenance {
+    fn publish_barrier(&self) {
+        let ttbr0 = crate::isa::aarch64::hardware_live_ttbr();
+        crate::sched::ThreadCpu::invalidate_asid(&mut crate::sched::HardwareCpu, ttbr0);
+    }
+    fn invalidate_range(&self, _va: u64, _len: u64) {
+        self.publish_barrier();
+    }
+}
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+static CURRENT_MM_MAINTENANCE: CurrentMmMaintenance = CurrentMmMaintenance;
+
+pub enum PreparedWords<'a> {
+    Borrowed(&'a dyn LiveDescriptorWords),
+    Owned(Box<dyn LiveDescriptorWords + 'a>),
+}
+impl<'a> core::ops::Deref for PreparedWords<'a> {
+    type Target = dyn LiveDescriptorWords + 'a;
+    fn deref(&self) -> &(dyn LiveDescriptorWords + 'a) {
+        match self {
+            Self::Borrowed(words) => *words,
+            Self::Owned(words) => &**words,
+        }
+    }
+}
+
+type Runtime = NativeProcessRuntime<'static, Mm, Aarch64ParkedContext>;
+static REGISTRY: NativeProcessRegistry<'static, Mm, Aarch64ParkedContext> =
+    NativeProcessRegistry::new();
+
+pub fn registry() -> &'static NativeProcessRegistry<'static, Mm, Aarch64ParkedContext> {
+    &REGISTRY
+}
+
+/// Admit only an exact published leader or thread-group member. The root
+/// address is checked by the shared owner against the zone's live MM grant.
+pub fn admit_entry(
+    source: BornInZoneSource<'static, Aarch64ParkedContext>,
+    task: &'static CurrentTask,
+    native: carrick_sched_core::ThreadCtx,
+    ttbr0: u64,
+    record_incarnation: u64,
+) -> Result<(Arc<Runtime>, Mm, Aarch64ParkedContext), NativeProcessError> {
+    let (page, control) = task.lifecycle_refs().ok_or(NativeProcessError::Stale)?;
+    let observed = Mm {
+        root: RootGpa::page_aligned(FrameGpa::new(ttbr0 & AARCH64_ROOT_ADDRESS_MASK))
+            .ok_or(NativeProcessError::Stale)?,
+        mm: MmGeneration::new(
+            NonZeroU64::new(task.mm.key.load(Ordering::Acquire))
+                .ok_or(NativeProcessError::Stale)?,
+        ),
+        generation: ContextGeneration::new(
+            NonZeroU64::new(record_incarnation).ok_or(NativeProcessError::Stale)?,
+        ),
+    };
+    let address = if control.entry().is_some() {
+        REGISTRY
+            .group_address(
+                source.zone,
+                observed,
+                page,
+                task.visible_pid().ok_or(NativeProcessError::Stale)?,
+            )
+            .ok_or(NativeProcessError::Stale)?
+    } else {
+        observed
+    };
+    let words = Aarch64ParkedContext::from_register(
+        native,
+        ttbr0,
+        address.mm.raw().get(),
+        address.generation.raw().get(),
+    );
+    if let Ok(runtime) = REGISTRY.for_entry(source, task, address) {
+        return Ok((runtime, address, words));
+    }
+    if control.entry().is_some() {
+        let runtime = REGISTRY.register_thread(source, task, address, page, control)?;
+        return Ok((runtime, address, words));
+    }
+    let runtime = Arc::new(NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source, task, page, control, address, address, words,
+    )?);
+    REGISTRY.register_root(runtime.clone(), source, task, address)?;
+    Ok((runtime, address, words))
+}
+
 pub struct Prepared<'a> {
     pub loan: ForkStockLoan,
     pub child: UnpublishedEl1Child<Aarch64Mmu>,
-    pub words: &'a (dyn LiveDescriptorWords + 'a),
+    pub words: PreparedWords<'a>,
     pub address: Mm,
     pub custody: Vec<PortalForkCustody>,
 }
@@ -283,7 +376,25 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         }
         let owner = self.portal()?;
         let mm = ReservationMm::new(parent.mm.raw().get()).ok_or(NativeProcessError::Stale)?;
-        let live = self.words.ok_or(NativeProcessError::Stale)?;
+        let live = if let Some(words) = self.words {
+            PreparedWords::Borrowed(words)
+        } else {
+            #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+            {
+                let ttbr0 = crate::isa::aarch64::hardware_live_ttbr();
+                let words = super::mm_portal::production::current_mm_words(
+                    ttbr0,
+                    ttbr0,
+                    &CURRENT_MM_MAINTENANCE,
+                )
+                .map_err(|_| NativeProcessError::Stale)?;
+                PreparedWords::Owned(Box::new(words))
+            }
+            #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+            {
+                return Err(NativeProcessError::Stale);
+            }
+        };
         let capacity = owner
             .fork_mapping_count(mm, self.worker())
             .map_err(|e| err("fork_mapping_count", e))?;
@@ -347,7 +458,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             };
             census_table::<Aarch64Mmu, _, _>(
                 &LinuxForkPolicy,
-                live,
+                &*live,
                 &mappings,
                 parent.root.address().raw(),
                 0,
@@ -412,7 +523,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             count.custody,
         )
         .map_err(|e| err("ForkScratch::bounded", e))?;
-        let plan = match owner.prepare_fork(loan.request, scratch, live, self.worker()) {
+        let plan = match owner.prepare_fork(loan.request, scratch, &*live, self.worker()) {
             Ok(plan) => plan,
             Err(e) => {
                 owner.spaces.free(index);
@@ -424,7 +535,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             .try_reserve_exact(plan.custody().len())
             .map_err(|_| NativeProcessError::Exhausted)?;
         custody.extend_from_slice(plan.custody());
-        let child = match owner.publish_fork(plan, live, self.worker()) {
+        let child = match owner.publish_fork(plan, &*live, self.worker()) {
             Ok(child) => child,
             Err(e) => {
                 owner.spaces.free(index);
@@ -489,7 +600,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         let result = self.portal().and_then(|owner| {
             prepared
                 .child
-                .abort(&owner, prepared.words, self.worker())
+                .abort(&owner, &*prepared.words, self.worker())
                 .map_err(|e| err("child.abort", e))
         });
         let mut settlement = carrick_el1_abi::ForkStockSettlement::abort(prepared.loan);

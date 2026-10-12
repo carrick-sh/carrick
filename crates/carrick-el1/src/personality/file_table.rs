@@ -561,7 +561,7 @@ impl PollContinuation {
     }
 
     /// Releases execution capacity on the zone scheduler by clearing the slot's current task.
-    pub fn release_capacity(&mut self, zone: &ZoneTables) {
+    pub fn release_capacity<C: carrick_el1_abi::EntryContext>(&mut self, zone: &ZoneTables<C>) {
         if let Some(slot) = self.slot {
             zone.clear_current(slot);
         }

@@ -2464,11 +2464,22 @@ pub const EL1_NAME_CACHE_BASE: u64 = EL1_REGION_BASE + EL1_NAME_CACHE_OFFSET;
 pub const EL1_NAME_CACHE_SIZE: u64 = 0x1_0000;
 
 pub use carrick_sched_core::{
-    AddressSpaces, BoundedSpin, Claim, CurrentHandback, CurrentRelease, ExcludedEditor, Exhausted,
-    Handback, HostClaim, HostPlacement, HostTransfer, LockWait, ParkedContextRead, RecordId,
-    RecordRef, SlotDrain, SlotId, SlotState, SwitchedIn, ThreadCtx, ThreadIdentity, WakeEffects,
-    WakeRecord, WakeRefusal, Waker, ZONE_SLOTS, ZoneRecord, ZoneTables,
+    Aarch64ParkedContext, AddressSpaces, BoundedSpin, Claim, CurrentHandback, CurrentRelease,
+    ExcludedEditor, Exhausted, Handback, HostClaim, HostPlacement, HostTransfer, LockWait,
+    ParkedContextRead, RecordId, RecordRef, SlotDrain, SlotId, SlotState, SwitchedIn, ThreadCtx,
+    ThreadIdentity, WakeEffects, WakeRecord, WakeRefusal, Waker, ZONE_SLOTS,
 };
+
+/// The ARM guest and its carrier share one record context type. Every zone
+/// reference uses these aliases, including scheduler and process ownership.
+#[cfg(target_arch = "aarch64")]
+pub type ZoneTables = carrick_sched_core::ZoneTables<Aarch64ParkedContext>;
+#[cfg(target_arch = "aarch64")]
+pub type ZoneRecord = carrick_sched_core::ZoneRecord<Aarch64ParkedContext>;
+#[cfg(not(target_arch = "aarch64"))]
+pub type ZoneTables = carrick_sched_core::ZoneTables<ThreadCtx>;
+#[cfg(not(target_arch = "aarch64"))]
+pub type ZoneRecord = carrick_sched_core::ZoneRecord<ThreadCtx>;
 
 /// Byte offset of the in-guest scheduler's tables ([`ZoneTables`]: futex
 /// wait queues, parked-thread records, per-vCPU run queues).
@@ -3725,7 +3736,7 @@ impl Default for InotifyNameCache {
 const _: () = {
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
-    assert!(EL1_ABI_LAYOUT_HASH == 0xd22014eee50dbddb);
+    assert!(EL1_ABI_LAYOUT_HASH == 0x1a753d6f24969197);
     assert!(
         EL1_APERTURE_CONTROL_OFFSET.is_multiple_of(core::mem::align_of::<ApertureControl>() as u64)
     );
