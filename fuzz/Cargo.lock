@@ -244,6 +244,7 @@ name = "carrick-el1"
 version = "0.1.0"
 dependencies = [
  "carrick-core",
+ "carrick-core-abi",
  "carrick-el1-abi",
  "carrick-fatal",
  "carrick-guest-arch",
@@ -482,12 +483,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-personality-api"
+version = "0.1.0"
+dependencies = [
+ "carrick-core",
+ "carrick-core-abi",
+ "carrick-guest-arch",
+ "carrick-sched-core",
+]
+
+[[package]]
 name = "carrick-personality-linux"
 version = "0.1.0"
 dependencies = [
  "carrick-core",
  "carrick-core-abi",
  "carrick-guest-arch",
+ "carrick-personality-api",
  "carrick-sched-core",
  "carrick-signal-core",
  "carrick-syscall-abi",
@@ -700,6 +712,7 @@ dependencies = [
  "carrick-aarch64",
  "carrick-abi",
  "carrick-core",
+ "carrick-core-abi",
  "carrick-el1",
  "carrick-el1-abi",
  "carrick-fatal",
