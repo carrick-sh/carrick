@@ -992,6 +992,25 @@ VM-free bindings:
   CPU are not refused for capacity.
 
 KVM binding:
+`native_runtime_wait_wakes_once_only_after_real_mm_retirement` holds the
+real CPL0 child-retire crossing pending. The parent observes WNOHANG zero,
+successfully forks again, and enrolls its blocking wait through the native
+runtime. The scheduler census remains parked with zero completion wakes
+until MM retirement and slot absence publish; completion queues that exact
+waiter with one wake and resumes it with the child's exit status. Reordering
+runtime readiness before `retire_mm`, or omitting channel publication,
+fails this witness. The existing carrier watchdog bounds guest execution;
+the host census only observes atomic enrollment and never publishes readiness.
+
+`child_born_on_idle_peer_can_fault_and_retire_on_root_executor` forces a
+fork loan and commit on the idle peer, then places that queued newborn on
+CPU 0 through the real scheduler claim/run queues. The fixture does not
+require the unported CPL0 sched_setaffinity syscall.
+Its private first-touch and physical MM retirement must authenticate the
+newborn's live binding while CPU 0 retains the root task's executor lease.
+The carrier's CPUs share one child-binding authority; executor detach does
+not retire a live child, and a conflicting live-root registration refuses.
+
 `mounted_static_x86_fork_rounds_beyond_lifecycle_stock_reuse_retired_children`
 (12 sequential fork/exit rounds, each child first-touching fresh private
 pages that must read zero; native output and exit; `loan` 12,
