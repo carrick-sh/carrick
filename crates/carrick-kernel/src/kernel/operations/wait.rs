@@ -329,6 +329,9 @@ impl WaitLive for TaskRecord {
 }
 impl WaitZombie<crate::kernel::container::ContainerId, NsUid> for ZombieRecord {
     type Status = LinuxWaitStatus;
+    fn exit_wait_phase(&self) -> carrick_sched_core::process::wait::ExitWaitPhase {
+        carrick_sched_core::process::wait::ExitWaitPhase::Waitable
+    }
     fn wait_zombie(&self) -> &Zombie {
         &self.zombie
     }

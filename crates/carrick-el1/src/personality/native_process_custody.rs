@@ -309,6 +309,7 @@ mod tests {
                 .unwrap()
                 .publish()
                 .unwrap();
+            published.retirement.publish();
             let permit = published
                 .effects
                 .cancel_members(|member| assert_eq!(member.exit_task(), child));

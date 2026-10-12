@@ -5489,8 +5489,9 @@ mod real {
     #[::usdt::provider(provider = "carrick")]
     mod carrick_usdt {
         /// Process incarnation from Darwin `PROC_PIDTBSDINFO`.
-        fn fork__admission__refusal(_: u32, _: u64, _: u64, _: u64, _: u64) {}
-        fn fork__quarantine__state(_: u64, _: u8, _: u8) {}
+        fn fork__admission__identity(_: u64, _: u64, _: u32, _: u64) {}
+        fn fork__admission__refusal(_: u64, _: u32, _: u64, _: u64, _: u64) {}
+        fn fork__quarantine__state(_: u64, _: u64, _: u8, _: u8) {}
         fn host__process__birth(_: u32, _: i64, _: i32) {}
         // arg2 is the ADDRESS of a `SyscallArgs` ([u64; 6], contiguous); DTrace
         // does `copyin(arg2, 48)` and reads the six args by offset. This probe
@@ -7532,15 +7533,22 @@ mod real {
     /// One refusal followed by every quarantined child at this boundary.
     /// No encoding or allocation is performed by the probes.
     pub fn fork_admission_refusal(event: &crate::compat::ForkAdmissionRefusal) {
+        carrick_usdt::fork__admission__identity!(|| (
+            event.carrier,
+            event.mm,
+            event.cpu,
+            event.available_lifecycles as u64
+        ));
         carrick_usdt::fork__admission__refusal!(|| (
+            event.carrier,
             event.resource as u32,
             event.child_pages,
             event.parent_pages,
-            event.available_pages as u64,
-            event.available_lifecycles as u64
+            event.available_pages as u64
         ));
         for child in &event.quarantine {
             carrick_usdt::fork__quarantine__state!(|| (
+                event.carrier,
                 child.mm,
                 u8::from(child.absent),
                 u8::from(child.carrier_released)

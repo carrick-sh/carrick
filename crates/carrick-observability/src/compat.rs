@@ -1038,6 +1038,9 @@ pub struct ForkQuarantineState {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ForkAdmissionRefusal {
+    pub carrier: u64,
+    pub mm: u64,
+    pub cpu: u32,
     pub resource: ForkCapacityResource,
     pub child_pages: u64,
     pub parent_pages: u64,
