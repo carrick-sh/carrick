@@ -1174,6 +1174,11 @@ ci-probe-coverage-base:
       git fetch --no-tags origin "$BASE"
     fi
 
+# Bootstrap before foreground recipes need the admission helper. Cargo checks
+# source freshness even when the workspace artifacts came from a CI cache.
+ci-prebuild-xtask:
+    {{_cargo}} build --locked -p carrick-xtask
+
 ci-toolchain:
     rustup show active-toolchain
 

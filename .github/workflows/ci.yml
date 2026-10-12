@@ -20,6 +20,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Ephemeral hosted runners persist this bounded compiler cache via rust-cache.
+  SCCACHE_CACHE_SIZE: "1G"
   # Harden registry transport against intermittent network errors without retrying tests.
   CARGO_HTTP_MULTIPLEXING: "false"   # avoid HTTP/2 framing failures against the crates.io index
   CARGO_NET_RETRY: "10"              # transport retries for registry/download fetches only
@@ -44,12 +46,31 @@ jobs:
       - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: just
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - name: Configure persisted compiler cache
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: ${{ github.job }}-debug
+          cache-directories: ${{ env.SCCACHE_DIR }}
+          cache-workspace-crates: "true"
+          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
+      - name: Install per-user compiler cache
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
+      - name: Prebuild cached xtask admission helpers
+        run: just ci-prebuild-xtask
       - name: Detect changed surfaces
         id: filter
         env:
           CI_EVENT: ${{ github.event_name }}
           CI_BASE: ${{ github.event.pull_request.base.sha }}
         run: just ci-changes
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just build-cache
 
   actionlint:
     needs: changes
@@ -116,13 +137,20 @@ jobs:
         run: just ci-probe-coverage-base
       - name: Install repository Rust toolchain
         run: just ci-toolchain
+      - name: Configure persisted compiler cache
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
+          shared-key: ${{ github.job }}-debug
+          cache-directories: ${{ env.SCCACHE_DIR }}
+          cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Prebuild cached xtask admission helpers
+        run: just ci-prebuild-xtask
       - name: Install Semgrep
         if: ${{ !cancelled() }}
         timeout-minutes: 12
@@ -152,6 +180,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: just lint-domains-source
 
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just build-cache
+
   portable:
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
@@ -166,8 +198,13 @@ jobs:
           tool: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
+      - name: Configure persisted compiler cache
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
+          shared-key: ${{ github.job }}-debug
+          cache-directories: ${{ env.SCCACHE_DIR }}
+          cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Compiler cache fallback without sccache
         run: cargo test -p carrick-xtask --test build_cache
@@ -175,6 +212,8 @@ jobs:
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Prebuild cached xtask admission helpers
+        run: just ci-prebuild-xtask
       - name: Install Linux C cross toolchain
         if: ${{ !cancelled() }}
         timeout-minutes: 12
@@ -188,6 +227,10 @@ jobs:
       - name: Kernel semantics on x86_64 Linux
         if: ${{ !cancelled() }}
         run: just test-kernel-semantics
+
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just build-cache
 
   linux-doc:
     needs: changes
@@ -203,19 +246,33 @@ jobs:
           tool: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
+      - name: Configure persisted compiler cache
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
+          shared-key: ${{ github.job }}-debug
+          cache-directories: ${{ env.SCCACHE_DIR }}
+          cache-workspace-crates: "true"
+          workspaces: |
+            . -> target
+            fuzz -> target
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Prebuild cached xtask admission helpers
+        run: just ci-prebuild-xtask
       - name: Linux crate rustdoc (including Linux host and KVM modules)
         if: ${{ !cancelled() }}
         run: just doc
       - name: Fuzz harness compile-check
         if: ${{ !cancelled() }}
         run: just check-fuzz
+
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just build-cache
 
   macos-clippy:
     needs: changes
@@ -236,20 +293,30 @@ jobs:
         run: just ci-probe-coverage-base
       - name: Install repository Rust toolchain
         run: just ci-toolchain
+      - name: Configure persisted compiler cache
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
-          shared-key: macos-host
+          shared-key: ${{ github.job }}-debug
+          cache-directories: ${{ env.SCCACHE_DIR }}
+          cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Prebuild cached xtask admission helpers
+        run: just ci-prebuild-xtask
       - name: Clippy (no-panic gate)
         if: ${{ !cancelled() }}
         run: just clippy
       - name: Live host-authority compiler census
         if: ${{ !cancelled() }}
         run: cargo run --locked -p carrick-xtask -- authority-debt
+
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just build-cache
 
   macos-build:
     needs: changes
@@ -265,14 +332,20 @@ jobs:
           tool: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
+      - name: Configure persisted compiler cache
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
-          shared-key: macos-host
+          shared-key: ${{ github.job }}-debug
+          cache-directories: ${{ env.SCCACHE_DIR }}
+          cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Prebuild cached xtask admission helpers
+        run: just ci-prebuild-xtask
       - name: Workspace build
         if: ${{ !cancelled() }}
         run: just check --workspace
@@ -281,6 +354,10 @@ jobs:
       - name: Workspace rustdoc
         if: ${{ !cancelled() }}
         run: just doc
+
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just build-cache
 
   macos-unit-a:
     needs: changes
@@ -296,17 +373,27 @@ jobs:
           tool: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
+      - name: Configure persisted compiler cache
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
-          shared-key: macos-host
+          shared-key: ${{ github.job }}-debug
+          cache-directories: ${{ env.SCCACHE_DIR }}
+          cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Prebuild cached xtask admission helpers
+        run: just ci-prebuild-xtask
       - name: Unit tests shard A (host test lanes)
         if: ${{ !cancelled() }}
         run: just ci-macos-test test-shard-a
+
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just build-cache
 
   macos-unit-e:
     needs: changes
@@ -322,17 +409,27 @@ jobs:
           tool: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
+      - name: Configure persisted compiler cache
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
-          shared-key: macos-host
+          shared-key: ${{ github.job }}-debug
+          cache-directories: ${{ env.SCCACHE_DIR }}
+          cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Prebuild cached xtask admission helpers
+        run: just ci-prebuild-xtask
       - name: Unit tests shard E (workspace)
         if: ${{ !cancelled() }}
         run: just ci-macos-test test-shard-e
+
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just build-cache
 
   macos-unit-b:
     needs: changes
@@ -348,17 +445,27 @@ jobs:
           tool: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
+      - name: Configure persisted compiler cache
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
-          shared-key: macos-host
+          shared-key: ${{ github.job }}-debug
+          cache-directories: ${{ env.SCCACHE_DIR }}
+          cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Prebuild cached xtask admission helpers
+        run: just ci-prebuild-xtask
       - name: Unit tests shard B (mm-owner + CLI + host + VFS + EL1)
         if: ${{ !cancelled() }}
         run: just ci-macos-test test-shard-b
+
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just build-cache
 
   macos-unit-c:
     needs: changes
@@ -374,17 +481,27 @@ jobs:
           tool: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
+      - name: Configure persisted compiler cache
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
-          shared-key: macos-host
+          shared-key: ${{ github.job }}-debug
+          cache-directories: ${{ env.SCCACHE_DIR }}
+          cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Prebuild cached xtask admission helpers
+        run: just ci-prebuild-xtask
       - name: Unit tests shard C (kernel)
         if: ${{ !cancelled() }}
         run: just ci-macos-test test-shard-c
+
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just build-cache
 
   macos-unit-d:
     needs: changes
@@ -400,17 +517,27 @@ jobs:
           tool: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
+      - name: Configure persisted compiler cache
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
-          shared-key: macos-host
+          shared-key: ${{ github.job }}-debug
+          cache-directories: ${{ env.SCCACHE_DIR }}
+          cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Prebuild cached xtask admission helpers
+        run: just ci-prebuild-xtask
       - name: Unit tests shard D (runtime + HVF)
         if: ${{ !cancelled() }}
         run: just ci-macos-test test-shard-d
+
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just build-cache
 
   macos-integration:
     needs: changes
@@ -426,17 +553,27 @@ jobs:
           tool: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
+      - name: Configure persisted compiler cache
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
-          shared-key: macos-host
+          shared-key: ${{ github.job }}-debug
+          cache-directories: ${{ env.SCCACHE_DIR }}
+          cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Prebuild cached xtask admission helpers
+        run: just ci-prebuild-xtask
       - name: Host integration tests (no HVF)
         if: ${{ !cancelled() }}
         run: just ci-macos-test test-integration
+
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just build-cache
 
   cross-check-linux:
     needs: changes
@@ -452,19 +589,30 @@ jobs:
           tool: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
+      - name: Configure persisted compiler cache
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
+          shared-key: ${{ github.job }}-debug
+          cache-directories: ${{ env.SCCACHE_DIR }}
+          cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Prebuild cached xtask admission helpers
+        run: just ci-prebuild-xtask
       - name: aarch64 Linux cross-check and no-HVF closure
         if: ${{ !cancelled() }}
         run: just check-linux
       - name: Native Linux host backend tests
         if: ${{ !cancelled() }}
         run: just test-host-linux
+
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just build-cache
 
   # Native Linux run of the kernel-semantics suites (crates/carrick-kernel-example):
   # scripted two-process Linux semantics against the public kernel API with no
@@ -502,16 +650,27 @@ jobs:
           tool: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
+      - name: Configure persisted compiler cache
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
+          shared-key: ${{ github.job }}-debug
+          cache-directories: ${{ env.SCCACHE_DIR }}
+          cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Prebuild cached xtask admission helpers
+        run: just ci-prebuild-xtask
       - name: Kernel semantics natively on ARM Linux
         if: ${{ !cancelled() }}
         run: just test-kernel-semantics
+
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just build-cache
 
   cross-check-freebsd:
     needs: changes
@@ -532,13 +691,20 @@ jobs:
           tool: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
+      - name: Configure persisted compiler cache
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
+          shared-key: ${{ github.job }}-debug
+          cache-directories: ${{ env.SCCACHE_DIR }}
+          cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Prebuild cached xtask admission helpers
+        run: just ci-prebuild-xtask
       - name: Install FreeBSD C cross toolchain
         if: ${{ !cancelled() }}
         timeout-minutes: 12
@@ -565,6 +731,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: just authority-check-cross x86_64-unknown-freebsd clang "--target=x86_64-unknown-freebsd${{ env.FBSD_MAJOR }} --sysroot=${{ env.FBSD_SYSROOT }}" llvm-ar
 
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just build-cache
+
   cross-check-netbsd:
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
@@ -583,13 +753,20 @@ jobs:
           tool: just
       - name: Install repository Rust toolchain
         run: just ci-toolchain
+      - name: Configure persisted compiler cache
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
+          shared-key: ${{ github.job }}-debug
+          cache-directories: ${{ env.SCCACHE_DIR }}
+          cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Install per-user compiler cache
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
+      - name: Prebuild cached xtask admission helpers
+        run: just ci-prebuild-xtask
       - name: Install BSD C cross toolchain
         if: ${{ !cancelled() }}
         timeout-minutes: 12
@@ -612,6 +789,10 @@ jobs:
 
   # Single ruleset check. Only a successful docs-only PR filter permits skips;
   # a failed/cancelled filter or an unexpectedly skipped dependency is red.
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just build-cache
+
   ci-ok:
     name: ci-ok
     if: always()
