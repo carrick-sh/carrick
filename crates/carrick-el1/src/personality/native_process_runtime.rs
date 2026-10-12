@@ -2663,12 +2663,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // A parent may scan without waiting for our notification. Publish
         // status readiness only after the child stock and slot absence are
         // retired, so that scan cannot admit a fork against charged stock.
-        published.retirement.publish();
         let (target, channels) = {
             let graph = self.runtime.graph.lock();
+            // Keep readiness and current-parent selection in one graph
+            // projection: an adopter parked on this pending receipt owns
+            // the completion wake even if the original parent has exited.
+            published.retirement.publish();
+            let parent = graph.owner.exit_notification_parent(&permit);
             let target = graph.owner.select_exit_parent(&permit);
             let mut channels = Vec::new();
-            for key in [permit.parent(), published.adopter].into_iter().flatten() {
+            for key in [parent, published.adopter].into_iter().flatten() {
                 if let Some(channel) = graph
                     .owner
                     .task(key)

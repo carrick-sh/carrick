@@ -466,6 +466,9 @@ impl<C, U, Claim> WaitZombie<C, U> for GuestZombie<C, U, Claim> {
     }
 }
 impl<C, U, Claim> ExitZombie for GuestZombie<C, U, Claim> {
+    fn exit_parent(&self) -> Option<TaskKey> {
+        self.receipt.parent
+    }
     fn exit_key(&self) -> TaskKey {
         self.receipt.key
     }
@@ -882,6 +885,10 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
             topology,
         })
     }
+    pub fn exit_notification_parent(&self, permit: &ExitParentPermit) -> Option<TaskKey> {
+        self.registry.exit_notification_parent(permit)
+    }
+
     /// Retain an exact shared parent target after exact member cancellation.
     /// The caller drops its enclosing graph guard before target.prepare().
     pub fn select_exit_parent(
