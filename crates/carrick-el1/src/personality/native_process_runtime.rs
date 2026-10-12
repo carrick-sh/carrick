@@ -2660,6 +2660,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         {
             self.service.retire_mm(mm);
         }
+        // A parent may scan without waiting for our notification. Publish
+        // status readiness only after the child stock and slot absence are
+        // retired, so that scan cannot admit a fork against charged stock.
+        published.retirement.publish();
         let (target, channels) = {
             let graph = self.runtime.graph.lock();
             let target = graph.owner.select_exit_parent(&permit);

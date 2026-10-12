@@ -35,9 +35,17 @@ pub trait WaitLive: WaitIdentitySource {
     fn commit_reap(&mut self, child: TaskKey, charge: TaskRusage, revision: Self::Revision);
 }
 
+/// A terminal task's status is observable only after resource retirement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExitWaitPhase {
+    Retiring,
+    Waitable,
+}
+
 pub trait WaitZombie<C, U> {
     type Status: Clone;
     fn wait_zombie(&self) -> &Zombie<C, U, Self::Status>;
+    fn exit_wait_phase(&self) -> ExitWaitPhase;
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -246,6 +254,7 @@ impl<
             .into_iter()
             .filter(|key| !children.contains(key))
             .collect();
+        let mut retiring_child = false;
         for child in &children {
             if let Some(record) = self.zombies.get(&child.id) {
                 let zombie = record.wait_zombie();
@@ -254,7 +263,10 @@ impl<
                     && query.class.admits(zombie.exit_signal)
                     && query.target.admits(*child, zombie.process_group)
                 {
-                    return Ok(WaitSelection::Exited(*child));
+                    match record.exit_wait_phase() {
+                        ExitWaitPhase::Waitable => return Ok(WaitSelection::Exited(*child)),
+                        ExitWaitPhase::Retiring => retiring_child = true,
+                    }
                 }
             }
         }
@@ -285,7 +297,8 @@ impl<
                 .get(&key.id)
                 .is_some_and(|record| query.admits_tracee(*key, parent, record.wait_identity()))
         });
-        let live_child = live_tracee
+        let live_child = retiring_child
+            || live_tracee
             || children.iter().any(|key| {
                 self.tasks
                     .get(&key.id)
