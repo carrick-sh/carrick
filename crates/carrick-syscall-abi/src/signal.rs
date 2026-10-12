@@ -430,61 +430,8 @@ impl LinuxFpsimdContext {
     }
 }
 
-/// Magic value placed in `CarrickSigframe::magic` so `rt_sigreturn` can
-/// detect a misaligned / corrupt frame and refuse to restore garbage.
-pub const CARRICK_SIGFRAME_MAGIC: u64 = 0x4361_7272_6963_6b53; // 'CarrickS'
-
-/// Carrick's signal frame layout. `siginfo` and `ucontext` are placed FIRST
-/// (matching Linux's `struct rt_sigframe` order) because Rosetta's signal
-/// trampoline reconstructs the `siginfo` pointer with `mov x1, sp` — i.e. it
-/// assumes `siginfo` sits at `SP+0`. `inject_signal` sets x1/x2 via
-/// `offset_of!`, so glibc and Go are unaffected by the field ordering here.
-/// The private authentication fields (`magic`, `saved_x`, …) follow after and
-/// are consumed only by Carrick's own `rt_sigreturn` handler.
-#[repr(C, packed)]
-#[derive(
-    ::core::fmt::Debug,
-    ::core::clone::Clone,
-    ::core::marker::Copy,
-    ::core::cmp::PartialEq,
-    ::core::cmp::Eq,
-    ::zerocopy::FromBytes,
-    ::zerocopy::IntoBytes,
-    ::zerocopy::KnownLayout,
-    ::zerocopy::Immutable,
-    ::zerocopy::Unaligned,
-)]
-pub struct CarrickSigframe {
-    // siginfo / ucontext MUST be first — Rosetta trampoline: `mov x1, sp`.
-    pub siginfo: LinuxSiginfo,
-    pub ucontext: LinuxUcontext,
-    // Private authentication / restoration state follows.
-    pub magic: u64,
-    pub signum: u32,
-    pub _pad0: u32,
-    pub saved_x: [u64; 31],
-    pub saved_pc: u64,
-    pub saved_sp: u64,
-    pub saved_spsr: u64,
-    pub _reserved: [u64; 6],
-}
-
-impl CarrickSigframe {
-    pub const fn empty() -> Self {
-        Self {
-            siginfo: LinuxSiginfo::empty(),
-            ucontext: LinuxUcontext::empty(),
-            magic: CARRICK_SIGFRAME_MAGIC,
-            signum: 0,
-            _pad0: 0,
-            saved_x: [0; 31],
-            saved_pc: 0,
-            saved_sp: 0,
-            saved_spsr: 0,
-            _reserved: [0; 6],
-        }
-    }
-}
+/// Public ARM ESR extension tag, retained from Carrick's carrier encoder.
+pub const LINUX_AARCH64_ESR_MAGIC: u32 = 0x4553_5201;
 
 // ─── x86-64 rt_sigframe (M3d) ────────────────────────────────────────────────
 //

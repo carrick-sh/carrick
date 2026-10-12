@@ -18,6 +18,9 @@ workspace = true
 test-support = []
 
 [dependencies]
+# Pure no_std Linux signal-frame codec; no normal EL1 dependency.
+carrick-personality-linux = { path = "../carrick-personality-linux" }
+carrick-signal-core = { path = "../carrick-signal-core" }
 carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-abi = { path = "../carrick-abi" }

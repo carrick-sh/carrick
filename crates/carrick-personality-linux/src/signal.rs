@@ -3,6 +3,8 @@
 //! Authority: signal(7), fork(2), execve(2). The owner serializes dequeue
 //! and mask publication; signal-core supplies storage, not queue policy.
 
+pub mod arm;
+
 use alloc::collections::{BTreeMap, VecDeque};
 
 use carrick_signal_core::StandardSignalSlot;

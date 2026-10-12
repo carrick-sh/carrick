@@ -1,35 +1,26 @@
 //! Pure ARM frame publication used by the native backend and VM-free tests.
 use crate::isa::ArchError;
 use carrick_el1_abi::TrapFrame;
-use carrick_syscall_abi::CarrickSigframe;
+use carrick_personality_linux::signal::arm::{self, RtSigframe};
 
 pub(crate) fn restore(
     frame: &mut TrapFrame,
-    signal: &CarrickSigframe,
+    signal: &RtSigframe,
     fpstate: &mut [u8],
+    signal_sp: carrick_guest_arch::UserVa,
 ) -> Result<(u64, u64), ArchError> {
-    use carrick_syscall_abi::{CARRICK_SIGFRAME_MAGIC, LINUX_FPSIMD_MAGIC, LinuxFpsimdContext};
-    use zerocopy::FromBytes;
-    let context = signal.ucontext.uc_mcontext;
-    let fp_len = core::mem::size_of::<LinuxFpsimdContext>();
-    let fp_bytes = &context.__reserved[..fp_len];
-    let fp = LinuxFpsimdContext::read_from_bytes(fp_bytes).map_err(|_| ArchError::InvalidFrame)?;
-    // Validate the entire record before publishing registers or SIMD state.
-    if signal.magic != CARRICK_SIGFRAME_MAGIC
-        || !crate::isa::signal_resume_is_el0(context.pstate)
-        || fp.magic != LINUX_FPSIMD_MAGIC
-        || fp.size as usize != fp_len
-        || fpstate.len() != fp_len
-        || context.sp & 15 != 0
-        || context.pc & 3 != 0
-    {
+    use zerocopy::IntoBytes;
+    let resume =
+        arm::decode(signal.as_bytes(), signal_sp, true).map_err(|_| ArchError::InvalidFrame)?;
+    let fp = resume.fpsimd.ok_or(ArchError::InvalidFrame)?;
+    if fpstate.len() != fp.as_bytes().len() {
         return Err(ArchError::InvalidFrame);
     }
-    fpstate.copy_from_slice(fp_bytes);
-    frame.x = context.regs;
-    frame.elr = context.pc;
-    frame.spsr = context.pstate;
-    Ok((signal.ucontext.uc_sigmask, context.sp))
+    fpstate.copy_from_slice(fp.as_bytes());
+    frame.x = resume.regs;
+    frame.elr = resume.pc.raw();
+    frame.spsr = resume.pstate;
+    Ok((resume.mask.signals().bits(), resume.sp.raw()))
 }
 
 pub(crate) fn build(
@@ -37,40 +28,20 @@ pub(crate) fn build(
     params: carrick_personality_linux::signal::SignalFrameParams,
     siginfo: Option<&[u8]>,
     fpstate: &[u8],
-) -> Result<(carrick_guest_arch::UserVa, CarrickSigframe), ArchError> {
-    use carrick_syscall_abi::{LINUX_FPSIMD_MAGIC, LinuxFpsimdContext, LinuxSiginfo};
-    use zerocopy::FromBytes;
-    let fp = LinuxFpsimdContext::read_from_bytes(fpstate).map_err(|_| ArchError::InvalidFrame)?;
-    if !crate::isa::signal_resume_is_el0(frame.spsr)
-        || fp.magic != LINUX_FPSIMD_MAGIC
-        || fp.size as usize != core::mem::size_of::<LinuxFpsimdContext>()
-        || params.restorer.is_none()
-    {
+) -> Result<(carrick_guest_arch::UserVa, arm::SignalFrame), ArchError> {
+    use carrick_syscall_abi::{LinuxFpsimdContext, LinuxSiginfo, LinuxSignalContext};
+    use zerocopy::{FromBytes, IntoBytes};
+    if params.restorer.is_none() {
         return Err(ArchError::InvalidFrame);
     }
-    let new_sp = params
-        .sp
-        .raw()
-        .checked_sub(core::mem::size_of::<CarrickSigframe>() as u64)
-        .ok_or(ArchError::InvalidFrame)?
-        & !15;
-    let mut signal = CarrickSigframe::empty();
-    signal.signum = params.signal.number() as u32;
-    signal.saved_pc = frame.elr;
-    signal.saved_spsr = frame.spsr;
-    signal.saved_sp = params.sp.raw();
-    signal.saved_x = frame.x;
-    signal.ucontext.uc_sigmask = params.mask.signals().bits();
-    signal.ucontext.uc_stack = params.stack;
-    signal.ucontext.uc_mcontext.regs = frame.x;
-    signal.ucontext.uc_mcontext.pc = frame.elr;
-    signal.ucontext.uc_mcontext.sp = params.sp.raw();
-    signal.ucontext.uc_mcontext.pstate = frame.spsr;
-    signal.ucontext.uc_mcontext.fault_address = params.fault_addr;
-    signal.ucontext.uc_mcontext.__reserved[..fpstate.len()].copy_from_slice(fpstate);
-    signal._reserved[0] = frame.x[29];
-    signal._reserved[1] = frame.x[30];
-    signal.siginfo = if let Some(bytes) = siginfo {
+    let fp = LinuxFpsimdContext::read_from_bytes(fpstate).map_err(|_| ArchError::InvalidFrame)?;
+    let mut context = LinuxSignalContext::empty();
+    context.regs = frame.x;
+    context.pc = frame.elr;
+    context.sp = params.sp.raw();
+    context.pstate = frame.spsr;
+    context.fault_address = params.fault_addr;
+    let info = if let Some(bytes) = siginfo {
         LinuxSiginfo::read_from_bytes(bytes).map_err(|_| ArchError::InvalidFrame)?
     } else {
         let mut info = LinuxSiginfo::empty();
@@ -79,17 +50,24 @@ pub(crate) fn build(
         info.si_addr = params.fault_addr;
         info
     };
-    Ok((carrick_guest_arch::UserVa::new(new_sp), signal))
+    let signal = arm::encode(context, params.stack, params.mask, info, Some(fp), None)
+        .map_err(|_| ArchError::InvalidFrame)?;
+    let sp = arm::stack_pointer(params.sp, None, signal.as_bytes().len())
+        .map_err(|_| ArchError::InvalidFrame)?;
+    Ok((sp, signal))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carrick_syscall_abi::{CARRICK_SIGFRAME_MAGIC, LinuxFpsimdContext};
+    use carrick_guest_arch::UserVa;
+    use carrick_syscall_abi::LinuxFpsimdContext;
     use zerocopy::IntoBytes;
-    fn valid() -> CarrickSigframe {
-        let mut signal = CarrickSigframe::empty();
-        signal.magic = CARRICK_SIGFRAME_MAGIC;
+    fn valid() -> RtSigframe {
+        let mut signal = RtSigframe {
+            siginfo: carrick_syscall_abi::LinuxSiginfo::empty(),
+            ucontext: carrick_syscall_abi::LinuxUcontext::empty(),
+        };
         let fp = LinuxFpsimdContext::empty();
         signal.ucontext.uc_mcontext.__reserved[..fp.as_bytes().len()]
             .copy_from_slice(fp.as_bytes());
@@ -122,14 +100,14 @@ mod tests {
         };
         let (sp, signal) = build(&frame, params, None, fp.as_bytes()).unwrap();
         assert_eq!(sp.raw() & 15, 0);
-        let context = signal.ucontext.uc_mcontext;
+        let context = signal.rt.ucontext.uc_mcontext;
         let regs = context.regs;
         assert_eq!(regs[0], 42);
-        let record = signal._reserved;
+        let record = signal.frame_record;
         assert_eq!(&record[..2], &[0x8000, 0x9000]);
         assert_eq!(&context.__reserved[..528], fp.as_bytes());
         assert_eq!(&context.__reserved[528..536], &[0; 8]);
-        let mask = signal.ucontext.uc_sigmask;
+        let mask = signal.rt.ucontext.uc_sigmask;
         assert_eq!(mask, 8);
         assert!(
             build(
@@ -149,7 +127,7 @@ mod tests {
     fn ucontext_is_the_resume_authority() {
         let signal = valid();
         let mut frame = TrapFrame::default();
-        let (_, sp) = restore(&mut frame, &signal, &mut [0; 528]).unwrap();
+        let (_, sp) = restore(&mut frame, &signal, &mut [0; 528], UserVa::new(0x40000)).unwrap();
         assert_eq!(frame.x[0], 0x1234);
         assert_eq!(frame.elr, 0x10000);
         assert_eq!(sp, 0x20000);
@@ -161,7 +139,7 @@ mod tests {
         let mut frame = TrapFrame::default();
         let original = frame;
         assert_eq!(
-            restore(&mut frame, &signal, &mut [0; 528]),
+            restore(&mut frame, &signal, &mut [0; 528], UserVa::new(0x40000)),
             Err(ArchError::InvalidFrame)
         );
         assert_eq!(frame, original);
@@ -172,23 +150,36 @@ mod tests {
             let mut signal = valid();
             signal.ucontext.uc_mcontext.pstate = pstate;
             let mut output = [0x55; 528];
-            assert!(restore(&mut TrapFrame::default(), &signal, &mut output).is_err());
+            assert!(
+                restore(
+                    &mut TrapFrame::default(),
+                    &signal,
+                    &mut output,
+                    UserVa::new(0x40000)
+                )
+                .is_err()
+            );
             assert!(output.iter().all(|byte| *byte == 0x55));
         }
         let mut signal = valid();
         signal.ucontext.uc_mcontext.__reserved[4..8].copy_from_slice(&0_u32.to_le_bytes());
-        assert!(restore(&mut TrapFrame::default(), &signal, &mut [0; 528]).is_err());
+        assert!(
+            restore(
+                &mut TrapFrame::default(),
+                &signal,
+                &mut [0; 528],
+                UserVa::new(0x40000)
+            )
+            .is_err()
+        );
     }
 
     #[test]
-    fn frame_and_fpsimd_magic_are_required() {
+    fn fpsimd_magic_is_required() {
         let mut signal = valid();
         let mut frame = TrapFrame::default();
-        signal.magic = 0;
-        assert!(restore(&mut frame, &signal, &mut [0; 528]).is_err());
-        signal.magic = CARRICK_SIGFRAME_MAGIC;
         signal.ucontext.uc_mcontext.__reserved[0] ^= 1;
-        assert!(restore(&mut frame, &signal, &mut [0; 528]).is_err());
+        assert!(restore(&mut frame, &signal, &mut [0; 528], UserVa::new(0x40000)).is_err());
     }
     #[test]
     fn fpsimd_payload_is_restored() {
@@ -198,15 +189,103 @@ mod tests {
         let len = fp.as_bytes().len();
         signal.ucontext.uc_mcontext.__reserved[..len].copy_from_slice(fp.as_bytes());
         let mut output = [0; 528];
-        restore(&mut TrapFrame::default(), &signal, &mut output).unwrap();
+        restore(
+            &mut TrapFrame::default(),
+            &signal,
+            &mut output,
+            UserVa::new(0x40000),
+        )
+        .unwrap();
         assert_eq!(output.as_slice(), fp.as_bytes());
+    }
+
+    #[test]
+    fn arm_public_signal_frame_roundtrip_has_no_private_magic() {
+        let signal = valid();
+        assert_eq!(signal.as_bytes().len(), arm::PUBLIC_FRAME_LEN);
+        let mut frame = TrapFrame::default();
+        let mut output = [0; 528];
+        let (_, sp) = restore(&mut frame, &signal, &mut output, UserVa::new(0x40000))
+            .expect("a public Linux ucontext has no private authentication trailer");
+        assert_eq!(frame.x[0], 0x1234);
+        assert_eq!(frame.elr, 0x10000);
+        assert_eq!(sp, 0x20000);
+        assert_eq!(output.as_slice(), LinuxFpsimdContext::empty().as_bytes());
+    }
+
+    #[test]
+    fn arm_public_signal_frame_fpsimd_need_not_be_first() {
+        let mut signal = valid();
+        let records = &mut signal.ucontext.uc_mcontext.__reserved;
+        records.copy_within(0..528, 16);
+        records[..16].fill(0);
+        records[..4].copy_from_slice(&0x4553_5201_u32.to_le_bytes());
+        records[4..8].copy_from_slice(&16_u32.to_le_bytes());
+        assert!(
+            restore(
+                &mut TrapFrame::default(),
+                &signal,
+                &mut [0; 528],
+                UserVa::new(0x40000)
+            )
+            .is_ok()
+        );
+    }
+
+    fn refused_without_publication(signal: RtSigframe) {
+        let mut frame = TrapFrame::default();
+        frame.x[0] = 0x55;
+        let original = frame;
+        let mut fpstate = [0x55; 528];
+        assert_eq!(
+            restore(&mut frame, &signal, &mut fpstate, UserVa::new(0x40000)),
+            Err(ArchError::InvalidFrame)
+        );
+        assert_eq!(frame, original);
+        assert_eq!(fpstate, [0x55; 528]);
+    }
+
+    #[test]
+    fn arm_public_signal_frame_duplicate_fpsimd_is_refused() {
+        let mut signal = valid();
+        signal
+            .ucontext
+            .uc_mcontext
+            .__reserved
+            .copy_within(0..528, 528);
+        refused_without_publication(signal);
+    }
+
+    #[test]
+    fn arm_public_signal_frame_bad_record_lengths_are_refused() {
+        for size in [0_u32, 8, 15, 17, u32::MAX] {
+            let mut signal = valid();
+            let records = &mut signal.ucontext.uc_mcontext.__reserved;
+            records[528..532].copy_from_slice(&0x4553_5201_u32.to_le_bytes());
+            records[532..536].copy_from_slice(&size.to_le_bytes());
+            refused_without_publication(signal);
+        }
+    }
+
+    #[test]
+    fn arm_public_signal_frame_half_terminator_is_refused() {
+        let mut signal = valid();
+        signal.ucontext.uc_mcontext.__reserved[532..536].copy_from_slice(&16_u32.to_le_bytes());
+        refused_without_publication(signal);
+    }
+
+    #[test]
+    fn arm_public_signal_frame_missing_terminator_is_refused() {
+        let mut signal = valid();
+        let records = &mut signal.ucontext.uc_mcontext.__reserved;
+        records[528..532].copy_from_slice(&0x4553_5201_u32.to_le_bytes());
+        records[532..536].copy_from_slice(&3568_u32.to_le_bytes());
+        refused_without_publication(signal);
     }
 }
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 use carrick_guest_arch::UserVa;
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
-use carrick_syscall_abi::CarrickSigframe as Arm64Sigframe;
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -228,14 +307,14 @@ impl carrick_personality_linux::signal::SignalBackend for crate::isa::aarch64::A
             return Err(ArchError::InvalidFrame);
         }
 
-        let info_addr = new_sp + core::mem::offset_of!(Arm64Sigframe, siginfo) as u64;
-        let uc_addr = new_sp + core::mem::offset_of!(Arm64Sigframe, ucontext) as u64;
+        let info_addr = new_sp;
+        let uc_addr = new_sp + arm::UCONTEXT_OFFSET as u64;
 
         frame.elr = params.handler.raw();
         frame.x[0] = params.signal.number() as u64;
         frame.x[1] = info_addr;
         frame.x[2] = uc_addr;
-        frame.x[29] = new_sp + core::mem::offset_of!(Arm64Sigframe, _reserved) as u64;
+        frame.x[29] = new_sp + arm::FRAME_RECORD_OFFSET as u64;
         frame.x[30] = params.restorer.ok_or(ArchError::InvalidFrame)?.raw();
 
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -258,15 +337,15 @@ impl carrick_personality_linux::signal::SignalBackend for crate::isa::aarch64::A
         let sp_val = 0u64;
 
         let sp = UserVa::new(sp_val);
-        let mut bytes = [0u8; core::mem::size_of::<Arm64Sigframe>()];
+        let mut bytes = [0u8; arm::PUBLIC_FRAME_LEN];
         if !copy_in(&mut bytes, sp) {
             return Err(ArchError::InvalidFrame);
         }
-        let Some(sigframe) = Arm64Sigframe::read_from_bytes(&bytes).ok() else {
+        let Some(sigframe) = RtSigframe::read_from_bytes(&bytes).ok() else {
             return Err(ArchError::InvalidFrame);
         };
 
-        let (mask, saved_sp) = restore(frame, &sigframe, _fpstate)?;
+        let (mask, saved_sp) = restore(frame, &sigframe, _fpstate, sp)?;
 
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         unsafe {
