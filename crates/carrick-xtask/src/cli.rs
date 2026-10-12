@@ -26,6 +26,8 @@ pub enum Commands {
     Info,
     #[command(about = "Prove unit shards preserve every unsharded Cargo test selection")]
     CheckTestShards,
+    #[command(about = "Compile all recipe lanes once and run their test binaries")]
+    TestBatch(crate::test_batch::TestBatchArgs),
     #[command(about = "Package a guest carrier image for an arbitrary composition root")]
     PackageGuestImage(crate::guest_image::PackageGuestImageArgs),
 
@@ -328,6 +330,10 @@ where
         }
     }
     match cli.command {
+        Commands::TestBatch(args) => {
+            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
+            crate::test_batch::run(&root, args).map_err(|e| CliError::TestShards(e.to_string()))
+        }
         Commands::CheckTestShards => {
             let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
             let report = crate::test_shards::check(&root)

@@ -437,8 +437,11 @@ test *ARGS: _test-stdio
 
 # Unit groups are whole Cargo selections: newly added tests stay selected.
 test-shard-a *ARGS: _test-stdio
-    just --justfile {{justfile()}} _test-unit-workspace {{ARGS}}
-    just --justfile {{justfile()}} _test-unit-lanes {{ARGS}}
+    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-lanes -- {{ARGS}}
+
+# Workspace compilation no longer shares the critical-path job with host lanes.
+test-shard-e *ARGS: _test-stdio
+    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-workspace -- {{ARGS}}
 
 test-shard-b *ARGS: _test-stdio
     just --justfile {{justfile()}} _test-unit-mm-owner {{ARGS}}
@@ -719,6 +722,9 @@ doc *ARGS:
 test-integration:
     #!/usr/bin/env bash
     set -euo pipefail
+    if [ -z "${CARRICK_TEST_CAPTURE-}" ]; then
+        exec {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch test-integration
+    fi
     if [ "{{os()}}" = "macos" ]; then
         {{_admit}} {{_cargo}} test -p carrick-runtime --test integration
         # The kernel/dispatch half of that suite: every case that names no
