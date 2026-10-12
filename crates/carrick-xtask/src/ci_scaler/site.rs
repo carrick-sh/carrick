@@ -40,6 +40,9 @@ pub(super) struct Site {
     pub node: &'static str,
     /// Name on the node's PVE certificate; resolved to 127.0.0.1.
     pub api_host: &'static str,
+    /// CA that signs the API certificate, when the system store does not
+    /// (a PVE cluster CA). `None` = system trust (Willow's ACME certificate).
+    pub api_ca: Option<&'static str>,
     /// Storage holding template 300 and its linked clones.
     pub storage: &'static str,
     pub headroom: Headroom,
@@ -56,6 +59,7 @@ pub(super) struct Site {
 pub(super) const WILLOW: Site = Site {
     node: "willow",
     api_host: "willow.atxconsulting.com",
+    api_ca: None,
     storage: "local-lvm",
     headroom: Headroom::LvmThin { pool: "pve/data" },
     bridge: "vmbr0",
@@ -71,6 +75,7 @@ pub(super) const WILLOW: Site = Site {
 pub(super) const CONTABO: Site = Site {
     node: "m28112",
     api_host: "m28112.contaboserver.net",
+    api_ca: Some("/etc/pve/pve-root-ca.pem"),
     storage: "local",
     headroom: Headroom::Directory,
     bridge: "vmbr1",
@@ -228,7 +233,7 @@ impl Site {
             Headroom::Directory => "qcow2",
         };
         Ok(format!(
-            "SITE_NODE={}\nSITE_API_HOST={}\nSITE_STORAGE={}\nSITE_DISK_FORMAT={disk_format}\nSITE_BRIDGE={}\nSITE_CORES={}\nSITE_MEMORY_MIB={}\nSITE_DISK_GIB={}\nSITE_TEMPLATE_IPCONFIG={}\nSITE_NAMESERVER={}\nSITE_VM_FIREWALL={}\n",
+            "SITE_NODE={}\nSITE_API_HOST={}\nSITE_STORAGE={}\nSITE_DISK_FORMAT={disk_format}\nSITE_BRIDGE={}\nSITE_CORES={}\nSITE_MEMORY_MIB={}\nSITE_DISK_GIB={}\nSITE_TEMPLATE_IPCONFIG={}\nSITE_NAMESERVER={}\nSITE_VM_FIREWALL={}\nSITE_API_CA={}\n",
             self.node,
             self.api_host,
             self.storage,
@@ -239,6 +244,7 @@ impl Site {
             self.ipconfig(300)?,
             self.nameserver().unwrap_or("none"),
             u8::from(self.isolates_bridge()),
+            self.api_ca.unwrap_or("system"),
         ))
     }
 }
@@ -309,6 +315,7 @@ mod tests {
             Site {
                 node: "willow",
                 api_host: "willow.atxconsulting.com",
+                api_ca: None,
                 storage: "local-lvm",
                 headroom: Headroom::LvmThin { pool: "pve/data" },
                 bridge: "vmbr0",
@@ -339,6 +346,7 @@ mod tests {
             Site {
                 node: "m28112",
                 api_host: "m28112.contaboserver.net",
+                api_ca: Some("/etc/pve/pve-root-ca.pem"),
                 storage: "local",
                 headroom: Headroom::Directory,
                 bridge: "vmbr1",
@@ -381,7 +389,7 @@ OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n
     fn template_builder_inputs_are_bare_tokens() {
         assert_eq!(
             WILLOW.shell_env().unwrap(),
-            "SITE_NODE=willow\nSITE_API_HOST=willow.atxconsulting.com\nSITE_STORAGE=local-lvm\nSITE_DISK_FORMAT=raw\nSITE_BRIDGE=vmbr0\nSITE_CORES=2\nSITE_MEMORY_MIB=4096\nSITE_DISK_GIB=64\nSITE_TEMPLATE_IPCONFIG=ip=dhcp\nSITE_NAMESERVER=none\nSITE_VM_FIREWALL=0\n"
+            "SITE_NODE=willow\nSITE_API_HOST=willow.atxconsulting.com\nSITE_STORAGE=local-lvm\nSITE_DISK_FORMAT=raw\nSITE_BRIDGE=vmbr0\nSITE_CORES=2\nSITE_MEMORY_MIB=4096\nSITE_DISK_GIB=64\nSITE_TEMPLATE_IPCONFIG=ip=dhcp\nSITE_NAMESERVER=none\nSITE_VM_FIREWALL=0\nSITE_API_CA=system\n"
         );
         for site in SITES {
             for line in site.shell_env().unwrap().lines() {
