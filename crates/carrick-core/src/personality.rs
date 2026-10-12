@@ -60,6 +60,7 @@ impl core::fmt::Display for ThreadKey {
 pub struct CallContext<'a, A: EntryArch> {
     arch: &'a mut A,
     frame: &'a A::NativeFrame,
+    pub(crate) file_service: Option<&'a mut dyn crate::file::FileService>,
 }
 
 impl<'a, A: EntryArch> CallContext<'a, A>
@@ -68,7 +69,17 @@ where
 {
     /// Create a new call context wrapping the architecture backend and native entry frame.
     pub fn new(arch: &'a mut A, frame: &'a A::NativeFrame) -> Self {
-        Self { arch, frame }
+        Self {
+            arch,
+            frame,
+            file_service: None,
+        }
+    }
+
+    /// Bind the carrier's file authority for this call.
+    pub fn with_files(mut self, service: &'a mut dyn crate::file::FileService) -> Self {
+        self.file_service = Some(service);
+        self
     }
 
     /// Access the native entry frame.
@@ -93,6 +104,11 @@ impl<'a, A: EntryArch + MmuArch + DefaultMmOwner> CallContext<'a, A>
 where
     ServiceError: From<A::Error>,
 {
+    /// Access the neutral file service, or typed Unsupported when unbound.
+    pub fn files<'s>(&'s mut self) -> crate::file::Files<'s, 'a, A> {
+        crate::file::Files::new(self)
+    }
+
     /// Access user memory for copying data in or out under the architecture's default MM owner.
     pub fn user<'s>(&'s mut self) -> UserMemory<'s, A> {
         UserMemory::new(self.arch)

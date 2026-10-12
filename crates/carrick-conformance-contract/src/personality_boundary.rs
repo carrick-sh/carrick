@@ -120,6 +120,18 @@ pub const FORBIDDEN_ERRNO_SYMBOLS: &[&str] = &[
     "SIGSTOP",
     "FD_CLOEXEC",
     "O_CLOEXEC",
+    "O_RDONLY",
+    "O_WRONLY",
+    "O_RDWR",
+    "O_APPEND",
+    "O_CREAT",
+    "O_TRUNC",
+    "O_EXCL",
+    "O_DIRECTORY",
+    "O_NOFOLLOW",
+    "ENOENT",
+    "ENAMETOOLONG",
+    "ESTALE",
     "EFD_SEMAPHORE",
     "EFD_NONBLOCK",
     "EFD_CLOEXEC",
@@ -2398,6 +2410,17 @@ mod tests {
         let parsed = syn::parse_file(code).unwrap();
         visitor.visit_file(&parsed);
         assert_eq!(visitor.violations.len(), 0);
+    }
+
+    #[test]
+    fn neutral_file_seam_rejects_personality_open_flags() {
+        for symbol in ["O_RDONLY", "O_CREAT", "O_APPEND", "ENOENT", "ESTALE"] {
+            let code = format!("pub fn open() {{ let _ = {symbol}; }}");
+            let mut visitor = make_test_visitor(&code);
+            visitor.visit_file(&syn::parse_file(&code).unwrap());
+            assert!(!visitor.violations.is_empty(), "accepted {symbol}");
+        }
+        assert!(DEFAULT_SUBSTRATE_ALLOWLIST.contains(&"carrick-personality-api"));
     }
 
     fn make_test_visitor<'a>(code: &'a str) -> SourceCheckerVisitor<'a> {

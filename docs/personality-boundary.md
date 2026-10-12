@@ -130,3 +130,31 @@ this extraction; their remaining dependency closure is tracked in #237.
 
 `carrick-personality-api` re-exports the neutral failure reason for personality
 lifecycle interfaces; transport consumers use its defining core-abi owner.
+
+## Neutral file seam (F0, #224)
+
+`carrick-personality-api::file` re-exports `carrick-core::file`. A carrier
+binds one `FileService` to a `CallContext` with `with_files`; unbound calls
+return `IoError::Unsupported`. `cx.files()` copies positional I/O through
+`cx.user()` using a bounded 64 KiB scratch buffer. Larger single transfers
+are refused with `TooLarge`; personalities may submit bounded operations.
+
+`FileRoot`, `FileIdentity` and `FilePinKey` are separate backend-issued
+key domains. Backends authenticate their scope. Pins are non-cloning and
+have no destructor; explicit release consumes the pin and retires the backend
+record. A caller cannot reuse the consumed pin. Backends must refuse stale or
+foreign keys with `Stale`. Pending release will own the pin's retirement custody.
+
+`FileOperation::Pending(FilePending)` reserves the owned-continuation API.
+F0 cannot construct a pending value. F4 will put owned buffers, the original
+operation's progress, and completion authority in the private representation,
+without borrowing a call context or retaining a vCPU lease. Read continuations
+must also own the guest destination and arrange copy-out when resumed. Adding
+host crossing or suspension is outside F0.
+
+`NamePath` permits an empty sequence to name the capability root, but rejects
+empty individual components. The boundary gate scans core and the facade and
+rejects personality open flags and errno symbols. Pure type tests cover name
+validation, request construction and exhaustive neutral errors. Behavioral
+red-first witnesses belong to F1/F4 against the real zone/crossing backend;
+F0 deliberately supplies no second file implementation.

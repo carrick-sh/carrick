@@ -1,0 +1,14 @@
+schema_version = 1
+id = "core.personality.files"
+title = "Neutral file service vocabulary"
+guest_surfaces = ["personality:files"]
+semantic_authority = ["Issue #224 owner decisions: capability authorization and owned continuations; director F0 scope decision: types and API only"]
+fixture = "carrick-core:file::tests"
+scale_points = [1]
+rationale = "F0 establishes types without a file implementation. Pure type tests prove validated components, request construction and exhaustive errors. Behavioral red-first evidence belongs to F1/F4 against the real backend."
+structural_budgets = []
+[bindings]
+vm_free = "carrick-core::file::tests"
+[bindings.unresolved]
+embed_structural = "Real zone/crossing backend witnesses belong to F1/F4."
+docker = "No Linux lowering or backend implementation is added in F0."
