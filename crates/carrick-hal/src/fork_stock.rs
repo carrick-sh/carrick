@@ -27,6 +27,15 @@ use carrick_el1_abi::{
 use carrick_guest_arch::{AddressContext, Asid, CpuId, RootGpa};
 
 use crate::asid::{AsidAllocator, AsidError, AsidGeneration};
+pub use carrick_observability::compat::{
+    ForkAdmissionRefusal, ForkCapacityResource, ForkQuarantineState,
+};
+
+#[derive(Debug, Default)]
+struct QuarantinedChild {
+    released: bool,
+    absent: bool,
+}
 
 /// Bytes in one loaned page-table page.
 const TABLE_PAGE_BYTES: u64 = 4096;
@@ -475,7 +484,8 @@ pub struct ForkStock<T: ChildAddressTags> {
     committed_tables: BTreeMap<MmKey, Vec<RootGpa>>,
     /// Quarantined children; `true` once their carrier release succeeded,
     /// so a later reclaim never releases the same MM twice.
-    quarantine: BTreeMap<MmKey, bool>,
+    quarantine: BTreeMap<MmKey, QuarantinedChild>,
+    last_refusal: Option<ForkAdmissionRefusal>,
     tags: T,
     counters: ForkStockCounters,
 }
@@ -492,6 +502,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
             children: BTreeMap::new(),
             committed_tables: BTreeMap::new(),
             quarantine: BTreeMap::new(),
+            last_refusal: None,
             tags,
             counters: ForkStockCounters::default(),
         }
@@ -597,6 +608,43 @@ impl<T: ChildAddressTags> ForkStock<T> {
         Ok(())
     }
 
+    /// Last refusal retained for a carrier's structured run report.
+    pub fn admission_refusal(&self) -> Option<ForkAdmissionRefusal> {
+        self.last_refusal.clone()
+    }
+
+    fn record_capacity(&mut self, exchange: &ForkStockExchange, resource: ForkCapacityResource) {
+        if let Some(request) = exchange.request() {
+            let record = ForkAdmissionRefusal {
+                resource,
+                child_pages: request.child_bytes / TABLE_PAGE_BYTES,
+                parent_pages: request.parent_bytes / TABLE_PAGE_BYTES,
+                available_pages: self.tables.len(),
+                available_lifecycles: self.lifecycles.len(),
+                quarantine: self
+                    .quarantine
+                    .iter()
+                    .map(|(mm, state)| ForkQuarantineState {
+                        mm: mm.0.get(),
+                        absent: state.absent,
+                        carrier_released: state.released,
+                    })
+                    .collect(),
+            };
+            carrick_observability::probes::fork_admission_refusal(&record);
+            self.last_refusal = Some(record);
+        }
+    }
+
+    fn refuse_capacity(
+        &mut self,
+        exchange: &mut ForkStockExchange,
+        resource: ForkCapacityResource,
+    ) -> Result<ForkStockLoan, ForkStockRefusal> {
+        self.record_capacity(exchange, resource);
+        self.refuse(exchange, ForkStockRefusal::Capacity)
+    }
+
     fn refuse(
         &mut self,
         exchange: &mut ForkStockExchange,
@@ -638,30 +686,33 @@ impl<T: ChildAddressTags> ForkStock<T> {
         if index >= self.pending.len() {
             self.pending.resize(index + 1, None);
         }
-        if self.pending[index].is_some() || self.lifecycles.is_empty() {
-            return self.refuse(exchange, ForkStockRefusal::Capacity);
+        if self.pending[index].is_some() {
+            return self.refuse_capacity(exchange, ForkCapacityResource::PendingLoan);
+        }
+        if self.lifecycles.is_empty() {
+            return self.refuse_capacity(exchange, ForkCapacityResource::Lifecycle);
         }
         let Some((child_tables, parent_tables)) =
             take_fork_table_stock(&mut self.tables, request.child_bytes, request.parent_bytes)
         else {
-            return self.refuse(exchange, ForkStockRefusal::Capacity);
+            return self.refuse_capacity(exchange, ForkCapacityResource::Tables);
         };
         let Some(next) = self.next_loan.checked_add(1) else {
             self.tables.extend(child_tables);
             self.tables.extend(parent_tables);
-            return self.refuse(exchange, ForkStockRefusal::Capacity);
+            return self.refuse_capacity(exchange, ForkCapacityResource::LoanIdentity);
         };
         let Some(tag) = self.tags.allocate() else {
             self.tables.extend(child_tables);
             self.tables.extend(parent_tables);
-            return self.refuse(exchange, ForkStockRefusal::Capacity);
+            return self.refuse_capacity(exchange, ForkCapacityResource::AddressTag);
         };
         let Some(lifecycle) = self.lifecycles.pop() else {
             self.tables.extend(child_tables);
             self.tables.extend(parent_tables);
             // A failed tag release still answers the guest with a refusal.
             let released = self.tags.release_unpublished(tag);
-            let refused = self.refuse(exchange, ForkStockRefusal::Capacity);
+            let refused = self.refuse_capacity(exchange, ForkCapacityResource::Lifecycle);
             return released.map_err(|_| ForkStockRefusal::Invalid).and(refused);
         };
         let id = self.next_loan;
@@ -710,6 +761,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
         let mut charged = 0;
         for (page, mm) in charges {
             if !ledger.grant(page, mm) {
+                self.record_capacity(exchange, ForkCapacityResource::Ledger);
                 return self.restore_and_refuse(
                     ledger,
                     exchange,
@@ -963,7 +1015,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
         if !retire.accept() {
             return Err(ForkStockServiceError::InvalidRecord);
         }
-        self.quarantine.insert(key, false);
+        self.quarantine.insert(key, QuarantinedChild::default());
         self.counters.quarantined_children = self.counters.quarantined_children.saturating_add(1);
         Ok(())
     }
@@ -995,6 +1047,9 @@ impl<T: ChildAddressTags> ForkStock<T> {
                 (absence.mm().raw() == key.0.get()).then_some((key, absence))
             })
             .collect();
+        for (key, state) in &mut self.quarantine {
+            state.absent = candidates.iter().any(|(candidate, _)| candidate == key);
+        }
         let mut reclaimed = 0;
         for (key, absence) in candidates {
             let mm = key.mm().ok_or(ForkStockServiceError::InvalidRecord)?;
@@ -1014,10 +1069,18 @@ impl<T: ChildAddressTags> ForkStock<T> {
             // a failed step defers only this child: it stays quarantined, its
             // stock stays held, the deferral is counted, and the next drain
             // retries it. Guest behaviour never turns into a carrier fault.
-            let deferred = if self.quarantine.get(&key) == Some(&false) && !release(&absence) {
+            let deferred = if self
+                .quarantine
+                .get(&key)
+                .is_some_and(|state| !state.released)
+                && !release(&absence)
+            {
                 true
             } else {
-                self.quarantine.insert(key, true);
+                self.quarantine
+                    .get_mut(&key)
+                    .ok_or(ForkStockServiceError::InvalidRecord)?
+                    .released = true;
                 !clear_tables(pages)
                     || !clear_lifecycle(child.lifecycle)
                     || self.tags.retire(child.tag, absence).is_err()
