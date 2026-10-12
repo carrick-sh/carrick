@@ -6,10 +6,19 @@
 use crate::lock::SpinLock;
 use core::alloc::Layout;
 
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[cfg(any(
+    all(test, not(target_os = "none")),
+    all(target_os = "none", target_arch = "aarch64")
+))]
 unsafe fn metadata_zone_at<'a>(base: *const u8) -> &'a carrick_el1_abi::ZoneTables {
     // SAFETY: the caller supplies the mapped, aligned zone for this lifetime.
     unsafe { &*base.cast::<carrick_el1_abi::ZoneTables>() }
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+unsafe fn metadata_zone_at<'a>(base: *const u8) -> &'a carrick_sched_core::ZoneTables {
+    // SAFETY: the CPL0 image retains the default ThreadCtx zone layout.
+    unsafe { &*base.cast::<carrick_sched_core::ZoneTables>() }
 }
 
 pub use carrick_core::mm::capacity::*;
