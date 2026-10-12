@@ -1,6 +1,6 @@
 # Carrick Crate Map
 
-Carrick is a 51-crate Cargo workspace. The product path is:
+Carrick is a 52-crate Cargo workspace. The product path is:
 
 ```text
 carrick-cli   -> carrick-engine -> { carrick-image, carrick-runtime -> carrick-kernel -> carrick-vfs } -> carrick-spec
@@ -16,6 +16,14 @@ containers in one host process are not yet public embed features.
 Platform code is selected by Cargo features. The default feature is
 `platform-macos`; non-macOS builds use `--no-default-features` plus exactly one
 `platform-*` feature.
+
+**Personality-neutral split: in progress.** The shared kernel is meant to be
+personality-neutral, with Linux as one personality
+(`carrick-personality-linux`), but the split is not finished
+(carrick-sh/carrick#237). Today `carrick-el1` and `carrick-el1-abi` still
+depend directly on `carrick-personality-linux`
+(`cargo tree -e normal -p carrick-el1-abi --prefix none | grep carrick-`
+lists it). Do not read the crate map as a completed neutral/Linux layering.
 
 ## Product and Runtime
 
@@ -49,6 +57,7 @@ Platform code is selected by Cargo features. The default feature is
 | `carrick-mem` | Guest address-space construction: ELF layout, boot identity/hvpatch tables, trampolines, VDSO/vvar, region helpers. |
 | `carrick-mmu-core` | `no_std` + `alloc` MMU management substrate and stage-1 page-table manipulation algorithms (AArch64 `PageTableManager`). |
 | `carrick-observability` | Platform-neutral compat-reporting support. |
+| `carrick-personality-api` | `no_std` pure re-export of the personality-facing items from `carrick-core`, `carrick-core-abi`, `carrick-guest-arch` and `carrick-sched-core` (the `Personality` trait, thread-pointer register selections, hardware-boundary types, neutral task identity). Out-of-tree personalities build only on this crate; the `check-personality-boundary` bin in `carrick-conformance-contract` (run from the `just lint-domains` source gate) checks its dependency closure. |
 | `carrick-personality-linux` | Linux interpretation of neutral owner records, shared by host and EL1. |
 | `carrick-pipe-core` | Allocation-free pipe and event counter substrate over shared or local records. |
 | `carrick-sched-core` | `no_std` in-guest scheduling core shared by guest EL1 and the host: the zone of futex-parked threads (records whose claim word names their one owner, hash-bucket wait queues, per-vCPU-slot run queues), laid out `repr(C)` in the shared EL1 region. |
