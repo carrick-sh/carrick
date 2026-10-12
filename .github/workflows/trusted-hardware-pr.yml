@@ -1,0 +1,24 @@
+# A separate workflow file is required because a same-named job inside a workflow
+# that also runs on merge_group would be skipped there, and a skipped required
+# check counts as passing.
+#
+# Having this placeholder trigger only on pull_request ensures pull requests
+# satisfy the required check name while the merge queue re-evaluates it on real
+# hardware via .github/workflows/kernel-runtime.yml.
+
+name: Trusted hardware (PR placeholder)
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  trusted-hardware-ok:
+    name: Trusted hardware OK
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: |
+          echo "Trusted hardware lanes (HVF signed + KVM) run only in the merge queue: .github/workflows/kernel-runtime.yml. This placeholder lets a pull request satisfy the required check name; the merge group re-evaluates it on real hardware."
