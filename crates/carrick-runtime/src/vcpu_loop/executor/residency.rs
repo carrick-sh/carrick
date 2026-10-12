@@ -345,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn recycled_owner_wait_record_resumes_a_completed_futex_without_an_owner_continuation() {
+    fn recycled_owner_wait_record_restores_one_root_to_both_halves() {
         let (zone, retired) = exercise_zone_wakes(true);
         let record = zone
             .alloc_record(ThreadIdentity {
@@ -363,6 +363,12 @@ mod tests {
         assert_eq!(reference.id, retired.id, "exercise actual slot reuse");
         assert_ne!(reference, retired, "the allocation has a fresh incarnation");
         let mut saved = pending_read();
+        let GuestCpuState::Aarch64V1(cpu) = &mut saved else {
+            panic!("AArch64 fixture");
+        };
+        let cpu = std::sync::Arc::make_mut(cpu);
+        cpu.ttbr0 = 0x4000;
+        cpu.ttbr1 = 0x8000;
         let ctx = crate::vcpu_loop::zone::zone_ctx_from_state(
             &saved,
             crate::vcpu_loop::zone::ZoneExit::Syscall { completed: true },
@@ -371,7 +377,7 @@ mod tests {
         // SAFETY: the freshly allocated record has not been published.
         unsafe {
             *zone.record(record).ctx_mut() =
-                carrick_el1_abi::Aarch64ParkedContext::from_register(ctx, 0, 1, 1)
+                carrick_el1_abi::Aarch64ParkedContext::from_register(ctx, 0x4000, 1, 1)
         };
         let GuestCpuState::Aarch64V1(cpu) = &mut saved else {
             panic!("AArch64 fixture");
@@ -416,6 +422,14 @@ mod tests {
         assert!(cpu.syscall_continuation.is_none());
         assert_eq!((cpu.trap_pc, cpu.trap_pstate), (ctx.pc, ctx.pstate));
         assert_eq!(cpu.gprs, ctx.x);
+        assert_eq!(
+            cpu.ttbr0, 0x4000,
+            "resume the parked caller's published root"
+        );
+        assert_eq!(
+            cpu.ttbr1, 0x4000,
+            "both halves use the parked caller's root"
+        );
         assert!(!zone.record(record).has_object_operation());
         zone.free_record(record);
         assert!(zone.live(reference).is_none());
