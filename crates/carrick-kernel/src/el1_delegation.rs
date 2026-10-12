@@ -85,6 +85,7 @@ pub fn publish_current_task(
     generation: u64,
     file_table: u64,
     visible_pid: u32,
+    root_generation: carrick_el1_abi::ContextGeneration,
 ) {
     if file_table == 0 {
         TABLELESS_PUBLISHES.fetch_add(1, Ordering::Relaxed);
@@ -112,6 +113,7 @@ pub fn publish_current_task(
         .file_table
         .store(file_table, Ordering::Relaxed);
     current_task.publish_visible_pid(visible_pid);
+    current_task.publish_root_generation(root_generation);
     current_task
         .execution
         .generation

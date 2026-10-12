@@ -20,6 +20,8 @@
 
 #![no_std]
 
+pub use carrick_guest_arch::ContextGeneration;
+
 mod cow_grants;
 pub use cow_grants::*;
 mod descriptor_txn;
@@ -693,6 +695,7 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(CurrentTask, mm.thread_generation) as u64,
         core::mem::offset_of!(CurrentTask, metadata.lifecycle_page) as u64,
         core::mem::offset_of!(CurrentTask, metadata.control_slot) as u64,
+        core::mem::offset_of!(CurrentTask, root_generation) as u64,
         core::mem::size_of::<MetadataGrantMailbox>() as u64,
         core::mem::align_of::<MetadataGrantMailbox>() as u64,
         core::mem::offset_of!(MetadataGrantMailbox, request_generation) as u64,
@@ -1067,7 +1070,8 @@ pub struct CurrentTask {
     pub linux: LinuxTaskState,
     pub mm: ExecutionMm,
     pub metadata: LinuxTaskMetadata,
-    _stride_padding: [u64; 5],
+    root_generation: AtomicU64,
+    _stride_padding: [u64; 4],
 }
 
 pub const CURRENT_TASK_STRIDE_SHIFT: u32 = 7;
@@ -1087,6 +1091,7 @@ const _: () = {
     assert!(core::mem::offset_of!(CurrentTask, metadata.lifecycle_page) == 64);
     assert!(core::mem::offset_of!(CurrentTask, metadata.control_slot) == 72);
     assert!(core::mem::offset_of!(CurrentTask, metadata.visible_pid) == 80);
+    assert!(core::mem::offset_of!(CurrentTask, root_generation) == 88);
 };
 
 impl CurrentTask {
@@ -1096,7 +1101,8 @@ impl CurrentTask {
             linux: LinuxTaskState::new(),
             mm: ExecutionMm::new(),
             metadata: LinuxTaskMetadata::new(),
-            _stride_padding: [0; 5],
+            root_generation: AtomicU64::new(0),
+            _stride_padding: [0; 4],
         }
     }
 
@@ -1158,6 +1164,18 @@ impl CurrentTask {
         (pid != 0).then_some(pid)
     }
 
+    /// The exact incarnation of the host-loaded ARM translation root.
+    /// A scheduler record's incarnation and execution generation are separate.
+    pub fn root_generation(&self) -> Option<carrick_guest_arch::ContextGeneration> {
+        core::num::NonZeroU64::new(self.root_generation.load(Ordering::Acquire))
+            .map(carrick_guest_arch::ContextGeneration::new)
+    }
+
+    pub fn publish_root_generation(&self, generation: carrick_guest_arch::ContextGeneration) {
+        self.root_generation
+            .store(generation.raw().get(), Ordering::Release);
+    }
+
     #[inline]
     pub fn clear(&self) {
         self.linux.file_table.store(0, Ordering::Release);
@@ -1169,6 +1187,7 @@ impl CurrentTask {
         self.linux.served_with_work.store(0, Ordering::Release);
         self.mm.key.store(0, Ordering::Release);
         self.mm.thread_generation.store(0, Ordering::Release);
+        self.root_generation.store(0, Ordering::Release);
         self.publish_lifecycle(0, 0);
         self.publish_visible_pid(0);
     }
@@ -3727,7 +3746,7 @@ impl Default for InotifyNameCache {
 const _: () = {
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
-    assert!(EL1_ABI_LAYOUT_HASH == 0x1a753d6f24969197);
+    assert!(EL1_ABI_LAYOUT_HASH == 0xd42665b03443920f);
     assert!(
         EL1_APERTURE_CONTROL_OFFSET.is_multiple_of(core::mem::align_of::<ApertureControl>() as u64)
     );
@@ -4068,16 +4087,21 @@ mod tests {
         assert_eq!(task.execution.task.load(Ordering::Relaxed), 0);
         assert_eq!(task.execution.generation.load(Ordering::Relaxed), 0);
         assert_eq!(task.linux.file_table.load(Ordering::Relaxed), 0);
+        assert_eq!(task.root_generation(), None);
 
         task.set(El1TaskId::from_linux_tid(7), 42, 100);
         assert_eq!(task.execution.task.load(Ordering::Relaxed), 7);
         assert_eq!(task.execution.generation.load(Ordering::Relaxed), 42);
         assert_eq!(task.linux.file_table.load(Ordering::Relaxed), 100);
+        let root = ContextGeneration::new(core::num::NonZeroU64::new(101).unwrap());
+        task.publish_root_generation(root);
+        assert_eq!(task.root_generation(), Some(root));
 
         task.clear();
         assert_eq!(task.execution.task.load(Ordering::Relaxed), 0);
         assert_eq!(task.execution.generation.load(Ordering::Relaxed), 0);
         assert_eq!(task.linux.file_table.load(Ordering::Relaxed), 0);
+        assert_eq!(task.root_generation(), None);
     }
 
     #[test]
@@ -5171,13 +5195,15 @@ mod layout_manifest {
                      linux: _,
                      mm: _,
                      metadata: _,
+                     root_generation: _,
                      _stride_padding: _,
                  }: CurrentTask| {};
         field!(CurrentTask, execution, ExecutionIdentity, 0, 16, 8);
         field!(CurrentTask, linux, LinuxTaskState, 16, 32, 8);
         field!(CurrentTask, mm, ExecutionMm, 48, 16, 8);
         field!(CurrentTask, metadata, LinuxTaskMetadata, 64, 24, 8);
-        field!(CurrentTask, _stride_padding, [u64; 5], 88, 40, 8);
+        field!(CurrentTask, root_generation, AtomicU64, 88, 8, 8);
+        field!(CurrentTask, _stride_padding, [u64; 4], 96, 32, 8);
     }
 
     #[test]

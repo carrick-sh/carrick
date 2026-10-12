@@ -321,6 +321,7 @@ impl Fixture {
             mm: MmGeneration::new(NonZeroU64::new(1).unwrap()),
             generation: ContextGeneration::new(NonZeroU64::new(101).unwrap()),
         };
+        task.publish_root_generation(address.generation);
 
         let slot = SlotId::new(0);
         let ttbr0 = (u64::from(asid.raw()) << 48) | root_gpa;
@@ -429,6 +430,44 @@ fn native_process_entry_uses_parked_root_generation_after_record_reuse() {
         unsafe { observed_entry_address(source, &fixture.task, other_root, record) },
         Err(NativeProcessError::Stale)
     ));
+}
+
+#[test]
+fn first_process_call_acquires_a_root_authenticated_home_record() {
+    let fixture = Fixture::new(0x10000, asid(1));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let record = fixture.zone.slot(fixture.slot).host_record().unwrap();
+    assert!(fixture.zone.release_host_home(fixture.slot, record));
+    assert!(fixture.zone.slot(fixture.slot).host_record().is_none());
+    let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
+    let record = process_record_for_call(source, &fixture.task, ThreadCtx::ZERO, ttbr0).unwrap();
+    let parked = unsafe { fixture.zone.record(record).ctx_mut() };
+    assert_eq!(parked.address_context(), Some(fixture.address));
+}
+
+#[test]
+fn host_home_process_call_seeds_an_unpublished_root_context() {
+    let fixture = Fixture::new(0x10000, asid(1));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let record = fixture.zone.slot(fixture.slot).host_record().unwrap();
+    assert!(
+        unsafe { fixture.zone.record(record).ctx_mut() }
+            .address_context()
+            .is_none()
+    );
+    let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
+    let retained = process_record_for_call(source, &fixture.task, ThreadCtx::ZERO, ttbr0).unwrap();
+    assert_eq!(retained, record);
+    assert_eq!(
+        unsafe { fixture.zone.record(record).ctx_mut() }.address_context(),
+        Some(fixture.address)
+    );
 }
 
 /// Red-first Test 1: child gets distinct root and x0 = 0.

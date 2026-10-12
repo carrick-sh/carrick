@@ -75,6 +75,54 @@ pub fn registry() -> &'static NativeProcessRegistry<'static, Mm, Aarch64ParkedCo
     &REGISTRY
 }
 
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(super) fn process_record_for_call(
+    source: BornInZoneSource<'_, Aarch64ParkedContext>,
+    task: &CurrentTask,
+    native: carrick_sched_core::ThreadCtx,
+    ttbr0: u64,
+) -> Result<RecordId, NativeProcessError> {
+    let lane = source.zone.slot(source.slot);
+    if let Some(record) = lane.current() {
+        return Ok(record);
+    }
+    let host_record = lane.host_record();
+    if let Some(record) = host_record
+        && unsafe { source.zone.record(record).ctx_mut() }
+            .address_context()
+            .is_some()
+    {
+        return Ok(record);
+    }
+    let address = Mm {
+        root: RootGpa::page_aligned(FrameGpa::new(ttbr0 & AARCH64_ROOT_ADDRESS_MASK))
+            .ok_or(NativeProcessError::Stale)?,
+        mm: MmGeneration::new(
+            NonZeroU64::new(task.mm.key.load(Ordering::Acquire))
+                .ok_or(NativeProcessError::Stale)?,
+        ),
+        generation: task.root_generation().ok_or(NativeProcessError::Stale)?,
+    };
+    let record = match host_record {
+        Some(record) => record,
+        None => source
+            .zone
+            .current_or_new(
+                source.slot,
+                crate::sched::identity_of(task, lane.affinity()),
+            )
+            .map_err(|_| NativeProcessError::Exhausted)?,
+    };
+    // SAFETY: the current host lane owns its unpublished home record.
+    unsafe {
+        *source.zone.record(record).ctx_mut() = Aarch64ParkedContext::from_parts(native, address);
+    }
+    if let Some((_, control)) = task.lifecycle_refs() {
+        control.bind_zone_record(source.zone.record_ref(record));
+    }
+    Ok(record)
+}
+
 /// Admit only an exact published leader or thread-group member. The root
 /// address is checked by the shared owner against the zone's live MM grant.
 pub fn admit_entry(
