@@ -98,6 +98,9 @@ jobs:
           command -v sccache
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: hvf-arm64-release
+          save-if: ${{ github.event_name != 'merge_group' }}
 
       - name: Download exact-SHA fixture bundle
         uses: actions/download-artifact@v4

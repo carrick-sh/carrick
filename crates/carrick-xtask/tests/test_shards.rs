@@ -83,7 +83,7 @@ fn every_shard_is_required_in_hosted_ci_and_union_check_runs_on_linux() {
         assert!(
             steps
                 .iter()
-                .any(|s| s["with"]["shared-key"].as_str() == Some("macos-host"))
+                .any(|s| s["with"]["shared-key"].as_str() == Some("${{ github.job }}-debug"))
         );
     }
     assert_eq!(
