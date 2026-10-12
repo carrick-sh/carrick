@@ -78,14 +78,17 @@ DATA
 # A bridge without DHCP gets the template's static address in the seed
 # (NoCloud network-config v2); a DHCP site keeps the image default.
 if [[ $ipconfig != ip=dhcp ]]; then
-  [[ $ipconfig =~ ^ip=([0-9.]+/24),gw=([0-9.]+)$ && $nameserver =~ ^[0-9.]+$ ]] || { echo 'bad static site network' >&2; exit 1; }
+  # Validate the resolver first: each =~ replaces BASH_REMATCH.
+  [[ $nameserver =~ ^[0-9.]+$ ]] || { echo 'bad static site resolver' >&2; exit 1; }
+  [[ $ipconfig =~ ^ip=([0-9.]+/24),gw=([0-9.]+)$ ]] || { echo 'bad static site network' >&2; exit 1; }
+  address=${BASH_REMATCH[1]} route=${BASH_REMATCH[2]}
   cat > seed/network-config <<NET
 version: 2
 ethernets:
   primary:
     match: {name: "e*"}
-    addresses: [${BASH_REMATCH[1]}]
-    routes: [{to: default, via: ${BASH_REMATCH[2]}}]
+    addresses: [$address]
+    routes: [{to: default, via: $route}]
     nameservers: {addresses: [$nameserver]}
 NET
 fi
