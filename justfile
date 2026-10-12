@@ -175,7 +175,7 @@ check-fuzz:
 # macOS enables `debug-all` (which includes HVF tracing); off-macOS compiles the
 # platform-agnostic debug features so macOS-only HVF is not pulled in.
 _debug_features := if os() == "macos" { "debug-all,alloc-census,fs-memory" \
-} else { "trace-tty,trace-io,trace-traps,watchpoint,event-ring-dump,trace-syscalls,trace-elf,trace-dtrace,alloc-census,fs-memory" }
+} else { "debug-portable,alloc-census,fs-memory" }
 
 check-debug-features:
     {{_admit}} {{_cargo}} check -p carrick-cli {{_platform_features}} --features {{_debug_features}}
