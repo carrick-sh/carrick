@@ -60,7 +60,7 @@ fn failed_recipe_is_not_treated_as_empty_coverage() {
 }
 
 #[test]
-fn every_shard_is_required_in_hosted_ci_and_union_check_runs_on_both_hosts() {
+fn every_shard_is_required_in_hosted_ci_and_union_check_runs_on_linux() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let workflow = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
     let documents = yaml_rust2::YamlLoader::load_from_str(&workflow).unwrap();
@@ -94,14 +94,70 @@ fn every_shard_is_required_in_hosted_ci_and_union_check_runs_on_both_hosts() {
             .count(),
         shards.len()
     );
-    for job in ["lint", "macos-clippy"] {
-        assert!(
-            jobs[job]["steps"]
-                .as_vec()
-                .unwrap()
-                .iter()
-                .any(|s| s["run"].as_str() == Some("just check-test-shards")),
-            "{job} must check the host's shard union"
-        );
-    }
+    let job = "lint";
+    assert!(
+        jobs[job]["steps"]
+            .as_vec()
+            .unwrap()
+            .iter()
+            .any(|s| s["run"].as_str() == Some("just check-test-shards")),
+        "{job} must check both hosts' shard unions"
+    );
+    assert!(
+        !jobs["macos-clippy"]["steps"]
+            .as_vec()
+            .unwrap()
+            .iter()
+            .any(|s| s["run"].as_str() == Some("just check-test-shards"))
+    );
+    let runs = |job: &str, command: &str| {
+        jobs[job]["steps"]
+            .as_vec()
+            .unwrap()
+            .iter()
+            .any(|s| s["run"].as_str() == Some(command))
+    };
+    assert!(runs("linux-doc", "just check-fuzz"));
+    assert!(!runs("macos-build", "just check-fuzz"));
+    assert!(
+        runs("macos-build", "just doc"),
+        "macOS cfg documentation must retain native coverage"
+    );
+    assert!(
+        runs(
+            "macos-clippy",
+            "cargo run --locked -p carrick-xtask -- authority-debt"
+        ),
+        "compiled macOS authority profiles cannot be replaced by Linux discovery"
+    );
+}
+
+#[test]
+fn linux_check_rejects_missing_macos_only_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("justfile"),
+        r#"
+host := env("CARRICK_TEST_CAPTURE_HOST", os())
+test:
+    #!/usr/bin/env bash
+    if [ "{{host}}" = "macos" ]; then
+        cargo test -p macos-only --lib
+    else
+        cargo test -p linux-only --lib
+    fi
+test-shard-a:
+    cargo test -p linux-only --lib
+"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .args(["--root", dir.path().to_str().unwrap(), "check-test-shards"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "macOS selections were not checked on Linux"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("shard coverage differs"));
 }
