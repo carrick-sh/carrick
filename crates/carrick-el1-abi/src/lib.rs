@@ -34,7 +34,11 @@ mod mm_portal;
 mod mm_portal_executable;
 mod mm_portal_fork;
 mod mm_portal_grant;
-pub use carrick_core_abi::*;
+pub use carrick_core_abi::{
+    ExtentGrantReceipt, MetadataExtent, MetadataExtentResolver, MetadataResolutionError,
+    PinnedMetadataExtent, entry, lifecycle, mm, wait,
+};
+pub use carrick_core_abi::{entry::*, lifecycle::*, mm::*, wait::*};
 pub use carrick_personality_linux::abi::entry::{
     LinuxTaskMetadata, LinuxTaskState, SERVED_COMMIT_OWED, SERVED_WAKES_OWED, ServedBoundary,
 };
