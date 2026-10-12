@@ -178,27 +178,25 @@ genisoimage -quiet -output /var/lib/vz/template/iso/carrick-template-300-seed.is
 # Root qm operations below apply ONLY to the approved template build.
 # A shared private bridge gets the PVE VM firewall on net0; PVE copies
 # 300.fw to every clone, so a job that undoes the guest firewall still
-# cannot reach other VMs on the subnet (only the gateway is admitted).
+# cannot reach other VMs, the host or any private range (public IPv4 only).
 net0="virtio,bridge=$bridge"
+create_extra=()
 if [[ $vm_firewall == 1 ]]; then
-  [[ $ipconfig =~ gw=([0-9]+\.[0-9]+\.[0-9]+)\.([0-9]+)$ ]] || { echo 'firewall site lacks a static gateway' >&2; exit 1; }
-  gateway="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}" subnet="${BASH_REMATCH[1]}.0/24"
+  # The datacenter firewall must be on for a VM firewall to apply.
+  awk '/^\[/{o=($0=="[OPTIONS]")} o && $1=="enable:" && $2=="1"{f=1} END{exit !f}' /etc/pve/firewall/cluster.fw ||
+    { echo 'datacenter firewall is not enabled' >&2; exit 1; }
   [[ ! -e /etc/pve/firewall/300.fw ]] || { echo 'stale 300.fw; owner inspection needed' >&2; exit 1; }
-  cat > /etc/pve/firewall/300.fw <<FW
-[OPTIONS]
-enable: 1
-policy_in: DROP
-policy_out: ACCEPT
-
-[RULES]
-IN ACCEPT -source $gateway -log nolog # controller SSH from the host
-OUT ACCEPT -dest $gateway -log nolog # gateway (NAT to the internet)
-OUT DROP -dest $subnet -log nolog # never agent workers or other clones
-FW
+  # The rule set comes from the site table; the controller verifies the same
+  # rules on the template and on every clone before it boots.
+  "$xtask" ci-scaler vm-firewall > /etc/pve/firewall/300.fw.new
+  mv /etc/pve/firewall/300.fw.new /etc/pve/firewall/300.fw
   net0="$net0,firewall=1"
+  # ipfilter admits only the addresses in ipconfig0, so the template needs
+  # its static address there while it provisions from the seed ISO.
+  create_extra=(--ipconfig0 "$ipconfig")
 fi
 qm create 300 --name carrick-debian13-kvm --pool carrick-ci --cores "$cores" --memory "$memory_mib" --balloon 0 --cpulimit "$cores" --cpu host \
-  --net0 "$net0" --scsihw virtio-scsi-pci --serial0 socket --vga serial0 --agent enabled=1
+  --net0 "$net0" --scsihw virtio-scsi-pci --serial0 socket --vga serial0 --agent enabled=1 "${create_extra[@]}"
 qm importdisk 300 "$image" "$storage" --format "$disk_format"
 # The imported volume's name depends on the storage type; attach exactly it.
 disk=$(qm config 300 | sed -n 's/^unused0: //p')

@@ -709,6 +709,8 @@ fn boot_and_register(
         return Err(ScalerError::Guard("host admission denied before boot"));
     }
     pve.guard(row)?;
+    // The clone inherits 300.fw; prove it before the guest can send a packet.
+    pve.verify_vm_firewall(row.vm.get())?;
     let deadline = Instant::now() + Duration::from_secs(300);
     pve.deadline.set(Some(deadline));
     let shared_deadline = ApiDeadline(&pve.deadline);
@@ -1152,6 +1154,82 @@ fn one_job_result(row: Option<&Record>) -> Result<(), ScalerError> {
     }
 }
 
+/// The datacenter firewall must be on for any VM firewall to apply. Read
+/// from the root-only cluster config: the scoped token has no `/` rights.
+fn cluster_firewall_enabled(cluster_fw: &str) -> bool {
+    let mut options = false;
+    for line in cluster_fw.lines().map(str::trim) {
+        if line.starts_with('[') {
+            options = line.eq_ignore_ascii_case("[OPTIONS]");
+        } else if options && line.split_whitespace().collect::<Vec<_>>() == ["enable:", "1"] {
+            return true;
+        }
+    }
+    false
+}
+/// Exact VM firewall check for an isolating site: options and the ordered
+/// rule list must equal [`Site::vm_firewall`]. Anything else fails closed.
+fn vm_firewall_matches(site: &Site, options: &Value, rules: &Value) -> bool {
+    let (Some(expected), Some(gateway)) = (site.vm_firewall(), site.gateway()) else {
+        return false;
+    };
+    let flag = |name: &str| options[name].as_u64() == Some(1);
+    let text = |value: &Value, want: &str| value.as_str() == Some(want);
+    if !(flag("enable")
+        && flag("ipfilter")
+        && options
+            .get("macfilter")
+            .is_none_or(|v| v.as_u64() == Some(1))
+        && text(&options["policy_in"], "DROP")
+        && text(&options["policy_out"], "DROP"))
+    {
+        return false;
+    }
+    let Some(mut live) = rules.as_array().cloned() else {
+        return false;
+    };
+    live.sort_by_key(|rule| rule["pos"].as_u64().unwrap_or(u64::MAX));
+    let optional = |value: &Value, want: Option<String>| match want {
+        Some(want) => value.as_str() == Some(want.as_str()),
+        None => value.is_null(),
+    };
+    live.len() == expected.len()
+        && live.iter().zip(expected).all(|(rule, want)| {
+            rule["enable"].as_u64() == Some(1)
+                && text(&rule["type"], want.direction)
+                && text(&rule["action"], want.action)
+                && optional(&rule["source"], want.source(&gateway))
+                && optional(&rule["dest"], want.dest(&gateway))
+                && optional(&rule["proto"], want.proto.map(str::to_owned))
+                && optional(&rule["dport"], want.dport.map(str::to_owned))
+                && rule.get("iface").is_none()
+                && rule.get("macro").is_none()
+                && rule.get("sport").is_none()
+        })
+}
+impl Pve {
+    /// On an isolating site, refuse a VM (template or clone, before boot)
+    /// whose PVE firewall is not exactly the site's, or a host whose
+    /// datacenter firewall is off. A no-op on other sites.
+    fn verify_vm_firewall(&self, vmid: u16) -> Result<(), ScalerError> {
+        if !self.site.isolates_bridge() {
+            return Ok(());
+        }
+        if !cluster_firewall_enabled(&std::fs::read_to_string("/etc/pve/firewall/cluster.fw")?) {
+            return Err(ScalerError::Guard("datacenter firewall is not enabled"));
+        }
+        let base = self.site.qemu(vmid);
+        let options = self.request(PveCall::Get, &format!("{base}/firewall/options"))?;
+        let rules = self.request(PveCall::Get, &format!("{base}/firewall/rules"))?;
+        if vm_firewall_matches(&self.site, &options, &rules) {
+            Ok(())
+        } else {
+            Err(ScalerError::Guard(
+                "VM firewall does not match the site's isolation rules",
+            ))
+        }
+    }
+}
 fn qualified_template(config: &Value, site: &Site) -> bool {
     // PVE 9 returns memory's decimal MiB quantity as a JSON string.
     let memory_mib = config["memory"].as_u64().or_else(|| {
@@ -1215,6 +1293,7 @@ pub(super) fn controller(
             "template does not match approved size/storage/bridge",
         ));
     }
+    pve.verify_vm_firewall(300)?;
     // Read-only privilege proof. Never probe a denied destructive operation.
     for vm in pve.site.protected {
         let protected =
@@ -1621,6 +1700,73 @@ mod tests {
         // On a shared private bridge the PVE VM firewall is mandatory.
         config["net0"] = json!("virtio=BC:24:11:00:00:01,bridge=vmbr1");
         assert!(!qualified_template(&config, contabo));
+    }
+    #[test]
+    fn vm_firewall_check_is_exact_and_fails_closed() {
+        let site = &super::site::CONTABO;
+        let options =
+            json!({"enable":1,"ipfilter":1,"macfilter":1,"policy_in":"DROP","policy_out":"DROP"});
+        let rules = json!([
+            {"pos":2,"type":"out","action":"ACCEPT","dest":"0.0.0.0/0","enable":1,"log":"nolog"},
+            {"pos":0,"type":"in","action":"ACCEPT","source":"10.77.0.1","proto":"tcp","dport":"22","enable":1},
+            {"pos":1,"type":"out","action":"DROP","dest":super::site::PRIVATE_V4,"enable":1}
+        ]);
+        assert!(vm_firewall_matches(site, &options, &rules));
+        // Willow has no VM firewall to match.
+        assert!(!vm_firewall_matches(&super::site::WILLOW, &options, &rules));
+        for (field, value) in [
+            ("enable", json!(0)),
+            ("ipfilter", json!(0)),
+            ("macfilter", json!(0)),
+            ("policy_out", json!("ACCEPT")),
+            ("policy_in", json!("ACCEPT")),
+        ] {
+            let mut weakened = options.clone();
+            weakened[field] = value;
+            assert!(!vm_firewall_matches(site, &weakened, &rules), "{field}");
+        }
+        let mut missing = options.clone();
+        missing.as_object_mut().unwrap().remove("policy_out");
+        assert!(!vm_firewall_matches(site, &missing, &rules));
+        let mutate = |index: usize, field: &str, value: Value| {
+            let mut changed = rules.clone();
+            changed[index][field] = value;
+            changed
+        };
+        for changed in [
+            mutate(0, "enable", json!(0)),
+            mutate(0, "dest", json!("10.0.0.0/8")),
+            mutate(1, "source", json!("10.77.0.0/24")),
+            mutate(1, "dport", json!("1:65535")),
+            mutate(2, "dest", json!("10.77.0.0/24")),
+            mutate(2, "iface", json!("net0")),
+        ] {
+            assert!(!vm_firewall_matches(site, &options, &changed));
+        }
+        let mut extra = rules.clone();
+        extra
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"pos":3,"type":"out","action":"ACCEPT","enable":1}));
+        assert!(!vm_firewall_matches(site, &options, &extra));
+        assert!(!vm_firewall_matches(site, &options, &json!([])));
+        // Order matters: ACCEPT any before DROP private would open the subnet.
+        let reordered = json!([
+            {"pos":0,"type":"in","action":"ACCEPT","source":"10.77.0.1","proto":"tcp","dport":"22","enable":1},
+            {"pos":1,"type":"out","action":"ACCEPT","dest":"0.0.0.0/0","enable":1},
+            {"pos":2,"type":"out","action":"DROP","dest":super::site::PRIVATE_V4,"enable":1}
+        ]);
+        assert!(!vm_firewall_matches(site, &options, &reordered));
+    }
+    #[test]
+    fn cluster_firewall_must_be_enabled_in_options() {
+        assert!(cluster_firewall_enabled(
+            "[OPTIONS]\nenable: 1\npolicy_in: DROP\n\n[RULES]\nIN SSH(ACCEPT)\n"
+        ));
+        assert!(!cluster_firewall_enabled("[OPTIONS]\nenable: 0\n"));
+        assert!(!cluster_firewall_enabled("[OPTIONS]\npolicy_in: DROP\n"));
+        assert!(!cluster_firewall_enabled("[RULES]\nenable: 1\n"));
+        assert!(!cluster_firewall_enabled(""));
     }
     #[test]
     fn directory_storage_admits_only_active_storage_with_free_space() {
