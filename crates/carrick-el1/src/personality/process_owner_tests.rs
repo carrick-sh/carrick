@@ -1568,3 +1568,30 @@ fn pending_exit_retirement_survives_reparenting_without_early_reap() {
     drop(reaped);
     assert_eq!(releases.get(), 1);
 }
+
+#[test]
+fn retirement_completion_notifies_the_adopter_of_a_pending_zombie() {
+    use super::super::native_process_entry::publish_exit;
+    let mut owner = owner();
+    let root = key(1, 1);
+    let parent = key(2, 2);
+    let child = key(3, 3);
+    birth(&mut owner, root, parent, Rc::new(Cell::new(0)));
+    birth(&mut owner, parent, child, Rc::new(Cell::new(0)));
+    let (_resources, pending) = publish_exit(
+        &mut owner,
+        child,
+        None,
+        Transaction(97),
+        LinuxWaitStatus::from_wait_encoding(0),
+    )
+    .unwrap();
+    let child_permit = pending.effects.cancel_members(Member::cancel);
+    let parent_exit = exit(&mut owner, parent, None);
+    parent_exit.effects.cancel_members(Member::cancel);
+    pending.retirement.publish();
+    let target = owner
+        .select_exit_parent(&child_permit)
+        .expect("pending retirement must notify the current adopter");
+    assert_eq!(target.prepare().parent, root);
+}

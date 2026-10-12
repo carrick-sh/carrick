@@ -150,6 +150,9 @@ impl carrick_sched_core::process::exit::ExitRetiring for RetiringTaskRecord {
     }
 }
 impl carrick_sched_core::process::exit::ExitZombie for ZombieRecord {
+    fn exit_parent(&self) -> Option<TaskKey> {
+        self.zombie.parent
+    }
     fn exit_key(&self) -> TaskKey {
         self.zombie.key
     }
