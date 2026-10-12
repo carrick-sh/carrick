@@ -647,7 +647,8 @@ fn job_env_gives_each_run_a_private_sccache_server_and_cache() {
     );
     assert!(uds.len() < 104, "sun_path limit on macOS");
     assert_eq!(env["SCCACHE_DIR"], SCCACHE_DIR);
-    assert_eq!(env["SCCACHE_CACHE_SIZE"], SCCACHE_CACHE_SIZE);
+    assert_eq!(env["SCCACHE_CACHE_SIZE"], "8G");
+    assert_eq!(SCCACHE_CACHE_SIZE, "8G");
     assert!(!env.contains_key("SCCACHE_BUCKET"));
     assert!(!env.contains_key("SCCACHE_SERVER_PORT"));
     let mut sccache: Vec<&str> = env
