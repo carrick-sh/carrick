@@ -3506,7 +3506,7 @@ fn el1_fork_cow_resolves_in_guest() {
     );
     assert!(
         warmup.result.success(),
-        "warm-up fork failed: {}; rt_sigaction (served, forwarded, refused)={:?}; owner process refusal stages={:?}; first process admission root={:?}; first process admission stage={:?}; first registry identities={:?}; first missing entry [presence,slot_valid,task,current,host; slot; syscall]={:?}; first native fork failure={:?}; fork progress={:?}; returned child stock delta={}",
+        "warm-up fork failed: {}; rt_sigaction (served, forwarded, refused)={:?}; owner process refusal stages={:?}; first process admission root={:?}; first process admission stage={:?}; first registry identities={:?}; first missing entry [presence,slot_valid,task,current,host; slot; syscall]={:?}; first native fork failure={:?}; fork progress={:?}; first COW refusal [stage,mm_or_page,page_or_claim,incarnation_or_owner]={:?}; COW pool={:?}; host COW={:?}; returned child stock delta={}",
         describe(&warmup),
         read_el1_counters().map(|c| [
             c.served[134].load(std::sync::atomic::Ordering::Relaxed),
@@ -3535,6 +3535,11 @@ fn el1_fork_cow_resolves_in_guest() {
         read_el1_counters().map(|c| c
             .native_fork_progress
             .map(|n| n.load(std::sync::atomic::Ordering::Relaxed))),
+        read_el1_counters().map(|c| c
+            .first_cow_supply_refusal
+            .map(|word| word.load(std::sync::atomic::Ordering::Acquire))),
+        el1_cow_pool_counters(),
+        carrick_embed::host_cow_snapshot(),
         carrick_vmm_hvf::fork_stock_returned().saturating_sub(returned_before),
     );
     let counters = read_el1_counters().expect("EL1 counters after fork warm-up");

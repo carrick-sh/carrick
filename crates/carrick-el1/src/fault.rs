@@ -593,6 +593,18 @@ impl CowResolver for HardwareCowResolver {
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(refusal) => {
+                // The owner claim and registry address generation are distinct
+                // authorities. Retain their exact first mismatch for signed
+                // diagnosis after the guest fault becomes a Linux SIGSEGV.
+                // SAFETY: the carrier maps this initialized shared counter
+                // region for every hardware guest dispatch.
+                let counters = unsafe { &*(carrick_el1_abi::EL1_COUNTERS_BASE as *const Counters) };
+                counters.record_first_cow_venue_refusal(
+                    refusal.reason as u64,
+                    far & !4095,
+                    refusal.claim_generation,
+                    refusal.owner_generation,
+                );
                 self.venue_refusal = Some(refusal);
                 return CowResolution::Refused;
             }
