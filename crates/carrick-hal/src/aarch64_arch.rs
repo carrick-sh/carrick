@@ -428,7 +428,7 @@ mod tests {
         let frame_sp = crate::sigframe::signal_frame_stack_pointer(
             e.sp,
             Some(altstack),
-            core::mem::size_of::<carrick_abi::CarrickSigframe>(),
+            core::mem::size_of::<carrick_personality_linux::signal::arm::SignalFrame>(),
         )
         .expect("frame lies inside alternate stack");
         e.prepared_page = Some(frame_sp & !4095);
@@ -559,7 +559,10 @@ mod tests {
         mc.pc = 0xBEEF;
         let mut uc = carrick_abi::LinuxUcontext::empty();
         uc.uc_mcontext = mc;
-        let mut frame = carrick_abi::CarrickSigframe::empty();
+        let mut frame = carrick_personality_linux::signal::arm::RtSigframe {
+            siginfo: carrick_abi::LinuxSiginfo::empty(),
+            ucontext: carrick_abi::LinuxUcontext::empty(),
+        };
         frame.ucontext = uc;
         e.write_bytes(frame_addr, frame.as_bytes())
             .expect("seed the bad frame into guest memory");
@@ -583,5 +586,88 @@ mod tests {
             e.elr_el1, before_elr,
             "rejected frame must not set the resume PC"
         );
+    }
+
+    #[test]
+    fn arm_public_signal_frame_carrier_validates_before_publication() {
+        use carrick_guest_mem::GuestMemory;
+        let mut e = empty_engine();
+        e.sp = 0x20_0000;
+        e.elr_el1 = 0x10000;
+        Aarch64GuestArch::build_sigframe(&mut e, inject_params(0)).unwrap();
+        let mut bytes = e
+            .read_bytes(
+                e.sp,
+                core::mem::size_of::<carrick_personality_linux::signal::arm::SignalFrame>(),
+            )
+            .unwrap();
+        let reserved = carrick_personality_linux::signal::arm::UCONTEXT_OFFSET
+            + core::mem::offset_of!(carrick_abi::LinuxUcontext, uc_mcontext)
+            + core::mem::offset_of!(carrick_abi::LinuxSignalContext, __reserved);
+        bytes[reserved + 4..reserved + 8].copy_from_slice(&0_u32.to_le_bytes());
+        e.write_bytes(e.sp, &bytes).unwrap();
+        e.x = [0x55; 31];
+        e.vregs = [0x55; 32];
+        let before_sp = e.sp;
+        let before_elr = e.elr_el1;
+        let before_pstate = e.spsr_el1;
+        assert!(matches!(
+            Aarch64GuestArch::restore_sigframe(&mut e, true),
+            Err(crate::TrapError::SignalDeliveryFault)
+        ));
+        assert_eq!(e.x, [0x55; 31]);
+        assert_eq!(e.vregs, [0x55; 32]);
+        assert_eq!(
+            (e.sp, e.elr_el1, e.spsr_el1),
+            (before_sp, before_elr, before_pstate)
+        );
+    }
+
+    #[test]
+    fn arm_signal_delivery_preserves_faulty_sp_on_valid_altstack() {
+        use carrick_guest_mem::GuestMemory;
+        use carrick_personality_linux::signal::arm;
+        use zerocopy::FromBytes;
+        let mut e = empty_engine();
+        e.sp = 0x20_0008;
+        e.elr_el1 = 0x10000;
+        let mut params = inject_params(0);
+        params.altstack = Some((0x4000, 0x8000));
+        let injection = Aarch64GuestArch::build_sigframe(&mut e, params)
+            .expect("a valid alternate stack admits a faulty interrupted snapshot");
+        assert_eq!(injection.new_sp & 15, 0);
+        let bytes = e.read_bytes(e.sp, arm::PUBLIC_FRAME_LEN).unwrap();
+        let frame = arm::RtSigframe::read_from_bytes(&bytes).unwrap();
+        let interrupted_sp = frame.ucontext.uc_mcontext.sp;
+        assert_eq!(interrupted_sp, 0x20_0008);
+        // The handler can inspect/repair the snapshot. Returning through the
+        // unchanged invalid resume state is refused without publication.
+        assert!(matches!(
+            Aarch64GuestArch::restore_sigframe(&mut e, true),
+            Err(crate::TrapError::SignalDeliveryFault)
+        ));
+        assert_eq!(e.sp, injection.new_sp);
+    }
+
+    #[test]
+    fn arm_signal_carrier_links_and_restores_frame_record() {
+        use carrick_guest_mem::GuestMemory;
+        use carrick_personality_linux::signal::arm;
+        use zerocopy::FromBytes;
+        let mut e = empty_engine();
+        e.sp = 0x20_0000;
+        e.elr_el1 = 0x10000;
+        e.x[29] = 0x8000;
+        e.x[30] = 0x9000;
+        let injection = Aarch64GuestArch::build_sigframe(&mut e, inject_params(0)).unwrap();
+        assert_eq!(e.x[29], injection.new_sp + arm::FRAME_RECORD_OFFSET as u64);
+        let bytes = e
+            .read_bytes(e.sp, core::mem::size_of::<arm::SignalFrame>())
+            .unwrap();
+        let frame = arm::SignalFrame::read_from_bytes(&bytes).unwrap();
+        let record = frame.frame_record;
+        assert_eq!(record, [0x8000, 0x9000]);
+        Aarch64GuestArch::restore_sigframe(&mut e, true).unwrap();
+        assert_eq!((e.x[29], e.x[30]), (0x8000, 0x9000));
     }
 }

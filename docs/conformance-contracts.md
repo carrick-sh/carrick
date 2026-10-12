@@ -829,6 +829,22 @@ VM-free evidence does not establish full signal frame compatibility. The
 in-ring ARM restore path remains unrouted until Linux ucontext and FPSIMD
 restore and forced SIGSEGV on invalid frames are implemented together.
 
+The public ARM frame codec is shared by the carrier and dormant EL1 backend
+in `carrick-personality-linux::signal::arm`, under
+`kernel.el1.signal-delivery-owner`. `arm_public_signal_frame_roundtrip_has_no_private_magic`
+restores the public prefix without a private trailer. The extension witnesses
+cover reordered FPSIMD, duplicate FPSIMD/ESR, malformed lengths, missing or
+half terminators, truncated extents, and refusal before GPR/SIMD publication.
+The parser walks the entire admitted 4 KiB reserved area through the null
+record, advancing by at least 16 bytes per nonterminal record with checked
+bounds, no allocation and no guest-pointer chasing. The admitted lane carries
+FPSIMD and optional ESR; SVE/SME and out-of-line extra context are refused.
+Authority for this record format is the [public arm64 SVE signal ABI
+documentation](https://www.kernel.org/doc/html/latest/arch/arm64/sve.html#signal-handling)
+and [Arm's Linux Plumbers 2017 signal-frame diagrams](https://blog.linuxplumbersconf.org/2017/ocw/system/presentations/4671/original/plumbers-dm-2017.pdf),
+alongside sigreturn(2). This extraction changes no signal routing and does not
+establish in-ring delivery or alternate-stack restoration.
+
 ## Signal return result ownership
 
 `signal.return.no-result` owns successful in-ring `rt_sigreturn` completion.

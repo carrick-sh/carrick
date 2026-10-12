@@ -5000,7 +5000,8 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // saved_pc — mirroring the per-backend impls.
         let fpsimd = self.vm.fpsimd_enabled();
         let r = <Self as ThreadedEngine>::Arch::restore_sigframe(self, fpsimd)?;
-        carrick_observability::probes::signal_restore(r.saved_pc, r.frame_sp, r.magic);
+        // Preserve the probe ABI; the public frame has no private magic.
+        carrick_observability::probes::signal_restore(r.saved_pc, r.frame_sp, 0);
         self.vcpu.get_mut().prepare_register_resume()?;
         Ok(r.sigmask)
     }
