@@ -3,7 +3,7 @@
 //! supervisor direct alias. No host pointer crosses this record.
 
 pub const X86_INITIAL_BOOT_MAGIC: u64 = u64::from_le_bytes(*b"CXRUN001");
-pub const X86_INITIAL_BOOT_VERSION: u32 = 3;
+pub const X86_INITIAL_BOOT_VERSION: u32 = 4;
 pub const X86_INITIAL_BOOT_HEADER_GPA: u64 = 0x10_1000;
 pub const X86_INITIAL_BOOT_PORT: u16 = 0xc6;
 /// Physical stop after the initial MM is installed, before entering EL0.
@@ -60,8 +60,13 @@ pub struct X86InitialBootRequest {
     pub generation: u64,
     pub result_table_used: u32,
     pub result_data_used: u32,
-    /// Guest MM owner's first byte beyond the highest PT_LOAD page.
+    /// Guest MM owner's first byte beyond the executable's highest PT_LOAD page.
     pub result_initial_break: u64,
+    pub executable_entry: u64,
+    pub interpreter_base: u64,
+    /// The region prefix belonging to the executable, excluding PT_INTERP.
+    pub executable_region_count: u32,
+    pub reserved: u32,
 }
 
 #[repr(C)]
@@ -95,7 +100,7 @@ pub struct X86InitialBootGrant {
 
 const _: () = {
     assert!(core::mem::size_of::<X86InitialBootHeader>() == 32);
-    assert!(core::mem::size_of::<X86InitialBootRequest>() == 176);
+    assert!(core::mem::size_of::<X86InitialBootRequest>() == 200);
     assert!(core::mem::align_of::<X86InitialBootRequest>() == 8);
     assert!(core::mem::offset_of!(X86InitialBootRequest, magic) == 0);
     assert!(core::mem::offset_of!(X86InitialBootRequest, region_count) == 12);
@@ -106,6 +111,9 @@ const _: () = {
     assert!(core::mem::offset_of!(X86InitialBootRequest, result_status) == 136);
     assert!(core::mem::offset_of!(X86InitialBootRequest, mm_key) == 144);
     assert!(core::mem::offset_of!(X86InitialBootRequest, result_table_used) == 160);
+    assert!(core::mem::offset_of!(X86InitialBootRequest, executable_entry) == 176);
+    assert!(core::mem::offset_of!(X86InitialBootRequest, interpreter_base) == 184);
+    assert!(core::mem::offset_of!(X86InitialBootRequest, executable_region_count) == 192);
     assert!(core::mem::size_of::<X86InitialBootRegion>() == 48);
     assert!(core::mem::offset_of!(X86InitialBootRegion, source_gpa) == 24);
     assert!(core::mem::size_of::<X86InitialBootString>() == 16);
