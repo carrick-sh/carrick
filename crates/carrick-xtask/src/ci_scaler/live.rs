@@ -1170,7 +1170,9 @@ fn cluster_firewall_enabled(cluster_fw: &str) -> bool {
 /// Exact VM firewall check for an isolating site: options and the ordered
 /// rule list must equal [`Site::vm_firewall`]. Anything else fails closed.
 fn vm_firewall_matches(site: &Site, options: &Value, rules: &Value) -> bool {
-    let (Some(expected), Some(gateway)) = (site.vm_firewall(), site.gateway()) else {
+    let (Some(expected), Some(gateway), Some(blocked)) =
+        (site.vm_firewall(), site.gateway(), site.blocked())
+    else {
         return false;
     };
     let flag = |name: &str| options[name].as_u64() == Some(1);
@@ -1198,8 +1200,8 @@ fn vm_firewall_matches(site: &Site, options: &Value, rules: &Value) -> bool {
             rule["enable"].as_u64() == Some(1)
                 && text(&rule["type"], want.direction)
                 && text(&rule["action"], want.action)
-                && optional(&rule["source"], want.source(&gateway))
-                && optional(&rule["dest"], want.dest(&gateway))
+                && optional(&rule["source"], want.source(&gateway, &blocked))
+                && optional(&rule["dest"], want.dest(&gateway, &blocked))
                 && optional(&rule["proto"], want.proto.map(str::to_owned))
                 && optional(&rule["dport"], want.dport.map(str::to_owned))
                 && rule.get("iface").is_none()
@@ -1704,12 +1706,14 @@ mod tests {
     #[test]
     fn vm_firewall_check_is_exact_and_fails_closed() {
         let site = &super::site::CONTABO;
+        let blocked = site.blocked().unwrap();
+        assert!(blocked.ends_with(",100.64.0.0/10,154.38.161.112"));
         let options =
             json!({"enable":1,"ipfilter":1,"macfilter":1,"policy_in":"DROP","policy_out":"DROP"});
         let rules = json!([
             {"pos":2,"type":"out","action":"ACCEPT","dest":"0.0.0.0/0","enable":1,"log":"nolog"},
             {"pos":0,"type":"in","action":"ACCEPT","source":"10.77.0.1","proto":"tcp","dport":"22","enable":1},
-            {"pos":1,"type":"out","action":"DROP","dest":super::site::PRIVATE_V4,"enable":1}
+            {"pos":1,"type":"out","action":"DROP","dest":blocked,"enable":1}
         ]);
         assert!(vm_firewall_matches(site, &options, &rules));
         // Willow has no VM firewall to match.
@@ -1735,7 +1739,8 @@ mod tests {
         };
         for changed in [
             mutate(0, "enable", json!(0)),
-            mutate(0, "dest", json!("10.0.0.0/8")),
+            mutate(0, "dest", json!(super::site::PRIVATE_V4)),
+            mutate(2, "dest", json!(super::site::PRIVATE_V4)),
             mutate(1, "source", json!("10.77.0.0/24")),
             mutate(1, "dport", json!("1:65535")),
             mutate(2, "dest", json!("10.77.0.0/24")),
@@ -1754,7 +1759,7 @@ mod tests {
         let reordered = json!([
             {"pos":0,"type":"in","action":"ACCEPT","source":"10.77.0.1","proto":"tcp","dport":"22","enable":1},
             {"pos":1,"type":"out","action":"ACCEPT","dest":"0.0.0.0/0","enable":1},
-            {"pos":2,"type":"out","action":"DROP","dest":super::site::PRIVATE_V4,"enable":1}
+            {"pos":2,"type":"out","action":"DROP","dest":blocked,"enable":1}
         ]);
         assert!(!vm_firewall_matches(site, &options, &reordered));
     }

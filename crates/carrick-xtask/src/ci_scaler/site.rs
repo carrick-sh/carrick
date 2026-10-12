@@ -26,6 +26,9 @@ pub(super) enum Network {
         subnet: [u8; 3],
         gateway: u8,
         nameserver: &'static str,
+        /// The host's own public IPv4 addresses: a clone reaching them would
+        /// land on host services, so the VM firewall drops them too.
+        host_public: &'static str,
     },
 }
 
@@ -75,6 +78,7 @@ pub(super) const CONTABO: Site = Site {
         subnet: [10, 77, 0],
         gateway: 1,
         nameserver: "1.1.1.1",
+        host_public: "154.38.161.112",
     },
     cores: 8,
     memory_mib: 16384,
@@ -134,9 +138,10 @@ impl Site {
     }
     /// The PVE VM firewall for an isolating site, as an exact rule list that
     /// the template builder writes and the controller verifies. Default
-    /// deny both ways; in: SSH from the host only; out: public IPv4 only
-    /// (every private and link-local range, the gateway and the agent
-    /// workers included, is dropped first; IPv6 falls to the DROP policy).
+    /// deny both ways; in: SSH from the gateway only; out: IPv4 except the
+    /// blocked set (RFC 1918, link-local, shared address space 100.64/10 and
+    /// the host's own public addresses, which covers the gateway, the agent
+    /// workers and every host service); IPv6 falls to the DROP policy.
     pub(super) fn vm_firewall(&self) -> Option<[FirewallRule; 3]> {
         if !self.isolates_bridge() {
             return None;
@@ -155,10 +160,10 @@ impl Site {
                 direction: "out",
                 action: "DROP",
                 source: None,
-                dest: Some(PRIVATE_V4),
+                dest: Some(BLOCKED_PLACEHOLDER),
                 proto: None,
                 dport: None,
-                comment: "no private, link-local or host destination",
+                comment: "no private, shared, link-local or host destination",
             },
             FirewallRule {
                 direction: "out",
@@ -167,7 +172,7 @@ impl Site {
                 dest: Some("0.0.0.0/0"),
                 proto: None,
                 dport: None,
-                comment: "public IPv4 through the NAT gateway",
+                comment: "remaining IPv4 through the NAT gateway",
             },
         ])
     }
@@ -182,15 +187,25 @@ impl Site {
             } => Some(format!("{a}.{b}.{c}.{gateway}")),
         }
     }
+    /// The outbound DROP destinations of a static site.
+    pub(super) fn blocked(&self) -> Option<String> {
+        match self.network {
+            Network::Dhcp => None,
+            Network::Static { host_public, .. } => {
+                Some(format!("{PRIVATE_V4},{SHARED_V4},{host_public}"))
+            }
+        }
+    }
     /// `/etc/pve/firewall/<vmid>.fw` for an isolating site.
     pub(super) fn vm_firewall_file(&self) -> Option<String> {
         let rules = self.vm_firewall()?;
         let gateway = self.gateway()?;
+        let blocked = self.blocked()?;
         let mut file = String::from(
             "[OPTIONS]\nenable: 1\npolicy_in: DROP\npolicy_out: DROP\nipfilter: 1\nmacfilter: 1\n\n[RULES]\n",
         );
         for rule in rules {
-            file.push_str(&rule.render(&gateway));
+            file.push_str(&rule.render(&gateway, &blocked));
             file.push('\n');
         }
         Some(file)
@@ -227,9 +242,13 @@ impl Site {
 
 /// `source` value meaning "this site's gateway address".
 pub(super) const GATEWAY_PLACEHOLDER: &str = "gateway";
+/// `dest` value meaning "this site's blocked destination set".
+pub(super) const BLOCKED_PLACEHOLDER: &str = "blocked";
 /// Every RFC 1918 and IPv4 link-local range: covers the bridge subnet, the
 /// gateway and any host-side private address.
 pub(super) const PRIVATE_V4: &str = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16";
+/// RFC 6598 shared address space (carrier-grade NAT).
+pub(super) const SHARED_V4: &str = "100.64.0.0/10";
 
 /// One PVE firewall rule, in the fields the PVE rules API reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,27 +262,25 @@ pub(super) struct FirewallRule {
     pub comment: &'static str,
 }
 impl FirewallRule {
-    fn resolve(field: Option<&'static str>, gateway: &str) -> Option<String> {
-        field.map(|value| {
-            if value == GATEWAY_PLACEHOLDER {
-                gateway.to_owned()
-            } else {
-                value.to_owned()
-            }
+    fn resolve(field: Option<&'static str>, gateway: &str, blocked: &str) -> Option<String> {
+        field.map(|value| match value {
+            GATEWAY_PLACEHOLDER => gateway.to_owned(),
+            BLOCKED_PLACEHOLDER => blocked.to_owned(),
+            value => value.to_owned(),
         })
     }
-    pub(super) fn source(&self, gateway: &str) -> Option<String> {
-        Self::resolve(self.source, gateway)
+    pub(super) fn source(&self, gateway: &str, blocked: &str) -> Option<String> {
+        Self::resolve(self.source, gateway, blocked)
     }
-    pub(super) fn dest(&self, gateway: &str) -> Option<String> {
-        Self::resolve(self.dest, gateway)
+    pub(super) fn dest(&self, gateway: &str, blocked: &str) -> Option<String> {
+        Self::resolve(self.dest, gateway, blocked)
     }
-    fn render(&self, gateway: &str) -> String {
+    fn render(&self, gateway: &str, blocked: &str) -> String {
         let mut line = format!("{} {}", self.direction.to_uppercase(), self.action);
-        if let Some(source) = self.source(gateway) {
+        if let Some(source) = self.source(gateway, blocked) {
             line.push_str(&format!(" -source {source}"));
         }
-        if let Some(dest) = self.dest(gateway) {
+        if let Some(dest) = self.dest(gateway, blocked) {
             line.push_str(&format!(" -dest {dest}"));
         }
         if let Some(proto) = self.proto {
@@ -326,6 +343,7 @@ mod tests {
                     subnet: [10, 77, 0],
                     gateway: 1,
                     nameserver: "1.1.1.1",
+                    host_public: "154.38.161.112",
                 },
                 cores: 8,
                 memory_mib: 16384,
@@ -351,8 +369,8 @@ mod tests {
             CONTABO.vm_firewall_file().unwrap(),
             "[OPTIONS]\nenable: 1\npolicy_in: DROP\npolicy_out: DROP\nipfilter: 1\nmacfilter: 1\n\n[RULES]\n\
 IN ACCEPT -source 10.77.0.1 -p tcp -dport 22 -log nolog # controller SSH from the host\n\
-OUT DROP -dest 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16 -log nolog # no private, link-local or host destination\n\
-OUT ACCEPT -dest 0.0.0.0/0 -log nolog # public IPv4 through the NAT gateway\n"
+OUT DROP -dest 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10,154.38.161.112 -log nolog # no private, shared, link-local or host destination\n\
+OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n"
         );
         assert_eq!(CONTABO.qemu(308), "/nodes/m28112/qemu/308");
     }
