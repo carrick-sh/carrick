@@ -444,6 +444,10 @@ fn validate_initial_reply(
         || reply.version != request.version
         || reply.region_count != request.region_count
         || reply.entry != request.entry
+        || reply.executable_entry != request.executable_entry
+        || reply.interpreter_base != request.interpreter_base
+        || reply.executable_region_count != request.executable_region_count
+        || reply.reserved != request.reserved
         || reply.phdr != request.phdr
         || reply.phent != request.phent
         || reply.phnum != request.phnum
@@ -488,8 +492,9 @@ fn initial_stack_pages(
     use carrick_el1::isa::x86_initial_mm::{InitialStackSpec, build_initial_stack};
     let argv_bytes: Vec<&[u8]> = argv.iter().map(|value| value.as_bytes()).collect();
     let env_bytes: Vec<&[u8]> = env.iter().map(|value| value.as_bytes()).collect();
-    let stack = build_initial_stack(&InitialStackSpec {
-        entry: image.entry,
+    let _stack = build_initial_stack(&InitialStackSpec {
+        entry: image.executable_entry,
+        interpreter_base: image.interpreter_base,
         phdr: image.phdr,
         phent: image.phent,
         phnum: image.phnum,
@@ -500,7 +505,9 @@ fn initial_stack_pages(
         stack_size: INITIAL_STACK_SIZE,
     })
     .map_err(|error| fail(format!("initial stack sizing: {error:?}")))?;
-    Ok(stack.bytes.len() / 4096)
+    // The guest owner backs the configured bootstrap stack, including its
+    // zero prefix. Serialization still copies only the initialized tail.
+    Ok((INITIAL_STACK_SIZE / 4096) as usize)
 }
 
 fn record_bytes<T: Copy>(record: &T) -> &[u8] {
@@ -2749,6 +2756,10 @@ impl Cpl0Carrier {
                 magic: X86_INITIAL_BOOT_MAGIC,
                 version: X86_INITIAL_BOOT_VERSION,
                 region_count: image.regions.len() as u32,
+                executable_region_count: image.executable_region_count as u32,
+                executable_entry: image.executable_entry,
+                interpreter_base: image.interpreter_base,
+                reserved: 0,
                 entry: image.entry,
                 phdr: image.phdr,
                 phent: image.phent,
@@ -2911,6 +2922,7 @@ impl Cpl0Carrier {
                 image
                     .regions
                     .iter()
+                    .take(image.executable_region_count)
                     .map(|region| region.end)
                     .max()
                     .unwrap_or(0),
@@ -6321,7 +6333,8 @@ mod cpl0_layout_tests {
     #[test]
     fn static_pie_reservations_follow_image_break_above_old_arena_and_stack() {
         let elf = static_pie_elf();
-        let image = carrick_mem::x86_initial_image::prepare_static_x86_elf(&elf).unwrap();
+        let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).unwrap();
+        let image = carrick_mem::x86_initial_image::prepare_x86_elf(&program).unwrap();
         let initial_break = image.regions.iter().map(|region| region.end).max().unwrap();
         assert_eq!(initial_break, 0x88_0013_1000);
         assert!(initial_break > 0x4000_0000 && initial_break > INITIAL_STACK_TOP);

@@ -6,7 +6,7 @@
 mod physical_inventory;
 use physical_inventory::physical_inventory;
 
-use carrick_mem::x86_initial_image::prepare_static_x86_elf;
+use carrick_mem::x86_initial_image::prepare_x86_elf;
 use carrick_vmm_kvm::cpl0_boot::{Cpl0Carrier, InitialReservationLimits, InitialTaskBinding};
 #[path = "common/kvm_pool_fixture.rs"]
 mod kvm_pool_fixture;
@@ -24,7 +24,8 @@ fn initial_root_uses_issued_thread_and_file_table_identity() {
     fn assert_send<T: Send>() {}
     assert_send::<carrick_vmm_kvm::cpl0_boot::ProductionWorkerParts>();
     let elf = tiny_elf();
-    let image = prepare_static_x86_elf(&elf).expect("static ELF");
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
+    let image = prepare_x86_elf(&program).expect("static ELF");
     let extent =
         Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("initial grant extent");
     let mut carrier =
@@ -192,7 +193,8 @@ fn explicit_initial_process_kick_preempts_and_resumes_under_pool() {
 #[test]
 fn shared_guest_owner_loads_static_elf_and_exits_seven() {
     let elf = tiny_elf();
-    let plan = prepare_static_x86_elf(&elf).expect("shared ELF parser");
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
+    let plan = prepare_x86_elf(&program).expect("shared ELF parser");
     assert_eq!(
         (plan.entry, plan.phdr, plan.phent, plan.phnum),
         (0x4000b0, 0x400040, 56, 1)
@@ -221,10 +223,56 @@ fn production_static_pie_loads_above_low_stack_and_exits_seven() {
     elf[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN without PT_INTERP
     elf[24..32].copy_from_slice(&0xb0u64.to_le_bytes());
     elf[80..88].copy_from_slice(&0u64.to_le_bytes());
-    let plan = prepare_static_x86_elf(&elf).expect("static PIE parser");
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
+    let plan = prepare_x86_elf(&program).expect("static PIE parser");
     assert_eq!(plan.entry, carrick_mem::elf::LINUX_PIE_DEFAULT_BASE + 0xb0);
     let outcome = run_pool_fixture(&elf, 8);
     assert_eq!(outcome.run.exit_code, 7);
+}
+
+#[test]
+fn production_enters_pt_interp_instead_of_executable_entry() {
+    let mut elf = tiny_elf();
+    elf.resize(0x200, 0);
+    elf.copy_within(64..120, 120);
+    elf[64..120].fill(0);
+    elf[64..68].copy_from_slice(&3u32.to_le_bytes());
+    elf[72..80].copy_from_slice(&0x180u64.to_le_bytes());
+    let path = b"/lib/ld-test.so\0";
+    elf[96..104].copy_from_slice(&(path.len() as u64).to_le_bytes());
+    elf[0x180..0x180 + path.len()].copy_from_slice(path);
+    elf[56..58].copy_from_slice(&2u16.to_le_bytes());
+    elf[24..32].copy_from_slice(&0x400100u64.to_le_bytes());
+    elf[152..160].copy_from_slice(&0x200u64.to_le_bytes());
+    elf[0x100..0x102].copy_from_slice(&[0x0f, 0x0b]); // Main must not enter ud2.
+
+    let mut interpreter = tiny_elf();
+    interpreter[16..18].copy_from_slice(&3u16.to_le_bytes());
+    interpreter[24..32].copy_from_slice(&0xb0u64.to_le_bytes());
+    interpreter[80..88].copy_from_slice(&0u64.to_le_bytes());
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|requested| {
+        assert_eq!(requested, "/lib/ld-test.so");
+        Some(interpreter.clone())
+    })
+    .expect("shared ELF loader");
+    let outcome = kvm_pool_fixture::try_run_program_with(&program, 8, |_| {})
+        .expect("PT_INTERP production entry");
+    assert_eq!(outcome.run.exit_code, 7);
+}
+
+#[test]
+fn production_bootstrap_stack_prefix_accepts_user_writes() {
+    let mut elf = tiny_elf();
+    let exit = elf[0xb0..0xbe].to_vec();
+    elf.resize(0x100, 0);
+    elf[96..104].copy_from_slice(&0x100u64.to_le_bytes());
+    // sub rsp,8192; mov qword [rsp],0x5a; exit_group(7).
+    let mut code = vec![
+        0x48, 0x81, 0xec, 0, 0x20, 0, 0, 0x48, 0xc7, 0x04, 0x24, 0x5a, 0, 0, 0,
+    ];
+    code.extend_from_slice(&exit);
+    elf[0xb0..0xb0 + code.len()].copy_from_slice(&code);
+    assert_eq!(run_pool_fixture(&elf, 8).run.exit_code, 7);
 }
 
 #[test]
@@ -235,7 +283,8 @@ fn production_extent_cannot_alias_kernel_metadata() {
     let mut carrier = Cpl0Carrier::boot_production(physical_inventory(), extent_bytes)
         .expect("production KVM image");
     let elf = tiny_elf();
-    let image = prepare_static_x86_elf(&elf).expect("static ELF");
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
+    let image = prepare_x86_elf(&program).expect("static ELF");
     carrier
         .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
         .expect("shared MM owner");
@@ -288,7 +337,8 @@ fn production_irq_entry_retains_each_native_vector_from_live_user_mode() {
 #[test]
 fn production_initial_mm_admits_one_shared_reservation_root() {
     let elf = tiny_elf();
-    let plan = prepare_static_x86_elf(&elf).expect("static ELF plan");
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
+    let plan = prepare_x86_elf(&program).expect("static ELF plan");
     let argv = vec!["/tiny".to_owned()];
     let extent =
         Cpl0Carrier::initial_extent_bytes_for(&plan, &argv, &[]).expect("typed initial extent");

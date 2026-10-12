@@ -6,7 +6,7 @@
 mod physical_inventory;
 use physical_inventory::physical_inventory;
 
-use carrick_mem::x86_initial_image::prepare_static_x86_elf;
+use carrick_mem::x86_initial_image::prepare_x86_elf;
 use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
 use carrick_x86::cpl0_entry::OBSERVE_INITIAL_MM;
 use std::path::PathBuf;
@@ -92,7 +92,8 @@ fn fork_wait_elf_with_nonblocking_probe() -> Vec<u8> {
 #[test]
 fn static_elf_fork_child_cow_wait_and_parent_exit_seven() {
     let elf = fork_wait_elf();
-    let plan = prepare_static_x86_elf(&elf).expect("shared static ELF plan");
+    let program = carrick_mem::elf::ElfProgram::load(&elf, 62, &|_| None).expect("ELF program");
+    let plan = prepare_x86_elf(&program).expect("shared static ELF plan");
     assert_eq!(plan.entry, 0x4000b0);
     let program = initial_process_program(&elf);
     let mut carrier =

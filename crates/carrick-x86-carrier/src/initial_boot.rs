@@ -155,6 +155,9 @@ fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
     if request.magic != X86_INITIAL_BOOT_MAGIC
         || request.version != X86_INITIAL_BOOT_VERSION
         || request.region_count == 0
+        || request.executable_region_count == 0
+        || request.executable_region_count > request.region_count
+        || request.reserved != 0
         || request.region_count as usize > X86_INITIAL_MAX_REGIONS
         || usize::from(request.argc) + usize::from(request.envc) > X86_INITIAL_MAX_STRINGS
         || request.extent_pages == 0
@@ -295,7 +298,8 @@ fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
         }
     }
     let stack = InitialStackSpec {
-        entry: request.entry,
+        entry: request.executable_entry,
+        interpreter_base: request.interpreter_base,
         phdr: request.phdr,
         phent: request.phent,
         phnum: request.phnum,
@@ -331,6 +335,8 @@ fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
             generation,
             &InitialImageSpec {
                 regions: &image_regions,
+                executable_region_count: request.executable_region_count as usize,
+                entry: carrick_guest_arch::UserVa::new(request.entry),
                 stack,
             },
         )
