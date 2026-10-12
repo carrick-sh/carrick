@@ -43,7 +43,6 @@ impl<C: carrick_el1_abi::EntryContext> carrick_core::mm::transaction::OwnerVenue
         carrick_personality_linux::mm::cancelled_copy_errno()
     }
 }
-#[cfg(target_arch = "aarch64")]
 pub type MmPortal<'a, P, B = NativePortalMmu> = carrick_core::mm::transaction::MmPortal<
     'a,
     P,
@@ -53,16 +52,6 @@ pub type MmPortal<'a, P, B = NativePortalMmu> = carrick_core::mm::transaction::M
     B,
     carrick_el1_abi::Aarch64ParkedContext,
 >;
-#[cfg(not(target_arch = "aarch64"))]
-pub type MmPortal<'a, P, B = NativePortalMmu> = carrick_core::mm::transaction::MmPortal<
-    'a,
-    P,
-    LinuxReservationPolicy,
-    NativeReservationGeometry,
-    NativeOwnerVenue,
-    B,
->;
-
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub(crate) fn current_mm_words<
     'a,
