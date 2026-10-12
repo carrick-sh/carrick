@@ -385,7 +385,7 @@ impl InterruptBackend for Aarch64Backend {
         // SAFETY: the carrier maps and retains the zone table through this
         // EL1 execution epoch; the target slot is bounds-checked above.
         let zone =
-            unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_sched_core::ZoneTables) };
+            unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
         let route = zone.slot(slot).sgi_target();
         if route == 0 {
             return Err(ArchError::Unbound);
