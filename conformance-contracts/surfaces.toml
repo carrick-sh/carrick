@@ -1108,7 +1108,7 @@ path = "crates/carrick-hal/src/fork_stock/tests.rs"
 contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
 
 [[surfaces]]
-path = "crates/carrick-el1-abi/src/x86_prepare_stock.rs"
+path = "crates/carrick-core-abi/src/prepare_stock.rs"
 contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents"]
 
 [[surfaces]]

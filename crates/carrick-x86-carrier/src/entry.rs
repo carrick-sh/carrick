@@ -466,7 +466,7 @@ pub struct InitialWords {
     start: u64,
     end: u64,
     edit_root: Option<carrick_guest_arch::RootGpa>,
-    working: Option<carrick_el1_abi::X86PrepareTableSpan>,
+    working: Option<carrick_core_abi::X86PrepareTableSpan>,
     pub context: Option<carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>>,
 }
 
@@ -475,7 +475,7 @@ impl InitialWords {
         start: u64,
         end: u64,
         edit_root: Option<carrick_guest_arch::RootGpa>,
-        working: Option<carrick_el1_abi::X86PrepareTableSpan>,
+        working: Option<carrick_core_abi::X86PrepareTableSpan>,
         context: Option<carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>>,
     ) -> Self {
         Self {
@@ -501,7 +501,7 @@ impl InitialWords {
         table_start: u64,
         table_end: u64,
         context: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
-        working: carrick_el1_abi::X86PrepareTableSpan,
+        working: carrick_core_abi::X86PrepareTableSpan,
     ) -> Self {
         Self {
             start: table_start,

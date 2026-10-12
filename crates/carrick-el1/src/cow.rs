@@ -1464,8 +1464,8 @@ mod x86_cow_tests {
     #[test]
     fn x86_cow_refuses_permanent_aliases_without_private_copy_window() {
         let words = Words::new();
-        let source = carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_VA + SOURCE
-            - carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_GPA;
+        let source = carrick_core_abi::X86_CPL0_INITIAL_EXTENT_VA + SOURCE
+            - carrick_core_abi::X86_CPL0_INITIAL_EXTENT_GPA;
         let destination = carrick_el1_abi::X86_CPL0_DIRECT_VA + DESTINATION;
         words.map(source, SOURCE, PRESENT);
         words.map(destination, DESTINATION, PRESENT | WRITE);
@@ -1540,8 +1540,8 @@ mod x86_cow_tests {
     #[test]
     fn x86_cow_refuses_wrong_or_nonwritable_copy_aliases_without_copying() {
         use carrick_core::mm::cow::CowRepointOutcome;
-        let source = carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_VA + SOURCE
-            - carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_GPA;
+        let source = carrick_core_abi::X86_CPL0_INITIAL_EXTENT_VA + SOURCE
+            - carrick_core_abi::X86_CPL0_INITIAL_EXTENT_GPA;
         let destination = carrick_el1_abi::X86_CPL0_DIRECT_VA + DESTINATION;
         for (source_output, destination_output, destination_flags) in [
             (SOURCE + 4096, DESTINATION, PRESENT | WRITE),
@@ -1581,8 +1581,8 @@ mod x86_cow_tests {
                 .checked_add(destination_gpa)
                 .is_none()
         );
-        let source = carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_VA + SOURCE
-            - carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_GPA;
+        let source = carrick_core_abi::X86_CPL0_INITIAL_EXTENT_VA + SOURCE
+            - carrick_core_abi::X86_CPL0_INITIAL_EXTENT_GPA;
         words.map(source, SOURCE, PRESENT);
         let mut copies = 0;
         assert_eq!(

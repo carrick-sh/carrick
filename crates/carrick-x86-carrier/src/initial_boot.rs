@@ -1,6 +1,9 @@
 use crate::entry::InitialWords;
 use crate::personality::Personality;
 use carrick_core_abi::{
+    X86_CPL0_INITIAL_EXTENT_GPA, X86_CPL0_INITIAL_EXTENT_MAX_SIZE, X86_CPL0_INITIAL_EXTENT_VA,
+};
+use carrick_core_abi::{
     X86_INITIAL_BOOT_LOADED, X86_INITIAL_BOOT_MAGIC, X86_INITIAL_BOOT_PORT,
     X86_INITIAL_BOOT_REFUSED, X86_INITIAL_BOOT_VERSION, X86_INITIAL_MAX_REGIONS,
     X86_INITIAL_MAX_STRINGS, X86_INITIAL_RUNNER_READY_PORT, X86InitialBootGrant,
@@ -9,9 +12,6 @@ use carrick_core_abi::{
 use carrick_el1::isa::x86::initial_mm::{
     InitialDataGrant, InitialFrameSource, InitialImageRegion, InitialImageSpec, InitialSourceRange,
     InitialStackSpec, install_initial_image,
-};
-use carrick_el1_abi::{
-    X86_CPL0_INITIAL_EXTENT_GPA, X86_CPL0_INITIAL_EXTENT_MAX_SIZE, X86_CPL0_INITIAL_EXTENT_VA,
 };
 use carrick_guest_arch::{
     EditBacking, EditPermissions, FrameGpa, GuestLen, MmuBackend, RootGpa, UserVa,
@@ -232,7 +232,7 @@ fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
         }
     }
     let occupied_end = first_grant.checked_add(grant_count.checked_mul(PAGE as usize)? as u64)?;
-    let working = carrick_el1_abi::X86PrepareTableSpan::derive(
+    let working = carrick_core_abi::X86PrepareTableSpan::derive(
         GuestLen::new(extent_bytes),
         FrameGpa::new(occupied_end),
         core::num::NonZeroUsize::new(2)?,
