@@ -1168,7 +1168,9 @@ fn qualified_template(config: &Value, site: &Site) -> bool {
         && config["scsi0"]
             .as_str()
             .is_some_and(|s| s.starts_with(&storage) && s.contains(&size))
-        && config["net0"].as_str().is_some_and(|s| s.contains(&bridge))
+        && config["net0"].as_str().is_some_and(|s| {
+            s.contains(&bridge) && (!site.isolates_bridge() || s.contains("firewall=1"))
+        })
 }
 
 /// Foreground Willow controller. The pilot admission always runs with one
@@ -1610,11 +1612,14 @@ mod tests {
         let mut config = json!({
             "cpu":"host", "cores":8, "memory":"16384",
             "scsi0":"local:300/base-300-disk-0.qcow2,size=100G",
-            "net0":"virtio=BC:24:11:00:00:01,bridge=vmbr1"
+            "net0":"virtio=BC:24:11:00:00:01,bridge=vmbr1,firewall=1"
         });
         assert!(qualified_template(&config, contabo));
         assert!(!qualified_template(&config, willow));
-        config["net0"] = json!("virtio=BC:24:11:00:00:01,bridge=vmbr0");
+        config["net0"] = json!("virtio=BC:24:11:00:00:01,bridge=vmbr0,firewall=1");
+        assert!(!qualified_template(&config, contabo));
+        // On a shared private bridge the PVE VM firewall is mandatory.
+        config["net0"] = json!("virtio=BC:24:11:00:00:01,bridge=vmbr1");
         assert!(!qualified_template(&config, contabo));
     }
     #[test]
