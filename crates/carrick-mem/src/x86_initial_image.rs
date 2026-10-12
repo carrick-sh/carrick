@@ -2,14 +2,12 @@
 //! The parser and stack serializer are the same ones used by the ARM image
 //! path. This module supplies no page-table or physical-frame authority.
 
-use crate::elf::{ElfInspectError, ElfType, SegmentPerms, plan_elf_load_bytes_for};
+use crate::elf::{ElfProgram, ElfType, LoadPlan, Machine, SegmentPerms};
 
 #[derive(::core::fmt::Debug, ::thiserror::Error)]
 pub enum X86InitialImageError {
-    #[error("invalid x86 ELF: {0}")]
-    Elf(#[from] ElfInspectError),
-    #[error("x86 ELF requires a dynamic interpreter")]
-    Interpreter,
+    #[error("x86 ELF load plan has wrong machine: {0:?}")]
+    InvalidMachine(Machine),
     #[error("x86 ELF program headers are not mapped in a PT_LOAD segment")]
     MissingProgramHeaders,
     #[error("x86 ELF entry is outside executable PT_LOAD memory")]
@@ -22,11 +20,17 @@ pub enum X86InitialImageError {
 /// frames, writes descriptors and publishes its exact edit receipts.
 #[derive(::core::fmt::Debug)]
 pub struct X86InitialImage<'a> {
+    /// Initial RIP, at the interpreter when PT_INTERP is present.
     pub entry: u64,
+    /// Executable entry for AT_ENTRY, independent of initial RIP.
+    pub executable_entry: u64,
+    pub interpreter_base: u64,
     pub phdr: u64,
     pub phent: u16,
     pub phnum: u16,
     pub regions: Vec<X86InitialRegion<'a>>,
+    /// Executable regions precede interpreter regions; only these set brk.
+    pub executable_region_count: usize,
 }
 
 /// A page-rounded PT_LOAD description borrowing only initialized file bytes.
@@ -40,32 +44,18 @@ pub struct X86InitialRegion<'a> {
     pub perms: SegmentPerms,
 }
 
-/// Parse one static x86_64 ELF using Carrick's existing ISA-neutral planner.
+/// Describe the executable and interpreter from the shared ELF loader.
 /// The host may read the ELF file, but no host code creates the task stack or
 /// writes a guest page-table descriptor.
-pub fn prepare_static_x86_elf(elf: &[u8]) -> Result<X86InitialImage<'_>, X86InitialImageError> {
-    const X86_USER_END: u64 = 0x0000_8000_0000_0000;
-    let plan = plan_elf_load_bytes_for(elf, 62)?;
-    if plan.interpreter.is_some() {
-        return Err(X86InitialImageError::Interpreter);
-    }
+pub fn prepare_x86_elf<'a>(
+    program: &'a ElfProgram<'_>,
+) -> Result<X86InitialImage<'a>, X86InitialImageError> {
+    let plan = &program.executable;
     let Some(phdr) = plan.program_header_address else {
         return Err(X86InitialImageError::MissingProgramHeaders);
     };
     if plan.program_header_count == 0 {
         return Err(X86InitialImageError::MissingProgramHeaders);
-    }
-    if !matches!(plan.e_type, ElfType::Exec | ElfType::Dyn)
-        || !plan.segments.iter().any(|segment| {
-            segment.perms.execute
-                && segment.virtual_address <= plan.entry
-                && segment
-                    .virtual_address
-                    .checked_add(segment.memory_size)
-                    .is_some_and(|end| plan.entry < end)
-        })
-    {
-        return Err(X86InitialImageError::InvalidEntry);
     }
     let phdr_end = phdr
         .checked_add(
@@ -80,6 +70,49 @@ pub fn prepare_static_x86_elf(elf: &[u8]) -> Result<X86InitialImage<'_>, X86Init
                 .is_some_and(|end| phdr_end <= end)
     }) {
         return Err(X86InitialImageError::MissingProgramHeaders);
+    }
+    let mut regions = image_regions(program.executable_bytes, plan)?;
+    let executable_region_count = regions.len();
+    if let Some(interpreter) = &program.interpreter {
+        regions.extend(image_regions(&interpreter.bytes, &interpreter.plan)?);
+    }
+    // Check the union without losing executable/interpreter identity.
+    let mut ordered: Vec<_> = regions.iter().collect();
+    ordered.sort_by_key(|region| region.start);
+    if ordered.windows(2).any(|pair| pair[0].end > pair[1].start) {
+        return Err(X86InitialImageError::InvalidRegion);
+    }
+    Ok(X86InitialImage {
+        entry: program.entry(),
+        executable_entry: plan.entry,
+        interpreter_base: program.interpreter_base().unwrap_or(0),
+        phdr,
+        phent: plan.program_header_entry_size,
+        phnum: plan.program_header_count,
+        regions,
+        executable_region_count,
+    })
+}
+
+fn image_regions<'a>(
+    elf: &'a [u8],
+    plan: &LoadPlan,
+) -> Result<Vec<X86InitialRegion<'a>>, X86InitialImageError> {
+    const X86_USER_END: u64 = 0x0000_8000_0000_0000;
+    if plan.machine != Machine::X86_64 {
+        return Err(X86InitialImageError::InvalidMachine(plan.machine));
+    }
+    if !matches!(plan.e_type, ElfType::Exec | ElfType::Dyn)
+        || !plan.segments.iter().any(|segment| {
+            segment.perms.execute
+                && segment.virtual_address <= plan.entry
+                && segment
+                    .virtual_address
+                    .checked_add(segment.memory_size)
+                    .is_some_and(|end| plan.entry < end)
+        })
+    {
+        return Err(X86InitialImageError::InvalidEntry);
     }
     let mut regions = Vec::with_capacity(plan.segments.len());
     for segment in &plan.segments {
@@ -125,11 +158,5 @@ pub fn prepare_static_x86_elf(elf: &[u8]) -> Result<X86InitialImage<'_>, X86Init
         }
         previous_end = region.end;
     }
-    Ok(X86InitialImage {
-        entry: plan.entry,
-        phdr,
-        phent: plan.program_header_entry_size,
-        phnum: plan.program_header_count,
-        regions,
-    })
+    Ok(regions)
 }

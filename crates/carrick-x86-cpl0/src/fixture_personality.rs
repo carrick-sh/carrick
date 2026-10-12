@@ -440,8 +440,11 @@ impl Personality for FixturePersonality {
                 };
                 let image = InitialImageSpec {
                     regions: core::slice::from_ref(&region),
+                    executable_region_count: 1,
+                    entry: carrick_guest_arch::UserVa::new(0x4000b0),
                     stack: InitialStackSpec {
                         entry: 0x4000b0,
+                        interpreter_base: 0,
                         phdr: 0x400040,
                         phent: 56,
                         phnum: 1,
@@ -484,7 +487,8 @@ impl Personality for FixturePersonality {
                 let Ok(loaded) = loaded else {
                     fatal_error(frame);
                 };
-                if loaded.publications.len() != 2
+                // One text page plus all four configured bootstrap stack pages.
+                if loaded.publications.len() != 5
                     || !loaded.context.authenticates(loaded.address)
                     || loaded.context.frame[15] != 0x4000b0
                     || loaded.context.frame[18] != loaded.stack_pointer

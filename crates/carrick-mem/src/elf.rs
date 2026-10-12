@@ -66,6 +66,7 @@ pub struct ElfMetadata {
 
 #[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize)]
 pub struct LoadPlan {
+    pub machine: Machine,
     pub entry: u64,
     /// Validated PT_INTERP pathname bytes, up to the first NUL.
     pub interpreter: Option<Vec<u8>>,
@@ -105,6 +106,85 @@ impl LoadPlan {
         }
         self.load_bias = new_bias;
         self
+    }
+}
+
+/// The executable and its optional interpreter, planned once for either ISA.
+/// Mapping and stack ownership remain with the execution lane's MM owner.
+pub struct ElfProgram<'a> {
+    pub executable_bytes: &'a [u8],
+    pub executable: LoadPlan,
+    pub interpreter: Option<ElfInterpreter>,
+}
+
+pub struct ElfInterpreter {
+    pub path: String,
+    pub bytes: Vec<u8>,
+    pub plan: LoadPlan,
+}
+
+impl<'a> ElfProgram<'a> {
+    pub fn load(
+        bytes: &'a [u8],
+        machine: u16,
+        read_interp: &dyn Fn(&str) -> Option<Vec<u8>>,
+    ) -> Result<Self, ElfInspectError> {
+        Self::resolve(
+            bytes,
+            plan_elf_load_bytes_for(bytes, machine)?,
+            machine,
+            read_interp,
+        )
+    }
+
+    /// Resolve PT_INTERP through the guest filesystem reader. ET_DYN
+    /// interpreters use the shared interpreter window; ET_EXEC keeps its
+    /// specified addresses (ELF gABI, Program Interpreter).
+    pub fn resolve(
+        executable_bytes: &'a [u8],
+        executable: LoadPlan,
+        machine: u16,
+        read_interp: &dyn Fn(&str) -> Option<Vec<u8>>,
+    ) -> Result<Self, ElfInspectError> {
+        let interpreter = executable
+            .interpreter
+            .as_deref()
+            .map(|path| -> Result<ElfInterpreter, ElfInspectError> {
+                let path =
+                    std::str::from_utf8(path).map_err(ElfInspectError::InterpreterPathEncoding)?;
+                let bytes = read_interp(path)
+                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+                let mut plan = plan_elf_load_bytes_for(&bytes, machine)
+                    .map_err(|error| ElfInspectError::Interpreter(Box::new(error)))?;
+                // Its own PT_INTERP is metadata, never a second filesystem
+                // lookup. Preserve the existing ARM loader's one-read policy.
+                if plan.e_type == ElfType::Dyn {
+                    plan = plan.with_load_bias(crate::memory::LINUX_INTERPRETER_BASE);
+                }
+                Ok(ElfInterpreter {
+                    path: path.to_owned(),
+                    bytes,
+                    plan,
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            executable_bytes,
+            executable,
+            interpreter,
+        })
+    }
+
+    pub fn entry(&self) -> u64 {
+        self.interpreter
+            .as_ref()
+            .map_or(self.executable.entry, |interp| interp.plan.entry)
+    }
+
+    pub fn interpreter_base(&self) -> Option<u64> {
+        self.interpreter
+            .as_ref()
+            .map(|interp| interp.plan.load_bias)
     }
 }
 
@@ -341,6 +421,8 @@ pub fn rw_page_spans(plan: &LoadPlan) -> Vec<RwSpan> {
 
 #[derive(Debug, ::thiserror::Error)]
 pub enum ElfInspectError {
+    #[error("failed to inspect ELF interpreter: {0}")]
+    Interpreter(#[source] Box<ElfInspectError>),
     #[error("failed to read ELF binary: {0}")]
     Io(#[from] std::io::Error),
     #[error("not an ELF binary")]
@@ -455,17 +537,21 @@ fn metadata_from_elf(elf: &Elf<'_>, interpreter: Option<&[u8]>) -> ElfMetadata {
         } else {
             ElfEndianness::Big
         },
-        machine: match elf.header.e_machine {
-            EM_AARCH64 => Machine::Aarch64,
-            EM_X86_64 => Machine::X86_64,
-            other => Machine::Other(other),
-        },
+        machine: machine_from(elf.header.e_machine),
         entry: elf.entry,
         interpreter: interpreter.map(<[u8]>::to_vec),
         is_dynamic: elf.dynamic.is_some(),
         program_header_count: elf.program_headers.len(),
         shared_object: elf.is_lib,
         e_type: elf_type_from(elf.header.e_type),
+    }
+}
+
+fn machine_from(machine: u16) -> Machine {
+    match machine {
+        EM_AARCH64 => Machine::Aarch64,
+        EM_X86_64 => Machine::X86_64,
+        other => Machine::Other(other),
     }
 }
 
@@ -511,6 +597,7 @@ fn load_plan_from_elf(elf: &Elf<'_>, interpreter: Option<&[u8]>) -> LoadPlan {
         .collect();
 
     LoadPlan {
+        machine: machine_from(elf.header.e_machine),
         entry: load_bias.wrapping_add(elf.entry),
         interpreter: interpreter.map(<[u8]>::to_vec),
         program_header_address: program_header_address(elf, &segments),
@@ -656,6 +743,7 @@ mod tests {
 
     fn plan_with_segments(segments: Vec<LoadSegment>) -> LoadPlan {
         LoadPlan {
+            machine: Machine::Aarch64,
             entry: 0x400000,
             interpreter: None,
             program_header_address: None,

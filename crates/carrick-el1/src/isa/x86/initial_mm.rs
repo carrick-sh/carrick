@@ -29,6 +29,7 @@ enum AuxvTag {
     Phent = 4,
     Phnum = 5,
     Pagesz = 6,
+    Base = 7,
     Flags = 8,
     Entry = 9,
     Uid = 11,
@@ -55,10 +56,11 @@ pub enum InitialMmError {
     PublicationRefused,
 }
 
-/// Inputs from a validated static ELF load plan. `random` is a fresh 16-byte
+/// Inputs from a validated executable load plan. `random` is a fresh 16-byte
 /// carrier CSPRNG grant; the guest places its bytes and publishes the address.
 pub struct InitialStackSpec<'a> {
     pub entry: u64,
+    pub interpreter_base: u64,
     pub phdr: u64,
     pub phent: u16,
     pub phnum: u16,
@@ -69,8 +71,9 @@ pub struct InitialStackSpec<'a> {
     pub stack_size: u64,
 }
 
-/// Only the initialized tail is materialized; the rest of the stack remains
-/// an MM reservation. `base` and `bytes` cover whole 4 KiB pages.
+/// Only the initialized tail is serialized. The MM owner supplies private
+/// zeroed frames for the full configured stack. `base` and `bytes` cover
+/// whole 4 KiB pages.
 pub struct InitialStackImage {
     pub base: u64,
     pub bytes: Vec<u8>,
@@ -117,6 +120,7 @@ pub fn build_initial_stack(
         || spec.stack_size & (PAGE - 1) != 0
         || spec.stack_top.checked_sub(spec.stack_size).is_none()
         || spec.entry >= USER_END
+        || spec.interpreter_base >= USER_END
         || spec.phdr >= USER_END
         || spec.phent == 0
         || spec.phnum == 0
@@ -132,7 +136,7 @@ pub fn build_initial_stack(
         })
         .ok_or(InitialMmError::StackTooLarge)?;
     let execfn = spec.argv.first().copied().unwrap_or(b"");
-    let auxv_count = 18usize;
+    let auxv_count = 19usize;
     let pointer_words = 1usize
         .checked_add(spec.argv.len())
         .and_then(|sum| sum.checked_add(1 + spec.envp.len() + 1))
@@ -182,6 +186,7 @@ pub fn build_initial_stack(
         (AuxvTag::Phent as u64, u64::from(spec.phent)),
         (AuxvTag::Phnum as u64, u64::from(spec.phnum)),
         (AuxvTag::Pagesz as u64, PAGE),
+        (AuxvTag::Base as u64, spec.interpreter_base),
         (AuxvTag::Flags as u64, 0),
         (AuxvTag::Entry as u64, spec.entry),
         (AuxvTag::Uid as u64, 0),
@@ -245,6 +250,10 @@ pub struct InitialImageRegion {
 
 pub struct InitialImageSpec<'a> {
     pub regions: &'a [InitialImageRegion],
+    /// Only executable PT_LOAD regions determine the initial program break.
+    pub executable_region_count: usize,
+    /// Entry into the interpreter, or the executable for a static image.
+    pub entry: UserVa,
     pub stack: InitialStackSpec<'a>,
 }
 
@@ -370,11 +379,15 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
     generation: NonZeroU64,
     image: &InitialImageSpec<'_>,
 ) -> Result<InitialMmImage, InitialMmError> {
+    if image.executable_region_count == 0 || image.executable_region_count > image.regions.len() {
+        return Err(InitialMmError::InvalidRange);
+    }
     let stack = build_initial_stack(&image.stack)?;
+    let stack_floor = image.stack.stack_top - image.stack.stack_size;
     let stack_region = MappedRegion {
-        start: stack.base,
-        len: stack.bytes.len() as u64,
-        initialized_offset: 0,
+        start: stack_floor,
+        len: image.stack.stack_size,
+        initialized_offset: stack.base - stack_floor,
         contents: RegionContents::Stack(&stack.bytes),
         perms: EditPermissions {
             readable: true,
@@ -406,8 +419,8 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
     }
     if !image.regions.iter().any(|region| {
         region.perms.executable
-            && image.stack.entry >= region.start.raw()
-            && image.stack.entry < region.start.raw() + region.len.raw()
+            && image.entry.raw() >= region.start.raw()
+            && image.entry.raw() < region.start.raw() + region.len.raw()
     }) {
         return Err(InitialMmError::InvalidRange);
     }
@@ -415,6 +428,7 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
         image
             .regions
             .iter()
+            .take(image.executable_region_count)
             .map(|region| region.start.raw() + region.len.raw())
             .max()
             .ok_or(InitialMmError::InvalidRange)?,
@@ -548,7 +562,7 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
     super::x86::mmu::register_shared_supervisor_tables(words, source_root)
         .map_err(|_| InitialMmError::DescriptorRefused)?;
     let mut frame = [0; 20];
-    frame[15] = image.stack.entry;
+    frame[15] = image.entry.raw();
     frame[16] = 0x23; // user 64-bit code selector in the CPL0 GDT
     frame[17] = 0x202; // fixed bit plus interrupt enable
     frame[18] = stack.rsp;
@@ -685,8 +699,17 @@ mod tests {
 
     #[test]
     fn fresh_owner_maps_static_text_data_and_stack_with_publications() {
+        check_fresh_owner(false);
+    }
+
+    #[test]
+    fn fresh_owner_enters_interpreter_but_break_and_auxv_belong_to_executable() {
+        check_fresh_owner(true);
+    }
+
+    fn check_fresh_owner(interpreted: bool) {
         use carrick_guest_arch::EditPermissions;
-        let regions = [
+        let mut regions = image_alloc::vec![
             InitialImageRegion {
                 start: UserVa::new(0x400000),
                 len: GuestLen::new(0x1000),
@@ -718,8 +741,27 @@ mod tests {
                 },
             },
         ];
+        let interpreter_base = if interpreted { 0x8c_0000_0000 } else { 0 };
+        if interpreted {
+            regions.push(InitialImageRegion {
+                start: UserVa::new(interpreter_base),
+                len: GuestLen::new(PAGE),
+                initialized_offset: GuestLen::new(0),
+                initialized: InitialSourceRange {
+                    start: FrameGpa::new(0x10_000),
+                    len: GuestLen::new(12),
+                },
+                perms: regions[0].perms,
+            });
+        }
+        let entry = if interpreted {
+            interpreter_base
+        } else {
+            0x400000
+        };
         let stack = InitialStackSpec {
             entry: 0x400000,
+            interpreter_base,
             phdr: 0x400040,
             phent: 56,
             phnum: 1,
@@ -735,8 +777,14 @@ mod tests {
             .staged
             .insert(0x10_000, b"\xb8\xe7\0\0\0\xbf\x07\0\0\0\x0f\x05".to_vec());
         frames.staged.insert(0x11_000, b"hi\n".to_vec());
+        let auxv = build_initial_stack(&stack).unwrap().auxv;
+        for pair in [(7, interpreter_base), (9, 0x400000), (3, 0x400040), (5, 1)] {
+            assert!(auxv.contains(&pair));
+        }
         let image = InitialImageSpec {
             regions: &regions,
+            executable_region_count: 2,
+            entry: UserVa::new(entry),
             stack,
         };
         let source_root = RootGpa::page_aligned(FrameGpa::new(0x60_0000)).unwrap();
@@ -761,6 +809,21 @@ mod tests {
             )
         }
         .unwrap();
+        let stack_floor = image.stack.stack_top - image.stack.stack_size;
+        let lower_stack = translate_leaf(
+            &words,
+            loaded.address.root,
+            UserVa::new(stack_floor),
+            Access::Write,
+            true,
+        )
+        .expect("the configured bootstrap stack must be backed before interpreter entry");
+        assert!(
+            frames
+                .data_at(lower_stack.output.raw())
+                .iter()
+                .all(|byte| *byte == 0)
+        );
         let child_copy_tables =
             carrick_mmu_core::x86::copy_window::cow_copy_table_frames(&words, loaded.address.root)
                 .unwrap();
@@ -796,9 +859,9 @@ mod tests {
             0,
             "initial ELF data is private Linux mapping custody too"
         );
-        assert_eq!(loaded.publications.len(), 3);
+        assert_eq!(loaded.publications.len(), 6 + usize::from(interpreted));
         assert_eq!(loaded.initial_break.raw(), 0x403000);
-        assert_eq!(loaded.context.frame[15], 0x400000);
+        assert_eq!(loaded.context.frame[15], entry);
         assert_eq!(loaded.context.frame[16], 0x23);
         assert_eq!(loaded.context.frame[17], 0x202);
         assert_eq!(loaded.context.frame[18], loaded.stack_pointer);
@@ -845,9 +908,14 @@ mod tests {
                 .iter()
                 .all(|byte| *byte == 0)
         );
-        assert_eq!(frames.next_data, 0x90_3000, "one data grant per user page");
         assert_eq!(
-            frames.next_table, 0x80_9000,
+            frames.next_data,
+            0x90_6000 + PAGE * u64::from(interpreted),
+            "one data grant per user page"
+        );
+        assert_eq!(
+            frames.next_table,
+            0x80_9000 + 3 * PAGE * u64::from(interpreted),
             "one root, five user tables and three private copy tables"
         );
         assert_ne!(loaded.address.root.address().raw(), 0x60_0000);
@@ -857,6 +925,7 @@ mod tests {
     fn guest_stack_has_sysv_order_and_exact_auxv_addresses() {
         let spec = InitialStackSpec {
             entry: 0x401000,
+            interpreter_base: 0,
             phdr: 0x400040,
             phent: 56,
             phnum: 2,
