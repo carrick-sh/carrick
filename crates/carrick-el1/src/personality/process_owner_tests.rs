@@ -1533,6 +1533,41 @@ fn exit_status_is_not_waitable_before_mm_retirement_completes() {
 }
 
 #[test]
+fn autoreap_keeps_wait_population_until_retirement() {
+    use super::super::native_process_entry::publish_exit;
+    let mut owner = owner();
+    let parent = key(1, 1);
+    let child = key(2, 2);
+    owner.task_mut(parent).unwrap().native_mut().autoreap = true;
+    let releases = Rc::new(Cell::new(0));
+    birth(&mut owner, parent, child, releases.clone());
+    let (_resources, pending) = publish_exit(
+        &mut owner,
+        child,
+        None,
+        Transaction(98),
+        LinuxWaitStatus::from_wait_encoding(19 << 8),
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            owner.scan_wait(parent, query(WaitTarget::Any)).unwrap(),
+            WaitSelection::StillRunning(_)
+        ),
+        "autoreaped child vanished before MM retirement"
+    );
+    assert!(owner.task(parent).unwrap().children().contains(&child));
+    assert_eq!(releases.get(), 0);
+    // Exact numeric custody remains held even when the exit lane is dropped.
+    drop(pending);
+    assert!(matches!(
+        owner.scan_wait(parent, query(WaitTarget::Any)).unwrap(),
+        WaitSelection::StillRunning(_)
+    ));
+    assert_eq!(releases.get(), 0);
+}
+
+#[test]
 fn pending_exit_retirement_survives_reparenting_without_early_reap() {
     use super::super::native_process_entry::publish_exit;
     let mut owner = owner();

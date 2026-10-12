@@ -20,6 +20,10 @@ const X86_SYS_WRITE: u8 = 1;
 const X86_SYS_EXIT_GROUP: u8 = 231;
 
 fn native_exit_fixture(name: &str) -> Vec<u8> {
+    native_exit_fixture_with_flags(name, &[])
+}
+
+fn native_exit_fixture_with_flags(name: &str, flags: &[&str]) -> Vec<u8> {
     let dir = tempfile::tempdir().expect("fixture directory");
     let output = dir.path().join("guest");
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -34,6 +38,7 @@ fn native_exit_fixture(name: &str) -> Vec<u8> {
             "-no-pie",
             "-Wl,--build-id=none",
         ])
+        .args(flags)
         .arg(source)
         .arg("-o")
         .arg(&output)
@@ -311,6 +316,156 @@ fn native_runtime_wait_wakes_once_only_after_real_mm_retirement() {
         wakes_before + 1
     );
     drop(next_retire);
+}
+
+fn peer_retirement(
+    peer: &mut carrick_vmm_kvm::cpl0_boot::ProductionCpuLease,
+) -> carrick_vmm_kvm::carrier_cpu::CarrierRunExit {
+    use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
+    (0..128)
+        .find_map(|_| {
+            let exit = peer
+                .fixture_run_idle_peer()
+                .expect("child runtime progress");
+            if matches!(
+                exit,
+                CarrierRunExit::PhysicalDoorbell {
+                    port: carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT,
+                    ..
+                }
+            ) {
+                Some(exit)
+            } else {
+                assert!(
+                    peer.service_idle_peer_doorbell(&exit)
+                        .expect("physical service")
+                        .is_none()
+                );
+                None
+            }
+        })
+        .expect("child must reach actual MM retirement")
+}
+
+fn native_autoreap_waits_for_every_mm(flags: &[&str]) {
+    use carrick_hal::VcpuKick;
+    use carrick_sched_core::Claim;
+    use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
+    let elf = native_exit_fixture_with_flags("native_autoreap_exit.S", flags);
+    let (parts, root_tid) = native_exit_workers(&elf);
+    let (root, factory) = parts.into_factory();
+    let first_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
+    let second_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 2);
+    let mut parent = factory.claim(0).expect("root executor");
+    let mut peer = factory.claim(1).expect("peer executor");
+    let task = root.binding().task();
+    parent.cpu_mut().load(root).expect("load parent");
+    run_to_marker(&mut parent, task, 1, &factory);
+    factory
+        .fixture_place_native_thread(first_tid, carrick_guest_arch::CpuId::new(1))
+        .expect("first child on peer");
+    let first_retire = peer_retirement(&mut peer);
+    // The parent forks successfully while its first child is retiring.
+    run_to_marker(&mut parent, task, 2, &factory);
+    factory
+        .fixture_place_native_thread(second_tid, carrick_guest_arch::CpuId::new(1))
+        .expect("second child on peer");
+    assert!(
+        factory
+            .fork_admission_refusal()
+            .expect("fork evidence")
+            .is_none()
+    );
+    run_until_wait_enrolled(&mut parent, task, &factory, root_tid, false);
+    let (claim, _, wakes) = factory
+        .fixture_native_wait_state(root_tid)
+        .expect("first wait");
+    assert_eq!(claim, Claim::Parked { seq: 1 });
+    assert_eq!(wakes, 0, "pending MM cannot wake wait");
+    assert!(
+        peer.service_idle_peer_doorbell(&first_retire)
+            .expect("first MM retirement")
+            .is_none()
+    );
+    let second_retire = peer_retirement(&mut peer);
+    let (claim, _, wakes) = factory
+        .fixture_native_wait_state(root_tid)
+        .expect("first completion");
+    assert!(matches!(claim, Claim::Queued { .. }));
+    assert_eq!(wakes, 1);
+    // A wake for the first child is insufficient: wait(-1) must enroll again
+    // instead of returning ECHILD while the second child's MM is still charged.
+    run_until_wait_enrolled(&mut parent, task, &factory, root_tid, false);
+    let (claim, _, wakes) = factory
+        .fixture_native_wait_state(root_tid)
+        .expect("remaining child");
+    assert_eq!(claim, Claim::Parked { seq: 2 });
+    assert_eq!(wakes, 1);
+    assert!(
+        peer.service_idle_peer_doorbell(&second_retire)
+            .expect("last MM retirement")
+            .is_none()
+    );
+    // Observe the real completion wake and stop the peer after publication.
+    // Neither observer changes the wait population or publishes a wake.
+    let kick = carrick_vmm_kvm::KvmKickHandle::for_current_thread();
+    let stopped = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let watcher = scope.spawn(|| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let (claim, _, wakes) = factory
+                    .fixture_native_wait_state(root_tid)
+                    .expect("completion census");
+                if matches!(claim, Claim::Queued { .. }) && wakes == 2 {
+                    kick.kick();
+                    return true;
+                }
+                if stopped.load(std::sync::atomic::Ordering::Acquire)
+                    || std::time::Instant::now() >= deadline
+                {
+                    kick.kick();
+                    return false;
+                }
+                std::thread::yield_now();
+            }
+        });
+        let exit = peer
+            .fixture_run_idle_peer()
+            .expect("finish last native exit");
+        stopped.store(true, std::sync::atomic::Ordering::Release);
+        assert!(watcher.join().expect("bounded completion observer"));
+        assert_eq!(exit, CarrierRunExit::Kick);
+    });
+    // Actual wait returns -10 only now, followed by another successful fork.
+    run_to_marker(&mut parent, task, 3, &factory);
+    run_to_marker(&mut parent, task, 4, &factory);
+    assert!(
+        factory
+            .fork_admission_refusal()
+            .expect("final fork evidence")
+            .is_none()
+    );
+    let stock = factory.fork_stock_counters().expect("stock census");
+    assert_eq!(stock.capacity_refusals, 0);
+    assert_eq!(stock.retire_refusals, 0);
+    assert_eq!(
+        factory
+            .fixture_native_wait_state(root_tid)
+            .expect("resumed wait")
+            .2,
+        2
+    );
+}
+
+#[test]
+fn native_nocldwait_blocks_until_every_child_mm_retires() {
+    native_autoreap_waits_for_every_mm(&[]);
+}
+
+#[test]
+fn native_sigign_blocks_until_every_child_mm_retires() {
+    native_autoreap_waits_for_every_mm(&["-DIGNORE_SIGCHLD"]);
 }
 
 #[test]
