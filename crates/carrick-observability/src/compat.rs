@@ -558,6 +558,9 @@ pub struct ExecutionWitness {
     /// refusal reason, withdrawn lifecycle records, child retirement.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fork_stock_families: Vec<ExecutionFamilyCount>,
+    /// Last refused fork admission, including quarantine at that boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_admission_refusal: Option<ForkAdmissionRefusal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
@@ -1011,4 +1014,34 @@ fn render_section<T: std::fmt::Display>(out: &mut String, name: &str, rows: &[T]
         out.push_str(&row.to_string());
         out.push('\n');
     }
+}
+
+/// The exact bounded resource that refused fork admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[repr(u32)]
+pub enum ForkCapacityResource {
+    PendingLoan = 1,
+    Lifecycle = 2,
+    Tables = 3,
+    LoanIdentity = 4,
+    AddressTag = 5,
+    Ledger = 6,
+}
+
+/// Occupancy proof from the drain immediately preceding admission.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ForkQuarantineState {
+    pub mm: u64,
+    pub absent: bool,
+    pub carrier_released: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ForkAdmissionRefusal {
+    pub resource: ForkCapacityResource,
+    pub child_pages: u64,
+    pub parent_pages: u64,
+    pub available_pages: usize,
+    pub available_lifecycles: usize,
+    pub quarantine: Vec<ForkQuarantineState>,
 }
