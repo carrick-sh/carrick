@@ -1018,6 +1018,19 @@ runtime readiness before `retire_mm`, or omitting channel publication,
 fails this witness. The existing carrier watchdog bounds guest execution;
 the host census only observes atomic enrollment and never publishes readiness.
 
+`native_nocldwait_blocks_until_every_child_mm_retires` and
+`native_sigign_blocks_until_every_child_mm_retires` exercise real native
+`rt_sigaction` and `wait4(-1)` with two autoreaped children. Linux authority:
+[wait(2)](https://man7.org/linux/man-pages/man2/wait.2.html) and
+[sigaction(2)](https://man7.org/linux/man-pages/man2/sigaction.2.html).
+The parent admits a second fork with the first MM retirement held pending,
+enrolls a real wait, and must enroll again after the first completion while
+the second MM remains charged. Only the last completion may return errno
+10 (`ECHILD`), followed by another successful fork. Each completion wakes
+the enrolled waiter exactly once; no observer publishes readiness. The
+VM-free binding `autoreap_keeps_wait_population_until_retirement` retains
+the child edge and numeric claim even if the exit lane is abandoned.
+
 `child_born_on_idle_peer_can_fault_and_retire_on_root_executor` forces a
 fork loan and commit on the idle peer, then places that queued newborn on
 CPU 0 through the real scheduler claim/run queues. The fixture does not
