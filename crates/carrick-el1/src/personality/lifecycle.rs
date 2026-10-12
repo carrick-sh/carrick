@@ -90,7 +90,7 @@ impl<
     Context: super::dispatch::DispatchContext,
 > LifecycleNative<'a> for El1PendingFamilies<'a, F, C, U, G, Context>
 {
-    fn fail_lifecycle(&mut self, reason: carrick_el1_abi::NativeRunFailureReason) -> ! {
+    fn fail_lifecycle(&mut self, reason: carrick_core_abi::NativeRunFailureReason) -> ! {
         let binding = LifecycleNative::binding(self).unwrap_or_else(|| {
             super::dispatch::invalid_completion(super::dispatch::NativeInvariant::EntryBinding)
         });

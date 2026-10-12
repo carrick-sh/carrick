@@ -119,8 +119,8 @@ pub enum NativeProcessError {
     NoChild,
 }
 impl NativeProcessError {
-    pub fn run_failure_reason(self) -> carrick_el1_abi::NativeRunFailureReason {
-        use carrick_el1_abi::NativeRunFailureReason as R;
+    pub fn run_failure_reason(self) -> carrick_core_abi::NativeRunFailureReason {
+        use carrick_core_abi::NativeRunFailureReason as R;
         match self {
             Self::Invalid => R::NativeInvalid,
             Self::Stale => R::NativeStale,
@@ -1390,7 +1390,7 @@ pub struct NativeProcessEntry<
     service: &'r mut S,
     handoff: Option<EntryHandoffReceipt<C>>,
     root_exit: Option<LinuxWaitStatus>,
-    run_failure: Option<carrick_el1_abi::NativeRunFailureReason>,
+    run_failure: Option<carrick_core_abi::NativeRunFailureReason>,
     #[cfg(test)]
     publication_wait_probe: Option<&'r (dyn Fn(u32) + Sync)>,
     calling_tid: u32,
@@ -1431,10 +1431,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub fn set_slot_for_test(&mut self, slot: &'a ThreadControlSlot) {
         self.slot = Some(slot);
     }
-    pub fn take_run_failure(&mut self) -> Option<carrick_el1_abi::NativeRunFailureReason> {
+    pub fn take_run_failure(&mut self) -> Option<carrick_core_abi::NativeRunFailureReason> {
         self.run_failure.take()
     }
-    fn run_failed(&mut self, reason: carrick_el1_abi::NativeRunFailureReason) -> LifecycleOutcome {
+    fn run_failed(&mut self, reason: carrick_core_abi::NativeRunFailureReason) -> LifecycleOutcome {
         self.run_failure = Some(reason);
         if let Some(record) = self
             .source
@@ -2524,8 +2524,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
                 if page.live() > 1 && page.claimed_count() == 0 {
                     drop(graph);
-                    return Ok(self
-                        .run_failed(carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody));
+                    return Ok(self.run_failed(
+                        carrick_core_abi::NativeRunFailureReason::X86GroupExitCustody,
+                    ));
                 }
                 page.close();
                 let channel = Arc::new(WaitChannel {
@@ -2562,7 +2563,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
         if page.live() > 1 {
             return Ok(
-                self.run_failed(carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody)
+                self.run_failed(carrick_core_abi::NativeRunFailureReason::X86GroupExitCustody)
             );
         }
         let root_exit = self.is_root_process();
@@ -3144,7 +3145,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> ProcessNative<C>
     for NativeProcessEntry<'_, 'a, M, C, S>
 {
-    fn take_run_failure(&mut self) -> Option<carrick_el1_abi::NativeRunFailureReason> {
+    fn take_run_failure(&mut self) -> Option<carrick_core_abi::NativeRunFailureReason> {
         self.run_failure.take()
     }
     fn copy_out_owned(&mut self, dst: UserVa, bytes: &[u8]) -> Option<bool> {
@@ -3269,7 +3270,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         if let Err(error) = published {
             // The sole pending-exit wake cannot be retried or discarded. The
             // active clone lane reports typed run failure before guest return.
-            self.run_failure = Some(carrick_el1_abi::NativeRunFailureReason::BirthSettlement);
+            self.run_failure = Some(carrick_core_abi::NativeRunFailureReason::BirthSettlement);
             return Err(error.errno());
         }
         Ok(())
@@ -6010,7 +6011,7 @@ mod tests {
         ));
         assert_eq!(
             entry.take_run_failure(),
-            Some(carrick_el1_abi::NativeRunFailureReason::NativeStale),
+            Some(carrick_core_abi::NativeRunFailureReason::NativeStale),
             "stale caller retains its true cause"
         );
     }
@@ -6263,7 +6264,7 @@ mod tests {
             if resume_stale {
                 assert_eq!(
                     entry.take_run_failure(),
-                    Some(carrick_el1_abi::NativeRunFailureReason::NativeStale)
+                    Some(carrick_core_abi::NativeRunFailureReason::NativeStale)
                 );
                 assert!(entry.take_root_exit().is_none());
                 assert_eq!(page.live(), 1);
@@ -6417,7 +6418,7 @@ mod tests {
         ));
         assert_eq!(
             entry.take_run_failure(),
-            Some(carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody)
+            Some(carrick_core_abi::NativeRunFailureReason::X86GroupExitCustody)
         );
         assert!(entry.take_handoff_receipt().is_some());
         assert!(entry.take_root_exit().is_none());

@@ -486,6 +486,7 @@ version = "0.1.0"
 dependencies = [
  "carrick-aarch64",
  "carrick-core",
+ "carrick-core-abi",
  "carrick-el1-abi",
  "carrick-fatal",
  "carrick-guest-arch",
@@ -1120,6 +1121,7 @@ dependencies = [
  "carrick-aarch64",
  "carrick-abi",
  "carrick-core",
+ "carrick-core-abi",
  "carrick-el1",
  "carrick-el1-abi",
  "carrick-fatal",

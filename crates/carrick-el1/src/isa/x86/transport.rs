@@ -73,14 +73,14 @@ pub fn witness(op: u64) -> u64 {
 /// Retain a supervisor-stack failure record across the declared carrier port.
 pub fn complete_native_run_failure(
     binding: carrick_el1_abi::ExecutionBinding,
-    reason: carrick_el1_abi::NativeRunFailureReason,
+    reason: carrick_core_abi::NativeRunFailureReason,
 ) -> ! {
-    let record = carrick_el1_abi::NativeRunFailure::new(binding, reason);
+    let record = carrick_core_abi::NativeRunFailure::new(binding, reason);
     // SAFETY: CPL0 retains the initialized record and cannot restore a guest
     // frame after this authenticated terminal crossing, even on refusal.
     unsafe {
         core::arch::asm!("out dx, al", "2: cli", "hlt", "jmp 2b",
-            in("dx") carrick_el1_abi::NATIVE_RUN_FAILURE_PORT,
+            in("dx") carrick_core_abi::NATIVE_RUN_FAILURE_PORT,
             in("rax") &record as *const _ as u64,
             options(noreturn));
     }

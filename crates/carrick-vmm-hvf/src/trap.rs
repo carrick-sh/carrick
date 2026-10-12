@@ -8353,7 +8353,7 @@ impl HvfInner {
                 let far_el1 = vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0);
                 let spsr_el1 = vcpu.get_sys_reg(SysReg::SPSR_EL1).unwrap_or(0);
                 let x0 = vcpu.get_reg(Reg::X0).unwrap_or(0);
-                if x0 == carrick_el1_abi::NATIVE_RUN_FAILURE_SENTINEL {
+                if x0 == carrick_core_abi::NATIVE_RUN_FAILURE_SENTINEL {
                     // Only EL1's supervisor-owned stack record may name a failure;
                     // the active slot supplies identity, never guest-supplied words.
                     if cpsr & 0xf != 0x5
@@ -8381,7 +8381,7 @@ impl HvfInner {
                         ));
                     }
                     let record_ptr = crate::fork_stock::ForkStockHostCustody::resolve_record_ptr::<
-                        carrick_el1_abi::NativeRunFailure,
+                        carrick_core_abi::NativeRunFailure,
                     >(custody, record_gpa)
                     .map_err(|_| {
                         TrapError::Hypervisor(

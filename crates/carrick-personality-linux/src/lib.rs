@@ -23,8 +23,6 @@ pub mod identity;
 pub mod ipc;
 pub mod sysinfo;
 
-pub mod native_run_failure;
-
 use carrick_core::Personality;
 use carrick_guest_arch::ThreadPointerRegister;
 

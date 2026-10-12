@@ -278,7 +278,7 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
 
 pub fn complete_run_failure(
     task: &CurrentTask,
-    reason: carrick_el1_abi::NativeRunFailureReason,
+    reason: carrick_core_abi::NativeRunFailureReason,
 ) -> ! {
     carrick_el1::isa::x86::complete_native_run_failure(
         carrick_el1::personality::common_entry::execution_binding(task),
@@ -345,7 +345,7 @@ pub(crate) fn deliver_signal_on_syscall_return(
                     Err(carrick_el1::personality::native_process_runtime::NativeProcessError::GroupExitCustody) => {
                         complete_run_failure(
                             task,
-                            carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody,
+                            carrick_core_abi::NativeRunFailureReason::X86GroupExitCustody,
                         )
                     }
                     Err(_) => CompletionRoute::InvalidCompletion,
@@ -437,7 +437,7 @@ fn force_delivery_fault(
             Err(carrick_el1::personality::native_process_runtime::NativeProcessError::GroupExitCustody) => {
                 complete_run_failure(
                     task,
-                    carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody,
+                    carrick_core_abi::NativeRunFailureReason::X86GroupExitCustody,
                 )
             }
             Err(_) => CompletionRoute::InvalidCompletion,

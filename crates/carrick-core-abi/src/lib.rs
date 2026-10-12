@@ -17,3 +17,6 @@ pub use entry::*;
 pub const EL1_DYNAMIC_METADATA_EXTENT_SIZE: usize = 512 * 1024;
 
 pub use entry::Served;
+
+mod native_run_failure;
+pub use native_run_failure::*;

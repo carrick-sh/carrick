@@ -38,7 +38,7 @@ pub(super) const CPL0_CARRIER_PORTS: [u16; 19] = [
     carrick_el1_abi::FORK_STOCK_PORT,
     carrick_el1_abi::NATIVE_ROOT_EXIT_PORT,
     carrick_el1_abi::NATIVE_PEER_READY_PORT,
-    carrick_el1_abi::NATIVE_RUN_FAILURE_PORT,
+    carrick_core_abi::NATIVE_RUN_FAILURE_PORT,
     carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT,
     carrick_el1_abi::X86_INITIAL_RUNNER_READY_PORT,
 ];
@@ -632,11 +632,11 @@ impl Cpl0HostCustody {
     pub(super) fn service_run_failure(
         &self,
         lease: &StoppedCpuLease<'_>,
-    ) -> Result<carrick_el1_abi::NativeRunFailureReason, TrapError> {
+    ) -> Result<carrick_core_abi::NativeRunFailureReason, TrapError> {
         let execution = self.physical_execution(lease)?;
         // SAFETY: the record consists of eight initialized u64s, valid for all bit patterns.
         let (_, record) = unsafe {
-            self.read_stack_record::<carrick_el1_abi::NativeRunFailure>(
+            self.read_stack_record::<carrick_core_abi::NativeRunFailure>(
                 lease,
                 execution.context,
                 lease.vcpu.get_gpr(X86Reg::Rax)?,

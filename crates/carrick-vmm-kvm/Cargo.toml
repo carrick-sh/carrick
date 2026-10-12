@@ -38,6 +38,7 @@ goblin.workspace = true
 carrick-runtime = { path = "../carrick-runtime", default-features = false, features = ["platform-linux", "syscall-shim", "test-support"] }
 
 [dependencies]
+carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-personality-linux = { path = "../carrick-personality-linux" }
 carrick-sched-core = { path = "../carrick-sched-core" }
