@@ -1434,7 +1434,9 @@ fn reservation_policy_readonly_none_and_retire_refuse_exact_mm() {
     ] {
         change_policy(
             &region,
-            carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+            carrick_sched_core::spaces::notification::SpaceAccess::source_free_with_context(
+                &spaces,
+            ),
             a,
             &a_tables,
             protection,
@@ -3102,13 +3104,15 @@ fn prepared_copy_el1_edit_parks_then_commit_or_cancel_wakes_exact_saved_syscall(
                 VA
             );
             let delivered = core::cell::Cell::new(false);
-            let completion =
-                |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
-                    assert!(!zone.object_queue_census(key.index()).unwrap().locked);
-                    let (_, effects) = owned.deliver_handbacks(&mut |_| panic!("available slot"));
-                    assert!(effects.queued_own);
-                    delivered.set(true);
-                };
+            let completion = |owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+                '_,
+                carrick_el1_abi::Aarch64ParkedContext,
+            >| {
+                assert!(!zone.object_queue_census(key.index()).unwrap().locked);
+                let (_, effects) = owned.deliver_handbacks(&mut |_| panic!("available slot"));
+                assert!(effects.queued_own);
+                delivered.set(true);
+            };
             let held_queue = zone
                 .object_wait_with_completion(key, &carrick_sched_core::BoundedSpin(0), &completion)
                 .unwrap();
@@ -3142,8 +3146,8 @@ fn prepared_copy_el1_edit_parks_then_commit_or_cancel_wakes_exact_saved_syscall(
                 .expect("settlement must queue waiter");
             // SAFETY: switch_in_full assigned the exact context to this slot.
             let context = unsafe { zone.record(switched.record).ctx_mut() };
-            assert_eq!(context.x, original);
-            assert_eq!(context.pc, 0x1000);
+            assert_eq!(context.native.x, original);
+            assert_eq!(context.native.pc, 0x1000);
             sched.cpu.load(&mut frame, context);
             assert!(park_prepared_edit(&mut sched, &mut frame, region.table()).is_none());
             let mut root = portal.root(mm, 1).unwrap();
@@ -3413,8 +3417,8 @@ fn schedulerless_settlement_preserves_prepared_permit(cancel: bool) {
         .switch_in_full(slot)
         .expect("correct cancellation must wake enrolled edit");
     let context = unsafe { zone.record(switched.record).ctx_mut() };
-    assert_eq!(context.x, original);
-    assert_eq!(context.pc, 0x1000);
+    assert_eq!(context.native.x, original);
+    assert_eq!(context.native.pc, 0x1000);
 }
 
 #[test]
@@ -3710,7 +3714,7 @@ fn owner_wait_enrollment_follows_only_its_real_release(
         })
         .unwrap();
     let operation = OperationToken::new(701, 11).unwrap();
-    let complete = |owned: OwnedObjectWakeEffects<'_>| {
+    let complete = |owned: OwnedObjectWakeEffects<'_, carrick_el1_abi::Aarch64ParkedContext>| {
         let _ = owned.defer_handbacks();
     };
     let release = |editor: &mut Option<_>, root: &mut Option<_>| {
@@ -3871,7 +3875,7 @@ fn owner_wait_queue_admission_busy_retains_owned_handback_until_unlock() {
     assert!(slots.bind_carrier(handle.carrier()));
     let enrollment = slots.authenticate_wait(zone, receipt).unwrap();
     let delivered = core::cell::RefCell::new(Vec::new());
-    let complete = |owned: OwnedObjectWakeEffects<'_>| {
+    let complete = |owned: OwnedObjectWakeEffects<'_, carrick_el1_abi::Aarch64ParkedContext>| {
         let _ = owned.deliver_handbacks(&mut |r| delivered.borrow_mut().push(r));
     };
     let queue = zone

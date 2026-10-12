@@ -15,7 +15,10 @@ pub(super) struct InodeWriteback {
 }
 
 impl InodeWriteback {
-    pub(super) fn capture(guard: &DelegatedFileGuard<'_>, handle: u32) -> Self {
+    pub(super) fn capture(
+        guard: &DelegatedFileGuard<'_, carrick_el1_abi::Aarch64ParkedContext>,
+        handle: u32,
+    ) -> Self {
         let file = guard.file();
         let size = file.size.load(Ordering::Acquire);
         let dirty = file.dirty_mask.load(Ordering::Acquire);
