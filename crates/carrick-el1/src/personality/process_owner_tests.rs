@@ -167,7 +167,11 @@ impl<C: ProcessContext> NativeProcessCustody for Native<C> {
 }
 type Owner = GuestProcessOwner<(), Uid, Native, Failure>;
 type Task = GuestTask<(), Uid, Native>;
-type Published = GuestPublishedExit<(), Uid, Native>;
+struct Published {
+    effects: ReadyExitEffects<Member>,
+    _retiring: GuestRetiring<Native>,
+    autoreaped_receipt: Option<GuestZombie<(), Uid, Claim>>,
+}
 fn key(id: i32, serial: u64) -> TaskKey {
     TaskKey {
         id: TaskId::from_abi_positive(id).unwrap(),
@@ -279,7 +283,7 @@ fn birth(owner: &mut Owner, parent: TaskKey, child: TaskKey, releases: Rc<Cell<u
         .publish(child_row);
 }
 fn exit(owner: &mut Owner, task: TaskKey, adopter: Option<TaskKey>) -> Published {
-    owner
+    let published = owner
         .prepare_exit(task, adopter)
         .unwrap()
         .reserve(Transaction(task.serial.raw()))
@@ -287,7 +291,13 @@ fn exit(owner: &mut Owner, task: TaskKey, adopter: Option<TaskKey>) -> Published
         .begin(LinuxWaitStatus::from_wait_encoding(5 << 8))
         .unwrap()
         .publish()
-        .unwrap()
+        .unwrap();
+    published.retirement.publish();
+    Published {
+        effects: published.effects,
+        _retiring: published.retiring,
+        autoreaped_receipt: published.autoreaped_receipt,
+    }
 }
 fn query(target: WaitTarget) -> WaitQuery {
     WaitQuery {
@@ -1063,13 +1073,15 @@ fn entry_exit_returns_resources_and_cancel_effects_before_native_service() {
     assert!(Rc::ptr_eq(&resources.unwrap(), &work));
     assert_eq!(work.signal_reads.get(), 0);
     assert!(owner.task(child).is_err());
+    published.retirement.publish();
     assert!(matches!(
         owner
             .scan_wait(parent, query(WaitTarget::Exact(child)))
             .unwrap(),
         WaitSelection::Exited(_)
     ));
-    drop(published);
+    drop(published.retiring);
+    drop(published.autoreaped_receipt);
 }
 
 impl<C: ProcessContext> super::super::native_process_custody::ProcessResources for Native<C> {
@@ -1157,7 +1169,9 @@ fn entry_adapter_uses_retained_primitive_custody_through_fork_exit_wait() {
     )
     .unwrap();
     assert!(resources.is_some());
-    drop(effects);
+    effects.retirement.publish();
+    drop(effects.retiring);
+    drop(effects.autoreaped_receipt);
     let WaitWork::Status(status) = scan_wait(&owner, parent, query(WaitTarget::Any)).unwrap()
     else {
         panic!("status")
@@ -1479,4 +1493,78 @@ fn exit_uid_receipt_reads_thread_credentials_without_a_metadata_mirror() {
             0
         );
     }
+}
+
+#[test]
+fn exit_status_is_not_waitable_before_mm_retirement_completes() {
+    use super::super::native_process_entry::publish_exit;
+    let mut owner = owner();
+    let parent = key(1, 1);
+    let child = key(2, 2);
+    birth(&mut owner, parent, child, Rc::new(Cell::new(0)));
+    let (_resources, published) = publish_exit(
+        &mut owner,
+        child,
+        None,
+        Transaction(95),
+        LinuxWaitStatus::from_wait_encoding(0),
+    )
+    .unwrap();
+    // Pause the child at the exact owner-graph publication / MM retirement
+    // boundary. A parent entering wait now must park, not begin another fork.
+    assert!(
+        matches!(
+            owner
+                .scan_wait(parent, query(WaitTarget::Exact(child)))
+                .unwrap(),
+            WaitSelection::StillRunning(_)
+        ),
+        "exit receipt became waitable before the child's MM stock was retired"
+    );
+    published.retirement.publish();
+    assert!(matches!(
+        owner
+            .scan_wait(parent, query(WaitTarget::Exact(child)))
+            .unwrap(),
+        WaitSelection::Exited(_)
+    ));
+    drop(published.retiring);
+    drop(published.autoreaped_receipt);
+}
+
+#[test]
+fn pending_exit_retirement_survives_reparenting_without_early_reap() {
+    use super::super::native_process_entry::publish_exit;
+    let mut owner = owner();
+    let root = key(1, 1);
+    let parent = key(2, 2);
+    let child = key(3, 3);
+    birth(&mut owner, root, parent, Rc::new(Cell::new(0)));
+    let releases = Rc::new(Cell::new(0));
+    birth(&mut owner, parent, child, releases.clone());
+    let (_resources, pending) = publish_exit(
+        &mut owner,
+        child,
+        None,
+        Transaction(96),
+        LinuxWaitStatus::from_wait_encoding(0),
+    )
+    .unwrap();
+    let parent_exit = exit(&mut owner, parent, None);
+    parent_exit.effects.cancel_members(Member::cancel);
+    assert!(matches!(
+        owner
+            .consume_wait(root, query(WaitTarget::Exact(child)))
+            .unwrap()
+            .selection,
+        WaitSelection::StillRunning(_)
+    ));
+    assert_eq!(releases.get(), 0);
+    pending.retirement.publish();
+    let reaped = owner
+        .consume_wait(root, query(WaitTarget::Exact(child)))
+        .unwrap();
+    assert!(matches!(&reaped.selection, WaitSelection::Exited(zombie) if zombie.key == child));
+    drop(reaped);
+    assert_eq!(releases.get(), 1);
 }

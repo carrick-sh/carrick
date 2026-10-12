@@ -8,6 +8,7 @@
 extern crate alloc;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use carrick_personality_linux::identity::TaskCredentials;
@@ -25,6 +26,7 @@ use carrick_sched_core::process::exit::{
 use carrick_sched_core::process::registry::{
     ProcessGroupRecord, ProcessRegistry, RegistryFailure, RegistryInvariant, SessionRecord,
 };
+use carrick_sched_core::process::wait::ExitWaitPhase;
 use carrick_sched_core::process::wait::{
     ConsumedWait, TaskWakeGeneration, WaitError, WaitIdentity, WaitIdentitySource, WaitJobControl,
     WaitLive, WaitQuery, WaitReadiness, WaitSelection, WaitZombie,
@@ -35,6 +37,16 @@ use carrick_sched_core::process::{
 };
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, Ordering};
+
+/// The exiting lane owns publication; the receipt retains an observer,
+/// including across reparenting. Dropping never completes a retirement.
+#[must_use = "publish only after member cancellation and MM retirement"]
+pub struct ExitRetirementPublication(Arc<AtomicBool>);
+impl ExitRetirementPublication {
+    pub fn publish(self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
 
 /// Primitive resource accesses for this row only. These hooks never choose a
 /// process identity, adopter, zombie, exit target, mapping or process population.
@@ -438,9 +450,17 @@ impl<C, U, N: NativeProcessCustody> ExitNotificationSource for GuestTask<C, U, N
 pub struct GuestZombie<C, U, Claim> {
     pub receipt: Zombie<C, U, LinuxWaitStatus>,
     pub claim: Claim,
+    retirement: Arc<AtomicBool>,
 }
 impl<C, U, Claim> WaitZombie<C, U> for GuestZombie<C, U, Claim> {
     type Status = LinuxWaitStatus;
+    fn exit_wait_phase(&self) -> ExitWaitPhase {
+        if self.retirement.load(Ordering::Acquire) {
+            ExitWaitPhase::Waitable
+        } else {
+            ExitWaitPhase::Retiring
+        }
+    }
     fn wait_zombie(&self) -> &Zombie<C, U, LinuxWaitStatus> {
         &self.receipt
     }
@@ -1053,9 +1073,11 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
                 native: record.native,
             },
         );
+        let retirement = Arc::new(AtomicBool::new(false));
         let receipt = GuestZombie {
             receipt: observation,
             claim: record.claim,
+            retirement: Arc::clone(&retirement),
         };
         let identity = (receipt.receipt.process_group, receipt.receipt.session);
         let publication = registry
@@ -1070,6 +1092,7 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
             .unwrap_or_else(|_| F::fail_process(GuestProcessInvariant::ExitReleaseLost(task)));
         self.reserved.registry = None;
         Ok(GuestPublishedExit {
+            retirement: ExitRetirementPublication(retirement),
             retiring: publication.retiring,
             autoreaped_receipt: publication.autoreaped_receipt,
             effects,
@@ -1080,6 +1103,7 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
 }
 
 pub struct GuestPublishedExit<C, U, N: NativeProcessCustody> {
+    pub retirement: ExitRetirementPublication,
     pub retiring: GuestRetiring<N>,
     pub autoreaped_receipt: Option<GuestZombie<C, U, N::Claim>>,
     pub effects: ReadyExitEffects<N::Member>,

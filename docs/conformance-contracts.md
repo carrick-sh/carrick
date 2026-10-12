@@ -947,11 +947,34 @@ Invariant: a fork beyond the limit is refused with a counted `Capacity`
 refusal and returns `EAGAIN` (-11). It never hangs, never faults the
 carrier, never strands a loan, and never returns another errno. The limit
 counts live children, not forks: retiring one child admits the next fork.
+A terminal receipt remains `Retiring` until exact member cancellation and
+MM retirement have completed. A parent entering wait in that interval
+parks through the existing wait continuation; it cannot reap and issue a
+new fork against the retiring child's charged tables. Completion publishes
+readiness before the existing parent notification/wakeup. This adds one
+acquire read per examined terminal receipt and no polling, retries, wider
+stock, or wall-clock deadline. Admission itself drains reclaimable stock
+once through the existing stopped crossing.
+
 Every refusal is attributable in the run report's
 `execution_witness.fork_stock_families` (`capacity_refusal`, and for a
 withdrawn dirty record `inventory_refusal` with `withdrawn_lifecycle`).
+The last exact capacity resource and all quarantined children at refusal
+are retained in `execution_witness.fork_admission_refusal` and emitted by
+`fork-admission-refusal` / `fork-quarantine-state` USDT probes. Their absence
+means no recorded capacity refusal, not evidence of a dropped trace.
 
 VM-free bindings:
+- `process_owner::tests::exit_status_is_not_waitable_before_mm_retirement_completes`
+  (carrick-el1): pause at owner publication, assert wait remains running,
+  complete retirement and assert the same status is available. Red before
+  the readiness publication gate, without load.
+- `carrier_cpu::tests::child_owner_grant_on_root_executor_is_a_physical_boundary`
+  (carrick-vmm-kvm): a registered child crosses for physical service while
+  the executor retains its root-task custody. Select the live registered
+  child root; an unregistered root still refuses. Red on the retirement-only
+  selection policy. Physical service separately authenticates the CPL0
+  binding and context incarnation.
 - `fork_stock::tests::kvm_live_children_beyond_lifecycle_records_are_counted_refusals`
   (carrick-hal): eight live children, the ninth loan is one counted
   `Capacity` refusal, and after one child is retired and reclaimed the

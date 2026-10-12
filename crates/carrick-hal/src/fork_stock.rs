@@ -613,9 +613,17 @@ impl<T: ChildAddressTags> ForkStock<T> {
         self.last_refusal.clone()
     }
 
-    fn record_capacity(&mut self, exchange: &ForkStockExchange, resource: ForkCapacityResource) {
+    fn record_capacity(
+        &mut self,
+        exchange: &ForkStockExchange,
+        resource: ForkCapacityResource,
+        cpu: CpuId,
+    ) {
         if let Some(request) = exchange.request() {
             let record = ForkAdmissionRefusal {
+                carrier: request.operation.carrier.get(),
+                mm: request.operation.mm.raw(),
+                cpu: cpu.raw(),
                 resource,
                 child_pages: request.child_bytes / TABLE_PAGE_BYTES,
                 parent_pages: request.parent_bytes / TABLE_PAGE_BYTES,
@@ -640,8 +648,9 @@ impl<T: ChildAddressTags> ForkStock<T> {
         &mut self,
         exchange: &mut ForkStockExchange,
         resource: ForkCapacityResource,
+        cpu: CpuId,
     ) -> Result<ForkStockLoan, ForkStockRefusal> {
-        self.record_capacity(exchange, resource);
+        self.record_capacity(exchange, resource, cpu);
         self.refuse(exchange, ForkStockRefusal::Capacity)
     }
 
@@ -687,32 +696,41 @@ impl<T: ChildAddressTags> ForkStock<T> {
             self.pending.resize(index + 1, None);
         }
         if self.pending[index].is_some() {
-            return self.refuse_capacity(exchange, ForkCapacityResource::PendingLoan);
+            return self.refuse_capacity(
+                exchange,
+                ForkCapacityResource::PendingLoan,
+                execution.cpu,
+            );
         }
         if self.lifecycles.is_empty() {
-            return self.refuse_capacity(exchange, ForkCapacityResource::Lifecycle);
+            return self.refuse_capacity(exchange, ForkCapacityResource::Lifecycle, execution.cpu);
         }
         let Some((child_tables, parent_tables)) =
             take_fork_table_stock(&mut self.tables, request.child_bytes, request.parent_bytes)
         else {
-            return self.refuse_capacity(exchange, ForkCapacityResource::Tables);
+            return self.refuse_capacity(exchange, ForkCapacityResource::Tables, execution.cpu);
         };
         let Some(next) = self.next_loan.checked_add(1) else {
             self.tables.extend(child_tables);
             self.tables.extend(parent_tables);
-            return self.refuse_capacity(exchange, ForkCapacityResource::LoanIdentity);
+            return self.refuse_capacity(
+                exchange,
+                ForkCapacityResource::LoanIdentity,
+                execution.cpu,
+            );
         };
         let Some(tag) = self.tags.allocate() else {
             self.tables.extend(child_tables);
             self.tables.extend(parent_tables);
-            return self.refuse_capacity(exchange, ForkCapacityResource::AddressTag);
+            return self.refuse_capacity(exchange, ForkCapacityResource::AddressTag, execution.cpu);
         };
         let Some(lifecycle) = self.lifecycles.pop() else {
             self.tables.extend(child_tables);
             self.tables.extend(parent_tables);
             // A failed tag release still answers the guest with a refusal.
             let released = self.tags.release_unpublished(tag);
-            let refused = self.refuse_capacity(exchange, ForkCapacityResource::Lifecycle);
+            let refused =
+                self.refuse_capacity(exchange, ForkCapacityResource::Lifecycle, execution.cpu);
             return released.map_err(|_| ForkStockRefusal::Invalid).and(refused);
         };
         let id = self.next_loan;
@@ -761,7 +779,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
         let mut charged = 0;
         for (page, mm) in charges {
             if !ledger.grant(page, mm) {
-                self.record_capacity(exchange, ForkCapacityResource::Ledger);
+                self.record_capacity(exchange, ForkCapacityResource::Ledger, execution.cpu);
                 return self.restore_and_refuse(
                     ledger,
                     exchange,
@@ -1039,17 +1057,16 @@ impl<T: ChildAddressTags> ForkStock<T> {
         let active = MmKey::of(active);
         let candidates: Vec<(MmKey, SlotAbsence)> = self
             .quarantine
-            .keys()
-            .copied()
-            .filter(|key| Some(*key) != active)
-            .filter_map(|key| {
-                let absence = occupancy(key.mm()?)?;
-                (absence.mm().raw() == key.0.get()).then_some((key, absence))
+            .iter_mut()
+            .filter_map(|(key, state)| {
+                let absence = (Some(*key) != active)
+                    .then(|| key.mm().and_then(&occupancy))
+                    .flatten()
+                    .filter(|absence| absence.mm().raw() == key.0.get());
+                state.absent = absence.is_some();
+                absence.map(|absence| (*key, absence))
             })
             .collect();
-        for (key, state) in &mut self.quarantine {
-            state.absent = candidates.iter().any(|(candidate, _)| candidate == key);
-        }
         let mut reclaimed = 0;
         for (key, absence) in candidates {
             let mm = key.mm().ok_or(ForkStockServiceError::InvalidRecord)?;
