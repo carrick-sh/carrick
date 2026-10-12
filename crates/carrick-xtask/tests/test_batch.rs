@@ -68,4 +68,20 @@ fn batch_builds_once_and_preserves_filters_serial_environment_and_failures() {
         !red.status.success(),
         "a failing binary must fail the batch"
     );
+    let compile_only = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .args([
+            "--root",
+            dir.path().to_str().unwrap(),
+            "test-batch",
+            "--no-run",
+            "red",
+        ])
+        .env("CARGO_TARGET_DIR", dir.path().join("target"))
+        .env_remove("CARGO_LOG")
+        .output()
+        .unwrap();
+    assert!(
+        compile_only.status.success(),
+        "--no-run executed a failing test"
+    );
 }

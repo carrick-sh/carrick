@@ -357,7 +357,7 @@ jobs:
         uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: sccache@0.18.0
-      - name: Unit tests shard B (mm-owner + CLI + host + VFS)
+      - name: Unit tests shard B (mm-owner + CLI + host + VFS + EL1)
         if: ${{ !cancelled() }}
         run: just ci-macos-test test-shard-b
 
