@@ -81,12 +81,12 @@ fn compact_parked_context_owner_clones_two_roots_and_selects_exact_cow_supply() 
             &*region
                 .ptr
                 .as_ptr()
-                .add(carrick_el1_abi::X86_CPL0_RESERVATIONS_OFFSET as usize)
+                .add(carrick_core_abi::X86_CPL0_RESERVATIONS_OFFSET as usize)
                 .cast::<X86Cpl0Reservations>(),
             &*region
                 .ptr
                 .as_ptr()
-                .add(carrick_el1_abi::X86_CPL0_ZONE_OFFSET as usize)
+                .add(carrick_core_abi::X86_CPL0_ZONE_OFFSET as usize)
                 .cast::<ZoneTables<ParkedContextWords>>(),
         )
     };
@@ -249,12 +249,12 @@ fn compact_native_portal_prepares_and_publishes_initial_private_ranges() {
             &*region
                 .ptr
                 .as_ptr()
-                .add(carrick_el1_abi::X86_CPL0_RESERVATIONS_OFFSET as usize)
+                .add(carrick_core_abi::X86_CPL0_RESERVATIONS_OFFSET as usize)
                 .cast::<X86Cpl0Reservations>(),
             &*region
                 .ptr
                 .as_ptr()
-                .add(carrick_el1_abi::X86_CPL0_ZONE_OFFSET as usize)
+                .add(carrick_core_abi::X86_CPL0_ZONE_OFFSET as usize)
                 .cast::<ZoneTables<ParkedContextWords>>(),
         )
     };

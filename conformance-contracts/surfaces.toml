@@ -1288,3 +1288,7 @@ contracts = ["x86.vmx.segment-entry"]
 [[surfaces]]
 path = "crates/carrick-vmm-bhyve/src/bhyve_x86_engine.rs"
 contracts = ["x86.vmx.segment-entry"]
+
+[[surfaces]]
+path = "crates/carrick-core-abi/src/initial_boot.rs"
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents"]

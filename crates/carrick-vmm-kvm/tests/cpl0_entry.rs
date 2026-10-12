@@ -147,7 +147,7 @@ fn image() -> PathBuf {
 
 #[test]
 fn production_cpl0_boot_retains_separate_supervisor_and_initial_extents() {
-    let metadata_bytes = (carrick_el1_abi::X86_CPL0_ZONE_OFFSET as usize
+    let metadata_bytes = (carrick_core_abi::X86_CPL0_ZONE_OFFSET as usize
         + std::mem::size_of::<carrick_el1::memory::reservations::X86Cpl0Zone>()
         + 4095)
         & !4095;

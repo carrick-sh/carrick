@@ -64,7 +64,8 @@ pub const fn x86_kernel_layout() -> carrick_guest_arch::KernelLayout {
     carrick_guest_arch::KernelLayout {
         region: carrick_guest_arch::KernelVa::new(carrick_el1_abi::X86_CPL0_REGION_BASE),
         zone: carrick_guest_arch::KernelVa::new(
-            carrick_el1_abi::X86_CPL0_DYNAMIC_METADATA_BASE + carrick_el1_abi::X86_CPL0_ZONE_OFFSET,
+            carrick_el1_abi::X86_CPL0_DYNAMIC_METADATA_BASE
+                + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
         ),
         portal: carrick_guest_arch::KernelVa::new(
             carrick_el1_abi::X86_CPL0_REGION_BASE + carrick_el1_abi::EL1_MM_PORTAL_OFFSET,
@@ -101,7 +102,7 @@ mod layout_tests {
         let layout = super::x86_kernel_layout();
         assert_eq!(
             layout.zone.raw(),
-            layout.dynamic_metadata.raw() + carrick_el1_abi::X86_CPL0_ZONE_OFFSET
+            layout.dynamic_metadata.raw() + carrick_core_abi::X86_CPL0_ZONE_OFFSET
         );
         assert_ne!(
             layout.zone.raw(),

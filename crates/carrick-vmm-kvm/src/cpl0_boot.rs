@@ -8,6 +8,12 @@ use crate::carrier_memory::{
 };
 use crate::guest_setup::{GuestRam, WindowKind};
 use crate::{KvmKickHandle, KvmVcpu};
+use carrick_core_abi::{
+    X86_INITIAL_BOOT_HEADER_GPA, X86_INITIAL_BOOT_LOADED, X86_INITIAL_BOOT_MAGIC,
+    X86_INITIAL_BOOT_PORT, X86_INITIAL_BOOT_VERSION, X86_INITIAL_MAX_REGIONS,
+    X86_INITIAL_MAX_STRINGS, X86_INITIAL_RUNNER_READY_PORT, X86InitialBootGrant,
+    X86InitialBootHeader, X86InitialBootRegion, X86InitialBootRequest, X86InitialBootString,
+};
 use carrick_el1::memory::reservations::{
     LinuxReservationLayout, NoRootWait, X86Cpl0Reservations, X86Cpl0RootReleaseVenue, X86Cpl0Zone,
 };
@@ -20,12 +26,6 @@ use carrick_el1_abi::{
     X86_CPL0_REGION_BASE,
 };
 use carrick_el1_abi::{ReservationMm, ReservationRange};
-use carrick_el1_abi::{
-    X86_INITIAL_BOOT_HEADER_GPA, X86_INITIAL_BOOT_LOADED, X86_INITIAL_BOOT_MAGIC,
-    X86_INITIAL_BOOT_PORT, X86_INITIAL_BOOT_VERSION, X86_INITIAL_MAX_REGIONS,
-    X86_INITIAL_MAX_STRINGS, X86_INITIAL_RUNNER_READY_PORT, X86InitialBootGrant,
-    X86InitialBootHeader, X86InitialBootRegion, X86InitialBootRequest, X86InitialBootString,
-};
 use carrick_guest_arch::FrameGpa;
 use carrick_guest_arch::{AddressContext, ContextGeneration, MmGeneration, RootGpa, UserVa};
 use carrick_guest_mem::{CurrentMmMemory, GuestMemory, MemoryError};
@@ -83,7 +83,7 @@ const _: () = {
     assert!(ROUTES_OFFSET + size_of::<PublishedApicIds>() as u64 <= SHOOTDOWN_OFFSET);
     assert!(SHOOTDOWN_OFFSET + size_of::<ShootdownTable>() as u64 <= COUNTERS_OFFSET);
     assert!(
-        carrick_el1_abi::X86_CPL0_RESERVATIONS_OFFSET + size_of::<X86Cpl0Reservations>() as u64
+        carrick_core_abi::X86_CPL0_RESERVATIONS_OFFSET + size_of::<X86Cpl0Reservations>() as u64
             <= META_LEN
     );
 };
@@ -100,7 +100,7 @@ const FORK_LIFECYCLE_STRIDE: u64 = carrick_hal::fork_stock::LIFECYCLE_SLOT_STRID
 const FORK_LIFECYCLE_SLOTS: u64 = 8;
 const _: () = {
     assert!(
-        carrick_el1_abi::X86_CPL0_RESERVATIONS_OFFSET + size_of::<X86Cpl0Reservations>() as u64
+        carrick_core_abi::X86_CPL0_RESERVATIONS_OFFSET + size_of::<X86Cpl0Reservations>() as u64
             <= FORK_LIFECYCLE_OFFSET
     );
     assert!(FORK_LIFECYCLE_OFFSET.is_multiple_of(0x4000));
@@ -2087,17 +2087,17 @@ impl Cpl0Carrier {
         let region_bytes = image
             .regions
             .len()
-            .checked_mul(size_of::<carrick_el1_abi::X86InitialBootRegion>())
+            .checked_mul(size_of::<carrick_core_abi::X86InitialBootRegion>())
             .ok_or_else(|| fail("initial region metadata"))?;
         let string_bytes = string_count
-            .checked_mul(size_of::<carrick_el1_abi::X86InitialBootString>())
+            .checked_mul(size_of::<carrick_core_abi::X86InitialBootString>())
             .ok_or_else(|| fail("initial string metadata"))?;
-        let metadata = size_of::<carrick_el1_abi::X86InitialBootRequest>()
+        let metadata = size_of::<carrick_core_abi::X86InitialBootRequest>()
             .checked_add(region_bytes)
             .and_then(|n| n.checked_add(string_bytes))
             .and_then(|n| {
                 n.checked_add(
-                    grants.checked_mul(size_of::<carrick_el1_abi::X86InitialBootGrant>())?,
+                    grants.checked_mul(size_of::<carrick_core_abi::X86InitialBootGrant>())?,
                 )
             })
             .and_then(|n| {
@@ -2135,11 +2135,11 @@ impl Cpl0Carrier {
     pub fn initial_reservation_admitted(&self) -> bool {
         let (Some(table), Some(zone), Some(mm)) = (
             self.custody.ram.host_ptr(
-                META_GPA + carrick_el1_abi::X86_CPL0_RESERVATIONS_OFFSET,
+                META_GPA + carrick_core_abi::X86_CPL0_RESERVATIONS_OFFSET,
                 size_of::<X86Cpl0Reservations>(),
             ),
             self.custody.ram.host_ptr(
-                META_GPA + carrick_el1_abi::X86_CPL0_ZONE_OFFSET,
+                META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
                 size_of::<X86Cpl0Zone>(),
             ),
             ReservationMm::new(self.initial_mm_key()),
@@ -2167,7 +2167,7 @@ impl Cpl0Carrier {
             .custody
             .ram
             .host_ptr(
-                META_GPA + carrick_el1_abi::X86_CPL0_RESERVATIONS_OFFSET,
+                META_GPA + carrick_core_abi::X86_CPL0_RESERVATIONS_OFFSET,
                 size_of::<X86Cpl0Reservations>(),
             )
             .ok_or_else(|| fail("initial census table"))?;
@@ -2175,7 +2175,7 @@ impl Cpl0Carrier {
             .custody
             .ram
             .host_ptr(
-                META_GPA + carrick_el1_abi::X86_CPL0_ZONE_OFFSET,
+                META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
                 size_of::<X86Cpl0Zone>(),
             )
             .ok_or_else(|| fail("initial census zone"))?;
@@ -2246,7 +2246,7 @@ impl Cpl0Carrier {
     /// in the same zone that owns its MM notifications.
     pub fn initial_thread_custody(&self) -> bool {
         let Some(zone) = self.custody.ram.host_ptr(
-            META_GPA + carrick_el1_abi::X86_CPL0_ZONE_OFFSET,
+            META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
             size_of::<X86Cpl0Zone>(),
         ) else {
             return false;
@@ -2712,7 +2712,7 @@ impl Cpl0Carrier {
                 random,
                 result_root_gpa: 0,
                 result_rsp: 0,
-                result_status: carrick_el1_abi::X86_INITIAL_BOOT_PENDING,
+                result_status: carrick_core_abi::X86_INITIAL_BOOT_PENDING,
                 extent_pages: (extent_len / 4096) as u32,
                 mm_key: self.initial_mm_key(),
                 generation: 1,
@@ -3091,7 +3091,7 @@ impl Cpl0Carrier {
             .custody
             .ram
             .host_ptr(
-                META_GPA + carrick_el1_abi::X86_CPL0_RESERVATIONS_OFFSET,
+                META_GPA + carrick_core_abi::X86_CPL0_RESERVATIONS_OFFSET,
                 size_of::<X86Cpl0Reservations>(),
             )
             .ok_or_else(|| fail("production reservation backing"))?
@@ -3100,7 +3100,7 @@ impl Cpl0Carrier {
             .custody
             .ram
             .host_ptr(
-                META_GPA + carrick_el1_abi::X86_CPL0_ZONE_OFFSET,
+                META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
                 size_of::<X86Cpl0Zone>(),
             )
             .ok_or_else(|| fail("production zone backing"))?
@@ -3377,7 +3377,7 @@ impl Cpl0Carrier {
         let mut ram = GuestRam::new();
         if initial_extent_bytes.is_some() {
             let zone_end =
-                carrick_el1_abi::X86_CPL0_ZONE_OFFSET as usize + size_of::<X86Cpl0Zone>();
+                carrick_core_abi::X86_CPL0_ZONE_OFFSET as usize + size_of::<X86Cpl0Zone>();
             let region_bytes = (zone_end + 4095) & !4095;
             ram.add_window(0, META_GPA as usize, WindowKind::Private)
                 .map_err(|e| fail(e.to_string()))?;
@@ -3451,7 +3451,9 @@ impl Cpl0Carrier {
             va: DIRECT_VA + META_GPA,
             gpa: META_GPA,
             len: if initial_extent_bytes.is_some() {
-                ((carrick_el1_abi::X86_CPL0_ZONE_OFFSET as usize + size_of::<X86Cpl0Zone>() + 4095)
+                ((carrick_core_abi::X86_CPL0_ZONE_OFFSET as usize
+                    + size_of::<X86Cpl0Zone>()
+                    + 4095)
                     & !4095) as u64
             } else if interrupts {
                 0x140_0000
@@ -3472,8 +3474,8 @@ impl Cpl0Carrier {
         });
         if initial_extent_bytes.is_some() {
             maps.push(Pml4MapSpec {
-                va: METADATA_VA + carrick_el1_abi::X86_CPL0_ZONE_OFFSET,
-                gpa: PRODUCTION_METADATA_GPA + carrick_el1_abi::X86_CPL0_ZONE_OFFSET,
+                va: METADATA_VA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
+                gpa: PRODUCTION_METADATA_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
                 len: (size_of::<X86Cpl0Zone>() as u64 + 4095) & !4095,
                 user: false,
                 write: true,
