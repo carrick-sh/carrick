@@ -29,7 +29,7 @@ while IFS='=' read -r name value; do
   [[ $name =~ ^SITE_[A-Z_]+$ && $value =~ ^[A-Za-z0-9._=/,-]+$ ]] || { echo "bad site line: $name" >&2; exit 1; }
   site[$name]=$value
 done < <("$xtask" ci-scaler site)
-for name in SITE_NODE SITE_API_HOST SITE_STORAGE SITE_DISK_FORMAT SITE_BRIDGE SITE_CORES SITE_MEMORY_MIB SITE_DISK_GIB SITE_TEMPLATE_IPCONFIG SITE_NAMESERVER SITE_VM_FIREWALL; do
+for name in SITE_NODE SITE_API_HOST SITE_STORAGE SITE_DISK_FORMAT SITE_BRIDGE SITE_CORES SITE_MEMORY_MIB SITE_DISK_GIB SITE_TEMPLATE_IPCONFIG SITE_NAMESERVER SITE_VM_FIREWALL SITE_API_CA; do
   [[ -n ${site[$name]:-} ]] || { echo "site lacks $name" >&2; exit 1; }
 done
 [[ ${site[SITE_NODE]} == $(hostname -s) ]] || { echo 'site node is not this host' >&2; exit 1; }
@@ -38,11 +38,17 @@ disk_format=${site[SITE_DISK_FORMAT]} bridge=${site[SITE_BRIDGE]}
 cores=${site[SITE_CORES]} memory_mib=${site[SITE_MEMORY_MIB]} disk_gib=${site[SITE_DISK_GIB]}
 ipconfig=${site[SITE_TEMPLATE_IPCONFIG]} nameserver=${site[SITE_NAMESERVER]} vm_firewall=${site[SITE_VM_FIREWALL]}
 [[ $vm_firewall == 0 || $vm_firewall == 1 ]] || { echo 'bad site firewall flag' >&2; exit 1; }
+# A PVE-cluster-CA-signed API certificate needs that CA; ACME uses system trust.
+api_ca_args=()
+if [[ ${site[SITE_API_CA]} != system ]]; then
+  [[ ${site[SITE_API_CA]} == /* && -f ${site[SITE_API_CA]} ]] || { echo 'site API CA missing' >&2; exit 1; }
+  api_ca_args=(--cacert "${site[SITE_API_CA]}")
+fi
 pve_call() {
   # The credential exists only in this on-host pipe, never argv or output.
   jq -r '"header = \"Authorization: PVEAPIToken=" + .["full-tokenid"] + "=" + .value + "\""' /root/carrick-ci-token.json |
     curl --disable --fail --silent --show-error --max-time 40 --config - \
-      --resolve "$api_host:8006:127.0.0.1" --request "$1" \
+      --resolve "$api_host:8006:127.0.0.1" ${api_ca_args[@]+"${api_ca_args[@]}"} --request "$1" \
       "https://$api_host:8006/api2/json$2"
 }
 ! qm status 300 >/dev/null 2>&1 || { echo 'VM 300 already exists; refusing replacement' >&2; exit 1; }
