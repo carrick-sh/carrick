@@ -10,6 +10,6 @@ pub use carrick_syscall_abi::{
 
 // One wire-format definition is shared with host delivery and both ring ISAs.
 pub use carrick_syscall_abi::{
-    CARRICK_SIGFRAME_MAGIC, CarrickSigframe, LinuxSigaction, LinuxSiginfo, LinuxSignalContext,
-    LinuxSignalStack, LinuxUcontext, X8664Rtsigframe, X8664Sigcontext, X8664Ucontext,
+    LinuxSigaction, LinuxSiginfo, LinuxSignalContext, LinuxSignalStack, LinuxUcontext,
+    X8664Rtsigframe, X8664Sigcontext, X8664Ucontext,
 };

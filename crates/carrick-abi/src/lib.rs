@@ -2346,7 +2346,7 @@ macro_rules! kernel_abi {
 /// Two forms — with a leading `size = N`, or offsets only:
 /// ```ignore
 /// assert_layout!(LinuxMsghdr, size = 56, name @ 0, namelen @ 8, iov @ 16);
-/// assert_layout!(CarrickSigframe, siginfo @ 0, ucontext @ 128);
+/// assert_layout!(LinuxUcontext, uc_sigmask @ 40);
 /// ```
 ///
 /// Field offsets use the const-stable `core::mem::offset_of!`. Every check is a
@@ -5779,10 +5779,7 @@ assert_layout!(LinuxSignalContext, size = 4384,
     regs @ 8, sp @ 256, pc @ 264, pstate @ 272, __reserved @ 288);
 assert_layout!(LinuxUcontext, size = 4560,
     uc_stack @ 16, uc_sigmask @ 40, _pad @ 48, _pad2 @ 168, uc_mcontext @ 176);
-// CarrickSigframe is carrick-internal, but `siginfo` MUST sit at SP+0 and
-// `ucontext` immediately after it (size_of::<LinuxSiginfo>() == 128) because
-// Rosetta's signal trampoline reconstructs the siginfo pointer with `mov x1,sp`.
-assert_layout!(CarrickSigframe, siginfo @ 0, ucontext @ 128);
+
 assert_layout!(LinuxFpsimdContext, size = 528,
     magic @ 0, size @ 4, fpsr @ 8, fpcr @ 12, vregs @ 16);
 // The fpsimd_context record plus the 8-byte null-terminator record the guest
@@ -6214,7 +6211,6 @@ mod signal_leaf_identity_tests {
     fn public_signal_records_are_the_canonical_guest_leaf_types() {
         let _: carrick_syscall_abi::LinuxSiginfo = super::LinuxSiginfo::empty();
         let _: carrick_syscall_abi::LinuxSigaction = super::LinuxSigaction::empty();
-        let _: carrick_syscall_abi::CarrickSigframe = super::CarrickSigframe::empty();
         let _: carrick_syscall_abi::X8664Ucontext = super::X8664Ucontext::empty();
         let _: carrick_syscall_abi::X8664Rtsigframe = super::X8664Rtsigframe::empty();
     }
