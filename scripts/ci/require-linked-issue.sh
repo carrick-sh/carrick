@@ -38,7 +38,7 @@ if jq -e '[.labels[]?.name] | index("no-issue")' <<<"$pr" >/dev/null; then
 fi
 
 # Strip HTML comments so the template's instructions cannot satisfy the check.
-if jq -r '(.body // "") | gsub("<!--.*?-->"; ""; "s")' <<<"$pr" |
+if jq -r '(.body // "") | gsub("<!--.*?-->"; ""; "p")' <<<"$pr" |
   grep -Eiq '\b(clos(e|es|ed)|fix(es|ed)?|resolv(e|es|ed)|part of):?[[:space:]]+([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#[0-9]+\b'; then
   echo "linked-issue: PR #$number links an issue; passing."
   exit 0

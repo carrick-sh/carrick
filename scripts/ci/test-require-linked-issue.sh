@@ -25,6 +25,7 @@ run linked-cross-repo 0 pull_request "Closes carrick-sh/carrick-nt#9" '[]' "$cod
 run unlinked 1 pull_request "no ref here" '[]' "$code"
 run template-untouched 1 pull_request $'Closes #\n<!-- Closes #1 -->' '[]' "$code"
 run comment-only-ref 1 pull_request $'<!-- Closes #1 -->' '[]' "$code"
+run multiline-comment-ref 1 pull_request $'<!--\nCloses #1\n-->\nhello' '[]' "$code"
 run docs-only 0 pull_request "nothing" '[]' $'docs/a.md\nREADME.md\ndocs/x/y.png'
 run docs-plus-code 1 pull_request "nothing" '[]' $'docs/a.md\njustfile'
 run label-exempt 0 pull_request "nothing" '["no-issue"]' "$code"
