@@ -71,7 +71,7 @@ fn serial_host_authenticated_curl_controller_ignores_ambient_trace() {
     // Control proves curl loads this ambient config and exposes the synthetic
     // Authorization header when its default-config loading is left enabled.
     let (url, server) = http_fixture();
-    let mut control = pve_curl(&PveCall::Get, &url);
+    let mut control = pve_curl(&PveCall::Get, &super::site::WILLOW.api_resolve(), &url);
     let args: Vec<_> = control
         .get_args()
         .filter(|arg| *arg != "--disable")
@@ -112,7 +112,7 @@ fn serial_host_authenticated_curl_controller_ignores_ambient_trace() {
         PveCall::Delete,
     ] {
         let (url, server) = http_fixture();
-        let mut command = pve_curl(&call, &url);
+        let mut command = pve_curl(&call, &super::site::WILLOW.api_resolve(), &url);
         command
             .env("CURL_HOME", dir.path())
             .env("NO_PROXY", "127.0.0.1");
@@ -152,11 +152,16 @@ fn serial_host_authenticated_curl_template_ignores_ambient_trace() {
         .unwrap();
     let (url, server) = http_fixture();
     let origin = url.strip_suffix("/fixture").unwrap();
+    // The endpoint comes from the site row; a silent no-op replacement would
+    // send the synthetic secret nowhere and pass vacuously.
+    const ENDPOINT: &str = "https://$api_host:8006/api2/json";
+    assert!(function.contains(ENDPOINT) && function.contains("/root/carrick-ci-token.json"));
     let function = function
         .replace("/root/carrick-ci-token.json", token_path.to_str().unwrap())
-        .replace("https://willow.atxconsulting.com:8006/api2/json", origin);
-    let script =
-        format!("set -euo pipefail\npve_call() {{\n{function}\n}}\npve_call POST /fixture\n");
+        .replace(ENDPOINT, origin);
+    let script = format!(
+        "set -euo pipefail\napi_host=site.invalid\npve_call() {{\n{function}\n}}\npve_call POST /fixture\n"
+    );
     execute(
         Command::new("/bin/bash")
             .args(["-c", &script])

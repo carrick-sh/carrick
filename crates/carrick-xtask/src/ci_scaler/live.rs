@@ -2,6 +2,7 @@
 use super::github::Github;
 #[cfg(test)]
 use super::github::recover_registration;
+use super::site::{Headroom, Site};
 use super::*;
 use serde_json::{Value, json};
 use std::net::Ipv4Addr;
@@ -104,7 +105,7 @@ fn request_config(token: &Token, call: &PveCall) -> Result<String, ScalerError> 
     }
     Ok(config)
 }
-fn clone_config(public_key: &str) -> Value {
+fn clone_config(public_key: &str, site: &Site) -> Value {
     let mut encoded = String::new();
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for byte in public_key.bytes() {
@@ -119,7 +120,7 @@ fn clone_config(public_key: &str) -> Value {
     json!({
         "ciuser":"runner", "sshkeys":encoded,
         "ipconfig0":"ip=dhcp", "tags":"carrick-ci;willow-pilot",
-        "cores":2,"memory":4096,"balloon":0,"cpulimit":2,"cpu":"host"
+        "cores":site.cores,"memory":site.memory_mib,"balloon":0,"cpulimit":site.cores,"cpu":"host"
     })
 }
 fn pve_response(bytes: &[u8]) -> Result<Value, ScalerError> {
@@ -161,10 +162,11 @@ fn pve_response(bytes: &[u8]) -> Result<Value, ScalerError> {
         .ok_or(ScalerError::External("PVE response lacks data"))
 }
 struct Pve {
+    site: Site,
     token: Token,
     deadline: std::cell::Cell<Option<Instant>>,
 }
-fn pve_curl(call: &PveCall, url: &str) -> Command {
+fn pve_curl(call: &PveCall, resolve: &str, url: &str) -> Command {
     let mut command = Command::new("curl");
     command.args([
         "--disable",
@@ -175,7 +177,7 @@ fn pve_curl(call: &PveCall, url: &str) -> Command {
         "--max-time",
         "40",
         "--resolve",
-        "willow.atxconsulting.com:8006:127.0.0.1",
+        resolve,
         "--config",
         "-",
         "--request",
@@ -186,9 +188,8 @@ fn pve_curl(call: &PveCall, url: &str) -> Command {
 }
 impl Pve {
     fn local() -> Result<Self, ScalerError> {
-        if std::fs::read_to_string("/etc/hostname")?.trim() != "willow" {
-            return Err(ScalerError::Guard("controller must run on Willow"));
-        }
+        // Fails closed on any host that is not a known clone site.
+        let site = Site::local()?;
         let path = Path::new("/root/carrick-ci-token.json");
         let meta = std::fs::symlink_metadata(path)?;
         if !meta.is_file() || meta.uid() != 0 || meta.mode() & 0o077 != 0 {
@@ -206,6 +207,7 @@ impl Pve {
             ));
         }
         Ok(Self {
+            site,
             token,
             deadline: std::cell::Cell::new(None),
         })
@@ -214,18 +216,18 @@ impl Pve {
         let limit = remaining(self.deadline.get(), Duration::from_secs(45))?;
         let config = request_config(&self.token, &call)?;
         let bytes = execute(
-            &mut pve_curl(
-                &call,
-                &format!("https://willow.atxconsulting.com:8006/api2/json{path}"),
-            ),
+            &mut pve_curl(&call, &self.site.api_resolve(), &self.site.api_url(path)),
             config.as_bytes(),
             limit,
         )?;
         pve_response(&bytes)
     }
+    fn base(&self, id: CloneId) -> String {
+        self.site.qemu(id.get())
+    }
     fn inventory(&self) -> Result<Vec<PoolMember>, ScalerError> {
         let pool = self.request(PveCall::Get, "/pools/carrick-ci")?;
-        pool_inventory(&pool)
+        pool_inventory(&pool, self.site.node)
     }
     fn guard(&self, row: &Record) -> Result<Vm, ScalerError> {
         let inventory = self.inventory()?;
@@ -233,11 +235,11 @@ impl Pve {
             .into_iter()
             .find(|v| v.id == row.vm.get())
             .ok_or(ScalerError::Guard("ledger VM is absent"))?;
-        let config = self.request(PveCall::Get, &format!("{}/config", base(row.vm)))?;
+        let config = self.request(PveCall::Get, &format!("{}/config", self.base(row.vm)))?;
         authenticate_config(row, vm, &config)
     }
 }
-fn pool_inventory(pool: &Value) -> Result<Vec<PoolMember>, ScalerError> {
+fn pool_inventory(pool: &Value, node: &str) -> Result<Vec<PoolMember>, ScalerError> {
     if pool["poolid"] != POOL {
         return Err(ScalerError::Guard("PVE returned another pool"));
     }
@@ -247,7 +249,7 @@ fn pool_inventory(pool: &Value) -> Result<Vec<PoolMember>, ScalerError> {
     let mut result = Vec::new();
     for member in members {
         if member["type"] == "qemu" {
-            if member["node"] != "willow" {
+            if member["node"] != node {
                 return Err(ScalerError::Guard("unexpected pool node"));
             }
             let id = member["vmid"]
@@ -276,10 +278,13 @@ impl Pve {
         }
     }
     fn task_state(&self, task: &str) -> Result<TaskState, ScalerError> {
-        if !task.starts_with("UPID:willow:") || task.contains('/') {
+        if !task.starts_with(&self.site.task_prefix()) || task.contains('/') {
             return Err(ScalerError::Guard("task belongs to another node"));
         }
-        let result = self.request(PveCall::Get, &format!("/nodes/willow/tasks/{task}/status"))?;
+        let result = self.request(
+            PveCall::Get,
+            &format!("/nodes/{}/tasks/{task}/status", self.site.node),
+        )?;
         if result["status"] == "stopped" {
             if result["exitstatus"] != "OK" {
                 return Ok(TaskState::Failed);
@@ -313,7 +318,7 @@ impl Pve {
         self.guard(row)?;
         let response = self.request(
             PveCall::Post(json!({"command":command})),
-            &format!("{}/agent/exec", base(row.vm)),
+            &format!("{}/agent/exec", self.base(row.vm)),
         )?;
         let pid = response["pid"]
             .as_u64()
@@ -322,7 +327,7 @@ impl Pve {
         while Instant::now() < deadline {
             let status = self.request(
                 PveCall::Get,
-                &format!("{}/agent/exec-status?pid={pid}", base(row.vm)),
+                &format!("{}/agent/exec-status?pid={pid}", self.base(row.vm)),
             )?;
             if status["exited"].as_bool() == Some(true) || status["exited"].as_u64() == Some(1) {
                 let exit = status["exitcode"]
@@ -342,7 +347,7 @@ impl Pve {
         self.guard(row)?;
         let data = self.request(
             PveCall::Get,
-            &format!("{}/agent/network-get-interfaces", base(row.vm)),
+            &format!("{}/agent/network-get-interfaces", self.base(row.vm)),
         )?;
         let interfaces = data["result"]
             .as_array()
@@ -364,9 +369,6 @@ impl Pve {
         }
         Err(ScalerError::External("no private guest IPv4 address"))
     }
-}
-fn base(id: CloneId) -> String {
-    format!("/nodes/willow/qemu/{}", id.get())
 }
 fn authenticate_config(
     row: &Record,
@@ -431,7 +433,7 @@ fn enforce_cpu_ceiling(busy: f64, threads: u32) -> Result<(), ScalerError> {
         Ok(())
     }
 }
-fn resource_admission() -> Result<bool, ScalerError> {
+fn resource_admission(pve: &Pve) -> Result<bool, ScalerError> {
     fn cpu() -> Result<(u64, u64), ScalerError> {
         let stat = std::fs::read_to_string("/proc/stat")?;
         let fields: Vec<u64> = stat
@@ -483,35 +485,64 @@ fn resource_admission() -> Result<bool, ScalerError> {
         busy + 2.0 / threads as f64
     );
     enforce_cpu_ceiling(busy, u32::try_from(threads).unwrap_or(0))?;
-    // No LVM mutation. Stop admission before thin data/metadata headroom runs out.
-    let output = execute(
-        Command::new("lvs").args([
-            "--reportformat",
-            "json",
-            "--units",
-            "b",
-            "--nosuffix",
-            "-o",
-            "lv_size,data_percent,metadata_percent",
-            "pve/data",
-        ]),
-        &[],
-        Duration::from_secs(10),
-    )?;
-    let data: Value = serde_json::from_slice(&output)?;
-    let lv = &data["report"][0]["lv"][0];
-    let number = |field| {
-        lv[field]
-            .as_str()
-            .and_then(|s| s.trim().parse::<f64>().ok())
-            .ok_or(ScalerError::Guard("thin-pool statistics unavailable"))
-    };
-    let free = number("lv_size")? * (1.0 - number("data_percent")? / 100.0);
     Ok(
         admit_resources(busy, u32::try_from(threads).unwrap_or(0), available)
-            && free >= (150_u64 << 30) as f64
-            && number("metadata_percent")? < 80.0,
+            && storage_headroom(pve)?,
     )
+}
+/// Storage headroom for one more linked clone: 150 GiB free, and for an LVM
+/// thin pool also metadata below 80%. Read-only; never mutates storage.
+fn storage_headroom(pve: &Pve) -> Result<bool, ScalerError> {
+    const FREE: u64 = 150 << 30;
+    match pve.site.headroom {
+        Headroom::LvmThin { pool } => {
+            let output = execute(
+                Command::new("lvs").args([
+                    "--reportformat",
+                    "json",
+                    "--units",
+                    "b",
+                    "--nosuffix",
+                    "-o",
+                    "lv_size,data_percent,metadata_percent",
+                    pool,
+                ]),
+                &[],
+                Duration::from_secs(10),
+            )?;
+            let data: Value = serde_json::from_slice(&output)?;
+            let lv = &data["report"][0]["lv"][0];
+            let number = |field| {
+                lv[field]
+                    .as_str()
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+                    .ok_or(ScalerError::Guard("thin-pool statistics unavailable"))
+            };
+            let free = number("lv_size")? * (1.0 - number("data_percent")? / 100.0);
+            Ok(free >= FREE as f64 && number("metadata_percent")? < 80.0)
+        }
+        Headroom::Directory => {
+            let status = pve.request(
+                PveCall::Get,
+                &format!(
+                    "/nodes/{}/storage/{}/status",
+                    pve.site.node, pve.site.storage
+                ),
+            )?;
+            directory_headroom(&status, FREE)
+        }
+    }
+}
+/// A directory storage admits a clone only while active, enabled and with at
+/// least `free` bytes available.
+fn directory_headroom(status: &Value, free: u64) -> Result<bool, ScalerError> {
+    if status["active"].as_u64() != Some(1) || status["enabled"].as_u64() != Some(1) {
+        return Err(ScalerError::Guard("clone storage is not active"));
+    }
+    let avail = status["avail"]
+        .as_u64()
+        .ok_or(ScalerError::Guard("storage statistics unavailable"))?;
+    Ok(avail >= free)
 }
 
 fn key_paths(dir: &Path, row: &Record) -> (PathBuf, PathBuf) {
@@ -624,7 +655,7 @@ fn provision(
             "newid":row.vm.get(), "pool":POOL, "name":row.name, "full":false,
             "description":format!("Carrick pilot ledger identity {}", row.name)
         })),
-        "/nodes/willow/qemu/300/clone",
+        &format!("{}/clone", pve.site.qemu(300)),
     )?)?);
     update(ledger, row, path)?;
     pve.wait_task(
@@ -653,19 +684,23 @@ fn boot_and_register(
         ));
     }
     pve.guard(row)?;
-    let status = pve.request(PveCall::Get, &format!("{}/status/current", base(row.vm)))?;
+    let status = pve.request(
+        PveCall::Get,
+        &format!("{}/status/current", pve.base(row.vm)),
+    )?;
     if status["status"] != "stopped" {
         return Err(ScalerError::Guard(
             "clone preparation requires a stopped owned VM",
         ));
     }
     pve.request(
-        PveCall::Put(clone_config(&std::fs::read_to_string(
-            key.with_extension("key.pub"),
-        )?)),
-        &format!("{}/config", base(row.vm)),
+        PveCall::Put(clone_config(
+            &std::fs::read_to_string(key.with_extension("key.pub"))?,
+            &pve.site,
+        )),
+        &format!("{}/config", pve.base(row.vm)),
     )?;
-    if !resource_admission()? {
+    if !resource_admission(pve)? {
         return Err(ScalerError::Guard("host admission denied before boot"));
     }
     pve.guard(row)?;
@@ -677,7 +712,7 @@ fn boot_and_register(
     update(ledger, row, path)?;
     row.task = Some(task_id(pve.request(
         PveCall::Post(json!({})),
-        &format!("{}/status/start", base(row.vm)),
+        &format!("{}/status/start", pve.base(row.vm)),
     )?)?);
     update(ledger, row, path)?;
     pve.wait_task(
@@ -835,9 +870,10 @@ impl TeardownApi for LiveTeardown<'_> {
     }
     fn stop(&mut self, row: &Record, dir: &Path) -> Result<Option<String>, ScalerError> {
         self.pve.guard(row)?;
-        let status = self
-            .pve
-            .request(PveCall::Get, &format!("{}/status/current", base(row.vm)))?;
+        let status = self.pve.request(
+            PveCall::Get,
+            &format!("{}/status/current", self.pve.base(row.vm)),
+        )?;
         if status["status"] == "stopped" {
             return Ok(None);
         }
@@ -852,12 +888,12 @@ impl TeardownApi for LiveTeardown<'_> {
         self.pve.guard(row)?;
         Ok(Some(task_id(self.pve.request(
             PveCall::Post(json!({})),
-            &format!("{}/status/stop", base(row.vm)),
+            &format!("{}/status/stop", self.pve.base(row.vm)),
         )?)?))
     }
     fn destroy(&mut self, row: &Record) -> Result<String, ScalerError> {
         self.pve.guard(row)?;
-        task_id(self.pve.request(PveCall::Delete, &base(row.vm))?)
+        task_id(self.pve.request(PveCall::Delete, &self.pve.base(row.vm))?)
     }
     fn wait_task(&mut self, task: &str) -> Result<(), ScalerError> {
         self.pve.wait_task(task)
@@ -1111,22 +1147,23 @@ fn one_job_result(row: Option<&Record>) -> Result<(), ScalerError> {
     }
 }
 
-fn qualified_template(config: &Value) -> bool {
+fn qualified_template(config: &Value, site: &Site) -> bool {
     // PVE 9 returns memory's decimal MiB quantity as a JSON string.
     let memory_mib = config["memory"].as_u64().or_else(|| {
         config["memory"]
             .as_str()
             .and_then(|value| value.parse::<u64>().ok())
     });
+    let storage = format!("{}:", site.storage);
+    let size = format!("size={}G", site.disk_gib);
+    let bridge = format!("bridge={}", site.bridge);
     config["cpu"] == "host"
-        && config["cores"] == 2
-        && memory_mib == Some(4096)
+        && config["cores"] == site.cores
+        && memory_mib == Some(site.memory_mib)
         && config["scsi0"]
             .as_str()
-            .is_some_and(|s| s.starts_with("local-lvm:") && s.contains("size=64G"))
-        && config["net0"]
-            .as_str()
-            .is_some_and(|s| s.contains("bridge=vmbr0"))
+            .is_some_and(|s| s.starts_with(&storage) && s.contains(&size))
+        && config["net0"].as_str().is_some_and(|s| s.contains(&bridge))
 }
 
 /// Foreground Willow controller. The pilot admission always runs with one
@@ -1165,21 +1202,24 @@ pub(super) fn controller(
     if template.pool != POOL {
         return Err(ScalerError::Guard("template pool mismatch"));
     }
-    let config = pve.request(PveCall::Get, "/nodes/willow/qemu/300/config")?;
-    if !qualified_template(&config) {
+    let config = pve.request(PveCall::Get, &format!("{}/config", pve.site.qemu(300)))?;
+    if !qualified_template(&config, &pve.site) {
         return Err(ScalerError::Guard(
             "template does not match approved size/storage/bridge",
         ));
     }
     // Read-only privilege proof. Never probe a denied destructive operation.
-    let protected = pve.request(PveCall::Get, "/access/permissions?path=/vms/105")?;
-    if protected.as_object().is_none_or(|map| {
-        map.values()
-            .any(|v| v.as_object().is_none_or(|m| !m.is_empty()))
-    }) {
-        return Err(ScalerError::Guard(
-            "token has unexpected protected-VM rights",
-        ));
+    for vm in pve.site.protected {
+        let protected =
+            pve.request(PveCall::Get, &format!("/access/permissions?path=/vms/{vm}"))?;
+        if protected.as_object().is_none_or(|map| {
+            map.values()
+                .any(|v| v.as_object().is_none_or(|m| !m.is_empty()))
+        }) {
+            return Err(ScalerError::Guard(
+                "token has unexpected protected-VM rights",
+            ));
+        }
     }
     let gh = Github;
     let path = dir.join("ledger.json");
@@ -1262,7 +1302,7 @@ fn admit_one(
     else {
         return Ok(());
     };
-    if !resource_admission()? {
+    if !resource_admission(pve)? {
         return Ok(());
     }
     let inventory = pve.inventory()?;
@@ -1376,12 +1416,22 @@ mod tests {
                 .unwrap()
                 .contains("invalid urlencoded string")
         );
-        let config = clone_config("ssh-ed25519 AAAA+/= validation-only\n");
+        let config = clone_config(
+            "ssh-ed25519 AAAA+/= validation-only\n",
+            &super::site::WILLOW,
+        );
         assert_eq!(
             config["sshkeys"],
             "ssh-ed25519%20AAAA%2B%2F%3D%20validation-only%0A"
         );
         assert_eq!(config["cores"], 2);
+        assert_eq!(config["cpulimit"], 2);
+        assert_eq!(config["memory"], 4096);
+        let config = clone_config("ssh-ed25519 AAAA\n", &super::site::CONTABO);
+        assert_eq!(config["cores"], 8);
+        assert_eq!(config["cpulimit"], 8);
+        assert_eq!(config["memory"], 16384);
+        assert_eq!(config["ipconfig0"], "ip=dhcp");
     }
     #[test]
     fn recovered_one_job_preserves_error_history_and_requires_actual_assignment() {
@@ -1430,7 +1480,9 @@ mod tests {
         let pool = json!({"poolid":POOL,"members":[
             {"type":"qemu","node":"willow","vmid":308,"template":0}
         ]});
-        let members = pool_inventory(&pool).unwrap();
+        let members = pool_inventory(&pool, "willow").unwrap();
+        // Membership on another site's node is foreign, never adopted.
+        assert!(pool_inventory(&pool, "m28112").is_err());
         assert_eq!(members[0].id, 308);
         let row = row();
         assert!(authenticate_config(&row, members[0].clone(), &json!({"name":row.name})).is_ok());
@@ -1532,13 +1584,36 @@ mod tests {
             "scsi0":"local-lvm:base-300-disk-0,size=64G",
             "net0":"virtio=BC:24:11:54:4F:C9,bridge=vmbr0"
         });
-        assert!(qualified_template(&config));
+        let willow = &super::site::WILLOW;
+        let contabo = &super::site::CONTABO;
+        assert!(qualified_template(&config, willow));
+        // A Willow-shaped template never qualifies on another site.
+        assert!(!qualified_template(&config, contabo));
         config["memory"] = json!(4096);
-        assert!(qualified_template(&config));
+        assert!(qualified_template(&config, willow));
         for memory in [json!(8192), json!("8192"), json!("4096MiB"), json!(null)] {
             config["memory"] = memory;
-            assert!(!qualified_template(&config));
+            assert!(!qualified_template(&config, willow));
         }
+        let mut config = json!({
+            "cpu":"host", "cores":8, "memory":"16384",
+            "scsi0":"local:300/base-300-disk-0.qcow2,size=100G",
+            "net0":"virtio=BC:24:11:00:00:01,bridge=vmbr1"
+        });
+        assert!(qualified_template(&config, contabo));
+        assert!(!qualified_template(&config, willow));
+        config["net0"] = json!("virtio=BC:24:11:00:00:01,bridge=vmbr0");
+        assert!(!qualified_template(&config, contabo));
+    }
+    #[test]
+    fn directory_storage_admits_only_active_storage_with_free_space() {
+        let free = 150_u64 << 30;
+        let status = |active: u64, avail: u64| json!({"active":active,"enabled":1,"avail":avail});
+        assert!(directory_headroom(&status(1, free), free).unwrap());
+        assert!(!directory_headroom(&status(1, free - 1), free).unwrap());
+        assert!(directory_headroom(&status(0, free * 4), free).is_err());
+        assert!(directory_headroom(&json!({"active":1,"enabled":1}), free).is_err());
+        assert!(directory_headroom(&json!({"active":1,"enabled":0,"avail":free}), free).is_err());
     }
     #[test]
     fn shared_readiness_deadline_bounds_a_nested_external_command() {
