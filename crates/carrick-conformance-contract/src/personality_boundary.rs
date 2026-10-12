@@ -406,6 +406,16 @@ pub fn check_substrate_boundary(
     let mut violation_messages = Vec::new();
 
     for crate_name in &config.substrate_allowlist {
+        // Execution transport must not acquire Linux-shaped object owners,
+        // even through a renamed or transitive dependency.
+        let mut root_forbidden = forbidden_crates.clone();
+        if crate_name == "carrick-core-abi" {
+            root_forbidden.extend([
+                "carrick-fd-core".to_string(),
+                "carrick-pipe-core".to_string(),
+                "carrick-inotify-core".to_string(),
+            ]);
+        }
         let mut report = CrateAuditReport {
             crate_name: crate_name.clone(),
             ..Default::default()
@@ -433,7 +443,7 @@ pub fn check_substrate_boundary(
             if mixed_el1 {
                 &el1_forbidden
             } else {
-                &forbidden_crates
+                &root_forbidden
             },
             &forbidden_host_crates,
             &mut report,
@@ -1478,6 +1488,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn terminal_run_transport_has_one_neutral_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let source =
+            fs::read_to_string(repo.join("crates/carrick-core-abi/src/native_run_failure.rs"))
+                .expect("terminal run transport must be owned by core-abi");
+        let items = syn::parse_file(&source).unwrap();
+        for name in [
+            "NativeRunFailureReason",
+            "NativeRunFailure",
+            "NativeRunFailureConsumer",
+        ] {
+            let count = items
+                .items
+                .iter()
+                .filter(|item| match item {
+                    syn::Item::Struct(item) => item.ident == name,
+                    syn::Item::Enum(item) => item.ident == name,
+                    _ => false,
+                })
+                .count();
+            assert_eq!(count, 1, "one neutral definition required for {name}");
+        }
+        for old in [
+            "crates/carrick-el1-abi/src/native_run_failure.rs",
+            "crates/carrick-personality-linux/src/native_run_failure.rs",
+        ] {
+            assert!(
+                !repo.join(old).exists(),
+                "old transport owner must be removed: {old}"
+            );
+        }
+        assert!(DEFAULT_SUBSTRATE_ALLOWLIST.contains(&"carrick-core-abi"));
+    }
+
+    #[test]
     fn mm_transfer_records_have_one_neutral_owner() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let neutral = repo.join("crates/carrick-core-abi/src/mm/transfer.rs");
@@ -1819,6 +1864,38 @@ mod tests {
         f.metadata["packages"][0]["dependencies"] =
             json!([{"name":"neutral-bridge", "optional":false}]);
         assert!(f.check().is_ok());
+    }
+
+    #[test]
+    fn core_abi_rejects_linux_object_cores_transitively() {
+        for name in [
+            "carrick-fd-core",
+            "carrick-pipe-core",
+            "carrick-inotify-core",
+        ] {
+            let mut f = Fixture::new("src/lib.rs", "");
+            let dir = f.root.path().join("crates/carrick-core-abi");
+            fs::rename(f.root.path().join("crates/carrick-sched-core"), &dir).unwrap();
+            f.metadata["packages"][0]["name"] = json!("carrick-core-abi");
+            f.metadata["packages"][0]["manifest_path"] = json!(dir.join("Cargo.toml"));
+            f.metadata["packages"][0]["targets"][0]["src_path"] = json!(dir.join("src/lib.rs"));
+            f.package("bridge", "neutral-bridge");
+            f.package("object", name);
+            f.edge(0, "bridge", "neutral_bridge", None, None);
+            f.edge(1, "object", "renamed_object", None, None);
+            let result = check_substrate_boundary(
+                f.root.path(),
+                &BoundaryConfig {
+                    metadata_json: Some(f.metadata.to_string()),
+                    substrate_allowlist: vec!["carrick-core-abi".to_string()],
+                    ..Default::default()
+                },
+            );
+            assert!(
+                matches!(result, Err(BoundaryError::Violations { .. })),
+                "neutral ABI reached {name}"
+            );
+        }
     }
 
     #[test]

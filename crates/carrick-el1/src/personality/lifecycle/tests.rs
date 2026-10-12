@@ -2431,9 +2431,9 @@ fn clone_terminal_failure_witness(mode: u8) {
     assert_eq!(
         failure.reason,
         if mode == 0 {
-            carrick_el1_abi::NativeRunFailureReason::BirthSettlement
+            carrick_core_abi::NativeRunFailureReason::BirthSettlement
         } else {
-            carrick_el1_abi::NativeRunFailureReason::ClaimRollback
+            carrick_core_abi::NativeRunFailureReason::ClaimRollback
         }
     );
     assert_eq!(w.zone.slot(SLOT).queued(), if mode == 0 { 1 } else { 0 });
@@ -2461,8 +2461,8 @@ fn arm_dispatch_consumes_native_run_failure_before_return() {
         binding: carrick_el1_abi::ExecutionBinding,
     }
     impl ProcessNative for Failed {
-        fn take_run_failure(&mut self) -> Option<carrick_el1_abi::NativeRunFailureReason> {
-            Some(carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody)
+        fn take_run_failure(&mut self) -> Option<carrick_core_abi::NativeRunFailureReason> {
+            Some(carrick_core_abi::NativeRunFailureReason::X86GroupExitCustody)
         }
         fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
             self.binding
@@ -2524,6 +2524,6 @@ fn arm_dispatch_consumes_native_run_failure_before_return() {
     assert_eq!(failure.binding, binding);
     assert_eq!(
         failure.reason,
-        carrick_el1_abi::NativeRunFailureReason::X86GroupExitCustody
+        carrick_core_abi::NativeRunFailureReason::X86GroupExitCustody
     );
 }

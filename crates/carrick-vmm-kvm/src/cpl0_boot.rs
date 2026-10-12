@@ -285,7 +285,7 @@ pub enum InitialSyscallDisposition {
 )]
 pub enum PhysicalProcessExit {
     Exited(carrick_personality_linux::lifecycle::LinuxWaitStatus),
-    RunFailed(carrick_el1_abi::NativeRunFailureReason),
+    RunFailed(carrick_core_abi::NativeRunFailureReason),
 }
 impl PhysicalProcessExit {
     pub fn into_initial_process_exit(self, exits: usize) -> InitialProcessExit {
@@ -1406,7 +1406,7 @@ impl ProductionCpuLease {
                     let retire_result = custody.service_child_retire(&lease);
                     Ok((None, None, Some((root_gpa, retire_result))))
                 }
-                carrick_el1_abi::NATIVE_RUN_FAILURE_PORT => {
+                carrick_core_abi::NATIVE_RUN_FAILURE_PORT => {
                     let reason = custody.service_run_failure(&lease)?;
                     custody.run_failure_crossings = custody
                         .run_failure_crossings
@@ -1619,7 +1619,7 @@ impl ProductionCpuLease {
                     let retire_result = custody.service_child_retire(&lease);
                     Ok((None, None, Some((root_gpa, retire_result))))
                 }
-                carrick_el1_abi::NATIVE_RUN_FAILURE_PORT => {
+                carrick_core_abi::NATIVE_RUN_FAILURE_PORT => {
                     let reason = custody.service_run_failure(&lease)?;
                     custody.run_failure_crossings = custody.run_failure_crossings
                         .checked_add(1)
@@ -6221,7 +6221,7 @@ pub enum InitialProcessExit {
         exits: usize,
     },
     RunFailed {
-        reason: carrick_el1_abi::NativeRunFailureReason,
+        reason: carrick_core_abi::NativeRunFailureReason,
         exits: usize,
     },
     Exited {

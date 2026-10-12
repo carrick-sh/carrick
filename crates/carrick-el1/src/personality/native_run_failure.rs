@@ -1,5 +1,5 @@
 //! Terminal native failures retain the exact execution incarnation.
-use carrick_el1_abi::{ExecutionBinding, NativeRunFailureReason};
+use carrick_core_abi::{ExecutionBinding, NativeRunFailureReason};
 
 /// VM-free witness of the production terminal completion boundary.
 #[cfg(all(not(target_os = "none"), test))]
