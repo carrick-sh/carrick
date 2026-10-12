@@ -10,6 +10,18 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
+// Compiler relinks may unlink the pathname of this still-running executable.
+// The capture owns a private copy for its entire child-process lifetime.
+fn snapshot_xtask(directory: &Path) -> Result<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    let source = std::path::PathBuf::from("/proc/self/exe");
+    #[cfg(not(target_os = "linux"))]
+    let source = std::env::current_exe()?;
+    let snapshot = directory.join("xtask");
+    std::fs::copy(source, &snapshot)?;
+    Ok(snapshot)
+}
+
 const CAPTURE: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 
@@ -84,7 +96,7 @@ pub fn records(root: &Path, recipe: &str, args: &[String]) -> Result<Vec<Vec<Str
         .env("CARRICK_REAL_CARGO", real_cargo)
         .env("CARRICK_TEST_CAPTURE", temp.path().join("commands"))
         .env("CARRICK_TEST_RECORDS", &log)
-        .env("CARRICK_TEST_XTASK", std::env::current_exe()?)
+        .env("CARRICK_TEST_XTASK", snapshot_xtask(temp.path())?)
         .status()?;
     if !status.success() {
         return Err(format!("capture {recipe} failed").into());
@@ -153,6 +165,7 @@ fn check_host(root: &Path, host: &str) -> Result<String> {
     let root = root.canonicalize()?;
     let shards = shard_recipes(&root)?;
     let temp = tempfile::tempdir()?;
+    let xtask = snapshot_xtask(temp.path())?;
     let stub = temp.path().join("cargo");
     std::fs::write(&stub, CAPTURE)?;
     std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))?;
@@ -174,7 +187,7 @@ fn check_host(root: &Path, host: &str) -> Result<String> {
             .env("CARRICK_REAL_CARGO", &real_cargo)
             .env("CARRICK_TEST_CAPTURE", &log)
             .env("CARRICK_TEST_CAPTURE_HOST", host)
-            .env("CARRICK_TEST_XTASK", std::env::current_exe()?)
+            .env("CARRICK_TEST_XTASK", &xtask)
             .env_remove("RUST_TEST_THREADS")
             .env_remove("RUST_MIN_STACK")
             .output()?;
