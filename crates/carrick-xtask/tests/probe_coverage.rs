@@ -369,6 +369,17 @@ fn landing_base_protects_later_additions() {
     );
 }
 
+/// Fixture commands must not depend on the runner's HOME, global or system
+/// config, or identity (a CI job HOME can be a bare skeleton).
+const HERMETIC_GIT_ENV: [(&str, &str); 6] = [
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+    ("GIT_AUTHOR_NAME", "Test User"),
+    ("GIT_AUTHOR_EMAIL", "test@example.com"),
+    ("GIT_COMMITTER_NAME", "Test User"),
+    ("GIT_COMMITTER_EMAIL", "test@example.com"),
+];
+
 fn init_git_repo() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let repo_path = dir.path().to_path_buf();
@@ -377,6 +388,7 @@ fn init_git_repo() -> (tempfile::TempDir, std::path::PathBuf) {
         let output = std::process::Command::new("git")
             .args(args)
             .current_dir(&repo_path)
+            .envs(HERMETIC_GIT_ENV)
             .output()
             .expect("git execution");
         assert!(
@@ -433,6 +445,7 @@ fn git_commit_all(repo_path: &Path, msg: &str) {
         let output = std::process::Command::new("git")
             .args(args)
             .current_dir(repo_path)
+            .envs(HERMETIC_GIT_ENV)
             .output()
             .expect("git execution");
         assert!(
@@ -468,15 +481,20 @@ fn git_checkout_branch(repo_path: &Path, branch: &str) {
 fn assert_one_skip_line(output: &std::process::Output) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // libtest prints `test NAME ... ` without a newline before a test runs
+    // when it is single-threaded (RUST_TEST_THREADS=1 or one available CPU),
+    // so the tool's line can follow that prefix on the same physical line.
+    // Match from the marker to the end of the line instead of at its start.
     let skip_lines = stdout
         .lines()
         .chain(stderr.lines())
-        .filter(|line| line.starts_with("probe coverage delta:"))
+        .filter_map(|line| line.find("probe coverage delta:").map(|at| &line[at..]))
         .collect::<Vec<_>>();
     assert_eq!(
         skip_lines,
         ["probe coverage delta: no change range (no base provided); delta ratchet not applicable"],
-        "expected exactly one complete skip line across both streams"
+        "expected exactly one complete skip line across both streams\nstatus: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
     );
     assert!(stderr.is_empty(), "skip must use stdout only: {stderr}");
 }
@@ -642,9 +660,17 @@ fn closure_without_change_range_enforces_absolute_checks_and_logs_once() {
         ])
         .env(ROOT_ENV, &repo_path)
         .env_remove("CARRICK_PROBE_COVERAGE_BASE")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
         .expect("capture closure entry point");
-    assert!(output.status.success(), "{output:?}");
+    assert!(
+        output.status.success(),
+        "closure child failed: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_one_skip_line(&output);
 }
 
