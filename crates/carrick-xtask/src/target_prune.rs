@@ -537,7 +537,7 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::process::{Child, Stdio};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn old_artifact(root: &Path) -> (PathBuf, PathBuf) {
         let target = root.join("target");
@@ -664,8 +664,6 @@ mod tests {
                     std::thread::sleep(Duration::from_secs(delay.parse().unwrap()));
                 }
                 let mut peer = UnixStream::connect(socket).unwrap();
-                peer.set_read_timeout(Some(Duration::from_secs(10)))
-                    .unwrap();
                 peer.write_all(b"ready\n").unwrap();
                 let mut reply = [0];
                 peer.read_exact(&mut reply).unwrap();
@@ -681,18 +679,119 @@ mod tests {
         assert!(output.status.success(), "{output:?}");
         String::from_utf8(output.stdout).unwrap()
     }
-    fn barrier(listener: UnixListener) -> UnixStream {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || sender.send(listener.accept()).unwrap());
-        let (mut peer, _) = receiver
-            .recv_timeout(Duration::from_secs(15))
-            .expect("pruner must reach final pre-unlink boundary")
-            .unwrap();
-        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    fn barrier(listener: UnixListener, child: &mut Child) -> UnixStream {
+        // Time bounds diagnose hangs only; readiness and child exit decide
+        // whether the fixture reached the boundary, regardless of host speed.
+        let started = Instant::now();
+        listener.set_nonblocking(true).unwrap();
+        let mut peer: Option<UnixStream> = None;
         let mut ready = [0; 6];
-        peer.read_exact(&mut ready).unwrap();
-        assert_eq!(&ready, b"ready\n");
-        peer
+        let mut received = 0;
+        let mut disconnected = false;
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                let mut stderr = String::new();
+                child
+                    .stderr
+                    .take()
+                    .unwrap()
+                    .read_to_string(&mut stderr)
+                    .unwrap();
+                panic!("pruner exited before final pre-unlink readiness: {status}\n{stderr}");
+            }
+            if started.elapsed() >= Duration::from_secs(600) {
+                child.kill().unwrap();
+                let status = child.wait().unwrap();
+                let mut stderr = String::new();
+                child
+                    .stderr
+                    .take()
+                    .unwrap()
+                    .read_to_string(&mut stderr)
+                    .unwrap();
+                panic!(
+                    "pruner readiness HANG: ten-minute safety guard; killed child: {status}\n{stderr}"
+                );
+            }
+            if peer.is_none() {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(true).unwrap();
+                        peer = Some(stream);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("pruner readiness accept failed: {error}"),
+                }
+            }
+            if let Some(stream) = &mut peer {
+                match stream.read(&mut ready[received..]) {
+                    Ok(0) => {
+                        // EOF precedes process reaping; wait for its status so
+                        // an early fixture failure includes the actual stderr.
+                        disconnected = true;
+                    }
+                    Ok(count) => {
+                        received += count;
+                        if received == ready.len() {
+                            assert_eq!(&ready, b"ready\n");
+                            let stream = peer.take().unwrap();
+                            stream.set_nonblocking(false).unwrap();
+                            return stream;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("pruner readiness read failed: {error}"),
+                }
+            }
+            // Block between status checks without a readiness deadline or
+            // detached accept thread surviving an exited fixture.
+            let fd = if disconnected {
+                -1
+            } else {
+                peer.as_ref()
+                    .map_or(listener.as_raw_fd(), AsRawFd::as_raw_fd)
+            };
+            let mut event = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let result = unsafe { libc::poll(&mut event, 1, 100) };
+            if result < 0 {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
+            }
+        }
+    }
+    #[test]
+    fn barrier_reports_child_exit_with_stderr() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("before-delete.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "target_prune::tests::prune_child_fixture",
+                "--nocapture",
+            ])
+            // Invalid fixture input fails before connecting to the barrier.
+            .env("PRUNE_FIXTURE_TARGET", temp.path())
+            .env_remove("PRUNE_FIXTURE_APPLY")
+            .env("PRUNE_FIXTURE_CASE", "")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Missing fixture input panics before readiness.
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            barrier(listener, &mut child)
+        }))
+        .unwrap_err();
+        let message = failure.downcast_ref::<String>().unwrap();
+        assert!(message.contains("pruner exited before final pre-unlink readiness"));
+        assert!(message.contains("exit status: 101"), "{message}");
+        assert!(message.contains("panicked"), "{message}");
     }
     #[test]
     fn replacement_after_final_check_is_never_deleted() {
@@ -702,8 +801,8 @@ mod tests {
             let (target, _) = old_artifact(&root);
             let socket = root.join("before-delete.sock");
             let listener = UnixListener::bind(&socket).unwrap();
-            let child = spawn(&target, true, Some(&socket));
-            let mut peer = barrier(listener);
+            let mut child = spawn(&target, true, Some(&socket));
+            let mut peer = barrier(listener, &mut child);
             let retired = root.join("target.old");
             fs::rename(&target, &retired).unwrap();
             let replacement = if link {
@@ -746,8 +845,8 @@ mod tests {
         let (target, artifact) = old_artifact(&root);
         let socket = root.join("before-delete.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let child = spawn(&target, true, Some(&socket));
-        let mut peer = barrier(listener);
+        let mut child = spawn(&target, true, Some(&socket));
+        let mut peer = barrier(listener, &mut child);
         let original = root.join("original-output");
         fs::rename(&artifact, &original).unwrap();
         fs::write(&artifact, "new unchecked candidate").unwrap();
@@ -826,8 +925,8 @@ mod tests {
         let (target, artifact) = old_artifact(&root);
         let socket = root.join("before-delete.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let child = spawn(&target, true, Some(&socket));
-        let mut peer = barrier(listener);
+        let mut child = spawn(&target, true, Some(&socket));
+        let mut peer = barrier(listener, &mut child);
         let lock = File::options()
             .read(true)
             .write(true)
@@ -851,7 +950,7 @@ mod tests {
         let socket = root.join("before-delete.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let mut child = spawn(&target, true, Some(&socket));
-        let _peer = barrier(listener);
+        let _peer = barrier(listener, &mut child);
         assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
         child.wait().unwrap();
         let lock = File::options()
@@ -920,8 +1019,8 @@ mod tests {
         }
         let socket = root.join("before-delete.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let child = spawn(&target, true, Some(&socket));
-        let mut peer = barrier(listener);
+        let mut child = spawn(&target, true, Some(&socket));
+        let mut peer = barrier(listener, &mut child);
         let retired = root.join("build.old");
         fs::rename(target.join("debug/build"), &retired).unwrap();
         fs::create_dir_all(target.join("debug/build/old-build/nested")).unwrap();
@@ -1114,7 +1213,7 @@ mod tests {
         fs::write(temp.path().join("build.rs"),r#"use std::io::{Read,Write}; fn main() { let mut s = std::os::unix::net::UnixStream::connect(std::env::var_os("BUILD_CENSUS_SOCKET").unwrap()).unwrap(); s.write_all(b"ready\n").unwrap(); let mut reply=[0]; s.read_exact(&mut reply).unwrap(); }"#).unwrap();
         let socket = temp.path().join("cargo.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let cargo = Command::new("cargo")
+        let mut cargo = Command::new("cargo")
             .arg("build")
             .current_dir(temp.path())
             .env("CARGO_TARGET_DIR", &target)
@@ -1124,7 +1223,7 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut peer = barrier(listener);
+        let mut peer = barrier(listener, &mut cargo);
         let output = prune(&target, true);
         peer.write_all(b"c").unwrap();
         drop(peer);
