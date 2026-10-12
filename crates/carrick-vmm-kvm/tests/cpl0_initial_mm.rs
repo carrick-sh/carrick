@@ -228,7 +228,7 @@ fn production_extent_cannot_alias_kernel_metadata() {
         .load_guest_mm(&image, &[], &[], InitialReservationLimits::UNLIMITED)
         .expect("shared MM owner");
 
-    let extent_va = carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_VA;
+    let extent_va = carrick_core_abi::X86_CPL0_INITIAL_EXTENT_VA;
     let extent_end = extent_va + extent_bytes as u64;
     let metadata_end = X86_CPL0_DYNAMIC_METADATA_BASE + EL1_DYNAMIC_METADATA_SIZE;
     assert!(

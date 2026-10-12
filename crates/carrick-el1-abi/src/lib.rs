@@ -28,8 +28,6 @@ mod guest_mmu_publication;
 pub use guest_mmu_publication::*;
 mod fork_stock;
 pub use fork_stock::*;
-mod x86_prepare_stock;
-pub use x86_prepare_stock::*;
 mod delegated_notification;
 pub use delegated_notification::*;
 mod mm_portal;
@@ -211,11 +209,6 @@ const _: () = {
 pub const X86_CPL0_DIRECT_VA: u64 = 0xffff_ffff_9000_0000;
 /// Bytes of guest-physical space (from GPA 0) the direct window maps.
 pub const X86_CPL0_DIRECT_WINDOW_BYTES: u64 = 0x0200_0000;
-/// Retained initial-image frames use their own supervisor alias, never the
-/// short bootstrap direct window. The full 512 MiB budget fits here.
-pub const X86_CPL0_INITIAL_EXTENT_VA: u64 = 0xffff_fffe_0000_0000;
-pub const X86_CPL0_INITIAL_EXTENT_GPA: u64 = 0x40_00000;
-pub const X86_CPL0_INITIAL_EXTENT_MAX_SIZE: u64 = 0x2000_0000;
 pub const X86_CPL0_REGION_BASE: u64 = 0xffff_ffff_c000_0000;
 /// MM-private temporary supervisor copy pair.
 pub const X86_CPL0_COW_COPY_BASE: u64 = carrick_mmu_core::x86::copy_window::COW_COPY_WINDOW_BASE;
@@ -237,17 +230,17 @@ pub fn x86_cpl0_table_alias(
         return None;
     }
     let end = gpa.checked_add(4096)?;
-    let address = if gpa < X86_CPL0_INITIAL_EXTENT_GPA {
+    let address = if gpa < carrick_core_abi::X86_CPL0_INITIAL_EXTENT_GPA {
         if end > X86_CPL0_DIRECT_WINDOW_BYTES {
             return None;
         }
         X86_CPL0_DIRECT_VA.checked_add(gpa)?
     } else {
-        let offset = gpa - X86_CPL0_INITIAL_EXTENT_GPA;
-        if offset.checked_add(4096)? > X86_CPL0_INITIAL_EXTENT_MAX_SIZE {
+        let offset = gpa - carrick_core_abi::X86_CPL0_INITIAL_EXTENT_GPA;
+        if offset.checked_add(4096)? > carrick_core_abi::X86_CPL0_INITIAL_EXTENT_MAX_SIZE {
             return None;
         }
-        X86_CPL0_INITIAL_EXTENT_VA.checked_add(offset)?
+        carrick_core_abi::X86_CPL0_INITIAL_EXTENT_VA.checked_add(offset)?
     };
     Some(carrick_guest_arch::KernelVa::new(address))
 }
@@ -282,7 +275,10 @@ const _: () = {
         (0xffff_ffff_b000_0000, 0x100_0000), // progress aliases
         (X86_CPL0_REGION_BASE, EL1_REGION_SIZE),
         (0xffff_ffff_d000_0000, 0x1000), // local APIC
-        (X86_CPL0_INITIAL_EXTENT_VA, X86_CPL0_INITIAL_EXTENT_MAX_SIZE),
+        (
+            carrick_core_abi::X86_CPL0_INITIAL_EXTENT_VA,
+            carrick_core_abi::X86_CPL0_INITIAL_EXTENT_MAX_SIZE,
+        ),
     ];
     let mut i = 0;
     while i < WINDOWS.len() {
@@ -5245,10 +5241,16 @@ mod x86_table_alias_tests {
     fn real_boot_layout_maintenance_root_is_reachable() {
         let frame_offset = 0x3000; // records staged before the frames
         let first_unused_grant = 5;
-        let maintenance = X86_CPL0_INITIAL_EXTENT_GPA + frame_offset + first_unused_grant * 4096;
+        let maintenance = carrick_core_abi::X86_CPL0_INITIAL_EXTENT_GPA
+            + frame_offset
+            + first_unused_grant * 4096;
         assert_eq!(
             x86_cpl0_table_alias(FrameGpa::new(maintenance)).map(|va| va.raw()),
-            Some(X86_CPL0_INITIAL_EXTENT_VA + frame_offset + first_unused_grant * 4096)
+            Some(
+                carrick_core_abi::X86_CPL0_INITIAL_EXTENT_VA
+                    + frame_offset
+                    + first_unused_grant * 4096
+            )
         );
         // The production metadata-backed roots below the extent use the
         // direct window.
@@ -5261,11 +5263,17 @@ mod x86_table_alias_tests {
     #[test]
     fn unreachable_or_partial_table_pages_are_refused() {
         // Unaligned.
-        assert!(x86_cpl0_table_alias(FrameGpa::new(X86_CPL0_INITIAL_EXTENT_GPA + 8)).is_none());
+        assert!(
+            x86_cpl0_table_alias(FrameGpa::new(
+                carrick_core_abi::X86_CPL0_INITIAL_EXTENT_GPA + 8
+            ))
+            .is_none()
+        );
         // Past the initial extent's maximum.
         assert!(
             x86_cpl0_table_alias(FrameGpa::new(
-                X86_CPL0_INITIAL_EXTENT_GPA + X86_CPL0_INITIAL_EXTENT_MAX_SIZE
+                carrick_core_abi::X86_CPL0_INITIAL_EXTENT_GPA
+                    + carrick_core_abi::X86_CPL0_INITIAL_EXTENT_MAX_SIZE
             ))
             .is_none()
         );

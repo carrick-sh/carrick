@@ -7,10 +7,10 @@ static TABLE_START: AtomicU64 = AtomicU64::new(0);
 static TABLE_END: AtomicU64 = AtomicU64::new(0);
 
 // Boot publishes this disjoint physical license before either native actor runs.
-static WORKING_TABLES: carrick_el1::lock::SpinLock<Option<carrick_el1_abi::X86PrepareTableSpan>> =
+static WORKING_TABLES: carrick_el1::lock::SpinLock<Option<carrick_core_abi::X86PrepareTableSpan>> =
     carrick_el1::lock::SpinLock::new(None);
 
-pub fn working_tables() -> Option<carrick_el1_abi::X86PrepareTableSpan> {
+pub fn working_tables() -> Option<carrick_core_abi::X86PrepareTableSpan> {
     *WORKING_TABLES.lock()
 }
 
@@ -53,7 +53,7 @@ pub fn admit_tables(
     start: u64,
     end: u64,
     context: carrick_guest_arch::AddressContext<RootGpa>,
-    working: carrick_el1_abi::X86PrepareTableSpan,
+    working: carrick_core_abi::X86PrepareTableSpan,
 ) {
     let mut retained = WORKING_TABLES.lock();
     if retained.is_some() {

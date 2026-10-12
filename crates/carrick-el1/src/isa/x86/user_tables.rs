@@ -44,7 +44,7 @@ pub(crate) fn page_allows(
 mod tests {
     #![allow(clippy::expect_used)]
     use super::*;
-    use carrick_el1_abi::{X86_CPL0_INITIAL_EXTENT_GPA, X86_CPL0_INITIAL_EXTENT_VA};
+    use carrick_core_abi::{X86_CPL0_INITIAL_EXTENT_GPA, X86_CPL0_INITIAL_EXTENT_VA};
 
     #[test]
     fn permission_walk_reads_initial_extent_tables_and_preserves_permissions() {
