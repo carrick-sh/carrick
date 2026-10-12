@@ -460,7 +460,7 @@ fn inherited_inventory_edges_authorize_only_selected_child_pages() {
         FrameEventCapacity, FrameId, FrameInventoryEvent, FrameLength, MappingGeneration, MemPerms,
     };
     use carrick_kernel::kernel::frame_inventory::FrameInventoryAuthority;
-    use carrick_kernel::kernel::{MmId, ObjectIdRegistry};
+    use carrick_kernel::kernel::{FrameOwner, MmId, ObjectIdRegistry};
     let authority = Arc::new(FrameInventoryAuthority::new());
     let ids = Arc::new(ObjectIdRegistry::new());
     let parent_mm = ids.mm_id().unwrap();
@@ -501,7 +501,13 @@ fn inherited_inventory_edges_authorize_only_selected_child_pages() {
             })
             .unwrap();
         let (_, receipt) = authority
-            .apply_with_receipt(mm, reservation.commit(()))
+            .apply_with_receipt(
+                FrameOwner::GuestMm(carrick_hal::GuestFrameOwner {
+                    native_mm: MmGeneration::new(nz(mm.raw())),
+                    root_generation: ContextGeneration::new(nz(1)),
+                }),
+                reservation.commit(()),
+            )
             .unwrap();
         (
             BackingIdentity {
@@ -822,7 +828,12 @@ fn inherited_inventory_edges_authorize_only_selected_child_pages() {
             },
         })
         .unwrap();
-    authority.apply(parent_mm, transition.commit(())).unwrap();
+    authority
+        .apply(
+            FrameOwner::GuestMm(contexts[0].into()),
+            transition.commit(()),
+        )
+        .unwrap();
     assert!(
         memory
             .select_inherited_frames(
@@ -900,90 +911,108 @@ fn inherited_compound_inventory_authenticates_only_exact_live_owner_pages() {
     use carrick_hal::{
         FrameEventCapacity, FrameInventoryEvent, FrameLength, MappingGeneration, MemPerms,
     };
-    use carrick_kernel::kernel::{FrameInventoryAuthority, ObjectIdRegistry};
+    use carrick_kernel::kernel::{FrameInventoryAuthority, FrameOwner, ObjectIdRegistry};
     let authority = Arc::new(FrameInventoryAuthority::new());
     let ids = Arc::new(ObjectIdRegistry::new());
     let mm = ids.mm_id().unwrap();
     let other_mm = ids.mm_id().unwrap();
-    let mut reservation = authority
-        .reserve(&ids, 1, 1, FrameEventCapacity::for_event_count(2).unwrap())
-        .unwrap();
-    let transaction = reservation.transaction();
-    let frame = reservation.claim_frame().unwrap();
-    let mapping = reservation.claim_mapping().unwrap();
-    let generation = MappingGeneration::from_backend_counter(nz(1));
-    reservation
-        .push(FrameInventoryEvent::PrepareMapping {
-            transaction,
-            frame,
-            mapping,
-            generation,
-            gpa: carrick_guest_mem::Gpa(0x800000),
-            length: FrameLength::from_mapping_extent(nz(0x4000)),
-            permissions: MemPerms {
-                read: true,
-                write: true,
-                exec: false,
-            },
-        })
-        .unwrap();
-    reservation
-        .push(FrameInventoryEvent::PublishMapping {
-            transaction,
-            mapping,
-            generation,
-        })
-        .unwrap();
-    let (_, receipt) = authority
-        .apply_with_receipt(mm, reservation.commit(()))
-        .unwrap();
-    let identity = BackingIdentity {
-        frame_id: nz(frame.raw()),
-        mapping_id: nz(mapping.raw()),
-        owner_generation: nz(1),
-        inventory_revision: nz(receipt.revision()),
+    let owner = carrick_hal::GuestFrameOwner {
+        native_mm: carrick_hal::MmGeneration::new(nz(mm.raw())),
+        root_generation: carrick_guest_arch::ContextGeneration::new(nz(1)),
     };
+    let other_owner = carrick_hal::GuestFrameOwner {
+        native_mm: carrick_hal::MmGeneration::new(nz(other_mm.raw())),
+        ..owner
+    };
+    let publish = |owner: FrameOwner| {
+        let mut reservation = authority
+            .reserve(&ids, 1, 1, FrameEventCapacity::for_event_count(2).unwrap())
+            .unwrap();
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().unwrap();
+        let mapping = reservation.claim_mapping().unwrap();
+        let generation = MappingGeneration::from_backend_counter(nz(1));
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa: carrick_guest_mem::Gpa(0x800000),
+                length: FrameLength::from_mapping_extent(nz(0x4000)),
+                permissions: MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+        let (_, receipt) = authority
+            .apply_with_receipt(owner, reservation.commit(()))
+            .unwrap();
+        BackingIdentity {
+            frame_id: nz(frame.raw()),
+            mapping_id: nz(mapping.raw()),
+            owner_generation: nz(1),
+            inventory_revision: nz(receipt.revision()),
+        }
+    };
+    let identity = publish(FrameOwner::GuestMm(owner));
     assert!(inventory_page_live(
         &*authority.physical_projection(Arc::clone(&ids)),
-        nz(mm.raw()),
+        owner,
         identity,
         FrameGpa::new(0x801000)
     ));
     assert!(!inventory_page_live(
         &*authority.physical_projection(Arc::clone(&ids)),
-        nz(other_mm.raw()),
+        other_owner,
         identity,
         FrameGpa::new(0x801000)
     ));
     assert!(!inventory_page_live(
         &*authority.physical_projection(Arc::clone(&ids)),
-        nz(mm.raw()),
+        owner,
         BackingIdentity {
-            frame_id: nz(frame.raw() + 1),
+            frame_id: nz(identity.frame_id.get() + 1),
             ..identity
         },
         FrameGpa::new(0x801000)
     ));
     assert!(!inventory_page_live(
         &*authority.physical_projection(Arc::clone(&ids)),
-        nz(mm.raw()),
+        owner,
         BackingIdentity {
-            mapping_id: nz(mapping.raw() + 1),
+            mapping_id: nz(identity.mapping_id.get() + 1),
             ..identity
         },
         FrameGpa::new(0x801000)
     ));
     assert!(!inventory_page_live(
         &*authority.physical_projection(Arc::clone(&ids)),
-        nz(mm.raw()),
+        owner,
         identity,
         FrameGpa::new(0x804000)
     ));
     assert!(!inventory_page_live(
         &*authority.physical_projection(Arc::clone(&ids)),
-        nz(mm.raw()),
+        owner,
         identity,
         FrameGpa::new(0x801001)
+    ));
+    let host_identity = publish(FrameOwner::HostMm(mm));
+    assert!(!inventory_page_live(
+        &*authority.physical_projection(Arc::clone(&ids)),
+        owner,
+        host_identity,
+        FrameGpa::new(0x801000)
     ));
 }
 
@@ -1220,7 +1249,7 @@ fn refused_retire_child_mutates_nothing_and_its_retry_completes() {
     let mut fixture = RetireFixture::new(2);
     // The child's private frame is still mapped in the inventory: the
     // carrier must refuse before touching any of its own state.
-    let child = fixture.mms[1];
+    let child = fixture.context(2);
     let mut reservation = fixture
         .authority
         .reserve(
@@ -1258,7 +1287,10 @@ fn refused_retire_child_mutates_nothing_and_its_retry_completes() {
         .unwrap();
     fixture
         .authority
-        .apply(child, reservation.commit(()))
+        .apply(
+            carrick_kernel::kernel::FrameOwner::GuestMm(child.into()),
+            reservation.commit(()),
+        )
         .unwrap();
     let mut prepared = backing(0x800000, PAGE as usize, 91);
     prepared.identity.frame_id = nz(frame.raw());
@@ -1313,7 +1345,7 @@ fn inherited_inventory_edge_survives_protect_advancing_mapping_generation() {
         MappingId, MemPerms,
     };
     use carrick_kernel::kernel::frame_inventory::FrameInventoryAuthority;
-    use carrick_kernel::kernel::{MmId, ObjectIdRegistry};
+    use carrick_kernel::kernel::{FrameOwner, MmId, ObjectIdRegistry};
 
     let authority = Arc::new(FrameInventoryAuthority::new());
     let ids = Arc::new(ObjectIdRegistry::new());
@@ -1356,7 +1388,13 @@ fn inherited_inventory_edge_survives_protect_advancing_mapping_generation() {
             })
             .unwrap();
         let (_, receipt) = authority
-            .apply_with_receipt(mm, reservation.commit(()))
+            .apply_with_receipt(
+                FrameOwner::GuestMm(carrick_hal::GuestFrameOwner {
+                    native_mm: MmGeneration::new(nz(mm.raw())),
+                    root_generation: ContextGeneration::new(nz(1)),
+                }),
+                reservation.commit(()),
+            )
             .unwrap();
         (
             BackingIdentity {
@@ -1457,7 +1495,10 @@ fn inherited_inventory_edge_survives_protect_advancing_mapping_generation() {
         })
         .unwrap();
     authority
-        .apply_with_receipt(parent_mm, reservation.commit(()))
+        .apply_with_receipt(
+            FrameOwner::GuestMm(parent_context.into()),
+            reservation.commit(()),
+        )
         .unwrap();
 
     let protect_txn = DescriptorTxn {
