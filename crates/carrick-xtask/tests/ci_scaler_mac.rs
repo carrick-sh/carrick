@@ -788,7 +788,7 @@ fn actual_assignment_requires_unique_runner_identity_and_exact_hvf_labels() {
         run_attempt: 2,
     };
     let actual = serde_json::json!({"id":22,"runner_id":100,"labels":HVF_LABELS});
-    let key = assigned_job_key(&context, RunnerId(100), &[actual.clone()]).unwrap();
+    let key = assigned_job_key(&context, RunnerId(100), std::slice::from_ref(&actual)).unwrap();
     assert_eq!(
         key,
         JobKey {
@@ -797,7 +797,7 @@ fn actual_assignment_requires_unique_runner_identity_and_exact_hvf_labels() {
             job: JobId(22)
         }
     );
-    assert!(assigned_job_key(&context, RunnerId(101), &[actual.clone()]).is_err());
+    assert!(assigned_job_key(&context, RunnerId(101), std::slice::from_ref(&actual)).is_err());
     assert!(assigned_job_key(&context, RunnerId(100), &[actual.clone(), actual.clone()]).is_err());
     let mut closure = actual;
     closure["labels"] = serde_json::json!(HVF_CLOSURE_LABELS);
