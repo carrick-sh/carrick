@@ -1,5 +1,30 @@
 //! One original exact COW completion record, shared by ISA adapters.
 use carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity;
+
+/// The execution and address incarnation licensed to consume replacement stock.
+/// The address MM may differ during an authenticated foreign-MM service.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CowGrantScope {
+    pub execution: crate::ExecutionBinding,
+    pub address: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
+}
+
+impl CowGrantScope {
+    pub fn is_valid(self) -> bool {
+        self.execution.issued()
+            && self.execution.mm.raw() != 0
+            && self.execution.thread_generation.raw() != 0
+            && self.address.root.address().raw() != 0
+    }
+
+    pub fn checked(
+        execution: crate::ExecutionBinding,
+        address: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
+    ) -> Option<Self> {
+        let scope = Self { execution, address };
+        scope.is_valid().then_some(scope)
+    }
+}
 /// Bytes of one grant: the host COW compound.
 pub const COW_GRANT_SIZE: u64 = 16 * 1024;
 const PAGE: u64 = 4096;

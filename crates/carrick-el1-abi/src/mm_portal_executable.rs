@@ -103,7 +103,7 @@ mod tests {
             },
         )
         .unwrap();
-        let grant = pool.claim(7).unwrap();
+        let grant = pool.claim_mm(7).unwrap();
         assert!(pool.authenticates_claimed(&grant));
         let slot = PortalExecutableSlot::new();
         let request = PortalExecutablePublication {

@@ -690,7 +690,7 @@ mod tests {
         drop(lease);
         drop(table.try_claim(slot).unwrap());
         assert!(
-            pool.claim(MM).is_some(),
+            pool.claim_mm(MM).is_some(),
             "failed copy returns its physical grant"
         );
     }
