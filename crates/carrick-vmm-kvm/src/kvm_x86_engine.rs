@@ -637,34 +637,27 @@ impl X86Vmm for KvmVmm {
 
 // ─── impl X86Vcpu for KvmVcpu ────────────────────────────────────────────────
 
-/// Map an `X86Seg` to the KVM bring-up selector (KVM uses the hidden `kvm_segment`
-/// directly and does not re-load from the GDT, but a consistent selector keeps
-/// the descriptor self-describing). CS=0x23, SS/DS/ES=0x1B, others 0.
-fn seg_selector(seg: X86Seg) -> u16 {
-    match seg {
-        X86Seg::Cs => 0x23,
-        X86Seg::Ss | X86Seg::Ds | X86Seg::Es => 0x1B,
-        _ => 0,
-    }
-}
-
-/// Unpack a packed long-mode access-rights word (see `carrick_x86`'s `seg_ar`)
-/// into the `kvm_segment` bit-fields.
-fn ar_to_kvm_segment(base: u64, limit: u32, ar: u32, selector: u16) -> kvm_segment {
-    kvm_segment {
-        base,
-        limit,
-        selector,
-        type_: (ar & 0xF) as u8,
-        s: ((ar >> 4) & 1) as u8,
-        dpl: ((ar >> 5) & 3) as u8,
-        present: ((ar >> 7) & 1) as u8,
-        avl: ((ar >> 12) & 1) as u8,
-        l: ((ar >> 13) & 1) as u8,
-        db: ((ar >> 14) & 1) as u8,
-        g: ((ar >> 15) & 1) as u8,
-        unusable: ((ar >> 16) & 1) as u8,
-        ..Default::default()
+/// Local conversion boundary (Rust's orphan rule forbids implementing the
+/// foreign From trait for a foreign kvm_segment with a foreign descriptor).
+pub(crate) struct KvmSegment(pub(crate) kvm_segment);
+impl From<carrick_x86::SegmentDescriptor> for KvmSegment {
+    fn from(descriptor: carrick_x86::SegmentDescriptor) -> Self {
+        let ar = descriptor.access_rights();
+        Self(kvm_segment {
+            base: descriptor.base(),
+            limit: descriptor.limit(),
+            selector: descriptor.selector(),
+            type_: (ar & 15) as u8,
+            s: ((ar >> 4) & 1) as u8,
+            dpl: ((ar >> 5) & 3) as u8,
+            present: ((ar >> 7) & 1) as u8,
+            avl: ((ar >> 12) & 1) as u8,
+            l: ((ar >> 13) & 1) as u8,
+            db: ((ar >> 14) & 1) as u8,
+            g: ((ar >> 15) & 1) as u8,
+            unusable: ((ar >> 16) & 1) as u8,
+            ..Default::default()
+        })
     }
 }
 
@@ -692,30 +685,29 @@ fn restore_segment_state(
     let in_supervisor_image = s.rip
         >= carrick_hal::guest_arch::UserVaCeiling::for_abi(carrick_abi::LinuxGuestAbi::X86_64)
             .exclusive_end();
-    let (cs_ar, cs_selector, ss_ar, ss_selector) = if at_sysret || in_supervisor_image {
-        (segs.kernel_cs_ar, kernel_cs, segs.kernel_data_ar, kernel_ss)
+    use carrick_x86::{SegmentDescriptor as D, SegmentDpl as P};
+    let (privilege, cs_selector, ss_selector) = if at_sysret || in_supervisor_image {
+        (P::Kernel, kernel_cs, kernel_ss)
     } else {
-        (segs.cs_ar, user_cs, segs.data_ar, user_ss)
+        (P::User, user_cs, user_ss)
     };
     sregs.cr0 = s.cr0;
     sregs.cr2 = 0;
     sregs.cr3 = s.cr3;
     sregs.cr4 = s.cr4;
     sregs.efer = s.efer;
-    sregs.cs = ar_to_kvm_segment(0, 0xFFFF_FFFF, cs_ar, cs_selector);
-    let data = |base| ar_to_kvm_segment(base, 0xFFFF_FFFF, segs.data_ar, 0);
-    sregs.ss = ar_to_kvm_segment(0, 0xFFFF_FFFF, ss_ar, ss_selector);
-    sregs.ds = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.data_ar, user_ss);
-    sregs.es = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.data_ar, user_ss);
-    sregs.fs = data(s.fs_base);
-    sregs.gs = data(s.gs_base);
-    sregs.tr = ar_to_kvm_segment(
-        carrick_x86::fault_slot_gpa(carrick_x86::fault_tss_base(layout), fault_slot)?,
-        carrick_x86::fault::X86_TSS64_LIMIT,
-        segs.tr_ar,
-        seg_selector(X86Seg::Tr),
-    );
-    sregs.ldt = ar_to_kvm_segment(0, 0, segs.ldtr_ar, seg_selector(X86Seg::Ldtr));
+    sregs.cs = KvmSegment::from(D::code64(privilege).with_selector(cs_selector)).0;
+    sregs.ss = KvmSegment::from(D::flat_data(privilege, 0).with_selector(ss_selector)).0;
+    sregs.ds = KvmSegment::from(D::flat_data(P::User, 0).with_selector(user_ss)).0;
+    sregs.es = sregs.ds;
+    sregs.fs = KvmSegment::from(D::flat_data(P::User, s.fs_base).with_selector(0)).0;
+    sregs.gs = KvmSegment::from(D::flat_data(P::User, s.gs_base).with_selector(0)).0;
+    sregs.tr = KvmSegment::from(D::tss64_busy(carrick_x86::fault_slot_gpa(
+        carrick_x86::fault_tss_base(layout),
+        fault_slot,
+    )?))
+    .0;
+    sregs.ldt = KvmSegment::from(D::unusable_ldt()).0;
     sregs.gdt = kvm_dtable {
         base: layout.gdt_base,
         limit: segs.gdt_limit as u16,
@@ -929,11 +921,18 @@ impl X86Vcpu for KvmVcpu {
         use carrick_hal::x8664_arch::X8664GuestArch;
 
         let boot = X8664GuestArch::bootstrap_sysregs();
-        let segs = carrick_x86::long_mode_segment_state();
         let kernel_cs = ((boot.star >> 32) & 0xFFFF) as u16;
         let kernel_ss = kernel_cs.wrapping_add(8);
-        let want_cs = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.kernel_cs_ar, kernel_cs);
-        let want_ss = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.kernel_data_ar, kernel_ss);
+        let want_cs = KvmSegment::from(
+            carrick_x86::SegmentDescriptor::code64(carrick_x86::SegmentDpl::Kernel)
+                .with_selector(kernel_cs),
+        )
+        .0;
+        let want_ss = KvmSegment::from(
+            carrick_x86::SegmentDescriptor::flat_data(carrick_x86::SegmentDpl::Kernel, 0)
+                .with_selector(kernel_ss),
+        )
+        .0;
 
         // Read sregs from the mmap'd kvm_run.s.regs (the kernel synced it out on
         // the doorbell exit; kvm_valid_regs requests SREGS too) instead of a
@@ -1074,10 +1073,10 @@ impl X86Vcpu for KvmVcpu {
     fn set_segment(
         &mut self,
         seg: X86Seg,
-        base: u64,
-        limit: u32,
-        ar: u32,
+        descriptor: carrick_x86::SegmentDescriptor,
     ) -> Result<(), TrapError> {
+        let base = descriptor.base();
+        let limit = descriptor.limit();
         crate::kvm::record_kvm_stat(crate::kvm::KvmStat::GetSregs);
         let mut s = self
             .fd()
@@ -1099,7 +1098,7 @@ impl X86Vcpu for KvmVcpu {
                 };
             }
             _ => {
-                let kseg = ar_to_kvm_segment(base, limit, ar, seg_selector(seg));
+                let kseg = KvmSegment::from(descriptor).0;
                 match seg {
                     X86Seg::Cs => s.cs = kseg,
                     X86Seg::Ds => s.ds = kseg,

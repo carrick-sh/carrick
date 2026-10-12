@@ -1,3 +1,8 @@
+# VMX entry audit (#253): carrier_cpu reconstructs its retained TR using
+# the typed busy-TSS constructor, preserving base and selector. MM load,
+# unload, occupancy and drain operations are unchanged. The KVM lib tests
+# retain their stopped-task and two-MM witnesses; Intel runtime acceptance
+# remains separately owned by x86.vmx.segment-entry.
 schema_version = 1
 # Pool admission audit (2026-10-04): the new configuration guard precedes
 # resolver installation and every worker, so rejection cannot load an MM or

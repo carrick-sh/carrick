@@ -59,12 +59,11 @@ pub struct RawSyscall {
     pub native_number: NativeNr,
 }
 
-/// A register/V-reg access through [`crate::RegAccess`] failed mid-sigframe
-/// build/restore. The shared builder reports it as a hypervisor error so it can
-/// use `?` on `RegAccess` calls (which return [`OsError`]) directly.
+/// Preserve the original OS/hypervisor operation context, including register
+/// access through [`crate::RegAccess`], without inventing a sigframe origin.
 impl From<OsError> for TrapError {
     fn from(e: OsError) -> Self {
-        TrapError::Hypervisor(format!("sigframe register access: {e}"))
+        TrapError::Hypervisor(e.to_string())
     }
 }
 

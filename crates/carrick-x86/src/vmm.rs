@@ -720,8 +720,11 @@ pub trait X86Vcpu {
     }
 
     /// Program a segment/system descriptor (`base`/`limit`/access-rights).
-    fn set_segment(&mut self, seg: X86Seg, base: u64, limit: u32, ar: u32)
-    -> Result<(), TrapError>;
+    fn set_segment(
+        &mut self,
+        seg: X86Seg,
+        descriptor: crate::SegmentDescriptor,
+    ) -> Result<(), TrapError>;
 
     /// Reload the ring-3 user segment selectors + hidden descriptors on the LIVE
     /// vCPU so a resume returns to user space (CS=DPL3/L, SS/DS/ES=DPL3, base=0,
@@ -740,11 +743,22 @@ pub trait X86Vcpu {
     /// fork/clone iretq-blocker), so it OVERRIDES this to write the selectors +
     /// descriptors directly via `vm_set_register`/`vm_set_desc`.
     fn restore_user_segments(&mut self) -> Result<(), TrapError> {
-        let segs = crate::long_mode_segment_state();
-        self.set_segment(X86Seg::Cs, 0, 0xFFFF_FFFF, segs.cs_ar)?;
-        self.set_segment(X86Seg::Ss, 0, 0xFFFF_FFFF, segs.data_ar)?;
-        self.set_segment(X86Seg::Ds, 0, 0xFFFF_FFFF, segs.data_ar)?;
-        self.set_segment(X86Seg::Es, 0, 0xFFFF_FFFF, segs.data_ar)
+        self.set_segment(
+            X86Seg::Cs,
+            crate::SegmentDescriptor::code64(crate::SegmentDpl::User),
+        )?;
+        self.set_segment(
+            X86Seg::Ss,
+            crate::SegmentDescriptor::flat_data(crate::SegmentDpl::User, 0),
+        )?;
+        self.set_segment(
+            X86Seg::Ds,
+            crate::SegmentDescriptor::flat_data(crate::SegmentDpl::User, 0),
+        )?;
+        self.set_segment(
+            X86Seg::Es,
+            crate::SegmentDescriptor::flat_data(crate::SegmentDpl::User, 0),
+        )
     }
 
     /// The `SegmentBaseRegs` mechanism (arch_prctl FS/GS base): KVM/NVMM via the

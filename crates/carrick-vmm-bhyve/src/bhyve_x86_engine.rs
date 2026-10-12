@@ -439,9 +439,7 @@ impl X86Vcpu for BhyveX86Vcpu {
     fn set_segment(
         &mut self,
         _seg: X86Seg,
-        _base: u64,
-        _limit: u32,
-        _ar: u32,
+        _descriptor: carrick_x86::SegmentDescriptor,
     ) -> Result<(), TrapError> {
         // INTENTIONAL NO-OP on bhyve. The ONLY caller of `set_segment` is the
         // shared `restore` (fork child / clone sibling) — bhyve's `bring_up` uses
