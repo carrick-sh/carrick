@@ -1,3 +1,7 @@
+# VMX entry audit (#253): bringup_fns adopts typed hidden descriptors; the
+# poll implementation and all existing poll budgets remain unchanged.
+# Shared VM-free entry checks bind the startup prerequisite separately as
+# x86.vmx.segment-entry. cargo test -p carrick-x86 runs both bindings.
 schema_version = 1
 id = "x86.run-elf.poll"
 title = "Standalone x86 startup serves the normalized poll ABI"

@@ -713,7 +713,7 @@ contracts = ["kernel.el1.files", "kernel.el1.fd-single-owner"]
 
 [[surfaces]]
 path = "crates/carrick-x86/src/bringup_fns.rs"
-contracts = ["x86.run-elf.poll"]
+contracts = ["x86.run-elf.poll", "x86.vmx.segment-entry"]
 
 [[surfaces]]
 path = "crates/carrick-x86/src/bringup_fns/poll_tests.rs"
@@ -1063,7 +1063,7 @@ contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-kvm/src/carrier_cpu.rs"
-contracts = ["kernel.mm.address-space-occupancy"]
+contracts = ["kernel.mm.address-space-occupancy", "x86.vmx.segment-entry"]
 
 [[surfaces]]
 path = "crates/carrick-personality-linux/tests/x86_process_route.rs"
@@ -1256,3 +1256,35 @@ contracts = ["process.native.short-lock"]
 [[surfaces]]
 path = "crates/carrick-el1/src/personality/ipc.rs"
 contracts = ["process.native.short-lock"]
+
+[[surfaces]]
+path = "crates/carrick-x86/src/segments.rs"
+contracts = ["x86.vmx.segment-entry"]
+
+[[surfaces]]
+path = "crates/carrick-x86/src/vmm.rs"
+contracts = ["x86.vmx.segment-entry"]
+
+[[surfaces]]
+path = "crates/carrick-x86/src/fault.rs"
+contracts = ["x86.vmx.segment-entry"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-kvm/src/kvm_x86_engine.rs"
+contracts = ["x86.vmx.segment-entry"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-kvm/src/cpl0_boot.rs"
+contracts = ["x86.vmx.segment-entry"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-nvmm/src/nvmm_x86_engine.rs"
+contracts = ["x86.vmx.segment-entry"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-bhyve/src/guest_setup_x86.rs"
+contracts = ["x86.vmx.segment-entry"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-bhyve/src/bhyve_x86_engine.rs"
+contracts = ["x86.vmx.segment-entry"]

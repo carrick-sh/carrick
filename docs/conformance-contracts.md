@@ -1000,6 +1000,7 @@ mounted wait/IPC fixtures are the CPU execution bindings; the #231 owner
 decision requires their receipt from the merge queue. No local KVM result
 is claimed. Signed HVF and Docker ratio evidence require their respective
 hosts and remain outstanding here.
+
 ## x86 VMX segment entry (`x86.vmx.segment-entry`)
 
 Authority: Intel SDM volume 3, §§26.3.1.1–26.3.1.4 (order 325384),

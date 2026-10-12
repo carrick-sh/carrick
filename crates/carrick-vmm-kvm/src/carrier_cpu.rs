@@ -60,7 +60,11 @@ impl CarrierCpuIo for KvmCpuIo {
                 .map_err(|error| boundary_error(&error.to_string()))?;
             sregs.gdt = static_state.sregs.gdt;
             sregs.idt = static_state.sregs.idt;
-            sregs.tr = static_state.sregs.tr;
+            sregs.tr = crate::kvm_x86_engine::KvmSegment::from(
+                carrick_x86::SegmentDescriptor::tss64_busy(static_state.sregs.tr.base)
+                    .with_selector(static_state.sregs.tr.selector),
+            )
+            .0;
             sregs.ldt = static_state.sregs.ldt;
             sregs.apic_base = static_state.sregs.apic_base;
             self.vcpu

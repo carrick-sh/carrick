@@ -1978,9 +1978,7 @@ mod tests {
         fn set_segment(
             &mut self,
             _seg: X86Seg,
-            _base: u64,
-            _limit: u32,
-            _ar: u32,
+            _descriptor: crate::SegmentDescriptor,
         ) -> Result<(), TrapError> {
             Ok(())
         }

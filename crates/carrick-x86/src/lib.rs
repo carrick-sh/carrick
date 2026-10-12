@@ -53,3 +53,5 @@ pub use segments::{
     GuestSegment, LongModeSegments, VmxGuestStateRule, VmxGuestStateViolation,
     check_vmx_guest_segments,
 };
+
+pub use segments::{SegmentDescriptor, SegmentDpl, UnrepresentableSegmentLimit};
