@@ -156,7 +156,9 @@ jobs:
       # (NEW failures) above; push and dispatch keep the full signed coverage.
       - name: Install Semgrep
         if: ${{ github.event_name != 'merge_group' }}
-        run: brew install semgrep || python3 -m pip install semgrep
+        # A venv, never the system interpreter (PEP 668 refuses a system-wide pip
+        # install on cloudmac's Homebrew Python).
+        run: just ci-install-semgrep
 
       - name: Host-only source gate
         if: ${{ github.event_name != 'merge_group' }}
