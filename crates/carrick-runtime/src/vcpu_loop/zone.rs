@@ -120,7 +120,7 @@ fn parked_context(
         native,
         cpu.ttbr0,
         identity.mm,
-        identity.generation,
+        cpu.asid_generation,
     ))
 }
 
@@ -1561,6 +1561,31 @@ mod ipc_tests {
     use carrick_el1_abi::ipc::{EventMode, IpcOperation, IpcRegion};
     use carrick_kernel::dispatch::SyscallDispatcher;
     use std::alloc::Layout;
+
+    #[test]
+    fn parked_arm_context_keeps_root_generation_not_execution_generation() {
+        let GuestCpuState::Aarch64V1(cpu) =
+            crate::vcpu_loop::executor::tests::test_guest_cpu_state(0x100)
+        else {
+            unreachable!();
+        };
+        let mut cpu = (*cpu).clone();
+        cpu.ttbr0 = 0x10000;
+        cpu.asid_generation = 101;
+        let state = GuestCpuState::from_aarch64_v1(cpu);
+        let identity = ThreadIdentity {
+            tid: 41,
+            serial: 101,
+            mm: 1,
+            file_table: 5,
+            generation: 11,
+            affinity: 1,
+            lifecycle_page: 0,
+            control_slot: 0,
+        };
+        let parked = parked_context(ThreadCtx::ZERO, &state, identity).unwrap();
+        assert_eq!(parked.generation(), 101);
+    }
 
     #[test]
     fn ignored_signal_preserves_zone_group_stop_interruption() {

@@ -21,7 +21,7 @@ use carrick_mmu_core::owner_mmu::Aarch64Mmu;
 use carrick_personality_linux::lifecycle::LinuxWaitStatus;
 use carrick_personality_linux::mm::{LinuxReservationPolicy, MmErrorLinux};
 use carrick_sched_core::{
-    AARCH64_ROOT_ADDRESS_MASK, Aarch64ParkedContext, WakeEffects, ZoneTables,
+    AARCH64_ROOT_ADDRESS_MASK, Aarch64ParkedContext, RecordId, WakeEffects, ZoneTables,
 };
 use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
@@ -82,20 +82,12 @@ pub fn admit_entry(
     task: &'static CurrentTask,
     native: carrick_sched_core::ThreadCtx,
     ttbr0: u64,
-    record_incarnation: u64,
+    record: RecordId,
 ) -> Result<(Arc<Runtime>, Mm, Aarch64ParkedContext), NativeProcessError> {
     let (page, control) = task.lifecycle_refs().ok_or(NativeProcessError::Stale)?;
-    let observed = Mm {
-        root: RootGpa::page_aligned(FrameGpa::new(ttbr0 & AARCH64_ROOT_ADDRESS_MASK))
-            .ok_or(NativeProcessError::Stale)?,
-        mm: MmGeneration::new(
-            NonZeroU64::new(task.mm.key.load(Ordering::Acquire))
-                .ok_or(NativeProcessError::Stale)?,
-        ),
-        generation: ContextGeneration::new(
-            NonZeroU64::new(record_incarnation).ok_or(NativeProcessError::Stale)?,
-        ),
-    };
+    // SAFETY: the EL1 caller owns the running slot and its record until the
+    // process route returns to the vector.
+    let observed = unsafe { observed_entry_address(source, task, ttbr0, record)? };
     let address = if control.entry().is_some() {
         REGISTRY
             .group_address(
@@ -126,6 +118,36 @@ pub fn admit_entry(
     )?);
     REGISTRY.register_root(runtime.clone(), source, task, address)?;
     Ok((runtime, address, words))
+}
+
+/// Read the MM's root incarnation from the parked execution context. The
+/// scheduler record incarnation only names reuse of that record slot.
+///
+/// # Safety
+/// The caller must own the stopped/running record exclusively.
+pub(super) unsafe fn observed_entry_address(
+    source: BornInZoneSource<'_, Aarch64ParkedContext>,
+    task: &CurrentTask,
+    ttbr0: u64,
+    record: RecordId,
+) -> Result<Mm, NativeProcessError> {
+    let zone_record = source.zone.record(record);
+    let binding = common_entry::execution_binding(task);
+    let identity = zone_record.identity();
+    // SAFETY: required by this function's caller contract.
+    let address = unsafe { zone_record.ctx_mut() }
+        .address_context()
+        .ok_or(NativeProcessError::Stale)?;
+    (binding.issued()
+        && identity.tid == binding.task.raw()
+        && identity.generation == binding.generation.raw()
+        && identity.serial == binding.thread_generation.raw()
+        && identity.mm == binding.mm.raw()
+        && source.zone.slot(source.slot).mm() == binding.mm.raw()
+        && address.mm.raw().get() == binding.mm.raw()
+        && address.root.address().raw() == ttbr0 & AARCH64_ROOT_ADDRESS_MASK)
+        .then_some(address)
+        .ok_or(NativeProcessError::Stale)
 }
 
 pub struct Prepared<'a> {

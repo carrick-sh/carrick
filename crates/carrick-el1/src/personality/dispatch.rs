@@ -248,7 +248,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                         task,
                         saved.native,
                         ttbr0,
-                        zone.record(record).incarnation(),
+                        record,
                     ) {
                         let mut service =
                             match super::aarch64_process::Aarch64NativeProcessService::new(
