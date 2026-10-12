@@ -1,16 +1,40 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn get_sysroot() -> String {
-    let output = Command::new("rustc")
-        .arg("--print")
-        .arg("sysroot")
+pub(crate) fn get_sysroot() -> Result<String, String> {
+    let rustc = std::env::var_os("RUSTC").ok_or("Cargo did not supply RUSTC")?;
+    // Cargo supplies the resolved wrappers to build scripts, including
+    // clippy-driver, which can be the compiler rather than execing RUSTC.
+    // Preserve Cargo's order: RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER RUSTC.
+    let mut invocation = Vec::new();
+    for name in ["RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER"] {
+        if let Some(wrapper) = std::env::var_os(name).filter(|value| !value.is_empty()) {
+            invocation.push(wrapper);
+        }
+    }
+    invocation.push(rustc);
+    let mut command = Command::new(&invocation[0]);
+    command.args(&invocation[1..]);
+    let output = command
+        .args(["--print", "sysroot"])
         .output()
-        .expect("failed to run rustc --print sysroot");
-    String::from_utf8(output.stdout)
-        .expect("sysroot is not valid utf-8")
-        .trim()
-        .to_string()
+        .map_err(|error| format!("failed to query compiler sysroot ({command:?}): {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "compiler sysroot query ({command:?}) failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let sysroot = String::from_utf8(output.stdout)
+        .map_err(|error| format!("sysroot is not valid UTF-8: {error}"))?;
+    let sysroot = sysroot.trim();
+    if sysroot.is_empty() {
+        return Err(format!(
+            "compiler sysroot query ({command:?}) returned an empty path"
+        ));
+    }
+    Ok(sysroot.to_owned())
 }
 
 fn find_sysroot_tool(tool: &str, sysroot: &str, host: &str) -> PathBuf {
@@ -181,7 +205,7 @@ fn main() {
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set");
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let host = std::env::var("HOST").expect("HOST not set");
-    let sysroot = get_sysroot();
+    let sysroot = get_sysroot().unwrap_or_else(|error| panic!("{error}"));
 
     // Verify that the aarch64-unknown-none-softfloat target is installed
     let target_dir = Path::new(&sysroot).join("lib/rustlib/aarch64-unknown-none-softfloat");
@@ -189,6 +213,7 @@ fn main() {
         panic!(
             "\n\n======================================================================\n\
              ERROR: Target 'aarch64-unknown-none-softfloat' is required to build carrick-el1-image.\n\
+             Compiler sysroot: {sysroot}\n\
              Install it with:\n\
                  rustup target add aarch64-unknown-none-softfloat\n\
              ======================================================================\n\n"
