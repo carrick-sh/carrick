@@ -1991,8 +1991,7 @@ fn x4_shared_wait_records() {
     let op_token = OperationToken::new(tid, 1).unwrap();
 
     let request = carrick_core_abi::ObjectParkRequest::new(key, snapshot, op_token, None);
-    let parked =
-        park_object_record(&zone, slot, request, 1024, &|_| {}, || Ok((record, false))).unwrap();
+    let parked = park_object_record(&zone, slot, request, &|_| {}, || Ok((record, false))).unwrap();
     assert!(parked.matches(&zone, slot));
     assert!(zone.slot(slot).current().is_none());
 
@@ -2023,7 +2022,7 @@ fn x4_shared_wait_records() {
         bad_token,
         Some(5000),
     );
-    let res = park_object_record(&zone, slot, concurrent_request, 1024, &|_| {}, || {
+    let res = park_object_record(&zone, slot, concurrent_request, &|_| {}, || {
         context_saved.set(true);
         Ok((concurrent, false))
     })
@@ -2040,7 +2039,7 @@ fn x4_shared_wait_records() {
     let stale_token = OperationToken::new(tid, 3).unwrap();
     let stale_request =
         carrick_core_abi::ObjectParkRequest::new(stale_key, snapshot, stale_token, None);
-    let res_stale = park_object_record(&zone, slot, stale_request, 1024, &|_| {}, || {
+    let res_stale = park_object_record(&zone, slot, stale_request, &|_| {}, || {
         context_saved.set(true);
         Ok((record, false))
     });
@@ -2051,7 +2050,7 @@ fn x4_shared_wait_records() {
     );
 
     // One-winner: Notify object wakes the waiter
-    let (report, _effects) = notify_object(&zone, slot, key, 1024).unwrap();
+    let (report, _effects) = notify_object(&zone, slot, key).unwrap();
     assert_eq!(report.queued, 1);
 
     // Switch in the woken record

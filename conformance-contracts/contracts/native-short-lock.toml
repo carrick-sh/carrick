@@ -1,0 +1,31 @@
+schema_version = 1
+id = "process.native.short-lock"
+title = "Native short-lock contention retains the operation and cannot publish a guest error"
+guest_surfaces = ["syscall:wait4", "syscall:msgrcv", "syscall:semtimedop", "syscall:exit", "syscall:exit_group", "scheduler:continuation"]
+semantic_authority = [
+  "man 2 wait4: scheduler lock contention is not EAGAIN",
+  "man 2 msgrcv and semop: EAGAIN describes the requested operation's nonblocking or timed predicate, not a scheduler bucket",
+  "man 2 exit: a committed exit retains terminal publication custody",
+]
+fixture = "All 1024 scheduler buckets held until the contention policy probe reaches the legacy 100000-spin refusal threshold; release also occurs on red refusal or assertion unwinding"
+scale_points = [1]
+rationale = "A short-lock holder can be host-descheduled. Its elapsed descheduling cannot decide Linux semantics. Native enrollment and committed publication acquire one guard without a contention refusal; the retained operation enrolls once, and lock waiting never redispatches a syscall. Interrupts remain masked through the sections; explicitly deferred IRQ expiry retains its timer ticket."
+
+[bindings]
+vm_free = "carrick-el1::personality::native_process_runtime::tests::bucket_contention_msgrcv"
+# Supplemental bindings in the same gated lib target:
+# bucket_contention_semtimedop
+# pending_default_stop_does_not_interrupt_wait4
+# child_exit_retains_wake_custody_across_parent_bucket_contention
+# child_signal_exit_retains_wake_custody_across_parent_bucket_contention
+
+[bindings.unresolved]
+embed_structural = "Linux x86-w1 cannot run signed HVF. Native KVM mounted_static wait4/IPC rows provide CPU execution evidence, not signed ARM acceptance or an exported structural snapshot."
+docker = "Native arm64 Docker oracle and uninstrumented timing remain director-owned; no Docker is available on x86-w1."
+
+[[structural_budgets]]
+kind = "exact"
+metric = "kernel_redispatches"
+value = 0
+layers = ["vm-free"]
+rationale = "Waiting for a short lock does not retry the guest operation: each fixture invokes it once and checks its owned handoff/registration and completion. This is ownership evidence, not a wall-time spin ceiling."

@@ -122,11 +122,8 @@ impl MetadataStorage {
                 else {
                     return false;
                 };
-                zone.bind_object_wait(
-                    key,
-                    &carrick_sched_core::BoundedSpin(crate::substrate::sched::EL1_ZONE_LOCK_SPINS),
-                )
-                .is_ok()
+                zone.bind_object_wait(key, &carrick_sched_core::ShortLockSpin)
+                    .is_ok()
             },
         ) {
             return false;
