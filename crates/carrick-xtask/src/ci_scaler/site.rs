@@ -13,6 +13,22 @@ pub(super) enum Headroom {
     Directory,
 }
 
+/// How a clone (and the template while it is built) gets its IPv4 address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Network {
+    /// The bridge's LAN serves DHCP and DNS.
+    Dhcp,
+    /// A private bridge with no DHCP server: VMID `v` (300-349) gets
+    /// `subnet.(v - 200)/24`, with the bridge's gateway and a public resolver
+    /// (the guest firewall rejects private destinations except DNS/DHCP, so
+    /// no host service or host firewall rule is needed).
+    Static {
+        subnet: [u8; 3],
+        gateway: u8,
+        nameserver: &'static str,
+    },
+}
+
 /// One Proxmox host's clone placement. Template 300 and clone VMIDs 308-349
 /// in pool `carrick-ci` are the same on every site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +42,7 @@ pub(super) struct Site {
     pub headroom: Headroom,
     /// Bridge the template's (and so every clone's) `net0` must use.
     pub bridge: &'static str,
+    pub network: Network,
     pub cores: u32,
     pub memory_mib: u64,
     pub disk_gib: u32,
@@ -39,20 +56,26 @@ pub(super) const WILLOW: Site = Site {
     storage: "local-lvm",
     headroom: Headroom::LvmThin { pool: "pve/data" },
     bridge: "vmbr0",
+    network: Network::Dhcp,
     cores: 2,
     memory_mib: 4096,
     disk_gib: 64,
     protected: &[105],
 };
 
-/// The dedicated Contabo host (issue #287): NAT bridge `vmbr1` with a DHCP
-/// server, directory storage, and the agent-worker VMs/template protected.
+/// The dedicated Contabo host (issue #287): NAT bridge `vmbr1` (no DHCP),
+/// directory storage, and the agent-worker VMs/template protected.
 pub(super) const CONTABO: Site = Site {
     node: "m28112",
     api_host: "m28112.contaboserver.net",
     storage: "local",
     headroom: Headroom::Directory,
     bridge: "vmbr1",
+    network: Network::Static {
+        subnet: [10, 77, 0],
+        gateway: 1,
+        nameserver: "1.1.1.1",
+    },
     cores: 8,
     memory_mib: 16384,
     disk_gib: 100,
@@ -86,23 +109,49 @@ impl Site {
     pub(super) fn task_prefix(&self) -> String {
         format!("UPID:{}:", self.node)
     }
+    /// Cloud-init `ipconfig0` for VMID `vmid` (template 300 or a clone).
+    pub(super) fn ipconfig(&self, vmid: u16) -> Result<String, ScalerError> {
+        match self.network {
+            Network::Dhcp => Ok("ip=dhcp".into()),
+            Network::Static {
+                subnet: [a, b, c],
+                gateway,
+                ..
+            } => {
+                if !(300..=349).contains(&vmid) {
+                    return Err(ScalerError::Guard("static address outside CI VMIDs"));
+                }
+                let host = vmid - 200;
+                Ok(format!("ip={a}.{b}.{c}.{host}/24,gw={a}.{b}.{c}.{gateway}"))
+            }
+        }
+    }
+    /// Cloud-init `nameserver`, only where the bridge does not provide one.
+    pub(super) fn nameserver(&self) -> Option<&'static str> {
+        match self.network {
+            Network::Dhcp => None,
+            Network::Static { nameserver, .. } => Some(nameserver),
+        }
+    }
     /// The template builder's inputs, one `SITE_NAME=value` per line. Every
     /// value is a bare token (no quoting needed); the script validates each.
-    pub(super) fn shell_env(&self) -> String {
+    pub(super) fn shell_env(&self) -> Result<String, ScalerError> {
         let disk_format = match self.headroom {
             Headroom::LvmThin { .. } => "raw",
             Headroom::Directory => "qcow2",
         };
-        format!(
-            "SITE_NODE={}\nSITE_API_HOST={}\nSITE_STORAGE={}\nSITE_DISK_FORMAT={disk_format}\nSITE_BRIDGE={}\nSITE_CORES={}\nSITE_MEMORY_MIB={}\nSITE_DISK_GIB={}\n",
+        Ok(format!(
+            "SITE_NODE={}\nSITE_API_HOST={}\nSITE_STORAGE={}\nSITE_DISK_FORMAT={disk_format}\nSITE_BRIDGE={}\nSITE_CORES={}\nSITE_MEMORY_MIB={}\nSITE_DISK_GIB={}\nSITE_TEMPLATE_IPCONFIG={}\nSITE_NAMESERVER={}\n",
             self.node,
             self.api_host,
             self.storage,
             self.bridge,
             self.cores,
             self.memory_mib,
-            self.disk_gib
-        )
+            self.disk_gib,
+            self.ipconfig(300)?,
+            self.nameserver().unwrap_or("none"),
+        ))
     }
 }
 
@@ -121,12 +170,15 @@ mod tests {
                 storage: "local-lvm",
                 headroom: Headroom::LvmThin { pool: "pve/data" },
                 bridge: "vmbr0",
+                network: Network::Dhcp,
                 cores: 2,
                 memory_mib: 4096,
                 disk_gib: 64,
                 protected: &[105],
             }
         );
+        assert_eq!(WILLOW.ipconfig(308).unwrap(), "ip=dhcp");
+        assert_eq!(WILLOW.nameserver(), None);
         assert_eq!(
             WILLOW.api_url("/pools/carrick-ci"),
             "https://willow.atxconsulting.com:8006/api2/json/pools/carrick-ci"
@@ -148,28 +200,45 @@ mod tests {
                 storage: "local",
                 headroom: Headroom::Directory,
                 bridge: "vmbr1",
+                network: Network::Static {
+                    subnet: [10, 77, 0],
+                    gateway: 1,
+                    nameserver: "1.1.1.1",
+                },
                 cores: 8,
                 memory_mib: 16384,
                 disk_gib: 100,
                 protected: &[101, 102, 103, 104, 9000],
             }
         );
+        assert_eq!(
+            CONTABO.ipconfig(300).unwrap(),
+            "ip=10.77.0.100/24,gw=10.77.0.1"
+        );
+        assert_eq!(
+            CONTABO.ipconfig(349).unwrap(),
+            "ip=10.77.0.149/24,gw=10.77.0.1"
+        );
+        // Static addresses never reach the agent workers (.11-.14) or leave
+        // the CI VMID range.
+        assert!(CONTABO.ipconfig(299).is_err() && CONTABO.ipconfig(350).is_err());
+        assert_eq!(CONTABO.nameserver(), Some("1.1.1.1"));
         assert_eq!(CONTABO.qemu(308), "/nodes/m28112/qemu/308");
     }
     #[test]
     fn template_builder_inputs_are_bare_tokens() {
         assert_eq!(
-            WILLOW.shell_env(),
-            "SITE_NODE=willow\nSITE_API_HOST=willow.atxconsulting.com\nSITE_STORAGE=local-lvm\nSITE_DISK_FORMAT=raw\nSITE_BRIDGE=vmbr0\nSITE_CORES=2\nSITE_MEMORY_MIB=4096\nSITE_DISK_GIB=64\n"
+            WILLOW.shell_env().unwrap(),
+            "SITE_NODE=willow\nSITE_API_HOST=willow.atxconsulting.com\nSITE_STORAGE=local-lvm\nSITE_DISK_FORMAT=raw\nSITE_BRIDGE=vmbr0\nSITE_CORES=2\nSITE_MEMORY_MIB=4096\nSITE_DISK_GIB=64\nSITE_TEMPLATE_IPCONFIG=ip=dhcp\nSITE_NAMESERVER=none\n"
         );
         for site in SITES {
-            for line in site.shell_env().lines() {
+            for line in site.shell_env().unwrap().lines() {
                 let (_, value) = line.split_once('=').unwrap();
                 assert!(
                     !value.is_empty()
                         && value
                             .bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b)),
+                            .all(|b| b.is_ascii_alphanumeric() || b"-._=/,".contains(&b)),
                     "{line:?}"
                 );
             }

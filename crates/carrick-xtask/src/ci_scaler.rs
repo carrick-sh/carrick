@@ -780,7 +780,7 @@ pub fn read_policy(path: &Path, owner: Option<u32>) -> Result<JobPolicy, ScalerE
 pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
     match args.action {
         ScalerAction::Site => {
-            print!("{}", site::Site::local()?.shell_env());
+            print!("{}", site::Site::local()?.shell_env()?);
             Ok(())
         }
         ScalerAction::VerifyKvm => verify_kvm(),
