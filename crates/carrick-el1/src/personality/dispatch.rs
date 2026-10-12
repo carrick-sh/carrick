@@ -226,9 +226,12 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
         };
         let name_cache = unsafe { &*(EL1_NAME_CACHE_BASE as *const InotifyNameCache) };
         let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
+        #[cfg(target_arch = "aarch64")]
         let slot = SlotId::from_index(frame.slot as usize);
+        #[cfg(target_arch = "aarch64")]
         let process_call = matches!(frame.x[8], 260 | 94 | 95 | 58 | 435)
             || (frame.x[8] == 220 && frame.x[0] & 0x0001_0000 == 0);
+        #[cfg(target_arch = "aarch64")]
         if process_call {
             if let (Some(slot), Some(task)) = (slot, current_tasks.get(frame.slot as usize)) {
                 let source = carrick_el1_abi::BornInZoneSource { zone, slot };
@@ -360,7 +363,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
     }
 }
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 fn refuse_owner_process_call(frame: &mut TrapFrame, counters: &Counters) -> Action {
     let nr = frame.x[8] as usize;
     frame.x[0] = (-38_i64) as u64;
@@ -575,10 +578,7 @@ where
     }
 }
 
-#[cfg(target_arch = "aarch64")]
 type LegacyDispatchContext = carrick_el1_abi::Aarch64ParkedContext;
-#[cfg(not(target_arch = "aarch64"))]
-type LegacyDispatchContext = carrick_sched_core::ThreadCtx;
 
 /// Exact context capability for the shared dispatcher. Only the ARM context
 /// can obtain an ARM scheduler source or consume an ARM scheduler receipt.

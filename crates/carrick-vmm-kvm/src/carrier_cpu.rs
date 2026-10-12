@@ -633,10 +633,7 @@ mod tests {
             }
         );
         assert_eq!(stopped.state.binding(), child.binding());
-        assert_eq!(
-            stopped.state.state().cr3(),
-            child.binding().context().root.address().raw()
-        );
+        assert_eq!(stopped.state.state().cr3(), child_root.address().raw());
     }
     #[test]
     fn unregistered_child_retire_cr3_refuses_with_typed_error() {
