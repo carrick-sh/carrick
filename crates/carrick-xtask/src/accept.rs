@@ -27,7 +27,7 @@ pub struct AcceptArgs {
         value_enum,
         default_value = "no-docker",
         overrides_with = "profile",
-        help = "Acceptance profile: no-docker (default for workers), linux-portable (host only), kvm (KVM runner lane, host only), or full (director)"
+        help = "Acceptance profile: no-docker (default for workers), linux-portable (host only, no KVM tests), kvm (KVM runner lane, host only), or full (director)"
     )]
     pub profile: AcceptProfile,
 
@@ -316,15 +316,6 @@ pub const LINUX_PORTABLE_STEPS: &[StepSpec] = &[
         ],
         env: &[],
         log_name: "02-portable-tests.log",
-    },
-    StepSpec {
-        name: "kvm-tests",
-        // Every `kvm`-lane test target (derived from Cargo metadata), with
-        // CARRICK_REQUIRE_KVM=1 so a missing /dev/kvm or fixture fails.
-        program: "just",
-        args: &["test-kvm"],
-        env: &[],
-        log_name: "03-kvm-tests.log",
     },
     StepSpec {
         name: "clippy-linux",
@@ -1887,7 +1878,6 @@ mod tests {
             vec![
                 "test-kernel",
                 "portable-tests",
-                "kvm-tests",
                 "clippy-linux",
                 "fmt-check",
                 "lint-domains-source",

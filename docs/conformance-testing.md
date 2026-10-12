@@ -42,8 +42,8 @@ just remote-accept --ref "$(git rev-parse HEAD)" --phase host
 host phase, including when the phase defaults to `all`. Explicit `--phase signed`
 is rejected before any steps run. It runs `just test-kernel`, native Cargo tests
 for the neutral cores/ABI/EL1, kernel example, x86/AArch64 engines, Linux host
-primitives, contract registry and xtask, plus a separate KVM test step; the
-`carrick-guest-arch` crate is absent (guest architecture types live in `carrick-hal`).
+primitives, contract registry and xtask; it does not run KVM tests (KVM evidence comes from the merge-queue
+`kvm-tests` lane, see AGENTS.md); the `carrick-guest-arch` crate is absent (guest architecture types live in `carrick-hal`).
 It also runs clippy for the CLI's `platform-linux,syscall-shim` closure and worker
 harnesses with `-D warnings`, fmt-check, and the shared `lint-domains-source` checks. A separate authority compiler
 step executes Linux profiles; live macOS/FreeBSD/NetBSD profiles require those

@@ -665,7 +665,7 @@ _test-unit-hvf *ARGS:
 # tests. Linux x86_64 with a usable /dev/kvm only: the recipe refuses anywhere
 # else, and exports CARRICK_REQUIRE_KVM=1 so a test that would skip on a
 # missing device or fixture fails instead. Run by `just accept --profile
-# linux-portable` (kvm-tests) and the KVM job in kernel-runtime.yml.
+# kvm` and the KVM job in kernel-runtime.yml (merge queue); not by workers.
 test-kvm *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
