@@ -743,6 +743,9 @@ pub enum ScalerAction {
     /// Print this host's KVM clone site as `SITE_*=value` lines for
     /// `build-template-debian.sh`; fails closed on an unknown host.
     Site,
+    /// Print this host's PVE VM firewall file for template 300; fails on a
+    /// site whose bridge needs no VM firewall.
+    VmFirewall,
     /// Fail unless the calling (non-root runner) user can open KVM API 12.
     VerifyKvm,
     /// Runner job-start hook: authorize before any workflow step executes.
@@ -781,6 +784,13 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
     match args.action {
         ScalerAction::Site => {
             print!("{}", site::Site::local()?.shell_env()?);
+            Ok(())
+        }
+        ScalerAction::VmFirewall => {
+            let file = site::Site::local()?
+                .vm_firewall_file()
+                .ok_or(ScalerError::Guard("this site uses no VM firewall"))?;
+            print!("{file}");
             Ok(())
         }
         ScalerAction::VerifyKvm => verify_kvm(),

@@ -212,9 +212,12 @@ Departures from the Willow procedure, and their reasons:
 - **Clones use static addresses on a private NAT bridge shared with the
   agent workers.** The host runs no DHCP or DNS service for them and opens no
   host firewall port. Besides the guest firewall, which a job with root in
-  the clone could undo, template 300 carries a PVE VM firewall on `net0`
-  that admits only the gateway on 10.77.0.0/24. Clones inherit it, and the
-  controller refuses a template without it on an isolating site.
+  the clone could undo, template 300 carries a PVE VM firewall on `net0`:
+  default deny in and out, `ipfilter` on, SSH in from the gateway only,
+  and out to public IPv4 only (all private and link-local ranges dropped
+  first; no IPv6). Clones inherit it. The controller fails closed: it checks
+  the exact options and ordered rules on the template and on each clone
+  before boot, and that the datacenter firewall is enabled.
 - **The host is shared with four agent-worker VMs.** They are outside the
   `carrick-ci` pool, so the scoped token has no rights over them, and the
   controller verifies that before serving.
