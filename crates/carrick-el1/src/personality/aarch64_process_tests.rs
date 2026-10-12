@@ -396,6 +396,41 @@ impl Fixture {
     }
 }
 
+#[test]
+fn native_process_entry_uses_parked_root_generation_after_record_reuse() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let record = fixture
+        .zone
+        .slot(fixture.slot)
+        .current()
+        .or_else(|| fixture.zone.slot(fixture.slot).host_record())
+        .unwrap();
+    assert_ne!(
+        fixture.zone.record(record).incarnation(),
+        fixture.address.generation.raw().get()
+    );
+    // SAFETY: this VM-free fixture owns the stopped record exclusively.
+    unsafe {
+        *fixture.zone.record(record).ctx_mut() =
+            Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    }
+    let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    // SAFETY: this VM-free fixture owns the stopped record exclusively.
+    let address = unsafe { observed_entry_address(source, &fixture.task, ttbr0, record) }.unwrap();
+    assert_eq!(address, fixture.address);
+    // The live register must still name the parked root; a recycled root
+    // address with another generation is checked by the registry at entry.
+    let other_root = ttbr0 + 0x1000;
+    assert!(matches!(
+        unsafe { observed_entry_address(source, &fixture.task, other_root, record) },
+        Err(NativeProcessError::Stale)
+    ));
+}
+
 /// Red-first Test 1: child gets distinct root and x0 = 0.
 #[test]
 fn test_fork_child_gets_distinct_root_and_x0_zero() {
