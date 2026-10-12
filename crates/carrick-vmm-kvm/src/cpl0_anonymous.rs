@@ -20,7 +20,7 @@ use carrick_mmu_core::x86::owner_mmu::X86Mmu;
 /// distinct. `carrick_x86::FP_STUB_DOORBELL_PORT` (0xc6) is deliberately
 /// absent: only the legacy no-FP-getter x86 engine in a bhyve VM decodes
 /// it (`run_fp_stub`), never a KVM CPL0 VM, so its number is shared with
-/// [`carrick_el1_abi::X86_INITIAL_BOOT_PORT`] without aliasing.
+/// [`carrick_core_abi::X86_INITIAL_BOOT_PORT`] without aliasing.
 pub(super) const CPL0_CARRIER_PORTS: [u16; 19] = [
     FAULT_DOORBELL_PORT,
     FORWARD_PORT,
@@ -31,7 +31,7 @@ pub(super) const CPL0_CARRIER_PORTS: [u16; 19] = [
     FATAL_PORT,
     YIELD_PORT,
     OWNER_GRANT_PORT,
-    carrick_el1_abi::X86_INITIAL_BOOT_PORT,
+    carrick_core_abi::X86_INITIAL_BOOT_PORT,
     carrick_x86::cpl0_scheduler::PROGRESS_ENTRY_PORT,
     carrick_x86::cpl0_scheduler::PROGRESS_RETURN_PORT,
     carrick_x86::cpl0_scheduler::PROGRESS_DONE_PORT,
@@ -40,7 +40,7 @@ pub(super) const CPL0_CARRIER_PORTS: [u16; 19] = [
     carrick_el1_abi::NATIVE_PEER_READY_PORT,
     carrick_core_abi::NATIVE_RUN_FAILURE_PORT,
     carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT,
-    carrick_el1_abi::X86_INITIAL_RUNNER_READY_PORT,
+    carrick_core_abi::X86_INITIAL_RUNNER_READY_PORT,
 ];
 
 const _: () = {
@@ -260,7 +260,7 @@ fn exact_cow_receipt(
 fn retained_cow_zone(ram: &GuestRam) -> Result<&X86Cpl0Zone, TrapError> {
     let ptr = ram
         .host_ptr(
-            META_GPA + carrick_el1_abi::X86_CPL0_ZONE_OFFSET,
+            META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
             size_of::<X86Cpl0Zone>(),
         )
         .ok_or_else(|| fail("owner COW zone"))?;
@@ -1967,7 +1967,7 @@ mod custody_tests {
         // initial-boot port, which this carrier decodes exactly once.
         assert_eq!(
             carrick_x86::FP_STUB_DOORBELL_PORT,
-            carrick_el1_abi::X86_INITIAL_BOOT_PORT
+            carrick_core_abi::X86_INITIAL_BOOT_PORT
         );
     }
 

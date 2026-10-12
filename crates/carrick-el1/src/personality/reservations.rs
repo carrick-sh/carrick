@@ -24,8 +24,8 @@ pub type SharedReservations =
 /// The same reservation owner in CPL0's compact supervisor metadata geometry.
 pub struct X86Cpl0ReservationGeometry;
 impl owner::ReservationGeometry for X86Cpl0ReservationGeometry {
-    const RESERVATIONS_OFFSET: usize = carrick_el1_abi::X86_CPL0_RESERVATIONS_OFFSET as usize;
-    const ZONE_OFFSET: usize = carrick_el1_abi::X86_CPL0_ZONE_OFFSET as usize;
+    const RESERVATIONS_OFFSET: usize = carrick_core_abi::X86_CPL0_RESERVATIONS_OFFSET as usize;
+    const ZONE_OFFSET: usize = carrick_core_abi::X86_CPL0_ZONE_OFFSET as usize;
     const REGION_BASE: u64 = carrick_el1_abi::X86_CPL0_DYNAMIC_METADATA_BASE;
     const BOOTSTRAP_BASE: u64 = carrick_el1_abi::X86_CPL0_BOOTSTRAP_METADATA_BASE;
     const BOOTSTRAP_SIZE: u64 = carrick_el1_abi::EL1_BOOTSTRAP_METADATA_SIZE;
@@ -43,14 +43,14 @@ pub type X86Cpl0RootReleaseVenue<'a> = owner::RootReleaseVenue<
     carrick_sched_core::ParkedContextWords,
 >;
 const _: () = assert!(
-    carrick_el1_abi::X86_CPL0_RESERVATIONS_OFFSET as usize
+    carrick_core_abi::X86_CPL0_RESERVATIONS_OFFSET as usize
         + core::mem::size_of::<X86Cpl0Reservations>()
-        <= carrick_el1_abi::X86_CPL0_ZONE_OFFSET as usize
+        <= carrick_core_abi::X86_CPL0_ZONE_OFFSET as usize
 );
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub fn shared_x86_cpl0_guest() -> &'static X86Cpl0Reservations {
     let address = carrick_el1_abi::X86_CPL0_DYNAMIC_METADATA_BASE
-        + carrick_el1_abi::X86_CPL0_RESERVATIONS_OFFSET;
+        + carrick_core_abi::X86_CPL0_RESERVATIONS_OFFSET;
     // SAFETY: the carrier maps and retains this zeroed typed region before
     // CPL0 enters, and its image owner publishes the layout before EL0.
     unsafe { &*(address as *const X86Cpl0Reservations) }
