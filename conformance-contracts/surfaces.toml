@@ -1304,3 +1304,7 @@ contracts = ["core.personality.files"]
 [[surfaces]]
 path = "crates/carrick-personality-api/src/lib.rs"
 contracts = ["core.personality.files"]
+
+[[surfaces]]
+path = "crates/carrick-core-abi/src/executable_publication.rs"
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]

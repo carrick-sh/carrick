@@ -212,7 +212,7 @@ pub trait TransferCustody {
     fn publish_executable(
         &self,
         target: TransferTarget,
-        request: carrick_el1_abi::PortalExecutablePublication,
+        request: carrick_core_abi::PortalExecutablePublication,
     ) -> bool;
     fn refill_cow(
         &self,
@@ -650,7 +650,7 @@ where
     fn publish_executable(
         &self,
         target: TransferTarget,
-        request: carrick_el1_abi::PortalExecutablePublication,
+        request: carrick_core_abi::PortalExecutablePublication,
     ) -> bool {
         self.0.publish_executable(target, request)
     }

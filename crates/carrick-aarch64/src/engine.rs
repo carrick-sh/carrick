@@ -9276,7 +9276,7 @@ mod transfer_service_tests {
         fn publish_executable(
             &self,
             _: crate::user_transfer::TransferTarget,
-            _: carrick_el1_abi::PortalExecutablePublication,
+            _: carrick_core_abi::PortalExecutablePublication,
         ) -> bool {
             panic!("no publication expected")
         }

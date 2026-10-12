@@ -337,7 +337,7 @@ impl<W: carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords> PreparedPage
 pub struct HardwareCowResolver {
     pub service_slot: Option<carrick_el1_abi::SlotId>,
     pub completion: Option<carrick_el1_abi::CowGrantCompletion>,
-    pub publication: Option<&'static carrick_el1_abi::PortalExecutableSlot>,
+    pub publication: Option<&'static carrick_core_abi::PortalExecutableSlot>,
 }
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -718,7 +718,7 @@ pub trait CowCopyWindow {
 pub(crate) fn with_hardware_cow_venue<R>(
     ttbr0: u64,
     service_slot: Option<carrick_el1_abi::SlotId>,
-    publication: Option<&'static carrick_el1_abi::PortalExecutableSlot>,
+    publication: Option<&'static carrick_core_abi::PortalExecutableSlot>,
     run: impl for<'a> FnOnce(
         &crate::cow::GuestCowVenue<
             'a,
@@ -803,7 +803,7 @@ pub(crate) fn with_hardware_cow_venue<R>(
     let publish = |grant, ipa, len| {
         publication.is_some_and(|slot| {
             slot.publish_with(
-                carrick_el1_abi::PortalExecutablePublication { grant, ipa, len },
+                carrick_core_abi::PortalExecutablePublication { grant, ipa, len },
                 || {
                     #[cfg(target_arch = "aarch64")]
                     unsafe {
