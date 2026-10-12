@@ -9,7 +9,7 @@
 //!
 //! `mac-run-once` runs as root through one fixed sudoers entry. It verifies
 //! the root-owned runner tree against a manifest pinned by the controller,
-//! writes a root-owned policy bound to the one vetted run, and starts the
+//! writes the reservation policy and a credential-free assignment rendezvous, then starts the
 //! runner as the unprivileged runner user in a fresh session with the shared
 //! job-start hook (`scripts/ci/admit-job.sh`). A rejected job kills that whole
 //! session before any workflow step, exactly as on Willow clones. The JIT
@@ -77,6 +77,9 @@ pub struct MacRecord {
     pub state: MacState,
     pub runner: Option<RunnerId>,
     pub assigned: Option<JobId>,
+    /// The true run/attempt/job; the reservation remains demand provenance.
+    #[serde(default)]
+    pub assigned_key: Option<JobKey>,
 }
 impl RunnerRegistration for MacRecord {
     fn key(&self) -> JobKey {
@@ -123,11 +126,15 @@ impl MacLedger {
             state: MacState::Registering,
             runner: None,
             assigned: None,
+            assigned_key: None,
         };
         self.rows.push(row.clone());
         Ok(row)
     }
     pub fn served(&self, key: JobKey) -> bool {
+        if self.rows.iter().any(|r| r.assigned == Some(key.job)) {
+            return true;
+        }
         served(
             self.rows.iter().map(|r| {
                 (
@@ -312,7 +319,7 @@ pub fn mac_hook_script(exe: &Path, state: &Path) -> Result<String, ScalerError> 
     Ok(source.replace(
         HOOK_COMMAND,
         &format!(
-            "{} ci-scaler admit-job --policy-file {} --state-dir {}",
+            "{} ci-scaler admit-job --policy-file {} --state-dir {} --controller",
             shell_quote(&text(exe)?),
             shell_quote(&text(&state.join("policy"))?),
             shell_quote(&text(state)?)
@@ -357,6 +364,7 @@ fn reconcile(
     let assignment = if row.state == MacState::Registering {
         Assignment::Unknown
     } else {
+        approve_assignment(gh, target, ledger, row, path)?;
         let assignment = gh.assignment(row)?;
         ledger.update(row, path)?;
         assignment
@@ -453,7 +461,7 @@ pub(super) fn controller(
                         let _ = handle.join();
                     }
                     if one_job {
-                        return if row.assigned == Some(row.key.job) {
+                        return if row.assigned.is_some() {
                             Ok(())
                         } else {
                             Err(ScalerError::External(
@@ -661,6 +669,10 @@ pub fn prepare_run_once(
         0o755,
         mac_hook_script(exe, &state)?.as_bytes(),
     )?;
+    let request = write("assignment.json", 0o600, b"")?;
+    if unsafe { libc::fchown(request.as_raw_fd(), run_uid, u32::MAX) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
     let lock = write("admission.lock", 0o600, b"")?;
     if unsafe { libc::fchown(lock.as_raw_fd(), run_uid, u32::MAX) } != 0 {
         return Err(std::io::Error::last_os_error().into());
@@ -1206,4 +1218,206 @@ pub(super) fn run_once(name: &str, binding: &RunBinding, pin: &str) -> Result<()
     std::fs::write(state.join("runner.exit"), format!("{status:?}\n"))?;
     println!("one-job runner exited");
     Ok(())
+}
+
+/// Credential-free rendezvous: publish the actual context, then wait for a
+/// root-owned policy produced by the controller's GitHub re-vetting.
+pub fn admit_assigned(
+    state: &Path,
+    context: &JobContext,
+    owner: u32,
+    limit: Duration,
+) -> Result<(), ScalerError> {
+    Admission::Standing.authorize(context)?;
+    if context.run_id == 0 || context.run_attempt == 0 {
+        return Err(ScalerError::Guard("invalid assigned run identity"));
+    }
+    {
+        let _lock = admission_lock(state)?;
+        if state.join("draining").exists() {
+            return Err(ScalerError::Guard("runner is draining"));
+        }
+        let mut request = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(state.join("assignment.json"))?;
+        request.write_all(&serde_json::to_vec(context)?)?;
+        request.sync_all()?;
+    }
+    let deadline = Instant::now() + limit;
+    loop {
+        if state.join("approved-policy").exists() {
+            return read_policy(&state.join("approved-policy"), Some(owner))?.authorize(context);
+        }
+        if state.join("draining").exists() || Instant::now() >= deadline {
+            return Err(ScalerError::Guard("assigned run approval unavailable"));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Read only the pre-created file beneath the fixed, root-owned state root.
+/// A job can request an identity; it cannot write approval or choose paths.
+pub fn pending_assignment(state: &Path) -> Result<Option<JobContext>, ScalerError> {
+    let _lock = admission_lock(state)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(state.join("assignment.json"))?;
+    let mut bytes = Vec::new();
+    file.take(8193).read_to_end(&mut bytes)?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes.len() > 8192 {
+        return Err(ScalerError::Guard("assignment request too large"));
+    }
+    let context = serde_json::from_slice(&bytes)?;
+    Admission::Standing.authorize(&context)?;
+    Ok(Some(context))
+}
+
+pub fn publish_assignment(state: &Path, policy: &JobPolicy) -> Result<(), ScalerError> {
+    let _lock = admission_lock(state)?;
+    if state.join("draining").exists() {
+        return Err(ScalerError::Guard("runner is draining"));
+    }
+    // Idempotent on controller restart; never replace approval with another run.
+    let path = state.join("approved-policy");
+    if path.exists() {
+        if read_policy(&path, Some(unsafe { libc::geteuid() }))? == *policy {
+            return Ok(());
+        }
+        return Err(ScalerError::Guard("assignment approval changed"));
+    }
+    let temp = state.join("approved-policy.tmp");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temp)?;
+    file.write_all(policy.render().as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(temp, path)?;
+    File::open(state)?.sync_all()?;
+    Ok(())
+}
+
+pub(super) fn assignment_exchange(name: &str, approve: Option<&str>) -> Result<(), ScalerError> {
+    if unsafe { libc::geteuid() } != 0 || !valid_name(name) {
+        return Err(ScalerError::Guard(
+            "assignment exchange requires root and a mac-jit name",
+        ));
+    }
+    let state = Path::new(STATE_ROOT).join(name);
+    if !state.join("assignment.json").exists() && approve.is_none() {
+        println!("null");
+        return Ok(());
+    }
+    let context = pending_assignment(&state)?;
+    if let Some(text) = approve {
+        let policy = JobPolicy::parse(text)?;
+        policy.authorize(
+            context
+                .as_ref()
+                .ok_or(ScalerError::Guard("no assignment request"))?,
+        )?;
+        publish_assignment(&state, &policy)?;
+    }
+    let approved = state.join("approved-policy").exists();
+    if approved {
+        read_policy(&state.join("approved-policy"), Some(0))?.authorize(
+            context
+                .as_ref()
+                .ok_or(ScalerError::Guard("approved request missing"))?,
+        )?;
+    }
+    let request = context.map(|context| AssignmentRequest {
+        context,
+        approved,
+        finished: state.join("runner.exit").exists(),
+    });
+    println!("{}", serde_json::to_string(&request)?);
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+struct AssignmentRequest {
+    context: JobContext,
+    approved: bool,
+    finished: bool,
+}
+
+fn approve_assignment(
+    gh: &Github,
+    target: &MacTarget,
+    ledger: &mut MacLedger,
+    row: &mut MacRecord,
+    path: &Path,
+) -> Result<(), ScalerError> {
+    let command = format!("{} --assignment", target.quiesce_command(&row.name));
+    let output = execute(&mut target.ssh(&command), &[], Duration::from_secs(30))?;
+    let Some(request): Option<AssignmentRequest> = serde_json::from_slice(&output)? else {
+        return Ok(());
+    };
+    let context = request.context;
+    Admission::Standing.authorize(&context)?;
+    let run = serde_json::json!({"id":context.run_id,"run_attempt":context.run_attempt});
+    let runner = row
+        .runner
+        .ok_or(ScalerError::Guard("assignment has no registered runner"))?;
+    let key = assigned_job_key(&context, runner, &gh.jobs(&run)?)?;
+    row.assigned = Some(key.job);
+    row.assigned_key = Some(key);
+    ledger.update(row, path)?; // True assignment is durable BEFORE steps may run.
+    if request.approved || request.finished {
+        return Ok(());
+    }
+    let policy = gh.vet(&Admission::Standing, key)?;
+    policy.authorize(&context)?;
+    let command = format!(
+        "{command} --approve {}",
+        crate::remote_accept::shell_quote(&policy.render())
+    );
+    execute(&mut target.ssh(&command), &[], Duration::from_secs(30))?;
+    Ok(())
+}
+
+/// Authenticate a hook request against GitHub job metadata for this runner.
+pub fn assigned_job_key(
+    context: &JobContext,
+    runner: RunnerId,
+    jobs: &[serde_json::Value],
+) -> Result<JobKey, ScalerError> {
+    Admission::Standing.authorize(context)?;
+    let jobs: Vec<_> = jobs
+        .iter()
+        .filter(|job| job["runner_id"].as_u64() == Some(runner.0))
+        .collect();
+    let [job] = jobs.as_slice() else {
+        return Err(ScalerError::Guard(
+            "actual assignment is not uniquely visible on GitHub",
+        ));
+    };
+    let labels: Vec<_> = job["labels"]
+        .as_array()
+        .ok_or(ScalerError::External("assigned labels"))?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    if !labels_match(&HVF_LABELS, &labels) {
+        return Err(ScalerError::Guard("actual job has incompatible labels"));
+    }
+    Ok(JobKey {
+        run: RunId(context.run_id),
+        attempt: context.run_attempt,
+        job: JobId(
+            job["id"]
+                .as_u64()
+                .ok_or(ScalerError::External("actual job id"))?,
+        ),
+    })
 }

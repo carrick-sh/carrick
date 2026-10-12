@@ -1,8 +1,8 @@
 # cloudmac HVF JIT runners
 
 `kernel-runtime.yml`'s `hvf-kernel` job runs on cloudmac, the owner's Apple
-Silicon gate Mac, as **one JIT ephemeral runner per job**, bound to the one
-workflow run the controller vetted. No runner is registered persistently, no
+Silicon gate Mac, as **one JIT ephemeral runner per job**, admitted to trusted runs of
+`kernel-runtime.yml`, re-vetted at assignment. No runner is registered persistently, no
 GitHub credential is ever written on cloudmac, and jobs run as an
 unprivileged account that owns nothing the next launch trusts.
 
@@ -13,10 +13,11 @@ carrick-xtask ci-scaler mac-jit               rentamac (SSH login, no privileges
   gh: queued jobs of kernel-runtime.yml         sudo -n carrick-xtask ci-scaler mac-run-once ...   (root)
       with exactly HVF_LABELS                     verify runner tree == pinned manifest
   gh: re-vet the run; merge group PR heads        write root-owned run/<name>/{policy,admit-job.sh}
-      must all be carrick-sh/carrick              policy = "standing run=R attempt=A sha=S"
+      must all be carrick-sh/carrick              reservation = "standing run=R attempt=A sha=S"
   gh: generate-jitconfig (one-use) --stdin-->     setsid; drop to carrick-ci; Runner.Listener run
   ledger: ~/.carrick-ci/mac-jit                   JIT via ACTIONS_RUNNER_INPUT_JITCONFIG (never argv)
-                                                  hook: admit-job (bound run), else kill -KILL 0
+                                                  hook: request actual run; await controller approval
+                                                  else kill -KILL 0
                                                   after exit: kill every carrick-ci process
 ```
 
@@ -42,13 +43,36 @@ group (its queue entry and every entry ahead of it, from the GraphQL
 `mergeQueue` listing) must have its head repository equal to
 `carrick-sh/carrick`. A group with a fork pull request is refused.
 
-The runner is then bound (`JobPolicy::Bound`) to that run id, attempt and
-SHA in a root-owned policy file. The job-start hook
-(`scripts/ci/admit-job.sh`, shared with Willow) admits only a job whose
-`GITHUB_RUN_ID`, `GITHUB_RUN_ATTEMPT` and `GITHUB_SHA` match and which also
-passes every standing check (repository, workflow file at the ref being run,
-event and ref). Anything else kills the runner's session before any step,
-including `always()` and `failure()` steps.
+GitHub does not bind a JIT registration to the reserved job: a compatible
+job from another run may be assigned. The mac hook therefore re-vets the
+**actual assignment** through a credential-free rendezvous with the controller:
+
+1. Before steps, the hook validates standing repository/workflow/event/ref
+   checks and writes its run id, attempt and SHA into the pre-created
+   `assignment.json`, under the admission flock. It waits at most four minutes
+   for approval; missing approval fails closed and kills the runner session.
+2. Through the existing root-only `mac-quiesce --assignment` command, the
+   controller reads that request. It finds the unique job in that run/attempt
+   assigned to this runner id, checks exact HVF labels, and re-vets the actual
+   run with `Github::vet`, including same-repository merge-group PR heads.
+3. The controller fsyncs the true job id and full run/attempt/job key into its
+   ledger **before** publishing `approved-policy` through
+   `mac-quiesce --assignment --approve`. That root-owned policy binds approval
+   to the actual run/attempt/SHA. The hook verifies it and marks job-started
+   under the same flock before returning to the runner.
+
+No GitHub credential reaches cloudmac. The runner user can request admission,
+but cannot write approval. Drain and approval share the admission flock;
+restart can republish the same approval but cannot replace it with another
+run. Once approval exists, reconciliation does not re-vet a completed merge
+group that may already have left the queue. An actual job B is deduplicated
+while the unserved reservation A remains eligible for another runner.
+Willow's bound policy and the historical pilot remain unchanged.
+
+This is Option A for [#256](https://github.com/carrick-sh/carrick/issues/256).
+A hook rejection fails the assigned job; it is not a release-to-queue API.
+Re-vetting before steps serves trusted reassignment while preserving refusal
+of pull requests, forks, other workflows and other repositories.
 
 ## One-time cloudmac preparation (owner, live)
 
@@ -198,8 +222,9 @@ receipt fails closed and names this reseed command.
 - **Re-serve.** A job key is served again when its runner closed without
   running it (failed vet or launch, drained, killed by the hook), at most
   three reservations per key; a key whose runner ran it is never re-served.
-- **Assignment** is read from the reserved job and the runner list only;
-  the controller never lists every run per poll.
+- **Assignment** is read from the hook rendezvous and the actual run/attempt
+  jobs, authenticated by runner id. Once recorded, reconciliation reads that
+  job and the runner list; it never lists every run per poll.
 - **Unassigned runner.** After 15 minutes without a job the controller runs
   `mac-quiesce` under the hook's flock. If no job started, further job starts
   are refused (and killed), the registration is removed, and `mac-run-once`
