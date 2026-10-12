@@ -264,6 +264,7 @@ pub fn run_prepared_kvm_pool(
         physical_crossing_families,
         host_forward_families: count_family(forward_families),
         guest_refusal_families: count_family(refusal_families),
+        fork_admission_refusal: physical.fork_admission_refusal()?,
         fork_stock_families: physical
             .fork_stock_counters()?
             .families()
