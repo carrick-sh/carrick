@@ -105,7 +105,7 @@ fn request_config(token: &Token, call: &PveCall) -> Result<String, ScalerError> 
     }
     Ok(config)
 }
-fn clone_config(public_key: &str, site: &Site) -> Value {
+fn clone_config(public_key: &str, site: &Site, vm: CloneId) -> Result<Value, ScalerError> {
     let mut encoded = String::new();
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for byte in public_key.bytes() {
@@ -117,11 +117,15 @@ fn clone_config(public_key: &str, site: &Site) -> Value {
             encoded.push(char::from(HEX[usize::from(byte & 15)]));
         }
     }
-    json!({
+    let mut config = json!({
         "ciuser":"runner", "sshkeys":encoded,
-        "ipconfig0":"ip=dhcp", "tags":"carrick-ci;willow-pilot",
+        "ipconfig0":site.ipconfig(vm.get())?, "tags":"carrick-ci;willow-pilot",
         "cores":site.cores,"memory":site.memory_mib,"balloon":0,"cpulimit":site.cores,"cpu":"host"
-    })
+    });
+    if let Some(nameserver) = site.nameserver() {
+        config["nameserver"] = json!(nameserver);
+    }
+    Ok(config)
 }
 fn pve_response(bytes: &[u8]) -> Result<Value, ScalerError> {
     let end = bytes
@@ -697,7 +701,8 @@ fn boot_and_register(
         PveCall::Put(clone_config(
             &std::fs::read_to_string(key.with_extension("key.pub"))?,
             &pve.site,
-        )),
+            row.vm,
+        )?),
         &format!("{}/config", pve.base(row.vm)),
     )?;
     if !resource_admission(pve)? {
@@ -1416,10 +1421,13 @@ mod tests {
                 .unwrap()
                 .contains("invalid urlencoded string")
         );
+        let vm = CloneId::try_from(308).unwrap();
         let config = clone_config(
             "ssh-ed25519 AAAA+/= validation-only\n",
             &super::site::WILLOW,
-        );
+            vm,
+        )
+        .unwrap();
         assert_eq!(
             config["sshkeys"],
             "ssh-ed25519%20AAAA%2B%2F%3D%20validation-only%0A"
@@ -1427,11 +1435,15 @@ mod tests {
         assert_eq!(config["cores"], 2);
         assert_eq!(config["cpulimit"], 2);
         assert_eq!(config["memory"], 4096);
-        let config = clone_config("ssh-ed25519 AAAA\n", &super::site::CONTABO);
+        // Willow's clone configuration is unchanged: DHCP, no nameserver key.
+        assert_eq!(config["ipconfig0"], "ip=dhcp");
+        assert!(config.get("nameserver").is_none());
+        let config = clone_config("ssh-ed25519 AAAA\n", &super::site::CONTABO, vm).unwrap();
         assert_eq!(config["cores"], 8);
         assert_eq!(config["cpulimit"], 8);
         assert_eq!(config["memory"], 16384);
-        assert_eq!(config["ipconfig0"], "ip=dhcp");
+        assert_eq!(config["ipconfig0"], "ip=10.77.0.108/24,gw=10.77.0.1");
+        assert_eq!(config["nameserver"], "1.1.1.1");
     }
     #[test]
     fn recovered_one_job_preserves_error_history_and_requires_actual_assignment() {
