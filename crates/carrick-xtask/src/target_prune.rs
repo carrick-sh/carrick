@@ -660,6 +660,9 @@ mod tests {
         let socket = std::env::var_os("PRUNE_FIXTURE_SOCKET");
         let mut hook = || {
             if let Some(socket) = &socket {
+                if let Ok(delay) = std::env::var("PRUNE_FIXTURE_CONNECT_DELAY_SECONDS") {
+                    std::thread::sleep(Duration::from_secs(delay.parse().unwrap()));
+                }
                 let mut peer = UnixStream::connect(socket).unwrap();
                 peer.set_read_timeout(Some(Duration::from_secs(10)))
                     .unwrap();
