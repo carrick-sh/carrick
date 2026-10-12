@@ -3736,6 +3736,7 @@ impl Default for InotifyNameCache {
 const _: () = {
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
+    #[cfg(target_arch = "aarch64")]
     assert!(EL1_ABI_LAYOUT_HASH == 0x1a753d6f24969197);
     assert!(
         EL1_APERTURE_CONTROL_OFFSET.is_multiple_of(core::mem::align_of::<ApertureControl>() as u64)
@@ -3745,6 +3746,8 @@ const _: () = {
             <= EL1_MM_PORTAL_OFFSET
     );
 };
+#[cfg(not(target_arch = "aarch64"))]
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0xd22014eee50dbddb);
 
 #[cfg(test)]
 mod tests {
