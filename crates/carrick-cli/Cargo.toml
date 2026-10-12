@@ -56,18 +56,17 @@ trace-syscalls = ["carrick-runtime/trace-syscalls"]
 debug-stats = ["carrick-runtime/debug-stats"]
 trace-elf = ["carrick-runtime/trace-elf"]
 trace-dtrace = []
-debug-all = [
+debug-portable = [
     "trace-tty",
     "trace-io",
     "trace-traps",
     "watchpoint",
     "event-ring-dump",
-    "trace-hvf",
     "trace-syscalls",
-    "debug-stats",
     "trace-elf",
     "trace-dtrace",
 ]
+debug-all = ["debug-portable", "trace-hvf", "debug-stats"]
 
 [dependencies]
 carrick-embed = { path = "../carrick-embed", default-features = false }
