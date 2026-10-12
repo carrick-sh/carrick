@@ -126,12 +126,74 @@ impl Site {
             }
         }
     }
-    /// A private bridge shared with other VMs: the template's `net0` must
-    /// carry the PVE VM firewall (inherited by every linked clone) that
-    /// admits only the gateway on that subnet. The in-guest firewall alone
-    /// is not enough, because a job could undo it.
+    /// A private bridge shared with other VMs: template 300 and every clone
+    /// must carry [`Site::vm_firewall`] on `net0`. The in-guest firewall
+    /// alone is not enough, because a job with root in the clone could undo it.
     pub(super) fn isolates_bridge(&self) -> bool {
         matches!(self.network, Network::Static { .. })
+    }
+    /// The PVE VM firewall for an isolating site, as an exact rule list that
+    /// the template builder writes and the controller verifies. Default
+    /// deny both ways; in: SSH from the host only; out: public IPv4 only
+    /// (every private and link-local range, the gateway and the agent
+    /// workers included, is dropped first; IPv6 falls to the DROP policy).
+    pub(super) fn vm_firewall(&self) -> Option<[FirewallRule; 3]> {
+        if !self.isolates_bridge() {
+            return None;
+        }
+        Some([
+            FirewallRule {
+                direction: "in",
+                action: "ACCEPT",
+                source: Some(GATEWAY_PLACEHOLDER),
+                dest: None,
+                proto: Some("tcp"),
+                dport: Some("22"),
+                comment: "controller SSH from the host",
+            },
+            FirewallRule {
+                direction: "out",
+                action: "DROP",
+                source: None,
+                dest: Some(PRIVATE_V4),
+                proto: None,
+                dport: None,
+                comment: "no private, link-local or host destination",
+            },
+            FirewallRule {
+                direction: "out",
+                action: "ACCEPT",
+                source: None,
+                dest: Some("0.0.0.0/0"),
+                proto: None,
+                dport: None,
+                comment: "public IPv4 through the NAT gateway",
+            },
+        ])
+    }
+    /// The gateway address of a static site, for [`FirewallRule::source`].
+    pub(super) fn gateway(&self) -> Option<String> {
+        match self.network {
+            Network::Dhcp => None,
+            Network::Static {
+                subnet: [a, b, c],
+                gateway,
+                ..
+            } => Some(format!("{a}.{b}.{c}.{gateway}")),
+        }
+    }
+    /// `/etc/pve/firewall/<vmid>.fw` for an isolating site.
+    pub(super) fn vm_firewall_file(&self) -> Option<String> {
+        let rules = self.vm_firewall()?;
+        let gateway = self.gateway()?;
+        let mut file = String::from(
+            "[OPTIONS]\nenable: 1\npolicy_in: DROP\npolicy_out: DROP\nipfilter: 1\nmacfilter: 1\n\n[RULES]\n",
+        );
+        for rule in rules {
+            file.push_str(&rule.render(&gateway));
+            file.push('\n');
+        }
+        Some(file)
     }
     /// Cloud-init `nameserver`, only where the bridge does not provide one.
     pub(super) fn nameserver(&self) -> Option<&'static str> {
@@ -160,6 +222,58 @@ impl Site {
             self.nameserver().unwrap_or("none"),
             u8::from(self.isolates_bridge()),
         ))
+    }
+}
+
+/// `source` value meaning "this site's gateway address".
+pub(super) const GATEWAY_PLACEHOLDER: &str = "gateway";
+/// Every RFC 1918 and IPv4 link-local range: covers the bridge subnet, the
+/// gateway and any host-side private address.
+pub(super) const PRIVATE_V4: &str = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16";
+
+/// One PVE firewall rule, in the fields the PVE rules API reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct FirewallRule {
+    pub direction: &'static str,
+    pub action: &'static str,
+    pub source: Option<&'static str>,
+    pub dest: Option<&'static str>,
+    pub proto: Option<&'static str>,
+    pub dport: Option<&'static str>,
+    pub comment: &'static str,
+}
+impl FirewallRule {
+    fn resolve(field: Option<&'static str>, gateway: &str) -> Option<String> {
+        field.map(|value| {
+            if value == GATEWAY_PLACEHOLDER {
+                gateway.to_owned()
+            } else {
+                value.to_owned()
+            }
+        })
+    }
+    pub(super) fn source(&self, gateway: &str) -> Option<String> {
+        Self::resolve(self.source, gateway)
+    }
+    pub(super) fn dest(&self, gateway: &str) -> Option<String> {
+        Self::resolve(self.dest, gateway)
+    }
+    fn render(&self, gateway: &str) -> String {
+        let mut line = format!("{} {}", self.direction.to_uppercase(), self.action);
+        if let Some(source) = self.source(gateway) {
+            line.push_str(&format!(" -source {source}"));
+        }
+        if let Some(dest) = self.dest(gateway) {
+            line.push_str(&format!(" -dest {dest}"));
+        }
+        if let Some(proto) = self.proto {
+            line.push_str(&format!(" -p {proto}"));
+        }
+        if let Some(dport) = self.dport {
+            line.push_str(&format!(" -dport {dport}"));
+        }
+        line.push_str(&format!(" -log nolog # {}", self.comment));
+        line
     }
 }
 
@@ -232,6 +346,14 @@ mod tests {
         assert!(CONTABO.ipconfig(299).is_err() && CONTABO.ipconfig(350).is_err());
         assert_eq!(CONTABO.nameserver(), Some("1.1.1.1"));
         assert!(CONTABO.isolates_bridge() && !WILLOW.isolates_bridge());
+        assert_eq!(WILLOW.vm_firewall_file(), None);
+        assert_eq!(
+            CONTABO.vm_firewall_file().unwrap(),
+            "[OPTIONS]\nenable: 1\npolicy_in: DROP\npolicy_out: DROP\nipfilter: 1\nmacfilter: 1\n\n[RULES]\n\
+IN ACCEPT -source 10.77.0.1 -p tcp -dport 22 -log nolog # controller SSH from the host\n\
+OUT DROP -dest 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16 -log nolog # no private, link-local or host destination\n\
+OUT ACCEPT -dest 0.0.0.0/0 -log nolog # public IPv4 through the NAT gateway\n"
+        );
         assert_eq!(CONTABO.qemu(308), "/nodes/m28112/qemu/308");
     }
     #[test]

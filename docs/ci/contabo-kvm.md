@@ -34,10 +34,16 @@ subnet:
 - The guest firewall from the template rejects private destinations. A job
   that gained root inside the clone could undo it.
 - The PVE VM firewall on the template's `net0` (`firewall=1`,
-  `/etc/pve/firewall/300.fw`) admits only the gateway 10.77.0.1, inbound
-  (controller SSH) and outbound, and drops the rest of 10.77.0.0/24. PVE
-  copies the VM firewall file to every clone, and the controller refuses a
-  template whose `net0` lacks it on this site.
+  `/etc/pve/firewall/300.fw`, written by `carrick-xtask ci-scaler vm-firewall`
+  from the site table) denies by default in both directions, with `ipfilter`
+  and `macfilter` on. Inbound, it admits only SSH from the gateway (the
+  controller). Outbound, it drops every RFC 1918 and link-local range (the
+  agent workers, other clones, the gateway itself) and then admits public
+  IPv4; IPv6 falls to the DROP policy. PVE copies the file to every linked
+  clone. The controller checks the exact options and ordered rules over the
+  API, on the template at startup and on each clone before it boots, and
+  requires the datacenter firewall to be enabled. Any difference refuses
+  service.
 
 DNS to the public resolver and NAT to the internet still work.
 
