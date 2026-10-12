@@ -229,8 +229,17 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
         #[cfg(target_arch = "aarch64")]
         let slot = SlotId::from_index(frame.slot as usize);
         #[cfg(target_arch = "aarch64")]
-        let process_call = matches!(frame.x[8], 260 | 94 | 95 | 58 | 435)
-            || (frame.x[8] == 220 && frame.x[0] & 0x0001_0000 == 0);
+        let process_call = arm_process_call_claimed(frame.x[8], frame.x[0], || {
+            slot.and_then(|slot| {
+                let lane = zone.slot(slot);
+                lane.current().or_else(|| lane.host_record())
+            })
+            .is_some_and(|record| {
+                super::aarch64_process::registry()
+                    .for_record(zone, zone.record_ref(record))
+                    .is_some()
+            })
+        });
         #[cfg(target_arch = "aarch64")]
         if process_call {
             if let (Some(slot), Some(task)) = (slot, current_tasks.get(frame.slot as usize)) {
@@ -372,9 +381,24 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
     }
 }
 
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn arm_process_call_claimed(nr: u64, flags: u64, registered: impl FnOnce() -> bool) -> bool {
+    nr == 435
+        || (nr == 220 && flags & 0x0001_0000 == 0)
+        || (matches!(nr, 260 | 94 | 95 | 58) && registered())
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn arm_process_refusal_must_abort(nr: u64) -> bool {
+    matches!(nr, 93 | 94)
+}
+
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 fn refuse_owner_process_call(frame: &mut TrapFrame, counters: &Counters) -> Action {
     let nr = frame.x[8] as usize;
+    if arm_process_refusal_must_abort(nr as u64) {
+        invalid_completion(NativeInvariant::EntryBinding);
+    }
     frame.x[0] = (-38_i64) as u64;
     if nr < 512 {
         counters.served[nr].fetch_add(1, Ordering::Relaxed);
@@ -1856,6 +1880,30 @@ pub unsafe fn serve_locked_file_op(
 mod tests {
     use super::*;
     use core::sync::atomic::Ordering;
+
+    #[test]
+    fn host_loaded_arm_task_keeps_terminal_calls_on_legacy_route() {
+        assert!(!arm_process_call_claimed(94, 0, || false), "exit_group");
+        assert!(!arm_process_call_claimed(95, 0, || false), "waitid");
+        assert!(arm_process_call_claimed(220, 0, || false), "first fork");
+        assert!(
+            arm_process_call_claimed(94, 0, || true),
+            "native child exit"
+        );
+        assert!(!arm_process_call_claimed(62, 0, || panic!(
+            "ordinary lseek queried registry"
+        )));
+    }
+
+    #[test]
+    fn refused_native_termination_never_returns_to_el0() {
+        assert!(arm_process_refusal_must_abort(94), "exit_group");
+        assert!(arm_process_refusal_must_abort(93), "exit");
+        assert!(
+            !arm_process_refusal_must_abort(260),
+            "waitid may report errno"
+        );
+    }
 
     #[test]
     fn absent_file_venue_forwards_without_answering_from_empty_tables() {
