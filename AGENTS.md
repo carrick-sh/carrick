@@ -49,6 +49,8 @@ with **`HV_DENIED` (`0xfae94007`)**.
   (`EmbedError::Entitlement`), never a skip. Any test that boots a VM is
   `#[ignore]`d and run only by a signed recipe (e.g. `just test-hvf-trap-engine`);
   never skip on a failed `hv_vm_create`.
+- **Never strip or trim debuginfo** — release keeps `debug = true`; fix
+  RAM-tight links with memory or lower link concurrency.
 - **Never use `lld`** — strips `__DATA,__dof_carrick` → USDT empty →
   `carrick trace` fires zero events. Keep Apple `ld64`; verify
   `otool -l target/release/carrick | grep dof`.
@@ -151,6 +153,12 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
   lease and never downgrade or reacquire it. Supervisor custody, cleanup
   deadlines and known escape limits:
   [`docs/host-lease-containment-follow-up.md`](docs/host-lease-containment-follow-up.md).
+- **Never pipe a gate through `tail`/`grep`/`head`** — the pipeline's status
+  is the last stage's. Redirect or `tee` to a durable file with absolute
+  paths and check the gate's own exit status.
+- **Deliberate load and tracing clean up after themselves:** load runs inside
+  the script that kills it (trap EXIT; receipts show `pgrep -x yes` empty);
+  every `dtrace -Z` session is bounded and ends with `pgrep dtrace` empty.
 - **Stamp `CARRICK_RUN_ID`; reap with [`scripts/sudo/kill.sh`](scripts/sudo/kill.sh) `<run-id>`**,
   never `pkill -f carrick` (kills other lanes/worktrees). `timeout` wrappers can't be lldb-attached and a
   wedged CLI ignores SIGTERM.
@@ -236,6 +244,8 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
   ENXIO where EINVAL was assumed; ESPIPE for `pwrite` on either pipe end, not
   EBADF.
 - **Bound every wait** (`poll`, 5 s) — a lost signal = false line, not a hang.
+  Native oracle fixtures too: run under `timeout 10`, bound every blocking
+  call, and `IPC_RMID`/`io_destroy` on every exit path.
 - Libc-only probes cross-compile locally
   (`cargo build --target aarch64-unknown-linux-{musl,gnu}` in
   `conformance-probes`, copy to `conformance-probes/target/<triple>/release/`); Docker is then only
@@ -290,6 +300,9 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
   (`nanosleep`/`exit_group` always look parked; 45 s bound). Wedged carrier:
   `sudo lldb -p <carrier> --batch -o "thread backtrace all"` on the CLI's
   CHILD (no password needed) — all executors in a condvar = lost wake.
+- **Never lldb-attach to a process descended from the agent session's own
+  terminal** (it crashed Terminal.app); attach from a separate shell or use
+  `carrick debug lldb-run`.
 - **Heisenbug → event ring via `carrick-lldb`** (live or core). Attach the
   **carrier**, not the parent (empty ring); a run may also have an NsSupervisor
   and FileAuthority helper, and plain `lldb run` follows only the outer
@@ -331,6 +344,10 @@ In Carrick, guest-visible correctness includes Linux semantics and non-pathologi
   cold go-build **10.18x** ([`docs/perf-results/2026-08-07-post-move3-default-refresh.md`](docs/perf-results/2026-08-07-post-move3-default-refresh.md)).
 - **Perf claims need a controlled single-variable run on a quiet host**
   (heterogeneous cores; sweeps move work) — else "suggests", never "confirmed".
+- **Perf A/B is paired and interleaved** (base/candidate on one host, same
+  session); never diff against a stored baseline column. Complexity tests
+  need adversarial rows (huge rows, mixed widths); run the affected ecosystem
+  row standalone before landing a perf refactor.
 - Go's `mem_linux.go` vs `mem_darwin.go` (BSD) is a dual-port oracle: translate
   INTENT, not mechanism. Never trade an ABI guarantee for speed — find the lever that removes the work.
 
@@ -360,6 +377,12 @@ In Carrick, guest-visible correctness includes Linux semantics and non-pathologi
 - Delegating in-zone returns the HOST's answer (`SCM_CREDENTIALS` leaked the
   Mac uid; a host-pty-backed guest pty had no line discipline, `^C` went
   nowhere). Audit: [`docs/host-facility-boundary.md`](docs/host-facility-boundary.md).
+- **No host readiness pipe for an in-zone object.** Carrick-owned waiters
+  park on the object's wait queue and probe readiness once after enrolling
+  (closes the lost-wakeup gap).
+- **On a contained fast path only ENOENT is authoritative**; an errno a
+  carrick-added flag could cause (e.g. `O_NOFOLLOW` → `ELOOP`) falls back to
+  the resolving path.
 - Host-owned → native mechanism (`sendfile`, `kqueue`, `__ulock`) via `libc`,
   not ad-hoc `extern "C"` (exception: `applevisor-sys`).
 
@@ -446,6 +469,11 @@ verification, acceptance.
 - **Workers base on GitHub main only** (`fetch https://github.com/carrick-sh/carrick`),
   never a host mirror (which lags). Rebase onto GitHub main at dispatch and
   before reporting review-ready.
+- **After rebasing a fix stack across a code move**, list each fix as kept,
+  ported or dropped and re-prove its red witness before any signed gate.
+- **PRs that add or move files under `crates/`** must pass
+  `just check-contract-change <main-sha> HEAD`. Never `git add -A` in a
+  worktree (it commits the `conformance-probes/target` symlink).
 - **Never `git merge --ff-only` inside a worktree** (merges its own branch).
   Rebase there, fast-forward from main, then run `just lint-domains` on
   the merged tree.
@@ -510,10 +538,18 @@ Chat, worker mailboxes, scratch notes and agent memory are not.
   build only on `carrick-personality-api`. Nothing in carrick names NT or any
   other out-of-tree personality. Personalities do not Forward: serve in ring
   or refuse.
+- **Ring-first:** every routed call is served exactly in ring or left
+  unrouted (counted ENOSYS); a Forward-only arm is a second path. Changes to
+  the crossing allowlist (`crates/carrick-personality-linux/src/crossing.rs`,
+  `docs/design/arm-ring-first-flip.tsv`) need owner sign-off.
+- **Fix in the shared layers** (shared kernel, `carrick-abi`, `carrick-hal`,
+  neutral cores) so every backend benefits; no per-backend one-offs. Move
+  code, never copy it.
 - **Seams:** a seam is a carrick issue labelled `seam`, in neutral
   vocabulary. Additive personality-API seams (new types and traits, no
-  guest-visible behaviour change) take the lighter gate: `just ci` plus the
-  personality boundary check, no signed run.
+  guest-visible behaviour change, Linux dispatch/mm/fork/signal untouched)
+  take the lighter gate: kernel-semantics, KVM/CPL0 builds and a signed
+  smoke. Anything touching Linux paths keeps the full signed gate.
 - **No fake backends.** No in-memory or stub implementation of a service
   ships beside the real one; test doubles stay behind `cfg(test)` or a
   test-support crate.
@@ -540,8 +576,15 @@ Chat, worker mailboxes, scratch notes and agent memory are not.
   - **Verified** — probe/test/LTP case/oracle diff; name red-first probes;
   - `-` bullets for distinct parts; backtick symbols/paths.
 - **Trailer:** `Co-Authored-By:` for the agent, after a blank line, e.g.
-  `Co-Authored-By: Codex <codex@openai.com>`. Rewording another agent's
+  `Co-Authored-By: Codex <codex@openai.com>`; agy/Gemini commits use
+  `Co-Authored-By: Antigravity <noreply@google.com>`. Rewording another agent's
   commits: PRESERVE the author.
+- **Fix forward:** repair a bad landing with a follow-up commit; never
+  `git revert` or reset main. Delete measured-worse code in a
+  commit that cites the measurement.
+- **No new line-pinned inventories or SHA-pinned receipts.** Retire existing
+  ones into types, monotone counts or delete-at-zero, in the PR that zeroes
+  them.
 - **Authority debt:** `AuthorityDebtCeilings` counters may only decrease;
   `just lint-domains` checks them live. Local range checks must pass the PR
   base (`xtask authority-debt --base <merge-base>`); HEAD can't be compared to
