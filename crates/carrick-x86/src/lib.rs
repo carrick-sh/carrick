@@ -47,3 +47,9 @@ pub use vmm::{
 };
 
 pub mod cpl0_lifecycle;
+
+pub mod segments;
+pub use segments::{
+    GuestSegment, LongModeSegments, VmxGuestStateRule, VmxGuestStateViolation,
+    check_vmx_guest_segments,
+};
