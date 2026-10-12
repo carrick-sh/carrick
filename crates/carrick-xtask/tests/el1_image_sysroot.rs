@@ -18,24 +18,27 @@ fn executable(path: &Path, script: &str) {
 }
 
 fn fixture() -> (tempfile::TempDir, Command) {
-    // Spaces in executable paths must remain one argument, including wrappers.
+    // Spaces in the Cargo/compiler directory must remain one argument.
     let root = tempfile::Builder::new()
         .prefix("image compiler ")
         .tempdir()
         .unwrap();
+    let toolchain_bin = root.path().join("toolchain bin");
+    std::fs::create_dir(&toolchain_bin).unwrap();
     executable(
         &root.path().join("rustc"),
         "#!/bin/sh\nprintf '/wrong/PATH/sysroot\\n'\n",
     );
     executable(
-        &root.path().join("selected rustc"),
+        &toolchain_bin.join("rustc"),
         "#!/bin/sh\n[ \"$#\" = 2 ] && [ \"$1\" = --print ] && [ \"$2\" = sysroot ] || exit 42\nprintf '/selected/sysroot\\n'\n",
     );
     let mut child = Command::new(std::env::current_exe().unwrap());
     child
         .args(["--exact", "sysroot_fixture", "--ignored", "--nocapture"])
         .env("PATH", root.path())
-        .env("RUSTC", root.path().join("selected rustc"))
+        .env("TEST_CARGO", toolchain_bin.join("cargo"))
+        .env("RUSTC", root.path().join("rustc"))
         .env_remove("RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env("EXPECTED_SYSROOT", "/selected/sysroot");
@@ -53,47 +56,27 @@ fn passes(child: &mut Command) {
 }
 
 #[test]
-fn cargo_rustc_beats_path() {
+fn cargo_sibling_rustc_beats_path() {
     let (_root, mut child) = fixture();
     passes(&mut child);
 }
 
 #[test]
-fn empty_wrappers_are_disabled() {
-    let (_root, mut child) = fixture();
-    child
-        .env("RUSTC_WRAPPER", "")
-        .env("RUSTC_WORKSPACE_WRAPPER", "");
-    passes(&mut child);
-}
-
-#[test]
-fn wrappers_nest_in_cargo_order() {
+fn compiler_wrapper_environment_does_not_select_sysroot() {
     let (root, mut child) = fixture();
-    let outer = root.path().join("outer wrapper");
-    let workspace = root.path().join("workspace wrapper");
-    executable(
-        &outer,
-        "#!/bin/sh\n[ \"$1\" = \"$EXPECTED_WORKSPACE_WRAPPER\" ] || exit 43\nexec \"$@\"\n",
-    );
-    // Like clippy-driver, this wrapper is the compiler: it accepts the
-    // nominal rustc argument but supplies its own sysroot instead of execing it.
-    executable(
-        &workspace,
-        "#!/bin/sh\n[ \"$1\" = \"$RUSTC\" ] && [ \"$2\" = --print ] && [ \"$3\" = sysroot ] && [ \"$#\" = 3 ] || exit 44\nprintf '/wrapper/sysroot\\n'\n",
-    );
+    let wrapper = root.path().join("compiler wrapper");
+    executable(&wrapper, "#!/bin/sh\nprintf '/wrong/wrapper/sysroot\\n'\n");
     child
-        .env("RUSTC_WRAPPER", &outer)
-        .env("RUSTC_WORKSPACE_WRAPPER", &workspace)
-        .env("EXPECTED_WORKSPACE_WRAPPER", &workspace)
-        .env("EXPECTED_SYSROOT", "/wrapper/sysroot");
+        .env("RUSTC_WRAPPER", &wrapper)
+        .env("RUSTC_WORKSPACE_WRAPPER", &wrapper);
     passes(&mut child);
-    // Each wrapper also works on its own.
-    child.env_remove("RUSTC_WRAPPER");
-    passes(&mut child);
-    child
-        .env("RUSTC_WRAPPER", &workspace)
-        .env_remove("RUSTC_WORKSPACE_WRAPPER");
+}
+
+#[test]
+fn missing_sibling_is_not_replaced_by_path_rustc() {
+    let (root, mut child) = fixture();
+    std::fs::remove_file(root.path().join("toolchain bin/rustc")).unwrap();
+    child.env("EXPECTED_SYSROOT", "MISSING");
     passes(&mut child);
 }
 
@@ -101,7 +84,7 @@ fn wrappers_nest_in_cargo_order() {
 fn failed_query_reports_status_and_stderr() {
     let (root, mut child) = fixture();
     executable(
-        &root.path().join("selected rustc"),
+        &root.path().join("toolchain bin/rustc"),
         "#!/bin/sh\nprintf '/misleading/stdout\\n'\nprintf 'compiler rejected query\\n' >&2\nexit 45\n",
     );
     child.env("EXPECTED_SYSROOT", "ERROR");
@@ -112,7 +95,7 @@ fn failed_query_reports_status_and_stderr() {
 fn empty_sysroot_is_rejected() {
     let (root, mut child) = fixture();
     executable(
-        &root.path().join("selected rustc"),
+        &root.path().join("toolchain bin/rustc"),
         "#!/bin/sh\nprintf '  \\n'\n",
     );
     child.env("EXPECTED_SYSROOT", "EMPTY");
@@ -123,13 +106,24 @@ fn empty_sysroot_is_rejected() {
 #[ignore = "subprocess fixture with compiler environment supplied by the parent"]
 fn sysroot_fixture() {
     let expected = std::env::var("EXPECTED_SYSROOT").unwrap();
+    let cargo = std::env::var_os("TEST_CARGO").unwrap();
+    let cargo = Path::new(&cargo);
     match expected.as_str() {
         "ERROR" => {
-            let error = image_build::get_sysroot().unwrap_err();
+            let error = image_build::get_sysroot(cargo).unwrap_err();
             assert!(error.contains("45"), "{error}");
             assert!(error.contains("compiler rejected query"), "{error}");
         }
-        "EMPTY" => assert!(image_build::get_sysroot().unwrap_err().contains("empty")),
-        _ => assert_eq!(image_build::get_sysroot().unwrap(), expected),
+        "MISSING" => assert!(
+            image_build::get_sysroot(cargo)
+                .unwrap_err()
+                .contains("failed to query")
+        ),
+        "EMPTY" => assert!(
+            image_build::get_sysroot(cargo)
+                .unwrap_err()
+                .contains("empty")
+        ),
+        _ => assert_eq!(image_build::get_sysroot(cargo).unwrap(), expected),
     }
 }
