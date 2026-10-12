@@ -7530,15 +7530,19 @@ mod real {
         carrick_usdt::hvpatch__frame__pool__miss!(|| (site, ipa));
     }
 
-    /// One refusal followed by every quarantined child at this boundary.
-    /// No encoding or allocation is performed by the probes.
-    pub fn fork_admission_refusal(event: &crate::compat::ForkAdmissionRefusal) {
+    /// Join identity for the refusal and quarantine records. Every probe
+    /// stays within five arguments on the macOS provider ABI.
+    pub fn fork_admission_identity(event: &crate::compat::ForkAdmissionRefusal) {
         carrick_usdt::fork__admission__identity!(|| (
             event.carrier,
             event.mm,
             event.cpu,
             event.available_lifecycles as u64
         ));
+    }
+
+    /// Exact refused resource and requested/available table capacity.
+    pub fn fork_admission_refusal(event: &crate::compat::ForkAdmissionRefusal) {
         carrick_usdt::fork__admission__refusal!(|| (
             event.carrier,
             event.resource as u32,
@@ -7546,14 +7550,20 @@ mod real {
             event.parent_pages,
             event.available_pages as u64
         ));
-        for child in &event.quarantine {
-            carrick_usdt::fork__quarantine__state!(|| (
-                event.carrier,
-                child.mm,
-                u8::from(child.absent),
-                u8::from(child.carrier_released)
-            ));
-        }
+    }
+
+    /// One quarantined child at the same admission boundary. No probe
+    /// encoding or allocation is performed by these wrappers.
+    pub fn fork_quarantine_state(
+        event: &crate::compat::ForkAdmissionRefusal,
+        child: &crate::compat::ForkQuarantineState,
+    ) {
+        carrick_usdt::fork__quarantine__state!(|| (
+            event.carrier,
+            child.mm,
+            u8::from(child.absent),
+            u8::from(child.carrier_released)
+        ));
     }
 
     #[inline(never)]
@@ -9758,7 +9768,9 @@ mod stub {
     stub!(hvpatch_mapping_index_fault(event: super::HvpatchMappingIndexCensus));
     stub!(hvpatch_frame_pool_hit(site: u32, ipa: u64));
     stub!(hvpatch_frame_pool_miss(site: u32, ipa: u64));
+    stub!(fork_admission_identity(event: &crate::compat::ForkAdmissionRefusal));
     stub!(fork_admission_refusal(event: &crate::compat::ForkAdmissionRefusal));
+    stub!(fork_quarantine_state(event: &crate::compat::ForkAdmissionRefusal, child: &crate::compat::ForkQuarantineState));
     stub!(hvpatch_fork_frame_share(event: super::HvpatchForkFrameShare));
     stub!(hvpatch_global_frame_stage2(event: super::HvpatchGlobalFrameStage2));
     stub!(hvpatch_global_frame_owner_miss(ipa: u64, length: u64, host_addr: u64, owner_host_addr: u64));
