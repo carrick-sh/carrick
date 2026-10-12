@@ -236,10 +236,16 @@ rustc --version
 cargo --version
 just --version"
 
+if [ "$CARRICK_ACCEPT_PROFILE" = linux-portable ]; then
+    # lint-domains-source needs semgrep; keep it in a venv (PEP 668).
+    say "installing semgrep for the portable lint steps"
+    runuser -l "$USER_NAME" -c 'python3 -m venv "$HOME/.local/semgrep" && "$HOME/.local/semgrep/bin/pip" install -q semgrep && mkdir -p "$HOME/.local/bin" && ln -sf "$HOME/.local/semgrep/bin/semgrep" "$HOME/.local/bin/semgrep"'
+fi
 say "running: just accept --profile $CARRICK_ACCEPT_PROFILE"
 set +e
 runuser -l "$USER_NAME" -c "set -euo pipefail
 . \"\$HOME/.cargo/env\"
+export PATH=\"\$HOME/.local/bin:\$PATH\"
 cd '$REPO'
 rm -rf target/ci-receipts
 mkdir -p target/ci-receipts
