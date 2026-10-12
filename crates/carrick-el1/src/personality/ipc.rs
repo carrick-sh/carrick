@@ -52,7 +52,7 @@ use carrick_el1_abi::ipc::{
 use carrick_el1_abi::ipc_tables::IpcTableMap;
 use carrick_el1_abi::{CurrentTask, EL1_GUEST_LOCK_SPINS, IpcLeave, TrapFrame};
 use carrick_sched_core::object_wait::{ObjectWaitError, ObjectWaitSnapshot};
-use carrick_sched_core::{BoundedSpin, LockWait, WakeEffects};
+use carrick_sched_core::{LockWait, ShortLockSpin, WakeEffects};
 use core::sync::atomic::Ordering;
 
 /// Linux AArch64 values this adapter decodes and returns.
@@ -139,7 +139,7 @@ impl IpcTables for GuestTables {
     }
 }
 
-const EL1_WAIT: BoundedSpin = BoundedSpin(EL1_GUEST_LOCK_SPINS);
+const EL1_WAIT: ShortLockSpin = ShortLockSpin;
 
 /// An object lock's wait, by holder: unbounded while EL1 on another vCPU
 /// holds it, bounded ([`EL1_GUEST_LOCK_SPINS`]) while a host thread does.

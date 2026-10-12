@@ -701,7 +701,6 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
                 slot: self.lane.slot,
             },
             record.id,
-            1024,
         );
         if self.handoff.is_some() {
             self.lane.retirements += 1;

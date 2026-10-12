@@ -69,16 +69,15 @@ fn suspended_turn_completes_only_through_exact_wait_owner() {
             let operation = OperationToken::new(17, generation).unwrap();
             let request = ObjectParkRequest::new(key, snapshot, operation, None);
             let mut parked =
-                park_object_record(&zone, slot, request, 1024, &|_| {}, || Ok((record, false)))
-                    .unwrap();
+                park_object_record(&zone, slot, request, &|_| {}, || Ok((record, false))).unwrap();
             assert!(parked.matches(&zone, slot));
             // The entry turn ends here. Its token cannot later take the
             // ordinary path; the record owns the sole remaining operation.
             handoff(entry, parked.take_receipt().unwrap()).unwrap();
             assert!(zone.slot(slot).current().is_none());
-            let (wake, _) = notify_object(&zone, slot, key, 1024).unwrap();
+            let (wake, _) = notify_object(&zone, slot, key).unwrap();
             assert_eq!(wake.queued, 1);
-            assert_eq!(notify_object(&zone, slot, key, 1024).unwrap().0.queued, 0);
+            assert_eq!(notify_object(&zone, slot, key).unwrap().0.queued, 0);
             assert_eq!(zone.switch_in_full(slot).unwrap().record, record);
             for _ in 0..2 {
                 if let Some(taken) = take_object_operation(&zone, slot, identity).unwrap() {
@@ -220,13 +219,12 @@ fn record_owned_entry_does_not_require_host_adoption_generation() {
         &zone,
         slot,
         ObjectParkRequest::new(key, snapshot, OperationToken::new(17, 13).unwrap(), None),
-        1024,
         &|_| {},
         || Ok((record, false)),
     )
     .unwrap();
     assert!(parked.matches(&zone, slot));
-    assert_eq!(notify_object(&zone, slot, key, 1024).unwrap().0.queued, 1);
+    assert_eq!(notify_object(&zone, slot, key).unwrap().0.queued, 1);
     assert_eq!(zone.switch_in(slot), Some(record));
     assert_eq!(
         complete_born_in_zone(stale, binding, source),
@@ -445,10 +443,10 @@ fn compact_ordinary_entry_retires_with_actual_handoff_receipt() {
         )
         .is_none()
     );
-    let receipt = retire_current(binding, source, record, 1024).unwrap();
+    let receipt = retire_current(binding, source, record).unwrap();
     assert!(zone.slot(slot).current().is_none());
     handoff(token, receipt).unwrap();
-    assert!(retire_current(binding, source, record, 1024).is_none());
+    assert!(retire_current(binding, source, record).is_none());
 }
 
 #[test]
@@ -460,7 +458,7 @@ fn compact_handoff_rejects_stale_record_incarnation_receipt() {
     let source = BornInZoneSource { zone: &zone, slot };
     let first = admit_born_in_zone(binding, source).unwrap();
     let captured_record = first.record();
-    let receipt = retire_current(binding, source, record, 1024).unwrap();
+    let receipt = retire_current(binding, source, record).unwrap();
     handoff_born_in_zone(first, receipt).unwrap();
     let identity = ThreadIdentity {
         tid: binding.task.raw(),
