@@ -270,7 +270,7 @@ impl TransferCustody for UserTransferCustody {
     fn publish_executable(
         &self,
         target: carrick_aarch64::user_transfer::TransferTarget,
-        request: carrick_el1_abi::PortalExecutablePublication,
+        request: carrick_core_abi::PortalExecutablePublication,
     ) -> bool {
         let Some(pool) = carrick_el1_abi::cow_grant_pool_host() else {
             return false;
@@ -358,7 +358,7 @@ impl UserTransferCustody {
         carrier: NonZeroU64,
         mm: u64,
         pool: &carrick_el1_abi::CowGrantPool,
-        request: carrick_el1_abi::PortalExecutablePublication,
+        request: carrick_core_abi::PortalExecutablePublication,
     ) -> bool {
         if carrier != self.carrier()
             || mm != request.grant.mm_key
@@ -1352,10 +1352,10 @@ pub(super) mod tests {
                 let residency = unsafe {
                     Box::from_raw(raw.cast::<carrick_el1_abi::FrameGrantResidencyTable>())
                 };
-                let publication_slot = carrick_el1_abi::PortalExecutableSlot::new();
+                let publication_slot = carrick_core_abi::PortalExecutableSlot::new();
                 let publish = |grant, ipa, len| {
                     publication_slot.publish_with(
-                        carrick_el1_abi::PortalExecutablePublication { grant, ipa, len },
+                        carrick_core_abi::PortalExecutablePublication { grant, ipa, len },
                         || {
                             crossings.set(crossings.get() + 1);
                             assert!(publication_slot.handle(|request| {

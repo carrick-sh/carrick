@@ -31,7 +31,6 @@ pub use fork_stock::*;
 mod delegated_notification;
 pub use delegated_notification::*;
 mod mm_portal;
-mod mm_portal_executable;
 mod mm_portal_fork;
 mod mm_portal_grant;
 pub use carrick_core_abi::{
@@ -43,7 +42,6 @@ pub use carrick_personality_linux::abi::entry::{
     LinuxTaskMetadata, LinuxTaskState, SERVED_COMMIT_OWED, SERVED_WAKES_OWED, ServedBoundary,
 };
 pub use mm_portal::*;
-pub use mm_portal_executable::*;
 pub use mm_portal_fork::*;
 pub use mm_portal_grant::*;
 
@@ -630,8 +628,8 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         MM_PORTAL_GRANT_ESR,
         MM_PORTAL_MAINTENANCE_ESR,
         core::mem::size_of::<PortalGrantSlot>() as u64,
-        core::mem::size_of::<PortalExecutableSlot>() as u64,
-        core::mem::size_of::<PortalExecutablePublication>() as u64,
+        core::mem::size_of::<carrick_core_abi::PortalExecutableSlot>() as u64,
+        core::mem::size_of::<carrick_core_abi::PortalExecutablePublication>() as u64,
         MM_PORTAL_MAX_BYTES,
         EL1_MM_PORTAL_OFFSET,
         core::mem::size_of::<PortalTransferSlot>() as u64,
