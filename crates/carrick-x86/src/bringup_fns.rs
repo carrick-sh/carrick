@@ -1111,6 +1111,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingVcpu {
         gprs: Vec<(X86Reg, u64)>,
+        segments: Vec<(X86Seg, crate::GuestSegment)>,
     }
     impl RecordingVcpu {
         fn last(&self, r: X86Reg) -> Option<u64> {
@@ -1121,6 +1122,39 @@ mod tests {
                 .map(|(_, v)| *v)
         }
     }
+    #[test]
+    fn vmx_programmed_entry_segments_are_valid() {
+        let mut cpu = RecordingVcpu::default();
+        let layout = BringupLayout {
+            trampoline_base: 0x1000,
+            gdt_base: 0x2000,
+            pml4_base: 0x3000,
+        };
+        program_longmode_entry(&mut cpu, layout, 0x400000, 0x500000).expect("entry");
+        let segment = |name| {
+            cpu.segments
+                .iter()
+                .rev()
+                .find(|(n, _)| *n == name)
+                .expect("programmed descriptor")
+                .1
+        };
+        let state = crate::LongModeSegments {
+            cs: segment(X86Seg::Cs),
+            ss: segment(X86Seg::Ss),
+            ds: segment(X86Seg::Ds),
+            es: segment(X86Seg::Es),
+            fs: segment(X86Seg::Fs),
+            gs: segment(X86Seg::Gs),
+            tr: segment(X86Seg::Tr),
+            ldtr: segment(X86Seg::Ldtr),
+            cr0: cpu.last(X86Reg::Cr0).unwrap(),
+            cr4: cpu.last(X86Reg::Cr4).unwrap(),
+            efer: cpu.last(X86Reg::Efer).unwrap(),
+            rflags: cpu.last(X86Reg::Rflags).unwrap(),
+        };
+        assert_eq!(crate::check_vmx_guest_segments(&state, false), Ok(()));
+    }
     impl X86Vcpu for RecordingVcpu {
         fn get_gpr(&self, _r: X86Reg) -> Result<u64, TrapError> {
             Ok(0)
@@ -1129,7 +1163,27 @@ mod tests {
             self.gprs.push((r, v));
             Ok(())
         }
-        fn set_segment(&mut self, _s: X86Seg, _b: u64, _l: u32, _a: u32) -> Result<(), TrapError> {
+        fn set_segment(
+            &mut self,
+            seg: X86Seg,
+            base: u64,
+            limit: u32,
+            ar: u32,
+        ) -> Result<(), TrapError> {
+            let selector = match seg {
+                X86Seg::Cs => 0x23,
+                X86Seg::Ss | X86Seg::Ds | X86Seg::Es => 0x1b,
+                _ => 0,
+            };
+            self.segments.push((
+                seg,
+                crate::GuestSegment {
+                    base,
+                    limit,
+                    ar,
+                    selector,
+                },
+            ));
             Ok(())
         }
         fn get_fs_base(&self) -> Result<u64, TrapError> {

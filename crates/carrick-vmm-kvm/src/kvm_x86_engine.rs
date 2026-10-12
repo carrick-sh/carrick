@@ -668,14 +668,11 @@ fn ar_to_kvm_segment(base: u64, limit: u32, ar: u32, selector: u16) -> kvm_segme
     }
 }
 
-pub(crate) fn restore_kvm_vcpu(
-    vcpu: &mut KvmVcpu,
+fn restore_segment_state(
+    sregs: &mut kvm_bindings::kvm_sregs,
     layout: BringupLayout,
     s: &X86VcpuSnapshot,
-    rcx_walk: [u64; 4],
-    rdx_walk: [u64; 4],
-    rsp_walk: [u64; 4],
-    fs_walk: [u64; 4],
+    fault_slot: u64,
 ) -> Result<(), TrapError> {
     use carrick_hal::guest_arch::GuestArch as _;
     use carrick_hal::x8664_arch::X8664GuestArch;
@@ -700,10 +697,6 @@ pub(crate) fn restore_kvm_vcpu(
     } else {
         (segs.cs_ar, user_cs, segs.data_ar, user_ss)
     };
-    let mut sregs = vcpu
-        .fd()
-        .get_sregs()
-        .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_SREGS(restore): {e}")))?;
     sregs.cr0 = s.cr0;
     sregs.cr2 = 0;
     sregs.cr3 = s.cr3;
@@ -716,7 +709,6 @@ pub(crate) fn restore_kvm_vcpu(
     sregs.es = ar_to_kvm_segment(0, 0xFFFF_FFFF, segs.data_ar, user_ss);
     sregs.fs = data(s.fs_base);
     sregs.gs = data(s.gs_base);
-    let fault_slot = vcpu.x86_fault_slot();
     sregs.tr = ar_to_kvm_segment(
         carrick_x86::fault_slot_gpa(carrick_x86::fault_tss_base(layout), fault_slot)?,
         carrick_x86::fault::X86_TSS64_LIMIT,
@@ -734,6 +726,23 @@ pub(crate) fn restore_kvm_vcpu(
         limit: (carrick_x86::fault::X86_IDT_BYTES - 1) as u16,
         ..Default::default()
     };
+    Ok(())
+}
+
+pub(crate) fn restore_kvm_vcpu(
+    vcpu: &mut KvmVcpu,
+    layout: BringupLayout,
+    s: &X86VcpuSnapshot,
+    rcx_walk: [u64; 4],
+    rdx_walk: [u64; 4],
+    rsp_walk: [u64; 4],
+    fs_walk: [u64; 4],
+) -> Result<(), TrapError> {
+    let mut sregs = vcpu
+        .fd()
+        .get_sregs()
+        .map_err(|e| TrapError::Hypervisor(format!("KVM_GET_SREGS(restore): {e}")))?;
+    restore_segment_state(&mut sregs, layout, s, vcpu.x86_fault_slot())?;
     vcpu.fd()
         .set_sregs(&sregs)
         .map_err(|e| TrapError::Hypervisor(format!("KVM_SET_SREGS(restore): {e}")))?;
@@ -767,6 +776,8 @@ pub(crate) fn restore_kvm_vcpu(
     if let Some(xs) = &s.xsave {
         let _ = vcpu.set_xsave(xs)?;
     }
+    use carrick_hal::guest_arch::GuestArch as _;
+    let boot = carrick_hal::x8664_arch::X8664GuestArch::bootstrap_sysregs();
     vcpu.set_syscall_msrs(layout.trampoline_base, boot.star, boot.sfmask)?;
     vcpu.record_x86_restore_state(crate::kvm::KvmX86RestoreState {
         rip: s.rip,
@@ -1484,4 +1495,72 @@ fn write_bringup_images_via_ram(ram: &mut GuestRam, pml4_bytes: &[u8]) -> Result
             .map_err(|e| TrapError::Hypervisor(e.to_string()))
     })?;
     Ok(())
+}
+
+/// Adapt the actual hidden KVM descriptors, without repairing diagnostic inputs.
+#[cfg(test)]
+fn vmx_segments(s: &kvm_bindings::kvm_sregs, rflags: u64) -> carrick_x86::LongModeSegments {
+    let segment = |v: kvm_segment| carrick_x86::GuestSegment {
+        base: v.base,
+        limit: v.limit,
+        selector: v.selector,
+        ar: u32::from(v.type_)
+            | (u32::from(v.s) << 4)
+            | (u32::from(v.dpl) << 5)
+            | (u32::from(v.present) << 7)
+            | (u32::from(v.avl) << 12)
+            | (u32::from(v.l) << 13)
+            | (u32::from(v.db) << 14)
+            | (u32::from(v.g) << 15)
+            | (u32::from(v.unusable) << 16),
+    };
+    carrick_x86::LongModeSegments {
+        cs: segment(s.cs),
+        ss: segment(s.ss),
+        ds: segment(s.ds),
+        es: segment(s.es),
+        fs: segment(s.fs),
+        gs: segment(s.gs),
+        tr: segment(s.tr),
+        ldtr: segment(s.ldt),
+        cr0: s.cr0,
+        cr4: s.cr4,
+        efer: s.efer,
+        rflags,
+    }
+}
+
+#[cfg(test)]
+mod vmx_segment_tests {
+    use super::*;
+    #[test]
+    fn vmx_restore_user_and_cpl0_segments_are_valid() {
+        let layout = BringupLayout {
+            trampoline_base: 0x1000,
+            gdt_base: 0x2000,
+            pml4_base: 0x3000,
+        };
+        for rip in [0x400000, layout.trampoline_base + 2, 0xffff_ffff_8000_0000] {
+            let snapshot = X86VcpuSnapshot {
+                gprs: [0; 16],
+                rip,
+                rsp: 0x400000,
+                rflags: 2,
+                cr0: 0x80010033,
+                cr3: layout.pml4_base,
+                cr4: 0x340620,
+                efer: 0xd01,
+                fs_base: 0,
+                gs_base: 0,
+                xsave: None,
+            };
+            let mut s = kvm_bindings::kvm_sregs::default();
+            restore_segment_state(&mut s, layout, &snapshot, 0).expect("restore builder");
+            assert_eq!(
+                carrick_x86::check_vmx_guest_segments(&vmx_segments(&s, 2), false),
+                Ok(()),
+                "rip={rip:#x}"
+            );
+        }
+    }
 }
