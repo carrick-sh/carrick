@@ -5489,6 +5489,8 @@ mod real {
     #[::usdt::provider(provider = "carrick")]
     mod carrick_usdt {
         /// Process incarnation from Darwin `PROC_PIDTBSDINFO`.
+        fn fork__admission__refusal(_: u32, _: u64, _: u64, _: u64, _: u64) {}
+        fn fork__quarantine__state(_: u64, _: u8, _: u8) {}
         fn host__process__birth(_: u32, _: i64, _: i32) {}
         // arg2 is the ADDRESS of a `SyscallArgs` ([u64; 6], contiguous); DTrace
         // does `copyin(arg2, 48)` and reads the six args by offset. This probe
@@ -7525,6 +7527,25 @@ mod real {
     #[inline(never)]
     pub fn hvpatch_frame_pool_miss(site: u32, ipa: u64) {
         carrick_usdt::hvpatch__frame__pool__miss!(|| (site, ipa));
+    }
+
+    /// One refusal followed by every quarantined child at this boundary.
+    /// No encoding or allocation is performed by the probes.
+    pub fn fork_admission_refusal(event: &crate::compat::ForkAdmissionRefusal) {
+        carrick_usdt::fork__admission__refusal!(|| (
+            event.resource as u32,
+            event.child_pages,
+            event.parent_pages,
+            event.available_pages as u64,
+            event.available_lifecycles as u64
+        ));
+        for child in &event.quarantine {
+            carrick_usdt::fork__quarantine__state!(|| (
+                child.mm,
+                u8::from(child.absent),
+                u8::from(child.carrier_released)
+            ));
+        }
     }
 
     #[inline(never)]
@@ -9729,6 +9750,7 @@ mod stub {
     stub!(hvpatch_mapping_index_fault(event: super::HvpatchMappingIndexCensus));
     stub!(hvpatch_frame_pool_hit(site: u32, ipa: u64));
     stub!(hvpatch_frame_pool_miss(site: u32, ipa: u64));
+    stub!(fork_admission_refusal(event: &crate::compat::ForkAdmissionRefusal));
     stub!(hvpatch_fork_frame_share(event: super::HvpatchForkFrameShare));
     stub!(hvpatch_global_frame_stage2(event: super::HvpatchGlobalFrameStage2));
     stub!(hvpatch_global_frame_owner_miss(ipa: u64, length: u64, host_addr: u64, owner_host_addr: u64));

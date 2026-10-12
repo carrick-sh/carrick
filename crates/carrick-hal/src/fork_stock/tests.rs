@@ -1054,3 +1054,30 @@ fn every_refusal_reason_is_counted_and_named() {
     }
     assert!(families.iter().all(|(_, count)| *count != 0));
 }
+
+#[test]
+fn refusal_reports_installed_quarantine_and_exact_lifecycle_resource() {
+    let mut stock = stock(UntaggedRoots, 4, 1);
+    let granted = loan(&mut stock, parent(), 302, 1, 1).unwrap();
+    commit(&mut stock, parent(), granted, 1, 0).unwrap();
+    retire(&mut stock, child_of(granted, 900)).unwrap();
+    let cleared = RefCell::new(Vec::new());
+    assert_eq!(reclaim(&mut stock, |_| false, &cleared), 0);
+    assert_eq!(
+        loan(&mut stock, parent(), 303, 1, 1),
+        Err(ForkStockRefusal::Capacity)
+    );
+    let refusal = stock.admission_refusal().unwrap();
+    assert_eq!(refusal.resource, ForkCapacityResource::Lifecycle);
+    assert_eq!(refusal.available_lifecycles, 0);
+    assert_eq!(
+        refusal.quarantine,
+        vec![ForkQuarantineState {
+            mm: 302,
+            absent: false,
+            carrier_released: false,
+        }]
+    );
+    assert!(cleared.borrow().is_empty());
+    assert_eq!(stock.counters().capacity_refusals, 1);
+}

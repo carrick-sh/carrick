@@ -1875,6 +1875,16 @@ impl ProductionCpuFactory {
         ])
     }
 
+    pub fn fork_admission_refusal(
+        &self,
+    ) -> Result<Option<carrick_hal::fork_stock::ForkAdmissionRefusal>, TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        Ok(custody.fork_stock.admission_refusal())
+    }
+
     pub fn fork_stock_counters(
         &self,
     ) -> Result<carrick_hal::fork_stock::ForkStockCounters, TrapError> {
