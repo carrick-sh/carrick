@@ -32,3 +32,6 @@ pub use carrick_sched_core::process::{
 pub use carrick_core_abi::{
     EntryRef, EntryState, GateState, NativeRunFailureReason, Served, ThreadLedgerActivity,
 };
+
+// 6. Capability-based neutral file service
+pub use carrick_core::file;
