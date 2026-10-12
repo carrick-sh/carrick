@@ -70,6 +70,8 @@ const KERNEL_REGION_GPA: u64 = 0x1_0000_0000;
 const INITIAL_MM_KEY: u64 = 301;
 const INITIAL_STACK_TOP: u64 = 0x7fff_0000;
 const INITIAL_STACK_SIZE: u64 = 0x1_0000;
+// Place mmap at the next boundary after the image, preserving low-image space.
+const INITIAL_ARENA_ALIGNMENT: u64 = 1024 * 1024 * 1024;
 const COUNTERS_OFFSET: u64 = 0x1_0000;
 const BINDING_OFFSET: u64 = 0x8000;
 const TASK_OFFSET: u64 = 0x9000;
@@ -78,6 +80,8 @@ const ROUTES_OFFSET: u64 = 0xd000;
 const SHOOTDOWN_OFFSET: u64 = 0xe000;
 const STRIDE: u64 = 0x100;
 const _: () = {
+    assert!(INITIAL_ARENA_ALIGNMENT.is_power_of_two());
+    assert!(INITIAL_ARENA_ALIGNMENT.is_multiple_of(4096));
     assert!(size_of::<CpuBinding>() <= STRIDE as usize);
     assert!(ROUTES_OFFSET >= 0xc000 + 9 * size_of::<ThreadControlSlot>() as u64);
     assert!(ROUTES_OFFSET + size_of::<PublishedApicIds>() as u64 <= SHOOTDOWN_OFFSET);
@@ -331,6 +335,58 @@ impl InitialReservationLimits {
         address: carrick_abi::LinuxRlimit::new(u64::MAX, u64::MAX),
         data: carrick_abi::LinuxRlimit::new(u64::MAX, u64::MAX),
     };
+}
+
+fn initial_reservation_layout(
+    initial_break: UserVa,
+    stack_top: UserVa,
+    limits: InitialReservationLimits,
+) -> Result<LinuxReservationLayout, TrapError> {
+    let stack_base = stack_top
+        .raw()
+        .checked_sub(INITIAL_STACK_SIZE)
+        .filter(|_| stack_top.raw() <= carrick_guest_arch::USER_CEILING)
+        .ok_or_else(|| fail("initial stack layout"))?;
+    let stack = ReservationRange::new(stack_base, stack_top.raw())
+        .ok_or_else(|| fail("initial stack layout"))?;
+    // The authenticated break is the highest page-rounded PT_LOAD end. A
+    // static PIE can sit above the low initial stack, so neither reservation
+    // may depend on a fixed split address or assume the stack is above it.
+    let ceiling = if initial_break.raw() <= stack.start() {
+        stack.start()
+    } else if initial_break.raw() >= stack.end() {
+        carrick_guest_arch::USER_CEILING
+    } else {
+        return Err(fail("initial heap overlaps stack"));
+    };
+    // Keep at least one page for mmap when the stack/user boundary clips the
+    // heap capacity. Neither hidden reservation allocates physical backing.
+    let heap_ceiling = ceiling
+        .checked_sub(4096)
+        .ok_or_else(|| fail("initial heap layout"))?;
+    let arena_start = initial_break
+        .raw()
+        .checked_add(INITIAL_ARENA_ALIGNMENT)
+        .map(|end| end & !(INITIAL_ARENA_ALIGNMENT - 1))
+        .map(|end| end.min(heap_ceiling))
+        .ok_or_else(|| fail("initial heap layout"))?;
+    let heap = ReservationRange::new(initial_break.raw(), arena_start)
+        .ok_or_else(|| fail("initial heap layout"))?;
+    let arena_end = arena_start
+        .checked_add(carrick_mem::memory::LINUX_MMAP_SIZE)
+        .ok_or_else(|| fail("initial mmap arena overflow"))?
+        .min(ceiling);
+    let arena = ReservationRange::new(arena_start, arena_end)
+        .ok_or_else(|| fail("initial mmap arena layout"))?;
+    Ok(LinuxReservationLayout {
+        heap,
+        arena,
+        brk: initial_break.raw(),
+        address_limit: limits.address.rlim_cur,
+        data_limit: limits.data.rlim_cur,
+        external_address_bytes: 0,
+        external_data_bytes: 0,
+    })
 }
 
 #[derive(
@@ -3082,11 +3138,8 @@ impl Cpl0Carrier {
         image: &carrick_mem::x86_initial_image::X86InitialImage<'_>,
         limits: InitialReservationLimits,
     ) -> Result<(), TrapError> {
-        const ARENA_START: u64 = 0x4000_0000;
-        let heap = ReservationRange::new(initial_break, ARENA_START)
-            .ok_or_else(|| fail("initial heap layout"))?;
-        let arena = ReservationRange::new(ARENA_START, stack_top - INITIAL_STACK_SIZE)
-            .ok_or_else(|| fail("initial mmap arena layout"))?;
+        let layout =
+            initial_reservation_layout(UserVa::new(initial_break), UserVa::new(stack_top), limits)?;
         let table = self
             .custody
             .ram
@@ -3114,19 +3167,7 @@ impl Cpl0Carrier {
             .publish_closed(mm.raw(), root.address().raw(), 0)
             .ok_or_else(|| fail("production space publication"))?;
         table
-            .publish(
-                index.index(),
-                mm,
-                LinuxReservationLayout {
-                    heap,
-                    arena,
-                    brk: initial_break,
-                    address_limit: limits.address.rlim_cur,
-                    data_limit: limits.data.rlim_cur,
-                    external_address_bytes: 0,
-                    external_data_bytes: 0,
-                },
-            )
+            .publish(index.index(), mm, layout)
             .map_err(|error| fail(format!("production reservation publication: {error:?}")))?;
         let wake_error = std::cell::RefCell::new(None);
         let deliver = |zone: &X86Cpl0Zone,
@@ -6239,6 +6280,174 @@ pub enum InitialProcessExit {
 #[cfg(test)]
 mod cpl0_layout_tests {
     use super::*;
+
+    // x86.mm.initial-image: the static PIE load shape observed in busybox:musl.
+    // Only ELF headers are needed to prove reservation placement; no VM or
+    // backing proportional to the virtual heap/mmap capacity is allocated.
+    fn static_pie_elf() -> Vec<u8> {
+        let mut bytes = vec![0; 0x200];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        bytes[4..7].copy_from_slice(&[2, 1, 1]);
+        bytes[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN, no PT_INTERP
+        bytes[18..20].copy_from_slice(&62u16.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        bytes[24..32].copy_from_slice(&0x203e5u64.to_le_bytes());
+        bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+        bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&4u16.to_le_bytes());
+        for (index, (address, memory_size, flags)) in [
+            (0u64, 0x80f0u64, 4u32),
+            (0x9000, 0xee36e, 5),
+            (0xf8000, 0x328bc, 4),
+            (0x12ba70, 0x50c0, 6),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let header = &mut bytes[64 + index * 56..64 + (index + 1) * 56];
+            header[..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+            header[4..8].copy_from_slice(&flags.to_le_bytes());
+            header[16..24].copy_from_slice(&address.to_le_bytes());
+            if index == 0 {
+                header[32..40].copy_from_slice(&0x200u64.to_le_bytes());
+            }
+            header[40..48].copy_from_slice(&memory_size.to_le_bytes());
+            header[48..56].copy_from_slice(&0x1000u64.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn static_pie_reservations_follow_image_break_above_old_arena_and_stack() {
+        let elf = static_pie_elf();
+        let image = carrick_mem::x86_initial_image::prepare_static_x86_elf(&elf).unwrap();
+        let initial_break = image.regions.iter().map(|region| region.end).max().unwrap();
+        assert_eq!(initial_break, 0x88_0013_1000);
+        assert!(initial_break > 0x4000_0000 && initial_break > INITIAL_STACK_TOP);
+        let layout = initial_reservation_layout(
+            UserVa::new(initial_break),
+            UserVa::new(INITIAL_STACK_TOP),
+            InitialReservationLimits::UNLIMITED,
+        )
+        .expect("static PIE heap and mmap reservations must follow its loaded image");
+        assert_eq!(layout.brk, initial_break);
+        assert_eq!(layout.heap.start(), initial_break);
+        assert_eq!(layout.heap.end(), layout.arena.start());
+        assert_eq!(layout.heap.end(), 0x88_4000_0000);
+        assert_eq!(layout.arena.len(), carrick_mem::memory::LINUX_MMAP_SIZE);
+        assert!(layout.arena.end() <= carrick_guest_arch::USER_CEILING);
+        assert!(
+            image
+                .regions
+                .iter()
+                .all(|region| region.end <= layout.heap.start())
+        );
+        assert!(INITIAL_STACK_TOP <= layout.heap.start());
+    }
+
+    #[test]
+    fn low_image_reservations_stop_before_stack_and_retain_launch_limits() {
+        let limits = InitialReservationLimits {
+            address: carrick_abi::LinuxRlimit::new(0x2000_0000, 0x3000_0000),
+            data: carrick_abi::LinuxRlimit::new(0x1000_0000, 0x2000_0000),
+        };
+        let address_limit = limits.address.rlim_cur;
+        let data_limit = limits.data.rlim_cur;
+        for initial_break in [
+            0x40_1000,
+            0x2000_0000,
+            0x4000_0000,
+            0x4000_1000,
+            INITIAL_STACK_TOP - INITIAL_STACK_SIZE - 8192,
+        ] {
+            let layout = initial_reservation_layout(
+                UserVa::new(initial_break),
+                UserVa::new(INITIAL_STACK_TOP),
+                limits,
+            )
+            .unwrap();
+            assert_eq!(layout.brk, initial_break);
+            assert_eq!(layout.heap.start(), initial_break);
+            assert!(layout.heap.len() <= INITIAL_ARENA_ALIGNMENT);
+            // Preserve both capacities for every formerly admitted low image.
+            if initial_break < 0x4000_0000 {
+                assert_eq!(layout.heap.len(), 0x4000_0000 - initial_break);
+                assert_eq!(
+                    layout.arena.len(),
+                    INITIAL_STACK_TOP - INITIAL_STACK_SIZE - 0x4000_0000
+                );
+            }
+            assert_eq!(layout.heap.end(), layout.arena.start());
+            assert_eq!(layout.arena.end(), INITIAL_STACK_TOP - INITIAL_STACK_SIZE);
+            assert_eq!(layout.address_limit, address_limit);
+            assert_eq!(layout.data_limit, data_limit);
+            assert_eq!(layout.external_address_bytes, 0);
+            assert_eq!(layout.external_data_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn initial_reservations_refuse_stack_collision_unaligned_and_exhausted_ranges() {
+        let stack_base = INITIAL_STACK_TOP - INITIAL_STACK_SIZE;
+        for initial_break in [
+            0x40_1001,
+            stack_base - 4096,
+            stack_base,
+            stack_base + 4096,
+            carrick_guest_arch::USER_CEILING - 4096,
+            carrick_guest_arch::USER_CEILING,
+            u64::MAX - 4095,
+        ] {
+            assert!(
+                initial_reservation_layout(
+                    UserVa::new(initial_break),
+                    UserVa::new(INITIAL_STACK_TOP),
+                    InitialReservationLimits::UNLIMITED,
+                )
+                .is_err(),
+                "invalid break {initial_break:#x} must not publish reservations"
+            );
+        }
+        for stack_top in [
+            0,
+            INITIAL_STACK_SIZE - 4096,
+            INITIAL_STACK_TOP + 1,
+            u64::MAX,
+        ] {
+            assert!(
+                initial_reservation_layout(
+                    UserVa::new(0x40_1000),
+                    UserVa::new(stack_top),
+                    InitialReservationLimits::UNLIMITED,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn high_image_arena_is_bounded_by_canonical_user_end() {
+        for (initial_break, arena_len) in [
+            (
+                carrick_guest_arch::USER_CEILING - INITIAL_ARENA_ALIGNMENT - 4096,
+                INITIAL_ARENA_ALIGNMENT,
+            ),
+            (carrick_guest_arch::USER_CEILING - 8192, 4096),
+        ] {
+            let layout = initial_reservation_layout(
+                UserVa::new(initial_break),
+                UserVa::new(INITIAL_STACK_TOP),
+                InitialReservationLimits::UNLIMITED,
+            )
+            .unwrap();
+            assert_eq!(layout.heap.start(), initial_break);
+            assert_eq!(layout.heap.end(), layout.arena.start());
+            assert_eq!(layout.heap.len(), 4096);
+            assert_eq!(layout.arena.len(), arena_len);
+            assert_eq!(layout.arena.end(), carrick_guest_arch::USER_CEILING);
+        }
+    }
 
     #[test]
     fn cpl0_supervisor_image_extent_ordering_alignment_and_nonoverlap() {
