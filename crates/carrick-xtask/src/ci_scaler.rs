@@ -788,7 +788,7 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
         }
         ScalerAction::VmFirewall => {
             let file = site::Site::local()?
-                .vm_firewall_file()
+                .vm_firewall_file(300)?
                 .ok_or(ScalerError::Guard("this site uses no VM firewall"))?;
             print!("{file}");
             Ok(())
