@@ -1,0 +1,37 @@
+schema_version = 1
+id = "process.native.arm-admission"
+title = "ARM root setup and process calls share one authenticated native owner"
+guest_surfaces = ["syscall:set_tid_address", "syscall:wait4", "kernel:thread-lifecycle", "kernel:process-admission"]
+semantic_authority = [
+  "man 2 set_tid_address: return the calling thread ID and retain its clear-child-tid address",
+  "man 2 wait4: a caller with no children receives ECHILD (10)",
+  "man 2 clone: CLONE_THREAD members belong to the same process and retain their individual thread identities",
+]
+fixture = "An ARM host root enters the production admission boundary before set_tid_address, then wait4; two already-live records import into that same owner; host lease renewal preserves its Arc and census; stale imported fields refuse before registry publication"
+scale_points = [1, 2]
+rationale = "Admission creates one native process owner for the retained root and imports authenticated lifecycle members without creating host tasks or changing live membership. Re-entry retains that owner. The setup and no-child wait each dispatch once and request no fork stock. The fixed lifecycle pool bounds the initial import scan; ordinary re-entry resolves the exact registry member. Signal resources are reachable from the native entry; ARM signal routing belongs to #285."
+
+[bindings]
+vm_free = "carrick-el1::personality::aarch64_process_tests::arm_root_setup_enters_production_process_venue"
+# Supplemental VM-free witnesses in the same lib target:
+# arm_root_admission_imports_live_thread_membership_without_changing_census
+# arm_root_host_lease_renewal_retains_the_admitted_process_owner
+# arm_root_admission_refuses_stale_imported_custody_without_publication
+
+[bindings.unresolved]
+embed_structural = "Scoped signed el1_transparent_smoke validates ARM startup on the exact fixture bundle; it does not export this admission observation. The director owns full signed failure-set comparison."
+docker = "Linux semantics are specified by the cited man pages; native arm64 differential and runtime ratio remain director-owned."
+
+[[structural_budgets]]
+kind = "exact"
+metric = "kernel_dispatches"
+value = 2
+layers = ["vm-free"]
+rationale = "One set_tid_address and one wait4 invocation, each with one served completion and zero forwarded dispatches."
+
+[[structural_budgets]]
+kind = "exact"
+metric = "host_backend_calls"
+value = 0
+layers = ["vm-free"]
+rationale = "Root admission, set_tid_address and the no-child wait request no stock or root-exit crossing."

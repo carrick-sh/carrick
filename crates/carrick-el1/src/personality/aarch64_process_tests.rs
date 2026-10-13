@@ -1396,3 +1396,479 @@ pub fn with_native_file_fork(
     );
     assert_eq!(crossing.stock.retirements.load(Ordering::Acquire), 1);
 }
+
+impl super::thread_setup::LifecycleVenue for Fixture {
+    fn thread<'a>(
+        &'a self,
+        task: &'a CurrentTask,
+    ) -> Option<carrick_personality_linux::thread::LifecycleThread<'a>> {
+        (task.metadata.control_slot.load(Ordering::Acquire) == self.control as *const _ as u64
+            && task.metadata.lifecycle_page.load(Ordering::Acquire) == self.page as *const _ as u64)
+            .then_some(carrick_personality_linux::thread::LifecycleThread {
+                page: self.page,
+                slot: self.control,
+            })
+    }
+    fn born_slot(
+        &self,
+        _: &ThreadLifecyclePage,
+        _: carrick_el1_abi::EntryRef,
+    ) -> Option<&ThreadControlSlot> {
+        None
+    }
+}
+
+#[test]
+fn arm_root_setup_enters_production_process_venue() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&[]),
+    );
+    let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
+    let counters = Box::new(carrick_el1_abi::Counters::new());
+    let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
+    let mut frame = carrick_el1_abi::TrapFrame {
+        x: [0; 31],
+        elr: 0,
+        spsr: 0,
+        esr: 0,
+        slot: 0,
+        far: 0,
+    };
+    for (nr, args, expected) in [
+        (96, [0, 0, 0, 0, 0, 0], 41),
+        (260, [u64::MAX, 0, 1, 0, 0, 0], -10),
+    ] {
+        frame.x[..6].copy_from_slice(&args);
+        frame.x[8] = nr;
+        let route = super::dispatch::dispatch_arm_syscall_with_native_process(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            None::<crate::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
+            None,
+            Some(&*fixture),
+            fixture.page,
+            fixture.control,
+            ThreadCtx::ZERO,
+            ttbr0,
+            &mut service,
+            |_| core::ptr::null_mut(),
+        )
+        .unwrap();
+        assert_eq!(frame.x[0] as i64, expected, "production ARM syscall {nr}");
+        assert_eq!(
+            route,
+            carrick_personality_linux::dispatch::CompletionRoute::WithWork
+        );
+        assert_eq!(counters.served[nr as usize].load(Ordering::Acquire), 1);
+        assert_eq!(counters.forwarded[nr as usize].load(Ordering::Acquire), 0);
+    }
+    assert_eq!(service.crossing.loans_requested.load(Ordering::Acquire), 0);
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
+    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 1);
+}
+
+fn imported_thread(
+    fixture: &Fixture,
+) -> (&'static ThreadControlSlot, carrick_sched_core::RecordRef) {
+    imported_thread_with_identity(fixture, |_| {})
+}
+
+fn imported_thread_with_identity(
+    fixture: &Fixture,
+    edit: impl FnOnce(&mut carrick_sched_core::ThreadIdentity),
+) -> (&'static ThreadControlSlot, carrick_sched_core::RecordRef) {
+    use carrick_el1_abi::Lifecycle;
+    let control = Box::leak(Box::new(ThreadControlSlot::new()));
+    let entry = fixture
+        .page
+        .stock(
+            0,
+            carrick_el1_abi::EntryIdentity {
+                tid: 42,
+                visible_tid: 42,
+                thread_serial: 102,
+                uid_credit: 0,
+            },
+        )
+        .unwrap();
+    fixture
+        .page
+        .bind_control_address(entry, control as *const _ as u64)
+        .unwrap();
+    let mut identity = carrick_sched_core::ThreadIdentity {
+        tid: 42,
+        serial: 102,
+        mm: 1,
+        file_table: 5,
+        generation: 12,
+        affinity: 1,
+        lifecycle_page: fixture.page as *const _ as u64,
+        control_slot: control as *const _ as u64,
+    };
+    edit(&mut identity);
+    let record = fixture.zone.alloc_record(identity).unwrap();
+    let reference = fixture.zone.record_ref(record);
+    unsafe {
+        *fixture.zone.record(record).ctx_mut() =
+            Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    }
+    control.reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry);
+    assert!(control.publish_visible_tid(42));
+    control.bind_zone_record(reference);
+    let claim = fixture.page.claim_any().unwrap();
+    fixture.page.thread_born().unwrap();
+    fixture
+        .page
+        .record_born(
+            claim,
+            carrick_el1_abi::BornRecord {
+                caller_task: 41,
+                caller_serial: 101,
+                clone_flags: 0x0001_0000,
+                clear_child_tid: 0,
+                blocked: carrick_el1_abi::BlockedMask(0),
+            },
+        )
+        .unwrap();
+    fixture.zone.requeue_preempted(fixture.slot, record);
+    (control, reference)
+}
+
+#[test]
+fn arm_root_admission_imports_live_thread_membership_without_changing_census() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let (_, record) = imported_thread(fixture);
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&[]),
+    );
+    let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
+    let signal = carrick_signal_core::policy::Signal::from_number(10).unwrap();
+    let action = carrick_signal_core::policy::Action {
+        disposition: carrick_signal_core::policy::Disposition::Ignore,
+        ..Default::default()
+    };
+    let route = with_process_entry(
+        source,
+        &fixture.task,
+        ThreadCtx::ZERO,
+        ttbr0,
+        fixture.page,
+        fixture.control,
+        &mut service,
+        |process| {
+            process
+                .signal_venue()
+                .unwrap()
+                .rt_sigaction(signal, Some(action))
+                .unwrap();
+            assert!(process.has_thread(41));
+            assert!(
+                process.has_thread(42),
+                "already-live member belongs to this process owner"
+            );
+        },
+    );
+    assert!(
+        route.is_ok(),
+        "authenticated imported membership must admit: {route:?}"
+    );
+    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
+    assert!(fixture.zone.live(record).is_some());
+    let owner = registry()
+        .for_entry(source, &fixture.task, fixture.address)
+        .unwrap();
+    fixture.task.set(El1TaskId::from_linux_tid(42), 12, 5);
+    fixture
+        .task
+        .mm
+        .thread_generation
+        .store(102, Ordering::Release);
+    let control = fixture.zone.record(record.id).identity().control_slot;
+    fixture
+        .task
+        .publish_lifecycle(fixture.page as *const _ as u64, control);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        record.id
+    );
+    let control = unsafe { &*(control as *const ThreadControlSlot) };
+    let stale_address = AddressContext {
+        generation: ContextGeneration::new(NonZeroU64::new(102).unwrap()),
+        ..fixture.address
+    };
+    unsafe {
+        *fixture.zone.record(record.id).ctx_mut() =
+            Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, stale_address);
+    }
+    assert!(
+        with_process_entry(
+            source,
+            &fixture.task,
+            ThreadCtx::ZERO,
+            ttbr0,
+            fixture.page,
+            control,
+            &mut service,
+            |_| panic!("thread must not substitute the group generation for a stale parked root")
+        )
+        .is_err()
+    );
+    unsafe {
+        *fixture.zone.record(record.id).ctx_mut() =
+            Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    }
+    with_process_entry(
+        source,
+        &fixture.task,
+        ThreadCtx::ZERO,
+        ttbr0,
+        fixture.page,
+        control,
+        &mut service,
+        |process| {
+            assert_eq!(
+                process.binding(),
+                super::common_entry::execution_binding(&fixture.task)
+            );
+            assert!(process.has_thread(41) && process.has_thread(42));
+            assert_eq!(
+                process
+                    .signal_venue()
+                    .unwrap()
+                    .rt_sigaction(signal, None)
+                    .unwrap(),
+                action,
+                "imported thread shares the retained sighand"
+            );
+        },
+    )
+    .unwrap();
+    assert!(std::sync::Arc::ptr_eq(
+        &owner,
+        &registry()
+            .for_entry(source, &fixture.task, fixture.address)
+            .unwrap()
+    ));
+    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
+}
+
+#[test]
+fn arm_root_host_lease_renewal_retains_the_admitted_process_owner() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    imported_thread(fixture);
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&[]),
+    );
+    let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
+    with_process_entry(
+        source,
+        &fixture.task,
+        ThreadCtx::ZERO,
+        ttbr0,
+        fixture.page,
+        fixture.control,
+        &mut service,
+        |process| assert!(process.has_thread(42)),
+    )
+    .unwrap();
+    let before = registry()
+        .for_entry(source, &fixture.task, fixture.address)
+        .unwrap();
+    let old = fixture.zone.slot(fixture.slot).host_record().unwrap();
+    assert!(fixture.zone.release_host_home(fixture.slot, old));
+    fixture
+        .task
+        .execution
+        .generation
+        .store(22, Ordering::Release);
+    let outcome = with_process_entry(
+        source,
+        &fixture.task,
+        ThreadCtx::ZERO,
+        ttbr0,
+        fixture.page,
+        fixture.control,
+        &mut service,
+        |process| assert!(process.has_thread(42)),
+    );
+    assert!(outcome.is_ok(), "lease renewal retains owner: {outcome:?}");
+    let after = registry()
+        .for_entry(source, &fixture.task, fixture.address)
+        .unwrap();
+    assert!(std::sync::Arc::ptr_eq(&before, &after));
+    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
+}
+
+#[test]
+fn arm_root_admission_refuses_stale_imported_custody_without_publication() {
+    for field in 0..6 {
+        let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+        imported_thread_with_identity(fixture, |identity| match field {
+            0 => identity.tid += 1,
+            1 => identity.serial += 1,
+            2 => identity.mm += 1,
+            3 => identity.lifecycle_page = fixture.control as *const _ as u64,
+            4 => identity.control_slot = fixture.control as *const _ as u64,
+            _ => identity.file_table += 1,
+        });
+        let source = BornInZoneSource {
+            zone: fixture.zone,
+            slot: fixture.slot,
+        };
+        let mut service = Aarch64NativeProcessService::with_crossing(
+            &fixture.task,
+            fixture.slot,
+            fixture.zone,
+            fixture.region.table(),
+            NonZeroU64::MIN,
+            TestStockCrossing::new(&[]),
+        );
+        let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
+        let outcome = with_process_entry(
+            source,
+            &fixture.task,
+            ThreadCtx::ZERO,
+            ttbr0,
+            fixture.page,
+            fixture.control,
+            &mut service,
+            |_| panic!("stale member must not enter production dispatch"),
+        );
+        assert!(outcome.is_err(), "stale field {field}");
+        assert!(
+            registry()
+                .for_entry(source, &fixture.task, fixture.address)
+                .is_err()
+        );
+        assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
+    }
+}
+
+#[test]
+fn arm_root_entry_refuses_wrong_binding_and_root_incarnation() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&[]),
+    );
+    let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
+    with_process_entry(
+        source,
+        &fixture.task,
+        ThreadCtx::ZERO,
+        ttbr0,
+        fixture.page,
+        fixture.control,
+        &mut service,
+        |_| (),
+    )
+    .unwrap();
+    let before = registry()
+        .for_entry(source, &fixture.task, fixture.address)
+        .unwrap();
+    for atomic in [
+        &fixture.task.execution.generation,
+        &fixture.task.mm.thread_generation,
+        &fixture.task.mm.key,
+        &fixture.task.metadata.lifecycle_page,
+        &fixture.task.metadata.control_slot,
+    ] {
+        let original = atomic.load(Ordering::Acquire);
+        atomic.store(original + 1, Ordering::Release);
+        assert!(
+            with_process_entry(
+                source,
+                &fixture.task,
+                ThreadCtx::ZERO,
+                ttbr0,
+                fixture.page,
+                fixture.control,
+                &mut service,
+                |_| panic!("wrong binding must not enter dispatch")
+            )
+            .is_err()
+        );
+        atomic.store(original, Ordering::Release);
+    }
+    let record = fixture.zone.slot(fixture.slot).host_record().unwrap();
+    let stale_address = AddressContext {
+        generation: ContextGeneration::new(NonZeroU64::new(102).unwrap()),
+        ..fixture.address
+    };
+    unsafe {
+        *fixture.zone.record(record).ctx_mut() =
+            Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, stale_address);
+    }
+    assert!(
+        with_process_entry(
+            source,
+            &fixture.task,
+            ThreadCtx::ZERO,
+            ttbr0,
+            fixture.page,
+            fixture.control,
+            &mut service,
+            |_| panic!("recycled root must not enter dispatch")
+        )
+        .is_err()
+    );
+    unsafe {
+        *fixture.zone.record(record).ctx_mut() =
+            Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    }
+    with_process_entry(
+        source,
+        &fixture.task,
+        ThreadCtx::ZERO,
+        ttbr0,
+        fixture.page,
+        fixture.control,
+        &mut service,
+        |_| (),
+    )
+    .unwrap();
+    assert!(std::sync::Arc::ptr_eq(
+        &before,
+        &registry()
+            .for_entry(source, &fixture.task, fixture.address)
+            .unwrap()
+    ));
+}

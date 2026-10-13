@@ -663,6 +663,108 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         Ok(())
     }
 
+    /// Renew the leader's host lane under exact retained group custody. The
+    /// process key and address incarnation stay owned by the same graph.
+    pub fn rehome_root(
+        &self,
+        source: BornInZoneSource<'a, C>,
+        current: &CurrentTask,
+        address: AddressContext<RootGpa>,
+        page: &ThreadLifecyclePage,
+        control: &ThreadControlSlot,
+    ) -> Result<Arc<NativeProcessRuntime<'a, M, C>>, NativeProcessError> {
+        let binding = super::common_entry::execution_binding(current);
+        let key = NativeExecutionKey::new(source.zone, binding, address)?;
+        let pid = current.visible_pid().ok_or(NativeProcessError::Stale)?;
+        let record = source
+            .zone
+            .slot(source.slot)
+            .current()
+            .or_else(|| source.zone.slot(source.slot).host_record())
+            .ok_or(NativeProcessError::Stale)?;
+        carrick_core::entry::prepare_handoff(binding, source, record)
+            .ok_or(NativeProcessError::Stale)?;
+        let reference = source.zone.record_ref(record);
+        let mut state = self.state.lock();
+        let (runtime, process) = state
+            .groups
+            .get(&Self::group_key(source.zone, address, page, pid))
+            .cloned()
+            .ok_or(NativeProcessError::Stale)?;
+        let mut graph = runtime.graph.lock();
+        let resources = graph
+            .owner
+            .task_mut(process)
+            .map_err(|_| NativeProcessError::Stale)?
+            .native_mut()
+            .resources_mut();
+        if !core::ptr::eq(resources.page, page)
+            || !core::ptr::eq(resources.control, control)
+            || resources.address != address
+            || control.entry().is_some()
+            || process.id.raw() as u64 != binding.task.raw()
+            || current.metadata.lifecycle_page.load(Ordering::Acquire) != page as *const _ as u64
+            || current.metadata.control_slot.load(Ordering::Acquire) != control as *const _ as u64
+        {
+            return Err(NativeProcessError::Stale);
+        }
+        let member_index = resources
+            .members
+            .iter()
+            .position(|member| core::ptr::eq(member.control, control))
+            .ok_or(NativeProcessError::Stale)?;
+        let old_record = resources.record;
+        let (_, keys) = state
+            .by_process
+            .get(&(key.carrier, process))
+            .ok_or(NativeProcessError::Stale)?;
+        let key_index = keys
+            .iter()
+            .position(|candidate| {
+                state
+                    .members
+                    .get(candidate)
+                    .is_some_and(|member| member.record == old_record)
+            })
+            .ok_or(NativeProcessError::Stale)?;
+        let old_key = keys[key_index];
+        if old_key.thread_generation != key.thread_generation {
+            return Err(NativeProcessError::Stale);
+        }
+        if old_record != reference && signal_record_exists(source.zone, old_record) {
+            return Err(NativeProcessError::Busy);
+        }
+        let record_key = Self::record_key(source.zone, reference);
+        if (old_key != key && state.members.contains_key(&key))
+            || (old_record != reference && state.records.contains_key(&record_key))
+        {
+            return Err(NativeProcessError::Busy);
+        }
+        let mut member = state
+            .members
+            .get(&old_key)
+            .cloned()
+            .ok_or(NativeProcessError::Stale)?;
+        member.record = reference;
+        // Every refusing check precedes publication under both owner guards.
+        state
+            .by_process
+            .get_mut(&(key.carrier, process))
+            .ok_or(NativeProcessError::Stale)?
+            .1[key_index] = key;
+        resources.record = reference;
+        resources.members[member_index].record = reference;
+        resources.members[member_index].thread = key.task;
+        state.members.remove(&old_key);
+        state
+            .records
+            .remove(&Self::record_key(source.zone, old_record));
+        state.members.insert(key, member);
+        state.records.insert(record_key, runtime.clone());
+        drop(graph);
+        Ok(runtime)
+    }
+
     pub fn for_entry(
         &self,
         source: BornInZoneSource<'_, C>,
@@ -829,24 +931,33 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 .task_mut(process)
                 .map_err(|_| NativeProcessError::Stale)?;
             let resources = row.native_mut().resources_mut();
-            if !core::ptr::eq(resources.page, page)
-                || resources
-                    .members
-                    .iter()
-                    .any(|member| member.thread == key.task)
-            {
+            if !core::ptr::eq(resources.page, page) {
                 return Err(NativeProcessError::Stale);
             }
-            resources.members.push(NativeMember {
-                thread: key.task,
-                process,
-                zone: source.zone,
-                record: source.zone.record_ref(record),
-                control,
-            });
+            let imported = resources
+                .members
+                .iter()
+                .find(|member| member.thread == key.task);
+            if imported.is_some_and(|member| {
+                member.record != source.zone.record_ref(record)
+                    || !core::ptr::eq(member.control, control)
+            }) {
+                return Err(NativeProcessError::Stale);
+            }
+            let already_owned = imported.is_some();
             if row.credentials_for(identity.visible_tid).is_err() {
                 let caller_tid = row.metadata().namespace_pid;
-                let _ = row.spawn_thread(caller_tid, identity.visible_tid);
+                row.spawn_thread(caller_tid, identity.visible_tid)
+                    .map_err(|_| NativeProcessError::Invalid)?;
+            }
+            if !already_owned {
+                row.native_mut().resources_mut().members.push(NativeMember {
+                    thread: key.task,
+                    process,
+                    zone: source.zone,
+                    record: source.zone.record_ref(record),
+                    control,
+                });
             }
         }
         state.members.insert(
@@ -961,6 +1072,86 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             && thread.control_slot == control as *const _ as u64)
             .then(|| resources.signals().clone())
     }
+    /// Import only retained, published thread records. The lifecycle census
+    /// must account for exactly these members plus the leader; admission never
+    /// edits the count or supplies missing host tasks.
+    fn imported_members(
+        zone: &'a ZoneTables<C>,
+        page: &'a ThreadLifecyclePage,
+        leader: &'a ThreadControlSlot,
+        process: TaskKey,
+        mm: u64,
+        file_table: u64,
+    ) -> Result<Vec<(NativeMember<'a, C>, NonZeroU32, u64)>, NativeProcessError> {
+        let mut members = Vec::new();
+        for index in 0..page.entry_count() {
+            let (generation, state) = page.state(index).ok_or(NativeProcessError::Stale)?;
+            if !matches!(
+                state,
+                carrick_el1_abi::EntryState::Born | carrick_el1_abi::EntryState::Published
+            ) {
+                continue;
+            }
+            let entry = EntryRef::new(index as u32, generation);
+            let identity = page.identity(entry).ok_or(NativeProcessError::Stale)?;
+            let born = page.born_record(entry).ok_or(NativeProcessError::Stale)?;
+            let address = page
+                .control_address(entry)
+                .filter(|address| {
+                    *address != 0
+                        && address.is_multiple_of(core::mem::align_of::<ThreadControlSlot>() as u64)
+                })
+                .ok_or(NativeProcessError::Stale)?;
+            let control = owned_control(page, leader, address).ok_or(NativeProcessError::Stale)?;
+            let record = control.zone_record().ok_or(NativeProcessError::Stale)?;
+            if !signal_record_exists(zone, record) {
+                return Err(NativeProcessError::Stale);
+            }
+            let retained = zone.record(record.id).identity();
+            let visible = NonZeroU32::new(identity.visible_tid).ok_or(NativeProcessError::Stale)?;
+            let thread = TaskKey {
+                id: TaskId::from_abi_positive(
+                    i32::try_from(identity.tid).map_err(|_| NativeProcessError::Invalid)?,
+                )
+                .map_err(|_| NativeProcessError::Invalid)?,
+                serial: TaskSerial::from_raw_u64(retained.generation)
+                    .ok_or(NativeProcessError::Stale)?,
+            };
+            if born.clone_flags & 0x0001_0000 == 0
+                || retained.tid != u64::from(identity.tid)
+                || retained.serial != identity.thread_serial
+                || retained.mm != mm
+                || retained.file_table != file_table
+                || retained.lifecycle_page != page as *const _ as u64
+                || retained.control_slot != address
+                || control.visible_tid() != Some(visible.get())
+                || thread.id == process.id
+                || members.iter().any(
+                    |(member, tid, _): &(NativeMember<'a, C>, NonZeroU32, u64)| {
+                        member.thread.id == thread.id || *tid == visible
+                    },
+                )
+            {
+                return Err(NativeProcessError::Stale);
+            }
+            members.push((
+                NativeMember {
+                    thread,
+                    process,
+                    zone,
+                    record,
+                    control,
+                },
+                visible,
+                identity.thread_serial,
+            ));
+        }
+        if page.live() as usize != 1 + members.len() || page.claimed_count() != 0 {
+            return Err(NativeProcessError::Invalid);
+        }
+        Ok(members)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn admit_fresh_root<B: carrick_mmu_core::owner_mmu::OwnerForkMmu>(
         source: BornInZoneSource<'a, C>,
@@ -1016,14 +1207,17 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         {
             return Err(NativeProcessError::Stale);
         }
-        // This constructor adopts one fresh leader. It cannot discard another
-        // admitted member to repair an execution lane's bootstrap census.
-        if page.live() != 1 {
-            return Err(NativeProcessError::Invalid);
-        }
+        let imported = Self::imported_members(
+            source.zone,
+            page,
+            control,
+            key,
+            binding.mm.raw(),
+            identity.file_table,
+        )?;
         let ns = Arc::new(SpinLock::new(NamespaceState::new(1, i32::MAX, id.raw())));
         let visible_namespace = VisibleNamespace::new(NonZeroU32::MIN, NonZeroU32::MIN);
-        let (task_claim, thread_claim, root_roles) = {
+        let (task_claim, mut thread_claim, root_roles) = {
             let mut n = ns.lock();
             let number = n
                 .reserve_exact(id.raw(), ClaimKind::Task)
@@ -1057,6 +1251,20 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 },
             )
         };
+        {
+            let mut n = ns.lock();
+            for (member, visible_tid, _) in &imported {
+                let number = n
+                    .reserve_exact(member.thread.id.raw(), ClaimKind::Thread)
+                    .map_err(|_| NativeProcessError::Exhausted)?;
+                n.advance_visible_past(
+                    visible_namespace,
+                    VisibleIdentity::from_existing_member(*visible_tid),
+                )
+                .ok_or(NativeProcessError::Exhausted)?;
+                thread_claim.claims.push((number, ClaimKind::Thread));
+            }
+        }
         let serials = SerialAllocator::new();
         serials
             .advance_past(
@@ -1066,7 +1274,14 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                         .raw()
                         .max(binding.thread_generation.raw())
                         .max(binding.mm.raw())
-                        .max(identity.file_table),
+                        .max(identity.file_table)
+                        .max(
+                            imported
+                                .iter()
+                                .map(|(member, _, serial)| member.thread.serial.raw().max(*serial))
+                                .max()
+                                .unwrap_or(0),
+                        ),
                 )
                 .ok_or(NativeProcessError::Invalid)?,
             )
@@ -1076,18 +1291,20 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         } else {
             1
         };
+        let mut members = vec![NativeMember {
+            thread: key,
+            process: key,
+            zone: source.zone,
+            record: source.zone.record_ref(record),
+            control,
+        }];
+        members.extend(imported.iter().map(|(member, _, _)| *member));
         let resources = NativeResources {
             zone: source.zone,
             record: source.zone.record_ref(record),
             control,
             page,
-            members: vec![NativeMember {
-                thread: key,
-                process: key,
-                zone: source.zone,
-                record: source.zone.record_ref(record),
-                control,
-            }],
+            members,
             mm,
             address,
             signals: NativeProcessSignals::fresh_root(key),
@@ -1097,25 +1314,32 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             file_table,
         };
         let mut owner = Owner::new();
+        let mut initial = GuestTask::new(
+            GuestTaskMetadata {
+                key,
+                container: visible_namespace,
+                namespace_pid: visible.get(),
+                identity: TaskIdentity::led_by(id),
+                namespace_process_group: visible.get(),
+                namespace_session: visible.get(),
+                receipt_uid: |uid| uid,
+                exit_signal: ChildExitSignal::SIGCHLD,
+                diagnostic_name: String::from("native-root"),
+            },
+            None,
+            words,
+            custody(resources),
+            task_claim,
+        );
+        for (_, tid, _) in &imported {
+            initial
+                .spawn_thread(visible.get(), tid.get())
+                .map_err(|_| NativeProcessError::Invalid)?;
+        }
         owner
-            .seed_initial(GuestTask::new(
-                GuestTaskMetadata {
-                    key,
-                    container: visible_namespace,
-                    namespace_pid: visible.get(),
-                    identity: TaskIdentity::led_by(id),
-                    namespace_process_group: visible.get(),
-                    namespace_session: visible.get(),
-                    receipt_uid: |uid| uid,
-                    exit_signal: ChildExitSignal::SIGCHLD,
-                    diagnostic_name: String::from("native-root"),
-                },
-                None,
-                words,
-                custody(resources),
-                task_claim,
-            ))
+            .seed_initial(initial)
             .map_err(|_| NativeProcessError::Invalid)?;
+
         #[cfg(target_arch = "x86_64")]
         let uts = carrick_personality_linux::sysinfo::LinuxUtsname::carrick_x86_64();
         #[cfg(not(target_arch = "x86_64"))]
@@ -1297,7 +1521,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             return Err(NativeProcessError::Stale);
         }
         member_control.bind_zone_record(source.zone.record_ref(record));
-        if member.process == member_key.task {
+        if core::ptr::eq(member_control, resources.control) {
             if resources.record != source.zone.record_ref(record) {
                 return Err(NativeProcessError::Stale);
             }
