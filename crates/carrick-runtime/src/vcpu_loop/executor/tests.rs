@@ -413,6 +413,8 @@ type InheritedStateRow = (u64, u64, u64, u64, u64);
 
 #[derive(Clone, Default)]
 struct FakeFactory {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    topology: Option<Arc<carrick_vmm_hvf::trap::VcpuTopologyTestFixture>>,
     bindings: Arc<parking_lot::Mutex<BTreeMap<ThreadKey, Arc<FakeBinding>>>>,
     authorities:
         Arc<parking_lot::Mutex<BTreeMap<(ThreadKey, ExecutionGeneration), SubmissionAuthority>>>,
@@ -859,6 +861,10 @@ impl PersistentExecutorFactory for FakeFactory {
         &self,
         registration: &carrick_kernel::kernel::ExecutorRegistration,
     ) -> Result<Self::Executor, TrapError> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some(topology) = &self.topology {
+            topology.admit_create().map_err(TrapError::Hypervisor)?;
+        }
         let executor = registration.id();
         let call = self.create_calls.fetch_add(1, Ordering::SeqCst) + 1;
         self.record(BackendEventKind::Create, executor, None);
@@ -3507,6 +3513,49 @@ fn start_pool(
         ExecutorBoundaryAudit::production(),
     )
     .expect("start executor pool")
+}
+
+// Exercise the real pool's failure/exit, owner-thread destruction and joins;
+// only hardware creation is replaced by production topology admission.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn carrier_pool_drain_fixture(
+    topology: Arc<carrick_vmm_hvf::trap::VcpuTopologyTestFixture>,
+    fail: bool,
+) -> impl FnOnce() -> Result<(), carrick_kernel::run_result::RuntimeError> {
+    let (kernel, root) = bootstrap(if fail { 19_901 } else { 19_902 });
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
+    let factory = Arc::new(FakeFactory {
+        topology: Some(Arc::clone(&topology)),
+        ..FakeFactory::default()
+    });
+    factory.install(
+        &root,
+        FakeBinding::new(901, [if fail { Step::FailRun } else { Step::Exit }]),
+    );
+    let pool = start_pool(Arc::clone(&scheduler), factory, 1);
+    topology.first_run().expect("fixture first run");
+    let authority = enqueue_root(&scheduler, &root, publish(&root, 901));
+    drop(authority);
+    move || {
+        topology.begin_teardown();
+        let result = pool.shutdown();
+        let report = match &result {
+            Ok(report) => report,
+            Err(error) => error.report(),
+        };
+        assert_eq!(report.created(), 1);
+        assert_eq!(report.destroyed(), 1);
+        assert_eq!(report.joined(), 1);
+        assert!(
+            matches!(
+                root.thread().execution_state(),
+                ThreadExecutionState::Failed { .. }
+            ) == fail
+        );
+        result.map(|_| ()).map_err(|error| {
+            carrick_kernel::run_result::RuntimeError::Configuration(error.to_string())
+        })
+    }
 }
 
 #[test]

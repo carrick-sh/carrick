@@ -415,6 +415,12 @@ mod vcpu_topology;
 pub use vcpu_admission::cooperative_release_atomic_permit;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use vcpu_admission::*;
+#[cfg(all(
+    target_os = "macos",
+    target_arch = "aarch64",
+    feature = "foreign-cow-test-support"
+))]
+pub use vcpu_topology::VcpuTopologyTestFixture;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use vcpu_topology::begin_carrier_vcpu_teardown;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
