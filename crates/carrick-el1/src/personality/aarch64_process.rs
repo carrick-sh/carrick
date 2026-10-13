@@ -161,7 +161,10 @@ pub fn admit_entry(
         return Ok((runtime, address, words));
     }
     if control.entry().is_some() {
-        let runtime = REGISTRY.register_thread(source, task, address, page, control)?;
+        let runtime = match REGISTRY.rehome_entry(source, task, address, page, control)? {
+            Some(runtime) => runtime,
+            None => REGISTRY.register_thread(source, task, address, page, control)?,
+        };
         return Ok((runtime, address, words));
     }
     if REGISTRY
@@ -173,7 +176,9 @@ pub fn admit_entry(
         )
         .is_some()
     {
-        let runtime = REGISTRY.rehome_root(source, task, address, page, control)?;
+        let runtime = REGISTRY
+            .rehome_entry(source, task, address, page, control)?
+            .ok_or(NativeProcessError::Stale)?;
         return Ok((runtime, address, words));
     }
     let runtime = Arc::new(NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
@@ -237,7 +242,7 @@ pub(super) unsafe fn observed_entry_address(
     let address = unsafe { zone_record.ctx_mut() }
         .address_context()
         .ok_or(NativeProcessError::Stale)?;
-    (binding.issued()
+    ((binding.issued() || carrick_core::entry::admit_born_in_zone(binding, source).is_some())
         && identity.tid == binding.task.raw()
         && identity.generation == binding.generation.raw()
         && identity.serial == binding.thread_generation.raw()

@@ -1402,12 +1402,26 @@ impl super::thread_setup::LifecycleVenue for Fixture {
         &'a self,
         task: &'a CurrentTask,
     ) -> Option<carrick_personality_linux::thread::LifecycleThread<'a>> {
-        (task.metadata.control_slot.load(Ordering::Acquire) == self.control as *const _ as u64
-            && task.metadata.lifecycle_page.load(Ordering::Acquire) == self.page as *const _ as u64)
-            .then_some(carrick_personality_linux::thread::LifecycleThread {
-                page: self.page,
-                slot: self.control,
-            })
+        if task.metadata.lifecycle_page.load(Ordering::Acquire) != self.page as *const _ as u64 {
+            return None;
+        }
+        let address = task.metadata.control_slot.load(Ordering::Acquire);
+        let slot = if address == self.control as *const _ as u64 {
+            self.control
+        } else {
+            let entry = self.page.entry_ref_for_visible_tid(
+                u32::try_from(task.execution.task.load(Ordering::Acquire)).ok()?,
+            )?;
+            if self.page.control_address(entry)? != address {
+                return None;
+            }
+            // The test fixture retains the published control allocation.
+            unsafe { &*(address as *const ThreadControlSlot) }
+        };
+        Some(carrick_personality_linux::thread::LifecycleThread {
+            page: self.page,
+            slot,
+        })
     }
     fn born_slot(
         &self,
@@ -1871,4 +1885,157 @@ fn arm_root_entry_refuses_wrong_binding_and_root_incarnation() {
             .for_entry(source, &fixture.task, fixture.address)
             .unwrap()
     ));
+}
+
+#[test]
+fn arm_born_thread_uses_native_owner_without_an_execution_generation() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let (control, record) =
+        imported_thread_with_identity(fixture, |identity| identity.generation = 0);
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&[]),
+    );
+    let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
+    with_process_entry(
+        source,
+        &fixture.task,
+        ThreadCtx::ZERO,
+        ttbr0,
+        fixture.page,
+        fixture.control,
+        &mut service,
+        |process| assert!(process.has_thread(42)),
+    )
+    .expect("a retained Born member has no host execution generation yet");
+    let owner = registry()
+        .for_entry(source, &fixture.task, fixture.address)
+        .unwrap();
+    fixture.task.set(El1TaskId::from_linux_tid(42), 0, 5);
+    fixture
+        .task
+        .mm
+        .thread_generation
+        .store(102, Ordering::Release);
+    fixture
+        .task
+        .publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        record.id
+    );
+    let mut frame = carrick_el1_abi::TrapFrame {
+        x: [0; 31],
+        elr: 0,
+        spsr: 0,
+        esr: 0,
+        slot: 0,
+        far: 0,
+    };
+    frame.x[8] = 96;
+    let counters = Box::new(carrick_el1_abi::Counters::new());
+    let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
+    let route = super::dispatch::dispatch_arm_syscall_with_native_process(
+        &mut frame,
+        &counters,
+        core::slice::from_ref(&fixture.task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &cache,
+        None::<crate::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
+        None,
+        Some(&*fixture),
+        fixture.page,
+        control,
+        ThreadCtx::ZERO,
+        ttbr0,
+        &mut service,
+        |_| core::ptr::null_mut(),
+    )
+    .unwrap();
+    assert_eq!(frame.x[0], 42);
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::WithWork
+    );
+    with_process_entry(
+        source,
+        &fixture.task,
+        ThreadCtx::ZERO,
+        ttbr0,
+        fixture.page,
+        control,
+        &mut service,
+        |process| {
+            assert_eq!(process.binding().generation.raw(), 0);
+            let LifecycleOutcome::Returned { result, .. } = process.wait4(
+                ProcessWaitPid::from_syscall_argument(u64::MAX),
+                UserVa::new(0),
+                LinuxWaitOptions::WNOHANG,
+                UserVa::new(0),
+            ) else {
+                panic!("wait4");
+            };
+            assert_eq!(result.raw(), -10);
+        },
+    )
+    .expect("Born entry must retain the existing owner without a host task row");
+    assert!(std::sync::Arc::ptr_eq(
+        &owner,
+        &registry()
+            .for_entry(source, &fixture.task, fixture.address)
+            .unwrap()
+    ));
+    assert_eq!(fixture.zone.record(record.id).identity().generation, 0);
+    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
+    // The normal host activation replaces the retired Born execution record;
+    // the process graph and lifecycle member remain the same authorities.
+    fixture.zone.clear_current(fixture.slot);
+    fixture.zone.free_record(record.id);
+    let slot = SlotId::new(1);
+    fixture.zone.drive(slot, 2);
+    fixture.zone.publish_slot(slot, 1, Some(0), 1);
+    fixture.zone.enter_guest(slot);
+    fixture.zone.install_space(slot, 1).unwrap();
+    fixture
+        .task
+        .execution
+        .generation
+        .store(19, Ordering::Release);
+    service.slot = slot;
+    let adopted_source = BornInZoneSource {
+        zone: fixture.zone,
+        slot,
+    };
+    with_process_entry(
+        adopted_source,
+        &fixture.task,
+        ThreadCtx::ZERO,
+        ttbr0,
+        fixture.page,
+        control,
+        &mut service,
+        |process| {
+            assert_eq!(process.binding().generation.raw(), 19);
+            assert!(process.has_thread(41) && process.has_thread(42));
+        },
+    )
+    .unwrap();
+    assert!(std::sync::Arc::ptr_eq(
+        &owner,
+        &registry()
+            .for_entry(adopted_source, &fixture.task, fixture.address)
+            .unwrap()
+    ));
+    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
 }
