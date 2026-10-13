@@ -117,6 +117,10 @@ impl<
     fn process_exit_group(&mut self, status: u8) -> Option<LifecycleOutcome> {
         Some(self.process_venue()?.exit_group(status))
     }
+    fn process_exit_binding(&self) -> Option<carrick_core_abi::ExecutionBinding> {
+        self.process.as_deref().map(|venue| venue.binding())
+    }
+
     fn publish_born(&mut self, mut birth: ThreadBirth<'a, '_>) -> Result<(), i64> {
         let mut process = self.process.take();
         let result = if let Some(venue) = process.as_deref_mut() {

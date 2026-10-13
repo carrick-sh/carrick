@@ -2045,3 +2045,86 @@ fn arm_born_thread_uses_native_owner_without_an_execution_generation() {
     ));
     assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
 }
+
+#[test]
+fn arm_owned_raw_exit_retires_only_one_of_two_live_threads() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let (control, record) = imported_thread_with_identity(fixture, |_| {});
+    let mut service = fixture.process_service();
+    let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
+    fixture
+        .enter(fixture.control, ttbr0, &mut service, |_| ())
+        .unwrap();
+    fixture.task.set(El1TaskId::from_linux_tid(42), 12, 5);
+    fixture
+        .task
+        .mm
+        .thread_generation
+        .store(102, Ordering::Release);
+    fixture
+        .task
+        .publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        record.id
+    );
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[8] = 93;
+    let counters = Box::new(carrick_el1_abi::Counters::new());
+    let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
+    let mut cpu = crate::sched::FakeCpu::default();
+    let user = crate::sched::HardwareUserWord;
+    let route = super::dispatch::dispatch_arm_syscall_with_native_process(
+        &mut frame,
+        &counters,
+        core::slice::from_ref(&fixture.task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &cache,
+        Some(crate::Zone {
+            tables: fixture.zone,
+            cpu: &mut cpu,
+            user: &user,
+        }),
+        None,
+        Some(&*fixture),
+        fixture.page,
+        control,
+        ThreadCtx::ZERO,
+        ttbr0,
+        &mut service,
+        |_| core::ptr::null_mut(),
+    )
+    .unwrap();
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+    );
+    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 1);
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
+    assert!(registry().for_record(fixture.zone, record).is_none());
+    fixture.task.set(El1TaskId::from_linux_tid(41), 11, 5);
+    fixture
+        .task
+        .mm
+        .thread_generation
+        .store(101, Ordering::Release);
+    fixture.task.publish_lifecycle(
+        fixture.page as *const _ as u64,
+        fixture.control as *const _ as u64,
+    );
+    fixture
+        .enter(fixture.control, ttbr0, &mut service, |process| {
+            assert!(process.has_thread(41));
+            assert!(!process.has_thread(42));
+            assert!(matches!(
+                process.exit_group(7),
+                LifecycleOutcome::Transferred { .. }
+            ));
+        })
+        .unwrap();
+    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 0);
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
+}
