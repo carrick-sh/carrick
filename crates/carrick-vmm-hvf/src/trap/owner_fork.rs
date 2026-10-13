@@ -271,6 +271,141 @@ fn inherited_futex_identity(
     }
 }
 
+/// Project owner-selected semantic leaves and their physical inventory custody.
+/// Kept separate from carrier publication so the production plan is VM-free.
+pub(super) fn project_owner_fork_frames(
+    physical: &ForkPhysicalCustody,
+    inventory: &parking_lot::Mutex<HvpatchFrameInventory>,
+    source_owners: &std::collections::BTreeMap<(u64, usize), Arc<StructuralBackingOwner>>,
+    published: &[Arc<StructuralBackingOwner>],
+    selected: &[PortalForkCustody],
+) -> Result<(Vec<ProcessMappingDesc>, Vec<ProcessInventoryDesc>), TrapError> {
+    let mut mappings = Vec::new();
+    let mut inventory_mappings = Vec::new();
+    let mut inherited = std::collections::BTreeSet::new();
+    for custody in selected {
+        let PortalForkCustody::Frame {
+            va,
+            ipa,
+            len,
+            shared,
+        } = *custody
+        else {
+            continue;
+        };
+        let end = ipa.checked_add(len).ok_or(TrapError::MappingOverflow {
+            guest_start: va,
+            mapped_size: len,
+        })?;
+        let mut cursor = ipa;
+        while cursor < end {
+            let Some((_, allocation, record)) = physical.retain_extent(cursor, 1)? else {
+                return Err(TrapError::Hypervisor(
+                    "owner-selected child frame lost exact physical custody".into(),
+                ));
+            };
+            let mut take = (record.ipa + record.len as u64).min(end) - cursor;
+            let start = va + (cursor - ipa);
+            let perms = applevisor::memory::MemPerms::from(record.perms);
+            let source = inventory
+                .lock()
+                .extents
+                .range(..=(cursor, u64::MAX))
+                .next_back()
+                .filter(|((base, length), _)| {
+                    *base <= cursor
+                        && base
+                            .checked_add(*length)
+                            .is_some_and(|bound| cursor < bound)
+                })
+                .map(|((base, length), extent)| {
+                    take = take.min(base + length - cursor);
+                    *extent
+                });
+            let structural = source_owners
+                .get(&(record.ipa, record.len))
+                .cloned()
+                .or_else(|| {
+                    published
+                        .iter()
+                        .find(|owner| {
+                            owner.physical_ipa == record.ipa && owner.physical_size == record.len
+                        })
+                        .cloned()
+                });
+            if source.is_none() && structural.is_none() {
+                return Err(TrapError::Hypervisor(
+                    "owner-selected physical frame has no exact inventory or structural lifetime"
+                        .into(),
+                ));
+            }
+            let backing = source
+                .map(|entry| entry.backing)
+                .unwrap_or_else(HvfVmState::private_backing_identity);
+            let owner_generation = structural.as_ref().map_or(
+                source.map_or(0, |entry| entry.stage2_owner.generation),
+                |owner| owner.epoch().raw(),
+            );
+            let physical_offset = cursor
+                .checked_sub(source.map_or(record.ipa, |entry| entry.stage2_base))
+                .ok_or_else(|| {
+                    TrapError::Hypervisor("owner fork physical offset underflow".into())
+                })?;
+            let (shared_key_base, shared_key_offset) =
+                inherited_futex_identity(backing, physical_offset)?;
+            mappings.push(ProcessMappingDesc {
+                start,
+                ipa: cursor,
+                end: start + take,
+                host: ProcessMappingHost::Borrowed {
+                    pointer: allocation.host_base(),
+                    structural_owner: structural,
+                },
+                size: take as usize,
+                physical_ipa: record.ipa,
+                physical_host_addr: allocation.host_base(),
+                physical_size: record.len,
+                inventory_backing: backing,
+                perms,
+                is_dynamic_alias: source.is_some(),
+                sharing: if shared {
+                    GuestMappingSharing::GlobalShared
+                } else {
+                    GuestMappingSharing::Private
+                },
+                guest_writable: false,
+                inherited_frame: source.map(|entry| entry.frame),
+                stage2_lease: None,
+                shared_key_base,
+                shared_key_offset,
+                owner_generation,
+            });
+            if inherited.insert((cursor, take)) {
+                inventory_mappings.push(ProcessInventoryDesc {
+                    gpa: cursor,
+                    length: take,
+                    permissions: carrick_hal::MemPerms {
+                        read: record.perms & 1 != 0,
+                        write: record.perms & 2 != 0,
+                        exec: record.perms & 4 != 0,
+                    },
+                    inherited_frame: source.map(|entry| entry.frame),
+                    inherited_mapping: source.map(|entry| entry.mapping),
+                    backing,
+                    stage2_lease: (record.ipa, record.len as u64),
+                    stage2_owner: InventoryStage2OwnerIdentity {
+                        host_addr: record.host_addr,
+                        generation: owner_generation,
+                    },
+                    fork_frame_receipt_kind: None,
+                });
+            }
+            cursor += take;
+        }
+    }
+    Ok((mappings, inventory_mappings))
+}
+
 pub(crate) struct OwnerPhysicalForkBuilder {
     physical: ForkPhysicalCustody,
     state: Arc<MmAccessState>,
@@ -334,129 +469,13 @@ impl carrick_aarch64::fork::PhysicalForkBuilder<ProcessSpec> for OwnerPhysicalFo
                 "physical Fork completion identity differs from prepared capacity".into(),
             ));
         }
-        let mut mappings = Vec::new();
-        let mut inventory_mappings = Vec::new();
-        let mut inherited = std::collections::BTreeSet::new();
-        for custody in selected {
-            let PortalForkCustody::Frame {
-                va,
-                ipa,
-                len,
-                shared,
-            } = *custody
-            else {
-                continue;
-            };
-            let end = ipa.checked_add(len).ok_or(TrapError::MappingOverflow {
-                guest_start: va,
-                mapped_size: len,
-            })?;
-            let mut cursor = ipa;
-            while cursor < end {
-                let Some((_, allocation, record)) = self.physical.retain_extent(cursor, 1)? else {
-                    return Err(TrapError::Hypervisor(
-                        "owner-selected child frame lost exact physical custody".into(),
-                    ));
-                };
-                let mut take = (record.ipa + record.len as u64).min(end) - cursor;
-                let start = va + (cursor - ipa);
-                let perms = applevisor::memory::MemPerms::from(record.perms);
-                let source = self
-                    .inventory
-                    .lock()
-                    .extents
-                    .range(..=(cursor, u64::MAX))
-                    .next_back()
-                    .filter(|((base, length), _)| {
-                        *base <= cursor
-                            && base
-                                .checked_add(*length)
-                                .is_some_and(|bound| cursor < bound)
-                    })
-                    .map(|((base, length), extent)| {
-                        take = take.min(base + length - cursor);
-                        *extent
-                    });
-                let structural = self
-                    .source_owners
-                    .get(&(record.ipa, record.len))
-                    .cloned()
-                    .or_else(|| {
-                        self.published
-                            .iter()
-                            .find(|owner| {
-                                owner.physical_ipa == record.ipa
-                                    && owner.physical_size == record.len
-                            })
-                            .cloned()
-                    });
-                if source.is_none() && structural.is_none() {
-                    return Err(TrapError::Hypervisor("owner-selected physical frame has no exact inventory or structural lifetime".into()));
-                }
-                let backing = source
-                    .map(|entry| entry.backing)
-                    .unwrap_or_else(HvfVmState::private_backing_identity);
-                let owner_generation = structural.as_ref().map_or(
-                    source.map_or(0, |entry| entry.stage2_owner.generation),
-                    |owner| owner.epoch().raw(),
-                );
-                let physical_offset = cursor
-                    .checked_sub(source.map_or(record.ipa, |entry| entry.stage2_base))
-                    .ok_or_else(|| {
-                        TrapError::Hypervisor("owner fork physical offset underflow".into())
-                    })?;
-                let (shared_key_base, shared_key_offset) =
-                    inherited_futex_identity(backing, physical_offset)?;
-                mappings.push(ProcessMappingDesc {
-                    start,
-                    ipa: cursor,
-                    end: start + take,
-                    host: ProcessMappingHost::Borrowed {
-                        pointer: allocation.host_base(),
-                        structural_owner: structural,
-                    },
-                    size: take as usize,
-                    physical_ipa: record.ipa,
-                    physical_host_addr: allocation.host_base(),
-                    physical_size: record.len,
-                    inventory_backing: backing,
-                    perms,
-                    is_dynamic_alias: source.is_some(),
-                    sharing: if shared {
-                        GuestMappingSharing::GlobalShared
-                    } else {
-                        GuestMappingSharing::Private
-                    },
-                    guest_writable: false,
-                    inherited_frame: source.map(|entry| entry.frame),
-                    stage2_lease: None,
-                    shared_key_base,
-                    shared_key_offset,
-                    owner_generation,
-                });
-                if inherited.insert((cursor, take)) {
-                    inventory_mappings.push(ProcessInventoryDesc {
-                        gpa: cursor,
-                        length: take,
-                        permissions: carrick_hal::MemPerms {
-                            read: record.perms & 1 != 0,
-                            write: record.perms & 2 != 0,
-                            exec: record.perms & 4 != 0,
-                        },
-                        inherited_frame: source.map(|entry| entry.frame),
-                        inherited_mapping: source.map(|entry| entry.mapping),
-                        backing,
-                        stage2_lease: (record.ipa, record.len as u64),
-                        stage2_owner: InventoryStage2OwnerIdentity {
-                            host_addr: record.host_addr,
-                            generation: owner_generation,
-                        },
-                        fork_frame_receipt_kind: None,
-                    });
-                }
-                cursor += take;
-            }
-        }
+        let (mut mappings, mut inventory_mappings) = project_owner_fork_frames(
+            &self.physical,
+            &self.inventory,
+            &self.source_owners,
+            &self.published,
+            selected,
+        )?;
         // Table and control capacities have no host semantic projection. Their
         // fixed carrier aliases were substituted by the owner itself.
         for owner in &self.published {

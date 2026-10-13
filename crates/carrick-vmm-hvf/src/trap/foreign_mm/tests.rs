@@ -5481,22 +5481,31 @@ fn structural_vvar_fork_inheritance_requires_exact_live_custody() {
 #[test]
 fn production_fork_plan_retains_structural_vvar_semantic_authority() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
-    production_fork_vvar_refresh(None);
+    production_fork_vvar_refresh(None, false);
 }
 
 #[test]
 fn owner_fork_refreshes_readonly_vvar_without_host_arm_ranges() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
-    production_fork_vvar_refresh(Some(4));
+    production_fork_vvar_refresh(Some(4), false);
 }
 
 #[test]
 fn owner_vvar_refresh_preserves_neighbors_outside_the_live_cow_arm() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
-    production_fork_vvar_refresh(Some(1));
+    production_fork_vvar_refresh(Some(1), false);
 }
 
-fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>) {
+/// #325: EL1 selects a 4 KiB leaf from the parent's 16 KiB compound.
+/// The child must inherit physical custody of that whole exact extent before
+/// its bootstrap RNG write, while retaining only the selected semantic leaf.
+#[test]
+fn owner_selected_fork_leaf_retains_vvar_compound_for_child_bootstrap() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    production_fork_vvar_refresh(Some(1), true);
+}
+
+fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>, owner_selected: bool) {
     let _external_alias_restore = ExternalAliasStateRestore::capture();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let transport = Arc::new(CarrierForeignMmTransport::new());
@@ -5871,6 +5880,38 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>) {
             .any(|mapping| mapping.start == vvar_ipa),
         "production fork planning must retain the vvar semantic descriptor",
     );
+    if owner_selected {
+        let physical = super::super::owner_fork::ForkPhysicalCustody::new(
+            Arc::clone(&transport.custody),
+            Arc::new(|_, _| false),
+        );
+        let source_owners = std::collections::BTreeMap::from([(
+            (vvar_ipa, vvar_len as usize),
+            Arc::clone(&vvar_owner),
+        )]);
+        let selection = carrick_el1_abi::PortalForkCustody::Frame {
+            va: vvar_ipa,
+            ipa: vvar_ipa,
+            len: 4096,
+            shared: false,
+        };
+        let (selected_mappings, selected_inventory) =
+            super::super::owner_fork::project_owner_fork_frames(
+                &physical,
+                &parent.frame_inventory.ledger,
+                &source_owners,
+                &[],
+                &[selection],
+            )
+            .expect("project the owner's exact vvar leaf");
+        assert_eq!(selected_mappings.len(), 1);
+        assert_eq!(selected_mappings[0].size, 4096);
+        plan.mappings.retain(|mapping| mapping.start != vvar_ipa);
+        plan.mappings.extend(selected_mappings);
+        plan.inventory_mappings
+            .retain(|mapping| mapping.gpa != vvar_ipa);
+        plan.inventory_mappings.extend(selected_inventory);
+    }
     let ids = std::sync::atomic::AtomicU64::new(880);
     plan.stage_with_reservation_factory(|frames, mappings, capacity| {
         let next =
