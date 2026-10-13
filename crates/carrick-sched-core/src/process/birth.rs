@@ -263,6 +263,9 @@ mod tests {
         fn exit_key(&self) -> TaskKey {
             *self
         }
+        fn exit_is_autoreap(&self) -> bool {
+            false
+        }
     }
     type Registry = BirthRegistry<(), Live, TaskKey, TaskKey, u32, (), (), (), Failure>;
     fn key(id: i32, serial: u64) -> TaskKey {

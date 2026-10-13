@@ -128,6 +128,7 @@ pub trait ExitLive<C>: WaitIdentitySource {
 pub trait ExitZombie {
     fn exit_key(&self) -> TaskKey;
     fn exit_parent(&self) -> Option<TaskKey>;
+    fn exit_is_autoreap(&self) -> bool;
 }
 
 #[derive(Debug)]
@@ -151,7 +152,8 @@ pub struct PreparedExitTopology<Credit> {
     adopter: Option<TaskKey>,
     autoreap_parent: Option<TaskKey>,
     prepared_adopter_children: Option<BTreeSet<TaskKey>>,
-    prepared_parent_children: Option<BTreeSet<TaskKey>>,
+    prepared_autoreap: Option<AutoreapParent<Credit>>,
+    prepared_adoptee_autoreaps: BTreeMap<TaskId, AutoreapParent<Credit>>,
     namespace_init: Option<TaskKey>,
 }
 
@@ -303,30 +305,52 @@ impl<
                 .ok_or(ExitError::Topology(key.id))?;
             affected_revisions.insert(key.id, reserve(record)?);
             let mut prepared = record.exit_children();
-            if autoreap_parent == Some(key) {
-                prepared.remove(&task_key);
-            }
             prepared.extend(children.iter().copied());
             Some(prepared)
         } else {
             None
         };
-        let prepared_parent_children =
-            if let Some(key) = autoreap_parent.filter(|key| Some(*key) != adopter) {
-                available(key.id)?;
-                reserved_ids.insert(key.id);
-                let record = self
-                    .tasks
-                    .get(&key.id)
-                    .filter(|record| record.wait_identity().key == key)
-                    .ok_or(ExitError::Topology(key.id))?;
-                affected_revisions.insert(key.id, reserve(record)?);
-                let mut prepared = record.exit_children();
-                prepared.remove(&task_key);
-                Some(prepared)
-            } else {
-                None
-            };
+        let prepared_autoreap = if let Some(key) = autoreap_parent {
+            available(key.id)?;
+            reserved_ids.insert(key.id);
+            let record = self
+                .tasks
+                .get(&key.id)
+                .filter(|record| record.wait_identity().key == key)
+                .ok_or(ExitError::Topology(key.id))?;
+            if let alloc::collections::btree_map::Entry::Vacant(entry) =
+                affected_revisions.entry(key.id)
+            {
+                entry.insert(reserve(record)?);
+            }
+            // Removal happens after retirement, not with topology publication.
+            // Retain separate headroom so unrelated births can still advance.
+            Some(AutoreapParent::Live {
+                key,
+                removal: reserve(record)?,
+            })
+        } else {
+            None
+        };
+        let mut prepared_adoptee_autoreaps = BTreeMap::new();
+        for child in &children {
+            if self
+                .zombies
+                .get(&child.id)
+                .is_some_and(ExitZombie::exit_is_autoreap)
+            {
+                let destination = if let Some(key) = adopter {
+                    let record = self.tasks.get(&key.id).ok_or(ExitError::Topology(key.id))?;
+                    AutoreapParent::Live {
+                        key,
+                        removal: reserve(record)?,
+                    }
+                } else {
+                    AutoreapParent::Orphan
+                };
+                prepared_adoptee_autoreaps.insert(child.id, destination);
+            }
+        }
         Ok(PreparedExitTopology {
             task_revision: Arc::new(ExitParticipantRevision::capture(
                 task_key,
@@ -338,7 +362,8 @@ impl<
             adopter,
             autoreap_parent,
             prepared_adopter_children,
-            prepared_parent_children,
+            prepared_autoreap,
+            prepared_adoptee_autoreaps,
             namespace_init,
         })
     }
@@ -347,10 +372,45 @@ impl<
 pub trait ExitLivePublication<C>: ExitLive<C> {
     fn exit_reparent(&mut self, parent: Option<TaskKey>);
     fn exit_publish_children(&mut self, children: BTreeSet<TaskKey>);
+    fn exit_forget_child(&mut self, child: TaskKey);
     fn exit_publish_credit(&mut self, participant: PreparedExitParticipant<Self::Credit>);
 }
-pub trait ExitZombiePublication: ExitZombie {
+/// Every live autoreap destination carries preadmitted removal headroom.
+/// An orphan has no live child edge to remove and needs no parent credit.
+#[derive(Debug)]
+pub enum AutoreapParent<Credit> {
+    Live {
+        key: TaskKey,
+        removal: PreparedExitParticipant<Credit>,
+    },
+    Orphan,
+}
+impl<Credit> AutoreapParent<Credit> {
+    fn key(&self) -> Option<TaskKey> {
+        match self {
+            Self::Live { key, .. } => Some(*key),
+            Self::Orphan => None,
+        }
+    }
+}
+/// Owned automatic removal of one terminal receipt. The admission belongs to
+/// the exact current parent and moves with the receipt on adoption.
+#[derive(Debug)]
+pub struct DeferredAutoreap<Credit> {
+    parent: AutoreapParent<Credit>,
+    group: super::ProcessGroupId,
+    session: super::SessionId,
+}
+impl<Credit> DeferredAutoreap<Credit> {
+    pub fn reparent(&mut self, parent: AutoreapParent<Credit>) {
+        self.parent = parent;
+    }
+}
+pub trait ExitZombiePublication<Credit>: ExitZombie {
     fn exit_reparent(&mut self, parent: Option<TaskKey>);
+    fn exit_publish_autoreap(&mut self, accounting: DeferredAutoreap<Credit>);
+    fn exit_reparent_autoreap(&mut self, parent: AutoreapParent<Credit>);
+    fn exit_take_autoreap(&mut self) -> Option<DeferredAutoreap<Credit>>;
 }
 impl<
     C: Copy + Ord,
@@ -402,7 +462,7 @@ impl<
 impl<
     C: Copy + Ord,
     L: ExitLivePublication<C>,
-    Z: ExitZombiePublication,
+    Z: ExitZombiePublication<L::Credit>,
     R,
     Reservation,
     Retired,
@@ -419,15 +479,12 @@ impl<
                 record.exit_reparent(plan.adopter);
             } else if let Some(record) = self.zombies.get_mut(&child.id) {
                 record.exit_reparent(plan.adopter);
+                if let Some(destination) = plan.prepared_adoptee_autoreaps.remove(&child.id) {
+                    record.exit_reparent_autoreap(destination);
+                }
             }
         }
         if let (Some(key), Some(children)) = (plan.adopter, plan.prepared_adopter_children.take())
-            && let Some(record) = self.tasks.get_mut(&key.id)
-        {
-            record.exit_publish_children(children);
-        }
-        if let (Some(key), Some(children)) =
-            (plan.autoreap_parent, plan.prepared_parent_children.take())
             && let Some(record) = self.tasks.get_mut(&key.id)
         {
             record.exit_publish_children(children);
@@ -594,13 +651,6 @@ impl<
 pub trait ExitRetiring {
     fn exit_key(&self) -> TaskKey;
 }
-#[derive(Debug)]
-pub struct ExitReceiptPublication<Retiring, Receipt> {
-    pub retiring: Retiring,
-    /// Keep an autoreaped resource receipt alive until the consumer releases
-    /// its graph guard; its retained numeric claim is a resource, not policy.
-    pub autoreaped_receipt: Option<Receipt>,
-}
 impl<
     C: Copy + Ord,
     L: ExitLive<C>,
@@ -613,14 +663,19 @@ impl<
     Failure: RegistryFailure,
 > ProcessRegistry<C, L, Z, R, Reservation, Retired, Group, Session, Failure>
 {
+    /// Terminal receipts remain in the authoritative population until resource
+    /// retirement. Autoreap removes them only through complete_exit_autoreap.
     pub fn publish_exit_receipt(
         &mut self,
         task: TaskKey,
-        plan: &PreparedExitTopology<L::Credit>,
-        receipt: Z,
+        plan: &mut PreparedExitTopology<L::Credit>,
+        mut receipt: Z,
         group: super::ProcessGroupId,
         session: super::SessionId,
-    ) -> Result<ExitReceiptPublication<R, Z>, ExitTopologyChanged> {
+    ) -> Result<R, ExitTopologyChanged>
+    where
+        Z: ExitZombiePublication<L::Credit>,
+    {
         if receipt.exit_key() != task
             || plan.task_revision.task != task
             || self
@@ -634,17 +689,63 @@ impl<
             .retiring_tasks
             .remove(&task.id)
             .ok_or(ExitTopologyChanged(task))?;
-        let autoreaped_receipt = if plan.autoreap_parent.is_some() {
-            self.remove_group_member(group, session, task);
-            Some(receipt)
-        } else {
-            self.zombies.insert(task.id, receipt);
-            None
-        };
-        Ok(ExitReceiptPublication {
-            retiring,
-            autoreaped_receipt,
-        })
+        if let Some(parent) = plan.autoreap_parent {
+            receipt.exit_publish_autoreap(DeferredAutoreap {
+                parent: plan
+                    .prepared_autoreap
+                    .take()
+                    .filter(|destination| destination.key() == Some(parent))
+                    .unwrap_or_else(|| {
+                        Failure::fail(super::registry::RegistryInvariant::AutoreapAccountingLost)
+                    }),
+                group,
+                session,
+            });
+        }
+        self.zombies.insert(task.id, receipt);
+        Ok(retiring)
+    }
+
+    /// Consume the admitted automatic removal only after exact MM retirement.
+    /// No CPU usage is charged to a reaper; the owned numeric claim is returned
+    /// for disposal outside the graph guard.
+    pub fn complete_exit_autoreap(
+        &mut self,
+        task: TaskKey,
+    ) -> Result<Option<Z>, ExitTopologyChanged>
+    where
+        L: ExitLivePublication<C>,
+        Z: ExitZombiePublication<L::Credit>,
+    {
+        let receipt = self
+            .zombies
+            .get(&task.id)
+            .filter(|receipt| receipt.exit_key() == task)
+            .ok_or(ExitTopologyChanged(task))?;
+        if !receipt.exit_is_autoreap() {
+            return Ok(None);
+        }
+        let mut receipt = self
+            .zombies
+            .remove(&task.id)
+            .ok_or(ExitTopologyChanged(task))?;
+        let accounting = receipt.exit_take_autoreap().unwrap_or_else(|| {
+            Failure::fail(super::registry::RegistryInvariant::AutoreapAccountingLost)
+        });
+        if receipt.exit_parent() != accounting.parent.key() {
+            Failure::fail(super::registry::RegistryInvariant::AutoreapAccountingLost);
+        }
+        if let AutoreapParent::Live { key, removal } = accounting.parent
+            && let Some(record) = self
+                .tasks
+                .get_mut(&key.id)
+                .filter(|record| record.wait_identity().key == key)
+        {
+            record.exit_forget_child(task);
+            record.exit_publish_credit(removal);
+        }
+        self.remove_group_member(accounting.group, accounting.session, task);
+        Ok(Some(receipt))
     }
 }
 

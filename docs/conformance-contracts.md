@@ -970,8 +970,13 @@ new fork against the retiring child's charged tables. Completion publishes
 readiness and selects the current receipt parent in one graph projection
 before notification/wakeup; an adopter owns the wake after reparenting. This adds one
 acquire read per examined terminal receipt and no polling, retries, wider
-stock, or wall-clock deadline. Admission itself drains reclaimable stock
-once through the existing stopped crossing.
+stock, or wall-clock deadline. Autoreaped children retain the same pending
+receipt, exact child edge and numeric claim. Each pending automatic removal
+owns one preadmitted parent revision credit; adoption replaces it with an
+admitted credit for the exact adopter. Retirement atomically removes that
+receipt and edge without charging CPU usage, before the existing channel
+wake. Dropping the exit publication leaves retirement pending. Admission itself
+drains reclaimable stock once through the existing stopped crossing.
 
 Every refusal is attributable in the run report's
 `execution_witness.fork_stock_families` (`capacity_refusal`, and for a
@@ -1030,6 +1035,14 @@ the second MM remains charged. Only the last completion may return errno
 the enrolled waiter exactly once; no observer publishes readiness. The
 VM-free binding `autoreap_keeps_wait_population_until_retirement` retains
 the child edge and numeric claim even if the exit lane is abandoned.
+`autoreap_completion_removes_only_the_retired_child` covers a new birth
+between retirement publications, exact removal and zero CPU charging;
+`pending_autoreap_moves_removal_credit_to_adopter` checks credit ownership
+and numeric-claim release after adoption. Mounted fork-rounds reuse covers
+normal waits, SA_NOCLDWAIT and SIG_IGN, each over twelve sequential rounds;
+the autoreap children attest successful private-page verification through
+the existing owned signal-wait protocol with a zero timeout, because their
+exit status is unavailable.
 
 `child_born_on_idle_peer_can_fault_and_retire_on_root_executor` forces a
 fork loan and commit on the idle peer, then places that queued newborn on

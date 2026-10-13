@@ -9,6 +9,28 @@
 .global _start
 .text
 _start:
+#ifdef AUTOREAP
+    lea action(%rip), %rsi
+    mov $17, %edi
+    xor %edx, %edx
+    mov $8, %r10d
+    mov $13, %eax
+    syscall
+    test %eax, %eax
+    jnz wait_fail
+    /* Existing in-zone signal-wait protocol; no host-forwarded child I/O. */
+    mov $14, %eax
+    mov $2, %edi
+    lea ack_mask(%rip), %rsi
+    xor %edx, %edx
+    mov $8, %r10d
+    syscall
+    test %eax, %eax
+    jnz wait_fail
+    mov $39, %eax
+    syscall
+    mov %rax, %rbp
+#endif
     xor %rbx, %rbx
 round:
     mov $57, %rax
@@ -19,16 +41,33 @@ round:
     jz child
     mov %rax, %r12
     sub $16, %rsp
+#ifdef AUTOREAP
+    mov $-1, %rdi
+#else
     mov %r12, %rdi
+#endif
     mov %rsp, %rsi
     xor %rdx, %rdx
     xor %r10, %r10
     mov $61, %rax
     syscall
+#ifdef AUTOREAP
+    cmp $-10, %rax
+    jne wait_fail
+    mov $128, %eax
+    lea ack_mask(%rip), %rdi
+    xor %esi, %esi
+    lea ack_timeout(%rip), %rdx
+    mov $8, %r10d
+    syscall
+    cmp $10, %rax
+    jne leaf_fail
+#else
     cmp %r12, %rax
     jne wait_fail
     cmpl $0, (%rsp)
     jne status_fail
+#endif
     add $16, %rsp
     inc %rbx
     cmp $12, %rbx
@@ -68,6 +107,15 @@ verify:
     add $4096, %r15
     cmp $16384, %r15
     jne verify
+#ifdef AUTOREAP
+    /* Exit status is unavailable: acknowledge verified private data in-zone. */
+    mov %rbp, %rdi
+    mov $10, %esi
+    mov $62, %eax
+    syscall
+    test %eax, %eax
+    jne leaf_fail
+#endif
     xor %rdi, %rdi
     jmp exit
 fork_fail:
@@ -90,3 +138,15 @@ exit:
     ud2
 .section .rodata
 ok: .ascii "R\n"
+
+#ifdef AUTOREAP
+.balign 8
+ack_mask: .quad 0x200
+ack_timeout: .quad 0, 0
+action:
+#ifdef IGNORE_SIGCHLD
+    .quad 1, 0, 0, 0
+#else
+    .quad 0, 2, 0, 0
+#endif
+#endif

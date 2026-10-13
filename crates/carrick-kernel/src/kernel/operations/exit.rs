@@ -133,15 +133,49 @@ impl carrick_sched_core::process::exit::ExitLivePublication<crate::kernel::conta
     fn exit_publish_children(&mut self, children: BTreeSet<TaskKey>) {
         self.task.publish_prepared_children(children);
     }
+    fn exit_forget_child(&mut self, child: TaskKey) {
+        self.task.remove_child(child);
+    }
     fn exit_publish_credit(&mut self, participant: PreparedExitParticipant) {
         self.revision = participant.publish(self.revision, |credit, current| {
             self.task.consume_reserved_revision(credit, current)
         });
     }
 }
-impl carrick_sched_core::process::exit::ExitZombiePublication for ZombieRecord {
+impl
+    carrick_sched_core::process::exit::ExitZombiePublication<
+        crate::kernel::revision_capacity::RevisionReservation,
+    > for ZombieRecord
+{
     fn exit_reparent(&mut self, parent: Option<TaskKey>) {
         self.zombie.parent = parent;
+    }
+    fn exit_publish_autoreap(
+        &mut self,
+        accounting: carrick_sched_core::process::exit::DeferredAutoreap<
+            crate::kernel::revision_capacity::RevisionReservation,
+        >,
+    ) {
+        self.autoreap = Some(accounting);
+    }
+    fn exit_reparent_autoreap(
+        &mut self,
+        parent: carrick_sched_core::process::exit::AutoreapParent<
+            crate::kernel::revision_capacity::RevisionReservation,
+        >,
+    ) {
+        if let Some(accounting) = &mut self.autoreap {
+            accounting.reparent(parent);
+        }
+    }
+    fn exit_take_autoreap(
+        &mut self,
+    ) -> Option<
+        carrick_sched_core::process::exit::DeferredAutoreap<
+            crate::kernel::revision_capacity::RevisionReservation,
+        >,
+    > {
+        self.autoreap.take()
     }
 }
 impl carrick_sched_core::process::exit::ExitRetiring for RetiringTaskRecord {
@@ -155,6 +189,9 @@ impl carrick_sched_core::process::exit::ExitZombie for ZombieRecord {
     }
     fn exit_key(&self) -> TaskKey {
         self.zombie.key
+    }
+    fn exit_is_autoreap(&self) -> bool {
+        self.autoreap.is_some()
     }
 }
 impl From<carrick_sched_core::process::exit::ExitError<KernelOperationError>>
@@ -874,27 +911,29 @@ impl Kernel {
                 // Include observers registered during the prepared clear;
                 // detach this exact generation before the zombie is visible.
                 let subscribers = kernel.exit_subscribers.take(prepared.task);
-                let carrick_sched_core::process::exit::ExitReceiptPublication {
-                    retiring,
-                    autoreaped_receipt: _autoreaped_receipt,
-                } = state
+                let (retiring, _autoreaped_receipt) = state
                     .publish_exit_receipt(
                         prepared.task,
-                        &prepared.topology,
+                        &mut prepared.topology,
                         ZombieRecord {
                             zombie: prepared.registry_zombie,
                             _task_claim: task_claim,
+                            autoreap: None,
                         },
                         task.process_group(),
                         task.session(),
                     )
+                    .and_then(|retiring| {
+                        // This closure runs after the host MM clear completes.
+                        let autoreaped_receipt = state.complete_exit_autoreap(prepared.task)?;
+                        Ok((retiring, autoreaped_receipt))
+                    })
                     .unwrap_or_else(|_| {
                         carrick_fatal!(
                             "kernel::task_exit_publication",
                             "retired task publication lost its exact incarnation"
                         );
                     });
-
                 drop(retiring);
                 let pending_publication = prepared.reservation.commit(&mut state)?;
                 drop(state);

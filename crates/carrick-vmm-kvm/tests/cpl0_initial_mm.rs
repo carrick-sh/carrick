@@ -157,6 +157,17 @@ fn run_until_wait_enrolled(
     tid: carrick_el1_abi::El1TaskId,
     peer: bool,
 ) {
+    run_until_wait_enrolled_with_boundary(cpu, task, factory, tid, peer, false);
+}
+
+fn run_until_wait_enrolled_with_boundary(
+    cpu: &mut carrick_vmm_kvm::cpl0_boot::ProductionCpuLease,
+    task: carrick_guest_arch::TaskIdentity,
+    factory: &carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory,
+    tid: carrick_el1_abi::El1TaskId,
+    peer: bool,
+    idle_boundary: bool,
+) {
     use carrick_hal::VcpuKick;
     use carrick_sched_core::Claim;
     use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
@@ -170,7 +181,14 @@ fn run_until_wait_enrolled(
                     .fixture_native_wait_state(tid)
                     .expect("native enrollment")
                     .0;
-                if matches!(claim, Claim::Parked { .. }) {
+                if matches!(claim, Claim::Parked { .. })
+                    && (!idle_boundary
+                        || factory
+                            .fixture_native_cpu_idle(carrick_guest_arch::CpuId::new(u32::from(
+                                peer,
+                            )))
+                            .expect("idle enrollment boundary"))
+                {
                     kick.kick();
                     return true;
                 }
@@ -362,13 +380,13 @@ fn native_autoreap_waits_for_every_mm(flags: &[&str]) {
     parent.cpu_mut().load(root).expect("load parent");
     run_to_marker(&mut parent, task, 1, &factory);
     factory
-        .fixture_place_native_thread(first_tid, carrick_guest_arch::CpuId::new(1))
+        .fixture_pin_native_thread(first_tid, carrick_guest_arch::CpuId::new(1))
         .expect("first child on peer");
     let first_retire = peer_retirement(&mut peer);
     // The parent forks successfully while its first child is retiring.
     run_to_marker(&mut parent, task, 2, &factory);
     factory
-        .fixture_place_native_thread(second_tid, carrick_guest_arch::CpuId::new(1))
+        .fixture_pin_native_thread(second_tid, carrick_guest_arch::CpuId::new(1))
         .expect("second child on peer");
     assert!(
         factory
@@ -376,12 +394,19 @@ fn native_autoreap_waits_for_every_mm(flags: &[&str]) {
             .expect("fork evidence")
             .is_none()
     );
-    run_until_wait_enrolled(&mut parent, task, &factory, root_tid, false);
+    run_until_wait_enrolled_with_boundary(&mut parent, task, &factory, root_tid, false, true);
     let (claim, _, wakes) = factory
         .fixture_native_wait_state(root_tid)
         .expect("first wait");
     assert_eq!(claim, Claim::Parked { seq: 1 });
     assert_eq!(wakes, 0, "pending MM cannot wake wait");
+    assert!(matches!(
+        factory
+            .fixture_native_wait_state(second_tid)
+            .expect("peer-bound second child")
+            .0,
+        Claim::Queued { slot, .. } if slot == carrick_sched_core::SlotId::new(1)
+    ));
     assert!(
         peer.service_idle_peer_doorbell(&first_retire)
             .expect("first MM retirement")
@@ -395,7 +420,7 @@ fn native_autoreap_waits_for_every_mm(flags: &[&str]) {
     assert_eq!(wakes, 1);
     // A wake for the first child is insufficient: wait(-1) must enroll again
     // instead of returning ECHILD while the second child's MM is still charged.
-    run_until_wait_enrolled(&mut parent, task, &factory, root_tid, false);
+    run_until_wait_enrolled_with_boundary(&mut parent, task, &factory, root_tid, false, true);
     let (claim, _, wakes) = factory
         .fixture_native_wait_state(root_tid)
         .expect("remaining child");
@@ -406,7 +431,8 @@ fn native_autoreap_waits_for_every_mm(flags: &[&str]) {
             .expect("last MM retirement")
             .is_none()
     );
-    // Observe the real completion wake and stop the peer after publication.
+    // Stop only after the exit lane reaches idle, including its real wake IPI.
+    // A queued claim alone precedes finish_wake and is not a safe stop boundary.
     // Neither observer changes the wait population or publishes a wake.
     let kick = carrick_vmm_kvm::KvmKickHandle::for_current_thread();
     let stopped = std::sync::atomic::AtomicBool::new(false);
@@ -417,7 +443,12 @@ fn native_autoreap_waits_for_every_mm(flags: &[&str]) {
                 let (claim, _, wakes) = factory
                     .fixture_native_wait_state(root_tid)
                     .expect("completion census");
-                if matches!(claim, Claim::Queued { .. }) && wakes == 2 {
+                if matches!(claim, Claim::Queued { .. })
+                    && wakes == 2
+                    && factory
+                        .fixture_native_cpu_idle(carrick_guest_arch::CpuId::new(1))
+                        .expect("completed exit boundary")
+                {
                     kick.kick();
                     return true;
                 }

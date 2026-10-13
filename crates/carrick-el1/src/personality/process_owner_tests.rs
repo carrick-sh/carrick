@@ -170,7 +170,7 @@ type Task = GuestTask<(), Uid, Native>;
 struct Published {
     effects: ReadyExitEffects<Member>,
     _retiring: GuestRetiring<Native>,
-    autoreaped_receipt: Option<GuestZombie<(), Uid, Claim>>,
+    autoreaped_receipt: Option<GuestZombie<(), Uid, Claim, Credit>>,
 }
 fn key(id: i32, serial: u64) -> TaskKey {
     TaskKey {
@@ -292,11 +292,11 @@ fn exit(owner: &mut Owner, task: TaskKey, adopter: Option<TaskKey>) -> Published
         .unwrap()
         .publish()
         .unwrap();
-    published.retirement.publish();
+    let autoreaped_receipt = owner.publish_exit_retirement(published.retirement);
     Published {
         effects: published.effects,
         _retiring: published.retiring,
-        autoreaped_receipt: published.autoreaped_receipt,
+        autoreaped_receipt,
     }
 }
 fn query(target: WaitTarget) -> WaitQuery {
@@ -1073,7 +1073,7 @@ fn entry_exit_returns_resources_and_cancel_effects_before_native_service() {
     assert!(Rc::ptr_eq(&resources.unwrap(), &work));
     assert_eq!(work.signal_reads.get(), 0);
     assert!(owner.task(child).is_err());
-    published.retirement.publish();
+    drop(owner.publish_exit_retirement(published.retirement));
     assert!(matches!(
         owner
             .scan_wait(parent, query(WaitTarget::Exact(child)))
@@ -1081,7 +1081,6 @@ fn entry_exit_returns_resources_and_cancel_effects_before_native_service() {
         WaitSelection::Exited(_)
     ));
     drop(published.retiring);
-    drop(published.autoreaped_receipt);
 }
 
 impl<C: ProcessContext> super::super::native_process_custody::ProcessResources for Native<C> {
@@ -1169,9 +1168,9 @@ fn entry_adapter_uses_retained_primitive_custody_through_fork_exit_wait() {
     )
     .unwrap();
     assert!(resources.is_some());
-    effects.retirement.publish();
+    drop(owner.publish_exit_retirement(effects.retirement));
     drop(effects.retiring);
-    drop(effects.autoreaped_receipt);
+
     let WaitWork::Status(status) = scan_wait(&owner, parent, query(WaitTarget::Any)).unwrap()
     else {
         panic!("status")
@@ -1521,7 +1520,7 @@ fn exit_status_is_not_waitable_before_mm_retirement_completes() {
         ),
         "exit receipt became waitable before the child's MM stock was retired"
     );
-    published.retirement.publish();
+    drop(owner.publish_exit_retirement(published.retirement));
     assert!(matches!(
         owner
             .scan_wait(parent, query(WaitTarget::Exact(child)))
@@ -1529,7 +1528,6 @@ fn exit_status_is_not_waitable_before_mm_retirement_completes() {
         WaitSelection::Exited(_)
     ));
     drop(published.retiring);
-    drop(published.autoreaped_receipt);
 }
 
 #[test]
@@ -1568,6 +1566,119 @@ fn autoreap_keeps_wait_population_until_retirement() {
 }
 
 #[test]
+fn autoreap_completion_removes_only_the_retired_child() {
+    use super::super::native_process_entry::publish_exit;
+    let mut owner = owner();
+    let parent = key(1, 1);
+    let first = key(2, 2);
+    let second = key(3, 3);
+    owner.task_mut(parent).unwrap().native_mut().autoreap = true;
+    let first_releases = Rc::new(Cell::new(0));
+    let second_releases = Rc::new(Cell::new(0));
+    birth(&mut owner, parent, first, first_releases.clone());
+    let (_, pending_first) = publish_exit(
+        &mut owner,
+        first,
+        None,
+        Transaction(99),
+        LinuxWaitStatus::from_wait_encoding(19 << 8),
+    )
+    .unwrap();
+    // Parent revisions and child admission remain live during retirement.
+    birth(&mut owner, parent, second, second_releases.clone());
+    let (_, pending_second) = publish_exit(
+        &mut owner,
+        second,
+        None,
+        Transaction(100),
+        LinuxWaitStatus::from_wait_encoding(20 << 8),
+    )
+    .unwrap();
+    let first_receipt = owner
+        .publish_exit_retirement(pending_first.retirement)
+        .unwrap();
+    assert_eq!(first_receipt.receipt.key, first);
+    assert!(matches!(
+        owner.scan_wait(parent, query(WaitTarget::Any)).unwrap(),
+        WaitSelection::StillRunning(_)
+    ));
+    assert_eq!(
+        owner.task(parent).unwrap().children(),
+        &BTreeSet::from([second])
+    );
+    assert_eq!(first_releases.get(), 0);
+    drop(first_receipt);
+    assert_eq!(first_releases.get(), 1);
+    assert_eq!(second_releases.get(), 0);
+    drop(owner.publish_exit_retirement(pending_second.retirement));
+    assert_eq!(second_releases.get(), 1);
+    assert!(matches!(
+        owner.scan_wait(parent, query(WaitTarget::Any)).unwrap(),
+        WaitSelection::NoChild
+    ));
+    assert_eq!(
+        owner.task(parent).unwrap().children_rusage(),
+        TaskRusage::default()
+    );
+    assert_eq!(
+        owner.task(parent).unwrap().native().budget.reserved.get(),
+        0
+    );
+}
+
+#[test]
+fn pending_autoreap_moves_removal_credit_to_adopter() {
+    use super::super::native_process_entry::publish_exit;
+    let mut owner = owner();
+    let root = key(1, 1);
+    let parent = key(2, 2);
+    let child = key(3, 3);
+    birth(&mut owner, root, parent, Rc::new(Cell::new(0)));
+    owner.task_mut(parent).unwrap().native_mut().autoreap = true;
+    let old_budget = owner.task(parent).unwrap().native().budget.clone();
+    let releases = Rc::new(Cell::new(0));
+    birth(&mut owner, parent, child, releases.clone());
+    let (_, pending) = publish_exit(
+        &mut owner,
+        child,
+        None,
+        Transaction(101),
+        LinuxWaitStatus::from_wait_encoding(19 << 8),
+    )
+    .unwrap();
+    let permit = pending.effects.cancel_members(Member::cancel);
+    let parent_exit = exit(&mut owner, parent, None);
+    parent_exit.effects.cancel_members(Member::cancel);
+    assert_eq!(
+        old_budget.reserved.get(),
+        0,
+        "old parent owns no removal headroom"
+    );
+    assert_eq!(
+        owner.select_exit_parent(&permit).unwrap().prepare().parent,
+        root
+    );
+    assert!(matches!(
+        owner
+            .scan_wait(root, query(WaitTarget::Exact(child)))
+            .unwrap(),
+        WaitSelection::StillRunning(_)
+    ));
+    let receipt = owner.publish_exit_retirement(pending.retirement).unwrap();
+    assert_eq!(receipt.receipt.parent, Some(root));
+    assert!(!owner.task(root).unwrap().children().contains(&child));
+    assert_eq!(owner.task(root).unwrap().native().budget.reserved.get(), 0);
+    assert!(matches!(
+        owner
+            .scan_wait(root, query(WaitTarget::Exact(child)))
+            .unwrap(),
+        WaitSelection::NoChild
+    ));
+    drop(receipt);
+    assert_eq!(releases.get(), 1);
+}
+
+#[test]
 fn pending_exit_retirement_survives_reparenting_without_early_reap() {
     use super::super::native_process_entry::publish_exit;
     let mut owner = owner();
@@ -1595,7 +1706,7 @@ fn pending_exit_retirement_survives_reparenting_without_early_reap() {
         WaitSelection::StillRunning(_)
     ));
     assert_eq!(releases.get(), 0);
-    pending.retirement.publish();
+    drop(owner.publish_exit_retirement(pending.retirement));
     let reaped = owner
         .consume_wait(root, query(WaitTarget::Exact(child)))
         .unwrap();
@@ -1624,7 +1735,7 @@ fn retirement_completion_notifies_the_adopter_of_a_pending_zombie() {
     let child_permit = pending.effects.cancel_members(Member::cancel);
     let parent_exit = exit(&mut owner, parent, None);
     parent_exit.effects.cancel_members(Member::cancel);
-    pending.retirement.publish();
+    drop(owner.publish_exit_retirement(pending.retirement));
     let target = owner
         .select_exit_parent(&child_permit)
         .expect("pending retirement must notify the current adopter");
