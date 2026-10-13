@@ -724,7 +724,20 @@ owner. Before invoking native fork, wait4 or exit_group custody, the pending
 family must authenticate task, task generation, MM and thread generation.
 A mismatch invokes zero native effects. A matching entry invokes its one
 native operation; native custody returns a LifecycleOutcome, never publishes
-a second completion. Existing ARM consumers supply no process venue.
+a second completion. ARM native process returns and the host-published getpid
+projection cross the existing completed-with-work boundary. The host consumes
+one `SyscallCompletionToken` and publishes the actual return through
+`publish_return`; it never replays the already served call. Admission refusals
+that return errno use the same completed boundary. Suspended and terminal
+transfers do not invent a syscall return.
+
+The VM-free runtime witness `owned_arm_process_return_is_observed_once` binds
+ARM getpid with and without a process venue, native fork/wait success and errno,
+and unported process-call refusals. Each returning call records exactly one
+audit return and one engine completion, with at most one native effect; a
+second completion is refused. Boundary publication and consumption are constant
+work. EL1's `refused_owned_process_return_retains_one_completed_boundary` also
+binds the pre-dispatch refusal transport.
 
 The VM-free `process_native_hooks_require_every_execution_identity_component`
 test independently changes each binding component and checks all three hooks.

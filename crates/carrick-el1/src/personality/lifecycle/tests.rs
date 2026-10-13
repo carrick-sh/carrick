@@ -249,9 +249,14 @@ fn getpid_uses_each_live_process_owner_published_projection() {
     second.task().publish_visible_pid(73);
     for (world, expected) in [(&mut first, 41), (&mut second, 73)] {
         let (action, frame) = world.syscall(172, &[]);
-        assert_eq!(action, Action::Served);
+        assert_eq!(action, Action::ServedWithWork);
         assert_eq!(frame.x[0], expected);
         assert_eq!(world.forwarded(172), 0);
+        assert_eq!(
+            world.task().linux.take_served_boundary(),
+            Some(carrick_el1_abi::ServedBoundary::Completed)
+        );
+        assert_eq!(world.task().linux.take_served_boundary(), None);
     }
 }
 
@@ -1867,9 +1872,14 @@ fn set_tid_address_arm_child_registers_the_word_that_exit_clears_and_wakes() {
     );
     assert!(matches!(
         route,
-        carrick_personality_linux::dispatch::CompletionRoute::Served
+        carrick_personality_linux::dispatch::CompletionRoute::WithWork
     ));
     assert_eq!(frame.x[0], u64::from(CHILD_VISIBLE));
+    assert_eq!(
+        w.task().linux.take_served_boundary(),
+        Some(carrick_el1_abi::ServedBoundary::Completed)
+    );
+    assert_eq!(w.task().linux.take_served_boundary(), None);
     assert_eq!(w.venue.child_slot(0).clear_child_tid(), addr(&*word));
     assert_eq!(w.call(&mut frame, SYS_EXIT, &[0]), Action::Served);
     assert_eq!(*word, 0);

@@ -7081,6 +7081,220 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn owned_arm_process_return_is_observed_once() {
+        use carrick_el1::personality::lifecycle::{
+            LifecycleOutcome, LinuxWaitOptions, ProcessNative, ProcessWaitPid,
+        };
+        use carrick_guest_arch::UserVa;
+        use carrick_personality_linux::abi::entry::SyscallResult;
+        use std::sync::atomic::Ordering;
+
+        struct NoCpu;
+        impl carrick_el1::sched::ThreadCpu for NoCpu {
+            fn save(
+                &mut self,
+                _: &carrick_el1_abi::TrapFrame,
+                _: &mut carrick_el1_abi::Aarch64ParkedContext,
+            ) {
+                panic!("no scheduler venue")
+            }
+            fn load(
+                &mut self,
+                _: &mut carrick_el1_abi::TrapFrame,
+                _: &carrick_el1_abi::Aarch64ParkedContext,
+            ) {
+                panic!("no scheduler venue")
+            }
+            fn set_translation(&mut self, _: u64, _: u64) {
+                panic!("no scheduler venue")
+            }
+            fn invalidate_asid(&mut self, _: u64) {
+                panic!("no scheduler venue")
+            }
+            fn now(&self) -> u64 {
+                panic!("no scheduler venue")
+            }
+            fn freq(&self) -> u64 {
+                panic!("no scheduler venue")
+            }
+            fn set_timer(&mut self, _: Option<u64>) {
+                panic!("no scheduler venue")
+            }
+            fn send_sgi(&mut self, _: u64) {
+                panic!("no scheduler venue")
+            }
+            fn ack_irq(&mut self) -> u32 {
+                panic!("no scheduler venue")
+            }
+            fn end_irq(&mut self, _: u32) {
+                panic!("no scheduler venue")
+            }
+            fn wait_for_interrupt(&mut self) {
+                panic!("no scheduler venue")
+            }
+            fn spin(&mut self) {
+                panic!("no scheduler venue")
+            }
+            fn own_sgi_target(&self) -> u64 {
+                panic!("no scheduler venue")
+            }
+        }
+        struct Venue;
+        impl carrick_el1::personality::lifecycle::LifecycleVenue for Venue {
+            fn thread<'a>(
+                &'a self,
+                _: &'a carrick_el1_abi::CurrentTask,
+            ) -> Option<carrick_el1::personality::lifecycle::LifecycleThread<'a>> {
+                None
+            }
+            fn born_slot(
+                &self,
+                _: &carrick_el1_abi::ThreadLifecyclePage,
+                _: carrick_el1_abi::EntryRef,
+            ) -> Option<&carrick_el1_abi::ThreadControlSlot> {
+                None
+            }
+        }
+        struct Owner {
+            binding: carrick_el1_abi::ExecutionBinding,
+            result: i64,
+            calls: usize,
+        }
+        impl ProcessNative<carrick_el1_abi::Aarch64ParkedContext> for Owner {
+            fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
+                self.binding
+            }
+            fn fork(&mut self) -> LifecycleOutcome {
+                self.calls += 1;
+                LifecycleOutcome::Returned {
+                    result: SyscallResult::new(self.result),
+                    work: false,
+                }
+            }
+            fn wait4(
+                &mut self,
+                _: ProcessWaitPid,
+                _: UserVa,
+                _: LinuxWaitOptions,
+                _: UserVa,
+            ) -> LifecycleOutcome {
+                self.fork()
+            }
+            fn exit_group(&mut self, _: u8) -> LifecycleOutcome {
+                panic!("a terminal call does not return")
+            }
+        }
+
+        // Include the ordinary lifecycle route as well as native fork/wait
+        // success and errno returns. No VM, global aperture or replay is used.
+        for (number, value, owned, effects) in [
+            (172, 1, true, 0),
+            (172, 1, false, 0),
+            (220, 42, true, 1),
+            (220, -11, true, 1),
+            (260, 42, true, 1),
+            (260, -10, true, 1),
+            (435, -38, true, 0),
+            (95, -38, true, 0),
+        ] {
+            let audit = Arc::new(carrick_kernel::observe::AuditObserver::new());
+            let mut dispatcher = SyscallDispatcher::new();
+            dispatcher.install_observer(audit.clone());
+            let (kernel, context, mut state) = typed_completion_fixture(72_497, dispatcher);
+            let task = carrick_el1_abi::CurrentTask::new();
+            task.set(carrick_el1_abi::El1TaskId::from_linux_tid(72_497), 11, 5);
+            task.mm.key.store(7, Ordering::Relaxed);
+            task.mm.thread_generation.store(13, Ordering::Relaxed);
+            task.publish_visible_pid(1);
+            let mut owner = Owner {
+                binding: carrick_el1::personality::common_entry::execution_binding(&task),
+                result: value,
+                calls: 0,
+            };
+            let mut frame = carrick_el1_abi::TrapFrame::default();
+            frame.x[8] = number;
+            frame.x[0] = if number == 220 { 17 } else { 0xfeed };
+            let args = carrick_kernel::compat::SyscallArgs::from([frame.x[0], 0, 0, 0, 0, 0]);
+            let syscall = PreparedSyscall {
+                request: SyscallRequest::new(number, args),
+                original_args: args,
+            };
+            state.syscall_completion =
+                SyscallCompletionOwnership::Guest(SyscallCompletionToken::new(
+                    syscall,
+                    context.retain_exact(),
+                    kernel.dispatcher.observers().cloned(),
+                ));
+            let route = carrick_el1::dispatch_syscall_with_native::<
+                _,
+                NoCpu,
+                carrick_el1::sched::HardwareUserWord,
+                _,
+                carrick_el1_abi::Aarch64ParkedContext,
+            >(
+                &mut frame,
+                &carrick_el1_abi::Counters::default(),
+                std::slice::from_ref(&task),
+                &[],
+                &[],
+                &[],
+                &[],
+                &carrick_el1_abi::InotifyNameCache::new(),
+                None,
+                None,
+                Some(&Venue),
+                owned.then_some(&mut owner as &mut dyn ProcessNative<_>),
+                None,
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            let mut engine = CrashCaptureTestEngine::default();
+            if route == carrick_personality_linux::dispatch::CompletionRoute::WithWork {
+                assert_eq!(
+                    task.linux.take_served_boundary(),
+                    Some(carrick_el1_abi::ServedBoundary::Completed)
+                );
+                assert_eq!(task.linux.orig_arg0.load(Ordering::Relaxed), args.0[0]);
+                state
+                    .complete_returned(&mut engine, &kernel.reporter, frame.x[0] as i64)
+                    .unwrap();
+            }
+            let returns: Vec<_> = audit
+                .events()
+                .into_iter()
+                .filter_map(|event| match event {
+                    carrick_kernel::observe::AuditEvent::SyscallReturn {
+                        syscall_number,
+                        outcome,
+                        ..
+                    } => Some((syscall_number, outcome.value)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                returns.len(),
+                1,
+                "expected exactly one return event for owned ARM syscall {number}, route={route:?}"
+            );
+            assert_eq!(returns[0].1, value);
+            assert_eq!(returns[0].0, number);
+            assert_eq!(owner.calls, effects, "native effect must run exactly once");
+            assert_eq!(engine.completed_syscalls, vec![value]);
+            assert_eq!(task.linux.take_served_boundary(), None);
+            assert!(
+                state
+                    .complete_returned(&mut engine, &kernel.reporter, value)
+                    .is_err()
+            );
+            assert_eq!(
+                kernel.reporter.snapshot().summary.syscall_returns_ok
+                    + kernel.reporter.snapshot().summary.syscall_returns_errno,
+                1
+            );
+        }
+    }
+
+    #[test]
     fn el1_served_with_work_maps_negative_result_to_errno_outcome() {
         let (kernel, context, mut state) =
             typed_completion_fixture(72_498, SyscallDispatcher::new());
