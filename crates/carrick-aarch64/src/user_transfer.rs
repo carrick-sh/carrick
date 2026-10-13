@@ -383,7 +383,7 @@ impl OwnedUserTransfer {
                 len,
                 intent,
             } => {
-                if intent == PortalTransferIntent::UserWrite {
+                if intent.is_write() {
                     return None;
                 }
                 (address, intent, vec![0; len])

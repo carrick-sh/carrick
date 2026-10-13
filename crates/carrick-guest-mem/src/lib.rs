@@ -589,6 +589,20 @@ pub trait GuestMemory {
         self.read_bytes_raw(range.address(), range.len() as usize)
     }
 
+    /// Publish a named per-MM kernel identity window, never a user buffer.
+    /// Admitted owners must implement exact live owner authorization; absence
+    /// of an implementation cannot fall back to legacy host backing.
+    fn write_carrick_identity(
+        &mut self,
+        range: carrick_el1_abi::CarrickIdentityWriteRange,
+        bytes: &[u8],
+    ) -> Result<(), MemoryError> {
+        if range.len() != bytes.len() as u64 || self.user_memory_venue() == UserMemoryVenue::Owner {
+            return Err(MemoryError::Unsupported);
+        }
+        self.write_bytes_unchecked(range.address(), bytes)
+    }
+
     /// Check the legacy inaccessible-range gate, then delegate to the concrete
     /// access venue. Owner implementations authorize even raw reads through
     /// EL1, so an absent legacy mirror cannot bypass owner permissions.

@@ -488,11 +488,21 @@ impl<
         if root.pending().is_some() {
             return Err(pending.map_or(MmError::Busy, MmError::Wait));
         }
-        if continuation.intent == TransferIntent::CarrickInternalRead {
+        if continuation.intent.is_internal() {
             // Only named Carrick control windows bypass user-VMA permission
             // selection. Live translation and exact owner validation still apply.
-            if !Geometry::authorizes_internal_read(continuation.address().raw(), continuation.len())
-            {
+            let authorized = match continuation.intent {
+                TransferIntent::CarrickInternalRead => Geometry::authorizes_internal_read(
+                    continuation.address().raw(),
+                    continuation.len(),
+                ),
+                TransferIntent::CarrickIdentityWrite => Geometry::authorizes_identity_write(
+                    continuation.address().raw(),
+                    continuation.len(),
+                ),
+                _ => false,
+            };
+            if !authorized {
                 return Err(MmError::Fault);
             }
         } else {
@@ -553,7 +563,7 @@ impl<
             result => result?,
         };
         let access = match continuation.intent {
-            TransferIntent::UserWrite => LeafAccess::Write,
+            TransferIntent::UserWrite | TransferIntent::CarrickIdentityWrite => LeafAccess::Write,
             TransferIntent::ReadInstruction => LeafAccess::Execute,
             _ => LeafAccess::Read,
         };
@@ -667,7 +677,7 @@ impl<
                     root_generation: NonZeroU64::new(generation).ok_or(MmError::Stale)?,
                     offset: continuation.offset(),
                     ipa,
-                    executable: continuation.intent == TransferIntent::UserWrite && executable,
+                    executable: continuation.intent.is_write() && executable,
                 },
                 PortalByteRange::new(va, len).ok_or(MmError::Invalid)?,
                 continuation.fork_sequence(),
@@ -707,7 +717,7 @@ impl<
             result => result?,
         };
         let access = match continuation.intent {
-            TransferIntent::UserWrite => LeafAccess::Write,
+            TransferIntent::UserWrite | TransferIntent::CarrickIdentityWrite => LeafAccess::Write,
             TransferIntent::ReadInstruction => LeafAccess::Execute,
             _ => LeafAccess::Read,
         };
@@ -750,15 +760,9 @@ fn translated<B: OwnerMmu, W: LiveDescriptorWords + ?Sized>(
     access: LeafAccess,
     intent: TransferIntent,
 ) -> Result<Option<(u64, bool)>, MmError> {
-    B::translate(
-        words,
-        root,
-        UserVa::new(va),
-        access,
-        intent != TransferIntent::CarrickInternalRead,
-    )
-    .map(|leaf| leaf.map(|leaf| (leaf.output.raw(), leaf.executable)))
-    .map_err(mmu_error)
+    B::translate(words, root, UserVa::new(va), access, !intent.is_internal())
+        .map(|leaf| leaf.map(|leaf| (leaf.output.raw(), leaf.executable)))
+        .map_err(mmu_error)
 }
 
 /// PREPARE finishes all fault/supply work and authenticates physical custody

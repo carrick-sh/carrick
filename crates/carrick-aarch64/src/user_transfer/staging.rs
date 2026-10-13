@@ -10,10 +10,16 @@ pub fn prepare_write<'a, V: Aarch64Vmm, C: TransferCustody + ?Sized>(
     slots: &'a MmPortalSlots,
     target: TransferTarget,
     ranges: &[GuestWriteRange],
+    intent: PortalTransferIntent,
 ) -> Result<Box<dyn PreparedGuestWrite + 'a>, MemoryPrepareError>
 where
     C::Pin: 'a,
 {
+    if !intent.is_write() {
+        return Err(MemoryPrepareError::Fault(
+            carrick_guest_mem::MemoryError::Unsupported,
+        ));
+    }
     let bounded =
         carrick_guest_mem::PreparedStreamRanges::new(ranges).map_err(MemoryPrepareError::Limit)?;
     let ranges = bounded.ranges();
@@ -26,16 +32,7 @@ where
                 .min(carrick_el1_abi::MM_PORTAL_MAX_BYTES as usize - (va as usize & 4095));
             pages.push(
                 stage_page(
-                    engine,
-                    custody,
-                    slots,
-                    target,
-                    va,
-                    len,
-                    output,
-                    offset,
-                    PortalTransferIntent::UserWrite,
-                    None,
+                    engine, custody, slots, target, va, len, output, offset, intent, None,
                 )
                 .map_err(|error| {
                     MemoryPrepareError::Fault(carrick_guest_mem::MemoryError::HostMap(

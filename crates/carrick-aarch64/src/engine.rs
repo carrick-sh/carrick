@@ -3476,23 +3476,41 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         }
     }
     fn write_owner_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        self.write_owner_bytes_with_intent(
+            address,
+            bytes,
+            carrick_el1_abi::PortalTransferIntent::UserWrite,
+        )
+    }
+    fn write_owner_bytes_with_intent(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+        intent: carrick_el1_abi::PortalTransferIntent,
+    ) -> Result<(), MemoryError> {
         let range = carrick_guest_mem::GuestWriteRange::new(GuestVa(address), bytes.len()).ok_or(
             MemoryError::OutOfBounds {
                 address,
                 length: bytes.len(),
             },
         )?;
-        let prepared = self.prepare_write(&[range]).map_err(|error| match error {
-            carrick_guest_mem::MemoryPrepareError::Limit(limit) => MemoryError::HostMap(format!(
-                "write requires bounded prepare before consumption: {limit:?}"
-            )),
-            carrick_guest_mem::MemoryPrepareError::Fault(error) => error,
-            carrick_guest_mem::MemoryPrepareError::Physical(wait) => MemoryError::Physical(wait),
-            carrick_guest_mem::MemoryPrepareError::OwnerWait(wait) => MemoryError::OwnerWait(wait),
-            carrick_guest_mem::MemoryPrepareError::Supply(supply) => {
-                MemoryError::Supply(Box::new(supply))
-            }
-        })?;
+        let prepared = self
+            .prepare_owner_write(&[range], intent)
+            .map_err(|error| match error {
+                carrick_guest_mem::MemoryPrepareError::Limit(limit) => MemoryError::HostMap(
+                    format!("write requires bounded prepare before consumption: {limit:?}"),
+                ),
+                carrick_guest_mem::MemoryPrepareError::Fault(error) => error,
+                carrick_guest_mem::MemoryPrepareError::Physical(wait) => {
+                    MemoryError::Physical(wait)
+                }
+                carrick_guest_mem::MemoryPrepareError::OwnerWait(wait) => {
+                    MemoryError::OwnerWait(wait)
+                }
+                carrick_guest_mem::MemoryPrepareError::Supply(supply) => {
+                    MemoryError::Supply(Box::new(supply))
+                }
+            })?;
         prepared.commit(&[bytes]);
         Ok(())
     }
@@ -3500,6 +3518,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     fn prepare_owner_write(
         &self,
         ranges: &[carrick_guest_mem::GuestWriteRange],
+        intent: carrick_el1_abi::PortalTransferIntent,
     ) -> Result<
         Box<dyn carrick_guest_mem::PreparedGuestWrite + '_>,
         carrick_guest_mem::MemoryPrepareError,
@@ -3546,7 +3565,14 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             0,
             carrick_el1_abi::MM_PORTAL_MAX_BYTES,
         );
-        match crate::user_transfer::prepare_write(self, custody.as_ref(), slots, target, ranges) {
+        match crate::user_transfer::prepare_write(
+            self,
+            custody.as_ref(),
+            slots,
+            target,
+            ranges,
+            intent,
+        ) {
             Err(MemoryPrepareError::Supply(request)) => {
                 let kind = match request {
                     carrick_guest_mem::MemorySupplyRequest::Grant(_) => 1,
@@ -3663,6 +3689,24 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             self.read_bytes_raw(range.address(), range.len() as usize)
         }
     }
+    fn write_carrick_identity(
+        &mut self,
+        range: carrick_el1_abi::CarrickIdentityWriteRange,
+        bytes: &[u8],
+    ) -> Result<(), MemoryError> {
+        if range.len() != bytes.len() as u64 {
+            return Err(MemoryError::Unsupported);
+        }
+        if self.protections.owner().is_some() {
+            self.write_owner_bytes_with_intent(
+                range.address(),
+                bytes,
+                carrick_el1_abi::PortalTransferIntent::CarrickIdentityWrite,
+            )
+        } else {
+            self.write_bytes_unchecked(range.address(), bytes)
+        }
+    }
     fn resume_read(
         &self,
         continuation: carrick_guest_mem::OwnedReadContinuation,
@@ -3720,7 +3764,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         Box<dyn carrick_guest_mem::PreparedGuestWrite + '_>,
         carrick_guest_mem::MemoryPrepareError,
     > {
-        self.prepare_owner_write(ranges)
+        self.prepare_owner_write(ranges, carrick_el1_abi::PortalTransferIntent::UserWrite)
     }
 
     fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {

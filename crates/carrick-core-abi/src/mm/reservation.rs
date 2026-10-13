@@ -402,6 +402,9 @@ pub trait ReservationGeometry {
     const BOOTSTRAP_BASE: u64;
     const BOOTSTRAP_SIZE: u64;
     fn authorizes_internal_read(address: u64, len: u64) -> bool;
+    fn authorizes_identity_write(_address: u64, _len: u64) -> bool {
+        false
+    }
 }
 
 /// The Linux client interprets the neutral node; core owns its storage and work.
