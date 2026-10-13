@@ -198,10 +198,30 @@ impl Tree {
 
 // Require complete owned records AND every anchored object in the queried
 // subtree. An empty census cannot conceal a path swapped during lsof's walk.
-fn idle_fields(code: Option<i32>, stdout: &[u8], stderr: &[u8], handles: &CensusHandles) -> bool {
-    if !matches!(code, Some(0 | 1)) || !stderr.is_empty() || stdout.is_empty() || handles.is_empty()
-    {
-        return false;
+fn census_reason(
+    code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+    handles: &CensusHandles,
+) -> Option<String> {
+    let status = code.map_or_else(|| "signal".to_owned(), |c| c.to_string());
+    if !stderr.is_empty() {
+        let line = String::from_utf8_lossy(stderr)
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        return Some(format!("lsof exit {status}, stderr: {line}"));
+    }
+    if !matches!(code, Some(0 | 1)) {
+        return Some(format!("lsof exit {status}"));
+    }
+    if handles.is_empty() {
+        return Some("no anchored handles".into());
+    }
+    if stdout.is_empty() {
+        return Some(format!("lsof exit {status}, empty stdout"));
     }
     let mut processes = BTreeSet::new();
     let mut seen = BTreeSet::new();
@@ -209,28 +229,34 @@ fn idle_fields(code: Option<i32>, stdout: &[u8], stderr: &[u8], handles: &Census
     let mut descriptor = None;
     let mut named = false;
     let Some(records) = stdout.strip_suffix(b"\n") else {
-        return false;
+        let tail = String::from_utf8_lossy(stdout)
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .to_owned();
+        return Some(format!("unmatched record: {tail}"));
     };
     for field in records.split(|b| *b == b'\n') {
+        let raw = || format!("unmatched record: {}", String::from_utf8_lossy(field));
         let Some((&tag, value)) = field.split_first() else {
-            return false;
+            return Some(raw());
         };
         match tag {
             b'p' => {
                 if pid.is_some() && (descriptor.is_none() || !named) {
-                    return false;
+                    return Some(raw());
                 }
                 let Ok(value) = std::str::from_utf8(value) else {
-                    return false;
+                    return Some(raw());
                 };
                 let Ok(process) = value.parse::<u32>() else {
-                    return false;
+                    return Some(raw());
                 };
                 if process != std::process::id()
                     || value != process.to_string()
                     || !processes.insert(process)
                 {
-                    return false;
+                    return Some(raw());
                 }
                 pid = Some(process);
                 descriptor = None;
@@ -238,37 +264,50 @@ fn idle_fields(code: Option<i32>, stdout: &[u8], stderr: &[u8], handles: &Census
             }
             b'f' => {
                 if pid.is_none() || (descriptor.is_some() && !named) {
-                    return false;
+                    return Some(raw());
                 }
                 let Ok(value) = std::str::from_utf8(value) else {
-                    return false;
+                    return Some(raw());
                 };
                 let Ok(fd) = value.parse::<i32>() else {
-                    return false;
+                    return Some(raw());
                 };
                 if value != fd.to_string() || !handles.contains_key(&fd) || !seen.insert(fd) {
-                    return false;
+                    return Some(raw());
                 }
                 descriptor = Some(fd);
                 named = false;
             }
             b'n' => {
                 let Some(fd) = descriptor else {
-                    return false;
+                    return Some(raw());
                 };
                 if named
                     || handles
                         .get(&fd)
                         .is_none_or(|path| path.as_os_str().as_bytes() != value)
                 {
-                    return false;
+                    return Some(raw());
                 }
                 named = true;
             }
-            _ => return false,
+            _ => return Some(raw()),
         }
     }
-    named && seen.len() == handles.len()
+    if !named {
+        return Some("unmatched record: incomplete trailing descriptor".into());
+    }
+    if let Some((fd, path)) = handles.iter().find(|(fd, _)| !seen.contains(fd)) {
+        return Some(format!(
+            "unmatched record: missing f{fd} n{}",
+            path.display()
+        ));
+    }
+    None
+}
+#[cfg(test)]
+fn idle_fields(code: Option<i32>, stdout: &[u8], stderr: &[u8], handles: &CensusHandles) -> bool {
+    census_reason(code, stdout, stderr, handles).is_none()
 }
 #[derive(Clone, Copy)]
 enum CensusScope {
@@ -308,9 +347,19 @@ fn census_output(path: &Path, directory: bool, scope: CensusScope) -> Option<std
     }
     command.arg(path).output().ok()
 }
+fn census_keep_reason(
+    path: &Path,
+    directory: bool,
+    handles: &CensusHandles,
+    scope: CensusScope,
+) -> Option<String> {
+    let Some(out) = census_output(path, directory, scope) else {
+        return Some("lsof unavailable".into());
+    };
+    census_reason(out.status.code(), &out.stdout, &out.stderr, handles)
+}
 fn census(path: &Path, directory: bool, handles: &CensusHandles, scope: CensusScope) -> bool {
-    census_output(path, directory, scope)
-        .is_some_and(|out| idle_fields(out.status.code(), &out.stdout, &out.stderr, handles))
+    census_keep_reason(path, directory, handles, scope).is_none()
 }
 
 fn stage(root: &File) -> Result<(OsString, File), GcError> {
@@ -390,10 +439,10 @@ fn prune_target(
             "target changed during lock acquisition".into(),
         ));
     }
-    if !census(&canonical, true, &handles, scope) {
+    if let Some(reason) = census_keep_reason(&canonical, true, &handles, scope) {
         writeln!(
             writer,
-            "keep target (in use or unknown visibility) | {}",
+            "keep target (in use or unknown visibility: {reason}) | {}",
             canonical.display()
         )?;
         return Ok(0);
@@ -664,7 +713,7 @@ mod tests {
                     "{malformed}"
                 );
             }
-            let _unrelated = File::open(target.join("debug/deps/old-output")).unwrap();
+            let unrelated_fd = File::open(target.join("debug/deps/old-output")).unwrap();
             let unrelated = census_output(&target, true, CensusScope::FixtureUser).unwrap();
             assert!(
                 !idle_fields(
@@ -674,6 +723,37 @@ mod tests {
                     &handles
                 ),
                 "{unrelated:?}"
+            );
+            assert_eq!(
+                census_reason(Some(2), real.as_bytes(), b"", &handles),
+                Some("lsof exit 2".into())
+            );
+            assert_eq!(
+                census_reason(
+                    Some(1),
+                    real.as_bytes(),
+                    b"\nsudo: a password is required\nextra stderr\n",
+                    &handles
+                ),
+                Some("lsof exit 1, stderr: sudo: a password is required".into())
+            );
+            assert_eq!(
+                census_reason(
+                    Some(0),
+                    format!("{real}fcwd\nn{}\n", target.display()).as_bytes(),
+                    b"",
+                    &handles
+                ),
+                Some("unmatched record: fcwd".into())
+            );
+            assert_eq!(
+                census_reason(
+                    unrelated.status.code(),
+                    &unrelated.stdout,
+                    &unrelated.stderr,
+                    &handles
+                ),
+                Some(format!("unmatched record: f{}", unrelated_fd.as_raw_fd()))
             );
             return;
         }
@@ -936,7 +1016,8 @@ mod tests {
         let _opened = File::open(&artifact).unwrap();
         let output = prune(&target, true);
         assert!(
-            artifact.exists() && output.contains("in use or unknown visibility"),
+            artifact.exists()
+                && output.contains("in use or unknown visibility: unmatched record: p"),
             "{output}"
         );
     }
@@ -1210,7 +1291,9 @@ mod tests {
         let output = fixture_case(&target, "own-open");
         assert!(
             artifact.exists()
-                && String::from_utf8_lossy(&output.stdout).contains("in use or unknown visibility")
+                && String::from_utf8_lossy(&output.stdout)
+                    .contains("in use or unknown visibility: unmatched record: f"),
+            "{output:?}"
         );
     }
     #[test]
@@ -1233,7 +1316,8 @@ mod tests {
         assert!(
             output.status.success()
                 && artifact.exists()
-                && String::from_utf8_lossy(&output.stdout).contains("unknown visibility"),
+                && String::from_utf8_lossy(&output.stdout)
+                    .contains("in use or unknown visibility: lsof unavailable"),
             "{output:?}"
         );
     }
@@ -1265,7 +1349,9 @@ mod tests {
         assert!(
             output.status.success()
                 && artifact.exists()
-                && String::from_utf8_lossy(&output.stdout).contains("unknown visibility"),
+                && String::from_utf8_lossy(&output.stdout).contains(
+                    "in use or unknown visibility: lsof exit 1, stderr: permission denied"
+                ),
             "{output:?}"
         );
     }
