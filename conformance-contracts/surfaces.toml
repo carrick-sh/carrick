@@ -33,6 +33,10 @@ path = "crates/carrick-embed/tests/el1_transparent.rs"
 contracts = ["kernel.el1.transparent"]
 
 [[surfaces]]
+path = "crates/carrick-embed/tests/el1_fork_exec.rs"
+contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
 path = "crates/carrick-aarch64/src/mailbox.rs"
 contracts = ["hvpatch.syscall.portal"]
 
