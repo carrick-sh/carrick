@@ -45,6 +45,7 @@ struct TestStockCrossing {
     zone: std::sync::Mutex<Option<&'static ZoneTables<Aarch64ParkedContext>>>,
     child: std::sync::Mutex<Option<(carrick_el1_abi::ExecutionBinding, AddressContext<RootGpa>)>>,
     handbacks: AtomicUsize,
+    root_exits: AtomicUsize,
 }
 
 impl TestStockCrossing {
@@ -71,6 +72,7 @@ impl TestStockCrossing {
             zone: std::sync::Mutex::new(None),
             child: std::sync::Mutex::new(None),
             handbacks: AtomicUsize::new(0),
+            root_exits: AtomicUsize::new(0),
         }
     }
 }
@@ -286,6 +288,7 @@ impl ForkStockCrossing for TestStockCrossing {
     }
 
     fn cross_root_exit(&self, _record_gpa: u64, _cpu: u64) -> Result<(), NativeProcessError> {
+        self.root_exits.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -410,6 +413,19 @@ impl Fixture {
             page,
             control,
         }
+    }
+}
+
+impl Fixture {
+    fn process_service(&'static self) -> Aarch64NativeProcessService<'static, TestStockCrossing> {
+        Aarch64NativeProcessService::with_crossing(
+            &self.task,
+            self.slot,
+            self.zone,
+            self.region.table(),
+            NonZeroU64::MIN,
+            TestStockCrossing::new(&[]),
+        )
     }
 }
 
@@ -1435,14 +1451,7 @@ impl super::thread_setup::LifecycleVenue for Fixture {
 #[test]
 fn arm_root_setup_enters_production_process_venue() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
-    let mut service = Aarch64NativeProcessService::with_crossing(
-        &fixture.task,
-        fixture.slot,
-        fixture.zone,
-        fixture.region.table(),
-        NonZeroU64::MIN,
-        TestStockCrossing::new(&[]),
-    );
+    let mut service = fixture.process_service();
     let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
     let counters = Box::new(carrick_el1_abi::Counters::new());
     let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
@@ -1457,6 +1466,7 @@ fn arm_root_setup_enters_production_process_venue() {
     for (nr, args, expected) in [
         (96, [0, 0, 0, 0, 0, 0], 41),
         (260, [u64::MAX, 0, 1, 0, 0, 0], -10),
+        (93, [7, 0, 0, 0, 0, 0], 7),
     ] {
         frame.x[..6].copy_from_slice(&args);
         frame.x[8] = nr;
@@ -1483,7 +1493,11 @@ fn arm_root_setup_enters_production_process_venue() {
         assert_eq!(frame.x[0] as i64, expected, "production ARM syscall {nr}");
         assert_eq!(
             route,
-            carrick_personality_linux::dispatch::CompletionRoute::WithWork
+            if nr == 93 {
+                carrick_personality_linux::dispatch::CompletionRoute::Suspended
+            } else {
+                carrick_personality_linux::dispatch::CompletionRoute::WithWork
+            }
         );
         assert_eq!(counters.served[nr as usize].load(Ordering::Acquire), 1);
         assert_eq!(counters.forwarded[nr as usize].load(Ordering::Acquire), 0);
@@ -1497,8 +1511,8 @@ fn arm_root_setup_enters_production_process_venue() {
         );
     }
     assert_eq!(service.crossing.loans_requested.load(Ordering::Acquire), 0);
-    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
-    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 1);
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
+    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 0);
 }
 
 #[test]
@@ -1508,14 +1522,7 @@ fn arm_returned_process_call_is_not_a_zone_park() {
         zone: fixture.zone,
         slot: fixture.slot,
     };
-    let mut service = Aarch64NativeProcessService::with_crossing(
-        &fixture.task,
-        fixture.slot,
-        fixture.zone,
-        fixture.region.table(),
-        NonZeroU64::MIN,
-        TestStockCrossing::new(&[]),
-    );
+    let mut service = fixture.process_service();
     let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
     let mut owner = None;
     for _ in 0..2 {
@@ -1652,14 +1659,7 @@ fn arm_root_admission_imports_live_thread_membership_without_changing_census() {
         zone: fixture.zone,
         slot: fixture.slot,
     };
-    let mut service = Aarch64NativeProcessService::with_crossing(
-        &fixture.task,
-        fixture.slot,
-        fixture.zone,
-        fixture.region.table(),
-        NonZeroU64::MIN,
-        TestStockCrossing::new(&[]),
-    );
+    let mut service = fixture.process_service();
     let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
     let signal = carrick_signal_core::policy::Signal::from_number(10).unwrap();
     let action = carrick_signal_core::policy::Action {
@@ -1769,6 +1769,56 @@ fn arm_root_admission_imports_live_thread_membership_without_changing_census() {
             .unwrap()
     ));
     assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
+    // The lifecycle owner retires the imported member before notifying the
+    // process owner. It must no longer be charged to the root's final exit.
+    with_process_entry(
+        source,
+        &fixture.task,
+        ThreadCtx::ZERO,
+        ttbr0,
+        fixture.page,
+        control,
+        &mut service,
+        |process| {
+            let admission =
+                carrick_el1_abi::Lifecycle::begin_exit(fixture.page, control.entry().unwrap())
+                    .unwrap();
+            fixture.page.try_exit().unwrap();
+            carrick_core::entry::retire_current(process.binding(), source, record.id).unwrap();
+            admission.commit().unwrap();
+            process.thread_exited(42);
+        },
+    )
+    .unwrap();
+    assert!(registry().for_record(fixture.zone, record).is_none());
+    fixture.task.set(El1TaskId::from_linux_tid(41), 11, 5);
+    fixture
+        .task
+        .mm
+        .thread_generation
+        .store(101, Ordering::Release);
+    fixture.task.publish_lifecycle(
+        fixture.page as *const _ as u64,
+        fixture.control as *const _ as u64,
+    );
+    with_process_entry(
+        source,
+        &fixture.task,
+        ThreadCtx::ZERO,
+        ttbr0,
+        fixture.page,
+        fixture.control,
+        &mut service,
+        |process| {
+            assert!(matches!(
+                process.exit_group(7),
+                LifecycleOutcome::Transferred { .. }
+            ));
+        },
+    )
+    .unwrap();
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
+    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 0);
 }
 
 #[test]
@@ -1779,14 +1829,7 @@ fn arm_root_host_lease_renewal_retains_the_admitted_process_owner() {
         zone: fixture.zone,
         slot: fixture.slot,
     };
-    let mut service = Aarch64NativeProcessService::with_crossing(
-        &fixture.task,
-        fixture.slot,
-        fixture.zone,
-        fixture.region.table(),
-        NonZeroU64::MIN,
-        TestStockCrossing::new(&[]),
-    );
+    let mut service = fixture.process_service();
     let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
     with_process_entry(
         source,
@@ -1842,14 +1885,7 @@ fn arm_root_admission_refuses_stale_imported_custody_without_publication() {
             zone: fixture.zone,
             slot: fixture.slot,
         };
-        let mut service = Aarch64NativeProcessService::with_crossing(
-            &fixture.task,
-            fixture.slot,
-            fixture.zone,
-            fixture.region.table(),
-            NonZeroU64::MIN,
-            TestStockCrossing::new(&[]),
-        );
+        let mut service = fixture.process_service();
         let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
         let outcome = with_process_entry(
             source,
@@ -1878,14 +1914,7 @@ fn arm_root_entry_refuses_wrong_binding_and_root_incarnation() {
         zone: fixture.zone,
         slot: fixture.slot,
     };
-    let mut service = Aarch64NativeProcessService::with_crossing(
-        &fixture.task,
-        fixture.slot,
-        fixture.zone,
-        fixture.region.table(),
-        NonZeroU64::MIN,
-        TestStockCrossing::new(&[]),
-    );
+    let mut service = fixture.process_service();
     let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
     with_process_entry(
         source,
@@ -1997,14 +2026,7 @@ fn arm_born_thread_uses_native_owner_without_an_execution_generation() {
         zone: fixture.zone,
         slot: fixture.slot,
     };
-    let mut service = Aarch64NativeProcessService::with_crossing(
-        &fixture.task,
-        fixture.slot,
-        fixture.zone,
-        fixture.region.table(),
-        NonZeroU64::MIN,
-        TestStockCrossing::new(&[]),
-    );
+    let mut service = fixture.process_service();
     let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
     with_process_entry(
         source,

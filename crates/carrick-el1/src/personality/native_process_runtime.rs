@@ -1022,6 +1022,29 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         Ok(runtime)
     }
 
+    fn unregister_member(
+        &self,
+        runtime: &NativeProcessRuntime<'a, M, C>,
+        process: TaskKey,
+        record: RecordRef,
+    ) {
+        let mut state = self.state.lock();
+        let carrier = core::ptr::from_ref(runtime.zone).addr();
+        let key = state.members.iter().find_map(|(key, member)| {
+            (key.carrier == carrier && member.process == process && member.record == record)
+                .then_some(*key)
+        });
+        if let Some(key) = key {
+            state.members.remove(&key);
+            state
+                .records
+                .remove(&Self::record_key(runtime.zone, record));
+            if let Some((_, keys)) = state.by_process.get_mut(&(carrier, process)) {
+                keys.retain(|candidate| *candidate != key);
+            }
+        }
+    }
+
     fn unregister_process(&self, runtime: &NativeProcessRuntime<'a, M, C>, process: TaskKey) {
         let mut state = self.state.lock();
         let carrier = core::ptr::from_ref(runtime.zone).addr();
@@ -3639,8 +3662,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     #[inline(never)]
     pub fn thread_exited(&mut self, tid: u32) {
         let mut graph = self.runtime.graph.lock();
+        let mut retired = None;
         if let Ok(task) = graph.owner.task_mut(self.key) {
             task.remove_thread(tid);
+            task.native_mut().resources_mut().members.retain(|member| {
+                if member.control.visible_tid() == Some(tid) {
+                    retired = Some(member.record);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        drop(graph);
+        if let Some(record) = retired
+            && let Some(registry) = *self.runtime.registry.lock()
+        {
+            registry.unregister_member(self.runtime, self.key, record);
         }
     }
 
