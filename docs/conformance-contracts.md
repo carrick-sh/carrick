@@ -436,6 +436,19 @@ same-VA isolation. Lookup work follows the physical extent index and selected
 records, without scanning other MM populations. Signed fork acceptance remains
 required.
 
+Owner-selected fork leaves retain the parent's exact physical inventory extent
+once per extent, independent of the selected leaf count. A 4 KiB semantic leaf
+must not shrink a 16 KiB compound's custody to 4 KiB: child bootstrap COW and
+exec retirement need that exact record. Guest access stays limited by the
+owner's stage-1 leaves. The VM-free binding
+`owner_selected_fork_leaf_retains_vvar_compound_for_child_bootstrap` runs the
+production owner projection, child inventory staging, privileged RNG COW and
+old-MM exec retirement while the parent's backing remains live and unchanged.
+It requires one inherited inventory mapping for the selected parent extent,
+a bounded compound copy, and zero retirement of parent-owned physical leases.
+Linux authority is [fork(2)](https://man7.org/linux/man-pages/man2/fork.2.html)
+and [execve(2)](https://man7.org/linux/man-pages/man2/execve.2.html).
+
 `kernel.fork.stage1-image` is the first contract whose structural budget lives
 entirely in the VMM layer. Every forked child owns a private stage-1
 page-table software image (a 1.75 MiB arena set) for its lifetime; `ltp-fork14`

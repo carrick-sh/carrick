@@ -8350,6 +8350,41 @@ impl carrick_hal::FrameCowAuthority for ModelKernel {
     }
 }
 
+/// Exercise the production exec retirement planner after owner-selected fork
+/// and bootstrap COW, using the existing VM-wide inventory authority model.
+pub(crate) fn assert_fork_child_exec_retirement(
+    parent: &HvpatchFrameInventory,
+    child: &mut HvpatchFrameInventory,
+    child_private: (u64, u64),
+) {
+    use carrick_hal::FrameCowAuthority;
+    let kernel = ModelKernel::default();
+    for extent in parent.extents.values().chain(child.extents.values()) {
+        kernel.map(extent.mapping, extent.frame);
+    }
+    let physical = final_exec_physical_extents(child, &kernel)
+        .expect("plan the fork child's old-mm exec retirement");
+    assert!(physical.contains(&(child_private.0, child_private.1 as usize)));
+    for extent in parent.extents.values() {
+        assert!(
+            !physical.contains(&(extent.stage2_base, extent.stage2_length as usize)),
+            "child exec must preserve every parent-owned physical lease"
+        );
+    }
+    let mut reservation = kernel.reserve(0, 0, child.extents.len() * 2).unwrap();
+    let retired = HvfVmState::stage_retirement(child, &mut reservation, &kernel)
+        .expect("stage the fork child's old-mm exec retirement");
+    kernel
+        .apply(reservation.commit(()))
+        .expect("apply child exec retirement");
+    assert!(child.extents.is_empty());
+    assert!(retired.contains(&child_private));
+    for extent in parent.extents.values() {
+        assert!(kernel.count(extent.frame).is_some_and(|count| count > 0));
+        assert!(!retired.contains(&(extent.stage2_base, extent.stage2_length)));
+    }
+}
+
 /// The unmap path's gap. T4b reconciliation retires an EL1-unmapped range
 /// through the alias lease retirement, which used to apply its Kernel unmap
 /// and only afterwards drop its backend reference. A fork sibling whose exit

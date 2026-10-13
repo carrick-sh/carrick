@@ -5703,11 +5703,15 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>, owner_selected: 
     };
     // Each fixture owns its root slots; pooled custody from another test
     // must never choose this test's child or grandchild address.
-    let root_slot_offset = match owner_cow_pages {
-        None => 0x40_0000,
-        Some(4) => 0x80_0000,
-        Some(1) => 0xc0_0000,
-        _ => panic!("unsupported vvar fixture shape"),
+    let root_slot_offset = if owner_selected {
+        0x100_0000
+    } else {
+        match owner_cow_pages {
+            None => 0x40_0000,
+            Some(4) => 0x80_0000,
+            Some(1) => 0xc0_0000,
+            _ => panic!("unsupported vvar fixture shape"),
+        }
     };
     let root_slot_base = crate::memory::LINUX_HVPATCH_ROOT_SLOT_BASE + root_slot_offset;
     let root_slot_size = 0x20_0000_u64;
@@ -6356,6 +6360,18 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>, owner_selected: 
         }),
         "the second fork must carry the COW overlay's exact inventory authority",
     );
+    if owner_selected {
+        super::super::frame_inventory::tests::assert_fork_child_exec_retirement(
+            &parent.frame_inventory.lock(),
+            &mut child_inventory.lock(),
+            child_private_key,
+        );
+        assert_eq!(
+            unsafe { parent_generation_ptr.cast::<u64>().read_unaligned() },
+            parent_generation_seed,
+            "child exec retirement must leave the parent's shared backing intact"
+        );
+    }
     drop(child_task);
     prepared.inventory = HvpatchTaskInventoryAuthority::Absent;
     drop(child_state);
