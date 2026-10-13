@@ -850,14 +850,15 @@ int main(int argc, char **argv) {
     const char *marker = getenv("DUMMY_NORMAL_MARKER");
     if (!run_id || !marker) return 2;
     stamp_proctitle(argv[0], run_id);
-    printf("running 1 test\ntest el1_dummy_normal ... ");
+    printf("running 1 test\n");
     fflush(stdout);
+    /* Sleep across pass 2 of binary 1's orphaned kill.sh reaper. */
     usleep(1500000);
     FILE *f = fopen(marker, "w");
     if (!f) return 3;
     fprintf(f, "%s\n", run_id);
     fclose(f);
-    printf("ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n");
+    printf("test el1_dummy_normal ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n");
     fflush(stdout);
     return 0;
 #endif
@@ -955,14 +956,20 @@ int main(int argc, char **argv) {
             !stderr.contains(&format!("test-signed: FAIL {}", exe_normal.display())),
             "normal binary must not be killed by previous binary's watchdog reap; stdout={stdout} stderr={stderr}"
         );
+        let normal_section = stdout
+            .split(&format!("test-signed: running {}", exe_normal.display()))
+            .nth(1)
+            .and_then(|s| s.split("test-signed: negative control").next())
+            .unwrap_or("");
         assert!(
-            stdout.contains("test el1_dummy_normal ... ok"),
-            "normal binary must run to completion; stdout={stdout} stderr={stderr}"
+            normal_section.contains("test result: ok. 1 passed"),
+            "normal binary must report 'test result: ok. 1 passed'; normal_section={normal_section:?} stdout={stdout} stderr={stderr}"
         );
         let recorded_run_id = std::fs::read_to_string(&marker).unwrap_or_default();
-        assert!(
-            !recorded_run_id.trim().is_empty() && recorded_run_id.trim() != run_id,
-            "normal binary must run under a distinct per-binary CARRICK_RUN_ID suffix (got {recorded_run_id:?}, suite run_id {run_id:?})"
+        assert_eq!(
+            recorded_run_id.trim(),
+            format!("{run_id}-b2"),
+            "normal binary must run under its distinct -b2 CARRICK_RUN_ID (stdout={stdout} stderr={stderr})"
         );
     }
 }
