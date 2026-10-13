@@ -1140,6 +1140,15 @@ fn terminal_retirement_cannot_retire_a_reused_record_or_slot_generation() {
     ));
     assert!(fixture.zone.accept_terminal(fixture.slot, replacement));
     assert!(!fixture.zone.accept_terminal(fixture.slot, replacement));
+    assert!(
+        !carrick_core::entry::terminal_matches(
+            next,
+            source,
+            carrick_sched_core::TerminalPhase::Retired
+        ),
+        "retirement acceptance must not wake a parent while the child MM remains installed"
+    );
+    fixture.zone.release_space(fixture.slot);
     assert!(carrick_core::entry::terminal_matches(
         next,
         source,

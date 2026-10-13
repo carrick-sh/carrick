@@ -33,7 +33,7 @@ use super::wait_wake::*;
 use super::*;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 struct TerminalNativeWaitWake;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl carrick_vmm_hvf::metadata_grant::NativeWaitChannelWake for TerminalNativeWaitWake {

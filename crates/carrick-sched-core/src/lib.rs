@@ -862,7 +862,13 @@ pub struct ForeignTimer {
 }
 
 /// Custody before physical retirement versus its owed completion wake.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum TerminalPhase {
     PendingRetirement,
     Retired,
@@ -918,8 +924,8 @@ pub struct ZoneSlot {
     /// drives it and is not away, because only that executor comes back to
     /// the slot to serve it.
     drive: AtomicU64,
-    /// Exact released execution; independent of records immediately reusable
-    /// by another CPU. Written only by this slot's stopped execution owner.
+    /// Exact released execution, independent of reusable records. The slot's
+    /// execution owner publishes it; the host authenticates at a CPU stop.
     terminal: [AtomicU64; 4],
 }
 
@@ -2879,6 +2885,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             && identity.generation != 0
             && identity.mm != 0
             && lane.current().is_none()
+            && (phase == TerminalPhase::PendingRetirement || self.installed_space(slot) == 0)
             && lane.terminal[0].load(Ordering::Acquire) == state
             && lane.terminal[1].load(Ordering::Relaxed) == identity.generation
             && lane.terminal[2].load(Ordering::Relaxed) == identity.mm
