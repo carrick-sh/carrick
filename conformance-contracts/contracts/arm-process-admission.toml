@@ -17,6 +17,8 @@ vm_free = "carrick-el1::personality::aarch64_process_tests::arm_root_setup_enter
 # arm_root_admission_imports_live_thread_membership_without_changing_census
 # arm_root_host_lease_renewal_retains_the_admitted_process_owner
 # arm_root_admission_refuses_stale_imported_custody_without_publication
+# arm_root_entry_refuses_wrong_binding_and_root_incarnation
+# arm_born_thread_uses_native_owner_without_an_execution_generation
 
 [bindings.unresolved]
 embed_structural = "Scoped signed el1_transparent_smoke validates ARM startup on the exact fixture bundle; it does not export this admission observation. The director owns full signed failure-set comparison."
