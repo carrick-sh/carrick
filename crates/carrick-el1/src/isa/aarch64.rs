@@ -16,6 +16,23 @@ use core::num::NonZeroU64;
 
 pub struct Aarch64Backend;
 
+/// Check the actual publication frame against this execution lane's stack.
+/// Deriving the slot from SP would silently accept an adjacent CPU's stack.
+#[inline(always)]
+pub(crate) fn check_process_stack(slot: carrick_el1_abi::SlotId) {
+    let sp: u64;
+    // SAFETY: EL1 reads its own current stack pointer.
+    unsafe {
+        core::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack));
+    }
+    let base =
+        carrick_el1_abi::EL1_STACKS_BASE + u64::from(slot.raw()) * carrick_el1_abi::EL1_STACK_SIZE;
+    assert!(
+        (base..base + carrick_el1_abi::EL1_STACK_SIZE).contains(&sp),
+        "native process publication exceeded its CPU stack"
+    );
+}
+
 pub type Kernel = carrick_guest_arch::Arch<Aarch64Backend>;
 
 /// Construct the sealed kernel-facing adapter for EL1.

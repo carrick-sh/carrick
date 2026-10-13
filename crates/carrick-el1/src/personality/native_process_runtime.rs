@@ -417,6 +417,18 @@ type NativeIdentityTask<'a, M, C> =
     GuestTask<VisibleNamespace, carrick_sched_core::process::TaskUid, Custody<'a, M, C>>;
 type Owner<'a, M, C> =
     GuestProcessOwner<VisibleNamespace, carrick_sched_core::process::TaskUid, Custody<'a, M, C>>;
+
+#[cfg(test)]
+#[test]
+fn arm_process_registry_moves_bounded_handles() {
+    type Native = Custody<'static, AddressContext<RootGpa>, carrick_el1_abi::Aarch64ParkedContext>;
+    // Registry insertion/removal must not copy an ISA save area on the EL1
+    // stack. The retirement row retains the same owned execution custody.
+    type Task =
+        NativeIdentityTask<'static, AddressContext<RootGpa>, carrick_el1_abi::Aarch64ParkedContext>;
+    assert!(core::mem::size_of::<Task>() <= 64);
+    assert!(core::mem::size_of::<super::process_owner::GuestRetiring<Native>>() <= 128);
+}
 struct PendingWait {
     caller: TaskKey,
     query: WaitQuery,
@@ -2928,6 +2940,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 None,
                 transaction,
                 wait_status,
+                || {
+                    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+                    crate::isa::aarch64::check_process_stack(self.source.slot);
+                },
             ) {
                 Ok(published) => published,
                 Err(_) => return Err(NativeProcessError::Quarantined),
