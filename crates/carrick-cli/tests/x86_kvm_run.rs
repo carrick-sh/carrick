@@ -298,19 +298,41 @@ fn mounted_static_x86_two_live_mms_have_private_anonymous_leaves() {
 /// record reissued clean. Matches native output and exit.
 #[test]
 fn mounted_static_x86_fork_rounds_beyond_lifecycle_stock_reuse_retired_children() {
+    fork_rounds_beyond_stock(&[]);
+}
+
+#[test]
+fn mounted_static_x86_nocldwait_fork_rounds_beyond_lifecycle_stock() {
+    fork_rounds_beyond_stock(&["-DAUTOREAP"]);
+}
+
+#[test]
+fn mounted_static_x86_sigign_fork_rounds_beyond_lifecycle_stock() {
+    fork_rounds_beyond_stock(&["-DAUTOREAP", "-DIGNORE_SIGCHLD"]);
+}
+
+fn fork_rounds_beyond_stock(flags: &[&str]) {
     if skip_without_kvm() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
     let elf = dir.path().join("fork-reuse");
-    compile_assembly("x86_fork_reuse.S", &elf);
+    compile_assembly_with_flags("x86_fork_reuse.S", &elf, flags);
     let native = Command::new(&elf)
         .timeout(Duration::from_secs(5))
         .output()
         .expect("native fork reuse oracle");
     assert_eq!(native.status.code(), Some(7));
-    assert_eq!(native.stdout, b"R\n");
-    let observed = run_mounted_binary(&elf, "x86-fork-reuse", true);
+    let expected_stdout: &[u8] = b"R\n";
+    assert_eq!(native.stdout, expected_stdout);
+    let run_id = if flags.is_empty() {
+        "x86-fork-reuse"
+    } else if flags.contains(&"-DIGNORE_SIGCHLD") {
+        "x86-fork-reuse-sigign"
+    } else {
+        "x86-fork-reuse-nocldwait"
+    };
+    let observed = run_mounted_binary(&elf, run_id, true);
     assert_eq!(
         observed.status.code(),
         Some(7),
@@ -321,7 +343,7 @@ fn mounted_static_x86_fork_rounds_beyond_lifecycle_stock_reuse_retired_children(
     let report: serde_json::Value = serde_json::from_slice(
         observed
             .stdout
-            .strip_prefix(b"R\n")
+            .strip_prefix(expected_stdout)
             .expect("fork reuse stdout"),
     )
     .unwrap();
@@ -1100,11 +1122,16 @@ fn compare_mounted_fault_with_native(fixture: &str) {
 }
 
 fn compile_assembly(fixture: &str, elf: &std::path::Path) {
+    compile_assembly_with_flags(fixture, elf, &[]);
+}
+
+fn compile_assembly_with_flags(fixture: &str, elf: &std::path::Path, flags: &[&str]) {
     let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(fixture);
     let compile = Command::new("cc")
         .timeout(Duration::from_secs(15))
+        .args(flags)
         .args([
             "-nostdlib",
             "-static",
@@ -1189,10 +1216,14 @@ fn run_mounted_binary(elf: &std::path::Path, run_id: &str, json: bool) -> std::p
         String::from_utf8_lossy(&load.stderr)
     );
     let mut command = Command::new(&cli);
+    let scoped_run_id = match std::env::var("CARRICK_RUN_ID") {
+        Ok(scope) => format!("{scope}-x86-kvm-{run_id}-test"),
+        Err(_) => format!("x86-kvm-{run_id}-test"),
+    };
     command
         .timeout(Duration::from_secs(5))
         .env("CARRICK_HOME", &home)
-        .env("CARRICK_RUN_ID", format!("x86-kvm-{run_id}-test"));
+        .env("CARRICK_RUN_ID", scoped_run_id);
     if json {
         command.arg("run").arg("--json");
     } else {

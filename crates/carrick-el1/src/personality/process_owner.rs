@@ -17,11 +17,11 @@ use carrick_sched_core::process::birth::{
     AdmittedProcessBirth, BirthAttachment, BirthError, BirthLive, BirthSnapshot,
 };
 use carrick_sched_core::process::exit::{
-    ExitEffectSource, ExitError, ExitLive, ExitLivePublication, ExitMember, ExitNotificationSource,
-    ExitParentPermit, ExitParentTarget, ExitRetiring, ExitSignalSource, ExitZombie,
-    ExitZombiePublication, PreparedExitEffects, PreparedExitParticipant, PreparedExitTopology,
-    ReadyExitEffects, ReleasedTaskSet, ReservedTaskSet, TaskGraphReservation, TaskRevision,
-    TaskSetError,
+    AutoreapParent, DeferredAutoreap, ExitEffectSource, ExitError, ExitLive, ExitLivePublication,
+    ExitMember, ExitNotificationSource, ExitParentPermit, ExitParentTarget, ExitRetiring,
+    ExitSignalSource, ExitZombie, ExitZombiePublication, PreparedExitEffects,
+    PreparedExitParticipant, PreparedExitTopology, ReadyExitEffects, ReleasedTaskSet,
+    ReservedTaskSet, TaskGraphReservation, TaskRevision, TaskSetError,
 };
 use carrick_sched_core::process::registry::{
     ProcessGroupRecord, ProcessRegistry, RegistryFailure, RegistryInvariant, SessionRecord,
@@ -41,11 +41,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// The exiting lane owns publication; the receipt retains an observer,
 /// including across reparenting. Dropping never completes a retirement.
 #[must_use = "publish only after member cancellation and MM retirement"]
-pub struct ExitRetirementPublication(Arc<AtomicBool>);
-impl ExitRetirementPublication {
-    pub fn publish(self) {
-        self.0.store(true, Ordering::Release);
-    }
+pub struct ExitRetirementPublication {
+    task: TaskKey,
+    readiness: Arc<AtomicBool>,
 }
 
 /// Primitive resource accesses for this row only. These hooks never choose a
@@ -421,6 +419,9 @@ impl<C: Copy, U, N: NativeProcessCustody> ExitLivePublication<C> for GuestTask<C
     fn exit_publish_children(&mut self, children: BTreeSet<TaskKey>) {
         self.relations.publish_prepared_children(children);
     }
+    fn exit_forget_child(&mut self, child: TaskKey) {
+        self.relations.remove_child(child);
+    }
     fn exit_publish_credit(&mut self, participant: PreparedExitParticipant<N::Credit>) {
         self.revision = participant.publish(self.revision, |credit, current| {
             self.native.consume_exit_credit(credit, current)
@@ -447,12 +448,13 @@ impl<C, U, N: NativeProcessCustody> ExitNotificationSource for GuestTask<C, U, N
 }
 
 /// Owned numeric/resource custody is never cloned with the semantic receipt.
-pub struct GuestZombie<C, U, Claim> {
+pub struct GuestZombie<C, U, Claim, Credit> {
     pub receipt: Zombie<C, U, LinuxWaitStatus>,
     pub claim: Claim,
     retirement: Arc<AtomicBool>,
+    autoreap: Option<DeferredAutoreap<Credit>>,
 }
-impl<C, U, Claim> WaitZombie<C, U> for GuestZombie<C, U, Claim> {
+impl<C, U, Claim, Credit> WaitZombie<C, U> for GuestZombie<C, U, Claim, Credit> {
     type Status = LinuxWaitStatus;
     fn exit_wait_phase(&self) -> ExitWaitPhase {
         if self.retirement.load(Ordering::Acquire) {
@@ -465,17 +467,31 @@ impl<C, U, Claim> WaitZombie<C, U> for GuestZombie<C, U, Claim> {
         &self.receipt
     }
 }
-impl<C, U, Claim> ExitZombie for GuestZombie<C, U, Claim> {
+impl<C, U, Claim, Credit> ExitZombie for GuestZombie<C, U, Claim, Credit> {
     fn exit_parent(&self) -> Option<TaskKey> {
         self.receipt.parent
     }
     fn exit_key(&self) -> TaskKey {
         self.receipt.key
     }
+    fn exit_is_autoreap(&self) -> bool {
+        self.autoreap.is_some()
+    }
 }
-impl<C, U, Claim> ExitZombiePublication for GuestZombie<C, U, Claim> {
+impl<C, U, Claim, Credit> ExitZombiePublication<Credit> for GuestZombie<C, U, Claim, Credit> {
     fn exit_reparent(&mut self, parent: Option<TaskKey>) {
         self.receipt.parent = parent;
+    }
+    fn exit_publish_autoreap(&mut self, accounting: DeferredAutoreap<Credit>) {
+        self.autoreap = Some(accounting);
+    }
+    fn exit_reparent_autoreap(&mut self, parent: AutoreapParent<Credit>) {
+        if let Some(accounting) = &mut self.autoreap {
+            accounting.reparent(parent);
+        }
+    }
+    fn exit_take_autoreap(&mut self) -> Option<DeferredAutoreap<Credit>> {
+        self.autoreap.take()
     }
 }
 
@@ -542,10 +558,14 @@ impl GuestProcessFailure for GuestRegistryFailure {
     }
 }
 
+pub type GuestExitReceipt<C, U, N> =
+    GuestZombie<C, U, <N as NativeProcessCustody>::Claim, <N as NativeProcessCustody>::Credit>;
+pub type GuestExitReceipts<C, U, N> = BTreeMap<TaskId, GuestExitReceipt<C, U, N>>;
+
 type GuestRegistry<C, U, N, F> = ProcessRegistry<
     C,
     GuestTask<C, U, N>,
-    GuestZombie<C, U, <N as NativeProcessCustody>::Claim>,
+    GuestZombie<C, U, <N as NativeProcessCustody>::Claim, <N as NativeProcessCustody>::Credit>,
     GuestRetiring<N>,
     TaskGraphReservation<<N as NativeProcessCustody>::Transaction>,
     (),
@@ -557,7 +577,7 @@ type SharedGuestBirth<'a, C, U, N, F> = AdmittedProcessBirth<
     'a,
     C,
     GuestTask<C, U, N>,
-    GuestZombie<C, U, <N as NativeProcessCustody>::Claim>,
+    GuestZombie<C, U, <N as NativeProcessCustody>::Claim, <N as NativeProcessCustody>::Credit>,
     GuestRetiring<N>,
     <N as NativeProcessCustody>::Transaction,
     (),
@@ -571,7 +591,7 @@ pub type GuestWaitSelection<C, U, N> =
 pub type GuestConsumedWait<C, U, N> = ConsumedWait<
     Zombie<C, U, LinuxWaitStatus>,
     <N as NativeProcessCustody>::Event,
-    GuestZombie<C, U, <N as NativeProcessCustody>::Claim>,
+    GuestZombie<C, U, <N as NativeProcessCustody>::Claim, <N as NativeProcessCustody>::Credit>,
 >;
 
 pub struct GuestProcessOwner<C, U, N: NativeProcessCustody, F = GuestRegistryFailure> {
@@ -714,7 +734,32 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
     pub fn tasks_mut(&mut self) -> &mut BTreeMap<TaskId, GuestTask<C, U, N>> {
         &mut self.registry.tasks
     }
-    pub fn zombies(&self) -> &BTreeMap<TaskId, GuestZombie<C, U, N::Claim>> {
+    /// The exit lane presents its exact publication only after cancellation and
+    /// MM retirement. Readiness and automatic removal share this graph guard.
+    pub fn publish_exit_retirement(
+        &mut self,
+        publication: ExitRetirementPublication,
+    ) -> Option<GuestExitReceipt<C, U, N>> {
+        let receipt = self
+            .registry
+            .zombies
+            .get(&publication.task.id)
+            .filter(|receipt| {
+                receipt.receipt.key == publication.task
+                    && Arc::ptr_eq(&receipt.retirement, &publication.readiness)
+            })
+            .unwrap_or_else(|| {
+                F::fail_process(GuestProcessInvariant::ExitPublicationLost(publication.task))
+            });
+        receipt.retirement.store(true, Ordering::Release);
+        self.registry
+            .complete_exit_autoreap(publication.task)
+            .unwrap_or_else(|_| {
+                F::fail_process(GuestProcessInvariant::ExitPublicationLost(publication.task))
+            })
+    }
+
+    pub fn zombies(&self) -> &GuestExitReceipts<C, U, N> {
         &self.registry.zombies
     }
     pub fn namespace_child_key(
@@ -1021,7 +1066,7 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
 {
     /// All fallible admission happens before publishing task state or topology.
     /// Resources can leave this custody only after successful publication.
-    pub fn publish(mut self) -> Result<GuestPublishedExit<C, U, N>, GuestProcessError<N::Error>> {
+    pub fn publish(mut self) -> Result<GuestPublishedExit<N>, GuestProcessError<N::Error>> {
         let task = self.reserved.task;
         let registry = self
             .reserved
@@ -1085,6 +1130,7 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
             receipt: observation,
             claim: record.claim,
             retirement: Arc::clone(&retirement),
+            autoreap: None,
         };
         let identity = (receipt.receipt.process_group, receipt.receipt.session);
         let publication = registry
@@ -1099,9 +1145,11 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
             .unwrap_or_else(|_| F::fail_process(GuestProcessInvariant::ExitReleaseLost(task)));
         self.reserved.registry = None;
         Ok(GuestPublishedExit {
-            retirement: ExitRetirementPublication(retirement),
-            retiring: publication.retiring,
-            autoreaped_receipt: publication.autoreaped_receipt,
+            retirement: ExitRetirementPublication {
+                task,
+                readiness: retirement,
+            },
+            retiring: publication,
             effects,
             resources,
             adopter,
@@ -1109,15 +1157,14 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
     }
 }
 
-pub struct GuestPublishedExit<C, U, N: NativeProcessCustody> {
+pub struct GuestPublishedExit<N: NativeProcessCustody> {
     pub retirement: ExitRetirementPublication,
     pub retiring: GuestRetiring<N>,
-    pub autoreaped_receipt: Option<GuestZombie<C, U, N::Claim>>,
     pub effects: ReadyExitEffects<N::Member>,
     pub adopter: Option<TaskKey>,
     resources: Option<N::Resources>,
 }
-impl<C, U, N: NativeProcessCustody> GuestPublishedExit<C, U, N> {
+impl<N: NativeProcessCustody> GuestPublishedExit<N> {
     pub fn take_resources(&mut self) -> Option<N::Resources> {
         self.resources.take()
     }
