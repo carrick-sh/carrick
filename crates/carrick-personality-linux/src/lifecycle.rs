@@ -520,6 +520,16 @@ pub fn invoke<'a>(
         LifecycleCall::ExitGroup => return native.process_exit_group(args[0] as u8),
         _ => {}
     }
+    // The last thread owns the process terminal transition, even for raw
+    // exit(2). Its leader has no pooled lifecycle entry to retire.
+    if call == LifecycleCall::Exit
+        && native
+            .thread()
+            .is_some_and(|thread| thread.page.live() == 1)
+        && let Some(outcome) = native.process_exit_group(args[0] as u8)
+    {
+        return Some(outcome);
+    }
     let thread = native.thread().or_else(|| {
         if call == LifecycleCall::Exit {
             native.record_decline(LifecycleDecline::ExitVenue);
