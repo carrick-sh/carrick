@@ -1,4 +1,4 @@
-//! Named Carrick-owned read windows shared by the host and EL1.
+//! Named Carrick-owned control access shared by the host and EL1.
 
 /// Fixed identity/control mapping. Its contents can change; its admitted
 /// geometry is immutable and does not describe a Linux user VMA.
@@ -66,9 +66,58 @@ impl CarrickInternalReadRange {
     }
 }
 
+/// Publication authority for the per-MM identity/control window only.
+/// EL1 revalidates this geometry, the exact owner and live writable translation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CarrickIdentityWriteRange(CarrickInternalReadRange);
+impl CarrickIdentityWriteRange {
+    pub const fn from_identity_address(address: u64, len: u64) -> Option<Self> {
+        if address < CARRICK_IDENTITY_PAGE_BASE {
+            return None;
+        }
+        match CarrickInternalReadRange::identity(address - CARRICK_IDENTITY_PAGE_BASE, len) {
+            Some(range) => Some(Self(range)),
+            None => None,
+        }
+    }
+    pub const fn address(self) -> u64 {
+        self.0.address()
+    }
+    pub const fn len(self) -> u64 {
+        self.0.len()
+    }
+    pub const fn is_empty(self) -> bool {
+        false
+    }
+    pub const fn authorizes(address: u64, len: u64) -> bool {
+        Self::from_identity_address(address, len).is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_write_capability_cannot_name_user_or_image_bytes() {
+        assert!(
+            CarrickIdentityWriteRange::from_identity_address(CARRICK_IDENTITY_PAGE_BASE + 4, 4)
+                .is_some()
+        );
+        for (address, len) in [
+            (0x4000_0000, 4),
+            (CARRICK_IDENTITY_PAGE_BASE - 1, 2),
+            (
+                CARRICK_IDENTITY_PAGE_BASE + CARRICK_IDENTITY_PAGE_SIZE - 1,
+                2,
+            ),
+            (crate::EL1_REGION_BASE + crate::EL1_IMAGE_OFFSET, 4),
+            (u64::MAX, 4),
+            (CARRICK_IDENTITY_PAGE_BASE, 0),
+        ] {
+            assert!(!CarrickIdentityWriteRange::authorizes(address, len));
+        }
+    }
 
     #[test]
     fn named_internal_reads_cannot_escape_their_windows() {

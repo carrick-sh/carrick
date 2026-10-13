@@ -859,10 +859,7 @@ pub(crate) fn bootstrap_hvpatch_process_child_identity_with(
     }
     let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
     let res = if shares_mm {
-        memory.write_bytes(
-            base + crate::memory::IDENTITY_OFF_SHIM_ENABLED,
-            &0_u32.to_le_bytes(),
-        )
+        carrick_kernel::kernel::identity_page::close_identity_gate(memory, base)
     } else {
         let id = dispatcher.identity_snapshot(kernel_context);
         stamp_identity_values(
@@ -1058,6 +1055,96 @@ pub(crate) mod tests {
         assert!(result.is_err());
         assert_eq!(ops.aborts, 1);
         assert_eq!(ops.parent_rollbacks, 1);
+    }
+
+    #[test]
+    fn owner_child_identity_publication_never_uses_user_copyout() {
+        use carrick_guest_mem::MemoryError;
+        struct ControlMemory(carrick_kernel::dispatch::LinearMemory);
+        impl carrick_guest_mem::GuestMemory for ControlMemory {
+            fn user_memory_venue(&self) -> carrick_guest_mem::UserMemoryVenue {
+                carrick_guest_mem::UserMemoryVenue::Owner
+            }
+            fn read_carrick_internal(
+                &self,
+                range: carrick_el1_abi::CarrickInternalReadRange,
+            ) -> Result<Vec<u8>, MemoryError> {
+                self.0.read_bytes_raw(range.address(), range.len() as usize)
+            }
+            fn write_carrick_identity(
+                &mut self,
+                range: carrick_el1_abi::CarrickIdentityWriteRange,
+                bytes: &[u8],
+            ) -> Result<(), MemoryError> {
+                assert_eq!(range.len(), bytes.len() as u64);
+                self.0.write_bytes_raw(range.address(), bytes)
+            }
+            fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+                Err(MemoryError::OutOfBounds { address, length })
+            }
+            fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+                Err(MemoryError::OutOfBounds {
+                    address,
+                    length: bytes.len(),
+                })
+            }
+        }
+        impl CurrentMmMemory for ControlMemory {}
+        let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
+        let dispatcher = SyscallDispatcher::new();
+        let (_, child) = crate::hvpatch::process_context_for_tests(70_302);
+        let mut memory = ControlMemory(carrick_kernel::dispatch::LinearMemory::new(
+            base,
+            vec![0; 4096],
+        ));
+        bootstrap_hvpatch_process_child_identity_with(
+            &mut memory,
+            &dispatcher,
+            &child,
+            false,
+            true,
+        )
+        .expect("fork identity is kernel control, not a Linux user VMA");
+        let pid = memory
+            .0
+            .read_bytes_raw(base + crate::memory::IDENTITY_OFF_PID, 4)
+            .unwrap();
+        assert_eq!(pid, dispatcher.identity_snapshot(&child).pid.to_le_bytes());
+        bootstrap_hvpatch_process_child_identity_with(&mut memory, &dispatcher, &child, true, true)
+            .expect("vfork closes the shared kernel-control gate");
+        assert_eq!(
+            memory
+                .0
+                .read_bytes_raw(base + crate::memory::IDENTITY_OFF_SHIM_ENABLED, 4)
+                .unwrap(),
+            [0; 4]
+        );
+        carrick_kernel::kernel::identity_page::stamp_clock_gate(&mut memory, base, 0).unwrap();
+        stamp_identity_values(&mut memory, base, 70_301, 1)
+            .expect("vfork handback restores the parent's kernel-control identity");
+        assert_eq!(
+            memory
+                .0
+                .read_bytes_raw(base + crate::memory::IDENTITY_OFF_PID, 4)
+                .unwrap(),
+            70_301u32.to_le_bytes()
+        );
+        memory
+            .0
+            .write_bytes_raw(
+                base + crate::memory::IDENTITY_OFF_SHIM_SYSCALLS,
+                &127u64.to_le_bytes(),
+            )
+            .unwrap();
+        assert_eq!(
+            carrick_kernel::kernel::identity_page::read_serviced_syscalls(&memory).unwrap(),
+            127u64.to_le_bytes()
+        );
+        carrick_kernel::kernel::identity_page::reset_serviced_syscalls(&mut memory).unwrap();
+        assert_eq!(
+            carrick_kernel::kernel::identity_page::read_serviced_syscalls(&memory).unwrap(),
+            [0; 8]
+        );
     }
 
     #[test]
