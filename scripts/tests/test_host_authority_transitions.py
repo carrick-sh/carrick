@@ -1087,7 +1087,10 @@ class MatrixOrchestrationTest(unittest.TestCase):
             for argv, kwargs in runner.calls:
                 with self.subTest(argv=argv):
                     environment = kwargs["env"]
-                    self.assertEqual(environment["RUSTUP_HOME"], str(provisioned_home))
+                    self.assertEqual(
+                        Path(environment["RUSTUP_HOME"]).resolve(),
+                        provisioned_home.resolve(),
+                    )
                     self.assertEqual(environment["RUSTUP_TOOLCHAIN"], "1.96.0")
                     self.assertEqual(environment["RUSTUP_AUTO_INSTALL"], "0")
                     self.assertTrue(
@@ -1104,7 +1107,10 @@ class MatrixOrchestrationTest(unittest.TestCase):
                 os.environ.pop("RUSTUP_HOME", None)
                 os.environ["HOME"] = "/tmp/ignored-home"
                 with self.host_authority._execution_context(ROOT) as execution:
-                    self.assertEqual(execution.rustup_home, Path(directory) / ".rustup")
+                    self.assertEqual(
+                        execution.rustup_home.resolve(),
+                        (Path(directory) / ".rustup").resolve(),
+                    )
 
     def test_hostile_temp_ancestor_cannot_choose_cargo_cwd_or_home(self):
         matrix = self.load()
