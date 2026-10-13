@@ -35,6 +35,10 @@ struct TestStockCrossing {
     settlements_committed: AtomicUsize,
     settlements_aborted: AtomicUsize,
     pending_loan: std::sync::Mutex<Option<ForkStockLoan>>,
+    retirements: AtomicUsize,
+    zone: std::sync::Mutex<Option<&'static ZoneTables<Aarch64ParkedContext>>>,
+    child: std::sync::Mutex<Option<(carrick_el1_abi::ExecutionBinding, AddressContext<RootGpa>)>>,
+    handbacks: AtomicUsize,
 }
 
 impl TestStockCrossing {
@@ -54,11 +58,107 @@ impl TestStockCrossing {
             settlements_committed: AtomicUsize::new(0),
             settlements_aborted: AtomicUsize::new(0),
             pending_loan: std::sync::Mutex::new(None),
+            retirements: AtomicUsize::new(0),
+            zone: std::sync::Mutex::new(None),
+            child: std::sync::Mutex::new(None),
+            handbacks: AtomicUsize::new(0),
         }
     }
 }
 
 impl ForkStockCrossing for TestStockCrossing {
+    fn cross_child_retire(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
+        let zone = self
+            .zone
+            .lock()
+            .unwrap()
+            .ok_or(NativeProcessError::Invalid)?;
+        let (binding, context) = self
+            .child
+            .lock()
+            .unwrap()
+            .ok_or(NativeProcessError::Invalid)?;
+        let slot = SlotId::from_index(cpu as usize).unwrap();
+        let source = BornInZoneSource { zone, slot };
+        // SAFETY: the synchronous test crossing retains this aligned ABI record.
+        let record = unsafe { &mut *(record_gpa as *mut carrick_el1_abi::NativeChildRetire) };
+        assert!(
+            zone.slot(slot).current().is_none(),
+            "retirement happens after zone exit"
+        );
+        if !carrick_core::entry::terminal_matches(
+            binding,
+            source,
+            carrick_sched_core::TerminalPhase::PendingRetirement,
+        ) || !record.request_matches(binding, context)
+        {
+            record.refuse(carrick_el1_abi::ChildRetireRefusal::Stale);
+            return Err(NativeProcessError::Stale);
+        }
+        assert!(zone.accept_terminal(
+            slot,
+            ThreadIdentity {
+                tid: binding.task.raw(),
+                generation: binding.generation.raw(),
+                mm: binding.mm.raw(),
+                serial: binding.thread_generation.raw(),
+                ..Default::default()
+            }
+        ));
+        assert!(record.accept());
+        self.retirements.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+    fn cross_wait_channel_wake(
+        &self,
+        channel: super::native_process_runtime::ProcessWaitChannel,
+        cpu: u64,
+    ) -> Result<(), NativeProcessError> {
+        let zone = self.zone.lock().unwrap().unwrap();
+        let (binding, _) = self.child.lock().unwrap().unwrap();
+        let slot = SlotId::from_index(cpu as usize).unwrap();
+        assert!(carrick_core::entry::terminal_matches(
+            binding,
+            BornInZoneSource { zone, slot },
+            carrick_sched_core::TerminalPhase::Retired
+        ));
+        assert_eq!(
+            self.retirements.load(Ordering::Acquire),
+            1,
+            "wake follows real retirement"
+        );
+        let mut transfers = Vec::new();
+        let guard = zone
+            .lock(
+                ZoneTables::<Aarch64ParkedContext>::bucket_of_with_context(
+                    channel.mm.raw(),
+                    channel.address.get(),
+                ),
+                &carrick_sched_core::ShortLockSpin,
+            )
+            .unwrap();
+        let count = zone.wake_host(
+            &guard,
+            channel.mm.raw(),
+            channel.address.get(),
+            u32::MAX,
+            u32::MAX,
+            false,
+            &mut |transfer| transfers.push(transfer),
+            &mut |_| panic!("must hand back to host"),
+        );
+        drop(guard);
+        for transfer in transfers {
+            assert!(
+                transfer
+                    .finish(&carrick_sched_core::ShortLockSpin)
+                    .is_some()
+            );
+        }
+        self.handbacks.fetch_add(count as usize, Ordering::AcqRel);
+        Ok(())
+    }
+
     fn fd_map(&self) -> &[carrick_el1_abi::FdMapSlot] {
         &self.fd_map
     }
@@ -624,6 +724,11 @@ fn test_wait4_consumes_zombie_once_with_exact_status() {
         slot: fixture.slot,
     };
     activate(child_source, &child_task, &child_binding);
+    *crossing.zone.lock().unwrap() = Some(fixture.zone);
+    *crossing.child.lock().unwrap() = Some((
+        super::common_entry::execution_binding(&child_task),
+        child_binding.address,
+    ));
 
     let mut child_service = Aarch64NativeProcessService::with_crossing(
         &child_task,
@@ -671,6 +776,206 @@ fn test_wait4_consumes_zombie_once_with_exact_status() {
         LinuxWaitOptions::empty(),
         UserVa::new(0),
     );
+
+    assert!(matches!(
+        wait_outcome,
+        LifecycleOutcome::Returned { result, .. } if result.raw() == child_pid as i64
+    ));
+    assert_eq!(
+        status_storage,
+        LinuxWaitStatus::from_wait_encoding(9 << 8).raw()
+    );
+
+    // Second wait on the consumed child must fail with ECHILD (error code -10)
+    let re_wait = parent_entry.wait4(
+        ProcessWaitPid::from_syscall_argument(child_pid as u64),
+        status_va,
+        LinuxWaitOptions::empty(),
+        UserVa::new(0),
+    );
+    assert!(matches!(
+        re_wait,
+        LifecycleOutcome::Returned { result, .. } if result.raw() == NativeProcessError::NoChild.errno()
+    ));
+}
+
+#[test]
+fn arm_terminal_child_retirement_and_parent_handback_once() {
+    let fixture = Fixture::new(0x10000, asid(1));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut native = ThreadCtx::ZERO;
+    native.x[0] = 99;
+    let parked = Aarch64ParkedContext::from_parts(native, fixture.address);
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
+
+    let words = fixture.tables.live(&fixture.maintenance);
+    let crossing = TestStockCrossing::new(&[
+        0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+    ]);
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::new(1).unwrap(),
+        &crossing,
+    )
+    .with_words(&words);
+
+    let child_pid;
+    {
+        let mut parent_entry = runtime
+            .enter(source, &fixture.task, parked, &mut service)
+            .unwrap();
+        let LifecycleOutcome::Returned { result, .. } = parent_entry.fork() else {
+            panic!("expected fork return");
+        };
+        child_pid = result.raw() as u32;
+    }
+
+    let parent_key = TaskKey {
+        id: TaskId::from_abi_positive(41).unwrap(),
+        serial: TaskSerial::from_raw_u64(11).unwrap(),
+    };
+    let parent_binding = runtime.task_binding(parent_key).unwrap();
+    let child_key = runtime.namespace_child_key(parent_key, child_pid).unwrap();
+    let child_binding = runtime.task_binding(child_key).unwrap();
+
+    // Parent yields slot to child
+    let mut status_storage = 0i32;
+    let status_va = UserVa::new(&raw mut status_storage as u64);
+    {
+        let mut parent_entry = runtime
+            .enter(source, &fixture.task, parked, &mut service)
+            .unwrap();
+        assert!(matches!(
+            parent_entry.wait4(
+                ProcessWaitPid::from_syscall_argument(child_pid as u64),
+                status_va,
+                LinuxWaitOptions::empty(),
+                UserVa::new(0)
+            ),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(parent_entry.take_handoff_receipt().is_some());
+    }
+    fixture
+        .zone
+        .unhome(fixture.slot, parent_binding.record.id, 1);
+
+    // Now child exits with status 9
+    let child_task = CurrentTask::new();
+    let child_source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    activate(child_source, &child_task, &child_binding);
+    *crossing.zone.lock().unwrap() = Some(fixture.zone);
+    *crossing.child.lock().unwrap() = Some((
+        super::common_entry::execution_binding(&child_task),
+        child_binding.address,
+    ));
+
+    let mut child_service = Aarch64NativeProcessService::with_crossing(
+        &child_task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::new(1).unwrap(),
+        &crossing,
+    )
+    .with_words(&words);
+
+    {
+        let mut child_entry = runtime
+            .enter(
+                child_source,
+                &child_task,
+                child_binding.words,
+                &mut child_service,
+            )
+            .unwrap();
+        // No guest slot may place the parent: its executor is in the host
+        // continuation, and the child is the last execution on this slot.
+        fixture.zone.publish_slot(fixture.slot, 0, Some(0), 1);
+        let exit_outcome = child_entry.exit_group(9);
+        assert_eq!(child_entry.take_run_failure(), None);
+        assert!(matches!(
+            exit_outcome,
+            LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                ..
+            }
+        ));
+    }
+
+    assert_eq!(
+        crossing.retirements.load(Ordering::Acquire),
+        1,
+        "terminal child must retire before parent can reap"
+    );
+
+    let binding = super::common_entry::execution_binding(&child_task);
+    for candidate in [
+        binding,
+        carrick_el1_abi::ExecutionBinding {
+            generation: carrick_el1_abi::EntryGeneration::from_raw(binding.generation.raw() + 1),
+            ..binding
+        },
+    ] {
+        let mut duplicate =
+            carrick_el1_abi::NativeChildRetire::new(candidate, child_binding.address).unwrap();
+        assert_eq!(
+            crossing.cross_child_retire(&raw mut duplicate as u64, u64::from(fixture.slot.raw())),
+            Err(NativeProcessError::Stale)
+        );
+        assert_eq!(
+            duplicate.take(candidate, child_binding.address),
+            Some(Err(carrick_el1_abi::ChildRetireRefusal::Stale))
+        );
+        assert_eq!(crossing.retirements.load(Ordering::Acquire), 1);
+    }
+
+    // Now parent calls wait4 to consume the zombie
+    assert_eq!(crossing.handbacks.load(Ordering::Acquire), 1);
+    assert_eq!(
+        fixture.zone.record(parent_binding.record.id).claim(),
+        carrick_sched_core::Claim::Host {
+            seq: fixture
+                .zone
+                .next_seq(parent_binding.record.id)
+                .wrapping_sub(1)
+        }
+    );
+    // Host reload uses the original continuation and restores execution capacity.
+    fixture.zone.publish_slot(fixture.slot, 1, Some(0), 1);
+    fixture.zone.install_space(fixture.slot, 1).unwrap();
+    assert!(
+        fixture
+            .zone
+            .place_from_host(parent_binding.record.id)
+            .is_some()
+    );
+    let parent_binding = runtime.task_binding(parent_key).unwrap();
+    activate(source, &fixture.task, &parent_binding);
+
+    let mut parent_entry = runtime
+        .enter(source, &fixture.task, parked, &mut service)
+        .unwrap();
+
+    let wait_outcome = parent_entry.resume_pending_wait().unwrap();
 
     assert!(matches!(
         wait_outcome,
@@ -781,4 +1086,63 @@ fn test_abort_after_stock_loan_returns_every_page_once() {
         initial_stock.len()
     );
     assert_eq!(crossing.total_returned_pages.load(Ordering::Acquire), 5);
+}
+
+#[test]
+fn terminal_retirement_cannot_retire_a_reused_record_or_slot_generation() {
+    let fixture = Fixture::new(0x10000, asid(1));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let old = super::common_entry::execution_binding(&fixture.task);
+    let record = fixture.zone.slot(fixture.slot).host_record().unwrap();
+    assert!(carrick_core::entry::retire_current(old, source, record).is_some());
+    let phase = carrick_sched_core::TerminalPhase::PendingRetirement;
+    assert!(carrick_core::entry::terminal_matches(old, source, phase));
+    // Global record storage can be reissued before the terminal crossing.
+    // Its new identity cannot replace the retained stopped CPU authority.
+    let replacement = ThreadIdentity {
+        tid: old.task.raw(),
+        generation: old.generation.raw() + 1,
+        mm: old.mm.raw(),
+        serial: old.thread_generation.raw() + 1,
+        ..Default::default()
+    };
+    let reused = fixture.zone.alloc_record(replacement).unwrap();
+    assert_eq!(reused, record);
+    assert!(carrick_core::entry::terminal_matches(old, source, phase));
+    fixture.zone.free_record(reused);
+    let current = fixture
+        .zone
+        .current_or_new(fixture.slot, replacement)
+        .unwrap();
+    assert_eq!(current, record);
+    assert!(!carrick_core::entry::terminal_matches(old, source, phase));
+    assert!(carrick_core::entry::retire_current(old, source, current).is_none());
+    assert_eq!(fixture.zone.slot(fixture.slot).host_record(), Some(current));
+    assert_eq!(fixture.zone.record(current).identity(), replacement);
+    let next = carrick_el1_abi::ExecutionBinding {
+        generation: carrick_el1_abi::EntryGeneration::from_raw(replacement.generation),
+        thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(replacement.serial),
+        ..old
+    };
+    assert!(carrick_core::entry::retire_current(next, source, current).is_some());
+    assert!(!fixture.zone.accept_terminal(
+        fixture.slot,
+        ThreadIdentity {
+            tid: old.task.raw(),
+            generation: old.generation.raw(),
+            mm: old.mm.raw(),
+            serial: old.thread_generation.raw(),
+            ..Default::default()
+        }
+    ));
+    assert!(fixture.zone.accept_terminal(fixture.slot, replacement));
+    assert!(!fixture.zone.accept_terminal(fixture.slot, replacement));
+    assert!(carrick_core::entry::terminal_matches(
+        next,
+        source,
+        carrick_sched_core::TerminalPhase::Retired
+    ));
 }

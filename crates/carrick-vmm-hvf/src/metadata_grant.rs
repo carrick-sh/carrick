@@ -16,6 +16,127 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+/// Runtime-owned handback venue for an already enrolled parent wait.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub trait NativeWaitChannelWake: std::fmt::Debug + Send + Sync {
+    fn wake(&self, mm: carrick_el1_abi::EntryMmKey, address: core::num::NonZeroU64) -> Option<u32>;
+}
+
+/// Authenticate the exact released task, independently of its former record.
+/// The CPU is synchronously stopped; a new slot entry invalidates this custody.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn terminal_child_execution(
+    custody: &crate::trap::CarrierVmCustody,
+    cpu: carrick_guest_arch::CpuId,
+    phase: carrick_sched_core::TerminalPhase,
+) -> Option<crate::fork_stock::GrantExecution> {
+    let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
+    let zone = carrick_el1_abi::zone_tables()?;
+    let gpa = carrick_el1_abi::EL1_CURRENT_TASKS_BASE.checked_add(
+        u64::from(cpu.raw()) * core::mem::size_of::<carrick_el1_abi::CurrentTask>() as u64,
+    )?;
+    let pointer = crate::fork_stock::ForkStockHostCustody::resolve_record_ptr::<
+        carrick_el1_abi::CurrentTask,
+    >(custody, gpa)
+    .ok()?;
+    // SAFETY: this stopped CPU owns its fixed CurrentTask slot.
+    let task = unsafe { &*pointer };
+    let binding = carrick_core::entry::binding(&task.execution, &task.mm);
+    let source = carrick_el1_abi::BornInZoneSource { zone, slot };
+    if !carrick_core::entry::terminal_matches(binding, source, phase) {
+        return None;
+    }
+    let stock = custody.fork_stock.lock();
+    let mm = carrick_sched_core::AddressSpaceKey::from_raw(binding.mm.raw())?;
+    let context = *stock.committed_children.get(&mm)?;
+    if !stock.committed_asids.contains_key(&binding.mm.raw())
+        || stock.retired_children.contains(&mm)
+            != (phase == carrick_sched_core::TerminalPhase::Retired)
+    {
+        return None;
+    }
+    Some(crate::fork_stock::GrantExecution::new(
+        cpu, binding, context,
+    ))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn service_terminal_operation(
+    custody: &crate::trap::CarrierVmCustody,
+    generation: Option<crate::trap::CarrierVmGeneration>,
+    cpu: carrick_guest_arch::CpuId,
+    op: u64,
+    args: [u64; 3],
+    ttbr0: u64,
+) -> [u64; 4] {
+    use carrick_el1_abi::{GRANT_OP_CHILD_RETIRE, METADATA_GRANT_ERR_DENIED, NativeChildRetire};
+    let retired = op != GRANT_OP_CHILD_RETIRE;
+    let expected_cpu = if retired { args[2] } else { args[1] };
+    if !request_has_live_vm(custody, generation) || expected_cpu != u64::from(cpu.raw()) {
+        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    }
+    let Some(execution) = terminal_child_execution(
+        custody,
+        cpu,
+        if retired {
+            carrick_sched_core::TerminalPhase::Retired
+        } else {
+            carrick_sched_core::TerminalPhase::PendingRetirement
+        },
+    ) else {
+        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    };
+    if retired {
+        let Some(address) = core::num::NonZeroU64::new(args[1]) else {
+            return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+        };
+        let wake = custody.native_wait_channel_wake.lock().clone();
+        return match wake
+            .and_then(|wake| wake.wake(carrick_el1_abi::EntryMmKey::from_raw(args[0]), address))
+        {
+            Some(count) => [METADATA_GRANT_SUCCESS, u64::from(count), 0, 0],
+            None => [METADATA_GRANT_ERR_DENIED, 0, 0, 0],
+        };
+    }
+    if execution.context.root.address().raw()
+        != ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK
+    {
+        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    }
+    let Ok(pointer) = crate::fork_stock::ForkStockHostCustody::resolve_record_ptr::<
+        NativeChildRetire,
+    >(custody, args[0]) else {
+        return [METADATA_GRANT_ERR_INVALID, 0, 0, 0];
+    };
+    // SAFETY: the synchronous crossing retains the caller's aligned wire record.
+    let retire = unsafe { &mut *pointer };
+    if custody
+        .fork_stock
+        .lock()
+        .service_child_retire(execution, retire)
+        .is_err()
+    {
+        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    }
+    let Some(zone) = carrick_el1_abi::zone_tables() else {
+        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    };
+    let Some(slot) = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize) else {
+        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    };
+    let identity = carrick_sched_core::ThreadIdentity {
+        tid: execution.binding.task.raw(),
+        generation: execution.binding.generation.raw(),
+        mm: execution.binding.mm.raw(),
+        serial: execution.binding.thread_generation.raw(),
+        ..Default::default()
+    };
+    if !zone.accept_terminal(slot, identity) {
+        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    }
+    [METADATA_GRANT_SUCCESS, 0, 0, 0]
+}
+
 pub const MAX_DYNAMIC_EXTENT_SLOTS: usize = 128;
 
 #[derive(
@@ -187,6 +308,15 @@ impl CarrierMetadataAccess {
     ) -> Result<(), MetadataResolutionError> {
         self.region()?;
         *self.carrier.custody.metadata_completion.lock() = Some(wake);
+        Ok(())
+    }
+
+    pub fn install_native_wait_channel_wake(
+        &self,
+        wake: Arc<dyn NativeWaitChannelWake>,
+    ) -> Result<(), MetadataResolutionError> {
+        self.region()?;
+        *self.carrier.custody.native_wait_channel_wake.lock() = Some(wake);
         Ok(())
     }
 
@@ -1143,7 +1273,17 @@ pub(crate) fn handle_metadata_grant_trap(
     let arg3 = vcpu
         .get_reg(Reg::X3)
         .map_err(|e| TrapError::Hypervisor(format!("failed to read X3 for metadata grant: {e}")))?;
-    let result = service_metadata_operation(custody, generation, cpu, op, arg1, arg2, arg3)?;
+    let result = if matches!(
+        op,
+        carrick_el1_abi::GRANT_OP_CHILD_RETIRE | carrick_el1_abi::GRANT_OP_WAIT_CHANNEL_WAKE
+    ) {
+        let ttbr0 = vcpu
+            .get_sys_reg(applevisor::vcpu::SysReg::TTBR0_EL1)
+            .map_err(|e| TrapError::Hypervisor(format!("read terminal child root: {e}")))?;
+        service_terminal_operation(custody, generation, cpu, op, [arg1, arg2, arg3], ttbr0)
+    } else {
+        service_metadata_operation(custody, generation, cpu, op, arg1, arg2, arg3)?
+    };
     vcpu.set_reg(Reg::X0, result[0])
         .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
     vcpu.set_reg(Reg::X1, result[1])

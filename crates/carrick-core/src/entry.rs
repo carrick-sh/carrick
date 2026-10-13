@@ -307,20 +307,40 @@ pub fn retire_current<C: EntryContext>(
     record: carrick_sched_core::RecordId,
 ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
     let start = prepare_handoff(binding, source, record)?;
-    if source.zone.slot(source.slot).current().is_none() {
-        return source
+    let identity = source.zone.record(record).identity();
+    let released = if source.zone.slot(source.slot).current().is_none() {
+        source.zone.release_host_home(source.slot, record)
+    } else {
+        source
             .zone
-            .release_host_home(source.slot, record)
-            .then(|| start.published());
-    }
-    if source
-        .zone
-        .release_current(source.slot, record, &carrick_sched_core::ShortLockSpin)
-        != carrick_sched_core::CurrentRelease::Released
-    {
+            .release_current(source.slot, record, &carrick_sched_core::ShortLockSpin)
+            == carrick_sched_core::CurrentRelease::Released
+    };
+    if !released {
         return None;
     }
+    source.zone.publish_terminal(source.slot, identity);
     Some(start.published())
+}
+
+/// Terminal authentication uses retained execution custody, never a freed
+/// record's identity or a carrier executor's unrelated loaded task.
+pub fn terminal_matches<C: EntryContext>(
+    binding: ExecutionBinding,
+    source: BornInZoneSource<'_, C>,
+    phase: carrick_sched_core::TerminalPhase,
+) -> bool {
+    source.zone.terminal_matches(
+        source.slot,
+        carrick_sched_core::ThreadIdentity {
+            tid: binding.task.raw(),
+            generation: binding.generation.raw(),
+            mm: binding.mm.raw(),
+            serial: binding.thread_generation.raw(),
+            ..Default::default()
+        },
+        phase,
+    )
 }
 
 /// A compact-context receipt cannot authorize a second entry turn.

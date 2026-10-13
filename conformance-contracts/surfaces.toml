@@ -525,7 +525,7 @@ contracts = ["kernel.vcpu.vm-lifetime"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/carrier_custody.rs"
-contracts = ["kernel.vcpu.vm-lifetime"]
+contracts = ["kernel.vcpu.vm-lifetime", "process.native.terminal-child"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/executor.rs"
@@ -561,7 +561,7 @@ contracts = ["kernel.el1.gic"]
 
 [[surfaces]]
 path = "crates/carrick-el1-abi/src/lib.rs"
-contracts = ["kernel.el1.gic", "kernel.el1.guest-run-queue", "kernel.el1.fault-entry", "kernel.el1.metadata-allocation", "kernel.el1.stage1-publication"]
+contracts = ["kernel.el1.gic", "kernel.el1.guest-run-queue", "kernel.el1.fault-entry", "kernel.el1.metadata-allocation", "kernel.el1.stage1-publication", "process.native.terminal-child"]
 
 [[surfaces]]
 path = "crates/carrick-el1/src/entry.rs"
@@ -577,7 +577,7 @@ contracts = ["kernel.el1.metadata-allocation", "process.native.short-lock"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/metadata_grant.rs"
-contracts = ["kernel.el1.metadata-allocation"]
+contracts = ["kernel.el1.metadata-allocation", "process.native.terminal-child"]
 
 [[surfaces]]
 path = "fixtures/linux-aarch64-hello/src/el1_vtimer_loop.rs"
@@ -589,11 +589,11 @@ contracts = ["kernel.el1.gic"]
 
 [[surfaces]]
 path = "crates/carrick-sched-core/src/lib.rs"
-contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.el1.deferred-handback-identity", "process.native.short-lock"]
+contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.el1.deferred-handback-identity", "process.native.short-lock", "process.native.terminal-child"]
 
 [[surfaces]]
 path = "crates/carrick-sched-core/src/tests.rs"
-contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue"]
+contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "process.native.terminal-child"]
 
 [[surfaces]]
 path = "crates/carrick-el1/src/sched.rs"
@@ -808,7 +808,7 @@ contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents"
 # semantic contracts alongside the shared admission/completion contract.
 [[surfaces]]
 path = "crates/carrick-core/src/entry.rs"
-contracts = ["core.entry.completion", "process.native.short-lock"]
+contracts = ["core.entry.completion", "process.native.short-lock", "process.native.terminal-child"]
 
 [[surfaces]]
 path = "crates/carrick-core-abi/src/entry.rs"
@@ -975,7 +975,7 @@ contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.wai
 
 [[surfaces]]
 path = "crates/carrick-el1/src/personality/native_process_runtime.rs"
-contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.short-lock"]
+contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.short-lock", "process.native.terminal-child"]
 
 [[surfaces]]
 path = "crates/carrick-el1/src/personality/fork_loan.rs"
@@ -1047,11 +1047,11 @@ contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1
 
 [[surfaces]]
 path = "crates/carrick-el1/src/personality/aarch64_process.rs"
-contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage"]
+contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.terminal-child"]
 
 [[surfaces]]
 path = "crates/carrick-el1/src/personality/aarch64_process_tests.rs"
-contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage"]
+contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.terminal-child"]
 
 [[surfaces]]
 path = "crates/carrick-x86-cpl0/src/native_execution.rs"
@@ -1093,7 +1093,7 @@ contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/fork_stock.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "process.native.terminal-child"]
 
 [[surfaces]]
 path = "crates/carrick-el1-abi/src/fork_stock.rs"
@@ -1308,3 +1308,11 @@ contracts = ["core.personality.files"]
 [[surfaces]]
 path = "crates/carrick-core-abi/src/executable_publication.rs"
 contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/isa/aarch64.rs"
+contracts = ["process.native.terminal-child"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/binding.rs"
+contracts = ["process.native.terminal-child"]

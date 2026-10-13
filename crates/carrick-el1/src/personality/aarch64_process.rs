@@ -83,9 +83,26 @@ pub trait ForkStockCrossing {
 
     fn cross_fork_stock(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError>;
     fn cross_root_exit(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError>;
+    fn cross_child_retire(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError>;
+    fn cross_wait_channel_wake(
+        &self,
+        channel: super::native_process_runtime::ProcessWaitChannel,
+        cpu: u64,
+    ) -> Result<(), NativeProcessError>;
 }
 
 impl<T: ForkStockCrossing> ForkStockCrossing for &T {
+    fn cross_child_retire(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
+        (**self).cross_child_retire(record_gpa, cpu)
+    }
+    fn cross_wait_channel_wake(
+        &self,
+        channel: super::native_process_runtime::ProcessWaitChannel,
+        cpu: u64,
+    ) -> Result<(), NativeProcessError> {
+        (**self).cross_wait_channel_wake(channel, cpu)
+    }
+
     fn fd_map(&self) -> &[carrick_el1_abi::FdMapSlot] {
         (**self).fd_map()
     }
@@ -103,6 +120,39 @@ impl<T: ForkStockCrossing> ForkStockCrossing for &T {
 pub struct HvcForkStockCrossing;
 
 impl ForkStockCrossing for HvcForkStockCrossing {
+    fn cross_child_retire(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            crate::isa::aarch64::cross_hvc_child_retire(record_gpa, cpu)
+                .map_err(|_| NativeProcessError::Fault)
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        {
+            let _ = (record_gpa, cpu);
+            Err(NativeProcessError::Unsupported)
+        }
+    }
+    fn cross_wait_channel_wake(
+        &self,
+        channel: super::native_process_runtime::ProcessWaitChannel,
+        cpu: u64,
+    ) -> Result<(), NativeProcessError> {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            crate::isa::aarch64::cross_hvc_wait_channel_wake(
+                channel.mm.raw(),
+                channel.address.get(),
+                cpu,
+            )
+            .map_err(|_| NativeProcessError::Fault)
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        {
+            let _ = (channel, cpu);
+            Err(NativeProcessError::Unsupported)
+        }
+    }
+
     fn cross_fork_stock(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
@@ -129,6 +179,9 @@ impl ForkStockCrossing for HvcForkStockCrossing {
         }
     }
 }
+
+static RETIRED_SPACES: super::retired_spaces::RetiredSpaces =
+    super::retired_spaces::RetiredSpaces::new();
 
 pub struct Aarch64Venue;
 
@@ -301,6 +354,12 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             return Err(NativeProcessError::Stale);
         }
         let owner = self.portal()?;
+        RETIRED_SPACES.drain_portal(
+            &owner,
+            self.zone,
+            carrick_sched_core::ZONE_SLOTS,
+            self.worker(),
+        )?;
         let mm = ReservationMm::new(parent.mm.raw().get()).ok_or(NativeProcessError::Stale)?;
         let live = self.words.ok_or(NativeProcessError::Stale)?;
         let capacity = owner
@@ -611,7 +670,60 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         fatal();
     }
 
-    fn retire_mm(&mut self, _mm: Self::Mm) {}
+    fn retire_mm(&mut self, mm: Self::Mm) {
+        let binding = common_entry::execution_binding(self.task);
+        let source = carrick_el1_abi::BornInZoneSource {
+            zone: self.zone,
+            slot: self.slot,
+        };
+        if !carrick_core::entry::terminal_matches(
+            binding,
+            source,
+            carrick_sched_core::TerminalPhase::PendingRetirement,
+        ) || binding.mm.raw() != mm.mm.raw().get()
+        {
+            fatal();
+        }
+        let Some(index) = self.zone.spaces.find(binding.mm.raw()) else {
+            fatal();
+        };
+        self.zone.spaces.close(index);
+        let Some(mut retire) = carrick_el1_abi::NativeChildRetire::new(binding, mm) else {
+            fatal();
+        };
+        if self
+            .crossing
+            .cross_child_retire(&raw mut retire as u64, u64::from(self.worker()))
+            .is_err()
+            || !matches!(retire.take(binding, mm), Some(Ok(())))
+        {
+            fatal();
+        }
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            let live = crate::isa::aarch64::hardware_live_ttbr();
+            let idle = self.zone.spaces.idle_ttbr();
+            if live & AARCH64_ROOT_ADDRESS_MASK != mm.root.address().raw() || idle == 0 {
+                fatal();
+            }
+            crate::sched::ThreadCpu::set_translation(&mut crate::sched::HardwareCpu, idle, idle);
+            crate::sched::ThreadCpu::invalidate_asid(&mut crate::sched::HardwareCpu, live);
+        }
+        self.zone.release_space(self.slot);
+        RETIRED_SPACES.push(super::retired_spaces::RetiredSpace {
+            carrier: self.carrier,
+            zone: core::ptr::from_ref(self.zone).addr(),
+            roots: core::ptr::from_ref(self.roots).addr(),
+            mm: ReservationMm::new(binding.mm.raw()).unwrap_or_else(|| fatal()),
+        });
+    }
+    fn wake_unplaceable_wait(
+        &mut self,
+        channel: super::native_process_runtime::ProcessWaitChannel,
+    ) -> Result<(), NativeProcessError> {
+        self.crossing
+            .cross_wait_channel_wake(channel, u64::from(self.worker()))
+    }
 
     fn copy_signal_bytes(
         &mut self,
