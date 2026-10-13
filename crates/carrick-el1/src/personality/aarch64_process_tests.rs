@@ -1487,10 +1487,94 @@ fn arm_root_setup_enters_production_process_venue() {
         );
         assert_eq!(counters.served[nr as usize].load(Ordering::Acquire), 1);
         assert_eq!(counters.forwarded[nr as usize].load(Ordering::Acquire), 0);
+        // ARM's host boundary interprets a retained home with no current
+        // record as a parked thread. An ordinary returned process call must
+        // not supply that false park (the signed root's first turn did).
+        assert!(fixture.zone.slot(fixture.slot).current().is_none());
+        assert!(
+            fixture.zone.slot(fixture.slot).host_record().is_none(),
+            "returned process call must not leave admission-only home custody"
+        );
     }
     assert_eq!(service.crossing.loans_requested.load(Ordering::Acquire), 0);
     assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
     assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 1);
+}
+
+#[test]
+fn arm_returned_process_call_is_not_a_zone_park() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&[]),
+    );
+    let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
+    let mut owner = None;
+    for _ in 0..2 {
+        with_process_entry(
+            source,
+            &fixture.task,
+            ThreadCtx::ZERO,
+            ttbr0,
+            fixture.page,
+            fixture.control,
+            &mut service,
+            |process| {
+                let LifecycleOutcome::Returned { result, .. } = process.wait4(
+                    ProcessWaitPid::from_syscall_argument(u64::MAX),
+                    UserVa::new(0),
+                    LinuxWaitOptions::WNOHANG,
+                    UserVa::new(0),
+                ) else {
+                    panic!("a no-child wait returns ECHILD without parking")
+                };
+                assert_eq!(result.raw(), -10);
+                let admitted = registry()
+                    .for_entry(source, &fixture.task, fixture.address)
+                    .unwrap();
+                if let Some(prior) = &owner {
+                    assert!(std::sync::Arc::ptr_eq(prior, &admitted));
+                }
+                owner = Some(admitted);
+            },
+        )
+        .unwrap();
+        // This is the production host reconciler's (current, home) input.
+        // (None, Some) would settle the running root as a zone wait; a Free
+        // record cannot supply the Host record its next executor must load.
+        assert!(fixture.zone.slot(fixture.slot).current().is_none());
+        assert!(fixture.zone.slot(fixture.slot).host_record().is_none());
+        assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 1);
+    }
+    // Conversely, a real publication must outlive the entry scope.
+    let published = with_process_entry(
+        source,
+        &fixture.task,
+        ThreadCtx::ZERO,
+        ttbr0,
+        fixture.page,
+        fixture.control,
+        &mut service,
+        |_| {
+            let record = fixture.zone.slot(fixture.slot).host_record().unwrap();
+            fixture.zone.requeue_preempted(fixture.slot, record);
+            fixture.zone.record_ref(record)
+        },
+    )
+    .unwrap();
+    assert!(fixture.zone.live(published).is_some());
+    assert_eq!(
+        fixture.zone.slot(fixture.slot).host_record(),
+        Some(published.id)
+    );
 }
 
 fn imported_thread(
@@ -1718,8 +1802,7 @@ fn arm_root_host_lease_renewal_retains_the_admitted_process_owner() {
     let before = registry()
         .for_entry(source, &fixture.task, fixture.address)
         .unwrap();
-    let old = fixture.zone.slot(fixture.slot).host_record().unwrap();
-    assert!(fixture.zone.release_host_home(fixture.slot, old));
+    assert!(fixture.zone.slot(fixture.slot).host_record().is_none());
     fixture
         .task
         .execution
@@ -1818,6 +1901,24 @@ fn arm_root_entry_refuses_wrong_binding_and_root_incarnation() {
     let before = registry()
         .for_entry(source, &fixture.task, fixture.address)
         .unwrap();
+    // These refusals compare a published running record with stale task
+    // metadata, rather than a new host lease that may renew admission.
+    let record = process_record_for_call(source, &fixture.task, ThreadCtx::ZERO, ttbr0).unwrap();
+    admit_entry(
+        source,
+        &fixture.task,
+        ThreadCtx::ZERO,
+        ttbr0,
+        record,
+        fixture.page,
+        fixture.control,
+    )
+    .unwrap();
+    fixture.zone.requeue_preempted(fixture.slot, record);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        record
+    );
     for atomic in [
         &fixture.task.execution.generation,
         &fixture.task.mm.thread_generation,
