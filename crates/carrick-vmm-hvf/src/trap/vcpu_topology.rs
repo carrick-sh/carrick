@@ -179,12 +179,17 @@ pub fn begin_carrier_vcpu_teardown() {
 /// Run `create` (one `hv_vcpu_create`) only while the generation assembles.
 /// The topology lock is held across the create so a concurrent first run
 /// cannot seal the generation underneath it.
-pub(crate) fn create_admitted<T>(create: impl FnOnce() -> T) -> T {
-    let topology = carrier_vcpu_topology().lock();
-    if let Err(violation) = topology.admit_create() {
-        topology_fault(violation);
-    }
-    create()
+pub(crate) fn create_admitted<T>(create: impl FnOnce() -> T) -> Result<T, VcpuTopologyViolation> {
+    create_admitted_in(carrier_vcpu_topology(), create)
+}
+
+fn create_admitted_in<T>(
+    topology: &parking_lot::Mutex<VcpuTopology>,
+    create: impl FnOnce() -> T,
+) -> Result<T, VcpuTopologyViolation> {
+    let topology = topology.lock();
+    topology.admit_create()?;
+    Ok(create())
 }
 
 pub(crate) fn admit_vcpu_first_run() {
@@ -258,6 +263,22 @@ mod tests {
             topology.admit_first_run(),
             Err(VcpuTopologyViolation::FirstRunDuringTeardown { generation: 3 })
         );
+    }
+
+    #[test]
+    fn teardown_refuses_creation_without_invoking_the_hypervisor() {
+        let topology = parking_lot::Mutex::new(VcpuTopology::VACANT);
+        topology.lock().begin_generation(7);
+        topology.lock().begin_teardown();
+        let attempted = std::sync::atomic::AtomicBool::new(false);
+        let result = create_admitted_in(&topology, || {
+            attempted.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert_eq!(
+            result,
+            Err(VcpuTopologyViolation::CreateDuringTeardown { generation: 7 })
+        );
+        assert!(!attempted.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
