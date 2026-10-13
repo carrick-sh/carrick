@@ -433,11 +433,11 @@ jobs:
         with:
           pattern: receipt-hvf-${{ github.sha }}-*
           path: ${{ runner.temp }}/candidate
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: gate-xtask-release
           cache-workspace-crates: "true"
-          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
+          save-if: false
       - name: Build the base xtask
         run: cargo build --locked --release -p carrick-xtask
       - name: Gate on NEW failures (waits up to 90 min for the base receipt)
@@ -472,11 +472,11 @@ jobs:
         with:
           pattern: receipt-kvm-${{ github.sha }}-*
           path: ${{ runner.temp }}/candidate
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: gate-xtask-release
           cache-workspace-crates: "true"
-          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
+          save-if: false
       - name: Build the base xtask
         run: cargo build --locked --release -p carrick-xtask
       - name: Gate on NEW failures (waits up to 90 min for the base receipt)
@@ -488,6 +488,23 @@ jobs:
           --base-sha "$BASE_SHA" --candidate-dir "$RUNNER_TEMP/candidate"
           --candidate-sha "$GITHUB_SHA" --run-attempt "$GITHUB_RUN_ATTEMPT"
           --download-dir "$RUNNER_TEMP/baseline" --wait-minutes 90 --poll-seconds 60
+
+  gate-xtask-cache:
+    name: Warm the receipt-gate xtask cache
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: gate-xtask-release
+          cache-workspace-crates: "true"
+          save-if: true
+      - name: Build the base xtask
+        run: cargo build --locked --release -p carrick-xtask
 
   # The single required check. `if: always()` so a skipped or cancelled lane
   # reports a failure here instead of letting a required check pass by
