@@ -157,7 +157,11 @@ pub fn admit_entry(
         address.mm.raw().get(),
         address.generation.raw().get(),
     );
-    if let Ok(runtime) = REGISTRY.for_entry(source, task, address) {
+    if let Ok(runtime) = REGISTRY.for_entry(source, task, address)
+        && REGISTRY
+            .for_record(source.zone, source.zone.record_ref(record))
+            .is_some_and(|retained| Arc::ptr_eq(&retained, &runtime))
+    {
         return Ok((runtime, address, words));
     }
     if control.entry().is_some() {
@@ -188,6 +192,32 @@ pub fn admit_entry(
     Ok((runtime, address, words))
 }
 
+/// Unpublished admission custody is scoped to this call: a home left in a
+/// host-loaded lane is otherwise interpreted as a zone park at the next HVC.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+struct AdmissionHome {
+    source: BornInZoneSource<'static, Aarch64ParkedContext>,
+    record: carrick_sched_core::RecordRef,
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+impl Drop for AdmissionHome {
+    fn drop(&mut self) {
+        let owned = self.source.zone.record(self.record.id);
+        // A genuine park/switch owns its publication; a retired/reused record
+        // is somebody else's custody. Neither may be undone by this entry.
+        if owned.incarnation() == self.record.incarnation
+            && owned.claim() == carrick_sched_core::Claim::Free
+            && owned.home() == Some(self.source.slot)
+            && !owned.has_object_operation()
+        {
+            self.source
+                .zone
+                .discard_unpublished(self.source.slot, self.record.id);
+        }
+    }
+}
+
 /// The production ARM entry boundary, shared by the VM-free admission witness.
 /// The callback receives the exact native venue retained for this SVC.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
@@ -205,6 +235,10 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
     ) -> R,
 ) -> Result<R, NativeProcessError> {
     let record = process_record_for_call(source, task, native, ttbr0)?;
+    let _home = AdmissionHome {
+        source,
+        record: source.zone.record_ref(record),
+    };
     let (runtime, address, words) =
         admit_entry(source, task, native, ttbr0, record, page, control)?;
     let (result, root_exit) = {
