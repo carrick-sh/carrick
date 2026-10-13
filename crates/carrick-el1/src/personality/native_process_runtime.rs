@@ -8357,9 +8357,14 @@ mod tests {
                 u64::MAX,
                 &mut pending
             ),
-            carrick_personality_linux::dispatch::CompletionRoute::Served
+            carrick_personality_linux::dispatch::CompletionRoute::WithWork
         );
         drop(pending);
+        assert_eq!(
+            task.linux.take_served_boundary(),
+            Some(carrick_el1_abi::ServedBoundary::Completed)
+        );
+        assert_eq!(task.linux.take_served_boundary(), None);
         assert_eq!(
             frame.x[0] as i64, 0,
             "filesystem credential match must permit the peer read"

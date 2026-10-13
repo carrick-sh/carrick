@@ -231,6 +231,12 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
         self.task_state()
             .is_some_and(crate::abi::entry::LinuxTaskState::has_pending_host_work)
     }
+    /// A returned in-ring result must cross the existing completed boundary
+    /// before resuming the guest, so the host completion owner can publish it.
+    /// This is completion work, never permission to replay the call.
+    fn return_requires_host_boundary(&self) -> bool {
+        false
+    }
     fn resumes_operation(&self) -> bool {
         false
     }
@@ -901,7 +907,11 @@ fn finish<'a, C: EntryContext + 'a>(
             |ret| pending.install_result(ret),
         );
         if decision == crate::crossing::HostCrossingDecision::Refused {
-            if pending.host_work() {
+            if pending.host_work() || pending.return_requires_host_boundary() {
+                if let Some(task) = pending.task_state() {
+                    task.orig_arg0
+                        .store(original_argument0, core::sync::atomic::Ordering::Relaxed);
+                }
                 pending.publish_work(false);
                 return CompletionRoute::WithWork;
             }
@@ -915,7 +925,7 @@ fn finish<'a, C: EntryContext + 'a>(
         && pending.host_work()
         && pending.crossing_set() == crate::crossing::HostCrossingSet::Aarch64
         && result == FamilyCompletion::Forward;
-    let route = if replay {
+    let route = if replay || (run.returned.is_some() && pending.return_requires_host_boundary()) {
         CompletionRoute::WithWork
     } else {
         completion_route(result, pending.host_work())
