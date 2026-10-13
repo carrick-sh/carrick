@@ -929,7 +929,12 @@ pub(super) fn create_vcpu_with_permit(
     // retries; only the terminal outcome registers or releases it.
     let created = create_admitted(|| {
         create_with_no_resources_backpressure("hv_vcpu_create", || vm.vcpu_create())
-    });
+    })
+    .map_err(|violation| {
+        TrapError::Hypervisor(format!(
+            "vCPU creation refused by carrier topology: {violation:?}"
+        ))
+    })?;
     match created {
         Ok(vcpu) => {
             if let Some(permit) = permit {
@@ -962,7 +967,11 @@ pub(super) fn create_vcpu(
     // Existing-VM vCPUs are admitted by the in-process scheduler. Applying the
     // VM-creation permit here would duplicate that scheduler's bounded vCPU
     // accounting.
-    match create_admitted(|| vm.vcpu_create()) {
+    match create_admitted(|| vm.vcpu_create()).map_err(|violation| {
+        TrapError::Hypervisor(format!(
+            "vCPU creation refused by carrier topology: {violation:?}"
+        ))
+    })? {
         Ok(vcpu) => {
             vcpu_created();
             let guard = SetupVcpuGuard::new(vcpu, SetupVcpuCleanup::DestroyOnError);
