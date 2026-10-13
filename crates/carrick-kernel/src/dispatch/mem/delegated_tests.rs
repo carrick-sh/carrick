@@ -561,6 +561,80 @@ fn admitted_file_byte_service_preserves_last_page_and_refuses_beyond_eof() {
 }
 
 #[test]
+fn guest_protection_journal_preserves_owner_file_source_for_fork() {
+    let mut dispatcher = SyscallDispatcher::new();
+    install_host_file_fd(&dispatcher, FILE_FD, &[0x5a; 4 * PAGE as usize]);
+    let root = Root::admit(&dispatcher);
+    let mut memory = arena_memory();
+    let file = returned(host_mmap(
+        &mut dispatcher,
+        &mut memory,
+        0,
+        4 * PAGE,
+        LINUX_PROT_READ | LINUX_PROT_WRITE,
+        LINUX_MAP_PRIVATE,
+        FILE_FD,
+    )) as u64;
+    let source = root.lock().mapping(file).unwrap().host_backing.unwrap();
+    assert!(
+        dispatcher
+            .mem()
+            .lock()
+            .semantic_vmas
+            .overlapping(file, file + 4 * PAGE)
+            .next()
+            .is_none()
+    );
+    let spaces = Arc::new(carrick_sched_core::AddressSpaces::new());
+    let key = root.mm.raw();
+    let index = spaces.publish_closed(key, 0x1_0000, 0x1_0000).unwrap();
+    spaces.open(index);
+    dispatcher
+        .mem()
+        .mem
+        .state
+        .bind_test_spaces(key, Arc::clone(&spaces));
+    let editor = spaces
+        .try_begin_edit(index, key, std::num::NonZeroU64::new(1).unwrap())
+        .unwrap();
+    editor
+        .journal_protect(file + PAGE, file + 3 * PAGE, 1)
+        .unwrap();
+    drop(editor);
+    // The first host observation settles the real EL1 permission journal.
+    drop(dispatcher.mem().lock());
+    for page in 0..4 {
+        let mapping = root
+            .lock()
+            .mapping(file + page * PAGE)
+            .expect("settling a permission edit must not retire an owner file page");
+        assert_eq!(
+            mapping.host_backing,
+            source.advance(mapping.range.start() - file)
+        );
+        assert_eq!(
+            mapping.protection.bits(),
+            if (1..3).contains(&page) { 1 } else { 3 }
+        );
+    }
+    let child = fork_child(&dispatcher);
+    let child_root = root.publish_child(&child);
+    assert_eq!(
+        fork_commit(&dispatcher, &child),
+        Ok(El1Admission::Delegated)
+    );
+    assert_eq!(
+        child_root.lock().mapping(file + PAGE).unwrap().host_backing,
+        source.advance(PAGE)
+    );
+    let rows = child.mem().lock().observed_vmas().as_slice().to_vec();
+    assert!(rows.iter().any(|row| row.start <= file + PAGE
+        && file + 3 * PAGE <= row.end
+        && row.read
+        && !row.write));
+}
+
+#[test]
 fn admitted_private_file_mmap_publishes_owner_backing_before_fork() {
     let mut dispatcher = SyscallDispatcher::new();
     install_host_file_fd(&dispatcher, FILE_FD, &[0x5a; 2 * PAGE as usize]);
