@@ -11,18 +11,21 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+mod assignment;
 mod github;
 mod live;
 mod mac;
 mod site;
 
+pub use assignment::{
+    admit_assigned, assigned_job_key, pending_assignment, publish_assignment, standing_hook_script,
+};
 pub use mac::{
     EXEMPT_AGENTS, JOB_HOME, MacLedger, MacRecord, MacState, MacStep, MacTarget, ProcessFacts,
-    SCCACHE_CACHE_SIZE, SCCACHE_DIR, SCCACHE_SOCKET, admit_assigned, apply_job_env,
-    assigned_job_key, clone_runner_tree, denies_user, ensure_run_user_dir, exempt_agent,
-    hand_clone_to_run_user, listener_command, mac_hook_script, mac_step, pending_assignment,
-    prepare_run_once, process_facts, publish_assignment, remove_run_root, reset_job_area,
-    run_root_path, runner_manifest_for, verify_runner_tree, verify_toolchain,
+    SCCACHE_CACHE_SIZE, SCCACHE_DIR, SCCACHE_SOCKET, apply_job_env, clone_runner_tree, denies_user,
+    ensure_run_user_dir, exempt_agent, hand_clone_to_run_user, listener_command, mac_hook_script,
+    mac_step, prepare_run_once, process_facts, remove_run_root, reset_job_area, run_root_path,
+    runner_manifest_for, verify_runner_tree, verify_toolchain,
 };
 
 pub const POOL: &str = "carrick-ci";
@@ -129,6 +132,10 @@ pub struct Record {
     pub assigned: Option<JobId>,
     pub ip: Option<std::net::Ipv4Addr>,
     pub failure: Option<String>,
+    /// The true run/attempt/job a re-vetted hook request named; the
+    /// reservation `key` remains demand provenance.
+    #[serde(default)]
+    pub assigned_key: Option<JobKey>,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +163,9 @@ impl Record {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Ledger {
     pub rows: Vec<Record>,
+    /// Refused actual assignments survive restarts; a new attempt has a new key.
+    #[serde(default)]
+    refused: Vec<JobKey>,
 }
 impl Ledger {
     pub fn reserve(
@@ -207,25 +217,24 @@ impl Ledger {
             assigned: None,
             ip: None,
             failure: None,
+            assigned_key: None,
         };
         self.rows.push(row.clone());
         Ok(row)
     }
-    /// Whether `key` must not be reserved again: a clone for it is active,
-    /// a clone ran it, or it reached [`MAX_SERVES_PER_JOB`]. A clone that
-    /// closed without running this job (failed launch, drained, another job)
-    /// does not consume it.
+    /// Whether `key` must not be reserved again: it was refused, a clone ran
+    /// (or runs) it, a clone reserved for it is active and was not assigned
+    /// another job, or it reached [`MAX_SERVES_PER_JOB`]. A clone that closed
+    /// without a job (failed launch, drained) consumes one serve; a clone
+    /// GitHub assigned another job neither holds nor consumes it.
     pub fn served(&self, key: JobKey) -> bool {
-        served(
-            self.rows.iter().map(|r| {
-                (
-                    r.key,
-                    r.state != State::Destroyed,
-                    r.assigned == Some(key.job),
-                )
-            }),
-            key,
-        )
+        self.refused.contains(&key)
+            || served(
+                self.rows
+                    .iter()
+                    .map(|r| (r.key, r.state != State::Destroyed, r.assigned)),
+                key,
+            )
     }
     pub fn load(path: &Path) -> Result<Self, ScalerError> {
         match std::fs::read(path) {
@@ -238,12 +247,28 @@ impl Ledger {
         save_json(self, path)
     }
 }
-/// Shared re-serve rule over (key, active, ran-this-job) ledger rows.
-fn served(rows: impl Iterator<Item = (JobKey, bool, bool)>, key: JobKey) -> bool {
+impl assignment::Refusals for Ledger {
+    fn refused(&self) -> &[JobKey] {
+        &self.refused
+    }
+    fn refused_mut(&mut self) -> &mut Vec<JobKey> {
+        &mut self.refused
+    }
+    fn persist(&self, path: &Path) -> Result<(), ScalerError> {
+        self.save(path)
+    }
+}
+/// Shared re-serve rule over (reservation, active, actual job) ledger rows.
+/// Job ids are unique across runs and attempts, so an actual assignment
+/// anywhere in the ledger serves that job.
+fn served(rows: impl Iterator<Item = (JobKey, bool, Option<JobId>)>, key: JobKey) -> bool {
     let mut count = 0;
-    for (row_key, active, ran) in rows {
-        if row_key == key {
-            if active || ran {
+    for (row_key, active, assigned) in rows {
+        if assigned == Some(key.job) {
+            return true;
+        }
+        if row_key == key && assigned.is_none() {
+            if active {
                 return true;
             }
             count += 1;
@@ -820,7 +845,7 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
                     .map_err(|_| ScalerError::Guard("malformed GitHub run context"))?,
             };
             if controller {
-                mac::admit_assigned(&state_dir, &context, 0, Duration::from_secs(240))?;
+                admit_assigned(&state_dir, &context, 0, assignment::APPROVAL_LIMIT)?;
             } else {
                 read_policy(&policy_file, Some(0))?.authorize(&context)?;
             }

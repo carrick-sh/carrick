@@ -82,8 +82,13 @@ but cannot write approval. Drain and approval share the admission flock;
 restart can republish the same approval but cannot replace it with another
 run. Once approval exists, reconciliation does not re-vet a completed merge
 group that may already have left the queue. An actual job B is deduplicated
-while the unserved reservation A remains eligible for another runner.
-Willow's bound policy and the historical pilot remain unchanged.
+while the unserved reservation A remains eligible for another runner; a
+runner assigned another job neither holds A nor consumes one of A's serves.
+A refused actual assignment is recorded once (a stale merge group is also
+cancelled, as for demand) and never approved.
+The decision (`serve_assignment` in `ci_scaler/assignment.rs`) is shared with
+the standing KVM controller ([willow-pilot.md](willow-pilot.md#standing-mode-merge-queue),
+#333); only the transport differs. The historical pilot remains bound.
 
 This is Option A for [#256](https://github.com/carrick-sh/carrick/issues/256).
 A hook rejection fails the assigned job; it is not a release-to-queue API.

@@ -1,0 +1,606 @@
+//! Re-vetting a JIT runner's **actual** assignment, shared by cloudmac HVF
+//! runners (`mac-jit`, #256) and standing KVM clones (`standing`, #333).
+//!
+//! GitHub does not bind a JIT registration to the run its controller reserved
+//! it for: any queued job with the runner's labels may be assigned to it. The
+//! job-start hook therefore publishes the actual run through a credential-free
+//! rendezvous (`assignment.json` in the runner's state directory) and waits.
+//! The credential-holding controller authenticates the request by runner id,
+//! re-vets that run exactly as it vets demand (same admission, attempt and,
+//! for a merge group, in-repository pull-request heads), records the actual
+//! job durably and only then publishes a root-owned `approved-policy` bound to
+//! the actual run, attempt and SHA. A refused assignment is recorded once and
+//! gets no approval: the hook's deadline kills the session before any step.
+//!
+//! Only the transport differs per controller ([`AssignmentExchange`]): SSH to
+//! the root-only `mac-quiesce --assignment` on cloudmac, or the scoped PVE
+//! guest agent for a KVM clone.
+use super::github::Github;
+use super::*;
+use serde_json::Value;
+
+/// Literal hook command in `scripts/ci/admit-job.sh` (the KVM guest path).
+pub(super) const HOOK_COMMAND: &str = "/usr/local/bin/carrick-xtask ci-scaler admit-job";
+/// How long a hook waits for the controller's approval before it fails closed.
+pub(super) const APPROVAL_LIMIT: Duration = Duration::from_secs(240);
+/// Upper bound of one hook request; a larger one is refused unread.
+pub(super) const REQUEST_LIMIT: usize = 8192;
+
+/// The shared terminal job-start hook with `command` substituted for its
+/// single policy decision. Everything else (the session kill) is unchanged.
+pub(super) fn hook_script(command: &str) -> Result<String, ScalerError> {
+    let source = include_str!("../../../../scripts/ci/admit-job.sh");
+    if source.matches(HOOK_COMMAND).count() != 1 {
+        return Err(ScalerError::Guard("job-start hook command is not unique"));
+    }
+    Ok(source.replace(HOOK_COMMAND, command))
+}
+
+/// The hook a standing KVM clone runs. The root-owned reservation policy
+/// admits the run the clone was minted for; any other assignment is admitted
+/// only after the controller re-vets it, else the session is killed.
+pub fn standing_hook_script() -> Result<String, ScalerError> {
+    hook_script(&format!("{HOOK_COMMAND} || {HOOK_COMMAND} --controller"))
+}
+
+/// Credential-free rendezvous: publish the actual context, then wait for a
+/// root-owned policy produced by the controller's GitHub re-vetting.
+pub fn admit_assigned(
+    state: &Path,
+    context: &JobContext,
+    owner: u32,
+    limit: Duration,
+) -> Result<(), ScalerError> {
+    Admission::Standing.authorize(context)?;
+    if context.run_id == 0 || context.run_attempt == 0 {
+        return Err(ScalerError::Guard("invalid assigned run identity"));
+    }
+    {
+        let _lock = admission_lock(state)?;
+        if state.join("draining").exists() {
+            return Err(ScalerError::Guard("runner is draining"));
+        }
+        let mut request = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(state.join("assignment.json"))?;
+        request.write_all(&serde_json::to_vec(context)?)?;
+        request.sync_all()?;
+    }
+    let deadline = Instant::now() + limit;
+    loop {
+        if state.join("approved-policy").exists() {
+            return read_policy(&state.join("approved-policy"), Some(owner))?.authorize(context);
+        }
+        if state.join("draining").exists() || Instant::now() >= deadline {
+            return Err(ScalerError::Guard("assigned run approval unavailable"));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Parse one hook request. Empty means the hook has not asked (yet).
+pub(super) fn parse_request(bytes: &[u8]) -> Result<Option<JobContext>, ScalerError> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes.len() > REQUEST_LIMIT {
+        return Err(ScalerError::Guard("assignment request too large"));
+    }
+    let context = serde_json::from_slice(bytes)?;
+    Admission::Standing.authorize(&context)?;
+    Ok(Some(context))
+}
+
+/// Read only the pre-created file beneath the fixed, root-owned state root.
+/// A job can request an identity; it cannot write approval or choose paths.
+pub fn pending_assignment(state: &Path) -> Result<Option<JobContext>, ScalerError> {
+    let _lock = admission_lock(state)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(state.join("assignment.json"))?;
+    let mut bytes = Vec::new();
+    file.take(REQUEST_LIMIT as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    parse_request(&bytes)
+}
+
+pub fn publish_assignment(state: &Path, policy: &JobPolicy) -> Result<(), ScalerError> {
+    let _lock = admission_lock(state)?;
+    if state.join("draining").exists() {
+        return Err(ScalerError::Guard("runner is draining"));
+    }
+    // Idempotent on controller restart; never replace approval with another run.
+    let path = state.join("approved-policy");
+    if path.exists() {
+        if read_policy(&path, Some(unsafe { libc::geteuid() }))? == *policy {
+            return Ok(());
+        }
+        return Err(ScalerError::Guard("assignment approval changed"));
+    }
+    let temp = state.join("approved-policy.tmp");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temp)?;
+    file.write_all(policy.render().as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(temp, path)?;
+    File::open(state)?.sync_all()?;
+    Ok(())
+}
+
+/// Authenticate a hook request against GitHub job metadata for this runner:
+/// exactly one job of the requested run/attempt runs on `runner`, with
+/// exactly the runner's `labels`.
+pub fn assigned_job_key(
+    context: &JobContext,
+    runner: RunnerId,
+    labels: &[&str],
+    jobs: &[Value],
+) -> Result<JobKey, ScalerError> {
+    Admission::Standing.authorize(context)?;
+    let jobs: Vec<_> = jobs
+        .iter()
+        .filter(|job| job["runner_id"].as_u64() == Some(runner.0))
+        .collect();
+    let [job] = jobs.as_slice() else {
+        return Err(ScalerError::Guard(
+            "actual assignment is not uniquely visible on GitHub",
+        ));
+    };
+    let actual: Vec<_> = job["labels"]
+        .as_array()
+        .ok_or(ScalerError::External("assigned labels"))?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    if !labels_match(labels, &actual) {
+        return Err(ScalerError::Guard("actual job has incompatible labels"));
+    }
+    Ok(JobKey {
+        run: RunId(context.run_id),
+        attempt: context.run_attempt,
+        job: JobId(
+            job["id"]
+                .as_u64()
+                .ok_or(ScalerError::External("actual job id"))?,
+        ),
+    })
+}
+
+/// A controller ledger that records per-job refusals durably.
+pub(super) trait Refusals {
+    fn refused(&self) -> &[JobKey];
+    fn refused_mut(&mut self) -> &mut Vec<JobKey>;
+    fn persist(&self, path: &Path) -> Result<(), ScalerError>;
+}
+
+/// Record and log a per-job refusal once; a new attempt has a new key. A
+/// merge group that left the queue is also cancelled, best effort.
+pub(super) fn refuse(
+    ledger: &mut impl Refusals,
+    key: JobKey,
+    error: &ScalerError,
+    path: &Path,
+    cancel: &mut impl FnMut(RunId) -> Result<(), ScalerError>,
+) -> Result<(), ScalerError> {
+    if ledger.refused().contains(&key) {
+        return Ok(());
+    }
+    ledger.refused_mut().push(key);
+    if let Err(error) = ledger.persist(path) {
+        ledger.refused_mut().pop();
+        return Err(error);
+    }
+    eprintln!(
+        "run={} attempt={} job={} refused: {error}; skipping",
+        key.run.0, key.attempt, key.job.0
+    );
+    if matches!(error, ScalerError::StaleMergeGroup) {
+        // Cancellation is best effort: insufficient permission or a run
+        // finishing concurrently must not starve another admitted job.
+        if let Err(error) = cancel(key.run) {
+            eprintln!(
+                "run={} stale cancellation failed: {error}; ignored",
+                key.run.0
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The hook's request as the controller's transport reports it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct AssignmentRequest {
+    pub(super) context: JobContext,
+    /// Approval already published (a restarted controller republishes nothing).
+    pub(super) approved: bool,
+    /// The one-use runner already exited.
+    pub(super) finished: bool,
+}
+
+/// The per-controller half of the rendezvous.
+pub(super) trait AssignmentExchange {
+    fn read(&mut self) -> Result<Option<AssignmentRequest>, ScalerError>;
+    fn approve(&mut self, policy: &JobPolicy) -> Result<(), ScalerError>;
+}
+
+/// The GitHub reads the re-vet needs; [`Github`] in production.
+pub(super) trait AssignmentApi {
+    fn run_jobs(&self, run: RunId, attempt: u32) -> Result<Vec<Value>, ScalerError>;
+    /// The same standing vet that admits demand.
+    fn revet(&self, key: JobKey) -> Result<JobPolicy, ScalerError>;
+    fn cancel(&self, run: RunId) -> Result<(), ScalerError>;
+}
+impl AssignmentApi for Github {
+    fn run_jobs(&self, run: RunId, attempt: u32) -> Result<Vec<Value>, ScalerError> {
+        self.jobs(&serde_json::json!({"id": run.0, "run_attempt": attempt}))
+    }
+    fn revet(&self, key: JobKey) -> Result<JobPolicy, ScalerError> {
+        self.vet(&Admission::Standing, key)
+    }
+    fn cancel(&self, run: RunId) -> Result<(), ScalerError> {
+        self.cancel_run(run)
+    }
+}
+
+/// What one rendezvous step decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Revetted {
+    /// No request: the hook has not asked (or its runner was admitted by
+    /// its reservation).
+    Idle,
+    /// Recorded; already approved, or the runner already exited.
+    Recorded(JobKey),
+    /// Re-vetted and approved with the actual run's own policy.
+    Approved(JobKey, JobPolicy),
+    /// Refused (recorded once); approval withheld, so the hook kills the job.
+    Refused(JobKey),
+}
+
+/// One rendezvous step for one runner. `record` makes the actual job key
+/// durable in the controller's ledger before any approval is published.
+/// Per-job refusals never fail the step; API/transport failures do.
+pub(super) fn serve_assignment<L: Refusals>(
+    api: &impl AssignmentApi,
+    exchange: &mut impl AssignmentExchange,
+    labels: &[&str],
+    runner: Option<RunnerId>,
+    ledger: &mut L,
+    path: &Path,
+    record: impl FnOnce(&mut L, JobKey) -> Result<(), ScalerError>,
+) -> Result<Revetted, ScalerError> {
+    let Some(request) = exchange.read()? else {
+        return Ok(Revetted::Idle);
+    };
+    let context = request.context;
+    Admission::Standing.authorize(&context)?;
+    let runner = runner.ok_or(ScalerError::Guard("assignment has no registered runner"))?;
+    let jobs = api.run_jobs(RunId(context.run_id), context.run_attempt)?;
+    let key = assigned_job_key(&context, runner, labels, &jobs)?;
+    record(ledger, key)?; // True assignment is durable BEFORE steps may run.
+    if request.approved || request.finished {
+        return Ok(Revetted::Recorded(key));
+    }
+    if ledger.refused().contains(&key) {
+        return Ok(Revetted::Refused(key)); // Withhold approval.
+    }
+    let policy = match api.revet(key) {
+        Ok(policy) => policy,
+        Err(error @ (ScalerError::Guard(_) | ScalerError::StaleMergeGroup)) => {
+            refuse(ledger, key, &error, path, &mut |run| api.cancel(run))?;
+            return Ok(Revetted::Refused(key));
+        }
+        Err(error) => return Err(error),
+    };
+    if let Err(error) = policy.authorize(&context) {
+        refuse(ledger, key, &error, path, &mut |_| Ok(()))?;
+        return Ok(Revetted::Refused(key));
+    }
+    exchange.approve(&policy)?;
+    Ok(Revetted::Approved(key, policy))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::cell::RefCell;
+
+    const RUNNER: RunnerId = RunnerId(700);
+
+    fn context(run: u64, event: &str, git_ref: &str, sha: &str) -> JobContext {
+        JobContext {
+            repository: REPOSITORY.into(),
+            event: event.into(),
+            workflow_ref: format!("{REPOSITORY}/{KERNEL_RUNTIME_WORKFLOW}@{git_ref}"),
+            git_ref: git_ref.into(),
+            sha: sha.into(),
+            run_id: run,
+            run_attempt: 1,
+        }
+    }
+    /// Run A: the push to main the clone was minted for.
+    fn run_a() -> JobContext {
+        context(10, "push", "refs/heads/main", &"a".repeat(40))
+    }
+    /// Run B: a merge group GitHub assigned to that clone instead.
+    fn run_b() -> JobContext {
+        context(
+            20,
+            "merge_group",
+            "refs/heads/gh-readonly-queue/main/pr-328-6c3b23300",
+            &"b".repeat(40),
+        )
+    }
+    fn key(context: &JobContext, job: u64) -> JobKey {
+        JobKey {
+            run: RunId(context.run_id),
+            attempt: context.run_attempt,
+            job: JobId(job),
+        }
+    }
+    fn bound(context: &JobContext) -> JobPolicy {
+        JobPolicy::Bound(RunBinding {
+            run: RunId(context.run_id),
+            attempt: context.run_attempt,
+            sha: context.sha.clone(),
+        })
+    }
+
+    /// GitHub for the fixture: B's KVM job runs on this clone's runner.
+    struct FakeGithub {
+        vet: RefCell<Option<Result<JobPolicy, ScalerError>>>,
+        cancelled: RefCell<Vec<RunId>>,
+    }
+    impl FakeGithub {
+        fn vetting(result: Result<JobPolicy, ScalerError>) -> Self {
+            Self {
+                vet: RefCell::new(Some(result)),
+                cancelled: RefCell::new(Vec::new()),
+            }
+        }
+    }
+    impl AssignmentApi for FakeGithub {
+        fn run_jobs(&self, run: RunId, attempt: u32) -> Result<Vec<Value>, ScalerError> {
+            assert_eq!(
+                (run, attempt),
+                (RunId(20), 1),
+                "jobs of the actual run only"
+            );
+            Ok(vec![
+                json!({"id":21,"runner_id":RUNNER.0,"labels":LABELS}),
+                json!({"id":22,"runner_id":701,"labels":LABELS}),
+            ])
+        }
+        fn revet(&self, key: JobKey) -> Result<JobPolicy, ScalerError> {
+            assert_eq!(key, key_b(), "the actual assignment is re-vetted, not A");
+            self.vet
+                .borrow_mut()
+                .take()
+                .unwrap_or_else(|| panic!("re-vetted twice"))
+        }
+        fn cancel(&self, run: RunId) -> Result<(), ScalerError> {
+            self.cancelled.borrow_mut().push(run);
+            Ok(())
+        }
+    }
+    fn key_b() -> JobKey {
+        key(&run_b(), 21)
+    }
+
+    /// The clone's rendezvous: the hook asked for `request`.
+    struct FakeGuest {
+        request: Option<AssignmentRequest>,
+        approved: Vec<JobPolicy>,
+    }
+    impl AssignmentExchange for FakeGuest {
+        fn read(&mut self) -> Result<Option<AssignmentRequest>, ScalerError> {
+            Ok(self.request.clone())
+        }
+        fn approve(&mut self, policy: &JobPolicy) -> Result<(), ScalerError> {
+            self.approved.push(policy.clone());
+            Ok(())
+        }
+    }
+    fn guest_asking(context: JobContext) -> FakeGuest {
+        FakeGuest {
+            request: Some(AssignmentRequest {
+                context,
+                approved: false,
+                finished: false,
+            }),
+            approved: Vec::new(),
+        }
+    }
+
+    /// The standing ledger with one clone reserved for A's KVM job.
+    fn minted_for_a(dir: &Path) -> (Ledger, Record, PathBuf) {
+        let path = dir.join("ledger.json");
+        let mut ledger = Ledger::default();
+        let mut row = ledger
+            .reserve(key(&run_a(), 11), &[], 100, Concurrency::ONE)
+            .unwrap();
+        row.state = State::Running;
+        row.runner = Some(RUNNER);
+        ledger.rows[0] = row.clone();
+        ledger.save(&path).unwrap();
+        (ledger, row, path)
+    }
+    fn serve(
+        gh: &FakeGithub,
+        guest: &mut FakeGuest,
+        ledger: &mut Ledger,
+        row: &mut Record,
+        path: &Path,
+    ) -> Result<Revetted, ScalerError> {
+        serve_assignment(
+            gh,
+            guest,
+            &LABELS,
+            row.runner,
+            ledger,
+            path,
+            |ledger, key| {
+                row.assigned = Some(key.job);
+                row.assigned_key = Some(key);
+                ledger.rows[0] = row.clone();
+                ledger.save(path)
+            },
+        )
+    }
+
+    #[test]
+    fn ci_scaler_standing_clone_for_run_a_admits_admissible_run_b_with_its_own_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, mut row, path) = minted_for_a(dir.path());
+        // The reservation's bound policy refuses B: the #333 failure.
+        let reservation = bound(&run_a());
+        assert!(reservation.authorize(&run_b()).is_err());
+        let gh = FakeGithub::vetting(Ok(bound(&run_b())));
+        let mut guest = guest_asking(run_b());
+        let outcome = serve(&gh, &mut guest, &mut ledger, &mut row, &path).unwrap();
+        assert_eq!(outcome, Revetted::Approved(key_b(), bound(&run_b())));
+        // B is admitted with its own policy, which still refuses A.
+        assert_eq!(guest.approved, vec![bound(&run_b())]);
+        assert!(guest.approved[0].authorize(&run_b()).is_ok());
+        assert!(guest.approved[0].authorize(&run_a()).is_err());
+        // B is durable before steps; A is still demand for another clone.
+        let ledger = Ledger::load(&path).unwrap();
+        assert_eq!(ledger.rows[0].assigned_key, Some(key_b()));
+        assert!(ledger.served(key_b()));
+        assert!(!ledger.served(key(&run_a(), 11)));
+        assert!(gh.cancelled.borrow().is_empty());
+    }
+
+    #[test]
+    fn ci_scaler_standing_refuses_inadmissible_run_b_and_re_serves_run_a() {
+        for refusal in [
+            ScalerError::StaleMergeGroup,
+            ScalerError::Guard("merge group contains a pull request from another repository"),
+        ] {
+            let stale = matches!(refusal, ScalerError::StaleMergeGroup);
+            let dir = tempfile::tempdir().unwrap();
+            let (mut ledger, mut row, path) = minted_for_a(dir.path());
+            let gh = FakeGithub::vetting(Err(refusal));
+            let mut guest = guest_asking(run_b());
+            let outcome = serve(&gh, &mut guest, &mut ledger, &mut row, &path).unwrap();
+            assert_eq!(outcome, Revetted::Refused(key_b()));
+            // No approval: the hook's deadline kills B before any step.
+            assert!(guest.approved.is_empty());
+            assert_eq!(
+                *gh.cancelled.borrow(),
+                if stale { vec![RunId(20)] } else { vec![] }
+            );
+            // A restart re-reads the request but never re-vets or approves B.
+            let mut ledger = Ledger::load(&path).unwrap();
+            assert_eq!(
+                serve(&gh, &mut guest, &mut ledger, &mut row, &path).unwrap(),
+                Revetted::Refused(key_b())
+            );
+            assert!(guest.approved.is_empty());
+            assert!(ledger.served(key_b()), "refused B is never served");
+            // A is re-served: with the clone still up (if budget allows) ...
+            let a = key(&run_a(), 11);
+            assert!(!ledger.served(a));
+            // ... and once the refused clone is gone, within budget one.
+            ledger.rows[0].state = State::Destroyed;
+            let again = ledger.reserve(a, &[], 200, Concurrency::ONE).unwrap();
+            assert_eq!(again.key, a);
+        }
+    }
+
+    #[test]
+    fn ci_scaler_assignment_api_failure_fails_the_step_without_refusing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, mut row, path) = minted_for_a(dir.path());
+        let gh = FakeGithub::vetting(Err(ScalerError::External("GitHub unavailable")));
+        let mut guest = guest_asking(run_b());
+        assert!(serve(&gh, &mut guest, &mut ledger, &mut row, &path).is_err());
+        assert!(guest.approved.is_empty());
+        assert!(ledger.refused.is_empty(), "a transient failure is retried");
+    }
+
+    #[test]
+    fn ci_scaler_assignment_is_authenticated_by_runner_and_never_widens_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, mut row, path) = minted_for_a(dir.path());
+        let gh = FakeGithub::vetting(Ok(bound(&run_b())));
+        // Untrusted events and other repositories never reach GitHub.
+        for (field, value) in [("event", "pull_request"), ("repository", "fork/carrick")] {
+            let mut untrusted = run_b();
+            match field {
+                "event" => untrusted.event = value.into(),
+                _ => untrusted.repository = value.into(),
+            }
+            let mut guest = guest_asking(untrusted);
+            assert!(serve(&gh, &mut guest, &mut ledger, &mut row, &path).is_err());
+            assert!(guest.approved.is_empty());
+        }
+        // A job of B on another runner is not this clone's assignment.
+        row.runner = Some(RunnerId(999));
+        let mut guest = guest_asking(run_b());
+        assert!(serve(&gh, &mut guest, &mut ledger, &mut row, &path).is_err());
+        assert!(guest.approved.is_empty());
+        assert_eq!(row.assigned, None);
+        // A vetted policy for another SHA than the hook reported is refused.
+        row.runner = Some(RUNNER);
+        let mut moved = run_b();
+        moved.sha = "c".repeat(40);
+        let mut guest = guest_asking(moved);
+        assert_eq!(
+            serve(&gh, &mut guest, &mut ledger, &mut row, &path).unwrap(),
+            Revetted::Refused(key_b())
+        );
+        assert!(guest.approved.is_empty());
+    }
+
+    #[test]
+    fn ci_scaler_recorded_or_finished_request_is_not_re_approved() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, mut row, path) = minted_for_a(dir.path());
+        let gh = FakeGithub {
+            vet: RefCell::new(None),
+            cancelled: RefCell::new(Vec::new()),
+        };
+        for (approved, finished) in [(true, false), (false, true)] {
+            let mut guest = guest_asking(run_b());
+            if let Some(request) = guest.request.as_mut() {
+                request.approved = approved;
+                request.finished = finished;
+            }
+            assert_eq!(
+                serve(&gh, &mut guest, &mut ledger, &mut row, &path).unwrap(),
+                Revetted::Recorded(key_b())
+            );
+            assert!(guest.approved.is_empty());
+        }
+        let mut idle = FakeGuest {
+            request: None,
+            approved: Vec::new(),
+        };
+        assert_eq!(
+            serve(&gh, &mut idle, &mut ledger, &mut row, &path).unwrap(),
+            Revetted::Idle
+        );
+    }
+
+    #[test]
+    fn ci_scaler_request_parsing_is_bounded_and_standing_only() {
+        assert_eq!(parse_request(b"").unwrap().map(|c| c.run_id), None);
+        let request = serde_json::to_vec(&run_b()).unwrap();
+        assert_eq!(parse_request(&request).unwrap().unwrap().run_id, 20);
+        assert!(parse_request(&vec![b' '; REQUEST_LIMIT + 1]).is_err());
+        let mut untrusted = run_b();
+        untrusted.event = "pull_request".into();
+        assert!(parse_request(&serde_json::to_vec(&untrusted).unwrap()).is_err());
+        assert!(parse_request(b"{").is_err());
+    }
+}

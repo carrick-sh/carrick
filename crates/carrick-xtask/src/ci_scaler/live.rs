@@ -1,4 +1,5 @@
 //! Local-only PVE transport and foreground lifecycle; secrets have no Debug impl.
+use super::assignment::Revetted;
 use super::github::Github;
 #[cfg(test)]
 use super::github::recover_registration;
@@ -32,16 +33,43 @@ struct GuestScript {
     path: &'static str,
     source: &'static str,
 }
+/// The job-start hook every clone runs (`ACTIONS_RUNNER_HOOK_JOB_STARTED`).
+const HOOK_PATH: &str = "/usr/local/bin/carrick-ci-admit-job.sh";
 const GUEST_SCRIPTS: [GuestScript; 2] = [
     GuestScript {
         path: "/usr/local/bin/carrick-ci-run-once",
         source: include_str!("../../../../scripts/ci/runner-once.sh"),
     },
     GuestScript {
-        path: "/usr/local/bin/carrick-ci-admit-job.sh",
+        path: HOOK_PATH,
         source: include_str!("../../../../scripts/ci/admit-job.sh"),
     },
 ];
+/// The bytes installed at `script.path`. A standing clone's hook falls back
+/// to the controller's re-vet of the actual assignment (#333); the pilot's
+/// hook admits only its approved SHA.
+fn guest_script_source(script: &GuestScript, admission: &Admission) -> Result<String, ScalerError> {
+    match admission {
+        Admission::Standing if script.path == HOOK_PATH => standing_hook_script(),
+        _ => Ok(script.source.to_owned()),
+    }
+}
+/// Guest state shared by the job-start hook and the controller (the hook's
+/// flock, drain marker and assignment rendezvous); created by the template.
+const GUEST_STATE: &str = "/run/carrick-ci";
+/// Root, under the hook's flock: report whether the rendezvous is settled
+/// (approved, started or draining) and otherwise the hook's request, if any.
+const GUEST_ASSIGNMENT_READ: &str = r#"cd /run/carrick-ci || exit 1
+if [ -e approved-policy ] || [ -e draining ] || [ -s admission.lock ]; then echo settled; exit 0; fi
+if [ -e /home/runner/runner.exit ]; then echo finished; else echo pending; fi
+if [ -f assignment.json ]; then head -c 8193 assignment.json; fi"#;
+/// Root, under the hook's flock: publish `$1` as the approved policy unless
+/// draining; idempotent, and never replaces an approval with another run.
+const GUEST_ASSIGNMENT_APPROVE: &str = r#"cd /run/carrick-ci || exit 1
+[ ! -e draining ] || exit 3
+if [ -e approved-policy ]; then [ "$(cat approved-policy)" = "$1" ] && exit 0; exit 4; fi
+umask 022
+printf '%s\n' "$1" > approved-policy.tmp && chmod 644 approved-policy.tmp && mv approved-policy.tmp approved-policy"#;
 fn script_install_command(path: &str, source: &str) -> String {
     format!(
         "umask 077; printf '%s' {} > {} && chmod 755 {}",
@@ -825,7 +853,7 @@ fn boot_and_register(
             &[
                 "/bin/sh",
                 "-c",
-                &script_install_command(script.path, script.source),
+                &script_install_command(script.path, &guest_script_source(script, admission)?),
             ],
         )?;
     }
@@ -833,18 +861,44 @@ fn boot_and_register(
         row,
         &["/bin/sh", "-c", "rm -f /usr/local/bin/carrick-ci-admit-job"],
     )?;
+    let standing = matches!(admission, Admission::Standing);
+    if standing {
+        // The re-vet half of the hook runs the template's own xtask; refuse a
+        // template whose xtask predates it rather than fail a job at set-up.
+        let help = pve.agent(
+            row,
+            &[
+                "/usr/local/bin/carrick-xtask",
+                "ci-scaler",
+                "admit-job",
+                "--help",
+            ],
+        )?;
+        if !help.contains("--controller") {
+            return Err(ScalerError::Guard(
+                "template xtask lacks admit-job --controller; rebuild template 300",
+            ));
+        }
+    }
     // Re-vet the reserved run now and bind the runner to it: the hook admits
-    // only this run, attempt and SHA (and, for a merge group, only groups
-    // whose pull-request heads all live in this repository).
+    // this run, attempt and SHA (and, for a merge group, only groups whose
+    // pull-request heads all live in this repository). A standing clone that
+    // GitHub assigns another job asks the controller to re-vet that one.
     let policy = gh.vet(admission, row.key)?;
     // The job-start hook reads this root-owned policy; jobs cannot write it.
+    // Only the runner-owned rendezvous request is writable by the hook.
+    let rendezvous = if standing {
+        format!(" && install -m 600 -o runner -g runner /dev/null {GUEST_STATE}/assignment.json")
+    } else {
+        String::new()
+    };
     pve.agent(
         row,
         &[
             "/bin/sh",
             "-c",
             &format!(
-                "install -d -m 755 /etc/carrick-ci; printf '%s\\n' {} > /etc/carrick-ci/policy; chmod 644 /etc/carrick-ci/policy",
+                "install -d -m 755 /etc/carrick-ci; printf '%s\\n' {} > /etc/carrick-ci/policy; chmod 644 /etc/carrick-ci/policy{rendezvous}",
                 crate::remote_accept::shell_quote(&policy.render())
             ),
         ],
@@ -1333,6 +1387,171 @@ fn ksm_matches(config: &Value, site: &Site) -> bool {
         || config["allow-ksm"].as_str() == Some("0")
 }
 
+/// What a clone reported for its assignment rendezvous.
+#[derive(Debug)]
+enum GuestRendezvous {
+    /// Approved, started (by its reservation or an approval) or draining.
+    Settled,
+    Open {
+        /// The one-use runner already exited.
+        finished: bool,
+        request: Option<JobContext>,
+    },
+}
+fn parse_guest_rendezvous(stdout: &str) -> Result<GuestRendezvous, ScalerError> {
+    let (status, request) = stdout.split_once('\n').unwrap_or((stdout, ""));
+    let finished = match status {
+        "settled" => return Ok(GuestRendezvous::Settled),
+        "finished" => true,
+        "pending" => false,
+        _ => return Err(ScalerError::External("guest assignment status")),
+    };
+    Ok(GuestRendezvous::Open {
+        finished,
+        request: assignment::parse_request(request.as_bytes())?,
+    })
+}
+/// The standing transport of the shared assignment re-vet: the scoped guest
+/// agent runs as root in the clone, under the job-start hook's flock.
+struct GuestExchange<'a> {
+    pve: &'a Pve,
+    row: Record,
+    /// Nothing more to serve on this clone.
+    settled: bool,
+}
+impl assignment::AssignmentExchange for GuestExchange<'_> {
+    fn read(&mut self) -> Result<Option<assignment::AssignmentRequest>, ScalerError> {
+        let lock = format!("{GUEST_STATE}/admission.lock");
+        let output = self.pve.agent(
+            &self.row,
+            &[
+                "/usr/bin/flock",
+                &lock,
+                "/bin/sh",
+                "-c",
+                GUEST_ASSIGNMENT_READ,
+            ],
+        )?;
+        match parse_guest_rendezvous(&output)? {
+            GuestRendezvous::Settled => {
+                self.settled = true;
+                Ok(None)
+            }
+            GuestRendezvous::Open { finished, request } => {
+                self.settled = finished;
+                Ok(request.map(|context| assignment::AssignmentRequest {
+                    context,
+                    approved: false,
+                    finished,
+                }))
+            }
+        }
+    }
+    fn approve(&mut self, policy: &JobPolicy) -> Result<(), ScalerError> {
+        let lock = format!("{GUEST_STATE}/admission.lock");
+        let output = self.pve.agent_output(
+            &self.row,
+            &[
+                "/usr/bin/flock",
+                &lock,
+                "/bin/sh",
+                "-c",
+                GUEST_ASSIGNMENT_APPROVE,
+                "sh",
+                &policy.render(),
+            ],
+        )?;
+        match output.exit {
+            GuestExit(0) => Ok(()),
+            GuestExit(3) => Err(ScalerError::Guard("runner is draining")),
+            GuestExit(4) => Err(ScalerError::Guard("assignment approval changed")),
+            _ => Err(ScalerError::External("guest assignment approval")),
+        }
+    }
+}
+/// Serve every standing clone's assignment rendezvous (#333): GitHub may
+/// assign a clone any queued job with its labels, not the one it was minted
+/// for. Runs on every poll, independent of reconciliation and admission
+/// backoff, well inside the hook's approval deadline. Failures are logged and
+/// retried on the next poll; they never block reconciliation or reaping.
+fn revet_assignments(
+    pve: &Pve,
+    gh: &Github,
+    ledger: &mut Ledger,
+    path: &Path,
+    settled: &mut Vec<String>,
+) {
+    settled.retain(|name| {
+        ledger
+            .rows
+            .iter()
+            .any(|r| r.name == *name && r.state != State::Destroyed)
+    });
+    let open: Vec<Record> = ledger
+        .rows
+        .iter()
+        .filter(|r| {
+            matches!(r.state, State::Registered | State::Running)
+                && r.runner.is_some()
+                && !settled.contains(&r.name)
+        })
+        .cloned()
+        .collect();
+    for mut row in open {
+        let mut exchange = GuestExchange {
+            pve,
+            row: row.clone(),
+            settled: false,
+        };
+        let runner = row.runner;
+        let outcome = assignment::serve_assignment(
+            gh,
+            &mut exchange,
+            &LABELS,
+            runner,
+            ledger,
+            path,
+            |ledger, key| {
+                row.assigned = Some(key.job);
+                row.assigned_key = Some(key);
+                update(ledger, &row, path)
+            },
+        );
+        let vm = row.vm.get();
+        match outcome {
+            Ok(Revetted::Idle) => {
+                if exchange.settled {
+                    settled.push(row.name);
+                }
+            }
+            Ok(Revetted::Approved(key, policy)) => {
+                println!(
+                    "vm={vm} reserved job={} assigned run={} attempt={} job={}: re-vetted; approved {}",
+                    row.key.job.0,
+                    key.run.0,
+                    key.attempt,
+                    key.job.0,
+                    policy.render()
+                );
+                settled.push(row.name);
+            }
+            Ok(Revetted::Refused(key) | Revetted::Recorded(key)) => {
+                println!(
+                    "vm={vm} reserved job={} assigned run={} attempt={} job={}: not approved",
+                    row.key.job.0, key.run.0, key.attempt, key.job.0
+                );
+                settled.push(row.name);
+            }
+            Err(error) => {
+                eprintln!("vm={vm} assignment re-vet failed: {error}; retried next poll");
+            }
+        }
+    }
+}
+
+/// Controller poll period; admission retries back off separately.
+const POLL: Duration = Duration::from_secs(30);
+
 /// Foreground Willow controller. The pilot admission always runs with one
 /// clone; standing mode is bounded by `limit` (at most two clones).
 pub(super) fn controller(
@@ -1395,7 +1614,12 @@ pub(super) fn controller(
     let mut reconcile = Instant::now() - Duration::from_secs(60);
     let mut frozen = true;
     let mut backoff = Backoff::default();
+    let mut admit_after = Instant::now();
+    let mut settled = Vec::new();
     loop {
+        if matches!(admission, Admission::Standing) {
+            revet_assignments(&pve, &gh, &mut ledger, &path, &mut settled);
+        }
         if reconcile.elapsed() >= Duration::from_secs(60) {
             let pass = reconcile_all(&pve, &gh, &mut ledger, dir, &path, (group, admission))?;
             if pass.finished > 0 && one_job {
@@ -1415,7 +1639,7 @@ pub(super) fn controller(
             .iter()
             .filter(|r| r.state != State::Destroyed)
             .count();
-        if !frozen && active < usize::from(limit.get()) {
+        if !frozen && active < usize::from(limit.get()) && Instant::now() >= admit_after {
             match admit_one(
                 &pve,
                 &gh,
@@ -1432,10 +1656,11 @@ pub(super) fn controller(
                     eprintln!("admission pass failed: {error}; backing off");
                     frozen = true;
                     backoff.grow();
+                    admit_after = Instant::now() + backoff.delay();
                 }
             }
         }
-        std::thread::sleep(backoff.delay());
+        std::thread::sleep(POLL);
     }
 }
 
@@ -1496,22 +1721,123 @@ mod tests {
     #[test]
     fn serial_host_guest_payload_installs_exact_bytes_without_expansion() {
         let dir = tempfile::tempdir().unwrap();
-        for (i, script) in GUEST_SCRIPTS.iter().enumerate() {
-            let path = dir.path().join(format!("payload-{i}"));
-            let status = Command::new("/bin/sh")
-                .args([
-                    "-c",
-                    &script_install_command(path.to_str().unwrap(), script.source),
-                ])
-                .status()
-                .unwrap();
-            assert!(status.success());
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), script.source);
-            assert_eq!(
-                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
-                0o755
-            );
+        let pilot = Admission::pilot(&"a".repeat(40)).unwrap();
+        for admission in [pilot, Admission::Standing] {
+            for (i, script) in GUEST_SCRIPTS.iter().enumerate() {
+                let source = guest_script_source(script, &admission).unwrap();
+                let path = dir.path().join(format!("payload-{i}"));
+                let status = Command::new("/bin/sh")
+                    .args([
+                        "-c",
+                        &script_install_command(path.to_str().unwrap(), &source),
+                    ])
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o755
+                );
+                // Only a standing clone's hook may fall back to a re-vet.
+                let revet = script.path == HOOK_PATH && admission == Admission::Standing;
+                assert_eq!(source.contains("admit-job --controller"), revet);
+            }
         }
+    }
+    /// Run a guest rendezvous script in `state` (standing in for
+    /// `/run/carrick-ci`), as the guest agent does under the hook's flock.
+    fn guest_script(state: &Path, script: &str, arg: &str) -> std::process::Output {
+        let script = script.replace("/run/carrick-ci", state.to_str().unwrap());
+        Command::new("/bin/sh")
+            .args(["-c", &script, "sh", arg])
+            .output()
+            .unwrap()
+    }
+    #[test]
+    fn serial_host_guest_rendezvous_reads_requests_and_publishes_one_approval() {
+        // The shell halves use the same state directory and request bound.
+        for script in [GUEST_ASSIGNMENT_READ, GUEST_ASSIGNMENT_APPROVE] {
+            assert!(script.starts_with(&format!("cd {GUEST_STATE} ")));
+        }
+        assert!(GUEST_ASSIGNMENT_READ.contains(&format!(
+            "head -c {} assignment.json",
+            assignment::REQUEST_LIMIT + 1
+        )));
+        let state = tempfile::tempdir().unwrap();
+        let state = state.path();
+        std::fs::set_permissions(state, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(state.join("admission.lock"), "").unwrap();
+        std::fs::write(state.join("assignment.json"), "").unwrap();
+        let read = |state: &Path| {
+            let output = guest_script(state, GUEST_ASSIGNMENT_READ, "");
+            assert!(output.status.success());
+            parse_guest_rendezvous(std::str::from_utf8(&output.stdout).unwrap()).unwrap()
+        };
+        // Before the hook asks: open, no request.
+        assert!(matches!(
+            read(state),
+            GuestRendezvous::Open {
+                finished: false,
+                request: None
+            }
+        ));
+        // The real hook rendezvous writes run B's request (and then waits).
+        let b = JobContext {
+            repository: REPOSITORY.into(),
+            event: "merge_group".into(),
+            workflow_ref: format!(
+                "{REPOSITORY}/{KERNEL_RUNTIME_WORKFLOW}@refs/heads/gh-readonly-queue/main/pr-328-x"
+            ),
+            git_ref: "refs/heads/gh-readonly-queue/main/pr-328-x".into(),
+            sha: "b".repeat(40),
+            run_id: 20,
+            run_attempt: 1,
+        };
+        let uid = unsafe { libc::geteuid() };
+        assert!(admit_assigned(state, &b, uid, Duration::ZERO).is_err());
+        let GuestRendezvous::Open {
+            finished: false,
+            request: Some(request),
+        } = read(state)
+        else {
+            panic!("hook request not visible to the controller");
+        };
+        assert_eq!((request.run_id, request.sha.as_str()), (20, b.sha.as_str()));
+        // Approval for B: published once, idempotent, never replaced.
+        let policy = JobPolicy::Bound(RunBinding {
+            run: RunId(20),
+            attempt: 1,
+            sha: b.sha.clone(),
+        });
+        assert_eq!(approve_in(state, &policy), Some(0));
+        assert_eq!(approve_in(state, &policy), Some(0));
+        let other = JobPolicy::Bound(RunBinding {
+            run: RunId(10),
+            attempt: 1,
+            sha: "a".repeat(40),
+        });
+        assert_eq!(approve_in(state, &other), Some(4));
+        // The hook accepts exactly that root-owned (here: owner-owned) policy.
+        assert_eq!(
+            read_policy(&state.join("approved-policy"), Some(uid)).unwrap(),
+            policy
+        );
+        assert!(admit_assigned(state, &b, uid, Duration::ZERO).is_ok());
+        assert!(matches!(read(state), GuestRendezvous::Settled));
+        // A draining clone never receives an approval.
+        let drained = tempfile::tempdir().unwrap();
+        std::fs::write(drained.path().join("admission.lock"), "").unwrap();
+        std::fs::write(drained.path().join("draining"), "").unwrap();
+        assert_eq!(approve_in(drained.path(), &policy), Some(3));
+        assert!(!drained.path().join("approved-policy").exists());
+        assert!(matches!(read(drained.path()), GuestRendezvous::Settled));
+        assert!(parse_guest_rendezvous("bogus\n").is_err());
+    }
+    fn approve_in(state: &Path, policy: &JobPolicy) -> Option<i32> {
+        guest_script(state, GUEST_ASSIGNMENT_APPROVE, &policy.render())
+            .status
+            .code()
     }
     #[test]
     fn official_runner_hook_has_a_supported_script_extension() {
@@ -1670,6 +1996,7 @@ mod tests {
         row.state = State::Reaping;
         let mut ledger = Ledger {
             rows: vec![row.clone()],
+            ..Ledger::default()
         };
         let path = dir.path().join("ledger.json");
         ledger.save(&path).unwrap();
