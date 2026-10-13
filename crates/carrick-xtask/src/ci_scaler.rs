@@ -53,6 +53,8 @@ pub enum ScalerError {
     Kvm { version: i32, errno: i32 },
     #[error("{0}")]
     Guard(&'static str),
+    #[error("merge group is no longer queued")]
+    StaleMergeGroup,
     #[error("{0}")]
     Usage(String),
     #[error("I/O: {0}")]
