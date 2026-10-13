@@ -713,6 +713,12 @@ fn boot_and_register(
         return Err(ScalerError::Guard("host admission denied before boot"));
     }
     pve.guard(row)?;
+    // A linked clone inherits the template's `allow-ksm: 0`; refuse one
+    // that lost it before the guest runs.
+    let config = pve.request(PveCall::Get, &format!("{}/config", pve.base(row.vm)))?;
+    if !ksm_matches(&config, &pve.site) {
+        return Err(ScalerError::Guard("clone may join KSM page merging"));
+    }
     // The clone inherits 300.fw; give it its own ipfilter address, then
     // prove the whole firewall before the guest can send a packet.
     pve.set_clone_ipfilter(row.vm.get())?;
@@ -1317,6 +1323,14 @@ fn qualified_template(config: &Value, site: &Site) -> bool {
         && config["net0"].as_str().is_some_and(|s| {
             s.contains(&bridge) && (!site.isolates_bridge() || s.contains("firewall=1"))
         })
+        && ksm_matches(config, site)
+}
+/// On a site that keeps CI out of KSM, the VM config must say
+/// `allow-ksm: 0` (PVE's default is 1, and absence means 1).
+fn ksm_matches(config: &Value, site: &Site) -> bool {
+    site.allows_ksm()
+        || config["allow-ksm"].as_u64() == Some(0)
+        || config["allow-ksm"].as_str() == Some("0")
 }
 
 /// Foreground Willow controller. The pilot admission always runs with one
@@ -1759,9 +1773,14 @@ mod tests {
         let mut config = json!({
             "cpu":"host", "cores":8, "memory":"16384",
             "scsi0":"local:300/base-300-disk-0.qcow2,size=100G",
-            "net0":"virtio=BC:24:11:00:00:01,bridge=vmbr1,firewall=1"
+            "net0":"virtio=BC:24:11:00:00:01,bridge=vmbr1,firewall=1",
+            "allow-ksm":0
         });
         assert!(qualified_template(&config, contabo));
+        // Without `allow-ksm: 0` (PVE default 1) a Contabo template is refused.
+        config.as_object_mut().unwrap().remove("allow-ksm");
+        assert!(!qualified_template(&config, contabo));
+        config["allow-ksm"] = json!(0);
         assert!(!qualified_template(&config, willow));
         config["net0"] = json!("virtio=BC:24:11:00:00:01,bridge=vmbr0,firewall=1");
         assert!(!qualified_template(&config, contabo));
@@ -1828,6 +1847,20 @@ mod tests {
             {"pos":2,"type":"out","action":"DROP","dest":blocked,"enable":1}
         ]);
         assert!(!vm_firewall_matches(site, &options, &reordered));
+    }
+    #[test]
+    fn ksm_is_refused_only_where_the_site_keeps_ci_out() {
+        let contabo = &super::site::CONTABO;
+        let willow = &super::site::WILLOW;
+        for config in [json!({"allow-ksm":0}), json!({"allow-ksm":"0"})] {
+            assert!(ksm_matches(&config, contabo));
+        }
+        // Absent means PVE's default, 1: refused on Contabo.
+        for config in [json!({}), json!({"allow-ksm":1}), json!({"allow-ksm":"1"})] {
+            assert!(!ksm_matches(&config, contabo), "{config}");
+            // Willow keeps the default and needs nothing.
+            assert!(ksm_matches(&config, willow));
+        }
     }
     #[test]
     fn ipfilter_holds_exactly_the_vms_own_address() {

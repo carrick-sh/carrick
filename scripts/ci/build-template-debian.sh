@@ -29,7 +29,7 @@ while IFS='=' read -r name value; do
   [[ $name =~ ^SITE_[A-Z_]+$ && $value =~ ^[A-Za-z0-9._=/,-]+$ ]] || { echo "bad site line: $name" >&2; exit 1; }
   site[$name]=$value
 done < <("$xtask" ci-scaler site)
-for name in SITE_NODE SITE_API_HOST SITE_STORAGE SITE_DISK_FORMAT SITE_BRIDGE SITE_CORES SITE_MEMORY_MIB SITE_DISK_GIB SITE_TEMPLATE_IPCONFIG SITE_NAMESERVER SITE_VM_FIREWALL SITE_API_CA; do
+for name in SITE_NODE SITE_API_HOST SITE_STORAGE SITE_DISK_FORMAT SITE_BRIDGE SITE_CORES SITE_MEMORY_MIB SITE_DISK_GIB SITE_TEMPLATE_IPCONFIG SITE_NAMESERVER SITE_VM_FIREWALL SITE_API_CA SITE_ALLOW_KSM; do
   [[ -n ${site[$name]:-} ]] || { echo "site lacks $name" >&2; exit 1; }
 done
 [[ ${site[SITE_NODE]} == $(hostname -s) ]] || { echo 'site node is not this host' >&2; exit 1; }
@@ -190,6 +190,14 @@ genisoimage -quiet -output /var/lib/vz/template/iso/carrick-template-300-seed.is
 # cannot reach other VMs, the host or any private range (public IPv4 only).
 net0="virtio,bridge=$bridge"
 create_extra=()
+# Sites whose clones share the host with credential-holding VMs keep CI out
+# of KSM page merging (a cross-VM timing side channel); linked clones
+# inherit the setting and the controller checks it before each boot.
+case ${site[SITE_ALLOW_KSM]} in
+  1) ;;
+  0) create_extra+=(--allow-ksm 0) ;;
+  *) echo 'bad site KSM flag' >&2; exit 1 ;;
+esac
 if [[ $vm_firewall == 1 ]]; then
   # The datacenter firewall must be on for a VM firewall to apply.
   awk '/^\[/{o=($0=="[OPTIONS]")} o && $1=="enable:" && $2=="1"{f=1} END{exit !f}' /etc/pve/firewall/cluster.fw ||
@@ -202,7 +210,7 @@ if [[ $vm_firewall == 1 ]]; then
   net0="$net0,firewall=1"
   # ipfilter admits only the addresses in ipconfig0, so the template needs
   # its static address there while it provisions from the seed ISO.
-  create_extra=(--ipconfig0 "$ipconfig")
+  create_extra+=(--ipconfig0 "$ipconfig")
 fi
 qm create 300 --name carrick-debian13-kvm --pool carrick-ci --cores "$cores" --memory "$memory_mib" --balloon 0 --cpulimit "$cores" --cpu host \
   --net0 "$net0" --scsihw virtio-scsi-pci --serial0 socket --vga serial0 --agent enabled=1 "${create_extra[@]}"
