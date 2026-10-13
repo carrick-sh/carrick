@@ -73,8 +73,8 @@ pub(super) const WILLOW: Site = Site {
 /// The dedicated Contabo host (issue #287): NAT bridge `vmbr1` (no DHCP),
 /// directory storage, and the agent-worker VMs/template protected.
 pub(super) const CONTABO: Site = Site {
-    node: "m28112",
-    api_host: "m28112.contaboserver.net",
+    node: "carrick-ctb",
+    api_host: "carrick-ctb.turkey-moth.ts.net",
     api_ca: Some("/etc/pve/pve-root-ca.pem"),
     storage: "local",
     headroom: Headroom::Directory,
@@ -379,8 +379,8 @@ mod tests {
         assert_eq!(
             CONTABO,
             Site {
-                node: "m28112",
-                api_host: "m28112.contaboserver.net",
+                node: "carrick-ctb",
+                api_host: "carrick-ctb.turkey-moth.ts.net",
                 api_ca: Some("/etc/pve/pve-root-ca.pem"),
                 storage: "local",
                 headroom: Headroom::Directory,
@@ -421,7 +421,7 @@ IN ACCEPT -source 10.77.0.1 -p tcp -dport 22 -log nolog # controller SSH from th
 OUT DROP -dest 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10,154.38.161.112 -log nolog # no private, shared, link-local or host destination\n\
 OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n"
         );
-        assert_eq!(CONTABO.qemu(308), "/nodes/m28112/qemu/308");
+        assert_eq!(CONTABO.qemu(308), "/nodes/carrick-ctb/qemu/308");
     }
     #[test]
     fn template_builder_inputs_are_bare_tokens() {
@@ -445,10 +445,10 @@ OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n
     #[test]
     fn site_selection_fails_closed_on_an_unknown_host() {
         assert_eq!(Site::for_hostname("willow\n").unwrap(), WILLOW);
-        assert_eq!(Site::for_hostname("m28112").unwrap(), CONTABO);
-        // Contabo's /etc/hostname is the FQDN.
+        assert_eq!(Site::for_hostname("carrick-ctb").unwrap(), CONTABO);
+        // Contabo's /etc/hostname may hold the FQDN (its Tailscale name).
         assert_eq!(
-            Site::for_hostname("m28112.contaboserver.net\n").unwrap(),
+            Site::for_hostname("carrick-ctb.turkey-moth.ts.net\n").unwrap(),
             CONTABO
         );
         for host in [
@@ -456,9 +456,12 @@ OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n
             "Willow",
             "willow2",
             "carrick-ctb-w1",
-            "m28112.evil.example",
-            "contaboserver.net",
-            "m28112.contaboserver.net.evil",
+            "carrick-ctb.evil.example",
+            "turkey-moth.ts.net",
+            "carrick-ctb.turkey-moth.ts.net.evil",
+            // The pre-rename node name no longer selects a site.
+            "m28112",
+            "m28112.contaboserver.net",
         ] {
             assert!(
                 matches!(Site::for_hostname(host), Err(ScalerError::Guard(_))),
