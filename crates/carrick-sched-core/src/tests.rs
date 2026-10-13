@@ -2636,3 +2636,36 @@ fn contended_timer_expiry_rearms_without_consuming_the_park() {
     assert_eq!(zone.expire_timer_and_rearm(SLOT, 510, 123, 10), None);
     assert_eq!(zone.switch_in_full(SLOT).unwrap().result, Some(123));
 }
+
+#[test]
+fn unplaceable_parent_host_handback_consumes_one_park() {
+    let zone = zone();
+    let address = 0x3210;
+    let parent = park(&zone, 41, address);
+    host_publish(&zone, SLOT, 0, Some(0), 1);
+    zone.enter_guest(SLOT);
+    let guard = zone
+        .lock(ZoneTables::bucket_of(MM, address), &HostWait)
+        .unwrap();
+    assert_eq!(
+        zone.wake_placed(
+            &guard,
+            MM,
+            address,
+            u32::MAX,
+            1,
+            Waker::El1 { slot: SLOT },
+            &mut [],
+            &mut WakeEffects::default()
+        ),
+        Err(WakeRefusal::Unplaceable)
+    );
+    drop(guard);
+    assert!(matches!(zone.record(parent).claim(), Claim::Parked { .. }));
+    let ready = wake(&zone, address, 1, Waker::Host).unwrap();
+    assert_eq!(ready, [parent]);
+    assert!(wake(&zone, address, 1, Waker::Host).unwrap().is_empty());
+    assert_eq!(zone.counters.host_wakes.load(Ordering::Acquire), 1);
+    assert_eq!(zone.record(parent).entry_count(), 0);
+    assert_eq!(zone.record(parent).handback(), Some(Handback::Woken));
+}
