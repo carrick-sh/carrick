@@ -1536,6 +1536,34 @@ fn shutdown_carrier_with_terminal(
     ) -> Result<(), String>,
     wait_observer: impl FnOnce(),
 ) -> Result<CarrierSnapshot, RuntimeError> {
+    shutdown_carrier_with_terminal_drained(
+        carrier,
+        destroy,
+        artifact_path,
+        publish,
+        wait_observer,
+        || {
+            if let Some(runtime) = carrier.kernel_runtime() {
+                runtime.directory().shutdown_carrier_runtime()
+            } else {
+                Ok(())
+            }
+        },
+    )
+}
+
+fn shutdown_carrier_with_terminal_drained(
+    carrier: &CarrierRuntime,
+    destroy: impl FnOnce() -> Result<(), RuntimeError>,
+    artifact_path: Option<&std::path::Path>,
+    publish: impl FnOnce(
+        &std::path::Path,
+        &crate::vm_lifecycle::VmLifecycleSnapshot,
+        &CarrierScopeId,
+    ) -> Result<(), String>,
+    wait_observer: impl FnOnce(),
+    drain: impl FnOnce() -> Result<(), RuntimeError>,
+) -> Result<CarrierSnapshot, RuntimeError> {
     match carrier.begin_close() {
         Ok(()) => {}
         Err(RuntimeError::CarrierClosed) => return carrier.snapshot(),
@@ -1581,18 +1609,16 @@ fn shutdown_carrier_with_terminal(
         // The persistent executor pool and every logical process job belong
         // to the carrier, not to whichever container root happens to finish
         // first. Only the terminal claimant may drain and close them.
-        if let Some(runtime) = carrier.kernel_runtime()
-            && let Err(error) = runtime.directory().shutdown_carrier_runtime()
-        {
-            let mut state = carrier.inner.state.lock();
-            if state.admission == CarrierAdmissionState::Closing
-                && state.terminal_claim == CarrierTerminalClaim::Destroying
-            {
-                state.terminal_claim = CarrierTerminalClaim::Unclaimed;
-                carrier.inner.changed.notify_all();
-            }
-            return Err(error);
-        }
+        // A failed executor still joins its worker during pool shutdown. Its
+        // error must remain visible, but it cannot veto destruction of the VM:
+        // doing so leaves the topology in TearingDown and makes the next
+        // container reuse generation 1's live carrier VM.
+        let drain_result = drain();
+        // A later teardown failure must not hide the drain failure.
+        let with_drain_failure = |error: RuntimeError| match &drain_result {
+            Ok(()) => error,
+            Err(drain_error) => RuntimeError::CarrierFailed(format!("{drain_error}; {error}")),
+        };
 
         // Admission is Closing, so the empty registry cannot gain a new
         // record. The claim remains published while the state mutex is
@@ -1606,7 +1632,7 @@ fn shutdown_carrier_with_terminal(
             carrier.inner.changed.notify_all();
             drop(state);
             carrier.release_failed_implicit_hold();
-            return Err(RuntimeError::CarrierFailed(failure));
+            return Err(with_drain_failure(RuntimeError::CarrierFailed(failure)));
         };
         let destroy_result = destroy_once();
         if let Err(error) = destroy_result {
@@ -1617,7 +1643,7 @@ fn shutdown_carrier_with_terminal(
                 state.terminal_claim = CarrierTerminalClaim::Unclaimed;
                 carrier.inner.changed.notify_all();
             }
-            return Err(error);
+            return Err(with_drain_failure(error));
         }
 
         let mut state = carrier.inner.state.lock();
@@ -1630,12 +1656,15 @@ fn shutdown_carrier_with_terminal(
             carrier.inner.changed.notify_all();
             drop(state);
             carrier.release_failed_implicit_hold();
-            return Err(RuntimeError::CarrierFailed(failure));
+            return Err(with_drain_failure(RuntimeError::CarrierFailed(failure)));
         }
         state.terminal_claim = CarrierTerminalClaim::Finalizing;
         carrier.inner.changed.notify_all();
         drop(state);
-        return carrier.finish_claimed_close(artifact_path, publish);
+        let terminal = carrier
+            .finish_claimed_close(artifact_path, publish)
+            .map_err(with_drain_failure)?;
+        return drain_result.map(|()| terminal);
     }
 }
 
@@ -2575,6 +2604,94 @@ mod tests {
         assert_eq!(retry_calls.load(Ordering::Acquire), 1);
         assert_eq!(terminal.state, CarrierAdmissionState::Closed);
         assert_eq!(snapshot(&carrier), terminal);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn failed_executor_drain_still_completes_vm_teardown_before_next_container() {
+        let _serial = TEST_LOCK.lock();
+        let topology = Arc::new(carrick_vmm_hvf::trap::VcpuTopologyTestFixture::default());
+        assert_eq!(topology.begin_vm().expect("container A VM"), 1);
+        let carrier = CarrierRuntime::new_for_tests().expect("carrier A");
+        let carrier_generation = carrier.inner.generation;
+        let drain = crate::vcpu_loop::executor::tests::carrier_pool_drain_fixture(
+            Arc::clone(&topology),
+            true,
+        );
+        let destroy_calls = std::sync::atomic::AtomicUsize::new(0);
+        let first = shutdown_carrier_with_terminal_drained(
+            &carrier,
+            || {
+                destroy_calls.fetch_add(1, Ordering::AcqRel);
+                topology
+                    .end_vm()
+                    .expect("VM teardown follows executor drain");
+                Ok(())
+            },
+            None,
+            |_, _, _| Ok(()),
+            || {},
+            drain,
+        );
+        assert!(
+            first
+                .expect_err("executor failure remains observable")
+                .to_string()
+                .contains("injected run failure")
+        );
+        assert_eq!(
+            destroy_calls.load(Ordering::Acquire),
+            1,
+            "generation 1 VM must be destroyed once"
+        );
+        assert_eq!(snapshot(&carrier).state, CarrierAdmissionState::Closed);
+        let repeated = shutdown_carrier_with(&carrier, || {
+            destroy_calls.fetch_add(1, Ordering::AcqRel);
+            topology
+                .end_vm()
+                .expect("VM teardown follows executor drain");
+            Ok(())
+        })
+        .expect("closed teardown is idempotent");
+        assert_eq!(repeated.state, CarrierAdmissionState::Closed);
+        assert_eq!(destroy_calls.load(Ordering::Acquire), 1);
+        drop(carrier);
+
+        assert_eq!(topology.begin_vm().expect("container B gets a fresh VM"), 2);
+        assert_eq!(
+            topology
+                .admit_create()
+                .expect("generation 2 admits pool startup"),
+            2
+        );
+        let next = CarrierRuntime::new_for_tests().expect("container B carrier");
+        assert_eq!(next.inner.generation, carrier_generation + 1);
+        let drain = crate::vcpu_loop::executor::tests::carrier_pool_drain_fixture(
+            Arc::clone(&topology),
+            false,
+        );
+        let terminal = shutdown_carrier_with_terminal_drained(
+            &next,
+            || {
+                destroy_calls.fetch_add(1, Ordering::AcqRel);
+                topology
+                    .end_vm()
+                    .expect("VM teardown follows executor drain");
+                Ok(())
+            },
+            None,
+            |_, _, _| Ok(()),
+            || {},
+            drain,
+        )
+        .expect("container B executor exits and carrier closes");
+        assert_eq!(terminal.state, CarrierAdmissionState::Closed);
+        shutdown_carrier_with(&next, || {
+            destroy_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        })
+        .expect("container B teardown is idempotent");
+        assert_eq!(destroy_calls.load(Ordering::Acquire), 2);
     }
 
     #[test]
