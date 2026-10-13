@@ -27,6 +27,6 @@ probe oracle. No structural work meter or runtime ratio is claimed.
 """
 
 [bindings]
-vm_free = "carrick-mem::memory::loader_tests::fresh_image_carrier_windows_are_not_el0_accessible; carrick-vmm-hvf::trap::frame_inventory::tests::exec_rebuild_maps_nothing_the_image_does_not_own; carrick-runtime::hvpatch::tests::prepares_loaded_text_with_a_near_island_and_no_carrick_data_page"
+vm_free = "carrick-mem::memory::loader_tests::fresh_image_carrier_windows_are_not_el0_accessible; carrick-vmm-hvf::trap::frame_inventory::tests::exec_rebuild_maps_nothing_the_image_does_not_own; carrick-runtime::hvpatch::tests::prepares_loaded_text_with_a_near_island_and_no_carrick_data_page; carrick-conformance-contract::personality_boundary::tests::executable_publication_has_one_neutral_owner; carrick-core-abi::executable_publication::{tests::publication_is_bounded_and_acknowledges_cancellation_before_reuse,layout_manifest::portal_executable_publication,layout_manifest::portal_executable_slot}; carrick-el1-abi::mm_portal::layout_manifest::mm_portal_slots (neutral executable-publication ownership move only: retained wire sizes, offsets, bounded single-flight acknowledgment and cancellation/reuse; existing semantic and work bindings above remain required, no broader or signed acceptance claim)"
 embed = "carrick-conformance-next::probes_shard_2::generic_probe_shard_2"
 docker = "probe:carrierwindowaccess"
