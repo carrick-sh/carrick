@@ -146,7 +146,7 @@ contracts = ["kernel.fork.stage1-image", "kernel.mm.metadata-refusal"]
 
 [[surfaces]]
 path = "crates/carrick-aarch64/src/engine.rs"
-contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel.vcpu.vm-lifetime", "kernel.el1.stage1-publication", "kernel.el1.task-load-entry", "kernel.mm.image-page-permissions", "kernel.mm.carrier-window-isolation"]
+contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel.vcpu.vm-lifetime", "kernel.el1.stage1-publication", "kernel.el1.task-load-entry", "kernel.mm.image-page-permissions", "kernel.mm.carrier-window-isolation", "process.native.arm-admission"]
 
 [[surfaces]]
 path = "crates/carrick-mmu-core/src/aarch64.rs"
@@ -178,7 +178,7 @@ contracts = ["kernel.mm.syscall-code-write", "kernel.fork.stage1-image", "kernel
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap.rs"
-contracts = ["kernel.fork.stage1-image", "kernel.transport.exit-overhead", "kernel.vcpu.vm-lifetime", "kernel.el1.gic", "kernel.vcpu.kick-el0-boundary", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.el1.stage1-publication"]
+contracts = ["kernel.fork.stage1-image", "kernel.transport.exit-overhead", "kernel.vcpu.vm-lifetime", "kernel.el1.gic", "kernel.vcpu.kick-el0-boundary", "kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "kernel.el1.stage1-publication", "process.native.arm-admission"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/dispatcher.rs"
@@ -400,7 +400,7 @@ contracts = ["kernel.mm.syscall-code-write"]
 
 [[surfaces]]
 path = "crates/carrick-aarch64/src/vmm.rs"
-contracts = ["kernel.mm.syscall-code-write", "kernel.vcpu.kick-el0-boundary", "kernel.vcpu.vm-lifetime", "kernel.el1.stage1-publication"]
+contracts = ["kernel.mm.syscall-code-write", "kernel.vcpu.kick-el0-boundary", "kernel.vcpu.vm-lifetime", "kernel.el1.stage1-publication", "process.native.arm-admission"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/guest_memory.rs"
@@ -589,7 +589,7 @@ contracts = ["kernel.el1.metadata-allocation", "process.native.short-lock"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/metadata_grant.rs"
-contracts = ["kernel.el1.metadata-allocation", "process.native.terminal-child"]
+contracts = ["kernel.el1.metadata-allocation", "process.native.terminal-child", "process.native.arm-admission"]
 
 [[surfaces]]
 path = "fixtures/linux-aarch64-hello/src/el1_vtimer_loop.rs"
@@ -1105,7 +1105,7 @@ contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/fork_stock.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "process.native.terminal-child"]
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "process.native.terminal-child", "process.native.arm-admission"]
 
 [[surfaces]]
 path = "crates/carrick-el1-abi/src/fork_stock.rs"
@@ -1352,3 +1352,11 @@ contracts = ["kernel.fork.stage1-image", "kernel.mm.carrier-window-isolation"]
 [[surfaces]]
 path = "crates/carrick-el1/src/personality/dispatch.rs"
 contracts = ["process.native.arm-admission", "core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-hal/src/trap.rs"
+contracts = ["process.native.arm-admission"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/binding.rs"
+contracts = ["process.native.arm-admission"]

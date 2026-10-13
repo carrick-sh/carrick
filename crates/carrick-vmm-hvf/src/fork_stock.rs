@@ -1159,6 +1159,7 @@ mod tests {
             &custody,
             Some(generation),
             exec.cpu,
+            None,
             carrick_el1_abi::GRANT_OP_FORK_STOCK,
             record_ipa,
             0,
@@ -1210,6 +1211,7 @@ mod tests {
             &custody,
             Some(generation),
             exec.cpu,
+            None,
             carrick_el1_abi::GRANT_OP_FORK_STOCK,
             record_ipa,
             0,
@@ -1277,6 +1279,7 @@ mod tests {
             &custody,
             Some(generation),
             exec.cpu,
+            None,
             carrick_el1_abi::GRANT_OP_FORK_STOCK,
             record_ipa,
             0,
@@ -1304,6 +1307,7 @@ mod tests {
             &custody,
             Some(generation),
             foreign_exec.cpu,
+            None,
             carrick_el1_abi::GRANT_OP_FORK_STOCK,
             record_ipa,
             0,
@@ -1324,6 +1328,7 @@ mod tests {
             &custody,
             Some(generation),
             exec.cpu,
+            None,
             carrick_el1_abi::GRANT_OP_FORK_STOCK,
             record_ipa + 1,
             0,
@@ -1341,6 +1346,7 @@ mod tests {
             &custody,
             Some(generation),
             exec.cpu,
+            None,
             carrick_el1_abi::GRANT_OP_FORK_STOCK,
             0x9999_0000,
             0,
@@ -1387,12 +1393,13 @@ mod tests {
             (record_page.0.as_mut_ptr() as *mut NativeRootExit).write(root_exit);
         }
 
-        // Case 1: Matching active execution -> SUCCESS with status, ledger unchanged
-        custody.fork_stock.lock().set_active_execution(exec);
+        // Production has no cached stock execution row. Exact stopped-CPU
+        // authority must still publish the root terminal status.
         let result = crate::metadata_grant::service_metadata_operation(
             &custody,
             Some(generation),
             exec.cpu,
+            Some(exec),
             carrick_el1_abi::GRANT_OP_ROOT_EXIT,
             record_ipa,
             0,
@@ -1418,6 +1425,7 @@ mod tests {
             &custody,
             Some(generation),
             foreign_exec.cpu,
+            Some(foreign_exec),
             carrick_el1_abi::GRANT_OP_ROOT_EXIT,
             record_ipa,
             0,
@@ -1499,6 +1507,7 @@ mod tests {
             &custody,
             Some(generation),
             exec_a.cpu, // Trapped on vCPU A!
+            None,
             carrick_el1_abi::GRANT_OP_FORK_STOCK,
             record_ipa,
             exec_b.cpu.raw() as u64, // Guest attempts to name vCPU B
@@ -1526,6 +1535,7 @@ mod tests {
             &custody,
             Some(generation),
             exec_a.cpu, // Trapped on vCPU A!
+            None,
             carrick_el1_abi::GRANT_OP_FORK_STOCK,
             record_ipa,
             9999, // Out of range!
@@ -1552,6 +1562,7 @@ mod tests {
             &custody,
             Some(generation),
             exec_a.cpu, // Trapped on vCPU A!
+            None,
             carrick_el1_abi::GRANT_OP_FORK_STOCK,
             record_ipa,
             0,
@@ -1574,6 +1585,7 @@ mod tests {
             &custody,
             Some(generation),
             exec_a.cpu, // Trapped on A
+            Some(exec_a),
             carrick_el1_abi::GRANT_OP_ROOT_EXIT,
             record_ipa,
             exec_b.cpu.raw() as u64, // Guest attempts to name B
@@ -1679,6 +1691,7 @@ mod tests {
             &custody,
             Some(generation),
             exec.cpu,
+            None,
             carrick_el1_abi::GRANT_OP_FORK_STOCK,
             record_ipa,
             0,
@@ -1718,6 +1731,7 @@ mod tests {
             &custody,
             Some(generation),
             exec.cpu,
+            None,
             carrick_el1_abi::GRANT_OP_FORK_STOCK,
             record_ipa,
             0,

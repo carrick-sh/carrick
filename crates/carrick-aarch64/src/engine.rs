@@ -2606,6 +2606,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     owed_kick.settle(self.vcpu.get_mut())?;
                     return Ok(None);
                 }
+                Aarch64Exit::NativeRootExit(status) => {
+                    owed_kick.settle(self.vcpu.get_mut())?;
+                    return Err(TrapError::NativeRootExit { status });
+                }
                 Aarch64Exit::Kicked => {
                     // A cross-thread kick (host signal → KVM_RUN EINTR, e.g. a timer
                     // or `tgkill`) can land while the guest is MID-SYSCALL-TRAP: the
@@ -3231,6 +3235,7 @@ fn exit_variant_name(exit: &Aarch64Exit) -> &'static str {
         Aarch64Exit::Sys64Read { .. } => "Sys64Read",
         Aarch64Exit::MaintenanceDone => "MaintenanceDone",
         Aarch64Exit::Halt => "Halt",
+        Aarch64Exit::NativeRootExit(_) => "NativeRootExit",
         Aarch64Exit::Kicked => "Kicked",
         Aarch64Exit::Memory { .. } => "Memory",
     }

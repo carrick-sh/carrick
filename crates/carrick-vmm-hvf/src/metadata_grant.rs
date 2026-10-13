@@ -755,10 +755,12 @@ fn request_has_live_vm(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn service_metadata_operation(
     custody: &crate::trap::CarrierVmCustody,
     generation: Option<crate::trap::CarrierVmGeneration>,
     cpu: carrick_guest_arch::CpuId,
+    active_execution: Option<crate::fork_stock::GrantExecution>,
     op: u64,
     arg1: u64,
     arg2: u64,
@@ -1045,8 +1047,7 @@ pub(crate) fn service_metadata_operation(
             return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
         }
         let root_exit = unsafe { &*record_ptr };
-        let execution = custody.fork_stock.lock().active_execution_for_cpu(cpu);
-        let Some(execution) = execution else {
+        let Some(execution) = active_execution.filter(|execution| execution.cpu == cpu) else {
             return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
         };
         let mut fork_stock = custody.fork_stock.lock();
@@ -1239,6 +1240,7 @@ fn complete_metadata_request(
         custody,
         generation,
         carrick_guest_arch::CpuId::new(0),
+        None,
         request.op,
         request.arg1,
         request.arg2,
@@ -1259,16 +1261,14 @@ fn complete_metadata_request(
     Ok(())
 }
 
-/// Legacy synchronous transport retained only as a fail-closed compatibility
-/// decoder while the exact signed red/green evidence is promoted. Production
-/// guest allocation publishes the shared mailbox and never executes HVC #6.
+/// Physical process crossings use HVC #6. Metadata allocation uses its mailbox.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn handle_metadata_grant_trap(
     vcpu: &mut applevisor::vcpu::Vcpu,
     cpu: carrick_guest_arch::CpuId,
     custody: &crate::trap::CarrierVmCustody,
     generation: Option<crate::trap::CarrierVmGeneration>,
-) -> Result<(), TrapError> {
+) -> Result<MetadataTrapOutcome, TrapError> {
     use applevisor::vcpu::Reg;
     INLINE_HVC_TRAPS.fetch_add(1, Ordering::Relaxed);
     let op = vcpu
@@ -1283,6 +1283,32 @@ pub(crate) fn handle_metadata_grant_trap(
     let arg3 = vcpu
         .get_reg(Reg::X3)
         .map_err(|e| TrapError::Hypervisor(format!("failed to read X3 for metadata grant: {e}")))?;
+    let execution = if op == GRANT_OP_ROOT_EXIT {
+        let ptr = carrick_el1_abi::get_el1_region_host_ptr();
+        let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize);
+        match (ptr, slot, carrick_el1_abi::zone_tables()) {
+            (ptr, Some(slot), Some(zone)) if ptr != 0 => {
+                // SAFETY: this stopped CPU retains the carrier's mapped ABI
+                // region and its host-published execution until trap completion.
+                let task = unsafe {
+                    &*((ptr
+                        + carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize
+                        + usize::from(slot.raw())
+                            * core::mem::size_of::<carrick_el1_abi::CurrentTask>())
+                        as *const carrick_el1_abi::CurrentTask)
+                };
+                let ttbr0 = vcpu
+                    .get_sys_reg(applevisor::vcpu::SysReg::TTBR0_EL1)
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!("read terminal root: {error}"))
+                    })?;
+                root_execution(cpu, task, zone, ttbr0)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
     let result = if matches!(
         op,
         carrick_el1_abi::GRANT_OP_CHILD_RETIRE | carrick_el1_abi::GRANT_OP_WAIT_CHANNEL_WAKE
@@ -1292,7 +1318,7 @@ pub(crate) fn handle_metadata_grant_trap(
             .map_err(|e| TrapError::Hypervisor(format!("read terminal child root: {e}")))?;
         service_terminal_operation(custody, generation, cpu, op, [arg1, arg2, arg3], ttbr0)
     } else {
-        service_metadata_operation(custody, generation, cpu, op, arg1, arg2, arg3)?
+        service_metadata_operation(custody, generation, cpu, execution, op, arg1, arg2, arg3)?
     };
     vcpu.set_reg(Reg::X0, result[0])
         .map_err(|e| TrapError::Hypervisor(format!("set X0: {e}")))?;
@@ -1302,12 +1328,138 @@ pub(crate) fn handle_metadata_grant_trap(
         .map_err(|e| TrapError::Hypervisor(format!("set X2: {e}")))?;
     vcpu.set_reg(Reg::X3, result[3])
         .map_err(|e| TrapError::Hypervisor(format!("set X3: {e}")))?;
-    Ok(())
+    classify_metadata_trap(op, result)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
+pub(crate) enum MetadataTrapOutcome {
+    Resume,
+    RootExit(carrick_sched_core::process::TerminationStatus),
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn classify_metadata_trap(op: u64, reply: [u64; 4]) -> Result<MetadataTrapOutcome, TrapError> {
+    if op != GRANT_OP_ROOT_EXIT {
+        return Ok(MetadataTrapOutcome::Resume);
+    }
+    if reply[0] != METADATA_GRANT_SUCCESS {
+        return Err(TrapError::Hypervisor(format!(
+            "native root-exit crossing refused: {}",
+            reply[0]
+        )));
+    }
+    let status = i32::try_from(reply[1])
+        .map_err(|_| TrapError::Hypervisor("invalid root-exit status".into()))?;
+    Ok(MetadataTrapOutcome::RootExit(
+        carrick_personality_linux::lifecycle::LinuxWaitStatus::from_wait_encoding(status)
+            .to_termination_status(),
+    ))
+}
+
+/// Root retirement has released its record. Authenticate the stopped lane
+/// against its retained host execution, installed MM grant and hardware root.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn root_execution(
+    cpu: carrick_guest_arch::CpuId,
+    task: &carrick_el1_abi::CurrentTask,
+    zone: &carrick_el1_abi::ZoneTables,
+    ttbr0: u64,
+) -> Option<crate::fork_stock::GrantExecution> {
+    let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
+    let binding = carrick_core::entry::binding(&task.execution, &task.mm);
+    let index = zone.spaces.find(binding.mm.raw())?;
+    let grant = zone.spaces.grant(index, binding.mm.raw())?;
+    let root = ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK;
+    if !binding.issued()
+        || zone.slot(slot).mm() != binding.mm.raw()
+        || zone.installed_space(slot) != binding.mm.raw()
+        || root != grant.ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK
+    {
+        return None;
+    }
+    Some(crate::fork_stock::GrantExecution::new(
+        cpu,
+        binding,
+        carrick_guest_arch::AddressContext {
+            root: carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(
+                root,
+            ))?,
+            mm: carrick_guest_arch::MmGeneration::new(core::num::NonZeroU64::new(
+                binding.mm.raw(),
+            )?),
+            generation: task.root_generation()?,
+        },
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn root_terminal_authentication_needs_no_parked_record_or_stock_row() {
+        let region = carrick_test_support::TestEl1Region::zeroed();
+        // SAFETY: aligned retained zeroed ABI storage; all zone fields accept zero.
+        let zone = unsafe {
+            &*region
+                .as_ptr()
+                .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+                .cast::<carrick_el1_abi::ZoneTables>()
+        };
+        let cpu = carrick_guest_arch::CpuId::new(3);
+        let slot = carrick_guest_arch::SlotId::new(3);
+        let ttbr = (4 << 48) | 0x90000;
+        let space = zone.spaces.publish_closed(5, ttbr, ttbr).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 5);
+        zone.publish_slot(slot, 5, Some(3), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 5).unwrap();
+        let task = carrick_el1_abi::CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 1);
+        task.mm.key.store(5, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        assert!(root_execution(cpu, &task, zone, ttbr).is_none());
+        task.publish_root_generation(carrick_guest_arch::ContextGeneration::new(
+            core::num::NonZeroU64::new(77).unwrap(),
+        ));
+        let execution = root_execution(cpu, &task, zone, ttbr).unwrap();
+        assert_eq!(execution.binding.generation.raw(), 11);
+        assert_eq!(execution.context.generation.raw().get(), 77);
+        assert_eq!(execution.context.root.address().raw(), 0x90000);
+        assert!(zone.slot(slot).host_record().is_none());
+        assert!(root_execution(cpu, &task, zone, ttbr + 4096).is_none());
+        assert!(root_execution(carrick_guest_arch::CpuId::new(2), &task, zone, ttbr).is_none());
+        task.execution.generation.store(0, Ordering::Release);
+        assert!(root_execution(cpu, &task, zone, ttbr).is_none());
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn authenticated_root_exit_is_terminal() {
+        for (wire, status) in [
+            (
+                7 << 8,
+                carrick_sched_core::process::TerminationStatus::exited(7),
+            ),
+            (
+                9,
+                carrick_sched_core::process::TerminationStatus::signaled(9, false),
+            ),
+        ] {
+            assert_eq!(
+                classify_metadata_trap(GRANT_OP_ROOT_EXIT, [0, wire, 0, 0]).unwrap(),
+                MetadataTrapOutcome::RootExit(status)
+            );
+        }
+        assert!(classify_metadata_trap(GRANT_OP_ROOT_EXIT, [1, 0, 0, 0]).is_err());
+        assert_eq!(
+            classify_metadata_trap(METADATA_GRANT_OP_ALLOC, [0; 4]).unwrap(),
+            MetadataTrapOutcome::Resume
+        );
+    }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn test_record(
@@ -1617,6 +1769,7 @@ mod tests {
                 &custody,
                 Some(generation),
                 carrick_guest_arch::CpuId::new(0),
+                None,
                 METADATA_GRANT_OP_ALLOC,
                 u64::MAX,
                 0,

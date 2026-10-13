@@ -52,6 +52,8 @@ pub use carrick_hal::ForkRamStrategy;
 /// only and never re-advances PC.
 #[derive(Debug, Clone)]
 pub enum Aarch64Exit {
+    /// Authenticated terminal completion from the in-ring process owner.
+    NativeRootExit(carrick_sched_core::process::TerminationStatus),
     /// A guest EL0 `svc #0`. `frame` carries x0..x5 + x8 (already read via the
     /// shared `read_aarch64_syscall_frame`); `resume_pc` is `ELR_EL1` (= svc+4).
     /// HVF: surfaced when the EL1-vector vehicle is an EXCEPTION with
