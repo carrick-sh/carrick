@@ -351,6 +351,11 @@ pub trait LifecycleNative<'a>: UserCopy {
     fn process_exit_group(&mut self, _status: u8) -> Option<LifecycleOutcome> {
         None
     }
+    /// Exact retained process owner for an adopted thread's terminal handoff.
+    fn process_exit_binding(&self) -> Option<ExecutionBinding> {
+        None
+    }
+
     fn publish_born(&mut self, mut birth: ThreadBirth<'a, '_>) -> Result<(), i64> {
         birth.record()?;
         self.enqueue_born(birth.record);
@@ -958,7 +963,7 @@ fn serve_exit<'a>(
         return decline!(LifecycleDecline::ExitHome);
     }
     // An adopted job's terminal completion stays with its retained runtime owner.
-    if !record.unadopted {
+    if !record.unadopted && native.process_exit_binding() != Some(binding) {
         return decline!(LifecycleDecline::ExitHostAdopted);
     }
     if !record.on_cpu {
@@ -1020,6 +1025,11 @@ fn serve_exit<'a>(
         native.task_state()?.mark_pending_host_work();
     }
     native.thread_exited(exiting_tid);
+    if !record.unadopted {
+        // The retained runtime consumes this exact terminal handoff; another
+        // guest task must not execute on the exiting job's host lease.
+        return Some((Served::Idle, 0));
+    }
     Some(native.run_next(SyscallResult::new(crate::sched::ETIMEDOUT_RESULT as i64)))
         .map(|(served, result)| (served, result.raw()))
 }

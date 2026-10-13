@@ -1792,6 +1792,7 @@ fn pending_reparented_zombie_keeps_process_group_until_adopter_reaps() {
         None,
         Transaction(98),
         LinuxWaitStatus::from_wait_encoding(7 << 8),
+        || {},
     )
     .unwrap();
     let permit = pending.effects.cancel_members(Member::cancel);
@@ -1851,6 +1852,7 @@ fn pending_reparented_child_charges_adopter_once_and_never_departed_parent() {
         None,
         Transaction(99),
         LinuxWaitStatus::from_wait_encoding(7 << 8),
+        || {},
     )
     .unwrap();
     let permit = pending.effects.cancel_members(Member::cancel);
