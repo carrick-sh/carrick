@@ -10,7 +10,7 @@
 //! - `El1FrameGrantLedger` accounts for all physical grants and returns;
 //! - [`PendingForkLoan`] records outstanding loans and validates exactly-once completion.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use carrick_el1_abi::{
     ForkLifecycleLoan, ForkStockExchange, ForkStockLoan, ForkStockRefusal, ForkStockSettlement,
@@ -129,6 +129,9 @@ pub struct ForkStockHostCustody {
     pub carrier: NonZeroU64,
     pub asids: AsidAllocator,
     pub committed_asids: BTreeMap<u64, AsidGeneration>,
+    pub(crate) committed_children:
+        BTreeMap<carrick_sched_core::AddressSpaceKey, AddressContext<RootGpa>>,
+    pub(crate) retired_children: BTreeSet<carrick_sched_core::AddressSpaceKey>,
     run_failure: carrick_core_abi::NativeRunFailureConsumer,
 }
 
@@ -154,6 +157,8 @@ impl ForkStockHostCustody {
             carrier,
             asids,
             committed_asids: BTreeMap::new(),
+            committed_children: BTreeMap::new(),
+            retired_children: BTreeSet::new(),
             run_failure: carrick_core_abi::NativeRunFailureConsumer::default(),
         }
     }
@@ -444,6 +449,23 @@ impl ForkStockHostCustody {
             self.committed_asids
                 .insert(pending.loan.request.child_mm.raw(), pending.asid_gen);
 
+            self.committed_children.insert(
+                carrick_sched_core::AddressSpaceKey::from_raw(loan.request.child_mm.raw())
+                    .ok_or(ForkStockServiceError::InvalidRecord)?,
+                AddressContext {
+                    root: RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(
+                        loan.request.child_tables.base,
+                    ))
+                    .ok_or(ForkStockServiceError::InvalidRecord)?,
+                    mm: carrick_guest_arch::MmGeneration::new(
+                        NonZeroU64::new(loan.request.child_mm.raw())
+                            .ok_or(ForkStockServiceError::InvalidRecord)?,
+                    ),
+                    generation: carrick_guest_arch::ContextGeneration::new(
+                        completion.child.incarnation(),
+                    ),
+                },
+            );
             let unused_child: Vec<_> = pending.child_tables.drain(child_used..).collect();
             let unused_parent: Vec<_> = pending.parent_tables.drain(parent_used..).collect();
 
@@ -479,6 +501,30 @@ impl ForkStockHostCustody {
             .ok_or(ForkStockServiceError::StaleExecution)?;
         self.clear_active_execution(cpu);
         Ok(result)
+    }
+
+    /// Retain physical stock in quarantine; reclamation is a separate owner
+    /// operation. Never turn a pending or stale receipt into a second retirement.
+    pub(crate) fn service_child_retire(
+        &mut self,
+        execution: GrantExecution,
+        retire: &mut carrick_el1_abi::NativeChildRetire,
+    ) -> Result<(), ForkStockServiceError> {
+        let mm = carrick_sched_core::AddressSpaceKey::from_raw(execution.binding.mm.raw())
+            .ok_or(ForkStockServiceError::StaleExecution)?;
+        if !retire.request_matches(execution.binding, execution.context)
+            || self.committed_children.get(&mm) != Some(&execution.context)
+            || !self.committed_asids.contains_key(&mm.raw())
+            || self.retired_children.contains(&mm)
+        {
+            retire.refuse(carrick_el1_abi::ChildRetireRefusal::Stale);
+            return Err(ForkStockServiceError::StaleExecution);
+        }
+        if !retire.accept() {
+            return Err(ForkStockServiceError::InvalidRecord);
+        }
+        self.retired_children.insert(mm);
+        Ok(())
     }
 
     /// Service a container root exit notification.
@@ -747,6 +793,58 @@ mod tests {
                 |_| true
             ),
             Err(ForkStockServiceError::NoPendingLoan)
+        );
+        let child = GrantExecution {
+            context: custody.committed_children
+                [&carrick_sched_core::AddressSpaceKey::from_raw(302).unwrap()],
+            ..test_execution(42, 0, 302)
+        };
+        for binding in [
+            ExecutionBinding {
+                task: EntryTaskKey::from_raw(43),
+                ..child.binding
+            },
+            ExecutionBinding {
+                generation: EntryGeneration::from_raw(12),
+                ..child.binding
+            },
+            ExecutionBinding {
+                thread_generation: EntryThreadGeneration::from_raw(102),
+                ..child.binding
+            },
+        ] {
+            let mut stale =
+                carrick_el1_abi::NativeChildRetire::new(binding, child.context).unwrap();
+            assert_eq!(
+                custody.service_child_retire(child, &mut stale),
+                Err(ForkStockServiceError::StaleExecution)
+            );
+            assert!(custody.retired_children.is_empty());
+        }
+        let recycled = AddressContext {
+            generation: ContextGeneration::new(NonZeroU64::new(2).unwrap()),
+            ..child.context
+        };
+        let mut stale = carrick_el1_abi::NativeChildRetire::new(child.binding, recycled).unwrap();
+        assert_eq!(
+            custody.service_child_retire(child, &mut stale),
+            Err(ForkStockServiceError::StaleExecution)
+        );
+        let mut retire =
+            carrick_el1_abi::NativeChildRetire::new(child.binding, child.context).unwrap();
+        assert_eq!(custody.service_child_retire(child, &mut retire), Ok(()));
+        assert_eq!(retire.take(child.binding, child.context), Some(Ok(())));
+        let mut duplicate =
+            carrick_el1_abi::NativeChildRetire::new(child.binding, child.context).unwrap();
+        assert_eq!(
+            custody.service_child_retire(child, &mut duplicate),
+            Err(ForkStockServiceError::StaleExecution)
+        );
+        assert_eq!(custody.retired_children.len(), 1);
+        assert_eq!(
+            custody.grant_tables.len(),
+            6,
+            "retirement never reissues charged stock"
         );
     }
 

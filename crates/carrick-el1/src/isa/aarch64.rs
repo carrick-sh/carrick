@@ -91,6 +91,52 @@ pub(crate) fn cross_hvc_root_exit(record_gpa: u64, cpu: u64) -> Result<(), ()> {
     }
 }
 
+pub(crate) fn cross_hvc_child_retire(record_gpa: u64, cpu: u64) -> Result<(), ()> {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    {
+        let mut status: u64 = carrick_el1_abi::GRANT_OP_CHILD_RETIRE;
+        unsafe {
+            core::arch::asm!(
+                "hvc #6",
+                inout("x0") status,
+                in("x1") record_gpa,
+                in("x2") cpu,
+                in("x3") 0u64,
+                options(nostack)
+            );
+        }
+        if status != 0 {
+            return Err(());
+        }
+        Ok(())
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    {
+        let _ = (record_gpa, cpu);
+        Ok(())
+    }
+}
+
+pub(crate) fn cross_hvc_wait_channel_wake(mm: u64, address: u64, cpu: u64) -> Result<(), ()> {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    {
+        let mut status = carrick_el1_abi::GRANT_OP_WAIT_CHANNEL_WAKE;
+        // SAFETY: synchronous stopped-CPU service retains the owned wait channel.
+        unsafe {
+            core::arch::asm!("hvc #6", inout("x0") status,
+            inlateout("x1") mm => _, inlateout("x2") address => _, inlateout("x3") cpu => _, options(nostack));
+        }
+        (status == carrick_el1_abi::METADATA_GRANT_SUCCESS)
+            .then_some(())
+            .ok_or(())
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    {
+        let _ = (mm, address, cpu);
+        Err(())
+    }
+}
+
 /// An exact running task's bounded EL1 transfer.
 pub struct Aarch64UserTransfer {
     owner: core::ptr::NonNull<CurrentTask>,

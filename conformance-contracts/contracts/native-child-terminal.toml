@@ -1,0 +1,25 @@
+schema_version = 1
+id = "process.native.terminal-child"
+title = "Terminal child retirement and parent handback retain exact execution custody"
+guest_surfaces = ["syscall:exit", "syscall:exit_group", "syscall:wait4", "vmm:hvf", "scheduler:continuation"]
+semantic_authority = [
+  "man 2 exit: termination releases process resources before notifying the parent",
+  "man 2 wait: a child's terminal status is consumed once by its parent",
+]
+fixture = "VM-free ARM native fork/exit/wait with a parked parent and no guest placement; reuse the child's record and CPU slot with a new TaskKey generation"
+scale_points = [1]
+rationale = "The successful authenticated zone retirement retains task, execution generation, MM and thread generation independently of reusable record storage. One terminal crossing authenticates that custody plus the committed child root incarnation and hardware root. Acceptance changes PendingRetirement to Retired once. After leaving the root and publishing slot absence, an unplaceable parent wait crosses to the existing runtime host continuation venue. The same wait claim produces at most one handback, with no polling, redispatch or population scan for execution authentication. A new slot entry invalidates terminal custody. Physical stock stays quarantined; stock reclamation and live ARM adoption are separate slices."
+
+[bindings]
+vm_free = "carrick-el1::personality::aarch64_process_tests::{arm_terminal_child_retirement_and_parent_handback_once,terminal_retirement_cannot_retire_a_reused_record_or_slot_generation}; carrick-sched-core::tests::unplaceable_parent_host_handback_consumes_one_park"
+
+[bindings.unresolved]
+embed_structural = "Director-owned ARM signed verification after production process adoption and stock slices land. This VM-free slice does not execute HVC or validate VMM registers."
+docker = "Native ARM wait/exit oracle and uninstrumented ratio evidence remain director-owned; Docker is unavailable on ctb-w2."
+
+[[structural_budgets]]
+kind = "exact"
+metric = "kernel_redispatches"
+value = 0
+layers = ["vm-free"]
+rationale = "The original owned parent wait resumes once, retirement is accepted once, duplicate/stale requests are refused, and one host wake consumes the original park. No semantic retry or polling is admitted."

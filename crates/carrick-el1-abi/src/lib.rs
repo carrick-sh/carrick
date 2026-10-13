@@ -318,6 +318,8 @@ pub const GRANT_OP_ROOT_EXIT: u64 = 4;
 
 /// Operation code for child retirement notification (HVC #6).
 pub const GRANT_OP_CHILD_RETIRE: u64 = 5;
+/// Runtime handback of a terminal child's unplaceable parent wait.
+pub const GRANT_OP_WAIT_CHANNEL_WAKE: u64 = 7;
 
 /// Metadata grant hypercall outcome: successful extent allocation or return.
 pub const METADATA_GRANT_SUCCESS: u64 = 0;

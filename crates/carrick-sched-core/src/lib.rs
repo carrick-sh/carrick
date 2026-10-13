@@ -861,6 +861,13 @@ pub struct ForeignTimer {
     pub seq: u32,
 }
 
+/// Custody before physical retirement versus its owed completion wake.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalPhase {
+    PendingRetirement,
+    Retired,
+}
+
 /// Per-vCPU-slot scheduler state. The slot's own vCPU (EL1, while it runs)
 /// and its executor (while the vCPU is stopped) own it in turn; other vCPUs
 /// may only queue a woken thread on it, under `lock`, while it is in the
@@ -911,6 +918,9 @@ pub struct ZoneSlot {
     /// drives it and is not away, because only that executor comes back to
     /// the slot to serve it.
     drive: AtomicU64,
+    /// Exact released execution; independent of records immediately reusable
+    /// by another CPU. Written only by this slot's stopped execution owner.
+    terminal: [AtomicU64; 4],
 }
 
 /// The bit of [`ZoneSlot`]'s drive word set while its driver waits on the
@@ -2800,6 +2810,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             return None;
         }
         let s = self.slot(slot);
+        s.terminal[0].store(0, Ordering::Release);
         s.current.store(record.raw(), Ordering::Release);
         rec.last_slot.store(slot.plus_one(), Ordering::Relaxed);
         self.counters.el1_switches.fetch_add(1, Ordering::Relaxed);
@@ -2822,6 +2833,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         slot: SlotId,
         identity: ThreadIdentity,
     ) -> Result<RecordId, Exhausted> {
+        self.slot(slot).terminal[0].store(0, Ordering::Release);
         match self.slot(slot).current() {
             Some(record) => Ok(record),
             None => {
@@ -2835,6 +2847,56 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 Ok(record)
             }
         }
+    }
+
+    /// Retain the identity authenticated before the successful terminal
+    /// record release. The slot owner publishes before crossing to the host.
+    pub fn publish_terminal(&self, slot: SlotId, identity: ThreadIdentity) {
+        let words = &self.slot(slot).terminal;
+        words[1].store(identity.generation, Ordering::Relaxed);
+        words[2].store(identity.mm, Ordering::Relaxed);
+        words[3].store(identity.serial, Ordering::Relaxed);
+        words[0].store(identity.tid, Ordering::Release);
+    }
+
+    /// Authenticate a released execution, including after record reuse. A
+    /// retired marker licenses only completion of that child's owed wake.
+    pub fn terminal_matches(
+        &self,
+        slot: SlotId,
+        identity: ThreadIdentity,
+        phase: TerminalPhase,
+    ) -> bool {
+        let lane = self.slot(slot);
+        let state = identity.tid
+            | if phase == TerminalPhase::Retired {
+                1 << 63
+            } else {
+                0
+            };
+        identity.tid != 0
+            && identity.tid < (1 << 63)
+            && identity.generation != 0
+            && identity.mm != 0
+            && lane.current().is_none()
+            && lane.terminal[0].load(Ordering::Acquire) == state
+            && lane.terminal[1].load(Ordering::Relaxed) == identity.generation
+            && lane.terminal[2].load(Ordering::Relaxed) == identity.mm
+            && lane.terminal[3].load(Ordering::Relaxed) == identity.serial
+    }
+
+    /// Accept retirement once. Caller holds this CPU stopped, so slot entry
+    /// and its identity cannot change between authentication and publication.
+    pub fn accept_terminal(&self, slot: SlotId, identity: ThreadIdentity) -> bool {
+        self.terminal_matches(slot, identity, TerminalPhase::PendingRetirement)
+            && self.slot(slot).terminal[0]
+                .compare_exchange(
+                    identity.tid,
+                    identity.tid | (1 << 63),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
     }
 
     /// EL1: undo [`Self::current_or_new`] for a new home record that was
@@ -3351,6 +3413,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         let s = self.slot(slot);
         // The run queue is not the loaded thread's: what EL1 queued here
         // stays queued, and EL1 runs it after this thread or steals it.
+        s.terminal[0].store(0, Ordering::Release);
         let clean = s.current.load(Ordering::Acquire) == NIL && self.timer_deadline(slot).is_none();
         s.current.store(NIL, Ordering::Release);
         s.host_record.store(NIL, Ordering::Release);
@@ -3371,6 +3434,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// (`None`: any) and the loaded thread's affinity mask (0: any).
     pub fn publish_slot(&self, slot: SlotId, mm: u64, cpu: Option<u32>, affinity: u64) {
         let s = self.slot(slot);
+        s.terminal[0].store(0, Ordering::Release);
         s.mm.store(mm, Ordering::Release);
         s.cpu.store(
             cpu.map_or(0, |cpu| cpu.saturating_add(1)),
@@ -3466,6 +3530,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 return None;
             }
             let t = self.slot(thief);
+            t.terminal[0].store(0, Ordering::Release);
             t.current.store(record.raw(), Ordering::Release);
             rec.last_slot.store(thief.plus_one(), Ordering::Relaxed);
             self.counters.el1_switches.fetch_add(1, Ordering::Relaxed);
