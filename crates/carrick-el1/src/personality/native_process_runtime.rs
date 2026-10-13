@@ -2688,11 +2688,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // A parent may scan without waiting for our notification. Publish
         // status readiness only after the child stock and slot absence are
         // retired, so that scan cannot admit a fork against charged stock.
-        let (target, channels, autoreaped_receipt) = {
+        #[cfg(test)]
+        if let Some(probe) = self.exit_notification_probe {
+            probe();
+        }
+        let (channels, autoreaped_receipt, notified) = {
             let mut graph = self.runtime.graph.lock();
             // Keep readiness and current-parent selection in one graph
             // projection: an adopter parked on this pending receipt owns
             // the completion wake even if the original parent has exited.
+            // Resolve the owned receipt at delivery, not before dropping custody.
+            // Native signal locks are leaves in the graph -> signal lock order
+            // (also used by fork admission and autoreap policy). Enqueue has no
+            // graph or scheduler callback. Keep selection through enqueue and
+            // channel capture atomic with respect to exact-generation reparenting;
+            // only the scheduler wake runs after releasing graph custody.
+            // Select the parent and capture channels before automatic removal
+            // drops the receipt and parent edge; publish readiness before the
+            // signal is enqueued.
             let parent = graph.owner.exit_notification_parent(&permit);
             let target = graph.owner.select_exit_parent(&permit);
             let mut channels = Vec::new();
@@ -2708,26 +2721,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
             }
             let autoreaped_receipt = graph.owner.publish_exit_retirement(published.retirement);
-            (target, channels, autoreaped_receipt)
-        };
-        #[cfg(test)]
-        if let Some(probe) = self.exit_notification_probe {
-            probe();
-        }
-        if let Some(target) = target {
-            let notification = target.prepare();
-            if let Some(signal) = notification.signal {
-                let signals = {
-                    let graph = self.runtime.graph.lock();
-                    graph
-                        .owner
-                        .task(notification.parent)
-                        .map_err(|_| NativeProcessError::Stale)?
-                        .native()
-                        .resources()
-                        .signals
-                        .clone()
+            // Hold a delivery failure until the guard is released: automatic
+            // removal custody is disposed outside graph custody on every path.
+            let notified = target.map_or(Ok(()), |target| {
+                let notification = target.prepare();
+                let Some(signal) = notification.signal else {
+                    return Ok(());
                 };
+                let signals = graph
+                    .owner
+                    .task(notification.parent)
+                    .map_err(|_| NativeProcessError::Stale)?
+                    .native()
+                    .resources()
+                    .signals
+                    .clone();
                 let signal = carrick_signal_core::policy::Signal::from_number(signal.raw())
                     .ok_or(NativeProcessError::Invalid)?;
                 let (code, status) = if let Some(term) = wait_status.term_signal() {
@@ -2754,9 +2762,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 );
                 signals
                     .enqueue(notification.parent, signal, Some(info))
-                    .map_err(|_| NativeProcessError::Stale)?;
-            }
-        }
+                    .map(|_| ())
+                    .map_err(|_| NativeProcessError::Stale)
+            });
+            (channels, autoreaped_receipt, notified)
+        };
+        notified?;
         for channel in channels {
             self.publish_channel(&channel)?;
         }
@@ -7031,6 +7042,17 @@ mod tests {
     }
     #[test]
     fn delayed_child_exit_notifies_adopter_when_selected_parent_exits_on_peer() {
+        reparented_exit_notification_contract(true, true);
+    }
+    #[test]
+    fn delayed_child_exit_uses_adopter_interest_when_old_parent_ignored_default() {
+        reparented_exit_notification_contract(false, true);
+    }
+    #[test]
+    fn delayed_child_exit_does_not_inherit_departed_parents_signal_interest() {
+        reparented_exit_notification_contract(true, false);
+    }
+    fn reparented_exit_notification_contract(parent_caught: bool, adopter_caught: bool) {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
         let zone = unsafe {
@@ -7070,7 +7092,7 @@ mod tests {
                 mm: 1,
                 file_table: 5,
                 generation: 11,
-                affinity: 1,
+                affinity: 3, // fixture owns both CPU slots before either fork
                 lifecycle_page: &*page as *const _ as u64,
                 control_slot: &*control as *const _ as u64,
             },
@@ -7141,6 +7163,11 @@ mod tests {
         let parent = runtime
             .namespace_child_key(root, result.raw() as u32)
             .unwrap();
+        if !adopter_caught {
+            root_entry
+                .rt_sigaction(Signal::CHLD, Some(Action::default()))
+                .unwrap();
+        }
         assert!(matches!(
             root_entry.wait4(
                 ProcessWaitPid::from_syscall_argument(u64::MAX),
@@ -7196,6 +7223,11 @@ mod tests {
         let mut parent_entry = runtime
             .enter(source, &task, words(parent_address), &mut parent_service)
             .unwrap();
+        if !parent_caught {
+            parent_entry
+                .rt_sigaction(Signal::CHLD, Some(Action::default()))
+                .unwrap();
+        }
         let LifecycleOutcome::Returned { result, .. } = parent_entry.fork() else {
             panic!("child fork")
         };
@@ -7276,14 +7308,18 @@ mod tests {
                     .join()
                     .unwrap();
             });
-            let (_, info) = root_signals
-                .take_timedwait(
-                    child_record,
-                    carrick_signal_core::SignalSet::EMPTY.with(Signal::CHLD),
-                )
-                .unwrap();
-            let info = info.unwrap();
-            assert_eq!(info.si_addr as u32, parent.id.raw() as u32);
+            if adopter_caught {
+                let (_, info) = root_signals
+                    .take_timedwait(
+                        child_record,
+                        carrick_signal_core::SignalSet::EMPTY.with(Signal::CHLD),
+                    )
+                    .unwrap();
+                let info = info.unwrap();
+                assert_eq!(info.si_addr as u32, parent.id.raw() as u32);
+            } else {
+                assert_eq!(root_signals.pending_count(), 0);
+            }
             let graph = runtime.graph.lock();
             assert!(
                 graph.owner.task(parent).is_err(),
@@ -7345,16 +7381,25 @@ mod tests {
             1,
             "one enrolled root waiter"
         );
-        let (_, info) = root_signals
-            .take_timedwait(
-                child_record,
-                carrick_signal_core::SignalSet::EMPTY.with(Signal::CHLD),
-            )
-            .unwrap();
-        let info = info.unwrap();
-        assert_eq!(info.si_addr as u32, child.id.raw() as u32);
-        assert_eq!(info.si_code, carrick_syscall_abi::LINUX_CLD_EXITED);
-        assert_eq!(i32::from_le_bytes(info._pad[0..4].try_into().unwrap()), 7);
+        if adopter_caught {
+            let (_, info) = root_signals
+                .take_timedwait(
+                    child_record,
+                    carrick_signal_core::SignalSet::EMPTY.with(Signal::CHLD),
+                )
+                .unwrap();
+            let info = info.unwrap();
+            assert_eq!(info.si_addr as u32, child.id.raw() as u32);
+            let code = info.si_code;
+            assert_eq!(code, carrick_syscall_abi::LINUX_CLD_EXITED);
+            assert_eq!(i32::from_le_bytes(info._pad[0..4].try_into().unwrap()), 7);
+        } else {
+            assert_eq!(
+                root_signals.pending_count(),
+                0,
+                "current adopter policy suppresses SIGCHLD"
+            );
+        }
         activate(&runtime, source, &task, root);
         let mut root_entry = runtime
             .enter(source, &task, words(address), &mut service)
