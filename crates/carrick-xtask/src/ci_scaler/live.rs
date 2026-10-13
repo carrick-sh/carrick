@@ -1657,7 +1657,7 @@ mod tests {
         ]});
         let members = pool_inventory(&pool, "willow").unwrap();
         // Membership on another site's node is foreign, never adopted.
-        assert!(pool_inventory(&pool, "m28112").is_err());
+        assert!(pool_inventory(&pool, "carrick-ctb").is_err());
         assert_eq!(members[0].id, 308);
         let row = row();
         assert!(authenticate_config(&row, members[0].clone(), &json!({"name":row.name})).is_ok());
