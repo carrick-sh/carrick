@@ -1227,6 +1227,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             run_failure: None,
             #[cfg(test)]
             publication_wait_probe: None,
+            #[cfg(test)]
+            exit_notification_probe: None,
             calling_tid,
             slot,
             interrupted_child_wait: None,
@@ -1324,6 +1326,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             run_failure: None,
             #[cfg(test)]
             publication_wait_probe: None,
+            #[cfg(test)]
+            exit_notification_probe: None,
             calling_tid,
             slot,
             interrupted_child_wait: None,
@@ -1405,6 +1409,8 @@ pub struct NativeProcessEntry<
     run_failure: Option<carrick_core_abi::NativeRunFailureReason>,
     #[cfg(test)]
     publication_wait_probe: Option<&'r (dyn Fn(u32) + Sync)>,
+    #[cfg(test)]
+    exit_notification_probe: Option<&'r (dyn Fn() + Sync)>,
     calling_tid: u32,
     slot: Option<&'a ThreadControlSlot>,
     interrupted_child_wait: Option<Box<C>>,
@@ -2704,6 +2710,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let autoreaped_receipt = graph.owner.publish_exit_retirement(published.retirement);
             (target, channels, autoreaped_receipt)
         };
+        #[cfg(test)]
+        if let Some(probe) = self.exit_notification_probe {
+            probe();
+        }
         if let Some(target) = target {
             let notification = target.prepare();
             if let Some(signal) = notification.signal {
@@ -7018,6 +7028,356 @@ mod tests {
             .store(identity.serial, Ordering::Release);
         task.publish_visible_pid(row.metadata().namespace_pid);
         task.publish_lifecycle(identity.lifecycle_page, identity.control_slot);
+    }
+    #[test]
+    fn delayed_child_exit_notifies_adopter_when_selected_parent_exits_on_peer() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = Box::new(ThreadLifecyclePage::new());
+        let control = Box::new(ThreadControlSlot::new());
+        let child_page = Box::new(ThreadLifecyclePage::new());
+        let child_controls = Box::new(core::array::from_fn::<_, 9, _>(|_| {
+            ThreadControlSlot::new()
+        }));
+        let task = CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &*page as *const _ as u64,
+                control_slot: &*control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
+        page.release_live(1).unwrap(); // fixture settles its bootstrap census
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+        assert_eq!(page.live(), 1);
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &*child_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+            on_signal_clock: None,
+        };
+        use carrick_personality_linux::signal::ProcessSignals;
+        use carrick_signal_core::policy::{Action, Disposition, HandlerAddress, Signal};
+        let root = runtime.graph.lock().root_key;
+        let root_signals = runtime
+            .graph
+            .lock()
+            .owner
+            .task(root)
+            .unwrap()
+            .native()
+            .resources()
+            .signals
+            .clone();
+        let root_channel = runtime
+            .graph
+            .lock()
+            .owner
+            .task(root)
+            .unwrap()
+            .native()
+            .resources()
+            .channel
+            .clone()
+            .unwrap();
+        let mut root_entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        root_entry
+            .rt_sigaction(
+                Signal::CHLD,
+                Some(Action {
+                    disposition: Disposition::Handler(HandlerAddress(0x4000)),
+                    ..Action::default()
+                }),
+            )
+            .unwrap();
+        let LifecycleOutcome::Returned { result, .. } = root_entry.fork() else {
+            panic!("parent fork")
+        };
+        let parent = runtime
+            .namespace_child_key(root, result.raw() as u32)
+            .unwrap();
+        assert!(matches!(
+            root_entry.wait4(
+                ProcessWaitPid::from_syscall_argument(u64::MAX),
+                UserVa::new(0x8000),
+                LinuxWaitOptions::empty(),
+                UserVa::new(0)
+            ),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        drop(root_entry);
+        activate(&runtime, source, &task, parent);
+        let parent_address = runtime
+            .graph
+            .lock()
+            .owner
+            .task(parent)
+            .unwrap()
+            .native()
+            .resources()
+            .address;
+        let parent_signals = runtime
+            .graph
+            .lock()
+            .owner
+            .task(parent)
+            .unwrap()
+            .native()
+            .resources()
+            .signals
+            .clone();
+        let parent_channel = runtime
+            .graph
+            .lock()
+            .owner
+            .task(parent)
+            .unwrap()
+            .native()
+            .resources()
+            .channel
+            .clone()
+            .unwrap();
+        // The grandchild owns a distinct lifecycle page and runs on CPU 1.
+        let grandchild_page = Box::new(ThreadLifecyclePage::new());
+        let grandchild_controls = core::array::from_fn::<_, 9, _>(|_| ThreadControlSlot::new());
+        let mut parent_service = Physical {
+            zone: &zone,
+            page: &grandchild_page,
+            controls: &grandchild_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+            on_signal_clock: None,
+        };
+        let mut parent_entry = runtime
+            .enter(source, &task, words(parent_address), &mut parent_service)
+            .unwrap();
+        let LifecycleOutcome::Returned { result, .. } = parent_entry.fork() else {
+            panic!("child fork")
+        };
+        let child = runtime
+            .namespace_child_key(parent, result.raw() as u32)
+            .unwrap();
+        drop(parent_entry);
+        let child_record = runtime
+            .graph
+            .lock()
+            .owner
+            .task(child)
+            .unwrap()
+            .native()
+            .resources()
+            .record;
+        let child_address = runtime
+            .graph
+            .lock()
+            .owner
+            .task(child)
+            .unwrap()
+            .native()
+            .resources()
+            .address;
+        let peer_slot = carrick_sched_core::SlotId::new(1);
+        zone.drive(peer_slot, 1);
+        zone.publish_slot(peer_slot, 1, Some(1), 1);
+        zone.enter_guest(peer_slot);
+        assert_eq!(
+            zone.claim_for_host(child_record, None, Handback::Resumed, &BoundedSpin(0)),
+            carrick_sched_core::HostClaim::Claimed
+        );
+        assert!(zone.requeue_on(peer_slot, child_record.id));
+        let peer_source = BornInZoneSource {
+            zone: &zone,
+            slot: peer_slot,
+        };
+        let peer_task = CurrentTask::new();
+        activate(&runtime, peer_source, &peer_task, child);
+        let before = root_channel.generation.generation();
+        let parent_before = parent_channel.generation.generation();
+        let probe_calls = core::sync::atomic::AtomicU32::new(0);
+        let probe = || {
+            assert_eq!(probe_calls.fetch_add(1, Ordering::AcqRel), 0);
+            assert_eq!(
+                runtime
+                    .graph
+                    .lock()
+                    .owner
+                    .zombies()
+                    .get(&child.id)
+                    .unwrap()
+                    .receipt
+                    .parent,
+                Some(parent)
+            );
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let mut service = Physical {
+                            zone: &zone,
+                            page: &grandchild_page,
+                            controls: &grandchild_controls,
+                            copies: Vec::new(),
+                            refuse_copy: false,
+                            on_signal_clock: None,
+                        };
+                        let mut entry = runtime
+                            .enter(source, &task, words(parent_address), &mut service)
+                            .unwrap();
+                        assert!(matches!(
+                            entry.exit_group(9),
+                            LifecycleOutcome::Transferred { .. }
+                        ));
+                        assert_eq!(entry.take_run_failure(), None, "peer parent exit");
+                    })
+                    .join()
+                    .unwrap();
+            });
+            let (_, info) = root_signals
+                .take_timedwait(
+                    child_record,
+                    carrick_signal_core::SignalSet::EMPTY.with(Signal::CHLD),
+                )
+                .unwrap();
+            let info = info.unwrap();
+            assert_eq!(info.si_addr as u32, parent.id.raw() as u32);
+            let graph = runtime.graph.lock();
+            assert!(
+                graph.owner.task(parent).is_err(),
+                "exact parent generation retired"
+            );
+            assert_eq!(
+                graph.owner.zombies().get(&child.id).unwrap().receipt.parent,
+                Some(root)
+            );
+        };
+        let mut child_service = Physical {
+            zone: &zone,
+            page: &grandchild_page,
+            controls: &grandchild_controls,
+            copies: Vec::new(),
+            refuse_copy: false,
+            on_signal_clock: None,
+        };
+        let mut entry = runtime
+            .enter(
+                peer_source,
+                &peer_task,
+                words(child_address),
+                &mut child_service,
+            )
+            .unwrap();
+        entry.exit_notification_probe = Some(&probe);
+        assert!(matches!(
+            entry.exit_group(7),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert_eq!(
+            entry.take_run_failure(),
+            None,
+            "reparented child exit must not fail the carrier"
+        );
+        assert!(entry.take_handoff_receipt().is_some());
+        drop(entry);
+        assert_eq!(
+            probe_calls.load(Ordering::Acquire),
+            1,
+            "one final publication, no retry"
+        );
+        assert_eq!(
+            parent_signals.pending_count(),
+            0,
+            "no delivery to departed parent"
+        );
+        assert_eq!(
+            parent_channel.generation.generation(),
+            parent_before,
+            "no stale channel publication"
+        );
+        // Parent and child each publish once to the adopter. Standard SIGCHLD
+        // coalesces; consume the parent's signal inside the probe to inspect C.
+        assert_eq!(root_channel.generation.generation().raw(), before.raw() + 2);
+        assert_eq!(
+            zone.counters.el1_wakes.load(Ordering::Acquire),
+            1,
+            "one enrolled root waiter"
+        );
+        let (_, info) = root_signals
+            .take_timedwait(
+                child_record,
+                carrick_signal_core::SignalSet::EMPTY.with(Signal::CHLD),
+            )
+            .unwrap();
+        let info = info.unwrap();
+        assert_eq!(info.si_addr as u32, child.id.raw() as u32);
+        assert_eq!(info.si_code, carrick_syscall_abi::LINUX_CLD_EXITED);
+        assert_eq!(i32::from_le_bytes(info._pad[0..4].try_into().unwrap()), 7);
+        activate(&runtime, source, &task, root);
+        let mut root_entry = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        let Some(LifecycleOutcome::Returned { result, .. }) = root_entry.resume_pending_wait()
+        else {
+            panic!("root wait resumes")
+        };
+        assert_eq!(result.raw(), parent.id.raw() as i64);
+        let LifecycleOutcome::Returned { result, .. } = root_entry.wait4(
+            ProcessWaitPid::from_syscall_argument(child.id.raw() as u64),
+            UserVa::new(0x8000),
+            LinuxWaitOptions::empty(),
+            UserVa::new(0),
+        ) else {
+            panic!("adopter reaps child")
+        };
+        assert_eq!(result.raw(), child.id.raw() as i64);
+        drop(root_entry);
+        assert_eq!(
+            service.copies,
+            [LinuxWaitStatus::exited(9), LinuxWaitStatus::exited(7)]
+        );
     }
     #[test]
     fn child_exit_group_waits_for_parent_bucket_and_delivers_status() {

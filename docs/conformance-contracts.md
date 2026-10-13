@@ -1089,6 +1089,29 @@ decision requires their receipt from the merge queue. No local KVM result
 is claimed. Signed HVF and Docker ratio evidence require their respective
 hosts and remain outstanding here.
 
+## Native reparented exit notification (`kernel.process.exit-notification`)
+
+Surface: delayed SIGCHLD and wait-channel publication after native child MM
+retirement. Linux authority: exit(2) and wait(2): orphaned children are adopted
+by the nearest live subreaper or init, which receives their termination signal
+and can reap their status. A concurrently exiting parent is not a run failure.
+
+The real `NativeProcessRuntime` binding
+`delayed_child_exit_notifies_adopter_when_selected_parent_exits_on_peer`
+forks R -> P -> C, parks R in wait4, and runs P and C on distinct compact
+scheduler slots. A test-only boundary after readiness publication releases P
+on a peer host thread through actual exit_group before C reacquires graph
+custody. The witness checks the reparented receipt, no run failure, C's SIGCHLD
+siginfo at R, no notification or channel publication to departed P, one wake
+of R's enrolled waiter, and both terminal statuses through real wait4.
+
+Structural budget: exactly one final notification publication per exit, no
+retry or unrelated-task scan, exact TaskKey generation selection, and zero
+stale-parent-to-run-failure transitions. Current recipient selection, signal
+publication and wake-channel capture form one graph projection; wake execution
+runs outside graph custody. Signed HVF and Docker evidence require their
+respective hosts; this Linux worker binding does not claim either.
+
 ## x86 VMX segment entry (`x86.vmx.segment-entry`)
 
 Authority: Intel SDM volume 3, §§26.3.1.1–26.3.1.4 (order 325384),
