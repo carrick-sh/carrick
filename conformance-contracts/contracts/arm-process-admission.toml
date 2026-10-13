@@ -1,13 +1,13 @@
 schema_version = 1
 id = "process.native.arm-admission"
 title = "ARM root setup and process calls share one authenticated native owner"
-guest_surfaces = ["syscall:set_tid_address", "syscall:wait4", "kernel:thread-lifecycle", "kernel:process-admission"]
+guest_surfaces = ["syscall:set_tid_address", "syscall:wait4", "syscall:exit", "kernel:thread-lifecycle", "kernel:process-admission"]
 semantic_authority = [
   "man 2 set_tid_address: return the calling thread ID and retain its clear-child-tid address",
   "man 2 wait4: a caller with no children receives ECHILD (10)",
   "man 2 clone: CLONE_THREAD members belong to the same process and retain their individual thread identities",
 ]
-fixture = "An ARM host root enters the production admission boundary before set_tid_address, then wait4; two already-live records import into that same owner; host lease renewal preserves its Arc and census; stale imported fields refuse before registry publication"
+fixture = "An ARM host root enters the production admission boundary before set_tid_address, then wait4 and raw last-thread exit; two already-live records import into that same owner; host lease renewal preserves its Arc and census; stale imported fields refuse before registry publication"
 scale_points = [1, 2]
 rationale = "Admission creates one native process owner for the retained root and imports authenticated lifecycle members without creating host tasks or changing live membership. Re-entry retains that owner. The setup and no-child wait each dispatch once and request no fork stock. Unpublished admission-only home custody ends with the call, so ARM host reconciliation cannot mistake an ordinary returned call for a parked thread; a published handoff retains its record. The fixed lifecycle pool bounds the initial import scan; ordinary re-entry resolves the exact registry member. Signal resources are reachable from the native entry; ARM signal routing belongs to #285."
 
@@ -15,13 +15,10 @@ rationale = "Admission creates one native process owner for the retained root an
 vm_free = "carrick-el1::personality::aarch64_process_tests::arm_root_setup_enters_production_process_venue"
 # Supplemental VM-free witnesses in the same lib target:
 # arm_root_admission_imports_live_thread_membership_without_changing_census
-# arm_root_host_lease_renewal_retains_the_admitted_process_owner
-# arm_root_admission_refuses_stale_imported_custody_without_publication
+# arm_root_host_lease_renewal_retains_the_admitted_process_owner; arm_root_admission_refuses_stale_imported_custody_without_publication
 # arm_root_entry_refuses_wrong_binding_and_root_incarnation
-# arm_born_thread_uses_native_owner_without_an_execution_generation
-# arm_returned_process_call_is_not_a_zone_park
-# carrick-vmm-hvf::metadata_grant::tests::authenticated_root_exit_is_terminal
-# carrick-vmm-hvf::metadata_grant::tests::root_terminal_authentication_needs_no_parked_record_or_stock_row
+# arm_born_thread_uses_native_owner_without_an_execution_generation; arm_returned_process_call_is_not_a_zone_park
+# carrick-vmm-hvf::metadata_grant::tests::authenticated_root_exit_is_terminal; root_terminal_authentication_needs_no_parked_record_or_stock_row
 # carrick-vmm-hvf::fork_stock::tests::dispatcher_root_exit_success_and_stale_refusal
 
 [bindings.unresolved]
@@ -31,13 +28,13 @@ docker = "Linux semantics are specified by the cited man pages; native arm64 dif
 [[structural_budgets]]
 kind = "exact"
 metric = "kernel_dispatches"
-value = 2
+value = 3
 layers = ["vm-free"]
-rationale = "One set_tid_address and one wait4 invocation, each with one served completion and zero forwarded dispatches."
+rationale = "One setup, one wait and one last-thread exit; each dispatches once with zero forwarding."
 
 [[structural_budgets]]
 kind = "exact"
 metric = "host_backend_calls"
-value = 0
+value = 1
 layers = ["vm-free"]
-rationale = "Root admission, set_tid_address and the no-child wait request no stock or root-exit crossing."
+rationale = "Setup and wait request no crossing or stock; the last-thread exit crosses the root terminal boundary exactly once."
