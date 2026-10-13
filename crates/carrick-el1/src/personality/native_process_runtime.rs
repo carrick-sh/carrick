@@ -2946,10 +2946,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if self.handoff.is_none() {
             return Err(NativeProcessError::Quarantined);
         }
+        // Only the calling thread is live. A sibling may have settled its
+        // lifecycle exit before its native membership notification arrives.
+        page.release_live(0)
+            .map_err(|_| NativeProcessError::Quarantined)?;
         for member in &members {
-            page.release_live(0)
-                .map_err(|_| NativeProcessError::Quarantined)?;
-            if let Some(entry) = member.control.entry() {
+            if let Some(entry) = member.control.entry()
+                && matches!(page.state(entry.index()), Some((generation,
+                    carrick_el1_abi::EntryState::Born | carrick_el1_abi::EntryState::Published))
+                    if generation == entry.generation())
+            {
                 page.retire_published(entry)
                     .map_err(|_| NativeProcessError::Quarantined)?;
             }
