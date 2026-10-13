@@ -102,6 +102,7 @@ struct FakeBinding {
         parking_lot::Mutex<Option<crate::hvpatch::PendingAddressSpaceRetirement>>,
     retire_detached_address_space_gate: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
     retire_detached_address_space_resume: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    retire_requires_materialized: AtomicBool,
     residency: parking_lot::Mutex<super::residency::TaskCpuResidency>,
     residency_condvar: parking_lot::Condvar,
 }
@@ -168,6 +169,7 @@ impl FakeBinding {
             pending_address_space_retirement: parking_lot::Mutex::new(None),
             retire_detached_address_space_gate: parking_lot::Mutex::new(None),
             retire_detached_address_space_resume: parking_lot::Mutex::new(None),
+            retire_requires_materialized: AtomicBool::new(false),
             residency: parking_lot::Mutex::new(super::residency::TaskCpuResidency::Materialized(
                 test_guest_cpu_state(marker),
             )),
@@ -275,6 +277,16 @@ impl PersistentTaskBinding for FakeBinding {
         &self,
         root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
     ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, TrapError> {
+        if self.retire_requires_materialized.load(Ordering::SeqCst)
+            && !matches!(
+                *self.residency.lock(),
+                super::residency::TaskCpuResidency::Materialized(_)
+            )
+        {
+            return Err(TrapError::Hypervisor(
+                "root retired while still loaded on a persistent executor".to_owned(),
+            ));
+        }
         if let Some(gate) = self.retire_detached_address_space_gate.lock().take() {
             let _ = gate.send(());
         }
@@ -327,6 +339,34 @@ impl PersistentTaskBinding for FakeBinding {
             }
         }
     }
+}
+
+#[test]
+fn terminal_retirement_flushes_its_loaded_root_before_table_release() {
+    let (process, context) = crate::hvpatch::process_context_for_tests(14_991);
+    let scheduler = Arc::new(single_cpu_scheduler(Arc::clone(context.kernel())));
+    let factory = Arc::new(FakeFactory::default());
+    let binding = FakeBinding::new(99, [Step::Exit]);
+    binding
+        .retire_requires_materialized
+        .store(true, Ordering::SeqCst);
+    let tid = ThreadId::from_guest_supplied_tid(context.thread().key().tid.raw());
+    let pending = process
+        .begin_address_space_retirement(0, tid, None)
+        .unwrap();
+    *binding.pending_address_space_retirement.lock() = Some(pending);
+    factory.install(&context, Arc::clone(&binding));
+    let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+    let generation = publish(&context, 99);
+    let authority = enqueue_root(&scheduler, &context, generation);
+    drop(authority);
+    pool.wait_for_event(
+        |event| matches!(event, ExecutorPoolEvent::Saved { .. }),
+        Duration::from_secs(5),
+    )
+    .expect("terminal root saved before retirement");
+    pool.shutdown()
+        .expect("root was materialized before retirement");
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

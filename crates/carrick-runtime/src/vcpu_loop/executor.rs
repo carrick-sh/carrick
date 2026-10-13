@@ -915,6 +915,34 @@ where
                 executor_id
             );
         }
+        if (terminal_retirement.is_some()
+            || pending_exec_retirement.is_some()
+            || pending_exec_cleanup)
+            && let Err(error) = backend.flush_resident_task()
+        {
+            let settlement = match settlement_authority {
+                SettlementAuthority::Live => fail_running_and_retire::<F::TaskBinding, _>(
+                    resolver.as_ref(),
+                    scheduler,
+                    running,
+                    ExecutionFailure::SnapshotRestoreFailed,
+                    receipts,
+                ),
+                SettlementAuthority::PredecessorConsumed(consumed) => {
+                    settle_consumed_predecessor_and_retire::<F::TaskBinding, _>(
+                        resolver.as_ref(),
+                        scheduler,
+                        running,
+                        consumed,
+                        receipts,
+                    )
+                }
+            };
+            return Err(with_settlement_error(
+                format!("flush resident root before table retirement: {error}"),
+                settlement,
+            ));
+        }
         let exec_cleanup_ran = pending_exec_retirement.is_some() || pending_exec_cleanup;
         if let Some(mut retirement) = pending_exec_retirement.take() {
             match control.invalidate_after_exec(
