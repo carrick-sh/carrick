@@ -1582,7 +1582,7 @@ mod tests {
             .split_once("fn drive_thread_exit(")
             .unwrap()
             .1
-            .split_once("fn take_terminal_memory_action(")
+            .split_once("fn take_retained_memory_action(")
             .unwrap()
             .0;
         assert!(thread_exit_driver.contains("settle_persistent_thread_exit"));
