@@ -22,17 +22,41 @@ test "$config" = 'header = "Authorization: Bearer test-relay-token"'
 [[ $* != *--location* ]]
 destination=
 url=
+max_time=
 while (($#)); do
     case $1 in
         --output) destination=$2; shift ;;
+        --max-time) max_time=$2; shift ;;
         https://*) url=$1 ;;
     esac
     shift
 done
+test -n "$destination"
+test -n "$url"
 test "$url" = "https://carrick-gate-relay.tjfontaine.workers.dev/bundles/$GITHUB_SHA/$BUNDLE_SHA256.part${url##*.part}"
+if [[ -n "$max_time" ]] && (( max_time > 600 )); then
+    echo "curl: max-time $max_time exceeds 600s ceiling" >&2
+    exit 99
+fi
 if [[ ${RELAY_TEST_MODE:-success} = failure ]]; then exit 22; fi
 if [[ ${RELAY_TEST_MODE:-success} = corrupt ]]; then
     printf 'corrupted bytes' > "$destination"
+elif [[ ${RELAY_TEST_MODE:-success} = slow ]]; then
+    if [[ -n "$max_time" ]] && (( max_time <= 45 )); then
+        echo "curl: (28) Operation timed out" >&2
+        exit 28
+    fi
+    cp "$RELAY_TEST_ROOT/${url##*.}" "$destination"
+elif [[ ${RELAY_TEST_MODE:-success} = transient-failure ]]; then
+    if [[ ! -f "$RELAY_TEST_ROOT/transient-failed" ]]; then
+        touch "$RELAY_TEST_ROOT/transient-failed"
+        echo "curl: (28) Operation timed out" >&2
+        exit 28
+    fi
+    cp "$RELAY_TEST_ROOT/${url##*.}" "$destination"
+elif [[ ${RELAY_TEST_MODE:-success} = consecutive-failure ]]; then
+    echo "curl: (56) Failure with receiving network data" >&2
+    exit 56
 else
     cp "$RELAY_TEST_ROOT/${url##*.}" "$destination"
 fi
@@ -90,6 +114,33 @@ download() {
 download
 test "$(cat selected-path)" = relay
 echo 'PASS relay success: ordered concatenation, SHA-256, no fallback'
+export RELAY_TEST_MODE=slow
+download
+test "$(cat selected-path)" = relay
+echo 'PASS slow relay success under new budget: no fallback'
+export RELAY_DEADLINE_SECONDS=40
+download
+test "$(cat selected-path)" = github
+grep -F -q "timed out" relay.log
+echo 'PASS slow relay with tight budget times out: GitHub fallback verified'
+unset RELAY_DEADLINE_SECONDS
+export RELAY_DEADLINE_SECONDS=1000
+download
+test "$(cat selected-path)" = relay
+unset RELAY_DEADLINE_SECONDS
+echo 'PASS relay budget ceiling enforced at 600s: no fallback'
+rm -f "$RELAY_TEST_ROOT/transient-failed"
+export RELAY_TEST_MODE=transient-failure
+download
+test "$(cat selected-path)" = relay
+test -f "$RELAY_TEST_ROOT/transient-failed"
+grep -F -q "timed out" relay.log
+echo 'PASS transient transport failure: retried and succeeded without fallback'
+export RELAY_TEST_MODE=consecutive-failure
+download
+test "$(cat selected-path)" = github
+grep -F -q "Failure with receiving network data" relay.log
+echo 'PASS consecutive transport failures: GitHub fallback verified'
 export RELAY_TEST_MODE=failure
 download
 test "$(cat selected-path)" = github
