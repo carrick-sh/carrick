@@ -229,9 +229,9 @@ qm disk resize 300 scsi0 "${disk_gib}G"
 read -ra before < /proc/stat
 sleep 5
 read -ra after < /proc/stat
-busy=$(awk -v a="${before[*]}" -v b="${after[*]}" -v n="$(nproc)" -v load="$(cut -d' ' -f1 /proc/loadavg)" 'BEGIN {
+busy=$(awk -v a="${before[*]}" -v b="${after[*]}" -v n="$(nproc)" -v loadavg="$(cut -d' ' -f1 /proc/loadavg)" 'BEGIN {
   split(a,x); split(b,y); t=0; for(i=2;i<=9;i++) t+=y[i]-x[i];
-  idle=y[5]-x[5]+y[6]-x[6]; u=(t>0?1-idle/t:1); if(load/n>u) u=load/n;
+  idle=y[5]-x[5]+y[6]-x[6]; u=(t>0?1-idle/t:1); if(loadavg/n>u) u=loadavg/n;
   printf "%.6f",u+2/n;
 }')
 awk -v projected="$busy" 'BEGIN { print "template projected CPU=" projected; exit !(projected<=0.80) }'
