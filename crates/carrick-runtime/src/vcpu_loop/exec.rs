@@ -3202,7 +3202,14 @@ pub(crate) mod tests {
         let frame = carrick_hal::RawSyscall {
             current_guest_sp: None,
             number: carrick_abi::CanonicalNr(220),
-            args: [0; 6],
+            args: [
+                carrick_abi::LinuxCloneFlags::CHILD_SETTID.bits() | 17,
+                0,
+                0,
+                0,
+                0x6000000fd0,
+                0,
+            ],
             guest_abi: carrick_abi::LinuxGuestAbi::Aarch64,
             native_number: carrick_abi::NativeNr(220),
         };
@@ -3240,6 +3247,12 @@ pub(crate) mod tests {
         let mut parent_control =
             executor::HvpatchQuantumControl::for_test(&need_resched, &mut parent_submission);
         let mut memory = Memory::default();
+        carrick_guest_mem::GuestMemory::write_bytes(
+            &mut memory,
+            0x6000000fd0,
+            &72_425_i32.to_le_bytes(),
+        )
+        .unwrap();
         let prepared = state
             .prepare_in_process_fork(
                 &kernel,
@@ -3363,6 +3376,10 @@ pub(crate) mod tests {
         drop(child_authority);
         drop(root_authority);
 
+        assert_eq!(
+            child_engine.guest_memory[&0x6000000fd0],
+            (child_pid as i32).to_le_bytes()
+        );
         assert!(child_engine.completed_syscalls.is_empty());
         assert_eq!(*events.lock(), vec!["engine", "observer", "observer"]);
         assert_eq!(*returns.lock(), vec![child_pid, 0]);
@@ -4573,14 +4590,14 @@ pub(crate) mod tests {
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         exit: executor::ExecutorExit,
     ) -> executor::ExecutorExit {
-        use super::super::binding::TerminalMemoryAction;
+        use super::super::binding::RetainedMemoryAction;
         if !matches!(exit, executor::ExecutorExit::Yielded) {
             return exit;
         }
         assert!(
             matches!(&job.phase,
-                HvpatchProductionPhase::TerminalMemoryRetry { action }
-                    if matches!(action.as_ref(), TerminalMemoryAction::ProcessFinish { .. })
+                HvpatchProductionPhase::RetainedMemoryRetry { action }
+                    if matches!(action.as_ref(), RetainedMemoryAction::ProcessFinish { .. })
             ),
             "only exact terminal memory admission adds a quantum"
         );
@@ -5125,7 +5142,7 @@ pub(crate) mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn terminal_memory_error_keeps_exec_and_process_owner_custody() {
-        use super::super::binding::{PersistentTerminal, TerminalMemoryAction};
+        use super::super::binding::{PersistentTerminal, RetainedMemoryAction};
         for (pid, parked) in [(72_551, false), (72_552, true)] {
             let mut case = pending_exec_drain_test_case(pid, ExecCompletionOrigin::GuestSyscall);
             let HvpatchProductionPhase::ExecSiblingDrain { context, owner } =
@@ -5133,11 +5150,11 @@ pub(crate) mod tests {
             else {
                 panic!("prepared exec must own the drain");
             };
-            let action = Box::new(TerminalMemoryAction::ExecDrain { context, owner });
+            let action = Box::new(RetainedMemoryAction::ExecDrain { context, owner });
             case.job.phase = if parked {
-                HvpatchProductionPhase::ResumeTerminalOwner { action }
+                HvpatchProductionPhase::ResumeRetainedOwner { action }
             } else {
-                HvpatchProductionPhase::TerminalMemoryRetry { action }
+                HvpatchProductionPhase::RetainedMemoryRetry { action }
             };
             let error = || {
                 ProductionHvpatchPollError::Runtime(RuntimeError::Dispatch(
@@ -5159,8 +5176,8 @@ pub(crate) mod tests {
                 handoff.claim_process_exit().unwrap().claim,
                 ProcessExitClaim::Owner
             );
-            case.job.phase = HvpatchProductionPhase::TerminalMemoryRetry {
-                action: Box::new(TerminalMemoryAction::ProcessFinish {
+            case.job.phase = HvpatchProductionPhase::RetainedMemoryRetry {
+                action: Box::new(RetainedMemoryAction::ProcessFinish {
                     context,
                     terminal: PersistentTerminal::Error(RuntimeError::Configuration(
                         "retained owner".into(),
@@ -5173,7 +5190,7 @@ pub(crate) mod tests {
             ));
             assert!(matches!(
                 case.job.phase,
-                HvpatchProductionPhase::TerminalMemoryRetry { .. }
+                HvpatchProductionPhase::RetainedMemoryRetry { .. }
             ));
             assert!(case.job.terminal_result.is_none());
             case.sibling

@@ -5887,6 +5887,9 @@ mod real {
         /// thread. Args: Linux PID, Linux TID, Carrick registry TID, typed
         /// terminal reason, and reason-specific detail (guest exit code or 0).
         fn hvpatch__thread__terminal(_: i32, _: i32, _: i32, _: u32, _: i32) {}
+        /// Original runtime cause before a terminal owner lowers it to 127.
+        /// Args: Linux process/thread identity and lazily formatted cause.
+        fn hvpatch__terminal__error(_: i32, _: i32, _: &str) {}
         /// Fail-closed Linux core lifecycle. Args: phase, Linux PID/TID,
         /// task-local capture generation, outcome (0=in progress/success,
         /// nonzero=failed at this phase).
@@ -7055,6 +7058,11 @@ mod real {
             lease_generation,
             successor_generation
         ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_terminal_error(pid: i32, tid: i32, error: &dyn std::fmt::Display) {
+        carrick_usdt::hvpatch__terminal__error!(|| (pid, tid, format!("{error}")));
     }
 
     #[inline(never)]
@@ -9699,6 +9707,7 @@ mod stub {
         successor_generation: u64
     ));
     stub!(hvpatch_thread_terminal(pid: i32, linux_tid: i32, registry_tid: i32, reason: super::HvpatchThreadTerminalReason, detail: i32));
+    stub!(hvpatch_terminal_error(pid: i32, tid: i32, error: &dyn std::fmt::Display));
     stub!(mn_clone_tid_output(
         tid: i32,
         output: super::HvpatchCloneTidOutput,

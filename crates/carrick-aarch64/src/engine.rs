@@ -8724,15 +8724,12 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     return Ok(transfer.into_bytes());
                 }
                 crate::user_transfer::TransferProgress::Advanced => {}
-                crate::user_transfer::TransferProgress::Suspended
-                | crate::user_transfer::TransferProgress::OwnerWait(_)
-                | crate::user_transfer::TransferProgress::Retired(_)
-                | crate::user_transfer::TransferProgress::Physical(_)
-                | crate::user_transfer::TransferProgress::Supply(_)
-                | crate::user_transfer::TransferProgress::Refused(_) => {
-                    return Err(TrapError::Hypervisor(
-                        "owner parent transfer refused".into(),
-                    ));
+                progress => {
+                    return Err(TrapError::Hypervisor(format!(
+                        "owner parent transfer at {:#x} length {} stopped: {progress:?}",
+                        transfer.address(),
+                        transfer.len(),
+                    )));
                 }
             }
         }

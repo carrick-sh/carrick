@@ -31,6 +31,15 @@ use super::{Kernel, ThreadRuntimeState, executor, stamp_ns_visible_guest_tid};
 use super::{RuntimeError, SyscallDispatcher};
 use carrick_kernel::kernel::identity_page::stamp_identity_values;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) enum ProcessChildBootstrapReady {
+    Complete,
+    ChildTid {
+        address: carrick_guest_mem::GuestVa,
+        tid: i32,
+    },
+}
+
 pub(crate) enum ProcessChildBootstrap {
     GuestFork {
         shares_mm: bool,
@@ -767,7 +776,7 @@ pub(crate) fn bootstrap_hvpatch_process_child<E: ThreadedEngine + 'static>(
     state: &mut ThreadRuntimeState<E>,
     engine: &mut E,
     bootstrap: ProcessChildBootstrap,
-) -> Result<(), RuntimeError>
+) -> Result<ProcessChildBootstrapReady, RuntimeError>
 where
     E::SiblingSpec: 'static,
 {
@@ -787,49 +796,14 @@ where
     stamp_ns_visible_guest_tid(engine, context).map_err(RuntimeError::Trap)?;
     if let ProcessChildBootstrap::GuestFork { child_settid, .. } = bootstrap {
         if let Some((address, tid)) = child_settid {
-            let owner_mm = match state.guest_execution.as_ref() {
-                Some(participation) => participation.has_admitted_el1_owner(),
-                None => kernel
-                    .dispatcher
-                    .enter_mm_executor()
-                    .map_err(|error| {
-                        RuntimeError::Configuration(format!("child TID owner admission: {error}"))
-                    })?
-                    .has_admitted_el1_owner(),
-            };
-            if owner_mm {
-                use carrick_hal::stage1_mm::Stage1MmProjection;
-                check_hvpatch_process_failpoint(
-                    context.task(),
-                    HvpatchProcessFailpoint::ChildSettidBootstrap,
-                )?;
-                let process = kernel.hvpatch_process.as_ref().ok_or_else(|| {
-                    RuntimeError::Configuration("owner child TID lost process lease".into())
-                })?;
-                let lease =
-                    process
-                        .mm_resources()
-                        .lease(context.task().key())
-                        .map_err(|error| {
-                            RuntimeError::Configuration(format!(
-                                "child TID ASID admission: {error}"
-                            ))
-                        })?;
-                let mut admission = lease.admit_borrowed_ttbr0().ok_or_else(|| {
-                    RuntimeError::Configuration("child TID ASID generation closed".into())
-                })?;
-                // FINISH has settled: the loaded child's exact owner now grants
-                // ordinary CopyOut, including untouched retained file pages.
-                engine
-                    .write_owner_fork_parent_bytes(address, &tid.to_le_bytes(), admission.as_mut())
-                    .map_err(RuntimeError::Trap)?;
-            } else {
-                bootstrap_hvpatch_process_child_tid(context.task(), engine, address, tid)?;
-            }
+            return Ok(ProcessChildBootstrapReady::ChildTid {
+                address: carrick_guest_mem::GuestVa(address),
+                tid,
+            });
         }
         state.complete_precompleted_child(&kernel.reporter, 0)?;
     }
-    Ok(())
+    Ok(ProcessChildBootstrapReady::Complete)
 }
 
 pub(crate) fn bootstrap_hvpatch_process_child_identity(
@@ -889,15 +863,34 @@ pub(crate) fn bootstrap_hvpatch_process_child_tid(
     memory: &mut impl CurrentMmMemory,
     address: u64,
     tid: i32,
-) -> Result<(), RuntimeError> {
+) -> Result<Option<carrick_guest_mem::MemoryPrepareError>, RuntimeError> {
+    use carrick_guest_mem::{GuestVa, GuestWriteRange, MemoryPrepareError, UserMemoryVenue};
     check_hvpatch_process_failpoint(task, HvpatchProcessFailpoint::ChildSettidBootstrap)?;
-    memory
-        .write_bytes(address, &tid.to_le_bytes())
-        .map_err(|error| {
+    let bytes = tid.to_le_bytes();
+    if memory.user_memory_venue() == UserMemoryVenue::Owner {
+        let range = GuestWriteRange::new(GuestVa(address), bytes.len())
+            .ok_or_else(|| RuntimeError::Configuration("child TID range overflow".into()))?;
+        match memory.prepare_write(&[range]) {
+            Ok(write) => write.commit(&[&bytes]),
+            Err(
+                error @ (MemoryPrepareError::Supply(_)
+                | MemoryPrepareError::OwnerWait(_)
+                | MemoryPrepareError::Physical(_)),
+            ) => return Ok(Some(error)),
+            Err(error) => {
+                return Err(RuntimeError::Configuration(format!(
+                    "prepare process child TID: {error:?}"
+                )));
+            }
+        }
+    } else {
+        memory.write_bytes(address, &bytes).map_err(|error| {
             RuntimeError::Trap(TrapError::Hypervisor(format!(
                 "process child TID bootstrap copyout: {error}"
             )))
-        })
+        })?;
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -2171,6 +2164,94 @@ pub(crate) mod tests {
         bootstrap_hvpatch_process_child_tid(bootstrap_context.task(), &mut bootstrap, 0x3000, 44)
             .unwrap();
         assert_eq!(bootstrap.0[&0x3000], 44_i32.to_le_bytes());
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn fork_child_tid_bootstrap_preserves_cow_supply_before_copyout() {
+        use carrick_el1_abi::{
+            PortalGrantWindow, PortalOperation, ReservationGeneration, ReservationMm,
+            ReservationProtection, ReservationRange,
+        };
+        use carrick_guest_mem::{
+            GuestWriteRange, MemoryError, MemoryPrepareError, MemorySupplyRequest,
+            PreparedGuestWrite, UserMemoryVenue,
+        };
+        use core::num::NonZeroU64;
+        struct TidMemory {
+            ready: bool,
+            bytes: [u8; 4],
+            prepares: usize,
+        }
+        struct Write<'a>(&'a mut TidMemory);
+        impl PreparedGuestWrite for Write<'_> {
+            fn commit(self: Box<Self>, outputs: &[&[u8]]) {
+                assert_eq!(outputs.len(), 1);
+                self.0.bytes.copy_from_slice(outputs[0]);
+            }
+        }
+        impl GuestMemory for TidMemory {
+            fn user_memory_venue(&self) -> UserMemoryVenue {
+                UserMemoryVenue::Owner
+            }
+            fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+                Ok(self.bytes.to_vec())
+            }
+            fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+                Err(MemoryError::Unsupported)
+            }
+            fn prepare_write(
+                &mut self,
+                ranges: &[GuestWriteRange],
+            ) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
+                assert_eq!(ranges.len(), 1);
+                assert_eq!(ranges[0].address().raw(), 0x6000000fd0);
+                assert_eq!(ranges[0].len(), 4);
+                self.prepares += 1;
+                if self.ready {
+                    return Ok(Box::new(Write(self)));
+                }
+                Err(MemoryPrepareError::Supply(MemorySupplyRequest::Cow(
+                    PortalGrantWindow {
+                        operation: PortalOperation {
+                            carrier: NonZeroU64::new(1).unwrap(),
+                            mm: ReservationMm::new(3).unwrap(),
+                            incarnation: NonZeroU64::new(1).unwrap(),
+                            sequence: NonZeroU64::new(124).unwrap(),
+                        },
+                        generation: ReservationGeneration::new(2).unwrap(),
+                        range: ReservationRange::new(0x6000000000, 0x6000001000).unwrap(),
+                        protection: ReservationProtection::READ_WRITE,
+                        fault_page: 0x6000000000,
+                        host_backing: None,
+                        fork_sequence: None,
+                    },
+                )))
+            }
+        }
+        impl CurrentMmMemory for TidMemory {}
+        let (_, child) = crate::hvpatch::process_context_for_tests(2);
+        let mut memory = TidMemory {
+            ready: false,
+            bytes: 1_i32.to_le_bytes(),
+            prepares: 0,
+        };
+        let result =
+            bootstrap_hvpatch_process_child_tid(child.task(), &mut memory, 0x6000000fd0, 2);
+        assert!(
+            result.is_ok(),
+            "valid owner COW supply must not terminate the child: {result:?}"
+        );
+        assert!(
+            matches!(result.unwrap(), Some(MemoryPrepareError::Supply(MemorySupplyRequest::Cow(window)))
+            if window.operation.mm.raw() == 3 && window.fault_page == 0x6000000000)
+        );
+        assert_eq!(memory.bytes, 1_i32.to_le_bytes());
+        assert_eq!(memory.prepares, 1);
+        memory.ready = true;
+        bootstrap_hvpatch_process_child_tid(child.task(), &mut memory, 0x6000000fd0, 2).unwrap();
+        assert_eq!(memory.bytes, 2_i32.to_le_bytes());
+        assert_eq!(memory.prepares, 2);
     }
 
     #[test]

@@ -7384,8 +7384,8 @@ fn terminal_zone_capture_has_no_syscall_and_keeps_signals_pending() {
     let wait = ZoneWait::new(carrick_el1_abi::RecordRef::PLACEHOLDER, 1);
     wait.mark_consumed();
     let continuation =
-        BlockedContinuation::from_terminal_zone_park(&context, &lease, wait).unwrap();
-    assert!(continuation.authority().is_terminal_action());
+        BlockedContinuation::from_retained_memory_zone_park(&context, &lease, wait).unwrap();
+    assert!(continuation.authority().is_retained_memory_action());
     assert_eq!(continuation.authority().syscall(), None);
     assert_eq!(continuation.authority().mm(), context.shared().mm().id());
     assert_eq!(
@@ -7410,7 +7410,7 @@ fn terminal_zone_capture_has_no_syscall_and_keeps_signals_pending() {
         .unwrap();
     assert_eq!(
         result.completion,
-        ContinuationCompletion::ResumeTerminalAction
+        ContinuationCompletion::ResumeRetainedMemory
     );
     assert_eq!(result.restart(), RestartDecision::NoRestart);
     assert!(result.reserved_signal().is_none());
@@ -7429,7 +7429,7 @@ fn terminal_zone_capture_rejects_another_threads_execution_lease() {
     let wait = ZoneWait::new(carrick_el1_abi::RecordRef::PLACEHOLDER, 1);
     wait.mark_consumed();
     assert!(matches!(
-        BlockedContinuation::from_terminal_zone_park(&other, &lease, wait),
+        BlockedContinuation::from_retained_memory_zone_park(&other, &lease, wait),
         Err(ContinuationBuildError::StaleExecutionAuthority),
     ));
 }
@@ -7441,7 +7441,7 @@ fn terminal_action_cannot_be_folded_into_a_guest_syscall_result() {
     let mut memory = crate::dispatch::LinearMemory::new(0x4000, vec![0; 16]);
     assert_eq!(
         fold_continuation_completion(
-            ContinuationCompletion::ResumeTerminalAction,
+            ContinuationCompletion::ResumeRetainedMemory,
             &dispatcher,
             &context,
             &mut memory,
