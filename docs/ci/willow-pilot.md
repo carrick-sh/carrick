@@ -76,13 +76,48 @@ main (`Admission::Standing`; see the
 Before minting each runner it re-vets the reserved run (same admission and
 attempt; for a merge group, every pull request in the group must have its
 head in `carrick-sh/carrick`) and writes the guest's root-owned
-`/etc/carrick-ci/policy` as `standing run=<id> attempt=<n> sha=<sha>`. The
-hook admits only that run. It admits at most `--max-concurrency` clones (1
-by default, never more than 2). Demand lists only this workflow's runs;
-assignment reads only the reserved job and the runner list. GitHub/PVE
-failures back off (30 s doubling to 10 min) and never end the loop; the 80%
-CPU ceiling still stops it. A job whose clone closed without running it is
-served again, at most three times per job key.
+`/etc/carrick-ci/policy` as `standing run=<id> attempt=<n> sha=<sha>`. That
+reservation admits the run the clone was minted for. It admits at most
+`--max-concurrency` clones (1 by default, never more than 2). Demand lists
+only this workflow's runs. GitHub/PVE admission failures back off (30 s
+doubling to 10 min) and never end the loop; the 80% CPU ceiling still stops
+it. A job whose clone closed without a job is served again, at most three
+times per job key.
+
+### Actual assignments are re-vetted (#333)
+
+GitHub assigns a queued job to *any* idle runner with matching labels, not to
+the run a clone was minted for: a clone minted for a main push can receive a
+merge group's KVM job. The standing hook (`standing_hook_script`) therefore
+tries the reservation first and otherwise runs `admit-job --controller`, the
+same credential-free rendezvous as cloudmac ([mac-jit.md](mac-jit.md)):
+
+1. The hook writes its actual run id, attempt and SHA into the runner-owned
+   `/run/carrick-ci/assignment.json` (created by the controller before JIT
+   delivery) under the admission flock, then waits at most four minutes for
+   `/run/carrick-ci/approved-policy`.
+2. On every 30 s poll the controller reads that request as root through the
+   scoped guest agent, under the same flock. It authenticates the job by this
+   clone's runner id and the exact `willow-kvm` label set, re-vets the actual
+   run exactly as demand (`Github::vet`), and fsyncs the actual job into the
+   ledger (`assigned`, `assigned_key`).
+3. Only then does it publish the root-owned `approved-policy`, bound to the
+   actual run, attempt and SHA; the hook verifies it and starts the job. An
+   inadmissible assignment (another workflow, untrusted event or fork heads,
+   a merge group that left the queue) is recorded once in the ledger's
+   refusal list and gets no approval, so the hook kills the session before
+   any step. A stale merge group's run is also cancelled, best effort: the
+   standing token's Actions read-only permission makes that a logged no-op.
+
+A clone assigned another job neither holds its reservation nor consumes one
+of its serves, so the reserved job is served by the next clone. The decision
+code is shared with cloudmac (`ci_scaler/assignment.rs`). Before JIT the
+controller requires the template's guest xtask to offer
+`admit-job --controller` (every template built since the cloudmac re-vet,
+#273, does) and otherwise refuses the clone, naming the template rebuild. With
+`--max-concurrency 2`, provisioning a second clone blocks the poll loop for
+several minutes and can outlast a waiting hook's four-minute deadline, which
+then fails that job closed; Contabo runs with 1.
 
 ### GitHub credential for standing mode
 
