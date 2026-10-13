@@ -114,6 +114,12 @@ enum HostVenue {
     Reserved(ReservationRange),
 }
 
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
+enum HostRowEdit {
+    Replace,
+    Protection(ReservationProtection),
+}
+
 /// Metadata that one forwarded operation needs before touching its backend.
 #[derive(::core::clone::Clone, ::core::marker::Copy)]
 pub(in crate::dispatch) enum HostMetadataNeed {
@@ -1100,6 +1106,27 @@ impl MemState {
     /// replacing whatever the root held there. No-op in host setup and for a
     /// range the pending host proposal owns.
     pub(in crate::dispatch) fn mirror_host_rows(&mut self, start: u64, end: u64) {
+        self.mirror_host_edit(start, end, HostRowEdit::Replace);
+    }
+
+    pub(in crate::dispatch) fn mirror_host_protection(
+        &mut self,
+        start: u64,
+        end: u64,
+        prot: LinuxProtFlags,
+    ) {
+        self.mirror_host_edit(
+            start,
+            end,
+            HostRowEdit::Protection(protection(
+                prot.contains(LinuxProtFlags::READ),
+                prot.contains(LinuxProtFlags::WRITE),
+                prot.contains(LinuxProtFlags::EXEC),
+            )),
+        );
+    }
+
+    fn mirror_host_edit(&mut self, start: u64, end: u64, edit: HostRowEdit) {
         let AnonymousAuthority::Delegated(delegated) = &self.anonymous else {
             return;
         };
@@ -1188,6 +1215,48 @@ impl MemState {
             }
         }
         root.with_root(|model| {
+            if let HostRowEdit::Protection(prot) = edit {
+                // Retained file rows live only in the owner root. A served
+                // descriptor permission edit has no replacement host row:
+                // preserve the source and attributes under this same guard
+                // before replacing the clipped permission spans.
+                let host_ranges: Vec<_> = rows.iter().map(|row| (row.0, row.1)).collect();
+                for &(segment_start, segment_end) in &segments {
+                    let mut retained = Vec::new();
+                    model.observe_nodes(
+                        reservation_range(segment_start, segment_end)?,
+                        &mut |mapping, _| {
+                            if mapping.host_backing.is_some()
+                                && mapping.flags.contains(
+                                    ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE),
+                                )
+                            {
+                                retained.push(mapping);
+                            }
+                        },
+                    )?;
+                    for mapping in retained {
+                        let source = mapping.host_backing.ok_or(Refusal::Stale)?;
+                        for (piece_start, piece_end) in uncovered_segments(
+                            mapping.range.start().max(segment_start),
+                            mapping.range.end().min(segment_end),
+                            &host_ranges,
+                        ) {
+                            rows.push((
+                                piece_start,
+                                piece_end,
+                                prot,
+                                mapping.flags,
+                                Some(
+                                    source
+                                        .advance(piece_start - mapping.range.start())
+                                        .ok_or(Refusal::Invalid)?,
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
             for &(segment_start, segment_end) in &segments {
                 model.retire_opaque(reservation_range(segment_start, segment_end)?)?;
             }
