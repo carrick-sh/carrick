@@ -87,6 +87,16 @@ fn service_terminal_operation(
         return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
     };
     if retired {
+        let Some(zone) = carrick_el1_abi::zone_tables() else {
+            return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+        };
+        let idle = zone.spaces.idle_ttbr();
+        if idle == 0
+            || (ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK)
+                != (idle & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK)
+        {
+            return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+        }
         let Some(address) = core::num::NonZeroU64::new(args[1]) else {
             return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
         };
