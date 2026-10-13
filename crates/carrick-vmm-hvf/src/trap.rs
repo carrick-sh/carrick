@@ -2599,6 +2599,15 @@ impl HvfMappedRegion {
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for HvfMappedRegion {
+    fn drop(&mut self) {
+        if self.start == carrick_mem::memory::LINUX_EL1_KERNEL_BASE && self.host_mapping.is_some() {
+            stage2_backend::clear_el1_region_host_ptr_if(self.host_addr as usize);
+        }
+    }
+}
+
 /// A copyable projection of the scalar fields of an [`HvfMappedRegion`] that the
 /// syscall-path accessors actually read (`start`/`end`/`ipa`/`host_addr`/`size`/
 /// `guest_writable`/sharing). [`HvfInner::mapping_for_range`] returns this

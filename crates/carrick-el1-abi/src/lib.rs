@@ -2566,6 +2566,14 @@ pub fn get_el1_region_host_ptr() -> usize {
     EL1_REGION_HOST_PTR.load(Ordering::Acquire)
 }
 
+/// Clear a retired aperture only if it is still the published mapping.
+/// A late drop of an old VM cannot revoke a successor VM's aperture.
+pub fn clear_el1_region_host_ptr_if(expected: usize) -> bool {
+    EL1_REGION_HOST_PTR
+        .compare_exchange(expected, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
 /// Shared aperture control word.
 #[repr(C, align(64))]
 pub struct ApertureControl {

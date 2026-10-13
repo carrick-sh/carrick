@@ -7775,6 +7775,57 @@ fn two_live_mm_bootstrap_retirement_releases_only_its_published_root_slot() {
 }
 
 #[test]
+fn final_rootless_shared_inventory_retires_exact_slot_before_sequential_root() {
+    let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let _stage2_stub = ScopedStage2MapTestStub::enable();
+    let custody = legacy_test_carrier_vm_custody_arc();
+    let pool = std::sync::Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
+        2,
+    ));
+    let _pool_fixture = BootstrapRetirementPoolFixture::install(custody, pool.clone());
+    let kernel = std::sync::Arc::new(PerFrameKernel::default());
+    let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
+    let (mut first, _, _, _) =
+        exit_task_holding_owned_lease(721, 0x4000, 721, 722, &kernel, &frames);
+    let (mut peer, _, _, _) =
+        exit_task_holding_owned_lease(723, 0x8000, 723, 724, &kernel, &frames);
+    let base = pool.base_ipa();
+    let first_record = relocate_exit_fixture_root(&mut first, base);
+    let peer_record = relocate_exit_fixture_root(&mut peer, base + 0x20_0000);
+    let parked = std::sync::Arc::clone(&first.mm_access);
+    assert!(pool.allocate_slot_at(base).is_none());
+    drop(parked); // The final parked holder has retired.
+    HvfVmState::retire_task_state_shared_inventory_table_capacity(&mut first).unwrap();
+    assert!(
+        custody
+            .stage2_record_snapshot(first_record.record_id)
+            .is_none()
+    );
+    let (mut successor, _, _, _) =
+        exit_task_holding_owned_lease(725, 0xc000, 725, 726, &kernel, &frames);
+    let successor_record = relocate_exit_fixture_root(&mut successor, base);
+    HvfVmState::retire_task_state_shared_inventory_table_capacity(&mut first).unwrap();
+    assert!(
+        pool.allocate_slot_at(base).is_none(),
+        "late prior retirement must not release successor"
+    );
+    assert!(
+        custody
+            .stage2_record_snapshot(successor_record.record_id)
+            .is_some()
+    );
+    assert!(
+        custody
+            .stage2_record_snapshot(peer_record.record_id)
+            .is_some()
+    );
+    HvfVmState::retire_task_state_process_mappings(&mut first).unwrap();
+    HvfVmState::retire_task_state_process_mappings(&mut peer).unwrap();
+    HvfVmState::retire_task_state_process_mappings(&mut successor).unwrap();
+    assert_eq!(pool.allocated_count(), 0);
+}
+
+#[test]
 fn two_live_mm_pinned_table_retirement_cannot_return_physical_capacity() {
     use carrick_aarch64::stage1_authority::TableArenaPublisher;
     let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();

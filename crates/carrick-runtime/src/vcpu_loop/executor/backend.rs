@@ -315,7 +315,10 @@ impl HvpatchTaskEngineBindingState {
                                 ))
                             })
                         }
-                        None => Ok(None),
+                        None => {
+                            carrick_vmm_hvf::hvf_aarch64_engine::retire_detached_task_only_shared_rootless_capacity(state)?;
+                            Ok(None)
+                        }
                     };
                 }
                 let (commit, root_receipt) = match root_ticket {
