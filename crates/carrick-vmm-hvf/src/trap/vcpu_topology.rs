@@ -192,6 +192,68 @@ fn create_admitted_in<T>(
     Ok(create())
 }
 
+/// VM-free fixture for the production topology admission state machine.
+#[cfg(feature = "foreign-cow-test-support")]
+#[doc(hidden)]
+#[derive(Default)]
+pub struct VcpuTopologyTestFixture {
+    state: parking_lot::Mutex<(VcpuTopology, u64)>,
+}
+
+#[cfg(feature = "foreign-cow-test-support")]
+impl Default for VcpuTopology {
+    fn default() -> Self {
+        Self::VACANT
+    }
+}
+
+#[cfg(feature = "foreign-cow-test-support")]
+impl VcpuTopologyTestFixture {
+    pub fn begin_vm(&self) -> Result<u64, String> {
+        let mut state = self.state.lock();
+        if state.0.phase != TopologyPhase::Vacant {
+            return Err(format!(
+                "VM generation {} is still {:?}",
+                state.0.generation, state.0.phase
+            ));
+        }
+        state.1 += 1;
+        let generation = state.1;
+        state.0.begin_generation(generation);
+        Ok(generation)
+    }
+
+    pub fn admit_create(&self) -> Result<u64, String> {
+        let state = self.state.lock();
+        state
+            .0
+            .admit_create()
+            .map_err(|error| format!("{error:?}"))?;
+        Ok(state.0.generation)
+    }
+
+    pub fn first_run(&self) -> Result<(), String> {
+        self.state
+            .lock()
+            .0
+            .admit_first_run()
+            .map_err(|error| format!("{error:?}"))
+    }
+
+    pub fn begin_teardown(&self) {
+        self.state.lock().0.begin_teardown();
+    }
+
+    pub fn end_vm(&self) -> Result<(), String> {
+        let mut state = self.state.lock();
+        if state.0.phase != TopologyPhase::TearingDown {
+            return Err("VM destruction requires teardown".to_owned());
+        }
+        state.0.end_generation();
+        Ok(())
+    }
+}
+
 pub(crate) fn admit_vcpu_first_run() {
     if let Err(violation) = carrier_vcpu_topology().lock().admit_first_run() {
         topology_fault(violation);

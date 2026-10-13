@@ -1180,3 +1180,21 @@ stock slice. The zone ABI signature changes with the retained custody storage,
 so signed verification needs fixtures admitted against the new input identity.
 VM-free Linux tests do not prove the ARM HVC, hardware root switch, full process
 adoption, or native ARM runtime ratio. Those gates remain director-owned.
+
+## Carrier teardown after executor failure (`runtime.carrier.failed-drain`)
+
+`runtime.carrier.failed-drain` covers successive containers in one host process.
+A failed task remains a failure; draining its executor pool must join every
+worker before destroying the VM and closing carrier admission. This is a
+Carrick hardware-lifecycle invariant, with no Docker timing or Linux syscall
+output claim. The structural budget is exactly one VM destruction per carrier,
+including repeated shutdown calls, and one fresh generation for the next VM.
+
+The VM-free binding
+`failed_executor_drain_still_completes_vm_teardown_before_next_container`
+runs the production executor pool with a failing test backend in container A,
+then an exiting backend in container B. The hardware substitute uses the
+production vCPU topology state machine: B's pool must be admitted on generation
+2, after generation 1 ends. It also checks one create, destroy and join per pool
+and consecutive carrier identities. This does not prove HVF destruction;
+the director's signed EL1/embed and probe batch supplies that integration gate.
