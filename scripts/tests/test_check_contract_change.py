@@ -247,6 +247,23 @@ class CheckContractChangeTest(unittest.TestCase):
         result = self.run_check()
         self.assertEqual(result.returncode, 0, msg=result.stderr)
 
+    def test_registered_rust_tests_module_is_evidence(self):
+        self.use_single_contract_surface()
+        unit_path = "crates/carrick-kernel/src/dispatch/futex/tests.rs"
+        unit = self.repo / unit_path
+        unit.parent.mkdir(parents=True)
+        unit.write_text("#[test] fn checks_futex() {}\n", encoding="utf-8")
+        with (self.repo / "conformance-contracts/surfaces.toml").open("a") as mapping:
+            mapping.write(
+                f'\n[[surfaces]]\npath = "{unit_path}"\n'
+                'contracts = ["kernel.futex.contention"]\n'
+            )
+        self.guest_file.write_text("// modified futex implementation\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "modify guest and Rust tests module"], cwd=self.repo, check=True)
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
     def test_3_byte_identical_rename_detected_with_M_exits_0(self):
         new_path = self.guest_file.parent / "futex_renamed.rs"
         subprocess.run(["git", "mv", str(self.guest_file), str(new_path)], cwd=self.repo, check=True)

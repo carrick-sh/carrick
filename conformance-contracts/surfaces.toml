@@ -352,7 +352,15 @@ contracts = ["kernel.mm.native-code-content", "kernel.mm.native-code-drain"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/foreign_mm/tests.rs"
-contracts = ["kernel.mm.native-code-content"]
+contracts = ["kernel.mm.native-code-content", "kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/owner_fork.rs"
+contracts = ["kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/frame_inventory/tests.rs"
+contracts = ["kernel.fork.stage1-image"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/foreign_mm.rs"
