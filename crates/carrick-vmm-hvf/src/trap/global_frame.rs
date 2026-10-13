@@ -2432,6 +2432,20 @@ impl Drop for StructuralBackingOwner {
         };
         let identity = *self.retained.record_identity.lock();
         let _ = custody.request_stage2_record_retirement(identity);
+        // The carrier pre-maps pooled table slots. Their stage-2 record has no
+        // backend mapping to unmap, so the final owner can complete retirement
+        // without issuing a hypervisor operation from Drop. This also releases
+        // the pool handle after a container root vanishes without a task-only
+        // retirement callback (for example at VM teardown).
+        if matches!(
+            self.retained.mapping.backing,
+            GlobalFrameBacking::PooledRoot(_)
+        ) && custody
+            .stage2_record_snapshot(identity.record_id)
+            .is_some_and(|record| !record.backend_map_installed && record.pin_count == 0)
+        {
+            let _ = retire_carrier_stage2_record_at_safe_point(&custody, identity);
+        }
     }
 }
 
