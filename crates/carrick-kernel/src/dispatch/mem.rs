@@ -572,7 +572,7 @@ impl MemState {
             visible.sort_by_key(|region| region.start);
             *regions = visible;
         }
-        mem.mirror_host_rows(start, end);
+        mem.mirror_host_protection(start, end, prot);
     }
 
     pub(super) fn new() -> Self {
