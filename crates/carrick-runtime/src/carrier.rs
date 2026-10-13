@@ -1953,6 +1953,14 @@ mod tests {
         let _serial = TEST_LOCK.lock();
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         let container = Arc::new(Container::new(launch("dropped-activation")));
+        let arena = Box::leak(Box::new(
+            carrick_kernel_arena::arena::KernelArena::create().expect("kernel arena"),
+        ));
+        let region = carrick_kernel::namespace::pid::NsSharedRegion::allocate(arena)
+            .expect("container pid namespace");
+        container
+            .install_pid_ns(Arc::clone(&region))
+            .expect("install container pid namespace");
         let first = carrick_kernel::kernel::RootBootstrap::for_reference_model(
             5_420,
             carrick_hal::ThreadId::synthetic_for_tests(5_420),
@@ -1963,6 +1971,7 @@ mod tests {
         let first = carrier
             .boot_kernel_root(first, |_, _, _| Ok(()))
             .expect("prepare first root");
+        assert_eq!(region.host_to_ns(5_420), Some(1));
         drop(
             carrier
                 .claim_kernel_activation(first.context.task().key())
@@ -1975,6 +1984,10 @@ mod tests {
             "rollback must retire the live root before releasing its namespace"
         );
         assert_eq!(container.pid_root(), Some(first.context.task().key()));
+        assert!(
+            !region.retire(),
+            "the exit transaction owns the one release"
+        );
         assert_eq!(carrier.snapshot().expect("rolled back").kernel_graphs, 0);
 
         let replacement = carrick_kernel::kernel::RootBootstrap::for_reference_model(
