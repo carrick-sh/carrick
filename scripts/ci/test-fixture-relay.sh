@@ -81,7 +81,7 @@ download() {
     bash "$scripts/download-fixture-bundle.sh" verify > verify.log 2>&1
     cmp original "target/fixtures/incoming/$BUNDLE_NAME"
     test -z "$(find target/fixtures/incoming -name '.relay-*' -print)"
-    if rg -q test-relay-token relay.log verify.log; then
+    if grep -F -q test-relay-token relay.log verify.log; then
         echo 'FAIL token appeared in logs' >&2
         exit 1
     fi
@@ -97,7 +97,7 @@ echo 'PASS HTTP failure: GitHub fallback verified'
 export RELAY_TEST_MODE=corrupt
 download
 test "$(cat selected-path)" = github
-rg -q FAILED relay.log
+grep -F -q FAILED relay.log
 echo 'PASS relay digest mismatch: GitHub fallback verified'
 export RELAY_TEST_MODE=success
 export RELAY_TEST_PERMISSIONS=501:644
@@ -125,5 +125,5 @@ if bash "$scripts/download-fixture-bundle.sh" verify > verify.log 2>&1; then
     echo 'FAIL corrupt GitHub artifact accepted' >&2
     exit 1
 fi
-rg -q FAILED verify.log
+grep -F -q FAILED verify.log
 echo 'PASS GitHub digest mismatch: rejected'
