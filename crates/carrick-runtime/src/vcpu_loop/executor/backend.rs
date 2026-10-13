@@ -111,6 +111,11 @@ impl HvpatchResidencyHandle {
         self.condvar.notify_all();
     }
 
+    pub(crate) fn clear_terminal_residency(&self) {
+        *self.residency.lock() = None;
+        self.condvar.notify_all();
+    }
+
     // Deadlock freedom proof:
     // Executor B waits for executor A to materialize thread T.
     // Executor A only holds thread T in `Resident` state while actively executing T's quantum
@@ -436,6 +441,10 @@ impl HvpatchTaskEngineBindingState {
     pub(crate) fn set_residency(&self, residency: TaskCpuResidency) {
         self.residency.set_residency(residency);
     }
+
+    pub(crate) fn clear_terminal_residency(&self) {
+        self.residency.clear_terminal_residency();
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -530,6 +539,12 @@ pub(crate) trait PersistentExecutor: 'static {
     fn destroy(self) -> Result<(), TrapError>;
 
     fn flush_resident_task(&mut self) -> Result<(), TrapError> {
+        Ok(())
+    }
+
+    /// The exact terminal entry has completed and can never resume. Clear its
+    /// idle-vCPU residency without taking another snapshot of a retired task.
+    fn retire_terminal_resident_task(&mut self, _thread: ThreadKey) -> Result<(), TrapError> {
         Ok(())
     }
 
@@ -1341,6 +1356,40 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
             }
             self.residency_generation = self.residency_generation.next();
         }
+        Ok(())
+    }
+
+    fn retire_terminal_resident_task(&mut self, thread: ThreadKey) -> Result<(), TrapError> {
+        let Some(mut resident) = self.resident_task.take() else {
+            return Ok(());
+        };
+        if resident.thread != thread {
+            self.resident_task = Some(resident);
+            return Err(TrapError::Hypervisor(format!(
+                "terminal resident record belongs to a different thread: expected={thread:?}"
+            )));
+        }
+        let result = (|| {
+            self.issue_resident_invalidation(resident.owed_invalidation.take())?;
+            let lifecycle = self.lifecycle.as_ref().ok_or_else(|| {
+                TrapError::Hypervisor("terminal resident root missing worker lifecycle".into())
+            })?;
+            let vcpu = self.vcpu.as_mut().ok_or_else(|| {
+                TrapError::Hypervisor("terminal resident root missing worker vCPU".into())
+            })?;
+            carrick_vmm_hvf::hvf_aarch64_engine::retire_terminal_resident_vcpu_root(
+                lifecycle, vcpu,
+            )?;
+            if let Some(binding) = resident.binding.upgrade() {
+                binding.clear_terminal_cpu_residency()?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.resident_task = Some(resident);
+            return Err(error);
+        }
+        self.residency_generation = self.residency_generation.next();
         Ok(())
     }
 

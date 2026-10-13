@@ -103,6 +103,7 @@ struct FakeBinding {
     retire_detached_address_space_gate: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
     retire_detached_address_space_resume: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     retire_requires_materialized: AtomicBool,
+    terminal_residency_retired: AtomicBool,
     residency: parking_lot::Mutex<super::residency::TaskCpuResidency>,
     residency_condvar: parking_lot::Condvar,
 }
@@ -170,6 +171,7 @@ impl FakeBinding {
             retire_detached_address_space_gate: parking_lot::Mutex::new(None),
             retire_detached_address_space_resume: parking_lot::Mutex::new(None),
             retire_requires_materialized: AtomicBool::new(false),
+            terminal_residency_retired: AtomicBool::new(false),
             residency: parking_lot::Mutex::new(super::residency::TaskCpuResidency::Materialized(
                 test_guest_cpu_state(marker),
             )),
@@ -278,6 +280,7 @@ impl PersistentTaskBinding for FakeBinding {
         root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
     ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, TrapError> {
         if self.retire_requires_materialized.load(Ordering::SeqCst)
+            && !self.terminal_residency_retired.load(Ordering::SeqCst)
             && !matches!(
                 *self.residency.lock(),
                 super::residency::TaskCpuResidency::Materialized(_)
@@ -297,12 +300,22 @@ impl PersistentTaskBinding for FakeBinding {
     }
 
     fn cpu_residency(&self) -> Option<super::residency::TaskCpuResidency> {
-        Some(self.residency.lock().clone())
+        (!self.terminal_residency_retired.load(Ordering::SeqCst))
+            .then(|| self.residency.lock().clone())
     }
 
     fn set_cpu_residency(&self, residency: super::residency::TaskCpuResidency) {
+        self.terminal_residency_retired
+            .store(false, Ordering::SeqCst);
         *self.residency.lock() = residency;
         self.residency_condvar.notify_all();
+    }
+
+    fn clear_terminal_cpu_residency(&self) -> Result<(), TrapError> {
+        self.terminal_residency_retired
+            .store(true, Ordering::SeqCst);
+        self.residency_condvar.notify_all();
+        Ok(())
     }
 
     fn wait_for_materialized(&self, thread: ThreadKey) -> Result<Option<GuestCpuState>, TrapError> {
@@ -342,10 +355,13 @@ impl PersistentTaskBinding for FakeBinding {
 }
 
 #[test]
-fn terminal_retirement_flushes_its_loaded_root_before_table_release() {
+fn exit_group_consumes_the_last_resident_entry_before_root_retirement() {
     let (process, context) = crate::hvpatch::process_context_for_tests(14_991);
     let scheduler = Arc::new(single_cpu_scheduler(Arc::clone(context.kernel())));
     let factory = Arc::new(FakeFactory::default());
+    factory
+        .snapshot_after_exit_fails
+        .store(true, Ordering::SeqCst);
     let binding = FakeBinding::new(99, [Step::Exit]);
     binding
         .retire_requires_materialized
@@ -366,7 +382,9 @@ fn terminal_retirement_flushes_its_loaded_root_before_table_release() {
     )
     .expect("terminal root saved before retirement");
     pool.shutdown()
-        .expect("root was materialized before retirement");
+        .expect("terminal record was retired without replaying entry completion");
+    assert_eq!(factory.snapshot_count.load(Ordering::SeqCst), 0);
+    assert!(binding.cpu_residency().is_none());
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -414,6 +432,7 @@ struct FakeFactory {
     owner_dirty_fds: Arc<parking_lot::Mutex<Vec<(i32, i32)>>>,
     destroy_mode: Arc<AtomicUsize>,
     snapshot_count: Arc<AtomicUsize>,
+    snapshot_after_exit_fails: Arc<AtomicBool>,
     overlay_count: Arc<AtomicUsize>,
     concurrent_loads: Arc<parking_lot::Mutex<BTreeSet<(ThreadKey, ExecutionGeneration)>>>,
     inherited_state: Arc<parking_lot::Mutex<Vec<InheritedStateRow>>>,
@@ -608,6 +627,7 @@ struct FakeExecutor {
     system_ns: u64,
     residency_generation: super::residency::ResidencyGeneration,
     resident_task: Option<(ThreadKey, ExecutionGeneration, Arc<FakeBinding>)>,
+    exit_seen: bool,
 }
 
 struct BoundaryAuditProbe;
@@ -860,6 +880,7 @@ impl PersistentExecutorFactory for FakeFactory {
             system_ns: 0,
             residency_generation: super::residency::ResidencyGeneration::INITIAL,
             resident_task: None,
+            exit_seen: false,
         })
     }
 }
@@ -869,6 +890,7 @@ impl PersistentExecutor for FakeExecutor {
 
     fn load(&mut self, task: &RunnableTask<'_, Self::TaskBinding>) -> Result<(), TrapError> {
         assert_eq!(thread::current().id(), self.owner);
+        self.exit_seen = false;
         task.validate_for_load()?;
         let key = (task.thread_key(), task.generation());
         assert_eq!(task.lease().generation(), task.generation());
@@ -1071,7 +1093,10 @@ impl PersistentExecutor for FakeExecutor {
             }
             Step::Yield => Ok(ExecutorExit::Yielded),
             Step::Preempt => Ok(ExecutorExit::Preempted),
-            Step::Exit => Ok(ExecutorExit::Exited),
+            Step::Exit => {
+                self.exit_seen = true;
+                Ok(ExecutorExit::Exited)
+            }
             Step::FailRun => Err(TrapError::Hypervisor("injected run failure".to_owned())),
             Step::PanicRun => panic!("injected executor panic"),
             Step::LoseLease => {
@@ -1263,10 +1288,39 @@ impl PersistentExecutor for FakeExecutor {
     }
 
     fn flush_resident_task(&mut self) -> Result<(), TrapError> {
+        if self.exit_seen
+            && self
+                .factory
+                .snapshot_after_exit_fails
+                .load(Ordering::SeqCst)
+        {
+            return Err(TrapError::Hypervisor(
+                "last syscall completion has retired its CPU snapshot".to_owned(),
+            ));
+        }
         if let Some((_thread, _gen, res_binding)) = self.resident_task.take() {
             self.factory.snapshot_count.fetch_add(1, Ordering::SeqCst);
             let state = test_guest_cpu_state(res_binding.marker);
             res_binding.set_cpu_residency(super::residency::TaskCpuResidency::Materialized(state));
+            self.residency_generation = self.residency_generation.next();
+        }
+        Ok(())
+    }
+
+    fn retire_terminal_resident_task(&mut self, thread: ThreadKey) -> Result<(), TrapError> {
+        if !self.exit_seen {
+            return Err(TrapError::Hypervisor(
+                "terminal residency retired before exit completion".to_owned(),
+            ));
+        }
+        if let Some((resident_thread, generation, binding)) = self.resident_task.take() {
+            if resident_thread != thread {
+                self.resident_task = Some((resident_thread, generation, binding));
+                return Err(TrapError::Hypervisor(
+                    "terminal resident record belongs to another thread".to_owned(),
+                ));
+            }
+            binding.clear_terminal_cpu_residency()?;
             self.residency_generation = self.residency_generation.next();
         }
         Ok(())

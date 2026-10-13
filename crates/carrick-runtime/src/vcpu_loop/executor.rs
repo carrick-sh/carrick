@@ -915,11 +915,14 @@ where
                 executor_id
             );
         }
-        if (terminal_retirement.is_some()
-            || pending_exec_retirement.is_some()
-            || pending_exec_cleanup)
-            && let Err(error) = backend.flush_resident_task()
-        {
+        let residency_release = if terminal_retirement.is_some() {
+            backend.retire_terminal_resident_task(running.thread_key())
+        } else if pending_exec_retirement.is_some() || pending_exec_cleanup {
+            backend.flush_resident_task()
+        } else {
+            Ok(())
+        };
+        if let Err(error) = residency_release {
             let settlement = match settlement_authority {
                 SettlementAuthority::Live => fail_running_and_retire::<F::TaskBinding, _>(
                     resolver.as_ref(),
@@ -939,7 +942,7 @@ where
                 }
             };
             return Err(with_settlement_error(
-                format!("flush resident root before table retirement: {error}"),
+                format!("release resident root before table retirement: {error}"),
                 settlement,
             ));
         }
