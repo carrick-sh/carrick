@@ -1434,28 +1434,21 @@ impl CarrierVmCustody {
     /// Release one pin on the exact record `identity` (the drop half of
     /// [`Self::pin_stage2_record`]).
     pub(crate) fn release_stage2_pin(&self, identity: CarrierStage2RecordIdentity) {
-        let premapped_retirement_ipa = {
+        use carrick_core::mm::retirement::{RecordPinRelease, release_record_pin_outcome};
+        let outcome = {
             let mut state = self.state.lock();
             let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
                 return;
             };
-            let remove_terminal_predecessor =
-                carrick_core::mm::retirement::release_record_pin(record, identity);
-            if remove_terminal_predecessor {
+            let outcome = release_record_pin_outcome(record, identity);
+            if outcome == RecordPinRelease::RemovePredecessor {
                 let _ = state.remove_record(identity.record_id);
-                None
-            } else {
-                let snapshot = record.snapshot;
-                (snapshot.vm_generation == identity.vm_generation
-                    && snapshot.logical_owner == identity.logical_owner
-                    && snapshot.pin_count == 0
-                    && snapshot.retirement_requested
-                    && !snapshot.backend_map_installed
-                    && !snapshot.release_ipa)
-                    .then_some(snapshot.ipa)
             }
+            outcome
         };
-        if premapped_retirement_ipa.is_some_and(|ipa| self.is_active_root_slot_pool_ipa(ipa)) {
+        if let RecordPinRelease::ReadyToRetire { ipa } = outcome
+            && self.is_active_root_slot_pool_ipa(ipa)
+        {
             let _ = super::retire_carrier_stage2_record_at_safe_point(self, identity);
         }
     }

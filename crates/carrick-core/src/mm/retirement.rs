@@ -591,25 +591,63 @@ pub fn settle_record_retirement(
         }
     }
 }
-/// Whether the physical ledger can discard a terminal superseded predecessor.
-pub fn release_record_pin(
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+/// The neutral owner's verdict after one pin on a carrier stage-2 record drops.
+pub enum RecordPinRelease {
+    /// Pins remain, the identity did not match, or retirement is not yet settled.
+    StillHeld,
+    /// Last pin dropped on a requested retirement with no backend mapping or
+    /// IPA release outstanding: the backend may retire `ipa` at a safe point.
+    ReadyToRetire { ipa: u64 },
+    /// Last pin dropped on a VM-destroy-terminalized predecessor that a rebind
+    /// superseded: the ledger discards the record.
+    RemovePredecessor,
+}
+
+/// Release one pin and classify the resulting physical retirement state.
+pub fn release_record_pin_outcome(
     record: &mut CarrierStage2Record,
     identity: CarrierStage2RecordIdentity,
-) -> bool {
+) -> RecordPinRelease {
     if record_identity_mismatch(record, identity).is_some() {
-        return false;
+        return RecordPinRelease::StillHeld;
     }
     record.snapshot.pin_count = record.snapshot.pin_count.saturating_sub(1);
-    if record.snapshot.pin_count == 0
-        && record.snapshot.retirement_requested
+    if record.snapshot.pin_count != 0 {
+        return RecordPinRelease::StillHeld;
+    }
+    if record.snapshot.retirement_requested
         && record.snapshot.mapped
         && !record.snapshot.terminalized_by_vm_destroy
     {
         record.snapshot.retry_eligible = true;
     }
-    record.snapshot.pin_count == 0
-        && record.snapshot.terminalized_by_vm_destroy
-        && record.snapshot.superseded_by_rebind
+    if record.snapshot.terminalized_by_vm_destroy && record.snapshot.superseded_by_rebind {
+        return RecordPinRelease::RemovePredecessor;
+    }
+    if record.snapshot.retirement_requested
+        && !record.snapshot.backend_map_installed
+        && !record.snapshot.release_ipa
+    {
+        return RecordPinRelease::ReadyToRetire {
+            ipa: record.snapshot.ipa,
+        };
+    }
+    RecordPinRelease::StillHeld
+}
+
+/// Whether the physical ledger can discard a terminal superseded predecessor.
+pub fn release_record_pin(
+    record: &mut CarrierStage2Record,
+    identity: CarrierStage2RecordIdentity,
+) -> bool {
+    release_record_pin_outcome(record, identity) == RecordPinRelease::RemovePredecessor
 }
 pub fn terminalize_record(record: &mut CarrierStage2Record) {
     record.snapshot.mapped = false;
@@ -795,5 +833,83 @@ mod nonce_tests {
             .expect("rootless retirement needs no nonce");
         assert!(rootless.take_ticket().unwrap().is_none());
         assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn release_record_pin_outcome_classifies_held_premapped_and_predecessor() {
+        let identity = CarrierStage2RecordIdentity {
+            record_id: CarrierStage2RecordId(7),
+            vm_generation: CarrierVmGeneration(3),
+            logical_owner: Some(CarrierLogicalOwner {
+                id: 19,
+                generation: 2,
+            }),
+        };
+        let base_record = CarrierStage2Record {
+            snapshot: CarrierStage2RecordSnapshot {
+                record_id: identity.record_id,
+                vm_generation: identity.vm_generation,
+                logical_owner: identity.logical_owner,
+                ipa: 0x9a_0000_0000,
+                len: 0x20_0000,
+                host_addr: 0,
+                mapped: true,
+                backend_map_installed: false,
+                release_ipa: false,
+                perms: 3,
+                pin_count: 2,
+                retirement_requested: true,
+                retry_eligible: false,
+                retry_pending: None,
+                terminalized_by_vm_destroy: false,
+                superseded_by_rebind: false,
+                release_in_flight: false,
+                release_retry_pending: false,
+            },
+            unmap_in_flight: false,
+        };
+
+        let mut record = base_record;
+        let wrong_gen = CarrierStage2RecordIdentity {
+            vm_generation: CarrierVmGeneration(4),
+            ..identity
+        };
+        assert_eq!(
+            release_record_pin_outcome(&mut record, wrong_gen),
+            RecordPinRelease::StillHeld
+        );
+        assert_eq!(record.snapshot.pin_count, 2);
+
+        assert_eq!(
+            release_record_pin_outcome(&mut record, identity),
+            RecordPinRelease::StillHeld
+        );
+        assert_eq!(record.snapshot.pin_count, 1);
+
+        assert_eq!(
+            release_record_pin_outcome(&mut record, identity),
+            RecordPinRelease::ReadyToRetire {
+                ipa: 0x9a_0000_0000,
+            }
+        );
+        assert_eq!(record.snapshot.pin_count, 0);
+        assert!(record.snapshot.retry_eligible);
+
+        let mut backend_mapped = base_record;
+        backend_mapped.snapshot.pin_count = 1;
+        backend_mapped.snapshot.backend_map_installed = true;
+        assert_eq!(
+            release_record_pin_outcome(&mut backend_mapped, identity),
+            RecordPinRelease::StillHeld
+        );
+
+        let mut predecessor = base_record;
+        predecessor.snapshot.pin_count = 1;
+        predecessor.snapshot.superseded_by_rebind = true;
+        terminalize_record(&mut predecessor);
+        assert_eq!(
+            release_record_pin_outcome(&mut predecessor, identity),
+            RecordPinRelease::RemovePredecessor
+        );
     }
 }
