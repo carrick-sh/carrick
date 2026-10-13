@@ -354,12 +354,14 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             return Err(NativeProcessError::Stale);
         }
         let owner = self.portal()?;
-        RETIRED_SPACES.drain_portal(
+        // As on x86, a refused drain keeps its entry queued for the next
+        // drain; an earlier child's retirement never refuses this fork.
+        let _retry_at_next_drain = RETIRED_SPACES.drain_portal(
             &owner,
             self.zone,
             carrick_sched_core::ZONE_SLOTS,
             self.worker(),
-        )?;
+        );
         let mm = ReservationMm::new(parent.mm.raw().get()).ok_or(NativeProcessError::Stale)?;
         let live = self.words.ok_or(NativeProcessError::Stale)?;
         let capacity = owner

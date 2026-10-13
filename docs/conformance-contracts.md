@@ -1120,7 +1120,10 @@ and thread generation in CPU-slot terminal custody before the freed record can
 be reused. A new slot entry invalidates that custody.
 `terminal_retirement_cannot_retire_a_reused_record_or_slot_generation` proves
 record reuse preserves the released authority, while a stale generation cannot
-retire the new slot execution. It also refuses completion authority while
+retire the new slot execution: four stale controls each differ from the
+retained custody in exactly one of task, execution generation, MM and thread
+generation, so dropping any one comparison admits a stale retirement. It also
+refuses completion authority while
 that CPU still has the child's MM installed; the host additionally validates
 the hardware maintenance root before a parent handback.
 `unplaceable_parent_host_handback_consumes_one_park`
