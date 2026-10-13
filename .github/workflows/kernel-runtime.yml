@@ -32,6 +32,10 @@ jobs:
           (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
+    outputs:
+      bundle-name: ${{ steps.bundle.outputs.name }}
+      bundle-sha256: ${{ steps.bundle.outputs.sha256 }}
+      bundle-parts: ${{ steps.bundle.outputs.parts }}
     steps:
       - uses: actions/checkout@v4
 
@@ -39,6 +43,9 @@ jobs:
         run: |
           test "$(uname -s)" = Linux
           test "$(uname -m)" = aarch64
+
+      - name: Test fixture relay transport and fallback
+        run: scripts/ci/test-fixture-relay.sh
 
       - name: Install pinned Rust toolchain and guest targets
         run: rustup show active-toolchain
@@ -55,6 +62,35 @@ jobs:
 
       - name: Publish exact-SHA fixture bundle
         run: just fixtures-publish "$GITHUB_SHA"
+
+      # The archive basename is the manifest digest, not the archive digest.
+      # Pass transport identity through the trusted publisher, never the relay.
+      - name: Record fixture archive transport identity
+        id: bundle
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bundles=(target/fixtures/published/"$GITHUB_SHA"/*.tar.gz)
+          test "${#bundles[@]}" -eq 1
+          digest=$(sha256sum "${bundles[0]}")
+          bytes=$(wc -c < "${bundles[0]}")
+          test "$bytes" -gt 0
+          printf 'name=%s\nsha256=%s\nparts=%s\n' \
+            "${bundles[0]##*/}" "${digest%% *}" "$(( (bytes + 268435455) / 268435456 ))" >> "$GITHUB_OUTPUT"
+
+      - name: Upload fixture parts to R2
+        if: >-
+          ${{ github.repository == 'carrick-sh/carrick' &&
+              ((github.event_name == 'merge_group' && startsWith(github.ref, 'refs/heads/gh-readonly-queue/main/')) ||
+               ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main')) }}
+        # R2 is an accelerator; GitHub remains available if publication fails.
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          BUNDLE_NAME: ${{ steps.bundle.outputs.name }}
+          BUNDLE_SHA256: ${{ steps.bundle.outputs.sha256 }}
+        run: scripts/ci/upload-fixture-parts.sh
 
       - name: Upload exact-SHA fixture bundle
         uses: actions/upload-artifact@v4
@@ -103,10 +139,26 @@ jobs:
           save-if: ${{ github.event_name != 'merge_group' }}
 
       - name: Download exact-SHA fixture bundle
+        id: relay
+        continue-on-error: true
+        env:
+          BUNDLE_NAME: ${{ needs.signed-fixtures.outputs.bundle-name }}
+          BUNDLE_SHA256: ${{ needs.signed-fixtures.outputs.bundle-sha256 }}
+          BUNDLE_PARTS: ${{ needs.signed-fixtures.outputs.bundle-parts }}
+        run: scripts/ci/download-fixture-bundle.sh relay
+
+      - name: Fall back to the GitHub fixture artifact
+        if: ${{ steps.relay.outcome != 'success' }}
         uses: actions/download-artifact@v4
         with:
           name: signed-fixtures-${{ github.sha }}
           path: target/fixtures/incoming
+
+      - name: Verify fixture archive transport digest
+        env:
+          BUNDLE_NAME: ${{ needs.signed-fixtures.outputs.bundle-name }}
+          BUNDLE_SHA256: ${{ needs.signed-fixtures.outputs.bundle-sha256 }}
+        run: scripts/ci/download-fixture-bundle.sh verify
 
       - name: Install just and cargo-deny
         uses: taiki-e/install-action@v2
