@@ -757,6 +757,214 @@ mod tests {
             .without_invariant(InvariantKind::ExitBudget);
         assert_eq!(installed_kinds(&armed_then_disabled), STRUCTURAL.to_vec());
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn watchdog_reap_does_not_kill_subsequent_test_binaries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir_name = dir
+            .path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("repro");
+        let sanitized: String = dir_name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect();
+        let run_id = format!("wd-cascade-{sanitized}");
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root");
+
+        let c_src = dir.path().join("dummy_test_bin.c");
+        std::fs::write(
+            &c_src,
+            r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+__attribute__((section("__DATA,__dof_carrick"), used))
+static const char dof_carrick = 1;
+
+static void stamp_proctitle(char *arg0, const char *run_id) {
+    size_t orig_len = strlen(arg0);
+    char label[256];
+    int written = snprintf(label, sizeof(label), "carrick:%s: 1 containers", run_id);
+    if (written < 0) return;
+    size_t n = (size_t)written < orig_len ? (size_t)written : orig_len;
+    memcpy(arg0, label, n);
+    if (orig_len > n) {
+        memset(arg0 + n, 0, orig_len - n);
+    }
+}
+
+int main(int argc, char **argv) {
+    int list = 0;
+    int ignored = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--list") == 0) list = 1;
+        if (strcmp(argv[i], "--ignored") == 0) ignored = 1;
+    }
+#ifdef HANG_BINARY
+    if (list && ignored) {
+        return 0;
+    }
+    if (list) {
+        printf("el1_dummy_hang: test\n");
+        return 0;
+    }
+    const char *run_id = getenv("CARRICK_RUN_ID");
+    const char *kill_sh = getenv("DUMMY_KILL_SH");
+    if (!run_id || !kill_sh) return 2;
+    stamp_proctitle(argv[0], run_id);
+    printf("running 1 test\ntest el1_dummy_hang ... ");
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        execl("/bin/sh", "sh", kill_sh, run_id, (char *)NULL);
+        _exit(127);
+    }
+    for (;;) {
+        usleep(100000);
+    }
+#else
+    if (list && ignored) {
+        printf("unsigned_executable_maps_hv_denied_to_entitlement: test\n");
+        return 0;
+    }
+    if (list) {
+        printf("el1_dummy_normal: test\n");
+        printf("unsigned_executable_maps_hv_denied_to_entitlement: test\n");
+        return 0;
+    }
+    if (ignored) {
+        printf("running 1 test\ntest unsigned_executable_maps_hv_denied_to_entitlement ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n");
+        return 0;
+    }
+    const char *run_id = getenv("CARRICK_RUN_ID");
+    const char *marker = getenv("DUMMY_NORMAL_MARKER");
+    if (!run_id || !marker) return 2;
+    stamp_proctitle(argv[0], run_id);
+    printf("running 1 test\ntest el1_dummy_normal ... ");
+    fflush(stdout);
+    usleep(1500000);
+    FILE *f = fopen(marker, "w");
+    if (!f) return 3;
+    fprintf(f, "%s\n", run_id);
+    fclose(f);
+    printf("ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n");
+    fflush(stdout);
+    return 0;
+#endif
+}
+"#,
+        )
+        .expect("write dummy C source");
+
+        let exe_hang = dir
+            .path()
+            .join("01_dummy_hanging_binary_with_room_for_carrick_proctitle_stamp");
+        let exe_normal = dir
+            .path()
+            .join("02_dummy_normal_binary_with_room_for_carrick_proctitle_stamp");
+
+        let status_hang = std::process::Command::new("/usr/bin/cc")
+            .arg("-DHANG_BINARY")
+            .arg(&c_src)
+            .arg("-o")
+            .arg(&exe_hang)
+            .status()
+            .expect("compile hang binary");
+        assert!(status_hang.success(), "cc failed for hang binary");
+
+        let status_normal = std::process::Command::new("/usr/bin/cc")
+            .arg(&c_src)
+            .arg("-o")
+            .arg(&exe_normal)
+            .status()
+            .expect("compile normal binary");
+        assert!(status_normal.success(), "cc failed for normal binary");
+
+        let fake_cargo = dir.path().join("cargo");
+        std::fs::write(
+            &fake_cargo,
+            format!(
+                "#!/bin/sh\n\
+                 case \"$*\" in\n\
+                     *worktree-run*)\n\
+                         while [ \"$#\" -gt 0 ] && [ \"$1\" != \"worktree-run\" ]; do shift; done\n\
+                         shift\n\
+                         [ \"${{1:-}}\" = \"--\" ] && shift\n\
+                         exec \"$@\"\n\
+                         ;;\n\
+                     *host-lease*) exit 0 ;;\n\
+                     *--message-format=json*)\n\
+                         printf '{{\"reason\":\"compiler-artifact\",\"profile\":{{\"test\":true}},\"executable\":\"%s\"}}\\n' '{}'\n\
+                         printf '{{\"reason\":\"compiler-artifact\",\"profile\":{{\"test\":true}},\"executable\":\"%s\"}}\\n' '{}'\n\
+                         exit 0 ;;\n\
+                     *) exit 99 ;;\n\
+                 esac\n",
+                exe_hang.display(),
+                exe_normal.display(),
+            ),
+        )
+        .expect("write fake cargo");
+        std::fs::set_permissions(&fake_cargo, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake cargo");
+
+        let fake_sudo = dir.path().join("sudo");
+        std::fs::write(&fake_sudo, "#!/bin/sh\nexit 1\n").expect("write fake sudo");
+        std::fs::set_permissions(&fake_sudo, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake sudo");
+
+        let marker = dir.path().join("normal_completed.txt");
+        let kill_sh = repo_root.join("scripts/sudo/kill.sh");
+        let path_env = format!(
+            "{}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            dir.path().display()
+        );
+
+        let output = std::process::Command::new(repo_root.join("scripts/test-signed.sh"))
+            .current_dir(repo_root)
+            .args(["dummy-watchdog-cascade-pkg", "el1_", "--nocapture"])
+            .env("PATH", path_env)
+            .env("CARRICK_HOST_LEASE_SOCKET", "dummy-lease-socket")
+            .env("CARRICK_RUN_ID", &run_id)
+            .env("DUMMY_KILL_SH", &kill_sh)
+            .env("DUMMY_NORMAL_MARKER", &marker)
+            .output()
+            .expect("run test-signed.sh");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            !output.status.success(),
+            "overall run must fail because the first binary timed out; stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("test-signed: FAIL {}", exe_hang.display())),
+            "hanging binary must be reported failed; stderr={stderr}"
+        );
+        assert!(
+            !stderr.contains(&format!("test-signed: FAIL {}", exe_normal.display())),
+            "normal binary must not be killed by previous binary's watchdog reap; stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            stdout.contains("test el1_dummy_normal ... ok"),
+            "normal binary must run to completion; stdout={stdout} stderr={stderr}"
+        );
+        let recorded_run_id = std::fs::read_to_string(&marker).unwrap_or_default();
+        assert!(
+            !recorded_run_id.trim().is_empty() && recorded_run_id.trim() != run_id,
+            "normal binary must run under a distinct per-binary CARRICK_RUN_ID suffix (got {recorded_run_id:?}, suite run_id {run_id:?})"
+        );
+    }
 }
 
 /// A trusted interceptor that stretches the scheduling window around the

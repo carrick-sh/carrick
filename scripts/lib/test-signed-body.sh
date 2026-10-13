@@ -44,7 +44,9 @@
 # terminal.
 set -euo pipefail
 # Also loads the shared compiler-cache environment before any cargo call.
+# shellcheck disable=SC1091
 . scripts/lib/post-link-sign.sh
+# shellcheck disable=SC1091
 . scripts/lib/test-signed-args.sh
 
 # Bootstrap once into the Rust lease supervisor, which owns the lock through
@@ -142,28 +144,65 @@ jq -nc \
     "{schema:\$schema,record_type:\"header\",source_head:\$source_head,package:\$package,arguments:\$arguments,requested_test_filter:\$requested_filter,carrick_run_id:\$run_id,enabled_features:\$enabled_features$contract_header_entry}" \
     >"$receipt_tmp"
 scratch=()
+active_exe_run_id=""
+reap_run_id() {
+    local id="$1"
+    local cleanup_log
+    local wait_ticks=0
+    # A watchdog inside a timed-out binary spawns `scripts/sudo/kill.sh $id`
+    # and dies on pass 1 while that child `kill.sh` sleeps 1s before pass 2/3.
+    # Wait for any in-flight `kill.sh` targeting this exact id to finish before
+    # running our own scoped reap.
+    while [ "$wait_ticks" -lt 50 ]; do
+        if ! ps -axww -o command= | awk -v id="$id" '
+            !/awk/ && index($0, "scripts/sudo/kill.sh") {
+                for (i = 1; i <= NF; i++) {
+                    if ($i == id) { found = 1; exit 0 }
+                }
+            }
+            END { exit(found ? 0 : 1) }
+        '; then
+            break
+        fi
+        sleep 0.1
+        wait_ticks=$((wait_ticks + 1))
+    done
+    cleanup_log="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-cleanup.XXXXXX")"
+    # The caller owns this mktemp log; only process cleanup needs sudo.
+    # shellcheck disable=SC2024
+    if sudo -n scripts/sudo/kill.sh "$id" >"$cleanup_log" 2>&1; then
+        :
+    elif scripts/sudo/kill.sh "$id" >"$cleanup_log" 2>&1; then
+        :
+    else
+        cat "$cleanup_log"
+        rm -f "$cleanup_log"
+        return 1
+    fi
+    cat "$cleanup_log"
+    rm -f "$cleanup_log"
+    return 0
+}
 cleanup() {
     status=$?
     trap - EXIT
     set +e
     cleanup_ok=1
+    if [ -n "$active_exe_run_id" ]; then
+        for id in "$active_exe_run_id" "$active_exe_run_id-cli"; do
+            if ! reap_run_id "$id"; then
+                cleanup_ok=0
+            fi
+        done
+    fi
     # Scoped reap of anything this run (or its CLI-parity child) left wedged.
     # Guests are same-user processes, so a direct call reaps them; `sudo -n`
     # first (NOPASSWD on the rig: scripts/sudo/ is under carrick/*/*/*) also
     # catches root-owned `carrick trace` front-ends carrying the same id.
     for id in "$run_id" "$run_id-cli"; do
-        cleanup_log="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-cleanup.XXXXXX")"
-        # The caller owns this mktemp log; only process cleanup needs sudo.
-        # shellcheck disable=SC2024
-        if sudo -n scripts/sudo/kill.sh "$id" >"$cleanup_log" 2>&1; then
-            :
-        elif scripts/sudo/kill.sh "$id" >"$cleanup_log" 2>&1; then
-            :
-        else
+        if ! reap_run_id "$id"; then
             cleanup_ok=0
         fi
-        cat "$cleanup_log"
-        rm -f "$cleanup_log"
     done
     if [ "${#scratch[@]}" -gt 0 ]; then
         rm -f "${scratch[@]}"
@@ -427,12 +466,19 @@ record_executable() {
 }
 
 # 4. Run each selected signed executable serially (one VM per process).
+#    Each executable receives a distinct CARRICK_RUN_ID suffix and is reaped
+#    before the next executable starts so an orphaned watchdog `kill.sh`
+#    (sleeping between passes 1..3) can never match subsequent executables.
 failed=0
+exe_index=0
 for exe in "${run_exes[@]}"; do
+    exe_index=$((exe_index + 1))
+    exe_run_id="$run_id-b$exe_index"
+    active_exe_run_id="$exe_run_id"
     record_executable "$exe"
     executable_id="$last_executable_id"
     echo "test-signed: running $exe $*"
-    if env RUST_TEST_THREADS=1 "$exe" "$@"; then
+    if env RUST_TEST_THREADS=1 CARRICK_RUN_ID="$exe_run_id" "$exe" "$@"; then
         while IFS="$(printf '\t')" read -r selected_exe test_name; do
             [ "$selected_exe" = "$exe" ] || continue
             jq -nc \
@@ -447,6 +493,13 @@ for exe in "${run_exes[@]}"; do
         echo "test-signed: FAIL $exe" >&2
         failed=1
     fi
+    for id in "$exe_run_id" "$exe_run_id-cli"; do
+        if ! reap_run_id "$id"; then
+            echo "test-signed: scoped cleanup failed for $id" >&2
+            failed=1
+        fi
+    done
+    active_exe_run_id=""
 done
 
 # 5. Negative control. The executable carrying the negative test is copied
@@ -481,9 +534,16 @@ fi
 neg_log="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-negative.XXXXXX")"
 scratch+=("$neg_log")
 echo "test-signed: negative control on $noent"
+neg_run_id="$run_id-neg"
+active_exe_run_id="$neg_run_id"
 neg_rc=0
-env RUST_TEST_THREADS=1 "$noent" --ignored --exact "$negative_test_name" >"$neg_log" 2>&1 || neg_rc=$?
+env RUST_TEST_THREADS=1 CARRICK_RUN_ID="$neg_run_id" "$noent" --ignored --exact "$negative_test_name" >"$neg_log" 2>&1 || neg_rc=$?
 cat "$neg_log"
+if ! reap_run_id "$neg_run_id"; then
+    echo "test-signed: scoped cleanup failed for $neg_run_id" >&2
+    failed=1
+fi
+active_exe_run_id=""
 if [ "$neg_rc" -ne 0 ] || ! grep -aq '^test result: ok. 1 passed' "$neg_log"; then
     echo "test-signed: FAIL negative control ($negative_test did not pass on the unentitled copy, rc=$neg_rc)" >&2
     failed=1
