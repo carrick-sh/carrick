@@ -958,6 +958,13 @@ impl CarrierVmCustody {
         }
     }
 
+    fn is_active_root_slot_pool_ipa(&self, ipa: u64) -> bool {
+        match &*self.root_slot_pool.lock() {
+            CarrierRootSlotPoolState::Active(pool) => pool.contains_ipa(ipa),
+            CarrierRootSlotPoolState::Uninitialized | CarrierRootSlotPoolState::Failed => false,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn install_frame_pool(
         &self,
@@ -1448,10 +1455,7 @@ impl CarrierVmCustody {
                     .then_some(snapshot.ipa)
             }
         };
-        if premapped_retirement_ipa.is_some_and(|ipa| {
-            self.root_slot_pool()
-                .is_some_and(|pool| pool.contains_ipa(ipa))
-        }) {
+        if premapped_retirement_ipa.is_some_and(|ipa| self.is_active_root_slot_pool_ipa(ipa)) {
             let _ = super::retire_carrier_stage2_record_at_safe_point(self, identity);
         }
     }
