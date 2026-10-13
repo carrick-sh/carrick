@@ -266,7 +266,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                         task, slot,
                     ) {
                         Ok(service) => service,
-                        Err(_) => return refuse_owner_process_call(frame, counters),
+                        Err(_) => return refuse_owner_process_call(frame, counters, current_tasks),
                     };
                     let action = {
                         let mut process = match runtime.enter_registered(
@@ -278,7 +278,9 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                             &mut service,
                         ) {
                             Ok(process) => process,
-                            Err(_) => return refuse_owner_process_call(frame, counters),
+                            Err(_) => {
+                                return refuse_owner_process_call(frame, counters, current_tasks);
+                            }
                         };
                         let route = dispatch_syscall_with_native(
                             frame,
@@ -313,7 +315,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                         )
                         .is_err()
                     {
-                        return refuse_owner_process_call(frame, counters);
+                        return refuse_owner_process_call(frame, counters, current_tasks);
                     }
                     return match action.0 {
                         carrick_personality_linux::dispatch::CompletionRoute::Served => {
@@ -326,7 +328,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                             Action::Idle
                         }
                         carrick_personality_linux::dispatch::CompletionRoute::Forward => {
-                            refuse_owner_process_call(frame, counters)
+                            refuse_owner_process_call(frame, counters, current_tasks)
                         }
                         carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion => {
                             invalid_completion(NativeInvariant::EntryBinding)
@@ -334,7 +336,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                     };
                 }
             }
-            return refuse_owner_process_call(frame, counters);
+            return refuse_owner_process_call(frame, counters, current_tasks);
         }
         dispatch_syscall_with_ipc(
             frame,
@@ -393,17 +395,26 @@ fn arm_process_refusal_must_abort(nr: u64) -> bool {
     matches!(nr, 93 | 94)
 }
 
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
-fn refuse_owner_process_call(frame: &mut TrapFrame, counters: &Counters) -> Action {
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+fn refuse_owner_process_call(
+    frame: &mut TrapFrame,
+    counters: &Counters,
+    current_tasks: &[CurrentTask],
+) -> Action {
     let nr = frame.x[8] as usize;
     if arm_process_refusal_must_abort(nr as u64) {
         invalid_completion(NativeInvariant::EntryBinding);
     }
+    let task = current_tasks
+        .get(frame.slot as usize)
+        .unwrap_or_else(|| invalid_completion(NativeInvariant::EntryBinding));
+    task.linux.orig_arg0.store(frame.x[0], Ordering::Relaxed);
     frame.x[0] = (-38_i64) as u64;
     if nr < 512 {
         counters.served[nr].fetch_add(1, Ordering::Relaxed);
     }
-    Action::Served
+    task.linux.record_completed_with_work();
+    Action::ServedWithWork
 }
 
 /// Handle an interrupt taken while EL0 ran (the vector's EL0 IRQ hook marks
@@ -1133,6 +1144,15 @@ impl<
     }
     fn original_argument0(&self) -> u64 {
         self.frame.argument(0).unwrap_or(0)
+    }
+    fn return_requires_host_boundary(&self) -> bool {
+        // ARM native process returns and the newly published getpid projection
+        // otherwise bypass the host's owned return-event publisher. Retain the
+        // completed result through the same boundary as other owed host work.
+        self.frame.arm_frame_ref().is_some()
+            && (self.process.is_some()
+                || self.frame.canonical_ordinal().raw()
+                    == carrick_personality_linux::lifecycle::SYS_GETPID as u64)
     }
     fn install_result(&mut self, result: SyscallResult) {
         self.frame
@@ -1908,6 +1928,27 @@ mod tests {
             !arm_process_refusal_must_abort(260),
             "waitid may report errno"
         );
+    }
+
+    #[test]
+    fn refused_owned_process_return_retains_one_completed_boundary() {
+        let mut frame = TrapFrame::default();
+        frame.x[8] = 435;
+        frame.x[0] = 0xfeed;
+        let tasks = [CurrentTask::new()];
+        let counters = Counters::default();
+        assert_eq!(
+            refuse_owner_process_call(&mut frame, &counters, &tasks),
+            Action::ServedWithWork
+        );
+        assert_eq!(frame.x[0] as i64, -38);
+        assert_eq!(tasks[0].linux.orig_arg0.load(Ordering::Relaxed), 0xfeed);
+        assert_eq!(
+            tasks[0].linux.take_served_boundary(),
+            Some(carrick_el1_abi::ServedBoundary::Completed)
+        );
+        assert_eq!(tasks[0].linux.take_served_boundary(), None);
+        assert_eq!(counters.served[435].load(Ordering::Relaxed), 1);
     }
 
     #[test]
