@@ -3609,12 +3609,17 @@ impl HvfTaskState {
         // run while the engine's mapping metadata is being rebuilt; failing
         // here must leave no staged MappingId for terminal retirement to see.
         let page_table_host = self
-            .mapping_for_range_in(
-                custody,
-                crate::memory::LINUX_PAGE_TABLES_BASE,
-                carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
-            )
-            .map(|mapping| mapping.host_addr)
+            .page_tables_authority()
+            .with_manager(|manager| {
+                // Table custody is physical. An owner-forked MM has its own
+                // root capacity without the bootstrap guest-VA alias.
+                carrick_mmu_core::aarch64::HostArenaResolver::host_ptr_for_range(
+                    &self.page_table_resolver(manager.base(), None),
+                    manager.base(),
+                    carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                )
+            })
+            .flatten()
             .ok_or_else(|| {
                 TrapError::Hypervisor("HVPatch COW page-table backing is absent".to_owned())
             })?;

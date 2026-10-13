@@ -446,6 +446,9 @@ production owner projection, child inventory staging, privileged RNG COW and
 old-MM exec retirement while the parent's backing remains live and unchanged.
 It requires one inherited inventory mapping for the selected parent extent,
 a bounded compound copy, and zero retirement of parent-owned physical leases.
+The owner's table capacity has no bootstrap guest-VA alias. Bootstrap COW
+resolves the manager's actual physical root through the current MM's arena
+resolver, and a second owner fork retains the refreshed overlay's exact extent.
 Linux authority is [fork(2)](https://man7.org/linux/man-pages/man2/fork.2.html)
 and [execve(2)](https://man7.org/linux/man-pages/man2/execve.2.html).
 

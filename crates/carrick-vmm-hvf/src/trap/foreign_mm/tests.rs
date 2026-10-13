@@ -5971,6 +5971,19 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>, owner_selected: 
             ))
             .unwrap();
     }
+    if owner_selected {
+        // The owner publishes physical table capacity, without the legacy
+        // boot-VA alias. Bootstrap COW must resolve this child's actual root.
+        let root = prepared
+            .mappings
+            .iter_mut()
+            .find(|mapping| mapping.start == crate::memory::LINUX_PAGE_TABLES_BASE)
+            .expect("child root physical custody");
+        assert!(root.structural_owner.is_some());
+        root.start = root.ipa;
+        root.end = root.start + root.size as u64;
+        assert_ne!(root.start, crate::memory::LINUX_PAGE_TABLES_BASE);
+    }
     let child_inventory = prepared
         .inventory
         .shared_runtime_ledger()
@@ -6308,39 +6321,62 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>, owner_selected: 
         child_generation,
         "the fresh generation must land in the child-private COW owner",
     );
-    let grandchild_root_slot = root_slot_base + root_slot_size;
-    let mut grandchild_page_tables = child_page_tables_authority
-        .snapshot_image()
-        .expect("refreshed child page tables");
-    grandchild_page_tables
-        .rebase(grandchild_root_slot, None)
-        .expect("rebase refreshed child page tables for grandchild");
-    let grandchild_plan = child_task
-        .build_setup_process_plan(
-            carrick_hal::ProcessForkRequest {
-                entry: carrick_hal::GuestEntryRegs::default(),
-                child_ttbr0: grandchild_root_slot,
-                root_slot_base: grandchild_root_slot,
-                root_slot_size,
-                plan: carrick_hal::ForkProjectionPlan::Copied {
-                    parent_mm: 871,
-                    child_mm: 872,
-                    ranges: Arc::from([]),
-                },
-                child_tid: carrick_hal::ThreadId::synthetic_for_tests(872),
-                forking_tid: carrick_hal::ThreadId::synthetic_for_tests(871),
-                table_arena_source: None,
-            },
-            &mut grandchild_page_tables,
-            &cow_ranges,
-            Arc::new(MailboxSlotAllocator::new()),
-            HvfSyscallTransport::Mailbox,
-            Arc::clone(&transport),
-            None,
+    let (grandchild_mappings, grandchild_inventory) = if owner_selected {
+        // An owner MM selects physical leaves again; its table capacities are
+        // not user VMA rows for the legacy fork projection to reconstruct.
+        let physical = super::super::owner_fork::ForkPhysicalCustody::new(
+            Arc::clone(&transport.custody),
+            Arc::new(|_, _| false),
+        );
+        super::super::owner_fork::project_owner_fork_frames(
+            &physical,
+            &child_inventory,
+            &Default::default(),
+            &[],
+            &[carrick_el1_abi::PortalForkCustody::Frame {
+                va: vvar_ipa,
+                ipa: refreshed.ipa,
+                len: 4096,
+                shared: false,
+            }],
         )
-        .expect("fork refreshed child-private vvar into grandchild");
+        .expect("owner selects refreshed child-private vvar into grandchild")
+    } else {
+        let grandchild_root_slot = root_slot_base + root_slot_size;
+        let mut grandchild_page_tables = child_page_tables_authority
+            .snapshot_image()
+            .expect("refreshed child page tables");
+        grandchild_page_tables
+            .rebase(grandchild_root_slot, None)
+            .expect("rebase refreshed child page tables for grandchild");
+        let plan = child_task
+            .build_setup_process_plan(
+                carrick_hal::ProcessForkRequest {
+                    entry: carrick_hal::GuestEntryRegs::default(),
+                    child_ttbr0: grandchild_root_slot,
+                    root_slot_base: grandchild_root_slot,
+                    root_slot_size,
+                    plan: carrick_hal::ForkProjectionPlan::Copied {
+                        parent_mm: 871,
+                        child_mm: 872,
+                        ranges: Arc::from([]),
+                    },
+                    child_tid: carrick_hal::ThreadId::synthetic_for_tests(872),
+                    forking_tid: carrick_hal::ThreadId::synthetic_for_tests(871),
+                    table_arena_source: None,
+                },
+                &mut grandchild_page_tables,
+                &cow_ranges,
+                Arc::new(MailboxSlotAllocator::new()),
+                HvfSyscallTransport::Mailbox,
+                Arc::clone(&transport),
+                None,
+            )
+            .expect("fork refreshed child-private vvar into grandchild");
+        (plan.mappings, plan.inventory_mappings)
+    };
     assert!(
-        grandchild_plan.mappings.iter().any(|mapping| {
+        grandchild_mappings.iter().any(|mapping| {
             mapping.start == vvar_ipa
                 && mapping.physical_ipa == child_private_key.0
                 && mapping.owner_generation == child_private_owner.generation()
@@ -6349,7 +6385,7 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>, owner_selected: 
         "the second fork must inherit the exact COW overlay owner",
     );
     assert!(
-        grandchild_plan.inventory_mappings.iter().any(|mapping| {
+        grandchild_inventory.iter().any(|mapping| {
             mapping.gpa == child_private_key.0
                 && mapping.length == child_private_key.1
                 && mapping.stage2_owner
