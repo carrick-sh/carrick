@@ -1654,7 +1654,55 @@ esac
             String::from_utf8_lossy(&out.stderr)
         );
         let upload = step(producer, "Upload exact-SHA fixture bundle");
-        let download = step(&jobs["hvf-kernel"], "Download exact-SHA fixture bundle");
+        let consumer = &jobs["hvf-kernel"];
+        let relay = step(consumer, "Download exact-SHA fixture bundle");
+        assert_eq!(relay["id"].as_str(), Some("relay"));
+        assert_eq!(relay["continue-on-error"].as_bool(), Some(true));
+        assert_eq!(
+            relay["run"].as_str(),
+            Some("scripts/ci/download-fixture-bundle.sh relay")
+        );
+        let download = step(consumer, "Fall back to the GitHub fixture artifact");
+        assert_eq!(
+            download["if"].as_str(),
+            Some("${{ steps.relay.outcome != 'success' }}")
+        );
+        let verify = step(consumer, "Verify fixture archive transport digest");
+        assert_eq!(
+            verify["run"].as_str(),
+            Some("scripts/ci/download-fixture-bundle.sh verify")
+        );
+        assert!(verify["if"].is_badvalue());
+        assert!(verify["continue-on-error"].is_badvalue());
+        for transport in [relay, verify] {
+            assert_eq!(
+                transport["env"]["BUNDLE_NAME"].as_str(),
+                Some("${{ needs.signed-fixtures.outputs.bundle-name }}")
+            );
+            assert_eq!(
+                transport["env"]["BUNDLE_SHA256"].as_str(),
+                Some("${{ needs.signed-fixtures.outputs.bundle-sha256 }}")
+            );
+        }
+        let steps = consumer["steps"].as_vec().unwrap();
+        let position = |name| {
+            steps
+                .iter()
+                .position(|s| s["name"].as_str() == Some(name))
+                .unwrap()
+        };
+        assert!(
+            position("Download exact-SHA fixture bundle")
+                < position("Fall back to the GitHub fixture artifact")
+        );
+        assert!(
+            position("Fall back to the GitHub fixture artifact")
+                < position("Verify fixture archive transport digest")
+        );
+        assert!(
+            position("Verify fixture archive transport digest")
+                < position("Signed acceptance receipt")
+        );
         assert_eq!(upload["uses"].as_str(), Some("actions/upload-artifact@v4"));
         assert_eq!(
             download["uses"].as_str(),
