@@ -7286,27 +7286,38 @@ mod tests {
                 Some(parent)
             );
             std::thread::scope(|scope| {
-                scope
-                    .spawn(|| {
-                        let mut service = Physical {
-                            zone: &zone,
-                            page: &grandchild_page,
-                            controls: &grandchild_controls,
-                            copies: Vec::new(),
-                            refuse_copy: false,
-                            on_signal_clock: None,
-                        };
-                        let mut entry = runtime
-                            .enter(source, &task, words(parent_address), &mut service)
-                            .unwrap();
-                        assert!(matches!(
-                            entry.exit_group(9),
-                            LifecycleOutcome::Transferred { .. }
-                        ));
-                        assert_eq!(entry.take_run_failure(), None, "peer parent exit");
-                    })
-                    .join()
-                    .unwrap();
+                let (done, completed) = std::sync::mpsc::channel();
+                scope.spawn(move || {
+                    if completed
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .is_err()
+                    {
+                        // A scope panic still joins a wedged peer. Terminate the
+                        // test process so a lock-order regression cannot hang CI.
+                        std::process::abort();
+                    }
+                });
+                let peer = scope.spawn(|| {
+                    let mut service = Physical {
+                        zone: &zone,
+                        page: &grandchild_page,
+                        controls: &grandchild_controls,
+                        copies: Vec::new(),
+                        refuse_copy: false,
+                        on_signal_clock: None,
+                    };
+                    let mut entry = runtime
+                        .enter(source, &task, words(parent_address), &mut service)
+                        .unwrap();
+                    assert!(matches!(
+                        entry.exit_group(9),
+                        LifecycleOutcome::Transferred { .. }
+                    ));
+                    assert_eq!(entry.take_run_failure(), None, "peer parent exit");
+                });
+                let result = peer.join();
+                done.send(()).unwrap();
+                result.unwrap();
             });
             if adopter_caught {
                 let (_, info) = root_signals
