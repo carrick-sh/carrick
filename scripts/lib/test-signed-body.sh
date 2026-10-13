@@ -148,25 +148,6 @@ active_exe_run_id=""
 reap_run_id() {
     local id="$1"
     local cleanup_log
-    local wait_ticks=0
-    # A watchdog inside a timed-out binary spawns `scripts/sudo/kill.sh $id`
-    # and dies on pass 1 while that child `kill.sh` sleeps 1s before pass 2/3.
-    # Wait for any in-flight `kill.sh` targeting this exact id to finish before
-    # running our own scoped reap.
-    while [ "$wait_ticks" -lt 50 ]; do
-        if ! ps -axww -o command= | awk -v id="$id" '
-            !/awk/ && index($0, "scripts/sudo/kill.sh") {
-                for (i = 1; i <= NF; i++) {
-                    if ($i == id) { found = 1; exit 0 }
-                }
-            }
-            END { exit(found ? 0 : 1) }
-        '; then
-            break
-        fi
-        sleep 0.1
-        wait_ticks=$((wait_ticks + 1))
-    done
     cleanup_log="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-cleanup.XXXXXX")"
     # The caller owns this mktemp log; only process cleanup needs sudo.
     # shellcheck disable=SC2024
