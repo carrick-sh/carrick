@@ -940,6 +940,7 @@ class MatrixOrchestrationTest(unittest.TestCase):
                     if variable != "RUSTUP_TOOLCHAIN":
                         self.assertNotIn(variable, environment)
                 self.assertEqual(environment["RUSTUP_TOOLCHAIN"], "1.96.0")
+                self.assertEqual(environment["RUSTUP_AUTO_INSTALL"], "0")
                 self.assertNotIn(
                     "aarch64-apple-darwin", environment["RUSTUP_TOOLCHAIN"]
                 )
@@ -1048,7 +1049,7 @@ class MatrixOrchestrationTest(unittest.TestCase):
             },
         )
         self.assertEqual(
-            observed["rustup_home"], canonical_home.resolve() / ".rustup"
+            observed["rustup_home"], (ambient_home / "rustup").resolve()
         )
         self.assertFalse(observed["cwd"].is_relative_to(ancestor))
         self.assertEqual(
@@ -1061,6 +1062,49 @@ class MatrixOrchestrationTest(unittest.TestCase):
             str((root / "Cargo.toml").resolve()),
         )
         self.assertIn("force-frame-pointers=yes", checked_config_text)
+
+    def test_identity_and_profiles_use_provisioned_rustup_home(self):
+        matrix = self.load()
+        with tempfile.TemporaryDirectory() as directory:
+            canonical_home = Path(directory) / "job-home"
+            canonical_home.mkdir()
+            provisioned_home = Path(directory) / "toolchain" / "rustup"
+            provisioned_home.mkdir(parents=True)
+            runner = FakeRunner()
+            with mock.patch.object(
+                pwd, "getpwuid", return_value=mock.Mock(pw_dir=str(canonical_home))
+            ), mock.patch.dict(
+                os.environ,
+                {"RUSTUP_HOME": str(provisioned_home), "RUSTUP_AUTO_INSTALL": "1"},
+            ):
+                self.host_authority.verify_toolchain(matrix, runner=runner)
+                for profile_id in ("macos-cli-default", "linux-cli"):
+                    profile = matrix.profiles[profile_id]
+                    self.host_authority.run_profile(
+                        profile, runner=runner, current_host=profile.host
+                    )
+            self.assertEqual(len(runner.calls), 4)
+            for argv, kwargs in runner.calls:
+                with self.subTest(argv=argv):
+                    environment = kwargs["env"]
+                    self.assertEqual(environment["RUSTUP_HOME"], str(provisioned_home))
+                    self.assertEqual(environment["RUSTUP_TOOLCHAIN"], "1.96.0")
+                    self.assertEqual(environment["RUSTUP_AUTO_INSTALL"], "0")
+                    self.assertTrue(
+                        Path(environment["CARGO_HOME"]).is_relative_to(
+                            ROOT / "target" / "host-authority-census"
+                        )
+                    )
+
+    def test_unconfigured_rustup_home_uses_canonical_home(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                pwd, "getpwuid", return_value=mock.Mock(pw_dir=directory)
+            ), mock.patch.dict(os.environ):
+                os.environ.pop("RUSTUP_HOME", None)
+                os.environ["HOME"] = "/tmp/ignored-home"
+                with self.host_authority._execution_context(ROOT) as execution:
+                    self.assertEqual(execution.rustup_home, Path(directory) / ".rustup")
 
     def test_hostile_temp_ancestor_cannot_choose_cargo_cwd_or_home(self):
         matrix = self.load()

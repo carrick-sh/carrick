@@ -427,6 +427,12 @@ def _execution_context(root: Path, *, state_root: Path | None = None):
         canonical_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(
             strict=True
         )
+        # Rustup storage is provisioned separately from Cargo configuration on
+        # CI hosts (and may be root-owned/read-only). Keep that toolchain and
+        # its declared targets instead of selecting the job user's ~/.rustup.
+        rustup_home = Path(
+            os.environ.get("RUSTUP_HOME", str(canonical_home / ".rustup"))
+        ).resolve()
         canonical_cargo_home = canonical_home / ".cargo"
         for cache_name in ("registry", "git"):
             cache = canonical_cargo_home / cache_name
@@ -441,7 +447,7 @@ def _execution_context(root: Path, *, state_root: Path | None = None):
         yield ExecutionContext(
             cargo_cwd,
             cargo_home,
-            canonical_home / ".rustup",
+            rustup_home,
             toolchain_channel,
             census_root,
             cargo_config,
@@ -462,6 +468,9 @@ def _sanitized_build_environment(
         "CARGO_HOME": str(cargo_home),
         "RUSTUP_HOME": str(rustup_home),
         "RUSTUP_TOOLCHAIN": toolchain_channel,
+        # Census builds consume provisioned toolchains; missing ones must fail,
+        # never trigger an install in a job or create a second minimal toolchain.
+        "RUSTUP_AUTO_INSTALL": "0",
     }
     if target_dir is not None:
         environment["CARGO_TARGET_DIR"] = str(target_dir)
