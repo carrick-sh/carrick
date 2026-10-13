@@ -798,6 +798,10 @@ fn run_lldb_attach(
     if !ctx.no_core {
         lldb.arg("-o").arg(modified_memory_core_command(core_path));
     }
+    // Optional ARM census comes after the primary evidence: a missing
+    // pointer/layout must not prevent stacks or the core from being saved.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    lldb.arg("-o").arg("carrick el1-counters");
     lldb.arg("-o").arg("detach").arg(ctx.exe);
 
     let stdout = log

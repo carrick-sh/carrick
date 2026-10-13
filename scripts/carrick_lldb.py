@@ -23,6 +23,7 @@ Commands
     carrick guest-processes              # summarize guest PID/TID host threads
     carrick guest-threads [pid]          # list guest threads, optionally by PID
     carrick eventring [count|start:count]# decode ring (default: last 128)
+    carrick el1-counters                 # ARM mapped syscall counters
     carrick mach-exceptions              # correlate DSR Mach exception ports
 
 The plugin caches the state file path between calls so you only have to
@@ -804,7 +805,7 @@ def _static_load_addr(target, fullname: str) -> Optional[int]:
     for module in target.modules:
         for sym in module:
             name = sym.GetName() or ""
-            if "event_ring" not in name:
+            if module_name not in name:
                 continue
             parts = name.split("::")
             if module_name in parts and base in parts:
@@ -1065,6 +1066,58 @@ def _c_global_load_addr(target, name: str) -> Optional[int]:
 
 # ----- the top-level `carrick` multiplex command --------------------------
 
+def cmd_el1_counters(debugger, command, exe_ctx, result, internal_dict):
+    """Read the mapped ARM counters, using this artifact's DWARF layout."""
+    import struct
+
+    if command.strip():
+        result.SetError("usage: carrick el1-counters")
+        return
+    process = _selected_process(debugger, exe_ctx, result)
+    if process is None:
+        return
+    target = process.GetTarget()
+    address = _static_load_addr(
+        target, "carrick_vmm_hvf::trap::stage2_backend::EL1_COUNTERS_HOST_PTR"
+    )
+    if address is None:
+        result.SetError("ARM counters pointer symbol unavailable in this artifact")
+        return
+    error = lldb.SBError()
+    pointer = process.ReadUnsignedFromMemory(address, target.GetAddressByteSize(), error)
+    if error.Fail() or pointer == 0:
+        result.SetError("ARM counters region unavailable: " + str(error))
+        return
+    layout = target.FindFirstType("carrick_el1_abi::Counters")
+    if not layout.IsValid():
+        result.SetError("ARM Counters DWARF layout unavailable")
+        return
+    values = {}
+    for index in range(layout.GetNumberOfFields()):
+        field = layout.GetFieldAtIndex(index)
+        name = field.GetName()
+        if name not in ("served", "forwarded", "refused"):
+            continue
+        size = field.GetType().GetByteSize()
+        if size == 0 or size % 8 != 0 or size > 8192:
+            result.SetError("invalid counter array extent in DWARF: " + name)
+            return
+        raw = process.ReadMemory(pointer + field.GetOffsetInBytes(), size, error)
+        if error.Fail() or len(raw) != size:
+            result.SetError("counter array unreadable: " + name + ": " + str(error))
+            return
+        values[name] = struct.unpack("<" + "Q" * (size // 8), raw)
+    if set(values) != {"served", "forwarded", "refused"}:
+        result.SetError("incomplete ARM Counters DWARF layout")
+        return
+    lines = [f"# ARM EL1 syscall counters host_pid={process.GetProcessID()} pointer={pointer:#x}"]
+    for nr in range(max(map(len, values.values()))):
+        row = {name: counts[nr] if nr < len(counts) else 0 for name, counts in values.items()}
+        if any(row.values()):
+            lines.append(f"nr={nr} " + " ".join(f"{name}={count}" for name, count in row.items()))
+    result.AppendMessage("\n".join(lines))
+
+
 _SUBCOMMANDS = {
     "load-state": cmd_load_state,
     "info": cmd_info,
@@ -1075,6 +1128,7 @@ _SUBCOMMANDS = {
     "guest-processes": cmd_guest_processes,
     "guest-threads": cmd_guest_threads,
     "eventring": cmd_eventring,
+    "el1-counters": cmd_el1_counters,
 }
 
 
