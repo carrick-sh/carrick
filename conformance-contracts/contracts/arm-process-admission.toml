@@ -9,7 +9,7 @@ semantic_authority = [
 ]
 fixture = "An ARM host root enters the production admission boundary before set_tid_address, then wait4; two already-live records import into that same owner; host lease renewal preserves its Arc and census; stale imported fields refuse before registry publication"
 scale_points = [1, 2]
-rationale = "Admission creates one native process owner for the retained root and imports authenticated lifecycle members without creating host tasks or changing live membership. Re-entry retains that owner. The setup and no-child wait each dispatch once and request no fork stock. The fixed lifecycle pool bounds the initial import scan; ordinary re-entry resolves the exact registry member. Signal resources are reachable from the native entry; ARM signal routing belongs to #285."
+rationale = "Admission creates one native process owner for the retained root and imports authenticated lifecycle members without creating host tasks or changing live membership. Re-entry retains that owner. The setup and no-child wait each dispatch once and request no fork stock. Unpublished admission-only home custody ends with the call, so ARM host reconciliation cannot mistake an ordinary returned call for a parked thread; a published handoff retains its record. The fixed lifecycle pool bounds the initial import scan; ordinary re-entry resolves the exact registry member. Signal resources are reachable from the native entry; ARM signal routing belongs to #285."
 
 [bindings]
 vm_free = "carrick-el1::personality::aarch64_process_tests::arm_root_setup_enters_production_process_venue"
@@ -19,6 +19,7 @@ vm_free = "carrick-el1::personality::aarch64_process_tests::arm_root_setup_enter
 # arm_root_admission_refuses_stale_imported_custody_without_publication
 # arm_root_entry_refuses_wrong_binding_and_root_incarnation
 # arm_born_thread_uses_native_owner_without_an_execution_generation
+# arm_returned_process_call_is_not_a_zone_park
 
 [bindings.unresolved]
 embed_structural = "Scoped signed el1_transparent_smoke validates ARM startup on the exact fixture bundle; it does not export this admission observation. The director owns full signed failure-set comparison."
