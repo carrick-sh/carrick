@@ -579,7 +579,7 @@ pub(crate) fn prepare_exec_region_raw_in_sized(
                 guest_start: mapping.guest_start,
                 mapped_size: mapping.mapped_size,
             })?;
-    Ok(HvfMappedRegion {
+    let region = HvfMappedRegion {
         start: mapping.guest_start,
         ipa: mapping.ipa_start,
         physical_ipa: mapping.ipa_start,
@@ -606,7 +606,9 @@ pub(crate) fn prepare_exec_region_raw_in_sized(
             mapping.ipa_start,
             size as u64,
         ),
-    })
+    };
+    publish_el1_region_host_ptr(mapping, host);
+    Ok(region)
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
@@ -876,6 +878,7 @@ pub(crate) fn map_region_raw_in_using_epoch_allocator(
         region.owner_generation = epoch.raw();
         region.structural_owner = Some(owner);
     }
+    publish_el1_region_host_ptr(mapping, host);
     Ok(region)
 }
 
@@ -922,12 +925,16 @@ pub(crate) fn map_exclusive_region(
             );
         }
     }
+    Ok((host, size, host_mapping))
+}
+
+fn publish_el1_region_host_ptr(mapping: &GuestMapping, host: *mut u8) {
     if mapping.guest_start == carrick_mem::memory::LINUX_EL1_KERNEL_BASE {
         let counters_ptr = unsafe { host.add(carrick_el1_abi::EL1_COUNTERS_OFFSET as usize) };
         record_el1_counters_host_ptr(counters_ptr as usize);
-        record_el1_region_host_ptr(host as usize);
+        EL1_REGION_HOST_PTR.store(host as usize, std::sync::atomic::Ordering::Release);
+        carrick_el1_abi::record_el1_region_host_ptr(host as usize);
     }
-    Ok((host, size, host_mapping))
 }
 
 static EL1_COUNTERS_HOST_PTR: std::sync::atomic::AtomicUsize =
@@ -940,9 +947,28 @@ pub(crate) fn record_el1_counters_host_ptr(ptr: usize) {
     EL1_COUNTERS_HOST_PTR.store(ptr, std::sync::atomic::Ordering::Release);
 }
 
+#[cfg(test)]
 pub(crate) fn record_el1_region_host_ptr(ptr: usize) {
     EL1_REGION_HOST_PTR.store(ptr, std::sync::atomic::Ordering::Release);
     carrick_el1_abi::record_el1_region_host_ptr(ptr);
+}
+
+/// Retire the pointer while its owning host mapping is still mapped.
+pub(crate) fn clear_el1_region_host_ptr_if(expected: usize) {
+    let _ = EL1_REGION_HOST_PTR.compare_exchange(
+        expected,
+        0,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    );
+    let _ = carrick_el1_abi::clear_el1_region_host_ptr_if(expected);
+    let counters = expected + carrick_el1_abi::EL1_COUNTERS_OFFSET as usize;
+    let _ = EL1_COUNTERS_HOST_PTR.compare_exchange(
+        counters,
+        0,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    );
 }
 
 pub fn read_el1_region_host_ptr() -> usize {
@@ -1209,6 +1235,60 @@ pub(crate) fn hvf_set_sys_reg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn el1_aperture_pointer_retires_with_its_host_mapping() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let mapping = GuestMapping {
+            guest_start: carrick_mem::memory::LINUX_EL1_KERNEL_BASE,
+            ipa_start: carrick_mem::memory::LINUX_EL1_KERNEL_BASE,
+            mapped_size: carrick_mem::memory::LINUX_EL1_KERNEL_SIZE,
+            offset_in_mapping: 0,
+            payload_size: 0,
+            perms: SegmentPerms {
+                read: true,
+                write: true,
+                execute: false,
+            },
+            shared: false,
+            image: std::sync::Arc::new(Vec::new()),
+            private_file_backing: None,
+        };
+        let region = prepare_exec_region_raw(&mapping).expect("EL1 host mapping");
+        let stale = region.host_addr as usize;
+        assert_eq!(carrick_el1_abi::get_el1_region_host_ptr(), stale);
+        drop(region);
+        let actual = carrick_el1_abi::get_el1_region_host_ptr();
+        reset_el1_counters();
+        assert_eq!(
+            actual, 0,
+            "unmapped EL1 aperture must not remain globally reachable"
+        );
+    }
+
+    #[test]
+    fn retired_el1_mapping_cannot_clear_a_successor_aperture() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let old = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            carrick_el1_abi::EL1_REGION_SIZE as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("old aperture");
+        let successor = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            carrick_el1_abi::EL1_REGION_SIZE as usize,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .expect("successor aperture");
+        record_el1_region_host_ptr(old.as_ptr() as usize);
+        record_el1_region_host_ptr(successor.as_ptr() as usize);
+        clear_el1_region_host_ptr_if(old.as_ptr() as usize);
+        assert_eq!(read_el1_region_host_ptr(), successor.as_ptr() as usize);
+        assert_eq!(
+            carrick_el1_abi::get_el1_region_host_ptr(),
+            successor.as_ptr() as usize
+        );
+        clear_el1_region_host_ptr_if(successor.as_ptr() as usize);
+    }
 
     #[test]
     fn el1_stage1_table_backing_is_stage2_writable_but_not_guest_writable() {

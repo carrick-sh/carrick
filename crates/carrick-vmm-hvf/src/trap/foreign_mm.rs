@@ -2212,8 +2212,8 @@ pub(crate) fn materialize_foreign_pristine_write(
             len: key.1 as usize,
         },
     });
-    for region in published.extension_regions {
-        let owner = region.structural_owner.unwrap_or_else(|| {
+    for mut region in published.extension_regions {
+        let owner = region.structural_owner.take().unwrap_or_else(|| {
             carrick_fatal!(
                 "hvpatch::foreign_sparse_materialization",
                 "stage-1 extension region lacks structural owner: va=0x{:x} physical_ipa=0x{:x}",
@@ -2334,8 +2334,8 @@ pub(crate) fn materialize_foreign_private_file_write(
             len: key.1 as usize,
         },
     });
-    for region in published.extension_regions {
-        let owner = region.structural_owner.unwrap_or_else(|| {
+    for mut region in published.extension_regions {
+        let owner = region.structural_owner.take().unwrap_or_else(|| {
             carrick_fatal!(
                 "hvpatch::foreign_file_materialization",
                 "stage-1 extension for private-file materialization missing structural owner"

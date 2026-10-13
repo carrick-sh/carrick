@@ -1872,6 +1872,19 @@ pub fn retire_detached_task_only_shared_root_with_proof(
     HvfVmState::retire_task_state_mm_root_only(task, (expected_root_base, expected_root_size))
 }
 
+/// The final shared-inventory owner may have a relocated bootstrap root,
+/// which has no reusable-root ticket. Retire its table capacity without
+/// touching the frame ledger shared with its predecessor.
+pub fn retire_detached_task_only_shared_rootless_capacity(
+    state: &HvpatchTaskOnlyEngineState,
+) -> Result<(), TrapError> {
+    let mut parked = state.parked_task.lock();
+    let task = parked.as_mut().ok_or_else(|| {
+        TrapError::Hypervisor("detached task-only retirement has no parked task state".to_owned())
+    })?;
+    HvfVmState::retire_task_state_shared_inventory_table_capacity(task)
+}
+
 pub fn retire_detached_exec_predecessor(
     state: &mut HvpatchTaskEngineState,
 ) -> Result<(), TrapError> {

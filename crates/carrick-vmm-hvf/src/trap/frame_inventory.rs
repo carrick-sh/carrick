@@ -3565,6 +3565,25 @@ impl HvfVmState {
         Ok(None)
     }
 
+    /// Retire table capacity for the final owner of a rootless shared-inventory
+    /// MM. Its frame ledger belongs to another task and is left untouched.
+    pub(crate) fn retire_task_state_shared_inventory_table_capacity(
+        task: &mut HvfTaskState,
+    ) -> Result<(), TrapError> {
+        if task.mm_root_slot.is_some() {
+            return Err(TrapError::Hypervisor(
+                "rootless shared-inventory retirement received a pooled root".to_owned(),
+            ));
+        }
+        task.page_tables_authority()
+            .retire_table_capacity(
+                None,
+                carrick_aarch64::stage1_authority::TableArenaRetirement::Terminal,
+                |_| Ok(()),
+            )
+            .map_err(TrapError::Hypervisor)
+    }
+
     pub(crate) fn retire_task_state_mm_root_only(
         task: &mut HvfTaskState,
         expected_root_slot: (u64, u64),

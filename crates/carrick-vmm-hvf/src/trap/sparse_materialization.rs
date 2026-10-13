@@ -859,8 +859,14 @@ impl MmAccessState {
                         .root_slot_pool()
                         .is_some_and(|pool| pool.contains_ipa(base))
                     {
+                        let held =
+                            custody
+                                .stage2_record_covering(base, TWO_MIB)
+                                .and_then(|identity| {
+                                    custody.stage2_record_snapshot(identity.record_id)
+                                });
                         return Err(TrapError::Hypervisor(format!(
-                            "stage-1 extension arena IPA 0x{base:x} is still held by the root-slot pool"
+                            "stage-1 extension arena IPA 0x{base:x} is still held by the root-slot pool; stage2={held:?}"
                         )));
                     }
                     let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
