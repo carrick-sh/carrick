@@ -760,7 +760,7 @@ pub(crate) fn service_metadata_operation(
     custody: &crate::trap::CarrierVmCustody,
     generation: Option<crate::trap::CarrierVmGeneration>,
     cpu: carrick_guest_arch::CpuId,
-    active_execution: Option<crate::fork_stock::GrantExecution>,
+    active_execution: Option<(crate::fork_stock::GrantExecution, &NativeRootExit)>,
     op: u64,
     arg1: u64,
     arg2: u64,
@@ -1033,21 +1033,17 @@ pub(crate) fn service_metadata_operation(
             None => Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]),
         }
     } else if op == GRANT_OP_ROOT_EXIT {
-        let record_gpa = arg1;
-        if !record_gpa.is_multiple_of(64) {
+        let record_va = carrick_guest_arch::KernelVa::new(arg1);
+        if !record_va.raw().is_multiple_of(64) {
             return Ok([METADATA_GRANT_ERR_ALIGNMENT, 0, 0, 0]);
         }
-        let Ok(record_ptr) = crate::fork_stock::ForkStockHostCustody::resolve_record_ptr::<
-            NativeRootExit,
-        >(custody, record_gpa) else {
-            return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
-        };
         // Foreign or out-of-range guest-supplied CPU index is refused immediately.
         if arg2 != 0 && arg2 != cpu.raw() as u64 {
             return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
         }
-        let root_exit = unsafe { &*record_ptr };
-        let Some(execution) = active_execution.filter(|execution| execution.cpu == cpu) else {
+        let Some((execution, root_exit)) =
+            active_execution.filter(|(execution, _)| execution.cpu == cpu)
+        else {
             return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
         };
         let mut fork_stock = custody.fork_stock.lock();
@@ -1302,7 +1298,18 @@ pub(crate) fn handle_metadata_grant_trap(
                     .map_err(|error| {
                         TrapError::Hypervisor(format!("read terminal root: {error}"))
                     })?;
-                root_execution(cpu, task, zone, ttbr0)
+                // SAFETY: the same retained ABI mapping owns this stopped CPU's stack.
+                let region = unsafe {
+                    core::slice::from_raw_parts(
+                        ptr as *const u8,
+                        carrick_el1_abi::EL1_REGION_SIZE as usize,
+                    )
+                };
+                root_execution(cpu, task, zone, ttbr0).zip(root_stack_record(
+                    region,
+                    cpu,
+                    carrick_guest_arch::KernelVa::new(arg1),
+                ))
             }
             _ => None,
         }
@@ -1355,6 +1362,43 @@ fn classify_metadata_trap(op: u64, reply: [u64; 4]) -> Result<MetadataTrapOutcom
         carrick_personality_linux::lifecycle::LinuxWaitStatus::from_wait_encoding(status)
             .to_termination_status(),
     ))
+}
+
+/// Read only a complete aligned terminal record on the stopped CPU's ABI stack.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn root_stack_record(
+    region: &[u8],
+    cpu: carrick_guest_arch::CpuId,
+    address: carrick_guest_arch::KernelVa,
+) -> Option<&NativeRootExit> {
+    let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
+    let start =
+        carrick_el1_abi::EL1_STACKS_BASE + u64::from(slot.raw()) * carrick_el1_abi::EL1_STACK_SIZE;
+    let end = address
+        .raw()
+        .checked_add(core::mem::size_of::<NativeRootExit>() as u64)?;
+    if address.raw() < start
+        || end > start + carrick_el1_abi::EL1_STACK_SIZE
+        || !address
+            .raw()
+            .is_multiple_of(core::mem::align_of::<NativeRootExit>() as u64)
+        || !region
+            .as_ptr()
+            .addr()
+            .is_multiple_of(core::mem::align_of::<NativeRootExit>())
+    {
+        return None;
+    }
+    let offset = usize::try_from(
+        address
+            .raw()
+            .checked_sub(carrick_el1_abi::EL1_REGION_BASE)?,
+    )
+    .ok()?;
+    let bytes = region.get(offset..offset.checked_add(core::mem::size_of::<NativeRootExit>())?)?;
+    // SAFETY: checked alignment, bounds and initialized ABI stack storage; the
+    // stopped CPU and retained region keep this wire record frozen for the call.
+    Some(unsafe { &*bytes.as_ptr().cast::<NativeRootExit>() })
 }
 
 /// Root retirement has released its record. Authenticate the stopped lane
@@ -1430,6 +1474,48 @@ mod tests {
         assert_eq!(execution.context.generation.raw().get(), 77);
         assert_eq!(execution.context.root.address().raw(), 0x90000);
         assert!(zone.slot(slot).host_record().is_none());
+        let custody = crate::trap::CarrierVmCustody::new();
+        let generation = custody.begin_create().unwrap();
+        custody.commit_create(generation).unwrap();
+        let address = carrick_guest_arch::KernelVa::new(
+            carrick_el1_abi::EL1_STACKS_BASE + 3 * carrick_el1_abi::EL1_STACK_SIZE,
+        );
+        let offset = (address.raw() - carrick_el1_abi::EL1_REGION_BASE) as usize;
+        // SAFETY: retained ABI storage is aligned; this fixture exclusively owns this stack.
+        unsafe {
+            region
+                .as_ptr()
+                .add(offset)
+                .cast_mut()
+                .cast::<NativeRootExit>()
+                .write(
+                    NativeRootExit::new(
+                        execution.binding,
+                        carrick_personality_linux::lifecycle::LinuxWaitStatus::exited(7),
+                    )
+                    .unwrap(),
+                );
+        }
+        let bytes = unsafe {
+            core::slice::from_raw_parts(region.as_ptr(), carrick_el1_abi::EL1_REGION_SIZE as usize)
+        };
+        let record = root_stack_record(bytes, cpu, address).unwrap();
+        assert!(root_stack_record(bytes, carrick_guest_arch::CpuId::new(2), address).is_none());
+        assert_eq!(
+            service_metadata_operation(
+                &custody,
+                Some(generation),
+                cpu,
+                Some((execution, record)),
+                GRANT_OP_ROOT_EXIT,
+                address.raw(),
+                cpu.raw() as u64,
+                0
+            )
+            .unwrap(),
+            [0, 7 << 8, 0, 0]
+        );
+
         assert!(root_execution(cpu, &task, zone, ttbr + 4096).is_none());
         assert!(root_execution(carrick_guest_arch::CpuId::new(2), &task, zone, ttbr).is_none());
         task.execution.generation.store(0, Ordering::Release);

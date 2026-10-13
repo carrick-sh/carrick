@@ -1399,7 +1399,7 @@ mod tests {
             &custody,
             Some(generation),
             exec.cpu,
-            Some(exec),
+            Some((exec, &root_exit)),
             carrick_el1_abi::GRANT_OP_ROOT_EXIT,
             record_ipa,
             0,
@@ -1425,7 +1425,7 @@ mod tests {
             &custody,
             Some(generation),
             foreign_exec.cpu,
-            Some(foreign_exec),
+            Some((foreign_exec, &root_exit)),
             carrick_el1_abi::GRANT_OP_ROOT_EXIT,
             record_ipa,
             0,
@@ -1585,7 +1585,7 @@ mod tests {
             &custody,
             Some(generation),
             exec_a.cpu, // Trapped on A
-            Some(exec_a),
+            Some((exec_a, &root_exit)),
             carrick_el1_abi::GRANT_OP_ROOT_EXIT,
             record_ipa,
             exec_b.cpu.raw() as u64, // Guest attempts to name B
