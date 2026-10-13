@@ -433,6 +433,11 @@ jobs:
         with:
           pattern: receipt-hvf-${{ github.sha }}-*
           path: ${{ runner.temp }}/candidate
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gate-xtask-release
+          cache-workspace-crates: "true"
+          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Build the base xtask
         run: cargo build --locked --release -p carrick-xtask
       - name: Gate on NEW failures (waits up to 90 min for the base receipt)
@@ -467,6 +472,11 @@ jobs:
         with:
           pattern: receipt-kvm-${{ github.sha }}-*
           path: ${{ runner.temp }}/candidate
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gate-xtask-release
+          cache-workspace-crates: "true"
+          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Build the base xtask
         run: cargo build --locked --release -p carrick-xtask
       - name: Gate on NEW failures (waits up to 90 min for the base receipt)
