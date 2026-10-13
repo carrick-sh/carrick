@@ -327,8 +327,11 @@ pub fn build_detached_start_cmd(
         "if {}; then echo joined >&3; exec 3>&-; else echo lost >&3; exit {LOCK_LOST_STATUS}; fi; {script}",
         build_join_cmd(&lock.lock_dir, &lock.run_id, "\"$1\"", "\"$$\"")
     );
+    // Ignore HUP in the spawning subshell so the job inherits it before exec.
+    // Darwin nohup additionally asks launchd to switch bootstrap sessions,
+    // which a runner started by setsid/setuid need not be allowed to do.
     let launcher = format!(
-        "{} || exit {LOCK_LOST_STATUS}\nmkdir -p {} || exit 1\nstatus=$(nohup sh -c {} carrick-gate-job \"$$\" 3>&1 >/dev/null 2>&1 </dev/null &)\nrm -f {}/holders/\"$$\"\n[ \"$status\" = joined ] || {{ echo \"remote accept job did not join the checkout lock: $status\" >&2; exit {LOCK_LOST_STATUS}; }}\n",
+        "{} || exit {LOCK_LOST_STATUS}\nmkdir -p {} || exit 1\nstatus=$(trap '' HUP; /bin/sh -c {} carrick-gate-job \"$$\" 3>&1 >/dev/null 2>{} </dev/null &)\nrm -f {}/holders/\"$$\"\n[ \"$status\" = joined ] || {{ echo \"remote accept job did not join the checkout lock: $status\" >&2; exit {LOCK_LOST_STATUS}; }}\n",
         build_join_cmd(
             &lock.lock_dir,
             &lock.run_id,
@@ -337,6 +340,7 @@ pub fn build_detached_start_cmd(
         ),
         shell_quote(run_dir),
         shell_quote(&job),
+        shell_quote(log_file),
         shell_quote(&lock.lock_dir),
     );
     Ok(format!("exec /bin/sh -c {}", shell_quote(&launcher)))
@@ -1142,7 +1146,7 @@ mod tests {
         .unwrap();
 
         assert!(start_cmd.starts_with("exec /bin/sh -c '"));
-        assert!(start_cmd.contains("nohup sh -c "));
+        assert!(start_cmd.contains(r"trap '\'''\'' HUP; /bin/sh -c "));
         assert!(start_cmd.contains("carrick-gate-lock-join"));
         let script = build_accept_job_script(
             worktree,
@@ -1460,6 +1464,7 @@ Filesystem     1024-blocks    Used Available Capacity Mounted on
             |run_id: &str| RemoteLock::acquire(RemoteShell::Local, &runs, &lock_dir, run_id);
 
         let mut lock = acquire("run-job").unwrap();
+        let keeper = lock.claim().keeper_pid.to_string();
         let start = build_detached_start_cmd(
             &worktree.to_string_lossy(),
             AcceptPhase::Host,
@@ -1477,6 +1482,18 @@ Filesystem     1024-blocks    Used Available Capacity Mounted on
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
+        let holders = fs::read_dir(root.join("gate-worktree.lock/holders"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|pid| pid != &keeper)
+            .collect::<Vec<_>>();
+        assert_eq!(holders.len(), 1, "only the detached job may have joined");
+        // The job must survive the hangup that a disconnected driver causes.
+        let signal = Command::new("/bin/kill")
+            .args(["-HUP", &holders[0]])
+            .output()
+            .unwrap();
+        assert!(signal.status.success(), "{signal:?}");
         // The driver goes away without releasing; the joined job holds on.
         lock.hand_off();
         drop(lock);
