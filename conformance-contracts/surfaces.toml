@@ -987,7 +987,7 @@ contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.wai
 
 [[surfaces]]
 path = "crates/carrick-el1/src/personality/native_process_runtime.rs"
-contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.short-lock", "process.native.terminal-child"]
+contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.short-lock", "process.native.terminal-child", "process.native.arm-admission"]
 
 [[surfaces]]
 path = "crates/carrick-el1/src/personality/fork_loan.rs"
@@ -1059,11 +1059,11 @@ contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1
 
 [[surfaces]]
 path = "crates/carrick-el1/src/personality/aarch64_process.rs"
-contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.terminal-child"]
+contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.terminal-child", "process.native.arm-admission"]
 
 [[surfaces]]
 path = "crates/carrick-el1/src/personality/aarch64_process_tests.rs"
-contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.terminal-child"]
+contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.terminal-child", "process.native.arm-admission"]
 
 [[surfaces]]
 path = "crates/carrick-x86-cpl0/src/native_execution.rs"
@@ -1368,3 +1368,7 @@ contracts = ["core.entry.completion"]
 [[surfaces]]
 path = "crates/carrick-kernel-example/tests/root_exit_full_width.rs"
 contracts = ["core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/personality/dispatch.rs"
+contracts = ["process.native.arm-admission", "core.entry.completion"]
