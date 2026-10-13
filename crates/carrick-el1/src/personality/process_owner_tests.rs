@@ -1741,3 +1741,144 @@ fn retirement_completion_notifies_the_adopter_of_a_pending_zombie() {
         .expect("pending retirement must notify the current adopter");
     assert_eq!(target.prepare().parent, root);
 }
+
+#[test]
+fn pending_reparented_zombie_keeps_process_group_until_adopter_reaps() {
+    use super::super::native_process_entry::publish_exit;
+    let mut owner = owner();
+    let root = key(1, 1);
+    let parent = key(2, 2);
+    let child = key(3, 3);
+    birth(&mut owner, root, parent, Rc::new(Cell::new(0)));
+    let releases = Rc::new(Cell::new(0));
+    birth(&mut owner, parent, child, releases.clone());
+    // The child leads its own job group so a group wait cannot match the
+    // departed parent, which stays in the root's group.
+    let group = carrick_sched_core::process::ProcessGroupId::from_leader(child.id);
+    let old_group = owner.task(child).unwrap().identity().process_group;
+    owner
+        .registry
+        .process_groups
+        .get_mut(&old_group)
+        .unwrap()
+        .members
+        .remove(&child);
+    let row = owner.registry.tasks.get_mut(&child.id).unwrap();
+    row.metadata.identity.process_group = group;
+    row.metadata.namespace_process_group = 42;
+    owner.registry.publish_process_group(
+        group,
+        ProcessGroupRecord {
+            object: (),
+            members: BTreeSet::from([child]),
+            container: (),
+            namespace_id: 42,
+        },
+    );
+    let (_resources, pending) = publish_exit(
+        &mut owner,
+        child,
+        None,
+        Transaction(98),
+        LinuxWaitStatus::from_wait_encoding(7 << 8),
+    )
+    .unwrap();
+    let permit = pending.effects.cancel_members(Member::cancel);
+    // The parent exits inside the child's MM-retirement window.
+    let parent_exit = exit(&mut owner, parent, None);
+    parent_exit.effects.cancel_members(Member::cancel);
+    // The exit lane selects its recipient before automatic removal can drop
+    // the receipt; the reparented zombie keeps its job group.
+    assert_eq!(
+        owner.select_exit_parent(&permit).unwrap().prepare().parent,
+        root
+    );
+    assert_eq!(owner.namespace_child_group(root, 42).unwrap(), Some(group));
+    assert!(matches!(
+        owner
+            .scan_wait(root, query(WaitTarget::ProcessGroup(group)))
+            .unwrap(),
+        WaitSelection::StillRunning(_)
+    ));
+    let absent = carrick_sched_core::process::ProcessGroupId::from_leader(key(9, 9).id);
+    assert!(matches!(
+        owner
+            .scan_wait(root, query(WaitTarget::ProcessGroup(absent)))
+            .unwrap(),
+        WaitSelection::NoChild
+    ));
+    assert!(owner.publish_exit_retirement(pending.retirement).is_none());
+    let reaped = owner
+        .consume_wait(root, query(WaitTarget::ProcessGroup(group)))
+        .unwrap();
+    assert!(
+        matches!(&reaped.selection, WaitSelection::Exited(zombie) if zombie.key == child && zombie.status.raw() == 7 << 8)
+    );
+    drop(reaped);
+    assert_eq!(releases.get(), 1);
+    assert_eq!(owner.namespace_child_group(root, 42).unwrap(), None);
+    assert!(matches!(
+        owner
+            .scan_wait(root, query(WaitTarget::ProcessGroup(group)))
+            .unwrap(),
+        WaitSelection::NoChild
+    ));
+}
+
+#[test]
+fn pending_reparented_child_charges_adopter_once_and_never_departed_parent() {
+    use super::super::native_process_entry::publish_exit;
+    let mut owner = owner();
+    let root = key(1, 1);
+    let parent = key(2, 2);
+    let child = key(3, 3);
+    birth(&mut owner, root, parent, Rc::new(Cell::new(0)));
+    birth(&mut owner, parent, child, Rc::new(Cell::new(0)));
+    let (_resources, pending) = publish_exit(
+        &mut owner,
+        child,
+        None,
+        Transaction(99),
+        LinuxWaitStatus::from_wait_encoding(7 << 8),
+    )
+    .unwrap();
+    let permit = pending.effects.cancel_members(Member::cancel);
+    let parent_exit = exit(&mut owner, parent, None);
+    parent_exit.effects.cancel_members(Member::cancel);
+    assert_eq!(
+        owner.select_exit_parent(&permit).unwrap().prepare().parent,
+        root
+    );
+    // The departed parent never reaped the child: its receipt carries only
+    // its own CPU, not the adopted child's.
+    let parent_reaped = owner
+        .consume_wait(root, query(WaitTarget::Exact(parent)))
+        .unwrap();
+    assert!(
+        matches!(&parent_reaped.selection, WaitSelection::Exited(receipt) if receipt.total_charge_to_reaper().user_time == Duration::from_micros(7))
+    );
+    drop(parent_reaped);
+    assert_eq!(
+        owner.task(root).unwrap().children_rusage().user_time,
+        Duration::from_micros(7)
+    );
+    drop(owner.publish_exit_retirement(pending.retirement));
+    let child_reaped = owner
+        .consume_wait(root, query(WaitTarget::Exact(child)))
+        .unwrap();
+    assert!(
+        matches!(&child_reaped.selection, WaitSelection::Exited(receipt) if receipt.total_charge_to_reaper().user_time == Duration::from_micros(7))
+    );
+    drop(child_reaped);
+    let charged = owner.task(root).unwrap().children_rusage();
+    assert_eq!(charged.user_time, Duration::from_micros(14));
+    assert_eq!(charged.system_time, Duration::from_micros(6));
+    assert!(matches!(
+        owner
+            .consume_wait(root, query(WaitTarget::Exact(child)))
+            .unwrap()
+            .selection,
+        WaitSelection::NoChild
+    ));
+    assert_eq!(owner.task(root).unwrap().children_rusage(), charged);
+}

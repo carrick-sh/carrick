@@ -1111,6 +1111,19 @@ The companion bindings
 `delayed_child_exit_does_not_inherit_departed_parents_signal_interest` require
 the current adopter's signal policy, even when it differs from P's.
 
+These witnesses are registered as VM-free bindings of
+`kernel.el1.signal-delivery-owner` (all three), `core.entry.completion`,
+`process.native.terminal-child` and the supplemental
+`process.native.short-lock` list (the peer witness), and as
+the process-exit interleave note of `kernel.el1.thread-lifecycle`. Two
+owner-level bindings in `process_owner_tests.rs` cover the same
+pending-retirement reparent window for `kernel.wait.process-group`
+(`pending_reparented_zombie_keeps_process_group_until_adopter_reaps`) and
+`kernel.wait.child-rusage`
+(`pending_reparented_child_charges_adopter_once_and_never_departed_parent`).
+The native runtime records no per-task CPU, so the rusage binding proves the
+shared charge ledger, not native CPU measurement.
+
 Structural budget: exactly one final notification publication per exit, no
 retry or unrelated-task scan, exact TaskKey generation selection, and zero
 stale-parent-to-run-failure transitions. Current recipient selection, signal
