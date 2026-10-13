@@ -344,8 +344,9 @@ impl<T> NativeProcessSignals<T> {
     }
 }
 
-/// Signal locks are sampled only when shared exit preparation requests them,
-/// after the process graph guard and member cancellation have completed.
+/// Native signal locks are leaves: their operations never acquire the process
+/// graph or scheduler buckets. Exit delivery may sample them while retaining
+/// graph custody to select and notify the same live parent generation.
 pub struct NativeExitSignals<T, M> {
     signals: NativeProcessSignals<T>,
     mask: M,
