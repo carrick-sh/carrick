@@ -270,7 +270,16 @@ fn idle_fields(code: Option<i32>, stdout: &[u8], stderr: &[u8], handles: &Census
     }
     named && seen.len() == handles.len()
 }
-fn census_output(path: &Path, directory: bool) -> Option<std::process::Output> {
+#[derive(Clone, Copy)]
+enum CensusScope {
+    AllUsers,
+    // Fixtures own their private targets and every process opening them.
+    // This authority is never available to the production pruner.
+    #[cfg(test)]
+    FixtureUser,
+}
+
+fn census_output(path: &Path, directory: bool, scope: CensusScope) -> Option<std::process::Output> {
     let lsof = std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths)
             .map(|dir| dir.join("lsof"))
@@ -281,7 +290,12 @@ fn census_output(path: &Path, directory: bool) -> Option<std::process::Output> {
             .and_then(|file| fs::canonicalize(file).ok())
     })?;
     // SAFETY: geteuid has no preconditions and observes the invoking user.
-    let mut command = if unsafe { libc::geteuid() } == 0 {
+    let privileged = match scope {
+        CensusScope::AllUsers => true,
+        #[cfg(test)]
+        CensusScope::FixtureUser => false,
+    };
+    let mut command = if !privileged || unsafe { libc::geteuid() } == 0 {
         Command::new(lsof)
     } else {
         let mut command = Command::new("sudo");
@@ -294,8 +308,8 @@ fn census_output(path: &Path, directory: bool) -> Option<std::process::Output> {
     }
     command.arg(path).output().ok()
 }
-fn census(path: &Path, directory: bool, handles: &CensusHandles) -> bool {
-    census_output(path, directory)
+fn census(path: &Path, directory: bool, handles: &CensusHandles, scope: CensusScope) -> bool {
+    census_output(path, directory, scope)
         .is_some_and(|out| idle_fields(out.status.code(), &out.stdout, &out.stderr, handles))
 }
 
@@ -315,6 +329,7 @@ fn prune_target(
     apply: bool,
     writer: &mut impl Write,
     before_delete: &mut impl FnMut(),
+    scope: CensusScope,
 ) -> Result<u64, GcError> {
     let source = match fs::symlink_metadata(target) {
         Ok(meta) if meta.is_dir() => meta,
@@ -375,7 +390,7 @@ fn prune_target(
             "target changed during lock acquisition".into(),
         ));
     }
-    if !census(&canonical, true, &handles) {
+    if !census(&canonical, true, &handles, scope) {
         writeln!(
             writer,
             "keep target (in use or unknown visibility) | {}",
@@ -399,7 +414,7 @@ fn prune_target(
                 let path = kind_path.join(&name);
                 let mut candidate_handles = CensusHandles::new();
                 tree.register(&path, &mut candidate_handles);
-                if !census(&path, tree.metadata.is_dir(), &candidate_handles) {
+                if !census(&path, tree.metadata.is_dir(), &candidate_handles, scope) {
                     continue;
                 }
                 if !tree.valid(&parent, &name)?
@@ -455,7 +470,14 @@ fn prune_targets(
     let mut total: u64 = 0;
     for target in targets {
         total = total
-            .checked_add(prune_target(target, cutoff, apply, writer, &mut || {})?)
+            .checked_add(prune_target(
+                target,
+                cutoff,
+                apply,
+                writer,
+                &mut || {},
+                CensusScope::AllUsers,
+            )?)
             .ok_or_else(|| GcError::Census("allocated byte accounting overflow".into()))?;
     }
     writeln!(
@@ -606,7 +628,7 @@ mod tests {
                 (root.as_raw_fd(), target.clone()),
                 (lock.as_raw_fd(), target.join(".cargo-lock")),
             ]);
-            let output = census_output(&target, true).unwrap();
+            let output = census_output(&target, true, CensusScope::FixtureUser).unwrap();
             assert!(
                 idle_fields(
                     output.status.code(),
@@ -643,7 +665,7 @@ mod tests {
                 );
             }
             let _unrelated = File::open(target.join("debug/deps/old-output")).unwrap();
-            let unrelated = census_output(&target, true).unwrap();
+            let unrelated = census_output(&target, true, CensusScope::FixtureUser).unwrap();
             assert!(
                 !idle_fields(
                     unrelated.status.code(),
@@ -670,7 +692,19 @@ mod tests {
             }
         };
         let mut output = Vec::new();
-        let result = prune_target(&target, cutoff(2).unwrap(), apply, &mut output, &mut hook);
+        let scope = if case == "privileged" {
+            CensusScope::AllUsers
+        } else {
+            CensusScope::FixtureUser
+        };
+        let result = prune_target(
+            &target,
+            cutoff(2).unwrap(),
+            apply,
+            &mut output,
+            &mut hook,
+            scope,
+        );
         std::io::stdout().write_all(&output).unwrap();
         result.unwrap();
     }
@@ -1194,6 +1228,38 @@ mod tests {
             .env("PRUNE_FIXTURE_TARGET", &target)
             .env("PRUNE_FIXTURE_APPLY", "1")
             .env("PATH", temp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && artifact.exists()
+                && String::from_utf8_lossy(&output.stdout).contains("unknown visibility"),
+            "{output:?}"
+        );
+    }
+    #[test]
+    fn all_user_census_denial_preserves_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let (target, artifact) = old_artifact(temp.path());
+        let bin = temp.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        // Deny both commands so this control also works for root test users.
+        for name in ["sudo", "lsof"] {
+            let path = bin.join(name);
+            fs::write(&path, "#!/bin/sh\necho 'permission denied' >&2\nexit 1\n").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "target_prune::tests::prune_child_fixture",
+                "--nocapture",
+            ])
+            .env("PRUNE_FIXTURE_TARGET", &target)
+            .env("PRUNE_FIXTURE_APPLY", "1")
+            .env("PRUNE_FIXTURE_CASE", "privileged")
+            .env("PATH", bin)
             .output()
             .unwrap();
         assert!(

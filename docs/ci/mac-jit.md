@@ -304,6 +304,21 @@ receipt fails closed and names this reseed command.
   parsed, never logged. Runner output stays in the root-owned
   `run/<name>/runner.log` on cloudmac.
 
+## Host test authorities
+
+The runner account has no sudo rights. Production target pruning requires an
+all-user `lsof` census and preserves artifacts when that census is denied.
+Its unit fixtures instead query real `lsof` as the invoking user: they own
+the private target directory and every process opening its files. This
+fixture scope exists only under `cfg(test)`; the CLI cannot select it.
+
+The listener starts through `setsid` and `setuid`, without a login into the
+runner user's launchd bootstrap session. Detached remote-accept jobs inherit
+an ignored SIGHUP from their spawning shell. They do not invoke Darwin's
+`nohup`, which additionally requires a launchd console-session detach before
+executing the requested command. Job startup errors go to the accept log;
+lock joining and exit publication still determine the lock's lifetime.
+
 ## Not claimed
 
 This is trusted-workflow infrastructure, not an adversarial isolation
