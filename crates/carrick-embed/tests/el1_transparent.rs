@@ -6,6 +6,7 @@
 mod common;
 
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use carrick_embed::{ContainerBuilder, read_el1_counters, reset_el1_counters};
 use carrick_image::PullPolicy;
@@ -13,6 +14,7 @@ use carrick_image::PullPolicy;
 #[test]
 fn el1_transparent_smoke() {
     let _guard = common::guest_lock();
+    let _watchdog = common::Watchdog::start(Duration::from_secs(90));
     reset_el1_counters();
 
     let result = common::run_or_fail(
@@ -37,6 +39,7 @@ fn el1_transparent_smoke() {
 #[test]
 fn el1_transparent_fork_exec_shared_backing() {
     let _guard = common::guest_lock();
+    let _watchdog = common::Watchdog::start(Duration::from_secs(90));
     reset_el1_counters();
 
     // A guest that forks a child that performs 5 writes, waits for it, then execs a program that writes.
