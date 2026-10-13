@@ -1996,6 +1996,18 @@ pub fn carrier_maintenance_ttbr(vmm: &HvfAarch64Vmm) -> Result<u64, TrapError> {
     Ok(vmm.state.carrier_maintenance_root()?.raw())
 }
 
+/// After a terminal entry, no task CPU snapshot is meaningful. Remove its
+/// exact stage-1 root from the idle worker vCPU before the root-slot owner can
+/// retire and reuse that physical slot.
+pub fn retire_terminal_resident_vcpu_root(
+    vmm: &HvfAarch64Vmm,
+    vcpu: &mut HvfAarch64Vcpu,
+) -> Result<(), TrapError> {
+    let neutral = carrier_maintenance_ttbr(vmm)?;
+    vcpu.set_sys_reg(SysReg::Ttbr0, neutral)?;
+    vcpu.set_sys_reg(SysReg::Ttbr1, neutral)
+}
+
 /// Service an exact-ASID generation on a loaded owner vCPU without detaching
 /// the task or reacquiring runtime page-table exclusion.
 pub fn invalidate_loaded_asid(engine: &mut HvfAarch64Engine, asid: u16) -> Result<(), TrapError> {
