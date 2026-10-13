@@ -125,14 +125,16 @@ pub(super) fn process_record_for_call(
 
 /// Admit only an exact published leader or thread-group member. The root
 /// address is checked by the shared owner against the zone's live MM grant.
+#[allow(clippy::too_many_arguments)]
 pub fn admit_entry(
     source: BornInZoneSource<'static, Aarch64ParkedContext>,
     task: &'static CurrentTask,
     native: carrick_sched_core::ThreadCtx,
     ttbr0: u64,
     record: RecordId,
+    page: &'static ThreadLifecyclePage,
+    control: &'static ThreadControlSlot,
 ) -> Result<(Arc<Runtime>, Mm, Aarch64ParkedContext), NativeProcessError> {
-    let (page, control) = task.lifecycle_refs().ok_or(NativeProcessError::Stale)?;
     // SAFETY: the EL1 caller owns the running slot and its record until the
     // process route returns to the vector.
     let observed = unsafe { observed_entry_address(source, task, ttbr0, record)? };
@@ -144,6 +146,7 @@ pub fn admit_entry(
                 page,
                 task.visible_pid().ok_or(NativeProcessError::Stale)?,
             )
+            .filter(|address| *address == observed)
             .ok_or(NativeProcessError::Stale)?
     } else {
         observed
@@ -161,11 +164,59 @@ pub fn admit_entry(
         let runtime = REGISTRY.register_thread(source, task, address, page, control)?;
         return Ok((runtime, address, words));
     }
+    if REGISTRY
+        .group_address(
+            source.zone,
+            address,
+            page,
+            task.visible_pid().ok_or(NativeProcessError::Stale)?,
+        )
+        .is_some()
+    {
+        let runtime = REGISTRY.rehome_root(source, task, address, page, control)?;
+        return Ok((runtime, address, words));
+    }
     let runtime = Arc::new(NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
         source, task, page, control, address, address, words,
     )?);
     REGISTRY.register_root(runtime.clone(), source, task, address)?;
     Ok((runtime, address, words))
+}
+
+/// The production ARM entry boundary, shared by the VM-free admission witness.
+/// The callback receives the exact native venue retained for this SVC.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
+    source: BornInZoneSource<'static, Aarch64ParkedContext>,
+    task: &'static CurrentTask,
+    native: carrick_sched_core::ThreadCtx,
+    ttbr0: u64,
+    page: &'static ThreadLifecyclePage,
+    control: &'static ThreadControlSlot,
+    service: &mut Aarch64NativeProcessService<'static, X>,
+    dispatch: impl FnOnce(
+        &mut dyn carrick_personality_linux::lifecycle::ProcessNative<Aarch64ParkedContext>,
+    ) -> R,
+) -> Result<R, NativeProcessError> {
+    let record = process_record_for_call(source, task, native, ttbr0)?;
+    let (runtime, address, words) =
+        admit_entry(source, task, native, ttbr0, record, page, control)?;
+    let (result, root_exit) = {
+        let mut process =
+            runtime.enter_registered(registry(), source, task, address, words, service)?;
+        let result = dispatch(&mut process);
+        (result, process.take_root_exit())
+    };
+    if let Some(status) = root_exit {
+        cross_root_exit(
+            &mut service.crossing,
+            task,
+            status,
+            u32::from(source.slot.raw()),
+        )?;
+    }
+    Ok(result)
 }
 
 /// Read the MM's root incarnation from the parked execution context. The

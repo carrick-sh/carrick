@@ -268,7 +268,10 @@ and its associated admission work. Today's main passes `process: None`;
 `Aarch64NativeProcessService` existing as a library type is not live adoption.
 Require authenticated root admission before the first setup syscall, native
 entry access to the retained signal resources, and correct imported thread
-membership for already-live records. Do not duplicate the adoption code,
+membership for already-live records. The admission sub-slice of
+[#322](https://github.com/carrick-sh/carrick/issues/322) binds these requirements
+in `process.native.arm-admission`; stock supply/completion and the narrowed
+signed COW fixture remain later sub-slices of that issue. Do not duplicate the adoption code,
 construct a signals-only second process graph or invent host rows for
 native children to make this design independently boot.
 

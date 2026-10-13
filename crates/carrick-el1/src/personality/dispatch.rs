@@ -229,132 +229,85 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
         #[cfg(target_arch = "aarch64")]
         let slot = SlotId::from_index(frame.slot as usize);
         #[cfg(target_arch = "aarch64")]
-        let process_call = arm_process_call_claimed(frame.x[8], frame.x[0], || {
-            slot.and_then(|slot| {
-                let lane = zone.slot(slot);
-                lane.current().or_else(|| lane.host_record())
-            })
-            .is_some_and(|record| {
-                super::aarch64_process::registry()
-                    .for_record(zone, zone.record_ref(record))
-                    .is_some()
-            })
-        });
-        #[cfg(target_arch = "aarch64")]
-        if process_call {
-            if let (Some(slot), Some(task)) = (slot, current_tasks.get(frame.slot as usize)) {
-                let source = carrick_el1_abi::BornInZoneSource { zone, slot };
-                let mut saved = carrick_el1_abi::Aarch64ParkedContext::ZERO;
-                sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
-                let ttbr0 = crate::isa::aarch64::hardware_live_ttbr();
-                let record = super::aarch64_process::process_record_for_call(
-                    source,
-                    task,
-                    saved.native,
-                    ttbr0,
-                );
-                if let Ok(record) = record
-                    && let Ok((runtime, address, words)) = super::aarch64_process::admit_entry(
-                        source,
-                        task,
-                        saved.native,
-                        ttbr0,
-                        record,
-                    )
-                {
-                    let mut service = match super::aarch64_process::Aarch64NativeProcessService::new(
-                        task, slot,
-                    ) {
-                        Ok(service) => service,
-                        Err(_) => return refuse_owner_process_call(frame, counters, current_tasks),
-                    };
-                    let action = {
-                        let mut process = match runtime.enter_registered(
-                            super::aarch64_process::registry(),
-                            source,
-                            task,
-                            address,
-                            words,
-                            &mut service,
-                        ) {
-                            Ok(process) => process,
-                            Err(_) => {
-                                return refuse_owner_process_call(frame, counters, current_tasks);
-                            }
-                        };
-                        let route = dispatch_syscall_with_native(
-                            frame,
-                            counters,
-                            current_tasks,
-                            fd_map,
-                            object_table,
-                            open_table,
-                            inotify_table,
-                            name_cache,
-                            Some(Zone {
-                                tables: zone,
-                                cpu: &mut sched::HardwareCpu,
-                                user: &sched::HardwareUserWord,
-                            }),
-                            ipc::guest_venue(frame.slot as u32).as_ref(),
-                            lifecycle::guest_venue(),
-                            Some(&mut process),
-                            Some(source),
-                            None,
-                            |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
-                        );
-                        let root_exit = process.take_root_exit();
-                        (route, root_exit)
-                    };
-                    if let Some(status) = action.1
-                        && super::aarch64_process::cross_root_exit(
-                            &mut service.crossing,
-                            task,
-                            status,
-                            u32::from(slot.raw()),
-                        )
-                        .is_err()
-                    {
-                        return refuse_owner_process_call(frame, counters, current_tasks);
+        {
+            let (Some(slot), Some(task)) = (slot, current_tasks.get(frame.slot as usize)) else {
+                return refuse_owner_process_call(frame, counters, current_tasks);
+            };
+            let Some((page, control)) = task.lifecycle_refs() else {
+                return refuse_owner_process_call(frame, counters, current_tasks);
+            };
+            let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
+            sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
+            let ttbr0 = crate::isa::aarch64::hardware_live_ttbr();
+            let mut service =
+                match super::aarch64_process::Aarch64NativeProcessService::new(task, slot) {
+                    Ok(service) => service,
+                    Err(_) => return refuse_owner_process_call(frame, counters, current_tasks),
+                };
+            let route = dispatch_arm_syscall_with_native_process(
+                frame,
+                counters,
+                current_tasks,
+                fd_map,
+                object_table,
+                open_table,
+                inotify_table,
+                name_cache,
+                Some(Zone {
+                    tables: zone,
+                    cpu: &mut sched::HardwareCpu,
+                    user: &sched::HardwareUserWord,
+                }),
+                ipc::guest_venue(frame.slot as u32).as_ref(),
+                lifecycle::guest_venue(),
+                page,
+                control,
+                saved.native,
+                ttbr0,
+                &mut service,
+                |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
+            );
+            match route {
+                Ok(route) => match route {
+                    carrick_personality_linux::dispatch::CompletionRoute::Served => Action::Served,
+                    carrick_personality_linux::dispatch::CompletionRoute::WithWork => {
+                        Action::ServedWithWork
                     }
-                    return match action.0 {
-                        carrick_personality_linux::dispatch::CompletionRoute::Served => {
-                            Action::Served
-                        }
-                        carrick_personality_linux::dispatch::CompletionRoute::WithWork => {
-                            Action::ServedWithWork
-                        }
-                        carrick_personality_linux::dispatch::CompletionRoute::Suspended => {
-                            Action::Idle
-                        }
-                        carrick_personality_linux::dispatch::CompletionRoute::Forward => {
+                    carrick_personality_linux::dispatch::CompletionRoute::Suspended => Action::Idle,
+                    carrick_personality_linux::dispatch::CompletionRoute::Forward => {
+                        if arm_process_call_claimed(frame.x[8], frame.x[0], || true) {
                             refuse_owner_process_call(frame, counters, current_tasks)
+                        } else {
+                            Action::Forward
                         }
-                        carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion => {
-                            invalid_completion(NativeInvariant::EntryBinding)
-                        }
-                    };
-                }
+                    }
+                    carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion => {
+                        invalid_completion(NativeInvariant::EntryBinding)
+                    }
+                },
+                Err(_) => refuse_owner_process_call(frame, counters, current_tasks),
             }
-            return refuse_owner_process_call(frame, counters, current_tasks);
         }
-        dispatch_syscall_with_ipc(
-            frame,
-            counters,
-            current_tasks,
-            fd_map,
-            object_table,
-            open_table,
-            inotify_table,
-            name_cache,
-            Some(Zone {
-                tables: zone,
-                cpu: &mut sched::HardwareCpu,
-                user: &sched::HardwareUserWord,
-            }),
-            ipc::guest_venue(frame.slot as u32).as_ref(),
-            |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
-        )
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            dispatch_syscall_with_ipc(
+                frame,
+                counters,
+                current_tasks,
+                fd_map,
+                object_table,
+                open_table,
+                inotify_table,
+                name_cache,
+                Some(Zone {
+                    tables: zone,
+                    cpu: &mut sched::HardwareCpu,
+                    user: &sched::HardwareUserWord,
+                }),
+                ipc::guest_venue(frame.slot as u32).as_ref(),
+                |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
+            )
+        }
     }
     #[cfg(not(target_os = "none"))]
     {
@@ -383,8 +336,78 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
     }
 }
 
+/// Production ARM admission and the single process capability passed to the
+/// shared Linux pipeline. The VM-free witness calls this exact adapter.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-fn arm_process_call_claimed(nr: u64, flags: u64, registered: impl FnOnce() -> bool) -> bool {
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dispatch_arm_syscall_with_native_process<F, C, U, X>(
+    frame: &mut TrapFrame,
+    counters: &Counters,
+    current_tasks: &'static [CurrentTask],
+    fd_map: &[FdMapSlot],
+    object_table: &[DelegatedFile],
+    open_table: &[DelegatedOpenFile],
+    inotify_table: &[DelegatedInotify],
+    name_cache: &InotifyNameCache,
+    zone: Option<Zone<'_, C, U>>,
+    ipc: Option<&ipc::IpcVenue<'_>>,
+    lifecycle: Option<&dyn lifecycle::LifecycleVenue>,
+    page: &'static carrick_el1_abi::ThreadLifecyclePage,
+    control: &'static carrick_el1_abi::ThreadControlSlot,
+    native: carrick_sched_core::ThreadCtx,
+    ttbr0: u64,
+    service: &mut super::aarch64_process::Aarch64NativeProcessService<'static, X>,
+    cache_lookup: F,
+) -> Result<
+    carrick_personality_linux::dispatch::CompletionRoute,
+    super::native_process_runtime::NativeProcessError,
+>
+where
+    F: Fn(u32) -> *mut u8,
+    C: sched::ThreadCpu,
+    U: sched::UserWord,
+    X: super::aarch64_process::ForkStockCrossing,
+{
+    let source = carrick_el1_abi::BornInZoneSource {
+        zone: service.zone,
+        slot: service.slot,
+    };
+    super::aarch64_process::with_process_entry(
+        source,
+        service.task,
+        native,
+        ttbr0,
+        page,
+        control,
+        service,
+        |process| {
+            dispatch_syscall_with_native(
+                frame,
+                counters,
+                current_tasks,
+                fd_map,
+                object_table,
+                open_table,
+                inotify_table,
+                name_cache,
+                zone,
+                ipc,
+                lifecycle,
+                Some(process),
+                Some(source),
+                None,
+                cache_lookup,
+            )
+        },
+    )
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(super) fn arm_process_call_claimed(
+    nr: u64,
+    flags: u64,
+    registered: impl FnOnce() -> bool,
+) -> bool {
     nr == 435
         || (nr == 220 && flags & 0x0001_0000 == 0)
         || (matches!(nr, 260 | 93 | 94 | 95 | 58) && registered())
