@@ -31,7 +31,7 @@ use carrick_kernel::el1_zone::HostLockWait;
 
 pub(super) enum OwnerMemoryAction {
     Syscall(carrick_hal::RawSyscall),
-    Terminal,
+    Retained,
 }
 
 thread_local! {
@@ -647,13 +647,13 @@ where
         self.park_owner_memory_action(engine, control, OwnerMemoryAction::Syscall(frame), wait)
     }
 
-    pub(super) fn park_retained_terminal_owner(
+    pub(super) fn park_retained_memory_owner(
         &mut self,
         engine: &mut E,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         wait: carrick_el1_abi::PortalOwnerWait,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
-        self.park_owner_memory_action(engine, control, OwnerMemoryAction::Terminal, wait)
+        self.park_owner_memory_action(engine, control, OwnerMemoryAction::Retained, wait)
     }
 
     pub(super) fn park_owner_memory_action(
@@ -695,7 +695,7 @@ where
                     .request;
                 Some((state, ctx, request))
             }
-            OwnerMemoryAction::Terminal => None,
+            OwnerMemoryAction::Retained => None,
         };
         let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
             RuntimeError::Configuration("owner wait lost its Kernel context".to_owned())
@@ -750,20 +750,20 @@ where
                         self.phase = HvpatchProductionPhase::ResumeOwnerZone { frame };
                         Ok(exit)
                     }
-                    (OwnerMemoryAction::Terminal, None) => {
+                    (OwnerMemoryAction::Retained, None) => {
                         let wait = carrick_kernel::kernel::continuation::ZoneWait::new(
                             zone.record_ref(record),
                             seq,
                         );
-                        let continuation = carrick_kernel::kernel::continuation::BlockedContinuation::from_terminal_zone_park(
+                        let continuation = carrick_kernel::kernel::continuation::BlockedContinuation::from_retained_memory_zone_park(
                             context,
                             control.execution_lease_mut().map_err(RuntimeError::Trap)?,
                             wait,
                         ).map_err(|error| RuntimeError::Configuration(error.to_string()))?;
                         // The ordinary CPU save remains authoritative. A terminal
                         // action has no syscall continuation for ZoneSave to fold.
-                        let action = self.take_terminal_memory_action()?;
-                        self.phase = HvpatchProductionPhase::ResumeTerminalOwner {
+                        let action = self.take_retained_memory_action()?;
+                        self.phase = HvpatchProductionPhase::ResumeRetainedOwner {
                             action: Box::new(action),
                         };
                         Ok(self.suspend(
@@ -794,9 +794,9 @@ where
                         )?;
                         self.service_outcome(engine, control, frame, outcome)
                     }
-                    OwnerMemoryAction::Terminal => {
-                        let action = self.take_terminal_memory_action()?;
-                        self.drive_terminal_memory(engine, control, action)
+                    OwnerMemoryAction::Retained => {
+                        let action = self.take_retained_memory_action()?;
+                        self.drive_retained_memory(engine, control, action)
                     }
                 }
             }

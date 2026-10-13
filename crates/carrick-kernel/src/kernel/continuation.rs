@@ -182,12 +182,12 @@ impl SyscallFrame {
     }
 }
 
-/// The boundary that owns a wait. Terminal work has no guest return frame.
+/// The boundary that owns a wait. Retained memory work has no return frame.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ContinuationOrigin {
     Syscall(SyscallFrame),
     HostReadiness,
-    ChildTidClear,
+    RetainedMemory,
 }
 
 #[derive(Debug)]
@@ -421,12 +421,12 @@ impl ContinuationAuthority {
     pub const fn syscall(&self) -> Option<SyscallFrame> {
         match self.origin {
             ContinuationOrigin::Syscall(frame) => Some(frame),
-            ContinuationOrigin::HostReadiness | ContinuationOrigin::ChildTidClear => None,
+            ContinuationOrigin::HostReadiness | ContinuationOrigin::RetainedMemory => None,
         }
     }
 
-    pub const fn is_terminal_action(&self) -> bool {
-        matches!(self.origin, ContinuationOrigin::ChildTidClear)
+    pub const fn is_retained_memory_action(&self) -> bool {
+        matches!(self.origin, ContinuationOrigin::RetainedMemory)
     }
 
     pub const fn restart_class(&self) -> RestartClass {
@@ -1667,9 +1667,9 @@ impl BlockedContinuation {
         })
     }
 
-    /// Retain a non-returning clear-child-tid action on the same exact zone
-    /// wait service. No syscall request, guest output, or restart is invented.
-    pub fn from_terminal_zone_park(
+    /// Retain child TID publication or clearing on the exact zone wait service.
+    /// No syscall request, guest output, or restart is invented.
+    pub fn from_retained_memory_zone_park(
         context: &KernelContext,
         lease: &crate::kernel::objects::ThreadExecutionLease,
         wait: ZoneWait,
@@ -1677,7 +1677,7 @@ impl BlockedContinuation {
         let capture = ContinuationCapture::capture_lease(
             context,
             lease,
-            ContinuationOrigin::ChildTidClear,
+            ContinuationOrigin::RetainedMemory,
             RestartClass::Never,
         )?;
         Ok(Self::from_zone_park(capture, wait, None))
@@ -2283,10 +2283,10 @@ impl BlockedContinuation {
         } else {
             event
         };
-        let outcome = if self.authority().is_terminal_action() {
+        let outcome = if self.authority().is_retained_memory_action() {
             // A notification makes the retained action eligible to prepare
-            // again. Even a raced signal cannot synthesize an exit return.
-            ContinuationCompletion::ResumeTerminalAction
+            // again. Even a raced signal cannot synthesize a guest return.
+            ContinuationCompletion::ResumeRetainedMemory
         } else if !completed && self.interrupted_by_group_stop(context.task()) {
             ContinuationCompletion::Errno(LINUX_EINTR)
         } else {
@@ -2711,7 +2711,7 @@ impl ContinuationEvent {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContinuationCompletion {
-    ResumeTerminalAction,
+    ResumeRetainedMemory,
     Return(i64),
     Errno(LinuxErrno),
     Redispatch,
@@ -2835,7 +2835,7 @@ pub fn fold_continuation_completion<M: CurrentMmMemory>(
     memory: &mut M,
 ) -> Result<Option<DispatchOutcome>, MemoryError> {
     Ok(match completion {
-        ContinuationCompletion::ResumeTerminalAction => return Err(MemoryError::Unsupported),
+        ContinuationCompletion::ResumeRetainedMemory => return Err(MemoryError::Unsupported),
         ContinuationCompletion::Return(value) => Some(DispatchOutcome::Returned { value }),
         ContinuationCompletion::Errno(errno) => Some(DispatchOutcome::Errno { errno }),
         ContinuationCompletion::Redispatch => None,

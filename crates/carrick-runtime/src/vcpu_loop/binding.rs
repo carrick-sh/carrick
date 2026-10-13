@@ -275,14 +275,14 @@ pub(super) enum HvpatchProductionPhase {
     ResumeOwnerZone {
         frame: carrick_hal::RawSyscall,
     },
-    ResumeTerminalOwner {
-        action: Box<TerminalMemoryAction>,
+    ResumeRetainedOwner {
+        action: Box<RetainedMemoryAction>,
     },
-    TerminalMemoryRetry {
-        action: Box<TerminalMemoryAction>,
+    RetainedMemoryRetry {
+        action: Box<RetainedMemoryAction>,
     },
-    ResumeTerminalPhysical {
-        action: Box<TerminalMemoryAction>,
+    ResumeRetainedPhysical {
+        action: Box<RetainedMemoryAction>,
         wait: carrick_guest_mem::OwnedMemoryWait,
         _subscription: Box<dyn std::fmt::Debug + Send + Sync>,
     },
@@ -321,7 +321,13 @@ pub(super) enum HvpatchProductionPhase {
     Complete,
 }
 
-pub(super) enum TerminalMemoryAction {
+pub(super) enum RetainedMemoryAction {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    ChildTid {
+        context: carrick_kernel::kernel::KernelContext,
+        address: carrick_guest_mem::GuestVa,
+        tid: i32,
+    },
     ThreadExit {
         code: i32,
     },
@@ -335,9 +341,9 @@ pub(super) enum TerminalMemoryAction {
     },
 }
 
-impl TerminalMemoryAction {
+impl RetainedMemoryAction {
     fn is_drain_owner(&self) -> bool {
-        !matches!(self, Self::ThreadExit { .. })
+        matches!(self, Self::ExecDrain { .. } | Self::ProcessFinish { .. })
     }
 }
 
@@ -415,9 +421,9 @@ pub(crate) fn registration_wake_callback(
 
 impl HvpatchProductionPhase {
     fn is_terminal_transition(&self) -> bool {
-        if let Self::ResumeTerminalOwner { action }
-        | Self::ResumeTerminalPhysical { action, .. }
-        | Self::TerminalMemoryRetry { action } = self
+        if let Self::ResumeRetainedOwner { action }
+        | Self::ResumeRetainedPhysical { action, .. }
+        | Self::RetainedMemoryRetry { action } = self
         {
             return action.is_drain_owner();
         }
@@ -454,9 +460,9 @@ impl HvpatchProductionPhase {
             Self::BootstrapThreadChild => 13,
             Self::ResumeZone | Self::ResumeOwnerZone { .. } => 14,
             Self::ResumeOwnerPhysical { .. } => 18,
-            Self::ResumeTerminalOwner { .. } => 19,
-            Self::ResumeTerminalPhysical { .. } => 20,
-            Self::TerminalMemoryRetry { .. } => 21,
+            Self::ResumeRetainedOwner { .. } => 19,
+            Self::ResumeRetainedPhysical { .. } => 20,
+            Self::RetainedMemoryRetry { .. } => 21,
             Self::ResumeFaultPhysical { .. } => 22,
         }
     }
@@ -709,10 +715,10 @@ where
                     }
                 };
                 if owner.is_ready() {
-                    self.drive_terminal_memory(
+                    self.drive_retained_memory(
                         engine,
                         control,
-                        TerminalMemoryAction::ExecDrain {
+                        RetainedMemoryAction::ExecDrain {
                             context,
                             owner: Box::new(owner),
                         },
@@ -1078,6 +1084,11 @@ where
                 // `cpython-importlib` wedge left one zombie at `127 << 8` and
                 // an unattributable error on stderr, so which Linux process
                 // carrick killed had to be inferred from the wait status.
+                crate::probes::hvpatch_terminal_error(
+                    process.pid(),
+                    terminal_context.thread().key().tid.raw(),
+                    error,
+                );
                 tracing::error!(
                     guest_pid = process.pid(),
                     %error,
@@ -1188,14 +1199,14 @@ where
             Err(carrick_kernel::kernel::KernelOperationError::TaskBusy(_)) => {
                 drop(topology);
                 drop(owner_set_edit);
-                let action = TerminalMemoryAction::ProcessFinish {
+                let action = RetainedMemoryAction::ProcessFinish {
                     context: terminal_context.retain_exact(),
                     terminal,
                 };
                 return Ok(self.park_thread_exit_retry(
                     &terminal_context,
                     epoch,
-                    HvpatchProductionPhase::TerminalMemoryRetry {
+                    HvpatchProductionPhase::RetainedMemoryRetry {
                         action: Box::new(action),
                     },
                 ));
@@ -1222,10 +1233,10 @@ where
                     // before parking. Keep only exact clear/terminal custody.
                     drop(topology);
                     drop(owner_set_edit);
-                    return self.wait_for_terminal_memory(
+                    return self.wait_for_retained_memory(
                         engine,
                         control,
-                        TerminalMemoryAction::ProcessFinish {
+                        RetainedMemoryAction::ProcessFinish {
                             context: terminal_context,
                             terminal,
                         },
@@ -1402,11 +1413,11 @@ where
         self.settle_persistent_thread_exit(engine, control, code, context, disposition)
     }
 
-    pub(super) fn take_terminal_memory_action(
+    pub(super) fn take_retained_memory_action(
         &mut self,
-    ) -> Result<TerminalMemoryAction, RuntimeError> {
+    ) -> Result<RetainedMemoryAction, RuntimeError> {
         match std::mem::replace(&mut self.phase, HvpatchProductionPhase::Resident) {
-            HvpatchProductionPhase::TerminalMemoryRetry { action } => Ok(*action),
+            HvpatchProductionPhase::RetainedMemoryRetry { action } => Ok(*action),
             other => {
                 self.phase = other;
                 Err(RuntimeError::Configuration(
@@ -1416,37 +1427,76 @@ where
         }
     }
 
-    pub(super) fn drive_terminal_memory(
+    pub(super) fn drive_retained_memory(
         &mut self,
         engine: &mut E,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
-        action: TerminalMemoryAction,
+        action: RetainedMemoryAction,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
-        if let TerminalMemoryAction::ThreadExit { code } = action {
+        if let RetainedMemoryAction::ThreadExit { code } = action {
             return self.drive_thread_exit(engine, control, code);
         }
-        self.phase = HvpatchProductionPhase::TerminalMemoryRetry {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let RetainedMemoryAction::ChildTid {
+            context,
+            address,
+            tid,
+        } = action
+        {
+            let current = self.state.service_kernel_context.as_ref().ok_or_else(|| {
+                RuntimeError::Configuration("child TID lost its exact context".into())
+            })?;
+            if current.thread().key() != context.thread().key()
+                || current.task().key() != context.task().key()
+                || current.shared().mm().id() != context.shared().mm().id()
+            {
+                return Err(
+                    RuntimeError::Configuration("child TID changed incarnation".into()).into(),
+                );
+            }
+            if let Some(error) =
+                bootstrap_hvpatch_process_child_tid(context.task(), engine, address.raw(), tid)?
+            {
+                return self.wait_for_retained_memory(
+                    engine,
+                    control,
+                    RetainedMemoryAction::ChildTid {
+                        context,
+                        address,
+                        tid,
+                    },
+                    error,
+                );
+            }
+            self.state
+                .complete_precompleted_child(&self.kernel.reporter, 0)?;
+            self.phase = HvpatchProductionPhase::Resident;
+            return Ok(executor::ExecutorExit::Syscall);
+        }
+        self.phase = HvpatchProductionPhase::RetainedMemoryRetry {
             action: Box::new(action),
         };
-        let result = self.drive_retained_terminal_memory(engine, control);
+        let result = self.drive_owned_memory_action(engine, control);
         self.route_poll_result(result)
     }
 
-    fn drive_retained_terminal_memory(
+    fn drive_owned_memory_action(
         &mut self,
         engine: &mut E,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
-        let HvpatchProductionPhase::TerminalMemoryRetry { action } = &self.phase else {
+        let HvpatchProductionPhase::RetainedMemoryRetry { action } = &self.phase else {
             return Err(RuntimeError::Configuration(
                 "terminal memory driver lost action".to_owned(),
             )
             .into());
         };
         let saved = match action.as_ref() {
-            TerminalMemoryAction::ExecDrain { context, .. }
-            | TerminalMemoryAction::ProcessFinish { context, .. } => context,
-            TerminalMemoryAction::ThreadExit { .. } => {
+            RetainedMemoryAction::ExecDrain { context, .. }
+            | RetainedMemoryAction::ProcessFinish { context, .. } => context,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            RetainedMemoryAction::ChildTid { .. } => unreachable!("child TID handled before drain"),
+            RetainedMemoryAction::ThreadExit { .. } => {
                 return Err(RuntimeError::Configuration(
                     "terminal memory driver received thread exit".to_owned(),
                 )
@@ -1473,16 +1523,16 @@ where
         if let Err(disposition) = self.state.drain_child_tid_clears(&self.kernel, engine) {
             return match disposition {
                 threads::PersistentThreadExitDisposition::Memory(error) => {
-                    let action = self.take_terminal_memory_action()?;
-                    self.wait_for_terminal_memory(engine, control, action, error)
+                    let action = self.take_retained_memory_action()?;
+                    self.wait_for_retained_memory(engine, control, action, error)
                 }
                 threads::PersistentThreadExitDisposition::Busy { observed_epoch } => {
                     let context = current.retain_exact();
-                    let action = self.take_terminal_memory_action()?;
+                    let action = self.take_retained_memory_action()?;
                     Ok(self.park_thread_exit_retry(
                         &context,
                         observed_epoch,
-                        HvpatchProductionPhase::TerminalMemoryRetry {
+                        HvpatchProductionPhase::RetainedMemoryRetry {
                             action: Box::new(action),
                         },
                     ))
@@ -1494,8 +1544,8 @@ where
                 ),
             };
         }
-        match self.take_terminal_memory_action()? {
-            TerminalMemoryAction::ExecDrain { context: _, owner } => {
+        match self.take_retained_memory_action()? {
+            RetainedMemoryAction::ExecDrain { context: _, owner } => {
                 let finished = self
                     .state
                     .finish_prepared_execve_drain(&self.kernel, engine, &self.completion, *owner)
@@ -1503,7 +1553,7 @@ where
                 self.state.finish_child_tid_drain();
                 self.finish_exec_suffix(engine, control, finished)
             }
-            TerminalMemoryAction::ProcessFinish { context, terminal } => self
+            RetainedMemoryAction::ProcessFinish { context, terminal } => self
                 .finalize_persistent_process_terminal(engine, control, context, terminal)
                 .map_err(|error| match error {
                     ProductionHvpatchPollError::Runtime(error) => {
@@ -1511,28 +1561,30 @@ where
                     }
                     other => other,
                 }),
-            TerminalMemoryAction::ThreadExit { .. } => Err(RuntimeError::Configuration(
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            RetainedMemoryAction::ChildTid { .. } => unreachable!("child TID handled before drain"),
+            RetainedMemoryAction::ThreadExit { .. } => Err(RuntimeError::Configuration(
                 "drain changed into a thread exit".to_owned(),
             )
             .into()),
         }
     }
 
-    fn wait_for_terminal_memory(
+    fn wait_for_retained_memory(
         &mut self,
         engine: &mut E,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
-        action: TerminalMemoryAction,
+        action: RetainedMemoryAction,
         error: carrick_guest_mem::MemoryPrepareError,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
-        self.phase = HvpatchProductionPhase::TerminalMemoryRetry {
+        self.phase = HvpatchProductionPhase::RetainedMemoryRetry {
             action: Box::new(action),
         };
-        let result = self.wait_for_retained_terminal_memory(engine, control, error);
+        let result = self.wait_for_owned_memory_action(engine, control, error);
         self.route_poll_result(result)
     }
 
-    fn wait_for_retained_terminal_memory(
+    fn wait_for_owned_memory_action(
         &mut self,
         engine: &mut E,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
@@ -1541,7 +1593,7 @@ where
         use carrick_guest_mem::MemoryPrepareError;
         match error {
             MemoryPrepareError::OwnerWait(wait) => {
-                self.park_retained_terminal_owner(engine, control, wait)
+                self.park_retained_memory_owner(engine, control, wait)
             }
             MemoryPrepareError::Supply(request) => {
                 if let Some(wait) = self.supply_owner_memory(engine, request)? {
@@ -1549,10 +1601,10 @@ where
                         OwnerSupplyWait::Owner(wait) => MemoryPrepareError::OwnerWait(wait),
                         OwnerSupplyWait::Physical(wait) => MemoryPrepareError::Physical(wait),
                     };
-                    return self.wait_for_retained_terminal_memory(engine, control, wait);
+                    return self.wait_for_owned_memory_action(engine, control, wait);
                 }
-                let action = self.take_terminal_memory_action()?;
-                self.drive_terminal_memory(engine, control, action)
+                let action = self.take_retained_memory_action()?;
+                self.drive_retained_memory(engine, control, action)
             }
             MemoryPrepareError::Physical(wait) => {
                 let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
@@ -1567,12 +1619,12 @@ where
                     context.thread().key(),
                     false,
                 ));
-                let action = self.take_terminal_memory_action()?;
+                let action = self.take_retained_memory_action()?;
                 if ready || wait.0.is_ready() {
                     drop(subscription);
-                    return self.drive_terminal_memory(engine, control, action);
+                    return self.drive_retained_memory(engine, control, action);
                 }
-                self.phase = HvpatchProductionPhase::ResumeTerminalPhysical {
+                self.phase = HvpatchProductionPhase::ResumeRetainedPhysical {
                     action: Box::new(action),
                     wait,
                     _subscription: subscription,
@@ -1608,10 +1660,10 @@ where
         Ok(match disposition {
             threads::PersistentThreadExitDisposition::Failed(error) => return Err(error.into()),
             threads::PersistentThreadExitDisposition::Memory(error) => {
-                return self.wait_for_terminal_memory(
+                return self.wait_for_retained_memory(
                     engine,
                     control,
-                    TerminalMemoryAction::ThreadExit { code },
+                    RetainedMemoryAction::ThreadExit { code },
                     error,
                 );
             }
@@ -1907,8 +1959,8 @@ where
                         "publish persistent process physical retirement failed: {failure}"
                     );
                 });
-            self.phase = HvpatchProductionPhase::TerminalMemoryRetry {
-                action: Box::new(TerminalMemoryAction::ProcessFinish { context, terminal }),
+            self.phase = HvpatchProductionPhase::RetainedMemoryRetry {
+                action: Box::new(RetainedMemoryAction::ProcessFinish { context, terminal }),
             };
             return self.suspend(
                 HvpatchLoopSuspension::TerminalSiblingDrain,
@@ -3466,10 +3518,10 @@ where
                             }
                         };
                         if owner.is_ready() {
-                            return self.drive_terminal_memory(
+                            return self.drive_retained_memory(
                                 engine,
                                 control,
-                                TerminalMemoryAction::ExecDrain {
+                                RetainedMemoryAction::ExecDrain {
                                     context,
                                     owner: Box::new(owner),
                                 },
@@ -4296,12 +4348,32 @@ where
                 }
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 HvpatchProductionPhase::BootstrapProcessChild(bootstrap) => {
-                    bootstrap_hvpatch_process_child(
-                        &self.kernel,
-                        &mut self.state,
-                        engine,
-                        bootstrap,
-                    )?;
+                    if let ProcessChildBootstrapReady::ChildTid { address, tid } =
+                        bootstrap_hvpatch_process_child(
+                            &self.kernel,
+                            &mut self.state,
+                            engine,
+                            bootstrap,
+                        )?
+                    {
+                        let context = self
+                            .state
+                            .service_kernel_context
+                            .as_ref()
+                            .ok_or_else(|| {
+                                RuntimeError::Configuration("child bootstrap lost context".into())
+                            })?
+                            .retain_exact();
+                        return self.drive_retained_memory(
+                            engine,
+                            control,
+                            RetainedMemoryAction::ChildTid {
+                                context,
+                                address,
+                                tid,
+                            },
+                        );
+                    }
                     if let Some(work) = self.kernel.take_external_exec_work() {
                         self.external_exec = Some(work);
                         return self.start_external_exec(engine, control);
@@ -4436,26 +4508,26 @@ where
                     self.state.thread_exit_retry_subscription = None;
                     return self.drive_thread_exit(engine, control, code);
                 }
-                HvpatchProductionPhase::TerminalMemoryRetry { action } => {
+                HvpatchProductionPhase::RetainedMemoryRetry { action } => {
                     self.state.thread_exit_retry_subscription = None;
-                    return self.drive_terminal_memory(engine, control, *action);
+                    return self.drive_retained_memory(engine, control, *action);
                 }
-                HvpatchProductionPhase::ResumeTerminalOwner { action } => {
-                    self.phase = HvpatchProductionPhase::TerminalMemoryRetry { action };
+                HvpatchProductionPhase::ResumeRetainedOwner { action } => {
+                    self.phase = HvpatchProductionPhase::RetainedMemoryRetry { action };
                     let result = self.consume_owner_zone(control)?;
-                    if !matches!(result.completion, carrick_kernel::kernel::continuation::ContinuationCompletion::ResumeTerminalAction) {
+                    if !matches!(result.completion, carrick_kernel::kernel::continuation::ContinuationCompletion::ResumeRetainedMemory) {
                         return Err(RuntimeError::Configuration("clear-child-tid resumed as a syscall".to_owned()).into());
                     }
-                    let action = self.take_terminal_memory_action()?;
-                    return self.drive_terminal_memory(engine, control, action);
+                    let action = self.take_retained_memory_action()?;
+                    return self.drive_retained_memory(engine, control, action);
                 }
-                HvpatchProductionPhase::ResumeTerminalPhysical {
+                HvpatchProductionPhase::ResumeRetainedPhysical {
                     action,
                     wait,
                     _subscription,
                 } => {
                     if !wait.0.is_ready() {
-                        self.phase = HvpatchProductionPhase::ResumeTerminalPhysical {
+                        self.phase = HvpatchProductionPhase::ResumeRetainedPhysical {
                             action,
                             wait,
                             _subscription,
@@ -4468,7 +4540,7 @@ where
                         ));
                     }
                     drop(_subscription);
-                    return self.drive_terminal_memory(engine, control, *action);
+                    return self.drive_retained_memory(engine, control, *action);
                 }
                 HvpatchProductionPhase::ResumeBlocked {
                     frame,
@@ -4538,10 +4610,10 @@ where
                             ),
                         ));
                     }
-                    return self.drive_terminal_memory(
+                    return self.drive_retained_memory(
                         engine,
                         control,
-                        TerminalMemoryAction::ExecDrain { context, owner },
+                        RetainedMemoryAction::ExecDrain { context, owner },
                     );
                 }
                 HvpatchProductionPhase::TerminalProcessDrain {
@@ -4568,10 +4640,10 @@ where
                     self.kernel
                         .process_physical_retirement
                         .publish(completions)?;
-                    return self.drive_terminal_memory(
+                    return self.drive_retained_memory(
                         engine,
                         control,
-                        TerminalMemoryAction::ProcessFinish { context, terminal },
+                        RetainedMemoryAction::ProcessFinish { context, terminal },
                     );
                 }
                 HvpatchProductionPhase::TerminalClaimRetry {
@@ -4588,10 +4660,10 @@ where
                     _subscription,
                 } => {
                     drop(_subscription);
-                    return self.drive_terminal_memory(
+                    return self.drive_retained_memory(
                         engine,
                         control,
-                        TerminalMemoryAction::ProcessFinish { context, terminal },
+                        RetainedMemoryAction::ProcessFinish { context, terminal },
                     );
                 }
                 HvpatchProductionPhase::Resident => {}
@@ -5245,10 +5317,10 @@ where
                         HvpatchProductionPhase::TerminalProcessDrain { .. }
                             | HvpatchProductionPhase::TerminalRetireRetry { .. }
                     ) || matches!(&self.phase,
-                            HvpatchProductionPhase::TerminalMemoryRetry { action }
-                            | HvpatchProductionPhase::ResumeTerminalOwner { action }
-                            | HvpatchProductionPhase::ResumeTerminalPhysical { action, .. }
-                            if matches!(action.as_ref(), TerminalMemoryAction::ProcessFinish { .. })) =>
+                            HvpatchProductionPhase::RetainedMemoryRetry { action }
+                            | HvpatchProductionPhase::ResumeRetainedOwner { action }
+                            | HvpatchProductionPhase::ResumeRetainedPhysical { action, .. }
+                            if matches!(action.as_ref(), RetainedMemoryAction::ProcessFinish { .. })) =>
                     {
                         Err(ProductionHvpatchPollError::TerminalOwner(error))
                     }
@@ -5274,12 +5346,12 @@ where
                     handoff,
                 })
             }
-            HvpatchProductionPhase::TerminalMemoryRetry { action }
-            | HvpatchProductionPhase::ResumeTerminalOwner { action }
-            | HvpatchProductionPhase::ResumeTerminalPhysical { action, .. }
-                if matches!(action.as_ref(), TerminalMemoryAction::ExecDrain { .. }) =>
+            HvpatchProductionPhase::RetainedMemoryRetry { action }
+            | HvpatchProductionPhase::ResumeRetainedOwner { action }
+            | HvpatchProductionPhase::ResumeRetainedPhysical { action, .. }
+                if matches!(action.as_ref(), RetainedMemoryAction::ExecDrain { .. }) =>
             {
-                let TerminalMemoryAction::ExecDrain { owner, .. } = *action else {
+                let RetainedMemoryAction::ExecDrain { owner, .. } = *action else {
                     return None;
                 };
                 let (context, handoff) = (*owner).into_terminal_authority();

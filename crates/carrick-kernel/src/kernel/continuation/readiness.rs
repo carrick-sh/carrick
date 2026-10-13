@@ -469,7 +469,7 @@ impl SignalReadinessProbe {
             _ => state.authority.task_wake_generation,
         };
         Self {
-            terminal_action: state.authority.is_terminal_action(),
+            terminal_action: state.authority.is_retained_memory_action(),
             kernel: state.authority.kernel.clone(),
             host_signal: Arc::clone(&state.authority.host_signal),
             task_ref: state.authority.task_ref.clone(),
