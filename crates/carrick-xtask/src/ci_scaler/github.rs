@@ -3,7 +3,7 @@
 use super::*;
 use serde_json::{Value, json};
 
-const MERGE_QUEUE_QUERY: &str = "query { repository(owner: \"carrick-sh\", name: \"carrick\") { mergeQueue(branch: \"main\") { entries(first: 100) { nodes { position headCommit { oid } pullRequest { number headRepository { nameWithOwner } } } } } } }";
+const MERGE_QUEUE_QUERY: &str = "query { repository(owner: \"carrick-sh\", name: \"carrick\") { mergeQueue(branch: \"main\") { entries(first: 100) { pageInfo { hasNextPage } nodes { position headCommit { oid } pullRequest { number headRepository { nameWithOwner } } } } } } }";
 
 pub(super) struct Github;
 impl Github {
@@ -26,7 +26,9 @@ impl Github {
             vec![]
         };
         let output = execute(&mut cmd, &input, Duration::from_secs(60))?;
-        if method == "DELETE" {
+        if method == "DELETE"
+            || (method == "POST" && endpoint.ends_with("/cancel") && output.is_empty())
+        {
             return Ok(Value::Null);
         }
         Ok(serde_json::from_slice(&output)?)
@@ -67,6 +69,24 @@ impl Github {
         admission: &Admission,
         labels: &[&str],
     ) -> Result<Vec<JobKey>, ScalerError> {
+        let mut demand: Vec<_> = self
+            .queued_demand(admission, labels)?
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        demand.sort_by_key(|key| key.job.0);
+        demand.dedup();
+        Ok(demand)
+    }
+    /// Retain the admitted event for cloudmac scheduling; no wider admission.
+    pub(super) fn mac_demand(&self) -> Result<Vec<(JobKey, String)>, ScalerError> {
+        self.queued_demand(&Admission::Standing, &HVF_LABELS)
+    }
+    fn queued_demand(
+        &self,
+        admission: &Admission,
+        labels: &[&str],
+    ) -> Result<Vec<(JobKey, String)>, ScalerError> {
         let mut demand = Vec::new();
         for status in ["queued", "in_progress"] {
             for run in self.workflow_runs(admission, status)? {
@@ -81,19 +101,29 @@ impl Github {
                         .filter_map(Value::as_str)
                         .collect();
                     if job["status"] == "queued" && labels_match(labels, &job_labels) {
-                        demand.push(JobKey {
-                            run: RunId(run["id"].as_u64().ok_or(ScalerError::External("run id"))?),
-                            attempt: run["run_attempt"]
-                                .as_u64()
-                                .and_then(|n| u32::try_from(n).ok())
-                                .ok_or(ScalerError::External("attempt"))?,
-                            job: JobId(job["id"].as_u64().ok_or(ScalerError::External("job id"))?),
-                        });
+                        demand.push((
+                            JobKey {
+                                run: RunId(
+                                    run["id"].as_u64().ok_or(ScalerError::External("run id"))?,
+                                ),
+                                attempt: run["run_attempt"]
+                                    .as_u64()
+                                    .and_then(|n| u32::try_from(n).ok())
+                                    .ok_or(ScalerError::External("attempt"))?,
+                                job: JobId(
+                                    job["id"].as_u64().ok_or(ScalerError::External("job id"))?,
+                                ),
+                            },
+                            run["event"]
+                                .as_str()
+                                .ok_or(ScalerError::External("run event"))?
+                                .to_owned(),
+                        ));
                     }
                 }
             }
         }
-        demand.sort_by_key(|key| key.job.0);
+        demand.sort_by_key(|(key, _)| key.job.0);
         demand.dedup();
         Ok(demand)
     }
@@ -152,11 +182,7 @@ impl Github {
                 Some(json!({ "query": MERGE_QUEUE_QUERY })),
                 false,
             )?;
-            if !merge_group_heads_trusted(&queue, &sha) {
-                return Err(ScalerError::Guard(
-                    "merge group contains a pull request from another repository, or is not queued",
-                ));
-            }
+            vet_merge_group(&queue, &sha)?;
         }
         Ok(match admission {
             Admission::Pilot { sha } => JobPolicy::Pilot { sha: sha.clone() },
@@ -166,6 +192,15 @@ impl Github {
                 sha,
             }),
         })
+    }
+    pub(super) fn cancel_run(&self, run: RunId) -> Result<(), ScalerError> {
+        self.request(
+            "POST",
+            &format!("repos/{REPOSITORY}/actions/runs/{}/cancel", run.0),
+            None,
+            false,
+        )?;
+        Ok(())
     }
     pub(super) fn job(&self, id: JobId) -> Result<Value, ScalerError> {
         self.request(
@@ -254,6 +289,31 @@ impl Github {
         Ok(())
     }
 }
+
+fn vet_merge_group(queue: &Value, sha: &str) -> Result<(), ScalerError> {
+    if queue.get("errors").is_some() {
+        return Err(ScalerError::External("merge queue GraphQL errors"));
+    }
+    let entries = &queue["data"]["repository"]["mergeQueue"]["entries"];
+    let nodes = entries["nodes"]
+        .as_array()
+        .ok_or(ScalerError::External("merge queue entries"))?;
+    if !nodes.iter().any(|node| node["headCommit"]["oid"] == sha) {
+        return match entries["pageInfo"]["hasNextPage"].as_bool() {
+            Some(false) => Err(ScalerError::StaleMergeGroup),
+            Some(true) => Err(ScalerError::Guard(
+                "merge group is outside the visible queue",
+            )),
+            None => Err(ScalerError::External("merge queue pagination")),
+        };
+    }
+    if !merge_group_heads_trusted(queue, sha) {
+        return Err(ScalerError::Guard(
+            "merge group contains a pull request from another repository, or is not queued",
+        ));
+    }
+    Ok(())
+}
 pub(super) fn recover_registration(
     row: &impl RunnerRegistration,
     runners: &[Value],
@@ -286,4 +346,59 @@ fn pages(data: &Value, field: &str) -> Result<Vec<Value>, ScalerError> {
         );
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn queue() -> Value {
+        json!({"data":{"repository":{"mergeQueue":{"entries":{
+            "pageInfo":{"hasNextPage":false},
+            "nodes":[{"position":1,"headCommit":{"oid":"live"},
+                "pullRequest":{"headRepository":{"nameWithOwner":REPOSITORY}}}]
+        }}}}})
+    }
+
+    #[test]
+    fn ci_scaler_merge_group_refusal_distinguishes_stale_from_untrusted() {
+        let mut response = queue();
+        assert!(vet_merge_group(&response, "live").is_ok());
+        assert!(matches!(
+            vet_merge_group(&response, "merged"),
+            Err(ScalerError::StaleMergeGroup)
+        ));
+        response["data"]["repository"]["mergeQueue"]["entries"]["nodes"][0]["pullRequest"]["headRepository"]
+            ["nameWithOwner"] = json!("fork/carrick");
+        assert!(matches!(
+            vet_merge_group(&response, "live"),
+            Err(ScalerError::Guard(_))
+        ));
+    }
+
+    #[test]
+    fn ci_scaler_partial_or_failed_queue_response_never_cancels_a_group() {
+        let mut response = queue();
+        response["data"]["repository"]["mergeQueue"]["entries"]["pageInfo"]["hasNextPage"] =
+            json!(true);
+        assert!(matches!(
+            vet_merge_group(&response, "unseen"),
+            Err(ScalerError::Guard(_))
+        ));
+        response["errors"] = json!([{"message":"fixture"}]);
+        assert!(matches!(
+            vet_merge_group(&response, "live"),
+            Err(ScalerError::External(_))
+        ));
+        assert!(matches!(
+            vet_merge_group(&json!({}), "live"),
+            Err(ScalerError::External(_))
+        ));
+        response = queue();
+        response["data"]["repository"]["mergeQueue"]["entries"]["pageInfo"] = Value::Null;
+        assert!(matches!(
+            vet_merge_group(&response, "unseen"),
+            Err(ScalerError::External(_))
+        ));
+    }
 }

@@ -44,6 +44,21 @@ group (its queue entry and every entry ahead of it, from the GraphQL
 `mergeQueue` listing) must have its head repository equal to
 `carrick-sh/carrick`. A group with a fork pull request is refused.
 
+Demand is served in priority order: admitted live merge groups, then the
+newest pending main push, then owner `workflow_dispatch` runs on main.
+Older pending main pushes are superseded and skipped. A per-job refusal
+never aborts the pass: the controller records and logs it once per
+run/attempt/job key, then considers the next job in the same pass. Refusals
+survive restarts; a re-run's new attempt is vetted afresh. Vetting happens
+before reserving a runner, so a refused job cannot occupy cloudmac's budget.
+
+When a merge group's SHA is absent from a complete, successful queue
+listing, the controller also requests cancellation of its workflow run.
+A fork-head refusal, truncated queue listing or API/parse failure does not
+trigger cancellation. Cancellation is best effort and attempted once for
+the refused job: a denied or failed cancellation leaves the job ignored
+and does not prevent serving live demand.
+
 GitHub does not bind a JIT registration to the reserved job: a compatible
 job from another run may be assigned. The mac hook therefore re-vets the
 **actual assignment** through a credential-free rendezvous with the controller:
@@ -228,7 +243,15 @@ Not performed by the repository change.
 
 `gh` on the director's Mac must be able to call
 `repos/carrick-sh/carrick/actions/runners/generate-jitconfig` (repository
-Administration). Only the encoded JIT config travels over SSH stdin:
+Administration). Only the encoded JIT config travels over SSH stdin.
+
+Stale-run cancellation uses the existing classic/OAuth `repo` scope. A
+fine-grained token needs **Actions: write** for
+[workflow-run cancellation](https://docs.github.com/en/rest/actions/workflow-runs#cancel-a-workflow-run);
+an Actions-read-only token still skips and ignores refused jobs, without
+expanding its permissions.
+
+Start the controller with the runner-tree pin:
 
 ```sh
 cargo run --locked --release -p carrick-xtask -- ci-scaler mac-jit \
@@ -239,7 +262,10 @@ cargo run --locked --release -p carrick-xtask -- ci-scaler mac-jit \
 `--host` defaults to `rentamac@cloudmac`; `--one-job` exits after one cleaned
 up lifecycle (for qualification). A second instance on the same ledger
 refuses to start. GitHub, SSH and parse failures back off (30 s doubling to
-10 min) and the loop continues.
+10 min) and the loop continues. Per-job admission refusals and failed
+stale-run cancellation do not grow the backoff. An actual-assignment
+refusal is recorded once and approval is withheld; the existing hook
+deadline kills the rejected runner session before any workflow step.
 
 ## Seeding baselines
 
@@ -264,11 +290,12 @@ receipt fails closed and names this reseed command.
 ## Lifecycle and recovery
 
 - **One runner at a time.** The ledger (`mac-ledger.json`, 0600, fsynced)
-  records `Registering` before vetting and the JIT request, `Launched` after
+  records `Registering` after vetting and before the JIT request, `Launched` after
   it, and `Done` after registration removal.
 - **Re-serve.** A job key is served again when its runner closed without
-  running it (failed vet or launch, drained, killed by the hook), at most
+  running it (failed launch, drained, killed by the hook), at most
   three reservations per key; a key whose runner ran it is never re-served.
+  A refused key is skipped until a new workflow attempt.
 - **Assignment** is read from the hook rendezvous and the actual run/attempt
   jobs, authenticated by runner id. Once recorded, reconciliation reads that
   job and the runner list; it never lists every run per poll.
