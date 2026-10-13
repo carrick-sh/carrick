@@ -4836,6 +4836,38 @@ where
         // welded loop's `continue`.
         let frame = match next {
             Ok(Some(frame)) => frame,
+            Err(TrapError::NativeRootExit { status }) => {
+                // A native root may exit without ever forwarding a syscall.
+                self.state.service_kernel_context = Some(
+                    self.kernel
+                        .dispatcher
+                        .capture_kernel_context(self.state.linux_tid)
+                        .map_err(|error| {
+                            RuntimeError::Configuration(format!(
+                                "capture native terminal context: {error}"
+                            ))
+                        })?,
+                );
+                let code = i32::try_from(status.code()).map_err(|_| {
+                    RuntimeError::Configuration(
+                        "native terminal status exceeds result domain".into(),
+                    )
+                })?;
+                let (exit_code, signal) = match status.kind() {
+                    carrick_sched_core::process::TerminationKind::Exited => (code, None),
+                    carrick_sched_core::process::TerminationKind::Signaled { .. } => {
+                        (128 + code, Some(code))
+                    }
+                };
+                let outcome = VcpuLoopOutcome::ProcessExit(Box::new(assemble_run_result(
+                    &self.kernel,
+                    exit_code,
+                    signal,
+                    self.traps,
+                    false,
+                )));
+                return Ok(self.enter_terminal_with_outcome(engine, outcome));
+            }
             Ok(None) => {
                 if let Some(slot) = engine.mailbox_slot() {
                     let _ = carrick_kernel::el1_delegation::settle_el1_boundary_for(

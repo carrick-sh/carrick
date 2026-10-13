@@ -322,6 +322,7 @@ dependencies = [
  "carrick-mem",
  "carrick-mmu-core",
  "carrick-observability",
+ "carrick-sched-core",
  "libc",
  "parking_lot",
  "sha2",

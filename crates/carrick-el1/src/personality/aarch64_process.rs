@@ -248,6 +248,9 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
         (result, process.take_root_exit())
     };
     if let Some(status) = root_exit {
+        // A successful terminal crossing never re-enters this guest stack.
+        drop(runtime);
+        drop(_home);
         cross_root_exit(
             &mut service.crossing,
             task,

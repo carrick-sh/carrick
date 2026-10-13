@@ -405,6 +405,11 @@ impl HostAliasBacking {
 
 #[derive(Debug, ::thiserror::Error)]
 pub enum TrapError {
+    /// An authenticated native owner retired its root; never resume the guest.
+    #[error("native root exited: {status:?}")]
+    NativeRootExit {
+        status: carrick_sched_core::process::TerminationStatus,
+    },
     /// Authenticated native dependency failure ends the run before guest return.
     #[error("native run failed: {reason}; run_failure_crossings={crossings}")]
     NativeRunFailure {
