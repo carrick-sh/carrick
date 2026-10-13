@@ -267,8 +267,8 @@ impl Drop for KernelBootClaim<'_> {
 }
 
 struct FirstRootRollback {
-    container: Arc<carrick_kernel::kernel::Container>,
-    task: carrick_kernel::kernel::TaskKey,
+    kernel: Arc<carrick_kernel::kernel::Kernel>,
+    container: carrick_kernel::kernel::ContainerId,
     armed: bool,
 }
 
@@ -281,7 +281,11 @@ impl FirstRootRollback {
 impl Drop for FirstRootRollback {
     fn drop(&mut self) {
         if self.armed {
-            self.container.rollback_pid_root(self.task);
+            // The kernel exit transaction captures the last zombie while the
+            // namespace mapping is still live, then releases its slot. A
+            // rejected retirement leaves the mapping owned by the retained
+            // task/container references instead of invalidating that task.
+            let _ = self.kernel.retire_container_root(self.container, None);
         }
     }
 }
@@ -680,8 +684,8 @@ impl CarrierRuntime {
             .map_err(|error| RuntimeError::Configuration(error.to_string()));
         let (kernel, context) = boot?;
         let root_rollback = FirstRootRollback {
-            container: context.container(),
-            task: context.task().key(),
+            kernel: Arc::clone(&kernel),
+            container: context.container().id(),
             armed: true,
         };
         let directory = Arc::new(
@@ -758,7 +762,10 @@ impl CarrierRuntime {
     fn rollback_kernel_boot_claim(&self) {
         let mut slot = self.inner.kernel_runtime.lock();
         if matches!(*slot, CarrierKernelRuntimeSlot::Booting(_)) {
-            *slot = CarrierKernelRuntimeSlot::Vacant;
+            let previous = std::mem::replace(&mut *slot, CarrierKernelRuntimeSlot::Booting(None));
+            drop(slot);
+            drop(previous);
+            *self.inner.kernel_runtime.lock() = CarrierKernelRuntimeSlot::Vacant;
             self.inner.kernel_runtime_changed.notify_all();
         }
     }
@@ -775,7 +782,10 @@ impl CarrierRuntime {
                 if pending.root_task == root_task && Arc::ptr_eq(&pending.runtime, runtime)
         );
         if matches {
-            *slot = CarrierKernelRuntimeSlot::Vacant;
+            let previous = std::mem::replace(&mut *slot, CarrierKernelRuntimeSlot::Booting(None));
+            drop(slot);
+            drop(previous);
+            *self.inner.kernel_runtime.lock() = CarrierKernelRuntimeSlot::Vacant;
             self.inner.kernel_runtime_changed.notify_all();
         }
     }
@@ -787,7 +797,10 @@ impl CarrierRuntime {
             &*slot,
             CarrierKernelRuntimeSlot::Booting(Some(pending)) if pending.owner == owner
         ) {
-            *slot = CarrierKernelRuntimeSlot::Vacant;
+            let previous = std::mem::replace(&mut *slot, CarrierKernelRuntimeSlot::Booting(None));
+            drop(slot);
+            drop(previous);
+            *self.inner.kernel_runtime.lock() = CarrierKernelRuntimeSlot::Vacant;
             self.inner.kernel_runtime_changed.notify_all();
         }
     }
@@ -1956,7 +1969,12 @@ mod tests {
                 .expect("claim")
                 .expect("pending activation"),
         );
-        assert_eq!(container.pid_root(), None);
+        assert_eq!(
+            first.kernel().registry().task_count(),
+            0,
+            "rollback must retire the live root before releasing its namespace"
+        );
+        assert_eq!(container.pid_root(), Some(first.context.task().key()));
         assert_eq!(carrier.snapshot().expect("rolled back").kernel_graphs, 0);
 
         let replacement = carrick_kernel::kernel::RootBootstrap::for_reference_model(
@@ -2034,7 +2052,7 @@ mod tests {
     }
 
     #[test]
-    fn panicking_first_kernel_boot_releases_claim_and_root_publication() {
+    fn panicking_first_kernel_boot_retires_root_before_releasing_claim() {
         let _serial = TEST_LOCK.lock();
         let carrier = CarrierRuntime::new_for_tests().expect("carrier");
         let failed_container = Arc::new(Container::new(launch("panic")));
@@ -2049,7 +2067,7 @@ mod tests {
             let _ = carrier.boot_kernel_root(failed, |_, _, _| panic!("injected boot panic"));
         }));
         assert!(panic.is_err());
-        assert_eq!(failed_container.pid_root(), None);
+        assert!(failed_container.pid_root().is_some());
         assert_eq!(carrier.snapshot().expect("after panic").kernel_graphs, 0);
 
         let replacement = carrick_kernel::kernel::RootBootstrap::for_reference_model(
