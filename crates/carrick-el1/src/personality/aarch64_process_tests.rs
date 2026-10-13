@@ -1128,16 +1128,37 @@ fn terminal_retirement_cannot_retire_a_reused_record_or_slot_generation() {
         ..old
     };
     assert!(carrick_core::entry::retire_current(next, source, current).is_some());
-    assert!(!fixture.zone.accept_terminal(
-        fixture.slot,
+    // Each stale control differs from the retained custody in exactly one
+    // field, so no single comparison can be dropped without admitting it.
+    for stale in [
         ThreadIdentity {
-            tid: old.task.raw(),
             generation: old.generation.raw(),
-            mm: old.mm.raw(),
+            ..replacement
+        },
+        ThreadIdentity {
             serial: old.thread_generation.raw(),
-            ..Default::default()
-        }
-    ));
+            ..replacement
+        },
+        ThreadIdentity {
+            mm: old.mm.raw() + 1,
+            ..replacement
+        },
+        ThreadIdentity {
+            tid: old.task.raw() + 1,
+            ..replacement
+        },
+    ] {
+        let binding = carrick_el1_abi::ExecutionBinding {
+            task: carrick_el1_abi::EntryTaskKey::from_raw(stale.tid),
+            generation: carrick_el1_abi::EntryGeneration::from_raw(stale.generation),
+            mm: carrick_el1_abi::EntryMmKey::from_raw(stale.mm),
+            thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(stale.serial),
+        };
+        assert!(!carrick_core::entry::terminal_matches(
+            binding, source, phase
+        ));
+        assert!(!fixture.zone.accept_terminal(fixture.slot, stale));
+    }
     assert!(fixture.zone.accept_terminal(fixture.slot, replacement));
     assert!(!fixture.zone.accept_terminal(fixture.slot, replacement));
     assert!(
