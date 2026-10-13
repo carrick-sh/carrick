@@ -320,8 +320,33 @@ pub(super) fn project_owner_fork_frames(
                 })
                 .map(|((base, length), extent)| {
                     take = take.min(base + length - cursor);
-                    *extent
+                    ((*base, *length), *extent)
                 });
+            // The selection bounds guest access, not physical custody. A 4 KiB
+            // leaf can name part of a 16 KiB frame; the child's later COW and
+            // exec retirement require the parent's exact inventory extent.
+            let (inventory_key, source) = match source {
+                Some((key, extent)) => {
+                    if key.0 < record.ipa
+                        || key
+                            .0
+                            .checked_add(key.1)
+                            .is_none_or(|end| end > record.ipa + record.len as u64)
+                        || (extent.stage2_base, extent.stage2_length)
+                            != (record.ipa, record.len as u64)
+                        || extent.stage2_owner.host_addr != record.host_addr
+                        || record
+                            .logical_owner
+                            .is_none_or(|owner| owner.generation != extent.stage2_owner.generation)
+                    {
+                        return Err(TrapError::Hypervisor(
+                            "owner-selected inventory differs from live physical custody".into(),
+                        ));
+                    }
+                    (key, Some(extent))
+                }
+                None => ((record.ipa, record.len as u64), None),
+            };
             let structural = source_owners
                 .get(&(record.ipa, record.len))
                 .cloned()
@@ -380,10 +405,10 @@ pub(super) fn project_owner_fork_frames(
                 shared_key_offset,
                 owner_generation,
             });
-            if inherited.insert((cursor, take)) {
+            if inherited.insert(inventory_key) {
                 inventory_mappings.push(ProcessInventoryDesc {
-                    gpa: cursor,
-                    length: take,
+                    gpa: inventory_key.0,
+                    length: inventory_key.1,
                     permissions: carrick_hal::MemPerms {
                         read: record.perms & 1 != 0,
                         write: record.perms & 2 != 0,
@@ -727,6 +752,127 @@ mod tests {
             length: 4,
         };
         assert!(inherited_futex_identity(overflow, 1).is_err());
+    }
+
+    #[test]
+    fn owner_fork_shared_leaves_inherit_one_exact_extent_and_keep_file_offsets() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let ipa = carrick_mem::memory::LINUX_HVPATCH_GLOBAL_FRAME_BASE + 0x200_0000;
+        let len = CowArmedRanges::COMPOUND_SIZE;
+        let host = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            len as usize,
+            crate::host_mapping::HostMappingKind::FrameCow,
+        )
+        .unwrap();
+        let pointer = host.as_ptr() as usize;
+        let mut lease = GlobalFrameStage2Lease::fixed(ipa, len);
+        lease.mark_test_mapped_without_backend();
+        let generation = register_global_frame_host_owner_in(
+            &custody,
+            lease,
+            host,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+        )
+        .unwrap();
+        let frame = carrick_hal::FrameId::from_kernel_allocation(NonZeroU64::new(1).unwrap());
+        let mapping = carrick_hal::MappingId::from_kernel_allocation(NonZeroU64::new(2).unwrap());
+        let extent = InventoryExtent {
+            frame,
+            mapping,
+            backing: InventoryBackingIdentity::SharedFile {
+                device: 71,
+                inode: 72,
+                offset: 0x8000,
+                length: len,
+            },
+            stage2_base: ipa,
+            stage2_length: len,
+            stage2_owner: InventoryStage2OwnerIdentity {
+                host_addr: pointer,
+                generation,
+            },
+        };
+        let mut inventory = HvpatchFrameInventory::default();
+        inventory.extents.insert((ipa, len), extent);
+        let inventory = parking_lot::Mutex::new(inventory);
+        let physical = ForkPhysicalCustody::new(custody.clone(), Arc::new(|_, _| false));
+        let selected = [
+            PortalForkCustody::Frame {
+                va: 0x7000,
+                ipa,
+                len: 4096,
+                shared: true,
+            },
+            PortalForkCustody::Frame {
+                va: 0xa000,
+                ipa: ipa + 0x2000,
+                len: 4096,
+                shared: true,
+            },
+        ];
+        let (semantic, inherited) =
+            project_owner_fork_frames(&physical, &inventory, &Default::default(), &[], &selected)
+                .unwrap();
+        assert_eq!(semantic.len(), 2);
+        assert_eq!(semantic.iter().map(|row| row.size).sum::<usize>(), 8192);
+        assert!(
+            semantic
+                .iter()
+                .all(|row| row.sharing == GuestMappingSharing::GlobalShared)
+        );
+        assert_eq!(semantic[0].shared_key_offset, 0x8000);
+        assert_eq!(semantic[1].shared_key_offset, 0xa000);
+        assert_eq!(semantic[0].shared_key_base, semantic[1].shared_key_base);
+        assert_eq!(
+            inherited.len(),
+            1,
+            "inventory work is per extent, not per leaf"
+        );
+        assert_eq!((inherited[0].gpa, inherited[0].length), (ipa, len));
+        assert_eq!(inherited[0].inherited_mapping, Some(mapping));
+        assert_eq!(inherited[0].inherited_frame, Some(frame));
+        assert_eq!(inherited[0].stage2_owner, extent.stage2_owner);
+
+        // A cached inventory row is not permission to enlarge custody beyond
+        // the live physical record or to inherit a recycled owner incarnation.
+        for corrupt in [0, 1, 2] {
+            let mut ledger = inventory.lock();
+            ledger.extents.clear();
+            let mut stale = extent;
+            let key = match corrupt {
+                0 => {
+                    stale.stage2_owner.generation += 1;
+                    (ipa, len)
+                }
+                1 => {
+                    stale.stage2_owner.host_addr += 4096;
+                    (ipa, len)
+                }
+                _ => (ipa, len + 4096),
+            };
+            ledger.extents.insert(key, stale);
+            drop(ledger);
+            assert!(
+                project_owner_fork_frames(
+                    &physical,
+                    &inventory,
+                    &Default::default(),
+                    &[],
+                    &selected,
+                )
+                .is_err()
+            );
+            assert_eq!(
+                inventory.lock().extents.len(),
+                1,
+                "refusal publishes nothing"
+            );
+        }
+        assert!(
+            retire_global_frame_host_owner_if_generation_in(&custody, ipa, len, generation,)
+                .is_retired()
+        );
     }
 
     fn request(custody: &CarrierVmCustody, mm: u64) -> PortalForkRequest {
