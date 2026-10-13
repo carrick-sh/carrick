@@ -18,6 +18,11 @@ vm_free = "carrick-el1::personality::native_process_runtime::tests::bucket_conte
 # pending_default_stop_does_not_interrupt_wait4
 # child_exit_retains_wake_custody_across_parent_bucket_contention
 # child_signal_exit_retains_wake_custody_across_parent_bucket_contention
+# delayed_child_exit_notifies_adopter_when_selected_parent_exits_on_peer
+#   (a peer parent exit contends for the graph guard inside a committed
+#   child exit; the exit retains terminal publication custody, publishes
+#   once without retry and never reports NativeStale. This is graph-guard
+#   contention, not scheduler-bucket contention.)
 
 [bindings.unresolved]
 embed_structural = "Linux x86-w1 cannot run signed HVF. Native KVM mounted_static wait4/IPC rows provide CPU execution evidence, not signed ARM acceptance or an exported structural snapshot."
