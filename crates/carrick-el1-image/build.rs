@@ -51,10 +51,95 @@ fn find_sysroot_tool(tool: &str, sysroot: &str, host: &str) -> PathBuf {
     );
 }
 
+/// Pin the emitted exit-chain frames, including saved registers and alignment.
+/// These ceilings total 10 KiB, leaving 6 KiB for exception entry and callees.
+fn check_process_exit_frames(disassembly: &str) {
+    let budgets = [
+        ("::dispatch::dispatch_syscall::", 0x600),
+        ("::aarch64_process::with_process_entry::", 0x1200),
+        ("::exit_owned::", 0x800),
+        ("::native_process_entry::publish_exit::", 0x800),
+    ];
+    for (symbol, ceiling) in budgets {
+        let mut found = false;
+        for body in disassembly.split(">:\n") {
+            if !body
+                .lines()
+                .last()
+                .is_some_and(|line| line.contains(symbol))
+            {
+                continue;
+            }
+            // The next segment begins with this function's instructions.
+            let start = disassembly.find(body).unwrap() + body.len() + 3;
+            let mut frame = 0;
+            let mut aligned = false;
+            for line in disassembly[start..].lines().take(20) {
+                let Some((_, instruction)) = line.split_once(':') else {
+                    continue;
+                };
+                let instruction = instruction.trim();
+                if instruction.starts_with("stp") && instruction.contains("[sp, #-0x") {
+                    let hex = instruction
+                        .split("#-0x")
+                        .nth(1)
+                        .unwrap()
+                        .split(']')
+                        .next()
+                        .unwrap();
+                    frame += usize::from_str_radix(hex, 16).unwrap();
+                }
+                // LLVM stack probing computes the final aligned SP in x9;
+                // count that target once, rather than counting the probe loop.
+                if instruction.starts_with("sub") {
+                    let operands = instruction
+                        .split_whitespace()
+                        .skip(1)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if operands.starts_with("x9, sp,") {
+                        aligned = true;
+                    }
+                    let counted = if aligned {
+                        operands.starts_with("x9, sp,") || operands.starts_with("x9, x9,")
+                    } else {
+                        operands.starts_with("sp, sp,")
+                    };
+                    if counted {
+                        let hex = operands
+                            .split("#0x")
+                            .nth(1)
+                            .expect("immediate frame allocation")
+                            .split([',', ' '])
+                            .next()
+                            .unwrap();
+                        let amount = usize::from_str_radix(hex, 16).unwrap();
+                        frame += if operands.contains("lsl #12") {
+                            amount << 12
+                        } else {
+                            amount
+                        };
+                    }
+                }
+            }
+            if aligned {
+                frame += 63;
+            }
+            assert!(
+                frame > 0 && frame <= ceiling,
+                "EL1 exit frame {symbol}: {frame:#x} exceeds {ceiling:#x}"
+            );
+            found = true;
+        }
+        assert!(found, "missing EL1 exit frame {symbol}");
+    }
+}
+
 fn check_no_fp_simd_instructions(llvm_objdump: &Path, elf_path: &Path) {
     let output = Command::new(llvm_objdump)
         .arg("-d")
         .arg("--no-show-raw-insn")
+        .arg("--demangle")
         .arg(elf_path)
         .output()
         .expect("failed to run llvm-objdump");
@@ -65,6 +150,8 @@ fn check_no_fp_simd_instructions(llvm_objdump: &Path, elf_path: &Path) {
         );
     }
     let stdout = String::from_utf8(output.stdout).expect("disassembly not valid utf-8");
+
+    check_process_exit_frames(&stdout);
 
     // The in-guest thread switch saves and restores the guest's FP/SIMD
     // state in exactly these two audited routines (`carrick-el1`

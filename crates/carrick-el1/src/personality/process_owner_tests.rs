@@ -1068,6 +1068,7 @@ fn entry_exit_returns_resources_and_cancel_effects_before_native_service() {
         None,
         Transaction(85),
         LinuxWaitStatus::from_wait_encoding(9 << 8),
+        || {},
     )
     .unwrap();
     assert!(Rc::ptr_eq(&resources.unwrap(), &work));
@@ -1114,11 +1115,13 @@ fn entry_adapter_uses_retained_primitive_custody_through_fork_exit_wait() {
     use super::super::native_process_entry::{PreparedFork, WaitWork, publish_exit, scan_wait};
     fn retained(row: Task) -> GuestTask<(), Uid, RetainedProcessCustody<Native>> {
         let parent = row.parent();
+        let row = *row.state;
+        let custody = *row.custody;
         GuestTask::new(
             row.metadata,
             parent,
-            row.context,
-            RetainedProcessCustody::new(row.native),
+            custody.context,
+            RetainedProcessCustody::new(custody.native),
             row.claim,
         )
     }
@@ -1165,6 +1168,7 @@ fn entry_adapter_uses_retained_primitive_custody_through_fork_exit_wait() {
         None,
         Transaction(90),
         LinuxWaitStatus::from_wait_encoding(4 << 8),
+        || {},
     )
     .unwrap();
     assert!(resources.is_some());
@@ -1507,6 +1511,7 @@ fn exit_status_is_not_waitable_before_mm_retirement_completes() {
         None,
         Transaction(95),
         LinuxWaitStatus::from_wait_encoding(0),
+        || {},
     )
     .unwrap();
     // Pause the child at the exact owner-graph publication / MM retirement
@@ -1545,6 +1550,7 @@ fn autoreap_keeps_wait_population_until_retirement() {
         None,
         Transaction(98),
         LinuxWaitStatus::from_wait_encoding(19 << 8),
+        || {},
     )
     .unwrap();
     assert!(
@@ -1582,6 +1588,7 @@ fn autoreap_completion_removes_only_the_retired_child() {
         None,
         Transaction(99),
         LinuxWaitStatus::from_wait_encoding(19 << 8),
+        || {},
     )
     .unwrap();
     // Parent revisions and child admission remain live during retirement.
@@ -1592,6 +1599,7 @@ fn autoreap_completion_removes_only_the_retired_child() {
         None,
         Transaction(100),
         LinuxWaitStatus::from_wait_encoding(20 << 8),
+        || {},
     )
     .unwrap();
     let first_receipt = owner
@@ -1644,6 +1652,7 @@ fn pending_autoreap_moves_removal_credit_to_adopter() {
         None,
         Transaction(101),
         LinuxWaitStatus::from_wait_encoding(19 << 8),
+        || {},
     )
     .unwrap();
     let permit = pending.effects.cancel_members(Member::cancel);
@@ -1694,6 +1703,7 @@ fn pending_exit_retirement_survives_reparenting_without_early_reap() {
         None,
         Transaction(96),
         LinuxWaitStatus::from_wait_encoding(0),
+        || {},
     )
     .unwrap();
     let parent_exit = exit(&mut owner, parent, None);
@@ -1730,6 +1740,7 @@ fn retirement_completion_notifies_the_adopter_of_a_pending_zombie() {
         None,
         Transaction(97),
         LinuxWaitStatus::from_wait_encoding(0),
+        || {},
     )
     .unwrap();
     let child_permit = pending.effects.cancel_members(Member::cancel);

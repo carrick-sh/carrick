@@ -232,13 +232,16 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, M> PreparedFork<C, U, N, 
 }
 /// Resources and cancellation effects are owned results for service after the
 /// enclosing graph guard is dropped. No cancellation or signal sampling occurs.
+#[inline(never)]
 pub fn publish_exit<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>(
     owner: &mut GuestProcessOwner<C, U, N, F>,
     task: TaskKey,
     adopter: Option<TaskKey>,
     transaction: N::Transaction,
     status: LinuxWaitStatus,
+    check_stack: impl FnOnce(),
 ) -> ExitPublicationResult<N> {
+    check_stack();
     let pending = owner
         .prepare_exit(task, adopter)?
         .reserve(transaction)?
