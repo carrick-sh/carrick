@@ -14,6 +14,7 @@ rationale = "Admission creates one native process owner for the retained root an
 [bindings]
 vm_free = "carrick-el1::personality::aarch64_process_tests::arm_root_setup_enters_production_process_venue"
 # Supplemental VM-free witnesses in the same lib target:
+# arm_process_registry_moves_bounded_handles: saved ISA contexts never move inline through registry rows
 # arm_root_admission_imports_live_thread_membership_without_changing_census
 # arm_root_host_lease_renewal_retains_the_admitted_process_owner; arm_root_admission_refuses_stale_imported_custody_without_publication
 # arm_root_entry_refuses_wrong_binding_and_root_incarnation

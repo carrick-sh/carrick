@@ -414,6 +414,29 @@ impl Fixture {
             control,
         }
     }
+    fn enter<R>(
+        &'static self,
+        control: &'static carrick_el1_abi::ThreadControlSlot,
+        ttbr0: u64,
+        service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+        dispatch: impl FnOnce(
+            &mut dyn carrick_personality_linux::lifecycle::ProcessNative<Aarch64ParkedContext>,
+        ) -> R,
+    ) -> Result<R, NativeProcessError> {
+        with_process_entry(
+            BornInZoneSource {
+                zone: self.zone,
+                slot: service.slot,
+            },
+            &self.task,
+            ThreadCtx::ZERO,
+            ttbr0,
+            self.page,
+            control,
+            service,
+            dispatch,
+        )
+    }
     fn process_service(&'static self) -> Aarch64NativeProcessService<'static, TestStockCrossing> {
         Aarch64NativeProcessService::with_crossing(
             &self.task,
@@ -1452,14 +1475,7 @@ fn arm_root_setup_enters_production_process_venue() {
     let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
     let counters = Box::new(carrick_el1_abi::Counters::new());
     let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
-    let mut frame = carrick_el1_abi::TrapFrame {
-        x: [0; 31],
-        elr: 0,
-        spsr: 0,
-        esr: 0,
-        slot: 0,
-        far: 0,
-    };
+    let mut frame = carrick_el1_abi::TrapFrame::default();
     for (nr, args, expected) in [
         (96, [0, 0, 0, 0, 0, 0], 41),
         (260, [u64::MAX, 0, 1, 0, 0, 0], -10),
@@ -1520,15 +1536,8 @@ fn arm_returned_process_call_is_not_a_zone_park() {
     let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
     let mut owner = None;
     for _ in 0..2 {
-        with_process_entry(
-            source,
-            &fixture.task,
-            ThreadCtx::ZERO,
-            ttbr0,
-            fixture.page,
-            fixture.control,
-            &mut service,
-            |process| {
+        fixture
+            .enter(fixture.control, ttbr0, &mut service, |process| {
                 let LifecycleOutcome::Returned { result, .. } = process.wait4(
                     ProcessWaitPid::from_syscall_argument(u64::MAX),
                     UserVa::new(0),
@@ -1545,28 +1554,19 @@ fn arm_returned_process_call_is_not_a_zone_park() {
                     assert!(std::sync::Arc::ptr_eq(prior, &admitted));
                 }
                 owner = Some(admitted);
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert!(fixture.zone.slot(fixture.slot).current().is_none());
         assert!(fixture.zone.slot(fixture.slot).host_record().is_none());
         assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 1);
     }
-    let published = with_process_entry(
-        source,
-        &fixture.task,
-        ThreadCtx::ZERO,
-        ttbr0,
-        fixture.page,
-        fixture.control,
-        &mut service,
-        |_| {
+    let published = fixture
+        .enter(fixture.control, ttbr0, &mut service, |_| {
             let record = fixture.zone.slot(fixture.slot).host_record().unwrap();
             fixture.zone.requeue_preempted(fixture.slot, record);
             fixture.zone.record_ref(record)
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     assert!(fixture.zone.live(published).is_some());
     assert_eq!(
         fixture.zone.slot(fixture.slot).host_record(),
@@ -1657,27 +1657,18 @@ fn arm_root_admission_imports_live_thread_membership_without_changing_census() {
             disposition: carrick_signal_core::policy::Disposition::Ignore,
             ..Default::default()
         };
-        let route = with_process_entry(
-            source,
-            &fixture.task,
-            ThreadCtx::ZERO,
-            ttbr0,
-            fixture.page,
-            fixture.control,
-            &mut service,
-            |process| {
-                process
-                    .signal_venue()
-                    .unwrap()
-                    .rt_sigaction(signal, Some(action))
-                    .unwrap();
-                assert!(process.has_thread(41));
-                assert!(
-                    process.has_thread(42),
-                    "already-live member belongs to this process owner"
-                );
-            },
-        );
+        let route = fixture.enter(fixture.control, ttbr0, &mut service, |process| {
+            process
+                .signal_venue()
+                .unwrap()
+                .rt_sigaction(signal, Some(action))
+                .unwrap();
+            assert!(process.has_thread(41));
+            assert!(
+                process.has_thread(42),
+                "already-live member belongs to this process owner"
+            );
+        });
         assert!(
             route.is_ok(),
             "authenticated imported membership must admit: {route:?}"
@@ -1711,33 +1702,18 @@ fn arm_root_admission_imports_live_thread_membership_without_changing_census() {
                 Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, stale_address);
         }
         assert!(
-            with_process_entry(
-                source,
-                &fixture.task,
-                ThreadCtx::ZERO,
-                ttbr0,
-                fixture.page,
-                control,
-                &mut service,
-                |_| panic!(
+            fixture
+                .enter(control, ttbr0, &mut service, |_| panic!(
                     "thread must not substitute the group generation for a stale parked root"
-                )
-            )
-            .is_err()
+                ))
+                .is_err()
         );
         unsafe {
             *fixture.zone.record(record.id).ctx_mut() =
                 Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
         }
-        with_process_entry(
-            source,
-            &fixture.task,
-            ThreadCtx::ZERO,
-            ttbr0,
-            fixture.page,
-            control,
-            &mut service,
-            |process| {
+        fixture
+            .enter(control, ttbr0, &mut service, |process| {
                 assert_eq!(
                     process.binding(),
                     super::common_entry::execution_binding(&fixture.task)
@@ -1752,9 +1728,8 @@ fn arm_root_admission_imports_live_thread_membership_without_changing_census() {
                     action,
                     "imported thread shares the retained sighand"
                 );
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert!(std::sync::Arc::ptr_eq(
             &owner,
             &registry()
@@ -1762,15 +1737,8 @@ fn arm_root_admission_imports_live_thread_membership_without_changing_census() {
                 .unwrap()
         ));
         assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
-        with_process_entry(
-            source,
-            &fixture.task,
-            ThreadCtx::ZERO,
-            ttbr0,
-            fixture.page,
-            control,
-            &mut service,
-            |process| {
+        fixture
+            .enter(control, ttbr0, &mut service, |process| {
                 let admission =
                     carrick_el1_abi::Lifecycle::begin_exit(fixture.page, control.entry().unwrap())
                         .unwrap();
@@ -1780,9 +1748,8 @@ fn arm_root_admission_imports_live_thread_membership_without_changing_census() {
                 if notified {
                     process.thread_exited(42);
                 }
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(
             registry().for_record(fixture.zone, record).is_none(),
             notified
@@ -1797,22 +1764,14 @@ fn arm_root_admission_imports_live_thread_membership_without_changing_census() {
             fixture.page as *const _ as u64,
             fixture.control as *const _ as u64,
         );
-        with_process_entry(
-            source,
-            &fixture.task,
-            ThreadCtx::ZERO,
-            ttbr0,
-            fixture.page,
-            fixture.control,
-            &mut service,
-            |process| {
+        fixture
+            .enter(fixture.control, ttbr0, &mut service, |process| {
                 assert!(matches!(
                     process.exit_group(7),
                     LifecycleOutcome::Transferred { .. }
                 ));
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
         assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 0);
         assert!(registry().for_record(fixture.zone, record).is_none());
@@ -1829,17 +1788,11 @@ fn arm_root_host_lease_renewal_retains_the_admitted_process_owner() {
     };
     let mut service = fixture.process_service();
     let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
-    with_process_entry(
-        source,
-        &fixture.task,
-        ThreadCtx::ZERO,
-        ttbr0,
-        fixture.page,
-        fixture.control,
-        &mut service,
-        |process| assert!(process.has_thread(42)),
-    )
-    .unwrap();
+    fixture
+        .enter(fixture.control, ttbr0, &mut service, |process| {
+            assert!(process.has_thread(42))
+        })
+        .unwrap();
     let before = registry()
         .for_entry(source, &fixture.task, fixture.address)
         .unwrap();
@@ -1849,16 +1802,9 @@ fn arm_root_host_lease_renewal_retains_the_admitted_process_owner() {
         .execution
         .generation
         .store(22, Ordering::Release);
-    let outcome = with_process_entry(
-        source,
-        &fixture.task,
-        ThreadCtx::ZERO,
-        ttbr0,
-        fixture.page,
-        fixture.control,
-        &mut service,
-        |process| assert!(process.has_thread(42)),
-    );
+    let outcome = fixture.enter(fixture.control, ttbr0, &mut service, |process| {
+        assert!(process.has_thread(42))
+    });
     assert!(outcome.is_ok(), "lease renewal retains owner: {outcome:?}");
     let after = registry()
         .for_entry(source, &fixture.task, fixture.address)
@@ -1885,16 +1831,9 @@ fn arm_root_admission_refuses_stale_imported_custody_without_publication() {
         };
         let mut service = fixture.process_service();
         let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
-        let outcome = with_process_entry(
-            source,
-            &fixture.task,
-            ThreadCtx::ZERO,
-            ttbr0,
-            fixture.page,
-            fixture.control,
-            &mut service,
-            |_| panic!("stale member must not enter production dispatch"),
-        );
+        let outcome = fixture.enter(fixture.control, ttbr0, &mut service, |_| {
+            panic!("stale member must not enter production dispatch")
+        });
         assert!(outcome.is_err(), "stale field {field}");
         assert!(
             registry()
@@ -1914,17 +1853,9 @@ fn arm_root_entry_refuses_wrong_binding_and_root_incarnation() {
     };
     let mut service = fixture.process_service();
     let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
-    with_process_entry(
-        source,
-        &fixture.task,
-        ThreadCtx::ZERO,
-        ttbr0,
-        fixture.page,
-        fixture.control,
-        &mut service,
-        |_| (),
-    )
-    .unwrap();
+    fixture
+        .enter(fixture.control, ttbr0, &mut service, |_| ())
+        .unwrap();
     let before = registry()
         .for_entry(source, &fixture.task, fixture.address)
         .unwrap();
@@ -1954,17 +1885,11 @@ fn arm_root_entry_refuses_wrong_binding_and_root_incarnation() {
         let original = atomic.load(Ordering::Acquire);
         atomic.store(original + 1, Ordering::Release);
         assert!(
-            with_process_entry(
-                source,
-                &fixture.task,
-                ThreadCtx::ZERO,
-                ttbr0,
-                fixture.page,
-                fixture.control,
-                &mut service,
-                |_| panic!("wrong binding must not enter dispatch")
-            )
-            .is_err()
+            fixture
+                .enter(fixture.control, ttbr0, &mut service, |_| panic!(
+                    "wrong binding must not enter dispatch"
+                ))
+                .is_err()
         );
         atomic.store(original, Ordering::Release);
     }
@@ -1978,33 +1903,19 @@ fn arm_root_entry_refuses_wrong_binding_and_root_incarnation() {
             Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, stale_address);
     }
     assert!(
-        with_process_entry(
-            source,
-            &fixture.task,
-            ThreadCtx::ZERO,
-            ttbr0,
-            fixture.page,
-            fixture.control,
-            &mut service,
-            |_| panic!("recycled root must not enter dispatch")
-        )
-        .is_err()
+        fixture
+            .enter(fixture.control, ttbr0, &mut service, |_| panic!(
+                "recycled root must not enter dispatch"
+            ))
+            .is_err()
     );
     unsafe {
         *fixture.zone.record(record).ctx_mut() =
             Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
     }
-    with_process_entry(
-        source,
-        &fixture.task,
-        ThreadCtx::ZERO,
-        ttbr0,
-        fixture.page,
-        fixture.control,
-        &mut service,
-        |_| (),
-    )
-    .unwrap();
+    fixture
+        .enter(fixture.control, ttbr0, &mut service, |_| ())
+        .unwrap();
     assert!(std::sync::Arc::ptr_eq(
         &before,
         &registry()
@@ -2024,17 +1935,11 @@ fn arm_born_thread_uses_native_owner_without_an_execution_generation() {
     };
     let mut service = fixture.process_service();
     let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
-    with_process_entry(
-        source,
-        &fixture.task,
-        ThreadCtx::ZERO,
-        ttbr0,
-        fixture.page,
-        fixture.control,
-        &mut service,
-        |process| assert!(process.has_thread(42)),
-    )
-    .expect("a retained Born member has no host execution generation yet");
+    fixture
+        .enter(fixture.control, ttbr0, &mut service, |process| {
+            assert!(process.has_thread(42))
+        })
+        .expect("a retained Born member has no host execution generation yet");
     let owner = registry()
         .for_entry(source, &fixture.task, fixture.address)
         .unwrap();
@@ -2087,15 +1992,8 @@ fn arm_born_thread_uses_native_owner_without_an_execution_generation() {
         route,
         carrick_personality_linux::dispatch::CompletionRoute::WithWork
     );
-    with_process_entry(
-        source,
-        &fixture.task,
-        ThreadCtx::ZERO,
-        ttbr0,
-        fixture.page,
-        control,
-        &mut service,
-        |process| {
+    fixture
+        .enter(control, ttbr0, &mut service, |process| {
             assert_eq!(process.binding().generation.raw(), 0);
             let LifecycleOutcome::Returned { result, .. } = process.wait4(
                 ProcessWaitPid::from_syscall_argument(u64::MAX),
@@ -2106,9 +2004,8 @@ fn arm_born_thread_uses_native_owner_without_an_execution_generation() {
                 panic!("wait4");
             };
             assert_eq!(result.raw(), -10);
-        },
-    )
-    .expect("Born entry must retain the existing owner without a host task row");
+        })
+        .expect("Born entry must retain the existing owner without a host task row");
     assert!(std::sync::Arc::ptr_eq(
         &owner,
         &registry()
@@ -2134,20 +2031,12 @@ fn arm_born_thread_uses_native_owner_without_an_execution_generation() {
         zone: fixture.zone,
         slot,
     };
-    with_process_entry(
-        adopted_source,
-        &fixture.task,
-        ThreadCtx::ZERO,
-        ttbr0,
-        fixture.page,
-        control,
-        &mut service,
-        |process| {
+    fixture
+        .enter(control, ttbr0, &mut service, |process| {
             assert_eq!(process.binding().generation.raw(), 19);
             assert!(process.has_thread(41) && process.has_thread(42));
-        },
-    )
-    .unwrap();
+        })
+        .unwrap();
     assert!(std::sync::Arc::ptr_eq(
         &owner,
         &registry()

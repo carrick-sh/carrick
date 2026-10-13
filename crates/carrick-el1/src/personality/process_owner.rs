@@ -8,6 +8,7 @@
 //! notification retain the same exact parent generation.
 //! This adapter returns custody, never syscall completion or a CPU/MM operation.
 extern crate alloc;
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -91,13 +92,17 @@ pub struct GuestTaskMetadata<C, U> {
 }
 
 pub struct GuestTask<C, U, N: NativeProcessCustody> {
+    state: Box<GuestTaskState<C, U, N>>,
+}
+
+/// Registry operations move one owner, never an ISA context or resource row.
+pub struct GuestTaskState<C, U, N: NativeProcessCustody> {
     metadata: GuestTaskMetadata<C, U>,
     exit_tid: u32,
     relations: ProcessRelations,
     revision: TaskRevision,
     exiting: AtomicBool,
-    context: N::Context,
-    native: N,
+    custody: Box<GuestRetiringState<N>>,
     claim: N::Claim,
     tracer: Option<TaskKey>,
     tracees: BTreeSet<TaskKey>,
@@ -111,6 +116,30 @@ pub struct GuestTask<C, U, N: NativeProcessCustody> {
     pub child_subreaper: bool,
     pub has_execed: bool,
     pub threads: GuestThreads,
+}
+
+impl<C, U, N: NativeProcessCustody> core::ops::Deref for GuestTaskState<C, U, N> {
+    type Target = GuestRetiringState<N>;
+    fn deref(&self) -> &Self::Target {
+        &self.custody
+    }
+}
+impl<C, U, N: NativeProcessCustody> core::ops::DerefMut for GuestTaskState<C, U, N> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.custody
+    }
+}
+
+impl<C, U, N: NativeProcessCustody> core::ops::Deref for GuestTask<C, U, N> {
+    type Target = GuestTaskState<C, U, N>;
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+impl<C, U, N: NativeProcessCustody> core::ops::DerefMut for GuestTask<C, U, N> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
 }
 
 #[derive(Clone)]
@@ -217,8 +246,8 @@ impl GuestThreads {
     }
 }
 
-impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
-    pub fn new(
+impl<C, U, N: NativeProcessCustody> GuestTaskState<C, U, N> {
+    fn new(
         metadata: GuestTaskMetadata<C, U>,
         parent: Option<TaskKey>,
         context: N::Context,
@@ -232,8 +261,7 @@ impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
             relations: ProcessRelations::new(parent),
             revision: TaskRevision::INITIAL,
             exiting: AtomicBool::new(false),
-            context,
-            native,
+            custody: Box::new(GuestRetiringState { context, native }),
             claim,
             tracer: None,
             tracees: BTreeSet::new(),
@@ -247,6 +275,22 @@ impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
             child_subreaper: false,
             has_execed: false,
             threads: GuestThreads::new(leader_tid),
+        }
+    }
+}
+
+impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
+    pub fn new(
+        metadata: GuestTaskMetadata<C, U>,
+        parent: Option<TaskKey>,
+        context: N::Context,
+        native: N,
+        claim: N::Claim,
+    ) -> Self {
+        Self {
+            state: Box::new(GuestTaskState::new(
+                metadata, parent, context, native, claim,
+            )),
         }
     }
     #[inline]
@@ -502,8 +546,18 @@ impl<C, U, Claim, Credit> ExitZombiePublication<Credit> for GuestZombie<C, U, Cl
 /// only the numeric claim survives in the shared zombie record.
 pub struct GuestRetiring<N: NativeProcessCustody> {
     identity: WaitIdentity,
+    state: Box<GuestRetiringState<N>>,
+}
+/// Terminal custody remains owned while the registry publishes its receipt.
+pub struct GuestRetiringState<N: NativeProcessCustody> {
     pub context: N::Context,
     pub native: N,
+}
+impl<N: NativeProcessCustody> core::ops::Deref for GuestRetiring<N> {
+    type Target = GuestRetiringState<N>;
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
 }
 impl<N: NativeProcessCustody> WaitIdentitySource for GuestRetiring<N> {
     fn wait_identity(&self) -> WaitIdentity {
@@ -1116,17 +1170,17 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
             .begin_prepared_exit_effects(task, topology, permit, self.effects)
             .map_err(GuestProcessError::Exit)?;
         let adopter = topology.adopter();
-        let record = registry
+        let record = *registry
             .tasks
             .remove(&task.id)
-            .unwrap_or_else(|| F::fail_process(GuestProcessInvariant::ExitCustodyLost(task)));
+            .unwrap_or_else(|| F::fail_process(GuestProcessInvariant::ExitCustodyLost(task)))
+            .state;
         registry.publish_exit_topology(topology);
         registry.retiring_tasks.insert(
             task.id,
             GuestRetiring {
                 identity,
-                context: record.context,
-                native: record.native,
+                state: record.custody,
             },
         );
         let retirement = Arc::new(AtomicBool::new(false));
