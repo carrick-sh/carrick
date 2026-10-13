@@ -2,9 +2,10 @@
 
 `kernel-runtime.yml`'s `hvf-kernel` job runs on cloudmac, the owner's Apple
 Silicon gate Mac, as **one JIT ephemeral runner per job**, admitted to trusted runs of
-`kernel-runtime.yml`, re-vetted at assignment. No runner is registered persistently, no
-GitHub credential is ever written on cloudmac, and jobs run as an
-unprivileged account that owns nothing the next launch trusts.
+`kernel-runtime.yml`, re-vetted at assignment. No runner is registered
+persistently, no long-lived GitHub or Cloudflare upload credential is ever
+written on cloudmac, and jobs run as an unprivileged account that owns
+nothing the next launch trusts.
 
 ```
 director's Mac                                cloudmac
@@ -126,6 +127,47 @@ Not performed by the repository change.
    toolchain into this read-only directory on cloudmac. Install it before
    the bump lands (both versions can coexist). Automating this from a
    reviewed commit is an open follow-up.
+
+   **Fixture relay token (director, one time before #318 lands).** The
+   existing `/Volumes/carrick/.relay-token` belongs to `rentamac` (0600),
+   so jobs cannot read it. Copy it into the provisioned toolchain without
+   printing its contents:
+
+   ```sh
+   sudo install -o root -g wheel -m 444 /Volumes/carrick/.relay-token \
+     /Volumes/carrick-build/carrick-ci/toolchain/relay-token
+   stat -f '%Su:%Sg %Lp' /Volumes/carrick-build/carrick-ci/toolchain/relay-token
+   sudo -u carrick-ci test -r /Volumes/carrick-build/carrick-ci/toolchain/relay-token
+   sudo -u carrick-ci test ! -w /Volumes/carrick-build/carrick-ci/toolchain/relay-token
+   ```
+
+   The containing toolchain directories must remain root-owned and 0755,
+   with no group/other write permission. The downloader refuses a symlink,
+   non-root ownership or a mode other than 0444. Repeat the copy after owner
+   rotation of the source token. This read-only relay bearer token is the
+   sole persistent credential deliberately readable by admitted jobs; it
+   must authorize **only downloads** through `carrick-gate-relay`, never R2
+   writes or GitHub access. Do not put it in GitHub secrets, job outputs or
+   the writable skeleton/home. Jobs can read it, so this retains the existing
+   trusted-workflow assumption; it does not isolate the token from admitted
+   code or other local readers. A previous job cannot change the provisioned
+   token for a later job.
+
+   The hosted `signed-fixtures` publisher alone receives the R2 upload token
+   and account id, scoped to its upload step. It uses pinned Wrangler 4.76.0
+   to publish at most 256 MiB per object at
+   `carrick-gate-images/bundles/<sha>/<archive-sha256>.part00`, `.part01`, etc.
+   The existing GitHub artifact upload is retained. The archive filename
+   names its manifest hash, so the publisher separately records the actual
+   archive SHA-256, filename and part count as job outputs. The Mac never
+   trusts digest metadata from the relay. It sends the bearer header to the
+   fixed HTTPS Worker endpoint via curl's stdin configuration (no token in
+   argv, output or a workspace file), concatenates parts in order, and
+   verifies the archive digest before publishing the download. A relay
+   attempt has a 45-second network budget; any failure, including missing
+   provisioning or digest mismatch, selects `actions/download-artifact`.
+   Both paths then pass the same mandatory archive digest check and the
+   existing checkout-aware fixture manifest/object verification at restore.
 
 2. **Runner tree, root-owned.** Download the macOS ARM64 runner from
    <https://github.com/actions/runner/releases>, verify the SHA-256 from that
