@@ -144,6 +144,14 @@ impl Site {
     pub(super) fn isolates_bridge(&self) -> bool {
         matches!(self.network, Network::Static { .. })
     }
+    /// Whether template 300 and its clones may take part in KSM page
+    /// merging. A site whose clones share the host with other VMs that hold
+    /// credentials (the isolating sites) keeps them out: cross-VM page
+    /// deduplication is a timing side channel. The PVE default (`1`) stays
+    /// on other sites.
+    pub(super) fn allows_ksm(&self) -> bool {
+        !self.isolates_bridge()
+    }
     /// The PVE VM firewall for an isolating site, as an exact rule list that
     /// the template builder writes and the controller verifies. Default
     /// deny both ways; in: SSH from the gateway only; out: IPv4 except the
@@ -257,7 +265,7 @@ impl Site {
             Headroom::Directory => "qcow2",
         };
         Ok(format!(
-            "SITE_NODE={}\nSITE_API_HOST={}\nSITE_STORAGE={}\nSITE_DISK_FORMAT={disk_format}\nSITE_BRIDGE={}\nSITE_CORES={}\nSITE_MEMORY_MIB={}\nSITE_DISK_GIB={}\nSITE_TEMPLATE_IPCONFIG={}\nSITE_NAMESERVER={}\nSITE_VM_FIREWALL={}\nSITE_API_CA={}\n",
+            "SITE_NODE={}\nSITE_API_HOST={}\nSITE_STORAGE={}\nSITE_DISK_FORMAT={disk_format}\nSITE_BRIDGE={}\nSITE_CORES={}\nSITE_MEMORY_MIB={}\nSITE_DISK_GIB={}\nSITE_TEMPLATE_IPCONFIG={}\nSITE_NAMESERVER={}\nSITE_VM_FIREWALL={}\nSITE_API_CA={}\nSITE_ALLOW_KSM={}\n",
             self.node,
             self.api_host,
             self.storage,
@@ -269,6 +277,7 @@ impl Site {
             self.nameserver().unwrap_or("none"),
             u8::from(self.isolates_bridge()),
             self.api_ca.unwrap_or("system"),
+            u8::from(self.allows_ksm()),
         ))
     }
 }
@@ -401,6 +410,7 @@ mod tests {
         assert!(CONTABO.ipconfig(299).is_err() && CONTABO.ipconfig(350).is_err());
         assert_eq!(CONTABO.nameserver(), Some("1.1.1.1"));
         assert!(CONTABO.isolates_bridge() && !WILLOW.isolates_bridge());
+        assert!(!CONTABO.allows_ksm() && WILLOW.allows_ksm());
         assert_eq!(WILLOW.vm_firewall_file(300).unwrap(), None);
         assert_eq!(CONTABO.static_address(308).unwrap().unwrap(), "10.77.0.108");
         assert!(CONTABO.vm_firewall_file(350).is_err());
@@ -417,7 +427,7 @@ OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n
     fn template_builder_inputs_are_bare_tokens() {
         assert_eq!(
             WILLOW.shell_env().unwrap(),
-            "SITE_NODE=willow\nSITE_API_HOST=willow.atxconsulting.com\nSITE_STORAGE=local-lvm\nSITE_DISK_FORMAT=raw\nSITE_BRIDGE=vmbr0\nSITE_CORES=2\nSITE_MEMORY_MIB=4096\nSITE_DISK_GIB=64\nSITE_TEMPLATE_IPCONFIG=ip=dhcp\nSITE_NAMESERVER=none\nSITE_VM_FIREWALL=0\nSITE_API_CA=system\n"
+            "SITE_NODE=willow\nSITE_API_HOST=willow.atxconsulting.com\nSITE_STORAGE=local-lvm\nSITE_DISK_FORMAT=raw\nSITE_BRIDGE=vmbr0\nSITE_CORES=2\nSITE_MEMORY_MIB=4096\nSITE_DISK_GIB=64\nSITE_TEMPLATE_IPCONFIG=ip=dhcp\nSITE_NAMESERVER=none\nSITE_VM_FIREWALL=0\nSITE_API_CA=system\nSITE_ALLOW_KSM=1\n"
         );
         for site in SITES {
             for line in site.shell_env().unwrap().lines() {
