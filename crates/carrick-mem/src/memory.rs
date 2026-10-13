@@ -2267,14 +2267,11 @@ impl AddressSpace {
     /// a private snapshot and the child re-stamps.
     ///
     /// `write:true` marks the *host*-visible mapping writable so the runtime can
-    /// stamp it through the ordinary checked `GuestMemory::write_bytes` (used by
-    /// the boot/fork/exec and cred-mutation stamps). It is NOT guest-EL0-writable:
-    /// the kernel hole's first 2 MiB block is mapped `AP=00` (kernel-only) by
-    /// `stage1_identity_page_tables`, independent of this region's perms — so guest
-    /// EL0 can neither read nor write it; only the EL1 stub reads it. (The vvar is
-    /// read-only because it is stamped via the *unchecked* `write_guest_bytes`
-    /// instead; the identity page reuses the checked path so the dispatcher's
-    /// cred handlers can re-stamp it with the `cx.memory` they already hold.)
+    /// stamp it through the named `GuestMemory::write_carrick_identity` venue.
+    /// It is not a Linux user VMA: the kernel hole's first 2 MiB block is
+    /// mapped AP=00 (EL1 RW, no EL0) by `stage1_identity_page_tables`.
+    /// Owner publication authenticates the exact MM and live translation;
+    /// ordinary user copyout must not acquire authority over this window.
     pub fn with_identity_page(self) -> Result<Self, AddressSpaceError> {
         let start = LINUX_IDENTITY_PAGE_BASE;
         let end = start.checked_add(LINUX_IDENTITY_PAGE_SIZE).ok_or(

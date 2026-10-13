@@ -705,7 +705,7 @@ contracts = ["kernel.mm.carrier-window-isolation"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/identity_page.rs"
-contracts = ["kernel.mm.carrier-window-isolation"]
+contracts = ["kernel.mm.carrier-window-isolation", "kernel.fork.stage1-image"]
 
 [[surfaces]]
 path = "crates/carrick-fd-core/src/tests.rs"
@@ -810,7 +810,7 @@ contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents"
 
 [[surfaces]]
 path = "crates/carrick-el1/src/personality/mm_portal/tests.rs"
-contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents"]
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents", "kernel.fork.stage1-image", "kernel.mm.carrier-window-isolation"]
 
 # Order 5 moves entry ownership once; pending family hooks retain their existing
 # semantic contracts alongside the shared admission/completion contract.
@@ -1324,3 +1324,24 @@ contracts = ["process.native.terminal-child"]
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/binding.rs"
 contracts = ["process.native.terminal-child"]
+
+[[surfaces]]
+path = "crates/carrick-el1-abi/src/internal_read.rs"
+contracts = ["kernel.fork.stage1-image", "kernel.mm.carrier-window-isolation"]
+
+[[surfaces]]
+path = "crates/carrick-core-abi/src/mm/transfer.rs"
+contracts = ["kernel.fork.stage1-image", "kernel.mm.carrier-window-isolation"]
+
+[[surfaces]]
+path = "crates/carrick-core/src/mm/transaction/owner.rs"
+contracts = ["kernel.fork.stage1-image", "kernel.mm.carrier-window-isolation"]
+
+[[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/lifecycle.rs"
+contracts = ["kernel.fork.stage1-image", "kernel.mm.carrier-window-isolation"]
+
+[[surfaces]]
+path = "crates/carrick-aarch64/src/user_transfer/staging.rs"
+contracts = ["kernel.fork.stage1-image", "kernel.mm.carrier-window-isolation"]
+

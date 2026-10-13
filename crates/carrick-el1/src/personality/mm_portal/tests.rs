@@ -423,6 +423,154 @@ fn internal_read_selects_identity_control_from_exact_live_mm() {
 }
 
 #[test]
+fn identity_publication_uses_exact_mm_kernel_translation_and_retained_copy() {
+    let base = carrick_el1_abi::CARRICK_IDENTITY_PAGE_BASE;
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let parent = admit(&region, &spaces, 77, ROOT, 1, 0);
+    let child_root = ROOT + 0x10_0000;
+    let child = admit(&region, &spaces, 78, child_root, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let maintenance = CallerInvalidatesAsid;
+    let mut published = [[0u8; 4]; 2];
+    for (index, mm, root, ipa) in [
+        (0, parent, ROOT, IPA),
+        (1, child, child_root, IPA + 0x20_0000),
+    ] {
+        let tables = Tables::new(root, ipa, 0);
+        tables.words[512 + ((base >> 30) & 511) as usize]
+            .store((root + 8192) | 3, Ordering::Relaxed);
+        tables.words[1024 + ((base >> 21) & 511) as usize]
+            .store((root + 12288) | 3, Ordering::Relaxed);
+        let leaf = &tables.words[1536 + ((base >> 12) & 511) as usize];
+        // EL1 RW, EL0 inaccessible, and no Linux VMA covers this address.
+        leaf.store(ipa | (RW & !(1 << 6)), Ordering::Release);
+        let handle = portal.admitted_handle(mm, 0).unwrap();
+        let user = portal
+            .begin(
+                handle,
+                GuestVa::new(base + 4),
+                4,
+                TransferIntent::UserWrite,
+                0,
+            )
+            .unwrap();
+        assert!(matches!(
+            portal.select(
+                &user,
+                &tables.live(&maintenance),
+                carrick_core::mm::transaction::SelectionVenues {
+                    prepared: &mut NoopPreparedResolver,
+                    cow: &mut NoopCowResolver,
+                    residency: &residency(),
+                    slot: 0
+                }
+            ),
+            Err(MmError::Fault)
+        ));
+        let transfer = portal
+            .begin(
+                handle,
+                GuestVa::new(base + 4),
+                4,
+                TransferIntent::CarrickIdentityWrite,
+                0,
+            )
+            .unwrap();
+        let chunk = selected(select(&portal, &transfer, &tables));
+        assert_eq!(chunk.ipa, ipa + 4);
+        let slot = carrick_el1_abi::PortalTransferSlot::new();
+        let request = chunk
+            .request(TransferIntent::CarrickIdentityWrite, retained())
+            .unwrap();
+        let mut ticket = slot.submit_prepare(request).unwrap();
+        serve_transfer(
+            &portal,
+            slot.claim().unwrap(),
+            &tables.live(&maintenance),
+            0,
+            || panic!("PREPARE cannot publish"),
+        )
+        .unwrap();
+        let permit = ticket.take_prepared().unwrap();
+        let mut ticket = slot.submit_commit(request, permit, 4).unwrap();
+        serve_transfer(
+            &portal,
+            slot.claim().unwrap(),
+            &tables.live(&maintenance),
+            0,
+            || {
+                assert!(ticket.copy_requested(|copy| {
+                    assert_eq!(copy.request().selected.ipa, ipa + 4);
+                    published[index] = (index as u32 + 1).to_le_bytes();
+                    true
+                }));
+            },
+        )
+        .unwrap();
+        let receipt = ticket.take_completion().unwrap();
+        assert_eq!((receipt.errno, receipt.completed), (0, 4));
+        leaf.store((ipa + 4096) | (RW & !(1 << 6)), Ordering::Release);
+        assert!(
+            portal
+                .revalidate(&transfer, chunk, &tables.live(&maintenance), 0)
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert_eq!(published, [1u32.to_le_bytes(), 2u32.to_le_bytes()]);
+}
+
+#[test]
+fn identity_publication_cannot_escape_control_window() {
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 77, ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let tables = Tables::new(ROOT, IPA, 1);
+    let maintenance = CallerInvalidatesAsid;
+    for (address, len) in [
+        (VA, 4),
+        (carrick_el1_abi::CARRICK_IDENTITY_PAGE_BASE - 1, 2),
+        (
+            carrick_el1_abi::CARRICK_IDENTITY_PAGE_BASE
+                + carrick_el1_abi::CARRICK_IDENTITY_PAGE_SIZE
+                - 1,
+            2,
+        ),
+        (
+            carrick_el1_abi::EL1_REGION_BASE + carrick_el1_abi::EL1_IMAGE_OFFSET,
+            4,
+        ),
+    ] {
+        let transfer = portal
+            .begin(
+                portal.admitted_handle(mm, 0).unwrap(),
+                GuestVa::new(address),
+                len,
+                TransferIntent::CarrickIdentityWrite,
+                0,
+            )
+            .unwrap();
+        assert!(matches!(
+            portal.select(
+                &transfer,
+                &tables.live(&maintenance),
+                carrick_core::mm::transaction::SelectionVenues {
+                    prepared: &mut NoopPreparedResolver,
+                    cow: &mut NoopCowResolver,
+                    residency: &residency(),
+                    slot: 0
+                }
+            ),
+            Err(MmError::Fault)
+        ));
+    }
+}
+
+#[test]
 fn internal_reads_cannot_name_arbitrary_user_windows() {
     let region = Region::new();
     let spaces = AddressSpaces::new();

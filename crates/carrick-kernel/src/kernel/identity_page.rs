@@ -4,8 +4,8 @@
 //! from this page in userspace with no vm exit, so the page is a publication
 //! the kernel must stamp before the guest issues any intercepted syscall: at
 //! boot, in a forked child, and after `execve`. The stamp is a pure write
-//! sequence over any [`CurrentMmMemory`] (the executor's engine in
-//! production, a `LinearMemory` in tests); the ordering argument for the gate
+//! sequence through the named kernel-control venue of [`CurrentMmMemory`]
+//! (the executor's engine in production, a `LinearMemory` in tests); the gate
 //! word lives on [`stamp_identity_values`].
 
 use carrick_guest_mem::CurrentMmMemory;
@@ -98,10 +98,62 @@ pub fn stamp_clock_gate<M: CurrentMmMemory>(
     enabled: u32,
 ) -> Result<(), carrick_guest_mem::MemoryError> {
     std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-    memory.write_bytes(
+    write_identity_bytes(
+        memory,
         base + crate::memory::IDENTITY_OFF_CLOCK_GATE,
         &enabled.to_le_bytes(),
     )
+}
+
+/// Close the shared identity fast path without changing its parent's identity.
+pub fn close_identity_gate<M: CurrentMmMemory>(
+    memory: &mut M,
+    base: u64,
+) -> Result<(), carrick_guest_mem::MemoryError> {
+    write_identity_bytes(
+        memory,
+        base + crate::memory::IDENTITY_OFF_SHIM_ENABLED,
+        &0_u32.to_le_bytes(),
+    )
+}
+
+/// Read the EL1-serviced syscall ledger through its named control window.
+pub fn read_serviced_syscalls<M: CurrentMmMemory>(
+    memory: &M,
+) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+    memory.read_carrick_internal(
+        carrick_el1_abi::CarrickInternalReadRange::identity(
+            crate::memory::IDENTITY_OFF_SHIM_SYSCALLS,
+            8,
+        )
+        .ok_or(carrick_guest_mem::MemoryError::Unsupported)?,
+    )
+}
+
+pub fn reset_serviced_syscalls<M: CurrentMmMemory>(
+    memory: &mut M,
+) -> Result<(), carrick_guest_mem::MemoryError> {
+    write_identity_bytes(
+        memory,
+        crate::memory::LINUX_IDENTITY_PAGE_BASE + crate::memory::IDENTITY_OFF_SHIM_SYSCALLS,
+        &0_u64.to_le_bytes(),
+    )
+}
+
+fn write_identity_bytes<M: CurrentMmMemory>(
+    memory: &mut M,
+    address: u64,
+    bytes: &[u8],
+) -> Result<(), carrick_guest_mem::MemoryError> {
+    let range = carrick_el1_abi::CarrickIdentityWriteRange::from_identity_address(
+        address,
+        bytes.len() as u64,
+    )
+    .ok_or(carrick_guest_mem::MemoryError::OutOfBounds {
+        address,
+        length: bytes.len(),
+    })?;
+    memory.write_carrick_identity(range, bytes)
 }
 
 /// The value to publish in the identity page's shim gate.
@@ -140,7 +192,8 @@ pub fn stamp_identity_values<M: CurrentMmMemory>(
     //
     // Closing the gate first costs nothing: a guest that reads it mid-stamp
     // takes the trap path and gets the correct answer from the dispatcher.
-    memory.write_bytes(
+    write_identity_bytes(
+        memory,
         base + crate::memory::IDENTITY_OFF_SHIM_ENABLED,
         &0_u32.to_le_bytes(),
     )?;
@@ -148,13 +201,18 @@ pub fn stamp_identity_values<M: CurrentMmMemory>(
     // identity it protects starts changing, or a guest can see the old gate
     // open over a half-written pid.
     std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-    memory.write_bytes(base + crate::memory::IDENTITY_OFF_PID, &pid.to_le_bytes())?;
+    write_identity_bytes(
+        memory,
+        base + crate::memory::IDENTITY_OFF_PID,
+        &pid.to_le_bytes(),
+    )?;
     // A fresh stamp starts a fresh serviced-syscall ledger: a forked child
     // COWs its parent's identity page and must not inherit the parent's
     // counter (Linux children start rusage at zero), and an exec'd image
     // keeps its task ledger but not the page. (The exec re-stamp drops any
     // pre-exec counted-but-unfolded syscalls — a µs-scale undercount.)
-    memory.write_bytes(
+    write_identity_bytes(
+        memory,
         base + crate::memory::IDENTITY_OFF_SHIM_SYSCALLS,
         &0_u64.to_le_bytes(),
     )?;
@@ -172,7 +230,8 @@ pub fn stamp_identity_values<M: CurrentMmMemory>(
     // The gate is a publication flag, so it needs release semantics: every
     // store above must be observable before the store that opens it.
     std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-    memory.write_bytes(
+    write_identity_bytes(
+        memory,
         base + crate::memory::IDENTITY_OFF_SHIM_ENABLED,
         &shim_enabled.to_le_bytes(),
     )?;

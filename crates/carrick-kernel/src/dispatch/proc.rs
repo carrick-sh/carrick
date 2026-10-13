@@ -1035,9 +1035,9 @@ impl<'a> ProcView<'a> {
                 crate::memory::LINUX_IDENTITY_PAGE_BASE,
                 0,
             );
-            let _ = memory.write_bytes(
-                crate::memory::LINUX_IDENTITY_PAGE_BASE + crate::memory::IDENTITY_OFF_SHIM_ENABLED,
-                &0u32.to_le_bytes(),
+            let _ = crate::kernel::identity_page::close_identity_gate(
+                memory,
+                crate::memory::LINUX_IDENTITY_PAGE_BASE,
             );
         }
         Ok(())
@@ -3740,12 +3740,10 @@ impl<'a> ProcView<'a> {
             // readers add the counter directly, so it is zeroed here to keep
             // the two accountings disjoint. A signal-killed process skips
             // this fold (its counter dies unread) — a bounded undercount.
-            let counter_addr = crate::memory::LINUX_IDENTITY_PAGE_BASE
-                + crate::memory::IDENTITY_OFF_SHIM_SYSCALLS;
-            if let Ok(bytes) = cx.memory.read_bytes(counter_addr, 8) {
+            if let Ok(bytes) = crate::kernel::identity_page::read_serviced_syscalls(cx.memory) {
                 let count = u64::from_le_bytes(bytes.as_slice().try_into().unwrap_or([0; 8]));
                 if count != 0 {
-                    let _ = cx.memory.write_bytes(counter_addr, &0_u64.to_le_bytes());
+                    let _ = crate::kernel::identity_page::reset_serviced_syscalls(cx.memory);
                     super::resources::with_active_context(|context| {
                         context.thread().charge_system_ns(
                             count

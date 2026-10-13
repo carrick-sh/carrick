@@ -424,6 +424,12 @@ equivalent or stronger failure detection.
 
 ## Fork stage-1 image example
 
+The fork image's identity/control publication uses a named kernel window,
+not Linux user-copy authority. VM-free witnesses exercise copied-child identity,
+shared-MM gate closure and parent handback, exact live MM translation, retained
+physical writer custody, and refusal of user/image windows or stale translations.
+The scoped signed bindings include fork/exec shared backing and inotify09 vfork.
+
 `kernel.fork.stage1-image` also requires owner-selected physical custody to
 authenticate the selected IPA through the carrier's exact extent record, VM
 generation and logical-owner generation. A carrier-MM alias index is not the

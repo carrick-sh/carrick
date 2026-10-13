@@ -1330,9 +1330,7 @@ fn timeval_from_duration(d: std::time::Duration) -> crate::linux_abi::LinuxTimev
 /// for RUSAGE_SELF/`times`; `sys_exit` folds-and-zeroes it into the thread
 /// ledger so the zombie snapshot and RUSAGE_CHILDREN carry it after exit.
 fn el1_counted_system_us(memory: &impl CurrentMmMemory) -> u64 {
-    let counter_addr =
-        crate::memory::LINUX_IDENTITY_PAGE_BASE + crate::memory::IDENTITY_OFF_SHIM_SYSCALLS;
-    let Ok(bytes) = memory.read_bytes(counter_addr, 8) else {
+    let Ok(bytes) = crate::kernel::identity_page::read_serviced_syscalls(memory) else {
         return 0;
     };
     let count = u64::from_le_bytes(bytes.as_slice().try_into().unwrap_or([0; 8]));

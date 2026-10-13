@@ -136,7 +136,7 @@ impl TransferPin for RetainedUserData {
         authorization: carrick_el1_abi::PortalCopyRequest<'_>,
         bytes: &mut [u8],
     ) -> bool {
-        if self.intent == PortalTransferIntent::UserWrite {
+        if self.intent.is_write() {
             self.copy_out(authorization, bytes)
         } else {
             self.copy_bytes(authorization, TransferBytes::Read(bytes))
@@ -147,7 +147,7 @@ impl TransferPin for RetainedUserData {
         authorization: carrick_el1_abi::PortalCopyRequest<'_>,
         bytes: &[u8],
     ) -> bool {
-        if self.intent != PortalTransferIntent::UserWrite {
+        if !self.intent.is_write() {
             return false;
         }
         self.copy_bytes(authorization, TransferBytes::Write(bytes))
@@ -188,7 +188,7 @@ impl RetainedUserData {
                 }
             }
         }
-        if self.intent == PortalTransferIntent::UserWrite {
+        if self.intent.is_write() {
             // A peer MM may have consumed admission dirtiness before this
             // memcpy. Publish the completed write, then await I2 completion.
             let mapping = self._mapping.as_ref().unwrap_or_else(|| {
@@ -200,7 +200,7 @@ impl RetainedUserData {
             let offset = self.pointer as usize - mapping.host_base() as usize;
             mapping.code_content.mark_icache_dirty(offset, len);
         }
-        if self.intent == PortalTransferIntent::UserWrite && self.selected.executable {
+        if self.intent.is_write() && self.selected.executable {
             self.custody
                 .publish_user_executable(self.selected.ipa, len as u64, |_, _| None, |_, _| None)
                 .unwrap_or_else(|error| {
@@ -530,7 +530,7 @@ impl UserTransferCustody {
         };
         // Revocation returns owned readiness without waiting for native-code
         // users. Its writer exclusion survives suspension through pending().
-        let write = if intent == PortalTransferIntent::UserWrite {
+        let write = if intent.is_write() {
             Some(Arc::new(
                 mapping
                     .as_ref()
@@ -737,6 +737,52 @@ pub(super) mod tests {
                 )
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn identity_publication_retains_writer_and_copies_to_exact_physical_owner() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let ipa = 0xa085_3000_0000;
+        let owner = backing(&custody, ipa);
+        let physical = UserTransferCustody::new(custody);
+        let selected = selection(ipa);
+        let intent = PortalTransferIntent::CarrickIdentityWrite;
+        let mut pin = physical.retain(selected, 4, intent).unwrap().unwrap();
+        assert!(
+            pin._write.is_some(),
+            "internal publication requires content writer custody"
+        );
+        let request = carrick_el1_abi::PortalTransferRequest::new(
+            PortalOperation {
+                carrier: physical.carrier(),
+                mm: ReservationMm::new(77).unwrap(),
+                incarnation: NonZeroU64::new(1).unwrap(),
+                sequence: NonZeroU64::new(1).unwrap(),
+            },
+            PortalByteRange::new(carrick_el1_abi::CARRICK_IDENTITY_PAGE_BASE, 4).unwrap(),
+            intent,
+            selected,
+            pin.identity(),
+        )
+        .unwrap();
+        let slot = PortalTransferSlot::new();
+        let mut ticket = slot.submit(request).unwrap();
+        let service = slot.claim().unwrap();
+        assert!(service.copy_with(|| {
+            assert!(
+                ticket.copy_requested(
+                    |authorization| pin.copy_out(authorization, &2u32.to_le_bytes())
+                )
+            );
+        }));
+        assert!(service.complete(4, 0));
+        assert_eq!(ticket.take_completion().unwrap().completed, 4);
+        // SAFETY: owner retains this initialized four-byte physical backing.
+        assert_eq!(
+            unsafe { core::slice::from_raw_parts(owner.mapping.host_base(), 4) },
+            2u32.to_le_bytes()
         );
     }
 

@@ -42,14 +42,15 @@ fn el1_transparent_fork_exec_shared_backing() {
     let _watchdog = common::Watchdog::start(Duration::from_secs(90));
     reset_el1_counters();
 
-    // A guest that forks a child that performs 5 writes, waits for it, then execs a program that writes.
+    // The forked child writes four lines and execs echo for the fifth. The
+    // parent waits for its normal exit, then execs a program that writes.
     let result = common::run_or_fail(
         ContainerBuilder::from_image(common::SMOKE_IMAGE)
             .pull_policy(PullPolicy::Missing)
             .command([
                 "/bin/sh",
                 "-c",
-                "(for i in 1 2 3 4 5; do echo \"child_$i\"; done) & wait $! && exec /bin/echo \"exec_done\"",
+                "(for i in 1 2 3 4; do echo \"child_$i\"; done; exec /bin/echo \"child_5\") & wait $! && exec /bin/echo \"exec_done\"",
             ])
             .run_blocking(),
     );

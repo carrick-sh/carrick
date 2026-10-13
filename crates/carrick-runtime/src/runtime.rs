@@ -2451,6 +2451,13 @@ impl<M: CurrentMmMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
     ) -> Result<Vec<u8>, MemoryError> {
         self.mem.read_carrick_internal(range)
     }
+    fn write_carrick_identity(
+        &mut self,
+        range: carrick_el1_abi::CarrickIdentityWriteRange,
+        bytes: &[u8],
+    ) -> Result<(), MemoryError> {
+        self.mem.write_carrick_identity(range, bytes)
+    }
     fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
         self.mem.read_bytes(address, length)
     }
