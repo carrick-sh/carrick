@@ -71,6 +71,12 @@ pub trait PersistentTaskBinding {
 
     fn set_cpu_residency(&self, _residency: super::residency::TaskCpuResidency) {}
 
+    /// Terminal exit consumes the exact resident record without constructing a
+    /// resumable CPU image for a task whose last entry has already completed.
+    fn clear_terminal_cpu_residency(&self) -> Result<(), TrapError> {
+        Ok(())
+    }
+
     fn wait_for_materialized(
         &self,
         _thread: ThreadKey,
@@ -164,6 +170,18 @@ impl PersistentTaskBinding for crate::vcpu_loop::continuation::HvpatchTaskBindin
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         let _ = residency;
+    }
+
+    fn clear_terminal_cpu_residency(&self) -> Result<(), TrapError> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            self.inspect_backend::<super::backend::HvpatchTaskEngineBindingState, _>(|state| {
+                state.clear_terminal_residency();
+                Ok(())
+            })
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        Ok(())
     }
 
     fn wait_for_materialized(
