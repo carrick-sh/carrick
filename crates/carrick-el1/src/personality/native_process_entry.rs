@@ -103,10 +103,10 @@ pub type ForkPublicationResult<C, U, N, M, B> = Result<
         PreparedFork<C, U, N, M>,
     )>,
 >;
-pub type ExitPublicationResult<C, U, N> = Result<
+pub type ExitPublicationResult<N> = Result<
     (
         Option<<N as NativeProcessCustody>::Resources>,
-        GuestPublishedExit<C, U, N>,
+        GuestPublishedExit<N>,
     ),
     GuestProcessError<<N as NativeProcessCustody>::Error>,
 >;
@@ -238,7 +238,7 @@ pub fn publish_exit<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestPr
     adopter: Option<TaskKey>,
     transaction: N::Transaction,
     status: LinuxWaitStatus,
-) -> ExitPublicationResult<C, U, N> {
+) -> ExitPublicationResult<N> {
     let pending = owner
         .prepare_exit(task, adopter)?
         .reserve(transaction)?

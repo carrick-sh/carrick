@@ -1806,6 +1806,27 @@ impl ProductionCpuFactory {
         tid: El1TaskId,
         cpu: carrick_guest_arch::CpuId,
     ) -> Result<(), TrapError> {
+        self.fixture_place_native_thread_policy(tid, cpu, false)
+    }
+
+    /// Bind a queued, unhomed fixture thread to its actor CPU while stopped.
+    /// Queue placement alone permits the other CPU to steal the child while
+    /// its parent parks. A fixture holding that CPU stopped would then strand
+    /// the child there instead of exercising the intended peer exit path.
+    pub fn fixture_pin_native_thread(
+        &self,
+        tid: El1TaskId,
+        cpu: carrick_guest_arch::CpuId,
+    ) -> Result<(), TrapError> {
+        self.fixture_place_native_thread_policy(tid, cpu, true)
+    }
+
+    fn fixture_place_native_thread_policy(
+        &self,
+        tid: El1TaskId,
+        cpu: carrick_guest_arch::CpuId,
+        pin_thread: bool,
+    ) -> Result<(), TrapError> {
         let custody = self
             .custody
             .lock()
@@ -1847,17 +1868,62 @@ impl ProductionCpuFactory {
                 "fixture placement requires an unhomed task and live CPU",
             ));
         }
+        let slot = SlotId::new(cpu.raw() as u8);
+        if pin_thread && zone.slot(slot).host_record().is_some() {
+            return Err(fail("fixture affinity requires a peer without a host home"));
+        }
         if zone.claim_for_host(
             zone.record_ref(record),
             None,
             carrick_sched_core::Handback::Resumed,
             &carrick_sched_core::BoundedSpin(0),
         ) != carrick_sched_core::HostClaim::Claimed
-            || !zone.requeue_on(SlotId::new(cpu.raw() as u8), record)
         {
             return Err(fail("fixture queue placement refused"));
         }
+        if pin_thread {
+            // The host owns this exact unhomed queued thread. The target has
+            // no host home, and a Host claim has no live park timer. Use the
+            // existing home-release primitive to publish its actor affinity.
+            let _ = zone.unhome(slot, record, 1 << cpu.raw());
+        }
+        if !zone.requeue_on(slot, record) {
+            return Err(fail("fixture queue placement refused"));
+        }
         Ok(())
+    }
+
+    /// Observe an idle actor boundary after its queue guard has been released.
+    /// This changes no scheduler claim, receipt readiness or wake generation.
+    pub fn fixture_native_cpu_idle(
+        &self,
+        cpu: carrick_guest_arch::CpuId,
+    ) -> Result<bool, TrapError> {
+        if cpu.raw() >= 2 {
+            return Err(fail("unknown native fixture CPU"));
+        }
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        let pointer = custody
+            .ram
+            .host_ptr(
+                META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
+                size_of::<X86Cpl0Zone>(),
+            )
+            .ok_or_else(|| fail("fixture native zone backing"))?;
+        // SAFETY: boot initialized the aligned zone in this retained window.
+        let zone = unsafe { &*pointer.cast::<X86Cpl0Zone>() };
+        let slot = SlotId::new(cpu.raw() as u8);
+        let Some(_guard) = zone.slot_lock(slot, &carrick_sched_core::BoundedSpin(0)) else {
+            return Ok(false);
+        };
+        Ok(
+            zone.slot(slot).state() == carrick_sched_core::SlotState::IdleWfi
+                && zone.slot(slot).current().is_none()
+                && zone.slot(slot).queued() == 0,
+        )
     }
 
     /// Atomic fixture census of the actual native wait enrollment.

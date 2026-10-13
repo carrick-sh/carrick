@@ -3105,6 +3105,11 @@ pub(super) struct TaskRecord {
 pub(super) struct ZombieRecord {
     pub(super) zombie: Zombie,
     pub(super) _task_claim: TaskClaim,
+    pub(super) autoreap: Option<
+        carrick_sched_core::process::exit::DeferredAutoreap<
+            super::revision_capacity::RevisionReservation,
+        >,
+    >,
 }
 
 #[derive(Debug)]

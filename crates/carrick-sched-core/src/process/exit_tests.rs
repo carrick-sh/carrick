@@ -145,6 +145,9 @@ fn exit_topology_owner_refuses_recycled_adopter_before_selecting_children() {
         fn exit_publish_children(&mut self, children: BTreeSet<TaskKey>) {
             self.children = children;
         }
+        fn exit_forget_child(&mut self, child: TaskKey) {
+            self.children.remove(&child);
+        }
         fn exit_publish_credit(&mut self, participant: super::exit::PreparedExitParticipant<()>) {
             participant.publish(TaskRevision::INITIAL, |_, current| current.next().unwrap());
         }
@@ -152,6 +155,7 @@ fn exit_topology_owner_refuses_recycled_adopter_before_selecting_children() {
     struct Dead {
         key: TaskKey,
         parent: Option<TaskKey>,
+        autoreap: Option<super::exit::DeferredAutoreap<()>>,
     }
     impl ExitZombie for Dead {
         fn exit_parent(&self) -> Option<TaskKey> {
@@ -160,10 +164,22 @@ fn exit_topology_owner_refuses_recycled_adopter_before_selecting_children() {
         fn exit_key(&self) -> TaskKey {
             self.key
         }
+        fn exit_is_autoreap(&self) -> bool {
+            self.autoreap.is_some()
+        }
     }
-    impl ExitZombiePublication for Dead {
+    impl ExitZombiePublication<()> for Dead {
         fn exit_reparent(&mut self, parent: Option<TaskKey>) {
             self.parent = parent;
+        }
+        fn exit_publish_autoreap(&mut self, accounting: super::exit::DeferredAutoreap<()>) {
+            self.autoreap = Some(accounting);
+        }
+        fn exit_reparent_autoreap(&mut self, parent: super::exit::AutoreapParent<()>) {
+            self.autoreap.as_mut().unwrap().reparent(parent);
+        }
+        fn exit_take_autoreap(&mut self) -> Option<super::exit::DeferredAutoreap<()>> {
+            self.autoreap.take()
         }
     }
     struct Failure;
@@ -297,22 +313,26 @@ fn exit_topology_owner_refuses_recycled_adopter_before_selecting_children() {
     assert_eq!(plan.reserved_ids().len(), 2);
     owner.validate_exit_topology(task, &plan).unwrap();
     owner.publish_exit_topology(&mut plan);
-    assert!(owner.tasks[&parent.id].children.is_empty());
+    assert!(owner.tasks[&parent.id].children.contains(&task));
     owner.retiring_tasks.insert(task.id, task);
     let receipt = owner
         .publish_exit_receipt(
             task,
-            &plan,
+            &mut plan,
             Dead {
                 key: task,
                 parent: Some(parent),
+                autoreap: None,
             },
             ProcessGroupId::from_abi_positive(1).unwrap(),
             super::SessionId::from_abi_positive(1).unwrap(),
         )
         .unwrap();
-    assert_eq!(receipt.retiring, task);
-    assert!(receipt.autoreaped_receipt.is_some());
+    assert_eq!(receipt, task);
+    assert!(owner.zombies[&task.id].exit_is_autoreap());
+    assert!(owner.tasks[&parent.id].children.contains(&task));
+    assert!(owner.complete_exit_autoreap(task).unwrap().is_some());
+    assert!(owner.tasks[&parent.id].children.is_empty());
     assert!(owner.zombies.is_empty());
     assert!(owner.retiring_tasks.is_empty());
 
@@ -338,6 +358,7 @@ fn exit_topology_owner_refuses_recycled_adopter_before_selecting_children() {
         Dead {
             key: dead_child,
             parent: Some(task),
+            autoreap: None,
         },
     );
     let mut plan = owner.prepare_exit_topology(task, Some(parent)).unwrap();
@@ -442,6 +463,9 @@ fn exit_effect_work_visits_only_own_members_at_all_scales() {
         }
         fn exit_key(&self) -> TaskKey {
             panic!("no zombie")
+        }
+        fn exit_is_autoreap(&self) -> bool {
+            false
         }
     }
     struct Failure;
@@ -614,6 +638,9 @@ fn prepared_exit_effects_reject_stale_membership_snapshot() {
         }
         fn exit_key(&self) -> TaskKey {
             panic!("no zombie")
+        }
+        fn exit_is_autoreap(&self) -> bool {
+            false
         }
     }
     struct Failure;
