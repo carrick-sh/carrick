@@ -106,6 +106,11 @@ Not performed by the repository change.
    (read-only) and a fresh writable `CARGO_HOME` in the job home; tools a
    workflow installs (`just`, `cargo-deny`) land there and are wiped.
 
+   The host-authority census preserves this `RUSTUP_HOME` while isolating
+   Cargo configuration and selecting the checked toolchain channel. Its
+   subprocesses disable automatic toolchain installation; a missing pinned
+   toolchain must be fixed during owner provisioning, not inside the job.
+
    **Private sccache per run.** `mac-run-once` sets `SCCACHE_SERVER_UDS` to a
    socket in the wiped job home, `SCCACHE_DIR` to
    `/Volumes/carrick-build/carrick-ci/sccache` (owned by `carrick-ci`, 0700)
