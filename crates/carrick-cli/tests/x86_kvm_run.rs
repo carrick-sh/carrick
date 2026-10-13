@@ -999,19 +999,134 @@ fn run_with_empty_stdin_then_write(mut command: std::process::Command) -> (Vec<u
 }
 
 fn poll_readable(fd: i32, timeout_ms: i32) -> bool {
+    poll_readable_with(fd, timeout_ms, |_, _| ())
+}
+
+fn poll_readable_with<Guard>(
+    fd: i32,
+    timeout_ms: i32,
+    before_wait: impl FnOnce(&libc::timespec, &libc::sigset_t) -> Guard,
+) -> bool {
+    assert!(timeout_ms >= 0, "stdout observation must be bounded");
     let mut pollfd = libc::pollfd {
         fd,
         events: libc::POLLIN,
         revents: 0,
     };
-    // SAFETY: pollfd is a valid stack allocation for one descriptor.
-    let result = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+    let timeout = libc::timespec {
+        tv_sec: (timeout_ms / 1_000).into(),
+        tv_nsec: ((timeout_ms % 1_000) * 1_000_000).into(),
+    };
+    // SAFETY: a null input mask only queries this thread's mask into valid
+    // storage, without changing thread or process signal state.
+    let mut mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    assert_eq!(
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut mask) },
+        0
+    );
+    // assert_cmd's wait-timeout installs a process-wide SIGCHLD handler.
+    // Any concurrent child exit can interrupt poll, even with SA_RESTART.
+    // This observation waits for stdout, not child signals: defer SIGCHLD
+    // atomically for one ppoll, preserving every other caller mask bit and
+    // the original timeout. ppoll restores the mask before returning.
+    // SAFETY: mask is initialized and SIGCHLD is a valid signal number.
+    assert_eq!(unsafe { libc::sigaddset(&mut mask, libc::SIGCHLD) }, 0);
+    let _guard = before_wait(&timeout, &mask);
+    // SAFETY: initialized stack allocations borrowed only for this call.
+    let result = unsafe { libc::ppoll(&mut pollfd, 1, &timeout, &mask) };
     assert!(
         result >= 0,
         "host poll failed: {}",
         std::io::Error::last_os_error()
     );
     result > 0
+}
+
+#[test]
+fn host_poll_observation_defers_sigchld_without_retry() {
+    struct RestoreMask(libc::sigset_t);
+    impl Drop for RestoreMask {
+        fn drop(&mut self) {
+            // SAFETY: the saved mask belongs to this thread.
+            assert_eq!(
+                unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut()) },
+                0
+            );
+        }
+    }
+    // Install the same wait-timeout SIGCHLD handler used by mounted runs,
+    // without replacing a process-wide disposition in this witness.
+    assert!(
+        Command::new("/bin/true")
+            .timeout(Duration::from_secs(5))
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    // Give the caller an unrelated blocked signal. The observation must
+    // preserve it, and must restore an initially unblocked SIGCHLD.
+    // SAFETY: valid thread-local masks, no process-wide disposition change.
+    let _caller_mask = unsafe {
+        let mut original = std::mem::zeroed::<libc::sigset_t>();
+        assert_eq!(
+            libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut original),
+            0
+        );
+        let mut caller = original;
+        assert_eq!(libc::sigaddset(&mut caller, libc::SIGUSR1), 0);
+        assert_eq!(libc::sigdelset(&mut caller, libc::SIGCHLD), 0);
+        assert_eq!(
+            libc::pthread_sigmask(libc::SIG_SETMASK, &caller, std::ptr::null_mut()),
+            0
+        );
+        RestoreMask(original)
+    };
+    let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    for (timeout_ms, data_ready) in [(0, false), (50, false), (50, true)] {
+        if data_ready {
+            writer.write_all(b"X").unwrap();
+        }
+        let mut calls = 0;
+        let ready = poll_readable_with(reader.as_raw_fd(), timeout_ms, |timeout, mask| {
+            calls += 1;
+            assert_eq!(timeout.tv_sec, 0);
+            assert_eq!(timeout.tv_nsec, i64::from(timeout_ms) * 1_000_000);
+
+            // Force a pending SIGCHLD at the native wait boundary. ppoll
+            // installs the supplied mask atomically: an unmasked SIGCHLD
+            // deterministically returns EINTR, even without scheduling delay.
+            // SAFETY: initialized masks and a live calling-thread identity.
+            unsafe {
+                assert_eq!(libc::sigismember(mask, libc::SIGUSR1), 1);
+                let mut blocked = *mask;
+                assert_eq!(libc::sigaddset(&mut blocked, libc::SIGCHLD), 0);
+                let mut original = std::mem::zeroed();
+                assert_eq!(
+                    libc::pthread_sigmask(libc::SIG_SETMASK, &blocked, &mut original),
+                    0
+                );
+                let restore = RestoreMask(original);
+                assert_eq!(libc::pthread_kill(libc::pthread_self(), libc::SIGCHLD), 0);
+                let mut pending = std::mem::zeroed();
+                assert_eq!(libc::sigpending(&mut pending), 0);
+                assert_eq!(libc::sigismember(&pending, libc::SIGCHLD), 1);
+                restore
+            }
+        });
+        assert_eq!(ready, data_ready, "a child signal is not stdout readiness");
+        assert_eq!(calls, 1, "one native wait, no retry or deadline reset");
+        // SAFETY: query only; validate the caller's mask after the wait.
+        unsafe {
+            let mut after = std::mem::zeroed();
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut after),
+                0
+            );
+            assert_eq!(libc::sigismember(&after, libc::SIGCHLD), 0);
+            assert_eq!(libc::sigismember(&after, libc::SIGUSR1), 1);
+        }
+    }
 }
 
 #[test]
