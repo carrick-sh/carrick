@@ -167,6 +167,44 @@ fn serial_host_cloudmac_hook_is_the_same_terminal_wrapper() {
 }
 
 #[test]
+fn serial_host_standing_hook_admits_a_re_vetted_assignment_and_kills_a_refused_one() {
+    // Issue #333: GitHub assigned the clone minted for run A a job from run B.
+    // The bound policy refuses B; only the controller's re-vet may admit it.
+    let hook = carrick_xtask::ci_scaler::standing_hook_script().unwrap();
+    let bound = "/usr/local/bin/carrick-xtask ci-scaler admit-job";
+    let revet = format!("{bound} --controller");
+    assert!(
+        hook.contains(&revet),
+        "standing hook never asks for a re-vet"
+    );
+    let decide = |bound_ok: bool, revet_ok: bool| {
+        let truth = |ok| {
+            if ok {
+                "/usr/bin/true"
+            } else {
+                "/usr/bin/false"
+            }
+        };
+        hook.replace(&revet, truth(revet_ok))
+            .replace(bound, truth(bound_ok))
+    };
+    // Reserved run A: the bound policy admits it, as before.
+    let (dir, status) = fixture_run(&decide(true, false));
+    assert!(status.success());
+    assert!(dir.path().join("always-ran").exists());
+    // Admissible run B: bound refuses, the controller approves B's own policy.
+    let (dir, status) = fixture_run(&decide(false, true));
+    assert!(status.success(), "re-vetted assignment B was refused");
+    assert!(dir.path().join("always-ran").exists());
+    // Inadmissible run B: both refuse, the whole session dies before any step.
+    let (dir, status) = fixture_run(&decide(false, false));
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    assert!(!dir.path().join("always-ran").exists());
+    assert!(!dir.path().join("failure-ran").exists());
+    assert!(!dir.path().join("listener-survived").exists());
+}
+
+#[test]
 fn cloudmac_launch_isolates_the_runner_session_before_it_can_receive_a_job() {
     let source = include_str!("../src/ci_scaler/mac.rs");
     assert!(source.contains("libc::setsid()"));

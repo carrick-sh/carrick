@@ -220,12 +220,41 @@ fn a_job_whose_clone_closed_without_running_it_is_served_again_up_to_a_cap() {
         assert!(ledger.served(job(1)));
         let last = ledger.rows.len() - 1;
         ledger.rows[last].state = State::Destroyed;
-        // Assigned to some other job, or never assigned: not consumed.
-        ledger.rows[last].assigned = if serve == 0 { Some(JobId(99)) } else { None };
+        // Never assigned (failed launch, drained, killed): not consumed.
         assert_eq!(ledger.rows[last].name, row.name);
     }
     assert!(ledger.served(job(1)), "cap reached");
     assert!(ledger.reserve(job(1), &[], 99, Concurrency::ONE).is_err());
+}
+
+#[test]
+fn a_clone_github_diverted_to_another_job_neither_holds_nor_consumes_its_reservation() {
+    // Issue #333: a clone minted for run A was assigned job B by GitHub.
+    let a = job(1);
+    let b = JobKey {
+        run: RunId(20),
+        attempt: 1,
+        job: JobId(21),
+    };
+    let mut ledger = Ledger::default();
+    for serve in 0..=MAX_SERVES_PER_JOB {
+        ledger
+            .reserve(a, &[], 10 + serve as u64, Concurrency::try_from(2).unwrap())
+            .unwrap();
+        let last = ledger.rows.len() - 1;
+        ledger.rows[last].assigned = Some(JobId(21 + serve as u64));
+        // B is running (or was refused) on this clone: never served again.
+        assert!(ledger.served(JobKey {
+            job: JobId(21 + serve as u64),
+            ..b
+        }));
+        // A is still queued demand: the diverted clone does not hold it ...
+        assert!(!ledger.served(a), "serve {serve}: diverted clone held A");
+        ledger.rows[last].state = State::Destroyed;
+    }
+    // ... and diversions never exhaust A's re-serve budget.
+    assert!(!ledger.served(a));
+    assert!(ledger.reserve(a, &[], 99, Concurrency::ONE).is_ok());
 }
 
 #[test]

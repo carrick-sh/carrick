@@ -6,6 +6,11 @@ Contabo host (issue #287). This replaces the per-run GCP VMs
 admission and teardown are the Willow standing controller's, unchanged
 ([willow-pilot.md](willow-pilot.md)). Only the clone placement differs, and
 it comes from the typed site table in `crates/carrick-xtask/src/ci_scaler/site.rs`.
+A clone that GitHub assigns a job from a run other than the one it was minted
+for admits it only after the controller re-vets that run
+([willow-pilot.md](willow-pilot.md#actual-assignments-are-re-vetted-333));
+the controller binary in `/root/carrick-ci/bin` carries this, so deploying it
+needs a controller restart, not a template rebuild.
 
 This is trusted-ref CI infrastructure for an experimental project, not an
 adversarial isolation boundary.
