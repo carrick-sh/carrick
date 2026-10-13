@@ -3,7 +3,9 @@
 //! The enclosing native graph guard supplies exclusive access to this owner.
 //! Child admission retains that access through publication; exit custody retains
 //! it through shared topology/receipt publication and exact reservation release.
-//! Cancellation and signal snapshots occur after the enclosing guard is dropped.
+//! Cancellation and scheduler wakes occur after the enclosing guard is dropped.
+//! Native leaf signal locks may be sampled under the guard so selection and
+//! notification retain the same exact parent generation.
 //! This adapter returns custody, never syscall completion or a CPU/MM operation.
 extern crate alloc;
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -65,8 +67,9 @@ pub trait NativeProcessCustody {
     fn wait_event(&self, flags: WaitJobControl, consume: bool) -> Option<Self::Event>;
     fn wake_generation(&self) -> TaskWakeGeneration;
     fn own_members_and_resources(&self) -> (Vec<Self::Member>, Self::Resources);
-    /// Retain a handle only; signal locks are sampled by shared `prepare()`
-    /// after cancellation and after the enclosing registry guard is released.
+    /// Retain a handle only; shared `prepare()` samples signal locks after
+    /// cancellation. Native leaf locks permit preparation under graph custody;
+    /// scheduler work must remain outside the enclosing registry guard.
     fn signal_target(&self) -> Self::SignalTarget;
     fn autoreaps_children(&self) -> bool;
     fn own_rusage(&self) -> TaskRusage;
@@ -935,7 +938,8 @@ impl<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>
     }
 
     /// Retain an exact shared parent target after exact member cancellation.
-    /// The caller drops its enclosing graph guard before target.prepare().
+    /// Native leaf signal locks permit `target.prepare()` under graph custody,
+    /// keeping recipient selection and notification atomic with reparenting.
     pub fn select_exit_parent(
         &self,
         permit: &ExitParentPermit,
