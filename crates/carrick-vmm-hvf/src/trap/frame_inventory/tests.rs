@@ -7659,6 +7659,91 @@ fn relocate_exit_fixture_root(task: &mut HvfTaskState, base: u64) -> CarrierStag
 }
 
 #[test]
+fn sequential_container_roots_return_their_final_pooled_arena() {
+    let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let _stage2_stub = ScopedStage2MapTestStub::enable();
+    let custody = legacy_test_carrier_vm_custody_arc();
+    let pool = std::sync::Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
+        1,
+    ));
+    let _pool_fixture = BootstrapRetirementPoolFixture::install(custody, pool.clone());
+    let kernel = std::sync::Arc::new(PerFrameKernel::default());
+    let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
+    let base = pool.base_ipa();
+    let mut unfinished = Vec::new();
+    let mut predecessor = None;
+
+    for run in 0..4 {
+        let id = 800 + run * 2;
+        let (mut task, _, _, _) =
+            exit_task_holding_owned_lease(id, 0x4000 + run * 0x4000, id, id + 1, &kernel, &frames);
+        let record = relocate_exit_fixture_root(&mut task, base);
+        if let Some(old) = predecessor {
+            assert_eq!(
+                custody.request_stage2_record_retirement(old),
+                CarrierStage2RetireOutcome::NotFound,
+                "retired predecessor cannot release the successor's reused slot"
+            );
+            assert!(
+                custody
+                    .stage2_record_snapshot(record.record_id)
+                    .unwrap()
+                    .mapped
+            );
+        }
+        drop(task);
+        let terminal = custody.stage2_record_snapshot(record.record_id).is_none();
+        if !terminal {
+            unfinished.push(run);
+            retire_carrier_stage2_record_at_safe_point(custody, record).unwrap();
+        }
+        let reused = pool
+            .allocate_slot_at(base)
+            .expect("next container reuses exact slot");
+        drop(reused);
+        predecessor = Some(record);
+    }
+    assert!(
+        unfinished.is_empty(),
+        "root teardown left pooled arenas live after runs {unfinished:?}"
+    );
+    assert_eq!(pool.allocated_count(), 0);
+}
+
+#[test]
+fn final_parked_pin_returns_pooled_arena_after_owner_retirement() {
+    let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let _stage2_stub = ScopedStage2MapTestStub::enable();
+    let custody = legacy_test_carrier_vm_custody_arc();
+    let pool = std::sync::Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
+        1,
+    ));
+    let _pool_fixture = BootstrapRetirementPoolFixture::install(custody, pool.clone());
+    let kernel = std::sync::Arc::new(PerFrameKernel::default());
+    let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
+    let (mut task, _, _, _) =
+        exit_task_holding_owned_lease(820, 0x4000, 820, 821, &kernel, &frames);
+    let base = pool.base_ipa();
+    let record = relocate_exit_fixture_root(&mut task, base);
+    let pin = custody.pin_stage2_record(record).unwrap();
+    drop(task);
+    assert!(
+        pool.allocate_slot_at(base).is_none(),
+        "parked pin owns the slot"
+    );
+    drop(pin);
+    let terminal = custody.stage2_record_snapshot(record.record_id).is_none();
+    if !terminal {
+        retire_carrier_stage2_record_at_safe_point(custody, record).unwrap();
+    }
+    let reused = pool
+        .allocate_slot_at(base)
+        .expect("last parked pin returns exact slot");
+    drop(reused);
+    assert!(terminal, "last parked pin left pooled arena pending");
+}
+
+#[test]
 fn two_live_mm_exec_successor_keeps_predecessor_table_retirement_custody() {
     let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
@@ -7870,7 +7955,9 @@ fn two_live_mm_pinned_table_retirement_cannot_return_physical_capacity() {
     // Explicit cleanup before the red assertions, preserving no pinned slot.
     drop(reused);
     drop(pin);
-    retire_carrier_stage2_record_at_safe_point(custody, record).unwrap();
+    if custody.stage2_record_snapshot(record.record_id).is_some() {
+        retire_carrier_stage2_record_at_safe_point(custody, record).unwrap();
+    }
     first.mm_access.release_structural_owner_at(base, 0x20_0000);
     retire_global_frame_host_owner_if_generation_in(custody, key.0, key.1, generation);
     HvfVmState::retire_task_state_process_mappings(&mut second).unwrap();
