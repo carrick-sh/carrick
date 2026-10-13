@@ -398,9 +398,6 @@ impl Fixture {
             control,
         }
     }
-}
-
-impl Fixture {
     fn process_service(&'static self) -> Aarch64NativeProcessService<'static, TestStockCrossing> {
         Aarch64NativeProcessService::with_crossing(
             &self.task,
@@ -1355,9 +1352,6 @@ fn arm_root_setup_enters_production_process_venue() {
         );
         assert_eq!(counters.served[nr as usize].load(Ordering::Acquire), 1);
         assert_eq!(counters.forwarded[nr as usize].load(Ordering::Acquire), 0);
-        // ARM's host boundary interprets a retained home with no current
-        // record as a parked thread. An ordinary returned process call must
-        // not supply that false park (the signed root's first turn did).
         assert!(fixture.zone.slot(fixture.slot).current().is_none());
         assert!(
             fixture.zone.slot(fixture.slot).host_record().is_none(),
@@ -1408,14 +1402,10 @@ fn arm_returned_process_call_is_not_a_zone_park() {
             },
         )
         .unwrap();
-        // This is the production host reconciler's (current, home) input.
-        // (None, Some) would settle the running root as a zone wait; a Free
-        // record cannot supply the Host record its next executor must load.
         assert!(fixture.zone.slot(fixture.slot).current().is_none());
         assert!(fixture.zone.slot(fixture.slot).host_record().is_none());
         assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 1);
     }
-    // Conversely, a real publication must outlive the entry scope.
     let published = with_process_entry(
         source,
         &fixture.task,
@@ -1507,73 +1497,92 @@ fn imported_thread_with_identity(
 
 #[test]
 fn arm_root_admission_imports_live_thread_membership_without_changing_census() {
-    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
-    let (_, record) = imported_thread(fixture);
-    let source = BornInZoneSource {
-        zone: fixture.zone,
-        slot: fixture.slot,
-    };
-    let mut service = fixture.process_service();
-    let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
-    let signal = carrick_signal_core::policy::Signal::from_number(10).unwrap();
-    let action = carrick_signal_core::policy::Action {
-        disposition: carrick_signal_core::policy::Disposition::Ignore,
-        ..Default::default()
-    };
-    let route = with_process_entry(
-        source,
-        &fixture.task,
-        ThreadCtx::ZERO,
-        ttbr0,
-        fixture.page,
-        fixture.control,
-        &mut service,
-        |process| {
-            process
-                .signal_venue()
-                .unwrap()
-                .rt_sigaction(signal, Some(action))
-                .unwrap();
-            assert!(process.has_thread(41));
-            assert!(
-                process.has_thread(42),
-                "already-live member belongs to this process owner"
-            );
-        },
-    );
-    assert!(
-        route.is_ok(),
-        "authenticated imported membership must admit: {route:?}"
-    );
-    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
-    assert!(fixture.zone.live(record).is_some());
-    let owner = registry()
-        .for_entry(source, &fixture.task, fixture.address)
-        .unwrap();
-    fixture.task.set(El1TaskId::from_linux_tid(42), 12, 5);
-    fixture
-        .task
-        .mm
-        .thread_generation
-        .store(102, Ordering::Release);
-    let control = fixture.zone.record(record.id).identity().control_slot;
-    fixture
-        .task
-        .publish_lifecycle(fixture.page as *const _ as u64, control);
-    assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
-        record.id
-    );
-    let control = unsafe { &*(control as *const ThreadControlSlot) };
-    let stale_address = AddressContext {
-        generation: ContextGeneration::new(NonZeroU64::new(102).unwrap()),
-        ..fixture.address
-    };
-    unsafe {
-        *fixture.zone.record(record.id).ctx_mut() =
-            Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, stale_address);
-    }
-    assert!(
+    for notified in [false, true] {
+        let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+        let (_, record) = imported_thread(fixture);
+        let source = BornInZoneSource {
+            zone: fixture.zone,
+            slot: fixture.slot,
+        };
+        let mut service = fixture.process_service();
+        let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
+        let signal = carrick_signal_core::policy::Signal::from_number(10).unwrap();
+        let action = carrick_signal_core::policy::Action {
+            disposition: carrick_signal_core::policy::Disposition::Ignore,
+            ..Default::default()
+        };
+        let route = with_process_entry(
+            source,
+            &fixture.task,
+            ThreadCtx::ZERO,
+            ttbr0,
+            fixture.page,
+            fixture.control,
+            &mut service,
+            |process| {
+                process
+                    .signal_venue()
+                    .unwrap()
+                    .rt_sigaction(signal, Some(action))
+                    .unwrap();
+                assert!(process.has_thread(41));
+                assert!(
+                    process.has_thread(42),
+                    "already-live member belongs to this process owner"
+                );
+            },
+        );
+        assert!(
+            route.is_ok(),
+            "authenticated imported membership must admit: {route:?}"
+        );
+        assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
+        assert!(fixture.zone.live(record).is_some());
+        let owner = registry()
+            .for_entry(source, &fixture.task, fixture.address)
+            .unwrap();
+        fixture.task.set(El1TaskId::from_linux_tid(42), 12, 5);
+        fixture
+            .task
+            .mm
+            .thread_generation
+            .store(102, Ordering::Release);
+        let control = fixture.zone.record(record.id).identity().control_slot;
+        fixture
+            .task
+            .publish_lifecycle(fixture.page as *const _ as u64, control);
+        assert_eq!(
+            fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+            record.id
+        );
+        let control = unsafe { &*(control as *const ThreadControlSlot) };
+        let stale_address = AddressContext {
+            generation: ContextGeneration::new(NonZeroU64::new(102).unwrap()),
+            ..fixture.address
+        };
+        unsafe {
+            *fixture.zone.record(record.id).ctx_mut() =
+                Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, stale_address);
+        }
+        assert!(
+            with_process_entry(
+                source,
+                &fixture.task,
+                ThreadCtx::ZERO,
+                ttbr0,
+                fixture.page,
+                control,
+                &mut service,
+                |_| panic!(
+                    "thread must not substitute the group generation for a stale parked root"
+                )
+            )
+            .is_err()
+        );
+        unsafe {
+            *fixture.zone.record(record.id).ctx_mut() =
+                Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+        }
         with_process_entry(
             source,
             &fixture.task,
@@ -1582,97 +1591,86 @@ fn arm_root_admission_imports_live_thread_membership_without_changing_census() {
             fixture.page,
             control,
             &mut service,
-            |_| panic!("thread must not substitute the group generation for a stale parked root")
+            |process| {
+                assert_eq!(
+                    process.binding(),
+                    super::common_entry::execution_binding(&fixture.task)
+                );
+                assert!(process.has_thread(41) && process.has_thread(42));
+                assert_eq!(
+                    process
+                        .signal_venue()
+                        .unwrap()
+                        .rt_sigaction(signal, None)
+                        .unwrap(),
+                    action,
+                    "imported thread shares the retained sighand"
+                );
+            },
         )
-        .is_err()
-    );
-    unsafe {
-        *fixture.zone.record(record.id).ctx_mut() =
-            Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+        .unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            &owner,
+            &registry()
+                .for_entry(source, &fixture.task, fixture.address)
+                .unwrap()
+        ));
+        assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
+        with_process_entry(
+            source,
+            &fixture.task,
+            ThreadCtx::ZERO,
+            ttbr0,
+            fixture.page,
+            control,
+            &mut service,
+            |process| {
+                let admission =
+                    carrick_el1_abi::Lifecycle::begin_exit(fixture.page, control.entry().unwrap())
+                        .unwrap();
+                fixture.page.try_exit().unwrap();
+                carrick_core::entry::retire_current(process.binding(), source, record.id).unwrap();
+                admission.commit().unwrap();
+                if notified {
+                    process.thread_exited(42);
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            registry().for_record(fixture.zone, record).is_none(),
+            notified
+        );
+        fixture.task.set(El1TaskId::from_linux_tid(41), 11, 5);
+        fixture
+            .task
+            .mm
+            .thread_generation
+            .store(101, Ordering::Release);
+        fixture.task.publish_lifecycle(
+            fixture.page as *const _ as u64,
+            fixture.control as *const _ as u64,
+        );
+        with_process_entry(
+            source,
+            &fixture.task,
+            ThreadCtx::ZERO,
+            ttbr0,
+            fixture.page,
+            fixture.control,
+            &mut service,
+            |process| {
+                assert!(matches!(
+                    process.exit_group(7),
+                    LifecycleOutcome::Transferred { .. }
+                ));
+            },
+        )
+        .unwrap();
+        assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
+        assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 0);
+        assert!(registry().for_record(fixture.zone, record).is_none());
     }
-    with_process_entry(
-        source,
-        &fixture.task,
-        ThreadCtx::ZERO,
-        ttbr0,
-        fixture.page,
-        control,
-        &mut service,
-        |process| {
-            assert_eq!(
-                process.binding(),
-                super::common_entry::execution_binding(&fixture.task)
-            );
-            assert!(process.has_thread(41) && process.has_thread(42));
-            assert_eq!(
-                process
-                    .signal_venue()
-                    .unwrap()
-                    .rt_sigaction(signal, None)
-                    .unwrap(),
-                action,
-                "imported thread shares the retained sighand"
-            );
-        },
-    )
-    .unwrap();
-    assert!(std::sync::Arc::ptr_eq(
-        &owner,
-        &registry()
-            .for_entry(source, &fixture.task, fixture.address)
-            .unwrap()
-    ));
-    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
-    // The lifecycle owner retires the imported member before notifying the
-    // process owner. It must no longer be charged to the root's final exit.
-    with_process_entry(
-        source,
-        &fixture.task,
-        ThreadCtx::ZERO,
-        ttbr0,
-        fixture.page,
-        control,
-        &mut service,
-        |process| {
-            let admission =
-                carrick_el1_abi::Lifecycle::begin_exit(fixture.page, control.entry().unwrap())
-                    .unwrap();
-            fixture.page.try_exit().unwrap();
-            carrick_core::entry::retire_current(process.binding(), source, record.id).unwrap();
-            admission.commit().unwrap();
-            process.thread_exited(42);
-        },
-    )
-    .unwrap();
-    assert!(registry().for_record(fixture.zone, record).is_none());
-    fixture.task.set(El1TaskId::from_linux_tid(41), 11, 5);
-    fixture
-        .task
-        .mm
-        .thread_generation
-        .store(101, Ordering::Release);
-    fixture.task.publish_lifecycle(
-        fixture.page as *const _ as u64,
-        fixture.control as *const _ as u64,
-    );
-    with_process_entry(
-        source,
-        &fixture.task,
-        ThreadCtx::ZERO,
-        ttbr0,
-        fixture.page,
-        fixture.control,
-        &mut service,
-        |process| {
-            assert!(matches!(
-                process.exit_group(7),
-                LifecycleOutcome::Transferred { .. }
-            ));
-        },
-    )
-    .unwrap();
-    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
-    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 0);
 }
 
 #[test]
@@ -1784,8 +1782,6 @@ fn arm_root_entry_refuses_wrong_binding_and_root_incarnation() {
     let before = registry()
         .for_entry(source, &fixture.task, fixture.address)
         .unwrap();
-    // These refusals compare a published running record with stale task
-    // metadata, rather than a new host lease that may renew admission.
     let record = process_record_for_call(source, &fixture.task, ThreadCtx::ZERO, ttbr0).unwrap();
     admit_entry(
         source,
@@ -1975,8 +1971,6 @@ fn arm_born_thread_uses_native_owner_without_an_execution_generation() {
     ));
     assert_eq!(fixture.zone.record(record.id).identity().generation, 0);
     assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
-    // The normal host activation replaces the retired Born execution record;
-    // the process graph and lifecycle member remain the same authorities.
     fixture.zone.clear_current(fixture.slot);
     fixture.zone.free_record(record.id);
     let slot = SlotId::new(1);
