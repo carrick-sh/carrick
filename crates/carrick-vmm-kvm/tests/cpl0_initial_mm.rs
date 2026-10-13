@@ -53,7 +53,9 @@ fn native_exit_workers(
     carrick_vmm_kvm::cpl0_boot::ProductionWorkerParts,
     carrick_el1_abi::El1TaskId,
 ) {
-    let image = prepare_static_x86_elf(elf).expect("static ELF");
+    let program = carrick_mem::elf::ElfProgram::load(elf, ELF_X86_64_MACHINE, &|_| None)
+        .expect("ELF program");
+    let image = prepare_x86_elf(&program).expect("static ELF");
     let extent = Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("extent");
     let mut carrier = Cpl0Carrier::boot_production(physical_inventory(), extent).expect("real KVM");
     let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::default();
