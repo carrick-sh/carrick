@@ -466,7 +466,7 @@ enum OutstandingExitReceipt<'a> {
     },
     HostBorn {
         identity: carrick_core::terminal::HostThreadRetirementReceipt,
-        control: &'a ThreadControlSlot,
+        index: usize,
     },
 }
 
@@ -494,17 +494,12 @@ impl PendingExit<'_> {
             OutstandingExitReceipt::Adopted { binding, control } => control
                 .host_retirement()
                 .is_some_and(|receipt| receipt.matches(*binding)),
-            OutstandingExitReceipt::HostBorn { identity, control } => {
-                control.host_retirement() == Some(*identity)
+            OutstandingExitReceipt::HostBorn { identity, index } => {
+                page.host_birth_identity(*index) == Some(*identity)
+                    && page.host_birth_receipt_returned(*index)
             }
         }) && (0..carrick_el1_abi::THREAD_POOL_ENTRIES).all(|index| {
-            page.host_born_address(index).is_none_or(|address| {
-                // SAFETY: Closing defers release until Settled.
-                let control = unsafe { &*(address as *const ThreadControlSlot) };
-                control.host_birth_identity().is_some_and(|identity| {
-                    control.host_retirement() == Some(identity)
-                })
-            })
+            page.host_birth_identity(index).is_none_or(|_| page.host_birth_receipt_returned(index))
         })
     }
 }
@@ -755,13 +750,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             }
         }
         for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
-            let Some(address) = page.host_born_address(index) else {
+            let Some(identity) = page.host_birth_identity(index) else {
                 continue;
             };
-            // SAFETY: Closing retains host-born slots until Settled.
-            let control = unsafe { &*(address as *const ThreadControlSlot) };
-            if !core::ptr::eq(control, caller) && control.host_birth_identity().is_some() {
-                control.request_host_exit();
+            if caller.host_birth_identity() != Some(identity) {
+                page.request_host_birth_cancel(index);
             }
         }
         for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
@@ -1260,7 +1253,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 .map_err(|_| NativeProcessError::Stale)?;
             let already_owned = if let Some(issued) = host_issued {
                 let already_owned = issued.authorize_group(source, row, address, page, control)?;
-                if !page.release_adopted_host_birth(core::ptr::from_ref(control).addr() as u64) {
+                if !page.release_adopted_host_birth(
+                    carrick_core::terminal::HostThreadRetirementReceipt::from_binding(binding),
+                ) {
                     return Err(NativeProcessError::Stale);
                 }
                 already_owned
@@ -1429,7 +1424,10 @@ impl IssuedHostThread {
         if control.host_birth_identity()
             != Some(carrick_core::terminal::HostThreadRetirementReceipt::from_binding(binding))
             || !(0..carrick_el1_abi::THREAD_POOL_ENTRIES).any(|index| {
-                page.host_born_address(index) == Some(core::ptr::from_ref(control).addr() as u64)
+                page.host_birth_identity(index)
+                    == Some(
+                        carrick_core::terminal::HostThreadRetirementReceipt::from_binding(binding),
+                    )
             })
         {
             return Err(NativeProcessError::Stale);
@@ -3401,18 +3399,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     }
                 }));
                 for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
-                    let Some(address) = page.host_born_address(index) else {
+                    let Some(identity) = page.host_birth_identity(index) else {
                         continue;
                     };
-                    // SAFETY: a Closing page retains the slot until Settled.
-                    let control = unsafe { &*(address as *const ThreadControlSlot) };
-                    if core::ptr::eq(control, self.control) {
+                    if page.host_birth_receipt_returned(index) {
                         continue;
                     }
-                    let identity = control
-                        .host_birth_identity()
-                        .ok_or(NativeProcessError::Stale)?;
-                    outstanding.push(OutstandingExitReceipt::HostBorn { identity, control });
+                    if self.control.host_birth_identity() == Some(identity) {
+                        continue;
+                    }
+                    outstanding.push(OutstandingExitReceipt::HostBorn { identity, index });
                 }
                 let bindings = outstanding
                     .iter()

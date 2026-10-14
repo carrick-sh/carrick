@@ -506,8 +506,11 @@ impl PreparedThreadClone {
             let page = thread.control_lease().lifecycle();
             if let Some(index) = host_birth {
                 thread.control_lease().pin_host_birth(index);
-                publication_valid &=
-                    page.publish_host_birth(index, thread.control_lease().slot_address().0 as u64);
+                if let Some(identity) = thread.control_slot().host_birth_identity() {
+                    publication_valid &= page.publish_host_birth(index, identity);
+                } else {
+                    publication_valid = false;
+                }
             } else if matches!(lane, PublicationLane::HostClone { host_birth: true }) {
                 publication_valid = false;
             }
@@ -1114,7 +1117,7 @@ mod tests {
         assert_eq!(page.host_birth_claimed_count(), 0);
         assert_eq!(
             (0..carrick_el1_abi::THREAD_POOL_ENTRIES)
-                .filter(|&index| page.host_born_address(index).is_some())
+                .filter(|&index| page.host_birth_identity(index).is_some())
                 .count(),
             carrick_el1_abi::THREAD_POOL_ENTRIES,
         );
