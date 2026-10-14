@@ -52,6 +52,14 @@ pub fn settle_el1_boundary(
     let boundary = carrick_el1_abi::take_served_boundary(slot);
     let served = boundary.is_some();
     let pending = carrick_el1_abi::take_pending_host_work(slot);
+    deliver_boundary_wakes(kernel, served, pending);
+    boundary
+}
+
+/// Publish wakes after the stopped carrier has consumed its exact task's
+/// completed-work and pending-work flags. Both ARM mailboxes and x86 CPL0
+/// work doorbells use this host side of the in-zone completion boundary.
+pub fn deliver_boundary_wakes(kernel: &crate::kernel::Kernel, served: bool, pending: bool) {
     if served {
         crate::el1_inotify::deliver_owed_wakes();
     }
@@ -61,7 +69,6 @@ pub fn settle_el1_boundary(
             owned_recall::notify(zone, carrick_sched_core::Waker::Host);
         }
     }
-    boundary
 }
 
 /// [`settle_el1_boundary`] for the kernel `dispatcher` serves.
