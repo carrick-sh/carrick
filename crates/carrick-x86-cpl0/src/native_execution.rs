@@ -70,35 +70,47 @@ pub fn schedule(slot: SlotId) -> ! {
                 let mut entry = runtime
                     .enter(source, current, words, &mut service)
                     .unwrap_or_else(|_| fatal_boot());
-                if let Some(outcome) = entry.resume_pending_lifecycle() {
-                    if let Some(reason) = entry.take_run_failure() {
-                        complete_run_failure(current, reason);
-                    }
-                    match outcome {
-                        carrick_personality_linux::lifecycle::LifecycleOutcome::Returned {
-                            result,
-                            ..
-                        } => words.set_syscall_return(result.raw() as u64),
-                        carrick_personality_linux::lifecycle::LifecycleOutcome::Transferred {
-                            progress: carrick_core::Served::Idle,
-                            ..
-                        } => {
-                            let _receipt =
-                                entry.take_handoff_receipt().unwrap_or_else(|| fatal_boot());
-                            let root_exit = entry.take_root_exit();
-                            if let Some(status) = root_exit {
-                                publish_root_exit(
-                                    current,
-                                    status.terminal_status().unwrap_or_else(|_| fatal_boot()),
-                                );
-                            }
-                            leave_space(source);
-                            continue;
+                match entry
+                    .resume_checkpoint()
+                    .unwrap_or_else(|reason| complete_run_failure(current, reason))
+                {
+                    carrick_el1::personality::native_process_runtime::NativeResume::Returned(
+                        result,
+                    ) => words.set_syscall_return(result.raw() as u64),
+                    carrick_el1::personality::native_process_runtime::NativeResume::Left(
+                        root_exit,
+                    ) => {
+                        if let Some(status) = root_exit {
+                            publish_root_exit(current, status.to_termination_status());
                         }
-                        _ => fatal_boot(),
+                        leave_space(source);
+                            continue;
+=======
+                match entry
+                    .resume_checkpoint()
+                    .unwrap_or_else(|reason| complete_run_failure(current, reason))
+                {
+                    carrick_el1::personality::native_process_runtime::NativeResume::Returned(
+                        result,
+                    ) => words.set_syscall_return(result.raw() as u64),
+                    carrick_el1::personality::native_process_runtime::NativeResume::Left(
+                        root_exit,
+                    ) => {
+                        if let Some(status) = root_exit {
+                            publish_root_exit(current, status.to_termination_status());
+>>>>>>> 7888f9c7d (feat(el1): resume switched ARM waits through the native owner)
+                        }
+                        leave_space(source);
+                        continue;
                     }
-                } else if let Some(result) = selected.result {
-                    words.set_syscall_return(result);
+                    carrick_el1::personality::native_process_runtime::NativeResume::NoPending => {
+                        if let Some(result) = selected.result {
+                            words.set_syscall_return(result);
+                        }
+                    }
+                    carrick_el1::personality::native_process_runtime::NativeResume::Invalid => {
+                        fatal_boot()
+                    }
                 }
                 if !suspended {
                     let native = context::context_words::into_native(words, state.address)
