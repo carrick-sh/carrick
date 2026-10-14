@@ -32,6 +32,59 @@ use std::path::{Path, PathBuf};
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
+/// Narrow transport guard while the broader carrier substrate split is pending.
+pub fn check_carrier_root_exit_transport(root: &Path) -> Result<(), BoundaryError> {
+    let path = root.join("crates/carrick-x86-carrier/src/native_execution.rs");
+    let source = fs::read_to_string(&path).map_err(|source| BoundaryError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let file = syn::parse_file(&source).map_err(|source| BoundaryError::Syn {
+        path: path.clone(),
+        source,
+    })?;
+    struct LoweringVisitor {
+        found: bool,
+    }
+    impl LoweringVisitor {
+        fn tokens(&mut self, tokens: proc_macro2::TokenStream) {
+            for token in tokens {
+                match token {
+                    proc_macro2::TokenTree::Ident(ident) => self.visit_ident(&ident),
+                    proc_macro2::TokenTree::Group(group) => self.tokens(group.stream()),
+                    _ => {}
+                }
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for LoweringVisitor {
+        fn visit_macro(&mut self, node: &'ast syn::Macro) {
+            self.tokens(node.tokens.clone());
+            syn::visit::visit_macro(self, node);
+        }
+        fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+            if matches!(
+                ident.to_string().as_str(),
+                "carrick_personality_linux" | "LinuxWaitStatus" | "from_termination_status"
+            ) {
+                self.found = true;
+            }
+        }
+    }
+    let mut visitor = LoweringVisitor { found: false };
+    visitor.visit_file(&file);
+    if visitor.found {
+        return Err(BoundaryError::Violations {
+            count: 1,
+            report: format!(
+                "{}: carrier root exit must carry neutral TerminationStatus without Linux wait lowering",
+                path.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Default allowlist of substrate crates subject to boundary verification.
 pub const DEFAULT_SUBSTRATE_ALLOWLIST: &[&str] = &[
     "carrick-core",
@@ -1501,6 +1554,31 @@ impl<'ast, 'a> Visit<'ast> for SourceCheckerVisitor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn carrier_root_exit_has_no_linux_wait_lowering() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        check_carrier_root_exit_transport(&repo).unwrap();
+    }
+
+    #[test]
+    fn carrier_root_exit_guard_rejects_import_aliases_and_lowering() {
+        for source in [
+            "use carrick_personality_linux as policy;",
+            "use policy::LinuxWaitStatus as Status;",
+            "fn exit() { Status::from_termination_status(status); }",
+            "macro_rules! exit { () => { LinuxWaitStatus::from_termination_status(status) }; }",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let dir = temp.path().join("crates/carrick-x86-carrier/src");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("native_execution.rs"), source).unwrap();
+            assert!(matches!(
+                check_carrier_root_exit_transport(temp.path()),
+                Err(BoundaryError::Violations { .. })
+            ));
+        }
+    }
 
     fn root_glob(tree: &syn::UseTree) -> bool {
         match tree {

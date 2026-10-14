@@ -290,13 +290,19 @@ pub enum InitialSyscallDisposition {
     ::core::cmp::PartialEq,
 )]
 pub enum PhysicalProcessExit {
-    Exited(carrick_personality_linux::lifecycle::LinuxWaitStatus),
+    Exited(carrick_sched_core::process::TerminationStatus),
     RunFailed(carrick_core_abi::NativeRunFailureReason),
 }
 impl PhysicalProcessExit {
     pub fn into_initial_process_exit(self, exits: usize) -> InitialProcessExit {
         match self {
-            Self::Exited(status) => InitialProcessExit::OwnedExit { status, exits },
+            Self::Exited(status) => InitialProcessExit::OwnedExit {
+                status:
+                    carrick_personality_linux::lifecycle::LinuxWaitStatus::from_termination_status(
+                        status,
+                    ),
+                exits,
+            },
             Self::RunFailed(reason) => InitialProcessExit::RunFailed { reason, exits },
         }
     }
@@ -1554,7 +1560,7 @@ impl ProductionCpuLease {
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
                     Ok((Some(PhysicalProcessExit::RunFailed(reason)), None, None))
                 }
-                carrick_el1_abi::NATIVE_ROOT_EXIT_PORT => {
+                carrick_core_abi::NATIVE_ROOT_EXIT_PORT => {
                     custody.root_exit_crossings = custody
                         .root_exit_crossings
                         .checked_add(1)
@@ -1766,7 +1772,7 @@ impl ProductionCpuLease {
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
                     Ok((Some(PhysicalProcessExit::RunFailed(reason)), None, None))
                 }
-                carrick_el1_abi::NATIVE_ROOT_EXIT_PORT => {
+                carrick_core_abi::NATIVE_ROOT_EXIT_PORT => {
                     custody.root_exit_crossings = custody
                         .root_exit_crossings
                         .checked_add(1)

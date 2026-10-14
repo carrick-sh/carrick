@@ -12,7 +12,6 @@ carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-mmu-core = { path = "../carrick-mmu-core" }
 carrick-personality-api = { path = "../carrick-personality-api" }
-carrick-personality-linux = { path = "../carrick-personality-linux" }
 carrick-sched-core = { path = "../carrick-sched-core" }
 
 [lints]
