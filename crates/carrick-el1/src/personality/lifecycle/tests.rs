@@ -1039,26 +1039,50 @@ fn sigaltstack_serves_off_the_alternate_stack() {
     let (action, _) = w.syscall(SYS_SIGALTSTACK, &[0, addr(&*old)]);
     assert_eq!(action, Action::Served);
     assert_eq!(*old, stack_t(0x10_0000, 0, 0x4000));
-    // Running on it (a handler): the host decides SS_ONSTACK and EPERM.
+    // Running on it (a handler): the retained slot reports SS_ONSTACK and
+    // refuses replacement with EPERM.
     w.cpu.regs.sp_el0 = 0x10_2000;
     let (action, _) = w.syscall(SYS_SIGALTSTACK, &[0, addr(&*old)]);
-    assert_eq!(action, Action::Forward);
+    assert_eq!(action, Action::Served);
+    assert_eq!(*old, stack_t(0x10_0000, 1, 0x4000));
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*new), 0]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(frame.x[0] as i64, -1);
     w.cpu.regs.sp_el0 = 0x2222_0000;
-    // Errors and aliases stay on the host.
-    for bad in [stack_t(0x20_0000, 0, 1024), stack_t(0x20_0000, 1, 0x4000)] {
+    // Linux error numbers stay in ring.
+    for (bad, errno) in [
+        (stack_t(0x20_0000, 0, 1024), -12),
+        (stack_t(0x20_0000, 1, 0x4000), -22),
+    ] {
         let bad = Box::new(bad);
-        let (action, _) = w.syscall(SYS_SIGALTSTACK, &[addr(&*bad), 0]);
-        assert_eq!(action, Action::Forward);
+        let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*bad), 0]);
+        assert_eq!(action, Action::Served);
+        assert_eq!(frame.x[0] as i64, errno);
     }
-    let (action, _) = w.syscall(SYS_SIGALTSTACK, &[addr(&*new), addr(&*new)]);
-    assert_eq!(action, Action::Forward);
+    let alias = Box::new(stack_t(0x30_0000, 0, 0x4000));
+    let (action, _) = w.syscall(SYS_SIGALTSTACK, &[addr(&*alias), addr(&*alias)]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(*alias, stack_t(0x10_0000, 0, 0x4000));
+    assert_eq!(w.venue.leader_slot().read_altstack().sp, 0x30_0000);
     // Disable, returning the old one.
     let off = Box::new(stack_t(0, SS_DISABLE, 0));
     let (action, _) = w.syscall(SYS_SIGALTSTACK, &[addr(&*off), addr(&*old)]);
     assert_eq!(action, Action::Served);
-    assert_eq!(*old, stack_t(0x10_0000, 0, 0x4000));
+    assert_eq!(*old, stack_t(0x30_0000, 0, 0x4000));
     assert!(w.venue.leader_slot().read_altstack().is_disabled());
-    assert_eq!(w.served(SYS_SIGALTSTACK), 4);
+    let autodisarm = Box::new(stack_t(
+        0x40_0000,
+        carrick_syscall_abi::LINUX_SS_AUTODISARM as u32,
+        0x4000,
+    ));
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*autodisarm), 0]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(frame.x[0], 0);
+    assert_eq!(
+        w.venue.leader_slot().read_altstack().flags,
+        carrick_syscall_abi::LINUX_SS_AUTODISARM as u32
+    );
+    assert_eq!(w.served(SYS_SIGALTSTACK), 10);
 }
 
 #[test]
