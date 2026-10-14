@@ -3,7 +3,7 @@
 #![allow(clippy::expect_used)]
 
 use carrick_el1::personality::file_table::{
-    admit_host_fd, admit_stdio, close_host_binding, retire_fd_map,
+    admit_host_fd, admit_stdio, close_host_binding, dup_host_binding, fork_fd_map, retire_fd_map,
 };
 use carrick_el1_abi::*;
 use carrick_guest_arch::{FrameGpa, GuestLen, KernelVa};
@@ -218,48 +218,40 @@ fn file_region_foreign_retired_and_two_carriers() {
 }
 
 #[test]
-fn file_region_two_live_tasks_share_inode_with_distinct_open_references() {
+fn file_region_fork_dup_lookup_and_retire_preserve_live_parent() {
     let fixture = Fixture::new(6);
     let tables = fixture.tables();
-    let tasks = [CurrentTask::new(), CurrentTask::new()];
-    for (index, task) in tasks.iter().enumerate() {
-        task.set(
-            El1TaskId::from_linux_tid(51 + index as i32),
-            1,
-            51 + index as u64,
-        );
-    }
-    // Storage-only witness: publish two open references to one inode using
-    // the actual ABI records. This does not claim a regular-file Open binding.
-    let inode = &tables.objects()[17];
-    inode.generation.store(9, Ordering::Relaxed);
-    inode.state.store(DELEGATED_STATE_GUEST, Ordering::Release);
-    for (index, task) in tasks.iter().enumerate() {
-        let open = &tables.opens()[18 + index];
-        open.generation.store(11 + index as u64, Ordering::Relaxed);
-        open.inode_handle.store(18, Ordering::Relaxed);
-        open.inode_generation.store(9, Ordering::Relaxed);
-        open.offset.store(index as u64 * 7, Ordering::Relaxed);
-        open.state.store(DELEGATED_STATE_GUEST, Ordering::Release);
-        tables.fd_map()[index].set(
-            task.linux.file_table.load(Ordering::Acquire),
-            3,
-            19 + index as u32,
-            11 + index as u64,
-        );
-        assert!(open.is_bound_to(inode));
-    }
-    inode.size.store(37, Ordering::Release);
-    assert_eq!(tables.opens()[18].offset.load(Ordering::Acquire), 0);
-    assert_eq!(tables.opens()[19].offset.load(Ordering::Acquire), 7);
-    let first = close_host_binding(tables.fd_map(), 51, 3).expect("first task close");
-    assert_eq!(first.release.expect("distinct open reference").handle, 19);
-    assert_eq!(
-        fd_map_lookup(tables.fd_map(), 52, 3).expect("live peer").0,
-        20
+    admit_stdio(
+        tables.fd_map(),
+        tables.opens(),
+        tables.objects(),
+        51,
+        [true; 3],
     );
-    assert!(tables.opens()[19].is_bound_to(inode));
-    assert_eq!(inode.size.load(Ordering::Acquire), 37);
-    retire_fd_map(tables.fd_map(), 51);
-    assert!(fd_map_lookup(tables.fd_map(), 52, 3).is_some());
+    assert!(fork_fd_map(tables.fd_map(), 51, 52));
+    for table in [51, 52] {
+        assert_eq!(
+            dup_host_binding(tables.fd_map(), table, 1, 0, 1024, false)
+                .expect("dup stdout")
+                .fd,
+            3
+        );
+    }
+    let parent = fd_map_lookup(tables.fd_map(), 51, 3).expect("parent dup");
+    let child = fd_map_lookup(tables.fd_map(), 52, 3).expect("child dup");
+    assert_ne!(parent.1, child.1);
+    assert_eq!(parent.0, child.0);
+    let open = &tables.opens()[parent.0 as usize - 1];
+    assert!(
+        open.is_bound_to(&tables.objects()[open.inode_handle.load(Ordering::Acquire) as usize - 1])
+    );
+    retire_fd_map(tables.fd_map(), 52);
+    assert_eq!(
+        tables.fd_map()[child.1].incarnation.load(Ordering::Acquire),
+        0
+    );
+    for fd in 0..=3 {
+        assert!(fd_map_lookup(tables.fd_map(), 51, fd).is_some());
+        assert!(fd_map_lookup(tables.fd_map(), 52, fd).is_none());
+    }
 }

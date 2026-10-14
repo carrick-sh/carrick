@@ -36,7 +36,32 @@ use crate::{anonymous, native_execution, native_process};
 pub fn file_tables(binding: &CpuBinding) -> FileTables<'static> {
     // SAFETY: current carrier CPU binding was installed by stopped bootstrap;
     // its supervisor mapping remains live until every guest CPU stops.
-    unsafe { FileTables::in_guest(binding.file_region) }.unwrap_or_else(|_| fatal_boot())
+    unsafe { FileTables::in_guest(binding.file_region) }.unwrap_or_else(|error| {
+        // SAFETY: this carrier owns the fatal doorbell; publish the complete
+        // venue-refusal domain before halting, rather than incidental RAX bits.
+        unsafe {
+            core::arch::asm!("out dx, al", in("dx") carrick_x86_carrier::entry::FATAL_PORT,
+                in("rax") error.fatal_payload(), options(nostack, preserves_flags));
+        }
+        halt()
+    })
+}
+
+/// One stdio admission policy for production and the hardware fixture lane.
+pub fn admit_stdio_cached(binding: &CpuBinding, task: &CurrentTask, files: &FileTables<'_>) {
+    let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
+    if binding.stdio_table_admitted.load(Ordering::Acquire) != file_table {
+        carrick_el1::personality::file_table::admit_stdio(
+            files.fd_map(),
+            files.opens(),
+            files.objects(),
+            file_table,
+            [true; 3],
+        );
+        binding
+            .stdio_table_admitted
+            .store(file_table, Ordering::Release);
+    }
 }
 
 // SAFETY: live diagnostic counter exported for test/telemetry inspection.
@@ -979,19 +1004,8 @@ impl Personality for LinuxPersonality {
         let source = carrick_x86_carrier::native_execution::source(slot);
         let words = capture(frame, early_xstate);
         native_process::admit_root(words, source, task).unwrap_or_else(|_| fatal_boot());
+        admit_stdio_cached(binding, task, &files);
         let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
-        if binding.stdio_table_admitted.load(Ordering::Acquire) != file_table {
-            carrick_el1::personality::file_table::admit_stdio(
-                files.fd_map(),
-                files.opens(),
-                files.objects(),
-                file_table,
-                [true; 3],
-            );
-            binding
-                .stdio_table_admitted
-                .store(file_table, Ordering::Release);
-        }
         let mut service = native_process::Service::new(task, slot);
         let (route, root_exit) = {
             let (runtime, address) =

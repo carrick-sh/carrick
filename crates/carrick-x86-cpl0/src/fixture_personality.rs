@@ -1109,14 +1109,8 @@ impl Personality for FixturePersonality {
                     fixture_handled(frame, cx.xsave, binding, task, counters, &call);
                 if !handled_by_fixture {
                     let files = linux_personality::file_tables(binding);
+                    linux_personality::admit_stdio_cached(binding, task, &files);
                     let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
-                    carrick_el1::personality::file_table::admit_stdio(
-                        files.fd_map(),
-                        files.opens(),
-                        files.objects(),
-                        file_table,
-                        [true; 3],
-                    );
                     let cache_lookup = |handle: u32| {
                         files
                             .cache(handle)
