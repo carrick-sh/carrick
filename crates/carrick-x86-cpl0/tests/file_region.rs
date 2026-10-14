@@ -255,3 +255,31 @@ fn file_region_fork_dup_lookup_and_retire_preserve_live_parent() {
         assert!(fd_map_lookup(tables.fd_map(), 52, fd).is_none());
     }
 }
+
+#[test]
+fn file_region_unpublished_is_distinct_from_retired() {
+    let mut fixture = Fixture::new(7);
+    let published = fixture.registration.binding();
+    assert!(matches!(
+        FileRegionBinding::new(
+            FileRegionBinding::UNPUBLISHED.identity(),
+            published.guest(),
+            published.physical(),
+            published.bytes()
+        ),
+        Err(FileRegionError::Unpublished)
+    ));
+    assert!(matches!(
+        fixture.registration.tables(FileRegionBinding::UNPUBLISHED),
+        Err(FileRegionError::Unpublished)
+    ));
+    fixture.registration.retire();
+    assert!(matches!(
+        fixture.registration.tables(published),
+        Err(FileRegionError::Retired)
+    ));
+    assert_ne!(
+        FileRegionError::Unpublished.fatal_payload(),
+        FileRegionError::Retired.fatal_payload()
+    );
+}
