@@ -10,6 +10,7 @@ pub mod ci_receipt;
 pub mod ci_scaler;
 pub mod cli;
 pub mod command;
+pub mod commit_trailers;
 pub mod fixtures;
 pub mod guest_image;
 pub mod host_lease;
