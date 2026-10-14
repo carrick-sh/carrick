@@ -1929,3 +1929,26 @@ fn shared_kernel_scheduler_ack_uses_spurious_sentinel() {
         i64::from(carrick_el1_abi::GIC_SPURIOUS_INTID)
     );
 }
+
+#[test]
+fn file_region_guest_refuses_unpublished_binding() {
+    let program = file_region_program(32, 1);
+    let mut carrier =
+        Cpl0Carrier::boot(physical_inventory(), &image(), [&program, &program]).expect("carrier");
+    assert_eq!(
+        carrier.observe(1).expect("intact binding control").result,
+        3
+    );
+    carrier
+        .fixture_bind_file_region(0, carrick_el1_abi::FileRegionBinding::UNPUBLISHED)
+        .expect("never-bound fixture");
+    let error = carrier
+        .observe(0)
+        .expect_err("unpublished binding must refuse access");
+    assert!(
+        error
+            .to_string()
+            .starts_with("hypervisor operation failed: CPL0 fatal exit: payload 0xf205,"),
+        "{error}"
+    );
+}

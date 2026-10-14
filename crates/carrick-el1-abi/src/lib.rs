@@ -1886,7 +1886,8 @@ pub struct FdMapSlot {
 /// Shared descriptor lock word inside the first record's existing padding.
 pub const FD_MAP_MUTATION_LOCK_OFFSET: usize = core::mem::offset_of!(FdMapSlot, mutation_lock);
 
-/// Non-cloning descriptor transaction guard. Host and image share this word.
+/// Non-cloning descriptor transaction guard. The x86 host and CPL0 image share
+/// this word; ARM host delegation still uses its separate host-side Mutex.
 pub struct FdMapMutationGuard<'a>(&'a AtomicU32);
 impl Drop for FdMapMutationGuard<'_> {
     fn drop(&mut self) {
@@ -1894,15 +1895,37 @@ impl Drop for FdMapMutationGuard<'_> {
     }
 }
 
-pub fn lock_fd_map(fd_map: &[FdMapSlot]) -> Option<FdMapMutationGuard<'_>> {
-    let word = &fd_map.first()?.mutation_lock;
-    while word
-        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        core::hint::spin_loop();
+enum FdMapLockOp {
+    Read,
+    CompareExchange,
+}
+
+// The observer exposes atomic work to the structural-budget witness; the
+// production monomorphization has an empty observer.
+fn acquire_fd_map(
+    word: &AtomicU32,
+    mut observe: impl FnMut(FdMapLockOp),
+) -> FdMapMutationGuard<'_> {
+    loop {
+        // TTAS: wait with read-only cache traffic before competing for ownership.
+        while {
+            observe(FdMapLockOp::Read);
+            word.load(Ordering::Relaxed) != 0
+        } {
+            core::hint::spin_loop();
+        }
+        observe(FdMapLockOp::CompareExchange);
+        if word
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return FdMapMutationGuard(word);
+        }
     }
-    Some(FdMapMutationGuard(word))
+}
+
+pub fn lock_fd_map(fd_map: &[FdMapSlot]) -> Option<FdMapMutationGuard<'_>> {
+    Some(acquire_fd_map(&fd_map.first()?.mutation_lock, |_| {}))
 }
 
 impl FdMapSlot {
@@ -3801,6 +3824,34 @@ const _: () = {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fd_map_waiter_does_no_rmw_while_lock_is_observed_held() {
+        let word = super::AtomicU32::new(1);
+        let (mut observations, mut held_rmw, mut held_reads, mut attempts) = (0, 0, 0, 0);
+        let guard = super::acquire_fd_map(&word, |operation| {
+            let held = word.load(super::Ordering::Relaxed) != 0;
+            match operation {
+                super::FdMapLockOp::Read => held_reads += usize::from(held),
+                super::FdMapLockOp::CompareExchange => {
+                    held_rmw += usize::from(held);
+                    attempts += 1;
+                }
+            }
+            observations += 1;
+            // Release the real atomic after bounded work, without timing or
+            // scheduler dependence. A CAS spinner also completes, then fails.
+            if observations == 3 {
+                word.store(0, super::Ordering::Release);
+            }
+        });
+        assert_eq!(held_rmw, 0, "waiting must not contend for write ownership");
+        assert!(held_reads >= 2);
+        assert_eq!(attempts, 1);
+        assert_eq!(word.load(super::Ordering::Relaxed), 1);
+        drop(guard);
+        assert_eq!(word.load(super::Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn aperture_control_is_disjoint_from_service_copy_descriptors() {
         let aperture_end =

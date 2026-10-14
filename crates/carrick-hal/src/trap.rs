@@ -405,6 +405,10 @@ impl HostAliasBacking {
 
 #[derive(Debug, ::thiserror::Error)]
 pub enum TrapError {
+    #[error("vCPU execution admission refused: host file-table access is active")]
+    ExecutionAdmissionBusy,
+    #[error("fatal vCPU execution admission: protection lock poisoned")]
+    ExecutionAdmissionPoisoned,
     /// Authenticated native dependency failure ends the run before guest return.
     #[error("native run failed: {reason}; run_failure_crossings={crossings}")]
     NativeRunFailure {

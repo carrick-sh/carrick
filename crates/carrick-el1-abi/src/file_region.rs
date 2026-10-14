@@ -49,6 +49,8 @@ const _: () = {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileRegionError {
+    /// No carrier has ever published this binding.
+    Unpublished,
     Layout,
     Foreign,
     Retired,
@@ -61,6 +63,7 @@ impl FileRegionError {
     /// general boot refusal. Guest-observed retirement is a fixture witness.
     pub const fn fatal_payload(self) -> u64 {
         match self {
+            Self::Unpublished => 0xf205,
             Self::Layout => 0xf201,
             Self::Foreign => 0xf202,
             Self::Retired => 0xf203,
@@ -110,7 +113,7 @@ impl FileRegionBinding {
         bytes: GuestLen,
     ) -> Result<Self, FileRegionError> {
         if identity.raw() == 0 {
-            return Err(FileRegionError::Retired);
+            return Err(FileRegionError::Unpublished);
         }
         if bytes.raw() != EL1_REGION_SIZE
             || guest.raw() == 0
@@ -221,6 +224,9 @@ impl FileRegionRegistration {
     }
 
     pub fn tables(&self, expected: FileRegionBinding) -> Result<FileTables<'_>, FileRegionError> {
+        if expected.identity.raw() == 0 {
+            return Err(FileRegionError::Unpublished);
+        }
         if expected != self.binding {
             return Err(FileRegionError::Foreign);
         }
@@ -252,9 +258,6 @@ impl Drop for FileRegionRegistration {
 }
 
 fn check_mapping(mapped: NonNull<u8>, binding: FileRegionBinding) -> Result<(), FileRegionError> {
-    if binding.identity.raw() == 0 {
-        return Err(FileRegionError::Retired);
-    }
     FileRegionBinding::new(
         binding.identity,
         binding.guest,
@@ -318,6 +321,9 @@ impl<'a> FileTables<'a> {
     /// guest; host code must use `FileRegionRegistration::tables`.
     #[cfg(target_os = "none")]
     pub unsafe fn in_guest(expected: FileRegionBinding) -> Result<Self, FileRegionError> {
+        if expected.identity.raw() == 0 {
+            return Err(FileRegionError::Unpublished);
+        }
         let mapped =
             NonNull::new(expected.guest.raw() as *mut u8).ok_or(FileRegionError::Layout)?;
         // SAFETY: guest mapping custody is the caller's explicit obligation.
