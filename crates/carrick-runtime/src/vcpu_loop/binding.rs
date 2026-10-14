@@ -1742,10 +1742,11 @@ where
             .control_slot()
             .publish_host_retirement(receipt);
         let page = context.lifecycle_page();
+        page.publish_host_birth_receipt(receipt);
         // An Open process can reuse a completed host-birth slot. Closing
         // retains the address until Settled, so a concurrent ring reader
         // never observes freed control storage.
-        page.release_adopted_host_birth(context.thread().control_slot() as *const _ as u64);
+        page.release_completed_host_birth(receipt);
         if let Some((mm, address)) = page.exit_wait()
             && let Some(zone) = carrick_kernel::el1_zone::zone()
         {
@@ -4126,7 +4127,14 @@ where
                     .service_kernel_context
                     .as_ref()
                     .is_some_and(|context| {
-                        context.thread().control_slot().host_exit_requested()
+                        (context.thread().control_slot().host_exit_requested()
+                            || context
+                                .thread()
+                                .control_slot()
+                                .host_birth_identity()
+                                .is_some_and(|identity| {
+                                    context.lifecycle_page().host_birth_requested(identity)
+                                }))
                             && context.lifecycle_page().exit_wait().is_some()
                     })
             {
