@@ -58,6 +58,8 @@ pub enum ScalerError {
     Guard(&'static str),
     #[error("merge group is no longer queued")]
     StaleMergeGroup,
+    #[error("merge group superseded by queued descendant {successor}")]
+    SupersededMergeGroup { successor: String },
     #[error("{0}")]
     Usage(String),
     #[error("I/O: {0}")]

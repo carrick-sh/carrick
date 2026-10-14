@@ -176,14 +176,40 @@ impl Github {
             .ok_or(ScalerError::External("run head SHA"))?
             .to_ascii_lowercase();
         if run["event"] == "merge_group" {
+            let mut queue = Value::Null;
             confirm_merge_group(&sha, || {
-                self.request(
+                queue = self.request(
                     "POST",
                     "graphql",
                     Some(json!({ "query": MERGE_QUEUE_QUERY })),
                     false,
-                )
+                )?;
+                Ok(queue.clone())
             })?;
+            // One page and at most five comparisons per vet, including actual
+            // assignments. Missing/failed observations disable supersession only.
+            let observed = self.request(
+                "GET",
+                &format!(
+                    "repos/{REPOSITORY}/actions/workflows/{}/runs?event=merge_group&per_page=100",
+                    admission.workflow_file()
+                ),
+                None,
+                false,
+            );
+            if let Ok(observed) = observed
+                && let Some(runs) = observed["workflow_runs"].as_array()
+                && let Some(successor) = superseded_group(&run, &queue, runs, |base, head| {
+                    self.request(
+                        "GET",
+                        &format!("repos/{REPOSITORY}/compare/{base}...{head}"),
+                        None,
+                        false,
+                    )
+                })
+            {
+                return Err(ScalerError::SupersededMergeGroup { successor });
+            }
         }
         Ok(match admission {
             Admission::Pilot { sha } => JobPolicy::Pilot { sha: sha.clone() },
@@ -359,9 +385,199 @@ fn pages(data: &Value, field: &str) -> Result<Vec<Value>, ScalerError> {
     Ok(result)
 }
 
+/// Conservative supersession proof; API ambiguity preserves ordinary service.
+fn superseded_group(
+    run: &Value,
+    queue: &Value,
+    runs: &[Value],
+    mut compare: impl FnMut(&str, &str) -> Result<Value, ScalerError>,
+) -> Option<String> {
+    if run["event"] != "merge_group" || queue.get("errors").is_some() {
+        return None;
+    }
+    let entries = &queue["data"]["repository"]["mergeQueue"]["entries"];
+    if entries["pageInfo"]["hasNextPage"] != false {
+        return None;
+    }
+    let nodes = entries["nodes"].as_array()?;
+    // A malformed or non-contiguous queue is not depth evidence.
+    let mut ordered: Vec<_> = nodes.iter().collect();
+    ordered.sort_by_key(|node| node["position"].as_u64());
+    for (index, node) in ordered.iter().enumerate() {
+        if node["position"].as_u64()? != u64::try_from(index).ok()? + 1
+            || !node["headCommit"]["oid"].as_str().is_some_and(full_sha)
+        {
+            return None;
+        }
+    }
+    let base = run["head_sha"].as_str()?;
+    let depth = ordered
+        .iter()
+        .position(|node| node["headCommit"]["oid"] == base)?;
+    let mut candidates = Vec::new();
+    for node in ordered.iter().skip(depth + 1).rev() {
+        let head = node["headCommit"]["oid"].as_str()?;
+        if !merge_group_heads_trusted(queue, head) {
+            continue;
+        }
+        // Use the latest run/attempt for a SHA: an older pass cannot hide
+        // a newer failure. Incomplete status information never suppresses work.
+        if runs.iter().filter(|r| r["head_sha"] == head).any(|r| {
+            r["id"].as_u64().is_none()
+                || r["run_attempt"].as_u64().is_none()
+                || r.get("conclusion").is_none()
+        }) {
+            return None;
+        }
+        let latest = runs
+            .iter()
+            .filter(|r| r["head_sha"] == head)
+            .max_by_key(|r| (r["id"].as_u64(), r["run_attempt"].as_u64()));
+        if let Some(latest) = latest
+            && Admission::Standing.admits_run(latest)
+            && latest["event"] == "merge_group"
+            && ((matches!(
+                latest["status"].as_str(),
+                Some("queued" | "in_progress" | "waiting" | "pending")
+            ) && latest["conclusion"].is_null())
+                || (latest["status"] == "completed" && latest["conclusion"] == "success"))
+        {
+            candidates.push(head);
+        }
+    }
+    if candidates.len() > 5 {
+        return None;
+    }
+    for head in candidates {
+        let proof = compare(base, head).ok()?;
+        if proof["status"] == "ahead"
+            && proof["merge_base_commit"]["sha"] == base
+            && proof["base_commit"]["sha"] == base
+        {
+            return Some(head.to_owned());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cumulative() -> (Value, Vec<Value>) {
+        let nodes: Vec<_> = (1..=3)
+            .map(|n| {
+                json!({"position":n,
+            "headCommit":{"oid":format!("{n:040x}")},
+            "pullRequest":{"headRepository":{"nameWithOwner":REPOSITORY}}})
+            })
+            .collect();
+        let queue = json!({"data":{"repository":{"mergeQueue":{"entries":{
+            "pageInfo":{"hasNextPage":false}, "nodes":nodes}}}}});
+        let runs = (1..=3)
+            .map(|n| {
+                json!({"id":n,"run_attempt":1,"event":"merge_group",
+            "head_sha":format!("{n:040x}"),"head_branch":format!("gh-readonly-queue/main/pr-{n}"),
+            "status":"queued","conclusion":null,
+            "path":".github/workflows/kernel-runtime.yml",
+            "repository":{"full_name":REPOSITORY},"head_repository":{"full_name":REPOSITORY}})
+            })
+            .collect();
+        (queue, runs)
+    }
+    fn ancestry(base: &str, head: &str) -> Result<Value, ScalerError> {
+        Ok(json!({"status":"ahead","merge_base_commit":{"sha":base},
+            "base_commit":{"sha":base},"commits":[{"sha":head}]}))
+    }
+    #[test]
+    fn deepest_pending_cumulative_group_only() {
+        let (queue, runs) = cumulative();
+        assert_eq!(
+            superseded_group(&runs[0], &queue, &runs, ancestry),
+            Some(format!("{:040x}", 3))
+        );
+        assert_eq!(
+            superseded_group(&runs[1], &queue, &runs, ancestry),
+            Some(format!("{:040x}", 3))
+        );
+        assert_eq!(superseded_group(&runs[2], &queue, &runs, ancestry), None);
+    }
+    #[test]
+    fn failed_or_ejected_successor_restores_next_deepest() {
+        let (mut queue, mut runs) = cumulative();
+        runs[2]["status"] = json!("completed");
+        runs[2]["conclusion"] = json!("failure");
+        assert_eq!(
+            superseded_group(&runs[0], &queue, &runs, ancestry),
+            Some(format!("{:040x}", 2))
+        );
+        assert_eq!(superseded_group(&runs[1], &queue, &runs, ancestry), None);
+        runs[2]["status"] = json!("queued");
+        runs[2]["conclusion"] = Value::Null;
+        queue["data"]["repository"]["mergeQueue"]["entries"]["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert_eq!(superseded_group(&runs[1], &queue, &runs, ancestry), None);
+    }
+    #[test]
+    fn main_and_ambiguous_depth_are_served_normally() {
+        let (mut queue, runs) = cumulative();
+        let mut main = runs[0].clone();
+        main["event"] = json!("push");
+        main["head_branch"] = json!("main");
+        assert_eq!(superseded_group(&main, &queue, &runs, ancestry), None);
+        assert_eq!(
+            superseded_group(&runs[0], &queue, &runs, |_, _| Ok(
+                json!({"status":"diverged"})
+            )),
+            None
+        );
+        assert_eq!(
+            superseded_group(&runs[0], &queue, &runs, |_, _| Err(ScalerError::External(
+                "fixture"
+            ))),
+            None
+        );
+        queue["data"]["repository"]["mergeQueue"]["entries"]["pageInfo"]["hasNextPage"] =
+            json!(true);
+        assert_eq!(superseded_group(&runs[0], &queue, &runs, ancestry), None);
+    }
+    #[test]
+    fn passing_successor_and_newer_failure_are_distinguished() {
+        let (queue, mut runs) = cumulative();
+        runs[2]["status"] = json!("completed");
+        runs[2]["conclusion"] = json!("success");
+        assert_eq!(
+            superseded_group(&runs[1], &queue, &runs, ancestry),
+            Some(format!("{:040x}", 3))
+        );
+        let mut failed = runs[2].clone();
+        failed["run_attempt"] = json!(2);
+        failed["conclusion"] = json!("failure");
+        runs.push(failed);
+        assert_eq!(superseded_group(&runs[1], &queue, &runs, ancestry), None);
+        runs[3].as_object_mut().unwrap().remove("conclusion");
+        assert_eq!(superseded_group(&runs[1], &queue, &runs, ancestry), None);
+    }
+
+    #[test]
+    fn malformed_queue_and_untrusted_successor_never_suppress() {
+        let (mut queue, runs) = cumulative();
+        let nodes = &mut queue["data"]["repository"]["mergeQueue"]["entries"]["nodes"];
+        nodes[2]["position"] = json!(2);
+        assert_eq!(superseded_group(&runs[1], &queue, &runs, ancestry), None);
+        let (mut queue, runs) = cumulative();
+        queue["data"]["repository"]["mergeQueue"]["entries"]["nodes"][2]["pullRequest"]["headRepository"]
+            ["nameWithOwner"] = json!("fork/carrick");
+        assert_eq!(superseded_group(&runs[1], &queue, &runs, ancestry), None);
+        assert_eq!(
+            superseded_group(&runs[1], &queue, &runs, |_, _| panic!(
+                "untrusted successor must not be compared"
+            )),
+            None
+        );
+    }
 
     fn queue() -> Value {
         json!({"data":{"repository":{"mergeQueue":{"entries":{
