@@ -11,6 +11,7 @@ const BASELINE: &str = "scripts/terminal-custody-baseline.txt";
 #[derive(Default)]
 struct DecisionFinder {
     found: bool,
+    group_exit_failure: bool,
 }
 
 impl<'ast> Visit<'ast> for DecisionFinder {
@@ -35,12 +36,25 @@ impl<'ast> Visit<'ast> for DecisionFinder {
         }
         visit::visit_path(self, node);
     }
+
+    fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+        if node
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "X86GroupExitCustody")
+        {
+            self.group_exit_failure = true;
+        }
+        visit::visit_expr_path(self, node);
+    }
 }
 
 #[derive(Default)]
 struct FunctionSites {
     owner: Option<String>,
     names: BTreeSet<String>,
+    path: String,
 }
 
 #[derive(Default)]
@@ -69,13 +83,17 @@ impl<'ast> Visit<'ast> for DefinitionSites {
 impl FunctionSites {
     fn record(&mut self, name: &syn::Ident, body: &syn::Block) {
         let name = name.to_string();
-        if !(name.starts_with("retire_") || name.starts_with("settle_") || name.starts_with("reap"))
-        {
-            return;
-        }
         let mut finder = DecisionFinder::default();
         finder.visit_block(body);
-        if finder.found {
+        let retirement_decision = finder.found
+            && (name.starts_with("retire_")
+                || name.starts_with("settle_")
+                || name.starts_with("reap"));
+        let syscall_exit =
+            name == "exit_group" || name == "exit_with_status" || name == "serve_exit";
+        let forbidden_failure =
+            finder.group_exit_failure && syscall_exit && !self.path.contains("/signal");
+        if retirement_decision || forbidden_failure {
             self.names.insert(match &self.owner {
                 Some(owner) => format!("{owner}::{name}"),
                 None => name,
@@ -124,7 +142,10 @@ fn production_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(
 
 fn sites_in_source(path: &str, source: &str) -> Result<BTreeSet<String>, String> {
     let file = syn::parse_file(source).map_err(|error| format!("{path}: {error}"))?;
-    let mut visitor = FunctionSites::default();
+    let mut visitor = FunctionSites {
+        path: path.to_owned(),
+        ..FunctionSites::default()
+    };
     visitor.visit_file(&file);
     Ok(visitor
         .names
@@ -248,5 +269,15 @@ mod tests {
         visitor.visit_file(&parsed);
         assert_eq!(visitor.verdicts, 1);
         assert_eq!(visitor.phase_impls, 1);
+    }
+
+    #[test]
+    fn syscall_group_exit_failure_is_a_retirement_decision() {
+        let sites = sites_in_source(
+            "crates/new-lane/src/exit.rs",
+            "fn exit_group() { NativeRunFailureReason::X86GroupExitCustody; }",
+        )
+        .unwrap();
+        assert!(sites.contains("crates/new-lane/src/exit.rs|exit_group"));
     }
 }

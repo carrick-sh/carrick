@@ -533,7 +533,8 @@ impl Kernel {
             .map_err(|TaskParticipantError::UnknownThread { .. }| {
                 KernelOperationError::UnknownThread(context.thread.key().tid)
             })?;
-        if !exit_participants.permits_nonfinal_exit() {
+        let ring_closing = context.lifecycle_page().exit_wait().is_some();
+        if !ring_closing && !exit_participants.permits_nonfinal_exit() {
             return Err(KernelOperationError::LastThreadRequiresTaskExit(
                 context.thread.key().tid,
             ));
@@ -555,9 +556,12 @@ impl Kernel {
             None
         } else {
             Some(
-                lifecycle
-                    .reserve_nonfinal_exit()
-                    .map_err(|_| KernelOperationError::LastThreadRequiresTaskExit(tid))?,
+                (if ring_closing {
+                    lifecycle.reserve_cancelled_member_exit()
+                } else {
+                    lifecycle.reserve_nonfinal_exit()
+                })
+                .map_err(|_| KernelOperationError::LastThreadRequiresTaskExit(tid))?,
             )
         };
         check_failpoint(failpoint, KernelFailpoint::AfterMembershipReserve)?;

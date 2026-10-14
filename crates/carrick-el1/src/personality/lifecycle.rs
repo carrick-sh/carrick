@@ -161,6 +161,13 @@ impl<
             venue.retire_thread_verdict(verdict);
         }
     }
+    fn route_host_thread_exit(
+        &mut self,
+        verdict: carrick_core::terminal::RetirementVerdict,
+    ) -> bool {
+        self.process_venue()
+            .is_some_and(|venue| venue.route_host_thread_exit(verdict))
+    }
     fn arguments(&self) -> [u64; 6] {
         [
             self.frame.argument(0).unwrap_or(0),

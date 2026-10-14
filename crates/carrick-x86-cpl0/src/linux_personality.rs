@@ -1093,7 +1093,7 @@ impl Personality for LinuxPersonality {
             CompletionRoute::InvalidCompletion => {
                 fatal_error(frame);
             }
-            CompletionRoute::Forward => {
+            CompletionRoute::Forward | CompletionRoute::HostCustody => {
                 let mut handled_in_ring = false;
                 if [
                     carrick_personality_linux::crossing::nr::READ,

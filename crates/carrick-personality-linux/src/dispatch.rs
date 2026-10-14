@@ -63,6 +63,7 @@ pub enum Family {
 /// turns it into the entry's completion/continuation decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FamilyCompletion {
+    HostCustody,
     FrameRestored,
     Complete(i64),
     CompleteWithWork(i64),
@@ -421,6 +422,7 @@ fn serve_family<'a, C: EntryContext + 'a>(
             .and_then(|native| crate::lifecycle::invoke(call, native))
             .map_or(FamilyCompletion::Forward.into(), |outcome| {
                 let returned = match outcome {
+                    LifecycleOutcome::HostCustody => None,
                     LifecycleOutcome::Returned { result, .. } => Some((result, original)),
                     LifecycleOutcome::Transferred { .. } => None,
                 };
@@ -781,6 +783,7 @@ pub const fn route_x86(ordinal: u64, allocator_control: u64) -> Family {
 /// Return transport selected by the Linux completion owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompletionRoute {
+    HostCustody,
     Served,
     WithWork,
     Suspended,
@@ -791,6 +794,7 @@ pub enum CompletionRoute {
 /// Linux return-work ordering, shared by common entry and pending families.
 pub fn completion_route(completion: FamilyCompletion, pending: bool) -> CompletionRoute {
     match completion {
+        FamilyCompletion::HostCustody => CompletionRoute::HostCustody,
         FamilyCompletion::Complete(_)
         | FamilyCompletion::Switched(_)
         | FamilyCompletion::FrameRestored

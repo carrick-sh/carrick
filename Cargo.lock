@@ -901,6 +901,7 @@ dependencies = [
  "carrick-abi",
  "carrick-conformance-contract",
  "carrick-core",
+ "carrick-core-abi",
  "carrick-el1",
  "carrick-el1-abi",
  "carrick-fatal",
