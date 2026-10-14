@@ -571,9 +571,10 @@ Chat, worker mailboxes, scratch notes and agent memory are not.
   (`NEW=[]`), not an absolute zero; `NEW=[]` is evidence only when every step
   is itemized and every binary finished (#352/#353, fix #377).
 - **cloudmac is shared with CI** ([`docs/ci/mac-jit.md`](docs/ci/mac-jit.md)):
-  JIT jobs run unprivileged on the same 100 GB build volume, so admit
-  build-heavy work (`remote-accept`, gates) against running HVF jobs — an
-  overlap killed both with ENOSPC (#376). Worktree admission keys on the
+  JIT jobs run unprivileged beside the gates, so admit build-heavy work
+  (`remote-accept`, gates) against running HVF jobs — an overlap on one
+  volume killed both with ENOSPC; the gate worktree now has its own
+  `carrick-gate` volume, CPU admission is still #376. Worktree admission keys on the
   checkout root's device+inode: never copy or cross-volume move an admitted
   checkout; remove and re-add it.
 - **KVM evidence comes from the merge queue.** The `kvm-tests` lane produces
