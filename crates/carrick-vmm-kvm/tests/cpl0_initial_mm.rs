@@ -1036,3 +1036,136 @@ fn production_fault_elf() -> Vec<u8> {
     elf[96..104].copy_from_slice(&size.to_le_bytes());
     elf
 }
+
+#[test]
+fn file_region_guest_fork_dup_and_child_retirement_preserve_parent() {
+    use carrick_el1_abi::fd_map_lookup;
+    use carrick_hal::VcpuKick;
+    use std::sync::atomic::Ordering;
+    let elf = native_exit_fixture("native_file_fork.S");
+    let (parts, root_tid) = native_exit_workers(&elf);
+    let (root, factory) = parts.into_factory();
+    let task = root.binding().task();
+    let child_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
+    let mut parent = factory.claim(0).expect("root executor");
+    let mut peer = factory.claim(1).expect("peer executor");
+    parent.cpu_mut().load(root).expect("load issued root");
+    run_to_marker(&mut parent, task, 1, &factory);
+    factory
+        .fixture_pin_native_thread(child_tid, carrick_guest_arch::CpuId::new(1))
+        .expect("child on independent physical lane");
+    let retiring = peer_retirement(&mut peer); // real child dup then exit(3)
+    let (parent_table, child_table, parent_slot, child_slot) = factory
+        .with_stopped_file_tables(|tables| {
+            let slots: Vec<_> = tables
+                .fd_map()
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| {
+                    s.incarnation.load(Ordering::Acquire) != 0 && s.fd.load(Ordering::Relaxed) == 3
+                })
+                .map(|(i, s)| (s.file_table.load(Ordering::Acquire), i))
+                .collect();
+            assert_eq!(
+                slots.len(),
+                2,
+                "parent and child each published dup(stdout)"
+            );
+            let [(parent_table, parent_slot), (child_table, child_slot)] = slots[..] else {
+                unreachable!()
+            };
+            assert_ne!(parent_table, child_table);
+            assert_ne!(parent_slot, child_slot);
+            let stdout = fd_map_lookup(tables.fd_map(), parent_table, 1)
+                .expect("parent stdout")
+                .0;
+            for table in [parent_table, child_table] {
+                assert_eq!(
+                    fd_map_lookup(tables.fd_map(), table, 1)
+                        .expect("inherited stdout")
+                        .0,
+                    stdout
+                );
+                assert_eq!(
+                    fd_map_lookup(tables.fd_map(), table, 3)
+                        .expect("independent dup reference")
+                        .0,
+                    stdout
+                );
+            }
+            let open = &tables.opens()[stdout as usize - 1];
+            assert!(
+                open.inode_handle.load(Ordering::Acquire) > 0,
+                "stdout open must reside in the retained region"
+            );
+            assert!(open.is_bound_to(
+                &tables.objects()[open.inode_handle.load(Ordering::Acquire) as usize - 1]
+            ));
+            (parent_table, child_table, parent_slot, child_slot)
+        })
+        .expect("both live tables in retained region");
+    run_until_wait_enrolled(&mut parent, task, &factory, root_tid, false);
+    assert!(
+        peer.service_idle_peer_doorbell(&retiring)
+            .expect("real MM retirement")
+            .is_none()
+    );
+    // Complete the real child's retirement and stop its now-idle executor.
+    // The watcher only bounds the fixture; it does not complete guest exit.
+    let kick = carrick_vmm_kvm::KvmKickHandle::for_current_thread();
+    std::thread::scope(|scope| {
+        let watcher = scope.spawn(|| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !factory
+                .fixture_native_cpu_idle(carrick_guest_arch::CpuId::new(1))
+                .expect("idle state")
+            {
+                if std::time::Instant::now() >= deadline {
+                    kick.kick();
+                    return false;
+                }
+                std::thread::yield_now();
+            }
+            kick.kick();
+            true
+        });
+        peer.fixture_run_idle_peer().expect("finish child exit");
+        assert!(
+            watcher.join().expect("idle watcher"),
+            "child retirement deadline"
+        );
+    });
+    run_to_marker(&mut parent, task, 2, &factory);
+    factory
+        .with_stopped_file_tables(|tables| {
+            assert_eq!(
+                tables.fd_map()[child_slot]
+                    .incarnation
+                    .load(Ordering::Acquire),
+                0
+            );
+            assert_eq!(
+                tables.fd_map()[child_slot]
+                    .file_table
+                    .load(Ordering::Acquire),
+                0
+            );
+            assert_eq!(
+                tables.fd_map()[parent_slot]
+                    .file_table
+                    .load(Ordering::Acquire),
+                parent_table
+            );
+            for fd in 0..=3 {
+                assert!(
+                    fd_map_lookup(tables.fd_map(), parent_table, fd).is_some(),
+                    "parent fd {fd} survives"
+                );
+                assert!(
+                    fd_map_lookup(tables.fd_map(), child_table, fd).is_none(),
+                    "child fd {fd} retired"
+                );
+            }
+        })
+        .expect("parent survives child file-table retirement");
+}

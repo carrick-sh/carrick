@@ -721,7 +721,7 @@ contracts = ["kernel.el1.fd-single-owner", "kernel.el1.ipc-fd-authority"]
 
 [[surfaces]]
 path = "crates/carrick-el1/src/personality/file_table.rs"
-contracts = ["kernel.el1.files", "kernel.el1.fd-single-owner"]
+contracts = ["kernel.x86.file-region", "kernel.el1.files", "kernel.el1.fd-single-owner"]
 
 [[surfaces]]
 path = "crates/carrick-x86/src/bringup_fns.rs"
@@ -757,7 +757,7 @@ contracts = ["x86.mm.initial-image"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-kvm/tests/cpl0_initial_mm.rs"
-contracts = ["x86.mm.initial-image", "core.entry.completion"]
+contracts = ["kernel.x86.file-region", "x86.mm.initial-image", "core.entry.completion"]
 
 # Fixture-only injection ownership for executor activation and rollback tests.
 [[surfaces]]
@@ -1366,3 +1366,6 @@ path = "crates/carrick-x86/src/cpl0_entry.rs"
 contracts = ["kernel.x86.file-region"]
 
 
+[[surfaces]]
+path = "crates/carrick-vmm-kvm/tests/fixtures/native_file_fork.S"
+contracts = ["kernel.x86.file-region"]

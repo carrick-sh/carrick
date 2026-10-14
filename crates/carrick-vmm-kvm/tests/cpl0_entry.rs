@@ -362,12 +362,18 @@ fn file_region_guest_refuses_foreign_publication() {
         Cpl0Carrier::boot(physical_inventory(), &image(), [&program, &program]).expect("carrier A");
     let mut b =
         Cpl0Carrier::boot(physical_inventory(), &image(), [&program, &program]).expect("carrier B");
+    assert_eq!(b.observe(0).expect("intact foreign-test control").result, 3);
     a.fixture_bind_file_region(0, b.file_region_binding())
         .expect("foreign binding witness");
     let error = a
         .observe(0)
         .expect_err("foreign publication must refuse guest table access");
-    assert!(error.to_string().contains("fatal"), "{error}");
+    assert!(
+        error
+            .to_string()
+            .starts_with("hypervisor operation failed: CPL0 fatal exit: payload 0xf202,"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -375,76 +381,23 @@ fn file_region_guest_refuses_retired_publication() {
     let program = file_region_program(32, 1);
     let mut carrier =
         Cpl0Carrier::boot(physical_inventory(), &image(), [&program, &program]).expect("carrier");
+    assert_eq!(
+        carrier
+            .observe(1)
+            .expect("intact retired-test control")
+            .result,
+        3
+    );
     carrier.fixture_retire_file_region();
     let error = carrier
         .observe(0)
         .expect_err("retired publication must refuse guest table access");
-    assert!(error.to_string().contains("fatal"), "{error}");
-}
-
-#[test]
-fn file_region_guest_two_live_tasks_keep_distinct_open_references() {
-    use carrick_el1::personality::file_table::{admit_host_fd, admit_stdio};
-    use carrick_el1_abi::{DELEGATED_FLAG_READABLE, fd_map_lookup};
-    use std::{os::fd::AsRawFd, sync::atomic::Ordering};
-    let programs = [file_region_program(32, 17), file_region_program(32, 18)];
-    let mut carrier =
-        Cpl0Carrier::boot(physical_inventory(), &image(), [&programs[0], &programs[1]])
-            .expect("two live carrier tasks");
-    let binding = carrier.file_region_binding();
-    let hosts = [
-        std::fs::File::open("/dev/null").expect("first native open"),
-        std::fs::File::open("/dev/null").expect("second native open"),
-    ];
-    {
-        let tables = carrier.file_tables(binding).expect("retained table venue");
-        admit_stdio(
-            tables.fd_map(),
-            tables.opens(),
-            tables.objects(),
-            5,
-            [true; 3],
-        );
-        for fd in 3..19 {
-            let host = &hosts[usize::from(fd == 18)];
-            assert_eq!(
-                admit_host_fd(
-                    tables.fd_map(),
-                    tables.opens(),
-                    tables.objects(),
-                    5,
-                    fd,
-                    host.as_raw_fd(),
-                    DELEGATED_FLAG_READABLE
-                ),
-                Some(fd as u32 + 1)
-            );
-        }
-        // F2 storage graph only: independent real host descriptions join one
-        // inode record. Full VFS admission/deduplication belongs to F3.
-        tables.opens()[18].inode_handle.store(18, Ordering::Release);
-        tables.opens()[17].offset.store(7, Ordering::Release);
-        tables.opens()[18].offset.store(11, Ordering::Release);
-        assert!(tables.opens()[17].is_bound_to(&tables.objects()[17]));
-        assert!(tables.opens()[18].is_bound_to(&tables.objects()[17]));
-    }
-    assert_eq!(carrier.observe(0).expect("first live task dup").result, 19);
-    assert_eq!(carrier.observe(1).expect("second live task dup").result, 20);
-    let tables = carrier.file_tables(binding).expect("shared carrier venue");
-    assert_eq!(
-        fd_map_lookup(tables.fd_map(), 5, 19)
-            .expect("first reference")
-            .0,
-        18
+    assert!(
+        error
+            .to_string()
+            .starts_with("hypervisor operation failed: CPL0 fatal exit: payload 0xf203,"),
+        "{error}"
     );
-    assert_eq!(
-        fd_map_lookup(tables.fd_map(), 5, 20)
-            .expect("second reference")
-            .0,
-        19
-    );
-    assert_eq!(tables.opens()[17].offset.load(Ordering::Acquire), 7);
-    assert_eq!(tables.opens()[18].offset.load(Ordering::Acquire), 11);
 }
 
 #[test]

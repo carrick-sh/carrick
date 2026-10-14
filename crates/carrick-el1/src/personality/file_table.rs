@@ -16,11 +16,10 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
-use crate::lock::SpinLock;
 use carrick_el1_abi::{
     DELEGATED_FLAG_READABLE, DELEGATED_FLAG_WRITABLE, DELEGATED_STATE_GUEST, DelegatedFile,
     DelegatedOpenFile, FD_MAP_CAPACITY, FdMapSlot, HostBoundFd, HostObjectBinding,
-    HostReadinessEntry, fd_map_lookup,
+    HostReadinessEntry, fd_map_lookup, lock_fd_map,
 };
 use carrick_sched_core::{SlotId, ZoneTables};
 pub use carrick_syscall_abi::{
@@ -28,9 +27,8 @@ pub use carrick_syscall_abi::{
     LINUX_POLLRDBAND, LINUX_POLLRDNORM, LINUX_POLLWRBAND, LINUX_POLLWRNORM,
 };
 
-// Descriptor mutations and poll snapshots share one short in-ring critical
-// section. No host crossing or blocking wait is made while it is held.
-static FD_MAP_LOCK: SpinLock<()> = SpinLock::new(());
+// Descriptor mutations and poll snapshots share the map's region-resident
+// lock word, including host consumers. No crossing or wait occurs while held.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReleasedDescription {
@@ -78,7 +76,7 @@ pub fn close_host_binding(
     file_table: u64,
     fd: i32,
 ) -> Option<GuestDescriptorChange> {
-    let _guard = FD_MAP_LOCK.lock();
+    let _guard = lock_fd_map(fd_map);
     let (handle, index) = fd_map_lookup(fd_map, file_table, fd)?;
     if handle == 0 {
         return None;
@@ -115,7 +113,7 @@ pub fn dup2_host_binding(
     if !(0..GUEST_FD_LIMIT).contains(&new_fd) {
         return None;
     }
-    let _guard = FD_MAP_LOCK.lock();
+    let _guard = lock_fd_map(fd_map);
     let (handle, source_index) = fd_map_lookup(fd_map, file_table, old_fd)?;
     if handle == 0 {
         return None;
@@ -188,7 +186,7 @@ pub fn dup_host_binding(
     if min_fd < 0 || max_fd <= min_fd {
         return None;
     }
-    let _guard = FD_MAP_LOCK.lock();
+    let _guard = lock_fd_map(fd_map);
     let (handle, source_index) = fd_map_lookup(fd_map, file_table, old_fd)?;
     if handle == 0 {
         return None;
@@ -250,7 +248,7 @@ pub fn admit_stdio(
     if file_table == 0 {
         return;
     }
-    let _guard = FD_MAP_LOCK.lock();
+    let _guard = lock_fd_map(fd_map);
     for (fd, &open) in open_mask.iter().enumerate() {
         if !open {
             continue;
@@ -313,7 +311,7 @@ pub fn admit_host_fd(
     if file_table == 0 || guest_fd < 0 {
         return None;
     }
-    let _guard = FD_MAP_LOCK.lock();
+    let _guard = lock_fd_map(fd_map);
     let ufd = guest_fd as u32;
     if fd_map_lookup(fd_map, file_table, guest_fd).is_some() {
         return None;
@@ -363,7 +361,7 @@ pub fn fork_fd_map(fd_map: &[FdMapSlot], parent_table: u64, child_table: u64) ->
     if parent_table == 0 || child_table == 0 || parent_table == child_table {
         return false;
     }
-    let _guard = FD_MAP_LOCK.lock();
+    let _guard = lock_fd_map(fd_map);
     if fd_map.iter().take(FD_MAP_CAPACITY).any(|slot| {
         slot.incarnation.load(Ordering::Acquire) != 0
             && slot.file_table.load(Ordering::Relaxed) == child_table
@@ -410,7 +408,7 @@ pub fn retire_fd_map(fd_map: &[FdMapSlot], file_table: u64) {
     if file_table == 0 {
         return;
     }
-    let _guard = FD_MAP_LOCK.lock();
+    let _guard = lock_fd_map(fd_map);
     for slot in fd_map.iter().take(FD_MAP_CAPACITY) {
         if slot.file_table.load(Ordering::Acquire) == file_table
             && slot.incarnation.load(Ordering::Acquire) != 0
@@ -430,7 +428,7 @@ pub fn host_readiness_entries(
     file_table: u64,
     pollfds: &[PollFd],
 ) -> Option<Vec<HostReadinessEntry>> {
-    let _guard = FD_MAP_LOCK.lock();
+    let _guard = lock_fd_map(fd_map);
     let mut host_entries = Vec::new();
     for (index, entry) in pollfds.iter().enumerate() {
         if entry.fd < 0 {
@@ -495,7 +493,7 @@ pub fn resolve_poll_with_host_readiness(
     pollfds: &mut [PollFd],
     host_entries: Option<&[HostReadinessEntry]>,
 ) -> i32 {
-    let _guard = FD_MAP_LOCK.lock();
+    let _guard = lock_fd_map(fd_map);
     let mut ready_count = 0;
     let mut host_cursor = host_entries.unwrap_or(&[]).iter().peekable();
     for (index, entry) in pollfds.iter_mut().enumerate() {
