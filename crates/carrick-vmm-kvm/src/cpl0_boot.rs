@@ -1818,7 +1818,6 @@ impl ProductionCpuLease {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProductionPort {
     OwnerGrant,
     ForkStock,
@@ -1859,11 +1858,13 @@ fn take_production_work_boundary(
 
 #[cfg(test)]
 mod production_work_port_tests {
-    use super::*;
+    use super::{
+        CurrentTask, ProductionPort, WORK_PORT, production_port, take_production_work_boundary,
+    };
 
     #[test]
     fn completed_cpl0_work_has_a_production_boundary() {
-        assert_eq!(production_port(WORK_PORT), Some(ProductionPort::Work));
+        assert!(matches!(production_port(WORK_PORT), Some(ProductionPort::Work)));
     }
 
     #[test]
