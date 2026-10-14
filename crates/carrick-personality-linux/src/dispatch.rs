@@ -1137,6 +1137,10 @@ mod ring_first_tests {
         fn signal_native(&mut self) -> Option<&mut dyn crate::signal::SignalNative<'a>> {
             Some(self)
         }
+        fn lifecycle_native(&mut self) -> Option<&mut dyn crate::lifecycle::LifecycleNative<'a>> {
+            (self.set == HostCrossingSet::X86 && self.native.0 == 61)
+                .then_some(self as &mut dyn crate::lifecycle::LifecycleNative<'a>)
+        }
         fn native_number(&self) -> Option<carrick_syscall_abi::NativeNr> {
             Some(self.native)
         }
@@ -1218,6 +1222,122 @@ mod ring_first_tests {
             self.signal_restore_calls += 1;
             Ok(self.current_blocked())
         }
+    }
+
+    impl<'a> crate::lifecycle::LifecycleNative<'a> for CarrierOwned<'a> {
+        fn fail_lifecycle(&mut self, _: carrick_core_abi::NativeRunFailureReason) -> ! {
+            panic!("unused lifecycle failure")
+        }
+        fn arguments(&self) -> [u64; 6] {
+            [0; 6]
+        }
+        fn binding(&self) -> Option<ExecutionBinding> {
+            None
+        }
+        fn task_state(&self) -> Option<&'a crate::abi::entry::LinuxTaskState> {
+            None
+        }
+        fn thread(&self) -> Option<crate::thread::LifecycleThread<'a>> {
+            None
+        }
+        fn born_slot(
+            &self,
+            _: &crate::abi::thread::ThreadLifecyclePage,
+            _: crate::abi::thread::EntryRef,
+        ) -> Option<&'a crate::abi::thread::ThreadControlSlot> {
+            None
+        }
+        fn record_decline(&self, _: crate::abi::thread::LifecycleDecline) {}
+        fn has_scheduler(&self) -> bool {
+            false
+        }
+        fn user_sp(&mut self) -> Option<carrick_guest_arch::UserVa> {
+            None
+        }
+        fn affinity(&self) -> Option<u64> {
+            None
+        }
+        fn allocate_record(
+            &mut self,
+            _: carrick_sched_core::ThreadIdentity,
+        ) -> Result<carrick_sched_core::RecordRef, carrick_sched_core::Exhausted> {
+            panic!("unused record allocation")
+        }
+        fn free_record(&mut self, _: carrick_sched_core::RecordRef) {}
+        fn can_prepare_child(
+            &self,
+            _: carrick_guest_arch::UserVa,
+            _: Option<carrick_guest_arch::UserVa>,
+        ) -> bool {
+            false
+        }
+        fn prepare_child(
+            &mut self,
+            _: carrick_sched_core::RecordRef,
+            _: crate::lifecycle::ChildContext,
+        ) {
+        }
+        fn enqueue_born(&mut self, _: carrick_sched_core::RecordRef) {}
+        fn exit_record(&self) -> Option<crate::lifecycle::ExitRecord> {
+            None
+        }
+        fn wake_child_tid(
+            &mut self,
+            _: carrick_core_abi::EntryMmKey,
+            _: carrick_guest_arch::UserVa,
+        ) -> bool {
+            false
+        }
+        fn release_current(&mut self, _: carrick_sched_core::RecordRef) -> bool {
+            false
+        }
+        fn run_next(&mut self, _: SyscallResult) -> (carrick_core_abi::Served, SyscallResult) {
+            panic!("unused scheduler handoff")
+        }
+        fn result(&self) -> SyscallResult {
+            SyscallResult::new(self.result)
+        }
+        fn set_result(&mut self, result: SyscallResult) {
+            self.result = result.raw();
+        }
+        fn process_wait4(
+            &mut self,
+            _: crate::lifecycle::ProcessWaitPid,
+            _: carrick_guest_arch::UserVa,
+            _: crate::lifecycle::LinuxWaitOptions,
+            _: carrick_guest_arch::UserVa,
+        ) -> Option<crate::lifecycle::LifecycleOutcome> {
+            Some(crate::lifecycle::LifecycleOutcome::Returned {
+                result: SyscallResult::new(123),
+                work: false,
+            })
+        }
+    }
+
+    #[test]
+    fn x86_owned_wait4_survives_pending_host_work() {
+        let refused = [const { AtomicU64::new(0) }; 513];
+        let mut pending = CarrierOwned {
+            set: HostCrossingSet::X86,
+            mutate_forward: false,
+            strict: true,
+            state: crate::abi::entry::LinuxTaskState::new(),
+            native: carrick_syscall_abi::NativeNr(61),
+            admitted: true,
+            result: 42,
+            work: true,
+            handback: false,
+            signal_restore_calls: 0,
+            refused: &refused,
+            forwarded: [const { AtomicU64::new(0) }; 512],
+        };
+        pending.state.mark_pending_host_work();
+        assert_eq!(
+            dispatch(carrick_syscall_abi::nr::WAIT4.raw(), u64::MAX, &mut pending),
+            CompletionRoute::WithWork
+        );
+        assert_eq!(pending.result, 123);
+        assert!(pending.state.has_pending_host_work());
     }
 
     #[test]
