@@ -909,6 +909,8 @@ pub const LINUX_RT_SIGSET_SIZE: u64 = 8;
 pub const LINUX_SS_ONSTACK: u64 = 1;
 pub const LINUX_SS_DISABLE: u64 = 2;
 pub const LINUX_SS_AUTODISARM: u64 = 0x8000_0000;
+/// Carrick's mapped EL0 fallback for AArch64 actions without SA_RESTORER.
+pub const LINUX_SIGRETURN_TRAMPOLINE_BASE: u64 = 0x30_0000_0000;
 
 /// EL0 signal-return PSTATE: NZCV, SSBS and DIT are user-modifiable. All mode,
 /// interrupt-mask and privileged state bits must remain clear.
