@@ -13,7 +13,8 @@ pub struct NativeRootExit {
 }
 
 impl NativeRootExit {
-    pub const MAGIC: u64 = 0x4352_524f_4f54_4558;
+    /// CRTERMST: distinct from the old Linux wait-encoding record.
+    pub const MAGIC: u64 = 0x4352_5445_524d_5354;
 
     pub fn new(binding: ExecutionBinding, status: TerminationStatus) -> Option<Self> {
         if !binding.issued() || binding.mm.raw() == 0 || binding.thread_generation.raw() == 0 {
@@ -103,6 +104,18 @@ mod tests {
             let copy = NativeRootExit::from_raw_words(record.raw_words());
             assert_eq!(copy.status_for(binding()), Some(status));
         }
+    }
+    #[test]
+    fn rejects_old_linux_wait_wire_record() {
+        let mut words = NativeRootExit::new(binding(), TerminationStatus::SUCCESS)
+            .unwrap()
+            .raw_words();
+        words[0] = 0x4352_524f_4f54_4558;
+        words[5] = 12 << 8;
+        assert_eq!(
+            NativeRootExit::from_raw_words(words).status_for(binding()),
+            None
+        );
     }
     #[test]
     fn rejects_foreign_bindings_and_malformed_wire_words() {
