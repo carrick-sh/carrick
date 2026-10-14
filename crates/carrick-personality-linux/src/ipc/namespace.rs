@@ -8,7 +8,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use crate::identity::{LinuxCapabilitySet, TaskCredentials};
-use carrick_sched_core::process::{TaskGid, TaskUid};
+use crate::identity::{TaskGid, TaskUid};
 pub use carrick_syscall_abi::ipc::{
     IPC_CREAT, IPC_EXCL, IPC_NOWAIT, IPC_PRIVATE, IPC_STAT, LinuxIpcPerm, LinuxMsginfo,
     LinuxMsqidDs, LinuxSembuf, LinuxSemidDs, LinuxSeminfo, MSG_EXCEPT, MSG_NOERROR, MSG_STAT,

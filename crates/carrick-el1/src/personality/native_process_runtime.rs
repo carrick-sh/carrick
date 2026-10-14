@@ -388,7 +388,7 @@ pub struct NativeResources<'a, M, C: ProcessContext> {
 }
 pub type NativeForkPreparation<'a, M, P, C> = PreparedFork<
     VisibleNamespace,
-    carrick_sched_core::process::TaskUid,
+    carrick_personality_linux::identity::TaskUid,
     RetainedProcessCustody<NativeResources<'a, M, C>>,
     P,
 >;
@@ -421,9 +421,12 @@ impl<'a, M: Clone, C: ProcessContext> ProcessResources for NativeResources<'a, M
 }
 type Custody<'a, M, C> = RetainedProcessCustody<NativeResources<'a, M, C>>;
 type NativeIdentityTask<'a, M, C> =
-    GuestTask<VisibleNamespace, carrick_sched_core::process::TaskUid, Custody<'a, M, C>>;
-type Owner<'a, M, C> =
-    GuestProcessOwner<VisibleNamespace, carrick_sched_core::process::TaskUid, Custody<'a, M, C>>;
+    GuestTask<VisibleNamespace, carrick_personality_linux::identity::TaskUid, Custody<'a, M, C>>;
+type Owner<'a, M, C> = GuestProcessOwner<
+    VisibleNamespace,
+    carrick_personality_linux::identity::TaskUid,
+    Custody<'a, M, C>,
+>;
 
 #[cfg(test)]
 #[test]
@@ -4114,7 +4117,7 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
             groups
                 .iter()
                 .copied()
-                .map(carrick_sched_core::process::TaskGid::new)
+                .map(carrick_personality_linux::identity::TaskGid::new)
                 .collect::<alloc::vec::Vec<_>>(),
         );
         self.update_calling_creds(&mut |creds| {
@@ -9197,8 +9200,8 @@ mod tests {
         // caller's real ids. Read a peer nonleader through the shared router.
         entry
             .update_calling_creds(&mut |c| {
-                c.fsuid = carrick_sched_core::process::TaskUid::new(2000);
-                c.fsgid = carrick_sched_core::process::TaskGid::new(2000);
+                c.fsuid = carrick_personality_linux::identity::TaskUid::new(2000);
+                c.fsgid = carrick_personality_linux::identity::TaskGid::new(2000);
                 Ok(())
             })
             .unwrap();
@@ -9213,10 +9216,10 @@ mod tests {
                 .unwrap();
             for tid in [child_pid, 987] {
                 let c = peer.credentials_for_mut(tid).unwrap();
-                c.ruid = carrick_sched_core::process::TaskUid::new(2000);
+                c.ruid = carrick_personality_linux::identity::TaskUid::new(2000);
                 c.euid = c.ruid;
                 c.suid = c.ruid;
-                c.rgid = carrick_sched_core::process::TaskGid::new(2000);
+                c.rgid = carrick_personality_linux::identity::TaskGid::new(2000);
                 c.egid = c.rgid;
                 c.sgid = c.rgid;
             }
@@ -9377,10 +9380,10 @@ mod tests {
         // A matching real uid cannot bypass mismatched filesystem credentials.
         entry
             .update_calling_creds(&mut |c| {
-                c.ruid = carrick_sched_core::process::TaskUid::new(2000);
-                c.rgid = carrick_sched_core::process::TaskGid::new(2000);
-                c.fsuid = carrick_sched_core::process::TaskUid::new(1000);
-                c.fsgid = carrick_sched_core::process::TaskGid::new(1000);
+                c.ruid = carrick_personality_linux::identity::TaskUid::new(2000);
+                c.rgid = carrick_personality_linux::identity::TaskGid::new(2000);
+                c.fsuid = carrick_personality_linux::identity::TaskUid::new(1000);
+                c.fsgid = carrick_personality_linux::identity::TaskGid::new(1000);
                 Ok(())
             })
             .unwrap();

@@ -439,46 +439,6 @@ impl<Container, Uid, Status> Zombie<Container, Uid, Status> {
     }
 }
 
-/// Typed user identity within a namespace.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct TaskUid(u32);
-
-impl TaskUid {
-    pub const ROOT: Self = Self(0);
-
-    pub const fn new(uid: u32) -> Self {
-        Self(uid)
-    }
-
-    pub const fn raw(self) -> u32 {
-        self.0
-    }
-
-    pub const fn is_root(self) -> bool {
-        self.0 == 0
-    }
-}
-
-/// Typed group identity within a namespace.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct TaskGid(u32);
-
-impl TaskGid {
-    pub const ROOT: Self = Self(0);
-
-    pub const fn new(gid: u32) -> Self {
-        Self(gid)
-    }
-
-    pub const fn raw(self) -> u32 {
-        self.0
-    }
-
-    pub const fn is_root(self) -> bool {
-        self.0 == 0
-    }
-}
-
 /// Linux resource limit specification.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
