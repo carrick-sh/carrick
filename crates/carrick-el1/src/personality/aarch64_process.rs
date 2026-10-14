@@ -292,12 +292,20 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
         // A successful terminal crossing never re-enters this guest stack.
         drop(runtime);
         drop(_home);
-        cross_root_exit(
+        // The exit is already published: an Err here would let the caller's
+        // unadmitted fallback replay it, so a refused crossing fail-stops.
+        if cross_root_exit(
             &mut service.crossing,
             task,
             status,
             u32::from(source.slot.raw()),
-        )?;
+        )
+        .is_err()
+        {
+            super::dispatch::invalid_completion(super::dispatch::NativeInvariant::PhysicalCustody(
+                "root exit crossing refused",
+            ));
+        }
     }
     Ok(result)
 }
