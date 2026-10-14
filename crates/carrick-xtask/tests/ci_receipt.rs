@@ -554,3 +554,140 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
     assert!(keys.contains("unitemized:el1-embed:crash:el1_wedged"));
     assert!(keys.contains("step:el1-embed"));
 }
+
+fn receipt_from_el1_log(passed: bool, log: &str) -> AcceptReceipt {
+    let mut s = step("el1-embed", passed, &[]);
+    let mut failures = Vec::new();
+    populate_step_from_log(&mut s, log, &mut failures);
+    receipt(vec![s])
+}
+
+#[test]
+fn replay_pr389_all_failed_base_binary_crashing_in_candidate_yields_no_new_failures() {
+    let base_log = "\
+test-signed: running /w/target/release/deps/el1_host_copyout-983cd9ce6da5d7a1 el1_ --nocapture
+
+running 3 tests
+test el1_file_mmap_replaces_a_live_anonymous_grant ...
+FAILED
+test el1_host_buffers_follow_reused_mapping_in_two_live_processes ...
+FAILED
+test el1_host_copyout_into_and_out_of_untouched_reserved_memory ...
+FAILED
+
+failures:
+
+failures:
+    el1_file_mmap_replaces_a_live_anonymous_grant
+    el1_host_buffers_follow_reused_mapping_in_two_live_processes
+    el1_host_copyout_into_and_out_of_untouched_reserved_memory
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+test-signed: FAIL /w/target/release/deps/el1_host_copyout-983cd9ce6da5d7a1
+";
+    let cand_log = "\
+test-signed: running /w/target/release/deps/el1_host_copyout-9e4a145bcc081d87 el1_ --nocapture
+
+running 3 tests
+test el1_file_mmap_replaces_a_live_anonymous_grant ...
+scripts/lib/test-signed-body.sh: line 431: 35031 Abort trap: 6           env RUST_TEST_THREADS=1 \"$exe\" \"$@\"
+test-signed: FAIL /w/target/release/deps/el1_host_copyout-9e4a145bcc081d87
+";
+    let base = receipt_from_el1_log(true, base_log);
+    let cand = receipt_from_el1_log(false, cand_log);
+    assert_eq!(cand.steps[0].started_tests.len(), 1);
+    assert_eq!(cand.steps[0].unfinished_binaries, ["el1_host_copyout"]);
+    assert_eq!(
+        cand.steps[0].unitemized_failures,
+        ["crash:el1_host_copyout"]
+    );
+
+    let result = diff(&base, &cand).unwrap();
+    assert!(
+        result.new.is_empty(),
+        "a crash in a binary whose base tests all failed must not report NEW failures, got: {:?}",
+        result.new
+    );
+    assert_eq!(
+        result.fixed,
+        vec![
+            "test:el1-embed:el1_host_copyout::el1_file_mmap_replaces_a_live_anonymous_grant",
+            "test:el1-embed:el1_host_copyout::el1_host_buffers_follow_reused_mapping_in_two_live_processes",
+            "test:el1-embed:el1_host_copyout::el1_host_copyout_into_and_out_of_untouched_reserved_memory",
+        ]
+    );
+}
+
+#[test]
+fn replay_base_passing_binary_with_candidate_missing_tests_yields_new_failures() {
+    let base_log = "\
+test-signed: running /w/target/release/deps/el1_gic-ee0e960234e427a0 el1_ --nocapture
+
+running 2 tests
+test el1_gic_el0_id_view_hides_the_gic ... ok
+test el1_gic_vtimer_reaches_el1_without_host_exits ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+";
+    let cand_log = "\
+test-signed: running /w/target/release/deps/el1_gic-ee0e960234e427a0 el1_ --nocapture
+
+running 1 test
+test el1_gic_el0_id_view_hides_the_gic ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+";
+    let base = receipt_from_el1_log(true, base_log);
+    let cand = receipt_from_el1_log(true, cand_log);
+    let result = diff(&base, &cand).unwrap();
+    assert_eq!(
+        result.new,
+        vec!["missing:el1_gic::el1_gic_vtimer_reaches_el1_without_host_exits"]
+    );
+}
+
+#[test]
+fn replay_partially_passing_base_binary_crashing_before_passing_test_yields_new_failures() {
+    let base_log = "\
+test-signed: running /w/target/release/deps/el1_kick_served_loop-a52172b471abd796 el1_ --nocapture
+
+running 3 tests
+test el1_served_burst_surfaces_kicks_under_oversubscription ...
+FAILED
+test el1_served_second_known_red ...
+FAILED
+test el1_served_loop_surfaces_kicks ...
+ok
+
+failures:
+
+failures:
+    el1_served_burst_surfaces_kicks_under_oversubscription
+    el1_served_second_known_red
+
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.35s
+
+test-signed: FAIL /w/target/release/deps/el1_kick_served_loop-a52172b471abd796
+";
+    let cand_log = "\
+test-signed: running /w/target/release/deps/el1_kick_served_loop-4bc14b20aecdb3a9 el1_ --nocapture
+
+running 3 tests
+test el1_served_burst_surfaces_kicks_under_oversubscription ...
+scripts/lib/test-signed-body.sh: line 431: 34920 Abort trap: 6           env RUST_TEST_THREADS=1 \"$exe\" \"$@\"
+test-signed: FAIL /w/target/release/deps/el1_kick_served_loop-4bc14b20aecdb3a9
+";
+    let base = receipt_from_el1_log(true, base_log);
+    let cand = receipt_from_el1_log(false, cand_log);
+    let result = diff(&base, &cand).unwrap();
+    assert_eq!(
+        result.new,
+        vec![
+            "missing:el1_kick_served_loop::el1_served_loop_surfaces_kicks",
+            "step:el1-embed",
+            "unfinished:el1_kick_served_loop",
+            "unitemized:el1-embed:crash:el1_kick_served_loop",
+        ]
+    );
+}
