@@ -1,0 +1,89 @@
+     Running `target/debug/carrick-xtask worktree-run -- /bin/bash scripts/lib/test-signed-body.sh carrick-embed el1_ --nocapture`
+     Running `target/debug/carrick-xtask host-lease --mode carrick --check-load -- true`
+test-signed: signed /Volumes/CaseSensitive/carrick-signed/wt/signed-pr338/target/release/deps/el1_inotify-509dc7fc6053fa41
+test-signed: signed /Volumes/CaseSensitive/carrick-signed/wt/signed-pr338/target/release/deps/el1_gic-e80dfe053d957e42
+test-signed: signed /Volumes/CaseSensitive/carrick-signed/wt/signed-pr338/target/release/deps/el1_kick_served_loop-4bc14b20aecdb3a9
+test-signed: signed /Volumes/CaseSensitive/carrick-signed/wt/signed-pr338/target/release/deps/el1_host_copyout-9e4a145bcc081d87
+test-signed: running /Volumes/CaseSensitive/carrick-signed/wt/signed-pr338/target/release/deps/el1_inotify-509dc7fc6053fa41 el1_ --nocapture
+
+running 4 tests
+test el1_inotify09_contract ... FAIL-LOUD pid=34677: guest executed at EL1 and faulted (current-EL sync vector) — carrick state corruption (a guest resume left PSTATE at EL1, commonly a signal handler entered with SPSR_EL1=EL1h). Was a silent 100% CPU spin before the hvc #3 vector trap. esr_el1=0x96000005 ec=0x25 elr_el1=0x2d04009c38 far_el1=0x2108 spsr_el1=0x200003c5 mailbox=MailboxDiagnostics { generation: 14, sequence: 0, state: 0, response_action: 0, native_nr: 0, return_value: 0 }
+
+thread 'el1_inotify09_contract' (175558405) panicked at crates/carrick-embed/tests/common/mod.rs:158:21:
+container run failed: the Carrick carrier failed: carrier runtime shutdown failed: configuration refused: persistent executor pool shutdown failed: guest executed at EL1 (carrick state corruption): esr_el1=0x96000005 elr_el1=0x2d04009c38 far_el1=0x2108 spsr_el1=0x200003c5
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test el1_inotify_contract ... el1_inotify_contract population: DelegationCounts { delegations: 28, recalls: 28, host_served: 0, tableless_publishes: 0, revalidated_records: 0, refusals: [(FileTooLarge, 3), (Unregistered, 4)], recall_triggers: [("crates/carrick-kernel/src/el1_delegation/owned_recall.rs:313", 28)] }
+el1_inotify_contract: add_watch served=1000, fwd=1; rm_watch served=1001, fwd=0; write served=1000; seek served=1026
+ok
+test el1_inotify_queue_shape ... ok
+test el1_inotify_recall_on_dir_watch ... FAIL-LOUD pid=34677: guest executed at EL1 and faulted (current-EL sync vector) — carrick state corruption (a guest resume left PSTATE at EL1, commonly a signal handler entered with SPSR_EL1=EL1h). Was a silent 100% CPU spin before the hvc #3 vector trap. esr_el1=0x96000005 ec=0x25 elr_el1=0x2d04009c38 far_el1=0x2108 spsr_el1=0x200003c5 mailbox=MailboxDiagnostics { generation: 49, sequence: 0, state: 0, response_action: 0, native_nr: 0, return_value: 0 }
+
+thread 'el1_inotify_recall_on_dir_watch' (175558486) panicked at crates/carrick-embed/tests/common/mod.rs:158:21:
+container run failed: the Carrick carrier failed: carrier runtime shutdown failed: configuration refused: persistent executor pool shutdown failed: guest executed at EL1 (carrick state corruption): esr_el1=0x96000005 elr_el1=0x2d04009c38 far_el1=0x2108 spsr_el1=0x200003c5
+FAILED
+
+failures:
+
+failures:
+    el1_inotify09_contract
+    el1_inotify_recall_on_dir_watch
+
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+test-signed: FAIL /Volumes/CaseSensitive/carrick-signed/wt/signed-pr338/target/release/deps/el1_inotify-509dc7fc6053fa41
+test-signed: running /Volumes/CaseSensitive/carrick-signed/wt/signed-pr338/target/release/deps/el1_gic-e80dfe053d957e42 el1_ --nocapture
+
+running 2 tests
+test el1_gic_el0_id_view_hides_the_gic ... el1-gic-id-view id_aa64pfr0_gic=0 CarrierGicSnapshot { gic: true, generation: 1, vcpus: 12, capacity: 256 }
+ok
+FAIL-LOUD pid=34703: guest executed at EL1 and faulted (current-EL sync vector) — carrick state corruption (a guest resume left PSTATE at EL1, commonly a signal handler entered with SPSR_EL1=EL1h). Was a silent 100% CPU spin before the hvc #3 vector trap. esr_el1=0x96000005 ec=0x25 elr_el1=0x2d04009c38 far_el1=0x2108 spsr_el1=0x200003c5 mailbox=test el1_gic_vtimer_reaches_el1_without_host_exits ... MailboxDiagnostics { generation: 2, sequence: 0, state: 0, response_action: 0, native_nr: 0, return_value: 0 }
+el1-gic-vtimer VtimerProbeReport { armed: true, delivered: true, vcpu: 1, host_initiated_exits: 0, other_exits: 0 } vtimer_taken=1 kick_sgis_taken=4 lseek served=2001000 forwarded=0
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.21s
+
+test-signed: running /Volumes/CaseSensitive/carrick-signed/wt/signed-pr338/target/release/deps/el1_kick_served_loop-4bc14b20aecdb3a9 el1_ --nocapture
+
+running 2 tests
+test el1_served_burst_surfaces_kicks_under_oversubscription ... carrick fatal [el1]: EL1 panic handler invoked: panic sentinel 0xdeadcafedeadbeef at elr_el1=0x224084; source_line=0 source_column=0 frame_grant_publication_detail=0
+scripts/lib/test-signed-body.sh: line 431: 34920 Abort trap: 6           env RUST_TEST_THREADS=1 "$exe" "$@"
+test-signed: FAIL /Volumes/CaseSensitive/carrick-signed/wt/signed-pr338/target/release/deps/el1_kick_served_loop-4bc14b20aecdb3a9
+test-signed: running /Volumes/CaseSensitive/carrick-signed/wt/signed-pr338/target/release/deps/el1_host_copyout-9e4a145bcc081d87 el1_ --nocapture
+
+running 3 tests
+test el1_file_mmap_replaces_a_live_anonymous_grant ... 
+thread 'el1_file_mmap_replaces_a_live_anonymous_grant' (175559794) panicked at crates/carrick-embed/tests/el1_host_copyout.rs:63:5:
+exit_code=139 stdout="" stderr=fatal runtime error: assertion failed: signal(libc::SIGPIPE, handler) != libc::SIG_ERR, aborting
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test el1_host_buffers_follow_reused_mapping_in_two_live_processes ... 
+thread 'el1_host_buffers_follow_reused_mapping_in_two_live_processes' (175559822) panicked at crates/carrick-embed/tests/el1_host_copyout.rs:84:5:
+exit_code=139 stdout="" stderr=fatal runtime error: assertion failed: signal(libc::SIGPIPE, handler) != libc::SIG_ERR, aborting
+
+FAILED
+test el1_host_copyout_into_and_out_of_untouched_reserved_memory ... 
+thread 'el1_host_copyout_into_and_out_of_untouched_reserved_memory' (175559842) panicked at crates/carrick-embed/tests/el1_host_copyout.rs:34:5:
+exit_code=139 stdout="" stderr=fatal runtime error: assertion failed: signal(libc::SIGPIPE, handler) != libc::SIG_ERR, aborting
+FAILED
+
+failures:
+
+failures:
+    el1_file_mmap_replaces_a_live_anonymous_grant
+    el1_host_buffers_follow_reused_mapping_in_two_live_processes
+    el1_host_copyout_into_and_out_of_untouched_reserved_memory
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+FAIL-LOUD pid=35031: guest executed at EL1 and faulted (current-EL sync vector) — carrick state corruption (a guest resume left PSTATE at EL1, commonly a signal handler entered with SPSR_EL1=EL1h). Was a silent 100% CPU spin before the hvc #3 vector trap. esr_el1=0x2000000test-signed: FAIL /Volumes/CaseSensitive/carrick-signed/wt/signed-pr338/target/release/deps/el1_host_copyout-9e4a145bcc081d87
+/Volumes/CaseSensitive/carrick-signed/wt/signed-pr338/target/release/deps/entitlement_negative-fa4f8d6c45c3430d.noent.26941: replacing existing signature
+test-signed: negative control on /Volumes/CaseSensitive/carrick-signed/wt/signed-pr338/target/release/deps/entitlement_negative-fa4f8d6c45c3430d.noent.26941
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+test-signed: FAILED (carrick-embed)
