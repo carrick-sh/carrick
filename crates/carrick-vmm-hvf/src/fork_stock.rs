@@ -539,7 +539,7 @@ impl ForkStockHostCustody {
     ) -> Result<LinuxWaitStatus, ForkStockServiceError> {
         let status = root_exit
             .status_for(execution.binding)
-            .map(LinuxWaitStatus::from_termination_status)
+            .and_then(|status| LinuxWaitStatus::from_termination_status(status).ok())
             .ok_or(ForkStockServiceError::StaleExecution)?;
         if let Some(asid_gen) = self.committed_asids.remove(&execution.binding.mm.raw()) {
             let retired = self
@@ -952,6 +952,25 @@ mod tests {
         let result =
             custody.service_settlement(&mut ledger, exec, &mut dirty_abort, |_| true, |_| false);
         assert_eq!(result, Err(ForkStockServiceError::ExposedDirtyTable));
+    }
+
+    #[test]
+    fn root_exit_refuses_invalid_terminal_signals() {
+        let mut custody = ForkStockHostCustody::new(NonZeroU64::new(7).unwrap());
+        let exec = test_execution(41, 0, 301);
+        for code in [0, 128, 256] {
+            for core_dump in [false, true] {
+                let record = NativeRootExit::new(
+                    exec.binding,
+                    carrick_sched_core::process::TerminationStatus::signaled(code, core_dump),
+                )
+                .unwrap();
+                assert_eq!(
+                    custody.service_root_exit(exec, &record),
+                    Err(ForkStockServiceError::StaleExecution)
+                );
+            }
+        }
     }
 
     #[test]

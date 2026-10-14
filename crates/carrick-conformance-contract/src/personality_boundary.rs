@@ -34,7 +34,7 @@ use syn::visit::Visit;
 
 /// Narrow transport guard while the broader carrier substrate split is pending.
 pub fn check_carrier_root_exit_transport(root: &Path) -> Result<(), BoundaryError> {
-    let path = root.join("crates/carrick-x86-carrier/src/native_execution.rs");
+    let path = root.join("crates/carrick-x86-carrier/src");
     let forbidden = [
         "carrick_personality_linux",
         "LinuxWaitStatus",
@@ -47,14 +47,19 @@ pub fn check_carrier_root_exit_transport(root: &Path) -> Result<(), BoundaryErro
         crate_name: "carrick-x86-carrier".to_owned(),
         ..Default::default()
     };
-    audit_source_file_tree(
-        "carrick-x86-carrier",
-        &path,
-        0,
-        &forbidden,
-        &mut BTreeSet::new(),
-        &mut report,
-    )?;
+    let mut files = Vec::new();
+    collect_rs_files(&path, &mut files)?;
+    let mut visited = BTreeSet::new();
+    for file in files {
+        audit_source_file_tree(
+            "carrick-x86-carrier",
+            &file,
+            0,
+            &forbidden,
+            &mut visited,
+            &mut report,
+        )?;
+    }
     // This guard owns only wait lowering. The strict substrate audit retains
     // its broader rules; carrier EL1 imports are deferred to the seam split.
     report.source_violations.retain(|violation| {
@@ -1565,7 +1570,7 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let dir = temp.path().join("crates/carrick-x86-carrier/src");
             fs::create_dir_all(&dir).unwrap();
-            fs::write(dir.join("native_execution.rs"), source).unwrap();
+            fs::write(dir.join("entry.rs"), source).unwrap();
             assert!(matches!(
                 check_carrier_root_exit_transport(temp.path()),
                 Err(BoundaryError::Violations { .. })

@@ -289,7 +289,7 @@ pub fn complete_run_failure(
 pub fn complete_root_exit(task: &CurrentTask, status: LinuxWaitStatus) -> ! {
     let exit = carrick_core_abi::NativeRootExit::new(
         carrick_el1::personality::common_entry::execution_binding(task),
-        status.to_termination_status(),
+        status.terminal_status().unwrap_or_else(|_| fatal_boot()),
     )
     .unwrap_or_else(|| fatal_boot());
     // SAFETY: shared retirement authenticated this exact root completion.
@@ -1074,7 +1074,9 @@ impl Personality for LinuxPersonality {
             }
             CompletionRoute::Suspended => {
                 if let Some(status) = root_exit {
-                    ControlFlow::Terminate(TerminationRequest::new(status.to_termination_status()))
+                    ControlFlow::Terminate(TerminationRequest::new(
+                        status.terminal_status().unwrap_or_else(|_| fatal_boot()),
+                    ))
                 } else {
                     ControlFlow::Suspend(OwnedContinuation::new(0))
                 }
