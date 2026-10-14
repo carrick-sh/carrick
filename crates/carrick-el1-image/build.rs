@@ -51,14 +51,16 @@ fn find_sysroot_tool(tool: &str, sysroot: &str, host: &str) -> PathBuf {
     );
 }
 
-/// Pin the emitted exit-chain frames, including saved registers and alignment.
-/// These ceilings total 10 KiB, leaving 6 KiB for exception entry and callees.
+/// Pin the frames that actually retain stack across owner entry and exit.
+/// Tail-call wrappers do not stand in for their callee's budget.
 fn check_process_exit_frames(disassembly: &str) {
     let budgets = [
         ("::dispatch::dispatch_syscall::", 0x600),
-        ("::aarch64_process::with_process_entry::", 0x1200),
-        ("::exit_owned::", 0x800),
-        ("::native_process_entry::publish_exit::", 0x800),
+        ("::aarch64_process::admit_entry_runtime::", 0x1200),
+        ("::exit_with_status::", 0x600),
+        ("::finish_exit::", 0x800),
+        ("::aarch64_process::resume_selected::", 0xa00),
+        ("::resume_checkpoint::", 0x400),
     ];
     for (symbol, ceiling) in budgets {
         let mut found = false;

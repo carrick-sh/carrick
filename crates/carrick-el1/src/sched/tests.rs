@@ -1290,6 +1290,103 @@ fn a_raised_gate_sends_the_thread_to_its_executor() {
     assert_eq!(zone.counters.el1_space_refusals.load(Ordering::Relaxed), 1);
 }
 
+#[test]
+fn left_checkpoint_skips_selected_frame_and_runs_next_record() {
+    let zone = zone();
+    publish_space(&zone, MM, TTBR_MM);
+    host_publish(&zone, SLOT, MM, None, 0);
+    zone.enter_guest(SLOT);
+    let first_word = AtomicU32::new(0);
+    let second_word = AtomicU32::new(0);
+    let first_addr = first_word.as_ptr() as u64;
+    let second_addr = second_word.as_ptr() as u64;
+    let first = queue_foreign(&zone, 202, MM, first_addr, thread_ctx(0xB, first_addr));
+    let second = queue_foreign(&zone, 203, MM, second_addr, thread_ctx(0xC, second_addr));
+    let task = task_for(101);
+    let (mut frame, mut cpu) = live(0xA, first_addr, FUTEX_WAIT_PRIVATE, 0);
+    cpu.resume_once = Some(ResumeAction::Left);
+    let original = frame.x[1];
+    let result = (Sched {
+        handoff: None,
+        zone: &zone,
+        slot: SLOT,
+        task: &task,
+        cpu: &mut cpu,
+        user: &HardwareUserWord,
+        counters: counters(),
+    })
+    .run_next(&mut frame, 0);
+    assert_eq!(result, Served::Returned { switched: true });
+    assert_eq!(zone.slot(SLOT).current(), Some(second));
+    assert_ne!(frame.x[1], original);
+    assert_eq!(frame.elr, thread_ctx(0xC, second_addr).pc);
+    assert!(matches!(zone.record(first).claim(), Claim::OnCpu { .. }));
+}
+
+#[test]
+fn left_checkpoint_host_exit_keeps_the_prior_frame() {
+    let zone = zone();
+    publish_space(&zone, MM, TTBR_MM);
+    host_publish(&zone, SLOT, MM, None, 0);
+    zone.enter_guest(SLOT);
+    let word = AtomicU32::new(0);
+    let address = word.as_ptr() as u64;
+    queue_foreign(&zone, 202, MM, address, thread_ctx(0xB, address));
+    let task = task_for(101);
+    task.linux.mark_pending_host_work();
+    let (mut frame, mut cpu) = live(0xA, address, FUTEX_WAIT_PRIVATE, 0);
+    let saved_x = frame.x;
+    let saved_elr = frame.elr;
+    cpu.resume_once = Some(ResumeAction::Left);
+    assert_eq!(
+        (Sched {
+            handoff: None,
+            zone: &zone,
+            slot: SLOT,
+            task: &task,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+            counters: counters(),
+        })
+        .run_next(&mut frame, 0),
+        Served::Idle
+    );
+    assert_eq!(frame.x, saved_x);
+    assert_eq!(frame.elr, saved_elr);
+}
+
+#[test]
+fn idle_left_checkpoint_selects_the_next_runnable_record() {
+    let zone = zone();
+    publish_space(&zone, MM, TTBR_MM);
+    host_publish(&zone, SLOT, MM, None, 0);
+    zone.enter_guest(SLOT);
+    let first_word = AtomicU32::new(0);
+    let second_word = AtomicU32::new(0);
+    let first_addr = first_word.as_ptr() as u64;
+    let second_addr = second_word.as_ptr() as u64;
+    queue_foreign(&zone, 202, MM, first_addr, thread_ctx(0xB, first_addr));
+    let second = queue_foreign(&zone, 203, MM, second_addr, thread_ctx(0xC, second_addr));
+    let task = task_for(101);
+    let (mut frame, mut cpu) = live(0xA, first_addr, FUTEX_WAIT_PRIVATE, 0);
+    cpu.resume_once = Some(ResumeAction::Left);
+    assert_eq!(
+        (Sched {
+            handoff: None,
+            zone: &zone,
+            slot: SLOT,
+            task: &task,
+            cpu: &mut cpu,
+            user: &HardwareUserWord,
+            counters: counters(),
+        })
+        .idle(&mut frame, 0),
+        Served::Returned { switched: true }
+    );
+    assert_eq!(zone.slot(SLOT).current(), Some(second));
+    assert_eq!(frame.elr, thread_ctx(0xC, second_addr).pc);
+}
+
 /// A foreign-COW publication for B's address space is covered by one
 /// broadcast invalidation of its ASID before its roots are installed, once.
 #[test]
