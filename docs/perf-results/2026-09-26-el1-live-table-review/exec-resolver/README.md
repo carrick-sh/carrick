@@ -1,6 +1,6 @@
 # Exec replacement live resolver regression
 
-The public probe gate on `33b590cd8762cb89cdba343fa95dff6d87508c81`
+The public probe gate on `ed00855572af0ea285b13068c8791521b2c85733`
 aborts at the first probe of each shard (`accessx`, `acceptsock`, `abortdeath`)
 with `dispatch::brk: protect_range failed during brk heap expansion`.
 No broad probe, smoke, full, or EL1 migration acceptance follows from the

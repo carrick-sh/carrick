@@ -200,7 +200,7 @@ go and cpython show exactly 2.00 nudges per block (8715/8715 and 3172/3172).
   `GuestGrantLedger` already keeps an `occupied` counter "so a boundary with
   nothing pending skips the scan". `guest_grants_awaiting_settlement()` reads
   it, but neither `settle_ready` nor `settle_guest_frame_grants` checks it
-  (still true on `main` at 3ab5c9956). The leaf
+  (still true on `main` at 84268e9e4). The leaf
   `settle_guest_frame_grants+0x10c` sits in that loop's inlined
   `RawMutex::lock`.
 - **Per-quantum bookkeeping (F, G, J).** This covers the pool-wide
@@ -277,7 +277,7 @@ cpython's carrier CPU and is worth its own investigation.
 on the executor that claims it, split into wake-to-claim and claim-to-run,
 plus the reactor's ready-to-wake for reactor-sourced wakes, and records how
 the claiming executor got there (a condvar unpark, a guest exit by class,
-or already running host-side). Node shard, lane off, on main 313a1ab00 plus
+or already running host-side). Node shard, lane off, on main c3173ed32 plus
 the classifier and ledger commits. The host was shared (load average 10-56
 during the captures), so every number here suggests, and none confirms.
 

@@ -1,6 +1,6 @@
 # Signed allocator with carrier custody and stage-2 records
 
-Source b61195767 (full revision in identity files). The focused signed allocator
+Source 55d9175a6 (full revision in identity files). The focused signed allocator
 test exits 0. Basic allocation, 10 MiB growth beyond the bootstrap, full return
 of 5,767,168 granted bytes, and recovery after one denied grant pass. Three
 successful grants have exactly three completed returns. Negative entitlement

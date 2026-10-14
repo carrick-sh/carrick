@@ -63,7 +63,7 @@ All required commands exited zero:
 - `cargo test -p carrick-el1-abi`: 125 tests.
 - `just test-kernel-semantics`.
 - `just clippy` and `just fmt-check`.
-- `CARRICK_AUTHORITY_BASE=dfc9100e277339016f537ba09e2b475470c953b6 just lint-domains`:
+- `CARRICK_AUTHORITY_BASE=75369d8ab8373439ce9d77e606e99515d50b7e0b just lint-domains`:
   source and full native compiler census passed, 1,232 counters, PR-base
   ratchet passed, no new cohort. Executed profiles: macos-cli-default,
   macos-runtime-default, macos-hvf-default. Six Linux/BSD profiles remain

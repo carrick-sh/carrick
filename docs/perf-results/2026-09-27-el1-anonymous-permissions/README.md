@@ -1,7 +1,7 @@
 # EL1 anonymous permission acceptance
 
 This directory binds the `kernel.el1.anonymous-permissions` contract to source
-commit `f1bff2ec47d91ec358f6b55801f21498062edec7`. The checkpoint moves exact,
+commit `e6f4c7eb59152c5f79b442250cd4e31ef5529e3f`. The checkpoint moves exact,
 fully resident private-anonymous `mprotect` transitions into guest EL1, keeps
 the output frames and permission ceilings authoritative in live stage-1
 descriptors, and routes denied reads and writes to Linux `SIGSEGV` with
@@ -60,7 +60,7 @@ live permission descriptor, so host service cannot bypass a guest-served
 ## Bound acceptance
 
 - `signed-artifacts.jsonl` binds the passed signed execution to source commit
-  `f1bff2ec4`, test executable SHA-256
+  `e6f4c7eb5`, test executable SHA-256
   `b3dc860a9dc8184c3979958860c0e300fa4082736eb30e401bfa3017c127143b`,
   CDHash `d923040a1b4ba64c374b80df6447296b8ac3cdc7`, LC_UUID
   `6B10F669-1F84-3159-B2C1-5678AA7BE945`, the hypervisor entitlement and the

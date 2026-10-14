@@ -1,7 +1,7 @@
 # Fault-entry worker verification and signed red preparation
 
 Worker `fault-entry` converged after three director review rounds at
-`a6fe8d4af4f4fb097a2801953b89c182678c1ea2`. The director independently
+`72b3815deb720cb07f3f89bd154599768818954a`. The director independently
 rebuilt the fixture, reran its host/image/contract/format/embed-compile checks,
 and executed the final fixture on the pinned native arm64 Docker image.
 All commands exited zero; native container cleanup is empty. This accepts

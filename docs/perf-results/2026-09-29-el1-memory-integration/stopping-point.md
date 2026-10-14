@@ -7,10 +7,10 @@ Nothing was pushed. This is consolidation of unfinished work, not acceptance.
 
 ## Integrated source
 
-Main fast-forwarded from f304f8415 to 4d3484cc2, including merge c90ce118e:
-- Adapter 0c8204e11: memory foundations, IPC routing, descriptor/copyout/COW
-  caller work, sparse publication f5a50259b, and the hardware service witness.
-- Controller/lifecycle 66b1a21d4: slot-liveness, pgrp/ICMP fixes, authenticated
+Main fast-forwarded from 7fd243eb1 to 689328551, including merge cc1ce5447:
+- Adapter d09a3d03f: memory foundations, IPC routing, descriptor/copyout/COW
+  caller work, sparse publication 410e06ee7, and the hardware service witness.
+- Controller/lifecycle 37c76a1c8: slot-liveness, pgrp/ICMP fixes, authenticated
   deferred handback and notification work, terminal-population correction.
 - Ancestry confirms the COW, descriptor, reservation, elastic-return, IPC host,
   object and wait foundations, plus slot-live/pgrp/ICMP branches are included.
@@ -26,7 +26,7 @@ Fixtures now explicitly publish their executor driver, as production does.
 - Scheduler: 80 passed, including pending-object cancellation through handback.
 - EL1: 116 passed. Runtime IPC adapter: 2 passed.
 - Affected all-target Clippy passed; formatting hook passed.
-- Signed service rebuilt and executed FROM MAIN source 4d3484cc2 under run ID
+- Signed service rebuilt and executed FROM MAIN source 689328551 under run ID
   el1-main-stop-20260929-a. One test passed: unpublished MM refusal leaves the
   live leaf unchanged, followed by actual EL1 ForkArm and exact host settlement.
   Host writes remain fenced. Unentitled control passed, both cleanup scopes 0.

@@ -205,7 +205,7 @@ contained transaction without removing permission or errno checks. The full
 
 ## Rebased link admission and fresh signed census (still open)
 
-Work was rebased onto `8bcd7fd97`. The exact cold dispatcher linkat
+Work was rebased onto `19574c6cd`. The exact cold dispatcher linkat
 contract failed with **14 dentry visits** before the change and passes with
 **four visits** after it (the parent has four components). Ordinary rootfs
 linkat carries the admitted source and target parent through target DAC,
@@ -420,7 +420,7 @@ while the required full host recipe is red.
 
 ## Post-review ABI marker correction and rebased host closure
 
-Rebased onto `26dfd3c3f` (SCM_RIGHTS test fix). Source commit `42b6c4af6`
+Rebased onto `d31ea8d22` (SCM_RIGHTS test fix). Source commit `42b6c4af6`
 replaces the marker's raw syscall numbers with the existing typed
 `carrick_abi::syscall::nr::{UNLINKAT, LINKAT, RENAMEAT, OPENAT, RENAMEAT2}`
 constants used by filesystem routing. No handler or census set changed.

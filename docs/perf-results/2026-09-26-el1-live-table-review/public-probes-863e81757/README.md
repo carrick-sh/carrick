@@ -1,7 +1,7 @@
-# Public probe result on 863e81757
+# Public probe result on 7ad7a66bf
 
-Source: `863e81757b066105ff9dd8696723983a20fdbc67`, clean for the run.
-Command: `CARRICK_RUN_ID=el1-public-probes-20260926-863e81757 RUSTC_WRAPPER= just --no-deps conformance-probes`.
+Source: `7ad7a66bfcf9b2ddd01699c8526133380b6ac19c`, clean for the run.
+Command: `CARRICK_RUN_ID=el1-public-probes-20260926-7ad7a66bf RUSTC_WRAPPER= just --no-deps conformance-probes`.
 The command exits zero. This is a qualified public-gate result, not strict
 conformance closure or completion of the EL1 memory checkpoint.
 
@@ -30,7 +30,7 @@ these as proven regressions, harmless timing noise, or accepted gaps yet.
 The CLI SHA-256 is
 `ba157402cc698aff67322f2c1ef6a3670219832bd10d6007f7b9f748b5f77b97`.
 It is unchanged after the gate and frozen at
-`target/el1-completion/live-integrated/cli-frozen-863e81757`.
+`target/el1-completion/live-integrated/cli-frozen-7ad7a66bf`.
 Its CDHash, LC_UUID, hypervisor entitlement and DOF are in the artifact JSON.
 All 516 probe executables per libc were rehashed and matched the prior complete
 build inventory before this run.
@@ -43,7 +43,7 @@ acceptance must retain each tested signed executable before the next stage
 re-signs it. Do not equate a matching LC_UUID with matching signed identity.
 
 Full CI on this revision is running separately at
-`target/el1-completion/live-integrated/ci-863e81757.log`. Smoke/full promotion,
+`target/el1-completion/live-integrated/ci-7ad7a66bf.log`. Smoke/full promotion,
 strict retained-probe closure, real EL1 first-touch service, and all later
 migration checkpoints remain open. No workload speedup or 2x acceptance is claimed.
 
@@ -51,7 +51,7 @@ migration checkpoints remain open. No workload speedup or 2x acceptance is claim
 
 The four dedicated-stage executables remain byte-identical to their recorded
 SHA-256 values and are now copied to
-`target/el1-completion/live-integrated/dedicated-frozen-863e81757/`.
+`target/el1-completion/live-integrated/dedicated-frozen-7ad7a66bf/`.
 `dedicated-frozen-artifacts.json` records their exact paths and identities;
 their existing receipt covers 32 passing test executions.
 

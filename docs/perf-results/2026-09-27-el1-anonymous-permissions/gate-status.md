@@ -1,6 +1,6 @@
 # Gate status
 
-Source commit: `f1bff2ec47d91ec358f6b55801f21498062edec7`.
+Source commit: `e6f4c7eb59152c5f79b442250cd4e31ef5529e3f`.
 
 - `cargo fmt --all -- --check`: pass.
 - `cargo test -p carrick-mmu-core --lib`: pass, 107 tests.

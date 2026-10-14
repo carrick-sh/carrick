@@ -33,7 +33,7 @@ All carried the hypervisor entitlement and `__dof_carrick`.
 
 Run IDs: `n1-cm-299b19ca1-s1` through `s5`, in the order below. All returned
 libtest 101 and signed runner 1. Main comparisons refer to the historical
-`51bfe67f4` [batch-five receipt](2026-10-04-n1-batch5-gate.md), not a fresh
+`bb24853c2` [batch-five receipt](2026-10-04-n1-batch5-gate.md), not a fresh
 control on this host.
 
 | Test suffix (`el1_`) | N1 result | Historical main |
@@ -109,7 +109,7 @@ outside this lane.
 ## Correction and qualified retained-artifact captures
 
 The red witness is committed as `e3291bbcb`, on director-supplied base
-`631785609`. `c4b1836c4` changes the owner census and copy selection to copy
+`b6af04514`. `c4b1836c4` changes the owner census and copy selection to copy
 only the named per-MM identity window. Carrier code, maintenance, mailbox
 outputs and coarse stage-two gaps remain inherited; child table aliases
 name the child's private root. The witness now passes, including physical

@@ -2,7 +2,7 @@
 
 Status: plan, 2026-09-24. Builds on
 [`2026-09-24-el1-born-in-zone.md`](2026-09-24-el1-born-in-zone.md) (phases 1
-and the inode/open-file split of phase 2 are on main at 4c92a8ab8).
+and the inode/open-file split of phase 2 are on main at 0eb073e87).
 
 ## What the EL1 work showed
 
@@ -12,7 +12,7 @@ and the inode/open-file split of phase 2 are on main at 4c92a8ab8).
 | Ownership, not code speed, decided the result | every delegate/recall protocol shipped defects; "born in the zone, one owner, one implementation" removed whole classes |
 | Focused contracts are not enough | the first full probe gate found 7 EL1 defects that passed focused tests; LTP found 2 more; phase 2 exposed a pre-existing O_TRUNC/truncate(path) data loss |
 | Tests lie when they do not prove their path | a fork silently made writes host-served; a perl literal made a script die; a green run proved nothing until counters were asserted |
-| Removing a mechanism removes what it covered | a "cleanup" (9e6ef15ab) deleted the signal pump's wake-debt retry; lost SIGALRM, found by bisect |
+| Removing a mechanism removes what it covered | a "cleanup" (6afc23182) deleted the signal pump's wake-debt retry; lost SIGALRM, found by bisect |
 | We have measured one workload | EL1 has never been run against go build, cpython or node. A trapping syscall costs ~12x native and ~70% of per-op cost was our own host work (2026-09-20); the cold go build is ~10x Docker |
 
 ## Goal

@@ -3,8 +3,8 @@
 **Not review-ready: the signed gate is pending.** The structural lookup
 omission and table-capacity retirement defects are repaired red-first in
 VM-free production-path witnesses. The final code
-and inventory snapshot is `5c8dba4288366b52b02e0e3376ac44ab65175e62` on
-batch-seven main `80bc107de`.
+and inventory snapshot is `1322a69cf2e849761f352b4eee4bd1f2f7be1ffc` on
+batch-seven main `3c9c3d37a`.
 This document's commit changes documentation only. No signed executable was
 built or run in this turn; the preceding receipt's copyout **10/10** and
 stage-six EBUSY remain evidence for that earlier artifact only.
@@ -26,7 +26,7 @@ remain. There is no new index or guest-VA lookup.
 
 All four owner-fork tests pass after the change. Original red/green commits
 are `c0b3122de` / `b300c4fe0`; after the batch-seven rebase they are
-`844dad6e1` / `ce442f619`. Live removal of stage-six EBUSY is not yet proven.
+`1ba5d260e` / `a417fab7c`. Live removal of stage-six EBUSY is not yet proven.
 
 ## Two live MMs: retire physical tables before returning capacity
 
@@ -48,7 +48,7 @@ peer's physical record while the first MM retires:
 
 The first two are 0/2 red, the third 0/1 red. All three pass together after
 the repairs. Original commits `64c335e4a`, `1c2411d87`, `37d07b989` rebased
-to `230143c29`, `132a50527`, `a369a8502`.
+to `3a2485eda`, `9cbcb6cac`, `5e13b9ca9`.
 
 `Stage1Authority::retire_table_capacity` holds its existing exclusion through
 retirement of its published arenas, an optional exact root callback, and
@@ -76,7 +76,7 @@ retains/restores that pool through an RAII guard. The documented serial
 recipe is unchanged; no serialization was added as a symptom fix.
 
 During fixture publication, the director reported batch seven on main and
-requested a rebase. The complete N1 stack was rebased onto `80bc107de`.
+requested a rebase. The complete N1 stack was rebased onto `3c9c3d37a`.
 Conflict resolution preserves both contract surfaces, N1's child owner
 copyout, and PR #56's exact-task failpoint admission. The range diff was
 reviewed. Clean reconciliation retains 663 authority rows and 621 compiler
@@ -84,7 +84,7 @@ capture rows, rebinding eight host sites, 32 K1 positions and 12 executor
 abort fingerprints without classification or debt changes.
 
 Final clean-tree **`just ci` passed**, including integration, and
-**`just test-loom` passed 8/8** on `5c8dba428`. Its HVF host suite again
+**`just test-loom` passed 8/8** on `1322a69cf`. Its HVF host suite again
 passed 735 tests with three existing ignores, including all four new
 witnesses. No production source changes followed these checks. The final
 push uses an exact force-with-lease from the verified pre-rebase remote
@@ -92,7 +92,7 @@ push uses an exact force-with-lease from the verified pre-rebase remote
 
 Raw red/green logs, both CI/loom runs, rebase range diff, publisher/cleanup
 receipts, the source patch and the prepared gate script are retained in
-`target/n1g5/custody-handoff-5c8dba428/`, with `SHA256SUMS`.
+`target/n1g5/custody-handoff-1322a69cf/`, with `SHA256SUMS`.
 
 ## Pre-rebase bundle retained, not restored
 
@@ -144,7 +144,7 @@ cleanup. It is the original full-gate script; adapt the invoked scope to
 the director's split only after the fork worker covers the **same final
 SHA**. No signed gate or partial signed retry was consumed in this Mac turn.
 
-Report every comparison against the recorded main `51bfe67f4` failure mode
+Report every comparison against the recorded main `bb24853c2` failure mode
 from the [batch-five receipt](2026-10-04-n1-batch5-gate.md), also summarized in
 the [full-suite investigation](../2026-10-05-storm-full-suite-investigation.md):
 

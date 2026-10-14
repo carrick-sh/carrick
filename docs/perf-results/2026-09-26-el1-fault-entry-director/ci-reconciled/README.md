@@ -1,7 +1,7 @@
 # Integrated fault-entry CI
 
 `RUSTC_WRAPPER= just ci` completed with exit zero on
-`084c9a2725e34ecc58269ebcbb13bf73a90505f0` with a clean source checkout.
+`959be85f14bd5bf89beabe043c4ce2b93c37efa1` with a clean source checkout.
 The Rust result groups total 6,188 passed, zero failed and 12 ignored across
 101 groups. The complete log and its SHA-256 are retained alongside this file.
 

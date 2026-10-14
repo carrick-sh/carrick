@@ -15,7 +15,7 @@ incomplete in `target/conformance/eco-20260917/results.jsonl`; they do not turn
 the older full run into a current-artifact full gate.
 
 The current focused artifact is built from committed source
-`5522e139f3be13a56ccaf90502ea961e237a8a90` plus the reviewed worktree changes:
+`5912eb6c0374ca1e7c9569b66459ff55a5ce9d8b` plus the reviewed worktree changes:
 
 - SHA-256: `968d44296fe0043f3c92b3b894c067838da0fe45a01c058726fc3b463b44cada`
 - CDHash: `1b6b9996abb6cd8a7ede28283597fc9c74107f17`

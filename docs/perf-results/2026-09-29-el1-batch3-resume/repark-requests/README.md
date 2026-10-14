@@ -1,6 +1,6 @@
 # Host requests lost when an EL1 thread parks again
 
-Source: `fb265ba9b` (`276e05673` implementation). Task A remains unaccepted.
+Source: `0e7540da2` (`4efc5b816` implementation). Task A remains unaccepted.
 `witness.patch` adds two deterministic tests to the real EL1 scheduler host
 fixture. Apply it and run:
 
@@ -56,7 +56,7 @@ admission, during enrollment, after park publication and direct handback;
 keep ordinary ping-pong, timers, preemption and two-thread progress green.
 Update the ABI hash, contract bindings and clean compiler inventory, then
 run applicable VM-free and signed gates. Existing signed receipts still
-belong to 40a707ba0, not this newer implementation.
+belong to 98621f69e, not this newer implementation.
 
 Baseline control after removing the witness: all 74 existing EL1 host
 tests passed (`baseline.log`). The formatted witness applies cleanly to
@@ -92,19 +92,19 @@ passed. Logs are retained here. Signed guest proof remains outstanding.
 This does not close the retirement/restore lifetime audit, exact scheduler
 wakes, park-sequence wrap, WorkObservation or full task-A acceptance.
 
-Implementation: `0e1d7c12c`. Clean compiler provenance: `b6810c6e8`.
+Implementation: `0182e255b`. Clean compiler provenance: `a2f4d9187`.
 All 595 census rows and pinned positions remained unchanged. lint-domains
 passed for the macOS subset; Linux/FreeBSD/NetBSD profiles remain pending.
 Contract-change initially identified omitted futex, deferred-lifetime and
-shared-ABI evidence registrations. Binding-only commits `ed32f941d` and
-`666f568c7` supply those mappings; the exact `afcf8676e..666f568c7` coverage
+shared-ABI evidence registrations. Binding-only commits `8b691af10` and
+`a63eda1d3` supply those mappings; the exact `221193151..a63eda1d3` coverage
 gate and final 68-contract registry passed. Both diagnostics and final
 coverage log are retained. ABI bindings claim image identity checks only,
 not fresh signed acceptance for GIC/fault/metadata/stage-1 behavior.
 
 ## Fresh signed regression
 
-Clean source `8916e1fe20a6eee7e174570dc8320973384a03ef` ran:
+Clean source `1d085f4c73eefca9160a9eec3af6a75202c11537` ran:
 
 ```
 CARRICK_RUN_ID=el1-b3-repark-20260929 RUSTC_WRAPPER= scripts/test-signed.sh carrick-embed el1_ --nocapture

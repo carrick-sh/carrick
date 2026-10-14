@@ -15,7 +15,7 @@ sites and invokes the recovered DSR decoder. Neither runs or rewrites the input
 program. No Carrick or Linux guest was run. A stopped container supplied the
 files and was removed afterward.
 
-The DSR donor is `20add4f9f1138cbca98cc672182cb093d473ac72`, as qualified in
+The DSR donor is `2496d96a06330e2eba35a75f7c86a193f66364a4`, as qualified in
 [dsr-reuse](../dsr-reuse/README.md). Its decoder and instruction vocabulary were
 not changed. The new tool was added to that existing isolated research workspace;
 no recovered translator became a product dependency.

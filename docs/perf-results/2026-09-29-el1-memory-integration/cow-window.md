@@ -1,6 +1,6 @@
 # EL1 COW copy aliases and guest descriptor execution
 
-Development continuation from `a5ca5ed03`; no production COW acceptance.
+Development continuation from `171f8aa64`; no production COW acceptance.
 Contract: `kernel.el1.stage1-publication`, with anonymous first-touch and
 fork-COW ownership obligations retained.
 

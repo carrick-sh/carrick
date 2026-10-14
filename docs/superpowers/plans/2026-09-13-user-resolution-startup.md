@@ -27,4 +27,4 @@ User explicitly approved Antigravity external sharing after the review rejection
 - Director stopped the second turn's repeated inventory checks via run-scoped manager and sent review-2 into the same conversation (turn 3). Existing worker commits and changes retained; no integration.
 - Fresh native-arm64 Docker suites all exit zero: go-net_smtp, cpython-httplib, cpython-urllib2_localnet, node-app-smoke, node-libuv. Cache untouched; evidence fresh-oracle/results.json under sep13-review.
 - Two pre-inzone/current comparisons: SMTP and HTTP each pass twice on preserved 457da5fb6521ff7b and fail twice on current fa1ec82e. Evidence tcp-attribution/results.json. These runs are correctness attribution, not performance measurements; worker host builds were separate but potentially concurrent.
-- Main remains 7a3818034. New TCP plan retains endpoint ownership/rollback scope. Startup acceptance and all signed promotion gates remain pending.
+- Main remains 8b74ac980. New TCP plan retains endpoint ownership/rollback scope. Startup acceptance and all signed promotion gates remain pending.

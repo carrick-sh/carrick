@@ -2,7 +2,7 @@
 
 This VM-free checkpoint joins the existing forwarded-fault boundary to real
 HVF stage-2 preparation and the authenticated kernel frame inventory. The
-source base is `ce1c23b4e`.
+source base is `ed2a19c08`.
 
 The runtime claims only a request matching the current MM, fault address and
 access class. It clips the request through the kernel's same-protection bulk
@@ -27,7 +27,7 @@ Evidence retained here:
 - `clippy.log`: warning-denied Clippy passes across the changed product crates;
 - `contract-green.log`: 62 contracts, 15 claims and 143 registered surfaces
   validate after adding the production host-service paths;
-- `contract-change-green.log`: the exact `ce1c23b4e..a90315d59` product diff
+- `contract-change-green.log`: the exact `ed2a19c08..8506298ed` product diff
   has stage-1-publication evidence, with a revision-bound exemption for older
   contracts sharing the ABI, HAL, AArch64 and HVF adapter files;
 - `inventory-drift-green.log`: the generated 338-syscall inventory remains
@@ -39,7 +39,7 @@ Evidence retained here:
   ignored tests and only the unchanged inherited GIC source-shape assertion
   filtered out. The two
   inventory failures from the parallel run pass in this isolated suite. The
-  excluded assertion already fails on `ce1c23b4e`: its expected call omits the
+  excluded assertion already fails on `ed2a19c08`: its expected call omits the
   custody and VM-generation arguments present in unchanged `trap.rs` source.
 
 This checkpoint does not install a guest stage-1 leaf or improve the signed

@@ -1,6 +1,6 @@
 # N2 L5 red-first handoff
 
-Base: `b1167c6e19811c5b3a601d979cedca844656454f`, cloudmac, 2026-10-04.
+Base: `be61e5aed26c93e9c8a3fdcbe832300fcb038e32`, cloudmac, 2026-10-04.
 Scope: tests only; **no row closed and no production path activated**.
 Controller: PR #25's `2026-10-04-n2-readiness.md`, L5 / landing E.
 

@@ -2,7 +2,7 @@
 
 ## Problem and evidence
 
-Current ca2dcc810 signed artifact7055c9d3 passes public probes but smoke is22/23: subprocess exceeds44s. Fresh pinned native arm64 Docker completes341tests/44skips (297passes) in20.3s. The historical instrumented case comparison attributes27.833s of excess to five descriptor scans (28.387s total excess among62 observed cases). Current sampling ranks83% of retained samples in the opaque guest/HVF execution path, not fstat service. Existing mailbox transport reaches174passing assertions but still exceeds44s. These are diagnostic facts, not a promised speedup.
+Current b8e89a567 signed artifact7055c9d3 passes public probes but smoke is22/23: subprocess exceeds44s. Fresh pinned native arm64 Docker completes341tests/44skips (297passes) in20.3s. The historical instrumented case comparison attributes27.833s of excess to five descriptor scans (28.387s total excess among62 observed cases). Current sampling ranks83% of retained samples in the opaque guest/HVF execution path, not fstat service. Existing mailbox transport reaches174passing assertions but still exceeds44s. These are diagnostic facts, not a promised speedup.
 
 ## Alternatives and decision
 

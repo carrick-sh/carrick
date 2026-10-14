@@ -225,7 +225,7 @@ pub enum EmbedError { /* existing */
    `just conformance-probes`; one global budget plus a typed per-probe override table for the known
    heavy probes is acceptable.
 4. The 438 closure-only cpython rows were already repaired by the Sep 14 `--refresh-oracle` run
-   and committed as 0745386ef; no further back-fill.
+   and committed as 3fe3a237f; no further back-fill.
 5. `forkstackstorm`'s spin attribution is a separate brief (Group B fork-planning family); this
    plan only makes the wedge visible and fatal.
 6. `CARRICK_DEADLOCK_WATCHDOG_MS` is deleted; the window becomes a typed parameter everywhere. One

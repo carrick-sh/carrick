@@ -1,6 +1,6 @@
 # Integrated metadata CI: contract inventory correction
 
-Full CI on bc5500391 passed workspace Clippy and reached contract-inventory
+Full CI on 422682443 passed workspace Clippy and reached contract-inventory
 validation, then exited 1 because the generated inventory lacked the new
 kernel.mm.metadata-refusal claim on mmap, munmap and mprotect. The generated
 correction adds exactly those three associations; no syscall support status

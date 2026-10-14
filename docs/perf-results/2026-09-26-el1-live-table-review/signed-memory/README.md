@@ -1,7 +1,7 @@
 # Signed memory foundation checks
 
-Product source: `54f3167a7`. Signed fork source receipt: `b6ce9ab26`;
-occupancy source receipt: `5c1116d55`. Changes between these revisions are
+Product source: `85a17114b`. Signed fork source receipt: `22c42b64d`;
+occupancy source receipt: `ca1b79229`. Changes between these revisions are
 only committed evidence/controller documentation. Full CI passed before these
 signed runs. This is focused live-table foundation proof, not EL1 memory-stage
 or full migration acceptance.
@@ -17,7 +17,7 @@ mode. The separate allocator witness proves zero large buffer allocations in
 warmed reuse; these pool counters alone do not prove that property.
 
 The same-image native Docker semantic controls are in the sibling
-`native-fork-54f3167a7` receipt. Signed negative entitlement passed and both
+`native-fork-85a17114b` receipt. Signed negative entitlement passed and both
 run IDs had zero remaining processes. The frozen fork binary is retained at
 `target/el1-completion/live-integrated/signed-fork-frozen/conformance_contracts-38fb068f15bda479`.
 Its SHA-256 is `bd64c57cd84927480c9cc129a773e27578769b594c6705505e5cc35f113acba1`.

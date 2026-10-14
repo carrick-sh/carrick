@@ -1,6 +1,6 @@
 # Matching-image native fork authority
 
-Source checkpoint: `54f3167a7d1929e962788e79b552a63cec03cf04`.
+Source checkpoint: `85a17114beb8f1dc821dee01e8d274cc69b719ea`.
 The snapshot-buffer reuse correction is integrated at this revision.
 
 All 12 native-arm64 Docker semantic rows passed: direct, dirty-parent, and
@@ -21,5 +21,5 @@ Earlier different-image receipts must not be used as same-image timing proof.
 
 The fixture SHA-256 is
 `1239c755486ab7d1c53cfb0675d22499810457ff0b8067db16945fb9960ced62`.
-Integrated CI is still running on `54f3167a7`; signed fork/memory validation,
+Integrated CI is still running on `85a17114b`; signed fork/memory validation,
 full promotion, first-touch migration and end-to-end acceptance remain open.

@@ -8,7 +8,7 @@ The director reported `el1_thread_lifecycle_spawn_slope` aborting in
 `/Volumes/carrick-build/evidence/n1-cm/fork-50d648e76/`. That evidence was not
 rerun here, and `work/n1-cm` was not merged.
 
-On the unchanged production sources of N1 `229194ae6`, a VM-free kernel unit
+On the unchanged production sources of N1 `fa63ab04a`, a VM-free kernel unit
 witness reproduced the same `ExitTopologyChanged` error for a live child of
 the exiting task. The child had two live threads. Its sibling claimed an ABI
 pool entry before the parent's exit preparation, then published Born after

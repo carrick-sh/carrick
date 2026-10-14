@@ -43,7 +43,7 @@ is promoted; no descriptor or passing native binding is claimed yet.
 ## Reuse boundary established from current history
 
 The current workspace has no callable DSR execution backend. The pre-removal
-revision cc7d9eaa2^ contains carrick-dsr, carrick-dsr-aarch64 and native host
+revision f9933c9da^ contains carrick-dsr, carrick-dsr-aarch64 and native host
 integration. The ISA crate includes decode/block/emit, reserved-register gateway,
 mapped memory, translation/cache identity, and signal-sensitive gateway phases.
 Its host identity-memory and fork assumptions are not today's unified MM model.

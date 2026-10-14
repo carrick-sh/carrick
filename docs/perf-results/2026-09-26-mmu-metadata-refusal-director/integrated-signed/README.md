@@ -1,7 +1,7 @@
 # Integrated metadata signed gate: first-touch remains red
 
-Source a6ac6935ca96c37947a23749481120bd3933876f; later commit
-8acb35b14 adds documentation/evidence only. CLI and all eight invoked signed
+Source 3d68ff1c0af14800650424fc5b62e0bc8d5b3eae; later commit
+7f06a8610 adds documentation/evidence only. CLI and all eight invoked signed
 executables are frozen and hash verified in receipt.json. This failed run has
 an independent manifest because the signed runner publishes normal receipts
 only on success.

@@ -8,7 +8,7 @@ resuming the migration. The goal and hourly progress monitor remain paused.
 Nothing has been pushed. X86 migration and hardware qualification are explicitly
 deferred by the user: “go all the way but don't do x86 for now.”
 
-The source baseline is local main `180b8d586711c9b683337c2c96ec7e28dcad5ba5`,
+The source baseline is local main `c8fee38fa3347c2f3d1c3ca876fea43625c7238b`,
 clean before this documentation update. Current implementation, controller and
 incorporated foundations are on main. Older unfinished branches were deliberately
 excluded at the user's direction. Their presence is not an instruction to merge
@@ -24,9 +24,9 @@ pause.
 
 ## What reached main, and what the evidence proves
 
-Main includes adapter `0c8204e11`, controller/lifecycle `66b1a21d4`, integration
-merge `c90ce118e`, inventory-position commit `4d3484cc2`, and stopping receipt
-`180b8d586`. Incorporated work includes memory ownership foundations, IPC routing,
+Main includes adapter `d09a3d03f`, controller/lifecycle `37c76a1c8`, integration
+merge `cc1ce5447`, inventory-position commit `689328551`, and stopping receipt
+`c8fee38fa`. Incorporated work includes memory ownership foundations, IPC routing,
 descriptor/copyout/COW caller conversions, sparse publication, slot liveness,
 pgrp/ICMP fixes, generation-authenticated deferred handback and notifications.
 The merge preserves IPC operation tokens through cancellation, captures exact
@@ -40,7 +40,7 @@ The merge preserves IPC operation tokens through cancellation, captures exact
 | Descriptor service on actual EL1 | Signed isolated-root service witness passed | Backed/two-live-MM operation, production COW/retirement, TLB workload proof and full admission |
 | Build/static checks | Affected all-target Clippy and formatting passed | Domain inventory review; full CI was not run for consolidation |
 
-The signed test was rebuilt **from main source `4d3484cc2`**, run ID
+The signed test was rebuilt **from main source `689328551`**, run ID
 `el1-main-stop-20260929-a`, using:
 
 ```sh
@@ -57,7 +57,7 @@ This is a service witness, not full COW or migration acceptance.
 Executable SHA-256, CDHash, LC_UUID, entitlements and DOF are retained in
 [artifact receipts](../../perf-results/2026-09-29-el1-memory-integration/main-stop-signed-artifacts.jsonl)
 and the [signed log](../../perf-results/2026-09-29-el1-memory-integration/main-stop-signed.log).
-`180b8d586` and this handoff change documentation only relative to the checked
+`c8fee38fa` and this handoff change documentation only relative to the checked
 product/test source. No runtime tests were rerun for this handoff.
 
 **Domain lint is red.** Seventeen IPC abort sites lack reviewed classifications.
@@ -195,25 +195,25 @@ question. No validation of these dirty files is claimed by this handoff.
 
 ## Already incorporated branches: do not merge again
 
-All heads below are ancestors of main `180b8d586`; all listed worktrees are clean.
+All heads below are ancestors of main `c8fee38fa`; all listed worktrees are clean.
 Keeping the checkout does not imply work remains unmerged. This is source
 integration, not acceptance of every migration contract.
 
 | Branch | Head | Worktree under `.worktrees/` |
 | --- | --- | --- |
-| `integ/batch3` | `66b1a21d4` | `wt-batch3` |
-| `work/cp2-hvf-cow-adapters` | `d581dd099` | `wt-cp2-cow` |
-| `work/cp2-el1-descriptor-owner` | `c555f5dd1` | `wt-cp2-descr` |
-| `work/cp2-el1-reservations` | `f2efa3716` | `wt-cp2-reserve` |
-| `work/cp2-elastic-return` | `8f268dee4` | `wt-cp2-return` |
-| `work/cp3-ipc-adapter` | `4d3484cc2` | `wt-cp3-adapter` |
-| `work/cp3-ipc-host` | `77b6f40a1` | `wt-cp3-host` |
-| `work/cp3-ipc-shared-objects` | `bb93917a4` | `wt-cp3-objects` |
-| `work/cp3-ipc-object-waits` | `7debfcc13` | `wt-cp3-waits` |
-| `work/icmp-bind-zero-flake` | `2a097c0bd` | `wt-icmpflake` |
-| `work/pgrp-snapshot-invariant` | `849e2119c` | `wt-pgrpsnap` |
-| `work/slot-live-root-cause` | `1cd5071d6` | `wt-slotlive` |
-| `work/syscall-return-cost` | `56f848a2b` | `wt-sysret` |
+| `integ/batch3` | `37c76a1c8` | `wt-batch3` |
+| `work/cp2-hvf-cow-adapters` | `0c53d6118` | `wt-cp2-cow` |
+| `work/cp2-el1-descriptor-owner` | `2223dc53e` | `wt-cp2-descr` |
+| `work/cp2-el1-reservations` | `ecb74fefb` | `wt-cp2-reserve` |
+| `work/cp2-elastic-return` | `391a43b3d` | `wt-cp2-return` |
+| `work/cp3-ipc-adapter` | `689328551` | `wt-cp3-adapter` |
+| `work/cp3-ipc-host` | `1d864b880` | `wt-cp3-host` |
+| `work/cp3-ipc-shared-objects` | `79af34bac` | `wt-cp3-objects` |
+| `work/cp3-ipc-object-waits` | `a17a6aa72` | `wt-cp3-waits` |
+| `work/icmp-bind-zero-flake` | `6c14872e7` | `wt-icmpflake` |
+| `work/pgrp-snapshot-invariant` | `a2733916c` | `wt-pgrpsnap` |
+| `work/slot-live-root-cause` | `d63e9e7ba` | `wt-slotlive` |
+| `work/syscall-return-cost` | `0209a7afa` | `wt-sysret` |
 
 ## Safe recovery checks
 

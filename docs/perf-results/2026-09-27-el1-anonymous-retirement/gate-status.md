@@ -1,7 +1,7 @@
 # Gate status
 
 The following checks passed on the implementation that became
-`8b1af0a1963a339e9f8182ab429362543509a021`:
+`e114c9c567ee5d610124a70bb133f10d83a12efd`:
 
 - `just fmt-check`
 - `cargo clippy --workspace --all-targets -- -D warnings`

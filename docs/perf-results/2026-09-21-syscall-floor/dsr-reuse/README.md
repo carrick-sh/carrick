@@ -1,6 +1,6 @@
 # DSR component reuse check against current Carrick
 
-Source donor: 20add4f9f1138cbca98cc672182cb093d473ac72 (parent of the native
+Source donor: 2496d96a06330e2eba35a75f7c86a193f66364a4 (parent of the native
 backend removal). Isolated research workspace: target/lease-cost/dsr-reuse.
 No restored translator crate is a member of the product workspace or linked
 into carrick-cli. Current carrick-abi/guest-mem/mem/host dependencies are used

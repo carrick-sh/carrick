@@ -29,7 +29,7 @@ Coalescing (`try_coalesce`) and table reclamation (`reclaim_invalid_tables`, `re
 ## Measured allocation and admission work
 
 Director correction supersedes the worker's claimed derived-budget result:
-`68bb6dc79` still contained the old scale-specific caps and no named negative
+`00257b5d5` still contained the old scale-specific caps and no named negative
 control test. The final fixture publishes setup before counting, so historical
 dirty entries from pool exhaustion do not inflate the transaction population.
 

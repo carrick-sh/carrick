@@ -46,7 +46,7 @@ rounds comes back to the director.
 | 9c, 9d, 10a, 10b | builder consistency, `RunSpec` grab-bag, tokio/env hacks | T17 `spec-and-embed-hygiene` | 3 |
 | 5e | errno translation split | verified correct by feature closure; no change | — |
 
-## Wave 1 (dispatched 2026-09-10, base `0ec4e75e9`)
+## Wave 1 (dispatched 2026-09-10, base `d5aaf7a9e`)
 
 File fences are disjoint except `crates/carrick-runtime/src/dispatch/mod.rs`
 (T3 edits `AutoCloseFd`; T4 adds one `mod` line) and
@@ -66,14 +66,14 @@ from sibling branches.
 
 ## Progress log
 
-- 2026-09-10 wave 1 LANDED on main: clippy fix (643b4f0a5); `OwnedFd` wrappers
-  + std errno (f06d4acc9); `carrick-fatal` + ledger gate (094233272); typed
-  return constructors `dispatch/retval.rs` (dd5d4435a); unified fs path lookup
-  `dispatch/fs/lookup.rs` (c6a2187c2); DSR + native-darwin removal
-  (cc7d9eaa2, four crates, bench-native, 121K lines).
-- 2026-09-10 wave 2a LANDED: abort shards for leaf crates (d0a6dc970), vcpu_loop
-  (3eff19088), carrick-vmm-hvf (f7fa24e44), fs.rs typed returns + semgrep rule
-  `carrick-no-raw-returned-as-i64` (20add4f9f). The runtime shard (T5c) lands
+- 2026-09-10 wave 1 LANDED on main: clippy fix (65bb21c12); `OwnedFd` wrappers
+  + std errno (e7a2b24e4); `carrick-fatal` + ledger gate (96902cf13); typed
+  return constructors `dispatch/retval.rs` (f1760c5dc); unified fs path lookup
+  `dispatch/fs/lookup.rs` (e39b5db9f); DSR + native-darwin removal
+  (f9933c9da, four crates, bench-native, 121K lines).
+- 2026-09-10 wave 2a LANDED: abort shards for leaf crates (082b225cd), vcpu_loop
+  (ed2a537f6), carrick-vmm-hvf (300e98862), fs.rs typed returns + semgrep rule
+  `carrick-no-raw-returned-as-i64` (2496d96a0). The runtime shard (T5c) lands
   once its gate is green. After it: every ledger row is `sink: fatal`; the
   ledger gate refuses any new raw `std::process::abort()` anywhere under
   `crates/` except the sink itself.
@@ -82,35 +82,35 @@ from sibling branches.
   signature changes; T8 owns them); the semgrep rule still excludes
   `dispatch/mod.rs` (two `Returned { value: … as i64 }` sites; T4c).
 - Two integration tests in `tests/integration/syscall_fs_open.rs` were red
-  on main before this campaign (bisected to 8236ed8bf and b2d22a814); fix
+  on main before this campaign (bisected to 27c3be289 and 489cfedaa); fix
   branch `agy/fsopen-red-bisect-sep10` routes overlay mutations through the VFS
   and drops the host-isatty authority for guest stdio.
-- 2026-09-10 wave 2a/2b LANDED: runtime abort shard (73dc8c517; every ledger
+- 2026-09-10 wave 2a/2b LANDED: runtime abort shard (1a88ea277; every ledger
   row is now `sink: fatal`); fs open fixes for the two pre-existing reds
-  (965268b70); CLI argument flattening + run-elf through the engine + named
-  `--user` resolved against the image passwd/group (d81900348); typed
+  (82aa86e29); CLI argument flattening + run-elf through the engine + named
+  `--user` resolved against the image passwd/group (8e49ba2a6); typed
   `ExecPrepareError` on the exec-prepare path with `RuntimeError::Exec`
-  (e64f8df07); typed `RecordStateCell` for process records (212226756);
-  shared `carrick_hal::VcpuCensus` with an RAII live guard (a10e8b59e);
-  `--rehome` mode for the line-pinned inventories (02756b0ab); one
+  (517ee5d68); typed `RecordStateCell` for process records (01b3369be);
+  shared `carrick_hal::VcpuCensus` with an RAII live guard (d325a7ad9);
+  `--rehome` mode for the line-pinned inventories (94109919a); one
   `WaitOnFds { completion: FdWaitCompletion }` and `SharedFutexTarget`
-  (6d6baf99c).
+  (d3a8037be).
 - Wave 3 dispatched: T10–T13 god-file splits (trap.rs, vcpu_loop/mod.rs,
   fs.rs, dispatch/mod.rs + net.rs), T17 spec/embed hygiene; T19 (two more
   pre-existing red integration tests: syslog manifest owner, timer_create
   thread-clock SIGEV_THREAD_ID) in review round 2.
 - Landing discipline learned today: never `git add -A` while a rebase is
   paused (a conflict-markered capture JSON reached main once and was fixed
-  forward in eec00f45f); validate every inventory JSON parses before commit;
+  forward in 2972005b0); validate every inventory JSON parses before commit;
   `git rerere` is enabled in this clone — its cache was cleared so a recorded
   "take main" resolution can never be replayed onto a newer inventory.
 - 2026-09-10 live verification: `just conformance-probes` on main at
-  ce62ddb26 (signed, carrick-only against the cached oracle) — every probe
+  9c709ebaa (signed, carrick-only against the cached oracle) — every probe
   MATCH except four DIFFs already recorded as open reds by earlier sessions
-  the same day (`seekholemap` 9bf699d88, `statfslifetime` 9bf699d88,
-  `tty0state` 4392584d0, `packetv3state` 1655fd6dd). No campaign regression
+  the same day (`seekholemap` 1621bc006, `statfslifetime` 1621bc006,
+  `tty0state` dc898bad1, `packetv3state` ed38c39c7). No campaign regression
   on the probe gate. Log: `target/perf/probes-wave2b-sep10.log`.
-- 2026-09-10 `just ci` GREEN on main at 73bb6d842 (log
+- 2026-09-10 `just ci` GREEN on main at cc4743ce5 (log
   `target/perf/ci-wave2b4-sep10.log`). Before the campaign main failed
   `just clippy` (15 lints), four runtime integration tests (O_TMPFILE
   materialisation, TIOCSCTTY on stdio, the syslog manifest owner,
@@ -127,7 +127,7 @@ from sibling branches.
   semgrep exclusion for mod.rs is gone). Each worker hit its 90-minute
   budget twice; round 2 continues from the landed state with a
   commit-per-move, stop-green-at-70-minutes rule. T17 spec/embed hygiene
-  landed (70f8413a3). T16 dispatcher subsystem views is briefed and waits
+  landed (7ac66d66b). T16 dispatcher subsystem views is briefed and waits
   for the dispatch split to finish.
 - 2026-09-10 wave 3 round 2 LANDED: trap.rs → 21,662 (guest_memory,
   global_frame, test modules moved with their subjects); vcpu_loop/mod.rs
@@ -160,15 +160,15 @@ from sibling branches.
   Classified load-sensitive per AGENTS.md ("anything flaky is an
   architectural flaw"): the crash-capture thread census under host load is
   an open defect class (it was root-caused once already on 2026-09-08,
-  cea7eecad), not a campaign regression. Not excused; recorded for the
+  86669b6a9), not a campaign regression. Not excused; recorded for the
   next fix cycle.
 - 2026-09-11 wave 3 round 5 LANDED: dispatch/net.rs 8,905 → 2,975 and
-  dispatch/mod.rs → 3,081 (9a04404c9). Every god file from feedback item 1
+  dispatch/mod.rs → 3,081 (57454bd72). Every god file from feedback item 1
   is now at or below its brief target except dispatch/mod.rs (3.1K vs
   2K, the remaining lines are `mod` declarations and re-exports). `just ci`
   green on main (ci-wave3f). Remaining: T16 dispatcher subsystem views
   (FsView landed in review), then the final probe run.
-- 2026-09-11 T16 LANDED (2624ae8bc): typed subsystem views (`FsView`,
+- 2026-09-11 T16 LANDED (64d387f58): typed subsystem views (`FsView`,
   `NetView`, `ProcView`, `SignalView`, `IpcView`, `MemView`) on
   `SyscallDispatcher`; all 88 fs handlers take `FsView`, whose
   `cross: &dyn FsCrossSubsystem` is non-optional (the test fixture
@@ -184,7 +184,7 @@ from sibling branches.
 - 2026-09-11 final gates: `just ci` green (ci-final-sep11); the probe gate
   caught one real regression from the dispatcher-views landing — FsView
   had header-only copies of the `/proc/sysvipc/*` renderers shadowing the
-  live ones (`sysvmsg` DIFF, deterministic) — fixed forward in de31e8ef5
+  live ones (`sysvmsg` DIFF, deterministic) — fixed forward in f679cf7de
   by routing them through `FsCrossSubsystem`; `coredumpfile` MATCHed this
   time (load-sensitive as recorded). Final CI + probes re-running with the
   fix (`*final2-sep11`).
@@ -196,7 +196,7 @@ from sibling branches.
 
 ## Closing state — 2026-09-11
 
-`just ci` green on main at 2fa79aba3 (`target/perf/ci-final3-sep11.log`);
+`just ci` green on main at 9e11fb06c (`target/perf/ci-final3-sep11.log`);
 signed probe gate shows only the four reds recorded before the campaign
 (`probes-final2-sep11.log`). Every task in the mapping table landed. The
 carry-forward items above are the honest remainder; none is a regression
@@ -209,12 +209,12 @@ Order: (1) the five open probe reds, (2) route every subsystem through its
 view + dedupe the FsView signal helpers, (3) retire the typed_error_debt
 rows, (4) resume the perf2x campaign.
 
-- (1) LANDED: `seekholemap` (748724945: F_PUNCHHOLE via libc on beyond-EOF
+- (1) LANDED: `seekholemap` (fafaadade: F_PUNCHHOLE via libc on beyond-EOF
   writes, block size from fstat, SparseBuffer seek), `statfslifetime`
-  (161ead9a2: typed `FsIdentity` per description, unlinked /proc/self/fd
-  reopen), `packetv3state` (1c3751ff2: in-zone AF_PACKET with a TPACKET
+  (a61f9e610: typed `FsIdentity` per description, unlinked /proc/self/fd
+  reopen), `packetv3state` (074f862e1: in-zone AF_PACKET with a TPACKET
   ring; `linux_to_host_af` now refuses unknown families instead of passing
-  them through), `tty0state` (c8650ee77: kernel-owned `VirtualConsole`,
+  them through), `tty0state` (a748a08ed: kernel-owned `VirtualConsole`,
   per-tty termios shared across opens, no host fd). `just ci` green
   (ci-phase2a-sep11). `coredumpfile` in review round 2: root cause found
   (premature begin_process_exit + a 10 s quorum deadline); round-1 branch
@@ -223,7 +223,7 @@ rows, (4) resume the perf2x campaign.
 - (2) dispatched (`views-routing`).
 - rerere is now disabled for this clone (`git config rerere.enabled false`)
   after it replayed a wrong inventory resolution onto a later rebase.
-- (1) `coredumpfile` LANDED (22f6ddbf1): `try_claim_persistent_process_exit`
+- (1) `coredumpfile` LANDED (0ad6a880c): `try_claim_persistent_process_exit`
   no longer flips `process_exiting` before capture; `CrashQuorum` snapshots
   the census at open, collects parked registers from blocked/withdrawing
   siblings, treats a dropped participation as departure, and has no
@@ -234,21 +234,21 @@ rows, (4) resume the perf2x campaign.
 - Gate after item 1: `fdsemantics` regressed (the statfslifetime reopen
   copied the inode instead of sharing it, so an O_TRUNC through
   /proc/self/fd/N was invisible to the original fd); fixed forward in
-  8caf30c2c (shared `FileContents` authority, size read from the bytes).
+  2bf89119c (shared `FileContents` authority, size read from the bytes).
   Next full gate: every prior red MATCH; one new load-only red,
   `setidthreadchurn` (gnu lane, guest SIGSEGV, 0 observations; passes
   alone 2/2) — root-cause worker dispatched with a load reproduction and
   a bisect across the day's thread-lifecycle landings.
-- (2) round 1 LANDED (9b3055d11): FsView signal helpers are shared free
+- (2) round 1 LANDED (66ecf838c): FsView signal helpers are shared free
   functions; net and signal route through NetView/SignalView. Round 2
   (proc, ipc, mem) in flight.
-- `setidthreadchurn` LANDED (66fe4d7af): an exiting thread is retired from
+- `setidthreadchurn` LANDED (a350e0a98): an exiting thread is retired from
   the task graph (peer tgkill → ESRCH) BEFORE its child-tid futex wake and
   runtime withdrawal; glibc's setxid signal could previously land on a
   stack the guest had already reclaimed (SignalDeliveryFault → SIGSEGV).
   3/3 alone, 10/10 under load per the worker; deterministic integration
   test pins the order.
-- (2) COMPLETE (ad248a618): proc, ipc and mem route through ProcView /
+- (2) COMPLETE (447ac1534): proc, ipc and mem route through ProcView /
   IpcView / MemView. Landing note: the abort ledger and the dispatch-lock
   and K1 inventories key rows by qualified function name, so a handler
   moving from `SyscallDispatcher::x` to `MemView<'a>::x` needs its rows
@@ -256,7 +256,7 @@ rows, (4) resume the perf2x campaign.
   allows are still 101 — the workers routed handlers but did not use the
   views to delete the allows; that is a bounded follow-up.
 - (3) dispatched (`typed-error-debt`).
-- (3) LANDED (57de08799): 22 of the 27 `typed_error_debt` rows converted
+- (3) LANDED (18f84c398): 22 of the 27 `typed_error_debt` rows converted
   to their named typed errors (KernelOperationError, RuntimeError,
   LinuxErrno, ArenaError, ThreadExecutionError; the wait reactor
   constructor is fallible and the scheduler propagates it); 5 rows remain
@@ -271,13 +271,13 @@ rows, (4) resume the perf2x campaign.
   telemetry (probe defect, being fixed) and `ppollwaitset` exposes a real
   runtime bug — poll on an unconnected stream socket must be POLLHUP
   immediately (worker dispatched).
-- Legacy lane LANDED (eddeef6b7): denominator 531 with the four new sources
+- Legacy lane LANDED (d2bf5c1f3): denominator 531 with the four new sources
   classified; `tlbibroadcast`/`windowcoherence` no longer print
   non-deterministic telemetry and MATCH on both arm64 lanes with freshly
   blessed oracles; `ppollwaitset` is bounded (5 s caps, 4 s writer) and
   blessed, and stays red until the POLLHUP runtime fix lands (worker
   running). No known-gap excuse was added anywhere.
-- ppollwaitset LANDED (f2e69c86c + 85d8f3240, reconciled f9a240698): the
+- ppollwaitset LANDED (7ba465f8c + 35ec07317, reconciled 9ab5a42b6): the
   runtime now reports POLLHUP immediately on an unconnected stream socket
   (`connected` on the open description; readiness and the wait authority
   consult it). Probe-design finding: the probe put that unconnected socket
@@ -298,17 +298,17 @@ rows, (4) resume the perf2x campaign.
   root-owned 12 GiB `asid-wedge` core cited by the 2026-08-22 audit.
 - Item 4 started: paired interleaved scorecard armed
   (`target/conformance/eco-load/paired-sep11.sh`, summary
-  `paired-summary.py`): base = pinned 62c63d979 binary afccec0cc339993c,
+  `paired-summary.py`): base = pinned 2fb09a429 binary afccec0cc339993c,
   cand = pinned current main, w4 x3 reps with alternating order, then w1,
   quiet-gated before every phase. Workers are dispatched only after it
   finishes (their builds would contaminate it).
-- Gate receipt on main 541a575ff (binary sha256 3c8dbee5b686c49d, CDHash sha256=cced55bc2,
+- Gate receipt on main b0d361cc3 (binary sha256 3c8dbee5b686c49d, CDHash sha256=cced55bc2,
   hypervisor entitlement present, `__dof_carrick` present): `just ci`
   EXIT 0 (target/perf/ci-ppoll-sep11.log, after clearing target/debug so
   every crate rebuilt from scratch) and `just conformance-probes` EXIT 0
   (target/perf/probes-ppoll-sep11.log; every generic shard and the legacy
   CLI step green, no gating DIFF). Pushed to origin/main
-  (01f812101..541a575ff). Residual: the report-only amd64:musl lane still
+  (0729dae32..b0d361cc3). Residual: the report-only amd64:musl lane still
   shows a stale ppollwaitset oracle carrying the old probe's panic text
   (non-gating, no native amd64 bless host here; root@carrick-x86 and
   willow VM 210 are candidates for a native amd64 oracle later).
@@ -439,7 +439,7 @@ commits and is re-checked at the next vet.
   Continuation split: the worker produced no commit in three turns; the
   director committed its compiled `quantum` submodule (12.1K → 10.5K) and
   started a fresh conversation on the same worktree.
-- Per-mm Task 3 LANDED (393340069): mmap alias install and the COW/
+- Per-mm Task 3 LANDED (ee2be6332): mmap alias install and the COW/
   materialize paths publish frames under `FrameRegistryGuard` (a leaf)
   instead of the carrier topology mutex; fork, exec and exit also take the
   leaf around their frame-inventory reservation/retirement steps so the
@@ -470,7 +470,7 @@ commits and is re-checked at the next vet.
   foreign_mm.rs the Task 3 `drop(registry)` beside tma's new
   `CowInventoryLifecycleScope` binding. Long-lived worker branches over a
   fast-moving main pay this at landing; land smaller batches sooner.
-- tma LANDED (4308621ca): 101 → 32 `too_many_arguments` allows over 17
+- tma LANDED (bf56e6dc8): 101 → 32 `too_many_arguments` allows over 17
   commits (CLI/embed/conformance, file_authority, dispatch/execution,
   observability probes, runtime.rs, vcpu_loop signal/mod/binding, trap,
   vfs/inotify). Remaining 32 are a bounded follow-up on fresh main.
@@ -481,7 +481,7 @@ commits and is re-checked at the next vet.
 - Landed and pushed (early 2026-09-12): split-continuation quantum
   submodule (12,097 → 10,549; the global-state ledger keys statics by
   file, so `NEXT_RUNNER_JOB_ID` was re-homed by hand) and
-  syscall-names-mem (decc8aca0: every routing arm now names its
+  syscall-names-mem (5a2bba35f: every routing arm now names its
   `nr::` constant; the literal-arm macro variant and its
   `#[allow(unreachable_code)]` are gone; a routing characterization
   fixture pins the handler set). Running: `mm-transactions` (per-mm Task
@@ -490,19 +490,19 @@ commits and is re-checked at the next vet.
   `too_many_arguments` allows, and the quiet-host measurements (Task 0
   traces, the two-process red numbers, paired A/B of the three landed perf
   clusters against 3c8dbee5b686c49d).
-- 2026-09-12 morning: per-mm Task 4 LANDED (5149bba88): fork, exec, exit
+- 2026-09-12 morning: per-mm Task 4 LANDED (29d345f32): fork, exec, exit
   and unmap hold their mm's `MmTransactionGuard` (minted from the stage-1
   authority) plus the registry leaf; the executor-lane retirement backoff
   helper is deleted; `acquire_topology_lock` has no production caller.
   Landing needed the abort-ledger re-bless (fatal statements re-tokened by
   the guard) and dropping the retired host-authority rows of the deleted
-  helper by hand. split-continuation-r3 LANDED (28d625f3f): continuation.rs
+  helper by hand. split-continuation-r3 LANDED (b762073bf): continuation.rs
   12,097 → 2,176 with quantum/tests/wait_service/readiness submodules —
   every file the vet listed above 10K lines is now under 3K.
 - Probe-gate stall (7h47m): on a cache miss the legacy harness ran the
   amd64:musl lane's probe live under a Rosetta container (the stale
   ppollwaitset amd64 oracle had been deleted on 09-11), which never
-  returned. Fixed forward (13aad0ba8): a live Docker oracle is attempted
+  returned. Fixed forward (52afe1b16): a live Docker oracle is attempted
   only for the host's own ISA; a foreign-platform miss is Unblessed
   (report-only NOTE) and must be blessed on a native amd64 host
   (root@carrick-x86 / willow VM 210). The `--platform linux/amd64` path in
@@ -516,7 +516,7 @@ commits and is re-checked at the next vet.
   while the main thread mprotects/munmaps, i.e. exactly the per-mm pause
   path Task 4 touched.
 - REGRESSION found by the sep12 measurement block: on every binary from
-  the Task 4 landing (5149bba88) onward, `python3 -m test
+  the Task 4 landing (29d345f32) onward, `python3 -m test
   test_multiprocessing_main_handling` on the `--fs host` cpython image
   wedges at interpreter startup — the per-task syscall-flow trace shows
   pid 1 parked in `openat` (nr 56, AT_FDCWD, O_CLOEXEC) after 2,557 completed
@@ -525,17 +525,17 @@ commits and is re-checked at the next vet.
   Core: `target/perf/perf2x-sep12/mp-wedge-14703.core` (+ `mp-wedge-bt.txt`,
   `mp-wedge-ring.txt`, `mp-wedge-flow.out`). Trivial guests (`python3 -c`,
   `/bin/sh -c echo`) and every probe lane pass on the same binary; the
-  pre-cluster control binary (3c8dbee5b686c49d, 541a575ff) runs the row in
-  7 s. Bisect in progress between 541a575ff and 5149bba88 with signed
-  builds, filesystem landings (hostfs-amplification fe9ceb4d6, fs_backend
-  split 32d32d44a) first. The sep12 measurement block is void until this is
+  pre-cluster control binary (3c8dbee5b686c49d, b0d361cc3) runs the row in
+  7 s. Bisect in progress between b0d361cc3 and 29d345f32 with signed
+  builds, filesystem landings (hostfs-amplification 333942f29, fs_backend
+  split 989d0ce14) first. The sep12 measurement block is void until this is
   fixed; the stall watch's guest threshold is being lowered to 10 minutes.
 - Post-mortem of the openat wedge (owner: post-mortem first, bisect second):
   the core's `bt all` had ONE non-idle thread — `carrick-executor-4` in
   `RawMutex::lock_slow` under `commit_process_alias_retirement`, reached
   from `mmap` → `materialize_private_file_backing` →
   `materialize_sparse_mmap_extent_inner` (holding `FrameRegistryGuard`
-  since Task 3) → `publish_replacing`. Task 4's unmap step (6ede8db7d)
+  since Task 3) → `publish_replacing`. Task 4's unmap step (6cfdeb43c)
   made the commit take `frame_registry_lock()` again: a self-deadlock on
   the non-reentrant leaf, on every private file-backed `mmap` that
   replaces live rows (Python loading `_bz2`). My first stack summary had
@@ -543,19 +543,19 @@ commits and is re-checked at the next vet.
   cost an hour of bisect builds that then converged on the same commit.
   Fix forward: the commit takes the caller's `&FrameRegistryGuard` as
   proof and never locks the leaf (the rule is now the signature); shape
-  test red on 5149bba88, green after; live receipt = the row completing on
+  test red on 29d345f32, green after; live receipt = the row completing on
   the rebuilt binary, then the full probe gate.
-- Wedge FIXED and landed (c1a967fc0): `commit_process_alias_retirement`
+- Wedge FIXED and landed (73b1b04ca): `commit_process_alias_retirement`
   takes the caller's `&FrameRegistryGuard`; live receipt — the
-  multiprocessing row that wedged on every binary since 6ede8db7d
+  multiprocessing row that wedged on every binary since 6cfdeb43c
   completes in 6.3 s on the rebuilt binary e40b856312ac253b; `just
   conformance-probes` EXIT 0 on main (target/perf/probes-fix-sep12.log);
-  denominator test fixed (8dfc069b7, 532 sources). The sep12 measurement
+  denominator test fixed (48ad746c4, 532 sources). The sep12 measurement
   block is rerunning on that binary; Task 6 and the allows round dispatch
   after it. Leaf rule for Tasks 5–6, now in the plan memory: a callee
   never locks the frame-registry leaf; it receives the guard.
 - Second Task 4 defect, found by the sep12 scorecard rerun and fixed
-  forward (3e69641b5): `go-net_http` hung [blocked] at four workers (twice)
+  forward (af79f1324): `go-net_http` hung [blocked] at four workers (twice)
   and, standalone, died with `acquire exact-MM terminal authority failed:
   UnkickableExecutor` → `CarrierFailed` at test 754/1,388 — the exit path
   had been made to elect a stage-1 pause over sibling executors that
@@ -567,13 +567,13 @@ commits and is re-checked at the next vet.
   binary dies at 754. Receipts on the rebuilt binary 4843f86387c98083:
   go-net_http PASS ×3 (1,388 each), multiprocessing SUCCESS 6.4 s,
   `just conformance-probes` EXIT 0 (target/perf/probes-exitfix-sep12.log).
-  Embed tests restructured around one carrier (cf5c08042). Measurement
+  Embed tests restructured around one carrier (c4e0e454e). Measurement
   block re-armed on this binary; Task 6 and the allows round follow it.
 - PERF REGRESSION found by the rerun scorecard: cpython-compile 17.5 s →
   175.9 s at four workers and 14.3 s → 175.6 s standalone (173 s user
   CPU) on the fixed binary. Carrier CPU ranking on the row: 95.5% under
   `TaskMappingIndex::remove_rows_matching_in_ranges`, 90.8% as its own
-  leaf — the alias-retain-index landing (e91947203) bounded candidate
+  leaf — the alias-retain-index landing (530e9bf4e) bounded candidate
   discovery by the WIDEST live row (`max_ipa_span`/`max_physical_span`),
   so one large row makes every munmap walk the whole index with a
   BTreeSet insert per key: worse than the linear `retain` it replaced,
@@ -583,10 +583,10 @@ commits and is re-checked at the next vet.
   The other four rows improved in the same rep (tarfile 0.74x, importlib
   0.89x, multiprocessing 0.94x, net_http 0.94x paired).
 - Attribution confirmed by pinned binaries (standalone compile row):
-  541a575ff 14.3 s; 5f4b957fd (alias-newest + alias-retain landed) 182.8 s;
-  fe9ceb4d6 174.0 s; 5149bba88 wedges (the openat deadlock). The 12x is
+  b0d361cc3 14.3 s; d3ca5d196 (alias-newest + alias-retain landed) 182.8 s;
+  333942f29 174.0 s; 29d345f32 wedges (the openat deadlock). The 12x is
   the alias-retain-index landing's widest-row window.
-- Compile regression FIXED and landed (874056e25): `TaskMappingIndex`
+- Compile regression FIXED and landed (370668357): `TaskMappingIndex`
   discovery is partitioned by width class (`TaskMappingClassIndex`,
   mirroring `AliasClassIndex`); red-first huge-row test (32 GiB row +
   4,096 small rows: thousands of visits before, 1 after), 2,000-case
@@ -599,7 +599,7 @@ commits and is re-checked at the next vet.
   11:33"): 40/40 MATCH; every targeted row faster paired — compile 0.58,
   tarfile 0.68, importlib 0.82, multiprocessing 0.90, net_http 0.90;
   importlib ≤2x at one worker. Task 6 and the allows round dispatching.
-- 2026-09-12 12:35: per-mm Task 6 landed and pushed (4242d0229) — fork
+- 2026-09-12 12:35: per-mm Task 6 landed and pushed (84e574212) — fork
   quiesce is per parent mm, fork kicks only sibling threads; receipts in
   the per-mm plan's Measurement section (mp 6.94 s, net_http 8/8 PASS,
   fault-latency embed test 154 s→37 s). Probe gate running on the pinned
@@ -610,7 +610,7 @@ commits and is re-checked at the next vet.
   `child_comm_visible=false` — PROBE race (parent scanned /proc before the
   forked child ran `prctl(PR_SET_NAME)`); 8/8 green standalone on both the
   new and pre-Task-6 binaries; fixed with a pipe rendezvous + bounded poll
-  (528cc75c0), gnu probe rebuilt, both gate modes report
+  (7cb0e463d), gnu probe rebuilt, both gate modes report
   `child_renamed=true`. (b) `arm64:musl:execfromthread` kernel abort
   `lost exact transition: thread#2:<old serial> Runnable N -> N+1 rejected
   while the kernel graph still calls it reachable; registry view: thread
@@ -633,7 +633,7 @@ commits and is re-checked at the next vet.
   siblings; carrick's drain does not wait for the kernel-graph settlement.
   Evidence tooling added so the next reproduction yields a core:
   `carrick debug lldb-run --fatal-hold-seconds` + `CARRICK_FATAL_HOLD_SECS`
-  (d6db89efc). 96 further lldb-run stress runs reproduced only the 125
+  (de91c9986). 96 further lldb-run stress runs reproduced only the 125
   shape (4×, post-mortem JSON, `target/perf/perf2x-sep12/eftcore{3,4}`).
   Fix dispatched as a red-first worker task (brief `exec-sibling-settle`).
 - 2026-09-12 13:53, probe gate on c8e82d013caba451: the in-process shard
@@ -661,7 +661,7 @@ commits and is re-checked at the next vet.
     poll — that is a second defect on top of the lost publication.
   Reaped by hand after capture; the gate resumed. OPEN, not yet
   attributed to a change (first occurrence in ~10 gates today).
-- 2026-09-12 14:40, forkexecstorm wedge ATTRIBUTED and FIXED (c40654c00):
+- 2026-09-12 14:40, forkexecstorm wedge ATTRIBUTED and FIXED (ea94a32c0):
   `carrick debug lldb-run` on the current main wedged 2/3 (fatal-hold
   capture `target/perf/perf2x-sep12/fes/fes-new-2`: vfork child pid 120
   `Blocked(HostWait)` at generation 2 after a `quiesced` boundary, never
@@ -678,7 +678,7 @@ commits and is re-checked at the next vet.
   forkexecstorm ×6 under lldb-run, 0 wedges; the 2 failures are the
   pre-existing `hvpatch::mm_authority` fatal (registration-cleanup dropping
   an Active inventory), the class `exec-sibling-settle` addresses.
-- 2026-09-12 14:45, per-mm Task 5 LANDED (ac96a1959) after a round-2
+- 2026-09-12 14:45, per-mm Task 5 LANDED (051e70365) after a round-2
   review: per-scope `AliasScopeBucket` now the single owner of rows, replay
   set and version chains (carrier-global `replay_mappings()` and
   `alias_version_registry()` deleted; the 3-lock order collapsed to the one
@@ -741,7 +741,7 @@ commits and is re-checked at the next vet.
   mm census, and one is parked in the page-table quiesce. Lock shapes
   (alias→owners in `mapping_for_range_in`; inventory→frames→owners→
   allocator in detached retirement) predate Task 5 (same code at
-  `ac96a1959^`); the candidate raised how often the retirement path runs.
+  `051e70365^`); the candidate raised how often the retirement path runs.
   Bisect (`nhbisect/`): pre-Task-5 binary 4/4 pass, current main 1 of 4
   so far. Two fixes are on the table: (1) `exec-sibling-settle` round 2
   makes losers retire exactly instead of through the detached path;
@@ -764,7 +764,7 @@ commits and is re-checked at the next vet.
   the `ProcessTerminalLoser` arm must leave its kernel thread terminal.
   The worktree `agy-exec-sibling-settle-sep12` is kept as evidence
   (tests + the two arms' shape); nothing from it lands as is.
-- 2026-09-12 16:45, exec-teardown class FIXED by the director (f509fd91f):
+- 2026-09-12 16:45, exec-teardown class FIXED by the director (0858c5063):
   root cause was not ordering but membership — `finish_persistent_process_handles`
   drained the surviving job's own handle and nothing re-enrolled it, so a
   process that had exec'd once had no leader in its next drain. Live
@@ -783,7 +783,7 @@ commits and is re-checked at the next vet.
   to post-mortem next. The worker branch `agy-exec-sibling-settle-sep12`
   is superseded (its loser-arm tests remain a reference for the Busy
   arms); worktree to be removed.
-- 2026-09-12 17:00, alias lock-order deadlock FIXED (e4e632c07): the
+- 2026-09-12 17:00, alias lock-order deadlock FIXED (c02077612): the
   alias registry is now a leaf for lookups — the five queries that
   authenticated frame owners inside their match closure
   (`mapping_for_range_in` IPA and VA arms, both
@@ -845,9 +845,9 @@ commits and is re-checked at the next vet.
   (`open_trusted_dir_fd`, 9.8%). Round 2 brief sent (mode fidelity first,
   red against the oracle table; per-directory interference; mkdir and
   open bounds). Also fixed on main: `just doc` red from three intra-doc
-  links broken by the splits (b9f4feeeb) — `just ci` is green-capable
+  links broken by the splits (3ce7a991c) — `just ci` is green-capable
   again.
-- 2026-09-12 18:45, `just ci` GREEN on main 53054ebc9 (fmt, clippy,
+- 2026-09-12 18:45, `just ci` GREEN on main 74f89a4a9 (fmt, clippy,
   lint-domains, deny, check-matrix, check, doc, test, test-integration) —
   first full local gate pass since the doc links broke in the splits.
 - 2026-09-12 20:10, `hostfs-opens` round 2 reviewed and accepted (fchmodat
@@ -871,11 +871,11 @@ commits and is re-checked at the next vet.
   total_spawned=0`), the probe's supervisor SIGKILLed the group, and the
   teardown abort was the masking symptom. Two defects, both on main:
   - `fes2/ref`: the fork LOSER spun forever in `prepare_in_process_fork`
-    (executor 9 in `subscribe_quiesce`) because c40654c00's "Ready when
+    (executor 9 in `subscribe_quiesce`) because ea94a32c0's "Ready when
     the flag is low" made the loser's `Ready => continue` loop never park
     while the winner held the fork token with the flag still low — a
     regression introduced by this morning's vfork-child fix. Fixed
-    3dbd77c72: `QuiesceBarrier::subscribe_fork_release` (predicate = the
+    47e095864: `QuiesceBarrier::subscribe_fork_release` (predicate = the
     fork TOKEN, which `end_fork` publishes); red-first
     `fork_loser_subscription_parks_until_end_fork_even_while_not_quiescing`
     + source-shape test. 47/48 eight-way after it.
@@ -883,7 +883,7 @@ commits and is re-checked at the next vet.
     WINNER had parked on the kernel RESERVATION epoch after
     `try_close_for_fork` yielded to an in-flight thread-clone permit; a
     clone that backs off (task busy / publication busy) publishes only the
-    clone-ADMISSION epoch. Fixed 36ae60e53: `ForkCloseAttempt::
+    clone-ADMISSION epoch. Fixed 84a7390e6: `ForkCloseAttempt::
     PermitsInFlight { observed_epoch }` read under the gate lock and
     `clone_admission.subscribe_change`; red-first
     `fork_close_behind_a_thread_clone_permit_wakes_on_that_permits_release`
@@ -892,7 +892,7 @@ commits and is re-checked at the next vet.
   Lesson recorded in memory: a fix that changes a shared primitive's
   predicate must audit every caller's loop; a lost-wakeup fix is proven
   only by a capture with all executors idle.
-- 2026-09-12 21:20, probe gate on main c54325cc70b4a47f (36ae60e53, both
+- 2026-09-12 21:20, probe gate on main c54325cc70b4a47f (84a7390e6, both
   fork-barrier fixes): 46/46, no DIFF. `hostfs-opens` lands on top next.
 - 2026-09-13 00:45, `vcpu-lazy-state-sep12` (net_http executor-boundary
   register traffic, ~30% of carrier CPU) rounds 1–2 reviewed against live
@@ -909,7 +909,7 @@ commits and is re-checked at the next vet.
   registration + single-CPU nudge, checked as the park predicate; no idle
   flush; no broadcast. Two wedged interactive `lldb --batch` sessions killed
   to unwedge the worker; the brief now mandates `carrick debug lldb-run`.
-- 2026-09-13 01:40, `vcpu-lazy-state` LANDED (598c987be..aeec3e384, three
+- 2026-09-13 01:40, `vcpu-lazy-state` LANDED (888c08a8f..8a2160421, three
   worker rounds): residency-keyed lazy vCPU register save/restore — a
   parked thread's registers stay on the executor's vCPU until that vCPU
   loads a different thread; the thread's own token (executor, residency
@@ -927,7 +927,7 @@ commits and is re-checked at the next vet.
     ("owner record is missing" on `compose down`): container teardown's
     `quiesce` released the control endpoint's owner record before
     `complete` persisted the terminal receipt, so the state read Running
-    with no owner. Fixed 614b2de8a: the record carries a typed
+    with no owner. Fixed 9051642af: the record carries a typed
     `OwnerPhase` (`Serving`/`TearingDown`), `quiesce` marks it instead of
     releasing, the client answers `ControlOutcome::TearingDown`, and the
     stop path waits for the receipt (red-first assertion in
@@ -937,7 +937,7 @@ commits and is re-checked at the next vet.
     hostfs-opens round-2 binaries (2/15 vs 0/12 on the pins before): the
     cached trusted dirfd was handed out as `dup`s sharing one seek offset
     and the enumerator `rewinddir`ed it, so concurrent listings of one
-    directory each saw a subset. Fixed 6906c19cc: the enumerator opens
+    directory each saw a subset. Fixed f1d0e56bd: the enumerator opens
     its own description (`openat(fd, ".")`), and an unclassifiable
     `DT_UNKNOWN` entry falls back to the layered listing instead of being
     dropped (red-first `trusted_dirent_stream_owns_its_seek_offset`).
@@ -955,7 +955,7 @@ commits and is re-checked at the next vet.
   + `kevent` 2.2% under the carrier wait service's reactor, which rebuilds a
   `pollfd` set of every pollable registration per cycle. Brief
   `reactor-kqueue.md` dispatched (worker `reactor-kqueue-sep13`, worktree
-  `agy-reactor-kqueue-sep13` from 6debb1639): one persistent kqueue per wait
+  `agy-reactor-kqueue-sep13` from 75303e573): one persistent kqueue per wait
   service, EV_ADD/EV_DELETE on the registration lifecycle, O(ready) cycles,
   guest epoll semantics untouched (kqueue = wake source only).
 - 2026-09-13 03:30, `reactor-kqueue-sep13` round 1 (904b48da2) REJECTED on
@@ -1008,7 +1008,7 @@ commits and is re-checked at the next vet.
   kqueue) with the line-exact epoll probes as judges before any reactor
   change is retried.
 - 2026-09-13 07:05, brief `epollet-evclear.md` dispatched (worker
-  `epollet-evclear-sep13`, worktree from d18d6dc67): the parked reactor's
+  `epollet-evclear-sep13`, worktree from 78fa3a8d3): the parked reactor's
   durable finding on its own — EPOLLET read interests register EV_CLEAR on
   the instance kqueue; red-first "instance fd not readable after a
   delivered edge with unread data"; epoll/ppoll line-exact probes judge;
@@ -1025,26 +1025,26 @@ commits and is re-checked at the next vet.
   InZone`) and Task 3 `inzone-semantics-sep13` (in-memory INET stream
   semantics). Task 2 (dispatcher wiring) follows Task 1; Task 4 the
   `inzonetcp` line-exact probe.
-- 2026-09-13 07:55, Task 1 LANDED (5f0a426ab..60fe4bd8b): `network/inzone.rs`
+- 2026-09-13 07:55, Task 1 LANDED (4ba19f604..d8fe0aa8f): `network/inzone.rs`
   registry, `ConnectTarget::InZone`, `SocketKey::for_in_memory`; the
   dispatcher's two exhaustive matches carry inert `InZone` arms until Task 2
-  (762104fca). Task 2 `inzone-wiring-sep13` dispatched from 60fe4bd8b.
-- 2026-09-13 07:55, EPOLLET LANDED (5f576e038..fef5360f2): `Interest.mode`
+  (7afe07aac). Task 2 `inzone-wiring-sep13` dispatched from d8fe0aa8f.
+- 2026-09-13 07:55, EPOLLET LANDED (47fee4e7b..762f54e9f): `Interest.mode`
   in the HAL; the BSD multiplexer maps Edge to `EV_CLEAR` (no more
   `EV_DISPATCH` + delete/re-add); `epoll_effective_interest` keeps read
   armed under a latched EPOLLIN; a wait-sample rebinds the host only for a
   write edge, a terminal edge, or cleared backpressure. Red-first test
   `epoll_et_unread_data_does_not_spin_and_waits_for_next_edge` fails on
   the pre-fix main at "instance kqueue fd must not be readable after edge
-  has already been delivered". Director cleanup 002a62054: the
+  has already been delivered". Director cleanup 21bbf7fab: the
   `NOTE_LOWAT` plumbing that the edge made unreachable is deleted (K1 row
-  retired by hand, e0c79407c). Receipts: worker's 3x net_http 1316/1316,
+  retired by hand, d71b6294c). Receipts: worker's 3x net_http 1316/1316,
   46/46 probes; kernel-aware profile poll share 9.3% vs 9.1% baseline —
   the spin is gone but `poll` is NOT the spin, it is the wait-service
   reactor's legitimate wake traffic. The row-level receipt folds into the
   Task 5 paired measure. Two workers alive (semantics at `just test`,
   wiring reading lifecycle.rs/unix_pure.rs).
-- 2026-09-13 08:40, Task 3 LANDED (5a5c83c0a..61c252556): in-memory INET
+- 2026-09-13 08:40, Task 3 LANDED (e0fbc7477..d52f91dff): in-memory INET
   halves carry TCP semantics (EPOLLRDHUP on peer SHUT_WR without HUP,
   EPIPE+SIGPIPE on sendmsg, MSG_PEEK, TCP_NODELAY/KEEP*/SO_*BUF/LINGER/
   TCP_INFO(state byte only), SO_SNDBUF-bounded EPOLLOUT, FIONREAD/SIOCOUTQ).
@@ -1060,7 +1060,7 @@ commits and is re-checked at the next vet.
   reset); (b) no reset state on the in-memory stream (listener close with a
   queued connection must leave the client POLLIN|POLLERR|POLLHUP, recv
   ECONNRESET, write EPIPE — probe case 7).
-- 2026-09-13 09:50, Task 2 LANDED (5f1e12d54..3be633a98) and judged on the
+- 2026-09-13 09:50, Task 2 LANDED (a5ea2a60b..2fd411bdb) and judged on the
   probe worktree rebased onto it (branch `agy/inzone-probe-sep13`): the
   blessed `inzonetcp` probe found two runtime gaps and go-net_http a
   third, all fixed by the director on that branch:
@@ -1120,7 +1120,7 @@ commits and is re-checked at the next vet.
   inzonetcp, socketpartialsend, streamdestmatrix MATCH; go-net_http x2
   1316/1316. Running `just conformance-probes` + `just test` for the
   landing.
-- 2026-09-13 12:05, in-zone loopback TCP LANDED in full (main 1323fe921,
+- 2026-09-13 12:05, in-zone loopback TCP LANDED in full (main 8df1aa352,
   pushed): probe `inzonetcp` + blessed oracle, the worker's OOB/EPOLLPRI
   and splice fixes, and the director's seven (poll fast path, reset read
   once, ABBA pair lock, blocking wait on the socket's queue, lost-wakeup

@@ -18,7 +18,7 @@ native `uname`, executable hash and exact stdout. This probe checks ordinary
 placement and fixed-address refusals; the VM-free dispatcher test forces the
 crowded lower-half search without allocating huge host memory.
 
-The VM-free red was captured against `904fd644b` before changing placement:
+The VM-free red was captured against `8b4778f5d` before changing placement:
 `x86_mmap_crowded_lower_half_refuses_noncanonical_gap` returned
 `0x800000200000` (140737490452480, above `2^47`) instead of `-12`.
 It reserves the occupied range as metadata and performs no huge host allocation.

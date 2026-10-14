@@ -8,13 +8,13 @@ physical owner remains live and has no committed residency. The contender
 must retain completion authority, not decline exact supply or allocate a
 second frame.
 
-The witness fails on the integrated tree and on exact `77b7d5e71`, with the
+The witness fails on the integrated tree and on exact `083a815f7`, with the
 same assertion: `a live unpublished predecessor must own a completion wait,
 not decline exact supply`. Baseline source is the detached worktree
 `/private/tmp/n1g2-grant-base`; only the same appended test was applied.
 Two baseline executions fail identically. This establishes a pre-existing
 missing in-flight-publication state, not semantics introduced by either
-`42e4070a4` maintenance or `71bd58268` table resolution. The newer binary
+`c2b35faf5` maintenance or `71bd58268` table resolution. The newer binary
 exposes the gap more readily in this sample; scheduling attribution to one
 change is not established and is not a correctness fix.
 
@@ -88,12 +88,12 @@ pending the final exact-artifact gate.
 
 ## Fork worker integration
 
-Reviewed and cherry-picked worker commits `69639dddb`, `9500b5d50`,
-`27762ac24`, `44e3ca9f1`, and `df282f8bd`, preserving authorship. The final
+Reviewed and cherry-picked worker commits `686212503`, `4892c1ef6`,
+`96a400f51`, `2f8656241`, and `a0a38aafe`, preserving authorship. The final
 change relocates the fixed bootstrap primary into this MM's table pool;
 it restores the original stage-3 pool restriction. The temporary fixed-root
 admission is therefore absent from the final code. No driver stage-3 edits
-were made. The worker's intermediate fingerprint-only `b677e6379` is omitted
+were made. The worker's intermediate fingerprint-only `2e566d84b` is omitted
 in favor of reconciliation on the integrated clean tree.
 
 Re-verified the worker's bootstrap witness before its final fix: at
@@ -103,8 +103,8 @@ refusal-probe receipts follow separately.
 
 ## Batch-6 rebase
 
-At the director's next-boundary request, rebased onto main `b2e77e2ff`.
-Git dropped already-applied `16041ed47`, `8188bb93d`, and `3e73dd1d2`.
+At the director's next-boundary request, rebased onto main `65ac260fe`.
+Git dropped already-applied `3868d5448`, `621f31c36`, and `67b97a75f`.
 Kept main's deleted derived syscall inventory and scoped fixture v2 inputs;
 retained both the kernel connect/wake loom suite and terminal-clear models.
 Preserved both kernel dev dependencies. Generated K1 census conflicts were

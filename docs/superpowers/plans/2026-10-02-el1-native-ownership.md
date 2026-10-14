@@ -1,7 +1,7 @@
 # EL1 native ownership: cut over objects, deliver workloads
 
 Design proposal, 2026-10-02; no implementation or runtime acceptance.
-Inspected native-design HEAD `8bcd7fd974b6c7028a1c2bb578ac90618ed3aba6`.
+Inspected native-design HEAD `19574c6cd65b95724073b099a2a4766557d375b6`.
 Admission branch was read-only at
 `cd7d4b335d738d3e995bf15f770b23fe0a68e642`; its two dirty copyout
 fixture files are not accepted evidence. Re-inventory the clean integrated
@@ -457,7 +457,7 @@ Section 6's reject/rethink conditions:
   N0 contains no guest or creation workload and makes no exit-count promise;
   this remains a mandatory N2/N3 workload rejection gate.
 
-Host-only acceptance uses main's official xtask driver (main `b0d8743ee`),
+Host-only acceptance uses main's official xtask driver (main `0e2816aa5`),
 compiled into this worktree's target, with `--root` naming this frozen-admission
 worktree. Receipt location: `target/el1-gate/n0-host-receipt.json`; its HEAD,
 cleanliness and step results are authoritative. The director owns signed
@@ -583,7 +583,7 @@ owner cutover, or `just accept` implementation is claimed.
 
 Each N1–N4 behavioral milestone requires **`just accept` and `just el1-gate`**,
 including after hatch deletion and clean integration. Both exist on main
-since `38b7578e6`/`062f98959`/`b0d8743ee` (2026-10-02): `just accept` runs the
+since `91cf02896`/`da33d4be2`/`0e2816aa5` (2026-10-02): `just accept` runs the
 host phase and the Docker-free signed phase against the committed known-red
 list `scripts/conformance/el1-known-red.txt`; `just el1-gate` is the same tool
 with the full profile (retained probes, LTP subset, inotify09 comparison),

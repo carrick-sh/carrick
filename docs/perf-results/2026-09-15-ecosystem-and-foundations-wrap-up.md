@@ -3,20 +3,20 @@
 This is an integration checkpoint on local `main`, not completion of the ecosystem goal. No push
 was performed; pushing is the owner's decision.
 
-## Landed on main (from `7142d2438`)
+## Landed on main (from `e9d422558`)
 
 Group A, in-zone loopback TCP lifecycle (agy workers, director-verified, all serial MATCH):
-- `6b6d94b7d`, `8d18b250e`: IPv4-mapped IPv6 connects resolve to in-zone IPv4 listeners; a `[::1]`-bound
+- `419e02f8f`, `48c3bfc4f`: IPv4-mapped IPv6 connects resolve to in-zone IPv4 listeners; a `[::1]`-bound
   client connecting to a v4-mapped target gets ENETUNREACH (go-net 449/449).
-- `940668bc6`: POLLHUP after drain on a closed in-zone stream (oracle-backed HUP bit).
-- `ed1d29e66`: pselect6 samples in-zone descriptions before parking (asyncio TLS handshake abort).
-- `28445af8c`: poll/select waits register carrick-owned descriptions host-fd-less so the wait
+- `b6e719775`: POLLHUP after drain on a closed in-zone stream (oracle-backed HUP bit).
+- `38a7dce48`: pselect6 samples in-zone descriptions before parking (asyncio TLS handshake abort).
+- `58f41c02e`: poll/select waits register carrick-owned descriptions host-fd-less so the wait
   service's post-enrollment probe runs (go-net_http 1316/1316).
-- `54fde3e88`: in-zone listener waits carry logical interest (cpython-xmlrpc 84/84, wsgiref 36/36).
-- `eb0578e11`: a refused nonblocking connect leaves the socket re-connectable (asyncio 2554/2554).
-- `d8edf9f0d`, `de60a9a19`: pure INET rebind after AF_UNSPEC disconnect, IPV6_ADDRFORM oracle-backed,
+- `ace937325`: in-zone listener waits carry logical interest (cpython-xmlrpc 84/84, wsgiref 36/36).
+- `7760a910c`: a refused nonblocking connect leaves the socket re-connectable (asyncio 2554/2554).
+- `600834a42`, `8bf736726`: pure INET rebind after AF_UNSPEC disconnect, IPV6_ADDRFORM oracle-backed,
   typed `PureSocketPhase` (LTP connect02 MATCH).
-- `0745386ef`: oracle re-bless (438 regression-profile cpython rows + 193 refreshed go/node rows).
+- `3fe3a237f`: oracle re-bless (438 regression-profile cpython rows + 193 refreshed go/node rows).
 
 Group D, foundations (Claude subagents, Opus plan -> implement, director-verified):
 - D2 harness (`feat/sep15-harness-budget`): typed `CarrickDeadline` provenance, `TimeoutKind::Progressing`
@@ -33,13 +33,13 @@ Group D, foundations (Claude subagents, Opus plan -> implement, director-verifie
 
 ## Measured
 
-Post-Group-A ecosystem run on `fea46512a` (635 rows, 8 workers, cached oracle): 629 MATCH, 0 rows
+Post-Group-A ecosystem run on `f050b55fc` (635 rows, 8 workers, cached oracle): 629 MATCH, 0 rows
 regressed from MATCH. Remaining non-MATCH: go_types/go-net/go-net_http/cpython-tarfile are 2x-oracle
 budget kills under load (all MATCH serially; the harness now classifies these as BUDGET_KILL and confirms
 serially), cpython-socket 23 SCTP MSG_EOR assertions (open gap), cpython-ssl TestPreHandshakeClose x2
 (open, brief A5 written). 
 
-Final run on landed `main` c8d65b9b6 (signed binary sha256 b4d306248b78f238…, entitlement and
+Final run on landed `main` e3c9a696a (signed binary sha256 b4d306248b78f238…, entitlement and
 `__dof_carrick` verified; receipts `target/conformance/sep15-ecosystem-final/`): 635/635 rows,
 628 MATCH, 3 BUDGET_KILL `[progressing]` (go-net_http, cpython-multiprocessing_main_handling,
 cpython-tarfile; the 900 s serial-confirmation pool was exhausted before they were confirmed, so they

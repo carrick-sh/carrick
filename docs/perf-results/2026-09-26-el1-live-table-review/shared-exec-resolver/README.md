@@ -1,6 +1,6 @@
 # Shared exec preparation must preserve parent live authority
 
-On source `aa5d55dd66b41f7a421f9fbf76bef9cd8f201526`, full CI passed
+On source `67061004bb036315e285eb0c54e2e657461d5130`, full CI passed
 6,180 tests across 101 result groups, with zero failures and 12 existing ignores.
 Its transcript is retained here (SHA-256
 `a31bbabc0956db4fa428974e8a0d17b52e629089c7b89d9cf3fc18bf6c098c4f`).
@@ -32,7 +32,7 @@ setup failure (`shared-exec-red.log`).
 shared page-table authority, then installed a child resolver backed by an empty
 ledger. Installing that resolver mutates the shared authority. The correction
 leaves the parent's resolver in place during preparation; the independent
-successor gets its resolver in `execve_rebuild_inner`, as fixed in `aa5d55dd6`.
+successor gets its resolver in `execve_rebuild_inner`, as fixed in `67061004b`.
 The causal witness now passes (`shared-exec-green.log`). No lookup scan,
 weakened ownership check, retry, timeout change or serialization is introduced.
 

@@ -2,10 +2,10 @@
 
 The reported `el1_thread_lifecycle_fork_during_clone_storm` failure did not
 reproduce in **20 complete full `el1_` suite runs** on unchanged
-`51bfe67f40f879c46ae506612c37e76f4867d5c7`. All 320 fork children reported
+`bb24853c2af78e63e4adb9c8d8d32a667333fba3`. All 320 fork children reported
 one live thread; all 20 reports had `bad=0` and `ok=true`. This is a
 non-reproduction result, not closure of the historical failure. The original
-batch log `51bfe67f40f8-20261005-031719` was no longer present.
+batch log `bb24853c2af7-20261005-031719` was no longer present.
 
 Each invocation was `./scripts/test-signed.sh carrick-embed el1_ --nocapture`,
 after sourcing `/Volumes/carrick/dev/env.sh`. The exact-SHA fixture bundle
@@ -52,7 +52,7 @@ tooling revision, with unchanged guest fixture inputs and an exact-HEAD bundle.
 
 The director assigned these six failures to N1/n1g2. No runtime correction
 for them is part of this investigation. Assertions below are from run 1;
-source anchors refer to the original `51bfe67f4` snapshot.
+source anchors refer to the original `bb24853c2` snapshot.
 
 | Test | Failing assertion | Contract |
 | --- | --- | --- |
@@ -147,7 +147,7 @@ mutation: the requested mask is 1 and the executor is CPU 0. That passing
 observation does not attribute the historical failure.
 
 The modified signed witness uses tooling HEAD
-`805eada21aaf8325be1a87271978afb22a04ca34`, whose restored bundle contains
+`55be9569fe9b1791dd07d2e7bf2f3b7a6ca0c0bd`, whose restored bundle contains
 1,132 verified executables. Its bundle identity is
 `802f853a11d295c1caa1c2b22089ce021c7f014b72da137878495f4069830507`;
 the tarball SHA-256 is
@@ -155,7 +155,7 @@ the tarball SHA-256 is
 The host-test and scheduler edits remain uncommitted during signed runs so
 the exact-HEAD requirement is preserved; source patches accompany the logs.
 
-## Affinity red-first completion on 805eada21
+## Affinity red-first completion on 55be9569f
 
 The continuation rechecked all three pre-fix witnesses before restoring
 `affinity-fix.patch`:
@@ -203,7 +203,7 @@ The director confirmed that the six N1 failures listed above are outside
 this affinity PR. The authorized five-run criterion is: those same six
 assertions fail as on main, and every other selected test passes. The
 committed kernel, runtime, EL1 and `el1_sched.rs` sources are byte-identical
-between the retained `51bfe67f4` baseline and tooling HEAD `805eada21`.
+between the retained `bb24853c2` baseline and tooling HEAD `55be9569f`.
 
 Each of `affinity-final-full-01/` through `affinity-final-full-05/` contains
 the complete `run.log`, the tested `el1_sched` executable, `identity.txt`
@@ -211,7 +211,7 @@ and the dirty host-source `source.patch`. Every invocation was
 `./scripts/test-signed.sh carrick-embed el1_ --nocapture`, with run IDs
 `storm-affinity-final-full-01-20261005` through
 `storm-affinity-final-full-05-20261005`. All five verified the same 1,132
-executables from the exact `805eada21` bundle by fixture input identity.
+executables from the exact `55be9569f` bundle by fixture input identity.
 
 Every run completed with **77 selected tests passing and exactly six
 failing**. All 25 handoff samples (the controlled launch plus four original

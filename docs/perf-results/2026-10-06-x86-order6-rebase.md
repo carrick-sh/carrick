@@ -2,7 +2,7 @@
 
 This packet supersedes the pre-rebase worker verdict in
 `2026-10-06-x86-order6-lifecycle-mapping.md` and its verification JSON.
-Comparison base: `7b6d15813d328899c63a01bd1e506cc482425735`.
+Comparison base: `9be9fa3ebc42734d360baf8ae4d4efeebb5af7e3`.
 Original PR #71 head: `3fd7862be859e106cdfa27ec183fea9cf66ccf63`.
 Host: `x86-w1`, Linux x86_64, real `/dev/kvm`; no Docker or HVF lane.
 
@@ -42,7 +42,7 @@ exited 101 with one failed test, rather than a compiler error. No red was droppe
 
 | Original red | Disposition and reason | Re-proved failure |
 | --- | --- | --- |
-| Shared lifecycle owner fence | Kept. The built source fence reads the actual `7b6d15813` dispatch source temporarily; reviewed order 5 still has the semantic lifecycle hook that order 6 must remove. | `order 6 must remove lifecycle from PendingFamilies` |
+| Shared lifecycle owner fence | Kept. The built source fence reads the actual `9be9fa3eb` dispatch source temporarily; reviewed order 5 still has the semantic lifecycle hook that order 6 must remove. | `order 6 must remove lifecycle from PendingFamilies` |
 | ExitingPublished rollback to Born | Kept. The neutral core interleaving and 13-acquisition budget are unchanged. | `Some((1, Born))` instead of `Some((1, Published))` |
 | Nonzero child-tid clear | Ported. X5's native retirement fixture now carries the core receipt and supplies Linux result-installation hooks; the clear-before-wake assertion is unchanged. | 1 instead of 0 at `clear before wake` |
 | Unavailable native stack/TLS accepted | Kept. Force the shared production `child_context_supported` leaf to accept; the same Linux dispatch refusal must still precede output/pool changes. | Served instead of Forward |
@@ -54,11 +54,11 @@ The fence binary is built green first, then executes while reading the reviewed
 base file; this avoids treating a baseline compile incompatibility as a red.
 The two hardware mutations each compile successfully before their KVM red.
 
-## ARM production census against 7b6d15813
+## ARM production census against 9be9fa3eb
 
 The unchanged standalone `order6-census` parser counts physical Rust source
 lines excluding test item/module spans, test-only fields/initializers and
-in-function test blocks. The base is a `git archive 7b6d15813` extraction of
+in-function test blocks. The base is a `git archive 9be9fa3eb` extraction of
 these three `src/` directories. Commands:
 
 ```sh
@@ -75,7 +75,7 @@ cargo run --locked --offline --manifest-path docs/perf-results/order6-census/Car
 
 All source lines including tests decrease from 58,829 to 56,634 (2,195).
 The revised production delta is measured against the requested reviewed base;
-it does not reuse the historical 1,813-line delta against `0f476ce7a`.
+it does not reuse the historical 1,813-line delta against `d3a359245`.
 
 ## Verification and limits
 
@@ -111,8 +111,8 @@ Later CI stages were not executed by that stopped recipe.
 **Correction: the baseline source-boundary attribution was invalid.**
 The archived baseline was scanned with order 6's newer auditor, rather than
 its own CI auditor. Identical policy blobs therefore did not prove identical
-baseline gate results. The director's exact CI scanner passes at `926ccbd46`
-and fails with nine `PendingSignals` findings at `6bb08a88d`.
+baseline gate results. The director's exact CI scanner passes at `6965c0200`
+and fails with nine `PendingSignals` findings at `7cca16366`.
 Order 6 added the forbidden-symbol check; locked all-feature metadata shows
 no shipped signal-core edge from core or core-ABI. Regardless of the trigger,
 Linux pending policy belongs in the personality, and the new correction moves

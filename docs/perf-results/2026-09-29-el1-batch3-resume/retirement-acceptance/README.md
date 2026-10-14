@@ -1,7 +1,7 @@
 # Corrected terminal retirement candidate acceptance
 
-Source: b5a751775cc9501ffec33c7a724053f8a33777a6, containing the red-first
-population correction d914c57ce. Full `RUSTC_WRAPPER= just ci` passed, then
+Source: 64573c8f6e3fe6bc24b825ab9d5c4ac6f7589ebe, containing the red-first
+population correction 60de5f333. Full `RUSTC_WRAPPER= just ci` passed, then
 `just build` built and signed the new CLI. Reconciliation retained all 595
 macOS authority rows, with no position changes. Other host profiles remain
 unqualified and x86 is deferred.

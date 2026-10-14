@@ -39,7 +39,7 @@ reconcile+cleanlint pass. just test RED two scm_rights tests parallel; serial
 isolation3x HEAD and base6550c4f49 allpass is NOT closure. Full gates must
 rerun current/final. No review-ready, no tests_passing true.
 
-Temporary attribution worktree .worktrees/main-attr at exactmain839f92126,
+Temporary attribution worktree .worktrees/main-attr at exactmainc1d9cddbc,
 clean tracked, reflink target and probes ignored. Remove when no longerneeded.
 Never Docker: director owns full just --no-deps conformance-probes and any
 mixed-protection Docker qualification. Worker cached signed2batches only.

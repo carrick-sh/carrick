@@ -23,7 +23,7 @@ unit tests as well. These tests need no VM, Docker, or guest executable.
   SCTP retains its source address and existing stream transport lifecycle.
   SCTP record boundaries and MSG_EOR remain unimplemented behavior gaps.
 
-Against original source `00fb0920b`, four close tests and 12 of the initial 17
+Against original source `3dcf9179e`, four close tests and 12 of the initial 17
 receive tests failed. Five receive controls passed. After the first fix, the
 signed LTP witness exposed an introduced TCP source-pointer regression. Three
 additional tests reproduced that regression and protocol-identity loss before
@@ -33,7 +33,7 @@ establish the pointer, copyout, ancillary, protocol, and close contracts.
 
 ## Fresh signed workload comparison
 
-Final source: `892b10a8e` (full revision in `final-source-head.txt`).
+Final source: `56615891b` (full revision in `final-source-head.txt`).
 The final focused run uses one worker, no retries, no automatic serial
 confirmation, and zero cached oracle rows. All Carrick runs precede all Docker
 runs. Eleven unique declared rows and unique run IDs were recorded under
@@ -107,7 +107,7 @@ provenance instead of collapsing a lost RunOutput into a spawn-failure record.
 1. **Child-selector lifetime / ptrace11.** The full run adds a TBROK after its
    passing assertion, with `HVPatch child selector is stale or invalid` and child
    exit 127. A predetermined alternating sample (10 original + 10 current)
-   reproduces the identical error twice on original `00fb0920b` and zero times
+   reproduces the identical error twice on original `3dcf9179e` and zero times
    on the current artifact. Since the current full run failed, the passing
    samples do not close it: it is a demonstrated pre-existing intermittent
    architectural defect. Receipts: `ptrace-attribution.json`, including

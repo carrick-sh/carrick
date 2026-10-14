@@ -1932,7 +1932,7 @@ guests ≤2x Linux; nothing that matched in `ledger-ed3a42c85` regresses; any
 row whose ratio moves more than 1.5x between an idle host and the 4-worker
 run is a load-coupling defect to be fixed, not excused.
 
-**Idle vs ledger.** Same binary (`a4c5c672…`, main `b82dd2b7c` is docs-only
+**Idle vs ledger.** Same binary (`a4c5c672…`, main `8bdc05eb9` is docs-only
 on top of the ledger's source), same harness invocation, one suite at a
 time on a quiet host (`target/conformance/eco-idle/`):
 
@@ -2003,12 +2003,12 @@ Landed on main, each fast-forwarded from the worker branch, inventories
 reconciled, `just lint-domains` and the signed build green, `ubuntu:24.04
 /bin/true` and `python:3.12-slim print(1)` launch receipts:
 
-- **subprocess-fdleak** (`dc23e0128`..`5967a7b71`): `/proc/<self-pid>/fd`
+- **subprocess-fdleak** (`dc23e0128`..`33944216f`): `/proc/<self-pid>/fd`
   resolves under HVPatch (the guest pid is not the carrier pid) and the
   `/proc/self/fd` listing is built from the live fd table on every
   `getdents64`. `cpython-subprocess` 297/297 on main (was 295/297).
   Probe `procselffdfail` awaits its Docker bless.
-- **dentry-evict** (`cba377ccb`..`a4fe401e5`, hatch cleanup `1c8a320a4`):
+- **dentry-evict** (`cba377ccb`..`41555f145`, hatch cleanup `9bf5d68ad`):
   the 4096-directory bulk reset is replaced by memory-bounded per-entry
   eviction (32 MiB default, `CARRICK_DENTRY_CACHE_CAPACITY_BYTES`;
   `CARRICK_DENTRY_EVICT=0` hatch), directories pinned by an explicit pin
@@ -2017,7 +2017,7 @@ reconciled, `just lint-domains` and the signed build green, `ubuntu:24.04
   gate, both binaries: `openat03` DIFF → MATCH, `renameat202` REGRESSION
   → MATCH, the six create-heavy LTP rows and `cpython-pathlib`/`tempfile`
   unchanged to the millisecond.
-- **fault-window** (`4daf4bb29`..`03908a220`): a single-page first touch
+- **fault-window** (`3262a2eac`..`03908a220`): a single-page first touch
   materializes its whole 16 KiB compound (always the pooled, zero-syscall
   path), anonymous private windows widen to 64 KiB
   (`CARRICK_FAULT_WINDOW_BYTES`, `=4096` hatch) clamped to the pristine
@@ -2062,8 +2062,8 @@ default is decided.
 
 ## 2026-09-07: the exec-generation abort, captured
 
-With the observer's failure sources named (`e0899dde9`) and the registry's
-view logged at the abort (`19235a09a`), `go-go_types` under eight
+With the observer's failure sources named (`adf6a79cb`) and the registry's
+view logged at the abort (`ec0b73902`), `go-go_types` under eight
 default-QoS CPU hogs reproduced it on the first run:
 
     scheduler generation observer lost exact transition
@@ -2105,7 +2105,7 @@ vector is sorted by start — but five publication paths `push` and one
 `extend`s out of order. A binary search over an unsorted vector misses
 live mappings, so a sparse extent could be materialized on top of a
 mapping the guest had already written; wider windows simply asked the
-broken question more often. `a1fd9ad94` restores full scans for the
+broken question more often. `eff1dc012` restores full scans for the
 three questions (the two sorted inserts stay, harmless). The perf that
 landed came from the compound-aligned pooled first touch and the bounded
 alias-registry queries, not from those searches. Validation on the fixed
@@ -2117,13 +2117,13 @@ assertion, or the search is a bug waiting for the next `push`.
 
 ## 2026-09-07 evening: where the perf lives, and who holds what
 
-On the fixed binary (`a1fd9ad94`, load 12–17), `cpython-itertools` runs in
+On the fixed binary (`eff1dc012`, load 12–17), `cpython-itertools` runs in
 **6.3 s** with `CARRICK_FAULT_WINDOW_BYTES=65536` and **47.8 s** with the
 4 KiB default — the compound-aligned pooled first touch alone buys
 nothing measurable on this row; the whole win is the wide window, which
 still corrupts guest memory (Go `allocCount != nelems`, 2 of 3 runs at
 64 KiB on the fixed binary, 0 of 6 at 4 KiB). The `partition_point`
-searches on the unsorted mapping vector (`a1fd9ad94`) were a real latent
+searches on the unsorted mapping vector (`eff1dc012`) were a real latent
 bug but not this one; the per-chunk receipt clamping was verified
 correct. A one-minute reducer exists:
 `target/conformance/eco-load/gobuild-loop.sh <label> <window> [iters] [bin]`
@@ -2151,7 +2151,7 @@ scheduler's phase 3 (blocking as a scheduler operation) is where the
 reactor's O(live blocked tasks) cost gets designed out, so the branch is
 kept as prior art rather than iterated further.
 
-**mm-scope landed** (`f0e783943`..`60af77a56`, repair `691ef3fd7`, main
+**mm-scope landed** (`e49c71d41`..`c0e89a3de`, repair `9e617328a`, main
 binary `20b7aebd…`): the stage-1 pause's coordinator election is per mm
 (`PtQuiesce` owned by the `Mm`, bound thread-locally while a vCPU
 executes for it) instead of one carrier-wide static, and the
@@ -2164,12 +2164,12 @@ MATCH with identical times (`go_types` 571/571, `net_http` 1316/1316,
 `munmap01`, `brk01`, `mmap01`); post-landing smoke and rows green. The
 worker's own receipts had used `--flake-retries`, so the landing gate
 re-ran them without retries. Two inventory JSONs reached main with
-conflict markers through the rebase and were repaired in `691ef3fd7`.
+conflict markers through the rebase and were repaired in `9e617328a`.
 
 ## 2026-09-07: the wide-window corruption, found — a stale row trusted by frame liveness
 
 A Fable subagent proved the mechanism (branch `agy/window-corruption-sep07`,
-landed as `e22aca098`..`5094077b8` plus registration). A task's
+landed as `5bd08b9e5`..`c71a514b6` plus registration). A task's
 `HvfMappedRegion` rows are per-task caches of the process-wide alias
 registry. A sibling thread's partial `munmap` (or `MAP_FIXED` over a
 sub-range) splits the registry entry and mirrors the split only onto the
@@ -2195,7 +2195,7 @@ exit wedges with every executor idle (the wake-vs-reap family), and the
 observer abort. The 64 KiB default returns with this landing; the
 receipts are in `target/conformance/eco-load/land-window.log`.
 
-**Landed with the 64 KiB default** (`9ac383a69`, main binary `1536e789…`,
+**Landed with the 64 KiB default** (`63750eab9`, main binary `1536e789…`,
 load ~5): `cpython-itertools` 3.6 s (3.5x; was 20–28 s), `importlib`
 7.1 s (2.6x; was 10.9), `multiprocessing_main_handling` 14.8 s (5.1x; was
 33), `cpython-compile` MATCH 150/150 in 62 s (was the 300 s cap),
@@ -2323,7 +2323,7 @@ binary via the harness (`--require-cached-oracle`): `go-go_types` 571/571,
 `go-net_http` 1316/1316, `cpython-multiprocessing_main_handling` 39/39,
 `ltp-mmap01` 1/1, `ltp-mmap18` 4/4 — all MATCH, no regressions.
 
-### 2026-09-07 20:54 — post-SEGV-landing receipt on main 0529523ac (binary 5f3ed049…)
+### 2026-09-07 20:54 — post-SEGV-landing receipt on main 0495912ed (binary 5f3ed049…)
 
 `--workers 1`, `--require-cached-oracle`, host load 5.3 → 1.9 over the run,
 no other guests. go-build reducer 8/8, zero fatal lines. All eleven goal
@@ -2367,8 +2367,8 @@ Fix under gate: `opus/exitwedge-sep07` rebased (df0a28a4d publish-on-lost-
 claim, e42253f68 bounded signed exec/exit-storm test); unit reproducer 20/20
 red → green; signed embed test running before the fast-forward.
 
-**Landed 2026-09-07 22:35:** exit-wedge publish fix on main (f8487d23b,
-8a27b53f1, reconcile 1152ced70; signed binary 93632a2e…). Gates run by the
+**Landed 2026-09-07 22:35:** exit-wedge publish fix on main (1cee09b30,
+e59867c45, reconcile 9eb9a3b54; signed binary 93632a2e…). Gates run by the
 director: unit reproducer green, `just lint-domains` 0, probe shards 3/3,
 signed build 0. The signed embed test `go_types_exit_publishes_every_process_job`
 compiles but did **not** execute: `just test-embed` shells out to Docker on
@@ -2377,7 +2377,7 @@ registries were down; fixing that lane is part of lane B. Post-landing rows
 in `post-exitwedge.log`. Lane B (KernelAbort sink, post-mortem, debug abort,
 deadline, exit budgets) dispatched on the same worktree.
 
-**Post-exit-wedge receipt (main 1152ced70, binary 93632a2e…, `--workers 1`,
+**Post-exit-wedge receipt (main 9eb9a3b54, binary 93632a2e…, `--workers 1`,
 load 4.6 → 2.9, other agents' guests intermittently alive):** smoke ok,
 go-build reducer 8/8 clean, all eleven rows MATCH, no regression. Ratios:
 asyncio 1.07, threading 1.22, pprof 1.47, importlib 2.71, subprocess 3.09,
@@ -2455,7 +2455,7 @@ running before the fast-forward. The signed embed test could not run: the
 `just test-embed` lane still needs Docker (lane B).
 
 **Landed 2026-09-08 01:50: lane A `KernelAuditor`** (agy/kernel-auditor-sep07 →
-main, last d462d6809; signed binary e1a87448…). Gates by the director:
+main, last 5b7c710c6; signed binary e1a87448…). Gates by the director:
 42 runtime + 69 embed unit tests, `just test` 0, `just lint-domains` 0,
 probe shards 3/3, signed build 0; smoke and the eleven rows running
 (`post-lanea.log`). Until lane B lands, an `Abort` verdict surfaces as
@@ -2526,7 +2526,7 @@ other half of the same window: a wake-queued row claimed before `activate`
 `brief-activation-window.md`, dispatched after this lands.
 
 **Landed 2026-09-08 ~02:40 (two landings, one binary):**
-- **Lane B** (`opus/exitwedge-sep07` → main through 0268b74d2): `KernelAbort`
+- **Lane B** (`opus/exitwedge-sep07` → main through 37a4e2efd): `KernelAbort`
   sink with in-process `PostMortem` (kernel graph, executors, event ring,
   findings incl. dangling mappings), `EmbedError::KernelAborted` from
   `join`/`execute`, `ContainerBuilder::post_mortem_dir` + `CARRICK_POSTMORTEM_DIR`
@@ -2543,15 +2543,15 @@ other half of the same window: a wake-queued row claimed before `activate`
   process-global statics; `std::process::abort()` sites are outside the
   sink; carrier teardown after an abort prints a lost-lease error.
 - **Activation-publish fix** (`opus/hostwait-sep08` → main through
-  c6f2eeb70): idempotent `SubmissionPublication::publish` and named run-queue
+  dbf96ab96): idempotent `SubmissionPublication::publish` and named run-queue
   rejections. Director gates: the three unit tests green on the rebased tree,
   lint 0 after the host-authority rows were rebound. Binary of main
-  c6f2eeb70: 32f5… (see build log). Smoke + reducer + rows in `post-laneb.log`
+  dbf96ab96: 32f5… (see build log). Smoke + reducer + rows in `post-laneb.log`
   (host loaded; crashes/wedges are the verdict).
 
 ### 2026-09-08 03:05 — a silent carrier abort in the mmap alias-install path (main, under load)
 
-The post-landing go-build reducer on c6f2eeb70 (binary 79e957f1…) died
+The post-landing go-build reducer on dbf96ab96 (binary 79e957f1…) died
 rc=134 with empty stdout/stderr at host load 49. The crash report names
 the site: `carrick-executor-8`, `std::process::abort` inside
 `redispatch_threaded_syscall_for_executor`'s mmap alias-install arm, where
@@ -2564,13 +2564,13 @@ through the lane B sink, reproduce under hogs with a post-mortem, fix the
 root cause. Five `carrick_runtime` test-binary crash reports at 02:48 abort
 in `dispatch::sysv::shmdt` — an agent's unit-test run; noted, unowned.
 
-**Post-landing rows on c6f2eeb70 (binary 79e957f1…, load 49 → 3 over the
+**Post-landing rows on dbf96ab96 (binary 79e957f1…, load 49 → 3 over the
 run):** 11/11 MATCH, no crash in the row run (the one silent abort was the
 go-build reducer before it, filed above). Ratios not cited (load). A quiet
 window opened at the end (load 3.2): `quiet-short.sh` is taking the
 fork-to-wait measurement and the short rows on this binary.
 
-**Quiet-window points on c6f2eeb70 (binary 79e957f1…, `--workers 1`, load
+**Quiet-window points on dbf96ab96 (binary 79e957f1…, `--workers 1`, load
 2.8–3.3, the only three rows that finished before the fleet resumed):**
 itertools 3.67 (3787 ms), importlib 3.10 (8328 ms), threading 2.22
 (30738 ms). Unchanged from the pre-fleet receipt within noise, as expected:
@@ -2581,7 +2581,7 @@ resolution for tarfile). The quiet fork-to-wait driver refused its
 preflight (two sibling guests alive); the goal's fork measurement is the
 four-sibling ledger condition and runs with the final ledger.
 
-### 2026-09-08 03:45 — tarfile dirfd-invalidation fix landed (main 7d4a5d222)
+### 2026-09-08 03:45 — tarfile dirfd-invalidation fix landed (main e6e5206de)
 
 The parked WIP self-deadlocked (a `Weak<DentryCache>` bridge re-entered a
 `parking_lot::RwLock` held across the root fill) and was removed. The real
@@ -2605,7 +2605,7 @@ the ratio is not citable (load 13–24). Next design item, from the worker:
 a per-path dirfd epoch instead of one global generation word, which also
 makes the cross-process re-stamp argument a type instead of a comment.
 
-**Post-tarfile gates (main 7d4a5d222, binary from build-7d4a5d222.log):**
+**Post-tarfile gates (main e6e5206de, binary from build-e6e5206de.log):**
 lint 0, probe shards 3/3, smoke incl. an `rmtree` sequence ok. The go-build
 reducer aborted once at load 32 on `scheduler generation observer lost
 exact transition` (crash report `carrick-2026-09-08-034418.ips`,
@@ -2641,7 +2641,7 @@ and their growth under repeated MAP_FIXED is unbounded (review note);
 The `lost exact transition` abort the worker hit under load ≥19 on both
 binaries is the scheduler lane's (round 4).
 
-**Post-mapping-index gates (main f84bfe3e7):** lint 0, probe shards 3/3,
+**Post-mapping-index gates (main 09dc40eb1):** lint 0, probe shards 3/3,
 smoke ok, rows 6/6 MATCH (`cpython-compile` 150/150 at 48.1 s under load
 24–35 — the pre-fix binary took 62 s at load 5; not a citable ratio, but
 the direction holds under worse load; `cpython-mmap`, `ltp-mmap18`,
@@ -2649,7 +2649,7 @@ the direction holds under worse load; `cpython-mmap`, `ltp-mmap18`,
 aborted once on the exec-generation observer class (third instance on
 main tonight, all at load ≥30; scheduler round 4 owns it).
 
-### 2026-09-08 05:10 — the pre-activation wake window closed (main a5f8592fc)
+### 2026-09-08 05:10 — the pre-activation wake window closed (main e66296470)
 
 The other half of the importlib hang: a wake-queued row could be CLAIMED
 before its submission's binding record was active, so `resolve` failed
@@ -2671,7 +2671,7 @@ argv: base 14/16 (two rc=134), fix 16/16, zero hangs, zero watchdog reaps.
 Director gates on the rebase: 36 scheduler/executor tests, lint 0,
 workspace check 0. Note for the scheduler branch: the per-CPU queue must
 carry the same gate when it rebases. Stale ledger argv: `--raw` (deleted
-in 457fd7bb0) still appears in `scripts/conformance/baseline.jsonl`.
+in 252f8c8f0) still appears in `scripts/conformance/baseline.jsonl`.
 
 ### 2026-09-08 05:30 — scheduler round 4 verdict and round 5
 
@@ -2691,11 +2691,11 @@ absence, which is also true mid-retirement. M = P: four interleaved pairs
 on importlib, two favour M = 10, one tie, one confounded — not flipped.
 Round 5 (dispatched): reaped settlement publishes the terminal result;
 classification from the kernel graph's execution state with the
-lost-transition arm becoming a `KernelAbort`; rebase onto a5f8592fc and
+lost-transition arm becoming a `KernelAbort`; rebase onto e66296470 and
 port the claimability gate into the per-CPU queues; go_types 5/5 with
 zero reaps as the bar.
 
-**Post-claimability-gate rows (main a5f8592fc, load 22–32):** lint 0, shards
+**Post-claimability-gate rows (main e66296470, load 22–32):** lint 0, shards
 3/3, smoke ok; rows asyncio, importlib, mp_main, subprocess MATCH; two
 crashes: `go-go_types` (executor-boundary cascade after the observer abort,
 the round-5 class) and **`cpython-threading`, new tonight**, inside
@@ -2720,7 +2720,7 @@ after `FrameInventoryAuthority::apply_inner`, and the crashed thread's
 `SharedFile` frame in the backend's shared registry at staging time under
 the AliasMap topology lock and the next installer of the same
 `(dev, ino, offset, len)` reuses that `FrameId` without reserving it; since
-d913972c2 the install arm released the topology lock BEFORE publishing, so
+9e764ff4c the install arm released the topology lock BEFORE publishing, so
 a sibling could stage its reuse and publish first (publication-order trace
 `scripts/dtrace/hvpatch-alias-publication-order.d`: 149 µs descheduling
 window vs ~15–20 µs undisturbed). Fix 13680c8f2: publish while still
@@ -2736,7 +2736,7 @@ post-mortem kernel snapshot hits its 2 s deadline with 7 sibling processes
 live (`truncated`); the remaining go-build aborts are the scheduler
 observer class (round 5).
 
-### 2026-09-08 07:00 — compile round 4 landed: the residual was the alias VA-window walk (main 65b3c791c)
+### 2026-09-08 07:00 — compile round 4 landed: the residual was the alias VA-window walk (main 69efe1a74)
 
 New probes (`hvpatch-mapping-index-begin/-fault/-cost`, read by
 `scripts/dtrace/hvpatch-mapping-index-census.d`) put a number on every
@@ -2746,7 +2746,7 @@ residual. The `AliasRegistry` VA-window walk is: six sites asked
 `by_va_start.range(va - widest_va .. end)` with `widest_va` a monotone global
 maximum, so the walk length was a property of the population (111M rows
 visited at 800k depth against the index's 209K; 341 → 847 rows per fault
-as `widest_va` grew 6.3 → 16 MiB). Fix dbc428c52: VA rows keyed by
+as `widest_va` grew 6.3 → 16 MiB). Fix 7969469dc: VA rows keyed by
 `(ceil(log2(size)), start)` with an exact class multiset; one
 `va_window_rows` query at all six sites; `widest_va` deleted. Alias visits
 1,963,695 → 5,751 (341x) at 100k, 24,748,685 → 44,641 (554x) at 400k; 1.0
@@ -2766,7 +2766,7 @@ next compile attribution; `widest_ipa` keeps the same latent shape; the
 ratio yet (load 9–55); a quiet-window compile re-measure is queued by the
 agent behind a load < 5 gate.
 
-### 2026-09-08 07:15 — a live-task HostWait hang on a go build (main 2f3e0288b)
+### 2026-09-08 07:15 — a live-task HostWait hang on a go build (main b2bcfe57d)
 
 The post-alias go-build reducer wedged for 45 min with CPU creeping half a
 second; the watchdog missed it (any CPU change counted as progress — now a
@@ -2779,15 +2779,15 @@ on the go toolchain's fork/exec/pipe path. Dispatched
 (`brief-gobuild-hostwait.md`) with the classification-first method.
 
 **Receipt hygiene note (07:25):** the post-alias row run straddled the
-build of 65b3c791c — `target/release/carrick` was replaced at 06:45:38 while
+build of 69efe1a74 — `target/release/carrick` was replaced at 06:45:38 while
 the harness was between rows, so `post-alias.jsonl` rows c00–c02 ran the
-2f3e0288b binary and c03–c04 the 65b3c791c binary. Both carry the alias
-fix; the verdicts stand for "main ≥ 2f3e0288b" only. A clean
-smoke-plus-rows on 65b3c791c runs after it finishes. Rule restated: the
+b2bcfe57d binary and c03–c04 the 69efe1a74 binary. Both carry the alias
+fix; the verdicts stand for "main ≥ b2bcfe57d" only. A clean
+smoke-plus-rows on 69efe1a74 runs after it finishes. Rule restated: the
 next landing's build waits for the previous post-landing script's DONE line.
 
-**Post-alias-VA-window receipt (main 65b3c791c, binary from
-build-65b3c791c.log, `--workers 1`, load 4.5–5.3 — the nearest to quiet
+**Post-alias-VA-window receipt (main 69efe1a74, binary from
+build-69efe1a74.log, `--workers 1`, load 4.5–5.3 — the nearest to quiet
 tonight):** smoke ok, go-build reducer 8/8 zero fatal, rows 6/6 MATCH:
 `cpython-compile` **17.1 s / 6.41x** (campaign start 62.3 s / 23.3x),
 `cpython-itertools` 2.13 s / **2.06x** (was 3.7x), `cpython-mmap` 1.68x,
@@ -2796,7 +2796,7 @@ Lint 0, probe shards 3/3. Disk: swept the build trees of eight landed,
 idle worktrees (66 GiB; 30 → 96 GiB free).
 ### 2026-09-08 — scheduler round 5: the go_types wedge closed
 
-Branch `agy/guest-cpu-sep07`, rebased onto `4ba654760`. Two defects, one
+Branch `agy/guest-cpu-sep07`, rebased onto `6530b273d`. Two defects, one
 ending. `go_types` wedged eight times under round 4 — guest at `PASS`, every
 Kernel task retired, eighteen executors parked in `take_row`, main in
 `wait_process_jobs → HvpatchLoopResult::wait` — and aborted on other runs of
@@ -2840,7 +2840,7 @@ published; and the classification scenario asserted as
 absence a reap.
 
 **go_types, 5 interleaved pairs** (mine `89906ec7c` /
-`b942632acefe5f65…` vs base `4ba654760` / `a77e7021f12bffac…`, order
+`b942632acefe5f65…` vs base `6530b273d` / `a77e7021f12bffac…`, order
 alternated, `--carrick-timeout-cap-s 0` so the declared 360 s budget applies
 rather than the harness's 21 s adaptive one — under which BOTH arms time out):
 
@@ -2884,10 +2884,10 @@ survivable is the whole answer for that residual, or only removes its loudest
 symptom; and only one interleaved asyncio pair was completed before the
 session ended (the second base run was still going).
 
-### 2026-09-08 08:45 — the guest-CPU scheduler landed (main 32e678d87)
+### 2026-09-08 08:45 — the guest-CPU scheduler landed (main 891f9d241)
 
-Rounds 1–5 collapsed onto lane B and the claimability gate (16e262602),
-plus the round-5 fix (60238bc06): the reaped settlement publishes the job
+Rounds 1–5 collapsed onto lane B and the claimability gate (56fab897a),
+plus the round-5 fix (28d83e5c3): the reaped settlement publishes the job
 it owns, "reaped" is judged from the kernel graph's execution state, and
 the lost-transition arm is a `KernelAbort` with a post-mortem instead of a
 bare `abort()`. Director gates on the rebase (the post-mortem enum merge
@@ -2909,7 +2909,7 @@ flipped). With this, the recurring `lost exact transition` abort under
 load ≥30 should be gone from main; the post-landing reducer and rows are
 the receipt.
 
-**Post-scheduler rows (main 32e678d87, binary fd1b5e75…, load 12–33):**
+**Post-scheduler rows (main 891f9d241, binary fd1b5e75…, load 12–33):**
 lint 0, shards 3/3, smoke ok, go-build reducer **8/8 with zero abort
 lines** (first clean reducer under load ≥20 tonight). Rows 9/11 MATCH;
 first loaded tarfile number since its fix: 36.2 s / 7.61x (was 75–84 s);
@@ -2935,7 +2935,7 @@ thread and the debug server both blocked on the run-queue STATE mutex
 their per-CPU condvars, spares parked in `park_spare` on that mutex's
 condvar, and no visible holder — a leaked or park-held guard on the
 close/drain path of the landed scheduler (round 6, dispatched). The
-pre-scheduler control (rebuilt 65b3c791c) on the same argv ends in 18 s
+pre-scheduler control (rebuilt 69efe1a74) on the same argv ends in 18 s
 with lane B's abort: `1 container job unpublished with 0 live task(s),
 1 live thread(s); zombie pid 1` (2/2, post-mortems in
 `pm-cmp-ctrl-{1,2}/`) — the exit-wedge residual lane B's carry-in named
@@ -2945,13 +2945,13 @@ activation residual's root cause (the clone child is kernel-runnable ~300
 lines before `admit`; fixed by gating the key before publication,
 threading 5/5 vs base 3/5) is being ported onto the per-CPU scheduler.
 
-### 2026-09-08 11:00 — round 6 landed (main 4b8b6b056): the exit deadlock was a self-deadlock
+### 2026-09-08 11:00 — round 6 landed (main a6be6f782): the exit deadlock was a self-deadlock
 
 `Scheduler::scheduler_summary` took the run-queue state mutex and, still
 holding it, called `RunQueue::waiter_count`, which locks the same
 non-reentrant mutex; the blocked main thread WAS the holder, the debug
 thread queued behind it, the parked spares innocent. Unconditional — no
-load needed. Fix ed05adb0e replaces the representation: the locked variant
+load needed. Fix d58bbf09b replaces the representation: the locked variant
 takes the guard the caller holds (the bad call is unwritable), a
 non-blocking census, and a named `SchedulerSummary` built from atomics plus
 `try_lock` that reports `WaiterCensus::RunQueueLocked` instead of joining a
@@ -2993,7 +2993,7 @@ refusal paths fired 0 times; the `TaskBusy` arm's unsampled precheck trades
 a lost wake for redispatches while a fork reservation is held (bounded,
 unmeasured).
 
-**Post-round-6 receipt (main 4b8b6b056, binary 8cb456a7… rebuilt from the
+**Post-round-6 receipt (main a6be6f782, binary 8cb456a7… rebuilt from the
 same source mid-run by the probe-gate reproduction; host load 32–104):**
 smoke ok, go-build reducer 8/8 zero abort lines at load 104, rows 6/6 MATCH
 (go_types, asyncio, compile, importlib, subprocess, threading) — the first
@@ -3001,12 +3001,12 @@ row run tonight with no crash under heavy load. Ratios not cited.
 
 ### 2026-09-08 14:50 — containment index landed (14th); the exit residual re-attributed; the probe gate was dead
 
-**HostWait landing receipt (main 0fd65be47):** build/lint/shards 0, reducer
+**HostWait landing receipt (main d8798b2c7):** build/lint/shards 0, reducer
 8/8 at load 35, rows 5/6 MATCH (go_types, net_http, importlib, mp_main,
 subprocess); `cpython-asyncio` crashed at 662 — the activation residual's
 spot, whose port onto the per-CPU scheduler is in flight.
 
-**Containment index (opus/exit-residual-sep08 → main 33942fb2f):** the
+**Containment index (opus/exit-residual-sep08 → main 7964f1530):** the
 terminal-retirement containment query asked once per inventory extent over
 every mapping row (O(extents × rows): 360,600 visits at 600×600, ~1.1e9
 in vivo behind 33k extents) now goes through a physical-extent index (one
@@ -3025,7 +3025,7 @@ hidden this). Scheduler round 7 dispatched on it with the post-mortems.
 (a sender dropped by re-arming the same task on fork-then-exec) as expiry;
 fixed on `opus/probegate-sep08` (exact `Timeout` match + timed invariants
 opt-in, both red-first). Consequence: **the gate executed 3 of 532 probes
-from d462d6809 until now**, so a day of merges went unmeasured. With the
+from 5b7c710c6 until now**, so a day of merges went unmeasured. With the
 fix it runs all 532 and fails three: `pidnsorphanreap` (orphan not
 reparented to local init, or the invariant misreads a nested pid ns),
 `coredumpfile` and `processvmsparse` oracle diffs — the latter a prime
@@ -3034,11 +3034,11 @@ dispatched: attribute by bisect before fixing.
 
 ### 2026-09-08 15:45 — containment-index receipt; probe-gate fix landed (15th); activation reservation ready
 
-**Containment index (main 33942fb2f) receipt:** build/lint/shards 0,
+**Containment index (main 7964f1530) receipt:** build/lint/shards 0,
 reducer 8/8 zero aborts, rows 6/6 MATCH (compile 35.2 s at load 22–29,
 mmap, mmap18, munmap01, go_types, itertools). Ratios not cited.
 
-**Probe-gate fix landed (`opus/probegate-sep08` → main 31fb94d67):**
+**Probe-gate fix landed (`opus/probegate-sep08` → main f7f93ad44):**
 `recv_timeout`'s `Disconnected` (a sender dropped by re-arming the same
 task on fork-then-exec) is no longer read as expiry — exact `Timeout`
 match, red-first (`ExitBudgetExceeded { within: 3600s }` after 100 ms
@@ -3074,7 +3074,7 @@ workspace check 0, the three red-first tests green; build, lint, shards and
 the eleven rows chained. Two other agents remain: scheduler round 7
 (`SwitchingOut` after `exited`) and the probe-gate triage.
 
-**Activation reservation receipt (main 40e67f69b):** build/lint/shards 0,
+**Activation reservation receipt (main 53c386eb3):** build/lint/shards 0,
 reducer 8/8, **11/11 rows MATCH with zero crashes** at load 14–26 — the
 first fully clean eleven-row run under load since the fleet started
 (previous loaded runs each lost one to two rows to a crash class that has
@@ -3085,7 +3085,7 @@ armed to fire on a quiet host: the eleven rows at `--workers 1`, then the
 ### 2026-09-08 17:40 — probe-gate triage: one real regression, one wrong invariant, one flake, one new finding
 
 With the gate alive again (643 probe executions per run): **`processvmsparse`
-was a regression from 9ac383a69** — restoring the 64 KiB anonymous fault
+was a regression from 63750eab9** — restoring the 64 KiB anonymous fault
 window as the default (bisected over 158 commits with `git bisect run`;
 hatch-confirmed on one binary: `CARRICK_FAULT_WINDOW_BYTES=4096` MATCH,
 default DIFF). Mechanism: the wide window materializes zeroed backing across
@@ -3128,7 +3128,7 @@ fix lands (brief written, dispatch after scheduler round 7).
 ### 2026-09-08 19:00 — first pass at the goal's own condition (contaminated, not citable)
 
 The self-gated closing run fired at 11:22 in a brief quiet window on the
-activation-reservation binary (d81b2093…, main 62ced7952) and finished its
+activation-reservation binary (d81b2093…, main a389ee3a8) and finished its
 two measurement phases before round 7's hogs and guests contaminated it
 (load 4.5 → 25 during phase 1). **Both phases 11/11 MATCH, zero crashes:**
 `--workers 1` and, for the first time tonight, **the `--workers 4` cached
@@ -3181,7 +3181,7 @@ behind this landing from a hash-pinned binary. Dispatched on top: the
 `mqnotifycrossproc` wake-audit fix (Exited vs Reaped), the `just doc`
 link, and a claim-age term so a claim held forever is still caught.
 
-**Seventeenth landing receipt (main d41833ae6):** build/lint/shards 0;
+**Seventeenth landing receipt (main c22eb7374):** build/lint/shards 0;
 `just conformance-probes` on main: 496 probe executions (shard 2 green;
 shard 1 stops at `mqnotifycrossproc`, the wake-audit mislabel whose fix is
 in flight; shard 0 stops at `coredumpfile`, the in-shard flake, DIFF at
@@ -3190,8 +3190,8 @@ reducer 8/8; rows 6/6 MATCH (compile, mmap, mmap18, munmap01, go_types,
 itertools at load 7–13). `coredumpfile` attribution dispatched (probe-side
 thread wait under load, or carrick dropping threads from the core).
 
-**Round-7 landing receipt (main e7eb0338d, receipt files named 4cc18d085):**
-build/lint/shards 0 (`target/perf/land/{build,lint,shards}-4cc18d085.log`);
+**Round-7 landing receipt (main 28983e61e, receipt files named ba679c395):**
+build/lint/shards 0 (`target/perf/land/{build,lint,shards}-ba679c395.log`);
 reducer 8/8 (`RESULT label=post-r7 window=65536 rc=0 BUILDS=8 FAILS=0
 fatal_lines=0 abort=0` at load 16–22); all eleven goal rows MATCH with zero
 crashes/wedges at that load (`target/conformance/eco-load/post-r7.log`):
@@ -3230,23 +3230,23 @@ tasks) after its work was committed; lesson: every brief now states "run
 every wait in the foreground; never background a sleep."
 
 **Landings 19–21 and the first complete probe gate (2026-09-08 afternoon).**
-- `mq_notify` fixes landed (`e6fb415a5`): probe gate on that binary ran
+- `mq_notify` fixes landed (`fe723d274`): probe gate on that binary ran
   ALL 876 generic rows (298/304/274 per shard) with 0 DIFF — the first
   complete pass of the gate this campaign; `mqnotifycrossproc` green.
-- Crash-capture deposit landed (`879dc8606`, from `ec3db6d2d`): probe gate
+- Crash-capture deposit landed (`1adb75465`, from `ec3db6d2d`): probe gate
   again 876/876, 0 DIFF, `coredumpfile` green in-shard.
 - The only red left in `just conformance-probes` was the closure
   denominator test, hidden until now because every earlier gate run died in
   a shard first: seven probe sources added 2026-09-06/07 by other sessions
   (`windowcoherence`, `tlbibroadcast`, `sigprofvdso`, `ppollwaitset`,
   `forkexecstorm`, `ptyjobcontrol`, …) without the denominator moving.
-  Fixed in `2156e577a` (527 sources = 477 generic + 23 dedicated + 26
+  Fixed in `a367e1d93` (527 sources = 477 generic + 23 dedicated + 26
   performance + 1 helper; `ppollwaitset` reclassed to conformance per the
-  validator's `perf_*` rule) and `72cf2bdd4` (shards regenerated by
+  validator's `perf_*` rule) and `a4820fc25` (shards regenerated by
   `regen-next-shards.py`; lint green on main). Follow-up: `forkexecstorm`
   and `ptyjobcontrol` are registered but uncached — need a Docker bless
   before the shards gate them.
-- Closing measurement #3 (binary `cea7eecad`, sha `04122c6dafa7e98f`) is
+- Closing measurement #3 (binary `86669b6a9`, sha `04122c6dafa7e98f`) is
   CONTAMINATED: its quiet preflight passed at a lull (load 3.3) and both row
   phases then overlapped the crash-capture chain's compile/build (load
   12–21). Verdicts 11/11 MATCH at w1 and w4; ratios not citable. The
@@ -3254,7 +3254,7 @@ every wait in the foreground; never background a sleep."
   go_types 2.5×, itertools 2.3×, pprof 1.6×, net_http 1.5×, asyncio/threading
   1.4×; perf_fork during w4 p50 484/1124/687 µs. Rerun #5 gates quiet before
   EVERY phase, samples load once a minute into its log, and pins the
-  `879dc8606` binary.
+  `1adb75465` binary.
 - Director hygiene: the two Opus agents polled with background sleeps (90
   harness tasks, 40 shells) and one leaked six `yes` hogs that held load at
   21 — killed; every brief now mandates foreground waits and pid-exact hog
@@ -3263,7 +3263,7 @@ every wait in the foreground; never background a sleep."
 
 ### 2026-09-08 15:40 — closing measurement #5: the first citable scorecard
 
-Binary `ad7f29b806ef0003` (main `a1772b279`, runtime = `879dc8606`), pinned
+Binary `ad7f29b806ef0003` (main `f753eaf3d`, runtime = `1adb75465`), pinned
 copy, `--require-cached-oracle`; phase 1 started at load 4.51 with no
 build and no guest alive, phase 2 gated quiet again (2.23), load 2–7 for
 the whole run (`quiet-close5.log`, `quiet-close5-w{1,4}.jsonl`). The script
@@ -3304,7 +3304,7 @@ multiprocessing (16.6 ms vs 4.5 ms per `python3 -c pass`).
 
 ### 2026-09-08 evening — the perf round: two briefs overturned by their own measurements
 
-**compile fault count (lane `opus-compile-faults-sep08`, landed `3538e22f7`).**
+**compile fault count (lane `opus-compile-faults-sep08`, landed `ed7bec395`).**
 The brief's premise was wrong and the lane proved it. The recorded "8x depth
 = 22.8x faults" reproduces (4,812 → 110,258 EL0 aborts) but is **linear
 growth with a large negative offset**, not a super-linear mechanism: 99.6%
@@ -3393,7 +3393,7 @@ newly registered probes "sit in the uncached population the shards do not
 gate". They do not: `regen-next-shards.py` derives the cached lane as every
 generic probe outside `LIVE_ORACLE_PROBES`/`OUT_OF_PROCESS_PROBES`, so the
 probe gate on main went red after 416 rows with "missing cached probe oracle
-for ppollwaitset" and the same for `forkexecstorm`. Fixed in `50aac60eb` by
+for ppollwaitset" and the same for `forkexecstorm`. Fixed in `1be799cfb` by
 quarantining all three on the live-oracle lane, where `tlbibroadcast`,
 `windowcoherence` and `sigprofvdso` already sit for the same reason.
 `ppollwaitset` belongs there on its own merits: it asserts sub-5 ms wake
@@ -3406,7 +3406,7 @@ gate belongs to the director's measurement, never to a worker's inner loop.
 
 ### 2026-09-08 22:20 — full-matrix state, and the receipt bug it found
 
-Pushed `b82dd2b7c..cf3995bb2` to `origin/main` (273 + 2 commits) behind a
+Pushed `8bdc05eb9..b53efd61d` to `origin/main` (273 + 2 commits) behind a
 green gate: probes 876/876 with 0 DIFF, clippy/build/test/lint 0, gobuild
 reducer 8/8 with no fatal lines.
 
@@ -3434,7 +3434,7 @@ committing it would have poisoned every future gate. Kept as
 `2x oracle + 2s` budget is unavailable and EVERY row falls back to that flat
 900 s. **Rule: refreshing the oracle disables the adaptive per-row budget.**
 
-**The crash was a real bug, fixed in `8fa02b214`.** `go-net` died with
+**The crash was a real bug, fixed in `9e4e8f9f2`.** `go-net` died with
 "fatal error: runtime: cannot allocate memory" from
 `runtime.persistentalloc1`. Not host exhaustion: carrick refused the mapping
 — `deferred COW protection authentication failed at VA 0x6047c96000:
@@ -3453,7 +3453,7 @@ contract repair it is, not as a demonstrated fix for that crash.
 
 ### 2026-09-09 02:23 — the goal measured on the fully fixed binary
 
-Binary `6b576f1cc532c06d` (main `fc1450ef7`), pinned copy, cached oracle,
+Binary `6b576f1cc532c06d` (main `d692a2037`), pinned copy, cached oracle,
 quiet gate passed before EVERY phase (load 3.8 → 2.4 → 1.9, no guests, no
 builds). This is the first measurement carrying the whole day: readdir,
 reactor work-set index, constant-cost first touch, per-syscall tax,
@@ -3497,9 +3497,9 @@ most of the ratio residue.
 
 ### 2026-09-09 03:33 — the alias ordering invariant, and a measurement caveat that matters
 
-**Landed `901121ea0`.** The scope scan is gone from `munmap`: 4,098 row
+**Landed `b446bac40`.** The scope scan is gone from `munmap`: 4,098 row
 visits for a 4,096-row mm become 15. The earlier failed attempt
-(`e123216a4`) is now explained, and it was NOT the window query — **a scope
+(`819e1ea8c`) is now explained, and it was NOT the window query — **a scope
 bucket must be ordered by sequence for `bucket_position_in`'s binary search,
 and the unmap planner's staged registry was not ordered**, because it builds
 from two index orders and `insert_indexed_row` pushed. On an unsorted bucket
@@ -3514,7 +3514,7 @@ comment is a bug that has not happened yet. Differential test
 (seeded generator, 1,903 unmaps) was **RED at 903/1,903 before the fix**;
 smallest diverging case is a two-row staged bucket in order `[seq=6, seq=4]`.
 
-**Goal on `62c63d979` (binary `afccec0cc339993c`), quiet before every phase:**
+**Goal on `2fb09a429` (binary `afccec0cc339993c`), quiet before every phase:**
 
 | row | w1 | w4 | move | prev w4 |
 |---|---|---|---|---|
@@ -3550,8 +3550,8 @@ a stored column.
 First scorecard measured the way the 03:33 caveat demands: base and
 candidate INTERLEAVED on one quiet host (quiet-gated before every phase,
 no other agent on the machine), w4 three reps with alternating order, then
-w1 once each. Base = pinned `62c63d979` binary `afccec0cc339993c`;
-candidate = pinned main `541a575ff` binary `3c8dbee5b686c49d` (the tree
+w1 once each. Base = pinned `2fb09a429` binary `afccec0cc339993c`;
+candidate = pinned main `b0d361cc3` binary `3c8dbee5b686c49d` (the tree
 after DSR removal, the god-file splits, `carrick_fatal!`, typed returns,
 the dispatcher views, and the five probe fixes). Driver
 `target/conformance/eco-load/paired-sep11.sh`, rows
@@ -3587,7 +3587,7 @@ load-coupled rows the 02:23 entry named.
 
 ### 2026-09-12 11:33 — paired five-row scorecard after the per-mm Tasks 1–4 and the three perf clusters
 
-Binary `1586567ad3501d32` (main a70bb5567) vs the pre-cluster pinned
+Binary `1586567ad3501d32` (main 28d2e8cb1) vs the pre-cluster pinned
 `3c8dbee5b686c49d`, interleaved paired, w4 x3 alternating then w1, quiet
 host, driver `target/conformance/eco-load/measure-sep12.sh`, rows
 `paired-sep12-*.jsonl`, summary `paired-summary-sep12.py`. **40/40 MATCH.**
@@ -3620,7 +3620,7 @@ net_http 1.01.
 
 ## 2026-09-12 16:00 — paired scorecard after per-mm Tasks 5+6 and the fork-quiesce fix
 
-Candidate b25f3b2d7f52c045 (main 486e46d8d) vs base 3c8dbee5b686c49d, same
+Candidate b25f3b2d7f52c045 (main e15e0f92d) vs base 3c8dbee5b686c49d, same
 method as 11:33 (`measure-sep12b.sh`: five rows, w4 ×3 alternating, then
 w1; quiet-gated; ratios are carrick/Docker medians, cand/base is the
 per-rep paired median).
@@ -3647,7 +3647,7 @@ being verified live on this row before anything else lands.
 
 ## 2026-09-12 17:15 — paired scorecard on the fixed main (gate 46/46)
 
-Candidate d8fbd6a94562b880 (main e4e632c07: Tasks 5+6, fork-quiesce wake
+Candidate d8fbd6a94562b880 (main c02077612: Tasks 5+6, fork-quiesce wake
 fix, sibling-drain survivor fix, alias lock-order fix) vs base
 3c8dbee5b686c49d; `measure-sep12c.sh`, same method. Probe gate on this
 binary: 46/46, no probe DIFF (first fully green gate of the day).
@@ -3669,7 +3669,7 @@ are compile and tarfile, from fresh profiles on this binary.
 
 ## 2026-09-12 21:30 — hostfs-opens landed; two more fork-barrier lost wakeups closed
 
-`hostfs-opens` round 2 landed (52420d8ca..4ea079b9d): host `openat`
+`hostfs-opens` round 2 landed (d0e25fb29..53a60c6b6): host `openat`
 amplification on mkdir/dirents/stat (fchmodat after mkdirat for mode
 fidelity, per-directory marker tracking instead of a tree-wide flag,
 `mkdir_under_parent`, cached-dirfd reuse in `open_trusted_dir_fd` /
@@ -3690,10 +3690,10 @@ its supervisor SIGKILLs the group and the teardown aborts the carrier.
 Live captures (`carrick debug lldb-run --deadline-seconds 6`, eight-way;
 only a hung run dumps) named two lost wakeups in the fork-barrier /
 clone-admission triangle: the fork LOSER spun on `subscribe_quiesce`
-after c40654c00 (fixed 3dbd77c72, `subscribe_fork_release`), and the fork
+after ea94a32c0 (fixed 47e095864, `subscribe_fork_release`), and the fork
 WINNER parked on the kernel reservation epoch after yielding to a
 thread-clone permit whose release publishes only the admission epoch
-(fixed 36ae60e53, `ForkCloseAttempt::PermitsInFlight`). Receipts:
+(fixed 84a7390e6, `ForkCloseAttempt::PermitsInFlight`). Receipts:
 forkexecstorm eight-way ×6 = 48/48 on c54325cc70b4a47f (4 hung of 48
 before); probe gate 46/46 on c54325cc70b4a47f and on the merged main
 67e536aace35f82e. Paired scorecard (`measure-sep12d.sh`, candidate
@@ -3762,9 +3762,9 @@ the sampler. Parked behind the net_http executor-boundary work.
 ## 2026-09-13 02:20 — lazy vCPU state landed; two gate-found defects fixed
 
 Main 457da5fb6521ff7b carries the residency-keyed lazy vCPU save/restore
-(598c987be..aeec3e384, three worker rounds; director review in the
-controller), the carrier teardown-window fix (614b2de8a) and the trusted
-dirent stream's own-description fix (6906c19cc). Paired scorecard
+(888c08a8f..8a2160421, three worker rounds; director review in the
+controller), the carrier teardown-window fix (9051642af) and the trusted
+dirent stream's own-description fix (f1d0e56bd). Paired scorecard
 (`measure-sep13b.sh`, candidate 457da5fb6521ff7b vs base 3c8dbee5b686c49d,
 40/40 MATCH; the table values are carrick/Docker wall ratios, not seconds):
 
@@ -3786,7 +3786,7 @@ smoke green inside the loaded gate.
 
 ## 2026-09-13 12:10 — in-zone loopback TCP landed; the net_http row does not move
 
-Main 1323fe921 (pin 321070a2c32be845) keeps every guest↔guest loopback TCP
+Main 8df1aa352 (pin 321070a2c32be845) keeps every guest↔guest loopback TCP
 connection inside the carrier (`network/inzone.rs` registry, in-memory
 INET stream semantics, dispatcher wiring, the line-exact `inzonetcp`
 probe and nine fixes the probe, go-net_http and the full probe gate

@@ -55,8 +55,8 @@ wrapper's entitlement negative control and scoped cleanup remain required.
 No Docker, timeout expansion, pool expansion, or retry-to-green is used.
 The director narrowed repeated verification to five focused allocator invocations
 plus canonical `just accept`; the initial full EL1 characterization had exactly
-the six checked-in known reds (base checkout `a257cdf9d`, not a reproduction
-of the original `ce408011c` signed artifact). Final acceptance and its receipt are reported
+the six checked-in known reds (base checkout `9a9dc7b80`, not a reproduction
+of the original `76fa4659f` signed artifact). Final acceptance and its receipt are reported
 separately after the final gate.
 
 The final matching red uses the deferred injector: without the guest park

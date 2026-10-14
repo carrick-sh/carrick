@@ -28,7 +28,7 @@ waits are untimed. Three things stand in the way:
 
 ## Artifact and method
 
-- Tree: `main` at `313a1ab00`, built and signed with `just build`.
+- Tree: `main` at `c3173ed32`, built and signed with `just build`.
   `target/release/carrick`: SHA-256 `bfdc722f404c7d2a862e96c71d28af0f49b947fe43b6a90f18f19ecb6c5b1848`,
   CDHash `68b641e32d1261a5df2f58972d3be8b37b17e6de`, LC_UUID
   `56D5FB15-3AB0-3277-9078-5937ACD453D7`, `__dof_carrick` present,
@@ -266,7 +266,7 @@ re-probed after enrollment).
   carries arg0 to arg3; the mask is arg4).
 - The latency of the in-zone wake (EL1 `notify_object` → SGI → waiter
   running) was not measured. It is the denominator of the gain estimate.
-- In the 313a1ab00 build the event-ring FDOPEN record and
+- In the c3173ed32 build the event-ring FDOPEN record and
   `event_ring_host_fd` are inlined into the install helpers. The script
   therefore reads backing from the fd type, which is exact for eventfd, pipe
   and socketpair but `unknown` for the two AF_UNIX `socket()` fds (neither

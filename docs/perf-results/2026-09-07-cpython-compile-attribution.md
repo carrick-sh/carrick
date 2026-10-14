@@ -1,6 +1,6 @@
 # cpython-compile ratio attribution (23.3x: 62.3 s vs 2.7 s)
 
-**Recorded 2026-09-07.** Base revision `31c473c16` on branch `agy/attr-compile2-sep07`.
+**Recorded 2026-09-07.** Base revision `26b012555` on branch `agy/attr-compile2-sep07`.
 
 ## 1. The Question
 
@@ -128,4 +128,4 @@ The mechanism driving the 23.3x slowdown is **O(N^2) linear scans over `HvfTaskS
 4. In total, **each fault executes 8 full linear scans over `self.mappings`**. Because `self.mappings` grows with every materialized extent (up to N ~ 40,000–100,000 items), the cumulative lookup work across the run is `8 * Sum_{i=1}^N i = 4 * N^2` comparisons.
 5. At N = 100,000, this requires **40 billion element comparisons**, burning ~27 s per 1M compilation (4 calls in `test_compiler_recursion_limit` = ~108 s total Carrick time vs ~2.0 s native).
 
-In commit `a1fd9ad94`, `partition_point` binary searches on `self.mappings` were reverted to full scans because `self.mappings` was not maintained sorted by start address across all insertion points (fork copies, extension arenas, and unmap split tails appended out-of-order). Restoring an always-sorted invariant on `self.mappings` by construction at every insertion site will reduce these searches from O(N) to O(log N), eliminating the quadratic bottleneck.
+In commit `eff1dc012`, `partition_point` binary searches on `self.mappings` were reverted to full scans because `self.mappings` was not maintained sorted by start address across all insertion points (fork copies, extension arenas, and unmap split tails appended out-of-order). Restoring an always-sorted invariant on `self.mappings` by construction at every insertion site will reduce these searches from O(N) to O(log N), eliminating the quadratic bottleneck.

@@ -1,6 +1,6 @@
 # Production descriptor conversion worklist
 
-Source review at alias-caller development on parent `ec366760f`. This worklist
+Source review at alias-caller development on parent `74bf206d5`. This worklist
 orders the known activation blockers; it does not replace final compiler-backed
 writer closure, rollback-path review or signed ownership acceptance.
 

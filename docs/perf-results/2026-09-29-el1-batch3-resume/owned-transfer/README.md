@@ -1,6 +1,6 @@
 # Owned host handback transfer
 
-Base `276793fb4`, branch `integ/batch3`. This is an unaccepted lifecycle
+Base `295efb88a`, branch `integ/batch3`. This is an unaccepted lifecycle
 checkpoint under controller A; steps 4-5 of the handback-publication plan
 remain open. No signed execution is claimed for this changed source.
 
@@ -46,9 +46,9 @@ request/cancel flag lifetime, sequence-wrap authentication, and exact
 scheduler handback wake targeting. Do not infer those are safe from the new
 producer token. No historical Python/otmp attribution, WorkObservation
 binding, fresh signed gate, complete batch acceptance or performance closure
-is claimed. The earlier signed receipt at 40a707ba0 belongs to older code.
+is claimed. The earlier signed receipt at 98621f69e belongs to older code.
 
-Implementation: `8c0ad1d34`; provenance refresh: `c90cc8a98`. All 595
+Implementation: `8dc1fd347`; provenance refresh: `736f0a2c5`. All 595
 authority identities were retained; one source position and two K1 line
 entries moved. Exact contract-change coverage passed. `just lint-domains`
 passed at the refreshed checkpoint; compiler authority remains the macOS

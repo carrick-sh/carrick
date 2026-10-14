@@ -1,6 +1,6 @@
 # Retired DTrace Scripts
 
-The following scripts were retired on **2026-09-10** (base commit `0ec4e75e9`) as part of the removal of the retired native/DSR translation execution lane:
+The following scripts were retired on **2026-09-10** (base commit `d5aaf7a9e`) as part of the removal of the retired native/DSR translation execution lane:
 
 - `dsr-profile.d`: DSR execution profiling
 - `dsr-indirect.d`: DSR indirect branch resolver tracing

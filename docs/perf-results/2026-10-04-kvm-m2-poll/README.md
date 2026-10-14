@@ -1,12 +1,12 @@
 # KVM M2 static musl startup regression
 
-The first bad commit is `0d3882d8501fe70ec744af3769708930efcb7dd9`,
+The first bad commit is `75d9e0252d09fb8d113d5d675dfc64730cb0805e`,
 `fix(x86): handle x86_64 poll(2) with its own ABI, not folded into ppoll`.
-Its parent `2cbd1e4a7b2b318359ef89344a76352a1982a311` passes twice;
-the culprit and main `b1167c6e19811c5b3a601d979cedca844656454f` fail twice.
+Its parent `dea44be07ff2820dea49f11d2092ba4e7e423e61` passes twice;
+the culprit and main `be61e5aed26c93e9c8a3fdcbe832300fcb038e32` fail twice.
 The automated [bisect log](bisect.log) covers the entire parent-to-main
 interval. Every runnable point was sampled twice, with no mixed outcomes.
-Two revisions (`ab0f14dd6`, `695142a7b`) could not compile the KVM crate
+Two revisions (`5284417fa`, `67eaf8a47`) could not compile the KVM crate
 and were skipped, not called good or bad. No Docker or copied binaries.
 
 The [bisect script](bisect-run.sh) builds the musl fixture in its own directory
@@ -73,7 +73,7 @@ full syscall conformance, or runtime-ratio claim is made.
 
 ## Verification
 
-- Clean fix parent `b1167c6e1`, rebuilt in the scratch worktree: M2 fails
+- Clean fix parent `be61e5aed`, rebuilt in the scratch worktree: M2 fails
   twice ([first](main-red-1.log), [second](main-red-2.log)).
 - Fixed worktree: M2 passes twice ([first](fix-green-1.log),
   [second](fix-green-2.log)); exact stdout, empty stderr, exit zero.

@@ -1,6 +1,6 @@
 # Metadata refusal: director review round 3
 
-The terminal review-2 candidate f27a3f644 passes all five prescribed host
+The terminal review-2 candidate 7eb7e2326 passes all five prescribed host
 commands independently. Actual authority refusal and same-instance recovery
 are now exercised. Acceptance is withheld for the remaining publication
 conversion that formats MetadataAllocation into a heap string, tests that

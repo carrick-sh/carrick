@@ -93,7 +93,7 @@ not the original concurrent LTP workload. Probe executable SHA-256:
 
 ## Scope and receipts
 
-Source HEAD: `9bb2392396b8531e93f5262657bf3aa9c5767488`, with the existing campaign
+Source HEAD: `6914b312cb07b7b72aeb99cc86a861f44bec704f`, with the existing campaign
 changes preserved. Source snapshots and frozen executables are under
 `target/lease-cost/context-borrow/` in this worktree.
 

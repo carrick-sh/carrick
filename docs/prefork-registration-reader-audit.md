@@ -113,6 +113,6 @@ uses the exact same validated production read. There is no test-only observer
 mutex, retry, sleep, expanded deadline or concurrency reduction.
 
 Baseline lint comparison: a detached scratch checkout of `origin/main`
-`9cbe10d75` passed `just lint-domains` (exit 0). This does **not** confirm the
+`46a221be8` passed `just lint-domains` (exit 0). This does **not** confirm the
 previous branch-runner matrix failures on main; no host-authority machinery
 was changed to explain or suppress them.

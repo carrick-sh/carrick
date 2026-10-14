@@ -4,7 +4,7 @@ This VM-free slice defines the carrier-wide single-flight transport needed
 before a host can give guest EL1 anonymous backing. It does not prepare a host
 mapping or install a guest stage-1 leaf.
 
-The red-first source base was `0bb342858`. `mailbox-red.log` records that no
+The red-first source base was `22ac511f5`. `mailbox-red.log` records that no
 frame-grant request, ready receipt, exact-MM claim or authenticated authority
 fields existed.
 

@@ -14,7 +14,7 @@
 
 **Spec:** [docs/superpowers/specs/2026-09-20-contract-driven-investigation-design.md](../specs/2026-09-20-contract-driven-investigation-design.md).
 
-**Inspected base:** `265d401ea87943c5493fc1764e209a7cbf91041a`.
+**Inspected base:** `4c51c085aa023288022d58cfaeb848d1b43e21e3`.
 **Status:** Approved implementation plan.
 
 ---

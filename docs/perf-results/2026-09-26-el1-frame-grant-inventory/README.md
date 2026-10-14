@@ -5,7 +5,7 @@ kernel-owned properties: an exact inventory/owner receipt with rollback before
 leaf publication, and a same-protection bulk semantic range clipped to one
 2 MiB window.
 
-The source base is `cc3647b4a`. `inventory-red.log` records the missing exact
+The source base is `d0a57e55f`. `inventory-red.log` records the missing exact
 apply and rollback endpoints. `grant-range-red.log` records the missing bulk
 resident-plan and whole-span commit endpoints.
 
@@ -30,7 +30,7 @@ Evidence retained here:
 - `clippy-green.log`: warning-denied Clippy passes for the four changed crates
   on the active platform;
 - `contract-green.log`: 62 contracts, 15 claims and 142 surfaces validate;
-- `contract-change-green.log`: the exact `cc3647b4a..3b1a110d4` product diff
+- `contract-change-green.log`: the exact `d0a57e55f..59e9592e4` product diff
   has stage-1-publication evidence, with a revision-bound exemption for the
   unchanged contracts that share the ABI, HAL and runtime source files;
 - `inventory-drift-green.log`: the generated syscall inventory remains current.

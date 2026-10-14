@@ -20,7 +20,7 @@ contract infrastructure. No new runtime dependency is proposed.
 
 **Spec:** [Research and design](../specs/2026-09-19-pluggable-scheduler-preemption-design.md).
 
-**Inspected base:** `e181864aa6c47a9df0681da433c548e46a72e771`.
+**Inspected base:** `4d6a0508b543c0e3059c193baf4e727546979d0f`.
 **Status:** Draft for owner review. No implementation or measured performance
 claim. Recheck the live tree at execution time; other work is active here.
 

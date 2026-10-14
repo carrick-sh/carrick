@@ -1,8 +1,8 @@
 # N1 fork integration and backing-maintenance gate
 
 Status: **not review-ready; signed gate RED**. Tested source:
-`e1435e4e06a83a57931f37cff46afbba8c23b7c2`, based on batch-5 main
-`51bfe67f4`. This receipt and the trace-header qualification are later
+`2812266df9912fa020469f786408a49233d85848`, based on batch-5 main
+`bb24853c2`. This receipt and the trace-header qualification are later
 non-executable changes; they do not claim a newly tested binary.
 
 ## Integrated work and host proof
@@ -13,7 +13,7 @@ the gate still named `a0d40fe78`. Recomputed the worker's inventory-only
 refreshes on the clean integrated tree. The Mac production trait bound needed
 qualification after the worker restricted its import to tests.
 
-`42e4070a4` implements typed pending-brk backing maintenance. The saved
+`c2b35faf5` implements typed pending-brk backing maintenance. The saved
 `pending_brk_scrub_must_not_wait_for_its_own_gate` witness first failed on
 ordinary UserWrite's own Gate at revision 2, then passed through the production
 owner-maintenance binding. Its two-live-MM case retains the peer's shared
@@ -27,7 +27,7 @@ Host verification:
 - 114 AArch64 lib tests, the two-MM owner-fork witness, 278 EL1 lib tests,
   134 EL1 ABI lib tests, and eight focused brk tests passed.
 - Clean-tree inventory reconciliation and all four runtime-abort shards passed.
-- Full `just ci` passed at `17f276152`, then again at `e1435e4e0`, including
+- Full `just ci` passed at `600b93204`, then again at `2812266df`, including
   rustdoc and integration. No inherited rustdoc waiver is used.
 - `just test-loom` passed all five tests (two fd-core, three terminal-clear).
   These existing models do not substitute for the new maintenance witness.
@@ -39,16 +39,16 @@ Host verification:
 ## Exact fixtures and signed artifacts
 
 Native Linux VM `carrick@10.14.14.66` published this exact source using
-`just fixtures-publish e1435e4e06a83a57931f37cff46afbba8c23b7c2` from the
+`just fixtures-publish 2812266df9912fa020469f786408a49233d85848` from the
 clean detached `/home/carrick/dev/wt-n1-fixpub`. Its temporary worktree was
 removed after copying and verifying the archive. No Docker was started.
 
-Bundle: `target/fixtures/published/e1435e4e06a83a57931f37cff46afbba8c23b7c2/d35300ad6e73a7644b109a743baa70af7f870691c4a69e435a38f66cce701370.tar.gz`.
+Bundle: `target/fixtures/published/2812266df9912fa020469f786408a49233d85848/d35300ad6e73a7644b109a743baa70af7f870691c4a69e435a38f66cce701370.tar.gz`.
 VM/Mac archive SHA-256 both:
 `0e90e6d3193a5860db44371daddf42d6e8d0cc53dc4914f998cba1834e0c81b0`.
 Restore verified **1,133 executables**, one durability flush.
 
-All evidence is retained in `target/n1g2/maintenance-e1435e4e0/`, including
+All evidence is retained in `target/n1g2/maintenance-2812266df/`, including
 `gate.sh`, `gate.log`, fixture manifest, image metadata/layer hash verification,
 raw outputs, exact D script, `SHA256SUMS`, and `cleanup-receipt.txt`.
 
@@ -79,7 +79,7 @@ Artifact hashes were checked before and after their runs; they did not change.
 Signed embed hello, CLI `/bin/sh -c 'echo hello world'`, and the entitlement
 negative control passed. All six comparison tests returned 101:
 
-| Test suffix (`el1_`) | Previous 77b7d5e71 failure | This artifact |
+| Test suffix (`el1_`) | Previous 083a815f7 failure | This artifact |
 |---|---|---|
 | `anonymous_reservations_stay_in_guest` | brk backing scrub abort | Guest reports `anonymous-reservations count=64 pages=160 mmaps=65 brks=2 ok=true`; teardown then refuses `clear-child-tid claim differs from its captured thread` |
 | `delegated_root_concurrent_vma_ops` | fork failed | Same guest fork failure |

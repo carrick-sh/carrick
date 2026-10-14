@@ -4,7 +4,7 @@
 
 # Inventory retirement audit: PR 1
 
-Authoritative section copied from `/home/carrick/dev/batch-tools/inventory-retirement-audit.md`, audited at `51bfe67f40f879c46ae506612c37e76f4867d5c7`.
+Authoritative section copied from `/home/carrick/dev/batch-tools/inventory-retirement-audit.md`, audited at `bb24853c2af78e63e4adb9c8d8d32a667333fba3`.
 
 ### PR 1 — remove positions and ambient inventory fingerprints from landing (M)
 
@@ -170,7 +170,7 @@ no existing ceiling was increased and no runtime behavior changed.
 
 The entire source file was identical at the accepted Round 7 head
 `2dc25b175` and actual base
-`8233b5488b92b406bce8bbe4ee495c0e09b166a5`; SHA-256
+`524162a5b33c55c0833e337af9e74bf13e57dba3`; SHA-256
 `6e366be31a1683d49333d250cec2afe744d8e4160823a7b977855c332955ef12`.
 This is an owned ratchet item. Reading `CARRICK_TRACE_TRAPS` in production
 runtime outside the LaunchContext boundary remains a defect for the
@@ -182,9 +182,9 @@ runtime design.
 
 The Rust production mask exposed a mistaken required-owner assertion for
 `with_sysv_process_mut`. History and blame confirm that no production lock
-responsibility disappeared: commit `9dad96736adcfb55443a0019709d95e9d9c07d35`
+responsibility disappeared: commit `0c3ff72cd048d68f3b040cb4e31b9f142663d667`
 introduced this helper already under built-in `#[cfg(test)]`.
-`f95c9d049989657912d8d2f3788cfb518633b654` moved the same discipline into
+`1b6ecc0bab57e3b15c70b7a5d65f91269a384904` moved the same discipline into
 `IpcView`; `c2228d660c` later required every helper spelling without excluding
 that test-only definition.
 
@@ -198,7 +198,7 @@ helper. No runtime code or ceiling changes accompany this contract correction.
 
 ## Rebase onto the shared-kernel main
 
-The initial schema-absent base is `8ebd6fe41`. Its one-time symbolic bootstrap
+The initial schema-absent base is `c4303f129`. Its one-time symbolic bootstrap
 records exact source and compiler cohorts in
 `scripts/migrate/authority-initial-base-counts.json`, with the full source commit
 and the four observed platforms. It contains no source locations or capture

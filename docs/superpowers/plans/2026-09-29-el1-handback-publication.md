@@ -2,7 +2,7 @@
 
 This is implementation detail for task A of the accepted EL1 completion
 controller, not a new goal or a reduced definition of completion. Source
-inspection starts at `26874b0b2`; the two host reds are retained in
+inspection starts at `dfcff84eb`; the two host reds are retained in
 `docs/perf-results/2026-09-29-el1-batch3-resume/host-publication/`.
 
 ## Invariant and evidence
@@ -82,7 +82,7 @@ as well; do not introduce another detached-but-publicly-owned state.
 
 Step 1 alone is a preparatory correction, not repair of the host red.
 Green scheduler-core/EL1 host tests do not replace signed proof. Existing
-signed receipts at `40a707ba0` belong to that source and cannot certify this
+signed receipts at `98621f69e` belong to that source and cannot certify this
 changed implementation. Full controller A and later B-E obligations remain.
 
 ## Implementation checkpoint after guest publication preparation
@@ -135,7 +135,7 @@ ZoneWait records; settle_vacated only re-places Service records. Audit those
 ownership classes separately before adding or claiming a universal read lease.
 
 
-## Re-park request boundary (red at fb265ba9b)
+## Re-park request boundary (red at 0e7540da2)
 
 The actual EL1 wait_word path can erase an admitted OnCpu host request:
 B parks after the request and is no longer current or queued at host exit.

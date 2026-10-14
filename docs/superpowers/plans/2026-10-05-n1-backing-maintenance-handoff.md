@@ -1,11 +1,11 @@
 # N1 pending-brk backing maintenance handoff
 
 Status: typed production correction implemented; fresh signed qualification pending.
-The tested source is `77b7d5e7151e142b95dacbca376aebbab607ced0`, on exact
-batch-5 main `51bfe67f4`. Do not rebase to batch 6 or integrate helper PRs
+The tested source is `083a815f71982075b22abae9416dba8e1e13f9d4`, on exact
+batch-5 main `bb24853c2`. Do not rebase to batch 6 or integrate helper PRs
 14/11/21/16 as part of this repair. The director approved this correction via
 mailbox on 2026-10-05. Fork/root arena repair is separately owned by `n1-fork`
-on `work/n1-fork`, based on `1dfba1500`; coordinate before editing those paths.
+on `work/n1-fork`, based on `064cfa0e7`; coordinate before editing those paths.
 
 ## Evidence and first reproduction
 
@@ -16,7 +16,7 @@ The anonymous fixture aborts at heap contraction after the partial-retirement
 residency repair gets it past its former SIGSEGV. Five fork/root cases still
 fail earlier than main's completing workloads. No review-ready verdict.
 
-Retained artifacts: `target/n1g2/batch5-77b7d5e71/`.
+Retained artifacts: `target/n1g2/batch5-083a815f7/`.
 `diagnostic/brkprogress.raw:1706-1708` names syscall 214, address
 `0x4000002000`, length 4096, then copyout PREPARE phase 4/detail 4 (Gate).
 `diagnostic/brk.log` reproduces the abort with one owner-bind control,
@@ -90,7 +90,7 @@ After the correction: focused VM-free tests, clean inventory reconciliation,
 full `just ci`, `just test-loom`, native Linux fixture publication, then a new
 signed artifact and the anonymous case plus exact 10/10 copyout and hello
 under one exclusive lease. Compare all six regressions by failure mode.
-Record new provenance and cleanup; the 77b7d5e71 receipts cannot transfer.
+Record new provenance and cleanup; the 083a815f7 receipts cannot transfer.
 Only post review-ready after the remaining functional regressions close.
 
 ## Implemented owner operation
@@ -119,7 +119,7 @@ claimed by these VM-free results.
 
 ## Signed checkpoint after integration
 
-The exact `e1435e4e0` gate is recorded in
+The exact `2812266df` gate is recorded in
 `docs/perf-results/2026-10-05-n1-maintenance-gate.md`. Full CI and five Loom
 tests passed. The anonymous guest now reports its complete zero/regrowth
 assertions `ok=true`, then fails at the separate captured-thread clear-child-tid

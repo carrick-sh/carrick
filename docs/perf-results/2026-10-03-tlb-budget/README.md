@@ -1,6 +1,6 @@
 # Required TLB invalidation fixture isolation
 
-Contract: `kernel.mm.tlb-maintenance-budget`. Base: `a257cdf9d`,
+Contract: `kernel.mm.tlb-maintenance-budget`. Base: `9a9dc7b80`,
 `work/tlb-budget`. No Docker was run. The minimum slope of 96 owed
 invalidations and the zero added host-maintenance budget are unchanged.
 

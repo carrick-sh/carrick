@@ -1,6 +1,6 @@
 # EL1 migration step 2: memory ownership completion
 
-Design pass, 2026-10-02. Source inspected: `4c4d06b4c345550da68b4b8cd44dfd8f6e53457b`.
+Design pass, 2026-10-02. Source inspected: `62ffec506218e9af76304e109dec4450fdbdda73`.
 This is a plan, not implementation or acceptance. Assume `work/s3-t3b`
 lands with anonymous reservations, capacity service and prepared-page
 retirement. Re-inventory its merged tree before implementation; do not

@@ -1,6 +1,6 @@
 # Memory foundation development integration
 
-Base: IPC integration 3e255ab20. Join elastic-return 8f268dee4 after source
+Base: IPC integration ee90427b5. Join elastic-return 391a43b3d after source
 review of physical receipt ownership, MM/carrier attribution, exact owner
 retirement, pooled backing lifetime, failure and reuse tests.
 
@@ -15,7 +15,7 @@ Verification: six el1_lifecycle_ tests, partial-discard peer-retention at
 check failed to generate macOS USDT; the same command with required host
 access passed. No signed execution or checkpoint acceptance is claimed.
 
-Next: review and join descriptor/COW c555f5dd1, resolve shared ABI/runtime
+Next: review and join descriptor/COW 2223dc53e, resolve shared ABI/runtime
 interfaces, then connect reservation ownership and remaining host writers.
 Guest descriptor activation remains guarded by copyout/backend conversion.
 Existing signed accounting consumers must adopt checked scope/completeness
@@ -23,7 +23,7 @@ and retained observers before claiming the new physical-return proof.
 
 ## Descriptor/COW foundation joined
 
-Join c555f5dd1 onto 3f8e349fc (the elastic-return merge). Review covered the
+Join 2223dc53e onto d38e8b3f9 (the elastic-return merge). Review covered the
 transaction/receipt identity boundary, slot admission/claim, rollback and
 TLBI obligations, ABI placement, MM lane admission, fork drain and COW
 continuation interfaces. This remains an unaccepted development integration;
@@ -46,7 +46,7 @@ or remove the host pause before these writers are converted.
 
 ## Carrier reservation provider connection
 
-Join reservation candidate f2efa3716 onto 8fc9513fd and connect its provider
+Join reservation candidate ecb74fefb onto 4e8fc8a0b and connect its provider
 to the persistent factory before worker admission. CarrierMetadataAccess
 retains the existing PersistentCarrierMappings and exact VM generation;
 dynamic extent resolution uses the existing exact-token resolver. Runtime
@@ -66,7 +66,7 @@ The signed first-touch regression is next. The reservation branch's earlier
 active-target fixture race, full source review, inventory reconciliation and
 full acceptance remain open.
 
-Signed first-touch regression passes on 96e912e6a, run
+Signed first-touch regression passes on c65f4331c, run
 el1-reservation-provider-20260929-a, at 256/1024/4096 pages with checked
 parent/child output. Exit counts are 99/106/136; incremental slopes
 0.0046/0.0049 exits per added page. The negative entitlement control passes;

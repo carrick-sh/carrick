@@ -5,8 +5,8 @@ to the production EL1 data-abort path. It is source and VM-free validation for
 the impact-bearing path; signed first-touch acceptance is deliberately not
 claimed here.
 
-Guest-transaction commit: `dae6f092c3a8eed2f574f93231d320edd6cc96b8`.
-Release-service fix: `afdf580392fd8244253b4a19c219e1f96d48885a`.
+Guest-transaction commit: `a974234c0a770b18ee69650b5cf95f5ff9085c08`.
+Release-service fix: `4652c5f9485ccc12afa1d7b44c11bcaa612369d7`.
 
 On the first recoverable translation or permission fault, EL1 publishes one
 carrier-wide request bound to the loaded task's exact MM, FAR, access class and
@@ -67,7 +67,7 @@ gate was run separately and passes.
 
 ## Open acceptance
 
-`afdf58039` fixes the release-only host service build by exposing the exact MM
+`4652c5f94` fixes the release-only host service build by exposing the exact MM
 identity through the existing borrow-bound permit in shipped configurations.
 The exact release CLI build passes; `artifact-identity.txt` records source HEAD,
 SHA-256, CDHash, LC_UUID, entitlement and DOF identity for that signed binary.
@@ -84,7 +84,7 @@ existing-invalid-leaf publisher to edit. The negative entitlement control and
 scoped cleanup passed.
 
 The diagnostic reruns contain uncommitted panic instrumentation and therefore
-are discovery evidence, not acceptance receipts for `afdf58039`. The previous
+are discovery evidence, not acceptance receipts for `4652c5f94`. The previous
 signed three-scale witness remains red at about 0.9954 host exits per page
 versus the `<0.125` contract, so no performance improvement is claimed.
 
@@ -134,7 +134,7 @@ assertion already documented by the host-service checkpoint; the new test and
 the affected production crate otherwise pass. A new exact signed artifact and
 256-page rerun remain the next acceptance step.
 
-The exact `4a939f00f` artifact is recorded in
+The exact `d52fd95ff` artifact is recorded in
 `stage2-write-artifact-identity.txt`, with signed build output in
 `stage2-write-signed-build.log`. The 256-page run
 `el1-stage2-table-write-first-touch-20260927` crossed the write-abort boundary:
@@ -148,7 +148,7 @@ first-touch receipt.
 `live-snapshot-cursor-red.log` reduces that exact failure to two serialized
 live editors over one backing. The guest editor allocates and links hierarchy
 beyond the host manager's cached prefix; the base snapshot returns no
-translation. `9d521e6be` makes snapshot discovery walk the reachable four-level
+translation. `9c3fd8b95` makes snapshot discovery walk the reachable four-level
 table graph against live physical capacity and extend the copied prefix only
 through the highest linked primary page. It does not scan or copy the whole
 1.75 MiB arena and adds no traversal allocation. The focused green receipt,
@@ -156,7 +156,7 @@ all 98 MMU tests, warning-denied MMU Clippy and the existing warmed recycled
 snapshot allocation witness pass in `live-snapshot-cursor-green.log`,
 `live-snapshot-mmu-tests.log` and `live-snapshot-clippy.log`.
 
-The exact signed `0a1c70a47` artifact is recorded in
+The exact signed `e74f00d7c` artifact is recorded in
 `live-snapshot-artifact-identity.txt`, with its build in
 `live-snapshot-signed-build.log`. The run
 `el1-live-snapshot-first-touch-20260927` reproduced the same pre-touch fork
@@ -168,14 +168,14 @@ leaf is intentionally invalid and retains the old identity output
 `0x6000001000`.
 
 `fork-invalid-alias-red.log` is the compile-red for the absent projection
-correction. `a6b32fe6b` repoints only an inherited dynamic private alias whose
+correction. `6c77556e5` repoints only an inherited dynamic private alias whose
 leaf is invalid and retains a superseded output. It preserves validity and all
 permission attributes, so fork does not make an untouched page accessible.
 The focused control, warning-denied HVF Clippy, formatting, and the prescribed
 serial HVF library suite pass; the suite reports 573 passed, three ignored and
 one already documented GIC source-shape assertion filtered.
 
-The frozen `58c76fdfd` artifact and exact in-process signed test executable are
+The frozen `98498f0b2` artifact and exact in-process signed test executable are
 attested in `fork-invalid-alias-artifact-identity.txt`; the build and run are
 in `fork-invalid-alias-signed-build.log` and
 `fork-invalid-alias-signed-first-touch.log`. The signed fixture now completes
@@ -232,7 +232,7 @@ The first signed acceptance execution after the slot-local correction reports:
 The incremental slopes are `(107 - 99) / 1536 = 0.0052` and
 `(113 - 107) / 6144 = 0.0010` host exits per added page. Both are far below the
 strict `<0.125` contract. This authoritative rerun names source
-`a44e510db6cf757c3a956e24bbd1b9e3d37a17b2` and signed test executable SHA-256
+`14c6dd4991cdbcead186db03fd432abd14d73d98` and signed test executable SHA-256
 `8604f89ef01daab89b9d9aad1cf461765463feef2064ad8dd893c7e30abf891f`, CDHash
 `5bb716f49f1ee11442d4ecba31905acb0105d411`, and LC_UUID
 `10BFE99A-AECB-353C-BB90-9B44A4671DD6`; the hypervisor entitlement and

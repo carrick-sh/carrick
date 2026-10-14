@@ -56,7 +56,7 @@ Logs remain in ignored `target/fes-load/reap-{red,green}.log` on cloudmac.
 
 ## Loaded controls on SSD
 
-The branch was rebased onto `github/main` `0250e7f2a834e8bd1b080780bd0f5b8e67bc30ad`.
+The branch was rebased onto `github/main` `a6399d675a1da127028a89947e0867598e6db44e`.
 Its signed CLI SHA-256 was
 `a9d95295fd8a689745a51e8679dd33ae7f990d5ec3ae3335ecefa2390905a3e6`;
 the signed shard-2 test executable SHA-256 was
@@ -113,7 +113,7 @@ remaining budget is zero. The fix adds no retry, sleep, timeout, concurrency
 reduction, or runtime path. Existing waits and workload sizes are unchanged.
 
 For fresh red evidence, only the helper's three-line deadline-first check
-from main `0250e7f2a` replaced the candidate comment; the witness remained.
+from main `a6399d675` replaced the candidate comment; the witness remained.
 The signed CLI and Linux musl test ELF were rebuilt locally, then run with
 `CARRICK_RUN_ID=fes2-witness-red` under the shared host lease:
 
@@ -225,7 +225,7 @@ its result explicitly leaves the Linux, FreeBSD and NetBSD profiles pending.
 CI passed the stages before `doc`, then failed on inherited unresolved links
 in `crates/carrick-mmu-core/src/aarch64.rs`: `[5:0]` at line 299,
 `publish_existing_invalid_private_pages` at lines 826/889/949, and `AP[1]`
-at line 1831. That file is unchanged from base main `0250e7f2a`.
+at line 1831. That file is unchanged from base main `a6399d675`.
 [PR #3](https://github.com/carrick-sh/carrick/pull/3) contains the rustdoc
 repairs; it was not folded into this probe-only investigation.
 

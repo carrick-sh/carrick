@@ -20,7 +20,7 @@
 
 Files: create `crates/carrick-kernel-example/tests/ptrace_wait.rs`; modify the process-wait branch of `crates/carrick-kernel/src/kernel/continuation.rs` and its owner accessor only if necessary.
 
-- [x] Drive PTRACE_ATTACH and actual wait dispatch through public backend/kernel APIs before stop settlement; prove continuation construction fails on source 1fa517693. Director verified four failures and two passing controls; test commit `6fcf9e831`.
+- [x] Drive PTRACE_ATTACH and actual wait dispatch through public backend/kernel APIs before stop settlement; prove continuation construction fails on source ec8c76a0c. Director verified four failures and two passing controls; test commit `426461005`.
 - [x] Cover sibling and ancestor/root tracees, wait4 and waitid; retain unrelated ECHILD and ordinary-child controls.
 - [x] Preserve the same scan-time precheck across stop-before-enrollment and stop-after-enrollment; assert the returned stop status and detach behavior.
 - [x] Fix the parent-only validation using exact tracer ownership; avoid numeric-ID relookup across authority snapshots. Review lifecycle race implications before accepting the implementation.
@@ -37,7 +37,7 @@ Files: create `crates/carrick-kernel-example/tests/ptrace_wait.rs`; modify the p
 
 ## Review checkpoint
 
-Integrated worker commits `6fcf9e831` and `c349748fa` into main. The director independently verified all 16 ptrace tests. The final worker also passed the normal partitioned kernel recipe with regular-file output. Stop-before-wait, stop-between-scan-and-enrollment, and stop-after-enrollment are covered for ancestor/root and sibling tracees across wait4 and waitid. Typed `StopKind` preserves provenance. The Unix credentials test now checks payload-to-sender correspondence without assuming child scheduling order.
+Integrated worker commits `426461005` and `facece618` into main. The director independently verified all 16 ptrace tests. The final worker also passed the normal partitioned kernel recipe with regular-file output. Stop-before-wait, stop-between-scan-and-enrollment, and stop-after-enrollment are covered for ancestor/root and sibling tracees across wait4 and waitid. Typed `StopKind` preserves provenance. The Unix credentials test now checks payload-to-sender correspondence without assuming child scheduling order.
 
 Worker console/resource failures and the earlier false sender-order assertion are preserved in `target/conformance/eco-ptrace-20260917/worker-final.jsonl`; passing retries were not accepted as their resolution. Independent unchanged-base and candidate kernel runs passed with complete regular-file output. Standing user authorization covers Antigravity use. Independent read-only review found no introduced defects. Full CI passed (5,507 passing executions, five existing ignores). The pinned signed artifact passed probes and fresh-oracle smoke; full closure completed red (1,263 MATCH / 864 INCOMPLETE), with complete row and run-ID populations. The live waitid reduction matches Docker and the predetermined ptrace sample is 9/10 original versus 10/10 corrected.
 

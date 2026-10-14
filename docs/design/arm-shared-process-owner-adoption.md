@@ -2,7 +2,7 @@
 
 **Rulebook authority:** [`AGENTS.md`](../../AGENTS.md)
 **Host facility authority:** [`docs/host-facility-boundary.md`](../../docs/host-facility-boundary.md)
-**Shared owner extraction:** `work/shared-process-owner` / [PR #121](https://github.com/carrick-sh/carrick/pull/121) (based on published main `510816e17`)
+**Shared owner extraction:** `work/shared-process-owner` / [PR #121](https://github.com/carrick-sh/carrick/pull/121) (based on published main `d2523f72b`)
 **Comparative reference branch:** `origin/work/n1-cm`
 **Classification:** ARM adoption design; the shared owner is carried by PR #121, while ARM activation and signed verification remain follow-ups. Symbol references below take precedence over the original branch line numbers.
 

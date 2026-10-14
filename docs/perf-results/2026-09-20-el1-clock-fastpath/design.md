@@ -1,7 +1,7 @@
 # Raw AArch64 clock_gettime without a host exit
 
 Status: implementation design, not executed proof. Reviewed against the current
-mailbox/vector and clock code after `567e88955`. No runtime source changes.
+mailbox/vector and clock code after `88427bae6`. No runtime source changes.
 
 ## Scope and expected benefit
 

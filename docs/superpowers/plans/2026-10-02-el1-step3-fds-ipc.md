@@ -1,6 +1,6 @@
 # EL1 migration step 3: descriptor and IPC ownership
 
-Design pass, 2026-10-02. Source inspected: `4c4d06b4c345550da68b4b8cd44dfd8f6e53457b`.
+Design pass, 2026-10-02. Source inspected: `62ffec506218e9af76304e109dec4450fdbdda73`.
 This document proposes implementation milestones; it claims no implementation
 or runtime acceptance. Only this document is changed by this design pass.
 

@@ -1,7 +1,7 @@
 # VM-free concurrent scenario testing
 
 Design plus a separate, non-product prototype; no runtime capability activated.
-Base `b148d69eb1135f55ab915ae6dff36c2d6c97576d`, x86_64 Linux Willow VM.
+Base `b4baca05c7adb1d058726f20d95142407b719428`, x86_64 Linux Willow VM.
 Paths below are repository-relative, anchors at that base unless qualified.
 Read [contracts](../../conformance-contracts.md), the
 [controller](2026-09-26-el1-completion.md),
@@ -153,7 +153,7 @@ No checkpoint, await_parked, sleep or bespoke barrier. Discovery starting at
 seed 0 finds **seed 5**; replay has 16 decisions. Child registration is ordered
 before OS spawn, so eligibility does not depend on thread arrival.
 
-On unchanged kernel `b148d69eb`, the focused test and replay fail with pid1/tid2
+On unchanged kernel `b4baca05c`, the focused test and replay fail with pid1/tid2
 `Unsupported(continuation build failed: failed to pin an exact fd description)`.
 On `c0b5cd424`, same seed/trace passes: 3 tasks, 6 dispatches, one read admission,
 zero redispatch/park, no read completion after group retirement. Fixed branch's
@@ -191,7 +191,7 @@ pools, reduced concurrency, synthetic short writes and blocking workers cannot
 close these contracts. Use real host-wait-handoff tests (`scheduler_handoff.rs`)
 as the initial kernel-only fixtures, then rerun through the extracted worker.
 
-**N1 collision fence:** inspected diff from `fda4e0350` to `8d5df2d2e` touches
+**N1 collision fence:** inspected diff from `ddd56dfd8` to `8d5df2d2e` touches
 runtime `vcpu_loop/{binding,lifecycle,memory,quiesce,reservations,signal,zone}.rs`,
 `executor/backend.rs`, `hvpatch/stage1_mm.rs`, runtime lib; kernel scheduler,
 MM occupancy/dispatch and EL1 owner/router/ABI; sched-core
@@ -268,7 +268,7 @@ semantic + complete structural observations; no ignored/inverted reds.
 - **Fence:** new test coordinator crate/module, kernel-example schedule/report
   plumbing, typed hooks at unlocked driver/birth/terminal seams; product
   release closure assertion and recipe. Remove prototype instrumentation.
-- **Red:** retained seed-5 fd-pin scenario on `b148d69eb`; wrong runnable-set,
+- **Red:** retained seed-5 fd-pin scenario on `b4baca05c`; wrong runnable-set,
   generation/fixture and trailing-trace mutation controls fail replay. Existing
   unscheduled semantics continue to run. This is real red #1, already shown.
 - **Accept:** `cargo test -p carrick-kernel-example --test schedule_replay`;

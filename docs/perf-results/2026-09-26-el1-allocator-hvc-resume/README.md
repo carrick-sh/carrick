@@ -1,6 +1,6 @@
 # Allocator grant completion: skipped guest instruction
 
-Signed source `bd604a876c05fbfe0c50e540c42c6504da92d452` passes the
+Signed source `4b56524cd6d493a1818e2058dc47bc1c7865f15d` passes the
 basic allocation phase and fails growth with rc=201. The negative entitlement
 control passes and original/debugger run scopes have zero remaining processes.
 Exact failed executable identity is in `identity.json`; no acceptance claimed.

@@ -1,4 +1,4 @@
-# Fixed workload acceptance on the e8db2fd51 artifact
+# Fixed workload acceptance on the 26079e466 artifact
 
 Python: two fixed rounds of eight suites passed, 16 unique round/suite rows.
 Every Carrick result is successful and its passed/failed/broken/skipped totals

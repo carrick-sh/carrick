@@ -564,7 +564,7 @@ stale request/physical generation, reused VA, and fork-shared physical pages
 must not authorize a scrub. Selection and cleanup scale with touched backing,
 not carrier-wide mappings; no lock spans host I/O or a scheduler wait.
 
-The signed red is `el1_anonymous_reservations_stay_in_guest` on `77b7d5e71`:
+The signed red is `el1_anonymous_reservations_stay_in_guest` on `083a815f7`:
 4 KiB heap contraction reaches PREPARE and receives its own Gate wait before
 aborting. A VM-free reproduction and its failing assertion are preserved in
 the 2026-10-05 backing-maintenance handoff. The typed production binding now

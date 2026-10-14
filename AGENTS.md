@@ -355,7 +355,7 @@ In Carrick, guest-visible correctness includes Linux semantics and non-pathologi
   on its timeout budget (300.3 s, 30.5 s) is a hang; its ratio is meaningless.
 - Data: [`docs/perf-results/overhead-campaign-narrative.md`](docs/perf-results/overhead-campaign-narrative.md)
   is **historical**: its figures (cold go-build 10.18x) measured the native
-  lane removed in `cc7d9eaa2`, and the `native-amplification` AMP1 profile
+  lane removed in `f9933c9da`, and the `native-amplification` AMP1 profile
   records nothing on HVPatch (no `native_syscall_service_entry` call site).
   Don't cite them; the paired HVPatch baseline is #357, the ledger port #356,
   and `hvpatch-exit-attribution` is the profile to measure with (#363).
@@ -459,7 +459,7 @@ In Carrick, guest-visible correctness includes Linux semantics and non-pathologi
   (`carrick_core::mm::retirement` today; `TerminalCustody` per #365).
   Backends apply verdicts and never re-derive eligibility: HVF re-deriving
   the pin-retirement predicate tripped
-  `personality_boundary::pin_retirement_has_one_neutral_owner` (`902cabbe8`).
+  `personality_boundary::pin_retirement_has_one_neutral_owner` (`668cbe01f`).
 
 ### No shortcuts, no second paths, no dark launches
 
@@ -633,9 +633,19 @@ Chat, worker mailboxes, scratch notes and agent memory are not.
   - **What** — approach and any candid divergence from Linux;
   - **Verified** — probe/test/LTP case/oracle diff; name red-first probes;
   - `-` bullets for distinct parts; backtick symbols/paths.
-- **Trailer:** `Co-Authored-By:` naming the agent that wrote the change, after
-  a blank line, in the form its tool documents. Rewording another agent's
-  commits: PRESERVE the author.
+- **Trailer:** one `Co-Authored-By: <Name> <email>` line per agent that wrote
+  the change, after a blank line, spelled exactly `Co-Authored-By`. The name
+  is the agent as its tool identifies it (model detail welcome, e.g.
+  `Claude Opus 5.5`, `GPT-6.1 Sol`, `Gemini 4 Argon`). The email is the
+  vendor's single noreply address, never anything else:
+  `noreply@anthropic.com` (Claude), `noreply@openai.com` (Codex, GPT),
+  `noreply@google.com` (Gemini, Antigravity). Human co-authors use their own
+  address. Rewording another agent's commits: PRESERVE the author.
+- **History rewrite, 2026-10-14:** every commit was rewritten once to
+  normalize these trailers (trees unchanged). The old-to-new SHA map is on
+  branch `history/coauthor-rewrite-2026-10-14`. Old SHAs quoted in markdown
+  were remapped; those in code comments, D scripts and evidence files were
+  left as historical provenance, so resolve them through the map.
 - **Fix forward:** repair a bad landing with a follow-up commit; never
   `git revert` or reset main. Delete measured-worse code in a
   commit that cites the measurement.

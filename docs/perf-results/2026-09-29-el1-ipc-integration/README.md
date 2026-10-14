@@ -1,6 +1,6 @@
 # IPC development integration (unaccepted)
 
-Join adapter b0313df83 with host 77b6f40a1. The merge is development work,
+Join adapter 330088ab7 with host 1d864b880. The merge is development work,
 not checkpoint acceptance or a merge to main. The adapter alone and joined
 runtime compile checks passed. The existing host blocking-eventfd witness
 initially failed with EAGAIN when an owned continuation was required; that red is retained below.
@@ -241,7 +241,7 @@ passed 138/138. No guest execution was concurrent. Affected ABI/kernel/runtime/
 embed Clippy passed before the final test-only O_RDWR expectation correction.
 
 
-The first signed routing run on 5cc3b64a6 completed correct data transfers but
+The first signed routing run on 08bedad0f completed correct data transfers but
 failed: served read=6/write=0, forwarded read=2052/write=2049. Entitlement
 negative control passed; both scoped cleanup populations were zero. The
 runner did not publish its failed manifest, so the still-unchanged failing
@@ -262,7 +262,7 @@ removed. The same signed witness must now prove this correction.
 
 ### First live routing milestone (not vertical acceptance)
 
-On clean source e6e2ab3bf, the unchanged signed witness passes: 1,024 pipe
+On clean source 0254e5cb7, the unchanged signed witness passes: 1,024 pipe
 round trips plus 1,024 eventfd round trips return exact bytes/values. Actual
 whole-run EL1 counters report served read=2054/write=2048, forwarded
 read=4/write=1. The prior artifact reported forwarded read=2052/write=2049
@@ -288,7 +288,7 @@ The first signed two-thread pipe-pingpong check passed, including an assertion
 of at least 256 real EL1 parks and EL1-served reads/writes across 256 measured
 rounds plus the existing warmup. Entitlement negative control and scoped
 cleanup passed. This initial development run used an uncommitted test on
-ab5ec3e1d; the manifest does not capture that test delta, so retain it as a
+4481351fa; the manifest does not capture that test delta, so retain it as a
 diagnostic result, not promotion evidence. Tested bytes were preserved in
 target/el1-ipc-blocking-initial before any signed rebuild.
 
@@ -301,7 +301,7 @@ an execution observation. Scoped zero-exit, two-process, descriptor reuse,
 signal/partial-progress and full vertical acceptance remain open.
 
 
-The first committed scale run (9055c465b) passed pipe N=1, with 258 actual
+The first committed scale run (aec251a4d) passed pipe N=1, with 258 actual
 EL1 parks. Pipe N=8 completed all 1,024 checked round trips with 2,056 EL1
 parks, but only 2,047 of 2,048 writes were served in guest (one data write
 forwarded, plus the output write). Its strict whole-run served-write assertion
@@ -313,11 +313,11 @@ lock contention, pending host work and phase boundaries remain hypotheses
 for the forwarding; no root-cause or scoped zero-exit claim is made.
 
 Unrelated rustfmt churn in the standalone fixture main file was removed,
-leaving only the intended module/mode additions relative to ab5ec3e1d.
+leaving only the intended module/mode additions relative to 4481351fa.
 
 ## Blocking population: capability demonstrated, acceptance still open
 
-Signed source `c1c17d963`, run `el1-ipc-pairs-20260929-b`, completed all
+Signed source `a9d095252`, run `el1-ipc-pairs-20260929-b`, completed all
 six pipe/eventfd populations at 1/8/64 pairs and 128 rounds. Each population
 checked payload identity and completed 128/1024/8192 round trips. Real EL1
 parks were pipe 258/2065/16514 and eventfd 258/2061/16512. The entitlement
@@ -340,7 +340,7 @@ attribution bounded and separate from independent capability development.
 
 ## Two-process inherited IPC: first signed execution is red
 
-Source `15021dfb8`, run `el1-ipc-processes-20260929-a`: pipe one-pair
+Source `58cf1d47e`, run `el1-ipc-processes-20260929-a`: pipe one-pair
 completed 128 checked round trips with 257 guest parks. Pipe eight-pair
 hit the unchanged 60-second watchdog. The census shows four idle-WFI slots
 and parked tasks spanning both address spaces. It also reports one lost
@@ -357,7 +357,7 @@ using existing scheduler/IPC contracts; no new diagnostic framework.
 
 ## Unplaceable guest wake correction, remaining eventfd failure
 
-`8c9617950` removes a proved ownership gap: object readiness could leave
+`bb1adc3e7` removes a proved ownership gap: object readiness could leave
 an unplaceable waiter parked with only a pending-host flag and no specific
 delivery owner. The existing scheduler fallback instead queues its owned
 operation and requests misplaced handback. The deterministic regression
@@ -379,7 +379,7 @@ Do not rerun until green or assume the first correction explains this state.
 
 ## Existing post-mortem capture narrows remaining eventfd stall
 
-One diagnostic execution of the preserved `8c9617950` binary, without
+One diagnostic execution of the preserved `bb1adc3e7` binary, without
 rebuild/re-signing, enables `CARRICK_POSTMORTEM_DIR`. Run
 `el1-ipc-processes-capture-20260929` stalls at eventfd8 after pipe1/8/64
 and eventfd1 complete. This is timing-dependent, not limited to eventfd64.

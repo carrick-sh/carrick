@@ -1,6 +1,6 @@
 # cpython-compile: the fault count is linear, not super-linear
 
-**Recorded 2026-09-08.** Base revision `251ab7b4f` (branch
+**Recorded 2026-09-08.** Base revision `1406d4a53` (branch
 `opus/opus-compile-faults-sep08`). Binary
 `26b9db0c046aeb6d3407f4593f0dbe10d023c6226af22b7bcc78e690e184a3ab`
 (pre-change control:
@@ -209,7 +209,7 @@ peak of 63).
 | 11.75 → 10.93 | 1 | 16.16x (43,273 ms) | 4.57x | 3.85x |
 | 10.93 → 10.85 | 4 | 16.26x (43,523 ms) | 5.55x | 4.43x |
 
-For reference the campaign's recorded quiet receipt on `65b3c791c` was 6.41x
+For reference the campaign's recorded quiet receipt on `69efe1a74` was 6.41x
 at load 4.5-5.3. The 7.54x above is the same row one load band higher, not a
 regression: the controlled comparison is the interleaved one below, which
 holds the load window constant.
@@ -217,7 +217,7 @@ holds the load window constant.
 **Interleaved control, `cpython-compile` at `--workers 1`, alternating
 binaries in one window (load 17-22):**
 
-| pair | before `251ab7b4f` | after |
+| pair | before `1406d4a53` | after |
 |---:|---:|---:|
 | 1 | 55,948 ms (20.90x) | 53,271 ms (19.90x) |
 | 2 | 43,409 ms (16.22x) | 49,272 ms (18.41x) |

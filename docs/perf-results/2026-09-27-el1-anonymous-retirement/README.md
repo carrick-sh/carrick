@@ -1,7 +1,7 @@
 # EL1 anonymous retirement acceptance
 
 This directory binds the `kernel.el1.anonymous-retirement` contract to source
-commit `8b1af0a1963a339e9f8182ab429362543509a021`. The checkpoint makes fixed
+commit `e114c9c567ee5d610124a70bb133f10d83a12efd`. The checkpoint makes fixed
 anonymous replacement retire its previous physical frame grants, return those
 grants to the global inventory, safely reuse them, and rearm first touch without
 page-granular host work.
@@ -54,7 +54,7 @@ passes with the complete-table publication.
   reports zero-fill, write/read verification, unmap/replacement, the structural
   slopes above, a passing unentitled negative control, and zero scoped Carrick
   processes after cleanup.
-- `signed-artifacts.jsonl` binds that execution to source commit `8b1af0a19`,
+- `signed-artifacts.jsonl` binds that execution to source commit `e114c9c56`,
   executable SHA-256 `38605328eb2bb6292072b2408b973bc5cefdade585ad98b658aa3ba96e369fae`,
   CDHash `4ee9d2e9acfacefbda26018335414fccb8982488`, LC_UUID
   `0EC8C4FC-EFF3-38DD-A031-5E5B074D27DE`, the hypervisor entitlement, and the

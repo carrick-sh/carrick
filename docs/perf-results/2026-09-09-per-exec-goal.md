@@ -3,7 +3,7 @@
 ## Scoped goal accepted — 2026-09-09
 
 The pinned normal Python-spawn goal is satisfied on committed source
-`4a67db3403d69f2b6abdf179b40af22800e4cc89`. Two predeclared, untraced serial
+`7cf1d8b731d9591c18c9f6f1e953ba69c2fba48a`. Two predeclared, untraced serial
 Docker/base/candidate/candidate/base/Docker screens yielded **1.921574x** and
 **1.976005x**; combining all arms gives **9.317571 ms / 4.782080 ms = 1.948435x**.
 Each arm uses five 50-spawn batches after five warmups; statistics are means
@@ -62,7 +62,7 @@ hypotheses and earlier open-state notes; this acceptance supersedes their
 historical status statements. All work is on local main; nothing was pushed.
 
 
-Measured 2026-09-09 on main e7db055ae; no runtime changes. The signed binary SHA-256 is afccec0cc339993c1ac265a3e6bf9c4c609f16da4d07150247a90201ab10d953, identical to the latest campaign receipt at 62c63d979; intervening changes are documentation only. LC_UUID 21E916E9-C9CD-3A7B-A0AB-9AB490809A71; hypervisor entitlement and __dof_carrick verified.
+Measured 2026-09-09 on main 0edfe588d; no runtime changes. The signed binary SHA-256 is afccec0cc339993c1ac265a3e6bf9c4c609f16da4d07150247a90201ab10d953, identical to the latest campaign receipt at 2fb09a429; intervening changes are documentation only. LC_UUID 21E916E9-C9CD-3A7B-A0AB-9AB490809A71; hypervisor entitlement and __dof_carrick verified.
 
 ## Baseline
 
@@ -114,7 +114,7 @@ Checkpoint validation: `just test` and `just clippy` exited zero. The serial run
 
 ## Next diagnostic checkpoint: mmap faults dominate the event population
 
-The first implementation is committed as `e1ce4909c`.
+The first implementation is committed as `0ebb7214f`.
 
 A same-binary ABBA of the existing `CARRICK_FAULT_WINDOW_BYTES` control (64 KiB vs 256 KiB) found no improvement. Ordinary Python averaged 13.563 ms at 64 KiB and 13.710 ms at 256 KiB; Python -S was 12.159 vs 12.499 ms. No default was changed. Evidence: `window-abba.json` and `measure-window.py`.
 
@@ -545,14 +545,14 @@ No invalidation implementation has been changed yet.
 
 The final serial runtime suite completed with 2,577 passed, zero failures and
 two ignored (`dirent-runtime-final.log`). The dirent change is committed as
-`747876a48`; its last source adjustment only corrected the moved reader's
+`029cb4d42`; its last source adjustment only corrected the moved reader's
 pre-existing misleading dup/offset comments. The code and tests remain the
 validated implementation. Line-pinned inventories and final integrated artifact
 receipts remain pending; this commit is not <=2x acceptance.
 
 ### COW invalidation experiment in implementation
 
-Inventory positions were reconciled and reviewed in `dc089daab`; the following
+Inventory positions were reconciled and reviewed in `a2d4dab5a`; the following
 `just lint-domains` passed (`dirent-lint-domains.log`). That closes the dirent
 inventory follow-up, not the final goal's future integrated-artifact gate.
 
@@ -668,7 +668,7 @@ Receipts under `target/perf/exec-overhead-20260909/`:
 `cow-pack-validated.json` validates the original capture, whose script is saved
 as `cow-pack-original.d`; `cow-pack-repeat-analysis.json` validates the revised
 script capture `cow-pack-validated.raw/.out/.err`.
-`cow-pack-validated-provenance.json` binds source HEAD `3129c5099`, script,
+`cow-pack-validated-provenance.json` binds source HEAD `e21041ce4`, script,
 command and binary SHA-256
 `e33490c116541179fbf30c02d7253144ab0c54bc6bb692b0ff5c6eb9e951af24`.
 The scoped process check found no remaining run command. The parent maps name
@@ -878,7 +878,7 @@ The full <=2x goal remains active.
 
 ### Accepted packing checkpoint and refreshed ranking
 
-Code commit `486a4305f` and inventory commit `7a0ee177c` are local only.
+Code commit `917fede2a` and inventory commit `800b5efb5` are local only.
 Inventory reconciliation changed positions/capture bindings only (31 host
 sites, one abort fingerprint); reviewed memberships and rationale text remain
 unchanged. `just lint-domains` passed (`pack-lint-domains.log`). Its host-authority
@@ -1047,7 +1047,7 @@ closure is not claimed until that check passes. No push is authorized or made.
 
 ### Entropy inventory closure and next attribution
 
-The entropy code is committed as `9c4002871`. Host PID use is explicitly
+The entropy code is committed as `f37320326`. Host PID use is explicitly
 reviewed as `HA-000649`: current-host identity invalidates inherited entropy
 only. The first domain retry caught noncanonical ordering of the appended
 review row; the next caught shifted K1 inventory positions with unchanged
@@ -1257,8 +1257,8 @@ mandatory. No immutable-view optimization has been implemented at this point.
 
 ### Stack closure and immutable-view qualification blocker
 
-The stack implementation is committed as `0809c1f91`. Source-location-only
-inventory reconciliation is committed as `6889e6e4a`: 16 positions and their
+The stack implementation is committed as `cc5af7b83`. Source-location-only
+inventory reconciliation is committed as `f90c1332b`: 16 positions and their
 rationale line references changed, with unchanged operation counts and
 classifications (`stack-tail-inventory-diff-check.json`). The complete
 `just lint-domains` passes (`stack-tail-lint-domains-reconciled.log`), retaining
@@ -1515,8 +1515,8 @@ performance verification will qualify the final committed artifact.
 
 ### Committed final gate and fresh timing: progress, threshold still missed
 
-Source commits 54687b2a9 (private file discard correctness), 17e1e956f
-(immutable view COW optimization), and 49e28af35 (reviewed inventory rebinding)
+Source commits 0efca1f5d (private file discard correctness), a78eb2354
+(immutable view COW optimization), and b27a0502b (reviewed inventory rebinding)
 are now recorded. The inventory reconciliation changes positions/fingerprints,
 not classifications or counts; just lint-domains passes. The fresh complete
 just conformance-probes invocation exits 0 (private-file-public-final.log and
@@ -1524,7 +1524,7 @@ private-file-public-final-result.json), including the retained phase's 46
 passed / one ignored. The earlier SIGCHLD failure remains intermittent and
 unattributed; this successful rerun does not erase it.
 
-The final signed CLI was copied after that gate, at source 49e28af35, with SHA
+The final signed CLI was copied after that gate, at source b27a0502b, with SHA
 5b92fb39c71f925f1c705c9b455683d371fa29ce048546922f24699fbd705ad8 and UUID
 78E249A1-61EE-386E-B59E-A72A959B13AF. Full signature, entitlement, DOF and
 clean source patch provenance is private-file-aperture-gated-provenance.json.
@@ -1754,8 +1754,8 @@ before `sparse_materialization::publish` reserves inventory and prepares host
 backing. Merely preparing mmap earlier would close this injection point but
 not the later inventory/page-table failure cases. The replacement transaction
 must retain recoverable old ownership through all fallible publication stages;
-whole rollback remains an explicit open gate. Local HEAD is main at 49e28af35,
-and 0809c1f91 is verified its ancestor. Current boot correction and diagnostics
+whole rollback remains an explicit open gate. Local HEAD is main at b27a0502b,
+and cc5af7b83 is verified its ancestor. Current boot correction and diagnostics
 remain uncommitted; no push or unrelated branch integration was performed.
 
 ### Replacement transaction audit and second failure class
@@ -1876,9 +1876,9 @@ commits now; inventories, full public gate and final timings remain outstanding.
 
 ### Committed-source inventory review
 
-Main is now 600c5abcd after separate boot-discard (557f1c4c0), replacement
-transaction (c97335657), diagnostics (b143ec66e), and evidence commits. Verified
-clean tracked tree and linear ancestry from 49e28af35, with no push.
+Main is now 8fa02708e after separate boot-discard (9a44f1ef0), replacement
+transaction (5f9be29ec), diagnostics (aa2d3f6c6), and evidence commits. Verified
+clean tracked tree and linear ancestry from b27a0502b, with no push.
 
 The inventory reconciler captured this committed source and rebound 28 host
 authority rows, 18 dispatch lock rows and 24 K1 taxonomy positions. It correctly

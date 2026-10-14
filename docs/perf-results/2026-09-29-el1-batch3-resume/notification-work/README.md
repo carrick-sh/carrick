@@ -23,7 +23,7 @@ release ordering and zero reaped-wake rejections remain mandatory. That initial 
 
 ## Correction after the first signed observation
 
-Signed source 44b2834c1 preserved capture/reap/release ordering and reported
+Signed source 7b1576b66 preserved capture/reap/release ordering and reported
 exactly two thread visits, but two scheduler calls exceeded the proposed
 limit of one. `signed-budget-red.log` retains that failure; the exact failed
 executable and identity are retained separately. Negative entitlement and
@@ -47,7 +47,7 @@ control reports one visit/attempt/delivery and one queue row; retired tests
 at 1/8/32 report N visits, zero attempts and zero deliveries. Extra visits,
 attempts or deliveries are each rejected. Corrected observations, affected
 Clippy, meter tests and registry checks pass. Signed qualification of this
-corrected distinction passed on source `9ba825eacc0a919aa57ba4d0d5ea9497865f4996`:
+corrected distinction passed on source `3e7e2bb669563e55bc6b5e27e923055d14cb5f0a`:
 exactly two visits, two authentication attempts and one delivered wake, with
 complete observations (zero dropped events, no unknown metrics). The exact
 capture/reap/release semantics and all excess-work controls passed.

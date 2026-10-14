@@ -1,6 +1,6 @@
 # Production COW backing transaction: development integration
 
-Parent adapter source: `9b0047959`. Contract: `kernel.el1.stage1-publication`.
+Parent adapter source: `584f1d8ac`. Contract: `kernel.el1.stage1-publication`.
 This joins the real `HvfTaskState::perform_frame_cow` caller to EL1 descriptor
 submission through its driving vCPU. No production activation or signed COW
 acceptance is claimed. The source still refuses unconverted writer shapes.

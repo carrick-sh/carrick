@@ -1,6 +1,6 @@
 # Signed concurrent allocator witness
 
-Source 8fc9c913a (full revision in identity.json). Both allocator tests pass
+Source fceb5ce82 (full revision in identity.json). Both allocator tests pass
 on one exact signed executable. Negative entitlement control passes; original
 and CLI run scopes both have zero remaining processes. Artifacts are frozen
 at the paths in identity.json, including the exact Linux fixture.

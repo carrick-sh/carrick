@@ -222,9 +222,9 @@ runs this crate serially for exactly that documented reason.)
 
 # Reproduced on the rebased artifact
 
-**Recorded 2026-09-08.** The branch was rebased onto main `2f3e0288b` (17
+**Recorded 2026-09-08.** The branch was rebased onto main `b2bcfe57d` (17
 commits), and every receipt above was re-taken on the resulting signed binary
-`d153103e8d433d38` at `43d0b7d61` so that one artifact carries the whole
+`d153103e8d433d38` at `5bcc99762` so that one artifact carries the whole
 result. Host load 9.2-20.6 throughout.
 
 The rebase conflicted only on the position-only inventory reconcile, which was
@@ -272,6 +272,6 @@ none of this change — aborted in 2 of 2 runs where the fix aborted in 3 of 5, 
 the `carrick_runtime::kernel::scheduler` "lost exact transition" abort is main's
 and is if anything less frequent here.
 
-**Gates on `43d0b7d61`:** `just fmt-check` 0, `just clippy` 0,
+**Gates on `5bcc99762`:** `just fmt-check` 0, `just clippy` 0,
 `just lint-domains` 0, `just doc` 0, `just test` 0, `just build` signed
 (`d153103e8d433d38`, hypervisor entitlement and `__dof_carrick` present).

@@ -56,14 +56,14 @@ historical. Current state, from signed and host evidence on main:
   the carrier ledger records selected/deferred/refused-by-reason and the
   fork-COW witness prints them.
 
-**Status 2026-09-30 (main `fb9a5e038`):**
+**Status 2026-09-30 (main `2b6901bc8`):**
 
 - **Delegated anonymous root (S1b/S1c/S1d landed):** on a delegated MM the
   EL1 root owns anonymous private mmap/munmap/mprotect/mremap placement,
   madvise flags and mlock; `/proc` maps merge root and host rows once;
   first-touch planning and mincore read the root (`FirstTouchOwner`).
   Delegation is still admitted only by the conformance fixture.
-- **Guest COW settlement fixed (`618be9af2`):** completions settle into the
+- **Guest COW settlement fixed (`b8ed60a7f`):** completions settle into the
   custody-registered MM state; fork planning and host frame COW fail
   closed on unsettled completions. Forced admission: fork-COW data correct,
   settled == resolved.
@@ -133,9 +133,9 @@ and incorporated foundations; preserve older unfinished branches separately.
 This overrides the earlier restriction against landing unaccepted intermediate
 work for this consolidation only. It does not confer checkpoint acceptance.
 
-The integration combines adapter `0c8204e11` (including sparse publication and
+The integration combines adapter `d09a3d03f` (including sparse publication and
 an isolated signed descriptor-service test) with controller/lifecycle
-`66b1a21d4`. Merge reconciliation retains incarnation-authenticated handback
+`37c76a1c8`. Merge reconciliation retains incarnation-authenticated handback
 and IPC endpoint cleanup together; IPC wake callbacks carry the captured
 RecordRef. Full production admission remains disabled. The stopping receipt
 records final source/gate identities and exclusions. On successful consolidation,
@@ -145,7 +145,7 @@ pause the goal and monitor; resume from main's controller when requested.
 
 ### Current work order after user-requested effectiveness review
 
-**Observed state:** adapter HEAD is `cdb5abd64`. Local sparse replacement is
+**Observed state:** adapter HEAD is `e16ca9cf9`. Local sparse replacement is
 also implemented in an uncommitted five-file change with retained red/green
 model, compile, Clippy and image-build logs. Preserve that work; do not restart
 it. Production admission still has `host_copyout=false` and
@@ -221,7 +221,7 @@ preserve evidence; their older “next” statements are not competing work orde
 
 **Diagnosis:** development has accumulated useful foundations and regression
 receipts faster than it has activated production ownership. On adapter source
-`a5ca5ed03` after the copyout conversion, guest descriptor admission still has
+`171f8aa64` after the copyout conversion, guest descriptor admission still has
 `host_copyout=false` and `backend_writers=false`; anonymous reservation dispatch
 has only test callers. A passing helper or ordinary boot test cannot demonstrate
 that either disabled path executes. The controller itself compounded drift by
@@ -245,7 +245,7 @@ Steps 2 and 3 may interleave where an exact dependency requires it. Do not flip
 admission booleans to bypass an unconverted writer. File/shared mapping and
 host-boundary semantics remain part of the conversion review.
 
-**Completed prerequisite:** copyout is committed in adapter `a5ca5ed03`.
+**Completed prerequisite:** copyout is committed in adapter `171f8aa64`.
 The engine's prepared-copyout caller now uses the shared fork/EL1 descriptor
 drain; the runtime retains exact-MM exclusion and kernel residency commits
 only after an exact Publish/Write receipt. Retained model red/green, 11 runtime
@@ -255,7 +255,7 @@ MM/page/read receipts preserve arming. See adapter memory-integration
 `copyout.md` and raw logs. Production admission remains disabled; no signed
 activation or checkpoint acceptance is claimed. Do not restart this slice.
 
-**Guest copy transport prerequisite:** adapter `9b0047959` now reserves two
+**Guest copy transport prerequisite:** adapter `584f1d8ac` now reserves two
 invalid kernel-only aliases at EL1 offsets `[0x1A0000,0x1A2000)` and the hardware
 descriptor handler uses them to copy a page before CowRepoint. Both aliases are
 revoked before completion; failed revocation is fatal. This reuses the descriptor
@@ -264,7 +264,7 @@ four window tests (including two roots), EL1/ABI/memory/MMU suites, affected
 Clippy and hardware EL1 image build pass. See adapter `cow-window.md`. No signed
 COW execution or production host submission is claimed.
 
-**Production COW caller joined (development):** adapter `bda5f4cb0` routes
+**Production COW caller joined (development):** adapter `2841f3b96` routes
 `HvfTaskState::perform_frame_cow` through the driving vCPU and the existing EL1
 descriptor service. The host retains the source owner and publishes a provisional
 replacement grant; one compound receipt precedes the existing inventory split.
@@ -275,7 +275,7 @@ runtime continuation/backing gate is removed. MMU 159, backend 11, runtime 10,
 affected Clippy, formatting and EL1 image build pass. See `cow-join.md` and logs.
 Admission remains disabled; no signed COW execution or checkpoint acceptance.
 
-**Private-anonymous mixed permissions:** adapter `1b121731c` fixes the next
+**Private-anonymous mixed permissions:** adapter `d05a834ad` fixes the next
 production transaction restriction. The red four-page witness was refused with
 PermissionDenied; it now preserves RW/read-only/PROT_NONE/prepared states while
 repointing the compound. The guest backend no longer refuses merely read-only
@@ -283,7 +283,7 @@ source metadata. MMU 160, EL1 114 and affected all-target Clippy pass. See
 `cow-permissions-*` receipts. This is executor/model evidence; admission remains
 disabled and successful real-authority COW execution is still unproven.
 
-**Local COW shape conversion (development):** adapter `09afdd4c5` routes
+**Local COW shape conversion (development):** adapter `5fa080078` routes
 kernel-only, legacy user, maintenance and private-file reuse through the existing
 compound EL1 transaction. Protocol v4 carries typed access authority; tagged
 private permissions remain EL1-owned. Maintenance retains the exact completion
@@ -329,8 +329,8 @@ followed by final ARM64 qualification. Earlier IPC/lifecycle failures stay open;
 resume their investigation only for a new discriminating test or a concrete
 dependency. No new broad capture campaign. x86 remains deferred.
 
-Current accepted base remains local main `f304f8415`; development integration is
-adapter `09afdd4c5` (clean development commit).
+Current accepted base remains local main `7fd243eb1`; development integration is
+adapter `5fa080078` (clean development commit).
 No checkpoint has been accepted by this work.
 
 **Execution correction after the renewed rabbit-hole warning:** keep one active
@@ -360,11 +360,11 @@ the connected production milestone; existing final acceptance gates remain intac
 ## Historical state and evidence rules
 
 At refresh, the implementation baseline on local `main` and local
-remote-tracking `origin/main` is `a70b40466`. The documentation commit for
+remote-tracking `origin/main` is `b2e683ca5`. The documentation commit for
 this refresh advances local main only; no remote fetch was performed.
 Batch 3 is on `integ/batch3`, unlanded. Its scheduler correction is
-`a2c0fcee3`, following the atomic re-park correction `0e1d7c12c` and exact
-zone handback targeting `da84671b7`. The latter has a deterministic red-first
+`aee40f93e`, following the atomic re-park correction `0182e255b` and exact
+zone handback targeting `84d77d27d`. The latter has a deterministic red-first
 reaped-child witness, continuation authentication and pre-enrollment kick
 controls. Direct adoption reserves ownership before publishing readiness.
 Final kernel/semantics 2,462 (one existing ignore), three focused controls
@@ -372,15 +372,15 @@ and affected Clippy passed. Serial kernel 109 and runtime 630 passed before
 the ordering-only follow-up. Registry, clean-source lint and exact contract
 coverage passed; the 595-row authority census remains macOS-only.
 
-Fresh signed source `257de53e0` passed 49 unique positive EL1 executions
+Fresh signed source `1cbcda5b0` passed 49 unique positive EL1 executions
 across nine artifacts, the unentitled negative control and scoped cleanup.
 The nine executable SHA-256 hashes were independently matched to the
 retained `exact-zone-wake/signed-artifacts.jsonl`; full output and final
-source-gate logs are in that receipt directory. This replaces `8916e1fe2`
+source-gate logs are in that receipt directory. This replaces `1d085f4c7`
 as current scheduler regression evidence, but does not supply deterministic
 signed race bindings, historical crash attribution or full task-A acceptance.
-New focused signed source `2e6e3794a` adds the notification capture audit
-event (`b55e57803`) and a deterministic three-process fixture. Delivery is
+New focused signed source `4a2e93bf5` adds the notification capture audit
+event (`039a43c9e`) and a deterministic three-process fixture. Delivery is
 held across the exact parent's reap: the retained pre-fix method produces one
 reaped-wake rejection; restored exact targeting produces zero. Entitlement
 negative controls and cleanup passed. See `notification-order/` for both
@@ -390,12 +390,12 @@ fixture result. This closes this producer's signed interleaving gap only; the
 acceptance for this source. Broad regressions after the audit event passed:
 kernel/semantics 2,462 (one existing ignore), serial kernel 110, runtime 630
 (eight existing ignores) and affected Clippy. Clean compiler reconciliation
-on `3fb63f608` retained all 595 rows and positions; `852fedd48` records the
-source stamp. Final lint and contract coverage passed on `852fedd48`. The
+on `8bfbd1dbe` retained all 595 rows and positions; `22a255757` records the
+source stamp. Final lint and contract coverage passed on `22a255757`. The
 compiler census remains the macOS subset; other host profiles are unqualified.
 Full `just ci` passed on `f256ce2`; fresh musl/GNU ARM64 probe inputs
 (544 binaries each) are hashed in `arm64-acceptance/`. The signed EL1 gate
-on `e8db2fd51` completed: 50 EL1 tests, 912 generic probe/libc pairs, 32
+on `26079e466` completed: 50 EL1 tests, 912 generic probe/libc pairs, 32
 dedicated tests, retained CLI cases and both inotify routes passed. The exact
 216-row LTP population reports 215 baseline MATCHes and one allowed fanotify25
 DIFF; this is regression evidence, not strict closure. Three generic shard
@@ -417,7 +417,7 @@ counts and passes after moving the existing backend-registry acquisition
 before the authority query. Eleven retirement tests, serial HVF 598 (three
 existing ignores), and affected Clippy pass. This is a branch-local correction,
 not retrospective attribution of the Go failure. See `retirement-population/`
-for limits and failed invocations. On source `b5a751775`, full `just ci` and
+for limits and failed invocations. On source `64573c8f6`, full `just ci` and
 the signed rebuild pass. The corrected CLI (SHA `ec12ac299cd4c7200fb8befe663da2803dc154ba148be9f45150a29f9acd342f`)
 passes all 20 fixed Go rows against the verified native ARM64 oracle, with
 no retries, diffs or leftover guests. This closes that candidate population;
@@ -428,7 +428,7 @@ executables, with negative entitlement and zero scoped leftovers. This includes
 the parked-thread crash-register witness. See `retirement-signed-el1/`.
 Remaining lifecycle/structural proofs and full batch qualification still block
 acceptance. The notification structural binding now passes on source
-`9ba825eac` with two visits, two authentications and one delivered wake,
+`3e7e2bb66` with two visits, two authentications and one delivered wake,
 complete counters, negative controls and verified cleanup. Its exact tested
 bytes are preserved; this is not full-tree acceptance.
 
@@ -462,16 +462,16 @@ Evidence labels:
 | 6: x86 venue | Deferred by user on 2026-09-29; outside the active goal | Same neutral cores in ring 0, each declared backend qualified with real execution and native x86 oracle |
 | Final acceptance | Pending | Entire declared conformance/workload denominator, provenance, cost gates, dead-path removal and unresolved-item closure |
 
-Main includes batches 1/2 (handoff batches `043ffbcc9` and `a70b40466`):
+Main includes batches 1/2 (handoff batches `a6da32b38` and `b2e683ca5`):
 namespace/syscall budgets, futex-exit bounds, close locking, directory identity,
 idle service rescue, fixture port/liveness fixes, dispatch/empty-steal cost
 reductions and carrier-CPU attribution. Merged presence does not transfer their
 old gate results to future integrations.
 
 Two obsolete open items are corrected: parked-EL1-thread crash registers have
-an implementation and signed fixture on main (`4d43ade6a`); the personality
-boundary has a mechanical gate for scheduler/MMU cores (`26f104341`,
-`1bc6c8900`). Preserve those gates and extend coverage as new cores move;
+an implementation and signed fixture on main (`4a9e0ba3e`); the personality
+boundary has a mechanical gate for scheduler/MMU cores (`a4af26576`,
+`1ea60510e`). Preserve those gates and extend coverage as new cores move;
 neither is still “not implemented.” Derived entrant bounds, GIC/SPI recovery
 obligations, complete boundary coverage and paired attribution remain open
 until their own receipts close them. Do not re-open historically accepted
@@ -486,22 +486,22 @@ do not overwrite it with that branch's pre-refresh controller.
 
 | Worktree / branch | Head | Disposition |
 |---|---|---|
-| `wt-batch3` / `integ/batch3` | `a2c0fcee3` implementation; signed `257de53e0` | Current blocker owner; review original slot-liveness/pgrp/ICMP changes, notification fix and deferred-handback identity correction together |
-| `wt-cp2-descr` / `work/cp2-el1-descriptor-owner` | `c555f5dd1` | Review candidate; 9 signed filters and first-touch slopes 0.004–0.009 are handoff claims |
-| `wt-cp2-cow` / `work/cp2-hvf-cow-adapters` | `d581dd099` | Ancestry-confirmed in descriptor branch; do not merge it a second time |
-| `wt-cp2-return` / `work/cp2-elastic-return` | `8f268dee4` | Review candidate; scoped grant/return accounting and signed green are handoff claims |
+| `wt-batch3` / `integ/batch3` | `aee40f93e` implementation; signed `1cbcda5b0` | Current blocker owner; review original slot-liveness/pgrp/ICMP changes, notification fix and deferred-handback identity correction together |
+| `wt-cp2-descr` / `work/cp2-el1-descriptor-owner` | `2223dc53e` | Review candidate; 9 signed filters and first-touch slopes 0.004–0.009 are handoff claims |
+| `wt-cp2-cow` / `work/cp2-hvf-cow-adapters` | `0c53d6118` | Ancestry-confirmed in descriptor branch; do not merge it a second time |
+| `wt-cp2-return` / `work/cp2-elastic-return` | `391a43b3d` | Review candidate; scoped grant/return accounting and signed green are handoff claims |
 | `wt-cp2-tests` / `work/cp2-ownership-tests` | `45fa94124` | Contains deliberately red ownership witnesses; dedicated host-COW accessor still panics |
-| `wt-cp2-reserve` / `work/cp2-el1-reservations` | `f2efa3716` | Explicit unverified WIP; reservation provider/projection and host authority work incomplete |
-| `wt-cp3-adapter` / `work/cp3-ipc-adapter` | `c1c17d963` (latest signed population source) | Live routing and blocking 1/8/64-pair data populations demonstrated; forwarding variability and full vertical acceptance open |
-| `wt-cp3-host` / `work/cp3-ipc-host` | `77b6f40a1` | Shared backing/lifetime foundation; descriptor-table integration and host blocking continuation open |
+| `wt-cp2-reserve` / `work/cp2-el1-reservations` | `ecb74fefb` | Explicit unverified WIP; reservation provider/projection and host authority work incomplete |
+| `wt-cp3-adapter` / `work/cp3-ipc-adapter` | `a9d095252` (latest signed population source) | Live routing and blocking 1/8/64-pair data populations demonstrated; forwarding variability and full vertical acceptance open |
+| `wt-cp3-host` / `work/cp3-ipc-host` | `1d864b880` | Shared backing/lifetime foundation; descriptor-table integration and host blocking continuation open |
 | `wt-cp3-fixture` / `work/cp3-ipc-fixture` | `fd27e748d` | Five signed acceptance tests plus report validators/contracts; baseline red is a handoff claim |
-| `wt-cp3-objects` / `work/cp3-ipc-shared-objects` | `bb93917a4` | Ancestry-confirmed in adapter branch |
-| `wt-cp3-waits` / `work/cp3-ipc-object-waits` | `7debfcc13` | Ancestry-confirmed in adapter branch |
+| `wt-cp3-objects` / `work/cp3-ipc-shared-objects` | `79af34bac` | Ancestry-confirmed in adapter branch |
+| `wt-cp3-waits` / `work/cp3-ipc-object-waits` | `a17a6aa72` | Ancestry-confirmed in adapter branch |
 | `wt-sigsuspend` / `work/rt-sigsuspend-parallel-flake` | `5011caffa` | Unverified WIP; establish root cause/pre-change evidence before considering integration |
 
-Preserve `wt-slotlive` (`1cd5071d6`), `wt-pgrpsnap` (`849e2119c`) and
-`wt-icmpflake` (`2a097c0bd`) until batch-3 integration is accepted. Older
-`wt-sysret` (`56f848a2b`) and `el1-inotify` (`7eb9a6853`) are not part of the
+Preserve `wt-slotlive` (`d63e9e7ba`), `wt-pgrpsnap` (`a2733916c`) and
+`wt-icmpflake` (`6c14872e7`) until batch-3 integration is accepted. Older
+`wt-sysret` (`0209a7afa`) and `el1-inotify` (`7eb9a6853`) are not part of the
 next slice; inventory their work before reuse/cleanup. Reuse suitable existing
 checkouts; retire worktrees only after verifying no task/process relies on them
 and saving recoverable state. Never sweep shared probe/build storage.
@@ -537,7 +537,7 @@ unless a concrete failure or acceptance dependency requires them. Preserve
 their unresolved acceptance status. No repeated full-suite runs on unchanged
 code and no infrastructure expansion without a named blocked execution step.
 
-Latest development observation: adapter commit `5cc3b64a6` connects HostTable
+Latest development observation: adapter commit `08bedad0f` connects HostTable
 to production FileTable publication and mutation/retirement. Boot and syscall
 entry attempt admission only into the exact Kernel's mapped IPC window.
 Initial namespace admission is complete; incremental updates touch changed
@@ -553,8 +553,8 @@ against retained native-Linux evidence, with its failed run preserved. Exact-
 owner host-token retirement also fixes the reproduced handback leak.
 
 The first honest signed routing witness now passes on clean source
-`e6e2ab3bf` (receipt commit `ab5ec3e1d`, clean adapter head). Initial signed
-source `5cc3b64a6` transferred correct data but forwarded all 2,048 loop
+`0254e5cb7` (receipt commit `4481351fa`, clean adapter head). Initial signed
+source `08bedad0f` transferred correct data but forwarded all 2,048 loop
 writes. The mapped IPC authority belonged to the loader's temporary bootstrap
 Kernel; root initialization later rebound the dispatcher to the authoritative
 HVPatch graph. Moving registration into authoritative executor launch before
@@ -570,7 +570,7 @@ unentitled negative control, with zero scoped leftovers. Tested SHA-256
 independently matched to the official manifest and its bytes preserved.
 The first failed run, fixture-lock delta and failing executable remain saved.
 
-**Latest blocking evidence:** signed source `c1c17d963`, run
+**Latest blocking evidence:** signed source `a9d095252`, run
 `el1-ipc-pairs-20260929-b`, completed pipe and eventfd at 1/8/64 pairs,
 128 rounds each, with checked payloads and real guest parks. All six cases,
 entitlement negative control and scoped cleanup passed. Exact manifest,
@@ -582,7 +582,7 @@ fix separates that red from this green. Whole-run counters do not establish
 unique completed syscalls or zero IPC-caused host exits. Do not retry this
 population to manufacture acceptance or build a new observation framework.
 
-**New direct blocker:** signed source `15021dfb8` runs real inherited IPC
+**New direct blocker:** signed source `58cf1d47e` runs real inherited IPC
 across forked parent/child descriptor tables. Pipe one-pair completed 128
 checked round trips with 257 parks. Pipe eight-pair hit the 60-second watchdog:
 four idle-WFI slots and parked tasks in both address spaces. The census also
@@ -591,7 +591,7 @@ cases did not run. Negative entitlement passed and cleanup was zero. Exact
 failed executable and raw census are preserved in the adapter's
 `processes-first-red*` receipts. No retries or product fix yet.
 
-**Follow-up `8c9617950`:** deterministic test proves an unplaceable object
+**Follow-up `bb1adc3e7`:** deterministic test proves an unplaceable object
 wake had no runnable owner. Reusing the existing misplaced handback queue
 fixes that gap: 62 scheduler-core and 14 focused EL1 IPC tests plus affected
 Clippy pass. Unchanged signed execution now completes pipe 1/8/64 and
@@ -690,9 +690,9 @@ cleanup pass. Exact tested bytes and manifest are retained in adapter
 `docs/perf-results/2026-09-29-el1-ipc-integration/vector-*`.
 
 **Next implementation: B+D memory ownership.** Review and join descriptor/COW
-`c555f5dd1` and elastic return `8f268dee4` on the development integration;
+`2223dc53e` and elastic return `391a43b3d` on the development integration;
 check their shared layout and run the focused memory regression net. Then
-review reservation candidate `f2efa3716` and wire authoritative reservation
+review reservation candidate `ecb74fefb` and wire authoritative reservation
 routing and remaining writers. All three worktrees were clean at this reset.
 Host pause removal remains last. Avoid a new diagnostic framework or another
 broad IPC capture before a specific new hypothesis provides a decisive test.
@@ -703,8 +703,8 @@ zero-IPC-exit proof and full qualification remain required. A remains an
 acceptance blocker. Advancing independent memory work defers these blockers;
 it does not resolve or waive them. Keep one implementation vertical active.
 
-**Memory development integration:** adapter `8fc9513fd` joins elastic-return
-`8f268dee4` (merge `3f8e349fc`) and descriptor/COW `c555f5dd1`. Additive IPC/MMU
+**Memory development integration:** adapter `4e8fc8a0b` joins elastic-return
+`391a43b3d` (merge `d38e8b3f9`) and descriptor/COW `2223dc53e`. Additive IPC/MMU
 exports and dependencies are preserved. Six return-lifecycle tests and one
 three-scale discard/fork-retention test pass; combined 97 EL1 + 55 ABI + 152
 MMU + 37 runtime guest + three architecture authority tests pass. Embed test
@@ -719,14 +719,14 @@ test callers. Production admission still refuses host copyout and backend
 writers. Do not count their helper coverage as migrated guest memory.
 
 **Immediate next action:** review/join reservation provider candidate
-`f2efa3716`, implement its carrier-bound resolver/installation, and connect
+`ecb74fefb`, implement its carrier-bound resolver/installation, and connect
 real reservation operations and host-copyout/backend transitions. Preserve
 its explicit fixture race as a bounded validation obligation. Do not spend
 the next interval expanding accounting or rerunning unchanged helper suites;
 connect a production owner. Keep host pause removal last.
 
-**Carrier provider connection:** adapter `96e912e6a` joins reservation
-candidate `f2efa3716` and installs the carrier-bound host provider before
+**Carrier provider connection:** adapter `c65f4331c` joins reservation
+candidate `ecb74fefb` and installs the carrier-bound host provider before
 worker admission. Owned metadata access retains the exact carrier mapping
 and VM generation; prepared views pin dynamic extents and cache unchanged
 storage generations. The lifetime/retirement witness is red-first; 27 kernel
@@ -756,7 +756,7 @@ Resume only for an explicit acceptance dependency or a concrete failure in the
 active vertical; do not keep adding trigger experiments as the main work.
 The capture hook is implemented with VM-free red/green and lock-release
 controls. Its first signed two-process trigger failed with zero captures
-on `497096b2f`; retain that fixture failure and establish actual queued-record
+on `8ec75d8a5`; retain that fixture failure and establish actual queued-record
 evacuation before adding retirement/reuse ordering or expanding populations. The parked-restore
 admission fixture now confirms generic and exact wakes cannot queue a parked
 record; this is negative coverage, not historical crash attribution.
@@ -768,24 +768,24 @@ Sources: `crates/carrick-runtime/src/vcpu_loop/{wait_wake.rs,zone.rs,executor/}`
 
 - [x] Preserve the original two failures and distinguish their boundaries.
 - [x] Reduce delayed parent notification to a deterministic VM-free red;
-  `932a33568` uses the existing exact task/thread/generation wake API.
+  `94db4bf05` uses the existing exact task/thread/generation wake API.
 - [x] Retain 630 runtime passes/8 existing ignores, Clippy and registry checks;
-  signed shard at `df9741d88`: 314 musl/glibc executions, negative control and
+  signed shard at `2d05d2642`: 314 musl/glibc executions, negative control and
   zero scoped leftovers. These are receipt-confirmed, not rerun for this edit.
 - [ ] Attribute the historical `otmpfileforkexec` reaped-task wake to an exact
   producer/interleaving. The reduction is a real defect but not that attribution.
 - [x] Reduce deferred evacuation identity reuse, fix it with retained
-  RecordRefs (`3981c0366`), and preserve the red/green witness at 1/8/32
+  RecordRefs (`9b7d8a940`), and preserve the red/green witness at 1/8/32
   records. Kernel/semantics 2,459 passes, serial-host 109 passes, kernel
   Clippy and `just lint-domains` passed. The authority census is the macOS
   subset (595 unchanged rows); non-macOS profiles remain pending. All 14
-  signed `el1_sched` tests at `0542e2d2f` passed, with negative entitlement
+  signed `el1_sched` tests at `11e11bc4a` passed, with negative entitlement
   control and zero scoped leftovers. This is regression evidence; signed
   deterministic interleaving and WorkObservation bindings remain open.
-- [x] Preserve identity at the earlier core publication boundary (`99c8cd5ac`):
+- [x] Preserve identity at the earlier core publication boundary (`9857a300c`):
   three red-first callback/returned-batch/executor-take witnesses. Core 53,
   EL1 host-test 74, kernel/semantics 2,459, serial-host 109 and runtime 630
-  passed (existing ignores unchanged). At `40a707ba0`, all 49 selected signed
+  passed (existing ignores unchanged). At `98621f69e`, all 49 selected signed
   EL1 executions across nine executables passed, with negative control and
   zero scoped leftovers. Clippy and lint passed. These are regression receipts,
   not historical attribution or deterministic signed-interleaving closure.
@@ -802,7 +802,7 @@ Sources: `crates/carrick-runtime/src/vcpu_loop/{wait_wake.rs,zone.rs,executor/}`
   witnesses, waitv/cancellation and host-request controls (core 58, EL1 host
   74, ABI 32, kernel/semantics 2,459, serial-host 109, runtime 630; existing
   ignores unchanged). The combined fixes now have signed EL1 regression
-  coverage at `257de53e0`; deterministic signed interleavings and the remaining
+  coverage at `1cbcda5b0`; deterministic signed interleavings and the remaining
   retirement/restore lifetime audit are still required. See `owned-transfer/`
   and `exact-zone-wake/` for their distinct proof scopes.
   Cancellation-before-El1Held and delayed flag writes now have red-first
@@ -824,9 +824,9 @@ Sources: `crates/carrick-runtime/src/vcpu_loop/{wait_wake.rs,zone.rs,executor/}`
   incarnation. Retaining RecordRef fixes that reduction at 1/8/32 records.
   Attribution to the historical Python crash is still open; see the branch
   receipt's deferred-handback section. A rebuilt, pinned Python run at
-  `5ce5bd059` passed (395 tests, 51 skips), with no fatal capture triggered.
+  `4f7ce57ec` passed (395 tests, 51 skips), with no fatal capture triggered.
 - [x] Bind delayed parent notification to deterministic signed capture/reap/
-  delivery ordering. Source `2e6e3794a` passes with zero reaped wake attempts;
+  delivery ordering. Source `4a2e93bf5` passes with zero reaped wake attempts;
   the same fixture with the retained pre-fix method fails at one attempt.
   This is producer proof, not attribution of the original otmp failure.
 - [x] Close the notification contract's scoped structural observation gap.
@@ -840,7 +840,7 @@ Sources: `crates/carrick-runtime/src/vcpu_loop/{wait_wake.rs,zone.rs,executor/}`
   Counters now distinguish attempts from actual Queued/Kicked deliveries;
   the corrected signed bound is one authentication per thread and at most one
   delivered wake for the whole fixture. A live-parent delivery counter control
-  was separately red-first. Corrected signed qualification passes on `9ba825eac`: two visits, two
+  was separately red-first. Corrected signed qualification passes on `3e7e2bb66`: two visits, two
   authentications, one delivered wake, complete observations, negative controls
   and zero scoped leftovers. Exact tested bytes and manifest are preserved.
   See `notification-work/`; no total scheduler work or timing claim is made.
@@ -848,7 +848,7 @@ Sources: `crates/carrick-runtime/src/vcpu_loop/{wait_wake.rs,zone.rs,executor/}`
 
 Receipt on branch `integ/batch3`:
 `docs/perf-results/2026-09-29-el1-batch3-resume/README.md` and its raw artifacts
-(initial receipt commit `11e8c6a29`, extended by the deferred-handback
+(initial receipt commit `f23520b35`, extended by the deferred-handback
 receipts). Read it in `wt-batch3`; it is not on main yet. Quiet Python passes
 and 100 passing probe diagnostics do not erase the original reds.
 
@@ -884,7 +884,7 @@ pipe/eventfd service with exact descriptor/operation lifetime. Checkpoint 3
 still includes the broader work in E.
 
 Development update (2026-09-29): `wt-cp3-adapter` is clean at local development
-merge `923c55550` (adapter `b0313df83` + host `77b6f40a1`). Runtime backing now
+merge `60d47dc6f` (adapter `330088ab7` + host `1d864b880`). Runtime backing now
 retains the same kernel IPC authority. Blocking-eventfd writes own their value
 and functional description lease, use object-queue enrollment, survive fd reuse
 and enrollment gaps, and avoid the host-fd reactor population. Guest-produced
@@ -898,23 +898,23 @@ main integration is claimed. Table publication/lifecycle, fixture integration
 and the five signed witnesses remain open. Refresh compiler captures only at
 the stable qualification boundary.
 
-Descriptor-lifetime follow-up at development commit `7a44fa384`:
+Descriptor-lifetime follow-up at development commit `da79d1a17`:
 Eventfd host ownership is a shared OFD pin; last host close no longer directly
 retires backing held by a guest pin. Admission refusal rolls back its object.
 Kernel IPC: 60 pass, one existing ignored; kernel/runtime Clippy and fmt pass.
-Pipe OFD lifetime is committed at `964c48bb4`: both endpoint
+Pipe OFD lifetime is committed at `ed0c91f7f`: both endpoint
 pins are admitted transactionally; guest writer pins prevent premature EOF after
 last host close. Second-OFD refusal rolls back endpoints, OFD and storage.
 Pipe regressions passed 87/87; final IPC 62 pass, one existing ignored;
 kernel/runtime Clippy and formatting pass. Shared supported mutable flags and
-access mode are bound at `3721ff3a3`; host/guest changes use one OFD and terminal observations do
+access mode are bound at `81d66ed6c`; host/guest changes use one OFD and terminal observations do
 not retain functional pins. Native ARM64 Linux confirmed eventfd O_RDWR reporting.
 Final IPC 64 pass/one existing ignore, pipe 89, eventfd 9 and fcntl 6 pass;
 populations overlap. Affected Clippy and formatting pass. Full table lifecycle
 and publication remain open. These remain development receipts, not signed
 migration acceptance.
 
-Earlier IPC development head was `375dddee3` in `wt-cp3-adapter`; the live routing update above supersedes this snapshot.
+Earlier IPC development head was `e7da0d3c1` in `wt-cp3-adapter`; the live routing update above supersedes this snapshot.
 Atomic pinned replacement reuses dup2's transaction; HostTable now owns shared
 create/grow/fork/replace/close/exec/destroy and releases backing after core locks.
 Red-first replacement/retirement witnesses are retained. Descriptor core 27/27,
@@ -939,7 +939,7 @@ continue descriptor ownership rather than starting another diagnostics detour.
   Contrary to the handoff, the adapter already contains the handback intercept
   before ordinary preparation (`vcpu_loop/mod.rs`), owed host-wake delivery at
   `served_with_work`, backing registration (`runtime.rs`), and interrupt/restart/
-  partial-progress helpers (`vcpu_loop/zone.rs`). `7baabfd95` and the top WIP
+  partial-progress helpers (`vcpu_loop/zone.rs`). `4028dbcf4` and the top WIP
   contain code, not verified completion. Audit ordering and every return path.
 - [ ] Complete the host-originated blocking continuation sharing the existing
   completion engine; `block_on_object` was not found in either active branch.

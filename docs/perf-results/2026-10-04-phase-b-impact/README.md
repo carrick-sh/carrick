@@ -1,11 +1,11 @@
 # Lifecycle Phase B impact — 2026-10-04
 
-Single-variable A/B on the director's Mac. Base `5e23be1a2` (batch 2a, before
-Phase B) against candidate `1e61be8e8` (Phase B), with native arm64 Docker as
+Single-variable A/B on the director's Mac. Base `40dcaf32d` (batch 2a, before
+Phase B) against candidate `87944f63d` (Phase B), with native arm64 Docker as
 the reference. `carrick-xtask impact`: 10 samples, one excluded warm-up, no
 retries. Docker ran under the exclusive Docker host lease and carrick under the
 exclusive gate lease. The `HEAD` fields in `report.md` name the measuring tree
-(097559be9); each artifact is identified by its own sha256/CDHash in the JSON.
+(df57d4585); each artifact is identified by its own sha256/CDHash in the JSON.
 
 | workload | base | Phase B | Docker | Phase B / Docker (per op) |
 |---|---|---|---|---|

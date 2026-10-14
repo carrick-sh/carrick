@@ -60,7 +60,7 @@ new durable D scripts. Host shared with other agents, so wall/CPU numbers are
   `carrick trace`, `$target` *is* the carrier: the run process retitles
   itself `carrick:<name>: N containers`, and guest forks create no host
   processes. These scripts need `get-task-allow`, so they ran on a
-  `just build-debug` of 313a1ab00 (`24b2f36f…`). Pid-provider names are
+  `just build-debug` of c3173ed32 (`24b2f36f…`). Pid-provider names are
   demangled and need `??` for `::` and `?GT?` for `$GT$`; the script
   headers record this.
 
@@ -245,7 +245,7 @@ This campaign's "COW 18% / 12%" is really "COW 7.6% / 0.35%".
     binary `c2c6b14f…`)
   - `cowc-cost-py3` (COW and reconcile cost), `cowc-tdph2` (teardown
     phases), `cowc-td11` (teardown counts), all on binary `24b2f36f…`,
-    313a1ab00 with `just build-debug`
+    c3173ed32 with `just build-debug`
   - All lane off (`CARRICK_EL1_DESCRIPTOR_LANE=0`).
 - Re-filed A/B stacks: from
   `.worktrees/wt-land-g2/target/perf/el1-workload-ab/el1ab-202610010107-attribution/*lane-off-carrier-cpu-attribution.raw`.

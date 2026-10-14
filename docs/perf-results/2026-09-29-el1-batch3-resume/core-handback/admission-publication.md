@@ -1,6 +1,6 @@
 # Admission fixture publication ordering
 
-While validating the core handback API changes on top of `b9d7fc35e`,
+While validating the core handback API changes on top of `cb5dae055`,
 `just test-kernel` reported one failure: `exec_table_capacity_refuses_new_admission`
 received `Unavailable` instead of `Rejected` from its first submitter after
 five seconds. The complete failing log is `admission-publication-red.log`.

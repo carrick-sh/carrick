@@ -1,6 +1,6 @@
 # Batch 3 resumed: delayed parent notification
 
-Base: `66302477b6cdc507f8885c03676a605bfc52b693`, branch `integ/batch3`.
+Base: `d94b5cf60744c271ef5d6f4e0ba080044d5b907a`, branch `integ/batch3`.
 Batch 3 is **not accepted or landed**. This receipt covers one deterministic
 notification defect; it does not attribute both historical gate failures to it.
 
@@ -56,7 +56,7 @@ concurrency reduction or auditor weakening is introduced.
 - Contract: `kernel.wait.child-exit-notification-lifecycle`. Its signed
   deterministic interleaving and WorkObservation bindings remain explicitly
   unresolved. Registry and inventory validation passed with 67 contracts.
-- The rebuilt signed shard at `df9741d88` passed both libc lanes, including
+- The rebuilt signed shard at `2d05d2642` passed both libc lanes, including
   `otmpfileforkexec`; see `candidate-shard0.log` and
   `candidate-shard0-artifacts.jsonl` for exact source, SHA-256, CDHash, UUID,
   entitlement and DOF identity. Negative entitlement control passed and both
@@ -73,7 +73,7 @@ the remaining EL1 controller obligations are untouched.
 
 ## Deferred handback identity reduction
 
-The rebuilt signed CLI at `5ce5bd059` completed the Python diagnostic on
+The rebuilt signed CLI at `4f7ce57ec` completed the Python diagnostic on
 native-arm64 image digest
 `3126629643b4adcf57ba5cecdb7f9ed257e733b56cd81da70fd5fdbdc1745b30`:
 395 tests, 51 skipped, SUCCESS. No fatal capture triggered; a scoped process
@@ -108,16 +108,16 @@ The producer-side transition to host ownership and every other handback
 producer still need review; this correction only closes the demonstrated
 deferred-batch identity gap. Batch 3 and migration acceptance remain open.
 
-Source comparison with local main `f304f8415` finds the same bare-ID
+Source comparison with local main `7fd243eb1` finds the same bare-ID
 collection and reconstruction in its older `settle_vacated` implementation;
-`git log -S 'fn settle_vacated'` points to `2fbb84312`. This pattern predates
+`git log -S 'fn settle_vacated'` points to `7d08158b6`. This pattern predates
 batch 3. This is source comparison, not a main-runtime Python reproduction.
-Compiler-backed inventory reconciliation at `3981c0366` retained all 595
+Compiler-backed inventory reconciliation at `9b7d8a940` retained all 595
 authority rows and all other inventory positions unchanged; only the source
 revision stamp changed. Its first sandboxed run failed because clang could
 not create a temporary assembly file; the authorized unrestricted run passed.
 
-Signed regression source `0542e2d2f`: all 14 `el1_sched` tests passed, the
+Signed regression source `11e11bc4a`: all 14 `el1_sched` tests passed, the
 negative entitlement control passed, and the runner found zero remaining
 processes for both scoped IDs. Full output is `deferred-handback/signed.log`;
 `signed-artifacts.jsonl` contains one execution row per selected test and
@@ -138,8 +138,8 @@ converted into acceptance by the successful diagnostics or focused suites.
 
 The follow-up producer/consumer audit found an earlier identity-loss boundary:
 the core returned raw indices after publishing host ownership. Correction
-`99c8cd5ac` carries the original RecordRef across that boundary. Three red-first
-witnesses and the 49-execution signed EL1 regression gate at `40a707ba0` are
+`9857a300c` carries the original RecordRef across that boundary. Three red-first
+witnesses and the 49-execution signed EL1 regression gate at `98621f69e` are
 recorded in [core-handback/README.md](core-handback/README.md). The separate
 capacity-test publication race is documented there. Historical crash
 attribution, producer lifetime and full batch acceptance remain open.

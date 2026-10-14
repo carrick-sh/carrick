@@ -1,6 +1,6 @@
-# Review round 1: ae6c3a17b is not accepted
+# Review round 1: 0dcc87b33 is not accepted
 
-All eight original host commands have been independently rerun and exit zero. Both alignment and grant-sizing red programs reproduce on your clean final ae6c3a17b. This is review round 1 of at most 3. Same task, same conversation. The original outcome remains installed guest
+All eight original host commands have been independently rerun and exit zero. Both alignment and grant-sizing red programs reproduce on your clean final 0dcc87b33. This is review round 1 of at most 3. Same task, same conversation. The original outcome remains installed guest
 metadata allocation, authenticated growth/return, and a genuine signed-ready
 witness. Do not replace it with a host-only allocator.
 
@@ -44,9 +44,9 @@ split/merge/retained-byte bounds at1/8/32/128 and repeated return/reuse. Include
 all new ABI layout/transport facts in the agreed handshake hash. Retain raw
 red outputs and source/fixture identity; do not synthesize evidence.
 
-Saved read-only source and two red screens are in integration commit8acb35b14
+Saved read-only source and two red screens are in integration commit7f06a8610
 under docs/perf-results/2026-09-26-el1-elastic-metadata-director/in-progress-screen/.
-Final-candidate reproduction and all eight verification logs are preserved in /tmp/el1-allocator-review1. The same failures remain in ae6c3a17b; fix production code and bind the regressions, not just these screens.
+Final-candidate reproduction and all eight verification logs are preserved in /tmp/el1-allocator-review1. The same failures remain in 0dcc87b33; fix production code and bind the regressions, not just these screens.
 
 Re-run every original prescribed verification command and report accurately.
 No signed guests/Docker/main/push. Preserve the original scope fence and read

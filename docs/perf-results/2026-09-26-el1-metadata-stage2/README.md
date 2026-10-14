@@ -1,6 +1,6 @@
 # Metadata extent stage-2 ledger integration
 
-Pre-change source 1c22dcdb3. Contract kernel.el1.metadata-allocation.
+Pre-change source 10f102398. Contract kernel.el1.metadata-allocation.
 The production map operation was extracted without adding record publication;
 the exact-record witness then failed because a successful map returned no
 ownership identity (red.log, semantic failure exit 101). An earlier compile
@@ -26,6 +26,6 @@ with -D warnings and formatting pass. Tests cover failed map rollback, stale
 VM rejection before map, exact identity, failed unmap with retry, exact-once
 release and removal of terminal records. Signed verification of the combined
 backing/custody/ledger changes is next; the previous signed green still belongs
-to c33e1d152. Concurrent guest use, IRQ discipline, structural/retention budgets
+to e483face2. Concurrent guest use, IRQ discipline, structural/retention budgets
 and private test-control gating remain before full allocator acceptance.
 First-touch and all remaining migration stages stay open.

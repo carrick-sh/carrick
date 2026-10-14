@@ -1,7 +1,7 @@
 # Stage 2a whiteout cache publication race correction
 
 Contract: `kernel.vfs.host-namespace-mutation-work`. Rebased onto
-`b0d8743ee`, which adds `just accept`. This is a host / VM-free correction;
+`0e2816aa5`, which adds `just accept`. This is a host / VM-free correction;
 existing signed census receipts still identify their original artifact.
 
 The landing failure at `9398c9c40` was a real cache race. Each matrix actor

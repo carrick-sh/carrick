@@ -1,6 +1,6 @@
 # EL1 fork and thread-lifecycle acceptance investigation
 
-Source baseline: `16ed0cced`, branch `work/forkexit`.
+Source baseline: `bf17e0c05`, branch `work/forkexit`.
 
 This is an investigation receipt, not acceptance. No production lifecycle
 integration or COW ownership change is included. Acceptance ceilings, slopes,
@@ -512,7 +512,7 @@ clippy command for runtime, EL1, memory and kernel exited zero
 (`/tmp/forkexit-sol-venue-clippy.log`). These are focused wiring receipts,
 not closure of the signed lifecycle contract or the full requested gates.
 
-Post-I2 rebase: wiring is `665a53f0f` atop main `d7548d894`. The first
+Post-I2 rebase: wiring is `665a53f0f` atop main `4b9297e48`. The first
 `just reconcile-inventories` refused the mapping count change, as designed;
 its follow-up regenerated the operation inventory. Reviewed additions are
 the eight mapping rows in `vcpu_loop/thread_lifecycle.rs`: the retained mapping
@@ -619,7 +619,7 @@ the publication-disabled passes do not confer default-on acceptance.
 
 ### Resume after landing J: slab capacity
 
-Rebased onto `75111e814`; the retained checkpoint is `3ea3cda16`.
+Rebased onto `0542b9d36`; the retained checkpoint is `3ea3cda16`.
 Conflicts were inventory counts/source-head receipts; product code merged.
 Two new landing-J test identities needed zero lifecycle/control bindings to
 compile against this branch's extended ABI.
@@ -676,7 +676,7 @@ remain outstanding.
 
 ### Phase A review checkpoint (2026-10-02)
 
-Rebased onto landing J (`75111e814`). Capacity and bounded exhaustion are
+Rebased onto landing J (`0542b9d36`). Capacity and bounded exhaustion are
 committed as `56238b41e` and `ebdc9625f`; `6c696dab6` puts the slab's host
 concurrency guarantee on its storage owner rather than the page wrapper.
 Clippy first rejected the missing slab Send/Sync contract, then passed;
@@ -766,7 +766,7 @@ teardown are not implemented or accepted by this checkpoint.
 
 ### Phase B kernel settlement checkpoint (2026-10-02)
 
-Branch `work/lifecycle-phase-b` rebased on main `4c4d06b4c` before this work.
+Branch `work/lifecycle-phase-b` rebased on main `62ffec506` before this work.
 This is an incomplete kernel checkpoint, not signed Phase B acceptance.
 
 - `828b888d5`: host and EL1 claims consume the same ABI pool CAS. The
@@ -857,7 +857,7 @@ carrier metadata retirement, pending-birth KernelArc lifetime and teardown
 remain open; credentials/affinity at claim are not yet protected by those
 guards. No signed acceptance, cached libc probes, hatch comparison, or
 Docker ran at this checkpoint. Spawn slope is not green. Main remained
-`4c4d06b4c345550da68b4b8cd44dfd8f6e53457b`, so no rebase was needed.
+`62ffec506218e9af76304e109dec4450fdbdda73`, so no rebase was needed.
 
 ### Phase B process adoption capacity checkpoint (2026-10-02)
 
@@ -865,7 +865,7 @@ The next three commits reserve exact-process adoption capacity
 (`0d1be206d`), share the typed-origin runtime constructor with host clone
 (`35012b995`), and reserve scheduler submission before birth (`c170a75dd`).
 These are the rebased names of `8ac07311f`, `c78d00a70`, and `ef4694b17`.
-Main moved to `e59eec4e4` during verification with four documentation-only
+Main moved to `4fa423e27` during verification with four documentation-only
 commits. Rebase completed cleanly; range-diff reports all nineteen branch
 commits unchanged.
 
@@ -989,7 +989,7 @@ performance claim is made. Forward counts are the recorded structural witness.
 
 ### Admission and watchdog checkpoint (2026-10-02)
 
-Rebased Phase B onto main `839f92126`. `ab012b68a` owns an exact-process
+Rebased Phase B onto main `c1d9cddbc`. `ab012b68a` owns an exact-process
 birth admission close through exec preparation/commit, settles completed ABI
 births before the sibling census, revokes unused identities and inactive
 CPU/scheduler/backend custody, and clears the old executable factory before MM

@@ -5,7 +5,7 @@ Status: approved 2026-09-22. Supersedes the native-islands/DSR direction in
 
 ## 1. Why: measured, not assumed
 
-Quiet host, signed binary `0f657b02` at `dbf360ebb`:
+Quiet host, signed binary `0f657b02` at `279c2d164`:
 
 | Path | Cost per call |
 |---|---:|

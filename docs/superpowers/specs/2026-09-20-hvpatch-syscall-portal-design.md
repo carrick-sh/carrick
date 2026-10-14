@@ -6,7 +6,7 @@ The executor-local helper described here was implemented experimentally and
 rejected after signed workload qualification. The helper made every completed
 steady-state `inotify09` reduction phase slower and then exposed a non-atomic
 `Armed -> RequestReady` versus cancellation ownership race. Production wiring
-was reverted in `a5bb139b4`; portal selection never defaulted on. The typed
+was reverted in `b1781fd3e`; portal selection never defaulted on. The typed
 mailbox protocol and contract remain as design groundwork, not a shipped
 performance claim.
 

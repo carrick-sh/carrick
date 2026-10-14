@@ -154,7 +154,7 @@ controls separate when measuring those workloads.
 ## Provenance and non-completion
 
 Worktree: `/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick`;
-source HEAD: `9bb2392396b8531e93f5262657bf3aa9c5767488`. No commit or push.
+source HEAD: `6914b312cb07b7b72aeb99cc86a861f44bec704f`. No commit or push.
 The [manifest](manifest.json), [15-file continuation patch](implementation.patch)
 and source archives preserve this continuation and the parent campaign.
 The measured archive predates only the final registry-test and generated

@@ -1,6 +1,6 @@
 # Stage 2a namespace checkpoint (partial)
 
-Base: `00ed7a580d2ddf24d71b6bccfc1abc1cc4d19c83`, branch `work/stage2a`.
+Base: `aaead2621adb539afd353b34e516e237211c52cc`, branch `work/stage2a`.
 This is a VM-free implementation checkpoint, **not milestone 0 acceptance**.
 No cache ownership has moved. No Docker phase or signed guest has run.
 

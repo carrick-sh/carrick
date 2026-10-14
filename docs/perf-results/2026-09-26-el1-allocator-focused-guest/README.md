@@ -1,6 +1,6 @@
 # Focused EL1 allocator guest witness
 
-Source: `c33e1d152` (full revision in identity files).
+Source: `e483face2` (full revision in identity files).
 `just test-embed el1_metadata_allocator_grows_and_returns_extents --nocapture`
 exits 0 on the exact signed executable recorded in `test-identity.json`.
 One positive signed executable invoked; 26 signed. The unentitled negative

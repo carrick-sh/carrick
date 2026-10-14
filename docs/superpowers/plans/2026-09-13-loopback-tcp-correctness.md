@@ -4,7 +4,7 @@ First priority in the approved correctness-recovery goal following the user's ex
 
 ## Evidence
 
-Full discovery at 7a3818034: Go SMTP TestTLSClient reports EPIPE sending TLS closeNotify; CPython httplib source-address test requests port 49466 but observes 32823. Fresh Docker-only runs pass both suites. Two comparisons each: preserved pre-inzone binary SHA256 457da5fb6521ff7bceacaff2e706242b9e5243610c0e935138f224a70a908239 passes, current fa1ec82e fails. Receipts: target/conformance/sep13-review/tcp-attribution/results.json and fresh-oracle/results.json.
+Full discovery at 8b74ac980: Go SMTP TestTLSClient reports EPIPE sending TLS closeNotify; CPython httplib source-address test requests port 49466 but observes 32823. Fresh Docker-only runs pass both suites. Two comparisons each: preserved pre-inzone binary SHA256 457da5fb6521ff7bceacaff2e706242b9e5243610c0e935138f224a70a908239 passes, current fa1ec82e fails. Receipts: target/conformance/sep13-review/tcp-attribution/results.json and fresh-oracle/results.json.
 
 Node libuv current fails not_readable_nor_writable_on_read_error, poll_oob, tcp_read_stop_start, tcp_reuseport, tcp_rst. Fresh Docker passes all 507 TAP entries. Partial DONTFORK node-app-smoke is a separate VM workstream, not a networking fix.
 
@@ -34,7 +34,7 @@ These are source-supported candidate causes, not independently reduced closure. 
 
 ## Inner-workload execution checkpoint
 
-User explicitly deferred image overhead; isolated image branch remains unmerged. TCP probe worker runs from main 7a381803487b5111c08d5f5442c40d31191295bb in `.worktrees/sep13-inner-tcp`, branch `agy/sep13-inner-tcp`, Antigravity run `sep13-inner-workloads`, worker `tcp-probe`. First task is probe-only, no runtime edits or guest runs. Director owns native Docker oracle and signed embedded red-first phases.
+User explicitly deferred image overhead; isolated image branch remains unmerged. TCP probe worker runs from main 8b74ac98082ce809e3a2f88c9f7fdc52bbd9df24 in `.worktrees/sep13-inner-tcp`, branch `agy/sep13-inner-tcp`, Antigravity run `sep13-inner-workloads`, worker `tcp-probe`. First task is probe-only, no runtime edits or guest runs. Director owns native Docker oracle and signed embedded red-first phases.
 
 Further source review: `OpenDescriptionBase` in dispatch/fd_table.rs owns receive/send timeouts, reuse flags, buffer requests, pending error, and connect state; constructing a fresh base during connect loses those values. Existing bind records translated guest endpoints only when rewritten, so the transaction must read provider guest identity with authenticated host endpoint fallback before retiring the old socket. In-zone ephemeral allocation checks listeners and its own ephemeral inventory, while bound host socket lifetime currently owns other reservations. Merely copying the source port would not prove reservation lifetime preservation.
 

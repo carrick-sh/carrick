@@ -693,7 +693,7 @@ test-kernel *ARGS:
 ### Execution decisions
 
 - Implementation branch: `codex/kernel-harness-conformance-loop`, based on
-  extraction revision `ce6dc16f6`; the original app worktree revision lacked
+  extraction revision `738e35399`; the original app worktree revision lacked
   both this plan and `carrick-kernel-example`. The plan was copied from the
   extraction worktree without changing that worktree.
 - Required ordering uses bounded explicit handshakes. The illustrative
@@ -1080,8 +1080,8 @@ for final acceptance.
 This follow-up records fixes requested after the original plan acceptance. The
 original deferral receipts above remain historical evidence, not current waivers.
 
-- Lifecycle implementation: `093f16c4c`; exact namespace retirement invariant
-  classifications: `2100db490`. Explicit SIGCHLD `SIG_IGN` and `SA_NOCLDWAIT`
+- Lifecycle implementation: `28aacffdd`; exact namespace retirement invariant
+  classifications: `adcb273b1`. Explicit SIGCHLD `SIG_IGN` and `SA_NOCLDWAIT`
   retire the child without a zombie, remove its parent topology entry, and wake
   an already-enrolled parent with `ECHILD`. Auto-reaped usage is not charged to
   `RUSAGE_CHILDREN`; a consumed ordinary wait still charges it. A clone child
@@ -1151,7 +1151,7 @@ original deferral receipts above remain historical evidence, not current waivers
 
 #### Follow-up final acceptance
 
-- Product/harness fix: `db74ae4e1`; tested committed tree: `e77341d7d`.
+- Product/harness fix: `5e5ffd098`; tested committed tree: `65843e7ec`.
   Full `just ci` exited zero, including workspace Clippy, all local architecture
   and inventory gates, compile/rustdoc, host tests, and integration/CLI/harness
   validation. Receipt: `/tmp/deferred-ci-accepted.log`.
@@ -1161,7 +1161,7 @@ original deferral receipts above remain historical evidence, not current waivers
   Independent normalized JSON comparison confirmed the five reconciled
   inventories changed only positions/provenance, not classifications. The
   existing UNIX listener registry's typed pending-state change was separately
-  reviewed in `e77341d7d`; its `host_kernel_object` classification is unchanged.
+  reviewed in `65843e7ec`; its `host_kernel_object` classification is unchanged.
   Receipt: `/tmp/deferred-inventory-reconcile.log`.
 - This closes all three deferrals. No push or signed guest conformance run was
   performed. The macOS host-authority census reports its documented partial

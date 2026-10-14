@@ -1,6 +1,6 @@
 # COW kernel, legacy, maintenance and private-file caller integration
 
-Development on adapter parent 1b121731c. Contract: kernel.el1.stage1-publication.
+Development on adapter parent d05a834ad. Contract: kernel.el1.stage1-publication.
 No production admission, signed COW execution or checkpoint acceptance claimed.
 
 CowRepoint protocol v4 carries typed access authority: EL1-recorded private

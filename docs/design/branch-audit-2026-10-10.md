@@ -6,8 +6,8 @@ deleted, moved, rebased, committed or pushed. The only side effects were
 `git fetch` of remote-tracking refs on the local Mac, and objects written by
 `git merge-tree --write-tree` (no refs touched).
 
-Reference main: GitHub `main` = `4e63042fe` (PR #136 landed 16:41Z during the
-audit; most numbers were computed against `c9c603b9c`, one commit earlier).
+Reference main: GitHub `main` = `09d8c7ddc` (PR #136 landed 16:41Z during the
+audit; most numbers were computed against `51c90d27c`, one commit earlier).
 
 ## Method and caveats
 
@@ -19,7 +19,7 @@ audit; most numbers were computed against `c9c603b9c`, one commit earlier).
   resolution changed the patch. Subject-unique is therefore the better
   "really not landed" signal. It is still a heuristic in two directions:
   - a ported fix with a new subject still counts as unique (example: n1-cm
-    `0565ec758` and `bbf545fd4` were ported to main as `6f0db0dc4`, PR #128);
+    `0a8e22236` and `d81e1bf61` were ported to main as `d29c90ab3`, PR #128);
   - a rebase residue with the same subject counts as landed.
 - **Content landed:** `git merge-tree --write-tree origin/main X`. If the
   result tree equals main's tree, the content is in main. Most stale branches
@@ -35,7 +35,7 @@ audit; most numbers were computed against `c9c603b9c`, one commit earlier).
 
 1. **Two lanes are restructuring the same fork-stock/HAL code from one
    56-commit base, on different hosts.**
-   - Local `work/arm-adopt-step5` (`63a7f7666`, 78 commits, codex sol2):
+   - Local `work/arm-adopt-step5` (`de84593b8`, 78 commits, codex sol2):
      **blocked**, waiting on a director decision about FrameOwner transfer
      services.
    - carrick-vm `x86-fork-land` (agy, **running**): porting the x86 parts of
@@ -48,17 +48,17 @@ audit; most numbers were computed against `c9c603b9c`, one commit earlier).
 2. **The same bug has been fixed twice, in different code, in several areas.**
    Detail in section 2.2.
 3. **Active PRs carry stale duplicates of landed work.**
-   - **PR #137** (`work/ring-ipc`) is based on `dfc9100e2`. It carries 12
+   - **PR #137** (`work/ring-ipc`) is based on `75369d8ab`. It carries 12
      pre-rebase identity commits that landed via PR #130, and a **4 MiB** CPL0
      extent (`999c6cdaf`). PR #136 found that 4 MiB overlaps the fixture
      tables at 0x30_0000 and landed 2 MiB instead. Only 4 commits in #137 are
      real IPC work.
    - **PR #131**'s GitHub head (`73cd4e5b9`) is stale: 45 of its 106 subjects
      are already on main. The rebased head `765f0ab08` (76 commits on
-     `c9c603b9c`) exists **only on carrick-vm**. The push was blocked by the
+     `51c90d27c`) exists **only on carrick-vm**. The push was blocked by the
      extent limit, which #136 has now removed.
 4. **Unpushed sole copies.**
-   - arm-step5 tip commits `bd49c09e3`, `535806136` and `63a7f7666` exist
+   - arm-step5 tip commits `873aa9b1b`, `9170d470b` and `de84593b8` exist
      only on the local Mac.
    - The rebased ring-signals branch exists only on carrick-vm.
    - The 186 subject-unique commits on `work/n1-cm` are on GitHub but in a
@@ -71,12 +71,12 @@ audit; most numbers were computed against `c9c603b9c`, one commit earlier).
      fixture is also false.
    - None of this is in the repo.
 6. **The carrick-vm mirror is out of date.**
-   - The bare repo `~/dev/carrick.git` has `main` at `39fbcacb3`, 110 commits
-     behind (`gh-main` = `c9c603b9c`, also one behind now).
+   - The bare repo `~/dev/carrick.git` has `main` at `7cd536423`, 110 commits
+     behind (`gh-main` = `51c90d27c`, also one behind now).
    - Workers repeatedly reported that `CARRICK_AUTHORITY_BASE=origin/main`
      gated against the wrong base.
    - There are two repos on the VM: worktrees hang off the non-bare
-     `~/dev/carrick` clone, whose own `main` is `652e0dcde` (Oct 4,
+     `~/dev/carrick` clone, whose own `main` is `8391edd89` (Oct 4,
      996 behind).
 7. **Hygiene.**
    - Local: 461 branches, 27 worktrees; about 115 GB is reclaimable in
@@ -103,32 +103,32 @@ decision.
 
 | worktree | branch | head | ahead | subj-uniq | date | owner (meta.json) | size | status |
 |---|---|---|---|---|---|---|---|---|
-| (root) | main | 0250e7f2a | 0 | 0 | 10-04 | director | target 74G, .sccache 10G | local `main` ref is **1047 behind** origin/main |
-| ab-n1cm | work/n1-cm | bbf545fd4 | 517 | 186 | 10-08 | n1-cm-sol/n1-db2..4/n1-g1/g2 | 695M | PARKED (PR #59 draft); ORPHANED-UNIQUE fixes (see 2.1) |
-| ab-n1cm-main-baseline | detached | 3de24ed69 | 0 | 0 | 10-08 | - | 231M | LANDED (A/B baseline) |
-| ab-n1cm-panic | detached | a6d5d07e5 | 479 | 156 | 10-07 | - | 613M | SUPERSEDED by work/n1-cm (474/474 subjects in n1-cm) |
+| (root) | main | a6399d675 | 0 | 0 | 10-04 | director | target 74G, .sccache 10G | local `main` ref is **1047 behind** origin/main |
+| ab-n1cm | work/n1-cm | d81e1bf61 | 517 | 186 | 10-08 | n1-cm-sol/n1-db2..4/n1-g1/g2 | 695M | PARKED (PR #59 draft); ORPHANED-UNIQUE fixes (see 2.1) |
+| ab-n1cm-main-baseline | detached | 86fe5f537 | 0 | 0 | 10-08 | - | 231M | LANDED (A/B baseline) |
+| ab-n1cm-panic | detached | 828b42f08 | 479 | 156 | 10-07 | - | 613M | SUPERSEDED by work/n1-cm (474/474 subjects in n1-cm) |
 | arm-flip | docs/arm-ring-first-flip | 94f487d46 | 1 | 0 | 10-08 | arm-flip | 232M | LANDED |
-| arm-step5 | work/arm-adopt-step5 | 63a7f7666 | 78 | 77 | 10-10 | arm-step5 / -sol / -sol2 | 57G (56G target) | ACTIVE (blocked on director); 3 tip commits only here |
+| arm-step5 | work/arm-adopt-step5 | de84593b8 | 78 | 77 | 10-10 | arm-step5 / -sol / -sol2 | 57G (56G target) | ACTIVE (blocked on director); 3 tip commits only here |
 | arm-step5-first-error | detached | b0052e4fe | 17 | 17 | 10-09 | - | 16G | SUPERSEDED by arm-step5 (all 17 subjects in arm-step5) |
-| arm-step5-main-baseline | detached | dfc9100e2 | 0 | 0 | 10-09 | - | 18G | LANDED (A/B baseline) |
+| arm-step5-main-baseline | detached | 75369d8ab | 0 | 0 | 10-09 | - | 18G | LANDED (A/B baseline) |
 | bisect-df605a239 | detached | df605a239 | 356 | 43 | 10-06 | - | 614M | SUPERSEDED (X1-era CPL0 admission, 14 unique subjects, replaced by shared-kernel inversion #104-108; uncertain per commit) |
 | el1-inotify | agy/el1-inotify | 7eb9a6853 | 4 | 2 | 09-23 | - | 199M, 1 uncommitted file | SUPERSEDED (delegate/recall design abandoned 09-24) |
 | fix-freebsd | fix/freebsd-process-exit-claim | 75187008c | 1 | 0 | 10-07 | - | 231M | LANDED via #110 |
-| fixture-lock | fix/fixture-lock-reviewed-versions | 095661042 | 1 | 0 | 10-08 | - | 352M | LANDED (#117) |
-| fork-shared-retire | review/fork-retire-on-9d6 | 042cfa479 | 91 | 90 | 10-09 | - | 14G | ACTIVE-PORT source (same SHA as GitHub `review/fork-retire-on-26e3`; being ported on carrick-vm) |
+| fixture-lock | fix/fixture-lock-reviewed-versions | 15c9516f6 | 1 | 0 | 10-08 | - | 352M | LANDED (#117) |
+| fork-shared-retire | review/fork-retire-on-9d6 | bba0a52a1 | 91 | 90 | 10-09 | - | 14G | ACTIVE-PORT source (same SHA as GitHub `review/fork-retire-on-26e3`; being ported on carrick-vm) |
 | land-pr62 | detached | 69db26365 | 1 | 0 | 10-05 | - | 228M | LANDED |
 | land-x86-fixes | land/x86-standalone-fixes | ed913968e | 3 | 0 | 10-09 | - | 2.1G | LANDED (#133) |
 | lease-order | fix/lease-release-ordering | 0c8943ebf | 2 | 0 | 10-08 | lease-sol | 231M | LANDED (#116) |
 | lease-zombie | fix/host-lease-zombie-liveness | 68b733a03 | 1 | 0 | 10-07 | lease-gem | 231M | LANDED (#111) |
-| n1-bisect | detached | 6607b0281 | 358 | 40 | 10-05 | - | 611M | SUPERSEDED by work/n1-cm |
+| n1-bisect | detached | 0455c2c66 | 358 | 40 | 10-05 | - | 611M | SUPERSEDED by work/n1-cm |
 | n1-files | wip/n1-files-g2-diag-0307 | ce5975e46 | 431 | 110 | 10-07 | n1-files-g2 | 624M | SUPERSEDED by work/n1-cm except one `wip(n1-files)` diagnostic checkpoint |
 | ring-switch | work/ring-switch | 21c30ac3d | 42 | 0 | 10-09 | ring-switch / -sol | 44G | LANDED (#132) |
 | ring-switch-main-ab-20261009 | detached | 10e41549e | 1 | 1 | 10-09 | - | 20G | disposable A/B control (`test(conformance): add unchanged-main glibc fork control`) |
-| rl-shared-kernel | work/shared-kernel | 02c209cea | 476 | 0 | 10-07 | - | 231M | LANDED (#104-108) |
-| rl-x86-legacy-retire | work/x86-legacy-retire | c1c2f2f1b | 22 | 19 | 10-08 | - | 231M | SUPERSEDED by GitHub PR #86 head a344ea49a (same subjects, newer rebase) |
+| rl-shared-kernel | work/shared-kernel | cefae2f34 | 476 | 0 | 10-07 | - | 231M | LANDED (#104-108) |
+| rl-x86-legacy-retire | work/x86-legacy-retire | c1c2f2f1b | 22 | 19 | 10-08 | - | 231M | SUPERSEDED by GitHub PR #86 head e6f734a9c (same subjects, newer rebase) |
 | spawn-regress-fixed-pb | detached | 0661cbe3b | 1 | 0 | 10-04 | - | 224M | LANDED |
 | wt-remote-gate | work/remote-gate | 935d47a21 | 3 | 0 | 10-03 | - | 223M | LANDED |
-| x86-user-ceiling | work/x86-user-ceiling | 34e8d8187 | 2 | 2 | 10-06 | - | 226M | SUPERSEDED: second implementation of the mmap user-VA ceiling. Main landed `a0177ecac` instead. |
+| x86-user-ceiling | work/x86-user-ceiling | 34e8d8187 | 2 | 2 | 10-06 | - | 226M | SUPERSEDED: second implementation of the mmap user-VA ceiling. Main landed `b1b5bbc61` instead. |
 | xtask-macos | fix/xtask-macos-tests | 47f24cf70 | 2 | 0 | 10-07 | xtask-gem | 231M | LANDED (#110) |
 
 Local branches: **461**.
@@ -147,8 +147,8 @@ The VM has two repos:
 - `~/dev/carrick.git`: bare. Its `origin` remote points at itself. It has
   110 branches, 70 of them `fixpub/<sha>` bundle-publication refs.
 - `~/dev/carrick`: non-bare clone with 125 branches. **All `~/dev/wt-*`
-  worktrees belong to this clone.** Its `main` is `652e0dcde` (Oct 4,
-  996 behind) and its `origin/main` is `39fbcacb3`.
+  worktrees belong to this clone.** Its `main` is `8391edd89` (Oct 4,
+  996 behind) and its `origin/main` is `7cd536423`.
 
 Running workers:
 - `ring-signals-sol`, pid 682464, in `wt-ring-signals`.
@@ -158,8 +158,8 @@ Disk: 174G of 246G used, 63G free.
 
 | worktree | branch | head | subj-uniq | date | owner | size | status |
 |---|---|---|---|---|---|---|---|
-| wt-ring-signals | work/ring-signals | 765f0ab08 | 74 | 10-10 | ring-signals-sol (RUNNING) | 63G | ACTIVE; rebased on c9c603b9c; **not on GitHub** (PR #131 head stale) |
-| wt-x86-fork-land | work/x86-fork-land | c9c603b9c (+ uncommitted port) | 0 | 10-10 | x86-fork-land (RUNNING) | 5.9G | ACTIVE: porting fork-retire x86 parts onto 4e63042fe |
+| wt-ring-signals | work/ring-signals | 765f0ab08 | 74 | 10-10 | ring-signals-sol (RUNNING) | 63G | ACTIVE; rebased on 51c90d27c; **not on GitHub** (PR #131 head stale) |
+| wt-x86-fork-land | work/x86-fork-land | 51c90d27c (+ uncommitted port) | 0 | 10-10 | x86-fork-land (RUNNING) | 5.9G | ACTIVE: porting fork-retire x86 parts onto 09d8c7ddc |
 | wt-ring-ipc | work/ring-ipc | 70badb62d | 5 | 10-10 | ring-ipc | 30G | ACTIVE (PR #137), needs rebase/cleanup |
 | wt-cpl0-extent | work/cpl0-image-extent | facdbfd20 | 1 | 10-10 | cpl0-extent | 12G | LANDED (#136) |
 | wt-fdtable | work/shared-fd-table | 84060af42 | 0 | 10-10 | x86-fdtable(-sol) | 238M | LANDED (#135) |
@@ -167,19 +167,19 @@ Disk: 174G of 246G used, 63G free.
 | wt-ring-sched | work/ring-sched | 4d1d06921 | 0 | 10-10 | ring-sched(-sol) | 237M | LANDED (#134) |
 | wt-land-x86 | detached | be9c604f2 | 0 | 10-09 | - | 236M | LANDED (#133) |
 | wt-review-switch | detached | bad35bc69 | 0 | 10-09 | - | 236M | LANDED (#132) |
-| wt-main-ab | detached | dfc9100e2 | 0 | 10-09 | - | 236M | disposable baseline |
-| wt-x86-diag | work/x86-n1-diag | 015a9bb84 | 247 | 10-08 | x86-diag | 628M | PARKED (PR #119 draft) |
-| wt-x86-anon | work/x86-process-owner-resume | e9eb22e1f | 228 | 10-08 | x86-anon-sol2/x86-fork-2/x86-fork-sol | 237M | PARKED (= GitHub work/x86-process-owner) |
-| wt-x86-legacy | work/x86-legacy-retire | a344ea49a | 19 | 10-08 | x86-retire-final | 235M | ACTIVE (PR #86) |
+| wt-main-ab | detached | 75369d8ab | 0 | 10-09 | - | 236M | disposable baseline |
+| wt-x86-diag | work/x86-n1-diag | b0f156332 | 247 | 10-08 | x86-diag | 628M | PARKED (PR #119 draft) |
+| wt-x86-anon | work/x86-process-owner-resume | 7bdb39272 | 228 | 10-08 | x86-anon-sol2/x86-fork-2/x86-fork-sol | 237M | PARKED (= GitHub work/x86-process-owner) |
+| wt-x86-legacy | work/x86-legacy-retire | e6f734a9c | 19 | 10-08 | x86-retire-final | 235M | ACTIVE (PR #86) |
 | wt-x86-entry | work/x86-entry-unify | 18d8cec53 | 0 | 10-08 | x86-entry-gem | 236M | LANDED |
 | wt-x86-shared-fixes | work/shared-x86-fork-fixes | 7cab20c99 | 0 | 10-08 | - | 235M | LANDED (#120) |
 | wt-process-owner-main | work/shared-process-owner | 344812665 | 0 | 10-08 | - | 236M | LANDED (#121) |
 | wt-review121-{ci-lint,ci-runtime,exit-effects,isa,kvm-boundary,wait} | work/review121-* | various | 0-1 | 10-08 | rev121 | 6 x 236M | LANDED via #121 (`wt-review121-wait` has 1 uncommitted file; `review121-exit-effects` has 1 unique subject, check) |
-| wt-x86-anon-main-classify | detached | 048c2b6c1 | 0 | 10-08 | - | 235M | disposable baseline |
-| wt-buildcode | fix/fixture-lock-reviewed-versions | 773d23573 | 0 | 10-08 | buildcode-sol | 235M | LANDED (#117) |
+| wt-x86-anon-main-classify | detached | eae1d0752 | 0 | 10-08 | - | 235M | disposable baseline |
+| wt-buildcode | fix/fixture-lock-reviewed-versions | af7cf436b | 0 | 10-08 | buildcode-sol | 235M | LANDED (#117) |
 | wt-buildrs | fix/vmm-kvm-build-no-nested-cargo | f6322220b | 0 | 10-08 | buildrs-sol | 236M | LANDED (#118) |
 | wt-mem-race | fix/mem-snapshot-deadline-race | 5c1de8dc7 | 0 | 10-08 | memrace-gem | 235M | LANDED (#115) |
-| wt-resv | work/resv-double-free | db716c74e | 0 | 10-08 | resv-* | 235M | LANDED (#112) |
+| wt-resv | work/resv-double-free | fd9556dbf | 0 | 10-08 | resv-* | 235M | LANDED (#112) |
 | wt-inv | work/inv-pr1 | c10d9bfb3 | 0 | 10-08 | inv-sol | 235M | LANDED |
 | wt-inv-review | detached | b476c25c1 | ? | 10-08 | review-51(b) | 234M | review scratch |
 | wt-merge-queue | work/merge-queue | 43bc3bd87 | 3 | 10-04 | - | 229M | SUPERSEDED (merge queue live) |
@@ -194,29 +194,29 @@ The VM also has 10-04 to 10-08 bundles and briefs in `~/dev`
 
 ### 1.3 cloudmac (`rentamac@cloudmac`)
 
-Two repos: `/Volumes/carrick/dev/carrick.git` (bare; `main` `8b6cf9031`
+Two repos: `/Volumes/carrick/dev/carrick.git` (bare; `main` `409b163da`
 10-04, `github/main` fetched 10-08; 137 branches, 116 of them `gate/*`) and
 `/Volumes/carrick/dev/carrick` (clone; `main` 10-03, `github/main` 10-07).
 The SSD `/Volumes/carrick-build` is 53% used.
 
 | worktree | head | date | size | status |
 |---|---|---|---|---|
-| gate-worktree | 8d615fac4 | 10-10 | 1.6G | LANDED (= main 476c73a65 by subject); live gate scratch |
-| signed-main | cb835a712 | 10-10 | 627M | stale main checkout |
+| gate-worktree | 8d615fac4 | 10-10 | 1.6G | LANDED (= main 350d9f345 by subject); live gate scratch |
+| signed-main | 5d67097ef | 10-10 | 627M | stale main checkout |
 | signed-pr130 / pr134 / pr135 / pr136 | b8730fee3 / 4d1d06921 / 84060af42 / facdbfd20 | 10-10 | 628M each | LANDED, deletable |
-| wt-attrib-main | f0e9a3265 | 10-05 | 656M | stale |
+| wt-attrib-main | 805a8c828 | 10-05 | 656M | stale |
 | wt-build-cache-proof | 53dc33549 | 10-05 | 225M | stale |
 | wt-elf-fix | c98fd647f (work/elf-fix) | 10-04 | 226M | PR #35 closed; 0 unique |
 | wt-fes-load | bedfd58cd | 10-04 | 1.4G | PR #20 closed; 0 unique |
 | wt-hosted-mac | d196e752d | 10-04 | 227M | PR #42 closed; 0 unique |
-| wt-n1-p4 | a0ead6ea5 | 10-04 | 227M | PR #21 draft (stale N1 p4) |
+| wt-n1-p4 | 55a1abd2d | 10-04 | 227M | PR #21 draft (stale N1 p4) |
 | wt-pool-guard | f6870ea6a | 10-04 | 226M | PR #37 closed; 0 unique |
-| wt-storm | dd75266a3 | 10-05 | 618M | PR #49 closed |
+| wt-storm | 5c6fd7a19 | 10-05 | 618M | PR #49 closed |
 
 Other cloudmac data: `evidence` 12G, `sccache` 14G, `home` 13G,
 `fixtures` 1G. Unique refs on cloudmac only:
 - `n1-cm-before-order4-ee105fb96`: missing locally; an older N1 snapshot.
-- `work/n1-cm` `cad5ae1f8`: an older copy of GitHub `work/n1-cm`.
+- `work/n1-cm` `62da3cc14`: an older copy of GitHub `work/n1-cm`.
 
 ### 1.4 GitHub (`carrick-sh/carrick`, 125 branches)
 
@@ -232,150 +232,150 @@ The local clone also has 64 stale remote-tracking refs
 
 | branch | head | ahead | subj-uniq | date | PR | status |
 |---|---|---|---|---|---|---|
-| fix/el1-grant-handback | 6569af7b6 | 0 | 0 | 2026-09-27 | - | LANDED |
-| wip-2.3-fix | 31ca9d8e9 | 4 | 4 | 2026-09-27 | - | SUPERSEDED/CHECK |
-| wip/el1-anon-mmap-2.3 | 8a5553abe | 1 | 1 | 2026-09-27 | - | SUPERSEDED/CHECK |
+| fix/el1-grant-handback | ffa78cd2f | 0 | 0 | 2026-09-27 | - | LANDED |
+| wip-2.3-fix | 237c9f808 | 4 | 4 | 2026-09-27 | - | SUPERSEDED/CHECK |
+| wip/el1-anon-mmap-2.3 | cd8a6f9a1 | 1 | 1 | 2026-09-27 | - | SUPERSEDED/CHECK |
 | work/futex-per-kernel | b5cbc4096 | 6 | 0 | 2026-10-04 | CLOSED#17 | LANDED |
-| work/batch4-linux-reconcile | 11a2e045c | 1 | 0 | 2026-10-04 | - | LANDED |
+| work/batch4-linux-reconcile | 03df9f58b | 1 | 0 | 2026-10-04 | - | LANDED |
 | work/spawn-regress | 2e92bc045 | 6 | 0 | 2026-10-04 | CLOSED#8 | LANDED |
 | work/fes-load | bedfd58cd | 7 | 0 | 2026-10-04 | CLOSED#20 | LANDED |
 | work/willow-pilot | df0ca8195 | 24 | 0 | 2026-10-04 | CLOSED#18 | LANDED |
 | work/flash-persona | 4c11d300d | 2 | 0 | 2026-10-04 | CLOSED#15 | LANDED |
-| work/n1-p2 | 41fe977bc | 159 | 12 | 2026-10-04 | OPEN#11 | ACTIVE (draft, stale) |
+| work/n1-p2 | 0508b2e49 | 159 | 12 | 2026-10-04 | OPEN#11 | ACTIVE (draft, stale) |
 | work/flash-x86parity | 93d44690e | 2 | 0 | 2026-10-04 | CLOSED#13 | LANDED |
 | work/x86-m3 | 786f6f4b3 | 155 | 8 | 2026-10-04 | CLOSED#7 | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
-| work/n1-p1 | 09cf6a56b | 159 | 12 | 2026-10-04 | OPEN#14 | ACTIVE (draft, stale) |
-| work/n2-audit | 94567dd6f | 2 | 2 | 2026-10-04 | CLOSED#25 | ORPHANED-UNIQUE (n2 readiness plan doc) |
+| work/n1-p1 | 9b8b7d492 | 159 | 12 | 2026-10-04 | OPEN#14 | ACTIVE (draft, stale) |
+| work/n2-audit | d94e9ec8c | 2 | 2 | 2026-10-04 | CLOSED#25 | ORPHANED-UNIQUE (n2 readiness plan doc) |
 | work/abi-meta | d51757343 | 1 | 0 | 2026-10-04 | CLOSED#33 | LANDED |
 | work/fixtures-nodocker | e9c1e032f | 9 | 0 | 2026-10-04 | CLOSED#10 | LANDED |
-| land/batch5 | 51bfe67f4 | 0 | 0 | 2026-10-04 | MERGED#40 | LANDED |
+| land/batch5 | bb24853c2 | 0 | 0 | 2026-10-04 | MERGED#40 | LANDED |
 | work/merge-queue | 0410065d0 | 2 | 2 | 2026-10-04 | CLOSED#2 | SUPERSEDED (merge queue live on main) |
-| work/n1-p3 | 3db84db7c | 159 | 12 | 2026-10-04 | OPEN#16 | ACTIVE (draft, stale) |
-| work/batch4-futex-replay | 16516bf7c | 1 | 0 | 2026-10-04 | - | LANDED |
+| work/n1-p3 | 5b9774b45 | 159 | 12 | 2026-10-04 | OPEN#16 | ACTIVE (draft, stale) |
+| work/batch4-futex-replay | 861e10077 | 1 | 0 | 2026-10-04 | - | LANDED |
 | work/elf-fix | c98fd647f | 6 | 0 | 2026-10-04 | CLOSED#35 | LANDED |
 | work/pool-guard | f6870ea6a | 1 | 0 | 2026-10-04 | CLOSED#37 | LANDED |
 | work/hosted-mac | 5e996d351 | 41 | 0 | 2026-10-04 | CLOSED#39 | LANDED |
 | work/hosted-mac-jit | d196e752d | 2 | 0 | 2026-10-04 | CLOSED#42 | LANDED |
-| work/n2-l2 | ac995a3f7 | 1 | 1 | 2026-10-04 | OPEN#31 | ACTIVE draft, stale; ORPHANED-UNIQUE N2 red witnesses |
+| work/n2-l2 | 74e126862 | 1 | 1 | 2026-10-04 | OPEN#31 | ACTIVE draft, stale; ORPHANED-UNIQUE N2 red witnesses |
 | work/n2-l5 | c6e85d291 | 1 | 0 | 2026-10-04 | CLOSED#32 | LANDED |
-| work/n2-l1 | 46abf774e | 1 | 1 | 2026-10-04 | OPEN#29 | ACTIVE draft, stale; ORPHANED-UNIQUE N2 red witnesses |
-| work/n2-l3 | 89e183f42 | 1 | 1 | 2026-10-04 | OPEN#28 | ACTIVE draft, stale; ORPHANED-UNIQUE N2 red witnesses |
-| work/n2-l4 | 2e6abf504 | 1 | 1 | 2026-10-04 | OPEN#27 | ACTIVE draft, stale; ORPHANED-UNIQUE N2 red witnesses |
-| work/n1-p4 | a0ead6ea5 | 154 | 7 | 2026-10-04 | OPEN#21 | ACTIVE (draft, stale) |
+| work/n2-l1 | a3a845f7a | 1 | 1 | 2026-10-04 | OPEN#29 | ACTIVE draft, stale; ORPHANED-UNIQUE N2 red witnesses |
+| work/n2-l3 | 63fdd16cd | 1 | 1 | 2026-10-04 | OPEN#28 | ACTIVE draft, stale; ORPHANED-UNIQUE N2 red witnesses |
+| work/n2-l4 | c4143fdfd | 1 | 1 | 2026-10-04 | OPEN#27 | ACTIVE draft, stale; ORPHANED-UNIQUE N2 red witnesses |
+| work/n1-p4 | 55a1abd2d | 154 | 7 | 2026-10-04 | OPEN#21 | ACTIVE (draft, stale) |
 | work/lease-leak | 9ae96f130 | 19 | 0 | 2026-10-04 | CLOSED#6 | LANDED |
-| work/flash-ns-seed | 80f362b32 | 1 | 1 | 2026-10-04 | CLOSED#23 | ORPHANED-UNIQUE (flake evidence README + seed sweep) |
-| work/flash-futex-seed | 391fae5ea | 1 | 1 | 2026-10-04 | CLOSED#22 | ORPHANED-UNIQUE (flake evidence README + seed sweep) |
+| work/flash-ns-seed | a7d10443c | 1 | 1 | 2026-10-04 | CLOSED#23 | ORPHANED-UNIQUE (flake evidence README + seed sweep) |
+| work/flash-futex-seed | d97f5a6c0 | 1 | 1 | 2026-10-04 | CLOSED#22 | ORPHANED-UNIQUE (flake evidence README + seed sweep) |
 | work/willow-pilot-workflow | 02d0500a6 | 1 | 0 | 2026-10-04 | MERGED#12 | LANDED |
 | work/vmfree-m2 | dd5808a2e | 24 | 0 | 2026-10-04 | CLOSED#1 | LANDED |
 | work/x86-i1 | 681f35571 | 1 | 0 | 2026-10-04 | CLOSED#26 | LANDED |
 | work/x86-i2 | d08aad46b | 1 | 0 | 2026-10-04 | CLOSED#30 | LANDED |
 | work/x1-arm-regress | 0feb7c7b0 | 369 | 51 | 2026-10-05 | CLOSED#70 | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
-| work/x86-wave2-plan-main | 289e8d797 | 3 | 3 | 2026-10-05 | CLOSED#67 | ORPHANED-UNIQUE doc (wave2 plan, inverted 10-06) |
+| work/x86-wave2-plan-main | 97dffe971 | 3 | 3 | 2026-10-05 | CLOSED#67 | ORPHANED-UNIQUE doc (wave2 plan, inverted 10-06) |
 | work/elastic-design | a98b655f5 | 4 | 0 | 2026-10-05 | CLOSED#4 | LANDED |
-| work/affinity-migration | dd75266a3 | 10 | 2 | 2026-10-05 | CLOSED#49 | SUPERSEDED/CHECK |
-| work/x86-audit | a9a39db0c | 2 | 2 | 2026-10-05 | CLOSED#24 | ORPHANED-UNIQUE doc, superseded by inversion plan |
+| work/affinity-migration | 5c6fd7a19 | 10 | 2 | 2026-10-05 | CLOSED#49 | SUPERSEDED/CHECK |
+| work/x86-audit | 9e9a24393 | 2 | 2 | 2026-10-05 | CLOSED#24 | ORPHANED-UNIQUE doc, superseded by inversion plan |
 | land/batch8 | 87aeb82d3 | 6 | 0 | 2026-10-05 | MERGED#58 | LANDED |
 | work/persona-design | 486394ebf | 2 | 0 | 2026-10-05 | CLOSED#19 | LANDED |
-| work/x86-a-imagedeps | 9bc49cadf | 318 | 23 | 2026-10-05 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
-| work/n1-fork | df282f8bd | 222 | 10 | 2026-10-05 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
-| work/fixture-scope | 805eada21 | 2 | 0 | 2026-10-05 | CLOSED#43 | LANDED |
+| work/x86-a-imagedeps | 6f00f8280 | 318 | 23 | 2026-10-05 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
+| work/n1-fork | a0a38aafe | 222 | 10 | 2026-10-05 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
+| work/fixture-scope | 55be9569f | 2 | 0 | 2026-10-05 | CLOSED#43 | LANDED |
 | work/inv-pr5 | 9847585b7 | 4 | 0 | 2026-10-05 | CLOSED#45 | LANDED |
 | work/inv-pr34 | 4d5915953 | 3 | 0 | 2026-10-05 | CLOSED#47 | LANDED |
 | work/tlb-ack-terminal | 111d92ecf | 2 | 0 | 2026-10-05 | CLOSED#55 | LANDED |
 | work/remote-bundle | 564b0c996 | 4 | 0 | 2026-10-05 | CLOSED#54 | LANDED |
-| work/x86-b | 804018d23 | 262 | 12 | 2026-10-05 | CLOSED#60 | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
+| work/x86-b | 99813df44 | 262 | 12 | 2026-10-05 | CLOSED#60 | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
 | work/ci-green | bcd1f5df7 | 37 | 0 | 2026-10-05 | CLOSED#3 | LANDED |
 | work/build-cache | e9f37be53 | 18 | 0 | 2026-10-05 | MERGED#5 | LANDED |
 | work/m2-kvm | 11fac0d7b | 4 | 0 | 2026-10-05 | CLOSED#34 | LANDED |
 | work/socket-dispatch | 4282a08a4 | 1 | 0 | 2026-10-05 | CLOSED#50 | LANDED |
-| work/x86-a-faultfix | c4e7eba4d | 295 | 20 | 2026-10-05 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
-| work/x86-a-cowfix2 | e6e6eb7c1 | 295 | 20 | 2026-10-05 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
-| land/batch6 | b2e77e2ff | 0 | 0 | 2026-10-05 | MERGED#53 | LANDED |
-| work/n1-filemap-wip | 3c5113bda | 348 | 30 | 2026-10-05 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
-| work/ci-unit-shard | a3f9b2d5b | 1 | 1 | 2026-10-05 | OPEN#44 | ACTIVE (PR44 draft, stale) |
+| work/x86-a-faultfix | 35f826eb4 | 295 | 20 | 2026-10-05 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
+| work/x86-a-cowfix2 | a6eec0d4b | 295 | 20 | 2026-10-05 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
+| land/batch6 | 65ac260fe | 0 | 0 | 2026-10-05 | MERGED#53 | LANDED |
+| work/n1-filemap-wip | 2506723d1 | 348 | 30 | 2026-10-05 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
+| work/ci-unit-shard | b25cb5bad | 1 | 1 | 2026-10-05 | OPEN#44 | ACTIVE (PR44 draft, stale) |
 | work/inv-pr2 | 35e803b1b | 1 | 0 | 2026-10-05 | CLOSED#46 | LANDED |
-| work/x86-a | 26b1548d9 | 334 | 26 | 2026-10-05 | CLOSED#61 | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
-| work/n1 | 56bf8c0ca | 347 | 29 | 2026-10-05 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
-| land/batch7 | 80bc107de | 0 | 0 | 2026-10-05 | MERGED#57 | LANDED |
-| work/ci-restructure | 48c1d9c41 | 0 | 0 | 2026-10-05 | MERGED#41 | LANDED |
-| work/affinity-el1-zone | 31c830e39 | 10 | 3 | 2026-10-05 | OPEN#52 | ACTIVE (PR52 draft, stale) |
+| work/x86-a | 7e0962947 | 334 | 26 | 2026-10-05 | CLOSED#61 | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
+| work/n1 | a4faef4c8 | 347 | 29 | 2026-10-05 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
+| land/batch7 | 3c9c3d37a | 0 | 0 | 2026-10-05 | MERGED#57 | LANDED |
+| work/ci-restructure | a25bba6ed | 0 | 0 | 2026-10-05 | MERGED#41 | LANDED |
+| work/affinity-el1-zone | eda91808f | 10 | 3 | 2026-10-05 | OPEN#52 | ACTIVE (PR52 draft, stale) |
 | work/vfork-hook-scope | 0310780a5 | 2 | 0 | 2026-10-05 | CLOSED#56 | LANDED |
 | work/wallclock-sweep | 4ab04bfd0 | 4 | 0 | 2026-10-05 | CLOSED#48 | LANDED |
 | work/x86-i4 | ec5aaaf7d | 1 | 0 | 2026-10-05 | CLOSED#38 | LANDED |
 | work/x86-i3 | ced34acc4 | 1 | 0 | 2026-10-05 | CLOSED#36 | LANDED |
-| land/pr87 | 06607ada3 | 7 | 0 | 2026-10-06 | - | LANDED |
+| land/pr87 | db75f7ec9 | 7 | 0 | 2026-10-06 | - | LANDED |
 | work/proc-uptime-host-bound | 65bcb1539 | 2 | 0 | 2026-10-06 | MERGED#84 | LANDED |
-| work/launch-trace-flag | f73f9e189 | 3 | 2 | 2026-10-06 | OPEN#90 | ACTIVE (PR90 draft, stale) |
-| work/shared-kernel-inversion-plan | e42dc0a4d | 3 | 3 | 2026-10-06 | CLOSED#72 | ORPHANED-UNIQUE doc + census tool (plan executed via #104-108) |
+| work/launch-trace-flag | e28228709 | 3 | 2 | 2026-10-06 | OPEN#90 | ACTIVE (PR90 draft, stale) |
+| work/shared-kernel-inversion-plan | dc399090f | 3 | 3 | 2026-10-06 | CLOSED#72 | ORPHANED-UNIQUE doc + census tool (plan executed via #104-108) |
 | work/x86-wave2-plan | 3f91c9bc5 | 149 | 7 | 2026-10-06 | CLOSED#65 | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
 | work/sk-mmu | 6acc625ed | 415 | 32 | 2026-10-06 | CLOSED#76 | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
 | work/x86-x1a | 1bbc39005 | 373 | 55 | 2026-10-06 | CLOSED#64 | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
 | work/layout-tools | 23de5c610 | 364 | 29 | 2026-10-06 | CLOSED#73 | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
-| work/x86-ord5 | 926ccbd46 | 366 | 30 | 2026-10-06 | CLOSED#68 | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
-| work/x86-ord6 | 904fd644b | 374 | 31 | 2026-10-06 | CLOSED#71 | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
-| work/mm-pub-v2 | 9bf9d2241 | 500 | 37 | 2026-10-06 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
-| work/x86-ord4 | 246038022 | 345 | 29 | 2026-10-06 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
+| work/x86-ord5 | 6965c0200 | 366 | 30 | 2026-10-06 | CLOSED#68 | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
+| work/x86-ord6 | 8b4778f5d | 374 | 31 | 2026-10-06 | CLOSED#71 | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
+| work/mm-pub-v2 | 494305d75 | 500 | 37 | 2026-10-06 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
+| work/x86-ord4 | 0edffc84d | 345 | 29 | 2026-10-06 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
 | work/cpl0-dep | 0d6f1bba5 | 1 | 0 | 2026-10-06 | MERGED#62 | LANDED |
 | work/accept-deps | f79cbb361 | 1 | 0 | 2026-10-06 | MERGED#88 | LANDED |
 | work/ci-sccache | f922e70b5 | 2 | 0 | 2026-10-06 | MERGED#63 | LANDED |
-| work/gate-hygiene | 0903c836a | 2 | 2 | 2026-10-06 | OPEN#66 | ACTIVE (PR66 draft, stale) |
-| work/n1-sigframe-draft | e8cbf3744 | 386 | 67 | 2026-10-06 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
+| work/gate-hygiene | f22b5f63b | 2 | 2 | 2026-10-06 | OPEN#66 | ACTIVE (PR66 draft, stale) |
+| work/n1-sigframe-draft | ba8d42f08 | 386 | 67 | 2026-10-06 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
 | work/sk-user | 63edab813 | 372 | 29 | 2026-10-06 | CLOSED#74 | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
 | work/x86-va-ceiling | 59e01e072 | 375 | 31 | 2026-10-06 | CLOSED#77 | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
-| work/syscall-abi-crate | 97fa80542 | 466 | 36 | 2026-10-06 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
-| work/anon-generic | 261f5721a | 482 | 51 | 2026-10-06 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
+| work/syscall-abi-crate | 4a7788c8e | 466 | 36 | 2026-10-06 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
+| work/anon-generic | b6a9dc177 | 482 | 51 | 2026-10-06 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
 | work/sk-mmu-fork | 519c1fe36 | 420 | 32 | 2026-10-06 | CLOSED#78 | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
-| work/backend-target-select | 48c73b1c3 | 4 | 4 | 2026-10-06 | - | ORPHANED-UNIQUE (no PR; BSD lanes via syscall shim) |
-| work/x86-fork-e2e | f114c0777 | 489 | 59 | 2026-10-06 | CLOSED#82 | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
+| work/backend-target-select | 3d2d2ce39 | 4 | 4 | 2026-10-06 | - | ORPHANED-UNIQUE (no PR; BSD lanes via syscall shim) |
+| work/x86-fork-e2e | 379e94e3c | 489 | 59 | 2026-10-06 | CLOSED#82 | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
 | work/x86-mm-owner | e3672b6b4 | 431 | 33 | 2026-10-06 | CLOSED#80 | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
 | work/futex-halt-poll-determinism | 52b203dd6 | 2 | 0 | 2026-10-06 | MERGED#69 | LANDED |
-| work/sk-gates | 735a08c59 | 485 | 37 | 2026-10-06 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
+| work/sk-gates | fdf5ec73d | 485 | 37 | 2026-10-06 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
 | work/sk-mmu-legacy | 15a685fb1 | 421 | 32 | 2026-10-06 | CLOSED#79 | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
-| wip/n1-cm-codex-stop | 8a2d52df7 | 400 | 81 | 2026-10-06 | - | SUPERSEDED by work/n1-cm |
+| wip/n1-cm-codex-stop | b494817ab | 400 | 81 | 2026-10-06 | - | SUPERSEDED by work/n1-cm |
 | work/x86-run | 7e77db9fd | 524 | 70 | 2026-10-07 | CLOSED#81 | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
-| work/shared-kernel | 02c209cea | 476 | 0 | 2026-10-07 | CLOSED#75 | LANDED |
-| work/x86-entry-unify2 | b745f87f1 | 509 | 23 | 2026-10-07 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
-| work/n1-cm-panic-diag | a6d5d07e5 | 479 | 156 | 2026-10-07 | - | SUPERSEDED by work/n1-cm (subject subset) |
+| work/shared-kernel | cefae2f34 | 476 | 0 | 2026-10-07 | CLOSED#75 | LANDED |
+| work/x86-entry-unify2 | 9e33d2f54 | 509 | 23 | 2026-10-07 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
+| work/n1-cm-panic-diag | 828b42f08 | 479 | 156 | 2026-10-07 | - | SUPERSEDED by work/n1-cm (subject subset) |
 | fix/freebsd-process-exit-claim | 75187008c | 1 | 0 | 2026-10-07 | CLOSED#109 | LANDED |
-| work/x86-anon-cpl0 | 83364467d | 580 | 105 | 2026-10-07 | CLOSED#102 | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
-| archive/shared-kernel-pre-land-d355743b2 | d355743b2 | 482 | 10 | 2026-10-07 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
-| work/shared-kernel-scorecard | 6261fd7e3 | 484 | 12 | 2026-10-07 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
-| work/x86-cpl0-input-authorities | d1cdac6bf | 508 | 54 | 2026-10-07 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
-| archive/x86-entry-unify-pre-rebase-ccb413b96 | ccb413b96 | 505 | 39 | 2026-10-07 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
+| work/x86-anon-cpl0 | 5d21b90b4 | 580 | 105 | 2026-10-07 | CLOSED#102 | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
+| archive/shared-kernel-pre-land-b1539a5ba | b1539a5ba | 482 | 10 | 2026-10-07 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
+| work/shared-kernel-scorecard | a95b52218 | 484 | 12 | 2026-10-07 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
+| work/x86-cpl0-input-authorities | c8617ce84 | 508 | 54 | 2026-10-07 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
+| archive/x86-entry-unify-pre-rebase-cc293ed66 | cc293ed66 | 505 | 39 | 2026-10-07 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
 | wip/shared-kernel-codex-stop | 577e01fc8 | 498 | 38 | 2026-10-07 | - | SUPERSEDED (pre-inversion x86/N1 wave; content re-landed via #104-108/#120/#121 or parked in n1-cm) |
-| work/x86-legacy-retire | a344ea49a | 21 | 19 | 2026-10-08 | OPEN#86 | ACTIVE (PR86, green CI, 269 behind) - ORPHANED-UNIQUE TLS/arch_prctl |
-| docs/arm-shared-owner-adoption | c770fc91d | 1 | 0 | 2026-10-08 | - | LANDED |
-| work/x86-process-owner | e9eb22e1f | 1652 | 228 | 2026-10-08 | - | PARKED - shared fixes extracted to PR120/121 |
-| work/x86-n1-diag | 015a9bb84 | 1672 | 247 | 2026-10-08 | OPEN#119 | PARKED (PR119 draft) - merge-based lane, some ORPHANED-UNIQUE |
-| fix/fixture-lock-reviewed-versions | 773d23573 | 2 | 0 | 2026-10-08 | - | LANDED |
-| work/n1-cm | bbf545fd4 | 517 | 186 | 2026-10-08 | OPEN#59 | PARKED (PR59 draft) - holds ORPHANED-UNIQUE fixes |
-| work/arm-step5-review | 9d62964fd | 56 | 55 | 2026-10-09 | - | SUPERSEDED by local work/arm-adopt-step5 (56/56 subjects; local has 22 more) |
-| review/fork-retire-on-26e3 | 042cfa479 | 91 | 90 | 2026-10-09 | - | ACTIVE-PORT (being ported by carrick-vm x86-fork-land) |
+| work/x86-legacy-retire | e6f734a9c | 21 | 19 | 2026-10-08 | OPEN#86 | ACTIVE (PR86, green CI, 269 behind) - ORPHANED-UNIQUE TLS/arch_prctl |
+| docs/arm-shared-owner-adoption | be7947d75 | 1 | 0 | 2026-10-08 | - | LANDED |
+| work/x86-process-owner | 7bdb39272 | 1652 | 228 | 2026-10-08 | - | PARKED - shared fixes extracted to PR120/121 |
+| work/x86-n1-diag | b0f156332 | 1672 | 247 | 2026-10-08 | OPEN#119 | PARKED (PR119 draft) - merge-based lane, some ORPHANED-UNIQUE |
+| fix/fixture-lock-reviewed-versions | af7cf436b | 2 | 0 | 2026-10-08 | - | LANDED |
+| work/n1-cm | d81e1bf61 | 517 | 186 | 2026-10-08 | OPEN#59 | PARKED (PR59 draft) - holds ORPHANED-UNIQUE fixes |
+| work/arm-step5-review | 4f0a18b26 | 56 | 55 | 2026-10-09 | - | SUPERSEDED by local work/arm-adopt-step5 (56/56 subjects; local has 22 more) |
+| review/fork-retire-on-26e3 | bba0a52a1 | 91 | 90 | 2026-10-09 | - | ACTIVE-PORT (being ported by carrick-vm x86-fork-land) |
 | work/fork-shared-retire | edeb17b82 | 60 | 59 | 2026-10-09 | - | SUPERSEDED by review/fork-retire-on-26e3 |
-| gh-readonly-queue/main/pr-136-c9c603b9cf5755c256b87dae257d3546281ce5aa | 4e63042fe | 1 | 1 | 2026-10-10 | - | LANDED (queue ref, auto-deleted) |
-| work/cpl0-image-extent | facdbfd20 | 1 | 1 | 2026-10-10 | MERGED#136 | LANDED (PR136 = 4e63042fe) |
+| gh-readonly-queue/main/pr-136-51c90d27cd7e35c88f1e2b58bb6e479c475cafeb | 09d8c7ddc | 1 | 1 | 2026-10-10 | - | LANDED (queue ref, auto-deleted) |
+| work/cpl0-image-extent | facdbfd20 | 1 | 1 | 2026-10-10 | MERGED#136 | LANDED (PR136 = 09d8c7ddc) |
 | work/ring-signals | 73cd4e5b9 | 107 | 61 | 2026-10-10 | OPEN#131 | ACTIVE (PR131; GitHub head STALE, newer 765f0ab08 on carrick-vm only) |
 | work/ring-ipc | 70badb62d | 19 | 5 | 2026-10-10 | OPEN#137 | ACTIVE (PR137; carries 12 stale identity commits + 4 MiB extent 999c6cdaf) |
-| main | c9c603b9c | 0 | 0 | 2026-10-10 | - | main |
+| main | 51c90d27c | 0 | 0 | 2026-10-10 | - | main |
 
 ## 2. Unshared or duplicated knowledge
 
 ### 2.1 ORPHANED-UNIQUE commits worth keeping
 
 **A. `work/arm-adopt-step5` (local only for the tip).**
-- `bd49c09e3` fix(runtime): authenticate grant crossings with parked address
+- `873aa9b1b` fix(runtime): authenticate grant crossings with parked address
   identity.
-- `535806136` fix(abi): refresh x86 pin for the shared fd table layout.
-- `63a7f7666` fix(hal): separate native frame custody in the shared
+- `9170d470b` fix(abi): refresh x86 pin for the shared fd table layout.
+- `de84593b8` fix(hal): separate native frame custody in the shared
   inventory. This introduces `HostMm` vs `GuestMm(native_mm,
   root_generation)` rows in one inventory.
 
 These are the current ARM shared-owner frontier. Push them to a GitHub
 branch now: their only other copy is the VM `fixpub/*` refs, which stop at
-`1adf07e0c`.
+`073bd7495`.
 
 **B. `work/ring-signals` `765f0ab08` (carrick-vm only).** 76 commits rebased
-on `c9c603b9c`; the worker reports it review-ready. Only-here commits
+on `51c90d27c`; the worker reports it review-ready. Only-here commits
 include:
 - fix(x86): retain fixture xstate through task switches
 - fix(x86): require process admission before timer expiry
@@ -385,18 +385,18 @@ include:
 
 The GitHub PR #131 head does not contain these.
 
-**C. `work/x86-legacy-retire` (PR #86, a344ea49a, CI green, 269 behind).**
-- `f746caeb3` fix(x86): serve task tls and clear-tid registration in cpl0.
-- `a69ebe08b` fix(x86): admit native tls calls and gate retired lane
+**C. `work/x86-legacy-retire` (PR #86, e6f734a9c, CI green, 269 behind).**
+- `62ea07367` fix(x86): serve task tls and clear-tid registration in cpl0.
+- `e5b9158a8` fix(x86): admit native tls calls and gate retired lane
   coverage.
-- `47f918253` refactor(x86): keep linux tls policy in the personality.
+- `c683d1230` refactor(x86): keep linux tls policy in the personality.
 - The deletion of `kvm_x86_engine.rs`, `run_elf_x86.rs` and
   `guest_setup_x86.rs` (still present on main).
 - `docs/retirements/x86-kvm-run-elf.md` and
   `docs/retirements/x86-legacy-syscall-audit.md`.
 
 Main lanes still list `arch_prctl` as a **main failure** (x86-fork-land
-baseline on 4e63042fe: `x86_kvm_run` fails arch_prctl, elf_matches,
+baseline on 09d8c7ddc: `x86_kvm_run` fails arch_prctl, elf_matches,
 adjacent_anonymous). PR #86 serves `arch_prctl`. Its clear-tid half is now a
 duplicate (see 2.2).
 
@@ -404,38 +404,38 @@ duplicate (see 2.2).
 (N1) fixes with no subject or keyword match on main (checked with keyword
 greps for MAP_STACK, getdents, pathname, producer revision, grant slot,
 read prefix):
-- `b5980416d` fix(runtime): serve advisory MAP_STACK reservations in EL1.
+- `82e7476a2` fix(runtime): serve advisory MAP_STACK reservations in EL1.
   x86-n1-diag also relies on "N1 advisory MAP_STACK admission".
 - Owner-wait copyout retention:
-  - `919bb7e23` getdents/readlink
-  - `3df4a205f` stat
-  - `770860e4b` signal frames
-  - `07081da64` pathname resolution
-  - `807f5f858` guest input copies
-  - `d559ef7b4` pipe creation
-  - `445b522e6` vector ipc
-  - `a47d49346` ipc copyout
-- `f0059acd1` fix(runtime): preserve ipc read prefixes when a peer reaches
+  - `5aadba01f` getdents/readlink
+  - `908b02f6d` stat
+  - `c5b368cce` signal frames
+  - `e22a27bc7` pathname resolution
+  - `f4b5c39ce` guest input copies
+  - `d6a068e3d` pipe creation
+  - `2427fbc24` vector ipc
+  - `8cb2d0522` ipc copyout
+- `e0f34c075` fix(runtime): preserve ipc read prefixes when a peer reaches
   eof.
 - Scheduler wakes:
-  - `cad5ae1f8` unlock resource before advancing producer revision
-  - `d221b3d49`, `751b0ec63`, `3f0762f65`: completion handback drain/dedupe
-  - `b05cc4214` recheck active editor before parking
-  - `8f7cbc1a0` wake owner metadata waiters
+  - `62da3cc14` unlock resource before advancing producer revision
+  - `67ae37f94`, `2242eb7ee`, `4d03f4059`: completion handback drain/dedupe
+  - `dc24ab263` recheck active editor before parking
+  - `3eb09f5c6` wake owner metadata waiters
 - Grant slots and mailbox:
-  - `025c4a558` fail-closed grant slots and exact mailbox cancellation
-  - `7a0fce9a2` reclaim stale grant slot/mailbox requests
-  - `017234a38` park busy owner faults and retire stale grant slots
-- Fork, owner and COW (`99ce82217`, `1e746c2c4`, `b9288897b`, `f6d731f37`,
-  `ad16fe6bf`, `8bd4d45a7`, `bd6fe3285`, `b047c48ed`, `853534225`,
-  `181bf50fd`, `62e279cf4`).
+  - `a2d3872a7` fail-closed grant slots and exact mailbox cancellation
+  - `a86bed07f` reclaim stale grant slot/mailbox requests
+  - `ec577036d` park busy owner faults and retire stale grant slots
+- Fork, owner and COW (`d87b7b2f1`, `a830aae11`, `f587bf129`, `853a5a845`,
+  `6312e5923`, `ea2c9b1a5`, `fd647feff`, `8a791c04a`, `33882ac64`,
+  `e8e4491fd`, `184c4a34b`).
 - Docs:
   - `docs/diagnostics/n1-ipc-ebusy.md`
   - eleven `docs/perf-results/2026-10-0[56]-n1-*.md` handoffs
 
 Status of these: **uncertain per commit.** Some may be obsolete after the
-ring-first and shared-owner direction. `0565ec758` and `bbf545fd4` were
-already salvaged as PR #128 `6f0db0dc4`. None of the rest has a home.
+ring-first and shared-owner direction. `0a8e22236` and `d81e1bf61` were
+already salvaged as PR #128 `d29c90ab3`. None of the rest has a home.
 
 **E. `work/x86-n1-diag` / `work/x86-process-owner` (parked,
 merge-structured, 247 / 228 subject-unique).** Mostly pre-inversion history
@@ -468,14 +468,14 @@ Code beyond what #120/#121 extracted is **uncertain**.
 
 | problem | implementation 1 | implementation 2 | state |
 |---|---|---|---|
-| Committed child exit fails with NativeBusy while parent wait holds the channel bucket (`native_process_runtime.rs`, publish_channel/wake path) | main `e3ddd4d91` fix(runtime): complete committed parent wakes under contention (ring-identity lane, 13:28Z, PR #130) | carrick-vm ring-signals `396312aa3` fix(portable): retain process wake publication under contention (14:08Z). It was written **after** rebasing onto a main that already contained e3ddd4d91; it advances the channel generation unconditionally. | Both now stack on the same function. Review whether 396312aa3 is still needed or now redundant (uncertain). |
-| Retire child space entries after the final MM exit | arm-step5 `ed6966683` (ARM, `aarch64_process.rs`, +162) | fork-retire `edeb17b82`/`b64e5eb3e` (x86, `carrick-x86-cpl0/native_process.rs`, +56), later unified by `refactor(portable): share one retired child space queue across isas` on fork-retire | arm-step5 keeps the ARM-only version; fork-retire has the unified one. x86-fork-land is porting the unified one. |
-| CPL0 clear-tid / `set_tid_address` registration | PR #86 `f746caeb3` + `d24b7b625` (10-08) | main `a195bacc6` fix(identity): serve cpl0 clear-tid registration for libc startup (10-10) | Main version landed; PR #86 must drop its copy on rebase. |
-| CPL0 supervisor image too small | main `a0a1b1ce5a` raises the cap 1 MiB to 0x120000 (signals fixture lane, via #130); main `436bdfa8b` (cherry-picked `99215dbcf`) derives the fixture table start | PR #136 `4e63042fe` raises it to 2 MiB with one typed authority (landed) | ring-ipc `999c6cdaf` sets **4 MiB**, which #136 showed overlaps 0x30_0000. It is a third implementation and a latent layout bug if rebased naively. |
-| mmap placement bounded by the per-ISA user VA ceiling | main `a0177ecac` fix(x86): use the guest user limit for mmap placement | local `x86-user-ceiling` `a84c3b633` (carrick-abi / dispatch mem.rs, +195 tests) | Main version landed; the local one is superseded. |
-| Transient root contention (Busy) aborting the carrier | n1-cm `0565ec758`, `bbf545fd4` | main `6f0db0dc4` (PR #128, busy-fwd port) | Salvaged correctly. Example of a fix that is invisible to `git cherry`. |
-| NativeRunFailure transport | ring-signals `1f1e4f0a4` (transport bundled with signal runtime) | landed via identity as `3f36d3c2c` feat(x86): transport authenticated native run failures | Signals must drop its copy; ring-identity-sol noted "Signals can drop its counter commit on rebase". |
-| Task submission directory generic | main `ed4862484` | arm-step5 `c9357476b` (same subject, 8-line rebase residue) | Rebase artifact; drop or squash. |
+| Committed child exit fails with NativeBusy while parent wait holds the channel bucket (`native_process_runtime.rs`, publish_channel/wake path) | main `a17159011` fix(runtime): complete committed parent wakes under contention (ring-identity lane, 13:28Z, PR #130) | carrick-vm ring-signals `396312aa3` fix(portable): retain process wake publication under contention (14:08Z). It was written **after** rebasing onto a main that already contained a17159011; it advances the channel generation unconditionally. | Both now stack on the same function. Review whether 396312aa3 is still needed or now redundant (uncertain). |
+| Retire child space entries after the final MM exit | arm-step5 `1b1eebbb4` (ARM, `aarch64_process.rs`, +162) | fork-retire `edeb17b82`/`4d2611442` (x86, `carrick-x86-cpl0/native_process.rs`, +56), later unified by `refactor(portable): share one retired child space queue across isas` on fork-retire | arm-step5 keeps the ARM-only version; fork-retire has the unified one. x86-fork-land is porting the unified one. |
+| CPL0 clear-tid / `set_tid_address` registration | PR #86 `62ea07367` + `783b8b9e4` (10-08) | main `534f2ca3d` fix(identity): serve cpl0 clear-tid registration for libc startup (10-10) | Main version landed; PR #86 must drop its copy on rebase. |
+| CPL0 supervisor image too small | main `f86478e532` raises the cap 1 MiB to 0x120000 (signals fixture lane, via #130); main `f9f221294` (cherry-picked `99215dbcf`) derives the fixture table start | PR #136 `09d8c7ddc` raises it to 2 MiB with one typed authority (landed) | ring-ipc `999c6cdaf` sets **4 MiB**, which #136 showed overlaps 0x30_0000. It is a third implementation and a latent layout bug if rebased naively. |
+| mmap placement bounded by the per-ISA user VA ceiling | main `b1b5bbc61` fix(x86): use the guest user limit for mmap placement | local `x86-user-ceiling` `a84c3b633` (carrick-abi / dispatch mem.rs, +195 tests) | Main version landed; the local one is superseded. |
+| Transient root contention (Busy) aborting the carrier | n1-cm `0a8e22236`, `d81e1bf61` | main `d29c90ab3` (PR #128, busy-fwd port) | Salvaged correctly. Example of a fix that is invisible to `git cherry`. |
+| NativeRunFailure transport | ring-signals `1f1e4f0a4` (transport bundled with signal runtime) | landed via identity as `c74c2e60a` feat(x86): transport authenticated native run failures | Signals must drop its copy; ring-identity-sol noted "Signals can drop its counter commit on rebase". |
+| Task submission directory generic | main `6826e94c6` | arm-step5 `5f3044b8c` (same subject, 8-line rebase residue) | Rebase artifact; drop or squash. |
 
 ### 2.3 Lanes that will conflict when landed
 
@@ -494,17 +494,17 @@ files excluding inventory JSON.
 
 Semantic conflicts (no textual overlap required):
 - **CPL0 carrier port 0xd5.** On fork-retire, `NATIVE_CHILD_RETIRE_PORT` is
-  0xd5. Main took 0xd5 for `NATIVE_RUN_FAILURE_PORT` (`3f36d3c2c`).
+  0xd5. Main took 0xd5 for `NATIVE_RUN_FAILURE_PORT` (`c74c2e60a`).
   x86-fork-land noticed and moved to 0xd6.
   - Main **also** defines `X86_INITIAL_RUNNER_READY_PORT = 0xd5` (from
-    `fc84cd9cc`). The two are consumed in different phases (boot handshake
+    `90d658602`). The two are consumed in different phases (boot handshake
     vs run), so this is probably not a live bug.
   - Main has no pairwise-distinct port check. That check exists only in
     fork-retire (`fix(kvm): check every cpl0 carrier port pairwise at
     compile time`).
   - **Uncertain** whether the runner-ready reuse is intended.
-- **ARM signal routing.** arm-step5 has `057ae8844` (retain rt_sigaction
-  kernel fallback on arm) and `a9c3a5773` (scope arm signal opt-out to fork
+- **ARM signal routing.** arm-step5 has `83cbc7e90` (retain rt_sigaction
+  kernel fallback on arm) and `71e49075b` (scope arm signal opt-out to fork
   witness). ring-signals has "admit carrier-owned arm signal crossings" and
   "preserve main arm signal lifecycle routes". Both edit ARM signal
   dispatch policy in `personality/dispatch.rs`, in opposite directions.
@@ -529,14 +529,14 @@ All found in mailboxes; none appears in the repo.
    - The director had told arm-step5 these are "a pre-existing main defect,
      tracked separately".
    - x86-fork-land's baseline still counts `cpl0_fork_e2e 2` failures on
-     4e63042fe.
+     09d8c7ddc.
 2. **False green.** x86-fdtable-sol: the "KVM stdout poll fixture 1/1 remains
    a known false green".
 3. **Main KVM baselines.** Workers recorded different sets without a ledger:
-   - ring-signals-sol on c9c603b9c: 5 named x86_kvm_run failures
+   - ring-signals-sol on 51c90d27c: 5 named x86_kvm_run failures
      (guest_owned_calls_refuse, poll_stdio, arch_prctl,
      elf_matches_native_anonymous_memory, adjacent_anonymous_memory).
-   - x86-fork-land on 4e63042fe: carrick-vmm-kvm cpl0_entry 3,
+   - x86-fork-land on 09d8c7ddc: carrick-vmm-kvm cpl0_entry 3,
      cpl0_fork_e2e 2, cpl0_lifecycle 1, live_vcpu_x86 1; x86_kvm_run 3.
    - x86-fdtable-sol: 3 failures (anonymous leaf, TLS bases, anonymous
      memory).
@@ -551,9 +551,9 @@ All found in mailboxes; none appears in the repo.
    - a `nonminimal_bool` in `carrick-kernel/src/kernel/objects/thread.rs`,
      fixed only on ring-signals (`a84eb60bf`).
 5. **Mirror lag.** ring-identity-sol, three times: "local origin mirror
-   main still advertises dfc9100e2 / 482e5ea89", so
+   main still advertises 75369d8ab / 0b8b9cf45", so
    `CARRICK_AUTHORITY_BASE=origin/main` gated against a stale base. It is
-   still true: bare `main` 39fbcacb3 vs GitHub 4e63042fe.
+   still true: bare `main` 7cd536423 vs GitHub 09d8c7ddc.
 6. **Test-isolation defect.** arm-step5-sol: the carrier-global test
    `holds_and_rolls_back_the_exact_carrier_lease` sees registered
    containers 1 vs 0 under parallel tests and passes serially. Recorded as a
@@ -566,7 +566,7 @@ All found in mailboxes; none appears in the repo.
    - Prefork A/B 6/50 vs 5/50 (x86-anon-sol2).
 8. **Root-cause notes in diagnosis lanes.**
    - n1-cm-db: duplicate `free_node` at `root_prepared.rs:184`, and invalid
-     active-free-head assertions corrected by tagged-head CAS (`9b06b4184`).
+     active-free-head assertions corrected by tagged-head CAS (`4eee66edc`).
    - n1-db3: a live-vs-manager COW classification divergence hypothesis.
    - Neither is in `docs/` on main.
 9. **Fixture build-code gap.** n1-db3: main's reviewed-build-code lacked the
@@ -640,7 +640,7 @@ Tag before deleting anything uncertain, for example
 - Triage the October subject-unique set individually. Most are N1, X1 and
   S3 snapshots superseded by `work/n1-cm` or the inversion:
 
-backup/el1-tlbi-pre-squash (6066c5947, 2026-10-01, subj-unique=3) backup/n1-before-pr46-47d111828 (47d111828, 2026-10-05, subj-unique=10) backup/n1-help-snapshot-715c5c35f (715c5c35f, 2026-10-04, subj-unique=9) backup/n1-pre-main-merge (02a0a437c, 2026-10-07, subj-unique=144) backup/n1-prebatch5-75debee90 (75debee90, 2026-10-04, subj-unique=6) backup/n1g2-before-batch6-12a028af2 (12a028af2, 2026-10-05, subj-unique=9) backup/s3-t2-pre-rebase (43ad636ad, 2026-10-01, subj-unique=1) backup/s3-t3b-pre-rebase (808b0bc37, 2026-10-01, subj-unique=5) checkpoint/s3t3-before-main-839f92126 (8f0e14faf, 2026-10-02, subj-unique=17) checkpoint/s3t3-rebased-839f92126 (6550c4f49, 2026-10-02, subj-unique=12) land/phase-b (de28644d6, 2026-10-03, subj-unique=2) pr11 (41fe977bc, 2026-10-04, subj-unique=12) pr14 (09cf6a56b, 2026-10-04, subj-unique=12) pr16 (3db84db7c, 2026-10-04, subj-unique=12) pr21 (a0ead6ea5, 2026-10-04, subj-unique=7) recap/ord6 (6bb08a88d, 2026-10-06, subj-unique=31) review/fork-retire-on-26e3 (3d5034278, 2026-10-09, subj-unique=75) review/fork-retire-on-9d6 (042cfa479, 2026-10-09, subj-unique=90) tmp/phaseb-full (94af9e82b, 2026-10-03, subj-unique=3) wip/n1-files-g2-diag-0307 (ce5975e46, 2026-10-07, subj-unique=110) work/agy-grpstop (970504845, 2026-10-01, subj-unique=1) work/agy-relaysig (1f861543f, 2026-10-01, subj-unique=6) work/anon-generic (261f5721a, 2026-10-06, subj-unique=51) work/arm-adopt-step5 (63a7f7666, 2026-10-10, subj-unique=77) work/backend-target-select (48c73b1c3, 2026-10-06, subj-unique=4) work/brk-heap (a62ece325, 2026-10-01, subj-unique=1) work/cow-cost (fdf7f38c5, 2026-10-01, subj-unique=1) work/el1-tlbi (1dd4fea9d, 2026-10-01, subj-unique=2) work/fork-shared-retire-pre-rebase2 (3260e0828, 2026-10-09, subj-unique=57) work/fork-shared-retire-pre-rebase (e1f13729e, 2026-10-09, subj-unique=54) work/fork-shared-retire (21c124404, 2026-10-09, subj-unique=70) work/forkexit (f07a26147, 2026-10-02, subj-unique=2) work/grpstop-zone (ced5b11c6, 2026-10-01, subj-unique=3) work/isolation-on-i (5914a5001, 2026-10-01, subj-unique=2) work/lane-maint (cb16f5c89, 2026-10-01, subj-unique=1) work/launch-trace-flag (f73f9e189, 2026-10-06, subj-unique=2) work/lifecycle-phase-b (fa5f7d95c, 2026-10-03, subj-unique=14) work/mm-pub-v2 (9bf9d2241, 2026-10-06, subj-unique=37) work/munmap-release (45bccc551, 2026-10-01, subj-unique=2) work/n0 (f83548642, 2026-10-02, subj-unique=15) work/n1-cm (bbf545fd4, 2026-10-08, subj-unique=186) work/n1-filemap-wip (3c5113bda, 2026-10-05, subj-unique=30) work/n1-files (623e3693d, 2026-10-07, subj-unique=109) work/n1-p1 (09cf6a56b, 2026-10-04, subj-unique=12) work/n1-p2 (41fe977bc, 2026-10-04, subj-unique=12) work/n1-p3 (3db84db7c, 2026-10-04, subj-unique=12) work/n1-pre-rebase (6c5e28e69, 2026-10-04, subj-unique=23) work/n1-sigframe-draft (e8cbf3744, 2026-10-06, subj-unique=67) work/n1 (56bf8c0ca, 2026-10-05, subj-unique=29) work/pb-exec (b5f739d5d, 2026-10-03, subj-unique=2) work/preempt-hang (cd9158bfb, 2026-10-01, subj-unique=1) work/read-pin (0d2e57343, 2026-10-01, subj-unique=1) work/s3-t2 (8abb0a722, 2026-10-01, subj-unique=1) work/s3-t3b (1cf7568e1, 2026-10-02, subj-unique=14) work/sched-diag (41281af8f, 2026-10-01, subj-unique=1) work/sk-gates (735a08c59, 2026-10-06, subj-unique=37) work/step2-prep (f6e90773f, 2026-10-02, subj-unique=29) work/vfs-deadline (5a71b22eb, 2026-10-03, subj-unique=1) work/x1-arm-regress (0feb7c7b0, 2026-10-05, subj-unique=51) work/x86-legacy-retire (c1c2f2f1b, 2026-10-08, subj-unique=19) work/x86-user-ceiling (34e8d8187, 2026-10-06, subj-unique=2) work/x86-wave2-plan-main (289e8d797, 2026-10-05, subj-unique=3) work/zone-wake (a754e946d, 2026-10-01, subj-unique=3) 
+backup/el1-tlbi-pre-squash (6066c5947, 2026-10-01, subj-unique=3) backup/n1-before-pr46-47d111828 (47d111828, 2026-10-05, subj-unique=10) backup/n1-help-snapshot-715c5c35f (715c5c35f, 2026-10-04, subj-unique=9) backup/n1-pre-main-merge (a72fd4a98, 2026-10-07, subj-unique=144) backup/n1-prebatch5-75debee90 (75debee90, 2026-10-04, subj-unique=6) backup/n1g2-before-batch6-12a028af2 (12a028af2, 2026-10-05, subj-unique=9) backup/s3-t2-pre-rebase (43ad636ad, 2026-10-01, subj-unique=1) backup/s3-t3b-pre-rebase (808b0bc37, 2026-10-01, subj-unique=5) checkpoint/s3t3-before-main-c1d9cddbc (8f0e14faf, 2026-10-02, subj-unique=17) checkpoint/s3t3-rebased-c1d9cddbc (6550c4f49, 2026-10-02, subj-unique=12) land/phase-b (de28644d6, 2026-10-03, subj-unique=2) pr11 (0508b2e49, 2026-10-04, subj-unique=12) pr14 (9b8b7d492, 2026-10-04, subj-unique=12) pr16 (5b9774b45, 2026-10-04, subj-unique=12) pr21 (55a1abd2d, 2026-10-04, subj-unique=7) recap/ord6 (7cca16366, 2026-10-06, subj-unique=31) review/fork-retire-on-26e3 (3d5034278, 2026-10-09, subj-unique=75) review/fork-retire-on-9d6 (bba0a52a1, 2026-10-09, subj-unique=90) tmp/phaseb-full (94af9e82b, 2026-10-03, subj-unique=3) wip/n1-files-g2-diag-0307 (ce5975e46, 2026-10-07, subj-unique=110) work/agy-grpstop (970504845, 2026-10-01, subj-unique=1) work/agy-relaysig (1f861543f, 2026-10-01, subj-unique=6) work/anon-generic (b6a9dc177, 2026-10-06, subj-unique=51) work/arm-adopt-step5 (de84593b8, 2026-10-10, subj-unique=77) work/backend-target-select (3d2d2ce39, 2026-10-06, subj-unique=4) work/brk-heap (a62ece325, 2026-10-01, subj-unique=1) work/cow-cost (fdf7f38c5, 2026-10-01, subj-unique=1) work/el1-tlbi (1dd4fea9d, 2026-10-01, subj-unique=2) work/fork-shared-retire-pre-rebase2 (3260e0828, 2026-10-09, subj-unique=57) work/fork-shared-retire-pre-rebase (e1f13729e, 2026-10-09, subj-unique=54) work/fork-shared-retire (21c124404, 2026-10-09, subj-unique=70) work/forkexit (f07a26147, 2026-10-02, subj-unique=2) work/grpstop-zone (ced5b11c6, 2026-10-01, subj-unique=3) work/isolation-on-i (5914a5001, 2026-10-01, subj-unique=2) work/lane-maint (cb16f5c89, 2026-10-01, subj-unique=1) work/launch-trace-flag (e28228709, 2026-10-06, subj-unique=2) work/lifecycle-phase-b (fa5f7d95c, 2026-10-03, subj-unique=14) work/mm-pub-v2 (494305d75, 2026-10-06, subj-unique=37) work/munmap-release (45bccc551, 2026-10-01, subj-unique=2) work/n0 (f83548642, 2026-10-02, subj-unique=15) work/n1-cm (d81e1bf61, 2026-10-08, subj-unique=186) work/n1-filemap-wip (2506723d1, 2026-10-05, subj-unique=30) work/n1-files (8854bff22, 2026-10-07, subj-unique=109) work/n1-p1 (9b8b7d492, 2026-10-04, subj-unique=12) work/n1-p2 (0508b2e49, 2026-10-04, subj-unique=12) work/n1-p3 (5b9774b45, 2026-10-04, subj-unique=12) work/n1-pre-rebase (6c5e28e69, 2026-10-04, subj-unique=23) work/n1-sigframe-draft (ba8d42f08, 2026-10-06, subj-unique=67) work/n1 (a4faef4c8, 2026-10-05, subj-unique=29) work/pb-exec (b5f739d5d, 2026-10-03, subj-unique=2) work/preempt-hang (cd9158bfb, 2026-10-01, subj-unique=1) work/read-pin (0d2e57343, 2026-10-01, subj-unique=1) work/s3-t2 (8abb0a722, 2026-10-01, subj-unique=1) work/s3-t3b (1cf7568e1, 2026-10-02, subj-unique=14) work/sched-diag (41281af8f, 2026-10-01, subj-unique=1) work/sk-gates (fdf5ec73d, 2026-10-06, subj-unique=37) work/step2-prep (f6e90773f, 2026-10-02, subj-unique=29) work/vfs-deadline (5a71b22eb, 2026-10-03, subj-unique=1) work/x1-arm-regress (0feb7c7b0, 2026-10-05, subj-unique=51) work/x86-legacy-retire (c1c2f2f1b, 2026-10-08, subj-unique=19) work/x86-user-ceiling (34e8d8187, 2026-10-06, subj-unique=2) work/x86-wave2-plan-main (97dffe971, 2026-10-05, subj-unique=3) work/zone-wake (a754e946d, 2026-10-01, subj-unique=3) 
 
 **carrick-vm.**
 - The bare repo's 70 `fixpub/<sha>` refs: delete them once their PRs
@@ -651,13 +651,13 @@ backup/el1-tlbi-pre-squash (6066c5947, 2026-10-01, subj-unique=3) backup/n1-befo
 
 ### 3.3 carrick-vm mirror staleness
 
-| ref | value | relation to GitHub main 4e63042fe |
+| ref | value | relation to GitHub main 09d8c7ddc |
 |---|---|---|
-| bare `~/dev/carrick.git` `main` | 39fbcacb3 (PR #134 merge) | 111 behind |
-| bare `gh-main` | c9c603b9c | 1 behind |
-| clone `~/dev/carrick` `origin/main` | 39fbcacb3 | 111 behind |
-| clone `main` | 652e0dcde (10-04) | about 1,000 behind |
-| cloudmac bare `main` / `github/main` | 8b6cf9031 (10-04) / 8f6e6bc08 (10-08) | stale; gates use explicit SHAs, so no harm yet |
+| bare `~/dev/carrick.git` `main` | 7cd536423 (PR #134 merge) | 111 behind |
+| bare `gh-main` | 51c90d27c | 1 behind |
+| clone `~/dev/carrick` `origin/main` | 7cd536423 | 111 behind |
+| clone `main` | 8391edd89 (10-04) | about 1,000 behind |
+| cloudmac bare `main` / `github/main` | 409b163da (10-04) / 97f542525 (10-08) | stale; gates use explicit SHAs, so no harm yet |
 
 Workers on carrick-vm gate with `CARRICK_AUTHORITY_BASE=origin/main`. On
 the VM that resolves to the bare mirror's `main`, not GitHub. ring-identity
@@ -669,7 +669,7 @@ director to refresh the mirror.
 ### Now (today)
 
 1. **Make every sole copy durable.**
-   - Push local `work/arm-adopt-step5` (`63a7f7666`) to GitHub, replacing
+   - Push local `work/arm-adopt-step5` (`de84593b8`) to GitHub, replacing
      `work/arm-step5-review`.
    - Have ring-signals-sol push `765f0ab08` (or its successor) to
      `work/ring-signals` now that #136 has removed the extent blocker.
@@ -678,17 +678,17 @@ director to refresh the mirror.
      (`share one retired child space queue across isas`,
      `share fork stock loans and child quarantine across isas`) first.
    - Then rebase arm-step5 onto it and drop arm-step5's ARM-only
-     `ed6966683` in favor of the shared queue.
+     `1b1eebbb4` in favor of the shared queue.
    - Doing it in the other order makes the shared refactor fight 78 ARM
      commits.
    - Have x86-fork-land port the pairwise CPL0 port check, and decide
      whether `X86_INITIAL_RUNNER_READY_PORT == NATIVE_RUN_FAILURE_PORT == 0xd5`
      on main is intended.
-3. **Clean PR #137 before review.** Rebase ring-ipc onto 4e63042fe keeping
+3. **Clean PR #137 before review.** Rebase ring-ipc onto 09d8c7ddc keeping
    only the 4 IPC commits (`c1d2241c6`, `b63ca3ca6`, `ffe298c9c`,
    `70badb62d`). Drop:
    - the 12 identity commits (landed in #130)
-   - the XSAVE commit `1ae57533a` (landed as `6207de63f`)
+   - the XSAVE commit `1ae57533a` (landed as `e1406d54f`)
    - the ARM flip doc
    - the 4 MiB extent `999c6cdaf` (it contradicts #136's layout proof)
 4. **Settle the false-fixture question in the repo.** Mark the two
@@ -703,7 +703,7 @@ director to refresh the mirror.
    2. x86-fork-land port
    3. ring-ipc (cleaned)
    4. arm-step5
-   5. PR #86 rebased. Drop its clear-tid copy (main `a195bacc6`) and keep
+   5. PR #86 rebased. Drop its clear-tid copy (main `534f2ca3d`) and keep
       TLS/`arch_prctl` and the standalone-lane deletion. That removes an
       `arch_prctl` "main failure" every lane currently subtracts.
 6. **Salvage n1-cm deliberately rather than by accident.**

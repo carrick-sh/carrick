@@ -1,6 +1,6 @@
 # Metadata-refusal review 1: rejected
 
-Reviewed worker commit `32b0ad50f`. All five prescribed host verification
+Reviewed worker commit `1f91396c3`. All five prescribed host verification
 commands pass independently (results.json and 0..4.log). No integration of
 this worker implementation is accepted.
 

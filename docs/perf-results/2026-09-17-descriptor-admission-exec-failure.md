@@ -148,13 +148,13 @@ green afterward.
 
 Implementation and inventory commits:
 
-- `e4f799155` — keep failed exec on the predecessor MM.
-- `7ef39686a` — discard terminal exec continuations.
-- `300e1d96d`, `16f6ecbb5`, `843c9afbb`, and `7a678c866` — reconcile the
+- `4d85a0562` — keep failed exec on the predecessor MM.
+- `8907194b3` — discard terminal exec continuations.
+- `35a588f1d`, `8c42fbdef`, `22e1038f8`, and `93e195ec9` — reconcile the
   authority and inventory ledgers for those contracts.
 
 The corrected signed artifact has source
-`7a678c8663231cfa7270568634d4d6a812add709`, SHA-256
+`93e195ec9fe2e6355bb3a9b349584263546e2a7a`, SHA-256
 `a8fca0a4f7152c6180af5d9e2da8a8ce915aebb9dfbb96d4d9628cf648ac22eb`,
 CDHash `58a29e25e731201c801a1e5becad23b4370fe39f`, and LC_UUID
 `ACFB28BF-E390-3AD9-B5ED-45B726098648`. Its signature identifier is
@@ -189,7 +189,7 @@ No performance improvement or closure of ltp-open04 is claimed here.
 Local diagnostic evidence is in `target/conformance/eco-fd-exec-20260917/`.
 The pinned image is
 `localhost:5050/cpython-test@sha256:3126629643b4adcf57ba5cecdb7f9ed257e733b56cd81da70fd5fdbdc1745b30`.
-The diagnostic Carrick binary has source `5b4a20661`, SHA-256
+The diagnostic Carrick binary has source `f2029ea7a`, SHA-256
 `1f03f7fd5eb215ae99382bacc2014cd8e18b819a837c53ca0dcc00dae76f9656`,
 CDHash `d9efcc76f474aa13f58b91f48fc842aac4c6d559`, and LC_UUID
 `6B46AFD4-4806-3308-9B75-34CC72AE3A39`; its signed provenance is recorded in

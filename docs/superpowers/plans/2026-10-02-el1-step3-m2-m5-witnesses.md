@@ -1,6 +1,6 @@
 # M2–M5 contract preparation (no cutover)
 
-Baseline: `1047fefdc7cf6ee99faca70c90bf94b2e5e854d4`.
+Baseline: `6ab39d8a5d9f0397ef69a8783b2a66f6ebe236df`.
 Production behavior is unchanged. No Docker, runtime ratio or migration
 acceptance is claimed. Scoped signed EL0 semantic receipts from the follow-up
 are recorded below; they do not establish EL1 delivery ownership. Known-red gates execute
@@ -137,8 +137,8 @@ compiler capture row hash are unchanged. Capture source-head is refreshed.
 The read-only final review found no blocking defect in this partial groundwork
 and confirmed the missing coverage prevents full cutover readiness.
 
-Milestone commits: M2 `98ed6ae2c`, M3 `49cb164c4`, M4 `525cb6ebc`,
-M5 `b1b5b007d`. Inventory reconciliation: `9a34d6937`.
+Milestone commits: M2 `a2b00af0b`, M3 `a83d94204`, M4 `734ad58c2`,
+M5 `7df3f7081`. Inventory reconciliation: `cc402f54c`.
 
 Fixture source SHA-256 (after all Rust edits):
 
@@ -152,7 +152,7 @@ a401dc5beb024894ad54fe0a3c51e65381356c62d03bcfefeaca49f0d988f287  crates/carrick
 
 ## Follow-up binding preparation, 2026-10-02
 
-Rebased onto main before continuation (already up to date at `948f43f4b`).
+Rebased onto main before continuation (already up to date at `4394d8e8c`).
 The original receipt above remains historical; the following entries extend it.
 
 ### M3 mixed mask — flips at M3 cutover
@@ -252,7 +252,7 @@ Existing lifecycle and frame semantics alone do not close those requirements.
 
 ## Follow-up signed verification receipts
 
-Source: `c808b83002d099990f6e4defd1f8c97699820b0f`, clean for both runs.
+Source: `b3d58e10be194c2e2f82e9264d8317a4cc8a9799`, clean for both runs.
 Evidence: `docs/perf-results/2026-10-02-step3-m2-m5-followup/` contains full
 logs, signed artifact receipts and SHA-256 for the ten freshly cross-built
 probe/init binaries. Builds used `CARGO_BUILD_JOBS=3 cargo build --release`
@@ -275,7 +275,7 @@ areas and records the newly observed cancellation, cycle and tgkill reds.
 
 ### Final follow-up host gates
 
-On source `c808b8300` (kernel/clippy) and receipt tree `b230195c1`
+On source `b3d58e10b` (kernel/clippy) and receipt tree `7f55d3838`
 (lint/inventory; source unchanged), all four foreground commands exited zero:
 `CARGO_BUILD_JOBS=3 just test-kernel`, `CARGO_BUILD_JOBS=3 just clippy`,
 `CARGO_BUILD_JOBS=3 just lint-domains`, and
@@ -286,8 +286,8 @@ same 599 rows. Its macOS subset passes; Linux/FreeBSD/NetBSD profiles remain
 pending as before. One new table guard is classified test_or_definition;
 other operation inventory changes only rebind test line positions.
 
-Follow-up commits: M3 `87c949c86`, M4 `fd09845b8`, M5 `c808b8300`;
-signed evidence and inventory reconciliation `b230195c1`. The director's
+Follow-up commits: M3 `aefef1e0c`, M4 `d33551197`, M5 `b3d58e10b`;
+signed evidence and inventory reconciliation `7f55d3838`. The director's
 signed-lane hold was read at the final mailbox breakpoint after both signed
 runs had completed and scoped cleanup reported zero. No further signed runs
 were started after reading the hold.
