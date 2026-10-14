@@ -1152,7 +1152,7 @@ fn arm_child_wait_wake(in_ring: bool, sibling: bool) {
         assert!(
             fixture
                 .page
-                .publish_host_birth(host_slot, control as *const _ as u64)
+                .publish_host_birth(host_slot, control.host_birth_identity().unwrap())
         );
         run_as(&fixture, 43, 13, 103, control);
         let record = fixture
@@ -2518,7 +2518,7 @@ fn host_born_sibling(fixture: &Fixture, visible_tid: u32) -> &'static ThreadCont
     assert!(
         fixture
             .page
-            .publish_host_birth(birth_slot, control as *const _ as u64)
+            .publish_host_birth(birth_slot, control.host_birth_identity().unwrap())
     );
     run_as(fixture, 42, 12, 102, control);
     control
@@ -2980,12 +2980,12 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
         );
         assert_eq!(service.crossing.retirements.load(Ordering::Acquire), 0);
         if matches!(siblings, Siblings::AdoptedHostBorn) {
-            let address = adopted_control.unwrap() as *const _ as u64;
+            let identity = adopted_control.unwrap().host_birth_identity().unwrap();
             assert!(
                 (0..carrick_el1_abi::THREAD_POOL_ENTRIES)
-                    .all(|index| fixture.page.host_born_address(index) != Some(address))
+                    .all(|index| fixture.page.host_birth_identity(index) != Some(identity))
             );
-            assert!(!fixture.page.release_adopted_host_birth(address));
+            assert!(!fixture.page.release_adopted_host_birth(identity));
         }
         assert_eq!(
             carrick_el1_abi::Lifecycle::gate(fixture.page),
@@ -3034,16 +3034,13 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
         }
         if matches!(siblings, Siblings::PooledAndUnadoptedHostBorn) {
             let control = unadopted_control.expect("unadopted control");
-            let address = control as *const _ as u64;
+            let identity = control.host_birth_identity().unwrap();
             assert!(
                 (0..carrick_el1_abi::THREAD_POOL_ENTRIES)
-                    .any(|index| fixture.page.host_born_address(index) == Some(address))
+                    .any(|index| fixture.page.host_birth_identity(index) == Some(identity))
             );
-            assert!(!fixture.page.release_adopted_host_birth(address));
-            assert!(
-                control.host_exit_requested(),
-                "Closing must cancel a host-born sibling before first ring entry"
-            );
+            assert!(!fixture.page.release_adopted_host_birth(identity));
+            assert!(fixture.page.host_birth_requested(identity));
             assert!(matches!(
                 wake_closing_root(fixture, &mut service),
                 crate::sched::ResumeAction::Left
@@ -3054,7 +3051,8 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
                 .reserve_cancelled_member_exit()
                 .unwrap()
                 .publish();
-            control.publish_host_retirement(control.host_birth_identity().unwrap());
+            control.publish_host_retirement(identity);
+            assert!(fixture.page.publish_host_birth_receipt(identity));
         }
         assert_eq!(fixture.page.live(), 0);
         assert!(matches!(
@@ -3090,14 +3088,16 @@ fn arm_host_exit_reserved_live_count_does_not_settle_group_before_receipt() {
         carrick_personality_linux::dispatch::CompletionRoute::Suspended
     );
     assert_eq!(fixture.page.live(), 0);
-    assert!(sibling.host_exit_requested());
+    let identity = sibling.host_birth_identity().unwrap();
+    assert!(fixture.page.host_birth_requested(identity));
     assert!(matches!(
         wake_closing_root(fixture, &mut service),
         crate::sched::ResumeAction::Left
     ));
     assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
     retirement.publish();
-    sibling.publish_host_retirement(sibling.host_birth_identity().unwrap());
+    sibling.publish_host_retirement(identity);
+    assert!(fixture.page.publish_host_birth_receipt(identity));
     assert!(matches!(
         wake_closing_root(fixture, &mut service),
         crate::sched::ResumeAction::Left
