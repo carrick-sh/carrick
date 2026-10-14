@@ -3,9 +3,7 @@
 
 use super::aarch64_process::{Aarch64NativeProcessService, ForkStockCrossing};
 #[cfg(test)]
-use super::aarch64_process::{
-    cross_root_exit, observed_entry_address, process_record_for_call, registry,
-};
+use super::aarch64_process::{observed_entry_address, process_record_for_call};
 #[cfg(test)]
 use super::native_process_runtime::NativeProcessService;
 use super::native_process_runtime::{NativeProcessError, NativeProcessRuntime};
