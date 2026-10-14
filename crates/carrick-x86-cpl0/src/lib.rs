@@ -45,4 +45,12 @@ mod tests {
             ProductionBoundary::Work
         );
     }
+
+    #[test]
+    fn host_thread_retirement_keeps_distinct_cpl0_transport() {
+        assert_eq!(
+            production_boundary(Action::HostCustody),
+            ProductionBoundary::HostCustody
+        );
+    }
 }
