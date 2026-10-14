@@ -2425,3 +2425,82 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
         }
     }
 }
+
+#[test]
+fn arm_unadmitted_thread_runs_ordinary_calls_and_refuses_owner_calls() {
+    use super::dispatch::{arm_owner_must_serve, arm_thread_group_owned};
+    // A non-last thread's raw exit is the host's; the last thread's and the
+    // process-family calls stay with a retained owner.
+    assert!(!arm_owner_must_serve(
+        62,
+        3,
+        || panic!("not a process call"),
+        1
+    ));
+    assert!(!arm_owner_must_serve(93, 0, || true, 2));
+    assert!(arm_owner_must_serve(93, 0, || true, 1));
+    assert!(arm_owner_must_serve(94, 0, || true, 2));
+    assert!(arm_owner_must_serve(260, 0, || true, 2));
+    assert!(!arm_owner_must_serve(260, 0, || false, 2));
+    assert!(!arm_owner_must_serve(94, 0, || false, 2));
+    assert!(arm_owner_must_serve(220, 17, || false, 1), "fork");
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let foreign_page = Box::leak(Box::new(ThreadLifecyclePage::new()));
+    assert!(!arm_thread_group_owned(
+        fixture.zone,
+        &fixture.task,
+        fixture.page
+    ));
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    assert!(arm_thread_group_owned(
+        fixture.zone,
+        &fixture.task,
+        fixture.page
+    ));
+    assert!(!arm_thread_group_owned(
+        fixture.zone,
+        &fixture.task,
+        foreign_page
+    ));
+    let counters = Box::new(carrick_el1_abi::Counters::new());
+    let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
+    let fallback = |frame: &mut carrick_el1_abi::TrapFrame, refused| {
+        super::dispatch::fallback_or_refuse_arm_process_call(
+            frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            None::<crate::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
+            None,
+            |_| core::ptr::null_mut(),
+            refused,
+        )
+    };
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[0] = 3;
+    frame.x[8] = 62; // lseek
+    assert_eq!(
+        fallback(&mut frame, false),
+        carrick_el1_abi::Action::Forward
+    );
+    assert_eq!(frame.x[0], 3, "an ordinary call is never answered -ENOSYS");
+    frame.x[0] = 17;
+    frame.x[8] = 220; // fork
+    assert_eq!(
+        fallback(&mut frame, true),
+        carrick_el1_abi::Action::ServedWithWork
+    );
+    assert_eq!(frame.x[0] as i64, -38);
+}

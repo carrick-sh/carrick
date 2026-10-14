@@ -230,11 +230,39 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
         let slot = SlotId::from_index(frame.slot as usize);
         #[cfg(target_arch = "aarch64")]
         {
+            let (nr, flags) = (frame.x[8], frame.x[0]);
+            // Without a published lifecycle no owner can retain this thread.
+            let unowned = arm_process_call_claimed(nr, flags, || false);
             let (Some(slot), Some(task)) = (slot, current_tasks.get(frame.slot as usize)) else {
                 return refuse_owner_process_call(frame, counters, current_tasks);
             };
             let Some((page, control)) = task.lifecycle_refs() else {
-                return refuse_owner_process_call(frame, counters, current_tasks);
+                return fallback_or_refuse_arm_process_call(
+                    frame,
+                    counters,
+                    current_tasks,
+                    fd_map,
+                    object_table,
+                    open_table,
+                    inotify_table,
+                    name_cache,
+                    Some(Zone {
+                        tables: zone,
+                        cpu: &mut sched::HardwareCpu,
+                        user: &sched::HardwareUserWord,
+                    }),
+                    ipc::guest_venue(frame.slot as u32).as_ref(),
+                    |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
+                    unowned,
+                );
+            };
+            let refused = || {
+                arm_owner_must_serve(
+                    nr,
+                    flags,
+                    || arm_thread_group_owned(zone, task, page),
+                    carrick_el1_abi::Lifecycle::live(page),
+                )
             };
             let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
             sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
@@ -242,7 +270,26 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
             let mut service =
                 match super::aarch64_process::Aarch64NativeProcessService::new(task, slot) {
                     Ok(service) => service,
-                    Err(_) => return refuse_owner_process_call(frame, counters, current_tasks),
+                    Err(_) => {
+                        return fallback_or_refuse_arm_process_call(
+                            frame,
+                            counters,
+                            current_tasks,
+                            fd_map,
+                            object_table,
+                            open_table,
+                            inotify_table,
+                            name_cache,
+                            Some(Zone {
+                                tables: zone,
+                                cpu: &mut sched::HardwareCpu,
+                                user: &sched::HardwareUserWord,
+                            }),
+                            ipc::guest_venue(frame.slot as u32).as_ref(),
+                            |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
+                            refused(),
+                        );
+                    }
                 };
             let route = dispatch_arm_syscall_with_native_process(
                 frame,
@@ -269,7 +316,24 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
             );
             match route {
                 Ok(route) => resolve_arm_process_route(route, page, frame, counters, current_tasks),
-                Err(_) => refuse_owner_process_call(frame, counters, current_tasks),
+                Err(_) => fallback_or_refuse_arm_process_call(
+                    frame,
+                    counters,
+                    current_tasks,
+                    fd_map,
+                    object_table,
+                    open_table,
+                    inotify_table,
+                    name_cache,
+                    Some(Zone {
+                        tables: zone,
+                        cpu: &mut sched::HardwareCpu,
+                        user: &sched::HardwareUserWord,
+                    }),
+                    ipc::guest_venue(frame.slot as u32).as_ref(),
+                    |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
+                    refused(),
+                ),
             }
         }
         #[cfg(not(target_arch = "aarch64"))]
@@ -464,6 +528,61 @@ pub(super) fn resolve_arm_process_route(
         carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion => {
             invalid_completion(NativeInvariant::EntryBinding)
         }
+    }
+}
+
+/// Whether an admitted owner retains this thread's group at any address.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(super) fn arm_thread_group_owned(
+    zone: &ZoneTables,
+    task: &CurrentTask,
+    page: &carrick_el1_abi::ThreadLifecyclePage,
+) -> bool {
+    task.visible_pid()
+        .is_some_and(|pid| super::aarch64_process::registry().owns_thread_group(zone, page, pid))
+}
+
+/// A thread the process venue could not admit still runs every call the
+/// owner need not serve through the ordinary pipeline (never a blanket
+/// ENOSYS); `refused` names a call only the retained owner may answer.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn fallback_or_refuse_arm_process_call<F, C, U>(
+    frame: &mut TrapFrame,
+    counters: &Counters,
+    current_tasks: &[CurrentTask],
+    fd_map: &[FdMapSlot],
+    object_table: &[DelegatedFile],
+    open_table: &[DelegatedOpenFile],
+    inotify_table: &[DelegatedInotify],
+    name_cache: &InotifyNameCache,
+    zone: Option<Zone<'_, C, U>>,
+    ipc: Option<&ipc::IpcVenue<'_>>,
+    cache_lookup: F,
+    refused: bool,
+) -> Action
+where
+    F: Fn(u32) -> *mut u8,
+    C: sched::ThreadCpu,
+    U: sched::UserWord,
+{
+    if refused {
+        refuse_owner_process_call(frame, counters, current_tasks)
+    } else {
+        dispatch_syscall_with_ipc(
+            frame,
+            counters,
+            current_tasks,
+            fd_map,
+            object_table,
+            open_table,
+            inotify_table,
+            name_cache,
+            zone,
+            ipc,
+            cache_lookup,
+        )
     }
 }
 

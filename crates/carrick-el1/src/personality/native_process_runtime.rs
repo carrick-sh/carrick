@@ -859,6 +859,23 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         runtime.task_binding(process).map(|binding| binding.address)
     }
 
+    /// Whether any admitted owner retains the thread group of `page` and
+    /// `visible_pid` in this carrier, at whatever address incarnation.
+    pub fn owns_thread_group(
+        &self,
+        zone: &ZoneTables<C>,
+        page: &ThreadLifecyclePage,
+        visible_pid: u32,
+    ) -> bool {
+        let carrier = core::ptr::from_ref(zone).addr();
+        let page = core::ptr::from_ref(page).addr();
+        self.state
+            .lock()
+            .groups
+            .range((carrier, 0, 0, 0, 0)..=(carrier, u64::MAX, u64::MAX, usize::MAX, u32::MAX))
+            .any(|(&(_, _, _, group_page, pid), _)| group_page == page && pid == visible_pid)
+    }
+
     fn register_child(
         &self,
         parent: &NativeProcessRuntime<'a, M, C>,
