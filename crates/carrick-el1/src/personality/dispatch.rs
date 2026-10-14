@@ -1086,6 +1086,7 @@ impl<
             nr if nr == carrick_personality_linux::crossing::nr::DUP.raw() => {
                 super::file_table::dup_host_binding(
                     self.fd_map,
+                    self.open_table,
                     file_table,
                     old,
                     0,
@@ -1101,14 +1102,28 @@ impl<
                         carrick_syscall_abi::LINUX_EINVAL.guest_retval(),
                     );
                 }
-                super::file_table::dup2_host_binding(self.fd_map, file_table, old, new, flags != 0)
+                super::file_table::dup2_host_binding(
+                    self.fd_map,
+                    self.open_table,
+                    file_table,
+                    old,
+                    new,
+                    flags != 0,
+                )
             }
             nr if nr == carrick_syscall_abi::CARRICK_PRIVATE_X86_DUP2 => {
                 let new = self.frame.argument(1).unwrap_or(0) as i32;
-                super::file_table::dup2_host_binding(self.fd_map, file_table, old, new, false)
+                super::file_table::dup2_host_binding(
+                    self.fd_map,
+                    self.open_table,
+                    file_table,
+                    old,
+                    new,
+                    false,
+                )
             }
             nr if nr == carrick_personality_linux::crossing::nr::CLOSE.raw() => {
-                super::file_table::close_host_binding(self.fd_map, file_table, old)
+                super::file_table::close_host_binding(self.fd_map, self.open_table, file_table, old)
             }
             _ => return FamilyCompletion::Forward,
         };
@@ -1123,14 +1138,17 @@ impl<
             return FamilyCompletion::Complete(errno.guest_retval());
         };
         if let Some(release) = change.release {
+            task.linux.mark_pending_host_work();
             let binding = self
                 .open_table
                 .get(release.handle.checked_sub(1).unwrap_or(u32::MAX) as usize)
                 .and_then(DelegatedOpenFile::host_object);
-            if !binding.is_some_and(|binding| {
-                self.frame
-                    .release_host_object(binding, release.handle, release.incarnation)
-            }) {
+            if binding.is_some_and(|binding| binding.stdio_fd().is_some())
+                && !binding.is_some_and(|binding| {
+                    self.frame
+                        .release_host_object(binding, release.handle, release.incarnation)
+                })
+            {
                 return FamilyCompletion::Complete(carrick_syscall_abi::LINUX_EIO.guest_retval());
             }
         }

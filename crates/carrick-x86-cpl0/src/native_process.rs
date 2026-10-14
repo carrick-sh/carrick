@@ -769,6 +769,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
     ) -> Result<(), NativeProcessError> {
         carrick_el1::personality::file_table::fork_fd_map(
             crate::linux_personality::fd_map(),
+            &crate::linux_personality::OPEN_TABLE,
             parent_table,
             child_table,
         )
@@ -778,8 +779,10 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
     fn retire_fd_table(&mut self, table: u64) {
         carrick_el1::personality::file_table::retire_fd_map(
             crate::linux_personality::fd_map(),
+            &crate::linux_personality::OPEN_TABLE,
             table,
         );
+        self.task.linux.mark_pending_host_work();
     }
 }
 

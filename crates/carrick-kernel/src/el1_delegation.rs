@@ -75,6 +75,7 @@ pub fn settle_el1_boundary_for(
 
 /// Clear the recorded host virtual address of the EL1 kernel aperture.
 pub fn clear_el1_region_host_ptr() {
+    recall_all_delegated();
     owned_recall::clear_aperture();
 }
 
@@ -225,8 +226,27 @@ use parking_lot::Condvar;
 static NEXT_INCARNATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static ALLOCATED_HANDLES: Mutex<[bool; MAX_DELEGATED_FILES]> =
     Mutex::new([false; MAX_DELEGATED_FILES]);
-static ALLOCATED_OPEN_FILES: Mutex<[bool; MAX_ZONE_OPEN_FILES]> =
-    Mutex::new([false; MAX_ZONE_OPEN_FILES]);
+struct OpenSlot {
+    allocated: bool,
+    description: Option<Weak<FileDescription>>,
+    cleanup: OpenCleanup,
+}
+enum OpenCleanup {
+    Unreleased,
+    Closing(crate::kernel::objects::FileDescriptionFdLease),
+    Settling,
+}
+impl OpenSlot {
+    const fn new() -> Self {
+        Self {
+            allocated: false,
+            description: None,
+            cleanup: OpenCleanup::Unreleased,
+        }
+    }
+}
+static ALLOCATED_OPEN_FILES: Mutex<[OpenSlot; MAX_ZONE_OPEN_FILES]> =
+    Mutex::new([const { OpenSlot::new() }; MAX_ZONE_OPEN_FILES]);
 static OWNERS: Mutex<Option<HashMap<InodeIdentity, Owner>>> = Mutex::new(None);
 static OWNERS_CHANGED: Condvar = Condvar::new();
 /// Number of owners not in `Host`: the lock-free negative fast path.
@@ -309,10 +329,17 @@ pub(crate) fn fd_map_publish(
             }
             fd_map_release(index, slots, old);
         }
-        let Some(slot) = index.free.pop() else {
+        let Some(position) = index.free.iter().position(|slot| slots[*slot].try_claim()) else {
             return false;
         };
-        slots[slot].set(table, fd as u32, handle_word, incarnation);
+        let slot = index.free.swap_remove(position);
+        slots[slot].set_with_flags(
+            table,
+            fd as u32,
+            handle_word,
+            incarnation,
+            FdMapSlot::HOST_VIEW,
+        );
         index.by_fd.insert(key, (slot, description));
         index.by_handle.entry(handle_word).or_default().push(slot);
         FD_MAP_PUBLISHED.fetch_add(1, Ordering::AcqRel);
@@ -808,8 +835,8 @@ fn free_handle(handle: u32) {
 
 fn allocate_open_file() -> Option<u32> {
     let mut handles = ALLOCATED_OPEN_FILES.lock();
-    let index = handles.iter().position(|in_use| !*in_use)?;
-    handles[index] = true;
+    let index = handles.iter().position(|slot| !slot.allocated)?;
+    handles[index].allocated = true;
     Some((index + 1) as u32)
 }
 
@@ -820,11 +847,37 @@ fn retire_open_file(region_ptr: usize, handle: u32) {
     if handle == 0 || handle as usize > MAX_ZONE_OPEN_FILES {
         return;
     }
+    let mut slots = ALLOCATED_OPEN_FILES.lock();
+    retire_open_file_locked(region_ptr, handle, &mut slots[handle as usize - 1]);
+}
+
+fn retire_open_file_locked(region_ptr: usize, handle: u32, slot: &mut OpenSlot) {
     let record = open_file_object(region_ptr, handle);
+    let key = OpenReferenceKey {
+        handle,
+        incarnation: record.generation.load(Ordering::Acquire),
+    };
+    // A recalled open may still have live host/ring references. Keep its host
+    // binding and incarnation; only its zone-byte authority was withdrawn.
+    record.inode_handle.store(0, Ordering::Release);
+    // Terminal publication does not discharge retained cleanup custody. A
+    // namespace recall can overtake the indexed terminal handoff.
+    if !matches!(slot.cleanup, OpenCleanup::Unreleased)
+        || (slot.description.is_some() && !record.lifetime.is_terminal(key.incarnation))
+    {
+        return;
+    }
+    if record.lifetime.ring_references(key.incarnation).is_some()
+        && !record.lifetime.is_terminal(key.incarnation)
+    {
+        // SAFETY: an unregistered slot never published a reference; live
+        // registered records returned above and cannot enter this rollback.
+        unsafe { record.lifetime.abort_admission(key.incarnation) };
+    }
     record.state.store(DELEGATED_STATE_DEAD, Ordering::Release);
     record.clear_host_fd();
-    record.inode_handle.store(0, Ordering::Release);
-    ALLOCATED_OPEN_FILES.lock()[handle as usize - 1] = false;
+    unsafe { pending_at(region_ptr) }.clear(handle);
+    *slot = OpenSlot::new();
 }
 
 /// A fresh carrier-wide incarnation for a delegated object (files and inotify
@@ -1573,14 +1626,32 @@ fn delegate_transaction(
     );
     file.state.store(DELEGATED_STATE_GUEST, Ordering::Release);
     drop(file_guard);
-    let published = fd_map_publish(
-        region_ptr,
-        file_table.raw(),
-        fd,
-        description.id(),
-        open_handle,
-        open_generation,
+    let key = OpenReferenceKey {
+        handle: open_handle,
+        incarnation: open_generation,
+    };
+    record.bind_host_fd(
+        HostBoundFd::new(host_fd.raw()).unwrap_or_else(|| unreachable!("retained host fd")),
     );
+    let published = description.publish_open_reference(key, || {
+        if !record.lifetime.initialize(open_generation, true) {
+            return false;
+        }
+        if !fd_map_publish(
+            region_ptr,
+            file_table.raw(),
+            fd,
+            description.id(),
+            open_handle,
+            open_generation,
+        ) {
+            return false;
+        }
+        ALLOCATED_OPEN_FILES.lock()[open_handle as usize - 1].description =
+            Some(Arc::downgrade(description));
+        description.set_delegation_handle(open_handle);
+        true
+    });
     if !published {
         let mut file_guard = lock_delegated_file(file, handle);
         file.state.store(DELEGATED_STATE_DEAD, Ordering::Release);
@@ -1662,14 +1733,32 @@ fn join_transaction(
     let inode_generation = file.generation.load(Ordering::Acquire);
     init_open_file(record, handle, inode_generation, generation, offset, flags);
     drop(file_guard);
-    if !fd_map_publish(
-        region_ptr,
-        file_table.raw(),
-        fd,
-        description.id(),
-        open_handle,
-        generation,
-    ) {
+    let key = OpenReferenceKey {
+        handle: open_handle,
+        incarnation: generation,
+    };
+    record.bind_host_fd(
+        HostBoundFd::new(host_fd.raw()).unwrap_or_else(|| unreachable!("retained host fd")),
+    );
+    if !description.publish_open_reference(key, || {
+        if !record.lifetime.initialize(generation, true) {
+            return false;
+        }
+        if !fd_map_publish(
+            region_ptr,
+            file_table.raw(),
+            fd,
+            description.id(),
+            open_handle,
+            generation,
+        ) {
+            return false;
+        }
+        ALLOCATED_OPEN_FILES.lock()[open_handle as usize - 1].description =
+            Some(Arc::downgrade(description));
+        description.set_delegation_handle(open_handle);
+        true
+    }) {
         let file_guard = lock_delegated_file(file, handle);
         retire_open_file(region_ptr, open_handle);
         drop(file_guard);
@@ -2158,7 +2247,123 @@ fn detach_recalled_member(description: &FileDescription) {
 }
 
 pub(crate) fn handoff_last_reference(lease: crate::kernel::objects::FileDescriptionFdLease) {
-    drop(owned_recall::handoff(lease, false));
+    // A cleared key needs no aperture borrow (including teardown's own drops).
+    if lease.description().open_reference().is_none() {
+        drop(owned_recall::handoff(lease, false));
+        return;
+    }
+    owned_recall::with_open_aperture(|| handoff_open_reference(lease));
+}
+
+fn handoff_open_reference(lease: crate::kernel::objects::FileDescriptionFdLease) {
+    // Revalidate after taking the aperture gate: teardown may have won first.
+    let Some(key) = lease.description().open_reference() else {
+        drop(owned_recall::handoff(lease, false));
+        return;
+    };
+    let region = get_el1_region_host_ptr();
+    assert_ne!(region, 0, "shared open lifetime retains its aperture");
+    let record = open_file_object(region, key.handle);
+    // Custody publication and host-group release share the slot gate. A ring
+    // terminal edge may arrive concurrently, but cannot consume an absent lease.
+    let terminal = {
+        let mut slots = ALLOCATED_OPEN_FILES.lock();
+        let slot = &mut slots[key.handle as usize - 1];
+        assert!(slot.allocated && matches!(slot.cleanup, OpenCleanup::Unreleased));
+        slot.cleanup = OpenCleanup::Closing(lease);
+        match record.lifetime.release_host(key.incarnation) {
+            OpenRelease::Terminal => true,
+            OpenRelease::Live => false,
+            OpenRelease::Stale => unreachable!("host group released exactly once"),
+        }
+    };
+    // Withdraw only host-published views, preserving counted ring duplicates.
+    fd_map_clear_handle(region, key.handle);
+    if terminal {
+        settle_open_release(region, key.handle);
+    } else {
+        owned_recall::arm_open_releases();
+    }
+}
+
+fn settle_open_release(region: usize, handle: u32) {
+    let record = open_file_object(region, handle);
+    let key = OpenReferenceKey {
+        handle,
+        incarnation: record.generation.load(Ordering::Acquire),
+    };
+    let lease = {
+        let mut slots = ALLOCATED_OPEN_FILES.lock();
+        let slot = &mut slots[handle as usize - 1];
+        if !slot.allocated || !record.lifetime.is_terminal(key.incarnation) {
+            return;
+        }
+        if !matches!(slot.cleanup, OpenCleanup::Closing(_)) {
+            return;
+        }
+        match std::mem::replace(&mut slot.cleanup, OpenCleanup::Settling) {
+            OpenCleanup::Closing(lease) => lease,
+            _ => unreachable!("slot gate owns terminal cleanup"),
+        }
+    };
+    #[cfg(test)]
+    if let Some(hook) = owned_recall::SETTLE_HOOK.lock().take() {
+        hook();
+    }
+    lease.description().retire_open_reference(key);
+    if lease.description().delegation_handle() != 0 {
+        drop(owned_recall::handoff(lease, false));
+    } else {
+        drop(lease);
+    }
+    // Retain the exact slot through key retirement and recall admission. A
+    // concurrent recall may already have demoted it, but cannot recycle it.
+    let mut slots = ALLOCATED_OPEN_FILES.lock();
+    let slot = &mut slots[handle as usize - 1];
+    assert!(matches!(slot.cleanup, OpenCleanup::Settling));
+    slot.cleanup = OpenCleanup::Unreleased;
+    if record.inode_handle.load(Ordering::Acquire) == 0 {
+        retire_open_file_locked(region, handle, slot);
+    }
+    drop(slots);
+    let _owners = OWNERS.lock();
+    OWNERS_CHANGED.notify_all();
+}
+
+fn clear_open_lifetimes(region: usize) {
+    let custody: Vec<_> = {
+        let mut slots = ALLOCATED_OPEN_FILES.lock();
+        slots
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, slot)| {
+                if !slot.allocated {
+                    return None;
+                }
+                let record = open_file_object(region, (index + 1) as u32);
+                let key = OpenReferenceKey {
+                    handle: (index + 1) as u32,
+                    incarnation: record.generation.load(Ordering::Acquire),
+                };
+                let description = slot.description.as_ref().and_then(Weak::upgrade);
+                let closing = match std::mem::replace(&mut slot.cleanup, OpenCleanup::Unreleased) {
+                    OpenCleanup::Closing(lease) => Some(lease),
+                    OpenCleanup::Unreleased => None,
+                    OpenCleanup::Settling => unreachable!("aperture gate excludes settlement"),
+                };
+                *slot = OpenSlot::new();
+                record.state.store(DELEGATED_STATE_DEAD, Ordering::Release);
+                unsafe { pending_at(region) }.clear(key.handle);
+                Some((key, description, closing))
+            })
+            .collect()
+    };
+    for (key, description, closing) in custody {
+        if let Some(description) = description {
+            description.retire_open_reference(key);
+        }
+        drop(closing);
+    }
 }
 
 /// What a write-back needs from an owner, captured under OWNERS so the
@@ -2327,21 +2532,44 @@ mod tests {
             )
         }
 
-        #[test]
-        fn file_seam_ring_duplicate_survives_last_host_reference() {
-            let _region = Region::new();
-            let scratch = tempfile::tempdir().unwrap();
-            let backend =
-                carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+        struct RealHostReference {
+            open: OpenFile,
+            closed: std::cell::Cell<bool>,
+        }
+        impl std::ops::Deref for RealHostReference {
+            type Target = OpenFile;
+            fn deref(&self) -> &OpenFile {
+                &self.open
+            }
+        }
+        impl RealHostReference {
+            fn close_host(&self) {
+                assert!(!self.closed.replace(true));
+                self.open.description.release_fd_ref();
+            }
+        }
+        impl Drop for RealHostReference {
+            fn drop(&mut self) {
+                if !self.closed.get() {
+                    self.open.description.release_fd_ref();
+                }
+            }
+        }
+        fn seam_open(
+            scratch: &std::path::Path,
+            path: &str,
+            fd: i32,
+        ) -> (FsState, RealHostReference) {
+            let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch).unwrap();
             let mut root = carrick_vfs::RootFsVfs::new();
             drop(root.set_overlay(Box::new(backend)));
-            root.create_file("/data").unwrap();
+            root.create_file(path).unwrap();
             let carrick_vfs::vfs::rootfs::OpenDispatchResult::HostFile {
                 host_fd,
                 metadata,
                 writable,
             } = root
-                .open_for_dispatch("/data", false, false, false, true)
+                .open_for_dispatch(path, false, false, false, true)
                 .unwrap()
             else {
                 panic!("the fixture must use the real host VFS backend");
@@ -2363,16 +2591,49 @@ mod tests {
             enter_zone_at_open(
                 &open,
                 table(),
-                3,
+                fd,
                 &fs,
                 Some(&RlimitSet::carrick_defaults()),
                 None,
             )
             .unwrap();
+            (
+                fs,
+                RealHostReference {
+                    open,
+                    closed: std::cell::Cell::new(false),
+                },
+            )
+        }
+        fn seam_table(region: &Region) -> &[DelegatedOpenFile] {
+            // SAFETY: Region retains aligned production ABI storage through each test.
+            unsafe {
+                std::slice::from_raw_parts(
+                    (region._buffer.as_ptr() as usize + EL1_OPEN_FILE_TABLE_OFFSET as usize)
+                        as *const DelegatedOpenFile,
+                    MAX_ZONE_OPEN_FILES,
+                )
+            }
+        }
+        fn assert_seam_live(identity: InodeIdentity) {
+            assert!(
+                OWNERS
+                    .lock()
+                    .as_ref()
+                    .and_then(|map| map.get(&identity))
+                    .is_some_and(|owner| matches!(owner.state, OwnerState::Guest(_))),
+                "last host reference admitted recall while a real ring duplicate is live"
+            );
+        }
+        #[test]
+        fn file_seam_ring_duplicate_survives_last_host_reference() {
+            let _region = Region::new();
+            let scratch = tempfile::tempdir().unwrap();
+            let (_fs, open) = seam_open(scratch.path(), "/data", 3);
             let region = get_el1_region_host_ptr();
-            let slots = fd_map_slots(region);
             let duplicate = carrick_el1::personality::file_table::dup2_host_binding(
-                slots,
+                fd_map_slots(region),
+                seam_table(&_region),
                 table().raw(),
                 3,
                 5,
@@ -2381,15 +2642,333 @@ mod tests {
             .unwrap();
             assert!(duplicate.release.is_none());
             let identity = open.description.el1_identity().unwrap();
-            open.description.release_fd_ref();
-            let owners = OWNERS.lock();
+            open.close_host();
+            assert_seam_live(identity);
+        }
+
+        #[test]
+        fn file_seam_settlement_custody_survives_concurrent_recall_and_admission() {
+            let region = Region::new();
+            let scratch = tempfile::tempdir().unwrap();
+            let (_fs, open) = seam_open(scratch.path(), "/data", 3);
+            let address = get_el1_region_host_ptr();
+            let handle = open.description.delegation_handle();
+            carrick_el1::personality::file_table::dup2_host_binding(
+                fd_map_slots(address),
+                seam_table(&region),
+                table().raw(),
+                3,
+                5,
+                false,
+            )
+            .unwrap();
+            open.close_host();
+            let description = open.description.clone();
+            let path = scratch.path().to_path_buf();
+            let admitted = Arc::new(Mutex::new(None));
+            let observed = admitted.clone();
+            *owned_recall::SETTLE_HOOK.lock() = Some(Box::new(move || {
+                // Pause after lease extraction, before reference-key retirement.
+                recall(&description).unwrap();
+                assert!(ALLOCATED_OPEN_FILES.lock()[handle as usize - 1].allocated);
+                let (fs, next) = seam_open(&path, "/next", 4);
+                assert_ne!(next.description.delegation_handle(), handle);
+                *observed.lock() = Some((fs, next));
+            }));
+            carrick_el1::personality::file_table::close_host_binding(
+                fd_map_slots(address),
+                seam_table(&region),
+                table().raw(),
+                5,
+            )
+            .unwrap();
+            owned_recall::test_drain_external();
+            assert!(owned_recall::wait_for_open_retirement(handle));
+            let (_next_fs, next) = admitted.lock().take().unwrap();
+            assert!(next.description.open_reference().is_some());
             assert!(
-                owners
-                    .as_ref()
-                    .and_then(|map| map.get(&identity))
-                    .is_some_and(|owner| matches!(owner.state, OwnerState::Guest(_))),
-                "last host reference admitted recall while a real ring duplicate is live"
+                open_file_object(address, next.description.delegation_handle())
+                    .inode_handle
+                    .load(Ordering::Acquire)
+                    != 0
             );
+            next.close_host();
+        }
+
+        #[test]
+        fn file_seam_recall_cannot_recycle_terminal_cleanup_custody() {
+            let region = Region::new();
+            let scratch = tempfile::tempdir().unwrap();
+            let (_fs, open) = seam_open(scratch.path(), "/data", 3);
+            let address = get_el1_region_host_ptr();
+            let handle = open.description.delegation_handle();
+            let description = open.description.clone();
+            carrick_el1::personality::file_table::dup2_host_binding(
+                fd_map_slots(address),
+                seam_table(&region),
+                table().raw(),
+                3,
+                5,
+                false,
+            )
+            .unwrap();
+            *owned_recall::ARM_HOOK.lock() = Some(Box::new(move || {
+                let records = unsafe {
+                    std::slice::from_raw_parts(
+                        (address + EL1_OPEN_FILE_TABLE_OFFSET as usize) as *const DelegatedOpenFile,
+                        MAX_ZONE_OPEN_FILES,
+                    )
+                };
+                carrick_el1::personality::file_table::close_host_binding(
+                    fd_map_slots(address),
+                    records,
+                    table().raw(),
+                    5,
+                )
+                .unwrap();
+                // The indexed driver cannot drain under the handoff's gate.
+                // Force namespace recall to overtake terminal cleanup instead.
+                recall(&description).unwrap();
+                assert!(ALLOCATED_OPEN_FILES.lock()[handle as usize - 1].allocated);
+                assert!(records[handle as usize - 1].host_object().is_some());
+                assert!(description.open_reference().is_some());
+            }));
+            open.close_host();
+            assert!(owned_recall::wait_for_open_retirement(handle));
+            assert!(open.description.open_reference().is_none());
+        }
+
+        #[test]
+        fn file_seam_aperture_clear_waits_for_host_group_handoff() {
+            let _region = Region::new();
+            let scratch = tempfile::tempdir().unwrap();
+            let (_fs, open) = seam_open(scratch.path(), "/data", 3);
+            let description = open.description.clone();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            *owned_recall::HANDOFF_HOOK.lock() = Some(Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            }));
+            open.closed.set(true);
+            let handoff = std::thread::spawn(move || description.release_fd_ref());
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let (cleared_tx, cleared_rx) = std::sync::mpsc::channel();
+            let clear = std::thread::spawn(move || {
+                clear_el1_region_host_ptr();
+                cleared_tx.send(()).unwrap();
+            });
+            let retired_during_handoff = cleared_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_ok();
+            release_tx.send(()).unwrap();
+            handoff.join().unwrap();
+            clear.join().unwrap();
+            assert!(
+                !retired_during_handoff,
+                "aperture retired during host-group handoff"
+            );
+            assert!(open.description.open_reference().is_none());
+            assert_eq!(get_el1_region_host_ptr(), 0);
+        }
+
+        #[test]
+        fn file_seam_first_use_terminal_edge_before_driver_admission_is_not_lost() {
+            let region = Region::new();
+            let scratch = tempfile::tempdir().unwrap();
+            let (_fs, open) = seam_open(scratch.path(), "/data", 3);
+            let handle = open.description.delegation_handle();
+            let address = get_el1_region_host_ptr();
+            carrick_el1::personality::file_table::dup2_host_binding(
+                fd_map_slots(address),
+                seam_table(&region),
+                table().raw(),
+                3,
+                5,
+                false,
+            )
+            .unwrap();
+            *owned_recall::ARM_HOOK.lock() = Some(Box::new(move || {
+                let records = unsafe {
+                    std::slice::from_raw_parts(
+                        (address + EL1_OPEN_FILE_TABLE_OFFSET as usize) as *const DelegatedOpenFile,
+                        MAX_ZONE_OPEN_FILES,
+                    )
+                };
+                assert!(
+                    carrick_el1::personality::file_table::close_host_binding(
+                        fd_map_slots(address),
+                        records,
+                        table().raw(),
+                        5,
+                    )
+                    .unwrap()
+                    .release
+                    .is_some()
+                );
+                owned_recall::notify(zone_tables().unwrap(), carrick_sched_core::Waker::Host);
+            }));
+            open.close_host();
+            let completed = owned_recall::wait_for_open_retirement(handle);
+            // Preserve the original verdict before scoped cleanup on a red run.
+            owned_recall::test_drain_external();
+            assert!(owned_recall::wait_for_cleanup_bounded(
+                open.description.el1_identity().unwrap()
+            ));
+            assert!(
+                completed,
+                "terminal edge queued before driver admission was lost"
+            );
+        }
+
+        #[test]
+        fn file_seam_final_ring_release_has_one_terminal_handoff_at_each_population() {
+            use carrick_el1::personality::file_table::{close_host_binding, dup2_host_binding};
+            for population in [1, 16, 512] {
+                let _region = Region::new();
+                let scratch = tempfile::tempdir().unwrap();
+                let (_fs, open) = seam_open(scratch.path(), "/data", 3);
+                let region = get_el1_region_host_ptr();
+                let records = seam_table(&_region);
+                let handle = open.description.delegation_handle();
+                let generation = records[handle as usize - 1]
+                    .generation
+                    .load(Ordering::Acquire);
+                let initial = population.min((FD_MAP_CAPACITY - 1) as i32);
+                for n in 0..initial {
+                    assert!(
+                        dup2_host_binding(
+                            fd_map_slots(region),
+                            records,
+                            table().raw(),
+                            3,
+                            5 + n,
+                            false
+                        )
+                        .unwrap()
+                        .release
+                        .is_none()
+                    );
+                }
+                assert_eq!(
+                    records[handle as usize - 1]
+                        .lifetime
+                        .ring_references(generation),
+                    Some(initial as u32)
+                );
+                let identity = open.description.el1_identity().unwrap();
+                open.close_host();
+                assert_seam_live(identity);
+                // At capacity, reclaim the now-withdrawn host view and admit
+                // the final owned duplicate without widening any table.
+                if initial != population {
+                    dup2_host_binding(
+                        fd_map_slots(region),
+                        records,
+                        table().raw(),
+                        5,
+                        5 + initial,
+                        false,
+                    )
+                    .unwrap();
+                }
+                assert_eq!(
+                    records[handle as usize - 1]
+                        .lifetime
+                        .ring_references(generation),
+                    Some(population as u32)
+                );
+                assert!(fd_map_lookup(fd_map_slots(region), table().raw(), 3).is_none());
+                for n in 0..population {
+                    let mut work = None;
+                    let release =
+                        carrick_el1::personality::file_table::close_host_binding_observed(
+                            fd_map_slots(region),
+                            records,
+                            table().raw(),
+                            5 + n,
+                            |steps| work = Some(steps),
+                        )
+                        .unwrap()
+                        .release;
+                    assert_eq!(release.is_some(), n == population - 1);
+                    assert_eq!(
+                        work,
+                        Some(OpenReferenceWork {
+                            records: 1,
+                            cas_attempts: 1
+                        })
+                    );
+                }
+                assert!(
+                    records[handle as usize - 1]
+                        .lifetime
+                        .is_terminal(generation)
+                );
+                // Production indexed drain, followed by a bounded completion wait.
+                owned_recall::test_drain_external();
+                assert!(owned_recall::wait_for_cleanup_bounded(identity));
+                assert_eq!(open.description.delegation_handle(), 0);
+                assert!(!ALLOCATED_OPEN_FILES.lock()[handle as usize - 1].allocated);
+                assert!(
+                    close_host_binding(fd_map_slots(region), records, table().raw(), 5).is_none()
+                );
+                let (_next_fs, next) = seam_open(scratch.path(), "/next", 4);
+                assert_eq!(next.description.delegation_handle(), handle);
+                assert_eq!(
+                    records[handle as usize - 1].lifetime.release(generation),
+                    OpenRelease::Stale
+                );
+                assert!(next.description.open_reference().is_some());
+                next.close_host();
+            }
+        }
+
+        #[test]
+        fn file_seam_fork_retirement_and_recall_preserve_exact_backing_custody() {
+            use carrick_el1::personality::file_table::{
+                dup2_host_binding, fork_fd_map, retire_fd_map,
+            };
+            let _region = Region::new();
+            let scratch = tempfile::tempdir().unwrap();
+            let (_fs, open) = seam_open(scratch.path(), "/data", 3);
+            let region = get_el1_region_host_ptr();
+            let records = seam_table(&_region);
+            let handle = open.description.delegation_handle();
+            let generation = records[handle as usize - 1]
+                .generation
+                .load(Ordering::Acquire);
+            dup2_host_binding(fd_map_slots(region), records, table().raw(), 3, 5, false).unwrap();
+            assert!(fork_fd_map(fd_map_slots(region), records, table().raw(), 2));
+            assert_eq!(
+                records[handle as usize - 1]
+                    .lifetime
+                    .ring_references(generation),
+                Some(3)
+            );
+            let identity = open.description.el1_identity().unwrap();
+            open.close_host();
+            assert_seam_live(identity);
+            // A real namespace/storage recall demotes bytes, not open lifetime.
+            recall(&open.description).unwrap();
+            assert_eq!(open.description.delegation_handle(), 0);
+            assert!(ALLOCATED_OPEN_FILES.lock()[handle as usize - 1].allocated);
+            assert!(records[handle as usize - 1].host_object().is_some());
+            retire_fd_map(fd_map_slots(region), records, 2);
+            assert_eq!(
+                records[handle as usize - 1]
+                    .lifetime
+                    .ring_references(generation),
+                Some(1)
+            );
+            retire_fd_map(fd_map_slots(region), records, table().raw());
+            owned_recall::test_drain_external();
+            assert!(!ALLOCATED_OPEN_FILES.lock()[handle as usize - 1].allocated);
+            assert!(open.description.open_reference().is_none());
         }
 
         /// Simulate EL1 serving a write: bytes into the cache, size, offset and
@@ -2407,7 +2986,11 @@ mod tests {
             }
             // Every member of the inode is at `end` (tests write through
             // their only member).
-            let allocated = *ALLOCATED_OPEN_FILES.lock();
+            let allocated: Vec<_> = ALLOCATED_OPEN_FILES
+                .lock()
+                .iter()
+                .map(|slot| slot.allocated)
+                .collect();
             for (index, in_use) in allocated.iter().enumerate() {
                 let record = open_file_object(region, (index + 1) as u32);
                 if *in_use && record.inode_handle.load(Ordering::Relaxed) == handle {

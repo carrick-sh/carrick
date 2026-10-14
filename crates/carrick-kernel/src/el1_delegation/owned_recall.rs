@@ -27,8 +27,21 @@ static START: Once = Once::new();
 // with aperture retirement. No storage or guest-resource wait holds this gate.
 static APERTURE_DRAIN: Mutex<()> = Mutex::new(());
 
+pub(super) fn with_open_aperture<T>(handoff: impl FnOnce() -> T) -> T {
+    let _drain = APERTURE_DRAIN.lock();
+    #[cfg(test)]
+    if let Some(hook) = HANDOFF_HOOK.lock().take() {
+        hook();
+    }
+    handoff()
+}
+
 pub(super) fn clear_aperture() {
     let _drain = APERTURE_DRAIN.lock();
+    let region = get_el1_region_host_ptr();
+    if region != 0 {
+        clear_open_lifetimes(region);
+    }
     carrick_el1_abi::record_el1_region_host_ptr(0);
 }
 
@@ -62,6 +75,18 @@ fn driver() -> &'static Driver {
     driver
 }
 
+pub(super) fn arm_open_releases() {
+    #[cfg(test)]
+    if let Some(hook) = ARM_HOOK.lock().take() {
+        hook();
+    }
+    // Notification may precede first driver admission. Retain that obligation
+    // explicitly instead of relying on a boundary that may already have fired.
+    let driver = driver();
+    driver.state.lock().external_ready = true;
+    driver.changed.notify_one();
+}
+
 /// A producer only nudges the carrier driver; it never performs storage or
 /// acquires an owner/description guard in a completion callback.
 pub(super) fn notify(_: &carrick_el1_abi::ZoneTables, _: carrick_sched_core::Waker) {
@@ -86,13 +111,20 @@ impl Driver {
     }
     fn drain_external(&self) {
         let _drain = APERTURE_DRAIN.lock();
-        let Some(zone) = zone_tables() else {
-            return;
-        };
         #[cfg(test)]
         if let Some(hook) = DRAIN_HOOK.lock().take() {
             hook();
         }
+        let region = get_el1_region_host_ptr();
+        if region != 0 {
+            // SAFETY: the aperture-drain gate excludes unmapping and reuse.
+            for handle in unsafe { pending_at(region) }.take() {
+                settle_open_release(region, handle);
+            }
+        }
+        let Some(zone) = zone_tables() else {
+            return;
+        };
         for index in zone.take_delegated_host_pending() {
             // Pin the exact target before consuming any owed edge.
             let job = self.state.lock().routes[index.index()].upgrade();
@@ -483,6 +515,25 @@ pub(super) fn start(job: &Arc<RecallJob>) {
 }
 
 #[cfg(test)]
+pub(super) fn wait_for_cleanup_bounded(identity: InodeIdentity) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut owners = OWNERS.lock();
+    loop {
+        let pending = owners
+            .as_ref()
+            .and_then(|map| map.get(&identity))
+            .is_some_and(|owner| matches!(owner.state, OwnerState::Recalling(_)));
+        if !pending {
+            return true;
+        }
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return false;
+        };
+        OWNERS_CHANGED.wait_for(&mut owners, remaining);
+    }
+}
+
+#[cfg(test)]
 pub(super) fn wait_for_cleanup(identity: InodeIdentity) {
     let owners = OWNERS.lock();
     let job = owners
@@ -500,6 +551,24 @@ pub(super) fn wait_for_cleanup(identity: InodeIdentity) {
 
 #[cfg(test)]
 pub(super) static DRAIN_HOOK: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+#[cfg(test)]
+pub(super) static ARM_HOOK: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+#[cfg(test)]
+pub(super) static HANDOFF_HOOK: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+#[cfg(test)]
+pub(super) static SETTLE_HOOK: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+#[cfg(test)]
+pub(super) fn wait_for_open_retirement(handle: u32) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut owners = OWNERS.lock();
+    while ALLOCATED_OPEN_FILES.lock()[handle as usize - 1].allocated {
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return false;
+        };
+        OWNERS_CHANGED.wait_for(&mut owners, remaining);
+    }
+    true
+}
 #[cfg(test)]
 pub(super) fn test_drain_external() {
     driver().drain_external();

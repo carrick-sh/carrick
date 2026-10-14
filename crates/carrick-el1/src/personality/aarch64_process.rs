@@ -230,6 +230,20 @@ impl core::fmt::Debug for Born<'_> {
 
 pub trait ForkStockCrossing {
     /// The carrier's shared descriptor metadata, owned by the guest kernel.
+    fn open_table(&self) -> &[carrick_el1_abi::DelegatedOpenFile] {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            unsafe {
+                &*(carrick_el1_abi::EL1_OPEN_FILE_TABLE_BASE
+                    as *const [carrick_el1_abi::DelegatedOpenFile;
+                        carrick_el1_abi::MAX_ZONE_OPEN_FILES])
+            }
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        {
+            &[]
+        }
+    }
     fn fd_map(&self) -> &[carrick_el1_abi::FdMapSlot] {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
@@ -266,6 +280,9 @@ impl<T: ForkStockCrossing> ForkStockCrossing for &T {
         (**self).cross_wait_channel_wake(channel, cpu)
     }
 
+    fn open_table(&self) -> &[carrick_el1_abi::DelegatedOpenFile] {
+        (**self).open_table()
+    }
     fn fd_map(&self) -> &[carrick_el1_abi::FdMapSlot] {
         (**self).fd_map()
     }
@@ -946,12 +963,18 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         parent_table: u64,
         child_table: u64,
     ) -> Result<(), NativeProcessError> {
-        super::file_table::fork_fd_map(self.crossing.fd_map(), parent_table, child_table)
-            .then_some(())
-            .ok_or(NativeProcessError::Exhausted)
+        super::file_table::fork_fd_map(
+            self.crossing.fd_map(),
+            self.crossing.open_table(),
+            parent_table,
+            child_table,
+        )
+        .then_some(())
+        .ok_or(NativeProcessError::Exhausted)
     }
     fn retire_fd_table(&mut self, table: u64) {
-        super::file_table::retire_fd_map(self.crossing.fd_map(), table);
+        super::file_table::retire_fd_map(self.crossing.fd_map(), self.crossing.open_table(), table);
+        self.task.linux.mark_pending_host_work();
     }
 }
 

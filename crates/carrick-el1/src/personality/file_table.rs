@@ -32,11 +32,8 @@ pub use carrick_syscall_abi::{
 // section. No host crossing or blocking wait is made while it is held.
 static FD_MAP_LOCK: SpinLock<()> = SpinLock::new(());
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ReleasedDescription {
-    pub handle: u32,
-    pub incarnation: u64,
-}
+pub use carrick_el1_abi::OpenReferenceKey as ReleasedDescription;
+use carrick_el1_abi::{OpenReferenceWork, OpenRelease, queue_open_release};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GuestDescriptorChange {
@@ -47,11 +44,31 @@ pub struct GuestDescriptorChange {
 pub const GUEST_FD_CLOEXEC: u32 = 1;
 pub const GUEST_FD_LIMIT: i32 = 1024;
 
-fn last_reference(fd_map: &[FdMapSlot], description: ReleasedDescription) -> bool {
-    !fd_map.iter().take(FD_MAP_CAPACITY).any(|slot| {
-        slot.incarnation.load(Ordering::Acquire) == description.incarnation
-            && slot.handle.load(Ordering::Relaxed) == description.handle
-    })
+fn release_reference(
+    open_table: &[DelegatedOpenFile],
+    key: ReleasedDescription,
+) -> Option<ReleasedDescription> {
+    release_reference_observed(open_table, key, |_| {})
+}
+fn release_reference_observed(
+    open_table: &[DelegatedOpenFile],
+    key: ReleasedDescription,
+    observe: impl FnMut(OpenReferenceWork),
+) -> Option<ReleasedDescription> {
+    let record = open_table.get(key.handle.checked_sub(1)? as usize)?;
+    match record.lifetime.release_observed(key.incarnation, observe) {
+        OpenRelease::Terminal => {
+            queue_open_release(key);
+            Some(key)
+        }
+        OpenRelease::Live | OpenRelease::Stale => None,
+    }
+}
+fn retain_reference(open_table: &[DelegatedOpenFile], key: ReleasedDescription) -> bool {
+    key.handle
+        .checked_sub(1)
+        .and_then(|i| open_table.get(i as usize))
+        .is_some_and(|record| record.lifetime.retain(key.incarnation))
 }
 
 fn tombstone_index(fd_map: &[FdMapSlot], file_table: u64, fd: i32) -> Option<usize> {
@@ -75,12 +92,22 @@ fn is_closed_stdio_tombstone(fd_map: &[FdMapSlot], file_table: u64, fd: i32) -> 
 /// release obligation. The host never owns the guest descriptor number.
 pub fn close_host_binding(
     fd_map: &[FdMapSlot],
+    open_table: &[DelegatedOpenFile],
     file_table: u64,
     fd: i32,
 ) -> Option<GuestDescriptorChange> {
+    close_host_binding_observed(fd_map, open_table, file_table, fd, |_| {})
+}
+pub fn close_host_binding_observed(
+    fd_map: &[FdMapSlot],
+    open_table: &[DelegatedOpenFile],
+    file_table: u64,
+    fd: i32,
+    observe: impl FnMut(OpenReferenceWork),
+) -> Option<GuestDescriptorChange> {
     let _guard = FD_MAP_LOCK.lock();
     let (handle, index) = fd_map_lookup(fd_map, file_table, fd)?;
-    if handle == 0 {
+    if handle == 0 || fd_map[index].fd_flags.load(Ordering::Acquire) & FdMapSlot::HOST_VIEW != 0 {
         return None;
     }
     let incarnation = fd_map[index].incarnation.load(Ordering::Acquire);
@@ -98,7 +125,7 @@ pub fn close_host_binding(
     };
     Some(GuestDescriptorChange {
         fd,
-        release: last_reference(fd_map, description).then_some(description),
+        release: release_reference_observed(open_table, description, observe),
     })
 }
 
@@ -107,6 +134,7 @@ pub fn close_host_binding(
 /// the new descriptor's close-on-exec flag.
 pub fn dup2_host_binding(
     fd_map: &[FdMapSlot],
+    open_table: &[DelegatedOpenFile],
     file_table: u64,
     old_fd: i32,
     new_fd: i32,
@@ -131,36 +159,54 @@ pub fn dup2_host_binding(
     }
     let incarnation = fd_map[source_index].incarnation.load(Ordering::Acquire);
     let tombstone = tombstone_index(fd_map, file_table, new_fd);
-    if let Some(index) = tombstone {
-        fd_map[index].clear();
-    }
     let target = fd_map_lookup(fd_map, file_table, new_fd);
-    let release = target.and_then(|(old_handle, index)| {
-        let old_incarnation = fd_map[index].incarnation.load(Ordering::Acquire);
-        fd_map[index].clear();
+    if target.is_some_and(|(_, index)| {
+        fd_map[index].fd_flags.load(Ordering::Acquire) & FdMapSlot::HOST_VIEW != 0
+    }) {
+        return None;
+    }
+    let source = ReleasedDescription {
+        handle,
+        incarnation,
+    };
+    if !retain_reference(open_table, source) {
+        return None;
+    }
+    let (slot, release) = if let Some((old_handle, index)) = target {
+        let slot = &fd_map[index];
         let old = ReleasedDescription {
             handle: old_handle,
-            incarnation: old_incarnation,
+            incarnation: slot.incarnation.load(Ordering::Acquire),
         };
-        (old_handle != 0 && last_reference(fd_map, old)).then_some(old)
-    });
-    let slot = if let Some((_, index)) = target {
-        let slot = &fd_map[index];
-        if !slot.try_claim() {
+        if !slot.try_claim_live(old.incarnation) {
+            release_reference(open_table, source);
             return None;
         }
-        slot
+        (
+            slot,
+            (old_handle != 0)
+                .then(|| release_reference(open_table, old))
+                .flatten(),
+        )
     } else if let Some(index) = tombstone {
         let slot = &fd_map[index];
-        if !slot.try_claim() {
+        if !slot.try_claim_live(1) {
+            release_reference(open_table, source);
             return None;
         }
-        slot
+        (slot, None)
     } else {
-        fd_map
+        match fd_map
             .iter()
             .take(FD_MAP_CAPACITY)
-            .find(|slot| slot.try_claim())?
+            .find(|slot| slot.try_claim())
+        {
+            Some(slot) => (slot, None),
+            None => {
+                release_reference(open_table, source);
+                return None;
+            }
+        }
     };
     slot.set_with_flags(
         file_table,
@@ -179,6 +225,7 @@ pub fn dup2_host_binding(
 /// open description. The caller enforces the task's RLIMIT_NOFILE ceiling.
 pub fn dup_host_binding(
     fd_map: &[FdMapSlot],
+    open_table: &[DelegatedOpenFile],
     file_table: u64,
     old_fd: i32,
     min_fd: i32,
@@ -196,20 +243,29 @@ pub fn dup_host_binding(
     let incarnation = fd_map[source_index].incarnation.load(Ordering::Acquire);
     let new_fd = (min_fd..max_fd).find(|fd| fd_map_lookup(fd_map, file_table, *fd).is_none())?;
     let tombstone = tombstone_index(fd_map, file_table, new_fd);
-    if let Some(index) = tombstone {
-        fd_map[index].clear();
-    }
-    let slot = if let Some(index) = tombstone {
-        &fd_map[index]
-    } else {
+    let candidate = tombstone.map(|index| &fd_map[index]).or_else(|| {
         fd_map
             .iter()
             .take(FD_MAP_CAPACITY)
-            .find(|slot| slot.incarnation.load(Ordering::Acquire) == 0)?
+            .find(|slot| slot.incarnation.load(Ordering::Acquire) == 0)
+    })?;
+    let source = ReleasedDescription {
+        handle,
+        incarnation,
     };
-    if !slot.try_claim() {
+    if !retain_reference(open_table, source) {
         return None;
     }
+    let claimed = if tombstone.is_some() {
+        candidate.try_claim_live(1)
+    } else {
+        candidate.try_claim()
+    };
+    if !claimed {
+        release_reference(open_table, source);
+        return None;
+    }
+    let slot = candidate;
     slot.set_with_flags(
         file_table,
         new_fd as u32,
@@ -282,6 +338,12 @@ pub fn admit_stdio(
             } else {
                 DELEGATED_FLAG_WRITABLE
             };
+            if open_file.generation.load(Ordering::Acquire) == 0 {
+                assert!(open_file.lifetime.initialize(1, false));
+            } else if !open_file.lifetime.retain(1) {
+                slot.clear();
+                continue;
+            }
             open_file.flags.store(flags, Ordering::Relaxed);
             open_file.generation.store(1, Ordering::Relaxed);
             open_file.inode_handle.store(handle, Ordering::Relaxed);
@@ -341,6 +403,7 @@ pub fn admit_host_fd(
     obj.generation.store(1, Ordering::Relaxed);
     obj.state.store(DELEGATED_STATE_GUEST, Ordering::Release);
 
+    assert!(open_file.lifetime.initialize(1, false));
     open_file.flags.store(flags, Ordering::Relaxed);
     open_file.generation.store(1, Ordering::Relaxed);
     open_file.inode_handle.store(handle, Ordering::Relaxed);
@@ -359,7 +422,12 @@ pub fn admit_host_fd(
 ///
 /// Copies `parent_table` descriptor slots in `fd_map` to `child_table`, sharing
 /// the exact same open description (`handle`).
-pub fn fork_fd_map(fd_map: &[FdMapSlot], parent_table: u64, child_table: u64) -> bool {
+pub fn fork_fd_map(
+    fd_map: &[FdMapSlot],
+    open_table: &[DelegatedOpenFile],
+    parent_table: u64,
+    child_table: u64,
+) -> bool {
     if parent_table == 0 || child_table == 0 || parent_table == child_table {
         return false;
     }
@@ -399,14 +467,34 @@ pub fn fork_fd_map(fd_map: &[FdMapSlot], parent_table: u64, child_table: u64) ->
             return false;
         }
     }
+    let mut retained = Vec::new();
+    for &(_, handle, inc, _) in &copies {
+        if handle == 0 || handle & carrick_el1_abi::FD_HANDLE_INOTIFY_TAG != 0 {
+            continue;
+        }
+        let key = ReleasedDescription {
+            handle,
+            incarnation: inc,
+        };
+        if !retain_reference(open_table, key) {
+            for key in retained {
+                release_reference(open_table, key);
+            }
+            for index in claimed {
+                fd_map[index].clear();
+            }
+            return false;
+        }
+        retained.push(key);
+    }
     for ((fd, handle, inc, flags), index) in copies.into_iter().zip(claimed) {
-        fd_map[index].set_with_flags(child_table, fd, handle, inc, flags);
+        fd_map[index].set_with_flags(child_table, fd, handle, inc, flags & !FdMapSlot::HOST_VIEW);
     }
     true
 }
 
 /// Retire only the exact table's published descriptors after exit or rollback.
-pub fn retire_fd_map(fd_map: &[FdMapSlot], file_table: u64) {
+pub fn retire_fd_map(fd_map: &[FdMapSlot], open_table: &[DelegatedOpenFile], file_table: u64) {
     if file_table == 0 {
         return;
     }
@@ -415,7 +503,15 @@ pub fn retire_fd_map(fd_map: &[FdMapSlot], file_table: u64) {
         if slot.file_table.load(Ordering::Acquire) == file_table
             && slot.incarnation.load(Ordering::Acquire) != 0
         {
+            if slot.fd_flags.load(Ordering::Acquire) & FdMapSlot::HOST_VIEW != 0 {
+                continue;
+            }
+            let key = ReleasedDescription {
+                handle: slot.handle.load(Ordering::Relaxed),
+                incarnation: slot.incarnation.load(Ordering::Acquire),
+            };
             slot.clear();
+            release_reference(open_table, key);
         }
     }
 }
@@ -742,12 +838,29 @@ mod tests {
     }
 
     #[test]
+    fn fork_preserves_inotify_without_open_file_accounting() {
+        let (fd_map, open_table, _) = setup_tables();
+        let handle = carrick_el1_abi::FD_HANDLE_INOTIFY_TAG | 1;
+        assert!(fd_map[0].try_claim());
+        fd_map[0].set(10, 4, handle, 9);
+        assert!(fork_fd_map(&fd_map, &open_table, 10, 11));
+        assert_eq!(
+            carrick_el1_abi::fd_map_lookup_inotify(&fd_map, 11, 4)
+                .unwrap()
+                .0,
+            1
+        );
+        retire_fd_map(&fd_map, &open_table, 11);
+        assert!(carrick_el1_abi::fd_map_lookup_inotify(&fd_map, 10, 4).is_some());
+    }
+
+    #[test]
     fn dup2_then_close_keeps_the_shared_host_binding() {
         let (fd_map, open_table, object_table) = setup_tables();
         admit_stdio(&fd_map, &open_table, &object_table, 10, [true, true, true]);
         let original = fd_map_lookup(&fd_map, 10, 1).unwrap().0;
         assert_eq!(
-            dup2_host_binding(&fd_map, 10, 1, 5, false),
+            dup2_host_binding(&fd_map, &open_table, 10, 1, 5, false),
             Some(GuestDescriptorChange {
                 fd: 5,
                 release: None
@@ -755,7 +868,7 @@ mod tests {
         );
         assert_eq!(fd_map_lookup(&fd_map, 10, 5).unwrap().0, original);
         assert_eq!(
-            close_host_binding(&fd_map, 10, 1),
+            close_host_binding(&fd_map, &open_table, 10, 1),
             Some(GuestDescriptorChange {
                 fd: 1,
                 release: None
@@ -795,7 +908,7 @@ mod tests {
         assert_eq!(entries[0].revents, LINUX_POLLOUT);
         assert_eq!(entries[1].revents, LINUX_POLLNVAL);
         assert_eq!(
-            close_host_binding(&fd_map, 10, 5),
+            close_host_binding(&fd_map, &open_table, 10, 5),
             Some(GuestDescriptorChange {
                 fd: 5,
                 release: Some(ReleasedDescription {
@@ -816,8 +929,16 @@ mod tests {
             10,
             [false, true, false],
         );
-        assert_eq!(dup2_host_binding(&fd_map, 10, 1, 1, true), None);
-        assert_eq!(dup2_host_binding(&fd_map, 10, 1, 5, true).unwrap().fd, 5);
+        assert_eq!(
+            dup2_host_binding(&fd_map, &open_table, 10, 1, 1, true),
+            None
+        );
+        assert_eq!(
+            dup2_host_binding(&fd_map, &open_table, 10, 1, 5, true)
+                .unwrap()
+                .fd,
+            5
+        );
         let (_, index) = fd_map_lookup(&fd_map, 10, 5).unwrap();
         assert_eq!(
             fd_map[index].fd_flags.load(Ordering::Acquire),
@@ -825,14 +946,16 @@ mod tests {
         );
         let (_, original_index) = fd_map_lookup(&fd_map, 10, 1).unwrap();
         assert_eq!(fd_map[original_index].fd_flags.load(Ordering::Acquire), 0);
-        assert!(fork_fd_map(&fd_map, 10, 11));
+        assert!(fork_fd_map(&fd_map, &open_table, 10, 11));
         let (_, child_index) = fd_map_lookup(&fd_map, 11, 5).unwrap();
         assert_eq!(
             fd_map[child_index].fd_flags.load(Ordering::Acquire),
             GUEST_FD_CLOEXEC
         );
         assert_eq!(
-            dup2_host_binding(&fd_map, 11, 1, 5, false).unwrap().release,
+            dup2_host_binding(&fd_map, &open_table, 11, 1, 5, false)
+                .unwrap()
+                .release,
             None
         );
         assert_eq!(fd_map[child_index].fd_flags.load(Ordering::Acquire), 0);
@@ -842,7 +965,7 @@ mod tests {
     fn readmitting_a_table_does_not_reopen_explicitly_closed_stdio() {
         let (fd_map, open_table, object_table) = setup_tables();
         admit_stdio(&fd_map, &open_table, &object_table, 10, [true; 3]);
-        assert!(close_host_binding(&fd_map, 10, 1).is_some());
+        assert!(close_host_binding(&fd_map, &open_table, 10, 1).is_some());
         assert!(is_closed_stdio_tombstone(&fd_map, 10, 1));
         admit_stdio(&fd_map, &open_table, &object_table, 10, [true; 3]);
         assert_eq!(fd_map_lookup(&fd_map, 10, 1), None);
@@ -853,14 +976,16 @@ mod tests {
     fn dup_reuses_closed_stdin_number() {
         let (fd_map, open_table, object_table) = setup_tables();
         admit_stdio(&fd_map, &open_table, &object_table, 10, [true; 3]);
-        close_host_binding(&fd_map, 10, 0).unwrap();
+        close_host_binding(&fd_map, &open_table, 10, 0).unwrap();
         assert_eq!(
-            dup_host_binding(&fd_map, 10, 1, 0, 1024, false).unwrap().fd,
+            dup_host_binding(&fd_map, &open_table, 10, 1, 0, 1024, false)
+                .unwrap()
+                .fd,
             0
         );
         assert_eq!(fd_map_lookup(&fd_map, 10, 0).unwrap().0, 2);
         assert_eq!(
-            dup2_host_binding(&fd_map, 10, 1, GUEST_FD_LIMIT, false),
+            dup2_host_binding(&fd_map, &open_table, 10, 1, GUEST_FD_LIMIT, false),
             None
         );
     }
@@ -1038,7 +1163,7 @@ mod tests {
             parent,
             [true, true, true],
         );
-        fork_fd_map(&fd_map, parent, child);
+        fork_fd_map(&fd_map, &open_table, parent, child);
 
         // Both have fd 1 pointing to the same handle
         let parent_lookup = fd_map_lookup(&fd_map, parent, 1).unwrap();
@@ -1059,7 +1184,7 @@ mod tests {
         for (fd, slot) in fd_map.iter().enumerate().skip(3).take(FD_MAP_CAPACITY - 5) {
             slot.set(99, fd as u32, 1, 1);
         }
-        fork_fd_map(&fd_map, 10, 20);
+        fork_fd_map(&fd_map, &open_table, 10, 20);
         for fd in 0..3 {
             assert_eq!(fd_map_lookup(&fd_map, 20, fd), None);
         }
@@ -1070,11 +1195,11 @@ mod tests {
         let (fd_map, open_table, object_table) = setup_tables();
         admit_stdio(&fd_map, &open_table, &object_table, 10, [true, true, true]);
         for child in 20..100 {
-            assert!(fork_fd_map(&fd_map, 10, child));
+            assert!(fork_fd_map(&fd_map, &open_table, 10, child));
             for fd in 0..3 {
                 assert!(fd_map_lookup(&fd_map, child, fd).is_some());
             }
-            retire_fd_map(&fd_map, child);
+            retire_fd_map(&fd_map, &open_table, child);
             for fd in 0..3 {
                 assert_eq!(fd_map_lookup(&fd_map, child, fd), None);
             }

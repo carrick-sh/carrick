@@ -22,6 +22,8 @@
 
 pub use carrick_guest_arch::ContextGeneration;
 
+mod open_lifetime;
+pub use open_lifetime::*;
 mod cow_grants;
 pub use cow_grants::*;
 mod descriptor_txn;
@@ -660,6 +662,9 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         EL1_OBJECT_TABLE_OFFSET,
         EL1_FD_MAP_OFFSET,
         EL1_OPEN_FILE_TABLE_OFFSET,
+        OPEN_REFERENCE_PENDING_OFFSET,
+        core::mem::size_of::<OpenReferencePending>() as u64,
+        FdMapSlot::HOST_VIEW as u64,
         EL1_CACHE_OFFSET,
         EL1_INOTIFY_TABLE_OFFSET,
         EL1_NAME_CACHE_OFFSET,
@@ -798,6 +803,7 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(DelegatedOpenFile, host_fd) as u64,
         core::mem::offset_of!(DelegatedOpenFile, inode_generation) as u64,
         core::mem::offset_of!(DelegatedOpenFile, offset) as u64,
+        core::mem::offset_of!(DelegatedOpenFile, lifetime) as u64,
         core::mem::size_of::<DelegatedMark>() as u64,
         core::mem::size_of::<DelegatedWatch>() as u64,
         core::mem::size_of::<DelegatedInotify>() as u64,
@@ -1620,7 +1626,8 @@ pub struct DelegatedOpenFile {
     pub inode_generation: AtomicU64,
     /// Current file offset of this description.
     pub offset: AtomicU64,
-    pub _pad: [u64; 3],
+    pub lifetime: OpenLifetime,
+    pub _pad: [u64; 2],
 }
 
 impl DelegatedOpenFile {
@@ -1659,7 +1666,8 @@ impl DelegatedOpenFile {
             host_fd: AtomicU32::new(0),
             inode_generation: AtomicU64::new(0),
             offset: AtomicU64::new(0),
-            _pad: [0; 3],
+            lifetime: OpenLifetime::new(),
+            _pad: [0; 2],
         }
     }
 
@@ -1878,12 +1886,28 @@ pub struct FdMapSlot {
 impl FdMapSlot {
     /// Reserved while a publisher fills a vacant slot; never a live incarnation.
     pub const CLAIMED: u64 = u64::MAX;
+    /// Non-owning view; the host file table owns the functional reference.
+    pub const HOST_VIEW: u32 = 1 << 31;
 
     #[inline]
     pub fn try_claim(&self) -> bool {
         self.incarnation
             .compare_exchange(0, Self::CLAIMED, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+    }
+    /// Reserve an exact published incarnation before replacing its fields.
+    pub fn try_claim_live(&self, incarnation: u64) -> bool {
+        incarnation != 0
+            && incarnation != Self::CLAIMED
+            && self
+                .incarnation
+                .compare_exchange(
+                    incarnation,
+                    Self::CLAIMED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
     }
     pub const fn new() -> Self {
         Self {
@@ -3754,7 +3778,8 @@ impl Default for InotifyNameCache {
 const _: () = {
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
-    assert!(EL1_ABI_LAYOUT_HASH == 0xd42665b03443920f);
+    assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);
+    assert!(core::mem::size_of::<OpenLifetime>() == 8);
     assert!(
         EL1_APERTURE_CONTROL_OFFSET.is_multiple_of(core::mem::align_of::<ApertureControl>() as u64)
     );
