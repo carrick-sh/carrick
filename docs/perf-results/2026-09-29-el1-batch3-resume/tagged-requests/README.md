@@ -1,6 +1,6 @@
 # Incarnation-bound cancellation and host requests
 
-Base `dc14f4f9e`, branch `integ/batch3`. Controller A remains unaccepted.
+Base `c16d5a648`, branch `integ/batch3`. Controller A remains unaccepted.
 
 Three red-first reductions:
 
@@ -34,7 +34,7 @@ restore proof, park-sequence wrap, exact scheduler wakes, deterministic signed
 bindings and WorkObservation remain open. Historical Python/otmp attribution
 and full batch acceptance are not implied by these reductions.
 
-Implementation `276e05673`; clean provenance refresh `8bb7fcd8d`.
+Implementation `4efc5b816`; clean provenance refresh `2e941282c`.
 The compiler reconciliation retained all 595 rows and positions unchanged.
 Exact contract-change coverage and `just lint-domains` passed. The compiler
 census covers the macOS subset; other host profiles remain pending.

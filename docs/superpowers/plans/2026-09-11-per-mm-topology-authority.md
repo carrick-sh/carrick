@@ -502,7 +502,7 @@ instruments. Task 5 must fire the same append-only operation ids from
 acquisitions so the scripts measure the new authorities, and the fork-wait
 script's anchors must be re-qualified live before its numbers are cited.
 
-## Measurement (2026-09-12, binary 56fe7daa3cd2d54d = main 9c04adc56, quiet host)
+## Measurement (2026-09-12, binary 56fe7daa3cd2d54d = main 4ad3c1003, quiet host)
 
 - Task 1 acceptance: `children_run_concurrently` PASSED (0.60 s for four
   400 ms spinners; serialized would be ~1.6 s) — child processes run in
@@ -519,7 +519,7 @@ script's anchors must be re-qualified live before its numbers are cited.
   parallelism is ~1.95 cores (was 1.3 before Task 4; Docker ~5 of 10 in
   2.9 s). The row is now ~2.2x Docker at one worker; the remaining
   serialization is Task 6's (fork flag/coordinator) and Task 5's.
-- 2026-09-12 10:36, binary 77edb0f41b3ff492 (main a263a4edf, both Task 4
+- 2026-09-12 10:36, binary 77edb0f41b3ff492 (main 4e2ae86ca, both Task 4
   fixes in): Task 1 acceptance GREEN — `children_run_concurrently` 0.60 s,
   `fault_latency_is_independent_of_sibling_fork` passes (154 s wall for
   its alone + contended phases; the 8-round 64 MiB fault loop is still
@@ -527,7 +527,7 @@ script's anchors must be re-qualified live before its numbers are cited.
   multiprocessing row: 6.66 s vs 6.62 s wall, 10.3 s user both — CPU
   exposure is not the limiter; parallelism ~1.9 cores. Paired five-row
   scorecard running.
-- 2026-09-12 12:35, Task 6 LANDED (4242d0229, pinned e32d0b3e1851faef):
+- 2026-09-12 12:35, Task 6 LANDED (84e574212, pinned e32d0b3e1851faef):
   `ForkQuiesce` lives in `DispatchMmAuthority`/`Mm`; executors bind it with
   `bind_current_mm_quiesce(pt, fork)`; `is_quiescing()` reads the bound
   per-mm barrier (the deleted `barrier::B` global had no production
@@ -547,4 +547,4 @@ script's anchors must be re-qualified live before its numbers are cited.
   "httptest.Server blocked in Close after 5 seconds … *tls.Conn … idle"
   — an idle TLS conn not closed promptly; take a core next time it
   reproduces rather than filing it as load. Task 5 dispatched
-  (`agy-mm-alias-scope-sep12`, base 4242d0229).
+  (`agy-mm-alias-scope-sep12`, base 84e574212).

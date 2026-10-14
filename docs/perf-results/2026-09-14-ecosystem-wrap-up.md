@@ -4,13 +4,13 @@ The user requested stopping development and fast-forwarding the consolidated cam
 
 ## Accepted implementation and validation
 
-The integration branch `codex/sep13-inner-integration` contains 61 campaign commits through `cc1c1d80ba9a2ef632d8dda2d39c9192b3741b87`, followed by position-only host-authority reconciliation and this handoff. Main started at `7a381803487b5111c08d5f5442c40d31191295bb`.
+The integration branch `codex/sep13-inner-integration` contains 61 campaign commits through `4d8080c2146ffc8a3c93856c11ccc1f58dfc4edd`, followed by position-only host-authority reconciliation and this handoff. Main started at `8b74ac98082ce809e3a2f88c9f7fdc52bbd9df24`.
 
 Work includes initial named-credential resolution from the prepared image root, partial MADV_DONTFORK handling, descriptor/wait correctness, loopback TCP lifecycle corrections, root mkdir transaction admission, and oracle/verdict accounting improvements. Container cache experiments were not accepted into this integration.
 
 All local receipts below are under `/Volumes/CaseSensitive/carrick/target/conformance/sep13-review/`.
 
-- Latest signed CLI receipt: `sep14-disconnect-final-artifact.json`; source cc1c1d80b; SHA-256 `24b0343bca9f4b0065491f66d5121985f52dfea392a9899230ee5ee2b38a3e78`. Entitlement, signature and DOF checked. Binary remains in the integration worktree's target/release directory; fast-forwarding source does not rebuild main's binary.
+- Latest signed CLI receipt: `sep14-disconnect-final-artifact.json`; source 4d8080c21; SHA-256 `24b0343bca9f4b0065491f66d5121985f52dfea392a9899230ee5ee2b38a3e78`. Entitlement, signature and DOF checked. Binary remains in the integration worktree's target/release directory; fast-forwarding source does not rebuild main's binary.
 - TCP disconnect probe: signed red failure followed by musl/GNU green, unentitled negative control passing, scoped cleanup zero. Receipts: `sep14-disconnect-signed-{red,green}.log` and associated artifacts JSONL.
 - Source-stable host gates: `sep14-disconnect-host-gates/results.json`; formatting, runtime (2895 passed, 2 ignored), integration and workspace clippy passed.
 - Fresh serial Docker/Carrick workload verification: `sep14-disconnect-workloads/verification.json`; connect01 7/7 MATCH; pathlib 461/461 MATCH with 148 matched skips; connect02 still fails at post-disconnect bind with ENOTSOCK. Three unique rows, unchanged artifact, no remaining scoped Carrick or Docker processes.

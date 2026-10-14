@@ -1,6 +1,6 @@
 # Integrated EL1 gate: memory performance remains red
 
-Source: `3667731b2d65347a3f8a5bf4166f397e18098ff7`.
+Source: `96d2b81783d90f727c64b43b15380a96e9fe9647`.
 The signed release CLI was built once and frozen before
 `just --no-deps el1-gate`. The command exits 1 at its signed embed step.
 Forty-one EL1 tests pass, including the new fault-entry witness; the sole

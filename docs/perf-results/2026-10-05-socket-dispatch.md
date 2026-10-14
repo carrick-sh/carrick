@@ -1,6 +1,6 @@
 # Deterministic connection notification scope
 
-Contract: `kernel.net.connect-wake-scope`. Starting revision: `51bfe67f4`.
+Contract: `kernel.net.connect-wake-scope`. Starting revision: `bb24853c2`.
 Original failure: `/tmp/inv-pr2-evidence/kernel-semantics.log`, where
 `socket_close::tcp_peer_shut_wr_live_peer_handshake` completed its Linux
 assertions but dispatched `epoll_pwait` three times instead of two.

@@ -1,6 +1,6 @@
 # Syscall support metadata audit (2026-10-04)
 
-Source inspected: `b1167c6e1`, before this metadata correction. This is a
+Source inspected: `be61e5aed`, before this metadata correction. This is a
 code/coverage audit, not fresh guest acceptance. No Docker or signed HVF run
 was performed on the Linux worker. Existing LTP baseline MATCH rows that
 contain TBROK/TCONF are not evidence of successful syscall execution.
@@ -100,7 +100,7 @@ counts count rows accurately.
 Contract exemption: changes to `crates/carrick-abi/src/syscall.rs`,
 `crates/carrick-kernel/tests/integration/syscall_table.rs`,
 `conformance-contracts/inventory.json`, `AGENTS.md`, and these two documentation
-files alter reporting only relative to `b1167c6e1`. Process/lifecycle/scheduling
+files alter reporting only relative to `be61e5aed`. Process/lifecycle/scheduling
 execution and work budgets are unchanged: neither resolver nor handlers consult
 SupportLevel or handler_for_aarch64 for execution routing. Existing metadata
 assertions are updated to match the inspected handlers. Existing probes and
@@ -108,7 +108,7 @@ kernel tests establish the inspected paths; fresh guest conformance remains
 outside this Linux worker's evidence.
 
 Red-first metadata verification: the updated `syscall_table` integration tests
-fail against `b1167c6e1` metadata (Deferred instead of BringUp for the priority
+fail against `be61e5aed` metadata (Deferred instead of BringUp for the priority
 query; Unimplemented instead of Lifecycle for execveat). All seven pass with
 the corrected table. The existing `rseq_reports_clean_bootstrap_fallback`
 integration test also passes, independently confirming errno 38.

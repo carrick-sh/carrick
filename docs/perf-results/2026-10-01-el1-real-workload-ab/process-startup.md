@@ -1,6 +1,6 @@
 # What does a process cost to start under Carrick?
 
-**Status (2026-10-01):** diagnosis only, Carrick side, on main 1c7406a7f
+**Status (2026-10-01):** diagnosis only, Carrick side, on main 42eb46216
 (binary f5e93503, lane off). The host was shared throughout (load average
 12–30 on 10 CPUs). Counts are citable. Times under the DTrace profiles are
 inflated (instrumented runs are about 3–4× slower than untraced), so use

@@ -8,7 +8,7 @@
 
 ## 1. Overview and Ring-First Census Policy
 
-Under Carrick's ring-first architecture (`origin/main` cb835a712):
+Under Carrick's ring-first architecture (`origin/main` 5d67097ef):
 - **AArch64 EL1:** Syscalls without a wired in-ring handler remain `Family::Unported` and are refused as `Counted-ENOSYS` under strict ring-first. Wired family handlers returning `Forward` are tagged `ForwardReason::FamilyFallback` and reach the host uncounted, which would bypass the strict census in `docs/design/arm-ring-first-flip.tsv`.
 - **x86_64 CPL0:** Operates in strict mode where any forwarding outside `HostCrossingSet::X86` (`crates/carrick-personality-linux/src/crossing.rs`) is refused as `ENOSYS`.
 

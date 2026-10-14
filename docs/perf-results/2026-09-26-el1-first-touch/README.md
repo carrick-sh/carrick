@@ -1,7 +1,7 @@
 # EL1 anonymous first-touch: initial red witness
 
-Source: `2c0b989c04bb1eb3c011268b9d01ad0ec5e14048`. The runtime is unchanged
-from `d7393f616`; subsequent commits added the controller and test fixture.
+Source: `6f7efffbd5f226ce45d7506d0df5776b029a270c`. The runtime is unchanged
+from `1b0b36e04`; subsequent commits added the controller and test fixture.
 
 Two live fork-related processes touch the same inherited, initially untouched
 private anonymous mapping. Each verifies zero-fill, writes its own pattern,
@@ -87,7 +87,7 @@ host image sees its valid live page, invalidates that leaf only in the retained
 hardware backing under the current-MM mutation authority, then takes the host
 fork/rollback image. The image incorrectly translates the revoked address to
 IPA `665719930880`; expected `None`. The test fails its semantic assertion,
-not setup or compilation. Runtime implementation at this point is `cc270b3f0`
+not setup or compilation. Runtime implementation at this point is `feaa903e6`
 plus only the test/helper and contract changes. It does not claim guest fault
 service is enabled. This red remains open until live storage and snapshots use
 one authority; read-window correction alone did not solve it.

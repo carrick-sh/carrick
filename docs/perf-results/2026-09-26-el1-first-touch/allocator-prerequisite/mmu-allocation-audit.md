@@ -1,6 +1,6 @@
 # MMU metadata allocation admission audit
 
-Source inspected: `31e3e3a14` (the integrated MMU implementation is unchanged
+Source inspected: `de8b60c90` (the integrated MMU implementation is unchanged
 by the concurrent fault-entry worker). This is static evidence for the next
 prerequisite, not a reproduced current guest failure or an accepted design.
 

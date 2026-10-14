@@ -20,7 +20,7 @@ Signed batch population, fixed Python/Go repetitions, controlled native-Linux
 ratios and remaining deterministic lifecycle obligations are still pending.
 No historical failure is cleared by this source gate. X86 is user-deferred.
 
-## Signed gate on e8db2fd51
+## Signed gate on 26079e466
 
 `just --no-deps el1-gate` exited 0. The release CLI SHA stayed
 `9d266e3aa63562d92764f6e3659f6be85e86aeb65691a862717ea1ed26c1b18a`.

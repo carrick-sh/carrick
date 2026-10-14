@@ -7,8 +7,8 @@
 Historical pre-rebase evidence. The current reviewed-base resolution and
 verification are recorded in [the rebase packet](2026-10-06-x86-order6-rebase.md).
 
-Comparison base: `0f476ce7a` (order 5), on integrated N1 `56bf8c0ca`.
-The exit-participant custody from `af7bda476` is an ancestor of this base.
+Comparison base: `d3a359245` (order 5), on integrated N1 `a4faef4c8`.
+The exit-participant custody from `100bc3bfa` is an ancestor of this base.
 This extraction consumes its current graph operations; it does not replace
 terminal-clear, adoption, graph revision reservations or participant custody.
 No wider Linux exit/robust-death semantics are claimed.
@@ -132,14 +132,14 @@ one-waiter policy).
 
 ## Evidence and red controls
 
-Pre-move AL commands on `0f476ce7a`: EL1 ABI `thread_lifecycle` 20 tests,
+Pre-move AL commands on `d3a359245`: EL1 ABI `thread_lifecycle` 20 tests,
 EL1 `personality::lifecycle` 20 tests, kernel `prepared_parent_exit_` 7 tests.
 After movement, the 20 ABI assertions run under Linux `abi::thread`; the
 20 ARM native-frame assertions remain local and execute the moved Linux
 owner. The old ABI test path has zero tests because its bodies were deleted;
 that zero-test run is not counted as verification.
 
-The order-6 owner fence was RED on an isolated checkout of `0f476ce7a`:
+The order-6 owner fence was RED on an isolated checkout of `d3a359245`:
 `order 6 must remove lifecycle from PendingFamilies`. Production mutation
 controls (restored before green verification) produce these specific reds:
 
@@ -188,11 +188,11 @@ cfg/feature branches. This is not the plan's all-source relocation metric.
 The standalone Rust census is retained in `docs/perf-results/order6-census`.
 Run it with `cargo run --locked --offline --manifest-path
 docs/perf-results/order6-census/Cargo.toml -- <tree>`; the base tree is a
-`git archive 0f476ce7a` extraction of the three crates' `src/` directories.
+`git archive d3a359245` extraction of the three crates' `src/` directories.
 It uses the same parser for both snapshots; no source renames receive extra
 credit.
 
-| Crate | Before `0f476ce7a` | After | Net reduction |
+| Crate | Before `d3a359245` | After | Net reduction |
 | --- | ---: | ---: | ---: |
 | carrick-el1 | 10,950 | 10,395 | 555 |
 | carrick-el1-abi | 9,311 | 8,053 | 1,258 |
@@ -227,7 +227,7 @@ The new core files contain no production panic/unwrap/expect/allow or Linux
 policy. Unsafe native mappings/context instructions carry SAFETY arguments.
 
 Runtime Linux `--all-targets` Clippy is a baseline blocker: 117 unused/dead-code
-errors occur both here and in an isolated `0f476ce7a` checkout. The diagnostic
+errors occur both here and in an isolated `d3a359245` checkout. The diagnostic
 multisets are identical, with zero additions/removals. Focused shared/native
 owner crates and kernel/kernel-example all-target Clippy pass. This does not
 confer a macOS runtime all-target or signed result.
@@ -265,7 +265,7 @@ signal-boundary correction moves Linux pending policy into the personality
 without changing the auditor. Historical lint results remain recorded here;
 see the correction report for current verification.
 
-PR #68 advanced to `3207564aa` during final verification. The director was
+PR #68 advanced to `4657c277b` during final verification. The director was
 asked to supply the settled rebase target. This work retains its approved
-`0f476ce7a` base pending that instruction; no later order-5 fixes are claimed
+`d3a359245` base pending that instruction; no later order-5 fixes are claimed
 as integrated. A kept/ported/dropped audit remains required on that rebase.

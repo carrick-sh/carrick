@@ -1,7 +1,7 @@
 # Order 6 signal boundary correction
 
-Base: director-rebased and macOS-recaptured `6bb08a88d` on order 5
-`926ccbd46`. The exact CI scanner is red before this correction: nine
+Base: director-rebased and macOS-recaptured `7cca16366` on order 5
+`6965c0200`. The exact CI scanner is red before this correction: nine
 `PendingSignals` findings in signal-core. This is an order-6 gate regression.
 The prior archived-source comparison used a newer auditor against older
 sources and was invalid for baseline attribution; those reports now mark it
@@ -30,7 +30,7 @@ The standalone ARM scheduler fixture lock records the new personality-to-
 signal-storage dependency; its locked offline metadata succeeds.
 ARM implementation files and CurrentTask's physical ABI are untouched.
 The correction contributes zero ARM production-line delta. Order 6's
-previously measured reduction versus `7b6d15813` remains 1,705 production
+previously measured reduction versus `9be9fa3eb` remains 1,705 production
 lines (33,658 to 31,953 across EL1, EL1-ABI and AArch64). The six original
 order-6 red dispositions remain as documented in the rebase ledger; this
 change touches none of those implementations or assertions.

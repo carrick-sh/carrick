@@ -1,7 +1,7 @@
 # Retired authority checker rule audit
 
-This audit compares the checkers on final main (`8f6e6bc08aea`) with PR 51.
-The checker rules are unchanged from the earlier `8ebd6fe41693` audit.
+This audit compares the checkers on final main (`97f542525eb4`) with PR 51.
+The checker rules are unchanged from the earlier `c4303f129cd5` audit.
 The replacements consume working production source or live compiler diagnostics;
 accepted identities are operation / owner / lane counters, never source positions.
 COUNT means a monotone ceiling and DELETE-AT-ZERO. TYPE/BOUNDARY and zero rules
@@ -95,7 +95,7 @@ Every changed cohort (all others remain unchanged):
 
 ## Conditional compilation audit
 
-The normalization diff against the 8ebd6fe41 merge base was inspected for every
+The normalization diff against the c4303f129 merge base was inspected for every
 changed production file containing `target_os`: 85 files. The audit also searched
 all source for retained `thiserror`, `serde`, `clap` and `zerocopy` imports after
 qualifying their derives. This found two macOS-only cleanup sites:
@@ -258,7 +258,7 @@ carrick-x86-cpl0:
 
 ## Final main rebase and discovery
 
-The one final rebase uses `8f6e6bc08aea90244b66a43192cf970462d33909`.
+The one final rebase uses `97f542525eb4e947eb8cb05332b9e10de49ed05a`.
 Fresh Linux, FreeBSD and NetBSD compiler observations are re-derived by symbolic
 owner. Main adds three `global:env_var` BuildTime cohorts in
 `carrick_observability::build_program::main`: `CARGO_CFG_TARGET_ARCH`,
@@ -333,7 +333,7 @@ the bootstrap.
 
 ## PR 85 landing rebase
 
-The landing base is `9cbe10d75a93dfeb37cb0a3d32026a332857ad7f`.
+The landing base is `46a221be85a8c6d59dc224a0cff623ab3ee14a4a`.
 Preserve main's shared SlotId, typed CPL0 forward boundary and contract surfaces;
 keep retired positional inventories deleted. Move main's fixture witness into
 parsed fixture source. Qualify AllowedHostCrossing's built-in derive providers:
@@ -360,7 +360,7 @@ vocabulary and discovery output format are unchanged from `e2588bd4f`.
 
 ## PR 118 landing rebase
 
-The landing base is `048c2b6c1297d1ed466df676f40df2f3315dfd0b`.
+The landing base is `eae1d0752c5fc435a2101365d6999540dad59cdb`.
 Keep the positional inventory deleted and preserve main's `cpl0_inputs.rs`
 and `build.rs` byte-for-byte. Manifest traversal no longer invokes nested Cargo
 metadata. Source census and compiler discovery observe exactly two new BuildTime

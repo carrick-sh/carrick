@@ -1,6 +1,6 @@
 # EL1 metadata host-wait red witness
 
-Source `7f40c2ad09f39ee27de8376dec5e0a0c4763a8e0` executes the real signed
+Source `f69e101992f196d94126fcdab1dbd0f72d1621de` executes the real signed
 allocator growth/return path and fails the no-host-wait-while-masked contract.
 The fixture returned `rc=4`: two extent grants and two returns reached the
 synchronous `HVC #6` boundary with `DAIF.I` set. The entitlement negative

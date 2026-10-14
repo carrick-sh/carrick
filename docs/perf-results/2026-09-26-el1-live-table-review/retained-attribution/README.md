@@ -1,11 +1,11 @@
 # Bounded attribution of retained GNU observations
 
-The public run on `863e81757` reported `ppollwaitset` wake bucket `lt100`
+The public run on `7ad7a66bf` reported `ppollwaitset` wake bucket `lt100`
 versus cached Linux `lt1`, and `sigprofvdso` timer text sampling `1` versus
 cached Linux `0`. No probe or oracle was changed for this investigation.
 
-Run two predetermined samples per probe on frozen predecessor `aa5d55dd6`,
-two on corrected `863e81757`, then two on native arm64 Docker. The original
+Run two predetermined samples per probe on frozen predecessor `67061004b`,
+two on corrected `7ad7a66bf`, then two on native arm64 Docker. The original
 base64/stdin shell transport is preserved. Carrick phases finish before Docker;
 no compiler/test job overlaps. Docker is pinned to Carrick's cached April
 Ubuntu image with rootfs digest checked. This compares the shared-exec fix,
@@ -28,7 +28,7 @@ is inferred from this comparison.
 
 ## CI source-position reconciliation
 
-Full CI on `863e81757` stopped at host-authority inventory drift: three existing
+Full CI on `7ad7a66bf` stopped at host-authority inventory drift: three existing
 `libc::getpid` sites in `trap.rs` moved down three lines. The compiler refresh is
 explicitly partial to macOS; six non-macOS profiles remain pending. Position
 reconciliation updates those three spans and matching rationale prefixes,

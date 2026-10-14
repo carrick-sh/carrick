@@ -153,7 +153,7 @@ Wrap-up requested; user also requested rebase on main. Pre-rebase final host
 chain exited 0: 2072 kernel parallel passed/1 existing ignored, serial and
 semantics passed; runtime 578 passed/1 ignored; policy 2 passed; fmt passed.
 
-Rebased codex/gmp-phase3 onto local main a58a89c219574b9aaad382db67fcf7206dd300f5.
+Rebased codex/gmp-phase3 onto local main eb8944eb756d8ac1b813290f3a862094b8105866.
 All work remains uncommitted. Recovery stash
 bb93803fdb9ec55a386858a04e2b2ac09ef97224 retained, already applied once; do not
 reapply it. No conflicts; embed lib reexport auto-merged. Tracked patch ID
@@ -172,8 +172,8 @@ stopped the chain with four needless_borrow errors in inotify.rs (1226, 1248,
 made. Full acceptance remains incomplete; detailed receipts are in the handoff.
 
 User requested logical commits and fast-forward to main if ready. Saved the
-implementation and internal tests as 4f36777b9 and public regression suites as
-58313ffeb, with separate debugging documentation and handoff commits. Fresh
+implementation and internal tests as 4778a23e2 and public regression suites as
+ecd9ee39e, with separate debugging documentation and handoff commits. Fresh
 checkpoint host chain exited 0: kernel 2072 parallel plus serial/semantics,
 runtime 578, embed policy 2, format clean. Existing ignored tests unchanged.
 Logs: /private/tmp/gmp-phase3-checkpoint-{kernel,runtime,policy,fmt}.log.
@@ -183,7 +183,7 @@ unchanged, including its three unrelated untracked plans. Resume the committed
 codex/gmp-phase3 branch using the standalone handoff.
 
 Subsequent explicit user direction supersedes the integration deferral above:
-fast-forwarded local main to f3c8685f2 and made the handoff checkout-independent.
+fast-forwarded local main to 78f643902 and made the handoff checkout-independent.
 No push; unrelated checkout changes preserved. Post-merge just test-kernel
 exited 101: 2072 parallel kernel tests passed/1 ignored, but semantics had
 78 pass and futex_contention::futex_pi_lock_unlock_deadlock_detection fail

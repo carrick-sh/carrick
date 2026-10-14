@@ -1,6 +1,6 @@
 # Guest wake publication preparation
 
-Base `26874b0b2`. The host-placement callback's immediate consumer saw a
+Base `dfcff84eb`. The host-placement callback's immediate consumer saw a
 runnable waiter with one futex queue entry still attached (expected zero).
 `guest_wake_publication_has_no_remaining_futex_entry` is red before the fix;
 with cleanup inside the destination queue publication boundary it passes
@@ -18,11 +18,11 @@ Validation: 54 scheduler-core tests, 74 EL1 host tests, 2,459 kernel/semantics
 tests (one existing ignore, 21 binaries) passed. Scheduler-core/EL1 all-target
 Clippy with warnings denied passed. Kernel command exited 0. No signed
 execution claim is made for this changed source: the prior 49-execution
-receipt at 40a707ba0 is historical. Signed promotion and full batch gates
+receipt at 98621f69e is historical. Signed promotion and full batch gates
 remain required after completing the transfer protocol.
 
-Implementation commit: `a9da3196d`; clean provenance refresh: `68a25b09d`.
+Implementation commit: `b8fe45428`; clean provenance refresh: `bfb16a1a2`.
 All 595 authority rows and positions were unchanged. `just lint-domains`
 exited 0 at the refreshed source; its compiler authority result explicitly
 covers the macOS subset, with Linux/FreeBSD/NetBSD profiles still pending.
-Exact contract-change coverage from `26874b0b2` passed.
+Exact contract-change coverage from `dfcff84eb` passed.

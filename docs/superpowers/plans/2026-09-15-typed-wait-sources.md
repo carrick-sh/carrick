@@ -24,7 +24,7 @@
 
 ## Baselines to preserve
 
-`RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib dispatch::` = 942 passed at `69dd945cb`. `just conformance-probes` = 46 passed. `cpython-asyncio` 2554/2554 MATCH (after eb0578e11). `go-net_http` MATCH 1316/1316. `cpython-xmlrpc` MATCH 84/84. `cpython-wsgiref` MATCH 36/36.
+`RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib dispatch::` = 942 passed at `a7db5bfc1`. `just conformance-probes` = 46 passed. `cpython-asyncio` 2554/2554 MATCH (after 7760a910c). `go-net_http` MATCH 1316/1316. `cpython-xmlrpc` MATCH 84/84. `cpython-wsgiref` MATCH 36/36.
 
 ## Task 1: The gap property, red against today
 
@@ -174,7 +174,7 @@ impl<'a> NetView<'a> {
 - [ ] Implement `wait_source_for` by porting the `host_poll_target` match (`net.rs:592-672`): `HostPipe`/`HostFile`/`HostSocket`(non-in-zone)/`Pidfd`/`Inotify`/`Fanotify`/stdio → `Host`; `PipeReader`/`PipeWriter`/`EventFd`/`Epoll` readiness pipes → `Dual { coverage: LatchedLevelTriggered }`; listening `HostSocket` with `inzone_listener` → `Dual { coverage: HostPeersOnly }`; everything else with an open description → `Description`. Delete the `fd < 0` arm.
 - [ ] Route `ppoll` (both arms) and `pselect6` (both arms) through `wait_source_for` + `WaitFds::from_registrations`. Do NOT yet move the revents normalizations.
 - [ ] Delete `WaitPollTargets` (`net.rs:315-350`), `wait_target_for_poll` (`net.rs:691-710`), and `HostPollTarget`.
-- [ ] Verify: `RUSTC_WRAPPER="" RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib dispatch::`; `RUSTC_WRAPPER="" just conformance-probes`; the four `*_carries_logical_pollin_interest` tests from `28445af8c`/`54fde3e88` are rewritten in terms of `WaitSource` and stay green.
+- [ ] Verify: `RUSTC_WRAPPER="" RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib dispatch::`; `RUSTC_WRAPPER="" just conformance-probes`; the four `*_carries_logical_pollin_interest` tests from `58f41c02e`/`ace937325` are rewritten in terms of `WaitSource` and stay green.
 
 ## Task 5: One shared assembly
 

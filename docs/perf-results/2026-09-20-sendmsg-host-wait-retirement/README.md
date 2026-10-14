@@ -41,7 +41,7 @@ There is not yet evidence that shmctl05 shares sendmsg02's cycle.
 Preserved executable:
 `target/investigations/parity-20260920/carrick-03d6545ce6e46988ef8e67bf1615b44b36d2f88740bfbeaf71811ed4809d1ad5`.
 Its existing artifact receipt records source HEAD
-`9784dc289edcddc640ceab7386efe047917f6212` plus the pre-existing dirty fs/vfs
+`2a7395eb7ca631c9d5a77250f6076bfbdf17ff53` plus the pre-existing dirty fs/vfs
 changes, SHA-256 matching the filename, CDHash
 `aef61a1683d22642ed13f702109d78ed11c2ca61`, LC_UUID
 `4FA13D27-5C19-3234-97B8-A744349EA53F`, entitlement and DOF section present.

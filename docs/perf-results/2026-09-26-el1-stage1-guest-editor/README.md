@@ -6,12 +6,12 @@ live stage-1 image concurrently, and a manager adopting live hardware backing
 does not reissue an occupied table page.
 
 The red-first source base was
-`4161a8a58988619c0c1dbb6208ae5726799cda6a`. `guest-editor-red.log` records the
+`4ff46fffe5b6dd35cb39d1ebb309cb51b1df15b2`. `guest-editor-red.log` records the
 missing exact-editor and host-drain API. `live-cursor-red.log` records
 `PageTableManager::new_live` resetting its cursor to 32 KiB even though the
 live image's last occupied spare page required a 48 KiB cursor.
 
-The accepted implementation is `5c131922259478f4255c14f2eba89f373151b04b`
+The accepted implementation is `8daa1fcfab0a4f7c983db244d264f1b0878157b5`
 (`feat(el1): serialize shared stage1 publication`).
 
 The corrected shared entry contains one exact nonzero editor token. Guest EL1

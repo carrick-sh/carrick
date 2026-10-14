@@ -130,7 +130,7 @@ The unentitled negative control passed; both scoped cleanup checks found zero
 remaining guests. The original inotify09 timing and broader promotion gates
 remain unqualified.
 
-The checkpoint used source HEAD `dd43066bef70d92f85a8ba99235ad31124b18452` plus the
+The checkpoint used source HEAD `d6cf27247572e5917958eb8b0c798c078407b3d8` plus the
 working-tree source digest
 `84d78973185a6f4ed3a68e3de01124db6e1c7d98309d7de72edd46cc9725aade`, including the
 pre-existing runtime changes. The signed executable SHA-256 was
@@ -158,7 +158,7 @@ contract; the full inotify workload's runtime ratio and broader promotion gates
 remain unqualified.
 
 The corrected checkpoint used source HEAD
-`dad786c8be97b98430ef13b6f5d876300132ceaf` plus working-tree source identity
+`73fe8a125d29aa684d19caa8ed9dd8577314d269` plus working-tree source identity
 `4dbe8cf88d8a78fa7c475ccea54bbca4dbac7e53b267d2d90506a4fb0887b0ba`.
 The signed test executable had SHA-256
 `e3d52e4293803cc5aaeea0198bd8c5e5af1801ba9b4c8f700dc6276335d86090`, CDHash

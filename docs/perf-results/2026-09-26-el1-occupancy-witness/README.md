@@ -1,7 +1,7 @@
 # Occupancy witness repair
 
-Source `77b044194e2c5e458fa1b3c383c54446eacf0982` integrates worker commits
-`ace5de9f0` and `1081e2d5e` as `8bafb145b` and `77b044194`.
+Source `478f94e03650d2ee03f00b16b8c29e5b479d1eab` integrates worker commits
+`ace5de9f0` and `1081e2d5e` as `4e88a7642` and `478f94e03`.
 The witness now rejects failed memory edits, zero completed edit cycles, worker
 join failures and unsuccessful child reaping. Fork children check every allocated
 writer page using storage allocated before fork; the original dynamic writer
@@ -46,7 +46,7 @@ Carrick runs used their respective default CPU populations. Full el1 suite,
 probe/smoke/full promotion, live-table authority, first-touch execution,
 elastic return and paired ecosystem measurements remain open.
 
-At `771e804d5`, integrated `RUSTC_WRAPPER= just lint-domains` exited zero. The
+At `35e782c13`, integrated `RUSTC_WRAPPER= just lint-domains` exited zero. The
 host-authority census explicitly remains partial for Linux, FreeBSD and NetBSD
 profiles. The complete log is `integrated-lint.log`. Reconciliation preserved
 all 588 authority rows without position or content changes.

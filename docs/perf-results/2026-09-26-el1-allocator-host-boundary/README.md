@@ -2,12 +2,12 @@
 
 This receipt closes the allocator's synchronous-host-wait and concurrent
 single-flight progress requirements on source
-`ef57645821299226da00ad4bf4b676c2ba7c8bb4`.
+`f63d2aeeab5207707ab35ceb432435989e5e88ae`.
 
 The exact signed command was:
 
 ```text
-CARRICK_RUN_ID=el1-allocator-final-receipt-ef5764582-20260926 RUSTC_WRAPPER= \
+CARRICK_RUN_ID=el1-allocator-final-receipt-f63d2aeea-20260926 RUSTC_WRAPPER= \
   just test-embed el1_metadata_allocator_ --nocapture
 ```
 
@@ -23,8 +23,8 @@ All three invoked witnesses passed together:
   `HVC #6` from masked EL1.
 
 The entitlement negative control passed. Cleanup reported zero processes for
-both `el1-allocator-final-receipt-ef5764582-20260926` and its `-cli` scope. The
-raw run is [`signed-final-ef5764582.log`](signed-final-ef5764582.log), and the
+both `el1-allocator-final-receipt-f63d2aeea-20260926` and its `-cli` scope. The
+raw run is [`signed-final-f63d2aeea.log`](signed-final-f63d2aeea.log), and the
 harness receipt is
 [`signed-final-artifacts.jsonl`](signed-final-artifacts.jsonl).
 
@@ -49,12 +49,12 @@ harness receipt is
   `e517ae08e595fbfa608c99a33a01dfef082691fa5def1bda87ac5aa89a2dcb3d`
 
 Frozen copies of the executable, CLI, fixture, and receipt remain under
-`target/el1-completion/allocator-final-ef5764582/frozen/`; rebuilding or re-signing
+`target/el1-completion/allocator-final-f63d2aeea/frozen/`; rebuilding or re-signing
 the working artifacts does not alter this receipt.
 
 ## Decisive progress red
 
-Source `3794e3a2abe530039c1a13bdeb6be15932ff0463` removed transient terminal
+Source `d3b6712e6366a7518a64eac30664f07c391e4d82` removed transient terminal
 allocation errors but still exhausted the descriptor-derived 258-entry bound
 in 12 concurrent phases. Every failure was `0xCA880501`; every per-round and
 final drain completed. That isolated an EL1-only starvation mode: a participant
@@ -69,7 +69,7 @@ single-flight request after the allocator stack and lock have unwound.
 
 ## Checked arithmetic red
 
-Source `548aa42382ac0aca8e2c737f984d772d07503b43` added two behavioral
+Source `c2cf60ea75e819d7b2fd751f09c701f743a146a9` added two behavioral
 controls before changing the allocator. An oversized guest layout panicked in
 alignment arithmetic, and an oversized host request panicked while deriving
 its extent size. The failing transcripts are

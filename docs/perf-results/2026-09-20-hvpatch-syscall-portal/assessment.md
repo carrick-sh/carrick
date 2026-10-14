@@ -4,7 +4,7 @@
 
 The executor-local helper portal is rejected as the next `inotify09`
 optimization. It remains useful design evidence, but its production integration
-was reverted by `a5bb139b4` after the signed A/B showed both worse steady-state
+was reverted by `b1781fd3e` after the signed A/B showed both worse steady-state
 cost and an unsafe cancellation race. Portal policy was never enabled by
 default.
 
@@ -13,7 +13,7 @@ than 2.0 times native-arm64 Docker on the same workload.
 
 ## Artifact
 
-- source revision: `e71105fef`
+- source revision: `6f992bb4b`
 - binary SHA-256: `f96cd3f9db8f214cea65a7c05936b1b38a8c073bec1e894720bd37e34306f9c1`
 - CDHash: `d2b379be9c8aa5c9886b3c3822793a14da647eec`
 - LC_UUID: `B91802AF-CC14-3268-9BCC-820853EB948F`
@@ -80,8 +80,8 @@ rejection before production admission.
 
 ## Post-revert verification
 
-The production source at `a5bb139b4` was rebuilt with `RUSTC_WRAPPER= just
-build`; only the assessment documentation changed in `e2c6353fd` during that
+The production source at `b1781fd3e` was rebuilt with `RUSTC_WRAPPER= just
+build`; only the assessment documentation changed in `25062cb38` during that
 build. All 24 VM-free `carrick-kernel-example` contract tests passed.
 
 - binary SHA-256: `7177143f6341f9784631d269ecf05f3eaa4ea44e48650f1f984350797c188e27`
@@ -152,7 +152,7 @@ aliases. The signed census passed with 369,966 host seeks, 370,033 writes,
 removed, while path metadata work remains. This is a structural improvement,
 not an end-to-end timing or promotion claim. No guest remained after capture.
 
-Candidate artifact, based on `5bde8b924` plus the descriptor-identity diff:
+Candidate artifact, based on `205408c33` plus the descriptor-identity diff:
 
 - SHA-256: `4a704873cf7643acabbaf4c24f1750cb7c4360a47f66fde1a7499fffc818bdd9`
 - CDHash: `778cf9d92a3944cca39ffb4440a229bb868f4145`
@@ -195,7 +195,7 @@ writes, 426,093 `fstat64`, and just 398 `fstatat64` calls including startup.
 Thus the two per-loop path metadata queries disappeared. Instrumented
 throughput is not a timing acceptance claim. Raw: `inotify-kind-cache.trace`.
 
-Artifact based on `489cd1fb9` plus the namespace-only lookup diff:
+Artifact based on `b7d9fb0d4` plus the namespace-only lookup diff:
 
 - SHA-256: `166143994b2502b38687b63deda3106da1e1d720e2c8d21d4faf576ae35f6086`
 - CDHash: `c6c7b7a034ae925f054dba8d8d08f93780b04342`
@@ -335,7 +335,7 @@ VMM campaign invocation remains applicable. No runtime default changes here.
 
 ### Balanced HVPatch boundary comparison
 
-At source `5acff4f74`, explicit `run-elf --raw --exec-backend hvpatch` completed
+At source `4df0d804e`, explicit `run-elf --raw --exec-backend hvpatch` completed
 10 warmup ABBA blocks followed by 30 measurement blocks, 60 samples per mode,
 with four exposed CPUs. Each leg ran serially on the same signed binary and
 static-musl probe identified above; both hashes were verified unchanged after
@@ -360,7 +360,7 @@ all end-to-end rows before a default change can be considered.
 ### Full current HVPatch transport campaign: promotion rejected
 
 `hvpatch-mailbox-full.jsonl` records the eight-workload campaign at
-`2f56d817b4e52823ed1813f4947d583bdfda8e7c`: ten warmup and thirty measured
+`6e4cf727ef2cb91da510e04026090048f768fcdf`: ten warmup and thirty measured
 ABBA blocks per workload, sixty samples per mode, zero cooldown as in the
 historical campaign. All eight static-PIE probes were freshly built with the
 repository's `rust:alpine` / `cc -static-pie` recipe. A local rust-lld build
@@ -395,7 +395,7 @@ open.
 
 ### Fresh inotify component scaling after transport rejection
 
-At `763a75bb7`, rebuilt the existing clean-room `perf_inotify09_scale` probe
+At `9ab9818d5`, rebuilt the existing clean-room `perf_inotify09_scale` probe
 and ran it first under the unchanged signed Carrick artifact, then under native
 ARM64 Docker, both with the pinned LTP image above and `/bin/sh -c` invocation.
 Carrick used the harness's unlimited trap count and host filesystem. Both runs
@@ -442,7 +442,7 @@ extent updates, aliasing, and unlink/replacement semantics.
 
 ### Owned identity reuse for sparse writes
 
-Production commit `ccc42d7ad` changes sparse-write bookkeeping to accept the
+Production commit `a2c576fc7` changes sparse-write bookkeeping to accept the
 owned `HostFdRef` and reuse its cached immutable inode identity. Sequential and
 positional writes retain the owner through extent publication. Mutable extents
 are still updated on every successful write. Ten sparse tests, including a new
@@ -479,7 +479,7 @@ The unsigned entitlement negative control passed and both scoped cleanup
 counts were zero. Receipt: `sparse-cache-write-seek-signed.jsonl`. The first
 attempt failed before guest execution because `CARRICK_OBSERVATION_SOURCE`
 was omitted; the qualified invocation supplied SHA-256 of `git archive HEAD`
-at `ff25eef96`,
+at `1e4627707`,
 `7c88ac4f90d74db502844f61cfad936d358e092c9300deba1883ac54ec20515d`,
 and the pinned LTP image. This is a signed instrumented test artifact, distinct
 from the release CLI timing artifact; it is not full probe-gate acceptance.
@@ -594,8 +594,8 @@ closure-mode result. AMD64 report-only diffs/skips are outside the canonical lan
 
 CLI SHA-256, CDHash and LC_UUID match the previous signed artifact; hypervisor
 entitlement and DOF remain present. Both scoped cleanup counts are zero.
-The generic signed receipt names aea6ecb76 and the dedicated receipt names
-25415c7b7; the intervening commit changed only these performance documents and
+The generic signed receipt names 3fc04bd00 and the dedicated receipt names
+8365a267f; the intervening commit changed only these performance documents and
 trace receipts, not compilation inputs. Both original signed manifests are
 preserved here as `live-oracle-{generic,dedicated}-signed-artifacts.jsonl`.
 
@@ -636,7 +636,7 @@ New signed CLI SHA-256:
 `a05fb6c4c3dfb6329ff4195f29d86109a8a82e99d1cfda848f450b2bb768d424`;
 CDHash `2a51964d55bf3a0e86c6a9b8c56d9eba839bf757`;
 LC_UUID `4E80856F-613E-3B8E-97BF-DC6FFAD483AD`.
-The build source is e11b87dbf plus this commit's production diff. The previous
+The build source is 14583ff81 plus this commit's production diff. The previous
 public probe-gate receipt belongs to the pre-fix artifact and cannot promote
 this one. Full signed promotion and <=2x Docker remain open.
 

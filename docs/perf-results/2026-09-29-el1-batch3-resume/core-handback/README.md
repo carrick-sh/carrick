@@ -1,7 +1,7 @@
 # Core handback identity transport
 
-Base: `b9d7fc35e` on `integ/batch3`; separate admission fixture repair
-`d5ca4673a` is documented in `admission-publication.md`.
+Base: `cb5dae055` on `integ/batch3`; separate admission fixture repair
+`a19c9854f` is documented in `admission-publication.md`.
 
 The deferred-batch correction retained the identity captured by its caller.
 The core still returned a bare RecordId after publishing Claim::Host, so a
@@ -42,7 +42,7 @@ Python/otmp attribution, deterministic signed interleavings, WorkObservation
 bindings and complete batch acceptance remain open. These reductions do not
 retroactively attribute a historical crash or accept checkpoint 0.
 
-Signed regression gate at clean source `40a707ba0`:
+Signed regression gate at clean source `98621f69e`:
 `CARRICK_RUN_ID=el1-b3-core-handback-20260929 RUSTC_WRAPPER= scripts/test-signed.sh carrick-embed el1_ --nocapture`
 exited 0. The machine-counted receipt records 49 passing positive executions
 across nine executables: scheduler/memory, interrupt kicks, GIC, parked-thread
@@ -52,7 +52,7 @@ processes. `signed-artifacts.jsonl` preserves SHA-256, CDHash, LC_UUID,
 entitlement and DOF presence for each invoked artifact. This broad regression
 gate does not supply the missing deterministic signed interleaving bindings.
 
-Clean compiler-backed reconciliation at `40a707ba0` retained all 595 authority
+Clean compiler-backed reconciliation at `98621f69e` retained all 595 authority
 identities with one source-position adjustment. `just lint-domains` passed;
 the compiler census covers the macOS subset, with other host profiles pending.
 See `reconcile.log`, `lint.log` and `signed.log`.

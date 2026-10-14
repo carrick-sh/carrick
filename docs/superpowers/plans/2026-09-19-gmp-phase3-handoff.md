@@ -7,8 +7,8 @@ Updated 2026-09-19. **Phase 3 is incomplete. Resume implementation, not promotio
 - Resume in any Carrick checkout containing the checkpoint commits below.
   Resolve the repository root and inspect its current status before editing;
   no particular branch name or worktree path is required.
-- Original base: `93f648aa956feeeb256d4bbd3aaa0c9a60101a8a`.
-- Rebased onto local `main`: `a58a89c219574b9aaad382db67fcf7206dd300f5`.
+- Original base: `4c94556820479295c290237c484bb1cccbecccc4`.
+- Rebased onto local `main`: `eb8944eb756d8ac1b813290f3a862094b8105866`.
 - Implementation is preserved as logical checkpoint commits:
   runtime/kernel foundation, public regression suites,
   debugging documentation, then this plan/evidence handoff. These are incomplete
@@ -187,9 +187,9 @@ All implementation agents and the validation chain have stopped.
 
 On the user's subsequent request, work was split into implementation (including
 internal tests), public regression suites, debugging documentation, and this
-handoff/evidence commit. The commits are `4f36777b9` (implementation),
-`58313ffeb` (public tests), `66a252e24` (debugging documentation), and
-`9e2bdb611` (handoff/evidence). These identifiers are independent of branch names.
+handoff/evidence commit. The commits are `4778a23e2` (implementation),
+`ecd9ee39e` (public tests), `6e07d5b9c` (debugging documentation), and
+`07fe3ce96` (handoff/evidence). These identifiers are independent of branch names.
 
 Fresh pre-commit validation exited 0: `just test-kernel` (2072 parallel passed,
 1 ignored, plus serial/semantics suites), serial runtime lib (578 passed,
@@ -206,7 +206,7 @@ or recovery-stash modification is part of this handoff.
 
 ## Local integration receipt and next validation blocker
 
-Local main was fast-forwarded to `f3c8685f2` on 2026-09-19, preserving unrelated
+Local main was fast-forwarded to `78f643902` on 2026-09-19, preserving unrelated
 checkout changes. No push was performed. Resume from any checkout containing
 that commit and this receipt; the original implementation branch is unnecessary.
 

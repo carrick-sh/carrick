@@ -73,8 +73,8 @@ the public caller boundary; no N1-owned implementation is copied or edited.
   generations or scale.
 
 Historical setid source is exactly
-`c1ea66b636998418fd1584f94cb184715aa065b4` (`800247419^`). In a detached scratch
-worktree, `git checkout 800247419^ --
+`924f861e6c92e54924c9986efca0a7b6b369f79c` (`45099ed63^`). In a detached scratch
+worktree, `git checkout 45099ed63^ --
 crates/carrick-kernel/src/kernel/operations/identity.rs` supplies the entire
 unmodified old file. Seed 0, scale 1 fails with `LinuxErrno(11)` versus
 `Returned { value: 0 }`. Restoring the current implementation passes. Retained
@@ -84,7 +84,7 @@ are paired historical receipts, not a claim of cross-source trace equality.
 
 ## Runtime exec admission: M3 handoff
 
-The director confirmed this dependency on 2026-10-04. Fix `c1ea66b63` is in
+The director confirmed this dependency on 2026-10-04. Fix `924f861e6` is in
 `carrick-runtime/src/vcpu_loop/terminal.rs::CloneAdmissionGate` and
 `thread_adoption.rs::adopt_thread_runtime`, not kernel ledger retirement.
 Existing private witnesses are
@@ -98,7 +98,7 @@ close before a delayed first entry, and the reverse ordering with admission
 held during the terminal census. The independent process must stay admitted.
 Emit typed events with exact task/thread/execution generation after gate unlock,
 never suspend with `CloneAdmissionState` locked. Check out the exact pre-fix
-runtime files from `c1ea66b63^` in a scratch worktree for the historical red.
+runtime files from `924f861e6^` in a scratch worktree for the historical red.
 Do not expose or implement a second gate.
 
 The generic failed-lock adapter also remains an N1 dependency: expose one
@@ -124,7 +124,7 @@ changes. Historical version-2 fd-pin receipts retain their original provenance
 and remain deliberately rejected by the version-3 replayer.
 
 The batch 4 setid red was re-run in `/tmp/vmfree-m2-batch4-red` at the
-merged receipt commit, checking out only `800247419^`'s entire `identity.rs`.
+merged receipt commit, checking out only `45099ed63^`'s entire `identity.rs`.
 The scratch file's Git blob matches the historical file exactly. Seed 0 at
 scale 1 still returns `LinuxErrno(11)` and fails the expected return 0
 assertion. The historical receipt was re-recorded with generator version 3

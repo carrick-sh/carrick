@@ -8,11 +8,11 @@ review boundary for this campaign. Do not push. Preserve unrelated changes.
 
 Logical commits on local main (not pushed):
 
-- `333d5ba6d`: coherent inotify watch indexes and queued readiness.
-- `cc02e4af6`: positive scalar-write notifications, contracts, and signed probes.
-- `09bec08d6`: strict closure preserves first observations and rejects serial recovery.
-- `bcf9c1f50`: preserve generic and dedicated signed receipts separately.
-- `e1de4b9e4`: fresh native ARM64 Go build oracle evidence.
+- `8cd8b3ff0`: coherent inotify watch indexes and queued readiness.
+- `414cfe910`: positive scalar-write notifications, contracts, and signed probes.
+- `3d44c489d`: strict closure preserves first observations and rejects serial recovery.
+- `96a0e1dfa`: preserve generic and dedicated signed receipts separately.
+- `a0df876d4`: fresh native ARM64 Go build oracle evidence.
 
 The exact signed candidate remains the previously recorded dirty-source artifact
 at SHA `bcbb4668628a0c15139fcb25dd44026a684923b5ca16f1b8012f5fe2615ad511`.
@@ -20,7 +20,7 @@ These commits do not retroactively turn its original source receipt into a
 clean-source release claim. Pre-existing sparse-state, fd-path, and VFS fast-path
 edits remain uncommitted, as do the unrelated older plans.
 
-Two clean baseline comparisons at `5b666b580` establish that the loaded failures
+Two clean baseline comparisons at `903436165` establish that the loaded failures
 predate this campaign's fixes. Baseline A: Go build completed in 3,124 ms, but
 cpython-subprocess hit 44,167 ms on a 44,000 ms budget. Baseline B: Go build hit
 7,255 ms on the same 7,000 ms budget as the candidate. Both ledgers contain
@@ -47,7 +47,7 @@ coverage outside this lane must remain explicit, not inferred from host tests.
 
 ## Starting checkpoint
 
-Source HEAD: `5b666b580`. Existing uncommitted runtime changes were preserved.
+Source HEAD: `903436165`. Existing uncommitted runtime changes were preserved.
 The write/seek bindings are real and the unchanged zero-query budget is red:
 scales 1/8/32/128 execute that many preparatory SEEK_CUR queries. Signed and
 native ARM64 Docker semantic checks pass; full workload parity remains open.
@@ -251,13 +251,13 @@ Raw trace, command, log and symbolicated top stacks are `go-build-profile.*` in
 the campaign receipt directory. The rejected capture-bound override failed
 before guest launch and is preserved as `go-build-profile-preflight.log`.
 
-Next attribution step: build an isolated, unmodified main at `5b666b580` and
+Next attribution step: build an isolated, unmodified main at `903436165` and
 measure the same smoke workload at unchanged concurrency before attributing the
 repeatable loaded Go failure to pending changes. The primary runtime artifact
 and edits remain preserved; no full-suite promotion has occurred.
 
 The isolated baseline worktree is clean at
-`/Users/tjfontaine/.codex/worktrees/parity-baseline/carrick`, HEAD `5b666b580`.
+`/Users/tjfontaine/.codex/worktrees/parity-baseline/carrick`, HEAD `903436165`.
 Its signed build uses separate cargo output
 `/private/tmp/carrick-parity-baseline-target`; session 26399, log
 `/tmp/carrick-parity-baseline-build.log`. This leaves the candidate CLI at SHA
@@ -323,7 +323,7 @@ the full promotion ladder remain pending.
 
 ## Post-handoff gate and setid crash attribution (2026-09-20)
 
-The release built from `995c738a2` plus the preserved FS/VFS worktree
+The release built from `dc81f5298` plus the preserved FS/VFS worktree
 changes has SHA-256
 `cb9da4a56ec5fd83eabbb21250d27deb2e7dcbbdab6500193673157a9ef5fe04`,
 CDHash `f04ba8f97c830a8a3afded2e6cc6b34e199f2ffb`, and LC_UUID

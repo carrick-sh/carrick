@@ -23,6 +23,6 @@ The same allocator witness now observes 0/0/0/0 large allocations. All 83 MMU,
 the contract registry pass. Commands use `RUSTC_WRAPPER=`; exact outputs are
 included here. The live descriptor visibility tests remain green.
 
-Full CI running on integration checkpoint `899873310` does not cover this
+Full CI running on integration checkpoint `972dbee3e` does not cover this
 follow-up until it is integrated and checked. Signed structural and workload
 acceptance remain open; the nominal pool-miss counter alone is insufficient.

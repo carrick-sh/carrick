@@ -1,6 +1,6 @@
 # Post-publication ownership audit checkpoint
 
-Read-only source audit at `8916e1fe2`, while the signed regression built/ran.
+Read-only source audit at `1d085f4c7`, while the signed regression built/ran.
 These observations narrow the next investigation; they are not full closure.
 
 ## Ordinary zone wait restore

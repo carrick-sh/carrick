@@ -185,7 +185,7 @@ time as a timing result. Timing comes only from the `carrick` phase.
 
 This was run on a shared host with other workers' guests alive (`--validation`
 implies `--allow-busy`), one sample per arm. The binary was built from
-`702c3931a` on top of `main` (`910503a5a`); the Rust tree is unchanged through
+`702c3931a` on top of `main` (`a8be53bf5`); the Rust tree is unchanged through
 `b0f4ead64`, the recorded harness HEAD. SHA-256 `342a567b...`, CDHash
 `8f26e401...`. On `main` the lane variable has no effect, so both arms are the
 same configuration, which is what the near-identical rows show.

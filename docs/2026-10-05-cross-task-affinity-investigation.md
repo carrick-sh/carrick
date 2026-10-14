@@ -99,7 +99,7 @@ section and under the same investigation directory.
 
 ## Fixed five-run signed population
 
-All five scheduled runs use clean host sources at `af1240c4c` and its exact
+All five scheduled runs use clean host sources at `ecc1187c2` and its exact
 fixture bundle: 1,132 executables, manifest
 `71cb5dc303f9a56029631c4f5ab4411efad03edfc80f5e1b9a16ed10ea11f159`, tar SHA-256
 `7961ee23db125673f442662e8678d725f60cf4c129a14fd2f076f3e4f805e423`.
@@ -127,8 +127,8 @@ retried or added to the six-case N1 inventory.
 The additional failure is
 `el1_tlb_cross_vcpu_mm_edits_leave_no_stale_translation_on_any_thread`:
 `faults=[598, 728] stale=2 errors=0 timeouts=3 ok=false`, with 600 faults
-expected per worker. Five isolated samples on each of `af1240c4c` and
-`805eada21` pass; that comparison is inconclusive, so sampling stopped.
+expected per worker. Five isolated samples on each of `ecc1187c2` and
+`55be9569f` pass; that comparison is inconclusive, so sampling stopped.
 
 The existing host migration protocol does not bypass invalidation:
 

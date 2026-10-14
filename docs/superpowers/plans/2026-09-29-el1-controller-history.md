@@ -10,7 +10,7 @@ The previous controller follows verbatim.
 # EL1 migration: end-to-end execution controller
 
 Status: active. Owner authorized this goal on 2026-09-26. Starting revision:
-`d7393f6163adccbe001868b9056f2832813e10d2`.
+`1b0b36e04cd92d513d97d3e5db1646f3c383fd50`.
 
 Authority: [accepted EL1 design](../specs/2026-09-24-el1-kernel.md),
 `AGENTS.md`, and [conformance contracts](../../conformance-contracts.md).
@@ -135,7 +135,7 @@ Baseline: `RUSTC_WRAPPER= cargo test -p carrick-sched-core -p carrick-el1
 baseline evidence; it does not qualify a signed guest artifact.
 
 2026-09-26: previous goal turn was progress (controller commit and baseline
-evidence). Added first-touch witness in `2c0b989c0`. Native arm64 Docker and
+evidence). Added first-touch witness in `6f7efffbd`. Native arm64 Docker and
 signed Carrick both pass the three-scale two-process semantic checks; Carrick
 is structurally red at about one host exit per page. Negative entitlement
 control passes and cleanup is zero. Exact artifact and raw evidence:
@@ -171,7 +171,7 @@ pre-existing external-fixture requirement. This is VM-free prerequisite proof
 only. Other shadow consumers, shared host/EL1 mutation exclusion, guest fault
 service, full CI, signed promotion and paired workload timing remain open.
 
-Verification of `28a096160`: the serial runtime library suite with
+Verification of `65046bd7c`: the serial runtime library suite with
 `conformance-metrics` passed 622 tests; eight existing manual/research diagnostics
 were ignored. Targeted runtime/HVF all-target Clippy passed. `just lint-domains`
 returned zero on the committed source; its host-authority census explicitly
@@ -181,10 +181,10 @@ The source-to-contract registry now names the live reader and its buffer tests.
 
 ### Extraction and boundary review (2026-09-26)
 
-The previous turn was progress: live-read runtime correction `28a096160` and
-verification receipts `e41965f3c`. The next turn revalidated the clean integration
+The previous turn was progress: live-read runtime correction `65046bd7c` and
+verification receipts `a414dd203`. The next turn revalidated the clean integration
 tree and live `mmu-core` worker handle, then started the independent
-`personality-boundary` worker in its own managed worktree at `e41965f3c`.
+`personality-boundary` worker in its own managed worktree at `a414dd203`.
 That task injects the scheduler timeout result and adds the first mechanical
 substrate dependency/literal gate. It does not claim the signal/timer or EL1
 personality split is finished; the MMU crate must be added to the gate on
@@ -222,12 +222,12 @@ fork allocation and work budgets are unchanged. The contract wording now names
 private stage-1 state rather than requiring an authoritative software shadow;
 its runtime binding adds the live-snapshot control. This new red is intentional
 and remains open alongside signed first-touch. The earlier 622-test green
-receipt still belongs only to `28a096160`.
+receipt still belongs only to `65046bd7c`.
 
 ### Integrated MMU extraction (2026-09-26)
 
-The extraction and bounded review corrections are now integrated as `41370ac96`
-and `600e5c859`. The director stopped an off-scope worker revision, retained
+The extraction and bounded review corrections are now integrated as `8775c648c`
+and `313754ecf`. The director stopped an off-scope worker revision, retained
 its rejected patch, and preserved original invariant comments, test-only APIs,
 and checked-overflow behavior. The normal no_std closure is hashbrown/foldhash.
 All 70 MMU and 171 memory tests passed on the integrated tree, alongside the
@@ -241,13 +241,13 @@ first-touch witness remain red. Live backing authority is the next bounded
 implementation; full CI, signed promotion, paired workloads and the remaining
 end-to-end stages are still open.
 
-At `d500a98ae`, integrated `just lint-domains` exited zero after inventory
+At `9457c091d`, integrated `just lint-domains` exited zero after inventory
 reconciliation. Its host-authority census explicitly remains partial: Linux,
 FreeBSD and NetBSD CLI/runtime profiles are pending. The EL1 and EL1 ABI library
 tests also passed (46 + 19). The corresponding MMU integration logs are preserved
 under `docs/perf-results/2026-09-26-el1-first-touch/mmu-integrated-*.log`.
 
-The live-table worker is running from `89c9fc55a` in the reused, isolated MMU
+The live-table worker is running from `4e81b1fc2` in the reused, isolated MMU
 worktree, preserving the failing snapshot witness. Personality review round 2
 requires resolved Cargo graph traversal: a path-only manifest walk cannot prove
 registry or Git transitive closure. Both are implementation work in progress;
@@ -255,8 +255,8 @@ neither grants EL1 memory acceptance.
 
 ### Full host gate on the extraction
 
-`RUSTC_WRAPPER= just ci` started at `2e5cce585`; only boundary-review evidence
-documents changed during execution (`6214798f2`), not product/test source. It
+`RUSTC_WRAPPER= just ci` started at `784a37917`; only boundary-review evidence
+documents changed during execution (`e94f48df6`), not product/test source. It
 exited 101 in `just test` at the intentional live-snapshot witness: 618 runtime
 tests passed, one failed, and eight existing diagnostics were ignored. The
 failure still reports a physical translation after revoking the live leaf.
@@ -271,12 +271,12 @@ shared storage authority.
 ### Anonymous first touch and retirement acceptance (2026-09-27)
 
 Checkpoint 2 has two accepted memory substrates. Bulk anonymous first touch
-landed in `a44e510db` with its bound acceptance in `2b2c5cb05`: the signed
+landed in `14c6dd499` with its bound acceptance in `130cf8960`: the signed
 256/1024/4096-page witness completed at 99/107/113 exits, with incremental
 slopes 0.0052 and 0.0010 exits per added page, below the 0.125 contract limit.
 
 Anonymous mapping replacement, retirement and physical frame reuse then landed
-in `8b1af0a19`, with exact committed evidence in `3aa775e81`. The red path grew
+in `e114c9c56`, with exact committed evidence in `830456bd2`. The red path grew
 at 1.5000 exits per added page per round. The accepted signed path grows at
 0.0033 and 0.0018, a 455x to 833x reduction; total exits at 4,096 pages fell
 from 24,631 to 101. Every scale returns exactly all granted bytes and reuses a
@@ -313,7 +313,7 @@ instrumenting that path.
 
 ### Accepted anonymous permission boundary (2026-09-27)
 
-The permission vertical landed in `f1bff2ec4`. Exact complete-range resident
+The permission vertical landed in `e6f4c7eb5`. Exact complete-range resident
 private-anonymous `mprotect` now runs under the guest's exact-MM editor across
 tagged L1/L2 blocks and L3 leaves. It validates the whole range and permission
 ceiling before the first store, preserves output identity, invalidates the
@@ -353,7 +353,7 @@ a new failing contract.
 
 ### Accepted resident anonymous munmap boundary (2026-09-27)
 
-The resident private-anonymous `munmap` vertical landed in `73dfedec1`. Guest
+The resident private-anonymous `munmap` vertical landed in `d4bac9ce7`. Guest
 EL1 validates every tagged terminal before mutation, refuses partial L1/L2
 blocks and untagged mapping shapes, retires complete L1/L2 blocks and L3 leaves
 under the exact-MM editor, and invalidates the ASID before crossing one host
@@ -382,8 +382,8 @@ fails.
 
 ### Scheduler personality split and mechanical gate
 
-The reviewed scheduler split and checker are integrated as `26f104341` and
-`1bc6c8900`. The substrate accepts the timeout result from its Linux caller;
+The reviewed scheduler split and checker are integrated as `a4af26576` and
+`1ea60510e`. The substrate accepts the timeout result from its Linux caller;
 both EL1 callsites still supply the existing -110 result. Three worker review
 rounds were required. Director review then replaced three scratch-dependent
 skipping tests with hermetic fixtures and proved two additional failures red
@@ -405,7 +405,7 @@ timer, VFS and other substrate/personality separation, live memory authority,
 signed gates, paired workloads and all later stages remain open. The initial
 snapshot and signed first-touch witnesses remain unmodified and unresolved.
 
-At `0c4ec58f4`, the integrated `just lint-domains` exited zero with both
+At `f7fdfb611`, the integrated `just lint-domains` exited zero with both
 substrate cores checked. The cross-platform authority profiles remain pending
 as documented. Its full receipt is
 `docs/perf-results/2026-09-26-el1-boundary-review/personality-integrated-lint.log`.
@@ -420,7 +420,7 @@ a sound backing lifetime, live-bound restore controls and root/extension
 retirement tests without weakening current-read budgets. A single green
 snapshot test is not acceptance of live stage-1 authority.
 
-`RUSTC_WRAPPER= just test-integration` on `b95b3bfb0` exited zero: 465 tests
+`RUSTC_WRAPPER= just test-integration` on `901a9412a` exited zero: 465 tests
 passed across 15 result groups, with no failures or ignored tests. The three
 guest-running shard entries were filtered by the existing host-only recipe.
 This covers the runtime/kernel integration, syscall-process, prepare compile-fail
@@ -446,7 +446,7 @@ remain unchanged. No signed or performance acceptance is claimed.
 
 ### Occupancy witness repair and signed evidence
 
-Integrated `8bafb145b` / `77b044194` repair false-pass paths in the existing
+Integrated `4e88a7642` / `478f94e03` repair false-pass paths in the existing
 occupancy fixture without reducing writer concurrency. Director independently
 verified 16 parser tests, cross-build, embed check, Clippy and formatting. Native
 arm64 Docker passed the exact fixture, then signed Carrick passed the default
@@ -456,7 +456,7 @@ Exact evidence: `docs/perf-results/2026-09-26-el1-occupancy-witness/README.md`.
 This is witness acceptance only; the live-snapshot and first-touch failures,
 full promotion and end-to-end stages remain open. No timing ratio is claimed.
 
-2026-09-26, continued review: `5d612ffb5` preserves the independent round-2
+2026-09-26, continued review: `bf38a5474` preserves the independent round-2
 live-table draft snapshot failure (Cargo exit 101, panic rather than the older
 silent live fallback). Round 2 ended without a committed candidate. Final
 review round 3 is active on the same worker, requiring fallible snapshots,
@@ -466,7 +466,7 @@ stop the delegated review loop and resolve the remaining runtime work directly;
 do not open a replacement worker to evade the review cap.
 
 Started the explicitly parallel checkpoint 2a task `host-namespace` in the idle
-`el1-personality-boundary` worktree, clean at `5d612ffb5`. Its bounded scope is
+`el1-personality-boundary` worktree, clean at `bf38a5474`. Its bounded scope is
 rename/unlink host opens and metadata work under the existing admitted namespace
 transaction. It must establish red-first structural counts with existing counter
 coverage, then remove demonstrated redundant work while preserving containment,
@@ -480,7 +480,7 @@ these two active worker tasks.
 
 ### Namespace integration and director rollback correction
 
-Integrated the reviewed namespace candidate through `0d8bf00cd`. Its complete
+Integrated the reviewed namespace candidate through `3d5cb00c0`. Its complete
 VFS split passes (253 parallel, 38 serial), as do Clippy, registry, and the
 post-integration work-budget witness. The original unlink cost is preserved;
 rename eliminates repeated backend directory opens. Exact receipts are under
@@ -495,12 +495,12 @@ exclusion and snapshot recovery. No fourth worker review is authorized;
 remaining corrections belong to the director. The original goal scope,
 first-touch structural red, signed gates, and workload objective remain open.
 
-Namespace integration follow-up: domain lint initially rejected the missing test-only counter ledger entry. Reviewed and registered it in `f664e7e02`; the full `just lint-domains` rerun exits zero. The memory worker is now terminal at `55bdfc220`; its product code equals candidate `22323a343` and only four inventories differ. Its final output contains waiting statements, so acceptance continues to rely on director evidence, not that report.
+Namespace integration follow-up: domain lint initially rejected the missing test-only counter ledger entry. Reviewed and registered it in `c037719b2`; the full `just lint-domains` rerun exits zero. The memory worker is now terminal at `55bdfc220`; its product code equals candidate `22323a343` and only four inventories differ. Its final output contains waiting statements, so acceptance continues to rely on director evidence, not that report.
 
 ### Live-table source integration after director corrections
 
 Integrated the reviewed worker product and director corrections through
-`d51e1915a`. Corrections retain rollback journals, preserve caller-owned
+`0f67bd38b`. Corrections retain rollback journals, preserve caller-owned
 snapshot recovery, prevent partial restore on unresolved destinations, hold
 root retirement exclusion in publication lock order, and record live extension
 prefixes so pooled reuse zeroes written bytes. The final correction's serial
@@ -519,31 +519,31 @@ checkpoints and the per-workload native-Docker objective in scope.
 
 ### Snapshot allocation correction and matching-image fork oracle
 
-Integrated `12246bbd5` as `54f3167a7`. The allocator witness observes zero
+Integrated `12246bbd5` as `85a17114b`. The allocator witness observes zero
 large snapshot-buffer allocations after warmup at all four scales, replacing
 the old live-conversion behavior that allocated once per fork. Live descriptors
 remain authoritative; retained buffers contain no readable snapshot contents.
 
-The preceding full CI on `899873310` exited zero (6,179 passing tests across
+The preceding full CI on `972dbee3e` exited zero (6,179 passing tests across
 101 result groups; 12 existing ignores). Its transcript remains at
 `target/el1-completion/live-integrated/ci.log`, SHA-256
 `73d09acfd5ac0012fa7493f15021e1a0acb54bd447927721f09b75b5755d6d03`.
-That result does not cover the allocation correction. Full CI for `54f3167a7`
-is in progress at `target/el1-completion/live-integrated/ci-54f3167a7.log`.
+That result does not cover the allocation correction. Full CI for `85a17114b`
+is in progress at `target/el1-completion/live-integrated/ci-85a17114b.log`.
 
 Fresh image inspection found different Ubuntu image versions behind Docker's
 and Carrick's cached tags. The native fork runner now pins Carrick's exact
 manifest and verifies equal root filesystem layer digests. All 12 native rows
 pass with cleanup proved. Receipts:
-[matching-image fork authority](../../perf-results/2026-09-26-el1-live-table-review/native-fork-54f3167a7/README.md).
+[matching-image fork authority](../../perf-results/2026-09-26-el1-live-table-review/native-fork-85a17114b/README.md).
 Signed validation and every remaining migration checkpoint remain open.
 
-Full CI for `54f3167a7` now exits zero: 6,180 passing tests across 101 result
+Full CI for `85a17114b` now exits zero: 6,180 passing tests across 101 result
 groups, zero failures and 12 existing ignores. Only evidence documentation
-changed to `b6ce9ab26` during the run. The complete transcript and hash are
+changed to `22c42b64d` during the run. The complete transcript and hash are
 preserved in the [integrated receipt](../../perf-results/2026-09-26-el1-live-table-review/integrated/README.md).
-Signed fork validation is running separately from `b6ce9ab26`, run ID
-`el1-live-fork-20260926-b6ce9ab26`; do not treat its in-progress build as
+Signed fork validation is running separately from `22c42b64d`, run ID
+`el1-live-fork-20260926-22c42b64d`; do not treat its in-progress build as
 signed acceptance. After it completes, preserve the exact signed artifact and
 receipt, then run the occupancy contract. Actual EL1 fault service remains the
 next implementation milestone, with no broader goal scope removed.
@@ -569,7 +569,7 @@ and inherited acceptance obligations remain in scope.
 
 ### Public probe regression: exec successor resolver
 
-Public probe promotion on `33b590cd8` aborted at the first case of every shard
+Public probe promotion on `ed0085557` aborted at the first case of every shard
 in brk heap expansion. LLDB established that the replacement exec tables were
 being read through the predecessor MM resolver. The initially displayed
 zero-length ledger key was an optimized-debugger artifact; real register bounds
@@ -585,7 +585,7 @@ first-touch service remain open. The complete migration scope is unchanged.
 
 ### Shared exec resolver isolation
 
-Full CI on `aa5d55dd6` passes 6,180 tests. Public probe promotion passed generic
+Full CI on `67061004b` passes 6,180 tests. Public probe promotion passed generic
 shards 0 and 1, then aborted on GNU `forkexecstorm` after 798 completed probe
 rows: anonymous discard could not resolve the parent root. A focused core
 capture reproduces it; fresh native Docker passes both libc variants.
@@ -603,7 +603,7 @@ by smoke/full and real EL1 first-touch service. No scope or budget is reduced.
 
 ### Qualified public probe result after both exec corrections
 
-`just --no-deps conformance-probes` exits zero on clean `863e81757`: 912 unique
+`just --no-deps conformance-probes` exits zero on clean `7ad7a66bf`: 912 unique
 generic arm64 executions, dedicated signed cases and the CLI boundary pass.
 Retained musl passes 33/33; GNU passes 31/33 with two report-only discrepancies:
 `ppollwaitset` wake latency bucket (`lt100` versus `lt1`) and `sigprofvdso`
@@ -611,14 +611,14 @@ timer text sampling (`1` versus `0`). Preserve both findings for controlled
 attribution; the zero exit status is not strict closure. The CLI remains byte
 identical and frozen, and final scoped cleanup is empty. Separate signed-stage
 receipts are preserved, with the generic artifact re-signing limitation stated
-in the [public probe receipt](../../perf-results/2026-09-26-el1-live-table-review/public-probes-863e81757/README.md).
+in the [public probe receipt](../../perf-results/2026-09-26-el1-live-table-review/public-probes-7ad7a66bf/README.md).
 Full CI on this revision is running. Smoke/full, strict probe acceptance and
 actual EL1 first-touch remain open with the full goal scope intact.
 
 ### Retained GNU attribution and authority inventory reconciliation
 
 Two fixed samples per retained probe on each frozen Carrick artifact
-(`aa5d55dd6`, `863e81757`), followed by matching-image native arm64 Docker,
+(`67061004b`, `7ad7a66bf`), followed by matching-image native arm64 Docker,
 all exit zero with empty cleanup. Every venue reports `ppollwaitset` wake
 bucket `lt1` and `sigprofvdso` timer text sampling `1` in both samples. Thus the
 public latency difference did not reproduce in the isolated screen, and the
@@ -635,7 +635,7 @@ strict probe acceptance, smoke/full and actual EL1 first-touch remain open.
 
 2026-09-26: dispatched bounded fault-entry implementation to Antigravity
 worker `fault-entry`, conversation `7b92561f-8c12-400a-9c0d-82f515281049`,
-in the reused isolated `el1-memory-corrections` checkout at `a7d3138df`.
+in the reused isolated `el1-memory-corrections` checkout at `ba596e112`.
 The prior checkout tip is preserved by
 `archive/el1-memory-corrections-before-fault-entry`. The exact task is
 [the fault-entry plan](2026-09-26-el1-fault-entry.md); worker execution is
@@ -643,13 +643,13 @@ limited to host tests and image compilation. Director owns diff review,
 signed red/green witnesses, native controls and integration. This new entry
 task does not reopen the exhausted live-table worker review rounds.
 
-The existing full CI process remains live against `d35c88001` (only plan
+The existing full CI process remains live against `3914aa437` (only plan
 documentation changed afterward); it has reached runtime tests. No final
 CI success or fault-entry acceptance is claimed. The latest status-only turn
 was no implementation progress; this dispatch advances the next prerequisite.
 
 2026-09-26: the existing authority-reconciled `just ci` process completed
-with exit 0 on `d35c88001`: 6,180 passed, zero failed, 12 ignored across
+with exit 0 on `3914aa437`: 6,180 passed, zero failed, 12 ignored across
 101 result groups. Raw evidence is in
 `docs/perf-results/2026-09-26-el1-live-table-review/ci-authority-reconciled/`.
 The dedicated public-probe executables were frozen and hash-verified (four
@@ -657,7 +657,7 @@ executables, 32 passing execution rows). The earlier generic-stage artifacts
 remain unavailable in their original signed form; a stale-receipt capture
 was rejected before copying. Fault-entry worker turn 1 remains active.
 
-2026-09-26: fault-entry worker produced `99610317a`, but director review
+2026-09-26: fault-entry worker produced `4f274d3e0`, but director review
 round 1 rejected acceptance. The 239 host tests pass independently; the real
 guest fixture fails cross-compilation (invalid assembly output constraints
 and siginfo accessor). Review also requires sound register capture, deliberate
@@ -676,7 +676,7 @@ alone cannot prove metadata-refusal recovery. Evidence and required witness
 cases are in `docs/perf-results/2026-09-26-el1-first-touch/allocator-prerequisite/mmu-allocation-audit.md`.
 No current guest OOM reproduction or new allocator acceptance is claimed.
 
-2026-09-26: director review round 2 of fault-entry at `eb2d4f6a3` confirms
+2026-09-26: director review round 2 of fault-entry at `b025eae1e` confirms
 244 host tests and fixture cross-compilation pass. The frozen fixture also
 passes on the pinned matching-image native arm64 Docker oracle with exit 0
 and no remaining container. Acceptance remains open: the bare-metal entry
@@ -686,7 +686,7 @@ The same worker is addressing these narrow findings on turn 3 (review round 2).
 Evidence: `docs/perf-results/2026-09-26-el1-fault-entry-director/review-2-*`.
 No worker implementation has yet been integrated.
 
-2026-09-26: fault-entry review round 3 at `8c5bd3ee1` found a fixture
+2026-09-26: fault-entry review round 3 at `e8b4aa454` found a fixture
 regression: SP capture overwrites x16 before recording its canary. The pinned
 native arm64 oracle confirms exit 1 with x16 containing SP instead of the
 canary. The same worker is addressing this narrow correction on turn 4, its
@@ -696,7 +696,7 @@ ran red because Cargo stopped at the earlier failed crate. Native evidence
 and review are preserved in the director review directory. No guest runtime
 regression is inferred from this fixture failure.
 
-2026-09-26: final fault-entry worker revision `a6fe8d4af` passes director
+2026-09-26: final fault-entry worker revision `72b3815de` passes director
 fixture cross-compilation, host/image/contract/format/embed compilation checks
 and the pinned native arm64 fixture run. Three review rounds are complete;
 no further worker rounds are authorized. Imported only the ABI instrumentation
@@ -705,15 +705,15 @@ and vectors. The actual fault-entry implementation remains unintegrated until
 this witness proves the missing entry. Full signed and performance gates stay
 open. Final worker verification is retained under the director evidence tree.
 
-2026-09-26: signed fault-entry red is established at `d409be2c7`: Linux
+2026-09-26: signed fault-entry red is established at `f38d78b91`: Linux
 fixture checks succeed, but the expected positive EL1 entry counter is zero.
 Negative entitlement control and scoped cleanup pass. Frozen signed identity
 and exact native-matching fixture hash are retained in the director signed-red
-receipt. Merged reviewed worker `a6fe8d4af` as `0c30348a2` and started signed
+receipt. Merged reviewed worker `72b3815de` as `6ba233953` and started signed
 green using the same fixture. The worker converged in three review rounds;
 EL1-off/GIC-off controls and higher promotion gates remain outstanding.
 
-2026-09-26: signed fault-entry green completed on `0c30348a2` using the
+2026-09-26: signed fault-entry green completed on `6ba233953` using the
 exact red/native fixture. The tested signed executable was frozen; both
 EL1-off and GIC-off controls pass on that same artifact, with negative
 entitlement and scoped zero-process cleanup evidence preserved under
@@ -723,34 +723,34 @@ promotion. Integrated CI is the next check; the broad EL1 gate still includes
 the deliberately red anonymous-first-touch contract.
 
 2026-09-26: fault-entry integrated CI exposed test-only Clippy errors, fixed
-in `a3fe1bd12`, then three position-only authority inventory shifts. Capture
+in `ed75a6196`, then three position-only authority inventory shifts. Capture
 reconciliation retains all 588 reviewed rows. Raw failed runs and correction
 evidence are preserved in the director integrated-ci directory. Full CI is
 rerun after reconciliation; no full integration acceptance is claimed yet.
 
 The next bounded task is the MMU metadata-refusal plan. Antigravity worker
 `metadata-refusal` (cid `8b754593-3510-4caf-995f-76732c475fdd`) runs in the clean
-reused el1-memory-corrections checkout at plan base `cb2a854bf`. This is a new
+reused el1-memory-corrections checkout at plan base `c1490a186`. This is a new
 task with zero review rounds used; the completed fault-entry worker remains
 terminal at its three-round cap. The task requires real allocator refusal,
 zero-allocation rollback and complete edit/publication recovery. It permits
 host tests only, with director-owned integration and signed execution.
 
-2026-09-26: integrated fault-entry full CI passed on `084c9a272`: 6,188
+2026-09-26: integrated fault-entry full CI passed on `959be85f1`: 6,188
 passed, zero failed, 12 ignored across 101 Rust result groups. Complete log
 and hashed receipt are preserved under the fault-entry director
 `ci-reconciled/` evidence directory. The six non-macOS authority profiles
 remain explicitly pending. Signed promotion and actual guest first-touch
 service are still open; the independent metadata-refusal worker is active.
 
-2026-09-26: signed integrated EL1 gate on `3667731b2` exits 1 solely on
+2026-09-26: signed integrated EL1 gate on `96d2b8178` exits 1 solely on
 anonymous first-touch work: 614/2148/8293 host exits at 512/2048/8192 total
 pages, slope 0.9987 versus <0.125. Forty-one other EL1 tests and the negative
 control pass; cleanup is zero. All eight executed artifacts are frozen and
 CLI identity is unchanged. Public probes/LTP/inotify recipe steps did not
 run. Exact failure evidence is under fault-entry-director/el1-gate/.
 
-Metadata-refusal worker `32b0ad50f` passes the five prescribed commands but
+Metadata-refusal worker `1f91396c3` passes the five prescribed commands but
 fails independent semantic review: under actual allocation refusal,
 coalescing drops a valid translation by freeing a still-linked child after
 ignoring the failed parent write. The retained director reproducer exits 101.
@@ -779,7 +779,7 @@ lifecycle allocation obligations for subsequent guest migration. The next
 impact milestone remains actual in-guest first-touch, not another host-only
 foundation checkpoint. The preceding user-facing status turn changed no code.
 
-2026-09-26: metadata-refusal candidate `f27a3f644` passes all five
+2026-09-26: metadata-refusal candidate `7eb7e2326` passes all five
 independent host checks and now exercises actual authority refusal and
 same-instance recovery. Review round 3 remains necessary: publication error
 conversion still allocates, conversion tests duplicate rather than call
@@ -792,7 +792,7 @@ verified wait on the same live worker; this turn completed independent
 verification and dispatched bounded corrections.
 
 2026-09-26: integrated metadata-refusal through director correction
-`1f6b71619` as `0687248fb`. The final worker `68bb6dc79` passes host checks
+`9f66a192a` as `33b1f0099`. The final worker `00257b5d5` passes host checks
 but its claimed derived budgets were absent; director correction installs
 actual structure-derived bounds and authentic production-mutation controls.
 Exact growth fails at scale 32 (112 > 99 allocations); new rollback storage
@@ -802,7 +802,7 @@ unused test-only public converter is removed. No fourth worker round occurred.
 Full integration CI and signed promotion remain open. First-touch remains red.
 
 The next bounded allocator/grant outcome is documented in
-2026-09-26-el1-elastic-metadata.md, committed as `b5df14f93`; it requires
+2026-09-26-el1-elastic-metadata.md, committed as `8e9351fba`; it requires
 actual guest allocation, dynamic growth and return rather than host-only
 proof. All later checkpoints and original performance objectives remain open.
 
@@ -821,7 +821,7 @@ not a semantic-red claim. Raw failure and validation evidence are under
 metadata-refusal-director/integrated-runtime/. Fresh clean-source capture,
 full CI and signed promotion remain pending.
 
-2026-09-26: clean-source inventory capture after `3b45df0ee` succeeds.
+2026-09-26: clean-source inventory capture after `9932e25d4` succeeds.
 Reconciliation moves 31 authority sites and one K1 operation position;
 mechanical comparison confirms all 588 authority rows retain classifications,
 identities and rationale bodies. The four earlier abort fingerprints remain
@@ -829,7 +829,7 @@ reviewed. Full integrated CI starts after committing these inventory updates;
 no full CI or signed acceptance is yet claimed. Non-macOS profiles remain
 pending as before.
 
-2026-09-26: full CI on `bc5500391` stopped at generated contract inventory
+2026-09-26: full CI on `422682443` stopped at generated contract inventory
 validation after workspace Clippy and earlier domain checks passed. Regenerated
 inventory adds only the metadata-refusal claim to mmap/munmap/mprotect; full
 CI reruns after commit. Failure evidence is under metadata-refusal-director/
@@ -837,14 +837,14 @@ integrated-ci/. No full CI acceptance is claimed.
 
 Dispatched the next distinct implementation, `el1-elastic-metadata`, through
 Antigravity (cid `bce3369a-a045-4632-a3f0-736bab05eae1`) in the clean reused
-el1-memory-corrections checkout at `bc5500391`. Its director-written brief is
+el1-memory-corrections checkout at `422682443`. Its director-written brief is
 2026-09-26-el1-elastic-metadata.md. It requires real guest allocator/grant/
 return wiring and an embed fixture, not host-only allocation. Worker runs host
 checks and compilation only; director retains signed execution and acceptance.
 This task has zero review rounds used; metadata-refusal is terminal after
 three rounds and director correction, not reopened.
 
-2026-09-26: full integrated CI on clean `b8a3ccea7` exits zero: 6,201
+2026-09-26: full integrated CI on clean `3c40d4337` exits zero: 6,201
 passing tests, zero failures, 12 existing ignores across 101 Rust result
 groups. Complete hashed evidence is under metadata-refusal-director/
 integrated-ci/green/. This closes the host gate only; signed guest validation,
@@ -859,10 +859,10 @@ failures: 64-byte alignment returns remainder 32, and payload-only grant sizing
 cannot fit its header. Raw source and red output are preserved under
 el1-elastic-metadata-director/in-progress-screen/. Recheck against the terminal
 candidate before review; no worker source was modified. Signed release build
-on a6ac6935c completed and its exact CLI artifact is frozen. The integrated EL1
+on 3d68ff1c0 completed and its exact CLI artifact is frozen. The integrated EL1
 gate is running; no result or first-touch acceptance is claimed yet.
 
-2026-09-26: signed integrated metadata gate on a6ac6935c finishes with only
+2026-09-26: signed integrated metadata gate on 3d68ff1c0 finishes with only
 the existing first-touch failure: 621/2150/8294 exits at 512/2048/8192 total
 pages; slope 0.9954 versus <0.125. Forty-one other EL1 tests and negative
 control pass, including the 30-round oversubscribed kick witness. Both scoped
@@ -870,7 +870,7 @@ cleanup counts are zero. CLI and eight executed test artifacts are frozen;
 raw logs/manifest are under metadata-refusal-director/integrated-signed/.
 Public probes/LTP/inotify steps did not run; no timing acceptance is claimed.
 
-2026-09-26: elastic metadata candidate ae6c3a17b passes all eight independent
+2026-09-26: elastic metadata candidate 0dcc87b33 passes all eight independent
 host verification commands but fails allocator review. Final-source screens
 reproduce alignment and grant-overhead failures; actual guest stage-1 mapping,
 owner lifetime, global allocation wiring, growth/refusal fixture and structural
@@ -879,7 +879,7 @@ Integration is withheld. Same worker received review round1 (turn2), with
 all evidence under el1-elastic-metadata-director/review-1/. No signed allocator
 acceptance is claimed and no later goal stage is removed from scope.
 
-2026-09-26: allocator candidate dc2b83706 passes all eight independent host
+2026-09-26: allocator candidate c9a401a50 passes all eight independent host
 checks and fixes the original alignment/grant-sizing reds. Acceptance remains
 withheld: standalone fixture cross-build fails an undeclared dependency; a
 real host slot-policy screen proposes overlapping extents for >512KiB grants;
@@ -917,10 +917,10 @@ Report milestones in guest behavior and host-exit slope, not commit/test count.
 2026-09-26: elastic metadata worker is terminal after initial implementation
 plus two review rounds (three turns); the broad delegation loop is now closed
 per the delivery ruling. No third review is dispatched. Its uncommitted final
-changes are preserved in worker checkpoint83972685e, explicitly unaccepted.
+changes are preserved in worker checkpointcd5bb823d, explicitly unaccepted.
 Director takes over the same now-idle correction checkout. Fixed the actual
 Linux fixture to execute exactly one requested basic/growth/denial phase in
-2d3b55cc9; the prior fixture ignored the phase argument and ran all three.
+981c1e090; the prior fixture ignored the phase argument and ran all three.
 The static fixture cross-build passes. Started the focused signed witness via
 `CARRICK_RUN_ID=el1-allocator-director-red-20260926 RUSTC_WRAPPER= just test-embed
 el1_metadata_allocator_grows_and_returns_extents --nocapture` on that source.
@@ -931,11 +931,11 @@ Remaining review includes coherent shared host backing and carrier-owned
 lifetime; use the actual focused failure to order direct corrections.
 
 2026-09-26: the director reproduced and corrected two guest integration
-failures in the correction checkout. bd604a876 restores maintenance HVC #1
-routing after strict syscall classification; c33e1d152 removes the extra PC
+failures in the correction checkout. 4b56524cd restores maintenance HVC #1
+routing after strict syscall classification; e483face2 removes the extra PC
 advance after HVC #6 (LLDB and exact guest disassembly prove the skipped
 status comparison). The focused signed allocator witness now passes on
-c33e1d152766d5802e1b6b86f152ccb204b8ab10: basic alignment/writes, 10 MiB
+e483face24e246a7a9cbf71c79c4e6aa1d860521: basic alignment/writes, 10 MiB
 allocation beyond the 9 MiB bootstrap, three grants/returns totaling 5,767,168
 bytes, and one denied grant followed by recovery. Negative entitlement control
 and both scoped cleanups pass. Exact identities and raw log are preserved in
@@ -943,7 +943,7 @@ and both scoped cleanups pass. Exact identities and raw log are preserved in
 
 This is focused guest proof, not allocator integration or memory checkpoint
 acceptance. Source remains in the correction checkout (receipt commit
-188114c43). Next directly close carrier-owned coherent backing, exact VM/owner
+5703845d9). Next directly close carrier-owned coherent backing, exact VM/owner
 lifetime and failed-unmap retention, then concurrency/IRQ and bounded-work
 witnesses. These are required by the accepted allocator brief, not new scope.
 Use the resulting allocator for shared MMU publication and EL1 first-touch;
@@ -951,19 +951,19 @@ the existing <0.125 host-exits/page target remains red. No end-to-end speedup
 is claimed and all later checkpoints remain required.
 
 2026-09-26: correction checkout advanced through coherent metadata backing
-(fa557cc7d), exact carrier ownership/generation (1c22dcdb3), and shared stage-2
-record publication/retirement (b61195767). Five focused metadata and 48 existing
+(5305f156d), exact carrier ownership/generation (10f102398), and shared stage-2
+record publication/retirement (55d9175a6). Five focused metadata and 48 existing
 custody tests pass. The exact signed sequential allocator witness passes on
-b61195767, including denial recovery and complete return of 5,767,168 bytes.
+55d9175a6, including denial recovery and complete return of 5,767,168 bytes.
 
-8fc9c913a adds a concurrent signed witness: four allocator users, sixteen rounds
+fceb5ce82 adds a concurrent signed witness: four allocator users, sixteen rounds
 of growth/free, and 1,024 successful host-forwarded uname calls. Both allocator
 tests pass with matching grant/return counts and bytes, no concurrent grant
 denial, the unchanged watchdog, negative entitlement control and zero scoped
 processes. See [concurrent evidence](../../perf-results/2026-09-26-el1-allocator-concurrent/README.md).
 This is concurrent completion/progress proof, not an interrupt-latency measurement.
 
-5b2da6bef gates private allocator controls behind an explicit embedded-image
+05c114b5e gates private allocator controls behind an explicit embedded-image
 test feature enabled by embed dev dependencies. Default and enabled shared
 dispatcher tests (57 each), both image builds, embed compile-check and Clippy
 pass. Signed verification is running in the correction checkout at
@@ -983,14 +983,14 @@ checkpoints.
 ### Accepted EL1 metadata allocator boundary (2026-09-26)
 
 The correction line closes the remaining allocator obligations through
-`7e08a6108`. Metadata capacity misses now publish one carrier-wide
+`582e486f2`. Metadata capacity misses now publish one carrier-wide
 single-flight request and unwind through the ordinary pending-host-work
 boundary before the host maps or unmaps storage. A participant observing
 unfinished mailbox work forces its own boundary, refusal stays with the
 capacity miss that owns it, fully unused dynamic extents return exactly once,
 and no synchronous metadata HVC runs on the masked allocator stack.
 
-Exact signed source `ef5764582` passes sequential 10 MiB growth beyond the
+Exact signed source `f63d2aeea` passes sequential 10 MiB growth beyond the
 9 MiB bootstrap, complete return, refusal with preserved live data and retry,
 four-user concurrent progress with 1,024 unrelated host services, and the IRQ
 boundary witness together. Real grant and return accounting matches with
@@ -1013,7 +1013,7 @@ allocator regression.
 
 ### Shared stage-1 publication groundwork (2026-09-26)
 
-`5c1319222` establishes the first production boundary of
+`8daa1fcfa` establishes the first production boundary of
 `kernel.el1.stage1-publication`. Each published address space now has one exact
 guest editor token. Guest admission rechecks the MM gate after claiming the
 token, while host mutation and retirement raise or close that gate and drain
@@ -1047,14 +1047,14 @@ specific prerequisite failure.
 
 ### Authenticated frame-grant host authority (2026-09-27)
 
-`cc3647b4a` defines a carrier-wide single-flight frame-grant mailbox. A guest
+`d0a57e55f` defines a carrier-wide single-flight frame-grant mailbox. A guest
 request carries one exact MM key, request generation, fault VA, bounded length
 and fault access class. The host response separately carries authoritative VMA
 permissions plus semantic and physical spans, frame and mapping identities,
 owner generation and inventory revision. Wrong-MM, stale-generation and
 unauthenticated responses cannot be consumed.
 
-`3b1a110d4` adds the kernel-side publication authority. It applies an exact
+`59e9592e4` adds the kernel-side publication authority. It applies an exact
 inventory transaction, authenticates its returned revision against the live
 MM/mapping/frame/GPA/span and an independently retained current owner, and can
 roll back an unpublished grant through the opaque receipt. The dispatcher now
@@ -1078,7 +1078,7 @@ and rerun the signed three-scale witness before broadening checkpoint 2.
 
 ### Authenticated frame-grant host service (2026-09-27)
 
-`a90315d59` completes the host half of the direct production join. The existing
+`8506298ed` completes the host half of the direct production join. The existing
 forwarded-fault boundary now claims only the current MM's exact request, clips
 it through the same-protection 2 MiB planner, and calls a neutral VMM service.
 HVF quiesces and reauthenticates that MM, creates real zeroed stage-2 backing,
@@ -1111,8 +1111,8 @@ allocator work unless this transaction exposes a specific allocator regression.
 
 ### Signed guest-leaf diagnosis (2026-09-27)
 
-`dae6f092c` connects the exact EL1 request/response/editor transaction, and
-`afdf58039` repairs its release-only host-service build without widening the
+`a974234c0` connects the exact EL1 request/response/editor transaction, and
+`4652c5f94` repairs its release-only host-service build without widening the
 permit's authority. The exact signed release CLI build passes and its SHA-256,
 CDHash, LC_UUID, entitlement and DOF identity are retained under
 `docs/perf-results/2026-09-27-el1-guest-leaf-publication/`.
@@ -1166,14 +1166,14 @@ exhaustion or names an extension-arena dependency.
 
 ### Guest-published hierarchy in fork snapshots (2026-09-27)
 
-The exact signed `4a939f00f` witness crossed both missing-hierarchy allocation
+The exact signed `d52fd95ff` witness crossed both missing-hierarchy allocation
 and the primary-table stage-2 write boundary. It reached fork child preparation,
 where the child snapshot resolved `0x6000001000` to the inherited identity IPA
 instead of the newly granted global frame. The host manager had been created
 before EL1 allocated the new table page, so its cached populated prefix ended
 before the now-live hierarchy and the fork image truncated it.
 
-`9d521e6be` is the bounded correction. A red-first dual-editor MMU test publishes
+`9c3fd8b95` is the bounded correction. A red-first dual-editor MMU test publishes
 the same missing hierarchy through a guest live manager and snapshots it through
 the older host live manager. Snapshot discovery now follows only reachable
 table descriptors across the four architectural levels, using live physical
@@ -1191,7 +1191,7 @@ boundary; checkpoint 2 and measured impact remain open.
 
 ### Untouched private alias across fork (2026-09-27)
 
-The exact signed `0a1c70a47` rerun did not move: it reproduced the same child
+The exact signed `e74f00d7c` rerun did not move: it reproduced the same child
 projection mismatch before either side touched the anonymous range. The
 environment-gated fork diagnostic corrected the attribution. The registry and
 mapping row already named global IPA `0x9b40001000`; the parent leaf was
@@ -1200,7 +1200,7 @@ intentionally invalid for first touch and retained the old identity output
 hierarchy beyond an older cursor, but that hierarchy was not the active cause
 in this fixture.
 
-`a6b32fe6b` is the direct correction. Fork projection repoints only an inherited
+`6c77556e5` is the direct correction. Fork projection repoints only an inherited
 dynamic private alias with an invalid leaf and a stale retained output. The
 operation preserves validity and every permission attribute, so it does not
 materialize or expose an untouched mapping. Its red-first focused test,
@@ -1212,7 +1212,7 @@ Build and sign one exact artifact containing this commit, then rerun the same
 4,096 pages. If it remains red, use the next exact signed boundary; do not turn
 this into a general fork rewrite.
 
-The frozen `58c76fdfd` signed result clears the semantic boundary at all three
+The frozen `98498f0b2` signed result clears the semantic boundary at all three
 scales. Both parent and child verify zero-fill, distinct private writes and
 post-rendezvous values at 256, 1,024 and 4,096 pages. Exit counts are 612,
 2,148 and 8,292, so both incremental slopes are exactly 1.0000 exit per added

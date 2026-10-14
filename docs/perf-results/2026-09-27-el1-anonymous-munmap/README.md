@@ -1,7 +1,7 @@
 # EL1 resident anonymous munmap acceptance
 
 This directory binds `kernel.el1.anonymous-munmap` to implementation commit
-`73dfedec1a12554790c6fef86375e9fe26733c54`. A fully resident tagged private
+`d4bac9ce7a6bc1fd16363355537bec2c54ddeaf2`. A fully resident tagged private
 anonymous range is now retired by guest EL1 under the exact-MM editor before
 the syscall crosses one host boundary for authenticated physical return and
 VMA bookkeeping.

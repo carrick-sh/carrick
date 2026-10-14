@@ -62,7 +62,7 @@ if needed), `rust-toolchain.toml` (add `aarch64-unknown-none`),
 - `carrick_el1_image::IMAGE: &'static [u8]`
 
 Steps:
-- [x] Task 1 landed on main at c1dac9055 (softfloat image, atomic counters, shared region, one kernel-only range predicate).
+- [x] Task 1 landed on main at 77c08f04b (softfloat image, atomic counters, shared region, one kernel-only range predicate).
 - [ ] Pick `EL1_REGION_BASE` in an unused VA/IPA range (verify against every `LINUX_*` constant in `memory.rs`; add a `const _: () = assert!` non-overlap check). Size 64 MiB.
 - [ ] Red test in `carrick-mem`: memory image built with EL1 enabled contains a region at `EL1_REGION_BASE` whose first bytes are the image header, and stage-1 walk of that VA from EL0 permission is denied, from EL1 permitted. Run `cargo test -p carrick-mem --lib el1_region` → FAIL.
 - [ ] Implement abi crate, image crate (`build.rs` runs `cargo build -p carrick-el1 --target aarch64-unknown-none --release` into `OUT_DIR/el1-target`, then `rust-objcopy -O binary`; fail the build loudly if the target is missing), region mapping through the same generic region list the identity page uses. Test → PASS.

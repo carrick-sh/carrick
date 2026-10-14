@@ -6,7 +6,7 @@ Caveats).
 
 ## Run
 
-- Binary: signed build of `412a9638f` (EL1 census, before the carrier-CPU
+- Binary: signed build of `b651a4988` (EL1 census, before the carrier-CPU
   fields), EL1 on.
 - `CARRICK_EL1_CENSUS=<dir> cargo run -p carrick-conformance -- --tier full
   --ecosystem cpython --ecosystem go --ecosystem node --workers 6`.
@@ -70,7 +70,7 @@ per-suite join, which will show whether file-byte classes matter anywhere.
 - Of the 29 gating failures, the seven rechecked serially split two ways:
   go-go_importer and node-libuv match (load flakes), and cpython-fork1,
   cpython-wait4, cpython-pkgutil, cpython-zipfile and cpython-zipimport fail
-  identically with `CARRICK_EL1=0` and on pre-branch main `b700bef18`. In the
+  identically with `CARRICK_EL1=0` and on pre-branch main `342c61b15`. In the
   guest, Python's `time.time()` returns about 1980 (seconds since the epoch),
   which breaks zipfile and zipimport and plausibly the other time-dependent
   suites. Bisect in progress; the rerun follows the fix.

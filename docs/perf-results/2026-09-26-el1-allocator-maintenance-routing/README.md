@@ -1,6 +1,6 @@
 # Allocator signed red: maintenance routing
 
-Source: `2d3b55cc9d411afb2df274c2da15be38b70bebbe`.
+Source: `981c1e09091ae7c4cfee4c546ccb6a14ce2e2d34`.
 The focused signed allocator test exited 1; its unentitled negative control
 passed and both original run scopes had zero remaining processes.
 The exact signed executable is frozen at the path in `identity.json`.

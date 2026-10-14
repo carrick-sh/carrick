@@ -1,6 +1,6 @@
 # Private/shared alias callers joined to EL1 publication
 
-Development on adapter parent `ec366760f`, contract
+Development on adapter parent `74bf206d5`, contract
 `kernel.el1.stage1-publication`. Production admission remains disabled. This
 connects real callers in source; it is not signed execution or checkpoint acceptance.
 

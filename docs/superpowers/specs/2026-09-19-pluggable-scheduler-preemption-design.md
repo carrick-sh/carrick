@@ -3,7 +3,7 @@
 Date: 2026-09-19. Status: research-backed proposal for review; not implementation
 authorization or an acceptance receipt.
 
-Carrick source inspected: `e181864aa6c47a9df0681da433c548e46a72e771`.
+Carrick source inspected: `4d6a0508b543c0e3059c193baf4e727546979d0f`.
 Research is source inspection, not a live scheduling measurement. Public XNU
 source does not establish the configuration of the kernel installed on this Mac.
 

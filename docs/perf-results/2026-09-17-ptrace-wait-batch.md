@@ -25,7 +25,7 @@ Stop provenance now travels as `StopKind` from the task owner through the wait
 receipt. `waitid` renders ptrace stops as CLD_TRAPPED (4) and ordinary job-control
 stops as CLD_STOPPED (5). The encoded wait4 stop status is unchanged.
 
-On original source `1fa517693`, four deterministic continuation tests fail and
+On original source `ec8c76a0c`, four deterministic continuation tests fail and
 two controls pass (`selector-red.log`). After the continuation fix, four
 intermediate waitid assertions fail with code 5 rather than 4
 (`stop-kind-red.log`). Native ARM64 Docker independently reports 4 for a ptrace
@@ -41,8 +41,8 @@ There is no scheduling serialization.
 
 ## Verification status
 
-Implementation commits: `6fcf9e831` (red tests), `c349748fa` (fixes and complete
-coverage). Documentation/inventory follow-ups: `0544ccb0b`, `8b54551fa`.
+Implementation commits: `426461005` (red tests), `facece618` (fixes and complete
+coverage). Documentation/inventory follow-ups: `0fb964fdf`, `d88926da3`.
 Independent read-only Antigravity review found no introduced defects. The
 director reviewed the inventory changes separately: only position/fingerprint
 receipts changed, with all 585 authority classifications retained.
@@ -60,7 +60,7 @@ files during authority capture. Host-access capture succeeded. Full host CI pass
 existing ignores. The macOS authority census is authoritative for its host
 profiles; Linux/FreeBSD/NetBSD profiles remain pending on their own hosts.
 
-Signed source: `8b54551fa`.
+Signed source: `d88926da3`.
 
 - SHA-256: `36cf56ae51c5f14cf1415eecc3a6fd8bc26595d8bfe1a99d5e94dc08b526b5e9`.
 - CDHash: `655f60add77b569ed9c159346581f93fe77cd6cb`.

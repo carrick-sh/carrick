@@ -1,6 +1,6 @@
 # Bounded service and restore follow-up
 
-Source inspected: `1522bbc05`. This is source evidence, not a runtime or
+Source inspected: `01382d67f`. This is source evidence, not a runtime or
 structural acceptance receipt. Question: which production path can compete
 with service delivery or ordinary zone restore to retire the same record?
 

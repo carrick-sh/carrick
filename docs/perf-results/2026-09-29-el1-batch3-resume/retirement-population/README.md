@@ -1,6 +1,6 @@
 # Coherent terminal frame populations
 
-Base: ed8dcb3ed. The original Go20 acceptance failure remains unresolved
+Base: c8e236244. The original Go20 acceptance failure remains unresolved
 pending signed candidate execution. This reduction proves a concrete
 backend race shape; it does not establish retrospective Go crash attribution.
 

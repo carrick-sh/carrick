@@ -1,6 +1,6 @@
 # Prepared host copyout through EL1 descriptor publication
 
-Development slice on base `cb285ae30`; not checkpoint acceptance.
+Development slice on base `4507d4655`; not checkpoint acceptance.
 Applicable contracts: `kernel.el1.stage1-publication` and
 `kernel.el1.anonymous-first-touch`.
 

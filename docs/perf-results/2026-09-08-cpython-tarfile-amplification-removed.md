@@ -20,7 +20,7 @@ The workload is deterministic: **the guest issued the same number of calls on
 both binaries** (2699 `unlinkat`, 2401 `mkdirat`, 8714 `newfstatat`), which is
 what makes the per-operation ratios comparable rather than merely suggestive.
 
-- BEFORE: `c21978acd` (branch point, pre-WIP), binary `7f671eb862d1f4a5…`,
+- BEFORE: `49df773e2` (branch point, pre-WIP), binary `7f671eb862d1f4a5…`,
   host load at start `{9.44 11.83 18.55}`.
 - AFTER: `3c3155917`, binary `2ada89bd5bef0d86…`, host load at start
   `{3.61 13.62 20.17}`.

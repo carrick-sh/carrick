@@ -134,7 +134,7 @@ performance acceptance is established here.
 ## Provenance
 
 Worktree: `/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick`.
-HEAD: `9bb2392396b8531e93f5262657bf3aa9c5767488`. The worktree already contained
+HEAD: `6914b312cb07b7b72aeb99cc86a861f44bec704f`. The worktree already contained
 substantial campaign changes; HEAD is not a clean-source identity.
 `source-inputs-sha256.txt` identifies the compiled source inputs and
 `source-revision.txt` is that manifest's SHA-256. `implementation.patch` is the

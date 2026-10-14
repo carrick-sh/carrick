@@ -1,6 +1,6 @@
 # Deterministic signed delayed-parent notification
 
-Final fixture/source: `2e6e3794abb60c2fa4016742f1c5fd5140118b4a`.
+Final fixture/source: `4a2e93bf58d8bcf0de23650e87b359e5f487e70b`.
 This proves the delayed runtime notification producer against a real guest
 reap. It does not attribute the historical otmpfileforkexec failure or accept
 the whole batch.
@@ -21,8 +21,8 @@ are retained. They are not acceptance proof. The final fixture adds an explicit
 reaped-wake rejection count; the default auditor's Continue disposition alone
 could not make the old method fail this embed test.
 
-Controlled red: base `2e6e3794a` plus pre-fix-control.patch replaces only the
-HvpatchRuntimeEndpoint method body with `932a33568^`'s untyped wake. It retains
+Controlled red: base `4a2e93bf5` plus pre-fix-control.patch replaces only the
+HvpatchRuntimeEndpoint method body with `94db4bf05^`'s untyped wake. It retains
 the current fixture and capture event. `red.log` fails the intended assertion:
 one reaped-target rejection versus zero, after the ordering/guest assertions.
 The script exited 1, its entitlement negative control passed, and both scoped
@@ -48,7 +48,7 @@ acceptance remain open.
 
 ## Final broader regression
 
-On `b1f5290b5` (the signed source plus receipt/controller changes), kernel and
+On `7d58af5bc` (the signed source plus receipt/controller changes), kernel and
 semantics passed 2,462 tests in 21 binaries with one existing ignore. The
 separate serialized kernel lane passed 110 tests; runtime passed 630 tests
 with eight existing ignores. Affected kernel/runtime/embed all-target Clippy
@@ -56,8 +56,8 @@ passed. Logs are final-kernel, final-serial, final-runtime and final-clippy.
 The contract registry also passed (final-registry). These are source regressions;
 they do not enlarge the signed fixture's one-test execution population.
 
-Clean compiler reconciliation on `3fb63f608` retained all 595 rows and their
-positions; only the source stamp changed (commit `852fedd48`). Final
-`just lint-domains` and contract coverage `257de53e0..852fedd48` passed.
+Clean compiler reconciliation on `8bfbd1dbe` retained all 595 rows and their
+positions; only the source stamp changed (commit `22a255757`). Final
+`just lint-domains` and contract coverage `1cbcda5b0..22a255757` passed.
 Logs are final-reconcile, final-lint and final-coverage. The compiler census
 is the macOS subset only; Linux/FreeBSD/NetBSD profiles remain unqualified.

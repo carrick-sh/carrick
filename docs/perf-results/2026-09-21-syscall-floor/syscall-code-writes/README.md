@@ -116,7 +116,7 @@ remain recorded and are not closed by this step.
 ## Provenance
 
 Worktree: `/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick`.
-HEAD: `9bb2392396b8531e93f5262657bf3aa9c5767488`, with pre-existing campaign changes.
+HEAD: `6914b312cb07b7b72aeb99cc86a861f44bec704f`, with pre-existing campaign changes.
 The 2,479-input manifest identifies the final signed source; its revision is
 `sha256:475bc5fa32a0cbbaa1b818e4547f1cbb7ab690c5cbc7ee8c6f87c0eaa35c1a57`.
 The initial manifest is retained separately. Contract metadata is archived

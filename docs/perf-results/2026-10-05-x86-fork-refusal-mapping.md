@@ -6,14 +6,14 @@ publication changed from `MmError::MetadataRequired` (errno 11) to
 `MmError::Core` (errno 5). The correction preserves owner failures in neutral
 core types and leaves Linux errno lowering in the personality adapter.
 
-The before-extraction authority is `5dc76a53352ecbe9189ec7fe3279afd11005902f`
-(parent of the publication/commit/abort move `89f3e708f`). Its owner calls use
+The before-extraction authority is `512e73376487b2d95482b656e7a3ac793f4f800e`
+(parent of the publication/commit/abort move `b3d1c60de`). Its owner calls use
 `MmError::from(Refusal)` directly. The reviewed bad implementation is
-`5edb380d5c17c9e05235423b0702d61e39c55560`.
+`a438074183f48f4a957733eb4deb8201b9f290c9`.
 
 ## Every Refusal variant
 
-| Owner Refusal | Before extraction: MmError / errno | At 5edb380d5: MmError / errno | Corrected neutral core error | Corrected MmError / errno |
+| Owner Refusal | Before extraction: MmError / errno | At a43807418: MmError / errno | Corrected neutral core error | Corrected MmError / errno |
 | --- | --- | --- | --- | --- |
 | `Busy` | `Busy` / 16 | `Busy` / 16 | `ForkError::Busy` | `Busy` / 16 |
 | `PreparedConflict` | `Busy` / 16 | `Busy` / 16 | `ForkError::Busy` | `Busy` / 16 |
@@ -70,7 +70,7 @@ Three VM-free witnesses invoke the real `MmPortal::publish_fork` and
 
 The fixtures fill the actual shared pool with unrelated unpublished imports.
 No allocator limit, retry count, timeout, or execution concurrency changes.
-On unchanged `5edb380d5` production code all three fail with errno **5**, expected
+On unchanged `a43807418` production code all three fail with errno **5**, expected
 **11**. After the correction they require `MmError::MetadataRequired`, unchanged
 parent generation, full parent descriptor rollback, no admitted child or copied
 child mappings, and a closed child gate. Returning the unrelated imports' actual
@@ -78,7 +78,7 @@ metadata permits the same exact fork request to publish and abort successfully.
 
 `fork_refusals_preserve_original_mm_error_and_errno` compares all nine variants
 through the new boundary against the pre-extraction direct conversion. It is
-red on `5edb380d5` (`Core` versus `Reservation(Invalid)`) and green after the fix.
+red on `a43807418` (`Core` versus `Reservation(Invalid)`) and green after the fix.
 
 Commands and raw logs are recorded in `target/x86-b4-review/`. This Linux
 worker proves VM-free portal behavior; signed ARM/HVF and Docker acceptance

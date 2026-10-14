@@ -321,7 +321,7 @@ nineteen Linux entry/dispatch witnesses, including the original-argument check.
 This is additional evidence to the generation, Born and physical KVM completion
 red controls recorded above.
 
-Production and tests are counted separately against integrated N1 `56bf8c0ca`.
+Production and tests are counted separately against integrated N1 `a4faef4c8`.
 Count Rust source lines containing lexical tokens (including multiline literal
 contents), excluding comments/blank lines. Strict cfg(test) items and their
 attributes, test-support items, tests directories and named test files belong
@@ -383,8 +383,8 @@ from pathlib import Path
 spec=importlib.util.spec_from_file_location('authority_count','scripts/migrate/check-dispatch-lock-authority.py')
 m=importlib.util.module_from_spec(spec);sys.modules[spec.name]=m;spec.loader.exec_module(m)
 roots=['el1','el1-abi','aarch64']
-for ref in ['56bf8c0ca','WORKTREE']:
- names=subprocess.check_output(['git','ls-tree','-r','--name-only','56bf8c0ca' if ref=='56bf8c0ca' else 'HEAD','crates'],text=True).splitlines()
+for ref in ['a4faef4c8','WORKTREE']:
+ names=subprocess.check_output(['git','ls-tree','-r','--name-only','a4faef4c8' if ref=='a4faef4c8' else 'HEAD','crates'],text=True).splitlines()
  totals={n:{'production':0,'test':0} for n in roots};details={}
  for p in names:
   owner=next((n for n in roots if p.startswith('crates/carrick-'+n+'/')),None)
@@ -411,7 +411,7 @@ for ref in ['56bf8c0ca','WORKTREE']:
   prod=len(counted & production);test=len(counted)-prod
   totals[owner]['production']+=prod;totals[owner]['test']+=test
   details[p]={'production':prod,'test':test}
- Path('/tmp/ord5-'+('before' if ref=='56bf8c0ca' else 'after')+'-census.json').write_text(json.dumps({'totals':totals,'files':details},indent=2)+'\n')
+ Path('/tmp/ord5-'+('before' if ref=='a4faef4c8' else 'after')+'-census.json').write_text(json.dumps({'totals':totals,'files':details},indent=2)+'\n')
  print(ref,json.dumps(totals))
 b=json.loads(Path('/tmp/ord5-before-census.json').read_text())['files'];a=json.loads(Path('/tmp/ord5-after-census.json').read_text())['files']
 for p in a:
@@ -605,7 +605,7 @@ passes after the move. The separate production/test census is unchanged.
 
 ## Hosted CI classification follow-up
 
-The follow-up starts from `7b6d15813d328899c63a01bd1e506cc482425735`,
+The follow-up starts from `9be9fa3ebc42734d360baf8ae4d4efeebb5af7e3`,
 including the director's macOS compiler recapture. No rebase occurred; all
 earlier fixes and the recapture are retained.
 
@@ -623,16 +623,16 @@ tests. `cargo test --locked -p carrick-el1 --lib memory::tests` passes all 16
 tests; no production editor implementation changes accompany this rebinding.
 
 Hosted run `37473750124`, lint job `112303830407`, uses PR base
-`56bf8c0caefe39fcc2260345d0a54772a74bffad` (the PR targets `work/n1`). Before
+`a4faef4c8b2100392ebec0e636ca73a30b5ae329` (the PR targets `work/n1`). Before
 the mapping change this exact-base command reports the ten unclassified paths;
 afterwards it prints:
 
 ```text
-$ just check-contract-change 56bf8c0caefe39fcc2260345d0a54772a74bffad HEAD
+$ just check-contract-change a4faef4c8b2100392ebec0e636ca73a30b5ae329 HEAD
 conformance contract check passed: all changed surfaces covered or exempted
 ```
 
-`origin/main` is `2322d859d463b0d6c9e99ae2ce04f044f66abf53`. A direct
+`origin/main` is `bc9fdf2b2743bf09e6805e5914f2415038674ddf`. A direct
 main-to-PR contract comparison additionally reports inherited N1 paths outside
 order 5; the actual CI base is used rather than reclassifying those other orders.
 
@@ -660,7 +660,7 @@ personality boundary checked: 7 substrate crate(s) clean
 There are nine production occurrences of `PendingSignals` in
 `crates/carrick-signal-core/src/policy.rs`, at lines
 375, 382, 393, 473, 474, 502, 509, 512 and 515, on both revisions.
-`git diff origin/main 7b6d15813 -- crates/carrick-signal-core/src/policy.rs`
+`git diff origin/main 9be9fa3eb -- crates/carrick-signal-core/src/policy.rs`
 prints nothing. Both file SHA-256 values are
 `34136bd1a6ae357ecd7f337947d799ae680524f0af4d337fb8d83da8a5188fea`.
 The director confirmed the claim originated in another worker's report, with

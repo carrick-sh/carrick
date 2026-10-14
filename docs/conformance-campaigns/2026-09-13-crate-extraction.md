@@ -1,7 +1,7 @@
 # Crate extraction campaign — acceptance receipts
 
 Plan: [`docs/superpowers/plans/2026-09-13-extract-carrick-vfs-and-carrick-kernel.md`](../superpowers/plans/2026-09-13-extract-carrick-vfs-and-carrick-kernel.md).
-Branch `feat/sep15-extract-vfs-kernel`, merge base `acbddc406` (main, 2026-09-15).
+Branch `feat/sep15-extract-vfs-kernel`, merge base `e63c54c2b` (main, 2026-09-15).
 
 Every receipt below is a pair: the branch binary and the UNMODIFIED merge-base
 binary, run through the same gate on the same host in the same hour, so a row is
@@ -9,9 +9,9 @@ attributed to the branch only when it fails on the branch and passes on the base
 
 ## Phase 1 receipt — `carrick-vfs` extracted (2026-09-16)
 
-| | Branch | Base (unmodified `acbddc406`) |
+| | Branch | Base (unmodified `e63c54c2b`) |
 |---|---|---|
-| Source HEAD | `401df015d` | `acbddc406` |
+| Source HEAD | `5d79ececf` | `e63c54c2b` |
 | Binary SHA-256 | `b40134ca433c87697493fd872ea7d883a663ed86b4802e5c57c675bf44cb3a39` | `fb4eceae5f5ee789d08b0a0a05b3ca0cb4775ff9aad8fe99d81993919109520e` |
 | CDHash | `1b85aadc05c4bfa985c2cf4cde67d52325336673` | `0fe4b0f2e3bbad8300aa53d36c66f36dfa867828` |
 | LC_UUID | `B37609B0-55EE-39C6-94A8-EC78C3EF38AA` | recorded in the base log |
@@ -52,7 +52,7 @@ this host today for those rows. Image digests (`ltp:arm64` `bc75ded4…`,
 `carrick-go-conformance:1.24` `357a0879…`) match every other worktree's
 recorded digests, so the images are not the variable. Not investigated further
 here: it is outside the branch's scope and needs the owner's attribution on
-`main` (the 2026-09-14 ecosystem run on `7142d2438` reported 0 regressions).
+`main` (the 2026-09-14 ecosystem run on `e9d422558` reported 0 regressions).
 
 ### `just conformance-probes`
 
@@ -79,15 +79,15 @@ No regression attributable to the Phase 1 extraction on any gate. The environmen
 
 ## Phase 2 receipt — `carrick-kernel` extracted (2026-09-17)
 
-| | Branch | Base (unmodified `acbddc406`) |
+| | Branch | Base (unmodified `e63c54c2b`) |
 |---|---|---|
-| Source HEAD | `bbd668760` | `acbddc406` |
+| Source HEAD | `dbb0b2588` | `e63c54c2b` |
 | Binary SHA-256 | `52a37d5bd0040bf18fd072d597b88aca43ed184f8fd32ced2ccb0db6cd58b2e6` | `fb4eceae5f5ee789d08b0a0a05b3ca0cb4775ff9aad8fe99d81993919109520e` (Phase 1 base run) |
 | CDHash | `755edd315f27d07b1aef59bf37ee8104cc316d16` | `0fe4b0f2e3bbad8300aa53d36c66f36dfa867828` |
 | LC_UUID | `BE0EC741-FBF2-337F-B7B7-767534A54E6F` | recorded in the base log |
 | Hypervisor entitlement / `__dof_carrick` | present / 1 | present / 1 |
 | Product proof | `strings target/release/carrick` names `NullHostSignal`/`NullTimerFiring`/`TestCarrierProcess` 0 times and `carrick_kernel` 18 times | n/a |
-| Run ids | `p2accept-92354` (layering, conformance, probes, embed), `bisect-*`, `rate-*` | `baseaccept-57012` (Phase 1), `rate-acbddc406-*` |
+| Run ids | `p2accept-92354` (layering, conformance, probes, embed), `bisect-*`, `rate-*` | `baseaccept-57012` (Phase 1), `rate-e63c54c2b-*` |
 | Host state | no sibling builds or guests, Docker VM idle | same |
 
 ### Gates
@@ -104,9 +104,9 @@ No regression attributable to the Phase 1 extraction on any gate. The environmen
 
 | Row | Gate verdict | Attribution |
 |---|---|---|
-| `cpython-multiprocessing_spawn` | TIMEOUT `[blocked]` (132 s vs 61 s oracle) | MATCH 350/350 at all six Phase 2 task-boundary builds (401df015d, 235879e1b, 62416be17, 511f5a228, 3923f201c, bbd668760): the gate row was load. |
+| `cpython-multiprocessing_spawn` | TIMEOUT `[blocked]` (132 s vs 61 s oracle) | MATCH 350/350 at all six Phase 2 task-boundary builds (5d79ececf, 7285dbe66, 8340c6141, 6233056b9, 0710aa9f6, dbb0b2588): the gate row was load. |
 | `ltp-mq_notify01`, `ltp-mq_notify03` | TIMEOUT `[blocked]` | MATCH 7/7 at every bisect sample and in 29 of 30 rate samples (one `[starved]`, one `[blocked]` at the Phase 2 head across 40+ samples): load. |
-| `ltp-ptrace11` | REGRESSION (carrick 1/2: the traced init's child dies with "configuration refused: HVPatch child selector is stale") | **Pre-existing on unmodified main.** Ten-sample failure counts: base `acbddc406` 4/10, Phase 1 head `401df015d` 8/10, Phase 2 head `bbd668760` 7/10; every Phase 2 bisect point flakes (1, 2, 3, 3, 0, 1 of 3). Phase 2 did not change the rate. Whether Phase 0's retired-lane deletion (Task 0.3) raised it is measured by a 30-sample pass at base and Phase 2 head: base `acbddc406` **5/30**, Phase 2 head `bbd668760` **2/30** — the branch did not raise the rate. The race is reported to the owner as a pre-existing main defect.. |
+| `ltp-ptrace11` | REGRESSION (carrick 1/2: the traced init's child dies with "configuration refused: HVPatch child selector is stale") | **Pre-existing on unmodified main.** Ten-sample failure counts: base `e63c54c2b` 4/10, Phase 1 head `5d79ececf` 8/10, Phase 2 head `dbb0b2588` 7/10; every Phase 2 bisect point flakes (1, 2, 3, 3, 0, 1 of 3). Phase 2 did not change the rate. Whether Phase 0's retired-lane deletion (Task 0.3) raised it is measured by a 30-sample pass at base and Phase 2 head: base `e63c54c2b` **5/30**, Phase 2 head `dbb0b2588` **2/30** — the branch did not raise the rate. The race is reported to the owner as a pre-existing main defect.. |
 
 ### Verdict
 
@@ -114,9 +114,9 @@ No regression attributable to the Phase 2 extraction on any gate. The kernel cra
 
 ## Final-head receipt — main merged, review fix wave landed (2026-09-17)
 
-The Phase 2 receipt above was recorded on `bbd668760`. After it, the branch merged `main` (`984f96545`, 29 commits: typed wait sources, the POLLNVAL fix, conformance budget-kill and the wedge watchdog), took the final whole-branch review's fix wave (`4da1de3c5..ce6dc16f6`, twelve commits: docs drift, the layering rule for `carrick-vfs`, the two gates in hosted CI, the stale conformance-harness binary, Python unit tests under `lint-domains`, `begin_pt_pause` off the public surface, the interim errno aliases, kernel test fixtures out of feature-compiled modules, `HvfGuestTimers` as an instantiation of `TimerCoreBridge`, the retired host-process wait family deleted, the example crate's unused `test-support` edge), and re-ran every signed gate on `ce6dc16f6` (run `finalaccept-14108`).
+The Phase 2 receipt above was recorded on `dbb0b2588`. After it, the branch merged `main` (`3275abba4`, 29 commits: typed wait sources, the POLLNVAL fix, conformance budget-kill and the wedge watchdog), took the final whole-branch review's fix wave (`302586ebe..738e35399`, twelve commits: docs drift, the layering rule for `carrick-vfs`, the two gates in hosted CI, the stale conformance-harness binary, Python unit tests under `lint-domains`, `begin_pt_pause` off the public surface, the interim errno aliases, kernel test fixtures out of feature-compiled modules, `HvfGuestTimers` as an instantiation of `TimerCoreBridge`, the retired host-process wait family deleted, the example crate's unused `test-support` edge), and re-ran every signed gate on `738e35399` (run `finalaccept-14108`).
 
-| | Head `ce6dc16f6` (conformance tier) | Head `ce6dc16f6` (relinked for probes/embed) |
+| | Head `738e35399` (conformance tier) | Head `738e35399` (relinked for probes/embed) |
 |---|---|---|
 | Binary SHA-256 | `6f1a442457f57a51c16b6696869d4aae03dac6774577cb5a56a3353ea1c15c19` | `83b6a0ff046f9acd…` (same source; `just test-embed` re-signs through the shipped post-link path) |
 | CDHash | `7a33074c755350f91f0ea02f1b15742ee57496a3` | recorded in the acceptance log |
@@ -143,7 +143,7 @@ Sixteen are the base set recorded in the Phase 1 receipt: the thirteen REGRESSIO
 | Row | Gate verdict | Attribution |
 |---|---|---|
 | `ltp-flock03` | REGRESSION, carrick `Empty`: guest abort "carrick-kernel arena creation failed: Too many open files in system (os error 23)" | Host `ENFILE` under the concurrent gate; MATCH 3/3 serially on the same binary. Load. |
-| `ltp-fork14` | REGRESSION 0/1: LTP's own 30 s timeout ("Test killed! (timeout?)") | The base's `[blocked]` hang, now cut by LTP's internal timeout before the harness deadline (main's harness change). FAIL 3/3 serially on the head binary and TIMEOUT `[blocked]` on the `bbd668760` binary. Pre-existing. |
+| `ltp-fork14` | REGRESSION 0/1: LTP's own 30 s timeout ("Test killed! (timeout?)") | The base's `[blocked]` hang, now cut by LTP's internal timeout before the harness deadline (main's harness change). FAIL 3/3 serially on the head binary and TIMEOUT `[blocked]` on the `dbb0b2588` binary. Pre-existing. |
 | `ltp-ptrace11` | REGRESSION 1/2 ("HVPatch child selector is stale") | The pre-existing race measured in the Phase 2 receipt; 1 of 3 serial samples here. |
 
 ### Verdict
@@ -152,6 +152,6 @@ No gating row is attributable to the merge of main or to the fix wave. The branc
 
 ### Head after the acceptance
 
-Two commits follow `ce6dc16f6`: `5703b27c2` (four cosmetic re-review follow-ups: a dangling `cfg_attr`, two comments, four test-only helpers narrowed to `pub(crate)`) and `9d5cc2b49` (the host-authority capture re-taken at a published `source_head`, rows and `rows_sha256` unchanged). No product behaviour changes, so the full tier was not re-run; the signed fast gates were re-bound to the head binary (run `headgate`): `just build` exit 0, SHA-256 `ca7c830ef5d0056c3c715fb4ed7a3fb5e95d6b06103ea2e0c4813befa229b83e`, CDHash `f657d8bf036468e9a682cedc546451b317a1f583`, `__dof_carrick` 1, entitlement present, 0 test-double strings; `scripts/conformance/smoke-two-process.sh` exit 0; `just conformance-probes` exit 0.
+Two commits follow `738e35399`: `48bb5641a` (four cosmetic re-review follow-ups: a dangling `cfg_attr`, two comments, four test-only helpers narrowed to `pub(crate)`) and `2eb840cfb` (the host-authority capture re-taken at a published `source_head`, rows and `rows_sha256` unchanged). No product behaviour changes, so the full tier was not re-run; the signed fast gates were re-bound to the head binary (run `headgate`): `just build` exit 0, SHA-256 `ca7c830ef5d0056c3c715fb4ed7a3fb5e95d6b06103ea2e0c4813befa229b83e`, CDHash `f657d8bf036468e9a682cedc546451b317a1f583`, `__dof_carrick` 1, entitlement present, 0 test-double strings; `scripts/conformance/smoke-two-process.sh` exit 0; `just conformance-probes` exit 0.
 
 Owner-facing items that predate this branch and are not fixed by it: unmodified main fails 25 conformance rows and 4 embed tests on this host (Phase 1 receipt); `ltp-ptrace11`'s "HVPatch child selector is stale" race; `ltp-fork14`'s hang; the `platform-linux` `carrick-runtime` crate does not compile (41 errors in untouched files); `just check-freebsd` needs the FreeBSD sysroot (CI's cross job has it); main's `wedge_capture.rs` followed `deadlock_watchdog` into `carrick-kernel` and shells out to `sudo -n lldb` from the kernel crate; main's `finish_and_run_image_owned` no longer arms the deadlock watchdog.

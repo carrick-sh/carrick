@@ -1,6 +1,6 @@
 # N1 fork refusal audit after closed child-root publication
 
-The retained signed trace at `1dfba1500` reaches root phase 9 for child MM 3,
+The retained signed trace at `064cfa0e7` reaches root phase 9 for child MM 3,
 then exits before runtime phase 3 (`ProcessSpec`). Runtime phase 2 precedes
 `publish_owner_child_address_space`; phase 3 follows `ops.prepare` and parent
 COW arming in `prepare_in_process_fork`. The trace has no raw guest errno.

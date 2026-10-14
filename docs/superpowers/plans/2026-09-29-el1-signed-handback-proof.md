@@ -48,7 +48,7 @@ EL1 record. No speculative production ownership fix is proposed by this brief.
 
 ## Initial feasibility result
 
-The first signed two-process workload (200 rounds) on `497096b2f` completed
+The first signed two-process workload (200 rounds) on `8ec75d8a5` completed
 but captured zero records, so the feasibility test failed. Preserve that
 result; do not expand iterations or retry. The hook's VM-free boundary tests
 pass, including slot/publisher lock release. Real guest triggering remains

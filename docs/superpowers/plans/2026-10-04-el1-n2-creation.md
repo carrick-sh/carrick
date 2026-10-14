@@ -1,7 +1,7 @@
 # N2: serve process and thread creation in EL1
 
 Execution plan, 2026-10-04. Planning complete; implementation and signed
-acceptance are not claimed. Base: `fda4e0350a86f9099d8dbf8383e01a0607a55928`.
+acceptance are not claimed. Base: `ddd56dfd895247e92919e8118d4c40a07e336f01`.
 This is N2 in the owner-adopted [N0–N4 order](2026-10-02-el1-native-ownership.md),
 not a replacement for N1 or N3. It targets spawn **8.448x** and fork+exec
 **6.700x** native arm64 Docker; thread creation is already **1.546x** in the
@@ -320,7 +320,7 @@ fd-core/pipe-core tests and core algorithms, graph work in
 `carrick-kernel/src/kernel/{operations.rs,operations/thread.rs,operations/wait.rs,operations/exit.rs,thread_ledger.rs,exec.rs}`,
 and signal policy extraction from `kernel/objects/signal.rs` into the existing
 `carrick-signal-core/src/lib.rs` plus new personality adapter files. These paths are
-absent from `git diff --name-only fda4e0350 origin/work/n1`. New core files can
+absent from `git diff --name-only ddd56dfd8 origin/work/n1`. New core files can
 be prepared, but publication/wiring waits; coordinate Phase B's overlapping
 lifecycle ownership separately. File-disjoint means preparable, not
 independently acceptable without N1.
@@ -374,7 +374,7 @@ GPL implementations.
 
 #### Landing A: VM-free witness receipt (2026-10-04)
 
-Prepared on `work/n2a-witness` from main `b148d69eb`, on the dedicated
+Prepared on `work/n2a-witness` from main `b4baca05c`, on the dedicated
 x86_64 Linux VM. Only the two new test files and this section change. No
 product routing, contract registry, observability, CLI or DTrace edits; the
 creation contract remains N1-owned until handoff. Linux authority is the
@@ -707,7 +707,7 @@ section 3; no new graph, lock, host timer or scheduler is supplied here.
 
 #### D-prep handoff
 
-Preparation on `work/n2d-prep`, base `652e0dcde`, changes only VM-free tests
+Preparation on `work/n2d-prep`, base `8391edd89`, changes only VM-free tests
 and this subsection. It does not move task ownership. Contracts are
 creation-native-path, thread-lifecycle, child exit notification and scheduler
 lifecycle. No product hook or substitute task graph was introduced.
@@ -789,7 +789,7 @@ n2_task_transactions` (12 passed, four documented budget reds ignored),
 `just test-kernel`, scoped Clippy for both changed crates and `just fmt-check`
 exit zero. Explicit budget-red execution exits 101 as recorded above.
 Workspace `just clippy` produces the same 518 runtime diagnostics on this
-Linux branch and a clean `origin/main` (`652e0dcde`); both logs were compared.
+Linux branch and a clean `origin/main` (`8391edd89`); both logs were compared.
 The director substituted these local checks for the not-yet-landed
 `linux-portable` accept profile. Exact-commit remote host acceptance and its
 receipt are reported separately in the worker handoff.

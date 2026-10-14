@@ -20,7 +20,7 @@ unrelated work and do not push.
 ## Start here
 
 Worktree: `/Volumes/CaseSensitive/carrick`, branch `main`.
-Last implementation/evidence commit before this handoff: `97377eb64`.
+Last implementation/evidence commit before this handoff: `87805dc50`.
 Read `AGENTS.md`, the conformance-contract, carrick-trace and ltp-conformance
 skills, and `docs/perf-results/2026-09-20-hvpatch-syscall-portal/assessment.md`.
 The assessment preserves the actual sequence and rejected alternatives; do not
@@ -55,26 +55,26 @@ the last micro-optimization was only about 1% and is not the main answer.
 
 ## Recent commits and impact
 
-- `ccc42d7ad`: reuse owned inode identity for sparse-write bookkeeping; removed
+- `a2c576fc7`: reuse owned inode identity for sparse-write bookkeeping; removed
   hundreds of thousands of redundant fstats in the diagnostic. Previous
   write/seek measurement improved about 7%; full inotify09 still timed out.
-- `aea6ecb76`: reconciled service timing and native Linux bpftrace baseline.
-- `25415c7b7`: CPU attribution evidence and explicit limits.
-- `e11b87dbf`: restored live-oracle public probe gate for the pre-fix artifact.
-- `4d8f0ac7e`: defer syscall trace task/MM identity resolution until USDT enabled.
+- `3fc04bd00`: reconciled service timing and native Linux bpftrace baseline.
+- `8365a267f`: CPU attribution evidence and explicit limits.
+- `14583ff81`: restored live-oracle public probe gate for the pre-fix artifact.
+- `5be70ff3a`: defer syscall trace task/MM identity resolution until USDT enabled.
   Regression was red (one resolution instead of zero), then green; all 83
   observability tests and 24 VM-free kernel-example contracts passed. Balanced
   uninstrumented ABBA: 2 warmup + 20 measured blocks, 40 samples/artifact,
   after/before median block ratio 0.989704, bootstrap 95% CI [0.982084, 0.992882].
   Signed enabled trace reconciled 512,636 services, no open windows/join errors.
-- `97377eb64`: native macOS control mode and new artifact's public probe receipt.
+- `87805dc50`: native macOS control mode and new artifact's public probe receipt.
   Non-Linux invocation without write-seek-only fails before Linux syscall
   numbers execute; that negative control passed. All final control runs passed.
 
 ## Current artifact and gate evidence
 
-`target/release/carrick` was built with `RUSTC_WRAPPER= just build` from e11b87dbf
-plus the production changes now committed in 4d8f0ac7e. Later commits change
+`target/release/carrick` was built with `RUSTC_WRAPPER= just build` from 14583ff81
+plus the production changes now committed in 5be70ff3a. Later commits change
 only diagnostics/docs; no later runtime relink occurred.
 
 - SHA-256: `a05fb6c4c3dfb6329ff4195f29d86109a8a82e99d1cfda848f450b2bb768d424`

@@ -173,10 +173,10 @@ Each fact names where it was verified. A worker who finds one false stops and
 reports; the plan is not valid under a different fact.
 
 1. **The pause fix has landed.** `director/fault-pause-deadline` was rebased onto
-   main as `c245596fe` (kick delivery at the EL0 boundary), `4eaf06af5`, `fdb75f7ac`
+   main as `665160bf0` (kick delivery at the EL0 boundary), `5d5c925bf`, `a2e44cf28`
    (contracts `kernel.mm.pt-pause-drain-acknowledgement`,
-   `kernel.vcpu.kick-el0-boundary`), `854eeff8b`, `08c239bf4`, `3dd2fdcb3`,
-   `b91d830ec`. This plan builds on its names: `crate::trap::HVF_VIRTUAL_IRQ`
+   `kernel.vcpu.kick-el0-boundary`), `459f9d5e6`, `e2754c3e2`, `9b7613a8e`,
+   `029a00a35`. This plan builds on its names: `crate::trap::HVF_VIRTUAL_IRQ`
    (trap.rs:6090), `carrick_aarch64::owed_kick::OwedKick`
    (`absorb`/`rearm`/`settle`), `Aarch64Vcpu::set_pending_irq` and
    `Aarch64Vcpu::injects_kick_irq` (carrick-aarch64/src/vmm.rs:307,315), the three
@@ -379,7 +379,7 @@ reports; the plan is not valid under a different fact.
 **Files:** none modified. Produces `target/el1-1a-base/` (untracked).
 
 **Interfaces:**
-- Consumes: main at or after `b91d830ec`.
+- Consumes: main at or after `029a00a35`.
 - Produces: `target/el1-1a-base/carrick` (signed base binary for paired runs),
   `target/el1-1a-base/artifact.txt` (source HEAD, SHA-256, CDHash, LC_UUID,
   entitlement, `__dof_carrick`), `target/el1-1a-base/ltp.jsonl` and
@@ -389,7 +389,7 @@ reports; the plan is not valid under a different fact.
 
 ```bash
 cd /Volumes/CaseSensitive/carrick/.worktrees/el1-inotify-r5
-git merge-base --is-ancestor c245596fe HEAD && echo PAUSE_FIX_PRESENT
+git merge-base --is-ancestor 665160bf0 HEAD && echo PAUSE_FIX_PRESENT
 git status --short | wc -l
 grep -n "pub(crate) const HVF_VIRTUAL_IRQ" crates/carrick-vmm-hvf/src/trap.rs
 grep -n "pub struct OwedKick" crates/carrick-aarch64/src/owed_kick.rs
@@ -2291,7 +2291,7 @@ Append to `.semgrep/typed-domains.yml` `rules:`:
   # reverse of the SDK (hv_vcpu_types.h: IRQ = 0, FIQ = 1). Naming a line by
   # the binding's variant asserted the FIQ line, which Carrick masks at every
   # level: kicks were silently lost and page-table drains timed out
-  # (c245596fe). Every line is named through HvfInterruptLine.
+  # (665160bf0). Every line is named through HvfInterruptLine.
   - id: carrick-hvf-interrupt-line-outside-boundary
     languages: [rust]
     severity: ERROR
@@ -2433,7 +2433,7 @@ refactor(hvf): name interrupt lines through one typed SDK mapping
 
 Why: applevisor-sys 1.0.0 numbers hv_interrupt_type_t in reverse of the
 SDK, and naming a line by the binding's variant already shipped one
-silent kick-loss defect (c245596fe). The fix lived in one constant;
+silent kick-loss defect (665160bf0). The fix lived in one constant;
 nothing stopped the next call site from repeating it, and GIC adoption
 adds call sites.
 
@@ -5690,7 +5690,7 @@ pub fn el1_irq_mode() -> carrick_mem::memory::El1IrqMode {
         // Today's served path, byte for byte: the lines from
         // `// Restore SP_EL1 to mailbox pointer` through the served-path
         // `emit(bytes, &mut cursor, 0xD69F_03E0); // eret`
-        // (memory.rs:4542-4575 at b91d830ec), moved here unchanged.
+        // (memory.rs:4542-4575 at 029a00a35), moved here unchanged.
     }
 ```
 
@@ -6456,7 +6456,7 @@ record what was applied only in part or rejected, one line each.
 - Typed `GicAffinityLease` (safety, major): not adopted for the same reason; the lock-held release closes the race it targets without adding a value to thread through nine creation sites.
 - Fact 9 first (safety, major): the experiment moved to Task 0B; "drop the kick tail if Fact 9 is refuted" is rejected, because once the window unmasks IRQs it acknowledges the kick SGI, so EL1 must surface that kick whatever Fact 9's verdict.
 - Load-dependent verdicts (safety, major): applied; C1's 5 s wedge bound is a hang detector that AGENTS.md requires of every wait, not a verdict rate.
-- Detector for a kicked vCPU that never surfaces (safety, major, kick liveness at scale): not added as a new probe; `scripts/dtrace/hvpatch-pt-pause-drain-stall.d` (commit 854eeff8b) already names each sibling still in the guest for a drain of 100 ms or more, and D11's mixed row calls for it.
+- Detector for a kicked vCPU that never surfaces (safety, major, kick liveness at scale): not added as a new probe; `scripts/dtrace/hvpatch-pt-pause-drain-stall.d` (commit 459f9d5e6) already names each sibling still in the guest for a drain of 100 ms or more, and D11's mixed row calls for it.
 - `hvf_gic_enabled` in carrick-mem (safety, major): moved to the one reader in `gic.rs`, with the vector mode passed as an argument; the extra fail-closed assertion at VM creation was not added, because both sides now derive from the same `OnceLock` and cannot differ within a process.
 - Vehicle before GIC (safety, blocker): landed as one Task 5+6 commit with a signed red, the facts finding's alternative; a vehicle-only commit would need an `InterruptModel::Gic` variant that nothing can construct, which `-D warnings` rejects as dead code.
 - Stage-1 window guard (safety, minor): placed in `PageTableManager`'s three output-writing paths (`map_aliased_with_flags`, `repoint_preserving_attributes`, `apply`'s identity rebuild) rather than in `Stage1Authority`, which owns the manager but writes no descriptor.

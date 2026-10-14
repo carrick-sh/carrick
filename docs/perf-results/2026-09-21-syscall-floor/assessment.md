@@ -23,7 +23,7 @@ because it has a faster microbenchmark.
 
 ## Current baseline evidence
 
-The frozen signed baseline is source `9bb2392396b8531e93f5262657bf3aa9c5767488`,
+The frozen signed baseline is source `6914b312cb07b7b72aeb99cc86a861f44bec704f`,
 SHA-256 `726c6848cf145e2aa0474cb7b12189da08ad77931b620c243654e9a4690509c9`.
 The reducer was freshly built; its exact executable and image hashes, commands,
 and raw results are preserved beside this assessment. The worktree also contains
@@ -71,7 +71,7 @@ times are not performance measurements.
    Extending local completion needs exact authority, revocation, and policy
    checks. The in-progress alias regression demonstrates why a speculative
    shared-offset mirror cannot qualify solely on speed.
-3. DSR's native backend was removed by `cc7d9eaa2a4ce61eab7b9daa59a4452f13a1d482`.
+3. DSR's native backend was removed by `f9933c9da338cc34076fc0180e7d301e7f7dd214`.
    Its implementation is available in Git history; historical design documents
    do not describe a currently selectable backend. Prior 0.2–0.3 microsecond
    identity-call measurements in `../native-dsr-syscall-floor.jsonl` establish
@@ -545,7 +545,7 @@ no commit or push was made, and the full near-native goal remains active.
 
 ## DSR scope check and refreshed Node attribution
 
-Inspection of the removed DSR implementation at `cc7d9eaa2^` confirms that the
+Inspection of the removed DSR implementation at `f9933c9da^` confirms that the
 native register envelope omits real backend work: `carrick-native-darwin`'s
 `carrick_native_dsr_enter_guest_abi` manages active context, deferred kicks and
 custom-x18 host ABI state; `carrick-dsr-aarch64` rewrites guest memory operands

@@ -1,4 +1,4 @@
-Implement the next EL1 checkpoint dependency in the dedicated checkout /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick, clean at bc5500391a333f9f78daf63a0224b04ec98bba8c. This is a NEW allocator/grant task, not another review round of metadata-refusal. Do not reopen that worker's exhausted review loop.
+Implement the next EL1 checkpoint dependency in the dedicated checkout /Users/tjfontaine/.codex/worktrees/el1-memory-corrections/carrick, clean at 422682443e55ca7dcc8f363dd6d932c4033d5eb7. This is a NEW allocator/grant task, not another review round of metadata-refusal. Do not reopen that worker's exhausted review loop.
 
 Read AGENTS.md (and any CLAUDE.md import), .agents/skills/carrick-conformance-contract/SKILL.md, docs/superpowers/specs/2026-09-24-el1-kernel.md, docs/superpowers/plans/2026-09-26-el1-completion.md, and the director-written docs/superpowers/plans/2026-09-26-el1-elastic-metadata.md before editing. The accepted design calls for a goal brief (outcome, constraints, acceptance), not a speculative step script. The user has already authorized execution of the whole migration; do not stop for generic workflow approval.
 

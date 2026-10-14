@@ -169,7 +169,7 @@ inotify09 or common-workload acceptance.
 ## Provenance
 
 Worktree: `/Users/tjfontaine/.codex/worktrees/inotify-lease-cost/carrick`.
-Source HEAD: `9bb2392396b8531e93f5262657bf3aa9c5767488` plus the
+Source HEAD: `6914b312cb07b7b72aeb99cc86a861f44bec704f` plus the
 [13-file continuation patch](implementation.patch). The
 [manifest](manifest.json) records final source, exact diagnostic executable,
 fixture, test and frozen-control identities. Source archives preserve this

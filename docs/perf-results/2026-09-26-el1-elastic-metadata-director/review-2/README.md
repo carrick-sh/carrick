@@ -1,6 +1,6 @@
 # Allocator review round 2: real guest path remains incomplete
 
-Candidate dc2b83706 (exact identity in candidate.json), clean when reviewed.
+Candidate c9a401a50 (exact identity in candidate.json), clean when reviewed.
 All eight prescribed host checks independently pass; results and raw logs are
 in verification/. An unchanged-core screen confirms alignment64 and grant
 sizing are corrected (exit0). These close the two earlier narrow findings.

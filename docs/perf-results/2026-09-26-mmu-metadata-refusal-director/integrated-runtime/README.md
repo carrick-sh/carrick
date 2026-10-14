@@ -1,6 +1,6 @@
 # Integrated runtime refusal conversion
 
-Compiler capture on c697c35fa failed with E0004: clone TID publication's
+Compiler capture on b067e3d38 failed with E0004: clone TID publication's
 MemoryError diagnostic match omitted MetadataAllocation. This is an actual
 integration compile failure, not semantic red evidence. The four-package
 worker checks did not compile this runtime caller.

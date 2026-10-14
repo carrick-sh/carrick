@@ -131,7 +131,7 @@ The final archive SHA-256 is
 
 The director-approved main control `10e41549e0e27546e0b536a7ada847e8c10365d7`
 contains only fixture, test and xtask fixture-plumbing changes over product
-baseline `dfc9100e277339016f537ba09e2b475470c953b6`. Its runtime, memory,
+baseline `75369d8ab8373439ce9d77e606e99515d50b7e0b`. Its runtime, memory,
 HVF, kernel, EL1, ABI, personality, engine and CLI product sources are unchanged.
 The published archive verifies 1,135 executables with clean input admission.
 Its GNU guest ELF has the identical SHA-256 recorded above.

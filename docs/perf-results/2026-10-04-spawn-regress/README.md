@@ -21,7 +21,7 @@ rebuilding or resigning; hashes were checked again after the measurements.
 
 | Identity | Base | Phase B candidate |
 | --- | --- | --- |
-| Build source HEAD | `5e23be1a2a09eaa098149ae3997280a80b74b9a0` | `1e61be8e8cf8a0320e764e363031261c46059f40` |
+| Build source HEAD | `40dcaf32d265635cad29306b22d2cf373fb50701` | `87944f63d0ab67f6549e4f94c04840839f673715` |
 | Build source tree | `56407acdfdb4aa479a27636c2583203a9125af6d` | `116a8b630eb3a4bb79d76dd60f56551b802d9685` |
 | SHA-256 | `00eacdb4e063903ba99e7b1ca9198650693dacbba39f2fdc3a32aea337ea079b` | `61c6126f25baed039db04a8afd20f2e59498e59224beafe7013b1d05a4d6c9a4` |
 | CDHash | `c9c247453fecdfefd6d65135b79a707845a63bc5` | `9fe8df0059bf729f61f3944904d2c75908d85d9f` |
@@ -198,7 +198,7 @@ runs in this session.
 
 For a future single-variable comparison, the detached worktree
 `../spawn-regress-fixed-pb` is at `0661cbe3b`: exactly Phase B candidate
-`1e61be8e8` plus runtime fix `74f9f63aa`. Its copied build cache still contains
+`87944f63d` plus runtime fix `74f9f63aa`. Its copied build cache still contains
 the **old, unfixed candidate executable**. The attempted signed rebuild was
 canceled while waiting for a shared lease, before the build. It must be rebuilt
 and signed under `just lease carrick` before use. Preserve the original base

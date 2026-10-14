@@ -1,6 +1,6 @@
 # Open defect: host publication precedes producer completion
 
-Source: `85abe62cf` (`99c8cd5ac` implementation, `40a707ba0` signed source).
+Source: `a3919194a` (`9857a300c` implementation, `98621f69e` signed source).
 The retained patch adds two VM-free tests to the existing scheduler-core
 fixtures; no product source is changed in this diagnostic receipt. Apply it
 with `git apply` and run each named test using
@@ -41,7 +41,7 @@ reconstructible; it is an explicit red acceptance blocker, not a skipped
 or expected-failure test. Promote the witnesses into the test suite with
 the ownership correction and update the contract's bindings.
 
-The source on local main `f304f8415` also publishes Host before unlinking;
+The source on local main `7fd243eb1` also publishes Host before unlinking;
 no main-runtime reproduction or historical Python/otmp attribution is claimed.
 The 49 passing signed regressions predate this newly reduced red and do not
 close it.

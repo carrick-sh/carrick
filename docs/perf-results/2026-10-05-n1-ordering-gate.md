@@ -2,7 +2,7 @@
 
 **Not review-ready.** Tested source is
 `d7151718089625289b6665546e0bc10da8b5f3ab`, rebased onto batch-six main
-`b2e77e2ff`. Copyout passes **10/10**, both hellos pass, and all cleanup is
+`65ac260fe`. Copyout passes **10/10**, both hellos pass, and all cleanup is
 zero. The six comparisons still have functional failures; these are not
 equivalent to main's serving/exit-budget reds. This receipt and its diagnostic
 overlay do not change the tested executable source.
@@ -79,7 +79,7 @@ comparison tests returned 101:
 | `thread_lifecycle_spawn_slope` | Guest fork fails. |
 
 The historical main comparison is the table in the
-[batch-five receipt](2026-10-04-n1-batch5-gate.md), source `51bfe67f4`.
+[batch-five receipt](2026-10-04-n1-batch5-gate.md), source `bb24853c2`.
 Its cloudmac raw path no longer exists; no fresh main control was run or
 claimed. Four fixtures still fail before main's completing fork workloads;
 anonymous advances past its first-scale assertion but introduces a later-root

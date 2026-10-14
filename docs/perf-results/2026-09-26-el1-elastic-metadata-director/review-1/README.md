@@ -1,6 +1,6 @@
 # Allocator review round 1 — acceptance withheld
 
-Candidate: ae6c3a17b (full identity in candidate.json), clean when reviewed.
+Candidate: 0dcc87b33 (full identity in candidate.json), clean when reviewed.
 All eight original prescribed commands independently exit zero; exact commands
 and raw logs are in verification/. Two unchanged-core screens still fail with
 exit 101: requested pointer alignment64 yields remainder32, and a payload-only

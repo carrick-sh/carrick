@@ -1,6 +1,6 @@
 # Final metadata refusal review and director correction
 
-Worker 68bb6dc79 completed its third and final review round. Its five host
+Worker 00257b5d5 completed its third and final review round. Its five host
 commands pass independently, and the real >8-arena publication refusal now
 flows through production converters under an allocator refusal guard.
 However, source still contained the old fitted admission caps despite the

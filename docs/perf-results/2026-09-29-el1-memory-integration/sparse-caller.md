@@ -1,6 +1,6 @@
 # Local sparse publication through the descriptor service
 
-Parent source: `cdb5abd64`. Contract: `kernel.el1.stage1-publication`.
+Parent source: `e16ca9cf9`. Contract: `kernel.el1.stage1-publication`.
 The production local `sparse_materialization::publish_replacing` caller now
 publishes authenticated backing through the existing driving-vCPU service.
 Protocol v6 adds typed Deferred alias access: retained output remains invalid,

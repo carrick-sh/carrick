@@ -2,8 +2,8 @@
 
 The fresh [ptrace-batch ledger](2026-09-17-ptrace-wait-batch.md) ranked CPython
 bufio at 5.47x Docker among completed workloads. Isolated measurement on the
-same signed artifact (`36cf56ae...`, source `8b54551fa`, documentation HEAD
-`4925ecdad`) passed at 1,275 ms versus fresh native ARM64 Docker 405 ms (3.15x).
+same signed artifact (`36cf56ae...`, source `d88926da3`, documentation HEAD
+`d944b3be5`) passed at 1,275 ms versus fresh native ARM64 Docker 405 ms (3.15x).
 These discovery timings are not controlled performance claims.
 
 ## Reproduction and diagnosis
@@ -53,9 +53,9 @@ not make normalization-equivalent names coexist on APFS; that pre-existing
 representation limitation remains.
 
 Antigravity read-only review independently identified the same whole-directory
-scan and per-sibling stat amplification. The implementation is committed locally as `089830e95` (tests) and
-`592273159` (fix), with inventory positions and portable test imports in
-`5b4a20661`. An independent read-only review found no defects. The director
+scan and per-sibling stat amplification. The implementation is committed locally as `1bdbbec04` (tests) and
+`167f903e4` (fix), with inventory positions and portable test imports in
+`f2029ea7a`. An independent read-only review found no defects. The director
 replayed both red tests: the kernel case visited 101 entries and the VFS owner
 case visited 201. Five semantic cases passed before the fix; all six kernel
 cases pass afterward. The new backend can now install a public FsBackend
@@ -71,7 +71,7 @@ output. A sandboxed pre-fix build was blocked by DTrace code generation; the
 unsandboxed replay produced the expected structural failures.
 
 Signed probe and smoke validation passed; full closure remains red. The frozen
-candidate source is `5b4a206617d7de31fb74725e68db5b29c0997d3b`, SHA-256
+candidate source is `f2029ea7ae04fc081bf0bf82d4b55dda8c84ccbb`, SHA-256
 `1f03f7fd5eb215ae99382bacc2014cd8e18b819a837c53ca0dcc00dae76f9656`, CDHash
 `d9efcc76f474aa13f58b91f48fc842aac4c6d559`, LC_UUID
 `6B46AFD4-4806-3308-9B75-34CC72AE3A39`. The hypervisor entitlement, strict

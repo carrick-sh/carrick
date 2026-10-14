@@ -1,6 +1,6 @@
 # M1 contract preparation (no functional cutover)
 
-Baseline: `e59eec4e4e63f187f81d1f954a0f2c53b797edb8`.
+Baseline: `4fa423e274ead8a450777f35ecf6a6a259bfb7a8`.
 Production behavior is unchanged. Phase B settlement and step-2 memory remain
 prerequisites. No Docker, signed guest, runtime ratio or migration acceptance
 is claimed. All new witnesses are VM-free; no new executable probe is added.

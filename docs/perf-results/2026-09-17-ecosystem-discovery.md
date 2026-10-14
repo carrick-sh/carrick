@@ -9,7 +9,7 @@ The approved follow-up is recorded in [the socket conformance batch](2026-09-17-
 
 ## Measurement and evidence
 
-- Source: `00fb0920b` (full revision in the evidence directory).
+- Source: `3dcf9179e` (full revision in the evidence directory).
 - Fresh signed product build and explicit release conformance-harness build.
 - Carrick SHA-256: `2b257700adc2db54eaae2e78c4b0e03d58a79cf7a9b47a1e27a6e82627b15a18`.
 - Harness SHA-256: `e264c0c9725652369c9b94f707b02a6aa31030d4a9915f9beeef68a78ded50f9`.

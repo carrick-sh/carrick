@@ -25,7 +25,7 @@ retirement/reuse or historical-attribution claim.
 
 ## First signed trigger rejected
 
-Source `497096b2f`, run `el1-deferred-capture-497096b2f`: the guest completed
+Source `8ec75d8a5`, run `el1-deferred-capture-8ec75d8a5`: the guest completed
 the two-process 200-round workload, including child success, but the audit
 vector was empty. The test failed as required. This is a fixture-trigger
 failure, not an ownership red or a passing signed contract. No retry or larger

@@ -1,6 +1,6 @@
 # Fork-storm: VM-free investigation
 
-Base: `b148d69eb1135f55ab915ae6dff36c2d6c97576d`, Linux x86_64.
+Base: `b4baca05c7adb1d058726f20d95142407b719428`, Linux x86_64.
 No runtime or kernel implementation fix is claimed. The deterministic
 reductions pass on the main kernel. There is no red witness for the reported
 signed failure, so this investigation stops at a capture handoff.
@@ -246,7 +246,7 @@ witness at the implicated seam and correct its authority.
   binaries pass, then the existing
   `unix_socketpair_local_shut_rd_wakes_epoll_with_epollrdhup` fails (expected
   one epoll event, observed zero). Cargo stops before the remaining binaries.
-  The same exact test fails in a detached worktree at `b148d69eb`. The
+  The same exact test fails in a detached worktree at `b4baca05c`. The
   remaining `socket_receive`, `stdio_host_wait_contention`,
   `stdio_inherited_backpressure`, and `unicode_paths` binaries were then
   selected explicitly and all 29 tests passed.

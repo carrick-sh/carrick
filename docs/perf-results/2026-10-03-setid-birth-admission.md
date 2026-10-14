@@ -2,7 +2,7 @@
 
 ## Attribution and reproduction
 
-The isolated `setidthreadchurn` GNU probe passed 20/20 on main `fda4e0350`
+The isolated `setidthreadchurn` GNU probe passed 20/20 on main `ddd56dfd8`
 on this gate Mac. Its full generic shard and the complete three-shard signed
 generic gate also passed. This does not explain the earlier failures reported
 on main: their cause remains unproven on this box.

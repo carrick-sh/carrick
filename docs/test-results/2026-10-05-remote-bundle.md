@@ -110,7 +110,7 @@ These were VM-free macOS tests, not signed/HVF acceptance.
 ## Batch 6 rebase and combined fixture contracts
 
 PR #54 was rebased onto `github/main` at
-`b2e77e2ff2b9d1bdfe6d8d97f3ed7fbf4eb95fe2`. Prior commit authors and
+`65ac260fe2e93124790a8f7a6a401226429f6a8a`. Prior commit authors and
 trailers were preserved. Conflict resolutions and semantic reconciliation:
 
 - `fixtures.rs` Verify combines `--bundle` and its manifest conflict with

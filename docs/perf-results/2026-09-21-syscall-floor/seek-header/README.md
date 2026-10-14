@@ -153,7 +153,7 @@ these medians. Native platform I/O differences remain separately visible.
 
 ## Artifacts, restoration and remaining scope
 
-Source HEAD: 9bb2392396b8531e93f5262657bf3aa9c5767488 plus the preexisting campaign
+Source HEAD: 6914b312cb07b7b72aeb99cc86a861f44bec704f plus the preexisting campaign
 working changes. Host: Apple M4, macOS 27.2 build 26B5086k. Image:
 localhost:5050/ltp@sha256:bc75ded40c5827f2ec9e1891edc23b988beae3f428f5be2c8fd7e3ee52fee80b.
 LTP reports version 20260529.

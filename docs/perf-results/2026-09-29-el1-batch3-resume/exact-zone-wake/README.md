@@ -1,6 +1,6 @@
 # Exact deferred zone handback wakes
 
-Base `55cb799a3`. Task A remains open. The prior signed gate at `8916e1fe2`
+Base `7341d3196`. Task A remains open. The prior signed gate at `1d085f4c7`
 precedes this scheduler change and cannot certify the changed source.
 
 ## Red reduction
@@ -56,7 +56,7 @@ Clippy passed. The earlier runtime/serial receipts precede this ordering-only
 follow-up; fresh signed validation of the final scheduler source is pending.
 
 The contract coverage checker also guessed descriptor filenames from IDs,
-missing three scheduler files. `dee7f08a1` matches the actual parsed path.
+missing three scheduler files. `1e93d0c2c` matches the actual parsed path.
 Two red-first fixture cases prove both correct descriptor acceptance and
 rejection of unrelated suffix-lookalike files; all 11 checker tests pass.
 The first new fixture inherited another undeclared surface contract; its
@@ -64,13 +64,13 @@ failure is retained and the final fixtures isolate the contract they test.
 
 ## Final source and signed regression
 
-Implementation `a2c0fcee3` includes the ordering follow-up. Clean compiler
+Implementation `aee40f93e` includes the ordering follow-up. Clean compiler
 reconciliation retained all 595 authority rows unchanged; provenance is
-`257de53e0`. Final lint-domains and exact contract-change coverage from
-`55cb799a3` both passed. The authority census covers macOS only; other host
+`1cbcda5b0`. Final lint-domains and exact contract-change coverage from
+`7341d3196` both passed. The authority census covers macOS only; other host
 profiles remain pending. See lint-final.log and coverage-final.log.
 
-On source `257de53e055aeba43a70e389c209fcfb1ccf1b47`, run
+On source `1cbcda5b06261f473c9e70b1298ba22eee242f84`, run
 `el1-b3-exactwake-20260929` completed `scripts/test-signed.sh carrick-embed
 el1_ --nocapture`: 49 unique positive executions across nine artifacts,
 unentitled negative control and scoped cleanup passed. All nine current

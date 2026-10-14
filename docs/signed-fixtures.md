@@ -379,7 +379,7 @@ drift, failed metadata resolution, missing lockfiles, input-identity receipt
 fields, incomplete/duplicate inventory, wrong targets/toolchain,
 permissions, symlinks, and missing/tampered installed files. The initial
 red-first CLI test failed with `unrecognized subcommand 'fixtures'` on
-`6a33e26b2` (see the implementation commit for the exact base SHA).
+`0eee15816` (see the implementation commit for the exact base SHA).
 
 Preparation bindings run real Git checkout/cleanup, the real just recipes,
 mode-preserving archive transport and xtask restore/preflight on empty and

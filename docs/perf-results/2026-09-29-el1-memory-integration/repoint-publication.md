@@ -1,6 +1,6 @@
 # Remove the duplicate shared-repoint descriptor writer
 
-Development on adapter parent `09afdd4c5` under
+Development on adapter parent `5fa080078` under
 `kernel.el1.stage1-publication`. This removes one production host writer;
 it does not activate descriptor admission or accept checkpoint 2.
 

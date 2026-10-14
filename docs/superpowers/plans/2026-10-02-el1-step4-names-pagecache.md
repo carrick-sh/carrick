@@ -1,6 +1,6 @@
 # EL1 migration step 4: names, metadata and host-file pages
 
-Design pass, 2026-10-02. Source inspected: `4c4d06b4c345550da68b4b8cd44dfd8f6e53457b`.
+Design pass, 2026-10-02. Source inspected: `62ffec506218e9af76304e109dec4450fdbdda73`.
 This is an implementation brief, not an implementation or acceptance receipt.
 The owner has approved the migration direction. The design of record is
 [the EL1 kernel spec](../specs/2026-09-24-el1-kernel.md), including its complete
@@ -178,7 +178,7 @@ final landing. Old-artifact comparison remains available afterward; no runtime
 fallback to a retired owner. Errors, resource pressure and unsupported I/O
 shapes still use the same authority and a backend request.
 
-### 0. Stage 2a: bounded host namespace primitives (Sol) — LANDED `f1681c228` (2026-10-02)
+### 0. Stage 2a: bounded host namespace primitives (Sol) — LANDED `a581e701b` (2026-10-02)
 
 Landed with the full `just el1-gate` green; census and before/after tables in
 `docs/perf-results/2026-10-02-stage2a-scoped-census-red.md`. The text below is

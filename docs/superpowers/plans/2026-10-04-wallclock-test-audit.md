@@ -27,7 +27,7 @@ The corrected fixtures use these proofs:
    a holder in a way that can satisfy the correctness assertion.
 
 The source-hash edit to `futex-wake-exit-seed637.json` is reverted to the
-pre-conversion snapshot (`51bfe67f4`). Its existing provenance problem belongs
+pre-conversion snapshot (`bb24853c2`). Its existing provenance problem belongs
 to inventory PR #46; this PR does not rebind or weaken replay acceptance.
 
 ---
@@ -147,13 +147,13 @@ The three focused macOS `cargo test -p carrick-vmm-hvf --lib <fixture> --
 (`--no-fail-fast`) has only `schedule_replay` failing; `just
 test-kernel-semantics` also exits 101 at
 `futex_wake_exit_receipt_replays`: `replay source hash mismatch`. The fixture
-is byte-identical to `51bfe67f4`, as requested. This is an open PR #46
+is byte-identical to `bb24853c2`, as requested. This is an open PR #46
 integration gate, not a pass or an ignored test. The other converted tests
 pass after restoration. All twelve representative implementation mutations
 exit 101 through unchanged assertions or failing watchdogs.
 
 Static comparison proves every production probe section outside the internal
-read helper is byte-identical to `51bfe67f4`, including all printed oracle
+read helper is byte-identical to `bb24853c2`, including all printed oracle
 reports. No oracle refresh is necessary for changed report text because none
 changed; guest execution acceptance still belongs to the director.
 

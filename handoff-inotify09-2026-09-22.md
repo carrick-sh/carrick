@@ -59,7 +59,7 @@ experiment's exact receipt and this handoff for current state.
 ## What is in this checkpoint
 
 The campaign had remained uncommitted on base
-`9bb2392396b8531e93f5262657bf3aa9c5767488`. The checkpoint preserves its product
+`6914b312cb07b7b72aeb99cc86a861f44bec704f`. The checkpoint preserves its product
 changes, contracts, tests, non-product experiment, trace tools and archived
 receipts together. It includes syscall/metadata and inotify work, signal
 lease-gap correctness, anonymous-discard/retirement work, retained-query bounds,
@@ -107,7 +107,7 @@ wall-time gains. All raw logs, including failed test setup attempts, are archive
 
 Do not quietly replace these failures with a later passing focused test:
 
-1. **Read-only readv consumes input on EFAULT.** FIXED in `dbf360ebb`
+1. **Read-only readv consumes input on EFAULT.** FIXED in `279c2d164`
    (`read_host_pipe_into` issued the host `read` before the copy-out could
    fail; it now delivers the writable page prefix and hands undelivered bytes
    back to the regular-file offset). Red-first VM-free tests
@@ -134,10 +134,10 @@ Do not quietly replace these failures with a later passing focused test:
    is still a fixture problem. It is not passing differential evidence.
 5. Earlier broad Clippy found six `manual_is_multiple_of` diagnostics in
    `carrick-aarch64`; subsequent scoped checks used `--no-deps`. FIXED in
-   `9c6daa54a` (seven sites); whole-workspace `cargo clippy --all-targets
+   `45f4e1409` (seven sites); whole-workspace `cargo clippy --all-targets
    -D warnings` is clean and nothing was masked behind them.
 6. **Post-merge governance is not green.** RESOLVED by hand review, not a
-   re-bless, in `64a9259b2`..`9a34a1cba`: the four test `asm!` copies moved
+   re-bless, in `6299c92b7`..`75b56ec5c`: the four test `asm!` copies moved
    behind `vcpu_loop/native_probe.rs` and the gateway instrument was added to
    both assembly allowlists; the `madvise` abort and eight `hvf::code_content`
    fatals were classified carrier faults; twenty test-only global-state rows
@@ -221,7 +221,7 @@ established merely by that prior approval.
   `20213344-A8B9-38E2-BA97-4038961F4E22`. This is the measured older artifact,
   **not a build of this new checkpoint**. Do not run an arbitrary stale
   `main/target/release/carrick` as the candidate.
-- DSR donor is `20add4f9f1138cbca98cc672182cb093d473ac72`. The recovered
+- DSR donor is `2496d96a06330e2eba35a75f7c86a193f66364a4`. The recovered
   workspace is `<campaign-worktree>/target/lease-cost/dsr-reuse` and is not in
   the product dependency graph. Its manifests currently point at the campaign
   checkout by absolute paths; update them deliberately if rebuilding against
@@ -265,9 +265,9 @@ does not launch another performance experiment or pretend a failed gate passed.
 
 ## Local integration receipt
 
-Campaign checkpoint `a553b814129da95960a34fea7409a90a36601ddf` was fast-forwarded
+Campaign checkpoint `90bb829626aca062642f4699ac41f1949148df4b` was fast-forwarded
 from the base into local `main`. Inventory commit
-`b9728213de2c1f7d6ab1f7570b1972517559947b` changes seven line numbers only.
+`644af8c715bc6e279d83ae581b95153261298843` changes seven line numbers only.
 The post-merge implementation checks ran at that second commit. Subsequent
 commits in this handoff only finish documentation and its evidence archive.
 
@@ -286,7 +286,7 @@ under `docs/superpowers/plans/`. No remote push or new guest/performance run was
 performed during handoff. Preserve the campaign worktree's ignored artifacts.
 
 Concurrent work appeared while finalizing the handoff: documentation commit
-`eca5f7302e2b12a7f1cac3e67be8701022a9289b` and then uncommitted edits to
+`0cf555def4c693ca48a38f35771e9b48b58629f7` and then uncommitted edits to
 `crates/carrick-aarch64/src/anonymous_discard.rs` and `src/engine.rs`. Those
 source edits were preserved and excluded from the handoff commits and test
 claims. Inspect current `git status` before starting work; the recorded test

@@ -1,6 +1,6 @@
 # Signed fault-entry green and controls
 
-Source: `0c30348a22c322e2ef528687a0e0994f4a5cab4a`.
+Source: `6ba2339535e539f3a05950af2c16f9cb00b66b9e`.
 The same fixture used for the committed signed red now passes
 `el1_memory_fault_entry_preserves_context` through the signed embed runner.
 The unentitled negative control passes and scoped cleanup reports zero

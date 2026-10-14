@@ -5,7 +5,7 @@ Status: approved by the owner 2026-10-05 (see Owner decisions). Amended
 [Repository boundary](#repository-boundary-nt-lives-out-of-tree)).
 
 Design proposal, 2026-10-04. Documentation only; no implementation, runtime
-acceptance, or compatibility claim. Inspected Carrick `0250e7f2a834e8bd1b080780bd0f5b8e67bc30ad`.
+acceptance, or compatibility claim. Inspected Carrick `a6399d675a1da127028a89947e0867598e6db44e`.
 
 ## Direction and constraints
 

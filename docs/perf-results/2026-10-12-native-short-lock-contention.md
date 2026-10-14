@@ -1,6 +1,6 @@
 # Native short-lock contention (#233, part of #236)
 
-Base: GitHub main b97e124c17b4ce0dd9a60d2ed22f81e8fa6c86d1.
+Base: GitHub main 854cda74d25e4d19407f169c1fd37fbe767a74d2.
 Contract: process.native.short-lock (docs/conformance-contracts.md).
 Host: x86-w1, Linux x86_64, no Docker or HVF.
 
@@ -109,7 +109,7 @@ Signed HVF and Docker ratio measurements are unavailable on this host.
 ## Final local results
 
 The red commit was rebased as `5a3ddce39`; the implementation as
-`13a745c38`, on GitHub main `34391e677`. Intervening main changes
+`13a745c38`, on GitHub main `7b8e3f8e6`. Intervening main changes
 are instructions, acceptance tooling and comments; no guest source or
 effective compiler pin changed. All fix hunks were kept unchanged.
 
@@ -117,7 +117,7 @@ effective compiler pin changed. All fix hunks were kept unchanged.
 |---|---:|---|
 | `cargo check --workspace` | 101 | Eight unchanged HVF import errors on Linux (E0432/E0433); not a portable platform-selected build |
 | `just clippy` | 0 | Linux product closure and all CLI targets |
-| `CARRICK_AUTHORITY_BASE=503874839abdc2cc288590f57f4d35efca2a154e just lint-domains` | 0 | Live Linux CLI/runtime discovery and source/delta ceilings pass; other host profiles explicitly pending |
+| `CARRICK_AUTHORITY_BASE=4f0fc1e777b11e13225f77d2ec48b6427c3d6427 just lint-domains` | 0 | Live Linux CLI/runtime discovery and source/delta ceilings pass; other host profiles explicitly pending |
 | `cargo test -p carrick-el1 --lib bucket_contention -- --nocapture` | 0 | Four deterministic contention witnesses green |
 | `cargo test -p carrick-el1 --lib pending_default_stop_does_not_interrupt_wait4 -- --nocapture` | 0 | Deterministic wait4 witness green |
 | `cargo test -p carrick-el1 --lib` | 0 | 401 passed |
@@ -125,11 +125,11 @@ effective compiler pin changed. All fix hunks were kept unchanged.
 | `cargo test -p carrick-sched-core -p carrick-core -p carrick-x86 -p carrick-personality-linux --lib` | 0 | 437 passed (102 + 84 + 188 + 63) |
 | `cargo test -p carrick-personality-linux --test x86_wave2` | 0 | 28 passed |
 | `just test-kernel` | 0 | 2468 kernel tests plus kernel-semantics suites; existing signed-only ignored case retained |
-| `CARRICK_AUTHORITY_BASE=b97e124c17b4ce0dd9a60d2ed22f81e8fa6c86d1 just ci` | 101 | Formatting, Clippy and full domain lint passed; unchanged debug-feature recipe selects platform-macos on Linux |
-| `just check-contract-change 503874839abdc2cc288590f57f4d35efca2a154e HEAD` | 0 | Changed surfaces covered |
+| `CARRICK_AUTHORITY_BASE=854cda74d25e4d19407f169c1fd37fbe767a74d2 just ci` | 101 | Formatting, Clippy and full domain lint passed; unchanged debug-feature recipe selects platform-macos on Linux |
+| `just check-contract-change 4f0fc1e777b11e13225f77d2ec48b6427c3d6427 HEAD` | 0 | Changed surfaces covered |
 | `cargo run -q -p carrick-conformance-contract --bin check-contracts -- --root .` | 0 | 107 contracts, 17 claims, 297 surfaces checked |
-| `CARRICK_AUTHORITY_BASE=34391e6773a4206118977981f49f1dbefccf3fa7 cargo run --locked -p carrick-xtask -- authority-debt --source-only` | 0 | Latest-main delta and absolute source ceilings pass |
-| `just check-contract-change 34391e6773a4206118977981f49f1dbefccf3fa7 HEAD` | 0 | Latest-main changed surfaces covered |
+| `CARRICK_AUTHORITY_BASE=7b8e3f8e6e979e4981fb02fad7bf4ca28ac5945a cargo run --locked -p carrick-xtask -- authority-debt --source-only` | 0 | Latest-main delta and absolute source ceilings pass |
+| `just check-contract-change 7b8e3f8e6e979e4981fb02fad7bf4ca28ac5945a HEAD` | 0 | Latest-main changed surfaces covered |
 
 
 The CI recipe defect is tracked as [#249](https://github.com/carrick-sh/carrick/issues/249),
