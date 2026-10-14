@@ -607,8 +607,10 @@ pub fn invoke<'a>(
         }),
         LifecycleCall::SigAltStack => {
             let sp = native.user_sp().map(UserVa::raw);
-            serve_sigaltstack(args, thread, native, sp)?;
-            Some(returned(SyscallResult::new(0), false))
+            Some(match serve_sigaltstack(args, thread, native, sp)? {
+                Ok(()) => returned(SyscallResult::new(0), false),
+                Err(errno) => returned(SyscallResult::new(errno.guest_retval()), false),
+            })
         }
         LifecycleCall::Clone => {
             let visible = serve_clone(args, thread, native)?;
@@ -644,10 +646,6 @@ pub fn invoke<'a>(
         }
         _ => None,
     }
-}
-
-fn ranges_overlap(a: u64, a_len: u64, b: u64, b_len: u64) -> bool {
-    a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
 }
 
 /// `rt_sigprocmask(how, set, oldset, sigsetsize)`. `Some(work)`: served
@@ -706,39 +704,38 @@ fn serve_sigaltstack(
     thread: LifecycleThread<'_>,
     user: &mut (impl UserCopy + ?Sized),
     sp: Option<u64>,
-) -> Option<()> {
+) -> Option<Result<(), carrick_syscall_abi::LinuxErrno>> {
     let [ss, old_ss] = [args[0], args[1]];
     if !setup_open(thread.page) {
         return None;
     }
-    let size = STACK_T_SIZE as u64;
-    if ss != 0 && old_ss != 0 && ranges_overlap(ss, size, old_ss, size) {
-        return None;
-    }
     let current = thread.slot.read_altstack();
-    if !current.is_disabled() {
+    let on_stack = if !current.is_disabled() {
         let sp = sp?;
         let top = current.sp.checked_add(current.size)?;
-        if sp > current.sp && sp <= top {
-            return None;
-        }
-    }
+        sp >= current.sp && sp < top
+    } else {
+        false
+    };
     let replacement = if ss != 0 {
         let mut bytes = [0u8; STACK_T_SIZE];
         if !user.copy_in(&mut bytes, UserVa::new(ss)) {
-            return None;
+            return Some(Err(carrick_syscall_abi::LINUX_EFAULT));
         }
         let [sp, flags, size] = stack_t_words(&bytes);
         let flags = flags as u32;
-        if flags & !SS_DISABLE != 0 {
-            return None;
+        if flags & !(SS_DISABLE | carrick_syscall_abi::LINUX_SS_AUTODISARM as u32) != 0 {
+            return Some(Err(carrick_syscall_abi::LINUX_EINVAL));
         }
         if flags & SS_DISABLE != 0 {
+            if flags != SS_DISABLE {
+                return Some(Err(carrick_syscall_abi::LINUX_EINVAL));
+            }
             Some(AltStack::DISABLED)
         } else {
             let stack = AltStack { sp, size, flags };
             if stack.size < MINSIGSTKSZ {
-                return None;
+                return Some(Err(carrick_syscall_abi::LINUX_ENOMEM));
             }
             Some(stack)
         }
@@ -749,20 +746,26 @@ fn serve_sigaltstack(
         let (sp, flags, size) = if current.is_disabled() {
             (0, SS_DISABLE, 0)
         } else {
-            // Not on the alternate stack (checked above): no SS_ONSTACK.
-            (current.sp, current.flags & !SS_ONSTACK, current.size)
+            (
+                current.sp,
+                current.flags | if on_stack { SS_ONSTACK } else { 0 },
+                current.size,
+            )
         };
         if !user.copy_out(
             UserVa::new(old_ss),
             &stack_t_bytes([sp, u64::from(flags), size]),
         ) {
-            return None;
+            return Some(Err(carrick_syscall_abi::LINUX_EFAULT));
         }
+    }
+    if ss != 0 && on_stack {
+        return Some(Err(carrick_syscall_abi::LINUX_EPERM));
     }
     if let Some(stack) = replacement {
         thread.slot.write_altstack(stack);
     }
-    Some(())
+    Some(Ok(()))
 }
 
 /// The preimage of one clone tid output (`CloneTidOutputTransaction`): the
