@@ -136,7 +136,9 @@ fn run_to_marker(
             }
             CarrierRunExit::PhysicalDoorbell { .. } => {
                 let outcome = cpu
-                    .service_physical_doorbell(task, &exit)
+                    .service_physical_doorbell(task, &exit, |_, _| {
+                        panic!("unexpected completed host work before marker")
+                    })
                     .expect("physical service");
                 assert!(
                     outcome.is_none(),
@@ -600,7 +602,9 @@ fn child_born_on_idle_peer_can_fault_and_retire_on_root_executor() {
                 }
                 assert!(
                     parent
-                        .service_physical_doorbell(task, &exit)
+                        .service_physical_doorbell(task, &exit, |_, _| {
+                            panic!("unexpected completed host work during grandchild retirement")
+                        })
                         .expect("registered migrated MM physical service")
                         .is_none()
                 );
@@ -614,7 +618,9 @@ fn child_born_on_idle_peer_can_fault_and_retire_on_root_executor() {
     );
     assert!(
         parent
-            .service_physical_doorbell(task, &grandchild_retire)
+            .service_physical_doorbell(task, &grandchild_retire, |_, _| {
+                panic!("unexpected completed host work during grandchild retirement")
+            })
             .expect("grandchild MM retirement")
             .is_none()
     );
@@ -690,11 +696,15 @@ fn initial_root_uses_issued_thread_and_file_table_identity() {
             data: vec![],
         };
         let wrong_error = lease
-            .service_physical_doorbell(wrong, &unknown)
+            .service_physical_doorbell(wrong, &unknown, |_, _| {
+                panic!("unexpected completed host work for wrong task")
+            })
             .expect_err("wrong task cannot enter physical service");
         assert!(wrong_error.to_string().contains("task generation"));
         let port_error = lease
-            .service_physical_doorbell(root.binding().task(), &unknown)
+            .service_physical_doorbell(root.binding().task(), &unknown, |_, _| {
+                panic!("unexpected completed host work for unknown port")
+            })
             .expect_err("unknown physical crossing must fail closed");
         assert!(port_error.to_string().contains("unexpected physical"));
         let saved = lease
