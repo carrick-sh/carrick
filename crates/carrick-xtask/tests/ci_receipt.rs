@@ -49,6 +49,20 @@ fn receipt(steps: Vec<StepResult>) -> AcceptReceipt {
 }
 
 #[test]
+fn successful_python_banner_is_not_an_unfinished_cargo_binary() {
+    let log = "Ran 4 tests in 2.487s\n\nOK\nRunning check-dispatch-lock-authority self-tests...\n";
+    let mut policy = step("lint-domains-source", true, &[]);
+    let mut failures = Vec::new();
+    populate_step_from_log(&mut policy, log, &mut failures);
+    assert!(policy.passed, "{failures:?}");
+    assert!(policy.unfinished_binaries.is_empty());
+    let crashed = parse_test_log(
+        "Running tests/policy.rs (target/debug/deps/policy-0123abcd4567ef89)\nrunning 1 test\n",
+    );
+    assert_eq!(crashed.unfinished_binaries, vec!["policy"]);
+}
+
+#[test]
 fn cargo_failures_are_qualified_by_their_test_binary() {
     let log = "\
      Running unittests src/lib.rs (target/debug/deps/carrick_vmm_kvm-0123abcd4567ef89)
