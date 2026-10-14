@@ -245,7 +245,6 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
         Ok(())
     }
-    fn thread_exited(&mut self, _tid: u32) {}
     fn retire_thread_verdict(&mut self, _verdict: carrick_core::terminal::RetirementVerdict) {}
     fn route_host_thread_exit(
         &mut self,
