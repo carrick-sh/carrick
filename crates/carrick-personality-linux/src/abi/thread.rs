@@ -50,7 +50,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Protocol revision, folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 9;
+pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 10;
 
 pub use carrick_core::lifecycle::{ClaimedEntry, ExitAdmission, Lifecycle};
 pub use carrick_core_abi::lifecycle::*;
@@ -623,11 +623,51 @@ pub struct ThreadLifecyclePage {
     controls: [AtomicU64; THREAD_POOL_ENTRIES],
     exit_wait_mm: AtomicU64,
     exit_wait_address: AtomicU64,
-    host_born: [AtomicU64; THREAD_POOL_ENTRIES],
+    host_born: [HostBornMember; THREAD_POOL_ENTRIES],
     host_birth_mutations: AtomicU32,
 }
 
 const _: () = assert!(core::mem::size_of::<ThreadLifecyclePage>() == THREAD_LIFECYCLE_PAGE_SIZE);
+
+/// Shared-page identity for a member born on the host before EL1 can map its
+/// control slab. States: vacant, publication claim, live, cancel requested,
+/// and exact host receipt. EL1 never dereferences a host virtual address.
+#[repr(C)]
+#[derive(::core::fmt::Debug)]
+struct HostBornMember {
+    task: AtomicU64,
+    execution: AtomicU64,
+    thread: AtomicU64,
+    state: AtomicU32,
+}
+
+impl HostBornMember {
+    const fn new() -> Self {
+        Self {
+            task: AtomicU64::new(0),
+            execution: AtomicU64::new(0),
+            thread: AtomicU64::new(0),
+            state: AtomicU32::new(0),
+        }
+    }
+
+    fn identity(&self) -> Option<carrick_core::terminal::HostThreadRetirementReceipt> {
+        if self.state.load(Ordering::Acquire) < 2 {
+            return None;
+        }
+        carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+            carrick_core_abi::entry::EntryTaskKey::from_raw(self.task.load(Ordering::Relaxed)),
+            carrick_core_abi::entry::EntryGeneration::from_raw(
+                self.execution.load(Ordering::Relaxed),
+            ),
+            carrick_core_abi::entry::EntryThreadGeneration::from_raw(
+                self.thread.load(Ordering::Relaxed),
+            ),
+        )
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<HostBornMember>() == 32);
 
 /// Environment names of the EL1 lifecycle opt-out hatches.
 pub const EL1_THREADS_HATCH_ENV: &str = "CARRICK_EL1_THREADS";
@@ -712,56 +752,107 @@ impl ThreadLifecyclePage {
             controls: [const { AtomicU64::new(0) }; THREAD_POOL_ENTRIES],
             exit_wait_mm: AtomicU64::new(0),
             exit_wait_address: AtomicU64::new(0),
-            host_born: [const { AtomicU64::new(0) }; THREAD_POOL_ENTRIES],
+            host_born: [const { HostBornMember::new() }; THREAD_POOL_ENTRIES],
             host_birth_mutations: AtomicU32::new(0),
         }
     }
 
     /// Reserve one host-born member before its irreversible task publication.
-    /// A value of one is an unpublished claim; a real control address is
-    /// aligned and therefore never one. Closing waits for every claim.
+    /// State one is an unpublished claim. Closing waits for every claim.
     pub fn reserve_host_birth(&self) -> Option<usize> {
         for (index, slot) in self.host_born.iter().enumerate() {
             if slot
+                .state
                 .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
                 if self.gate() == GateState::Open {
                     return Some(index);
                 }
-                slot.store(0, Ordering::SeqCst);
+                slot.state.store(0, Ordering::SeqCst);
                 return None;
             }
         }
         None
     }
 
-    pub fn publish_host_birth(&self, index: usize, address: u64) -> bool {
-        if address <= 1
-            || !address.is_multiple_of(core::mem::align_of::<ThreadControlSlot>() as u64)
-        {
+    pub fn publish_host_birth(
+        &self,
+        index: usize,
+        identity: carrick_core::terminal::HostThreadRetirementReceipt,
+    ) -> bool {
+        let Some(slot) = self.host_born.get(index) else {
+            return false;
+        };
+        if slot.state.load(Ordering::SeqCst) != 1 {
             return false;
         }
-        self.host_born.get(index).is_some_and(|slot| {
-            slot.compare_exchange(1, address, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-        })
+        slot.task.store(identity.task().raw(), Ordering::Relaxed);
+        slot.execution
+            .store(identity.execution().raw(), Ordering::Relaxed);
+        slot.thread
+            .store(identity.thread().raw(), Ordering::Relaxed);
+        slot.state
+            .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
     }
 
     pub fn cancel_host_birth_claim(&self, index: usize) -> bool {
         self.host_born.get(index).is_some_and(|slot| {
-            slot.compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+            slot.state
+                .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
         })
     }
 
-    pub fn host_born_address(&self, index: usize) -> Option<u64> {
+    pub fn host_birth_identity(
+        &self,
+        index: usize,
+    ) -> Option<carrick_core::terminal::HostThreadRetirementReceipt> {
+        self.host_born.get(index)?.identity()
+    }
+
+    pub fn host_birth_requested(
+        &self,
+        identity: carrick_core::terminal::HostThreadRetirementReceipt,
+    ) -> bool {
+        self.host_born.iter().any(|slot| {
+            slot.identity() == Some(identity) && slot.state.load(Ordering::Acquire) == 3
+        })
+    }
+
+    pub fn request_host_birth_cancel(&self, index: usize) -> bool {
+        self.host_born.get(index).is_some_and(|slot| {
+            slot.identity().is_some()
+                && (slot
+                    .state
+                    .compare_exchange(2, 3, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                    || slot.state.load(Ordering::Acquire) == 3)
+        })
+    }
+
+    pub fn publish_host_birth_receipt(
+        &self,
+        identity: carrick_core::terminal::HostThreadRetirementReceipt,
+    ) -> bool {
+        self.host_born.iter().any(|slot| {
+            if slot.identity() != Some(identity) {
+                return false;
+            }
+            let state = slot.state.load(Ordering::SeqCst);
+            matches!(state, 2 | 3)
+                && slot
+                    .state
+                    .compare_exchange(state, 4, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+        })
+    }
+
+    pub fn host_birth_receipt_returned(&self, index: usize) -> bool {
         self.host_born
             .get(index)
-            .and_then(|slot| match slot.load(Ordering::SeqCst) {
-                0 | 1 => None,
-                address => Some(address),
-            })
+            .is_some_and(|slot| slot.state.load(Ordering::Acquire) == 4)
     }
 
     pub fn host_birth_claimed_count(&self) -> usize {
@@ -769,34 +860,52 @@ impl ThreadLifecyclePage {
             + self
                 .host_born
                 .iter()
-                .filter(|slot| slot.load(Ordering::SeqCst) == 1)
+                .filter(|slot| slot.state.load(Ordering::SeqCst) == 1)
                 .count()
     }
 
-    /// Release only while Open. During Closing all addresses remain pinned
-    /// until settlement, even after their exact receipts arrive.
-    pub fn release_adopted_host_birth(&self, address: u64) -> bool {
+    fn release_host_birth(
+        &self,
+        identity: carrick_core::terminal::HostThreadRetirementReceipt,
+        expected: u32,
+    ) -> bool {
         self.host_birth_mutations.fetch_add(1, Ordering::SeqCst);
         let released = self.host_born.iter().any(|slot| {
-            if slot
-                .compare_exchange(address, 1, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
+            if slot.identity() != Some(identity)
+                || slot
+                    .state
+                    .compare_exchange(expected, 1, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
             {
                 return false;
             }
             if self.gate() != GateState::Open {
-                slot.store(address, Ordering::SeqCst);
+                slot.state.store(expected, Ordering::SeqCst);
                 return false;
             }
-            slot.store(0, Ordering::SeqCst);
-            if self.gate() != GateState::Open {
-                slot.store(address, Ordering::SeqCst);
-                return false;
-            }
+            // The Open read is the release linearization point. Closing
+            // sees the mutation claim until this vacancy is published.
+            slot.state.store(0, Ordering::SeqCst);
             true
         });
         self.host_birth_mutations.fetch_sub(1, Ordering::SeqCst);
         released
+    }
+
+    /// Adoption and normal host completion consume their exact slot while
+    /// Open. Closing retains every slot until settlement.
+    pub fn release_adopted_host_birth(
+        &self,
+        identity: carrick_core::terminal::HostThreadRetirementReceipt,
+    ) -> bool {
+        self.release_host_birth(identity, 2)
+    }
+
+    pub fn release_completed_host_birth(
+        &self,
+        identity: carrick_core::terminal::HostThreadRetirementReceipt,
+    ) -> bool {
+        self.release_host_birth(identity, 4)
     }
 
     /// Whether EL1 may serve clone and exit (`CARRICK_EL1_THREADS`).
@@ -1028,7 +1137,7 @@ impl Default for ThreadLifecyclePage {
 }
 
 /// Layout facts folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 32] = [
+pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 33] = [
     THREAD_LIFECYCLE_PROTOCOL_VERSION,
     core::mem::size_of::<ThreadLedgerActivity>() as u64,
     ::core::mem::offset_of!(ThreadLifecyclePage, ledger_host) as u64,
@@ -1061,6 +1170,7 @@ pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 32] = [
     ::core::mem::offset_of!(ThreadControlSlot, host_exit_requested) as u64,
     ::core::mem::offset_of!(ThreadLifecyclePage, host_born) as u64,
     ::core::mem::offset_of!(ThreadLifecyclePage, host_birth_mutations) as u64,
+    ::core::mem::size_of::<HostBornMember>() as u64,
 ];
 
 #[cfg(test)]
@@ -1082,20 +1192,38 @@ mod tests {
     #[test]
     fn host_birth_adoption_and_closing_have_one_slot_winner() {
         use super::Lifecycle;
+        let first = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+            carrick_core_abi::entry::EntryTaskKey::from_raw(41),
+            carrick_core_abi::entry::EntryGeneration::from_raw(11),
+            carrick_core_abi::entry::EntryThreadGeneration::from_raw(101),
+        )
+        .unwrap();
+        let second = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+            carrick_core_abi::entry::EntryTaskKey::from_raw(42),
+            carrick_core_abi::entry::EntryGeneration::from_raw(12),
+            carrick_core_abi::entry::EntryThreadGeneration::from_raw(102),
+        )
+        .unwrap();
         let adopted = super::ThreadLifecyclePage::new();
         let slot = adopted.reserve_host_birth().unwrap();
-        assert!(adopted.publish_host_birth(slot, 0x1000));
-        assert!(adopted.release_adopted_host_birth(0x1000));
-        assert!(!adopted.release_adopted_host_birth(0x1000));
+        assert!(adopted.publish_host_birth(slot, first));
+        assert!(adopted.release_adopted_host_birth(first));
+        assert!(!adopted.release_adopted_host_birth(first));
         adopted.close();
-        assert_eq!(adopted.host_born_address(slot), None);
+        assert_eq!(adopted.host_birth_identity(slot), None);
 
         let cancelled = super::ThreadLifecyclePage::new();
         let slot = cancelled.reserve_host_birth().unwrap();
-        assert!(cancelled.publish_host_birth(slot, 0x2000));
+        assert!(cancelled.publish_host_birth(slot, second));
         cancelled.close();
-        assert!(!cancelled.release_adopted_host_birth(0x2000));
-        assert_eq!(cancelled.host_born_address(slot), Some(0x2000));
+        assert!(!cancelled.release_adopted_host_birth(second));
+        assert_eq!(cancelled.host_birth_identity(slot), Some(second));
+        assert!(cancelled.request_host_birth_cancel(slot));
+        assert!(cancelled.host_birth_requested(second));
+        assert!(!cancelled.publish_host_birth_receipt(first));
+        assert!(!cancelled.host_birth_receipt_returned(slot));
+        assert!(cancelled.publish_host_birth_receipt(second));
+        assert!(cancelled.host_birth_receipt_returned(slot));
         assert_eq!(cancelled.host_birth_claimed_count(), 0);
     }
 
@@ -1806,16 +1934,16 @@ mod layout_manifest {
         field!(
             ThreadLifecyclePage,
             host_born,
-            [AtomicU64; THREAD_POOL_ENTRIES],
+            [HostBornMember; THREAD_POOL_ENTRIES],
             760,
-            64,
+            256,
             8
         );
         field!(
             ThreadLifecyclePage,
             host_birth_mutations,
             AtomicU32,
-            824,
+            1016,
             4,
             4
         );
