@@ -1249,6 +1249,10 @@ path = "crates/carrick-core/src/personality.rs"
 contracts = []
 
 [[surfaces]]
+path = "crates/carrick-core/src/terminal.rs"
+contracts = ["kernel.el1.thread-lifecycle", "process.native.terminal-child"]
+
+[[surfaces]]
 path = "crates/carrick-kernel-example/src/personality.rs"
 contracts = []
 
