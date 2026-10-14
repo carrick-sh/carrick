@@ -344,7 +344,7 @@ impl RootBootstrap {
     ) -> Result<Self, KernelError> {
         Ok(Self {
             population_origin: KernelPopulationOrigin::PreparedNativeLaunch,
-            task_id: TaskId::for_root_bootstrap(observed_pid)?,
+            task_id: carrick_personality_linux::identity::task_id_from_linux_pid(observed_pid)?,
             shared_futex: carrick_thread::platform_futex::SharedFutexTable::new(),
             registry_id,
             mm_backend: None,
@@ -418,7 +418,7 @@ impl RootBootstrap {
         // Product bootstraps override this with `with_container`.
         Ok(Self {
             population_origin: KernelPopulationOrigin::Host,
-            task_id: TaskId::for_root_bootstrap(observed_pid)?,
+            task_id: carrick_personality_linux::identity::task_id_from_linux_pid(observed_pid)?,
             shared_futex: carrick_thread::platform_futex::SharedFutexTable::new(),
             registry_id,
             mm_backend,
@@ -2808,7 +2808,7 @@ impl Registry {
         let Ok(pid) = i32::try_from(pid) else {
             return false;
         };
-        let Ok(task_id) = TaskId::from_abi_positive(pid) else {
+        let Ok(task_id) = carrick_personality_linux::identity::task_id_from_linux_pid(pid) else {
             return false;
         };
         let state = self.settled().read();
@@ -2827,7 +2827,7 @@ impl Registry {
     /// `getpriority(PRIO_PROCESS, peer)` needs the TARGET's value; it used to
     /// report the CALLER's, which is only right when the target IS the caller.
     pub(crate) fn task_nice(&self, pid: i32) -> Option<i32> {
-        let Ok(task_id) = TaskId::from_abi_positive(pid) else {
+        let Ok(task_id) = carrick_personality_linux::identity::task_id_from_linux_pid(pid) else {
             return None;
         };
         self.settled()
@@ -2841,7 +2841,7 @@ impl Registry {
     /// process. Companion to [`Self::task_nice`]; nice is per-`Task`, so a
     /// cross-process `setpriority` is serviceable from the kernel graph.
     pub(crate) fn set_task_nice(&self, pid: i32, nice: i32) -> bool {
-        let Ok(task_id) = TaskId::from_abi_positive(pid) else {
+        let Ok(task_id) = carrick_personality_linux::identity::task_id_from_linux_pid(pid) else {
             return false;
         };
         let state = self.settled().read();
@@ -3216,7 +3216,8 @@ mod tests {
     #[test]
     fn root_adapter_preserves_observed_pid_and_all_associations() {
         let (kernel, context) = bootstrap(4242);
-        let task_id = TaskId::for_root_bootstrap(4242).expect("task ID");
+        let task_id =
+            carrick_personality_linux::identity::task_id_from_linux_pid(4242).expect("task ID");
         let leader_tid = LinuxTid::for_task_leader(task_id);
 
         assert_eq!(context.task.key().id, task_id);

@@ -336,7 +336,7 @@ enum NativeThreadIdentity {
 }
 impl NativeThreadIdentity {
     fn from_binding(binding: ExecutionBinding) -> Result<Self, NativeProcessError> {
-        let id = TaskId::from_abi_positive(
+        let id = carrick_personality_linux::identity::task_id_from_linux_pid(
             i32::try_from(binding.task.raw()).map_err(|_| NativeProcessError::Invalid)?,
         )
         .map_err(|_| NativeProcessError::Invalid)?;
@@ -1397,7 +1397,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .ok_or(NativeProcessError::Invalid)?;
         let id = i32::try_from(binding.task.raw())
             .ok()
-            .and_then(|id| TaskId::from_abi_positive(id).ok())
+            .and_then(|id| carrick_personality_linux::identity::task_id_from_linux_pid(id).ok())
             .ok_or(NativeProcessError::Invalid)?;
         let key = TaskKey {
             id,
@@ -3358,7 +3358,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 (number, visible)
             };
             let child_key = TaskKey {
-                id: TaskId::from_abi_positive(number.get())
+                id: carrick_personality_linux::identity::task_id_from_linux_pid(number.get())
                     .map_err(|_| NativeProcessError::Invalid)?,
                 serial: TaskSerial::from_raw_u64(serial.get())
                     .ok_or(NativeProcessError::Invalid)?,
@@ -5933,7 +5933,7 @@ mod tests {
         };
         assert_eq!(result.raw(), 42);
         let leader_key = TaskKey {
-            id: TaskId::from_abi_positive(41).unwrap(),
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
             serial: TaskSerial::from_raw_u64(11).unwrap(),
         };
         assert!(runtime.namespace_child_key(leader_key, 42).is_some());
@@ -7136,7 +7136,7 @@ mod tests {
             on_signal_clock: None,
         };
         let parent = TaskKey {
-            id: TaskId::from_abi_positive(41).unwrap(),
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
             serial: TaskSerial::from_raw_u64(11).unwrap(),
         };
         let child;
@@ -7162,7 +7162,7 @@ mod tests {
             };
             assert_eq!(result.raw(), 42);
             let parent = TaskKey {
-                id: TaskId::from_abi_positive(41).unwrap(),
+                id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
                 serial: TaskSerial::from_raw_u64(11).unwrap(),
             };
             child = runtime.namespace_child_key(parent, 42).unwrap();
@@ -8048,7 +8048,7 @@ mod tests {
             on_signal_clock: None,
         };
         let parent = TaskKey {
-            id: TaskId::from_abi_positive(41).unwrap(),
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
             serial: TaskSerial::from_raw_u64(11).unwrap(),
         };
         let mut entry = runtime
@@ -8222,7 +8222,7 @@ mod tests {
                 on_signal_clock: None,
             };
             let parent = TaskKey {
-                id: TaskId::from_abi_positive(41).unwrap(),
+                id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
                 serial: TaskSerial::from_raw_u64(11).unwrap(),
             };
             let descendant_pages = [ThreadLifecyclePage::new(), ThreadLifecyclePage::new()];
@@ -8613,7 +8613,7 @@ mod tests {
             )
             .unwrap();
         let key = TaskKey {
-            id: TaskId::from_abi_positive(41).unwrap(),
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
             serial: TaskSerial::from_raw_u64(11).unwrap(),
         };
         let mut service = Physical {
@@ -8702,7 +8702,7 @@ mod tests {
             )
             .unwrap();
         let key = TaskKey {
-            id: TaskId::from_abi_positive(41).unwrap(),
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
             serial: TaskSerial::from_raw_u64(11).unwrap(),
         };
         let mut service = Physical {
@@ -8939,7 +8939,7 @@ mod tests {
         use carrick_personality_linux::identity::ProcessIdentityVenue;
 
         let parent_key = TaskKey {
-            id: TaskId::from_abi_positive(41).unwrap(),
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
             serial: TaskSerial::from_raw_u64(11).unwrap(),
         };
         let parent_record = runtime

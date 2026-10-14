@@ -644,7 +644,7 @@ fn initial_root_uses_issued_thread_and_file_table_identity() {
                 std::num::NonZeroU64::new(911).expect("issued fixture MM"),
             ),
             task: carrick_sched_core::process::TaskKey {
-                id: carrick_sched_core::process::TaskId::from_abi_positive(67)
+                id: carrick_personality_linux::identity::task_id_from_linux_pid(67)
                     .expect("fixture task id"),
                 serial: carrick_sched_core::process::TaskSerial::from_registry_allocation(
                     std::num::NonZeroU64::new(700).expect("fixture task serial"),

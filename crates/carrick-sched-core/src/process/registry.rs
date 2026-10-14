@@ -130,7 +130,7 @@ mod tests {
         let a = ProcessGroupId::from_abi_positive(10).unwrap();
         let b = ProcessGroupId::from_abi_positive(11).unwrap();
         let key = TaskKey {
-            id: TaskId::from_abi_positive(10).unwrap(),
+            id: TaskId::from_registry_allocation(core::num::NonZeroI32::new(10).unwrap()),
             serial: super::super::TaskSerial::from_raw_u64(2).unwrap(),
         };
         let stale = TaskKey {
@@ -138,7 +138,7 @@ mod tests {
             ..key
         };
         let other_key = TaskKey {
-            id: TaskId::from_abi_positive(11).unwrap(),
+            id: TaskId::from_registry_allocation(core::num::NonZeroI32::new(11).unwrap()),
             serial: super::super::TaskSerial::from_raw_u64(3).unwrap(),
         };
         for (id, scope) in [(a, Scope(1)), (b, Scope(2))] {

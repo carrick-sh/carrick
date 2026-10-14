@@ -1403,7 +1403,8 @@ mod tests {
         );
         assert_eq!(zombie.0.load(Ordering::Acquire), 1);
         let unknown = Arc::new(CountingExitSubscriber::default());
-        let unknown_id = TaskId::for_root_bootstrap(9_999).expect("unknown task");
+        let unknown_id = carrick_personality_linux::identity::task_id_from_linux_pid(9_999)
+            .expect("unknown task");
         assert_eq!(
             kernel.register_task_exit_subscriber(unknown_id, &unknown),
             None

@@ -3430,7 +3430,9 @@ fn hvpatch_process_signal_target(
     let raw = u32::try_from(pid).ok()?;
     let task_target = crate::namespace::pid::ns_to_kernel_for(context, raw)
         .and_then(|internal| i32::try_from(internal).ok())
-        .and_then(|internal| crate::kernel::TaskId::from_abi_positive(internal).ok());
+        .and_then(|internal| {
+            carrick_personality_linux::identity::task_id_from_linux_pid(internal).ok()
+        });
     task_target
         .and_then(|target| context.kernel().live_task_key(target))
         .map(ProcessSignalTarget::process)
@@ -3469,7 +3471,7 @@ fn hvpatch_signal_observes_zombie(context: &crate::kernel::KernelContext, pid: i
         .ok()
         .and_then(|pid| crate::namespace::pid::ns_to_kernel_for(context, pid))
         .and_then(|pid| i32::try_from(pid).ok())
-        .and_then(|pid| crate::kernel::TaskId::from_abi_positive(pid).ok())
+        .and_then(|pid| carrick_personality_linux::identity::task_id_from_linux_pid(pid).ok())
         .and_then(|target| context.kernel().registry().exited_process(target))
         .is_some_and(|zombie| zombie.container == context.container().id())
 }

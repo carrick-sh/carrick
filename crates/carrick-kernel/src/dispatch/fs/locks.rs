@@ -289,7 +289,7 @@ impl LogicalRecordLockOwner {
     fn task_key(&self) -> Option<crate::kernel::TaskKey> {
         match self {
             Self::Process { pid, serial } => Some(crate::kernel::TaskKey {
-                id: crate::kernel::TaskId::from_abi_positive(*pid).ok()?,
+                id: carrick_personality_linux::identity::task_id_from_linux_pid(*pid).ok()?,
                 serial: crate::kernel::TaskSerial::from_raw_u64(*serial)?,
             }),
             Self::Ofd(_) => None,

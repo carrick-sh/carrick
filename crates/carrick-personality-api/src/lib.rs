@@ -22,11 +22,8 @@ pub use carrick_guest_arch::{
     ThreadContext, UserReturn, UserVa,
 };
 
-// 4. Neutral process lifecycle and scheduling identity from carrick-sched-core
-pub use carrick_sched_core::process::{
-    ProcessGroupId, SessionId, TaskId, TaskIdentity, TaskKey, TaskLifecycle, TaskRusage,
-    TerminationKind, TerminationStatus, WaitChildClass, WaitMode, WaitTarget, Zombie,
-};
+// 4. Neutral process identity and termination from core
+pub use carrick_core::{TaskKey, TaskRusage, TaskSerial, TerminationStatus};
 
 // 5. Neutral lifecycle authority and entry tokens from carrick-core-abi
 pub use carrick_core_abi::{

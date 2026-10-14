@@ -191,7 +191,7 @@ mod tests {
     fn dummy_task_key() -> TaskKey {
         let registry = ObjectIdRegistry::new();
         TaskKey {
-            id: TaskId::for_root_bootstrap(1).unwrap(),
+            id: TaskId::from_registry_allocation(core::num::NonZeroI32::new(1).unwrap()),
             serial: registry.task_serial().unwrap(),
         }
     }

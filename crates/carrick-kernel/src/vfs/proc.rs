@@ -1714,7 +1714,7 @@ pub(crate) fn synthetic_task_dir(
         let container_id = container.unwrap_or_else(|| context.container().id());
         let internal_id = crate::namespace::pid::ns_to_kernel_for(context, pid)?;
         let pid_i32 = i32::try_from(internal_id).ok()?;
-        let task_id = crate::kernel::TaskId::from_abi_positive(pid_i32).ok()?;
+        let task_id = carrick_personality_linux::identity::task_id_from_linux_pid(pid_i32).ok()?;
         let registry = context.kernel().registry();
         if let Some(process) = registry
             .live_processes_for_container(container_id)

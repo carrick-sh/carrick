@@ -9,8 +9,10 @@ use carrick_el1::isa::x86::context::{
 use carrick_el1_abi::{Counters, CurrentTask};
 use carrick_guest_arch::UserVa;
 pub use carrick_personality_api::{
-    CallContext, EntryDecodeError, PersonalityAbi, TerminationKind, TerminationStatus,
+    CallContext, EntryDecodeError, PersonalityAbi, TerminationStatus,
 };
+
+pub use carrick_sched_core::process::TerminationKind;
 
 /// Request to terminate the root process with a wait status.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

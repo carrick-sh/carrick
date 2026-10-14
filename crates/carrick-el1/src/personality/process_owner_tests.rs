@@ -174,7 +174,7 @@ struct Published {
 }
 fn key(id: i32, serial: u64) -> TaskKey {
     TaskKey {
-        id: TaskId::from_abi_positive(id).unwrap(),
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(id).unwrap(),
         serial: TaskSerial::from_raw_u64(serial).unwrap(),
     }
 }

@@ -1679,7 +1679,8 @@ mod tests {
 
     #[test]
     fn test_exec_prepare_error_kernel_operation_variant_errno() {
-        let task_id = TaskId::from_abi_positive(1).expect("valid positive task id");
+        let task_id = carrick_personality_linux::identity::task_id_from_linux_pid(1)
+            .expect("valid positive task id");
         let err_busy = ExecPrepareError::KernelOperation(
             crate::kernel::KernelOperationError::TaskBusy(task_id),
         );

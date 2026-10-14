@@ -1118,7 +1118,8 @@ mod netlink_readiness_tests {
     /// spell one even when the test only exercises readiness.
     fn fixture_pidfd_task() -> crate::kernel::TaskKey {
         crate::kernel::TaskKey {
-            id: crate::kernel::TaskId::for_root_bootstrap(1234).expect("fixture task id"),
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(1234)
+                .expect("fixture task id"),
             serial: crate::kernel::TaskSerial::from_registry_allocation(
                 std::num::NonZeroU64::new(1).expect("nonzero fixture serial"),
             ),

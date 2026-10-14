@@ -3671,7 +3671,7 @@ mod tests {
     #[test]
     fn waitid_siginfo_uses_the_visible_pid_retained_by_the_wait_receipt() {
         let exit = ChildExit::new(
-            carrick_kernel::kernel::TaskId::from_abi_positive(42).expect("internal pid"),
+            carrick_personality_linux::identity::task_id_from_linux_pid(42).expect("internal pid"),
             7,
             carrick_abi::NsUid::new(1_000),
             9 << 8,

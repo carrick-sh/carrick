@@ -531,7 +531,8 @@ mod tests {
 
     #[test]
     fn root_bootstrap_preserves_exact_tgid() {
-        let root = TaskId::for_root_bootstrap(42).expect("root ID");
+        let root =
+            carrick_personality_linux::identity::task_id_from_linux_pid(42).expect("root ID");
         let (registry, root_claim) = IdRegistry::with_root(root).expect("root registry");
 
         assert_eq!(root_claim.raw(), 42);

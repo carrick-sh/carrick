@@ -552,7 +552,7 @@ pub enum TaskSharedCloneError {
 mod tests {
     use super::*;
     use crate::kernel::container::{Container, LaunchContext, RunId};
-    use crate::kernel::ids::{LinuxTid, TaskId};
+    use crate::kernel::ids::LinuxTid;
     use crate::kernel::objects::{
         Credentials, FileTable, FsContext, TaskIdentity, ThreadKey, ThreadResources,
     };
@@ -580,7 +580,9 @@ mod tests {
                 TaskShared::for_new_task_reference(&fixture.task.shared(), plan, &fixture.ids)
                     .unwrap();
             let lifecycle = shared.pending_signals().lifecycle_lease();
-            let id = TaskId::for_root_bootstrap(101 + index as i32).unwrap();
+            let id =
+                carrick_personality_linux::identity::task_id_from_linux_pid(101 + index as i32)
+                    .unwrap();
             let arena = super::super::thread_control::ThreadControlArena::with_lifecycle(
                 TaskKey {
                     id,
@@ -632,7 +634,8 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let ids = ObjectIdRegistry::new();
-            let task_id = TaskId::for_root_bootstrap(100).expect("task ID");
+            let task_id =
+                carrick_personality_linux::identity::task_id_from_linux_pid(100).expect("task ID");
             let key = TaskKey {
                 id: task_id,
                 serial: ids.task_serial().expect("task serial"),

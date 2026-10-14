@@ -95,7 +95,7 @@ pub trait CarrierProcess: Send + Sync {
         target: i32,
         watch: &std::sync::Arc<crate::dispatch::fd_table::PidfdWatch>,
     ) -> Option<crate::kernel::TaskKey> {
-        let target = crate::kernel::TaskId::from_abi_positive(target).ok()?;
+        let target = carrick_personality_linux::identity::task_id_from_linux_pid(target).ok()?;
         self.kernel_graph()
             .register_task_exit_subscriber(target, watch)
     }
@@ -105,7 +105,7 @@ pub trait CarrierProcess: Send + Sync {
     }
 
     fn live_process_key(&self, target: i32) -> Option<crate::kernel::TaskKey> {
-        let target = crate::kernel::TaskId::from_abi_positive(target).ok()?;
+        let target = carrick_personality_linux::identity::task_id_from_linux_pid(target).ok()?;
         self.kernel_graph().live_task_key(target)
     }
 
@@ -196,7 +196,8 @@ pub trait CarrierProcess: Send + Sync {
         include_stopped: bool,
         include_continued: bool,
     ) -> WaitResult {
-        let target = target.and_then(|raw| crate::kernel::TaskId::from_abi_positive(raw).ok());
+        let target = target
+            .and_then(|raw| carrick_personality_linux::identity::task_id_from_linux_pid(raw).ok());
         let outcome = self.kernel_graph().wait_child_with_job_control(
             self.task_id(),
             target,

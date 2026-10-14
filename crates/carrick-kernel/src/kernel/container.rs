@@ -1565,7 +1565,7 @@ mod tests {
         let container = Container::new(LaunchContext::unmanaged(RunId::new("once")));
         assert_eq!(container.pid_root(), None);
         let key = TaskKey {
-            id: crate::kernel::TaskId::for_root_bootstrap(77).expect("task id"),
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(77).expect("task id"),
             serial: crate::kernel::ObjectIdRegistry::new()
                 .task_serial()
                 .expect("serial"),

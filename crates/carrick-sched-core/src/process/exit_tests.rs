@@ -22,7 +22,7 @@ fn topology_publication_uses_current_membership_revision_and_owned_credit() {
 
 fn key(serial: u64) -> TaskKey {
     TaskKey {
-        id: TaskId::from_abi_positive(2).unwrap(),
+        id: TaskId::from_registry_allocation(core::num::NonZeroI32::new(2).unwrap()),
         serial: TaskSerial::from_raw_u64(serial).unwrap(),
     }
 }
@@ -189,7 +189,7 @@ fn exit_topology_owner_refuses_recycled_adopter_before_selecting_children() {
         }
     }
     let parent = TaskKey {
-        id: TaskId::from_abi_positive(1).unwrap(),
+        id: TaskId::from_registry_allocation(core::num::NonZeroI32::new(1).unwrap()),
         ..key(1)
     };
     let task = key(2);
@@ -337,11 +337,11 @@ fn exit_topology_owner_refuses_recycled_adopter_before_selecting_children() {
     assert!(owner.retiring_tasks.is_empty());
 
     let live_child = TaskKey {
-        id: TaskId::from_abi_positive(3).unwrap(),
+        id: TaskId::from_registry_allocation(core::num::NonZeroI32::new(3).unwrap()),
         ..key(3)
     };
     let dead_child = TaskKey {
-        id: TaskId::from_abi_positive(4).unwrap(),
+        id: TaskId::from_registry_allocation(core::num::NonZeroI32::new(4).unwrap()),
         ..key(4)
     };
     owner.tasks.get_mut(&task.id).unwrap().children = BTreeSet::from([live_child, dead_child]);
@@ -513,7 +513,7 @@ fn exit_effect_work_visits_only_own_members_at_all_scales() {
         );
         for id in 100..612 {
             let other = TaskKey {
-                id: TaskId::from_abi_positive(id).unwrap(),
+                id: TaskId::from_registry_allocation(core::num::NonZeroI32::new(id).unwrap()),
                 ..key(99)
             };
             owner.tasks.insert(
@@ -690,7 +690,7 @@ fn prepared_exit_effects_reject_stale_membership_snapshot() {
         );
         for id in 100..612 {
             let other = TaskKey {
-                id: TaskId::from_abi_positive(id).unwrap(),
+                id: TaskId::from_registry_allocation(core::num::NonZeroI32::new(id).unwrap()),
                 ..key(99)
             };
             owner.tasks.insert(

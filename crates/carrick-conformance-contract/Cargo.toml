@@ -18,4 +18,5 @@ carrick-abi = { path = "../carrick-abi" }
 carrick-observability = { path = "../carrick-observability", features = ["conformance-metrics"] }
 
 [dev-dependencies]
+carrick-personality-api = { path = "../carrick-personality-api" }
 tempfile.workspace = true

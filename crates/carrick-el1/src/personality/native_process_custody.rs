@@ -178,8 +178,8 @@ mod tests {
     use carrick_sched_core::{
         ParkedContextWords,
         process::{
-            ChildExitSignal, LinuxSignal, TaskId, TaskIdentity, TaskKey, TaskSerial,
-            WaitChildClass, WaitTarget,
+            ChildExitSignal, LinuxSignal, TaskIdentity, TaskKey, TaskSerial, WaitChildClass,
+            WaitTarget,
             birth::BirthAttachment,
             exit::{DefaultSignalDisposition, ExitSignalDisposition, ExitSignalState},
             wait::{WaitQuery, WaitReadiness, WaitSelection},
@@ -233,7 +233,7 @@ mod tests {
     }
     fn key(id: i32) -> TaskKey {
         TaskKey {
-            id: TaskId::from_abi_positive(id).unwrap(),
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(id).unwrap(),
             serial: TaskSerial::from_raw_u64(id as u64).unwrap(),
         }
     }

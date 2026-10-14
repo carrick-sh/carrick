@@ -456,7 +456,7 @@ impl Deref for ThreadControlLease {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::ids::{LinuxTid, ObjectIdRegistry, TaskId};
+    use crate::kernel::ids::{LinuxTid, ObjectIdRegistry};
 
     mod serial_host {
         use super::*;
@@ -465,7 +465,7 @@ mod tests {
         fn lifecycle_backing_keeps_one_vm_object_across_host_fork() {
             let ids = ObjectIdRegistry::new();
             let owner = TaskKey {
-                id: TaskId::from_abi_positive(100).unwrap(),
+                id: carrick_personality_linux::identity::task_id_from_linux_pid(100).unwrap(),
                 serial: ids.task_serial().unwrap(),
             };
             let key = ThreadKey {
@@ -533,7 +533,7 @@ mod tests {
     fn equal_numeric_keys_do_not_cross_live_arena_authorities() {
         let ids = ObjectIdRegistry::new();
         let owner = TaskKey {
-            id: TaskId::from_abi_positive(100).unwrap(),
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(100).unwrap(),
             serial: ids.task_serial().unwrap(),
         };
         let key = ThreadKey {
@@ -573,7 +573,7 @@ mod tests {
     fn pins_delay_reuse_and_release_backing_after_arena_teardown() {
         let ids = ObjectIdRegistry::new();
         let owner = TaskKey {
-            id: TaskId::from_abi_positive(100).unwrap(),
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(100).unwrap(),
             serial: ids.task_serial().unwrap(),
         };
         let key = || ThreadKey {
@@ -611,7 +611,7 @@ mod tests {
     fn control_pages_grow_without_moving_live_slots() {
         let ids = ObjectIdRegistry::new();
         let owner = TaskKey {
-            id: TaskId::from_abi_positive(100).unwrap(),
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(100).unwrap(),
             serial: ids.task_serial().unwrap(),
         };
         let arena = ThreadControlArena::new(owner);

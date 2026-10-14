@@ -3,6 +3,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 extern crate alloc;
 pub use carrick_core_abi::Served;
+pub use carrick_sched_core::process::{TaskRusage, TerminationStatus};
 pub mod entry;
 pub mod file;
 pub mod lifecycle;

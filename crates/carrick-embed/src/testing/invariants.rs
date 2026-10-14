@@ -359,7 +359,7 @@ mod tests {
     fn sample_task_key(pid: i32) -> TaskKey {
         let registry = ObjectIdRegistry::new();
         TaskKey {
-            id: TaskId::from_abi_positive(pid).unwrap(),
+            id: TaskId::from_registry_allocation(core::num::NonZeroI32::new(pid).unwrap()),
             serial: registry.task_serial().unwrap(),
         }
     }

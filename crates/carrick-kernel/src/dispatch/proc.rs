@@ -165,7 +165,7 @@ fn guest_pid_to_task_id(
     let raw = u32::try_from(pid.0).map_err(|_| LINUX_ESRCH)?;
     let host = crate::namespace::pid::ns_to_kernel_for(context, raw).ok_or(LINUX_ESRCH)?;
     let host = i32::try_from(host).map_err(|_| LINUX_ESRCH)?;
-    crate::kernel::TaskId::from_abi_positive(host).map_err(|_| LINUX_ESRCH)
+    carrick_personality_linux::identity::task_id_from_linux_pid(host).map_err(|_| LINUX_ESRCH)
 }
 
 fn identity_target_task(
@@ -882,7 +882,7 @@ impl<'a> ProcView<'a> {
         let namespace_id = u32::try_from(pid).ok()?;
         let pid = crate::namespace::pid::ns_to_kernel_for(context, namespace_id)
             .and_then(|pid| i32::try_from(pid).ok())?;
-        let Ok(task) = crate::kernel::TaskId::from_abi_positive(pid) else {
+        let Ok(task) = carrick_personality_linux::identity::task_id_from_linux_pid(pid) else {
             return None;
         };
         let kernel = process.kernel_graph();

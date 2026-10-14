@@ -485,7 +485,7 @@ impl CapturedAsyncIoOwner {
             }
             _ => crate::namespace::pid::ns_to_kernel_for(context, namespace_id)
                 .and_then(|id| i32::try_from(id).ok())
-                .and_then(|id| TaskId::from_abi_positive(id).ok())
+                .and_then(|id| carrick_personality_linux::identity::task_id_from_linux_pid(id).ok())
                 .and_then(|id| context.kernel().registry().task(id))
                 .filter(|task| task.container().id().raw() == container_id)
                 .map(|task| AsyncIoTarget {
@@ -506,7 +506,9 @@ impl CapturedAsyncIoOwner {
         signal: LinuxSignal,
         siginfo: Option<LinuxSiginfo>,
     ) -> bool {
-        let Some(target_id) = TaskId::from_abi_positive(self.target.target_id).ok() else {
+        let Some(target_id) =
+            carrick_personality_linux::identity::task_id_from_linux_pid(self.target.target_id).ok()
+        else {
             return false;
         };
         match self.visible.owner_type {
