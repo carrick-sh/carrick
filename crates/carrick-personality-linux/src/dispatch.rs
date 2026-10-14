@@ -1117,6 +1117,12 @@ mod ring_first_tests {
         forwarded: [AtomicU64; 512],
     }
     impl<'a> PendingFamilies<'a> for CarrierOwned<'a> {
+        fn guest_isa(&self) -> carrick_guest_arch::GuestIsa {
+            match self.set {
+                HostCrossingSet::X86 => carrick_guest_arch::GuestIsa::X86_64,
+                HostCrossingSet::Aarch64 => carrick_guest_arch::GuestIsa::Aarch64,
+            }
+        }
         fn binding(&self) -> Option<ExecutionBinding> {
             if !self.admitted {
                 return None;
