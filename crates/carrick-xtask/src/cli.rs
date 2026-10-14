@@ -300,7 +300,25 @@ where
     W: Write,
 {
     let argv: Vec<OsString> = args.into_iter().map(Into::into).collect();
-    let cli = Cli::try_parse_from(&argv)?;
+    let cli = match Cli::try_parse_from(&argv) {
+        Ok(cli) => cli,
+        // `--help` and `--version` are successful requests: print to stdout
+        // and exit 0, so callers that probe a subcommand's flags (the
+        // standing CI template qualification) see a clean status.
+        Err(err)
+            if matches!(
+                err.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) =>
+        {
+            write!(writer, "{}", err.render()).map_err(|source| CliError::Io {
+                path: PathBuf::from("stdout"),
+                source,
+            })?;
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
     if std::env::var_os("CARRICK_HOST_LEASE_SOCKET").is_none() {
         let mode = match &cli.command {
             Commands::Accept(_) => Some(crate::host_lease::HostLeaseMode::Gate),

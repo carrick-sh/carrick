@@ -266,3 +266,21 @@ fn worktree_run_preserves_signal_status() {
         }
     }
 }
+
+#[test]
+fn subcommand_help_exits_zero_on_stdout() {
+    let bin = env!("CARGO_BIN_EXE_carrick-xtask");
+    let output = Command::new(bin)
+        .args(["ci-scaler", "admit-job", "--help"])
+        .output()
+        .expect("spawn carrick-xtask ci-scaler admit-job --help");
+    assert!(output.status.success(), "help exited {:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--controller"), "stdout: {stdout}");
+    assert!(output.stderr.is_empty());
+
+    let mut out = Vec::new();
+    cli::run_with_writer(["carrick-xtask", "remote-accept", "--help"], &mut out)
+        .expect("help is not an error");
+    assert!(String::from_utf8_lossy(&out).contains("--ref"));
+}
