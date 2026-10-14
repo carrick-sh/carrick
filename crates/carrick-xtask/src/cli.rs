@@ -119,6 +119,12 @@ pub enum Commands {
         about = "Derive each test target's gate lane from Cargo metadata and check coverage"
     )]
     TestLanes(crate::test_lanes::TestLanesArgs),
+
+    #[command(
+        name = "commit-trailers",
+        about = "Enforce the Co-Authored-By trailer standard on commit messages and ranges"
+    )]
+    CommitTrailers(crate::commit_trailers::CommitTrailersArgs),
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -222,6 +228,8 @@ pub enum CliError {
     ProbeEmitters(#[from] crate::probe_emitters::ProbeEmittersError),
     #[error("guest image: {0}")]
     GuestImage(#[from] crate::guest_image::GuestImageError),
+    #[error(transparent)]
+    CommitTrailers(#[from] crate::commit_trailers::CommitTrailersError),
 }
 
 pub fn resolve_repo_info(root: Option<&Path>) -> Result<RepoInfo, CliError> {
@@ -533,6 +541,11 @@ where
         }
         Commands::PackageGuestImage(args) => {
             crate::guest_image::run_package_guest_image(&args)?;
+            Ok(())
+        }
+        Commands::CommitTrailers(args) => {
+            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
+            crate::commit_trailers::run(&root, args, writer)?;
             Ok(())
         }
     }

@@ -182,10 +182,10 @@ check-debug-features:
     {{_admit}} {{_cargo}} check -p carrick-kernel-example --features allocation-metrics
 
 
-# Install git hooks (.githooks/): fmt-check at commit, clippy gate at push.
+# Install git hooks (.githooks/): fmt-check and trailer check at commit, clippy gate at push.
 install-hooks:
     git config core.hooksPath .githooks
-    @echo "Installed hooks: pre-commit (fmt-check), pre-push (clippy). --no-verify needs owner approval recorded on the PR."
+    @echo "Installed hooks: pre-commit (fmt-check), commit-msg (co-author trailer), pre-push (clippy). --no-verify needs owner approval recorded on the PR."
 
 # No-panic lint gate (unwrap/expect/panic/todo denied) — matches CI.
 # `--keep-going` reports clippy errors across ALL crates in one pass instead of
@@ -1291,10 +1291,11 @@ ci-results:
          del(.changes) | all(.[]; .result == "success")
        elif $event == "pull_request" then
          (del(.changes) | with_entries(select(.key | startswith("macos-"))) | all(.[]; .result == "skipped")) and
-         (del(.changes) | with_entries(select((.key | startswith("macos-") | not) and .key != "actionlint" and .key != "linked-issue"))
+         (del(.changes) | with_entries(select((.key | startswith("macos-") | not) and .key != "actionlint" and .key != "linked-issue" and .key != "commit-trailers"))
            | if ($root.changes.outputs.heavy // "true") == "true" then all(.[]; .result == "success")
              else all(.[]; .result == "skipped") end) and
          (.["linked-issue"].result == "success") and
+         (.["commit-trailers"].result == "success") and
          (del(.changes).actionlint
            | if ($root.changes.outputs.workflows // "false") == "true" then .result == "success"
              else .result == "skipped" end)

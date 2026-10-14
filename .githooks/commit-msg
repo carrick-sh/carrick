@@ -1,0 +1,35 @@
+#!/bin/sh
+# Carrick commit-msg hook: validate Co-Authored-By trailers.
+#
+# Enforces exact `Co-Authored-By: <Name> <email>` trailers on every commit.
+# Install with `just install-hooks` (sets core.hooksPath to .githooks).
+#
+# `git commit --no-verify` only with owner approval recorded on the PR (AGENTS.md).
+
+set -eu
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+msg_file="$1"
+if [ ! -f "$msg_file" ]; then
+    if [ -f "$root/$msg_file" ]; then
+        msg_file="$root/$msg_file"
+    fi
+fi
+
+if [ -x "$root/target/release/carrick-xtask" ]; then
+    check="$root/target/release/carrick-xtask commit-trailers check-message $msg_file"
+elif [ -x "$root/target/debug/carrick-xtask" ]; then
+    check="$root/target/debug/carrick-xtask commit-trailers check-message $msg_file"
+elif command -v just >/dev/null 2>&1; then
+    check="just xtask commit-trailers check-message $msg_file"
+else
+    check="cargo run --locked -q -p carrick-xtask -- commit-trailers check-message $msg_file"
+fi
+
+printf 'commit-msg: validating trailers (%s)\n' "$check"
+if ! $check; then
+    printf '\ncommit-msg: trailer check failed.\n' >&2
+    exit 1
+fi

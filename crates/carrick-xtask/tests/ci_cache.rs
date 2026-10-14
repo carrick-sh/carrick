@@ -8,6 +8,10 @@ fn hosted_caches_keep_profiles_compiler_data_and_bootstrap_artifacts() {
     let workflow = &documents[0];
     let mut cached_jobs = 0;
     for (job, body) in workflow["jobs"].as_hash().unwrap() {
+        if job.as_str() == Some("commit-trailers") {
+            // commit-trailers reuses the cheap gate-xtask-release cache without sccache.
+            continue;
+        }
         let Some(steps) = body["steps"].as_vec() else {
             continue;
         };

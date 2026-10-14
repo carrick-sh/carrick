@@ -115,6 +115,40 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: scripts/ci/require-linked-issue.sh
 
+  # Enforce canonical Co-Authored-By trailers on all non-merge PR commits.
+  # Runs on every event so ci-ok can require plain success; it passes trivially
+  # outside pull_request.
+  commit-trailers:
+    name: commit-trailers
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Skip non-pull-request events
+        if: github.event_name != 'pull_request'
+        run: echo "commit-trailers (${{ github.event_name }}) is not a pull_request; passing."
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        if: github.event_name == 'pull_request'
+        with:
+          shared-key: gate-xtask-release
+          cache-workspace-crates: "true"
+          save-if: false
+      - name: Build xtask
+        if: github.event_name == 'pull_request'
+        run: cargo build --locked --release -p carrick-xtask
+      - name: Enforce Co-Authored-By trailers
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: target/release/carrick-xtask commit-trailers check-range "$BASE_SHA..$HEAD_SHA"
+
   # Independent checks keep reporting after an earlier check fails. No
   # continue-on-error: every failure still makes its job (and ci-ok) fail.
 
@@ -800,6 +834,7 @@ jobs:
       - changes
       - actionlint
       - linked-issue
+      - commit-trailers
       - lint
       - portable
       - linux-doc
