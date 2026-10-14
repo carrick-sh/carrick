@@ -455,8 +455,8 @@ In Carrick, guest-visible correctness includes Linux semantics and non-pathologi
 
 ### Directing workers is reviewing diffs, not reading reports
 
-Worker worktrees (agy/codex) code; the director owns runtime fixes, live
-verification, acceptance.
+Worker worktrees code; the director owns runtime fixes, live verification,
+acceptance.
 
 - **Verdicts are claims** (`tests_passing: true` on non-compiling diffs has
   happened) — re-verify in the worktree; land only what you read.
@@ -485,8 +485,11 @@ verification, acceptance.
   runs `just accept --profile linux-portable` and the signed gate once per
   stacked batch, in a dedicated detached worktree at the PR SHA, never in a
   worker's live worktree.
-- **Routing:** codex (Sol) for shared-kernel, mm, fork, signal, carrier and
-  seam work; Gemini for precisely specified mechanical work.
+- **Routing:** a strong design-capable worker for shared-kernel, mm, fork,
+  signal, carrier and seam work; a fast instruction-following worker for
+  precisely specified mechanical work. A lane refused by one provider's
+  content filter restarts fresh on the same worktree (WIP committed first)
+  with a provider tier suited to systems work, never by rewording the retry.
 
 ### GitHub-first workflow
 
@@ -584,9 +587,8 @@ Chat, worker mailboxes, scratch notes and agent memory are not.
   - **What** — approach and any candid divergence from Linux;
   - **Verified** — probe/test/LTP case/oracle diff; name red-first probes;
   - `-` bullets for distinct parts; backtick symbols/paths.
-- **Trailer:** `Co-Authored-By:` for the agent, after a blank line, e.g.
-  `Co-Authored-By: Codex <codex@openai.com>`; agy/Gemini commits use
-  `Co-Authored-By: Antigravity <noreply@google.com>`. Rewording another agent's
+- **Trailer:** `Co-Authored-By:` naming the agent that wrote the change, after
+  a blank line, in the form its tool documents. Rewording another agent's
   commits: PRESERVE the author.
 - **Fix forward:** repair a bad landing with a follow-up commit; never
   `git revert` or reset main. Delete measured-worse code in a
