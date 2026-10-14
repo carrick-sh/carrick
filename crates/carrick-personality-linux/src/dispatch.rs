@@ -1112,6 +1112,7 @@ mod ring_first_tests {
         admitted: bool,
         work: bool,
         handback: bool,
+        signal_restore_calls: u32,
         refused: &'a [AtomicU64; 513],
         forwarded: [AtomicU64; 512],
     }
@@ -1126,6 +1127,9 @@ mod ring_first_tests {
                 mm: EntryMmKey::from_raw(1),
                 thread_generation: EntryThreadGeneration::from_raw(1),
             })
+        }
+        fn signal_native(&mut self) -> Option<&mut dyn crate::signal::SignalNative<'a>> {
+            Some(self)
         }
         fn native_number(&self) -> Option<carrick_syscall_abi::NativeNr> {
             Some(self.native)
@@ -1173,6 +1177,71 @@ mod ring_first_tests {
         }
     }
 
+    impl crate::lifecycle::UserCopy for CarrierOwned<'_> {
+        fn copy_in(&mut self, _dst: &mut [u8], _src: carrick_guest_arch::UserVa) -> bool {
+            false
+        }
+        fn copy_out(&mut self, _dst: carrick_guest_arch::UserVa, _src: &[u8]) -> bool {
+            false
+        }
+    }
+
+    impl<'a> crate::signal::SignalNative<'a> for CarrierOwned<'a> {
+        fn arguments(&self) -> [u64; 6] {
+            [0; 6]
+        }
+        fn process_signals(&mut self) -> Option<&mut dyn crate::signal::ProcessSignals> {
+            None
+        }
+        fn current_blocked(&self) -> carrick_signal_core::policy::SigBlockMask {
+            carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                carrick_signal_core::SignalSet::from_bits(0),
+            )
+        }
+        fn set_current_blocked(&mut self, _mask: carrick_signal_core::policy::SigBlockMask) {}
+        fn current_pid(&self) -> u32 {
+            1
+        }
+        fn current_tid(&self) -> u32 {
+            1
+        }
+        fn restore_signal_frame(
+            &mut self,
+        ) -> Result<carrick_signal_core::policy::SigBlockMask, carrick_syscall_abi::LinuxErrno>
+        {
+            self.signal_restore_calls += 1;
+            Ok(self.current_blocked())
+        }
+    }
+
+    #[test]
+    fn x86_signal_return_restores_frame_with_owned_wait_work_pending() {
+        let refused = [const { AtomicU64::new(0) }; 513];
+        let mut pending = CarrierOwned {
+            set: HostCrossingSet::X86,
+            mutate_forward: false,
+            strict: true,
+            state: crate::abi::entry::LinuxTaskState::new(),
+            native: carrick_syscall_abi::NativeNr(15),
+            admitted: true,
+            result: 42,
+            work: true,
+            handback: false,
+            signal_restore_calls: 0,
+            refused: &refused,
+            forwarded: [const { AtomicU64::new(0) }; 512],
+        };
+        pending.state.mark_pending_host_work();
+        assert_eq!(
+            dispatch(139, u64::MAX, &mut pending),
+            CompletionRoute::WithWork
+        );
+        assert_eq!(pending.signal_restore_calls, 1);
+        assert_eq!(pending.result, 42);
+        assert!(pending.state.has_pending_host_work());
+        assert_eq!(pending.refused[139].load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn failed_entry_admission_cannot_bypass_crossing_policy() {
         let refused = [const { AtomicU64::new(0) }; 513];
@@ -1186,6 +1255,7 @@ mod ring_first_tests {
             result: 42,
             work: false,
             handback: false,
+            signal_restore_calls: 0,
             refused: &refused,
             forwarded: [const { AtomicU64::new(0) }; 512],
         };
@@ -1225,6 +1295,7 @@ mod ring_first_tests {
                 result: 42,
                 work,
                 handback,
+                signal_restore_calls: 0,
                 refused: &refused,
                 forwarded: [const { AtomicU64::new(0) }; 512],
             };
@@ -1269,6 +1340,7 @@ mod ring_first_tests {
                 result: 42,
                 work: true,
                 handback: false,
+                signal_restore_calls: 0,
                 refused: &refused,
                 forwarded: [const { AtomicU64::new(0) }; 512],
             };
@@ -1305,6 +1377,7 @@ mod ring_first_tests {
                 result: 42,
                 work: true,
                 handback: false,
+                signal_restore_calls: 0,
                 refused: &refused,
                 forwarded: [const { AtomicU64::new(0) }; 512],
             };
@@ -1337,6 +1410,7 @@ mod ring_first_tests {
             result: 42,
             work: false,
             handback: false,
+            signal_restore_calls: 0,
             refused: &refused,
             forwarded: [const { AtomicU64::new(0) }; 512],
         };
@@ -1365,6 +1439,7 @@ mod ring_first_tests {
                 result: 42,
                 work: false,
                 handback: false,
+                signal_restore_calls: 0,
                 refused: &refused,
                 forwarded: [const { AtomicU64::new(0) }; 512],
             };
