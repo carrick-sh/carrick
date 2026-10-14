@@ -561,14 +561,16 @@ mod tests {
     fn ci_scaler_refusal_history_is_bounded_and_newest_decision_is_durable() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.json");
-        let mut ledger = Ledger::default();
-        ledger.refused = (1..=4096)
-            .map(|n| JobKey {
-                run: RunId(n),
-                attempt: 1,
-                job: JobId(n),
-            })
-            .collect();
+        let mut ledger = Ledger {
+            refused: (1..=4096)
+                .map(|n| JobKey {
+                    run: RunId(n),
+                    attempt: 1,
+                    job: JobId(n),
+                })
+                .collect(),
+            ..Ledger::default()
+        };
         let newest = JobKey {
             run: RunId(5000),
             attempt: 1,
