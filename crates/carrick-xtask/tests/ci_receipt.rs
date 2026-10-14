@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use carrick_xtask::accept::{
-    AcceptReceipt, CLEANUP_UNKNOWN, CleanupCount, ProbeDiff, StepResult, parse_failed_tests,
-    parse_unitemized_failures,
+    AcceptReceipt, CLEANUP_UNKNOWN, CleanupCount, ProbeDiff, StepResult, evaluate_el1_step,
+    parse_failed_tests, parse_test_log, parse_unitemized_failures, populate_step_from_log,
 };
 use carrick_xtask::ci_receipt::{
     Baseline, Lane, artifact_name, baseline_decision, diff, failure_keys, newest_receipt,
@@ -20,6 +20,9 @@ fn step(name: &str, passed: bool, failed: &[&str]) -> StepResult {
         error: None,
         failed_tests: failed.iter().map(|t| (*t).to_owned()).collect(),
         unitemized_failures: vec![],
+        started_tests: vec![],
+        finished_binaries: vec![],
+        unfinished_binaries: vec![],
     }
 }
 
@@ -294,4 +297,205 @@ fn a_gate_only_rerun_uses_the_newest_receipt_attempt_not_after_it() {
     // Never a later attempt's receipt, never another lane's.
     assert_eq!(pick_candidate(&names, Lane::Kvm, &sha, 0), None);
     assert_eq!(pick_candidate(&names, Lane::Hvf, &sha, 2), None);
+}
+
+const MAIN_EL1_EXCERPT: &str = include_str!("fixtures/el1-embed-main-3eda28c32-excerpt.log");
+const PR338_EL1_EXCERPT: &str = include_str!("fixtures/el1-embed-pr338-6d4e2f25e-excerpt.log");
+
+fn legacy_single_line_failed_tests(log: &str) -> Vec<String> {
+    log.lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("test ")?
+                .strip_suffix(" ... FAILED")
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+#[test]
+fn nocapture_signed_logs_itemize_failures_and_crashes_from_real_excerpts() {
+    // Under --nocapture, single-line `test X ... FAILED` never appears in either real excerpt.
+    assert!(legacy_single_line_failed_tests(MAIN_EL1_EXCERPT).is_empty());
+    assert!(legacy_single_line_failed_tests(PR338_EL1_EXCERPT).is_empty());
+
+    let main_parsed = parse_test_log(MAIN_EL1_EXCERPT);
+    assert_eq!(
+        main_parsed.failed_tests,
+        vec![
+            "el1_gic::el1_gic_vtimer_reaches_el1_without_host_exits",
+            "el1_host_copyout::el1_file_mmap_replaces_a_live_anonymous_grant",
+            "el1_host_copyout::el1_host_buffers_follow_reused_mapping_in_two_live_processes",
+            "el1_host_copyout::el1_host_copyout_into_and_out_of_untouched_reserved_memory",
+            "el1_inotify::el1_inotify09_contract",
+            "el1_kick_served_loop::el1_served_burst_surfaces_kicks_under_oversubscription",
+        ]
+    );
+    assert!(main_parsed.unitemized_failures.is_empty());
+    assert!(main_parsed.unfinished_binaries.is_empty());
+    assert_eq!(
+        main_parsed.finished_binaries,
+        vec![
+            "el1_gic",
+            "el1_host_copyout",
+            "el1_inotify",
+            "el1_kick_served_loop",
+            "entitlement_negative",
+        ]
+    );
+
+    let pr338_parsed = parse_test_log(PR338_EL1_EXCERPT);
+    assert_eq!(
+        pr338_parsed.failed_tests,
+        vec![
+            "el1_host_copyout::el1_file_mmap_replaces_a_live_anonymous_grant",
+            "el1_host_copyout::el1_host_buffers_follow_reused_mapping_in_two_live_processes",
+            "el1_host_copyout::el1_host_copyout_into_and_out_of_untouched_reserved_memory",
+            "el1_inotify::el1_inotify09_contract",
+            "el1_inotify::el1_inotify_recall_on_dir_watch",
+        ]
+    );
+    assert_eq!(
+        pr338_parsed.unitemized_failures,
+        vec!["crash:el1_kick_served_loop"]
+    );
+    assert_eq!(
+        pr338_parsed.unfinished_binaries,
+        vec!["el1_kick_served_loop"]
+    );
+    assert_eq!(
+        pr338_parsed.finished_binaries,
+        vec![
+            "el1_gic",
+            "el1_host_copyout",
+            "el1_inotify",
+            "entitlement_negative",
+        ]
+    );
+    // Even when `test el1_gic_vtimer_reaches_el1_without_host_exits ...` was glued
+    // after `mailbox=`, it is still recorded in `started_tests`.
+    assert!(
+        pr338_parsed
+            .started_tests
+            .contains(&"el1_gic::el1_gic_vtimer_reaches_el1_without_host_exits".to_string())
+    );
+}
+
+#[test]
+fn replay_pr338_excerpt_against_main_excerpt_yields_new_keys_for_failures_missing_and_abort() {
+    let allowlist = vec![
+        "el1_file_mmap_replaces_a_live_anonymous_grant".to_string(),
+        "el1_gic_vtimer_reaches_el1_without_host_exits".to_string(),
+        "el1_host_buffers_follow_reused_mapping_in_two_live_processes".to_string(),
+        "el1_host_copyout_into_and_out_of_untouched_reserved_memory".to_string(),
+        "el1_inotify09_contract".to_string(),
+        "el1_served_burst_surfaces_kicks_under_oversubscription".to_string(),
+    ];
+
+    let (_, main_passed, main_err) = evaluate_el1_step(Some(1), MAIN_EL1_EXCERPT, &allowlist);
+    assert!(
+        main_passed,
+        "main with all failures allowlisted and finished binaries should pass: {main_err:?}"
+    );
+    let mut main_step = step("el1-embed", main_passed, &[]);
+    let mut main_failures = Vec::new();
+    populate_step_from_log(&mut main_step, MAIN_EL1_EXCERPT, &mut main_failures);
+    assert!(main_failures.is_empty());
+    let base_receipt = receipt(vec![main_step]);
+
+    let (_, pr338_passed, pr338_err) = evaluate_el1_step(Some(1), PR338_EL1_EXCERPT, &allowlist);
+    assert!(
+        !pr338_passed,
+        "pr338 must fail on unexpected failure + crashed/unfinished binary"
+    );
+    assert!(pr338_err.is_some());
+    let mut pr338_step = step("el1-embed", pr338_passed, &[]);
+    let mut pr338_failures = Vec::new();
+    populate_step_from_log(&mut pr338_step, PR338_EL1_EXCERPT, &mut pr338_failures);
+    let cand_receipt = receipt(vec![pr338_step]);
+
+    let result = diff(&base_receipt, &cand_receipt).unwrap();
+    assert_eq!(
+        result.new,
+        vec![
+            "missing:el1_kick_served_loop::el1_served_loop_surfaces_kicks",
+            "step:el1-embed",
+            "test:el1-embed:el1_inotify::el1_inotify_recall_on_dir_watch",
+            "unfinished:el1_kick_served_loop",
+            "unitemized:el1-embed:crash:el1_kick_served_loop",
+        ]
+    );
+    assert_eq!(
+        result.fixed,
+        vec![
+            "test:el1-embed:el1_gic::el1_gic_vtimer_reaches_el1_without_host_exits",
+            "test:el1-embed:el1_kick_served_loop::el1_served_burst_surfaces_kicks_under_oversubscription",
+        ]
+    );
+}
+
+#[test]
+fn el1_step_fails_closed_when_binary_aborts_after_an_allowlisted_failure() {
+    let log = "\
+test-signed: running /w/target/release/deps/el1_a-1111111111111111 el1_ --nocapture
+running 1 test
+test el1_known_red ...
+FAILED
+
+failures:
+
+failures:
+    el1_known_red
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+test-signed: FAIL /w/target/release/deps/el1_a-1111111111111111
+test-signed: running /w/target/release/deps/el1_b-2222222222222222 el1_ --nocapture
+running 1 test
+test el1_aborts_mid_run ...
+scripts/lib/test-signed-body.sh: line 431: 999 Abort trap: 6
+test-signed: FAIL /w/target/release/deps/el1_b-2222222222222222
+";
+    let allowlist = vec!["el1_known_red".to_string()];
+    let (cmp, passed, error) = evaluate_el1_step(Some(1), log, &allowlist);
+    assert!(cmp.unexpected_failures.is_empty());
+    assert!(
+        !passed,
+        "aborted binary must not pass behind an allowlisted failure"
+    );
+    let err = error.unwrap();
+    assert!(err.contains("crash:el1_b"));
+    assert!(err.contains("el1_b"));
+}
+
+#[test]
+fn empty_itemization_with_test_result_failed_is_a_parse_error_that_fails_the_gate() {
+    let log = "\
+test-signed: running /w/target/release/deps/el1_broken-abcdef0123456789 el1_ --nocapture
+running 1 test
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test-signed: FAIL /w/target/release/deps/el1_broken-abcdef0123456789
+";
+    let parsed = parse_test_log(log);
+    assert!(parsed.failed_tests.is_empty());
+    assert!(
+        parsed
+            .unitemized_failures
+            .contains(&"parse-error:el1_broken".to_string())
+    );
+
+    let (_, el1_passed, el1_err) = evaluate_el1_step(Some(1), log, &[]);
+    assert!(!el1_passed);
+    assert!(el1_err.unwrap().contains("empty itemization"));
+
+    let mut s = step("el1-embed", true, &[]);
+    let mut failures = Vec::new();
+    populate_step_from_log(&mut s, log, &mut failures);
+    assert!(!s.passed);
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].contains("empty itemization"));
+
+    let keys = failure_keys(&receipt(vec![s]));
+    assert!(keys.contains("unitemized:el1-embed:parse-error:el1_broken"));
+    assert!(keys.contains("step:el1-embed"));
 }
