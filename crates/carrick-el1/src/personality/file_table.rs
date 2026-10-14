@@ -44,21 +44,31 @@ pub struct GuestDescriptorChange {
 pub const GUEST_FD_CLOEXEC: u32 = 1;
 pub const GUEST_FD_LIMIT: i32 = 1024;
 
+#[cfg(any(test, feature = "host-test"))]
+pub static RETAINED_HOOK: SpinLock<Option<alloc::boxed::Box<dyn FnOnce() + Send>>> =
+    SpinLock::new(None);
+#[cfg(any(test, feature = "host-test"))]
+pub static SNAPSHOT_HOOK: SpinLock<Option<alloc::boxed::Box<dyn FnOnce() + Send>>> =
+    SpinLock::new(None);
+
 fn release_reference(
     open_table: &[DelegatedOpenFile],
     key: ReleasedDescription,
+    file_table: u64,
 ) -> Option<ReleasedDescription> {
-    release_reference_observed(open_table, key, |_| {})
+    release_reference_observed(open_table, key, file_table, |_| {})
 }
 fn release_reference_observed(
     open_table: &[DelegatedOpenFile],
     key: ReleasedDescription,
+    file_table: u64,
     observe: impl FnMut(OpenReferenceWork),
 ) -> Option<ReleasedDescription> {
     let record = open_table.get(key.handle.checked_sub(1)? as usize)?;
     match record.lifetime.release_observed(key.incarnation, observe) {
         OpenRelease::Terminal => {
             queue_open_release(key);
+            carrick_el1_abi::mark_pending_host_work_for_file_tables(&[file_table]);
             Some(key)
         }
         OpenRelease::Live | OpenRelease::Stale => None,
@@ -125,7 +135,7 @@ pub fn close_host_binding_observed(
     };
     Some(GuestDescriptorChange {
         fd,
-        release: release_reference_observed(open_table, description, observe),
+        release: release_reference_observed(open_table, description, file_table, observe),
     })
 }
 
@@ -172,6 +182,10 @@ pub fn dup2_host_binding(
     if !retain_reference(open_table, source) {
         return None;
     }
+    #[cfg(any(test, feature = "host-test"))]
+    if let Some(hook) = RETAINED_HOOK.lock().take() {
+        hook();
+    }
     let (slot, release) = if let Some((old_handle, index)) = target {
         let slot = &fd_map[index];
         let old = ReleasedDescription {
@@ -179,19 +193,19 @@ pub fn dup2_host_binding(
             incarnation: slot.incarnation.load(Ordering::Acquire),
         };
         if !slot.try_claim_live(old.incarnation) {
-            release_reference(open_table, source);
+            release_reference(open_table, source, file_table);
             return None;
         }
         (
             slot,
             (old_handle != 0)
-                .then(|| release_reference(open_table, old))
+                .then(|| release_reference(open_table, old, file_table))
                 .flatten(),
         )
     } else if let Some(index) = tombstone {
         let slot = &fd_map[index];
         if !slot.try_claim_live(1) {
-            release_reference(open_table, source);
+            release_reference(open_table, source, file_table);
             return None;
         }
         (slot, None)
@@ -203,7 +217,7 @@ pub fn dup2_host_binding(
         {
             Some(slot) => (slot, None),
             None => {
-                release_reference(open_table, source);
+                release_reference(open_table, source, file_table);
                 return None;
             }
         }
@@ -256,13 +270,17 @@ pub fn dup_host_binding(
     if !retain_reference(open_table, source) {
         return None;
     }
+    #[cfg(any(test, feature = "host-test"))]
+    if let Some(hook) = RETAINED_HOOK.lock().take() {
+        hook();
+    }
     let claimed = if tombstone.is_some() {
         candidate.try_claim_live(1)
     } else {
         candidate.try_claim()
     };
     if !claimed {
-        release_reference(open_table, source);
+        release_reference(open_table, source, file_table);
         return None;
     }
     let slot = candidate;
@@ -451,6 +469,10 @@ pub fn fork_fd_map(
             copies.push((fd, handle, inc, flags));
         }
     }
+    #[cfg(any(test, feature = "host-test"))]
+    if let Some(hook) = SNAPSHOT_HOOK.lock().take() {
+        hook();
+    }
     let mut claimed = Vec::new();
     for _ in &copies {
         if let Some((index, _)) = fd_map
@@ -467,27 +489,21 @@ pub fn fork_fd_map(
             return false;
         }
     }
-    let mut retained = Vec::new();
-    for &(_, handle, inc, _) in &copies {
-        if handle == 0 || handle & carrick_el1_abi::FD_HANDLE_INOTIFY_TAG != 0 {
-            continue;
-        }
+    // A host close may withdraw a borrowed view after the snapshot. Fork
+    // inherits it only if its exact generation can still be retained. Nothing
+    // fallible follows retention, so fork has no retained-reference rollback.
+    for ((fd, handle, inc, flags), index) in copies.into_iter().zip(claimed) {
         let key = ReleasedDescription {
             handle,
             incarnation: inc,
         };
-        if !retain_reference(open_table, key) {
-            for key in retained {
-                release_reference(open_table, key);
-            }
-            for index in claimed {
-                fd_map[index].clear();
-            }
-            return false;
+        if handle != 0
+            && handle & carrick_el1_abi::FD_HANDLE_INOTIFY_TAG == 0
+            && !retain_reference(open_table, key)
+        {
+            fd_map[index].clear();
+            continue;
         }
-        retained.push(key);
-    }
-    for ((fd, handle, inc, flags), index) in copies.into_iter().zip(claimed) {
         fd_map[index].set_with_flags(child_table, fd, handle, inc, flags & !FdMapSlot::HOST_VIEW);
     }
     true
@@ -511,7 +527,7 @@ pub fn retire_fd_map(fd_map: &[FdMapSlot], open_table: &[DelegatedOpenFile], fil
                 incarnation: slot.incarnation.load(Ordering::Acquire),
             };
             slot.clear();
-            release_reference(open_table, key);
+            release_reference(open_table, key, file_table);
         }
     }
 }
@@ -959,6 +975,33 @@ mod tests {
             None
         );
         assert_eq!(fd_map[child_index].fd_flags.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn fresh_table_cannot_resurrect_terminal_stdio() {
+        let (fd_map, open_table, object_table) = setup_tables();
+        admit_stdio(
+            &fd_map,
+            &open_table,
+            &object_table,
+            10,
+            [false, true, false],
+        );
+        assert!(
+            close_host_binding(&fd_map, &open_table, 10, 1)
+                .unwrap()
+                .release
+                .is_some()
+        );
+        admit_stdio(
+            &fd_map,
+            &open_table,
+            &object_table,
+            11,
+            [false, true, false],
+        );
+        assert!(fd_map_lookup(&fd_map, 11, 1).is_none());
+        assert!(open_table[1].lifetime.is_terminal(1));
     }
 
     #[test]

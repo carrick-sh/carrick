@@ -19,7 +19,6 @@ pub enum OpenRelease {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OpenReferenceWork {
-    pub records: u64,
     pub cas_attempts: u64,
 }
 
@@ -78,10 +77,7 @@ impl OpenLifetime {
         f: impl Fn(u64) -> Option<u64>,
         mut observe: impl FnMut(OpenReferenceWork),
     ) -> OpenRelease {
-        let mut work = OpenReferenceWork {
-            records: 1,
-            cas_attempts: 0,
-        };
+        let mut work = OpenReferenceWork { cas_attempts: 0 };
         let mut old = self.0.load(Ordering::Acquire);
         loop {
             if old >> 32 != incarnation || old & (HOST | COUNT) == 0 {
@@ -218,7 +214,9 @@ pub fn queue_open_release(key: OpenReferenceKey) {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     let region = super::EL1_REGION_BASE as usize;
     #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-    let region = super::X86_CPL0_REGION_BASE as usize;
+    // F2/F3 must wire region-indexed open retirement before x86 emits edges.
+    // Its current static handle namespace has no matching host drain.
+    let region = 0;
     #[cfg(not(target_os = "none"))]
     let region = super::get_el1_region_host_ptr();
     if region != 0 {

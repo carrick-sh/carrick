@@ -2560,6 +2560,14 @@ mod tests {
             path: &str,
             fd: i32,
         ) -> (FsState, RealHostReference) {
+            seam_open_in_table(scratch, path, fd, table())
+        }
+        fn seam_open_in_table(
+            scratch: &std::path::Path,
+            path: &str,
+            fd: i32,
+            file_table: FileTableId,
+        ) -> (FsState, RealHostReference) {
             let backend = carrick_vfs::fs_backend::HostFsBackend::from_path(scratch).unwrap();
             let mut root = carrick_vfs::RootFsVfs::new();
             drop(root.set_overlay(Box::new(backend)));
@@ -2590,7 +2598,7 @@ mod tests {
             let open = OpenFile::new(description, 0);
             enter_zone_at_open(
                 &open,
-                table(),
+                file_table,
                 fd,
                 &fs,
                 Some(&RlimitSet::carrick_defaults()),
@@ -2627,23 +2635,17 @@ mod tests {
         }
         #[test]
         fn file_seam_ring_duplicate_survives_last_host_reference() {
-            let _region = Region::new();
+            let region = Region::new();
             let scratch = tempfile::tempdir().unwrap();
             let (_fs, open) = seam_open(scratch.path(), "/data", 3);
-            let region = get_el1_region_host_ptr();
-            let duplicate = carrick_el1::personality::file_table::dup2_host_binding(
-                fd_map_slots(region),
-                seam_table(&_region),
-                table().raw(),
-                3,
-                5,
-                false,
-            )
-            .unwrap();
-            assert!(duplicate.release.is_none());
-            let identity = open.description.el1_identity().unwrap();
-            open.close_host();
-            assert_seam_live(identity);
+            seam_fork(&region, |_child| {
+                open.close_host();
+                assert_seam_live(open.description.el1_identity().unwrap());
+            });
+            owned_recall::test_drain_external();
+            assert!(owned_recall::wait_for_cleanup_bounded(
+                open.description.el1_identity().unwrap()
+            ));
         }
 
         #[test]
@@ -2653,37 +2655,23 @@ mod tests {
             let (_fs, open) = seam_open(scratch.path(), "/data", 3);
             let address = get_el1_region_host_ptr();
             let handle = open.description.delegation_handle();
-            carrick_el1::personality::file_table::dup2_host_binding(
-                fd_map_slots(address),
-                seam_table(&region),
-                table().raw(),
-                3,
-                5,
-                false,
-            )
-            .unwrap();
-            open.close_host();
-            let description = open.description.clone();
-            let path = scratch.path().to_path_buf();
             let admitted = Arc::new(Mutex::new(None));
-            let observed = admitted.clone();
-            *owned_recall::SETTLE_HOOK.lock() = Some(Box::new(move || {
-                // Pause after lease extraction, before reference-key retirement.
-                recall(&description).unwrap();
-                assert!(ALLOCATED_OPEN_FILES.lock()[handle as usize - 1].allocated);
-                let (fs, next) = seam_open(&path, "/next", 4);
-                assert_ne!(next.description.delegation_handle(), handle);
-                *observed.lock() = Some((fs, next));
-            }));
-            carrick_el1::personality::file_table::close_host_binding(
-                fd_map_slots(address),
-                seam_table(&region),
-                table().raw(),
-                5,
-            )
-            .unwrap();
-            owned_recall::test_drain_external();
-            assert!(owned_recall::wait_for_open_retirement(handle));
+            seam_fork(&region, |child| {
+                open.close_host();
+                let description = open.description.clone();
+                let path = scratch.path().to_path_buf();
+                let observed = admitted.clone();
+                *owned_recall::SETTLE_HOOK.lock() = Some(Box::new(move || {
+                    recall(&description).unwrap();
+                    assert!(ALLOCATED_OPEN_FILES.lock()[handle as usize - 1].allocated);
+                    let (fs, next) = seam_open(&path, "/next", 4);
+                    assert_ne!(next.description.delegation_handle(), handle);
+                    *observed.lock() = Some((fs, next));
+                }));
+                assert_eq!(seam_call(&region, child, 57, 3).1, 0);
+                owned_recall::test_drain_external();
+                assert!(owned_recall::wait_for_open_retirement(handle));
+            });
             let (_next_fs, next) = admitted.lock().take().unwrap();
             assert!(next.description.open_reference().is_some());
             assert!(
@@ -2702,39 +2690,32 @@ mod tests {
             let (_fs, open) = seam_open(scratch.path(), "/data", 3);
             let address = get_el1_region_host_ptr();
             let handle = open.description.delegation_handle();
-            let description = open.description.clone();
-            carrick_el1::personality::file_table::dup2_host_binding(
-                fd_map_slots(address),
-                seam_table(&region),
-                table().raw(),
-                3,
-                5,
-                false,
-            )
-            .unwrap();
-            *owned_recall::ARM_HOOK.lock() = Some(Box::new(move || {
-                let records = unsafe {
-                    std::slice::from_raw_parts(
-                        (address + EL1_OPEN_FILE_TABLE_OFFSET as usize) as *const DelegatedOpenFile,
-                        MAX_ZONE_OPEN_FILES,
+            seam_fork(&region, |child| {
+                let child_table = child.linux.file_table.load(Ordering::Acquire);
+                let description = open.description.clone();
+                *owned_recall::ARM_HOOK.lock() = Some(Box::new(move || {
+                    let records = unsafe {
+                        std::slice::from_raw_parts(
+                            (address + EL1_OPEN_FILE_TABLE_OFFSET as usize)
+                                as *const DelegatedOpenFile,
+                            MAX_ZONE_OPEN_FILES,
+                        )
+                    };
+                    carrick_el1::personality::file_table::close_host_binding(
+                        fd_map_slots(address),
+                        records,
+                        child_table,
+                        3,
                     )
-                };
-                carrick_el1::personality::file_table::close_host_binding(
-                    fd_map_slots(address),
-                    records,
-                    table().raw(),
-                    5,
-                )
-                .unwrap();
-                // The indexed driver cannot drain under the handoff's gate.
-                // Force namespace recall to overtake terminal cleanup instead.
-                recall(&description).unwrap();
-                assert!(ALLOCATED_OPEN_FILES.lock()[handle as usize - 1].allocated);
-                assert!(records[handle as usize - 1].host_object().is_some());
-                assert!(description.open_reference().is_some());
-            }));
-            open.close_host();
-            assert!(owned_recall::wait_for_open_retirement(handle));
+                    .unwrap();
+                    recall(&description).unwrap();
+                    assert!(ALLOCATED_OPEN_FILES.lock()[handle as usize - 1].allocated);
+                    assert!(records[handle as usize - 1].host_object().is_some());
+                    assert!(description.open_reference().is_some());
+                }));
+                open.close_host();
+                assert!(owned_recall::wait_for_open_retirement(handle));
+            });
             assert!(open.description.open_reference().is_none());
         }
 
@@ -2783,192 +2764,343 @@ mod tests {
             let (_fs, open) = seam_open(scratch.path(), "/data", 3);
             let handle = open.description.delegation_handle();
             let address = get_el1_region_host_ptr();
-            carrick_el1::personality::file_table::dup2_host_binding(
-                fd_map_slots(address),
-                seam_table(&region),
-                table().raw(),
-                3,
-                5,
-                false,
-            )
-            .unwrap();
-            *owned_recall::ARM_HOOK.lock() = Some(Box::new(move || {
-                let records = unsafe {
-                    std::slice::from_raw_parts(
-                        (address + EL1_OPEN_FILE_TABLE_OFFSET as usize) as *const DelegatedOpenFile,
-                        MAX_ZONE_OPEN_FILES,
-                    )
-                };
+            seam_fork(&region, |child| {
+                let child_table = child.linux.file_table.load(Ordering::Acquire);
+                *owned_recall::ARM_HOOK.lock() = Some(Box::new(move || {
+                    let records = unsafe {
+                        std::slice::from_raw_parts(
+                            (address + EL1_OPEN_FILE_TABLE_OFFSET as usize)
+                                as *const DelegatedOpenFile,
+                            MAX_ZONE_OPEN_FILES,
+                        )
+                    };
+                    assert!(
+                        carrick_el1::personality::file_table::close_host_binding(
+                            fd_map_slots(address),
+                            records,
+                            child_table,
+                            3
+                        )
+                        .unwrap()
+                        .release
+                        .is_some()
+                    );
+                    owned_recall::notify(zone_tables().unwrap(), carrick_sched_core::Waker::Host);
+                }));
+                open.close_host();
+                let completed = owned_recall::wait_for_open_retirement(handle);
+                owned_recall::test_drain_external();
+                assert!(owned_recall::wait_for_cleanup_bounded(
+                    open.description.el1_identity().unwrap()
+                ));
                 assert!(
-                    carrick_el1::personality::file_table::close_host_binding(
-                        fd_map_slots(address),
-                        records,
-                        table().raw(),
-                        5,
-                    )
-                    .unwrap()
-                    .release
-                    .is_some()
+                    completed,
+                    "terminal edge queued before driver admission was lost"
                 );
-                owned_recall::notify(zone_tables().unwrap(), carrick_sched_core::Waker::Host);
-            }));
-            open.close_host();
-            let completed = owned_recall::wait_for_open_retirement(handle);
-            // Preserve the original verdict before scoped cleanup on a red run.
-            owned_recall::test_drain_external();
-            assert!(owned_recall::wait_for_cleanup_bounded(
-                open.description.el1_identity().unwrap()
-            ));
-            assert!(
-                completed,
-                "terminal edge queued before driver admission was lost"
-            );
+            });
         }
 
         #[test]
         fn file_seam_final_ring_release_has_one_terminal_handoff_at_each_population() {
-            use carrick_el1::personality::file_table::{close_host_binding, dup2_host_binding};
+            use carrick_el1::personality::file_table::{
+                close_host_binding_observed, dup2_host_binding,
+            };
             for population in [1, 16, 512] {
-                let _region = Region::new();
+                let region = Region::new();
                 let scratch = tempfile::tempdir().unwrap();
                 let (_fs, open) = seam_open(scratch.path(), "/data", 3);
-                let region = get_el1_region_host_ptr();
-                let records = seam_table(&_region);
+                let address = get_el1_region_host_ptr();
+                let records = seam_table(&region);
                 let handle = open.description.delegation_handle();
                 let generation = records[handle as usize - 1]
                     .generation
                     .load(Ordering::Acquire);
-                let initial = population.min((FD_MAP_CAPACITY - 1) as i32);
-                for n in 0..initial {
-                    assert!(
-                        dup2_host_binding(
-                            fd_map_slots(region),
-                            records,
-                            table().raw(),
-                            3,
-                            5 + n,
-                            false
-                        )
-                        .unwrap()
-                        .release
-                        .is_none()
-                    );
-                }
-                assert_eq!(
-                    records[handle as usize - 1]
-                        .lifetime
-                        .ring_references(generation),
-                    Some(initial as u32)
-                );
                 let identity = open.description.el1_identity().unwrap();
-                open.close_host();
-                assert_seam_live(identity);
-                // At capacity, reclaim the now-withdrawn host view and admit
-                // the final owned duplicate without widening any table.
-                if initial != population {
-                    dup2_host_binding(
-                        fd_map_slots(region),
-                        records,
-                        table().raw(),
-                        5,
-                        5 + initial,
-                        false,
-                    )
-                    .unwrap();
-                }
-                assert_eq!(
-                    records[handle as usize - 1]
-                        .lifetime
-                        .ring_references(generation),
-                    Some(population as u32)
-                );
-                assert!(fd_map_lookup(fd_map_slots(region), table().raw(), 3).is_none());
-                for n in 0..population {
-                    let mut work = None;
-                    let release =
-                        carrick_el1::personality::file_table::close_host_binding_observed(
-                            fd_map_slots(region),
+                seam_fork(&region, |child| {
+                    let child_table = child.linux.file_table.load(Ordering::Acquire);
+                    open.close_host();
+                    assert_seam_live(identity);
+                    for n in 1..population {
+                        dup2_host_binding(
+                            fd_map_slots(address),
                             records,
-                            table().raw(),
-                            5 + n,
+                            child_table,
+                            3,
+                            4 + n,
+                            false,
+                        )
+                        .unwrap();
+                    }
+                    assert_eq!(
+                        records[handle as usize - 1]
+                            .lifetime
+                            .ring_references(generation),
+                        Some(population as u32)
+                    );
+                    for n in 0..population {
+                        let fd = if n == 0 { 3 } else { 4 + n };
+                        let mut work = None;
+                        let release = close_host_binding_observed(
+                            fd_map_slots(address),
+                            records,
+                            child_table,
+                            fd,
                             |steps| work = Some(steps),
                         )
                         .unwrap()
                         .release;
-                    assert_eq!(release.is_some(), n == population - 1);
-                    assert_eq!(
-                        work,
-                        Some(OpenReferenceWork {
-                            records: 1,
-                            cas_attempts: 1
-                        })
+                        assert_eq!(release.is_some(), n == population - 1);
+                        assert_eq!(work.unwrap().cas_attempts, 1);
+                    }
+                    owned_recall::test_drain_external();
+                    assert!(owned_recall::wait_for_cleanup_bounded(identity));
+                    assert!(!ALLOCATED_OPEN_FILES.lock()[handle as usize - 1].allocated);
+                    assert!(
+                        close_host_binding_observed(
+                            fd_map_slots(address),
+                            records,
+                            child_table,
+                            3,
+                            |_| {}
+                        )
+                        .is_none()
                     );
-                }
-                assert!(
-                    records[handle as usize - 1]
-                        .lifetime
-                        .is_terminal(generation)
-                );
-                // Production indexed drain, followed by a bounded completion wait.
-                owned_recall::test_drain_external();
-                assert!(owned_recall::wait_for_cleanup_bounded(identity));
-                assert_eq!(open.description.delegation_handle(), 0);
-                assert!(!ALLOCATED_OPEN_FILES.lock()[handle as usize - 1].allocated);
-                assert!(
-                    close_host_binding(fd_map_slots(region), records, table().raw(), 5).is_none()
-                );
-                let (_next_fs, next) = seam_open(scratch.path(), "/next", 4);
-                assert_eq!(next.description.delegation_handle(), handle);
-                assert_eq!(
-                    records[handle as usize - 1].lifetime.release(generation),
-                    OpenRelease::Stale
-                );
-                assert!(next.description.open_reference().is_some());
-                next.close_host();
+                    let (_next_fs, next) = seam_open(scratch.path(), "/next", 4);
+                    assert_eq!(next.description.delegation_handle(), handle);
+                    assert_eq!(
+                        records[handle as usize - 1].lifetime.release(generation),
+                        OpenRelease::Stale
+                    );
+                    next.close_host();
+                });
             }
         }
 
         #[test]
-        fn file_seam_fork_retirement_and_recall_preserve_exact_backing_custody() {
+        fn file_seam_failed_dup_rollback_publishes_terminal_host_work() {
             use carrick_el1::personality::file_table::{
-                dup2_host_binding, fork_fd_map, retire_fd_map,
+                RETAINED_HOOK, dup_host_binding, dup2_host_binding,
             };
-            let _region = Region::new();
+            // Primitive rollback safety: borrowed host views are not ARM dup's
+            // production source; real native child descriptors are covered below.
+            for dup2 in [false, true] {
+                let region = Region::new();
+                let scratch = tempfile::tempdir().unwrap();
+                let (_fs, open) = seam_open(scratch.path(), "/data", 3);
+                let address = get_el1_region_host_ptr();
+                let task = unsafe {
+                    &*((address + carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize)
+                        as *const carrick_el1_abi::CurrentTask)
+                };
+                task.set(
+                    carrick_el1_abi::El1TaskId::from_linux_tid(41),
+                    11,
+                    table().raw(),
+                );
+                let description = open.description.clone();
+                open.closed.set(true);
+                *RETAINED_HOOK.lock() = Some(Box::new(move || {
+                    description.release_fd_ref();
+                    // Concurrent slot admission wins after retain, before claim.
+                    for slot in fd_map_slots(address) {
+                        slot.try_claim();
+                    }
+                }));
+                let result = if dup2 {
+                    dup2_host_binding(
+                        fd_map_slots(address),
+                        seam_table(&region),
+                        table().raw(),
+                        3,
+                        5,
+                        false,
+                    )
+                } else {
+                    dup_host_binding(
+                        fd_map_slots(address),
+                        seam_table(&region),
+                        table().raw(),
+                        3,
+                        5,
+                        1024,
+                        false,
+                    )
+                };
+                assert!(result.is_none());
+                let owed = task.linux.has_pending_host_work();
+                for slot in fd_map_slots(address) {
+                    slot.clear();
+                }
+                owned_recall::test_drain_external();
+                assert!(owned_recall::wait_for_cleanup_bounded(
+                    open.description.el1_identity().unwrap()
+                ));
+                assert!(owed, "terminal dup rollback did not mark pending host work");
+            }
+        }
+
+        #[test]
+        fn file_seam_native_fork_survives_host_close_during_snapshot() {
+            let region = Region::new();
             let scratch = tempfile::tempdir().unwrap();
             let (_fs, open) = seam_open(scratch.path(), "/data", 3);
-            let region = get_el1_region_host_ptr();
-            let records = seam_table(&_region);
-            let handle = open.description.delegation_handle();
-            let generation = records[handle as usize - 1]
-                .generation
-                .load(Ordering::Acquire);
-            dup2_host_binding(fd_map_slots(region), records, table().raw(), 3, 5, false).unwrap();
-            assert!(fork_fd_map(fd_map_slots(region), records, table().raw(), 2));
-            assert_eq!(
-                records[handle as usize - 1]
-                    .lifetime
-                    .ring_references(generation),
-                Some(3)
+            let description = open.description.clone();
+            open.closed.set(true);
+            *carrick_el1::personality::file_table::SNAPSHOT_HOOK.lock() =
+                Some(Box::new(move || {
+                    description.release_fd_ref();
+                }));
+            let address = get_el1_region_host_ptr();
+            carrick_el1::personality::aarch64_process_tests::with_native_file_fork(
+                fd_map_slots(address),
+                seam_table(&region),
+                table().raw(),
+                |child| {
+                    let child_table = child.linux.file_table.load(Ordering::Acquire);
+                    assert!(fd_map_lookup(fd_map_slots(address), child_table, 3).is_none());
+                },
             );
-            let identity = open.description.el1_identity().unwrap();
-            open.close_host();
-            assert_seam_live(identity);
-            // A real namespace/storage recall demotes bytes, not open lifetime.
-            recall(&open.description).unwrap();
-            assert_eq!(open.description.delegation_handle(), 0);
-            assert!(ALLOCATED_OPEN_FILES.lock()[handle as usize - 1].allocated);
-            assert!(records[handle as usize - 1].host_object().is_some());
-            retire_fd_map(fd_map_slots(region), records, 2);
-            assert_eq!(
-                records[handle as usize - 1]
-                    .lifetime
-                    .ring_references(generation),
-                Some(1)
+            assert!(owned_recall::wait_for_cleanup_bounded(
+                open.description.el1_identity().unwrap()
+            ));
+        }
+
+        fn seam_fork(region: &Region, witness: impl FnOnce(&carrick_el1_abi::CurrentTask)) {
+            carrick_el1::personality::aarch64_process_tests::with_native_file_fork(
+                fd_map_slots(get_el1_region_host_ptr()),
+                seam_table(region),
+                table().raw(),
+                witness,
             );
-            retire_fd_map(fd_map_slots(region), records, table().raw());
-            owned_recall::test_drain_external();
-            assert!(!ALLOCATED_OPEN_FILES.lock()[handle as usize - 1].allocated);
-            assert!(open.description.open_reference().is_none());
+        }
+
+        // Actual ARM descriptor routing, with the same tables used by admission.
+        fn seam_call(
+            region: &Region,
+            task: &carrick_el1_abi::CurrentTask,
+            nr: u64,
+            fd: i32,
+        ) -> (carrick_el1_abi::Action, i64) {
+            let address = get_el1_region_host_ptr();
+            let objects = unsafe {
+                std::slice::from_raw_parts(
+                    (address + EL1_OBJECT_TABLE_OFFSET as usize) as *const DelegatedFile,
+                    MAX_DELEGATED_FILES,
+                )
+            };
+            let mut frame = carrick_el1_abi::TrapFrame::default();
+            frame.x[8] = nr;
+            frame.x[0] = fd as u64;
+            let action = carrick_el1::dispatch_syscall_with_regions::<
+                _,
+                carrick_el1::sched::FakeCpu,
+                carrick_el1::sched::HardwareUserWord,
+            >(
+                &mut frame,
+                &carrick_el1_abi::Counters::default(),
+                std::slice::from_ref(task),
+                fd_map_slots(address),
+                objects,
+                seam_table(region),
+                &[],
+                &carrick_el1_abi::InotifyNameCache::new(),
+                None,
+                |handle| delegated_cache(address, handle),
+            );
+            (action, frame.x[0] as i64)
+        }
+
+        #[test]
+        fn file_seam_native_child_close_cannot_leave_a_shadow_slot() {
+            let region = Region::new();
+            let scratch = tempfile::tempdir().unwrap();
+            let (_fs, open) = seam_open(scratch.path(), "/data", 3);
+            let address = get_el1_region_host_ptr();
+            carrick_el1::personality::aarch64_process_tests::with_native_file_fork(
+                fd_map_slots(address),
+                seam_table(&region),
+                table().raw(),
+                |child| {
+                    let child_table = child.linux.file_table.load(Ordering::Acquire);
+                    assert!(fd_map_lookup(fd_map_slots(address), child_table, 3).is_some());
+                    let (dup_route, dup_fd) = seam_call(&region, child, 23, 3);
+                    assert_ne!(dup_route, carrick_el1_abi::Action::Forward);
+                    assert_eq!(dup_fd, 0);
+                    assert_eq!(
+                        fd_map_lookup(fd_map_slots(address), child_table, 0)
+                            .unwrap()
+                            .0,
+                        open.description.delegation_handle()
+                    );
+                    let (route, result) = seam_call(&region, child, 57, 3);
+                    assert_ne!(
+                        route,
+                        carrick_el1_abi::Action::Forward,
+                        "native child's close was forwarded with no host table"
+                    );
+                    assert_eq!(result, 0);
+                    assert!(
+                        fd_map_lookup(fd_map_slots(address), child_table, 3).is_none(),
+                        "closed child descriptor shadows fd reuse"
+                    );
+                    let (_next_fs, next) = seam_open_in_table(
+                        scratch.path(),
+                        "/next",
+                        3,
+                        FileTableId::from_raw_u64(child_table).unwrap(),
+                    );
+                    assert_eq!(
+                        fd_map_lookup(fd_map_slots(address), child_table, 3)
+                            .unwrap()
+                            .0,
+                        next.description.delegation_handle()
+                    );
+                    next.close_host();
+                    open.close_host();
+                },
+            );
+            assert!(owned_recall::wait_for_cleanup_bounded(
+                open.description.el1_identity().unwrap()
+            ));
+        }
+
+        #[test]
+        fn file_seam_native_child_exit_preserves_parent_and_terminal_custody() {
+            for parent_closes_first in [false, true] {
+                let region = Region::new();
+                let scratch = tempfile::tempdir().unwrap();
+                let (_fs, open) = seam_open(scratch.path(), "/data", 3);
+                let identity = open.description.el1_identity().unwrap();
+                let address = get_el1_region_host_ptr();
+                carrick_el1::personality::aarch64_process_tests::with_native_file_fork(
+                    fd_map_slots(address),
+                    seam_table(&region),
+                    table().raw(),
+                    |_child| {
+                        if parent_closes_first {
+                            open.close_host();
+                        }
+                        assert_seam_live(identity);
+                        if parent_closes_first {
+                            let handle = open.description.open_reference().unwrap().handle;
+                            recall(&open.description).unwrap();
+                            assert!(ALLOCATED_OPEN_FILES.lock()[handle as usize - 1].allocated);
+                            assert!(
+                                seam_table(&region)[handle as usize - 1]
+                                    .host_object()
+                                    .is_some()
+                            );
+                        }
+                    },
+                );
+                if !parent_closes_first {
+                    assert_seam_live(identity);
+                    open.close_host();
+                }
+                owned_recall::test_drain_external();
+                assert!(owned_recall::wait_for_cleanup_bounded(identity));
+                assert!(open.description.open_reference().is_none());
+            }
         }
 
         /// Simulate EL1 serving a write: bytes into the cache, size, offset and
