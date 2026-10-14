@@ -268,23 +268,7 @@ pub fn dispatch_syscall(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 |handle| carrick_el1_abi::delegated_file_cache_va(handle) as *mut u8,
             );
             match route {
-                Ok(route) => match route {
-                    carrick_personality_linux::dispatch::CompletionRoute::Served => Action::Served,
-                    carrick_personality_linux::dispatch::CompletionRoute::WithWork => {
-                        Action::ServedWithWork
-                    }
-                    carrick_personality_linux::dispatch::CompletionRoute::Suspended => Action::Idle,
-                    carrick_personality_linux::dispatch::CompletionRoute::Forward => {
-                        if arm_process_call_claimed(frame.x[8], frame.x[0], || true) {
-                            refuse_owner_process_call(frame, counters, current_tasks)
-                        } else {
-                            Action::Forward
-                        }
-                    }
-                    carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion => {
-                        invalid_completion(NativeInvariant::EntryBinding)
-                    }
-                },
+                Ok(route) => resolve_arm_process_route(route, page, frame, counters, current_tasks),
                 Err(_) => refuse_owner_process_call(frame, counters, current_tasks),
             }
         }
@@ -372,6 +356,7 @@ where
         zone: service.zone,
         slot: service.slot,
     };
+    let nr = frame.x[8];
     super::aarch64_process::with_process_entry(
         source,
         service.task,
@@ -381,7 +366,7 @@ where
         control,
         service,
         |process| {
-            dispatch_syscall_with_native(
+            let route = dispatch_syscall_with_native(
                 frame,
                 counters,
                 current_tasks,
@@ -393,13 +378,37 @@ where
                 zone,
                 ipc,
                 lifecycle,
-                Some(process),
+                Some(&mut *process),
                 Some(source),
                 None,
                 cache_lookup,
-            )
+            );
+            retire_forwarded_exit_member(nr, route, page, control, process);
+            route
         },
     )
+}
+
+/// A non-last thread's raw `exit` that the in-ring path declined (robust
+/// list, pending signal, clear-tid wake, host work...) is retired by the
+/// host, which walks the robust list and drops the live census. The owner
+/// retires that member now: the host never returns this thread to the ring.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[inline(never)]
+fn retire_forwarded_exit_member<C: carrick_core_abi::EntryContext>(
+    nr: u64,
+    route: carrick_personality_linux::dispatch::CompletionRoute,
+    page: &carrick_el1_abi::ThreadLifecyclePage,
+    control: &carrick_el1_abi::ThreadControlSlot,
+    process: &mut dyn lifecycle::ProcessNative<C>,
+) {
+    if nr == carrick_personality_linux::lifecycle::SYS_EXIT as u64
+        && route == carrick_personality_linux::dispatch::CompletionRoute::Forward
+        && carrick_el1_abi::Lifecycle::live(page) > 1
+        && let Some(tid) = control.visible_tid()
+    {
+        process.thread_exited(tid);
+    }
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
@@ -416,6 +425,46 @@ pub(super) fn arm_process_call_claimed(
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 fn arm_process_refusal_must_abort(nr: u64) -> bool {
     matches!(nr, 93 | 94)
+}
+
+/// Whether the retained process owner must serve this call, so that neither
+/// the host nor the owner-free pipeline may answer it. A non-last thread's raw
+/// `exit` is never the owner's: the host retires that thread.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(super) fn arm_owner_must_serve(
+    nr: u64,
+    flags: u64,
+    owned: impl FnOnce() -> bool,
+    live: u32,
+) -> bool {
+    !(nr == carrick_personality_linux::lifecycle::SYS_EXIT as u64 && live > 1)
+        && arm_process_call_claimed(nr, flags, owned)
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(super) fn resolve_arm_process_route(
+    route: carrick_personality_linux::dispatch::CompletionRoute,
+    page: &carrick_el1_abi::ThreadLifecyclePage,
+    frame: &mut TrapFrame,
+    counters: &Counters,
+    current_tasks: &[CurrentTask],
+) -> Action {
+    match route {
+        carrick_personality_linux::dispatch::CompletionRoute::Served => Action::Served,
+        carrick_personality_linux::dispatch::CompletionRoute::WithWork => Action::ServedWithWork,
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended => Action::Idle,
+        carrick_personality_linux::dispatch::CompletionRoute::Forward => {
+            let live = carrick_el1_abi::Lifecycle::live(page);
+            if arm_owner_must_serve(frame.x[8], frame.x[0], || true, live) {
+                refuse_owner_process_call(frame, counters, current_tasks)
+            } else {
+                Action::Forward
+            }
+        }
+        carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion => {
+            invalid_completion(NativeInvariant::EntryBinding)
+        }
+    }
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]

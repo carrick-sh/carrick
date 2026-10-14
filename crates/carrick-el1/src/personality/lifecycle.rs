@@ -118,7 +118,18 @@ impl<
         Some(self.process_venue()?.exit_group(status))
     }
     fn process_exit_binding(&self) -> Option<carrick_core_abi::ExecutionBinding> {
-        self.process.as_deref().map(|venue| venue.binding())
+        let binding = LifecycleNative::binding(self)?;
+        if !binding.issued() {
+            return None;
+        }
+        let thread = LifecycleNative::thread(self)?;
+        let _entry = thread.slot.entry()?;
+        let tid = thread.slot.visible_tid()?;
+        if tid == LifecycleNative::process_pid(self)? {
+            return None;
+        }
+        let venue = self.process.as_deref()?;
+        (venue.binding() == binding && venue.has_thread(tid)).then_some(binding)
     }
 
     fn publish_born(&mut self, mut birth: ThreadBirth<'a, '_>) -> Result<(), i64> {
