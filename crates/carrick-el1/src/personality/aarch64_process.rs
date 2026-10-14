@@ -658,6 +658,12 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     type PreparedMm = Prepared<'a>;
     type Born = Box<Born<'a>>;
 
+    /// The HVC root exit crossing becomes the host's whole-process terminal
+    /// (`TrapError::NativeRootExit`), which ends every host and zone thread.
+    fn root_exit_ends_run(&self) -> bool {
+        true
+    }
+
     fn prepare_mm(
         &mut self,
         parent: &Self::Mm,
