@@ -27,7 +27,7 @@ pub struct FrameGrantRequest {
     pub mm_key: u64,
     /// Exact anonymous root node at the fault, if one owns this request.
     /// A refusal for an older node must not answer a reused VA.
-    pub reservation_incarnation: Option<ReservationIncarnation>,
+    pub reservation_incarnation: ReservationIncarnation,
     /// Nonzero carrier-wide request incarnation chosen by EL1.
     pub request_generation: u64,
     /// The semantic address whose recoverable data abort created the request.
@@ -149,19 +149,20 @@ impl FrameGrantMailbox {
             && request.requested_len.is_multiple_of(Self::PAGE_SIZE)
             && request.access.is_power_of_two()
             && request.access & !Self::PERMISSION_MASK == 0
+            && request.reservation_incarnation.raw() != 0
     }
 
-    fn load_request(&self) -> FrameGrantRequest {
-        FrameGrantRequest {
+    fn load_request(&self) -> Option<FrameGrantRequest> {
+        Some(FrameGrantRequest {
             mm_key: self.mm_key.load(Ordering::Relaxed),
             reservation_incarnation: ReservationIncarnation::new(
                 self.reservation_incarnation.load(Ordering::Relaxed),
-            ),
+            )?,
             request_generation: self.request_generation.load(Ordering::Relaxed),
             fault_va: self.fault_va.load(Ordering::Relaxed),
             requested_len: self.requested_len.load(Ordering::Relaxed),
             access: self.access.load(Ordering::Relaxed),
-        }
+        })
     }
 
     fn permissions_allow_access(permissions: u64, access: u64) -> bool {
@@ -215,12 +216,8 @@ impl FrameGrantMailbox {
         self.status
             .store(FRAME_GRANT_ERR_INVALID, Ordering::Relaxed);
         self.mm_key.store(request.mm_key, Ordering::Relaxed);
-        self.reservation_incarnation.store(
-            request
-                .reservation_incarnation
-                .map_or(0, ReservationIncarnation::raw),
-            Ordering::Relaxed,
-        );
+        self.reservation_incarnation
+            .store(request.reservation_incarnation.raw(), Ordering::Relaxed);
         self.request_generation
             .store(request.request_generation, Ordering::Relaxed);
         self.fault_va.store(request.fault_va, Ordering::Relaxed);
@@ -249,7 +246,7 @@ impl FrameGrantMailbox {
                 Ordering::Acquire,
             )
             .ok()?;
-        Some(self.load_request())
+        self.load_request()
     }
 
     /// Claim only the request produced by this exact forwarded fault.
@@ -269,7 +266,7 @@ impl FrameGrantMailbox {
         if self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_REQUESTED {
             return None;
         }
-        let preview = self.load_request();
+        let preview = self.load_request()?;
         if !matches(preview) {
             return None;
         }
@@ -282,8 +279,8 @@ impl FrameGrantMailbox {
             )
             .ok()?;
         let claimed = self.load_request();
-        if matches(claimed) {
-            return Some(claimed);
+        if claimed.is_some_and(matches) {
+            return claimed;
         }
 
         // The mailbox completed one request and accepted another between the
@@ -318,7 +315,9 @@ impl FrameGrantMailbox {
         commit: impl FnOnce(),
     ) -> Result<bool, E> {
         if self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_HOST_WORKING
-            || !Self::ready_is_valid(self.load_request(), ready)
+            || !self
+                .load_request()
+                .is_some_and(|request| Self::ready_is_valid(request, ready))
         {
             return Ok(false);
         }
@@ -353,7 +352,7 @@ impl FrameGrantMailbox {
     /// this vCPU's single-flight mailbox.
     pub fn complete_resolved_owner_fault(&self, request: FrameGrantRequest) -> bool {
         if self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_HOST_WORKING
-            || self.load_request() != request
+            || self.load_request() != Some(request)
         {
             return false;
         }
@@ -383,7 +382,7 @@ impl FrameGrantMailbox {
         if self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_RESPONSE {
             return None;
         }
-        let request = self.load_request();
+        let request = self.load_request()?;
         if request.mm_key != mm_key || request.fault_va != fault_va || request.access != access {
             return None;
         }
@@ -404,7 +403,7 @@ impl FrameGrantMailbox {
         if self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_RESPONSE {
             return None;
         }
-        let request = self.load_request();
+        let request = self.load_request()?;
         if request.mm_key != mm_key {
             return None;
         }
@@ -433,7 +432,11 @@ impl FrameGrantMailbox {
                 Ordering::Acquire,
             )
             .ok()?;
-        let request = self.load_request();
+        let Some(request) = self.load_request() else {
+            self.state
+                .store(FRAME_GRANT_MAILBOX_RESPONSE, Ordering::Release);
+            return None;
+        };
         if request.mm_key != mm_key || request.request_generation != request_generation {
             self.state
                 .store(FRAME_GRANT_MAILBOX_RESPONSE, Ordering::Release);
@@ -475,6 +478,52 @@ impl FrameGrantMailbox {
 
     pub fn has_guest_work(&self) -> bool {
         self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_IDLE
+    }
+
+    /// Retire a refusal whose asserted resident page is being discarded while
+    /// the root node itself remains live (for example MADV_DONTNEED). Requests
+    /// still in flight are left for the host to resolve against the new state.
+    pub fn withdraw_response_covering(&self, mm_key: u64, start: u64, len: u64) -> bool {
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        if self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_RESPONSE {
+            return false;
+        }
+        let Some(request) = self.load_request() else {
+            return false;
+        };
+        let page = request.fault_va & !(Self::PAGE_SIZE - 1);
+        if request.mm_key != mm_key || page < start || page >= end {
+            return false;
+        }
+        if self
+            .state
+            .compare_exchange(
+                FRAME_GRANT_MAILBOX_RESPONSE,
+                FRAME_GRANT_MAILBOX_HOST_WORKING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        let matches = self.load_request().is_some_and(|current| {
+            current.mm_key == mm_key
+                && current.request_generation == request.request_generation
+                && page >= start
+                && page < end
+        });
+        self.state.store(
+            if matches {
+                FRAME_GRANT_MAILBOX_IDLE
+            } else {
+                FRAME_GRANT_MAILBOX_RESPONSE
+            },
+            Ordering::Release,
+        );
+        matches
     }
 
     /// Host, at an MM's final teardown or exec replacement: release an

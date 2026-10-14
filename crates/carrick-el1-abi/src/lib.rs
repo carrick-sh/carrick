@@ -4424,7 +4424,7 @@ mod tests {
         let mailbox = FrameGrantMailbox::new();
         let request = FrameGrantRequest {
             mm_key: 41,
-            reservation_incarnation: None,
+            reservation_incarnation: ReservationIncarnation::new(1).unwrap(),
             request_generation: 7,
             fault_va: 0x4000_3000,
             requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
@@ -4783,7 +4783,7 @@ mod tests {
             let mailbox = FrameGrantMailbox::new();
             let request = FrameGrantRequest {
                 mm_key: 41,
-                reservation_incarnation: None,
+                reservation_incarnation: ReservationIncarnation::new(1).unwrap(),
                 request_generation: 7,
                 fault_va: 0x4000_3000,
                 requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
@@ -4830,7 +4830,7 @@ mod tests {
         let mailbox = FrameGrantMailbox::new();
         let request = FrameGrantRequest {
             mm_key: 41,
-            reservation_incarnation: None,
+            reservation_incarnation: ReservationIncarnation::new(1).unwrap(),
             request_generation: 7,
             fault_va: 0x4000_3000,
             requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
@@ -4866,7 +4866,7 @@ mod tests {
         let mailbox = FrameGrantMailbox::new();
         let first = FrameGrantRequest {
             mm_key: 41,
-            reservation_incarnation: None,
+            reservation_incarnation: ReservationIncarnation::new(1).unwrap(),
             request_generation: 7,
             fault_va: 0x4000_3000,
             requested_len: 4096,
@@ -4895,7 +4895,7 @@ mod tests {
         let mailboxes = FrameGrantMailboxes::new();
         let first = FrameGrantRequest {
             mm_key: 61,
-            reservation_incarnation: None,
+            reservation_incarnation: ReservationIncarnation::new(1).unwrap(),
             request_generation: 17,
             fault_va: 0x6100_1000,
             requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
@@ -4903,7 +4903,7 @@ mod tests {
         };
         let second = FrameGrantRequest {
             mm_key: 62,
-            reservation_incarnation: None,
+            reservation_incarnation: ReservationIncarnation::new(1).unwrap(),
             request_generation: 18,
             fault_va: 0x6200_1000,
             requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
@@ -4928,7 +4928,7 @@ mod tests {
     fn a_retiring_mm_withdraws_exactly_its_own_mailbox_work() {
         let request = |mm_key, request_generation| FrameGrantRequest {
             mm_key,
-            reservation_incarnation: None,
+            reservation_incarnation: ReservationIncarnation::new(1).unwrap(),
             request_generation,
             fault_va: 0x4000_3000,
             requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
@@ -4963,12 +4963,45 @@ mod tests {
         assert!(requested.try_publish_request(request(73, 6)));
     }
 
+    /// DONTNEED retires residency without replacing the root node. A refusal
+    /// from before the discard must not answer the next first touch of it.
+    #[test]
+    fn discard_withdraws_only_covering_refusals_from_the_same_mm() {
+        let request = |mm_key, fault_va, generation| FrameGrantRequest {
+            mm_key,
+            reservation_incarnation: ReservationIncarnation::new(7).unwrap(),
+            request_generation: generation,
+            fault_va,
+            requested_len: 4096,
+            access: 2,
+        };
+        let stale = FrameGrantMailbox::new();
+        let neighbor = FrameGrantMailbox::new();
+        let other_mm = FrameGrantMailbox::new();
+        for (mailbox, value) in [
+            (&stale, request(71, 0x4000_3000, 1)),
+            (&neighbor, request(71, 0x4000_4000, 2)),
+            (&other_mm, request(72, 0x4000_3000, 3)),
+        ] {
+            assert!(mailbox.try_publish_request(value));
+            assert_eq!(mailbox.claim_request(), Some(value));
+            assert!(mailbox.publish_refusal(FRAME_GRANT_ERR_DENIED));
+        }
+        for mailbox in [&stale, &neighbor, &other_mm] {
+            mailbox.withdraw_response_covering(71, 0x4000_3000, 4096);
+        }
+        assert!(!stale.has_guest_work());
+        assert!(neighbor.has_guest_work());
+        assert!(other_mm.has_guest_work());
+        assert!(stale.try_publish_request(request(71, 0x4000_3000, 4)));
+    }
+
     #[test]
     fn frame_grant_host_claim_leaves_another_faults_request_pending() {
         let mailbox = FrameGrantMailbox::new();
         let request = FrameGrantRequest {
             mm_key: 41,
-            reservation_incarnation: None,
+            reservation_incarnation: ReservationIncarnation::new(1).unwrap(),
             request_generation: 8,
             fault_va: 0x4000_3000,
             requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
@@ -5012,7 +5045,7 @@ mod tests {
         let mailbox = FrameGrantMailbox::new();
         let request = FrameGrantRequest {
             mm_key: 51,
-            reservation_incarnation: None,
+            reservation_incarnation: ReservationIncarnation::new(1).unwrap(),
             request_generation: 11,
             fault_va: 0x5000_1000,
             requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
@@ -5068,7 +5101,7 @@ mod tests {
             let mailbox = FrameGrantMailbox::new();
             let request = FrameGrantRequest {
                 mm_key: 301,
-                reservation_incarnation: None,
+                reservation_incarnation: ReservationIncarnation::new(1).unwrap(),
                 request_generation: permissions,
                 fault_va: 0x6000_1000,
                 requested_len: 4096,
@@ -5103,7 +5136,7 @@ mod tests {
         let mailbox = FrameGrantMailbox::new();
         let request = FrameGrantRequest {
             mm_key: 501,
-            reservation_incarnation: None,
+            reservation_incarnation: ReservationIncarnation::new(1).unwrap(),
             request_generation: 502,
             fault_va: 0x7000_2123,
             requested_len: 4096,
