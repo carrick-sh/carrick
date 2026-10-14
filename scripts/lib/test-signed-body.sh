@@ -90,6 +90,16 @@ case "$binary_deadline_secs" in
         exit 2
         ;;
 esac
+# Per-command wall-clock bound (seconds) for deadline diagnostics (`ps`, `lldb`).
+# Prevents a stalled `lldb -p` or `task_for_pid` attach on unprivileged CI hosts
+# from hanging the harness before reaping.
+diag_timeout_secs="${CARRICK_TEST_SIGNED_DIAG_TIMEOUT_SECS:-60}"
+case "$diag_timeout_secs" in
+    ''|0|*[!0-9]*)
+        echo "test-signed: invalid CARRICK_TEST_SIGNED_DIAG_TIMEOUT_SECS: $diag_timeout_secs (expected positive integer seconds)" >&2
+        exit 2
+        ;;
+esac
 test_signed_parse_libtest_args "$@"
 requested_filter="$TEST_SIGNED_REQUESTED_FILTER"
 has_exact="$TEST_SIGNED_HAS_EXACT"
@@ -189,6 +199,57 @@ stop_watchdog() {
     kill -9 "$w_pid" 2>/dev/null || true
     wait "$w_pid" 2>/dev/null || true
 }
+kill_process_tree() {
+    local root_pid="$1"
+    [ -n "$root_pid" ] || return 0
+    local child_pid
+    while IFS= read -r child_pid; do
+        if [ -n "$child_pid" ]; then
+            kill_process_tree "$child_pid"
+        fi
+    done < <(ps -axo pid=,ppid= | awk -v p="$root_pid" '$2 == p { print $1 }')
+    kill -9 "$root_pid" 2>/dev/null || sudo -n kill -9 "$root_pid" 2>/dev/null || true
+}
+run_bounded_diag() {
+    local timeout_secs="$1"
+    shift
+    local diag_out
+    local timed_out_marker
+    diag_out="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-diag-cmd.XXXXXX")"
+    timed_out_marker="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-diag-timeout.XXXXXX")"
+    if command -v perl >/dev/null 2>&1; then
+        perl -MPOSIX -e 'POSIX::setpgid(0, 0); exec @ARGV or exit 127' -- "$@" </dev/null >"$diag_out" 2>&1 &
+    else
+        (exec "$@" </dev/null >"$diag_out" 2>&1) &
+    fi
+    local cmd_pid=$!
+    local watcher_pid=""
+    (
+        set +e
+        sleep "$timeout_secs" >/dev/null 2>&1 &
+        local sleep_pid=$!
+        trap 'kill -9 "$sleep_pid" 2>/dev/null || true; exit 0' TERM INT
+        wait "$sleep_pid" 2>/dev/null || exit 0
+        if kill -0 "$cmd_pid" 2>/dev/null; then
+            printf '1\n' >"$timed_out_marker"
+            kill_process_tree "$cmd_pid"
+            kill -9 -- "-$cmd_pid" 2>/dev/null || sudo -n kill -9 -- "-$cmd_pid" 2>/dev/null || true
+        fi
+    ) >/dev/null 2>&1 &
+    watcher_pid=$!
+    local cmd_rc=0
+    wait "$cmd_pid" 2>/dev/null || cmd_rc=$?
+    if [ -s "$timed_out_marker" ]; then
+        wait "$watcher_pid" 2>/dev/null || true
+        echo "test-signed: diagnostic command timed out after ${timeout_secs}s: $*" >>"$diag_out"
+        cmd_rc=124
+    else
+        stop_watchdog "$watcher_pid"
+    fi
+    cat "$diag_out"
+    rm -f "$diag_out" "$timed_out_marker"
+    return "$cmd_rc"
+}
 capture_deadline_diagnostics() {
     local target_exe="$1"
     local target_pid="$2"
@@ -224,11 +285,13 @@ capture_deadline_diagnostics() {
         seen_pids="$seen_pids$p "
         kill -0 "$p" 2>/dev/null || continue
         echo "test-signed: deadline process status (pid=$p):"
-        ps -ww -p "$p" -o user=,pid=,ppid=,pgid=,stat=,etime=,%cpu=,command= 2>&1 || true
+        run_bounded_diag "$diag_timeout_secs" ps -ww -p "$p" -o user=,pid=,ppid=,pgid=,stat=,etime=,%cpu=,command= || true
         if command -v lldb >/dev/null 2>&1; then
             echo "test-signed: deadline host backtrace (pid=$p):"
-            if ! sudo -n lldb -p "$p" --batch -o "thread backtrace all" -o "detach" -o "quit" </dev/null 2>&1; then
-                lldb -p "$p" --batch -o "thread backtrace all" -o "detach" -o "quit" </dev/null 2>&1 || true
+            local bt_rc=0
+            run_bounded_diag "$diag_timeout_secs" sudo -n lldb -p "$p" --batch -o "thread backtrace all" -o "detach" -o "quit" || bt_rc=$?
+            if [ "$bt_rc" -ne 0 ] && [ "$bt_rc" -ne 124 ]; then
+                run_bounded_diag "$diag_timeout_secs" lldb -p "$p" --batch -o "thread backtrace all" -o "detach" -o "quit" || true
             fi
         fi
     done

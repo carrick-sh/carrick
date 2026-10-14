@@ -953,17 +953,41 @@ int main(int argc, char **argv) {
         std::fs::set_permissions(&fake_cargo, std::fs::Permissions::from_mode(0o755))
             .expect("chmod fake cargo");
 
+        let fake_lldb = dir.path().join("lldb");
+        std::fs::write(
+            &fake_lldb,
+            "#!/bin/sh\n\
+             if [ -n \"${DUMMY_BT_MARKER:-}\" ]; then\n\
+                 printf 'lldb %s\\n' \"$*\" >>\"$DUMMY_BT_MARKER\"\n\
+             fi\n\
+             if [ \"${DUMMY_LLDB_HANG:-0}\" = \"1\" ]; then\n\
+                 sleep 60 &\n\
+                 child_pid=$!\n\
+                 if [ -n \"${DUMMY_LLDB_CHILD_PID_FILE:-}\" ]; then\n\
+                     printf '%s\\n' \"$child_pid\" >\"$DUMMY_LLDB_CHILD_PID_FILE\"\n\
+                 fi\n\
+                 while :; do\n\
+                     sleep 1\n\
+                 done\n\
+             fi\n\
+             echo \"thread #1: tid = 0x01, el1_dummy_block_forever\"\n\
+             exit 0\n",
+        )
+        .expect("write fake lldb");
+        std::fs::set_permissions(&fake_lldb, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake lldb");
+
         let fake_sudo = dir.path().join("sudo");
         std::fs::write(
             &fake_sudo,
             "#!/bin/sh\n\
+             if [ \"${DUMMY_SUDO_FAIL:-0}\" = \"1\" ]; then\n\
+                 exit 1\n\
+             fi\n\
              case \"$*\" in\n\
                  *lldb*)\n\
-                     if [ -n \"${DUMMY_BT_MARKER:-}\" ]; then\n\
-                         printf '%s\\n' \"$*\" >>\"$DUMMY_BT_MARKER\"\n\
-                     fi\n\
-                     echo \"thread #1: tid = 0x01, el1_dummy_block_forever\"\n\
-                     exit 0\n\
+                     while [ \"$#\" -gt 0 ] && [ \"$1\" != \"lldb\" ]; do shift; done\n\
+                     exec \"$@\"\n\
                      ;;\n\
              esac\n\
              exit 1\n",
@@ -1042,7 +1066,7 @@ int main(int argc, char **argv) {
             .env("PATH", &path_env)
             .env("CARRICK_HOST_LEASE_SOCKET", "dummy-lease-socket")
             .env("CARRICK_RUN_ID", &run_id)
-            .env("CARRICK_TEST_SIGNED_DEADLINE_SECS", "3")
+            .env("CARRICK_TEST_SIGNED_DEADLINE_SECS", "2")
             .env("DUMMY_KILL_SH", &kill_sh)
             .env("DUMMY_BLOCK_MARKER", &block_marker)
             .env("DUMMY_BT_MARKER", &bt_marker)
@@ -1130,6 +1154,110 @@ int main(int argc, char **argv) {
             recorded_run_id.trim(),
             format!("{run_id}-b3"),
             "normal binary must run under its distinct -b3 CARRICK_RUN_ID (stdout={stdout} stderr={stderr})"
+        );
+
+        // 3. When the diagnostic command itself (`lldb`) blocks (e.g. unprivileged
+        //    host where `sudo -n` fails and `lldb -p` stalls on task_for_pid), the
+        //    diagnostic timeout kills the `lldb` process group, still reaps the
+        //    binary, reports DEADLINE plus FAIL, and runs the subsequent binary.
+        let hang_diag_run_id = format!("{run_id}-diaghang");
+        let hang_diag_block_marker = dir.path().join("block_started_diaghang.txt");
+        let hang_diag_bt_marker = dir.path().join("bt_captured_diaghang.txt");
+        let hang_diag_child_pid_file = dir.path().join("lldb_child_pid.txt");
+        let hang_diag_normal_marker = dir.path().join("normal_completed_diaghang.txt");
+        let mut hang_diag_child =
+            std::process::Command::new(repo_root.join("scripts/test-signed.sh"))
+                .current_dir(repo_root)
+                .args(["dummy-watchdog-cascade-pkg", "el1_", "--nocapture"])
+                .env("PATH", &path_env)
+                .env("CARRICK_HOST_LEASE_SOCKET", "dummy-lease-socket")
+                .env("CARRICK_RUN_ID", &hang_diag_run_id)
+                .env("CARRICK_TEST_SIGNED_DEADLINE_SECS", "2")
+                .env("CARRICK_TEST_SIGNED_DIAG_TIMEOUT_SECS", "1")
+                .env("DUMMY_SUDO_FAIL", "1")
+                .env("DUMMY_LLDB_HANG", "1")
+                .env("DUMMY_LLDB_CHILD_PID_FILE", &hang_diag_child_pid_file)
+                .env("DUMMY_KILL_SH", &kill_sh)
+                .env("DUMMY_BLOCK_MARKER", &hang_diag_block_marker)
+                .env("DUMMY_BT_MARKER", &hang_diag_bt_marker)
+                .env("DUMMY_NORMAL_MARKER", &hang_diag_normal_marker)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn test-signed.sh with hanging lldb");
+
+        let hang_diag_bound = std::time::Instant::now();
+        let hang_diag_timed_out = loop {
+            if hang_diag_child
+                .try_wait()
+                .expect("poll hang_diag_child")
+                .is_some()
+            {
+                break false;
+            }
+            if hang_diag_bound.elapsed() >= Duration::from_secs(15) {
+                let _ = hang_diag_child.kill();
+                for suffix in ["-b1", "-b2", "-b3", ""] {
+                    let _ = std::process::Command::new(&kill_sh)
+                        .arg(format!("{hang_diag_run_id}{suffix}"))
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+                break true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let hang_diag_output = hang_diag_child
+            .wait_with_output()
+            .expect("collect hanging-lldb test-signed.sh output");
+        let hang_diag_stdout = String::from_utf8_lossy(&hang_diag_output.stdout);
+        let hang_diag_stderr = String::from_utf8_lossy(&hang_diag_output.stderr);
+        assert!(
+            !hang_diag_timed_out,
+            "stalled lldb diagnostic must be bounded and not hang test-signed.sh; stdout={hang_diag_stdout} stderr={hang_diag_stderr}"
+        );
+        assert!(
+            !hang_diag_output.status.success(),
+            "overall run must still fail when binary 1 hits deadline; stdout={hang_diag_stdout} stderr={hang_diag_stderr}"
+        );
+        assert!(
+            hang_diag_stderr.contains("test-signed: diagnostic command timed out after 1s: lldb"),
+            "stderr must record the bounded lldb timeout; stderr={hang_diag_stderr}"
+        );
+        assert!(
+            hang_diag_stderr.contains(&format!("test-signed: DEADLINE {}", exe_block.display())),
+            "forever-blocking binary must still be reported with DEADLINE when lldb stalls; stderr={hang_diag_stderr}"
+        );
+        assert!(
+            hang_diag_stderr.contains(&format!("test-signed: FAIL {}", exe_block.display())),
+            "forever-blocking binary must still be reported with FAIL when lldb stalls; stderr={hang_diag_stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&hang_diag_normal_marker)
+                .unwrap_or_default()
+                .trim(),
+            format!("{hang_diag_run_id}-b3"),
+            "subsequent normal binary must still run after a stalled diagnostic is bounded; stdout={hang_diag_stdout} stderr={hang_diag_stderr}"
+        );
+        let lldb_child_pid = std::fs::read_to_string(&hang_diag_child_pid_file)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        assert!(
+            !lldb_child_pid.is_empty(),
+            "fake lldb must have spawned its child process before timing out"
+        );
+        let lldb_child_alive = std::process::Command::new("kill")
+            .args(["-0", &lldb_child_pid])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(
+            !lldb_child_alive,
+            "bounded diagnostic timeout must kill the entire lldb process group (child pid={lldb_child_pid})"
         );
     }
 }
