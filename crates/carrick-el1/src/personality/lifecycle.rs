@@ -156,9 +156,9 @@ impl<
         self.enqueue_born(birth.record);
         Ok(())
     }
-    fn thread_exited(&mut self, tid: u32) {
+    fn thread_exited(&mut self, verdict: carrick_core::terminal::RetirementVerdict) {
         if let Some(venue) = self.process_venue() {
-            venue.thread_exited(tid);
+            venue.retire_thread_verdict(verdict);
         }
     }
     fn arguments(&self) -> [u64; 6] {
