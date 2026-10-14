@@ -314,6 +314,17 @@ pub(super) fn admit_demand<T>(
         }
         match admit(job) {
             Ok(vetted) => return Ok(Some(vetted)),
+            Err(error @ ScalerError::SupersededMergeGroup { .. }) => {
+                // Temporary skip: never put demand in the durable refusal
+                // ledger, because the successor can fail or leave the queue.
+                eprintln!("run={} {error}; skipping reservation", job.run.0);
+                if let Err(error) = cancel(job.run) {
+                    eprintln!(
+                        "run={} cancellation unavailable (Actions write required): {error}; skip only",
+                        job.run.0
+                    );
+                }
+            }
             Err(error @ (ScalerError::Guard(_) | ScalerError::StaleMergeGroup)) => {
                 refuse(ledger, job, &error, path, &mut cancel)?;
             }
@@ -346,12 +357,15 @@ pub(super) fn refuse(
         "run={} attempt={} job={} refused: {error}; skipping",
         key.run.0, key.attempt, key.job.0
     );
-    if matches!(error, ScalerError::StaleMergeGroup) {
+    if matches!(
+        error,
+        ScalerError::StaleMergeGroup | ScalerError::SupersededMergeGroup { .. }
+    ) {
         // Cancellation is best effort: insufficient permission or a run
         // finishing concurrently must not starve another admitted job.
         if let Err(error) = cancel(key.run) {
             eprintln!(
-                "run={} stale cancellation failed: {error}; ignored",
+                "run={} merge-group cancellation unavailable (Actions write required): {error}; ignored",
                 key.run.0
             );
         }
@@ -437,7 +451,11 @@ pub(super) fn serve_assignment<L: Refusals>(
     }
     let policy = match api.revet(key) {
         Ok(policy) => policy,
-        Err(error @ (ScalerError::Guard(_) | ScalerError::StaleMergeGroup)) => {
+        Err(
+            error @ (ScalerError::Guard(_)
+            | ScalerError::StaleMergeGroup
+            | ScalerError::SupersededMergeGroup { .. }),
+        ) => {
             refuse(ledger, key, &error, path, &mut |run| api.cancel(run))?;
             return Ok(Revetted::Refused(key));
         }
@@ -803,12 +821,63 @@ mod tests {
     }
 
     #[test]
+    fn superseded_demand_is_temporary_and_cancellation_denial_does_not_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let mut ledger = Ledger::default();
+        let keys: Vec<_> = (1..=3)
+            .map(|n| JobKey {
+                run: RunId(n),
+                attempt: 1,
+                job: JobId(n),
+            })
+            .collect();
+        let mut cancelled = Vec::new();
+        let selected = admit_demand(
+            &mut ledger,
+            &path,
+            keys.clone(),
+            |key| {
+                if key.run.0 < 3 {
+                    Err(ScalerError::SupersededMergeGroup {
+                        successor: "deepest".into(),
+                    })
+                } else {
+                    Ok(key)
+                }
+            },
+            |run| {
+                cancelled.push(run);
+                Err(ScalerError::External("Actions read-only"))
+            },
+        )
+        .unwrap();
+        assert_eq!(selected, Some(keys[2]));
+        assert_eq!(cancelled, vec![RunId(1), RunId(2)]);
+        assert!(ledger.refused.is_empty());
+        // The same attempt becomes eligible when its successor fails/ejects.
+        assert_eq!(
+            admit_demand(&mut ledger, &path, keys[..2].to_vec(), Ok, |_| panic!(
+                "eligible demand must not be cancelled"
+            ))
+            .unwrap(),
+            Some(keys[0])
+        );
+    }
+
+    #[test]
     fn ci_scaler_standing_refuses_inadmissible_run_b_and_re_serves_run_a() {
         for refusal in [
             ScalerError::StaleMergeGroup,
+            ScalerError::SupersededMergeGroup {
+                successor: "descendant".into(),
+            },
             ScalerError::Guard("merge group contains a pull request from another repository"),
         ] {
-            let stale = matches!(refusal, ScalerError::StaleMergeGroup);
+            let stale = matches!(
+                refusal,
+                ScalerError::StaleMergeGroup | ScalerError::SupersededMergeGroup { .. }
+            );
             let dir = tempfile::tempdir().unwrap();
             let (mut ledger, mut row, path) = minted_for_a(dir.path());
             let gh = FakeGithub::vetting(Err(refusal));

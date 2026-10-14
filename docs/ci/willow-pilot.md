@@ -84,6 +84,31 @@ doubling to 10 min) and never end the loop; the 80% CPU ceiling still stops
 it. A job whose clone closed without a job is served again, at most three
 times per job key.
 
+### Cumulative merge groups (#402)
+
+Both controllers check supersession in the shared `Github::vet` path,
+for reservations and actual assignments. A shallower merge group is skipped
+while a deeper queued group contains it, or that successor's workflow passed.
+The proof requires a complete merge-queue listing, trusted heads, a pending
+or successful latest workflow run, and a GitHub comparison whose merge base
+is exactly the shallower SHA. The extra observation uses one page of at most
+100 workflow runs and at most five comparisons per vet. Missing, partial,
+failed or ambiguous depth observations preserve ordinary service. Main pushes
+remain eligible and retain their per-SHA baseline receipts.
+
+Superseded demand does not enter the durable refusal ledger: if the successor
+fails or leaves the queue, the shallower group can be served again. A diverted
+actual assignment is durably refused before approval, just like a stale group.
+Cancellation uses the existing workflow-run endpoint as an authorization
+check; Actions write (or classic/OAuth repo scope) is required. Denial is
+logged and leaves skip-only behavior. Controllers never expand token rights.
+The standing credential documented below has Actions read-only; the owner
+must grant write separately if cancellation is desired.
+
+The director must qualify HEADGREEN on the first live batch after deployment:
+cancelling a non-head group must not eject its PR when the head passes, and
+the deepest group's baseline receipt dependencies must still resolve.
+
 ### Actual assignments are re-vetted (#333)
 
 GitHub assigns a queued job to *any* idle runner with matching labels, not to
