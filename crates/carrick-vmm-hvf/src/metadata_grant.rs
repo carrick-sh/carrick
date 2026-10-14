@@ -1,12 +1,13 @@
 //! Host engine for servicing in-guest EL1 metadata extent grant (`HVC #6`) requests.
 
 use crate::host_mapping::{HostMappingKind, OwnedHostMapping};
+use carrick_core_abi::NativeRootExit;
 use carrick_el1_abi::{
     EL1_DYNAMIC_METADATA_BASE, EL1_DYNAMIC_METADATA_EXTENT_SIZE, EL1_DYNAMIC_METADATA_SIZE,
     ForkStockExchange, ForkStockKind, ForkStockRefusal, ForkStockSettlement, GRANT_OP_FORK_STOCK,
     GRANT_OP_ROOT_EXIT, METADATA_GRANT_ERR_ALIGNMENT, METADATA_GRANT_ERR_DENIED,
     METADATA_GRANT_ERR_INVALID, METADATA_GRANT_ERR_NOT_FOUND, METADATA_GRANT_OP_ALLOC,
-    METADATA_GRANT_OP_FREE, METADATA_GRANT_SUCCESS, NativeRootExit,
+    METADATA_GRANT_OP_FREE, METADATA_GRANT_SUCCESS,
 };
 use carrick_el1_abi::{
     MetadataExtent, MetadataExtentResolver, MetadataResolutionError, PinnedMetadataExtent,

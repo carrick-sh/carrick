@@ -10,11 +10,11 @@
 //! - `El1FrameGrantLedger` accounts for all physical grants and returns;
 //! - [`PendingForkLoan`] records outstanding loans and validates exactly-once completion.
 
+use carrick_core_abi::NativeRootExit;
 use std::collections::{BTreeMap, BTreeSet};
 
 use carrick_el1_abi::{
     ForkLifecycleLoan, ForkStockExchange, ForkStockLoan, ForkStockRefusal, ForkStockSettlement,
-    NativeRootExit,
 };
 use carrick_guest_arch::{AddressContext, CpuId, RootGpa};
 use carrick_hal::asid::{AsidAllocator, AsidError, AsidGeneration};
@@ -539,6 +539,7 @@ impl ForkStockHostCustody {
     ) -> Result<LinuxWaitStatus, ForkStockServiceError> {
         let status = root_exit
             .status_for(execution.binding)
+            .map(LinuxWaitStatus::from_termination_status)
             .ok_or(ForkStockServiceError::StaleExecution)?;
         if let Some(asid_gen) = self.committed_asids.remove(&execution.binding.mm.raw()) {
             let retired = self
@@ -962,7 +963,8 @@ mod tests {
 
         let exec = test_execution(41, 0, 301);
         let valid_status = LinuxWaitStatus::from_wait_encoding(42 << 8);
-        let root_exit = NativeRootExit::new(exec.binding, valid_status).unwrap();
+        let root_exit =
+            NativeRootExit::new(exec.binding, valid_status.to_termination_status()).unwrap();
 
         // Foreign execution binding (wrong task ID)
         let mut foreign_exec = exec;
@@ -1068,9 +1070,11 @@ mod tests {
 
         // Root exit for the child MM retires the ASID exactly once
         let child_exec = test_execution(42, 0, 303);
-        let root_exit =
-            NativeRootExit::new(child_exec.binding, LinuxWaitStatus::from_wait_encoding(0))
-                .unwrap();
+        let root_exit = NativeRootExit::new(
+            child_exec.binding,
+            LinuxWaitStatus::from_wait_encoding(0).to_termination_status(),
+        )
+        .unwrap();
         let status = custody
             .service_root_exit(child_exec, &root_exit)
             .expect("root exit");
@@ -1382,7 +1386,7 @@ mod tests {
         let initial_ledger = custody.el1_frame_grants.lock().snapshot();
         let exec = test_execution(41, 0, 301);
         let status = LinuxWaitStatus::from_wait_encoding(25 << 8);
-        let root_exit = NativeRootExit::new(exec.binding, status).unwrap();
+        let root_exit = NativeRootExit::new(exec.binding, status.to_termination_status()).unwrap();
         unsafe {
             (record_page.0.as_mut_ptr() as *mut NativeRootExit).write(root_exit);
         }
@@ -1566,7 +1570,8 @@ mod tests {
 
         // Case 4: Root exit trapped on vCPU A (1) naming vCPU B in arg2 -> refused
         let status = LinuxWaitStatus::from_wait_encoding(25 << 8);
-        let root_exit = NativeRootExit::new(exec_b.binding, status).unwrap();
+        let root_exit =
+            NativeRootExit::new(exec_b.binding, status.to_termination_status()).unwrap();
         unsafe {
             (record_page.0.as_mut_ptr() as *mut NativeRootExit).write(root_exit);
         }

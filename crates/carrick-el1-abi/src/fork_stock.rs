@@ -2,7 +2,7 @@
 //! The caller retains the supervisor stack record across the physical crossing.
 //!
 //! On x86, this crossing is driven by synchronous port I/O over [`FORK_STOCK_PORT`]
-//! and [`NATIVE_ROOT_EXIT_PORT`]. On AArch64, it is driven by `HVC #6` using
+//! and [`carrick_core_abi::NATIVE_ROOT_EXIT_PORT`]. On AArch64, it is driven by `HVC #6` using
 //! [`GRANT_OP_FORK_STOCK`] and [`GRANT_OP_ROOT_EXIT`].
 //!
 //! The record wire layouts and alignment are ISA-neutral and 100% byte-identical
@@ -20,8 +20,6 @@ pub use crate::{GRANT_OP_CHILD_RETIRE, GRANT_OP_FORK_STOCK, GRANT_OP_ROOT_EXIT};
 
 /// x86 synchronous I/O port for physical fork stock loans and settlements.
 pub const FORK_STOCK_PORT: u16 = 0xd2;
-/// x86 synchronous I/O port for container root termination notification.
-pub const NATIVE_ROOT_EXIT_PORT: u16 = 0xd3;
 /// x86 synchronous I/O port for native peer readiness notification.
 pub const NATIVE_PEER_READY_PORT: u16 = 0xd4;
 /// x86 synchronous I/O port for [`NativeChildRetire`], the twin of AArch64
@@ -426,79 +424,6 @@ impl ForkStockExchange {
     }
 }
 
-/// VM termination notification after the shared root owner's exit receipt.
-#[repr(C, align(64))]
-#[derive(Clone, Copy)]
-pub struct NativeRootExit {
-    pub words: [u64; 8],
-}
-
-impl NativeRootExit {
-    pub const MAGIC: u64 = 0x4352_524f_4f54_4558;
-
-    fn terminal_status(raw: u64) -> bool {
-        raw & !0xff00 == 0 || (raw & !0xff == 0 && (1..=64).contains(&(raw & 0x7f)))
-    }
-
-    pub fn new(
-        binding: ExecutionBinding,
-        status: carrick_personality_linux::lifecycle::LinuxWaitStatus,
-    ) -> Option<Self> {
-        if !binding.issued()
-            || binding.mm.raw() == 0
-            || binding.thread_generation.raw() == 0
-            || status.raw() < 0
-            || !Self::terminal_status(status.raw() as u32 as u64)
-        {
-            return None;
-        }
-        Some(Self {
-            words: [
-                0x4352_524f_4f54_4558,
-                binding.task.raw(),
-                binding.generation.raw(),
-                binding.mm.raw(),
-                binding.thread_generation.raw(),
-                status.raw() as u32 as u64,
-                0,
-                0,
-            ],
-        })
-    }
-
-    pub fn status_for(
-        &self,
-        expected: ExecutionBinding,
-    ) -> Option<carrick_personality_linux::lifecycle::LinuxWaitStatus> {
-        if self.words[..5]
-            != [
-                0x4352_524f_4f54_4558,
-                expected.task.raw(),
-                expected.generation.raw(),
-                expected.mm.raw(),
-                expected.thread_generation.raw(),
-            ]
-            || !Self::terminal_status(self.words[5])
-            || self.words[6..] != [0; 2]
-        {
-            return None;
-        }
-        Some(
-            carrick_personality_linux::lifecycle::LinuxWaitStatus::from_wait_encoding(
-                i32::try_from(self.words[5]).ok()?,
-            ),
-        )
-    }
-
-    pub fn raw_words(&self) -> [u64; 8] {
-        self.words
-    }
-
-    pub fn from_raw_words(words: [u64; 8]) -> Self {
-        Self { words }
-    }
-}
-
 /// Why the carrier refused a child retirement. The guest fails the retiring
 /// process cleanly; its stock stays charged rather than being reclaimed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -766,13 +691,11 @@ const _: () = {
     // 1. Wire size constants (exact bytes matching origin/main x86 layout)
     assert!(core::mem::size_of::<ForkStockExchange>() == 24 * 8);
     assert!(core::mem::size_of::<ForkStockSettlement>() == 16 * 8);
-    assert!(core::mem::size_of::<NativeRootExit>() == 8 * 8);
     assert!(core::mem::size_of::<NativeChildRetire>() == 8 * 8);
 
     // 2. Wire alignment constants
     assert!(core::mem::align_of::<ForkStockExchange>() == 64);
     assert!(core::mem::align_of::<ForkStockSettlement>() == 64);
-    assert!(core::mem::align_of::<NativeRootExit>() == 64);
     assert!(core::mem::align_of::<NativeChildRetire>() == 64);
 
     // 3. Exact field byte offsets against the previous x86 layout (origin/main)
@@ -783,15 +706,12 @@ const _: () = {
     assert!(core::mem::offset_of!(ForkStockExchange, _reserved) == 184);
 
     assert!(core::mem::offset_of!(ForkStockSettlement, words) == 0);
-    assert!(core::mem::offset_of!(NativeRootExit, words) == 0);
 
     // 4. Magic words and port numbers
     assert!(ForkStockKind::Loan.word() == 0x4352_464b_4c4f_414e);
     assert!(ForkStockKind::Commit.word() == 0x4352_464b_434f_4d4d);
     assert!(ForkStockKind::Abort.word() == 0x4352_464b_4142_4f52);
-    assert!(NativeRootExit::MAGIC == 0x4352_524f_4f54_4558);
     assert!(FORK_STOCK_PORT == 0xd2);
-    assert!(NATIVE_ROOT_EXIT_PORT == 0xd3);
     assert!(NATIVE_PEER_READY_PORT == 0xd4);
     assert!(NATIVE_CHILD_RETIRE_PORT == 0xd6);
     assert!(NativeChildRetire::MAGIC == 0x4352_4348_5245_5449);
@@ -891,30 +811,6 @@ mod tests {
         assert!(!garbage.request_matches(binding, context));
         assert_eq!(garbage.take(binding, context), None);
         assert!(!garbage.accept() && !garbage.refuse(ChildRetireRefusal::Invalid));
-    }
-
-    #[test]
-    fn native_root_exit_refuses_foreign_execution_and_nonterminal_status() {
-        use carrick_personality_linux::lifecycle::LinuxWaitStatus;
-        let binding = request().binding;
-        let status = LinuxWaitStatus::from_wait_encoding(37 << 8);
-        let record = NativeRootExit::new(binding, status).unwrap();
-        assert_eq!(record.status_for(binding), Some(status));
-        let mut foreign = binding;
-        foreign.generation = EntryGeneration::from_raw(binding.generation.raw() + 1);
-        assert!(record.status_for(foreign).is_none());
-        let mut foreign = binding;
-        foreign.mm = EntryMmKey::from_raw(binding.mm.raw() + 1);
-        assert!(record.status_for(foreign).is_none());
-        let killed = LinuxWaitStatus::signaled(9, false);
-        assert_eq!(
-            NativeRootExit::new(binding, killed)
-                .unwrap()
-                .status_for(binding),
-            Some(killed)
-        );
-        assert!(NativeRootExit::new(binding, LinuxWaitStatus::stopped(19)).is_none());
-        assert!(NativeRootExit::new(binding, LinuxWaitStatus::continued()).is_none());
     }
 
     #[test]
@@ -1083,14 +979,6 @@ mod tests {
         let words = exchange.raw_words();
         let restored = ForkStockExchange::from_raw_words(words);
         assert_eq!(restored.request(), Some(request));
-
-        let binding = request.binding;
-        let status =
-            carrick_personality_linux::lifecycle::LinuxWaitStatus::from_wait_encoding(12 << 8);
-        let root_exit = NativeRootExit::new(binding, status).unwrap();
-        let exit_words = root_exit.raw_words();
-        let restored_exit = NativeRootExit::from_raw_words(exit_words);
-        assert_eq!(restored_exit.status_for(binding), Some(status));
     }
 
     #[test]
@@ -1109,10 +997,6 @@ mod tests {
         assert_eq!(size_of::<ForkStockSettlement>(), 16 * 8);
         assert_eq!(align_of::<ForkStockSettlement>(), 64);
         assert_eq!(offset_of!(ForkStockSettlement, words), 0);
-
-        assert_eq!(size_of::<NativeRootExit>(), 8 * 8);
-        assert_eq!(align_of::<NativeRootExit>(), 64);
-        assert_eq!(offset_of!(NativeRootExit, words), 0);
 
         // 2. Wire word position verification: every field in ForkStockExchange
         // must land at the exact byte offset dictated by origin/main's x86 wire encoding
@@ -1308,43 +1192,6 @@ mod tests {
             0xffff_8000
         );
         assert_eq!(u64::from_ne_bytes(s_bytes[56..64].try_into().unwrap()), 2);
-
-        // 4. NativeRootExit wire layout
-        let exit_status =
-            carrick_personality_linux::lifecycle::LinuxWaitStatus::from_wait_encoding(12 << 8);
-        let root_exit = NativeRootExit::new(req.binding, exit_status).unwrap();
-        let re_bytes = unsafe {
-            core::slice::from_raw_parts(
-                (&raw const root_exit).cast::<u8>(),
-                size_of::<NativeRootExit>(),
-            )
-        };
-        assert_eq!(
-            u64::from_ne_bytes(re_bytes[0..8].try_into().unwrap()),
-            0x4352_524f_4f54_4558
-        );
-        assert_eq!(
-            u64::from_ne_bytes(re_bytes[8..16].try_into().unwrap()),
-            req.binding.task.raw()
-        );
-        assert_eq!(
-            u64::from_ne_bytes(re_bytes[16..24].try_into().unwrap()),
-            req.binding.generation.raw()
-        );
-        assert_eq!(
-            u64::from_ne_bytes(re_bytes[24..32].try_into().unwrap()),
-            req.binding.mm.raw()
-        );
-        assert_eq!(
-            u64::from_ne_bytes(re_bytes[32..40].try_into().unwrap()),
-            req.binding.thread_generation.raw()
-        );
-        assert_eq!(
-            u64::from_ne_bytes(re_bytes[40..48].try_into().unwrap()),
-            exit_status.raw() as u64
-        );
-        assert_eq!(u64::from_ne_bytes(re_bytes[48..56].try_into().unwrap()), 0);
-        assert_eq!(u64::from_ne_bytes(re_bytes[56..64].try_into().unwrap()), 0);
     }
 
     #[test]

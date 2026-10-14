@@ -287,16 +287,16 @@ pub fn complete_run_failure(
 }
 
 pub fn complete_root_exit(task: &CurrentTask, status: LinuxWaitStatus) -> ! {
-    let exit = carrick_el1_abi::NativeRootExit::new(
+    let exit = carrick_core_abi::NativeRootExit::new(
         carrick_el1::personality::common_entry::execution_binding(task),
-        status,
+        status.to_termination_status(),
     )
     .unwrap_or_else(|| fatal_boot());
     // SAFETY: shared retirement authenticated this exact root completion.
     unsafe {
         core::arch::asm!(
             "out dx, al",
-            in("dx") carrick_el1_abi::NATIVE_ROOT_EXIT_PORT,
+            in("dx") carrick_core_abi::NATIVE_ROOT_EXIT_PORT,
             in("rax") &exit as *const _ as u64,
             options(nostack, preserves_flags)
         );

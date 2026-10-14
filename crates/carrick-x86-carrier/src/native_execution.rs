@@ -2,10 +2,9 @@
 
 use crate::entry::{fatal_boot, halt};
 use crate::table_span;
+use carrick_core_abi::{NATIVE_ROOT_EXIT_PORT, NativeRootExit};
 use carrick_el1::isa::x86::{self, context};
-use carrick_el1_abi::{
-    BornInZoneSource, CurrentTask, NATIVE_ROOT_EXIT_PORT, NativeRootExit, ReservationMm,
-};
+use carrick_el1_abi::{BornInZoneSource, CurrentTask, ReservationMm};
 use carrick_sched_core::{ParkedContextWords, SlotId, WakeEffects};
 use core::sync::atomic::Ordering;
 
@@ -71,9 +70,7 @@ pub fn publish_root_exit(
     status: carrick_personality_api::TerminationStatus,
 ) -> ! {
     let binding = carrick_core::entry::binding(&current.execution, &current.mm);
-    let linux_status =
-        carrick_personality_linux::lifecycle::LinuxWaitStatus::from_termination_status(status);
-    let exit = NativeRootExit::new(binding, linux_status).unwrap_or_else(|| fatal_boot());
+    let exit = NativeRootExit::new(binding, status).unwrap_or_else(|| fatal_boot());
     // SAFETY: owned retirement authenticated this exact VM completion.
     unsafe {
         core::arch::asm!(

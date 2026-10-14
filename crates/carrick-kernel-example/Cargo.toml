@@ -51,6 +51,7 @@ allocation-metrics = []
 conformance-metrics = ["carrick-kernel/conformance-metrics", "carrick-observability/conformance-metrics"]
 
 [dev-dependencies]
+carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-core = { path = "../carrick-core", features = ["host-test"] }
 carrick-sched-core = { path = "../carrick-sched-core" }
 carrick-personality-linux = { path = "../carrick-personality-linux" }
