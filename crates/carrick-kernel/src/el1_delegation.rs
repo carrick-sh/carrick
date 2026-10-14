@@ -2327,6 +2327,71 @@ mod tests {
             )
         }
 
+        #[test]
+        fn file_seam_ring_duplicate_survives_last_host_reference() {
+            let _region = Region::new();
+            let scratch = tempfile::tempdir().unwrap();
+            let backend =
+                carrick_vfs::fs_backend::HostFsBackend::from_path(scratch.path()).unwrap();
+            let mut root = carrick_vfs::RootFsVfs::new();
+            drop(root.set_overlay(Box::new(backend)));
+            root.create_file("/data").unwrap();
+            let carrick_vfs::vfs::rootfs::OpenDispatchResult::HostFile {
+                host_fd,
+                metadata,
+                writable,
+            } = root
+                .open_for_dispatch("/data", false, false, false, true)
+                .unwrap()
+            else {
+                panic!("the fixture must use the real host VFS backend");
+            };
+            let mut fs = FsState::new_with_host_resolver(None);
+            fs.rootfs_vfs = Arc::new(root);
+            let desc = OpenDescription::HostFile {
+                base: OpenDescriptionBase::new(LINUX_O_RDWR),
+                host_fd: HostFdRef::new(host_fd),
+                metadata,
+                writable,
+            };
+            let description = crate::dispatch::fd_table::kernel_file_description(
+                Arc::new(parking_lot::RwLock::new(desc)),
+                LINUX_O_RDWR,
+            );
+            description.retain_fd_ref();
+            let open = OpenFile::new(description, 0);
+            enter_zone_at_open(
+                &open,
+                table(),
+                3,
+                &fs,
+                Some(&RlimitSet::carrick_defaults()),
+                None,
+            )
+            .unwrap();
+            let region = get_el1_region_host_ptr();
+            let slots = fd_map_slots(region);
+            let duplicate = carrick_el1::personality::file_table::dup2_host_binding(
+                slots,
+                table().raw(),
+                3,
+                5,
+                false,
+            )
+            .unwrap();
+            assert!(duplicate.release.is_none());
+            let identity = open.description.el1_identity().unwrap();
+            open.description.release_fd_ref();
+            let owners = OWNERS.lock();
+            assert!(
+                owners
+                    .as_ref()
+                    .and_then(|map| map.get(&identity))
+                    .is_some_and(|owner| matches!(owner.state, OwnerState::Guest(_))),
+                "last host reference admitted recall while a real ring duplicate is live"
+            );
+        }
+
         /// Simulate EL1 serving a write: bytes into the cache, size, offset and
         /// the dirty mask, exactly as carrick-el1 records them.
         fn guest_write(handle: u32, at: u64, bytes: &[u8]) {
