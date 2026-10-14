@@ -3,6 +3,7 @@
 //! Run ONLY through `just test-embed` (scripts/test-signed.sh): it signs the test
 //! executable with the hypervisor entitlement, exports `CARRICK_RUN_ID`, and runs
 //! it under `RUST_TEST_THREADS=1`.
+#![allow(clippy::panic)]
 
 mod common;
 
@@ -12,11 +13,41 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use carrick_embed::{
-    Carrier, ContainerId, EmbedError, ImageStore, PullPolicy, RunId, SharedBuffer,
+    Carrier, ContainerId, ContainerResult, EmbedError, ImageStore, PullPolicy, RunId, SharedBuffer,
     SharedBufferError,
 };
 
 static SHARED_CARRIER: std::sync::Mutex<Option<Carrier>> = std::sync::Mutex::new(None);
+
+const GUEST_DONE: u32 = 1 << 31;
+
+// Publish container completion on the same futex the host awaits for pong.
+// The guard also runs when the guest runner unwinds.
+struct GuestCompletion(carrick_embed::SharedBufferLease);
+
+impl Drop for GuestCompletion {
+    fn drop(&mut self) {
+        let pong = unsafe { &*(self.0.as_ptr().add(4) as *const AtomicU32) };
+        pong.fetch_or(GUEST_DONE, Ordering::AcqRel);
+        let _ = self.0.futex_wake(4, 1);
+    }
+}
+
+fn fail_before_pong(guest: thread::JoinHandle<ContainerResult>, round: u32) -> ! {
+    let when = if round == 1 {
+        "first pong".to_owned()
+    } else {
+        format!("pong round {round}")
+    };
+    match guest.join() {
+        Ok(result) => panic!(
+            "guest exited {} before {when}: stderr={}",
+            result.exit_code,
+            result.stderr_utf8()
+        ),
+        Err(_) => panic!("guest runner panicked before {when}"),
+    }
+}
 
 fn carrier_or_fail() -> Option<Carrier> {
     let mut guard = SHARED_CARRIER.lock().unwrap_or_else(|p| p.into_inner());
@@ -149,6 +180,7 @@ fn shared_buffer_lease_after_retirement_fails_closed() {
 #[test]
 fn shared_buffer_futex_pingpong_latency() {
     let _guest = common::guest_lock();
+    let _watchdog = common::Watchdog::start(Duration::from_secs(90));
     let Some(carrier) = carrier_or_fail() else {
         return;
     };
@@ -168,6 +200,7 @@ fn shared_buffer_futex_pingpong_latency() {
         .expect("write pong initial");
 
     const ROUNDS: u32 = 100;
+    const PONG_DEADLINE: Duration = Duration::from_secs(30);
 
     // Launch guest probe inside carrier container
     let container = carrier
@@ -186,12 +219,16 @@ fn shared_buffer_futex_pingpong_latency() {
         )
         .shared_buffer("bench", &buf);
 
+    let completion_lease = lease.clone();
     let guest_handle = thread::spawn(move || {
+        let _completion = GuestCompletion(completion_lease);
         let outcome = container.run_blocking();
         common::run_or_fail(outcome)
     });
 
     let start = Instant::now();
+    let deadline = start + PONG_DEADLINE;
+    let pong_ptr = unsafe { (lease.as_ptr().add(4)) as *const AtomicU32 };
     for round in 1..=ROUNDS {
         // Host writes round to ping (offset 0) and wakes guest
         let ping_ptr = lease.as_ptr() as *mut AtomicU32;
@@ -201,9 +238,23 @@ fn shared_buffer_futex_pingpong_latency() {
         let _ = lease.futex_wake(0, 1);
 
         // Host waits for guest to echo round on pong (offset 4)
-        let pong_ptr = unsafe { (lease.as_ptr().add(4)) as *const AtomicU32 };
-        while unsafe { (*pong_ptr).load(Ordering::Acquire) } != round {
-            let _ = lease.futex_wait(4, round - 1, Some(Duration::from_millis(50)));
+        loop {
+            let pong = unsafe { (*pong_ptr).load(Ordering::Acquire) };
+            if pong & !GUEST_DONE == round {
+                break;
+            }
+            if pong & GUEST_DONE != 0 {
+                fail_before_pong(guest_handle, round);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for pong round {round}"
+            );
+            match lease.futex_wait(4, pong, Some(remaining)) {
+                Ok(()) | Err(SharedBufferError::TimedOut) => {}
+                Err(error) => panic!("futex wait for pong round {round} failed: {error}"),
+            }
         }
     }
 
