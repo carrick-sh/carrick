@@ -844,8 +844,8 @@ fn sigprocmask_serves_block_setmask_and_query() {
 }
 
 #[test]
-fn sigprocmask_forwards_errors_aliases_and_closed_services() {
-    let set = Box::new(SIGUSR1_BIT);
+fn sigprocmask_serves_errors_aliases_and_refuses_closed_services() {
+    let mut set = Box::new(SIGUSR1_BIT);
     let old = Box::new(0x55_u64);
     let cases: [(LifecycleHatches, [u64; 4], bool); 5] = [
         (
@@ -878,27 +878,55 @@ fn sigprocmask_forwards_errors_aliases_and_closed_services() {
         ),
     ];
     for (hatches, args, close) in cases {
+        *set = SIGUSR1_BIT;
         let mut w = World::new(hatches);
         if close {
             w.page().close();
         }
         let (action, frame) = w.syscall(SYS_RT_SIGPROCMASK, &args);
-        assert_eq!(action, Action::Forward, "{args:x?}");
-        assert_eq!(&frame.x[..4], &args);
-        assert_eq!(w.venue.leader_slot().blocked(), BlockedMask(0));
+        if hatches.sigmask && !close {
+            assert_eq!(action, Action::Served, "{args:x?}");
+            assert_eq!(
+                frame.x[0] as i64,
+                if args[3] != 8 || args[0] == 7 { -22 } else { 0 }
+            );
+        } else {
+            assert_eq!(action, Action::Forward, "{args:x?}");
+            assert_eq!(&frame.x[..4], &args);
+        }
+        assert_eq!(
+            w.venue.leader_slot().blocked(),
+            BlockedMask(if args[1] == args[2] && action == Action::Served {
+                SIGUSR1_BIT
+            } else {
+                0
+            })
+        );
         assert_eq!(*old, 0x55);
-        assert_eq!(*set, SIGUSR1_BIT);
+        assert_eq!(
+            *set,
+            if args[1] == args[2] && action == Action::Served {
+                0
+            } else {
+                SIGUSR1_BIT
+            }
+        );
     }
     // A set EL1 cannot read: the host answers (EFAULT or the fault-in).
     let mut w = World::new(LifecycleHatches::ON);
     let mut frame = TrapFrame::default();
     frame.x[..4].copy_from_slice(&[SIG_BLOCK, addr(&*set), addr(&*old), 8]);
     frame.x[8] = SYS_RT_SIGPROCMASK as u64;
+    frame.slot = SLOT_IDX as u64;
     let mut user = FaultingUser {
         deny_in: std::vec![addr(&*set)],
         ..FaultingUser::default()
     };
-    assert_eq!(serve_directly(&mut w, &mut frame, &mut user), None);
+    assert_eq!(
+        serve_directly(&mut w, &mut frame, &mut user),
+        Some(Action::Served)
+    );
+    assert_eq!(frame.x[0] as i64, -14);
     assert_eq!(*old, 0x55);
 }
 
@@ -958,6 +986,7 @@ fn run_sigprocmask_dekker_storm(process: bool) {
                     thread,
                     &mut FaultingUser::default(),
                 )
+                .unwrap()
                 .unwrap(),
             );
             end.wait();
