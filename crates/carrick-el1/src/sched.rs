@@ -665,7 +665,7 @@ pub use hw::HardwareCpu;
 pub use hw::HardwareUserWord;
 
 /// The live system and FP/SIMD registers a switch moves, as plain fields.
-#[cfg(test)]
+#[cfg(any(test, feature = "host-test"))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FakeRegs {
     pub sp_el0: u64,
@@ -679,7 +679,7 @@ pub struct FakeRegs {
 
 /// A host-test stand-in for the CPU: the registers a switch moves, plus a
 /// model of the counter, the virtual timer and the GIC CPU interface.
-#[cfg(test)]
+#[cfg(any(test, feature = "host-test"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FakeCpu {
     pub regs: FakeRegs,
@@ -706,7 +706,7 @@ pub struct FakeCpu {
     pub asid_invalidations: std::vec::Vec<u64>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "host-test"))]
 impl Default for FakeCpu {
     fn default() -> Self {
         Self {
@@ -727,7 +727,7 @@ impl Default for FakeCpu {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "host-test"))]
 impl ThreadCpu for FakeCpu {
     fn save(&mut self, frame: &TrapFrame, ctx: &mut Aarch64ParkedContext) {
         let ctx = &mut ctx.native;

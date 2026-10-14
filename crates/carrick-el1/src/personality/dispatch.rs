@@ -824,7 +824,31 @@ impl<
         self.frame.may_serve_poll()
     }
     fn may_serve_descriptor(&self) -> bool {
-        self.frame.may_serve_descriptor()
+        if self.frame.may_serve_descriptor() {
+            return true;
+        }
+        let ordinal = self.frame.canonical_ordinal().raw();
+        if ![
+            carrick_personality_linux::crossing::nr::DUP,
+            carrick_personality_linux::crossing::nr::DUP3,
+            carrick_personality_linux::crossing::nr::CLOSE,
+        ]
+        .iter()
+        .any(|nr| nr.raw() == ordinal)
+        {
+            return false;
+        }
+        // Native fork owns its copied file slots; the host has no child table.
+        // Host views and inotify retain their existing mutation owner.
+        self.task().is_some_and(|task| {
+            let table = task.linux.file_table.load(Ordering::Acquire);
+            let fd = self.frame.argument(0).unwrap_or(0) as i32;
+            fd_map_lookup(self.fd_map, table, fd).is_some_and(|(handle, index)| {
+                handle & carrick_el1_abi::FD_HANDLE_INOTIFY_TAG == 0
+                    && self.fd_map[index].fd_flags.load(Ordering::Acquire) & FdMapSlot::HOST_VIEW
+                        == 0
+            })
+        })
     }
     fn take_handoff_receipt(&mut self) -> Option<carrick_el1_abi::EntryHandoffReceipt<Context>> {
         self.process
