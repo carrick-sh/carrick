@@ -302,8 +302,9 @@ fn file_region_guest_stdio_parity_and_two_carrier_independence() {
 #[test]
 fn file_region_guest_closes_record_beyond_fifteen() {
     use carrick_el1::personality::file_table::{admit_host_fd, admit_stdio};
-    use carrick_el1_abi::{DELEGATED_FLAG_READABLE, HostObjectReleaseCrossing, fd_map_lookup};
+    use carrick_el1_abi::{DELEGATED_FLAG_READABLE, OpenRelease, fd_map_lookup};
     use std::os::fd::AsRawFd;
+    use std::sync::atomic::Ordering;
     let program = file_region_program(3, 19); // close(fd 19)
     let mut carrier =
         Cpl0Carrier::boot(physical_inventory(), &image(), [&program, &program]).expect("carrier");
@@ -334,25 +335,24 @@ fn file_region_guest_closes_record_beyond_fifteen() {
         }
     }
     let result = carrier
-        .observe_with_forward(0, |frame| {
-            assert_eq!(frame.rax, HostObjectReleaseCrossing::NUMBER);
-            assert_eq!(frame.rcx, HostObjectReleaseCrossing::FRAME_TAG);
-            assert_eq!(frame.rsi, 20);
-            assert_eq!(frame.rdx, 1);
-            frame.rax = 0;
-            Ok(())
-        })
+        .observe(0)
         .expect("close authenticates region record 19");
     assert_eq!(result.result, 0);
-    assert_eq!(result.semantic_host_exits, 1);
-    assert!(
-        fd_map_lookup(
-            carrier.file_tables(binding).expect("live tables").fd_map(),
-            5,
-            19
-        )
-        .is_none()
+    assert_eq!(result.semantic_host_exits, 0);
+    let tables = carrier.file_tables(binding).expect("live tables");
+    assert!(fd_map_lookup(tables.fd_map(), 5, 19).is_none());
+    // F1a owns terminal release; regular files no longer cross inline.
+    // Inspect the same handle/incarnation in the actual retained record.
+    let open = &tables.opens()[19];
+    assert_eq!(
+        open.host_fd().expect("host binding").raw(),
+        host.as_raw_fd()
     );
+    assert_eq!(open.generation.load(Ordering::Acquire), 1);
+    assert!(open.is_bound_to(&tables.objects()[19]));
+    assert!(open.lifetime.is_terminal(1));
+    assert_eq!(open.lifetime.release(1), OpenRelease::Stale);
+    assert!(!open.lifetime.retain(1), "terminal cannot be resurrected");
 }
 
 #[test]
