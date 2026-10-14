@@ -13,7 +13,7 @@ pub struct NativeRootExit {
 }
 
 impl NativeRootExit {
-    /// CRTERMST: distinct from the old Linux wait-encoding record.
+    /// CRTERMST: distinct from the legacy wait-encoded record.
     pub const MAGIC: u64 = 0x4352_5445_524d_5354;
 
     pub fn new(binding: ExecutionBinding, status: TerminationStatus) -> Option<Self> {
@@ -73,6 +73,8 @@ impl NativeRootExit {
 }
 
 const _: () = {
+    assert!(NativeRootExit::MAGIC == 0x4352_5445_524d_5354);
+    assert!(NATIVE_ROOT_EXIT_PORT == 0xd3);
     assert!(core::mem::size_of::<NativeRootExit>() == 64);
     assert!(core::mem::align_of::<NativeRootExit>() == 64);
     assert!(core::mem::offset_of!(NativeRootExit, words) == 0);
@@ -106,7 +108,7 @@ mod tests {
         }
     }
     #[test]
-    fn rejects_old_linux_wait_wire_record() {
+    fn rejects_legacy_wait_encoded_record() {
         let mut words = NativeRootExit::new(binding(), TerminationStatus::SUCCESS)
             .unwrap()
             .raw_words();

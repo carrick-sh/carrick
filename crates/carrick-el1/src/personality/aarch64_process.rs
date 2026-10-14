@@ -985,8 +985,13 @@ pub fn cross_root_exit<X: ForkStockCrossing>(
     worker: u32,
 ) -> Result<(), NativeProcessError> {
     let binding = common_entry::execution_binding(task);
-    let exit = carrick_core_abi::NativeRootExit::new(binding, status.to_termination_status())
-        .ok_or(NativeProcessError::Invalid)?;
+    let exit = carrick_core_abi::NativeRootExit::new(
+        binding,
+        status
+            .terminal_status()
+            .map_err(|_| NativeProcessError::Invalid)?,
+    )
+    .ok_or(NativeProcessError::Invalid)?;
     crossing.cross_root_exit(&exit as *const _ as u64, u64::from(worker))
 }
 

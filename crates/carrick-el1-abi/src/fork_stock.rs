@@ -727,6 +727,46 @@ mod tests {
     use crate::{EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration};
     use carrick_guest_arch::{ContextGeneration, FrameGpa, MmGeneration};
 
+    #[test]
+    fn neutral_root_exit_wire_layout_is_pinned() {
+        use carrick_core_abi::{NATIVE_ROOT_EXIT_PORT, NativeRootExit};
+        use carrick_sched_core::process::TerminationStatus;
+        assert_eq!(NativeRootExit::MAGIC, 0x4352_5445_524d_5354);
+        assert_eq!(NATIVE_ROOT_EXIT_PORT, 0xd3);
+        assert_eq!(core::mem::size_of::<NativeRootExit>(), 64);
+        assert_eq!(core::mem::align_of::<NativeRootExit>(), 64);
+        assert_eq!(core::mem::offset_of!(NativeRootExit, words), 0);
+        let binding = ExecutionBinding {
+            task: EntryTaskKey::from_raw(41),
+            generation: EntryGeneration::from_raw(11),
+            mm: EntryMmKey::from_raw(301),
+            thread_generation: EntryThreadGeneration::from_raw(101),
+        };
+        for (status, kind) in [
+            (TerminationStatus::exited(0xdead_beef), 0),
+            (TerminationStatus::signaled(9, false), 1),
+            (TerminationStatus::signaled(9, true), 2),
+        ] {
+            let record = NativeRootExit::new(binding, status).unwrap();
+            // SAFETY: this fully initialized record contains exactly eight u64 words.
+            let bytes = unsafe {
+                core::slice::from_raw_parts((&record as *const NativeRootExit).cast::<u8>(), 64)
+            };
+            for (offset, word) in [
+                (0, NativeRootExit::MAGIC),
+                (8, 41),
+                (16, 11),
+                (24, 301),
+                (32, 101),
+                (40, u64::from(status.code())),
+                (48, kind),
+                (56, 0),
+            ] {
+                assert_eq!(&bytes[offset..offset + 8], &word.to_ne_bytes());
+            }
+        }
+    }
+
     fn lifecycle_x86() -> ForkLifecycleLoan {
         assert_eq!(
             ForkLifecycleLoan::new(
@@ -985,7 +1025,7 @@ mod tests {
     fn pre_change_x86_layout_wire_byte_identity() {
         use core::mem::{align_of, offset_of, size_of};
 
-        // 1. Layout manifest matching pre-change X86ForkStockExchange, X86ForkStockSettlement, X86NativeRootExit
+        // 1. Layout manifest matching pre-change X86ForkStockExchange, X86ForkStockSettlement
         assert_eq!(size_of::<ForkStockExchange>(), 24 * 8);
         assert_eq!(align_of::<ForkStockExchange>(), 64);
         assert_eq!(offset_of!(ForkStockExchange, tag), 0);

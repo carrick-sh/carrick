@@ -148,7 +148,7 @@ pub struct ForkStockSettlement {
   - Word 8: `status` (1=accepted, 2=refused, 3=taken)
   - Words 9..15: 0
 
-### 3.3 `NativeRootExit` Layout (64 bytes, 64-byte aligned)
+### 3.3 `carrick-core-abi::NativeRootExit` Layout (64 bytes, 64-byte aligned)
 
 ```rust
 #[repr(C, align(64))]
@@ -156,13 +156,20 @@ pub struct NativeRootExit {
     words: [u64; 8],
 }
 ```
-- Word 0: `CRROOTEX` (`0x4352_524f_4f54_4558`)
+- Word 0: `CRTERMST` (`0x4352_5445_524d_5354`)
 - Word 1: `binding.task`
 - Word 2: `binding.generation`
 - Word 3: `binding.mm`
 - Word 4: `binding.thread_generation`
-- Word 5: `status` (Linux wait status encoding: `code << 8`)
-- Words 6..7: 0
+- Word 5: full-width `TerminationStatus` code (u32 widened to u64)
+- Word 6: terminal kind (0=exited, 1=signaled, 2=signaled with core dump)
+- Word 7: 0 (reserved)
+
+The x86 notification port remains `0xd3`. The authenticated host personality
+adapter encodes its wait ABI only after decoding this neutral record. Linux
+adapters refuse invalid signal codes, and Linux producers refuse stopped or
+continued notifications. Legacy wait-encoded records use a different magic
+and are rejected.
 
 ---
 
