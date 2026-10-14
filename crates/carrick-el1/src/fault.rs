@@ -1,7 +1,8 @@
 //! In-guest EL1 fault handling and dispatch.
 
 use carrick_el1_abi::{
-    Action, Counters, CurrentTask, FrameGrantMailbox, FrameGrantMailboxes, TrapFrame,
+    Action, Counters, CurrentTask, FrameGrantMailbox, FrameGrantMailboxes, ReservationIncarnation,
+    TrapFrame,
 };
 use carrick_mmu_core::aarch64::descriptor_txn::{
     DescriptorOutcome, DescriptorReceipt, DescriptorTxnSlot,
@@ -18,7 +19,9 @@ pub fn panic_publication_detail() -> u64 {
     0
 }
 
-pub use carrick_core::mm::fault::{request_lazy_frames, root_fault_admission};
+pub use carrick_core::mm::fault::{
+    request_lazy_frames, root_fault_admission, root_mapping_incarnation,
+};
 
 /// Decode an EL0 translation fault that can be satisfied by publishing fresh
 /// anonymous backing. Permission faults name an already-mapped page and must
@@ -1248,12 +1251,19 @@ fn release_refusal(source: &FrameGrantMailbox, mm_key: u64, request_generation: 
 }
 
 /// Consume the refusal answering this fault, left on the faulting vCPU's
-/// mailbox or, after an EL1 scheduler migration, on a peer's. `true` when one
-/// was found.
-fn consume_refusal(mailboxes: GrantMailboxes<'_>, mm_key: u64, far: u64, access: u64) -> bool {
+/// mailbox or, after an EL1 scheduler migration, on a peer's. `true` only
+/// when it still answers the current mapping; an older node's refusal is
+/// retired and the replacement may issue its own request.
+fn consume_refusal(
+    mailboxes: GrantMailboxes<'_>,
+    mm_key: u64,
+    far: u64,
+    access: u64,
+    current_incarnation: impl FnOnce() -> Option<ReservationIncarnation>,
+) -> bool {
     let found = mailboxes
         .own
-        .response_for_fault(mm_key, far, access)
+        .response_covering_fault(mm_key, far, access)
         .map(|response| (mailboxes.own, response))
         .or_else(|| {
             mailboxes.peers?.iter().find_map(|peer| {
@@ -1264,8 +1274,12 @@ fn consume_refusal(mailboxes: GrantMailboxes<'_>, mm_key: u64, far: u64, access:
     let Some((source, response)) = found else {
         return false;
     };
+    let stale = response
+        .request
+        .reservation_incarnation
+        .is_some_and(|old| current_incarnation().is_some_and(|current| current != old));
     release_refusal(source, mm_key, response.request.request_generation);
-    true
+    !stale
 }
 
 /// A fault the residency table served may still have a refusal outstanding
@@ -1600,7 +1614,15 @@ fn dispatch_classified_fault<
     let mailbox = mailboxes.own;
     // Only refusals cross back to EL1. Successful grants have already
     // published and released their slot on the host, even after migration.
-    if consume_refusal(mailboxes, mm_key, far, access) {
+    if consume_refusal(mailboxes, mm_key, far, access, || {
+        root_mapping_incarnation(
+            prepared.as_ref().and_then(|path| path.roots),
+            spaces,
+            slot as u32,
+            mm_key,
+            far,
+        )
+    }) {
         return Action::Forward;
     }
 
@@ -1618,7 +1640,14 @@ fn dispatch_classified_fault<
     {
         return Action::Forward;
     }
-    let _ = request_lazy_frames(mailbox, mm_key, far, access);
+    let incarnation = root_mapping_incarnation(
+        prepared.as_ref().and_then(|path| path.roots),
+        spaces,
+        slot as u32,
+        mm_key,
+        far,
+    );
+    let _ = request_lazy_frames(mailbox, mm_key, far, access, incarnation);
     Action::Forward
 }
 
@@ -2320,6 +2349,102 @@ mod tests {
         );
         assert!(!mailbox.has_guest_work());
         assert_ne!(request.request_generation, 0);
+    }
+
+    /// A refusal answers the mapping that faulted, not a later mapping at
+    /// the same VA. The host may have refused an obsolete request after a
+    /// sibling published its leaf; munmap and mmap can then reuse the VA
+    /// before EL1 next sees the mailbox response.
+    #[test]
+    fn old_mapping_refusal_does_not_block_first_touch_after_va_reuse() {
+        use crate::memory::reservations::{Decision, Placement};
+        use carrick_el1_abi::{
+            ReservationBackingReceipt, ReservationCompletion, ReservationMm, ReservationProtection,
+            ReservationRange,
+        };
+        let mm = 88;
+        let va = 0x4000_5000;
+        let spaces = published_space(mm, 0x8800_0000);
+        let roots = admitted_root(&spaces, mm, &[(va, 4096, 3)]);
+        let residency = carrick_el1_abi::FrameGrantResidencyTable::new();
+        let task = CurrentTask::new();
+        task.mm.key.store(mm, Ordering::Release);
+        let tasks = [task];
+        let mailbox = FrameGrantMailbox::new();
+        let mut fault = write_translation_fault(0, va);
+        let dispatch = |frame: &mut TrapFrame| {
+            dispatch_fault_with_prepared(
+                frame,
+                &Counters::default(),
+                &tasks,
+                SpaceAccess::source_free(&spaces),
+                GrantMailboxes::own(&mailbox),
+                Some(PreparedFaultPath::<_> {
+                    residency: &residency,
+                    resolver: &mut NoopPreparedResolver,
+                    roots: Some(&roots),
+                    file_slots: None,
+                }),
+                &mut NoopCowResolver,
+            )
+        };
+        assert_eq!(dispatch(&mut fault), Action::Forward);
+        let old_request = mailbox
+            .claim_request()
+            .expect("old mapping requested backing");
+        let old_incarnation = old_request
+            .reservation_incarnation
+            .expect("admitted anonymous request names its node");
+        assert!(mailbox.publish_refusal(FRAME_GRANT_ERR_DENIED));
+
+        let index = spaces.find(mm).unwrap().index();
+        let mut root = roots.lock(index, ReservationMm::new(mm).unwrap()).unwrap();
+        let range = ReservationRange::new(va, va + 4096).unwrap();
+        let Decision::Work(retire) = root.munmap(range).unwrap() else {
+            panic!("the old node must retire");
+        };
+        let completion = unsafe {
+            ReservationCompletion::after_descriptor_and_backing_commit(
+                retire,
+                ReservationBackingReceipt {
+                    receipt: retire.sequence.raw(),
+                    granted_bytes: 0,
+                    returned_bytes: 0,
+                },
+            )
+        }
+        .unwrap();
+        root.complete(completion).unwrap();
+        let Decision::Work(replace) = root
+            .mmap(
+                Placement::Fixed(va),
+                4096,
+                ReservationProtection::READ_WRITE,
+            )
+            .unwrap()
+        else {
+            panic!("VA reuse must create a new node");
+        };
+        let completion = unsafe {
+            ReservationCompletion::after_descriptor_and_backing_commit(
+                replace,
+                ReservationBackingReceipt {
+                    receipt: replace.sequence.raw(),
+                    granted_bytes: 0,
+                    returned_bytes: 0,
+                },
+            )
+        }
+        .unwrap();
+        root.complete(completion).unwrap();
+        drop(root);
+
+        assert_eq!(dispatch(&mut fault), Action::Forward);
+        let new_request = mailbox
+            .claim_request()
+            .expect("the replacement mapping must issue its own grant request");
+        assert_ne!(new_request.reservation_incarnation, Some(old_incarnation));
+        assert!(new_request.reservation_incarnation.is_some());
     }
 
     /// Guest-lane shape: a fault inside a grant EL1 already applied, before
