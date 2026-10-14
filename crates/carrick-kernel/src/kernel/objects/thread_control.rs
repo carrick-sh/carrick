@@ -303,6 +303,7 @@ struct Arena {
     lifecycle: ThreadLifecycleLease,
     free: Mutex<Vec<FreeSlot>>,
     births: Mutex<BirthControlPins>,
+    host_births: Mutex<[Option<ThreadControlLease>; carrick_el1_abi::THREAD_POOL_ENTRIES]>,
 }
 
 /// One process's control storage. A fork creates a distinct arena. Free-list
@@ -325,6 +326,7 @@ impl ThreadControlArena {
             lifecycle,
             free: Mutex::new(Vec::new()),
             births: Mutex::new(std::array::from_fn(|_| None)),
+            host_births: Mutex::new(std::array::from_fn(|_| None)),
         }))
     }
 
@@ -391,6 +393,13 @@ impl Drop for Lease {
 pub struct ThreadControlLease(Arc<Lease>);
 
 impl ThreadControlLease {
+    /// The host arena pins a birth while the shared page exposes its address.
+    /// A reused page slot replaces only a lease the ring already released.
+    pub(in crate::kernel) fn pin_host_birth(&self, index: usize) {
+        if let Some(arena) = self.0.arena.upgrade() {
+            arena.host_births.lock()[index] = Some(self.clone());
+        }
+    }
     pub(in crate::kernel) fn register_birth_entry(&self, entry: carrick_el1_abi::EntryRef) {
         if let Some(arena) = self.0.arena.upgrade() {
             arena.births.lock()[entry.index()] = Some((entry, Arc::downgrade(&self.0)));

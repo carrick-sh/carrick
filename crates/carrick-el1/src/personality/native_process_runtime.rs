@@ -464,6 +464,10 @@ enum OutstandingExitReceipt<'a> {
         binding: ExecutionBinding,
         control: &'a ThreadControlSlot,
     },
+    HostBorn {
+        identity: carrick_core::terminal::HostThreadRetirementReceipt,
+        control: &'a ThreadControlSlot,
+    },
 }
 
 struct PendingExit<'a> {
@@ -490,6 +494,17 @@ impl PendingExit<'_> {
             OutstandingExitReceipt::Adopted { binding, control } => control
                 .host_retirement()
                 .is_some_and(|receipt| receipt.matches(*binding)),
+            OutstandingExitReceipt::HostBorn { identity, control } => {
+                control.host_retirement() == Some(*identity)
+            }
+        }) && (0..carrick_el1_abi::THREAD_POOL_ENTRIES).all(|index| {
+            page.host_born_address(index).is_none_or(|address| {
+                // SAFETY: Closing defers release until Settled.
+                let control = unsafe { &*(address as *const ThreadControlSlot) };
+                control.host_birth_identity().is_some_and(|identity| {
+                    control.host_retirement() == Some(identity)
+                })
+            })
         })
     }
 }
@@ -737,6 +752,16 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 let _ = runtime
                     .zone
                     .claim_for_host(*record, None, Handback::Cancelled, &wait);
+            }
+        }
+        for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
+            let Some(address) = page.host_born_address(index) else {
+                continue;
+            };
+            // SAFETY: Closing retains host-born slots until Settled.
+            let control = unsafe { &*(address as *const ThreadControlSlot) };
+            if !core::ptr::eq(control, caller) && control.host_birth_identity().is_some() {
+                control.request_host_exit();
             }
         }
         for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
@@ -1227,74 +1252,79 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         if !state.by_process.contains_key(&(key.carrier, process)) {
             return Err(NativeProcessError::Stale);
         }
-        let closing =
-            {
-                let mut graph = runtime.graph.lock();
-                let row = graph
-                    .owner
-                    .task_mut(process)
-                    .map_err(|_| NativeProcessError::Stale)?;
-                let already_owned = if let Some(issued) = host_issued {
-                    issued.authorize_group(source, row, address, page, control)?
-                } else {
-                    let resources = row.native_mut().resources_mut();
-                    if !core::ptr::eq(resources.page, page) {
-                        return Err(NativeProcessError::Stale);
-                    }
-                    let imported = resources
-                        .members
-                        .iter()
-                        .find(|member| member.thread.id() == key.task.id());
-                    if imported.is_some_and(|member| {
-                        !core::ptr::eq(member.control, control)
-                            || (member.record != source.zone.record_ref(record)
-                                && signal_record_exists(source.zone, member.record))
-                    }) {
-                        return Err(NativeProcessError::Stale);
-                    }
-                    imported.is_some()
-                };
-                if row.credentials_for(visible_tid).is_err() {
-                    let caller_tid = row.metadata().namespace_pid;
-                    row.spawn_thread(caller_tid, visible_tid)
-                        .map_err(|_| NativeProcessError::Invalid)?;
+        let closing = {
+            let mut graph = runtime.graph.lock();
+            let row = graph
+                .owner
+                .task_mut(process)
+                .map_err(|_| NativeProcessError::Stale)?;
+            let already_owned = if let Some(issued) = host_issued {
+                let already_owned = issued.authorize_group(source, row, address, page, control)?;
+                if !page.release_adopted_host_birth(core::ptr::from_ref(control).addr() as u64) {
+                    return Err(NativeProcessError::Stale);
                 }
-                if already_owned {
-                    let member = row
-                        .native_mut()
-                        .resources_mut()
-                        .members
-                        .iter_mut()
-                        .find(|member| member.thread.id() == key.task.id())
-                        .ok_or(NativeProcessError::Stale)?;
-                    member.thread = key.task;
-                    member.record = source.zone.record_ref(record);
-                } else {
-                    row.native_mut().resources_mut().members.push(NativeMember {
-                        thread: key.task,
-                        process,
-                        zone: source.zone,
-                        record: source.zone.record_ref(record),
-                        control,
-                    });
+                already_owned
+            } else {
+                let resources = row.native_mut().resources_mut();
+                if !core::ptr::eq(resources.page, page) {
+                    return Err(NativeProcessError::Stale);
                 }
-                let closing = graph.pending_exit.get_mut(&process);
-                if let Some(pending) = closing {
-                    if binding.issued() && !pending.outstanding.iter().any(|receipt| {
+                let imported = resources
+                    .members
+                    .iter()
+                    .find(|member| member.thread.id() == key.task.id());
+                if imported.is_some_and(|member| {
+                    !core::ptr::eq(member.control, control)
+                        || (member.record != source.zone.record_ref(record)
+                            && signal_record_exists(source.zone, member.record))
+                }) {
+                    return Err(NativeProcessError::Stale);
+                }
+                imported.is_some()
+            };
+            if row.credentials_for(visible_tid).is_err() {
+                let caller_tid = row.metadata().namespace_pid;
+                row.spawn_thread(caller_tid, visible_tid)
+                    .map_err(|_| NativeProcessError::Invalid)?;
+            }
+            if already_owned {
+                let member = row
+                    .native_mut()
+                    .resources_mut()
+                    .members
+                    .iter_mut()
+                    .find(|member| member.thread.id() == key.task.id())
+                    .ok_or(NativeProcessError::Stale)?;
+                member.thread = key.task;
+                member.record = source.zone.record_ref(record);
+            } else {
+                row.native_mut().resources_mut().members.push(NativeMember {
+                    thread: key.task,
+                    process,
+                    zone: source.zone,
+                    record: source.zone.record_ref(record),
+                    control,
+                });
+            }
+            let closing = graph.pending_exit.get_mut(&process);
+            if let Some(pending) = closing {
+                if binding.issued()
+                    && !pending.outstanding.iter().any(|receipt| {
                         matches!(receipt,
                             OutstandingExitReceipt::Adopted { binding: old, control: old_control }
                                 if *old == binding && core::ptr::eq(*old_control, control)
                         )
-                    }) {
-                        pending
-                            .outstanding
-                            .push(OutstandingExitReceipt::Adopted { binding, control });
-                    }
-                    true
-                } else {
-                    false
+                    })
+                {
+                    pending
+                        .outstanding
+                        .push(OutstandingExitReceipt::Adopted { binding, control });
                 }
-            };
+                true
+            } else {
+                false
+            }
+        };
         state.members.insert(
             key,
             NativeOwnerMember {
@@ -1396,6 +1426,14 @@ impl IssuedHostThread {
             .issued()
             .ok_or(NativeProcessError::Stale)?;
         let visible_tid = control.visible_tid().ok_or(NativeProcessError::Stale)?;
+        if control.host_birth_identity()
+            != Some(carrick_core::terminal::HostThreadRetirementReceipt::from_binding(binding))
+            || !(0..carrick_el1_abi::THREAD_POOL_ENTRIES).any(|index| {
+                page.host_born_address(index) == Some(core::ptr::from_ref(control).addr() as u64)
+            })
+        {
+            return Err(NativeProcessError::Stale);
+        }
         let record_ref = source.zone.record_ref(record);
         if control.zone_record() != Some(record_ref) {
             return Err(NativeProcessError::Stale);
@@ -3365,8 +3403,38 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         control,
                     }
                 }));
-                let members = carrick_core::terminal::MemberSet::new(pool_mask, adopted.len())
-                    .ok_or(NativeProcessError::Exhausted)?;
+                for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
+                    let Some(address) = page.host_born_address(index) else {
+                        continue;
+                    };
+                    // SAFETY: a Closing page retains the slot until Settled.
+                    let control = unsafe { &*(address as *const ThreadControlSlot) };
+                    if core::ptr::eq(control, self.control) {
+                        continue;
+                    }
+                    let identity = control
+                        .host_birth_identity()
+                        .ok_or(NativeProcessError::Stale)?;
+                    outstanding.push(OutstandingExitReceipt::HostBorn { identity, control });
+                }
+                let bindings = outstanding
+                    .iter()
+                    .filter_map(|receipt| match receipt {
+                        OutstandingExitReceipt::Pool(_) => None,
+                        OutstandingExitReceipt::Adopted { binding, .. } => Some(
+                            carrick_core::terminal::HostThreadRetirementReceipt::from_binding(
+                                *binding,
+                            ),
+                        ),
+                        OutstandingExitReceipt::HostBorn { identity, .. } => Some(*identity),
+                    })
+                    .collect();
+                let members = carrick_core::terminal::MemberSet::new(
+                    pool_mask,
+                    bindings,
+                    page.live() as usize,
+                )
+                .ok_or(NativeProcessError::Exhausted)?;
                 let identity = carrick_core::terminal::ProcessTerminalIdentity::from_exit(
                     self.key,
                     address,

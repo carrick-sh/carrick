@@ -440,7 +440,24 @@ impl PreparedThreadClone {
             .transpose()?
             .flatten();
         check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
+        let host_birth = if matches!(lane, PublicationLane::HostClone) {
+            Some(
+                thread
+                    .control_lease()
+                    .lifecycle()
+                    .reserve_host_birth()
+                    .ok_or(KernelOperationError::HostBirthCapacity)?,
+            )
+        } else {
+            None
+        };
         if pid_identity.is_some_and(|identity| !identity.commit()) {
+            if let Some(index) = host_birth {
+                thread
+                    .control_lease()
+                    .lifecycle()
+                    .cancel_host_birth_claim(index);
+            }
             return Err(KernelOperationError::PidNamespaceMembership(task.key().id));
         }
         let claim = reservation.commit();
@@ -449,14 +466,20 @@ impl PreparedThreadClone {
         // failure left after namespace membership commits; treating an
         // invariant violation as an ordinary error would leave a ghost
         // namespace member behind.
-        task.publish_thread(Arc::clone(&thread))
-            .unwrap_or_else(|_| {
-                carrick_fatal!(
-                    "kernel::thread_publication",
-                    "publish_thread failed in PreparedThreadClone::publish_reserved"
-                );
-            });
+        let mut publication_valid = task.publish_thread(Arc::clone(&thread)).is_ok();
         if matches!(lane, PublicationLane::HostClone) {
+            let task_key = task.key();
+            let thread_key = thread.key();
+            thread
+                .control_slot()
+                .publish_host_birth_identity(carrick_el1_abi::ExecutionBinding {
+                    task: carrick_el1_abi::EntryTaskKey::from_raw(thread_key.tid.raw() as u64),
+                    generation: carrick_el1_abi::EntryGeneration::from_raw(task_key.serial.raw()),
+                    mm: carrick_el1_abi::EntryMmKey::from_raw(shared.mm().id().raw()),
+                    thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(
+                        thread_key.serial.raw(),
+                    ),
+                });
             thread
                 .control_lease()
                 .lifecycle()
@@ -464,6 +487,23 @@ impl PreparedThreadClone {
                 .unwrap_or_else(|| {
                     carrick_fatal!("kernel::thread_publication", "thread live count overflow");
                 });
+            let page = thread.control_lease().lifecycle();
+            if let Some(index) = host_birth {
+                thread.control_lease().pin_host_birth(index);
+                publication_valid &=
+                    page.publish_host_birth(index, thread.control_lease().slot_address().0 as u64);
+            } else {
+                publication_valid = false;
+            }
+            if page.gate() == carrick_core::lifecycle::GateState::Closed {
+                thread.control_slot().request_host_exit();
+            }
+        }
+        if !publication_valid {
+            carrick_fatal!(
+                "kernel::thread_publication",
+                "thread or host birth publication lost its exact claim"
+            );
         }
         record.thread_claims.insert(tid, claim);
         if let Some(membership_revision) = membership_revision {
@@ -1032,6 +1072,43 @@ mod tests {
     use crate::kernel::operations::tests::bootstrap;
     use crate::kernel::operations::{ChildStartOutcome, WaitMode, WaitOutcome};
     use crate::kernel::{Credentials, FileTable, FsContext, Mm, Sighand};
+
+    #[test]
+    fn host_birth_capacity_refuses_before_publication_without_leaking_slot() {
+        let (kernel, root) = bootstrap(189);
+        let plan = ClonePlan::from_flags(
+            LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+        )
+        .expect("thread plan");
+        let mut children = Vec::new();
+        for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
+            children.push(
+                kernel
+                    .clone_thread(
+                        &root,
+                        plan,
+                        ThreadId::synthetic_for_tests(8_800 + index as i32),
+                        None,
+                    )
+                    .expect("host birth within page capacity"),
+            );
+        }
+        let page = root.lifecycle_page();
+        assert_eq!(page.host_birth_claimed_count(), 0);
+        assert_eq!(
+            (0..carrick_el1_abi::THREAD_POOL_ENTRIES)
+                .filter(|&index| page.host_born_address(index).is_some())
+                .count(),
+            carrick_el1_abi::THREAD_POOL_ENTRIES,
+        );
+        assert!(matches!(
+            kernel.clone_thread(&root, plan, ThreadId::synthetic_for_tests(8_899), None),
+            Err(KernelOperationError::HostBirthCapacity)
+        ));
+        assert_eq!(page.host_birth_claimed_count(), 0);
+        assert_eq!(page.live(), 1 + carrick_el1_abi::THREAD_POOL_ENTRIES as u32);
+        assert_eq!(root.task().thread_count_for_test(), 1 + children.len());
+    }
 
     #[test]
     fn thread_clone_reservation_keeps_tid_private_until_commit() {
