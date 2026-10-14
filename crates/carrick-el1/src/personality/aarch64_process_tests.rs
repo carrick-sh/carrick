@@ -1,7 +1,11 @@
 //! Red-first VM-free tests for [`Aarch64NativeProcessService`] and the shared process owner.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use super::aarch64_process::*;
+use super::aarch64_process::{Aarch64NativeProcessService, ForkStockCrossing};
+#[cfg(test)]
+use super::aarch64_process::{
+    cross_root_exit, observed_entry_address, process_record_for_call, registry,
+};
 #[cfg(test)]
 use super::native_process_runtime::NativeProcessService;
 use super::native_process_runtime::{NativeProcessError, NativeProcessRuntime};
