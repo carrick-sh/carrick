@@ -176,13 +176,14 @@ impl Github {
             .ok_or(ScalerError::External("run head SHA"))?
             .to_ascii_lowercase();
         if run["event"] == "merge_group" {
-            let queue = self.request(
-                "POST",
-                "graphql",
-                Some(json!({ "query": MERGE_QUEUE_QUERY })),
-                false,
-            )?;
-            vet_merge_group(&queue, &sha)?;
+            confirm_merge_group(&sha, || {
+                self.request(
+                    "POST",
+                    "graphql",
+                    Some(json!({ "query": MERGE_QUEUE_QUERY })),
+                    false,
+                )
+            })?;
         }
         Ok(match admission {
             Admission::Pilot { sha } => JobPolicy::Pilot { sha: sha.clone() },
@@ -290,6 +291,16 @@ impl Github {
     }
 }
 
+fn confirm_merge_group(
+    sha: &str,
+    mut observe: impl FnMut() -> Result<Value, ScalerError>,
+) -> Result<(), ScalerError> {
+    match vet_merge_group(&observe()?, sha) {
+        Err(ScalerError::StaleMergeGroup) => vet_merge_group(&observe()?, sha),
+        result => result,
+    }
+}
+
 fn vet_merge_group(queue: &Value, sha: &str) -> Result<(), ScalerError> {
     if queue.get("errors").is_some() {
         return Err(ScalerError::External("merge queue GraphQL errors"));
@@ -301,7 +312,7 @@ fn vet_merge_group(queue: &Value, sha: &str) -> Result<(), ScalerError> {
     if !nodes.iter().any(|node| node["headCommit"]["oid"] == sha) {
         return match entries["pageInfo"]["hasNextPage"].as_bool() {
             Some(false) => Err(ScalerError::StaleMergeGroup),
-            Some(true) => Err(ScalerError::Guard(
+            Some(true) => Err(ScalerError::External(
                 "merge group is outside the visible queue",
             )),
             None => Err(ScalerError::External("merge queue pagination")),
@@ -361,6 +372,33 @@ mod tests {
     }
 
     #[test]
+    fn ci_scaler_stale_group_requires_two_consecutive_complete_observations() {
+        let absent = queue();
+        let mut live = queue();
+        live["data"]["repository"]["mergeQueue"]["entries"]["nodes"][0]["headCommit"]["oid"] =
+            json!("new");
+        let mut observations = [absent.clone(), live.clone()].into_iter();
+        assert!(confirm_merge_group("new", || Ok(observations.next().unwrap())).is_ok());
+        let mut count = 0;
+        assert!(matches!(
+            confirm_merge_group("new", || {
+                count += 1;
+                Ok(absent.clone())
+            }),
+            Err(ScalerError::StaleMergeGroup)
+        ));
+        assert_eq!(count, 2);
+        let mut truncated = absent.clone();
+        truncated["data"]["repository"]["mergeQueue"]["entries"]["pageInfo"]["hasNextPage"] =
+            json!(true);
+        let mut observations = [absent, truncated].into_iter();
+        assert!(matches!(
+            confirm_merge_group("new", || Ok(observations.next().unwrap())),
+            Err(ScalerError::External(_))
+        ));
+    }
+
+    #[test]
     fn ci_scaler_merge_group_refusal_distinguishes_stale_from_untrusted() {
         let mut response = queue();
         assert!(vet_merge_group(&response, "live").is_ok());
@@ -383,7 +421,7 @@ mod tests {
             json!(true);
         assert!(matches!(
             vet_merge_group(&response, "unseen"),
-            Err(ScalerError::Guard(_))
+            Err(ScalerError::External(_))
         ));
         response["errors"] = json!([{"message":"fixture"}]);
         assert!(matches!(

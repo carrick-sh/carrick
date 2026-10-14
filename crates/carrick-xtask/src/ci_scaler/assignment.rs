@@ -19,10 +19,108 @@ use super::github::Github;
 use super::*;
 use serde_json::Value;
 
+/// In-process ledger publication. The assignment worker never owns a lifecycle
+/// transition, and the lifecycle loop never overwrites an assignment decision.
+#[derive(Debug, Clone)]
+pub(super) struct Publication<T> {
+    committed: std::sync::Arc<std::sync::Mutex<T>>,
+    assignments_only: bool,
+}
+impl<T: Clone> Publication<T> {
+    pub(super) fn new(value: T) -> Self {
+        Self {
+            committed: std::sync::Arc::new(std::sync::Mutex::new(value)),
+            assignments_only: false,
+        }
+    }
+    pub(super) fn snapshot(&self) -> Result<T, ScalerError> {
+        self.committed
+            .lock()
+            .map(|value| value.clone())
+            .map_err(|_| ScalerError::Guard("ledger publication poisoned"))
+    }
+    pub(super) fn worker(&self) -> Self {
+        Self {
+            committed: self.committed.clone(),
+            assignments_only: true,
+        }
+    }
+    pub(super) fn commit(
+        &self,
+        candidate: &T,
+        path: &Path,
+        merge: impl FnOnce(&mut T, &T),
+    ) -> Result<(), ScalerError>
+    where
+        T: Serialize,
+    {
+        let mut committed = self
+            .committed
+            .lock()
+            .map_err(|_| ScalerError::Guard("ledger publication poisoned"))?;
+        let mut next = if self.assignments_only {
+            committed.clone()
+        } else {
+            candidate.clone()
+        };
+        let source = if self.assignments_only {
+            candidate
+        } else {
+            &committed
+        };
+        merge(&mut next, source);
+        save_json(&next, path)?;
+        *committed = next;
+        Ok(())
+    }
+}
+
+/// A separately scheduled rendezvous worker. Shutdown wakes its timer and
+/// joins it; no detached worker survives the controller's ledger lock.
+pub(super) struct AssignmentService {
+    stop: std::sync::mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl AssignmentService {
+    pub(super) fn start(mut pass: impl FnMut() + Send + 'static) -> Self {
+        let (stop, wake) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            loop {
+                pass();
+                if wake.recv_timeout(Duration::from_secs(1))
+                    != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                {
+                    break;
+                }
+            }
+        });
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+impl Drop for AssignmentService {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// Literal hook command in `scripts/ci/admit-job.sh` (the KVM guest path).
 pub(super) const HOOK_COMMAND: &str = "/usr/local/bin/carrick-xtask ci-scaler admit-job";
 /// How long a hook waits for the controller's approval before it fails closed.
 pub(super) const APPROVAL_LIMIT: Duration = Duration::from_secs(240);
+/// Retain a bounded cache of recent refusal decisions. Eviction only removes
+/// a scheduling cache entry: every later assignment still undergoes full vetting.
+pub(super) fn bound_refusals(keys: &mut Vec<JobKey>) {
+    keys.sort_by_key(|key| key.job.0);
+    let excess = keys.len().saturating_sub(4096);
+    keys.drain(..excess);
+}
+
 /// Upper bound of one hook request; a larger one is refused unread.
 pub(super) const REQUEST_LIMIT: usize = 8192;
 
@@ -193,9 +291,11 @@ pub(super) fn refuse(
     if ledger.refused().contains(&key) {
         return Ok(());
     }
+    let previous = ledger.refused().to_vec();
     ledger.refused_mut().push(key);
+    bound_refusals(ledger.refused_mut());
     if let Err(error) = ledger.persist(path) {
-        ledger.refused_mut().pop();
+        *ledger.refused_mut() = previous;
         return Err(error);
     }
     eprintln!(
@@ -455,6 +555,97 @@ mod tests {
                 ledger.save(path)
             },
         )
+    }
+
+    #[test]
+    fn ci_scaler_refusal_history_is_bounded_and_newest_decision_is_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let mut ledger = Ledger::default();
+        ledger.refused = (1..=4096)
+            .map(|n| JobKey {
+                run: RunId(n),
+                attempt: 1,
+                job: JobId(n),
+            })
+            .collect();
+        let newest = JobKey {
+            run: RunId(5000),
+            attempt: 1,
+            job: JobId(5000),
+        };
+        refuse(
+            &mut ledger,
+            newest,
+            &ScalerError::Guard("fixture refusal"),
+            &path,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        let restored = Ledger::load(&path).unwrap();
+        assert_eq!(restored.refused.len(), 4096);
+        assert!(restored.refused.contains(&newest));
+        assert!(!restored.refused.contains(&JobKey {
+            run: RunId(1),
+            attempt: 1,
+            job: JobId(1)
+        }));
+    }
+
+    #[test]
+    fn ci_scaler_diverted_assignment_is_approved_during_provision_and_backoff() {
+        // The lifecycle controller deliberately makes no progress until the
+        // worker has approved B; neither a provision nor a backoff may own
+        // the rendezvous scheduler or the ledger publication lock.
+        for blocked_phase in ["provision", "backoff"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut lifecycle, row, path) = minted_for_a(dir.path());
+            let publication = Publication::new(lifecycle.clone());
+            lifecycle.publication = Some(publication.clone());
+            let worker_publication = publication.worker();
+            let worker_path = path.clone();
+            let (approved, approval) = std::sync::mpsc::channel();
+            let mut served = false;
+            let service = AssignmentService::start(move || {
+                if served {
+                    return;
+                }
+                let mut ledger = worker_publication.snapshot().unwrap();
+                ledger.publication = Some(worker_publication.clone());
+                let mut row = row.clone();
+                let api = FakeGithub::vetting(Ok(bound(&run_b())));
+                let mut guest = guest_asking(run_b());
+                let outcome = serve(&api, &mut guest, &mut ledger, &mut row, &worker_path).unwrap();
+                assert_eq!(outcome, Revetted::Approved(key_b(), bound(&run_b())));
+                assert_eq!(
+                    Ledger::load(&worker_path).unwrap().rows[0].assigned_key,
+                    Some(key_b())
+                );
+                approved.send(()).unwrap();
+                served = true;
+            });
+            approval
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap_or_else(|_| panic!("assignment stalled during {blocked_phase}"));
+            // A lifecycle write made from the pre-approval snapshot must not
+            // erase the durable assignment; a worker write cannot roll back
+            // a lifecycle transition either.
+            lifecycle.rows[0].state = State::Destroyed;
+            lifecycle.save(&path).unwrap();
+            lifecycle.refresh().unwrap();
+            assert_eq!(lifecycle.rows[0].assigned_key, Some(key_b()));
+            let worker = worker_publication_for_test(&publication);
+            worker.save(&path).unwrap();
+            assert_eq!(Ledger::load(&path).unwrap().rows[0].state, State::Destroyed);
+            drop(service);
+        }
+    }
+
+    fn worker_publication_for_test(publication: &Publication<Ledger>) -> Ledger {
+        let mut ledger = publication.snapshot().unwrap();
+        ledger.publication = Some(publication.worker());
+        ledger.rows[0].state = State::Running;
+        ledger
     }
 
     #[test]

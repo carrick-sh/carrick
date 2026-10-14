@@ -46,14 +46,15 @@ group (its queue entry and every entry ahead of it, from the GraphQL
 
 Demand is served in priority order: admitted live merge groups, then the
 newest pending main push, then owner `workflow_dispatch` runs on main.
-Older pending main pushes are superseded and skipped. A per-job refusal
+Older pending main pushes are ordered last and remain eligible. A per-job refusal
 never aborts the pass: the controller records and logs it once per
 run/attempt/job key, then considers the next job in the same pass. Refusals
 survive restarts; a re-run's new attempt is vetted afresh. Vetting happens
 before reserving a runner, so a refused job cannot occupy cloudmac's budget.
 
-When a merge group's SHA is absent from a complete, successful queue
-listing, the controller also requests cancellation of its workflow run.
+When a merge group's SHA is absent from two consecutive complete, successful queue
+listings, the controller also requests cancellation of its workflow run.
+A truncated queue listing is retried without a durable refusal.
 A fork-head refusal, truncated queue listing or API/parse failure does not
 trigger cancellation. Cancellation is best effort and attempted once for
 the refused job: a denied or failed cancellation leaves the job ignored
@@ -270,7 +271,12 @@ refuses to start. GitHub, SSH and parse failures back off (30 s doubling to
 10 min) and the loop continues. Per-job admission refusals and failed
 stale-run cancellation do not grow the backoff. An actual-assignment
 refusal is recorded once and approval is withheld; the existing hook
-deadline kills the rejected runner session before any workflow step.
+deadline kills the rejected runner session before any workflow step. A dedicated
+assignment worker continues serving while the lifecycle loop backs off or
+waits on provisioning and cleanup. It uses a one-second timer between passes
+and publishes through a short-held ledger mutex, preserving both lifecycle
+transitions and authenticated assignment decisions. Refusal history retains
+at most 4096 job keys; eviction never bypasses vetting.
 
 ## Seeding baselines
 
