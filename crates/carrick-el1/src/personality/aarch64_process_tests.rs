@@ -2200,6 +2200,21 @@ fn arm_call(
     )
 }
 
+fn arm_route_action(
+    fixture: &Fixture,
+    route: carrick_personality_linux::dispatch::CompletionRoute,
+    frame: &mut carrick_el1_abi::TrapFrame,
+) -> carrick_el1_abi::Action {
+    let counters = Box::new(carrick_el1_abi::Counters::new());
+    super::dispatch::resolve_arm_process_route(
+        route,
+        fixture.page,
+        frame,
+        &counters,
+        core::slice::from_ref(&fixture.task),
+    )
+}
+
 fn run_as(fixture: &Fixture, tid: i32, generation: u64, serial: u64, control: &ThreadControlSlot) {
     fixture
         .task
@@ -2280,8 +2295,25 @@ fn arm_host_born_sibling_raw_exit_retires_exact_owned_thread() {
             .for_entry(source, &fixture.task, fixture.address)
             .unwrap()
     ));
-    assert!(leader_sees_thread(fixture, &mut service, 42));
+    // Its raw exit has no pool entry to retire in ring: the host retires it,
+    // and the owner drops the member instead of failing the EL1.
+    frame.x = [0; 31];
+    frame.x[8] = 93;
+    let route = arm_call(fixture, control, &mut service, &mut frame).unwrap();
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Forward
+    );
+    assert_eq!(
+        arm_route_action(fixture, route, &mut frame),
+        carrick_el1_abi::Action::Forward
+    );
+    assert_eq!(frame.x[0], 0, "a forwarded exit keeps its status argument");
+    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
+    fixture.page.try_exit().unwrap(); // the host's retirement
+    assert!(!leader_sees_thread(fixture, &mut service, 42));
     assert!(leader_sees_thread(fixture, &mut service, 41));
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
 }
 
 #[test]
@@ -2403,4 +2435,57 @@ fn arm_host_born_sibling_refuses_stale_or_foreign_binding() {
             "{defect:?} left a member in the owner"
         );
     }
+}
+
+#[test]
+fn arm_two_live_threads_robust_exit_forwards_without_abort() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let (control, record) = imported_thread_with_identity(fixture, |_| {});
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    run_as(fixture, 42, 12, 102, control);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        record.id
+    );
+    // Every glibc/musl thread registers a robust list at start.
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[0] = 0x2000;
+    frame.x[1] = 24;
+    frame.x[8] = 99; // set_robust_list
+    let route = arm_call(fixture, control, &mut service, &mut frame).unwrap();
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::WithWork
+    );
+    assert_eq!(frame.x[0], 0);
+    assert_eq!(control.robust_list().0, 0x2000);
+    // The in-ring exit declines (no robust-list walker here) with a live
+    // sibling: the host walks the list and retires the thread.
+    frame.x = [0; 31];
+    frame.x[8] = 93;
+    let route = arm_call(fixture, control, &mut service, &mut frame).unwrap();
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Forward
+    );
+    assert_eq!(
+        arm_route_action(fixture, route, &mut frame),
+        carrick_el1_abi::Action::Forward
+    );
+    assert_eq!(frame.x[0], 0, "never rewritten to -ENOSYS");
+    assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
+    assert!(registry().for_record(fixture.zone, record).is_none());
+    fixture.zone.clear_current(fixture.slot);
+    fixture.zone.free_record(record.id);
+    fixture.page.try_exit().unwrap(); // the host's retirement
+    assert!(!leader_sees_thread(fixture, &mut service, 42));
+    assert!(leader_sees_thread(fixture, &mut service, 41));
 }

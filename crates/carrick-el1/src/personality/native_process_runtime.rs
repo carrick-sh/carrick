@@ -3838,12 +3838,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     #[inline(never)]
     pub fn thread_exited(&mut self, tid: u32) {
         let mut graph = self.runtime.graph.lock();
-        let mut retired = None;
+        let mut retired = Vec::new();
         if let Ok(task) = graph.owner.task_mut(self.key) {
+            if tid == task.metadata().namespace_pid {
+                return;
+            }
             task.remove_thread(tid);
             task.native_mut().resources_mut().members.retain(|member| {
-                if member.control.visible_tid() == Some(tid) {
-                    retired = Some(member.record);
+                let matches_caller = tid == self.calling_tid
+                    && (member.record == self.record
+                        || core::ptr::eq(member.control, self.control));
+                if matches_caller || member.control.visible_tid() == Some(tid) {
+                    retired.push(member.record);
                     false
                 } else {
                     true
@@ -3851,10 +3857,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             });
         }
         drop(graph);
-        if let Some(record) = retired
-            && let Some(registry) = *self.runtime.registry.lock()
-        {
-            registry.unregister_member(self.runtime, self.key, record);
+        if let Some(registry) = *self.runtime.registry.lock() {
+            for record in retired {
+                registry.unregister_member(self.runtime, self.key, record);
+            }
         }
     }
 
