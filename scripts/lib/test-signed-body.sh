@@ -79,6 +79,17 @@ else
     run_id="embed-signed-$$"
 fi
 test_signed_validate_run_id "$run_id"
+# Default per-binary wall-clock deadline (seconds): 600s (10m) sits comfortably
+# above the slowest legitimate signed test binary (`kernel_abort` at ~210s in
+# CI, `el1_kick_served_loop` at ~105s in el1-embed). Exact `0` disables the
+# deadline for bisection or harness tests.
+binary_deadline_secs="${CARRICK_TEST_SIGNED_DEADLINE_SECS:-600}"
+case "$binary_deadline_secs" in
+    ''|*[!0-9]*)
+        echo "test-signed: invalid CARRICK_TEST_SIGNED_DEADLINE_SECS: $binary_deadline_secs (expected non-negative integer seconds)" >&2
+        exit 2
+        ;;
+esac
 test_signed_parse_libtest_args "$@"
 requested_filter="$TEST_SIGNED_REQUESTED_FILTER"
 has_exact="$TEST_SIGNED_HAS_EXACT"
@@ -145,6 +156,8 @@ jq -nc \
     >"$receipt_tmp"
 scratch=()
 active_exe_run_id=""
+active_exe_pid=""
+active_watchdog_pid=""
 reap_run_id() {
     local id="$1"
     local cleanup_log
@@ -164,11 +177,76 @@ reap_run_id() {
     rm -f "$cleanup_log"
     return 0
 }
+stop_watchdog() {
+    local w_pid="$1"
+    [ -n "$w_pid" ] || return 0
+    local child_pid
+    while IFS= read -r child_pid; do
+        if [ -n "$child_pid" ]; then
+            kill -9 "$child_pid" 2>/dev/null || true
+        fi
+    done < <(ps -axo pid=,ppid= | awk -v p="$w_pid" '$2 == p { print $1 }')
+    kill -9 "$w_pid" 2>/dev/null || true
+    wait "$w_pid" 2>/dev/null || true
+}
+capture_deadline_diagnostics() {
+    local target_exe="$1"
+    local target_pid="$2"
+    local target_run_id="$3"
+    local diag_pids=()
+    local p
+
+    echo "test-signed: capturing deadline diagnostics for $target_exe (pid=$target_pid, CARRICK_RUN_ID=$target_run_id)"
+    if [ -n "$target_pid" ] && kill -0 "$target_pid" 2>/dev/null; then
+        diag_pids+=("$target_pid")
+    fi
+    while IFS= read -r p; do
+        [ -n "$p" ] && diag_pids+=("$p")
+    done < <(
+        ps -axww -o pid=,ppid=,command= | awk -v id="$target_run_id" -v cli_id="$target_run_id-cli" -v ppid="$target_pid" -v self="$$" '
+            $1 == self { next }
+            (ppid != "" && $2 == ppid) || index($0, "carrick:" id ":") > 0 || index($0, "carrick:" cli_id ":") > 0 {
+                print $1
+            }
+        '
+    )
+
+    if [ "${#diag_pids[@]}" -eq 0 ]; then
+        echo "test-signed: no live processes found for $target_exe (CARRICK_RUN_ID=$target_run_id)"
+        return 0
+    fi
+
+    local seen_pids=" "
+    for p in "${diag_pids[@]}"; do
+        case "$seen_pids" in
+            *" $p "*) continue ;;
+        esac
+        seen_pids="$seen_pids$p "
+        kill -0 "$p" 2>/dev/null || continue
+        echo "test-signed: deadline process status (pid=$p):"
+        ps -ww -p "$p" -o user=,pid=,ppid=,pgid=,stat=,etime=,%cpu=,command= 2>&1 || true
+        if command -v lldb >/dev/null 2>&1; then
+            echo "test-signed: deadline host backtrace (pid=$p):"
+            if ! sudo -n lldb -p "$p" --batch -o "thread backtrace all" -o "detach" -o "quit" </dev/null 2>&1; then
+                lldb -p "$p" --batch -o "thread backtrace all" -o "detach" -o "quit" </dev/null 2>&1 || true
+            fi
+        fi
+    done
+}
 cleanup() {
     status=$?
     trap - EXIT
     set +e
     cleanup_ok=1
+    if [ -n "$active_watchdog_pid" ]; then
+        stop_watchdog "$active_watchdog_pid"
+        active_watchdog_pid=""
+    fi
+    if [ -n "$active_exe_pid" ]; then
+        kill -9 "$active_exe_pid" 2>/dev/null || true
+        wait "$active_exe_pid" 2>/dev/null || true
+        active_exe_pid=""
+    fi
     if [ -n "$active_exe_run_id" ]; then
         for id in "$active_exe_run_id" "$active_exe_run_id-cli"; do
             if ! reap_run_id "$id"; then
@@ -447,9 +525,11 @@ record_executable() {
 }
 
 # 4. Run each selected signed executable serially (one VM per process).
-#    Each executable receives a distinct CARRICK_RUN_ID suffix and is reaped
-#    before the next executable starts so an orphaned watchdog `kill.sh`
-#    (sleeping between passes 1..3) can never match subsequent executables.
+#    Each executable receives a distinct CARRICK_RUN_ID suffix, a structural
+#    per-binary wall-clock deadline (`CARRICK_TEST_SIGNED_DEADLINE_SECS`,
+#    default 600s, `0` disables), and is reaped before the next executable
+#    starts so neither a test omitting `common::Watchdog::start` nor an
+#    orphaned watchdog `kill.sh` can block or kill subsequent executables.
 failed=0
 exe_index=0
 for exe in "${run_exes[@]}"; do
@@ -459,7 +539,46 @@ for exe in "${run_exes[@]}"; do
     record_executable "$exe"
     executable_id="$last_executable_id"
     echo "test-signed: running $exe $*"
-    if env RUST_TEST_THREADS=1 CARRICK_RUN_ID="$exe_run_id" "$exe" "$@"; then
+    deadline_marker="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-deadline-fired.XXXXXX")"
+    deadline_diag_log="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-deadline-diag.XXXXXX")"
+    scratch+=("$deadline_marker" "$deadline_diag_log")
+    env RUST_TEST_THREADS=1 CARRICK_RUN_ID="$exe_run_id" "$exe" "$@" &
+    active_exe_pid=$!
+    if [ "$binary_deadline_secs" -gt 0 ]; then
+        (
+            set +e
+            sleep "$binary_deadline_secs" >/dev/null 2>&1 &
+            sleep_pid=$!
+            trap 'kill -9 "$sleep_pid" 2>/dev/null || true; exit 0' TERM INT
+            wait "$sleep_pid" 2>/dev/null || exit 0
+            if kill -0 "$active_exe_pid" 2>/dev/null; then
+                printf '1\n' >"$deadline_marker"
+                capture_deadline_diagnostics "$exe" "$active_exe_pid" "$exe_run_id" >"$deadline_diag_log" 2>&1
+                for id in "$exe_run_id" "$exe_run_id-cli"; do
+                    reap_run_id "$id" >>"$deadline_diag_log" 2>&1 || true
+                done
+                kill -9 "$active_exe_pid" 2>/dev/null || true
+            fi
+        ) >/dev/null 2>&1 &
+        active_watchdog_pid=$!
+    fi
+    exe_rc=0
+    wait "$active_exe_pid" || exe_rc=$?
+    active_exe_pid=""
+    if [ -n "$active_watchdog_pid" ]; then
+        if [ -s "$deadline_marker" ]; then
+            wait "$active_watchdog_pid" 2>/dev/null || true
+        else
+            stop_watchdog "$active_watchdog_pid"
+        fi
+        active_watchdog_pid=""
+    fi
+    if [ -s "$deadline_marker" ]; then
+        cat "$deadline_diag_log" >&2
+        echo "test-signed: DEADLINE $exe (${binary_deadline_secs}s, CARRICK_RUN_ID=$exe_run_id)" >&2
+        echo "test-signed: FAIL $exe" >&2
+        failed=1
+    elif [ "$exe_rc" -eq 0 ]; then
         while IFS="$(printf '\t')" read -r selected_exe test_name; do
             [ "$selected_exe" = "$exe" ] || continue
             jq -nc \
@@ -474,6 +593,7 @@ for exe in "${run_exes[@]}"; do
         echo "test-signed: FAIL $exe" >&2
         failed=1
     fi
+    rm -f "$deadline_marker" "$deadline_diag_log"
     for id in "$exe_run_id" "$exe_run_id-cli"; do
         if ! reap_run_id "$id"; then
             echo "test-signed: scoped cleanup failed for $id" >&2
