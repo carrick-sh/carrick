@@ -2549,7 +2549,7 @@ where
             ops.abort(prepared_backend)?;
             return Err(error);
         }
-        let published = match prepared.commit() {
+        let published = match prepared.commit_for_el1() {
             Ok(published) => published,
             Err(error) => {
                 tid_outputs.rollback(memory).map_err(|rollback| {
