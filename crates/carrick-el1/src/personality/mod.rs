@@ -22,6 +22,7 @@ pub mod native_run_failure;
 pub mod process_owner;
 pub mod retired_spaces;
 pub mod sched;
+pub mod signal_delivery;
 pub mod thread_setup;
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]

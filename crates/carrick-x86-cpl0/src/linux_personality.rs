@@ -18,7 +18,6 @@ use carrick_personality_linux::crossing::{HostCrossingSet, evaluate_host_crossin
 use carrick_personality_linux::dispatch::{CompletionRoute, SyscallFrame};
 use carrick_personality_linux::entry::{CanonicalCall, decode_x86_snapshot};
 use carrick_personality_linux::lifecycle::LinuxWaitStatus;
-use carrick_personality_linux::signal::ProcessSignals;
 use carrick_syscall_abi::{CanonicalNr, LINUX_EBADF};
 use carrick_x86_carrier::entry::{
     PageFaultStack, cross_owner_grant, fatal_boot, fatal_error, forward_to_host, halt, notify_work,
@@ -325,6 +324,46 @@ pub fn complete_root_exit(task: &CurrentTask, status: LinuxWaitStatus) -> ! {
     halt();
 }
 
+struct X86SignalMachine {
+    backend: carrick_el1::isa::x86::X86Backend,
+}
+
+impl
+    carrick_el1::personality::signal_delivery::SignalMachine<carrick_sched_core::ParkedContextWords>
+    for X86SignalMachine
+{
+    type Backend = carrick_el1::isa::x86::X86Backend;
+
+    fn backend(&mut self) -> &mut Self::Backend {
+        &mut self.backend
+    }
+
+    fn user_sp(&self, frame: &NativeFrame) -> UserVa {
+        UserVa::new(frame.rsp)
+    }
+
+    fn restart(
+        &self,
+        frame: &mut NativeFrame,
+        original: carrick_sched_core::ParkedContextWords,
+    ) -> bool {
+        frame.rax = original.syscall_return();
+        if let Some(pc) = frame.rcx.checked_sub(2) {
+            frame.rcx = pc;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn group_exit_custody(&self, task: &CurrentTask) -> CompletionRoute {
+        complete_run_failure(
+            task,
+            carrick_core_abi::NativeRunFailureReason::X86GroupExitCustody,
+        )
+    }
+}
+
 pub(crate) fn deliver_signal_on_syscall_return(
     task: &CurrentTask,
     process: &mut carrick_el1::personality::native_process_runtime::NativeProcessEntry<
@@ -337,143 +376,15 @@ pub(crate) fn deliver_signal_on_syscall_return(
     frame: &mut NativeFrame,
     fpstate: &XsaveArea,
 ) -> Option<CompletionRoute> {
-    use carrick_personality_linux::signal::ProcessSignals;
-    use carrick_personality_linux::signal::policy::{self, SigBlockMask};
-
-    if !carrick_personality_linux::signal::signal_delivery_before_work(
-        CompletionRoute::Served,
-        &task.linux,
-    ) {
-        return None;
-    }
-    let thread = GuestLifecycleVenue.thread(task)?;
-    let mut thread_blocked = SigBlockMask::blocking_all_of(
-        carrick_personality_linux::signal::SignalSet::from_bits(thread.slot.blocked().0),
-    );
-
-    let saved_mask = process.take_suspend_mask().unwrap_or(thread_blocked);
-    thread
-        .slot
-        .init_blocked(carrick_el1_abi::BlockedMask(saved_mask.signals().bits()));
-    let (sig, info, action) =
-        process.take_deliverable_after_suspend(&mut thread_blocked, saved_mask)?;
-    match action.disposition {
-        policy::Disposition::Ignore => None,
-        policy::Disposition::Default => {
-            if let policy::Delivery::Terminate { .. } = policy::default_delivery(sig) {
-                Some(match process.exit_with_signal(sig.number() as u8) {
-                    Ok(_) => CompletionRoute::Suspended,
-                    Err(carrick_el1::personality::native_process_runtime::NativeProcessError::GroupExitCustody) => {
-                        complete_run_failure(
-                            task,
-                            carrick_core_abi::NativeRunFailureReason::X86GroupExitCustody,
-                        )
-                    }
-                    Err(_) => CompletionRoute::InvalidCompletion,
-                })
-            } else {
-                None
-            }
-        }
-        policy::Disposition::Handler(handler) => {
-            if let Some(original) = process.take_interrupted_child_wait()
-                && action.flags.restart
-            {
-                frame.rax = original.syscall_return();
-                let Some(restart_pc) = frame.rcx.checked_sub(2) else {
-                    return force_delivery_fault(
-                        task,
-                        process,
-                        frame,
-                        fpstate,
-                        sig,
-                        thread_blocked,
-                    );
-                };
-                frame.rcx = restart_pc;
-            }
-            let selected_stack = carrick_personality_linux::signal::delivery_stack(
-                thread.slot.read_altstack(),
-                UserVa::new(frame.rsp),
-                action.flags.on_stack,
-            );
-            let Some((sp, stack)) = selected_stack else {
-                return force_delivery_fault(task, process, frame, fpstate, sig, thread_blocked);
-            };
-            let params = carrick_personality_linux::signal::SignalFrameParams {
-                stack,
-                signal: sig,
-                sigcode: info.as_ref().map_or(0, |i| i.si_code),
-                fault_addr: info.as_ref().map_or(0, |i| i.si_addr),
-                handler: UserVa::new(handler.0),
-                restorer: action.restorer.map(|r| UserVa::new(r.0)),
-                mask: saved_mask,
-                sp,
-            };
-            let mut backend = carrick_el1::isa::x86::X86Backend;
-            // SAFETY: siginfo reference is valid for its size as byte slice.
-            let info_bytes = info.as_ref().map(|i| unsafe {
-                core::slice::from_raw_parts(i as *const _ as *const u8, core::mem::size_of_val(i))
-            });
-            let setup = carrick_personality_linux::signal::SignalBackend::setup_signal_frame(
-                &mut backend,
-                frame,
-                params,
-                info_bytes,
-                &fpstate.0,
-                &mut |va, bytes| process.copy_signal_frame(va, bytes).is_ok(),
-            );
-            if setup.is_err() {
-                return force_delivery_fault(task, process, frame, fpstate, sig, thread_blocked);
-            }
-            let mask = policy::handler_block_mask(sig, action, thread_blocked);
-            let _ = thread.slot.store_blocked_then_read_pending(
-                carrick_el1_abi::BlockedMask(mask.signals().bits()),
-                thread.slot.pending(),
-            );
-            None
-        }
-    }
-}
-
-fn force_delivery_fault(
-    task: &CurrentTask,
-    process: &mut carrick_el1::personality::native_process_runtime::NativeProcessEntry<
-        '_,
-        'static,
-        native_process::Mm,
-        carrick_sched_core::ParkedContextWords,
-        native_process::Service,
-    >,
-    frame: &mut NativeFrame,
-    fpstate: &XsaveArea,
-    original: carrick_personality_linux::signal::policy::Signal,
-    blocked: carrick_personality_linux::signal::policy::SigBlockMask,
-) -> Option<CompletionRoute> {
-    use carrick_personality_linux::signal::policy::Signal;
-
-    if original == Signal::SEGV {
-        return Some(match process.exit_with_signal(Signal::SEGV.number() as u8) {
-            Ok(_) => CompletionRoute::Suspended,
-            Err(carrick_el1::personality::native_process_runtime::NativeProcessError::GroupExitCustody) => {
-                complete_run_failure(
-                    task,
-                    carrick_core_abi::NativeRunFailureReason::X86GroupExitCustody,
-                )
-            }
-            Err(_) => CompletionRoute::InvalidCompletion,
-        });
-    }
-    let thread = GuestLifecycleVenue.thread(task)?;
-    if process.force_sigsegv(blocked).is_err() {
-        return Some(CompletionRoute::InvalidCompletion);
-    }
-    let mask = blocked.signals().without(Signal::SEGV);
-    let _ = thread.slot.store_blocked_then_read_pending(
-        carrick_el1_abi::BlockedMask(mask.bits()),
-        thread.slot.pending(),
-    );
-    deliver_signal_on_syscall_return(task, process, frame, fpstate)
+    carrick_el1::personality::signal_delivery::deliver_signal_on_syscall_return(
+        task,
+        process,
+        frame,
+        &fpstate.0,
+        &mut X86SignalMachine {
+            backend: carrick_el1::isa::x86::X86Backend,
+        },
+    )
 }
 
 pub fn signal_user_return(
