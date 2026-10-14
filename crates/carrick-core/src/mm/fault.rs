@@ -1,7 +1,7 @@
 //! Shared lazy-supply generations and exact reservation fault admission.
 use carrick_core_abi::{
     EL1_FRAME_GRANT_TARGET_SIZE, FrameGrantMailbox, FrameGrantRequest, ReservationIncarnation,
-    ReservationMm, ReservationRange,
+    ReservationMm,
 };
 use carrick_mmu_core::aarch64::LeafAccess;
 use carrick_sched_core::spaces::notification::SpaceAccess;
@@ -27,7 +27,7 @@ pub fn request_lazy_frames(
     mm_key: u64,
     va: u64,
     access: u64,
-    reservation_incarnation: Option<ReservationIncarnation>,
+    reservation_incarnation: ReservationIncarnation,
 ) -> bool {
     mailbox.try_publish_request(FrameGrantRequest {
         mm_key,
@@ -59,16 +59,7 @@ pub fn root_mapping_incarnation<
         return None;
     }
     let mut root = roots.lock_in(spaces, index, mm, slot).ok()?;
-    let page = va & !4095;
-    let range = ReservationRange::new(page, page.checked_add(4096)?)?;
-    let mut incarnation = None;
-    root.observe_nodes(range, &mut |mapping, current| {
-        if mapping.range.start() <= page && page < mapping.range.end() {
-            incarnation = Some(current);
-        }
-    })
-    .ok()?;
-    incarnation
+    root.node(va).map(|(_, incarnation)| incarnation)
 }
 
 /// Whether a delegated MM's root lets this prepared page be committed:
@@ -250,7 +241,8 @@ impl<
                 .roots
                 .lock_in(self.spaces, index.index(), mm, self.worker)
                 .ok()?;
-            root.mapping(va)?.host_backing?;
+            let (mapping, reservation_incarnation) = root.node(va)?;
+            mapping.host_backing?;
             owner_source.set(true);
             let window = select_fault_window(
                 &mut root,
@@ -268,7 +260,7 @@ impl<
             }
             if !self.mailbox.try_publish_request(FrameGrantRequest {
                 mm_key,
-                reservation_incarnation: None,
+                reservation_incarnation,
                 request_generation: generation,
                 fault_va: va,
                 requested_len: window.range.len(),

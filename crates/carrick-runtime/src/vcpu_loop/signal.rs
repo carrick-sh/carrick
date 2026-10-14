@@ -483,6 +483,13 @@ pub(super) fn resolve_owner_file_fault(
     Ok(Some(completed))
 }
 
+fn frame_grant_root_matches(
+    request: carrick_el1_abi::FrameGrantRequest,
+    current: Option<carrick_el1_abi::ReservationIncarnation>,
+) -> bool {
+    Some(request.reservation_incarnation) == current
+}
+
 fn publish_frame_grant_refusal(
     mailbox: &carrick_el1_abi::FrameGrantMailbox,
     request: carrick_el1_abi::FrameGrantRequest,
@@ -1407,9 +1414,7 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     );
                     return Ok(true);
                 };
-                if request.reservation_incarnation.is_some()
-                    && request.reservation_incarnation != plan.root_incarnation()
-                {
+                if !frame_grant_root_matches(request, plan.root_incarnation()) {
                     publish_frame_grant_refusal(
                         mailbox,
                         request,
@@ -2739,10 +2744,35 @@ mod first_touch_access_tests {
     }
 
     #[test]
+    fn host_refuses_a_request_from_an_older_root_node_as_stale() {
+        let old = carrick_el1_abi::ReservationIncarnation::new(7).unwrap();
+        let current = carrick_el1_abi::ReservationIncarnation::new(8).unwrap();
+        let request = carrick_el1_abi::FrameGrantRequest {
+            mm_key: 71,
+            reservation_incarnation: old,
+            request_generation: 9,
+            fault_va: 0x4000_3000,
+            requested_len: 4096,
+            access: crate::linux_abi::LINUX_PROT_WRITE,
+        };
+        let mailbox = carrick_el1_abi::FrameGrantMailbox::new();
+        assert!(mailbox.try_publish_request(request));
+        assert_eq!(mailbox.claim_request(), Some(request));
+        assert!(!frame_grant_root_matches(request, Some(current)));
+        publish_frame_grant_refusal(&mailbox, request, carrick_el1_abi::FRAME_GRANT_ERR_STALE);
+        assert_eq!(
+            mailbox.claim_response(71, 9).unwrap().status,
+            carrick_el1_abi::FRAME_GRANT_ERR_STALE
+        );
+        assert!(!frame_grant_root_matches(request, None));
+        assert!(frame_grant_root_matches(request, Some(old)));
+    }
+
+    #[test]
     fn frame_grant_claim_requires_the_exact_mm_fault_and_access() {
         let request = carrick_el1_abi::FrameGrantRequest {
             mm_key: 7,
-            reservation_incarnation: None,
+            reservation_incarnation: carrick_el1_abi::ReservationIncarnation::new(1).unwrap(),
             requested_len: carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE,
             request_generation: 11,
             fault_va: 0x4000_3123,
