@@ -35,47 +35,40 @@ use syn::visit::Visit;
 /// Narrow transport guard while the broader carrier substrate split is pending.
 pub fn check_carrier_root_exit_transport(root: &Path) -> Result<(), BoundaryError> {
     let path = root.join("crates/carrick-x86-carrier/src/native_execution.rs");
-    let source = fs::read_to_string(&path).map_err(|source| BoundaryError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    let file = syn::parse_file(&source).map_err(|source| BoundaryError::Syn {
-        path: path.clone(),
-        source,
-    })?;
-    struct LoweringVisitor {
-        found: bool,
-    }
-    impl LoweringVisitor {
-        fn tokens(&mut self, tokens: proc_macro2::TokenStream) {
-            for token in tokens {
-                match token {
-                    proc_macro2::TokenTree::Ident(ident) => self.visit_ident(&ident),
-                    proc_macro2::TokenTree::Group(group) => self.tokens(group.stream()),
-                    _ => {}
-                }
-            }
-        }
-    }
-    impl<'ast> Visit<'ast> for LoweringVisitor {
-        fn visit_macro(&mut self, node: &'ast syn::Macro) {
-            self.tokens(node.tokens.clone());
-            syn::visit::visit_macro(self, node);
-        }
-        fn visit_ident(&mut self, ident: &'ast syn::Ident) {
-            if matches!(
-                ident.to_string().as_str(),
-                "carrick_personality_linux" | "LinuxWaitStatus" | "from_termination_status"
-            ) {
-                self.found = true;
-            }
-        }
-    }
-    let mut visitor = LoweringVisitor { found: false };
-    visitor.visit_file(&file);
-    if visitor.found {
+    let forbidden = [
+        "carrick_personality_linux",
+        "LinuxWaitStatus",
+        "from_termination_status",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    let mut report = CrateAuditReport {
+        crate_name: "carrick-x86-carrier".to_owned(),
+        ..Default::default()
+    };
+    audit_source_file_tree(
+        "carrick-x86-carrier",
+        &path,
+        0,
+        &forbidden,
+        &mut BTreeSet::new(),
+        &mut report,
+    )?;
+    // This guard owns only wait lowering. The strict substrate audit retains
+    // its broader rules; carrier EL1 imports are deferred to the seam split.
+    report.source_violations.retain(|violation| {
+        forbidden.contains(
+            violation
+                .symbol_or_literal
+                .split_whitespace()
+                .next()
+                .unwrap_or(""),
+        )
+    });
+    if !report.source_violations.is_empty() {
         return Err(BoundaryError::Violations {
-            count: 1,
+            count: report.source_violations.len(),
             report: format!(
                 "{}: carrier root exit must carry neutral TerminationStatus without Linux wait lowering",
                 path.display()
