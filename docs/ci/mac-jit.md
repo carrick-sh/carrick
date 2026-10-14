@@ -311,7 +311,10 @@ failed or ambiguous depth observations preserve ordinary service. Main pushes
 remain eligible and retain their per-SHA baseline receipts.
 
 Superseded demand does not enter the durable refusal ledger: if the successor
-fails or leaves the queue, the shallower group can be served again. A diverted
+fails or leaves the queue, the shallower group can be served again. If a
+Contabo reservation becomes superseded during provisioning, its pre-JIT clone
+is released through the existing owned teardown path; registered or assigned
+runners retain their normal lifecycle. A diverted
 actual assignment is durably refused before approval, just like a stale group.
 Cancellation uses the existing workflow-run endpoint as an authorization
 check; Actions write (or classic/OAuth repo scope) is required. Denial is

@@ -314,16 +314,8 @@ pub(super) fn admit_demand<T>(
         }
         match admit(job) {
             Ok(vetted) => return Ok(Some(vetted)),
-            Err(error @ ScalerError::SupersededMergeGroup { .. }) => {
-                // Temporary skip: never put demand in the durable refusal
-                // ledger, because the successor can fail or leave the queue.
-                eprintln!("run={} {error}; skipping reservation", job.run.0);
-                if let Err(error) = cancel(job.run) {
-                    eprintln!(
-                        "run={} cancellation unavailable (Actions write required): {error}; skip only",
-                        job.run.0
-                    );
-                }
+            Err(ScalerError::SupersededMergeGroup { successor }) => {
+                skip_superseded(job, &successor, &mut cancel);
             }
             Err(error @ (ScalerError::Guard(_) | ScalerError::StaleMergeGroup)) => {
                 refuse(ledger, job, &error, path, &mut cancel)?;
@@ -332,6 +324,25 @@ pub(super) fn admit_demand<T>(
         }
     }
     Ok(None)
+}
+
+/// A superseded reservation is a temporary skip, never a durable refusal:
+/// the same job can become eligible when its successor fails or leaves.
+pub(super) fn skip_superseded(
+    key: JobKey,
+    successor: &str,
+    mut cancel: impl FnMut(RunId) -> Result<(), ScalerError>,
+) {
+    eprintln!(
+        "run={} superseded by queued descendant {successor}; skipping reservation",
+        key.run.0
+    );
+    if let Err(error) = cancel(key.run) {
+        eprintln!(
+            "run={} cancellation unavailable (Actions write required): {error}; skip only",
+            key.run.0
+        );
+    }
 }
 
 /// Record and log a per-job refusal once; a new attempt has a new key. A
