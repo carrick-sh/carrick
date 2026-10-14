@@ -22,7 +22,7 @@ contracts = ["kernel.wait.child-exit-notification-lifecycle"]
 
 [[surfaces]]
 path = "crates/carrick-observability/src/work_meter.rs"
-contracts = ["kernel.mm.native-code-content", "hvpatch.syscall.portal", "kernel.execution.native-code-density", "kernel.el1.open-lifetime"]
+contracts = ["kernel.mm.native-code-content", "hvpatch.syscall.portal", "kernel.execution.native-code-density"]
 
 [[surfaces]]
 path = "crates/carrick-mem/src/memory.rs"
