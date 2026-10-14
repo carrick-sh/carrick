@@ -846,6 +846,7 @@ dependencies = [
  "carrick-fatal",
  "carrick-guest-mem",
  "carrick-mmu-core",
+ "carrick-syscall-abi",
  "goblin",
  "libc",
  "parking_lot",
