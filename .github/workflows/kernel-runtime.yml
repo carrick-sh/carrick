@@ -209,6 +209,16 @@ jobs:
       # the per-SHA baseline from existing. Not on the merge queue: main is not
       # green under these absolute verdicts, so the queue gates on the receipt
       # (NEW failures) above; push and dispatch keep the full signed coverage.
+      - name: Prune release test dSYM bundles after receipt
+        if: ${{ github.event_name != 'merge_group' }}
+        # `Signed acceptance receipt` links ~60 release test binaries (`debug = true`,
+        # `split-debuginfo = "packed"`), leaving ~21.08 GiB of `.dSYM` bundles in
+        # `target/release/{deps,examples}`. Removing only the `.dSYM` bundles keeps
+        # `target/release` executables and rlibs warm for `Signed embedded guest tests`
+        # (zero relink) while preventing `Host-only source gate` (`just ci`, +28.27 GiB)
+        # from pushing `target/` to ~55.63 GiB on the 100 GB runner volume.
+        run: rm -rf target/release/deps/*.dSYM target/release/examples/*.dSYM
+
       - name: Install Semgrep
         if: ${{ github.event_name != 'merge_group' }}
         # A venv, never the system interpreter (PEP 668 refuses a system-wide pip
@@ -218,6 +228,23 @@ jobs:
       - name: Host-only source gate
         if: ${{ github.event_name != 'merge_group' }}
         run: RUST_TEST_THREADS=1 just lease gate just ci
+
+      - name: Prune host-only gate build artifacts
+        if: ${{ github.event_name != 'merge_group' }}
+        # `just ci` populates `target/debug` (~24.82 GiB), `target/host-authority-census`
+        # (~2.28 GiB), `target/aarch64-unknown-linux-gnu` (~0.55 GiB), `target/doc`
+        # (~0.55 GiB), and `target/host-authority-escape-syntax` (~0.06 GiB). None of the
+        # 211 host unit/integration binaries, docs, or portable-check artifacts are reused
+        # by `Signed embedded guest tests`, which reuses `target/release` and only needs
+        # ~3.48 GiB in `target/debug` for `carrick-xtask` and the two `carrick-cli`
+        # conformance harness binaries.
+        run: |
+          rm -rf \
+            target/debug \
+            target/doc \
+            target/aarch64-unknown-linux-gnu \
+            target/host-authority-census \
+            target/host-authority-escape-syntax
 
       - name: Signed embedded guest tests
         if: ${{ github.event_name != 'merge_group' }}
