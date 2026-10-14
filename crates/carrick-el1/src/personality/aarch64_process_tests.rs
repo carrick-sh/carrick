@@ -1999,11 +1999,23 @@ fn arm_root_admission_imports_live_thread_membership_without_changing_census() {
                 let admission =
                     carrick_el1_abi::Lifecycle::begin_exit(fixture.page, control.entry().unwrap())
                         .unwrap();
+                let terminal_entry = control.entry();
                 fixture.page.try_exit().unwrap();
                 carrick_core::entry::retire_current(process.binding(), source, record.id).unwrap();
                 admission.commit().unwrap();
                 if notified {
-                    process.thread_exited(42);
+                    let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
+                        process.binding(),
+                        terminal_entry,
+                        carrick_sched_core::process::TerminationStatus::exited(0),
+                    )
+                    .unwrap();
+                    process.retire_thread_verdict(
+                        carrick_core::terminal::RetirementVerdict::RetireThread {
+                            identity,
+                            requires_slot_absence: true,
+                        },
+                    );
                 }
             })
             .unwrap();
