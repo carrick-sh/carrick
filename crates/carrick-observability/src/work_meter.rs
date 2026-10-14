@@ -52,6 +52,8 @@ pub enum WorkMetric {
     VfsBackendOperations,
     DirectoryEntriesVisited,
     HostBackendCalls,
+    /// Exact open records visited by the generation-authenticated terminal-reference decision.
+    OpenReferenceRecords,
     /// Executed owned dentry and host namei component visits in a namespace request.
     NamespacePathVisits,
     /// Host openat calls within the warm namespace mutation fixture.
@@ -139,7 +141,7 @@ pub enum WorkMetric {
 }
 
 impl WorkMetric {
-    pub const COUNT: usize = 54;
+    pub const COUNT: usize = 55;
     pub const ALL: [WorkMetric; Self::COUNT] = [
         Self::KernelDispatches,
         Self::KernelRedispatches,
@@ -155,6 +157,7 @@ impl WorkMetric {
         Self::VfsBackendOperations,
         Self::DirectoryEntriesVisited,
         Self::HostBackendCalls,
+        Self::OpenReferenceRecords,
         Self::NamespacePathVisits,
         Self::HostNamespaceMutationOpens,
         Self::HostWritePositionQueries,
