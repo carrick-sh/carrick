@@ -86,7 +86,7 @@ pub struct GuestTaskMetadata<C, U> {
     pub namespace_process_group: u32,
     pub namespace_session: u32,
     /// Encode a UID into the immutable zombie receipt's presentation domain.
-    pub receipt_uid: fn(carrick_sched_core::process::TaskUid) -> U,
+    pub receipt_uid: fn(carrick_personality_linux::identity::TaskUid) -> U,
     pub exit_signal: ChildExitSignal,
     pub diagnostic_name: String,
 }

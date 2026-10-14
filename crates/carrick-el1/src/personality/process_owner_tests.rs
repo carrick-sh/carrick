@@ -1480,7 +1480,7 @@ fn exit_uid_receipt_reads_thread_credentials_without_a_metadata_mirror() {
             row.spawn_thread(2, exit_tid).unwrap();
         }
         row.credentials_for_mut(exit_tid).unwrap().ruid =
-            carrick_sched_core::process::TaskUid::new(1000);
+            carrick_personality_linux::identity::TaskUid::new(1000);
         row.select_exit_thread(exit_tid).unwrap();
         let done = exit(&mut owner, child, None);
         done.effects.cancel_members(Member::cancel);

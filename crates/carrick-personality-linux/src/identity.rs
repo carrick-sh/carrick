@@ -38,7 +38,46 @@ pub const LINUX_PR_SET_NO_NEW_PRIVS: u64 = 38;
 pub const LINUX_PR_GET_NO_NEW_PRIVS: u64 = 39;
 pub const LINUX_NGROUPS_MAX: usize = 65536;
 
-use carrick_sched_core::process::{TaskGid, TaskUid};
+/// Typed user identity within a namespace.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TaskUid(u32);
+
+impl TaskUid {
+    pub const ROOT: Self = Self(0);
+
+    pub const fn new(uid: u32) -> Self {
+        Self(uid)
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    pub const fn is_root(self) -> bool {
+        self.0 == 0
+    }
+}
+
+/// Typed group identity within a namespace.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TaskGid(u32);
+
+impl TaskGid {
+    pub const ROOT: Self = Self(0);
+
+    pub const fn new(gid: u32) -> Self {
+        Self(gid)
+    }
+
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    pub const fn is_root(self) -> bool {
+        self.0 == 0
+    }
+}
+
 pub use carrick_syscall_abi::LinuxCapabilitySet;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
