@@ -1,8 +1,14 @@
 //! VM-free evidence for the N2 plan, not a signed exit-count measurement.
-use carrick_el1::fault::{GrantMailboxes, NoopCowResolver, dispatch_fault_with_regions};
+use carrick_el1::fault::{
+    GrantMailboxes, NoopCowResolver, NoopPreparedResolver, PreparedFaultPath,
+    dispatch_fault_with_prepared,
+};
+use carrick_el1::memory::reservations::{Decision, Layout, Placement, SharedReservations};
 use carrick_el1::{Zone, dispatch_syscall_with_lifecycle, sched};
 use carrick_el1_abi::{
-    Action, Counters, CurrentTask, FrameGrantMailbox, InotifyNameCache, TrapFrame,
+    Action, Counters, CurrentTask, FrameGrantMailbox, FrameGrantResidencyTable, InotifyNameCache,
+    ReservationBackingReceipt, ReservationCompletion, ReservationMm, ReservationProtection,
+    ReservationRange, TrapFrame,
 };
 use carrick_sched_core::AddressSpaces;
 use core::sync::atomic::Ordering;
@@ -82,15 +88,60 @@ fn creation_host_routes(policy: ArmRingFirst) {
 fn first_touch_capacity_forward_is_not_a_linux_syscall_forward() {
     let spaces = AddressSpaces::new();
     let counters = Counters::default();
+    // SAFETY: the shared reservation ABI starts in its all-zero unpublished state.
+    let roots = unsafe { Box::<SharedReservations>::new_zeroed().assume_init() };
     // Same VA in two live MMs: each request must retain its actual MM.
     for mm in [71, 83] {
         let slot = spaces.publish_closed(mm, mm << 12, mm << 12).unwrap();
+        let owner = ReservationMm::new(mm).unwrap();
+        roots
+            .publish(
+                slot.index(),
+                owner,
+                Layout {
+                    heap: ReservationRange::new(0x1000, 0x10_0000).unwrap(),
+                    arena: ReservationRange::new(0x4000_0000, 0x8000_0000).unwrap(),
+                    brk: 0x1000,
+                    address_limit: u64::MAX,
+                    data_limit: u64::MAX,
+                    external_address_bytes: 0,
+                    external_data_bytes: 0,
+                },
+            )
+            .unwrap();
+        let mut root = roots.lock(slot.index(), owner).unwrap();
+        root.finish_import().unwrap();
+        let Decision::Work(request) = root
+            .mmap(
+                Placement::Fixed(0x4000_0000),
+                0x2000,
+                ReservationProtection::READ_WRITE,
+            )
+            .unwrap()
+        else {
+            panic!("fresh reservation must require publication");
+        };
+        // SAFETY: this VM-free owner has no live descriptor/backing projection.
+        let completion = unsafe {
+            ReservationCompletion::after_descriptor_and_backing_commit(
+                request,
+                ReservationBackingReceipt {
+                    receipt: request.sequence.raw(),
+                    granted_bytes: 0,
+                    returned_bytes: 0,
+                },
+            )
+        }
+        .unwrap();
+        root.complete(completion).unwrap();
+        drop(root);
         spaces.open(slot);
     }
     let tasks = [CurrentTask::new(), CurrentTask::new()];
     for (slot, mm) in [71, 83].into_iter().enumerate() {
         tasks[slot].mm.key.store(mm, Ordering::Release);
         let mailbox = FrameGrantMailbox::new();
+        let residency = FrameGrantResidencyTable::new();
         let mut frame = TrapFrame {
             esr: (0x24 << 26) | (1 << 6) | 0x07,
             far: 0x4000_1000,
@@ -99,12 +150,18 @@ fn first_touch_capacity_forward_is_not_a_linux_syscall_forward() {
         };
         frame.x[8] = 220; // stale clone nr must not become syscall attribution
         assert_eq!(
-            dispatch_fault_with_regions(
+            dispatch_fault_with_prepared(
                 &mut frame,
                 &counters,
                 &tasks,
                 carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                 GrantMailboxes::own(&mailbox),
+                Some(PreparedFaultPath::<_> {
+                    residency: &residency,
+                    resolver: &mut NoopPreparedResolver,
+                    roots: Some(&roots),
+                    file_slots: None,
+                }),
                 &mut NoopCowResolver,
             ),
             Action::Forward
@@ -112,6 +169,7 @@ fn first_touch_capacity_forward_is_not_a_linux_syscall_forward() {
         assert!(mailbox.has_guest_work());
         let request = mailbox.claim_request().unwrap();
         assert_eq!(request.mm_key, mm);
+        assert_ne!(request.reservation_incarnation.raw(), 0);
         assert_eq!(request.fault_va, frame.far);
         assert_eq!(counters.forwarded[220].load(Ordering::Relaxed), 0);
     }
