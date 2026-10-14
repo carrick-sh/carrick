@@ -3,6 +3,8 @@
 .global _start
 .text
 _start:
+    xor %r13d, %r13d
+    call marker
     mov $57, %eax
     syscall
     test %eax, %eax

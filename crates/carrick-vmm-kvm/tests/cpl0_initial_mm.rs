@@ -120,7 +120,7 @@ fn run_to_marker(
                     })
                     .expect("real write crossing");
                 assert!(
-                    fork_result > 0,
+                    expected == 0 || fork_result > 0,
                     "guest fork result: {fork_result}; refusal {:?}; stock {:?}",
                     factory.fork_admission_refusal(),
                     factory.fork_stock_counters()
@@ -1050,6 +1050,24 @@ fn file_region_guest_fork_dup_and_child_retirement_preserve_parent() {
     let mut parent = factory.claim(0).expect("root executor");
     let mut peer = factory.claim(1).expect("peer executor");
     parent.cpu_mut().load(root).expect("load issued root");
+    run_to_marker(&mut parent, task, 0, &factory);
+    let (stdout, incarnation) = factory
+        .with_stopped_file_tables(|tables| {
+            let slot = tables
+                .fd_map()
+                .iter()
+                .find(|slot| {
+                    slot.incarnation.load(Ordering::Acquire) != 0
+                        && slot.fd.load(Ordering::Relaxed) == 1
+                })
+                .expect("initial stdout descriptor");
+            let stdout = slot.handle.load(Ordering::Relaxed);
+            let open = &tables.opens()[stdout as usize - 1];
+            let incarnation = open.generation.load(Ordering::Acquire);
+            assert_eq!(open.lifetime.ring_references(incarnation), Some(1));
+            (stdout, incarnation)
+        })
+        .expect("pre-fork open lifetime");
     run_to_marker(&mut parent, task, 1, &factory);
     factory
         .fixture_pin_native_thread(child_tid, carrick_guest_arch::CpuId::new(1))
@@ -1094,6 +1112,7 @@ fn file_region_guest_fork_dup_and_child_retirement_preserve_parent() {
                 );
             }
             let open = &tables.opens()[stdout as usize - 1];
+            assert_eq!(open.lifetime.ring_references(incarnation), Some(4));
             assert!(
                 open.inode_handle.load(Ordering::Acquire) > 0,
                 "stdout open must reside in the retained region"
@@ -1138,6 +1157,19 @@ fn file_region_guest_fork_dup_and_child_retirement_preserve_parent() {
     run_to_marker(&mut parent, task, 2, &factory);
     factory
         .with_stopped_file_tables(|tables| {
+            // Returning to the real idle peer admits its bootstrap table (2),
+            // in addition to the parent's two references. Count it explicitly
+            // rather than treating the peer's stdout as a child lifetime leak.
+            let idle_stdout = fd_map_lookup(tables.fd_map(), 2, 1).expect("idle peer stdout");
+            assert_ne!(parent_table, 2);
+            assert_ne!(child_table, 2);
+            assert_eq!(idle_stdout.0, stdout);
+            assert_eq!(
+                tables.opens()[stdout as usize - 1]
+                    .lifetime
+                    .ring_references(incarnation),
+                Some(3)
+            );
             assert_eq!(
                 tables.fd_map()[child_slot]
                     .incarnation
