@@ -499,3 +499,44 @@ test-signed: FAIL /w/target/release/deps/el1_broken-abcdef0123456789
     assert!(keys.contains("unitemized:el1-embed:parse-error:el1_broken"));
     assert!(keys.contains("step:el1-embed"));
 }
+
+#[test]
+fn per_binary_deadline_expiry_is_recorded_as_unfinished_and_fails_gate() {
+    let log = "\
+test-signed: running /w/target/release/deps/el1_wedged-1111111111111111 el1_ --nocapture
+running 1 test
+test el1_forgot_watchdog ...
+test-signed: capturing deadline diagnostics for /w/target/release/deps/el1_wedged-1111111111111111 (pid=4242, CARRICK_RUN_ID=embed-signed-99-b1)
+test-signed: deadline host backtrace (pid=4242):
+thread #1: tid = 0x01, el1_forgot_watchdog
+test-signed: DEADLINE /w/target/release/deps/el1_wedged-1111111111111111 (600s, CARRICK_RUN_ID=embed-signed-99-b1)
+test-signed: FAIL /w/target/release/deps/el1_wedged-1111111111111111
+test-signed: running /w/target/release/deps/el1_after-2222222222222222 el1_ --nocapture
+running 1 test
+test el1_after_ok ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+";
+    let parsed = parse_test_log(log);
+    assert_eq!(parsed.unfinished_binaries, vec!["el1_wedged"]);
+    assert_eq!(parsed.finished_binaries, vec!["el1_after"]);
+    assert_eq!(parsed.unitemized_failures, vec!["crash:el1_wedged"]);
+    assert_eq!(
+        parsed.started_tests,
+        vec!["el1_after::el1_after_ok", "el1_wedged::el1_forgot_watchdog",]
+    );
+
+    let (_, el1_passed, el1_err) = evaluate_el1_step(Some(1), log, &[]);
+    assert!(!el1_passed, "deadline-killed binary must fail the el1 step");
+    let err = el1_err.unwrap();
+    assert!(err.contains("el1_wedged"), "error={err}");
+
+    let mut s = step("el1-embed", false, &[]);
+    let mut failures = Vec::new();
+    populate_step_from_log(&mut s, log, &mut failures);
+    assert_eq!(s.unfinished_binaries, vec!["el1_wedged"]);
+    let keys = failure_keys(&receipt(vec![s]));
+    assert!(keys.contains("unfinished:el1_wedged"));
+    assert!(keys.contains("unitemized:el1-embed:crash:el1_wedged"));
+    assert!(keys.contains("step:el1-embed"));
+}

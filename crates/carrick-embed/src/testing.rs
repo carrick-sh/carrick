@@ -810,7 +810,28 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--list") == 0) list = 1;
         if (strcmp(argv[i], "--ignored") == 0) ignored = 1;
     }
-#ifdef HANG_BINARY
+#if defined(BLOCK_FOREVER_BINARY)
+    if (list && ignored) {
+        return 0;
+    }
+    if (list) {
+        printf("el1_dummy_block_forever: test\n");
+        return 0;
+    }
+    const char *run_id = getenv("CARRICK_RUN_ID");
+    const char *block_marker = getenv("DUMMY_BLOCK_MARKER");
+    if (!run_id || !block_marker) return 2;
+    stamp_proctitle(argv[0], run_id);
+    printf("running 1 test\ntest el1_dummy_block_forever ... ");
+    fflush(stdout);
+    FILE *f = fopen(block_marker, "w");
+    if (!f) return 3;
+    fprintf(f, "%s\n", run_id);
+    fclose(f);
+    for (;;) {
+        usleep(100000);
+    }
+#elif defined(HANG_BINARY)
     if (list && ignored) {
         return 0;
     }
@@ -852,7 +873,7 @@ int main(int argc, char **argv) {
     stamp_proctitle(argv[0], run_id);
     printf("running 1 test\n");
     fflush(stdout);
-    /* Sleep across pass 2 of binary 1's orphaned kill.sh reaper. */
+    /* Sleep across pass 2 of the previous binary's orphaned kill.sh reaper. */
     usleep(1500000);
     FILE *f = fopen(marker, "w");
     if (!f) return 3;
@@ -867,12 +888,24 @@ int main(int argc, char **argv) {
         )
         .expect("write dummy C source");
 
+        let exe_block = dir
+            .path()
+            .join("01_dummy_blocking_binary_with_room_for_carrick_proctitle_stamp");
         let exe_hang = dir
             .path()
-            .join("01_dummy_hanging_binary_with_room_for_carrick_proctitle_stamp");
+            .join("02_dummy_hanging_binary_with_room_for_carrick_proctitle_stamp");
         let exe_normal = dir
             .path()
-            .join("02_dummy_normal_binary_with_room_for_carrick_proctitle_stamp");
+            .join("03_dummy_normal_binary_with_room_for_carrick_proctitle_stamp");
+
+        let status_block = std::process::Command::new("/usr/bin/cc")
+            .arg("-DBLOCK_FOREVER_BINARY")
+            .arg(&c_src)
+            .arg("-o")
+            .arg(&exe_block)
+            .status()
+            .expect("compile block-forever binary");
+        assert!(status_block.success(), "cc failed for block-forever binary");
 
         let status_hang = std::process::Command::new("/usr/bin/cc")
             .arg("-DHANG_BINARY")
@@ -907,9 +940,11 @@ int main(int argc, char **argv) {
                      *--message-format=json*)\n\
                          printf '{{\"reason\":\"compiler-artifact\",\"profile\":{{\"test\":true}},\"executable\":\"%s\"}}\\n' '{}'\n\
                          printf '{{\"reason\":\"compiler-artifact\",\"profile\":{{\"test\":true}},\"executable\":\"%s\"}}\\n' '{}'\n\
+                         printf '{{\"reason\":\"compiler-artifact\",\"profile\":{{\"test\":true}},\"executable\":\"%s\"}}\\n' '{}'\n\
                          exit 0 ;;\n\
                      *) exit 99 ;;\n\
                  esac\n",
+                exe_block.display(),
                 exe_hang.display(),
                 exe_normal.display(),
             ),
@@ -919,42 +954,167 @@ int main(int argc, char **argv) {
             .expect("chmod fake cargo");
 
         let fake_sudo = dir.path().join("sudo");
-        std::fs::write(&fake_sudo, "#!/bin/sh\nexit 1\n").expect("write fake sudo");
+        std::fs::write(
+            &fake_sudo,
+            "#!/bin/sh\n\
+             case \"$*\" in\n\
+                 *lldb*)\n\
+                     if [ -n \"${DUMMY_BT_MARKER:-}\" ]; then\n\
+                         printf '%s\\n' \"$*\" >>\"$DUMMY_BT_MARKER\"\n\
+                     fi\n\
+                     echo \"thread #1: tid = 0x01, el1_dummy_block_forever\"\n\
+                     exit 0\n\
+                     ;;\n\
+             esac\n\
+             exit 1\n",
+        )
+        .expect("write fake sudo");
         std::fs::set_permissions(&fake_sudo, std::fs::Permissions::from_mode(0o755))
             .expect("chmod fake sudo");
 
-        let marker = dir.path().join("normal_completed.txt");
         let kill_sh = repo_root.join("scripts/sudo/kill.sh");
         let path_env = format!(
             "{}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
             dir.path().display()
         );
 
-        let output = std::process::Command::new(repo_root.join("scripts/test-signed.sh"))
+        // 1. With the per-binary deadline disabled (`=0` hatch), the forever-blocking
+        //    binary hangs indefinitely.
+        let disabled_run_id = format!("{run_id}-disabled");
+        let disabled_block_marker = dir.path().join("block_started_disabled.txt");
+        let disabled_marker = dir.path().join("normal_completed_disabled.txt");
+        let mut disabled_child =
+            std::process::Command::new(repo_root.join("scripts/test-signed.sh"))
+                .current_dir(repo_root)
+                .args(["dummy-watchdog-cascade-pkg", "el1_", "--nocapture"])
+                .env("PATH", &path_env)
+                .env("CARRICK_HOST_LEASE_SOCKET", "dummy-lease-socket")
+                .env("CARRICK_RUN_ID", &disabled_run_id)
+                .env("CARRICK_TEST_SIGNED_DEADLINE_SECS", "0")
+                .env("DUMMY_KILL_SH", &kill_sh)
+                .env("DUMMY_BLOCK_MARKER", &disabled_block_marker)
+                .env("DUMMY_NORMAL_MARKER", &disabled_marker)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn test-signed.sh with deadline disabled");
+
+        let wait_start = std::time::Instant::now();
+        while std::fs::read_to_string(&disabled_block_marker)
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            assert!(
+                wait_start.elapsed() < Duration::from_secs(10),
+                "forever-blocking binary did not start within 10s"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(1200));
+        let still_running = disabled_child
+            .try_wait()
+            .expect("poll disabled-deadline child")
+            .is_none();
+        let _ = disabled_child.kill();
+        let _ = disabled_child.wait();
+        for suffix in ["-b1", ""] {
+            let _ = std::process::Command::new(&kill_sh)
+                .arg(format!("{disabled_run_id}{suffix}"))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        assert!(
+            still_running,
+            "forever-blocking binary must remain blocked when CARRICK_TEST_SIGNED_DEADLINE_SECS=0"
+        );
+
+        // 2. With a short per-binary deadline override, the forever-blocking binary
+        //    has its diagnostics captured, is reaped via kill.sh, is reported as
+        //    DEADLINE and FAIL, and subsequent binaries still execute cleanly.
+        let block_marker = dir.path().join("block_started.txt");
+        let bt_marker = dir.path().join("bt_captured.txt");
+        let marker = dir.path().join("normal_completed.txt");
+        let mut child = std::process::Command::new(repo_root.join("scripts/test-signed.sh"))
             .current_dir(repo_root)
             .args(["dummy-watchdog-cascade-pkg", "el1_", "--nocapture"])
-            .env("PATH", path_env)
+            .env("PATH", &path_env)
             .env("CARRICK_HOST_LEASE_SOCKET", "dummy-lease-socket")
             .env("CARRICK_RUN_ID", &run_id)
+            .env("CARRICK_TEST_SIGNED_DEADLINE_SECS", "3")
             .env("DUMMY_KILL_SH", &kill_sh)
+            .env("DUMMY_BLOCK_MARKER", &block_marker)
+            .env("DUMMY_BT_MARKER", &bt_marker)
             .env("DUMMY_NORMAL_MARKER", &marker)
-            .output()
-            .expect("run test-signed.sh");
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn test-signed.sh with short deadline");
 
+        let bound = std::time::Instant::now();
+        let timed_out = loop {
+            if child.try_wait().expect("poll child").is_some() {
+                break false;
+            }
+            if bound.elapsed() >= Duration::from_secs(15) {
+                let _ = child.kill();
+                for suffix in ["-b1", "-b2", "-b3", ""] {
+                    let _ = std::process::Command::new(&kill_sh)
+                        .arg(format!("{run_id}{suffix}"))
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+                break true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let output = child
+            .wait_with_output()
+            .expect("collect test-signed.sh output");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !timed_out,
+            "test-signed.sh hung past per-binary deadline override; stdout={stdout} stderr={stderr}"
+        );
 
         assert!(
             !output.status.success(),
-            "overall run must fail because the first binary timed out; stdout={stdout} stderr={stderr}"
+            "overall run must fail because binaries 1 and 2 timed out; stdout={stdout} stderr={stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&block_marker)
+                .unwrap_or_default()
+                .trim(),
+            format!("{run_id}-b1"),
+            "blocking binary must run under -b1 CARRICK_RUN_ID (stdout={stdout} stderr={stderr})"
+        );
+        let bt_invocations = std::fs::read_to_string(&bt_marker).unwrap_or_default();
+        assert!(
+            bt_invocations.contains("lldb") && bt_invocations.contains("thread backtrace all"),
+            "deadline expiry must capture host backtraces via lldb before reaping; bt_invocations={bt_invocations:?} stderr={stderr}"
+        );
+        assert!(
+            stderr.contains("thread #1: tid = 0x01, el1_dummy_block_forever"),
+            "captured host backtrace must be emitted to stderr; stderr={stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("test-signed: DEADLINE {}", exe_block.display())),
+            "forever-blocking binary must be reported with a clear DEADLINE line; stderr={stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("test-signed: FAIL {}", exe_block.display())),
+            "forever-blocking binary must be reported failed; stderr={stderr}"
         );
         assert!(
             stderr.contains(&format!("test-signed: FAIL {}", exe_hang.display())),
-            "hanging binary must be reported failed; stderr={stderr}"
+            "watchdog-hanging binary must be reported failed; stderr={stderr}"
         );
         assert!(
             !stderr.contains(&format!("test-signed: FAIL {}", exe_normal.display())),
-            "normal binary must not be killed by previous binary's watchdog reap; stdout={stdout} stderr={stderr}"
+            "normal binary must not be killed by previous binaries' reaps; stdout={stdout} stderr={stderr}"
         );
         let normal_section = stdout
             .split(&format!("test-signed: running {}", exe_normal.display()))
@@ -968,8 +1128,8 @@ int main(int argc, char **argv) {
         let recorded_run_id = std::fs::read_to_string(&marker).unwrap_or_default();
         assert_eq!(
             recorded_run_id.trim(),
-            format!("{run_id}-b2"),
-            "normal binary must run under its distinct -b2 CARRICK_RUN_ID (stdout={stdout} stderr={stderr})"
+            format!("{run_id}-b3"),
+            "normal binary must run under its distinct -b3 CARRICK_RUN_ID (stdout={stdout} stderr={stderr})"
         );
     }
 }
