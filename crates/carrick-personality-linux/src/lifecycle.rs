@@ -657,8 +657,8 @@ pub fn serve_sigprocmask(
 }
 
 /// `sigaltstack(ss, old_ss)`. `sp` is the caller's stack pointer, when
-/// known. Served only when the caller is certainly not running on its
-/// alternate stack (the host decides that case: it tracks handler frames).
+/// known. An active alternate stack rejects changes before touching either
+/// userspace argument, while a query may still report `SS_ONSTACK`.
 fn serve_sigaltstack(
     args: [u64; 6],
     thread: LifecycleThread<'_>,
@@ -677,6 +677,9 @@ fn serve_sigaltstack(
     } else {
         false
     };
+    if ss != 0 && on_stack {
+        return Some(Err(carrick_syscall_abi::LINUX_EPERM));
+    }
     let replacement = if ss != 0 {
         let mut bytes = [0u8; STACK_T_SIZE];
         if !user.copy_in(&mut bytes, UserVa::new(ss)) {
@@ -718,9 +721,6 @@ fn serve_sigaltstack(
         ) {
             return Some(Err(carrick_syscall_abi::LINUX_EFAULT));
         }
-    }
-    if ss != 0 && on_stack {
-        return Some(Err(carrick_syscall_abi::LINUX_EPERM));
     }
     if let Some(stack) = replacement {
         thread.slot.write_altstack(stack);

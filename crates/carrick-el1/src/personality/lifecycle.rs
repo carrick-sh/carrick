@@ -621,9 +621,6 @@ impl<
     fn process_signals(
         &mut self,
     ) -> Option<&mut dyn carrick_personality_linux::signal::ProcessSignals> {
-        if self.frame.arm_scheduler() {
-            return None;
-        }
         self.process.as_deref_mut().and_then(|p| p.signal_venue())
     }
 
