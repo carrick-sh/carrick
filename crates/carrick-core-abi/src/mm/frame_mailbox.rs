@@ -19,13 +19,13 @@ pub const FRAME_GRANT_ERR_STALE: u64 = 3;
 
 /// Included in the image ABI fingerprint: a host-published grant must never
 /// be paired with an EL1 image that still owns successful leaf publication.
-pub const FRAME_GRANT_PROTOCOL_VERSION: u64 = 3;
+pub const FRAME_GRANT_PROTOCOL_VERSION: u64 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameGrantRequest {
     /// Exact zone/MM key selected by the loaded executor.
     pub mm_key: u64,
-    /// Exact anonymous root node at the fault, if one owns this request.
+    /// Required root node at the fault, including retained file mappings.
     /// A refusal for an older node must not answer a reused VA.
     pub reservation_incarnation: ReservationIncarnation,
     /// Nonzero carrier-wide request incarnation chosen by EL1.
