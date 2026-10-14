@@ -106,6 +106,8 @@ pub struct MacLedger {
     /// Refusals survive controller restarts; a new attempt has a new key.
     #[serde(default)]
     refused: Vec<JobKey>,
+    #[serde(skip)]
+    publication: Option<assignment::Publication<MacLedger>>,
 }
 impl MacLedger {
     /// One cloudmac runner at a time. A job key is re-served only when its
@@ -143,13 +145,46 @@ impl MacLedger {
     }
     pub fn load(path: &Path) -> Result<Self, ScalerError> {
         match std::fs::read(path) {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Ok(bytes) => {
+                let mut ledger: Self = serde_json::from_slice(&bytes)?;
+                assignment::bound_refusals(&mut ledger.refused);
+                Ok(ledger)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e.into()),
         }
     }
+    fn merge_assignments(&mut self, source: &Self) {
+        for row in &mut self.rows {
+            if let Some(other) = source.rows.iter().find(|other| other.name == row.name)
+                && other.assigned_key.is_some()
+            {
+                row.assigned = other.assigned;
+                row.assigned_key = other.assigned_key;
+            }
+        }
+        for key in &source.refused {
+            if !self.refused.contains(key) {
+                self.refused.push(*key);
+            }
+        }
+        assignment::bound_refusals(&mut self.refused);
+        // Runtime state must never recursively own the publication itself.
+        self.publication = None;
+    }
+    fn refresh(&mut self) -> Result<(), ScalerError> {
+        if let Some(publication) = self.publication.clone() {
+            *self = publication.snapshot()?;
+            self.publication = Some(publication);
+        }
+        Ok(())
+    }
     pub fn save(&self, path: &Path) -> Result<(), ScalerError> {
-        save_json(self, path)
+        if let Some(publication) = &self.publication {
+            publication.commit(self, path, Self::merge_assignments)
+        } else {
+            save_json(self, path)
+        }
     }
     fn update(&mut self, row: &MacRecord, path: &Path) -> Result<(), ScalerError> {
         let target = self
@@ -363,7 +398,6 @@ fn reconcile(
     let assignment = if row.state == MacState::Registering {
         Assignment::Unknown
     } else {
-        approve_assignment(gh, target, ledger, row, path)?;
         let assignment = gh.assignment(row)?;
         ledger.update(row, path)?;
         assignment
@@ -411,37 +445,23 @@ fn admit_demand<T>(
     Ok(None)
 }
 
-fn prioritize_demand(
-    ledger: &mut MacLedger,
-    path: &Path,
-    mut demand: Vec<(JobKey, String)>,
-) -> Result<Vec<JobKey>, ScalerError> {
+fn prioritize_demand(mut demand: Vec<(JobKey, String)>) -> Vec<JobKey> {
     let newest_push = demand
         .iter()
         .filter(|(_, event)| event == "push")
         .map(|(key, _)| key.run.0)
         .max();
-    for (key, event) in &demand {
-        if event == "push" && Some(key.run.0) != newest_push {
-            assignment::refuse(
-                ledger,
-                *key,
-                &ScalerError::Guard("superseded main push"),
-                path,
-                &mut |_| Ok(()),
-            )?;
-        }
-    }
     demand.sort_by_key(|(key, event)| {
         let priority = match event.as_str() {
             "merge_group" => 0,
-            "push" => 1,
+            "push" if Some(key.run.0) == newest_push => 1,
+            "push" => 3,
             _ => 2, // Admitted owner workflow_dispatch on main.
         };
         (priority, key.job.0)
     });
     demand.dedup();
-    Ok(demand.into_iter().map(|(key, _)| key).collect())
+    demand.into_iter().map(|(key, _)| key).collect()
 }
 
 fn launch(
@@ -498,7 +518,42 @@ pub(super) fn controller(
     let mut ledger = MacLedger::load(&path)?;
     let mut launched: Option<Launch> = None;
     let mut backoff = super::live::Backoff::default();
+    let publication = assignment::Publication::new(ledger.clone());
+    ledger.publication = Some(publication.clone());
+    let worker_publication = publication.worker();
+    let worker_path = path.clone();
+    let worker_target = target.clone();
+    let mut settled = Vec::new();
+    let _assignments = assignment::AssignmentService::start(move || {
+        let pass = (|| -> Result<(), ScalerError> {
+            let mut ledger = worker_publication.snapshot()?;
+            ledger.publication = Some(worker_publication.clone());
+            settled.retain(|name| {
+                ledger
+                    .rows
+                    .iter()
+                    .any(|row| row.name == *name && row.state != MacState::Done)
+            });
+            let open: Vec<_> = ledger
+                .rows
+                .iter()
+                .filter(|r| r.state == MacState::Launched && !settled.contains(&r.name))
+                .cloned()
+                .collect();
+            for mut row in open {
+                if approve_assignment(&Github, &worker_target, &mut ledger, &mut row, &worker_path)?
+                {
+                    settled.push(row.name);
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = pass {
+            eprintln!("assignment worker failed: {error}; retried");
+        }
+    });
     loop {
+        ledger.refresh()?;
         let active = ledger
             .rows
             .iter()
@@ -516,7 +571,13 @@ pub(super) fn controller(
                         let _ = handle.join();
                     }
                     if one_job {
-                        return if row.assigned.is_some() {
+                        ledger.refresh()?;
+                        let assigned = ledger
+                            .rows
+                            .iter()
+                            .find(|current| current.name == row.name)
+                            .and_then(|current| current.assigned);
+                        return if assigned.is_some() {
                             Ok(())
                         } else {
                             Err(ScalerError::External(
@@ -531,7 +592,7 @@ pub(super) fn controller(
             }
         } else {
             gh.mac_demand()
-                .and_then(|demand| prioritize_demand(&mut ledger, &path, demand))
+                .map(prioritize_demand)
                 .and_then(|demand| {
                     admit_demand(
                         &mut ledger,
@@ -1357,13 +1418,13 @@ fn approve_assignment(
     ledger: &mut MacLedger,
     row: &mut MacRecord,
     path: &Path,
-) -> Result<(), ScalerError> {
+) -> Result<bool, ScalerError> {
     let mut exchange = MacExchange {
         target,
         command: format!("{} --assignment", target.quiesce_command(&row.name)),
     };
     let runner = row.runner;
-    assignment::serve_assignment(
+    let outcome = assignment::serve_assignment(
         gh,
         &mut exchange,
         &HVF_LABELS,
@@ -1376,7 +1437,7 @@ fn approve_assignment(
             ledger.update(row, path)
         },
     )?;
-    Ok(())
+    Ok(!matches!(outcome, assignment::Revetted::Idle))
 }
 
 #[cfg(test)]
@@ -1519,9 +1580,9 @@ mod tests {
             (job(3), "merge_group".into()),
             (job(6), "workflow_dispatch".into()),
         ];
-        let ordered = prioritize_demand(&mut ledger, &path, demand).unwrap();
+        let ordered = prioritize_demand(demand);
         let mut admitted = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..5 {
             let key = admit_demand(&mut ledger, &path, ordered.clone(), Ok, |_| Ok(()))
                 .unwrap()
                 .unwrap();
@@ -1531,7 +1592,7 @@ mod tests {
             last.state = MacState::Done;
             last.assigned = Some(row.key.job);
         }
-        assert_eq!(admitted, vec![job(3), job(4), job(5), job(6)]);
-        assert_eq!(ledger.refused, vec![job(1)]);
+        assert_eq!(admitted, vec![job(3), job(4), job(5), job(6), job(1)]);
+        assert!(ledger.refused.is_empty());
     }
 }

@@ -62,7 +62,7 @@ const GUEST_STATE: &str = "/run/carrick-ci";
 const GUEST_ASSIGNMENT_READ: &str = r#"cd /run/carrick-ci || exit 1
 if [ -e approved-policy ] || [ -e draining ] || [ -s admission.lock ]; then echo settled; exit 0; fi
 if [ -e /home/runner/runner.exit ]; then echo finished; else echo pending; fi
-if [ -f assignment.json ]; then head -c 8193 assignment.json; fi"#;
+if [ ! -L assignment.json ] && [ -f assignment.json ]; then head -c 8193 assignment.json; fi"#;
 /// Root, under the hook's flock: publish `$1` as the approved policy unless
 /// draining; idempotent, and never replaces an approval with another run.
 const GUEST_ASSIGNMENT_APPROVE: &str = r#"cd /run/carrick-ci || exit 1
@@ -1182,6 +1182,13 @@ fn reconcile_one(
         row.failure = Some("recorded PVE task failed; owned VM retained for reap".into());
         row.task = None;
     }
+    ledger.refresh()?;
+    if let Some(current) = ledger.rows.iter().find(|current| current.name == row.name)
+        && current.assigned_key.is_some()
+    {
+        row.assigned = current.assigned;
+        row.assigned_key = current.assigned_key;
+    }
     let mut assignment = gh.assignment(&mut row)?;
     update(ledger, &row, path)?;
     if assignment == Assignment::Unknown && runner_exited(pve, &row) {
@@ -1471,8 +1478,8 @@ impl assignment::AssignmentExchange for GuestExchange<'_> {
 }
 /// Serve every standing clone's assignment rendezvous (#333): GitHub may
 /// assign a clone any queued job with its labels, not the one it was minted
-/// for. Runs on every poll, independent of reconciliation and admission
-/// backoff, well inside the hook's approval deadline. Failures are logged and
+/// for. Runs on a dedicated worker, independent of reconciliation, provisioning
+/// and admission backoff. Failures are logged and
 /// retried on the next poll; they never block reconciliation or reaping.
 fn revet_assignments(
     pve: &Pve,
@@ -1615,14 +1622,33 @@ pub(super) fn controller(
     let mut frozen = true;
     let mut backoff = Backoff::default();
     let mut admit_after = Instant::now();
-    let mut settled = Vec::new();
+    let publication = assignment::Publication::new(ledger.clone());
+    ledger.publication = Some(publication.clone());
+    let _assignments = if matches!(admission, Admission::Standing) {
+        let publication = publication.worker();
+        let path = path.clone();
+        let assignment_pve = Pve::local()?;
+        let mut settled = Vec::new();
+        Some(assignment::AssignmentService::start(move || {
+            let pass = (|| -> Result<(), ScalerError> {
+                let mut ledger = publication.snapshot()?;
+                ledger.publication = Some(publication.clone());
+                revet_assignments(&assignment_pve, &Github, &mut ledger, &path, &mut settled);
+                Ok(())
+            })();
+            if let Err(error) = pass {
+                eprintln!("assignment worker failed: {error}");
+            }
+        }))
+    } else {
+        None
+    };
     loop {
-        if matches!(admission, Admission::Standing) {
-            revet_assignments(&pve, &gh, &mut ledger, &path, &mut settled);
-        }
+        ledger.refresh()?;
         if reconcile.elapsed() >= Duration::from_secs(60) {
             let pass = reconcile_all(&pve, &gh, &mut ledger, dir, &path, (group, admission))?;
             if pass.finished > 0 && one_job {
+                ledger.refresh()?;
                 return one_job_result(ledger.rows.last());
             }
             frozen = match pass.frozen {
@@ -1679,6 +1705,29 @@ impl Backoff {
     }
 }
 
+fn select_demand(
+    ledger: &mut Ledger,
+    path: &Path,
+    demand: Vec<JobKey>,
+    mut vet: impl FnMut(JobKey) -> Result<JobKey, ScalerError>,
+    mut cancel: impl FnMut(RunId) -> Result<(), ScalerError>,
+) -> Result<Option<JobKey>, ScalerError> {
+    ledger.refresh()?;
+    for key in demand {
+        if ledger.served(key) {
+            continue;
+        }
+        match vet(key) {
+            Ok(key) => return Ok(Some(key)),
+            Err(error @ (ScalerError::Guard(_) | ScalerError::StaleMergeGroup)) => {
+                assignment::refuse(ledger, key, &error, path, &mut cancel)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
 fn admit_one(
     pve: &Pve,
     gh: &Github,
@@ -1688,10 +1737,13 @@ fn admit_one(
     approval: (u64, &Admission),
     limit: Concurrency,
 ) -> Result<(), ScalerError> {
-    let Some(job) = gh
-        .demand(approval.1, &LABELS)?
-        .into_iter()
-        .find(|job| !ledger.served(*job))
+    let Some(job) = select_demand(
+        ledger,
+        path,
+        gh.demand(approval.1, &LABELS)?,
+        |job| gh.vet(approval.1, job).map(|_| job),
+        |run| gh.cancel_run(run),
+    )?
     else {
         return Ok(());
     };
@@ -1699,15 +1751,33 @@ fn admit_one(
         return Ok(());
     }
     let inventory = pve.inventory()?;
+    ledger.refresh()?;
+    if ledger.served(job) {
+        return Ok(());
+    }
     let mut row = ledger.reserve(job, &inventory, now()?, limit)?;
     ledger.save(path)?; // Must reach durable storage before clone.
     println!("reserved vm={} job={}", row.vm.get(), job.job.0);
     if let Err(error) = provision(pve, gh, ledger, &mut row, dir, path, approval) {
         row.failure = Some(error.to_string());
         update(ledger, &row, path)?;
-        return Err(error);
+        return provision_failure(ledger, job, error, path, |run| gh.cancel_run(run));
     }
     Ok(())
+}
+
+fn provision_failure(
+    ledger: &mut Ledger,
+    job: JobKey,
+    error: ScalerError,
+    path: &Path,
+    mut cancel: impl FnMut(RunId) -> Result<(), ScalerError>,
+) -> Result<(), ScalerError> {
+    if matches!(error, ScalerError::StaleMergeGroup) {
+        assignment::refuse(ledger, job, &error, path, &mut cancel)
+    } else {
+        Err(error)
+    }
 }
 
 #[cfg(test)]
@@ -1718,6 +1788,82 @@ mod security_tests;
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    #[test]
+    fn ci_scaler_standing_group_that_expires_during_provision_does_not_freeze() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let mut ledger = Ledger::default();
+        let job = JobKey {
+            run: RunId(1),
+            attempt: 1,
+            job: JobId(1),
+        };
+        let mut cancelled = Vec::new();
+        assert!(
+            provision_failure(
+                &mut ledger,
+                job,
+                ScalerError::StaleMergeGroup,
+                &path,
+                |run| {
+                    cancelled.push(run);
+                    Ok(())
+                }
+            )
+            .is_ok()
+        );
+        assert_eq!(cancelled, vec![job.run]);
+        assert!(Ledger::load(&path).unwrap().served(job));
+        assert!(
+            provision_failure(
+                &mut ledger,
+                job,
+                ScalerError::External("PVE failure"),
+                &path,
+                |_| Ok(())
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn ci_scaler_standing_stale_demand_is_cancelled_before_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let mut ledger = Ledger::default();
+        let stale = JobKey {
+            run: RunId(1),
+            attempt: 1,
+            job: JobId(1),
+        };
+        let live = JobKey {
+            run: RunId(2),
+            attempt: 1,
+            job: JobId(2),
+        };
+        let mut cancelled = Vec::new();
+        let selected = select_demand(
+            &mut ledger,
+            &path,
+            vec![stale, live],
+            |key| {
+                if key == stale {
+                    Err(ScalerError::StaleMergeGroup)
+                } else {
+                    Ok(key)
+                }
+            },
+            |run| {
+                cancelled.push(run);
+                Ok(())
+            },
+        );
+        assert_eq!(selected.unwrap(), Some(live));
+        assert_eq!(cancelled, vec![stale.run]);
+        assert!(ledger.rows.is_empty());
+        assert!(Ledger::load(&path).unwrap().served(stale));
+    }
+
     #[test]
     fn serial_host_guest_payload_installs_exact_bytes_without_expansion() {
         let dir = tempfile::tempdir().unwrap();
@@ -1754,6 +1900,16 @@ mod tests {
             .output()
             .unwrap()
     }
+    #[test]
+    fn serial_host_guest_rendezvous_does_not_follow_assignment_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, "must-not-read").unwrap();
+        std::os::unix::fs::symlink(&secret, dir.path().join("assignment.json")).unwrap();
+        let output = guest_script(dir.path(), GUEST_ASSIGNMENT_READ, "");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("must-not-read"));
+    }
+
     #[test]
     fn serial_host_guest_rendezvous_reads_requests_and_publishes_one_approval() {
         // The shell halves use the same state directory and request bound.

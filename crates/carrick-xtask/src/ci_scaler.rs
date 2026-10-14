@@ -166,6 +166,8 @@ pub struct Ledger {
     /// Refused actual assignments survive restarts; a new attempt has a new key.
     #[serde(default)]
     refused: Vec<JobKey>,
+    #[serde(skip)]
+    publication: Option<assignment::Publication<Ledger>>,
 }
 impl Ledger {
     pub fn reserve(
@@ -238,13 +240,46 @@ impl Ledger {
     }
     pub fn load(path: &Path) -> Result<Self, ScalerError> {
         match std::fs::read(path) {
-            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Ok(bytes) => {
+                let mut ledger: Self = serde_json::from_slice(&bytes)?;
+                assignment::bound_refusals(&mut ledger.refused);
+                Ok(ledger)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e.into()),
         }
     }
+    fn merge_assignments(&mut self, source: &Self) {
+        for row in &mut self.rows {
+            if let Some(other) = source.rows.iter().find(|other| other.name == row.name)
+                && other.assigned_key.is_some()
+            {
+                row.assigned = other.assigned;
+                row.assigned_key = other.assigned_key;
+            }
+        }
+        for key in &source.refused {
+            if !self.refused.contains(key) {
+                self.refused.push(*key);
+            }
+        }
+        assignment::bound_refusals(&mut self.refused);
+        // Runtime state must never recursively own the publication itself.
+        self.publication = None;
+    }
+    fn refresh(&mut self) -> Result<(), ScalerError> {
+        if let Some(publication) = self.publication.clone() {
+            *self = publication.snapshot()?;
+            self.publication = Some(publication);
+        }
+        Ok(())
+    }
     pub fn save(&self, path: &Path) -> Result<(), ScalerError> {
-        save_json(self, path)
+        if let Some(publication) = &self.publication {
+            publication.commit(self, path, Self::merge_assignments)
+        } else {
+            save_json(self, path)
+        }
     }
 }
 impl assignment::Refusals for Ledger {

@@ -96,8 +96,8 @@ same credential-free rendezvous as cloudmac ([mac-jit.md](mac-jit.md)):
    `/run/carrick-ci/assignment.json` (created by the controller before JIT
    delivery) under the admission flock, then waits at most four minutes for
    `/run/carrick-ci/approved-policy`.
-2. On every 30 s poll the controller reads that request as root through the
-   scoped guest agent, under the same flock. It authenticates the job by this
+2. A dedicated assignment worker reads that request as root through the
+   scoped guest agent, with a one-second timer between passes and under the same flock. It authenticates the job by this
    clone's runner id and the exact `willow-kvm` label set, re-vets the actual
    run exactly as demand (`Github::vet`), and fsyncs the actual job into the
    ledger (`assigned`, `assigned_key`).
@@ -114,10 +114,12 @@ of its serves, so the reserved job is served by the next clone. The decision
 code is shared with cloudmac (`ci_scaler/assignment.rs`). Before JIT the
 controller requires the template's guest xtask to offer
 `admit-job --controller` (every template built since the cloudmac re-vet,
-#273, does) and otherwise refuses the clone, naming the template rebuild. With
-`--max-concurrency 2`, provisioning a second clone blocks the poll loop for
-several minutes and can outlast a waiting hook's four-minute deadline, which
-then fails that job closed; Contabo runs with 1.
+#273, does) and otherwise refuses the clone, naming the template rebuild. Assignment serving continues while the lifecycle loop provisions another clone,
+reconciles teardown, or backs off. The two loops publish through a short-held
+ledger mutex: assignment writes preserve lifecycle state, lifecycle writes
+preserve authenticated assignments, and every publication is fsynced before
+approval. Refusal history retains at most 4096 job keys; evicted keys still
+undergo full admission vetting if encountered again.
 
 ### GitHub credential for standing mode
 
