@@ -4143,9 +4143,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     fn retire_thread_verdict(&mut self, verdict: carrick_core::terminal::RetirementVerdict) {
         self.retire_thread_verdict(verdict);
     }
-    fn thread_exited(&mut self, tid: u32) {
-        self.thread_exited(tid);
-    }
     fn route_host_thread_exit(
         &mut self,
         verdict: carrick_core::terminal::RetirementVerdict,
@@ -4312,11 +4309,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 registry.unregister_member(self.runtime, self.key, record);
             }
         }
-    }
-
-    pub fn thread_exited(&mut self, tid: u32) {
-        self.retire_thread_identity(tid);
-        self.wake_pending_exit_on_receipt();
     }
 
     fn robust_target<'g>(
@@ -9035,7 +9027,15 @@ mod tests {
         for i in 0..100 {
             let tid = 1000 + i;
             entry.thread_spawned(41, tid, &mut || Ok(())).unwrap();
-            entry.thread_exited(tid);
+            // This fixture has no execution binding for its synthetic row.
+            // Remove it in the graph instead of bypassing production custody.
+            runtime
+                .graph
+                .lock()
+                .owner
+                .task_mut(key)
+                .unwrap()
+                .remove_thread(tid);
         }
 
         drop(entry);
