@@ -1709,23 +1709,11 @@ fn select_demand(
     ledger: &mut Ledger,
     path: &Path,
     demand: Vec<JobKey>,
-    mut vet: impl FnMut(JobKey) -> Result<JobKey, ScalerError>,
-    mut cancel: impl FnMut(RunId) -> Result<(), ScalerError>,
+    vet: impl FnMut(JobKey) -> Result<JobKey, ScalerError>,
+    cancel: impl FnMut(RunId) -> Result<(), ScalerError>,
 ) -> Result<Option<JobKey>, ScalerError> {
     ledger.refresh()?;
-    for key in demand {
-        if ledger.served(key) {
-            continue;
-        }
-        match vet(key) {
-            Ok(key) => return Ok(Some(key)),
-            Err(error @ (ScalerError::Guard(_) | ScalerError::StaleMergeGroup)) => {
-                assignment::refuse(ledger, key, &error, path, &mut cancel)?;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(None)
+    assignment::admit_demand(ledger, path, demand, vet, cancel)
 }
 
 fn admit_one(

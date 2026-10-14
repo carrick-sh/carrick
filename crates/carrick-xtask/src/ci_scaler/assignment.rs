@@ -75,6 +75,25 @@ impl<T: Clone> Publication<T> {
     }
 }
 
+/// Publish matching records without scanning the source population per row.
+/// First occurrence wins, matching the ledger's existing identity lookup.
+pub(super) fn merge_records<R, K: Ord>(
+    target: &mut [R],
+    source: &[R],
+    mut key: impl FnMut(&R) -> K,
+    mut merge: impl FnMut(&mut R, &R),
+) {
+    let mut records = std::collections::BTreeMap::new();
+    for row in source {
+        records.entry(key(row)).or_insert(row);
+    }
+    for row in target {
+        if let Some(other) = records.get(&key(row)) {
+            merge(row, other);
+        }
+    }
+}
+
 /// A separately scheduled rendezvous worker. Shutdown wakes its timer and
 /// joins it; no detached worker survives the controller's ledger lock.
 pub(super) struct AssignmentService {
@@ -274,9 +293,34 @@ pub fn assigned_job_key(
 
 /// A controller ledger that records per-job refusals durably.
 pub(super) trait Refusals {
+    fn served(&self, key: JobKey) -> bool;
     fn refused(&self) -> &[JobKey];
     fn refused_mut(&mut self) -> &mut Vec<JobKey>;
     fn persist(&self, path: &Path) -> Result<(), ScalerError>;
+}
+
+/// One admission decision for both controller ledgers. Per-job refusals are
+/// skipped in-pass; external failures retain the controller's backoff policy.
+pub(super) fn admit_demand<T>(
+    ledger: &mut impl Refusals,
+    path: &Path,
+    demand: Vec<JobKey>,
+    mut admit: impl FnMut(JobKey) -> Result<T, ScalerError>,
+    mut cancel: impl FnMut(RunId) -> Result<(), ScalerError>,
+) -> Result<Option<T>, ScalerError> {
+    for job in demand {
+        if ledger.served(job) {
+            continue;
+        }
+        match admit(job) {
+            Ok(vetted) => return Ok(Some(vetted)),
+            Err(error @ (ScalerError::Guard(_) | ScalerError::StaleMergeGroup)) => {
+                refuse(ledger, job, &error, path, &mut cancel)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
 }
 
 /// Record and log a per-job refusal once; a new attempt has a new key. A
@@ -555,6 +599,70 @@ mod tests {
                 ledger.save(path)
             },
         )
+    }
+
+    #[derive(Clone)]
+    struct CountedName {
+        name: String,
+        comparisons: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+    impl PartialEq for CountedName {
+        fn eq(&self, other: &Self) -> bool {
+            self.cmp(other).is_eq()
+        }
+    }
+    impl Eq for CountedName {}
+    impl PartialOrd for CountedName {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for CountedName {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.comparisons.set(self.comparisons.get() + 1);
+            self.name.cmp(&other.name)
+        }
+    }
+
+    #[test]
+    fn ci_scaler_assignment_publication_work_scales_with_ledger_population() {
+        for population in [64_usize, 512, 4096] {
+            let comparisons = std::rc::Rc::new(std::cell::Cell::new(0));
+            // Mixed widths and a large population expose repeated name scans.
+            let mut source: Vec<_> = (0..population)
+                .map(|n| (format!("{}-{n}", "x".repeat((n % 3) * 127)), Some(n)))
+                .collect();
+            let mut target: Vec<_> = source
+                .iter()
+                .map(|(name, _)| (name.clone(), None))
+                .collect();
+            // Duplicate source identities preserve the first observation;
+            // unmatched target rows preserve their own assignment.
+            source.push((source[0].0.clone(), Some(population + 1)));
+            target.push(("unmatched".into(), Some(population + 2)));
+            merge_records(
+                &mut target,
+                &source,
+                |row| CountedName {
+                    name: row.0.clone(),
+                    comparisons: comparisons.clone(),
+                },
+                |target, source| target.1 = source.1,
+            );
+            for (n, (_, assigned)) in target[..population].iter().enumerate() {
+                assert_eq!(*assigned, Some(n));
+            }
+            assert_eq!(target[population].1, Some(population + 2));
+            // B-tree insert + lookup do O((source + target) log(source))
+            // name comparisons, including mixed-width keys and duplicate rows.
+            let budget = 16 * (source.len() + target.len()) * (source.len().ilog2() as usize + 1);
+            assert!(comparisons.get() > 0);
+            assert!(
+                comparisons.get() <= budget,
+                "ledger population {population}: {} name comparisons exceed budget {budget}",
+                comparisons.get()
+            );
+        }
     }
 
     #[test]

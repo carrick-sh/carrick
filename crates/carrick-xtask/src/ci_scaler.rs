@@ -250,14 +250,17 @@ impl Ledger {
         }
     }
     fn merge_assignments(&mut self, source: &Self) {
-        for row in &mut self.rows {
-            if let Some(other) = source.rows.iter().find(|other| other.name == row.name)
-                && other.assigned_key.is_some()
-            {
-                row.assigned = other.assigned;
-                row.assigned_key = other.assigned_key;
-            }
-        }
+        assignment::merge_records(
+            &mut self.rows,
+            &source.rows,
+            |row| row.name.clone(),
+            |row, other| {
+                if other.assigned_key.is_some() {
+                    row.assigned = other.assigned;
+                    row.assigned_key = other.assigned_key;
+                }
+            },
+        );
         for key in &source.refused {
             if !self.refused.contains(key) {
                 self.refused.push(*key);
@@ -283,6 +286,9 @@ impl Ledger {
     }
 }
 impl assignment::Refusals for Ledger {
+    fn served(&self, key: JobKey) -> bool {
+        Ledger::served(self, key)
+    }
     fn refused(&self) -> &[JobKey] {
         &self.refused
     }
