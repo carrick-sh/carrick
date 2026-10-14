@@ -3057,6 +3057,17 @@ mod tests {
                     );
                     next.close_host();
                     open.close_host();
+                    assert_seam_live(open.description.el1_identity().unwrap());
+                    let (route, result) = seam_call(&region, child, 57, 0);
+                    assert_ne!(route, carrick_el1_abi::Action::Forward);
+                    assert_eq!(result, 0);
+                    owned_recall::test_drain_external();
+                    assert!(
+                        owned_recall::wait_for_cleanup_bounded(
+                            open.description.el1_identity().unwrap()
+                        ),
+                        "child close deferred terminal cleanup until exit"
+                    );
                 },
             );
             assert!(owned_recall::wait_for_cleanup_bounded(
