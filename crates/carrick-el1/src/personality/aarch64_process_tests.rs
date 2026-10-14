@@ -2,8 +2,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::aarch64_process::{
-    Aarch64NativeProcessService, ForkStockCrossing, admit_entry, observed_entry_address,
-    process_record_for_call, registry, with_process_entry,
+    Aarch64NativeProcessService, ForkStockCrossing, Mm, admit_entry, map_resume,
+    observed_entry_address, process_record_for_call, registry, resume_selected, with_process_entry,
 };
 use super::native_process_runtime::{
     NativeProcessError, NativeProcessRegistry, NativeProcessRuntime, NativeProcessService,
