@@ -3112,6 +3112,11 @@ pub fn mark_pending_host_work_for_file_tables(tables: &[u64]) {
     if tables.is_empty() {
         return;
     }
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    let ptr = EL1_REGION_BASE as usize;
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    let ptr = X86_CPL0_REGION_BASE as usize;
+    #[cfg(not(target_os = "none"))]
     let ptr = get_el1_region_host_ptr();
     if ptr == 0 {
         return;
@@ -3776,6 +3781,7 @@ impl Default for InotifyNameCache {
 }
 
 const _: () = {
+    assert!(EL1_ABI_LAYOUT_HASH == 0x23ed0d114b425b46);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);

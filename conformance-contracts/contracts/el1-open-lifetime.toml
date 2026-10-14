@@ -5,13 +5,11 @@ guest_surfaces = ["syscall:dup", "syscall:dup3", "syscall:close", "syscall:fork"
 semantic_authority = ["man 2 dup", "man 2 close", "man 2 fork", "Issue #329 and director ruling on PR #332: F1a shared lifetime cutover"]
 fixture = "carrick-kernel:el1_delegation::tests::serial_host::file_seam_"
 scale_points = [1, 16, 512]
-rationale = "Host fd-map entries are non-owning views. Ring dup/fork acquire explicit references in the same generation-authenticated lifetime that owns the host functional-reference group. Closing that host group cannot elect recall while a ring reference lives. The last release retains cleanup custody and publishes one indexed handoff; recall demotes bytes without recycling a live open record. Real VFS fixtures observe one open record and one CAS per uncontended last-reference decision at all populations, with no fd-map census in that decision. FD-number lookup is separately outside this metric."
-# ABI-local budgets use the actual OpenReferenceWork observer: exactly one
-# record visit and one uncontended CAS at every scale, asserted by the fixture.
-# There is no global WorkScope observation for this reference decision.
+rationale = "Host fd-map entries are non-owning views. Ring dup/fork acquire explicit references in the same generation-authenticated lifetime that owns the host functional-reference group. Closing that host group cannot elect recall while a ring reference lives. The last release retains cleanup custody and publishes one indexed handoff; recall demotes bytes without recycling a live open record. The real-VFS witnesses fork through Aarch64NativeProcessService with two live graph tasks. ARM host-view dup/close still cross; owned native-child slots now close/dup in ring. EL1-owned mutation keeps copied child slots out of the host index and removes them before fd reuse. No registered structural-observation closure is claimed."
 structural_budgets = []
 [bindings]
-vm_free = "carrick-kernel::el1_delegation::tests::serial_host::{file_seam_ring_duplicate_survives_last_host_reference,file_seam_final_ring_release_has_one_terminal_handoff_at_each_population,file_seam_fork_retirement_and_recall_preserve_exact_backing_custody}; carrick-el1-abi::open_lifetime::tests"
+vm_free = "carrick-kernel::el1_delegation::tests::serial_host::{file_seam_ring_duplicate_survives_last_host_reference,file_seam_final_ring_release_has_one_terminal_handoff_at_each_population,file_seam_native_child_exit_preserves_parent_and_terminal_custody}; carrick-el1-abi::open_lifetime::tests"
 [bindings.unresolved]
 embed_structural = "Director-owned full signed regression gate; the production non-Linux binding follows in F1b/F4."
 docker = "Linux dup/close/fork authority is public man pages; this slice's real-VFS proof targets internal reference custody. Neutral Open belongs to F4."
+observation = "The ABI observer measures actual CAS attempts; the unfalsifiable records=1 field and record-visit claim are removed. Uncontended one-CAS assertions at 1/16/512 are diagnostic local checks, not a registered WorkScope budget or a bound on fd lookup, fork, host-work task selection or runtime cost. F3 must bind any broader structural claim."

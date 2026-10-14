@@ -6,9 +6,13 @@
 #[cfg(target_os = "none")]
 use super::ThreadCpu;
 use super::UserWord;
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[cfg(any(
+    test,
+    feature = "host-test",
+    all(target_os = "none", target_arch = "aarch64")
+))]
 mod aarch64_context;
-#[cfg(test)]
+#[cfg(any(test, feature = "host-test"))]
 pub(super) use aarch64_context::{load_frame, save_frame};
 use carrick_el1_abi::CurrentTask;
 #[cfg(target_os = "none")]

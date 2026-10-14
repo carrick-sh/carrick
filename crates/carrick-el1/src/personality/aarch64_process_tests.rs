@@ -2,22 +2,25 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::aarch64_process::*;
-use super::native_process_runtime::{
-    NativeProcessError, NativeProcessRuntime, NativeProcessService,
-};
+#[cfg(test)]
+use super::native_process_runtime::NativeProcessService;
+use super::native_process_runtime::{NativeProcessError, NativeProcessRuntime};
 use carrick_el1_abi::{
     BornInZoneSource, CurrentTask, El1TaskId, ForkStockExchange, ForkStockKind, ForkStockLoan,
     ForkStockRefusal, ForkStockSettlement, ReservationMm, ThreadControlSlot, ThreadIdentity,
     ThreadLifecyclePage,
 };
+#[cfg(test)]
+use carrick_guest_arch::UserVa;
 use carrick_guest_arch::{
-    AddressContext, ContextGeneration, FrameGpa, KernelVa, MmGeneration, RootGpa, SlotId, UserVa,
+    AddressContext, ContextGeneration, FrameGpa, KernelVa, MmGeneration, RootGpa, SlotId,
 };
 use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
 use carrick_mmu_core::owner_mmu::Aarch64Mmu;
-use carrick_personality_linux::lifecycle::{
-    LifecycleOutcome, LinuxWaitOptions, LinuxWaitStatus, ProcessNative, ProcessWaitPid,
-};
+use carrick_personality_linux::lifecycle::{LifecycleOutcome, ProcessNative};
+#[cfg(test)]
+use carrick_personality_linux::lifecycle::{LinuxWaitOptions, LinuxWaitStatus, ProcessWaitPid};
+#[cfg(test)]
 use carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK;
 use carrick_sched_core::process::{TaskId, TaskKey, TaskSerial};
 use carrick_sched_core::{Aarch64ParkedContext, ThreadCtx, ZoneTables};
@@ -302,7 +305,11 @@ fn asid(raw: u16) -> carrick_guest_arch::Asid {
 }
 
 impl Fixture {
+    #[cfg(test)]
     fn new(root_gpa: u64, asid: carrick_guest_arch::Asid) -> Self {
+        Self::with_file_table(root_gpa, asid, 5)
+    }
+    fn with_file_table(root_gpa: u64, asid: carrick_guest_arch::Asid, file_table: u64) -> Self {
         let region_box = Box::new(crate::personality::mm_portal::test_support::Region::new());
         let region = Box::leak(region_box);
         let zone: &'static ZoneTables<Aarch64ParkedContext> = unsafe {
@@ -317,7 +324,7 @@ impl Fixture {
         let control = Box::leak(Box::new(ThreadControlSlot::new()));
 
         let task = CurrentTask::new();
-        task.set(El1TaskId::from_linux_tid(41), 11, 5);
+        task.set(El1TaskId::from_linux_tid(41), 11, file_table);
         task.mm.key.store(1, Ordering::Release);
         task.mm.thread_generation.store(101, Ordering::Release);
         task.publish_visible_pid(41);
@@ -344,7 +351,7 @@ impl Fixture {
                 tid: 41,
                 serial: 101,
                 mm: 1,
-                file_table: 5,
+                file_table,
                 generation: 11,
                 affinity: 1,
                 lifecycle_page: page as *const _ as u64,
@@ -1262,4 +1269,128 @@ fn terminal_retirement_cannot_retire_a_reused_record_or_slot_generation() {
         source,
         carrick_sched_core::TerminalPhase::Retired
     ));
+}
+
+/// Runs the production native fork/exit owners over caller-owned file tables.
+/// Only MMU stock supply is simulated; files use real VFS admission and custody.
+pub fn with_native_file_fork(
+    fd_map: &[carrick_el1_abi::FdMapSlot],
+    open_table: &[carrick_el1_abi::DelegatedOpenFile],
+    parent_table: u64,
+    witness: impl FnOnce(&CurrentTask),
+) {
+    struct Crossing<'a> {
+        stock: TestStockCrossing,
+        fds: &'a [carrick_el1_abi::FdMapSlot],
+        opens: &'a [carrick_el1_abi::DelegatedOpenFile],
+    }
+    impl ForkStockCrossing for Crossing<'_> {
+        fn fd_map(&self) -> &[carrick_el1_abi::FdMapSlot] {
+            self.fds
+        }
+        fn open_table(&self) -> &[carrick_el1_abi::DelegatedOpenFile] {
+            self.opens
+        }
+        fn cross_fork_stock(&self, record: u64, cpu: u64) -> Result<(), NativeProcessError> {
+            self.stock.cross_fork_stock(record, cpu)
+        }
+        fn cross_root_exit(&self, record: u64, cpu: u64) -> Result<(), NativeProcessError> {
+            self.stock.cross_root_exit(record, cpu)
+        }
+        fn cross_child_retire(&self, record: u64, cpu: u64) -> Result<(), NativeProcessError> {
+            self.stock.cross_child_retire(record, cpu)
+        }
+        fn cross_wait_channel_wake(
+            &self,
+            channel: super::native_process_runtime::ProcessWaitChannel,
+            cpu: u64,
+        ) -> Result<(), NativeProcessError> {
+            self.stock.cross_wait_channel_wake(channel, cpu)
+        }
+    }
+    let fixture = Fixture::with_file_table(0x10000, asid(1), parent_table);
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
+    let words = fixture.tables.live(&fixture.maintenance);
+    let crossing = Crossing {
+        stock: TestStockCrossing::new(&[
+            0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+        ]),
+        fds: fd_map,
+        opens: open_table,
+    };
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::new(1).unwrap(),
+        &crossing,
+    )
+    .with_words(&words);
+    let LifecycleOutcome::Returned { result, .. } = runtime
+        .enter(source, &fixture.task, parked, &mut service)
+        .unwrap()
+        .fork()
+    else {
+        panic!("native fork must publish a live child");
+    };
+    assert!(result.raw() > 0, "native fork refused: {}", result.raw());
+    let parent_key = TaskKey {
+        id: TaskId::from_abi_positive(41).unwrap(),
+        serial: TaskSerial::from_raw_u64(11).unwrap(),
+    };
+    let parent = runtime.task_binding(parent_key).unwrap();
+    let child_key = runtime
+        .namespace_child_key(parent_key, result.raw() as u32)
+        .unwrap();
+    let child = runtime.task_binding(child_key).unwrap();
+    assert_ne!(parent.key, child.key);
+    fixture
+        .zone
+        .requeue_preempted(fixture.slot, parent.record.id);
+    let child_task = CurrentTask::new();
+    activate(source, &child_task, &child);
+    *crossing.stock.zone.lock().unwrap() = Some(fixture.zone);
+    *crossing.stock.child.lock().unwrap() = Some((
+        super::common_entry::execution_binding(&child_task),
+        child.address,
+    ));
+    assert!(runtime.task_binding(parent_key).is_some());
+    assert!(runtime.task_binding(child_key).is_some());
+    witness(&child_task);
+    let mut child_service = Aarch64NativeProcessService::with_crossing(
+        &child_task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::new(1).unwrap(),
+        &crossing,
+    )
+    .with_words(&words);
+    assert!(matches!(
+        runtime
+            .enter(source, &child_task, child.words, &mut child_service)
+            .unwrap()
+            .exit_group(0),
+        LifecycleOutcome::Transferred { .. }
+    ));
+    assert!(
+        runtime.task_binding(parent_key).is_some(),
+        "parent survives child exit"
+    );
+    assert_eq!(crossing.stock.retirements.load(Ordering::Acquire), 1);
 }
