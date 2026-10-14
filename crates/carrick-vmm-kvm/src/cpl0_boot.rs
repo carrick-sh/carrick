@@ -1735,6 +1735,7 @@ impl ProductionCpuLease {
         &mut self,
         task: carrick_guest_arch::TaskIdentity,
         exit: &CarrierRunExit,
+        on_work: impl FnOnce(bool, bool),
     ) -> Result<Option<PhysicalProcessExit>, TrapError> {
         let CarrierRunExit::PhysicalDoorbell { port, .. } = exit else {
             return Err(fail("physical service requires a doorbell exit"));
@@ -1746,10 +1747,11 @@ impl ProductionCpuLease {
             ._custody
             .lock()
             .map_err(|_| fail("physical custody poisoned"))?;
+        let mut work_flags = None;
         let (exit, register_child, unregister_child) = self.cpu.with_stopped_vcpu(task, |vcpu| {
             let lease = StoppedCpuLease { cpu: slot, vcpu };
-            match *port {
-                OWNER_GRANT_PORT => {
+            match production_port(*port) {
+                Some(ProductionPort::OwnerGrant) => {
                     custody.owner_grant_crossings = custody
                         .owner_grant_crossings
                         .checked_add(1)
@@ -1757,7 +1759,7 @@ impl ProductionCpuLease {
                     custody.service_anonymous_grant(&lease)?;
                     Ok((None, None, None))
                 }
-                carrick_el1_abi::FORK_STOCK_PORT => {
+                Some(ProductionPort::ForkStock) => {
                     custody.owner_grant_crossings = custody
                         .owner_grant_crossings
                         .checked_add(1)
@@ -1765,7 +1767,7 @@ impl ProductionCpuLease {
                     let child_binding = custody.service_fork_stock(&lease)?;
                     Ok((None, child_binding, None))
                 }
-                carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT => {
+                Some(ProductionPort::ChildRetire) => {
                     custody.child_retire_crossings = custody
                         .child_retire_crossings
                         .checked_add(1)
@@ -1776,21 +1778,25 @@ impl ProductionCpuLease {
                     let retire_result = custody.service_child_retire(&lease);
                     Ok((None, None, Some((root_gpa, retire_result))))
                 }
-                carrick_core_abi::NATIVE_RUN_FAILURE_PORT => {
+                Some(ProductionPort::RunFailure) => {
                     let reason = custody.service_run_failure(&lease)?;
                     custody.run_failure_crossings = custody.run_failure_crossings
                         .checked_add(1)
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
                     Ok((Some(PhysicalProcessExit::RunFailed(reason)), None, None))
                 }
-                carrick_core_abi::NATIVE_ROOT_EXIT_PORT => {
+                Some(ProductionPort::RootExit) => {
                     custody.root_exit_crossings = custody
                         .root_exit_crossings
                         .checked_add(1)
                         .ok_or_else(|| fail("physical crossing counter exhausted"))?;
                     custody.service_root_exit(&lease).map(|status| (Some(PhysicalProcessExit::Exited(status)), None, None))
                 }
-                _ => {
+                Some(ProductionPort::Work) => {
+                    work_flags = Some(take_production_work_boundary(&custody.task(slot).linux)?);
+                    Ok((None, None, None))
+                }
+                None => {
                     let binding = custody.binding(slot);
                     Err(fail(format!(
                         "unexpected physical production port {port:#x}; outer fault active {}, address {:#x}, reason {}",
@@ -1811,7 +1817,81 @@ impl ProductionCpuLease {
         if let Some(PhysicalProcessExit::Exited(_) | PhysicalProcessExit::RunFailed(_)) = exit {
             self.cpu.clear_child_bindings()?;
         }
+        drop(custody);
+        if let Some((served, pending)) = work_flags {
+            on_work(served, pending);
+        }
         Ok(exit)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProductionPort {
+    OwnerGrant,
+    ForkStock,
+    ChildRetire,
+    RunFailure,
+    RootExit,
+    Work,
+}
+
+fn production_port(port: u16) -> Option<ProductionPort> {
+    match port {
+        OWNER_GRANT_PORT => Some(ProductionPort::OwnerGrant),
+        carrick_el1_abi::FORK_STOCK_PORT => Some(ProductionPort::ForkStock),
+        carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT => Some(ProductionPort::ChildRetire),
+        carrick_core_abi::NATIVE_RUN_FAILURE_PORT => Some(ProductionPort::RunFailure),
+        carrick_core_abi::NATIVE_ROOT_EXIT_PORT => Some(ProductionPort::RootExit),
+        WORK_PORT => Some(ProductionPort::Work),
+        _ => None,
+    }
+}
+
+fn take_production_work_boundary(
+    state: &carrick_personality_linux::abi::entry::LinuxTaskState,
+) -> Result<(bool, bool), TrapError> {
+    let boundary = state.take_served_boundary();
+    if matches!(
+        boundary,
+        Some(carrick_el1_abi::ServedBoundary::ReplayOriginal { .. })
+    ) {
+        return Err(fail("x86 work boundary cannot replay a completed syscall"));
+    }
+    let pending = state.pending_host_work.swap(0, Ordering::AcqRel) != 0;
+    if boundary.is_none() && !pending {
+        return Err(fail("x86 work port without owed boundary work"));
+    }
+    Ok((boundary.is_some(), pending))
+}
+
+#[cfg(test)]
+mod production_work_port_tests {
+    use super::*;
+
+    #[test]
+    fn completed_cpl0_work_has_a_production_boundary() {
+        assert_eq!(production_port(WORK_PORT), Some(ProductionPort::Work));
+    }
+
+    #[test]
+    fn work_boundary_consumes_only_the_stopped_tasks_flags_once() {
+        let stopped = CurrentTask::new();
+        let peer = CurrentTask::new();
+        stopped.linux.record_completed_with_work();
+        stopped.linux.mark_pending_host_work();
+        peer.linux.record_completed_with_work();
+        peer.linux.mark_pending_host_work();
+
+        assert_eq!(
+            take_production_work_boundary(&stopped.linux).unwrap(),
+            (true, true)
+        );
+        assert!(take_production_work_boundary(&stopped.linux).is_err());
+        assert!(peer.linux.has_pending_host_work());
+        assert_eq!(
+            take_production_work_boundary(&peer.linux).unwrap(),
+            (true, true)
+        );
     }
 }
 

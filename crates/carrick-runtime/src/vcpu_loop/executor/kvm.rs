@@ -705,10 +705,23 @@ impl PersistentExecutor for KvmPersistentExecutor {
                 TrapError::Hypervisor(format!("KVM stopped run boundary: {error}"))
             })?;
             match &stopped.exit {
-                CarrierRunExit::PhysicalDoorbell { .. } => {
-                    let status = self
-                        .physical
-                        .service_physical_doorbell(task, &stopped.exit)?;
+                CarrierRunExit::PhysicalDoorbell { port, .. } => {
+                    let binding = self.binding.as_ref().ok_or_else(|| {
+                        TrapError::Hypervisor("KVM doorbell lost task binding".into())
+                    })?;
+                    let kernel = binding.kernel_binding.kernel();
+                    if *port == carrick_x86::cpl0_entry::WORK_PORT {
+                        kernel.settle_thread_ledger();
+                    }
+                    let status = self.physical.service_physical_doorbell(
+                        task,
+                        &stopped.exit,
+                        |served, pending| {
+                            carrick_kernel::el1_delegation::deliver_boundary_wakes(
+                                kernel, served, pending,
+                            );
+                        },
+                    )?;
                     self.scheduler.poke_executor_control();
                     if let Some(status) = status {
                         self.publish_exit(status.into_initial_process_exit(exited))?;
