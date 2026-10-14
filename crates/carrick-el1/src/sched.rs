@@ -1,7 +1,8 @@
 //! Context switching, wait enrollment, timer expiration and CPU hardware.
 use carrick_el1_abi::{
     Aarch64ParkedContext, Counters, CurrentTask, El1ExitReason, GIC_KICK_INTID, GIC_RESCHED_INTID,
-    GIC_SPURIOUS_INTID, GIC_VTIMER_INTID, SlotId, ThreadIdentity, TrapFrame, Waker, ZoneTables,
+    GIC_SPURIOUS_INTID, GIC_VTIMER_INTID, RecordId, SlotId, ThreadIdentity, TrapFrame, Waker,
+    ZoneTables,
 };
 use carrick_sched_core::{IDLE_SPIN_NS, PREEMPT_SLICE_NS, ShortLockSpin, SwitchedIn, WakeEffects};
 use core::sync::atomic::Ordering;
@@ -19,6 +20,16 @@ pub trait ThreadCpu {
     fn save(&mut self, frame: &TrapFrame, ctx: &mut Aarch64ParkedContext);
     /// Make `ctx` the running thread: fill `frame` and load live state.
     fn load(&mut self, frame: &mut TrapFrame, ctx: &Aarch64ParkedContext);
+    /// ISA entry after a selected record is installed, before ERET.
+    fn resume_lifecycle(
+        &mut self,
+        _zone: &ZoneTables,
+        _task: &CurrentTask,
+        _slot: SlotId,
+        _record: RecordId,
+    ) -> ResumeAction {
+        ResumeAction::NoPending
+    }
     /// Install translation roots (`TTBR0_EL1`, `TTBR1_EL1`), effective for
     /// everything after the call.
     fn set_translation(&mut self, ttbr0: u64, ttbr1: u64);
@@ -50,6 +61,13 @@ pub trait ThreadCpu {
     fn spin(&mut self);
     /// This vCPU's `ICC_SGI1R_EL1` routing bits, from `MPIDR_EL1`.
     fn own_sgi_target(&self) -> u64;
+}
+
+/// Scheduler effect of the native owner resume checkpoint.
+pub enum ResumeAction {
+    NoPending,
+    Returned(carrick_guest_arch::NativeReturnWord),
+    Left,
 }
 
 /// Reads guest user memory.
@@ -336,10 +354,22 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             .linux
             .orig_arg0
             .store(ctx.native.x[0], Ordering::Relaxed);
-        if let Some(result) = switched.result {
-            frame.x[0] = result;
-        }
         publish_identity(self.task, rec.identity());
+        match self
+            .cpu
+            .resume_lifecycle(zone, self.task, slot, switched.record)
+        {
+            ResumeAction::Returned(result) => frame.x[0] = result.0,
+            ResumeAction::NoPending => {
+                if let Some(result) = switched.result {
+                    frame.x[0] = result;
+                }
+            }
+            ResumeAction::Left => {
+                self.leave_space();
+                return false;
+            }
+        }
         if zone.slot(slot).queued() != 0 {
             zone.slot(slot).restart_slice(self.cpu.now());
         }

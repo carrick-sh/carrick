@@ -24,6 +24,79 @@ use carrick_sched_core::{Aarch64ParkedContext, ThreadCtx, ZoneTables};
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+/// Scheduler CPU with the same owner checkpoint as the production ARM CPU.
+struct ResumeCpu<'a, 'b, X: ForkStockCrossing> {
+    inner: crate::sched::FakeCpu,
+    runtime: &'a NativeProcessRuntime<'b, Mm, Aarch64ParkedContext>,
+    source: BornInZoneSource<'b, Aarch64ParkedContext>,
+    task: &'b CurrentTask,
+    service: &'a mut Aarch64NativeProcessService<'b, X>,
+}
+
+impl<X: ForkStockCrossing> crate::sched::ThreadCpu for ResumeCpu<'_, '_, X> {
+    fn save(&mut self, frame: &carrick_el1_abi::TrapFrame, ctx: &mut Aarch64ParkedContext) {
+        self.inner.save(frame, ctx);
+    }
+    fn load(&mut self, frame: &mut carrick_el1_abi::TrapFrame, ctx: &Aarch64ParkedContext) {
+        self.inner.load(frame, ctx);
+    }
+    fn resume_lifecycle(
+        &mut self,
+        _: &ZoneTables<Aarch64ParkedContext>,
+        _: &CurrentTask,
+        _: SlotId,
+        record: carrick_el1_abi::RecordId,
+    ) -> crate::sched::ResumeAction {
+        match resume_selected(self.runtime, self.source, self.task, record, self.service) {
+            super::native_process_runtime::NativeResume::NoPending => {
+                crate::sched::ResumeAction::NoPending
+            }
+            super::native_process_runtime::NativeResume::Returned(result) => {
+                crate::sched::ResumeAction::Returned(carrick_guest_arch::NativeReturnWord(
+                    result.raw() as u64,
+                ))
+            }
+            super::native_process_runtime::NativeResume::Left(_) => {
+                crate::sched::ResumeAction::Left
+            }
+            super::native_process_runtime::NativeResume::Invalid => panic!("invalid owner resume"),
+        }
+    }
+    fn set_translation(&mut self, a: u64, b: u64) {
+        self.inner.set_translation(a, b);
+    }
+    fn invalidate_asid(&mut self, root: u64) {
+        self.inner.invalidate_asid(root);
+    }
+    fn now(&self) -> u64 {
+        self.inner.now()
+    }
+    fn freq(&self) -> u64 {
+        self.inner.freq()
+    }
+    fn set_timer(&mut self, deadline: Option<u64>) {
+        self.inner.set_timer(deadline);
+    }
+    fn send_sgi(&mut self, route: u64) {
+        self.inner.send_sgi(route);
+    }
+    fn ack_irq(&mut self) -> u32 {
+        self.inner.ack_irq()
+    }
+    fn end_irq(&mut self, intid: u32) {
+        self.inner.end_irq(intid);
+    }
+    fn wait_for_interrupt(&mut self) {
+        self.inner.wait_for_interrupt();
+    }
+    fn spin(&mut self) {
+        self.inner.spin();
+    }
+    fn own_sgi_target(&self) -> u64 {
+        self.inner.own_sgi_target()
+    }
+}
+
 const VA: u64 = 0x4000_0000;
 const IPA: u64 = 0x9000_0000;
 
@@ -931,7 +1004,19 @@ fn test_wait4_consumes_zombie_once_with_exact_status() {
 
 #[test]
 fn arm_terminal_child_retirement_and_parent_handback_once() {
+    arm_child_wait_wake(false);
+}
+
+#[test]
+fn arm_in_ring_wait4_wake_resumes_owner_before_eret() {
+    arm_child_wait_wake(true);
+}
+
+fn arm_child_wait_wake(in_ring: bool) {
     let fixture = Fixture::new(0x10000, asid(1));
+    if in_ring {
+        fixture.zone.spaces.set_idle_ttbr(0x30000);
+    }
     let source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
@@ -1001,9 +1086,11 @@ fn arm_terminal_child_retirement_and_parent_handback_once() {
         ));
         assert!(parent_entry.take_handoff_receipt().is_some());
     }
-    fixture
-        .zone
-        .unhome(fixture.slot, parent_binding.record.id, 1);
+    if !in_ring {
+        fixture
+            .zone
+            .unhome(fixture.slot, parent_binding.record.id, 1);
+    }
 
     // Now child exits with status 9
     let child_task = CurrentTask::new();
@@ -1039,7 +1126,9 @@ fn arm_terminal_child_retirement_and_parent_handback_once() {
             .unwrap();
         // No guest slot may place the parent: its executor is in the host
         // continuation, and the child is the last execution on this slot.
-        fixture.zone.publish_slot(fixture.slot, 0, Some(0), 1);
+        if !in_ring {
+            fixture.zone.publish_slot(fixture.slot, 0, Some(0), 1);
+        }
         let exit_outcome = child_entry.exit_group(9);
         assert_eq!(child_entry.take_run_failure(), None);
         assert!(matches!(
@@ -1079,44 +1168,80 @@ fn arm_terminal_child_retirement_and_parent_handback_once() {
     }
 
     // Now parent calls wait4 to consume the zombie
-    assert_eq!(crossing.handbacks.load(Ordering::Acquire), 1);
-    assert_eq!(
-        fixture.zone.record(parent_binding.record.id).claim(),
-        carrick_sched_core::Claim::Host {
-            seq: fixture
+    if in_ring {
+        assert_eq!(crossing.handbacks.load(Ordering::Acquire), 0);
+        assert_eq!(
+            fixture.zone.record(parent_binding.record.id).claim(),
+            carrick_sched_core::Claim::Queued {
+                slot: fixture.slot,
+                seq: fixture
+                    .zone
+                    .next_seq(parent_binding.record.id)
+                    .wrapping_sub(1)
+            }
+        );
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        let mut cpu = ResumeCpu {
+            inner: crate::sched::FakeCpu::default(),
+            runtime: &runtime,
+            source,
+            task: &fixture.task,
+            service: &mut service,
+        };
+        let counters = carrick_el1_abi::Counters::new();
+        assert_eq!(
+            (crate::sched::Sched {
+                handoff: None,
+                zone: fixture.zone,
+                slot: fixture.slot,
+                task: &fixture.task,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+                counters: &counters,
+            })
+            .run_next(&mut frame, 0),
+            crate::sched::Served::Returned { switched: true }
+        );
+        assert_eq!(frame.x[0], u64::from(child_pid));
+        assert_eq!(fixture.task.visible_pid(), Some(41));
+    } else {
+        assert_eq!(crossing.handbacks.load(Ordering::Acquire), 1);
+        assert_eq!(
+            fixture.zone.record(parent_binding.record.id).claim(),
+            carrick_sched_core::Claim::Host {
+                seq: fixture
+                    .zone
+                    .next_seq(parent_binding.record.id)
+                    .wrapping_sub(1)
+            }
+        );
+        fixture.zone.publish_slot(fixture.slot, 1, Some(0), 1);
+        fixture.zone.install_space(fixture.slot, 1).unwrap();
+        assert!(
+            fixture
                 .zone
-                .next_seq(parent_binding.record.id)
-                .wrapping_sub(1)
-        }
-    );
-    // Host reload uses the original continuation and restores execution capacity.
-    fixture.zone.publish_slot(fixture.slot, 1, Some(0), 1);
-    fixture.zone.install_space(fixture.slot, 1).unwrap();
-    assert!(
-        fixture
-            .zone
-            .place_from_host(parent_binding.record.id)
-            .is_some()
-    );
-    let parent_binding = runtime.task_binding(parent_key).unwrap();
-    activate(source, &fixture.task, &parent_binding);
-
-    let mut parent_entry = runtime
-        .enter(source, &fixture.task, parked, &mut service)
-        .unwrap();
-
-    let wait_outcome = parent_entry.resume_pending_wait().unwrap();
-
-    assert!(matches!(
-        wait_outcome,
-        LifecycleOutcome::Returned { result, .. } if result.raw() == child_pid as i64
-    ));
+                .place_from_host(parent_binding.record.id)
+                .is_some()
+        );
+        let parent_binding = runtime.task_binding(parent_key).unwrap();
+        activate(source, &fixture.task, &parent_binding);
+        let mut parent_entry = runtime
+            .enter(source, &fixture.task, parked, &mut service)
+            .unwrap();
+        assert!(matches!(
+            parent_entry.resume_pending_wait(),
+            Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == child_pid as i64
+        ));
+    }
     assert_eq!(
         status_storage,
         LinuxWaitStatus::from_wait_encoding(9 << 8).raw()
     );
 
     // Second wait on the consumed child must fail with ECHILD (error code -10)
+    let mut parent_entry = runtime
+        .enter(source, &fixture.task, parked, &mut service)
+        .unwrap();
     let re_wait = parent_entry.wait4(
         ProcessWaitPid::from_syscall_argument(child_pid as u64),
         status_va,
