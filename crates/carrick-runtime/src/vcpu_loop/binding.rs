@@ -1742,6 +1742,10 @@ where
             .control_slot()
             .publish_host_retirement(receipt);
         let page = context.lifecycle_page();
+        // An Open process can reuse a completed host-birth slot. Closing
+        // retains the address until Settled, so a concurrent ring reader
+        // never observes freed control storage.
+        page.release_adopted_host_birth(context.thread().control_slot() as *const _ as u64);
         if let Some((mm, address)) = page.exit_wait()
             && let Some(zone) = carrick_kernel::el1_zone::zone()
         {
@@ -2554,6 +2558,18 @@ where
                     ))
                 })?;
                 ops.abort(prepared_backend)?;
+                if matches!(
+                    error,
+                    carrick_kernel::kernel::KernelOperationError::HostBirthCapacity
+                ) {
+                    carrick_kernel::event_ring::rec_clone_refusal(
+                        parent_context,
+                        carrick_kernel::event_ring::CloneRefusalProducer::RuntimeReservation,
+                    );
+                    return Ok(PersistentHvpatchCloneAttempt::Complete(
+                        threads::CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EAGAIN),
+                    ));
+                }
                 return Err(RuntimeError::Configuration(format!(
                     "publish persistent HVPatch thread: {error}"
                 )));
@@ -4104,6 +4120,21 @@ where
         // EL1 still holds on-CPU mid-operation, and a suspension unloads it
         // (the reload then finds the slot still holding it).
         if !engine.el1_operation_suspended() {
+            if !self.phase.is_terminal_transition()
+                && self
+                    .state
+                    .service_kernel_context
+                    .as_ref()
+                    .is_some_and(|context| {
+                        context.thread().control_slot().host_exit_requested()
+                            && context.lifecycle_page().exit_wait().is_some()
+                    })
+            {
+                // A host-born member can be cancelled before its first EL1
+                // entry. Retire the exact kernel member, then publish the
+                // receipt through settle_persistent_thread_exit.
+                return self.drive_thread_exit(engine, control, 0);
+            }
             // Exec/exit can force a blocked vfork parent runnable solely so it can
             // retire its exact logical result. Do not resume the old continuation
             // or touch guest state after that terminal ownership transition.

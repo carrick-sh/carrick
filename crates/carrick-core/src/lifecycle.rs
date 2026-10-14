@@ -10,6 +10,10 @@ pub trait Lifecycle {
     fn entry_count(&self) -> usize;
     fn entry_word(&self, index: usize) -> Option<&AtomicEntry>;
     fn activity(&self) -> Option<&ThreadLedgerActivity>;
+    /// Host-born publications admitted before Closing but not yet visible.
+    fn host_claimed_count(&self) -> usize {
+        0
+    }
     // ---- gate ----
 
     fn gate(&self) -> GateState {
@@ -66,18 +70,19 @@ pub trait Lifecycle {
     /// Clone and exit admissions a host must drain after `close_for_fork`.
     /// `SeqCst` scan (second half of both claim/gate pairs).
     fn claimed_count(&self) -> usize {
-        (0..self.entry_count())
-            .filter(|&index| {
-                self.entry_word(index).is_some_and(|e| {
-                    matches!(
-                        unpack(e.load(Ordering::SeqCst)).1,
-                        EntryState::Claimed
-                            | EntryState::ExitingBorn
-                            | EntryState::ExitingPublished
-                    )
+        self.host_claimed_count()
+            + (0..self.entry_count())
+                .filter(|&index| {
+                    self.entry_word(index).is_some_and(|e| {
+                        matches!(
+                            unpack(e.load(Ordering::SeqCst)).1,
+                            EntryState::Claimed
+                                | EntryState::ExitingBorn
+                                | EntryState::ExitingPublished
+                        )
+                    })
                 })
-            })
-            .count()
+                .count()
     }
 
     // ---- live count ----
