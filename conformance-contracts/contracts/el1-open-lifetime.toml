@@ -6,14 +6,12 @@ semantic_authority = ["man 2 dup", "man 2 close", "man 2 fork", "Issue #329 and 
 fixture = "carrick-kernel:el1_delegation::tests::serial_host::file_seam_"
 scale_points = [1, 16, 512]
 rationale = "Host fd-map entries are non-owning views. Ring dup/fork acquire explicit references in the same generation-authenticated lifetime that owns the host functional-reference group. Closing that host group cannot elect recall while a ring reference lives. The last release retains cleanup custody and publishes one indexed handoff; recall demotes bytes without recycling a live open record. Real VFS fixtures observe one open record and one CAS per uncontended last-reference decision at all populations, with no fd-map census in that decision. FD-number lookup is separately outside this metric."
+# ABI-local budgets use the actual OpenReferenceWork observer: exactly one
+# record visit and one uncontended CAS at every scale, asserted by the fixture.
+# There is no global WorkScope observation for this reference decision.
+structural_budgets = []
 [bindings]
 vm_free = "carrick-kernel::el1_delegation::tests::serial_host::{file_seam_ring_duplicate_survives_last_host_reference,file_seam_final_ring_release_has_one_terminal_handoff_at_each_population,file_seam_fork_retirement_and_recall_preserve_exact_backing_custody}; carrick-el1-abi::open_lifetime::tests"
 [bindings.unresolved]
 embed_structural = "Director-owned full signed regression gate; the production non-Linux binding follows in F1b/F4."
 docker = "Linux dup/close/fork authority is public man pages; this slice's real-VFS proof targets internal reference custody. Neutral Open belongs to F4."
-[[structural_budgets]]
-kind = "exact"
-metric = "open_reference_records"
-value = 1
-layers = ["vm-free"]
-rationale = "Each observed release decision selects exactly its authenticated open record; generation and population are changed in one CAS word, independent of descriptor population."
