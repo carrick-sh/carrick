@@ -3,6 +3,8 @@
 
 use super::aarch64_process::{Aarch64NativeProcessService, ForkStockCrossing};
 #[cfg(test)]
+use super::aarch64_process::{admit_entry, registry, with_process_entry};
+#[cfg(test)]
 use super::aarch64_process::{observed_entry_address, process_record_for_call};
 #[cfg(test)]
 use super::native_process_runtime::NativeProcessService;
@@ -291,7 +293,7 @@ impl ForkStockCrossing for TestStockCrossing {
 
     fn cross_root_exit(&self, record_gpa: u64, _cpu: u64) -> Result<(), NativeProcessError> {
         // SAFETY: the VM-free crossing receives the caller's live exit record.
-        let exit = unsafe { &*(record_gpa as *const carrick_el1_abi::NativeRootExit) };
+        let exit = unsafe { &*(record_gpa as *const carrick_core_abi::NativeRootExit) };
         self.root_exit_status
             .store(exit.words[5], Ordering::Relaxed);
         self.root_exits.fetch_add(1, Ordering::Relaxed);
@@ -420,6 +422,7 @@ impl Fixture {
             control,
         }
     }
+    #[cfg(test)]
     fn enter<R>(
         &'static self,
         control: &'static carrick_el1_abi::ThreadControlSlot,
@@ -2167,11 +2170,13 @@ fn arm_owned_raw_exit_retires_only_one_of_two_live_threads() {
     assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
 }
 
+#[cfg(test)]
 fn fixture_ttbr0(fixture: &Fixture) -> u64 {
     (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw()
 }
 
 /// One production ARM syscall through the exact adapter the vector uses.
+#[cfg(test)]
 fn arm_call(
     fixture: &'static Fixture,
     control: &'static ThreadControlSlot,
@@ -2206,6 +2211,7 @@ fn arm_call(
     )
 }
 
+#[cfg(test)]
 fn arm_route_action(
     fixture: &Fixture,
     route: carrick_personality_linux::dispatch::CompletionRoute,
@@ -2221,6 +2227,7 @@ fn arm_route_action(
     )
 }
 
+#[cfg(test)]
 fn run_as(fixture: &Fixture, tid: i32, generation: u64, serial: u64, control: &ThreadControlSlot) {
     fixture
         .task
@@ -2235,12 +2242,14 @@ fn run_as(fixture: &Fixture, tid: i32, generation: u64, serial: u64, control: &T
         .publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
 }
 
+#[cfg(test)]
 fn run_as_leader(fixture: &Fixture) {
     run_as(fixture, 41, 11, 101, fixture.control);
 }
 
 /// A sibling the host cloned because the in-ring pool was empty: an issued
 /// execution binding and a retained control slot, but no pool entry.
+#[cfg(test)]
 fn host_born_sibling(fixture: &Fixture, visible_tid: u32) -> &'static ThreadControlSlot {
     let control = Box::leak(Box::new(ThreadControlSlot::new()));
     control.reset_for_host_birth(carrick_el1_abi::BlockedMask(0));
@@ -2250,6 +2259,7 @@ fn host_born_sibling(fixture: &Fixture, visible_tid: u32) -> &'static ThreadCont
     control
 }
 
+#[cfg(test)]
 fn leader_sees_thread(
     fixture: &'static Fixture,
     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
@@ -2547,10 +2557,7 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
             "{siblings:?}"
         );
         assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
-        assert_eq!(
-            service.crossing.root_exit_status.load(Ordering::Acquire),
-            LinuxWaitStatus::exited(7).raw() as u64
-        );
+        assert_eq!(service.crossing.root_exit_status.load(Ordering::Acquire), 7);
         // Only the caller's membership is released. Every sibling, owned or
         // not, keeps its census until the host's process terminal (entered
         // by the root crossing) retires it, and no address space is retired
