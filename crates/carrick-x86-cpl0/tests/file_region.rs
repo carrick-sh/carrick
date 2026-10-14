@@ -139,7 +139,7 @@ fn file_region_stdio_parity_and_closed_descriptor_stays_closed() {
             }
         );
     }
-    let change = close_host_binding(tables.fd_map(), 51, 1).expect("close stdout");
+    let change = close_host_binding(tables.fd_map(), tables.opens(), 51, 1).expect("close stdout");
     assert!(change.release.is_some());
     admit_stdio(
         tables.fd_map(),
@@ -184,7 +184,7 @@ fn file_region_record_beyond_fifteen_uses_shared_capacity() {
         assert!(open.is_bound_to(&tables.objects()[index as usize]));
     }
     assert!(
-        close_host_binding(tables.fd_map(), 51, 19)
+        close_host_binding(tables.fd_map(), tables.opens(), 51, 19)
             .expect("close beyond 15")
             .release
             .is_some()
@@ -228,10 +228,10 @@ fn file_region_fork_dup_lookup_and_retire_preserve_live_parent() {
         51,
         [true; 3],
     );
-    assert!(fork_fd_map(tables.fd_map(), 51, 52));
+    assert!(fork_fd_map(tables.fd_map(), tables.opens(), 51, 52));
     for table in [51, 52] {
         assert_eq!(
-            dup_host_binding(tables.fd_map(), table, 1, 0, 1024, false)
+            dup_host_binding(tables.fd_map(), tables.opens(), table, 1, 0, 1024, false)
                 .expect("dup stdout")
                 .fd,
             3
@@ -245,7 +245,7 @@ fn file_region_fork_dup_lookup_and_retire_preserve_live_parent() {
     assert!(
         open.is_bound_to(&tables.objects()[open.inode_handle.load(Ordering::Acquire) as usize - 1])
     );
-    retire_fd_map(tables.fd_map(), 52);
+    retire_fd_map(tables.fd_map(), tables.opens(), 52);
     assert_eq!(
         tables.fd_map()[child.1].incarnation.load(Ordering::Acquire),
         0
