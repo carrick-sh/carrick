@@ -3298,8 +3298,9 @@ pub(crate) mod tests {
         assert_eq!(*returns.lock(), vec![child_pid]);
         assert!(job.state.syscall_completion.is_idle());
 
-        let child_id = carrick_kernel::kernel::TaskId::for_root_bootstrap(child_pid as i32)
-            .expect("child task id");
+        let child_id =
+            carrick_personality_linux::identity::task_id_from_linux_pid(child_pid as i32)
+                .expect("child task id");
         let child_context = root
             .kernel()
             .context(
@@ -6851,8 +6852,9 @@ pub(crate) mod tests {
         };
         assert_eq!(submitter.join().expect("exec submitter"), Ok(capability));
 
-        let child_id = carrick_kernel::kernel::TaskId::for_root_bootstrap(child_pid as i32)
-            .expect("child task id");
+        let child_id =
+            carrick_personality_linux::identity::task_id_from_linux_pid(child_pid as i32)
+                .expect("child task id");
         let child_context = root
             .kernel()
             .context(

@@ -1473,7 +1473,7 @@ impl BlockedContinuation {
                 let selector = match target {
                     None => ChildSelector::AnyChildOf(parent_task),
                     Some(pid) => {
-                        let id = crate::kernel::TaskId::from_abi_positive(pid)
+                        let id = carrick_personality_linux::identity::task_id_from_linux_pid(pid)
                             .map_err(|_| ContinuationBuildError::StaleChildSelector)?;
                         let kernel = kernel
                             .as_ref()

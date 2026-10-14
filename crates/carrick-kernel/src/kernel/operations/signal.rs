@@ -1867,7 +1867,8 @@ mod tests {
         assert_eq!(
             kernel.attach_task_for_ptrace(
                 &tracer,
-                TaskId::from_abi_positive(999_999).expect("unused id")
+                carrick_personality_linux::identity::task_id_from_linux_pid(999_999)
+                    .expect("unused id")
             ),
             Err(carrick_abi::LINUX_ESRCH),
         );
@@ -2797,7 +2798,8 @@ mod tests {
         let child_id = fork_child(&kernel, &root, "exiting target", 713);
         let sigterm = LinuxSignal::for_signal_number(15).expect("SIGTERM");
 
-        let absent = TaskId::from_abi_positive(9_999).expect("unused id");
+        let absent =
+            carrick_personality_linux::identity::task_id_from_linux_pid(9_999).expect("unused id");
         assert!(
             !kernel.post_signal_to_task(absent, sigterm, None),
             "a task that does not exist takes no signal"

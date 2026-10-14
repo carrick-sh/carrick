@@ -10,9 +10,6 @@ use std::sync::{Arc, Weak};
 use arc_swap::ArcSwap;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 
-#[cfg(test)]
-use crate::kernel::ids::TaskId;
-
 use carrick_abi::keyring::{KeyRequestDefault, KeySerial};
 use carrick_abi::{LINUX_RLIM_INFINITY, LinuxResource, LinuxRlimit, SigSet};
 use carrick_fatal::carrick_fatal;
@@ -2409,7 +2406,8 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let ids = ObjectIdRegistry::new();
-            let task_id = TaskId::for_root_bootstrap(100).expect("task ID");
+            let task_id =
+                carrick_personality_linux::identity::task_id_from_linux_pid(100).expect("task ID");
             let key = TaskKey {
                 id: task_id,
                 serial: ids.task_serial().expect("task serial"),

@@ -1727,6 +1727,112 @@ mod tests {
         assert!(!old.contains("X86InitialBoot"), "no old-owner facade");
     }
 
+    /// A compile witness using only the public neutral personality surface.
+    /// This personality has no process groups, sessions or Linux wait classes.
+    #[test]
+    fn personality_without_process_groups_compiles() {
+        use carrick_personality_api::{
+            Personality, TaskKey, TaskRusage, TaskSerial, TerminationStatus, ThreadPointerRegister,
+        };
+        struct Ungrouped;
+        impl Personality for Ungrouped {
+            fn name(&self) -> &'static str {
+                "ungrouped"
+            }
+            fn thread_pointer_register(&self) -> ThreadPointerRegister {
+                ThreadPointerRegister::FS
+            }
+            fn thread_pointer_register_for_task(&self, _: TaskKey) -> ThreadPointerRegister {
+                self.thread_pointer_register()
+            }
+        }
+        fn accepts_personality(
+            _: &dyn Personality,
+            _: Option<TaskKey>,
+            _: Option<TaskSerial>,
+            _: TaskRusage,
+            status: TerminationStatus,
+        ) -> u32 {
+            status.code()
+        }
+        assert_eq!(
+            accepts_personality(
+                &Ungrouped,
+                None,
+                None,
+                TaskRusage::default(),
+                TerminationStatus::exited(0xdeadbeef)
+            ),
+            0xdeadbeef
+        );
+    }
+
+    #[test]
+    fn credential_ids_have_one_linux_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let linux =
+            fs::read_to_string(repo.join("crates/carrick-personality-linux/src/identity.rs"))
+                .unwrap();
+        let neutral =
+            fs::read_to_string(repo.join("crates/carrick-sched-core/src/process.rs")).unwrap();
+        for name in ["TaskUid", "TaskGid"] {
+            let declaration = format!("pub struct {name}(");
+            assert!(linux.contains(&declaration), "Linux must own {name}");
+            assert!(
+                !neutral.contains(&declaration),
+                "neutral owner must release {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn personality_api_has_only_neutral_process_exports() {
+        fn quote_use_tree(tree: &syn::UseTree) -> String {
+            match tree {
+                syn::UseTree::Path(path) => {
+                    format!("{} {}", path.ident, quote_use_tree(&path.tree))
+                }
+                syn::UseTree::Name(name) => name.ident.to_string(),
+                syn::UseTree::Rename(name) => format!("{} {}", name.ident, name.rename),
+                syn::UseTree::Glob(_) => panic!("wildcard exports conceal personality ownership"),
+                syn::UseTree::Group(group) => group
+                    .items
+                    .iter()
+                    .map(quote_use_tree)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            }
+        }
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let source =
+            fs::read_to_string(repo.join("crates/carrick-personality-api/src/lib.rs")).unwrap();
+        let items = syn::parse_file(&source).unwrap();
+        for item in items.items {
+            if let syn::Item::Use(item) = item {
+                let tree = quote_use_tree(&item.tree);
+                for forbidden in [
+                    "TaskId",
+                    "ProcessGroupId",
+                    "SessionId",
+                    "TaskIdentity",
+                    "TaskLifecycle",
+                    "TerminationKind",
+                    "WaitChildClass",
+                    "WaitMode",
+                    "WaitTarget",
+                    "Zombie",
+                ] {
+                    assert!(
+                        !tree
+                            .split(|c: char| !c.is_alphanumeric() && c != '_')
+                            .any(|name| name == forbidden),
+                        "personality API exposes {forbidden}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn terminal_run_transport_has_one_neutral_owner() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

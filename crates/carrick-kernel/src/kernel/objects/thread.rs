@@ -3234,7 +3234,7 @@ fn altstack_from_slot(slot: AltStack) -> Option<LinuxSigaltstack> {
 mod tests {
     use super::*;
     use crate::kernel::container::{Container, LaunchContext, RunId};
-    use crate::kernel::ids::{ChildExitSignal, ObjectIdRegistry, TaskId};
+    use crate::kernel::ids::{ChildExitSignal, ObjectIdRegistry};
     use crate::kernel::objects::process::Mm;
     use crate::kernel::objects::signal::Sighand;
     use crate::kernel::objects::{Credentials, FileTable, FsContext, TaskIdentity};
@@ -3248,7 +3248,8 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let ids = ObjectIdRegistry::new();
-            let task_id = TaskId::for_root_bootstrap(100).expect("task ID");
+            let task_id =
+                carrick_personality_linux::identity::task_id_from_linux_pid(100).expect("task ID");
             let key = TaskKey {
                 id: task_id,
                 serial: ids.task_serial().expect("task serial"),

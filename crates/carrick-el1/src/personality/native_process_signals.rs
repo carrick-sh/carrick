@@ -378,11 +378,11 @@ impl<T, M: BlockedMaskSource> ExitSignalSource for NativeExitSignals<T, M> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use carrick_sched_core::process::{TaskId, TaskSerial};
+    use carrick_sched_core::process::TaskSerial;
     use carrick_signal_core::policy::{Disposition, HandlerAddress};
     fn key(raw: i32, serial: u64) -> TaskKey {
         TaskKey {
-            id: TaskId::from_abi_positive(raw).unwrap(),
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(raw).unwrap(),
             serial: TaskSerial::from_raw_u64(serial).unwrap(),
         }
     }

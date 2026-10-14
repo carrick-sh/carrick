@@ -414,6 +414,7 @@ version = "0.1.0"
 dependencies = [
  "carrick-abi",
  "carrick-observability",
+ "carrick-personality-api",
  "proc-macro2",
  "serde",
  "serde_json",
@@ -854,7 +855,6 @@ dependencies = [
  "carrick-core",
  "carrick-core-abi",
  "carrick-guest-arch",
- "carrick-sched-core",
 ]
 
 [[package]]

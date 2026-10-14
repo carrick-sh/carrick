@@ -1493,7 +1493,7 @@ mod tests {
 
     fn root_key() -> carrick_kernel::kernel::TaskKey {
         carrick_kernel::kernel::TaskKey {
-            id: carrick_kernel::kernel::TaskId::for_root_bootstrap(40).unwrap(),
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(40).unwrap(),
             serial: carrick_kernel::kernel::TaskSerial::from_registry_allocation(
                 NonZeroU64::new(1).unwrap(),
             ),

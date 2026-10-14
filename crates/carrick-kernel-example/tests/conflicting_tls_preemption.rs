@@ -257,11 +257,11 @@ fn test_personality_configured_thread_pointer_registers() {
     let thread_42 = ThreadKey::new(42, 1);
     let thread_43 = ThreadKey::new(43, 1);
     let task_100 = TaskKey {
-        id: TaskId::from_abi_positive(100).unwrap(),
+        id: TaskId::from_registry_allocation(core::num::NonZeroI32::new(100).unwrap()),
         serial: TaskSerial::from_registry_allocation(core::num::NonZeroU64::new(1).unwrap()),
     };
     let task_101 = TaskKey {
-        id: TaskId::from_abi_positive(101).unwrap(),
+        id: TaskId::from_registry_allocation(core::num::NonZeroI32::new(101).unwrap()),
         serial: TaskSerial::from_registry_allocation(core::num::NonZeroU64::new(1).unwrap()),
     };
     custom_personality.configure_thread(thread_42, ThreadPointerRegister::FS);

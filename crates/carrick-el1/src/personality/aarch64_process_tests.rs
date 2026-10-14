@@ -27,7 +27,7 @@ use carrick_personality_linux::lifecycle::{LifecycleOutcome, ProcessNative};
 use carrick_personality_linux::lifecycle::{LinuxWaitOptions, LinuxWaitStatus, ProcessWaitPid};
 #[cfg(test)]
 use carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK;
-use carrick_sched_core::process::{TaskId, TaskKey, TaskSerial};
+use carrick_sched_core::process::{TaskKey, TaskSerial};
 use carrick_sched_core::{Aarch64ParkedContext, ThreadCtx, ZoneTables};
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -669,7 +669,7 @@ fn test_fork_child_gets_distinct_root_and_x0_zero() {
     assert_eq!(child_pid, 42);
 
     let parent_key = TaskKey {
-        id: TaskId::from_abi_positive(41).unwrap(),
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
         serial: TaskSerial::from_raw_u64(11).unwrap(),
     };
     let child_key = runtime.namespace_child_key(parent_key, child_pid).unwrap();
@@ -753,7 +753,7 @@ fn plain_fork_owns_an_independent_fd_table() {
     assert_eq!(child_pid, 42);
 
     let parent_key = TaskKey {
-        id: TaskId::from_abi_positive(41).unwrap(),
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
         serial: TaskSerial::from_raw_u64(11).unwrap(),
     };
     let child_key = runtime.namespace_child_key(parent_key, child_pid).unwrap();
@@ -937,7 +937,7 @@ fn test_wait4_consumes_zombie_once_with_exact_status() {
     }
 
     let parent_key = TaskKey {
-        id: TaskId::from_abi_positive(41).unwrap(),
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
         serial: TaskSerial::from_raw_u64(11).unwrap(),
     };
     let parent_binding = runtime.task_binding(parent_key).unwrap();
@@ -1105,7 +1105,7 @@ fn arm_child_wait_wake(in_ring: bool, sibling: bool) {
     }
 
     let parent_key = TaskKey {
-        id: TaskId::from_abi_positive(41).unwrap(),
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
         serial: TaskSerial::from_raw_u64(11).unwrap(),
     };
     let parent_binding = runtime.task_binding(parent_key).unwrap();
@@ -1610,7 +1610,7 @@ pub fn with_native_file_fork(
     };
     assert!(result.raw() > 0, "native fork refused: {}", result.raw());
     let parent_key = TaskKey {
-        id: TaskId::from_abi_positive(41).unwrap(),
+        id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
         serial: TaskSerial::from_raw_u64(11).unwrap(),
     };
     let parent = runtime.task_binding(parent_key).unwrap();

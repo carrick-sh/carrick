@@ -270,7 +270,7 @@ mod tests {
     type Registry = BirthRegistry<(), Live, TaskKey, TaskKey, u32, (), (), (), Failure>;
     fn key(id: i32, serial: u64) -> TaskKey {
         TaskKey {
-            id: TaskId::from_abi_positive(id).unwrap(),
+            id: TaskId::from_registry_allocation(core::num::NonZeroI32::new(id).unwrap()),
             serial: TaskSerial::from_raw_u64(serial).unwrap(),
         }
     }

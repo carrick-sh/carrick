@@ -3,6 +3,19 @@ use crate::abi::entry::SyscallResult;
 use crate::lifecycle::UserCopy;
 use carrick_guest_arch::UserVa;
 
+/// Validate a Linux positive PID/TID view before binding an internal task identity.
+/// The internal identity itself is allocated and owned by the neutral registry.
+pub fn task_id_from_linux_pid(
+    raw: i32,
+) -> Result<carrick_sched_core::process::TaskId, carrick_sched_core::process::InvalidLinuxId> {
+    use carrick_sched_core::process::{InvalidLinuxId, TaskId};
+    let value = core::num::NonZeroI32::new(raw).ok_or(InvalidLinuxId::Zero)?;
+    if raw < 0 {
+        return Err(InvalidLinuxId::Negative(raw));
+    }
+    Ok(TaskId::from_registry_allocation(value))
+}
+
 pub const EPERM: i64 = -1;
 pub const ESRCH: i64 = -3;
 pub const EACCES: i64 = -13;

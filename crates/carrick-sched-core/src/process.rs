@@ -70,7 +70,16 @@ macro_rules! serial_id {
     };
 }
 
-linux_i32_id!(TaskId);
+/// Internal registry identity, independent of a personality's visible IDs.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct TaskId(NonZeroI32);
+
+impl TaskId {
+    pub const fn raw(self) -> i32 {
+        self.0.get()
+    }
+}
 linux_i32_id!(ProcessGroupId);
 linux_i32_id!(SessionId);
 serial_id!(TaskSerial);
@@ -158,10 +167,6 @@ impl ChildExitSignal {
 impl TaskId {
     pub const fn from_registry_allocation(raw: NonZeroI32) -> Self {
         Self(raw)
-    }
-
-    pub fn for_root_bootstrap(raw: i32) -> Result<Self, InvalidLinuxId> {
-        Self::from_abi_positive(raw)
     }
 }
 

@@ -471,7 +471,7 @@ impl SyscallDispatcher {
         let namespace_id = u32::try_from(pid).ok()?;
         let host = crate::namespace::pid::ns_to_kernel_for(context, namespace_id)?;
         let host = i32::try_from(host).ok()?;
-        let task = crate::kernel::TaskId::from_abi_positive(host).ok()?;
+        let task = carrick_personality_linux::identity::task_id_from_linux_pid(host).ok()?;
         let task = process.kernel_graph().live_task(task)?;
         (task.container().id() == context.container().id()).then_some(task)
     }
@@ -485,7 +485,7 @@ impl SyscallDispatcher {
         let namespace_id = u32::try_from(pid).ok()?;
         let pid = crate::namespace::pid::ns_to_kernel_for(context, namespace_id)
             .and_then(|pid| i32::try_from(pid).ok())?;
-        let Ok(task) = crate::kernel::TaskId::from_abi_positive(pid) else {
+        let Ok(task) = carrick_personality_linux::identity::task_id_from_linux_pid(pid) else {
             return None;
         };
         let kernel = process.kernel_graph();

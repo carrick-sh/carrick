@@ -264,7 +264,10 @@ mod tests {
 
     #[test]
     fn linux_ids_reject_zero_and_negative_values() {
-        assert_eq!(TaskId::from_abi_positive(0), Err(InvalidLinuxId::Zero));
+        assert_eq!(
+            carrick_personality_linux::identity::task_id_from_linux_pid(0),
+            Err(InvalidLinuxId::Zero)
+        );
         assert_eq!(
             LinuxTid::from_abi_positive(-2),
             Err(InvalidLinuxId::Negative(-2))
@@ -278,7 +281,8 @@ mod tests {
 
     #[test]
     fn group_and_session_ids_preserve_the_leader_domain() {
-        let leader = TaskId::for_root_bootstrap(42).expect("positive leader");
+        let leader = carrick_personality_linux::identity::task_id_from_linux_pid(42)
+            .expect("positive leader");
 
         assert_eq!(LinuxTid::for_task_leader(leader).raw(), 42);
         assert_eq!(ProcessGroupId::from_leader(leader).raw(), 42);

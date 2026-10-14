@@ -1547,9 +1547,9 @@ impl<'a> FsView<'a> {
         let target_process_provider = || {
             let visible_pid = target_pid?;
             let internal_pid = crate::namespace::pid::ns_to_kernel_for(context, visible_pid)?;
-            let task_id = i32::try_from(internal_pid)
-                .ok()
-                .and_then(|pid| crate::kernel::TaskId::from_abi_positive(pid).ok())?;
+            let task_id = i32::try_from(internal_pid).ok().and_then(|pid| {
+                carrick_personality_linux::identity::task_id_from_linux_pid(pid).ok()
+            })?;
             let process = hvpatch_process.as_ref()?;
             let registry = process.kernel_graph().registry();
             if let Some(live) = registry

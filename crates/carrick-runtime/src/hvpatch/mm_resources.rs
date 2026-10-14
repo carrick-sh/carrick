@@ -1461,11 +1461,11 @@ mod tests {
     use std::num::NonZeroU64;
 
     use super::*;
-    use carrick_kernel::kernel::{LinuxTid, TaskId, TaskSerial, ThreadKey, ThreadSerial};
+    use carrick_kernel::kernel::{LinuxTid, TaskSerial, ThreadKey, ThreadSerial};
 
     fn task(raw: i32, serial: u64) -> TaskKey {
         TaskKey {
-            id: TaskId::for_root_bootstrap(raw).unwrap(),
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(raw).unwrap(),
             serial: TaskSerial::from_registry_allocation(NonZeroU64::new(serial).unwrap()),
         }
     }

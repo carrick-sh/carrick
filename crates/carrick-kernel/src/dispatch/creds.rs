@@ -137,7 +137,9 @@ fn resolve_prio_process_target<M: CurrentMmMemory>(
             .ok()
             .and_then(|who| crate::namespace::pid::ns_to_kernel_for(cx.kernel, who))
             .and_then(|task| i32::try_from(task).ok())
-            .and_then(|task| crate::kernel::TaskId::from_abi_positive(task).ok());
+            .and_then(|task| {
+                carrick_personality_linux::identity::task_id_from_linux_pid(task).ok()
+            });
         return match (
             this.guest_process_target(cx.kernel, who)
                 .and_then(|t| t.euid()),
@@ -696,7 +698,7 @@ impl SyscallDispatcher {
                             .ok()
                             .and_then(|who| crate::namespace::pid::ns_to_kernel_for(cx.kernel, who))
                             .and_then(|leader| i32::try_from(leader).ok())
-                            .and_then(|leader| crate::kernel::TaskId::from_abi_positive(leader).ok())
+                            .and_then(|leader| carrick_personality_linux::identity::task_id_from_linux_pid(leader).ok())
                         {
                             Some(leader) => crate::kernel::ProcessGroupId::from_leader(leader),
                             None => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),
@@ -820,7 +822,7 @@ impl SyscallDispatcher {
                             .ok()
                             .and_then(|who| crate::namespace::pid::ns_to_kernel_for(cx.kernel, who))
                             .and_then(|leader| i32::try_from(leader).ok())
-                            .and_then(|leader| crate::kernel::TaskId::from_abi_positive(leader).ok())
+                            .and_then(|leader| carrick_personality_linux::identity::task_id_from_linux_pid(leader).ok())
                         {
                             Some(leader) => crate::kernel::ProcessGroupId::from_leader(leader),
                             None => return Ok(DispatchOutcome::errno(LINUX_ESRCH)),

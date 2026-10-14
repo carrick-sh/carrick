@@ -603,7 +603,7 @@ pub fn get_container_auditors(container_id: carrick_hal::ContainerId) -> Arc<Aud
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::ids::{TaskId, TaskSerial};
+    use crate::kernel::ids::TaskSerial;
     use crate::kernel::objects::{ExecutionGeneration, ExecutorId, LinuxWaitStatus, TaskKey};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -739,7 +739,7 @@ mod tests {
 
     fn sample_task_key(pid: i32, serial: u64) -> TaskKey {
         TaskKey {
-            id: TaskId::from_abi_positive(pid).unwrap(),
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(pid).unwrap(),
             serial: TaskSerial::from_raw_u64(serial).unwrap(),
         }
     }
