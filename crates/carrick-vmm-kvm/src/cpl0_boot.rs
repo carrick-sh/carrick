@@ -1871,7 +1871,10 @@ mod production_work_port_tests {
 
     #[test]
     fn completed_cpl0_work_has_a_production_boundary() {
-        assert!(matches!(production_port(WORK_PORT), Some(ProductionPort::Work)));
+        assert!(matches!(
+            production_port(WORK_PORT),
+            Some(ProductionPort::Work)
+        ));
     }
 
     #[test]
