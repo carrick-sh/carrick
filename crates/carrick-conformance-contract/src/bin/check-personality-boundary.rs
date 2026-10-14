@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use carrick_conformance_contract::personality_boundary::{
-    BoundaryConfig, check_substrate_boundary,
+    BoundaryConfig, check_carrier_root_exit_transport, check_substrate_boundary,
 };
 
 fn parse_args() -> Result<(PathBuf, BoundaryConfig), String> {
@@ -45,6 +45,11 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    if let Err(err) = check_carrier_root_exit_transport(&root) {
+        eprintln!("{err}");
+        std::process::exit(1);
+    }
 
     match check_substrate_boundary(&root, &config) {
         Ok(reports) => {

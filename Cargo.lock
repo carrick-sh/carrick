@@ -781,6 +781,7 @@ dependencies = [
  "carrick-abi",
  "carrick-conformance-contract",
  "carrick-core",
+ "carrick-core-abi",
  "carrick-el1-abi",
  "carrick-guest-arch",
  "carrick-guest-mem",
@@ -1206,7 +1207,6 @@ dependencies = [
  "carrick-guest-arch",
  "carrick-mmu-core",
  "carrick-personality-api",
- "carrick-personality-linux",
  "carrick-sched-core",
 ]
 

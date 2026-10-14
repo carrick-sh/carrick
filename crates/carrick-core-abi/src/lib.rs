@@ -29,3 +29,6 @@ pub use prepare_stock::*;
 
 mod executable_publication;
 pub use executable_publication::*;
+
+mod root_exit;
+pub use root_exit::*;

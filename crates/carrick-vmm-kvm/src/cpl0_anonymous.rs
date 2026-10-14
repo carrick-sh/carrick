@@ -36,7 +36,7 @@ pub(super) const CPL0_CARRIER_PORTS: [u16; 19] = [
     carrick_x86::cpl0_scheduler::PROGRESS_RETURN_PORT,
     carrick_x86::cpl0_scheduler::PROGRESS_DONE_PORT,
     carrick_el1_abi::FORK_STOCK_PORT,
-    carrick_el1_abi::NATIVE_ROOT_EXIT_PORT,
+    carrick_core_abi::NATIVE_ROOT_EXIT_PORT,
     carrick_el1_abi::NATIVE_PEER_READY_PORT,
     carrick_core_abi::NATIVE_RUN_FAILURE_PORT,
     carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT,
@@ -650,11 +650,11 @@ impl Cpl0HostCustody {
     pub(super) fn service_root_exit(
         &self,
         lease: &StoppedCpuLease<'_>,
-    ) -> Result<carrick_personality_linux::lifecycle::LinuxWaitStatus, TrapError> {
+    ) -> Result<carrick_sched_core::process::TerminationStatus, TrapError> {
         let execution = self.physical_execution(lease)?;
         // SAFETY: the root exit record consists of eight fully initialized u64s.
         let (_, record) = unsafe {
-            self.read_stack_record::<carrick_el1_abi::NativeRootExit>(
+            self.read_stack_record::<carrick_core_abi::NativeRootExit>(
                 lease,
                 execution.context,
                 lease.vcpu.get_gpr(X86Reg::Rax)?,
