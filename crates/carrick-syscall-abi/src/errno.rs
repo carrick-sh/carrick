@@ -60,6 +60,7 @@ pub const LINUX_E2BIG: LinuxErrno = LinuxErrno::new(7);
 pub const LINUX_EBADF: LinuxErrno = LinuxErrno::new(9);
 pub const LINUX_ECHILD: LinuxErrno = LinuxErrno::new(10);
 pub const LINUX_EAGAIN: LinuxErrno = LinuxErrno::new(11);
+pub const LINUX_ENOMEM: LinuxErrno = LinuxErrno::new(12);
 pub const LINUX_EACCES: LinuxErrno = LinuxErrno::new(13);
 pub const LINUX_EFAULT: LinuxErrno = LinuxErrno::new(14);
 pub const LINUX_EEXIST: LinuxErrno = LinuxErrno::new(17);
