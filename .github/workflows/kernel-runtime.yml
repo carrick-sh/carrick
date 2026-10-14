@@ -25,10 +25,52 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # Check if a prior merge_group run for this exact commit already passed.
+  # Every merge-queue landing rebase-merges onto main at the exact SHA its
+  # merge group verified. If that run succeeded, skip the duplicate hardware run.
+  check-merge-group:
+    name: Check for prior merge-group pass
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+      run-id: ${{ steps.check.outputs.run-id }}
+    steps:
+      - name: Query prior successful merge_group run
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! res=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/kernel-runtime.yml/runs?event=merge_group&head_sha=$GITHUB_SHA&status=success" \
+              --jq '{count: .total_count, run_id: (.workflow_runs[0].id // "")}' 2>/dev/null); then
+            echo "GitHub API query failed; continuing with full run"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "run-id=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          count=$(jq -r '.count // 0' <<< "$res" 2>/dev/null || echo 0)
+          run_id=$(jq -r '.run_id // ""' <<< "$res" 2>/dev/null || echo "")
+          if [ "$count" -gt 0 ] 2>/dev/null && [ -n "$run_id" ]; then
+            echo "Found successful merge_group run $run_id for $GITHUB_SHA; skipping duplicate hardware run"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
+          else
+            echo "No prior successful merge_group run found for $GITHUB_SHA; running trusted hardware jobs"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "run-id=" >> "$GITHUB_OUTPUT"
+          fi
+
   signed-fixtures:
     name: Linux ARM64 · exact-SHA signed fixtures
+    needs: [check-merge-group]
     if: >-
-      ${{ vars.CARRICK_SELF_HOSTED == 'true' &&
+      ${{ !cancelled() &&
+          needs.check-merge-group.outputs.skip != 'true' &&
+          vars.CARRICK_SELF_HOSTED == 'true' &&
           (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
@@ -348,8 +390,11 @@ jobs:
   # queue refs, and fork PR code must not reach Willow either.
   kvm-tests:
     name: KVM · x86 kvm-lane tests
+    needs: [check-merge-group]
     if: >-
-      ${{ vars.CARRICK_GCP_KVM == 'true' && vars.CARRICK_KVM_BACKEND != 'willow' &&
+      ${{ !cancelled() &&
+          needs.check-merge-group.outputs.skip != 'true' &&
+          vars.CARRICK_GCP_KVM == 'true' && vars.CARRICK_KVM_BACKEND != 'willow' &&
           (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-latest
     # The script waits up to 150 min for the VM; the VM's own backstop is
@@ -429,8 +474,11 @@ jobs:
   # `ci_scaler::LABELS`; a test keeps them identical.
   kvm-tests-willow:
     name: KVM · x86 kvm-lane tests (Willow)
+    needs: [check-merge-group]
     if: >-
-      ${{ vars.CARRICK_SELF_HOSTED_KVM == 'true' &&
+      ${{ !cancelled() &&
+          needs.check-merge-group.outputs.skip != 'true' &&
+          vars.CARRICK_SELF_HOSTED_KVM == 'true' &&
           !(vars.CARRICK_GCP_KVM == 'true' && vars.CARRICK_KVM_BACKEND != 'willow') &&
           (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
     runs-on: [self-hosted, Linux, X64, willow-kvm]
@@ -593,12 +641,14 @@ jobs:
   trusted-hardware-ok:
     name: Trusted hardware OK
     if: ${{ always() }}
-    needs: [signed-fixtures, hvf-kernel, kvm-tests, kvm-tests-willow, hvf-gate, kvm-gate]
+    needs: [check-merge-group, signed-fixtures, hvf-kernel, kvm-tests, kvm-tests-willow, hvf-gate, kvm-gate]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Require both trusted-hardware lanes (and their gates in the queue)
         env:
+          SKIPPED_BY_MERGE_GROUP: ${{ needs.check-merge-group.outputs.skip }}
+          MERGE_GROUP_RUN_ID: ${{ needs.check-merge-group.outputs.run-id }}
           HVF: ${{ needs.hvf-kernel.result }}
           # The selected KVM backend's result (same expression as the lanes'
           # `if:`); the other backend's job is skipped by construction.
@@ -610,6 +660,11 @@ jobs:
           KVM_GATE: ${{ needs.kvm-gate.result }}
           EVENT: ${{ github.event_name }}
         run: |
+          if [ "$SKIPPED_BY_MERGE_GROUP" = "true" ]; then
+            echo "::notice title=Trusted hardware skipped::Commit $GITHUB_SHA was already verified by merge_group run $MERGE_GROUP_RUN_ID"
+            echo "Skipped duplicate hardware run: merge_group run $MERGE_GROUP_RUN_ID passed for $GITHUB_SHA"
+            exit 0
+          fi
           echo "hvf-kernel=$HVF kvm($KVM_BACKEND)=$KVM hvf-gate=$HVF_GATE kvm-gate=$KVM_GATE"
           test "$HVF" = success
           test "$KVM" = success
