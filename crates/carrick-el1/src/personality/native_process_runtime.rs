@@ -458,10 +458,40 @@ struct PendingWait {
 struct ExitWakeCustody {
     channel: Arc<WaitChannel>,
 }
-struct PendingExit {
+enum OutstandingExitReceipt<'a> {
+    Pool(carrick_el1_abi::EntryRef),
+    Adopted {
+        binding: ExecutionBinding,
+        control: &'a ThreadControlSlot,
+    },
+}
+
+struct PendingExit<'a> {
     status: LinuxWaitStatus,
     channel: Arc<WaitChannel>,
     wake: Option<ExitWakeCustody>,
+    outstanding: Vec<OutstandingExitReceipt<'a>>,
+    custody: Option<
+        carrick_core::terminal::TerminalCustody<
+            carrick_core::terminal::Process,
+            carrick_core::terminal::Closing,
+        >,
+    >,
+}
+
+impl PendingExit<'_> {
+    fn receipts_returned(&self, page: &ThreadLifecyclePage) -> bool {
+        self.outstanding.iter().all(|receipt| match receipt {
+            OutstandingExitReceipt::Pool(entry) => matches!(
+                page.state(entry.index()),
+                Some((generation, carrick_el1_abi::EntryState::ExitedInZone | carrick_el1_abi::EntryState::Reaped))
+                    if generation == entry.generation()
+            ),
+            OutstandingExitReceipt::Adopted { binding, control } => control
+                .host_retirement()
+                .is_some_and(|receipt| receipt.matches(*binding)),
+        })
+    }
 }
 
 #[derive(::core::clone::Clone)]
@@ -528,7 +558,7 @@ struct Graph<'a, M: Clone, C: ProcessContext> {
     visible_namespace: VisibleNamespace,
     serials: SerialAllocator,
     pending: BTreeMap<TaskKey, PendingContinuation>,
-    pending_exit: BTreeMap<TaskKey, PendingExit>,
+    pending_exit: BTreeMap<TaskKey, PendingExit<'a>>,
     signal_waits: BTreeMap<RecordRef, PendingSignalWait>,
     suspend_masks: BTreeMap<RecordRef, carrick_signal_core::policy::SigBlockMask>,
     _root_roles: NativeClaim,
@@ -564,6 +594,20 @@ struct NativeExecutionKey {
 }
 
 impl NativeExecutionKey {
+    fn binding(self) -> ExecutionBinding {
+        use carrick_core_abi::entry::{
+            EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration,
+        };
+        ExecutionBinding {
+            task: EntryTaskKey::from_raw(self.task.id().raw() as u64),
+            generation: EntryGeneration::from_raw(
+                self.task.issued().map_or(0, |key| key.serial.raw()),
+            ),
+            mm: EntryMmKey::from_raw(self.mm),
+            thread_generation: EntryThreadGeneration::from_raw(self.thread_generation),
+        }
+    }
+
     fn new<C: ProcessContext>(
         zone: &ZoneTables<C>,
         binding: ExecutionBinding,
@@ -601,6 +645,7 @@ struct NativeOwnerMember<'a, M: Clone, C: ProcessContext> {
     process: TaskKey,
     address: AddressContext<RootGpa>,
     record: RecordRef,
+    control: &'a ThreadControlSlot,
 }
 
 impl<'a, M: Clone, C: ProcessContext> Clone for NativeOwnerMember<'a, M, C> {
@@ -610,6 +655,7 @@ impl<'a, M: Clone, C: ProcessContext> Clone for NativeOwnerMember<'a, M, C> {
             process: self.process,
             address: self.address,
             record: self.record,
+            control: self.control,
         }
     }
 }
@@ -628,6 +674,142 @@ pub struct NativeProcessRegistry<'a, M: Clone, C: ProcessContext> {
 }
 
 impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
+    /// Consume host retirement receipts when a sibling next enters the ring.
+    /// The receipt is published after kernel and runtime withdrawal, so this
+    /// projection cannot make a still-running thread disappear from the graph.
+    fn fold_host_receipts(&self, runtime: &Arc<NativeProcessRuntime<'a, M, C>>, process: TaskKey) {
+        let carrier = core::ptr::from_ref(runtime.zone).addr();
+        let mut state = self.state.lock();
+        let Some((_, keys)) = state.by_process.get(&(carrier, process)) else {
+            return;
+        };
+        let completed: Vec<_> = keys
+            .iter()
+            .filter_map(|key| {
+                let member = state.members.get(key)?;
+                member
+                    .control
+                    .host_retirement()
+                    .is_some_and(|receipt| receipt.matches(key.binding()))
+                    .then_some((*key, member.record, member.control.visible_tid()))
+            })
+            .collect();
+        if completed.is_empty() {
+            return;
+        }
+        let mut graph = runtime.graph.lock();
+        if let Ok(row) = graph.owner.task_mut(process) {
+            for (key, record, visible_tid) in &completed {
+                if let Some(tid) = visible_tid {
+                    row.remove_thread(*tid);
+                }
+                row.native_mut().resources_mut().members.retain(|member| {
+                    member.record != *record && member.thread.id() != key.task.id()
+                });
+            }
+        }
+        drop(graph);
+        for (key, record, _) in completed {
+            state.members.remove(&key);
+            state
+                .records
+                .remove(&Self::record_key(runtime.zone, record));
+            if let Some((_, keys)) = state.by_process.get_mut(&(carrier, process)) {
+                keys.retain(|candidate| *candidate != key);
+            }
+        }
+    }
+
+    fn cancel_members(
+        &self,
+        runtime: &NativeProcessRuntime<'a, M, C>,
+        page: &ThreadLifecyclePage,
+        caller: &ThreadControlSlot,
+        adopted: &[(ExecutionBinding, &'a ThreadControlSlot, RecordRef)],
+    ) {
+        let wait = NativeBucketWait {
+            lifetime: core::marker::PhantomData,
+            #[cfg(test)]
+            probe: None,
+        };
+        for (_, _, record) in adopted {
+            if runtime.zone.live(*record).is_some() {
+                let _ = runtime
+                    .zone
+                    .claim_for_host(*record, None, Handback::Cancelled, &wait);
+            }
+        }
+        for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
+            let Some((generation, state)) = page.state(index) else {
+                continue;
+            };
+            if !matches!(
+                state,
+                carrick_el1_abi::EntryState::Born
+                    | carrick_el1_abi::EntryState::Published
+                    | carrick_el1_abi::EntryState::ExitingBorn
+                    | carrick_el1_abi::EntryState::ExitingPublished
+            ) {
+                continue;
+            }
+            let entry = carrick_el1_abi::EntryRef::new(index as u32, generation);
+            let Some(address) = page.control_address(entry) else {
+                continue;
+            };
+            // SAFETY: a live page entry pins its control allocation through
+            // terminal settlement; the entry generation authenticates reuse.
+            let control = unsafe { &*(address as *const ThreadControlSlot) };
+            if core::ptr::eq(control, caller) {
+                continue;
+            }
+            let Some(record) = control.zone_record() else {
+                continue;
+            };
+            let Some(owned) = runtime.zone.live(record) else {
+                continue;
+            };
+            let Some(identity) = page.identity(entry) else {
+                continue;
+            };
+            if owned.identity().tid != u64::from(identity.tid)
+                || owned.identity().serial != identity.thread_serial
+            {
+                continue;
+            }
+            let _ = runtime
+                .zone
+                .claim_for_host(record, None, Handback::Cancelled, &wait);
+        }
+    }
+
+    fn adopted_members(
+        &self,
+        runtime: &NativeProcessRuntime<'a, M, C>,
+        process: TaskKey,
+        caller: ExecutionBinding,
+    ) -> Vec<(ExecutionBinding, &'a ThreadControlSlot, RecordRef)> {
+        let state = self.state.lock();
+        let carrier = core::ptr::from_ref(runtime.zone).addr();
+        state
+            .by_process
+            .get(&(carrier, process))
+            .map_or_else(Vec::new, |(_, keys)| {
+                keys.iter()
+                    .filter_map(|key| {
+                        let binding = key.binding();
+                        (binding != caller && binding.issued())
+                            .then(|| {
+                                state
+                                    .members
+                                    .get(key)
+                                    .map(|member| (binding, member.control, member.record))
+                            })
+                            .flatten()
+                    })
+                    .collect()
+            })
+    }
+
     pub const fn new() -> Self {
         Self {
             state: SpinLock::new(NativeRegistryState {
@@ -685,13 +867,17 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         if owned.address != address {
             return Err(NativeProcessError::Stale);
         }
-        let (page, visible_pid) = {
+        let (page, visible_pid, control) = {
             let graph = runtime.graph.lock();
             let row = graph
                 .owner
                 .task(process)
                 .map_err(|_| NativeProcessError::Stale)?;
-            (row.native().resources().page, row.metadata().namespace_pid)
+            (
+                row.native().resources().page,
+                row.metadata().namespace_pid,
+                row.native().resources().control,
+            )
         };
         let mut state = self.state.lock();
         let record_key = Self::record_key(source.zone, owned.record);
@@ -709,6 +895,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 process,
                 address,
                 record: owned.record,
+                control,
             },
         );
         state.groups.insert(group_key, (runtime.clone(), process));
@@ -819,6 +1006,20 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         }
         resources.members[member_index].record = reference;
         resources.members[member_index].thread = key.task;
+        if let Some(pending) = graph.pending_exit.get_mut(&process) {
+            let old_binding = old_key.binding();
+            for receipt in &mut pending.outstanding {
+                if let OutstandingExitReceipt::Adopted {
+                    binding,
+                    control: expected,
+                } = receipt
+                    && *binding == old_binding
+                    && core::ptr::eq(*expected, control)
+                {
+                    *binding = key.binding();
+                }
+            }
+        }
         state.members.remove(&old_key);
         state
             .records
@@ -837,12 +1038,15 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
     ) -> Result<Arc<NativeProcessRuntime<'a, M, C>>, NativeProcessError> {
         let binding = super::common_entry::execution_binding(current);
         let key = NativeExecutionKey::new(source.zone, binding, address)?;
-        self.state
+        let (runtime, process) = self
+            .state
             .lock()
             .members
             .get(&key)
-            .map(|member| member.runtime.clone())
-            .ok_or(NativeProcessError::Stale)
+            .map(|member| (member.runtime.clone(), member.process))
+            .ok_or(NativeProcessError::Stale)?;
+        self.fold_host_receipts(&runtime, process);
+        Ok(runtime)
     }
 
     pub fn for_record(
@@ -914,13 +1118,17 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             address_generation: child.address.generation.raw().get(),
         };
         let record_key = Self::record_key(parent.zone, child.record);
-        let (page, visible_pid) = {
+        let (page, visible_pid, control) = {
             let graph = runtime.graph.lock();
             let row = graph
                 .owner
                 .task(child.child)
                 .map_err(|_| NativeProcessError::Stale)?;
-            (row.native().resources().page, row.metadata().namespace_pid)
+            (
+                row.native().resources().page,
+                row.metadata().namespace_pid,
+                row.native().resources().control,
+            )
         };
         let group_key = Self::group_key(parent.zone, child.address, page, visible_pid);
         if state.members.contains_key(&child_key)
@@ -936,6 +1144,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 process: child.child,
                 address: child.address,
                 record: child.record,
+                control,
             },
         );
         state
@@ -1018,57 +1227,74 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         if !state.by_process.contains_key(&(key.carrier, process)) {
             return Err(NativeProcessError::Stale);
         }
-        {
-            let mut graph = runtime.graph.lock();
-            let row = graph
-                .owner
-                .task_mut(process)
-                .map_err(|_| NativeProcessError::Stale)?;
-            let already_owned = if let Some(issued) = host_issued {
-                issued.authorize_group(source, row, address, page, control)?
-            } else {
-                let resources = row.native_mut().resources_mut();
-                if !core::ptr::eq(resources.page, page) {
-                    return Err(NativeProcessError::Stale);
+        let closing =
+            {
+                let mut graph = runtime.graph.lock();
+                let row = graph
+                    .owner
+                    .task_mut(process)
+                    .map_err(|_| NativeProcessError::Stale)?;
+                let already_owned = if let Some(issued) = host_issued {
+                    issued.authorize_group(source, row, address, page, control)?
+                } else {
+                    let resources = row.native_mut().resources_mut();
+                    if !core::ptr::eq(resources.page, page) {
+                        return Err(NativeProcessError::Stale);
+                    }
+                    let imported = resources
+                        .members
+                        .iter()
+                        .find(|member| member.thread.id() == key.task.id());
+                    if imported.is_some_and(|member| {
+                        !core::ptr::eq(member.control, control)
+                            || (member.record != source.zone.record_ref(record)
+                                && signal_record_exists(source.zone, member.record))
+                    }) {
+                        return Err(NativeProcessError::Stale);
+                    }
+                    imported.is_some()
+                };
+                if row.credentials_for(visible_tid).is_err() {
+                    let caller_tid = row.metadata().namespace_pid;
+                    row.spawn_thread(caller_tid, visible_tid)
+                        .map_err(|_| NativeProcessError::Invalid)?;
                 }
-                let imported = resources
-                    .members
-                    .iter()
-                    .find(|member| member.thread.id() == key.task.id());
-                if imported.is_some_and(|member| {
-                    !core::ptr::eq(member.control, control)
-                        || (member.record != source.zone.record_ref(record)
-                            && signal_record_exists(source.zone, member.record))
-                }) {
-                    return Err(NativeProcessError::Stale);
+                if already_owned {
+                    let member = row
+                        .native_mut()
+                        .resources_mut()
+                        .members
+                        .iter_mut()
+                        .find(|member| member.thread.id() == key.task.id())
+                        .ok_or(NativeProcessError::Stale)?;
+                    member.thread = key.task;
+                    member.record = source.zone.record_ref(record);
+                } else {
+                    row.native_mut().resources_mut().members.push(NativeMember {
+                        thread: key.task,
+                        process,
+                        zone: source.zone,
+                        record: source.zone.record_ref(record),
+                        control,
+                    });
                 }
-                imported.is_some()
+                let closing = graph.pending_exit.get_mut(&process);
+                if let Some(pending) = closing {
+                    if binding.issued() && !pending.outstanding.iter().any(|receipt| {
+                        matches!(receipt,
+                            OutstandingExitReceipt::Adopted { binding: old, control: old_control }
+                                if *old == binding && core::ptr::eq(*old_control, control)
+                        )
+                    }) {
+                        pending
+                            .outstanding
+                            .push(OutstandingExitReceipt::Adopted { binding, control });
+                    }
+                    true
+                } else {
+                    false
+                }
             };
-            if row.credentials_for(visible_tid).is_err() {
-                let caller_tid = row.metadata().namespace_pid;
-                row.spawn_thread(caller_tid, visible_tid)
-                    .map_err(|_| NativeProcessError::Invalid)?;
-            }
-            if already_owned {
-                let member = row
-                    .native_mut()
-                    .resources_mut()
-                    .members
-                    .iter_mut()
-                    .find(|member| member.thread.id() == key.task.id())
-                    .ok_or(NativeProcessError::Stale)?;
-                member.thread = key.task;
-                member.record = source.zone.record_ref(record);
-            } else {
-                row.native_mut().resources_mut().members.push(NativeMember {
-                    thread: key.task,
-                    process,
-                    zone: source.zone,
-                    record: source.zone.record_ref(record),
-                    control,
-                });
-            }
-        }
         state.members.insert(
             key,
             NativeOwnerMember {
@@ -1076,6 +1302,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 process,
                 address,
                 record: source.zone.record_ref(record),
+                control,
             },
         );
         state
@@ -1085,6 +1312,20 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .1
             .push(key);
         state.records.insert(record_key, runtime.clone());
+        drop(state);
+        if closing {
+            let wait = NativeBucketWait {
+                lifetime: core::marker::PhantomData,
+                #[cfg(test)]
+                probe: None,
+            };
+            let _ = source.zone.claim_for_host(
+                source.zone.record_ref(record),
+                None,
+                Handback::Cancelled,
+                &wait,
+            );
+        }
         Ok(runtime)
     }
 
@@ -3008,7 +3249,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         );
         // Settlement publishes under this same bucket. A claim which settled
         // before enrollment needs no wake; a later settlement owns our wake.
-        if page.claimed_count() == 0 {
+        let ready = self
+            .runtime
+            .graph
+            .lock()
+            .pending_exit
+            .get(&self.key)
+            .is_some_and(|pending| {
+                page.live() == 0 && page.claimed_count() == 0 && pending.receipts_returned(page)
+            });
+        if ready {
             return Ok(None);
         }
         let sequence = zone.next_seq(record);
@@ -3055,6 +3305,117 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         self.exit_with_status(wait_status)
     }
     #[inline(never)]
+    fn begin_closing(
+        &mut self,
+        wait_status: LinuxWaitStatus,
+    ) -> Result<(&'a ThreadLifecyclePage, Arc<WaitChannel>), NativeProcessError> {
+        let registry = *self.runtime.registry.lock();
+        let adopted = registry.map_or_else(Vec::new, |registry| {
+            registry.adopted_members(self.runtime, self.key, self.binding)
+        });
+        let address = self
+            .runtime
+            .task_binding(self.key)
+            .ok_or(NativeProcessError::Stale)?
+            .address;
+        let (page, channel, first_close) = {
+            let mut graph = self.runtime.graph.lock();
+            let row = graph
+                .owner
+                .task_mut(self.key)
+                .map_err(|_| NativeProcessError::Stale)?;
+            row.select_exit_thread(self.calling_tid)
+                .map_err(|_| NativeProcessError::Stale)?;
+            let page = row.native().resources().page;
+            let first_close = !graph.pending_exit.contains_key(&self.key);
+            if first_close {
+                // Already admitted sibling retirement still needs its own
+                // exact-record cancellation binding. Pre-live claims are
+                // refused by thread_spawned after this terminal close.
+                if page.live() == 0 {
+                    return Err(NativeProcessError::Quarantined);
+                }
+                let channel = Arc::new(WaitChannel {
+                    generation: ProcessWake::new(),
+                    mm: self.binding.mm.raw(),
+                });
+                let mut outstanding = Vec::new();
+                let mut pool_mask = 0u16;
+                for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
+                    if let Some((generation, state)) = page.state(index)
+                        && matches!(
+                            state,
+                            carrick_el1_abi::EntryState::Born
+                                | carrick_el1_abi::EntryState::Published
+                                | carrick_el1_abi::EntryState::ExitingBorn
+                                | carrick_el1_abi::EntryState::ExitingPublished
+                        )
+                    {
+                        let entry = carrick_el1_abi::EntryRef::new(index as u32, generation);
+                        if self.control.entry() == Some(entry) {
+                            continue;
+                        }
+                        pool_mask |= 1 << index;
+                        outstanding.push(OutstandingExitReceipt::Pool(entry));
+                    }
+                }
+                outstanding.extend(adopted.iter().map(|(binding, control, _)| {
+                    OutstandingExitReceipt::Adopted {
+                        binding: *binding,
+                        control,
+                    }
+                }));
+                let members = carrick_core::terminal::MemberSet::new(pool_mask, adopted.len())
+                    .ok_or(NativeProcessError::Exhausted)?;
+                let identity = carrick_core::terminal::ProcessTerminalIdentity::from_exit(
+                    self.key,
+                    address,
+                    wait_status.to_termination_status(),
+                );
+                let (custody, verdict) = carrick_core::terminal::TerminalCustody::<
+                    carrick_core::terminal::Process,
+                    carrick_core::terminal::Live,
+                >::admitted(identity)
+                .close(page, members);
+                let carrick_core::terminal::RetirementVerdict::CancelMembers { .. } = verdict
+                else {
+                    return Err(NativeProcessError::Quarantined);
+                };
+                page.publish_exit_wait(self.binding.mm, WaitChannel::address(&channel));
+                page.release_live(0)
+                    .map_err(|_| NativeProcessError::Quarantined)?;
+                let wake = Some(ExitWakeCustody {
+                    channel: channel.clone(),
+                });
+                graph.pending_exit.insert(
+                    self.key,
+                    PendingExit {
+                        status: wait_status,
+                        channel,
+                        wake,
+                        outstanding,
+                        custody: Some(custody),
+                    },
+                );
+            }
+            (
+                page,
+                graph
+                    .pending_exit
+                    .get(&self.key)
+                    .ok_or(NativeProcessError::Quarantined)?
+                    .channel
+                    .clone(),
+                first_close,
+            )
+        };
+        if first_close && let Some(registry) = registry {
+            registry.cancel_members(self.runtime, page, self.control, &adopted);
+        }
+        Ok((page, channel))
+    }
+
+    #[inline(never)]
     pub fn exit_with_status(
         &mut self,
         wait_status: LinuxWaitStatus,
@@ -3069,70 +3430,29 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .metadata()
             .namespace_pid;
         let root_exit = self.is_root_process();
-        // Live siblings end with the run only behind a root exit crossing.
-        let siblings_end_with_run = root_exit && self.service.root_exit_ends_run();
-        let (page, channel) = {
-            let mut graph = self.runtime.graph.lock();
-            let row = graph
-                .owner
-                .task_mut(self.key)
-                .map_err(|_| NativeProcessError::Stale)?;
-            row.select_exit_thread(self.calling_tid)
-                .map_err(|_| NativeProcessError::Stale)?;
-            let page = row.native().resources().page;
-            if !graph.pending_exit.contains_key(&self.key) {
-                // Already admitted sibling retirement still needs its own
-                // exact-record cancellation binding. Pre-live claims are
-                // refused by thread_spawned after this terminal close.
-                if page.live() == 0 {
-                    return Err(NativeProcessError::Quarantined);
-                }
-                if !siblings_end_with_run && page.live() > 1 && page.claimed_count() == 0 {
-                    drop(graph);
-                    return Ok(self.run_failed(
-                        carrick_core_abi::NativeRunFailureReason::X86GroupExitCustody,
-                    ));
-                }
-                page.close();
-                let channel = Arc::new(WaitChannel {
-                    generation: ProcessWake::new(),
-                    mm: self.binding.mm.raw(),
-                });
-                let wake = Some(ExitWakeCustody {
-                    channel: channel.clone(),
-                });
-                graph.pending_exit.insert(
-                    self.key,
-                    PendingExit {
-                        status: wait_status,
-                        channel,
-                        wake,
-                    },
-                );
-            }
-            (
-                page,
-                graph
-                    .pending_exit
-                    .get(&self.key)
-                    .ok_or(NativeProcessError::Quarantined)?
-                    .channel
-                    .clone(),
-            )
-        };
+        let (page, channel) = self.begin_closing(wait_status)?;
         if let Some(outcome) = self.park_pending_exit(page, &channel)? {
             return Ok(outcome);
         }
-        if page.live() == 0 {
-            return Err(NativeProcessError::Quarantined);
-        }
-        // The gate is closed and claims have settled: the census only falls.
-        let siblings_live = page.live() > 1;
-        if siblings_live && !siblings_end_with_run {
-            return Ok(
-                self.run_failed(carrick_core_abi::NativeRunFailureReason::X86GroupExitCustody)
-            );
-        }
+        let settled = {
+            let mut graph = self.runtime.graph.lock();
+            let pending = graph
+                .pending_exit
+                .get_mut(&self.key)
+                .ok_or(NativeProcessError::Quarantined)?;
+            let custody = pending
+                .custody
+                .take()
+                .ok_or(NativeProcessError::Quarantined)?;
+            match custody.settle(page, pending.receipts_returned(page)) {
+                Ok(settled) => settled,
+                Err(closing) => {
+                    pending.custody = Some(closing);
+                    return Err(NativeProcessError::Quarantined);
+                }
+            }
+        };
+        let _identity = settled.identity();
         let transaction = self
             .runtime
             .graph
@@ -3156,7 +3476,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.wake_ipc_channel(ch);
             }
         }
-        let (page, members, file_table, resources, published) = {
+        let (page, file_table, resources, published) = {
             let mut graph = self.runtime.graph.lock();
             let row = graph
                 .owner
@@ -3165,7 +3485,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             row.select_exit_thread(self.calling_tid)
                 .map_err(|_| NativeProcessError::Stale)?;
             let page = row.native().resources().page;
-            let members = row.native().resources().members.clone();
             let file_table = row.native().resources().file_table;
             let (resources, published) = match native_process_entry::publish_exit(
                 &mut graph.owner,
@@ -3182,7 +3501,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Err(_) => return Err(NativeProcessError::Quarantined),
             };
             graph.pending_exit.remove(&self.key);
-            (page, members, file_table, resources, published)
+            (page, file_table, resources, published)
         };
         let record = self
             .source
@@ -3195,7 +3514,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if self.handoff.is_none() {
             return Err(NativeProcessError::Quarantined);
         }
-        self.retire_exit_group_lifecycle(page, &members, siblings_live)?;
+        if let Some(entry) = self.control.entry() {
+            page.retire_closing_caller(entry)
+                .map_err(|_| NativeProcessError::Quarantined)?;
+        }
+        page.clear_exit_wait();
         let permit = published.effects.cancel_members(|member| {
             if member.zone.live(member.record).is_some() {
                 let _ = member.zone.claim_for_host(
@@ -3826,6 +4149,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     fn thread_exited(&mut self, tid: u32) {
         self.thread_exited(tid);
     }
+    fn route_host_thread_exit(
+        &mut self,
+        verdict: carrick_core::terminal::RetirementVerdict,
+    ) -> bool {
+        let carrick_core::terminal::RetirementVerdict::RetireThreadOnHost { identity } = verdict
+        else {
+            return false;
+        };
+        if identity.binding() != self.binding || identity.entry() != self.control.entry() {
+            self.run_failure = Some(carrick_core_abi::NativeRunFailureReason::NativeStale);
+            return false;
+        }
+        self.control.request_host_exit();
+        true
+    }
     fn lifecycle_admission_settled(&mut self) -> Result<(), i64> {
         let wake = {
             let mut graph = self.runtime.graph.lock();
@@ -3911,46 +4249,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     NativeProcessEntry<'_, 'a, M, C, S>
 {
-    /// Release the caller's own membership. With no live sibling, also retire
-    /// the member entries whose lifecycle exit settled before their membership
-    /// notification. Live siblings of a root that ends the run keep their
-    /// census and entries for the host's own retirement: draining them here
-    /// would race a host-lane sibling's `try_exit`/`retire_published`.
-    #[inline(never)]
-    fn retire_exit_group_lifecycle(
-        &self,
-        page: &ThreadLifecyclePage,
-        members: &[NativeMember<'a, C>],
-        siblings_live: bool,
-    ) -> Result<(), NativeProcessError> {
-        page.release_live(0)
-            .map_err(|_| NativeProcessError::Quarantined)?;
-        if siblings_live {
-            return Ok(());
-        }
-        for member in members {
-            if let Some(entry) = member.control.entry()
-                && matches!(
-                    page.state(entry.index()),
-                    Some((
-                        generation,
-                        carrick_el1_abi::EntryState::Born | carrick_el1_abi::EntryState::Published
-                    )) if generation == entry.generation()
-                )
-            {
-                page.retire_published(entry)
-                    .map_err(|_| NativeProcessError::Quarantined)?;
-            }
-        }
-        Ok(())
-    }
-
     #[inline(never)]
     pub fn retire_thread_verdict(&mut self, verdict: carrick_core::terminal::RetirementVerdict) {
         let carrick_core::terminal::RetirementVerdict::RetireThread {
             identity,
             requires_slot_absence,
-        } = verdict;
+        } = verdict
+        else {
+            self.run_failure = Some(carrick_core_abi::NativeRunFailureReason::NativeStale);
+            return;
+        };
         if identity.binding() != self.binding
             || identity.entry() != self.control.entry()
             || !requires_slot_absence
@@ -3963,6 +4271,22 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return;
         };
         self.retire_thread_identity(tid);
+        self.wake_pending_exit_on_receipt();
+    }
+
+    fn wake_pending_exit_on_receipt(&mut self) {
+        let channel = self
+            .runtime
+            .graph
+            .lock()
+            .pending_exit
+            .get(&self.key)
+            .map(|pending| pending.channel.clone());
+        if let Some(channel) = channel
+            && self.publish_channel(&channel).is_err()
+        {
+            self.run_failure = Some(carrick_core_abi::NativeRunFailureReason::BirthSettlement);
+        }
     }
 
     fn retire_thread_identity(&mut self, tid: u32) {
@@ -3995,6 +4319,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 
     pub fn thread_exited(&mut self, tid: u32) {
         self.retire_thread_identity(tid);
+        self.wake_pending_exit_on_receipt();
     }
 
     fn robust_target<'g>(
@@ -6873,7 +7198,7 @@ mod tests {
                 "exit must suspend, never return guest EAGAIN"
             );
             assert_eq!(page.gate(), carrick_el1_abi::GateState::Closed);
-            assert_eq!(page.live(), if claim_live { 2 } else { 1 });
+            assert_eq!(page.live(), if claim_live { 1 } else { 0 });
             assert!(entry.take_run_failure().is_none());
             assert!(entry.take_root_exit().is_none());
             assert!(entry.take_handoff_receipt().is_some());
@@ -6883,7 +7208,7 @@ mod tests {
                 Err(-11)
             );
             if claim_live {
-                assert_eq!(page.try_exit(), Ok(1));
+                assert_eq!(page.release_live(0), Ok(0));
             }
             page.unclaim(claim).unwrap();
             // Claim owners deliver their settlement only after rollback is complete.
@@ -6963,7 +7288,7 @@ mod tests {
                     Some(carrick_core_abi::NativeRunFailureReason::NativeStale)
                 );
                 assert!(entry.take_root_exit().is_none());
-                assert_eq!(page.live(), 1);
+                assert_eq!(page.live(), 0);
                 continue;
             }
             assert_eq!(entry.take_root_exit(), Some(expected_status));
@@ -7105,21 +7430,18 @@ mod tests {
             })
             .unwrap();
         // The child owns Born membership but has not been enqueued yet.
-        // Group cancellation is not wired: fail the run with typed custody,
-        // preserving graph membership and MM ownership rather than guest errno.
+        // Closing retains the admitted Born member and parks the leader until
+        // cancellation returns its exact retirement receipt.
         assert_eq!(zone.slot(slot).queued(), 0);
         assert!(matches!(
             entry.exit_owned(9),
             Ok(LifecycleOutcome::Transferred { .. })
         ));
-        assert_eq!(
-            entry.take_run_failure(),
-            Some(carrick_core_abi::NativeRunFailureReason::X86GroupExitCustody)
-        );
+        assert_eq!(entry.take_run_failure(), None);
         assert!(entry.take_handoff_receipt().is_some());
         assert!(entry.take_root_exit().is_none());
         assert!(entry.has_thread(42));
-        assert_eq!(page.live(), 2);
+        assert_eq!(page.live(), 1);
         assert_eq!(zone.record(child).claim(), carrick_sched_core::Claim::Free);
         assert!(runtime.graph.lock().owner.task(entry.key).is_ok());
         assert_eq!(zone.record_ref(child), child_ref);
@@ -7489,7 +7811,7 @@ mod tests {
                 ));
                 assert!(child_entry.take_handoff_receipt().is_some());
                 assert!(child_entry.take_root_exit().is_none());
-                assert_eq!(child_page.live(), 1);
+                assert_eq!(child_page.live(), 0);
                 child_page.unclaim(claim).unwrap();
                 child_entry.lifecycle_admission_settled().unwrap();
                 drop(child_entry);

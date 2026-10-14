@@ -50,7 +50,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Protocol revision, folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 6;
+pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 8;
 
 pub use carrick_core::lifecycle::{ClaimedEntry, ExitAdmission, Lifecycle};
 pub use carrick_core_abi::lifecycle::*;
@@ -320,6 +320,12 @@ pub struct ThreadControlSlot {
     zone_seq: AtomicU64,
     zone_incarnation: AtomicU64,
     zone_id: AtomicU32,
+    host_exit_requested: AtomicU32,
+    /// The host writes task/execution first and publishes thread last. A
+    /// Closing owner only credits the complete exact receipt it requested.
+    retired_task: AtomicU64,
+    retired_execution: AtomicU64,
+    retired_thread: AtomicU64,
 }
 
 impl ThreadControlSlot {
@@ -339,6 +345,10 @@ impl ThreadControlSlot {
             zone_seq: AtomicU64::new(0),
             zone_incarnation: AtomicU64::new(0),
             zone_id: AtomicU32::new(0),
+            host_exit_requested: AtomicU32::new(0),
+            retired_task: AtomicU64::new(0),
+            retired_execution: AtomicU64::new(0),
+            retired_thread: AtomicU64::new(0),
         }
     }
 
@@ -383,6 +393,10 @@ impl ThreadControlSlot {
 
     fn reset(&self, blocked: BlockedMask, clear_child_tid: u64, entry: Option<EntryRef>) {
         self.zone_id.store(0, Ordering::Relaxed);
+        self.host_exit_requested.store(0, Ordering::Relaxed);
+        self.retired_thread.store(0, Ordering::Relaxed);
+        self.retired_task.store(0, Ordering::Relaxed);
+        self.retired_execution.store(0, Ordering::Relaxed);
         self.zone_incarnation.store(0, Ordering::Relaxed);
         self.zone_seq.store(0, Ordering::Relaxed);
         self.pending.clear(PendingSignals(u64::MAX));
@@ -523,6 +537,42 @@ impl ThreadControlSlot {
         let len = self.robust_len.load(Ordering::Acquire);
         (self.robust_head.load(Ordering::Relaxed), len)
     }
+
+    /// Publish only after the host has retired the exact kernel thread and
+    /// withdrawn its runtime membership. The control lease stays pinned.
+    pub fn publish_host_retirement(
+        &self,
+        receipt: carrick_core::terminal::HostThreadRetirementReceipt,
+    ) {
+        self.retired_task
+            .store(receipt.task().raw(), Ordering::Relaxed);
+        self.retired_execution
+            .store(receipt.execution().raw(), Ordering::Relaxed);
+        self.retired_thread
+            .store(receipt.thread().raw(), Ordering::Release);
+    }
+
+    pub fn host_retirement(&self) -> Option<carrick_core::terminal::HostThreadRetirementReceipt> {
+        let thread = self.retired_thread.load(Ordering::Acquire);
+        carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+            carrick_core_abi::entry::EntryTaskKey::from_raw(
+                self.retired_task.load(Ordering::Relaxed),
+            ),
+            carrick_core_abi::entry::EntryGeneration::from_raw(
+                self.retired_execution.load(Ordering::Relaxed),
+            ),
+            carrick_core_abi::entry::EntryThreadGeneration::from_raw(thread),
+        )
+    }
+
+    /// The ring routed a declined raw exit to this exact host-owned slot.
+    pub fn request_host_exit(&self) {
+        self.host_exit_requested.store(1, Ordering::Release);
+    }
+
+    pub fn host_exit_requested(&self) -> bool {
+        self.host_exit_requested.load(Ordering::Acquire) != 0
+    }
 }
 impl Default for ThreadControlSlot {
     fn default() -> Self {
@@ -543,6 +593,8 @@ pub struct ThreadLifecyclePage {
     ledger_host: AtomicU64,
     ledger_guest: AtomicU64,
     controls: [AtomicU64; THREAD_POOL_ENTRIES],
+    exit_wait_mm: AtomicU64,
+    exit_wait_address: AtomicU64,
 }
 
 const _: () = assert!(core::mem::size_of::<ThreadLifecyclePage>() == THREAD_LIFECYCLE_PAGE_SIZE);
@@ -628,6 +680,8 @@ impl ThreadLifecyclePage {
             ledger_host: AtomicU64::new(0),
             ledger_guest: AtomicU64::new(0),
             controls: [const { AtomicU64::new(0) }; THREAD_POOL_ENTRIES],
+            exit_wait_mm: AtomicU64::new(0),
+            exit_wait_address: AtomicU64::new(0),
         }
     }
 
@@ -663,6 +717,29 @@ impl ThreadLifecyclePage {
     }
     pub fn guest_activity_address(&self) -> u64 {
         self.ledger_guest.load(Ordering::Acquire)
+    }
+
+    /// Publish the already-owned WaitChannel key before cancellation starts.
+    /// The address is released last so the host never reads a partial key.
+    pub fn publish_exit_wait(&self, mm: carrick_core_abi::entry::EntryMmKey, address: u64) {
+        self.exit_wait_mm.store(mm.raw(), Ordering::Relaxed);
+        self.exit_wait_address.store(address, Ordering::Release);
+    }
+
+    pub fn exit_wait(&self) -> Option<(carrick_core_abi::entry::EntryMmKey, u64)> {
+        let address = self.exit_wait_address.load(Ordering::Acquire);
+        (address != 0).then(|| {
+            (
+                carrick_core_abi::entry::EntryMmKey::from_raw(
+                    self.exit_wait_mm.load(Ordering::Relaxed),
+                ),
+                address,
+            )
+        })
+    }
+
+    pub fn clear_exit_wait(&self) {
+        self.exit_wait_address.store(0, Ordering::Release);
     }
     fn activity(&self) -> Option<&ThreadLedgerActivity> {
         #[cfg(target_os = "none")]
@@ -834,7 +911,7 @@ impl Default for ThreadLifecyclePage {
 }
 
 /// Layout facts folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 24] = [
+pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 30] = [
     THREAD_LIFECYCLE_PROTOCOL_VERSION,
     core::mem::size_of::<ThreadLedgerActivity>() as u64,
     ::core::mem::offset_of!(ThreadLifecyclePage, ledger_host) as u64,
@@ -859,6 +936,12 @@ pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 24] = [
     ::core::mem::offset_of!(ThreadControlSlot, zone_incarnation) as u64,
     ::core::mem::offset_of!(ThreadControlSlot, zone_id) as u64,
     ::core::mem::offset_of!(ThreadLifecyclePage, serving) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, retired_task) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, retired_execution) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, retired_thread) as u64,
+    ::core::mem::offset_of!(ThreadLifecyclePage, exit_wait_mm) as u64,
+    ::core::mem::offset_of!(ThreadLifecyclePage, exit_wait_address) as u64,
+    ::core::mem::offset_of!(ThreadControlSlot, host_exit_requested) as u64,
 ];
 
 #[cfg(test)]
@@ -1494,6 +1577,10 @@ mod layout_manifest {
                      zone_seq: _,
                      zone_incarnation: _,
                      zone_id: _,
+                     host_exit_requested: _,
+                     retired_task: _,
+                     retired_execution: _,
+                     retired_thread: _,
                  }: ThreadControlSlot| {};
         field!(ThreadControlSlot, visible_tid, AtomicU32, 0, 4, 4);
         field!(ThreadControlSlot, blocked, AtomicU64, 8, 8, 8);
@@ -1509,6 +1596,10 @@ mod layout_manifest {
         field!(ThreadControlSlot, zone_seq, AtomicU64, 80, 8, 8);
         field!(ThreadControlSlot, zone_incarnation, AtomicU64, 88, 8, 8);
         field!(ThreadControlSlot, zone_id, AtomicU32, 96, 4, 4);
+        field!(ThreadControlSlot, host_exit_requested, AtomicU32, 100, 4, 4);
+        field!(ThreadControlSlot, retired_task, AtomicU64, 104, 8, 8);
+        field!(ThreadControlSlot, retired_execution, AtomicU64, 112, 8, 8);
+        field!(ThreadControlSlot, retired_thread, AtomicU64, 120, 8, 8);
     }
 
     #[test]
@@ -1530,6 +1621,8 @@ mod layout_manifest {
                      ledger_host: _,
                      ledger_guest: _,
                      controls: _,
+                     exit_wait_mm: _,
+                     exit_wait_address: _,
                  }: ThreadLifecyclePage| {};
         field!(ThreadLifecyclePage, gate, AtomicU32, 0, 4, 4);
         field!(ThreadLifecyclePage, live, AtomicU32, 4, 4, 4);
@@ -1553,5 +1646,7 @@ mod layout_manifest {
             64,
             8
         );
+        field!(ThreadLifecyclePage, exit_wait_mm, AtomicU64, 744, 8, 8);
+        field!(ThreadLifecyclePage, exit_wait_address, AtomicU64, 752, 8, 8);
     }
 }

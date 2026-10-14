@@ -17,6 +17,7 @@ use carrick_el1_abi::Action;
 /// The production CPL0 transport owed by a completed shared dispatch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProductionBoundary {
+    HostCustody,
     Continue,
     Work,
     Forward,
@@ -29,6 +30,7 @@ pub const fn production_boundary(action: Action) -> ProductionBoundary {
         Action::ServedWithWork => ProductionBoundary::Work,
         Action::Forward => ProductionBoundary::Forward,
         Action::Idle => ProductionBoundary::Invalid,
+        Action::HostCustody => ProductionBoundary::HostCustody,
     }
 }
 
