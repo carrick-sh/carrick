@@ -15,7 +15,7 @@ use carrick_el1::isa::x86::context::native::{
 use carrick_el1::isa::x86::context::scheduler::XsaveArea;
 use carrick_el1::personality::{sched, thread_setup::GuestLifecycleVenue};
 use carrick_el1_abi::{Counters, CurrentTask};
-use carrick_guest_arch::{EntryArch, LayoutBackend, NativeReturnWord, UserVa};
+use carrick_guest_arch::{EntryArch, NativeReturnWord, UserVa};
 use carrick_personality_linux::crossing::{HostCrossingSet, evaluate_host_crossing};
 use carrick_personality_linux::dispatch::CompletionRoute;
 use carrick_personality_linux::entry::{CanonicalCall, decode_x86_snapshot};
@@ -29,7 +29,7 @@ use carrick_x86_carrier::personality::{
 };
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use carrick_x86_cpl0::linux_personality::{self, EMPTY_NAME_CACHE, NativeDispatch};
+use carrick_x86_cpl0::linux_personality::{self, NativeDispatch};
 use carrick_x86_cpl0::native_execution;
 use carrick_x86_cpl0::{ProductionBoundary, production_boundary};
 
@@ -1108,23 +1108,19 @@ impl Personality for FixturePersonality {
                 let handled_by_fixture =
                     fixture_handled(frame, cx.xsave, binding, task, counters, &call);
                 if !handled_by_fixture {
-                    let layout =
-                        <carrick_el1::isa::x86::X86Backend as LayoutBackend>::KERNEL_LAYOUT;
+                    let files = linux_personality::file_tables(binding);
+                    let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
+                    carrick_el1::personality::file_table::admit_stdio(
+                        files.fd_map(),
+                        files.opens(),
+                        files.objects(),
+                        file_table,
+                        [true; 3],
+                    );
                     let cache_lookup = |handle: u32| {
-                        handle
-                            .checked_sub(1)
-                            .and_then(|index| {
-                                u64::from(index)
-                                    .checked_mul(carrick_el1_abi::DELEGATED_FILE_MAX_SIZE)
-                            })
-                            .and_then(|offset| {
-                                layout
-                                    .region
-                                    .raw()
-                                    .checked_add(carrick_el1_abi::EL1_CACHE_OFFSET)?
-                                    .checked_add(offset)
-                            })
-                            .map_or(core::ptr::null_mut(), |address| address as *mut u8)
+                        files
+                            .cache(handle)
+                            .map_or(core::ptr::null_mut(), |ptr| ptr.as_ptr())
                     };
 
                     let mut native = NativeDispatch {
@@ -1133,18 +1129,19 @@ impl Personality for FixturePersonality {
                         call,
                         publications: &binding.publications,
                         slot: carrick_guest_arch::SlotId::from_index(binding.cpu_slot as usize),
-                        file_table: task.linux.file_table.load(Ordering::Acquire).max(1),
+                        file_table,
+                        files: &files,
                     };
                     let route =
                         match production_boundary(carrick_el1::dispatch_syscall_with_lifecycle(
                             &mut native,
                             counters,
                             core::slice::from_ref(task),
+                            files.fd_map(),
+                            files.objects(),
+                            files.opens(),
                             &[],
-                            &[],
-                            &[],
-                            &[],
-                            &EMPTY_NAME_CACHE,
+                            files.names(),
                             None::<
                                 carrick_el1::Zone<'_, sched::HardwareCpu, sched::HardwareUserWord>,
                             >,

@@ -59,6 +59,8 @@ mod internal_read;
 pub use internal_read::*;
 mod kernel_fault_venues;
 pub use kernel_fault_venues::*;
+mod file_region;
+pub use file_region::*;
 
 use core::cell::UnsafeCell;
 
@@ -665,6 +667,8 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         OPEN_REFERENCE_PENDING_OFFSET,
         core::mem::size_of::<OpenReferencePending>() as u64,
         FdMapSlot::HOST_VIEW as u64,
+        EL1_FILE_REGION_HEADER_OFFSET,
+        core::mem::size_of::<FileRegionBinding>() as u64,
         EL1_CACHE_OFFSET,
         EL1_INOTIFY_TABLE_OFFSET,
         EL1_NAME_CACHE_OFFSET,
@@ -3782,7 +3786,7 @@ impl Default for InotifyNameCache {
 }
 
 const _: () = {
-    assert!(EL1_ABI_LAYOUT_HASH == 0x9ce430ad64a04308);
+    assert!(EL1_ABI_LAYOUT_HASH == 0xed03315fdfe584f4);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);
