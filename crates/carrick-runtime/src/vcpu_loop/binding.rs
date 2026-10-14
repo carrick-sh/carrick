@@ -1728,15 +1728,14 @@ where
         use carrick_core_abi::entry::{EntryGeneration, EntryTaskKey, EntryThreadGeneration};
         let task = context.task().key();
         let thread = context.thread().key();
-        let Some(receipt) = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+        let receipt = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
             EntryTaskKey::from_raw(thread.tid.raw() as u64),
             EntryGeneration::from_raw(task.serial.raw()),
             EntryThreadGeneration::from_raw(thread.serial.raw()),
-        ) else {
-            carrick_fatal!(
-                "kernel::thread_settlement",
-                "retired thread lost exact identity"
-            );
+        );
+        let Some(receipt) = receipt else {
+            tracing::error!("retired thread lost exact identity");
+            return;
         };
         context
             .thread()
