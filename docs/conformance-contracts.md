@@ -935,6 +935,23 @@ and [Arm's Linux Plumbers 2017 signal-frame diagrams](https://blog.linuxplumbers
 alongside sigreturn(2). This extraction changes no signal routing and does not
 establish in-ring delivery or alternate-stack restoration.
 
+`signal.arm.sigaltstack-setup` binds the native ARM `sigaltstack` owner to
+raw `syscall(SYS_sigaltstack)` observations from arm64 Docker `gcc:14`,
+kernel `7.0.14-linuxkit` (`scratchpad sigalt/p.c`). Its VM-free setup witness
+is `sigaltstack_serves_off_the_alternate_stack`. Bad flags plus undersized
+storage return EINVAL (-22); undersized storage alone returns ENOMEM (-12);
+SS_DISABLE ignores size. Input and output may alias: the entire new stack is
+read before the old stack is written, and the old value is returned while the
+new value is installed. Bad input and output pointers return EFAULT (-14).
+Bad flags beat a bad output pointer with EINVAL, and output remains untouched
+on validation errors. While executing on the alternate stack, *every* change
+(valid, bad flags, undersized, or disable) returns EPERM (-1), even with a bad
+output pointer; no output is written. An on-stack query reports SS_ONSTACK.
+SS_AUTODISARM is accepted and is returned in the old flags at bit 31. The
+structural budget is one fixed-size input read, one fixed-size output write,
+and one slot publication after validation; active-stack refusal performs no
+user copy, carrier handback, task scan, allocation, or wait.
+
 ## Signal return result ownership
 
 `signal.return.no-result` owns successful in-ring `rt_sigreturn` completion.
