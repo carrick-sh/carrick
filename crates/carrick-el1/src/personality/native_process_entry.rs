@@ -246,6 +246,13 @@ pub fn publish_exit<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestPr
         .prepare_exit(task, adopter)?
         .reserve(transaction)?
         .begin(status)?;
+    finish_exit(pending)
+}
+
+#[inline(never)]
+fn finish_exit<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>(
+    pending: GuestPendingExit<'_, C, U, N, F>,
+) -> ExitPublicationResult<N> {
     let mut published = pending.publish()?;
     let resources = published.take_resources();
     Ok((resources, published))

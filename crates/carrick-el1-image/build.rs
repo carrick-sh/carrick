@@ -75,6 +75,11 @@ fn check_process_exit_frames(disassembly: &str) {
             let mut frame = 0;
             let mut aligned = false;
             for line in disassembly[start..].lines().take(20) {
+                // A short tail-call wrapper may end before twenty instructions.
+                // Do not charge the next symbol's frame to this function.
+                if line.ends_with(">:") {
+                    break;
+                }
                 let Some((_, instruction)) = line.split_once(':') else {
                     continue;
                 };
