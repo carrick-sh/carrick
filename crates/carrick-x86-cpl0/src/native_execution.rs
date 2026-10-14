@@ -84,23 +84,6 @@ pub fn schedule(slot: SlotId) -> ! {
                             publish_root_exit(current, status.to_termination_status());
                         }
                         leave_space(source);
-                            continue;
-=======
-                match entry
-                    .resume_checkpoint()
-                    .unwrap_or_else(|reason| complete_run_failure(current, reason))
-                {
-                    carrick_el1::personality::native_process_runtime::NativeResume::Returned(
-                        result,
-                    ) => words.set_syscall_return(result.raw() as u64),
-                    carrick_el1::personality::native_process_runtime::NativeResume::Left(
-                        root_exit,
-                    ) => {
-                        if let Some(status) = root_exit {
-                            publish_root_exit(current, status.to_termination_status());
->>>>>>> 7888f9c7d (feat(el1): resume switched ARM waits through the native owner)
-                        }
-                        leave_space(source);
                         continue;
                     }
                     carrick_el1::personality::native_process_runtime::NativeResume::NoPending => {
