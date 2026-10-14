@@ -1296,6 +1296,14 @@ impl<'a> MemView<'a> {
         if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
             table.retire_overlapping(authority.mm_id.raw(), start, len);
         }
+        // DONTNEED keeps the reservation node incarnation while retiring its
+        // residency. A refusal asserting the old resident page must not answer
+        // the next first touch of that same node.
+        for slot in 0..carrick_el1_abi::ZONE_SLOTS {
+            if let Some(mailbox) = carrick_el1_abi::frame_grant_mailbox_host_for_slot(slot) {
+                mailbox.withdraw_response_covering(authority.mm_id.raw(), start, len);
+            }
+        }
         let mut mem = authority.lock();
         mem.resident.remove(range);
         let _ = mem

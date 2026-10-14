@@ -127,7 +127,13 @@ fn owner_lazy_selection_keeps_supply_owned_when_fault_mailbox_is_occupied() {
         )
         .unwrap();
     let mailbox = FrameGrantMailbox::new();
-    assert!(crate::fault::request_lazy_frames(&mailbox, 99, VA, 1, None));
+    assert!(crate::fault::request_lazy_frames(
+        &mailbox,
+        99,
+        VA,
+        1,
+        carrick_el1_abi::ReservationIncarnation::new(1).unwrap()
+    ));
     let result = portal
         .select(
             &transfer,
