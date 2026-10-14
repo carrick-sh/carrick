@@ -1263,7 +1263,7 @@ fn consume_refusal(
 ) -> bool {
     let found = mailboxes
         .own
-        .response_covering_fault(mm_key, far, access)
+        .response_for_fault(mm_key, far, access)
         .map(|response| (mailboxes.own, response))
         .or_else(|| {
             mailboxes.peers?.iter().find_map(|peer| {
@@ -1274,12 +1274,9 @@ fn consume_refusal(
     let Some((source, response)) = found else {
         return false;
     };
-    let stale = response
-        .request
-        .reservation_incarnation
-        .is_some_and(|old| current_incarnation().is_some_and(|current| current != old));
+    let current = current_incarnation() == Some(response.request.reservation_incarnation);
     release_refusal(source, mm_key, response.request.request_generation);
-    !stale
+    current
 }
 
 /// A fault the residency table served may still have a refusal outstanding
@@ -1647,7 +1644,9 @@ fn dispatch_classified_fault<
         mm_key,
         far,
     );
-    let _ = request_lazy_frames(mailbox, mm_key, far, access, incarnation);
+    if let Some(incarnation) = incarnation {
+        let _ = request_lazy_frames(mailbox, mm_key, far, access, incarnation);
+    }
     Action::Forward
 }
 
@@ -2166,11 +2165,13 @@ mod tests {
             let peer = boxes.slot(1).unwrap();
             let mut cow = NoopCowResolver;
             let base = 0x4000_0000;
+            let roots = admitted_root(&spaces, mm, &[(base, 0x20_0000, 3)]);
+            let residency = carrick_el1_abi::FrameGrantResidencyTable::new();
             let mut first = write_translation_fault(0, base);
             let mut second = write_translation_fault(1, base + (pages - 1) * 4096);
             for (frame, own) in [(&mut first, origin), (&mut second, peer)] {
                 assert_eq!(
-                    dispatch_fault_with_regions(
+                    dispatch_fault_with_prepared(
                         frame,
                         &counters,
                         &tasks,
@@ -2179,6 +2180,12 @@ mod tests {
                             own,
                             peers: Some(&boxes)
                         },
+                        Some(PreparedFaultPath::<_> {
+                            residency: &residency,
+                            resolver: &mut NoopPreparedResolver,
+                            roots: Some(&roots),
+                            file_slots: None
+                        }),
                         &mut cow,
                     ),
                     Action::Forward
@@ -2233,7 +2240,7 @@ mod tests {
             // forwards; it never republishes stale frame metadata on that slot.
             second.slot = 0;
             assert_eq!(
-                dispatch_fault_with_regions(
+                dispatch_fault_with_prepared(
                     &mut second,
                     &counters,
                     &tasks,
@@ -2242,6 +2249,12 @@ mod tests {
                         own: origin,
                         peers: Some(&boxes)
                     },
+                    Some(PreparedFaultPath::<_> {
+                        residency: &residency,
+                        resolver: &mut NoopPreparedResolver,
+                        roots: Some(&roots),
+                        file_slots: None
+                    }),
                     &mut cow,
                 ),
                 Action::Forward
@@ -2260,15 +2273,23 @@ mod tests {
         task.mm.key.store(7, Ordering::Release);
         let tasks = [task];
         let spaces = published_space(7, 0x8800_0000);
+        let roots = admitted_root(&spaces, 7, &[(0x4000_0000, 0x20_0000, 3)]);
+        let residency = carrick_el1_abi::FrameGrantResidencyTable::new();
         let mailbox = FrameGrantMailbox::new();
         let mut frame = write_translation_fault(0, 0x4000_1000);
         assert_eq!(
-            dispatch_fault_with_regions(
+            dispatch_fault_with_prepared(
                 &mut frame,
                 &Counters::default(),
                 &tasks,
                 carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                 GrantMailboxes::own(&mailbox),
+                Some(PreparedFaultPath::<_> {
+                    residency: &residency,
+                    resolver: &mut NoopPreparedResolver,
+                    roots: Some(&roots),
+                    file_slots: None
+                }),
                 &mut NoopCowResolver,
             ),
             Action::Forward
@@ -2318,18 +2339,26 @@ mod tests {
         task.mm.key.store(mm, Ordering::Release);
         let tasks = [task];
         let spaces = published_space(mm, (32_u64 << 48) | 0x8900_0000_0000);
+        let roots = admitted_root(&spaces, mm, &[(0x5000_0000, 0x20_0000, 3)]);
+        let residency = carrick_el1_abi::FrameGrantResidencyTable::new();
         let mailbox = FrameGrantMailbox::new();
         let counters = Counters::default();
         let mut cow_resolver = NoopCowResolver;
         let mut frame = write_translation_fault(0, 0x5000_1000);
 
         assert_eq!(
-            dispatch_fault_with_regions(
+            dispatch_fault_with_prepared(
                 &mut frame,
                 &counters,
                 &tasks,
                 carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                 GrantMailboxes::own(&mailbox),
+                Some(PreparedFaultPath::<_> {
+                    residency: &residency,
+                    resolver: &mut NoopPreparedResolver,
+                    roots: Some(&roots),
+                    file_slots: None
+                }),
                 &mut cow_resolver,
             ),
             Action::Forward
@@ -2337,12 +2366,18 @@ mod tests {
         let request = mailbox.claim_request().unwrap();
         assert!(mailbox.publish_refusal(FRAME_GRANT_ERR_DENIED));
         assert_eq!(
-            dispatch_fault_with_regions(
+            dispatch_fault_with_prepared(
                 &mut frame,
                 &counters,
                 &tasks,
                 carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                 GrantMailboxes::own(&mailbox),
+                Some(PreparedFaultPath::<_> {
+                    residency: &residency,
+                    resolver: &mut NoopPreparedResolver,
+                    roots: Some(&roots),
+                    file_slots: None
+                }),
                 &mut cow_resolver,
             ),
             Action::Forward
@@ -2392,9 +2427,7 @@ mod tests {
         let old_request = mailbox
             .claim_request()
             .expect("old mapping requested backing");
-        let old_incarnation = old_request
-            .reservation_incarnation
-            .expect("admitted anonymous request names its node");
+        let old_incarnation = old_request.reservation_incarnation;
         assert!(mailbox.publish_refusal(FRAME_GRANT_ERR_DENIED));
 
         let index = spaces.find(mm).unwrap().index();
@@ -2443,8 +2476,107 @@ mod tests {
         let new_request = mailbox
             .claim_request()
             .expect("the replacement mapping must issue its own grant request");
-        assert_ne!(new_request.reservation_incarnation, Some(old_incarnation));
-        assert!(new_request.reservation_incarnation.is_some());
+        assert_ne!(new_request.reservation_incarnation, old_incarnation);
+    }
+
+    #[test]
+    fn contended_root_retries_stale_refusal_without_untagged_request() {
+        use crate::memory::reservations::{Decision, Placement};
+        use carrick_el1_abi::{
+            ReservationBackingReceipt, ReservationCompletion, ReservationMm, ReservationProtection,
+            ReservationRange,
+        };
+        let mm = 88;
+        let va = 0x4000_5000;
+        let spaces = published_space(mm, 0x8800_0000);
+        let roots = admitted_root(&spaces, mm, &[(va, 4096, 3)]);
+        let residency = carrick_el1_abi::FrameGrantResidencyTable::new();
+        let task = CurrentTask::new();
+        task.mm.key.store(mm, Ordering::Release);
+        let tasks = [task];
+        let mailbox = FrameGrantMailbox::new();
+        let mut fault = write_translation_fault(0, va);
+        let dispatch = |frame: &mut TrapFrame| {
+            dispatch_fault_with_prepared(
+                frame,
+                &Counters::default(),
+                &tasks,
+                SpaceAccess::source_free(&spaces),
+                GrantMailboxes::own(&mailbox),
+                Some(PreparedFaultPath::<_> {
+                    residency: &residency,
+                    resolver: &mut NoopPreparedResolver,
+                    roots: Some(&roots),
+                    file_slots: None,
+                }),
+                &mut NoopCowResolver,
+            )
+        };
+        assert_eq!(dispatch(&mut fault), Action::Forward);
+        let old_request = mailbox
+            .claim_request()
+            .expect("old mapping requested backing");
+        let old_incarnation = old_request.reservation_incarnation;
+        assert!(mailbox.publish_refusal(FRAME_GRANT_ERR_DENIED));
+
+        let index = spaces.find(mm).unwrap().index();
+        let mut root = roots.lock(index, ReservationMm::new(mm).unwrap()).unwrap();
+        let range = ReservationRange::new(va, va + 4096).unwrap();
+        let Decision::Work(retire) = root.munmap(range).unwrap() else {
+            panic!("the old node must retire");
+        };
+        let completion = unsafe {
+            ReservationCompletion::after_descriptor_and_backing_commit(
+                retire,
+                ReservationBackingReceipt {
+                    receipt: retire.sequence.raw(),
+                    granted_bytes: 0,
+                    returned_bytes: 0,
+                },
+            )
+        }
+        .unwrap();
+        root.complete(completion).unwrap();
+        let Decision::Work(replace) = root
+            .mmap(
+                Placement::Fixed(va),
+                4096,
+                ReservationProtection::READ_WRITE,
+            )
+            .unwrap()
+        else {
+            panic!("VA reuse must create a new node");
+        };
+        let completion = unsafe {
+            ReservationCompletion::after_descriptor_and_backing_commit(
+                replace,
+                ReservationBackingReceipt {
+                    receipt: replace.sequence.raw(),
+                    granted_bytes: 0,
+                    returned_bytes: 0,
+                },
+            )
+        }
+        .unwrap();
+        root.complete(completion).unwrap();
+        // Root still held (host/sibling critical section) at the retry.
+        assert!(
+            !consume_refusal(GrantMailboxes::own(&mailbox), mm, va, 2, || {
+                root_mapping_incarnation(Some(&roots), SpaceAccess::source_free(&spaces), 0, mm, va)
+            }),
+            "unreadable incarnation cannot authenticate an old refusal"
+        );
+        assert_eq!(dispatch(&mut fault), Action::Forward);
+        assert!(
+            mailbox.claim_request().is_none(),
+            "contended root must not create an untagged request"
+        );
+        drop(root);
+        assert_eq!(dispatch(&mut fault), Action::Forward);
+        let new_request = mailbox
+            .claim_request()
+            .expect("the replacement mapping must issue its own grant request");
+        assert_ne!(new_request.reservation_incarnation, old_incarnation);
     }
 
     /// Guest-lane shape: a fault inside a grant EL1 already applied, before
@@ -2464,6 +2596,7 @@ mod tests {
             let tasks = [task, CurrentTask::new()];
             tasks[1].mm.key.store(mm, Ordering::Release);
             let spaces = published_space(mm, 0x8800_0000);
+            let roots = admitted_root(&spaces, mm, &[(base, 0x40_0000, 3)]);
             let boxes = FrameGrantMailboxes::new();
             let origin = boxes.slot(0).unwrap();
             let counters = Counters::default();
@@ -2482,7 +2615,7 @@ mod tests {
                     Some(PreparedFaultPath::<_> {
                         residency: &table,
                         resolver: &mut RecordingPreparedResolver::default(),
-                        roots: None,
+                        roots: Some(&roots),
                         file_slots: None,
                     }),
                     &mut NoopCowResolver,
@@ -2520,7 +2653,7 @@ mod tests {
                     Some(PreparedFaultPath::<_> {
                         residency: &table,
                         resolver: &mut RecordingPreparedResolver::default(),
-                        roots: None,
+                        roots: Some(&roots),
                         file_slots: None,
                     }),
                     &mut NoopCowResolver,
@@ -2546,7 +2679,7 @@ mod tests {
                     Some(PreparedFaultPath::<_> {
                         residency: &table,
                         resolver: &mut RecordingPreparedResolver::default(),
-                        roots: None,
+                        roots: Some(&roots),
                         file_slots: None,
                     }),
                     &mut NoopCowResolver,
