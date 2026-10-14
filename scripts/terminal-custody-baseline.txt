@@ -1,0 +1,32 @@
+# #365 S0 historical inventory: 26 decisions at design review. Numbered
+# sites remain here for provenance; the unnumbered symbol rows below are the
+# live monotone allowance for the scanner's retire/settle/reap rule.
+# 01 personality-linux lifecycle serve_exit page.try_exit
+# 02 el1 native_process_runtime exit_with_status live and claimed checks
+# 03 kernel operations exit retire_thread_in_registry participant census
+# 04 runtime vcpu_loop threads persistent_thread_exit last selection
+# 05 runtime vcpu_loop binding settle_persistent_thread_exit Busy choice
+# 06 kernel thread_ledger replenishment live word
+# 07 el1 native_process_runtime thread_exited member retention
+# 08 kernel operations exit host sched-core exit transaction
+# 09 el1 process_owner ring sched-core exit transaction
+# 10 el1 native_process_runtime exit_with_status terminal close
+# 11 el1 native_process_runtime and kernel exit parent selection
+# 12 personality-linux lifecycle raw exit to process exit_group
+# 13 el1 aarch64_process retire_mm authentication
+# 14 x86-cpl0 native_process retire_mm authentication
+# 15 runtime executor binding detached and shared MM retirement
+# 16 vmm-hvf hvf_aarch64_engine detached MM retirement variants
+# 17 runtime hvpatch mm_resources failed-exec retirement
+# 18 runtime vcpu_loop exec and vmm-hvf trap exec predecessor
+# 19 core mm retirement record and root owner
+# 20 vmm-hvf frame_inventory and foreign_mm table retirement
+# 21 el1 file_table retire_fd_map and admit_stdio
+# 22 runtime vcpu_loop threads draining file table after exit
+# 23 runtime executor backend resident task retirement
+# 24 runtime carrier teardown and drain verdict
+# 25 hal fork_stock retire_child and retire_exited_root
+# 26 kernel core and namespace identity retirement
+crates/carrick-el1/src/personality/aarch64_process.rs|Aarch64NativeProcessService < 'a , X >::retire_mm
+crates/carrick-kernel/src/el1_zone.rs|settle_vacated
+crates/carrick-kernel/src/kernel/mm_occupancy.rs|AddressSpacePublication::retire_reservations

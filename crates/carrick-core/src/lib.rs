@@ -9,6 +9,7 @@ pub mod file;
 pub mod lifecycle;
 pub mod mm;
 pub mod personality;
+pub mod terminal;
 pub mod wait;
 pub use personality::{
     CallContext, CallOrdinal, EntryDecodeError, Personality, PersonalityAbi, ServiceError, TaskId,
