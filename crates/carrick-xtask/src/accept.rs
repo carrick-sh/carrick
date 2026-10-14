@@ -105,14 +105,25 @@ pub struct StepResult {
     pub passed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Qualified `<test-binary>::<test>` names a host step reported FAILED.
+    /// Qualified `<test-binary>::<test>` names a step reported FAILED.
     /// `ci-receipt diff` keys NEW/FIXED on these, never on exit codes alone.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failed_tests: Vec<String>,
     /// Failures no test name explains: a crashed or signalled test binary, a
-    /// compile error, a step killed by a signal. Each is its own identity.
+    /// compile error, a step killed by a signal, or a `test result: FAILED`
+    /// line with empty itemization. Each is its own identity.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unitemized_failures: Vec<String>,
+    /// Qualified `<test-binary>::<test>` names that started (`test <name> ...`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub started_tests: Vec<String>,
+    /// Test binaries that printed a `test result:` summary line.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub finished_binaries: Vec<String>,
+    /// Test binaries that started or reported `test-signed: FAIL <exe>` without
+    /// printing a `test result:` summary line.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unfinished_binaries: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -427,72 +438,296 @@ fn linux_host_failure_details(log: &str, exceptions: &[LinuxHostTestException]) 
         .join("; ")
 }
 
-/// Every `test <name> ... FAILED` line, qualified by the cargo test binary
-/// announced in the preceding `Running ... (target/.../deps/<bin>-<hash>)`
-/// line, so equally named tests in different targets stay distinct.
-pub fn parse_failed_tests(log: &str) -> Vec<String> {
-    let mut binary = String::new();
-    let mut failed = std::collections::BTreeSet::new();
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParsedTestLog {
+    pub failed_tests: Vec<String>,
+    pub unitemized_failures: Vec<String>,
+    pub started_tests: Vec<String>,
+    pub finished_binaries: Vec<String>,
+    pub unfinished_binaries: Vec<String>,
+    pub saw_failed_result: bool,
+}
+
+fn binary_stem_from_path(path: &str) -> String {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    let file = match file.rsplit_once(".noent.") {
+        Some((stem, pid)) if !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) => stem,
+        _ => file,
+    };
+    match file.rsplit_once('-') {
+        Some((stem, hash))
+            if !stem.is_empty()
+                && !hash.is_empty()
+                && hash.bytes().all(|b| b.is_ascii_hexdigit()) =>
+        {
+            stem.to_string()
+        }
+        _ => file.to_string(),
+    }
+}
+
+fn is_valid_test_name(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with(':')
+        && !s.ends_with(':')
+        && !s.contains(":::")
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':')
+}
+
+fn qualify_test(binary: &str, name: &str) -> String {
+    if binary.is_empty() {
+        name.to_string()
+    } else {
+        format!("{binary}::{name}")
+    }
+}
+
+fn extract_test_line(line: &str) -> Option<(&str, &str)> {
+    let (before_dots, after_dots) = line.split_once(" ...")?;
+    if !after_dots.is_empty() && !after_dots.starts_with(' ') {
+        return None;
+    }
+    let before_trimmed = before_dots.trim_start();
+    let candidate = if let Some(rest) = before_trimmed.strip_prefix("test ") {
+        rest.trim()
+    } else if let Some((prefix, rest)) = before_dots.rsplit_once("test ") {
+        if prefix
+            .bytes()
+            .last()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return None;
+        }
+        rest.trim()
+    } else {
+        return None;
+    };
+    is_valid_test_name(candidate).then_some((candidate, after_dots.trim()))
+}
+
+/// Parse a cargo or `test-signed` log into itemized test failures, unitemized
+/// binary crashes/compile/parse errors, started test names, and finished vs
+/// unfinished test binaries.
+pub fn parse_test_log(log: &str) -> ParsedTestLog {
+    use std::collections::BTreeSet;
+
+    let mut current_binary = String::new();
+    let mut current_run_saw_result = false;
+    let mut current_run_failed_result = false;
+    let mut current_run_itemized_count = 0usize;
+    let mut in_failures_block = false;
+    let mut pending_failures: Vec<String> = Vec::new();
+    let mut saw_failed_result = false;
+
+    let mut failed_tests = BTreeSet::new();
+    let mut unitemized_failures = BTreeSet::new();
+    let mut started_tests = BTreeSet::new();
+    let mut finished_binaries = BTreeSet::new();
+    let mut unfinished_binaries = BTreeSet::new();
+
+    let start_binary = |new_binary: String,
+                        current_binary: &mut String,
+                        current_run_saw_result: &mut bool,
+                        current_run_failed_result: &mut bool,
+                        current_run_itemized_count: &mut usize,
+                        in_failures_block: &mut bool,
+                        pending_failures: &mut Vec<String>,
+                        unfinished_binaries: &mut BTreeSet<String>| {
+        if !current_binary.is_empty() && !*current_run_saw_result {
+            unfinished_binaries.insert(current_binary.clone());
+        }
+        *current_binary = new_binary;
+        *current_run_saw_result = false;
+        *current_run_failed_result = false;
+        *current_run_itemized_count = 0;
+        *in_failures_block = false;
+        pending_failures.clear();
+    };
+
     for line in log.lines() {
         let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("Running ") {
+        if let Some((_, rest)) = line.split_once("test-signed: running ")
+            && let Some(exe) = rest.split_whitespace().next()
+        {
+            start_binary(
+                binary_stem_from_path(exe),
+                &mut current_binary,
+                &mut current_run_saw_result,
+                &mut current_run_failed_result,
+                &mut current_run_itemized_count,
+                &mut in_failures_block,
+                &mut pending_failures,
+                &mut unfinished_binaries,
+            );
+            continue;
+        }
+        if let Some((_, rest)) = line.split_once("test-signed: negative control on ")
+            && let Some(exe) = rest.split_whitespace().next()
+        {
+            start_binary(
+                binary_stem_from_path(exe),
+                &mut current_binary,
+                &mut current_run_saw_result,
+                &mut current_run_failed_result,
+                &mut current_run_itemized_count,
+                &mut in_failures_block,
+                &mut pending_failures,
+                &mut unfinished_binaries,
+            );
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("Running ")
+            && !rest.trim_start().starts_with('`')
+        {
             let path = rest
                 .rsplit_once('(')
                 .and_then(|(_, tail)| tail.strip_suffix(')'))
-                .unwrap_or(rest);
-            let file = path.rsplit('/').next().unwrap_or(path);
-            binary = match file.rsplit_once('-') {
-                Some((stem, hash))
-                    if !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()) =>
-                {
-                    stem.to_string()
-                }
-                _ => file.to_string(),
-            };
+                .unwrap_or_else(|| rest.split_whitespace().next().unwrap_or(rest));
+            start_binary(
+                binary_stem_from_path(path),
+                &mut current_binary,
+                &mut current_run_saw_result,
+                &mut current_run_failed_result,
+                &mut current_run_itemized_count,
+                &mut in_failures_block,
+                &mut pending_failures,
+                &mut unfinished_binaries,
+            );
             continue;
         }
-        if let Some(name) = trimmed
-            .strip_prefix("test ")
-            .and_then(|rest| rest.strip_suffix(" ... FAILED"))
-        {
-            failed.insert(if binary.is_empty() {
-                name.to_string()
-            } else {
-                format!("{binary}::{name}")
-            });
-        }
-    }
-    failed.into_iter().collect()
-}
 
-/// Failures in a step's log that no `test ... FAILED` line names: a test
-/// binary that exited other than cargo's ordinary test failure (101), e.g. a
-/// signal, and compile errors.
-pub fn parse_unitemized_failures(log: &str) -> Vec<String> {
-    let mut found = std::collections::BTreeSet::new();
-    for line in log.lines() {
-        let trimmed = line.trim();
-        if let Some((_, rest)) = trimmed.split_once("process didn't exit successfully: `") {
-            if trimmed.contains("(exit status: 101)") {
-                continue;
+        if let Some((name, status)) = extract_test_line(line) {
+            let qualified = qualify_test(&current_binary, name);
+            if status != "ignored" && !status.starts_with("ignored,") {
+                started_tests.insert(qualified.clone());
             }
-            let program = rest.split([' ', '`']).next().unwrap_or(rest);
-            let file = program.rsplit('/').next().unwrap_or(program);
-            let binary = match file.rsplit_once('-') {
-                Some((stem, hash))
-                    if !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()) =>
-                {
-                    stem
-                }
-                _ => file,
-            };
-            found.insert(format!("crash:{binary}"));
+            if status == "FAILED" {
+                failed_tests.insert(qualified);
+                current_run_itemized_count += 1;
+            }
+        }
+
+        if let Some((_, rest)) = trimmed.split_once("process didn't exit successfully: `") {
+            if !trimmed.contains("(exit status: 101)") {
+                let program = rest.split([' ', '`']).next().unwrap_or(rest);
+                let binary = binary_stem_from_path(program);
+                unitemized_failures.insert(format!("crash:{binary}"));
+            }
         } else if let Some(rest) = trimmed.strip_prefix("error: could not compile `") {
             let krate = rest.split('`').next().unwrap_or(rest);
-            found.insert(format!("compile:{krate}"));
+            unitemized_failures.insert(format!("compile:{krate}"));
+        }
+
+        if let Some((_, rest)) = line.split_once("test-signed: FAIL ")
+            && let Some(exe) = rest.split_whitespace().next()
+        {
+            let fail_bin = binary_stem_from_path(exe);
+            let explained = current_binary == fail_bin
+                && current_run_saw_result
+                && current_run_failed_result
+                && current_run_itemized_count > 0;
+            if !explained {
+                unitemized_failures.insert(format!("crash:{fail_bin}"));
+                if current_binary != fail_bin || !current_run_saw_result {
+                    unfinished_binaries.insert(fail_bin.clone());
+                }
+            }
+            if current_binary == fail_bin {
+                current_binary.clear();
+                in_failures_block = false;
+                pending_failures.clear();
+            }
+            continue;
+        }
+
+        if trimmed == "failures:" {
+            in_failures_block = true;
+            pending_failures.clear();
+            continue;
+        }
+
+        if let Some((_, rest)) = line.split_once("test result:") {
+            let rest_trimmed = rest.trim_start();
+            if trimmed.starts_with("test result:")
+                || rest_trimmed.starts_with("ok.")
+                || rest_trimmed.starts_with("FAILED.")
+            {
+                if in_failures_block {
+                    for name in pending_failures.drain(..) {
+                        failed_tests.insert(qualify_test(&current_binary, &name));
+                        current_run_itemized_count += 1;
+                    }
+                    in_failures_block = false;
+                }
+                current_run_saw_result = true;
+                if !current_binary.is_empty() {
+                    finished_binaries.insert(current_binary.clone());
+                }
+                if rest_trimmed.starts_with("FAILED") {
+                    saw_failed_result = true;
+                    current_run_failed_result = true;
+                    if current_run_itemized_count == 0 {
+                        let tag = if current_binary.is_empty() {
+                            "empty-itemization"
+                        } else {
+                            &current_binary
+                        };
+                        unitemized_failures.insert(format!("parse-error:{tag}"));
+                    }
+                }
+                continue;
+            }
+        }
+
+        if in_failures_block {
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.starts_with("----") {
+                in_failures_block = false;
+                pending_failures.clear();
+            } else if is_valid_test_name(trimmed) {
+                pending_failures.push(trimmed.to_string());
+            }
         }
     }
-    found.into_iter().collect()
+
+    if !current_binary.is_empty() && !current_run_saw_result {
+        unfinished_binaries.insert(current_binary);
+    }
+    if saw_failed_result
+        && failed_tests.is_empty()
+        && !unitemized_failures
+            .iter()
+            .any(|u| u.starts_with("parse-error:"))
+    {
+        unitemized_failures.insert("parse-error:empty-itemization".to_string());
+    }
+
+    ParsedTestLog {
+        failed_tests: failed_tests.into_iter().collect(),
+        unitemized_failures: unitemized_failures.into_iter().collect(),
+        started_tests: started_tests.into_iter().collect(),
+        finished_binaries: finished_binaries.into_iter().collect(),
+        unfinished_binaries: unfinished_binaries.into_iter().collect(),
+        saw_failed_result,
+    }
+}
+
+/// Every failed test from `test <name> ... FAILED` lines and libtest's
+/// end-of-binary `failures:` summary blocks, qualified by the test binary
+/// announced in `Running ...` or `test-signed: running <exe>`.
+pub fn parse_failed_tests(log: &str) -> Vec<String> {
+    parse_test_log(log).failed_tests
+}
+
+/// Failures in a step's log that no itemized test failure explains: a test
+/// binary that crashed or exited non-zero without itemized `test result: FAILED`
+/// (`process didn't exit successfully` or `test-signed: FAIL <exe>`), compile
+/// errors, and `test result: FAILED` lines with empty itemization.
+pub fn parse_unitemized_failures(log: &str) -> Vec<String> {
+    parse_test_log(log).unitemized_failures
 }
 
 /// The failure text `cleanup_remaining` records for an unproven reap.
@@ -557,58 +792,13 @@ pub fn load_allowlist(path: &Path) -> Result<Vec<String>, io::Error> {
 }
 
 pub fn parse_el1_failures(log: &str) -> Vec<String> {
-    let mut failures = Vec::new();
-    let mut in_failures_block = false;
-
-    for line in log.lines() {
-        let trimmed = line.trim();
-        if trimmed == "failures:" {
-            in_failures_block = true;
-            continue;
-        }
-
-        if in_failures_block {
-            if trimmed.is_empty() {
-                continue;
-            }
-            if trimmed.starts_with("test result:") {
-                in_failures_block = false;
-                continue;
-            }
-            if trimmed.starts_with("----") {
-                continue;
-            }
-            let test_name = trimmed.rsplit("::").next().unwrap_or(trimmed);
-            if !test_name.is_empty()
-                && test_name
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
-                && !failures.contains(&test_name.to_string())
-            {
-                failures.push(test_name.to_string());
-            }
-        } else if (trimmed.starts_with("test ") && trimmed.ends_with("FAILED"))
-            || trimmed.ends_with("... FAILED")
-        {
-            let without_failed = trimmed.strip_suffix("FAILED").unwrap_or(trimmed).trim();
-            let test_part = without_failed
-                .strip_suffix("...")
-                .unwrap_or(without_failed)
-                .trim();
-            let test_part = test_part.strip_prefix("test ").unwrap_or(test_part).trim();
-            let test_name = test_part.rsplit("::").next().unwrap_or(test_part);
-            if !test_name.is_empty()
-                && test_name
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
-                && !failures.contains(&test_name.to_string())
-            {
-                failures.push(test_name.to_string());
-            }
-        }
-    }
-
+    let mut failures: Vec<String> = parse_test_log(log)
+        .failed_tests
+        .into_iter()
+        .map(|name| name.rsplit("::").next().unwrap_or(&name).to_string())
+        .collect();
     failures.sort();
+    failures.dedup();
     failures
 }
 
@@ -638,6 +828,110 @@ pub fn compare_el1_failures(actual_failures: &[String], allowlist: &[String]) ->
         allowlist: allowlist_sorted,
         unexpected_failures,
         now_passing,
+    }
+}
+
+/// Evaluate the `el1-embed` step log and exit code against `allowlist`.
+/// A non-zero exit passes ONLY when every failure is itemized AND allowlisted
+/// AND every started binary finished with a `test result:` summary line.
+pub fn evaluate_el1_step(
+    exit_code: Option<i32>,
+    log_content: &str,
+    allowlist: &[String],
+) -> (El1Comparison, bool, Option<String>) {
+    let parsed = parse_test_log(log_content);
+    let actual_failures = parse_el1_failures(log_content);
+    let comparison = compare_el1_failures(&actual_failures, allowlist);
+
+    let mut reasons = Vec::new();
+    if !comparison.unexpected_failures.is_empty() {
+        reasons.push(format!(
+            "el1 unexpected failures: {}",
+            comparison.unexpected_failures.join(", ")
+        ));
+    }
+    if parsed.saw_failed_result && parsed.failed_tests.is_empty() {
+        reasons.push("el1 parse error: test result: FAILED with empty itemization".to_string());
+    }
+    if !parsed.unitemized_failures.is_empty() {
+        reasons.push(format!(
+            "el1 unitemized failures: {}",
+            parsed.unitemized_failures.join(", ")
+        ));
+    }
+    if !parsed.unfinished_binaries.is_empty() {
+        reasons.push(format!(
+            "el1 unfinished binaries: {}",
+            parsed.unfinished_binaries.join(", ")
+        ));
+    }
+    if exit_code != Some(0)
+        && reasons.is_empty()
+        && (parsed.failed_tests.is_empty() || parsed.finished_binaries.is_empty())
+    {
+        reasons.push(format!(
+            "el1 step crashed before executing tests (exit code {})",
+            exit_code.unwrap_or(-1)
+        ));
+    }
+
+    if reasons.is_empty() {
+        (comparison, true, None)
+    } else {
+        (comparison, false, Some(reasons.join("; ")))
+    }
+}
+
+/// Populate `step` from its log and fail closed if the log contains
+/// `test result: FAILED` with empty itemization or unitemized/unfinished
+/// binary failures.
+pub fn populate_step_from_log(step: &mut StepResult, log: &str, failures: &mut Vec<String>) {
+    let parsed = parse_test_log(log);
+    step.failed_tests = parsed.failed_tests;
+    step.unitemized_failures = parsed.unitemized_failures;
+    step.started_tests = parsed.started_tests;
+    step.finished_binaries = parsed.finished_binaries;
+    step.unfinished_binaries = parsed.unfinished_binaries;
+    if !step.passed
+        && step.exit_code.is_none()
+        && !step.unitemized_failures.iter().any(|u| u == "signal")
+    {
+        step.unitemized_failures.push("signal".into());
+    }
+    let has_parse_error = (parsed.saw_failed_result && step.failed_tests.is_empty())
+        || step
+            .unitemized_failures
+            .iter()
+            .any(|u| u.starts_with("parse-error:"));
+    if has_parse_error {
+        let msg = format!(
+            "step '{}' parse error: test result: FAILED present with empty itemization",
+            step.name
+        );
+        step.passed = false;
+        if step.error.is_none() {
+            step.error = Some(msg.clone());
+        }
+        if !failures.iter().any(|f| f.contains("empty itemization")) {
+            failures.push(msg);
+        }
+    } else if step.passed
+        && (!step.unitemized_failures.is_empty() || !step.unfinished_binaries.is_empty())
+    {
+        let mut details = step.unitemized_failures.clone();
+        for bin in &step.unfinished_binaries {
+            details.push(format!("unfinished:{bin}"));
+        }
+        let msg = format!(
+            "step '{}' had unitemized or unfinished failures: {}",
+            step.name,
+            details.join(", ")
+        );
+        step.passed = false;
+        if step.error.is_none() {
+            step.error = Some(msg.clone());
+        }
+        failures.push(msg);
     }
 }
 
@@ -1043,6 +1337,9 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 error,
                 failed_tests: Vec::new(),
                 unitemized_failures: Vec::new(),
+                started_tests: Vec::new(),
+                finished_binaries: Vec::new(),
+                unfinished_binaries: Vec::new(),
             });
         }
     }
@@ -1099,6 +1396,9 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
             error,
             failed_tests: Vec::new(),
             unitemized_failures: Vec::new(),
+            started_tests: Vec::new(),
+            finished_binaries: Vec::new(),
+            unfinished_binaries: Vec::new(),
         });
     }
 
@@ -1211,6 +1511,9 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 error,
                 failed_tests: Vec::new(),
                 unitemized_failures: Vec::new(),
+                started_tests: Vec::new(),
+                finished_binaries: Vec::new(),
+                unfinished_binaries: Vec::new(),
             });
         }
 
@@ -1251,11 +1554,11 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
             }
 
             let log_content = fs::read_to_string(&log_path).unwrap_or_default();
-            let actual_failures = parse_el1_failures(&log_content);
             let allowlist_path = root.join("scripts/conformance/el1-known-red.txt");
             let allowlist = load_allowlist(&allowlist_path).unwrap_or_default();
 
-            let comparison = compare_el1_failures(&actual_failures, &allowlist);
+            let (comparison, passed, error) =
+                evaluate_el1_step(exit_code, &log_content, &allowlist);
 
             if !comparison.now_passing.is_empty() {
                 println!(
@@ -1264,24 +1567,8 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 );
             }
 
-            let mut passed = comparison.unexpected_failures.is_empty();
-            let mut error = None;
-
-            if !comparison.unexpected_failures.is_empty() {
-                let msg = format!(
-                    "el1 unexpected failures: {}",
-                    comparison.unexpected_failures.join(", ")
-                );
+            if let Some(msg) = &error {
                 failures.push(msg.clone());
-                error = Some(msg);
-            } else if exit_code != Some(0) && actual_failures.is_empty() {
-                passed = false;
-                let msg = format!(
-                    "el1 step crashed before executing tests (exit code {})",
-                    exit_code.unwrap_or(-1)
-                );
-                failures.push(msg.clone());
-                error = Some(msg);
             }
 
             el1_summary = Some(comparison);
@@ -1296,6 +1583,9 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 error,
                 failed_tests: Vec::new(),
                 unitemized_failures: Vec::new(),
+                started_tests: Vec::new(),
+                finished_binaries: Vec::new(),
+                unfinished_binaries: Vec::new(),
             });
         }
 
@@ -1358,6 +1648,9 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 error,
                 failed_tests: Vec::new(),
                 unitemized_failures: Vec::new(),
+                started_tests: Vec::new(),
+                finished_binaries: Vec::new(),
+                unfinished_binaries: Vec::new(),
             });
         }
 
@@ -1435,6 +1728,9 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 error,
                 failed_tests: Vec::new(),
                 unitemized_failures: Vec::new(),
+                started_tests: Vec::new(),
+                finished_binaries: Vec::new(),
+                unfinished_binaries: Vec::new(),
             });
         }
 
@@ -1508,6 +1804,9 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 error,
                 failed_tests: Vec::new(),
                 unitemized_failures: Vec::new(),
+                started_tests: Vec::new(),
+                finished_binaries: Vec::new(),
+                unfinished_binaries: Vec::new(),
             });
         }
 
@@ -1565,6 +1864,9 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                     error,
                     failed_tests: Vec::new(),
                     unitemized_failures: Vec::new(),
+                    started_tests: Vec::new(),
+                    finished_binaries: Vec::new(),
+                    unfinished_binaries: Vec::new(),
                 });
             }
 
@@ -1644,6 +1946,9 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                     error,
                     failed_tests: Vec::new(),
                     unitemized_failures: Vec::new(),
+                    started_tests: Vec::new(),
+                    finished_binaries: Vec::new(),
+                    unfinished_binaries: Vec::new(),
                 });
             }
 
@@ -1722,6 +2027,9 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                     error,
                     failed_tests: Vec::new(),
                     unitemized_failures: Vec::new(),
+                    started_tests: Vec::new(),
+                    finished_binaries: Vec::new(),
+                    unfinished_binaries: Vec::new(),
                 });
             }
         } else {
@@ -1748,17 +2056,15 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
         clean_tree = false;
         failures.push(error.to_string());
     }
-    let overall = if failures.is_empty() { "PASS" } else { "FAIL" };
     // Allowlisted failures still count: baseline comparison needs the whole
-    // failing set, not only what made this receipt FAIL.
+    // failing set, not only what made this receipt FAIL. Populate step logs
+    // before computing `overall` so parse errors and unitemized failures flip
+    // the gate verdict to FAIL.
     for step in &mut step_results {
         let log = fs::read_to_string(&step.log_path).unwrap_or_default();
-        step.failed_tests = parse_failed_tests(&log);
-        step.unitemized_failures = parse_unitemized_failures(&log);
-        if !step.passed && step.exit_code.is_none() {
-            step.unitemized_failures.push("signal".into());
-        }
+        populate_step_from_log(step, &log, &mut failures);
     }
+    let overall = if failures.is_empty() { "PASS" } else { "FAIL" };
 
     let receipt = AcceptReceipt {
         schema_version: 1,
@@ -2140,6 +2446,9 @@ thread 'test_probe_futex' panicked at 'explicit panic', tests/foo.rs:12:5
                 error: None,
                 failed_tests: Vec::new(),
                 unitemized_failures: Vec::new(),
+                started_tests: Vec::new(),
+                finished_binaries: Vec::new(),
+                unfinished_binaries: Vec::new(),
             }],
             skipped_steps: vec!["ltp".to_string()],
             artifact: None,

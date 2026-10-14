@@ -113,11 +113,12 @@ fn candidate_receipt(
     Ok(dir.join(name).join("receipt.json"))
 }
 
-/// Stable failure identities of one receipt: failed tests, probe diffs and
-/// unitemized failures (crashes, signals, compile errors) each by name. A
-/// failed step adds its own key whenever anything in it is unitemized, or
-/// nothing was itemized at all, so a crash is never hidden behind a test
-/// failure the base also had.
+/// Stable failure identities of one receipt: failed tests, probe diffs,
+/// unfinished binaries and unitemized failures (crashes, signals, compile
+/// errors, empty itemization on `test result: FAILED`) each by name. A step
+/// adds its own key whenever anything in it is unitemized or unfinished, or
+/// when a failed step has nothing itemized at all, so a crash or aborted
+/// binary is never hidden behind a test failure the base also had.
 pub fn failure_keys(receipt: &AcceptReceipt) -> BTreeSet<String> {
     let mut keys = BTreeSet::new();
     for step in &receipt.steps {
@@ -135,8 +136,13 @@ pub fn failure_keys(receipt: &AcceptReceipt) -> BTreeSet<String> {
         for failure in &step.unitemized_failures {
             keys.insert(format!("unitemized:{}:{failure}", step.name));
         }
+        for bin in &step.unfinished_binaries {
+            keys.insert(format!("unfinished:{bin}"));
+        }
         let itemized = !step.failed_tests.is_empty() || !probes.is_empty();
-        if !step.passed && (!itemized || !step.unitemized_failures.is_empty()) {
+        let has_unitemized =
+            !step.unitemized_failures.is_empty() || !step.unfinished_binaries.is_empty();
+        if (!step.passed && !itemized) || has_unitemized {
             keys.insert(format!("step:{}", step.name));
         }
     }
@@ -173,7 +179,10 @@ pub struct ReceiptDiff {
 }
 
 /// Compare two receipts of the same gate. Different phases or profiles are
-/// different gates; comparing them would invent NEW/FIXED entries.
+/// different gates; comparing them would invent NEW/FIXED entries. Any test
+/// the baseline started that the candidate did not (`missing:<bin>::<test>`)
+/// or binary the baseline finished that the candidate did not
+/// (`unfinished:<bin>`) is added as a NEW failure key.
 pub fn diff(
     baseline: &AcceptReceipt,
     candidate: &AcceptReceipt,
@@ -185,7 +194,31 @@ pub fn diff(
         )));
     }
     let base = failure_keys(baseline);
-    let next = failure_keys(candidate);
+    let mut next = failure_keys(candidate);
+    for base_step in &baseline.steps {
+        let cand_started: BTreeSet<&str> = candidate
+            .steps
+            .iter()
+            .filter(|s| s.name == base_step.name)
+            .flat_map(|s| s.started_tests.iter().map(String::as_str))
+            .collect();
+        for test in &base_step.started_tests {
+            if !cand_started.contains(test.as_str()) {
+                next.insert(format!("missing:{test}"));
+            }
+        }
+        let cand_finished: BTreeSet<&str> = candidate
+            .steps
+            .iter()
+            .filter(|s| s.name == base_step.name)
+            .flat_map(|s| s.finished_binaries.iter().map(String::as_str))
+            .collect();
+        for bin in &base_step.finished_binaries {
+            if !cand_finished.contains(bin.as_str()) {
+                next.insert(format!("unfinished:{bin}"));
+            }
+        }
+    }
     Ok(ReceiptDiff {
         new: next.difference(&base).cloned().collect(),
         fixed: base.difference(&next).cloned().collect(),

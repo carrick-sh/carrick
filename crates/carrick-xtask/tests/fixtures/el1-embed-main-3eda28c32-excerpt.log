@@ -1,0 +1,106 @@
+     Running `target/debug/carrick-xtask worktree-run -- /bin/bash scripts/lib/test-signed-body.sh carrick-embed el1_ --nocapture`
+     Running `target/debug/carrick-xtask host-lease --mode carrick --check-load -- true`
+test-signed: signed /Volumes/CaseSensitive/carrick-signed/wt/signed-main/target/release/deps/el1_gic-ee0e960234e427a0
+test-signed: signed /Volumes/CaseSensitive/carrick-signed/wt/signed-main/target/release/deps/el1_kick_served_loop-a52172b471abd796
+test-signed: signed /Volumes/CaseSensitive/carrick-signed/wt/signed-main/target/release/deps/el1_inotify-04308bbc401ae412
+test-signed: signed /Volumes/CaseSensitive/carrick-signed/wt/signed-main/target/release/deps/el1_host_copyout-983cd9ce6da5d7a1
+test-signed: running /Volumes/CaseSensitive/carrick-signed/wt/signed-main/target/release/deps/el1_gic-ee0e960234e427a0 el1_ --nocapture
+
+running 2 tests
+test el1_gic_el0_id_view_hides_the_gic ... el1-gic-id-view id_aa64pfr0_gic=0 CarrierGicSnapshot { gic: true, generation: 1, vcpus: 12, capacity: 256 }
+ok
+test el1_gic_vtimer_reaches_el1_without_host_exits ... el1-gic-vtimer VtimerProbeReport { armed: false, delivered: false, vcpu: 0, host_initiated_exits: 0, other_exits: 0 } vtimer_taken=0 kick_sgis_taken=2 lseek served=2001000 forwarded=0
+
+thread 'el1_gic_vtimer_reaches_el1_without_host_exits' (175899606) panicked at crates/carrick-embed/tests/el1_gic.rs:135:5:
+no vCPU resumed the marker syscall: VtimerProbeReport { armed: false, delivered: false, vcpu: 0, host_initiated_exits: 0, other_exits: 0 }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    el1_gic_vtimer_reaches_el1_without_host_exits
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+
+test-signed: FAIL /Volumes/CaseSensitive/carrick-signed/wt/signed-main/target/release/deps/el1_gic-ee0e960234e427a0
+test-signed: running /Volumes/CaseSensitive/carrick-signed/wt/signed-main/target/release/deps/el1_kick_served_loop-a52172b471abd796 el1_ --nocapture
+
+running 2 tests
+test el1_served_burst_surfaces_kicks_under_oversubscription ... el1-served-loop-kick mode=burst served loop kick max_ns=45102458 cycles=20000 lseeks=568929 el1 lseek served=568929 forwarded=0
+
+thread 'el1_served_burst_surfaces_kicks_under_oversubscription' (175902609) panicked at crates/carrick-embed/tests/el1_kick_served_loop.rs:169:5:
+mode burst: only 568929 lseeks served in EL1 (forwarded 0); the kicks did not land in the served path
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test el1_served_loop_surfaces_kicks ... el1-served-loop-kick mode=loop served loop kick max_ns=231500 cycles=2000 lseeks=61462 el1 lseek served=59945 forwarded=1517
+ok
+
+failures:
+
+failures:
+    el1_served_burst_surfaces_kicks_under_oversubscription
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 9.35s
+
+test-signed: FAIL /Volumes/CaseSensitive/carrick-signed/wt/signed-main/target/release/deps/el1_kick_served_loop-a52172b471abd796
+test-signed: running /Volumes/CaseSensitive/carrick-signed/wt/signed-main/target/release/deps/el1_inotify-04308bbc401ae412 el1_ --nocapture
+
+running 4 tests
+test el1_inotify09_contract ... 
+thread 'el1_inotify09_contract' (175902886) panicked at crates/carrick-embed/tests/common/mod.rs:158:21:
+container run failed: runtime failure: filesystem backend error: failed to run ELF from dispatcher: trap engine failed: hypervisor operation failed: restore vfork parent identity page: guest memory read is out of bounds at 0x2d001e4010 for 4 bytes
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test el1_inotify_contract ... el1_inotify_contract population: DelegationCounts { delegations: 28, recalls: 28, host_served: 0, tableless_publishes: 0, revalidated_records: 0, refusals: [(FileTooLarge, 3), (Unregistered, 4)], recall_triggers: [("crates/carrick-kernel/src/el1_delegation/owned_recall.rs:312", 28)] }
+el1_inotify_contract: add_watch served=1000, fwd=1; rm_watch served=1001, fwd=0; write served=1000; seek served=1026
+ok
+test el1_inotify_queue_shape ... ok
+test el1_inotify_recall_on_dir_watch ... ok
+
+failures:
+
+failures:
+    el1_inotify09_contract
+
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+test-signed: FAIL /Volumes/CaseSensitive/carrick-signed/wt/signed-main/target/release/deps/el1_inotify-04308bbc401ae412
+test-signed: running /Volumes/CaseSensitive/carrick-signed/wt/signed-main/target/release/deps/el1_host_copyout-983cd9ce6da5d7a1 el1_ --nocapture
+
+running 3 tests
+test el1_file_mmap_replaces_a_live_anonymous_grant ... 
+thread 'el1_file_mmap_replaces_a_live_anonymous_grant' (175903019) panicked at crates/carrick-embed/tests/el1_host_copyout.rs:63:5:
+exit_code=139 stdout="" stderr=fatal runtime error: assertion failed: signal(libc::SIGPIPE, handler) != libc::SIG_ERR, aborting
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test el1_host_buffers_follow_reused_mapping_in_two_live_processes ... 
+thread 'el1_host_buffers_follow_reused_mapping_in_two_live_processes' (175903040) panicked at crates/carrick-embed/tests/el1_host_copyout.rs:84:5:
+exit_code=139 stdout="" stderr=fatal runtime error: assertion failed: signal(libc::SIGPIPE, handler) != libc::SIG_ERR, aborting
+
+FAILED
+test el1_host_copyout_into_and_out_of_untouched_reserved_memory ... 
+thread 'el1_host_copyout_into_and_out_of_untouched_reserved_memory' (175903060) panicked at crates/carrick-embed/tests/el1_host_copyout.rs:34:5:
+exit_code=139 stdout="" stderr=fatal runtime error: assertion failed: signal(libc::SIGPIPE, handler) != libc::SIG_ERR, aborting
+FAILED
+
+failures:
+
+failures:
+    el1_file_mmap_replaces_a_live_anonymous_grant
+    el1_host_buffers_follow_reused_mapping_in_two_live_processes
+    el1_host_copyout_into_and_out_of_untouched_reserved_memory
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+test-signed: FAIL /Volumes/CaseSensitive/carrick-signed/wt/signed-main/target/release/deps/el1_host_copyout-983cd9ce6da5d7a1
+/Volumes/CaseSensitive/carrick-signed/wt/signed-main/target/release/deps/entitlement_negative-4200a979868e911a.noent.14090: replacing existing signature
+test-signed: negative control on /Volumes/CaseSensitive/carrick-signed/wt/signed-main/target/release/deps/entitlement_negative-4200a979868e911a.noent.14090
+
+running 1 test
+test unsigned_executable_maps_hv_denied_to_entitlement ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+test-signed: FAILED (carrick-embed)
