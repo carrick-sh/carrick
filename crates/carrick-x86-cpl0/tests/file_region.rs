@@ -265,6 +265,10 @@ fn file_region_fork_dup_lookup_and_retire_preserve_live_parent() {
 
 #[test]
 fn file_region_unpublished_is_distinct_from_retired() {
+    assert_ne!(
+        FileRegionError::Running.fatal_payload(),
+        FileRegionError::MutationActive.fatal_payload()
+    );
     let mut fixture = Fixture::new(7);
     let published = fixture.registration.binding();
     assert!(matches!(

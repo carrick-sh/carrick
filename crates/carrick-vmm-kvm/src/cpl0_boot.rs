@@ -2360,7 +2360,7 @@ impl Cpl0HostCustody {
         // A kick may stop CPL0 inside a descriptor transaction. Execution
         // exclusion prevents reentry while its shared lock state is checked.
         if tables.fd_map()[0].mutation_active() {
-            return Err(carrick_el1_abi::FileRegionError::Running);
+            return Err(carrick_el1_abi::FileRegionError::MutationActive);
         }
         Ok(StoppedFileTables {
             tables,
@@ -6867,7 +6867,7 @@ mod cpl0_layout_tests {
         );
         let refused = matches!(
             carrier.file_tables(binding),
-            Err(carrick_el1_abi::FileRegionError::Running)
+            Err(carrick_el1_abi::FileRegionError::MutationActive)
         );
         // Complete the actual guest unlock before asserting; no held lock leaks.
         assert!(matches!(

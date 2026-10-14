@@ -1132,6 +1132,7 @@ fn file_region_guest_fork_dup_and_child_retirement_preserve_parent() {
     // Complete the real child's retirement and stop its now-idle executor.
     // The watcher only bounds the fixture; it does not complete guest exit.
     let kick = carrick_vmm_kvm::KvmKickHandle::for_current_thread();
+    let stopped = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|scope| {
         let watcher = scope.spawn(|| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1139,7 +1140,7 @@ fn file_region_guest_fork_dup_and_child_retirement_preserve_parent() {
                 .fixture_native_cpu_idle(carrick_guest_arch::CpuId::new(1))
                 .expect("idle state")
             {
-                if std::time::Instant::now() >= deadline {
+                if stopped.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
                     kick.kick();
                     return false;
                 }
@@ -1148,7 +1149,9 @@ fn file_region_guest_fork_dup_and_child_retirement_preserve_parent() {
             kick.kick();
             true
         });
-        peer.fixture_run_idle_peer().expect("finish child exit");
+        let exit = peer.fixture_run_idle_peer();
+        stopped.store(true, Ordering::Release);
+        exit.expect("finish child exit");
         assert!(
             watcher.join().expect("idle watcher"),
             "child retirement deadline"
