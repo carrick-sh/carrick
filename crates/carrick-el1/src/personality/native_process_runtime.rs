@@ -703,6 +703,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
 
     /// Renew retained execution custody (including Born -> issued adoption).
     /// The process key and address incarnation remain owned by the same graph.
+    #[inline(never)]
     pub fn rehome_entry(
         &self,
         source: BornInZoneSource<'a, C>,
@@ -739,7 +740,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         if !core::ptr::eq(resources.page, page)
             || resources.address != address
             || (control.entry().is_none()
-                && (!core::ptr::eq(resources.control, control) || process.id != key.task.id()))
+                && core::ptr::eq(resources.control, control) != (process.id == key.task.id()))
             || current.metadata.lifecycle_page.load(Ordering::Acquire) != page as *const _ as u64
             || current.metadata.control_slot.load(Ordering::Acquire) != control as *const _ as u64
         {
@@ -915,6 +916,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
     /// Authenticate an existing thread-lifecycle member before lending its
     /// process owner. An equal MM key without the exact lifecycle publication
     /// cannot confer membership.
+    #[inline(never)]
     pub fn register_thread(
         &self,
         source: BornInZoneSource<'a, C>,
@@ -933,16 +935,6 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         {
             return Err(NativeProcessError::Stale);
         }
-        let entry = control.entry().ok_or(NativeProcessError::Stale)?;
-        let born = page.born_record(entry).ok_or(NativeProcessError::Stale)?;
-        let identity = page.identity(entry).ok_or(NativeProcessError::Stale)?;
-        if page.control_address(entry) != Some(core::ptr::from_ref(control).addr() as u64)
-            || u64::from(identity.tid) != binding.task.raw()
-            || identity.thread_serial != binding.thread_generation.raw()
-            || born.clone_flags & 0x0001_0000 == 0
-        {
-            return Err(NativeProcessError::Stale);
-        }
         let record = source
             .zone
             .slot(source.slot)
@@ -954,6 +946,28 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         if control.zone_record() != Some(source.zone.record_ref(record)) {
             return Err(NativeProcessError::Stale);
         }
+        let (visible_tid, host_issued) = if let Some(entry) = control.entry() {
+            let born = page.born_record(entry).ok_or(NativeProcessError::Stale)?;
+            let identity = page.identity(entry).ok_or(NativeProcessError::Stale)?;
+            if page.control_address(entry) != Some(core::ptr::from_ref(control).addr() as u64)
+                || u64::from(identity.tid) != binding.task.raw()
+                || identity.thread_serial != binding.thread_generation.raw()
+                || born.clone_flags & 0x0001_0000 == 0
+            {
+                return Err(NativeProcessError::Stale);
+            }
+            (identity.visible_tid, None)
+        } else {
+            let issued = IssuedHostThread::authenticate(
+                source,
+                binding,
+                visible_pid,
+                page,
+                control,
+                record,
+            )?;
+            (issued.visible_tid, Some(issued))
+        };
         let group_key = Self::group_key(source.zone, address, page, visible_pid);
         let mut state = self.state.lock();
         let (runtime, process) = state
@@ -974,25 +988,29 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 .owner
                 .task_mut(process)
                 .map_err(|_| NativeProcessError::Stale)?;
-            let resources = row.native_mut().resources_mut();
-            if !core::ptr::eq(resources.page, page) {
-                return Err(NativeProcessError::Stale);
-            }
-            let imported = resources
-                .members
-                .iter()
-                .find(|member| member.thread.id() == key.task.id());
-            if imported.is_some_and(|member| {
-                !core::ptr::eq(member.control, control)
-                    || (member.record != source.zone.record_ref(record)
-                        && signal_record_exists(source.zone, member.record))
-            }) {
-                return Err(NativeProcessError::Stale);
-            }
-            let already_owned = imported.is_some();
-            if row.credentials_for(identity.visible_tid).is_err() {
+            let already_owned = if let Some(issued) = host_issued {
+                issued.authorize_group(source, row, address, page, control)?
+            } else {
+                let resources = row.native_mut().resources_mut();
+                if !core::ptr::eq(resources.page, page) {
+                    return Err(NativeProcessError::Stale);
+                }
+                let imported = resources
+                    .members
+                    .iter()
+                    .find(|member| member.thread.id() == key.task.id());
+                if imported.is_some_and(|member| {
+                    !core::ptr::eq(member.control, control)
+                        || (member.record != source.zone.record_ref(record)
+                            && signal_record_exists(source.zone, member.record))
+                }) {
+                    return Err(NativeProcessError::Stale);
+                }
+                imported.is_some()
+            };
+            if row.credentials_for(visible_tid).is_err() {
                 let caller_tid = row.metadata().namespace_pid;
-                row.spawn_thread(caller_tid, identity.visible_tid)
+                row.spawn_thread(caller_tid, visible_tid)
                     .map_err(|_| NativeProcessError::Invalid)?;
             }
             if already_owned {
@@ -1071,6 +1089,105 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             }
         }
         state.groups.remove(&group);
+    }
+}
+
+/// Proof that a non-pooled thread carries an exact host-issued execution
+/// binding and retained control slot for an already-admitted thread group.
+#[derive(Clone, Copy)]
+struct IssuedHostThread {
+    key: TaskKey,
+    visible_pid: u32,
+    visible_tid: u32,
+    file_table: u64,
+    record: RecordRef,
+}
+
+impl IssuedHostThread {
+    fn authenticate<C: ProcessContext>(
+        source: BornInZoneSource<'_, C>,
+        binding: ExecutionBinding,
+        visible_pid: u32,
+        page: &ThreadLifecyclePage,
+        control: &ThreadControlSlot,
+        record: carrick_sched_core::RecordId,
+    ) -> Result<Self, NativeProcessError> {
+        if !binding.issued() || control.entry().is_some() {
+            return Err(NativeProcessError::Stale);
+        }
+        let key = NativeThreadIdentity::from_binding(binding)?
+            .issued()
+            .ok_or(NativeProcessError::Stale)?;
+        let visible_tid = control.visible_tid().ok_or(NativeProcessError::Stale)?;
+        let record_ref = source.zone.record_ref(record);
+        if control.zone_record() != Some(record_ref) {
+            return Err(NativeProcessError::Stale);
+        }
+        let identity = source.zone.record(record).identity();
+        if identity.tid != binding.task.raw()
+            || identity.generation != binding.generation.raw()
+            || identity.serial != binding.thread_generation.raw()
+            || identity.mm != binding.mm.raw()
+            || identity.lifecycle_page != core::ptr::from_ref(page).addr() as u64
+            || identity.control_slot != core::ptr::from_ref(control).addr() as u64
+        {
+            return Err(NativeProcessError::Stale);
+        }
+        Ok(Self {
+            key,
+            visible_pid,
+            visible_tid,
+            file_table: identity.file_table,
+            record: record_ref,
+        })
+    }
+
+    fn authorize_group<'a, M: Clone, C: ProcessContext>(
+        self,
+        source: BornInZoneSource<'a, C>,
+        row: &NativeIdentityTask<'a, M, C>,
+        address: AddressContext<RootGpa>,
+        page: &ThreadLifecyclePage,
+        control: &ThreadControlSlot,
+    ) -> Result<bool, NativeProcessError> {
+        let namespace_pid = row.metadata().namespace_pid;
+        if self.visible_pid != namespace_pid || self.visible_tid == namespace_pid {
+            return Err(NativeProcessError::Stale);
+        }
+        let resources = row.native().resources();
+        if !core::ptr::eq(resources.page, page)
+            || resources.address != address
+            || resources.file_table != self.file_table
+            || core::ptr::eq(resources.control, control)
+            || resources.page.gate() != carrick_el1_abi::GateState::Open
+            || resources.page.live() <= 1
+        {
+            return Err(NativeProcessError::Stale);
+        }
+        if let Some(existing) = resources
+            .members
+            .iter()
+            .find(|member| member.thread.id() == self.key.id)
+        {
+            if existing.thread != NativeThreadIdentity::Issued(self.key)
+                || !core::ptr::eq(existing.control, control)
+                || (existing.record != self.record
+                    && signal_record_exists(source.zone, existing.record))
+            {
+                return Err(NativeProcessError::Stale);
+            }
+            return Ok(true);
+        }
+        if resources
+            .members
+            .iter()
+            .any(|member| core::ptr::eq(member.control, control) || member.record == self.record)
+            || resources.members.len() >= resources.page.live() as usize
+            || row.credentials_for(self.visible_tid).is_ok()
+        {
+            return Err(NativeProcessError::Stale);
+        }
+        Ok(false)
     }
 }
 
@@ -1545,6 +1662,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
     /// Enter through the exact process registry. A non-leader thread retains
     /// its own execution binding and context, while process operations name
     /// the graph row of its authenticated thread group.
+    #[inline(always)]
     pub fn enter_registered<'r, S: NativeProcessService<'a, C, Mm = M>>(
         &'r self,
         registry: &NativeProcessRegistry<'a, M, C>,
@@ -1554,6 +1672,50 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         words: C,
         service: &'r mut S,
     ) -> Result<NativeProcessEntry<'r, 'a, M, C, S>, NativeProcessError> {
+        let (binding, record, member_control, process, calling_tid) =
+            self.authenticate_registered(registry, source, current, address, &words)?;
+        Ok(NativeProcessEntry {
+            runtime: self,
+            source,
+            current,
+            binding,
+            record,
+            control: member_control,
+            key: process,
+            caller_address: address,
+            words,
+            service,
+            handoff: None,
+            root_exit: None,
+            run_failure: None,
+            #[cfg(test)]
+            publication_wait_probe: None,
+            #[cfg(test)]
+            exit_notification_probe: None,
+            calling_tid,
+            slot: Some(member_control),
+            interrupted_child_wait: None,
+        })
+    }
+
+    #[inline(never)]
+    fn authenticate_registered(
+        &self,
+        registry: &NativeProcessRegistry<'a, M, C>,
+        source: BornInZoneSource<'a, C>,
+        current: &'a CurrentTask,
+        address: AddressContext<RootGpa>,
+        words: &C,
+    ) -> Result<
+        (
+            ExecutionBinding,
+            RecordRef,
+            &'a ThreadControlSlot,
+            TaskKey,
+            u32,
+        ),
+        NativeProcessError,
+    > {
         if !core::ptr::eq(source.zone, self.zone) {
             return Err(NativeProcessError::Stale);
         }
@@ -1604,42 +1766,27 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         {
             return Err(NativeProcessError::Stale);
         }
-        member_control.bind_zone_record(source.zone.record_ref(record));
+        let record_ref = source.zone.record_ref(record);
+        member_control.bind_zone_record(record_ref);
         if core::ptr::eq(member_control, resources.control) {
-            if resources.record != source.zone.record_ref(record) {
+            if resources.record != record_ref {
                 return Err(NativeProcessError::Stale);
             }
-            *row.context_mut() = words;
+            *row.context_mut() = *words;
         }
-        let slot = Some(member_control);
         let calling_tid = member_control
             .visible_tid()
             .ok_or(NativeProcessError::Stale)?;
         row.credentials_for(calling_tid)
             .map_err(|_| NativeProcessError::Stale)?;
         drop(graph);
-        Ok(NativeProcessEntry {
-            runtime: self,
-            source,
-            current,
+        Ok((
             binding,
-            record: source.zone.record_ref(record),
-            control: member_control,
-            key: member.process,
-            caller_address: address,
-            words,
-            service,
-            handoff: None,
-            root_exit: None,
-            run_failure: None,
-            #[cfg(test)]
-            publication_wait_probe: None,
-            #[cfg(test)]
-            exit_notification_probe: None,
+            record_ref,
+            member_control,
+            member.process,
             calling_tid,
-            slot,
-            interrupted_child_wait: None,
-        })
+        ))
     }
     pub fn namespace_child_key(&self, caller: TaskKey, visible: u32) -> Option<TaskKey> {
         self.graph
@@ -3664,6 +3811,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         let resources = target.native().resources();
         if tid == target.metadata().namespace_pid {
             return Ok(resources.control.robust_list());
+        }
+        if let Some(member) = resources
+            .members
+            .iter()
+            .find(|member| member.control.visible_tid() == Some(tid))
+        {
+            return Ok(member.control.robust_list());
         }
         let entry = resources
             .page

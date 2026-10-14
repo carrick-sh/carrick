@@ -700,6 +700,7 @@ impl DispatchContext for carrick_sched_core::Aarch64ParkedContext {
 }
 
 /// Supply native process and anonymous custody to the same full Linux pipeline.
+#[inline(never)]
 #[allow(clippy::too_many_arguments)]
 pub fn dispatch_syscall_with_native<'a, F, C, U, G, Context>(
     frame: &'a mut G,
