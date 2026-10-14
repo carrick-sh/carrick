@@ -495,7 +495,14 @@ fn first_process_call_acquires_a_root_authenticated_home_record() {
     assert!(fixture.zone.release_host_home(fixture.slot, record));
     assert!(fixture.zone.slot(fixture.slot).host_record().is_none());
     let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
-    let record = process_record_for_call(source, &fixture.task, ThreadCtx::ZERO, ttbr0).unwrap();
+    let record = process_record_for_call(
+        source,
+        &fixture.task,
+        ThreadCtx::ZERO,
+        ttbr0,
+        fixture.control,
+    )
+    .unwrap();
     let parked = unsafe { fixture.zone.record(record).ctx_mut() };
     assert_eq!(parked.address_context(), Some(fixture.address));
 }
@@ -514,7 +521,14 @@ fn host_home_process_call_seeds_an_unpublished_root_context() {
             .is_none()
     );
     let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
-    let retained = process_record_for_call(source, &fixture.task, ThreadCtx::ZERO, ttbr0).unwrap();
+    let retained = process_record_for_call(
+        source,
+        &fixture.task,
+        ThreadCtx::ZERO,
+        ttbr0,
+        fixture.control,
+    )
+    .unwrap();
     assert_eq!(retained, record);
     assert_eq!(
         unsafe { fixture.zone.record(record).ctx_mut() }.address_context(),
@@ -1445,14 +1459,25 @@ impl super::thread_setup::LifecycleVenue for Fixture {
         let slot = if address == self.control as *const _ as u64 {
             self.control
         } else {
-            let entry = self.page.entry_ref_for_visible_tid(
-                u32::try_from(task.execution.task.load(Ordering::Acquire)).ok()?,
-            )?;
-            if self.page.control_address(entry)? != address {
-                return None;
+            let tid = u32::try_from(task.execution.task.load(Ordering::Acquire)).ok()?;
+            if let Some(entry) = self.page.entry_ref_for_visible_tid(tid) {
+                if self.page.control_address(entry)? != address {
+                    return None;
+                }
+                // The test fixture retains the published control allocation.
+                unsafe { &*(address as *const ThreadControlSlot) }
+            } else {
+                if address == 0
+                    || !address.is_multiple_of(core::mem::align_of::<ThreadControlSlot>() as u64)
+                {
+                    return None;
+                }
+                let slot = unsafe { &*(address as *const ThreadControlSlot) };
+                if slot.entry().is_some() || slot.visible_tid() != Some(tid) {
+                    return None;
+                }
+                slot
             }
-            // The test fixture retains the published control allocation.
-            unsafe { &*(address as *const ThreadControlSlot) }
         };
         Some(carrick_personality_linux::thread::LifecycleThread {
             page: self.page,
@@ -1859,7 +1884,14 @@ fn arm_root_entry_refuses_wrong_binding_and_root_incarnation() {
     let before = registry()
         .for_entry(source, &fixture.task, fixture.address)
         .unwrap();
-    let record = process_record_for_call(source, &fixture.task, ThreadCtx::ZERO, ttbr0).unwrap();
+    let record = process_record_for_call(
+        source,
+        &fixture.task,
+        ThreadCtx::ZERO,
+        ttbr0,
+        fixture.control,
+    )
+    .unwrap();
     admit_entry(
         source,
         &fixture.task,
@@ -2127,4 +2159,248 @@ fn arm_owned_raw_exit_retires_only_one_of_two_live_threads() {
         .unwrap();
     assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 0);
     assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
+}
+
+fn fixture_ttbr0(fixture: &Fixture) -> u64 {
+    (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw()
+}
+
+/// One production ARM syscall through the exact adapter the vector uses.
+fn arm_call(
+    fixture: &'static Fixture,
+    control: &'static ThreadControlSlot,
+    service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    frame: &mut carrick_el1_abi::TrapFrame,
+) -> Result<carrick_personality_linux::dispatch::CompletionRoute, NativeProcessError> {
+    let counters = Box::new(carrick_el1_abi::Counters::new());
+    let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
+    let mut cpu = crate::sched::FakeCpu::default();
+    super::dispatch::dispatch_arm_syscall_with_native_process(
+        frame,
+        &counters,
+        core::slice::from_ref(&fixture.task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &cache,
+        Some(crate::Zone {
+            tables: fixture.zone,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+        }),
+        None,
+        Some(fixture),
+        fixture.page,
+        control,
+        ThreadCtx::ZERO,
+        fixture_ttbr0(fixture),
+        service,
+        |_| core::ptr::null_mut(),
+    )
+}
+
+fn run_as(fixture: &Fixture, tid: i32, generation: u64, serial: u64, control: &ThreadControlSlot) {
+    fixture
+        .task
+        .set(El1TaskId::from_linux_tid(tid), generation, 5);
+    fixture
+        .task
+        .mm
+        .thread_generation
+        .store(serial, Ordering::Release);
+    fixture
+        .task
+        .publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
+}
+
+fn run_as_leader(fixture: &Fixture) {
+    run_as(fixture, 41, 11, 101, fixture.control);
+}
+
+/// A sibling the host cloned because the in-ring pool was empty: an issued
+/// execution binding and a retained control slot, but no pool entry.
+fn host_born_sibling(fixture: &Fixture, visible_tid: u32) -> &'static ThreadControlSlot {
+    let control = Box::leak(Box::new(ThreadControlSlot::new()));
+    control.reset_for_host_birth(carrick_el1_abi::BlockedMask(0));
+    assert!(control.publish_visible_tid(visible_tid));
+    carrick_el1_abi::Lifecycle::thread_born(fixture.page).unwrap();
+    run_as(fixture, 42, 12, 102, control);
+    control
+}
+
+fn leader_sees_thread(
+    fixture: &'static Fixture,
+    service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+    tid: u32,
+) -> bool {
+    run_as_leader(fixture);
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            service,
+            |process| process.has_thread(tid),
+        )
+        .unwrap()
+}
+
+#[test]
+fn arm_host_born_sibling_raw_exit_retires_exact_owned_thread() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    let owner = registry()
+        .for_entry(source, &fixture.task, fixture.address)
+        .unwrap();
+    let control = host_born_sibling(fixture, 42);
+    // The first syscall of the host-issued sibling adopts it into the owner.
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[8] = 178; // gettid
+    let route = arm_call(fixture, control, &mut service, &mut frame).unwrap();
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::WithWork
+    );
+    assert_eq!(frame.x[0], 42);
+    assert!(std::sync::Arc::ptr_eq(
+        &owner,
+        &registry()
+            .for_entry(source, &fixture.task, fixture.address)
+            .unwrap()
+    ));
+    assert!(leader_sees_thread(fixture, &mut service, 42));
+    assert!(leader_sees_thread(fixture, &mut service, 41));
+}
+
+#[test]
+fn arm_host_born_sibling_refuses_stale_or_foreign_binding() {
+    #[derive(Clone, Copy, Debug)]
+    enum Defect {
+        UnissuedGeneration,
+        StaleRecordSerial,
+        StaleRecordGeneration,
+        ForeignPage,
+        ForeignControl,
+        ForeignPid,
+        LeaderTid,
+        DuplicateTid,
+        NoCensus,
+    }
+    for defect in [
+        Defect::UnissuedGeneration,
+        Defect::StaleRecordSerial,
+        Defect::StaleRecordGeneration,
+        Defect::ForeignPage,
+        Defect::ForeignControl,
+        Defect::ForeignPid,
+        Defect::LeaderTid,
+        Defect::DuplicateTid,
+        Defect::NoCensus,
+    ] {
+        let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+        if matches!(defect, Defect::DuplicateTid) {
+            imported_thread(fixture); // already owns visible tid 42
+        }
+        let mut service = fixture.process_service();
+        let ttbr0 = fixture_ttbr0(fixture);
+        fixture
+            .enter(fixture.control, ttbr0, &mut service, |_| ())
+            .unwrap();
+        let control = match defect {
+            Defect::LeaderTid => host_born_sibling(fixture, 41),
+            Defect::NoCensus => {
+                let control = host_born_sibling(fixture, 42);
+                fixture.page.try_exit().unwrap();
+                control
+            }
+            _ => host_born_sibling(fixture, 42),
+        };
+        let mut page = fixture.page;
+        let mut entered = control;
+        match defect {
+            Defect::UnissuedGeneration => fixture
+                .task
+                .execution
+                .generation
+                .store(0, Ordering::Release),
+            Defect::StaleRecordSerial | Defect::StaleRecordGeneration => {
+                let identity = crate::sched::identity_of(&fixture.task, 1);
+                let stale = if matches!(defect, Defect::StaleRecordSerial) {
+                    ThreadIdentity {
+                        serial: identity.serial - 1,
+                        ..identity
+                    }
+                } else {
+                    ThreadIdentity {
+                        generation: identity.generation - 1,
+                        ..identity
+                    }
+                };
+                let record = fixture.zone.current_or_new(fixture.slot, stale).unwrap();
+                // SAFETY: this VM-free fixture owns the current record.
+                unsafe {
+                    *fixture.zone.record(record).ctx_mut() =
+                        Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+                }
+                control.bind_zone_record(fixture.zone.record_ref(record));
+            }
+            Defect::ForeignPage => page = Box::leak(Box::new(ThreadLifecyclePage::new())),
+            Defect::ForeignControl => {
+                let foreign = Box::leak(Box::new(ThreadControlSlot::new()));
+                foreign.reset_for_host_birth(carrick_el1_abi::BlockedMask(0));
+                assert!(foreign.publish_visible_tid(42));
+                entered = foreign;
+            }
+            Defect::ForeignPid => fixture.task.publish_visible_pid(99),
+            Defect::DuplicateTid => run_as(fixture, 43, 13, 103, control),
+            Defect::LeaderTid | Defect::NoCensus => {}
+        }
+        let admitted = with_process_entry(
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: service.slot,
+            },
+            &fixture.task,
+            ThreadCtx::ZERO,
+            ttbr0,
+            page,
+            entered,
+            &mut service,
+            |_| (),
+        );
+        assert!(admitted.is_err(), "{defect:?} must not adopt");
+        let source = BornInZoneSource {
+            zone: fixture.zone,
+            slot: fixture.slot,
+        };
+        assert!(
+            registry()
+                .for_entry(source, &fixture.task, fixture.address)
+                .is_err(),
+            "{defect:?} registered the refused binding"
+        );
+        assert!(
+            entered.zone_record().is_none() || !matches!(defect, Defect::ForeignControl),
+            "a foreign control slot is never bound to the caller's home record"
+        );
+        fixture.zone.clear_current(fixture.slot);
+        fixture.task.publish_visible_pid(41);
+        assert!(
+            matches!(defect, Defect::DuplicateTid)
+                || !leader_sees_thread(fixture, &mut service, 42),
+            "{defect:?} left a member in the owner"
+        );
+    }
 }
