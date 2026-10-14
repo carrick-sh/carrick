@@ -22,7 +22,7 @@ contracts = ["kernel.wait.child-exit-notification-lifecycle"]
 
 [[surfaces]]
 path = "crates/carrick-observability/src/work_meter.rs"
-contracts = ["kernel.mm.native-code-content", "hvpatch.syscall.portal", "kernel.execution.native-code-density"]
+contracts = ["kernel.mm.native-code-content", "hvpatch.syscall.portal", "kernel.execution.native-code-density", "kernel.el1.open-lifetime"]
 
 [[surfaces]]
 path = "crates/carrick-mem/src/memory.rs"
@@ -573,7 +573,7 @@ contracts = ["kernel.el1.gic"]
 
 [[surfaces]]
 path = "crates/carrick-el1-abi/src/lib.rs"
-contracts = ["kernel.el1.gic", "kernel.el1.guest-run-queue", "kernel.el1.fault-entry", "kernel.el1.metadata-allocation", "kernel.el1.stage1-publication", "process.native.terminal-child"]
+contracts = ["kernel.el1.gic", "kernel.el1.guest-run-queue", "kernel.el1.fault-entry", "kernel.el1.metadata-allocation", "kernel.el1.stage1-publication", "process.native.terminal-child", "kernel.el1.open-lifetime"]
 
 [[surfaces]]
 path = "crates/carrick-el1/src/entry.rs"
@@ -721,7 +721,7 @@ contracts = ["kernel.el1.fd-single-owner", "kernel.el1.ipc-fd-authority"]
 
 [[surfaces]]
 path = "crates/carrick-el1/src/personality/file_table.rs"
-contracts = ["kernel.el1.files", "kernel.el1.fd-single-owner"]
+contracts = ["kernel.el1.files", "kernel.el1.fd-single-owner", "kernel.el1.open-lifetime"]
 
 [[surfaces]]
 path = "crates/carrick-x86/src/bringup_fns.rs"
@@ -1349,3 +1349,14 @@ contracts = ["kernel.fork.stage1-image", "kernel.mm.carrier-window-isolation"]
 path = "crates/carrick-aarch64/src/user_transfer/staging.rs"
 contracts = ["kernel.fork.stage1-image", "kernel.mm.carrier-window-isolation"]
 
+[[surfaces]]
+path = "crates/carrick-el1-abi/src/open_lifetime.rs"
+contracts = ["kernel.el1.open-lifetime"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/el1_delegation.rs"
+contracts = ["kernel.el1.open-lifetime", "kernel.el1.files", "kernel.el1.files.shared-inode"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/el1_delegation/owned_recall.rs"
+contracts = ["kernel.el1.open-lifetime", "kernel.el1.files"]

@@ -1085,6 +1085,7 @@ impl DescriptionCommon {
 
 #[derive(Debug, Default)]
 struct DescriptionLifecycle {
+    shared_open: Option<carrick_el1_abi::OpenReferenceKey>,
     mapping_refs: usize,
     terminal_finalizers: Vec<Arc<dyn FileDescriptionFinalizer>>,
 }
@@ -1305,6 +1306,28 @@ impl FileDescription {
     pub fn set_delegation_handle(&self, handle: u32) {
         self.delegation_handle
             .store(handle, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn publish_open_reference(
+        &self,
+        key: carrick_el1_abi::OpenReferenceKey,
+        publish: impl FnOnce() -> bool,
+    ) -> bool {
+        let mut lifecycle = self.lifecycle_transition.lock();
+        if self.common.fd_refs() == 0 || lifecycle.shared_open.is_some() || !publish() {
+            return false;
+        }
+        lifecycle.shared_open = Some(key);
+        true
+    }
+    pub(crate) fn open_reference(&self) -> Option<carrick_el1_abi::OpenReferenceKey> {
+        self.lifecycle_transition.lock().shared_open
+    }
+    pub(crate) fn retire_open_reference(&self, key: carrick_el1_abi::OpenReferenceKey) {
+        let mut lifecycle = self.lifecycle_transition.lock();
+        if lifecycle.shared_open == Some(key) {
+            lifecycle.shared_open = None;
+        }
     }
 
     /// Attach the EL1 inode registration; first caller wins.
@@ -1542,7 +1565,9 @@ impl FileDescription {
             let mut lifecycle = self.lifecycle_transition.lock();
             // Transfer the last functional reference to cleanup before it can
             // reach zero. The releasing pool thread never waits for recall.
-            if self.common.fd_refs() == 1 && self.delegation_handle() != 0 {
+            if self.common.fd_refs() == 1
+                && (lifecycle.shared_open.is_some() || self.delegation_handle() != 0)
+            {
                 self.common.retain_fd_ref();
                 recall_lease = Some(FileDescriptionFdLease {
                     description: Arc::clone(self),

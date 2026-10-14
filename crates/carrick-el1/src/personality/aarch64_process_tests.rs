@@ -29,6 +29,7 @@ const IPA: u64 = 0x9000_0000;
 
 struct TestStockCrossing {
     fd_map: Vec<carrick_el1_abi::FdMapSlot>,
+    open_table: Vec<carrick_el1_abi::DelegatedOpenFile>,
     grant_tables: std::sync::Mutex<Vec<RootGpa>>,
     total_returned_pages: AtomicU64,
     loans_requested: AtomicUsize,
@@ -44,6 +45,9 @@ struct TestStockCrossing {
 impl TestStockCrossing {
     fn new(stock_pages: &[u64]) -> Self {
         Self {
+            open_table: (0..16)
+                .map(|_| carrick_el1_abi::DelegatedOpenFile::new())
+                .collect(),
             fd_map: (0..carrick_el1_abi::FD_MAP_CAPACITY)
                 .map(|_| carrick_el1_abi::FdMapSlot::default())
                 .collect(),
@@ -67,6 +71,9 @@ impl TestStockCrossing {
 }
 
 impl ForkStockCrossing for TestStockCrossing {
+    fn open_table(&self) -> &[carrick_el1_abi::DelegatedOpenFile] {
+        &self.open_table
+    }
     fn cross_child_retire(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
         let zone = self
             .zone
@@ -578,6 +585,7 @@ fn plain_fork_owns_an_independent_fd_table() {
         0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
     ]);
     let parent_table = fixture.task.linux.file_table.load(Ordering::Acquire);
+    assert!(crossing.open_table[2].lifetime.initialize(1, false));
     crossing.fd_map[0].set(parent_table, 7, 3, 1);
     let mut service = Aarch64NativeProcessService::with_crossing(
         &fixture.task,
@@ -629,10 +637,15 @@ fn plain_fork_owns_an_independent_fd_table() {
         3
     );
     assert!(
-        super::file_table::close_host_binding(&crossing.fd_map, child_table, 7)
-            .unwrap()
-            .release
-            .is_none(),
+        super::file_table::close_host_binding(
+            &crossing.fd_map,
+            &crossing.open_table,
+            child_table,
+            7
+        )
+        .unwrap()
+        .release
+        .is_none(),
         "parent still owns the shared open description"
     );
     assert!(carrick_el1_abi::fd_map_lookup(&crossing.fd_map, child_table, 7).is_none());
