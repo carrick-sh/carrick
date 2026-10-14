@@ -171,6 +171,35 @@ jobs:
       - name: Fetch fixture lockfile dependencies
         run: just xtask fixtures fetch
 
+      # Run the host-only source gate before the signed release steps on
+      # non-merge_group runs and prune its build tree immediately afterward.
+      # `just ci` populates ~28.27 GiB (`target/debug` ~24.82 GiB,
+      # `target/host-authority-census` ~2.28 GiB, `target/aarch64-unknown-linux-gnu`
+      # ~0.55 GiB, `target/doc` ~0.55 GiB, `target/host-authority-escape-syntax`
+      # ~0.06 GiB) and `Signed acceptance receipt` populates ~27.86 GiB in
+      # `target/release` (including ~21.08 GiB of `.dSYM` bundles needed for
+      # crash post-mortem and `carrick-lldb`). Reordering and pruning keeps peak
+      # `target/` at ~31.34 GiB instead of ~55.63 GiB without trimming debuginfo.
+      - name: Install Semgrep
+        if: ${{ github.event_name != 'merge_group' }}
+        # A venv, never the system interpreter (PEP 668 refuses a system-wide pip
+        # install on cloudmac's Homebrew Python).
+        run: just ci-install-semgrep
+
+      - name: Host-only source gate
+        if: ${{ github.event_name != 'merge_group' }}
+        run: RUST_TEST_THREADS=1 just lease gate just ci
+
+      - name: Prune host-only gate build artifacts
+        if: ${{ github.event_name != 'merge_group' }}
+        run: |
+          rm -rf \
+            target/debug \
+            target/doc \
+            target/aarch64-unknown-linux-gnu \
+            target/host-authority-census \
+            target/host-authority-escape-syntax
+
       # The landing gate's signed phase (`xtask accept`): build + artifact
       # identity, el1 embed, fresh executable page, probe shards and cases,
       # with scoped cleanup per step. Its receipt is the lane's per-SHA
@@ -205,47 +234,12 @@ jobs:
           path: target/ci-receipts/receipt.json
           if-no-files-found: error
 
-      # After the receipt is published, so a red absolute gate cannot prevent
-      # the per-SHA baseline from existing. Not on the merge queue: main is not
-      # green under these absolute verdicts, so the queue gates on the receipt
-      # (NEW failures) above; push and dispatch keep the full signed coverage.
-      - name: Prune release test dSYM bundles after receipt
-        if: ${{ github.event_name != 'merge_group' }}
-        # `Signed acceptance receipt` links ~60 release test binaries (`debug = true`,
-        # `split-debuginfo = "packed"`), leaving ~21.08 GiB of `.dSYM` bundles in
-        # `target/release/{deps,examples}`. Removing only the `.dSYM` bundles keeps
-        # `target/release` executables and rlibs warm for `Signed embedded guest tests`
-        # (zero relink) while preventing `Host-only source gate` (`just ci`, +28.27 GiB)
-        # from pushing `target/` to ~55.63 GiB on the 100 GB runner volume.
-        run: rm -rf target/release/deps/*.dSYM target/release/examples/*.dSYM
-
-      - name: Install Semgrep
-        if: ${{ github.event_name != 'merge_group' }}
-        # A venv, never the system interpreter (PEP 668 refuses a system-wide pip
-        # install on cloudmac's Homebrew Python).
-        run: just ci-install-semgrep
-
-      - name: Host-only source gate
-        if: ${{ github.event_name != 'merge_group' }}
-        run: RUST_TEST_THREADS=1 just lease gate just ci
-
-      - name: Prune host-only gate build artifacts
-        if: ${{ github.event_name != 'merge_group' }}
-        # `just ci` populates `target/debug` (~24.82 GiB), `target/host-authority-census`
-        # (~2.28 GiB), `target/aarch64-unknown-linux-gnu` (~0.55 GiB), `target/doc`
-        # (~0.55 GiB), and `target/host-authority-escape-syntax` (~0.06 GiB). None of the
-        # 211 host unit/integration binaries, docs, or portable-check artifacts are reused
-        # by `Signed embedded guest tests`, which reuses `target/release` and only needs
-        # ~3.48 GiB in `target/debug` for `carrick-xtask` and the two `carrick-cli`
-        # conformance harness binaries.
-        run: |
-          rm -rf \
-            target/debug \
-            target/doc \
-            target/aarch64-unknown-linux-gnu \
-            target/host-authority-census \
-            target/host-authority-escape-syntax
-
+      # After the receipt is published, so a red absolute signed gate cannot
+      # prevent the per-SHA baseline from existing. Not on the merge queue:
+      # main is not green under these absolute verdicts, so the queue gates on
+      # the receipt (NEW failures) above; push and dispatch keep the full
+      # signed coverage, reusing `target/release` (with `.dSYM` bundles intact)
+      # from `Signed acceptance receipt`.
       - name: Signed embedded guest tests
         if: ${{ github.event_name != 'merge_group' }}
         run: |
