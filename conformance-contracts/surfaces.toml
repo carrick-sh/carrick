@@ -1239,6 +1239,10 @@ contracts = ["kernel.el1.signal-delivery-owner"]
 path = "crates/carrick-el1/src/personality/x86_signal.rs"
 contracts = ["kernel.el1.signal-delivery-owner"]
 
+[[surfaces]]
+path = "crates/carrick-el1/src/personality/signal_delivery.rs"
+contracts = ["kernel.el1.signal-delivery-owner"]
+
 # Concurrent owned deadlines belong to the shared guest scheduler.
 [[surfaces]]
 path = "crates/carrick-sched-core/src/timer_index.rs"
