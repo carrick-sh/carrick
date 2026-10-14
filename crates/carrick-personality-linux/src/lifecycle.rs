@@ -244,6 +244,7 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
         Ok(())
     }
     fn thread_exited(&mut self, _tid: u32) {}
+    fn retire_thread_verdict(&mut self, _verdict: carrick_core::terminal::RetirementVerdict) {}
     fn set_calling_tid(&mut self, _tid: u32) {}
 
     fn has_thread(&self, _tid: u32) -> bool {
@@ -388,7 +389,7 @@ pub trait LifecycleNative<'a>: UserCopy {
         self.enqueue_born(birth.record);
         Ok(())
     }
-    fn thread_exited(&mut self, _tid: u32) {}
+    fn thread_exited(&mut self, _verdict: carrick_core::terminal::RetirementVerdict) {}
 }
 /// Linux aarch64 syscall numbers served here (`SYS_SET_ROBUST_LIST` is the
 /// shared canonical number from [`crate::thread`]).
@@ -530,7 +531,7 @@ pub fn invoke<'a>(
     if call == LifecycleCall::Exit
         && native
             .thread()
-            .is_some_and(|thread| thread.page.live() == 1)
+            .is_some_and(|thread| carrick_core::terminal::raw_exit_is_process(thread.page))
         && let Some(outcome) = native.process_exit_group(args[0] as u8)
     {
         return Some(outcome);
@@ -1014,10 +1015,21 @@ fn serve_exit<'a>(
             native.record_decline(LifecycleDecline::ExitAdmission);
         })
         .ok()?;
-    // n > 1 -> n - 1; the last thread exits on the host.
-    let membership = page
-        .reserve_nonfinal_exit()
-        .inspect_err(|_| {
+    let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
+        binding,
+        Some(entry),
+        carrick_sched_core::process::TerminationStatus::exited(native.arguments()[0] as u32),
+    )?;
+    let custody = carrick_core::terminal::TerminalCustody::<
+        carrick_core::terminal::Thread,
+        carrick_core::terminal::Live,
+    >::admitted(identity)
+    .begin();
+    // Core reserves the page's nonfinal membership before the native
+    // handoff; a declined handoff restores that membership on drop.
+    let (custody, membership) = custody
+        .reserve_nonfinal(page)
+        .map_err(|_| {
             native.record_decline(LifecycleDecline::ExitLast);
         })
         .ok()?;
@@ -1042,20 +1054,16 @@ fn serve_exit<'a>(
             });
         }
     }
-    let exiting_tid = slot
-        .visible_tid()
-        .or_else(|| page.identity(entry).map(|id| id.visible_tid))
-        .unwrap_or(record.identity.tid as u32);
     if !native.release_current(record.reference) {
         return None;
     }
-    membership.publish();
     if admission.commit().is_err() {
         // Unreachable (checked above; only this thread leaves Born or
         // Published that way): the host must look at this process.
         native.task_state()?.mark_pending_host_work();
     }
-    native.thread_exited(exiting_tid);
+    membership.publish();
+    native.thread_exited(custody.into_verdict());
     if !record.unadopted {
         // The retained runtime consumes this exact terminal handoff; another
         // guest task must not execute on the exiting job's host lease.
