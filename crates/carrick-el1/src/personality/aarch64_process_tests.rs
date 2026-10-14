@@ -1,13 +1,15 @@
 //! Red-first VM-free tests for [`Aarch64NativeProcessService`] and the shared process owner.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use super::aarch64_process::{Aarch64NativeProcessService, ForkStockCrossing};
+#[cfg(test)]
 use super::aarch64_process::{
-    Aarch64NativeProcessService, ForkStockCrossing, Mm, admit_entry, map_resume,
-    observed_entry_address, process_record_for_call, registry, resume_selected, with_process_entry,
+    Mm, admit_entry, map_resume, observed_entry_address, process_record_for_call, registry,
+    resume_selected, with_process_entry,
 };
-use super::native_process_runtime::{
-    NativeProcessError, NativeProcessRegistry, NativeProcessRuntime, NativeProcessService,
-};
+use super::native_process_runtime::{NativeProcessError, NativeProcessRuntime};
+#[cfg(test)]
+use super::native_process_runtime::{NativeProcessRegistry, NativeProcessService};
 use carrick_el1_abi::{
     BornInZoneSource, CurrentTask, El1TaskId, ForkStockExchange, ForkStockKind, ForkStockLoan,
     ForkStockRefusal, ForkStockSettlement, ReservationMm, ThreadControlSlot, ThreadIdentity,
@@ -31,6 +33,7 @@ use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Scheduler CPU with the same owner checkpoint as the production ARM CPU.
+#[cfg(test)]
 struct ResumeCpu<'a, 'b, X: ForkStockCrossing> {
     inner: crate::sched::FakeCpu,
     runtime: &'a NativeProcessRuntime<'b, Mm, Aarch64ParkedContext>,
@@ -40,6 +43,7 @@ struct ResumeCpu<'a, 'b, X: ForkStockCrossing> {
     service: &'a mut Aarch64NativeProcessService<'b, X>,
 }
 
+#[cfg(test)]
 impl<X: ForkStockCrossing> crate::sched::ThreadCpu for ResumeCpu<'_, '_, X> {
     fn save(&mut self, frame: &carrick_el1_abi::TrapFrame, ctx: &mut Aarch64ParkedContext) {
         self.inner.save(frame, ctx);
@@ -1027,21 +1031,25 @@ fn test_wait4_consumes_zombie_once_with_exact_status() {
     ));
 }
 
+#[cfg(test)]
 #[test]
 fn arm_terminal_child_retirement_and_parent_handback_once() {
     arm_child_wait_wake(false, false);
 }
 
+#[cfg(test)]
 #[test]
 fn arm_in_ring_wait4_wake_resumes_owner_before_eret() {
     arm_child_wait_wake(true, false);
 }
 
+#[cfg(test)]
 #[test]
 fn arm_registered_sibling_wait4_wakes_through_owner_in_ring() {
     arm_child_wait_wake(true, true);
 }
 
+#[cfg(test)]
 fn arm_child_wait_wake(in_ring: bool, sibling: bool) {
     let fixture = Fixture::new(0x10000, asid(1));
     if in_ring {
@@ -2525,6 +2533,7 @@ fn arm_host_born_sibling_raw_exit_retires_exact_owned_thread() {
     assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
 }
 
+#[cfg(test)]
 #[test]
 fn arm_registered_sibling_switch_in_without_pending_owner_work() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
