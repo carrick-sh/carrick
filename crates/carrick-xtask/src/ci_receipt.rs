@@ -113,13 +113,99 @@ fn candidate_receipt(
     Ok(dir.join(name).join("receipt.json"))
 }
 
-/// Stable failure identities of one receipt: failed tests, probe diffs,
-/// unfinished binaries and unitemized failures (crashes, signals, compile
-/// errors, empty itemization on `test result: FAILED`) each by name. A step
-/// adds its own key whenever anything in it is unitemized or unfinished, or
-/// when a failed step has nothing itemized at all, so a crash or aborted
-/// binary is never hidden behind a test failure the base also had.
-pub fn failure_keys(receipt: &AcceptReceipt) -> BTreeSet<String> {
+fn test_belongs_to_binary(qualified_test: &str, bin: &str) -> bool {
+    qualified_test
+        .split_once("::")
+        .is_some_and(|(test_bin, _)| test_bin == bin)
+}
+
+/// Whether an unfinished or crashed binary `<bin>` in `step_name` should emit
+/// `unfinished:<bin>`, `unitemized:<step>:crash:<bin>`, and the `step:<step>`
+/// key derived from them when compared against `baseline`.
+///
+/// Without a baseline (`failure_keys`), every unfinished/crashed binary is
+/// included. Against a baseline (`diff`), a crash or unfinished state in
+/// `<bin>` is NEW only when the base binary finished (without all its base
+/// tests failing), or had at least one passing test that the candidate now
+/// fails or misses (or `<bin>` did not run in the base at all). A crash in a
+/// binary whose base tests ALL failed is not a new failure.
+fn binary_crash_or_unfinished_active(
+    baseline: Option<&AcceptReceipt>,
+    candidate: &AcceptReceipt,
+    step_name: &str,
+    bin: &str,
+) -> bool {
+    let Some(base) = baseline else {
+        return true;
+    };
+    let base_steps: Vec<_> = base.steps.iter().filter(|s| s.name == step_name).collect();
+    if base_steps.is_empty() {
+        return true;
+    }
+    let base_started: BTreeSet<&str> = base_steps
+        .iter()
+        .flat_map(|s| s.started_tests.iter().map(String::as_str))
+        .collect();
+    let base_failed: BTreeSet<&str> = base_steps
+        .iter()
+        .flat_map(|s| s.failed_tests.iter().map(String::as_str))
+        .collect();
+    let base_finished: BTreeSet<&str> = base_steps
+        .iter()
+        .flat_map(|s| s.finished_binaries.iter().map(String::as_str))
+        .collect();
+    let base_unfinished: BTreeSet<&str> = base_steps
+        .iter()
+        .flat_map(|s| s.unfinished_binaries.iter().map(String::as_str))
+        .collect();
+    let base_crashed = base_steps.iter().any(|s| {
+        s.unitemized_failures
+            .iter()
+            .any(|u| u.strip_prefix("crash:") == Some(bin))
+    });
+    if base_unfinished.contains(bin) || base_crashed {
+        return true;
+    }
+
+    let base_bin_started: Vec<&str> = base_started
+        .iter()
+        .copied()
+        .filter(|t| test_belongs_to_binary(t, bin))
+        .collect();
+    let base_bin_passed: Vec<&str> = base_bin_started
+        .iter()
+        .copied()
+        .filter(|t| !base_failed.contains(*t))
+        .collect();
+
+    if !base_bin_started.is_empty() && base_bin_passed.is_empty() {
+        return false;
+    }
+    if base_finished.contains(bin) || base_bin_started.is_empty() {
+        return true;
+    }
+
+    let cand_started: BTreeSet<&str> = candidate
+        .steps
+        .iter()
+        .filter(|s| s.name == step_name)
+        .flat_map(|s| s.started_tests.iter().map(String::as_str))
+        .collect();
+    let cand_failed: BTreeSet<&str> = candidate
+        .steps
+        .iter()
+        .filter(|s| s.name == step_name)
+        .flat_map(|s| s.failed_tests.iter().map(String::as_str))
+        .collect();
+    base_bin_passed
+        .iter()
+        .any(|t| !cand_started.contains(*t) || cand_failed.contains(*t))
+}
+
+fn receipt_failure_keys(
+    receipt: &AcceptReceipt,
+    baseline: Option<&AcceptReceipt>,
+) -> BTreeSet<String> {
     let mut keys = BTreeSet::new();
     for step in &receipt.steps {
         let probes: Vec<_> = receipt
@@ -133,16 +219,28 @@ pub fn failure_keys(receipt: &AcceptReceipt) -> BTreeSet<String> {
         for diff in &probes {
             keys.insert(format!("probe:{}:{}", step.name, diff.probe));
         }
+        let mut active_unitemized = false;
         for failure in &step.unitemized_failures {
-            keys.insert(format!("unitemized:{}:{failure}", step.name));
+            let active = match failure.strip_prefix("crash:") {
+                Some(bin) => binary_crash_or_unfinished_active(baseline, receipt, &step.name, bin),
+                None => true,
+            };
+            if active {
+                active_unitemized = true;
+                keys.insert(format!("unitemized:{}:{failure}", step.name));
+            }
         }
         for bin in &step.unfinished_binaries {
-            keys.insert(format!("unfinished:{bin}"));
+            if binary_crash_or_unfinished_active(baseline, receipt, &step.name, bin) {
+                active_unitemized = true;
+                keys.insert(format!("unfinished:{bin}"));
+            }
         }
-        let itemized = !step.failed_tests.is_empty() || !probes.is_empty();
-        let has_unitemized =
-            !step.unitemized_failures.is_empty() || !step.unfinished_binaries.is_empty();
-        if (!step.passed && !itemized) || has_unitemized {
+        let any_explained = !step.failed_tests.is_empty()
+            || !probes.is_empty()
+            || !step.unitemized_failures.is_empty()
+            || !step.unfinished_binaries.is_empty();
+        if (!step.passed && !any_explained) || active_unitemized {
             keys.insert(format!("step:{}", step.name));
         }
     }
@@ -172,6 +270,16 @@ pub fn failure_keys(receipt: &AcceptReceipt) -> BTreeSet<String> {
     keys
 }
 
+/// Stable failure identities of one receipt: failed tests, probe diffs,
+/// unfinished binaries and unitemized failures (crashes, signals, compile
+/// errors, empty itemization on `test result: FAILED`) each by name. A step
+/// adds its own key whenever anything in it is unitemized or unfinished, or
+/// when a failed step has nothing itemized at all, so a crash or aborted
+/// binary is never hidden behind a test failure the base also had.
+pub fn failure_keys(receipt: &AcceptReceipt) -> BTreeSet<String> {
+    receipt_failure_keys(receipt, None)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiptDiff {
     pub new: Vec<String>,
@@ -180,8 +288,9 @@ pub struct ReceiptDiff {
 
 /// Compare two receipts of the same gate. Different phases or profiles are
 /// different gates; comparing them would invent NEW/FIXED entries. Any test
-/// the baseline started that the candidate did not (`missing:<bin>::<test>`)
-/// or binary the baseline finished that the candidate did not
+/// the baseline passed (started and not failed) that the candidate did not
+/// start (`missing:<bin>::<test>`) or binary the baseline finished (without
+/// all its base tests failing) that the candidate did not finish
 /// (`unfinished:<bin>`) is added as a NEW failure key.
 pub fn diff(
     baseline: &AcceptReceipt,
@@ -194,8 +303,10 @@ pub fn diff(
         )));
     }
     let base = failure_keys(baseline);
-    let mut next = failure_keys(candidate);
+    let mut next = receipt_failure_keys(candidate, Some(baseline));
     for base_step in &baseline.steps {
+        let base_failed: BTreeSet<&str> =
+            base_step.failed_tests.iter().map(String::as_str).collect();
         let cand_started: BTreeSet<&str> = candidate
             .steps
             .iter()
@@ -203,7 +314,7 @@ pub fn diff(
             .flat_map(|s| s.started_tests.iter().map(String::as_str))
             .collect();
         for test in &base_step.started_tests {
-            if !cand_started.contains(test.as_str()) {
+            if !base_failed.contains(test.as_str()) && !cand_started.contains(test.as_str()) {
                 next.insert(format!("missing:{test}"));
             }
         }
@@ -214,7 +325,14 @@ pub fn diff(
             .flat_map(|s| s.finished_binaries.iter().map(String::as_str))
             .collect();
         for bin in &base_step.finished_binaries {
-            if !cand_finished.contains(bin.as_str()) {
+            if !cand_finished.contains(bin.as_str())
+                && binary_crash_or_unfinished_active(
+                    Some(baseline),
+                    candidate,
+                    &base_step.name,
+                    bin,
+                )
+            {
                 next.insert(format!("unfinished:{bin}"));
             }
         }
