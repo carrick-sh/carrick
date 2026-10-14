@@ -1407,6 +1407,16 @@ pub(super) fn resolve_mutating_fault<E: ThreadedEngine>(
                     );
                     return Ok(true);
                 };
+                if request.reservation_incarnation.is_some()
+                    && request.reservation_incarnation != plan.root_incarnation()
+                {
+                    publish_frame_grant_refusal(
+                        mailbox,
+                        request,
+                        carrick_el1_abi::FRAME_GRANT_ERR_STALE,
+                    );
+                    return Ok(true);
+                }
                 let prot = plan.prot();
                 crate::probes::hvpatch_el1_frame_grant_plan(
                     request.fault_va,
@@ -2732,6 +2742,7 @@ mod first_touch_access_tests {
     fn frame_grant_claim_requires_the_exact_mm_fault_and_access() {
         let request = carrick_el1_abi::FrameGrantRequest {
             mm_key: 7,
+            reservation_incarnation: None,
             requested_len: carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE,
             request_generation: 11,
             fault_va: 0x4000_3123,
