@@ -434,7 +434,7 @@ where
         control,
         service,
         |process| {
-            let route = dispatch_syscall_with_native(
+            dispatch_syscall_with_native(
                 frame,
                 counters,
                 current_tasks,
@@ -450,8 +450,7 @@ where
                 Some(source),
                 None,
                 cache_lookup,
-            );
-            route
+            )
         },
     )
 }
