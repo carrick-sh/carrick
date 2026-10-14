@@ -31,3 +31,6 @@ bench = false
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+carrick-test-support = { path = "../carrick-test-support" }

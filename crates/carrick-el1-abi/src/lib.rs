@@ -57,6 +57,8 @@ mod internal_read;
 pub use internal_read::*;
 mod kernel_fault_venues;
 pub use kernel_fault_venues::*;
+mod file_region;
+pub use file_region::*;
 
 use core::cell::UnsafeCell;
 
@@ -660,6 +662,8 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         EL1_OBJECT_TABLE_OFFSET,
         EL1_FD_MAP_OFFSET,
         EL1_OPEN_FILE_TABLE_OFFSET,
+        EL1_FILE_REGION_HEADER_OFFSET,
+        core::mem::size_of::<FileRegionBinding>() as u64,
         EL1_CACHE_OFFSET,
         EL1_INOTIFY_TABLE_OFFSET,
         EL1_NAME_CACHE_OFFSET,
@@ -3754,7 +3758,7 @@ impl Default for InotifyNameCache {
 const _: () = {
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
-    assert!(EL1_ABI_LAYOUT_HASH == 0xd42665b03443920f);
+    assert!(EL1_ABI_LAYOUT_HASH == 0x3fb5455d2ebb9ce7);
     assert!(
         EL1_APERTURE_CONTROL_OFFSET.is_multiple_of(core::mem::align_of::<ApertureControl>() as u64)
     );

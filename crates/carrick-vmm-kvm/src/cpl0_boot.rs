@@ -2203,6 +2203,18 @@ impl RetainedMetadataPtr {
 // non-cloneable view to another thread cannot outlive or alias its storage.
 unsafe impl Send for RetainedMetadataPtr {}
 
+/// Registration and mapping have one custody. Registration drops first,
+/// withdrawing publication while its own backing remains mapped.
+struct RetainedFileRegion {
+    registration: carrick_el1_abi::FileRegionRegistration,
+    _backing: Arc<BackingExtent>,
+}
+
+// SAFETY: moved only inside exclusive carrier custody. The non-cloning
+// registration never escapes its retained backing, and tables use atomics
+// and their existing inode/descriptor owners for concurrent guest access.
+unsafe impl Send for RetainedFileRegion {}
+
 /// One coordinator owns physical backing, grants and retained metadata.
 /// CPU execution leases are disjoint from this custody, so stopped host service
 /// never borrows the carrier or a simultaneously running peer CPU.
@@ -2211,6 +2223,7 @@ pub(crate) struct Cpl0HostCustody {
     pub(crate) ram: Arc<GuestRam>,
     initial_extent: Option<(BackingHandle, usize)>,
     _kernel_region: Option<BackingHandle>,
+    files: RetainedFileRegion,
     frame_inventory: Arc<dyn PhysicalFrameInventory>,
     pub(crate) private_anonymous_witness: crate::cpl0_private_witness::PrivateAnonymousWitness,
     actual_run: Arc<[AtomicU32; 2]>,
@@ -3586,6 +3599,51 @@ impl Cpl0Carrier {
         }
     }
 
+    /// Exact carrier publication used by both stopped host and guest consumers.
+    pub fn file_region_binding(&self) -> carrick_el1_abi::FileRegionBinding {
+        self.custody.files.registration.binding()
+    }
+
+    /// Host access authenticates against this carrier's retained registration.
+    pub fn file_tables(
+        &self,
+        binding: carrick_el1_abi::FileRegionBinding,
+    ) -> Result<carrick_el1_abi::FileTables<'_>, carrick_el1_abi::FileRegionError> {
+        self.custody.files.registration.tables(binding)
+    }
+
+    /// Deliberately replace a stopped fixture CPU's publication to exercise
+    /// guest authentication. This cannot mutate a running worker's binding.
+    pub fn fixture_bind_file_region(
+        &mut self,
+        index: usize,
+        binding: carrick_el1_abi::FileRegionBinding,
+    ) -> Result<(), TrapError> {
+        if index >= 2 {
+            return Err(fail("unknown file-region fixture CPU"));
+        }
+        let mapped = self
+            .custody
+            .ram
+            .host_ptr(
+                META_GPA + BINDING_OFFSET + index as u64 * STRIDE,
+                size_of::<CpuBinding>(),
+            )
+            .ok_or_else(|| fail("file-region fixture binding"))?
+            .cast::<CpuBinding>();
+        // SAFETY: this carrier exclusively owns both stopped CPUs and binding.
+        unsafe {
+            (*mapped).file_region = binding;
+        }
+        Ok(())
+    }
+
+    /// Withdraw the region with both fixture CPUs stopped; subsequent entry
+    /// must refuse without consulting the retired tables.
+    pub fn fixture_retire_file_region(&mut self) {
+        self.custody.files.registration.retire();
+    }
+
     /// Counters from the stopped production carrier, including its initial
     /// image entry and each guest-to-host syscall forward.
     pub fn initial_execution_witness(&self) -> (u64, u64) {
@@ -4076,6 +4134,7 @@ impl Cpl0Carrier {
                     mm_owner_generation: AtomicU64::new(1),
                     last_seen_generation: AtomicU64::new(0),
                     stdio_table_admitted: AtomicU64::new(0),
+                    file_region: carrick_el1_abi::FileRegionBinding::UNPUBLISHED,
                 });
             }
         }
@@ -4113,16 +4172,33 @@ impl Cpl0Carrier {
             }
         }
         let identity = backing_identity(&*frame_inventory)?;
-        let extent = BackingExtent::private(
+        let extent = Arc::new(
+            BackingExtent::private(
+                FrameGpa::new(KERNEL_REGION_GPA),
+                carrick_el1_abi::EL1_REGION_SIZE as usize,
+            )
+            .map_err(|e| fail(e.to_string()))?,
+        );
+        let file_binding = carrick_el1_abi::FileRegionBinding::new(
+            carrick_el1_abi::FileRegionId::from_carrier(memory.identity().nonzero()),
+            carrick_guest_arch::KernelVa::new(X86_CPL0_REGION_BASE),
             FrameGpa::new(KERNEL_REGION_GPA),
-            carrick_el1_abi::EL1_REGION_SIZE as usize,
+            carrick_guest_arch::GuestLen::new(carrick_el1_abi::EL1_REGION_SIZE),
         )
-        .map_err(|e| fail(e.to_string()))?;
+        .map_err(|e| fail(format!("file region binding: {e:?}")))?;
+        let host = extent.host_base().map_err(|e| fail(e.to_string()))?;
+        let mapped = NonNull::new(host.raw() as *mut u8).ok_or_else(|| fail("null file region"))?;
+        // SAFETY: this unpublished extent is exclusively initialized here;
+        // RetainedFileRegion keeps its mapping alive through registration drop.
+        let registration =
+            unsafe { carrick_el1_abi::FileRegionRegistration::initialize(mapped, file_binding) }
+                .map_err(|e| fail(format!("file region publication: {e:?}")))?;
+        let files = RetainedFileRegion {
+            registration,
+            _backing: Arc::clone(&extent),
+        };
         let handles = memory
-            .install(&[PreparedBacking {
-                extent: Arc::new(extent),
-                identity,
-            }])
+            .install(&[PreparedBacking { extent, identity }])
             .map_err(|e| fail(e.to_string()))?;
         let kernel_region = Some(handles[0]);
         let initial_extent = if let Some(len) = initial_extent_bytes {
@@ -4142,6 +4218,19 @@ impl Cpl0Carrier {
         memory
             .initialize_fault_records(FrameGpa::new(KERNEL_REGION_GPA))
             .map_err(|error| fail(error.to_string()))?;
+        for index in 0..2 {
+            let binding = ram
+                .host_ptr(
+                    META_GPA + BINDING_OFFSET + index as u64 * STRIDE,
+                    size_of::<CpuBinding>(),
+                )
+                .ok_or_else(|| fail("file CPU binding"))?
+                .cast::<CpuBinding>();
+            // SAFETY: initialized retained binding; vCPUs have not been created.
+            unsafe {
+                (*binding).file_region = file_binding;
+            }
+        }
         let machine = CarrierMachine::from_memory(memory, 2).map_err(|e| fail(e.to_string()))?;
         let (cpus, vm) = machine.into_parts();
         let [mut a, mut b]: [KvmVcpu; 2] =
@@ -4334,6 +4423,7 @@ impl Cpl0Carrier {
                 ram,
                 initial_extent,
                 _kernel_region: kernel_region,
+                files,
                 frame_inventory,
                 private_anonymous_witness: Default::default(),
                 actual_run: Arc::new(std::array::from_fn(|_| AtomicU32::new(0))),
@@ -6548,17 +6638,21 @@ mod cpl0_layout_tests {
     fn file_region_published_before_guest_entry() {
         let inventory = Arc::new(FrameInventoryAuthority::new())
             .physical_projection(Arc::new(ObjectIdRegistry::new()));
-        let carrier = Cpl0Carrier::boot_production(inventory, 0x20_000)
-            .expect("production carrier");
+        let carrier =
+            Cpl0Carrier::boot_production(inventory, 0x20_000).expect("production carrier");
         // Reserved tail of the shared open-table allocation: publication
         // must name this VM, not a process-global host mapping.
-        let header_offset = carrick_el1_abi::EL1_OPEN_FILE_TABLE_OFFSET
-            + carrick_el1_abi::EL1_OPEN_FILE_TABLE_SIZE - 64;
-        let bytes = carrier.custody._vm.read(FrameGpa::new(KERNEL_REGION_GPA + header_offset), 8)
+        let header_offset = carrick_el1_abi::EL1_FILE_REGION_HEADER_OFFSET;
+        let bytes = carrier
+            .custody
+            ._vm
+            .read(FrameGpa::new(KERNEL_REGION_GPA + header_offset), 8)
             .expect("retained supervisor publication");
-        assert_eq!(u64::from_le_bytes(bytes.try_into().expect("identity word")),
+        assert_eq!(
+            u64::from_le_bytes(bytes.try_into().expect("identity word")),
             carrier.custody._vm.identity().nonzero().get(),
-            "retained file tables need the exact carrier identity before entry");
+            "retained file tables need the exact carrier identity before entry"
+        );
     }
 
     // x86.mm.initial-image: the static PIE load shape observed in busybox:musl.

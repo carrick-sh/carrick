@@ -10,10 +10,8 @@ use carrick_el1::personality::lifecycle::LifecycleVenue;
 use carrick_el1::personality::thread_setup::GuestLifecycleVenue;
 use carrick_el1::{PollSignalMask, PollTimeoutKind, dispatch_syscall_with_native};
 use carrick_el1_abi::{
-    Action, Counters, CurrentTask, DELEGATED_FILE_MAX_SIZE, DelegatedFile, DelegatedOpenFile,
-    EL1_CACHE_OFFSET, EL1_FD_MAP_OFFSET, FD_MAP_CAPACITY, FdMapSlot, HostObjectBinding,
-    HostObjectReleaseCrossing, HostObjectWriteCrossing, HostReadinessCrossing, InotifyNameCache,
-    X86_CPL0_REGION_BASE, fd_map_lookup,
+    Action, Counters, CurrentTask, DelegatedOpenFile, FileTables, HostObjectBinding,
+    HostObjectReleaseCrossing, HostObjectWriteCrossing, HostReadinessCrossing, fd_map_lookup,
 };
 use carrick_guest_arch::{LayoutBackend, NativeReturnWord, SlotId, UserVa};
 use carrick_personality_linux::crossing::{HostCrossingSet, evaluate_host_crossing};
@@ -35,17 +33,11 @@ use core::sync::atomic::Ordering;
 
 use crate::{anonymous, native_execution, native_process};
 
-pub static EMPTY_NAME_CACHE: InotifyNameCache = InotifyNameCache::new();
-
-pub fn fd_map() -> &'static [FdMapSlot; FD_MAP_CAPACITY] {
-    // SAFETY: The KVM carrier maps the shared kernel region supervisor-only at
-    // X86_CPL0_REGION_BASE. The fd map is owned by that mapped region,
-    // exactly as it is on ARM, rather than by the image's static data.
-    unsafe { &*((X86_CPL0_REGION_BASE + EL1_FD_MAP_OFFSET) as *const [FdMapSlot; FD_MAP_CAPACITY]) }
+pub fn file_tables(binding: &CpuBinding) -> FileTables<'static> {
+    // SAFETY: current carrier CPU binding was installed by stopped bootstrap;
+    // its supervisor mapping remains live until every guest CPU stops.
+    unsafe { FileTables::in_guest(binding.file_region) }.unwrap_or_else(|_| fatal_boot())
 }
-
-pub static OPEN_TABLE: [DelegatedOpenFile; 16] = [const { DelegatedOpenFile::new() }; 16];
-pub static OBJECT_TABLE: [DelegatedFile; 16] = [const { DelegatedFile::new() }; 16];
 
 // SAFETY: live diagnostic counter exported for test/telemetry inspection.
 #[unsafe(no_mangle)]
@@ -59,6 +51,7 @@ pub struct NativeDispatch<'a> {
     pub publications: &'a core::sync::atomic::AtomicU64,
     pub slot: Option<carrick_guest_arch::SlotId>,
     pub file_table: u64,
+    pub files: &'a FileTables<'a>,
 }
 
 impl SyscallFrame for NativeDispatch<'_> {
@@ -118,9 +111,9 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
         if !stdio_call || !(0..=2).contains(&guest_fd) {
             return true;
         }
-        let binding = fd_map_lookup(fd_map(), self.file_table, guest_fd)
+        let binding = fd_map_lookup(self.files.fd_map(), self.file_table, guest_fd)
             .and_then(|(handle, _)| handle.checked_sub(1))
-            .and_then(|index| OPEN_TABLE.get(index as usize))
+            .and_then(|index| self.files.opens().get(index as usize))
             .and_then(DelegatedOpenFile::host_object);
         if binding.is_none()
             || (read && binding.is_some_and(|binding| binding.stdio_fd() != Some(guest_fd)))
@@ -972,19 +965,11 @@ impl Personality for LinuxPersonality {
             return ControlFlow::Return(());
         }
 
-        let layout = <carrick_el1::isa::x86::X86Backend as LayoutBackend>::KERNEL_LAYOUT;
+        let files = file_tables(binding);
         let cache_lookup = |handle: u32| {
-            handle
-                .checked_sub(1)
-                .and_then(|index| u64::from(index).checked_mul(DELEGATED_FILE_MAX_SIZE))
-                .and_then(|offset| {
-                    layout
-                        .region
-                        .raw()
-                        .checked_add(EL1_CACHE_OFFSET)?
-                        .checked_add(offset)
-                })
-                .map_or(core::ptr::null_mut(), |address| address as *mut u8)
+            files
+                .cache(handle)
+                .map_or(core::ptr::null_mut(), |ptr| ptr.as_ptr())
         };
 
         let mut anonymous =
@@ -997,9 +982,9 @@ impl Personality for LinuxPersonality {
         let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
         if binding.stdio_table_admitted.load(Ordering::Acquire) != file_table {
             carrick_el1::personality::file_table::admit_stdio(
-                fd_map(),
-                &OPEN_TABLE,
-                &OBJECT_TABLE,
+                files.fd_map(),
+                files.opens(),
+                files.objects(),
                 file_table,
                 [true; 3],
             );
@@ -1028,16 +1013,17 @@ impl Personality for LinuxPersonality {
                 publications: &binding.publications,
                 slot: carrick_guest_arch::SlotId::from_index(binding.cpu_slot as usize),
                 file_table,
+                files: &files,
             };
             let mut route = dispatch_syscall_with_native(
                 &mut native,
                 counters,
                 core::slice::from_ref(task),
-                fd_map(),
-                &OBJECT_TABLE,
-                &OPEN_TABLE,
+                files.fd_map(),
+                files.objects(),
+                files.opens(),
                 &[],
-                &EMPTY_NAME_CACHE,
+                files.names(),
                 None::<
                     carrick_el1::Zone<
                         '_,
@@ -1095,9 +1081,9 @@ impl Personality for LinuxPersonality {
                 {
                     let table = task.linux.file_table.load(Ordering::Acquire).max(1);
                     let guest_fd = call.args[0] as i32;
-                    let binding = fd_map_lookup(fd_map(), table, guest_fd)
+                    let binding = fd_map_lookup(files.fd_map(), table, guest_fd)
                         .and_then(|(handle, _)| handle.checked_sub(1))
-                        .and_then(|index| OPEN_TABLE.get(index as usize))
+                        .and_then(|index| files.opens().get(index as usize))
                         .and_then(DelegatedOpenFile::host_object);
                     if call.canonical.raw() == carrick_personality_linux::crossing::nr::WRITE.raw()
                         && let Some(binding) = binding
