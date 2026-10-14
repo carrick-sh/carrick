@@ -781,9 +781,10 @@ pub(crate) fn run_member(
     actual_run: Option<&AtomicU32>,
     execution: &RwLock<()>,
 ) -> Result<VcpuExit, TrapError> {
-    let _running = execution
-        .read()
-        .map_err(|_| fail("file execution admission poisoned"))?;
+    let _running = execution.try_read().map_err(|error| match error {
+        std::sync::TryLockError::WouldBlock => TrapError::ExecutionAdmissionBusy,
+        std::sync::TryLockError::Poisoned(_) => TrapError::ExecutionAdmissionPoisoned,
+    })?;
     let member = table
         .members
         .get(slot)
@@ -2243,9 +2244,15 @@ struct RetainedFileRegion {
     _backing: Arc<BackingExtent>,
 }
 
-/// Host file references own an exclusive execution admission: every physical
-/// run takes shared admission, so no CPU can enter until this proof drops.
+/// Host file references own exclusive execution admission against `run_member`.
+/// The single-step fixture bypasses it under exclusive mutable carrier custody;
+/// M1 `CarrierMachine::create_stopped` has no F2 admission or file registration.
 /// Atomics alone and the host image's descriptor lock are not this proof.
+///
+/// Limit (F3/F4 constraint): acquisition checks only the fd-map transaction word.
+/// A kicked CPU can still hold a `DelegatedFile` inode lock. This proof does not
+/// establish inode-lock quiescence for `objects()` / `opens()`; host operations
+/// needing those locks can still stall on a paused guest owner.
 pub struct StoppedFileTables<'a> {
     tables: carrick_el1_abi::FileTables<'a>,
     _stopped: RwLockWriteGuard<'a, ()>,
@@ -6710,6 +6717,79 @@ pub enum InitialProcessExit {
 #[cfg(test)]
 mod cpl0_layout_tests {
     use super::*;
+
+    fn admission_fixture() -> Cpl0Carrier {
+        let inventory = Arc::new(FrameInventoryAuthority::new())
+            .physical_projection(Arc::new(ObjectIdRegistry::new()));
+        let mut program = vec![0x48, 0xb8];
+        program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+        program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+        Cpl0Carrier::boot(
+            inventory,
+            Path::new(env!("CARRICK_X86_CPL0_FIXTURE_IMAGE")),
+            [&program, &program],
+        )
+        .expect("admission fixture")
+    }
+
+    #[test]
+    fn file_region_run_refuses_host_access_without_waiting() {
+        let mut carrier = admission_fixture();
+        let context = carrier
+            .custody
+            .production_run_context(0)
+            .expect("run context");
+        let stopped = carrier
+            .custody
+            .file_tables(carrier.file_region_binding())
+            .expect("host access");
+        let cpu = &mut carrier.cpus[0];
+        let outcome = std::thread::scope(|scope| {
+            let (send, recv) = mpsc::channel();
+            let worker = scope.spawn(move || {
+                let watchdog = Watchdog::start();
+                send.send(watchdog.during_guest(|| context.run(cpu)))
+                    .expect("run result");
+            });
+            let outcome = recv.recv_timeout(Duration::from_secs(2));
+            // Always release custody and join, including the blocking pre-fix path.
+            drop(stopped);
+            worker.join().expect("join CPU");
+            outcome
+        });
+        assert!(
+            matches!(outcome, Ok(Err(TrapError::ExecutionAdmissionBusy))),
+            "{:?}",
+            outcome.as_ref().map(|result| result.as_ref().err())
+        );
+        carrier.observe(0).expect("intact admission control");
+    }
+
+    #[test]
+    fn file_region_poisoned_admission_is_repeated_typed_fatal() {
+        let mut carrier = admission_fixture();
+        let execution = Arc::clone(&carrier.custody.files.execution);
+        let poison = std::panic::catch_unwind(|| {
+            let _writer = execution.write().expect("exclusive admission");
+            panic!("injected host custody failure");
+        });
+        assert!(poison.is_err());
+        for _ in 0..2 {
+            let error = match carrier.run_cpu(0) {
+                Err(error) => error,
+                Ok(_) => panic!("poison must never admit CPU"),
+            };
+            assert!(
+                matches!(error, TrapError::ExecutionAdmissionPoisoned),
+                "{error}"
+            );
+            assert_eq!(
+                error.to_string(),
+                "fatal vCPU execution admission: protection lock poisoned"
+            );
+            assert_eq!(carrier.custody.actual_run[0].load(Ordering::Acquire), 0);
+        }
+    }
 
     #[test]
     fn file_region_published_before_guest_entry() {

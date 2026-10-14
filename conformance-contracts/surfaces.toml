@@ -1402,3 +1402,9 @@ contracts = ["kernel.x86.file-region"]
 path = "crates/carrick-vmm-kvm/tests/fixtures/native_file_fork.S"
 contracts = ["kernel.x86.file-region"]
 
+
+
+[[surfaces]]
+path = "crates/carrick-hal/src/trap.rs"
+contracts = ["kernel.x86.file-region"]
+
