@@ -601,10 +601,10 @@ pub fn invoke<'a>(
                 false,
             ))
         }
-        LifecycleCall::SigProcMask => {
-            let work = serve_sigprocmask(args, thread, native)?;
-            Some(returned(SyscallResult::new(0), work))
-        }
+        LifecycleCall::SigProcMask => Some(match serve_sigprocmask(args, thread, native)? {
+            Ok(work) => returned(SyscallResult::new(0), work),
+            Err(errno) => returned(SyscallResult::new(errno.guest_retval()), false),
+        }),
         LifecycleCall::SigAltStack => {
             let sp = native.user_sp().map(UserVa::raw);
             serve_sigaltstack(args, thread, native, sp)?;
@@ -657,39 +657,37 @@ pub fn serve_sigprocmask(
     args: [u64; 6],
     thread: LifecycleThread<'_>,
     user: &mut (impl UserCopy + ?Sized),
-) -> Option<bool> {
+) -> Option<Result<bool, carrick_syscall_abi::LinuxErrno>> {
     let [how, set, oldset, size] = [args[0], args[1], args[2], args[3]];
-    if !setup_open(thread.page) || size != RT_SIGSET_SIZE {
+    if !setup_open(thread.page) {
         return None;
     }
-    // Linux reads the new set before it writes the old one; the host lane
-    // writes first. An aliased pair would see two answers: the host decides.
-    if set != 0 && oldset != 0 && ranges_overlap(set, RT_SIGSET_SIZE, oldset, RT_SIGSET_SIZE) {
-        return None;
+    if size != RT_SIGSET_SIZE {
+        return Some(Err(carrick_syscall_abi::LINUX_EINVAL));
     }
     // The owning thread is the only writer of its mask.
     let old = thread.slot.blocked();
     let new = if set != 0 {
         let mut bytes = [0u8; 8];
         if !user.copy_in(&mut bytes, UserVa::new(set)) {
-            return None;
+            return Some(Err(carrick_syscall_abi::LINUX_EFAULT));
         }
         let bits = u64::from_le_bytes(bytes);
         let mask = match how {
             SIG_BLOCK => old.0 | bits,
             SIG_UNBLOCK => old.0 & !bits,
             SIG_SETMASK => bits,
-            _ => return None,
+            _ => return Some(Err(carrick_syscall_abi::LINUX_EINVAL)),
         };
         Some(BlockedMask(mask & !UNBLOCKABLE))
     } else {
         None
     };
     if oldset != 0 && !user.copy_out(UserVa::new(oldset), &old.0.to_le_bytes()) {
-        return None;
+        return Some(Err(carrick_syscall_abi::LINUX_EFAULT));
     }
     let Some(new) = new else {
-        return Some(false);
+        return Some(Ok(false));
     };
     let (prev, pending) = thread
         .slot
@@ -697,7 +695,7 @@ pub fn serve_sigprocmask(
     let pending = pending.0 | thread.page.pending().load().0;
     let deliverable = pending & !new.0;
     let newly_blocked = pending & new.0 & !prev.0;
-    Some(deliverable | newly_blocked != 0)
+    Some(Ok(deliverable | newly_blocked != 0))
 }
 
 /// `sigaltstack(ss, old_ss)`. `sp` is the caller's stack pointer, when
