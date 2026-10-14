@@ -1,5 +1,6 @@
 //! Exact frame supply requests and single-flight completion protocol.
 use super::EL1_FRAME_GRANT_TARGET_SIZE;
+use super::ReservationIncarnation;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub const FRAME_GRANT_MAILBOX_IDLE: u32 = 0;
@@ -18,12 +19,15 @@ pub const FRAME_GRANT_ERR_STALE: u64 = 3;
 
 /// Included in the image ABI fingerprint: a host-published grant must never
 /// be paired with an EL1 image that still owns successful leaf publication.
-pub const FRAME_GRANT_PROTOCOL_VERSION: u64 = 2;
+pub const FRAME_GRANT_PROTOCOL_VERSION: u64 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameGrantRequest {
     /// Exact zone/MM key selected by the loaded executor.
     pub mm_key: u64,
+    /// Exact anonymous root node at the fault, if one owns this request.
+    /// A refusal for an older node must not answer a reused VA.
+    pub reservation_incarnation: Option<ReservationIncarnation>,
     /// Nonzero carrier-wide request incarnation chosen by EL1.
     pub request_generation: u64,
     /// The semantic address whose recoverable data abort created the request.
@@ -73,8 +77,10 @@ pub struct FrameGrantResponse {
 /// response. The MM guard serializes publication with unmap/protect/replacement.
 ///
 /// On refusal the host moves HOST_WORKING -> RESPONSE. EL1 claims RESPONSE ->
-/// GUEST_CONSUMING, discards the refusal, then releases -> IDLE and forwards
-/// once without issuing another request. Refusal carries no frame authority.
+/// GUEST_CONSUMING, discards the refusal, then releases -> IDLE. A refusal
+/// from the current root node forwards once; one from a retired node cannot
+/// answer a replacement at the same VA, so EL1 may issue that node's request.
+/// Refusal carries no frame authority.
 /// GUEST_FAILED is a reserved ABI value: host publication handles missing table
 /// pages directly, so guest hand-back is no longer a reachable transition.
 /// Failed publication cannot commit or free the slot; the host must refuse or
@@ -95,6 +101,7 @@ pub struct FrameGrantMailbox {
     pub state: AtomicU32,
     status: AtomicU64,
     mm_key: AtomicU64,
+    reservation_incarnation: AtomicU64,
     request_generation: AtomicU64,
     fault_va: AtomicU64,
     requested_len: AtomicU64,
@@ -118,6 +125,7 @@ impl FrameGrantMailbox {
             state: AtomicU32::new(FRAME_GRANT_MAILBOX_IDLE),
             status: AtomicU64::new(FRAME_GRANT_ERR_INVALID),
             mm_key: AtomicU64::new(0),
+            reservation_incarnation: AtomicU64::new(0),
             request_generation: AtomicU64::new(0),
             fault_va: AtomicU64::new(0),
             requested_len: AtomicU64::new(0),
@@ -146,6 +154,9 @@ impl FrameGrantMailbox {
     fn load_request(&self) -> FrameGrantRequest {
         FrameGrantRequest {
             mm_key: self.mm_key.load(Ordering::Relaxed),
+            reservation_incarnation: ReservationIncarnation::new(
+                self.reservation_incarnation.load(Ordering::Relaxed),
+            ),
             request_generation: self.request_generation.load(Ordering::Relaxed),
             fault_va: self.fault_va.load(Ordering::Relaxed),
             requested_len: self.requested_len.load(Ordering::Relaxed),
@@ -204,6 +215,12 @@ impl FrameGrantMailbox {
         self.status
             .store(FRAME_GRANT_ERR_INVALID, Ordering::Relaxed);
         self.mm_key.store(request.mm_key, Ordering::Relaxed);
+        self.reservation_incarnation.store(
+            request
+                .reservation_incarnation
+                .map_or(0, ReservationIncarnation::raw),
+            Ordering::Relaxed,
+        );
         self.request_generation
             .store(request.request_generation, Ordering::Relaxed);
         self.fault_va.store(request.fault_va, Ordering::Relaxed);
@@ -542,6 +559,8 @@ impl FrameGrantMailbox {
     pub const STATE_OFFSET: usize = core::mem::offset_of!(Self, state);
     pub const STATUS_OFFSET: usize = core::mem::offset_of!(Self, status);
     pub const MM_KEY_OFFSET: usize = core::mem::offset_of!(Self, mm_key);
+    pub const RESERVATION_INCARNATION_OFFSET: usize =
+        core::mem::offset_of!(Self, reservation_incarnation);
     pub const REQUEST_GENERATION_OFFSET: usize = core::mem::offset_of!(Self, request_generation);
     pub const FAULT_VA_OFFSET: usize = core::mem::offset_of!(Self, fault_va);
     pub const REQUESTED_LEN_OFFSET: usize = core::mem::offset_of!(Self, requested_len);
@@ -595,6 +614,7 @@ mod layout_manifest {
                      state: _,
                      status: _,
                      mm_key: _,
+                     reservation_incarnation: _,
                      request_generation: _,
                      fault_va: _,
                      requested_len: _,
@@ -611,18 +631,26 @@ mod layout_manifest {
         field!(FrameGrantMailbox, state, AtomicU32, 0, 4, 4);
         field!(FrameGrantMailbox, status, AtomicU64, 8, 8, 8);
         field!(FrameGrantMailbox, mm_key, AtomicU64, 16, 8, 8);
-        field!(FrameGrantMailbox, request_generation, AtomicU64, 24, 8, 8);
-        field!(FrameGrantMailbox, fault_va, AtomicU64, 32, 8, 8);
-        field!(FrameGrantMailbox, requested_len, AtomicU64, 40, 8, 8);
-        field!(FrameGrantMailbox, access, AtomicU64, 48, 8, 8);
-        field!(FrameGrantMailbox, semantic_base, AtomicU64, 56, 8, 8);
-        field!(FrameGrantMailbox, physical_ipa, AtomicU64, 64, 8, 8);
-        field!(FrameGrantMailbox, granted_len, AtomicU64, 72, 8, 8);
-        field!(FrameGrantMailbox, permissions, AtomicU64, 80, 8, 8);
-        field!(FrameGrantMailbox, frame_id, AtomicU64, 88, 8, 8);
-        field!(FrameGrantMailbox, mapping_id, AtomicU64, 96, 8, 8);
-        field!(FrameGrantMailbox, owner_generation, AtomicU64, 104, 8, 8);
-        field!(FrameGrantMailbox, inventory_revision, AtomicU64, 112, 8, 8);
+        field!(
+            FrameGrantMailbox,
+            reservation_incarnation,
+            AtomicU64,
+            24,
+            8,
+            8
+        );
+        field!(FrameGrantMailbox, request_generation, AtomicU64, 32, 8, 8);
+        field!(FrameGrantMailbox, fault_va, AtomicU64, 40, 8, 8);
+        field!(FrameGrantMailbox, requested_len, AtomicU64, 48, 8, 8);
+        field!(FrameGrantMailbox, access, AtomicU64, 56, 8, 8);
+        field!(FrameGrantMailbox, semantic_base, AtomicU64, 64, 8, 8);
+        field!(FrameGrantMailbox, physical_ipa, AtomicU64, 72, 8, 8);
+        field!(FrameGrantMailbox, granted_len, AtomicU64, 80, 8, 8);
+        field!(FrameGrantMailbox, permissions, AtomicU64, 88, 8, 8);
+        field!(FrameGrantMailbox, frame_id, AtomicU64, 96, 8, 8);
+        field!(FrameGrantMailbox, mapping_id, AtomicU64, 104, 8, 8);
+        field!(FrameGrantMailbox, owner_generation, AtomicU64, 112, 8, 8);
+        field!(FrameGrantMailbox, inventory_revision, AtomicU64, 120, 8, 8);
     }
 
     #[test]
