@@ -579,11 +579,9 @@ pub fn parse_test_log(log: &str) -> ParsedTestLog {
         }
         if let Some(rest) = trimmed.strip_prefix("Running ")
             && !rest.trim_start().starts_with('`')
+            && let Some((_, tail)) = rest.rsplit_once('(')
+            && let Some(path) = tail.strip_suffix(')')
         {
-            let path = rest
-                .rsplit_once('(')
-                .and_then(|(_, tail)| tail.strip_suffix(')'))
-                .unwrap_or_else(|| rest.split_whitespace().next().unwrap_or(rest));
             start_binary(
                 binary_stem_from_path(path),
                 &mut current_binary,
