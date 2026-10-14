@@ -1492,7 +1492,7 @@ mod tests {
                 .write(
                     NativeRootExit::new(
                         execution.binding,
-                        carrick_personality_linux::lifecycle::LinuxWaitStatus::exited(7),
+                        carrick_sched_core::process::TerminationStatus::exited(7),
                     )
                     .unwrap(),
                 );

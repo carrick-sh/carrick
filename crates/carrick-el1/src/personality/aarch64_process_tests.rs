@@ -446,6 +446,7 @@ impl Fixture {
             dispatch,
         )
     }
+    #[cfg(test)]
     fn process_service(&'static self) -> Aarch64NativeProcessService<'static, TestStockCrossing> {
         Aarch64NativeProcessService::with_crossing(
             &self.task,
@@ -1608,12 +1609,14 @@ fn arm_returned_process_call_is_not_a_zone_park() {
     );
 }
 
+#[cfg(test)]
 fn imported_thread(
     fixture: &Fixture,
 ) -> (&'static ThreadControlSlot, carrick_sched_core::RecordRef) {
     imported_thread_with_identity(fixture, |_| {})
 }
 
+#[cfg(test)]
 fn imported_thread_with_identity(
     fixture: &Fixture,
     edit: impl FnOnce(&mut carrick_sched_core::ThreadIdentity),
