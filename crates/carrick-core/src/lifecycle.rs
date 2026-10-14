@@ -134,6 +134,39 @@ pub trait Lifecycle {
             });
     }
 
+    /// A Closing process has already reserved its leader's terminal
+    /// membership. Its cancelled host members may therefore take the page
+    /// from one live member to zero without publishing process status.
+    fn reserve_cancelled_member_exit(&self) -> Result<NonfinalExitMembership<'_>, MembershipFloor>
+    where
+        Self: Sized,
+    {
+        self.release_live(0)?;
+        Ok(NonfinalExitMembership {
+            page: self,
+            reserved: Some(ReservedLiveUnit::new()),
+        })
+    }
+
+    /// The caller of group exit has already released its live membership;
+    /// its own entry is consumed by Closing rather than by CancelMembers.
+    fn retire_closing_caller(&self, entry: EntryRef) -> Result<(), TransitionError> {
+        if self.gate() != GateState::Closed {
+            return Err(TransitionError::GateClosed(self.gate()));
+        }
+        self.transition(
+            entry,
+            &[
+                EntryState::Born,
+                EntryState::Published,
+                EntryState::ExitingBorn,
+                EntryState::ExitingPublished,
+            ],
+            EntryState::Reaped,
+            Ordering::AcqRel,
+        )
+    }
+
     fn state(&self, index: usize) -> Option<(u64, EntryState)> {
         self.entry_word(index)
             .map(|word| unpack(word.load(Ordering::Acquire)))

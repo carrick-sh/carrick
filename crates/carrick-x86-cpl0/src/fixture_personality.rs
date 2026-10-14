@@ -246,7 +246,8 @@ fn fixture_handled(
             carrick_personality_linux::dispatch::CompletionRoute::WithWork => {
                 notify_work(frame);
             }
-            carrick_personality_linux::dispatch::CompletionRoute::Forward => {
+            carrick_personality_linux::dispatch::CompletionRoute::Forward
+            | carrick_personality_linux::dispatch::CompletionRoute::HostCustody => {
                 forward_to_host(frame);
             }
             _ => {
@@ -1147,6 +1148,7 @@ impl Personality for FixturePersonality {
                             ProductionBoundary::Continue => CompletionRoute::Served,
                             ProductionBoundary::Work => CompletionRoute::WithWork,
                             ProductionBoundary::Forward => CompletionRoute::Forward,
+                            ProductionBoundary::HostCustody => CompletionRoute::HostCustody,
                             ProductionBoundary::Invalid => CompletionRoute::InvalidCompletion,
                         };
                     match route {
@@ -1158,7 +1160,7 @@ impl Personality for FixturePersonality {
                         CompletionRoute::InvalidCompletion => {
                             fatal_error(frame);
                         }
-                        CompletionRoute::Forward => {
+                        CompletionRoute::Forward | CompletionRoute::HostCustody => {
                             forward_to_host(frame);
                         }
                     }

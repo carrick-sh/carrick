@@ -1668,11 +1668,17 @@ where
                 );
             }
             threads::PersistentThreadExitDisposition::Done(VcpuLoopOutcome::ThreadDone) => {
+                self.publish_host_thread_retirement(&context);
                 self.finish(Ok(VcpuLoopOutcome::ThreadDone))
             }
             threads::PersistentThreadExitDisposition::Done(
                 outcome @ VcpuLoopOutcome::ProcessExit(_),
             ) => {
+                let ring_closing = context.lifecycle_page().exit_wait().is_some();
+                self.publish_host_thread_retirement(&context);
+                if ring_closing {
+                    return Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)));
+                }
                 self.terminal_runtime = PersistentTerminalRuntimeState::Withdrawn;
                 self.begin_persistent_process_terminal(
                     engine,
@@ -1716,6 +1722,33 @@ where
                 )
             }
         })
+    }
+
+    fn publish_host_thread_retirement(&self, context: &carrick_kernel::kernel::KernelContext) {
+        use carrick_core_abi::entry::{EntryGeneration, EntryTaskKey, EntryThreadGeneration};
+        let task = context.task().key();
+        let thread = context.thread().key();
+        let Some(receipt) = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+            EntryTaskKey::from_raw(thread.tid.raw() as u64),
+            EntryGeneration::from_raw(task.serial.raw()),
+            EntryThreadGeneration::from_raw(thread.serial.raw()),
+        ) else {
+            carrick_fatal!(
+                "kernel::thread_settlement",
+                "retired thread lost exact identity"
+            );
+        };
+        context
+            .thread()
+            .control_slot()
+            .publish_host_retirement(receipt);
+        let page = context.lifecycle_page();
+        if let Some((mm, address)) = page.exit_wait()
+            && let Some(zone) = carrick_kernel::el1_zone::zone()
+        {
+            let wake = carrick_kernel::el1_zone::wake(zone, mm.raw(), address, u32::MAX, u32::MAX);
+            carrick_kernel::el1_zone::hand_back(&wake.handed);
+        }
     }
 
     /// Park a Busy thread exit as a Blocked job subscribed to the kernel

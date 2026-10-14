@@ -4,16 +4,139 @@
 use core::marker::PhantomData;
 use core::num::NonZeroU64;
 
-use carrick_core_abi::entry::ExecutionBinding;
+use carrick_core_abi::entry::{
+    EntryGeneration, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+};
 use carrick_core_abi::lifecycle::EntryRef;
+use carrick_guest_arch::{AddressContext, RootGpa};
 use carrick_sched_core::process::{TaskId, TaskKey, TaskSerial, TerminationStatus};
 
 use crate::lifecycle::{Lifecycle, MembershipFloor, NonfinalExitMembership};
 
 pub struct Thread;
+pub struct Process;
 pub struct Live;
 pub struct Exiting;
 pub struct Terminal;
+pub struct Closing;
+pub struct Settled;
+
+mod sealed {
+    pub trait Sealed {}
+}
+pub trait TerminalKind: sealed::Sealed {
+    type Identity: Copy;
+    type LaneMarker;
+}
+impl sealed::Sealed for Thread {}
+impl sealed::Sealed for Process {}
+impl TerminalKind for Thread {
+    type Identity = ThreadTerminalIdentity;
+    type LaneMarker = *const ();
+}
+impl TerminalKind for Process {
+    type Identity = ProcessTerminalIdentity;
+    type LaneMarker = ();
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessTerminalIdentity {
+    task: TaskKey,
+    address: AddressContext<RootGpa>,
+    status: TerminationStatus,
+}
+
+impl ProcessTerminalIdentity {
+    pub fn from_exit(
+        task: TaskKey,
+        address: AddressContext<RootGpa>,
+        status: TerminationStatus,
+    ) -> Self {
+        Self {
+            task,
+            address,
+            status,
+        }
+    }
+
+    pub fn task(self) -> TaskKey {
+        self.task
+    }
+    pub fn address(self) -> AddressContext<RootGpa> {
+        self.address
+    }
+    pub fn status(self) -> TerminationStatus {
+        self.status
+    }
+}
+
+/// A bounded description of the work the registry applies. Exact adopted
+/// bindings remain in its outstanding receipt set, not on the EL1 stack.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemberSet {
+    pool_mask: u16,
+    adopted_count: u16,
+}
+
+impl MemberSet {
+    pub fn new(pool_mask: u16, adopted_count: usize) -> Option<Self> {
+        Some(Self {
+            pool_mask,
+            adopted_count: u16::try_from(adopted_count).ok()?,
+        })
+    }
+    pub fn pool_mask(self) -> u16 {
+        self.pool_mask
+    }
+    pub fn adopted_count(self) -> u16 {
+        self.adopted_count
+    }
+}
+
+/// Host retirement's exact acknowledgement of an adopted member. A visible
+/// tid is never sufficient: its execution or thread generation may be reused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostThreadRetirementReceipt {
+    task: EntryTaskKey,
+    execution: EntryGeneration,
+    thread: EntryThreadGeneration,
+}
+
+impl HostThreadRetirementReceipt {
+    pub fn from_parts(
+        task: EntryTaskKey,
+        execution: EntryGeneration,
+        thread: EntryThreadGeneration,
+    ) -> Option<Self> {
+        (task.raw() != 0 && execution.raw() != 0 && thread.raw() != 0).then_some(Self {
+            task,
+            execution,
+            thread,
+        })
+    }
+
+    pub fn from_binding(binding: ExecutionBinding) -> Self {
+        Self {
+            task: binding.task,
+            execution: binding.generation,
+            thread: binding.thread_generation,
+        }
+    }
+
+    pub fn matches(self, binding: ExecutionBinding) -> bool {
+        self == Self::from_binding(binding)
+    }
+
+    pub fn task(self) -> EntryTaskKey {
+        self.task
+    }
+    pub fn execution(self) -> EntryGeneration {
+        self.execution
+    }
+    pub fn thread(self) -> EntryThreadGeneration {
+        self.thread
+    }
+}
 
 /// A raw thread exit at the page's last live membership becomes a process
 /// exit. The process owner then closes admission and fixes the group status.
@@ -67,17 +190,73 @@ impl ThreadTerminalIdentity {
     }
 }
 
-pub struct TerminalCustody<K, P> {
-    identity: ThreadTerminalIdentity,
-    phase: PhantomData<(K, P, *const ())>,
+pub struct TerminalCustody<K: TerminalKind, P> {
+    identity: K::Identity,
+    phase: PhantomData<(K, P, K::LaneMarker)>,
 }
 
 #[must_use]
 pub enum RetirementVerdict {
+    RetireThreadOnHost {
+        identity: ThreadTerminalIdentity,
+    },
     RetireThread {
         identity: ThreadTerminalIdentity,
         requires_slot_absence: bool,
     },
+    CancelMembers {
+        process: ProcessTerminalIdentity,
+        members: MemberSet,
+    },
+}
+
+impl TerminalCustody<Process, Live> {
+    pub fn admitted(identity: ProcessTerminalIdentity) -> Self {
+        Self {
+            identity,
+            phase: PhantomData,
+        }
+    }
+
+    pub fn close(
+        self,
+        page: &impl Lifecycle,
+        members: MemberSet,
+    ) -> (TerminalCustody<Process, Closing>, RetirementVerdict) {
+        page.close();
+        (
+            TerminalCustody {
+                identity: self.identity,
+                phase: PhantomData,
+            },
+            RetirementVerdict::CancelMembers {
+                process: self.identity,
+                members,
+            },
+        )
+    }
+}
+
+impl TerminalCustody<Process, Closing> {
+    pub fn settle(
+        self,
+        page: &impl Lifecycle,
+        receipts_returned: bool,
+    ) -> Result<TerminalCustody<Process, Settled>, Self> {
+        if page.live() != 0 || page.claimed_count() != 0 || !receipts_returned {
+            return Err(self);
+        }
+        Ok(TerminalCustody {
+            identity: self.identity,
+            phase: PhantomData,
+        })
+    }
+}
+
+impl TerminalCustody<Process, Settled> {
+    pub fn identity(self) -> ProcessTerminalIdentity {
+        self.identity
+    }
 }
 
 impl TerminalCustody<Thread, Live> {
@@ -97,6 +276,12 @@ impl TerminalCustody<Thread, Live> {
 }
 
 impl TerminalCustody<Thread, Exiting> {
+    pub fn route_to_host(self) -> RetirementVerdict {
+        RetirementVerdict::RetireThreadOnHost {
+            identity: self.identity,
+        }
+    }
+
     pub fn reserve_nonfinal<'a>(
         self,
         page: &'a impl Lifecycle,
@@ -132,3 +317,4 @@ impl TerminalCustody<Thread, Terminal> {
 
 // The EL1 caller may hold custody on its 16 KiB stack.
 const _: () = assert!(core::mem::size_of::<TerminalCustody<Thread, Live>>() <= 64);
+const _: () = assert!(core::mem::size_of::<TerminalCustody<Process, Closing>>() <= 64);
