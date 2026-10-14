@@ -1048,16 +1048,81 @@ fn sigaltstack_serves_off_the_alternate_stack() {
     let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*new), 0]);
     assert_eq!(action, Action::Served);
     assert_eq!(frame.x[0] as i64, -1);
+    for change in [
+        stack_t(0x20_0000, 0, 0x4000),
+        stack_t(0x20_0000, 1, 1024),
+        stack_t(0x20_0000, 0, 1024),
+        stack_t(0, SS_DISABLE, 0),
+    ] {
+        let change = Box::new(change);
+        let bad_old = Box::new([0x55; 24]);
+        let mut frame = TrapFrame::default();
+        frame.x[..2].copy_from_slice(&[addr(&*change), addr(&*bad_old)]);
+        frame.x[8] = SYS_SIGALTSTACK as u64;
+        frame.slot = SLOT_IDX as u64;
+        let mut user = FaultingUser {
+            deny_out: std::vec![addr(&*bad_old)],
+            ..FaultingUser::default()
+        };
+        assert_eq!(
+            serve_directly(&mut w, &mut frame, &mut user),
+            Some(Action::Served)
+        );
+        assert_eq!(
+            frame.x[0] as i64, -1,
+            "active stack change precedes flags, size and output fault"
+        );
+        assert_eq!(*bad_old, [0x55; 24]);
+    }
     w.cpu.regs.sp_el0 = 0x2222_0000;
     // Linux error numbers stay in ring.
     for (bad, errno) in [
         (stack_t(0x20_0000, 0, 1024), -12),
         (stack_t(0x20_0000, 1, 0x4000), -22),
+        (stack_t(0x20_0000, 1, 1024), -22),
     ] {
         let bad = Box::new(bad);
         let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*bad), 0]);
         assert_eq!(action, Action::Served);
         assert_eq!(frame.x[0] as i64, errno);
+    }
+    let invalid = Box::new(stack_t(0x20_0000, 1, 1024));
+    let bad_old = Box::new([0x55; 24]);
+    let mut frame = TrapFrame::default();
+    frame.x[..2].copy_from_slice(&[addr(&*invalid), addr(&*bad_old)]);
+    frame.x[8] = SYS_SIGALTSTACK as u64;
+    frame.slot = SLOT_IDX as u64;
+    let mut user = FaultingUser {
+        deny_out: std::vec![addr(&*bad_old)],
+        ..FaultingUser::default()
+    };
+    assert_eq!(
+        serve_directly(&mut w, &mut frame, &mut user),
+        Some(Action::Served)
+    );
+    assert_eq!(frame.x[0] as i64, -22);
+    assert_eq!(*bad_old, [0x55; 24]);
+    for (ss, old_ss, deny_in, deny_out) in [
+        (addr(&*new), 0, true, false),
+        (0, addr(&*bad_old), false, true),
+    ] {
+        let mut frame = TrapFrame::default();
+        frame.x[..2].copy_from_slice(&[ss, old_ss]);
+        frame.x[8] = SYS_SIGALTSTACK as u64;
+        frame.slot = SLOT_IDX as u64;
+        let mut user = FaultingUser {
+            deny_in: if deny_in { std::vec![ss] } else { Vec::new() },
+            deny_out: if deny_out {
+                std::vec![old_ss]
+            } else {
+                Vec::new()
+            },
+        };
+        assert_eq!(
+            serve_directly(&mut w, &mut frame, &mut user),
+            Some(Action::Served)
+        );
+        assert_eq!(frame.x[0] as i64, -14);
     }
     let alias = Box::new(stack_t(0x30_0000, 0, 0x4000));
     let (action, _) = w.syscall(SYS_SIGALTSTACK, &[addr(&*alias), addr(&*alias)]);
@@ -1065,7 +1130,7 @@ fn sigaltstack_serves_off_the_alternate_stack() {
     assert_eq!(*alias, stack_t(0x10_0000, 0, 0x4000));
     assert_eq!(w.venue.leader_slot().read_altstack().sp, 0x30_0000);
     // Disable, returning the old one.
-    let off = Box::new(stack_t(0, SS_DISABLE, 0));
+    let off = Box::new(stack_t(0, SS_DISABLE, 1024));
     let (action, _) = w.syscall(SYS_SIGALTSTACK, &[addr(&*off), addr(&*old)]);
     assert_eq!(action, Action::Served);
     assert_eq!(*old, stack_t(0x30_0000, 0, 0x4000));
@@ -1082,7 +1147,10 @@ fn sigaltstack_serves_off_the_alternate_stack() {
         w.venue.leader_slot().read_altstack().flags,
         carrick_syscall_abi::LINUX_SS_AUTODISARM as u32
     );
-    assert_eq!(w.served(SYS_SIGALTSTACK), 10);
+    let (action, _) = w.syscall(SYS_SIGALTSTACK, &[0, addr(&*old)]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(*old, *autodisarm);
+    assert_eq!(w.served(SYS_SIGALTSTACK), 12);
 }
 
 #[test]

@@ -1064,11 +1064,7 @@ impl<
     fn signal_native(
         &mut self,
     ) -> Option<&mut dyn carrick_personality_linux::signal::SignalNative<'a>> {
-        if self.frame.arm_scheduler() {
-            None
-        } else {
-            Some(self)
-        }
+        Some(self)
     }
     fn task_state(&self) -> Option<&LinuxTaskState> {
         self.task().map(|task| &task.linux)
