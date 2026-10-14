@@ -60,6 +60,8 @@ pub enum FileRegionError {
     Retired,
     /// Host table access cannot acquire stopped-carrier custody.
     Running,
+    /// Stopped CPL0 still owns an unfinished descriptor transaction.
+    MutationActive,
 }
 
 impl FileRegionError {
@@ -72,6 +74,7 @@ impl FileRegionError {
             Self::Foreign => 0xf202,
             Self::Retired => 0xf203,
             Self::Running => 0xf204,
+            Self::MutationActive => 0xf206,
         }
     }
 }
