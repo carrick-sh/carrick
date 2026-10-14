@@ -47,6 +47,15 @@ use core::{
     sync::atomic::Ordering,
     time::Duration,
 };
+
+/// Outcome of re-entering the shared process owner after an ISA switches in
+/// a record with retained lifecycle work.
+pub enum NativeResume {
+    NoPending,
+    Returned(SyscallResult),
+    Left(Option<LinuxWaitStatus>),
+    Invalid,
+}
 #[cfg(test)]
 const LOCK_SPINS: u32 = 100_000;
 
@@ -2927,6 +2936,31 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         self.resume_pending_wait()
     }
 
+    /// The ISA execution lane's single checkpoint after selecting a parked
+    /// record. The owner consumes its continuation before any EL0 return.
+    pub fn resume_checkpoint(
+        &mut self,
+    ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureReason> {
+        let outcome = self.resume_pending_lifecycle();
+        if let Some(reason) = self.take_run_failure() {
+            return Err(reason);
+        }
+        match outcome {
+            None => Ok(NativeResume::NoPending),
+            Some(LifecycleOutcome::Returned { result, .. }) => Ok(NativeResume::Returned(result)),
+            Some(LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                ..
+            }) => {
+                if self.take_handoff_receipt().is_none() {
+                    return Ok(NativeResume::Invalid);
+                }
+                Ok(NativeResume::Left(self.take_root_exit()))
+            }
+            Some(_) => Ok(NativeResume::Invalid),
+        }
+    }
+
     fn park_pending_exit(
         &mut self,
         page: &ThreadLifecyclePage,
@@ -2997,6 +3031,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let wait_status = LinuxWaitStatus::signaled(sig, false);
         self.exit_with_status(wait_status)
     }
+    #[inline(never)]
     pub fn exit_with_status(
         &mut self,
         wait_status: LinuxWaitStatus,

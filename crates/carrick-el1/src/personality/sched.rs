@@ -10,6 +10,67 @@ pub use carrick_personality_linux::sched::{
 use carrick_personality_linux::sched::{FutexCall, FutexFrequency, FutexVenue, FutexWait};
 use core::sync::atomic::Ordering;
 
+/// ARM's Linux execution entry: the substrate moves registers, then this
+/// adapter re-enters the admitted native process owner before EL0 resumes.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub struct HardwareCpu;
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+impl ThreadCpu for HardwareCpu {
+    fn save(&mut self, frame: &TrapFrame, ctx: &mut carrick_el1_abi::Aarch64ParkedContext) {
+        crate::substrate::sched::hw::HardwareCpu.save(frame, ctx);
+    }
+    fn load(&mut self, frame: &mut TrapFrame, ctx: &carrick_el1_abi::Aarch64ParkedContext) {
+        crate::substrate::sched::hw::HardwareCpu.load(frame, ctx);
+    }
+    fn resume_lifecycle(
+        &mut self,
+        zone: &carrick_el1_abi::ZoneTables,
+        task: &carrick_el1_abi::CurrentTask,
+        slot: carrick_el1_abi::SlotId,
+        record: carrick_el1_abi::RecordId,
+    ) -> ResumeAction {
+        // SAFETY: these references point into fixed image-lifetime EL1 ABI
+        // storage, and the scheduler owns this slot through the checkpoint.
+        let zone = unsafe { &*(zone as *const carrick_el1_abi::ZoneTables) };
+        let task = unsafe { &*(task as *const carrick_el1_abi::CurrentTask) };
+        super::aarch64_process::resume_production(zone, task, slot, record)
+    }
+    fn set_translation(&mut self, a: u64, b: u64) {
+        crate::substrate::sched::hw::HardwareCpu.set_translation(a, b);
+    }
+    fn invalidate_asid(&mut self, root: u64) {
+        crate::substrate::sched::hw::HardwareCpu.invalidate_asid(root);
+    }
+    fn now(&self) -> u64 {
+        crate::substrate::sched::hw::HardwareCpu.now()
+    }
+    fn freq(&self) -> u64 {
+        crate::substrate::sched::hw::HardwareCpu.freq()
+    }
+    fn set_timer(&mut self, deadline: Option<u64>) {
+        crate::substrate::sched::hw::HardwareCpu.set_timer(deadline);
+    }
+    fn send_sgi(&mut self, route: u64) {
+        crate::substrate::sched::hw::HardwareCpu.send_sgi(route);
+    }
+    fn ack_irq(&mut self) -> u32 {
+        crate::substrate::sched::hw::HardwareCpu.ack_irq()
+    }
+    fn end_irq(&mut self, intid: u32) {
+        crate::substrate::sched::hw::HardwareCpu.end_irq(intid);
+    }
+    fn wait_for_interrupt(&mut self) {
+        crate::substrate::sched::hw::HardwareCpu.wait_for_interrupt();
+    }
+    fn spin(&mut self) {
+        crate::substrate::sched::hw::HardwareCpu.spin();
+    }
+    fn own_sgi_target(&self) -> u64 {
+        crate::substrate::sched::hw::HardwareCpu.own_sgi_target()
+    }
+}
+
 pub fn is_served_futex_op(frame: &TrapFrame) -> bool {
     ::carrick_personality_linux::sched::is_served_futex_op(
         frame.x[8],
