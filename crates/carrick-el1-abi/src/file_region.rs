@@ -52,6 +52,21 @@ pub enum FileRegionError {
     Layout,
     Foreign,
     Retired,
+    /// Host table access cannot acquire stopped-carrier custody.
+    Running,
+}
+
+impl FileRegionError {
+    /// Exact CPL0 fatal-doorbell domain for venue refusal, separate from a
+    /// general boot refusal. Guest-observed retirement is a fixture witness.
+    pub const fn fatal_payload(self) -> u64 {
+        match self {
+            Self::Layout => 0xf201,
+            Self::Foreign => 0xf202,
+            Self::Retired => 0xf203,
+            Self::Running => 0xf204,
+        }
+    }
 }
 
 /// Region identity issued by the carrier owner. Task/MM IDs cannot be passed
@@ -256,7 +271,8 @@ fn check_mapping(mapped: NonNull<u8>, binding: FileRegionBinding) -> Result<(), 
     Ok(())
 }
 
-/// All file storage access uses this checked venue, including stdio and cache.
+/// The x86 CPL0 personality uses this checked venue for its file records,
+/// stdio and cache. ARM dispatch/delegation still use their existing raw bases.
 pub struct FileTables<'a> {
     mapped: NonNull<u8>,
     _retained: PhantomData<&'a FileRegionRegistration>,

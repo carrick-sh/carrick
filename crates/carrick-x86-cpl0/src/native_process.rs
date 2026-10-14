@@ -114,17 +114,10 @@ pub(super) fn admit_root(
         source, task, page, control, address, address, words,
     )?;
     REGISTRY.register_root(Arc::new(owner), source, task, address)?;
-    let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
     let binding =
         carrick_el1::isa::x86::context::current_cpu_binding().ok_or(NativeProcessError::Stale)?;
     let files = crate::linux_personality::file_tables(binding);
-    carrick_el1::personality::file_table::admit_stdio(
-        files.fd_map(),
-        files.opens(),
-        files.objects(),
-        file_table,
-        [true; 3],
-    );
+    crate::linux_personality::admit_stdio_cached(binding, task, &files);
     Ok(())
 }
 

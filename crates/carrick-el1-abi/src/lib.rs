@@ -793,6 +793,7 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         carrick_sched_core::GATE_CLOSED,
         EL1_STACK_SLOTS,
         core::mem::size_of::<FdMapSlot>() as u64,
+        FD_MAP_MUTATION_LOCK_OFFSET as u64,
         core::mem::offset_of!(FdMapSlot, handle) as u64,
         core::mem::offset_of!(FdMapSlot, incarnation) as u64,
         core::mem::size_of::<DelegatedFile>() as u64,
@@ -1886,9 +1887,38 @@ pub struct FdMapSlot {
     pub incarnation: AtomicU64,
     /// Per-descriptor flags; these are not open-description status flags.
     pub fd_flags: AtomicU32,
+    /// Slot zero owns the map-wide descriptor transaction lock.
+    /// This occupies existing padding; clearing a descriptor never clears it.
+    mutation_lock: AtomicU32,
+}
+
+/// Shared descriptor lock word inside the first record's existing padding.
+pub const FD_MAP_MUTATION_LOCK_OFFSET: usize = core::mem::offset_of!(FdMapSlot, mutation_lock);
+
+/// Non-cloning descriptor transaction guard. Host and image share this word.
+pub struct FdMapMutationGuard<'a>(&'a AtomicU32);
+impl Drop for FdMapMutationGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(0, Ordering::Release);
+    }
+}
+
+pub fn lock_fd_map(fd_map: &[FdMapSlot]) -> Option<FdMapMutationGuard<'_>> {
+    let word = &fd_map.first()?.mutation_lock;
+    while word
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    Some(FdMapMutationGuard(word))
 }
 
 impl FdMapSlot {
+    pub fn mutation_active(&self) -> bool {
+        self.mutation_lock.load(Ordering::Acquire) != 0
+    }
+
     /// Reserved while a publisher fills a vacant slot; never a live incarnation.
     pub const CLAIMED: u64 = u64::MAX;
     /// Non-owning view; the host file table owns the functional reference.
@@ -1921,6 +1951,7 @@ impl FdMapSlot {
             handle: AtomicU32::new(0),
             incarnation: AtomicU64::new(0),
             fd_flags: AtomicU32::new(0),
+            mutation_lock: AtomicU32::new(0),
         }
     }
 
@@ -3786,7 +3817,7 @@ impl Default for InotifyNameCache {
 }
 
 const _: () = {
-    assert!(EL1_ABI_LAYOUT_HASH == 0xed03315fdfe584f4);
+    assert!(EL1_ABI_LAYOUT_HASH == 0x25ac016959802080);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);
@@ -4109,6 +4140,7 @@ mod tests {
     fn test_fd_map_slot_layout() {
         assert_eq!(core::mem::size_of::<FdMapSlot>(), 32);
         assert_eq!(core::mem::align_of::<FdMapSlot>(), 8);
+        assert_eq!(FD_MAP_MUTATION_LOCK_OFFSET, 28);
         assert_eq!(core::mem::offset_of!(FdMapSlot, file_table), 0);
         assert_eq!(core::mem::offset_of!(FdMapSlot, fd), 8);
         assert_eq!(core::mem::offset_of!(FdMapSlot, handle), 12);

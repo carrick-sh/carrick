@@ -57,9 +57,9 @@ use kvm_ioctls::VmFd;
 use std::num::NonZeroU64;
 use std::path::Path;
 use std::ptr::NonNull;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::time::Duration;
 
 const RAM_SIZE: usize = 16 * 1024 * 1024;
@@ -779,7 +779,11 @@ pub(crate) fn run_member(
     slot: usize,
     vm: &VmFd,
     actual_run: Option<&AtomicU32>,
+    execution: &RwLock<()>,
 ) -> Result<VcpuExit, TrapError> {
+    let _running = execution
+        .read()
+        .map_err(|_| fail("file execution admission poisoned"))?;
     let member = table
         .members
         .get(slot)
@@ -850,6 +854,7 @@ pub(crate) struct ProductionRunContext {
     ram: Arc<GuestRam>,
     vm: Arc<VmFd>,
     actual_run: Arc<[AtomicU32; 2]>,
+    file_execution: Arc<RwLock<()>>,
     slot: usize,
 }
 
@@ -872,6 +877,7 @@ impl ProductionRunContext {
             self.slot,
             &self.vm,
             Some(&self.actual_run[self.slot]),
+            &self.file_execution,
         )
     }
 }
@@ -2051,6 +2057,22 @@ impl ProductionCpuFactory {
         ))
     }
 
+    /// Lend authenticated file records only while every physical CPU is stopped.
+    /// The capability and retained owner remain borrowed for the whole callback.
+    pub fn with_stopped_file_tables<R>(
+        &self,
+        inspect: impl FnOnce(&StoppedFileTables<'_>) -> R,
+    ) -> Result<R, TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        let tables = custody
+            .file_tables(custody.files.registration.binding())
+            .map_err(|error| fail(format!("stopped file tables: {error:?}")))?;
+        Ok(inspect(&tables))
+    }
+
     pub fn initial_execution_witness(&self) -> Result<(u64, u64), TrapError> {
         let custody = self
             .custody
@@ -2217,7 +2239,23 @@ unsafe impl Send for RetainedMetadataPtr {}
 /// withdrawing publication while its own backing remains mapped.
 struct RetainedFileRegion {
     registration: carrick_el1_abi::FileRegionRegistration,
+    execution: Arc<RwLock<()>>,
     _backing: Arc<BackingExtent>,
+}
+
+/// Host file references own an exclusive execution admission: every physical
+/// run takes shared admission, so no CPU can enter until this proof drops.
+/// Atomics alone and the host image's descriptor lock are not this proof.
+pub struct StoppedFileTables<'a> {
+    tables: carrick_el1_abi::FileTables<'a>,
+    _stopped: RwLockWriteGuard<'a, ()>,
+}
+
+impl<'a> core::ops::Deref for StoppedFileTables<'a> {
+    type Target = carrick_el1_abi::FileTables<'a>;
+    fn deref(&self) -> &Self::Target {
+        &self.tables
+    }
 }
 
 // SAFETY: moved only inside exclusive carrier custody. The non-cloning
@@ -2302,6 +2340,27 @@ pub struct ForwardVenue<'a> {
 }
 
 impl Cpl0HostCustody {
+    fn file_tables(
+        &self,
+        binding: carrick_el1_abi::FileRegionBinding,
+    ) -> Result<StoppedFileTables<'_>, carrick_el1_abi::FileRegionError> {
+        let stopped = self
+            .files
+            .execution
+            .try_write()
+            .map_err(|_| carrick_el1_abi::FileRegionError::Running)?;
+        let tables = self.files.registration.tables(binding)?;
+        // A kick may stop CPL0 inside a descriptor transaction. Execution
+        // exclusion prevents reentry while its shared lock state is checked.
+        if tables.fd_map()[0].mutation_active() {
+            return Err(carrick_el1_abi::FileRegionError::Running);
+        }
+        Ok(StoppedFileTables {
+            tables,
+            _stopped: stopped,
+        })
+    }
+
     fn production_run_context(&self, slot: usize) -> Result<ProductionRunContext, TrapError> {
         if slot >= self.actual_run.len() {
             return Err(fail("unknown CPL0 CPU slot"));
@@ -2310,6 +2369,7 @@ impl Cpl0HostCustody {
             ram: Arc::clone(&self.ram),
             vm: Arc::clone(&self._vm.vm().vm),
             actual_run: Arc::clone(&self.actual_run),
+            file_execution: Arc::clone(&self.files.execution),
             slot,
         })
     }
@@ -3614,12 +3674,12 @@ impl Cpl0Carrier {
         self.custody.files.registration.binding()
     }
 
-    /// Host access authenticates against this carrier's retained registration.
+    /// Acquire stopped-carrier proof and authenticate the retained registration.
     pub fn file_tables(
         &self,
         binding: carrick_el1_abi::FileRegionBinding,
-    ) -> Result<carrick_el1_abi::FileTables<'_>, carrick_el1_abi::FileRegionError> {
-        self.custody.files.registration.tables(binding)
+    ) -> Result<StoppedFileTables<'_>, carrick_el1_abi::FileRegionError> {
+        self.custody.file_tables(binding)
     }
 
     /// Deliberately replace a stopped fixture CPU's publication to exercise
@@ -4205,6 +4265,7 @@ impl Cpl0Carrier {
                 .map_err(|e| fail(format!("file region publication: {e:?}")))?;
         let files = RetainedFileRegion {
             registration,
+            execution: Arc::new(RwLock::new(())),
             _backing: Arc::clone(&extent),
         };
         let handles = memory
@@ -5073,10 +5134,12 @@ impl Cpl0Carrier {
             table: &ShootdownTable,
             slot: usize,
             vm: &VmFd,
+            execution: &RwLock<()>,
         ) -> Result<u64, TrapError> {
             let watchdog = Watchdog::start();
             for _ in 0..32 {
-                let exit = watchdog.during_guest(|| run_member(cpu, table, slot, vm, None))?;
+                let exit =
+                    watchdog.during_guest(|| run_member(cpu, table, slot, vm, None, execution))?;
                 if watchdog.expired() {
                     return Err(fail("paired fixture guest interval deadline"));
                 }
@@ -5135,10 +5198,11 @@ impl Cpl0Carrier {
                 .cast::<ShootdownTable>()
         };
         let vm = &self.custody._vm.vm().vm;
+        let execution = &self.custody.files.execution;
         let [a, b] = &mut self.cpus;
         std::thread::scope(|scope| {
-            let left = scope.spawn(|| first_result(a, &ram, stacks[0], table, 0, vm));
-            let right = scope.spawn(|| first_result(b, &ram, stacks[1], table, 1, vm));
+            let left = scope.spawn(|| first_result(a, &ram, stacks[0], table, 0, vm, execution));
+            let right = scope.spawn(|| first_result(b, &ram, stacks[1], table, 1, vm, execution));
             let a = left.join().map_err(|_| fail("paired CPU 0 host panic"))??;
             let b = right
                 .join()
@@ -5251,6 +5315,7 @@ impl Cpl0Carrier {
                 .cast::<ShootdownTable>()
         };
         let vm = &self.custody._vm.vm().vm;
+        let execution = &self.custody.files.execution;
         let [a, b] = &mut self.cpus;
         let (editor_cpu, reader_cpu) = if editor == 0 { (a, b) } else { (b, a) };
         if hold_mode != carrick_x86::cpl0_entry::FIXTURE_HOLD_NONE {
@@ -5263,8 +5328,9 @@ impl Cpl0Carrier {
                 let start = std::time::Instant::now();
                 let mut words = Vec::with_capacity(carrick_x86::X86_FAULT_RECORD_U32_WORDS);
                 while words.len() < carrick_x86::X86_FAULT_RECORD_U32_WORDS {
-                    let exit = watchdog
-                        .during_guest(|| run_member(reader_cpu, table, reader, vm, None))?;
+                    let exit = watchdog.during_guest(|| {
+                        run_member(reader_cpu, table, reader, vm, None, execution)
+                    })?;
                     if watchdog.expired() || start.elapsed() > Duration::from_secs(5) {
                         return Err(fail("running reader did not fault before deadline"));
                     }
@@ -5320,8 +5386,9 @@ impl Cpl0Carrier {
                     }
                 }
                 for _ in 0..32 {
-                    let exit = watchdog
-                        .during_guest(|| run_member(editor_cpu, table, editor, vm, None))?;
+                    let exit = watchdog.during_guest(|| {
+                        run_member(editor_cpu, table, editor, vm, None, execution)
+                    })?;
                     if watchdog.expired() {
                         return Err(fail("running editor deadline"));
                     }
@@ -6662,6 +6729,171 @@ mod cpl0_layout_tests {
             u64::from_le_bytes(bytes.try_into().expect("identity word")),
             carrier.custody._vm.identity().nonzero().get(),
             "retained file tables need the exact carrier identity before entry"
+        );
+    }
+
+    #[test]
+    fn file_region_host_refuses_paused_cpl0_descriptor_transaction() {
+        let inventory = Arc::new(FrameInventoryAuthority::new())
+            .physical_projection(Arc::new(ObjectIdRegistry::new()));
+        let lock_va = X86_CPL0_REGION_BASE
+            + carrick_el1_abi::EL1_FD_MAP_OFFSET
+            + carrick_el1_abi::FD_MAP_MUTATION_LOCK_OFFSET as u64;
+        let mut program = vec![0x48, 0xbe]; // movabs rsi, shared lock word
+        program.extend_from_slice(&lock_va.to_le_bytes());
+        program.extend_from_slice(&[0xb9, 1, 0, 0, 0, 0x31, 0xc0, 0xf0, 0x0f, 0xb1, 0x0e]);
+        program.extend_from_slice(&[0x66, 0xba]);
+        program.extend_from_slice(&YIELD_PORT.to_le_bytes());
+        program.extend_from_slice(&[0xee, 0xc7, 0x06, 0, 0, 0, 0, 0xee, 0xf4]);
+        let mut carrier = Cpl0Carrier::boot(
+            inventory,
+            Path::new(env!("CARRICK_X86_CPL0_FIXTURE_IMAGE")),
+            [&program, &program],
+        )
+        .expect("CPL0 transaction fixture");
+        let binding = carrier.file_region_binding();
+        let cpu = &mut carrier.cpus[0];
+        let mut sregs = cpu.fd().get_sregs().expect("stopped sregs");
+        sregs.cs = crate::kvm_x86_engine::KvmSegment::from(carrick_x86::SegmentDescriptor::code64(
+            carrick_x86::SegmentDpl::Kernel,
+        ))
+        .0;
+        sregs.ss = crate::kvm_x86_engine::KvmSegment::from(
+            carrick_x86::SegmentDescriptor::flat_data(carrick_x86::SegmentDpl::Kernel, 0),
+        )
+        .0;
+        cpu.fd().set_sregs(&sregs).expect("enter CPL0 fixture");
+        let mut regs = cpu.fd().get_regs().expect("stopped regs");
+        regs.rip = USER_CODE;
+        regs.rflags = 2;
+        cpu.fd().set_regs(&regs).expect("CPL0 entry");
+        assert!(matches!(
+            carrier.run_cpu(0).expect("guest acquired lock"),
+            VcpuExit::IoOut {
+                port: YIELD_PORT,
+                ..
+            }
+        ));
+        assert!(
+            carrier
+                .custody
+                .files
+                .registration
+                .tables(binding)
+                .expect("retained records")
+                .fd_map()[0]
+                .mutation_active(),
+            "guest owns shared descriptor transaction"
+        );
+        let refused = matches!(
+            carrier.file_tables(binding),
+            Err(carrick_el1_abi::FileRegionError::Running)
+        );
+        // Complete the actual guest unlock before asserting; no held lock leaks.
+        assert!(matches!(
+            carrier.run_cpu(0).expect("guest unlock control"),
+            VcpuExit::IoOut {
+                port: YIELD_PORT,
+                ..
+            }
+        ));
+        assert!(
+            carrier.file_tables(binding).is_ok(),
+            "quiescent control admitted"
+        );
+        assert!(
+            refused,
+            "physical stop must not grant a paused guest transaction"
+        );
+    }
+
+    #[test]
+    fn file_region_host_mutation_refused_while_cpu_running() {
+        use carrick_el1::personality::file_table::admit_host_fd;
+        use std::os::fd::AsRawFd;
+        let inventory = Arc::new(FrameInventoryAuthority::new())
+            .physical_projection(Arc::new(ObjectIdRegistry::new()));
+        // No host crossing: the CPU loops in real CPL3 until its scoped kick.
+        let program = [0xc6, 0x04, 0x25, 0, 0, 4, 0, 0x77, 0xeb, 0xfe];
+        let mut carrier = Cpl0Carrier::boot(
+            inventory,
+            Path::new(env!("CARRICK_X86_CPL0_FIXTURE_IMAGE")),
+            [&program, &program],
+        )
+        .expect("running carrier");
+        let binding = carrier.file_region_binding();
+        let host = std::fs::File::open("/dev/null").expect("real host descriptor");
+        let context = carrier
+            .custody
+            .production_run_context(0)
+            .expect("run admission");
+        let custody = &carrier.custody;
+        let cpu = &mut carrier.cpus[0];
+        let refused = std::thread::scope(|scope| {
+            let (send, recv) = mpsc::channel();
+            let worker = scope.spawn(move || {
+                let kick = KvmKickHandle::for_current_thread();
+                send.send(kick).expect("publish scoped kick");
+                let watchdog = Watchdog::start();
+                watchdog.during_guest(|| context.run(cpu))
+            });
+            let kick = recv
+                .recv_timeout(Duration::from_secs(2))
+                .expect("worker ready");
+            let start = std::time::Instant::now();
+            while custody.actual_run[0].load(Ordering::Acquire) == 0
+                || unsafe {
+                    (&*custody
+                        .ram
+                        .host_ptr(0x4_0000, 1)
+                        .expect("live marker")
+                        .cast::<AtomicU8>())
+                        .load(Ordering::Acquire)
+                } != 0x77
+            {
+                assert!(
+                    start.elapsed() < Duration::from_secs(2),
+                    "CPU did not enter KVM_RUN"
+                );
+                std::hint::spin_loop();
+            }
+            let refused = match custody.file_tables(binding) {
+                Err(error) => error == carrick_el1_abi::FileRegionError::Running,
+                Ok(tables) => {
+                    admit_host_fd(
+                        tables.fd_map(),
+                        tables.opens(),
+                        tables.objects(),
+                        5,
+                        19,
+                        host.as_raw_fd(),
+                        carrick_el1_abi::DELEGATED_FLAG_READABLE,
+                    );
+                    false
+                }
+            };
+            kick.kick();
+            let _stopped = worker
+                .join()
+                .expect("join running CPU")
+                .expect("bounded KVM run");
+            refused
+        });
+        assert!(refused, "host mutated file tables while a CPU was running");
+        let tables = carrier
+            .file_tables(binding)
+            .expect("stopped access restored");
+        assert!(
+            admit_host_fd(
+                tables.fd_map(),
+                tables.opens(),
+                tables.objects(),
+                5,
+                19,
+                host.as_raw_fd(),
+                carrick_el1_abi::DELEGATED_FLAG_READABLE
+            )
+            .is_some()
         );
     }
 
