@@ -605,6 +605,10 @@ mod tests {
             let worker_publication = publication.worker();
             let worker_path = path.clone();
             let (approved, approval) = std::sync::mpsc::channel();
+            let (first_pass, first_pass_complete) = std::sync::mpsc::channel();
+            let requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let worker_requested = requested.clone();
+            let mut first_pass = Some(first_pass);
             let mut served = false;
             let service = AssignmentService::start(move || {
                 if served {
@@ -615,6 +619,17 @@ mod tests {
                 let mut row = row.clone();
                 let api = FakeGithub::vetting(Ok(bound(&run_b())));
                 let mut guest = guest_asking(run_b());
+                if !worker_requested.load(std::sync::atomic::Ordering::Acquire) {
+                    guest.request = None;
+                    assert_eq!(
+                        serve(&api, &mut guest, &mut ledger, &mut row, &worker_path).unwrap(),
+                        Revetted::Idle
+                    );
+                    if let Some(first_pass) = first_pass.take() {
+                        first_pass.send(()).unwrap();
+                    }
+                    return;
+                }
                 let outcome = serve(&api, &mut guest, &mut ledger, &mut row, &worker_path).unwrap();
                 assert_eq!(outcome, Revetted::Approved(key_b(), bound(&run_b())));
                 assert_eq!(
@@ -624,6 +639,12 @@ mod tests {
                 approved.send(()).unwrap();
                 served = true;
             });
+            first_pass_complete
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            // The hook asks only AFTER the controller's original assignment
+            // pass, exactly when it has entered provision/backoff.
+            requested.store(true, std::sync::atomic::Ordering::Release);
             approval
                 .recv_timeout(Duration::from_secs(2))
                 .unwrap_or_else(|_| panic!("assignment stalled during {blocked_phase}"));
