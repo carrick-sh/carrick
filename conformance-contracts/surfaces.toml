@@ -442,7 +442,6 @@ contracts = ["kernel.mm.native-code-drain"]
 path = "crates/carrick-kernel-example/tests/semantics/pgrp.rs"
 contracts = ["kernel.wait.process-group"]
 
-
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/executor/backend.rs"
 contracts = ["kernel.el1.files.cross-process-readers", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy", "kernel.el1.task-load-entry"]
@@ -573,7 +572,7 @@ contracts = ["kernel.el1.gic"]
 
 [[surfaces]]
 path = "crates/carrick-el1-abi/src/lib.rs"
-contracts = ["kernel.el1.gic", "kernel.el1.guest-run-queue", "kernel.el1.fault-entry", "kernel.el1.metadata-allocation", "kernel.el1.stage1-publication", "process.native.terminal-child", "kernel.el1.open-lifetime"]
+contracts = ["kernel.el1.gic", "kernel.el1.guest-run-queue", "kernel.el1.fault-entry", "kernel.el1.metadata-allocation", "kernel.el1.stage1-publication", "process.native.terminal-child", "kernel.el1.open-lifetime", "kernel.x86.file-region"]
 
 [[surfaces]]
 path = "crates/carrick-el1/src/entry.rs"
@@ -896,11 +895,11 @@ contracts = ["core.entry.completion", "kernel.el1.files", "kernel.el1.inotify", 
 
 [[surfaces]]
 path = "crates/carrick-vmm-kvm/tests/cpl0_entry.rs"
-contracts = ["core.entry.completion"]
+contracts = ["core.entry.completion", "kernel.x86.file-region"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-kvm/tests/cpl0_shared_entry.rs"
-contracts = ["core.entry.completion", "kernel.el1.thread-lifecycle", "kernel.el1.signal-delivery-owner"]
+contracts = ["core.entry.completion", "kernel.el1.thread-lifecycle", "kernel.el1.signal-delivery-owner", "kernel.x86.file-region"]
 
 [[surfaces]]
 path = "crates/carrick-el1/tests/x86_production_forward.rs"
@@ -908,7 +907,7 @@ contracts = ["core.entry.completion", "kernel.el1.files", "kernel.el1.inotify", 
 
 [[surfaces]]
 path = "crates/carrick-x86-cpl0/src/lib.rs"
-contracts = ["core.entry.completion"]
+contracts = ["core.entry.completion", "kernel.x86.file-region"]
 
 [[surfaces]]
 path = "crates/carrick-x86-carrier/src/lib.rs"
@@ -932,11 +931,11 @@ contracts = ["core.entry.completion"]
 
 [[surfaces]]
 path = "crates/carrick-x86-cpl0/src/linux_personality.rs"
-contracts = ["core.entry.completion"]
+contracts = ["core.entry.completion", "kernel.x86.file-region"]
 
 [[surfaces]]
 path = "crates/carrick-x86-cpl0/src/fixture_personality.rs"
-contracts = ["core.entry.completion"]
+contracts = ["core.entry.completion", "kernel.x86.file-region"]
 
 [[surfaces]]
 path = "crates/carrick-cli/tests/x86_kvm_run.rs"
@@ -1055,7 +1054,7 @@ contracts = ["core.entry.completion"]
 
 [[surfaces]]
 path = "crates/carrick-x86-cpl0/src/native_process.rs"
-contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage"]
+contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage", "kernel.x86.file-region"]
 
 [[surfaces]]
 path = "crates/carrick-el1/src/personality/aarch64_process.rs"
@@ -1291,7 +1290,7 @@ contracts = ["x86.vmx.segment-entry"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-kvm/src/cpl0_boot.rs"
-contracts = ["x86.vmx.segment-entry"]
+contracts = ["x86.vmx.segment-entry", "kernel.x86.file-region"]
 
 [[surfaces]]
 path = "crates/carrick-vmm-nvmm/src/nvmm_x86_engine.rs"
@@ -1380,3 +1379,20 @@ contracts = ["process.native.arm-admission"]
 [[surfaces]]
 path = "crates/carrick-runtime/src/vcpu_loop/binding.rs"
 contracts = ["process.native.arm-admission"]
+
+[[surfaces]]
+path = "crates/carrick-el1-abi/src/file_region.rs"
+contracts = ["kernel.x86.file-region"]
+
+[[surfaces]]
+path = "crates/carrick-x86-cpl0/tests/file_region.rs"
+contracts = ["kernel.x86.file-region"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-kvm/src/carrier_memory.rs"
+contracts = ["kernel.x86.file-region"]
+
+[[surfaces]]
+path = "crates/carrick-x86/src/cpl0_entry.rs"
+contracts = ["kernel.x86.file-region"]
+

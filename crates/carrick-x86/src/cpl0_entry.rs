@@ -377,6 +377,8 @@ pub struct CpuBinding {
     /// Per-physical CPU cache of the file table last admitted to the shared
     /// in-ring stdio owner. It is a cache, never descriptor authority.
     pub stdio_table_admitted: AtomicU64,
+    /// Carrier-issued region publication; installed before any guest entry.
+    pub file_region: carrick_el1_abi::FileRegionBinding,
 }
 const _: () = {
     assert!(core::mem::offset_of!(CpuBinding, kernel_stack) == 0);

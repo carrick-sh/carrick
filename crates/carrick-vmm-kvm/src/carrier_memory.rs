@@ -125,6 +125,13 @@ impl BackingExtent {
         }
         self.ram.host_ptr(pa, len)
     }
+
+    /// Host view of this retained extent; never a guest VA or a GPA.
+    pub(crate) fn host_base(&self) -> Result<carrick_guest_mem::HostVa, MemoryError> {
+        self.ptr(self.base.raw(), self.len)
+            .map(|ptr| carrick_guest_mem::HostVa(ptr as usize))
+            .ok_or_else(|| error("retained extent host mapping"))
+    }
 }
 #[derive(::core::clone::Clone)]
 pub struct PreparedBacking {

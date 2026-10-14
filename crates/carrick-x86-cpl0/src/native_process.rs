@@ -115,12 +115,15 @@ pub(super) fn admit_root(
     )?;
     REGISTRY.register_root(Arc::new(owner), source, task, address)?;
     let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
+    let binding =
+        carrick_el1::isa::x86::context::current_cpu_binding().ok_or(NativeProcessError::Stale)?;
+    let files = crate::linux_personality::file_tables(binding);
     carrick_el1::personality::file_table::admit_stdio(
-        crate::linux_personality::fd_map(),
-        &crate::linux_personality::OPEN_TABLE,
-        &crate::linux_personality::OBJECT_TABLE,
+        files.fd_map(),
+        files.opens(),
+        files.objects(),
         file_table,
-        [true, true, true],
+        [true; 3],
     );
     Ok(())
 }
@@ -767,9 +770,13 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         parent_table: u64,
         child_table: u64,
     ) -> Result<(), NativeProcessError> {
+        let files = crate::linux_personality::file_tables(
+            carrick_el1::isa::x86::context::current_cpu_binding()
+                .ok_or(NativeProcessError::Stale)?,
+        );
         carrick_el1::personality::file_table::fork_fd_map(
-            crate::linux_personality::fd_map(),
-            &crate::linux_personality::OPEN_TABLE,
+            files.fd_map(),
+            files.opens(),
             parent_table,
             child_table,
         )
@@ -777,11 +784,10 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         .ok_or(NativeProcessError::Exhausted)
     }
     fn retire_fd_table(&mut self, table: u64) {
-        carrick_el1::personality::file_table::retire_fd_map(
-            crate::linux_personality::fd_map(),
-            &crate::linux_personality::OPEN_TABLE,
-            table,
-        );
+        let binding =
+            carrick_el1::isa::x86::context::current_cpu_binding().unwrap_or_else(|| fatal());
+        let files = crate::linux_personality::file_tables(binding);
+        carrick_el1::personality::file_table::retire_fd_map(files.fd_map(), files.opens(), table);
         self.task.linux.mark_pending_host_work();
     }
 }

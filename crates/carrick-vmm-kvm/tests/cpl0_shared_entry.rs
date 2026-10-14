@@ -32,6 +32,25 @@ fn tiny_elf(code: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn production_file_region_stdio_dup_parity() {
+    let code = [
+        0xbf, 1, 0, 0, 0, // mov edi,1: stdout
+        0xb8, 32, 0, 0, 0, 0x0f, 0x05, // dup(stdout)
+        0x48, 0x89, 0xc7, // mov rdi,rax: return the new descriptor as status
+        0xb8, 231, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b, // exit_group; ud2
+    ];
+    let run = run_pool_fixture(&tiny_elf(&code), 4).run;
+    assert_eq!(run.exit_code, 3);
+    let witness = run
+        .report
+        .execution_witness
+        .expect("production region witness");
+    assert_eq!(witness.physical_crossing_families.len(), 1);
+    assert_eq!(witness.physical_crossing_families[0].family, "root_exit");
+    assert_eq!(witness.physical_crossing_families[0].count, 1);
+}
+
+#[test]
 fn production_sigprocmask_uses_shared_lifecycle_family() {
     let code = [
         // NULL set and oldset need no guest memory or host resource. The old

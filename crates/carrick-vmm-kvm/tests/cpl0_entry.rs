@@ -245,6 +245,208 @@ fn cpl0_forward_port_returns_host_result_through_shared_entry() {
     assert_eq!(result.completions[0], 1);
 }
 
+fn file_region_program(number: u64, fd: u32) -> Vec<u8> {
+    let mut program = vec![0xbf]; // mov edi,fd
+    program.extend_from_slice(&fd.to_le_bytes());
+    program.extend_from_slice(&[0x48, 0xb8]);
+    program.extend_from_slice(&number.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    program
+}
+
+#[test]
+fn file_region_guest_stdio_parity_and_two_carrier_independence() {
+    use carrick_el1_abi::{FileRegionError, HostObjectBinding, fd_map_lookup};
+    use std::sync::atomic::Ordering;
+    let program = file_region_program(32, 1); // dup(stdout)
+    let mut a =
+        Cpl0Carrier::boot(physical_inventory(), &image(), [&program, &program]).expect("carrier A");
+    let mut b =
+        Cpl0Carrier::boot(physical_inventory(), &image(), [&program, &program]).expect("carrier B");
+    let a_binding = a.file_region_binding();
+    let b_binding = b.file_region_binding();
+    assert_ne!(a_binding.identity(), b_binding.identity());
+    assert!(matches!(
+        a.file_tables(b_binding),
+        Err(FileRegionError::Foreign)
+    ));
+    assert_eq!(a.observe(0).expect("A dup stdout").result, 3);
+    assert!(fd_map_lookup(b.file_tables(b_binding).expect("B tables").fd_map(), 5, 3).is_none());
+    {
+        let tables = a.file_tables(a_binding).expect("A tables");
+        let (handle, _) = fd_map_lookup(tables.fd_map(), 5, 3).expect("region-resident dup");
+        assert_eq!(
+            tables.opens()[handle as usize - 1].host_object(),
+            Some(HostObjectBinding::STDOUT)
+        );
+        tables.objects()[17].size.store(37, Ordering::Release);
+    }
+    assert_eq!(b.observe(0).expect("B dup stdout").result, 3);
+    assert_eq!(
+        b.file_tables(b_binding).expect("B tables").objects()[17]
+            .size
+            .load(Ordering::Acquire),
+        0
+    );
+    drop(b);
+    assert_eq!(
+        a.file_tables(a_binding).expect("A survives B").objects()[17]
+            .size
+            .load(Ordering::Acquire),
+        37
+    );
+}
+
+#[test]
+fn file_region_guest_closes_record_beyond_fifteen() {
+    use carrick_el1::personality::file_table::{admit_host_fd, admit_stdio};
+    use carrick_el1_abi::{DELEGATED_FLAG_READABLE, HostObjectReleaseCrossing, fd_map_lookup};
+    use std::os::fd::AsRawFd;
+    let program = file_region_program(3, 19); // close(fd 19)
+    let mut carrier =
+        Cpl0Carrier::boot(physical_inventory(), &image(), [&program, &program]).expect("carrier");
+    let binding = carrier.file_region_binding();
+    let host = std::fs::File::open("/dev/null").expect("real host object");
+    {
+        let tables = carrier.file_tables(binding).expect("retained tables");
+        admit_stdio(
+            tables.fd_map(),
+            tables.opens(),
+            tables.objects(),
+            5,
+            [true; 3],
+        );
+        for fd in 3..20 {
+            assert_eq!(
+                admit_host_fd(
+                    tables.fd_map(),
+                    tables.opens(),
+                    tables.objects(),
+                    5,
+                    fd,
+                    host.as_raw_fd(),
+                    DELEGATED_FLAG_READABLE
+                ),
+                Some(fd as u32 + 1)
+            );
+        }
+    }
+    let result = carrier
+        .observe_with_forward(0, |frame| {
+            assert_eq!(frame.rax, HostObjectReleaseCrossing::NUMBER);
+            assert_eq!(frame.rcx, HostObjectReleaseCrossing::FRAME_TAG);
+            assert_eq!(frame.rsi, 20);
+            assert_eq!(frame.rdx, 1);
+            frame.rax = 0;
+            Ok(())
+        })
+        .expect("close authenticates region record 19");
+    assert_eq!(result.result, 0);
+    assert_eq!(result.semantic_host_exits, 1);
+    assert!(
+        fd_map_lookup(
+            carrier.file_tables(binding).expect("live tables").fd_map(),
+            5,
+            19
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn file_region_guest_refuses_foreign_publication() {
+    let program = file_region_program(32, 1);
+    let mut a =
+        Cpl0Carrier::boot(physical_inventory(), &image(), [&program, &program]).expect("carrier A");
+    let mut b =
+        Cpl0Carrier::boot(physical_inventory(), &image(), [&program, &program]).expect("carrier B");
+    a.fixture_bind_file_region(0, b.file_region_binding())
+        .expect("foreign binding witness");
+    let error = a
+        .observe(0)
+        .expect_err("foreign publication must refuse guest table access");
+    assert!(error.to_string().contains("fatal"), "{error}");
+}
+
+#[test]
+fn file_region_guest_refuses_retired_publication() {
+    let program = file_region_program(32, 1);
+    let mut carrier =
+        Cpl0Carrier::boot(physical_inventory(), &image(), [&program, &program]).expect("carrier");
+    carrier.fixture_retire_file_region();
+    let error = carrier
+        .observe(0)
+        .expect_err("retired publication must refuse guest table access");
+    assert!(error.to_string().contains("fatal"), "{error}");
+}
+
+#[test]
+fn file_region_guest_two_live_tasks_keep_distinct_open_references() {
+    use carrick_el1::personality::file_table::{admit_host_fd, admit_stdio};
+    use carrick_el1_abi::{DELEGATED_FLAG_READABLE, fd_map_lookup};
+    use std::{os::fd::AsRawFd, sync::atomic::Ordering};
+    let programs = [file_region_program(32, 17), file_region_program(32, 18)];
+    let mut carrier =
+        Cpl0Carrier::boot(physical_inventory(), &image(), [&programs[0], &programs[1]])
+            .expect("two live carrier tasks");
+    let binding = carrier.file_region_binding();
+    let hosts = [
+        std::fs::File::open("/dev/null").expect("first native open"),
+        std::fs::File::open("/dev/null").expect("second native open"),
+    ];
+    {
+        let tables = carrier.file_tables(binding).expect("retained table venue");
+        admit_stdio(
+            tables.fd_map(),
+            tables.opens(),
+            tables.objects(),
+            5,
+            [true; 3],
+        );
+        for fd in 3..19 {
+            let host = &hosts[usize::from(fd == 18)];
+            assert_eq!(
+                admit_host_fd(
+                    tables.fd_map(),
+                    tables.opens(),
+                    tables.objects(),
+                    5,
+                    fd,
+                    host.as_raw_fd(),
+                    DELEGATED_FLAG_READABLE
+                ),
+                Some(fd as u32 + 1)
+            );
+        }
+        // F2 storage graph only: independent real host descriptions join one
+        // inode record. Full VFS admission/deduplication belongs to F3.
+        tables.opens()[18].inode_handle.store(18, Ordering::Release);
+        tables.opens()[17].offset.store(7, Ordering::Release);
+        tables.opens()[18].offset.store(11, Ordering::Release);
+        assert!(tables.opens()[17].is_bound_to(&tables.objects()[17]));
+        assert!(tables.opens()[18].is_bound_to(&tables.objects()[17]));
+    }
+    assert_eq!(carrier.observe(0).expect("first live task dup").result, 19);
+    assert_eq!(carrier.observe(1).expect("second live task dup").result, 20);
+    let tables = carrier.file_tables(binding).expect("shared carrier venue");
+    assert_eq!(
+        fd_map_lookup(tables.fd_map(), 5, 19)
+            .expect("first reference")
+            .0,
+        18
+    );
+    assert_eq!(
+        fd_map_lookup(tables.fd_map(), 5, 20)
+            .expect("second reference")
+            .0,
+        19
+    );
+    assert_eq!(tables.opens()[17].offset.load(Ordering::Acquire), 7);
+    assert_eq!(tables.opens()[18].offset.load(Ordering::Acquire), 11);
+}
+
 #[test]
 fn cpl0_rechecks_host_modified_return_frame_before_iret() {
     let mut program = vec![0x48, 0xc7, 0xc7, 0x03, 0x00, 0x00, 0x00]; // mov rdi, 3 (non-stdio fd)
