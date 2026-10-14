@@ -96,6 +96,12 @@ impl KernelContext {
         &self.shared
     }
 
+    /// Retain the exact shared page for a host retirement receipt after the
+    /// kernel graph removes this thread's membership.
+    pub fn lifecycle_page(&self) -> super::objects::ThreadLifecycleLease {
+        self.shared.pending_signals().lifecycle_lease()
+    }
+
     pub fn resources(&self) -> &Arc<ThreadResources> {
         &self.resources
     }

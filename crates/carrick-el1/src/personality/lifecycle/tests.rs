@@ -388,6 +388,7 @@ fn serve_directly(w: &mut World, frame: &mut TrapFrame, user: &mut FaultingUser)
     (result != carrick_personality_linux::dispatch::FamilyCompletion::Forward).then(|| {
         use carrick_personality_linux::dispatch::{CompletionRoute, completion_route};
         match completion_route(result, task.linux.has_pending_host_work()) {
+            CompletionRoute::HostCustody => Action::HostCustody,
             CompletionRoute::Served => Action::Served,
             CompletionRoute::WithWork => Action::ServedWithWork,
             CompletionRoute::Suspended => Action::Idle,

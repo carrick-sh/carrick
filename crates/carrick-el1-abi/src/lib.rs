@@ -934,6 +934,9 @@ pub enum Action {
     /// no thread on the vCPU (`hvc #5`). The parked thread's context is in its
     /// zone record.
     Idle = 3,
+    /// Exact raw thread exit custody is routed to the host retirement lane.
+    /// The vector captures the syscall without classifying it as Forward.
+    HostCustody = 4,
 }
 
 /// Register trap frame saved by the exception vector before calling `carrick_el1_syscall`.

@@ -425,7 +425,6 @@ where
         zone: service.zone,
         slot: service.slot,
     };
-    let nr = frame.x[8];
     super::aarch64_process::with_process_entry(
         source,
         service.task,
@@ -452,32 +451,9 @@ where
                 None,
                 cache_lookup,
             );
-            retire_forwarded_exit_member(nr, route, page, control, process);
             route
         },
     )
-}
-
-/// A non-last thread's raw `exit` that the in-ring path declined (robust
-/// list, pending signal, clear-tid wake, host work...) is retired by the
-/// host, which walks the robust list and drops the live census. The owner
-/// retires that member now: the host never returns this thread to the ring.
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-#[inline(never)]
-fn retire_forwarded_exit_member<C: carrick_core_abi::EntryContext>(
-    nr: u64,
-    route: carrick_personality_linux::dispatch::CompletionRoute,
-    page: &carrick_el1_abi::ThreadLifecyclePage,
-    control: &carrick_el1_abi::ThreadControlSlot,
-    process: &mut dyn lifecycle::ProcessNative<C>,
-) {
-    if nr == carrick_personality_linux::lifecycle::SYS_EXIT as u64
-        && route == carrick_personality_linux::dispatch::CompletionRoute::Forward
-        && carrick_el1_abi::Lifecycle::live(page) > 1
-        && let Some(tid) = control.visible_tid()
-    {
-        process.thread_exited(tid);
-    }
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
@@ -519,6 +495,7 @@ pub(super) fn resolve_arm_process_route(
     current_tasks: &[CurrentTask],
 ) -> Action {
     match route {
+        carrick_personality_linux::dispatch::CompletionRoute::HostCustody => Action::HostCustody,
         carrick_personality_linux::dispatch::CompletionRoute::Served => Action::Served,
         carrick_personality_linux::dispatch::CompletionRoute::WithWork => Action::ServedWithWork,
         carrick_personality_linux::dispatch::CompletionRoute::Suspended => Action::Idle,
@@ -808,6 +785,7 @@ where
         None,
         cache_lookup,
     ) {
+        carrick_personality_linux::dispatch::CompletionRoute::HostCustody => Action::HostCustody,
         carrick_personality_linux::dispatch::CompletionRoute::Served => Action::Served,
         carrick_personality_linux::dispatch::CompletionRoute::WithWork => Action::ServedWithWork,
         carrick_personality_linux::dispatch::CompletionRoute::Suspended => Action::Idle,

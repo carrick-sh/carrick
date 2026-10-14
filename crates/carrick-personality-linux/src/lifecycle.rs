@@ -148,6 +148,7 @@ pub enum LifecycleCall {
 
 /// A primitive returns data, never an entry completion or a final frame write.
 pub enum LifecycleOutcome {
+    HostCustody,
     Returned {
         result: SyscallResult,
         work: bool,
@@ -161,6 +162,7 @@ pub enum LifecycleOutcome {
 pub fn lifecycle_effect(outcome: &LifecycleOutcome) -> crate::dispatch::FamilyCompletion {
     use crate::dispatch::FamilyCompletion;
     match *outcome {
+        LifecycleOutcome::HostCustody => FamilyCompletion::HostCustody,
         LifecycleOutcome::Returned { result, work: true } => {
             FamilyCompletion::CompleteWithWork(result.raw())
         }
@@ -245,6 +247,12 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     }
     fn thread_exited(&mut self, _tid: u32) {}
     fn retire_thread_verdict(&mut self, _verdict: carrick_core::terminal::RetirementVerdict) {}
+    fn route_host_thread_exit(
+        &mut self,
+        _verdict: carrick_core::terminal::RetirementVerdict,
+    ) -> bool {
+        false
+    }
     fn set_calling_tid(&mut self, _tid: u32) {}
 
     fn has_thread(&self, _tid: u32) -> bool {
@@ -390,6 +398,12 @@ pub trait LifecycleNative<'a>: UserCopy {
         Ok(())
     }
     fn thread_exited(&mut self, _verdict: carrick_core::terminal::RetirementVerdict) {}
+    fn route_host_thread_exit(
+        &mut self,
+        _verdict: carrick_core::terminal::RetirementVerdict,
+    ) -> bool {
+        false
+    }
 }
 /// Linux aarch64 syscall numbers served here (`SYS_SET_ROBUST_LIST` is the
 /// shared canonical number from [`crate::thread`]).
@@ -570,11 +584,28 @@ pub fn invoke<'a>(
                 native.record_decline(LifecycleDecline::ExitScheduler);
                 return None;
             }
-            let (progress, result) = serve_exit(thread, native)?;
-            Some(LifecycleOutcome::Transferred {
-                progress,
-                result: SyscallResult::new(result),
-            })
+            if let Some((progress, result)) = serve_exit(thread, native) {
+                Some(LifecycleOutcome::Transferred {
+                    progress,
+                    result: SyscallResult::new(result),
+                })
+            } else {
+                let binding = native.binding()?;
+                let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
+                    binding,
+                    thread.slot.entry(),
+                    TerminationStatus::exited(args[0] as u32),
+                )?;
+                let verdict = carrick_core::terminal::TerminalCustody::<
+                    carrick_core::terminal::Thread,
+                    carrick_core::terminal::Live,
+                >::admitted(identity)
+                .begin()
+                .route_to_host();
+                native
+                    .route_host_thread_exit(verdict)
+                    .then_some(LifecycleOutcome::HostCustody)
+            }
         }
         _ => None,
     }
