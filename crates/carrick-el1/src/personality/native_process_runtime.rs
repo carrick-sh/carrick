@@ -1856,6 +1856,23 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             record,
         })
     }
+
+    /// Resolve only the process identity needed to re-enter a selected record.
+    /// The saved register words remain in the exclusively owned zone record.
+    ///
+    /// # Safety
+    /// The scheduler must own the selected record until entry completes.
+    pub unsafe fn resume_visible_pid(&self, record: RecordRef) -> Option<u32> {
+        let live = self.zone.live(record)?;
+        let identity = live.identity();
+        let graph = self.graph.lock();
+        let (_, row) = graph.owner.tasks().iter().find(|(_, row)| {
+            let resources = row.native().resources();
+            resources.address.mm.raw().get() == identity.mm
+                && resources.page as *const _ as u64 == identity.lifecycle_page
+        })?;
+        Some(row.metadata().namespace_pid)
+    }
     pub fn task_binding(&self, key: TaskKey) -> Option<NativeRecordBinding<M, C>> {
         let graph = self.graph.lock();
         let row = graph.owner.task(key).ok()?;

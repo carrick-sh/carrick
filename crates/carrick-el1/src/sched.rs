@@ -64,9 +64,16 @@ pub trait ThreadCpu {
 }
 
 /// Scheduler effect of the native owner resume checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResumeAction {
     NoPending,
     Returned(carrick_guest_arch::NativeReturnWord),
+    Left,
+}
+
+enum LoadResult {
+    Running,
+    NeedsHost,
     Left,
 }
 
@@ -298,11 +305,15 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// runnable thread, or leave for the host when that thread needs its
     /// executor, or idle.
     pub(crate) fn run_next(&mut self, frame: &mut TrapFrame, timeout_result: u64) -> Served {
-        if let Some(switched) = self.zone.switch_in_full(self.slot) {
-            if self.load(frame, switched) {
-                return Served::Returned { switched: true };
+        loop {
+            if let Some(switched) = self.zone.switch_in_full(self.slot) {
+                match self.load(frame, switched) {
+                    LoadResult::Running => return Served::Returned { switched: true },
+                    LoadResult::NeedsHost => return self.service_exit(),
+                    LoadResult::Left => continue,
+                }
             }
-            return self.service_exit();
+            break;
         }
         if self.zone.head_needs_host(self.slot) {
             return self.service_exit();
@@ -336,45 +347,44 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     }
 
     /// Make the switched-in thread the running one, in its address space.
-    /// False: EL1 may not install that address space now (a pause of it is
+    /// `NeedsHost`: EL1 may not install that address space now (a pause of it is
     /// raised, or it is unpublished or retiring); the thread went back to
     /// the head of the run queue and the vCPU must leave for its executor
     /// ([`Self::service_exit`]), which loads it.
-    fn load(&mut self, frame: &mut TrapFrame, switched: SwitchedIn) -> bool {
+    fn load(&mut self, frame: &mut TrapFrame, switched: SwitchedIn) -> LoadResult {
         let (zone, slot) = (self.zone, self.slot);
         let rec = zone.record(switched.record);
         if !self.enter_space(rec.identity().mm) {
             zone.unswitch(slot, switched.record);
-            return false;
+            return LoadResult::NeedsHost;
         }
         // SAFETY: switch_in_full made the record OnCpu on this slot.
         let ctx = unsafe { rec.ctx_mut() };
+        publish_identity(self.task, rec.identity());
+        let resumed = self
+            .cpu
+            .resume_lifecycle(zone, self.task, slot, switched.record);
+        let result = match resumed {
+            ResumeAction::Returned(result) => Some(result.0),
+            ResumeAction::NoPending => switched.result,
+            ResumeAction::Left => {
+                self.leave_space();
+                return LoadResult::Left;
+            }
+        };
         self.cpu.load(frame, ctx);
         self.task
             .linux
             .orig_arg0
             .store(ctx.native.x[0], Ordering::Relaxed);
-        publish_identity(self.task, rec.identity());
-        match self
-            .cpu
-            .resume_lifecycle(zone, self.task, slot, switched.record)
-        {
-            ResumeAction::Returned(result) => frame.x[0] = result.0,
-            ResumeAction::NoPending => {
-                if let Some(result) = switched.result {
-                    frame.x[0] = result;
-                }
-            }
-            ResumeAction::Left => {
-                self.leave_space();
-                return false;
-            }
+        if let Some(result) = result {
+            frame.x[0] = result;
         }
         if zone.slot(slot).queued() != 0 {
             zone.slot(slot).restart_slice(self.cpu.now());
         }
         self.program_timer(true);
-        true
+        LoadResult::Running
     }
 
     /// Run address space `mm` on this vCPU. Nothing to do when it is the one
@@ -458,10 +468,14 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             let _ = zone.expire_timer(slot, now, timeout_result);
             if let Some(switched) = zone.switch_in_full(slot).or_else(|| zone.steal(slot)) {
                 zone.leave_idle(slot);
-                if self.load(frame, switched) {
-                    return Served::Returned { switched: true };
+                match self.load(frame, switched) {
+                    LoadResult::Running => return Served::Returned { switched: true },
+                    LoadResult::NeedsHost => return self.service_exit(),
+                    LoadResult::Left => {
+                        zone.enter_idle(slot, false);
+                        continue;
+                    }
                 }
-                return self.service_exit();
             }
             if zone.head_needs_host(slot) {
                 zone.leave_idle(slot);
@@ -626,7 +640,13 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         match zone.switch_in_full(slot) {
             Some(switched) => {
                 zone.requeue_preempted(slot, prev);
-                self.load(frame, switched)
+                match self.load(frame, switched) {
+                    LoadResult::Running => true,
+                    LoadResult::NeedsHost => false,
+                    LoadResult::Left => {
+                        matches!(self.run_next(frame, 0), Served::Returned { switched: true })
+                    }
+                }
             }
             None => {
                 // The head changed under us (it cannot: only this vCPU takes
@@ -712,6 +732,7 @@ pub struct FakeRegs {
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FakeCpu {
+    pub resume_once: Option<ResumeAction>,
     pub regs: FakeRegs,
     pub now: u64,
     pub freq: u64,
@@ -740,6 +761,7 @@ pub struct FakeCpu {
 impl Default for FakeCpu {
     fn default() -> Self {
         Self {
+            resume_once: None,
             regs: FakeRegs::default(),
             now: 1_000_000,
             freq: 24_000_000,
@@ -759,6 +781,19 @@ impl Default for FakeCpu {
 
 #[cfg(test)]
 impl ThreadCpu for FakeCpu {
+    fn resume_lifecycle(
+        &mut self,
+        zone: &ZoneTables,
+        _: &CurrentTask,
+        slot: SlotId,
+        _: RecordId,
+    ) -> ResumeAction {
+        let action = self.resume_once.take().unwrap_or(ResumeAction::NoPending);
+        if matches!(action, ResumeAction::Left) {
+            zone.clear_current(slot);
+        }
+        action
+    }
     fn save(&mut self, frame: &TrapFrame, ctx: &mut Aarch64ParkedContext) {
         let ctx = &mut ctx.native;
         hw::save_frame(frame, ctx);

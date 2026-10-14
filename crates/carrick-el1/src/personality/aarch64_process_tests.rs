@@ -3,7 +3,7 @@
 
 use super::aarch64_process::*;
 use super::native_process_runtime::{
-    NativeProcessError, NativeProcessRuntime, NativeProcessService,
+    NativeProcessError, NativeProcessRegistry, NativeProcessRuntime, NativeProcessService,
 };
 use carrick_el1_abi::{
     BornInZoneSource, CurrentTask, El1TaskId, ForkStockExchange, ForkStockKind, ForkStockLoan,
@@ -28,6 +28,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 struct ResumeCpu<'a, 'b, X: ForkStockCrossing> {
     inner: crate::sched::FakeCpu,
     runtime: &'a NativeProcessRuntime<'b, Mm, Aarch64ParkedContext>,
+    registry: &'a NativeProcessRegistry<'b, Mm, Aarch64ParkedContext>,
     source: BornInZoneSource<'b, Aarch64ParkedContext>,
     task: &'b CurrentTask,
     service: &'a mut Aarch64NativeProcessService<'b, X>,
@@ -47,20 +48,19 @@ impl<X: ForkStockCrossing> crate::sched::ThreadCpu for ResumeCpu<'_, '_, X> {
         _: SlotId,
         record: carrick_el1_abi::RecordId,
     ) -> crate::sched::ResumeAction {
-        match resume_selected(self.runtime, self.source, self.task, record, self.service) {
-            super::native_process_runtime::NativeResume::NoPending => {
-                crate::sched::ResumeAction::NoPending
-            }
-            super::native_process_runtime::NativeResume::Returned(result) => {
-                crate::sched::ResumeAction::Returned(carrick_guest_arch::NativeReturnWord(
-                    result.raw() as u64,
-                ))
-            }
-            super::native_process_runtime::NativeResume::Left(_) => {
-                crate::sched::ResumeAction::Left
-            }
-            super::native_process_runtime::NativeResume::Invalid => panic!("invalid owner resume"),
-        }
+        map_resume(
+            resume_selected(
+                self.runtime,
+                self.registry,
+                self.source,
+                self.task,
+                record,
+                self.service,
+            ),
+            self.service,
+            self.task,
+            self.source.slot,
+        )
     }
     fn set_translation(&mut self, a: u64, b: u64) {
         self.inner.set_translation(a, b);
@@ -389,7 +389,7 @@ impl Fixture {
         };
 
         let page = Box::leak(Box::new(ThreadLifecyclePage::new()));
-        let control = Box::leak(Box::new(ThreadControlSlot::new()));
+        let control: &'static ThreadControlSlot = Box::leak(Box::new(ThreadControlSlot::new()));
 
         let task = CurrentTask::new();
         task.set(El1TaskId::from_linux_tid(41), 11, 5);
@@ -1004,15 +1004,20 @@ fn test_wait4_consumes_zombie_once_with_exact_status() {
 
 #[test]
 fn arm_terminal_child_retirement_and_parent_handback_once() {
-    arm_child_wait_wake(false);
+    arm_child_wait_wake(false, false);
 }
 
 #[test]
 fn arm_in_ring_wait4_wake_resumes_owner_before_eret() {
-    arm_child_wait_wake(true);
+    arm_child_wait_wake(true, false);
 }
 
-fn arm_child_wait_wake(in_ring: bool) {
+#[test]
+fn arm_registered_sibling_wait4_wakes_through_owner_in_ring() {
+    arm_child_wait_wake(true, true);
+}
+
+fn arm_child_wait_wake(in_ring: bool, sibling: bool) {
     let fixture = Fixture::new(0x10000, asid(1));
     if in_ring {
         fixture.zone.spaces.set_idle_ttbr(0x30000);
@@ -1024,16 +1029,22 @@ fn arm_child_wait_wake(in_ring: bool) {
     let mut native = ThreadCtx::ZERO;
     native.x[0] = 99;
     let parked = Aarch64ParkedContext::from_parts(native, fixture.address);
-    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
-        source,
-        &fixture.task,
-        fixture.page,
-        fixture.control,
-        fixture.address,
-        fixture.address,
-        parked,
-    )
-    .unwrap();
+    let runtime = std::sync::Arc::new(
+        NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+            source,
+            &fixture.task,
+            fixture.page,
+            fixture.control,
+            fixture.address,
+            fixture.address,
+            parked,
+        )
+        .unwrap(),
+    );
+    let owner_registry = NativeProcessRegistry::new();
+    owner_registry
+        .register_root(runtime.clone(), source, &fixture.task, fixture.address)
+        .unwrap();
 
     let words = fixture.tables.live(&fixture.maintenance);
     let crossing = TestStockCrossing::new(&[
@@ -1068,12 +1079,64 @@ fn arm_child_wait_wake(in_ring: bool) {
     let child_key = runtime.namespace_child_key(parent_key, child_pid).unwrap();
     let child_binding = runtime.task_binding(child_key).unwrap();
 
-    // Parent yields slot to child
+    // A host-issued CLONE_THREAD sibling shares the process owner and can
+    // itself park the child wait while the leader remains live.
+    let sibling_control = if sibling {
+        fixture.zone.clear_current(fixture.slot);
+        let control: &'static ThreadControlSlot = Box::leak(Box::new(ThreadControlSlot::new()));
+        control.reset_for_host_birth(carrick_el1_abi::BlockedMask(0));
+        assert!(control.publish_visible_tid(43));
+        carrick_el1_abi::Lifecycle::thread_born(fixture.page).unwrap();
+        run_as(&fixture, 43, 13, 103, control);
+        let record = fixture
+            .zone
+            .current_or_new(
+                fixture.slot,
+                ThreadIdentity {
+                    tid: 43,
+                    serial: 103,
+                    mm: 1,
+                    file_table: 5,
+                    generation: 13,
+                    affinity: 1,
+                    lifecycle_page: fixture.page as *const _ as u64,
+                    control_slot: control as *const _ as u64,
+                },
+            )
+            .unwrap();
+        control.bind_zone_record(fixture.zone.record_ref(record));
+        // SAFETY: this unpublished home record belongs exclusively to the fixture.
+        unsafe { *fixture.zone.record(record).ctx_mut() = parked };
+        owner_registry
+            .register_thread(
+                source,
+                &fixture.task,
+                fixture.address,
+                fixture.page,
+                control,
+            )
+            .unwrap();
+        Some(control)
+    } else {
+        None
+    };
+    let waiter_record = sibling_control
+        .and_then(|control| control.zone_record().map(|record| record.id))
+        .unwrap_or(parent_binding.record.id);
+
+    // Waiter yields slot to child.
     let mut status_storage = 0i32;
     let status_va = UserVa::new(&raw mut status_storage as u64);
     {
         let mut parent_entry = runtime
-            .enter(source, &fixture.task, parked, &mut service)
+            .enter_registered(
+                &owner_registry,
+                source,
+                &fixture.task,
+                fixture.address,
+                parked,
+                &mut service,
+            )
             .unwrap();
         assert!(matches!(
             parent_entry.wait4(
@@ -1087,9 +1150,7 @@ fn arm_child_wait_wake(in_ring: bool) {
         assert!(parent_entry.take_handoff_receipt().is_some());
     }
     if !in_ring {
-        fixture
-            .zone
-            .unhome(fixture.slot, parent_binding.record.id, 1);
+        fixture.zone.unhome(fixture.slot, waiter_record, 1);
     }
 
     // Now child exits with status 9
@@ -1171,19 +1232,17 @@ fn arm_child_wait_wake(in_ring: bool) {
     if in_ring {
         assert_eq!(crossing.handbacks.load(Ordering::Acquire), 0);
         assert_eq!(
-            fixture.zone.record(parent_binding.record.id).claim(),
+            fixture.zone.record(waiter_record).claim(),
             carrick_sched_core::Claim::Queued {
                 slot: fixture.slot,
-                seq: fixture
-                    .zone
-                    .next_seq(parent_binding.record.id)
-                    .wrapping_sub(1)
+                seq: fixture.zone.next_seq(waiter_record).wrapping_sub(1)
             }
         );
         let mut frame = carrick_el1_abi::TrapFrame::default();
         let mut cpu = ResumeCpu {
             inner: crate::sched::FakeCpu::default(),
             runtime: &runtime,
+            registry: &owner_registry,
             source,
             task: &fixture.task,
             service: &mut service,
@@ -1240,7 +1299,14 @@ fn arm_child_wait_wake(in_ring: bool) {
 
     // Second wait on the consumed child must fail with ECHILD (error code -10)
     let mut parent_entry = runtime
-        .enter(source, &fixture.task, parked, &mut service)
+        .enter_registered(
+            &owner_registry,
+            source,
+            &fixture.task,
+            fixture.address,
+            parked,
+            &mut service,
+        )
         .unwrap();
     let re_wait = parent_entry.wait4(
         ProcessWaitPid::from_syscall_argument(child_pid as u64),
@@ -2299,6 +2365,76 @@ fn arm_host_born_sibling_raw_exit_retires_exact_owned_thread() {
     assert!(!leader_sees_thread(fixture, &mut service, 42));
     assert!(leader_sees_thread(fixture, &mut service, 41));
     assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn arm_registered_sibling_switch_in_without_pending_owner_work() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    let sibling = host_born_sibling(fixture, 42);
+    let mut syscall = carrick_el1_abi::TrapFrame::default();
+    syscall.x[8] = 178;
+    arm_call(fixture, sibling, &mut service, &mut syscall).unwrap();
+    let runtime = registry()
+        .for_entry(source, &fixture.task, fixture.address)
+        .unwrap();
+    let record = sibling.zone_record().unwrap().id;
+    // SAFETY: the fixture owns the stopped sibling record.
+    unsafe {
+        *fixture.zone.record(record).ctx_mut() =
+            Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    }
+    fixture.zone.requeue_preempted(fixture.slot, record);
+    let mut cpu = ResumeCpu {
+        inner: crate::sched::FakeCpu::default(),
+        runtime: &runtime,
+        registry: registry(),
+        source,
+        task: &fixture.task,
+        service: &mut service,
+    };
+    let counters = carrick_el1_abi::Counters::new();
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    assert_eq!(
+        (crate::sched::Sched {
+            handoff: None,
+            zone: fixture.zone,
+            slot: fixture.slot,
+            task: &fixture.task,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+            counters: &counters,
+        })
+        .run_next(&mut frame, 0),
+        crate::sched::Served::Returned { switched: true }
+    );
+    assert_eq!(fixture.task.visible_pid(), Some(41));
+}
+
+#[test]
+#[should_panic(expected = "native aarch64 process service failure")]
+fn arm_invalid_resume_fails_closed_in_production_mapping() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    let _ = map_resume(
+        super::native_process_runtime::NativeResume::Invalid,
+        &mut service,
+        &fixture.task,
+        fixture.slot,
+    );
 }
 
 #[test]

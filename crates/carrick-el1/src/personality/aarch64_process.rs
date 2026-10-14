@@ -84,6 +84,7 @@ pub fn registry() -> &'static NativeProcessRegistry<'static, Mm, Aarch64ParkedCo
 #[inline(never)]
 pub(super) fn resume_selected<'a, X: ForkStockCrossing>(
     runtime: &NativeProcessRuntime<'a, Mm, Aarch64ParkedContext>,
+    owner_registry: &NativeProcessRegistry<'a, Mm, Aarch64ParkedContext>,
     source: BornInZoneSource<'a, Aarch64ParkedContext>,
     task: &'a CurrentTask,
     record: RecordId,
@@ -91,19 +92,18 @@ pub(super) fn resume_selected<'a, X: ForkStockCrossing>(
 ) -> NativeResume {
     // The scheduler publishes the execution identity; the native owner also
     // owns the namespace PID and MM incarnation for this selected record.
-    let (visible_pid, generation) = {
-        // SAFETY: switch_in_full gave this slot exclusive record custody.
-        let binding = unsafe { runtime.record_binding(source.zone.record_ref(record)) }
-            .unwrap_or_else(|| fatal());
-        (binding.visible_pid, binding.address.generation)
-    };
-    task.publish_visible_pid(visible_pid);
-    task.publish_root_generation(generation);
+    // SAFETY: switch_in_full gave this slot exclusive record custody.
+    let visible_pid = unsafe { runtime.resume_visible_pid(source.zone.record_ref(record)) }
+        .unwrap_or_else(|| fatal());
     // SAFETY: the scheduler selected this exact record and holds its context
     // exclusively until it returns or publishes a new wait handoff.
-    let words = unsafe { *source.zone.record(record).ctx_mut() };
+    let context = unsafe { source.zone.record(record).ctx_mut() };
+    let address = context.address_context().unwrap_or_else(|| fatal());
+    task.publish_visible_pid(visible_pid);
+    task.publish_root_generation(address.generation);
+    let words = *context;
     let mut entry = runtime
-        .enter(source, task, words, service)
+        .enter_registered(owner_registry, source, task, address, words, service)
         .unwrap_or_else(|_| fatal());
     entry.resume_checkpoint().unwrap_or_else(|reason| {
         super::native_run_failure::complete_native_run_failure(
@@ -126,7 +126,22 @@ pub fn resume_production(
     };
     let source = BornInZoneSource { zone, slot };
     let mut service = Aarch64NativeProcessService::new(task, slot).unwrap_or_else(|_| fatal());
-    match resume_selected(&runtime, source, task, record, &mut service) {
+    map_resume(
+        resume_selected(&runtime, registry(), source, task, record, &mut service),
+        &mut service,
+        task,
+        slot,
+    )
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(super) fn map_resume<X: ForkStockCrossing>(
+    outcome: NativeResume,
+    service: &mut Aarch64NativeProcessService<'_, X>,
+    task: &CurrentTask,
+    slot: SlotId,
+) -> crate::sched::ResumeAction {
+    match outcome {
         NativeResume::NoPending => crate::sched::ResumeAction::NoPending,
         NativeResume::Returned(result) => crate::sched::ResumeAction::Returned(
             carrick_guest_arch::NativeReturnWord(result.raw() as u64),
