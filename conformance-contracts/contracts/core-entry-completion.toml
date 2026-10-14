@@ -23,7 +23,11 @@ wait record retains the continuation. Stale handoff cannot publish completion
 or work. Lifecycle results and original arguments publish only after successful
 authentication in the Linux owner. Pending
 return work marks the admitted call complete exactly once; it cannot send the
-same syscall through a semantic host dispatcher. Unknown native ordinals are
+same syscall through a semantic host dispatcher. Root termination carries its
+full-width neutral code and terminal kind in one authenticated 64-byte record;
+only the Linux host adapter encodes Linux wait status. The root-exit binding
+checks code/kind preservation and every Linux exit-byte and terminal-signal
+encoding without changing lifecycle ownership or dispatch work. Unknown native ordinals are
 counted refusals with zero Linux-side publication.
 The syscall-ABI root also reexports signal wire records. Retiring the ARM
 private wire exports preserves native completion: a valid public frame
@@ -33,7 +37,7 @@ return-work route. This binding does not change ARM production routing.
 """
 
 [bindings]
-vm_free = "carrick-personality-linux::x86_wave2::x4_linux_common_entry; carrick-personality-linux::signal_return_contract::public_arm_frame_preserves_same_entry_completion; carrick-el1::personality::native_process_runtime::tests::delayed_child_exit_notifies_adopter_when_selected_parent_exits_on_peer"
+vm_free = "carrick-kernel-example::root_exit_full_width::root_exit_wire_preserves_full_width_termination; carrick-kernel-example::root_exit_full_width::linux_host_adapter_preserves_exit_and_signal_wait_encodings; carrick-personality-linux::x86_wave2::x4_linux_common_entry; carrick-personality-linux::signal_return_contract::public_arm_frame_preserves_same_entry_completion; carrick-el1::personality::native_process_runtime::tests::delayed_child_exit_notifies_adopter_when_selected_parent_exits_on_peer"
 
 [bindings.unresolved]
 native_exit_scope = "The native EL1 exit binding proves only lifecycle completion: a committed exit_group returns Transferred with exactly one handoff receipt and no run failure while its selected parent generation retires on a peer CPU, and the adopter's parked wait4 continuation resumes exactly once with that parent's pid. It does not cover set_robust_list, unknown ordinals or the x86 entry token."

@@ -1360,3 +1360,11 @@ contracts = ["kernel.el1.open-lifetime", "kernel.el1.files", "kernel.el1.files.s
 [[surfaces]]
 path = "crates/carrick-kernel/src/el1_delegation/owned_recall.rs"
 contracts = ["kernel.el1.open-lifetime", "kernel.el1.files"]
+
+[[surfaces]]
+path = "crates/carrick-core-abi/src/root_exit.rs"
+contracts = ["core.entry.completion"]
+
+[[surfaces]]
+path = "crates/carrick-kernel-example/tests/root_exit_full_width.rs"
+contracts = ["core.entry.completion"]
