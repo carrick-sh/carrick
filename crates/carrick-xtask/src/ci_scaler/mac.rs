@@ -14,6 +14,7 @@
 //! job-start hook (`scripts/ci/admit-job.sh`). A rejected job kills that whole
 //! session before any workflow step, exactly as on Willow clones. The JIT
 //! config reaches the runner only through `ACTIONS_RUNNER_INPUT_JITCONFIG`.
+use super::assignment::admit_demand;
 use super::github::Github;
 use super::*;
 use std::os::fd::AsRawFd;
@@ -155,14 +156,17 @@ impl MacLedger {
         }
     }
     fn merge_assignments(&mut self, source: &Self) {
-        for row in &mut self.rows {
-            if let Some(other) = source.rows.iter().find(|other| other.name == row.name)
-                && other.assigned_key.is_some()
-            {
-                row.assigned = other.assigned;
-                row.assigned_key = other.assigned_key;
-            }
-        }
+        assignment::merge_records(
+            &mut self.rows,
+            &source.rows,
+            |row| row.name.clone(),
+            |row, other| {
+                if other.assigned_key.is_some() {
+                    row.assigned = other.assigned;
+                    row.assigned_key = other.assigned_key;
+                }
+            },
+        );
         for key in &source.refused {
             if !self.refused.contains(key) {
                 self.refused.push(*key);
@@ -197,6 +201,9 @@ impl MacLedger {
     }
 }
 impl assignment::Refusals for MacLedger {
+    fn served(&self, key: JobKey) -> bool {
+        MacLedger::served(self, key)
+    }
     fn refused(&self) -> &[JobKey] {
         &self.refused
     }
@@ -422,28 +429,6 @@ type Launch = (
     String,
     std::thread::JoinHandle<Result<Vec<u8>, ScalerError>>,
 );
-
-fn admit_demand<T>(
-    ledger: &mut MacLedger,
-    path: &Path,
-    demand: Vec<JobKey>,
-    mut admit: impl FnMut(JobKey) -> Result<T, ScalerError>,
-    mut cancel: impl FnMut(RunId) -> Result<(), ScalerError>,
-) -> Result<Option<T>, ScalerError> {
-    for job in demand {
-        if ledger.served(job) {
-            continue;
-        }
-        match admit(job) {
-            Ok(vetted) => return Ok(Some(vetted)),
-            Err(error @ (ScalerError::Guard(_) | ScalerError::StaleMergeGroup)) => {
-                assignment::refuse(ledger, job, &error, path, &mut cancel)?;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(None)
-}
 
 fn prioritize_demand(mut demand: Vec<(JobKey, String)>) -> Vec<JobKey> {
     let newest_push = demand
