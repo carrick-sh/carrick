@@ -6554,6 +6554,23 @@ pub enum InitialProcessExit {
 mod cpl0_layout_tests {
     use super::*;
 
+    #[test]
+    fn file_region_published_before_guest_entry() {
+        let inventory = Arc::new(FrameInventoryAuthority::new())
+            .physical_projection(Arc::new(ObjectIdRegistry::new()));
+        let carrier = Cpl0Carrier::boot_production(inventory, 0x20_000)
+            .expect("production carrier");
+        // Reserved tail of the shared open-table allocation: publication
+        // must name this VM, not a process-global host mapping.
+        let header_offset = carrick_el1_abi::EL1_OPEN_FILE_TABLE_OFFSET
+            + carrick_el1_abi::EL1_OPEN_FILE_TABLE_SIZE - 64;
+        let bytes = carrier.custody._vm.read(FrameGpa::new(KERNEL_REGION_GPA + header_offset), 8)
+            .expect("retained supervisor publication");
+        assert_eq!(u64::from_le_bytes(bytes.try_into().expect("identity word")),
+            carrier.custody._vm.identity().nonzero().get(),
+            "retained file tables need the exact carrier identity before entry");
+    }
+
     // x86.mm.initial-image: the static PIE load shape observed in busybox:musl.
     // Only ELF headers are needed to prove reservation placement; no VM or
     // backing proportional to the virtual heap/mmap capacity is allocated.
