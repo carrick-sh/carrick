@@ -1320,6 +1320,8 @@ pub enum KernelOperationError {
     RevisionExhausted,
     #[error("could not reserve {0} retired-thread records")]
     RetiredThreadCapacity(usize),
+    #[error("host-born thread slots are exhausted")]
+    HostBirthCapacity,
     #[error("task's process-group or session object disappeared before commit")]
     IdentityObjectMissing,
     #[error("kernel task {0:?} could not join its container PID namespace")]

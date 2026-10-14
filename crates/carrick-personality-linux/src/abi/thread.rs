@@ -50,7 +50,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Protocol revision, folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 8;
+pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 9;
 
 pub use carrick_core::lifecycle::{ClaimedEntry, ExitAdmission, Lifecycle};
 pub use carrick_core_abi::lifecycle::*;
@@ -540,6 +540,30 @@ impl ThreadControlSlot {
 
     /// Publish only after the host has retired the exact kernel thread and
     /// withdrawn its runtime membership. The control lease stays pinned.
+    pub fn publish_host_birth_identity(&self, binding: carrick_core_abi::entry::ExecutionBinding) {
+        self.retired_task
+            .store(binding.task.raw(), Ordering::Relaxed);
+        self.retired_execution
+            .store(binding.generation.raw(), Ordering::Relaxed);
+        self.retired_thread
+            .store(binding.thread_generation.raw(), Ordering::Release);
+    }
+
+    pub fn host_birth_identity(
+        &self,
+    ) -> Option<carrick_core::terminal::HostThreadRetirementReceipt> {
+        let thread = self.retired_thread.load(Ordering::Acquire);
+        carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+            carrick_core_abi::entry::EntryTaskKey::from_raw(
+                self.retired_task.load(Ordering::Relaxed),
+            ),
+            carrick_core_abi::entry::EntryGeneration::from_raw(
+                self.retired_execution.load(Ordering::Relaxed),
+            ),
+            carrick_core_abi::entry::EntryThreadGeneration::from_raw(thread),
+        )
+    }
+
     pub fn publish_host_retirement(
         &self,
         receipt: carrick_core::terminal::HostThreadRetirementReceipt,
@@ -550,9 +574,13 @@ impl ThreadControlSlot {
             .store(receipt.execution().raw(), Ordering::Relaxed);
         self.retired_thread
             .store(receipt.thread().raw(), Ordering::Release);
+        self.host_exit_requested.fetch_or(2, Ordering::Release);
     }
 
     pub fn host_retirement(&self) -> Option<carrick_core::terminal::HostThreadRetirementReceipt> {
+        if self.host_exit_requested.load(Ordering::Acquire) & 2 == 0 {
+            return None;
+        }
         let thread = self.retired_thread.load(Ordering::Acquire);
         carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
             carrick_core_abi::entry::EntryTaskKey::from_raw(
@@ -567,11 +595,11 @@ impl ThreadControlSlot {
 
     /// The ring routed a declined raw exit to this exact host-owned slot.
     pub fn request_host_exit(&self) {
-        self.host_exit_requested.store(1, Ordering::Release);
+        self.host_exit_requested.fetch_or(1, Ordering::Release);
     }
 
     pub fn host_exit_requested(&self) -> bool {
-        self.host_exit_requested.load(Ordering::Acquire) != 0
+        self.host_exit_requested.load(Ordering::Acquire) & 1 != 0
     }
 }
 impl Default for ThreadControlSlot {
@@ -595,6 +623,8 @@ pub struct ThreadLifecyclePage {
     controls: [AtomicU64; THREAD_POOL_ENTRIES],
     exit_wait_mm: AtomicU64,
     exit_wait_address: AtomicU64,
+    host_born: [AtomicU64; THREAD_POOL_ENTRIES],
+    host_birth_mutations: AtomicU32,
 }
 
 const _: () = assert!(core::mem::size_of::<ThreadLifecyclePage>() == THREAD_LIFECYCLE_PAGE_SIZE);
@@ -682,7 +712,91 @@ impl ThreadLifecyclePage {
             controls: [const { AtomicU64::new(0) }; THREAD_POOL_ENTRIES],
             exit_wait_mm: AtomicU64::new(0),
             exit_wait_address: AtomicU64::new(0),
+            host_born: [const { AtomicU64::new(0) }; THREAD_POOL_ENTRIES],
+            host_birth_mutations: AtomicU32::new(0),
         }
+    }
+
+    /// Reserve one host-born member before its irreversible task publication.
+    /// A value of one is an unpublished claim; a real control address is
+    /// aligned and therefore never one. Closing waits for every claim.
+    pub fn reserve_host_birth(&self) -> Option<usize> {
+        for (index, slot) in self.host_born.iter().enumerate() {
+            if slot
+                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                if self.gate() == GateState::Open {
+                    return Some(index);
+                }
+                slot.store(0, Ordering::SeqCst);
+                return None;
+            }
+        }
+        None
+    }
+
+    pub fn publish_host_birth(&self, index: usize, address: u64) -> bool {
+        if address <= 1
+            || !address.is_multiple_of(core::mem::align_of::<ThreadControlSlot>() as u64)
+        {
+            return false;
+        }
+        self.host_born.get(index).is_some_and(|slot| {
+            slot.compare_exchange(1, address, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        })
+    }
+
+    pub fn cancel_host_birth_claim(&self, index: usize) -> bool {
+        self.host_born.get(index).is_some_and(|slot| {
+            slot.compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        })
+    }
+
+    pub fn host_born_address(&self, index: usize) -> Option<u64> {
+        self.host_born
+            .get(index)
+            .and_then(|slot| match slot.load(Ordering::SeqCst) {
+                0 | 1 => None,
+                address => Some(address),
+            })
+    }
+
+    pub fn host_birth_claimed_count(&self) -> usize {
+        self.host_birth_mutations.load(Ordering::SeqCst) as usize
+            + self
+                .host_born
+                .iter()
+                .filter(|slot| slot.load(Ordering::SeqCst) == 1)
+                .count()
+    }
+
+    /// Release only while Open. During Closing all addresses remain pinned
+    /// until settlement, even after their exact receipts arrive.
+    pub fn release_adopted_host_birth(&self, address: u64) -> bool {
+        self.host_birth_mutations.fetch_add(1, Ordering::SeqCst);
+        let released = self.host_born.iter().any(|slot| {
+            if slot
+                .compare_exchange(address, 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return false;
+            }
+            if self.gate() != GateState::Open {
+                slot.store(address, Ordering::SeqCst);
+                return false;
+            }
+            slot.store(0, Ordering::SeqCst);
+            if self.gate() != GateState::Open {
+                slot.store(address, Ordering::SeqCst);
+                return false;
+            }
+            true
+        });
+        self.host_birth_mutations.fetch_sub(1, Ordering::SeqCst);
+        released
     }
 
     /// Whether EL1 may serve clone and exit (`CARRICK_EL1_THREADS`).
@@ -888,6 +1002,9 @@ impl ThreadLifecyclePage {
     }
 }
 impl Lifecycle for ThreadLifecyclePage {
+    fn host_claimed_count(&self) -> usize {
+        self.host_birth_claimed_count()
+    }
     fn gate_word(&self) -> &AtomicU32 {
         &self.gate
     }
@@ -911,7 +1028,7 @@ impl Default for ThreadLifecyclePage {
 }
 
 /// Layout facts folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 30] = [
+pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 32] = [
     THREAD_LIFECYCLE_PROTOCOL_VERSION,
     core::mem::size_of::<ThreadLedgerActivity>() as u64,
     ::core::mem::offset_of!(ThreadLifecyclePage, ledger_host) as u64,
@@ -942,10 +1059,46 @@ pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 30] = [
     ::core::mem::offset_of!(ThreadLifecyclePage, exit_wait_mm) as u64,
     ::core::mem::offset_of!(ThreadLifecyclePage, exit_wait_address) as u64,
     ::core::mem::offset_of!(ThreadControlSlot, host_exit_requested) as u64,
+    ::core::mem::offset_of!(ThreadLifecyclePage, host_born) as u64,
+    ::core::mem::offset_of!(ThreadLifecyclePage, host_birth_mutations) as u64,
 ];
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_birth_capacity_refuses_without_leaking_a_claim() {
+        let page = super::ThreadLifecyclePage::new();
+        let mut slots = [0usize; super::THREAD_POOL_ENTRIES];
+        for slot in &mut slots {
+            *slot = page.reserve_host_birth().expect("capacity available");
+        }
+        assert_eq!(page.reserve_host_birth(), None);
+        assert_eq!(page.host_birth_claimed_count(), super::THREAD_POOL_ENTRIES);
+        assert!(page.cancel_host_birth_claim(slots[0]));
+        assert_eq!(page.reserve_host_birth(), Some(slots[0]));
+        assert_eq!(page.host_birth_claimed_count(), super::THREAD_POOL_ENTRIES);
+    }
+
+    #[test]
+    fn host_birth_adoption_and_closing_have_one_slot_winner() {
+        use super::Lifecycle;
+        let adopted = super::ThreadLifecyclePage::new();
+        let slot = adopted.reserve_host_birth().unwrap();
+        assert!(adopted.publish_host_birth(slot, 0x1000));
+        assert!(adopted.release_adopted_host_birth(0x1000));
+        assert!(!adopted.release_adopted_host_birth(0x1000));
+        adopted.close();
+        assert_eq!(adopted.host_born_address(slot), None);
+
+        let cancelled = super::ThreadLifecyclePage::new();
+        let slot = cancelled.reserve_host_birth().unwrap();
+        assert!(cancelled.publish_host_birth(slot, 0x2000));
+        cancelled.close();
+        assert!(!cancelled.release_adopted_host_birth(0x2000));
+        assert_eq!(cancelled.host_born_address(slot), Some(0x2000));
+        assert_eq!(cancelled.host_birth_claimed_count(), 0);
+    }
+
     #[test]
     fn zone_record_binding_is_bounded_and_reset_with_its_control_incarnation() {
         let slot = super::ThreadControlSlot::new();
@@ -1623,6 +1776,8 @@ mod layout_manifest {
                      controls: _,
                      exit_wait_mm: _,
                      exit_wait_address: _,
+                     host_born: _,
+                     host_birth_mutations: _,
                  }: ThreadLifecyclePage| {};
         field!(ThreadLifecyclePage, gate, AtomicU32, 0, 4, 4);
         field!(ThreadLifecyclePage, live, AtomicU32, 4, 4, 4);
@@ -1648,5 +1803,21 @@ mod layout_manifest {
         );
         field!(ThreadLifecyclePage, exit_wait_mm, AtomicU64, 744, 8, 8);
         field!(ThreadLifecyclePage, exit_wait_address, AtomicU64, 752, 8, 8);
+        field!(
+            ThreadLifecyclePage,
+            host_born,
+            [AtomicU64; THREAD_POOL_ENTRIES],
+            760,
+            64,
+            8
+        );
+        field!(
+            ThreadLifecyclePage,
+            host_birth_mutations,
+            AtomicU32,
+            824,
+            4,
+            4
+        );
     }
 }

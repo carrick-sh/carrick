@@ -1,6 +1,8 @@
 //! Exact, by-value thread terminal custody. The page live word chooses the
 //! nonfinal member; lanes apply the resulting verdict.
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::num::NonZeroU64;
 
@@ -70,26 +72,33 @@ impl ProcessTerminalIdentity {
     }
 }
 
-/// A bounded description of the work the registry applies. Exact adopted
-/// bindings remain in its outstanding receipt set, not on the EL1 stack.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// A bounded description of the work the registry applies. Exact host
+/// bindings live in a boxed list rather than on the EL1 stack.
+#[derive(Debug, Eq, PartialEq)]
 pub struct MemberSet {
     pool_mask: u16,
-    adopted_count: u16,
+    adopted: Box<[HostThreadRetirementReceipt]>,
 }
 
 impl MemberSet {
-    pub fn new(pool_mask: u16, adopted_count: usize) -> Option<Self> {
+    pub fn new(
+        pool_mask: u16,
+        adopted: Vec<HostThreadRetirementReceipt>,
+        capacity: usize,
+    ) -> Option<Self> {
+        if adopted.len() > capacity {
+            return None;
+        }
         Some(Self {
             pool_mask,
-            adopted_count: u16::try_from(adopted_count).ok()?,
+            adopted: adopted.into_boxed_slice(),
         })
     }
     pub fn pool_mask(self) -> u16 {
         self.pool_mask
     }
-    pub fn adopted_count(self) -> u16 {
-        self.adopted_count
+    pub fn adopted(&self) -> &[HostThreadRetirementReceipt] {
+        &self.adopted
     }
 }
 
