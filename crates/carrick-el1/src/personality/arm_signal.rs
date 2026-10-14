@@ -46,9 +46,6 @@ pub(crate) fn build(
 ) -> Result<(carrick_guest_arch::UserVa, arm::SignalFrame), ArchError> {
     use carrick_syscall_abi::{LinuxFpsimdContext, LinuxSiginfo, LinuxSignalContext};
     use zerocopy::{FromBytes, IntoBytes};
-    if params.restorer.is_none() {
-        return Err(ArchError::InvalidFrame);
-    }
     let fp = LinuxFpsimdContext::read_from_bytes(fpstate).map_err(|_| ArchError::InvalidFrame)?;
     let mut context = LinuxSignalContext::empty();
     context.regs = frame.x;
@@ -124,18 +121,18 @@ mod tests {
         assert_eq!(&context.__reserved[528..536], &[0; 8]);
         let mask = signal.rt.ucontext.uc_sigmask;
         assert_eq!(mask, 8);
-        assert!(
-            build(
-                &frame,
-                SignalFrameParams {
-                    restorer: None,
-                    ..params
-                },
-                None,
-                fp.as_bytes()
-            )
-            .is_err()
-        );
+        let (_, without_restorer) = build(
+            &frame,
+            SignalFrameParams {
+                restorer: None,
+                ..params
+            },
+            None,
+            fp.as_bytes(),
+        )
+        .expect("glibc ARM actions use the mapped user trampoline");
+        let saved_pc = without_restorer.rt.ucontext.uc_mcontext.pc;
+        assert_eq!(saved_pc, frame.elr);
     }
 
     #[test]
@@ -342,7 +339,10 @@ impl carrick_personality_linux::signal::SignalBackend for crate::isa::aarch64::A
         frame.x[1] = info_addr;
         frame.x[2] = uc_addr;
         frame.x[29] = new_sp + arm::FRAME_RECORD_OFFSET as u64;
-        frame.x[30] = params.restorer.ok_or(ArchError::InvalidFrame)?.raw();
+        frame.x[30] = params.restorer.map_or(
+            carrick_syscall_abi::LINUX_SIGRETURN_TRAMPOLINE_BASE,
+            UserVa::raw,
+        );
 
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         unsafe {
