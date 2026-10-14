@@ -12,18 +12,45 @@ pub use carrick_syscall_abi::LinuxWaitOptions;
 #[repr(transparent)]
 pub struct LinuxWaitStatus(i32);
 
+/// Refusal to encode a non-terminal or invalid terminal notification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalStatusError {
+    InvalidSignal,
+    NonTerminal,
+}
+
 impl LinuxWaitStatus {
     pub const fn from_wait_encoding(raw: i32) -> Self {
         Self(raw)
     }
 
-    pub const fn from_termination_status(status: TerminationStatus) -> Self {
+    pub const fn from_termination_status(
+        status: TerminationStatus,
+    ) -> Result<Self, TerminalStatusError> {
         match status.kind() {
-            TerminationKind::Exited => Self::exited(status.code() as u8),
+            TerminationKind::Exited => Ok(Self::exited(status.code() as u8)),
             TerminationKind::Signaled { core_dump } => {
-                Self::signaled(status.code() as u8, core_dump)
+                if status.code() == 0 || status.code() > 64 {
+                    return Err(TerminalStatusError::InvalidSignal);
+                }
+                Ok(Self::signaled(status.code() as u8, core_dump))
             }
         }
+    }
+
+    /// Root publication accepts only exact terminal wait encodings.
+    pub const fn terminal_status(self) -> Result<TerminationStatus, TerminalStatusError> {
+        if self.0 & !0xff00 == 0 {
+            return Ok(TerminationStatus::exited(((self.0 >> 8) & 0xff) as u32));
+        }
+        let signal = self.0 & 0x7f;
+        if self.0 & !0xff == 0 && signal >= 1 && signal <= 64 {
+            return Ok(TerminationStatus::signaled(
+                signal as u32,
+                self.0 & 0x80 != 0,
+            ));
+        }
+        Err(TerminalStatusError::NonTerminal)
     }
 
     pub const fn to_termination_status(self) -> TerminationStatus {

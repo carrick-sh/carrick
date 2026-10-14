@@ -296,13 +296,17 @@ pub enum PhysicalProcessExit {
 impl PhysicalProcessExit {
     pub fn into_initial_process_exit(self, exits: usize) -> InitialProcessExit {
         match self {
-            Self::Exited(status) => InitialProcessExit::OwnedExit {
-                status:
-                    carrick_personality_linux::lifecycle::LinuxWaitStatus::from_termination_status(
-                        status,
-                    ),
-                exits,
-            },
+            Self::Exited(status) => {
+                match carrick_personality_linux::lifecycle::LinuxWaitStatus::from_termination_status(
+                    status,
+                ) {
+                    Ok(status) => InitialProcessExit::OwnedExit { status, exits },
+                    Err(_) => InitialProcessExit::RunFailed {
+                        reason: carrick_core_abi::NativeRunFailureReason::NativeInvalid,
+                        exits,
+                    },
+                }
+            }
             Self::RunFailed(reason) => InitialProcessExit::RunFailed { reason, exits },
         }
     }
@@ -6747,5 +6751,28 @@ mod cpl0_layout_tests {
         assert!(idt_base < stub_start);
         assert!(stub_start < stub_end);
         assert!(stub_end < META_GPA);
+    }
+}
+
+#[cfg(test)]
+mod root_exit_validation_tests {
+    use super::*;
+    #[test]
+    fn invalid_signal_root_exits_are_typed_run_failures() {
+        for code in [0, 128, 256] {
+            for core_dump in [false, true] {
+                let outcome = PhysicalProcessExit::Exited(
+                    carrick_sched_core::process::TerminationStatus::signaled(code, core_dump),
+                )
+                .into_initial_process_exit(1);
+                assert!(matches!(
+                    outcome,
+                    InitialProcessExit::RunFailed {
+                        reason: carrick_core_abi::NativeRunFailureReason::NativeInvalid,
+                        exits: 1
+                    }
+                ));
+            }
+        }
     }
 }

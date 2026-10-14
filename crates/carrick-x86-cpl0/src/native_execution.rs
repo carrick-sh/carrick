@@ -87,7 +87,10 @@ pub fn schedule(slot: SlotId) -> ! {
                                 entry.take_handoff_receipt().unwrap_or_else(|| fatal_boot());
                             let root_exit = entry.take_root_exit();
                             if let Some(status) = root_exit {
-                                publish_root_exit(current, status.to_termination_status());
+                                publish_root_exit(
+                                    current,
+                                    status.terminal_status().unwrap_or_else(|_| fatal_boot()),
+                                );
                             }
                             leave_space(source);
                             continue;
