@@ -126,8 +126,8 @@ fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
     );
 
     // The JSON run exposes a guest-entry receipt. Exact CPL0 lane identity
-    // plus two shared-kernel entries and host forwards distinguish this from
-    // the retired carrick-x86 bringup_fns trap path.
+    // plus two shared-kernel entries and the write's host forward distinguish
+    // this from the retired carrick-x86 bringup_fns trap path.
     let observed = Command::new(&cli)
         .timeout(Duration::from_secs(5))
         .env("CARRICK_HOME", &home)
@@ -160,10 +160,9 @@ fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
             .as_u64()
             .is_some_and(|n| n >= 2)
     );
-    assert!(
-        json["report"]["execution_witness"]["host_forwards"]
-            .as_u64()
-            .is_some_and(|n| n >= 2)
+    assert_eq!(
+        json["report"]["execution_witness"]["host_forwards"], 1,
+        "only write crosses host dispatch; exit uses the owned root receipt"
     );
 }
 
