@@ -228,7 +228,12 @@ fn file_region_fork_dup_lookup_and_retire_preserve_live_parent() {
         51,
         [true; 3],
     );
+    let stdout = fd_map_lookup(tables.fd_map(), 51, 1).expect("stdout").0;
+    let shared_open = &tables.opens()[stdout as usize - 1];
+    let incarnation = shared_open.generation.load(Ordering::Acquire);
+    assert_eq!(shared_open.lifetime.ring_references(incarnation), Some(1));
     assert!(fork_fd_map(tables.fd_map(), tables.opens(), 51, 52));
+    assert_eq!(shared_open.lifetime.ring_references(incarnation), Some(2));
     for table in [51, 52] {
         assert_eq!(
             dup_host_binding(tables.fd_map(), tables.opens(), table, 1, 0, 1024, false)
@@ -237,6 +242,7 @@ fn file_region_fork_dup_lookup_and_retire_preserve_live_parent() {
             3
         );
     }
+    assert_eq!(shared_open.lifetime.ring_references(incarnation), Some(4));
     let parent = fd_map_lookup(tables.fd_map(), 51, 3).expect("parent dup");
     let child = fd_map_lookup(tables.fd_map(), 52, 3).expect("child dup");
     assert_ne!(parent.1, child.1);
@@ -246,6 +252,7 @@ fn file_region_fork_dup_lookup_and_retire_preserve_live_parent() {
         open.is_bound_to(&tables.objects()[open.inode_handle.load(Ordering::Acquire) as usize - 1])
     );
     retire_fd_map(tables.fd_map(), tables.opens(), 52);
+    assert_eq!(shared_open.lifetime.ring_references(incarnation), Some(2));
     assert_eq!(
         tables.fd_map()[child.1].incarnation.load(Ordering::Acquire),
         0

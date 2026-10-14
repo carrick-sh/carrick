@@ -214,7 +214,7 @@ pub fn queue_open_release(key: OpenReferenceKey) {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     let region = super::EL1_REGION_BASE as usize;
     #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-    // F3 must wire region-indexed terminal retirement and its host drain.
+    // F3 (#384) must wire region-indexed terminal retirement and its host drain.
     // F2 handles name carrier-local records, but the x86 host only consumes
     // explicit stdio release crossings, not exit-time pending release keys.
     let region = 0;
