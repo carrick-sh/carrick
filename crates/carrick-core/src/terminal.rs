@@ -195,6 +195,13 @@ pub struct TerminalCustody<K: TerminalKind, P> {
     phase: PhantomData<(K, P, K::LaneMarker)>,
 }
 
+// EL1/CPL0 terminal paths already have tight stack budgets. Phase changes
+// consume this small value rather than moving an execution context by value.
+const _: () = {
+    assert!(core::mem::size_of::<TerminalCustody<Thread, Exiting>>() <= 64);
+    assert!(core::mem::size_of::<TerminalCustody<Process, Closing>>() <= 64);
+};
+
 #[must_use]
 pub enum RetirementVerdict {
     RetireThreadOnHost {
