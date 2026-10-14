@@ -40,6 +40,7 @@ struct TestStockCrossing {
     child: std::sync::Mutex<Option<(carrick_el1_abi::ExecutionBinding, AddressContext<RootGpa>)>>,
     handbacks: AtomicUsize,
     root_exits: AtomicUsize,
+    root_exit_status: AtomicU64,
 }
 
 impl TestStockCrossing {
@@ -64,6 +65,7 @@ impl TestStockCrossing {
             child: std::sync::Mutex::new(None),
             handbacks: AtomicUsize::new(0),
             root_exits: AtomicUsize::new(0),
+            root_exit_status: AtomicU64::new(u64::MAX),
         }
     }
 }
@@ -275,7 +277,11 @@ impl ForkStockCrossing for TestStockCrossing {
         }
     }
 
-    fn cross_root_exit(&self, _record_gpa: u64, _cpu: u64) -> Result<(), NativeProcessError> {
+    fn cross_root_exit(&self, record_gpa: u64, _cpu: u64) -> Result<(), NativeProcessError> {
+        // SAFETY: the VM-free crossing receives the caller's live exit record.
+        let exit = unsafe { &*(record_gpa as *const carrick_el1_abi::NativeRootExit) };
+        self.root_exit_status
+            .store(exit.words[5], Ordering::Relaxed);
         self.root_exits.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -2342,4 +2348,80 @@ fn arm_two_live_threads_robust_exit_forwards_without_abort() {
     fixture.page.try_exit().unwrap(); // the host's retirement
     assert!(!leader_sees_thread(fixture, &mut service, 42));
     assert!(leader_sees_thread(fixture, &mut service, 41));
+}
+
+#[test]
+fn arm_two_live_threads_exit_group_ends_group_with_status() {
+    #[derive(Clone, Copy, Debug)]
+    enum Siblings {
+        Pooled,
+        AdoptedHostBorn,
+        /// One owned member plus a host-born thread the owner never adopted.
+        PooledAndUnadoptedHostBorn,
+    }
+    for siblings in [
+        Siblings::Pooled,
+        Siblings::AdoptedHostBorn,
+        Siblings::PooledAndUnadoptedHostBorn,
+    ] {
+        let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+        let pooled = (!matches!(siblings, Siblings::AdoptedHostBorn))
+            .then(|| imported_thread_with_identity(fixture, |_| {}));
+        let mut service = fixture.process_service();
+        fixture
+            .enter(
+                fixture.control,
+                fixture_ttbr0(fixture),
+                &mut service,
+                |_| (),
+            )
+            .unwrap();
+        match siblings {
+            Siblings::Pooled => {}
+            Siblings::AdoptedHostBorn => {
+                let control = host_born_sibling(fixture, 42);
+                let mut frame = carrick_el1_abi::TrapFrame::default();
+                frame.x[8] = 178; // gettid adopts the sibling
+                arm_call(fixture, control, &mut service, &mut frame).unwrap();
+            }
+            Siblings::PooledAndUnadoptedHostBorn => {
+                host_born_sibling(fixture, 43);
+            }
+        }
+        assert!(leader_sees_thread(fixture, &mut service, 42));
+        let live = carrick_el1_abi::Lifecycle::live(fixture.page);
+        // main() returns while workers are live.
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[0] = 7;
+        frame.x[8] = 94;
+        let route = arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap();
+        assert_eq!(
+            route,
+            carrick_personality_linux::dispatch::CompletionRoute::Suspended,
+            "{siblings:?}"
+        );
+        assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
+        assert_eq!(
+            service.crossing.root_exit_status.load(Ordering::Acquire),
+            LinuxWaitStatus::exited(7).raw() as u64
+        );
+        // Only the caller's membership is released. Every sibling, owned or
+        // not, keeps its census until the host's process terminal (entered
+        // by the root crossing) retires it, and no address space is retired
+        // under a thread that may still run.
+        assert_eq!(
+            carrick_el1_abi::Lifecycle::live(fixture.page),
+            live - 1,
+            "{siblings:?}"
+        );
+        assert_eq!(service.crossing.retirements.load(Ordering::Acquire), 0);
+        assert_eq!(
+            carrick_el1_abi::Lifecycle::gate(fixture.page),
+            carrick_el1_abi::GateState::Closed,
+            "no new thread may be born into an exited group"
+        );
+        if let Some((_, record)) = pooled {
+            assert!(fixture.zone.record(record.id).is_cancelled());
+        }
+    }
 }

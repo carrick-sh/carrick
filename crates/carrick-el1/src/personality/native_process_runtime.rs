@@ -217,6 +217,13 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
         Ok(())
     }
     fn retire_fd_table(&mut self, _table: u64) {}
+    /// The root exit crossing terminates every remaining thread of the run,
+    /// so a root `exit_group` may complete while siblings are still live.
+    /// Their census and pool entries stay with the host, which retires them
+    /// at run teardown; this owner cancels only the records it executes.
+    fn root_exit_ends_run(&self) -> bool {
+        false
+    }
     fn signal_deadline(
         &mut self,
         nanos: u64,
@@ -2986,6 +2993,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .map_err(|_| NativeProcessError::Stale)?
             .metadata()
             .namespace_pid;
+        let root_exit = self.is_root_process();
+        // Live siblings end with the run only behind a root exit crossing.
+        let siblings_end_with_run = root_exit && self.service.root_exit_ends_run();
         let (page, channel) = {
             let mut graph = self.runtime.graph.lock();
             let row = graph
@@ -3002,7 +3012,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 if page.live() == 0 {
                     return Err(NativeProcessError::Quarantined);
                 }
-                if page.live() > 1 && page.claimed_count() == 0 {
+                if !siblings_end_with_run && page.live() > 1 && page.claimed_count() == 0 {
                     drop(graph);
                     return Ok(self.run_failed(
                         carrick_core_abi::NativeRunFailureReason::X86GroupExitCustody,
@@ -3041,12 +3051,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if page.live() == 0 {
             return Err(NativeProcessError::Quarantined);
         }
-        if page.live() > 1 {
+        // The gate is closed and claims have settled: the census only falls.
+        let siblings_live = page.live() > 1;
+        if siblings_live && !siblings_end_with_run {
             return Ok(
                 self.run_failed(carrick_core_abi::NativeRunFailureReason::X86GroupExitCustody)
             );
         }
-        let root_exit = self.is_root_process();
         let transaction = self
             .runtime
             .graph
@@ -3109,20 +3120,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if self.handoff.is_none() {
             return Err(NativeProcessError::Quarantined);
         }
-        // Only the calling thread is live. A sibling may have settled its
-        // lifecycle exit before its native membership notification arrives.
-        page.release_live(0)
-            .map_err(|_| NativeProcessError::Quarantined)?;
-        for member in &members {
-            if let Some(entry) = member.control.entry()
-                && matches!(page.state(entry.index()), Some((generation,
-                    carrick_el1_abi::EntryState::Born | carrick_el1_abi::EntryState::Published))
-                    if generation == entry.generation())
-            {
-                page.retire_published(entry)
-                    .map_err(|_| NativeProcessError::Quarantined)?;
-            }
-        }
+        self.retire_exit_group_lifecycle(page, &members, siblings_live)?;
         let permit = published.effects.cancel_members(|member| {
             if member.zone.live(member.record).is_some() {
                 let _ = member.zone.claim_for_host(
@@ -3835,6 +3833,40 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     NativeProcessEntry<'_, 'a, M, C, S>
 {
+    /// Release the caller's own membership. With no live sibling, also retire
+    /// the member entries whose lifecycle exit settled before their membership
+    /// notification. Live siblings of a root that ends the run keep their
+    /// census and entries for the host's own retirement: draining them here
+    /// would race a host-lane sibling's `try_exit`/`retire_published`.
+    #[inline(never)]
+    fn retire_exit_group_lifecycle(
+        &self,
+        page: &ThreadLifecyclePage,
+        members: &[NativeMember<'a, C>],
+        siblings_live: bool,
+    ) -> Result<(), NativeProcessError> {
+        page.release_live(0)
+            .map_err(|_| NativeProcessError::Quarantined)?;
+        if siblings_live {
+            return Ok(());
+        }
+        for member in members {
+            if let Some(entry) = member.control.entry()
+                && matches!(
+                    page.state(entry.index()),
+                    Some((
+                        generation,
+                        carrick_el1_abi::EntryState::Born | carrick_el1_abi::EntryState::Published
+                    )) if generation == entry.generation()
+                )
+            {
+                page.retire_published(entry)
+                    .map_err(|_| NativeProcessError::Quarantined)?;
+            }
+        }
+        Ok(())
+    }
+
     #[inline(never)]
     pub fn thread_exited(&mut self, tid: u32) {
         let mut graph = self.runtime.graph.lock();
