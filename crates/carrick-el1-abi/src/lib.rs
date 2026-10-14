@@ -708,6 +708,7 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         FrameGrantMailbox::STATE_OFFSET as u64,
         FrameGrantMailbox::STATUS_OFFSET as u64,
         FrameGrantMailbox::MM_KEY_OFFSET as u64,
+        FrameGrantMailbox::RESERVATION_INCARNATION_OFFSET as u64,
         FrameGrantMailbox::REQUEST_GENERATION_OFFSET as u64,
         FrameGrantMailbox::FAULT_VA_OFFSET as u64,
         FrameGrantMailbox::REQUESTED_LEN_OFFSET as u64,
@@ -3754,7 +3755,7 @@ impl Default for InotifyNameCache {
 const _: () = {
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
-    assert!(EL1_ABI_LAYOUT_HASH == 0xd42665b03443920f);
+    assert!(EL1_ABI_LAYOUT_HASH == 0xaff2565eb1b2821e);
     assert!(
         EL1_APERTURE_CONTROL_OFFSET.is_multiple_of(core::mem::align_of::<ApertureControl>() as u64)
     );
@@ -4423,6 +4424,7 @@ mod tests {
         let mailbox = FrameGrantMailbox::new();
         let request = FrameGrantRequest {
             mm_key: 41,
+            reservation_incarnation: None,
             request_generation: 7,
             fault_va: 0x4000_3000,
             requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
@@ -4781,6 +4783,7 @@ mod tests {
             let mailbox = FrameGrantMailbox::new();
             let request = FrameGrantRequest {
                 mm_key: 41,
+                reservation_incarnation: None,
                 request_generation: 7,
                 fault_va: 0x4000_3000,
                 requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
@@ -4827,6 +4830,7 @@ mod tests {
         let mailbox = FrameGrantMailbox::new();
         let request = FrameGrantRequest {
             mm_key: 41,
+            reservation_incarnation: None,
             request_generation: 7,
             fault_va: 0x4000_3000,
             requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
@@ -4862,6 +4866,7 @@ mod tests {
         let mailbox = FrameGrantMailbox::new();
         let first = FrameGrantRequest {
             mm_key: 41,
+            reservation_incarnation: None,
             request_generation: 7,
             fault_va: 0x4000_3000,
             requested_len: 4096,
@@ -4890,6 +4895,7 @@ mod tests {
         let mailboxes = FrameGrantMailboxes::new();
         let first = FrameGrantRequest {
             mm_key: 61,
+            reservation_incarnation: None,
             request_generation: 17,
             fault_va: 0x6100_1000,
             requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
@@ -4897,6 +4903,7 @@ mod tests {
         };
         let second = FrameGrantRequest {
             mm_key: 62,
+            reservation_incarnation: None,
             request_generation: 18,
             fault_va: 0x6200_1000,
             requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
@@ -4921,6 +4928,7 @@ mod tests {
     fn a_retiring_mm_withdraws_exactly_its_own_mailbox_work() {
         let request = |mm_key, request_generation| FrameGrantRequest {
             mm_key,
+            reservation_incarnation: None,
             request_generation,
             fault_va: 0x4000_3000,
             requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
@@ -4960,6 +4968,7 @@ mod tests {
         let mailbox = FrameGrantMailbox::new();
         let request = FrameGrantRequest {
             mm_key: 41,
+            reservation_incarnation: None,
             request_generation: 8,
             fault_va: 0x4000_3000,
             requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
@@ -5003,6 +5012,7 @@ mod tests {
         let mailbox = FrameGrantMailbox::new();
         let request = FrameGrantRequest {
             mm_key: 51,
+            reservation_incarnation: None,
             request_generation: 11,
             fault_va: 0x5000_1000,
             requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
@@ -5058,6 +5068,7 @@ mod tests {
             let mailbox = FrameGrantMailbox::new();
             let request = FrameGrantRequest {
                 mm_key: 301,
+                reservation_incarnation: None,
                 request_generation: permissions,
                 fault_va: 0x6000_1000,
                 requested_len: 4096,
@@ -5092,6 +5103,7 @@ mod tests {
         let mailbox = FrameGrantMailbox::new();
         let request = FrameGrantRequest {
             mm_key: 501,
+            reservation_incarnation: None,
             request_generation: 502,
             fault_va: 0x7000_2123,
             requested_len: 4096,
