@@ -37,6 +37,10 @@ const _: () = {
         EL1_OPEN_FILE_TABLE_OFFSET + size_of::<[DelegatedOpenFile; MAX_ZONE_OPEN_FILES]>() as u64
             <= EL1_FILE_REGION_HEADER_OFFSET
     );
+    assert!(
+        crate::OPEN_REFERENCE_PENDING_OFFSET + size_of::<crate::OpenReferencePending>() as u64
+            <= EL1_FILE_REGION_HEADER_OFFSET
+    );
     assert!(size_of::<InotifyNameCache>() as u64 <= EL1_NAME_CACHE_SIZE);
     assert!(EL1_OBJECT_TABLE_OFFSET.is_multiple_of(align_of::<DelegatedFile>() as u64));
     assert!(EL1_FD_MAP_OFFSET.is_multiple_of(align_of::<FdMapSlot>() as u64));
