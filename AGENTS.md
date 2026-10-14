@@ -166,6 +166,13 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
   LC_UUID, entitlement, `__dof_carrick`; run the full backend probe set on it;
   prove scoped cleanup. Earlier focused tests/`just ci`/400-of-400 receipts
   don't carry over.
+- **A signed verdict compares populations, not failure names.** A killed
+  binary reports no failures (#344's watchdog cascade started 25 of 89 EL1
+  tests and read clean): diff started tests and finished binaries against the
+  main baseline too. Until #377 lands the receipt gate collapses `--nocapture`
+  EL1 failures to one `step:el1-embed` key, already red on main, so EL1
+  regressions read `NEW=0` (#352/#353); the director's local signed
+  comparison is the EL1 gate meanwhile.
 - **Re-signing changes identity without relinking** (PID-bearing temp name).
   Keep the probe-tested artifact; use `just --no-deps conformance smoke` then
   `just --no-deps conformance full`, checking SHA/CDHash each rung. LC_UUID
@@ -317,6 +324,12 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
   add + 3M remove watches, one host seek). Need live request/completion
   closure; counts ≠ critical path; keep uninstrumented A/B and native-I/O
   controls. `--profile hvpatch-inotify09-population` fits only that case.
+- **Bad ELR far outside EL1 text, or "guest executed at EL1" at pool
+  shutdown = ring stack overflow**, not a wild jump: the 16 KiB per-CPU EL1
+  stack has no guard page, and by-value records on the exit chain
+  (`publish_exit` alone 0x2190) overwrote a neighbour CPU's stack (#338). No
+  large by-value locals or return values on EL1/CPL0 paths — box or borrow;
+  frame-budget gate plus guard pages: #369.
 - **Verify diagnoses empirically** — "race/coherence/Heisenbug" labels and
   memory notes are hypotheses; read real values, and check how you read them.
 
@@ -340,8 +353,12 @@ In Carrick, guest-visible correctness includes Linux semantics and non-pathologi
 - 5x/30x/80x = structurally wrong work (`munmap04` 47x, `mmap18` 34x were
   wrong algorithms; `splice02` 37x a false EOF). Rank by ratio-to-Docker. A row
   on its timeout budget (300.3 s, 30.5 s) is a hang; its ratio is meaningless.
-- Data: [`docs/perf-results/overhead-campaign-narrative.md`](docs/perf-results/overhead-campaign-narrative.md);
-  cold go-build **10.18x** ([`docs/perf-results/2026-08-07-post-move3-default-refresh.md`](docs/perf-results/2026-08-07-post-move3-default-refresh.md)).
+- Data: [`docs/perf-results/overhead-campaign-narrative.md`](docs/perf-results/overhead-campaign-narrative.md)
+  is **historical**: its figures (cold go-build 10.18x) measured the native
+  lane removed in `cc7d9eaa2`, and the `native-amplification` AMP1 profile
+  records nothing on HVPatch (no `native_syscall_service_entry` call site).
+  Don't cite them; the paired HVPatch baseline is #357, the ledger port #356,
+  and `hvpatch-exit-attribution` is the profile to measure with (#363).
 - **Perf claims need a controlled single-variable run on a quiet host**
   (heterogeneous cores; sweeps move work) — else "suggests", never "confirmed".
 - **Perf A/B is paired and interleaved** (base/candidate on one host, same
@@ -410,8 +427,11 @@ In Carrick, guest-visible correctness includes Linux semantics and non-pathologi
   owner-licensed.
 - Populations, "alive vs can-reach-a-safe-point", "which mm is self",
   process-vs-carrier scope all break at two processes, invisible to the
-  single-process smoke — **a two-live-process test beats any number of
-  single-process cases** ([`docs/identity-and-scope-domains.md`](docs/identity-and-scope-domains.md)).
+  single-process smoke — **a two-live-process (or two-live-thread) test beats
+  any number of single-process cases** ([`docs/identity-and-scope-domains.md`](docs/identity-and-scope-domains.md)).
+  Cover lifecycle exits: a non-last pthread's raw `exit` (every glibc/musl
+  thread registers a robust list) and `exit_group` while a worker still runs
+  were P0s no signed test exercised (#338).
 - **Exit reserves topology, not a live participant's thread membership.** The
   exiting task, a child or an adopter can finish an already admitted EL1 birth
   or nonfinal exit while the graph is reserved. An owned participant transition
@@ -435,6 +455,11 @@ In Carrick, guest-visible correctness includes Linux semantics and non-pathologi
 - Lanes forking real host processes need durable fork-coherent authorities
   (xattrs, inherited fds, host bookkeeping), not private `HashMap`s; shared code
   takes a typed backend authority.
+- **Retirement and terminal decisions belong to the neutral owner**
+  (`carrick_core::mm::retirement` today; `TerminalCustody` per #365).
+  Backends apply verdicts and never re-derive eligibility: HVF re-deriving
+  the pin-retirement predicate tripped
+  `personality_boundary::pin_retirement_has_one_neutral_owner` (`902cabbe8`).
 
 ### No shortcuts, no second paths, no dark launches
 
@@ -452,6 +477,10 @@ In Carrick, guest-visible correctness includes Linux semantics and non-pathologi
   Rust under `-D warnings`.
 - **Search before writing** — a second implementation is worse than a slightly
   wrong first (both drift).
+- **Ring ports go through shared `no_std` `*-core` crates** (`carrick-pipe-core`,
+  `carrick-fd-core`, `carrick-signal-core`, …) that the host dispatcher also
+  consumes; no fresh ring-only copies (`rt_sigaction` existed three times,
+  pipes twice; owner ruling 2026-10-13, #367).
 
 ### Directing workers is reviewing diffs, not reading reports
 
@@ -459,7 +488,12 @@ Worker worktrees (agy/codex) code; the director owns runtime fixes, live
 verification, acceptance.
 
 - **Verdicts are claims** (`tests_passing: true` on non-compiling diffs has
-  happened) — re-verify in the worktree; land only what you read.
+  happened), and so are subagent and reviewer reports (one review cited
+  nonexistent dead files, #368) — re-verify key claims in the worktree; land
+  only what you read.
+- **Every large or shared-kernel PR gets an independent review by a strong
+  reviewer before landing.** Gates passed what review caught: two P0s in #338,
+  forged two-task witnesses standing in for production operations in #331.
 - **Grep diffs for out-of-fence changes** — a page-table worker flipped
   `pwrite64` on a pipe read end ESPIPE→EBADF, broke main for a day, and a later
   worker "fixed" the test to match. Out-of-fence changes need an oracle line.
@@ -534,7 +568,14 @@ Chat, worker mailboxes, scratch notes and agent memory are not.
   (self-hosted JIT clones on the Contabo host, `docs/ci/contabo-kvm.md`;
   GCP nested-KVM VMs as fallback, `docs/ci/gcp-kvm.md`). The
   signed gate stays on cloudmac. Land on a failure-set diff against main
-  (`NEW=[]`), not an absolute zero.
+  (`NEW=[]`), not an absolute zero; `NEW=[]` is evidence only when every step
+  is itemized and every binary finished (#352/#353, fix #377).
+- **cloudmac is shared with CI** ([`docs/ci/mac-jit.md`](docs/ci/mac-jit.md)):
+  JIT jobs run unprivileged on the same 100 GB build volume, so admit
+  build-heavy work (`remote-accept`, gates) against running HVF jobs — an
+  overlap killed both with ENOSPC (#376). Worktree admission keys on the
+  checkout root's device+inode: never copy or cross-volume move an admitted
+  checkout; remove and re-add it.
 - **KVM evidence comes from the merge queue.** The `kvm-tests` lane produces
   a receipt and `kvm-gate` fails on NEW failures against the merge-group base.
   Do not run `just test-kvm` on the shared willow worker VMs; a targeted KVM
@@ -543,7 +584,11 @@ Chat, worker mailboxes, scratch notes and agent memory are not.
   one personality (`carrick-personality-linux`); out-of-tree personalities
   build only on `carrick-personality-api`. Nothing in carrick names NT or any
   other out-of-tree personality. Personalities do not Forward: serve in ring
-  or refuse.
+  or refuse. **Neutral crates must not depend on `carrick-personality-linux`**
+  (`carrick-el1`, `carrick-core`, `carrick-x86-carrier` still do: #366/#237);
+  per-task personality state is a ring-owned table keyed by `TaskKey`, Linux
+  ids and lineage types move out of neutral crates, new seams use neutral
+  vocabulary.
 - **Ring-first:** every routed call is served exactly in ring or left
   unrouted (counted ENOSYS); a Forward-only arm is a second path. Changes to
   the crossing allowlist (`crates/carrick-personality-linux/src/crossing.rs`,
