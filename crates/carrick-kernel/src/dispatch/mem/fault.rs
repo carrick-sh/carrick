@@ -998,6 +998,10 @@ impl Drop for PreparedRootGrant {
 }
 
 impl ResidentFrameGrantPlan<'_> {
+    pub fn root_incarnation(&self) -> Option<ReservationIncarnation> {
+        self.root_incarnation
+    }
+
     pub fn fault_page(&self) -> u64 {
         self.fault_page
     }
