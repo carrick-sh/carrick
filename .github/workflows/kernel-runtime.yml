@@ -191,7 +191,10 @@ jobs:
         run: RUST_TEST_THREADS=1 just lease gate just ci
 
       - name: Prune host-only gate build artifacts
-        if: ${{ github.event_name != 'merge_group' }}
+        # Must run even when `Host-only source gate` fails (`!cancelled()`), so
+        # `Signed acceptance receipt` below starts with a clean worktree and can
+        # still publish main's per-SHA baseline receipt without hitting the disk floor.
+        if: ${{ !cancelled() && github.event_name != 'merge_group' }}
         run: |
           rm -rf \
             target/debug \
@@ -206,7 +209,11 @@ jobs:
       # record; a FAIL receipt is still a receipt. Main is not green under
       # the strict signed gate, so this lane gates on NEW failures against
       # the base SHA's receipt (hosted hvf-gate job), not on the absolute verdict.
+      # `if: ${{ !cancelled() }}` ensures a red `Host-only source gate` on a
+      # main push cannot prevent the per-SHA baseline receipt from being
+      # produced and uploaded for `hvf-gate` (while the job itself still ends red).
       - name: Signed acceptance receipt
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -238,7 +245,8 @@ jobs:
       # prevent the per-SHA baseline from existing. Not on the merge queue:
       # main is not green under these absolute verdicts, so the queue gates on
       # the receipt (NEW failures) above; push and dispatch keep the full
-      # signed coverage, reusing `target/release` (with `.dSYM` bundles intact)
+      # signed coverage (skipped via implicit `success()` if `Host-only source
+      # gate` failed), reusing `target/release` (with `.dSYM` bundles intact)
       # from `Signed acceptance receipt`.
       - name: Signed embedded guest tests
         if: ${{ github.event_name != 'merge_group' }}
