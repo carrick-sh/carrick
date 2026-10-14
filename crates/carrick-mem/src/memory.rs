@@ -463,7 +463,7 @@ const _: () = assert!(
 // must not collide with ET_EXEC binaries that commonly start at 0x200000. Keep
 // it in the unused gap above the PIE default base and below the heap/mmap
 // arenas so normal guest mappings never collide.
-pub const LINUX_SIGRETURN_TRAMPOLINE_BASE: u64 = 0x30_0000_0000;
+pub use carrick_syscall_abi::LINUX_SIGRETURN_TRAMPOLINE_BASE;
 pub const LINUX_SIGRETURN_TRAMPOLINE_SIZE: u64 = 0x4000;
 /// Is `[start, end)` wholly inside memory carrick's kernel owns and guest EL0
 /// can never reach: the 2 MiB kernel hole (vectors, trampolines, page tables,
