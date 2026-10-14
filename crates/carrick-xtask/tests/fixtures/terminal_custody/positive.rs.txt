@@ -1,0 +1,6 @@
+struct Owner;
+impl Owner {
+    fn retire_thread(&self, verdict: Verdict) {
+        self.apply(verdict);
+    }
+}

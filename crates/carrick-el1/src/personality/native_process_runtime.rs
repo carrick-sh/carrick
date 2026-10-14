@@ -3820,6 +3820,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         }
         Ok(())
     }
+    fn retire_thread_verdict(&mut self, verdict: carrick_core::terminal::RetirementVerdict) {
+        self.retire_thread_verdict(verdict);
+    }
     fn thread_exited(&mut self, tid: u32) {
         self.thread_exited(tid);
     }
@@ -3943,7 +3946,26 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     }
 
     #[inline(never)]
-    pub fn thread_exited(&mut self, tid: u32) {
+    pub fn retire_thread_verdict(&mut self, verdict: carrick_core::terminal::RetirementVerdict) {
+        let carrick_core::terminal::RetirementVerdict::RetireThread {
+            identity,
+            requires_slot_absence,
+        } = verdict;
+        if identity.binding() != self.binding
+            || identity.entry() != self.control.entry()
+            || !requires_slot_absence
+        {
+            self.run_failure = Some(carrick_core_abi::NativeRunFailureReason::NativeStale);
+            return;
+        }
+        let Some(tid) = self.control.visible_tid() else {
+            self.run_failure = Some(carrick_core_abi::NativeRunFailureReason::NativeStale);
+            return;
+        };
+        self.retire_thread_identity(tid);
+    }
+
+    fn retire_thread_identity(&mut self, tid: u32) {
         let mut graph = self.runtime.graph.lock();
         let mut retired = Vec::new();
         if let Ok(task) = graph.owner.task_mut(self.key) {
@@ -3955,7 +3977,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 let matches_caller = tid == self.calling_tid
                     && (member.record == self.record
                         || core::ptr::eq(member.control, self.control));
-                if matches_caller || member.control.visible_tid() == Some(tid) {
+                if matches_caller {
                     retired.push(member.record);
                     false
                 } else {
@@ -3969,6 +3991,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 registry.unregister_member(self.runtime, self.key, record);
             }
         }
+    }
+
+    pub fn thread_exited(&mut self, tid: u32) {
+        self.retire_thread_identity(tid);
     }
 
     fn robust_target<'g>(
