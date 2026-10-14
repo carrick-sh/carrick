@@ -2887,6 +2887,7 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
         let pooled = (!matches!(siblings, Siblings::AdoptedHostBorn))
             .then(|| imported_thread_with_identity(fixture, |_| {}));
         let mut adopted_control = None;
+        let mut unadopted_control = None;
         let mut service = fixture.process_service();
         fixture
             .enter(
@@ -2906,7 +2907,7 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
                 arm_call(fixture, control, &mut service, &mut frame).unwrap();
             }
             Siblings::PooledAndUnadoptedHostBorn => {
-                host_born_sibling(fixture, 43);
+                unadopted_control = Some(host_born_sibling(fixture, 43));
             }
         }
         assert!(leader_sees_thread(fixture, &mut service, 42));
@@ -2978,7 +2979,12 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
             control.publish_host_retirement(receipt);
         }
         if matches!(siblings, Siblings::PooledAndUnadoptedHostBorn) {
-            fixture.page.release_live(0).unwrap();
+            assert!(
+                unadopted_control
+                    .expect("unadopted control")
+                    .host_exit_requested(),
+                "Closing must cancel a host-born sibling before first ring entry"
+            );
         }
         assert_eq!(fixture.page.live(), 0);
         assert!(matches!(
