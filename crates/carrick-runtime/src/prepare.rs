@@ -214,7 +214,7 @@ pub fn run_prepared_kvm_pool(
         .to_owned();
     let physical_debug: Arc<dyn carrick_kernel::kernel::debug::PhysicalCaptureProvider> =
         Arc::new(KvmPhysicalDebug(Arc::clone(&physical)));
-    let _debug_server = carrick_kernel::kernel::KernelDebugServer::install_with_physical(
+    let _debug_server = carrick_kernel::kernel::KernelDebugServer::install(
         Arc::clone(root_context.kernel()),
         &run_id,
         Some(physical_debug),
