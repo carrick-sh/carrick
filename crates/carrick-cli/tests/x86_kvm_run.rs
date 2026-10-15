@@ -930,6 +930,70 @@ fn mounted_static_x86_blocking_stdin_read_matches_native() {
     );
 }
 
+/// A guest held in its read wait must remain inspectable before the test
+/// releases stdin. This exercises the production carrier, not a model zone.
+#[test]
+fn mounted_static_x86_blocked_read_has_live_kernel_capture() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("blocked-read");
+    compile_assembly("x86_blocking_stdin.S", &elf);
+    let archive = dir.path().join("image.tar");
+    std::fs::write(&archive, empty_image_archive()).unwrap();
+    let cli = assert_cmd::cargo::cargo_bin("carrick");
+    let home = dir.path().join("home");
+    let load = Command::new(&cli)
+        .timeout(Duration::from_secs(5))
+        .env("CARRICK_HOME", &home)
+        .args(["load", "--input", archive.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(load.status.success(), "{}", String::from_utf8_lossy(&load.stderr));
+
+    let run_id = format!("x86-kvm-blocked-capture-{}", std::process::id());
+    let mut child = ReapChild(
+        std::process::Command::new(&cli)
+            .env("CARRICK_HOME", &home)
+            .env("CARRICK_RUN_ID", &run_id)
+            .args([
+                "run", "--platform", "linux/amd64", "--pull", "never",
+                "--volume", &format!("{}:/hello:ro", elf.display()),
+                "x86-kvm-hello:latest",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut stdout = child.stdout.take().unwrap();
+    assert!(poll_readable(stdout.as_raw_fd(), 5_000), "guest ready marker missing");
+    let mut marker = [0; 2];
+    stdout.read_exact(&mut marker).unwrap();
+    assert_eq!(&marker, b"R\n");
+
+    let capture = Command::new(&cli)
+        .timeout(Duration::from_secs(5))
+        .args(["debug", "hvpatch-kernel", "--run-id", &run_id])
+        .output()
+        .unwrap();
+    assert!(
+        capture.status.success(),
+        "live KVM capture failed: {}",
+        String::from_utf8_lossy(&capture.stderr)
+    );
+    let snapshot: serde_json::Value = serde_json::from_slice(&capture.stdout).unwrap();
+    assert!(snapshot["threads"].as_array().is_some_and(|rows| !rows.is_empty()));
+
+    child.stdin.as_mut().unwrap().write_all(b"X").unwrap();
+    let mut rest = Vec::new();
+    stdout.read_to_end(&mut rest).unwrap();
+    assert_eq!(rest, b"B\n");
+    assert_eq!(child.wait().unwrap().code(), Some(7));
+}
+
 fn run_with_empty_stdin_then_write(mut command: std::process::Command) -> (Vec<u8>, Option<i32>) {
     let mut child = ReapChild(
         command
