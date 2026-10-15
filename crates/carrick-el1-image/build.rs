@@ -55,14 +55,18 @@ fn find_sysroot_tool(tool: &str, sysroot: &str, host: &str) -> PathBuf {
 /// Tail-call wrappers do not stand in for their callee's budget.
 fn check_process_exit_frames(disassembly: &str) {
     let budgets = [
-        ("::dispatch::dispatch_syscall::", 0x600),
-        ("::aarch64_process::admit_entry_runtime::", 0x1200),
-        ("::exit_with_status::", 0x600),
-        ("::finish_exit::", 0x800),
-        ("::aarch64_process::resume_selected::", 0xa00),
-        ("::resume_checkpoint::", 0x400),
+        ("::dispatch::dispatch_syscall::", 0x600, true),
+        ("::aarch64_process::admit_entry_runtime::", 0x1200, true),
+        ("::exit_with_status::", 0x600, true),
+        ("::finish_exit::", 0x800, true),
+        ("::aarch64_process::resume_selected::", 0xa00, true),
+        ("::resume_checkpoint::", 0x400, true),
+        // The ARM codec is dormant until #323 routes rt_sigreturn in-ring.
+        // Once linked, its frame must fit below the budget; #323 makes this
+        // symbol required as part of the atomic signal-owner cutover.
+        ("Aarch64Backend$GT$::restore_signal_frame::", 0x1300, false),
     ];
-    for (symbol, ceiling) in budgets {
+    for (symbol, ceiling, required) in budgets {
         let mut found = false;
         for body in disassembly.split(">:\n") {
             if !body
@@ -138,7 +142,9 @@ fn check_process_exit_frames(disassembly: &str) {
             );
             found = true;
         }
-        assert!(found, "missing EL1 exit frame {symbol}");
+        if required {
+            assert!(found, "missing EL1 exit frame {symbol}");
+        }
     }
 }
 
