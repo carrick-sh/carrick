@@ -1,0 +1,7 @@
+fn stop() {
+    assert!(page.live() == 0);
+    matches!(page.claimed_count(), 0);
+    wrapper!(Owner::task_is_live(task));
+    wrapper!(nested!(page.hardware_live_root()));
+    assert!(reason == NativeRunFailureReason::X86GroupExitCustody);
+}
