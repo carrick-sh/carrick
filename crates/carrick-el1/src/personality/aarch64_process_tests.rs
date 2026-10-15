@@ -1992,7 +1992,7 @@ fn arm_root_admission_imports_live_thread_membership_without_changing_census() {
                 let terminal_entry = control.entry();
                 fixture.page.try_exit().unwrap();
                 carrick_core::entry::retire_current(process.binding(), source, record.id).unwrap();
-                admission.commit().unwrap();
+                admission.commit_with_member(control).unwrap();
                 if notified {
                     let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
                         process.binding(),
@@ -3031,8 +3031,15 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
             }
             fixture
                 .page
-                .retire_published_host_member(control.entry().unwrap(), retirement)
+                .retire_published_host_member(control.entry().unwrap(), control, retirement)
                 .unwrap();
+            let receipt = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+                carrick_core_abi::entry::EntryTaskKey::from_raw(42),
+                carrick_core_abi::entry::EntryGeneration::from_raw(12),
+                carrick_core_abi::entry::EntryThreadGeneration::from_raw(102),
+            )
+            .unwrap();
+            fixture.page.publish_exact_host_retirement(control, receipt);
         }
         if let Some(control) = adopted_control {
             let stale = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
@@ -3098,7 +3105,7 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
 }
 
 #[cfg(test)]
-fn arm_pool_raw_exit_closing_at_commit_boundary() {
+fn arm_pool_raw_exit_closing_at_commit_boundary(recycle_entry: bool) {
     use carrick_el1_abi::Lifecycle;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let (control, record) = imported_thread(fixture);
@@ -3142,10 +3149,27 @@ fn arm_pool_raw_exit_closing_at_commit_boundary() {
                 as *mut Aarch64NativeProcessService<'static, TestStockCrossing>)
         };
         assert_eq!(
-            fixture.page.expected_exit_receipt(control.entry()),
+            fixture.page.expected_exit_receipt(control, control.entry()),
             carrick_core::lifecycle::ExpectedExitReceipt::AlreadyExited
         );
         assert!(registry().for_record(fixture.zone, record).is_some());
+        if recycle_entry {
+            let entry = control.entry().unwrap();
+            fixture.page.reap(entry).unwrap();
+            let replacement = fixture
+                .page
+                .stock(
+                    entry.index(),
+                    carrick_el1_abi::EntryIdentity {
+                        tid: 99,
+                        visible_tid: 99,
+                        thread_serial: 199,
+                        uid_credit: 0,
+                    },
+                )
+                .unwrap();
+            assert_ne!(replacement.generation(), entry.generation());
+        }
         fixture.zone.clear_current(fixture.slot);
         run_as_leader(fixture);
         let mut frame = carrick_el1_abi::TrapFrame::default();
@@ -3165,12 +3189,6 @@ fn arm_pool_raw_exit_closing_at_commit_boundary() {
         carrick_personality_linux::dispatch::CompletionRoute::Suspended
     );
     assert!(registry().for_record(fixture.zone, record).is_none());
-    if fixture.page.exit_wait().is_some() {
-        assert!(matches!(
-            wake_closing_root(fixture, root_service),
-            crate::sched::ResumeAction::Left
-        ));
-    }
     assert_eq!(root_service.crossing.root_exits.load(Ordering::Acquire), 1);
     assert_eq!(
         root_service
@@ -3183,12 +3201,181 @@ fn arm_pool_raw_exit_closing_at_commit_boundary() {
 
 #[test]
 fn arm_adopted_pool_exit_in_progress_settles_group_once() {
-    arm_pool_raw_exit_closing_at_commit_boundary();
+    arm_pool_raw_exit_closing_at_commit_boundary(false);
 }
 
 #[test]
 fn arm_pool_raw_exit_committed_before_unregister_owes_no_host_receipt() {
-    arm_pool_raw_exit_closing_at_commit_boundary();
+    arm_pool_raw_exit_closing_at_commit_boundary(false);
+}
+
+#[test]
+fn arm_raw_exit_reaped_and_replenished_before_closing_owes_no_host_receipt() {
+    arm_pool_raw_exit_closing_at_commit_boundary(true);
+}
+
+#[test]
+fn arm_host_retired_pool_member_waits_for_exact_host_receipt() {
+    use carrick_el1_abi::Lifecycle;
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let (control, record) = imported_thread(fixture);
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[0] = 7;
+    frame.x[8] = 94;
+    assert_eq!(
+        arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+    );
+    assert!(fixture.zone.record(record.id).is_cancelled());
+    let entry = control.entry().unwrap();
+    fixture.page.publish(entry).unwrap();
+    let retirement = fixture.page.reserve_cancelled_member_exit().unwrap();
+    fixture
+        .page
+        .retire_published_host_member(entry, control, retirement)
+        .unwrap();
+    assert_eq!(fixture.page.live(), 0);
+    assert!(matches!(
+        wake_closing_root(fixture, &mut service),
+        crate::sched::ResumeAction::Left
+    ));
+    assert_eq!(
+        service.crossing.root_exits.load(Ordering::Acquire),
+        0,
+        "host retirement must wait for the exact receipt after Reaped"
+    );
+    let receipt = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+        carrick_core_abi::entry::EntryTaskKey::from_raw(42),
+        carrick_core_abi::entry::EntryGeneration::from_raw(12),
+        carrick_core_abi::entry::EntryThreadGeneration::from_raw(102),
+    )
+    .unwrap();
+    fixture.page.publish_exact_host_retirement(control, receipt);
+    assert!(matches!(
+        wake_closing_root(fixture, &mut service),
+        crate::sched::ResumeAction::Left
+    ));
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
+    assert_eq!(service.crossing.root_exit_status.load(Ordering::Acquire), 7);
+}
+
+#[test]
+fn arm_closing_during_raw_exit_admission_settles_after_commit() {
+    use carrick_el1_abi::Lifecycle;
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let (control, record) = imported_thread(fixture);
+    let mut worker_service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut worker_service,
+            |_| (),
+        )
+        .unwrap();
+    run_as(fixture, 42, 12, 102, control);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        record.id
+    );
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    registry()
+        .register_thread(
+            source,
+            &fixture.task,
+            fixture.address,
+            fixture.page,
+            control,
+        )
+        .unwrap();
+    let root_service: &'static mut Aarch64NativeProcessService<'static, TestStockCrossing> =
+        Box::leak(Box::new(fixture.process_service()));
+    let root_service_address = root_service as *mut _ as usize;
+    let fixture_address = fixture as *const Fixture as usize;
+    super::lifecycle::install_raw_exit_before_commit_hook(
+        fixture.page,
+        Box::new(move || {
+            // SAFETY: both allocations are leaked for this test and used
+            // sequentially while the outer raw-exit call owns this hook.
+            let fixture = unsafe { &*(fixture_address as *const Fixture) };
+            let service = unsafe {
+                &mut *(root_service_address
+                    as *mut Aarch64NativeProcessService<'static, TestStockCrossing>)
+            };
+            assert!(matches!(
+                fixture.page.state(control.entry().unwrap().index()),
+                Some((generation, carrick_el1_abi::EntryState::ExitingBorn
+                    | carrick_el1_abi::EntryState::ExitingPublished))
+                    if generation == control.entry().unwrap().generation()
+            ));
+            assert_eq!(
+                control.recorded_exit_kind(control.entry()),
+                carrick_core::lifecycle::MemberExitKind::Active
+            );
+            fixture.zone.clear_current(fixture.slot);
+            run_as_leader(fixture);
+            let mut frame = carrick_el1_abi::TrapFrame::default();
+            frame.x[0] = 7;
+            frame.x[8] = 94;
+            assert_eq!(
+                arm_call(fixture, fixture.control, service, &mut frame).unwrap(),
+                carrick_personality_linux::dispatch::CompletionRoute::Suspended
+            );
+            assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
+            run_as(fixture, 42, 12, 102, control);
+        }),
+    );
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[8] = 93;
+    assert_eq!(
+        arm_call(fixture, control, &mut worker_service, &mut frame).unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+    );
+    assert_eq!(
+        control.recorded_exit_kind(control.entry()),
+        carrick_core::lifecycle::MemberExitKind::InZone
+    );
+    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    run_as_leader(fixture);
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let runtime = registry()
+        .for_entry(source, &fixture.task, fixture.address)
+        .unwrap();
+    let resumed = super::aarch64_process::resume_selected(
+        &runtime,
+        registry(),
+        source,
+        &fixture.task,
+        selected.record,
+        root_service,
+    );
+    assert!(matches!(
+        super::aarch64_process::map_resume(resumed, root_service, &fixture.task, fixture.slot),
+        crate::sched::ResumeAction::Left
+    ));
+    assert_eq!(root_service.crossing.root_exits.load(Ordering::Acquire), 1);
+    assert_eq!(
+        root_service
+            .crossing
+            .root_exit_status
+            .load(Ordering::Acquire),
+        7
+    );
 }
 
 #[test]

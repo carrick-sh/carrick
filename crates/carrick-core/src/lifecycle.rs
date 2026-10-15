@@ -15,9 +15,85 @@ pub enum ExpectedExitReceipt {
     AlreadyExited,
 }
 
+/// The exit path recorded on one exact member's retained custody. A pool
+/// entry word can be reaped or restocked while that member is unregistering.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub enum MemberExitKind {
+    Active,
+    InZone,
+    HostRetiring,
+    Stale,
+}
+
+const IN_ZONE_COMMITTED: u32 = 4;
+const HOST_RETIRING: u32 = 8;
+
+/// Exact member custody, reset exclusively before each birth. The entry
+/// reference is the generation key; the flag word is member-owned storage.
+pub trait MemberExitCustody {
+    fn member_entry(&self) -> Option<EntryRef>;
+    fn member_exit_word(&self) -> &AtomicU32;
+    fn host_retirement(&self) -> Option<crate::terminal::HostThreadRetirementReceipt>;
+
+    fn recorded_exit_kind(&self, entry: Option<EntryRef>) -> MemberExitKind {
+        if self.member_entry() != entry {
+            return MemberExitKind::Stale;
+        }
+        let word = self.member_exit_word().load(Ordering::Acquire);
+        if word & HOST_RETIRING != 0 {
+            MemberExitKind::HostRetiring
+        } else if word & IN_ZONE_COMMITTED != 0 {
+            MemberExitKind::InZone
+        } else {
+            MemberExitKind::Active
+        }
+    }
+
+    fn record_in_zone_commit(&self, entry: EntryRef) -> Result<(), TransitionError> {
+        if self.member_entry() != Some(entry) {
+            return Err(TransitionError::StaleGeneration);
+        }
+        self.member_exit_word()
+            .fetch_or(IN_ZONE_COMMITTED, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn record_host_retiring(&self, entry: Option<EntryRef>) -> Result<(), TransitionError> {
+        if self.member_entry() != entry {
+            return Err(TransitionError::StaleGeneration);
+        }
+        self.member_exit_word()
+            .fetch_or(HOST_RETIRING, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn rollback_in_zone_commit(&self) {
+        self.member_exit_word()
+            .fetch_and(!IN_ZONE_COMMITTED, Ordering::SeqCst);
+    }
+
+    fn rollback_host_retiring(&self) {
+        self.member_exit_word()
+            .fetch_and(!HOST_RETIRING, Ordering::SeqCst);
+    }
+}
+
 /// The exact page owns the storage and retains its ledger notification authority.
 /// Linux payload initialization happens between reserve and release publication.
 pub trait Lifecycle {
+    fn host_birth_receipt_returned_exact(
+        &self,
+        _index: usize,
+        _identity: crate::terminal::HostThreadRetirementReceipt,
+    ) -> bool {
+        false
+    }
     fn gate_word(&self) -> &AtomicU32;
     fn live_word(&self) -> &AtomicU32;
     fn entry_count(&self) -> usize;
@@ -79,6 +155,9 @@ pub trait Lifecycle {
     fn close(&self) {
         self.gate_word()
             .store(GateState::Closed as u32, Ordering::SeqCst);
+    }
+    fn close_if_open(&self) -> Result<(), GateState> {
+        self.transition_gate(GateState::Open, GateState::Closed)
     }
     /// Clone and exit admissions a host must drain after `close_for_fork`.
     /// `SeqCst` scan (second half of both claim/gate pairs).
@@ -151,6 +230,19 @@ pub trait Lifecycle {
         })
     }
 
+    /// Reserve the Closing caller while a competing close can still fail.
+    /// The guard restores that exact unit if gate CAS loses.
+    fn reserve_closing_caller_exit(&self) -> Result<NonfinalExitMembership<'_>, MembershipFloor>
+    where
+        Self: Sized,
+    {
+        self.release_live(0)?;
+        Ok(NonfinalExitMembership {
+            page: self,
+            reserved: Some(ReservedLiveUnit::new()),
+        })
+    }
+
     /// Return a live unit taken by one exact exit reservation. The token is
     /// minted only after the same page subtracts that unit.
     fn restore_reserved(&self, _unit: ReservedLiveUnit) {
@@ -191,7 +283,18 @@ pub trait Lifecycle {
     }
     /// One exact member has one Closing receipt kind. A completed in-zone
     /// entry cannot acquire a host-retirement obligation while unregistering.
-    fn expected_exit_receipt(&self, entry: Option<EntryRef>) -> ExpectedExitReceipt {
+    fn expected_exit_receipt(
+        &self,
+        member: &dyn MemberExitCustody,
+        entry: Option<EntryRef>,
+    ) -> ExpectedExitReceipt {
+        match member.recorded_exit_kind(entry) {
+            MemberExitKind::InZone => return ExpectedExitReceipt::AlreadyExited,
+            MemberExitKind::HostRetiring | MemberExitKind::Stale => {
+                return ExpectedExitReceipt::Host;
+            }
+            MemberExitKind::Active => {}
+        }
         let Some(entry) = entry else {
             return ExpectedExitReceipt::Host;
         };
@@ -203,11 +306,6 @@ pub trait Lifecycle {
                 | EntryState::ExitingBorn
                 | EntryState::ExitingPublished,
             )) if generation == entry.generation() => ExpectedExitReceipt::Pool,
-            Some((generation, EntryState::ExitedInZone | EntryState::Reaped))
-                if generation == entry.generation() =>
-            {
-                ExpectedExitReceipt::AlreadyExited
-            }
             _ => ExpectedExitReceipt::Host,
         }
     }
@@ -468,6 +566,18 @@ pub struct ExitAdmission<'a> {
 }
 
 impl ExitAdmission<'_> {
+    /// Publish the member-owned exit kind before making the shared entry
+    /// reappable. Closing may observe the marker during the admitted window,
+    /// but claimed_count prevents settlement until this CAS completes.
+    pub fn commit_with_member(self, member: &dyn MemberExitCustody) -> Result<(), TransitionError> {
+        member.record_in_zone_commit(self.entry)?;
+        let result = self.commit();
+        if result.is_err() {
+            member.rollback_in_zone_commit();
+        }
+        result
+    }
+
     pub fn commit(mut self) -> Result<(), TransitionError> {
         let activity = self.page.activity();
         if let Some(activity) = activity {
