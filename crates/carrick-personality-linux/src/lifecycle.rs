@@ -1087,7 +1087,7 @@ fn serve_exit<'a>(
     if !native.release_current(record.reference) {
         return None;
     }
-    if admission.commit().is_err() {
+    if admission.commit_with_member(slot).is_err() {
         // Unreachable (checked above; only this thread leaves Born or
         // Published that way): the host must look at this process.
         native.task_state()?.mark_pending_host_work();

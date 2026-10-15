@@ -636,7 +636,7 @@ impl Kernel {
                         Some(membership) => owned
                             .control
                             .lifecycle()
-                            .retire_published_host_member(owned.entry, membership)
+                            .retire_published_host_member(owned.entry, &owned.control, membership)
                             .err()
                             .map(Some),
                         None => Some(None),

@@ -14,6 +14,20 @@ use carrick_personality_linux::entry::aarch64_child_vdso_identity;
 pub use carrick_personality_linux::lifecycle::*;
 pub use carrick_personality_linux::thread::{LifecycleThread, SYS_SET_ROBUST_LIST};
 
+#[cfg(test)]
+type RawExitBeforeCommitHook = Option<(usize, std::boxed::Box<dyn FnOnce() + Send>)>;
+#[cfg(test)]
+static RAW_EXIT_BEFORE_COMMIT_HOOK: crate::lock::SpinLock<RawExitBeforeCommitHook> =
+    crate::lock::SpinLock::new(None);
+
+#[cfg(test)]
+pub(super) fn install_raw_exit_before_commit_hook(
+    page: &ThreadLifecyclePage,
+    hook: std::boxed::Box<dyn FnOnce() + Send>,
+) {
+    *RAW_EXIT_BEFORE_COMMIT_HOOK.lock() = Some((page as *const _ as usize, hook));
+}
+
 impl<
     'a,
     F: Fn(u32) -> *mut u8,
@@ -376,6 +390,24 @@ impl<
             },
             record.id,
         );
+        #[cfg(test)]
+        if self.handoff.is_some() {
+            let page_address =
+                task.metadata
+                    .lifecycle_page
+                    .load(core::sync::atomic::Ordering::Acquire) as usize;
+            let hook = {
+                let mut slot = RAW_EXIT_BEFORE_COMMIT_HOOK.lock();
+                if slot.as_ref().is_some_and(|(page, _)| *page == page_address) {
+                    slot.take().map(|(_, hook)| hook)
+                } else {
+                    None
+                }
+            };
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         self.handoff.is_some()
     }
     fn run_next(&mut self, timeout_result: SyscallResult) -> (carrick_core::Served, SyscallResult) {
