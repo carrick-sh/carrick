@@ -89,6 +89,10 @@ struct State {
 }
 
 impl State {
+    fn purge_unregistered(&mut self) {
+        self.threads
+            .retain(|_, control| !control.graph_unregister_receipt());
+    }
     fn retain_thread(&mut self, control: ThreadControlLease) {
         self.threads.insert(
             (
@@ -160,13 +164,7 @@ impl CarrierLifecycleMappings {
             };
             publish_resolved(task, || {
                 let mut state = self.state.lock();
-                state.threads.retain(|_, control| {
-                    control.entry().is_none_or(|entry| {
-                        !matches!(control.lifecycle().state(entry.index()), Some((generation,
-                            carrick_el1_abi::EntryState::Reaped | carrick_el1_abi::EntryState::Revoked))
-                            if generation == entry.generation())
-                    })
-                });
+                state.purge_unregistered();
                 let page = self.map(&mut state, Arc::new(LifecycleBacking(control.lifecycle())))?;
                 let page_offset = lifecycle.page_address().raw() - lifecycle.backing_base().raw();
                 let base = self.map(&mut state, Arc::new(ControlBacking(control.clone())))?;
@@ -294,6 +292,16 @@ mod tests {
         state.retain_thread(first.clone());
         state.retain_thread(second.clone());
         assert_eq!(state.threads.len(), 2);
+        let custody = carrick_core::lifecycle::MemberControlCustody::retain(&*first).unwrap();
+        state.purge_unregistered();
+        assert_eq!(state.threads.len(), 2);
+        drop(custody);
+        state.purge_unregistered();
+        assert_eq!(
+            state.threads.len(),
+            1,
+            "only the unregister receipt releases a pin"
+        );
         first.lifecycle().close();
         assert_eq!(second.lifecycle().gate(), carrick_el1_abi::GateState::Open);
     }

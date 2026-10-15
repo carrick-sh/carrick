@@ -899,6 +899,19 @@ fn serve_clone<'a>(
         }
         return None;
     };
+    if child_slot
+        .reset_for_birth(blocked, clear_child_tid, entry)
+        .is_err()
+    {
+        native.free_record(record);
+        if page.unclaim(claimed).is_err() {
+            native.fail_lifecycle(NativeRunFailureReason::ClaimRollback);
+        }
+        if native.lifecycle_admission_settled().is_err() {
+            native.fail_lifecycle(NativeRunFailureReason::BirthSettlement);
+        }
+        return None;
+    }
     if !outputs.publish(identity.visible_tid, native) {
         native.free_record(record);
         if page.unclaim(claimed).is_err() {
@@ -932,7 +945,6 @@ fn serve_clone<'a>(
             visible_tid: identity.visible_tid,
         },
     );
-    child_slot.reset_for_birth(blocked, clear_child_tid, entry);
     let born = BornRecord {
         caller_task: binding.task.raw(),
         caller_serial: binding.thread_generation.raw(),

@@ -254,9 +254,14 @@ pub(in crate::kernel) struct PublishedAbiThread {
 
 impl ThreadIdentityPool {
     pub(super) fn revoke_unused(&self) {
-        self.entries
-            .lock()
-            .retain(|entry| entry.page().revoke(entry.entry).is_err());
+        self.entries.lock().retain(|entry| {
+            carrick_core::lifecycle::revoke_unborn_control(
+                &*entry.page(),
+                entry.entry,
+                &*entry.control,
+            )
+            .is_err()
+        });
     }
 
     fn take_adoption(
@@ -314,9 +319,14 @@ impl ThreadIdentityPool {
         let mut entries = self.entries.lock();
         // Host consumption and guest claim arbitrate on the same ABI CAS.
         // A guest-owned entry remains in custody until birth settlement.
-        let index = entries
-            .iter()
-            .position(|entry| entry.page().revoke(entry.entry).is_ok())?;
+        let index = entries.iter().position(|entry| {
+            carrick_core::lifecycle::revoke_unborn_control(
+                &*entry.page(),
+                entry.entry,
+                &*entry.control,
+            )
+            .is_ok()
+        })?;
         entries
             .remove(index)
             .map(|entry| (entry.identity, entry.control))
@@ -352,7 +362,15 @@ impl ThreadIdentityPool {
         let mut entries = self.entries.lock();
         let revoked = entries
             .iter()
-            .filter(|entry| entry.credit == uid && entry.page().revoke(entry.entry).is_ok())
+            .filter(|entry| {
+                entry.credit == uid
+                    && carrick_core::lifecycle::revoke_unborn_control(
+                        &*entry.page(),
+                        entry.entry,
+                        &*entry.control,
+                    )
+                    .is_ok()
+            })
             .count();
         entries.retain(|entry| entry.state() != EntryState::Revoked);
         revoked
@@ -1087,7 +1105,13 @@ impl Kernel {
         {
             let mut entries = record.thread_pool.entries.lock();
             entries.retain(|entry| {
-                entry.adoption.is_some() || entry.page().revoke(entry.entry).is_err()
+                entry.adoption.is_some()
+                    || carrick_core::lifecycle::revoke_unborn_control(
+                        &*entry.page(),
+                        entry.entry,
+                        &*entry.control,
+                    )
+                    .is_err()
             });
         }
         // Only a newly installed executable factory can reopen post-exec custody.
@@ -1246,7 +1270,9 @@ mod tests {
         let caller = caller.thread().key();
         let tid = LinuxTid::from_abi_positive(identity.tid as i32).unwrap();
         (entry, tid, move || {
-            control.reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry);
+            control
+                .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry)
+                .unwrap();
             page.thread_born().unwrap();
             page.record_born(
                 claim,
@@ -1761,7 +1787,9 @@ mod tests {
             pooled.control.clone()
         };
         let mut record_birth = Some(|| {
-            control.reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry);
+            control
+                .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry)
+                .unwrap();
             page.thread_born().unwrap();
             page.record_born(
                 claim,
@@ -2236,7 +2264,9 @@ mod tests {
                 .control
                 .clone()
         };
-        control.reset_for_birth(carrick_el1_abi::BlockedMask(0x400), 0x8000, entry);
+        control
+            .reset_for_birth(carrick_el1_abi::BlockedMask(0x400), 0x8000, entry)
+            .unwrap();
         if exhaust_ids {
             kernel.object_ids().exhaust_for_test();
         }
@@ -2374,7 +2404,9 @@ mod tests {
                 .control
                 .clone()
         };
-        control.reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry);
+        control
+            .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry)
+            .unwrap();
         page.thread_born().unwrap();
         page.record_born(
             claim,

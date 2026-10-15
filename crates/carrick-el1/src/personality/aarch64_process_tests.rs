@@ -633,6 +633,7 @@ fn test_fork_child_gets_distinct_root_and_x0_zero() {
     let mut native = ThreadCtx::ZERO;
     native.x[0] = 99;
     let parked = Aarch64ParkedContext::from_parts(native, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
     let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
         source,
         &fixture.task,
@@ -644,7 +645,6 @@ fn test_fork_child_gets_distinct_root_and_x0_zero() {
     )
     .unwrap();
 
-    let words = fixture.tables.live(&fixture.maintenance);
     let crossing = TestStockCrossing::new(&[
         0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
     ]);
@@ -714,6 +714,7 @@ fn plain_fork_owns_an_independent_fd_table() {
         fixture.address.mm.raw().get(),
         fixture.address.generation.raw().get(),
     );
+    let words = fixture.tables.live(&fixture.maintenance);
     let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
         source,
         &fixture.task,
@@ -725,7 +726,6 @@ fn plain_fork_owns_an_independent_fd_table() {
     )
     .unwrap();
 
-    let words = fixture.tables.live(&fixture.maintenance);
     let crossing = TestStockCrossing::new(&[
         0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
     ]);
@@ -813,6 +813,7 @@ fn test_fork_private_pages_cow_armed_in_both() {
     let mut native = ThreadCtx::ZERO;
     native.x[0] = 99;
     let parked = Aarch64ParkedContext::from_parts(native, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
     let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
         source,
         &fixture.task,
@@ -824,7 +825,6 @@ fn test_fork_private_pages_cow_armed_in_both() {
     )
     .unwrap();
 
-    let words = fixture.tables.live(&fixture.maintenance);
     let crossing = TestStockCrossing::new(&[
         0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
     ]);
@@ -900,6 +900,8 @@ fn test_wait4_consumes_zombie_once_with_exact_status() {
     let mut native = ThreadCtx::ZERO;
     native.x[0] = 99;
     let parked = Aarch64ParkedContext::from_parts(native, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let child_task = CurrentTask::new();
     let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
         source,
         &fixture.task,
@@ -911,7 +913,6 @@ fn test_wait4_consumes_zombie_once_with_exact_status() {
     )
     .unwrap();
 
-    let words = fixture.tables.live(&fixture.maintenance);
     let crossing = TestStockCrossing::new(&[
         0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
     ]);
@@ -950,7 +951,6 @@ fn test_wait4_consumes_zombie_once_with_exact_status() {
         .requeue_preempted(fixture.slot, parent_binding.record.id);
 
     // Now child exits with status 9
-    let child_task = CurrentTask::new();
     let child_source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
@@ -1062,6 +1062,8 @@ fn arm_child_wait_wake(in_ring: bool, sibling: bool) {
     let mut native = ThreadCtx::ZERO;
     native.x[0] = 99;
     let parked = Aarch64ParkedContext::from_parts(native, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let child_task = CurrentTask::new();
     let runtime = std::sync::Arc::new(
         NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
             source,
@@ -1074,12 +1076,11 @@ fn arm_child_wait_wake(in_ring: bool, sibling: bool) {
         )
         .unwrap(),
     );
-    let owner_registry = NativeProcessRegistry::new();
+    let owner_registry = Box::leak(Box::new(NativeProcessRegistry::new()));
     owner_registry
         .register_root(runtime.clone(), source, &fixture.task, fixture.address)
         .unwrap();
 
-    let words = fixture.tables.live(&fixture.maintenance);
     let crossing = TestStockCrossing::new(&[
         0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
     ]);
@@ -1117,7 +1118,9 @@ fn arm_child_wait_wake(in_ring: bool, sibling: bool) {
     let sibling_control = if sibling {
         fixture.zone.clear_current(fixture.slot);
         let control: &'static ThreadControlSlot = Box::leak(Box::new(ThreadControlSlot::new()));
-        control.reset_for_host_birth(carrick_el1_abi::BlockedMask(0));
+        control
+            .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
+            .unwrap();
         assert!(control.publish_visible_tid(43));
         control.publish_host_birth_identity(carrick_el1_abi::ExecutionBinding {
             task: carrick_el1_abi::EntryTaskKey::from_raw(43),
@@ -1175,7 +1178,7 @@ fn arm_child_wait_wake(in_ring: bool, sibling: bool) {
     {
         let mut parent_entry = runtime
             .enter_registered(
-                &owner_registry,
+                owner_registry,
                 source,
                 &fixture.task,
                 fixture.address,
@@ -1199,7 +1202,6 @@ fn arm_child_wait_wake(in_ring: bool, sibling: bool) {
     }
 
     // Now child exits with status 9
-    let child_task = CurrentTask::new();
     let child_source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
@@ -1287,7 +1289,7 @@ fn arm_child_wait_wake(in_ring: bool, sibling: bool) {
         let mut cpu = ResumeCpu {
             inner: crate::sched::FakeCpu::default(),
             runtime: &runtime,
-            registry: &owner_registry,
+            registry: owner_registry,
             source,
             task: &fixture.task,
             service: &mut service,
@@ -1345,7 +1347,7 @@ fn arm_child_wait_wake(in_ring: bool, sibling: bool) {
     // Second wait on the consumed child must fail with ECHILD (error code -10)
     let mut parent_entry = runtime
         .enter_registered(
-            &owner_registry,
+            owner_registry,
             source,
             &fixture.task,
             fixture.address,
@@ -1376,6 +1378,7 @@ fn test_stock_loan_requested_and_settled_once() {
     let mut native = ThreadCtx::ZERO;
     native.x[0] = 99;
     let parked = Aarch64ParkedContext::from_parts(native, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
     let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
         source,
         &fixture.task,
@@ -1387,7 +1390,6 @@ fn test_stock_loan_requested_and_settled_once() {
     )
     .unwrap();
 
-    let words = fixture.tables.live(&fixture.maintenance);
     let crossing = TestStockCrossing::new(&[
         0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
     ]);
@@ -1586,6 +1588,8 @@ pub fn with_native_file_fork(
         slot: fixture.slot,
     };
     let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let child_task = CurrentTask::new();
     let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
         source,
         &fixture.task,
@@ -1596,7 +1600,6 @@ pub fn with_native_file_fork(
         parked,
     )
     .unwrap();
-    let words = fixture.tables.live(&fixture.maintenance);
     let crossing = Crossing {
         stock: TestStockCrossing::new(&[
             0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
@@ -1634,7 +1637,6 @@ pub fn with_native_file_fork(
     fixture
         .zone
         .requeue_preempted(fixture.slot, parent.record.id);
-    let child_task = CurrentTask::new();
     activate(source, &child_task, &child);
     *crossing.stock.zone.lock().unwrap() = Some(fixture.zone);
     *crossing.stock.child.lock().unwrap() = Some((
@@ -1831,8 +1833,16 @@ fn imported_thread_with_identity(
     fixture: &Fixture,
     edit: impl FnOnce(&mut carrick_sched_core::ThreadIdentity),
 ) -> (&'static ThreadControlSlot, carrick_sched_core::RecordRef) {
+    imported_thread_on_control(fixture, Box::leak(Box::new(ThreadControlSlot::new())), edit)
+}
+
+#[cfg(test)]
+fn imported_thread_on_control(
+    fixture: &Fixture,
+    control: &'static ThreadControlSlot,
+    edit: impl FnOnce(&mut carrick_sched_core::ThreadIdentity),
+) -> (&'static ThreadControlSlot, carrick_sched_core::RecordRef) {
     use carrick_el1_abi::Lifecycle;
-    let control = Box::leak(Box::new(ThreadControlSlot::new()));
     let entry = fixture
         .page
         .stock(
@@ -1866,7 +1876,9 @@ fn imported_thread_with_identity(
         *fixture.zone.record(record).ctx_mut() =
             Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
     }
-    control.reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry);
+    control
+        .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry)
+        .unwrap();
     assert!(control.publish_visible_tid(42));
     control.bind_zone_record(reference);
     let claim = fixture.page.claim_any().unwrap();
@@ -2484,7 +2496,9 @@ fn host_born_sibling(fixture: &Fixture, visible_tid: u32) -> &'static ThreadCont
     let generation = u64::from(binding_tid - 30);
     let thread_generation = u64::from(binding_tid + 60);
     let control = Box::leak(Box::new(ThreadControlSlot::new()));
-    control.reset_for_host_birth(carrick_el1_abi::BlockedMask(0));
+    control
+        .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
+        .unwrap();
     assert!(control.publish_visible_tid(visible_tid));
     control.publish_host_birth_identity(carrick_el1_abi::ExecutionBinding {
         task: carrick_el1_abi::EntryTaskKey::from_raw(u64::from(binding_tid)),
@@ -2784,7 +2798,9 @@ fn arm_host_born_sibling_refuses_stale_or_foreign_binding() {
             Defect::ForeignPage => page = Box::leak(Box::new(ThreadLifecyclePage::new())),
             Defect::ForeignControl => {
                 let foreign = Box::leak(Box::new(ThreadControlSlot::new()));
-                foreign.reset_for_host_birth(carrick_el1_abi::BlockedMask(0));
+                foreign
+                    .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
+                    .unwrap();
                 assert!(foreign.publish_visible_tid(42));
                 entered = foreign;
             }
@@ -2935,11 +2951,12 @@ fn arm_raw_exit_decline_after_membership_reservation_restores_live() {
     let route = arm_call(fixture, control, &mut service, &mut frame).unwrap();
     assert_eq!(
         route,
-        carrick_personality_linux::dispatch::CompletionRoute::Forward
+        carrick_personality_linux::dispatch::CompletionRoute::HostCustody
     );
     assert_eq!(fixture.page.live(), live);
     fixture.zone.clear_current(fixture.slot);
     assert_eq!(fixture.page.state(entry.index()), state);
+    assert!(leader_sees_thread(fixture, &mut service, 42));
 }
 
 #[test]
@@ -3105,10 +3122,20 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
 }
 
 #[cfg(test)]
-fn arm_pool_raw_exit_closing_at_commit_boundary(recycle_entry: bool) {
+fn arm_pool_raw_exit_closing_at_commit_boundary(
+    recycle_entry: bool,
+    recycle_control: Option<bool>,
+) {
     use carrick_el1_abi::Lifecycle;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
-    let (control, record) = imported_thread(fixture);
+    let arena: &'static carrick_kernel::kernel::objects::TestThreadControlArena = Box::leak(
+        Box::new(carrick_kernel::kernel::objects::TestThreadControlArena::try_new().unwrap()),
+    );
+    let lease = arena.allocate(42).unwrap();
+    // SAFETY: the arena and fixture outlive the call; the allocator owns the
+    // backing even when its final host lease returns the slot to the free list.
+    let control = unsafe { &*(lease.slot_address().raw() as *const ThreadControlSlot) };
+    let (control, record) = imported_thread_on_control(fixture, control, |_| {});
     let mut worker_service = fixture.process_service();
     fixture
         .enter(
@@ -3170,6 +3197,23 @@ fn arm_pool_raw_exit_closing_at_commit_boundary(recycle_entry: bool) {
                 .unwrap();
             assert_ne!(replacement.generation(), entry.generation());
         }
+        if let Some(rebind) = recycle_control {
+            drop(lease);
+            let replacement = arena.allocate(99).unwrap();
+            if rebind {
+                // E2 belongs to the new allocation's unpublished birth, not
+                // the old member's lifecycle publication in this graph.
+                replacement
+                    .reset_for_birth(
+                        carrick_el1_abi::BlockedMask(0),
+                        0,
+                        carrick_el1_abi::EntryRef::new(1, 1),
+                    )
+                    .unwrap();
+            }
+            // Keep the newly allocated incarnation live through exit_group.
+            core::mem::forget(replacement);
+        }
         fixture.zone.clear_current(fixture.slot);
         run_as_leader(fixture);
         let mut frame = carrick_el1_abi::TrapFrame::default();
@@ -3178,6 +3222,11 @@ fn arm_pool_raw_exit_closing_at_commit_boundary(recycle_entry: bool) {
         assert_eq!(
             arm_call(fixture, fixture.control, service, &mut frame).unwrap(),
             carrick_personality_linux::dispatch::CompletionRoute::Suspended
+        );
+        assert_eq!(
+            service.crossing.root_exits.load(Ordering::Acquire),
+            1,
+            "exit_group must settle before the old member unregisters"
         );
         run_as(fixture, 42, 12, 102, control);
     });
@@ -3188,6 +3237,15 @@ fn arm_pool_raw_exit_closing_at_commit_boundary(recycle_entry: bool) {
         arm_call(fixture, control, &mut worker_service, &mut frame).unwrap(),
         carrick_personality_linux::dispatch::CompletionRoute::Suspended
     );
+    if recycle_control.is_some() {
+        let recycled = arena.allocate(100).unwrap();
+        assert_eq!(
+            recycled.slot_address().raw(),
+            control as *const _ as usize,
+            "unregister must return the old slot to allocation"
+        );
+        assert!(recycled.entry().is_none());
+    }
     assert!(registry().for_record(fixture.zone, record).is_none());
     assert_eq!(root_service.crossing.root_exits.load(Ordering::Acquire), 1);
     assert_eq!(
@@ -3200,25 +3258,20 @@ fn arm_pool_raw_exit_closing_at_commit_boundary(recycle_entry: bool) {
 }
 
 #[test]
-fn arm_adopted_pool_exit_in_progress_settles_group_once() {
-    arm_pool_raw_exit_closing_at_commit_boundary(false);
-}
-
-#[test]
 fn arm_pool_raw_exit_committed_before_unregister_owes_no_host_receipt() {
-    arm_pool_raw_exit_closing_at_commit_boundary(false);
+    arm_pool_raw_exit_closing_at_commit_boundary(false, None);
 }
 
 #[test]
 fn arm_raw_exit_reaped_and_replenished_before_closing_owes_no_host_receipt() {
-    arm_pool_raw_exit_closing_at_commit_boundary(true);
+    arm_pool_raw_exit_closing_at_commit_boundary(true, None);
 }
 
 #[test]
 fn arm_host_retired_pool_member_waits_for_exact_host_receipt() {
     use carrick_el1_abi::Lifecycle;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
-    let (control, record) = imported_thread(fixture);
+    let (control, _record) = imported_thread(fixture);
     let mut service = fixture.process_service();
     fixture
         .enter(
@@ -3228,6 +3281,13 @@ fn arm_host_retired_pool_member_waits_for_exact_host_receipt() {
             |_| (),
         )
         .unwrap();
+    let entry = control.entry().unwrap();
+    fixture.page.publish(entry).unwrap();
+    let retirement = fixture.page.reserve_nonfinal_exit().unwrap();
+    fixture
+        .page
+        .retire_published_host_member(entry, control, retirement)
+        .unwrap();
     let mut frame = carrick_el1_abi::TrapFrame::default();
     frame.x[0] = 7;
     frame.x[8] = 94;
@@ -3235,14 +3295,11 @@ fn arm_host_retired_pool_member_waits_for_exact_host_receipt() {
         arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap(),
         carrick_personality_linux::dispatch::CompletionRoute::Suspended
     );
-    assert!(fixture.zone.record(record.id).is_cancelled());
-    let entry = control.entry().unwrap();
-    fixture.page.publish(entry).unwrap();
-    let retirement = fixture.page.reserve_cancelled_member_exit().unwrap();
-    fixture
-        .page
-        .retire_published_host_member(entry, control, retirement)
-        .unwrap();
+    assert_eq!(
+        service.crossing.root_exits.load(Ordering::Acquire),
+        0,
+        "host retirement before Closing still owes its exact receipt"
+    );
     assert_eq!(fixture.page.live(), 0);
     assert!(matches!(
         wake_closing_root(fixture, &mut service),
@@ -3798,4 +3855,81 @@ fn arm_unadmitted_thread_runs_ordinary_calls_and_refuses_owner_calls() {
         carrick_el1_abi::Action::ServedWithWork
     );
     assert_eq!(frame.x[0] as i64, -38);
+}
+
+#[test]
+fn arm_raw_exit_control_reallocation_none_before_closing() {
+    arm_pool_raw_exit_closing_at_commit_boundary(true, Some(false));
+}
+#[test]
+fn arm_raw_exit_control_reallocation_rebound_before_closing() {
+    arm_pool_raw_exit_closing_at_commit_boundary(true, Some(true));
+}
+
+#[cfg(test)]
+fn arm_exit_group_under_gate(state: carrick_el1_abi::GateState) {
+    use carrick_el1_abi::Lifecycle;
+    {
+        let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+        let mut service = fixture.process_service();
+        fixture
+            .enter(
+                fixture.control,
+                fixture_ttbr0(fixture),
+                &mut service,
+                |_| (),
+            )
+            .unwrap();
+        fixture.page.close_for_fork().unwrap();
+        match state {
+            carrick_el1_abi::GateState::AwaitingExecBinding => {
+                fixture.page.await_exec_binding().unwrap()
+            }
+            carrick_el1_abi::GateState::Closed => fixture.page.close(),
+            _ => {}
+        }
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[0] = 7;
+        frame.x[8] = 94;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            arm_call(fixture, fixture.control, &mut service, &mut frame)
+        }));
+        assert!(
+            outcome.is_ok(),
+            "exit_group must not quarantine under {state:?}: {:?}",
+            outcome
+                .as_ref()
+                .err()
+                .and_then(|failure| failure
+                    .downcast_ref::<super::native_run_failure::NativeRunFailurePanic>())
+        );
+        assert_eq!(
+            outcome.unwrap().unwrap(),
+            carrick_personality_linux::dispatch::CompletionRoute::Suspended,
+            "{state:?}"
+        );
+        assert_eq!(
+            service.crossing.root_exits.load(Ordering::Acquire),
+            1,
+            "{state:?}"
+        );
+        assert_eq!(
+            service.crossing.root_exit_status.load(Ordering::Acquire),
+            7,
+            "{state:?}"
+        );
+    }
+}
+
+#[test]
+fn arm_exit_group_under_fork_closing() {
+    arm_exit_group_under_gate(carrick_el1_abi::GateState::ForkClosing);
+}
+#[test]
+fn arm_exit_group_under_awaiting_exec_binding() {
+    arm_exit_group_under_gate(carrick_el1_abi::GateState::AwaitingExecBinding);
+}
+#[test]
+fn arm_exit_group_under_host_only_closed() {
+    arm_exit_group_under_gate(carrick_el1_abi::GateState::Closed);
 }

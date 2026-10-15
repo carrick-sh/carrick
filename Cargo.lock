@@ -497,6 +497,7 @@ dependencies = [
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-inotify-core",
+ "carrick-kernel",
  "carrick-mem",
  "carrick-mmu-core",
  "carrick-personality-linux",

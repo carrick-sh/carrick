@@ -368,13 +368,13 @@ impl NativeThreadIdentity {
     }
 }
 
-#[derive(::core::clone::Clone, ::core::marker::Copy)]
+#[derive(::core::clone::Clone)]
 pub struct NativeMember<'a, C: ProcessContext> {
     thread: NativeThreadIdentity,
     process: TaskKey,
     zone: &'a ZoneTables<C>,
     record: RecordRef,
-    control: &'a ThreadControlSlot,
+    control: Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
     expected_host: Option<carrick_core::terminal::HostThreadRetirementReceipt>,
 }
 impl<C: ProcessContext> ExitMember for NativeMember<'_, C> {
@@ -382,7 +382,19 @@ impl<C: ProcessContext> ExitMember for NativeMember<'_, C> {
         self.process
     }
 }
+fn retain_member_control(
+    control: &ThreadControlSlot,
+) -> Result<
+    Arc<carrick_core::lifecycle::MemberControlCustody<'_, ThreadControlSlot>>,
+    NativeProcessError,
+> {
+    carrick_core::lifecycle::MemberControlCustody::retain(control)
+        .map(Arc::new)
+        .map_err(|_| NativeProcessError::Stale)
+}
 pub struct NativeResources<'a, M, C: ProcessContext> {
+    terminal: carrick_core::terminal::ProcessExitCustody,
+    _control_custody: carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>,
     zone: &'a ZoneTables<C>,
     record: RecordRef,
     control: &'a ThreadControlSlot,
@@ -462,12 +474,12 @@ struct ExitWakeCustody {
 enum OutstandingExitReceipt<'a> {
     Pool {
         entry: carrick_el1_abi::EntryRef,
-        control: &'a ThreadControlSlot,
+        control: Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
         expected_host: Option<carrick_core::terminal::HostThreadRetirementReceipt>,
     },
     Adopted {
         binding: ExecutionBinding,
-        control: &'a ThreadControlSlot,
+        control: Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
     },
     HostBorn {
         identity: carrick_core::terminal::HostThreadRetirementReceipt,
@@ -510,7 +522,7 @@ impl PendingExit<'_> {
                     expected_host,
                 } => pool.push(carrick_core::terminal::PoolMemberObservation {
                     entry: *entry,
-                    member: *control,
+                    member: control.control(),
                     expected_host: *expected_host,
                 }),
                 OutstandingExitReceipt::Adopted { binding, control } => {
@@ -518,7 +530,7 @@ impl PendingExit<'_> {
                         binding: carrick_core::terminal::HostThreadRetirementReceipt::from_binding(
                             *binding,
                         ),
-                        member: *control,
+                        member: control.control(),
                     });
                 }
                 OutstandingExitReceipt::HostBorn { identity, index } => {
@@ -692,7 +704,7 @@ struct NativeOwnerMember<'a, M: Clone, C: ProcessContext> {
     process: TaskKey,
     address: AddressContext<RootGpa>,
     record: RecordRef,
-    control: &'a ThreadControlSlot,
+    control: Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
 }
 
 impl<'a, M: Clone, C: ProcessContext> Clone for NativeOwnerMember<'a, M, C> {
@@ -702,7 +714,7 @@ impl<'a, M: Clone, C: ProcessContext> Clone for NativeOwnerMember<'a, M, C> {
             process: self.process,
             address: self.address,
             record: self.record,
-            control: self.control,
+            control: self.control.clone(),
         }
     }
 }
@@ -849,10 +861,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                                         (member.control.entry().is_none()
                                             && carrick_el1_abi::Lifecycle::expected_exit_receipt(
                                             page,
-                                            member.control,
+                                            member.control.control(),
                                             member.control.entry(),
                                         ) == carrick_core::lifecycle::ExpectedExitReceipt::Host)
-                                            .then_some((binding, member.control, member.record))
+                                            .then_some((binding, member.control.control(), member.record))
                                     })
                             })
                             .flatten()
@@ -946,7 +958,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 process,
                 address,
                 record: owned.record,
-                control,
+                control: retain_member_control(control)?,
             },
         );
         state.groups.insert(group_key, (runtime.clone(), process));
@@ -1006,7 +1018,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         let Some(member_index) = resources
             .members
             .iter()
-            .position(|member| core::ptr::eq(member.control, control))
+            .position(|member| core::ptr::eq(member.control.control(), control))
         else {
             return Ok(None);
         };
@@ -1051,7 +1063,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             let old_binding = old_key.binding();
             if pending.outstanding.iter().any(|receipt| {
                 matches!(receipt, OutstandingExitReceipt::Adopted { binding, control: expected }
-                    if *binding == old_binding && core::ptr::eq(*expected, control))
+                    if *binding == old_binding && core::ptr::eq(expected.control(), control))
             }) && !pending.members.rehome_host(
                 carrick_core::terminal::HostThreadRetirementReceipt::from_binding(old_binding),
                 carrick_core::terminal::HostThreadRetirementReceipt::from_binding(key.binding()),
@@ -1064,7 +1076,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     expected_host,
                     ..
                 } = receipt
-                    && core::ptr::eq(*expected, control)
+                    && core::ptr::eq(expected.control(), control)
                 {
                     *expected_host = Some(
                         carrick_core::terminal::HostThreadRetirementReceipt::from_binding(
@@ -1077,7 +1089,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     control: expected,
                 } = receipt
                     && *binding == old_binding
-                    && core::ptr::eq(*expected, control)
+                    && core::ptr::eq(expected.control(), control)
                 {
                     *binding = key.binding();
                 }
@@ -1225,7 +1237,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 process: child.child,
                 address: child.address,
                 record: child.record,
-                control,
+                control: retain_member_control(control)?,
             },
         );
         state
@@ -1335,7 +1347,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     .iter()
                     .find(|member| member.thread.id() == key.task.id());
                 if imported.is_some_and(|member| {
-                    !core::ptr::eq(member.control, control)
+                    !core::ptr::eq(member.control.control(), control)
                         || (member.record != source.zone.record_ref(record)
                             && signal_record_exists(source.zone, member.record))
                 }) {
@@ -1367,7 +1379,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     process,
                     zone: source.zone,
                     record: source.zone.record_ref(record),
-                    control,
+                    control: retain_member_control(control)?,
                     expected_host: Some(
                         carrick_core::terminal::HostThreadRetirementReceipt::from_binding(binding),
                     ),
@@ -1382,7 +1394,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 process,
                 address,
                 record: source.zone.record_ref(record),
-                control,
+                control: retain_member_control(control)?,
             },
         );
         state
@@ -1538,7 +1550,7 @@ impl IssuedHostThread {
             .find(|member| member.thread.id() == self.key.id)
         {
             if existing.thread != NativeThreadIdentity::Issued(self.key)
-                || !core::ptr::eq(existing.control, control)
+                || !core::ptr::eq(existing.control.control(), control)
                 || (existing.record != self.record
                     && signal_record_exists(source.zone, existing.record))
             {
@@ -1546,11 +1558,9 @@ impl IssuedHostThread {
             }
             return Ok(true);
         }
-        if resources
-            .members
-            .iter()
-            .any(|member| core::ptr::eq(member.control, control) || member.record == self.record)
-            || resources.members.len() >= resources.page.live() as usize
+        if resources.members.iter().any(|member| {
+            core::ptr::eq(member.control.control(), control) || member.record == self.record
+        }) || resources.members.len() >= resources.page.live() as usize
             || row.credentials_for(self.visible_tid).is_ok()
         {
             return Err(NativeProcessError::Stale);
@@ -1716,8 +1726,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                     process,
                     zone,
                     record,
-                    control,
-                    expected_host: member_binding.issued().then(|| {
+                    control: retain_member_control(control)?,
+                    expected_host: Some({
                         carrick_core::terminal::HostThreadRetirementReceipt::from_binding(
                             member_binding,
                         )
@@ -1883,11 +1893,16 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             process: key,
             zone: source.zone,
             record: source.zone.record_ref(record),
-            control,
-            expected_host: None,
+            control: retain_member_control(control)?,
+            expected_host: Some(
+                carrick_core::terminal::HostThreadRetirementReceipt::from_binding(binding),
+            ),
         }];
-        members.extend(imported.iter().map(|(member, _, _)| *member));
+        members.extend(imported.iter().map(|(member, _, _)| member.clone()));
         let resources = NativeResources {
+            terminal: Default::default(),
+            _control_custody: carrick_core::lifecycle::MemberControlCustody::retain(control)
+                .map_err(|_| NativeProcessError::Stale)?,
             zone: source.zone,
             record: source.zone.record_ref(record),
             control,
@@ -2036,6 +2051,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             binding,
             record: source.zone.record_ref(record),
             control,
+            _control_custody: carrick_core::lifecycle::MemberControlCustody::retain(control)
+                .map_err(|_| NativeProcessError::Stale)?,
             key,
             caller_address,
             words,
@@ -2074,6 +2091,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             binding,
             record,
             control: member_control,
+            _control_custody: carrick_core::lifecycle::MemberControlCustody::retain(member_control)
+                .map_err(|_| NativeProcessError::Stale)?,
             key: process,
             caller_address: address,
             words,
@@ -2152,7 +2171,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .members
             .iter()
             .find(|m| m.thread == member_key.task)
-            .map(|m| m.control)
+            .map(|m| m.control.control())
             .ok_or(NativeProcessError::Stale)?;
         if current.metadata.control_slot.load(Ordering::Acquire)
             != member_control as *const _ as u64
@@ -2265,6 +2284,7 @@ pub struct NativeProcessEntry<
     binding: ExecutionBinding,
     record: RecordRef,
     control: &'a ThreadControlSlot,
+    _control_custody: carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>,
     key: TaskKey,
     caller_address: AddressContext<RootGpa>,
     words: C,
@@ -3467,7 +3487,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     carrick_core::terminal::Process,
                     carrick_core::terminal::Live,
                 >::begin_exit(
-                    page, self.key, address, wait_status.to_termination_status()
+                    &mut graph
+                        .owner
+                        .task_mut(self.key)
+                        .map_err(|_| NativeProcessError::Stale)?
+                        .native_mut()
+                        .resources_mut()
+                        .terminal,
+                    page,
+                    self.key,
+                    address,
+                    wait_status.to_termination_status(),
                 )
                 .map_err(|_| NativeProcessError::Quarantined)?;
                 if let Some(state) = registry_state.as_deref() {
@@ -3492,7 +3522,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .resources()
                     .members
                     .iter()
-                    .map(|member| (member.control, member.expected_host))
+                    .map(|member| (member.control.control(), member.expected_host))
                     .collect();
                 for (control, expected_host) in graph_controls {
                     let Some(entry) = control.entry() else {
@@ -3510,7 +3540,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     pool.push(entry);
                     outstanding.push(OutstandingExitReceipt::Pool {
                         entry,
-                        control,
+                        control: retain_member_control(control)?,
                         expected_host,
                     });
                 }
@@ -3540,17 +3570,30 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         pool.push(entry);
                         outstanding.push(OutstandingExitReceipt::Pool {
                             entry,
-                            control,
-                            expected_host: None,
+                            control: retain_member_control(control)?,
+                            expected_host: control.zone_record().and_then(|record| {
+                                self.source.zone.live(record).and_then(|owned| {
+                                    let identity = owned.identity();
+                                    carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+                                        carrick_core_abi::EntryTaskKey::from_raw(identity.tid),
+                                        carrick_core_abi::EntryGeneration::from_raw(
+                                            identity.generation,
+                                        ),
+                                        carrick_core_abi::EntryThreadGeneration::from_raw(
+                                            identity.serial,
+                                        ),
+                                    )
+                                })
+                            }),
                         });
                     }
                 }
-                outstanding.extend(adopted.iter().map(|(binding, control, _)| {
-                    OutstandingExitReceipt::Adopted {
+                for (binding, control, _) in &adopted {
+                    outstanding.push(OutstandingExitReceipt::Adopted {
                         binding: *binding,
-                        control,
-                    }
-                }));
+                        control: retain_member_control(control)?,
+                    });
+                }
                 for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
                     let Some(identity) = page.host_birth_identity(index) else {
                         continue;
@@ -4078,7 +4121,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let claim = page
                 .claim(lifecycle_entry)
                 .map_err(|_| NativeProcessError::Busy)?;
-            control.reset_for_birth(blocked, 0, lifecycle_entry);
+            if control
+                .reset_for_birth(blocked, 0, lifecycle_entry)
+                .is_err()
+            {
+                page.unclaim(claim)
+                    .map_err(|_| NativeProcessError::Quarantined)?;
+                return Err(NativeProcessError::Busy);
+            }
             if !control.publish_visible_tid(visible.get()) {
                 page.unclaim(claim)
                     .map_err(|_| NativeProcessError::Quarantined)?;
@@ -4154,6 +4204,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // SAFETY: this exact newly allocated record remains Free and unpublished.
         unsafe { *self.source.zone.record(record).ctx_mut() = child_words };
         let resources = NativeResources {
+            terminal: Default::default(),
+            _control_custody: carrick_core::lifecycle::MemberControlCustody::retain(control)
+                .map_err(|_| NativeProcessError::Stale)?,
             zone: self.source.zone,
             record: self.source.zone.record_ref(record),
             control,
@@ -4163,8 +4216,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 process: child_key,
                 zone: self.source.zone,
                 record: self.source.zone.record_ref(record),
-                control,
-                expected_host: None,
+                control: retain_member_control(control)?,
+                expected_host: carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+                    carrick_core_abi::EntryTaskKey::from_raw(thread.tid),
+                    carrick_core_abi::EntryGeneration::from_raw(thread.generation),
+                    carrick_core_abi::EntryThreadGeneration::from_raw(thread.serial),
+                ),
             }],
             mm: self.service.prepared_mm(&prepared),
             address,
@@ -4533,7 +4590,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             task.native_mut().resources_mut().members.retain(|member| {
                 let matches_caller = tid == self.calling_tid
                     && (member.record == self.record
-                        || core::ptr::eq(member.control, self.control));
+                        || core::ptr::eq(member.control.control(), self.control));
                 if matches_caller {
                     retired.push(member.record);
                     false
@@ -6248,7 +6305,10 @@ mod tests {
             assert!(!ptr.is_null());
             Box::from_raw(ptr)
         };
-        let registry = NativeProcessRegistry::<AddressContext<RootGpa>, ParkedContextWords>::new();
+        let registry = Box::leak(Box::new(NativeProcessRegistry::<
+            AddressContext<RootGpa>,
+            ParkedContextWords,
+        >::new()));
         let pages = [ThreadLifecyclePage::new(), ThreadLifecyclePage::new()];
         let controls = [ThreadControlSlot::new(), ThreadControlSlot::new()];
         let child_pages = [ThreadLifecyclePage::new(), ThreadLifecyclePage::new()];
@@ -6354,7 +6414,7 @@ mod tests {
             assert!(Arc::ptr_eq(&runtime, &runtimes[index]));
             let mut entry = runtime
                 .enter_registered(
-                    &registry,
+                    registry,
                     source,
                     task,
                     addresses[index],
@@ -6377,7 +6437,7 @@ mod tests {
             let runtime = registry.for_entry(source, task, addresses[index]).unwrap();
             let mut entry = runtime
                 .enter_registered(
-                    &registry,
+                    registry,
                     source,
                     task,
                     addresses[index],
@@ -6431,7 +6491,10 @@ mod tests {
             assert!(!ptr.is_null());
             Box::from_raw(ptr)
         };
-        let registry = NativeProcessRegistry::<AddressContext<RootGpa>, ParkedContextWords>::new();
+        let registry = Box::leak(Box::new(NativeProcessRegistry::<
+            AddressContext<RootGpa>,
+            ParkedContextWords,
+        >::new()));
         let page = ThreadLifecyclePage::new();
         let leader_control = ThreadControlSlot::new();
         let thread_control = ThreadControlSlot::new();
@@ -6470,6 +6533,7 @@ mod tests {
         )
         .unwrap();
         let source = BornInZoneSource { zone: &zone, slot };
+        let thread = CurrentTask::new();
         let runtime = Arc::new(
             NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
@@ -6499,7 +6563,9 @@ mod tests {
             .unwrap();
         page.bind_control_address(entry, &thread_control as *const _ as u64)
             .unwrap();
-        thread_control.reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry);
+        thread_control
+            .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry)
+            .unwrap();
         assert!(thread_control.publish_visible_tid(43));
         let claim = page.claim(entry).unwrap();
         page.record_born(
@@ -6530,7 +6596,6 @@ mod tests {
         thread_control.bind_zone_record(zone.record_ref(record));
         zone.requeue_preempted(slot, record);
         assert_eq!(zone.switch_in_full(slot).unwrap().record, record);
-        let thread = CurrentTask::new();
         thread.set(carrick_el1_abi::El1TaskId::from_linux_tid(43), 13, 5);
         thread.mm.key.store(1, Ordering::Release);
         thread.mm.thread_generation.store(103, Ordering::Release);
@@ -6557,7 +6622,7 @@ mod tests {
         };
         let mut process = runtime
             .enter_registered(
-                &registry,
+                registry,
                 source,
                 &thread,
                 address,
@@ -8277,6 +8342,9 @@ mod tests {
         let source = BornInZoneSource { zone: &zone, slot };
         assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
         page.release_live(1).unwrap(); // fixture settles its bootstrap census
+        let grandchild_page = Box::new(ThreadLifecyclePage::new());
+        let grandchild_controls = core::array::from_fn::<_, 9, _>(|_| ThreadControlSlot::new());
+        let peer_task = CurrentTask::new();
         let runtime =
             NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
@@ -8386,8 +8454,6 @@ mod tests {
             .clone()
             .unwrap();
         // The grandchild owns a distinct lifecycle page and runs on CPU 1.
-        let grandchild_page = Box::new(ThreadLifecyclePage::new());
-        let grandchild_controls = core::array::from_fn::<_, 9, _>(|_| ThreadControlSlot::new());
         let mut parent_service = Physical {
             zone: &zone,
             page: &grandchild_page,
@@ -8442,7 +8508,6 @@ mod tests {
             zone: &zone,
             slot: peer_slot,
         };
-        let peer_task = CurrentTask::new();
         activate(&runtime, peer_source, &peer_task, child);
         let before = root_channel.generation.generation();
         let parent_before = parent_channel.generation.generation();
@@ -8835,6 +8900,9 @@ mod tests {
             let source = BornInZoneSource { zone: &zone, slot };
             assert_eq!(page.thread_born(), Some(2)); // retained legacy bootstrap census
             page.release_live(1).unwrap(); // fixture settles its bootstrap census
+            let descendant_pages = [ThreadLifecyclePage::new(), ThreadLifecyclePage::new()];
+            let descendant_controls: [[ThreadControlSlot; 9]; 2] =
+                core::array::from_fn(|_| core::array::from_fn(|_| ThreadControlSlot::new()));
             let runtime =
                 NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                     source,
@@ -8859,9 +8927,6 @@ mod tests {
                 id: carrick_personality_linux::identity::task_id_from_linux_pid(41).unwrap(),
                 serial: TaskSerial::from_raw_u64(11).unwrap(),
             };
-            let descendant_pages = [ThreadLifecyclePage::new(), ThreadLifecyclePage::new()];
-            let descendant_controls: [[ThreadControlSlot; 9]; 2] =
-                core::array::from_fn(|_| core::array::from_fn(|_| ThreadControlSlot::new()));
             let mut actors = vec![parent];
             for depth in 0..depth_count {
                 let current = *actors.last().unwrap();
@@ -9809,7 +9874,9 @@ mod tests {
         child_page
             .bind_control_address(peer_entry, &child_controls[2] as *const _ as u64)
             .unwrap();
-        child_controls[2].reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, peer_entry);
+        child_controls[2]
+            .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, peer_entry)
+            .unwrap();
         assert!(child_controls[2].publish_visible_tid(987));
         use carrick_el1_abi::Lifecycle;
         child_page.thread_born().unwrap();
