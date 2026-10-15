@@ -13,7 +13,7 @@ use std::fs::File;
 use std::os::fd::{AsRawFd, RawFd};
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use carrick_guest_mem::{HostVa, SharedFutexLocation};
@@ -104,24 +104,53 @@ impl SharedBufferInner {
 
     fn read_into(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SharedBufferError> {
         self.check_range(offset, buf.len())?;
-        for (index, byte) in buf.iter_mut().enumerate() {
-            // SAFETY: range checked above; AtomicU8 has alignment 1 and the
-            // mapping remains live while this inner Arc is held.
-            let source = unsafe { &*self.ptr.as_ptr().add(offset + index).cast::<AtomicU8>() };
-            *byte = source.load(Ordering::Relaxed);
+        let mut copied = 0;
+        while copied < buf.len() {
+            let position = offset + copied;
+            let word_offset = position & !3;
+            let byte_in_word = position & 3;
+            let count = (4 - byte_in_word).min(buf.len() - copied);
+            let word = self
+                .word_at(word_offset)
+                .load(Ordering::Relaxed)
+                .to_ne_bytes();
+            buf[copied..copied + count].copy_from_slice(&word[byte_in_word..byte_in_word + count]);
+            copied += count;
         }
         Ok(buf.len())
     }
 
     fn write_from(&self, offset: usize, data: &[u8]) -> Result<usize, SharedBufferError> {
         self.check_range(offset, data.len())?;
-        for (index, byte) in data.iter().enumerate() {
-            // SAFETY: range checked above; AtomicU8 has alignment 1 and the
-            // mapping remains live while this inner Arc is held.
-            let target = unsafe { &*self.ptr.as_ptr().add(offset + index).cast::<AtomicU8>() };
-            target.store(*byte, Ordering::Relaxed);
+        let mut copied = 0;
+        while copied < data.len() {
+            let position = offset + copied;
+            let word_offset = position & !3;
+            let byte_in_word = position & 3;
+            let count = (4 - byte_in_word).min(data.len() - copied);
+            let word = self.word_at(word_offset);
+            if byte_in_word == 0 && count == 4 {
+                let mut bytes = [0; 4];
+                bytes.copy_from_slice(&data[copied..copied + 4]);
+                word.store(u32::from_ne_bytes(bytes), Ordering::Relaxed);
+            } else {
+                let _ = word.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                    let mut bytes = old.to_ne_bytes();
+                    bytes[byte_in_word..byte_in_word + count]
+                        .copy_from_slice(&data[copied..copied + count]);
+                    Some(u32::from_ne_bytes(bytes))
+                });
+            }
+            copied += count;
         }
         Ok(data.len())
+    }
+
+    fn word_at(&self, aligned_offset: usize) -> &AtomicU32 {
+        // SAFETY: callers checked their byte range; the buffer is page-sized,
+        // so the containing word is mapped. The base and offset are aligned,
+        // and every safe host access uses the same atomic width.
+        unsafe { &*self.ptr.as_ptr().add(aligned_offset).cast::<AtomicU32>() }
     }
 
     fn bind_generation(&self) -> u64 {
@@ -189,12 +218,12 @@ impl SharedBuffer {
         self.inner.file.as_raw_fd()
     }
 
-    /// Copy bytes from shared memory using atomic byte loads.
+    /// Copy bytes from shared memory using 32-bit atomic loads.
     pub fn read_into(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SharedBufferError> {
         self.inner.read_into(offset, buf)
     }
 
-    /// Copy bytes into shared memory using atomic byte stores.
+    /// Copy bytes into shared memory using 32-bit atomic writes.
     pub fn write_from(&self, offset: usize, data: &[u8]) -> Result<usize, SharedBufferError> {
         self.inner.write_from(offset, data)
     }
@@ -368,13 +397,13 @@ impl SharedBufferLease {
         Ok(())
     }
 
-    /// Read bytes into `buf` with atomic byte loads.
+    /// Read bytes into `buf` with 32-bit atomic loads.
     pub fn read_into(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SharedBufferError> {
         self.validate_access()?;
         self.inner.read_into(offset, buf)
     }
 
-    /// Write bytes from `data` with atomic byte stores.
+    /// Write bytes from `data` with 32-bit atomic writes.
     pub fn write_from(&self, offset: usize, data: &[u8]) -> Result<usize, SharedBufferError> {
         self.validate_access()?;
         self.inner.write_from(offset, data)
@@ -478,17 +507,7 @@ pub struct SharedAtomicU32 {
 impl SharedAtomicU32 {
     fn word(&self) -> Result<&AtomicU32, SharedBufferError> {
         self.lease.validate_access()?;
-        // SAFETY: atomic_u32 checked range and 4-byte alignment at creation;
-        // the lease keeps the mapping alive for this operation.
-        Ok(unsafe {
-            &*self
-                .lease
-                .inner
-                .ptr
-                .as_ptr()
-                .add(self.offset)
-                .cast::<AtomicU32>()
-        })
+        Ok(self.lease.inner.word_at(self.offset))
     }
 
     pub fn load(&self, ordering: Ordering) -> Result<u32, SharedBufferError> {
@@ -551,6 +570,16 @@ mod tests {
             lease.write_from(buf.len() - 5, &out_buf),
             Err(SharedBufferError::OutOfBounds { .. })
         ));
+    }
+
+    #[test]
+    fn unaligned_copy_preserves_the_other_bytes_of_atomic_words() {
+        let buf = SharedBuffer::new(8).unwrap();
+        buf.write_from(0, &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        buf.write_from(1, &[9, 10, 11, 12, 13]).unwrap();
+        let mut result = [0; 8];
+        buf.read_into(0, &mut result).unwrap();
+        assert_eq!(result, [1, 9, 10, 11, 12, 13, 7, 8]);
     }
 
     #[test]
