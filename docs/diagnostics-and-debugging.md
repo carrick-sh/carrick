@@ -441,13 +441,14 @@ plus each coordinator's holder `tid`. With no capture at all it leaves
 rings comes from the surrounding records, not from their separate logical
 indexes.
 
-On Linux/KVM, `carrick debug kvm-capture --run-id <id> --output-dir <dir>` asks
+On Linux/KVM, `carrick debug capture --run-id <id> --output-dir <dir>` asks
 the running carrier for a read-only capture in the existing post-mortem JSON
 shape. Use the same `CARRICK_RUN_ID` as the guest run. It includes both event
 rings, the kernel task/thread view (or a named degraded view), scheduler
 queues and executor receipts, the CPL0 zone census, per-vCPU last-stopped
-registers and state, and pending host work. Host thread stacks are currently
-reported as unavailable on this path.
+registers and state, and pending host work. On a test deadline, the harness
+also invokes the existing external wedge capture for carrier host stacks and
+a core; a failed `sudo -n lldb` attempt is named in the test log.
 Live sections are non-coherent; a running vCPU's register row is explicitly
 its last stopped state. Unavailable sections are named in `truncated` or
 `physical.unavailable`.

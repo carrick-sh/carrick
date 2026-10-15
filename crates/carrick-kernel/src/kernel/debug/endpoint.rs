@@ -89,6 +89,7 @@ pub struct DebugEndpoint {
     base: PathBuf,
     directory: PathBuf,
     socket: PathBuf,
+    run_id: String,
 }
 
 impl DebugEndpoint {
@@ -123,7 +124,26 @@ impl DebugEndpoint {
             base,
             directory,
             socket,
+            run_id: run_id.to_owned(),
         })
+    }
+
+    /// Immutable scope used to create this endpoint, owned by the carrier.
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    /// PID authenticated by this endpoint's live owner record.
+    pub fn live_owner_pid(&self) -> Result<u32, EndpointError> {
+        let owner = self
+            .read_owner()?
+            .ok_or_else(|| EndpointError::UnreadableOwner("no carrier owner record".to_owned()))?;
+        if !endpoint_owner_is_live(owner.pid, &self.socket) {
+            return Err(EndpointError::UnreadableOwner(
+                "carrier owner is no longer live".to_owned(),
+            ));
+        }
+        Ok(owner.pid)
     }
 
     pub fn socket_path(&self) -> &Path {

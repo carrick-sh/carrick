@@ -1923,6 +1923,19 @@ mod production_work_port_tests {
 }
 
 impl ProductionCpuFactory {
+    /// Attach per-exit mirrors only after the run's debug endpoint is live.
+    pub fn attach_debug(&self) {
+        let mut cpus = self
+            .cpus
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (cpu, debug) in cpus.iter_mut().zip(self.debug_cpus.iter()) {
+            if let Some(cpu) = cpu {
+                cpu.attach_debug(Arc::clone(debug));
+            }
+        }
+    }
+
     /// Read the physical zone without taking an execution lease or entering
     /// KVM. A held host custody is reported, never waited on by the debugger.
     pub fn capture_physical_state(&self) -> ProductionPhysicalCapture {
@@ -2363,15 +2376,12 @@ impl ProductionWorkerParts {
         ProductionCpuFactory,
     ) {
         let Self {
-            mut cpus,
+            cpus,
             custody,
             root_state,
         } = self;
         let debug_cpus: [Arc<CarrierCpuDebug>; 2] =
             std::array::from_fn(|_| Arc::new(CarrierCpuDebug::default()));
-        for (cpu, debug) in cpus.iter_mut().zip(debug_cpus.iter()) {
-            cpu.attach_debug(Arc::clone(debug));
-        }
         (
             root_state,
             ProductionCpuFactory {

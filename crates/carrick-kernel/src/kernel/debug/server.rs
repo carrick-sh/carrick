@@ -92,6 +92,7 @@ impl KernelDebugServer {
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
         let thread_endpoint = endpoint.clone();
+        let carrier_scope = endpoint.run_id().to_owned();
         let thread_cancellation = Arc::clone(&cancellation);
         let join = std::thread::Builder::new()
             .name("carrick-kernel-debug".to_owned())
@@ -102,6 +103,7 @@ impl KernelDebugServer {
                     physical,
                     &thread_shutdown,
                     &thread_cancellation,
+                    &carrier_scope,
                 );
                 drop(listener);
                 thread_endpoint.release(nonce);
@@ -194,6 +196,7 @@ fn serve_loop(
     physical: Option<Arc<dyn PhysicalCaptureProvider>>,
     shutdown: &AtomicBool,
     cancellation: &Arc<Cancellation>,
+    carrier_scope: &str,
 ) {
     let slots = Arc::new(ConnectionSlots::default());
     let mut handlers: Vec<std::thread::JoinHandle<()>> = Vec::new();
@@ -228,6 +231,7 @@ fn serve_loop(
         };
         let kernel = Arc::clone(kernel);
         let physical = physical.clone();
+        let carrier_scope = carrier_scope.to_owned();
         if let Ok(handler) = std::thread::Builder::new()
             .name("carrick-debug-conn".to_owned())
             .spawn(move || {
@@ -236,7 +240,12 @@ fn serve_loop(
                 let _permit = permit;
                 let mut connection = connection;
                 let kernel = kernel;
-                let _ = handle_connection(&mut connection, &kernel, physical.as_deref());
+                let _ = handle_connection(
+                    &mut connection,
+                    &kernel,
+                    physical.as_deref(),
+                    &carrier_scope,
+                );
             })
         {
             handlers.push(handler);
@@ -252,11 +261,12 @@ fn handle_connection(
     stream: &mut Connection,
     kernel: &Arc<Kernel>,
     physical: Option<&dyn PhysicalCaptureProvider>,
+    carrier_scope: &str,
 ) -> Result<(), WireError> {
     authenticate(stream)?;
     let payload = socket_rpc::read_frame(stream, MAX_REQUEST_BYTES)?;
     let request: KernelDebugRequest = wire::decode_exact(&payload)?;
-    let response = build_response(&request, kernel, physical, Instant::now());
+    let response = build_response(&request, kernel, physical, carrier_scope, Instant::now());
     let encoded = encode_canonical(&response)?;
     socket_rpc::write_frame(stream, &encoded, MAX_RESPONSE_BYTES)?;
     Ok(())
@@ -291,6 +301,7 @@ fn build_response(
     request: &KernelDebugRequest,
     kernel: &Arc<Kernel>,
     physical: Option<&dyn PhysicalCaptureProvider>,
+    carrier_scope: &str,
     started: Instant,
 ) -> ServerResponse {
     if let Err(error) = request.check_schema() {
@@ -310,13 +321,13 @@ fn build_response(
                 .map(|dir| dir.display().to_string()),
         };
     }
-    if let super::dto::KernelDebugAction::Capture { run_id } = &request.action {
+    if let super::dto::KernelDebugAction::Capture { .. } = &request.action {
         let mut capture = PostMortem::capture(
             Some(kernel),
             AbortReason::LiveCapture {
-                run_id: run_id.clone(),
+                run_id: carrier_scope.to_owned(),
             },
-            Some(run_id.clone()),
+            Some(carrier_scope.to_owned()),
         );
         capture.physical = physical.map(PhysicalCaptureProvider::capture);
         return ServerResponse::Capture(Box::new(capture));
@@ -452,6 +463,40 @@ mod tests {
     }
 
     #[test]
+    fn capture_with_held_registry_fits_client_deadline_and_reports_degradation() {
+        let bootstrap = RootBootstrap::for_reference_model(
+            437,
+            carrick_hal::ThreadId::synthetic_for_tests(437),
+            "registry-held".to_owned(),
+        )
+        .expect("bootstrap");
+        let (kernel, _context) = Kernel::bootstrap_root(bootstrap).expect("kernel");
+        let _held = kernel.registry().settled().write();
+        let request = KernelDebugRequest::capture("untrusted-wire-id");
+        let started = Instant::now();
+        let response = build_response(&request, &kernel, None, "carrier-owned-id", started);
+        let encoded = encode_canonical(&response).expect("encode post-mortem");
+        assert!(
+            started.elapsed() < wire::DEADLINE,
+            "capture outlasted the client's two-second deadline"
+        );
+        let capture: PostMortem = wire::decode_exact(&encoded).expect("post-mortem");
+        assert_eq!(capture.run_id.as_deref(), Some("carrier-owned-id"));
+        assert!(matches!(
+            capture.reason,
+            AbortReason::LiveCapture { ref run_id } if run_id == "carrier-owned-id"
+        ));
+        assert!(capture.kernel.is_none());
+        assert!(capture.degraded_kernel.is_some());
+        assert!(
+            capture
+                .degraded_kernel
+                .as_ref()
+                .is_some_and(|view| view.unreadable.iter().any(|row| row == "task registry"))
+        );
+    }
+
+    #[test]
     fn a_partial_request_does_not_block_a_complete_frame_or_shutdown() {
         let (_temp, endpoint) = super::super::endpoint::tests::scoped_endpoint("debug-partial");
         let bootstrap = RootBootstrap::for_reference_model(
@@ -579,7 +624,7 @@ mod tests {
         ));
 
         let request = KernelDebugRequest::for_tables(None);
-        let response = build_response(&request, &kernel, None, Instant::now());
+        let response = build_response(&request, &kernel, None, "invariant-root", Instant::now());
         let snapshot = match response {
             ServerResponse::Snapshot(snapshot) => *snapshot,
             other => panic!(
