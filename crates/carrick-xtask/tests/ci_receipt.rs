@@ -8,6 +8,7 @@ use carrick_xtask::ci_receipt::{
     pick_candidate, trusted_baseline_run,
 };
 use std::path::PathBuf;
+use std::process::Command;
 
 fn step(name: &str, passed: bool, failed: &[&str]) -> StepResult {
     StepResult {
@@ -259,6 +260,113 @@ fn baseline_waits_for_an_in_progress_base_run_and_fails_closed_when_finished() {
         &sha,
     );
     assert_eq!(untrusted, Baseline::Missing);
+}
+
+#[cfg(unix)]
+mod serial_host {
+    use super::*;
+
+    #[test]
+    fn deepest_group_uses_main_receipt_when_two_ancestors_were_superseded() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let fake_gh = bin.join("gh");
+        std::fs::write(
+        &fake_gh,
+        r#"#!/usr/bin/env python3
+import json, os, pathlib, shutil, sys
+main, head, middle = (os.environ[k] for k in ('CHAIN_MAIN', 'CHAIN_HEAD', 'CHAIN_MIDDLE'))
+args = sys.argv[1:]
+if args[:2] == ['api', 'graphql']:
+    nodes = [
+        {'position': 1, 'baseCommit': {'oid': main}, 'headCommit': {'oid': head}},
+        {'position': 2, 'baseCommit': {'oid': head}, 'headCommit': {'oid': middle}},
+        {'position': 3, 'baseCommit': {'oid': middle}, 'headCommit': {'oid': os.environ['CHAIN_DEEP']}},
+    ]
+    print(json.dumps({'data': {'repository': {'mergeQueue': {'entries': {'pageInfo': {'hasNextPage': False}, 'nodes': nodes}}}}}))
+elif args[0] == 'api' and '/runs?head_sha=' in args[-1]:
+    sha = args[-1].split('head_sha=')[1].split('&')[0]
+    event = 'push' if sha == main else 'merge_group'
+    branch = 'main' if sha == main else 'gh-readonly-queue/main/pr-chain'
+    run = {'id': {main: 1, head: 2, middle: 3}[sha], 'status': 'completed',
+           'event': event, 'head_branch': branch, 'head_sha': sha,
+           'path': '.github/workflows/kernel-runtime.yml',
+           'repository': {'full_name': 'carrick-sh/carrick'},
+           'head_repository': {'full_name': 'carrick-sh/carrick'}}
+    print(json.dumps({'workflow_runs': [run]}))
+elif args[0] == 'api' and '/artifacts?' in args[-1]:
+    names = [f'receipt-hvf-{main}-1'] if '/runs/1/' in args[-1] else []
+    print(json.dumps({'artifacts': [{'name': name, 'expired': False} for name in names]}))
+elif args[:2] == ['run', 'download']:
+    dest = pathlib.Path(args[args.index('--dir') + 1])
+    dest.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(os.environ['CHAIN_BASE_RECEIPT'], dest / 'receipt.json')
+else:
+    raise SystemExit(f'unexpected gh invocation: {args}')
+"#,
+    )
+    .unwrap();
+        let mut permissions = std::fs::metadata(&fake_gh).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, permissions).unwrap();
+
+        let main = "a".repeat(40);
+        let head = "b".repeat(40);
+        let middle = "c".repeat(40);
+        let deep = "d".repeat(40);
+        let mut baseline = receipt(vec![]);
+        baseline.head = main.clone();
+        let baseline_file = dir.path().join("base.json");
+        std::fs::write(&baseline_file, serde_json::to_vec(&baseline).unwrap()).unwrap();
+        let mut candidate = baseline;
+        candidate.head = deep.clone();
+        let candidate_dir = dir.path().join("candidate");
+        let candidate_artifact = candidate_dir.join(artifact_name(Lane::Hvf, &deep, 1));
+        std::fs::create_dir_all(&candidate_artifact).unwrap();
+        std::fs::write(
+            candidate_artifact.join("receipt.json"),
+            serde_json::to_vec(&candidate).unwrap(),
+        )
+        .unwrap();
+
+        let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .args(["ci-receipt", "gate", "--lane", "hvf", "--base-sha", &middle])
+            .arg("--candidate-dir")
+            .arg(&candidate_dir)
+            .args(["--candidate-sha", &deep, "--run-attempt", "1"])
+            .arg("--download-dir")
+            .arg(dir.path().join("download"))
+            .args(["--wait-minutes", "0"])
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("CHAIN_MAIN", &main)
+            .env("CHAIN_HEAD", &head)
+            .env("CHAIN_MIDDLE", &middle)
+            .env("CHAIN_DEEP", &deep)
+            .env("CHAIN_BASE_RECEIPT", baseline_file)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains(&format!("receipt diff against {main}: 0 NEW"))
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains(&format!("selected baseline ancestor {main} (overall FAIL")),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
 }
 
 #[test]

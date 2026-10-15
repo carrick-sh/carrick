@@ -2,13 +2,13 @@
 //!
 //! `kernel-runtime.yml` uploads each signed-HVF and KVM receipt as the
 //! artifact `receipt-<lane>-<sha>`. A merge-group run compares its receipt
-//! with the receipt of the group's base SHA and fails on any NEW failure. A
-//! missing baseline is a failure, never a skip.
+//! with the nearest receipt-bearing ancestor of its base on the merge queue
+//! chain and fails on any NEW failure. A missing baseline is a failure.
 
 use crate::accept::AcceptReceipt;
 use crate::ci_scaler::{KERNEL_RUNTIME_WORKFLOW, REPOSITORY};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -454,7 +454,12 @@ fn validate_sha(sha: &str) -> Result<(), ReceiptError> {
 }
 
 /// One query round: this workflow's runs for the SHA and their artifacts.
-fn query_baseline(lane: Lane, sha: &str) -> Result<Baseline, ReceiptError> {
+struct BaselineObservation {
+    decision: Baseline,
+    merge_group_run: bool,
+}
+
+fn query_baseline(lane: Lane, sha: &str) -> Result<BaselineObservation, ReceiptError> {
     validate_sha(sha)?;
     let workflow = KERNEL_RUNTIME_WORKFLOW
         .rsplit('/')
@@ -476,7 +481,65 @@ fn query_baseline(lane: Lane, sha: &str) -> Result<Baseline, ReceiptError> {
         ))?;
         pairs.push((run.clone(), artifacts));
     }
-    Ok(baseline_decision(&pairs, lane, sha))
+    Ok(BaselineObservation {
+        decision: baseline_decision(&pairs, lane, sha),
+        merge_group_run: pairs.iter().any(|(run, _)| run["event"] == "merge_group"),
+    })
+}
+
+/// The queue owns the relationship between each synthetic group head and its
+/// base. Commit parents do not describe this relationship.
+fn queue_base_chain() -> Result<BTreeMap<String, String>, ReceiptError> {
+    let query = "query { repository(owner: \"carrick-sh\", name: \"carrick\") { mergeQueue(branch: \"main\") { entries(first: 100) { pageInfo { hasNextPage } nodes { baseCommit { oid } headCommit { oid } } } } } }";
+    let output = Command::new("gh")
+        .args(["api", "graphql", "-f", &format!("query={query}")])
+        .output()
+        .map_err(|source| ReceiptError::Io {
+            path: PathBuf::from("gh"),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(ReceiptError::Baseline(format!(
+            "merge queue GraphQL lookup failed ({})",
+            output.status
+        )));
+    }
+    let response: Value =
+        serde_json::from_slice(&output.stdout).map_err(|source| ReceiptError::Parse {
+            path: PathBuf::from("merge queue GraphQL"),
+            source,
+        })?;
+    if response.get("errors").is_some() {
+        return Err(ReceiptError::Baseline("merge queue GraphQL errors".into()));
+    }
+    let entries = &response["data"]["repository"]["mergeQueue"]["entries"];
+    if entries["pageInfo"]["hasNextPage"] != false {
+        return Err(ReceiptError::Baseline(
+            "merge queue listing is incomplete".into(),
+        ));
+    }
+    let nodes = entries["nodes"]
+        .as_array()
+        .ok_or_else(|| ReceiptError::Baseline("merge queue entries missing".into()))?;
+    let mut chain = BTreeMap::new();
+    for node in nodes {
+        let head = node["headCommit"]["oid"]
+            .as_str()
+            .ok_or_else(|| ReceiptError::Baseline("merge queue head SHA missing".into()))?
+            .to_ascii_lowercase();
+        let base = node["baseCommit"]["oid"]
+            .as_str()
+            .ok_or_else(|| ReceiptError::Baseline("merge queue base SHA missing".into()))?
+            .to_ascii_lowercase();
+        validate_sha(&head)?;
+        validate_sha(&base)?;
+        if chain.insert(head, base).is_some() {
+            return Err(ReceiptError::Baseline(
+                "merge queue has duplicate head SHA".into(),
+            ));
+        }
+    }
+    Ok(chain)
 }
 
 /// Seeding/reseed instructions named in every missing-baseline error.
@@ -494,31 +557,62 @@ fn download_baseline(
     dir: &Path,
     wait: Duration,
     poll: Duration,
-) -> Result<PathBuf, ReceiptError> {
+) -> Result<(PathBuf, String), ReceiptError> {
     let deadline = Instant::now() + wait;
+    let mut ancestor = sha.to_owned();
+    let mut chain = None;
+    let mut visited = BTreeSet::new();
     let (run_id, name) = loop {
-        match query_baseline(lane, sha)? {
-            Baseline::Found(run, name) => break (run, name),
-            Baseline::Missing => {
-                return Err(ReceiptError::Baseline(format!(
-                    "no baseline: every trusted kernel-runtime.yml run of {sha} finished without a \
-                     receipt-{}-{sha}-<attempt> artifact (or none exists); {}",
-                    lane.name(),
-                    reseed_hint(sha)
-                )));
-            }
+        if !visited.insert(ancestor.clone()) {
+            return Err(ReceiptError::Baseline(format!(
+                "merge queue base chain cycles at {ancestor}"
+            )));
+        }
+        let observation = query_baseline(lane, &ancestor)?;
+        if let Baseline::Found(run, name) = &observation.decision {
+            break (*run, name.clone());
+        }
+        if chain.is_none() {
+            chain = Some(queue_base_chain()?);
+        }
+        if let Some(base) = chain.as_ref().and_then(|links| links.get(&ancestor)) {
+            println!(
+                "ancestor {ancestor} has no published {} receipt; following merge-queue base {base}",
+                lane.name()
+            );
+            ancestor = base.clone();
+            continue;
+        }
+        if observation.merge_group_run {
+            return Err(ReceiptError::Baseline(format!(
+                "no baseline: merge-group ancestor {ancestor} has no published {} receipt and no live queue base link",
+                lane.name()
+            )));
+        }
+        match observation.decision {
             Baseline::Pending if Instant::now() + poll <= deadline => {
-                println!("base {sha} run in progress; waiting for its receipt");
+                println!(
+                    "receipt-bearing ancestor {ancestor} run in progress; waiting for its receipt"
+                );
+                visited.remove(&ancestor);
                 std::thread::sleep(poll);
             }
             Baseline::Pending => {
                 return Err(ReceiptError::Baseline(format!(
-                    "no baseline: the base run of {sha} did not publish a receipt within {} minutes; \
-                     re-queue once it finishes, or {}",
+                    "no baseline: ancestor {ancestor} did not publish a {} receipt within {} minutes; {}",
+                    lane.name(),
                     wait.as_secs() / 60,
-                    reseed_hint(sha)
+                    reseed_hint(&ancestor)
                 )));
             }
+            Baseline::Missing => {
+                return Err(ReceiptError::Baseline(format!(
+                    "no baseline: ancestor {ancestor} has no trusted {} receipt and no queue base link; {}",
+                    lane.name(),
+                    reseed_hint(&ancestor)
+                )));
+            }
+            Baseline::Found(_, _) => unreachable!(),
         }
     };
     // Persistent runner workspaces: never read a previous job's download.
@@ -560,7 +654,7 @@ fn download_baseline(
             "baseline artifact {name} from run {run_id} has no receipt.json"
         )));
     }
-    Ok(receipt)
+    Ok((receipt, ancestor))
 }
 
 #[derive(clap::Args, Debug)]
@@ -581,9 +675,9 @@ pub enum ReceiptAction {
         #[arg(long)]
         fail_on_new: bool,
     },
-    /// Fetch BASE-SHA's trusted receipt, diff CANDIDATE against it and fail on
-    /// NEW. While a trusted base run is still in progress, wait (bounded) for
-    /// its receipt; a base run that finished without one fails closed.
+    /// Fetch the nearest published receipt on BASE-SHA's queue ancestry,
+    /// diff CANDIDATE against it and fail on NEW. Wait only for an in-progress
+    /// terminal ancestor run; an unresolved chain fails closed.
     Gate {
         #[arg(long, value_enum)]
         lane: Lane,
@@ -643,7 +737,7 @@ pub fn run(args: ReceiptArgs) -> Result<(), ReceiptError> {
                 &candidate_sha,
                 run_attempt,
             )?)?;
-            let path = download_baseline(
+            let (path, selected_ancestor) = download_baseline(
                 lane,
                 &base_sha,
                 &download_dir,
@@ -651,20 +745,25 @@ pub fn run(args: ReceiptArgs) -> Result<(), ReceiptError> {
                 Duration::from_secs(poll_seconds.max(1)),
             )?;
             let base = load(&path)?;
-            if base.head != base_sha {
+            if base.head != selected_ancestor {
                 return Err(ReceiptError::Baseline(format!(
-                    "baseline receipt records head {} but was published for {base_sha}",
+                    "baseline receipt records head {} but was published for ancestor {selected_ancestor}",
                     base.head
                 )));
             }
+            println!(
+                "selected baseline ancestor {selected_ancestor} (overall {}, {} recorded failure keys); comparing cumulative group against its published receipt",
+                base.overall,
+                failure_keys(&base).len()
+            );
             let result = diff(&base, &candidate)?;
-            print_diff(&base_sha, &result);
+            print_diff(&selected_ancestor, &result);
             if result.new.is_empty() {
                 Ok(())
             } else {
                 Err(ReceiptError::New {
                     count: result.new.len(),
-                    base: base_sha,
+                    base: selected_ancestor,
                 })
             }
         }

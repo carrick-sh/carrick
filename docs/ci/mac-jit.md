@@ -291,9 +291,13 @@ at most 4096 job keys; eviction never bypasses vetting.
 
 ## Seeding baselines
 
-The merge-queue gate compares each group's receipt with the receipt of the
-group's base SHA (`ci-receipt gate`). Baselines are published by push-to-main,
-merge-group and owner `workflow_dispatch`-on-main runs. Before making the
+The merge-queue gate compares each group's receipt with the nearest published
+receipt on its base chain (`ci-receipt gate`). A superseded shallower group may
+have no receipt, so the gate follows that queue entry's base, repeating until
+it finds a published receipt. It reports the selected ancestor SHA and its
+recorded failure state; a failed ancestor receipt is compared, not silently
+skipped. Baselines are published by push-to-main, merge-group and owner
+`workflow_dispatch`-on-main runs. Before making the
 check required, and whenever a main push failed to upload its receipt, seed
 main's tip:
 
@@ -302,12 +306,13 @@ gh workflow run kernel-runtime.yml --repo carrick-sh/carrick --ref main
 ```
 
 The comparison runs in the hosted `hvf-gate`/`kvm-gate` jobs, never on the
-trusted hardware: a lane job only produces and uploads its receipt, so a
-queued entry can never hold the runner its base entry needs. If the base
-SHA's run is still in progress (queue depth above one), the hosted gate waits
-for its receipt for up to 90 minutes (polled every 60 s; job timeout 110 min,
-so the actionable message always prints). A base run that finished without a
-receipt fails closed and names this reseed command.
+trusted hardware: a lane job only produces and uploads its receipt. The gate
+uses the live merge-queue base links, not commit parents, for the chain. It
+waits up to 90 minutes only when the terminal receipt-producing ancestor's
+run is still in progress (polled every 60 s; job timeout 110 min). A missing
+queue link for an unreceipted merge-group ancestor fails immediately. A
+terminal ancestor that finished without a receipt fails closed and names this
+reseed command.
 
 ### Cumulative merge groups (#402)
 
@@ -336,8 +341,8 @@ listings preserve ordinary service.
 
 The director must qualify HEADGREEN on the first live batch after deployment:
 a skipped group must resume when its successor fails, is cancelled or leaves
-the queue, and the deepest group's baseline receipt dependencies must still
-resolve.
+the queue, and the deepest group's gate must reach a published ancestor
+receipt through skipped shallower groups.
 
 ## Lifecycle and recovery
 
