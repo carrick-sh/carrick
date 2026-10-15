@@ -135,8 +135,8 @@ fn resolved_link_target(base: &Path, link: &Path) -> io::Result<PathBuf> {
             Component::CurDir => {}
             Component::Normal(name) => {
                 resolved.push(name);
-                if std::fs::symlink_metadata(&resolved).is_ok() {
-                    resolved = std::fs::canonicalize(&resolved)?;
+                if resolved.exists() || resolved.is_symlink() {
+                    resolved = resolved.canonicalize()?;
                 }
             }
             Component::ParentDir => {
@@ -154,13 +154,8 @@ fn reject_symlink_parent(dest: &Path, path: &Path) -> io::Result<()> {
         for component in components.components() {
             if let Component::Normal(name) = component {
                 parent.push(name);
-                match std::fs::symlink_metadata(&parent) {
-                    Ok(metadata) if metadata.file_type().is_symlink() => {
-                        return Err(invalid_context("tar entry parent is a symlink"));
-                    }
-                    Ok(_) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
+                if parent.is_symlink() {
+                    return Err(invalid_context("tar entry parent is a symlink"));
                 }
             }
         }
@@ -174,7 +169,7 @@ fn unpack_context(gz_tar: &[u8], dest: &Path) -> std::io::Result<()> {
     if gz_tar.len() > MAX_BUILD_CONTEXT_COMPRESSED_BYTES {
         return Err(invalid_context("compressed build context is too large"));
     }
-    let dest = std::fs::canonicalize(dest)?;
+    let dest = dest.canonicalize()?;
     let decoder = flate2::read::GzDecoder::new(gz_tar);
     let mut limited = decoder.take(MAX_BUILD_CONTEXT_DECOMPRESSED_BYTES + 1);
     {
@@ -267,35 +262,21 @@ pub(crate) async fn build_response(
     query: &str,
     body_bytes: Bytes,
 ) -> Response<BoxBody<Bytes, std::io::Error>> {
-    let tmp = match tempfile::tempdir() {
-        Ok(tmp) => tmp,
-        Err(error) => {
-            return build_error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
-        }
-    };
-    let ctx_dir = tmp.path().join("context");
-    if let Err(error) = std::fs::create_dir(&ctx_dir) {
-        return build_error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
-    }
-    let unpack = tokio::task::spawn_blocking(move || unpack_context(&body_bytes, &ctx_dir)).await;
-    match unpack {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            return build_error_response(
-                StatusCode::BAD_REQUEST,
-                &format!("invalid build context: {error}"),
-            );
-        }
-        Err(error) => {
-            return build_error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
-        }
-    }
     let parsed = parse_build_query(query);
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(64);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
 
     tokio::spawn(async move {
-        run_build_streaming(parsed, tmp, tx).await;
+        run_build_streaming(parsed, body_bytes, ready_tx, tx).await;
     });
+
+    match ready_rx.await {
+        Ok(Ok(())) => {}
+        Ok(Err((status, message))) => return build_error_response(status, &message),
+        Err(error) => {
+            return build_error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+        }
+    }
 
     let stream = ReceiverStream { rx };
     let body = StreamBody::new(stream).boxed();
@@ -320,7 +301,8 @@ pub(crate) async fn build_response(
 /// thus the receiver) closes.
 async fn run_build_streaming(
     parsed: BuildQuery,
-    tmp: tempfile::TempDir,
+    body_bytes: Bytes,
+    ready_tx: tokio::sync::oneshot::Sender<Result<(), (StatusCode, String)>>,
     tx: mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
 ) {
     // A helper to push a JSON object as one NDJSON frame; a send error means the
@@ -343,7 +325,35 @@ async fn run_build_streaming(
         .await;
     }
 
+    let tmp = match tempfile::tempdir() {
+        Ok(tmp) => tmp,
+        Err(error) => {
+            let _ = ready_tx.send(Err((StatusCode::INTERNAL_SERVER_ERROR, error.to_string())));
+            return;
+        }
+    };
     let ctx_dir = tmp.path().join("context");
+    if let Err(error) = std::fs::create_dir_all(&ctx_dir) {
+        let _ = ready_tx.send(Err((StatusCode::INTERNAL_SERVER_ERROR, error.to_string())));
+        return;
+    }
+    let ctx_for_unpack = ctx_dir.clone();
+    match tokio::task::spawn_blocking(move || unpack_context(&body_bytes, &ctx_for_unpack)).await {
+        Ok(Ok(())) => {
+            let _ = ready_tx.send(Ok(()));
+        }
+        Ok(Err(error)) => {
+            let _ = ready_tx.send(Err((
+                StatusCode::BAD_REQUEST,
+                format!("invalid build context: {error}"),
+            )));
+            return;
+        }
+        Err(error) => {
+            let _ = ready_tx.send(Err((StatusCode::INTERNAL_SERVER_ERROR, error.to_string())));
+            return;
+        }
+    }
     // Run the build in-process. `run_build` enters the unified carrier
     // directly; the API server never creates an intermediate CLI helper.
     let primary_tag = parsed.tags.first().cloned();
