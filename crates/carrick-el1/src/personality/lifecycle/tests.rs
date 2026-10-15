@@ -359,6 +359,30 @@ fn clone_args(flags: u64, parent_tid: u64, child_tid: u64) -> [u64; 5] {
 // ---- clone ----
 
 #[test]
+fn raw_clone_sibling_runs_when_parent_only_sched_yields() {
+    // The scheduler_preemption fixture uses clone without libc's TLS and
+    // clear-tid flags, then makes no call except sched_yield while waiting
+    // for the child to publish its first shared-memory store.
+    const RAW_THREAD_FLAGS: u64 = 0x0005_0f00;
+    const SYS_SCHED_YIELD: usize = 124;
+    let mut w = World::new(LifecycleHatches::ON);
+    w.venue.stock(2, CHILD_TID, CHILD_VISIBLE);
+    let (action, mut frame) = w.syscall(SYS_CLONE, &clone_args(RAW_THREAD_FLAGS, 0, 0));
+    assert_eq!(action, Action::Served);
+    assert_eq!(frame.x[0], u64::from(CHILD_VISIBLE));
+    assert_eq!(w.zone.slot(SLOT).queued(), 1);
+
+    assert_eq!(w.call(&mut frame, SYS_SCHED_YIELD, &[]), Action::Served);
+    assert_eq!(
+        w.task().execution.task.load(Ordering::Acquire),
+        u64::from(CHILD_TID)
+    );
+    assert_eq!(frame.x[0], 0, "the child returns from raw clone");
+    assert_eq!(frame.elr, CLONE_PC);
+    assert_eq!(w.forwarded(SYS_SCHED_YIELD), 0);
+}
+
+#[test]
 fn clone_serves_libc_and_go_thread_flag_sets_and_queues_the_child() {
     for flags in [GLIBC_FLAGS, MUSL_FLAGS, GO_FLAGS] {
         let mut w = World::new(LifecycleHatches::ON);
