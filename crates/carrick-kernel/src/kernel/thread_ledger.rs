@@ -48,6 +48,13 @@ pub(super) struct BirthAdmissionGuard {
 
 impl BirthAdmissionGuard {
     pub(super) fn acquire(task: &super::objects::Task) -> Result<Self, KernelOperationError> {
+        Self::acquire_after_gate_read(task, || {})
+    }
+
+    fn acquire_after_gate_read(
+        task: &super::objects::Task,
+        after_gate_read: impl FnOnce(),
+    ) -> Result<Self, KernelOperationError> {
         let page = task.shared().pending_signals().lifecycle_lease();
         if !page.serves_threads() || page.gate() == carrick_el1_abi::GateState::Closed {
             return Ok(Self {
@@ -55,13 +62,23 @@ impl BirthAdmissionGuard {
                 awaiting_exec_binding: false,
             });
         }
+        after_gate_read();
         let awaiting_exec_binding = page.gate() == carrick_el1_abi::GateState::AwaitingExecBinding;
         let close = if awaiting_exec_binding {
             page.close_awaiting_exec_binding()
         } else {
             page.close_for_fork()
         };
-        close.map_err(|_| KernelOperationError::LifecycleAdmissionBusy(task.key().id))?;
+        match close {
+            Ok(()) => {}
+            Err(carrick_el1_abi::GateState::Closed) => {
+                return Ok(Self {
+                    page: None,
+                    awaiting_exec_binding: false,
+                });
+            }
+            Err(_) => return Err(KernelOperationError::LifecycleAdmissionBusy(task.key().id)),
+        }
         let guard = Self {
             page: Some(page),
             awaiting_exec_binding,
@@ -2149,6 +2166,17 @@ mod tests {
     #[test]
     fn lifecycle_abi_birth_uses_reserved_resources_after_allocator_exhaustion() {
         abi_birth_observed_by_peer(true, false, false);
+    }
+
+    #[test]
+    fn closed_gate_between_ledger_read_and_cas_is_terminal_not_busy() {
+        let (_kernel, root) = bootstrap(9_669);
+        let page = root.thread().control_lease().lifecycle();
+        let guard =
+            super::BirthAdmissionGuard::acquire_after_gate_read(root.task(), || page.close())
+                .expect("terminal close is not a transient birth conflict");
+        assert!(guard.page.is_none());
+        assert_eq!(page.gate(), carrick_el1_abi::GateState::Closed);
     }
 
     #[test]
