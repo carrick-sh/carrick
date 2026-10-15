@@ -475,6 +475,7 @@ struct PendingExit<'a> {
     channel: Arc<WaitChannel>,
     wake: Option<ExitWakeCustody>,
     outstanding: Vec<OutstandingExitReceipt<'a>>,
+    members: carrick_core::terminal::MemberSet,
     custody: Option<
         carrick_core::terminal::TerminalCustody<
             carrick_core::terminal::Process,
@@ -484,23 +485,40 @@ struct PendingExit<'a> {
 }
 
 impl PendingExit<'_> {
-    fn receipts_returned(&self, page: &ThreadLifecyclePage) -> bool {
-        self.outstanding.iter().all(|receipt| match receipt {
-            OutstandingExitReceipt::Pool(entry) => matches!(
-                page.state(entry.index()),
-                Some((generation, carrick_el1_abi::EntryState::ExitedInZone | carrick_el1_abi::EntryState::Reaped))
-                    if generation == entry.generation()
-            ),
-            OutstandingExitReceipt::Adopted { binding, control } => control
-                .host_retirement()
-                .is_some_and(|receipt| receipt.matches(*binding)),
-            OutstandingExitReceipt::HostBorn { identity, index } => {
-                page.host_birth_identity(*index) == Some(*identity)
-                    && page.host_birth_receipt_returned(*index)
+    fn completed_receipts(
+        &self,
+        page: &ThreadLifecyclePage,
+    ) -> Option<carrick_core::terminal::CompletedMemberReceipts> {
+        let mut pool = Vec::new();
+        let mut host = Vec::new();
+        for receipt in &self.outstanding {
+            match receipt {
+                OutstandingExitReceipt::Pool(entry)
+                    if matches!(
+                        page.state(entry.index()),
+                        Some((generation, carrick_el1_abi::EntryState::ExitedInZone | carrick_el1_abi::EntryState::Reaped))
+                            if generation == entry.generation()
+                    ) =>
+                {
+                    pool.push(*entry)
+                }
+                OutstandingExitReceipt::Adopted { binding, control } => {
+                    host.push(
+                        control
+                            .host_retirement()
+                            .filter(|receipt| receipt.matches(*binding))?,
+                    );
+                }
+                OutstandingExitReceipt::HostBorn { identity, index }
+                    if page.host_birth_identity(*index) == Some(*identity)
+                        && page.host_birth_receipt_returned(*index) =>
+                {
+                    host.push(*identity)
+                }
+                _ => return None,
             }
-        }) && (0..carrick_el1_abi::THREAD_POOL_ENTRIES).all(|index| {
-            page.host_birth_identity(index).is_none_or(|_| page.host_birth_receipt_returned(index))
-        })
+        }
+        self.members.completed(&pool, &host)
     }
 }
 
@@ -734,7 +752,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         &self,
         runtime: &NativeProcessRuntime<'a, M, C>,
         page: &ThreadLifecyclePage,
-        caller: &ThreadControlSlot,
+        members: &carrick_core::terminal::MemberSet,
         adopted: &[(ExecutionBinding, &'a ThreadControlSlot, RecordRef)],
     ) {
         let wait = NativeBucketWait {
@@ -742,51 +760,36 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             #[cfg(test)]
             probe: None,
         };
-        for (_, _, record) in adopted {
-            if runtime.zone.live(*record).is_some() {
-                let _ = runtime
-                    .zone
-                    .claim_for_host(*record, None, Handback::Cancelled, &wait);
-            }
-        }
-        for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
-            let Some(identity) = page.host_birth_identity(index) else {
-                continue;
-            };
-            if caller.host_birth_identity() != Some(identity) {
+        for identity in members.host() {
+            if let Some((_, _, record)) = adopted.iter().find(|(binding, _, _)| {
+                *identity
+                    == carrick_core::terminal::HostThreadRetirementReceipt::from_binding(*binding)
+            }) {
+                if runtime.zone.live(*record).is_some() {
+                    let _ = runtime
+                        .zone
+                        .claim_for_host(*record, None, Handback::Cancelled, &wait);
+                }
+            } else if let Some(index) = (0..carrick_el1_abi::THREAD_POOL_ENTRIES)
+                .find(|&index| page.host_birth_identity(index) == Some(*identity))
+            {
                 page.request_host_birth_cancel(index);
             }
         }
-        for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
-            let Some((generation, state)) = page.state(index) else {
-                continue;
-            };
-            if !matches!(
-                state,
-                carrick_el1_abi::EntryState::Born
-                    | carrick_el1_abi::EntryState::Published
-                    | carrick_el1_abi::EntryState::ExitingBorn
-                    | carrick_el1_abi::EntryState::ExitingPublished
-            ) {
-                continue;
-            }
-            let entry = carrick_el1_abi::EntryRef::new(index as u32, generation);
-            let Some(address) = page.control_address(entry) else {
+        for entry in members.pool() {
+            let Some(address) = page.control_address(*entry) else {
                 continue;
             };
             // SAFETY: a live page entry pins its control allocation through
             // terminal settlement; the entry generation authenticates reuse.
             let control = unsafe { &*(address as *const ThreadControlSlot) };
-            if core::ptr::eq(control, caller) {
-                continue;
-            }
             let Some(record) = control.zone_record() else {
                 continue;
             };
             let Some(owned) = runtime.zone.live(record) else {
                 continue;
             };
-            let Some(identity) = page.identity(entry) else {
+            let Some(identity) = page.identity(*entry) else {
                 continue;
             };
             if owned.identity().tid != u64::from(identity.tid)
@@ -3292,7 +3295,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .pending_exit
             .get(&self.key)
             .is_some_and(|pending| {
-                page.live() == 0 && page.claimed_count() == 0 && pending.receipts_returned(page)
+                pending.custody.as_ref().is_some_and(|custody| {
+                    pending
+                        .completed_receipts(page)
+                        .is_some_and(|receipts| custody.can_settle(page, &receipts))
+                })
             });
         if ready {
             return Ok(None);
@@ -3376,7 +3383,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     mm: self.binding.mm.raw(),
                 });
                 let mut outstanding = Vec::new();
-                let mut pool_mask = 0u16;
+                let mut pool = Vec::new();
                 for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
                     if let Some((generation, state)) = page.state(index)
                         && matches!(
@@ -3391,7 +3398,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         if self.control.entry() == Some(entry) {
                             continue;
                         }
-                        pool_mask |= 1 << index;
+                        pool.push(entry);
                         outstanding.push(OutstandingExitReceipt::Pool(entry));
                     }
                 }
@@ -3425,23 +3432,25 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         OutstandingExitReceipt::HostBorn { identity, .. } => Some(*identity),
                     })
                     .collect();
-                let members = carrick_core::terminal::MemberSet::new(
-                    pool_mask,
-                    bindings,
-                    page.live() as usize,
-                )
-                .ok_or(NativeProcessError::Exhausted)?;
                 let identity = carrick_core::terminal::ProcessTerminalIdentity::from_exit(
                     self.key,
                     address,
                     wait_status.to_termination_status(),
                 );
+                let members = carrick_core::terminal::MemberSet::new(
+                    identity,
+                    pool,
+                    bindings,
+                    page.live() as usize,
+                )
+                .ok_or(NativeProcessError::Exhausted)?;
                 let (custody, verdict) = carrick_core::terminal::TerminalCustody::<
                     carrick_core::terminal::Process,
                     carrick_core::terminal::Live,
                 >::admitted(identity)
                 .close(page, members);
-                let carrick_core::terminal::RetirementVerdict::CancelMembers { .. } = verdict
+                let carrick_core::terminal::RetirementVerdict::CancelMembers { members, .. } =
+                    verdict
                 else {
                     return Err(NativeProcessError::Quarantined);
                 };
@@ -3458,6 +3467,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         channel,
                         wake,
                         outstanding,
+                        members,
                         custody: Some(custody),
                     },
                 );
@@ -3474,7 +3484,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             )
         };
         if first_close && let Some(registry) = registry {
-            registry.cancel_members(self.runtime, page, self.control, &adopted);
+            let members = self
+                .runtime
+                .graph
+                .lock()
+                .pending_exit
+                .get(&self.key)
+                .ok_or(NativeProcessError::Quarantined)?
+                .members
+                .clone();
+            registry.cancel_members(self.runtime, page, &members, &adopted);
         }
         Ok((page, channel))
     }
@@ -3508,7 +3527,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .custody
                 .take()
                 .ok_or(NativeProcessError::Quarantined)?;
-            match custody.settle(page, pending.receipts_returned(page)) {
+            let receipts = pending.completed_receipts(page);
+            let result = match receipts {
+                Some(receipts) => custody.settle(page, receipts),
+                None => Err(custody),
+            };
+            match result {
                 Ok(settled) => settled,
                 Err(closing) => {
                     pending.custody = Some(closing);
@@ -4229,13 +4253,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         let wake = {
             let mut graph = self.runtime.graph.lock();
             if graph.pending_exit.contains_key(&self.key) {
-                let settled = graph
+                let page = graph
                     .owner
                     .task(self.key)
                     .map_err(|_| NativeProcessError::Quarantined)
-                    .map(|row| row.native().resources().page.claimed_count() == 0);
-                settled.map(|settled| {
-                    if settled {
+                    .map(|row| row.native().resources().page);
+                page.map(|page| {
+                    let ready = graph.pending_exit.get(&self.key).is_some_and(|pending| {
+                        pending.custody.as_ref().is_some_and(|custody| {
+                            pending
+                                .completed_receipts(page)
+                                .is_some_and(|receipts| custody.can_settle(page, &receipts))
+                        })
+                    });
+                    if ready {
                         graph
                             .pending_exit
                             .get_mut(&self.key)
