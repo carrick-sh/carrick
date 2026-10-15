@@ -425,7 +425,10 @@ pub fn validate_probes(
     let mut selected_names: Vec<String> = inventory
         .into_iter()
         .filter(|(_, entry)| {
-            (entry.class == "conformance" || entry.class == "helper") && !entry.excluded
+            (entry.class == "conformance"
+                || entry.class == "helper"
+                || entry.class == "performance")
+                && !entry.excluded
         })
         .map(|(name, _)| name)
         .collect();

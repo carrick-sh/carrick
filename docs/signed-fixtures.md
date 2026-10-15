@@ -16,9 +16,10 @@ The signed steps in `crates/carrick-xtask/src/accept.rs` consume:
 | `carrick-embed el1_` | `fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/<name>` | `scripts/build-linux-fixtures.sh`, raw `rustc --emit=obj` and static ELF linking; PIE declaration retains its static PIE shape |
 | Embed interceptor, file-reader, icache, copyout and EL1 scheduler bindings | `target/embed-fixtures/{interceptor-probe,zone-readers,icache-reuse,copyout,el1-sched}-aarch64` | The five `scripts/build-embed-*.sh` builders, local musl Cargo builds |
 
-The bundle contains every non-excluded `conformance` and `helper` entry in
-`conformance-probes/probe-inventory.json`, for both libcs. This includes
-`probeinit`, the fork/exec transport helper. At introduction there are 530
+The bundle contains every non-excluded `conformance`, `helper`, and
+`performance` entry in `conformance-probes/probe-inventory.json`, for both
+libcs. This includes `probeinit`, the fork/exec transport helper, and
+performance probes such as `perf_futex_pingpong`. At introduction there are 530
 names per libc, 68 raw fixture declarations, and five embed executables after adding N1 copyout:
 1,133 executable destinations. Restore derives the inventory from the
 checkout rather than trusting this count or the manifest's claims.
