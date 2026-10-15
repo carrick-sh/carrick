@@ -3355,7 +3355,7 @@ fn arm_non_graph_retired_pool_member(reallocate: bool, resetting: bool) {
             1,
             "fallible retention must precede begin_exit"
         );
-        assert_eq!(fixture.page.gate(), carrick_el1_abi::GateState::Open);
+        assert_eq!(fixture.page.gate(), carrick_el1_abi::GateState::Closed);
     }
     assert_eq!(
         outcome
@@ -3397,6 +3397,16 @@ fn arm_reaped_slot_reset_cannot_leave_partially_begun_exit() {
 
 #[test]
 fn arm_host_retirement_between_page_scan_and_retain_does_not_quarantine() {
+    arm_pool_retirement_during_scan(false);
+}
+
+#[test]
+fn arm_pool_restock_between_scan_and_retain_settles() {
+    arm_pool_retirement_during_scan(true);
+}
+
+#[cfg(test)]
+fn arm_pool_retirement_during_scan(restock: bool) {
     use carrick_el1_abi::Lifecycle;
     let fixture: &'static Fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let mut service = fixture.process_service();
@@ -3432,7 +3442,7 @@ fn arm_host_retirement_between_page_scan_and_retain_does_not_quarantine() {
         .unwrap();
     let page = fixture.page;
     let zone = fixture.zone;
-    runtime.install_pool_control_hook(Box::new(move || {
+    let retirement: Box<dyn FnOnce() + Send> = Box::new(move || {
         let membership = page.reserve_nonfinal_exit().unwrap();
         page.retire_published_host_member(entry, control, membership)
             .unwrap();
@@ -3445,8 +3455,27 @@ fn arm_host_retirement_between_page_scan_and_retain_does_not_quarantine() {
         page.publish_exact_host_retirement(control, receipt);
         zone.free_record(record.id);
         drop(lease);
-        *held_reset.lock().unwrap() = Some(control.reserve_reset_for_test().unwrap());
-    }));
+        if restock {
+            page.stock(
+                entry.index(),
+                carrick_el1_abi::EntryIdentity {
+                    tid: 99,
+                    visible_tid: 99,
+                    thread_serial: 199,
+                    execution: carrick_core_abi::entry::EntryGeneration::from_raw(11),
+                    uid_credit: 0,
+                },
+            )
+            .unwrap();
+        } else {
+            *held_reset.lock().unwrap() = Some(control.reserve_reset_for_test().unwrap());
+        }
+    });
+    if restock {
+        runtime.install_pool_retained_hook(retirement);
+    } else {
+        runtime.install_pool_control_hook(retirement);
+    }
     let mut frame = carrick_el1_abi::TrapFrame::default();
     frame.x[0] = 7;
     frame.x[8] = 94;
@@ -3458,6 +3487,122 @@ fn arm_host_retirement_between_page_scan_and_retain_does_not_quarantine() {
     assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
     assert_eq!(service.crossing.root_exit_status.load(Ordering::Acquire), 7);
     assert_eq!(arena.allocate(99).unwrap().slot_address(), address);
+}
+
+#[test]
+fn arm_host_birth_after_snapshot_is_cancelled_and_settles() {
+    use carrick_el1_abi::Lifecycle;
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    let runtime = registry()
+        .for_entry(
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            &fixture.task,
+            fixture.address,
+        )
+        .unwrap();
+    let control: &'static ThreadControlSlot = Box::leak(Box::new(ThreadControlSlot::new()));
+    control
+        .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
+        .unwrap();
+    control.publish_host_birth_identity(carrick_el1_abi::ExecutionBinding {
+        task: carrick_core_abi::EntryTaskKey::from_raw(42),
+        generation: carrick_core_abi::EntryGeneration::from_raw(11),
+        mm: carrick_core_abi::EntryMmKey::from_raw(1),
+        thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(102),
+    });
+    let receipt = control.host_birth_identity().unwrap();
+    let page = fixture.page;
+    let slot = page.reserve_host_birth().unwrap();
+    runtime.install_pool_control_hook(Box::new(move || {
+        // Complete a host birth admitted before exit, using the publication
+        // order in Kernel::thread_spawned: live, receipt slot, gate check.
+        page.thread_born().unwrap();
+        assert!(page.publish_host_birth(slot, receipt));
+        if page.gate() == carrick_el1_abi::GateState::Closed {
+            control.request_host_exit();
+        }
+    }));
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[0] = 7;
+    frame.x[8] = 94;
+    assert_eq!(
+        arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+    );
+    assert!(
+        control.host_exit_requested(),
+        "a host birth published after the snapshot must see terminal cancellation"
+    );
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
+    page.reserve_cancelled_member_exit().unwrap().publish();
+    page.publish_exact_host_retirement(control, receipt);
+    assert!(matches!(
+        wake_closing_root(fixture, &mut service),
+        crate::sched::ResumeAction::Left
+    ));
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
+    assert_eq!(service.crossing.root_exit_status.load(Ordering::Acquire), 7);
+}
+
+#[test]
+fn arm_reserved_pool_control_is_not_transiently_registered() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    let control = Box::leak(Box::new(ThreadControlSlot::new()));
+    let entry = fixture
+        .page
+        .stock(
+            0,
+            carrick_el1_abi::EntryIdentity {
+                tid: 42,
+                visible_tid: 42,
+                thread_serial: 102,
+                execution: carrick_core_abi::EntryGeneration::from_raw(11),
+                uid_credit: 0,
+            },
+        )
+        .unwrap();
+    fixture
+        .page
+        .bind_control_address(entry, control as *const _ as u64)
+        .unwrap();
+    control
+        .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry)
+        .unwrap();
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[0] = 7;
+    frame.x[8] = 94;
+    arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap();
+    assert!(
+        !control.graph_referenced(),
+        "a Reserved control must not acquire a graph reference"
+    );
+    assert!(
+        !control.graph_unregister_receipt(),
+        "a skipped control must not acquire GRAPH_REGISTERED"
+    );
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
+    assert_eq!(service.crossing.root_exit_status.load(Ordering::Acquire), 7);
 }
 
 #[test]
@@ -3540,7 +3685,7 @@ fn arm_failed_member_retain_leaves_terminal_admission_unbegun() {
         2,
         "failed retain must not consume caller membership"
     );
-    assert_eq!(fixture.page.gate(), carrick_el1_abi::GateState::Open);
+    assert_eq!(fixture.page.gate(), carrick_el1_abi::GateState::Closed);
     drop(reset);
     assert_eq!(
         arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap(),
