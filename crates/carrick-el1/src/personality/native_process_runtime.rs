@@ -830,7 +830,16 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                                 state
                                     .members
                                     .get(key)
-                                    .map(|member| (binding, member.control, member.record))
+                                    // A re-registered pool member returns its
+                                    // exact entry receipt, never a second host
+                                    // retirement receipt for the same identity.
+                                    .and_then(|member| {
+                                        member.control.entry().is_none().then_some((
+                                            binding,
+                                            member.control,
+                                            member.record,
+                                        ))
+                                    })
                             })
                             .flatten()
                     })

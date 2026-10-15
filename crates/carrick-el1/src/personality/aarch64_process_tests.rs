@@ -3098,6 +3098,59 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
 }
 
 #[test]
+fn arm_adopted_pool_exit_in_progress_settles_group_once() {
+    use carrick_el1_abi::Lifecycle;
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let (control, record) = imported_thread(fixture);
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    run_as(fixture, 42, 12, 102, control);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        record.id
+    );
+    registry()
+        .register_thread(
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            &fixture.task,
+            fixture.address,
+            fixture.page,
+            control,
+        )
+        .unwrap();
+    let membership = fixture.page.reserve_nonfinal_exit().unwrap();
+    let exiting = fixture.page.begin_exit(control.entry().unwrap()).unwrap();
+    fixture.zone.clear_current(fixture.slot);
+    run_as_leader(fixture);
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[0] = 7;
+    frame.x[8] = 94;
+    assert_eq!(
+        arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+    );
+    exiting.commit().unwrap();
+    membership.publish();
+    assert_eq!(fixture.page.live(), 0);
+    assert!(matches!(
+        wake_closing_root(fixture, &mut service),
+        crate::sched::ResumeAction::Left
+    ));
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
+    assert_eq!(service.crossing.root_exit_status.load(Ordering::Acquire), 7);
+}
+
+#[test]
 #[allow(clippy::disallowed_methods)] // VM-free two-actor admission witness.
 fn arm_host_birth_adoption_racing_closing_has_one_cancel_owner() {
     use carrick_el1_abi::Lifecycle;
