@@ -1222,6 +1222,29 @@ mod tests {
     }
 
     #[test]
+    fn ipc_perm_accepts_creator_and_supplementary_group_but_not_other() {
+        let mut creator = TaskCredentials::ROOT;
+        creator.euid = TaskUid::new(1001);
+        creator.egid = TaskGid::new(2001);
+        creator.cap_effective = LinuxCapabilitySet::empty();
+        let mut perm = IpcPerm::new(77, 0o040, 1, &creator);
+        perm.uid = TaskUid::new(1002);
+        perm.gid = TaskGid::new(2002);
+        let mut caller = creator.clone();
+        caller.euid = TaskUid::new(1003);
+        caller.egid = TaskGid::new(2003);
+        caller.groups = alloc::vec![TaskGid::new(2001)];
+        assert_eq!(perm.check_perm(&caller, 0o400), Ok(()));
+        caller.groups.clear();
+        assert_eq!(perm.check_perm(&caller, 0o400), Err(IpcError::PermissionDenied));
+        assert_eq!(IpcError::PermissionDenied.guest_retval(), -13);
+
+        perm.mode = 0o400;
+        caller.euid = creator.euid;
+        assert_eq!(perm.check_perm(&caller, 0o400), Ok(()));
+    }
+
+    #[test]
     fn test_sysv_msg_round_trip() {
         let creds = TaskCredentials::ROOT;
         let mut ns = IpcNamespace::new();
