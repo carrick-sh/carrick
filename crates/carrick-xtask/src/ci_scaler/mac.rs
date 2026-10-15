@@ -15,7 +15,7 @@
 //! session before any workflow step, exactly as on Willow clones. The JIT
 //! config reaches the runner only through `ACTIONS_RUNNER_INPUT_JITCONFIG`.
 use super::assignment::admit_demand;
-use super::github::Github;
+use super::github::{Github, QueuedJob};
 use super::*;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -430,30 +430,36 @@ type Launch = (
     std::thread::JoinHandle<Result<Vec<u8>, ScalerError>>,
 );
 
-pub(super) fn prioritize_demand(mut demand: Vec<(JobKey, String)>) -> Vec<JobKey> {
-    let pending_group = demand.iter().any(|(_, event)| event == "merge_group");
+pub(super) fn prioritize_demand(
+    mut demand: Vec<QueuedJob>,
+    required_pushes: &[JobKey],
+) -> Vec<JobKey> {
+    let pending_group = demand.iter().any(|job| job.event == "merge_group");
     let newest_push = demand
         .iter()
-        .filter(|(_, event)| event == "push")
-        .map(|(key, _)| key.run.0)
+        .filter(|job| job.event == "push")
+        .map(|job| job.key.run.0)
         .max();
-    // A group remains pending even when its current vet is temporarily
-    // superseded. Keep main pushes in the GitHub queue, not this pass's
-    // runner candidates, so they can become eligible on a later observation.
-    demand.retain(|(key, event)| match event.as_str() {
-        "push" => !pending_group && Some(key.run.0) == newest_push,
+    // A group's base receipt is a dependency of its hosted gate. Its pending
+    // producer stays eligible even while other main pushes are deferred.
+    demand.retain(|job| match job.event.as_str() {
+        "push" => {
+            required_pushes.contains(&job.key)
+                || (!pending_group && Some(job.key.run.0) == newest_push)
+        }
         _ => true,
     });
-    demand.sort_by_key(|(key, event)| {
-        let priority = match event.as_str() {
-            "merge_group" => 0,
-            "push" => 1,
-            _ => 2, // Admitted owner workflow_dispatch on main.
+    demand.sort_by_key(|job| {
+        let priority = match job.event.as_str() {
+            "push" if required_pushes.contains(&job.key) => 0,
+            "merge_group" => 1,
+            "push" => 2,
+            _ => 3, // Admitted owner workflow_dispatch on main.
         };
-        (priority, key.job.0)
+        (priority, job.key.job.0)
     });
-    demand.dedup();
-    demand.into_iter().map(|(key, _)| key).collect()
+    demand.dedup_by_key(|job| job.key.job.0);
+    demand.into_iter().map(|job| job.key).collect()
 }
 
 fn launch(
@@ -584,14 +590,14 @@ pub(super) fn controller(
             }
         } else {
             gh.mac_demand()
-                .map(prioritize_demand)
                 .and_then(|demand| {
+                    let ordered = prioritize_demand(demand.jobs, &demand.required_pushes);
                     admit_demand(
                         &mut ledger,
                         &path,
-                        demand,
+                        ordered,
                         |job| {
-                            gh.vet(&Admission::Standing, job)
+                            gh.vet_mac(job, demand.queue.as_ref())
                                 .map(|policy| (job, policy))
                         },
                         |run| gh.cancel_run(run),
@@ -1566,13 +1572,33 @@ mod tests {
         let path = dir.path().join("ledger.json");
         let mut ledger = MacLedger::default();
         let demand = vec![
-            (job(1), "push".into()),
-            (job(5), "push".into()),
-            (job(4), "merge_group".into()),
-            (job(3), "merge_group".into()),
-            (job(6), "workflow_dispatch".into()),
+            QueuedJob {
+                key: job(1),
+                event: "push".into(),
+                sha: "1".repeat(40),
+            },
+            QueuedJob {
+                key: job(5),
+                event: "push".into(),
+                sha: "5".repeat(40),
+            },
+            QueuedJob {
+                key: job(4),
+                event: "merge_group".into(),
+                sha: "4".repeat(40),
+            },
+            QueuedJob {
+                key: job(3),
+                event: "merge_group".into(),
+                sha: "3".repeat(40),
+            },
+            QueuedJob {
+                key: job(6),
+                event: "workflow_dispatch".into(),
+                sha: "6".repeat(40),
+            },
         ];
-        let ordered = prioritize_demand(demand);
+        let ordered = prioritize_demand(demand, &[]);
         let mut admitted = Vec::new();
         for _ in 0..3 {
             let key = admit_demand(&mut ledger, &path, ordered.clone(), Ok, |_| Ok(()))

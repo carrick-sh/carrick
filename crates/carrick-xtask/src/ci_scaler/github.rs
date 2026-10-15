@@ -3,7 +3,20 @@
 use super::*;
 use serde_json::{Value, json};
 
-const MERGE_QUEUE_QUERY: &str = "query { repository(owner: \"carrick-sh\", name: \"carrick\") { mergeQueue(branch: \"main\") { entries(first: 100) { pageInfo { hasNextPage } nodes { position headCommit { oid } pullRequest { number headRepository { nameWithOwner } } } } } } }";
+#[derive(Clone)]
+pub(super) struct QueuedJob {
+    pub key: JobKey,
+    pub event: String,
+    pub sha: String,
+}
+
+pub(super) struct MacDemand {
+    pub jobs: Vec<QueuedJob>,
+    pub queue: Option<Value>,
+    pub required_pushes: Vec<JobKey>,
+}
+
+const MERGE_QUEUE_QUERY: &str = "query { repository(owner: \"carrick-sh\", name: \"carrick\") { mergeQueue(branch: \"main\") { entries(first: 100) { pageInfo { hasNextPage } nodes { position baseCommit { oid } headCommit { oid } pullRequest { number headRepository { nameWithOwner } } } } } } }";
 
 pub(super) struct Github;
 impl Github {
@@ -72,21 +85,59 @@ impl Github {
         let mut demand: Vec<_> = self
             .queued_demand(admission, labels)?
             .into_iter()
-            .map(|(key, _)| key)
+            .map(|job| job.key)
             .collect();
         demand.sort_by_key(|key| key.job.0);
         demand.dedup();
         Ok(demand)
     }
     /// Retain the admitted event for cloudmac scheduling; no wider admission.
-    pub(super) fn mac_demand(&self) -> Result<Vec<(JobKey, String)>, ScalerError> {
-        self.queued_demand(&Admission::Standing, &HVF_LABELS)
+    pub(super) fn mac_demand(&self) -> Result<MacDemand, ScalerError> {
+        let jobs = self.queued_demand(&Admission::Standing, &HVF_LABELS)?;
+        let queue = if jobs.iter().any(|job| job.event == "merge_group") {
+            Some(self.request(
+                "POST",
+                "graphql",
+                Some(json!({ "query": MERGE_QUEUE_QUERY })),
+                false,
+            )?)
+        } else {
+            None
+        };
+        let required_pushes =
+            if let Some(queue) = &queue {
+                required_base_pushes(&jobs, queue, |key, sha| {
+                    let data = self.request(
+                        "GET",
+                        &format!(
+                            "repos/{REPOSITORY}/actions/runs/{}/artifacts?per_page=100",
+                            key.run.0
+                        ),
+                        None,
+                        true,
+                    )?;
+                    let artifacts = json!({ "artifacts": pages(&data, "artifacts")? });
+                    Ok(crate::ci_receipt::newest_receipt(
+                        &artifacts,
+                        crate::ci_receipt::Lane::Hvf,
+                        sha,
+                    )
+                    .is_some())
+                })?
+            } else {
+                Vec::new()
+            };
+        Ok(MacDemand {
+            jobs,
+            queue,
+            required_pushes,
+        })
     }
     fn queued_demand(
         &self,
         admission: &Admission,
         labels: &[&str],
-    ) -> Result<Vec<(JobKey, String)>, ScalerError> {
+    ) -> Result<Vec<QueuedJob>, ScalerError> {
         let mut demand = Vec::new();
         for status in ["queued", "in_progress"] {
             for run in self.workflow_runs(admission, status)? {
@@ -101,8 +152,8 @@ impl Github {
                         .filter_map(Value::as_str)
                         .collect();
                     if job["status"] == "queued" && labels_match(labels, &job_labels) {
-                        demand.push((
-                            JobKey {
+                        demand.push(QueuedJob {
+                            key: JobKey {
                                 run: RunId(
                                     run["id"].as_u64().ok_or(ScalerError::External("run id"))?,
                                 ),
@@ -114,17 +165,22 @@ impl Github {
                                     job["id"].as_u64().ok_or(ScalerError::External("job id"))?,
                                 ),
                             },
-                            run["event"]
+                            event: run["event"]
                                 .as_str()
                                 .ok_or(ScalerError::External("run event"))?
                                 .to_owned(),
-                        ));
+                            sha: run["head_sha"]
+                                .as_str()
+                                .filter(|sha| full_sha(sha))
+                                .ok_or(ScalerError::External("run head SHA"))?
+                                .to_ascii_lowercase(),
+                        });
                     }
                 }
             }
         }
-        demand.sort_by_key(|(key, _)| key.job.0);
-        demand.dedup();
+        demand.sort_by_key(|job| job.key.job.0);
+        demand.dedup_by_key(|job| job.key.job.0);
         Ok(demand)
     }
     /// Mint one-use JIT material for `name`. The returned encoded config is
@@ -159,9 +215,29 @@ impl Github {
     /// attempt, and for a merge group only pull requests whose heads live in
     /// this repository. The runner is bound to this exact run and SHA.
     pub(super) fn vet(&self, admission: &Admission, key: JobKey) -> Result<JobPolicy, ScalerError> {
-        Self::vet_inner(admission, key, true, |method, endpoint, body, paginate| {
-            self.request(method, endpoint, body, paginate)
-        })
+        Self::vet_inner(
+            admission,
+            key,
+            true,
+            None,
+            |method, endpoint, body, paginate| self.request(method, endpoint, body, paginate),
+        )
+    }
+
+    /// Reuse the queue observation that selected the mac-jit reservation.
+    /// A stale observation is refreshed by the normal two-read verifier.
+    pub(super) fn vet_mac(
+        &self,
+        key: JobKey,
+        queue: Option<&Value>,
+    ) -> Result<JobPolicy, ScalerError> {
+        Self::vet_inner(
+            &Admission::Standing,
+            key,
+            true,
+            queue,
+            |method, endpoint, body, paginate| self.request(method, endpoint, body, paginate),
+        )
     }
 
     /// Assigned hooks cannot defer without failing their job. Keep all normal
@@ -171,6 +247,7 @@ impl Github {
             &Admission::Standing,
             key,
             false,
+            None,
             |method, endpoint, body, paginate| self.request(method, endpoint, body, paginate),
         )
     }
@@ -179,6 +256,7 @@ impl Github {
         admission: &Admission,
         key: JobKey,
         supersession: bool,
+        first_queue: Option<&Value>,
         mut request: impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
     ) -> Result<JobPolicy, ScalerError> {
         let run = request(
@@ -199,13 +277,18 @@ impl Github {
             .to_ascii_lowercase();
         if run["event"] == "merge_group" {
             let mut queue = Value::Null;
+            let mut first_queue = first_queue;
             confirm_merge_group(&sha, || {
-                queue = request(
-                    "POST",
-                    "graphql",
-                    Some(json!({ "query": MERGE_QUEUE_QUERY })),
-                    false,
-                )?;
+                queue = if let Some(observed) = first_queue.take() {
+                    observed.clone()
+                } else {
+                    request(
+                        "POST",
+                        "graphql",
+                        Some(json!({ "query": MERGE_QUEUE_QUERY })),
+                        false,
+                    )?
+                };
                 Ok(queue.clone())
             })?;
             // One page and at most five comparisons per reservation vet.
@@ -354,6 +437,55 @@ fn confirm_merge_group(
         Err(ScalerError::StaleMergeGroup) => vet_merge_group(&observe()?, sha),
         result => result,
     }
+}
+
+/// Preserve the receipt producers required by currently admitted groups.
+/// Only the existing merge-queue observation supplies the base SHA; a
+/// truncated or malformed observation cannot justify filtering a push.
+pub(super) fn required_base_pushes(
+    jobs: &[QueuedJob],
+    queue: &Value,
+    mut has_receipt: impl FnMut(JobKey, &str) -> Result<bool, ScalerError>,
+) -> Result<Vec<JobKey>, ScalerError> {
+    if queue.get("errors").is_some() {
+        return Err(ScalerError::External("merge queue GraphQL errors"));
+    }
+    let entries = &queue["data"]["repository"]["mergeQueue"]["entries"];
+    if entries["pageInfo"]["hasNextPage"] != false {
+        return Err(ScalerError::External("merge queue pagination"));
+    }
+    let nodes = entries["nodes"]
+        .as_array()
+        .ok_or(ScalerError::External("merge queue entries"))?;
+    let mut bases = Vec::new();
+    for group in jobs.iter().filter(|job| job.event == "merge_group") {
+        let Some(node) = nodes.iter().find(|node| {
+            node["headCommit"]["oid"]
+                .as_str()
+                .is_some_and(|sha| sha.eq_ignore_ascii_case(&group.sha))
+        }) else {
+            // Vetting will handle a group that left the queue.
+            continue;
+        };
+        if !merge_group_heads_trusted(queue, &group.sha) {
+            continue;
+        }
+        let base = node["baseCommit"]["oid"]
+            .as_str()
+            .filter(|sha| full_sha(sha))
+            .ok_or(ScalerError::External("merge group base SHA"))?
+            .to_ascii_lowercase();
+        if !bases.contains(&base) {
+            bases.push(base);
+        }
+    }
+    let mut required = Vec::new();
+    for push in jobs.iter().filter(|job| job.event == "push") {
+        if bases.contains(&push.sha) && !has_receipt(push.key, &push.sha)? {
+            required.push(push.key);
+        }
+    }
+    Ok(required)
 }
 
 fn vet_merge_group(queue: &Value, sha: &str) -> Result<(), ScalerError> {
@@ -584,6 +716,7 @@ mod tests {
                 &Admission::Standing,
                 key,
                 false,
+                None,
                 |method, endpoint, _, _| match (method, endpoint) {
                     ("GET", "repos/carrick-sh/carrick/actions/runs/2") => Ok(runs[1].clone()),
                     ("POST", "graphql") => Ok(queue.clone()),
@@ -603,6 +736,37 @@ mod tests {
                 assert!(matches!(policy, Err(ScalerError::Guard(_))));
             }
         }
+    }
+
+    #[test]
+    fn mac_vet_reuses_demand_queue_observation() {
+        let (queue, runs) = cumulative();
+        let key = JobKey {
+            run: RunId(2),
+            attempt: 1,
+            job: JobId(2),
+        };
+        let policy = Github::vet_inner(
+            &Admission::Standing,
+            key,
+            true,
+            Some(&queue),
+            |method, endpoint, _, _| match (method, endpoint) {
+                ("GET", "repos/carrick-sh/carrick/actions/runs/2") => Ok(runs[1].clone()),
+                ("GET", _) => Err(ScalerError::External("depth unavailable")),
+                ("POST", "graphql") => panic!("demand already observed the merge queue"),
+                _ => panic!("unexpected request: {endpoint}"),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            policy,
+            JobPolicy::Bound(RunBinding {
+                run: key.run,
+                attempt: key.attempt,
+                sha: format!("{:040x}", 2),
+            })
+        );
     }
 
     #[test]
