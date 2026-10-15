@@ -4,7 +4,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
-use core::num::NonZeroU64;
+use core::num::{NonZeroI32, NonZeroU64};
 
 use carrick_core_abi::entry::{
     EntryGeneration, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
@@ -14,6 +14,14 @@ use carrick_guest_arch::{AddressContext, RootGpa};
 use carrick_sched_core::process::{TaskId, TaskKey, TaskSerial, TerminationStatus};
 
 use crate::lifecycle::{Lifecycle, MembershipFloor, NonfinalExitMembership};
+
+fn task_id_from_binding(binding: ExecutionBinding) -> Option<TaskId> {
+    let raw = i32::try_from(binding.task.raw()).ok()?;
+    if raw <= 0 {
+        return None;
+    }
+    Some(TaskId::from_registry_allocation(NonZeroI32::new(raw)?))
+}
 
 pub struct Thread;
 pub struct Process;
@@ -207,7 +215,7 @@ impl ThreadTerminalIdentity {
         entry: Option<EntryRef>,
         status: TerminationStatus,
     ) -> Option<Self> {
-        TaskId::from_abi_positive(i32::try_from(binding.task.raw()).ok()?).ok()?;
+        task_id_from_binding(binding)?;
         let entry = match entry {
             Some(entry) => Some(NonZeroU64::new(entry.pack())?),
             None => None,
@@ -221,7 +229,7 @@ impl ThreadTerminalIdentity {
 
     pub fn task(&self) -> Option<TaskKey> {
         Some(TaskKey {
-            id: TaskId::from_abi_positive(i32::try_from(self.binding.task.raw()).ok()?).ok()?,
+            id: task_id_from_binding(self.binding)?,
             serial: TaskSerial::from_raw_u64(self.binding.generation.raw())?,
         })
     }
@@ -411,7 +419,7 @@ mod tests {
         };
         let identity = ProcessTerminalIdentity::from_exit(
             TaskKey {
-                id: TaskId::from_abi_positive(41).unwrap(),
+                id: TaskId::from_registry_allocation(NonZeroI32::new(41).unwrap()),
                 serial: TaskSerial::from_raw_u64(11).unwrap(),
             },
             AddressContext {
