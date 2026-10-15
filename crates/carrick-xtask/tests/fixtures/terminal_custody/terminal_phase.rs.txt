@@ -1,0 +1,1 @@
+fn park_pending_exit(x: TerminalPhase) { if x == TerminalPhase::Retired {} }

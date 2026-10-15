@@ -10,29 +10,82 @@ const BASELINE: &str = "scripts/terminal-custody-baseline.txt";
 
 #[derive(Default)]
 struct DecisionFinder {
-    found: bool,
+    rules: BTreeSet<&'static str>,
     group_exit_failure: bool,
 }
 
 impl<'ast> Visit<'ast> for DecisionFinder {
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        fn identifiers(tokens: proc_macro2::TokenStream, rules: &mut BTreeSet<&'static str>) {
+            for token in tokens {
+                match token {
+                    proc_macro2::TokenTree::Ident(ident) if ident == "EntryState" => {
+                        rules.insert("EntryState");
+                    }
+                    proc_macro2::TokenTree::Ident(ident) if ident == "TerminalPhase" => {
+                        rules.insert("TerminalPhase");
+                    }
+                    proc_macro2::TokenTree::Group(group) => identifiers(group.stream(), rules),
+                    _ => {}
+                }
+            }
+        }
+        identifiers(node.tokens.clone(), &mut self.rules);
+        visit::visit_macro(self, node);
+    }
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-        if matches!(
-            node.method.to_string().as_str(),
-            "live" | "claimed_count" | "task_is_live" | "hardware_live_root"
-        ) {
-            self.found = true;
+        match node.method.to_string().as_str() {
+            "live" => {
+                self.rules.insert("live");
+            }
+            "claimed_count" => {
+                self.rules.insert("claimed_count");
+            }
+            "task_is_live" => {
+                self.rules.insert("task_is_live");
+            }
+            "hardware_live_root" => {
+                self.rules.insert("hardware_live_root");
+            }
+            _ => {}
         }
         visit::visit_expr_method_call(self, node);
     }
 
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(path) = &*node.func {
+            if let Some(last) = path.path.segments.last() {
+                match last.ident.to_string().as_str() {
+                    "live" => {
+                        self.rules.insert("live");
+                    }
+                    "claimed_count" => {
+                        self.rules.insert("claimed_count");
+                    }
+                    "task_is_live" => {
+                        self.rules.insert("task_is_live");
+                    }
+                    "hardware_live_root" => {
+                        self.rules.insert("hardware_live_root");
+                    }
+                    _ => {}
+                }
+            }
+        }
+        visit::visit_expr_call(self, node);
+    }
+
     fn visit_path(&mut self, node: &'ast syn::Path) {
-        if node.segments.iter().any(|segment| {
-            matches!(
-                segment.ident.to_string().as_str(),
-                "EntryState" | "TerminalPhase"
-            )
-        }) {
-            self.found = true;
+        for segment in &node.segments {
+            match segment.ident.to_string().as_str() {
+                "EntryState" => {
+                    self.rules.insert("EntryState");
+                }
+                "TerminalPhase" => {
+                    self.rules.insert("TerminalPhase");
+                }
+                _ => {}
+            }
         }
         visit::visit_path(self, node);
     }
@@ -85,25 +138,38 @@ impl FunctionSites {
         let name = name.to_string();
         let mut finder = DecisionFinder::default();
         finder.visit_block(body);
-        let retirement_decision = finder.found
-            && (name.starts_with("retire_")
-                || name.starts_with("settle_")
-                || name.starts_with("reap"));
-        let syscall_exit =
-            name == "exit_group" || name == "exit_with_status" || name == "serve_exit";
-        let forbidden_failure =
-            finder.group_exit_failure && syscall_exit && !self.path.contains("/signal");
-        if retirement_decision || forbidden_failure {
-            self.names.insert(match &self.owner {
+        if finder.group_exit_failure
+            && !self.path.contains("/signal")
+            && !self.path.ends_with("/native_run_failure.rs")
+        {
+            finder.rules.insert("X86GroupExitCustody");
+        }
+        for rule in finder.rules {
+            let location = match &self.owner {
                 Some(owner) => format!("{owner}::{name}"),
-                None => name,
-            });
+                None => name.clone(),
+            };
+            self.names.insert(format!("{location}|{rule}"));
         }
     }
 }
 
+fn test_only(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        attr.path().is_ident("cfg") && attr.meta.to_token_stream().to_string().contains("test")
+    })
+}
+
 impl<'ast> Visit<'ast> for FunctionSites {
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if !test_only(&node.attrs) {
+            visit::visit_item_mod(self, node);
+        }
+    }
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if test_only(&node.attrs) {
+            return;
+        }
         let previous = self
             .owner
             .replace(node.self_ty.to_token_stream().to_string());
@@ -112,11 +178,17 @@ impl<'ast> Visit<'ast> for FunctionSites {
     }
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        if test_only(&node.attrs) {
+            return;
+        }
         self.record(&node.sig.ident, &node.block);
         visit::visit_item_fn(self, node);
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        if test_only(&node.attrs) {
+            return;
+        }
         self.record(&node.sig.ident, &node.block);
         visit::visit_impl_item_fn(self, node);
     }
@@ -133,6 +205,17 @@ fn production_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(
             production_files(root, &path, out)?;
         } else if path.extension().is_some_and(|extension| extension == "rs")
             && path.starts_with(root.join("crates"))
+            && !path
+                .components()
+                .any(|component| component.as_os_str() == "tests")
+            && !path
+                .components()
+                .any(|component| component.as_os_str() == "test_support")
+            && !path.file_name().is_some_and(|name| {
+                name.to_string_lossy().ends_with("_tests.rs")
+                    || name == "tests.rs"
+                    || name == "test_support.rs"
+            })
         {
             out.push(path);
         }
@@ -229,6 +312,10 @@ fn validate(sites: &BTreeSet<String>, allowed: &BTreeSet<String>) -> Result<(), 
     if !added.is_empty() {
         return Err(format!("new retirement decisions outside core: {added:?}"));
     }
+    let stale: Vec<_> = allowed.difference(sites).collect();
+    if !stale.is_empty() {
+        return Err(format!("stale terminal custody baseline rows: {stale:?}"));
+    }
     Ok(())
 }
 
@@ -240,7 +327,7 @@ mod tests {
     fn negative_fixture_finds_renamed_file_and_deciding_method() {
         let source = include_str!("../tests/fixtures/terminal_custody/negative.rs.txt");
         let sites = sites_in_source("crates/new-lane/src/owner.rs", source).unwrap();
-        assert!(sites.contains("crates/new-lane/src/owner.rs|Owner::retire_thread"));
+        assert!(sites.contains("crates/new-lane/src/owner.rs|Owner::retire_thread|live"));
         assert!(validate(&sites, &BTreeSet::from(["other".to_owned()])).is_err());
     }
 
@@ -278,6 +365,61 @@ mod tests {
             "fn exit_group() { NativeRunFailureReason::X86GroupExitCustody; }",
         )
         .unwrap();
-        assert!(sites.contains("crates/new-lane/src/exit.rs|exit_group"));
+        assert!(sites.contains("crates/new-lane/src/exit.rs|exit_group|X86GroupExitCustody"));
+    }
+
+    #[test]
+    fn decision_expressions_are_found_without_retirement_function_names() {
+        for (name, source) in [
+            (
+                "live",
+                include_str!("../tests/fixtures/terminal_custody/live.rs.txt"),
+            ),
+            (
+                "claimed_count",
+                include_str!("../tests/fixtures/terminal_custody/claimed_count.rs.txt"),
+            ),
+            (
+                "EntryState",
+                include_str!("../tests/fixtures/terminal_custody/entry_state.rs.txt"),
+            ),
+            (
+                "TerminalPhase",
+                include_str!("../tests/fixtures/terminal_custody/terminal_phase.rs.txt"),
+            ),
+            (
+                "task_is_live",
+                include_str!("../tests/fixtures/terminal_custody/task_is_live.rs.txt"),
+            ),
+            (
+                "hardware_live_root",
+                include_str!("../tests/fixtures/terminal_custody/hardware_live_root.rs.txt"),
+            ),
+            (
+                "X86GroupExitCustody",
+                include_str!("../tests/fixtures/terminal_custody/group_exit.rs.txt"),
+            ),
+        ] {
+            let sites = sites_in_source("crates/new-lane/src/custody.rs", source).unwrap();
+            assert!(
+                sites.iter().any(|site| site.ends_with(name)),
+                "missed {name}: {sites:?}"
+            );
+            assert!(
+                validate(&sites, &BTreeSet::from(["unrelated allowance".to_owned()])).is_err(),
+                "planted {name} violation passed the gate"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_baseline_row_fails_even_without_new_sites() {
+        assert!(
+            validate(
+                &BTreeSet::from(["live".to_owned()]),
+                &BTreeSet::from(["live".to_owned(), "stale".to_owned()])
+            )
+            .is_err()
+        );
     }
 }
