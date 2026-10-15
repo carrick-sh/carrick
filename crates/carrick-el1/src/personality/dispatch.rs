@@ -56,6 +56,11 @@ fn ppoll_timeout_ms(
 pub trait GuestDispatchFrame: SyscallFrame {
     fn native_number(&self) -> carrick_guest_arch::NativeOrdinal;
     fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet;
+    /// Whether this execution venue settles owed work at an owned wait's
+    /// park boundary and after restoring a signal frame before guest return.
+    fn settles_owed_work_at_continuation_boundary(&self) -> bool {
+        false
+    }
     fn crossing_strict(&self, arm_policy: impl FnOnce() -> bool) -> bool {
         match self.crossing_set() {
             carrick_personality_linux::crossing::HostCrossingSet::X86 => true,
@@ -1410,6 +1415,9 @@ impl<
     }
     fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
         self.frame.crossing_set()
+    }
+    fn settles_owed_work_at_continuation_boundary(&self) -> bool {
+        self.frame.settles_owed_work_at_continuation_boundary()
     }
     fn native_number(&self) -> Option<carrick_personality_linux::crossing::NativeNr> {
         Some(carrick_personality_linux::crossing::NativeNr(

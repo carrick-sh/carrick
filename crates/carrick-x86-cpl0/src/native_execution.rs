@@ -4,7 +4,6 @@
 
 use carrick_el1::isa::x86::{self, context};
 use carrick_guest_arch::MmuBackend;
-use carrick_personality_linux::lifecycle::ProcessNative;
 use carrick_sched_core::SlotId;
 use carrick_x86_carrier::entry::{fatal_boot, user_fault_gate};
 use carrick_x86_carrier::native_execution::{leave_space, publish_root_exit, task};

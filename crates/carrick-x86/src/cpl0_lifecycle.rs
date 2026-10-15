@@ -1073,6 +1073,11 @@ impl<'a> PendingFamilies<'a> for NativeLane<'a> {
     fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
         carrick_personality_linux::crossing::HostCrossingSet::X86
     }
+    fn settles_owed_work_at_continuation_boundary(&self) -> bool {
+        // The carrier clears earlier work before wait4 dispatch; a completed
+        // signal return publishes its work before the guest resumes.
+        true
+    }
     fn take_handoff_receipt(&mut self) -> Option<carrick_core_abi::EntryHandoffReceipt> {
         self.handoff.take()
     }

@@ -110,6 +110,9 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
     fn crossing_set(&self) -> carrick_personality_linux::crossing::HostCrossingSet {
         carrick_personality_linux::crossing::HostCrossingSet::X86
     }
+    fn settles_owed_work_at_continuation_boundary(&self) -> bool {
+        true
+    }
 
     fn may_serve_descriptor(&self) -> bool {
         [
@@ -891,6 +894,12 @@ impl Personality for LinuxPersonality {
 
     fn call_stack(&self, call: &Self::Call) -> UserVa {
         call.stack
+    }
+
+    fn settle_work_before_dispatch(&self, call: &Self::Call) -> bool {
+        carrick_syscall_abi::syscall_x86_64::canonical_x86_64(carrick_syscall_abi::NativeNr(
+            call.native.raw(),
+        )) == Some(carrick_syscall_abi::nr::WAIT4)
     }
 
     fn handle_unrecognized_call(

@@ -231,6 +231,12 @@ pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadC
         self.task_state()
             .is_some_and(crate::abi::entry::LinuxTaskState::has_pending_host_work)
     }
+    /// This venue settles earlier host work before an owned wait can park and
+    /// after signal-frame restoration before guest return. Only such venues
+    /// may pass those calls through the generic pending-work gate.
+    fn settles_owed_work_at_continuation_boundary(&self) -> bool {
+        false
+    }
     /// A returned in-ring result must cross the existing completed boundary
     /// before resuming the guest, so the host completion owner can publish it.
     /// This is completion work, never permission to replay the call.
@@ -1034,7 +1040,19 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
     // Serve them before handing back metadata work; an absent owner still
     // declines through Unported crossing policy, never host identity replay.
     let owned_identity = matches!(family, Family::Identity(_) | Family::Sysinfo(_));
-    if pending.host_work() && !pending.resumes_operation() && !transfer && !setup && !owned_identity
+    // The execution venue, not its ISA, owns the settlement guarantee.
+    let owned_continuation = pending.settles_owed_work_at_continuation_boundary()
+        && matches!(
+            family,
+            Family::Signal(crate::signal::SignalCall::RtSigreturn)
+                | Family::Lifecycle(LifecycleCall::Wait4)
+        );
+    if pending.host_work()
+        && !pending.resumes_operation()
+        && !transfer
+        && !setup
+        && !owned_identity
+        && !owned_continuation
     {
         pending.declined_for_work(ordinal);
         return finish(
@@ -1170,6 +1188,9 @@ mod ring_first_tests {
         }
         fn crossing_set(&self) -> HostCrossingSet {
             self.set
+        }
+        fn settles_owed_work_at_continuation_boundary(&self) -> bool {
+            self.set == HostCrossingSet::X86
         }
         fn ring_first_strict(&self) -> bool {
             self.strict
@@ -1433,7 +1454,10 @@ mod ring_first_tests {
                 "ordinal={ordinal} work={work} handback={handback}"
             );
             if ordinal == 260 && work {
-                assert_eq!(pending.result, 42, "ARM wait4 must hand back before its owner runs");
+                assert_eq!(
+                    pending.result, 42,
+                    "ARM wait4 must hand back before its owner runs"
+                );
             }
             if ordinal == 174 {
                 assert_eq!(
