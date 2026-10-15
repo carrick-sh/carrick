@@ -229,6 +229,8 @@ pub struct DentryCache {
     next_dentry_id: AtomicU64,
     #[cfg(test)]
     before_entry_remove_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    parent_inode_lock_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     is_shared: bool,
     host_opens: AtomicU64,
     #[cfg(any(test, feature = "test-support"))]
@@ -362,6 +364,8 @@ impl DentryCache {
             next_dentry_id: AtomicU64::new(1),
             #[cfg(test)]
             before_entry_remove_hook: Mutex::new(None),
+            #[cfg(test)]
+            parent_inode_lock_hook: Mutex::new(None),
             is_shared,
             host_opens: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-support"))]
@@ -3031,6 +3035,10 @@ impl DentryCache {
 
             let parent_gen = {
                 let dirs = self.dirs.read();
+                #[cfg(test)]
+                if let Some(hook) = self.parent_inode_lock_hook.lock().clone() {
+                    hook();
+                }
                 if let Some(d) = dirs.get(&parent_id) {
                     if self.inodes.write().remove(&(d.dev, d.ino)).is_some() {
                         self.sub_approx_bytes(inode_approx_bytes());
@@ -3414,6 +3422,50 @@ mod tests {
     use crate::fs_backend::HostFsBackend;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn entry_removal_never_holds_dirs_while_waiting_for_inodes() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let cache = Arc::new(DentryCache::new_with_capacity(
+            false,
+            32 * 1024 * 1024,
+            true,
+            Arc::default(),
+        ));
+        let (at_parent_tx, at_parent_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        *cache.parent_inode_lock_hook.lock() = Some(Arc::new(move || {
+            at_parent_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+        }));
+
+        let worker_cache = Arc::clone(&cache);
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            worker_cache.entry_removed("/victim", None);
+            done_tx.send(()).unwrap();
+        });
+        at_parent_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // If this thread can own inodes(W) while the remover owns dirs(R),
+        // the normal entries/inodes/dirs writer can wait on that reader and
+        // the remover can then wait on this writer: the ABBA state is live.
+        let inverted = cache.inodes.try_write().is_some_and(|inodes| {
+            let dirs_blocked = cache.dirs.try_write().is_none();
+            drop(inodes);
+            dirs_blocked
+        });
+        release_tx.send(()).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        assert!(!inverted, "dirs(R) preceded inodes(W) during removal");
+    }
 
     #[test]
     fn late_lower_directory_absence_cannot_hide_published_whiteout() {
