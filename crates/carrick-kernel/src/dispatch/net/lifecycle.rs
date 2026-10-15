@@ -1406,7 +1406,7 @@ impl<'a> NetView<'a> {
                         type_,
                         protocol,
                         base.inzone_listener(),
-                        base.recv_timeout(),
+                        socket.get_rcvtimeo(),
                     )
                 }
                 _ => {
