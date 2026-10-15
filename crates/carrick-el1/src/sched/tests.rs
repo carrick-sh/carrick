@@ -1663,6 +1663,33 @@ fn el1_ipc_wait_cross_slot_wake_sends_sgi_after_queue_unlock() {
     assert!(!task.linux.has_pending_host_work());
 }
 
+#[test]
+fn arm_native_wake_effects_reschedule_other_vcpu() {
+    let zone = zone();
+    let other = SlotId::new(4);
+    for slot in [SLOT, other] {
+        host_publish(&zone, slot, MM, None, 0);
+        zone.enter_guest(slot);
+    }
+    let target = super::sgi_target_of(0x8000_0004);
+    zone.slot(other).set_sgi_target(target);
+    let mut effects = carrick_sched_core::WakeEffects::default();
+    effects.request_reschedule(other);
+    let mut sent = std::vec::Vec::new();
+    let mut pending = std::vec::Vec::new();
+    super::object_wait::deliver_effects_with(
+        &zone,
+        SLOT,
+        carrick_sched_core::Waker::El1 { slot: SLOT },
+        effects,
+        false,
+        |slot, target| sent.push((slot, target)),
+        |slot| pending.push(slot),
+    );
+    assert_eq!(sent, [(other, target)]);
+    assert!(pending.is_empty());
+}
+
 /// Fixed pre-extraction trace: save A, load B, save B, load A, then roots/timer/
 /// wake. The FP/TLS negative control makes loss visible before refactoring.
 #[test]

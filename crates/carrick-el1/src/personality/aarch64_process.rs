@@ -598,12 +598,11 @@ impl OwnerVenue<Aarch64ParkedContext> for Aarch64Venue {
     }
 
     fn deliver_completion(
-        _: &ZoneTables<Aarch64ParkedContext>,
-        _: SlotId,
+        zone: &ZoneTables<Aarch64ParkedContext>,
+        slot: SlotId,
         effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, Aarch64ParkedContext>,
     ) {
-        let (_, effects) = effects.deliver_handbacks(&mut |_| fatal());
-        deliver_wakes(effects);
+        crate::sched::object_wait::deliver_completion(zone, slot, effects);
     }
 
     fn encode_error(error: carrick_core::mm::transaction::MmError) -> u32 {
@@ -616,18 +615,14 @@ impl OwnerVenue<Aarch64ParkedContext> for Aarch64Venue {
 }
 
 fn release(
-    _: &ZoneTables<Aarch64ParkedContext>,
-    _: carrick_sched_core::Waker,
+    zone: &ZoneTables<Aarch64ParkedContext>,
+    waker: carrick_sched_core::Waker,
     effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, Aarch64ParkedContext>,
 ) {
-    let (_, effects) = effects.deliver_handbacks(&mut |_| fatal());
-    deliver_wakes(effects);
-}
-
-fn deliver_wakes(effects: WakeEffects) {
-    for _slot in effects.sgi_slots() {
-        // vCPU reschedule signaling
-    }
+    let carrick_sched_core::Waker::El1 { slot } = waker else {
+        fatal()
+    };
+    crate::sched::object_wait::deliver_completion(zone, slot, effects);
 }
 
 #[cfg(target_os = "none")]
@@ -1186,7 +1181,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         self.copy_signal_bytes(mm, address, bytes)
     }
     fn wake_effects(&mut self, effects: WakeEffects) {
-        deliver_wakes(effects);
+        crate::sched::object_wait::deliver_wake_effects(self.zone, self.slot, effects);
     }
     fn fork_fd_table(
         &mut self,

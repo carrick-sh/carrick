@@ -24,34 +24,84 @@ pub(crate) fn deliver_completion<C: carrick_el1_abi::EntryContext>(
     #[cfg(target_os = "none")]
     {
         let mut cpu = crate::substrate::sched::hw::HardwareCpu;
-        let own = match waker {
-            carrick_sched_core::Waker::El1 { slot } => Some(slot),
-            carrick_sched_core::Waker::Host => None,
-        };
-        assert!(own.is_some() || (!effects.queued_own && !effects.misplaced));
-        for slot in effects
-            .sgi_slots()
-            .chain(own.filter(|slot| effects.queued_own && *slot != venue))
-        {
-            let target = zone.slot(slot).sgi_target();
-            if target != 0 {
-                cpu.send_resched(slot, target);
-            }
-        }
-        if effects.misplaced
-            && let Some(slot) = own
-            && let Some(task) = carrick_el1_abi::current_task_guest(usize::from(slot.raw()))
-        {
-            task.linux.mark_pending_host_work();
-        }
-        if (deferred || (effects.queued_own && own == Some(venue)))
-            && let Some(task) = carrick_el1_abi::current_task_guest(usize::from(venue.raw()))
-        {
-            task.linux.mark_pending_host_work();
-        }
+        deliver_effects_with(
+            zone,
+            venue,
+            waker,
+            effects,
+            deferred,
+            |slot, target| cpu.send_resched(slot, target),
+            |slot| {
+                if let Some(task) = carrick_el1_abi::current_task_guest(usize::from(slot.raw())) {
+                    task.linux.mark_pending_host_work();
+                }
+            },
+        );
     }
     #[cfg(not(target_os = "none"))]
     let _ = (waker, effects, deferred, venue, zone);
+}
+
+/// Deliver a native owner's plain wake through the same SGI and host-work
+/// authority used by object-wait completion.
+pub(crate) fn deliver_wake_effects<C: carrick_el1_abi::EntryContext>(
+    zone: &carrick_sched_core::ZoneTables<C>,
+    venue: SlotId,
+    effects: WakeEffects,
+) {
+    #[cfg(target_os = "none")]
+    {
+        let mut cpu = crate::substrate::sched::hw::HardwareCpu;
+        deliver_effects_with(
+            zone,
+            venue,
+            carrick_sched_core::Waker::El1 { slot: venue },
+            effects,
+            false,
+            |slot, target| cpu.send_resched(slot, target),
+            |slot| {
+                if let Some(task) = carrick_el1_abi::current_task_guest(usize::from(slot.raw())) {
+                    task.linux.mark_pending_host_work();
+                }
+            },
+        );
+    }
+    #[cfg(not(target_os = "none"))]
+    let _ = (zone, venue, effects);
+}
+
+#[cfg(any(test, target_os = "none"))]
+pub(super) fn deliver_effects_with<C: carrick_el1_abi::EntryContext>(
+    zone: &carrick_sched_core::ZoneTables<C>,
+    venue: SlotId,
+    waker: carrick_sched_core::Waker,
+    effects: WakeEffects,
+    deferred: bool,
+    mut send: impl FnMut(SlotId, u64),
+    mut mark_pending: impl FnMut(SlotId),
+) {
+    let own = match waker {
+        carrick_sched_core::Waker::El1 { slot } => Some(slot),
+        carrick_sched_core::Waker::Host => None,
+    };
+    assert!(own.is_some() || (!effects.queued_own && !effects.misplaced));
+    for slot in effects
+        .sgi_slots()
+        .chain(own.filter(|slot| effects.queued_own && *slot != venue))
+    {
+        let target = zone.slot(slot).sgi_target();
+        if target != 0 {
+            send(slot, target);
+        }
+    }
+    if effects.misplaced
+        && let Some(slot) = own
+    {
+        mark_pending(slot);
+    }
+    if deferred || (effects.queued_own && own == Some(venue)) {
+        mark_pending(venue);
+    }
 }
 
 pub use carrick_core::wait::{ObjectParked, OperationResumePc};
