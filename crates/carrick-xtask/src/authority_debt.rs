@@ -548,7 +548,10 @@ fn host_counts(
     }
     Ok(actual)
 }
-fn comparison_base(root: &Path, explicit: Option<&str>) -> Result<Option<String>, DebtError> {
+pub(crate) fn comparison_base(
+    root: &Path,
+    explicit: Option<&str>,
+) -> Result<Option<String>, DebtError> {
     let environment = std::env::var("CARRICK_AUTHORITY_BASE").ok();
     let Some(base) = explicit
         .filter(|base| !base.trim().is_empty())

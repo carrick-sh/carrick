@@ -130,11 +130,13 @@ pub enum Commands {
         about = "Ratchet neutral terminal decision ownership"
     )]
     TerminalCustody {
+        #[arg(long, help = "Print current retiring decision sites for review")]
+        list: bool,
         #[arg(
             long,
-            help = "Print current retiring decision sites for baseline review"
+            help = "Actual change-range base; defaults to CARRICK_AUTHORITY_BASE"
         )]
-        list: bool,
+        base: Option<String>,
     },
 }
 
@@ -550,7 +552,7 @@ where
             crate::test_lanes::run(&info.repository_root, args, writer)?;
             Ok(())
         }
-        Commands::TerminalCustody { list } => {
+        Commands::TerminalCustody { list, base } => {
             let info = resolve_repo_info(cli.root.as_deref())?;
             if list {
                 for site in crate::terminal_custody::discover(&info.repository_root)
@@ -563,7 +565,8 @@ where
                 }
                 Ok(())
             } else {
-                crate::terminal_custody::check(&info.repository_root).map_err(CliError::Impact)
+                crate::terminal_custody::check(&info.repository_root, base.as_deref())
+                    .map_err(CliError::Impact)
             }
         }
         Commands::PackageGuestImage(args) => {
