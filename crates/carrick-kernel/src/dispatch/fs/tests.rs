@@ -1289,10 +1289,31 @@ fn reactor_polled_f_setlkw_cycle_reports_edeadlk() {
 /// checks the empty-table shortcut; a third process must then acquire.
 #[test]
 fn reactor_grant_then_close_releases_record_lock_for_third_owner() {
-    let locks = Arc::new(LogicalRecordLocks::default());
+    let dispatcher = SyscallDispatcher::new();
+    let locks = Arc::clone(&dispatcher.fs_view().fs.classic_record_locks);
     let blocker = logical_lock_request((41, 1), (0, 10), true);
     let owner = logical_lock_request((42, 2), (0, 10), true);
     let third = logical_lock_request((43, 3), (0, 10), true);
+    let installed = dispatcher.install_fd(
+        OpenDescription::File {
+            base: OpenDescriptionBase::new(LINUX_O_RDWR),
+            path: "/logical-lock".to_owned(),
+            metadata: RootFsMetadata {
+                path: "/logical-lock".into(),
+                kind: RootFsEntryKind::File,
+                mode: 0o644,
+                size: 0,
+            },
+            contents: FileContents::dense(Vec::new()),
+            offset: 0,
+            writable: true,
+        },
+        0,
+    );
+    let DispatchOutcome::Returned { value: fd } = installed else {
+        panic!("install lock owner fd: {installed:?}");
+    };
+    let open_file = dispatcher.open_file(fd as i32).expect("lock owner fd");
     assert_eq!(locks.try_set(blocker.clone()), Ok(()));
     assert_eq!(locks.try_set(owner.clone()), Err(LINUX_EAGAIN));
     let waiter = LogicalRecordLockWait::new(
@@ -1305,16 +1326,16 @@ fn reactor_grant_then_close_releases_record_lock_for_third_owner() {
     locks.release_file_owner(&blocker.file, blocker.owner);
     assert!(locks.is_empty());
     assert_eq!(waiter.try_acquire(), Ok(()));
-    assert!(
-        !locks.is_empty(),
-        "reactor grant must publish table occupancy"
+    // Invoke the exact close(fd) owner-release hook while the continuation
+    // still lives, not a test copy of its fast-path decision.
+    dispatcher.fs_view().release_hvpatch_classic_record_locks(
+        crate::kernel::TaskKey {
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(42)
+                .expect("owner task id"),
+            serial: crate::kernel::TaskSerial::from_raw_u64(2).expect("owner task serial"),
+        },
+        &open_file,
     );
-
-    // This is the close(fd) fast-path decision and owner release in
-    // release_hvpatch_classic_record_locks, while the continuation still lives.
-    if !locks.is_empty() {
-        locks.release_file_owner(&owner.file, owner.owner);
-    }
     assert_eq!(locks.try_set(third), Ok(()));
 }
 
