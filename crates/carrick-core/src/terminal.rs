@@ -892,6 +892,142 @@ mod tests {
     }
 
     #[test]
+    fn closing_waits_for_late_born_and_exited_in_zone_publication() {
+        use crate::lifecycle::{EntryState, MemberExitCustody, pack};
+
+        struct OneEntryPage {
+            terminal: ProcessExitCustody,
+            gate: AtomicU32,
+            live: AtomicU32,
+            entry: AtomicEntry,
+        }
+        impl Lifecycle for OneEntryPage {
+            fn process_exit_custody(&self) -> &ProcessExitCustody {
+                &self.terminal
+            }
+            fn host_birth_receipt_returned_exact(
+                &self,
+                _: usize,
+                _: HostThreadRetirementReceipt,
+            ) -> bool {
+                false
+            }
+            fn gate_word(&self) -> &AtomicU32 {
+                &self.gate
+            }
+            fn live_word(&self) -> &AtomicU32 {
+                &self.live
+            }
+            fn entry_count(&self) -> usize {
+                1
+            }
+            fn entry_word(&self, index: usize) -> Option<&AtomicEntry> {
+                (index == 0).then_some(&self.entry)
+            }
+            fn activity(&self) -> Option<&crate::lifecycle::ThreadLedgerActivity> {
+                None
+            }
+        }
+        struct Member {
+            entry: EntryRef,
+            exit: MemberExitCustody,
+        }
+        impl MemberControl for Member {
+            fn member_entry(&self) -> Option<EntryRef> {
+                Some(self.entry)
+            }
+            fn exit_custody(&self) -> &MemberExitCustody {
+                &self.exit
+            }
+            fn host_retirement(&self) -> Option<HostThreadRetirementReceipt> {
+                None
+            }
+        }
+
+        let page = OneEntryPage {
+            terminal: ProcessExitCustody::new(),
+            gate: AtomicU32::new(0),
+            live: AtomicU32::new(1),
+            entry: AtomicEntry::new(pack(0, EntryState::Vacant)),
+        };
+        let entry = page.reserve_stock(0).unwrap();
+        page.transition(
+            entry,
+            &[EntryState::Stocking],
+            EntryState::Reserved,
+            core::sync::atomic::Ordering::Release,
+        )
+        .unwrap();
+        let born = page.complete_birth(page.claim_any().unwrap()).unwrap();
+        assert_eq!(born, entry);
+        assert_eq!(page.thread_born(), Some(2));
+        let admission = page.begin_exit(entry).unwrap();
+        let member = Member {
+            entry,
+            exit: MemberExitCustody::new(),
+        };
+        let task = TaskKey {
+            id: TaskId::from_registry_allocation(NonZeroI32::new(41).unwrap()),
+            serial: TaskSerial::from_raw_u64(11).unwrap(),
+        };
+        let address = AddressContext {
+            root: RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(0x10000)).unwrap(),
+            mm: carrick_guest_arch::MmGeneration::new(NonZeroU64::new(1).unwrap()),
+            generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::new(1).unwrap()),
+        };
+        let closing = TerminalCustody::<Process, Live>::begin_exit(
+            TerminalCustody::<Process, Live>::close_admission(&page),
+            task,
+            address,
+            TerminationStatus::exited(0),
+        )
+        .unwrap();
+        let members = MemberSet::new(closing.identity, alloc::vec![entry], Vec::new());
+        let expected_host = HostThreadRetirementReceipt::from_binding(ExecutionBinding {
+            task: EntryTaskKey::from_raw(42),
+            generation: EntryGeneration::from_raw(11),
+            mm: carrick_core_abi::entry::EntryMmKey::from_raw(5),
+            thread_generation: EntryThreadGeneration::from_raw(2),
+        });
+        let observation = [PoolMemberObservation {
+            entry,
+            member: &member,
+            expected_host,
+        }];
+        assert!(
+            closing
+                .observe_members(&page, &members, &observation, &[])
+                .is_none()
+        );
+        page.publish(entry).unwrap(); // Born -> ExitingPublished after close
+        let identity = ThreadTerminalIdentity::from_exit(
+            ExecutionBinding {
+                task: EntryTaskKey::from_raw(42),
+                generation: EntryGeneration::from_raw(11),
+                mm: carrick_core_abi::entry::EntryMmKey::from_raw(5),
+                thread_generation: EntryThreadGeneration::from_raw(2),
+            },
+            Some(entry),
+            TerminationStatus::exited(0),
+        )
+        .unwrap();
+        let (_thread, membership) = TerminalCustody::<Thread, Live>::admitted(identity)
+            .begin()
+            .reserve_nonfinal(&page)
+            .unwrap_or_else(|_| panic!("admitted exiting sibling must finish during close"));
+        assert_eq!(page.claimed_count(), 1);
+        admission.commit_with_member(&member).unwrap();
+        membership.publish();
+        assert_eq!(page.state(0).unwrap().1, EntryState::ExitedInZone);
+        let receipts = closing
+            .observe_members(&page, &members, &observation, &[])
+            .expect("late in-zone exit supplies its exact receipt");
+        assert!(closing.can_settle(&page, &receipts));
+        page.reap(entry).unwrap();
+        assert!(closing.settle(&page, receipts).is_ok());
+    }
+
+    #[test]
     fn completed_pool_proof_uses_member_exit_kind_after_entry_reuse() {
         struct Member {
             entry: EntryRef,
