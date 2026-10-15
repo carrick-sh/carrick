@@ -575,6 +575,7 @@ Chat, worker mailboxes, scratch notes and agent memory are not.
   `gh stack merge <top PR>`: it enters the merge queue as one merge group and
   takes one HVF gate. Ejecting a layer ejects everything above it, so
   independent work stays in separate PRs. Stacks have no auto-merge.
+  Workflow: [`.agents/skills/carrick-stacked-prs`](.agents/skills/carrick-stacked-prs/SKILL.md).
 - **Lanes:** hosted Linux/macOS jobs in `ci.yml`; `kernel-runtime.yml` adds
   the self-hosted HVF lane (cloudmac, merge queue only) and the KVM lane
   (self-hosted JIT clones on the Contabo host, `docs/ci/contabo-kvm.md`;
@@ -690,4 +691,4 @@ Chat, worker mailboxes, scratch notes and agent memory are not.
 | [`docs/support-matrix.md`](docs/support-matrix.md) | Generated verdict table (`just matrix`). |
 | [`docs/hal.md`](docs/hal.md) | Multi-platform HAL plan. |
 | [`docs/syscall-shim-design.md`](docs/syscall-shim-design.md), [`namespaces-design.md`](docs/namespaces-design.md), [`ptrace-darwin-design.md`](docs/ptrace-darwin-design.md), [`rosetta.md`](docs/rosetta.md) | Subsystem designs. |
-| [`.agents/skills/`](.agents/skills/) | `carrick-trace`, `carrick-lldb`, `ltp-conformance`, `carrick-bhyve-debug`, `carrick-conformance-contract`. |
+| [`.agents/skills/`](.agents/skills/) | `carrick-trace`, `carrick-lldb`, `ltp-conformance`, `carrick-bhyve-debug`, `carrick-conformance-contract`, `carrick-stacked-prs`. |
