@@ -1679,15 +1679,43 @@ fn arm_native_wake_effects_reschedule_other_vcpu() {
     let mut pending = std::vec::Vec::new();
     super::object_wait::deliver_effects_with(
         &zone,
-        SLOT,
+        Some(SLOT),
         carrick_sched_core::Waker::El1 { slot: SLOT },
         effects,
         false,
         |slot, target| sent.push((slot, target)),
-        |slot| pending.push(slot),
+        (|slot| pending.push(slot), || {}),
     );
     assert_eq!(sent, [(other, target)]);
     assert!(pending.is_empty());
+}
+
+#[test]
+fn host_release_delivers_cross_slot_wake_and_deferred_handback() {
+    let zone = zone();
+    let other = SlotId::new(4);
+    host_publish(&zone, other, MM, None, 0);
+    zone.enter_guest(other);
+    let target = super::sgi_target_of(0x8000_0004);
+    zone.slot(other).set_sgi_target(target);
+    let mut effects = carrick_sched_core::WakeEffects::default();
+    effects.request_reschedule(other);
+    let mut sent = std::vec::Vec::new();
+    let mut all_pending = 0;
+    super::object_wait::deliver_effects_with(
+        &zone,
+        None,
+        carrick_sched_core::Waker::Host,
+        effects,
+        true,
+        |slot, value| sent.push((slot, value)),
+        (
+            |_slot| panic!("host completion has no owning slot"),
+            || all_pending += 1,
+        ),
+    );
+    assert_eq!(sent, [(other, target)]);
+    assert_eq!(all_pending, 1);
 }
 
 /// Fixed pre-extraction trace: save A, load B, save B, load A, then roots/timer/

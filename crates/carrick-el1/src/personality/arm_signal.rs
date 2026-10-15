@@ -1,7 +1,11 @@
 //! Pure ARM frame publication used by the native backend and VM-free tests.
 use crate::isa::ArchError;
+#[cfg(target_os = "none")]
+use crate::rust_alloc::vec::Vec;
 use carrick_el1_abi::TrapFrame;
 use carrick_personality_linux::signal::arm::{self, RtSigframe};
+#[cfg(not(target_os = "none"))]
+use std::vec::Vec;
 
 pub(crate) fn restore(
     frame: &mut TrapFrame,
@@ -21,6 +25,17 @@ pub(crate) fn restore(
     frame.elr = resume.pc.raw();
     frame.spsr = resume.pstate;
     Ok((resume.mask.signals().bits(), resume.sp.raw()))
+}
+
+fn frame_copy_buffer(len: usize) -> Result<Vec<u8>, ArchError> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| ArchError::InvalidFrame)?;
+    // Capacity was admitted above, so this only initializes already owned
+    // bytes. Allocation failure takes the ordinary sigreturn failure path.
+    bytes.resize(len, 0);
+    Ok(bytes)
 }
 
 pub(crate) fn build(
@@ -214,6 +229,18 @@ mod tests {
     }
 
     #[test]
+    fn sigreturn_frame_allocation_failure_is_a_frame_error() {
+        assert!(matches!(
+            frame_copy_buffer(usize::MAX),
+            Err(ArchError::InvalidFrame)
+        ));
+        assert_eq!(
+            frame_copy_buffer(arm::PUBLIC_FRAME_LEN).unwrap().len(),
+            arm::PUBLIC_FRAME_LEN
+        );
+    }
+
+    #[test]
     fn arm_public_signal_frame_fpsimd_need_not_be_first() {
         let mut signal = valid();
         let records = &mut signal.ucontext.uc_mcontext.__reserved;
@@ -339,7 +366,7 @@ impl carrick_personality_linux::signal::SignalBackend for crate::isa::aarch64::A
         let sp = UserVa::new(sp_val);
         // A public frame is over 4 KiB. Keep the admitted copy off the 16 KiB
         // EL1 stack and borrow it throughout decode.
-        let mut bytes = crate::rust_alloc::vec![0u8; arm::PUBLIC_FRAME_LEN];
+        let mut bytes = frame_copy_buffer(arm::PUBLIC_FRAME_LEN)?;
         if !copy_in(&mut bytes, sp) {
             return Err(ArchError::InvalidFrame);
         }
