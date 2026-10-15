@@ -42,7 +42,7 @@ use super::dto::{
     DebugExecutorReceiptRow, DebugExecutorReceiptSummary, DebugExecutorRow, DebugRunQueueRow,
     DebugSchedulerRow, KernelDebugDegraded, KernelDebugSnapshot, KernelDebugTable,
 };
-use super::wire::DEGRADED_BUDGET;
+use super::wire::{DEGRADED_BUDGET, STRICT_SNAPSHOT_BUDGET};
 use crate::kernel::core::Kernel;
 
 pub const POST_MORTEM_SCHEMA: &str = "carrick.kernel-post-mortem.v1";
@@ -417,8 +417,13 @@ impl PostMortem {
         reason: AbortReason,
         run_id: Option<String>,
     ) -> Self {
-        let deadline = Instant::now() + CAPTURE_DEADLINE;
         let live_capture = matches!(&reason, AbortReason::LiveCapture { .. });
+        let deadline = Instant::now()
+            + if live_capture {
+                STRICT_SNAPSHOT_BUDGET
+            } else {
+                CAPTURE_DEADLINE
+            };
         let mut truncated = Vec::new();
         let mut findings = Vec::new();
         let mut degraded_kernel = None;

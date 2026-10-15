@@ -1025,7 +1025,7 @@ fn mounted_static_x86_blocked_read_has_live_kernel_capture() {
     let capture_path = capture_dir.join("post-mortem.json");
     let capture = Command::new(&cli)
         .timeout(Duration::from_secs(5))
-        .args(["debug", "kvm-capture", "--run-id", &run_id, "--output-dir"])
+        .args(["debug", "capture", "--run-id", &run_id, "--output-dir"])
         .arg(&capture_dir)
         .output()
         .unwrap();
@@ -1514,13 +1514,36 @@ fn run_mounted_binary_with_capture(
         .timeout(Duration::from_secs(4))
         .args([
             "debug",
-            "kvm-capture",
+            "capture",
             "--run-id",
             &scoped_run_id,
             "--output-dir",
         ])
         .arg(&capture_dir)
         .output();
+    let endpoint = carrick_kernel::kernel::debug::DebugEndpoint::for_run_id(&scoped_run_id)
+        .expect("resolve KVM carrier endpoint");
+    let stack_result = endpoint
+        .live_owner_pid()
+        .map_err(|error| error.to_string())
+        .and_then(|pid| {
+            let pid = i32::try_from(pid).expect("carrier PID fits i32");
+            let request = carrick_kernel::wedge_capture::WedgeCaptureRequest {
+                label: "kvm-deadline".to_owned(),
+                pid,
+                run_id: Some(scoped_run_id.clone()),
+                budget_ms: 5_000,
+                elapsed_ms: 5_000,
+                out_root: capture_dir.clone(),
+            };
+            carrick_kernel::wedge_capture::capture_wedged_carrier(request)
+                .map(|capture| capture.dir.display().to_string())
+                .map_err(|error| error.to_string())
+        });
+    match stack_result {
+        Ok(dir) => eprintln!("KVM deadline host stacks: {dir}"),
+        Err(error) => eprintln!("KVM deadline host stack capture failed: {error}"),
+    }
     // SAFETY: this test created an exclusive process group for this exact run.
     unsafe { libc::killpg(child.id() as i32, libc::SIGKILL) };
     let output = child.wait_with_output().expect("reap timed-out KVM run");
@@ -1548,6 +1571,16 @@ fn mounted_static_x86_deadline_captures_parked_wait() {
     let capture_path = capture_path.expect("deadline must write a capture");
     let capture: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    let wedge_manifest = std::fs::read_dir(capture_path.parent().unwrap())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("manifest.json"))
+        .find(|path| path.is_file())
+        .expect("deadline must invoke carrier host stack capture");
+    let wedge: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(wedge_manifest).unwrap()).unwrap();
+    assert_eq!(wedge["schema"], "carrick.wedge-capture.v1");
+    assert_eq!(wedge["run_id"], capture["run_id"]);
     assert_eq!(capture["schema"], "carrick.kernel-post-mortem.v1");
     assert!(
         capture["event_ring"]
@@ -1564,13 +1597,6 @@ fn mounted_static_x86_deadline_captures_parked_wait() {
                     .is_some_and(|text| text.contains("last_stopped_gprs="))))
     );
     assert!(capture["scheduler_aux"]["scheduler"].as_array().is_some());
-    assert!(
-        capture["physical"]["unavailable"]
-            .as_array()
-            .is_some_and(|rows| rows.iter().any(|row| row
-                .as_str()
-                .is_some_and(|text| text.contains("host thread stacks unavailable"))))
-    );
     let named_wait = capture["degraded_kernel"]["tasks"]
         .as_array()
         .into_iter()

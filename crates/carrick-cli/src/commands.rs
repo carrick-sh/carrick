@@ -885,12 +885,12 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
         ))]
         Commands::Debug { command } => match command {
             #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
-            DebugCommand::KvmCapture { run_id, output_dir } => {
+            DebugCommand::Capture { run_id, output_dir } => {
                 let snapshot = carrick_kernel::kernel::debug::capture(&run_id)
-                    .with_context(|| format!("capture live KVM run {run_id}"))?;
+                    .with_context(|| format!("capture live run {run_id}"))?;
                 let output = snapshot
                     .write_to_dir(&output_dir)
-                    .with_context(|| format!("write KVM capture to {}", output_dir.display()))?;
+                    .with_context(|| format!("write capture to {}", output_dir.display()))?;
                 println!("{}", output.display());
             }
             // Parses a file only, so it is available wherever the binary is.
