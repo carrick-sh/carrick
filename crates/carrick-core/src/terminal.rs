@@ -14,7 +14,7 @@ use carrick_guest_arch::{AddressContext, RootGpa};
 use carrick_sched_core::process::{TaskId, TaskKey, TaskSerial, TerminationStatus};
 
 use crate::lifecycle::{
-    Lifecycle, MemberExitCustody, MemberExitKind, MembershipFloor, NonfinalExitMembership,
+    Lifecycle, MemberControl, MemberExitKind, MembershipFloor, NonfinalExitMembership,
 };
 
 pub struct PoolMemberObservation<'a> {
@@ -22,14 +22,14 @@ pub struct PoolMemberObservation<'a> {
     /// The control slot retained by this member, even if its shared pool
     /// entry has since been reaped and reused. Host retirement must publish
     /// its typed receipt on this same slot.
-    pub member: &'a dyn MemberExitCustody,
+    pub member: &'a dyn MemberControl,
     pub expected_host: Option<HostThreadRetirementReceipt>,
 }
 
 pub enum HostMemberObservation<'a> {
     Adopted {
         binding: HostThreadRetirementReceipt,
-        member: &'a dyn MemberExitCustody,
+        member: &'a dyn MemberControl,
     },
     HostBorn {
         identity: HostThreadRetirementReceipt,
@@ -46,6 +46,12 @@ fn task_id_from_binding(binding: ExecutionBinding) -> Option<TaskId> {
 }
 
 pub struct Thread;
+/// One process incarnation owns exactly one terminal admission claim.
+#[derive(Default)]
+pub struct ProcessExitCustody {
+    begun: bool,
+}
+
 pub struct Process;
 pub struct Live;
 pub struct Exiting;
@@ -344,18 +350,18 @@ impl TerminalCustody<Process, Live> {
     }
 
     pub fn begin_exit(
+        state: &mut ProcessExitCustody,
         page: &impl Lifecycle,
         task: TaskKey,
         address: AddressContext<RootGpa>,
         status: TerminationStatus,
     ) -> Result<TerminalCustody<Process, Closing>, MembershipFloor> {
-        if page.gate() != crate::lifecycle::GateState::Open {
+        if state.begun {
             return Err(MembershipFloor);
         }
         let caller = page.reserve_closing_caller_exit()?;
-        if page.close_if_open().is_err() {
-            return Err(MembershipFloor);
-        }
+        state.begun = true;
+        page.close();
         caller.publish();
         Ok(TerminalCustody {
             identity: ProcessTerminalIdentity::from_exit(task, address, status),
@@ -395,16 +401,17 @@ impl TerminalCustody<Process, Closing> {
     ) -> Option<CompletedMemberReceipts> {
         let mut completed_pool = Vec::with_capacity(pool.len());
         for observation in pool {
-            let kind = observation
-                .member
-                .recorded_exit_kind(Some(observation.entry));
+            let kind = crate::lifecycle::recorded_member_exit_kind(
+                observation.member,
+                Some(observation.entry),
+            );
             let returned = match kind {
                 MemberExitKind::InZone => true,
                 MemberExitKind::HostRetiring => {
                     observation.member.host_retirement().is_some_and(|receipt| {
                         observation
                             .expected_host
-                            .is_none_or(|expected| expected == receipt)
+                            .is_some_and(|expected| expected == receipt)
                     })
                 }
                 MemberExitKind::Active | MemberExitKind::Stale => false,
@@ -418,8 +425,10 @@ impl TerminalCustody<Process, Closing> {
         for observation in host {
             let identity = match observation {
                 HostMemberObservation::Adopted { binding, member }
-                    if member.recorded_exit_kind(member.member_entry())
-                        != MemberExitKind::InZone
+                    if crate::lifecycle::recorded_member_exit_kind(
+                        *member,
+                        member.member_entry(),
+                    ) != MemberExitKind::InZone
                         && member.host_retirement() == Some(*binding) =>
                 {
                     *binding
@@ -531,6 +540,14 @@ mod tests {
         live: AtomicU32,
     }
     impl Lifecycle for Page {
+        fn host_birth_receipt_returned_exact(
+            &self,
+            _: usize,
+            _: HostThreadRetirementReceipt,
+        ) -> bool {
+            false
+        }
+
         fn gate_word(&self) -> &AtomicU32 {
             &self.gate
         }
@@ -625,7 +642,9 @@ mod tests {
             mm: carrick_guest_arch::MmGeneration::new(NonZeroU64::new(1).unwrap()),
             generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::new(1).unwrap()),
         };
+        let mut state = ProcessExitCustody::default();
         let _first = TerminalCustody::<Process, Live>::begin_exit(
+            &mut state,
             &page,
             task,
             address,
@@ -634,6 +653,7 @@ mod tests {
         .unwrap();
         assert!(
             TerminalCustody::<Process, Live>::begin_exit(
+                &mut state,
                 &page,
                 task,
                 address,
@@ -648,14 +668,14 @@ mod tests {
     fn completed_pool_proof_uses_member_exit_kind_after_entry_reuse() {
         struct Member {
             entry: EntryRef,
-            exit: AtomicU32,
+            exit: crate::lifecycle::MemberExitCustody,
             host: Option<HostThreadRetirementReceipt>,
         }
-        impl MemberExitCustody for Member {
+        impl MemberControl for Member {
             fn member_entry(&self) -> Option<EntryRef> {
                 Some(self.entry)
             }
-            fn member_exit_word(&self) -> &AtomicU32 {
+            fn exit_custody(&self) -> &crate::lifecycle::MemberExitCustody {
                 &self.exit
             }
             fn host_retirement(&self) -> Option<HostThreadRetirementReceipt> {
@@ -683,7 +703,7 @@ mod tests {
         let custody = TerminalCustody::<Process, Live>::admitted(identity).close_gate(&page);
         let in_zone = Member {
             entry,
-            exit: AtomicU32::new(0),
+            exit: crate::lifecycle::MemberExitCustody::new(),
             host: None,
         };
         let observation = [PoolMemberObservation {
@@ -696,7 +716,7 @@ mod tests {
                 .observe_members(&page, &members, &observation, &[])
                 .is_none()
         );
-        in_zone.record_in_zone_commit(entry).unwrap();
+        in_zone.exit.test_record(4);
         assert!(
             custody
                 .observe_members(&page, &members, &observation, &[])
@@ -711,7 +731,7 @@ mod tests {
         });
         let host = Member {
             entry,
-            exit: AtomicU32::new(0),
+            exit: crate::lifecycle::MemberExitCustody::new(),
             host: Some(receipt),
         };
         let observation = [PoolMemberObservation {
@@ -724,11 +744,22 @@ mod tests {
                 .observe_members(&page, &members, &observation, &[])
                 .is_none()
         );
-        host.record_host_retiring(Some(entry)).unwrap();
+        host.exit.test_record(8);
         assert!(
             custody
                 .observe_members(&page, &members, &observation, &[])
                 .is_some()
+        );
+        let unspecified = [PoolMemberObservation {
+            entry,
+            member: &host,
+            expected_host: None,
+        }];
+        assert!(
+            custody
+                .observe_members(&page, &members, &unspecified, &[])
+                .is_none(),
+            "HostRetiring cannot accept an unspecified receipt identity"
         );
         let wrong_receipt = [PoolMemberObservation {
             entry,
@@ -749,10 +780,10 @@ mod tests {
         );
         let recycled = Member {
             entry: EntryRef::new(0, 2),
-            exit: AtomicU32::new(0),
+            exit: crate::lifecycle::MemberExitCustody::new(),
             host: Some(receipt),
         };
-        recycled.record_host_retiring(Some(recycled.entry)).unwrap();
+        recycled.exit.test_record(8);
         let wrong_generation = [PoolMemberObservation {
             entry,
             member: &recycled,
