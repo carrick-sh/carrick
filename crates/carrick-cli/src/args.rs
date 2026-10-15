@@ -995,9 +995,9 @@ pub(crate) enum DebugCommand {
         /// Exact `CARRICK_RUN_ID` of the running carrier.
         #[arg(long)]
         run_id: String,
-        /// Write the bounded capture to this path.
+        /// Write the existing post-mortem and event-ring files here.
         #[arg(long)]
-        output: PathBuf,
+        output_dir: PathBuf,
     },
     /// Abort a LIVE run's kernel and make it produce a post-mortem.
     ///
