@@ -1399,12 +1399,14 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 member.record = source.zone.record_ref(record);
                 member.expected_host = host_identity;
             } else {
+                let retained = retain_member_control(control)?;
+                retained.commit_registration();
                 row.native_mut().resources_mut().members.push(NativeMember {
                     thread: key.task,
                     process,
                     zone: source.zone,
                     record: source.zone.record_ref(record),
-                    control: retain_member_control(control)?,
+                    control: retained,
                     expected_host: host_identity,
                 });
             }
@@ -1975,6 +1977,15 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         let uts = carrick_personality_linux::sysinfo::LinuxUtsname::carrick_aarch64();
         if !control.publish_visible_tid(visible.get()) {
             return Err(NativeProcessError::Stale);
+        }
+        for member in &owner
+            .task(key)
+            .map_err(|_| NativeProcessError::Stale)?
+            .native()
+            .resources()
+            .members
+        {
+            member.control.commit_registration();
         }
         let ipc = Arc::new(SpinLock::new(IpcNamespace::default()));
         let ipc_channels = Arc::new(SpinLock::new(Vec::new()));
@@ -3690,6 +3701,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 else {
                     unreachable!("process closing always cancels members")
                 };
+                for receipt in &outstanding {
+                    match receipt {
+                        OutstandingExitReceipt::Pool { control, .. }
+                        | OutstandingExitReceipt::Adopted { control, .. } => {
+                            control.commit_registration();
+                        }
+                        OutstandingExitReceipt::HostBorn { .. } => {}
+                    }
+                }
                 page.publish_exit_wait(self.binding.mm, WaitChannel::address(&channel));
                 let wake = Some(ExitWakeCustody {
                     channel: channel.clone(),
@@ -4299,6 +4319,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let child_words = self.service.fork_child_context(self.words, &prepared);
         // SAFETY: this exact newly allocated record remains Free and unpublished.
         unsafe { *self.source.zone.record(record).ctx_mut() = child_words };
+        let member_registration = member_custody.clone();
         let resources = NativeResources {
             _control_custody: leader_custody,
             zone: self.source.zone,
@@ -4362,8 +4383,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             })
         };
         let published = match result {
-            Ok(p) => p,
+            Ok(p) => {
+                member_registration.commit_registration();
+                p
+            }
             Err(failure) => {
+                drop(member_registration);
                 let (error, prep) = match failure {
                     ForkTryError::Admission(_, prep) => (NativeProcessError::Busy, prep),
                     ForkTryError::Commit(error, prep) => (error, prep),
