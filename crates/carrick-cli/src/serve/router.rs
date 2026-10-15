@@ -558,6 +558,44 @@ mod archive_body_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
 
+    #[tokio::test]
+    async fn oversized_build_body_is_rejected_before_collection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    hyper_util::rt::TokioIo::new(server),
+                    hyper::service::service_fn(route),
+                )
+                .await
+        });
+        client
+            .write_all(
+                format!(
+                    "POST /build HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+                    MAX_HTTP_ARCHIVE_BYTES + 1
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = [0_u8; 512];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            client.read(&mut response),
+        )
+        .await
+        .expect("oversized body must be rejected without waiting for it")
+        .unwrap();
+        assert!(
+            std::str::from_utf8(&response[..read])
+                .unwrap()
+                .starts_with("HTTP/1.1 413")
+        );
+        task.abort();
+    }
+
     struct TestBody {
         frames: VecDeque<Result<Frame<Bytes>, std::io::Error>>,
         polls: Arc<AtomicUsize>,
