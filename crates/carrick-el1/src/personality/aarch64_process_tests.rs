@@ -3043,6 +3043,133 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
 }
 
 #[test]
+fn arm_host_birth_adoption_racing_closing_has_one_cancel_owner() {
+    use carrick_el1_abi::Lifecycle;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    let owner = registry()
+        .for_entry(
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            &fixture.task,
+            fixture.address,
+        )
+        .unwrap();
+    let control = host_born_sibling(fixture, 42);
+    let birth_identity = control.host_birth_identity().unwrap();
+    let sibling_task = Box::leak(Box::new(CurrentTask::new()));
+    sibling_task.set(El1TaskId::from_linux_tid(42), 12, 5);
+    sibling_task.mm.key.store(
+        fixture.task.mm.key.load(Ordering::Acquire),
+        Ordering::Release,
+    );
+    sibling_task
+        .mm
+        .thread_generation
+        .store(102, Ordering::Release);
+    sibling_task.publish_visible_pid(41);
+    sibling_task.publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
+    sibling_task.publish_root_generation(fixture.address.generation);
+    let slot = SlotId::new(1);
+    fixture.zone.drive(slot, 2);
+    fixture.zone.publish_slot(slot, 1, Some(1), 1);
+    fixture.zone.enter_guest(slot);
+    fixture.zone.install_space(slot, 1).unwrap();
+    let record = fixture
+        .zone
+        .current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 42,
+                serial: 102,
+                mm: fixture.task.mm.key.load(Ordering::Acquire),
+                file_table: 5,
+                generation: 12,
+                affinity: 1,
+                lifecycle_page: fixture.page as *const _ as u64,
+                control_slot: control as *const _ as u64,
+            },
+        )
+        .unwrap();
+    control.bind_zone_record(fixture.zone.record_ref(record));
+    let (start_tx, start_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let fixture_address = fixture as *const Fixture as usize;
+    let worker = std::thread::spawn(move || {
+        start_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // SAFETY: this leaked fixture outlives the joined worker; the worker
+        // uses only the zone's atomic/locked registry entry path.
+        let fixture = unsafe { &*(fixture_address as *const Fixture) };
+        let adopted = registry()
+            .register_thread(
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot,
+                },
+                sibling_task,
+                fixture.address,
+                fixture.page,
+                control,
+            )
+            .is_ok();
+        let _ = done_tx.send(adopted);
+        adopted
+    });
+    owner.install_closing_race_hook(Box::new(move || {
+        start_tx.send(()).unwrap();
+        // On the old ordering adoption completes in the snapshot/close gap.
+        // On the corrected ordering it waits for the registry lock and Closed.
+        let _ = done_rx.recv_timeout(Duration::from_millis(250));
+    }));
+    run_as_leader(fixture);
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[0] = 7;
+    frame.x[8] = 94;
+    assert_eq!(
+        arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+    );
+    let adopted = worker.join().unwrap();
+    let cancelled = if adopted {
+        fixture.zone.record(record).is_cancelled()
+    } else {
+        fixture.page.host_birth_requested(birth_identity)
+    };
+    assert!(
+        cancelled,
+        "adopted={adopted}: Closing must cancel the sibling"
+    );
+    assert_eq!(fixture.page.live(), 1);
+    fixture
+        .page
+        .reserve_cancelled_member_exit()
+        .unwrap()
+        .publish();
+    control.publish_host_retirement(birth_identity);
+    if !adopted {
+        assert!(fixture.page.publish_host_birth_receipt(birth_identity));
+    }
+    assert!(matches!(
+        wake_closing_root(fixture, &mut service),
+        crate::sched::ResumeAction::Left
+    ));
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
+}
+
+#[test]
 fn arm_host_exit_reserved_live_count_does_not_settle_group_before_receipt() {
     use carrick_el1_abi::Lifecycle;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
