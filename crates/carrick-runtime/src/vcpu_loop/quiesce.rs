@@ -1455,14 +1455,26 @@ where
         if let Err(error) = check_hvpatch_process_failpoint(
             parent_context.task(),
             HvpatchProcessFailpoint::ParentCopyout,
-        ) {
+        )
+        .and_then(|()| {
+            check_hvpatch_process_failpoint(
+                parent_context.task(),
+                HvpatchProcessFailpoint::BackendCommit,
+            )
+        })
+        .and_then(|()| {
+            check_hvpatch_process_failpoint(
+                parent_context.task(),
+                HvpatchProcessFailpoint::KernelCommit,
+            )
+        }) {
             if let (Some(address), Some(bytes)) =
                 (request.parent_tid_addr, parent_tid_original.as_ref())
             {
                 ops.write_fork_parent_output(memory, address, bytes, &mut owner_parent_admission).unwrap_or_else(|_| {
                     carrick_fatal!(
                         "vcpu_loop::quiesce_rollback",
-                        "failed to restore original parent_tid memory bytes during fork copyout rollback: address={:?}",
+                        "failed to restore original parent_tid memory bytes during fork publication rollback: address={:?}",
                         address
                     );
                 });
@@ -1471,72 +1483,7 @@ where
                 ops.write_fork_parent_output(memory, address, bytes, &mut owner_parent_admission).unwrap_or_else(|_| {
                     carrick_fatal!(
                         "vcpu_loop::quiesce_rollback",
-                        "failed to restore original pidfd memory bytes during fork copyout rollback: address={:?}",
-                        address
-                    );
-                });
-            }
-            if let Err(cleanup_error) =
-                ops.abort_and_rollback_prepared(prepared_backend, memory, !shares_mm)
-            {
-                return Err(ops.fail_stop(cleanup_error));
-            }
-            rollback_pidfd(installed_pidfd);
-            return Err(error);
-        }
-        if let Err(error) = check_hvpatch_process_failpoint(
-            parent_context.task(),
-            HvpatchProcessFailpoint::BackendCommit,
-        ) {
-            if let (Some(address), Some(bytes)) =
-                (request.parent_tid_addr, parent_tid_original.as_ref())
-            {
-                ops.write_fork_parent_output(memory, address, bytes, &mut owner_parent_admission).unwrap_or_else(|_| {
-                    carrick_fatal!(
-                        "vcpu_loop::quiesce_rollback",
-                        "failed to restore parent_tid bytes on failpoint rollback: address={:?}",
-                        address
-                    );
-                });
-            }
-            if let (Some(address), Some(bytes)) = (request.pidfd_out, pidfd_original.as_ref()) {
-                ops.write_fork_parent_output(memory, address, bytes, &mut owner_parent_admission)
-                    .unwrap_or_else(|_| {
-                        carrick_fatal!(
-                            "vcpu_loop::quiesce_rollback",
-                            "failed to restore pidfd bytes on failpoint rollback: address={:?}",
-                            address
-                        );
-                    });
-            }
-            if let Err(cleanup_error) =
-                ops.abort_and_rollback_prepared(prepared_backend, memory, !shares_mm)
-            {
-                return Err(ops.fail_stop(cleanup_error));
-            }
-            rollback_pidfd(installed_pidfd);
-            return Err(error);
-        }
-        if let Err(error) = check_hvpatch_process_failpoint(
-            parent_context.task(),
-            HvpatchProcessFailpoint::KernelCommit,
-        ) {
-            if let (Some(address), Some(bytes)) =
-                (request.parent_tid_addr, parent_tid_original.as_ref())
-            {
-                ops.write_fork_parent_output(memory, address, bytes, &mut owner_parent_admission).unwrap_or_else(|_| {
-                    carrick_fatal!(
-                        "vcpu_loop::quiesce_rollback",
-                        "failed to restore parent_tid memory on child materialization failure: address={:?}",
-                        address
-                    );
-                });
-            }
-            if let (Some(address), Some(bytes)) = (request.pidfd_out, pidfd_original.as_ref()) {
-                ops.write_fork_parent_output(memory, address, bytes, &mut owner_parent_admission).unwrap_or_else(|_| {
-                    carrick_fatal!(
-                        "vcpu_loop::quiesce_rollback",
-                        "failed to restore pidfd memory on child materialization failure: address={:?}",
+                        "failed to restore original pidfd memory bytes during fork publication rollback: address={:?}",
                         address
                     );
                 });
