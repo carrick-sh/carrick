@@ -50,7 +50,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Protocol revision, folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 10;
+pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 11;
 
 pub use carrick_core::lifecycle::{ClaimedEntry, ExitAdmission, Lifecycle};
 pub use carrick_core_abi::lifecycle::*;
@@ -320,6 +320,8 @@ pub struct ThreadControlSlot {
     zone_seq: AtomicU64,
     zone_incarnation: AtomicU64,
     zone_id: AtomicU32,
+    /// Exit request/receipt bits plus the core-owned exact member exit kind.
+    /// The slot's `entry` is the generation key until exclusive reset.
     host_exit_requested: AtomicU32,
     /// The host writes task/execution first and publishes thread last. A
     /// Closing owner only credits the complete exact receipt it requested.
@@ -329,6 +331,13 @@ pub struct ThreadControlSlot {
 }
 
 impl ThreadControlSlot {
+    pub fn recorded_exit_kind(
+        &self,
+        entry: Option<EntryRef>,
+    ) -> carrick_core::lifecycle::MemberExitKind {
+        carrick_core::lifecycle::MemberExitCustody::recorded_exit_kind(self, entry)
+    }
+
     pub const fn new() -> Self {
         Self {
             visible_tid: AtomicU32::new(0),
@@ -600,6 +609,19 @@ impl ThreadControlSlot {
 
     pub fn host_exit_requested(&self) -> bool {
         self.host_exit_requested.load(Ordering::Acquire) & 1 != 0
+    }
+}
+impl carrick_core::lifecycle::MemberExitCustody for ThreadControlSlot {
+    fn member_entry(&self) -> Option<EntryRef> {
+        self.entry()
+    }
+
+    fn member_exit_word(&self) -> &AtomicU32 {
+        &self.host_exit_requested
+    }
+
+    fn host_retirement(&self) -> Option<carrick_core::terminal::HostThreadRetirementReceipt> {
+        ThreadControlSlot::host_retirement(self)
     }
 }
 impl Default for ThreadControlSlot {
@@ -881,9 +903,14 @@ impl ThreadLifecyclePage {
     pub fn retire_published_host_member(
         &self,
         entry: EntryRef,
+        control: &ThreadControlSlot,
         membership: carrick_core::lifecycle::NonfinalExitMembership<'_>,
     ) -> Result<(), TransitionError> {
-        self.retire_published(entry)?;
+        carrick_core::lifecycle::MemberExitCustody::record_host_retiring(control, Some(entry))?;
+        if let Err(error) = self.retire_published(entry) {
+            carrick_core::lifecycle::MemberExitCustody::rollback_host_retiring(control);
+            return Err(error);
+        }
         membership.publish();
         Ok(())
     }
@@ -1161,6 +1188,13 @@ impl ThreadLifecyclePage {
     }
 }
 impl Lifecycle for ThreadLifecyclePage {
+    fn host_birth_receipt_returned_exact(
+        &self,
+        index: usize,
+        identity: carrick_core::terminal::HostThreadRetirementReceipt,
+    ) -> bool {
+        self.host_birth_identity(index) == Some(identity) && self.host_birth_receipt_returned(index)
+    }
     fn host_claimed_count(&self) -> usize {
         self.host_birth_claimed_count()
     }
