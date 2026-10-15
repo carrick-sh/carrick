@@ -16,6 +16,26 @@ use super::*;
 use crate::dispatch::SharedFutexTarget;
 
 #[test]
+fn socket_waits_restart_with_sa_restart_except_timed_calls() {
+    use carrick_abi::syscall::nr;
+
+    for number in [
+        nr::ACCEPT, nr::ACCEPT4, nr::CONNECT, nr::RECVFROM, nr::RECVMSG,
+        nr::RECVMMSG, nr::SENDTO, nr::SENDMSG, nr::SENDMMSG,
+    ] {
+        assert_eq!(
+            RestartClass::for_syscall(number.raw()),
+            RestartClass::RestartSyscall,
+            "socket syscall {} must restart after SA_RESTART",
+            number.raw()
+        );
+    }
+    // Linux signal(7): SO_RCVTIMEO/SO_SNDTIMEO calls report EINTR (4)
+    // even when the handler has SA_RESTART.
+    assert_eq!(LINUX_EINTR.guest_retval(), -4);
+}
+
+#[test]
 fn redispatch_resume_does_not_veto_later_signal_restart() {
     let mut resumed = ContinuationResult {
         completion: ContinuationCompletion::Redispatch,

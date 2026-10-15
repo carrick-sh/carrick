@@ -4593,6 +4593,33 @@ mod ipc_set_tests {
     }
 
     #[test]
+    fn shm_permission_uses_creator_group_and_supplementary_membership() {
+        let dispatcher = SyscallDispatcher::new();
+        let shmid = 4_899;
+        let _backing = insert_test_shm_segment(&dispatcher, shmid, LINUX_PAGE_SIZE as usize);
+        {
+            let mut state = dispatcher.sysv.state.lock();
+            let segment = state.segments.get_mut(&shmid).unwrap();
+            segment.mode = ShmPermMode::requested(0o040);
+            segment.uid = NsUid::new(1001);
+            segment.cuid = NsUid::new(1002);
+            segment.gid = NsGid::new(2001);
+            segment.cgid = NsGid::new(2002);
+        }
+        let root = dispatcher.capture_one_task_context().unwrap();
+        let member = root.kernel().update_credentials(&root, |creds| {
+            creds.seed_identity(NsUid::new(1003), NsGid::new(2003));
+            creds.set_supplementary_groups(vec![NsGid::new(2002)]);
+        }).unwrap();
+        let creds = member.resources().credentials();
+        let state = dispatcher.sysv.state.lock();
+        let segment = state.segments.get(&shmid).unwrap();
+        assert!(segment.can_read(&creds), "creator group read must succeed");
+        assert!(!segment.can_write(&creds), "creator group write must fail with EACCES (13)");
+        assert_eq!(LINUX_EACCES.guest_retval(), -13);
+    }
+
+    #[test]
     fn shmctl_rmid_authorizes_the_owner_even_without_write_mode_bits() {
         let dispatcher = SyscallDispatcher::new();
         let shmid = 4_898;
