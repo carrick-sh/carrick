@@ -321,6 +321,95 @@ impl Stream for ReceiverStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+
+    fn gzip_tar(append: impl FnOnce(&mut tar::Builder<&mut Vec<u8>>)) -> Vec<u8> {
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            append(&mut builder);
+            builder.finish().unwrap();
+        }
+        let mut gz = Vec::new();
+        let mut encoder = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+        encoder.write_all(&tar_buf).unwrap();
+        encoder.finish().unwrap();
+        gz
+    }
+
+    fn append_link(
+        builder: &mut tar::Builder<&mut Vec<u8>>,
+        name: &str,
+        target: &Path,
+        hard: bool,
+    ) {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(if hard {
+            tar::EntryType::Link
+        } else {
+            tar::EntryType::Symlink
+        });
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_link_name(target).unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, name, std::io::empty())
+            .unwrap();
+    }
+
+    #[test]
+    fn rejects_symlink_parent_escape_without_writing_outside() {
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("context");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let gz = gzip_tar(|builder| {
+            append_link(builder, "sub", &outside, false);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "sub/x", &b"x"[..])
+                .unwrap();
+        });
+        assert!(unpack_context(&gz, &dest).is_err());
+        assert!(!outside.join("x").exists());
+    }
+
+    #[test]
+    fn rejects_hardlink_to_file_outside_context() {
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("context");
+        std::fs::create_dir(&dest).unwrap();
+        let outside = root.path().join("host-file");
+        std::fs::write(&outside, b"host").unwrap();
+        let gz = gzip_tar(|builder| append_link(builder, "copied", &outside, true));
+        assert!(unpack_context(&gz, &dest).is_err());
+        assert!(!dest.join("copied").exists());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"host");
+    }
+
+    #[test]
+    fn rejects_gzip_expansion_past_context_cap() {
+        let gz = gzip_tar(|builder| {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(32 * 1024 * 1024 + 1);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(
+                    &mut header,
+                    "bomb",
+                    std::io::repeat(0).take(32 * 1024 * 1024 + 1),
+                )
+                .unwrap();
+        });
+        let dest = tempfile::tempdir().unwrap();
+        assert!(unpack_context(&gz, dest.path()).is_err());
+    }
 
     #[test]
     fn parses_single_tag_and_default_dockerfile() {
