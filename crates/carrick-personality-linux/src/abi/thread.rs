@@ -980,7 +980,7 @@ impl ThreadLifecyclePage {
             {
                 return false;
             }
-            if self.gate() == GateState::Closed {
+            if self.gate().is_terminal() {
                 slot.state.store(expected, Ordering::SeqCst);
                 return false;
             }

@@ -1,5 +1,5 @@
 //! Linux per-thread registration and clear/wake policy.
-use crate::abi::thread::{GateState, Lifecycle, ThreadControlSlot, ThreadLifecyclePage};
+use crate::abi::thread::{Lifecycle, ThreadControlSlot, ThreadLifecyclePage};
 use core::sync::atomic::{AtomicU64, Ordering};
 /// Canonical `set_robust_list` (the generic table's number, which the
 /// AArch64 table uses natively; x86_64 273 decodes to it).
@@ -19,10 +19,10 @@ pub struct LifecycleThread<'a> {
 }
 
 /// Whether the common kernel may serve the per-thread setup calls: the
-/// hatch is on and the gate is not terminally closed (a tracer or seccomp
-/// must see them).
+/// hatch is on and ring service is allowed. Host-only pages must decline
+/// so that a tracer or seccomp sees these calls.
 pub fn setup_open(page: &ThreadLifecyclePage) -> bool {
-    page.serves_sigmask() && page.gate() != GateState::Closed
+    page.serves_sigmask() && page.gate().serves_ring()
 }
 
 /// The `head` argument of `set_robust_list`: a user address that is stored,

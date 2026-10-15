@@ -1059,6 +1059,33 @@ fn set_robust_list_stores_the_head_or_returns_einval() {
     assert_eq!(w.venue.leader_slot().robust_list(), (0, 0));
 }
 
+#[test]
+fn host_only_setup_sigprocmask_declines_to_host() {
+    let mut w = World::new(LifecycleHatches::ON);
+    w.page().decline_to_host();
+    let set = Box::new(SIGUSR1_BIT);
+    let (action, _) = w.syscall(SYS_RT_SIGPROCMASK, &[SIG_BLOCK, addr(&*set), 0, 8]);
+    assert_eq!(
+        action,
+        Action::Forward,
+        "HostOnly must preserve host signal-mask authority"
+    );
+    assert_eq!(w.venue.leader_slot().blocked(), BlockedMask(0));
+}
+
+#[test]
+fn host_only_setup_robust_list_declines_to_host() {
+    let mut w = World::new(LifecycleHatches::ON);
+    w.page().decline_to_host();
+    let (action, _) = w.syscall(SYS_SET_ROBUST_LIST, &[0x9000, 24]);
+    assert_eq!(
+        action,
+        Action::Forward,
+        "HostOnly must preserve host registration authority"
+    );
+    assert_eq!(w.venue.leader_slot().robust_list(), (0, 0));
+}
+
 // ---- exit ----
 
 /// The leader clones a glibc thread whose tid word is `word`, then joins
