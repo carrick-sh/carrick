@@ -112,9 +112,99 @@ pub(crate) fn parse_build_query(query: &str) -> BuildQuery {
     out
 }
 
-pub(crate) const MAX_BUILD_CONTEXT_COMPRESSED_BYTES: usize = 16 * 1024 * 1024;
-const MAX_BUILD_CONTEXT_DECOMPRESSED_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_BUILD_CONTEXT_ENTRIES: usize = 10_000;
+pub(crate) const DEFAULT_BUILD_CONTEXT_COMPRESSED_BYTES: usize = 1024 * 1024 * 1024;
+const DEFAULT_BUILD_CONTEXT_EXPANDED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const DEFAULT_BUILD_CONTEXT_ENTRIES: usize = 1_000_000;
+const BUILD_CONTEXT_DISK_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Operator limits for one build request. The expanded cap is also clamped to
+/// the free space on the context's actual temporary volume minus 1 GiB.
+#[derive(Clone, Copy)]
+pub(crate) struct BuildContextLimits {
+    pub compressed: usize,
+    expanded: u64,
+    entries: usize,
+}
+
+impl BuildContextLimits {
+    pub(crate) fn from_env() -> Result<Self, String> {
+        fn limit(name: &str, default: u64) -> Result<u64, String> {
+            match std::env::var(name) {
+                Ok(value) => value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| format!("{name} must be a positive byte or entry count")),
+                Err(std::env::VarError::NotPresent) => Ok(default),
+                Err(error) => Err(format!("{name}: {error}")),
+            }
+        }
+        let compressed = limit(
+            "CARRICK_SERVE_BUILD_MAX_COMPRESSED_BYTES",
+            DEFAULT_BUILD_CONTEXT_COMPRESSED_BYTES as u64,
+        )?;
+        let entries = limit(
+            "CARRICK_SERVE_BUILD_MAX_ENTRIES",
+            DEFAULT_BUILD_CONTEXT_ENTRIES as u64,
+        )?;
+        Ok(Self {
+            compressed: usize::try_from(compressed)
+                .map_err(|_| "compressed build cap exceeds this host's address size".to_owned())?,
+            expanded: limit(
+                "CARRICK_SERVE_BUILD_MAX_EXPANDED_BYTES",
+                DEFAULT_BUILD_CONTEXT_EXPANDED_BYTES,
+            )?,
+            entries: usize::try_from(entries)
+                .map_err(|_| "build entry cap exceeds this host's address size".to_owned())?,
+        })
+    }
+
+    fn for_destination(mut self, dest: &Path) -> io::Result<Self> {
+        let path = std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(dest.as_os_str()))
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in context path"))?;
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: `path` is NUL-terminated and `stat` is writable storage for
+        // the full libc record. It is read only after statvfs reports success.
+        if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a successful statvfs initialized the output record above.
+        let stat = unsafe { stat.assume_init() };
+        let available = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
+        self = self.bounded_by_available(available);
+        Ok(self)
+    }
+
+    fn bounded_by_available(mut self, available: u64) -> Self {
+        self.expanded = self
+            .expanded
+            .min(available.saturating_sub(BUILD_CONTEXT_DISK_FLOOR_BYTES));
+        self
+    }
+}
+
+#[derive(Debug)]
+enum ContextUnpackError {
+    Invalid(io::Error),
+    Limit { resource: &'static str, cap: u64 },
+}
+
+impl From<io::Error> for ContextUnpackError {
+    fn from(error: io::Error) -> Self {
+        Self::Invalid(error)
+    }
+}
+
+impl ContextUnpackError {
+    fn message(&self) -> String {
+        match self {
+            Self::Invalid(error) => format!("invalid build context: {error}"),
+            Self::Limit { resource, cap } => {
+                format!("{resource} exceeds configured cap of {cap}")
+            }
+        }
+    }
+}
 
 fn invalid_context(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
@@ -165,28 +255,43 @@ fn reject_symlink_parent(dest: &Path, path: &Path) -> io::Result<()> {
 
 /// Unpack a bounded gzipped tar into an existing context directory. The tar
 /// entry API performs its own canonical containment check via `unpack_in`.
-fn unpack_context(gz_tar: &[u8], dest: &Path) -> std::io::Result<()> {
-    if gz_tar.len() > MAX_BUILD_CONTEXT_COMPRESSED_BYTES {
-        return Err(invalid_context("compressed build context is too large"));
+fn unpack_context(
+    gz_tar: &[u8],
+    dest: &Path,
+    limits: BuildContextLimits,
+) -> Result<(), ContextUnpackError> {
+    if gz_tar.len() > limits.compressed {
+        return Err(ContextUnpackError::Limit {
+            resource: "compressed build context bytes",
+            cap: limits.compressed as u64,
+        });
+    }
+    if limits.expanded == 0 {
+        return Err(ContextUnpackError::Limit {
+            resource: "expanded build context bytes",
+            cap: 0,
+        });
     }
     let dest = dest.canonicalize()?;
     let decoder = flate2::read::GzDecoder::new(gz_tar);
-    let mut limited = decoder.take(MAX_BUILD_CONTEXT_DECOMPRESSED_BYTES + 1);
-    {
+    let mut limited = decoder.take(limits.expanded.saturating_add(1));
+    let unpacked = (|| -> Result<(), ContextUnpackError> {
         let mut archive = tar::Archive::new(&mut limited);
         let mut count = 0_usize;
         for entry in archive.entries()? {
             let mut entry = entry?;
             count += 1;
-            if count > MAX_BUILD_CONTEXT_ENTRIES {
-                return Err(invalid_context("build context has too many entries"));
+            if count > limits.entries {
+                return Err(ContextUnpackError::Limit {
+                    resource: "build context entries",
+                    cap: limits.entries as u64,
+                });
             }
             let path = entry.path()?.into_owned();
             if !is_safe_relative(&path) {
-                return Err(invalid_context(format!(
-                    "unsafe tar entry path: {}",
-                    path.display()
-                )));
+                return Err(
+                    invalid_context(format!("unsafe tar entry path: {}", path.display())).into(),
+                );
             }
             reject_symlink_parent(&dest, &path)?;
             let kind = entry.header().entry_type();
@@ -201,22 +306,36 @@ fn unpack_context(gz_tar: &[u8], dest: &Path) -> std::io::Result<()> {
                 };
                 let target = resolved_link_target(&base, &link)?;
                 if !target.starts_with(&dest) {
-                    return Err(invalid_context("tar link escapes build context"));
+                    return Err(invalid_context("tar link escapes build context").into());
                 }
             } else if !kind.is_file() && !kind.is_dir() {
-                return Err(invalid_context("unsupported tar entry type"));
+                return Err(invalid_context("unsupported tar entry type").into());
             }
-            if entry.size() > MAX_BUILD_CONTEXT_DECOMPRESSED_BYTES {
-                return Err(invalid_context("build context entry is too large"));
+            if entry.size() > limits.expanded {
+                return Err(ContextUnpackError::Limit {
+                    resource: "expanded build context bytes",
+                    cap: limits.expanded,
+                });
             }
             if !entry.unpack_in(&dest)? {
-                return Err(invalid_context("tar entry was not unpacked"));
+                return Err(invalid_context("tar entry was not unpacked").into());
             }
         }
+        Ok(())
+    })();
+    if limited.limit() == 0 {
+        return Err(ContextUnpackError::Limit {
+            resource: "expanded build context bytes",
+            cap: limits.expanded,
+        });
     }
+    unpacked?;
     io::copy(&mut limited, &mut io::sink())?;
     if limited.limit() == 0 {
-        return Err(invalid_context("expanded build context is too large"));
+        return Err(ContextUnpackError::Limit {
+            resource: "expanded build context bytes",
+            cap: limits.expanded,
+        });
     }
     Ok(())
 }
@@ -261,13 +380,14 @@ fn build_error_response(status: StatusCode, message: &str) -> Response<BoxBody<B
 pub(crate) async fn build_response(
     query: &str,
     body_bytes: Bytes,
+    limits: BuildContextLimits,
 ) -> Response<BoxBody<Bytes, std::io::Error>> {
     let parsed = parse_build_query(query);
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(64);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
 
     tokio::spawn(async move {
-        run_build_streaming(parsed, body_bytes, ready_tx, tx).await;
+        run_build_streaming(parsed, body_bytes, limits, ready_tx, tx).await;
     });
 
     match ready_rx.await {
@@ -302,6 +422,7 @@ pub(crate) async fn build_response(
 async fn run_build_streaming(
     parsed: BuildQuery,
     body_bytes: Bytes,
+    limits: BuildContextLimits,
     ready_tx: tokio::sync::oneshot::Sender<Result<(), (StatusCode, String)>>,
     tx: mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
 ) {
@@ -337,16 +458,26 @@ async fn run_build_streaming(
         let _ = ready_tx.send(Err((StatusCode::INTERNAL_SERVER_ERROR, error.to_string())));
         return;
     }
+    let limits = match limits.for_destination(&ctx_dir) {
+        Ok(limits) => limits,
+        Err(error) => {
+            let _ = ready_tx.send(Err((StatusCode::INTERNAL_SERVER_ERROR, error.to_string())));
+            return;
+        }
+    };
     let ctx_for_unpack = ctx_dir.clone();
-    match tokio::task::spawn_blocking(move || unpack_context(&body_bytes, &ctx_for_unpack)).await {
+    match tokio::task::spawn_blocking(move || unpack_context(&body_bytes, &ctx_for_unpack, limits))
+        .await
+    {
         Ok(Ok(())) => {
             let _ = ready_tx.send(Ok(()));
         }
         Ok(Err(error)) => {
-            let _ = ready_tx.send(Err((
-                StatusCode::BAD_REQUEST,
-                format!("invalid build context: {error}"),
-            )));
+            let status = match error {
+                ContextUnpackError::Invalid(_) => StatusCode::BAD_REQUEST,
+                ContextUnpackError::Limit { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            };
+            let _ = ready_tx.send(Err((status, error.message())));
             return;
         }
         Err(error) => {
@@ -424,6 +555,26 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
+    fn test_limits() -> BuildContextLimits {
+        BuildContextLimits {
+            compressed: DEFAULT_BUILD_CONTEXT_COMPRESSED_BYTES,
+            expanded: 32 * 1024 * 1024,
+            entries: 10_000,
+        }
+    }
+
+    #[test]
+    fn expanded_limit_reserves_one_gib_on_the_context_volume() {
+        let limits = test_limits();
+        assert_eq!(
+            limits
+                .bounded_by_available(BUILD_CONTEXT_DISK_FLOOR_BYTES + 4096)
+                .expanded,
+            4096
+        );
+        assert_eq!(limits.bounded_by_available(4096).expanded, 0);
+    }
+
     fn gzip_tar(append: impl FnOnce(&mut tar::Builder<&mut Vec<u8>>)) -> Vec<u8> {
         let mut tar_buf = Vec::new();
         {
@@ -476,7 +627,7 @@ mod tests {
                 .append_data(&mut header, "sub/x", &b"x"[..])
                 .unwrap();
         });
-        assert!(unpack_context(&gz, &dest).is_err());
+        assert!(unpack_context(&gz, &dest, test_limits()).is_err());
         assert!(!outside.join("x").exists());
     }
 
@@ -488,7 +639,7 @@ mod tests {
         let outside = root.path().join("host-file");
         std::fs::write(&outside, b"host").unwrap();
         let gz = gzip_tar(|builder| append_link(builder, "copied", &outside, true));
-        assert!(unpack_context(&gz, &dest).is_err());
+        assert!(unpack_context(&gz, &dest, test_limits()).is_err());
         assert!(!dest.join("copied").exists());
         assert_eq!(std::fs::read(&outside).unwrap(), b"host");
     }
@@ -497,7 +648,7 @@ mod tests {
     async fn outside_link_is_an_http_bad_request() {
         let root = tempfile::tempdir().unwrap();
         let gz = gzip_tar(|builder| append_link(builder, "sub", root.path(), false));
-        let response = build_response("", Bytes::from(gz)).await;
+        let response = build_response("", Bytes::from(gz), test_limits()).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -513,7 +664,7 @@ mod tests {
             append_link(builder, "soft", Path::new("file"), false);
         });
         let dest = tempfile::tempdir().unwrap();
-        unpack_context(&gz, dest.path()).unwrap();
+        unpack_context(&gz, dest.path(), test_limits()).unwrap();
         assert_eq!(std::fs::read(dest.path().join("hard")).unwrap(), b"x");
         assert_eq!(std::fs::read(dest.path().join("soft")).unwrap(), b"x");
     }
@@ -522,44 +673,56 @@ mod tests {
     fn rejects_gzip_expansion_past_context_cap() {
         let gz = gzip_tar(|builder| {
             let mut header = tar::Header::new_gnu();
-            header.set_size(32 * 1024 * 1024 + 1);
+            header.set_size(2048);
             header.set_mode(0o644);
             header.set_cksum();
             builder
-                .append_data(
-                    &mut header,
-                    "bomb",
-                    std::io::repeat(0).take(32 * 1024 * 1024 + 1),
-                )
+                .append_data(&mut header, "bomb", std::io::repeat(0).take(2048))
                 .unwrap();
         });
         let dest = tempfile::tempdir().unwrap();
-        assert!(unpack_context(&gz, dest.path()).is_err());
+        let limits = BuildContextLimits {
+            expanded: 1024,
+            ..test_limits()
+        };
+        assert!(matches!(
+            unpack_context(&gz, dest.path(), limits),
+            Err(ContextUnpackError::Limit { cap: 1024, .. })
+        ));
     }
 
     #[tokio::test]
     async fn gzip_expansion_over_cap_returns_413_with_limit() {
         let gz = gzip_tar(|builder| {
             let mut header = tar::Header::new_gnu();
-            header.set_size(32 * 1024 * 1024 + 1);
+            header.set_size(2048);
             header.set_mode(0o644);
             header.set_cksum();
             builder
-                .append_data(
-                    &mut header,
-                    "bomb",
-                    std::io::repeat(0).take(32 * 1024 * 1024 + 1),
-                )
+                .append_data(&mut header, "bomb", std::io::repeat(0).take(2048))
                 .unwrap();
         });
-        let response = build_response("", Bytes::from(gz)).await;
+        let limits = BuildContextLimits {
+            expanded: 1024,
+            ..test_limits()
+        };
+        let response = build_response("", Bytes::from(gz), limits).await;
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert!(std::str::from_utf8(&body).unwrap().contains("1024"));
     }
 
     #[test]
     fn rejects_context_entry_count_past_cap() {
+        let limits = BuildContextLimits {
+            entries: 4,
+            ..test_limits()
+        };
         let gz = gzip_tar(|builder| {
-            for index in 0..=MAX_BUILD_CONTEXT_ENTRIES {
+            for index in 0..=limits.entries {
                 let mut header = tar::Header::new_gnu();
                 header.set_size(0);
                 header.set_mode(0o644);
@@ -570,11 +733,11 @@ mod tests {
             }
         });
         let dest = tempfile::tempdir().unwrap();
-        assert!(unpack_context(&gz, dest.path()).is_err());
+        assert!(unpack_context(&gz, dest.path(), limits).is_err());
         assert!(
             !dest
                 .path()
-                .join(format!("file-{MAX_BUILD_CONTEXT_ENTRIES}"))
+                .join(format!("file-{}", limits.entries))
                 .exists()
         );
     }
@@ -683,7 +846,7 @@ mod tests {
             enc.finish().unwrap();
         }
         let dir = tempfile::tempdir().unwrap();
-        unpack_context(&gz, dir.path()).unwrap();
+        unpack_context(&gz, dir.path(), test_limits()).unwrap();
         let dockerfile = std::fs::read_to_string(dir.path().join("Dockerfile")).unwrap();
         assert_eq!(dockerfile, "FROM alpine:3.20\n");
     }

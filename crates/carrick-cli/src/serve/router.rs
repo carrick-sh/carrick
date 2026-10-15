@@ -132,6 +132,22 @@ pub(crate) async fn route(
     let method = req.method().clone();
     let path = strip_version(req.uri().path()).to_string();
     let query = req.uri().query().unwrap_or("").to_string();
+    let build_limits = if method == Method::POST && path == "/build" {
+        match crate::serve::build::BuildContextLimits::from_env() {
+            Ok(limits) => Some(limits),
+            Err(error) => {
+                return Ok(boxed(json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({ "message": error }).to_string(),
+                )));
+            }
+        }
+    } else {
+        None
+    };
+    let body_limit = build_limits
+        .map(|limits| limits.compressed)
+        .unwrap_or(MAX_HTTP_BODY_BYTES);
 
     // Reject declared oversize bodies before a handler waits for their bytes.
     // The collectors below enforce the same cap for chunked bodies.
@@ -140,29 +156,24 @@ pub(crate) async fn route(
         .get(hyper::header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
-        .is_some_and(|length| length > MAX_HTTP_BODY_BYTES as u64)
+        .is_some_and(|length| length > body_limit as u64)
     {
         return Ok(boxed(json(
             StatusCode::PAYLOAD_TOO_LARGE,
-            serde_json::json!({ "message": "request body is too large" }).to_string(),
+            serde_json::json!({ "message": format!("request body exceeds cap of {body_limit} bytes") }).to_string(),
         )));
     }
 
     // `/build`'s request body is a (potentially large) gzipped tar streamed
     // back as NDJSON; it is the only streaming endpoint. Handle it before the
     // buffered dispatch so its response body stays unboxed-but-streaming.
-    if method == Method::POST && path == "/build" {
-        let body_bytes = match collect_limited_body(
-            req.into_body(),
-            crate::serve::build::MAX_BUILD_CONTEXT_COMPRESSED_BYTES,
-        )
-        .await
-        {
+    if let Some(build_limits) = build_limits {
+        let body_bytes = match collect_limited_body(req.into_body(), body_limit).await {
             Ok(bytes) => bytes,
             Err(LimitedBodyError::TooLarge) => {
                 return Ok(boxed(json(
                     StatusCode::PAYLOAD_TOO_LARGE,
-                    serde_json::json!({ "message": "build context body is too large" }).to_string(),
+                    serde_json::json!({ "message": format!("compressed build context exceeds cap of {body_limit} bytes") }).to_string(),
                 )));
             }
             Err(LimitedBodyError::Transport(error)) => {
@@ -173,7 +184,7 @@ pub(crate) async fn route(
                 )));
             }
         };
-        return Ok(crate::serve::build::build_response(&query, body_bytes).await);
+        return Ok(crate::serve::build::build_response(&query, body_bytes, build_limits).await);
     }
 
     if method == Method::GET && container_action(&path).map(|(_, a)| a) == Some("logs") {
@@ -621,7 +632,11 @@ mod archive_body_tests {
             .write_all(
                 format!(
                     "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
-                    MAX_HTTP_ARCHIVE_BYTES + 1
+                    if path == "/build" {
+                        crate::serve::build::DEFAULT_BUILD_CONTEXT_COMPRESSED_BYTES + 1
+                    } else {
+                        MAX_HTTP_ARCHIVE_BYTES + 1
+                    }
                 )
                 .as_bytes(),
             )
