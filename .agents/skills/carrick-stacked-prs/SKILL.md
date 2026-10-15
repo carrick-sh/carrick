@@ -64,9 +64,14 @@ gh stack view                                 # layers, PRs and their state
    every layer. Post the receipt on the top PR and link it from the others.
 3. Mark every layer ready and wait for each layer's `ci-ok`. A higher PR
    can merge only when every PR below it has passing checks.
-4. Land with `gh stack merge <top PR>`. With the merge queue, the whole
-   stack enters as one merge group and takes one HVF gate. Stacks have no
-   auto-merge, so the director runs the merge. `gh stack modify` is refused
-   while any layer is queued.
+4. Land with `gh stack merge <PR>`: it queues every layer up to and
+   including that PR. Plain `gh pr merge` is refused for a stacked PR
+   (`Auto-merge is not supported for stacked pull requests`), and admin
+   bypass is not supported for stacks; an owner admin merge needs
+   `gh stack unstack` first. GitHub documents a queued stack entering as one
+   merge group, but our pilot (#468) saw separate entries with the upper
+   layer `UNMERGEABLE`, so until that is resolved land one layer at a time
+   (`gh stack merge <bottom PR>`, then the next once it merges).
+   `gh stack modify` is refused while any layer is queued.
 5. After landing: `gh stack sync --prune` and remove every layer's
    worktree and `target/` on every host.
