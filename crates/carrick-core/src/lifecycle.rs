@@ -34,54 +34,178 @@ pub enum MemberExitKind {
 const IN_ZONE_COMMITTED: u32 = 4;
 const HOST_RETIRING: u32 = 8;
 
+const GRAPH_REGISTERED: u32 = 16;
+const GRAPH_REFERENCE: u32 = 32;
+const RESETTING: u32 = 1 << 31;
+const REFERENCES: u32 = RESETTING - GRAPH_REFERENCE;
+
+/// Shared ownership and exit provenance for one control incarnation. Only
+/// core's admitted exit operations can publish its terminal provenance.
+#[repr(transparent)]
+#[derive(::core::fmt::Debug)]
+pub struct MemberExitCustody {
+    word: AtomicU32,
+}
+impl Default for MemberExitCustody {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl MemberExitCustody {
+    pub const fn new() -> Self {
+        Self {
+            word: AtomicU32::new(0),
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn test_record(&self, word: u32) {
+        self.word.store(word, Ordering::Release);
+    }
+    pub fn referenced(&self) -> bool {
+        self.word.load(Ordering::Acquire) & REFERENCES != 0
+    }
+    pub fn unregister_receipt(&self) -> bool {
+        self.word.load(Ordering::Acquire) & (GRAPH_REGISTERED | REFERENCES) == GRAPH_REGISTERED
+    }
+    pub fn host_exit_requested(&self) -> bool {
+        self.word.load(Ordering::Acquire) & 1 != 0
+    }
+    pub fn request_host_exit(&self) {
+        self.word.fetch_or(1, Ordering::Release);
+    }
+    pub fn host_receipt_published(&self) -> bool {
+        self.word.load(Ordering::Acquire) & 2 != 0
+    }
+    pub fn publish_host_receipt(&self) {
+        self.word.fetch_or(2 | GRAPH_REGISTERED, Ordering::Release);
+    }
+    pub fn reserve_reset(&self) -> Result<MemberReset<'_>, TransitionError> {
+        self.word
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |word| {
+                (word & (REFERENCES | RESETTING) == 0).then_some(RESETTING)
+            })
+            .map_err(|_| TransitionError::StaleGeneration)?;
+        Ok(MemberReset(self))
+    }
+}
+/// Exclusive reset authority; retained graph references make it unavailable.
+pub struct MemberReset<'a>(&'a MemberExitCustody);
+impl Drop for MemberReset<'_> {
+    fn drop(&mut self) {
+        self.0.word.store(0, Ordering::Release);
+    }
+}
+
+/// An owned graph reference. The host allocation cannot be recycled until
+/// every copy drops and publishes the unregister receipt in shared storage.
+pub struct MemberControlCustody<'a, T: MemberControl + ?Sized> {
+    control: &'a T,
+}
+impl<'a, T: MemberControl + ?Sized> MemberControlCustody<'a, T> {
+    pub fn retain(control: &'a T) -> Result<Self, TransitionError> {
+        control
+            .exit_custody()
+            .word
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |word| {
+                if word & RESETTING != 0 || word & REFERENCES == REFERENCES {
+                    None
+                } else {
+                    Some((word + GRAPH_REFERENCE) | GRAPH_REGISTERED)
+                }
+            })
+            .map_err(|_| TransitionError::StaleGeneration)?;
+        Ok(Self { control })
+    }
+    pub fn control(&self) -> &'a T {
+        self.control
+    }
+}
+impl<T: MemberControl + ?Sized> core::ops::Deref for MemberControlCustody<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.control
+    }
+}
+impl<T: MemberControl + ?Sized> Drop for MemberControlCustody<'_, T> {
+    fn drop(&mut self) {
+        self.control
+            .exit_custody()
+            .word
+            .fetch_sub(GRAPH_REFERENCE, Ordering::AcqRel);
+    }
+}
+
 /// Exact member custody, reset exclusively before each birth. The entry
 /// reference is the generation key; the flag word is member-owned storage.
-pub trait MemberExitCustody {
+pub trait MemberControl {
     fn member_entry(&self) -> Option<EntryRef>;
-    fn member_exit_word(&self) -> &AtomicU32;
+    fn exit_custody(&self) -> &MemberExitCustody;
     fn host_retirement(&self) -> Option<crate::terminal::HostThreadRetirementReceipt>;
+}
 
-    fn recorded_exit_kind(&self, entry: Option<EntryRef>) -> MemberExitKind {
-        if self.member_entry() != entry {
-            return MemberExitKind::Stale;
+pub fn recorded_member_exit_kind(
+    member: &dyn MemberControl,
+    entry: Option<EntryRef>,
+) -> MemberExitKind {
+    if member.member_entry() != entry {
+        return MemberExitKind::Stale;
+    }
+    let word = member.exit_custody().word.load(Ordering::Acquire);
+    if word & HOST_RETIRING != 0 {
+        MemberExitKind::HostRetiring
+    } else if word & IN_ZONE_COMMITTED != 0 {
+        MemberExitKind::InZone
+    } else {
+        MemberExitKind::Active
+    }
+}
+
+/// A revoked, never-published birth has no ring graph reference to retire.
+/// Publish its release receipt at the successful revocation, not a later scan.
+pub fn revoke_unborn_control(
+    page: &dyn Lifecycle,
+    entry: EntryRef,
+    member: &dyn MemberControl,
+) -> Result<(), TransitionError> {
+    if member.member_entry().is_some_and(|actual| actual != entry) {
+        return Err(TransitionError::StaleGeneration);
+    }
+    page.revoke(entry)?;
+    member
+        .exit_custody()
+        .word
+        .fetch_or(GRAPH_REGISTERED, Ordering::Release);
+    Ok(())
+}
+
+pub fn retire_host_member(
+    page: &dyn Lifecycle,
+    entry: EntryRef,
+    member: &dyn MemberControl,
+    membership: NonfinalExitMembership<'_>,
+) -> Result<(), TransitionError> {
+    let _pin = MemberControlCustody::retain(member)?;
+    if !core::ptr::addr_eq(page, membership.page) {
+        return Err(TransitionError::StaleGeneration);
+    }
+    if member.member_entry() != Some(entry) {
+        return Err(TransitionError::StaleGeneration);
+    }
+    member
+        .exit_custody()
+        .word
+        .fetch_or(HOST_RETIRING, Ordering::SeqCst);
+    if let Err(error) = page.retire_published(entry) {
+        if member.member_entry() == Some(entry) {
+            member
+                .exit_custody()
+                .word
+                .fetch_and(!HOST_RETIRING, Ordering::SeqCst);
         }
-        let word = self.member_exit_word().load(Ordering::Acquire);
-        if word & HOST_RETIRING != 0 {
-            MemberExitKind::HostRetiring
-        } else if word & IN_ZONE_COMMITTED != 0 {
-            MemberExitKind::InZone
-        } else {
-            MemberExitKind::Active
-        }
+        return Err(error);
     }
-
-    fn record_in_zone_commit(&self, entry: EntryRef) -> Result<(), TransitionError> {
-        if self.member_entry() != Some(entry) {
-            return Err(TransitionError::StaleGeneration);
-        }
-        self.member_exit_word()
-            .fetch_or(IN_ZONE_COMMITTED, Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn record_host_retiring(&self, entry: Option<EntryRef>) -> Result<(), TransitionError> {
-        if self.member_entry() != entry {
-            return Err(TransitionError::StaleGeneration);
-        }
-        self.member_exit_word()
-            .fetch_or(HOST_RETIRING, Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn rollback_in_zone_commit(&self) {
-        self.member_exit_word()
-            .fetch_and(!IN_ZONE_COMMITTED, Ordering::SeqCst);
-    }
-
-    fn rollback_host_retiring(&self) {
-        self.member_exit_word()
-            .fetch_and(!HOST_RETIRING, Ordering::SeqCst);
-    }
+    membership.publish();
+    Ok(())
 }
 
 /// The exact page owns the storage and retains its ledger notification authority.
@@ -89,11 +213,9 @@ pub trait MemberExitCustody {
 pub trait Lifecycle {
     fn host_birth_receipt_returned_exact(
         &self,
-        _index: usize,
-        _identity: crate::terminal::HostThreadRetirementReceipt,
-    ) -> bool {
-        false
-    }
+        index: usize,
+        identity: crate::terminal::HostThreadRetirementReceipt,
+    ) -> bool;
     fn gate_word(&self) -> &AtomicU32;
     fn live_word(&self) -> &AtomicU32;
     fn entry_count(&self) -> usize;
@@ -155,9 +277,6 @@ pub trait Lifecycle {
     fn close(&self) {
         self.gate_word()
             .store(GateState::Closed as u32, Ordering::SeqCst);
-    }
-    fn close_if_open(&self) -> Result<(), GateState> {
-        self.transition_gate(GateState::Open, GateState::Closed)
     }
     /// Clone and exit admissions a host must drain after `close_for_fork`.
     /// `SeqCst` scan (second half of both claim/gate pairs).
@@ -285,10 +404,10 @@ pub trait Lifecycle {
     /// entry cannot acquire a host-retirement obligation while unregistering.
     fn expected_exit_receipt(
         &self,
-        member: &dyn MemberExitCustody,
+        member: &dyn MemberControl,
         entry: Option<EntryRef>,
     ) -> ExpectedExitReceipt {
-        match member.recorded_exit_kind(entry) {
+        match recorded_member_exit_kind(member, entry) {
             MemberExitKind::InZone => return ExpectedExitReceipt::AlreadyExited,
             MemberExitKind::HostRetiring | MemberExitKind::Stale => {
                 return ExpectedExitReceipt::Host;
@@ -527,6 +646,7 @@ pub trait Lifecycle {
         )
     }
 }
+
 #[must_use]
 pub struct NonfinalExitMembership<'a> {
     page: &'a dyn Lifecycle,
@@ -569,11 +689,22 @@ impl ExitAdmission<'_> {
     /// Publish the member-owned exit kind before making the shared entry
     /// reappable. Closing may observe the marker during the admitted window,
     /// but claimed_count prevents settlement until this CAS completes.
-    pub fn commit_with_member(self, member: &dyn MemberExitCustody) -> Result<(), TransitionError> {
-        member.record_in_zone_commit(self.entry)?;
+    pub fn commit_with_member(self, member: &dyn MemberControl) -> Result<(), TransitionError> {
+        let _pin = MemberControlCustody::retain(member)?;
+        if member.member_entry() != Some(self.entry) {
+            return Err(TransitionError::StaleGeneration);
+        }
+        member
+            .exit_custody()
+            .word
+            .fetch_or(IN_ZONE_COMMITTED, Ordering::SeqCst);
+        let entry = self.entry;
         let result = self.commit();
-        if result.is_err() {
-            member.rollback_in_zone_commit();
+        if result.is_err() && member.member_entry() == Some(entry) {
+            member
+                .exit_custody()
+                .word
+                .fetch_and(!IN_ZONE_COMMITTED, Ordering::SeqCst);
         }
         result
     }
@@ -664,6 +795,14 @@ mod membership_tests {
     }
 
     impl Lifecycle for Page {
+        fn host_birth_receipt_returned_exact(
+            &self,
+            _: usize,
+            _: crate::terminal::HostThreadRetirementReceipt,
+        ) -> bool {
+            false
+        }
+
         fn gate_word(&self) -> &AtomicU32 {
             &self.gate
         }

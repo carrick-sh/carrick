@@ -401,7 +401,7 @@ pub fn x5_linux_clone_exit() {
                         },
                     )
                     .unwrap();
-                a.slots[1].reset_for_host_birth(BlockedMask(0));
+                a.slots[1].reset_for_host_birth(BlockedMask(0)).unwrap();
                 let args = [FLAGS, 0xdead0000, 0x1000, 0x77770000, 0x1004, 0];
                 turn.fail_copy = Some(0x1004);
                 assert_eq!(turn.syscall(220, args), dispatch::CompletionRoute::Forward);

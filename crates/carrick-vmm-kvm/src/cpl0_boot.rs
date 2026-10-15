@@ -2945,7 +2945,9 @@ impl Cpl0Carrier {
         let tid = u32::try_from(identity.thread.tid)
             .map_err(|_| fail("initial task TID outside guest ABI"))?;
         let control: &ThreadControlSlot = self.metadata(CONTROL_OFFSET);
-        control.reset_for_host_birth(BlockedMask(0));
+        control
+            .reset_for_host_birth(BlockedMask(0))
+            .map_err(|_| fail("control slot still owned by graph"))?;
         if !control.publish_visible_tid(tid) {
             return Err(fail("initial root control slot identity"));
         }
@@ -4230,7 +4232,9 @@ impl Cpl0Carrier {
                     .ok_or_else(|| fail("control slot backing"))?
                     .cast::<ThreadControlSlot>();
                 slot.write(ThreadControlSlot::new());
-                (*slot).reset_for_host_birth(BlockedMask(0));
+                (*slot)
+                    .reset_for_host_birth(BlockedMask(0))
+                    .map_err(|_| fail("control slot still owned by graph"))?;
                 if !(*slot).publish_visible_tid(41 + index as u32) {
                     return Err(fail("issued slot identity"));
                 }
@@ -6532,7 +6536,7 @@ impl Cpl0Carrier {
             )
             .map_err(|e| fail(format!("stock: {e:?}")))?;
         let controls: &[ThreadControlSlot; 9] = self.metadata(0xb000 + index as u64 * 0x1000);
-        controls[1].reset_for_host_birth(BlockedMask(0));
+        controls[1].reset_for_host_birth(BlockedMask(0)).unwrap();
         page.bind_control_address(
             entry,
             METADATA_VA + 0xb000 + index as u64 * 0x1000 + size_of::<ThreadControlSlot>() as u64,

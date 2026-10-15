@@ -50,7 +50,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Protocol revision, folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 11;
+pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 12;
 
 pub use carrick_core::lifecycle::{ClaimedEntry, ExitAdmission, Lifecycle};
 pub use carrick_core_abi::lifecycle::*;
@@ -322,7 +322,7 @@ pub struct ThreadControlSlot {
     zone_id: AtomicU32,
     /// Exit request/receipt bits plus the core-owned exact member exit kind.
     /// The slot's `entry` is the generation key until exclusive reset.
-    host_exit_requested: AtomicU32,
+    host_exit_requested: carrick_core::lifecycle::MemberExitCustody,
     /// The host writes task/execution first and publishes thread last. A
     /// Closing owner only credits the complete exact receipt it requested.
     retired_task: AtomicU64,
@@ -335,7 +335,7 @@ impl ThreadControlSlot {
         &self,
         entry: Option<EntryRef>,
     ) -> carrick_core::lifecycle::MemberExitKind {
-        carrick_core::lifecycle::MemberExitCustody::recorded_exit_kind(self, entry)
+        carrick_core::lifecycle::recorded_member_exit_kind(self, entry)
     }
 
     pub const fn new() -> Self {
@@ -354,7 +354,7 @@ impl ThreadControlSlot {
             zone_seq: AtomicU64::new(0),
             zone_incarnation: AtomicU64::new(0),
             zone_id: AtomicU32::new(0),
-            host_exit_requested: AtomicU32::new(0),
+            host_exit_requested: carrick_core::lifecycle::MemberExitCustody::new(),
             retired_task: AtomicU64::new(0),
             retired_execution: AtomicU64::new(0),
             retired_thread: AtomicU64::new(0),
@@ -365,14 +365,24 @@ impl ThreadControlSlot {
     /// it is visible (nothing else reads the slot of a thread not yet Born):
     /// the mask captured at claim, no alternate stack and no robust list
     /// (`clone(2)` with `CLONE_VM` clears both), its `clear_child_tid`.
-    pub fn reset_for_birth(&self, blocked: BlockedMask, clear_child_tid: u64, entry: EntryRef) {
-        self.reset(blocked, clear_child_tid, Some(entry));
+    pub fn reset_for_birth(
+        &self,
+        blocked: BlockedMask,
+        clear_child_tid: u64,
+        entry: EntryRef,
+    ) -> Result<(), TransitionError> {
+        self.reset(blocked, clear_child_tid, Some(entry))
     }
 
     /// Initialise an exclusively retained host-born slot before publication.
-    pub fn reset_for_host_birth(&self, blocked: BlockedMask) {
-        self.visible_tid.store(0, Ordering::Relaxed);
-        self.reset(blocked, 0, None);
+    pub fn reset_for_host_birth(&self, blocked: BlockedMask) -> Result<(), TransitionError> {
+        self.reset(blocked, 0, None)
+    }
+    pub fn graph_referenced(&self) -> bool {
+        self.host_exit_requested.referenced()
+    }
+    pub fn graph_unregister_receipt(&self) -> bool {
+        self.host_exit_requested.unregister_receipt()
     }
 
     /// Publish once for this exclusively reserved slot incarnation. Repeated
@@ -400,9 +410,17 @@ impl ThreadControlSlot {
         &self.pending
     }
 
-    fn reset(&self, blocked: BlockedMask, clear_child_tid: u64, entry: Option<EntryRef>) {
+    fn reset(
+        &self,
+        blocked: BlockedMask,
+        clear_child_tid: u64,
+        entry: Option<EntryRef>,
+    ) -> Result<(), TransitionError> {
+        let _reset = self.host_exit_requested.reserve_reset()?;
+        if entry.is_none() {
+            self.visible_tid.store(0, Ordering::Relaxed);
+        }
         self.zone_id.store(0, Ordering::Relaxed);
-        self.host_exit_requested.store(0, Ordering::Relaxed);
         self.retired_thread.store(0, Ordering::Relaxed);
         self.retired_task.store(0, Ordering::Relaxed);
         self.retired_execution.store(0, Ordering::Relaxed);
@@ -423,6 +441,7 @@ impl ThreadControlSlot {
             .store(clear_child_tid, Ordering::Relaxed);
         self.entry
             .store(entry.map_or(0, EntryRef::pack), Ordering::Release);
+        Ok(())
     }
 
     /// The pool entry the thread holds, if any.
@@ -583,11 +602,11 @@ impl ThreadControlSlot {
             .store(receipt.execution().raw(), Ordering::Relaxed);
         self.retired_thread
             .store(receipt.thread().raw(), Ordering::Release);
-        self.host_exit_requested.fetch_or(2, Ordering::Release);
+        self.host_exit_requested.publish_host_receipt();
     }
 
     pub fn host_retirement(&self) -> Option<carrick_core::terminal::HostThreadRetirementReceipt> {
-        if self.host_exit_requested.load(Ordering::Acquire) & 2 == 0 {
+        if !self.host_exit_requested.host_receipt_published() {
             return None;
         }
         let thread = self.retired_thread.load(Ordering::Acquire);
@@ -604,19 +623,19 @@ impl ThreadControlSlot {
 
     /// The ring routed a declined raw exit to this exact host-owned slot.
     pub fn request_host_exit(&self) {
-        self.host_exit_requested.fetch_or(1, Ordering::Release);
+        self.host_exit_requested.request_host_exit();
     }
 
     pub fn host_exit_requested(&self) -> bool {
-        self.host_exit_requested.load(Ordering::Acquire) & 1 != 0
+        self.host_exit_requested.host_exit_requested()
     }
 }
-impl carrick_core::lifecycle::MemberExitCustody for ThreadControlSlot {
+impl carrick_core::lifecycle::MemberControl for ThreadControlSlot {
     fn member_entry(&self) -> Option<EntryRef> {
         self.entry()
     }
 
-    fn member_exit_word(&self) -> &AtomicU32 {
+    fn exit_custody(&self) -> &carrick_core::lifecycle::MemberExitCustody {
         &self.host_exit_requested
     }
 
@@ -906,13 +925,7 @@ impl ThreadLifecyclePage {
         control: &ThreadControlSlot,
         membership: carrick_core::lifecycle::NonfinalExitMembership<'_>,
     ) -> Result<(), TransitionError> {
-        carrick_core::lifecycle::MemberExitCustody::record_host_retiring(control, Some(entry))?;
-        if let Err(error) = self.retire_published(entry) {
-            carrick_core::lifecycle::MemberExitCustody::rollback_host_retiring(control);
-            return Err(error);
-        }
-        membership.publish();
-        Ok(())
+        carrick_core::lifecycle::retire_host_member(self, entry, control, membership)
     }
 
     pub fn host_birth_receipt_returned(&self, index: usize) -> bool {
@@ -1260,6 +1273,47 @@ pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 33] = [
 #[cfg(test)]
 mod tests {
     #[test]
+    fn revoked_unpublished_control_publishes_its_release_receipt() {
+        let page = super::ThreadLifecyclePage::new();
+        let control = super::ThreadControlSlot::new();
+        let entry = page
+            .stock(
+                0,
+                super::EntryIdentity {
+                    tid: 42,
+                    visible_tid: 42,
+                    thread_serial: 2,
+                    uid_credit: 0,
+                },
+            )
+            .unwrap();
+        assert!(!control.graph_unregister_receipt());
+        carrick_core::lifecycle::revoke_unborn_control(&page, entry, &control).unwrap();
+        assert!(control.graph_unregister_receipt());
+    }
+
+    #[test]
+    fn graph_owned_control_rejects_reset_until_unregister() {
+        let slot = super::ThreadControlSlot::new();
+        let entry = super::EntryRef::new(0, 1);
+        slot.reset_for_birth(super::BlockedMask(0), 0, entry)
+            .unwrap();
+        let custody = carrick_core::lifecycle::MemberControlCustody::retain(&slot).unwrap();
+        assert!(slot.reset_for_host_birth(super::BlockedMask(0)).is_err());
+        assert!(
+            slot.reset_for_birth(super::BlockedMask(0), 0, super::EntryRef::new(1, 2))
+                .is_err()
+        );
+        assert_eq!(slot.entry(), Some(entry));
+        assert!(!slot.graph_unregister_receipt());
+        drop(custody);
+        assert!(slot.graph_unregister_receipt());
+        slot.reset_for_host_birth(super::BlockedMask(0)).unwrap();
+        assert_eq!(slot.entry(), None);
+        assert!(!slot.graph_unregister_receipt());
+    }
+
+    #[test]
     fn host_birth_capacity_refuses_without_leaking_a_claim() {
         let page = super::ThreadLifecyclePage::new();
         let mut slots = [0usize; super::THREAD_POOL_ENTRIES];
@@ -1343,7 +1397,7 @@ mod tests {
         assert_eq!(slot.zone_record(), Some(record));
         slot.zone_seq.fetch_add(1, super::Ordering::SeqCst);
         assert_eq!(slot.zone_record(), None, "no retry on an in-flight writer");
-        slot.reset_for_host_birth(super::BlockedMask(0));
+        slot.reset_for_host_birth(super::BlockedMask(0)).unwrap();
         assert_eq!(
             slot.zone_record(),
             None,
@@ -1366,7 +1420,7 @@ mod tests {
                 .1,
             PendingSignals(0x400)
         );
-        first.reset_for_host_birth(BlockedMask(0));
+        first.reset_for_host_birth(BlockedMask(0)).unwrap();
         assert_eq!(first.pending().load(), PendingSignals(0));
     }
     extern crate std;
@@ -1734,10 +1788,10 @@ mod tests {
         assert!(!first.publish_visible_tid(73));
         let page = ThreadLifecyclePage::new();
         let entry = page.stock(0, ident(1)).unwrap();
-        first.reset_for_birth(BlockedMask(0), 0, entry);
+        first.reset_for_birth(BlockedMask(0), 0, entry).unwrap();
         assert_eq!(first.visible_tid(), Some(41));
         assert_eq!(second.visible_tid(), Some(73));
-        first.reset_for_host_birth(BlockedMask(0));
+        first.reset_for_host_birth(BlockedMask(0)).unwrap();
         assert_eq!(first.visible_tid(), None);
         assert_eq!(second.visible_tid(), Some(73));
         assert!(first.publish_visible_tid(91));
@@ -1756,7 +1810,7 @@ mod tests {
             flags: 0,
         });
         s.init_blocked(BlockedMask(0xff));
-        s.reset_for_birth(BlockedMask(0x10), 0x7000, r);
+        s.reset_for_birth(BlockedMask(0x10), 0x7000, r).unwrap();
         assert_eq!(s.entry(), Some(r));
         assert_eq!(s.blocked(), BlockedMask(0x10));
         assert_eq!(s.robust_list(), (0, 0));
@@ -1764,7 +1818,7 @@ mod tests {
         assert_eq!(s.clear_child_tid(), 0x7000);
         s.set_clear_child_tid(0);
         assert_eq!(s.clear_child_tid(), 0);
-        s.reset_for_host_birth(BlockedMask(0x20));
+        s.reset_for_host_birth(BlockedMask(0x20)).unwrap();
         assert_eq!(s.entry(), None);
         assert_eq!(s.blocked(), BlockedMask(0x20));
         assert_eq!(s.robust_list(), (0, 0));
@@ -1981,7 +2035,14 @@ mod layout_manifest {
         field!(ThreadControlSlot, zone_seq, AtomicU64, 80, 8, 8);
         field!(ThreadControlSlot, zone_incarnation, AtomicU64, 88, 8, 8);
         field!(ThreadControlSlot, zone_id, AtomicU32, 96, 4, 4);
-        field!(ThreadControlSlot, host_exit_requested, AtomicU32, 100, 4, 4);
+        field!(
+            ThreadControlSlot,
+            host_exit_requested,
+            carrick_core::lifecycle::MemberExitCustody,
+            100,
+            4,
+            4
+        );
         field!(ThreadControlSlot, retired_task, AtomicU64, 104, 8, 8);
         field!(ThreadControlSlot, retired_execution, AtomicU64, 112, 8, 8);
         field!(ThreadControlSlot, retired_thread, AtomicU64, 120, 8, 8);

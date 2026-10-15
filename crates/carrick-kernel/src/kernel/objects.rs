@@ -4863,3 +4863,6 @@ mod tests {
         assert!(!table.is_slot_reserved(3));
     }
 }
+
+#[cfg(feature = "test-support")]
+pub use thread_control::TestThreadControlArena;
