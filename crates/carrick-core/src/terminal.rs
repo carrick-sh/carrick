@@ -74,32 +74,72 @@ impl ProcessTerminalIdentity {
 
 /// A bounded description of the work the registry applies. Exact host
 /// bindings live in a boxed list rather than on the EL1 stack.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MemberSet {
-    pool_mask: u16,
-    adopted: Box<[HostThreadRetirementReceipt]>,
+    process: ProcessTerminalIdentity,
+    pool: Box<[EntryRef]>,
+    host: Box<[HostThreadRetirementReceipt]>,
 }
 
 impl MemberSet {
     pub fn new(
-        pool_mask: u16,
-        adopted: Vec<HostThreadRetirementReceipt>,
+        process: ProcessTerminalIdentity,
+        pool: Vec<EntryRef>,
+        host: Vec<HostThreadRetirementReceipt>,
         capacity: usize,
     ) -> Option<Self> {
-        if adopted.len() > capacity {
+        if pool.len() + host.len() > capacity
+            || pool
+                .iter()
+                .enumerate()
+                .any(|(i, entry)| pool[..i].contains(entry))
+            || host
+                .iter()
+                .enumerate()
+                .any(|(i, receipt)| host[..i].contains(receipt))
+        {
             return None;
         }
         Some(Self {
-            pool_mask,
-            adopted: adopted.into_boxed_slice(),
+            process,
+            pool: pool.into_boxed_slice(),
+            host: host.into_boxed_slice(),
         })
     }
-    pub fn pool_mask(self) -> u16 {
-        self.pool_mask
+    pub fn pool(&self) -> &[EntryRef] {
+        &self.pool
     }
-    pub fn adopted(&self) -> &[HostThreadRetirementReceipt] {
-        &self.adopted
+    pub fn host(&self) -> &[HostThreadRetirementReceipt] {
+        &self.host
     }
+    pub fn completed(
+        &self,
+        pool: &[EntryRef],
+        host: &[HostThreadRetirementReceipt],
+    ) -> Option<CompletedMemberReceipts> {
+        if pool.len() != self.pool.len()
+            || host.len() != self.host.len()
+            || self
+                .pool
+                .iter()
+                .any(|entry| pool.iter().filter(|got| *got == entry).count() != 1)
+            || self
+                .host
+                .iter()
+                .any(|receipt| host.iter().filter(|got| *got == receipt).count() != 1)
+        {
+            return None;
+        }
+        Some(CompletedMemberReceipts {
+            process: self.process,
+        })
+    }
+}
+
+/// Core-minted proof that every exact member named by one verdict returned a
+/// receipt. Callers cannot turn a census read or a boolean into this proof.
+pub struct CompletedMemberReceipts {
+    process: ProcessTerminalIdentity,
 }
 
 /// Host retirement's exact acknowledgement of an adopted member. A visible
@@ -254,12 +294,16 @@ impl TerminalCustody<Process, Live> {
 }
 
 impl TerminalCustody<Process, Closing> {
+    pub fn can_settle(&self, page: &impl Lifecycle, receipts: &CompletedMemberReceipts) -> bool {
+        self.identity == receipts.process && page.live() == 0 && page.claimed_count() == 0
+    }
+
     pub fn settle(
         self,
         page: &impl Lifecycle,
-        receipts_returned: bool,
+        receipts: CompletedMemberReceipts,
     ) -> Result<TerminalCustody<Process, Settled>, Self> {
-        if page.live() != 0 || page.claimed_count() != 0 || !receipts_returned {
+        if !self.can_settle(page, &receipts) {
             return Err(self);
         }
         Ok(TerminalCustody {
@@ -334,3 +378,59 @@ impl TerminalCustody<Thread, Terminal> {
 // The EL1 caller may hold custody on its 16 KiB stack.
 const _: () = assert!(core::mem::size_of::<TerminalCustody<Thread, Live>>() <= 64);
 const _: () = assert!(core::mem::size_of::<TerminalCustody<Process, Closing>>() <= 64);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lifecycle::AtomicEntry;
+    use core::sync::atomic::AtomicU32;
+
+    struct Page {
+        gate: AtomicU32,
+        live: AtomicU32,
+    }
+    impl Lifecycle for Page {
+        fn gate_word(&self) -> &AtomicU32 {
+            &self.gate
+        }
+        fn live_word(&self) -> &AtomicU32 {
+            &self.live
+        }
+        fn entry_count(&self) -> usize {
+            0
+        }
+        fn entry_word(&self, _: usize) -> Option<&AtomicEntry> {
+            None
+        }
+        fn activity(&self) -> Option<&crate::lifecycle::ThreadLedgerActivity> {
+            None
+        }
+    }
+
+    #[test]
+    fn closing_rejects_caller_claim_without_member_receipts() {
+        let page = Page {
+            gate: AtomicU32::new(0),
+            live: AtomicU32::new(0),
+        };
+        let identity = ProcessTerminalIdentity::from_exit(
+            TaskKey {
+                id: TaskId::from_abi_positive(41).unwrap(),
+                serial: TaskSerial::from_raw_u64(11).unwrap(),
+            },
+            AddressContext {
+                root: RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(0x10000)).unwrap(),
+                mm: carrick_guest_arch::MmGeneration::new(NonZeroU64::new(1).unwrap()),
+                generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::new(1).unwrap()),
+            },
+            TerminationStatus::exited(0),
+        );
+        let entry = EntryRef::new(0, 1);
+        let members = MemberSet::new(identity, alloc::vec![entry], Vec::new(), 1).unwrap();
+        let (closing, _) =
+            TerminalCustody::<Process, Live>::admitted(identity).close(&page, members.clone());
+        assert!(members.completed(&[], &[]).is_none());
+        let receipt = members.completed(&[entry], &[]).unwrap();
+        assert!(closing.settle(&page, receipt).is_ok());
+    }
+}
