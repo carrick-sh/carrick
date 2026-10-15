@@ -1,1 +1,0 @@
-fn inspect(x: EntryState) { if matches!(x, EntryState::Born) {} }
