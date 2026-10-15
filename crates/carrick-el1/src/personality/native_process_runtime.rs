@@ -482,7 +482,7 @@ enum PendingIpcPayload {
     Semop {
         semid: i32,
         ops: Vec<(u16, i16, i16)>,
-        timeout_deadline: Option<u64>,
+        timeout_deadline: Option<carrick_guest_arch::Deadline>,
         blocking_sem: Option<(u16, bool)>,
     },
 }
@@ -2370,22 +2370,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if channel.generation.generation() != observed {
             return Ok(false);
         }
-        if deadline.is_some() && !zone.timer_admission_available(self.source.slot) {
-            return Err(NativeProcessError::Busy);
-        }
         let sequence = zone.next_seq(record);
-        zone.set_deadline(record, deadline.map_or(0, |deadline| deadline.0.raw()));
-        if let Some(deadline) = deadline {
-            // Program the same shared timer to the earliest owned deadline.
-            let earliest = zone
-                .timer_deadline(self.source.slot)
-                .map_or(deadline.0.raw(), |owned| owned.min(deadline.0.raw()));
-            self.service.arm_signal_timer(carrick_guest_arch::Deadline(
-                carrick_guest_arch::CounterTick::new(earliest),
-            ))?;
-            zone.arm_timer(self.source.slot, record, sequence)
-                .map_err(|_| NativeProcessError::Busy)?;
-        }
+        self.arm_park_timer(record, sequence, deadline)?;
         zone.enqueue(&guard, record, sequence, channel.mm, address, u32::MAX, 0)
             .map_err(|_| {
                 zone.cancel_timer_admission(self.record);
@@ -2408,6 +2394,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         );
         if receipt.is_none() {
             self.runtime.graph.lock().signal_waits.remove(&self.record);
+            zone.cancel_timer_admission(self.record);
             return Err(NativeProcessError::Busy);
         }
         drop(guard);
@@ -2643,26 +2630,29 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
     }
 
-    fn read_tsc(&self) -> u64 {
-        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-        {
-            crate::isa::x86::interrupt::read_tsc()
+    /// Reserve one timed park using the signal wait's shared counter authority.
+    fn arm_park_timer(
+        &mut self,
+        record: carrick_sched_core::RecordId,
+        sequence: u32,
+        deadline: Option<carrick_guest_arch::Deadline>,
+    ) -> Result<(), NativeProcessError> {
+        let zone = self.source.zone;
+        if deadline.is_some() && !zone.timer_admission_available(self.source.slot) {
+            return Err(NativeProcessError::Busy);
         }
-        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
-        {
-            0
+        zone.set_deadline(record, deadline.map_or(0, |deadline| deadline.0.raw()));
+        if let Some(deadline) = deadline {
+            let earliest = zone
+                .timer_deadline(self.source.slot)
+                .map_or(deadline.0.raw(), |owned| owned.min(deadline.0.raw()));
+            self.service.arm_signal_timer(carrick_guest_arch::Deadline(
+                carrick_guest_arch::CounterTick::new(earliest),
+            ))?;
+            zone.arm_timer(self.source.slot, record, sequence)
+                .map_err(|_| NativeProcessError::Busy)?;
         }
-    }
-
-    fn tsc_freq(&self) -> u64 {
-        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-        {
-            crate::isa::x86::interrupt::tsc_frequency().map_or(2_000_000_000, |f| f.get())
-        }
-        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
-        {
-            2_000_000_000
-        }
+        Ok(())
     }
 
     fn park_ipc(
@@ -2670,7 +2660,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         channel: Arc<WaitChannel>,
         precheck_gen: TaskWakeGeneration,
         payload: PendingIpcPayload,
-        deadline_tsc: Option<u64>,
+        deadline: Option<carrick_guest_arch::Deadline>,
     ) -> Result<bool, i64> {
         let ch = channel.clone();
         let zone = self.source.zone;
@@ -2718,12 +2708,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return Err(NativeProcessError::Busy.errno());
         }
         let sequence = zone.next_seq(record);
-        if let Some(dl) = deadline_tsc {
-            let _ = zone.arm_timer(self.source.slot, record, sequence);
-            zone.set_deadline(record, dl);
-        }
+        self.arm_park_timer(record, sequence, deadline)
+            .map_err(|error| error.errno())?;
         zone.enqueue(&guard, record, sequence, ch.mm, address, u32::MAX, 0)
-            .map_err(|_| NativeProcessError::Exhausted.errno())?;
+            .map_err(|_| {
+                zone.cancel_timer_admission(self.record);
+                NativeProcessError::Exhausted.errno()
+            })?;
         unsafe { *zone.record(record).ctx_mut() = self.words };
         graph.pending.insert(
             self.key,
@@ -2742,6 +2733,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         );
         if receipt.is_none() {
             self.runtime.graph.lock().pending.remove(&self.key);
+            zone.cancel_timer_admission(self.record);
             return Err(NativeProcessError::Busy.errno());
         }
         drop(guard);
@@ -2752,11 +2744,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 
     fn resume_ipc(&mut self, pending: PendingIpc) -> LifecycleOutcome {
         let interrupted = self.signal_interrupts_current();
-        let is_timed_out = matches!(
-            &pending.payload,
-            PendingIpcPayload::Semop { timeout_deadline: Some(dl), .. } if self.read_tsc() >= *dl
-        );
-        if interrupted || is_timed_out {
+        let timeout_status = match &pending.payload {
+            PendingIpcPayload::Semop {
+                timeout_deadline: Some(dl),
+                ..
+            } => match self.service.signal_now() {
+                Ok(now) => Ok(now.raw() >= dl.0.raw()),
+                Err(error) => Err(error.errno()),
+            },
+            _ => Ok(false),
+        };
+        if interrupted || timeout_status != Ok(false) {
             if let PendingIpcPayload::Semop {
                 semid,
                 blocking_sem: Some((sem_num, is_zero)),
@@ -2771,7 +2769,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return returned(if interrupted {
                 carrick_syscall_abi::LINUX_EINTR.guest_retval()
             } else {
-                carrick_syscall_abi::LINUX_EAGAIN.guest_retval()
+                timeout_status
+                    .err()
+                    .unwrap_or_else(|| carrick_syscall_abi::LINUX_EAGAIN.guest_retval())
             });
         }
 
@@ -2815,26 +2815,37 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 msgflg,
             } => match self.msgrcv(msqid, msgp, msgtyp, msgflg, msgsz) {
                 Ok((IpcOutcome::Returned(r), Some((original_idx, mtype, data)))) => {
-                    let mtype_bytes = mtype.to_ne_bytes();
-                    let ok1 = unsafe {
-                        crate::file::copy_to_user_guarded(
-                            self.current,
-                            msgp.raw() as *mut u8,
-                            mtype_bytes.as_ptr(),
-                            8,
-                        )
-                    };
-                    let ok2 = if !data.is_empty() {
-                        unsafe {
+                    let text_va = msgp.raw().checked_add(8).and_then(|raw| {
+                        let len = u64::try_from(data.len()).ok()?;
+                        (msgp.raw() < (1_u64 << 63))
+                            .then_some(raw)?
+                            .checked_add(len)
+                            .filter(|end| *end <= (1_u64 << 63))
+                            .map(|_| UserVa::new(raw))
+                    });
+                    let (ok1, ok2) = if let Some(text_va) = text_va {
+                        let mtype_bytes = mtype.to_ne_bytes();
+                        let mtype_ok = unsafe {
                             crate::file::copy_to_user_guarded(
                                 self.current,
-                                (msgp.raw() + 8) as *mut u8,
-                                data.as_ptr(),
-                                data.len(),
+                                msgp.raw() as *mut u8,
+                                mtype_bytes.as_ptr(),
+                                8,
                             )
-                        }
+                        };
+                        let text_ok = mtype_ok
+                            && (data.is_empty()
+                                || unsafe {
+                                    crate::file::copy_to_user_guarded(
+                                        self.current,
+                                        text_va.raw() as *mut u8,
+                                        data.as_ptr(),
+                                        data.len(),
+                                    )
+                                });
+                        (mtype_ok, text_ok)
                     } else {
-                        true
+                        (false, false)
                     };
                     if !ok1 || !ok2 {
                         let _ = self.msgrcv_restore(msqid, original_idx, mtype, data);
@@ -2869,19 +2880,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         }
                     })
                     .collect();
-                let remaining_timeout = timeout_deadline.map(|dl| {
-                    let now = self.read_tsc();
-                    if dl > now {
-                        let ticks = dl - now;
-                        let freq = self.tsc_freq();
-                        core::time::Duration::from_nanos(
-                            (ticks as u128 * 1_000_000_000 / freq as u128) as u64,
-                        )
-                    } else {
-                        core::time::Duration::from_nanos(0)
-                    }
-                });
-                match self.semop(semid, &raw_sops, remaining_timeout) {
+                match self.semop_until(semid, &raw_sops, timeout_deadline) {
                     Ok(IpcOutcome::Returned(r)) => returned(r.raw()),
                     Ok(IpcOutcome::Suspended) => LifecycleOutcome::Transferred {
                         progress: carrick_core::Served::Idle,
@@ -5021,18 +5020,31 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
         sops: &[LinuxSembuf],
         timeout: Option<Duration>,
     ) -> Result<IpcOutcome, i64> {
+        let deadline = timeout
+            .map(|duration| {
+                self.service
+                    .signal_deadline(u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
+                    .map_err(|error| error.errno())
+            })
+            .transpose()?;
+        self.semop_until(semid, sops, deadline)
+    }
+}
+
+impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
+    NativeProcessEntry<'_, 'a, M, C, S>
+{
+    fn semop_until(
+        &mut self,
+        semid: i32,
+        sops: &[LinuxSembuf],
+        deadline: Option<carrick_guest_arch::Deadline>,
+    ) -> Result<IpcOutcome, i64> {
         let (creds, pid, ipc) = self.ipc_env()?;
         let raw_sops: Vec<(u16, i16, i16)> = sops
             .iter()
             .map(|s| (s.sem_num, s.sem_op, s.sem_flg))
             .collect();
-        let deadline_tsc = timeout.map(|d| {
-            let nanos = d.as_nanos();
-            let freq = self.tsc_freq() as u128;
-            let ticks_128 = nanos.saturating_mul(freq) / 1_000_000_000;
-            let ticks = u64::try_from(ticks_128).unwrap_or(u64::MAX);
-            self.read_tsc().saturating_add(ticks)
-        });
         let mut prev_blocking: Option<(u16, bool)> = None;
         let mut has_suspended = false;
         loop {
@@ -5075,18 +5087,27 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
                 }
                 SemopOutcome::Suspend { sem_num, is_zero } => {
                     has_suspended = true;
-                    if deadline_tsc.is_some_and(|dl| self.read_tsc() >= dl) {
-                        ipc.lock().semop_suspend_exit(pid, semid, sem_num, is_zero);
-                        return Err(carrick_syscall_abi::LINUX_EAGAIN.guest_retval());
+                    if let Some(dl) = deadline {
+                        let now = match self.service.signal_now() {
+                            Ok(now) => now,
+                            Err(error) => {
+                                ipc.lock().semop_suspend_exit(pid, semid, sem_num, is_zero);
+                                return Err(error.errno());
+                            }
+                        };
+                        if now.raw() >= dl.0.raw() {
+                            ipc.lock().semop_suspend_exit(pid, semid, sem_num, is_zero);
+                            return Err(carrick_syscall_abi::LINUX_EAGAIN.guest_retval());
+                        }
                     }
                     prev_blocking = Some((sem_num, is_zero));
                     let payload = PendingIpcPayload::Semop {
                         semid,
                         ops: raw_sops.clone(),
-                        timeout_deadline: deadline_tsc,
+                        timeout_deadline: deadline,
                         blocking_sem: Some((sem_num, is_zero)),
                     };
-                    match self.park_ipc(channel, precheck_gen, payload, deadline_tsc) {
+                    match self.park_ipc(channel, precheck_gen, payload, deadline) {
                         Ok(true) => return Ok(IpcOutcome::Suspended),
                         Ok(false) => continue,
                         Err(e) => {
