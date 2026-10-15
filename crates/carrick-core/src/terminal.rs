@@ -304,14 +304,14 @@ pub enum RetirementVerdict {
 }
 
 impl TerminalCustody<Process, Live> {
-    pub fn admitted_exit(
+    pub(crate) fn admitted_exit(
         task: TaskKey,
         address: AddressContext<RootGpa>,
         status: TerminationStatus,
     ) -> Self {
         Self::admitted(ProcessTerminalIdentity::from_exit(task, address, status))
     }
-    pub fn admitted(identity: ProcessTerminalIdentity) -> Self {
+    pub(crate) fn admitted(identity: ProcessTerminalIdentity) -> Self {
         Self {
             identity,
             phase: PhantomData,
@@ -324,6 +324,16 @@ impl TerminalCustody<Process, Live> {
             identity: self.identity,
             phase: PhantomData,
         }
+    }
+
+    pub fn begin_exit(
+        page: &impl Lifecycle,
+        task: TaskKey,
+        address: AddressContext<RootGpa>,
+        status: TerminationStatus,
+    ) -> Result<TerminalCustody<Process, Closing>, MembershipFloor> {
+        page.release_live(0)?;
+        Ok(Self::admitted_exit(task, address, status).close_gate(page))
     }
 }
 
@@ -339,7 +349,7 @@ impl TerminalCustody<Process, Closing> {
             members,
         }
     }
-    pub fn complete_members(
+    fn complete_members(
         &self,
         members: &MemberSet,
         pool: &[EntryRef],
@@ -348,6 +358,29 @@ impl TerminalCustody<Process, Closing> {
         (members.process == self.identity)
             .then(|| members.completed(pool, host))
             .flatten()
+    }
+    pub fn can_settle_observed(
+        &self,
+        page: &impl Lifecycle,
+        members: &MemberSet,
+        pool: &[EntryRef],
+        host: &[HostThreadRetirementReceipt],
+    ) -> bool {
+        self.complete_members(members, pool, host)
+            .is_some_and(|receipts| self.can_settle(page, &receipts))
+    }
+
+    pub fn settle_observed(
+        self,
+        page: &impl Lifecycle,
+        members: &MemberSet,
+        pool: &[EntryRef],
+        host: &[HostThreadRetirementReceipt],
+    ) -> Result<TerminalCustody<Process, Settled>, Self> {
+        match self.complete_members(members, pool, host) {
+            Some(receipts) => self.settle(page, receipts),
+            None => Err(self),
+        }
     }
     pub fn can_settle(&self, page: &impl Lifecycle, receipts: &CompletedMemberReceipts) -> bool {
         self.identity == receipts.process && page.live() == 0 && page.claimed_count() == 0

@@ -3123,17 +3123,17 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
     }
 }
 
-#[test]
-fn arm_adopted_pool_exit_in_progress_settles_group_once() {
+#[cfg(test)]
+fn arm_pool_raw_exit_closing_at_commit_boundary() {
     use carrick_el1_abi::Lifecycle;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let (control, record) = imported_thread(fixture);
-    let mut service = fixture.process_service();
+    let mut worker_service = fixture.process_service();
     fixture
         .enter(
             fixture.control,
             fixture_ttbr0(fixture),
-            &mut service,
+            &mut worker_service,
             |_| (),
         )
         .unwrap();
@@ -3142,38 +3142,79 @@ fn arm_adopted_pool_exit_in_progress_settles_group_once() {
         fixture.zone.switch_in_full(fixture.slot).unwrap().record,
         record.id
     );
-    registry()
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let owner = registry()
         .register_thread(
-            BornInZoneSource {
-                zone: fixture.zone,
-                slot: fixture.slot,
-            },
+            source,
             &fixture.task,
             fixture.address,
             fixture.page,
             control,
         )
         .unwrap();
-    let membership = fixture.page.reserve_nonfinal_exit().unwrap();
-    let exiting = fixture.page.begin_exit(control.entry().unwrap()).unwrap();
-    fixture.zone.clear_current(fixture.slot);
-    run_as_leader(fixture);
+    let root_service: &'static mut Aarch64NativeProcessService<'static, TestStockCrossing> =
+        Box::leak(Box::new(fixture.process_service()));
+    let root_service_address = root_service as *mut _ as usize;
+    let fixture_address = fixture as *const Fixture as usize;
+    let closing = Box::new(move || {
+        // SAFETY: both allocations are leaked for this test, and the hook
+        // completes before the outer raw-exit call uses either again.
+        let fixture = unsafe { &*(fixture_address as *const Fixture) };
+        let service = unsafe {
+            &mut *(root_service_address
+                as *mut Aarch64NativeProcessService<'static, TestStockCrossing>)
+        };
+        assert_eq!(
+            fixture.page.expected_exit_receipt(control.entry()),
+            carrick_core::lifecycle::ExpectedExitReceipt::AlreadyExited
+        );
+        assert!(registry().for_record(fixture.zone, record).is_some());
+        fixture.zone.clear_current(fixture.slot);
+        run_as_leader(fixture);
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[0] = 7;
+        frame.x[8] = 94;
+        assert_eq!(
+            arm_call(fixture, fixture.control, service, &mut frame).unwrap(),
+            carrick_personality_linux::dispatch::CompletionRoute::Suspended
+        );
+        run_as(fixture, 42, 12, 102, control);
+    });
+    owner.install_raw_exit_after_commit_hook(closing);
     let mut frame = carrick_el1_abi::TrapFrame::default();
-    frame.x[0] = 7;
-    frame.x[8] = 94;
+    frame.x[8] = 93;
     assert_eq!(
-        arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap(),
+        arm_call(fixture, control, &mut worker_service, &mut frame).unwrap(),
         carrick_personality_linux::dispatch::CompletionRoute::Suspended
     );
-    exiting.commit().unwrap();
-    membership.publish();
-    assert_eq!(fixture.page.live(), 0);
-    assert!(matches!(
-        wake_closing_root(fixture, &mut service),
-        crate::sched::ResumeAction::Left
-    ));
-    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
-    assert_eq!(service.crossing.root_exit_status.load(Ordering::Acquire), 7);
+    assert!(registry().for_record(fixture.zone, record).is_none());
+    if fixture.page.exit_wait().is_some() {
+        assert!(matches!(
+            wake_closing_root(fixture, root_service),
+            crate::sched::ResumeAction::Left
+        ));
+    }
+    assert_eq!(root_service.crossing.root_exits.load(Ordering::Acquire), 1);
+    assert_eq!(
+        root_service
+            .crossing
+            .root_exit_status
+            .load(Ordering::Acquire),
+        7
+    );
+}
+
+#[test]
+fn arm_adopted_pool_exit_in_progress_settles_group_once() {
+    arm_pool_raw_exit_closing_at_commit_boundary();
+}
+
+#[test]
+fn arm_pool_raw_exit_committed_before_unregister_owes_no_host_receipt() {
+    arm_pool_raw_exit_closing_at_commit_boundary();
 }
 
 #[test]
