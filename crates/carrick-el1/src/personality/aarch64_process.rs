@@ -619,10 +619,14 @@ fn release(
     waker: carrick_sched_core::Waker,
     effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, Aarch64ParkedContext>,
 ) {
-    let carrick_sched_core::Waker::El1 { slot } = waker else {
-        fatal()
-    };
-    crate::sched::object_wait::deliver_completion(zone, slot, effects);
+    match waker {
+        carrick_sched_core::Waker::El1 { slot } => {
+            crate::sched::object_wait::deliver_completion(zone, slot, effects);
+        }
+        carrick_sched_core::Waker::Host => {
+            crate::sched::object_wait::deliver_host_completion(zone, effects);
+        }
+    }
 }
 
 #[cfg(target_os = "none")]
