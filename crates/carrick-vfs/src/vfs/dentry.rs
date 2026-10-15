@@ -44,7 +44,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::fs_backend::{FsBackend, RealStat};
 use crate::rootfs::{RootFs, RootFsEntryKind};
@@ -260,6 +260,29 @@ pub struct DentryCache {
     orphaned_dirs: RwLock<HashMap<InodeIdentity, DentryId>>,
 }
 
+/// The cache lock order is entries, then inodes, then dirs. Callers needing
+/// all three cannot construct a partial or reversed acquisition sequence.
+struct CacheWriteGuards<'a> {
+    entries: RwLockWriteGuard<'a, HashMap<(DentryId, String), DentryNode>>,
+    inodes: RwLockWriteGuard<'a, HashMap<(u64, u64), InodeRecord>>,
+    dirs: RwLockWriteGuard<'a, HashMap<DentryId, DirEntry>>,
+}
+
+/// Mutations which only inspect directory records take the same prefix,
+/// with a read guard for the final directory lock.
+struct CacheReadGuards<'a> {
+    entries: RwLockWriteGuard<'a, HashMap<(DentryId, String), DentryNode>>,
+    inodes: RwLockWriteGuard<'a, HashMap<(u64, u64), InodeRecord>>,
+    dirs: RwLockReadGuard<'a, HashMap<DentryId, DirEntry>>,
+}
+
+#[derive(Clone, Copy)]
+enum ParentInvalidation {
+    NameOnly,
+    NameAndPositiveInode,
+    Exchange,
+}
+
 impl Default for DentryCache {
     fn default() -> Self {
         Self::new(false, Arc::default())
@@ -309,6 +332,63 @@ struct FillComponentParams<'a> {
 }
 
 impl DentryCache {
+    fn write_guards(&self) -> CacheWriteGuards<'_> {
+        let entries = self.entries.write();
+        let inodes = self.inodes.write();
+        let dirs = self.dirs.write();
+        CacheWriteGuards {
+            entries,
+            inodes,
+            dirs,
+        }
+    }
+
+    fn read_guards(&self) -> CacheReadGuards<'_> {
+        let entries = self.entries.write();
+        let inodes = self.inodes.write();
+        let dirs = self.dirs.read();
+        CacheReadGuards {
+            entries,
+            inodes,
+            dirs,
+        }
+    }
+
+    /// Remove one name and invalidate its parent's inode without exposing a
+    /// partly invalidated cache entry to another walker. Some notifications
+    /// also invalidate the removed positive entry's inode or bump the parent.
+    fn invalidate_named_parent(
+        &self,
+        parent_id: DentryId,
+        name: &str,
+        mode: ParentInvalidation,
+    ) -> Option<u64> {
+        let mut guards = self.read_guards();
+        #[cfg(test)]
+        if let Some(hook) = self.parent_inode_lock_hook.lock().clone() {
+            hook();
+        }
+        if let Some(node) = guards.entries.remove(&(parent_id, name.to_string())) {
+            self.sub_approx_bytes(entry_node_approx_bytes(name, &node));
+            if matches!(
+                mode,
+                ParentInvalidation::NameAndPositiveInode | ParentInvalidation::Exchange
+            ) && let DentryNode::Positive(pos) = node
+                && guards.inodes.remove(&(pos.dev, pos.ino)).is_some()
+            {
+                self.sub_approx_bytes(inode_approx_bytes());
+            }
+        }
+        let parent = guards.dirs.get(&parent_id)?;
+        if matches!(mode, ParentInvalidation::Exchange) {
+            parent.dir_gen.fetch_add(1, Ordering::SeqCst);
+        }
+        if guards.inodes.remove(&(parent.dev, parent.ino)).is_some() {
+            self.sub_approx_bytes(inode_approx_bytes());
+        }
+        Some(parent.dir_gen.load(Ordering::SeqCst))
+    }
+
     pub fn new(is_shared: bool, coherence: Arc<crate::fs_resolve_cache::FsCacheCoherence>) -> Self {
         let eviction_enabled = std::env::var("CARRICK_DENTRY_EVICT")
             .ok()
@@ -532,11 +612,14 @@ impl DentryCache {
                 return;
             }
             if proc_stale {
-                let mut entries = self.entries.write();
-                let mut dirs = self.dirs.write();
+                let CacheWriteGuards {
+                    mut entries,
+                    mut inodes,
+                    mut dirs,
+                } = self.write_guards();
                 let mut path_to_dir_id = self.path_to_dir_id.write();
                 entries.clear();
-                self.inodes.write().clear();
+                inodes.clear();
                 dirs.clear();
                 path_to_dir_id.clear();
                 self.orphaned_dirs.write().clear();
@@ -564,8 +647,11 @@ impl DentryCache {
                 path_to_dir_id.insert("/".to_string(), DentryId::ROOT);
                 path_to_dir_id.insert("".to_string(), DentryId::ROOT);
             } else {
-                let mut entries = self.entries.write();
-                let mut dirs = self.dirs.write();
+                let CacheWriteGuards {
+                    mut entries,
+                    mut inodes,
+                    mut dirs,
+                } = self.write_guards();
                 let mut path_to_dir_id = self.path_to_dir_id.write();
 
                 // Name knowledge expires, not the identity of an owned fd.
@@ -586,7 +672,7 @@ impl DentryCache {
                 // exception for kept dirs; only ROOT's fixed "/"/"" entry
                 // survives (ROOT's path can never change).
                 entries.clear();
-                self.inodes.write().clear();
+                inodes.clear();
                 path_to_dir_id.retain(|_, id| *id == DentryId::ROOT);
 
                 for dir in dirs.values_mut() {
@@ -1405,9 +1491,11 @@ impl DentryCache {
         } = params;
         if !self.eviction_enabled {
             if self.dirs.read().len() >= 4096 {
-                let mut entries = self.entries.write();
-                let mut inodes = self.inodes.write();
-                let mut dirs = self.dirs.write();
+                let CacheWriteGuards {
+                    mut entries,
+                    mut inodes,
+                    mut dirs,
+                } = self.write_guards();
                 let mut path_map = self.path_to_dir_id.write();
                 if dirs.len() >= 4096 {
                     entries.clear();
@@ -1571,9 +1659,11 @@ impl DentryCache {
 
         let target_bytes = (self.capacity_bytes * 7) / 8;
 
-        let mut entries = self.entries.write();
-        let mut inodes = self.inodes.write();
-        let mut dirs = self.dirs.write();
+        let CacheWriteGuards {
+            mut entries,
+            mut inodes,
+            mut dirs,
+        } = self.write_guards();
         let mut path_map = self.path_to_dir_id.write();
 
         let mut bumped = false;
@@ -2963,16 +3053,7 @@ impl DentryCache {
         if let Some((parent_path, name)) = Self::split_parent_and_name(norm)
             && let Some(parent_id) = self.find_parent_dir_id(parent_path)
         {
-            let mut entries = self.entries.write();
-            if let Some(node) = entries.remove(&(parent_id, name.to_string())) {
-                self.sub_approx_bytes(entry_node_approx_bytes(name, &node));
-            }
-            let dirs = self.dirs.read();
-            if let Some(d) = dirs.get(&parent_id) {
-                if self.inodes.write().remove(&(d.dev, d.ino)).is_some() {
-                    self.sub_approx_bytes(inode_approx_bytes());
-                }
-            }
+            let _ = self.invalidate_named_parent(parent_id, name, ParentInvalidation::NameOnly);
         }
         let dir_id = self.path_to_dir_id.read().get(norm).copied();
         if let Some(dir_id) = dir_id {
@@ -3022,32 +3103,11 @@ impl DentryCache {
         if let Some((parent_path, name)) = Self::split_parent_and_name(norm)
             && let Some(parent_id) = self.find_parent_dir_id(parent_path)
         {
-            let mut entries = self.entries.write();
-            if let Some(node) = entries.remove(&(parent_id, name.to_string())) {
-                self.sub_approx_bytes(entry_node_approx_bytes(name, &node));
-                if let DentryNode::Positive(pos) = node {
-                    if self.inodes.write().remove(&(pos.dev, pos.ino)).is_some() {
-                        self.sub_approx_bytes(inode_approx_bytes());
-                    }
-                }
-            }
-            drop(entries);
-
-            let parent_gen = {
-                let dirs = self.dirs.read();
-                #[cfg(test)]
-                if let Some(hook) = self.parent_inode_lock_hook.lock().clone() {
-                    hook();
-                }
-                if let Some(d) = dirs.get(&parent_id) {
-                    if self.inodes.write().remove(&(d.dev, d.ino)).is_some() {
-                        self.sub_approx_bytes(inode_approx_bytes());
-                    }
-                    Some(d.dir_gen.load(Ordering::SeqCst))
-                } else {
-                    None
-                }
-            };
+            let parent_gen = self.invalidate_named_parent(
+                parent_id,
+                name,
+                ParentInvalidation::NameAndPositiveInode,
+            );
             if let Some(generation) = parent_gen {
                 if !self.is_shared {
                     self.insert_negative(parent_id, name, generation);
@@ -3088,23 +3148,8 @@ impl DentryCache {
         if let Some((old_parent_path, old_name)) = Self::split_parent_and_name(norm_old)
             && let Some(old_parent_id) = self.find_parent_dir_id(old_parent_path)
         {
-            let mut entries = self.entries.write();
-            if let Some(node) = entries.remove(&(old_parent_id, old_name.to_string())) {
-                self.sub_approx_bytes(entry_node_approx_bytes(old_name, &node));
-            }
-            drop(entries);
-
-            let old_parent_gen = {
-                let dirs = self.dirs.read();
-                if let Some(d) = dirs.get(&old_parent_id) {
-                    if self.inodes.write().remove(&(d.dev, d.ino)).is_some() {
-                        self.sub_approx_bytes(inode_approx_bytes());
-                    }
-                    Some(d.dir_gen.load(Ordering::SeqCst))
-                } else {
-                    None
-                }
-            };
+            let old_parent_gen =
+                self.invalidate_named_parent(old_parent_id, old_name, ParentInvalidation::NameOnly);
             if let Some(generation) = old_parent_gen {
                 if !self.is_shared {
                     self.insert_negative(old_parent_id, old_name, generation);
@@ -3116,21 +3161,11 @@ impl DentryCache {
         if let Some((new_parent_path, new_name)) = Self::split_parent_and_name(norm_new)
             && let Some(new_parent_id) = self.find_parent_dir_id(new_parent_path)
         {
-            let mut entries = self.entries.write();
-            if let Some(node) = entries.remove(&(new_parent_id, new_name.to_string())) {
-                self.sub_approx_bytes(entry_node_approx_bytes(new_name, &node));
-                if let DentryNode::Positive(pos) = node {
-                    if self.inodes.write().remove(&(pos.dev, pos.ino)).is_some() {
-                        self.sub_approx_bytes(inode_approx_bytes());
-                    }
-                }
-            }
-            let dirs = self.dirs.read();
-            if let Some(d) = dirs.get(&new_parent_id) {
-                if self.inodes.write().remove(&(d.dev, d.ino)).is_some() {
-                    self.sub_approx_bytes(inode_approx_bytes());
-                }
-            }
+            let _ = self.invalidate_named_parent(
+                new_parent_id,
+                new_name,
+                ParentInvalidation::NameAndPositiveInode,
+            );
         }
         if let Some(id) = inode {
             if self.inodes.write().remove(&(id.dev, id.ino)).is_some() {
@@ -3153,9 +3188,9 @@ impl DentryCache {
 
         // Invalidate directory path cache for both if present
         {
-            // Match check_fork / insert_dir / entry_removed: directory
-            // objects precede name bindings. Reversing these locks deadlocks
-            // an exchange against a concurrent generation reset.
+            // The directory object lock precedes path_to_dir_id. This scope
+            // does not acquire entries or inodes; parent invalidation below
+            // uses the ordered cache guard.
             let mut dirs = self.dirs.write();
             let mut path_map = self.path_to_dir_id.write();
             if let Some(id_a) = path_map.remove(norm_a) {
@@ -3174,44 +3209,14 @@ impl DentryCache {
         if let Some((parent_path_a, name_a)) = Self::split_parent_and_name(norm_a)
             && let Some(parent_id_a) = self.find_parent_dir_id(parent_path_a)
         {
-            let mut entries = self.entries.write();
-            if let Some(node) = entries.remove(&(parent_id_a, name_a.to_string())) {
-                self.sub_approx_bytes(entry_node_approx_bytes(name_a, &node));
-                if let DentryNode::Positive(pos) = node {
-                    if self.inodes.write().remove(&(pos.dev, pos.ino)).is_some() {
-                        self.sub_approx_bytes(inode_approx_bytes());
-                    }
-                }
-            }
-            let dirs = self.dirs.read();
-            if let Some(d) = dirs.get(&parent_id_a) {
-                d.dir_gen.fetch_add(1, Ordering::SeqCst);
-                if self.inodes.write().remove(&(d.dev, d.ino)).is_some() {
-                    self.sub_approx_bytes(inode_approx_bytes());
-                }
-            }
+            let _ = self.invalidate_named_parent(parent_id_a, name_a, ParentInvalidation::Exchange);
         }
 
         // Invalidate entry b in its parent
         if let Some((parent_path_b, name_b)) = Self::split_parent_and_name(norm_b)
             && let Some(parent_id_b) = self.find_parent_dir_id(parent_path_b)
         {
-            let mut entries = self.entries.write();
-            if let Some(node) = entries.remove(&(parent_id_b, name_b.to_string())) {
-                self.sub_approx_bytes(entry_node_approx_bytes(name_b, &node));
-                if let DentryNode::Positive(pos) = node {
-                    if self.inodes.write().remove(&(pos.dev, pos.ino)).is_some() {
-                        self.sub_approx_bytes(inode_approx_bytes());
-                    }
-                }
-            }
-            let dirs = self.dirs.read();
-            if let Some(d) = dirs.get(&parent_id_b) {
-                d.dir_gen.fetch_add(1, Ordering::SeqCst);
-                if self.inodes.write().remove(&(d.dev, d.ino)).is_some() {
-                    self.sub_approx_bytes(inode_approx_bytes());
-                }
-            }
+            let _ = self.invalidate_named_parent(parent_id_b, name_b, ParentInvalidation::Exchange);
         }
 
         if let Some(id) = inode_a {
@@ -3424,47 +3429,62 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn entry_removal_never_holds_dirs_while_waiting_for_inodes() {
+    fn entry_mutations_never_hold_dirs_while_waiting_for_inodes() {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        let cache = Arc::new(DentryCache::new_with_capacity(
-            false,
-            32 * 1024 * 1024,
-            true,
-            Arc::default(),
-        ));
-        let (at_parent_tx, at_parent_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
-        *cache.parent_inode_lock_hook.lock() = Some(Arc::new(move || {
-            at_parent_tx.send(()).unwrap();
-            release_rx
-                .lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(2))
-                .unwrap();
-        }));
+        let operations: [(&str, fn(&DentryCache)); 4] = [
+            ("create", |cache| cache.entry_created("/victim", None)),
+            ("remove", |cache| cache.entry_removed("/victim", None)),
+            ("move", |cache| cache.entry_moved("/victim", "/new", None)),
+            ("exchange", |cache| {
+                cache.entry_exchanged("/victim", "/other", None, None);
+            }),
+        ];
+        for (operation_name, operation) in operations {
+            let cache = Arc::new(DentryCache::new_with_capacity(
+                false,
+                32 * 1024 * 1024,
+                true,
+                Arc::default(),
+            ));
+            let (at_parent_tx, at_parent_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+            let first = Arc::new(AtomicBool::new(true));
+            *cache.parent_inode_lock_hook.lock() = Some(Arc::new(move || {
+                if first.swap(false, Ordering::AcqRel) {
+                    at_parent_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(2))
+                        .unwrap();
+                }
+            }));
 
-        let worker_cache = Arc::clone(&cache);
-        let (done_tx, done_rx) = mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            worker_cache.entry_removed("/victim", None);
-            done_tx.send(()).unwrap();
-        });
-        at_parent_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        // If this thread can own inodes(W) while the remover owns dirs(R),
-        // the normal entries/inodes/dirs writer can wait on that reader and
-        // the remover can then wait on this writer: the ABBA state is live.
-        let inverted = cache.inodes.try_write().is_some_and(|inodes| {
-            let dirs_blocked = cache.dirs.try_write().is_none();
-            drop(inodes);
-            dirs_blocked
-        });
-        release_tx.send(()).unwrap();
-        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        worker.join().unwrap();
-        assert!(!inverted, "dirs(R) preceded inodes(W) during removal");
+            let worker_cache = Arc::clone(&cache);
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                operation(&worker_cache);
+                done_tx.send(()).unwrap();
+            });
+            at_parent_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            // Owning inodes(W) while the mutator owns dirs(R) is the ABBA
+            // state with a normal entries/inodes/dirs writer.
+            let inverted = cache.inodes.try_write().is_some_and(|inodes| {
+                let dirs_blocked = cache.dirs.try_write().is_none();
+                drop(inodes);
+                dirs_blocked
+            });
+            release_tx.send(()).unwrap();
+            done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            worker.join().unwrap();
+            assert!(
+                !inverted,
+                "dirs(R) preceded inodes(W) during {operation_name}"
+            );
+        }
     }
 
     #[test]
