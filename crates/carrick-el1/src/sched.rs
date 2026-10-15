@@ -57,6 +57,9 @@ pub trait ThreadCpu {
     /// Wait for an interrupt (`WFI`), with IRQs masked at EL1: a pending
     /// interrupt ends the wait, and it may also end early.
     fn wait_for_interrupt(&mut self);
+    /// Host-test rendezvous at the last idle boundary before WFI.
+    #[cfg(any(test, feature = "host-test"))]
+    fn before_idle_wfi(&mut self) {}
     /// One iteration of an idle poll.
     fn spin(&mut self);
     /// This vCPU's `ICC_SGI1R_EL1` routing bits, from `MPIDR_EL1`.
@@ -527,6 +530,17 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             self.leave_space();
             if zone.enter_idle(slot, true) {
                 self.program_timer(false);
+                #[cfg(any(test, feature = "host-test"))]
+                self.cpu.before_idle_wfi();
+                // A host placement or handback can follow the last queue
+                // scan while the slot is already IdleWfi. Its exit kick may
+                // have arrived before this vCPU's next effective run. The
+                // shared pending-work and owed-reschedule words are the
+                // durable half of that wake; recheck them before WFI.
+                if self.task.linux.has_pending_host_work() || zone.take_resched(slot) {
+                    zone.enter_idle(slot, false);
+                    continue;
+                }
                 zone.counters
                     .el1_wfi_entries
                     .fetch_add(1, Ordering::Relaxed);
@@ -770,7 +784,7 @@ pub struct FakeRegs {
 /// A host-test stand-in for the CPU: the registers a switch moves, plus a
 /// model of the counter, the virtual timer and the GIC CPU interface.
 #[cfg(any(test, feature = "host-test"))]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct FakeCpu {
     pub resume_once: Option<ResumeAction>,
     pub regs: FakeRegs,
@@ -786,6 +800,8 @@ pub struct FakeCpu {
     /// WFIs executed; a `WFI` with nothing to end it fails the test
     /// instead of hanging.
     pub wfis: u64,
+    /// Coordinate a host publication after the idle slot entered WFI state.
+    pub idle_gate: Option<std::sync::Arc<std::sync::Barrier>>,
     pub mpidr: u64,
     /// Negative control: a switch that forgets FP/SIMD.
     pub skip_fpsimd: bool,
@@ -810,6 +826,7 @@ impl Default for FakeCpu {
             pending: std::collections::VecDeque::new(),
             sgis: std::vec::Vec::new(),
             wfis: 0,
+            idle_gate: None,
             mpidr: 0x8000_0003,
             skip_fpsimd: false,
             ttbr: (0, 0),
@@ -821,6 +838,12 @@ impl Default for FakeCpu {
 
 #[cfg(any(test, feature = "host-test"))]
 impl ThreadCpu for FakeCpu {
+    fn before_idle_wfi(&mut self) {
+        if let Some(gate) = self.idle_gate.take() {
+            gate.wait();
+            gate.wait();
+        }
+    }
     fn resume_lifecycle(
         &mut self,
         zone: &ZoneTables,

@@ -413,6 +413,56 @@ fn an_idle_vcpu_parks_in_wfi_after_its_spin() {
     );
 }
 
+/// A host service for another live process can arrive after the idle loop's
+/// last queue scan and after it publishes IdleWfi. The host's exit kick may
+/// precede the next effective vCPU run; the owed reschedule word must keep
+/// that work from sleeping in WFI without an interrupt.
+#[test]
+fn host_service_posted_at_idle_boundary_does_not_sleep_in_wfi() {
+    let zone = std::sync::Arc::<ZoneTables>::from(zone());
+    let word = AtomicU32::new(0);
+    let uaddr = word.as_ptr() as u64;
+    let task = task_for(101);
+    let service = zone
+        .alloc_record(ThreadIdentity {
+            mm: OTHER_MM,
+            generation: 0,
+            ..identity(202)
+        })
+        .unwrap();
+    let seq = zone.next_seq(service);
+    zone.publish_park(service, seq);
+    assert_eq!(
+        zone.claim_for_host(
+            zone.record_ref(service),
+            Some(seq),
+            Handback::Service,
+            &HostWait,
+        ),
+        carrick_el1_abi::HostClaim::Claimed
+    );
+
+    let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let publisher_zone = zone.clone();
+    let publisher_gate = gate.clone();
+    let publisher = std::thread::spawn(move || {
+        publisher_gate.wait();
+        let placed = publisher_zone
+            .place_from_host(service)
+            .expect("other process has a live idle executor");
+        assert_eq!(placed.slot, SLOT);
+        assert!(placed.resched, "the host owes an idle reschedule");
+        publisher_gate.wait();
+    });
+    let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAIT_PRIVATE, 0);
+    cpu.idle_gate = Some(gate);
+    let result = serve(&mut frame, &task, &zone, &mut cpu);
+    publisher.join().unwrap();
+    assert_eq!(result, Some(Served::Idle));
+    assert_eq!(cpu.wfis, 0, "owed service cannot sleep behind a lost kick");
+    assert_eq!(zone.runnable_head(SLOT), Some(service));
+}
+
 fn libc_timespec(secs: u64, nanos: u64) -> [u64; 2] {
     [secs, nanos]
 }
