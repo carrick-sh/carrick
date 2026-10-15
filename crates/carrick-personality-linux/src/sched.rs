@@ -129,6 +129,7 @@ pub fn is_served_futex_op(ordinal: u64, args: [u64; 6]) -> bool {
 /// Scheduling calls served directly in-ring.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchedCall {
+    Yield,
     GetPriorityMax,
     GetPriorityMin,
     RrGetInterval,
@@ -137,6 +138,11 @@ pub enum SchedCall {
 /// Execution venue and guest memory access for in-ring scheduling operations.
 pub trait SchedVenue {
     fn argument(&self, index: usize) -> u64;
+    /// Rotate a runnable sibling owned by the in-ring scheduler. With no
+    /// sibling, the host scheduler remains the yield authority.
+    fn yield_current(&mut self) -> FamilyCompletion {
+        FamilyCompletion::Forward
+    }
     fn current_pid(&self) -> Option<u32> {
         None
     }
@@ -170,6 +176,7 @@ pub fn sched_priority_max(policy: i32) -> Result<i64, LinuxErrno> {
 
 pub fn serve_sched(call: SchedCall, venue: &mut dyn SchedVenue) -> FamilyCompletion {
     match call {
+        SchedCall::Yield => venue.yield_current(),
         SchedCall::GetPriorityMax => {
             let policy = venue.argument(0) as i32;
             match sched_priority_max(policy) {

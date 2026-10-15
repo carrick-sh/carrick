@@ -639,6 +639,7 @@ const fn route_shared(ordinal: u64, allocator_control: u64) -> Family {
         27 => Family::InotifyAdd,
         28 => Family::InotifyRemove,
         98 => Family::Futex,
+        124 => Family::Sched(SchedCall::Yield),
         93 => Family::Lifecycle(LifecycleCall::Exit),
         129 => Family::Signal(crate::signal::SignalCall::Kill),
         130 => Family::Signal(crate::signal::SignalCall::Tkill),
