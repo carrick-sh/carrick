@@ -166,6 +166,14 @@ mod range_tests {
         assert_eq!(validator.writable_bytes(u64::MAX - 3, 8), 0);
         assert_eq!(validator.readable_bytes(1 << 63, 1), 0);
         assert_eq!(validator.writable_bytes((1 << 63) - 4, 8), 0);
+        assert_eq!(
+            validator.readable_bytes(carrick_guest_arch::USER_CEILING - 4, 8),
+            0
+        );
+        assert_eq!(
+            validator.writable_bytes(carrick_guest_arch::USER_CEILING, 1),
+            0
+        );
     }
 }
 
@@ -174,10 +182,7 @@ fn valid_lower_half_range(user_va: u64, len: usize) -> bool {
     let Ok(len) = u64::try_from(len) else {
         return false;
     };
-    user_va < (1_u64 << 63)
-        && user_va
-            .checked_add(len)
-            .is_some_and(|end| end <= (1_u64 << 63))
+    carrick_guest_arch::lower_half_range(user_va, len)
 }
 
 #[cfg(not(target_os = "none"))]
