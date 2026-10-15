@@ -484,6 +484,12 @@ struct PendingExit<'a> {
     >,
 }
 
+// Pool entries and the carrier's bounded record registry are the maximum
+// member population. A concurrent retirement may lower live() after the
+// snapshot without reducing the receipts Closing still owes.
+const MEMBER_SET_CAPACITY: usize =
+    carrick_el1_abi::THREAD_POOL_ENTRIES + carrick_sched_core::ZONE_RECORDS;
+
 impl PendingExit<'_> {
     fn completed_receipts(
         &self,
@@ -3466,7 +3472,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     identity,
                     pool,
                     bindings,
-                    page.live() as usize,
+                    MEMBER_SET_CAPACITY,
                 )
                 .ok_or(NativeProcessError::Exhausted)?;
                 let verdict = custody.cancel_members(members);

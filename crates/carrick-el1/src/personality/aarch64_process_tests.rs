@@ -2482,14 +2482,16 @@ fn run_as_leader(fixture: &Fixture) {
 /// execution binding and a retained control slot, but no pool entry.
 #[cfg(test)]
 fn host_born_sibling(fixture: &Fixture, visible_tid: u32) -> &'static ThreadControlSlot {
+    let generation = u64::from(visible_tid - 30);
+    let thread_generation = u64::from(visible_tid + 60);
     let control = Box::leak(Box::new(ThreadControlSlot::new()));
     control.reset_for_host_birth(carrick_el1_abi::BlockedMask(0));
     assert!(control.publish_visible_tid(visible_tid));
     control.publish_host_birth_identity(carrick_el1_abi::ExecutionBinding {
-        task: carrick_el1_abi::EntryTaskKey::from_raw(42),
-        generation: carrick_el1_abi::EntryGeneration::from_raw(12),
+        task: carrick_el1_abi::EntryTaskKey::from_raw(u64::from(visible_tid)),
+        generation: carrick_el1_abi::EntryGeneration::from_raw(generation),
         mm: carrick_el1_abi::EntryMmKey::from_raw(5),
-        thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(102),
+        thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(thread_generation),
     });
     let birth_slot = fixture.page.reserve_host_birth().expect("host birth slot");
     carrick_el1_abi::Lifecycle::thread_born(fixture.page).unwrap();
@@ -2498,7 +2500,13 @@ fn host_born_sibling(fixture: &Fixture, visible_tid: u32) -> &'static ThreadCont
             .page
             .publish_host_birth(birth_slot, control.host_birth_identity().unwrap())
     );
-    run_as(fixture, 42, 12, 102, control);
+    run_as(
+        fixture,
+        visible_tid as i32,
+        generation,
+        thread_generation,
+        control,
+    );
     control
 }
 
@@ -3011,7 +3019,7 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
         );
         if let Some((control, record)) = pooled {
             assert!(fixture.zone.record(record.id).is_cancelled());
-            fixture.page.release_live(0).unwrap();
+            let retirement = fixture.page.reserve_cancelled_member_exit().unwrap();
             if matches!(
                 fixture.page.state(control.entry().unwrap().index()),
                 Some((_, carrick_el1_abi::EntryState::Born))
@@ -3020,7 +3028,7 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
             }
             fixture
                 .page
-                .retire_published(control.entry().unwrap())
+                .retire_published_host_member(control.entry().unwrap(), retirement)
                 .unwrap();
         }
         if let Some(control) = adopted_control {
@@ -3031,7 +3039,11 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
             )
             .unwrap();
             control.publish_host_retirement(stale);
-            fixture.page.release_live(0).unwrap();
+            fixture
+                .page
+                .reserve_cancelled_member_exit()
+                .unwrap()
+                .publish();
             assert!(matches!(
                 wake_closing_root(fixture, &mut service),
                 crate::sched::ResumeAction::Left
@@ -3047,7 +3059,7 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
                 carrick_core_abi::entry::EntryThreadGeneration::from_raw(102),
             )
             .unwrap();
-            control.publish_host_retirement(receipt);
+            fixture.page.publish_exact_host_retirement(control, receipt);
         }
         if matches!(siblings, Siblings::PooledAndUnadoptedHostBorn) {
             let control = unadopted_control.expect("unadopted control");
@@ -3068,8 +3080,9 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
                 .reserve_cancelled_member_exit()
                 .unwrap()
                 .publish();
-            control.publish_host_retirement(identity);
-            assert!(fixture.page.publish_host_birth_receipt(identity));
+            fixture
+                .page
+                .publish_exact_host_retirement(control, identity);
         }
         assert_eq!(fixture.page.live(), 0);
         assert!(matches!(
@@ -3197,10 +3210,9 @@ fn arm_host_birth_adoption_racing_closing_has_one_cancel_owner() {
         .reserve_cancelled_member_exit()
         .unwrap()
         .publish();
-    control.publish_host_retirement(birth_identity);
-    if !adopted {
-        assert!(fixture.page.publish_host_birth_receipt(birth_identity));
-    }
+    fixture
+        .page
+        .publish_exact_host_retirement(control, birth_identity);
     assert!(matches!(
         wake_closing_root(fixture, &mut service),
         crate::sched::ResumeAction::Left
@@ -3240,14 +3252,66 @@ fn arm_host_exit_reserved_live_count_does_not_settle_group_before_receipt() {
     ));
     assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
     retirement.publish();
-    sibling.publish_host_retirement(identity);
-    assert!(fixture.page.publish_host_birth_receipt(identity));
+    fixture
+        .page
+        .publish_exact_host_retirement(sibling, identity);
     assert!(matches!(
         wake_closing_root(fixture, &mut service),
         crate::sched::ResumeAction::Left
     ));
     assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
     assert_eq!(service.crossing.root_exit_status.load(Ordering::Acquire), 7);
+}
+
+#[test]
+fn arm_closing_member_set_capacity_uses_static_registry_bound() {
+    use carrick_el1_abi::Lifecycle;
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    let first = host_born_sibling(fixture, 42);
+    let second = host_born_sibling(fixture, 43);
+    let first_retirement = fixture.page.reserve_nonfinal_exit().unwrap();
+    let second_retirement = fixture.page.reserve_nonfinal_exit().unwrap();
+    assert_eq!(fixture.page.live(), 1);
+    run_as_leader(fixture);
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[0] = 7;
+    frame.x[8] = 94;
+    assert_eq!(
+        arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+    );
+    assert!(
+        fixture
+            .page
+            .host_birth_requested(first.host_birth_identity().unwrap())
+    );
+    assert!(
+        fixture
+            .page
+            .host_birth_requested(second.host_birth_identity().unwrap())
+    );
+    first_retirement.publish();
+    second_retirement.publish();
+    for control in [first, second] {
+        let identity = control.host_birth_identity().unwrap();
+        fixture
+            .page
+            .publish_exact_host_retirement(control, identity);
+    }
+    assert!(matches!(
+        wake_closing_root(fixture, &mut service),
+        crate::sched::ResumeAction::Left
+    ));
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
 }
 
 #[cfg(test)]
