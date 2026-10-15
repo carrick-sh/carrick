@@ -155,6 +155,20 @@ pub trait MemoryValidator {
     fn readable_bytes(&self, user_va: u64, len: usize) -> usize;
 }
 
+#[cfg(test)]
+mod range_tests {
+    use super::{HardwareValidator, MemoryValidator};
+
+    #[test]
+    fn hardware_validator_rejects_overflowing_and_upper_half_ranges() {
+        let validator = HardwareValidator;
+        assert_eq!(validator.readable_bytes(u64::MAX - 3, 8), 0);
+        assert_eq!(validator.writable_bytes(u64::MAX - 3, 8), 0);
+        assert_eq!(validator.readable_bytes(1 << 63, 1), 0);
+        assert_eq!(validator.writable_bytes((1 << 63) - 4, 8), 0);
+    }
+}
+
 #[cfg(not(target_os = "none"))]
 pub struct HardwareValidator;
 

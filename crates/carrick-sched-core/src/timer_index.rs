@@ -52,6 +52,13 @@ impl Drop for Guard<'_> {
     }
 }
 impl Index {
+    /// Allocated timer nodes, including admissions not yet published as parks.
+    pub(super) fn allocated_nodes(&self) -> usize {
+        self.map
+            .iter()
+            .map(|word| word.load(Ordering::Acquire).count_ones() as usize)
+            .sum()
+    }
     fn tree(&self, slot: SlotId) -> &Tree {
         &self.trees[slot.raw() as usize]
     }
