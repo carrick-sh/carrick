@@ -135,11 +135,7 @@ impl KernelDebugServer {
     /// publish the endpoint is reported and the run continues: the guest
     /// workload is the product, and losing the debugger must not lose the run.
     /// The failure is never silent.
-    pub fn install(kernel: Arc<Kernel>, carrier_scope: &str) {
-        Self::install_with_physical(kernel, carrier_scope, None);
-    }
-
-    pub fn install_with_physical(
+    pub fn install(
         kernel: Arc<Kernel>,
         carrier_scope: &str,
         physical: Option<Arc<dyn PhysicalCaptureProvider>>,
