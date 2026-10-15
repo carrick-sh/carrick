@@ -1,0 +1,16 @@
+schema_version = 1
+id = "kernel.ipc.permission-classes"
+title = "SysV IPC access uses owner, creator, group and other classes"
+guest_surfaces = ["syscall:shmat", "syscall:semop", "syscall:msgsnd", "syscall:msgrcv"]
+semantic_authority = ["Linux ipcperms(5): owner uid/cuid, group gid/cgid including supplementary groups, then other; CAP_IPC_OWNER bypasses access permission and denial returns EACCES (13)."]
+fixture = "unit:ipc_perm_accepts_creator_and_supplementary_group_but_not_other"
+scale_points = [1]
+structural_budgets = []
+rationale = "The EL1 IPC namespace and kernel dispatcher consume one shared permission decision. A task's effective credentials decide its class exactly once; permission checks must not clone IPC objects or create a second access path."
+
+[bindings]
+vm_free = "carrick-core::ipc_permissions::tests::owner_group_and_other_are_exclusive_classes"
+
+[bindings.unresolved]
+embed_structural = "Signed two-task IPC binding belongs to the director gate."
+docker = "Native Linux oracle comparison remains for the director gate."

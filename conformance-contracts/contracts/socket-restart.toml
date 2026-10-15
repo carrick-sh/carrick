@@ -1,0 +1,16 @@
+schema_version = 1
+id = "kernel.signal.socket-restart"
+title = "Interrupted blocking socket calls restart only without socket timeouts"
+guest_surfaces = ["syscall:accept", "syscall:connect", "syscall:recvfrom", "syscall:recvmsg", "syscall:sendto", "syscall:sendmsg", "syscall:read", "syscall:write"]
+semantic_authority = ["Linux signal(7), Interruption of system calls: blocking socket calls restart with SA_RESTART except calls with SO_RCVTIMEO or SO_SNDTIMEO, which return EINTR (4).", "Linux socket(7): a timed blocking connect returns EINPROGRESS on timeout."]
+fixture = "unit:socket_waits_restart_with_sa_restart_except_timed_calls"
+scale_points = [1]
+structural_budgets = []
+rationale = "The syscall continuation must use the dispatcher's single published socket deadline to classify signal restart. It must not add polling, retries, or a second timeout authority."
+
+[bindings]
+vm_free = "carrick-kernel::kernel::continuation::tests::{socket_waits_restart_with_sa_restart_except_timed_calls,socket_timeout_forces_eintr_even_with_restart_action}"
+
+[bindings.unresolved]
+embed_structural = "Signed HVF binding belongs to the director gate."
+docker = "Native Linux oracle comparison remains for the director gate."

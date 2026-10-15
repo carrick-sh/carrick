@@ -50,7 +50,35 @@ contracts = ["kernel.futex.contention", "kernel.futex.requeue"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/continuation.rs"
-contracts = ["kernel.futex.contention", "kernel.futex.requeue", "kernel.signal.temporary-wait-mask"]
+contracts = ["kernel.futex.contention", "kernel.futex.requeue", "kernel.signal.temporary-wait-mask", "kernel.signal.socket-restart"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/kernel/continuation/tests.rs"
+contracts = ["kernel.signal.socket-restart"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/net/lifecycle.rs"
+contracts = ["kernel.signal.socket-restart"]
+
+[[surfaces]]
+path = "crates/carrick-core/src/ipc_permissions.rs"
+contracts = ["kernel.ipc.permission-classes"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/sysv.rs"
+contracts = ["kernel.ipc.permission-classes"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/src/ipc/namespace.rs"
+contracts = ["kernel.ipc.permission-classes"]
+
+[[surfaces]]
+path = "crates/carrick-vfs/src/copyfile_policy.rs"
+contracts = ["kernel.file.copyfile-accounting"]
+
+[[surfaces]]
+path = "crates/carrick-vfs/src/darwin_fs.rs"
+contracts = ["kernel.file.copyfile-accounting"]
 
 [[surfaces]]
 path = "crates/carrick-thread/src/platform_futex.rs"
