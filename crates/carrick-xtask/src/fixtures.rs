@@ -437,7 +437,9 @@ fn probe_names(root: &Path) -> Result<Vec<String>> {
     )?;
     let names: Vec<_> = inventory
         .into_iter()
-        .filter(|(_, row)| !row.excluded && matches!(row.class.as_str(), "conformance" | "helper"))
+        .filter(|(_, row)| {
+            !row.excluded && matches!(row.class.as_str(), "conformance" | "helper" | "performance")
+        })
         .map(|(name, _)| name)
         .collect();
     if !names.iter().any(|n| n == "probeinit") {

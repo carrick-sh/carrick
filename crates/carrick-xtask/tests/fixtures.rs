@@ -2986,3 +2986,60 @@ fn response_file_pulling_external_linker_script_refuses() {
         "{result:?}"
     );
 }
+
+#[test]
+fn performance_probes_are_included_in_executable_inventory() {
+    let f = Fixture::new();
+    let root = f.repo.path();
+    write(
+        root,
+        "conformance-probes/src/bin/perf_futex_pingpong.rs",
+        b"perf probe\n",
+    );
+    let mut inventory: serde_json::Value = serde_json::from_slice(
+        &fs::read(root.join("conformance-probes/probe-inventory.json")).unwrap(),
+    )
+    .unwrap();
+    inventory["perf_futex_pingpong"] =
+        serde_json::json!({"class":"performance","runner":"generic","excluded":false});
+    write(
+        root,
+        "conformance-probes/probe-inventory.json",
+        &serde_json::to_vec(&inventory).unwrap(),
+    );
+    let inv = fixtures::executable_inventory(root).unwrap();
+    assert!(inv.contains_key(
+        "conformance-probes/target/aarch64-unknown-linux-musl/release/perf_futex_pingpong"
+    ));
+    assert!(inv.contains_key(
+        "conformance-probes/target/aarch64-unknown-linux-gnu/release/perf_futex_pingpong"
+    ));
+}
+
+#[test]
+fn real_repo_inventory_includes_perf_probes() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let inv = fixtures::executable_inventory(repo_root).unwrap();
+    assert!(inv.contains_key(
+        "conformance-probes/target/aarch64-unknown-linux-musl/release/perf_futex_pingpong"
+    ));
+    assert!(inv.contains_key(
+        "conformance-probes/target/aarch64-unknown-linux-gnu/release/perf_futex_pingpong"
+    ));
+    assert!(
+        inv.contains_key("conformance-probes/target/aarch64-unknown-linux-musl/release/perf_fork")
+    );
+    assert!(
+        inv.contains_key("conformance-probes/target/aarch64-unknown-linux-gnu/release/perf_fork")
+    );
+    assert!(inv.contains_key(
+        "conformance-probes/target/aarch64-unknown-linux-musl/release/perf_wait_pipe_pingpong"
+    ));
+    assert!(inv.contains_key(
+        "conformance-probes/target/aarch64-unknown-linux-gnu/release/perf_wait_pipe_pingpong"
+    ));
+}

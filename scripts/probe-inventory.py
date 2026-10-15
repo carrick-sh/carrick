@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_INVENTORY = ROOT / "conformance-probes/probe-inventory.json"
 DEFAULT_SOURCES = ROOT / "conformance-probes/src/bin"
 VALID_CLASSES = {"conformance", "helper", "performance"}
-SELECTED_CLASSES = {"conformance", "helper"}
+SELECTED_CLASSES = {"conformance", "helper", "performance"}
 
 
 class ProbeInventoryError(RuntimeError):
