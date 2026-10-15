@@ -16,6 +16,54 @@ use super::*;
 use crate::dispatch::SharedFutexTarget;
 
 #[test]
+fn zone_snapshot_identifies_a_parked_record_without_a_wake_producer() {
+    use carrick_el1_abi::{ThreadIdentity, ZoneTables};
+
+    let layout = std::alloc::Layout::new::<ZoneTables>();
+    // SAFETY: the zone ABI defines zeroed storage as its empty state. The
+    // allocation has the exact alignment and size required by ZoneTables.
+    let zone = unsafe {
+        let pointer = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
+        assert!(!pointer.is_null());
+        Box::from_raw(pointer)
+    };
+    let record = zone
+        .alloc_record(ThreadIdentity {
+            tid: 1,
+            serial: 1,
+            mm: 1,
+            ..ThreadIdentity::default()
+        })
+        .expect("zone record");
+    let reference = zone.record_ref(record);
+    zone.publish_park(record, zone.next_seq(record));
+
+    let detail = zone_record_diagnostic(zone.live(reference).expect("exact parked record"));
+    assert!(detail.contains("claim=Parked { seq:"), "{detail}");
+    assert!(detail.contains("handback=None"), "{detail}");
+    assert!(
+        detail.contains("entries=0 object_operation=false"),
+        "{detail}"
+    );
+
+    zone.free_record(record);
+    let reused = zone
+        .alloc_record(ThreadIdentity {
+            tid: 2,
+            serial: 2,
+            mm: 1,
+            ..ThreadIdentity::default()
+        })
+        .expect("reused zone record");
+    assert_eq!(reused, record);
+    assert!(
+        zone.live(reference).is_none(),
+        "stale incarnation must be hidden"
+    );
+    zone.free_record(reused);
+}
+
+#[test]
 fn redispatch_resume_does_not_veto_later_signal_restart() {
     let mut resumed = ContinuationResult {
         completion: ContinuationCompletion::Redispatch,

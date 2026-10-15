@@ -606,6 +606,20 @@ fn fd_authority_diagnostic(authority: &WaitFdAuthority) -> String {
     }
 }
 
+fn zone_record_diagnostic(record: &carrick_el1_abi::ZoneRecord) -> String {
+    format!(
+        " claim={:?} home={:?} last_slot={:?} handback={:?} host_wanted={} cancelled={} entries={} object_operation={}",
+        record.claim(),
+        record.home(),
+        record.last_slot(),
+        record.handback(),
+        record.host_wanted(),
+        record.is_cancelled(),
+        record.entry_count(),
+        record.has_object_operation(),
+    )
+}
+
 fn detail_diagnostic(detail: &ContinuationDetail) -> String {
     match detail {
         ContinuationDetail::Futex { wait, index } => {
@@ -614,19 +628,7 @@ fn detail_diagnostic(detail: &ContinuationDetail) -> String {
         ContinuationDetail::Zone(wait) => {
             let state = crate::el1_zone::zone()
                 .and_then(|zone| zone.live(wait.record))
-                .map(|record| {
-                    format!(
-                        " claim={:?} home={:?} last_slot={:?} handback={:?} host_wanted={} cancelled={} entries={} object_operation={}",
-                        record.claim(),
-                        record.home(),
-                        record.last_slot(),
-                        record.handback(),
-                        record.host_wanted(),
-                        record.is_cancelled(),
-                        record.entry_count(),
-                        record.has_object_operation(),
-                    )
-                })
+                .map(zone_record_diagnostic)
                 .unwrap_or_default();
             format!(
                 "zone record={}#{} armed_seq={}{}",
