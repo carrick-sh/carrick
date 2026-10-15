@@ -430,17 +430,24 @@ type Launch = (
     std::thread::JoinHandle<Result<Vec<u8>, ScalerError>>,
 );
 
-fn prioritize_demand(mut demand: Vec<(JobKey, String)>) -> Vec<JobKey> {
+pub(super) fn prioritize_demand(mut demand: Vec<(JobKey, String)>) -> Vec<JobKey> {
+    let pending_group = demand.iter().any(|(_, event)| event == "merge_group");
     let newest_push = demand
         .iter()
         .filter(|(_, event)| event == "push")
         .map(|(key, _)| key.run.0)
         .max();
+    // A group remains pending even when its current vet is temporarily
+    // superseded. Keep main pushes in the GitHub queue, not this pass's
+    // runner candidates, so they can become eligible on a later observation.
+    demand.retain(|(key, event)| match event.as_str() {
+        "push" => !pending_group && Some(key.run.0) == newest_push,
+        _ => true,
+    });
     demand.sort_by_key(|(key, event)| {
         let priority = match event.as_str() {
             "merge_group" => 0,
-            "push" if Some(key.run.0) == newest_push => 1,
-            "push" => 3,
+            "push" => 1,
             _ => 2, // Admitted owner workflow_dispatch on main.
         };
         (priority, key.job.0)
@@ -1567,7 +1574,7 @@ mod tests {
         ];
         let ordered = prioritize_demand(demand);
         let mut admitted = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..3 {
             let key = admit_demand(&mut ledger, &path, ordered.clone(), Ok, |_| Ok(()))
                 .unwrap()
                 .unwrap();
@@ -1577,7 +1584,7 @@ mod tests {
             last.state = MacState::Done;
             last.assigned = Some(row.key.job);
         }
-        assert_eq!(admitted, vec![job(3), job(4), job(5), job(6), job(1)]);
+        assert_eq!(admitted, vec![job(3), job(4), job(6)]);
         assert!(ledger.refused.is_empty());
     }
 }

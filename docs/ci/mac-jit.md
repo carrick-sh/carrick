@@ -46,7 +46,11 @@ group (its queue entry and every entry ahead of it, from the GraphQL
 
 Demand is served in priority order: admitted live merge groups, then the
 newest pending main push, then owner `workflow_dispatch` runs on main.
-Older pending main pushes are ordered last and remain eligible. A per-job refusal
+While any merge-group HVF job is pending, no main-push HVF job is offered a
+runner, even if the group is temporarily superseded or refused in this pass.
+A newer main push temporarily supersedes older pending pushes. These skips
+do not cancel a run or enter the durable refusal ledger: a push becomes
+eligible again when the higher-priority demand leaves the queue. A per-job refusal
 never aborts the pass: the controller records and logs it once per
 run/attempt/job key, then considers the next job in the same pass. Refusals
 survive restarts; a re-run's new attempt is vetted afresh. Vetting happens
@@ -309,8 +313,9 @@ The proof requires a complete merge-queue listing, trusted heads, a pending
 or successful latest workflow run, and a GitHub comparison whose merge base
 is exactly the shallower SHA. The extra observation uses one page of at most
 100 workflow runs and at most five comparisons per vet. Missing, partial,
-failed or ambiguous depth observations preserve ordinary service. Main pushes
-remain eligible and retain their per-SHA baseline receipts.
+failed or ambiguous depth observations preserve ordinary group service. Main
+pushes retain their per-SHA baseline receipts and are served once no group is
+pending.
 
 Superseded demand does not enter the durable refusal ledger: if the successor
 fails or leaves the queue, the shallower group can be served again. If a
