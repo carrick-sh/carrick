@@ -1076,10 +1076,6 @@ fn serve_exit<'a>(
         })
         .ok()?;
     let clear_child_tid = slot.clear_child_tid();
-    #[cfg(feature = "host-test")]
-    if clear_child_tid == u64::MAX {
-        return decline!(LifecycleDecline::ExitClearTidCopyout);
-    }
     if clear_child_tid != 0 {
         let status = native.result();
         let copied = native.copy_out(UserVa::new(clear_child_tid), &CHILD_TID_CLEAR);
