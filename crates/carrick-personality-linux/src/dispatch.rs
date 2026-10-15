@@ -1432,10 +1432,13 @@ mod ring_first_tests {
                 expected,
                 "ordinal={ordinal} work={work} handback={handback}"
             );
-            if ordinal == 174 || (ordinal == 260 && work) {
+            if ordinal == 260 && work {
+                assert_eq!(pending.result, 42, "ARM wait4 must hand back before its owner runs");
+            }
+            if ordinal == 174 {
                 assert_eq!(
                     pending.result, -38,
-                    "pending work must retain ARM's host handback"
+                    "pending work must not leak host getuid"
                 );
             }
             if ordinal == 174 {
