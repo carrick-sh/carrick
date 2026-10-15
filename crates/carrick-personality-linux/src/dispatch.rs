@@ -551,6 +551,10 @@ fn serve_family<'a, C: EntryContext + 'a>(
                     };
                     completion
                 }
+                None if call == SchedCall::Yield => {
+                    returned = Some((SyscallResult::new(0), original));
+                    FamilyCompletion::Complete(0)
+                }
                 None => FamilyCompletion::Forward,
             }
         }
@@ -1125,25 +1129,27 @@ mod ring_first_tests {
 
     #[test]
     fn yield_without_a_scheduler_venue_still_completes_in_ring() {
-        let refused = [const { AtomicU64::new(0) }; 513];
-        let mut pending = CarrierOwned {
-            set: HostCrossingSet::Aarch64,
-            mutate_forward: false,
-            strict: true,
-            state: crate::abi::entry::LinuxTaskState::new(),
-            native: carrick_syscall_abi::NativeNr(124),
-            admitted: true,
-            result: 42,
-            work: false,
-            handback: false,
-            signal_restore_calls: 0,
-            refused: &refused,
-            forwarded: [const { AtomicU64::new(0) }; 512],
-        };
-        assert_eq!(dispatch(124, 42, &mut pending), CompletionRoute::Served);
-        assert_eq!(pending.result, 0);
-        assert_eq!(pending.forwarded[124].load(Ordering::Relaxed), 0);
-        assert_eq!(pending.refused[124].load(Ordering::Relaxed), 0);
+        for (set, native) in [(HostCrossingSet::Aarch64, 124), (HostCrossingSet::X86, 24)] {
+            let refused = [const { AtomicU64::new(0) }; 513];
+            let mut pending = CarrierOwned {
+                set,
+                mutate_forward: false,
+                strict: true,
+                state: crate::abi::entry::LinuxTaskState::new(),
+                native: carrick_syscall_abi::NativeNr(native),
+                admitted: true,
+                result: 42,
+                work: false,
+                handback: false,
+                signal_restore_calls: 0,
+                refused: &refused,
+                forwarded: [const { AtomicU64::new(0) }; 512],
+            };
+            assert_eq!(dispatch(124, 42, &mut pending), CompletionRoute::Served);
+            assert_eq!(pending.result, 0);
+            assert_eq!(pending.forwarded[124].load(Ordering::Relaxed), 0);
+            assert_eq!(pending.refused[124].load(Ordering::Relaxed), 0);
+        }
     }
 
     // No lifecycle or process venue: a terminal call still belongs to the
