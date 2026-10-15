@@ -1,6 +1,7 @@
 //! Control-only backing retained by the thread and every execution-lane pin.
 
 use carrick_el1_abi::Lifecycle;
+use std::collections::VecDeque;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock, Weak};
 
@@ -302,6 +303,7 @@ struct Arena {
     owner: TaskKey,
     lifecycle: ThreadLifecycleLease,
     free: Mutex<Vec<FreeSlot>>,
+    deferred: Mutex<VecDeque<FreeSlot>>,
     births: Mutex<BirthControlPins>,
     host_births: Mutex<[Option<ThreadControlLease>; carrick_el1_abi::THREAD_POOL_ENTRIES]>,
 }
@@ -325,6 +327,7 @@ impl ThreadControlArena {
             owner,
             lifecycle,
             free: Mutex::new(Vec::new()),
+            deferred: Mutex::new(VecDeque::new()),
             births: Mutex::new(std::array::from_fn(|_| None)),
             host_births: Mutex::new(std::array::from_fn(|_| None)),
         }))
@@ -333,6 +336,17 @@ impl ThreadControlArena {
     pub(in crate::kernel) fn allocate(&self, thread: ThreadKey) -> ThreadControlLease {
         let allocation = {
             let mut free = self.0.free.lock();
+            // Inspect at most one deferred allocation per request. A held
+            // graph cannot turn allocation into a scan of every live member.
+            let mut deferred = self.0.deferred.lock();
+            if let Some(slot) = deferred.pop_front() {
+                if slot.page.page.slots[slot.index].graph_referenced() {
+                    deferred.push_back(slot);
+                } else {
+                    free.push(slot);
+                }
+            }
+            drop(deferred);
             if free.is_empty() {
                 let page = Arc::new(ControlBacking {
                     page: SharedAbiPage::new(
@@ -347,11 +361,19 @@ impl ThreadControlArena {
                     index,
                 }));
             }
-            free.pop().unwrap_or_else(|| {
-                carrick_fatal::carrick_fatal!("thread::control", "control refill supplied no slot")
-            })
+            free.pop()
+                .filter(|allocation| {
+                    allocation.page.page.slots[allocation.index]
+                        .reset_for_host_birth(BlockedMask(0))
+                        .is_ok()
+                })
+                .unwrap_or_else(|| {
+                    carrick_fatal::carrick_fatal!(
+                        "thread::control",
+                        "control refill supplied no resettable slot"
+                    )
+                })
         };
-        allocation.page.page.slots[allocation.index].reset_for_host_birth(BlockedMask(0));
         ThreadControlLease(Arc::new(Lease {
             owner: self.0.owner,
             thread,
@@ -380,7 +402,11 @@ impl Drop for Lease {
         if let Some(arena) = self.arena.upgrade()
             && let Some(allocation) = self.allocation.take()
         {
-            arena.free.lock().push(allocation);
+            if allocation.page.page.slots[allocation.index].graph_referenced() {
+                arena.deferred.lock().push_back(allocation);
+            } else {
+                arena.free.lock().push(allocation);
+            }
         }
     }
 }
@@ -459,6 +485,33 @@ impl Deref for ThreadControlLease {
     fn deref(&self) -> &Self::Target {
         let allocation = self.allocation();
         &allocation.page.page.slots[allocation.index]
+    }
+}
+
+/// VM-free fixtures use the production allocator and reset path.
+#[cfg(feature = "test-support")]
+pub struct TestThreadControlArena {
+    arena: ThreadControlArena,
+    ids: super::super::ids::ObjectIdRegistry,
+}
+#[cfg(feature = "test-support")]
+impl TestThreadControlArena {
+    pub fn try_new() -> Option<Self> {
+        let ids = super::super::ids::ObjectIdRegistry::new();
+        let owner = TaskKey {
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(41).ok()?,
+            serial: ids.task_serial().ok()?,
+        };
+        Some(Self {
+            arena: ThreadControlArena::with_lifecycle(owner, ThreadLifecycleLease::new()),
+            ids,
+        })
+    }
+    pub fn allocate(&self, tid: i32) -> Option<ThreadControlLease> {
+        Some(self.arena.allocate(ThreadKey {
+            tid: super::super::ids::LinuxTid::from_abi_positive(tid).ok()?,
+            serial: self.ids.thread_serial().ok()?,
+        }))
     }
 }
 

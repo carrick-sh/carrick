@@ -1236,7 +1236,8 @@ fn exit_forwards_unless_a_switched_in_non_last_thread_may_leave() {
     let word = Box::new(9_u32);
     w.venue
         .child_slot(0)
-        .reset_for_birth(BlockedMask(0), addr(&*word), entry);
+        .reset_for_birth(BlockedMask(0), addr(&*word), entry)
+        .unwrap();
     w.page().thread_born().unwrap();
     w.task()
         .set(El1TaskId::from_linux_tid(CHILD_TID as i32), 1, 5);
@@ -1682,7 +1683,8 @@ fn clone_missing_nonleader_identity_cannot_inherit_leader() {
     let running = w.venue.stock(1, 70, 42);
     w.venue
         .child_slot(1)
-        .reset_for_birth(BlockedMask(0), 0, running);
+        .reset_for_birth(BlockedMask(0), 0, running)
+        .unwrap();
     w.task().set(El1TaskId::from_linux_tid(70), 1, 5);
     assert_eq!(w.venue.child_slot(1).visible_tid(), None);
     let mut probe = BirthProbe {
@@ -1768,7 +1770,8 @@ fn clone_stamped_nonleader_inherits_the_calling_thread() {
     let running = w.venue.stock(1, 70, 42);
     w.venue
         .child_slot(1)
-        .reset_for_birth(BlockedMask(0), 0, running);
+        .reset_for_birth(BlockedMask(0), 0, running)
+        .unwrap();
     w.task().set(El1TaskId::from_linux_tid(70), 1, 5);
     assert!(w.venue.child_slot(1).publish_visible_tid(42));
     let mut probe = BirthProbe {

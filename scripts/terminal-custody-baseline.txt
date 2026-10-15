@@ -73,7 +73,6 @@ crates/carrick-personality-linux/src/lifecycle.rs|serve_exit|EntryState
 crates/carrick-runtime/src/vcpu_loop/executor.rs|adopt_born_record|live
 crates/carrick-runtime/src/vcpu_loop/executor.rs|next_runnable|live
 crates/carrick-runtime/src/vcpu_loop/executor/residency.rs|materialize_zone_in|live
-crates/carrick-runtime/src/vcpu_loop/thread_lifecycle.rs|CarrierLifecycleMappings::publish|EntryState
 crates/carrick-runtime/src/vcpu_loop/zone.rs|ProductionHvpatchLoopJob < E >::consume_owner_zone|live
 crates/carrick-runtime/src/vcpu_loop/zone.rs|ProductionHvpatchLoopJob < E >::resume_zone|live
 crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs|HvfAarch64Vcpu::el1_switchable_roots|live
