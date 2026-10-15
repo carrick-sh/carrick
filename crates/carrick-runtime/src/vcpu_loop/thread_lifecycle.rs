@@ -293,6 +293,9 @@ mod tests {
         state.retain_thread(second.clone());
         assert_eq!(state.threads.len(), 2);
         let custody = carrick_core::lifecycle::MemberControlCustody::retain(&*first).unwrap();
+        // Only a committed registration publishes the unregister receipt on
+        // drop; a speculative retain must not manufacture one.
+        custody.commit_registration();
         state.purge_unregistered();
         assert_eq!(state.threads.len(), 2);
         drop(custody);
