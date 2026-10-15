@@ -52,6 +52,18 @@ pub enum SharedBufferError {
 }
 
 /// A host-created, page-aligned shared memory buffer backed by a real host file descriptor.
+///
+/// Clones share the same mapping, so creating mutable slice views from safe
+/// code must remain impossible:
+/// ```compile_fail
+/// use carrick_embed::SharedBuffer;
+/// let mut first = SharedBuffer::new(4096).unwrap();
+/// let mut second = first.clone();
+/// let a: &mut [u8] = first.as_mut_slice();
+/// let b: &mut [u8] = second.as_mut_slice();
+/// a[0] = 1;
+/// b[0] = 2;
+/// ```
 #[derive(Clone, Debug)]
 pub struct SharedBuffer {
     inner: Arc<SharedBufferInner>,
@@ -532,6 +544,14 @@ mod tests {
         retired.store(true, Ordering::Release);
         assert!(lease.is_retired());
         assert!(matches!(
+            lease.as_ptr(),
+            Err(SharedBufferError::Retired { .. })
+        ));
+        assert!(matches!(
+            lease.as_mut_ptr(),
+            Err(SharedBufferError::Retired { .. })
+        ));
+        assert!(matches!(
             lease.validate_access(),
             Err(SharedBufferError::Retired {
                 container_id: cid,
@@ -569,6 +589,24 @@ mod tests {
 
         // 3. Dropping the retired lease succeeds cleanly without panics or leaks
         drop(lease);
+    }
+
+    #[test]
+    fn rebinding_a_buffer_to_a_new_container_invalidates_its_prior_lease() {
+        let buf = SharedBuffer::new(4096).expect("allocate shared buffer");
+        let futex = carrick_thread::platform_futex::SharedFutexTable::new();
+        let first = buf.lease(
+            RunId::new("first"),
+            ContainerId::allocate(),
+            1,
+            futex.clone(),
+        );
+        let next = buf.lease(RunId::new("next"), ContainerId::allocate(), 2, futex);
+        assert!(next.validate_access().is_ok());
+        assert!(matches!(
+            first.validate_access(),
+            Err(SharedBufferError::GenerationMismatch { .. })
+        ));
     }
 
     #[test]
