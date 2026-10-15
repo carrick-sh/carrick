@@ -315,7 +315,7 @@ pub(super) fn admit_demand<T>(
         match admit(job) {
             Ok(vetted) => return Ok(Some(vetted)),
             Err(ScalerError::SupersededMergeGroup { successor }) => {
-                skip_superseded(job, &successor, &mut cancel);
+                skip_superseded(job, &successor);
             }
             Err(error @ (ScalerError::Guard(_) | ScalerError::StaleMergeGroup)) => {
                 refuse(ledger, job, &error, path, &mut cancel)?;
@@ -328,21 +328,11 @@ pub(super) fn admit_demand<T>(
 
 /// A superseded reservation is a temporary skip, never a durable refusal:
 /// the same job can become eligible when its successor fails or leaves.
-pub(super) fn skip_superseded(
-    key: JobKey,
-    successor: &str,
-    mut cancel: impl FnMut(RunId) -> Result<(), ScalerError>,
-) {
+pub(super) fn skip_superseded(key: JobKey, successor: &str) {
     eprintln!(
         "run={} superseded by queued descendant {successor}; skipping reservation",
         key.run.0
     );
-    if let Err(error) = cancel(key.run) {
-        eprintln!(
-            "run={} cancellation unavailable (Actions write required): {error}; skip only",
-            key.run.0
-        );
-    }
 }
 
 /// Record and log a per-job refusal once; a new attempt has a new key. A
@@ -354,6 +344,10 @@ pub(super) fn refuse(
     path: &Path,
     cancel: &mut impl FnMut(RunId) -> Result<(), ScalerError>,
 ) -> Result<(), ScalerError> {
+    if let ScalerError::SupersededMergeGroup { successor } = error {
+        skip_superseded(key, successor);
+        return Ok(());
+    }
     if ledger.refused().contains(&key) {
         return Ok(());
     }
@@ -368,10 +362,7 @@ pub(super) fn refuse(
         "run={} attempt={} job={} refused: {error}; skipping",
         key.run.0, key.attempt, key.job.0
     );
-    if matches!(
-        error,
-        ScalerError::StaleMergeGroup | ScalerError::SupersededMergeGroup { .. }
-    ) {
+    if matches!(error, ScalerError::StaleMergeGroup) {
         // Cancellation is best effort: insufficient permission or a run
         // finishing concurrently must not starve another admitted job.
         if let Err(error) = cancel(key.run) {
@@ -412,7 +403,7 @@ impl AssignmentApi for Github {
         self.jobs(&serde_json::json!({"id": run.0, "run_attempt": attempt}))
     }
     fn revet(&self, key: JobKey) -> Result<JobPolicy, ScalerError> {
-        self.vet(&Admission::Standing, key)
+        self.vet_assignment(key)
     }
     fn cancel(&self, run: RunId) -> Result<(), ScalerError> {
         self.cancel_run(run)
@@ -462,11 +453,7 @@ pub(super) fn serve_assignment<L: Refusals>(
     }
     let policy = match api.revet(key) {
         Ok(policy) => policy,
-        Err(
-            error @ (ScalerError::Guard(_)
-            | ScalerError::StaleMergeGroup
-            | ScalerError::SupersededMergeGroup { .. }),
-        ) => {
+        Err(error @ (ScalerError::Guard(_) | ScalerError::StaleMergeGroup)) => {
             refuse(ledger, key, &error, path, &mut |run| api.cancel(run))?;
             return Ok(Revetted::Refused(key));
         }
@@ -832,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn superseded_demand_is_temporary_and_cancellation_denial_does_not_block() {
+    fn superseded_demand_is_temporary_and_failure_restores_service() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.json");
         let mut ledger = Ledger::default();
@@ -864,7 +851,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selected, Some(keys[2]));
-        assert_eq!(cancelled, vec![RunId(1), RunId(2)]);
+        assert!(cancelled.is_empty());
         assert!(ledger.refused.is_empty());
         // The same attempt becomes eligible when its successor fails/ejects.
         assert_eq!(
@@ -877,12 +864,28 @@ mod tests {
     }
 
     #[test]
+    fn superseded_refusal_records_nothing_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let mut ledger = Ledger::default();
+        refuse(
+            &mut ledger,
+            key_b(),
+            &ScalerError::SupersededMergeGroup {
+                successor: "deeper".into(),
+            },
+            &path,
+            &mut |_| panic!("supersession must never cancel"),
+        )
+        .unwrap();
+        assert!(ledger.refused.is_empty());
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn ci_scaler_standing_refuses_inadmissible_run_b_and_re_serves_run_a() {
         for refusal in [
             ScalerError::StaleMergeGroup,
-            ScalerError::SupersededMergeGroup {
-                successor: "descendant".into(),
-            },
             ScalerError::Guard("merge group contains a pull request from another repository"),
         ] {
             let stale = matches!(

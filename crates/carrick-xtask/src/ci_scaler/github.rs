@@ -159,7 +159,29 @@ impl Github {
     /// attempt, and for a merge group only pull requests whose heads live in
     /// this repository. The runner is bound to this exact run and SHA.
     pub(super) fn vet(&self, admission: &Admission, key: JobKey) -> Result<JobPolicy, ScalerError> {
-        let run = self.request(
+        Self::vet_inner(admission, key, true, |method, endpoint, body, paginate| {
+            self.request(method, endpoint, body, paginate)
+        })
+    }
+
+    /// Assigned hooks cannot defer without failing their job. Keep all normal
+    /// admission checks, but serve them regardless of queue depth.
+    pub(super) fn vet_assignment(&self, key: JobKey) -> Result<JobPolicy, ScalerError> {
+        Self::vet_inner(
+            &Admission::Standing,
+            key,
+            false,
+            |method, endpoint, body, paginate| self.request(method, endpoint, body, paginate),
+        )
+    }
+
+    fn vet_inner(
+        admission: &Admission,
+        key: JobKey,
+        supersession: bool,
+        mut request: impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
+    ) -> Result<JobPolicy, ScalerError> {
+        let run = request(
             "GET",
             &format!("repos/{REPOSITORY}/actions/runs/{}", key.run.0),
             None,
@@ -178,7 +200,7 @@ impl Github {
         if run["event"] == "merge_group" {
             let mut queue = Value::Null;
             confirm_merge_group(&sha, || {
-                queue = self.request(
+                queue = request(
                     "POST",
                     "graphql",
                     Some(json!({ "query": MERGE_QUEUE_QUERY })),
@@ -186,9 +208,16 @@ impl Github {
                 )?;
                 Ok(queue.clone())
             })?;
-            // One page and at most five comparisons per vet, including actual
-            // assignments. Missing/failed observations disable supersession only.
-            let observed = self.request(
+            // One page and at most five comparisons per reservation vet.
+            // Missing/failed observations disable supersession only.
+            if !supersession {
+                return Ok(JobPolicy::Bound(RunBinding {
+                    run: key.run,
+                    attempt: key.attempt,
+                    sha,
+                }));
+            }
+            let observed = request(
                 "GET",
                 &format!(
                     "repos/{REPOSITORY}/actions/workflows/{}/runs?event=merge_group&per_page=100",
@@ -200,7 +229,7 @@ impl Github {
             if let Ok(observed) = observed
                 && let Some(runs) = observed["workflow_runs"].as_array()
                 && let Some(successor) = superseded_group(&run, &queue, runs, |base, head| {
-                    self.request(
+                    request(
                         "GET",
                         &format!("repos/{REPOSITORY}/compare/{base}...{head}"),
                         None,
@@ -410,28 +439,42 @@ fn superseded_group(
             return None;
         }
     }
-    let base = run["head_sha"].as_str()?;
-    let depth = ordered
-        .iter()
-        .position(|node| node["headCommit"]["oid"] == base)?;
+    let base = run["head_sha"].as_str()?.to_ascii_lowercase();
+    let depth = ordered.iter().position(|node| {
+        node["headCommit"]["oid"]
+            .as_str()
+            .is_some_and(|sha| sha.eq_ignore_ascii_case(&base))
+    })?;
     let mut candidates = Vec::new();
     for node in ordered.iter().skip(depth + 1).rev() {
-        let head = node["headCommit"]["oid"].as_str()?;
-        if !merge_group_heads_trusted(queue, head) {
+        let head = node["headCommit"]["oid"].as_str()?.to_ascii_lowercase();
+        if !merge_group_heads_trusted(queue, node["headCommit"]["oid"].as_str()?) {
             continue;
         }
         // Use the latest run/attempt for a SHA: an older pass cannot hide
         // a newer failure. Incomplete status information never suppresses work.
-        if runs.iter().filter(|r| r["head_sha"] == head).any(|r| {
-            r["id"].as_u64().is_none()
-                || r["run_attempt"].as_u64().is_none()
-                || r.get("conclusion").is_none()
-        }) {
+        if runs
+            .iter()
+            .filter(|r| {
+                r["head_sha"]
+                    .as_str()
+                    .is_some_and(|sha| sha.eq_ignore_ascii_case(&head))
+            })
+            .any(|r| {
+                r["id"].as_u64().is_none()
+                    || r["run_attempt"].as_u64().is_none()
+                    || r.get("conclusion").is_none()
+            })
+        {
             return None;
         }
         let latest = runs
             .iter()
-            .filter(|r| r["head_sha"] == head)
+            .filter(|r| {
+                r["head_sha"]
+                    .as_str()
+                    .is_some_and(|sha| sha.eq_ignore_ascii_case(&head))
+            })
             .max_by_key(|r| (r["id"].as_u64(), r["run_attempt"].as_u64()));
         if let Some(latest) = latest
             && Admission::Standing.admits_run(latest)
@@ -449,10 +492,14 @@ fn superseded_group(
         return None;
     }
     for head in candidates {
-        let proof = compare(base, head).ok()?;
+        let proof = compare(&base, &head).ok()?;
         if proof["status"] == "ahead"
-            && proof["merge_base_commit"]["sha"] == base
-            && proof["base_commit"]["sha"] == base
+            && proof["merge_base_commit"]["sha"]
+                .as_str()
+                .is_some_and(|sha| sha.eq_ignore_ascii_case(&base))
+            && proof["base_commit"]["sha"]
+                .as_str()
+                .is_some_and(|sha| sha.eq_ignore_ascii_case(&base))
         {
             return Some(head.to_owned());
         }
@@ -520,6 +567,116 @@ mod tests {
             .pop();
         assert_eq!(superseded_group(&runs[1], &queue, &runs, ancestry), None);
     }
+    #[test]
+    fn standing_assignment_ignores_depth_and_retains_admission() {
+        let (mut queue, runs) = cumulative();
+        let key = JobKey {
+            run: RunId(2),
+            attempt: 1,
+            job: JobId(2),
+        };
+        for trusted in [true, false] {
+            if !trusted {
+                queue["data"]["repository"]["mergeQueue"]["entries"]["nodes"][0]["pullRequest"]["headRepository"]
+                    ["nameWithOwner"] = json!("fork/carrick");
+            }
+            let policy = Github::vet_inner(
+                &Admission::Standing,
+                key,
+                false,
+                |method, endpoint, _, _| match (method, endpoint) {
+                    ("GET", "repos/carrick-sh/carrick/actions/runs/2") => Ok(runs[1].clone()),
+                    ("POST", "graphql") => Ok(queue.clone()),
+                    _ => panic!("actual assignment must not observe supersession: {endpoint}"),
+                },
+            );
+            if trusted {
+                assert_eq!(
+                    policy.unwrap(),
+                    JobPolicy::Bound(RunBinding {
+                        run: key.run,
+                        attempt: key.attempt,
+                        sha: format!("{:040x}", 2),
+                    })
+                );
+            } else {
+                assert!(matches!(policy, Err(ScalerError::Guard(_))));
+            }
+        }
+    }
+
+    #[test]
+    fn failed_successor_after_skip_serves_same_shallower_job() {
+        let (queue, mut runs) = cumulative();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let mut ledger = Ledger::default();
+        let keys: Vec<_> = (2..=3)
+            .map(|n| JobKey {
+                run: RunId(n),
+                attempt: 1,
+                job: JobId(n),
+            })
+            .collect();
+        let mut select = |runs: &[Value]| {
+            assignment::admit_demand(
+                &mut ledger,
+                &path,
+                keys.clone(),
+                |key| {
+                    let run = &runs[usize::try_from(key.run.0 - 1).unwrap()];
+                    match superseded_group(run, &queue, runs, ancestry) {
+                        Some(successor) => Err(ScalerError::SupersededMergeGroup { successor }),
+                        None => Ok(key),
+                    }
+                },
+                |_| panic!("supersession must never cancel"),
+            )
+            .unwrap()
+        };
+        assert_eq!(select(&runs), Some(keys[1]));
+        runs[2]["status"] = json!("completed");
+        runs[2]["conclusion"] = json!("failure");
+        assert_eq!(select(&runs), Some(keys[0]));
+        assert!(!path.exists(), "no durable refusal during the skip");
+    }
+
+    #[test]
+    fn cancelled_and_rebuilt_queue_restore_service() {
+        let (mut queue, mut runs) = cumulative();
+        runs[2]["status"] = json!("completed");
+        runs[2]["conclusion"] = json!("cancelled");
+        assert_eq!(superseded_group(&runs[1], &queue, &runs, ancestry), None);
+        // A replacement head has no qualifying workflow yet.
+        queue["data"]["repository"]["mergeQueue"]["entries"]["nodes"][2]["headCommit"]["oid"] =
+            json!("a".repeat(40));
+        assert_eq!(superseded_group(&runs[1], &queue, &runs, ancestry), None);
+    }
+
+    #[test]
+    fn supersession_normalizes_sha_case() {
+        let (mut queue, mut runs) = cumulative();
+        let base = "a".repeat(40);
+        let head = "b".repeat(40);
+        queue["data"]["repository"]["mergeQueue"]["entries"]["nodes"][1]["headCommit"]["oid"] =
+            json!(base.to_uppercase());
+        queue["data"]["repository"]["mergeQueue"]["entries"]["nodes"][2]["headCommit"]["oid"] =
+            json!(head.to_uppercase());
+        runs[1]["head_sha"] = json!(base);
+        runs[2]["head_sha"] = json!(head);
+        assert_eq!(
+            superseded_group(&runs[1], &queue, &runs, |base, head| {
+                assert_eq!(base, "a".repeat(40));
+                assert_eq!(head, "b".repeat(40));
+                Ok(
+                    json!({"status":"ahead", "base_commit":{"sha":base.to_uppercase()},
+                "merge_base_commit":{"sha":base.to_uppercase()}}),
+                )
+            }),
+            Some("b".repeat(40))
+        );
+    }
+
     #[test]
     fn main_and_ambiguous_depth_are_served_normally() {
         let (mut queue, runs) = cumulative();

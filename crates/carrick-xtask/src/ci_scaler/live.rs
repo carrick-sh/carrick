@@ -1174,6 +1174,9 @@ fn reconcile_one(
                     {
                         return Ok(true);
                     }
+                    if matches!(error, ScalerError::SupersededMergeGroup { .. }) {
+                        return Ok(false);
+                    }
                     return Err(error);
                 }
                 return Ok(false);
@@ -1773,7 +1776,7 @@ fn retire_superseded_reservation(
     if let ScalerError::SupersededMergeGroup { successor } = error
         && superseded_before_jit(row)
     {
-        assignment::skip_superseded(row.key, successor, |run| gh.cancel_run(run));
+        assignment::skip_superseded(row.key, successor);
         // Booting precedes the write-ahead Registered state and JIT POST.
         // No runner can hold this reservation: use the existing ownership-
         // checked, durably licensed teardown instead of the idle timeout.
@@ -1796,7 +1799,9 @@ fn provision_failure(
     path: &Path,
     mut cancel: impl FnMut(RunId) -> Result<(), ScalerError>,
 ) -> Result<(), ScalerError> {
-    if matches!(error, ScalerError::StaleMergeGroup) {
+    if matches!(error, ScalerError::SupersededMergeGroup { .. }) {
+        Ok(())
+    } else if matches!(error, ScalerError::StaleMergeGroup) {
         assignment::refuse(ledger, job, &error, path, &mut cancel)
     } else {
         Err(error)
@@ -1836,6 +1841,32 @@ mod tests {
             row.state = state;
             assert!(!superseded_before_jit(&row));
         }
+    }
+
+    #[test]
+    fn superseded_provisioning_is_ok_without_durable_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let mut ledger = Ledger::default();
+        let job = JobKey {
+            run: RunId(1),
+            attempt: 1,
+            job: JobId(1),
+        };
+        assert!(
+            provision_failure(
+                &mut ledger,
+                job,
+                ScalerError::SupersededMergeGroup {
+                    successor: "deeper".into()
+                },
+                &path,
+                |_| panic!("supersession must never cancel")
+            )
+            .is_ok()
+        );
+        assert!(!ledger.served(job));
+        assert!(!path.exists());
     }
 
     #[test]
