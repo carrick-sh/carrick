@@ -300,6 +300,23 @@ pub fn publish_handoff_park<C: EntryContext>(
     Some(start.published())
 }
 
+/// Publish a yield handoff only after the running record has left the CPU
+/// for the run queue. The initiating entry's receipt still names its exact
+/// pre-switch record and binding, even though the live frame names a sibling.
+pub fn publish_handoff_yield<C: EntryContext>(
+    start: HandoffStart<'_, C>,
+) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
+    let zone = start.source.zone;
+    let slot = start.source.slot;
+    if zone.slot(slot).current() == Some(start.record.record)
+        || !matches!(zone.record(start.record.record).claim(),
+            carrick_sched_core::Claim::Queued { slot: owner, .. } if owner == slot)
+    {
+        return None;
+    }
+    Some(start.published())
+}
+
 /// Authenticate and retire the current record through its existing owner.
 pub fn retire_current<C: EntryContext>(
     binding: ExecutionBinding,

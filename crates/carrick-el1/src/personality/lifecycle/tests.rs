@@ -5,8 +5,8 @@ use carrick_el1_abi::Lifecycle;
 
 use super::*;
 use carrick_el1_abi::{
-    AltStack, BlockedMask, BornRecord, Counters, CurrentTask, El1TaskId, EntryState,
-    ThreadIdentity, TrapFrame,
+    Aarch64ParkedContext, AltStack, BlockedMask, BornInZoneSource, BornRecord, Counters,
+    CurrentTask, El1TaskId, EntryState, ThreadIdentity, TrapFrame,
 };
 use core::sync::atomic::Ordering;
 
@@ -30,6 +30,7 @@ use carrick_el1_abi::{
     EntryRef, InotifyNameCache, LifecycleHatches, PendingSignals, SlotId, ThreadControlSlot,
     ThreadLifecyclePage, ZoneTables,
 };
+use carrick_personality_linux::dispatch::CompletionRoute;
 use carrick_sched_core::ExecutionSlot;
 use std::boxed::Box;
 use std::sync::Barrier;
@@ -205,6 +206,50 @@ impl World {
         )
     }
 
+    fn call_native(&mut self, frame: &mut TrapFrame, nr: usize, args: &[u64]) -> Action {
+        frame.x[..args.len()].copy_from_slice(args);
+        frame.x[8] = nr as u64;
+        frame.slot = SLOT_IDX as u64;
+        frame.esr = 0x5600_0000;
+        let source = BornInZoneSource {
+            zone: &*self.zone,
+            slot: SLOT,
+        };
+        match crate::personality::dispatch::dispatch_syscall_with_native::<
+            _,
+            _,
+            _,
+            _,
+            Aarch64ParkedContext,
+        >(
+            frame,
+            &self.counters,
+            &self.tasks,
+            &[],
+            &[],
+            &[],
+            &[],
+            &InotifyNameCache::new(),
+            Some(Zone {
+                tables: &self.zone,
+                cpu: &mut self.cpu,
+                user: &HardwareUserWord,
+            }),
+            None,
+            Some(&*self.venue),
+            None,
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        ) {
+            CompletionRoute::Served => Action::Served,
+            CompletionRoute::WithWork => Action::ServedWithWork,
+            CompletionRoute::Suspended => Action::Idle,
+            CompletionRoute::Forward => Action::Forward,
+            CompletionRoute::InvalidCompletion => panic!("stale native completion"),
+        }
+    }
+
     fn syscall(&mut self, nr: usize, args: &[u64]) -> (Action, TrapFrame) {
         let mut frame = TrapFrame {
             elr: CLONE_PC,
@@ -372,7 +417,10 @@ fn raw_clone_sibling_runs_when_parent_only_sched_yields() {
     assert_eq!(frame.x[0], u64::from(CHILD_VISIBLE));
     assert_eq!(w.zone.slot(SLOT).queued(), 1);
 
-    assert_eq!(w.call(&mut frame, SYS_SCHED_YIELD, &[]), Action::Served);
+    assert_eq!(
+        w.call_native(&mut frame, SYS_SCHED_YIELD, &[]),
+        Action::Served
+    );
     assert_eq!(
         w.task().execution.task.load(Ordering::Acquire),
         u64::from(CHILD_TID)
@@ -380,6 +428,14 @@ fn raw_clone_sibling_runs_when_parent_only_sched_yields() {
     assert_eq!(frame.x[0], 0, "the child returns from raw clone");
     assert_eq!(frame.elr, CLONE_PC);
     assert_eq!(w.forwarded(SYS_SCHED_YIELD), 0);
+
+    assert_eq!(
+        w.call_native(&mut frame, SYS_SCHED_YIELD, &[]),
+        Action::Served
+    );
+    assert_eq!(w.task().execution.task.load(Ordering::Acquire), PARENT_TID);
+    assert_eq!(frame.x[0], 0, "the parent resumes its successful yield");
+    assert_eq!(w.zone.slot(SLOT).queued(), 1);
 }
 
 #[test]

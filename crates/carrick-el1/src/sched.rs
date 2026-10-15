@@ -335,6 +335,42 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         self.program_timer(true);
     }
 
+    /// A guest yield is a fairness boundary for runnable work already owned
+    /// by this EL1 zone. Save the caller's zero result before switching: the
+    /// frame after the switch belongs to the sibling's suspended syscall.
+    pub(crate) fn yield_queued(&mut self, frame: &mut TrapFrame) -> Option<Served> {
+        if self.zone.runnable_head(self.slot).is_none()
+            || self.task.linux.has_pending_host_work()
+            || self.task.lifecycle_refs().is_some_and(|(page, control)| {
+                page.pending().load().0 != 0 || control.pending().load().0 != 0
+            })
+        {
+            return None;
+        }
+        let record = self.current_record().ok()?;
+        let start = carrick_core::entry::prepare_handoff(
+            carrick_core::entry::binding(&self.task.execution, &self.task.mm),
+            carrick_el1_abi::BornInZoneSource {
+                zone: self.zone,
+                slot: self.slot,
+            },
+            record,
+        )?;
+        frame.x[0] = 0;
+        let loaded = self.preempt_record(frame, record);
+        if self.zone.slot(self.slot).current() == Some(record) {
+            return Some(Served::Returned { switched: false });
+        }
+        let receipt = carrick_core::entry::publish_handoff_yield(start);
+        self.record_handoff(receipt);
+        if loaded {
+            self.program_timer(true);
+            Some(Served::Returned { switched: true })
+        } else {
+            Some(self.service_exit())
+        }
+    }
+
     /// The next thread on this vCPU needs its executor: leave for the host
     /// with no thread on the vCPU; the executor takes it from the run queue.
     fn service_exit(&mut self) -> Served {
@@ -626,14 +662,18 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// address space could not be installed; the vCPU must leave for its
     /// executor (both threads are queued).
     fn preempt(&mut self, frame: &mut TrapFrame) -> bool {
-        let (zone, slot) = (self.zone, self.slot);
-        if zone.runnable_head(slot).is_none() {
+        if self.zone.runnable_head(self.slot).is_none() {
             return true;
         }
-        let fresh = zone.slot(slot).current().is_none();
         let Ok(prev) = self.current_record() else {
             return true;
         };
+        self.preempt_record(frame, prev)
+    }
+
+    fn preempt_record(&mut self, frame: &mut TrapFrame, prev: carrick_el1_abi::RecordId) -> bool {
+        let (zone, slot) = (self.zone, self.slot);
+        let fresh = zone.slot(slot).current().is_none();
         // SAFETY: `prev` holds the running thread (a fresh home record, or
         // the switched-in OnCpu one): this vCPU is its only owner.
         self.cpu.save(frame, unsafe { zone.record(prev).ctx_mut() });
