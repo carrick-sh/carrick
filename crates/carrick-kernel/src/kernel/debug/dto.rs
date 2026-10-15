@@ -147,6 +147,8 @@ pub struct KernelDebugRequest {
 pub enum KernelDebugAction {
     #[default]
     Snapshot,
+    /// Read-only bounded post-mortem shape for a live carrier.
+    Capture { run_id: String },
     /// Latch a `KernelAbort`. The runtime freezes, captures one post-mortem
     /// and completes every unpublished container job with
     /// `EmbedError::KernelAborted`.
@@ -172,6 +174,16 @@ impl KernelDebugRequest {
             schema: KERNEL_DEBUG_REQUEST_SCHEMA.to_owned(),
             tables: None,
             action: KernelDebugAction::Abort {
+                run_id: run_id.into(),
+            },
+        }
+    }
+
+    pub fn capture(run_id: impl Into<String>) -> Self {
+        Self {
+            schema: KERNEL_DEBUG_REQUEST_SCHEMA.to_owned(),
+            tables: None,
+            action: KernelDebugAction::Capture {
                 run_id: run_id.into(),
             },
         }

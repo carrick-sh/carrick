@@ -17,7 +17,7 @@ pub mod post_mortem;
 pub mod server;
 pub mod wire;
 
-pub use client::{AbortAck, ClientError, abort_at, fetch, fetch_at, kernel_debug_abort};
+pub use client::{AbortAck, ClientError, abort_at, capture, fetch, fetch_at, kernel_debug_abort};
 pub use dto::{
     DebugAltstack, DebugClass, DebugCredentialsRow, DebugExecutorBindingRow,
     DebugExecutorReceiptRow, DebugExecutorReceiptSummary, DebugExecutorRow,
@@ -33,7 +33,8 @@ pub use dto::{
 pub use endpoint::{DebugEndpoint, EndpointError};
 pub use post_mortem::{
     AbortReason, CAPTURE_DEADLINE, HvpatchAliasInstallSite, POST_MORTEM_DIR_ENV,
-    POST_MORTEM_SCHEMA, PostMortem, Truncated, ZombieSummary, request_abort, take_abort_request,
+    POST_MORTEM_SCHEMA, PhysicalCapture, PhysicalCaptureProvider, PostMortem, Truncated,
+    ZombieSummary, request_abort, take_abort_request,
 };
 pub use server::{KernelDebugServer, ServerError};
 pub use wire::{

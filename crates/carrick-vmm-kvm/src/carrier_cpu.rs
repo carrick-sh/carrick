@@ -5,6 +5,78 @@ use carrick_hal::guest_arch_binding::{
 use carrick_hal::threaded::X86_TASK_RESUME_PAYLOAD_LEN;
 use carrick_hal::{HvVcpu, HvVm, TrapError, VcpuExit};
 use carrick_x86::{BringupLayout, X86Vcpu, X86VcpuSnapshot, arch_context::X86ArchContext};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+/// Scalar last-stopped image and live phase. Readers never alias a `VcpuFd`.
+#[derive(Default)]
+pub(crate) struct CarrierCpuDebug {
+    phase: AtomicU8,
+    task_serial: AtomicU64,
+    task_execution: AtomicU64,
+    gprs: [AtomicU64; 16],
+    rip: AtomicU64,
+    rsp: AtomicU64,
+    rflags: AtomicU64,
+    rax: AtomicU64,
+    cr3: AtomicU64,
+    cr0: AtomicU64,
+    cr4: AtomicU64,
+    efer: AtomicU64,
+    fs_base: AtomicU64,
+    gs_base: AtomicU64,
+}
+
+impl CarrierCpuDebug {
+    fn image(&self, image: &X86VcpuSnapshot) {
+        for (slot, value) in self.gprs.iter().zip(image.gprs.iter()) {
+            slot.store(*value, Ordering::Relaxed);
+        }
+        self.rip.store(image.rip, Ordering::Relaxed);
+        self.rsp.store(image.rsp, Ordering::Relaxed);
+        self.rflags.store(image.rflags, Ordering::Relaxed);
+        self.rax.store(image.gprs[0], Ordering::Relaxed);
+        self.cr3.store(image.cr3, Ordering::Release);
+        self.cr0.store(image.cr0, Ordering::Relaxed);
+        self.cr4.store(image.cr4, Ordering::Relaxed);
+        self.efer.store(image.efer, Ordering::Relaxed);
+        self.fs_base.store(image.fs_base, Ordering::Relaxed);
+        self.gs_base.store(image.gs_base, Ordering::Relaxed);
+    }
+
+    fn bound(&self, task: TaskIdentity) {
+        self.task_serial
+            .store(task.task.raw().get(), Ordering::Relaxed);
+        self.task_execution
+            .store(task.execution.raw().get(), Ordering::Release);
+    }
+
+    pub(crate) fn render(&self, slot: usize) -> String {
+        let phase = match self.phase.load(Ordering::Acquire) {
+            1 => "running",
+            2 => "stopped",
+            3 => "halted",
+            4 => "poisoned",
+            _ => "idle",
+        };
+        format!(
+            "cpu={slot} phase={phase} bound_task_serial={} bound_execution={} last_stopped_rip={:#x} last_stopped_rsp={:#x} last_stopped_rflags={:#x} last_stopped_rax={:#x} last_stopped_cr0={:#x} last_stopped_cr3={:#x} last_stopped_cr4={:#x} last_stopped_efer={:#x} last_stopped_fs={:#x} last_stopped_gs={:#x} last_stopped_gprs={:?}",
+            self.task_serial.load(Ordering::Relaxed),
+            self.task_execution.load(Ordering::Relaxed),
+            self.rip.load(Ordering::Relaxed),
+            self.rsp.load(Ordering::Relaxed),
+            self.rflags.load(Ordering::Relaxed),
+            self.rax.load(Ordering::Relaxed),
+            self.cr0.load(Ordering::Relaxed),
+            self.cr3.load(Ordering::Acquire),
+            self.cr4.load(Ordering::Relaxed),
+            self.efer.load(Ordering::Relaxed),
+            self.fs_base.load(Ordering::Relaxed),
+            self.gs_base.load(Ordering::Relaxed),
+            std::array::from_fn::<_, 16, _>(|index| self.gprs[index].load(Ordering::Relaxed)),
+        )
+    }
+}
 
 mod sealed {
     pub trait Sealed {}
@@ -174,6 +246,7 @@ pub struct KvmCarrierCpu<I: CarrierCpuIo = KvmCpuIo> {
     neutral: X86VcpuSnapshot,
     custody: Custody,
     child_bindings: CarrierChildBindings,
+    debug: Option<Arc<CarrierCpuDebug>>,
 }
 impl KvmCarrierCpu<KvmCpuIo> {
     /// A scheduler fixture stops inside the native kernel, potentially after
@@ -219,7 +292,21 @@ impl KvmCarrierCpu<KvmCpuIo> {
                 "only the physical peer has idle guest entry",
             ));
         }
-        CarrierRunExit::from_raw(self.io.run()?)
+        if let Some(debug) = &self.debug {
+            debug.phase.store(1, Ordering::Release);
+        }
+        let result = self.io.run().and_then(CarrierRunExit::from_raw);
+        if let Some(debug) = &self.debug {
+            debug.phase.store(
+                if matches!(&result, Ok(CarrierRunExit::Halt)) {
+                    3
+                } else {
+                    2
+                },
+                Ordering::Release,
+            );
+        }
+        result
     }
 
     pub(crate) fn with_idle_peer_vcpu<R>(
@@ -328,7 +415,12 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
             neutral,
             custody: Custody::Idle,
             child_bindings,
+            debug: None,
         })
+    }
+    pub(crate) fn attach_debug(&mut self, debug: Arc<CarrierCpuDebug>) {
+        debug.image(&self.neutral);
+        self.debug = Some(debug);
     }
     pub fn register_child_binding(&mut self, binding: GuestArchBinding) -> Result<(), TrapError> {
         let mut children = self
@@ -378,6 +470,11 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
         self.custody = Custody::Poisoned;
         self.io.write_image(&expected)?;
         audit_image(&self.io.read_image()?, &expected)?;
+        if let Some(debug) = &self.debug {
+            debug.image(&expected);
+            debug.bound(binding.task());
+            debug.phase.store(2, Ordering::Release);
+        }
         self.custody = Custody::Loaded {
             binding,
             resume,
@@ -395,9 +492,15 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
                 "carrier run requires its exact loaded task generation",
             ));
         }
+        if let Some(debug) = &self.debug {
+            debug.phase.store(1, Ordering::Release);
+        }
         let raw = match self.io.run() {
             Ok(exit) => exit,
             Err(error) => {
+                if let Some(debug) = &self.debug {
+                    debug.phase.store(4, Ordering::Release);
+                }
                 self.custody = Custody::Poisoned;
                 return Err(error);
             }
@@ -423,6 +526,17 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
                 return Err(error);
             }
         };
+        if let Some(debug) = &self.debug {
+            debug.image(&image);
+            debug.phase.store(
+                if matches!(&exit, CarrierRunExit::Halt) {
+                    3
+                } else {
+                    2
+                },
+                Ordering::Release,
+            );
+        }
         let target_binding = match &exit {
             // CPL0 schedules descendants in-zone without changing the
             // executor's loaded task. Every physical crossing uses the
@@ -505,6 +619,12 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
         self.io.write_image(&self.neutral)?;
         audit_image(&self.io.read_image()?, &self.neutral)?;
         self.custody = Custody::Idle;
+        if let Some(debug) = &self.debug {
+            debug.image(&self.neutral);
+            debug.task_serial.store(0, Ordering::Relaxed);
+            debug.task_execution.store(0, Ordering::Release);
+            debug.phase.store(0, Ordering::Release);
+        }
         Ok(saved)
     }
     pub fn audit_idle(&self) -> Result<(), TrapError> {

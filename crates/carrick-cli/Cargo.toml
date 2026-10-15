@@ -121,6 +121,7 @@ futures-util.workspace = true
 tokio.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
+wait-timeout = "0.2.1"
 
 # Arch-scoped for the same reason as carrick-runtime's copies: bhyve and NVMM
 # are x86_64-only VMMs whose own crate-level gates key on `target_os` alone, so

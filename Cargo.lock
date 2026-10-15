@@ -388,6 +388,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wait-timeout",
 ]
 
 [[package]]

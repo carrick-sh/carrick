@@ -38,7 +38,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::dto::{KernelDebugSnapshot, KernelDebugTable};
+use super::dto::{
+    DebugExecutorReceiptRow, DebugExecutorReceiptSummary, DebugExecutorRow, DebugRunQueueRow,
+    DebugSchedulerRow, KernelDebugDegraded, KernelDebugSnapshot, KernelDebugTable,
+};
+use super::wire::DEGRADED_BUDGET;
 use crate::kernel::core::Kernel;
 
 pub const POST_MORTEM_SCHEMA: &str = "carrick.kernel-post-mortem.v1";
@@ -84,6 +88,7 @@ pub const CAPTURE_DEADLINE: Duration = Duration::from_secs(2);
 /// Ring records a capture carries. The ring holds 8192; taking all of them
 /// keeps the capture whole where `carrick debug executor-receipt` truncates.
 const EVENT_RING_RECORDS: usize = 8192;
+const SCHEDULER_AUX_ROWS: usize = 1024;
 
 /// Why the kernel was aborted. Typed, because the reader's next question is
 /// always "which invariant, on what evidence", and a string cannot be joined
@@ -91,6 +96,8 @@ const EVENT_RING_RECORDS: usize = 8192;
 #[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum AbortReason {
+    /// Read-only operator or test-deadline capture of a live carrier.
+    LiveCapture { run_id: String },
     /// The always-on runner invariant: no live Linux task can ever reach a
     /// safe point again, yet a container process job has no published result.
     /// `zombies` names the unreapable remains — a pid-1 zombie with no parent
@@ -194,6 +201,7 @@ impl AbortReason {
     /// One line for a `Display`/log/error message.
     pub fn summary(&self) -> String {
         match self {
+            Self::LiveCapture { run_id } => format!("live capture of run {run_id}"),
             Self::ProcessGraphLiveness {
                 unpublished_jobs,
                 live_tasks,
@@ -322,6 +330,15 @@ pub struct PostMortem {
     /// The kernel graph, in the same projection `carrick debug hvpatch-kernel`
     /// serves — so the two views can never disagree about shape.
     pub kernel: Option<KernelDebugSnapshot>,
+    /// Non-coherent task view when the strict kernel snapshot is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_kernel: Option<super::dto::KernelDebugDegraded>,
+    /// Backend-owned physical scheduler and vCPU state, when installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical: Option<PhysicalCapture>,
+    /// Host executor queues when the MM authority prevents a full graph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler_aux: Option<SchedulerAuxCapture>,
     /// What is WRONG with that graph. A dangling alias-registry row lands
     /// here instead of destroying the capture.
     pub findings: Vec<String>,
@@ -334,6 +351,45 @@ pub struct PostMortem {
     #[serde(default)]
     pub event_ring_high_rate: Vec<EventRingRecord>,
     pub truncated: Vec<Truncated>,
+}
+
+#[derive(Clone, Debug, ::serde::Serialize, ::serde::Deserialize)]
+pub struct SchedulerAuxCapture {
+    pub scheduler: Vec<DebugSchedulerRow>,
+    pub run_queue: Vec<DebugRunQueueRow>,
+    pub executors: Vec<DebugExecutorRow>,
+    pub executor_receipts: Vec<DebugExecutorReceiptRow>,
+    pub executor_receipt_summary: Option<DebugExecutorReceiptSummary>,
+}
+
+fn bounded_rows<T>(rows: &mut Vec<T>, section: &str, truncated: &mut Vec<Truncated>) {
+    if rows.len() > SCHEDULER_AUX_ROWS {
+        truncated.push(Truncated {
+            section: section.to_owned(),
+            reason: format!(
+                "{} rows exceed the {}-row capture limit",
+                rows.len(),
+                SCHEDULER_AUX_ROWS
+            ),
+        });
+        rows.truncate(SCHEDULER_AUX_ROWS);
+    }
+}
+
+/// Backend observations are deliberately non-coherent with the kernel graph.
+/// Every producer must bound its census and name unavailable sections.
+#[derive(Clone, Debug, ::serde::Serialize, ::serde::Deserialize)]
+pub struct PhysicalCapture {
+    pub zone_census: String,
+    pub vcpus: Vec<String>,
+    /// Linux kernel thread stacks where procfs permits reading them.
+    pub host_threads: Vec<String>,
+    pub unavailable: Vec<String>,
+}
+
+/// Carrier-owned state reader used only while serving an explicit capture.
+pub trait PhysicalCaptureProvider: Send + Sync {
+    fn capture(&self) -> PhysicalCapture;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
@@ -352,17 +408,20 @@ pub struct EventRingRecord {
 }
 
 impl PostMortem {
-    /// Capture in process, under a deadline, from a kernel that is already
-    /// frozen (or about to be). Never fails: a section that cannot be taken
-    /// is recorded in [`Self::truncated`].
+    /// Capture in process, under a deadline. Abort captures see a kernel that
+    /// is already frozen (or about to be); explicit live captures are marked
+    /// non-coherent. A section that cannot be taken is recorded in
+    /// [`Self::truncated`].
     pub fn capture(
         kernel: Option<&Arc<Kernel>>,
         reason: AbortReason,
         run_id: Option<String>,
     ) -> Self {
         let deadline = Instant::now() + CAPTURE_DEADLINE;
+        let live_capture = matches!(&reason, AbortReason::LiveCapture { .. });
         let mut truncated = Vec::new();
         let mut findings = Vec::new();
+        let mut degraded_kernel = None;
         let kernel_snapshot = match kernel {
             None => {
                 truncated.push(Truncated {
@@ -388,6 +447,12 @@ impl PostMortem {
                         section: "kernel".to_owned(),
                         reason: error.to_string(),
                     });
+                    if live_capture {
+                        degraded_kernel = Some(KernelDebugDegraded::project(
+                            error.to_string(),
+                            &kernel.degraded_snapshot(Instant::now() + DEGRADED_BUDGET),
+                        ));
+                    }
                     None
                 }
             },
@@ -397,6 +462,31 @@ impl PostMortem {
         let event_ring_high_rate = ring_records(crate::event_ring::drain_recent_high_rate(
             EVENT_RING_RECORDS,
         ));
+        let scheduler_aux = if live_capture && kernel_snapshot.is_none() {
+            kernel
+                .and_then(|kernel| kernel.debug_aux_provider())
+                .map(|aux| {
+                    let (executor_receipts, executor_receipt_summary) = aux.executor_receipt_rows();
+                    let mut capture = SchedulerAuxCapture {
+                        scheduler: aux.scheduler_rows(),
+                        run_queue: aux.run_queue_rows(),
+                        executors: aux.executor_rows(),
+                        executor_receipts,
+                        executor_receipt_summary,
+                    };
+                    bounded_rows(&mut capture.scheduler, "scheduler", &mut truncated);
+                    bounded_rows(&mut capture.run_queue, "run_queue", &mut truncated);
+                    bounded_rows(&mut capture.executors, "executors", &mut truncated);
+                    bounded_rows(
+                        &mut capture.executor_receipts,
+                        "executor_receipts",
+                        &mut truncated,
+                    );
+                    capture
+                })
+        } else {
+            None
+        };
 
         Self {
             schema: POST_MORTEM_SCHEMA.to_owned(),
@@ -407,6 +497,9 @@ impl PostMortem {
                 .unwrap_or(0),
             reason,
             kernel: kernel_snapshot,
+            degraded_kernel,
+            physical: None,
+            scheduler_aux,
             findings,
             event_ring,
             event_ring_high_rate,
