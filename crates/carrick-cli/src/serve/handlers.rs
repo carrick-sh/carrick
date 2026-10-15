@@ -2393,32 +2393,50 @@ pub(crate) async fn start_exec_route(
         }
     };
 
-    let first_frame = match req.body_mut().frame().await {
-        Some(Ok(f)) => f,
-        _ => {
+    let body = match crate::serve::router::collect_limited_body(
+        req.body_mut(),
+        crate::serve::router::MAX_HTTP_BODY_BYTES,
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(crate::serve::router::LimitedBodyError::TooLarge) => {
+            return Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .body(
+                    http_body_util::Full::new(Bytes::from(error_json(
+                        "Exec start body is too large",
+                    )))
+                    .map_err(|never| match never {})
+                    .boxed(),
+                )
+                .unwrap_or_else(|_| fallback());
+        }
+        Err(crate::serve::router::LimitedBodyError::Transport(error)) => {
             return Response::builder()
                 .status(StatusCode::BAD_REQUEST)
                 .body(
-                    http_body_util::Full::new(Bytes::from(error_json("Empty request body")))
-                        .map_err(|never| match never {})
-                        .boxed(),
+                    http_body_util::Full::new(Bytes::from(error_json(&format!(
+                        "Exec start body failed: {error}"
+                    ))))
+                    .map_err(|never| match never {})
+                    .boxed(),
                 )
                 .unwrap_or_else(|_| fallback());
         }
     };
-
-    let Some(data) = first_frame.data_ref() else {
+    if body.is_empty() {
         return Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(
-                http_body_util::Full::new(Bytes::from(error_json("Invalid frame data")))
+                http_body_util::Full::new(Bytes::from(error_json("Empty request body")))
                     .map_err(|never| match never {})
                     .boxed(),
             )
             .unwrap_or_else(|_| fallback());
-    };
+    }
 
-    let start_body: ExecStartBody = match serde_json::from_slice(data) {
+    let start_body: ExecStartBody = match serde_json::from_slice(&body) {
         Ok(b) => b,
         Err(e) => {
             return Response::builder()
