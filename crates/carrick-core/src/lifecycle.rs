@@ -130,8 +130,8 @@ impl Drop for MemberReset<'_> {
     }
 }
 
-/// An owned graph reference. The host allocation cannot be recycled until
-/// every copy drops and publishes the unregister receipt in shared storage.
+/// An owned control reference that prevents allocation reuse. A committed
+/// registration publishes its unregister receipt when every reference drops.
 pub struct MemberControlCustody<'a, T: MemberControl + ?Sized> {
     control: &'a T,
 }
@@ -144,11 +144,19 @@ impl<'a, T: MemberControl + ?Sized> MemberControlCustody<'a, T> {
                 if word & RESETTING != 0 || word & REFERENCES == REFERENCES {
                     None
                 } else {
-                    Some((word + GRAPH_REFERENCE) | GRAPH_REGISTERED)
+                    Some(word + GRAPH_REFERENCE)
                 }
             })
             .map_err(|_| TransitionError::StaleGeneration)?;
         Ok(Self { control })
+    }
+    /// Commit a retained reference into the graph or terminal receipt set.
+    /// Speculative retains must drop without manufacturing an unregister receipt.
+    pub fn commit_registration(&self) {
+        self.control
+            .exit_custody()
+            .word
+            .fetch_or(GRAPH_REGISTERED, Ordering::Release);
     }
     pub fn control(&self) -> &'a T {
         self.control

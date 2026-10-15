@@ -1316,12 +1316,32 @@ mod tests {
     }
 
     #[test]
+    fn rejected_recycled_control_retain_does_not_publish_unregister() {
+        let slot = super::ThreadControlSlot::new();
+        let old = super::EntryRef::new(0, 1);
+        let replacement = super::EntryRef::new(0, 2);
+        slot.reset_for_birth(super::BlockedMask(0), 0, old).unwrap();
+        // The scan observed old before the host recycled this allocation.
+        slot.reset_for_host_birth(super::BlockedMask(0)).unwrap();
+        slot.reset_for_birth(super::BlockedMask(0), 0, replacement)
+            .unwrap();
+        let retained = carrick_core::lifecycle::MemberControlCustody::retain(&slot).unwrap();
+        assert_ne!(retained.entry(), Some(old));
+        drop(retained);
+        assert!(
+            !slot.graph_unregister_receipt(),
+            "a rejected retain must not release the replacement host lease"
+        );
+    }
+
+    #[test]
     fn graph_owned_control_rejects_reset_until_unregister() {
         let slot = super::ThreadControlSlot::new();
         let entry = super::EntryRef::new(0, 1);
         slot.reset_for_birth(super::BlockedMask(0), 0, entry)
             .unwrap();
         let custody = carrick_core::lifecycle::MemberControlCustody::retain(&slot).unwrap();
+        custody.commit_registration();
         assert!(slot.reset_for_host_birth(super::BlockedMask(0)).is_err());
         assert!(
             slot.reset_for_birth(super::BlockedMask(0), 0, super::EntryRef::new(1, 2))
