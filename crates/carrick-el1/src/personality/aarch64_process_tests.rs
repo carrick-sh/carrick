@@ -3343,6 +3343,81 @@ fn arm_host_exit_reserved_live_count_does_not_settle_group_before_receipt() {
 }
 
 #[test]
+#[allow(clippy::disallowed_methods)]
+fn arm_host_retirement_release_racing_settle_reparks_without_quarantine() {
+    use carrick_el1_abi::Lifecycle;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    let sibling = host_born_sibling(fixture, 42);
+    let retirement = fixture.page.reserve_nonfinal_exit().unwrap();
+    run_as_leader(fixture);
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[0] = 7;
+    frame.x[8] = 94;
+    assert_eq!(
+        arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+    );
+    retirement.publish();
+    let identity = sibling.host_birth_identity().unwrap();
+    let (published_tx, published_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (claimed_tx, claimed_rx) = mpsc::channel();
+    let (finish_tx, finish_rx) = mpsc::channel();
+    let page = fixture.page;
+    let worker = std::thread::spawn(move || {
+        page.publish_exact_host_retirement_with_hooks(
+            sibling,
+            identity,
+            || {
+                published_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            },
+            || {
+                claimed_tx.send(()).unwrap();
+                finish_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            },
+        );
+    });
+    published_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let runtime = registry()
+        .for_entry(source, &fixture.task, fixture.address)
+        .unwrap();
+    runtime.install_settle_race_hook(Box::new(move || {
+        release_tx.send(()).unwrap();
+        claimed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    }));
+    assert!(matches!(
+        wake_closing_root(fixture, &mut service),
+        crate::sched::ResumeAction::Left
+    ));
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
+    finish_tx.send(()).unwrap();
+    worker.join().unwrap();
+    assert!(matches!(
+        wake_closing_root(fixture, &mut service),
+        crate::sched::ResumeAction::Left
+    ));
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
+    assert_eq!(service.crossing.root_exit_status.load(Ordering::Acquire), 7);
+}
+
+#[test]
 fn arm_closing_member_set_capacity_uses_static_registry_bound() {
     use carrick_el1_abi::Lifecycle;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));

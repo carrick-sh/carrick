@@ -607,6 +607,8 @@ pub struct NativeProcessRuntime<'a, M: Clone, C: ProcessContext> {
     signal_check_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     closing_race_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    settle_race_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
     registry: SpinLock<Option<&'a NativeProcessRegistry<'a, M, C>>>,
 }
 
@@ -1573,6 +1575,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
     pub(super) fn install_closing_race_hook(&self, hook: Box<dyn FnOnce() + Send>) {
         *self.closing_race_hook.lock() = Some(hook);
     }
+    #[cfg(test)]
+    pub(super) fn install_settle_race_hook(&self, hook: Box<dyn FnOnce() + Send>) {
+        *self.settle_race_hook.lock() = Some(hook);
+    }
     pub fn zone(&self) -> &'a ZoneTables<C> {
         self.zone
     }
@@ -1910,6 +1916,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             signal_check_hook: SpinLock::new(None),
             #[cfg(test)]
             closing_race_hook: SpinLock::new(None),
+            #[cfg(test)]
+            settle_race_hook: SpinLock::new(None),
             registry: SpinLock::new(None),
         })
     }
@@ -3555,31 +3563,42 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .namespace_pid;
         let root_exit = self.is_root_process();
         let (page, channel) = self.begin_closing(wait_status)?;
-        if let Some(outcome) = self.park_pending_exit(page, &channel)? {
-            return Ok(outcome);
-        }
-        let settled = {
-            let mut graph = self.runtime.graph.lock();
-            let pending = graph
-                .pending_exit
-                .get_mut(&self.key)
-                .ok_or(NativeProcessError::Quarantined)?;
-            let custody = pending
-                .custody
-                .take()
-                .ok_or(NativeProcessError::Quarantined)?;
-            let receipts = pending.completed_receipts(page);
-            let result = match receipts {
-                Some(receipts) => custody.settle(page, receipts),
-                None => Err(custody),
-            };
-            match result {
-                Ok(settled) => settled,
-                Err(closing) => {
-                    pending.custody = Some(closing);
-                    return Err(NativeProcessError::Quarantined);
-                }
+        let settled = loop {
+            if let Some(outcome) = self.park_pending_exit(page, &channel)? {
+                return Ok(outcome);
             }
+            #[cfg(test)]
+            if let Some(hook) = self.runtime.settle_race_hook.lock().take() {
+                hook();
+            }
+            let attempt = {
+                let mut graph = self.runtime.graph.lock();
+                let pending = graph
+                    .pending_exit
+                    .get_mut(&self.key)
+                    .ok_or(NativeProcessError::Quarantined)?;
+                let custody = pending
+                    .custody
+                    .take()
+                    .ok_or(NativeProcessError::Quarantined)?;
+                let receipts = pending.completed_receipts(page);
+                let result = match receipts {
+                    Some(receipts) => custody.settle(page, receipts),
+                    None => Err(custody),
+                };
+                match result {
+                    Ok(settled) => Some(settled),
+                    Err(closing) => {
+                        pending.custody = Some(closing);
+                        None
+                    }
+                }
+            };
+            if let Some(settled) = attempt {
+                break settled;
+            }
+            // A host retirement can claim its birth slot after the ready
+            // check. Re-enrol on the channel and recheck under its lock.
         };
         let _identity = settled.identity();
         let transaction = self
