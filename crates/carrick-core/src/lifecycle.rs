@@ -250,7 +250,13 @@ pub trait Lifecycle {
             .state(entry.index())
             .is_some_and(|(generation, state)| {
                 generation == entry.generation()
-                    && !matches!(state, EntryState::Reaped | EntryState::Revoked)
+                    && matches!(
+                        state,
+                        EntryState::Born
+                            | EntryState::Published
+                            | EntryState::ExitingBorn
+                            | EntryState::ExitingPublished
+                    )
             })
         {
             PoolControlDisposition::Retain
@@ -397,8 +403,8 @@ pub trait Lifecycle {
         })
     }
 
-    /// Reserve the Closing caller while a competing close can still fail.
-    /// The guard restores that exact unit if gate CAS loses.
+    /// Reserve the Closing caller after closed admission and fallible member
+    /// preparation. Dropping an unpublished reservation restores its unit.
     fn reserve_closing_caller_exit(&self) -> Result<NonfinalExitMembership<'_>, MembershipFloor>
     where
         Self: Sized,
