@@ -365,6 +365,10 @@ impl TerminalCustody<Process, Live> {
 
     pub fn close_admission<L: Lifecycle>(page: &L) -> ProcessExitAdmission<'_, L> {
         page.close();
+        // Pair with Kernel::thread_spawned's publication-before-gate check.
+        // Order the gate store before the Acquire host-born snapshot loads,
+        // including targets where Acquire may compile to an RCpc load.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         ProcessExitAdmission { page }
     }
 
