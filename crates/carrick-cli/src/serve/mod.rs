@@ -1,5 +1,13 @@
 //! `carrick serve --docker-api`: an optional Docker Engine API server over a
 //! unix socket. Server-as-translator.
+//!
+//! Build-context limits may be set with positive integer environment values:
+//! `CARRICK_SERVE_BUILD_MAX_COMPRESSED_BYTES` (default 1 GiB),
+//! `CARRICK_SERVE_BUILD_MAX_EXPANDED_BYTES` (default 8 GiB), and
+//! `CARRICK_SERVE_BUILD_MAX_ENTRIES` (default 1,000,000). The expanded limit is
+//! additionally capped by free space on the temporary context volume minus a
+//! reserved 1 GiB. The server returns HTTP 413 with the active cap when a
+//! context exceeds one of these limits.
 
 mod build;
 mod handlers;
