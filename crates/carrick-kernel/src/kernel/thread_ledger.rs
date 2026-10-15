@@ -55,7 +55,18 @@ impl BirthAdmissionGuard {
         task: &super::objects::Task,
         after_gate_read: impl FnOnce(),
     ) -> Result<Self, KernelOperationError> {
-        let page = task.shared().pending_signals().lifecycle_lease();
+        Self::acquire_page(
+            task.key().id,
+            task.shared().pending_signals().lifecycle_lease(),
+            after_gate_read,
+        )
+    }
+
+    fn acquire_page(
+        task: super::ids::TaskId,
+        page: super::objects::ThreadLifecycleLease,
+        after_gate_read: impl FnOnce(),
+    ) -> Result<Self, KernelOperationError> {
         if !page.serves_threads() || page.gate() == carrick_el1_abi::GateState::Closed {
             return Ok(Self {
                 page: None,
@@ -77,7 +88,7 @@ impl BirthAdmissionGuard {
                     awaiting_exec_binding: false,
                 });
             }
-            Err(_) => return Err(KernelOperationError::LifecycleAdmissionBusy(task.key().id)),
+            Err(_) => return Err(KernelOperationError::LifecycleAdmissionBusy(task)),
         }
         let guard = Self {
             page: Some(page),
@@ -88,7 +99,7 @@ impl BirthAdmissionGuard {
             .as_ref()
             .is_some_and(|page| page.claimed_count() != 0)
         {
-            return Err(KernelOperationError::LifecycleAdmissionBusy(task.key().id));
+            return Err(KernelOperationError::LifecycleAdmissionBusy(task));
         }
         Ok(guard)
     }
@@ -109,6 +120,22 @@ impl Drop for BirthAdmissionGuard {
                 let _ = page.reopen_after_fork();
             }
         }
+    }
+}
+
+/// VM-free witnesses hold the production admission guard on their actual page.
+#[cfg(feature = "test-support")]
+pub struct TestBirthAdmissionGuard(BirthAdmissionGuard);
+#[cfg(feature = "test-support")]
+impl TestBirthAdmissionGuard {
+    pub(in crate::kernel) fn acquire(
+        task: super::ids::TaskId,
+        page: super::objects::ThreadLifecycleLease,
+    ) -> Result<Self, KernelOperationError> {
+        BirthAdmissionGuard::acquire_page(task, page, || {}).map(Self)
+    }
+    pub fn keep_closed(&mut self) {
+        self.0.keep_closed();
     }
 }
 
@@ -436,6 +463,7 @@ impl ThreadIdentityPool {
                     tid: identity.key.tid.raw() as u32,
                     visible_tid,
                     thread_serial: identity.key.serial.raw(),
+                    execution: carrick_el1_abi::EntryGeneration::from_raw(task.key().serial.raw()),
                     uid_credit: u64::from(credit.raw()),
                 },
             )

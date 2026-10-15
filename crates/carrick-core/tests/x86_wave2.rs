@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 // Linux sidecars are deliberately absent from this publication owner witness.
 struct NativePool {
     mm: EntryMmKey,
+    terminal: carrick_core::terminal::ProcessExitCustody,
     gate: AtomicU32,
     live: AtomicU32,
     cells: [AtomicEntry; 8],
@@ -17,6 +18,7 @@ impl NativePool {
     fn new(mm: u64) -> Self {
         Self {
             mm: EntryMmKey::from_raw(mm),
+            terminal: carrick_core::terminal::ProcessExitCustody::new(),
             gate: AtomicU32::new(0),
             live: AtomicU32::new(1),
             cells: std::array::from_fn(|_| AtomicEntry::new(pack(0, EntryState::Vacant))),
@@ -26,6 +28,9 @@ impl NativePool {
     }
 }
 impl Lifecycle for NativePool {
+    fn process_exit_custody(&self) -> &carrick_core::terminal::ProcessExitCustody {
+        &self.terminal
+    }
     fn host_birth_receipt_returned_exact(
         &self,
         _: usize,

@@ -88,6 +88,7 @@ impl Venue {
                     tid,
                     visible_tid: visible,
                     thread_serial: CHILD_SERIAL + index as u64,
+                    execution: carrick_core_abi::entry::EntryGeneration::from_raw(1),
                     uid_credit: 1,
                 },
             )

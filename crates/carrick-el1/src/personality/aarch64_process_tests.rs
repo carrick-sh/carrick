@@ -399,6 +399,19 @@ impl Fixture {
         Self::with_file_table(root_gpa, asid, 5)
     }
     fn with_file_table(root_gpa: u64, asid: carrick_guest_arch::Asid, file_table: u64) -> Self {
+        Self::with_page(
+            root_gpa,
+            asid,
+            file_table,
+            Box::leak(Box::new(ThreadLifecyclePage::new())),
+        )
+    }
+    fn with_page(
+        root_gpa: u64,
+        asid: carrick_guest_arch::Asid,
+        file_table: u64,
+        page: &'static ThreadLifecyclePage,
+    ) -> Self {
         let region_box = Box::new(crate::personality::mm_portal::test_support::Region::new());
         let region = Box::leak(region_box);
         let zone: &'static ZoneTables<Aarch64ParkedContext> = unsafe {
@@ -409,7 +422,6 @@ impl Fixture {
                 .cast()
         };
 
-        let page = Box::leak(Box::new(ThreadLifecyclePage::new()));
         let control: &'static ThreadControlSlot = Box::leak(Box::new(ThreadControlSlot::new()));
 
         let task = CurrentTask::new();
@@ -1851,6 +1863,7 @@ fn imported_thread_on_control(
                 tid: 42,
                 visible_tid: 42,
                 thread_serial: 102,
+                execution: carrick_core_abi::entry::EntryGeneration::from_raw(12),
                 uid_credit: 0,
             },
         )
@@ -3191,6 +3204,7 @@ fn arm_pool_raw_exit_closing_at_commit_boundary(
                         tid: 99,
                         visible_tid: 99,
                         thread_serial: 199,
+                        execution: carrick_core_abi::entry::EntryGeneration::from_raw(1),
                         uid_credit: 0,
                     },
                 )
@@ -3267,11 +3281,275 @@ fn arm_raw_exit_reaped_and_replenished_before_closing_owes_no_host_receipt() {
     arm_pool_raw_exit_closing_at_commit_boundary(true, None);
 }
 
-#[test]
-fn arm_host_retired_pool_member_waits_for_exact_host_receipt() {
+#[cfg(test)]
+fn arm_non_graph_retired_pool_member(reallocate: bool, resetting: bool) {
     use carrick_el1_abi::Lifecycle;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
-    let (control, _record) = imported_thread(fixture);
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    // This birth happens after the root graph snapshot and never enters ring.
+    let arena = Box::leak(Box::new(
+        carrick_kernel::kernel::objects::TestThreadControlArena::try_new().unwrap(),
+    ));
+    let lease = arena.allocate(42).unwrap();
+    let address = lease.slot_address();
+    // SAFETY: the leaked arena retains the free-list backing after lease drop.
+    let control = unsafe { &*(address.raw() as *const ThreadControlSlot) };
+    let (_, record) = imported_thread_on_control(fixture, control, |_| {});
+    assert!(registry().for_record(fixture.zone, record).is_none());
+    let entry = control.entry().unwrap();
+    fixture.page.publish(entry).unwrap();
+    let membership = fixture.page.reserve_nonfinal_exit().unwrap();
+    fixture
+        .page
+        .retire_published_host_member(entry, control, membership)
+        .unwrap();
+    let receipt = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+        carrick_core_abi::EntryTaskKey::from_raw(42),
+        carrick_core_abi::EntryGeneration::from_raw(12),
+        carrick_core_abi::EntryThreadGeneration::from_raw(102),
+    )
+    .unwrap();
+    fixture.page.publish_exact_host_retirement(control, receipt);
+    fixture.zone.free_record(record.id);
+    drop(lease);
+    let reset = resetting.then(|| control.reserve_reset_for_test().unwrap());
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[0] = 7;
+    frame.x[8] = 94;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        arm_call(fixture, fixture.control, &mut service, &mut frame)
+    }));
+    if outcome.is_err() {
+        assert_eq!(
+            fixture.page.live(),
+            1,
+            "fallible retention must precede begin_exit"
+        );
+        assert_eq!(fixture.page.gate(), carrick_el1_abi::GateState::Open);
+    }
+    assert_eq!(
+        outcome
+            .expect("Reaped reset must not quarantine exit_group")
+            .unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+    );
+    drop(reset);
+    if reallocate {
+        let replacement = arena.allocate(99).unwrap();
+        assert_eq!(
+            replacement.slot_address(),
+            address,
+            "Closing must not retain a Reaped free-list slot"
+        );
+    }
+    assert_eq!(
+        service.crossing.root_exits.load(Ordering::Acquire),
+        1,
+        "a non-graph host-retired member must not strand Closing"
+    );
+    assert_eq!(service.crossing.root_exit_status.load(Ordering::Acquire), 7);
+}
+
+#[test]
+fn arm_non_graph_pool_member_host_retires_before_exit_group() {
+    arm_non_graph_retired_pool_member(false, false);
+}
+
+#[test]
+fn arm_reaped_free_list_slot_is_not_retained_by_closing() {
+    arm_non_graph_retired_pool_member(true, false);
+}
+
+#[test]
+fn arm_reaped_slot_reset_cannot_leave_partially_begun_exit() {
+    arm_non_graph_retired_pool_member(false, true);
+}
+
+#[test]
+fn arm_host_retirement_between_page_scan_and_retain_does_not_quarantine() {
+    use carrick_el1_abi::Lifecycle;
+    let fixture: &'static Fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    let arena = Box::leak(Box::new(
+        carrick_kernel::kernel::objects::TestThreadControlArena::try_new().unwrap(),
+    ));
+    let lease = arena.allocate(42).unwrap();
+    let address = lease.slot_address();
+    // SAFETY: the leaked arena retains this backing through the controlled race.
+    let control = unsafe { &*(address.raw() as *const ThreadControlSlot) };
+    let (_, record) = imported_thread_on_control(fixture, control, |_| {});
+    let entry = control.entry().unwrap();
+    fixture.page.publish(entry).unwrap();
+    let reset = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let held_reset = reset.clone();
+    let runtime = registry()
+        .for_entry(
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            &fixture.task,
+            fixture.address,
+        )
+        .unwrap();
+    let page = fixture.page;
+    let zone = fixture.zone;
+    runtime.install_pool_control_hook(Box::new(move || {
+        let membership = page.reserve_nonfinal_exit().unwrap();
+        page.retire_published_host_member(entry, control, membership)
+            .unwrap();
+        let receipt = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+            carrick_core_abi::EntryTaskKey::from_raw(42),
+            carrick_core_abi::EntryGeneration::from_raw(12),
+            carrick_core_abi::EntryThreadGeneration::from_raw(102),
+        )
+        .unwrap();
+        page.publish_exact_host_retirement(control, receipt);
+        zone.free_record(record.id);
+        drop(lease);
+        *held_reset.lock().unwrap() = Some(control.reserve_reset_for_test().unwrap());
+    }));
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[0] = 7;
+    frame.x[8] = 94;
+    assert_eq!(
+        arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+    );
+    drop(reset.lock().unwrap().take());
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
+    assert_eq!(service.crossing.root_exit_status.load(Ordering::Acquire), 7);
+    assert_eq!(arena.allocate(99).unwrap().slot_address(), address);
+}
+
+#[test]
+fn arm_non_graph_pool_member_uses_page_identity_after_zone_release() {
+    use carrick_el1_abi::Lifecycle;
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    let (control, record) = imported_thread(fixture);
+    let entry = control.entry().unwrap();
+    fixture.page.publish(entry).unwrap();
+    fixture.zone.free_record(record.id);
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[0] = 7;
+    frame.x[8] = 94;
+    assert_eq!(
+        arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+    );
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
+    let membership = fixture.page.reserve_cancelled_member_exit().unwrap();
+    fixture
+        .page
+        .retire_published_host_member(entry, control, membership)
+        .unwrap();
+    let receipt = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+        carrick_core_abi::EntryTaskKey::from_raw(42),
+        carrick_core_abi::EntryGeneration::from_raw(12),
+        carrick_core_abi::EntryThreadGeneration::from_raw(102),
+    )
+    .unwrap();
+    fixture.page.publish_exact_host_retirement(control, receipt);
+    assert!(matches!(
+        wake_closing_root(fixture, &mut service),
+        crate::sched::ResumeAction::Left
+    ));
+    assert_eq!(
+        service.crossing.root_exits.load(Ordering::Acquire),
+        1,
+        "the page identity must survive release of the zone record"
+    );
+    assert_eq!(service.crossing.root_exit_status.load(Ordering::Acquire), 7);
+}
+
+#[test]
+fn arm_failed_member_retain_leaves_terminal_admission_unbegun() {
+    use carrick_el1_abi::Lifecycle;
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    let (control, _) = imported_thread(fixture);
+    fixture.page.publish(control.entry().unwrap()).unwrap();
+    let reset = control.reserve_reset_for_test().unwrap();
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[0] = 7;
+    frame.x[8] = 94;
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        arm_call(fixture, fixture.control, &mut service, &mut frame)
+    }));
+    assert!(
+        refused.is_err(),
+        "the controlled reset window must refuse retention"
+    );
+    assert_eq!(
+        fixture.page.live(),
+        2,
+        "failed retain must not consume caller membership"
+    );
+    assert_eq!(fixture.page.gate(), carrick_el1_abi::GateState::Open);
+    drop(reset);
+    assert_eq!(
+        arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap(),
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+    );
+    assert_eq!(
+        fixture.page.live(),
+        1,
+        "the first successful admission consumes exactly one member"
+    );
+}
+
+#[test]
+fn arm_host_retired_pool_member_waits_for_exact_host_receipt() {
+    arm_graph_pool_host_retirement(false);
+}
+
+#[test]
+fn arm_graph_pool_member_without_execution_binding_uses_page_identity() {
+    arm_graph_pool_host_retirement(true);
+}
+
+#[cfg(test)]
+fn arm_graph_pool_host_retirement(unbound: bool) {
+    use carrick_el1_abi::Lifecycle;
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let (control, _record) = imported_thread_with_identity(fixture, |identity| {
+        if unbound {
+            identity.generation = 0;
+        }
+    });
     let mut service = fixture.process_service();
     fixture
         .enter(
@@ -3870,7 +4148,16 @@ fn arm_raw_exit_control_reallocation_rebound_before_closing() {
 fn arm_exit_group_under_gate(state: carrick_el1_abi::GateState) {
     use carrick_el1_abi::Lifecycle;
     {
-        let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+        let arena = Box::leak(Box::new(
+            carrick_kernel::kernel::objects::TestThreadControlArena::try_new().unwrap(),
+        ));
+        let fixture = Box::leak(Box::new(Fixture::with_page(
+            0x10000,
+            asid(1),
+            5,
+            arena.lifecycle(),
+        )));
+        let (sibling, _) = imported_thread(fixture);
         let mut service = fixture.process_service();
         fixture
             .enter(
@@ -3880,13 +4167,12 @@ fn arm_exit_group_under_gate(state: carrick_el1_abi::GateState) {
                 |_| (),
             )
             .unwrap();
-        fixture.page.close_for_fork().unwrap();
-        match state {
-            carrick_el1_abi::GateState::AwaitingExecBinding => {
-                fixture.page.await_exec_binding().unwrap()
-            }
-            carrick_el1_abi::GateState::Closed => fixture.page.close(),
-            _ => {}
+        if state == carrick_el1_abi::GateState::Closed {
+            fixture.page.close();
+        }
+        let mut admission = arena.birth_admission().unwrap();
+        if state == carrick_el1_abi::GateState::AwaitingExecBinding {
+            admission.keep_closed();
         }
         let mut frame = carrick_el1_abi::TrapFrame::default();
         frame.x[0] = 7;
@@ -3908,6 +4194,31 @@ fn arm_exit_group_under_gate(state: carrick_el1_abi::GateState) {
             carrick_personality_linux::dispatch::CompletionRoute::Suspended,
             "{state:?}"
         );
+        assert_eq!(
+            service.crossing.root_exits.load(Ordering::Acquire),
+            0,
+            "live sibling must delay status publication"
+        );
+        let entry = sibling.entry().unwrap();
+        fixture.page.publish(entry).unwrap();
+        let membership = fixture.page.reserve_cancelled_member_exit().unwrap();
+        fixture
+            .page
+            .retire_published_host_member(entry, sibling, membership)
+            .unwrap();
+        let receipt = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+            carrick_core_abi::EntryTaskKey::from_raw(42),
+            carrick_core_abi::EntryGeneration::from_raw(12),
+            carrick_core_abi::EntryThreadGeneration::from_raw(102),
+        )
+        .unwrap();
+        fixture.page.publish_exact_host_retirement(sibling, receipt);
+        drop(admission);
+        assert_eq!(fixture.page.gate(), carrick_el1_abi::GateState::Closed);
+        assert!(matches!(
+            wake_closing_root(fixture, &mut service),
+            crate::sched::ResumeAction::Left
+        ));
         assert_eq!(
             service.crossing.root_exits.load(Ordering::Acquire),
             1,
