@@ -590,10 +590,33 @@ impl TerminalCustody<Thread, Exiting> {
         ),
         (Self, MembershipFloor),
     > {
-        let membership = match if page.process_exit_custody().caller_reserved() {
+        self.reserve_nonfinal_with(page, || {})
+    }
+
+    fn reserve_nonfinal_with<'a>(
+        self,
+        page: &'a impl Lifecycle,
+        after_phase_observation: impl FnOnce(),
+    ) -> Result<
+        (
+            TerminalCustody<Thread, Terminal>,
+            NonfinalExitMembership<'a>,
+        ),
+        (Self, MembershipFloor),
+    > {
+        let caller_reserved = page.process_exit_custody().caller_reserved();
+        after_phase_observation();
+        let membership = match if caller_reserved {
             page.reserve_cancelled_member_exit()
         } else {
-            page.reserve_nonfinal_exit()
+            match page.reserve_nonfinal_exit() {
+                // The root can claim and publish its caller between our
+                // first phase observation and the floor-one reservation.
+                Err(_) if page.process_exit_custody().caller_reserved() => {
+                    page.reserve_cancelled_member_exit()
+                }
+                result => result,
+            }
         } {
             Ok(membership) => membership,
             Err(error) => return Err((self, error)),
@@ -886,6 +909,64 @@ mod tests {
             .is_err(),
             "zero live units cannot be spent again"
         );
+        let members = MemberSet::new(closing.identity, Vec::new(), Vec::new());
+        let receipts = members.completed(&[], &[]).unwrap();
+        assert!(closing.settle(&page, receipts).is_ok());
+    }
+
+    #[test]
+    fn close_between_sibling_phase_check_and_live_reservation_keeps_its_unit() {
+        let page = Page {
+            terminal: ProcessExitCustody::new(),
+            gate: AtomicU32::new(0),
+            live: AtomicU32::new(2),
+        };
+        let at_observation = std::sync::Barrier::new(2);
+        let after_close = std::sync::Barrier::new(2);
+        let task = TaskKey {
+            id: TaskId::from_registry_allocation(NonZeroI32::new(41).unwrap()),
+            serial: TaskSerial::from_raw_u64(11).unwrap(),
+        };
+        let address = AddressContext {
+            root: RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(0x10000)).unwrap(),
+            mm: carrick_guest_arch::MmGeneration::new(NonZeroU64::new(1).unwrap()),
+            generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::new(1).unwrap()),
+        };
+        let closing = std::thread::scope(|scope| {
+            let sibling = scope.spawn(|| {
+                let identity = ThreadTerminalIdentity::from_exit(
+                    ExecutionBinding {
+                        task: EntryTaskKey::from_raw(42),
+                        generation: EntryGeneration::from_raw(11),
+                        mm: carrick_core_abi::entry::EntryMmKey::from_raw(5),
+                        thread_generation: EntryThreadGeneration::from_raw(2),
+                    },
+                    None,
+                    TerminationStatus::exited(0),
+                )
+                .unwrap();
+                let (_terminal, membership) = TerminalCustody::<Thread, Live>::admitted(identity)
+                    .begin()
+                    .reserve_nonfinal_with(&page, || {
+                        at_observation.wait();
+                        after_close.wait();
+                    })
+                    .unwrap_or_else(|_| panic!("closing sibling lost its last live unit"));
+                membership.publish();
+            });
+            at_observation.wait();
+            let closing = TerminalCustody::<Process, Live>::begin_exit(
+                TerminalCustody::<Process, Live>::close_admission(&page),
+                task,
+                address,
+                TerminationStatus::exited(0),
+            )
+            .unwrap();
+            after_close.wait();
+            sibling.join().unwrap();
+            closing
+        });
+        assert_eq!(page.live(), 0);
         let members = MemberSet::new(closing.identity, Vec::new(), Vec::new());
         let receipts = members.completed(&[], &[]).unwrap();
         assert!(closing.settle(&page, receipts).is_ok());
