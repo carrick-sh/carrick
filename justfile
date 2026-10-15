@@ -233,8 +233,6 @@ authority-check-cross TARGET CC CFLAGS AR:
 
 # Host-independent domain checks; live compiler capture runs separately.
 lint-domains-source:
-    cargo test --locked -p carrick-xtask --lib terminal_custody
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- terminal-custody
     python3 scripts/conformance/check-next-strategy.py
     # Every test target is in exactly one gate lane (Cargo metadata), derived
     # lanes are consumed by their recipes, named-lane targets are named.

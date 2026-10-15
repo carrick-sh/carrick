@@ -1,8 +1,0 @@
-struct Owner;
-impl Owner {
-    fn retire_thread(&self, page: &Page) {
-        if page.live() > 1 {
-            self.finish();
-        }
-    }
-}

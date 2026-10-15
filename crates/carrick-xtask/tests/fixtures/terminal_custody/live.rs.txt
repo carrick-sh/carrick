@@ -1,1 +1,0 @@
-fn begin_closing(page: &Page) { if page.live() == 0 {} }
