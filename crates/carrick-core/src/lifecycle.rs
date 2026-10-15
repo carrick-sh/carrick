@@ -144,12 +144,12 @@ pub trait Lifecycle {
         let _ = self
             .live_word()
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                // SAFETY: a reserved unit was removed from this page before
-                // this non-cloneable token existed. Concurrent births retain
+                // A reserved unit was removed from this page before this
+                // non-cloneable token existed, and concurrent births hold
                 // distinct bounded pool or registry slots (far fewer than
-                // u32::MAX); they cannot consume this reserved unit's census
-                // headroom. Thus checked_add(1) is Some here.
-                Some(unsafe { n.checked_add(1).unwrap_unchecked() })
+                // u32::MAX), so this add cannot overflow. Saturate rather
+                // than assume: a broken invariant must never become UB.
+                Some(n.saturating_add(1))
             });
     }
 
