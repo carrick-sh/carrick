@@ -9,7 +9,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use std::sync::{Arc, LazyLock};
 
 pub(crate) const MAX_HTTP_ARCHIVE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_HTTP_BODY_BYTES: usize = MAX_HTTP_ARCHIVE_BYTES;
+pub(crate) const MAX_HTTP_BODY_BYTES: usize = MAX_HTTP_ARCHIVE_BYTES;
 const MAX_CONCURRENT_ARCHIVE_BODY_BYTES: usize = 32 * 1024 * 1024;
 static ARCHIVE_BODY_BUDGET: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
     Arc::new(tokio::sync::Semaphore::new(
@@ -18,12 +18,15 @@ static ARCHIVE_BODY_BUDGET: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::ne
 });
 
 #[derive(Debug, Eq, PartialEq)]
-enum LimitedBodyError {
+pub(crate) enum LimitedBodyError {
     TooLarge,
     Transport(String),
 }
 
-async fn collect_limited_body<B>(mut body: B, limit: usize) -> Result<Bytes, LimitedBodyError>
+pub(crate) async fn collect_limited_body<B>(
+    mut body: B,
+    limit: usize,
+) -> Result<Bytes, LimitedBodyError>
 where
     B: Body<Data = Bytes> + Unpin,
     B::Error: std::fmt::Display,
