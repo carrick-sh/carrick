@@ -136,58 +136,15 @@ struct KvmPhysicalDebug(Arc<carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory>);
 impl carrick_kernel::kernel::debug::PhysicalCaptureProvider for KvmPhysicalDebug {
     fn capture(&self) -> carrick_kernel::kernel::debug::PhysicalCapture {
         let capture = self.0.capture_physical_state();
-        let (host_threads, mut unavailable) = kvm_host_thread_census();
-        unavailable.extend(capture.unavailable);
+        let mut unavailable = capture.unavailable;
+        unavailable.push("host thread stacks unavailable on this KVM capture path".to_owned());
         carrick_kernel::kernel::debug::PhysicalCapture {
             zone_census: capture.zone_census,
             vcpus: capture.vcpus,
-            host_threads,
+            host_threads: Vec::new(),
             unavailable,
         }
     }
-}
-
-#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
-fn kvm_host_thread_census() -> (Vec<String>, Vec<String>) {
-    const MAX_THREADS: usize = 64;
-    const MAX_STACK_CHARS: usize = 4096;
-    let mut unavailable = Vec::new();
-    let entries = match std::fs::read_dir("/proc/self/task") {
-        Ok(entries) => entries,
-        Err(error) => {
-            return (Vec::new(), vec![format!("host thread census: {error}")]);
-        }
-    };
-    let mut tids: Vec<_> = entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
-        .take(MAX_THREADS + 1)
-        .collect();
-    tids.sort_unstable();
-    if tids.len() > MAX_THREADS {
-        unavailable.push(format!(
-            "host threads truncated after {MAX_THREADS} entries"
-        ));
-        tids.truncate(MAX_THREADS);
-    }
-    let threads = tids
-        .into_iter()
-        .map(|tid| {
-            let base = format!("/proc/self/task/{tid}");
-            let read = |name: &str| {
-                std::fs::read_to_string(format!("{base}/{name}"))
-                    .map(|value| value.chars().take(MAX_STACK_CHARS).collect::<String>())
-                    .unwrap_or_else(|error| format!("unavailable ({error})"))
-            };
-            format!(
-                "tid={tid} comm={} wchan={} kernel_stack={}",
-                read("comm").trim(),
-                read("wchan").trim(),
-                read("stack").trim(),
-            )
-        })
-        .collect();
-    (threads, unavailable)
 }
 
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]

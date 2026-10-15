@@ -1564,7 +1564,13 @@ fn mounted_static_x86_deadline_captures_parked_wait() {
                     .is_some_and(|text| text.contains("last_stopped_gprs="))))
     );
     assert!(capture["scheduler_aux"]["scheduler"].as_array().is_some());
-    assert!(capture["physical"]["host_threads"].as_array().is_some());
+    assert!(
+        capture["physical"]["unavailable"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row
+                .as_str()
+                .is_some_and(|text| text.contains("host thread stacks unavailable"))))
+    );
     let named_wait = capture["degraded_kernel"]["tasks"]
         .as_array()
         .into_iter()

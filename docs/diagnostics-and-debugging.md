@@ -446,7 +446,8 @@ the running carrier for a read-only capture in the existing post-mortem JSON
 shape. Use the same `CARRICK_RUN_ID` as the guest run. It includes both event
 rings, the kernel task/thread view (or a named degraded view), scheduler
 queues and executor receipts, the CPL0 zone census, per-vCPU last-stopped
-registers and state, pending host work, and a bounded host thread census.
+registers and state, and pending host work. Host thread stacks are currently
+reported as unavailable on this path.
 Live sections are non-coherent; a running vCPU's register row is explicitly
 its last stopped state. Unavailable sections are named in `truncated` or
 `physical.unavailable`.
