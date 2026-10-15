@@ -3081,6 +3081,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         self.timers.cancel_admission(record);
     }
 
+    /// Timer nodes held by active parks or unpublished admissions.
+    pub fn timer_node_count(&self) -> usize {
+        self.timers.allocated_nodes()
+    }
+
     /// Each admitted record has capacity for one timer lease. Other records'
     /// deadlines never prevent admission on the same serving slot.
     pub fn timer_admission_available(&self, _slot: SlotId) -> bool {
