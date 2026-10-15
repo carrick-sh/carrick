@@ -1160,7 +1160,7 @@ fn hvpatch_classic_record_lock_replacement_splits_only_the_callers_range() {
         whole.owner,
         LogicalRecordLockRange { start: 10, end: 20 },
     );
-    let state = locks.state.lock();
+    let state = locks.state();
     assert_eq!(state.locks.len(), 2);
     assert_eq!(
         state.locks[0].range,
@@ -1202,13 +1202,13 @@ fn f_setlkw_cycle_reports_edeadlk_instead_of_parking_forever() {
     // Wait for A's edge to appear rather than sleeping a fixed amount.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
-        if locks.state.lock().waits_on(a.owner).is_some() {
+        if locks.state().waits_on(a.owner).is_some() {
             break;
         }
         std::thread::yield_now();
     }
     assert!(
-        locks.state.lock().waits_on(a.owner).is_some(),
+        locks.state().waits_on(a.owner).is_some(),
         "owner A should have published a wait-for edge"
     );
 
@@ -1228,7 +1228,7 @@ fn f_setlkw_cycle_reports_edeadlk_instead_of_parking_forever() {
     // Releasing B lets A through, proving the edge was retracted, not leaked.
     locks.unlock(&b.file, b.owner, b.range);
     assert_eq!(waiter.join().expect("waiter thread"), Ok(()));
-    assert!(locks.state.lock().waiting_on.is_empty());
+    assert!(locks.state().waiting_on.is_empty());
 }
 
 /// The HVPatch reactor never parks a thread in `wait_set_interruptibly`: a
@@ -1250,11 +1250,11 @@ fn reactor_polled_f_setlkw_cycle_reports_edeadlk() {
         Arc::clone(&locks),
         logical_lock_request((41, 1), (10, 20), true),
         crate::thread::ThreadId::synthetic_for_tests(1),
-    carrick_abi::SigBlockMask::NONE,
+        carrick_abi::SigBlockMask::NONE,
     );
     assert_eq!(a_wants_b.try_acquire(), Err(LINUX_EAGAIN));
     assert!(
-        locks.state.lock().waits_on(a.owner).is_some(),
+        locks.state().waits_on(a.owner).is_some(),
         "a polled F_SETLKW must publish its wait-for edge"
     );
 
@@ -1265,14 +1265,14 @@ fn reactor_polled_f_setlkw_cycle_reports_edeadlk() {
         Arc::clone(&locks),
         logical_lock_request((42, 1), (0, 10), true),
         crate::thread::ThreadId::synthetic_for_tests(2),
-    carrick_abi::SigBlockMask::NONE,
+        carrick_abi::SigBlockMask::NONE,
     );
     assert_eq!(
         b_wants_a.try_acquire(),
         Err(crate::linux_abi::LINUX_EDEADLK),
         "closing the cycle through the reactor poll must be EDEADLK"
     );
-    assert!(locks.state.lock().waits_on(b.owner).is_none());
+    assert!(locks.state().waits_on(b.owner).is_none());
 
     // The verdict is per-attempt: A is still legitimately blocked, so a
     // re-poll after B's request failed is still EAGAIN, never EDEADLK.
@@ -1281,7 +1281,7 @@ fn reactor_polled_f_setlkw_cycle_reports_edeadlk() {
     // B gives up its lock instead: A's next poll acquires and retracts its edge.
     locks.unlock(&b.file, b.owner, b.range);
     assert_eq!(a_wants_b.try_acquire(), Ok(()));
-    assert!(locks.state.lock().waiting_on.is_empty());
+    assert!(locks.state().waiting_on.is_empty());
 }
 
 /// The reactor can first poll a contended F_SETLKW after its blocker closes.
@@ -1299,13 +1299,16 @@ fn reactor_grant_then_close_releases_record_lock_for_third_owner() {
         Arc::clone(&locks),
         owner.clone(),
         crate::thread::ThreadId::synthetic_for_tests(42),
-    carrick_abi::SigBlockMask::NONE,
+        carrick_abi::SigBlockMask::NONE,
     );
 
     locks.release_file_owner(&blocker.file, blocker.owner);
     assert!(locks.is_empty());
     assert_eq!(waiter.try_acquire(), Ok(()));
-    assert!(!locks.is_empty(), "reactor grant must publish table occupancy");
+    assert!(
+        !locks.is_empty(),
+        "reactor grant must publish table occupancy"
+    );
 
     // This is the close(fd) fast-path decision and owner release in
     // release_hvpatch_classic_record_locks, while the continuation still lives.
@@ -1329,22 +1332,21 @@ fn dropped_reactor_record_lock_wait_retracts_its_edge() {
         Arc::clone(&locks),
         logical_lock_request((42, 1), (0, 10), true),
         crate::thread::ThreadId::synthetic_for_tests(2),
-    carrick_abi::SigBlockMask::NONE,
+        carrick_abi::SigBlockMask::NONE,
     );
     assert_eq!(b_wants_a.try_acquire(), Err(LINUX_EAGAIN));
     let clone = b_wants_a.clone();
     drop(b_wants_a);
     assert!(
         locks
-            .state
-            .lock()
+            .state()
             .waits_on(LogicalRecordLockOwner::Process { pid: 42, serial: 1 })
             .is_some(),
         "a live clone of the wait keeps the edge published"
     );
     drop(clone);
     assert!(
-        locks.state.lock().waiting_on.is_empty(),
+        locks.state().waiting_on.is_empty(),
         "the last handle to an abandoned wait retracts its edge"
     );
 
@@ -1353,7 +1355,7 @@ fn dropped_reactor_record_lock_wait_retracts_its_edge() {
         Arc::clone(&locks),
         logical_lock_request((41, 1), (0, 10), true),
         crate::thread::ThreadId::synthetic_for_tests(1),
-    carrick_abi::SigBlockMask::NONE,
+        carrick_abi::SigBlockMask::NONE,
     );
     assert_eq!(a_again.try_acquire(), Ok(()));
 }
@@ -1416,13 +1418,15 @@ fn blocking_record_lock_ignores_blocked_signal_but_unblocked_signal_is_eintr() {
     let settled = rx.recv_timeout(std::time::Duration::from_secs(1));
     worker.join().expect("record waiter");
     let _ = carrick_hal::HostSignalBridge::take_pending_for(&*bridge, tid.raw());
-    assert!(premature.is_err(), "blocked signal must leave F_SETLKW parked: {premature:?}");
+    assert!(
+        premature.is_err(),
+        "blocked signal must leave F_SETLKW parked: {premature:?}"
+    );
     assert_eq!(settled, Ok(Ok(())));
 
     let unblocked_tid = crate::thread::ThreadId::synthetic_for_tests(42_852);
-    let unblocked_blocker = logical_lock_request((53, 3), (0, 10), true);
     let unblocked_waiter = logical_lock_request((54, 4), (0, 10), true);
-    assert_eq!(locks.try_set(unblocked_blocker), Ok(()));
+    assert_eq!(locks.try_set(unblocked_waiter.clone()), Err(LINUX_EAGAIN));
     carrick_hal::HostSignalBridge::publish_pending_for(&*bridge, unblocked_tid.raw(), 10);
     assert_eq!(
         locks.wait_set_interruptibly(
@@ -1451,7 +1455,14 @@ fn blocking_flock_ignores_blocked_signal_but_unblocked_signal_is_eintr() {
     let worker_file = file.clone();
     let worker_bridge = Arc::clone(&bridge);
     let worker = std::thread::spawn(move || {
-        let result = worker_locks.wait_flock_interruptibly(&worker_file, 2, true, tid, blocked, &*worker_bridge);
+        let result = worker_locks.wait_flock_interruptibly(
+            &worker_file,
+            2,
+            true,
+            tid,
+            blocked,
+            &*worker_bridge,
+        );
         tx.send(result).expect("flock wait result");
     });
     let premature = rx.recv_timeout(std::time::Duration::from_millis(30));
@@ -1459,7 +1470,10 @@ fn blocking_flock_ignores_blocked_signal_but_unblocked_signal_is_eintr() {
     let settled = rx.recv_timeout(std::time::Duration::from_secs(1));
     worker.join().expect("flock waiter");
     let _ = carrick_hal::HostSignalBridge::take_pending_for(&*bridge, tid.raw());
-    assert!(premature.is_err(), "blocked signal must leave flock parked: {premature:?}");
+    assert!(
+        premature.is_err(),
+        "blocked signal must leave flock parked: {premature:?}"
+    );
     assert_eq!(settled, Ok(Ok(())));
 
     assert_eq!(locks.try_flock(file.clone(), 3, true), Err(LINUX_EAGAIN));
