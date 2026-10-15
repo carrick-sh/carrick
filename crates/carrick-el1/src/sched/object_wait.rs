@@ -13,6 +13,27 @@ use carrick_sched_core::object_wait::{
 use carrick_sched_core::{RecordId, WakeEffects};
 use core::sync::atomic::Ordering;
 
+#[cfg(test)]
+std::thread_local! {
+    static NATIVE_WAKE_TRACE: std::cell::RefCell<std::vec::Vec<(SlotId, u64)>> =
+        const { std::cell::RefCell::new(std::vec::Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn clear_test_wake_trace() {
+    NATIVE_WAKE_TRACE.with(|trace| trace.borrow_mut().clear());
+}
+
+#[cfg(test)]
+pub(crate) fn test_wake_trace() -> std::vec::Vec<(SlotId, u64)> {
+    NATIVE_WAKE_TRACE.with(|trace| trace.borrow().clone())
+}
+
+#[cfg(test)]
+fn record_test_wake(slot: SlotId, target: u64) {
+    NATIVE_WAKE_TRACE.with(|trace| trace.borrow_mut().push((slot, target)));
+}
+
 /// Required completion venue for EL1-held queues. Detached handbacks use
 /// the carrier boundary; SGIs and pending work are delivered after unlock.
 pub(crate) fn deliver_completion<C: carrick_el1_abi::EntryContext>(
@@ -73,7 +94,7 @@ pub(crate) fn deliver_wake_effects<C: carrick_el1_abi::EntryContext>(
         carrick_sched_core::Waker::El1 { slot: venue },
         effects,
         false,
-        crate::personality::aarch64_process_tests::record_native_wake_for_test,
+        record_test_wake,
         |_slot| {},
     );
     #[cfg(all(not(test), not(target_os = "none")))]
