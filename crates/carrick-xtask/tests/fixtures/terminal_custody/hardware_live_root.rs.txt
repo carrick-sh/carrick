@@ -1,0 +1,1 @@
+fn check(mm: &Mm) { if mm.hardware_live_root() == 0 {} }
