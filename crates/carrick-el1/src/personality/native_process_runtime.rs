@@ -2815,14 +2815,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 msgflg,
             } => match self.msgrcv(msqid, msgp, msgtyp, msgflg, msgsz) {
                 Ok((IpcOutcome::Returned(r), Some((original_idx, mtype, data)))) => {
-                    let text_va = msgp.raw().checked_add(8).and_then(|raw| {
-                        let len = u64::try_from(data.len()).ok()?;
-                        (msgp.raw() < (1_u64 << 63))
-                            .then_some(raw)?
-                            .checked_add(len)
-                            .filter(|end| *end <= (1_u64 << 63))
-                            .map(|_| UserVa::new(raw))
-                    });
+                    let text_va = u64::try_from(data.len())
+                        .ok()
+                        .and_then(|len| len.checked_add(8))
+                        .and_then(|len| {
+                            carrick_guest_arch::UserRange::checked(
+                                msgp,
+                                carrick_guest_arch::GuestLen::new(len),
+                            )
+                        })
+                        .filter(|range| range.in_lower_half())
+                        .and_then(|_| msgp.raw().checked_add(8))
+                        .map(UserVa::new);
                     let (ok1, ok2) = if let Some(text_va) = text_va {
                         let mtype_bytes = mtype.to_ne_bytes();
                         let mtype_ok = unsafe {
@@ -9653,6 +9657,7 @@ mod tests {
     #[test]
     fn msgrcv_resume_rejects_overflowing_msgp_and_restores_message() {
         blocked_ipc_signal_contract(5, false);
+        blocked_ipc_signal_contract(7, false);
     }
     #[test]
     fn failed_ipc_enqueue_returns_timer_admission() {
@@ -9763,11 +9768,11 @@ mod tests {
         });
         entry.publication_wait_probe = Some(&probe);
         release_bucket_when_publisher_waits(guards, &waiting, || match operation {
-            0 | 5 => {
-                let msgp = if operation == 5 {
-                    UserVa::new(u64::MAX - 3)
-                } else {
-                    UserVa::new(0)
+            0 | 5 | 7 => {
+                let msgp = match operation {
+                    5 => UserVa::new(u64::MAX - 3),
+                    7 => UserVa::new(carrick_guest_arch::USER_CEILING - 4),
+                    _ => UserVa::new(0),
                 };
                 let result = entry.msgrcv(queue, msgp, 0, 0, 8);
                 assert!(
@@ -9868,7 +9873,7 @@ mod tests {
             assert!(zone.timer_owner(slot).is_none());
             return;
         }
-        if operation == 5 {
+        if operation == 5 || operation == 7 {
             assert!(matches!(
                 entry.msgsnd(queue, 1, &[7], 0),
                 Ok(IpcOutcome::Returned(_))
