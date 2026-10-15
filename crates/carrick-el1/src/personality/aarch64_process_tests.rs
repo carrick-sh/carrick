@@ -2482,13 +2482,16 @@ fn run_as_leader(fixture: &Fixture) {
 /// execution binding and a retained control slot, but no pool entry.
 #[cfg(test)]
 fn host_born_sibling(fixture: &Fixture, visible_tid: u32) -> &'static ThreadControlSlot {
-    let generation = u64::from(visible_tid - 30);
-    let thread_generation = u64::from(visible_tid + 60);
+    // The leader-TID rejection case keeps a sibling binding while claiming
+    // the leader's visible TID; other callers need distinct exact identities.
+    let binding_tid = if visible_tid == 41 { 42 } else { visible_tid };
+    let generation = u64::from(binding_tid - 30);
+    let thread_generation = u64::from(binding_tid + 60);
     let control = Box::leak(Box::new(ThreadControlSlot::new()));
     control.reset_for_host_birth(carrick_el1_abi::BlockedMask(0));
     assert!(control.publish_visible_tid(visible_tid));
     control.publish_host_birth_identity(carrick_el1_abi::ExecutionBinding {
-        task: carrick_el1_abi::EntryTaskKey::from_raw(u64::from(visible_tid)),
+        task: carrick_el1_abi::EntryTaskKey::from_raw(u64::from(binding_tid)),
         generation: carrick_el1_abi::EntryGeneration::from_raw(generation),
         mm: carrick_el1_abi::EntryMmKey::from_raw(5),
         thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(thread_generation),
@@ -2502,7 +2505,7 @@ fn host_born_sibling(fixture: &Fixture, visible_tid: u32) -> &'static ThreadCont
     );
     run_as(
         fixture,
-        visible_tid as i32,
+        binding_tid as i32,
         generation,
         thread_generation,
         control,
