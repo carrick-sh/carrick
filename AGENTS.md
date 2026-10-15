@@ -517,7 +517,7 @@ acceptance.
   focused tests, `just clippy` and `just lint-domains` (plus scoped signed
   witnesses when they have HVF) and post the results on the PR. The director
   runs `just accept --profile linux-portable` and the signed gate once per
-  stacked batch, in a dedicated detached worktree at the PR SHA, never in a
+  stack, at the top PR's SHA, in a dedicated detached worktree, never in a
   worker's live worktree.
 - **Routing:** a strong design-capable worker for shared-kernel, mm, fork,
   signal, carrier and seam work; a fast instruction-following worker for
@@ -553,7 +553,7 @@ Chat, worker mailboxes, scratch notes and agent memory are not.
   personality-neutral vocabulary (no NT names), labelled `seam`. carrick-nt
   links to them and pins carrick only at main merge commits.
 - **One owner per hot file via [`.github/CODEOWNERS`](.github/CODEOWNERS)**;
-  a second lane stacks on the owner's lane instead of carrying a copy.
+  a second lane adds a layer to the owner's stack instead of carrying a copy.
 - **Agent memory is not a rulebook.** A rule that every agent must follow
   goes in this file (or the skill or doc it points to); plans and status go
   on GitHub. Private agent memory holds only an agent's own working
@@ -563,9 +563,18 @@ Chat, worker mailboxes, scratch notes and agent memory are not.
 ## Landing and personalities
 
 - **Land through the merge queue** (`main-merge-queue`: rebase, all-green,
-  `ci-ok` required). Batch related PRs into one rebased stack and one gate.
-  Cancel PR runs that won't land before enqueueing; hosted macOS capacity is
-  scarce.
+  `ci-ok` required). Cancel PR runs that won't land before enqueueing;
+  hosted macOS capacity is scarce.
+- **Dependent work is a native GitHub stack** (`gh stack`, #468), not a
+  hand-built landing branch and not a wait-then-rebase chain. One branch and
+  PR per independently reviewable layer, each under the size cap, with its
+  own witness and issue link, and each PR based on the layer below. Fix a
+  lower layer on its own branch, then `gh stack rebase` and `gh stack push`
+  (force-with-lease). The director reviews every layer, runs the signed gate
+  once at the top of the stack, and lands the stack with
+  `gh stack merge <top PR>`: it enters the merge queue as one merge group and
+  takes one HVF gate. Ejecting a layer ejects everything above it, so
+  independent work stays in separate PRs. Stacks have no auto-merge.
 - **Lanes:** hosted Linux/macOS jobs in `ci.yml`; `kernel-runtime.yml` adds
   the self-hosted HVF lane (cloudmac, merge queue only) and the KVM lane
   (self-hosted JIT clones on the Contabo host, `docs/ci/contabo-kvm.md`;
