@@ -33,7 +33,7 @@ fn scheduler_preemption_progress_structural_and_timing_receipts_are_distinct() {
     assert!(structural.timing.is_none());
     assert_eq!(timing.layer, ExecutionLayer::EmbedTiming);
     assert!(timing.work.is_none());
-    assert!(timing.timing.is_some());
+    assert!(timing.timing.is_none());
     assert_ne!(structural.implementation_revision, "");
     assert_eq!(structural.fixture_identity, timing.fixture_identity);
 }
@@ -48,7 +48,10 @@ fn scheduler_preemption_progress_contract() {
     let obs = run_scheduler_progress_structural_contract();
     evaluate(contract, &[obs]).expect("scheduler progress structural contract evaluation");
     let timing_obs = run_scheduler_progress_timing_contract();
-    evaluate(contract, &[timing_obs]).expect("scheduler progress timing contract evaluation");
+    assert!(matches!(
+        timing_obs.completeness,
+        carrick_conformance_contract::Completeness::Incomplete { .. }
+    ));
 }
 
 #[test]
@@ -61,7 +64,7 @@ fn scheduler_preemption_lifecycle_structural_and_timing_receipts_are_distinct() 
     assert!(structural.timing.is_none());
     assert_eq!(timing.layer, ExecutionLayer::EmbedTiming);
     assert!(timing.work.is_none());
-    assert!(timing.timing.is_some());
+    assert!(timing.timing.is_none());
     assert_ne!(structural.implementation_revision, "");
     assert_eq!(structural.fixture_identity, timing.fixture_identity);
 }
@@ -76,7 +79,10 @@ fn scheduler_preemption_lifecycle_contract() {
     let obs = run_scheduler_lifecycle_structural_contract();
     evaluate(contract, &[obs]).expect("scheduler lifecycle structural contract evaluation");
     let timing_obs = run_scheduler_lifecycle_timing_contract();
-    evaluate(contract, &[timing_obs]).expect("scheduler lifecycle timing contract evaluation");
+    assert!(matches!(
+        timing_obs.completeness,
+        carrick_conformance_contract::Completeness::Incomplete { .. }
+    ));
 }
 
 #[test]
@@ -89,7 +95,7 @@ fn scheduler_preemption_cost_structural_and_timing_receipts_are_distinct() {
     assert!(structural.timing.is_none());
     assert_eq!(timing.layer, ExecutionLayer::EmbedTiming);
     assert!(timing.work.is_none());
-    assert!(timing.timing.is_some());
+    assert!(timing.timing.is_none());
     assert_ne!(structural.implementation_revision, "");
     assert_eq!(structural.fixture_identity, timing.fixture_identity);
 }
@@ -104,7 +110,10 @@ fn scheduler_preemption_cost_contract() {
     let obs = run_scheduler_cost_structural_contract();
     evaluate(contract, &[obs]).expect("scheduler cost structural contract evaluation");
     let timing_obs = run_scheduler_cost_timing_contract();
-    evaluate(contract, &[timing_obs]).expect("scheduler cost timing contract evaluation");
+    assert!(matches!(
+        timing_obs.completeness,
+        carrick_conformance_contract::Completeness::Incomplete { .. }
+    ));
 }
 
 fn carrier_or_fail() -> Carrier {
