@@ -2,7 +2,13 @@
 pub use carrick_core_abi::lifecycle::*;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum ExpectedExitReceipt {
     Pool,
     Host,
