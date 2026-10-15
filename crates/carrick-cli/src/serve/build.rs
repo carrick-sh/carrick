@@ -2,19 +2,17 @@
 //!
 //! Unlike the buffered container endpoints, this streams an NDJSON response body
 //! as the build runs. The request body is a gzipped tar of the build context; we
-//! unpack it to a temp dir and shell out to `carrick build` (kaniko-as-guest) via
-//! `current_exe()`, then forward kaniko's output line-by-line as
-//! `{"stream":"<line>\n"}` frames, ending in a success aux frame or an error
-//! frame. The guest fork happens in the spawned `carrick build` → `carrick run`
-//! process, never in the server's tokio runtime (the no-tokio-before-fork
-//! invariant).
+//! unpack it to a temp dir and run `carrick build` in-process on a blocking
+//! worker, then forward its output as NDJSON frames. The build enters the
+//! carrier directly; it does not spawn a CLI child.
 
 use std::collections::BTreeMap;
-use std::path::{Component, Path};
+use std::io::{self, Read};
+use std::path::{Component, Path, PathBuf};
 
 use futures_util::stream::Stream;
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, StreamBody};
+use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Bytes, Frame};
 use hyper::{Response, StatusCode};
 use tokio::sync::mpsc;
@@ -114,30 +112,116 @@ pub(crate) fn parse_build_query(query: &str) -> BuildQuery {
     out
 }
 
-/// Unpack a gzipped tar of the build context into `dest`. Guards against path
-/// traversal: an entry whose path escapes `dest` (absolute, or containing `..`)
-/// is rejected. `dest` must already exist.
+pub(crate) const MAX_BUILD_CONTEXT_COMPRESSED_BYTES: usize = 16 * 1024 * 1024;
+const MAX_BUILD_CONTEXT_DECOMPRESSED_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_BUILD_CONTEXT_ENTRIES: usize = 10_000;
+
+fn invalid_context(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+/// Resolve a link target against the canonical context root. Existing path
+/// components are canonicalized, so an earlier symlink cannot hide an escape;
+/// missing suffixes are retained for links to files created later in the tar.
+fn resolved_link_target(base: &Path, link: &Path) -> io::Result<PathBuf> {
+    let mut resolved = if link.is_absolute() {
+        PathBuf::from("/")
+    } else {
+        base.to_path_buf()
+    };
+    for component in link.components() {
+        match component {
+            Component::RootDir => {}
+            Component::CurDir => {}
+            Component::Normal(name) => {
+                resolved.push(name);
+                if std::fs::symlink_metadata(&resolved).is_ok() {
+                    resolved = std::fs::canonicalize(&resolved)?;
+                }
+            }
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Prefix(_) => return Err(invalid_context("unsupported link prefix")),
+        }
+    }
+    Ok(resolved)
+}
+
+fn reject_symlink_parent(dest: &Path, path: &Path) -> io::Result<()> {
+    let mut parent = dest.to_path_buf();
+    if let Some(components) = path.parent() {
+        for component in components.components() {
+            if let Component::Normal(name) = component {
+                parent.push(name);
+                match std::fs::symlink_metadata(&parent) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(invalid_context("tar entry parent is a symlink"));
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Unpack a bounded gzipped tar into an existing context directory. The tar
+/// entry API performs its own canonical containment check via `unpack_in`.
 fn unpack_context(gz_tar: &[u8], dest: &Path) -> std::io::Result<()> {
+    if gz_tar.len() > MAX_BUILD_CONTEXT_COMPRESSED_BYTES {
+        return Err(invalid_context("compressed build context is too large"));
+    }
+    let dest = std::fs::canonicalize(dest)?;
     let decoder = flate2::read::GzDecoder::new(gz_tar);
-    let mut archive = tar::Archive::new(decoder);
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.into_owned();
-        if !is_safe_relative(&path) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("unsafe tar entry path: {}", path.display()),
-            ));
+    let mut limited = decoder.take(MAX_BUILD_CONTEXT_DECOMPRESSED_BYTES + 1);
+    {
+        let mut archive = tar::Archive::new(&mut limited);
+        let mut count = 0_usize;
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            count += 1;
+            if count > MAX_BUILD_CONTEXT_ENTRIES {
+                return Err(invalid_context("build context has too many entries"));
+            }
+            let path = entry.path()?.into_owned();
+            if !is_safe_relative(&path) {
+                return Err(invalid_context(format!(
+                    "unsafe tar entry path: {}",
+                    path.display()
+                )));
+            }
+            reject_symlink_parent(&dest, &path)?;
+            let kind = entry.header().entry_type();
+            if kind.is_symlink() || kind.is_hard_link() {
+                let link = entry
+                    .link_name()?
+                    .ok_or_else(|| invalid_context("tar link has no target"))?;
+                let base = if kind.is_symlink() {
+                    dest.join(path.parent().unwrap_or_else(|| Path::new("")))
+                } else {
+                    dest.clone()
+                };
+                let target = resolved_link_target(&base, &link)?;
+                if !target.starts_with(&dest) {
+                    return Err(invalid_context("tar link escapes build context"));
+                }
+            } else if !kind.is_file() && !kind.is_dir() {
+                return Err(invalid_context("unsupported tar entry type"));
+            }
+            if entry.size() > MAX_BUILD_CONTEXT_DECOMPRESSED_BYTES {
+                return Err(invalid_context("build context entry is too large"));
+            }
+            if !entry.unpack_in(&dest)? {
+                return Err(invalid_context("tar entry was not unpacked"));
+            }
         }
-        let target = dest.join(&path);
-        // Defense in depth: confirm the joined target stays under dest.
-        if !target.starts_with(dest) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("tar entry escapes context: {}", path.display()),
-            ));
-        }
-        entry.unpack(&target)?;
+    }
+    io::copy(&mut limited, &mut io::sink())?;
+    if limited.limit() == 0 {
+        return Err(invalid_context("expanded build context is too large"));
     }
     Ok(())
 }
@@ -157,23 +241,60 @@ fn ndjson_frame(value: &serde_json::Value) -> Bytes {
     Bytes::from(s)
 }
 
-/// Build the streaming `POST /build` response. Returns immediately with a body
-/// that streams as the background task runs; the build itself happens in the
-/// spawned `carrick build` child.
-///
-/// `body_bytes` is the (already-buffered) gzipped-tar request body. On any setup
-/// failure (bad tar, temp-dir error, spawn error) we still return a 200 with a
-/// single error frame, matching Docker, which reports build problems in-band on
-/// the stream rather than via the HTTP status.
-pub(crate) fn build_response(
+fn build_error_response(status: StatusCode, message: &str) -> Response<BoxBody<Bytes, io::Error>> {
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(
+            Full::new(Bytes::from(
+                serde_json::json!({ "message": message }).to_string(),
+            ))
+            .map_err(|never| match never {})
+            .boxed(),
+        )
+        .unwrap_or_else(|_| {
+            Response::new(
+                Full::new(Bytes::new())
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+        })
+}
+
+/// Validate and unpack the context before returning HTTP 200. Bad archive
+/// entries are request errors; only the admitted build streams NDJSON.
+pub(crate) async fn build_response(
     query: &str,
     body_bytes: Bytes,
 ) -> Response<BoxBody<Bytes, std::io::Error>> {
+    let tmp = match tempfile::tempdir() {
+        Ok(tmp) => tmp,
+        Err(error) => {
+            return build_error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+        }
+    };
+    let ctx_dir = tmp.path().join("context");
+    if let Err(error) = std::fs::create_dir(&ctx_dir) {
+        return build_error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    }
+    let unpack = tokio::task::spawn_blocking(move || unpack_context(&body_bytes, &ctx_dir)).await;
+    match unpack {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            return build_error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid build context: {error}"),
+            );
+        }
+        Err(error) => {
+            return build_error_response(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+        }
+    }
     let parsed = parse_build_query(query);
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(64);
 
     tokio::spawn(async move {
-        run_build_streaming(parsed, body_bytes, tx).await;
+        run_build_streaming(parsed, tmp, tx).await;
     });
 
     let stream = ReceiverStream { rx };
@@ -193,13 +314,13 @@ pub(crate) fn build_response(
         })
 }
 
-/// Drive the build: unpack the context, spawn `carrick build`, forward its
+/// Drive the admitted build, forward its
 /// stdout/stderr line-by-line as `{"stream":...}` frames, and emit a terminal
 /// aux/error frame. Sends frames into `tx`; the body stream ends when `tx` (and
 /// thus the receiver) closes.
 async fn run_build_streaming(
     parsed: BuildQuery,
-    body_bytes: Bytes,
+    tmp: tempfile::TempDir,
     tx: mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
 ) {
     // A helper to push a JSON object as one NDJSON frame; a send error means the
@@ -222,38 +343,8 @@ async fn run_build_streaming(
         .await;
     }
 
-    // 1. Unpack the gzipped-tar context into a fresh temp dir.
-    let tmp = match tempfile::tempdir() {
-        Ok(t) => t,
-        Err(e) => {
-            send_error(&tx, &format!("failed to create build temp dir: {e}")).await;
-            return;
-        }
-    };
     let ctx_dir = tmp.path().join("context");
-    if let Err(e) = std::fs::create_dir_all(&ctx_dir) {
-        send_error(&tx, &format!("failed to create context dir: {e}")).await;
-        return;
-    }
-    // Unpacking can be CPU/IO heavy; do it on a blocking thread. The closure
-    // owns the (in-memory) gz-tar bytes and unpacks them through the gz/tar
-    // decoders directly.
-    let ctx_for_unpack = ctx_dir.clone();
-    let unpack =
-        tokio::task::spawn_blocking(move || unpack_context(&body_bytes, &ctx_for_unpack)).await;
-    match unpack {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            send_error(&tx, &format!("failed to unpack build context: {e}")).await;
-            return;
-        }
-        Err(e) => {
-            send_error(&tx, &format!("build context unpack task failed: {e}")).await;
-            return;
-        }
-    }
-
-    // 2. Run the build in-process. `run_build` enters the unified carrier
+    // Run the build in-process. `run_build` enters the unified carrier
     // directly; the API server never creates an intermediate CLI helper.
     let primary_tag = parsed.tags.first().cloned();
     let build_args = parsed
@@ -392,6 +483,31 @@ mod tests {
         assert_eq!(std::fs::read(&outside).unwrap(), b"host");
     }
 
+    #[tokio::test]
+    async fn outside_link_is_an_http_bad_request() {
+        let root = tempfile::tempdir().unwrap();
+        let gz = gzip_tar(|builder| append_link(builder, "sub", root.path(), false));
+        let response = build_response("", Bytes::from(gz)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn accepts_links_wholly_inside_context() {
+        let gz = gzip_tar(|builder| {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, "file", &b"x"[..]).unwrap();
+            append_link(builder, "hard", Path::new("file"), true);
+            append_link(builder, "soft", Path::new("file"), false);
+        });
+        let dest = tempfile::tempdir().unwrap();
+        unpack_context(&gz, dest.path()).unwrap();
+        assert_eq!(std::fs::read(dest.path().join("hard")).unwrap(), b"x");
+        assert_eq!(std::fs::read(dest.path().join("soft")).unwrap(), b"x");
+    }
+
     #[test]
     fn rejects_gzip_expansion_past_context_cap() {
         let gz = gzip_tar(|builder| {
@@ -409,6 +525,29 @@ mod tests {
         });
         let dest = tempfile::tempdir().unwrap();
         assert!(unpack_context(&gz, dest.path()).is_err());
+    }
+
+    #[test]
+    fn rejects_context_entry_count_past_cap() {
+        let gz = gzip_tar(|builder| {
+            for index in 0..=MAX_BUILD_CONTEXT_ENTRIES {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(0);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, format!("file-{index}"), std::io::empty())
+                    .unwrap();
+            }
+        });
+        let dest = tempfile::tempdir().unwrap();
+        assert!(unpack_context(&gz, dest.path()).is_err());
+        assert!(
+            !dest
+                .path()
+                .join(format!("file-{MAX_BUILD_CONTEXT_ENTRIES}"))
+                .exists()
+        );
     }
 
     #[test]

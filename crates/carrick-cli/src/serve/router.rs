@@ -9,6 +9,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use std::sync::{Arc, LazyLock};
 
 pub(crate) const MAX_HTTP_ARCHIVE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_HTTP_BODY_BYTES: usize = MAX_HTTP_ARCHIVE_BYTES;
 const MAX_CONCURRENT_ARCHIVE_BODY_BYTES: usize = 32 * 1024 * 1024;
 static ARCHIVE_BODY_BUDGET: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
     Arc::new(tokio::sync::Semaphore::new(
@@ -129,15 +130,47 @@ pub(crate) async fn route(
     let path = strip_version(req.uri().path()).to_string();
     let query = req.uri().query().unwrap_or("").to_string();
 
+    // Reject declared oversize bodies before a handler waits for their bytes.
+    // The collectors below enforce the same cap for chunked bodies.
+    if req
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > MAX_HTTP_BODY_BYTES as u64)
+    {
+        return Ok(boxed(json(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            serde_json::json!({ "message": "request body is too large" }).to_string(),
+        )));
+    }
+
     // `/build`'s request body is a (potentially large) gzipped tar streamed
     // back as NDJSON; it is the only streaming endpoint. Handle it before the
     // buffered dispatch so its response body stays unboxed-but-streaming.
     if method == Method::POST && path == "/build" {
-        let body_bytes = match BodyExt::collect(req.into_body()).await {
-            Ok(b) => b.to_bytes(),
-            Err(_) => Bytes::new(),
+        let body_bytes = match collect_limited_body(
+            req.into_body(),
+            crate::serve::build::MAX_BUILD_CONTEXT_COMPRESSED_BYTES,
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(LimitedBodyError::TooLarge) => {
+                return Ok(boxed(json(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    serde_json::json!({ "message": "build context body is too large" }).to_string(),
+                )));
+            }
+            Err(LimitedBodyError::Transport(error)) => {
+                return Ok(boxed(json(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({ "message": format!("build context body failed: {error}") })
+                        .to_string(),
+                )));
+            }
         };
-        return Ok(crate::serve::build::build_response(&query, body_bytes));
+        return Ok(crate::serve::build::build_response(&query, body_bytes).await);
     }
 
     if method == Method::GET && container_action(&path).map(|(_, a)| a) == Some("logs") {
@@ -248,9 +281,21 @@ pub(crate) async fn route(
         return Ok(crate::serve::handlers::start_exec_route(exec_id, req).await);
     }
 
-    let body_bytes = match BodyExt::collect(req.into_body()).await {
-        Ok(b) => b.to_bytes(),
-        Err(_) => Bytes::new(),
+    let body_bytes = match collect_limited_body(req.into_body(), MAX_HTTP_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(LimitedBodyError::TooLarge) => {
+            return Ok(boxed(json(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                serde_json::json!({ "message": "request body is too large" }).to_string(),
+            )));
+        }
+        Err(LimitedBodyError::Transport(error)) => {
+            return Ok(boxed(json(
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({ "message": format!("request body failed: {error}") })
+                    .to_string(),
+            )));
+        }
     };
 
     let resp = match (&method, path.as_str()) {
@@ -558,8 +603,7 @@ mod archive_body_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
 
-    #[tokio::test]
-    async fn oversized_build_body_is_rejected_before_collection() {
+    async fn assert_oversized_request_rejected(path: &str) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (mut client, server) = tokio::io::duplex(4096);
         let task = tokio::spawn(async move {
@@ -573,7 +617,7 @@ mod archive_body_tests {
         client
             .write_all(
                 format!(
-                    "POST /build HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+                    "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
                     MAX_HTTP_ARCHIVE_BYTES + 1
                 )
                 .as_bytes(),
@@ -594,6 +638,16 @@ mod archive_body_tests {
                 .starts_with("HTTP/1.1 413")
         );
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_build_body_is_rejected_before_collection() {
+        assert_oversized_request_rejected("/build").await;
+    }
+
+    #[tokio::test]
+    async fn oversized_catch_all_body_is_rejected_before_collection() {
+        assert_oversized_request_rejected("/unrecognized").await;
     }
 
     struct TestBody {
