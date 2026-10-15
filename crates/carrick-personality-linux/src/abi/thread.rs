@@ -849,6 +849,29 @@ impl ThreadLifecyclePage {
         })
     }
 
+    /// Publish one exact host retirement to the control slot and retained
+    /// host-birth slot. The runtime calls this only after graph retirement.
+    pub fn publish_exact_host_retirement(
+        &self,
+        control: &ThreadControlSlot,
+        receipt: carrick_core::terminal::HostThreadRetirementReceipt,
+    ) {
+        control.publish_host_retirement(receipt);
+        self.publish_host_birth_receipt(receipt);
+        self.release_completed_host_birth(receipt);
+    }
+
+    /// Retire the exact published entry and consume its reserved membership.
+    pub fn retire_published_host_member(
+        &self,
+        entry: EntryRef,
+        membership: carrick_core::lifecycle::NonfinalExitMembership<'_>,
+    ) -> Result<(), TransitionError> {
+        self.retire_published(entry)?;
+        membership.publish();
+        Ok(())
+    }
+
     pub fn host_birth_receipt_returned(&self, index: usize) -> bool {
         self.host_born
             .get(index)
@@ -1226,6 +1249,26 @@ mod tests {
         assert!(cancelled.publish_host_birth_receipt(second));
         assert!(cancelled.host_birth_receipt_returned(slot));
         assert_eq!(cancelled.host_birth_claimed_count(), 0);
+    }
+
+    #[test]
+    fn host_retirement_publication_keeps_exact_control_and_slot_receipt() {
+        use super::Lifecycle;
+        let page = super::ThreadLifecyclePage::new();
+        let control = super::ThreadControlSlot::new();
+        let receipt = carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+            carrick_core_abi::entry::EntryTaskKey::from_raw(42),
+            carrick_core_abi::entry::EntryGeneration::from_raw(12),
+            carrick_core_abi::entry::EntryThreadGeneration::from_raw(102),
+        )
+        .unwrap();
+        let slot = page.reserve_host_birth().unwrap();
+        assert!(page.publish_host_birth(slot, receipt));
+        page.close();
+        page.publish_exact_host_retirement(&control, receipt);
+        assert_eq!(control.host_retirement(), Some(receipt));
+        assert!(page.host_birth_receipt_returned(slot));
+        assert_eq!(page.host_birth_identity(slot), Some(receipt));
     }
 
     #[test]
