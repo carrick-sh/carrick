@@ -42,6 +42,7 @@ pub use exit::{PreparedTaskExit, RetiredTaskExit};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KernelFailpoint {
     AfterReserve,
+    AfterMembershipReserve,
     AfterObjects,
     AfterBackendPrepare,
     BeforePublish,

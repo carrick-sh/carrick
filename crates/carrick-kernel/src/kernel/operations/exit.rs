@@ -546,6 +546,21 @@ impl Kernel {
             return Err(KernelOperationError::UnknownThread(tid));
         }
         check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
+        // The page can lead the graph while an in-zone sibling exit awaits
+        // settlement. Reserve this host member's nonfinality from the page
+        // before changing either graph membership or the published ABI entry.
+        let control_lease = context.thread.control_lease();
+        let lifecycle = control_lease.lifecycle();
+        let live_membership = if matches!(lane, ThreadRetirementLane::ExitedInZone { .. }) {
+            None
+        } else {
+            Some(
+                lifecycle
+                    .reserve_nonfinal_exit()
+                    .map_err(|_| KernelOperationError::LastThreadRequiresTaskExit(tid))?,
+            )
+        };
+        check_failpoint(failpoint, KernelFailpoint::AfterMembershipReserve)?;
         if matches!(lane, ThreadRetirementLane::Host) {
             if let Some(owned) = record.thread_pool.take_published(context.thread.key()) {
                 lane = ThreadRetirementLane::HostAdopted(owned);
@@ -583,14 +598,6 @@ impl Kernel {
             thread
                 .child_tid_cleared_in_zone
                 .store(true, std::sync::atomic::Ordering::Release);
-        } else {
-            thread
-                .control_lease()
-                .lifecycle()
-                .try_exit()
-                .unwrap_or_else(|_| {
-                    carrick_fatal!("kernel::thread_retirement", "host exit lost live count");
-                });
         }
         let record = state
             .tasks
@@ -637,6 +644,9 @@ impl Kernel {
                     state.retired_threads.push_reserved(storage, retired)
                 }
             }
+        }
+        if let Some(membership) = live_membership {
+            membership.publish();
         }
         Ok(next)
     }
@@ -1345,6 +1355,29 @@ mod tests {
                 .fork_barrier_participants(sibling.thread().key()),
             Err(TaskParticipantError::UnknownThread { .. })
         ));
+    }
+
+    #[test]
+    fn host_exit_observes_page_last_member_before_mutating_graph() {
+        use carrick_el1_abi::Lifecycle;
+
+        let (kernel, leader) = bootstrap(19_425);
+        let sibling = clone_sibling(&kernel, &leader, 19_426);
+        let page = leader.thread().control_lease().lifecycle();
+        assert_eq!(page.live(), 2);
+        // The zone committed a sibling's live decrement before the host
+        // folded that entry into the graph. The host's own exit is now the
+        // last live membership even while the graph has two thread records.
+        page.try_exit()
+            .expect("zone sibling releases its live word");
+        assert_eq!(page.live(), 1);
+        assert!(matches!(
+            kernel.exit_thread(&sibling, None),
+            Err(KernelOperationError::LastThreadRequiresTaskExit(tid))
+                if tid == sibling.thread().key().tid
+        ));
+        assert!(sibling.exact_thread_is_live());
+        assert_eq!(page.live(), 1);
     }
 
     #[test]

@@ -2779,6 +2779,43 @@ fn arm_two_live_threads_robust_exit_forwards_without_abort() {
 }
 
 #[test]
+fn arm_raw_exit_decline_after_membership_reservation_restores_live() {
+    use carrick_el1_abi::Lifecycle;
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let (control, record) = imported_thread_with_identity(fixture, |_| {});
+    let mut service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |_| (),
+        )
+        .unwrap();
+    run_as(fixture, 42, 12, 102, control);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        record.id
+    );
+    // A bad clear_child_tid address is checked only after the nonfinal
+    // membership reservation. The host must still see both page memberships.
+    control.set_clear_child_tid(u64::MAX);
+    let live = fixture.page.live();
+    let entry = control.entry().unwrap();
+    let state = fixture.page.state(entry.index());
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[8] = 93;
+    let route = arm_call(fixture, control, &mut service, &mut frame).unwrap();
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Forward
+    );
+    assert_eq!(fixture.page.live(), live);
+    fixture.zone.clear_current(fixture.slot);
+    assert_eq!(fixture.page.state(entry.index()), state);
+}
+
+#[test]
 fn arm_two_live_threads_exit_group_ends_group_with_status() {
     #[derive(Clone, Copy, Debug)]
     enum Siblings {
