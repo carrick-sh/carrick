@@ -67,7 +67,7 @@ impl BirthAdmissionGuard {
         page: super::objects::ThreadLifecycleLease,
         after_gate_read: impl FnOnce(),
     ) -> Result<Self, KernelOperationError> {
-        if page.gate() == carrick_el1_abi::GateState::Closed {
+        if page.gate().is_terminal() {
             return Err(KernelOperationError::LifecycleAdmissionBusy(task));
         }
         if !page.serves_threads() || page.gate() == carrick_el1_abi::GateState::HostOnly {

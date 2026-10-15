@@ -340,8 +340,7 @@ pub trait Lifecycle {
         let _ = self
             .gate_word()
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |raw| {
-                (GateState::from_raw(raw) != GateState::Closed)
-                    .then_some(GateState::HostOnly as u32)
+                (!GateState::from_raw(raw).is_terminal()).then_some(GateState::HostOnly as u32)
             });
     }
     /// Terminal admission close, from any state.
@@ -452,7 +451,7 @@ pub trait Lifecycle {
     /// The caller of group exit has already released its live membership;
     /// its own entry is consumed by Closing rather than by CancelMembers.
     fn retire_closing_caller(&self, entry: EntryRef) -> Result<(), TransitionError> {
-        if self.gate() != GateState::Closed {
+        if !self.gate().is_terminal() {
             return Err(TransitionError::GateClosed(self.gate()));
         }
         self.transition(

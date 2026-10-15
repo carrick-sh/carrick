@@ -154,6 +154,23 @@ pub enum GateState {
     HostOnly = 4,
 }
 impl GateState {
+    /// Whether authority permits ring service. Individual operations must
+    /// still satisfy their fork/exec admission rules.
+    pub const fn serves_ring(self) -> bool {
+        match self {
+            Self::Open | Self::ForkClosing | Self::AwaitingExecBinding => true,
+            Self::Closed | Self::HostOnly => false,
+        }
+    }
+
+    /// Terminal close cancels host publication too; host-only service does not.
+    pub const fn is_terminal(self) -> bool {
+        match self {
+            Self::Closed => true,
+            Self::Open | Self::ForkClosing | Self::AwaitingExecBinding | Self::HostOnly => false,
+        }
+    }
+
     pub const fn from_raw(raw: u32) -> Self {
         match raw {
             0 => Self::Open,

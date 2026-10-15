@@ -514,7 +514,7 @@ impl PreparedThreadClone {
             } else if matches!(lane, PublicationLane::HostClone { host_birth: true }) {
                 publication_valid = false;
             }
-            if page.gate() == carrick_core::lifecycle::GateState::Closed {
+            if page.gate().is_terminal() {
                 thread.control_slot().request_host_exit();
             }
         }

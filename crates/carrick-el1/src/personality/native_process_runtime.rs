@@ -1334,7 +1334,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         };
         let group_key = Self::group_key(source.zone, address, page, visible_pid);
         let mut state = self.state.lock();
-        if page.gate() == carrick_el1_abi::GateState::Closed {
+        if !page.gate().serves_ring() {
             return Err(NativeProcessError::Stale);
         }
         let (runtime, process) = state
@@ -1564,7 +1564,7 @@ impl IssuedHostThread {
             || resources.address != address
             || resources.file_table != self.file_table
             || core::ptr::eq(resources.control, control)
-            || resources.page.gate() == carrick_el1_abi::GateState::Closed
+            || !resources.page.gate().serves_ring()
             || resources.page.live() <= 1
         {
             return Err(NativeProcessError::Stale);
@@ -4530,7 +4530,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             .owner
             .task_mut(self.key)
             .map_err(|_| carrick_personality_linux::identity::ESRCH)?;
-        if task.native().resources().page.gate() == carrick_el1_abi::GateState::Closed {
+        if !task.native().resources().page.gate().serves_ring() {
             return Err(-11);
         }
         if task.has_thread(child_tid) {

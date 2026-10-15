@@ -92,7 +92,7 @@ where
     pub fn admitted(&self) -> bool {
         // Pair claim-before-gate with terminal close-before-claimed_count.
         // Either the fork observes Closed or Closing observes this claim.
-        self.0.gate() != carrick_core_abi::lifecycle::GateState::Closed
+        !self.0.gate().is_terminal()
     }
 }
 impl<P: core::ops::Deref> Drop for ForkPublicationClaim<P>

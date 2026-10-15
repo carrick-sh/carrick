@@ -1502,8 +1502,6 @@ where
         let admitted = match publication.admit() {
             Ok(admitted) => admitted,
             Err(error) => {
-                drop(topology);
-                drop(parent_mutation);
                 for (address, bytes) in [
                     (request.parent_tid_addr, parent_tid_original.as_ref()),
                     (request.pidfd_out, pidfd_original.as_ref()),
@@ -1520,6 +1518,8 @@ where
                 {
                     return Err(ops.fail_stop(error));
                 }
+                drop(topology);
+                drop(parent_mutation);
                 rollback_pidfd(installed_pidfd);
                 drop(prepared_mm);
                 drop(owner_child_publication);
