@@ -685,7 +685,8 @@ test-kvm *ARGS:
     red=()
     while IFS= read -r selection; do
         [ -n "$selection" ] || continue
-        {{_admit}} {{_cargo}} test --locked --no-fail-fast $selection {{ARGS}} </dev/null || red+=("$selection")
+        {{_admit}} {{_cargo}} test --locked --no-fail-fast $selection {{ARGS}} -- --skip serial_host </dev/null || red+=("$selection")
+        env RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test --locked --no-fail-fast $selection {{ARGS}} serial_host </dev/null || red+=("$selection (serial_host)")
     done <<< "$selections"
     if [ "${#red[@]}" -ne 0 ]; then
         printf 'test-kvm: red kvm-lane selection: %s\n' "${red[@]}" >&2
