@@ -552,7 +552,7 @@ impl Kernel {
         // before changing either graph membership or the published ABI entry.
         let control_lease = context.thread.control_lease();
         let lifecycle = control_lease.lifecycle();
-        let live_membership = if matches!(lane, ThreadRetirementLane::ExitedInZone { .. }) {
+        let mut live_membership = if matches!(lane, ThreadRetirementLane::ExitedInZone { .. }) {
             None
         } else {
             Some(
@@ -635,7 +635,10 @@ impl Kernel {
                     owned
                         .control
                         .lifecycle()
-                        .retire_published(owned.entry)
+                        .retire_published_host_member(
+                            owned.entry,
+                            live_membership.take().expect("host member reservation"),
+                        )
                         .unwrap_or_else(|error| {
                             carrick_fatal!(
                                 "kernel::thread_retirement",
