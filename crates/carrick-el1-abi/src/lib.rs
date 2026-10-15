@@ -146,6 +146,17 @@ pub const EL1_FRAME_GRANT_MAILBOX_BASE: u64 = EL1_REGION_BASE + EL1_FRAME_GRANT_
 pub const EL1_FRAME_GRANT_RESIDENCY_OFFSET: u64 = EL1_CURRENT_TASKS_OFFSET + 0x30_000;
 pub const EL1_FRAME_GRANT_RESIDENCY_BASE: u64 = EL1_REGION_BASE + EL1_FRAME_GRANT_RESIDENCY_OFFSET;
 
+/// One shared external-signal ingress reservation in either ISA's kernel
+/// region, after the frame residency inventory. Its concrete identity type
+/// is supplied by the live native thread-custody protocol.
+pub const EL1_SIGNAL_INGRESS_OFFSET: u64 = (EL1_FRAME_GRANT_RESIDENCY_OFFSET
+    + core::mem::size_of::<FrameGrantResidencyTable>() as u64
+    + 63)
+    & !63;
+pub const EL1_SIGNAL_INGRESS_RESERVED_SIZE: u64 = 0x4000;
+pub const EL1_SIGNAL_INGRESS_BASE: u64 = EL1_REGION_BASE + EL1_SIGNAL_INGRESS_OFFSET;
+pub const X86_CPL0_SIGNAL_INGRESS_BASE: u64 = X86_CPL0_REGION_BASE + EL1_SIGNAL_INGRESS_OFFSET;
+
 /// Guest VA/IPA base of the 2 MiB AArch64 kernel control window (L1 index 180).
 pub const AARCH64_KERNEL_CONTROL_BASE: u64 =
     carrick_mmu_core::aarch64::owner_fork::KERNEL_CONTROL_BASE;
@@ -692,12 +703,9 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         EL1_RESERVATIONS_END,
         RESERVATION_PROTOCOL_VERSION,
         SIGNAL_INGRESS_PROTOCOL,
-        core::mem::size_of::<ExternalSignalRecord>() as u64,
-        core::mem::align_of::<ExternalSignalRecord>() as u64,
+        EL1_SIGNAL_INGRESS_OFFSET,
+        EL1_SIGNAL_INGRESS_RESERVED_SIZE,
         SIGNAL_INGRESS_CAPACITY as u64,
-        core::mem::size_of::<SharedSignalIngressQueue>() as u64,
-        core::mem::align_of::<SharedSignalIngressQueue>() as u64,
-        SIGNAL_INGRESS_OFFSETS_HASH,
         MM_PORTAL_PROTOCOL,
         MM_TRANSFER_LAYOUT_HASH,
         MM_PORTAL_BIND_ESR,
@@ -2700,6 +2708,11 @@ const _: () = assert!(
     EL1_FRAME_GRANT_RESIDENCY_OFFSET + core::mem::size_of::<FrameGrantResidencyTable>() as u64
         <= EL1_CURRENT_TASKS_OFFSET + EL1_CURRENT_TASKS_SIZE
 );
+const _: () = assert!(
+    EL1_SIGNAL_INGRESS_OFFSET + EL1_SIGNAL_INGRESS_RESERVED_SIZE
+        <= EL1_CURRENT_TASKS_OFFSET + EL1_CURRENT_TASKS_SIZE
+);
+const _: () = assert!(EL1_SIGNAL_INGRESS_OFFSET.is_multiple_of(64));
 const _: () =
     assert!(EL1_CURRENT_TASKS_OFFSET + EL1_CURRENT_TASKS_SIZE <= EL1_BOOTSTRAP_METADATA_OFFSET);
 const _: () =
@@ -3916,7 +3929,7 @@ impl Default for InotifyNameCache {
 }
 
 const _: () = {
-    assert!(EL1_ABI_LAYOUT_HASH == 0x511e505623bce97f);
+    assert!(EL1_ABI_LAYOUT_HASH == 0xb30ac8dfa9f34668);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);
