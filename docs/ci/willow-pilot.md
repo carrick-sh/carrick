@@ -87,7 +87,9 @@ times per job key.
 ### Cumulative merge groups (#402)
 
 Both controllers check supersession in the shared `Github::vet` path,
-for reservations and actual assignments. A shallower merge group is skipped
+for reservations. Actual assignments retain ordinary admission checks and
+serve normally regardless of queue depth: withholding approval would make
+the job-start hook fail at its deadline. A shallower merge group is skipped
 while a deeper queued group contains it, or that successor's workflow passed.
 The proof requires a complete merge-queue listing, trusted heads, a pending
 or successful latest workflow run, and a GitHub comparison whose merge base
@@ -100,17 +102,16 @@ Superseded demand does not enter the durable refusal ledger: if the successor
 fails or leaves the queue, the shallower group can be served again. If a
 Contabo reservation becomes superseded during provisioning, its pre-JIT clone
 is released through the existing owned teardown path; registered or assigned
-runners retain their normal lifecycle. A diverted
-actual assignment is durably refused before approval, just like a stale group.
-Cancellation uses the existing workflow-run endpoint as an authorization
-check; Actions write (or classic/OAuth repo scope) is required. Denial is
-logged and leaves skip-only behavior. Controllers never expand token rights.
-The standing credential documented below has Actions read-only; the owner
-must grant write separately if cancellation is desired.
+runners retain their normal lifecycle. Supersession never cancels a workflow
+run or records a durable refusal, including during provisioning. Superseded
+provisioning returns normally without backoff or freezing. Cancelled deeper
+runs, rebuilt queues without a qualifying successor, and partial queue
+listings preserve ordinary service.
 
 The director must qualify HEADGREEN on the first live batch after deployment:
-cancelling a non-head group must not eject its PR when the head passes, and
-the deepest group's baseline receipt dependencies must still resolve.
+a skipped group must resume when its successor fails, is cancelled or leaves
+the queue, and the deepest group's baseline receipt dependencies must still
+resolve.
 
 ### Actual assignments are re-vetted (#333)
 
@@ -127,7 +128,7 @@ same credential-free rendezvous as cloudmac ([mac-jit.md](mac-jit.md)):
 2. A dedicated assignment worker reads that request as root through the
    scoped guest agent, with a one-second timer between passes and under the same flock. It authenticates the job by this
    clone's runner id and the exact `willow-kvm` label set, re-vets the actual
-   run exactly as demand (`Github::vet`), and fsyncs the actual job into the
+   run through `Github::vet_assignment` (ordinary admission without supersession), and fsyncs the actual job into the
    ledger (`assigned`, `assigned_key`).
 3. Only then does it publish the root-owned `approved-policy`, bound to the
    actual run, attempt and SHA; the hook verifies it and starts the job. An
