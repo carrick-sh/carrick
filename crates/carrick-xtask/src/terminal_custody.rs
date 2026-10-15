@@ -53,23 +53,23 @@ impl<'ast> Visit<'ast> for DecisionFinder {
     }
 
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
-        if let syn::Expr::Path(path) = &*node.func {
-            if let Some(last) = path.path.segments.last() {
-                match last.ident.to_string().as_str() {
-                    "live" => {
-                        self.rules.insert("live");
-                    }
-                    "claimed_count" => {
-                        self.rules.insert("claimed_count");
-                    }
-                    "task_is_live" => {
-                        self.rules.insert("task_is_live");
-                    }
-                    "hardware_live_root" => {
-                        self.rules.insert("hardware_live_root");
-                    }
-                    _ => {}
+        if let syn::Expr::Path(path) = &*node.func
+            && let Some(last) = path.path.segments.last()
+        {
+            match last.ident.to_string().as_str() {
+                "live" => {
+                    self.rules.insert("live");
                 }
+                "claimed_count" => {
+                    self.rules.insert("claimed_count");
+                }
+                "task_is_live" => {
+                    self.rules.insert("task_is_live");
+                }
+                "hardware_live_root" => {
+                    self.rules.insert("hardware_live_root");
+                }
+                _ => {}
             }
         }
         visit::visit_expr_call(self, node);
