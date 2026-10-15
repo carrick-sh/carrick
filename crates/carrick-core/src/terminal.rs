@@ -57,7 +57,7 @@ pub struct ProcessTerminalIdentity {
 }
 
 impl ProcessTerminalIdentity {
-    pub fn from_exit(
+    pub(crate) fn from_exit(
         task: TaskKey,
         address: AddressContext<RootGpa>,
         status: TerminationStatus,
@@ -90,29 +90,32 @@ pub struct MemberSet {
 }
 
 impl MemberSet {
-    pub fn new(
+    pub(crate) fn new(
         process: ProcessTerminalIdentity,
-        pool: Vec<EntryRef>,
-        host: Vec<HostThreadRetirementReceipt>,
-        capacity: usize,
-    ) -> Option<Self> {
-        if pool.len() + host.len() > capacity
-            || pool
-                .iter()
-                .enumerate()
-                .any(|(i, entry)| pool[..i].contains(entry))
-            || host
-                .iter()
-                .enumerate()
-                .any(|(i, receipt)| host[..i].contains(receipt))
-        {
-            return None;
-        }
-        Some(Self {
+        mut pool: Vec<EntryRef>,
+        mut host: Vec<HostThreadRetirementReceipt>,
+    ) -> Self {
+        // One identity has one expected receipt, even if two registry views
+        // named it during a handoff. The exact value remains authoritative.
+        let mut seen_pool = Vec::new();
+        pool.retain(|entry| {
+            !seen_pool.contains(entry) && {
+                seen_pool.push(*entry);
+                true
+            }
+        });
+        let mut seen_host = Vec::new();
+        host.retain(|receipt| {
+            !seen_host.contains(receipt) && {
+                seen_host.push(*receipt);
+                true
+            }
+        });
+        Self {
             process,
             pool: pool.into_boxed_slice(),
             host: host.into_boxed_slice(),
-        })
+        }
     }
     pub fn pool(&self) -> &[EntryRef] {
         &self.pool
@@ -120,7 +123,23 @@ impl MemberSet {
     pub fn host(&self) -> &[HostThreadRetirementReceipt] {
         &self.host
     }
-    pub fn completed(
+    /// Move one exact expected host receipt with its retained execution
+    /// binding. A duplicate or absent identity cannot mint a new proof.
+    pub fn rehome_host(
+        &mut self,
+        old: HostThreadRetirementReceipt,
+        new: HostThreadRetirementReceipt,
+    ) -> bool {
+        let Some(index) = self.host.iter().position(|receipt| *receipt == old) else {
+            return false;
+        };
+        if old != new && self.host.contains(&new) {
+            return false;
+        }
+        self.host[index] = new;
+        true
+    }
+    pub(crate) fn completed(
         &self,
         pool: &[EntryRef],
         host: &[HostThreadRetirementReceipt],
@@ -275,6 +294,13 @@ pub enum RetirementVerdict {
 }
 
 impl TerminalCustody<Process, Live> {
+    pub fn admitted_exit(
+        task: TaskKey,
+        address: AddressContext<RootGpa>,
+        status: TerminationStatus,
+    ) -> Self {
+        Self::admitted(ProcessTerminalIdentity::from_exit(task, address, status))
+    }
     pub fn admitted(identity: ProcessTerminalIdentity) -> Self {
         Self {
             identity,
@@ -292,11 +318,26 @@ impl TerminalCustody<Process, Live> {
 }
 
 impl TerminalCustody<Process, Closing> {
-    pub fn cancel_members(&self, members: MemberSet) -> Option<RetirementVerdict> {
-        (self.identity == members.process).then_some(RetirementVerdict::CancelMembers {
+    pub fn cancel_members(
+        &self,
+        pool: Vec<EntryRef>,
+        host: Vec<HostThreadRetirementReceipt>,
+    ) -> RetirementVerdict {
+        let members = MemberSet::new(self.identity, pool, host);
+        RetirementVerdict::CancelMembers {
             process: self.identity,
             members,
-        })
+        }
+    }
+    pub fn complete_members(
+        &self,
+        members: &MemberSet,
+        pool: &[EntryRef],
+        host: &[HostThreadRetirementReceipt],
+    ) -> Option<CompletedMemberReceipts> {
+        (members.process == self.identity)
+            .then(|| members.completed(pool, host))
+            .flatten()
     }
     pub fn can_settle(&self, page: &impl Lifecycle, receipts: &CompletedMemberReceipts) -> bool {
         self.identity == receipts.process && page.live() == 0 && page.claimed_count() == 0
@@ -430,11 +471,46 @@ mod tests {
             TerminationStatus::exited(0),
         );
         let entry = EntryRef::new(0, 1);
-        let members = MemberSet::new(identity, alloc::vec![entry], Vec::new(), 1).unwrap();
+        let members = MemberSet::new(identity, alloc::vec![entry], Vec::new());
         let closing = TerminalCustody::<Process, Live>::admitted(identity).close_gate(&page);
-        assert!(closing.cancel_members(members.clone()).is_some());
+        assert!(matches!(
+            closing.cancel_members(alloc::vec![entry], Vec::new()),
+            RetirementVerdict::CancelMembers { .. }
+        ));
         assert!(members.completed(&[], &[]).is_none());
         let receipt = members.completed(&[entry], &[]).unwrap();
         assert!(closing.settle(&page, receipt).is_ok());
+    }
+
+    #[test]
+    fn rehomed_host_receipt_replaces_exact_pending_identity() {
+        let identity = ProcessTerminalIdentity::from_exit(
+            TaskKey {
+                id: TaskId::from_registry_allocation(NonZeroI32::new(41).unwrap()),
+                serial: TaskSerial::from_raw_u64(11).unwrap(),
+            },
+            AddressContext {
+                root: RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(0x10000)).unwrap(),
+                mm: carrick_guest_arch::MmGeneration::new(NonZeroU64::new(1).unwrap()),
+                generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::new(1).unwrap()),
+            },
+            TerminationStatus::exited(7),
+        );
+        let old = HostThreadRetirementReceipt::from_binding(ExecutionBinding {
+            task: EntryTaskKey::from_raw(42),
+            generation: EntryGeneration::from_raw(1),
+            mm: carrick_core_abi::entry::EntryMmKey::from_raw(5),
+            thread_generation: EntryThreadGeneration::from_raw(2),
+        });
+        let new = HostThreadRetirementReceipt::from_binding(ExecutionBinding {
+            task: EntryTaskKey::from_raw(42),
+            generation: EntryGeneration::from_raw(2),
+            mm: carrick_core_abi::entry::EntryMmKey::from_raw(5),
+            thread_generation: EntryThreadGeneration::from_raw(2),
+        });
+        let mut members = MemberSet::new(identity, Vec::new(), alloc::vec![old]);
+        assert!(members.rehome_host(old, new));
+        assert!(members.completed(&[], &[old]).is_none());
+        assert!(members.completed(&[], &[new]).is_some());
     }
 }
