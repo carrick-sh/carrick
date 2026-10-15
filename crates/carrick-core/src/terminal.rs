@@ -31,6 +31,16 @@ pub struct Terminal;
 pub struct Closing;
 pub struct Settled;
 
+/// Raw task membership supplied by the graph that owns its registry. Core
+/// decides whether an absent task makes a terminal retry already retired.
+pub trait TaskMembership {
+    fn contains_task(&self, task: TaskId) -> bool;
+}
+
+pub fn terminal_task_absent(graph: &impl TaskMembership, task: TaskId) -> bool {
+    !graph.contains_task(task)
+}
+
 mod sealed {
     pub trait Sealed {}
 }
