@@ -15,6 +15,20 @@ pub enum ExpectedExitReceipt {
     AlreadyExited,
 }
 
+/// Whether a page incarnation still requires a retained control reference
+/// while preparing terminal custody. Recycled entries carry no such reference.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub enum PoolControlDisposition {
+    Retain,
+    Released,
+}
+
 /// The exit path recorded on one exact member's retained custody. A pool
 /// entry word can be reaped or restocked while that member is unregistering.
 #[derive(
@@ -70,22 +84,42 @@ impl MemberExitCustody {
     pub fn host_exit_requested(&self) -> bool {
         self.word.load(Ordering::Acquire) & 1 != 0
     }
-    pub fn request_host_exit(&self) {
-        self.word.fetch_or(1, Ordering::Release);
-    }
     pub fn host_receipt_published(&self) -> bool {
         self.word.load(Ordering::Acquire) & 2 != 0
     }
+}
+/// The storage owner alone holds mutation authority. Borrowed member views
+/// expose custody observations, never the capability that resets or publishes.
+#[repr(transparent)]
+#[derive(::core::fmt::Debug, ::core::default::Default)]
+pub struct MemberControlAuthority {
+    custody: MemberExitCustody,
+}
+impl MemberControlAuthority {
+    pub const fn new() -> Self {
+        Self {
+            custody: MemberExitCustody::new(),
+        }
+    }
+    pub fn custody(&self) -> &MemberExitCustody {
+        &self.custody
+    }
+    pub fn request_host_exit(&self) {
+        self.custody.word.fetch_or(1, Ordering::Release);
+    }
     pub fn publish_host_receipt(&self) {
-        self.word.fetch_or(2 | GRAPH_REGISTERED, Ordering::Release);
+        self.custody
+            .word
+            .fetch_or(2 | GRAPH_REGISTERED, Ordering::Release);
     }
     pub fn reserve_reset(&self) -> Result<MemberReset<'_>, TransitionError> {
-        self.word
+        self.custody
+            .word
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |word| {
                 (word & (REFERENCES | RESETTING) == 0).then_some(RESETTING)
             })
             .map_err(|_| TransitionError::StaleGeneration)?;
-        Ok(MemberReset(self))
+        Ok(MemberReset(&self.custody))
     }
 }
 /// Exclusive reset authority; retained graph references make it unavailable.
@@ -211,6 +245,20 @@ pub fn retire_host_member(
 /// The exact page owns the storage and retains its ledger notification authority.
 /// Linux payload initialization happens between reserve and release publication.
 pub trait Lifecycle {
+    fn pool_control_disposition(&self, entry: EntryRef) -> PoolControlDisposition {
+        if self
+            .state(entry.index())
+            .is_some_and(|(generation, state)| {
+                generation == entry.generation()
+                    && !matches!(state, EntryState::Reaped | EntryState::Revoked)
+            })
+        {
+            PoolControlDisposition::Retain
+        } else {
+            PoolControlDisposition::Released
+        }
+    }
+    fn process_exit_custody(&self) -> &crate::terminal::ProcessExitCustody;
     fn host_birth_receipt_returned_exact(
         &self,
         index: usize,
@@ -790,11 +838,15 @@ mod membership_tests {
     use super::*;
 
     struct Page {
+        terminal: crate::terminal::ProcessExitCustody,
         gate: AtomicU32,
         live: AtomicU32,
     }
 
     impl Lifecycle for Page {
+        fn process_exit_custody(&self) -> &crate::terminal::ProcessExitCustody {
+            &self.terminal
+        }
         fn host_birth_receipt_returned_exact(
             &self,
             _: usize,
@@ -823,6 +875,7 @@ mod membership_tests {
     #[test]
     fn unpublished_nonfinal_exit_restores_live_in_release() {
         let page = Page {
+            terminal: crate::terminal::ProcessExitCustody::new(),
             gate: AtomicU32::new(GateState::Open as u32),
             live: AtomicU32::new(2),
         };

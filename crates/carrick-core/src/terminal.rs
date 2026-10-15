@@ -23,7 +23,7 @@ pub struct PoolMemberObservation<'a> {
     /// entry has since been reaped and reused. Host retirement must publish
     /// its typed receipt on this same slot.
     pub member: &'a dyn MemberControl,
-    pub expected_host: Option<HostThreadRetirementReceipt>,
+    pub expected_host: HostThreadRetirementReceipt,
 }
 
 pub enum HostMemberObservation<'a> {
@@ -47,9 +47,17 @@ fn task_id_from_binding(binding: ExecutionBinding) -> Option<TaskId> {
 
 pub struct Thread;
 /// One process incarnation owns exactly one terminal admission claim.
-#[derive(Default)]
+#[repr(transparent)]
+#[derive(::core::fmt::Debug, ::core::default::Default)]
 pub struct ProcessExitCustody {
-    begun: bool,
+    begun: core::sync::atomic::AtomicU32,
+}
+impl ProcessExitCustody {
+    pub const fn new() -> Self {
+        Self {
+            begun: core::sync::atomic::AtomicU32::new(0),
+        }
+    }
 }
 
 pub struct Process;
@@ -350,17 +358,24 @@ impl TerminalCustody<Process, Live> {
     }
 
     pub fn begin_exit(
-        state: &mut ProcessExitCustody,
         page: &impl Lifecycle,
         task: TaskKey,
         address: AddressContext<RootGpa>,
         status: TerminationStatus,
     ) -> Result<TerminalCustody<Process, Closing>, MembershipFloor> {
-        if state.begun {
-            return Err(MembershipFloor);
-        }
-        let caller = page.reserve_closing_caller_exit()?;
-        state.begun = true;
+        use core::sync::atomic::Ordering;
+        let state = page.process_exit_custody();
+        state
+            .begun
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| MembershipFloor)?;
+        let caller = match page.reserve_closing_caller_exit() {
+            Ok(caller) => caller,
+            Err(error) => {
+                state.begun.store(0, Ordering::Release);
+                return Err(error);
+            }
+        };
         page.close();
         caller.publish();
         Ok(TerminalCustody {
@@ -408,11 +423,7 @@ impl TerminalCustody<Process, Closing> {
             let returned = match kind {
                 MemberExitKind::InZone => true,
                 MemberExitKind::HostRetiring => {
-                    observation.member.host_retirement().is_some_and(|receipt| {
-                        observation
-                            .expected_host
-                            .is_some_and(|expected| expected == receipt)
-                    })
+                    observation.member.host_retirement() == Some(observation.expected_host)
                 }
                 MemberExitKind::Active | MemberExitKind::Stale => false,
             };
@@ -536,10 +547,14 @@ mod tests {
     use core::sync::atomic::AtomicU32;
 
     struct Page {
+        terminal: crate::terminal::ProcessExitCustody,
         gate: AtomicU32,
         live: AtomicU32,
     }
     impl Lifecycle for Page {
+        fn process_exit_custody(&self) -> &crate::terminal::ProcessExitCustody {
+            &self.terminal
+        }
         fn host_birth_receipt_returned_exact(
             &self,
             _: usize,
@@ -568,6 +583,7 @@ mod tests {
     #[test]
     fn closing_rejects_caller_claim_without_member_receipts() {
         let page = Page {
+            terminal: crate::terminal::ProcessExitCustody::new(),
             gate: AtomicU32::new(0),
             live: AtomicU32::new(0),
         };
@@ -630,6 +646,7 @@ mod tests {
     #[test]
     fn second_process_close_cannot_consume_another_live_member() {
         let page = Page {
+            terminal: crate::terminal::ProcessExitCustody::new(),
             gate: AtomicU32::new(0),
             live: AtomicU32::new(2),
         };
@@ -642,9 +659,7 @@ mod tests {
             mm: carrick_guest_arch::MmGeneration::new(NonZeroU64::new(1).unwrap()),
             generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::new(1).unwrap()),
         };
-        let mut state = ProcessExitCustody::default();
         let _first = TerminalCustody::<Process, Live>::begin_exit(
-            &mut state,
             &page,
             task,
             address,
@@ -653,7 +668,6 @@ mod tests {
         .unwrap();
         assert!(
             TerminalCustody::<Process, Live>::begin_exit(
-                &mut state,
                 &page,
                 task,
                 address,
@@ -683,6 +697,7 @@ mod tests {
             }
         }
         let page = Page {
+            terminal: crate::terminal::ProcessExitCustody::new(),
             gate: AtomicU32::new(0),
             live: AtomicU32::new(0),
         };
@@ -706,10 +721,16 @@ mod tests {
             exit: crate::lifecycle::MemberExitCustody::new(),
             host: None,
         };
+        let receipt = HostThreadRetirementReceipt::from_binding(ExecutionBinding {
+            task: EntryTaskKey::from_raw(42),
+            generation: EntryGeneration::from_raw(12),
+            mm: carrick_core_abi::entry::EntryMmKey::from_raw(1),
+            thread_generation: EntryThreadGeneration::from_raw(102),
+        });
         let observation = [PoolMemberObservation {
             entry,
             member: &in_zone,
-            expected_host: None,
+            expected_host: receipt,
         }];
         assert!(
             custody
@@ -723,12 +744,6 @@ mod tests {
                 .is_some()
         );
 
-        let receipt = HostThreadRetirementReceipt::from_binding(ExecutionBinding {
-            task: EntryTaskKey::from_raw(42),
-            generation: EntryGeneration::from_raw(12),
-            mm: carrick_core_abi::entry::EntryMmKey::from_raw(1),
-            thread_generation: EntryThreadGeneration::from_raw(102),
-        });
         let host = Member {
             entry,
             exit: crate::lifecycle::MemberExitCustody::new(),
@@ -737,7 +752,7 @@ mod tests {
         let observation = [PoolMemberObservation {
             entry,
             member: &host,
-            expected_host: Some(receipt),
+            expected_host: receipt,
         }];
         assert!(
             custody
@@ -750,28 +765,15 @@ mod tests {
                 .observe_members(&page, &members, &observation, &[])
                 .is_some()
         );
-        let unspecified = [PoolMemberObservation {
-            entry,
-            member: &host,
-            expected_host: None,
-        }];
-        assert!(
-            custody
-                .observe_members(&page, &members, &unspecified, &[])
-                .is_none(),
-            "HostRetiring cannot accept an unspecified receipt identity"
-        );
         let wrong_receipt = [PoolMemberObservation {
             entry,
             member: &host,
-            expected_host: Some(HostThreadRetirementReceipt::from_binding(
-                ExecutionBinding {
-                    task: EntryTaskKey::from_raw(42),
-                    generation: EntryGeneration::from_raw(13),
-                    mm: carrick_core_abi::entry::EntryMmKey::from_raw(1),
-                    thread_generation: EntryThreadGeneration::from_raw(102),
-                },
-            )),
+            expected_host: HostThreadRetirementReceipt::from_binding(ExecutionBinding {
+                task: EntryTaskKey::from_raw(42),
+                generation: EntryGeneration::from_raw(13),
+                mm: carrick_core_abi::entry::EntryMmKey::from_raw(1),
+                thread_generation: EntryThreadGeneration::from_raw(102),
+            }),
         }];
         assert!(
             custody
@@ -787,7 +789,7 @@ mod tests {
         let wrong_generation = [PoolMemberObservation {
             entry,
             member: &recycled,
-            expected_host: Some(receipt),
+            expected_host: receipt,
         }];
         assert!(
             custody
