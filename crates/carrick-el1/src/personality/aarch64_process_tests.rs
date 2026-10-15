@@ -2975,20 +2975,25 @@ fn arm_raw_exit_decline_after_membership_reservation_restores_live() {
         fixture.zone.switch_in_full(fixture.slot).unwrap().record,
         record.id
     );
-    // A bad clear_child_tid address is checked only after the nonfinal
+    // A failed clear_child_tid copy is checked only after the nonfinal
     // membership reservation. The host must still see both page memberships.
-    control.set_clear_child_tid(u64::MAX);
+    let mut child_tid = 42_u32;
+    control.set_clear_child_tid((&raw mut child_tid).addr() as u64);
     let live = fixture.page.live();
     let entry = control.entry().unwrap();
     let state = fixture.page.state(entry.index());
     let mut frame = carrick_el1_abi::TrapFrame::default();
     frame.x[8] = 93;
-    let route = arm_call(fixture, control, &mut service, &mut frame).unwrap();
+    super::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
+    let route = arm_call(fixture, control, &mut service, &mut frame);
+    super::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
+    let route = route.unwrap();
     assert_eq!(
         route,
         carrick_personality_linux::dispatch::CompletionRoute::HostCustody
     );
     assert_eq!(fixture.page.live(), live);
+    assert_eq!(child_tid, 42);
     fixture.zone.clear_current(fixture.slot);
     assert_eq!(fixture.page.state(entry.index()), state);
     assert!(leader_sees_thread(fixture, &mut service, 42));
