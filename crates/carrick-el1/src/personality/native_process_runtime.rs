@@ -9625,6 +9625,18 @@ mod tests {
     fn bucket_contention_semtimedop() {
         blocked_ipc_signal_contract(3, true);
     }
+    #[test]
+    fn arm_timed_semop_expires_at_shared_counter_deadline() {
+        blocked_ipc_signal_contract(4, false);
+    }
+    #[test]
+    fn msgrcv_resume_rejects_overflowing_msgp_and_restores_message() {
+        blocked_ipc_signal_contract(5, false);
+    }
+    #[test]
+    fn failed_ipc_enqueue_returns_timer_admission() {
+        blocked_ipc_signal_contract(6, false);
+    }
     fn blocked_ipc_signal_contract(operation: u8, contended: bool) {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
@@ -9716,6 +9728,7 @@ mod tests {
             .unwrap();
         let queue = entry.msgget(0, 0o600).unwrap();
         let sem = entry.semget(0, 1, 0o600).unwrap();
+        let initial_timer_nodes = zone.timer_node_count();
         let waiting = core::sync::atomic::AtomicBool::new(false);
         let probe = |attempt| {
             if attempt == LOCK_SPINS {
@@ -9729,8 +9742,13 @@ mod tests {
         });
         entry.publication_wait_probe = Some(&probe);
         release_bucket_when_publisher_waits(guards, &waiting, || match operation {
-            0 => {
-                let result = entry.msgrcv(queue, UserVa::new(0), 0, 0, 8);
+            0 | 5 => {
+                let msgp = if operation == 5 {
+                    UserVa::new(u64::MAX - 3)
+                } else {
+                    UserVa::new(0)
+                };
+                let result = entry.msgrcv(queue, msgp, 0, 0, 8);
                 assert!(
                     matches!(result, Ok((IpcOutcome::Suspended, None))),
                     "msgrcv: {result:?}"
@@ -9754,13 +9772,41 @@ mod tests {
                     Ok(IpcOutcome::Suspended)
                 ));
             }
+            6 => {
+                let guard = zone
+                    .lock(
+                        ZoneTables::<ParkedContextWords>::bucket_of_with_context(1, 0x7000),
+                        &BoundedSpin(0),
+                    )
+                    .unwrap();
+                let record = entry.record.id;
+                let sequence = zone.next_seq(record);
+                for index in 0..(carrick_sched_core::ZONE_ENTRIES - 1) {
+                    zone.enqueue(&guard, record, sequence, 1, 0x7000, u32::MAX, index as u32)
+                        .unwrap();
+                }
+                drop(guard);
+                let ops = [carrick_personality_linux::ipc::LinuxSembuf {
+                    sem_num: 0,
+                    sem_op: -1,
+                    sem_flg: 0,
+                }];
+                assert!(matches!(
+                    entry.semop(sem, &ops, Some(core::time::Duration::from_nanos(1))),
+                    Err(error) if error == carrick_syscall_abi::LINUX_EAGAIN.guest_retval()
+                ));
+            }
             _ => {
                 let ops = [carrick_personality_linux::ipc::LinuxSembuf {
                     sem_num: 0,
                     sem_op: -1,
                     sem_flg: 0,
                 }];
-                let timeout = (operation == 3).then_some(core::time::Duration::from_secs(1));
+                let timeout = match operation {
+                    3 => Some(core::time::Duration::from_secs(1)),
+                    4 => Some(core::time::Duration::from_nanos(1)),
+                    _ => None,
+                };
                 let result = entry.semop(sem, &ops, timeout);
                 assert!(
                     matches!(result, Ok(IpcOutcome::Suspended)),
@@ -9770,6 +9816,12 @@ mod tests {
             }
         });
         entry.publication_wait_probe = None;
+        if operation == 6 {
+            assert_eq!(zone.timer_node_count(), initial_timer_nodes);
+            assert_eq!(runtime.graph.lock().pending.len(), 0);
+            assert_eq!(entry.semctl_getncnt(sem, 0), Ok(0));
+            return;
+        }
         if contended {
             assert!(
                 waiting.load(Ordering::Acquire),
@@ -9783,6 +9835,33 @@ mod tests {
         );
         assert!(entry.take_handoff_receipt().is_some());
         assert!(zone.slot(slot).current().is_none());
+        if operation == 4 {
+            assert_eq!(zone.timer_deadline(slot), Some(1001));
+            assert_eq!(zone.expire_timer(slot, 1001, (-11_i64) as u64), Ok(true));
+            let selected = zone.switch_in_full(slot).expect("timer must wake semop");
+            assert_eq!(zone.record_ref(selected.record), entry.record);
+            assert!(
+                matches!(entry.resume_pending_wait(), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == carrick_syscall_abi::LINUX_EAGAIN.guest_retval())
+            );
+            assert_eq!(entry.semctl_getncnt(sem, 0), Ok(0));
+            assert!(zone.timer_owner(slot).is_none());
+            return;
+        }
+        if operation == 5 {
+            assert!(matches!(
+                entry.msgsnd(queue, 1, &[7], 0),
+                Ok(IpcOutcome::Returned(_))
+            ));
+            let selected = zone.switch_in_full(slot).expect("message must wake msgrcv");
+            assert_eq!(zone.record_ref(selected.record), entry.record);
+            assert!(
+                matches!(entry.resume_pending_wait(), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == carrick_syscall_abi::LINUX_EFAULT.guest_retval())
+            );
+            assert!(
+                matches!(entry.msgrcv(queue, UserVa::new(0), 0, carrick_syscall_abi::ipc::IPC_NOWAIT, 8), Ok((IpcOutcome::Returned(_), Some((_, 1, data)))) if data == [7])
+            );
+            return;
+        }
         // Publish through the signal owner while execution capacity is released.
         entry
             .kill(
