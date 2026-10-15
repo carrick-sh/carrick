@@ -220,10 +220,10 @@ impl ThreadLifecycleLease {
 
     pub(in crate::kernel) fn for_fork(&self) -> Self {
         let child = Self::in_pool(self.0.pool.clone(), self.1.clone());
-        // Terminal exclusion includes inherited seccomp authority. Temporary
-        // fork/exec custody belongs to the parent and is not inherited.
-        if self.gate() == carrick_el1_abi::GateState::Closed {
-            child.close();
+        // Host-only service includes inherited seccomp authority. Terminal
+        // close and temporary fork/exec custody belong only to the parent.
+        if self.gate() == carrick_el1_abi::GateState::HostOnly {
+            child.decline_to_host();
         }
         child
     }

@@ -600,6 +600,45 @@ pub struct PreparedFork {
     start_release: ChildStartRelease,
 }
 
+/// Owns terminal publication custody through backend commit or rollback.
+/// The prepared kernel resources drop before the neutral claim is released.
+#[must_use = "retain publication custody through backend completion"]
+pub struct ForkPublication {
+    prepared: Option<PreparedFork>,
+    custody: Result<super::thread_ledger::HostForkPublication, KernelOperationError>,
+}
+impl ForkPublication {
+    pub fn admit(&mut self) -> Result<AdmittedFork<'_>, KernelOperationError> {
+        let prepared = self
+            .prepared
+            .take()
+            .ok_or(KernelOperationError::StaleReservation)?;
+        match &self.custody {
+            Ok(custody) => custody.validate(prepared.reservation.caller_task.key().id)?,
+            Err(_) => {
+                return Err(KernelOperationError::LifecycleAdmissionBusy(
+                    prepared.reservation.caller_task.key().id,
+                ));
+            }
+        }
+        Ok(AdmittedFork {
+            prepared,
+            _publication: self,
+        })
+    }
+}
+
+/// A fork that won terminal arbitration, borrowing its owned publication scope.
+pub struct AdmittedFork<'a> {
+    prepared: PreparedFork,
+    _publication: &'a ForkPublication,
+}
+impl AdmittedFork<'_> {
+    pub fn commit(self) -> Result<PublishedFork, KernelOperationError> {
+        self.prepared.publish()
+    }
+}
+
 impl PreparedFork {
     pub const fn child_id(&self) -> TaskId {
         self.reservation.child_id
@@ -618,6 +657,14 @@ impl PreparedFork {
 
     pub fn child_key(&self) -> TaskKey {
         self.child.key()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn resource_retention_probe(&self) -> impl Fn() -> bool + use<> {
+        let mm = Arc::downgrade(&self.child_shared.mm());
+        let files = Arc::downgrade(&self.child_resources.files());
+        let child = Arc::downgrade(&self.child);
+        move || mm.upgrade().is_some() || files.upgrade().is_some() || child.upgrade().is_some()
     }
 
     pub fn retain_stdio_only(&mut self) -> Result<(), KernelOperationError> {
@@ -682,6 +729,42 @@ impl PreparedFork {
     }
 
     pub fn commit(self) -> Result<PublishedFork, KernelOperationError> {
+        let mut publication = self.publication();
+        publication.admit()?.commit()
+    }
+
+    /// Claim publication before inspecting the terminal gate. Backends retain
+    /// this owner through their complete publication or rollback transaction.
+    pub fn publication(self) -> ForkPublication {
+        let page = self
+            .reservation
+            .caller_shared
+            .pending_signals()
+            .lifecycle_lease();
+        let custody = super::thread_ledger::HostForkPublication::acquire(
+            page,
+            self.reservation.caller_task.key().id,
+        );
+        ForkPublication {
+            prepared: Some(self),
+            custody,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn commit_with_publication_boundary(
+        self,
+        before_gate_check: impl FnOnce(),
+        after_gate_check: impl FnOnce(),
+    ) -> Result<PublishedFork, KernelOperationError> {
+        let mut publication = self.publication();
+        before_gate_check();
+        let admitted = publication.admit()?;
+        after_gate_check();
+        admitted.commit()
+    }
+
+    fn publish(self) -> Result<PublishedFork, KernelOperationError> {
         let Self {
             reservation,
             child,

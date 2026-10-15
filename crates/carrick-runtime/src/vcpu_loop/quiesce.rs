@@ -1549,6 +1549,49 @@ where
             rollback_pidfd(installed_pidfd);
             return Err(error);
         }
+        // Terminal arbitration precedes irreversible backend publication; the
+        // neutral claim stays live through both backend and kernel commit.
+        let mut publication = prepared_fork.publication();
+        let admitted = match publication.admit() {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                drop(topology);
+                drop(parent_mutation);
+                for (address, bytes) in [
+                    (request.parent_tid_addr, parent_tid_original.as_ref()),
+                    (request.pidfd_out, pidfd_original.as_ref()),
+                ] {
+                    if let (Some(address), Some(bytes)) = (address, bytes) {
+                        ops.write_fork_parent_output(memory, address, bytes, &mut owner_parent_admission)
+                            .unwrap_or_else(|_| {
+                                carrick_fatal!("vcpu_loop::quiesce_rollback", "failed to restore fork output after terminal close: address={address:?}")
+                            });
+                    }
+                }
+                if let Err(error) =
+                    ops.abort_and_rollback_prepared(prepared_backend, memory, !shares_mm)
+                {
+                    return Err(ops.fail_stop(error));
+                }
+                rollback_pidfd(installed_pidfd);
+                drop(prepared_mm);
+                drop(owner_child_publication);
+                drop(child_dispatcher);
+                drop(owner_parent_admission);
+                drop(_inventory_abandon);
+                process_fork_release.release();
+                drop(fork_clone_admission);
+                drop(process_fork_admission);
+                return match error {
+                    carrick_kernel::kernel::KernelOperationError::LifecycleAdmissionBusy(_) => {
+                        Ok(PreparedInProcessFork::Complete(Some(
+                            crate::linux_abi::LINUX_EAGAIN.guest_retval(),
+                        )))
+                    }
+                    error => Err(RuntimeError::Configuration(error.to_string())),
+                };
+            }
+        };
         if !shares_mm {
             let owner_receipt = if owner_child_publication.is_some() {
                 Some(ops.pending_owner_fork_receipt(memory).unwrap_or_else(|| {
@@ -1606,7 +1649,7 @@ where
         drop(parent_mutation);
 
         fork_stage_started = Instant::now();
-        let published = match prepared_fork.commit() {
+        let published = match admitted.commit() {
             Ok(published) => published,
             Err(error) => {
                 tracing::error!(

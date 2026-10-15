@@ -145,12 +145,13 @@ pub enum GateState {
     Open = 0,
     /// A fork transaction is settling claims; new claims back out.
     ForkClosing = 1,
-    /// Terminal for this page: exec, tracer, seccomp or opt-out. A new page
-    /// is stocked for the next incarnation.
+    /// Terminal process close. No host or in-zone birth may commit.
     Closed = 2,
     /// Exec committed; no conflicting operation owns this page, but its new
     /// image has not installed executable birth capacity yet.
     AwaitingExecBinding = 3,
+    /// In-zone service is disabled by host authority; host births remain legal.
+    HostOnly = 4,
 }
 impl GateState {
     pub const fn from_raw(raw: u32) -> Self {
@@ -158,6 +159,7 @@ impl GateState {
             0 => Self::Open,
             1 => Self::ForkClosing,
             3 => Self::AwaitingExecBinding,
+            4 => Self::HostOnly,
             _ => Self::Closed,
         }
     }

@@ -31,6 +31,7 @@ path = "src/entry.rs"
 path = "src/lib.rs"
 
 [dev-dependencies]
+carrick-abi = { path = "../carrick-abi" }
 carrick-kernel = { path = "../carrick-kernel", features = ["test-support"] }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-test-support = { path = "../carrick-test-support" }

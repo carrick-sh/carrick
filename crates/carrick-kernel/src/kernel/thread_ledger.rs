@@ -67,7 +67,10 @@ impl BirthAdmissionGuard {
         page: super::objects::ThreadLifecycleLease,
         after_gate_read: impl FnOnce(),
     ) -> Result<Self, KernelOperationError> {
-        if !page.serves_threads() || page.gate() == carrick_el1_abi::GateState::Closed {
+        if page.gate() == carrick_el1_abi::GateState::Closed {
+            return Err(KernelOperationError::LifecycleAdmissionBusy(task));
+        }
+        if !page.serves_threads() || page.gate() == carrick_el1_abi::GateState::HostOnly {
             return Ok(Self {
                 page: None,
                 awaiting_exec_binding: false,
@@ -82,7 +85,7 @@ impl BirthAdmissionGuard {
         };
         match close {
             Ok(()) => {}
-            Err(carrick_el1_abi::GateState::Closed) => {
+            Err(carrick_el1_abi::GateState::HostOnly) => {
                 return Ok(Self {
                     page: None,
                     awaiting_exec_binding: false,
@@ -119,6 +122,45 @@ impl Drop for BirthAdmissionGuard {
             } else {
                 let _ = page.reopen_after_fork();
             }
+        }
+    }
+}
+
+/// Retains the neutral publication claim through all host registry/resource
+/// rollback, then notifies the exact parked Closing continuation.
+pub(super) struct HostForkPublication {
+    claim:
+        Option<carrick_core::terminal::ForkPublicationClaim<super::objects::ThreadLifecycleLease>>,
+    page: super::objects::ThreadLifecycleLease,
+}
+impl HostForkPublication {
+    pub(super) fn acquire(
+        page: super::objects::ThreadLifecycleLease,
+        task: super::ids::TaskId,
+    ) -> Result<Self, KernelOperationError> {
+        let mut publication = Self { claim: None, page };
+        publication.claim = Some(
+            carrick_core::terminal::ForkPublicationClaim::acquire(publication.page.clone())
+                .map_err(|_| KernelOperationError::LifecycleAdmissionBusy(task))?,
+        );
+        Ok(publication)
+    }
+    pub(super) fn validate(&self, task: super::ids::TaskId) -> Result<(), KernelOperationError> {
+        if self.claim.as_ref().is_some_and(|claim| claim.admitted()) {
+            Ok(())
+        } else {
+            Err(KernelOperationError::LifecycleAdmissionBusy(task))
+        }
+    }
+}
+impl Drop for HostForkPublication {
+    fn drop(&mut self) {
+        drop(self.claim.take());
+        if let Some((mm, address)) = self.page.exit_wait()
+            && let Some(zone) = crate::el1_zone::zone()
+        {
+            let wake = crate::el1_zone::wake(zone, mm.raw(), address, u32::MAX, u32::MAX);
+            crate::el1_zone::hand_back(&wake.handed);
         }
     }
 }
@@ -169,7 +211,7 @@ impl Kernel {
             .shared()
             .pending_signals()
             .lifecycle_lease()
-            .close();
+            .decline_to_host();
         let state = self.registry().settled().read();
         if let Some(record) = state
             .tasks
@@ -1712,7 +1754,7 @@ mod tests {
             }
             "ptrace" => {
                 assert!(kernel.claim_ptrace_traceme(&current));
-                assert_eq!(page.gate(), carrick_el1_abi::GateState::Closed);
+                assert_eq!(page.gate(), carrick_el1_abi::GateState::HostOnly);
             }
             "seccomp" => {
                 assert!(
@@ -1732,7 +1774,7 @@ mod tests {
                         .unwrap()
                         .is_ok()
                 );
-                assert_eq!(page.gate(), carrick_el1_abi::GateState::Closed);
+                assert_eq!(page.gate(), carrick_el1_abi::GateState::HostOnly);
                 assert!(page.claim_any().is_err());
                 let filtered = kernel
                     .context(current.task().key().id, current.thread().key().tid)
@@ -1748,7 +1790,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(
                     child.thread().control_lease().lifecycle().gate(),
-                    carrick_el1_abi::GateState::Closed,
+                    carrick_el1_abi::GateState::HostOnly,
                     "a fork must not reopen inherited filter authority"
                 );
             }
@@ -2225,13 +2267,95 @@ mod tests {
     }
 
     #[test]
-    fn closed_gate_between_ledger_read_and_cas_is_terminal_not_busy() {
+    fn terminal_close_makes_prepared_host_fork_lose_with_live_peer() {
+        for close_before_prepare in [true, false] {
+            let (kernel, root) = bootstrap(59_110);
+            let peer = kernel
+                .fork_task(
+                    &root,
+                    fork_plan(),
+                    ThreadId::synthetic_for_tests(59_111),
+                    "fork-race-peer".into(),
+                    None,
+                )
+                .unwrap();
+            let page = root.thread().control_lease().lifecycle();
+            let live = page.live();
+            let claimed = page.claimed_count();
+            let reservation = kernel
+                .reserve_fork(&root, fork_plan(), "must-rollback".into(), None)
+                .unwrap();
+            let child = reservation.child_id();
+            if close_before_prepare {
+                page.close();
+            }
+            let prepared = reservation
+                .prepare_reference(ThreadId::synthetic_for_tests(59_112))
+                .unwrap();
+            if !close_before_prepare {
+                page.close();
+            }
+            assert!(
+                matches!(
+                    prepared.commit(),
+                    Err(KernelOperationError::LifecycleAdmissionBusy(_))
+                ),
+                "terminal close must defeat fork commit (close_before_prepare={close_before_prepare})"
+            );
+            assert!(
+                !kernel
+                    .registry()
+                    .settled()
+                    .read()
+                    .tasks
+                    .contains_key(&child)
+            );
+            assert_eq!(page.live(), live);
+            assert_eq!(page.claimed_count(), claimed);
+            assert!(peer.exact_thread_is_live());
+        }
+    }
+
+    #[test]
+    fn terminal_close_refuses_host_fork_admission_with_live_peer() {
+        let (kernel, root) = bootstrap(59_100);
+        let peer = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(59_101),
+                "exit-admission-peer".into(),
+                None,
+            )
+            .unwrap();
+        assert!(root.exact_thread_is_live() && peer.exact_thread_is_live());
+        let page = root.thread().control_lease().lifecycle();
+        let live = page.live();
+        let claimed = page.claimed_count();
+        let _closing = carrick_core::terminal::TerminalCustody::<
+            carrick_core::terminal::Process,
+            carrick_core::terminal::Live,
+        >::close_admission(&*page);
+        assert!(
+            matches!(
+                kernel.reserve_fork(&root, fork_plan(), "must-lose".into(), None),
+                Err(KernelOperationError::LifecycleAdmissionBusy(_))
+            ),
+            "terminal close must refuse host fork admission"
+        );
+        assert_eq!(page.live(), live);
+        assert_eq!(page.claimed_count(), claimed);
+        assert!(peer.exact_thread_is_live());
+    }
+
+    #[test]
+    fn terminal_close_between_ledger_read_and_cas_refuses_admission() {
         let (_kernel, root) = bootstrap(9_669);
         let page = root.thread().control_lease().lifecycle();
-        let guard =
-            super::BirthAdmissionGuard::acquire_after_gate_read(root.task(), || page.close())
-                .expect("terminal close is not a transient birth conflict");
-        assert!(guard.page.is_none());
+        assert!(matches!(
+            super::BirthAdmissionGuard::acquire_after_gate_read(root.task(), || page.close()),
+            Err(KernelOperationError::LifecycleAdmissionBusy(_))
+        ));
         assert_eq!(page.gate(), carrick_el1_abi::GateState::Closed);
     }
 

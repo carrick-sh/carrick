@@ -247,8 +247,31 @@ pub fn enable(guest_interrupts: bool) {
     GUEST_SCHEDULER.store(guest_interrupts, std::sync::atomic::Ordering::Release);
 }
 
+#[cfg(feature = "test-support")]
+std::thread_local! {
+    static TEST_ZONE: std::cell::Cell<Option<&'static ZoneTables>> = const { std::cell::Cell::new(None) };
+}
+
+/// Bind a VM-free fixture's real scheduler tables to host operations on this
+/// thread. The scoped binding cannot affect parallel tests or escape unwind.
+#[cfg(feature = "test-support")]
+pub fn with_test_zone<T>(zone: &'static ZoneTables, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<&'static ZoneTables>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_ZONE.set(self.0);
+        }
+    }
+    let _restore = Restore(TEST_ZONE.replace(Some(zone)));
+    run()
+}
+
 /// The zone tables, if this carrier serves private futexes in the zone.
 pub fn zone() -> Option<&'static ZoneTables> {
+    #[cfg(feature = "test-support")]
+    if let Some(zone) = TEST_ZONE.get() {
+        return Some(zone);
+    }
     if !hatch_enabled() || !GUEST_SCHEDULER.load(std::sync::atomic::Ordering::Acquire) {
         return None;
     }

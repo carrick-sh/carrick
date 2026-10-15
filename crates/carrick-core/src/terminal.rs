@@ -47,16 +47,63 @@ fn task_id_from_binding(binding: ExecutionBinding) -> Option<TaskId> {
 
 pub struct Thread;
 /// One process incarnation owns exactly one terminal admission claim.
-#[repr(transparent)]
+#[repr(C)]
 #[derive(::core::fmt::Debug, ::core::default::Default)]
 pub struct ProcessExitCustody {
     begun: core::sync::atomic::AtomicU32,
+    fork_publications: core::sync::atomic::AtomicU32,
 }
 impl ProcessExitCustody {
     pub const fn new() -> Self {
         Self {
             begun: core::sync::atomic::AtomicU32::new(0),
+            fork_publications: core::sync::atomic::AtomicU32::new(0),
         }
+    }
+}
+
+impl ProcessExitCustody {
+    pub(crate) fn fork_publications(&self) -> usize {
+        self.fork_publications
+            .load(core::sync::atomic::Ordering::SeqCst) as usize
+    }
+}
+
+/// An admitted host fork publication, retained until publication or rollback
+/// completes. It is an outstanding claim, never a parent thread membership.
+pub struct ForkPublicationClaim<P: core::ops::Deref>(P)
+where
+    P::Target: Lifecycle;
+impl<P: core::ops::Deref> ForkPublicationClaim<P>
+where
+    P::Target: Lifecycle,
+{
+    pub fn acquire(page: P) -> Result<Self, carrick_core_abi::lifecycle::GateState> {
+        use carrick_core_abi::lifecycle::GateState;
+        use core::sync::atomic::Ordering;
+        page.process_exit_custody()
+            .fork_publications
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_add(1)
+            })
+            .map_err(|_| GateState::ForkClosing)?;
+        Ok(Self(page))
+    }
+    pub fn admitted(&self) -> bool {
+        // Pair claim-before-gate with terminal close-before-claimed_count.
+        // Either the fork observes Closed or Closing observes this claim.
+        self.0.gate() != carrick_core_abi::lifecycle::GateState::Closed
+    }
+}
+impl<P: core::ops::Deref> Drop for ForkPublicationClaim<P>
+where
+    P::Target: Lifecycle,
+{
+    fn drop(&mut self) {
+        self.0
+            .process_exit_custody()
+            .fork_publications
+            .fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -656,6 +703,38 @@ mod tests {
         assert!(members.rehome_host(old, new));
         assert!(members.completed(&[], &[old]).is_none());
         assert!(members.completed(&[], &[new]).is_some());
+    }
+
+    #[test]
+    fn fork_publication_claims_are_exact_and_host_only_never_reopens_terminal() {
+        use carrick_core_abi::lifecycle::GateState;
+        let page = Page {
+            terminal: ProcessExitCustody::new(),
+            gate: AtomicU32::new(0),
+            live: AtomicU32::new(1),
+        };
+        let peer = Page {
+            terminal: ProcessExitCustody::new(),
+            gate: AtomicU32::new(0),
+            live: AtomicU32::new(1),
+        };
+        page.decline_to_host();
+        assert_eq!(page.gate(), GateState::HostOnly);
+        let first = ForkPublicationClaim::acquire(&page).unwrap();
+        assert!(first.admitted());
+        let second = ForkPublicationClaim::acquire(&page).unwrap();
+        assert!(second.admitted());
+        assert_eq!(page.claimed_count(), 2);
+        assert_eq!(peer.claimed_count(), 0);
+        let _exit = TerminalCustody::<Process, Live>::close_admission(&page);
+        page.decline_to_host();
+        assert_eq!(page.gate(), GateState::Closed);
+        assert!(!first.admitted());
+        drop(first);
+        assert_eq!(page.claimed_count(), 1);
+        drop(second);
+        assert_eq!(page.claimed_count(), 0);
+        assert_eq!(peer.gate(), GateState::Open);
     }
 
     #[test]
