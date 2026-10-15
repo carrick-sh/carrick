@@ -441,6 +441,21 @@ plus each coordinator's holder `tid`. With no capture at all it leaves
 rings comes from the surrounding records, not from their separate logical
 indexes.
 
+On Linux/KVM, `carrick debug kvm-capture --run-id <id> --output <path>` asks
+the running carrier for a read-only capture in the existing post-mortem JSON
+shape. Use the same `CARRICK_RUN_ID` as the guest run. It includes both event
+rings, the kernel task/thread view (or a named degraded view), scheduler
+queues and executor receipts, the CPL0 zone census, per-vCPU last-stopped
+registers and state, pending host work, and a bounded host thread census.
+Live sections are non-coherent; a running vCPU's register row is explicitly
+its last stopped state. Unavailable sections are named in `truncated` or
+`physical.unavailable`.
+
+The `x86_kvm_run` test harness takes this capture before killing a guest at
+its five-second deadline. It prints the capture path in the test log. Set
+`CARRICK_KVM_CAPTURE_DIR` to place the JSON beside a chosen log directory;
+otherwise it uses `/tmp/carrick-kvm-deadlines`.
+
 > [!IMPORTANT]
 > Use the event ring when `carrick trace` perturbs the bug away. dtrace's
 > per-syscall probes change a timing-sensitive race's outcome (it stops

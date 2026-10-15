@@ -14,6 +14,7 @@ use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
+use wait_timeout::ChildExt;
 
 fn append_tar(builder: &mut tar::Builder<&mut Vec<u8>>, name: &str, bytes: &[u8]) {
     let mut header = tar::Header::new_gnu();
@@ -980,7 +981,11 @@ fn mounted_static_x86_blocked_read_has_live_kernel_capture() {
         .args(["load", "--input", archive.to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(load.status.success(), "{}", String::from_utf8_lossy(&load.stderr));
+    assert!(
+        load.status.success(),
+        "{}",
+        String::from_utf8_lossy(&load.stderr)
+    );
 
     let run_id = format!("x86-kvm-blocked-capture-{}", std::process::id());
     let mut child = ReapChild(
@@ -988,8 +993,13 @@ fn mounted_static_x86_blocked_read_has_live_kernel_capture() {
             .env("CARRICK_HOME", &home)
             .env("CARRICK_RUN_ID", &run_id)
             .args([
-                "run", "--platform", "linux/amd64", "--pull", "never",
-                "--volume", &format!("{}:/hello:ro", elf.display()),
+                "run",
+                "--platform",
+                "linux/amd64",
+                "--pull",
+                "never",
+                "--volume",
+                &format!("{}:/hello:ro", elf.display()),
                 "x86-kvm-hello:latest",
             ])
             .stdin(Stdio::piped())
@@ -999,14 +1009,23 @@ fn mounted_static_x86_blocked_read_has_live_kernel_capture() {
             .unwrap(),
     );
     let mut stdout = child.stdout.take().unwrap();
-    assert!(poll_readable(stdout.as_raw_fd(), 5_000), "guest ready marker missing");
+    assert!(
+        poll_readable(stdout.as_raw_fd(), 5_000),
+        "guest ready marker missing"
+    );
     let mut marker = [0; 2];
     stdout.read_exact(&mut marker).unwrap();
     assert_eq!(&marker, b"R\n");
 
+    let capture_dir = std::env::var_os("CARRICK_KVM_CAPTURE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| dir.path().to_path_buf());
+    std::fs::create_dir_all(&capture_dir).unwrap();
+    let capture_path = capture_dir.join(format!("{run_id}.json"));
     let capture = Command::new(&cli)
         .timeout(Duration::from_secs(5))
-        .args(["debug", "hvpatch-kernel", "--run-id", &run_id])
+        .args(["debug", "kvm-capture", "--run-id", &run_id, "--output"])
+        .arg(&capture_path)
         .output()
         .unwrap();
     assert!(
@@ -1014,8 +1033,15 @@ fn mounted_static_x86_blocked_read_has_live_kernel_capture() {
         "live KVM capture failed: {}",
         String::from_utf8_lossy(&capture.stderr)
     );
-    let snapshot: serde_json::Value = serde_json::from_slice(&capture.stdout).unwrap();
-    assert!(snapshot["threads"].as_array().is_some_and(|rows| !rows.is_empty()));
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    assert!(
+        snapshot["degraded_kernel"]["tasks"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
+        "capture did not name a task: {}",
+        capture_path.display()
+    );
 
     child.stdin.as_mut().unwrap().write_all(b"X").unwrap();
     let mut rest = Vec::new();
@@ -1407,6 +1433,14 @@ fn compare_mounted_binary_with_native(
 }
 
 fn run_mounted_binary(elf: &std::path::Path, run_id: &str, json: bool) -> std::process::Output {
+    run_mounted_binary_with_capture(elf, run_id, json).0
+}
+
+fn run_mounted_binary_with_capture(
+    elf: &std::path::Path,
+    run_id: &str,
+    json: bool,
+) -> (std::process::Output, Option<std::path::PathBuf>) {
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("image.tar");
     std::fs::write(&archive, empty_image_archive()).unwrap();
@@ -1423,15 +1457,14 @@ fn run_mounted_binary(elf: &std::path::Path, run_id: &str, json: bool) -> std::p
         "load stderr: {}",
         String::from_utf8_lossy(&load.stderr)
     );
-    let mut command = Command::new(&cli);
+    let mut command = std::process::Command::new(&cli);
     let scoped_run_id = match std::env::var("CARRICK_RUN_ID") {
         Ok(scope) => format!("{scope}-x86-kvm-{run_id}-test"),
         Err(_) => format!("x86-kvm-{run_id}-test"),
     };
     command
-        .timeout(Duration::from_secs(5))
         .env("CARRICK_HOME", &home)
-        .env("CARRICK_RUN_ID", scoped_run_id);
+        .env("CARRICK_RUN_ID", &scoped_run_id);
     if json {
         command.arg("run").arg("--json");
     } else {
@@ -1447,8 +1480,107 @@ fn run_mounted_binary(elf: &std::path::Path, run_id: &str, json: bool) -> std::p
         "x86-kvm-hello:latest",
     ]);
     command
-        .output()
-        .expect("run mounted x86 Linux binary through carrick")
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .expect("run mounted x86 Linux binary through carrick");
+    if child
+        .wait_timeout(Duration::from_secs(5))
+        .expect("wait for mounted x86 Linux binary")
+        .is_some()
+    {
+        return (
+            child.wait_with_output().expect("collect mounted x86 run"),
+            None,
+        );
+    }
+
+    // The carrier is still live here. Request evidence before killing its
+    // scoped process group; a failed capture is a named test failure.
+    let capture_dir = std::env::var_os("CARRICK_KVM_CAPTURE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("carrick-kvm-deadlines"));
+    std::fs::create_dir_all(&capture_dir).expect("create KVM capture directory");
+    let (_, capture_path) = tempfile::Builder::new()
+        .prefix("kvm-deadline-")
+        .suffix(".json")
+        .tempfile_in(&capture_dir)
+        .expect("reserve KVM capture file")
+        .keep()
+        .expect("retain KVM capture file");
+    let capture = Command::new(&cli)
+        .timeout(Duration::from_secs(4))
+        .args([
+            "debug",
+            "kvm-capture",
+            "--run-id",
+            &scoped_run_id,
+            "--output",
+        ])
+        .arg(&capture_path)
+        .output();
+    // SAFETY: this test created an exclusive process group for this exact run.
+    unsafe { libc::killpg(child.id() as i32, libc::SIGKILL) };
+    let output = child.wait_with_output().expect("reap timed-out KVM run");
+    let capture = capture.expect("run KVM deadline capture");
+    assert!(
+        capture.status.success(),
+        "KVM deadline capture {} failed: {}",
+        capture_path.display(),
+        String::from_utf8_lossy(&capture.stderr)
+    );
+    eprintln!("KVM deadline capture: {}", capture_path.display());
+    (output, Some(capture_path))
+}
+
+#[test]
+fn mounted_static_x86_deadline_captures_parked_wait() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("wait-forever");
+    compile_assembly("x86_wait_forever.S", &elf);
+    let (output, capture_path) = run_mounted_binary_with_capture(&elf, "x86_wait_forever.S", false);
+    assert_eq!(output.status.signal(), Some(libc::SIGKILL));
+    let capture_path = capture_path.expect("deadline must write a capture");
+    let capture: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    assert_eq!(capture["schema"], "carrick.kernel-post-mortem.v1");
+    assert!(
+        capture["event_ring"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty())
+    );
+    assert!(capture["physical"]["zone_census"].as_str().is_some());
+    assert!(
+        capture["physical"]["vcpus"]
+            .as_array()
+            .is_some_and(|rows| rows.len() == 2
+                && rows.iter().all(|row| row
+                    .as_str()
+                    .is_some_and(|text| text.contains("last_stopped_gprs="))))
+    );
+    assert!(capture["scheduler_aux"]["scheduler"].as_array().is_some());
+    assert!(capture["physical"]["host_threads"].as_array().is_some());
+    let named_wait = capture["degraded_kernel"]["tasks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|task| task["threads"].as_array().into_iter().flatten())
+        .any(|thread| {
+            thread["key"]["tid"].as_u64().is_some()
+                && thread["execution"]
+                    .as_str()
+                    .is_some_and(|state| state.contains("Blocked") && state.contains("HostWait"))
+        });
+    assert!(
+        named_wait,
+        "deadline capture did not name the parked task and wait: {}",
+        capture_path.display()
+    );
 }
 
 #[test]

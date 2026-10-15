@@ -989,6 +989,16 @@ pub(crate) enum DebugCommand {
         #[arg(long)]
         list_tables: bool,
     },
+    /// Capture a live x86 KVM carrier through its run-scoped kernel endpoint.
+    #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+    KvmCapture {
+        /// Exact `CARRICK_RUN_ID` of the running carrier.
+        #[arg(long)]
+        run_id: String,
+        /// Write the bounded capture to this path.
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Abort a LIVE run's kernel and make it produce a post-mortem.
     ///
     /// The runtime freezes its scheduler, captures one `PostMortem` in

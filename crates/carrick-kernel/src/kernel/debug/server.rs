@@ -22,6 +22,7 @@ use super::dto::{
     KernelDebugTable,
 };
 use super::endpoint::{DebugEndpoint, EndpointError};
+use super::post_mortem::{AbortReason, PhysicalCaptureProvider, PostMortem};
 use super::wire::{
     self, DEGRADED_BUDGET, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, STRICT_SNAPSHOT_BUDGET,
     WireError, encode_canonical,
@@ -60,12 +61,29 @@ pub struct KernelDebugServer {
 impl KernelDebugServer {
     /// Bind and serve snapshots for the carrier's immutable cleanup scope.
     pub fn start(kernel: Arc<Kernel>, carrier_scope: &str) -> Result<Self, ServerError> {
-        Self::start_at(kernel, DebugEndpoint::for_run_id(carrier_scope)?)
+        Self::start_with_physical(kernel, carrier_scope, None)
+    }
+
+    /// Bind the ordinary kernel endpoint with a backend-owned physical census.
+    pub fn start_with_physical(
+        kernel: Arc<Kernel>,
+        carrier_scope: &str,
+        physical: Option<Arc<dyn PhysicalCaptureProvider>>,
+    ) -> Result<Self, ServerError> {
+        Self::start_at_with_physical(kernel, DebugEndpoint::for_run_id(carrier_scope)?, physical)
     }
 
     /// Bind and serve at an exact endpoint. Used by tests and by callers that
     /// already resolved the run identity.
     pub fn start_at(kernel: Arc<Kernel>, endpoint: DebugEndpoint) -> Result<Self, ServerError> {
+        Self::start_at_with_physical(kernel, endpoint, None)
+    }
+
+    fn start_at_with_physical(
+        kernel: Arc<Kernel>,
+        endpoint: DebugEndpoint,
+        physical: Option<Arc<dyn PhysicalCaptureProvider>>,
+    ) -> Result<Self, ServerError> {
         let cancellation = Arc::new(Cancellation::new()?);
         let nonce = server_nonce();
         endpoint.claim(nonce)?;
@@ -82,7 +100,13 @@ impl KernelDebugServer {
         let join = std::thread::Builder::new()
             .name("carrick-kernel-debug".to_owned())
             .spawn(move || {
-                serve_loop(&listener, &kernel, &thread_shutdown, &thread_cancellation);
+                serve_loop(
+                    &listener,
+                    &kernel,
+                    physical,
+                    &thread_shutdown,
+                    &thread_cancellation,
+                );
                 drop(listener);
                 thread_endpoint.release(nonce);
             })?;
@@ -109,10 +133,18 @@ impl KernelDebugServer {
     /// workload is the product, and losing the debugger must not lose the run.
     /// The failure is never silent.
     pub fn install(kernel: Arc<Kernel>, carrier_scope: &str) -> Option<Self> {
+        Self::install_with_physical(kernel, carrier_scope, None)
+    }
+
+    pub fn install_with_physical(
+        kernel: Arc<Kernel>,
+        carrier_scope: &str,
+        physical: Option<Arc<dyn PhysicalCaptureProvider>>,
+    ) -> Option<Self> {
         if std::env::var_os(DISABLE_ENV).is_some_and(|value| value == "0") {
             return None;
         }
-        match Self::start(kernel, carrier_scope) {
+        match Self::start_with_physical(kernel, carrier_scope, physical) {
             Ok(server) => Some(server),
             Err(error) => {
                 tracing::warn!(
@@ -167,6 +199,7 @@ fn server_nonce() -> u64 {
 fn serve_loop(
     listener: &UnixListener,
     kernel: &Arc<Kernel>,
+    physical: Option<Arc<dyn PhysicalCaptureProvider>>,
     shutdown: &AtomicBool,
     cancellation: &Arc<Cancellation>,
 ) {
@@ -202,6 +235,7 @@ fn serve_loop(
             continue;
         };
         let kernel = Arc::clone(kernel);
+        let physical = physical.clone();
         if let Ok(handler) = std::thread::Builder::new()
             .name("carrick-debug-conn".to_owned())
             .spawn(move || {
@@ -210,7 +244,7 @@ fn serve_loop(
                 let _permit = permit;
                 let mut connection = connection;
                 let kernel = kernel;
-                let _ = handle_connection(&mut connection, &kernel);
+                let _ = handle_connection(&mut connection, &kernel, physical.as_deref());
             })
         {
             handlers.push(handler);
@@ -222,11 +256,15 @@ fn serve_loop(
     }
 }
 
-fn handle_connection(stream: &mut Connection, kernel: &Arc<Kernel>) -> Result<(), WireError> {
+fn handle_connection(
+    stream: &mut Connection,
+    kernel: &Arc<Kernel>,
+    physical: Option<&dyn PhysicalCaptureProvider>,
+) -> Result<(), WireError> {
     authenticate(stream)?;
     let payload = socket_rpc::read_frame(stream, MAX_REQUEST_BYTES)?;
     let request: KernelDebugRequest = wire::decode_exact(&payload)?;
-    let response = build_response(&request, kernel, Instant::now());
+    let response = build_response(&request, kernel, physical, Instant::now());
     let encoded = encode_canonical(&response)?;
     socket_rpc::write_frame(stream, &encoded, MAX_RESPONSE_BYTES)?;
     Ok(())
@@ -260,6 +298,7 @@ fn authenticate(stream: &impl AsRawFd) -> Result<(), WireError> {
 fn build_response(
     request: &KernelDebugRequest,
     kernel: &Arc<Kernel>,
+    physical: Option<&dyn PhysicalCaptureProvider>,
     started: Instant,
 ) -> ServerResponse {
     if let Err(error) = request.check_schema() {
@@ -278,6 +317,17 @@ fn build_response(
             post_mortem_dir: super::post_mortem::PostMortem::configured_dir()
                 .map(|dir| dir.display().to_string()),
         };
+    }
+    if let super::dto::KernelDebugAction::Capture { run_id } = &request.action {
+        let mut capture = PostMortem::capture(
+            Some(kernel),
+            AbortReason::LiveCapture {
+                run_id: run_id.clone(),
+            },
+            Some(run_id.clone()),
+        );
+        capture.physical = physical.map(PhysicalCaptureProvider::capture);
+        return ServerResponse::Capture(Box::new(capture));
     }
     let selected = request.selected();
     match kernel.snapshot(started + STRICT_SNAPSHOT_BUDGET) {
@@ -349,6 +399,7 @@ fn build_response(
 #[derive(Debug, serde::Serialize)]
 #[serde(untagged)]
 pub enum ServerResponse {
+    Capture(Box<PostMortem>),
     Snapshot(Box<KernelDebugSnapshot>),
     /// The coherent snapshot was refused by a busy authority; this is the
     /// non-coherent per-object view plus the busy coordinators.
@@ -535,7 +586,7 @@ mod tests {
         ));
 
         let request = KernelDebugRequest::for_tables(None);
-        let response = build_response(&request, &kernel, Instant::now());
+        let response = build_response(&request, &kernel, None, Instant::now());
         let snapshot = match response {
             ServerResponse::Snapshot(snapshot) => *snapshot,
             other => panic!(
