@@ -27,7 +27,6 @@ mod prune_fs;
 pub mod remote_accept;
 pub mod remote_lock;
 mod target_prune;
-pub mod terminal_custody;
 pub mod test_batch;
 pub mod test_lanes;
 pub mod test_shards;

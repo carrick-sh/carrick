@@ -119,23 +119,12 @@ pub enum Commands {
         about = "Derive each test target's gate lane from Cargo metadata and check coverage"
     )]
     TestLanes(crate::test_lanes::TestLanesArgs),
+
     #[command(
         name = "commit-trailers",
         about = "Enforce the Co-Authored-By trailer standard on commit messages and ranges"
     )]
     CommitTrailers(crate::commit_trailers::CommitTrailersArgs),
-
-    #[command(
-        name = "terminal-custody",
-        about = "Ratchet neutral terminal decision ownership"
-    )]
-    TerminalCustody {
-        #[arg(
-            long,
-            help = "Print current retiring decision sites for baseline review"
-        )]
-        list: bool,
-    },
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -549,22 +538,6 @@ where
             let info = resolve_repo_info(cli.root.as_deref())?;
             crate::test_lanes::run(&info.repository_root, args, writer)?;
             Ok(())
-        }
-        Commands::TerminalCustody { list } => {
-            let info = resolve_repo_info(cli.root.as_deref())?;
-            if list {
-                for site in crate::terminal_custody::discover(&info.repository_root)
-                    .map_err(CliError::Impact)?
-                {
-                    writeln!(writer, "{site}").map_err(|source| CliError::Io {
-                        path: PathBuf::from("stdout"),
-                        source,
-                    })?;
-                }
-                Ok(())
-            } else {
-                crate::terminal_custody::check(&info.repository_root).map_err(CliError::Impact)
-            }
         }
         Commands::PackageGuestImage(args) => {
             crate::guest_image::run_package_guest_image(&args)?;

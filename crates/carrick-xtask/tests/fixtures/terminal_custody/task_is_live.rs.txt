@@ -1,1 +1,0 @@
-fn check(graph: &Graph) { if graph.task_is_live() {} }
