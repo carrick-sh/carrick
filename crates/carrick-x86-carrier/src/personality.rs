@@ -86,6 +86,12 @@ pub trait Personality: PersonalityAbi<Kernel> + 'static + Default {
         false
     }
 
+    /// Calls whose owner may park must settle earlier host work while the
+    /// original task still owns this physical CPU.
+    fn settle_work_before_dispatch(&self, _call: &Self::Call) -> bool {
+        false
+    }
+
     fn handle_unrecognized_call(
         &mut self,
         frame: &mut NativeFrame,

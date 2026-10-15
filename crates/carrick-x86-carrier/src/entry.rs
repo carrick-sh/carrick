@@ -690,6 +690,16 @@ pub fn carrier_enter<P: Personality>(
             .store(personality.call_stack(&call).raw(), Ordering::Release);
     }
 
+    // A wait owner can park this task before the normal return boundary.
+    // Settle earlier owed work now, while the original task is still bound
+    // to this physical CPU; after handoff the host may see an idle peer.
+    if counted
+        && personality.settle_work_before_dispatch(&call)
+        && personality.has_pending_host_work(task)
+    {
+        doorbell(WORK_PORT, frame);
+    }
+
     let mut cx = ExecutionContext {
         task,
         binding,
