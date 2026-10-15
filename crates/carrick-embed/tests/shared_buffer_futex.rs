@@ -23,14 +23,23 @@ const GUEST_DONE: u32 = 1 << 31;
 
 // Publish container completion on the same futex the host awaits for pong.
 // The guard also runs when the guest runner unwinds.
-struct GuestCompletion(carrick_embed::SharedBufferLease);
+struct GuestCompletion {
+    buffer: SharedBuffer,
+    pong_location: carrick_hal::SharedFutexLocation,
+    futex: carrick_thread::platform_futex::SharedFutexTable,
+}
 
 impl Drop for GuestCompletion {
     fn drop(&mut self) {
-        if let Ok(pong) = self.0.atomic_u32(4) {
-            let _ = pong.fetch_or(GUEST_DONE, Ordering::AcqRel);
+        let mut word = [0; 4];
+        if self.buffer.read_into(4, &mut word).is_ok() {
+            let done = u32::from_ne_bytes(word) | GUEST_DONE;
+            let _ = self.buffer.write_from(4, &done.to_ne_bytes());
         }
-        let _ = self.0.futex_wake(4, 1);
+        let _ = self.futex.table().wake(
+            carrick_thread::platform_futex::carrier_shared_futex_key(self.pong_location),
+            1,
+        );
     }
 }
 
@@ -189,24 +198,10 @@ fn shared_buffer_futex_pingpong_latency() {
     };
 
     let buf = SharedBuffer::new(4096).expect("allocate shared buffer");
-    let run_id = RunId::new("pingpong-test");
-    let container_id = ContainerId::allocate();
-    let lease = buf.lease(run_id, container_id, carrier.shared_futex().clone());
-
-    // Offset 0: ping word (written by host, awaited by guest)
-    // Offset 4: pong word (written by guest, awaited by host)
-    lease
-        .write_from(0, &0u32.to_ne_bytes())
-        .expect("write ping initial");
-    lease
-        .write_from(4, &0u32.to_ne_bytes())
-        .expect("write pong initial");
-
     const ROUNDS: u32 = 100;
     const PONG_DEADLINE: Duration = Duration::from_secs(30);
 
-    // Launch guest probe inside carrier container
-    let container = carrier
+    let builder = carrier
         .container(common::SMOKE_IMAGE)
         .image_store(ImageStore::default_for_user())
         .pull_policy(PullPolicy::Missing)
@@ -221,11 +216,33 @@ fn shared_buffer_futex_pingpong_latency() {
             Box::new(common::interceptor_probe_vfs(None)),
         )
         .shared_buffer("bench", &buf);
+    let prepared = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build image-resolution runtime")
+        .block_on(builder.prepare())
+        .expect("prepare pingpong container");
+    let lease = prepared
+        .shared_buffer_lease("bench")
+        .expect("lease for prepared pingpong container");
 
-    let completion_lease = lease.clone();
+    // Offset 0: ping word (written by host, awaited by guest)
+    // Offset 4: pong word (written by guest, awaited by host)
+    lease
+        .write_from(0, &0u32.to_ne_bytes())
+        .expect("write ping initial");
+    lease
+        .write_from(4, &0u32.to_ne_bytes())
+        .expect("write pong initial");
+
+    let completion = GuestCompletion {
+        buffer: buf.clone(),
+        pong_location: lease.shared_futex_location(4).expect("pong location"),
+        futex: carrier.shared_futex().clone(),
+    };
     let guest_handle = thread::spawn(move || {
-        let _completion = GuestCompletion(completion_lease);
-        let outcome = container.run_blocking();
+        let _completion = completion;
+        let outcome = prepared.execute();
         common::run_or_fail(outcome)
     });
 

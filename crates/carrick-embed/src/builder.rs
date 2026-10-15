@@ -1409,10 +1409,26 @@ mod tests {
         let mut data = [0u8; 11];
         lease.read_into(0, &mut data).unwrap();
         assert_eq!(&data, b"embed_shbuf");
+        assert_eq!(lease.current_container_generation(), lease.generation());
 
         assert!(matches!(
             prepared.shared_buffer_lease("nonexistent"),
             Err(crate::SharedBufferError::NotFound(_))
+        ));
+
+        drop(prepared);
+        let rebound = ContainerBuilder::from_image("shbuf-test:latest")
+            .image_store(ImageStore::new(tmp.path()))
+            .pull_policy(PullPolicy::Never)
+            .shared_buffer("tensor_mem", &buf)
+            .prepare()
+            .await
+            .expect("prepare next container with the same buffer");
+        let next = rebound.shared_buffer_lease("tensor_mem").unwrap();
+        assert!(next.validate_access().is_ok());
+        assert!(matches!(
+            lease.validate_access(),
+            Err(crate::SharedBufferError::GenerationMismatch { .. })
         ));
     }
 }
