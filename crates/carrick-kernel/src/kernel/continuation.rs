@@ -611,12 +611,31 @@ fn detail_diagnostic(detail: &ContinuationDetail) -> String {
         ContinuationDetail::Futex { wait, index } => {
             format!("futex addr={:#x} index={index:?}", wait.addr)
         }
-        ContinuationDetail::Zone(wait) => format!(
-            "zone record={}#{} armed_seq={}",
-            wait.record.id.raw(),
-            wait.record.incarnation,
-            wait.armed_seq
-        ),
+        ContinuationDetail::Zone(wait) => {
+            let state = crate::el1_zone::zone()
+                .and_then(|zone| zone.live(wait.record))
+                .map(|record| {
+                    format!(
+                        " claim={:?} home={:?} last_slot={:?} handback={:?} host_wanted={} cancelled={} entries={} object_operation={}",
+                        record.claim(),
+                        record.home(),
+                        record.last_slot(),
+                        record.handback(),
+                        record.host_wanted(),
+                        record.is_cancelled(),
+                        record.entry_count(),
+                        record.has_object_operation(),
+                    )
+                })
+                .unwrap_or_default();
+            format!(
+                "zone record={}#{} armed_seq={}{}",
+                wait.record.id.raw(),
+                wait.record.incarnation,
+                wait.armed_seq,
+                state,
+            )
+        }
         ContinuationDetail::SharedFutex {
             generation, value, ..
         } => format!("shared-futex addr={:#x} value={value}", generation.addr),
