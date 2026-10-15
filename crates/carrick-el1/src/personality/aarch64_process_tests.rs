@@ -2587,8 +2587,10 @@ fn arm_host_born_sibling_raw_exit_retires_exact_owned_thread() {
         carrick_core_abi::entry::EntryThreadGeneration::from_raw(102),
     )
     .unwrap();
-    control.publish_host_retirement(receipt);
-    fixture.page.try_exit().unwrap(); // the host's retirement
+    carrick_el1_abi::Lifecycle::reserve_nonfinal_exit(fixture.page)
+        .unwrap()
+        .publish();
+    fixture.page.publish_exact_host_retirement(control, receipt);
     let source = BornInZoneSource {
         zone: fixture.zone,
         slot: fixture.slot,
@@ -2887,8 +2889,10 @@ fn arm_two_live_threads_robust_exit_routes_host_custody_without_abort() {
         carrick_core_abi::entry::EntryThreadGeneration::from_raw(102),
     )
     .unwrap();
-    control.publish_host_retirement(receipt);
-    fixture.page.try_exit().unwrap(); // the host's retirement
+    carrick_el1_abi::Lifecycle::reserve_nonfinal_exit(fixture.page)
+        .unwrap()
+        .publish();
+    fixture.page.publish_exact_host_retirement(control, receipt);
     run_as_leader(fixture);
     registry()
         .for_entry(
