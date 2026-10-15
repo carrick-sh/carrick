@@ -476,6 +476,33 @@ mod tests {
 
     const RUNNER: RunnerId = RunnerId(700);
 
+    #[test]
+    fn pending_merge_group_outranks_and_blocks_main_push() {
+        let push = key(&run_a(), 11);
+        let group = key(&run_b(), 21);
+        let demand = super::super::mac::prioritize_demand(vec![
+            (push, "push".into()),
+            (group, "merge_group".into()),
+        ]);
+        assert_eq!(demand, vec![group]);
+    }
+
+    #[test]
+    fn newer_main_push_temporarily_supersedes_older_pending_push() {
+        let older = key(&run_a(), 11);
+        let newer = key(&context(30, "push", "refs/heads/main", &"c".repeat(40)), 31);
+        let demand = super::super::mac::prioritize_demand(vec![
+            (older, "push".into()),
+            (newer, "push".into()),
+        ]);
+        assert_eq!(demand, vec![newer]);
+        assert_eq!(
+            super::super::mac::prioritize_demand(vec![(older, "push".into())]),
+            vec![older],
+            "older push resumes when its successor leaves the queue"
+        );
+    }
+
     fn context(run: u64, event: &str, git_ref: &str, sha: &str) -> JobContext {
         JobContext {
             repository: REPOSITORY.into(),
