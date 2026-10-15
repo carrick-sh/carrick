@@ -104,6 +104,36 @@ pub trait Lifecycle {
             .map_err(|_| MembershipFloor)
     }
 
+    /// Atomically reserve a nonfinal host exit before its graph publication.
+    /// The page word, rather than a potentially lagging graph census, decides
+    /// whether this member is last. Dropping an unpublished reservation puts
+    /// its membership back.
+    fn reserve_nonfinal_exit(&self) -> Result<NonfinalExitMembership<'_>, MembershipFloor>
+    where
+        Self: Sized,
+    {
+        self.release_live(1)?;
+        Ok(NonfinalExitMembership {
+            page: self,
+            reserved: Some(ReservedLiveUnit::new()),
+        })
+    }
+
+    /// Return a live unit taken by one exact exit reservation. The token is
+    /// minted only after the same page subtracts that unit.
+    fn restore_reserved(&self, _unit: ReservedLiveUnit) {
+        let _ = self
+            .live_word()
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                // A reserved unit was removed from this page before this
+                // non-cloneable token existed, and concurrent births hold
+                // distinct bounded pool or registry slots (far fewer than
+                // u32::MAX), so this add cannot overflow. Saturate rather
+                // than assume: a broken invariant must never become UB.
+                Some(n.saturating_add(1))
+            });
+    }
+
     fn state(&self, index: usize) -> Option<(u64, EntryState)> {
         self.entry_word(index)
             .map(|word| unpack(word.load(Ordering::Acquire)))
@@ -326,6 +356,36 @@ pub trait Lifecycle {
         )
     }
 }
+#[must_use]
+pub struct NonfinalExitMembership<'a> {
+    page: &'a dyn Lifecycle,
+    reserved: Option<ReservedLiveUnit>,
+}
+
+/// Proof that one live unit was removed from an exact page. Its constructor
+/// stays private to the successful reservation paths above.
+pub struct ReservedLiveUnit(());
+
+impl ReservedLiveUnit {
+    fn new() -> Self {
+        Self(())
+    }
+}
+
+impl NonfinalExitMembership<'_> {
+    /// The graph's exact-thread retirement and ledger publication completed.
+    pub fn publish(mut self) {
+        self.reserved.take();
+    }
+}
+
+impl Drop for NonfinalExitMembership<'_> {
+    fn drop(&mut self) {
+        if let Some(unit) = self.reserved.take() {
+            self.page.restore_reserved(unit);
+        }
+    }
+}
 /// Non-cloneable ownership of the bounded EL1 exit window. Dropping an
 /// unfinished exit restores membership, including a concurrent publication.
 pub struct ExitAdmission<'a> {
@@ -408,5 +468,47 @@ impl BirthRefusal {
     }
     pub fn into_parts(self) -> (TransitionError, ClaimedEntry) {
         (self.error, self.claim)
+    }
+}
+
+#[cfg(test)]
+mod membership_tests {
+    use super::*;
+
+    struct Page {
+        gate: AtomicU32,
+        live: AtomicU32,
+    }
+
+    impl Lifecycle for Page {
+        fn gate_word(&self) -> &AtomicU32 {
+            &self.gate
+        }
+        fn live_word(&self) -> &AtomicU32 {
+            &self.live
+        }
+        fn entry_count(&self) -> usize {
+            0
+        }
+        fn entry_word(&self, _: usize) -> Option<&AtomicEntry> {
+            None
+        }
+        fn activity(&self) -> Option<&ThreadLedgerActivity> {
+            None
+        }
+    }
+
+    #[test]
+    fn unpublished_nonfinal_exit_restores_live_in_release() {
+        let page = Page {
+            gate: AtomicU32::new(GateState::Open as u32),
+            live: AtomicU32::new(2),
+        };
+        drop(page.reserve_nonfinal_exit().unwrap());
+        assert_eq!(page.live(), 2);
+        let reserved = page.reserve_nonfinal_exit().unwrap();
+        assert_eq!(page.thread_born(), Some(2));
+        drop(reserved);
+        assert_eq!(page.live(), 3);
     }
 }

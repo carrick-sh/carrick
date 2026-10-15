@@ -2261,6 +2261,17 @@ mod tests {
             Some((entry.generation(), EntryState::Published))
         );
         if host_exit {
+            let live_before_decline = page.live();
+            assert!(matches!(
+                kernel.exit_thread(
+                    &adopted,
+                    Some(crate::kernel::operations::KernelFailpoint::AfterMembershipReserve)
+                ),
+                Err(crate::kernel::operations::KernelOperationError::Injected(
+                    crate::kernel::operations::KernelFailpoint::AfterMembershipReserve
+                ))
+            ));
+            assert_eq!(page.live(), live_before_decline);
             assert!(
                 kernel
                     .exit_thread(

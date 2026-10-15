@@ -15,6 +15,9 @@ carrick-sched-core = { path = "../carrick-sched-core" }
 carrick-signal-core = { path = "../carrick-signal-core" }
 zerocopy = { workspace = true }
 
+[features]
+host-test = []
+
 [lints]
 workspace = true
 

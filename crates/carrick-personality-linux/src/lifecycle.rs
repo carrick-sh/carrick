@@ -1015,12 +1015,17 @@ fn serve_exit<'a>(
         })
         .ok()?;
     // n > 1 -> n - 1; the last thread exits on the host.
-    page.try_exit()
+    let membership = page
+        .reserve_nonfinal_exit()
         .inspect_err(|_| {
             native.record_decline(LifecycleDecline::ExitLast);
         })
         .ok()?;
     let clear_child_tid = slot.clear_child_tid();
+    #[cfg(feature = "host-test")]
+    if clear_child_tid == u64::MAX {
+        return decline!(LifecycleDecline::ExitClearTidCopyout);
+    }
     if clear_child_tid != 0 {
         let status = native.result();
         let copied = native.copy_out(UserVa::new(clear_child_tid), &CHILD_TID_CLEAR);
@@ -1030,7 +1035,6 @@ fn serve_exit<'a>(
             // The host exits the thread instead: clearing the word again
             // and waking are idempotent.
             native.set_result(status);
-            let _ = page.thread_born();
             return decline!(if copied {
                 LifecycleDecline::ExitClearTidWake
             } else {
@@ -1043,9 +1047,9 @@ fn serve_exit<'a>(
         .or_else(|| page.identity(entry).map(|id| id.visible_tid))
         .unwrap_or(record.identity.tid as u32);
     if !native.release_current(record.reference) {
-        let _ = page.thread_born();
         return None;
     }
+    membership.publish();
     if admission.commit().is_err() {
         // Unreachable (checked above; only this thread leaves Born or
         // Published that way): the host must look at this process.
