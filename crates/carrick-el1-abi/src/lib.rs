@@ -53,6 +53,8 @@ pub use mm_portal_grant::*;
 
 mod reservations;
 pub use reservations::*;
+mod signal_ingress;
+pub use signal_ingress::*;
 mod thread_lifecycle;
 pub use thread_lifecycle::*;
 mod service_copy;
@@ -691,6 +693,9 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         EL1_RESERVATIONS_OFFSET,
         EL1_RESERVATIONS_END,
         RESERVATION_PROTOCOL_VERSION,
+        SIGNAL_INGRESS_PROTOCOL,
+        core::mem::size_of::<ExternalSignalRecord>() as u64,
+        core::mem::align_of::<ExternalSignalRecord>() as u64,
         MM_PORTAL_PROTOCOL,
         MM_TRANSFER_LAYOUT_HASH,
         MM_PORTAL_BIND_ESR,

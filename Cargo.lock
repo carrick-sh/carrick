@@ -516,6 +516,7 @@ dependencies = [
  "carrick-personality-linux",
  "carrick-pipe-core",
  "carrick-sched-core",
+ "carrick-signal-core",
  "carrick-syscall-abi",
 ]
 
