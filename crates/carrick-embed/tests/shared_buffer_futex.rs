@@ -8,7 +8,7 @@
 mod common;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -27,8 +27,9 @@ struct GuestCompletion(carrick_embed::SharedBufferLease);
 
 impl Drop for GuestCompletion {
     fn drop(&mut self) {
-        let pong = unsafe { &*(self.0.as_ptr().add(4) as *const AtomicU32) };
-        pong.fetch_or(GUEST_DONE, Ordering::AcqRel);
+        if let Ok(pong) = self.0.atomic_u32(4) {
+            let _ = pong.fetch_or(GUEST_DONE, Ordering::AcqRel);
+        }
         let _ = self.0.futex_wake(4, 1);
     }
 }
@@ -81,10 +82,10 @@ fn shared_buffer_host_write_guest_read_round_trip() {
         return;
     };
 
-    let mut buf = SharedBuffer::new(4096).expect("allocate shared buffer");
+    let buf = SharedBuffer::new(4096).expect("allocate shared buffer");
     // Host writes greeting sentinel at offset 0
     let host_msg = b"HELLO_CARRIER";
-    buf.as_mut_slice()[..host_msg.len()].copy_from_slice(host_msg);
+    buf.write_from(0, host_msg).expect("write greeting");
 
     let outcome = carrier
         .container(common::SMOKE_IMAGE)
@@ -112,12 +113,14 @@ fn shared_buffer_host_write_guest_read_round_trip() {
     );
 
     // Host reads the updated value written by guest
-    let guest_reply = &buf.as_slice()[..14];
+    let mut guest_reply = [0u8; 14];
+    buf.read_into(0, &mut guest_reply)
+        .expect("read guest reply");
     assert_eq!(
-        guest_reply,
+        &guest_reply,
         b"GUEST_REPLY_OK",
         "host must see guest zero-copy mutation: got {:?}",
-        String::from_utf8_lossy(guest_reply)
+        String::from_utf8_lossy(&guest_reply)
     );
 }
 
@@ -131,7 +134,7 @@ fn shared_buffer_lease_after_retirement_fails_closed() {
     let retired = Arc::new(AtomicBool::new(false));
     let current_gen = Arc::new(AtomicU64::new(1));
 
-    let mut lease = buf.lease_with_witness(
+    let lease = buf.lease_with_witness(
         run_id,
         container_id,
         1,
@@ -141,9 +144,9 @@ fn shared_buffer_lease_after_retirement_fails_closed() {
     );
 
     // 1. While active, operations succeed
-    assert!(lease.write_at(0, &[1, 2, 3, 4]).is_ok());
+    assert!(lease.write_from(0, &[1, 2, 3, 4]).is_ok());
     let mut data = [0u8; 4];
-    assert!(lease.read_at(0, &mut data).is_ok());
+    assert!(lease.read_into(0, &mut data).is_ok());
     assert_eq!(data, [1, 2, 3, 4]);
 
     // 2. Container retires
@@ -151,19 +154,19 @@ fn shared_buffer_lease_after_retirement_fails_closed() {
 
     // 3. All operations fail closed
     assert!(matches!(
-        lease.read_at(0, &mut data),
+        lease.read_into(0, &mut data),
         Err(SharedBufferError::Retired { .. })
     ));
     assert!(matches!(
-        lease.write_at(0, &[5, 6, 7, 8]),
+        lease.write_from(0, &[5, 6, 7, 8]),
         Err(SharedBufferError::Retired { .. })
     ));
     assert!(matches!(
-        lease.as_slice(),
+        lease.as_ptr(),
         Err(SharedBufferError::Retired { .. })
     ));
     assert!(matches!(
-        lease.as_mut_slice(),
+        lease.as_mut_ptr(),
         Err(SharedBufferError::Retired { .. })
     ));
     assert!(matches!(
@@ -188,15 +191,15 @@ fn shared_buffer_futex_pingpong_latency() {
     let buf = SharedBuffer::new(4096).expect("allocate shared buffer");
     let run_id = RunId::new("pingpong-test");
     let container_id = ContainerId::allocate();
-    let lease = buf.lease(run_id, container_id, 1, carrier.shared_futex().clone());
+    let lease = buf.lease(run_id, container_id, carrier.shared_futex().clone());
 
     // Offset 0: ping word (written by host, awaited by guest)
     // Offset 4: pong word (written by guest, awaited by host)
     lease
-        .write_at(0, &0u32.to_ne_bytes())
+        .write_from(0, &0u32.to_ne_bytes())
         .expect("write ping initial");
     lease
-        .write_at(4, &0u32.to_ne_bytes())
+        .write_from(4, &0u32.to_ne_bytes())
         .expect("write pong initial");
 
     const ROUNDS: u32 = 100;
@@ -228,22 +231,20 @@ fn shared_buffer_futex_pingpong_latency() {
 
     let start = Instant::now();
     let deadline = start + PONG_DEADLINE;
-    let pong_ptr = unsafe { (lease.as_ptr().add(4)) as *const AtomicU32 };
+    let pong = lease.atomic_u32(4).expect("pong word");
+    let ping = lease.atomic_u32(0).expect("ping word");
     for round in 1..=ROUNDS {
         // Host writes round to ping (offset 0) and wakes guest
-        let ping_ptr = lease.as_ptr() as *mut AtomicU32;
-        unsafe {
-            (*ping_ptr).store(round, Ordering::Release);
-        }
+        ping.store(round, Ordering::Release).expect("write ping");
         let _ = lease.futex_wake(0, 1);
 
         // Host waits for guest to echo round on pong (offset 4)
         loop {
-            let pong = unsafe { (*pong_ptr).load(Ordering::Acquire) };
-            if pong & !GUEST_DONE == round {
+            let pong_value = pong.load(Ordering::Acquire).expect("read pong");
+            if pong_value & !GUEST_DONE == round {
                 break;
             }
-            if pong & GUEST_DONE != 0 {
+            if pong_value & GUEST_DONE != 0 {
                 fail_before_pong(guest_handle, round);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -251,7 +252,7 @@ fn shared_buffer_futex_pingpong_latency() {
                 !remaining.is_zero(),
                 "timed out waiting for pong round {round}"
             );
-            match lease.futex_wait(4, pong, Some(remaining)) {
+            match lease.futex_wait(4, pong_value, Some(remaining)) {
                 Ok(()) | Err(SharedBufferError::TimedOut) => {}
                 Err(error) => panic!("futex wait for pong round {round} failed: {error}"),
             }
