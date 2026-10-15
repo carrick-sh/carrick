@@ -879,11 +879,11 @@ impl ThreadLifecyclePage {
             {
                 return false;
             }
-            if self.gate() != GateState::Open {
+            if self.gate() == GateState::Closed {
                 slot.state.store(expected, Ordering::SeqCst);
                 return false;
             }
-            // The Open read is the release linearization point. Closing
+            // The non-Closed read is the release linearization point. Closing
             // sees the mutation claim until this vacancy is published.
             slot.state.store(0, Ordering::SeqCst);
             true
@@ -892,8 +892,9 @@ impl ThreadLifecyclePage {
         released
     }
 
-    /// Adoption and normal host completion consume their exact slot while
-    /// Open. Closing retains every slot until settlement.
+    /// Adoption and normal host completion consume their exact slot until
+    /// Closed. Fork/exec gates block new births, not already-born adoption.
+    /// Closing retains every slot until settlement.
     pub fn release_adopted_host_birth(
         &self,
         identity: carrick_core::terminal::HostThreadRetirementReceipt,
