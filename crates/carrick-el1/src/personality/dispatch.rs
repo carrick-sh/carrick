@@ -1788,6 +1788,32 @@ impl<
     Context: DispatchContext,
 > carrick_personality_linux::sched::SchedVenue for El1PendingFamilies<'_, F, C, U, G, Context>
 {
+    fn yield_current(&mut self) -> FamilyCompletion {
+        let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
+            return FamilyCompletion::Forward;
+        };
+        let Some(slot) = self.frame.slot() else {
+            return FamilyCompletion::Forward;
+        };
+        let Some(zone) = &mut self.zone else {
+            return FamilyCompletion::Forward;
+        };
+        let Some(frame) = self.frame.arm_frame() else {
+            return FamilyCompletion::Forward;
+        };
+        match native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
+            .yield_queued(frame)
+        {
+            Some(carrick_core::Served::Returned { switched: true }) => {
+                FamilyCompletion::Switched(0)
+            }
+            Some(carrick_core::Served::Returned { switched: false }) => {
+                FamilyCompletion::Complete(0)
+            }
+            Some(carrick_core::Served::Idle) => FamilyCompletion::Suspended,
+            None => FamilyCompletion::Forward,
+        }
+    }
     fn argument(&self, index: usize) -> u64 {
         self.frame.argument(index).unwrap_or(0)
     }
