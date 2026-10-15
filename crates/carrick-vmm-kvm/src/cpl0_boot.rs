@@ -6537,7 +6537,9 @@ impl Cpl0Carrier {
             )
             .map_err(|e| fail(format!("stock: {e:?}")))?;
         let controls: &[ThreadControlSlot; 9] = self.metadata(0xb000 + index as u64 * 0x1000);
-        controls[1].reset_for_host_birth(BlockedMask(0)).unwrap();
+        controls[1]
+            .reset_for_host_birth(BlockedMask(0))
+            .map_err(|e| fail(format!("reset: {e:?}")))?;
         page.bind_control_address(
             entry,
             METADATA_VA + 0xb000 + index as u64 * 0x1000 + size_of::<ThreadControlSlot>() as u64,
