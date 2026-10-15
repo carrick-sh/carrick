@@ -229,6 +229,7 @@ impl CarrierKernelRuntime {
         *self.debug_server.lock() = carrick_kernel::kernel::KernelDebugServer::install(
             Arc::clone(&self.kernel),
             scope.as_str(),
+            None,
         );
     }
 

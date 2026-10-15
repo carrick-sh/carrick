@@ -132,11 +132,7 @@ impl KernelDebugServer {
     /// publish the endpoint is reported and the run continues: the guest
     /// workload is the product, and losing the debugger must not lose the run.
     /// The failure is never silent.
-    pub fn install(kernel: Arc<Kernel>, carrier_scope: &str) -> Option<Self> {
-        Self::install_with_physical(kernel, carrier_scope, None)
-    }
-
-    pub fn install_with_physical(
+    pub fn install(
         kernel: Arc<Kernel>,
         carrier_scope: &str,
         physical: Option<Arc<dyn PhysicalCaptureProvider>>,
@@ -448,7 +444,7 @@ mod tests {
             .expect("bootstrap");
             let (kernel, _context) = Kernel::bootstrap_root(bootstrap).expect("kernel");
             {
-                let _server = KernelDebugServer::install(kernel, &scope);
+                let _server = KernelDebugServer::install(kernel, &scope, None);
                 let endpoint = DebugEndpoint::for_run_id(&scope).expect("endpoint");
                 assert!(UnixStream::connect(endpoint.socket_path()).is_ok());
             }
