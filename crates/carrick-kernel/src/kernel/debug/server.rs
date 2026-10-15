@@ -70,16 +70,12 @@ impl KernelDebugServer {
         carrier_scope: &str,
         physical: Option<Arc<dyn PhysicalCaptureProvider>>,
     ) -> Result<Self, ServerError> {
-        Self::start_at_with_physical(kernel, DebugEndpoint::for_run_id(carrier_scope)?, physical)
+        Self::start_at(kernel, DebugEndpoint::for_run_id(carrier_scope)?, physical)
     }
 
     /// Bind and serve at an exact endpoint. Used by tests and by callers that
     /// already resolved the run identity.
-    pub fn start_at(kernel: Arc<Kernel>, endpoint: DebugEndpoint) -> Result<Self, ServerError> {
-        Self::start_at_with_physical(kernel, endpoint, None)
-    }
-
-    fn start_at_with_physical(
+    pub fn start_at(
         kernel: Arc<Kernel>,
         endpoint: DebugEndpoint,
         physical: Option<Arc<dyn PhysicalCaptureProvider>>,
@@ -465,7 +461,8 @@ mod tests {
         )
         .expect("bootstrap");
         let (kernel, _context) = Kernel::bootstrap_root(bootstrap).expect("kernel");
-        let mut server = KernelDebugServer::start_at(kernel, endpoint.clone()).expect("server");
+        let mut server =
+            KernelDebugServer::start_at(kernel, endpoint.clone(), None).expect("server");
         let mut stalled = UnixStream::connect(endpoint.socket_path()).expect("stalled peer");
         stalled.write_all(&64_u32.to_be_bytes()).expect("prefix");
         stalled.write_all(b"x").expect("partial payload");
