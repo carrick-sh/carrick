@@ -498,6 +498,15 @@ fn queue_base_chain() -> Result<BTreeMap<String, String>, ReceiptError> {
             path: PathBuf::from("gh"),
             source,
         })?;
+    let denied = [&output.stdout, &output.stderr].iter().any(|stream| {
+        let message = String::from_utf8_lossy(stream).to_ascii_lowercase();
+        message.contains("forbidden") || message.contains("resource not accessible")
+    });
+    if denied {
+        return Err(ReceiptError::Baseline(
+            "merge queue GraphQL lookup denied (token scope?)".into(),
+        ));
+    }
     if !output.status.success() {
         return Err(ReceiptError::Baseline(format!(
             "merge queue GraphQL lookup failed ({})",
