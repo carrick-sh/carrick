@@ -337,15 +337,17 @@ impl carrick_personality_linux::signal::SignalBackend for crate::isa::aarch64::A
         let sp_val = 0u64;
 
         let sp = UserVa::new(sp_val);
-        let mut bytes = [0u8; arm::PUBLIC_FRAME_LEN];
+        // A public frame is over 4 KiB. Keep the admitted copy off the 16 KiB
+        // EL1 stack and borrow it throughout decode.
+        let mut bytes = crate::rust_alloc::vec![0u8; arm::PUBLIC_FRAME_LEN];
         if !copy_in(&mut bytes, sp) {
             return Err(ArchError::InvalidFrame);
         }
-        let Some(sigframe) = RtSigframe::read_from_bytes(&bytes).ok() else {
+        let Some(sigframe) = RtSigframe::ref_from_bytes(&bytes).ok() else {
             return Err(ArchError::InvalidFrame);
         };
 
-        let (mask, saved_sp) = restore(frame, &sigframe, _fpstate, sp)?;
+        let (mask, saved_sp) = restore(frame, sigframe, _fpstate, sp)?;
 
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         unsafe {
