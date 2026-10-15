@@ -198,8 +198,8 @@ mod tests {
         )
         .expect("root bootstrap input");
         let (kernel, _context) = Kernel::bootstrap_root(bootstrap).expect("root kernel");
-        let mut server =
-            KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
+        let mut server = KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone(), None)
+            .expect("server");
 
         let degraded = match fetch_at(&endpoint, None) {
             Err(ClientError::Degraded(degraded)) => degraded,
@@ -234,8 +234,8 @@ mod tests {
     fn a_live_server_serves_every_table_from_one_coherent_snapshot() {
         let (_temp, endpoint) = scoped_endpoint("k1-debug-all-tables");
         let kernel = kernel_with_root();
-        let mut server =
-            KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
+        let mut server = KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone(), None)
+            .expect("server");
 
         let snapshot = fetch_at(&endpoint, None).expect("fetch snapshot");
 
@@ -259,8 +259,8 @@ mod tests {
     fn a_filtered_request_carries_exactly_the_requested_tables() {
         let (_temp, endpoint) = scoped_endpoint("k1-debug-filtered");
         let kernel = kernel_with_root();
-        let mut server =
-            KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
+        let mut server = KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone(), None)
+            .expect("server");
 
         let wanted = vec![KernelDebugTable::Task, KernelDebugTable::Thread];
         let snapshot = fetch_at(&endpoint, Some(wanted.clone())).expect("fetch filtered");
@@ -291,10 +291,10 @@ mod tests {
     fn a_second_server_cannot_steal_a_live_endpoint() {
         let (_temp, endpoint) = scoped_endpoint("k1-debug-exclusive");
         let kernel = kernel_with_root();
-        let mut first =
-            KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
+        let mut first = KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone(), None)
+            .expect("server");
 
-        let error = KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone())
+        let error = KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone(), None)
             .expect_err("a live endpoint must not be stolen");
         assert!(
             matches!(
@@ -310,8 +310,8 @@ mod tests {
     fn shutdown_releases_the_socket() {
         let (_temp, endpoint) = scoped_endpoint("k1-debug-release");
         let kernel = kernel_with_root();
-        let mut server =
-            KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
+        let mut server = KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone(), None)
+            .expect("server");
         assert!(endpoint.socket_path().exists(), "server must bind");
         server.shutdown();
         assert!(
@@ -453,8 +453,8 @@ mod tests {
     fn aux_provider_absent_returns_empty_tables_with_marker() {
         let (_temp, endpoint) = scoped_endpoint("k1-debug-aux-absent");
         let kernel = kernel_with_root();
-        let mut server =
-            KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
+        let mut server = KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone(), None)
+            .expect("server");
 
         let wanted = vec![
             KernelDebugTable::Scheduler,
@@ -609,8 +609,8 @@ mod tests {
         kernel
             .register_debug_aux_provider(&provider)
             .expect("register carrier provider");
-        let mut server =
-            KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
+        let mut server = KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone(), None)
+            .expect("server");
 
         let wanted = vec![
             KernelDebugTable::Scheduler,
@@ -654,8 +654,8 @@ mod tests {
             kernel.register_debug_aux_provider(&beta).is_err(),
             "a second allocation must fail closed",
         );
-        let mut server =
-            KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
+        let mut server = KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone(), None)
+            .expect("server");
 
         let snapshot = fetch_at(&endpoint, None).expect("unfiltered snapshot");
         let ids = snapshot
@@ -692,8 +692,8 @@ mod tests {
             .register_debug_aux_provider(&provider)
             .expect("idempotent registration");
         assert_eq!(first, second, "same allocation must retain one exact token");
-        let mut server =
-            KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
+        let mut server = KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone(), None)
+            .expect("server");
 
         let snapshot =
             fetch_at(&endpoint, Some(vec![KernelDebugTable::Executor])).expect("fetch snapshot");
@@ -714,8 +714,8 @@ mod tests {
     fn thread_row_carries_exec_invalidation_pending() {
         let (_temp, endpoint) = scoped_endpoint("k1-debug-thread-inval");
         let kernel = kernel_with_root();
-        let mut server =
-            KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
+        let mut server = KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone(), None)
+            .expect("server");
 
         let snapshot =
             fetch_at(&endpoint, Some(vec![KernelDebugTable::Thread])).expect("fetch snapshot");
@@ -768,7 +768,8 @@ mod tests {
             let (_temp, endpoint) = scoped_endpoint("k1-debug-abort");
             let kernel = kernel_with_root();
             let mut server =
-                KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
+                KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone(), None)
+                    .expect("server");
             // A prior test's latch would make this prove nothing.
             let _ = post_mortem::take_abort_request();
 
@@ -795,7 +796,8 @@ mod tests {
             let (_temp, endpoint) = scoped_endpoint("k1-debug-default-action");
             let kernel = kernel_with_root();
             let mut server =
-                KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone()).expect("server");
+                KernelDebugServer::start_at(Arc::clone(&kernel), endpoint.clone(), None)
+                    .expect("server");
             let _ = post_mortem::take_abort_request();
 
             let snapshot = fetch_at(&endpoint, None).expect("fetch snapshot");
