@@ -476,28 +476,73 @@ mod tests {
 
     const RUNNER: RunnerId = RunnerId(700);
 
+    fn queued(context: &JobContext, job: u64) -> super::super::github::QueuedJob {
+        super::super::github::QueuedJob {
+            key: key(context, job),
+            event: context.event.clone(),
+            sha: context.sha.clone(),
+        }
+    }
+
     #[test]
     fn pending_merge_group_outranks_and_blocks_main_push() {
-        let push = key(&run_a(), 11);
         let group = key(&run_b(), 21);
-        let demand = super::super::mac::prioritize_demand(vec![
-            (push, "push".into()),
-            (group, "merge_group".into()),
-        ]);
+        let demand = super::super::mac::prioritize_demand(
+            vec![queued(&run_a(), 11), queued(&run_b(), 21)],
+            &[],
+        );
         assert_eq!(demand, vec![group]);
+    }
+
+    #[test]
+    fn pending_group_base_push_is_required_before_group() {
+        // The merge-group job's base SHA is the push run's head SHA. Its
+        // receipt gate cannot finish until this push publishes a receipt.
+        let base_push = key(&run_a(), 11);
+        let group = key(&run_b(), 21);
+        let newer = context(30, "push", "refs/heads/main", &"c".repeat(40));
+        let jobs = vec![
+            queued(&run_a(), 11),
+            queued(&run_b(), 21),
+            queued(&newer, 31),
+        ];
+        let queue = json!({"data":{"repository":{"mergeQueue":{"entries":{
+            "pageInfo":{"hasNextPage":false},
+            "nodes":[{"position":1,
+                "baseCommit":{"oid":run_a().sha},
+                "headCommit":{"oid":run_b().sha},
+                "pullRequest":{"headRepository":{"nameWithOwner":REPOSITORY}}
+            }]
+        }}}}});
+        let required = super::super::github::required_base_pushes(&jobs, &queue, |key, sha| {
+            assert_eq!(key, base_push);
+            assert_eq!(sha, run_a().sha);
+            Ok(false)
+        })
+        .unwrap();
+        let demand = super::super::mac::prioritize_demand(jobs.clone(), &required);
+        assert_eq!(demand, vec![base_push, group]);
+        let received =
+            super::super::github::required_base_pushes(&jobs, &queue, |_, _| Ok(true)).unwrap();
+        assert!(received.is_empty());
+        assert_eq!(
+            super::super::mac::prioritize_demand(jobs, &received),
+            vec![group]
+        );
     }
 
     #[test]
     fn newer_main_push_temporarily_supersedes_older_pending_push() {
         let older = key(&run_a(), 11);
         let newer = key(&context(30, "push", "refs/heads/main", &"c".repeat(40)), 31);
-        let demand = super::super::mac::prioritize_demand(vec![
-            (older, "push".into()),
-            (newer, "push".into()),
-        ]);
+        let newer_context = context(30, "push", "refs/heads/main", &"c".repeat(40));
+        let demand = super::super::mac::prioritize_demand(
+            vec![queued(&run_a(), 11), queued(&newer_context, 31)],
+            &[],
+        );
         assert_eq!(demand, vec![newer]);
         assert_eq!(
-            super::super::mac::prioritize_demand(vec![(older, "push".into())]),
+            super::super::mac::prioritize_demand(vec![queued(&run_a(), 11)], &[]),
             vec![older],
             "older push resumes when its successor leaves the queue"
         );

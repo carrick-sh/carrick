@@ -44,14 +44,21 @@ group (its queue entry and every entry ahead of it, from the GraphQL
 `mergeQueue` listing) must have its head repository equal to
 `carrick-sh/carrick`. A group with a fork pull request is refused.
 
-Demand is served in priority order: admitted live merge groups, then the
-newest pending main push, then owner `workflow_dispatch` runs on main.
-While any merge-group HVF job is pending, no main-push HVF job is offered a
-runner, even if the group is temporarily superseded or refused in this pass.
-A newer main push temporarily supersedes older pending pushes. These skips
-do not cancel a run or enter the durable refusal ledger: a push becomes
-eligible again when the higher-priority demand leaves the queue. A per-job refusal
-never aborts the pass: the controller records and logs it once per
+Demand is served in priority order: a pending main push needed for a group's
+missing base receipt, admitted live merge groups, then the newest pending
+main push when no group is pending, then owner `workflow_dispatch` runs on main.
+While a merge-group HVF job is pending, a main-push job is offered a runner
+only when its head SHA is the group's `base_sha` and that push run has not
+published an HVF receipt. The group's hosted `hvf-gate` waits for that base
+receipt; its producer runs before the group, even when a newer main push is
+queued. The controller obtains the base from `baseCommit.oid` in the existing
+merge-queue GraphQL observation and reuses that observation when vetting the
+group. Other main pushes are deferred while groups are pending. A newer main
+push temporarily supersedes older pending pushes unless an older push is a
+group's missing base-receipt producer. These skips do not cancel a run or
+enter the durable refusal ledger: a push becomes eligible again when the
+higher-priority demand leaves the queue. A per-job refusal never aborts the
+pass: the controller records and logs it once per
 run/attempt/job key, then considers the next job in the same pass. Refusals
 survive restarts; a re-run's new attempt is vetted afresh. Vetting happens
 before reserving a runner, so a refused job cannot occupy cloudmac's budget.
@@ -314,8 +321,8 @@ or successful latest workflow run, and a GitHub comparison whose merge base
 is exactly the shallower SHA. The extra observation uses one page of at most
 100 workflow runs and at most five comparisons per vet. Missing, partial,
 failed or ambiguous depth observations preserve ordinary group service. Main
-pushes retain their per-SHA baseline receipts and are served once no group is
-pending.
+pushes retain their per-SHA baseline receipts; only an unreceipted base
+producer is served while a group is pending.
 
 Superseded demand does not enter the durable refusal ledger: if the successor
 fails or leaves the queue, the shallower group can be served again. If a
