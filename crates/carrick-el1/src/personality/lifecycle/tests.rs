@@ -248,6 +248,7 @@ impl World {
             CompletionRoute::Suspended => Action::Idle,
             CompletionRoute::Forward => Action::Forward,
             CompletionRoute::InvalidCompletion => panic!("stale native completion"),
+            CompletionRoute::HostCustody => Action::HostCustody,
         }
     }
 
