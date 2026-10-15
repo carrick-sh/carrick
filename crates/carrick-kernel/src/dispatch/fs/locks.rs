@@ -408,7 +408,7 @@ impl LogicalRecordLockState {
 
 #[derive(::core::default::Default)]
 pub struct LogicalRecordLocks {
-    pub(crate) state: parking_lot::Mutex<LogicalRecordLockState>,
+    state: parking_lot::Mutex<LogicalRecordLockState>,
     changed: parking_lot::Condvar,
     next_wait_id: std::sync::atomic::AtomicU64,
     /// How many entries the table holds right now — locks, flocks and
@@ -650,7 +650,7 @@ impl LogicalRecordLocks {
                 self.changed.notify_all();
                 return Ok(());
             }
-            if host_signal.has_unblocked_pending_for(tid.raw(), carrick_abi::SigBlockMask::NONE) {
+            if host_signal.has_unblocked_pending_for(tid.raw(), block_mask) {
                 return Err(LINUX_EINTR);
             }
             state.wait_for(&self.changed, std::time::Duration::from_millis(10));
@@ -781,7 +781,7 @@ impl LogicalRecordLocks {
                 Err(errno) if errno == LINUX_EAGAIN => {}
                 settled => break settled,
             }
-            if host_signal.has_unblocked_pending_for(tid.raw(), carrick_abi::SigBlockMask::NONE) {
+            if host_signal.has_unblocked_pending_for(tid.raw(), block_mask) {
                 self.retract_wait_locked(&mut state, wait);
                 break Err(LINUX_EINTR);
             }
@@ -848,7 +848,7 @@ impl LogicalRecordLockWait {
     /// `try_set`, this publishes the wait's edge in the wait-for graph so the
     /// deadlock a re-polled waiter is part of is visible to the other side.
     pub(crate) fn try_acquire(&self) -> Result<(), LinuxErrno> {
-        let mut state = self.locks.state.lock();
+        let mut state = self.locks.state();
         self.locks
             .poll_set_locked(&mut state, &self.request, self.edge.id)
     }
