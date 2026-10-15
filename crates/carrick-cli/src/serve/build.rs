@@ -537,6 +537,25 @@ mod tests {
         assert!(unpack_context(&gz, dest.path()).is_err());
     }
 
+    #[tokio::test]
+    async fn gzip_expansion_over_cap_returns_413_with_limit() {
+        let gz = gzip_tar(|builder| {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(32 * 1024 * 1024 + 1);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(
+                    &mut header,
+                    "bomb",
+                    std::io::repeat(0).take(32 * 1024 * 1024 + 1),
+                )
+                .unwrap();
+        });
+        let response = build_response("", Bytes::from(gz)).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     #[test]
     fn rejects_context_entry_count_past_cap() {
         let gz = gzip_tar(|builder| {
