@@ -550,6 +550,7 @@ mod tests {
             CanonicalNr(28),  // inotify_rm_watch
             CanonicalNr(98),  // futex
             CanonicalNr(99),  // set_robust_list
+            CanonicalNr(124), // sched_yield
             CanonicalNr(132), // sigaltstack
             CanonicalNr(135), // rt_sigprocmask
             CanonicalNr(172), // getpid

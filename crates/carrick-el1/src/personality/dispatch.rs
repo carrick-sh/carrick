@@ -1790,17 +1790,29 @@ impl<
 {
     fn yield_current(&mut self) -> FamilyCompletion {
         let Some(task) = self.current_tasks.get(self.frame.task_index()) else {
-            return FamilyCompletion::Forward;
+            return FamilyCompletion::Complete(0);
         };
         let Some(slot) = self.frame.slot() else {
-            return FamilyCompletion::Forward;
+            return FamilyCompletion::Complete(0);
         };
         let Some(zone) = &mut self.zone else {
-            return FamilyCompletion::Forward;
+            return FamilyCompletion::Complete(0);
         };
         let Some(frame) = self.frame.arm_frame() else {
-            return FamilyCompletion::Forward;
+            // x86 ordinal 24 maps to this shared canonical call. It has no
+            // ARM frame to rotate, but still completes in ring.
+            return FamilyCompletion::Complete(0);
         };
+        if task.linux.has_pending_host_work()
+            || task.lifecycle_refs().is_some_and(|(page, control)| {
+                page.pending().load().0 != 0 || control.pending().load().0 != 0
+            })
+        {
+            return FamilyCompletion::CompleteWithWork(0);
+        }
+        if zone.tables.runnable_head(slot).is_none() {
+            return FamilyCompletion::Complete(0);
+        }
         match native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
             .yield_queued(frame)
         {
@@ -1811,7 +1823,9 @@ impl<
                 FamilyCompletion::Complete(0)
             }
             Some(carrick_core::Served::Idle) => FamilyCompletion::Suspended,
-            None => FamilyCompletion::Forward,
+            // A late scheduler guard or failed handoff must retain the
+            // completed syscall while the host settles pending work.
+            None => FamilyCompletion::CompleteWithWork(0),
         }
     }
     fn argument(&self, index: usize) -> u64 {
