@@ -491,10 +491,13 @@ const MEMBER_SET_CAPACITY: usize =
     carrick_el1_abi::THREAD_POOL_ENTRIES + carrick_sched_core::ZONE_RECORDS;
 
 impl PendingExit<'_> {
-    fn completed_receipts(
+    fn collected_receipts(
         &self,
         page: &ThreadLifecyclePage,
-    ) -> Option<carrick_core::terminal::CompletedMemberReceipts> {
+    ) -> Option<(
+        Vec<EntryRef>,
+        Vec<carrick_core::terminal::HostThreadRetirementReceipt>,
+    )> {
         let mut pool = Vec::new();
         let mut host = Vec::new();
         for receipt in &self.outstanding {
@@ -524,9 +527,7 @@ impl PendingExit<'_> {
                 _ => return None,
             }
         }
-        self.custody
-            .as_ref()?
-            .complete_members(&self.members, &pool, &host)
+        Some((pool, host))
     }
 }
 
@@ -611,6 +612,8 @@ pub struct NativeProcessRuntime<'a, M: Clone, C: ProcessContext> {
     closing_race_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     settle_race_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    raw_exit_after_commit_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
     registry: SpinLock<Option<&'a NativeProcessRegistry<'a, M, C>>>,
 }
 
@@ -835,21 +838,15 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                                 state
                                     .members
                                     .get(key)
-                                    // A live pool entry returns its exact entry
-                                    // receipt. An already exited entry no
-                                    // longer has a pool receipt to await.
+                                    // Core gives each exact identity one
+                                    // receipt kind. In-zone completion owes
+                                    // neither a pool nor a host receipt.
                                     .and_then(|member| {
-                                        let pool_receipt_pending =
-                                            member.control.entry().is_some_and(|entry| {
-                                                carrick_el1_abi::Lifecycle::exit_receipt_expected(
-                                                    page, entry,
-                                                )
-                                            });
-                                        (!pool_receipt_pending).then_some((
-                                            binding,
-                                            member.control,
-                                            member.record,
-                                        ))
+                                        (carrick_el1_abi::Lifecycle::expected_exit_receipt(
+                                            page,
+                                            member.control.entry(),
+                                        ) == carrick_core::lifecycle::ExpectedExitReceipt::Host)
+                                            .then_some((binding, member.control, member.record))
                                     })
                             })
                             .flatten()
@@ -1349,24 +1346,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     control,
                 });
             }
-            let closing = graph.pending_exit.get_mut(&process);
-            if let Some(pending) = closing {
-                if binding.issued()
-                    && !pending.outstanding.iter().any(|receipt| {
-                        matches!(receipt,
-                            OutstandingExitReceipt::Adopted { binding: old, control: old_control }
-                                if *old == binding && core::ptr::eq(*old_control, control)
-                        )
-                    })
-                {
-                    pending
-                        .outstanding
-                        .push(OutstandingExitReceipt::Adopted { binding, control });
-                }
-                true
-            } else {
-                false
-            }
+            graph.pending_exit.contains_key(&process)
         };
         state.members.insert(
             key,
@@ -1602,6 +1582,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
     #[cfg(test)]
     pub(super) fn install_settle_race_hook(&self, hook: Box<dyn FnOnce() + Send>) {
         *self.settle_race_hook.lock() = Some(hook);
+    }
+    #[cfg(test)]
+    pub(super) fn install_raw_exit_after_commit_hook(&self, hook: Box<dyn FnOnce() + Send>) {
+        *self.raw_exit_after_commit_hook.lock() = Some(hook);
     }
     pub fn zone(&self) -> &'a ZoneTables<C> {
         self.zone
@@ -1942,6 +1926,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             closing_race_hook: SpinLock::new(None),
             #[cfg(test)]
             settle_race_hook: SpinLock::new(None),
+            #[cfg(test)]
+            raw_exit_after_commit_hook: SpinLock::new(None),
             registry: SpinLock::new(None),
         })
     }
@@ -3351,8 +3337,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .is_some_and(|pending| {
                 pending.custody.as_ref().is_some_and(|custody| {
                     pending
-                        .completed_receipts(page)
-                        .is_some_and(|receipts| custody.can_settle(page, &receipts))
+                        .collected_receipts(page)
+                        .is_some_and(|(pool, host)| {
+                            custody.can_settle_observed(page, &pending.members, &pool, &host)
+                        })
                 })
             });
         if ready {
@@ -3443,15 +3431,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 });
                 // Consume the caller's membership while all refusal checks
                 // can still leave the gate open. Closing has no failure path.
-                page.release_live(0)
-                    .map_err(|_| NativeProcessError::Quarantined)?;
                 let custody = carrick_core::terminal::TerminalCustody::<
                     carrick_core::terminal::Process,
                     carrick_core::terminal::Live,
-                >::admitted_exit(
-                    self.key, address, wait_status.to_termination_status()
+                >::begin_exit(
+                    page, self.key, address, wait_status.to_termination_status()
                 )
-                .close_gate(page);
+                .map_err(|_| NativeProcessError::Quarantined)?;
                 if let Some(state) = registry_state.as_deref() {
                     adopted = NativeProcessRegistry::adopted_members(
                         state,
@@ -3464,17 +3450,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 let mut outstanding = Vec::with_capacity(MEMBER_SET_CAPACITY);
                 let mut pool = Vec::new();
                 for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
-                    if let Some((generation, state)) = page.state(index)
-                        && matches!(
-                            state,
-                            carrick_el1_abi::EntryState::Born
-                                | carrick_el1_abi::EntryState::Published
-                                | carrick_el1_abi::EntryState::ExitingBorn
-                                | carrick_el1_abi::EntryState::ExitingPublished
-                        )
-                    {
+                    if let Some((generation, _)) = page.state(index) {
                         let entry = carrick_el1_abi::EntryRef::new(index as u32, generation);
                         if self.control.entry() == Some(entry) {
+                            continue;
+                        }
+                        if carrick_el1_abi::Lifecycle::expected_exit_receipt(page, Some(entry))
+                            != carrick_core::lifecycle::ExpectedExitReceipt::Pool
+                        {
                             continue;
                         }
                         pool.push(entry);
@@ -3589,13 +3572,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .pending_exit
                     .get_mut(&self.key)
                     .ok_or(NativeProcessError::Quarantined)?;
-                let receipts = pending.completed_receipts(page);
+                let receipts = pending.collected_receipts(page);
                 let custody = pending
                     .custody
                     .take()
                     .ok_or(NativeProcessError::Quarantined)?;
                 let result = match receipts {
-                    Some(receipts) => custody.settle(page, receipts),
+                    Some((pool, host)) => {
+                        custody.settle_observed(page, &pending.members, &pool, &host)
+                    }
                     None => Err(custody),
                 };
                 match result {
@@ -4334,8 +4319,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
                     let ready = graph.pending_exit.get(&self.key).is_some_and(|pending| {
                         pending.custody.as_ref().is_some_and(|custody| {
                             pending
-                                .completed_receipts(page)
-                                .is_some_and(|receipts| custody.can_settle(page, &receipts))
+                                .collected_receipts(page)
+                                .is_some_and(|(pool, host)| {
+                                    custody.can_settle_observed(
+                                        page,
+                                        &pending.members,
+                                        &pool,
+                                        &host,
+                                    )
+                                })
                         })
                     });
                     if ready {
@@ -4415,6 +4407,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 {
     #[inline(never)]
     pub fn retire_thread_verdict(&mut self, verdict: carrick_core::terminal::RetirementVerdict) {
+        #[cfg(test)]
+        if let Some(hook) = self.runtime.raw_exit_after_commit_hook.lock().take() {
+            hook();
+        }
         let carrick_core::terminal::RetirementVerdict::RetireThread {
             identity,
             requires_slot_absence,
