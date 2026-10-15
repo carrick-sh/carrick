@@ -36,6 +36,45 @@ fn socket_waits_restart_with_sa_restart_except_timed_calls() {
 }
 
 #[test]
+fn socket_timeout_forces_eintr_even_with_restart_action() {
+    let (_kernel, context) = bootstrap(15_371);
+    let generation = publish(&context, 0x705);
+    for (number, timeout) in [
+        (carrick_abi::syscall::nr::RECVFROM, Some(Duration::from_secs(1))),
+        (carrick_abi::syscall::nr::SENDTO, Some(Duration::from_secs(1))),
+        (carrick_abi::syscall::nr::CONNECT, Some(Duration::from_secs(1))),
+        (carrick_abi::syscall::nr::RECVFROM, None),
+    ] {
+        let capture = ContinuationCapture::new(
+            &context,
+            generation,
+            request(number.raw()),
+            RestartClass::RestartSyscall,
+        )
+        .unwrap();
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnFds {
+                fds: WaitFds::empty(),
+                timeout,
+                sig_mask: WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd {
+                    on_timeout: LINUX_EAGAIN.guest_retval(),
+                },
+            },
+            capture,
+        )
+        .unwrap();
+        let expected = if timeout.is_some() {
+            RestartClass::Never
+        } else {
+            RestartClass::RestartSyscall
+        };
+        assert_eq!(continuation.authority().restart_class(), expected);
+    }
+    assert_eq!(LINUX_EINTR.guest_retval(), -4);
+}
+
+#[test]
 fn redispatch_resume_does_not_veto_later_signal_restart() {
     let mut resumed = ContinuationResult {
         completion: ContinuationCompletion::Redispatch,
