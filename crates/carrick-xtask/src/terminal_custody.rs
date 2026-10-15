@@ -177,6 +177,25 @@ impl<'ast> Visit<'ast> for FunctionSites {
         self.owner = previous;
     }
 
+    fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+        if test_only(&node.attrs) {
+            return;
+        }
+        let previous = self.owner.replace(node.ident.to_string());
+        visit::visit_item_trait(self, node);
+        self.owner = previous;
+    }
+
+    fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
+        if test_only(&node.attrs) {
+            return;
+        }
+        if let Some(body) = &node.default {
+            self.record(&node.sig.ident, body);
+        }
+        visit::visit_trait_item_fn(self, node);
+    }
+
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
         if test_only(&node.attrs) {
             return;
@@ -329,6 +348,16 @@ mod tests {
         let sites = sites_in_source("crates/new-lane/src/owner.rs", source).unwrap();
         assert!(sites.contains("crates/new-lane/src/owner.rs|Owner::retire_thread|live"));
         assert!(validate(&sites, &BTreeSet::from(["other".to_owned()])).is_err());
+    }
+
+    #[test]
+    fn trait_default_method_is_scanned_for_retirement_decisions() {
+        let sites = sites_in_source(
+            "crates/new-lane/src/owner.rs",
+            "trait Owner { fn retire(&self) { if self.live() == 0 {} } }",
+        )
+        .unwrap();
+        assert!(sites.contains("crates/new-lane/src/owner.rs|Owner::retire|live"));
     }
 
     #[test]
