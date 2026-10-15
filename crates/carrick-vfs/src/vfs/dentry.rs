@@ -3433,7 +3433,8 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        let operations: [(&str, fn(&DentryCache)); 4] = [
+        type CacheMutation = (&'static str, fn(&DentryCache));
+        let operations: [CacheMutation; 4] = [
             ("create", |cache| cache.entry_created("/victim", None)),
             ("remove", |cache| cache.entry_removed("/victim", None)),
             ("move", |cache| cache.entry_moved("/victim", "/new", None)),
