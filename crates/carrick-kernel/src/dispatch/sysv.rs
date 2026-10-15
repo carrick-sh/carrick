@@ -29,6 +29,7 @@ pub(crate) use super::dispatcher::IpcView;
 use super::*;
 use crate::linux_abi::{LINUX_EIO, LINUX_ENOMSG, LINUX_ENOSPC, LinuxErrno};
 use carrick_abi::{NsGid, NsUid};
+use carrick_core::ipc_permissions::{IpcGroupId, IpcPermission, IpcUserId};
 use carrick_fatal::carrick_fatal;
 use carrick_vfs::ProcMapSharing;
 use carrick_vfs::errno::HostSyscallResult as _;
@@ -331,22 +332,36 @@ impl ShmPermMode {
             self.bits &= !ShmModeFlags::LOCKED.bits();
         }
     }
+}
 
-    fn owner_readable(self) -> bool {
-        self.bits & 0o400 != 0
+fn ipc_allows(
+    mode: ShmPermMode,
+    uid: NsUid,
+    cuid: NsUid,
+    gid: NsGid,
+    cgid: NsGid,
+    creds: &crate::kernel::Credentials,
+    requested_mode: u16,
+) -> bool {
+    IpcPermission {
+        uid: IpcUserId::new(uid.raw()),
+        cuid: IpcUserId::new(cuid.raw()),
+        gid: IpcGroupId::new(gid.raw()),
+        cgid: IpcGroupId::new(cgid.raw()),
+        mode: mode.perms() as u16,
     }
-
-    fn other_readable(self) -> bool {
-        self.bits & 0o004 != 0
-    }
-
-    fn owner_writable(self) -> bool {
-        self.bits & 0o200 != 0
-    }
-
-    fn other_writable(self) -> bool {
-        self.bits & 0o002 != 0
-    }
+    .allows(
+        IpcUserId::new(creds.euid.raw()),
+        |group| {
+            let group = NsGid::new(group.raw());
+            creds.egid == group
+                || creds
+                    .supplementary_groups_override()
+                    .is_some_and(|groups| groups.contains(&group))
+        },
+        creds.euid.is_root(),
+        requested_mode,
+    )
 }
 
 #[derive(::core::clone::Clone, ::core::fmt::Debug)]
@@ -392,21 +407,15 @@ impl ShmSegment {
     }
 
     fn can_read(&self, creds: &crate::kernel::Credentials) -> bool {
-        creds.euid.is_root()
-            || if creds.euid == self.uid {
-                self.mode.owner_readable()
-            } else {
-                self.mode.other_readable()
-            }
+        ipc_allows(
+            self.mode, self.uid, self.cuid, self.gid, self.cgid, creds, 0o400,
+        )
     }
 
     fn can_write(&self, creds: &crate::kernel::Credentials) -> bool {
-        creds.euid.is_root()
-            || if creds.euid == self.uid {
-                self.mode.owner_writable()
-            } else {
-                self.mode.other_writable()
-            }
+        ipc_allows(
+            self.mode, self.uid, self.cuid, self.gid, self.cgid, creds, 0o200,
+        )
     }
 }
 
@@ -778,21 +787,15 @@ impl SemSet {
     }
 
     fn can_read(&self, creds: &crate::kernel::Credentials) -> bool {
-        creds.euid.is_root()
-            || if creds.euid == self.uid {
-                self.mode.owner_readable()
-            } else {
-                self.mode.other_readable()
-            }
+        ipc_allows(
+            self.mode, self.uid, self.cuid, self.gid, self.cgid, creds, 0o400,
+        )
     }
 
     fn can_write(&self, creds: &crate::kernel::Credentials) -> bool {
-        creds.euid.is_root()
-            || if creds.euid == self.uid {
-                self.mode.owner_writable()
-            } else {
-                self.mode.other_writable()
-            }
+        ipc_allows(
+            self.mode, self.uid, self.cuid, self.gid, self.cgid, creds, 0o200,
+        )
     }
 
     fn record_logical_semop(&self, pid: i32, sops: &[LinuxSembuf]) {
@@ -1231,21 +1234,15 @@ impl MsgQueueFile {
     }
 
     fn can_read(&self, creds: &crate::kernel::Credentials) -> bool {
-        creds.euid.is_root()
-            || if creds.euid == self.uid {
-                self.mode.owner_readable()
-            } else {
-                self.mode.other_readable()
-            }
+        ipc_allows(
+            self.mode, self.uid, self.cuid, self.gid, self.cgid, creds, 0o400,
+        )
     }
 
     fn can_write(&self, creds: &crate::kernel::Credentials) -> bool {
-        creds.euid.is_root()
-            || if creds.euid == self.uid {
-                self.mode.owner_writable()
-            } else {
-                self.mode.other_writable()
-            }
+        ipc_allows(
+            self.mode, self.uid, self.cuid, self.gid, self.cgid, creds, 0o200,
+        )
     }
 
     fn serialize(&self) -> Vec<u8> {
@@ -4607,15 +4604,21 @@ mod ipc_set_tests {
             segment.cgid = NsGid::new(2002);
         }
         let root = dispatcher.capture_one_task_context().unwrap();
-        let member = root.kernel().update_credentials(&root, |creds| {
-            creds.seed_identity(NsUid::new(1003), NsGid::new(2003));
-            creds.set_supplementary_groups(vec![NsGid::new(2002)]);
-        }).unwrap();
+        let member = root
+            .kernel()
+            .update_credentials(&root, |creds| {
+                creds.seed_identity(NsUid::new(1003), NsGid::new(2003));
+                creds.set_supplementary_groups(vec![NsGid::new(2002)]);
+            })
+            .unwrap();
         let creds = member.resources().credentials();
         let state = dispatcher.sysv.state.lock();
         let segment = state.segments.get(&shmid).unwrap();
         assert!(segment.can_read(&creds), "creator group read must succeed");
-        assert!(!segment.can_write(&creds), "creator group write must fail with EACCES (13)");
+        assert!(
+            !segment.can_write(&creds),
+            "creator group write must fail with EACCES (13)"
+        );
         assert_eq!(LINUX_EACCES.guest_retval(), -13);
     }
 
