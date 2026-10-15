@@ -605,7 +605,7 @@ Chat, worker mailboxes, scratch notes and agent memory are not.
   guest-visible behaviour change, Linux dispatch/mm/fork/signal untouched)
   take the lighter gate: kernel-semantics, KVM/CPL0 builds and a signed
   smoke. Anything touching Linux paths keeps the full signed gate.
-- **PRs are capped at about 2k changed lines.** Larger work lands as
+- **PRs are capped at about 4k changed lines** (owner, 2026-10-15). Larger work lands as
   independent slices, each with its own witness; exceptions need owner
   approval recorded on the PR (decision log #231).
 - **No fake backends.** No in-memory or stub implementation of a service
