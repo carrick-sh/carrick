@@ -2590,6 +2590,45 @@ fn arm_host_born_sibling_raw_exit_retires_exact_owned_thread() {
     assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
 }
 
+#[test]
+fn arm_host_birth_first_syscall_adopts_during_fork_and_exec_gate() {
+    use carrick_el1_abi::Lifecycle;
+    for awaiting_exec in [false, true] {
+        let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+        let mut service = fixture.process_service();
+        fixture
+            .enter(
+                fixture.control,
+                fixture_ttbr0(fixture),
+                &mut service,
+                |_| (),
+            )
+            .unwrap();
+        let control = host_born_sibling(fixture, 42);
+        fixture.page.close_for_fork().unwrap();
+        if awaiting_exec {
+            fixture.page.await_exec_binding().unwrap();
+        }
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[8] = 178; // gettid is the host-born thread's first syscall.
+        assert_eq!(
+            arm_call(fixture, control, &mut service, &mut frame).unwrap(),
+            carrick_personality_linux::dispatch::CompletionRoute::WithWork,
+            "awaiting_exec={awaiting_exec}"
+        );
+        assert_eq!(frame.x[0], 42);
+        assert!(
+            (0..carrick_el1_abi::THREAD_POOL_ENTRIES)
+                .all(|index| fixture.page.host_birth_identity(index).is_none())
+        );
+        if awaiting_exec {
+            fixture.page.reopen_after_exec_binding().unwrap();
+        } else {
+            fixture.page.reopen_after_fork().unwrap();
+        }
+    }
+}
+
 #[cfg(test)]
 #[test]
 fn arm_registered_sibling_switch_in_without_pending_owner_work() {

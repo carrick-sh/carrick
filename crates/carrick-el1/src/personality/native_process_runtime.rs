@@ -1479,7 +1479,7 @@ impl IssuedHostThread {
             || resources.address != address
             || resources.file_table != self.file_table
             || core::ptr::eq(resources.control, control)
-            || resources.page.gate() != carrick_el1_abi::GateState::Open
+            || resources.page.gate() == carrick_el1_abi::GateState::Closed
             || resources.page.live() <= 1
         {
             return Err(NativeProcessError::Stale);
