@@ -1,5 +1,6 @@
 # ppoll sleeps on an empty set, then rejects an invalid nanosecond field.
 .equ SYS_ppoll, 271
+.equ SYS_read, 0
 .equ SYS_write, 1
 .equ SYS_exit_group, 231
 .global _start
@@ -10,6 +11,7 @@ _start:
     movq $100000000, 8(%rsp)
     lea begin(%rip), %rsi
     call marker
+    call start_wait
     mov $SYS_ppoll, %rax
     xor %rdi, %rdi
     xor %rsi, %rsi
@@ -45,6 +47,17 @@ marker:
     mov $2, %rdx
     syscall
     cmp $2, %rax
+    jne fail
+    ret
+start_wait:
+    sub $8, %rsp
+    mov $SYS_read, %rax
+    xor %rdi, %rdi
+    mov %rsp, %rsi
+    mov $1, %rdx
+    syscall
+    add $8, %rsp
+    cmp $1, %rax
     jne fail
     ret
 fail:

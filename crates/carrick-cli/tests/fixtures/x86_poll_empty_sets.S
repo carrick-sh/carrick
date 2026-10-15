@@ -1,5 +1,6 @@
 # Both zero descriptors and all-negative descriptors must wait for a timeout.
 .equ SYS_poll, 7
+.equ SYS_read, 0
 .equ SYS_write, 1
 .equ SYS_exit_group, 231
 .global _start
@@ -7,6 +8,7 @@
 _start:
     lea begin(%rip), %rsi
     call marker
+    call start_wait
     mov $SYS_poll, %rax
     xor %rdi, %rdi
     xor %rsi, %rsi
@@ -16,6 +18,7 @@ _start:
     jne fail
     lea negative(%rip), %rsi
     call marker
+    call start_wait
     sub $8, %rsp
     movl $-1, 0(%rsp)
     movw $1, 4(%rsp)
@@ -39,6 +42,17 @@ marker:
     mov $2, %rdx
     syscall
     cmp $2, %rax
+    jne fail
+    ret
+start_wait:
+    sub $8, %rsp
+    mov $SYS_read, %rax
+    xor %rdi, %rdi
+    mov %rsp, %rsi
+    mov $1, %rdx
+    syscall
+    add $8, %rsp
+    cmp $1, %rax
     jne fail
     ret
 fail:

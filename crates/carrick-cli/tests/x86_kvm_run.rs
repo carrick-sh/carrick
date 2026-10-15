@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 
@@ -743,8 +743,17 @@ fn run_poll_timeout_markers(
     mut command: std::process::Command,
     markers: &[&[u8; 2]],
 ) -> (Vec<u8>, Option<i32>) {
+    run_poll_timeout_markers_with(&mut command, markers, |_, _| ())
+}
+
+fn run_poll_timeout_markers_with(
+    command: &mut std::process::Command,
+    markers: &[&[u8; 2]],
+    mut after_start: impl FnMut(i32, usize),
+) -> (Vec<u8>, Option<i32>) {
     let mut child = ReapChild(
         command
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -752,6 +761,7 @@ fn run_poll_timeout_markers(
     );
     let mut stdout = child.stdout.take().unwrap();
     let mut output = Vec::new();
+    let mut start_epoch: Option<Instant> = None;
     for (index, expected) in markers.iter().enumerate() {
         assert!(
             poll_readable(stdout.as_raw_fd(), 5_000),
@@ -775,15 +785,35 @@ fn run_poll_timeout_markers(
         }
         assert_eq!(&marker, *expected);
         output.extend_from_slice(&marker);
-        if index + 1 < markers.len() {
+        if let Some(start) = start_epoch.take() {
             assert!(
-                !poll_readable(stdout.as_raw_fd(), 40),
-                "poll returned before its 100ms deadline after marker {index}"
+                start.elapsed() >= Duration::from_millis(100),
+                "poll returned before its 100ms deadline after marker {}",
+                index - 1
             );
+        }
+        if index + 1 < markers.len() {
+            start_epoch = Some(Instant::now());
+            child.stdin.as_mut().unwrap().write_all(b"X").unwrap();
+            after_start(stdout.as_raw_fd(), index);
         }
     }
     let status = child.wait().unwrap();
     (output, status.code())
+}
+
+#[test]
+fn host_poll_observer_late_marker_uses_original_start_epoch() {
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("poll-empty-sets");
+    compile_assembly("x86_poll_empty_sets.S", &elf);
+    let mut native = std::process::Command::new(&elf);
+    assert_eq!(
+        run_poll_timeout_markers_with(&mut native, &[b"B\n", b"N\n", b"T\n"], |fd, _| {
+            assert!(poll_readable(fd, 5_000), "native poll completion missing");
+        }),
+        (b"B\nN\nT\n".to_vec(), Some(7))
+    );
 }
 
 fn mounted_poll_command(dir: &std::path::Path, elf: &std::path::Path) -> std::process::Command {
