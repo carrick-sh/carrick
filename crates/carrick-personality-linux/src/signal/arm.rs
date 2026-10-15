@@ -145,9 +145,18 @@ pub fn decode(
         return Err(FrameError::InvalidContext);
     }
     let bytes = bytes.get(..PUBLIC_FRAME_LEN).ok_or(FrameError::Truncated)?;
-    let frame = RtSigframe::read_from_bytes(bytes).map_err(|_| FrameError::Truncated)?;
-    let context = frame.ucontext.uc_mcontext;
-    validate_context(&context)?;
+    let frame = RtSigframe::ref_from_bytes(bytes).map_err(|_| FrameError::Truncated)?;
+    let context_bytes = bytes
+        .get(
+            UCONTEXT_OFFSET + core::mem::offset_of!(LinuxUcontext, uc_mcontext)
+                ..UCONTEXT_OFFSET
+                    + core::mem::offset_of!(LinuxUcontext, uc_mcontext)
+                    + core::mem::size_of::<LinuxSignalContext>(),
+        )
+        .ok_or(FrameError::Truncated)?;
+    let context =
+        LinuxSignalContext::ref_from_bytes(context_bytes).map_err(|_| FrameError::Truncated)?;
+    validate_context(context)?;
     let fpsimd = decode_records(&context.__reserved, require_fpsimd)?;
     Ok(ResumeContext {
         regs: context.regs,
