@@ -4698,16 +4698,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     }
 
     fn wake_pending_exit_on_receipt(&mut self) {
-        let channel = self
-            .runtime
-            .graph
-            .lock()
-            .pending_exit
-            .get(&self.key)
-            .map(|pending| pending.channel.clone());
-        if let Some(channel) = channel
-            && self.publish_channel(&channel).is_err()
-        {
+        // The shared pending-exit wake is consumed once, after all exact
+        // receipts and live membership have returned. A sibling's partial
+        // receipt alone does not make the parked owner runnable.
+        if self.lifecycle_admission_settled().is_err() {
             self.run_failure = Some(carrick_core_abi::NativeRunFailureReason::BirthSettlement);
         }
     }
@@ -7610,6 +7604,7 @@ mod tests {
             let claim = page.claim_any().unwrap();
             if claim_live {
                 assert_eq!(page.thread_born(), Some(2));
+                entry.thread_spawned(41, 42, &mut || Ok(())).unwrap();
             }
             let expected_status = if signal_exit {
                 LinuxWaitStatus::signaled(15, false)
@@ -7635,10 +7630,43 @@ mod tests {
                 entry.thread_spawned(41, 42, &mut || panic!("terminal close admitted Born")),
                 Err(-11)
             );
-            if claim_live {
-                assert_eq!(page.release_live(0), Ok(0));
-            }
             page.unclaim(claim).unwrap();
+            let channel = runtime
+                .graph
+                .lock()
+                .pending_exit
+                .get(&entry.key)
+                .unwrap()
+                .channel
+                .clone();
+            assert_eq!(channel.generation.generation().raw(), 0);
+            if claim_live {
+                let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
+                    carrick_core_abi::ExecutionBinding {
+                        task: carrick_core_abi::entry::EntryTaskKey::from_raw(41),
+                        generation: carrick_core_abi::entry::EntryGeneration::from_raw(11),
+                        mm: carrick_core_abi::entry::EntryMmKey::from_raw(1),
+                        thread_generation: carrick_core_abi::entry::EntryThreadGeneration::from_raw(
+                            102,
+                        ),
+                    },
+                    None,
+                    carrick_sched_core::process::TerminationStatus::exited(0),
+                )
+                .unwrap();
+                let (_terminal, membership) = carrick_core::terminal::TerminalCustody::<
+                    carrick_core::terminal::Thread,
+                    carrick_core::terminal::Live,
+                >::admitted(identity)
+                .begin()
+                .reserve_nonfinal(&*page)
+                .unwrap_or_else(|_| panic!("last sibling must retire during close"));
+                membership.publish();
+                entry.retire_thread_identity(42);
+                entry.wake_pending_exit_on_receipt();
+                assert_eq!(channel.generation.generation().raw(), 1);
+                assert_eq!(entry.take_run_failure(), None);
+            }
             // Claim owners deliver their settlement only after rollback is complete.
             // Direct hook invocation models that production lifecycle notification.
             if wake_contention {
@@ -7674,14 +7702,6 @@ mod tests {
             }
             entry.lifecycle_admission_settled().unwrap();
             assert_eq!(zone.slot(slot).queued(), 1);
-            let channel = runtime
-                .graph
-                .lock()
-                .pending_exit
-                .get(&entry.key)
-                .unwrap()
-                .channel
-                .clone();
             let published = channel.generation.generation();
             entry.lifecycle_admission_settled().unwrap();
             assert_eq!(
@@ -7689,6 +7709,7 @@ mod tests {
                 published,
                 "wake custody has one publisher"
             );
+            assert_eq!(published.raw(), 1, "terminal readiness publishes one wake");
             assert_eq!(zone.slot(slot).queued(), 1);
             assert!(matches!(
                 page.claim_any(),
