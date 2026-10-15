@@ -1,12 +1,12 @@
 //! Ratchet for retirement decisions outside the neutral owner.
 
 use quote::ToTokens;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use syn::visit::{self, Visit};
 
-const BASELINE: &str = "scripts/terminal-custody-baseline.txt";
+const CEILINGS: &str = "scripts/terminal-custody-ceilings.json";
 
 #[derive(Default)]
 struct DecisionFinder {
@@ -302,18 +302,128 @@ pub fn discover(root: &Path) -> Result<BTreeSet<String>, String> {
     Ok(sites)
 }
 
-pub fn check(root: &Path) -> Result<(), String> {
-    let baseline = fs::read_to_string(root.join(BASELINE)).map_err(|error| error.to_string())?;
-    let allowed: BTreeSet<_> = baseline
-        .lines()
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(str::to_owned)
-        .collect();
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CrateCeiling {
+    crate_name: String,
+    ceiling: usize,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalCustodyCeilings {
+    schema: u32,
+    counters: Vec<CrateCeiling>,
+}
+
+impl TerminalCustodyCeilings {
+    fn counts(&self) -> Result<BTreeMap<String, usize>, String> {
+        if self.schema != 1 {
+            return Err("unknown terminal custody ceiling schema".to_owned());
+        }
+        let mut counts = BTreeMap::new();
+        for counter in &self.counters {
+            if counter.crate_name.is_empty()
+                || counter.crate_name.contains(['/', '\\', '|'])
+                || counter.ceiling == 0
+            {
+                return Err(format!(
+                    "invalid or zero crate ceiling; delete zero entries: {}",
+                    counter.crate_name
+                ));
+            }
+            if counts
+                .insert(counter.crate_name.clone(), counter.ceiling)
+                .is_some()
+            {
+                return Err(format!("duplicate crate ceiling: {}", counter.crate_name));
+            }
+        }
+        Ok(counts)
+    }
+}
+
+fn read_counts(source: &str) -> Result<BTreeMap<String, usize>, String> {
+    serde_json::from_str::<TerminalCustodyCeilings>(source)
+        .map_err(|error| error.to_string())?
+        .counts()
+}
+
+fn crate_sites(sites: &BTreeSet<String>) -> BTreeMap<String, Vec<&str>> {
+    let mut crates: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+    for site in sites {
+        // Sites are produced from paths under crates/<crate>/ by discover.
+        let name = site.split('/').nth(1).unwrap_or(site);
+        crates.entry(name.to_owned()).or_default().push(site);
+    }
+    crates
+}
+
+fn ratchet(
+    current: &BTreeMap<String, usize>,
+    base: &BTreeMap<String, usize>,
+) -> Result<(), String> {
+    for (name, count) in current {
+        let previous = base.get(name).copied().unwrap_or(0);
+        if *count > previous {
+            return Err(format!(
+                "terminal custody ceiling increase: {name}: {previous} -> {count}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn base_counts(root: &Path, base: &str) -> Result<BTreeMap<String, usize>, String> {
+    let exists = crate::command::run_checked("git", ["ls-tree", base, "--", CEILINGS], Some(root))
+        .map_err(|error| error.to_string())?;
+    if !exists.stdout.trim().is_empty() {
+        let source =
+            crate::command::run_checked("git", ["show", &format!("{base}:{CEILINGS}")], Some(root))
+                .map_err(|error| error.to_string())?;
+        return read_counts(&source.stdout);
+    }
+    // Bootstrap from the actual base sources, never from the candidate policy
+    // or a checked-in site inventory. Corrupt existing policies fail above.
+    let archive = std::process::Command::new("git")
+        .args(["archive", base])
+        .current_dir(root)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !archive.status.success() {
+        return Err("cannot read terminal custody base sources".to_owned());
+    }
+    let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+    tar::Archive::new(archive.stdout.as_slice())
+        .unpack(temporary.path())
+        .map_err(|error| error.to_string())?;
+    Ok(crate_sites(&discover(temporary.path())?)
+        .into_iter()
+        .map(|(name, sites)| (name, sites.len()))
+        .collect())
+}
+
+pub fn check(root: &Path, base: Option<&str>) -> Result<(), String> {
+    let base =
+        crate::authority_debt::comparison_base(root, base).map_err(|error| error.to_string())?;
+    check_policy(root, base.as_deref())
+}
+
+fn check_policy(root: &Path, base: Option<&str>) -> Result<(), String> {
+    let allowed =
+        read_counts(&fs::read_to_string(root.join(CEILINGS)).map_err(|error| error.to_string())?)?;
     let sites = discover(root)?;
     validate(&sites, &allowed)?;
+    if let Some(base) = base {
+        ratchet(&allowed, &base_counts(root, base)?)
+            .map_err(|error| format!("{error}; current sites: {sites:?}"))?;
+        println!("terminal custody PR-base ratchet passed ({base})");
+    } else {
+        println!("terminal custody delta: no base provided; delta ratchet not applicable");
+    }
     check_definition_ownership(root)?;
     println!(
-        "terminal custody: {} current sites, {} baseline sites",
+        "terminal custody: {} current sites across {} nonzero crates",
         sites.len(),
         allowed.len()
     );
@@ -350,17 +460,17 @@ fn check_definition_ownership(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn validate(sites: &BTreeSet<String>, allowed: &BTreeSet<String>) -> Result<(), String> {
-    if allowed.is_empty() {
-        return Err("terminal custody baseline is empty".to_owned());
-    }
-    let added: Vec<_> = sites.difference(allowed).collect();
-    if !added.is_empty() {
-        return Err(format!("new retirement decisions outside core: {added:?}"));
-    }
-    let stale: Vec<_> = allowed.difference(sites).collect();
-    if !stale.is_empty() {
-        return Err(format!("stale terminal custody baseline rows: {stale:?}"));
+fn validate(sites: &BTreeSet<String>, allowed: &BTreeMap<String, usize>) -> Result<(), String> {
+    let actual = crate_sites(sites);
+    for name in actual.keys().chain(allowed.keys()).collect::<BTreeSet<_>>() {
+        let found = actual.get(name).map_or(0, Vec::len);
+        let ceiling = allowed.get(name).copied().unwrap_or(0);
+        if found != ceiling {
+            return Err(format!(
+                "terminal custody crate {name}: {found} sites, ceiling {ceiling}; ratchet decreases and delete zero entries; sites: {:?}",
+                actual.get(name).map_or(&[][..], Vec::as_slice)
+            ));
+        }
     }
     Ok(())
 }
@@ -369,12 +479,42 @@ fn validate(sites: &BTreeSet<String>, allowed: &BTreeSet<String>) -> Result<(), 
 mod tests {
     use super::*;
 
+    fn policy_fixture(source: &str, counts: &str) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("crates/lane/src")).unwrap();
+        fs::create_dir_all(root.path().join("scripts")).unwrap();
+        fs::write(root.path().join("crates/lane/src/lib.rs"), source).unwrap();
+        fs::write(root.path().join(CEILINGS), counts).unwrap();
+        root
+    }
+
+    #[test]
+    fn stale_crate_headroom_is_rejected() {
+        let root = policy_fixture(
+            "fn stop() { page.live(); }",
+            r#"{"schema":1,"counters":[{"crate_name":"lane","ceiling":2}]}"#,
+        );
+        assert!(
+            check_policy(root.path(), None).is_err(),
+            "unused per-crate headroom must be ratcheted down"
+        );
+    }
+
+    #[test]
+    fn zero_debt_deletes_the_last_crate_entry() {
+        let root = policy_fixture("fn apply() {}", r#"{"schema":1,"counters":[]}"#);
+        assert!(
+            check_policy(root.path(), None).is_ok(),
+            "zero debt with no remaining crate entries must pass"
+        );
+    }
+
     #[test]
     fn negative_fixture_finds_renamed_file_and_deciding_method() {
         let source = include_str!("../tests/fixtures/terminal_custody/negative.rs.txt");
         let sites = sites_in_source("crates/new-lane/src/owner.rs", source).unwrap();
         assert!(sites.contains("crates/new-lane/src/owner.rs|Owner::retire_thread|live"));
-        assert!(validate(&sites, &BTreeSet::from(["other".to_owned()])).is_err());
+        assert!(validate(&sites, &BTreeMap::new()).is_err());
     }
 
     #[test]
@@ -388,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn positive_fixture_keeps_applier_out_of_baseline() {
+    fn positive_fixture_keeps_applier_out_of_debt() {
         let source = include_str!("../tests/fixtures/terminal_custody/positive.rs.txt");
         assert!(
             sites_in_source("crates/new-lane/src/apply.rs", source)
@@ -447,8 +587,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_baseline_is_not_a_green_gate() {
-        assert!(validate(&BTreeSet::new(), &BTreeSet::new()).is_err());
+    fn nonzero_debt_cannot_use_an_empty_policy() {
+        let sites = BTreeSet::from(["crates/lane/src/lib.rs|stop|live".to_owned()]);
+        assert!(validate(&sites, &BTreeMap::new()).is_err());
     }
 
     #[test]
@@ -544,20 +685,88 @@ mod tests {
                 "missed {name}: {sites:?}"
             );
             assert!(
-                validate(&sites, &BTreeSet::from(["unrelated allowance".to_owned()])).is_err(),
+                validate(&sites, &BTreeMap::new()).is_err(),
                 "planted {name} violation passed the gate"
             );
         }
     }
 
     #[test]
-    fn stale_baseline_row_fails_even_without_new_sites() {
-        assert!(
-            validate(
-                &BTreeSet::from(["live".to_owned()]),
-                &BTreeSet::from(["live".to_owned(), "stale".to_owned()])
-            )
-            .is_err()
+    fn monotone_counts_allow_relocation_and_deletion_but_not_growth() {
+        let base = BTreeMap::from([("lane".to_owned(), 2)]);
+        assert!(ratchet(&BTreeMap::from([("lane".to_owned(), 1)]), &base).is_ok());
+        assert!(ratchet(&BTreeMap::new(), &base).is_ok());
+        assert!(ratchet(&BTreeMap::from([("lane".to_owned(), 3)]), &base).is_err());
+        assert!(ratchet(&BTreeMap::from([("new-lane".to_owned(), 1)]), &base).is_err());
+        let relocated = BTreeSet::from(["crates/lane/src/renamed.rs|new_name|live".to_owned()]);
+        assert!(validate(&relocated, &BTreeMap::from([("lane".to_owned(), 1)])).is_ok());
+    }
+
+    #[test]
+    fn base_bootstrap_scans_committed_sources_and_corrupt_policy_fails_closed() {
+        let root = policy_fixture(
+            "fn stop() { page.live(); }",
+            r#"{"schema":1,"counters":[]}"#,
         );
+        let git = |args: &[&str]| {
+            crate::command::run_checked("git", args, Some(root.path()))
+                .unwrap()
+                .stdout
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        git(&["add", "crates"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=noreply@openai.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "base sources",
+        ]);
+        let base = git(&["rev-parse", "HEAD"]);
+        assert_eq!(
+            base_counts(root.path(), base.trim()).unwrap(),
+            BTreeMap::from([("lane".to_owned(), 1)])
+        );
+        fs::write(root.path().join(CEILINGS), "invalid JSON").unwrap();
+        git(&["add", CEILINGS]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=noreply@openai.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "corrupt policy",
+        ]);
+        let corrupt = git(&["rev-parse", "HEAD"]);
+        assert!(base_counts(root.path(), corrupt.trim()).is_err());
+    }
+
+    #[test]
+    fn policy_rejects_zero_duplicates_unknown_schema_and_fields() {
+        for source in [
+            r#"{"schema":2,"counters":[]}"#,
+            r#"{"schema":1,"counters":[{"crate_name":"lane","ceiling":0}]}"#,
+            r#"{"schema":1,"counters":[{"crate_name":"lane","ceiling":1},{"crate_name":"lane","ceiling":1}]}"#,
+            r#"{"schema":1,"counters":[],"sites":[]}"#,
+        ] {
+            assert!(
+                read_counts(source).is_err(),
+                "invalid policy accepted: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn excess_crate_count_names_the_scanned_sites() {
+        let site = "crates/lane/src/lib.rs|stop|live";
+        let error = validate(&BTreeSet::from([site.to_owned()]), &BTreeMap::new()).unwrap_err();
+        assert!(error.contains(site));
+        assert!(error.contains("lane: 1 sites, ceiling 0"));
     }
 }

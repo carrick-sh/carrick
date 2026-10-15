@@ -1,0 +1,53 @@
+{
+  "schema": 1,
+  "counters": [
+    {
+      "crate_name": "carrick-core-abi",
+      "ceiling": 1
+    },
+    {
+      "crate_name": "carrick-el1",
+      "ceiling": 32
+    },
+    {
+      "crate_name": "carrick-kernel",
+      "ceiling": 33
+    },
+    {
+      "crate_name": "carrick-kernel-example",
+      "ceiling": 3
+    },
+    {
+      "crate_name": "carrick-personality-linux",
+      "ceiling": 8
+    },
+    {
+      "crate_name": "carrick-runtime",
+      "ceiling": 6
+    },
+    {
+      "crate_name": "carrick-vmm-hvf",
+      "ceiling": 17
+    },
+    {
+      "crate_name": "carrick-vmm-kvm",
+      "ceiling": 2
+    },
+    {
+      "crate_name": "carrick-x86",
+      "ceiling": 3
+    },
+    {
+      "crate_name": "carrick-x86-carrier",
+      "ceiling": 5
+    },
+    {
+      "crate_name": "carrick-x86-cpl0",
+      "ceiling": 11
+    },
+    {
+      "crate_name": "carrick-xtask",
+      "ceiling": 2
+    }
+  ]
+}
