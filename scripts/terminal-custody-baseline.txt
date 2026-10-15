@@ -12,7 +12,6 @@ crates/carrick-el1/src/personality/aarch64_process.rs|Aarch64NativeProcessServic
 crates/carrick-el1/src/personality/dispatch.rs|dispatch_syscall|live
 crates/carrick-el1/src/personality/lifecycle.rs|El1PendingFamilies < 'a , F , C , U , G , Context >::release_current|live
 crates/carrick-el1/src/personality/native_process_runtime.rs|IssuedHostThread::authorize_group|live
-crates/carrick-el1/src/personality/native_process_runtime.rs|NativeProcessEntry < '_ , 'a , M , C , S >::begin_closing|EntryState
 crates/carrick-el1/src/personality/native_process_runtime.rs|NativeProcessEntry < '_ , 'a , M , C , S >::begin_closing|live
 crates/carrick-el1/src/personality/native_process_runtime.rs|NativeProcessEntry < '_ , 'a , M , C , S >::exit_with_signal|live
 crates/carrick-el1/src/personality/native_process_runtime.rs|NativeProcessEntry < '_ , 'a , M , C , S >::exit_with_status|live
