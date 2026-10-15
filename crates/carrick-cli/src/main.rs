@@ -130,6 +130,8 @@ mod debug_amplification;
 mod debug_core;
 mod debug_el1_census;
 mod debug_exec_stamps;
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+mod debug_kvm;
 mod fs_setup;
 mod hvpatch_carrier_cpu_attribution_profile;
 mod hvpatch_carrier_cpu_low_rate_profile;

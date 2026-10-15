@@ -1,7 +1,7 @@
 //! Shared CPL0 KVM carrier and its retained guest-MM/metadata backing.
 //! Hardware fixtures and the initial production process use the same image;
 //! fixture observation ports remain separate from the production transport.
-use crate::carrier_cpu::{CarrierRunExit, KvmCarrierCpu};
+use crate::carrier_cpu::{CarrierCpuDebug, CarrierRunExit, KvmCarrierCpu};
 use crate::carrier_memory::{
     BackingExtent, BackingHandle, CarrierMachine, CarrierMemory, InventoryTransaction,
     PreparedBacking,
@@ -1240,6 +1240,14 @@ pub struct ProductionWorkerParts {
 pub struct ProductionCpuFactory {
     cpus: std::sync::Mutex<[Option<KvmCarrierCpu>; 2]>,
     custody: Arc<std::sync::Mutex<Cpl0HostCustody>>,
+    debug_cpus: [Arc<CarrierCpuDebug>; 2],
+}
+
+/// Bounded physical observations owned by the KVM carrier.
+pub struct ProductionPhysicalCapture {
+    pub zone_census: String,
+    pub vcpus: Vec<String>,
+    pub unavailable: Vec<String>,
 }
 
 pub struct ProductionCpuLease {
@@ -1915,6 +1923,50 @@ mod production_work_port_tests {
 }
 
 impl ProductionCpuFactory {
+    /// Read the physical zone without taking an execution lease or entering
+    /// KVM. A held host custody is reported, never waited on by the debugger.
+    pub fn capture_physical_state(&self) -> ProductionPhysicalCapture {
+        let mut capture = ProductionPhysicalCapture {
+            zone_census: String::new(),
+            vcpus: (0..2)
+                .map(|index| self.debug_cpus[index].render(index))
+                .collect(),
+            unavailable: Vec::new(),
+        };
+        match self.custody.try_lock() {
+            Ok(custody) => {
+                if let Some(pointer) = custody.ram.host_ptr(
+                    META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
+                    size_of::<X86Cpl0Zone>(),
+                ) {
+                    // SAFETY: the retained, initialized zone uses atomic
+                    // readers for this deliberately non-coherent census.
+                    let zone = unsafe { &*pointer.cast::<X86Cpl0Zone>() };
+                    if zone.write_census(&mut capture.zone_census).is_err() {
+                        capture
+                            .unavailable
+                            .push("zone census formatting failed".to_owned());
+                    }
+                } else {
+                    capture.unavailable.push("zone backing absent".to_owned());
+                }
+                for index in 0..2 {
+                    let task = custody.task(carrick_guest_arch::CpuId::new(index));
+                    capture.vcpus[index as usize].push_str(&format!(
+                        " actual_kvm_run={} pending_host_work={} served_with_work={}",
+                        custody.actual_run[index as usize].load(Ordering::Acquire) != 0,
+                        task.linux.has_pending_host_work(),
+                        task.linux.served_with_work.load(Ordering::Acquire),
+                    ));
+                }
+            }
+            Err(_) => capture
+                .unavailable
+                .push("physical custody busy; pending host work unavailable".to_owned()),
+        }
+        capture
+    }
+
     /// Place an already runnable fixture task using the real claim/run queues.
     /// Both CPUs must be stopped. Parked waiters are deliberately refused.
     pub fn fixture_place_native_thread(
@@ -2311,15 +2363,21 @@ impl ProductionWorkerParts {
         ProductionCpuFactory,
     ) {
         let Self {
-            cpus,
+            mut cpus,
             custody,
             root_state,
         } = self;
+        let debug_cpus: [Arc<CarrierCpuDebug>; 2] =
+            std::array::from_fn(|_| Arc::new(CarrierCpuDebug::default()));
+        for (cpu, debug) in cpus.iter_mut().zip(debug_cpus.iter()) {
+            cpu.attach_debug(Arc::clone(debug));
+        }
         (
             root_state,
             ProductionCpuFactory {
                 cpus: std::sync::Mutex::new(cpus.map(Some)),
                 custody: Arc::new(std::sync::Mutex::new(custody)),
+                debug_cpus,
             },
         )
     }

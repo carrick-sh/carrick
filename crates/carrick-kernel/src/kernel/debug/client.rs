@@ -13,6 +13,7 @@ use super::dto::{
     KernelDebugDtoError, KernelDebugRequest, KernelDebugSnapshot, KernelDebugTable,
 };
 use super::endpoint::{DebugEndpoint, EndpointError};
+use super::post_mortem::{POST_MORTEM_SCHEMA, PostMortem};
 use super::wire::{self, DEADLINE, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, WireError};
 
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +46,28 @@ pub fn fetch(
 ) -> Result<KernelDebugSnapshot, ClientError> {
     let endpoint = DebugEndpoint::for_run_id(run_id)?;
     fetch_at(&endpoint, tables)
+}
+
+/// Fetch the existing bounded post-mortem shape without aborting a live run.
+pub fn capture(run_id: &str) -> Result<PostMortem, ClientError> {
+    let endpoint = DebugEndpoint::for_run_id(run_id)?;
+    let payload = exchange_at(
+        &endpoint,
+        &KernelDebugRequest::capture(run_id),
+        ResponseWait::Deadline(Instant::now() + DEADLINE),
+    )?;
+    if let Ok(refusal) = wire::decode_exact::<ServerRefusal>(&payload)
+        && refusal.schema == KERNEL_DEBUG_RESPONSE_SCHEMA
+    {
+        return Err(ClientError::Refused(refusal.error));
+    }
+    let capture: PostMortem = wire::decode_exact(&payload)?;
+    if capture.schema != POST_MORTEM_SCHEMA || capture.run_id.as_deref() != Some(run_id) {
+        return Err(ClientError::Refused(
+            "capture schema or run identity mismatch".to_owned(),
+        ));
+    }
+    Ok(capture)
 }
 
 /// Ask the run identified by `run_id` to abort its kernel.
