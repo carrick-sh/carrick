@@ -13,7 +13,7 @@ use std::fs::File;
 use std::os::fd::{AsRawFd, RawFd};
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use carrick_guest_mem::{HostVa, SharedFutexLocation};
@@ -74,6 +74,7 @@ struct SharedBufferInner {
     file: File,
     ptr: NonNull<u8>,
     len: usize,
+    generation: Arc<AtomicU64>,
 }
 
 // SAFETY: SharedBufferInner owns a page-aligned host mapping of an anonymous file.
@@ -89,6 +90,45 @@ impl Drop for SharedBufferInner {
     }
 }
 
+impl SharedBufferInner {
+    fn check_range(&self, offset: usize, len: usize) -> Result<(), SharedBufferError> {
+        if offset.checked_add(len).is_none_or(|end| end > self.len) {
+            return Err(SharedBufferError::OutOfBounds {
+                offset,
+                len,
+                buffer_size: self.len,
+            });
+        }
+        Ok(())
+    }
+
+    fn read_into(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SharedBufferError> {
+        self.check_range(offset, buf.len())?;
+        for (index, byte) in buf.iter_mut().enumerate() {
+            // SAFETY: range checked above; AtomicU8 has alignment 1 and the
+            // mapping remains live while this inner Arc is held.
+            let source = unsafe { &*self.ptr.as_ptr().add(offset + index).cast::<AtomicU8>() };
+            *byte = source.load(Ordering::Relaxed);
+        }
+        Ok(buf.len())
+    }
+
+    fn write_from(&self, offset: usize, data: &[u8]) -> Result<usize, SharedBufferError> {
+        self.check_range(offset, data.len())?;
+        for (index, byte) in data.iter().enumerate() {
+            // SAFETY: range checked above; AtomicU8 has alignment 1 and the
+            // mapping remains live while this inner Arc is held.
+            let target = unsafe { &*self.ptr.as_ptr().add(offset + index).cast::<AtomicU8>() };
+            target.store(*byte, Ordering::Relaxed);
+        }
+        Ok(data.len())
+    }
+
+    fn bind_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+}
+
 impl SharedBuffer {
     /// Allocate a new page-aligned shared memory buffer of at least `len` bytes.
     pub fn new(len: usize) -> Result<Self, SharedBufferError> {
@@ -96,7 +136,12 @@ impl SharedBuffer {
             return Err(SharedBufferError::ZeroLength);
         }
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        let aligned_len = (len + page_size - 1) & !(page_size - 1);
+        let aligned_len = len
+            .checked_add(page_size - 1)
+            .ok_or(SharedBufferError::Allocation(std::io::Error::from(
+                std::io::ErrorKind::InvalidInput,
+            )))?
+            & !(page_size - 1);
 
         let file = tempfile::tempfile().map_err(SharedBufferError::Allocation)?;
         file.set_len(aligned_len as u64)
@@ -124,6 +169,7 @@ impl SharedBuffer {
                 file,
                 ptr,
                 len: aligned_len,
+                generation: Arc::new(AtomicU64::new(0)),
             }),
         })
     }
@@ -143,24 +189,18 @@ impl SharedBuffer {
         self.inner.file.as_raw_fd()
     }
 
-    /// Raw pointer to the host mapping.
-    pub fn as_ptr(&self) -> *const u8 {
-        self.inner.ptr.as_ptr()
+    /// Copy bytes from shared memory using atomic byte loads.
+    pub fn read_into(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SharedBufferError> {
+        self.inner.read_into(offset, buf)
     }
 
-    /// Raw mutable pointer to the host mapping.
-    pub fn as_mut_ptr(&self) -> *mut u8 {
-        self.inner.ptr.as_ptr()
+    /// Copy bytes into shared memory using atomic byte stores.
+    pub fn write_from(&self, offset: usize, data: &[u8]) -> Result<usize, SharedBufferError> {
+        self.inner.write_from(offset, data)
     }
 
-    /// Safe host-side slice view of the shared buffer.
-    pub fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.inner.ptr.as_ptr(), self.inner.len) }
-    }
-
-    /// Safe host-side mutable slice view of the shared buffer.
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.inner.ptr.as_ptr(), self.inner.len) }
+    pub(crate) fn bind_generation(&self) -> u64 {
+        self.inner.bind_generation()
     }
 
     /// Mint a lease scoped to a container and execution generation.
@@ -168,9 +208,9 @@ impl SharedBuffer {
         &self,
         run_id: RunId,
         container_id: ContainerId,
-        generation: u64,
         shared_futex: carrick_thread::platform_futex::SharedFutexTable,
     ) -> SharedBufferLease {
+        let generation = self.bind_generation();
         SharedBufferLease {
             inner: Arc::clone(&self.inner),
             shared_futex,
@@ -178,7 +218,7 @@ impl SharedBuffer {
             container_id,
             generation,
             retired: Arc::new(AtomicBool::new(false)),
-            current_generation: Arc::new(AtomicU64::new(generation)),
+            current_generation: Arc::clone(&self.inner.generation),
         }
     }
 
@@ -188,14 +228,34 @@ impl SharedBuffer {
         container: &Arc<Container>,
         shared_futex: carrick_thread::platform_futex::SharedFutexTable,
     ) -> SharedBufferLease {
+        let generation = self.bind_generation();
         SharedBufferLease {
             inner: Arc::clone(&self.inner),
             shared_futex,
             run_id: container.run_id().clone(),
             container_id: container.id(),
-            generation: container.generation(),
+            generation,
             retired: container.retirement_token(),
-            current_generation: Arc::new(AtomicU64::new(container.generation())),
+            current_generation: Arc::clone(&self.inner.generation),
+        }
+    }
+
+    pub(crate) fn lease_for_prepared(
+        &self,
+        run_id: RunId,
+        container_id: ContainerId,
+        generation: u64,
+        retired: Arc<AtomicBool>,
+        shared_futex: carrick_thread::platform_futex::SharedFutexTable,
+    ) -> SharedBufferLease {
+        SharedBufferLease {
+            inner: Arc::clone(&self.inner),
+            shared_futex,
+            run_id,
+            container_id,
+            generation,
+            retired,
+            current_generation: Arc::clone(&self.inner.generation),
         }
     }
 
@@ -274,14 +334,20 @@ impl SharedBufferLease {
         self.current_generation.load(Ordering::Acquire)
     }
 
-    /// Raw pointer to the host mapping.
-    pub fn as_ptr(&self) -> *const u8 {
-        self.inner.ptr.as_ptr()
+    /// Raw pointer to the host mapping, after validating this lease.
+    /// Dereferencing the pointer is unsafe; callers must synchronize guest
+    /// access and revalidate after a lifecycle transition.
+    pub fn as_ptr(&self) -> Result<*const u8, SharedBufferError> {
+        self.validate_access()?;
+        Ok(self.inner.ptr.as_ptr())
     }
 
-    /// Raw mutable pointer to the host mapping.
-    pub fn as_mut_ptr(&self) -> *mut u8 {
-        self.inner.ptr.as_ptr()
+    /// Raw mutable pointer to the host mapping, after validating this lease.
+    /// Dereferencing the pointer is unsafe; callers must synchronize guest
+    /// access and revalidate after a lifecycle transition.
+    pub fn as_mut_ptr(&self) -> Result<*mut u8, SharedBufferError> {
+        self.validate_access()?;
+        Ok(self.inner.ptr.as_ptr())
     }
 
     /// Validate that the lease is still live and generation-coherent. Fails closed if retired.
@@ -302,62 +368,25 @@ impl SharedBufferLease {
         Ok(())
     }
 
-    /// Safe slice access to the shared buffer, authenticated against container retirement.
-    pub fn as_slice(&self) -> Result<&[u8], SharedBufferError> {
+    /// Read bytes into `buf` with atomic byte loads.
+    pub fn read_into(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SharedBufferError> {
         self.validate_access()?;
-        Ok(unsafe { std::slice::from_raw_parts(self.inner.ptr.as_ptr(), self.inner.len) })
+        self.inner.read_into(offset, buf)
     }
 
-    /// Safe mutable slice access to the shared buffer, authenticated against container retirement.
-    pub fn as_mut_slice(&mut self) -> Result<&mut [u8], SharedBufferError> {
+    /// Write bytes from `data` with atomic byte stores.
+    pub fn write_from(&self, offset: usize, data: &[u8]) -> Result<usize, SharedBufferError> {
         self.validate_access()?;
-        Ok(unsafe { std::slice::from_raw_parts_mut(self.inner.ptr.as_ptr(), self.inner.len) })
+        self.inner.write_from(offset, data)
     }
 
-    /// Read bytes from the shared buffer at `offset` into `buf`.
-    pub fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SharedBufferError> {
-        self.validate_access()?;
-        if offset
-            .checked_add(buf.len())
-            .is_none_or(|end| end > self.inner.len)
-        {
-            return Err(SharedBufferError::OutOfBounds {
-                offset,
-                len: buf.len(),
-                buffer_size: self.inner.len,
-            });
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.inner.ptr.as_ptr().add(offset),
-                buf.as_mut_ptr(),
-                buf.len(),
-            );
-        }
-        Ok(buf.len())
-    }
-
-    /// Write bytes into the shared buffer at `offset` from `data`.
-    pub fn write_at(&self, offset: usize, data: &[u8]) -> Result<usize, SharedBufferError> {
-        self.validate_access()?;
-        if offset
-            .checked_add(data.len())
-            .is_none_or(|end| end > self.inner.len)
-        {
-            return Err(SharedBufferError::OutOfBounds {
-                offset,
-                len: data.len(),
-                buffer_size: self.inner.len,
-            });
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                self.inner.ptr.as_ptr().add(offset),
-                data.len(),
-            );
-        }
-        Ok(data.len())
+    /// A generation-checked atomic 32-bit word in shared memory.
+    pub fn atomic_u32(&self, offset: usize) -> Result<SharedAtomicU32, SharedBufferError> {
+        self.shared_futex_location(offset)?;
+        Ok(SharedAtomicU32 {
+            lease: self.clone(),
+            offset,
+        })
     }
 
     /// Derive the unified [`SharedFutexLocation`] for a 4-byte futex word at `offset`.
@@ -439,6 +468,43 @@ impl SharedBufferLease {
     }
 }
 
+/// A checked atomic word view that revalidates its lease on every operation.
+#[derive(Clone, Debug)]
+pub struct SharedAtomicU32 {
+    lease: SharedBufferLease,
+    offset: usize,
+}
+
+impl SharedAtomicU32 {
+    fn word(&self) -> Result<&AtomicU32, SharedBufferError> {
+        self.lease.validate_access()?;
+        // SAFETY: atomic_u32 checked range and 4-byte alignment at creation;
+        // the lease keeps the mapping alive for this operation.
+        Ok(unsafe {
+            &*self
+                .lease
+                .inner
+                .ptr
+                .as_ptr()
+                .add(self.offset)
+                .cast::<AtomicU32>()
+        })
+    }
+
+    pub fn load(&self, ordering: Ordering) -> Result<u32, SharedBufferError> {
+        Ok(self.word()?.load(ordering))
+    }
+
+    pub fn store(&self, value: u32, ordering: Ordering) -> Result<(), SharedBufferError> {
+        self.word()?.store(value, ordering);
+        Ok(())
+    }
+
+    pub fn fetch_or(&self, value: u32, ordering: Ordering) -> Result<u32, SharedBufferError> {
+        Ok(self.word()?.fetch_or(value, ordering))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,14 +518,16 @@ mod tests {
             Err(SharedBufferError::ZeroLength)
         ));
 
-        let mut buf = SharedBuffer::new(1024).expect("allocate shared buffer");
+        let buf = SharedBuffer::new(1024).expect("allocate shared buffer");
         assert!(buf.len() >= 1024);
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
         assert_eq!(buf.len() % page_size, 0);
 
         let data = b"hello shared world";
-        buf.as_mut_slice()[..data.len()].copy_from_slice(data);
-        assert_eq!(&buf.as_slice()[..data.len()], data);
+        buf.write_from(0, data).unwrap();
+        let mut direct_read = vec![0; data.len()];
+        buf.read_into(0, &mut direct_read).unwrap();
+        assert_eq!(&direct_read, data);
 
         let mut read_back = vec![0u8; data.len()];
         let run_id = RunId::new("test-run");
@@ -467,21 +535,20 @@ mod tests {
         let lease = buf.lease(
             run_id,
             container_id,
-            1,
             carrick_thread::platform_futex::SharedFutexTable::new(),
         );
 
-        assert_eq!(lease.read_at(0, &mut read_back).unwrap(), data.len());
+        assert_eq!(lease.read_into(0, &mut read_back).unwrap(), data.len());
         assert_eq!(&read_back, data);
 
         // Out of bounds checks
         let mut out_buf = vec![0u8; 10];
         assert!(matches!(
-            lease.read_at(buf.len() - 5, &mut out_buf),
+            lease.read_into(buf.len() - 5, &mut out_buf),
             Err(SharedBufferError::OutOfBounds { .. })
         ));
         assert!(matches!(
-            lease.write_at(buf.len() - 5, &out_buf),
+            lease.write_from(buf.len() - 5, &out_buf),
             Err(SharedBufferError::OutOfBounds { .. })
         ));
     }
@@ -494,7 +561,7 @@ mod tests {
         let retired = Arc::new(AtomicBool::new(false));
         let cur_gen = Arc::new(AtomicU64::new(1));
 
-        let mut lease = buf.lease_with_witness(
+        let lease = buf.lease_with_witness(
             run_id.clone(),
             container_id,
             1,
@@ -505,9 +572,10 @@ mod tests {
 
         // Initial access succeeds
         assert!(lease.validate_access().is_ok());
-        lease.write_at(0, b"data-generation-1").unwrap();
+        lease.write_from(0, b"data-generation-1").unwrap();
+        let word = lease.atomic_u32(0).unwrap();
         let mut check = [0u8; 17];
-        lease.read_at(0, &mut check).unwrap();
+        lease.read_into(0, &mut check).unwrap();
         assert_eq!(&check, b"data-generation-1");
 
         // 1. Generation drift / mismatch fails closed
@@ -520,19 +588,23 @@ mod tests {
             })
         ));
         assert!(matches!(
-            lease.as_slice(),
+            lease.read_into(0, &mut check),
             Err(SharedBufferError::GenerationMismatch { .. })
         ));
         assert!(matches!(
-            lease.as_mut_slice(),
+            lease.write_from(0, b"no"),
             Err(SharedBufferError::GenerationMismatch { .. })
         ));
         assert!(matches!(
-            lease.read_at(0, &mut check),
+            lease.read_into(0, &mut check),
             Err(SharedBufferError::GenerationMismatch { .. })
         ));
         assert!(matches!(
-            lease.write_at(0, b"unauthorized"),
+            lease.write_from(0, b"unauthorized"),
+            Err(SharedBufferError::GenerationMismatch { .. })
+        ));
+        assert!(matches!(
+            word.load(Ordering::Acquire),
             Err(SharedBufferError::GenerationMismatch { .. })
         ));
 
@@ -559,19 +631,23 @@ mod tests {
             }) if cid == container_id
         ));
         assert!(matches!(
-            lease.as_slice(),
+            lease.as_ptr(),
             Err(SharedBufferError::Retired { .. })
         ));
         assert!(matches!(
-            lease.as_mut_slice(),
+            lease.as_mut_ptr(),
             Err(SharedBufferError::Retired { .. })
         ));
         assert!(matches!(
-            lease.read_at(0, &mut check),
+            lease.read_into(0, &mut check),
             Err(SharedBufferError::Retired { .. })
         ));
         assert!(matches!(
-            lease.write_at(0, b"unauthorized"),
+            lease.write_from(0, b"unauthorized"),
+            Err(SharedBufferError::Retired { .. })
+        ));
+        assert!(matches!(
+            word.load(Ordering::Acquire),
             Err(SharedBufferError::Retired { .. })
         ));
         assert!(matches!(
@@ -595,13 +671,8 @@ mod tests {
     fn rebinding_a_buffer_to_a_new_container_invalidates_its_prior_lease() {
         let buf = SharedBuffer::new(4096).expect("allocate shared buffer");
         let futex = carrick_thread::platform_futex::SharedFutexTable::new();
-        let first = buf.lease(
-            RunId::new("first"),
-            ContainerId::allocate(),
-            1,
-            futex.clone(),
-        );
-        let next = buf.lease(RunId::new("next"), ContainerId::allocate(), 2, futex);
+        let first = buf.lease(RunId::new("first"), ContainerId::allocate(), futex.clone());
+        let next = buf.lease(RunId::new("next"), ContainerId::allocate(), futex);
         assert!(next.validate_access().is_ok());
         assert!(matches!(
             first.validate_access(),
@@ -617,7 +688,6 @@ mod tests {
         let lease = buf.lease(
             run_id,
             container_id,
-            1,
             carrick_thread::platform_futex::SharedFutexTable::new(),
         );
 
@@ -638,16 +708,17 @@ mod tests {
         ));
 
         // Initialize futex word at offset 0 to 0
-        lease.write_at(0, &0u32.to_ne_bytes()).unwrap();
+        lease.write_from(0, &0u32.to_ne_bytes()).unwrap();
 
         let lease_clone = lease.clone();
         let handle = thread::spawn(move || {
             thread::sleep(Duration::from_millis(30));
             // Simulate guest updating futex word and waking host
-            let word_ptr = lease_clone.as_ptr() as *mut AtomicU32;
-            unsafe {
-                (*word_ptr).store(42, Ordering::Release);
-            }
+            lease_clone
+                .atomic_u32(0)
+                .unwrap()
+                .store(42, Ordering::Release)
+                .unwrap();
             let woken = lease_clone.futex_wake(0, 1).expect("futex wake");
             assert_eq!(woken, 1);
         });
@@ -676,23 +747,21 @@ mod tests {
         let lease_a = buf_a.lease(
             run_a,
             cid_a,
-            1,
             carrick_thread::platform_futex::SharedFutexTable::new(),
         );
         let lease_b = buf_b.lease(
             run_b,
             cid_b,
-            1,
             carrick_thread::platform_futex::SharedFutexTable::new(),
         );
 
-        lease_a.write_at(0, &[0xAA; 32]).unwrap();
-        lease_b.write_at(0, &[0xBB; 32]).unwrap();
+        lease_a.write_from(0, &[0xAA; 32]).unwrap();
+        lease_b.write_from(0, &[0xBB; 32]).unwrap();
 
         let mut read_a = [0u8; 32];
         let mut read_b = [0u8; 32];
-        lease_a.read_at(0, &mut read_a).unwrap();
-        lease_b.read_at(0, &mut read_b).unwrap();
+        lease_a.read_into(0, &mut read_a).unwrap();
+        lease_b.read_into(0, &mut read_b).unwrap();
 
         assert_eq!(read_a, [0xAA; 32]);
         assert_eq!(read_b, [0xBB; 32]);
@@ -702,8 +771,8 @@ mod tests {
     fn test_in_memory_vfs_host_file_mounting() {
         use crate::vfs::Vfs;
         let vfs = crate::vfs::InMemoryFileVfs::new();
-        let mut buf = SharedBuffer::new(4096).expect("buffer");
-        buf.as_mut_slice()[..5].copy_from_slice(b"shbuf");
+        let buf = SharedBuffer::new(4096).expect("buffer");
+        buf.write_from(0, b"shbuf").unwrap();
 
         vfs.add_host_file("/test_buf", buf.host_fd(), 4096)
             .expect("add host file");

@@ -108,7 +108,7 @@ pub use contracts::{
 pub use error::{BuildError, EmbedError};
 pub use prepared::PreparedContainer;
 pub use result::ContainerResult;
-pub use shared_buffer::{SharedBuffer, SharedBufferError, SharedBufferLease};
+pub use shared_buffer::{SharedAtomicU32, SharedBuffer, SharedBufferError, SharedBufferLease};
 pub use vfs::{
     DirEnt, EntryKind, FilterVfs, InMemoryFileVfs, LayeredVfs, MAX_IN_MEMORY_FILE_SIZE, Metadata,
     OpenContext, OpenFlags, RecordingVfs, Vfs, VfsError, VfsEvent, VfsHandle, VfsOp, VfsOpOutcome,

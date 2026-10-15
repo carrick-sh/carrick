@@ -1391,8 +1391,8 @@ mod tests {
             "shbuf-test:latest",
             r#"{"architecture":"arm64","os":"linux","config":{"Cmd":["/bin/true"]}}"#,
         );
-        let mut buf = crate::SharedBuffer::new(4096).expect("create buffer");
-        buf.as_mut_slice()[..11].copy_from_slice(b"embed_shbuf");
+        let buf = crate::SharedBuffer::new(4096).expect("create buffer");
+        buf.write_from(0, b"embed_shbuf").unwrap();
 
         let prepared = ContainerBuilder::from_image("shbuf-test:latest")
             .image_store(store)
@@ -1407,7 +1407,7 @@ mod tests {
             .expect("lease for registered buffer");
         assert_eq!(lease.len(), buf.len());
         let mut data = [0u8; 11];
-        lease.read_at(0, &mut data).unwrap();
+        lease.read_into(0, &mut data).unwrap();
         assert_eq!(&data, b"embed_shbuf");
 
         assert!(matches!(

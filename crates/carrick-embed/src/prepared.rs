@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use carrick_engine::ResolveWarning;
@@ -21,10 +21,8 @@ pub struct PreparedContainer {
     extensions: RuntimeExtensions,
     captured: CapturedStreams,
     launch: LaunchContext,
-    generation: u64,
     retired: Arc<AtomicBool>,
-    current_generation: Arc<AtomicU64>,
-    shared_buffers: Vec<(String, SharedBuffer)>,
+    shared_buffers: Vec<(String, SharedBuffer, u64)>,
     auditors: Arc<carrick_kernel::observe::AuditorChain>,
     carrier: PreparedCarrierOwnership,
     work_scope: Option<carrick_observability::work_meter::WorkScope>,
@@ -48,9 +46,14 @@ impl PreparedContainer {
         carrier: PreparedCarrierOwnership,
     ) -> Self {
         let launch = carrier.lease.launch().clone();
-        let generation = 1;
         let retired = Arc::new(AtomicBool::new(false));
-        let current_generation = Arc::new(AtomicU64::new(generation));
+        let shared_buffers = shared_buffers
+            .into_iter()
+            .map(|(name, buffer)| {
+                let generation = buffer.bind_generation();
+                (name, buffer, generation)
+            })
+            .collect();
         let auditors = Arc::new(carrick_kernel::observe::AuditorChain::new(auditors));
         let work_scope = carrier.work_scope.clone();
         Self {
@@ -59,9 +62,7 @@ impl PreparedContainer {
             extensions,
             captured,
             launch,
-            generation,
             retired,
-            current_generation,
             shared_buffers,
             auditors,
             carrier,
@@ -86,14 +87,13 @@ impl PreparedContainer {
 
     /// Obtain an authenticated, generation-stamped lease for the named shared buffer.
     pub fn shared_buffer_lease(&self, name: &str) -> Result<SharedBufferLease, SharedBufferError> {
-        for (n, buf) in &self.shared_buffers {
+        for (n, buf, generation) in &self.shared_buffers {
             if n == name {
-                return Ok(buf.lease_with_witness(
+                return Ok(buf.lease_for_prepared(
                     self.launch.run_id.clone(),
                     self.launch.container_id,
-                    self.generation,
+                    *generation,
                     Arc::clone(&self.retired),
-                    Arc::clone(&self.current_generation),
                     self.carrier.runtime.shared_futex().clone(),
                 ));
             }
