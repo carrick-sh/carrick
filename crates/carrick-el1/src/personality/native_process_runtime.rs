@@ -503,11 +503,8 @@ impl PendingExit<'_> {
         for receipt in &self.outstanding {
             match receipt {
                 OutstandingExitReceipt::Pool(entry)
-                    if matches!(
-                        page.state(entry.index()),
-                        Some((generation, carrick_el1_abi::EntryState::ExitedInZone | carrick_el1_abi::EntryState::Reaped))
-                            if generation == entry.generation()
-                    ) =>
+                    if carrick_el1_abi::Lifecycle::expected_exit_receipt(page, Some(*entry))
+                        == carrick_core::lifecycle::ExpectedExitReceipt::AlreadyExited =>
                 {
                     pool.push(*entry)
                 }
