@@ -176,6 +176,13 @@ pub trait Lifecycle {
         self.entry_word(index)
             .map(|word| unpack(word.load(Ordering::Acquire)))
     }
+    /// Whether Closing still expects this exact pool entry's exit receipt.
+    fn exit_receipt_expected(&self, entry: EntryRef) -> bool {
+        matches!(self.state(entry.index()),
+            Some((generation, EntryState::Born | EntryState::Published
+                | EntryState::ExitingBorn | EntryState::ExitingPublished))
+                if generation == entry.generation())
+    }
     fn transition(
         &self,
         r: EntryRef,

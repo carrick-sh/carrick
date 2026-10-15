@@ -120,7 +120,12 @@ pub trait CarrierProcess: Send + Sync {
                 // thread while its host loop is unwinding.
                 return Ok(ProcessThreadExit::AlreadyRetired);
             }
-            Err(_) if !self.kernel_graph().task_is_live(self.task_id()) => {
+            Err(_)
+                if carrick_core::terminal::terminal_task_absent(
+                    self.kernel_graph().as_ref(),
+                    self.task_id(),
+                ) =>
+            {
                 return Ok(ProcessThreadExit::AlreadyRetired);
             }
             Err(_) => {
@@ -176,7 +181,10 @@ pub trait CarrierProcess: Send + Sync {
             }
             Err(crate::kernel::KernelOperationError::ParentExited)
             | Err(crate::kernel::KernelOperationError::UnknownTask(_))
-                if !self.kernel_graph().task_is_live(self.task_id()) =>
+                if carrick_core::terminal::terminal_task_absent(
+                    self.kernel_graph().as_ref(),
+                    self.task_id(),
+                ) =>
             {
                 Ok(ProcessThreadExit::AlreadyRetired)
             }
