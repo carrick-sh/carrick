@@ -27,7 +27,6 @@ crates/carrick-el1/src/personality/native_process_runtime.rs|NativeProcessRuntim
 crates/carrick-el1/src/personality/native_process_runtime.rs|NativeProcessRuntime < 'a , M , C >::imported_members|live
 crates/carrick-el1/src/personality/native_process_runtime.rs|NativeProcessRuntime < 'a , M , C >::record_binding|live
 crates/carrick-el1/src/personality/native_process_runtime.rs|NativeProcessRuntime < 'a , M , C >::resume_visible_pid|live
-crates/carrick-el1/src/personality/native_process_runtime.rs|PendingExit < '_ >::completed_receipts|EntryState
 crates/carrick-el1/src/personality/native_process_runtime.rs|owned_control|EntryState
 crates/carrick-el1/src/personality/native_process_runtime.rs|signal_record_exists|live
 crates/carrick-kernel-example/src/scripted.rs|Task::is_live|task_is_live
