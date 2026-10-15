@@ -3098,6 +3098,7 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
 }
 
 #[test]
+#[allow(clippy::disallowed_methods)] // VM-free two-actor admission witness.
 fn arm_host_birth_adoption_racing_closing_has_one_cancel_owner() {
     use carrick_el1_abi::Lifecycle;
     use std::sync::mpsc;

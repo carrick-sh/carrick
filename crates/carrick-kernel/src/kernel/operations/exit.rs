@@ -637,7 +637,12 @@ impl Kernel {
                         .lifecycle()
                         .retire_published_host_member(
                             owned.entry,
-                            live_membership.take().expect("host member reservation"),
+                            live_membership.take().unwrap_or_else(|| {
+                                carrick_fatal!(
+                                    "kernel::thread_retirement",
+                                    "host-adopted retirement lost reserved membership"
+                                )
+                            }),
                         )
                         .unwrap_or_else(|error| {
                             carrick_fatal!(
