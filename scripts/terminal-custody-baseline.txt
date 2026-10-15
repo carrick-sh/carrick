@@ -56,7 +56,7 @@ crates/carrick-kernel/src/kernel/objects.rs|close_system_charge_window|live
 crates/carrick-kernel/src/kernel/objects/thread.rs|Thread::flush_open_system_charge|live
 crates/carrick-kernel/src/kernel/objects/thread.rs|Thread::open_system_charge_window|live
 crates/carrick-kernel/src/kernel/objects/thread_control.rs|ThreadControlLease::birth_controls|EntryState
-crates/carrick-kernel/src/kernel/thread_ledger.rs|BirthAdmissionGuard::acquire|claimed_count
+crates/carrick-kernel/src/kernel/thread_ledger.rs|BirthAdmissionGuard::acquire_after_gate_read|claimed_count
 crates/carrick-kernel/src/kernel/thread_ledger.rs|Kernel::prepare_executable_thread_births|live
 crates/carrick-kernel/src/kernel/thread_ledger.rs|PooledThreadIdentity::state|EntryState
 crates/carrick-kernel/src/kernel/thread_ledger.rs|ThreadIdentityPool::credits|EntryState
