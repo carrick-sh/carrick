@@ -7,11 +7,11 @@
     },
     {
       "crate_name": "carrick-el1",
-      "ceiling": 32
+      "ceiling": 28
     },
     {
       "crate_name": "carrick-kernel",
-      "ceiling": 33
+      "ceiling": 31
     },
     {
       "crate_name": "carrick-kernel-example",
@@ -19,11 +19,11 @@
     },
     {
       "crate_name": "carrick-personality-linux",
-      "ceiling": 8
+      "ceiling": 7
     },
     {
       "crate_name": "carrick-runtime",
-      "ceiling": 6
+      "ceiling": 5
     },
     {
       "crate_name": "carrick-vmm-hvf",
