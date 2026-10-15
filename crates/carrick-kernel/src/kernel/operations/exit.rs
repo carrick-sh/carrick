@@ -632,24 +632,21 @@ impl Kernel {
             match lane {
                 ThreadRetirementLane::Host => state.retired_threads.push(retired),
                 ThreadRetirementLane::HostAdopted(owned) => {
-                    owned
-                        .control
-                        .lifecycle()
-                        .retire_published_host_member(
-                            owned.entry,
-                            live_membership.take().unwrap_or_else(|| {
-                                carrick_fatal!(
-                                    "kernel::thread_retirement",
-                                    "host-adopted retirement lost reserved membership"
-                                )
-                            }),
-                        )
-                        .unwrap_or_else(|error| {
-                            carrick_fatal!(
-                                "kernel::thread_retirement",
-                                "host retirement lost exact published ABI generation: {error:?}"
-                            );
-                        });
+                    let retirement_error = match live_membership.take() {
+                        Some(membership) => owned
+                            .control
+                            .lifecycle()
+                            .retire_published_host_member(owned.entry, membership)
+                            .err()
+                            .map(Some),
+                        None => Some(None),
+                    };
+                    if let Some(error) = retirement_error {
+                        carrick_fatal!(
+                            "kernel::thread_retirement",
+                            "host retirement lost exact ABI generation or reserved membership: {error:?}"
+                        );
+                    }
                     state.retired_threads.push_reserved(owned.storage, retired);
                 }
                 ThreadRetirementLane::ExitedInZone { storage, .. } => {

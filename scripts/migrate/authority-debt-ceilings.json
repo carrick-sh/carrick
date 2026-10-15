@@ -402,13 +402,6 @@
     },
     {
       "family": "fatal_carrier_fault",
-      "operation": "fatal:core::lifecycle",
-      "owner": "carrick_core::lifecycle::<NonfinalExitMembership<'_> as Drop>::drop",
-      "lane": "shared",
-      "ceiling": 1
-    },
-    {
-      "family": "fatal_carrier_fault",
       "operation": "fatal:dispatch::anonymous",
       "owner": "carrick_kernel::dispatch::mem::anonymous::broken_root",
       "lane": "shared",
@@ -3170,7 +3163,7 @@
       "operation": "fatal:kernel::thread_retirement",
       "owner": "carrick_kernel::kernel::operations::exit::Kernel::retire_thread_in_registry",
       "lane": "shared",
-      "ceiling": 3
+      "ceiling": 2
     },
     {
       "family": "fatal_carrier_fault",

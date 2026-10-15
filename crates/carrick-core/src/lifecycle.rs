@@ -124,21 +124,6 @@ pub trait Lifecycle {
         })
     }
 
-    /// Return a live unit taken by one exact exit reservation. The token is
-    /// minted only after the same page subtracts that unit.
-    fn restore_reserved(&self, _unit: ReservedLiveUnit) {
-        let _ = self
-            .live_word()
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                // A reserved unit was removed from this page before this
-                // non-cloneable token existed, and concurrent births hold
-                // distinct bounded pool or registry slots (far fewer than
-                // u32::MAX), so this add cannot overflow. Saturate rather
-                // than assume: a broken invariant must never become UB.
-                Some(n.saturating_add(1))
-            });
-    }
-
     /// A Closing process has already reserved its leader's terminal
     /// membership. Its cancelled host members may therefore take the page
     /// from one live member to zero without publishing process status.
@@ -151,6 +136,21 @@ pub trait Lifecycle {
             page: self,
             reserved: Some(ReservedLiveUnit::new()),
         })
+    }
+
+    /// Return a live unit taken by one exact exit reservation. The token is
+    /// minted only after the same page subtracts that unit.
+    fn restore_reserved(&self, _unit: ReservedLiveUnit) {
+        let _ = self
+            .live_word()
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                // SAFETY: a reserved unit was removed from this page before
+                // this non-cloneable token existed. Concurrent births retain
+                // distinct bounded pool or registry slots (far fewer than
+                // u32::MAX); they cannot consume this reserved unit's census
+                // headroom. Thus checked_add(1) is Some here.
+                Some(unsafe { n.checked_add(1).unwrap_unchecked() })
+            });
     }
 
     /// The caller of group exit has already released its live membership;
@@ -547,6 +547,9 @@ mod membership_tests {
         let reserved = page.reserve_nonfinal_exit().unwrap();
         assert_eq!(page.thread_born(), Some(2));
         drop(reserved);
+        assert_eq!(page.live(), 3);
+        page.close();
+        drop(page.reserve_cancelled_member_exit().unwrap());
         assert_eq!(page.live(), 3);
     }
 }
