@@ -404,6 +404,41 @@ fn clone_args(flags: u64, parent_tid: u64, child_tid: u64) -> [u64; 5] {
 // ---- clone ----
 
 #[test]
+fn sched_yield_without_a_sibling_completes_in_ring() {
+    const SYS_SCHED_YIELD: usize = 124;
+    let mut w = World::new(LifecycleHatches::ON);
+    let mut frame = TrapFrame {
+        elr: CLONE_PC,
+        ..TrapFrame::default()
+    };
+    assert_eq!(
+        w.call_native(&mut frame, SYS_SCHED_YIELD, &[]),
+        Action::Served
+    );
+    assert_eq!(frame.x[0], 0);
+    assert_eq!(w.served(SYS_SCHED_YIELD), 1);
+    assert_eq!(w.forwarded(SYS_SCHED_YIELD), 0);
+}
+
+#[test]
+fn sched_yield_with_pending_host_work_completes_before_handback() {
+    const SYS_SCHED_YIELD: usize = 124;
+    let mut w = World::new(LifecycleHatches::ON);
+    w.task().linux.mark_pending_host_work();
+    let mut frame = TrapFrame {
+        elr: CLONE_PC,
+        ..TrapFrame::default()
+    };
+    assert_eq!(
+        w.call_native(&mut frame, SYS_SCHED_YIELD, &[]),
+        Action::ServedWithWork
+    );
+    assert_eq!(frame.x[0], 0);
+    assert_eq!(w.served(SYS_SCHED_YIELD), 1);
+    assert_eq!(w.forwarded(SYS_SCHED_YIELD), 0);
+}
+
+#[test]
 fn raw_clone_sibling_runs_when_parent_only_sched_yields() {
     // The scheduler_preemption fixture uses clone without libc's TLS and
     // clear-tid flags, then makes no call except sched_yield while waiting
