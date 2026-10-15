@@ -47,20 +47,56 @@ pub(crate) fn deliver_completion<C: carrick_el1_abi::EntryContext>(
         let mut cpu = crate::substrate::sched::hw::HardwareCpu;
         deliver_effects_with(
             zone,
-            venue,
+            Some(venue),
             waker,
             effects,
             deferred,
             |slot, target| cpu.send_resched(slot, target),
-            |slot| {
-                if let Some(task) = carrick_el1_abi::current_task_guest(usize::from(slot.raw())) {
-                    task.linux.mark_pending_host_work();
-                }
-            },
+            (
+                |slot| {
+                    if let Some(task) = carrick_el1_abi::current_task_guest(usize::from(slot.raw()))
+                    {
+                        task.linux.mark_pending_host_work();
+                    }
+                },
+                carrick_el1_abi::mark_pending_host_work_all,
+            ),
         );
     }
     #[cfg(not(target_os = "none"))]
     let _ = (waker, effects, deferred, venue, zone);
+}
+
+/// A host release has no owning EL1 slot. Its deferred handbacks must be
+/// visible at the carrier boundary even when another vCPU is running.
+pub(crate) fn deliver_host_completion<C: carrick_el1_abi::EntryContext>(
+    zone: &carrick_sched_core::ZoneTables<C>,
+    owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>,
+) {
+    let (waker, effects, deferred) = owned.defer_handbacks();
+    #[cfg(target_os = "none")]
+    {
+        let mut cpu = crate::substrate::sched::hw::HardwareCpu;
+        deliver_effects_with(
+            zone,
+            None,
+            waker,
+            effects,
+            deferred,
+            |slot, target| cpu.send_resched(slot, target),
+            (
+                |slot| {
+                    if let Some(task) = carrick_el1_abi::current_task_guest(usize::from(slot.raw()))
+                    {
+                        task.linux.mark_pending_host_work();
+                    }
+                },
+                carrick_el1_abi::mark_pending_host_work_all,
+            ),
+        );
+    }
+    #[cfg(not(target_os = "none"))]
+    let _ = (zone, waker, effects, deferred);
 }
 
 /// Deliver a native owner's plain wake through the same SGI and host-work
@@ -75,27 +111,31 @@ pub(crate) fn deliver_wake_effects<C: carrick_el1_abi::EntryContext>(
         let mut cpu = crate::substrate::sched::hw::HardwareCpu;
         deliver_effects_with(
             zone,
-            venue,
+            Some(venue),
             carrick_sched_core::Waker::El1 { slot: venue },
             effects,
             false,
             |slot, target| cpu.send_resched(slot, target),
-            |slot| {
-                if let Some(task) = carrick_el1_abi::current_task_guest(usize::from(slot.raw())) {
-                    task.linux.mark_pending_host_work();
-                }
-            },
+            (
+                |slot| {
+                    if let Some(task) = carrick_el1_abi::current_task_guest(usize::from(slot.raw()))
+                    {
+                        task.linux.mark_pending_host_work();
+                    }
+                },
+                carrick_el1_abi::mark_pending_host_work_all,
+            ),
         );
     }
     #[cfg(test)]
     deliver_effects_with(
         zone,
-        venue,
+        Some(venue),
         carrick_sched_core::Waker::El1 { slot: venue },
         effects,
         false,
         record_test_wake,
-        |_slot| {},
+        (|_slot| {}, || {}),
     );
     #[cfg(all(not(test), not(target_os = "none")))]
     let _ = (zone, venue, effects);
@@ -104,12 +144,12 @@ pub(crate) fn deliver_wake_effects<C: carrick_el1_abi::EntryContext>(
 #[cfg(any(test, target_os = "none"))]
 pub(super) fn deliver_effects_with<C: carrick_el1_abi::EntryContext>(
     zone: &carrick_sched_core::ZoneTables<C>,
-    venue: SlotId,
+    venue: Option<SlotId>,
     waker: carrick_sched_core::Waker,
     effects: WakeEffects,
     deferred: bool,
     mut send: impl FnMut(SlotId, u64),
-    mut mark_pending: impl FnMut(SlotId),
+    mut marks: (impl FnMut(SlotId), impl FnMut()),
 ) {
     let own = match waker {
         carrick_sched_core::Waker::El1 { slot } => Some(slot),
@@ -118,7 +158,7 @@ pub(super) fn deliver_effects_with<C: carrick_el1_abi::EntryContext>(
     assert!(own.is_some() || (!effects.queued_own && !effects.misplaced));
     for slot in effects
         .sgi_slots()
-        .chain(own.filter(|slot| effects.queued_own && *slot != venue))
+        .chain(own.filter(|slot| effects.queued_own && Some(*slot) != venue))
     {
         let target = zone.slot(slot).sgi_target();
         if target != 0 {
@@ -128,10 +168,14 @@ pub(super) fn deliver_effects_with<C: carrick_el1_abi::EntryContext>(
     if effects.misplaced
         && let Some(slot) = own
     {
-        mark_pending(slot);
+        (marks.0)(slot);
     }
-    if deferred || (effects.queued_own && own == Some(venue)) {
-        mark_pending(venue);
+    if deferred || (effects.queued_own && own == venue) {
+        if let Some(venue) = venue {
+            (marks.0)(venue);
+        } else {
+            (marks.1)();
+        }
     }
 }
 
