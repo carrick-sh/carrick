@@ -347,7 +347,21 @@ impl ThreadControlArena {
                 }
             }
             drop(deferred);
-            if free.is_empty() {
+            // A page reader can retain a slot after its last host lease
+            // queued it as free. A refused reset returns it to deferred
+            // storage; allocation never treats that race as an invariant fault.
+            let candidate = free.pop().and_then(|slot| {
+                if slot.page.page.slots[slot.index]
+                    .reset_for_host_birth(BlockedMask(0))
+                    .is_ok()
+                {
+                    Some(slot)
+                } else {
+                    self.0.deferred.lock().push_back(slot);
+                    None
+                }
+            });
+            candidate.unwrap_or_else(|| {
                 let page = Arc::new(ControlBacking {
                     page: SharedAbiPage::new(
                         ControlPage {
@@ -356,23 +370,16 @@ impl ThreadControlArena {
                         self.0.lifecycle.0.pool.clone(),
                     ),
                 });
-                free.extend((0..SLOTS).map(|index| FreeSlot {
+                free.extend((0..SLOTS - 1).map(|index| FreeSlot {
                     page: Arc::clone(&page),
                     index,
                 }));
-            }
-            free.pop()
-                .filter(|allocation| {
-                    allocation.page.page.slots[allocation.index]
-                        .reset_for_host_birth(BlockedMask(0))
-                        .is_ok()
-                })
-                .unwrap_or_else(|| {
-                    carrick_fatal::carrick_fatal!(
-                        "thread::control",
-                        "control refill supplied no resettable slot"
-                    )
-                })
+                // Fresh storage is unpublished and already initialized.
+                FreeSlot {
+                    page,
+                    index: SLOTS - 1,
+                }
+            })
         };
         ThreadControlLease(Arc::new(Lease {
             owner: self.0.owner,
@@ -507,6 +514,20 @@ impl TestThreadControlArena {
             ids,
         })
     }
+    pub fn lifecycle(&self) -> &carrick_el1_abi::ThreadLifecyclePage {
+        &self.arena.0.lifecycle
+    }
+    pub fn birth_admission(
+        &self,
+    ) -> Result<
+        super::super::thread_ledger::TestBirthAdmissionGuard,
+        super::super::operations::KernelOperationError,
+    > {
+        super::super::thread_ledger::TestBirthAdmissionGuard::acquire(
+            self.arena.0.owner.id,
+            self.arena.0.lifecycle.clone(),
+        )
+    }
     pub fn allocate(&self, tid: i32) -> Option<ThreadControlLease> {
         Some(self.arena.allocate(ThreadKey {
             tid: super::super::ids::LinuxTid::from_abi_positive(tid).ok()?,
@@ -629,6 +650,32 @@ mod tests {
         );
         drop(first);
         assert_eq!(first_page.gate(), carrick_el1_abi::GateState::Closed);
+    }
+
+    #[test]
+    fn late_graph_retain_defers_a_free_list_slot() {
+        let ids = ObjectIdRegistry::new();
+        let owner = TaskKey {
+            id: carrick_personality_linux::identity::task_id_from_linux_pid(100).unwrap(),
+            serial: ids.task_serial().unwrap(),
+        };
+        let key = ThreadKey {
+            tid: LinuxTid::from_abi_positive(101).unwrap(),
+            serial: ids.thread_serial().unwrap(),
+        };
+        let arena = ThreadControlArena::new(owner);
+        let lease = arena.allocate(key);
+        let address = lease.slot_address();
+        // The arena retains the free allocation throughout this controlled
+        // late-retain window, just as a page scan did before Reaped filtering.
+        let control = unsafe { &*(address.0 as *const ThreadControlSlot) };
+        drop(lease);
+        let retained = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
+        let other = arena.allocate(key);
+        assert_ne!(other.slot_address(), address);
+        drop(retained);
+        let recycled = arena.allocate(key);
+        assert_eq!(recycled.slot_address(), address);
     }
 
     #[test]
