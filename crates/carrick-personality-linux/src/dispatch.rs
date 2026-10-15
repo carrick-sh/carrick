@@ -1138,7 +1138,8 @@ mod ring_first_tests {
             Some(self)
         }
         fn lifecycle_native(&mut self) -> Option<&mut dyn crate::lifecycle::LifecycleNative<'a>> {
-            (self.set == HostCrossingSet::X86 && self.native.0 == 61)
+            ((self.set == HostCrossingSet::X86 && self.native.0 == 61)
+                || (self.set == HostCrossingSet::Aarch64 && self.native.0 == 260 && self.work))
                 .then_some(self as &mut dyn crate::lifecycle::LifecycleNative<'a>)
         }
         fn native_number(&self) -> Option<carrick_syscall_abi::NativeNr> {
@@ -1408,6 +1409,7 @@ mod ring_first_tests {
             (139, false, false, CompletionRoute::Forward),
             (220, false, false, CompletionRoute::Forward),
             (260, false, false, CompletionRoute::Forward),
+            (260, true, false, CompletionRoute::WithWork),
             (174, true, false, CompletionRoute::WithWork),
         ] {
             let refused = [const { AtomicU64::new(0) }; 513];
@@ -1430,11 +1432,13 @@ mod ring_first_tests {
                 expected,
                 "ordinal={ordinal} work={work} handback={handback}"
             );
-            if ordinal == 174 {
+            if ordinal == 174 || (ordinal == 260 && work) {
                 assert_eq!(
                     pending.result, -38,
-                    "pending work must not leak host getuid"
+                    "pending work must retain ARM's host handback"
                 );
+            }
+            if ordinal == 174 {
                 assert_eq!(pending.refused[174].load(Ordering::Relaxed), 1);
                 assert_eq!(pending.forwarded[174].load(Ordering::Relaxed), 0);
                 assert_eq!(
