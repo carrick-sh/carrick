@@ -599,6 +599,8 @@ pub struct NativeProcessRuntime<'a, M: Clone, C: ProcessContext> {
     ipc_channels: IpcWaitChannels,
     #[cfg(test)]
     signal_check_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    closing_race_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
     registry: SpinLock<Option<&'a NativeProcessRegistry<'a, M, C>>>,
 }
 
@@ -804,12 +806,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
     }
 
     fn adopted_members(
-        &self,
+        state: &NativeRegistryState<'a, M, C>,
         runtime: &NativeProcessRuntime<'a, M, C>,
         process: TaskKey,
         caller: ExecutionBinding,
     ) -> Vec<(ExecutionBinding, &'a ThreadControlSlot, RecordRef)> {
-        let state = self.state.lock();
         let carrier = core::ptr::from_ref(runtime.zone).addr();
         state
             .by_process
@@ -1236,6 +1237,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         };
         let group_key = Self::group_key(source.zone, address, page, visible_pid);
         let mut state = self.state.lock();
+        if page.gate() == carrick_el1_abi::GateState::Closed {
+            return Err(NativeProcessError::Stale);
+        }
         let (runtime, process) = state
             .groups
             .get(&group_key)
@@ -1550,6 +1554,10 @@ impl<M, C: ProcessContext> NativeResources<'_, M, C> {
     }
 }
 impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
+    #[cfg(test)]
+    pub(super) fn install_closing_race_hook(&self, hook: Box<dyn FnOnce() + Send>) {
+        *self.closing_race_hook.lock() = Some(hook);
+    }
     pub fn zone(&self) -> &'a ZoneTables<C> {
         self.zone
     }
@@ -1885,6 +1893,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             ipc_channels,
             #[cfg(test)]
             signal_check_hook: SpinLock::new(None),
+            #[cfg(test)]
+            closing_race_hook: SpinLock::new(None),
             registry: SpinLock::new(None),
         })
     }
@@ -3350,14 +3360,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         wait_status: LinuxWaitStatus,
     ) -> Result<(&'a ThreadLifecyclePage, Arc<WaitChannel>), NativeProcessError> {
         let registry = *self.runtime.registry.lock();
-        let adopted = registry.map_or_else(Vec::new, |registry| {
-            registry.adopted_members(self.runtime, self.key, self.binding)
-        });
         let address = self
             .runtime
             .task_binding(self.key)
             .ok_or(NativeProcessError::Stale)?
             .address;
+        // Adoption holds this lock through graph publication. Keep it while
+        // closing the gate and taking the authoritative member snapshot.
+        let registry_state = registry.map(|registry| registry.state.lock());
+        #[cfg(test)]
+        if let Some(hook) = self.runtime.closing_race_hook.lock().take() {
+            hook();
+        }
+        let mut adopted = Vec::new();
         let (page, channel, first_close) = {
             let mut graph = self.runtime.graph.lock();
             let row = graph
@@ -3375,10 +3390,28 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 if page.live() == 0 {
                     return Err(NativeProcessError::Quarantined);
                 }
+                let identity = carrick_core::terminal::ProcessTerminalIdentity::from_exit(
+                    self.key,
+                    address,
+                    wait_status.to_termination_status(),
+                );
                 let channel = Arc::new(WaitChannel {
                     generation: ProcessWake::new(),
                     mm: self.binding.mm.raw(),
                 });
+                let custody = carrick_core::terminal::TerminalCustody::<
+                    carrick_core::terminal::Process,
+                    carrick_core::terminal::Live,
+                >::admitted(identity)
+                .close_gate(page);
+                if let Some(state) = registry_state.as_deref() {
+                    adopted = NativeProcessRegistry::adopted_members(
+                        state,
+                        self.runtime,
+                        self.key,
+                        self.binding,
+                    );
+                }
                 let mut outstanding = Vec::new();
                 let mut pool = Vec::new();
                 for index in 0..carrick_el1_abi::THREAD_POOL_ENTRIES {
@@ -3429,11 +3462,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         OutstandingExitReceipt::HostBorn { identity, .. } => Some(*identity),
                     })
                     .collect();
-                let identity = carrick_core::terminal::ProcessTerminalIdentity::from_exit(
-                    self.key,
-                    address,
-                    wait_status.to_termination_status(),
-                );
                 let members = carrick_core::terminal::MemberSet::new(
                     identity,
                     pool,
@@ -3441,13 +3469,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     page.live() as usize,
                 )
                 .ok_or(NativeProcessError::Exhausted)?;
-                let (custody, verdict) = carrick_core::terminal::TerminalCustody::<
-                    carrick_core::terminal::Process,
-                    carrick_core::terminal::Live,
-                >::admitted(identity)
-                .close(page, members);
-                let carrick_core::terminal::RetirementVerdict::CancelMembers { members, .. } =
-                    verdict
+                let verdict = custody.cancel_members(members);
+                let Some(carrick_core::terminal::RetirementVerdict::CancelMembers {
+                    members, ..
+                }) = verdict
                 else {
                     return Err(NativeProcessError::Quarantined);
                 };
@@ -3480,6 +3505,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 first_close,
             )
         };
+        drop(registry_state);
         if first_close && let Some(registry) = registry {
             let members = self
                 .runtime
