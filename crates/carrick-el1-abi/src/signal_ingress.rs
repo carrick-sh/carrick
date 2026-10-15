@@ -147,4 +147,41 @@ mod tests {
             }
         ));
     }
+
+    #[test]
+    fn full_ingress_returns_owned_event_and_preserves_fifo_order() {
+        let queue = SignalIngressQueue::<2>::new();
+        let task = TaskKey {
+            id: TaskId::from_registry_allocation(NonZeroI32::new(41).unwrap()),
+            serial: TaskSerial::from_registry_allocation(NonZeroU64::new(7).unwrap()),
+        };
+        let binding = ExecutionBinding {
+            task: EntryTaskKey::from_raw(41),
+            generation: EntryGeneration::from_raw(11),
+            mm: EntryMmKey::from_raw(301),
+            thread_generation: EntryThreadGeneration::from_raw(101),
+        };
+        let record = RecordRef {
+            id: RecordId::from_raw(4).unwrap(),
+            incarnation: 9,
+        };
+        let make = |generation| {
+            ExternalSignalRecord::new(
+                task,
+                binding,
+                record,
+                SignalEventGeneration::new(NonZeroU64::new(generation).unwrap()),
+                Signal::SEGV,
+                ExternalSignalSource::HostFault,
+            )
+        };
+        assert_eq!(queue.try_publish(make(1)), Ok(()));
+        assert_eq!(queue.try_publish(make(2)), Ok(()));
+        assert_eq!(queue.try_publish(make(3)), Err(make(3)));
+        assert_eq!(queue.take(), Some(make(1)));
+        assert_eq!(queue.try_publish(make(3)), Ok(()));
+        assert_eq!(queue.take(), Some(make(2)));
+        assert_eq!(queue.take(), Some(make(3)));
+        assert_eq!(queue.take(), None);
+    }
 }
