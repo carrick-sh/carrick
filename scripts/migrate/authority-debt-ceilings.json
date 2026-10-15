@@ -3723,7 +3723,7 @@
       "operation": "fatal:vcpu_loop::quiesce_rollback",
       "owner": "carrick_runtime::vcpu_loop::quiesce::ThreadRuntimeState<E>::prepare_in_process_fork",
       "lane": "shared",
-      "ceiling": 6
+      "ceiling": 3
     },
     {
       "family": "fatal_carrier_fault",
