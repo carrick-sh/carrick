@@ -2031,15 +2031,11 @@ fn arm_root_admission_imports_live_thread_membership_without_changing_census() {
                 ));
             })
             .unwrap();
-        assert_eq!(
-            service.crossing.root_exits.load(Ordering::Acquire),
-            usize::from(notified)
-        );
+        // An exact ExitedInZone member owes no host receipt even when its
+        // registry row has not yet been unregistered.
+        assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
         assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 0);
-        assert_eq!(
-            registry().for_record(fixture.zone, record).is_none(),
-            notified
-        );
+        assert!(registry().for_record(fixture.zone, record).is_none());
     }
 }
 
