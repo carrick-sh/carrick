@@ -281,6 +281,12 @@ import json, os, pathlib, shutil, sys
 main, head, middle = (os.environ[k] for k in ('CHAIN_MAIN', 'CHAIN_HEAD', 'CHAIN_MIDDLE'))
 args = sys.argv[1:]
 if args[:2] == ['api', 'graphql']:
+    if os.environ.get('CHAIN_DENY') == 'forbidden':
+        print(json.dumps({'errors': [{'type': 'FORBIDDEN', 'message': 'Resource not accessible by integration'}]}))
+        raise SystemExit(1)
+    if os.environ.get('CHAIN_DENY') == 'resource':
+        print(json.dumps({'errors': [{'message': 'Resource not accessible by integration'}]}))
+        raise SystemExit(0)
     nodes = [
         {'position': 1, 'baseCommit': {'oid': main}, 'headCommit': {'oid': head}},
         {'position': 2, 'baseCommit': {'oid': head}, 'headCommit': {'oid': middle}},
@@ -348,7 +354,7 @@ else:
             .env("CHAIN_HEAD", &head)
             .env("CHAIN_MIDDLE", &middle)
             .env("CHAIN_DEEP", &deep)
-            .env("CHAIN_BASE_RECEIPT", baseline_file)
+            .env("CHAIN_BASE_RECEIPT", &baseline_file)
             .output()
             .unwrap();
         assert!(
@@ -366,6 +372,36 @@ else:
             "{}",
             String::from_utf8_lossy(&output.stdout)
         );
+
+        for denial in ["forbidden", "resource"] {
+            let denied = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+                .args(["ci-receipt", "gate", "--lane", "hvf", "--base-sha", &middle])
+                .arg("--candidate-dir")
+                .arg(&candidate_dir)
+                .args(["--candidate-sha", &deep, "--run-attempt", "1"])
+                .arg("--download-dir")
+                .arg(dir.path().join("denied-download"))
+                .args(["--wait-minutes", "0"])
+                .env(
+                    "PATH",
+                    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+                )
+                .env("CHAIN_MAIN", &main)
+                .env("CHAIN_HEAD", &head)
+                .env("CHAIN_MIDDLE", &middle)
+                .env("CHAIN_DEEP", &deep)
+                .env("CHAIN_BASE_RECEIPT", &baseline_file)
+                .env("CHAIN_DENY", denial)
+                .output()
+                .unwrap();
+            assert!(!denied.status.success());
+            assert!(
+                String::from_utf8_lossy(&denied.stderr)
+                    .contains("merge queue GraphQL lookup denied (token scope?)"),
+                "{}",
+                String::from_utf8_lossy(&denied.stderr)
+            );
+        }
     }
 }
 
