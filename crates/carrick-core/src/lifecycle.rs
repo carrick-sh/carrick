@@ -335,6 +335,15 @@ pub trait Lifecycle {
             .map(|_| ())
             .map_err(GateState::from_raw)
     }
+    /// Decline in-zone service without reviving a terminal process.
+    fn decline_to_host(&self) {
+        let _ = self
+            .gate_word()
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |raw| {
+                (GateState::from_raw(raw) != GateState::Closed)
+                    .then_some(GateState::HostOnly as u32)
+            });
+    }
     /// Terminal admission close, from any state.
     fn close(&self) {
         self.gate_word()
@@ -343,7 +352,8 @@ pub trait Lifecycle {
     /// Clone and exit admissions a host must drain after `close_for_fork`.
     /// `SeqCst` scan (second half of both claim/gate pairs).
     fn claimed_count(&self) -> usize {
-        self.host_claimed_count()
+        self.process_exit_custody().fork_publications()
+            + self.host_claimed_count()
             + (0..self.entry_count())
                 .filter(|&index| {
                     self.entry_word(index).is_some_and(|e| {

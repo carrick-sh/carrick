@@ -294,7 +294,11 @@ impl Kernel {
         if !tracee.claim_ptrace_tracer(tracer) {
             return false;
         }
-        tracee.shared().pending_signals().lifecycle_lease().close();
+        tracee
+            .shared()
+            .pending_signals()
+            .lifecycle_lease()
+            .decline_to_host();
         {
             let state = self.registry().settled().read();
             if let Some(record) = state

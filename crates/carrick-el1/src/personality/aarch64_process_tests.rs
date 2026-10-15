@@ -409,6 +409,8 @@ struct Fixture {
     maintenance: CallerInvalidatesAsid,
     page: &'static ThreadLifecyclePage,
     control: &'static ThreadControlSlot,
+    #[cfg(test)]
+    leader: ThreadIdentity,
 }
 
 fn asid(raw: u16) -> carrick_guest_arch::Asid {
@@ -434,42 +436,12 @@ impl Fixture {
         file_table: u64,
         page: &'static ThreadLifecyclePage,
     ) -> Self {
-        let region_box = Box::new(crate::personality::mm_portal::test_support::Region::new());
-        let region = Box::leak(region_box);
-        let zone: &'static ZoneTables<Aarch64ParkedContext> = unsafe {
-            &*region
-                .ptr
-                .as_ptr()
-                .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
-                .cast()
-        };
-
-        let control: &'static ThreadControlSlot = Box::leak(Box::new(ThreadControlSlot::new()));
-
-        let task = CurrentTask::new();
-        task.set(El1TaskId::from_linux_tid(41), 11, file_table);
-        task.mm.key.store(1, Ordering::Release);
-        task.mm.thread_generation.store(101, Ordering::Release);
-        task.publish_visible_pid(41);
-        task.publish_lifecycle(page as *const _ as u64, control as *const _ as u64);
-
-        let address = AddressContext {
-            root: RootGpa::page_aligned(FrameGpa::new(root_gpa)).unwrap(),
-            mm: MmGeneration::new(NonZeroU64::new(1).unwrap()),
-            generation: ContextGeneration::new(NonZeroU64::new(101).unwrap()),
-        };
-        task.publish_root_generation(address.generation);
-
-        let slot = SlotId::new(0);
-        let ttbr0 = (u64::from(asid.raw()) << 48) | root_gpa;
-        let space = zone.spaces.publish_closed(1, ttbr0, ttbr0).unwrap();
-        zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
-        zone.enter_guest(slot);
-        zone.install_space(slot, 1).unwrap();
-        zone.current_or_new(
-            slot,
+        let control = Box::leak(Box::new(ThreadControlSlot::new()));
+        Self::with_identity(
+            root_gpa,
+            asid,
+            page,
+            control,
             ThreadIdentity {
                 tid: 41,
                 serial: 101,
@@ -481,10 +453,58 @@ impl Fixture {
                 control_slot: control as *const _ as u64,
             },
         )
-        .unwrap();
+    }
+    fn with_identity(
+        root_gpa: u64,
+        asid: carrick_guest_arch::Asid,
+        page: &'static ThreadLifecyclePage,
+        control: &'static ThreadControlSlot,
+        leader: ThreadIdentity,
+    ) -> Self {
+        let file_table = leader.file_table;
 
-        let index = zone.spaces.find(1).unwrap();
-        let mm = ReservationMm::new(1).unwrap();
+        let region_box = Box::new(crate::personality::mm_portal::test_support::Region::new());
+        let region = Box::leak(region_box);
+        let zone: &'static ZoneTables<Aarch64ParkedContext> = unsafe {
+            &*region
+                .ptr
+                .as_ptr()
+                .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+                .cast()
+        };
+
+        let task = CurrentTask::new();
+        task.set(
+            El1TaskId::from_linux_tid(leader.tid as i32),
+            leader.generation,
+            file_table,
+        );
+        task.mm.key.store(leader.mm, Ordering::Release);
+        task.mm
+            .thread_generation
+            .store(leader.serial, Ordering::Release);
+        task.publish_visible_pid(leader.tid as u32);
+        task.publish_lifecycle(page as *const _ as u64, control as *const _ as u64);
+
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(root_gpa)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::new(leader.mm).unwrap()),
+            generation: ContextGeneration::new(NonZeroU64::new(101).unwrap()),
+        };
+        task.publish_root_generation(address.generation);
+
+        let slot = SlotId::new(0);
+        let ttbr0 = (u64::from(asid.raw()) << 48) | root_gpa;
+        let space = zone.spaces.publish_closed(leader.mm, ttbr0, ttbr0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, leader.mm);
+        zone.publish_slot(slot, leader.mm, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, leader.mm).unwrap();
+        zone.current_or_new(slot, leader).unwrap();
+
+        let index = zone.spaces.find(leader.mm).unwrap();
+        let mm = ReservationMm::new(leader.mm).unwrap();
         let table = region.table();
         table
             .publish(
@@ -530,6 +550,8 @@ impl Fixture {
             maintenance,
             page,
             control,
+            #[cfg(test)]
+            leader,
         }
     }
     #[cfg(test)]
@@ -2518,7 +2540,13 @@ fn run_as(fixture: &Fixture, tid: i32, generation: u64, serial: u64, control: &T
 
 #[cfg(test)]
 fn run_as_leader(fixture: &Fixture) {
-    run_as(fixture, 41, 11, 101, fixture.control);
+    run_as(
+        fixture,
+        fixture.leader.tid as i32,
+        fixture.leader.generation,
+        fixture.leader.serial,
+        fixture.control,
+    );
 }
 
 /// A sibling the host cloned because the in-ring pool was empty: an issued
@@ -4208,6 +4236,14 @@ fn wake_closing_root(
     drop(guard);
     assert_eq!(count, 1);
     assert!(transfers.is_empty());
+    resume_closing_root(fixture, service)
+}
+
+#[cfg(test)]
+fn resume_closing_root(
+    fixture: &'static Fixture,
+    service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
+) -> crate::sched::ResumeAction {
     let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
     run_as_leader(fixture);
     let source = BornInZoneSource {
@@ -4339,8 +4375,8 @@ fn arm_exit_group_under_gate(state: carrick_el1_abi::GateState) {
                 |_| (),
             )
             .unwrap();
-        if state == carrick_el1_abi::GateState::Closed {
-            fixture.page.close();
+        if state == carrick_el1_abi::GateState::HostOnly {
+            fixture.page.decline_to_host();
         }
         let mut admission = arena.birth_admission().unwrap();
         if state == carrick_el1_abi::GateState::AwaitingExecBinding {
@@ -4414,5 +4450,194 @@ fn arm_exit_group_under_awaiting_exec_binding() {
 }
 #[test]
 fn arm_exit_group_under_host_only_closed() {
-    arm_exit_group_under_gate(carrick_el1_abi::GateState::Closed);
+    arm_exit_group_under_gate(carrick_el1_abi::GateState::HostOnly);
+}
+
+/// Actual host reservations share the exact parent's page and control with
+/// ARM dispatch; the peer is another live process in the same host registry.
+#[cfg(test)]
+fn arm_exit_group_host_fork_race(stage: u8) {
+    use carrick_el1_abi::Lifecycle;
+    use carrick_kernel::kernel::clone_plan::ClonePlan;
+    use carrick_kernel::kernel::{Kernel, KernelOperationError, RootBootstrap};
+    let input = RootBootstrap::for_reference_model(
+        41,
+        carrick_hal::ThreadId::synthetic_for_tests(41),
+        "fork-exit-root".into(),
+    )
+    .unwrap();
+    let (kernel, root) = Kernel::bootstrap_root(input).unwrap();
+    let root = Box::leak(Box::new(root));
+    let plan = ClonePlan::from_flags(carrick_abi::LinuxCloneFlags::empty()).unwrap();
+    let peer = kernel
+        .reserve_fork(root, plan, "live-peer".into(), None)
+        .unwrap()
+        .prepare_reference(carrick_hal::ThreadId::synthetic_for_tests(42))
+        .unwrap()
+        .commit()
+        .unwrap()
+        .start_child()
+        .unwrap()
+        .into_parts()
+        .0;
+    assert!(root.exact_thread_is_live() && peer.exact_thread_is_live());
+    let page_lease = Box::leak(Box::new(root.lifecycle_page()));
+    let page = &**page_lease;
+    let control = root.thread().control_slot();
+    let fixture = Box::leak(Box::new(Fixture::with_identity(
+        0x10000,
+        asid(1),
+        page,
+        control,
+        ThreadIdentity {
+            tid: root.thread().key().tid.raw() as u64,
+            serial: root.thread().key().serial.raw(),
+            generation: root.task().key().serial.raw(),
+            mm: root.shared().mm().id().raw(),
+            file_table: root.resources().files().id().raw(),
+            affinity: 1,
+            lifecycle_page: page as *const _ as u64,
+            control_slot: control as *const _ as u64,
+        },
+    )));
+    let mut service = fixture.process_service();
+    fixture
+        .enter(control, fixture_ttbr0(fixture), &mut service, |_| ())
+        .unwrap();
+    let baseline_claimed = page.claimed_count();
+    let reserved = kernel
+        .reserve_fork(root, plan, "racing-child".into(), None)
+        .unwrap();
+    let child_id = reserved.child_id();
+    let mut exit = || {
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[0] = 7;
+        frame.x[8] = 94;
+        arm_call(fixture, control, &mut service, &mut frame).unwrap()
+    };
+    if stage == 0 {
+        let _ = exit();
+    }
+    let prepared = reserved
+        .prepare_reference(carrick_hal::ThreadId::synthetic_for_tests(43))
+        .unwrap();
+    let retained = prepared.resource_retention_probe();
+    if stage == 1 {
+        let _ = exit();
+    }
+    let result = carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
+        if stage == 2 {
+            prepared.commit_with_publication_boundary(
+                || {
+                    assert_eq!(page.claimed_count(), baseline_claimed + 1);
+                    assert_eq!(
+                        exit(),
+                        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+                    );
+                },
+                || panic!("terminal close must defeat publication"),
+            )
+        } else if stage == 3 {
+            let mut publication = prepared.publication();
+            let admitted = publication.admit().unwrap();
+            assert_eq!(
+                exit(),
+                carrick_personality_linux::dispatch::CompletionRoute::Suspended
+            );
+            let result = admitted.commit();
+            // Kernel publication alone cannot release Closing: the backend
+            // still owns its publication scope until its transaction finishes.
+            assert_eq!(page.claimed_count(), baseline_claimed + 1);
+            drop(publication);
+            result
+        } else if stage == 4 {
+            let mut publication = prepared.publication();
+            assert_eq!(
+                exit(),
+                carrick_personality_linux::dispatch::CompletionRoute::Suspended
+            );
+            let error = match publication.admit() {
+                Ok(_) => panic!("terminal close must defeat backend admission"),
+                Err(error) => error,
+            };
+            assert!(!retained(), "kernel rollback precedes backend rollback");
+            assert_eq!(page.claimed_count(), baseline_claimed + 1);
+            drop(publication);
+            Err(error)
+        } else {
+            prepared.commit()
+        }
+    });
+    let child = if stage == 3 {
+        Some(result.unwrap().start_child().unwrap().into_parts().0)
+    } else {
+        assert!(
+            matches!(result, Err(KernelOperationError::LifecycleAdmissionBusy(_))),
+            "exit_group must defeat host fork at stage {stage}"
+        );
+        assert!(
+            !retained(),
+            "prepared record, MM and file table must be dropped"
+        );
+        assert!(
+            kernel
+                .context(
+                    child_id,
+                    carrick_kernel::kernel::LinuxTid::for_task_leader(child_id)
+                )
+                .is_err()
+        );
+        None
+    };
+    assert_eq!(page.claimed_count(), baseline_claimed);
+    assert_eq!(page.live(), 0);
+    if stage >= 2 {
+        assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
+        assert!(matches!(
+            resume_closing_root(fixture, &mut service),
+            crate::sched::ResumeAction::Left
+        ));
+    }
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
+    assert_eq!(service.crossing.root_exit_status.load(Ordering::Acquire), 7);
+    // The fork's reservation was released: host topology exit can now commit.
+    let status = carrick_kernel::kernel::objects::LinuxWaitStatus::exited(7);
+    assert_eq!(
+        kernel
+            .exit_task(root.task().key().id, status, None)
+            .unwrap()
+            .status,
+        status
+    );
+    assert!(peer.exact_thread_is_live());
+    if let Some(child) = child {
+        assert!(child.exact_thread_is_live());
+        assert_ne!(
+            kernel.task_parent_key(child.task().key()).unwrap(),
+            Some(root.task().key())
+        );
+    }
+}
+
+#[test]
+fn arm_exit_group_defeats_admitted_host_fork() {
+    arm_exit_group_host_fork_race(0);
+}
+#[test]
+fn arm_exit_group_defeats_prepared_host_fork() {
+    arm_exit_group_host_fork_race(1);
+}
+#[test]
+fn arm_exit_group_defeats_committing_host_fork() {
+    arm_exit_group_host_fork_race(2);
+}
+
+#[test]
+fn arm_exit_group_waits_for_winning_host_fork_publication() {
+    arm_exit_group_host_fork_race(3);
+}
+
+#[test]
+fn arm_exit_group_waits_for_losing_host_fork_backend_rollback() {
+    arm_exit_group_host_fork_race(4);
 }
