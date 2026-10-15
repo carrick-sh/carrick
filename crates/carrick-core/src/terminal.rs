@@ -274,26 +274,22 @@ impl TerminalCustody<Process, Live> {
         }
     }
 
-    pub fn close(
-        self,
-        page: &impl Lifecycle,
-        members: MemberSet,
-    ) -> (TerminalCustody<Process, Closing>, RetirementVerdict) {
+    pub fn close_gate(self, page: &impl Lifecycle) -> TerminalCustody<Process, Closing> {
         page.close();
-        (
-            TerminalCustody {
-                identity: self.identity,
-                phase: PhantomData,
-            },
-            RetirementVerdict::CancelMembers {
-                process: self.identity,
-                members,
-            },
-        )
+        TerminalCustody {
+            identity: self.identity,
+            phase: PhantomData,
+        }
     }
 }
 
 impl TerminalCustody<Process, Closing> {
+    pub fn cancel_members(&self, members: MemberSet) -> Option<RetirementVerdict> {
+        (self.identity == members.process).then_some(RetirementVerdict::CancelMembers {
+            process: self.identity,
+            members,
+        })
+    }
     pub fn can_settle(&self, page: &impl Lifecycle, receipts: &CompletedMemberReceipts) -> bool {
         self.identity == receipts.process && page.live() == 0 && page.claimed_count() == 0
     }
@@ -427,8 +423,8 @@ mod tests {
         );
         let entry = EntryRef::new(0, 1);
         let members = MemberSet::new(identity, alloc::vec![entry], Vec::new(), 1).unwrap();
-        let (closing, _) =
-            TerminalCustody::<Process, Live>::admitted(identity).close(&page, members.clone());
+        let closing = TerminalCustody::<Process, Live>::admitted(identity).close_gate(&page);
+        assert!(closing.cancel_members(members.clone()).is_some());
         assert!(members.completed(&[], &[]).is_none());
         let receipt = members.completed(&[entry], &[]).unwrap();
         assert!(closing.settle(&page, receipt).is_ok());
