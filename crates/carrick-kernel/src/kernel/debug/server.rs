@@ -37,14 +37,6 @@ pub enum ServerError {
     Io(#[from] io::Error),
 }
 
-/// Process-wide slot holding the run's server so it lives as long as the run.
-///
-/// A server parked in a local would be dropped at the end of the bootstrap
-/// function and the socket would vanish immediately — the exact "live mechanism
-/// doing nothing" shape this project treats as abandoned.
-static INSTALLED: std::sync::OnceLock<parking_lot::Mutex<Option<KernelDebugServer>>> =
-    std::sync::OnceLock::new();
-
 /// Exact opt-out. The server is ON by default.
 const DISABLE_ENV: &str = "CARRICK_KERNEL_DEBUG";
 
@@ -105,38 +97,32 @@ impl KernelDebugServer {
         })
     }
 
-    /// Start the run's server and retain it for the process lifetime.
+    /// Start the carrier's server and return its owned lifetime handle.
+    ///
+    /// The carrier must retain the handle until retirement, then drop it before
+    /// admitting a replacement carrier under the same cleanup scope. A host
+    /// process can outlive many carriers; retaining a process-global server
+    /// would keep serving a retired kernel and prevent the next bind.
     ///
     /// Default ON; `CARRICK_KERNEL_DEBUG=0` is the exact opt-out. A failure to
     /// publish the endpoint is reported and the run continues: the guest
     /// workload is the product, and losing the debugger must not lose the run.
     /// The failure is never silent.
-    pub fn install(kernel: Arc<Kernel>, carrier_scope: &str) {
+    pub fn install(kernel: Arc<Kernel>, carrier_scope: &str) -> Option<Self> {
         if std::env::var_os(DISABLE_ENV).is_some_and(|value| value == "0") {
-            return;
+            return None;
         }
         match Self::start(kernel, carrier_scope) {
-            Ok(server) => {
-                let slot = INSTALLED.get_or_init(|| parking_lot::Mutex::new(None));
-                *slot.lock() = Some(server);
-            }
+            Ok(server) => Some(server),
             Err(error) => {
                 tracing::warn!(
                     target: "carrick::kernel::debug",
                     %error,
                     "kernel debug endpoint not published; `carrick debug hvpatch-kernel` is unavailable for this run"
                 );
+                None
             }
         }
-    }
-
-    /// Path of the installed server, when one is running.
-    pub fn installed_socket_path() -> Option<std::path::PathBuf> {
-        let slot = INSTALLED.get()?;
-        let guard = slot.lock();
-        guard
-            .as_ref()
-            .map(|server| server.socket_path().to_path_buf())
     }
 
     pub fn socket_path(&self) -> &std::path::Path {
@@ -398,6 +384,29 @@ mod tests {
     use crate::kernel::{Asid, MmBackend, MmBackendSnapshot, RootBootstrap, SnapshotError};
 
     const COMPLETION_FAILURE_BOUND: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn installed_server_retires_with_its_owner_before_scope_reuse() {
+        let scope = format!("debug-owned-{}", std::process::id());
+        for pid in [4242, 4343] {
+            let bootstrap = RootBootstrap::for_reference_model(
+                pid,
+                carrick_hal::ThreadId::synthetic_for_tests(pid),
+                format!("owned-root-{pid}"),
+            )
+            .expect("bootstrap");
+            let (kernel, _context) = Kernel::bootstrap_root(bootstrap).expect("kernel");
+            {
+                let _server = KernelDebugServer::install(kernel, &scope);
+                let endpoint = DebugEndpoint::for_run_id(&scope).expect("endpoint");
+                assert!(UnixStream::connect(endpoint.socket_path()).is_ok());
+            }
+            assert!(matches!(
+                super::super::client::fetch(&scope, None),
+                Err(super::super::client::ClientError::NotListening { .. })
+            ));
+        }
+    }
 
     #[test]
     fn a_partial_request_does_not_block_a_complete_frame_or_shutdown() {

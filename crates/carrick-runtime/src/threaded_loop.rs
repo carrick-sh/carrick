@@ -556,15 +556,7 @@ where
             // was initialized before execution; acknowledge it only after the
             // route exists, without recapturing a possibly exited root.
             publish_root_tty(&kernel.dispatcher, runtime.kernel());
-            carrick_kernel::kernel::KernelDebugServer::install(
-                Arc::clone(runtime.kernel()),
-                kernel
-                    .dispatcher
-                    .container()
-                    .launch()
-                    .carrier_scope_id
-                    .as_str(),
-            );
+            runtime.install_debug_server(&kernel.dispatcher.container().launch().carrier_scope_id);
         });
     }
     let outcome = launch.wait();

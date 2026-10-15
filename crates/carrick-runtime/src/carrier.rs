@@ -219,11 +219,23 @@ struct CarrierState {
 }
 
 pub(crate) struct CarrierKernelRuntime {
+    debug_server: parking_lot::Mutex<Option<carrick_kernel::kernel::KernelDebugServer>>,
     kernel: Arc<carrick_kernel::kernel::Kernel>,
     directory: Arc<crate::vcpu_loop::HvpatchRuntimeDirectory>,
 }
 
 impl CarrierKernelRuntime {
+    pub(crate) fn install_debug_server(&self, scope: &CarrierScopeId) {
+        *self.debug_server.lock() = carrick_kernel::kernel::KernelDebugServer::install(
+            Arc::clone(&self.kernel),
+            scope.as_str(),
+        );
+    }
+
+    fn retire_debug_server(&self) {
+        drop(self.debug_server.lock().take());
+    }
+
     pub(crate) fn kernel(&self) -> &Arc<carrick_kernel::kernel::Kernel> {
         &self.kernel
     }
@@ -694,7 +706,11 @@ impl CarrierRuntime {
             ),
         );
         let initialization = initialize(&kernel, &directory, &context)?;
-        let runtime = Arc::new(CarrierKernelRuntime { kernel, directory });
+        let runtime = Arc::new(CarrierKernelRuntime {
+            debug_server: parking_lot::Mutex::new(None),
+            kernel,
+            directory,
+        });
         let mut slot = self.inner.kernel_runtime.lock();
         if !matches!(*slot, CarrierKernelRuntimeSlot::Booting(None)) {
             return Err(RuntimeError::CarrierFailed(
@@ -1012,6 +1028,13 @@ impl CarrierRuntime {
         };
         state.completed_lifecycle = Some(completed.clone());
         drop(state);
+
+        // A closed carrier may remain referenced by observers. Release its
+        // socket before publishing Closed, so the next carrier can bind the
+        // same run-id digest and cannot expose this retired graph.
+        if let Some(runtime) = self.kernel_runtime() {
+            runtime.retire_debug_server();
+        }
 
         if let Some(path) = artifact_path.filter(|_| !completed.events.is_empty()) {
             if let Err(failure) = publish(path, &completed, &self.inner.scope) {
