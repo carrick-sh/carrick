@@ -834,9 +834,15 @@ fn mounted_poll_command(dir: &std::path::Path, elf: &std::path::Path) -> std::pr
         String::from_utf8_lossy(&load.stderr)
     );
     let mut command = std::process::Command::new(&cli);
+    let scope = std::env::var("CARRICK_RUN_ID").unwrap_or_else(|_| "local".to_owned());
+    let run_id = format!(
+        "{scope}-x86-kvm-poll-{}-{}",
+        std::process::id(),
+        dir.file_name().unwrap().to_string_lossy()
+    );
     command
         .env("CARRICK_HOME", &home)
-        .env("CARRICK_RUN_ID", "x86-kvm-poll-wait-test")
+        .env("CARRICK_RUN_ID", run_id)
         .args([
             "run",
             "--platform",
@@ -848,6 +854,27 @@ fn mounted_poll_command(dir: &std::path::Path, elf: &std::path::Path) -> std::pr
             "x86-kvm-hello:latest",
         ]);
     command
+}
+
+#[test]
+fn mounted_poll_commands_use_distinct_carrier_scopes() {
+    let first_dir = tempfile::tempdir().unwrap();
+    let second_dir = tempfile::tempdir().unwrap();
+    let first = mounted_poll_command(first_dir.path(), &first_dir.path().join("hello"));
+    let second = mounted_poll_command(second_dir.path(), &second_dir.path().join("hello"));
+    let run_id = |command: &std::process::Command| {
+        command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("CARRICK_RUN_ID"))
+            .and_then(|(_, value)| value)
+            .unwrap()
+            .to_owned()
+    };
+    assert_ne!(
+        run_id(&first),
+        run_id(&second),
+        "parallel poll carriers must not claim the same debug endpoint"
+    );
 }
 
 struct ReapChild(Child);
@@ -1558,61 +1585,69 @@ fn run_mounted_binary_with_capture(
     (output, Some(capture_path))
 }
 
-#[test]
-fn mounted_static_x86_deadline_captures_parked_wait() {
-    if skip_without_kvm() {
-        return;
+// Host stack capture may attach to and stop its carrier. Keep this witness
+// outside the parallel KVM test population while preserving the normal
+// parallelism of every other KVM test.
+mod serial_host {
+    use super::*;
+
+    #[test]
+    fn mounted_static_x86_deadline_captures_parked_wait() {
+        if skip_without_kvm() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let elf = dir.path().join("wait-forever");
+        compile_assembly("x86_wait_forever.S", &elf);
+        let (output, capture_path) =
+            run_mounted_binary_with_capture(&elf, "x86_wait_forever.S", false);
+        assert_eq!(output.status.signal(), Some(libc::SIGKILL));
+        let capture_path = capture_path.expect("deadline must write a capture");
+        let capture: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+        let wedge_manifest = std::fs::read_dir(capture_path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("manifest.json"))
+            .find(|path| path.is_file())
+            .expect("deadline must invoke carrier host stack capture");
+        let wedge: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(wedge_manifest).unwrap()).unwrap();
+        assert_eq!(wedge["schema"], "carrick.wedge-capture.v1");
+        assert_eq!(wedge["run_id"], capture["run_id"]);
+        assert_eq!(capture["schema"], "carrick.kernel-post-mortem.v1");
+        assert!(
+            capture["event_ring"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty())
+        );
+        assert!(capture["physical"]["zone_census"].as_str().is_some());
+        assert!(
+            capture["physical"]["vcpus"]
+                .as_array()
+                .is_some_and(|rows| rows.len() == 2
+                    && rows.iter().all(|row| row
+                        .as_str()
+                        .is_some_and(|text| text.contains("last_stopped_gprs="))))
+        );
+        assert!(capture["scheduler_aux"]["scheduler"].as_array().is_some());
+        let named_wait = capture["degraded_kernel"]["tasks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|task| task["threads"].as_array().into_iter().flatten())
+            .any(|thread| {
+                thread["key"]["tid"].as_u64().is_some()
+                    && thread["execution"].as_str().is_some_and(|state| {
+                        state.contains("Blocked") && state.contains("HostWait")
+                    })
+            });
+        assert!(
+            named_wait,
+            "deadline capture did not name the parked task and wait: {}",
+            capture_path.display()
+        );
     }
-    let dir = tempfile::tempdir().unwrap();
-    let elf = dir.path().join("wait-forever");
-    compile_assembly("x86_wait_forever.S", &elf);
-    let (output, capture_path) = run_mounted_binary_with_capture(&elf, "x86_wait_forever.S", false);
-    assert_eq!(output.status.signal(), Some(libc::SIGKILL));
-    let capture_path = capture_path.expect("deadline must write a capture");
-    let capture: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
-    let wedge_manifest = std::fs::read_dir(capture_path.parent().unwrap())
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path().join("manifest.json"))
-        .find(|path| path.is_file())
-        .expect("deadline must invoke carrier host stack capture");
-    let wedge: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(wedge_manifest).unwrap()).unwrap();
-    assert_eq!(wedge["schema"], "carrick.wedge-capture.v1");
-    assert_eq!(wedge["run_id"], capture["run_id"]);
-    assert_eq!(capture["schema"], "carrick.kernel-post-mortem.v1");
-    assert!(
-        capture["event_ring"]
-            .as_array()
-            .is_some_and(|rows| !rows.is_empty())
-    );
-    assert!(capture["physical"]["zone_census"].as_str().is_some());
-    assert!(
-        capture["physical"]["vcpus"]
-            .as_array()
-            .is_some_and(|rows| rows.len() == 2
-                && rows.iter().all(|row| row
-                    .as_str()
-                    .is_some_and(|text| text.contains("last_stopped_gprs="))))
-    );
-    assert!(capture["scheduler_aux"]["scheduler"].as_array().is_some());
-    let named_wait = capture["degraded_kernel"]["tasks"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .flat_map(|task| task["threads"].as_array().into_iter().flatten())
-        .any(|thread| {
-            thread["key"]["tid"].as_u64().is_some()
-                && thread["execution"]
-                    .as_str()
-                    .is_some_and(|state| state.contains("Blocked") && state.contains("HostWait"))
-        });
-    assert!(
-        named_wait,
-        "deadline capture did not name the parked task and wait: {}",
-        capture_path.display()
-    );
 }
 
 #[test]
