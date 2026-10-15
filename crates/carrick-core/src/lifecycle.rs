@@ -2,6 +2,13 @@
 pub use carrick_core_abi::lifecycle::*;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExpectedExitReceipt {
+    Pool,
+    Host,
+    AlreadyExited,
+}
+
 /// The exact page owns the storage and retains its ledger notification authority.
 /// Linux payload initialization happens between reserve and release publication.
 pub trait Lifecycle {
@@ -176,12 +183,27 @@ pub trait Lifecycle {
         self.entry_word(index)
             .map(|word| unpack(word.load(Ordering::Acquire)))
     }
-    /// Whether Closing still expects this exact pool entry's exit receipt.
-    fn exit_receipt_expected(&self, entry: EntryRef) -> bool {
-        matches!(self.state(entry.index()),
-            Some((generation, EntryState::Born | EntryState::Published
-                | EntryState::ExitingBorn | EntryState::ExitingPublished))
-                if generation == entry.generation())
+    /// One exact member has one Closing receipt kind. A completed in-zone
+    /// entry cannot acquire a host-retirement obligation while unregistering.
+    fn expected_exit_receipt(&self, entry: Option<EntryRef>) -> ExpectedExitReceipt {
+        let Some(entry) = entry else {
+            return ExpectedExitReceipt::Host;
+        };
+        match self.state(entry.index()) {
+            Some((
+                generation,
+                EntryState::Born
+                | EntryState::Published
+                | EntryState::ExitingBorn
+                | EntryState::ExitingPublished,
+            )) if generation == entry.generation() => ExpectedExitReceipt::Pool,
+            Some((generation, EntryState::ExitedInZone | EntryState::Reaped))
+                if generation == entry.generation() =>
+            {
+                ExpectedExitReceipt::AlreadyExited
+            }
+            _ => ExpectedExitReceipt::Host,
+        }
     }
     fn transition(
         &self,
