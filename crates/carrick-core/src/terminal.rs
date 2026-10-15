@@ -60,6 +60,20 @@ impl ProcessExitCustody {
             fork_publications: core::sync::atomic::AtomicU32::new(0),
         }
     }
+
+    fn caller_reserved(&self) -> bool {
+        use core::sync::atomic::Ordering;
+        loop {
+            match self.begun.load(Ordering::Acquire) {
+                0 => return false,
+                2 => return true,
+                // The process owner has claimed the close but has not yet
+                // published its caller's membership reservation. A sibling
+                // cannot choose a last-member floor until that completes.
+                _ => core::hint::spin_loop(),
+            }
+        }
+    }
 }
 
 impl ProcessExitCustody {
@@ -440,6 +454,7 @@ impl TerminalCustody<Process, Live> {
             }
         };
         caller.publish();
+        state.begun.store(2, Ordering::Release);
         Ok(TerminalCustody {
             identity: ProcessTerminalIdentity::from_exit(task, address, status),
             phase: PhantomData,
@@ -575,7 +590,11 @@ impl TerminalCustody<Thread, Exiting> {
         ),
         (Self, MembershipFloor),
     > {
-        let membership = match page.reserve_nonfinal_exit() {
+        let membership = match if page.process_exit_custody().caller_reserved() {
+            page.reserve_cancelled_member_exit()
+        } else {
+            page.reserve_nonfinal_exit()
+        } {
             Ok(membership) => membership,
             Err(error) => return Err((self, error)),
         };
@@ -788,6 +807,88 @@ mod tests {
             .is_err()
         );
         assert_eq!(page.live(), 1);
+    }
+
+    #[test]
+    fn closing_caller_and_last_sibling_both_return_live_membership() {
+        let page = Page {
+            terminal: ProcessExitCustody::new(),
+            gate: AtomicU32::new(0),
+            live: AtomicU32::new(2),
+        };
+        let task = TaskKey {
+            id: TaskId::from_registry_allocation(NonZeroI32::new(41).unwrap()),
+            serial: TaskSerial::from_raw_u64(11).unwrap(),
+        };
+        let address = AddressContext {
+            root: RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(0x10000)).unwrap(),
+            mm: carrick_guest_arch::MmGeneration::new(NonZeroU64::new(1).unwrap()),
+            generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::new(1).unwrap()),
+        };
+        let closing = TerminalCustody::<Process, Live>::begin_exit(
+            TerminalCustody::<Process, Live>::close_admission(&page),
+            task,
+            address,
+            TerminationStatus::exited(0),
+        )
+        .unwrap();
+        assert_eq!(page.live(), 1);
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let identity = ThreadTerminalIdentity::from_exit(
+                        ExecutionBinding {
+                            task: EntryTaskKey::from_raw(41),
+                            generation: EntryGeneration::from_raw(11),
+                            mm: carrick_core_abi::entry::EntryMmKey::from_raw(5),
+                            thread_generation: EntryThreadGeneration::from_raw(2),
+                        },
+                        None,
+                        TerminationStatus::exited(0),
+                    )
+                    .unwrap();
+                    let (_custody, unfinished) =
+                        TerminalCustody::<Thread, Live>::admitted(identity)
+                            .begin()
+                            .reserve_nonfinal(&page)
+                            .unwrap_or_else(|_| {
+                                panic!("the only remaining sibling can retire after process close")
+                            });
+                    assert_eq!(page.live(), 0);
+                    drop(unfinished);
+                    assert_eq!(page.live(), 1, "abandoned sibling exit restores its unit");
+                    let (_custody, sibling) = TerminalCustody::<Thread, Live>::admitted(identity)
+                        .begin()
+                        .reserve_nonfinal(&page)
+                        .unwrap_or_else(|_| panic!("restored sibling exit must be admitted"));
+                    sibling.publish();
+                })
+                .join()
+                .unwrap();
+        });
+        assert_eq!(page.live(), 0);
+        assert!(
+            TerminalCustody::<Thread, Live>::admitted(
+                ThreadTerminalIdentity::from_exit(
+                    ExecutionBinding {
+                        task: EntryTaskKey::from_raw(41),
+                        generation: EntryGeneration::from_raw(11),
+                        mm: carrick_core_abi::entry::EntryMmKey::from_raw(5),
+                        thread_generation: EntryThreadGeneration::from_raw(3),
+                    },
+                    None,
+                    TerminationStatus::exited(0),
+                )
+                .unwrap(),
+            )
+            .begin()
+            .reserve_nonfinal(&page)
+            .is_err(),
+            "zero live units cannot be spent again"
+        );
+        let members = MemberSet::new(closing.identity, Vec::new(), Vec::new());
+        let receipts = members.completed(&[], &[]).unwrap();
+        assert!(closing.settle(&page, receipts).is_ok());
     }
 
     #[test]
