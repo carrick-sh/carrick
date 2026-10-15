@@ -655,6 +655,8 @@ pub struct NativeProcessRuntime<'a, M: Clone, C: ProcessContext> {
     #[cfg(test)]
     pool_control_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
+    pool_retained_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
     settle_race_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     raw_exit_after_commit_hook: SpinLock<Option<Box<dyn FnOnce() + Send>>>,
@@ -1642,6 +1644,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         *self.pool_control_hook.lock() = Some(hook);
     }
     #[cfg(test)]
+    pub(super) fn install_pool_retained_hook(&self, hook: Box<dyn FnOnce() + Send>) {
+        *self.pool_retained_hook.lock() = Some(hook);
+    }
+    #[cfg(test)]
     pub(super) fn install_settle_race_hook(&self, hook: Box<dyn FnOnce() + Send>) {
         *self.settle_race_hook.lock() = Some(hook);
     }
@@ -1995,6 +2001,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             closing_race_hook: SpinLock::new(None),
             #[cfg(test)]
             pool_control_hook: SpinLock::new(None),
+            #[cfg(test)]
+            pool_retained_hook: SpinLock::new(None),
             #[cfg(test)]
             settle_race_hook: SpinLock::new(None),
             #[cfg(test)]
@@ -3493,6 +3501,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let page = row.native().resources().page;
             let first_close = !graph.pending_exit.contains_key(&self.key);
             if first_close {
+                let admission = carrick_core::terminal::TerminalCustody::<
+                    carrick_core::terminal::Process,
+                    carrick_core::terminal::Live,
+                >::close_admission(page);
                 // Already admitted sibling retirement still needs its own
                 // exact-record cancellation binding. Pre-live claims are
                 // refused by thread_spawned after this terminal close.
@@ -3557,6 +3569,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         {
                             continue;
                         }
+                        let expected_host = pool_host_identity(page, entry);
+                        if page.pool_control_disposition(entry)
+                            == carrick_core::lifecycle::PoolControlDisposition::Released
+                        {
+                            continue;
+                        }
+                        let expected_host = expected_host?;
                         let Some(address) =
                             page.control_address(entry).filter(|address| *address != 0)
                         else {
@@ -3568,6 +3587,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         #[cfg(test)]
                         if let Some(hook) = self.runtime.pool_control_hook.lock().take() {
                             hook();
+                        }
+                        if page.pool_control_disposition(entry)
+                            == carrick_core::lifecycle::PoolControlDisposition::Released
+                            || control.entry() != Some(entry)
+                            || carrick_el1_abi::Lifecycle::expected_exit_receipt(
+                                page,
+                                control,
+                                Some(entry),
+                            ) == carrick_core::lifecycle::ExpectedExitReceipt::AlreadyExited
+                        {
+                            continue;
                         }
                         let retained = match retain_member_control(control) {
                             Ok(retained) => retained,
@@ -3583,7 +3613,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                                 return Err(error);
                             }
                         };
-                        if control.entry() != Some(entry)
+                        #[cfg(test)]
+                        if let Some(hook) = self.runtime.pool_retained_hook.lock().take() {
+                            hook();
+                        }
+                        if page.pool_control_disposition(entry)
+                            == carrick_core::lifecycle::PoolControlDisposition::Released
+                            || control.entry() != Some(entry)
                             || carrick_el1_abi::Lifecycle::expected_exit_receipt(
                                 page,
                                 control,
@@ -3596,7 +3632,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         outstanding.push(OutstandingExitReceipt::Pool {
                             entry,
                             control: retained,
-                            expected_host: pool_host_identity(page, entry)?,
+                            expected_host,
                         });
                     }
                 }
@@ -3618,6 +3654,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     }
                     outstanding.push(OutstandingExitReceipt::HostBorn { identity, index });
                 }
+                // A fixture with no pool candidate uses the same one-shot
+                // hook at the completed snapshot boundary.
+                #[cfg(test)]
+                if let Some(hook) = self.runtime.pool_control_hook.lock().take() {
+                    hook();
+                }
                 let bindings = outstanding
                     .iter()
                     .filter_map(|receipt| match receipt {
@@ -3630,13 +3672,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         OutstandingExitReceipt::HostBorn { identity, .. } => Some(*identity),
                     })
                     .collect();
-                // Consume the caller's membership while all refusal checks
-                // can still leave the gate open. Closing has no failure path.
+                // Every fallible retain precedes consumption. A refusal
+                // drops preparation with admission still closed and no begun
+                // claim or caller live unit consumed.
                 let custody = carrick_core::terminal::TerminalCustody::<
                     carrick_core::terminal::Process,
                     carrick_core::terminal::Live,
                 >::begin_exit(
-                    page, self.key, address, wait_status.to_termination_status()
+                    admission,
+                    self.key,
+                    address,
+                    wait_status.to_termination_status(),
                 )
                 .map_err(|_| NativeProcessError::Quarantined)?;
                 let carrick_core::terminal::RetirementVerdict::CancelMembers { members, .. } =
