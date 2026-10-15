@@ -136,13 +136,11 @@ struct KvmPhysicalDebug(Arc<carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory>);
 impl carrick_kernel::kernel::debug::PhysicalCaptureProvider for KvmPhysicalDebug {
     fn capture(&self) -> carrick_kernel::kernel::debug::PhysicalCapture {
         let capture = self.0.capture_physical_state();
-        let mut unavailable = capture.unavailable;
-        unavailable.push("host thread stacks unavailable on this KVM capture path".to_owned());
         carrick_kernel::kernel::debug::PhysicalCapture {
             zone_census: capture.zone_census,
             vcpus: capture.vcpus,
             host_threads: Vec::new(),
-            unavailable,
+            unavailable: capture.unavailable,
         }
     }
 }
@@ -171,11 +169,13 @@ pub fn run_prepared_kvm_pool(
         .to_owned();
     let physical_debug: Arc<dyn carrick_kernel::kernel::debug::PhysicalCaptureProvider> =
         Arc::new(KvmPhysicalDebug(Arc::clone(&physical)));
-    carrick_kernel::kernel::KernelDebugServer::install(
+    if carrick_kernel::kernel::KernelDebugServer::install(
         Arc::clone(root_context.kernel()),
         &run_id,
         Some(physical_debug),
-    );
+    ) {
+        physical.attach_debug();
+    }
     let dispatcher = Arc::new(std::sync::Mutex::new(dispatcher));
     root_context
         .thread()
