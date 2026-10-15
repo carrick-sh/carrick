@@ -13,6 +13,10 @@ rationale = "Admission creates one native process owner for the retained root an
 
 [bindings]
 vm_free = "carrick-el1::personality::aarch64_process_tests::arm_root_setup_enters_production_process_venue"
+# The shared dispatch trait change defaults to no continuation-work exemption
+# for ARM. dispatch::ring_first_tests::strict_arm_preserves_family_declines_
+# handback_and_owed_work includes wait4 with owed work (native 260): it must
+# retain WithWork and its original result before ARM process admission.
 # Supplemental VM-free witnesses in the same lib target:
 # arm_process_registry_moves_bounded_handles: saved ISA contexts never move inline through registry rows
 # arm_owned_raw_exit_retires_only_one_of_two_live_threads: exact adopted exit retains its live sibling
