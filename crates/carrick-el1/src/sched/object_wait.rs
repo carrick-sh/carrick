@@ -66,7 +66,17 @@ pub(crate) fn deliver_wake_effects<C: carrick_el1_abi::EntryContext>(
             },
         );
     }
-    #[cfg(not(target_os = "none"))]
+    #[cfg(test)]
+    deliver_effects_with(
+        zone,
+        venue,
+        carrick_sched_core::Waker::El1 { slot: venue },
+        effects,
+        false,
+        crate::personality::aarch64_process_tests::record_native_wake_for_test,
+        |_slot| {},
+    );
+    #[cfg(all(not(test), not(target_os = "none")))]
     let _ = (zone, venue, effects);
 }
 
