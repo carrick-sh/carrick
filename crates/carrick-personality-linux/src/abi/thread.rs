@@ -861,6 +861,22 @@ impl ThreadLifecyclePage {
         self.release_completed_host_birth(receipt);
     }
 
+    /// Exercise the two publication boundaries through the production
+    /// retirement sequence without changing its ordering.
+    #[cfg(feature = "host-test")]
+    pub fn publish_exact_host_retirement_with_hooks(
+        &self,
+        control: &ThreadControlSlot,
+        receipt: carrick_core::terminal::HostThreadRetirementReceipt,
+        after_receipt: impl FnOnce(),
+        after_release_claim: impl FnOnce(),
+    ) {
+        control.publish_host_retirement(receipt);
+        self.publish_host_birth_receipt(receipt);
+        after_receipt();
+        self.release_host_birth_with_hook(receipt, 4, after_release_claim);
+    }
+
     /// Retire the exact published entry and consume its reserved membership.
     pub fn retire_published_host_member(
         &self,
@@ -892,7 +908,17 @@ impl ThreadLifecyclePage {
         identity: carrick_core::terminal::HostThreadRetirementReceipt,
         expected: u32,
     ) -> bool {
+        self.release_host_birth_with_hook(identity, expected, || {})
+    }
+
+    fn release_host_birth_with_hook(
+        &self,
+        identity: carrick_core::terminal::HostThreadRetirementReceipt,
+        expected: u32,
+        after_claim: impl FnOnce(),
+    ) -> bool {
         self.host_birth_mutations.fetch_add(1, Ordering::SeqCst);
+        after_claim();
         let released = self.host_born.iter().any(|slot| {
             if slot.identity() != Some(identity)
                 || slot
