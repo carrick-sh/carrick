@@ -1280,6 +1280,36 @@ fn reactor_polled_f_setlkw_cycle_reports_edeadlk() {
     assert!(locks.state.lock().waiting_on.is_empty());
 }
 
+/// The reactor can first poll a contended F_SETLKW after its blocker closes.
+/// Granting the wait must publish occupancy before the new owner's close
+/// checks the empty-table shortcut; a third process must then acquire.
+#[test]
+fn reactor_grant_then_close_releases_record_lock_for_third_owner() {
+    let locks = Arc::new(LogicalRecordLocks::default());
+    let blocker = logical_lock_request((41, 1), (0, 10), true);
+    let owner = logical_lock_request((42, 2), (0, 10), true);
+    let third = logical_lock_request((43, 3), (0, 10), true);
+    assert_eq!(locks.try_set(blocker.clone()), Ok(()));
+    assert_eq!(locks.try_set(owner.clone()), Err(LINUX_EAGAIN));
+    let waiter = LogicalRecordLockWait::new(
+        Arc::clone(&locks),
+        owner.clone(),
+        crate::thread::ThreadId::synthetic_for_tests(42),
+    );
+
+    locks.release_file_owner(&blocker.file, blocker.owner);
+    assert!(locks.is_empty());
+    assert_eq!(waiter.try_acquire(), Ok(()));
+    assert!(!locks.is_empty(), "reactor grant must publish table occupancy");
+
+    // This is the close(fd) fast-path decision and owner release in
+    // release_hvpatch_classic_record_locks, while the continuation still lives.
+    if !locks.is_empty() {
+        locks.release_file_owner(&owner.file, owner.owner);
+    }
+    assert_eq!(locks.try_set(third), Ok(()));
+}
+
 /// A waiter that is abandoned without ever acquiring — the continuation is
 /// torn down by EINTR, exit or exec — must retract its edge when the wait is
 /// dropped, or the stale edge would convict a later, unrelated waiter of a
