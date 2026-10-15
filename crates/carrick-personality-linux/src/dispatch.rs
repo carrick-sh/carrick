@@ -1041,6 +1041,9 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
     // Serve them before handing back metadata work; an absent owner still
     // declines through Unported crossing policy, never host identity replay.
     let owned_identity = matches!(family, Family::Identity(_) | Family::Sysinfo(_));
+    // Yield has no host replay. Its in-ring result completes before the
+    // ordinary pending-work handback, even when no sibling is runnable.
+    let owned_yield = family == Family::Sched(SchedCall::Yield);
     // The execution venue, not its ISA, owns the settlement guarantee.
     let owned_continuation = pending.settles_owed_work_at_continuation_boundary()
         && matches!(
@@ -1053,6 +1056,7 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
         && !transfer
         && !setup
         && !owned_identity
+        && !owned_yield
         && !owned_continuation
     {
         pending.declined_for_work(ordinal);

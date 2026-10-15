@@ -138,10 +138,10 @@ pub enum SchedCall {
 /// Execution venue and guest memory access for in-ring scheduling operations.
 pub trait SchedVenue {
     fn argument(&self, index: usize) -> u64;
-    /// Rotate a runnable sibling owned by the in-ring scheduler. With no
-    /// sibling, the host scheduler remains the yield authority.
+    /// Rotate a runnable sibling owned by the in-ring scheduler. Yield with
+    /// no runnable sibling is a successful in-ring no-op on every ISA.
     fn yield_current(&mut self) -> FamilyCompletion {
-        FamilyCompletion::Forward
+        FamilyCompletion::Complete(0)
     }
     fn current_pid(&self) -> Option<u32> {
         None
