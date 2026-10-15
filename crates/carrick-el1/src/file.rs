@@ -169,17 +169,36 @@ mod range_tests {
     }
 }
 
+/// Reject an entire invalid user range before probing or copying any byte.
+fn valid_lower_half_range(user_va: u64, len: usize) -> bool {
+    let Ok(len) = u64::try_from(len) else {
+        return false;
+    };
+    user_va < (1_u64 << 63)
+        && user_va
+            .checked_add(len)
+            .is_some_and(|end| end <= (1_u64 << 63))
+}
+
 #[cfg(not(target_os = "none"))]
 pub struct HardwareValidator;
 
 #[cfg(not(target_os = "none"))]
 impl MemoryValidator for HardwareValidator {
-    fn writable_bytes(&self, _user_va: u64, len: usize) -> usize {
-        len
+    fn writable_bytes(&self, user_va: u64, len: usize) -> usize {
+        if valid_lower_half_range(user_va, len) {
+            len
+        } else {
+            0
+        }
     }
 
-    fn readable_bytes(&self, _user_va: u64, len: usize) -> usize {
-        len
+    fn readable_bytes(&self, user_va: u64, len: usize) -> usize {
+        if valid_lower_half_range(user_va, len) {
+            len
+        } else {
+            0
+        }
     }
 }
 
@@ -189,12 +208,12 @@ pub struct HardwareValidator;
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl MemoryValidator for HardwareValidator {
     fn writable_bytes(&self, user_va: u64, len: usize) -> usize {
-        if len == 0 {
+        if len == 0 || !valid_lower_half_range(user_va, len) {
             return 0;
         }
         let mut checked = 0;
         while checked < len {
-            let cur_va = user_va + checked as u64;
+            let cur_va = user_va + checked as u64; // range checked above
             let mut par: u64;
             unsafe {
                 core::arch::asm!(
@@ -210,20 +229,19 @@ impl MemoryValidator for HardwareValidator {
                 // Translation fault or permission failure
                 break;
             }
-            let next_page = (cur_va + 4096) & !4095;
-            let page_remaining = (next_page - cur_va) as usize;
+            let page_remaining = 4096 - (cur_va as usize & 4095);
             checked += core::cmp::min(len - checked, page_remaining);
         }
         checked
     }
 
     fn readable_bytes(&self, user_va: u64, len: usize) -> usize {
-        if len == 0 {
+        if len == 0 || !valid_lower_half_range(user_va, len) {
             return 0;
         }
         let mut checked = 0;
         while checked < len {
-            let cur_va = user_va + checked as u64;
+            let cur_va = user_va + checked as u64; // range checked above
             let mut par: u64;
             unsafe {
                 core::arch::asm!(
@@ -239,8 +257,7 @@ impl MemoryValidator for HardwareValidator {
                 // Translation fault or permission failure
                 break;
             }
-            let next_page = (cur_va + 4096) & !4095;
-            let page_remaining = (next_page - cur_va) as usize;
+            let page_remaining = 4096 - (cur_va as usize & 4095);
             checked += core::cmp::min(len - checked, page_remaining);
         }
         checked
@@ -250,9 +267,15 @@ impl MemoryValidator for HardwareValidator {
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 impl MemoryValidator for HardwareValidator {
     fn writable_bytes(&self, user_va: u64, len: usize) -> usize {
+        if !valid_lower_half_range(user_va, len) {
+            return 0;
+        }
         crate::isa::x86::user_access::accessible_bytes(user_va, len, true)
     }
     fn readable_bytes(&self, user_va: u64, len: usize) -> usize {
+        if !valid_lower_half_range(user_va, len) {
+            return 0;
+        }
         crate::isa::x86::user_access::accessible_bytes(user_va, len, false)
     }
 }
