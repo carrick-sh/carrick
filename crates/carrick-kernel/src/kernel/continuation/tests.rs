@@ -20,8 +20,15 @@ fn socket_waits_restart_with_sa_restart_except_timed_calls() {
     use carrick_abi::syscall::nr;
 
     for number in [
-        nr::ACCEPT, nr::ACCEPT4, nr::CONNECT, nr::RECVFROM, nr::RECVMSG,
-        nr::RECVMMSG, nr::SENDTO, nr::SENDMSG, nr::SENDMMSG,
+        nr::ACCEPT,
+        nr::ACCEPT4,
+        nr::CONNECT,
+        nr::RECVFROM,
+        nr::RECVMSG,
+        nr::RECVMMSG,
+        nr::SENDTO,
+        nr::SENDMSG,
+        nr::SENDMMSG,
     ] {
         assert_eq!(
             RestartClass::for_syscall(number.raw()),
@@ -40,9 +47,23 @@ fn socket_timeout_forces_eintr_even_with_restart_action() {
     let (_kernel, context) = bootstrap(15_371);
     let generation = publish(&context, 0x705);
     for (number, timeout) in [
-        (carrick_abi::syscall::nr::RECVFROM, Some(Duration::from_secs(1))),
-        (carrick_abi::syscall::nr::SENDTO, Some(Duration::from_secs(1))),
-        (carrick_abi::syscall::nr::CONNECT, Some(Duration::from_secs(1))),
+        (
+            carrick_abi::syscall::nr::RECVFROM,
+            Some(Duration::from_secs(1)),
+        ),
+        (
+            carrick_abi::syscall::nr::SENDTO,
+            Some(Duration::from_secs(1)),
+        ),
+        (
+            carrick_abi::syscall::nr::CONNECT,
+            Some(Duration::from_secs(1)),
+        ),
+        (carrick_abi::syscall::nr::READ, Some(Duration::from_secs(1))),
+        (
+            carrick_abi::syscall::nr::WRITE,
+            Some(Duration::from_secs(1)),
+        ),
         (carrick_abi::syscall::nr::RECVFROM, None),
     ] {
         let capture = ContinuationCapture::new(

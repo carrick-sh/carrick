@@ -712,10 +712,18 @@ impl<'a> NetView<'a> {
 
     /// Read the per-description `connect_in_progress` flag for `fd` (false if the
     /// fd is missing or not a HostSocket). See `OpenDescriptionBase.connect_in_progress`.
-    fn socket_connect_in_progress(&self, fd: i32) -> bool {
-        self.open_file(fd).is_some_and(|of| {
-            ::std::matches!(crate::kernel::FileDescription::inspect(&of.description).as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.connect_in_progress())
-        })
+    fn socket_connect_in_progress(&self, fd: i32) -> (bool, Option<std::time::Duration>) {
+        self.open_file(fd)
+            .and_then(|of| {
+                let description = crate::kernel::FileDescription::inspect(&of.description)?;
+                match &*description {
+                    OpenDescription::HostSocket { base, .. } => {
+                        Some((base.connect_in_progress(), base.send_timeout()))
+                    }
+                    _ => None,
+                }
+            })
+            .unwrap_or((false, None))
     }
 
     /// Update the per-description `connect_in_progress` and/or `connected` flags for `fd`.
@@ -1361,7 +1369,7 @@ impl<'a> NetView<'a> {
         let fd = fd.0;
         let addr_addr = addr.0;
         let addrlen_addr = addrlen.0;
-        let (host_fd, family, type_, protocol, inzone_listener) = {
+        let (host_fd, family, type_, protocol, inzone_listener, recv_timeout) = {
             let Some(open_file) = self.open_file(fd) else {
                 return DispatchOutcome::errno(LINUX_EBADF);
             };
@@ -1386,12 +1394,20 @@ impl<'a> NetView<'a> {
                     *type_,
                     *protocol,
                     base.inzone_listener(),
+                    base.recv_timeout(),
                 ),
                 Some(OpenDescription::InMemorySocket { base, socket }) => {
                     let family = socket.family();
                     let type_ = socket.socket_type;
                     let protocol = socket.protocol;
-                    (None, family, type_, protocol, base.inzone_listener())
+                    (
+                        None,
+                        family,
+                        type_,
+                        protocol,
+                        base.inzone_listener(),
+                        base.recv_timeout(),
+                    )
                 }
                 _ => {
                     return DispatchOutcome::errno(LINUX_ENOTSOCK);
@@ -1460,7 +1476,7 @@ impl<'a> NetView<'a> {
             if nonblocking {
                 return DispatchOutcome::errno(LINUX_EAGAIN);
             }
-            return self.wait_in_memory_slot(fd, libc::POLLIN, None);
+            return self.wait_in_memory_slot(fd, libc::POLLIN, recv_timeout);
         };
         // accept(2) has no per-call non-blocking flag, but listen() already put
         // the host listen socket in non-blocking mode, so this never blocks.
@@ -1469,7 +1485,6 @@ impl<'a> NetView<'a> {
         // run in the closure (no &self); the fd is installed AFTER (the
         // install needs &self, which blocking_io's &self closure can't hold).
         let nonblocking = self.io_is_nonblocking(fd, 0);
-        // accept(2) has no SO_*TIMEO bound on Linux — no per-fd timeout.
         let accepted_source = std::cell::RefCell::new(None::<Vec<u8>>);
         // SO_REUSEPORT: Darwin parks EVERY incoming connection on the last
         // socket that bound the addr:port, so this member's own host socket is
@@ -1481,7 +1496,7 @@ impl<'a> NetView<'a> {
         let accept_targets: Vec<i32> = std::iter::once(host_fd)
             .chain(reuseport::steal_targets(host_fd))
             .collect();
-        let outcome = self.blocking_io(fd, host_fd, IoDir::Read, nonblocking, None, || {
+        let outcome = self.blocking_io(fd, host_fd, IoDir::Read, nonblocking, recv_timeout, || {
             let mut last = Err(LINUX_EAGAIN);
             for target in accept_targets {
                 let mut sa_storage = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
@@ -1742,7 +1757,7 @@ impl<'a> NetView<'a> {
         let e = HostSyscallError::last().linux_errno();
         // See `fn connect` for why EISCONN is split on connect_in_progress.
         if e == LINUX_EISCONN {
-            if self.socket_connect_in_progress(fd) {
+            if self.socket_connect_in_progress(fd).0 {
                 let outcome = connect_success_or_pending_error(host_fd.get());
                 let connected = matches!(outcome, DispatchOutcome::Returned { value: 0 });
                 self.update_socket_connection_state(fd, Some(false), Some(connected));
@@ -1761,7 +1776,7 @@ impl<'a> NetView<'a> {
             };
             return DispatchOutcome::WaitOnFds {
                 fds,
-                timeout: None,
+                timeout: self.socket_connect_in_progress(fd).1,
                 sig_mask: carrick_abi::WaitSigMask::NONE,
                 completion: FdWaitCompletion::Fd {
                     on_timeout: LINUX_EINPROGRESS.guest_retval(),
@@ -3745,7 +3760,7 @@ impl<'a> NetView<'a> {
             //   - in-progress clear ⇒ a real re-connect of an established socket:
             //     surface EISCONN to the guest (Linux connect01 "already connected").
             if e == LINUX_EISCONN {
-                if this.socket_connect_in_progress(fd) {
+                if this.socket_connect_in_progress(fd).0 {
                     let outcome = connect_success_or_pending_error(host_fd.get());
                     let connected = matches!(outcome, DispatchOutcome::Returned { value: 0 });
                     this.update_socket_connection_state(fd, Some(false), Some(connected));
@@ -3792,7 +3807,7 @@ impl<'a> NetView<'a> {
                 };
                 return Ok(DispatchOutcome::WaitOnFds {
                     fds,
-                    timeout: None,
+                    timeout: this.socket_connect_in_progress(fd).1,
                     sig_mask: carrick_abi::WaitSigMask::NONE,
                     completion: FdWaitCompletion::Fd {
                         on_timeout: LINUX_EINPROGRESS.guest_retval(),

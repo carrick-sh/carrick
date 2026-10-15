@@ -1,5 +1,6 @@
 //! Small Darwin filesystem primitives used by Linux syscall emulation.
 
+use crate::copyfile_policy::{self, CopyMethod};
 use crate::vfs::errno::HostSyscallError;
 use carrick_abi::LinuxErrno;
 
@@ -22,11 +23,14 @@ pub fn copyfile_clone_or_data(
     dst_fd: i32,
     expected_len: u64,
 ) -> Result<Option<CopyfileResult>, LinuxErrno> {
-    if let Some(bytes) = run_fcopyfile(src_fd, dst_fd, libc::COPYFILE_DATA, expected_len)? {
-        return Ok(Some(CopyfileResult::Copied(bytes)));
-    }
-    if let Some(bytes) = run_fcopyfile(src_fd, dst_fd, libc::COPYFILE_CLONE, expected_len)? {
-        return Ok(Some(CopyfileResult::Cloned(bytes)));
+    for method in copyfile_policy::attempt_order() {
+        let (flags, result) = match method {
+            CopyMethod::Clone => (libc::COPYFILE_CLONE, CopyfileResult::Cloned),
+            CopyMethod::Data => (libc::COPYFILE_DATA, CopyfileResult::Copied),
+        };
+        if let Some(bytes) = run_fcopyfile(src_fd, dst_fd, flags, expected_len)? {
+            return Ok(Some(result(bytes)));
+        }
     }
     Ok(None)
 }
@@ -42,12 +46,10 @@ fn run_fcopyfile(
     if rc < 0 {
         return Ok(None);
     }
-    Ok(Some(
-        state
-            .copied_bytes()
-            .filter(|bytes| *bytes > 0)
-            .unwrap_or(expected_len),
-    ))
+    Ok(Some(copyfile_policy::reported_len(
+        state.copied_bytes(),
+        expected_len,
+    )))
 }
 
 struct CopyfileState {

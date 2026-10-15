@@ -7,11 +7,11 @@ pub enum CopyMethod {
 }
 
 pub const fn attempt_order() -> [CopyMethod; 2] {
-    [CopyMethod::Data, CopyMethod::Clone]
+    [CopyMethod::Clone, CopyMethod::Data]
 }
 
 pub fn reported_len(copied_bytes: Option<u64>, expected_len: u64) -> u64 {
-    copied_bytes.filter(|bytes| *bytes > 0).unwrap_or(expected_len)
+    copied_bytes.unwrap_or(expected_len)
 }
 
 #[cfg(test)]

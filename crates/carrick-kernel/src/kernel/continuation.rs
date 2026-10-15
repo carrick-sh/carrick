@@ -1242,8 +1242,24 @@ pub enum ContinuationBuildError {
 impl BlockedContinuation {
     pub fn from_dispatch_outcome(
         outcome: DispatchOutcome,
-        capture: ContinuationCapture,
+        mut capture: ContinuationCapture,
     ) -> Result<Self, ContinuationBuildError> {
+        // The dispatcher owns the SO_RCVTIMEO/SO_SNDTIMEO (or recvmmsg)
+        // deadline. A socket syscall with that deadline must expose EINTR to
+        // the handler even when SA_RESTART was requested (signal(7)).
+        if let ContinuationOrigin::Syscall(frame) = capture.origin
+            && is_timeout_sensitive_socket_call(frame.request().number.raw())
+            && matches!(
+                &outcome,
+                DispatchOutcome::WaitOnFds {
+                    timeout: Some(_),
+                    completion: FdWaitCompletion::Fd { .. },
+                    ..
+                }
+            )
+        {
+            capture.restart = RestartClass::Never;
+        }
         let parent_task = capture.task;
         let persistent_signal_mask = capture.persistent_signal_mask;
         let restore_after_signal = capture.restore_after_signal;
@@ -2784,19 +2800,15 @@ pub enum BlockingWriteOutcome {
 /// `msgrcv`/`msgsnd`, `semop`/`semtimedop`, and the `sigsuspend`/
 /// `rt_sigtimedwait` family.
 ///
-/// Socket calls (`accept`, `connect`, the `recv`/`send` families) are also
-/// absent, and that is a KNOWN REMAINING GAP rather than a judgement that they
-/// do not restart — they do, but only when the socket carries no
-/// `SO_RCVTIMEO`/`SO_SNDTIMEO`. This decision point sees only the syscall
-/// NUMBER, not the fd, so honouring that exclusion needs the timeout plumbed
-/// through first; restarting unconditionally would re-block a timeout socket
-/// that Linux would have failed with `EINTR`.
+/// Socket timeout exclusions are applied when the blocked outcome is captured,
+/// where the dispatcher-published deadline is available.
 pub fn is_restartable_syscall(nr: u64) -> bool {
-    matches!(
-        nr,
-        // Reads and writes on "slow" devices — pipes, terminals, sockets. On a
-        // regular file these never return EINTR, so listing them is harmless.
-        63  // read
+    is_socket_restart_syscall(nr)
+        || matches!(
+            nr,
+            // Reads and writes on "slow" devices — pipes, terminals, sockets. On a
+            // regular file these never return EINTR, so listing them is harmless.
+            63  // read
         | 64  // write
         | 65  // readv
         | 66  // writev
@@ -2820,7 +2832,32 @@ pub fn is_restartable_syscall(nr: u64) -> bool {
         // Waits.
         | 95  // waitid
         | 260 // wait4
-    )
+        )
+}
+
+fn is_socket_restart_syscall(number: u64) -> bool {
+    use carrick_abi::syscall::nr;
+    [
+        nr::ACCEPT,
+        nr::ACCEPT4,
+        nr::CONNECT,
+        nr::RECVFROM,
+        nr::RECVMSG,
+        nr::RECVMMSG,
+        nr::SENDTO,
+        nr::SENDMSG,
+        nr::SENDMMSG,
+    ]
+    .iter()
+    .any(|candidate| candidate.raw() == number)
+}
+
+fn is_timeout_sensitive_socket_call(number: u64) -> bool {
+    use carrick_abi::syscall::nr;
+    is_socket_restart_syscall(number)
+        || [nr::READ, nr::READV, nr::WRITE, nr::WRITEV]
+            .iter()
+            .any(|candidate| candidate.raw() == number)
 }
 
 /// Raise SIGPIPE on the task when a blocking write encounters EPIPE and SIGPIPE is not ignored.

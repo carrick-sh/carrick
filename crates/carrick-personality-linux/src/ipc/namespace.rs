@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 
 use crate::identity::{LinuxCapabilitySet, TaskCredentials};
 use crate::identity::{TaskGid, TaskUid};
+use carrick_core::ipc_permissions::{IpcGroupId, IpcPermission, IpcUserId};
 pub use carrick_syscall_abi::ipc::{
     IPC_CREAT, IPC_EXCL, IPC_NOWAIT, IPC_PRIVATE, IPC_STAT, LinuxIpcPerm, LinuxMsginfo,
     LinuxMsqidDs, LinuxSembuf, LinuxSemidDs, LinuxSeminfo, MSG_EXCEPT, MSG_NOERROR, MSG_STAT,
@@ -88,29 +89,27 @@ impl IpcPerm {
     /// - Else if GID matches `perm.gid` or `perm.cgid` or any supplementary group, ONLY group bits are checked.
     /// - Else other bits are checked.
     pub fn check_perm(&self, creds: &TaskCredentials, req_mode: u16) -> Result<(), IpcError> {
-        if creds
-            .cap_effective
-            .contains(LinuxCapabilitySet::CAP_IPC_OWNER)
-        {
-            return Ok(());
-        }
-
-        let req = ((req_mode >> 6) | (req_mode >> 3) | req_mode) & 0o7;
-        let is_owner = creds.euid == self.uid;
-        let is_group = creds.egid == self.gid || creds.groups.contains(&self.gid);
-
-        let granted = if is_owner {
-            (self.mode >> 6) & 0o7
-        } else if is_group {
-            (self.mode >> 3) & 0o7
-        } else {
-            self.mode & 0o7
+        let permission = IpcPermission {
+            uid: IpcUserId::new(self.uid.raw()),
+            cuid: IpcUserId::new(self.cuid.raw()),
+            gid: IpcGroupId::new(self.gid.raw()),
+            cgid: IpcGroupId::new(self.cgid.raw()),
+            mode: self.mode,
         };
-
-        if (req & !granted) != 0 {
-            return Err(IpcError::PermissionDenied);
-        }
-        Ok(())
+        permission
+            .allows(
+                IpcUserId::new(creds.euid.raw()),
+                |group| {
+                    let group = TaskGid::new(group.raw());
+                    creds.egid == group || creds.groups.contains(&group)
+                },
+                creds
+                    .cap_effective
+                    .contains(LinuxCapabilitySet::CAP_IPC_OWNER),
+                req_mode,
+            )
+            .then_some(())
+            .ok_or(IpcError::PermissionDenied)
     }
 
     /// Check administrative permissions for IPC_SET / IPC_RMID.
@@ -1236,7 +1235,10 @@ mod tests {
         caller.groups = alloc::vec![TaskGid::new(2001)];
         assert_eq!(perm.check_perm(&caller, 0o400), Ok(()));
         caller.groups.clear();
-        assert_eq!(perm.check_perm(&caller, 0o400), Err(IpcError::PermissionDenied));
+        assert_eq!(
+            perm.check_perm(&caller, 0o400),
+            Err(IpcError::PermissionDenied)
+        );
         assert_eq!(IpcError::PermissionDenied.guest_retval(), -13);
 
         perm.mode = 0o400;
@@ -1508,7 +1510,7 @@ mod tests {
     }
 
     #[test]
-    fn test_finding_2_creator_loses_data_access_after_ownership_transfer() {
+    fn creator_retains_data_access_after_ownership_transfer() {
         let mut creator = TaskCredentials::ROOT;
         creator.euid = TaskUid::new(1000);
         creator.egid = TaskGid::new(1000);
@@ -1526,11 +1528,8 @@ mod tests {
         ds.msg_perm.uid = 2000;
         ns.msgctl_set(&creator, msqid, &ds).unwrap();
 
-        // Creator (UID 1000) must now lose data access (EACCES)
-        assert_eq!(
-            ns.msgsnd(&creator, 1, msqid, 1, b"world", 0).unwrap_err(),
-            IpcError::PermissionDenied
-        );
+        // The creator UID remains in the owner access class after IPC_SET.
+        assert!(ns.msgsnd(&creator, 1, msqid, 1, b"world", 0).is_ok());
 
         // New owner (UID 2000) has access
         let mut new_owner = TaskCredentials::ROOT;
@@ -1538,6 +1537,15 @@ mod tests {
         new_owner.egid = TaskGid::new(1000);
         new_owner.cap_effective = LinuxCapabilitySet::empty();
         assert!(ns.msgsnd(&new_owner, 1, msqid, 1, b"world", 0).is_ok());
+
+        let mut stranger = creator.clone();
+        stranger.euid = TaskUid::new(3000);
+        stranger.egid = TaskGid::new(3000);
+        assert_eq!(
+            ns.msgsnd(&stranger, 1, msqid, 1, b"world", 0),
+            Err(IpcError::PermissionDenied)
+        );
+        assert_eq!(IpcError::PermissionDenied.guest_retval(), -13);
     }
 
     #[test]
