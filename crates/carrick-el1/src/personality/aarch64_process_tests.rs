@@ -32,6 +32,34 @@ use carrick_sched_core::{Aarch64ParkedContext, ThreadCtx, ZoneTables};
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+#[cfg(test)]
+static NATIVE_WAKE_TRACE: std::sync::Mutex<std::vec::Vec<(SlotId, u64)>> =
+    std::sync::Mutex::new(std::vec::Vec::new());
+
+#[cfg(test)]
+pub(crate) fn record_native_wake_for_test(slot: SlotId, target: u64) {
+    NATIVE_WAKE_TRACE.lock().unwrap().push((slot, target));
+}
+
+#[cfg(test)]
+#[test]
+fn arm_native_wake_cross_slot_reaches_reschedule_transport() {
+    use carrick_sched_core::WakeEffects;
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let other = SlotId::new(4);
+    fixture.zone.drive(other, 2);
+    fixture.zone.publish_slot(other, 1, Some(0), 1);
+    fixture.zone.enter_guest(other);
+    let target = 0x8000_0004;
+    fixture.zone.slot(other).set_sgi_target(target);
+    NATIVE_WAKE_TRACE.lock().unwrap().clear();
+    let mut service = fixture.process_service();
+    let mut effects = WakeEffects::default();
+    effects.request_reschedule(other);
+    NativeProcessService::wake_effects(&mut service, effects);
+    assert_eq!(NATIVE_WAKE_TRACE.lock().unwrap().as_slice(), &[(other, target)]);
+}
+
 /// Scheduler CPU with the same owner checkpoint as the production ARM CPU.
 #[cfg(test)]
 struct ResumeCpu<'a, 'b, X: ForkStockCrossing> {
