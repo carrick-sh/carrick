@@ -227,6 +227,7 @@ fn forward_record_lock<M: CurrentMmMemory>(
                     Arc::clone(&this.fs.classic_record_locks),
                     request,
                     req.tid,
+                    carrick_abi::SigBlockMask::blocking_all_of(req.kernel.thread().blocked_mask()),
                 );
                 DispatchOutcome::BlockingRecordLock(
                     crate::dispatch::BlockingRecordLock::logical_lock(LogicalLockWait::Record {
@@ -628,6 +629,7 @@ impl LogicalRecordLocks {
         owner: usize,
         write: bool,
         tid: crate::thread::ThreadId,
+        block_mask: carrick_abi::SigBlockMask,
         host_signal: &dyn carrick_hal::HostSignalBridge,
     ) -> Result<(), LinuxErrno> {
         let mut state = self.state();
@@ -769,6 +771,7 @@ impl LogicalRecordLocks {
         &self,
         request: &LogicalRecordLockRequest,
         tid: crate::thread::ThreadId,
+        block_mask: carrick_abi::SigBlockMask,
         host_signal: &dyn carrick_hal::HostSignalBridge,
     ) -> Result<(), LinuxErrno> {
         let wait = self.mint_wait_id();
@@ -806,6 +809,7 @@ pub struct LogicalRecordLockWait {
     locks: Arc<LogicalRecordLocks>,
     request: LogicalRecordLockRequest,
     tid: crate::thread::ThreadId,
+    block_mask: carrick_abi::SigBlockMask,
     edge: Arc<RecordLockWaitEdge>,
 }
 
@@ -814,6 +818,7 @@ impl LogicalRecordLockWait {
         locks: Arc<LogicalRecordLocks>,
         request: LogicalRecordLockRequest,
         tid: crate::thread::ThreadId,
+        block_mask: carrick_abi::SigBlockMask,
     ) -> Self {
         let edge = Arc::new(RecordLockWaitEdge {
             locks: Arc::clone(&locks),
@@ -823,6 +828,7 @@ impl LogicalRecordLockWait {
             locks,
             request,
             tid,
+            block_mask,
             edge,
         }
     }
@@ -834,7 +840,7 @@ impl LogicalRecordLockWait {
         host_signal: &dyn carrick_hal::HostSignalBridge,
     ) -> Result<(), LinuxErrno> {
         self.locks
-            .wait_set_interruptibly(&self.request, self.tid, host_signal)
+            .wait_set_interruptibly(&self.request, self.tid, self.block_mask, host_signal)
     }
 
     /// One reactor step: take the lock if it is free, `EDEADLK` if waiting
@@ -906,6 +912,7 @@ impl RecordLockContentionFixture {
                 write: true,
             },
             tid,
+            carrick_abi::SigBlockMask::NONE,
         ))
     }
 
@@ -975,6 +982,7 @@ pub struct LogicalFlockWait {
     owner: usize,
     write: bool,
     tid: crate::thread::ThreadId,
+    block_mask: carrick_abi::SigBlockMask,
     _lease: FileDescriptionFdLease,
 }
 
@@ -985,6 +993,7 @@ impl LogicalFlockWait {
         owner: usize,
         write: bool,
         tid: crate::thread::ThreadId,
+        block_mask: carrick_abi::SigBlockMask,
         lease: FileDescriptionFdLease,
     ) -> Self {
         Self {
@@ -993,6 +1002,7 @@ impl LogicalFlockWait {
             owner,
             write,
             tid,
+            block_mask,
             _lease: lease,
         }
     }
@@ -1003,6 +1013,7 @@ impl LogicalFlockWait {
             self.owner,
             self.write,
             self.tid,
+            self.block_mask,
             host_signal,
         )
     }
@@ -2173,6 +2184,7 @@ impl<'a> FsView<'a> {
                         desc_ptr,
                         write,
                         cx.tid(),
+                        carrick_abi::SigBlockMask::blocking_all_of(cx.kernel.thread().blocked_mask()),
                         lease,
                     );
                     Ok(DispatchOutcome::BlockingRecordLock(

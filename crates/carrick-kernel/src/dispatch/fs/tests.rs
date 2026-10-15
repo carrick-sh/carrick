@@ -1194,6 +1194,7 @@ fn f_setlkw_cycle_reports_edeadlk_instead_of_parking_forever() {
             locks.wait_set_interruptibly(
                 &a_wants_b,
                 crate::thread::ThreadId::synthetic_for_tests(1),
+                carrick_abi::SigBlockMask::NONE,
                 &carrick_hal::NullHostSignalBridge::default(),
             )
         })
@@ -1217,6 +1218,7 @@ fn f_setlkw_cycle_reports_edeadlk_instead_of_parking_forever() {
         locks.wait_set_interruptibly(
             &b_wants_a,
             crate::thread::ThreadId::synthetic_for_tests(2),
+            carrick_abi::SigBlockMask::NONE,
             &carrick_hal::NullHostSignalBridge::default(),
         ),
         Err(crate::linux_abi::LINUX_EDEADLK),
@@ -1248,6 +1250,7 @@ fn reactor_polled_f_setlkw_cycle_reports_edeadlk() {
         Arc::clone(&locks),
         logical_lock_request((41, 1), (10, 20), true),
         crate::thread::ThreadId::synthetic_for_tests(1),
+    carrick_abi::SigBlockMask::NONE,
     );
     assert_eq!(a_wants_b.try_acquire(), Err(LINUX_EAGAIN));
     assert!(
@@ -1262,6 +1265,7 @@ fn reactor_polled_f_setlkw_cycle_reports_edeadlk() {
         Arc::clone(&locks),
         logical_lock_request((42, 1), (0, 10), true),
         crate::thread::ThreadId::synthetic_for_tests(2),
+    carrick_abi::SigBlockMask::NONE,
     );
     assert_eq!(
         b_wants_a.try_acquire(),
@@ -1295,6 +1299,7 @@ fn reactor_grant_then_close_releases_record_lock_for_third_owner() {
         Arc::clone(&locks),
         owner.clone(),
         crate::thread::ThreadId::synthetic_for_tests(42),
+    carrick_abi::SigBlockMask::NONE,
     );
 
     locks.release_file_owner(&blocker.file, blocker.owner);
@@ -1324,6 +1329,7 @@ fn dropped_reactor_record_lock_wait_retracts_its_edge() {
         Arc::clone(&locks),
         logical_lock_request((42, 1), (0, 10), true),
         crate::thread::ThreadId::synthetic_for_tests(2),
+    carrick_abi::SigBlockMask::NONE,
     );
     assert_eq!(b_wants_a.try_acquire(), Err(LINUX_EAGAIN));
     let clone = b_wants_a.clone();
@@ -1347,6 +1353,7 @@ fn dropped_reactor_record_lock_wait_retracts_its_edge() {
         Arc::clone(&locks),
         logical_lock_request((41, 1), (0, 10), true),
         crate::thread::ThreadId::synthetic_for_tests(1),
+    carrick_abi::SigBlockMask::NONE,
     );
     assert_eq!(a_again.try_acquire(), Ok(()));
 }
@@ -1366,6 +1373,7 @@ fn hvpatch_blocking_classic_record_lock_wakes_after_unlock() {
         let result = worker_locks.wait_set_interruptibly(
             &child,
             crate::thread::ThreadId::synthetic_for_tests(42),
+            carrick_abi::SigBlockMask::NONE,
             &carrick_hal::NullHostSignalBridge::default(),
         );
         done_tx.send(result).expect("publish waiter result");
@@ -1384,6 +1392,92 @@ fn hvpatch_blocking_classic_record_lock_wakes_after_unlock() {
         Ok(Ok(()))
     );
     worker.join().expect("logical record-lock waiter");
+}
+
+#[test]
+fn blocking_record_lock_ignores_blocked_signal_but_unblocked_signal_is_eintr() {
+    let locks = Arc::new(LogicalRecordLocks::default());
+    let blocker = logical_lock_request((51, 1), (0, 10), true);
+    let waiter = logical_lock_request((52, 2), (0, 10), true);
+    assert_eq!(locks.try_set(blocker.clone()), Ok(()));
+    let tid = crate::thread::ThreadId::synthetic_for_tests(42_851);
+    let bridge = Arc::new(carrick_hal::NullHostSignalBridge::default());
+    carrick_hal::HostSignalBridge::publish_pending_for(&*bridge, tid.raw(), 10);
+    let blocked = carrick_abi::SigBlockMask::blocking_all_of(carrick_abi::SigSet::EMPTY.with(10));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker_locks = Arc::clone(&locks);
+    let worker_bridge = Arc::clone(&bridge);
+    let worker = std::thread::spawn(move || {
+        let result = worker_locks.wait_set_interruptibly(&waiter, tid, blocked, &*worker_bridge);
+        tx.send(result).expect("record wait result");
+    });
+    let premature = rx.recv_timeout(std::time::Duration::from_millis(30));
+    locks.release_file_owner(&blocker.file, blocker.owner);
+    let settled = rx.recv_timeout(std::time::Duration::from_secs(1));
+    worker.join().expect("record waiter");
+    let _ = carrick_hal::HostSignalBridge::take_pending_for(&*bridge, tid.raw());
+    assert!(premature.is_err(), "blocked signal must leave F_SETLKW parked: {premature:?}");
+    assert_eq!(settled, Ok(Ok(())));
+
+    let unblocked_tid = crate::thread::ThreadId::synthetic_for_tests(42_852);
+    let unblocked_blocker = logical_lock_request((53, 3), (0, 10), true);
+    let unblocked_waiter = logical_lock_request((54, 4), (0, 10), true);
+    assert_eq!(locks.try_set(unblocked_blocker), Ok(()));
+    carrick_hal::HostSignalBridge::publish_pending_for(&*bridge, unblocked_tid.raw(), 10);
+    assert_eq!(
+        locks.wait_set_interruptibly(
+            &unblocked_waiter,
+            unblocked_tid,
+            carrick_abi::SigBlockMask::NONE,
+            &*bridge,
+        ),
+        Err(LINUX_EINTR)
+    );
+    assert_eq!(LINUX_EINTR.get(), 4);
+    let _ = carrick_hal::HostSignalBridge::take_pending_for(&*bridge, unblocked_tid.raw());
+}
+
+#[test]
+fn blocking_flock_ignores_blocked_signal_but_unblocked_signal_is_eintr() {
+    let locks = Arc::new(LogicalRecordLocks::default());
+    let file = LeaseFileId::Path("/signal-flock".to_owned());
+    assert_eq!(locks.try_flock(file.clone(), 1, true), Ok(()));
+    let tid = crate::thread::ThreadId::synthetic_for_tests(42_853);
+    let bridge = Arc::new(carrick_hal::NullHostSignalBridge::default());
+    carrick_hal::HostSignalBridge::publish_pending_for(&*bridge, tid.raw(), 10);
+    let blocked = carrick_abi::SigBlockMask::blocking_all_of(carrick_abi::SigSet::EMPTY.with(10));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker_locks = Arc::clone(&locks);
+    let worker_file = file.clone();
+    let worker_bridge = Arc::clone(&bridge);
+    let worker = std::thread::spawn(move || {
+        let result = worker_locks.wait_flock_interruptibly(&worker_file, 2, true, tid, blocked, &*worker_bridge);
+        tx.send(result).expect("flock wait result");
+    });
+    let premature = rx.recv_timeout(std::time::Duration::from_millis(30));
+    locks.unlock_flock(&file, 1);
+    let settled = rx.recv_timeout(std::time::Duration::from_secs(1));
+    worker.join().expect("flock waiter");
+    let _ = carrick_hal::HostSignalBridge::take_pending_for(&*bridge, tid.raw());
+    assert!(premature.is_err(), "blocked signal must leave flock parked: {premature:?}");
+    assert_eq!(settled, Ok(Ok(())));
+
+    assert_eq!(locks.try_flock(file.clone(), 3, true), Err(LINUX_EAGAIN));
+    let unblocked_tid = crate::thread::ThreadId::synthetic_for_tests(42_854);
+    carrick_hal::HostSignalBridge::publish_pending_for(&*bridge, unblocked_tid.raw(), 10);
+    assert_eq!(
+        locks.wait_flock_interruptibly(
+            &file,
+            3,
+            true,
+            unblocked_tid,
+            carrick_abi::SigBlockMask::NONE,
+            &*bridge,
+        ),
+        Err(LINUX_EINTR)
+    );
+    assert_eq!(LINUX_EINTR.get(), 4);
+    let _ = carrick_hal::HostSignalBridge::take_pending_for(&*bridge, unblocked_tid.raw());
 }
 
 #[derive(Default)]
@@ -6269,6 +6363,7 @@ fn flock_wait_lease_retires_its_exact_description_after_slot_close() {
         waiter_owner,
         true,
         crate::thread::ThreadId::synthetic_for_tests(4_401),
+        carrick_abi::SigBlockMask::NONE,
         lease,
     );
 
