@@ -6531,6 +6531,7 @@ impl Cpl0Carrier {
                     thread_serial: 1001
                         + index as u64
                         + 2 * (page.state(0).map_or(0, |(generation, _)| generation) + 1),
+                    execution: carrick_core_abi::entry::EntryGeneration::from_raw(1),
                     uid_credit: 1,
                 },
             )

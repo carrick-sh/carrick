@@ -3310,7 +3310,7 @@
       "operation": "fatal:thread::control",
       "owner": "carrick_kernel::kernel::objects::thread_control::ThreadControlArena::allocate",
       "lane": "shared",
-      "ceiling": 1
+      "ceiling": 0
     },
     {
       "family": "fatal_carrier_fault",

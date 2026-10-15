@@ -4866,3 +4866,6 @@ mod tests {
 
 #[cfg(feature = "test-support")]
 pub use thread_control::TestThreadControlArena;
+
+#[cfg(feature = "test-support")]
+pub use super::thread_ledger::TestBirthAdmissionGuard;

@@ -56,6 +56,7 @@ impl Venue {
                     tid: 10_000 + tid * THREAD_POOL_ENTRIES as u32 + index as u32,
                     visible_tid: 10_000 + tid * THREAD_POOL_ENTRIES as u32 + index as u32,
                     thread_serial: u64::from(tid) * 100 + index as u64,
+                    execution: carrick_core_abi::entry::EntryGeneration::from_raw(1),
                     uid_credit: 1,
                 },
             )

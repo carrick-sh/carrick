@@ -50,7 +50,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Protocol revision, folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 12;
+pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 13;
 
 pub use carrick_core::lifecycle::{ClaimedEntry, ExitAdmission, Lifecycle};
 pub use carrick_core_abi::lifecycle::*;
@@ -142,6 +142,8 @@ pub struct EntryIdentity {
     pub visible_tid: u32,
     /// `ThreadKey` serial the child will carry.
     pub thread_serial: u64,
+    /// Execution incarnation issued with this exact pool identity.
+    pub execution: carrick_core_abi::entry::EntryGeneration,
     /// RLIMIT_NPROC credit held for the owning uid.
     pub uid_credit: u64,
 }
@@ -204,6 +206,7 @@ pub struct PoolEntry {
     clone_flags: AtomicU64,
     clear_child_tid: AtomicU64,
     blocked: AtomicU64,
+    execution: AtomicU64,
 }
 
 impl PoolEntry {
@@ -219,6 +222,7 @@ impl PoolEntry {
             clone_flags: AtomicU64::new(0),
             clear_child_tid: AtomicU64::new(0),
             blocked: AtomicU64::new(0),
+            execution: AtomicU64::new(0),
         }
     }
 }
@@ -322,7 +326,7 @@ pub struct ThreadControlSlot {
     zone_id: AtomicU32,
     /// Exit request/receipt bits plus the core-owned exact member exit kind.
     /// The slot's `entry` is the generation key until exclusive reset.
-    host_exit_requested: carrick_core::lifecycle::MemberExitCustody,
+    host_exit_requested: carrick_core::lifecycle::MemberControlAuthority,
     /// The host writes task/execution first and publishes thread last. A
     /// Closing owner only credits the complete exact receipt it requested.
     retired_task: AtomicU64,
@@ -354,7 +358,7 @@ impl ThreadControlSlot {
             zone_seq: AtomicU64::new(0),
             zone_incarnation: AtomicU64::new(0),
             zone_id: AtomicU32::new(0),
-            host_exit_requested: carrick_core::lifecycle::MemberExitCustody::new(),
+            host_exit_requested: carrick_core::lifecycle::MemberControlAuthority::new(),
             retired_task: AtomicU64::new(0),
             retired_execution: AtomicU64::new(0),
             retired_thread: AtomicU64::new(0),
@@ -378,11 +382,17 @@ impl ThreadControlSlot {
     pub fn reset_for_host_birth(&self, blocked: BlockedMask) -> Result<(), TransitionError> {
         self.reset(blocked, 0, None)
     }
+    #[cfg(feature = "host-test")]
+    pub fn reserve_reset_for_test(
+        &self,
+    ) -> Result<carrick_core::lifecycle::MemberReset<'_>, TransitionError> {
+        self.host_exit_requested.reserve_reset()
+    }
     pub fn graph_referenced(&self) -> bool {
-        self.host_exit_requested.referenced()
+        self.host_exit_requested.custody().referenced()
     }
     pub fn graph_unregister_receipt(&self) -> bool {
-        self.host_exit_requested.unregister_receipt()
+        self.host_exit_requested.custody().unregister_receipt()
     }
 
     /// Publish once for this exclusively reserved slot incarnation. Repeated
@@ -606,7 +616,7 @@ impl ThreadControlSlot {
     }
 
     pub fn host_retirement(&self) -> Option<carrick_core::terminal::HostThreadRetirementReceipt> {
-        if !self.host_exit_requested.host_receipt_published() {
+        if !self.host_exit_requested.custody().host_receipt_published() {
             return None;
         }
         let thread = self.retired_thread.load(Ordering::Acquire);
@@ -627,7 +637,7 @@ impl ThreadControlSlot {
     }
 
     pub fn host_exit_requested(&self) -> bool {
-        self.host_exit_requested.host_exit_requested()
+        self.host_exit_requested.custody().host_exit_requested()
     }
 }
 impl carrick_core::lifecycle::MemberControl for ThreadControlSlot {
@@ -636,7 +646,7 @@ impl carrick_core::lifecycle::MemberControl for ThreadControlSlot {
     }
 
     fn exit_custody(&self) -> &carrick_core::lifecycle::MemberExitCustody {
-        &self.host_exit_requested
+        self.host_exit_requested.custody()
     }
 
     fn host_retirement(&self) -> Option<carrick_core::terminal::HostThreadRetirementReceipt> {
@@ -666,6 +676,7 @@ pub struct ThreadLifecyclePage {
     exit_wait_address: AtomicU64,
     host_born: [HostBornMember; THREAD_POOL_ENTRIES],
     host_birth_mutations: AtomicU32,
+    terminal: carrick_core::terminal::ProcessExitCustody,
 }
 
 const _: () = assert!(core::mem::size_of::<ThreadLifecyclePage>() == THREAD_LIFECYCLE_PAGE_SIZE);
@@ -795,6 +806,7 @@ impl ThreadLifecyclePage {
             exit_wait_address: AtomicU64::new(0),
             host_born: [const { HostBornMember::new() }; THREAD_POOL_ENTRIES],
             host_birth_mutations: AtomicU32::new(0),
+            terminal: carrick_core::terminal::ProcessExitCustody::new(),
         }
     }
 
@@ -1112,6 +1124,8 @@ impl ThreadLifecyclePage {
         e.thread_serial
             .store(identity.thread_serial, Ordering::Relaxed);
         e.uid_credit.store(identity.uid_credit, Ordering::Relaxed);
+        e.execution
+            .store(identity.execution.raw(), Ordering::Relaxed);
         e.state
             .store(pack(next, EntryState::Reserved), Ordering::Release);
         Ok(reference)
@@ -1153,6 +1167,9 @@ impl ThreadLifecyclePage {
             visible_tid: e.visible_tid.load(Ordering::Relaxed),
             thread_serial: e.thread_serial.load(Ordering::Relaxed),
             uid_credit: e.uid_credit.load(Ordering::Relaxed),
+            execution: carrick_core_abi::entry::EntryGeneration::from_raw(
+                e.execution.load(Ordering::Relaxed),
+            ),
         })
     }
 
@@ -1201,6 +1218,9 @@ impl ThreadLifecyclePage {
     }
 }
 impl Lifecycle for ThreadLifecyclePage {
+    fn process_exit_custody(&self) -> &carrick_core::terminal::ProcessExitCustody {
+        &self.terminal
+    }
     fn host_birth_receipt_returned_exact(
         &self,
         index: usize,
@@ -1234,8 +1254,10 @@ impl Default for ThreadLifecyclePage {
 }
 
 /// Layout facts folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 33] = [
+pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 35] = [
     THREAD_LIFECYCLE_PROTOCOL_VERSION,
+    core::mem::offset_of!(PoolEntry, execution) as u64,
+    core::mem::offset_of!(ThreadLifecyclePage, terminal) as u64,
     core::mem::size_of::<ThreadLedgerActivity>() as u64,
     ::core::mem::offset_of!(ThreadLifecyclePage, ledger_host) as u64,
     ::core::mem::offset_of!(ThreadLifecyclePage, ledger_guest) as u64,
@@ -1283,6 +1305,7 @@ mod tests {
                     tid: 42,
                     visible_tid: 42,
                     thread_serial: 2,
+                    execution: carrick_core_abi::entry::EntryGeneration::from_raw(1),
                     uid_credit: 0,
                 },
             )
@@ -1435,6 +1458,7 @@ mod tests {
             tid: n,
             visible_tid: n + 100,
             thread_serial: n as u64 + 1000,
+            execution: carrick_core_abi::entry::EntryGeneration::from_raw(1),
             uid_credit: 1,
         }
     }
@@ -1978,6 +2002,7 @@ mod layout_manifest {
                      clone_flags: _,
                      clear_child_tid: _,
                      blocked: _,
+                     execution: _,
                  }: PoolEntry| {};
         field!(PoolEntry, state, AtomicEntry, 0, 8, 8);
         field!(PoolEntry, tid, AtomicU32, 8, 4, 4);
@@ -1989,6 +2014,7 @@ mod layout_manifest {
         field!(PoolEntry, clone_flags, AtomicU64, 48, 8, 8);
         field!(PoolEntry, clear_child_tid, AtomicU64, 56, 8, 8);
         field!(PoolEntry, blocked, AtomicU64, 64, 8, 8);
+        field!(PoolEntry, execution, AtomicU64, 72, 8, 8);
     }
 
     #[test]
@@ -2038,7 +2064,7 @@ mod layout_manifest {
         field!(
             ThreadControlSlot,
             host_exit_requested,
-            carrick_core::lifecycle::MemberExitCustody,
+            carrick_core::lifecycle::MemberControlAuthority,
             100,
             4,
             4
@@ -2071,6 +2097,7 @@ mod layout_manifest {
                      exit_wait_address: _,
                      host_born: _,
                      host_birth_mutations: _,
+                     terminal: _,
                  }: ThreadLifecyclePage| {};
         field!(ThreadLifecyclePage, gate, AtomicU32, 0, 4, 4);
         field!(ThreadLifecyclePage, live, AtomicU32, 4, 4, 4);
@@ -2109,6 +2136,14 @@ mod layout_manifest {
             host_birth_mutations,
             AtomicU32,
             1016,
+            4,
+            4
+        );
+        field!(
+            ThreadLifecyclePage,
+            terminal,
+            carrick_core::terminal::ProcessExitCustody,
+            1020,
             4,
             4
         );
