@@ -1,8 +1,23 @@
 use carrick_guest_arch::UserVa;
 use carrick_personality_linux::{
-    dispatch::FamilyCompletion,
+    dispatch::{Family, FamilyCompletion, route_x86},
     sched::{SchedCall, SchedVenue, serve_sched},
 };
+
+#[test]
+fn x86_native_sched_yield_uses_canonical_in_ring_completion() {
+    // x86 native ordinal 24 is translated to canonical ordinal 124.
+    assert_eq!(route_x86(124, 0), Family::Sched(SchedCall::Yield));
+    let mut venue = Venue {
+        pid: 0,
+        exists: None,
+        copies: false,
+    };
+    assert_eq!(
+        serve_sched(SchedCall::Yield, &mut venue),
+        FamilyCompletion::Complete(0)
+    );
+}
 
 struct Venue {
     pid: u64,
