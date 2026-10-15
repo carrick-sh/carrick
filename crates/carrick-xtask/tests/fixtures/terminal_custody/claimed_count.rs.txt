@@ -1,0 +1,1 @@
+fn lifecycle_admission_settled(page: &Page) { if page.claimed_count() == 0 {} }
