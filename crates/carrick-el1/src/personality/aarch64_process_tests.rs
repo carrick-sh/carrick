@@ -33,12 +33,14 @@ use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(test)]
-static NATIVE_WAKE_TRACE: std::sync::Mutex<std::vec::Vec<(SlotId, u64)>> =
-    std::sync::Mutex::new(std::vec::Vec::new());
+std::thread_local! {
+    static NATIVE_WAKE_TRACE: std::cell::RefCell<std::vec::Vec<(SlotId, u64)>> =
+        const { std::cell::RefCell::new(std::vec::Vec::new()) };
+}
 
 #[cfg(test)]
 pub(crate) fn record_native_wake_for_test(slot: SlotId, target: u64) {
-    NATIVE_WAKE_TRACE.lock().unwrap().push((slot, target));
+    NATIVE_WAKE_TRACE.with(|trace| trace.borrow_mut().push((slot, target)));
 }
 
 #[cfg(test)]
@@ -52,12 +54,12 @@ fn arm_native_wake_cross_slot_reaches_reschedule_transport() {
     fixture.zone.enter_guest(other);
     let target = 0x8000_0004;
     fixture.zone.slot(other).set_sgi_target(target);
-    NATIVE_WAKE_TRACE.lock().unwrap().clear();
+    NATIVE_WAKE_TRACE.with(|trace| trace.borrow_mut().clear());
     let mut service = fixture.process_service();
     let mut effects = WakeEffects::default();
     effects.request_reschedule(other);
     NativeProcessService::wake_effects(&mut service, effects);
-    assert_eq!(NATIVE_WAKE_TRACE.lock().unwrap().as_slice(), &[(other, target)]);
+    NATIVE_WAKE_TRACE.with(|trace| assert_eq!(trace.borrow().as_slice(), &[(other, target)]));
 }
 
 /// Scheduler CPU with the same owner checkpoint as the production ARM CPU.
