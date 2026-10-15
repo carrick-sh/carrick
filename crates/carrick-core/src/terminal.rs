@@ -60,6 +60,12 @@ impl ProcessExitCustody {
     }
 }
 
+/// Closed birth admission, without a consumed caller membership or begun
+/// terminal claim. Dropping this preparation never reopens the gate.
+pub struct ProcessExitAdmission<'a, L: Lifecycle> {
+    page: &'a L,
+}
+
 pub struct Process;
 pub struct Live;
 pub struct Exiting;
@@ -357,13 +363,19 @@ impl TerminalCustody<Process, Live> {
         }
     }
 
-    pub fn begin_exit(
-        page: &impl Lifecycle,
+    pub fn close_admission<L: Lifecycle>(page: &L) -> ProcessExitAdmission<'_, L> {
+        page.close();
+        ProcessExitAdmission { page }
+    }
+
+    pub fn begin_exit<L: Lifecycle>(
+        admission: ProcessExitAdmission<'_, L>,
         task: TaskKey,
         address: AddressContext<RootGpa>,
         status: TerminationStatus,
     ) -> Result<TerminalCustody<Process, Closing>, MembershipFloor> {
         use core::sync::atomic::Ordering;
+        let page = admission.page;
         let state = page.process_exit_custody();
         state
             .begun
@@ -376,7 +388,6 @@ impl TerminalCustody<Process, Live> {
                 return Err(error);
             }
         };
-        page.close();
         caller.publish();
         Ok(TerminalCustody {
             identity: ProcessTerminalIdentity::from_exit(task, address, status),
@@ -644,6 +655,24 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_exit_admission_keeps_gate_closed_without_consuming_membership() {
+        use carrick_core_abi::lifecycle::GateState;
+        use core::sync::atomic::Ordering;
+        let page = Page {
+            terminal: ProcessExitCustody::new(),
+            gate: AtomicU32::new(GateState::ForkClosing as u32),
+            live: AtomicU32::new(2),
+        };
+        {
+            let _admission = TerminalCustody::<Process, Live>::close_admission(&page);
+            assert_eq!(page.gate(), GateState::Closed);
+        }
+        assert_eq!(page.gate(), GateState::Closed);
+        assert_eq!(page.live(), 2);
+        assert_eq!(page.terminal.begun.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn second_process_close_cannot_consume_another_live_member() {
         let page = Page {
             terminal: crate::terminal::ProcessExitCustody::new(),
@@ -660,7 +689,7 @@ mod tests {
             generation: carrick_guest_arch::ContextGeneration::new(NonZeroU64::new(1).unwrap()),
         };
         let _first = TerminalCustody::<Process, Live>::begin_exit(
-            &page,
+            TerminalCustody::<Process, Live>::close_admission(&page),
             task,
             address,
             TerminationStatus::exited(7),
@@ -668,7 +697,7 @@ mod tests {
         .unwrap();
         assert!(
             TerminalCustody::<Process, Live>::begin_exit(
-                &page,
+                TerminalCustody::<Process, Live>::close_admission(&page),
                 task,
                 address,
                 TerminationStatus::exited(7),
