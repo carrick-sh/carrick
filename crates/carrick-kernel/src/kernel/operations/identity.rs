@@ -12,6 +12,12 @@ use crate::kernel::core::{Kernel, KernelContext};
 use crate::kernel::ids::{LinuxTid, MmId, ProcessGroupId, SessionId, TaskId};
 use crate::kernel::objects::{Credentials, Task, TaskKey, TaskLifecycle, TaskRef};
 
+impl carrick_core::terminal::TaskMembership for Kernel {
+    fn contains_task(&self, task: TaskId) -> bool {
+        self.registry().settled().read().tasks.contains_key(&task)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Observable identity of one exact task generation.
 ///
@@ -152,11 +158,7 @@ impl Kernel {
     }
 
     pub fn task_is_live(&self, task_id: TaskId) -> bool {
-        self.registry()
-            .settled()
-            .read()
-            .tasks
-            .contains_key(&task_id)
+        carrick_core::terminal::TaskMembership::contains_task(self, task_id)
     }
 
     /// Resolve a task id to the LIVE task itself, for the callers that must

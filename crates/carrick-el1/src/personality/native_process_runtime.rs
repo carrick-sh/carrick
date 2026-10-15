@@ -839,14 +839,12 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                                     // receipt. An already exited entry no
                                     // longer has a pool receipt to await.
                                     .and_then(|member| {
-                                        let pool_receipt_pending = member.control.entry().is_some_and(|entry| {
-                                            matches!(page.state(entry.index()),
-                                                Some((generation, carrick_el1_abi::EntryState::Born
-                                                    | carrick_el1_abi::EntryState::Published
-                                                    | carrick_el1_abi::EntryState::ExitingBorn
-                                                    | carrick_el1_abi::EntryState::ExitingPublished))
-                                                    if generation == entry.generation())
-                                        });
+                                        let pool_receipt_pending =
+                                            member.control.entry().is_some_and(|entry| {
+                                                carrick_el1_abi::Lifecycle::exit_receipt_expected(
+                                                    page, entry,
+                                                )
+                                            });
                                         (!pool_receipt_pending).then_some((
                                             binding,
                                             member.control,
