@@ -441,7 +441,7 @@ plus each coordinator's holder `tid`. With no capture at all it leaves
 rings comes from the surrounding records, not from their separate logical
 indexes.
 
-On Linux/KVM, `carrick debug kvm-capture --run-id <id> --output <path>` asks
+On Linux/KVM, `carrick debug kvm-capture --run-id <id> --output-dir <dir>` asks
 the running carrier for a read-only capture in the existing post-mortem JSON
 shape. Use the same `CARRICK_RUN_ID` as the guest run. It includes both event
 rings, the kernel task/thread view (or a named degraded view), scheduler

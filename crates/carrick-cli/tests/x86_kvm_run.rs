@@ -1021,11 +1021,12 @@ fn mounted_static_x86_blocked_read_has_live_kernel_capture() {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| dir.path().to_path_buf());
     std::fs::create_dir_all(&capture_dir).unwrap();
-    let capture_path = capture_dir.join(format!("{run_id}.json"));
+    let capture_dir = capture_dir.join(&run_id);
+    let capture_path = capture_dir.join("post-mortem.json");
     let capture = Command::new(&cli)
         .timeout(Duration::from_secs(5))
-        .args(["debug", "kvm-capture", "--run-id", &run_id, "--output"])
-        .arg(&capture_path)
+        .args(["debug", "kvm-capture", "--run-id", &run_id, "--output-dir"])
+        .arg(&capture_dir)
         .output()
         .unwrap();
     assert!(
@@ -1503,13 +1504,12 @@ fn run_mounted_binary_with_capture(
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("carrick-kvm-deadlines"));
     std::fs::create_dir_all(&capture_dir).expect("create KVM capture directory");
-    let (_, capture_path) = tempfile::Builder::new()
+    let capture_dir = tempfile::Builder::new()
         .prefix("kvm-deadline-")
-        .suffix(".json")
-        .tempfile_in(&capture_dir)
-        .expect("reserve KVM capture file")
-        .keep()
-        .expect("retain KVM capture file");
+        .tempdir_in(&capture_dir)
+        .expect("reserve KVM capture directory")
+        .keep();
+    let capture_path = capture_dir.join("post-mortem.json");
     let capture = Command::new(&cli)
         .timeout(Duration::from_secs(4))
         .args([
@@ -1517,9 +1517,9 @@ fn run_mounted_binary_with_capture(
             "kvm-capture",
             "--run-id",
             &scoped_run_id,
-            "--output",
+            "--output-dir",
         ])
-        .arg(&capture_path)
+        .arg(&capture_dir)
         .output();
     // SAFETY: this test created an exclusive process group for this exact run.
     unsafe { libc::killpg(child.id() as i32, libc::SIGKILL) };

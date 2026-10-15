@@ -885,8 +885,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
         ))]
         Commands::Debug { command } => match command {
             #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
-            DebugCommand::KvmCapture { run_id, output } => {
-                crate::debug_kvm::capture(&run_id, &output)?
+            DebugCommand::KvmCapture { run_id, output_dir } => {
+                crate::debug_kvm::capture(&run_id, &output_dir)?
             }
             // Parses a file only, so it is available wherever the binary is.
             DebugCommand::Core { core } => crate::debug_core::run_debug_core(&core)?,
