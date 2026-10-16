@@ -41,7 +41,9 @@ use carrick_sched_core::process::{
     },
     wait::{TaskWakeGeneration, WaitJobControl, WaitPrecheck, WaitQuery, WaitSelection},
 };
-use carrick_sched_core::{Handback, RecordRef, ThreadIdentity, WakeEffects, Waker, ZoneTables};
+use carrick_sched_core::{
+    Handback, RecordRef, SlotId, ThreadIdentity, WakeEffects, Waker, ZoneTables,
+};
 use core::{
     num::{NonZeroU32, NonZeroU64},
     sync::atomic::Ordering,
@@ -69,6 +71,71 @@ fn signal_record_exists<C: ProcessContext>(zone: &ZoneTables<C>, record: RecordR
         && retained.home().is_some_and(|slot| {
             zone.slot(slot).current().is_none() && zone.slot(slot).host_record() == Some(record.id)
         })
+}
+
+fn request_signal_reschedule<'a, C: ProcessContext, S: NativeProcessService<'a, C>>(
+    zone: &ZoneTables<C>,
+    service: &mut S,
+    record: RecordRef,
+) {
+    if !signal_record_exists(zone, record) {
+        return;
+    }
+    let owned = zone.record(record.id);
+    let target = match owned.claim() {
+        carrick_sched_core::Claim::OnCpu { slot, .. }
+        | carrick_sched_core::Claim::OnCpuRequested { slot, .. } => Some(slot),
+        carrick_sched_core::Claim::Free => owned.home(),
+        _ => None,
+    };
+    if let Some(slot) = target {
+        let mut effects = WakeEffects::default();
+        effects.request_reschedule(slot);
+        service.wake_effects(effects);
+    }
+}
+
+fn publish_signal_channel<'a, C: ProcessContext, S: NativeProcessService<'a, C>>(
+    zone: &'a ZoneTables<C>,
+    slot: SlotId,
+    service: &mut S,
+    channel: &Arc<WaitChannel>,
+    #[cfg(test)] probe: Option<&(dyn Fn(u32) + Sync)>,
+) -> Result<(), NativeProcessError> {
+    let address = WaitChannel::address(channel);
+    let guard = zone.short_lock(
+        ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
+        &NativeBucketWait {
+            lifetime: core::marker::PhantomData,
+            #[cfg(test)]
+            probe,
+        },
+    );
+    channel
+        .generation
+        .publish()
+        .map_err(|_| NativeProcessError::Exhausted)?;
+    let mut effects = WakeEffects::default();
+    let wake = zone.wake_placed(
+        &guard,
+        channel.mm,
+        address,
+        u32::MAX,
+        u32::MAX,
+        Waker::El1 { slot },
+        &mut [],
+        &mut effects,
+    );
+    drop(guard);
+    if matches!(wake, Err(carrick_sched_core::WakeRefusal::Unplaceable)) {
+        return service.wake_unplaceable_wait(ProcessWaitChannel {
+            mm: carrick_el1_abi::EntryMmKey::from_raw(channel.mm),
+            address: core::num::NonZeroU64::new(address).ok_or(NativeProcessError::Quarantined)?,
+        });
+    }
+    wake.map_err(|_| NativeProcessError::Quarantined)?;
+    service.wake_effects(effects);
+    Ok(())
 }
 
 fn owned_control<'a>(
@@ -1178,6 +1245,22 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         state.members.get(key).map(|member| member.runtime.clone())
     }
 
+    fn external_member<'s>(
+        state: &'s NativeRegistryState<'a, M, C>,
+        zone: &ZoneTables<C>,
+        event: carrick_el1_abi::ExternalSignalRecord,
+    ) -> Option<&'s NativeOwnerMember<'a, M, C>> {
+        let key = state.records.get(&Self::record_key(zone, event.record()))?;
+        let member = state.members.get(key)?;
+        let binding = key.binding();
+        (event.matches_live(
+            carrick_core_abi::EntryEventIdentity::from_binding(binding),
+            binding,
+            member.record,
+        ) && signal_record_exists(zone, member.record))
+        .then_some(member)
+    }
+
     /// Resolve one ingress event through the exact live member index. A tid,
     /// MM, or record slot on its own is never authority to admit a signal.
     pub fn for_external_event(
@@ -1186,17 +1269,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         event: carrick_el1_abi::ExternalSignalRecord,
     ) -> Option<Arc<NativeProcessRuntime<'a, M, C>>> {
         let state = self.state.lock();
-        let key = state.records.get(&Self::record_key(zone, event.record()))?;
-        let member = state.members.get(key)?;
-        let binding = key.binding();
-        if !event.matches_live(
-            carrick_core_abi::EntryEventIdentity::from_binding(binding),
-            binding,
-            member.record,
-        ) || !signal_record_exists(zone, member.record)
-        {
-            return None;
-        }
+        let member = Self::external_member(&state, zone, event)?;
         let graph = member.runtime.graph.lock();
         let row = graph.owner.task(member.process).ok()?;
         let resources = row.native().resources();
@@ -1204,6 +1277,93 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             return None;
         }
         Some(member.runtime.clone())
+    }
+
+    /// Consume one authenticated external event into the native pending owner.
+    /// Admission and the live lifecycle check share the registry guard, so a
+    /// recycled member cannot receive an event between lookup and enqueue.
+    pub fn admit_external_event<S: NativeProcessService<'a, C, Mm = M>>(
+        &self,
+        zone: &'a ZoneTables<C>,
+        event: carrick_el1_abi::ExternalSignalRecord,
+        publishing_slot: SlotId,
+        service: &mut S,
+    ) -> Result<bool, NativeProcessError> {
+        let state = self.state.lock();
+        let Some(member) = Self::external_member(&state, zone, event) else {
+            return Ok(false);
+        };
+        let graph = member.runtime.graph.lock();
+        let Ok(row) = graph.owner.task(member.process) else {
+            return Ok(false);
+        };
+        let resources = row.native().resources();
+        if !resources.page.gate().serves_ring() || resources.address != member.address {
+            return Ok(false);
+        }
+        let signals = resources.signals().clone();
+        let channel = resources.channel.clone();
+        signals.enqueue_thread(member.record, event.signal(), None);
+        let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+            carrick_signal_core::SignalSet::from_bits(member.control.blocked().0),
+        );
+        let interrupt = signals.has_deliverable(member.record, blocked);
+        let ipc_channel = if interrupt {
+            match graph.pending.get(&member.process) {
+                Some(PendingContinuation::Ipc(pending)) => Some(pending.channel.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        drop(graph);
+        drop(state);
+        if let Some(channel) = ipc_channel {
+            publish_signal_channel(
+                zone,
+                publishing_slot,
+                service,
+                &channel,
+                #[cfg(test)]
+                None,
+            )?;
+        }
+        if interrupt {
+            request_signal_reschedule(zone, service, event.record());
+        }
+        if let Some(channel) = channel {
+            publish_signal_channel(
+                zone,
+                publishing_slot,
+                service,
+                &channel,
+                #[cfg(test)]
+                None,
+            )?;
+        }
+        Ok(true)
+    }
+
+    /// Drain the one shared transport at a guest boundary. Every published
+    /// record is claimed once; stale bindings are refused without selecting a
+    /// different task by numeric signal target.
+    pub fn drain_external_ingress<S: NativeProcessService<'a, C, Mm = M>>(
+        &self,
+        zone: &'a ZoneTables<C>,
+        queue: &carrick_el1_abi::SharedSignalIngressQueue,
+        publishing_slot: SlotId,
+        service: &mut S,
+    ) -> Result<usize, NativeProcessError> {
+        let mut admitted = 0;
+        for _ in 0..carrick_el1_abi::SIGNAL_INGRESS_CAPACITY {
+            let Some(event) = queue.take() else {
+                break;
+            };
+            if self.admit_external_event(zone, event, publishing_slot, service)? {
+                admitted += 1;
+            }
+        }
+        Ok(admitted)
     }
 
     /// The exact admitted process address for a published thread-group
@@ -2587,21 +2747,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     // retain their pending signals until their owner resumes; an IPI does not
     // cancel their operation or release its queue/timer custody.
     fn interrupt_signal_record(&mut self, record: RecordRef) {
-        if !signal_record_exists(self.source.zone, record) {
-            return;
-        }
-        let owned = self.source.zone.record(record.id);
-        let target = match owned.claim() {
-            carrick_sched_core::Claim::OnCpu { slot, .. }
-            | carrick_sched_core::Claim::OnCpuRequested { slot, .. } => Some(slot),
-            carrick_sched_core::Claim::Free => owned.home(),
-            _ => None,
-        };
-        if let Some(slot) = target {
-            let mut effects = WakeEffects::default();
-            effects.request_reschedule(slot);
-            self.service.wake_effects(effects);
-        }
+        request_signal_reschedule(self.source.zone, self.service, record);
     }
 
     pub fn take_root_exit(&mut self) -> Option<LinuxWaitStatus> {
@@ -3349,44 +3495,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         self.interrupted_child_wait.take().map(|words| *words)
     }
     fn publish_channel(&mut self, channel: &Arc<WaitChannel>) -> Result<(), NativeProcessError> {
-        let zone = self.source.zone;
-        let address = WaitChannel::address(channel);
-        let guard = zone.short_lock(
-            ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
-            &NativeBucketWait {
-                lifetime: core::marker::PhantomData,
-                #[cfg(test)]
-                probe: self.publication_wait_probe,
-            },
-        );
-        channel
-            .generation
-            .publish()
-            .map_err(|_| NativeProcessError::Exhausted)?;
-        let mut effects = WakeEffects::default();
-        let wake = zone.wake_placed(
-            &guard,
-            channel.mm,
-            address,
-            u32::MAX,
-            u32::MAX,
-            Waker::El1 {
-                slot: self.source.slot,
-            },
-            &mut [],
-            &mut effects,
-        );
-        drop(guard);
-        if matches!(wake, Err(carrick_sched_core::WakeRefusal::Unplaceable)) {
-            return self.service.wake_unplaceable_wait(ProcessWaitChannel {
-                mm: carrick_el1_abi::EntryMmKey::from_raw(channel.mm),
-                address: core::num::NonZeroU64::new(address)
-                    .ok_or(NativeProcessError::Quarantined)?,
-            });
-        }
-        wake.map_err(|_| NativeProcessError::Quarantined)?;
-        self.service.wake_effects(effects);
-        Ok(())
+        publish_signal_channel(
+            self.source.zone,
+            self.source.slot,
+            self.service,
+            channel,
+            #[cfg(test)]
+            self.publication_wait_probe,
+        )
     }
     /// Resume owned lifecycle custody before the execution lane returns to EL0.
     /// Exit keeps its original status and cannot become a guest syscall return.
