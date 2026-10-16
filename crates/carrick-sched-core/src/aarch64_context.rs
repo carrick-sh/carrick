@@ -119,10 +119,15 @@ impl Aarch64ParkedContext {
         disposition: crate::object_wait::ResumeDisposition,
     ) -> Option<ThreadCtx> {
         let mut native = self.native;
-        if disposition == crate::object_wait::ResumeDisposition::OwnerContinuation {
-            native.pc = native.pc.checked_sub(4)?;
-            if native.pc == 0 || !native.pc.is_multiple_of(4) || native.pstate & 0xf != 0 {
-                return None;
+        use crate::object_wait::{OwnerEntry, ResumeDisposition};
+        match disposition {
+            ResumeDisposition::UserReturn => {}
+            ResumeDisposition::OwnerContinuation(OwnerEntry::Exception) => return None,
+            ResumeDisposition::OwnerContinuation(OwnerEntry::Syscall) => {
+                native.pc = native.pc.checked_sub(4)?;
+                if native.pc == 0 || !native.pc.is_multiple_of(4) || native.pstate & 0xf != 0 {
+                    return None;
+                }
             }
         }
         Some(native)
@@ -163,6 +168,19 @@ mod tests {
     use super::*;
     use carrick_guest_arch::{ContextGeneration, FrameGpa, MmGeneration};
     use core::num::NonZeroU64;
+
+    #[test]
+    fn host_resume_refuses_exception_owner() {
+        let mut native = ThreadCtx::ZERO;
+        native.pc = 0x4000; // An exception frame saves the faulting PC.
+        let ctx = Aarch64ParkedContext::from_parts(native, test_address(0x1000, 1, 1));
+        assert!(
+            ctx.host_resume(crate::object_wait::ResumeDisposition::OwnerContinuation(
+                crate::object_wait::OwnerEntry::Exception
+            ))
+            .is_none()
+        );
+    }
 
     fn test_address(root_addr: u64, mm_val: u64, gen_val: u64) -> AddressContext<RootGpa> {
         AddressContext {
