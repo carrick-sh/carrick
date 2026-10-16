@@ -973,9 +973,6 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// syscall still owns its single terminal return; redispatch uses only
     /// the remaining destination/count (and positioned source offset).
     pub(super) owner_read_progress: u64,
-    /// The write's original description and owner transfer remain with this
-    /// syscall completion while its execution lease is released.
-    pub(super) pending_write_copy_in: Option<Box<carrick_kernel::dispatch::OwnedWriteCopyIn>>,
     pub(super) continuation_restart: Option<carrick_kernel::kernel::continuation::RestartDecision>,
     /// Consecutive identical (FAR, ESR) COW faults "successfully" resolved.
     /// A resolution that does not change the faulting translation refaults
@@ -1065,7 +1062,6 @@ where
             committed_exec_context_for_test: None,
             syscall_completion: SyscallCompletionOwnership::Idle,
             owner_read_progress: 0,
-            pending_write_copy_in: None,
             continuation_restart: None,
             cow_refault_watch: None,
             reserved_signal: None,
@@ -1685,16 +1681,35 @@ where
         &mut self,
         kernel: &Kernel,
         engine: &mut E,
+        pending: Box<carrick_kernel::dispatch::OwnedWriteCopyIn>,
         host_wait: Option<carrick_kernel::dispatch::HostWaitContext<'_>>,
     ) -> Result<DispatchOutcome, RuntimeError> {
-        let pending = self.pending_write_copy_in.take().ok_or_else(|| {
-            RuntimeError::Configuration("write copy-in lost its owned transfer".to_owned())
-        })?;
         let request = self
             .syscall_completion
             .guest("write copy-in lost syscall completion")?
             .syscall()
             .request;
+        let nr = request.number.raw();
+        let census_start =
+            if crate::el1_census::enabled() && !CENSUS_IN_SERVICE.with(std::cell::Cell::get) {
+                Some(crate::el1_census::thread_cpu_ns())
+            } else {
+                None
+            };
+        if let Some(scope) = kernel.dispatcher.work_scope() {
+            let _ = scope.add(
+                carrick_observability::work_meter::WorkMetric::KernelRedispatches,
+                1,
+            );
+        }
+        let _syscall_guard = kernel.hvpatch_process.as_ref().and_then(|proc| {
+            HvpatchSyscallServiceGuard::begin(
+                || proc.syscall_trace_identity(),
+                self.linux_tid.raw(),
+                nr,
+                request.args.0,
+            )
+        });
         let context = self
             .service_kernel_context
             .as_ref()
@@ -1727,7 +1742,27 @@ where
             },
         );
         self.guest_execution = Some(executor);
+        if let Some(start) = census_start {
+            crate::el1_census::record_redispatch(nr, start);
+        }
         Ok(result?)
+    }
+
+    fn resume_owned_syscall(
+        &mut self,
+        kernel: &Kernel,
+        engine: &mut E,
+        resume: binding::OwnedSyscallResume,
+        host_wait: Option<carrick_kernel::dispatch::HostWaitContext<'_>>,
+    ) -> Result<DispatchOutcome, RuntimeError> {
+        match resume {
+            binding::OwnedSyscallResume::Redispatch => {
+                self.redispatch_threaded_syscall(kernel, engine, host_wait)
+            }
+            binding::OwnedSyscallResume::PreparedWrite(pending) => {
+                self.resume_write_copy_in(kernel, engine, pending, host_wait)
+            }
+        }
     }
 
     fn redispatch_threaded_syscall_for_executor(
@@ -2254,7 +2289,6 @@ where
 
     pub(super) fn retire_syscall(&mut self) -> Result<(), RuntimeError> {
         self.owner_read_progress = 0;
-        self.pending_write_copy_in = None;
         match std::mem::replace(
             &mut self.syscall_completion,
             SyscallCompletionOwnership::Idle,

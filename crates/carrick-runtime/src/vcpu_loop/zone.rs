@@ -18,7 +18,7 @@
 //! - [`ProductionHvpatchLoopJob::resume_zone`]: a zone-parked thread loaded
 //!   from its record applies how its wait ended ([`Handback`]).
 
-use super::binding::{HvpatchProductionPhase, ProductionHvpatchLoopJob};
+use super::binding::{HvpatchProductionPhase, OwnedSyscallResume, ProductionHvpatchLoopJob};
 use super::exec::ProductionHvpatchPollError;
 use super::outcome::HvpatchLoopSuspension;
 use super::*;
@@ -30,7 +30,10 @@ use carrick_hal::threaded::GuestCpuState;
 use carrick_kernel::el1_zone::HostLockWait;
 
 pub(super) enum OwnerMemoryAction {
-    Syscall(carrick_hal::RawSyscall),
+    Syscall {
+        frame: carrick_hal::RawSyscall,
+        resume: OwnedSyscallResume,
+    },
     Retained,
 }
 
@@ -212,6 +215,23 @@ pub(super) fn owner_wait_interruption(
             Some(DispatchOutcome::Errno { errno: *errno })
         }
         _ => None,
+    }
+}
+
+fn owned_owner_wait_interruption(
+    completion: &carrick_kernel::kernel::continuation::ContinuationCompletion,
+    retained_copy: bool,
+    reserved_signum: Option<i32>,
+) -> Option<DispatchOutcome> {
+    // User-copy page waits are killable: an ordinary signal remains pending
+    // while the exact transfer retries its owner dependency. SIGKILL alone
+    // ends the wait; common signal delivery terminates the task.
+    if retained_copy && reserved_signum == Some(carrick_abi::LINUX_SIGKILL) {
+        Some(DispatchOutcome::errno(carrick_abi::LINUX_EINTR))
+    } else if !retained_copy {
+        owner_wait_interruption(completion)
+    } else {
+        None
     }
 }
 
@@ -542,7 +562,7 @@ where
         index: u32,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         let Some((zone, mm)) = zone_for(self.state.zone_mm) else {
-            return self.service_outcome(
+            return self.route_outcome(
                 engine,
                 control,
                 frame,
@@ -617,7 +637,7 @@ where
         let (record, seq) = match parked {
             Ok(parked) => parked,
             Err(errno) => {
-                return self.service_outcome(
+                return self.route_outcome(
                     engine,
                     control,
                     frame,
@@ -643,8 +663,14 @@ where
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         frame: carrick_hal::RawSyscall,
         wait: carrick_el1_abi::PortalOwnerWait,
+        resume: OwnedSyscallResume,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
-        self.park_owner_memory_action(engine, control, OwnerMemoryAction::Syscall(frame), wait)
+        self.park_owner_memory_action(
+            engine,
+            control,
+            OwnerMemoryAction::Syscall { frame, resume },
+            wait,
+        )
     }
 
     pub(super) fn park_retained_memory_owner(
@@ -684,7 +710,7 @@ where
                 as *const carrick_el1_abi::MmPortalSlots)
         };
         let syscall_state = match &action {
-            OwnerMemoryAction::Syscall(_) => {
+            OwnerMemoryAction::Syscall { .. } => {
                 let state = engine.snapshot_guest_state_for_publication()?;
                 let ctx = zone_ctx_from_state(&state, ZoneExit::Syscall { completed: true })?;
                 let request = self
@@ -738,7 +764,7 @@ where
                     .host_parks
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 match (action, syscall_state) {
-                    (OwnerMemoryAction::Syscall(frame), Some((state, _, request))) => {
+                    (OwnerMemoryAction::Syscall { frame, resume }, Some((state, _, request))) => {
                         let exit = self.settle_into_zone(
                             control,
                             state,
@@ -747,7 +773,7 @@ where
                             None,
                             request,
                         )?;
-                        self.phase = HvpatchProductionPhase::ResumeOwnerZone { frame };
+                        self.phase = HvpatchProductionPhase::ResumeOwnerZone { frame, resume };
                         Ok(exit)
                     }
                     (OwnerMemoryAction::Retained, None) => {
@@ -786,21 +812,14 @@ where
             Err((ObjectWaitError::Changed | ObjectWaitError::Stale, _token)) => {
                 zone.free_record(record);
                 match action {
-                    OwnerMemoryAction::Syscall(frame) => {
-                        let outcome = if self.state.pending_write_copy_in.is_some() {
-                            self.state.resume_write_copy_in(
-                                &self.kernel,
-                                engine,
-                                control.submission.host_wait_context(),
-                            )?
-                        } else {
-                            self.state.redispatch_threaded_syscall(
-                                &self.kernel,
-                                engine,
-                                control.submission.host_wait_context(),
-                            )?
-                        };
-                        self.service_outcome(engine, control, frame, outcome)
+                    OwnerMemoryAction::Syscall { frame, resume } => {
+                        let outcome = self.state.resume_owned_syscall(
+                            &self.kernel,
+                            engine,
+                            resume,
+                            control.submission.host_wait_context(),
+                        )?;
+                        self.route_outcome(engine, control, frame, outcome)
                     }
                     OwnerMemoryAction::Retained => {
                         let action = self.take_retained_memory_action()?;
@@ -825,33 +844,38 @@ where
         engine: &mut E,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         frame: carrick_hal::RawSyscall,
+        resume: OwnedSyscallResume,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         let mut result = self.consume_owner_zone(control)?;
+        let reserved_signum = result.reserved_signal().map(|signal| signal.signum());
+        let interruption = owned_owner_wait_interruption(
+            &result.completion,
+            matches!(resume, OwnedSyscallResume::PreparedWrite(_)),
+            reserved_signum,
+        );
         let reserved = result.take_reserved_signal();
-        let interruption = owner_wait_interruption(&result.completion);
         // The restored CPU still owns the pending syscall's EL1 trap frame.
         // Carry the reservation to common completion, which publishes the
         // actual return value before signal delivery at the EL0 boundary.
-        // Dropping any later reservation requeues it through its authority.
-        self.state.reserved_signal = self.state.reserved_signal.take().or(reserved);
+        // A newly reserved SIGKILL supersedes an ordinary signal held from an
+        // earlier owner wake. Dropping the displaced reservation requeues it.
+        let previous = self.state.reserved_signal.take();
+        self.state.reserved_signal = if reserved_signum == Some(carrick_abi::LINUX_SIGKILL) {
+            reserved
+        } else {
+            previous.or(reserved)
+        };
         self.state.continuation_restart = None;
-        if interruption.is_some() {
-            self.state.pending_write_copy_in = None;
-        }
         let outcome = match interruption {
             Some(outcome) => outcome,
-            None if self.state.pending_write_copy_in.is_some() => self.state.resume_write_copy_in(
+            None => self.state.resume_owned_syscall(
                 &self.kernel,
                 engine,
-                control.submission.host_wait_context(),
-            )?,
-            None => self.state.redispatch_threaded_syscall(
-                &self.kernel,
-                engine,
+                resume,
                 control.submission.host_wait_context(),
             )?,
         };
-        self.service_outcome(engine, control, frame, outcome)
+        self.route_outcome(engine, control, frame, outcome)
     }
 
     pub(super) fn consume_owner_zone(
@@ -1391,7 +1415,7 @@ where
                 IpcParkAttempt::Changed(token) => match self.ipc_continue(engine, token)? {
                     IpcHandbackRoute::Park(next) => park = next,
                     IpcHandbackRoute::Complete(outcome) => {
-                        return self.service_outcome(engine, control, frame, outcome);
+                        return self.route_outcome(engine, control, frame, outcome);
                     }
                     IpcHandbackRoute::Restart => {
                         return Err(RuntimeError::Configuration(
@@ -1811,5 +1835,38 @@ mod ipc_tests {
         let (state, completed) = settle_served_state(syscall_state(226, 0x5000), None);
         assert!(!completed);
         assert_eq!(x0_x1(&state).0, 0x5000, "a forwarded call keeps its frame");
+    }
+
+    #[test]
+    fn retained_copyin_owner_wait_is_killable_only() {
+        use carrick_kernel::kernel::continuation::ContinuationCompletion;
+        let interrupted = ContinuationCompletion::Errno(carrick_abi::LINUX_EINTR);
+        assert_eq!(
+            super::owned_owner_wait_interruption(
+                &interrupted,
+                true,
+                Some(carrick_abi::LINUX_SIGUSR1)
+            ),
+            None,
+            "ordinary signal remains pending until the owned write completes",
+        );
+        assert_eq!(
+            super::owned_owner_wait_interruption(
+                &interrupted,
+                true,
+                Some(carrick_abi::LINUX_SIGKILL)
+            ),
+            Some(DispatchOutcome::errno(carrick_abi::LINUX_EINTR)),
+            "fatal signal ends the wait for terminal delivery",
+        );
+        assert_eq!(
+            super::owned_owner_wait_interruption(
+                &ContinuationCompletion::Redispatch,
+                true,
+                Some(carrick_abi::LINUX_SIGKILL),
+            ),
+            Some(DispatchOutcome::errno(carrick_abi::LINUX_EINTR)),
+            "fatal signal wins even when owner release races the wake",
+        );
     }
 }

@@ -227,6 +227,35 @@ pub(super) enum OwnerSupplyWait {
     Physical(carrick_guest_mem::OwnedMemoryWait),
 }
 
+/// The syscall operation to resume after an owner-memory dependency.
+/// A retained transfer cannot fall through to numeric syscall redispatch.
+pub(super) enum OwnedSyscallResume {
+    Redispatch,
+    PreparedWrite(Box<carrick_kernel::dispatch::OwnedWriteCopyIn>),
+}
+
+fn owner_copyin_route(outcome: DispatchOutcome) -> (DispatchOutcome, Option<OwnedSyscallResume>) {
+    let DispatchOutcome::WriteCopyInSuspended(pending) = outcome else {
+        return (outcome, None);
+    };
+    let wait_outcome = match pending.wait().clone() {
+        carrick_guest_mem::MemoryReadWait::Owner(wait) => {
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        }
+        carrick_guest_mem::MemoryReadWait::Supply(request) => DispatchOutcome::OwnerMemorySupply {
+            request,
+            committed: 0,
+        },
+        carrick_guest_mem::MemoryReadWait::Physical(wait) => {
+            DispatchOutcome::OwnerPhysicalWait { wait, committed: 0 }
+        }
+    };
+    (
+        wait_outcome,
+        Some(OwnedSyscallResume::PreparedWrite(pending)),
+    )
+}
+
 pub(super) enum HvpatchProductionPhase {
     Resident,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -274,6 +303,7 @@ pub(super) enum HvpatchProductionPhase {
     /// syscall still owns completion; a wake re-enters its exact dispatch.
     ResumeOwnerZone {
         frame: carrick_hal::RawSyscall,
+        resume: OwnedSyscallResume,
     },
     ResumeRetainedOwner {
         action: Box<RetainedMemoryAction>,
@@ -290,6 +320,7 @@ pub(super) enum HvpatchProductionPhase {
     /// remains live while the job, not a pool worker, is blocked.
     ResumeOwnerPhysical {
         frame: carrick_hal::RawSyscall,
+        resume: OwnedSyscallResume,
         wait: carrick_guest_mem::OwnedMemoryWait,
         _subscription: Box<dyn std::fmt::Debug + Send + Sync>,
     },
@@ -3258,37 +3289,25 @@ where
         result
     }
 
-    pub(super) fn service_outcome(
+    pub(super) fn route_outcome(
         &mut self,
         engine: &mut E,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         frame: carrick_hal::RawSyscall,
         outcome: DispatchOutcome,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
-        if let DispatchOutcome::WriteCopyInSuspended(pending) = outcome {
-            let wait = pending.wait().clone();
-            if self.state.pending_write_copy_in.replace(pending).is_some() {
-                return Err(RuntimeError::Configuration(
-                    "write copy-in replaced a live transfer".to_owned(),
-                )
-                .into());
-            }
-            let wait_outcome = match wait {
-                carrick_guest_mem::MemoryReadWait::Owner(wait) => {
-                    DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
-                }
-                carrick_guest_mem::MemoryReadWait::Supply(request) => {
-                    DispatchOutcome::OwnerMemorySupply {
-                        request,
-                        committed: 0,
-                    }
-                }
-                carrick_guest_mem::MemoryReadWait::Physical(wait) => {
-                    DispatchOutcome::OwnerPhysicalWait { wait, committed: 0 }
-                }
-            };
-            return self.service_outcome(engine, control, frame, wait_outcome);
-        }
+        let (outcome, resume) = owner_copyin_route(outcome);
+        self.service_outcome(engine, control, frame, outcome, resume)
+    }
+
+    fn service_outcome(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        frame: carrick_hal::RawSyscall,
+        outcome: DispatchOutcome,
+        resume: Option<OwnedSyscallResume>,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         if let DispatchOutcome::OwnerMemorySupply { request, committed } = outcome {
             self.state.owner_read_progress = self
                 .state
@@ -3307,22 +3326,15 @@ where
                         DispatchOutcome::OwnerPhysicalWait { wait, committed: 0 }
                     }
                 };
-                return self.service_outcome(engine, control, frame, outcome);
+                return self.service_outcome(engine, control, frame, outcome, resume);
             }
-            let outcome = if self.state.pending_write_copy_in.is_some() {
-                self.state.resume_write_copy_in(
-                    &self.kernel,
-                    engine,
-                    control.submission.host_wait_context(),
-                )?
-            } else {
-                self.state.redispatch_threaded_syscall(
-                    &self.kernel,
-                    engine,
-                    control.submission.host_wait_context(),
-                )?
-            };
-            return self.service_outcome(engine, control, frame, outcome);
+            let outcome = self.state.resume_owned_syscall(
+                &self.kernel,
+                engine,
+                resume.unwrap_or(OwnedSyscallResume::Redispatch),
+                control.submission.host_wait_context(),
+            )?;
+            return self.route_outcome(engine, control, frame, outcome);
         }
         if let DispatchOutcome::OwnerMemoryWait { wait, committed } = outcome {
             self.state.owner_read_progress = self
@@ -3332,7 +3344,13 @@ where
                 .ok_or_else(|| {
                     RuntimeError::Configuration("owner read progress overflow".to_owned())
                 })?;
-            return self.owner_memory_park(engine, control, frame, wait);
+            return self.owner_memory_park(
+                engine,
+                control,
+                frame,
+                wait,
+                resume.unwrap_or(OwnedSyscallResume::Redispatch),
+            );
         }
         if let DispatchOutcome::OwnerPhysicalWait { wait, committed } = outcome {
             self.state.owner_read_progress = self
@@ -3353,23 +3371,17 @@ where
             let (subscription, ready) = wait.0.enroll(wake);
             if ready || wait.0.is_ready() {
                 drop(subscription);
-                let outcome = if self.state.pending_write_copy_in.is_some() {
-                    self.state.resume_write_copy_in(
-                        &self.kernel,
-                        engine,
-                        control.submission.host_wait_context(),
-                    )?
-                } else {
-                    self.state.redispatch_threaded_syscall(
-                        &self.kernel,
-                        engine,
-                        control.submission.host_wait_context(),
-                    )?
-                };
-                return self.service_outcome(engine, control, frame, outcome);
+                let outcome = self.state.resume_owned_syscall(
+                    &self.kernel,
+                    engine,
+                    resume.unwrap_or(OwnedSyscallResume::Redispatch),
+                    control.submission.host_wait_context(),
+                )?;
+                return self.route_outcome(engine, control, frame, outcome);
             }
             self.phase = HvpatchProductionPhase::ResumeOwnerPhysical {
                 frame,
+                resume: resume.unwrap_or(OwnedSyscallResume::Redispatch),
                 wait,
                 _subscription: subscription,
             };
@@ -4404,17 +4416,19 @@ where
             let phase = std::mem::replace(&mut self.phase, HvpatchProductionPhase::Resident);
             match phase {
                 HvpatchProductionPhase::ResumeZone => return self.resume_zone(engine, control),
-                HvpatchProductionPhase::ResumeOwnerZone { frame } => {
-                    return self.resume_owner_zone(engine, control, frame);
+                HvpatchProductionPhase::ResumeOwnerZone { frame, resume } => {
+                    return self.resume_owner_zone(engine, control, frame, resume);
                 }
                 HvpatchProductionPhase::ResumeOwnerPhysical {
                     frame,
+                    resume,
                     wait,
                     _subscription,
                 } => {
                     if !wait.0.is_ready() {
                         self.phase = HvpatchProductionPhase::ResumeOwnerPhysical {
                             frame,
+                            resume,
                             wait,
                             _subscription,
                         };
@@ -4426,20 +4440,13 @@ where
                         ));
                     }
                     drop(_subscription);
-                    let outcome = if self.state.pending_write_copy_in.is_some() {
-                        self.state.resume_write_copy_in(
-                            &self.kernel,
-                            engine,
-                            control.submission.host_wait_context(),
-                        )?
-                    } else {
-                        self.state.redispatch_threaded_syscall(
-                            &self.kernel,
-                            engine,
-                            control.submission.host_wait_context(),
-                        )?
-                    };
-                    return self.service_outcome(engine, control, frame, outcome);
+                    let outcome = self.state.resume_owned_syscall(
+                        &self.kernel,
+                        engine,
+                        resume,
+                        control.submission.host_wait_context(),
+                    )?;
+                    return self.route_outcome(engine, control, frame, outcome);
                 }
                 HvpatchProductionPhase::ResumeFaultPhysical {
                     wait,
@@ -4712,7 +4719,7 @@ where
                             .signal_pump
                             .start_signal_pump(&self.state.kicker, &self.state.platform_futex);
                     }
-                    return self.service_outcome(engine, control, frame, outcome);
+                    return self.route_outcome(engine, control, frame, outcome);
                 }
                 HvpatchProductionPhase::ExecSiblingDrain { context, owner } => {
                     if !owner.is_ready() {
@@ -5423,7 +5430,7 @@ where
         if let Some(park) = self.state.pending_ipc_park.take() {
             return self.ipc_park(engine, control, frame, park);
         }
-        self.service_outcome(engine, control, frame, outcome)
+        self.route_outcome(engine, control, frame, outcome)
     }
 
     fn poll_with_engine_typed(
@@ -6831,6 +6838,67 @@ mod tests {
     use carrick_guest_mem::GuestMemory;
     use std::num::NonZeroU64;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn owner_copyin_route_keeps_the_transfer_for_zone_resume() {
+        use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+        use carrick_guest_mem::{
+            CurrentMmMemory, MemoryError, MemoryReadSuspension, MemoryReadWait,
+            OwnedReadContinuation,
+        };
+
+        struct Suspended(PortalOwnerWait);
+        impl GuestMemory for Suspended {
+            fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+                Err(MemoryError::ReadSuspended(Box::new(MemoryReadSuspension {
+                    wait: MemoryReadWait::Owner(self.0),
+                    continuation: OwnedReadContinuation::new(b"copy".to_vec()),
+                })))
+            }
+            fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+                unreachable!()
+            }
+            fn resume_read(
+                &self,
+                continuation: OwnedReadContinuation,
+            ) -> Result<Vec<u8>, MemoryError> {
+                Ok(continuation.take::<Vec<u8>>().unwrap())
+            }
+        }
+        impl CurrentMmMemory for Suspended {}
+
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let wait = unsafe {
+            PortalOwnerWait::from_owner(
+                El1MmHandle::from_admitted_owner(
+                    NonZeroU64::new(1).unwrap(),
+                    ReservationMm::new(context.shared().mm().id().raw()).unwrap(),
+                    NonZeroU64::new(3).unwrap(),
+                ),
+                PortalWaitCause::Reservations,
+                7,
+            )
+        };
+        let request = carrick_kernel::dispatch::SyscallRequest::new(
+            carrick_abi::syscall::nr::WRITE.raw(),
+            carrick_kernel::compat::SyscallArgs::from([1, 0x200120, 4, 0, 0, 0]),
+        );
+        let reporter = carrick_kernel::compat::CompatReporter::default();
+        let mut memory = Suspended(wait);
+        let first = dispatcher
+            .dispatch(&context, request, &mut memory, &reporter)
+            .unwrap();
+        let (wait_outcome, resume) = super::owner_copyin_route(first);
+        assert_eq!(
+            wait_outcome,
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+        );
+        let Some(OwnedSyscallResume::PreparedWrite(pending)) = resume else {
+            panic!("owner route lost the exact transfer");
+        };
+        assert_eq!(pending.wait(), &MemoryReadWait::Owner(wait));
+    }
 
     #[test]
     fn retired_host_wait_finishes_only_its_thread_without_guest_return() {
