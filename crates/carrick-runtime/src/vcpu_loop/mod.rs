@@ -1103,7 +1103,7 @@ where
         })?;
         self.external_signals
             .publish(queue, target, |tid| {
-                kernel.dispatcher.host_signal.take_pending_for(tid)
+                kernel.dispatcher.host_signal.take_pending_event_for(tid)
             })
             .map_err(|error| RuntimeError::Configuration(format!("external ingress: {error:?}")))?;
         Ok(())

@@ -995,7 +995,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
         );
         self.external_signals
             .publish(self.physical.signal_ingress()?, target, |tid| {
-                host_signal.take_pending_for(tid)
+                host_signal.take_pending_event_for(tid)
             })
             .map_err(|error| TrapError::Hypervisor(format!("KVM external ingress: {error:?}")))?;
         if let Some(binding) = self.binding.as_ref().cloned()

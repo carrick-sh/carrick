@@ -45,6 +45,19 @@ use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 /// delivery ever uses signum 0.
 pub const NO_PENDING_SIGNAL: i32 = 0;
 
+/// Scope survives the host bridge and must be retained by native ingress.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingSignalScope {
+    Process,
+    Thread,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingSignalEvent {
+    pub signum: i32,
+    pub scope: PendingSignalScope,
+}
+
 /// `THREAD_PENDING` bit for `signum` (bit `signum-1`), or 0 if out of range.
 pub fn thread_pending_bit(signum: i32) -> u64 {
     pending_bit(signum).unwrap_or(0)
@@ -223,6 +236,13 @@ fn take_proc_pending_in(wait_set: SigSet) -> i32 {
 /// Returns `0` (`NO_PENDING_SIGNAL`) if neither is set. This is the single point
 /// of consumption (called under the dispatcher lock in `deliver_pending_signal`).
 pub fn take_pending_for(tid: i32) -> i32 {
+    take_pending_event_for(tid).map_or(NO_PENDING_SIGNAL, |event| event.signum)
+}
+
+/// Consume one host event while preserving whether it was directed to the
+/// process or the exact thread. Ingress cannot infer this from the polling
+/// thread: doing so strands SIGINT when that thread blocks it or exits.
+pub fn take_pending_event_for(tid: i32) -> Option<PendingSignalEvent> {
     // Lock-free empty fast path: a clear hint bit proves no THREAD_PENDING
     // entry for this tid exists (see THREAD_PENDING_TID_HINT), so the global
     // mutex + map lookup is skipped on the hot no-signal-pending path.
@@ -238,10 +258,17 @@ pub fn take_pending_for(tid: i32) -> i32 {
                 map.remove(&tid);
                 recompute_tid_hint(&guard);
             }
-            return signum;
+            return Some(PendingSignalEvent {
+                signum,
+                scope: PendingSignalScope::Thread,
+            });
         }
     }
-    take_proc_pending_in(SigSet::EMPTY.complement())
+    let signum = take_proc_pending_in(SigSet::EMPTY.complement());
+    (signum != NO_PENDING_SIGNAL).then_some(PendingSignalEvent {
+        signum,
+        scope: PendingSignalScope::Process,
+    })
 }
 
 /// Drain a signal pending for `tid` only if it intersects `wait_set`. Used by
