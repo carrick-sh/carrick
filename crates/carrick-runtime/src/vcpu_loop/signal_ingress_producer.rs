@@ -207,6 +207,55 @@ mod tests {
     }
 
     #[test]
+    fn serial_host_process_event_queued_across_exec_keeps_task_serial() {
+        let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
+            101,
+            carrick_hal::ThreadId::synthetic_for_tests(218),
+            "queued-exec-signal".to_owned(),
+        )
+        .unwrap();
+        let (kernel, context) = carrick_kernel::kernel::Kernel::bootstrap_root(bootstrap).unwrap();
+        let control = context.thread().control_slot();
+        control.bind_zone_record(RecordRef {
+            id: RecordId::from_raw(4).unwrap(),
+            incarnation: 9,
+        });
+        let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
+        custody.commit_registration();
+        custody.commit_native_signal_owner();
+        let queue = SignalIngressQueue::<2>::new();
+        let mut producer = HostSignalIngressProducer::new();
+        carrick_signal_linux::publish_process_signal(2);
+        assert_eq!(
+            producer
+                .publish(
+                    &queue,
+                    HostIngressTarget::from_context(&context),
+                    carrick_signal_linux::take_pending_event_for,
+                )
+                .unwrap(),
+            HostIngressStep::Published
+        );
+        let before = context.task().key();
+        let prepared = kernel.prepare_exec(&context, None).unwrap();
+        let replacement = kernel.commit_exec(prepared, None).unwrap();
+        let queued = queue.take().unwrap();
+        assert_eq!(replacement.task().key().serial, before.serial);
+        assert_eq!(
+            queued.process_generation().raw(),
+            replacement.task().key().serial.raw()
+        );
+        assert_eq!(
+            queued.process_id().raw(),
+            replacement.task().key().id.raw() as u64
+        );
+        assert_eq!(
+            queued.scope(),
+            carrick_el1_abi::ExternalSignalScope::Process
+        );
+    }
+
+    #[test]
     fn full_external_ingress_parks_exact_signal_and_continues_after_drain() {
         let queue = SignalIngressQueue::<2>::new();
         let binding = ExecutionBinding {
