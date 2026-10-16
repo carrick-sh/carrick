@@ -2541,6 +2541,12 @@ pub(crate) mod tests {
     use carrick_guest_mem::GuestMemory;
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn arm_signal_domain_has_no_carrier_consumer() {
+        assert!(!carrier_signal_selection_permitted(true));
+        assert!(carrier_signal_selection_permitted(false));
+    }
+
     struct ContinueInterceptor;
 
     impl carrick_kernel::observe::SyscallInterceptor for ContinueInterceptor {
