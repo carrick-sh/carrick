@@ -339,6 +339,15 @@ impl<const N: usize> SignalIngressQueue<N> {
 mod tests {
     extern crate std;
     use super::*;
+
+    #[test]
+    fn shared_ingress_issues_distinct_event_generations() {
+        let queue = SignalIngressQueue::<2>::new();
+        let first = queue.issue_event_generation().unwrap();
+        let second = queue.issue_event_generation().unwrap();
+        assert_ne!(first, second);
+        assert!(first.raw() < second.raw());
+    }
     use carrick_core_abi::{EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration};
     use carrick_sched_core::RecordId;
 
