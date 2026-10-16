@@ -1324,6 +1324,10 @@ path = "crates/carrick-el1-abi/src/signal_ingress.rs"
 contracts = ["kernel.el1.signal-delivery-owner"]
 
 [[surfaces]]
+path = "crates/carrick-runtime/src/vcpu_loop/signal_ingress_producer.rs"
+contracts = ["kernel.el1.signal-delivery-owner"]
+
+[[surfaces]]
 path = "crates/carrick-signal-core/src/policy.rs"
 contracts = ["kernel.el1.signal-delivery-owner"]
 
