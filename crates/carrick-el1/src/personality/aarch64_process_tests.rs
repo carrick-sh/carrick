@@ -1642,7 +1642,7 @@ pub fn with_native_terminal_host_handback(
             .page
             .publish_host_birth(birth, sibling.host_birth_identity().unwrap())
     );
-    assert_eq!(fixture.page.live(), 2);
+    ::core::assert_eq!(fixture.page.live(), 2);
     let mut service = Aarch64NativeProcessService::with_crossing(
         &fixture.task,
         fixture.slot,
@@ -1667,7 +1667,7 @@ pub fn with_native_terminal_host_handback(
     fixture
         .page
         .publish_exact_host_retirement(&sibling, sibling.host_birth_identity().unwrap());
-    assert_eq!(fixture.page.live(), 0);
+    ::core::assert_eq!(fixture.page.live(), 0);
     let guard = fixture
         .zone
         .lock(

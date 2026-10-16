@@ -765,7 +765,13 @@ const OBJECT_HOST_CONTINUATION: u32 = 2;
 const OWNER_CONTINUATION: u32 = 4;
 
 /// The owner decides whether a readiness notification completes a user call.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum ResumeDisposition {
     UserReturn,
     OwnerContinuation,
