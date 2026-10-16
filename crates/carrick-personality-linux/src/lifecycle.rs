@@ -219,7 +219,7 @@ pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::
     fn pid_exists(&self, _pid: u32) -> Option<bool> {
         None
     }
-    fn fork(&mut self) -> LifecycleOutcome;
+    fn fork(&mut self, child_tid: ProcessForkChildTid) -> LifecycleOutcome;
     fn wait4(
         &mut self,
         pid: ProcessWaitPid,
@@ -374,9 +374,8 @@ pub trait LifecycleNative<'a>: UserCopy {
     fn run_next(&mut self, timeout_result: SyscallResult) -> (Served, SyscallResult);
     fn result(&self) -> SyscallResult;
     fn set_result(&mut self, result: SyscallResult);
-    /// Native custody for a process fork. The shared owner selects this only
-    /// for an x86 process call with an admitted guest process venue.
-    fn process_fork(&mut self) -> Option<LifecycleOutcome> {
+    /// Native custody for an admitted process fork through the guest process venue.
+    fn process_fork(&mut self, _child_tid: ProcessForkChildTid) -> Option<LifecycleOutcome> {
         None
     }
     fn process_wait4(
@@ -434,6 +433,28 @@ const CLONE_DETACHED: u64 = 0x0040_0000;
 const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 /// The low byte: the child's exit signal. A thread has none.
 const CSIGNAL: u64 = 0xff;
+
+/// Child-only TID effects of a process fork. The address belongs to the new
+/// MM, so callers must not copy it through the parent's UserCopy aperture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessForkChildTid {
+    pub address: UserVa,
+    pub set: bool,
+    pub clear: bool,
+}
+
+impl ProcessForkChildTid {
+    pub const NONE: Self = Self {
+        address: UserVa::new(0),
+        set: false,
+        clear: false,
+    };
+
+    pub const fn flags(self) -> u64 {
+        (if self.set { CLONE_CHILD_SETTID } else { 0 })
+            | (if self.clear { CLONE_CHILD_CLEARTID } else { 0 })
+    }
+}
 
 /// Every flag a libc or Go thread creation passes.
 const THREAD_CLONE_REQUIRED: u64 =
@@ -518,17 +539,27 @@ pub fn invoke<'a>(
     {
         return Some(returned(SyscallResult::new(i64::from(tid)), false));
     }
-    // Without the corresponding CLONE_* flags, Linux ignores parent_tid,
-    // tls and child_tid. libc's fork wrapper only initializes flags and
-    // stack; stale argument registers must not turn that fork into ENOSYS.
+    // clone(2): only SIGCHLD with child-local TID effects is equivalent to
+    // fork here. CLONE_VM/THREAD, shared tables, other exit signals and extra
+    // arguments keep their existing thread-path refusal and errno.
     if call == LifecycleCall::Clone
-        && args[0] == carrick_signal_core::policy::Signal::CHLD.number() as u64
+        && args[0] & !(CSIGNAL | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) == 0
+        && args[0] & CSIGNAL == carrick_signal_core::policy::Signal::CHLD.number() as u64
         && args[1] == 0
+        && args[2] == 0
+        && args[3] == 0
+        && args[5] == 0
+        && ((args[0] & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) != 0 && args[4] != 0)
+            || (args[0] & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) == 0 && args[4] == 0))
     {
-        return native.process_fork();
+        return native.process_fork(ProcessForkChildTid {
+            address: UserVa::new(args[4]),
+            set: args[0] & CLONE_CHILD_SETTID != 0,
+            clear: args[0] & CLONE_CHILD_CLEARTID != 0,
+        });
     }
     match call {
-        LifecycleCall::Fork => return native.process_fork(),
+        LifecycleCall::Fork => return native.process_fork(ProcessForkChildTid::NONE),
         LifecycleCall::Wait4 => {
             return native.process_wait4(
                 ProcessWaitPid::from_syscall_argument(args[0]),

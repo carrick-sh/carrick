@@ -720,7 +720,16 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         self.frame.rax = result.raw() as u64;
     }
     #[cfg(target_os = "none")]
-    fn process_fork(&mut self) -> Option<LifecycleOutcome> {
+    fn process_fork(
+        &mut self,
+        child_tid: carrick_personality_linux::lifecycle::ProcessForkChildTid,
+    ) -> Option<LifecycleOutcome> {
+        // This bounded CPL0 fixture has no child-MM copy aperture. Keep its
+        // former ENOSYS for TID-bearing clones until that owner can publish
+        // the child-only write and wake, instead of reporting false success.
+        if child_tid.set || child_tid.clear {
+            return None;
+        }
         if !crate::process::process_mode()
             || self.lane.slot.raw() != 0
             || self.task.mm.key.load(Ordering::Acquire) != crate::process::parent_mm()
