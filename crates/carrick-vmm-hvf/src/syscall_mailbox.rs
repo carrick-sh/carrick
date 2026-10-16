@@ -1025,6 +1025,18 @@ impl MailboxBinding {
     }
 
     pub fn publish_normal_return(&mut self, value: i64) -> Result<(), MailboxConsumeError> {
+        self.publish_return_with_action(value, MailboxResponseAction::NormalReturn)
+    }
+
+    pub fn publish_native_signal_return(&mut self, value: i64) -> Result<(), MailboxConsumeError> {
+        self.publish_return_with_action(value, MailboxResponseAction::NativeSignalCheckpoint)
+    }
+
+    fn publish_return_with_action(
+        &mut self,
+        value: i64,
+        action: MailboxResponseAction,
+    ) -> Result<(), MailboxConsumeError> {
         self.require_request_ready()?;
         // SAFETY: the host owns RequestReady and publishes state only after both
         // payload stores complete.
@@ -1035,7 +1047,7 @@ impl MailboxBinding {
             );
             self.write_volatile(
                 core::ptr::addr_of_mut!((*self.host.as_ptr()).response_action),
-                MailboxResponseAction::NormalReturn.raw(),
+                action.raw(),
             );
         }
         self.state()
@@ -1114,7 +1126,8 @@ impl MailboxBinding {
         match MailboxResponseAction::try_from(action) {
             Ok(
                 MailboxResponseAction::NormalReturn
-                | MailboxResponseAction::NormalReturnAndArmPortal,
+                | MailboxResponseAction::NormalReturnAndArmPortal
+                | MailboxResponseAction::NativeSignalCheckpoint,
             ) => Ok(Some(value as i64)),
             Ok(MailboxResponseAction::RegistersPrepared) => Ok(None),
             Err(unknown) => Err(MailboxConsumeError::Protocol(

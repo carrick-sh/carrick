@@ -1466,6 +1466,34 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         state.members.get(key).map(|member| member.runtime.clone())
     }
 
+    /// Cheap read-only signal checkpoint predicate before an ARM hardware
+    /// context is saved. The record index and process graph remain the same
+    /// authority used by the delivery owner; a stale record is never treated
+    /// as an empty signal set.
+    pub fn signal_checkpoint_needed(&self, zone: &ZoneTables<C>, record: RecordRef) -> bool {
+        let state = self.state.lock();
+        let Some(key) = state.records.get(&Self::record_key(zone, record)) else {
+            return true;
+        };
+        let Some(member) = state.members.get(key) else {
+            return true;
+        };
+        let graph = member.runtime.graph.lock();
+        let Ok(row) = graph.owner.task(member.process) else {
+            return true;
+        };
+        if graph.suspend_masks.contains_key(&record) {
+            return true;
+        }
+        let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+            carrick_signal_core::SignalSet::from_bits(member.control.blocked().0),
+        );
+        row.native()
+            .resources()
+            .signals()
+            .has_deliverable(record, blocked)
+    }
+
     fn external_member<'s>(
         state: &'s NativeRegistryState<'a, M, C>,
         zone: &ZoneTables<C>,
@@ -1482,6 +1510,50 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         .then_some(member)
     }
 
+    fn external_event_member<'s>(
+        state: &'s NativeRegistryState<'a, M, C>,
+        zone: &ZoneTables<C>,
+        event: carrick_el1_abi::ExternalSignalRecord,
+    ) -> Option<&'s NativeOwnerMember<'a, M, C>> {
+        if event.scope() == carrick_el1_abi::ExternalSignalScope::Thread {
+            return Self::external_member(state, zone, event);
+        }
+        // A process-directed event may outlive the polling thread or an
+        // execve MM replacement. Authenticate the durable process generation,
+        // then choose a surviving member of that exact process. The original
+        // thread record is only an observation, never the target owner.
+        if !event.identity().issued()
+            || !event.identity().matches(event.binding())
+            || event.binding().generation != event.process_generation()
+        {
+            return None;
+        }
+        let carrier = core::ptr::from_ref(zone).addr();
+        let (_, keys) = state
+            .by_process
+            .iter()
+            .find_map(|((place, process), group)| {
+                (*place == carrier
+                    && process.id.raw() as u64 == event.process_id().raw()
+                    && process.serial.raw() == event.process_generation().raw())
+                .then_some(group)
+            })?;
+        let mut fallback = None;
+        for key in keys {
+            let Some(member) = state.members.get(key) else {
+                continue;
+            };
+            fallback.get_or_insert(member);
+            let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                carrick_signal_core::SignalSet::from_bits(member.control.blocked().0),
+            );
+            if !blocked.contains(event.signal()) {
+                return Some(member);
+            }
+        }
+        fallback
+    }
+
     /// Resolve one ingress event through the exact live member index. A tid,
     /// MM, or record slot on its own is never authority to admit a signal.
     pub fn for_external_event(
@@ -1490,7 +1562,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         event: carrick_el1_abi::ExternalSignalRecord,
     ) -> Option<Arc<NativeProcessRuntime<'a, M, C>>> {
         let state = self.state.lock();
-        let member = Self::external_member(&state, zone, event)?;
+        let member = Self::external_event_member(&state, zone, event)?;
         let graph = member.runtime.graph.lock();
         let row = graph.owner.task(member.process).ok()?;
         let resources = row.native().resources();
@@ -1511,7 +1583,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         service: &mut S,
     ) -> Result<bool, NativeProcessError> {
         let state = self.state.lock();
-        let Some(member) = Self::external_member(&state, zone, event) else {
+        let Some(member) = Self::external_event_member(&state, zone, event) else {
             return Ok(false);
         };
         let graph = member.runtime.graph.lock();
@@ -1524,7 +1596,17 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         }
         let signals = resources.signals().clone();
         let channel = resources.channel.clone();
-        signals.enqueue_thread(member.record, event.signal(), None);
+        let wake_record = member.record;
+        match event.scope() {
+            carrick_el1_abi::ExternalSignalScope::Process => {
+                signals
+                    .enqueue(member.process, event.signal(), None)
+                    .map_err(|_| NativeProcessError::Stale)?;
+            }
+            carrick_el1_abi::ExternalSignalScope::Thread => {
+                signals.enqueue_thread(member.record, event.signal(), None);
+            }
+        }
         let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
             carrick_signal_core::SignalSet::from_bits(member.control.blocked().0),
         );
@@ -1550,7 +1632,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             )?;
         }
         if interrupt {
-            request_signal_reschedule(zone, service, event.record());
+            request_signal_reschedule(zone, service, wake_record);
         }
         if let Some(channel) = channel {
             publish_signal_channel(
@@ -2805,6 +2887,29 @@ pub struct NativeProcessEntry<
     // Captured by native admission under its existing graph guard. Ordinary
     // syscall dispatch does not acquire another graph lock for this checkpoint.
     owner_continuation: bool,
+}
+
+impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
+    NativeProcessEntry<'r, 'a, M, C, S>
+{
+    /// Test pending native work before the ISA saves FP/SIMD for delivery.
+    /// A suspended mask needs its restoration even if no signal is pending.
+    pub fn signal_checkpoint_needed(&self) -> bool {
+        let graph = self.runtime.graph.lock();
+        let Ok(row) = graph.owner.task(self.key) else {
+            return true;
+        };
+        if graph.suspend_masks.contains_key(&self.record) {
+            return true;
+        }
+        let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+            carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
+        );
+        row.native()
+            .resources()
+            .signals()
+            .has_deliverable(self.record, blocked)
+    }
 }
 // Enrollment and committed settlement wait only for another party's short
 // bucket section. No graph guard is retained while acquiring this lock.

@@ -2292,7 +2292,14 @@ where
                 "threaded syscall completed without guest completion ownership".to_owned(),
             ));
         }
-        engine.complete_syscall(value)?;
+        if self.service_kernel_context.as_ref().is_some_and(|context| {
+            context.thread().control_slot().native_signal_owner()
+                && context.lifecycle_page().gate().serves_ring()
+        }) {
+            engine.complete_native_signal_return(value)?;
+        } else {
+            engine.complete_syscall(value)?;
+        }
         let SyscallCompletionOwnership::Guest(completion) = std::mem::replace(
             &mut self.syscall_completion,
             SyscallCompletionOwnership::Idle,
