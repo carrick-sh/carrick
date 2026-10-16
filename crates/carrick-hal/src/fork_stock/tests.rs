@@ -501,8 +501,12 @@ fn stale_lifecycle_record_is_withdrawn_and_refused_on_every_carrier() {
 
 /// Host bytes of an x86 CPL0 metadata window, aligned like the retained
 /// carrier mapping.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct AlignedMetadataChunk([u64; 8]);
+
 struct MetadataBytes {
-    words: Vec<u64>,
+    chunks: Vec<AlignedMetadataChunk>,
 }
 
 const X86_METADATA_LEN: u64 = 0x10_0000;
@@ -511,12 +515,12 @@ const X86_FORK_LIFECYCLE_OFFSET: u64 = 0x8_8000;
 impl MetadataBytes {
     fn new() -> Self {
         Self {
-            words: vec![0; (X86_METADATA_LEN / 8) as usize],
+            chunks: vec![AlignedMetadataChunk([0; 8]); (X86_METADATA_LEN / 64) as usize],
         }
     }
 
     fn window(&mut self) -> LifecycleWindow {
-        let host = core::ptr::NonNull::new(self.words.as_mut_ptr().cast::<u8>()).unwrap();
+        let host = core::ptr::NonNull::new(self.chunks.as_mut_ptr().cast::<u8>()).unwrap();
         // SAFETY: the vector outlives every use of the window in the test.
         unsafe {
             LifecycleWindow::new(
@@ -533,13 +537,18 @@ fn x86_lifecycles(count: u64) -> Vec<ForkLifecycleLoan> {
     lifecycle_slots(base, base + X86_FORK_LIFECYCLE_OFFSET, count).unwrap()
 }
 
-/// The guest initializes its census in the loaned record before any task.
+/// The guest initializes its census in the loaned record before any task, and
+/// releases its control custody before the MM's lifecycle window is reclaimed.
 fn guest_initializes(window: LifecycleWindow, lifecycle: ForkLifecycleLoan) {
     let ranges = window.ranges(lifecycle).unwrap();
-    for (ptr, len) in ranges {
-        // SAFETY: in-window test bytes.
-        unsafe { core::ptr::write_bytes(ptr, 0xa5, len) };
-    }
+    // SAFETY: in-window test bytes.
+    unsafe { core::ptr::write_bytes(ranges[0].0, 0xa5, ranges[0].1) };
+    let control = unsafe { &*ranges[1].0.cast::<carrick_el1_abi::ThreadControlSlot>() };
+    assert!(control.publish_visible_tid(42));
+    let custody = carrick_el1_abi::MemberControlCustody::retain(control).unwrap();
+    custody.commit_registration();
+    drop(custody);
+    assert!(!control.graph_referenced());
     assert!(!window.is_zero(lifecycle));
 }
 
@@ -592,6 +601,65 @@ fn kvm_lifecycle_window_cycles_exceed_stock_with_cleared_records() {
     }
     assert_eq!(stock.counters().returned_children, 9);
     assert_eq!(stock.counters().capacity_refusals, 0);
+}
+
+#[test]
+fn lifecycle_window_clear_refuses_graph_referenced_control_and_defers_reclaim() {
+    let mut bytes = MetadataBytes::new();
+    let window = bytes.window();
+    let mut stock = ForkStock::new(CARRIER, 0x1_0000_0000, UntaggedRoots);
+    stock
+        .install(
+            (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            x86_lifecycles(1),
+        )
+        .unwrap();
+    let granted = x86_loan(&mut stock, window, 302).unwrap();
+    let ranges = window.ranges(granted.lifecycle).unwrap();
+    // SAFETY: in-window test bytes aligned to 64 bytes.
+    let control = unsafe { &*ranges[1].0.cast::<carrick_el1_abi::ThreadControlSlot>() };
+    assert!(control.publish_visible_tid(42));
+    let custody = carrick_el1_abi::MemberControlCustody::retain(control).unwrap();
+    custody.commit_registration();
+    assert!(control.graph_referenced());
+    commit(&mut stock, parent(), granted, 1, 0).unwrap();
+    retire(&mut stock, child_of(granted, 900)).unwrap();
+
+    // While the process graph still holds `MemberControlCustody` on the child's
+    // loaned control slot, `window.clear` refuses to zero it and `reclaim`
+    // defers the child rather than clobbering a referenced control slot.
+    assert!(!window.clear(granted.lifecycle));
+    let deferred = stock
+        .reclaim(
+            &mut NoTableLedger,
+            mm(PARENT_MM),
+            absent,
+            |_| true,
+            |life| window.clear(life),
+            |_| true,
+        )
+        .unwrap();
+    assert_eq!(deferred, 0);
+    assert_eq!(stock.counters().reclaim_deferrals, 1);
+    assert!(stock.is_quarantined(mm(302)));
+    assert!(control.graph_referenced());
+
+    // Once the graph drops its custody before reclaim, `window.clear` zeroes
+    // the record and `reclaim` returns the child's stock.
+    drop(custody);
+    assert!(!control.graph_referenced());
+    let returned = stock
+        .reclaim(
+            &mut NoTableLedger,
+            mm(PARENT_MM),
+            absent,
+            |_| true,
+            |life| window.clear(life),
+            |_| true,
+        )
+        .unwrap();
+    assert_eq!(returned, 1);
+    assert!(window.is_zero(granted.lifecycle));
 }
 
 #[test]

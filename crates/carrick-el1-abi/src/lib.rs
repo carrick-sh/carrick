@@ -1214,6 +1214,10 @@ impl CurrentTask {
             .generation
             .store(generation, Ordering::Release);
         self.linux.file_table.store(file_table, Ordering::Release);
+        self.linux.fixup_pc.store(0, Ordering::Relaxed);
+        self.linux.orig_arg0.store(0, Ordering::Relaxed);
+        self.linux.pending_host_work.store(0, Ordering::Release);
+        self.linux.served_with_work.store(0, Ordering::Release);
     }
 }
 
@@ -4232,6 +4236,28 @@ mod tests {
         assert_eq!(task.execution.generation.load(Ordering::Relaxed), 0);
         assert_eq!(task.linux.file_table.load(Ordering::Relaxed), 0);
         assert_eq!(task.root_generation(), None);
+    }
+
+    #[test]
+    fn current_task_set_clears_per_cpu_pending_and_served_work_across_switch() {
+        let task = CurrentTask::new();
+        task.set(El1TaskId::from_linux_tid(42), 11, 200);
+        task.linux.fixup_pc.store(0x401000, Ordering::Relaxed);
+        task.linux.orig_arg0.store(0xdead_beef, Ordering::Relaxed);
+        task.linux.mark_pending_host_work();
+        task.linux.record_completed_with_work();
+        assert!(task.linux.has_pending_host_work());
+
+        // Switching the slot to the next runnable task must not leak the
+        // exiting or suspended task's per-CPU pending/served work flags.
+        task.set(El1TaskId::from_linux_tid(41), 12, 100);
+        assert_eq!(task.execution.task.load(Ordering::Relaxed), 41);
+        assert_eq!(task.execution.generation.load(Ordering::Relaxed), 12);
+        assert_eq!(task.linux.file_table.load(Ordering::Relaxed), 100);
+        assert_eq!(task.linux.fixup_pc.load(Ordering::Relaxed), 0);
+        assert_eq!(task.linux.orig_arg0.load(Ordering::Relaxed), 0);
+        assert!(!task.linux.has_pending_host_work());
+        assert_eq!(task.linux.take_served_boundary(), None);
     }
 
     #[test]

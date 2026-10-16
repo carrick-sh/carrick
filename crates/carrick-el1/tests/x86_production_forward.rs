@@ -284,7 +284,8 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         NativeProcessRuntime, NativeProcessService,
     };
     use carrick_el1_abi::{
-        BornInZoneSource, ThreadControlSlot, ThreadIdentity, ThreadLifecyclePage,
+        BornInZoneSource, DelegatedOpenFile, FD_MAP_CAPACITY, FdMapSlot, ThreadControlSlot,
+        ThreadIdentity, ThreadLifecyclePage,
     };
     use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
     use carrick_mmu_core::x86::owner_mmu::X86Mmu;
@@ -295,9 +296,13 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
 
     struct StockReclaimingService<'a> {
         zone: &'a ZoneTables<ParkedContextWords>,
-        child_page: ThreadLifecyclePage,
-        child_controls: [ThreadControlSlot; 9],
+        child_page: &'a ThreadLifecyclePage,
+        child_controls: &'a [ThreadControlSlot; 9],
+        task: &'a CurrentTask,
+        fd_map: [FdMapSlot; FD_MAP_CAPACITY],
+        opens: [DelegatedOpenFile; 1],
         retired_count: usize,
+        retired_fd_tables: Vec<u64>,
     }
 
     fn context_words(address: AddressContext<RootGpa>) -> ParkedContextWords {
@@ -336,12 +341,9 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         }
 
         fn child_lifecycle(&self, _: &Self::PreparedMm) -> NativeLifecycleResources<'a> {
-            // SAFETY: `self` outlives every NativeProcessEntry in this test.
-            unsafe {
-                NativeLifecycleResources {
-                    page: &*(&self.child_page as *const _),
-                    controls: &*(&self.child_controls[..] as *const _),
-                }
+            NativeLifecycleResources {
+                page: self.child_page,
+                controls: self.child_controls,
             }
         }
 
@@ -397,13 +399,25 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
                     .all(|control| !control.graph_referenced()),
                 "retiring a fork child MM must not leave control custody alive on its loaned stock"
             );
-            for control in &mut self.child_controls {
-                *control = ThreadControlSlot::new();
+            for control in self.child_controls {
+                control
+                    .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
+                    .expect("unreferenced control resets through interior mutability");
             }
             self.retired_count += 1;
         }
 
         fn wake_effects(&mut self, _: WakeEffects) {}
+
+        fn child_file_table(&self, _parent_table: u64, issued: u64) -> u64 {
+            issued
+        }
+
+        fn retire_fd_table(&mut self, table: u64) {
+            carrick_el1::personality::file_table::retire_fd_map(&self.fd_map, &self.opens, table);
+            self.task.linux.mark_pending_host_work();
+            self.retired_fd_tables.push(table);
+        }
     }
 
     let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
@@ -418,6 +432,9 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
     >::new()));
     let page = Box::new(ThreadLifecyclePage::new());
     let control = Box::new(ThreadControlSlot::new());
+    let child_page = Box::new(ThreadLifecyclePage::new());
+    let child_controls: Box<[ThreadControlSlot; 9]> =
+        Box::new(core::array::from_fn(|_| ThreadControlSlot::new()));
     let task = CurrentTask::new();
     let peer_task = CurrentTask::new();
     task.set(El1TaskId::from_linux_tid(41), 11, 5);
@@ -458,9 +475,13 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
     let source = BornInZoneSource { zone: &zone, slot };
     let mut service = StockReclaimingService {
         zone: &zone,
-        child_page: ThreadLifecyclePage::new(),
-        child_controls: core::array::from_fn(|_| ThreadControlSlot::new()),
+        child_page: &child_page,
+        child_controls: &child_controls,
+        task: &peer_task,
+        fd_map: [const { FdMapSlot::new() }; FD_MAP_CAPACITY],
+        opens: [const { DelegatedOpenFile::new() }; 1],
         retired_count: 0,
+        retired_fd_tables: Vec::new(),
     };
     let runtime = Arc::new(
         NativeProcessRuntime::admit_fresh_root::<X86Mmu>(
@@ -519,6 +540,13 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         .store(identity.serial, Ordering::Release);
     peer_task.publish_visible_pid(child_pid);
     peer_task.publish_lifecycle(identity.lifecycle_page, identity.control_slot);
+    // Give the child the last reference to a host-backed open file description
+    // in its file table so `retire_fd_table` -> `retire_fd_map` exercises
+    // `OpenRelease::Terminal` (`mark_pending_host_work_for_file_tables`) as
+    // well as `retire_fd_table`'s `mark_pending_host_work`.
+    assert!(service.opens[0].lifetime.initialize(1, false));
+    service.opens[0].generation.store(1, Ordering::Release);
+    service.fd_map[0].set(identity.file_table, 3, 1, 1);
     let peer_source = BornInZoneSource {
         zone: &zone,
         slot: peer_slot,
@@ -543,12 +571,30 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         ));
     }
     assert_eq!(service.retired_count, 1);
+    assert_eq!(service.retired_fd_tables, vec![identity.file_table]);
     assert!(
-        !service.child_controls[0].graph_referenced(),
+        !service.opens[0].lifetime.retain(1),
+        "child exit must release the last reference to its open file description"
+    );
+    assert!(
+        peer_task.linux.has_pending_host_work(),
+        "retire_fd_table marks pending_host_work while the exiting child owns CurrentTask"
+    );
+    assert!(
+        !child_controls[0].graph_referenced(),
         "dropping NativeProcessEntry after exit_group must not underflow reclaimed control stock"
     );
     assert!(
-        MemberControlCustody::retain(&service.child_controls[0]).is_ok(),
+        MemberControlCustody::retain(&child_controls[0]).is_ok(),
         "reclaimed control stock must accept a fresh retain after child exit completes"
     );
+    // When `schedule(peer_slot)` switches in the next runnable thread via
+    // `CurrentTask::set`, the exited child's per-CPU `pending_host_work` must
+    // not survive the task switch.
+    peer_task.set(El1TaskId::from_linux_tid(41), 11, 5);
+    assert!(
+        !peer_task.linux.has_pending_host_work(),
+        "switching CurrentTask to the next runnable thread must clear pending_host_work"
+    );
+    assert_eq!(peer_task.linux.take_served_boundary(), None);
 }
