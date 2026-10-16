@@ -69,7 +69,7 @@ pub(crate) fn cross_hvc_fork_refusal(record: &carrick_el1_abi::NativeForkDiagnos
     }
 }
 
-pub(crate) fn cross_hvc_fork_stock(record_gpa: u64, cpu: u64) -> Result<(), ()> {
+pub(crate) fn cross_hvc_fork_stock(record_gpa: u64, cpu: u64) -> Result<(), u64> {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
         let mut status: u64 = carrick_el1_abi::GRANT_OP_FORK_STOCK;
@@ -84,7 +84,7 @@ pub(crate) fn cross_hvc_fork_stock(record_gpa: u64, cpu: u64) -> Result<(), ()> 
             );
         }
         if status != 0 {
-            return Err(());
+            return Err(status);
         }
         Ok(())
     }

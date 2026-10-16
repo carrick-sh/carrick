@@ -1093,6 +1093,10 @@ path = "crates/carrick-el1/src/personality/aarch64_process.rs"
 contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.terminal-child", "process.native.arm-admission"]
 
 [[surfaces]]
+path = "crates/carrick-el1/src/personality/native_fork_refusal.rs"
+contracts = ["process.native.arm-admission"]
+
+[[surfaces]]
 path = "crates/carrick-el1/src/personality/aarch64_process_tests.rs"
 contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.terminal-child", "process.native.arm-admission"]
 
