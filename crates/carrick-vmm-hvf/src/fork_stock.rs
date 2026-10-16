@@ -55,6 +55,7 @@ impl ForkStockHostCustody {
         let mut arenas = Vec::new();
         let mut tables = Vec::new();
         for root in resources.tables.arenas() {
+            let epoch = crate::trap::next_structural_epoch()?;
             let base = root.address().raw();
             let len = crate::frame_pool::ROOT_SLOT_SIZE;
             let perms = u64::from(applevisor::memory::MemPerms::ReadWriteExec);
@@ -66,13 +67,7 @@ impl ForkStockHostCustody {
                     arena.record_populated_prefix(len);
                     lease.mark_pre_mapped();
                     crate::trap::StructuralBackingOwner::new_pooled_root_in(
-                        custody,
-                        arena,
-                        lease,
-                        perms,
-                        crate::trap::next_structural_epoch()?,
-                        base,
-                        len,
+                        custody, arena, lease, perms, epoch, base, len,
                     )?
                 } else {
                     // Same retained structural backing used by host roots outside
@@ -91,13 +86,7 @@ impl ForkStockHostCustody {
                     }
                     lease.mark_mapped();
                     crate::trap::StructuralBackingOwner::new_in(
-                        custody,
-                        mapping,
-                        lease,
-                        perms,
-                        crate::trap::next_structural_epoch()?,
-                        base,
-                        len,
+                        custody, mapping, lease, perms, epoch, base, len,
                     )?
                 };
             for offset in (0..len).step_by(4096) {
