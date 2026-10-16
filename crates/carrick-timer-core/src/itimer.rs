@@ -24,7 +24,7 @@
 //! runs under the slot's private transition gate (`SlotGate`), and the
 //! fallback threads deliver through
 //! [`fire_wall_if_current`] / [`fire_cpu_if_current`], which check the arm
-//! generation, decide expiry, run the delivery callback and retire a one-shot
+//! generation, decide expiry, retire a one-shot and run the delivery callback
 //! inside ONE gate hold. That makes delivery linearizable with `setitimer`:
 //! once an arm or disarm returns, no fallback thread of a superseded
 //! generation can deliver or mutate the slot. (A delivery that won the gate
@@ -134,8 +134,6 @@ impl SlotGate<'_> {
 
     fn disarm(&self) {
         let slot = self.slot;
-        slot.generation.fetch_add(1, Ordering::SeqCst);
-        slot.armed.store(false, Ordering::SeqCst);
         slot.value_ns.store(0, Ordering::SeqCst);
         slot.interval_ns.store(0, Ordering::SeqCst);
         slot.needs_periodic.store(false, Ordering::SeqCst);
@@ -144,6 +142,8 @@ impl SlotGate<'_> {
         // disarmed. (HVF disarm reads the ident BEFORE calling disarm, so this
         // does not race the EV_DELETE.)
         slot.live_ident.store(0, Ordering::SeqCst);
+        slot.armed.store(false, Ordering::SeqCst);
+        slot.generation.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Retire a spent one-shot; periodic/two-phase arms stay armed.
@@ -177,10 +177,13 @@ impl SlotGate<'_> {
         CpuTimerDecision::Fire
     }
 
-    /// Deliver one expiry under the gate and retire a spent one-shot.
+    /// Retire a spent one-shot before delivery makes its signal visible.
     fn fire(&self, on_fire: impl FnOnce()) -> FireOutcome {
+        let retired = self.complete_fire();
+        // `disarm` publishes `armed = false` and the new generation with
+        // SeqCst atomics before the callback can publish the pending signal.
         on_fire();
-        if self.complete_fire() {
+        if retired {
             FireOutcome::Retired
         } else {
             FireOutcome::Fired
@@ -854,6 +857,72 @@ mod tests {
             FireOutcome::Retired
         );
         assert!(!is_armed(0));
+    }
+
+    #[test]
+    fn one_shot_state_is_retired_before_delivery_for_each_itimer() {
+        let table = ItimerTable::new();
+        for which in 0..ITIMER_COUNT {
+            let generation = table.arm_with_cpu_now(
+                which,
+                TimerSpecNs {
+                    value: 1_000,
+                    interval: 0,
+                },
+                false,
+                0,
+            );
+            let delivered = || {
+                assert!(
+                    !table.is_armed(which),
+                    "which={which} still armed at delivery"
+                );
+                assert_ne!(
+                    table.generation(which),
+                    generation,
+                    "which={which} generation unchanged"
+                );
+                assert_eq!(table.interval_ns(which), 0);
+            };
+            let outcome = if which == 0 {
+                table.fire_wall_if_current(which, generation, delivered)
+            } else {
+                table.fire_cpu_if_current(which, generation, 1_000, 1, delivered)
+            };
+            assert_eq!(outcome, FireOutcome::Retired);
+            assert_eq!(table.current_arm(which), None);
+
+            let kq_generation = table.arm_with_cpu_now(
+                which,
+                TimerSpecNs {
+                    value: 1_000,
+                    interval: 0,
+                },
+                false,
+                0,
+            );
+            let kq_outcome = table.fire_kqueue_if_current(
+                which,
+                kq_generation,
+                1_000,
+                1,
+                || {
+                    assert!(
+                        !table.is_armed(which),
+                        "which={which} still armed at kqueue delivery"
+                    );
+                    assert_ne!(
+                        table.generation(which),
+                        kq_generation,
+                        "which={which} generation unchanged at kqueue delivery"
+                    );
+                    assert_eq!(table.interval_ns(which), 0);
+                },
+                |_| panic!("one-shot kqueue fire must not re-arm"),
+            );
+            assert_eq!(kq_outcome, FireOutcome::Retired);
+            assert_eq!(table.current_arm(which), None);
+        }
     }
 
     #[test]

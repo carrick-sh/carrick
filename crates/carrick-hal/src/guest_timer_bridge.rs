@@ -637,7 +637,135 @@ mod tests {
             ),
             "a CLOCK_PROCESS_CPUTIME_ID timer never fired on a kick lane after guest CPU crossed its due time"
         );
+        assert!(!crate::posix_timer::is_armed(id));
+        assert_eq!(crate::posix_timer::remaining(id), Some(TimerSpecNs::DISARM));
         assert!(crate::posix_timer::delete(id));
+        carrick_signal_linux::clear_proc_pending();
+    }
+
+    #[test]
+    fn kicker_one_shot_timers_are_disarmed_when_signal_becomes_pending() {
+        struct DueCpuSampler(u64);
+        impl carrick_timer_core::CpuSampler for DueCpuSampler {
+            fn total_cpu_ns(&self) -> u64 {
+                self.0
+            }
+            fn active_vcpus(&self) -> u64 {
+                1
+            }
+        }
+
+        let _serial = TIMER_REGISTRY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        carrick_timer_core::itimer::clear();
+        crate::posix_timer::clear();
+        carrick_signal_linux::clear_proc_pending();
+        let bridge = KickerGuestTimers::default();
+
+        for which in 0..carrick_timer_core::itimer::ITIMER_COUNT {
+            let signum = bridge.itimer_signum_for(which);
+            let spec = TimerSpecNs {
+                value: 1,
+                interval: 0,
+            };
+            let generation = carrick_timer_core::itimer::arm_with_cpu_now(which, spec, false, 0);
+            let observed = Arc::new(Mutex::new(None));
+            let observed_in_wake = Arc::clone(&observed);
+            let registry: Arc<dyn VcpuRegistry> = Arc::new(crate::GenericVcpuRegistry::new());
+            register_kicker(
+                registry,
+                ThreadId::synthetic_for_tests(0x17e7),
+                Box::new(move || {
+                    *observed_in_wake.lock().unwrap_or_else(|e| e.into_inner()) = Some((
+                        carrick_signal_linux::has_process_pending(),
+                        carrick_timer_core::itimer::is_armed(which),
+                        carrick_timer_core::itimer::generation(which),
+                    ));
+                }),
+            );
+            crate::timer_delivery::run_fallback(
+                which,
+                generation,
+                spec,
+                &DueCpuSampler(spec.value),
+                || deliver(signum),
+            );
+            let (sig_pending, armed_at_publish, gen_at_publish) = observed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .expect("one-shot itimer fires through deliver");
+            assert!(sig_pending, "which={which} signal must be pending at wake");
+            assert!(
+                !armed_at_publish,
+                "which={which} one-shot itimer still armed when signal became pending"
+            );
+            assert_ne!(
+                gen_at_publish, generation,
+                "which={which} generation not bumped when signal became pending"
+            );
+            assert_eq!(carrick_signal_linux::take_process_pending(), signum);
+        }
+
+        let id = bridge.posix_create_with_target_and_value(
+            carrick_abi::LINUX_CLOCK_PROCESS_CPUTIME_ID as i32,
+            carrick_abi::LINUX_SIGPROF,
+            None,
+            0,
+        );
+        let spec = TimerSpecNs {
+            value: 1_000,
+            interval: 0,
+        };
+        let armed = crate::posix_timer::arm(id, spec).expect("known id");
+        let generation = armed.generation;
+        let slot_for_wake = Arc::clone(&armed.slot);
+        let observed = Arc::new(Mutex::new(None));
+        let observed_in_wake = Arc::clone(&observed);
+        let registry: Arc<dyn VcpuRegistry> = Arc::new(crate::GenericVcpuRegistry::new());
+        register_kicker(
+            registry,
+            ThreadId::synthetic_for_tests(0x17e7),
+            Box::new(move || {
+                *observed_in_wake.lock().unwrap_or_else(|e| e.into_inner()) = Some((
+                    carrick_signal_linux::has_process_pending(),
+                    crate::posix_timer::is_armed(id),
+                    crate::posix_timer::remaining(id),
+                    crate::posix_timer::generation_matches(&slot_for_wake, generation),
+                ));
+            }),
+        );
+        let step = std::sync::atomic::AtomicU64::new(0);
+        let cpu_now: Arc<dyn Fn() -> Option<u64> + Send + Sync> = Arc::new(move || {
+            let n = step.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(if n == 0 { 0 } else { spec.value })
+        });
+        crate::posix_timer::run_fallback_with_cpu(
+            armed.slot,
+            generation,
+            spec,
+            Some(cpu_now),
+            || deliver(armed.signum),
+        );
+        let (sig_pending, armed_at_publish, rem_at_publish, gen_matches_at_publish) = observed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .expect("one-shot CPU POSIX timer fires through deliver");
+        assert!(sig_pending, "POSIX timer signal must be pending at wake");
+        assert!(
+            !armed_at_publish,
+            "one-shot CPU POSIX timer still armed when signal became pending"
+        );
+        assert_eq!(rem_at_publish, Some(TimerSpecNs::DISARM));
+        assert!(
+            !gen_matches_at_publish,
+            "one-shot CPU POSIX timer generation not bumped when signal became pending"
+        );
+        assert_eq!(
+            carrick_signal_linux::take_process_pending(),
+            carrick_abi::LINUX_SIGPROF
+        );
+        assert!(bridge.posix_delete(id));
         carrick_signal_linux::clear_proc_pending();
     }
 }
