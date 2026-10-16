@@ -2090,12 +2090,14 @@ mod layout_manifest {
                 size_of::<ThreadControlSlot>(),
                 align_of::<ThreadControlSlot>()
             ),
-            (128, 64)
+            (192, 64)
         );
         // Exhaustive pattern makes newly added fields require a manifest entry.
         let _ = |ThreadControlSlot {
                      visible_tid: _,
                      blocked: _,
+                     forwarded_saved_mask: _,
+                     forwarded_mask_armed: _,
                      alt_seq: _,
                      alt_sp: _,
                      alt_size: _,
@@ -2115,29 +2117,31 @@ mod layout_manifest {
                  }: ThreadControlSlot| {};
         field!(ThreadControlSlot, visible_tid, AtomicU32, 0, 4, 4);
         field!(ThreadControlSlot, blocked, AtomicU64, 8, 8, 8);
-        field!(ThreadControlSlot, alt_seq, AtomicU64, 16, 8, 8);
-        field!(ThreadControlSlot, alt_sp, AtomicU64, 24, 8, 8);
-        field!(ThreadControlSlot, alt_size, AtomicU64, 32, 8, 8);
-        field!(ThreadControlSlot, alt_flags, AtomicU32, 40, 4, 4);
-        field!(ThreadControlSlot, robust_len, AtomicU32, 44, 4, 4);
-        field!(ThreadControlSlot, robust_head, AtomicU64, 48, 8, 8);
-        field!(ThreadControlSlot, clear_child_tid, AtomicU64, 56, 8, 8);
-        field!(ThreadControlSlot, entry, AtomicU64, 64, 8, 8);
-        field!(ThreadControlSlot, pending, PendingSummary, 72, 8, 8);
-        field!(ThreadControlSlot, zone_seq, AtomicU64, 80, 8, 8);
-        field!(ThreadControlSlot, zone_incarnation, AtomicU64, 88, 8, 8);
-        field!(ThreadControlSlot, zone_id, AtomicU32, 96, 4, 4);
+        field!(ThreadControlSlot, forwarded_saved_mask, AtomicU64, 16, 8, 8);
+        field!(ThreadControlSlot, forwarded_mask_armed, AtomicU32, 24, 4, 4);
+        field!(ThreadControlSlot, alt_seq, AtomicU64, 32, 8, 8);
+        field!(ThreadControlSlot, alt_sp, AtomicU64, 40, 8, 8);
+        field!(ThreadControlSlot, alt_size, AtomicU64, 48, 8, 8);
+        field!(ThreadControlSlot, alt_flags, AtomicU32, 56, 4, 4);
+        field!(ThreadControlSlot, robust_len, AtomicU32, 60, 4, 4);
+        field!(ThreadControlSlot, robust_head, AtomicU64, 64, 8, 8);
+        field!(ThreadControlSlot, clear_child_tid, AtomicU64, 72, 8, 8);
+        field!(ThreadControlSlot, entry, AtomicU64, 80, 8, 8);
+        field!(ThreadControlSlot, pending, PendingSummary, 88, 8, 8);
+        field!(ThreadControlSlot, zone_seq, AtomicU64, 96, 8, 8);
+        field!(ThreadControlSlot, zone_incarnation, AtomicU64, 104, 8, 8);
+        field!(ThreadControlSlot, zone_id, AtomicU32, 112, 4, 4);
         field!(
             ThreadControlSlot,
             host_exit_requested,
             carrick_core::lifecycle::MemberControlAuthority,
-            100,
+            116,
             4,
             4
         );
-        field!(ThreadControlSlot, retired_task, AtomicU64, 104, 8, 8);
-        field!(ThreadControlSlot, retired_execution, AtomicU64, 112, 8, 8);
-        field!(ThreadControlSlot, retired_thread, AtomicU64, 120, 8, 8);
+        field!(ThreadControlSlot, retired_task, AtomicU64, 120, 8, 8);
+        field!(ThreadControlSlot, retired_execution, AtomicU64, 128, 8, 8);
+        field!(ThreadControlSlot, retired_thread, AtomicU64, 136, 8, 8);
     }
 
     #[test]
