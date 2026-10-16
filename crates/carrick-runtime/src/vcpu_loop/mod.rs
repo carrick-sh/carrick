@@ -1021,6 +1021,26 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     pub(super) _engine: std::marker::PhantomData<fn() -> E>,
 }
 
+/// The host wait's mask was temporary, but native delivery owns the handler
+/// and sigreturn. Carry the saved persistent mask into that one checkpoint.
+fn arm_native_forwarded_wait_mask(
+    control: &carrick_personality_linux::abi::thread::ThreadControlSlot,
+    masks: carrick_kernel::kernel::continuation::SignalMaskContinuationState,
+) {
+    let Some(temporary) = masks.temporary() else {
+        return;
+    };
+    let effective = match temporary {
+        carrick_abi::WaitSigMask::Additive(extra) => masks.persistent().union(extra),
+        carrick_abi::WaitSigMask::Replace(replacement) => replacement,
+    };
+    let original = masks.restore_after_signal().unwrap_or(masks.persistent());
+    control.arm_forwarded_wait_mask(
+        carrick_personality_linux::abi::thread::BlockedMask(effective.raw()),
+        carrick_personality_linux::abi::thread::BlockedMask(original.raw()),
+    );
+}
+
 impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E>
 where
     E::SiblingSpec: 'static,
@@ -1386,6 +1406,16 @@ where
             .map_err(|error| {
                 RuntimeError::Configuration(format!("continuation event: {error:?}"))
             })?;
+        let forwarded_masks = matches!(
+            event,
+            carrick_kernel::kernel::continuation::ContinuationEvent::Signal
+        )
+        .then(|| {
+            lease
+                .blocked_continuation()
+                .map(|pending| pending.signal_masks())
+        })
+        .flatten();
         self.native_restart_eligible = matches!(
             event,
             carrick_kernel::kernel::continuation::ContinuationEvent::Signal
@@ -1423,6 +1453,15 @@ where
         let effects = result.take_resume_effects();
         self.continuation_restart = effects.restart;
         self.reserved_signal = effects.reserved_signal;
+        if matches!(
+            &result.completion,
+            carrick_kernel::kernel::continuation::ContinuationCompletion::Errno(errno)
+                if *errno == carrick_syscall_abi::LINUX_EINTR
+        ) && context.thread().control_slot().native_signal_owner()
+            && let Some(masks) = forwarded_masks
+        {
+            arm_native_forwarded_wait_mask(context.thread().control_slot(), masks);
+        }
 
         carrick_kernel::kernel::continuation::fold_continuation_completion(
             result.completion,

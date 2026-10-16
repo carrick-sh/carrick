@@ -669,6 +669,106 @@ fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
 }
 
 #[test]
+fn serial_host_ppoll_temporary_mask_delivers_then_restores_blocked_sigint() {
+    use carrick_core_abi::{
+        EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+    };
+    use carrick_el1::personality::native_process_runtime::host_test_support::{
+        NativeSignalFixture, take_signal_copies,
+    };
+    use carrick_guest_mem::GuestMemory;
+    use carrick_personality_linux::abi::thread::BlockedMask;
+    use carrick_personality_linux::signal::arm;
+
+    let (_kernel, context) = bootstrap(153_801);
+    let control = context.thread().control_slot();
+    control.init_blocked(BlockedMask(2)); // persistent SIGINT block
+    context.signal_authority().set_blocked(SigSet::from_raw(2));
+    let binding = ExecutionBinding {
+        task: EntryTaskKey::from_raw(context.thread().key().tid.raw() as u64),
+        generation: EntryGeneration::from_raw(context.task().key().serial.raw()),
+        mm: EntryMmKey::from_raw(context.shared().mm().id().raw()),
+        thread_generation: EntryThreadGeneration::from_raw(context.thread().key().serial.raw()),
+    };
+    let fixture = NativeSignalFixture::new(
+        binding,
+        EntryTaskKey::from_raw(context.task().key().id.raw() as u64),
+    );
+    fixture.install_sigint_handler(false);
+    fixture.control_slot().init_blocked(BlockedMask(2));
+    control.bind_zone_record(fixture.record());
+    let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
+    custody.commit_registration();
+    custody.commit_native_signal_owner();
+    let mut memory = carrick_kernel::dispatch::LinearMemory::new(0x10000, vec![0; 0x1000]);
+    memory.write_bytes(0x10100, &0u64.to_ne_bytes()).unwrap();
+    let request = SyscallRequest::new(73, SyscallArgs::from([0, 0, 0, 0x10100, 8, 0]));
+    let outcome = carrick_kernel::dispatch::SyscallDispatcher::new()
+        .dispatch(
+            &context,
+            request,
+            &mut memory,
+            &crate::compat::CompatReporter::default(),
+        )
+        .unwrap();
+    assert!(matches!(outcome, DispatchOutcome::WaitOnFds { .. }));
+    let continuation = BlockedContinuation::from_dispatch_outcome(
+        outcome,
+        ContinuationCapture::new(
+            &context,
+            publish(&context, 0x720),
+            request,
+            RestartClass::Never,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        continuation.signal_masks().temporary(),
+        Some(WaitSigMask::Replace(SigSet::EMPTY))
+    );
+    // The host-side continuation uses the temporary mask. The native owner
+    // must still save the persistent mask into the signal frame.
+    let masks = continuation.signal_masks();
+    carrick_signal_linux::publish_process_signal(2);
+    let event = SignalReadinessProbe::from_continuation(&continuation)
+        .event()
+        .expect("temporary ppoll mask admits SIGINT");
+    assert!(matches!(event, ContinuationEvent::Signal));
+    let completed = continuation.resume(event, &context).unwrap();
+    assert!(matches!(
+        completed.completion,
+        ContinuationCompletion::Errno(carrick_syscall_abi::LINUX_EINTR)
+    ));
+    super::super::arm_native_forwarded_wait_mask(fixture.control_slot(), masks);
+    let queue = carrick_el1_abi::SharedSignalIngressQueue::new();
+    let mut producer = super::super::signal_ingress_producer::HostSignalIngressProducer::new();
+    assert_eq!(
+        producer
+            .publish(
+                &queue,
+                super::super::signal_ingress_producer::HostIngressTarget::from_context(&context),
+                carrick_signal_linux::take_pending_event_for,
+            )
+            .unwrap(),
+        super::super::signal_ingress_producer::HostIngressStep::Published
+    );
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.esr = 0xfffd;
+    frame.elr = 0x400004;
+    frame.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
+    frame.x[8] = 73;
+    assert_eq!(fixture.drain_and_deliver(&queue, &mut frame).0, 1);
+    assert_eq!(frame.elr, 0x7000);
+    let copies = take_signal_copies();
+    assert_eq!(copies.len(), 1);
+    let (sp, bytes) = &copies[0];
+    let saved = arm::decode(bytes, *sp, true).unwrap();
+    assert_eq!(saved.mask.signals().bits(), 2);
+    assert!(!fixture.control_slot().forwarded_wait_mask_armed());
+}
+
+#[test]
 fn serial_host_two_live_reads_share_one_process_signal_wake() {
     use carrick_core_abi::{
         EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
@@ -755,20 +855,21 @@ fn serial_host_two_live_reads_share_one_process_signal_wake() {
     fixtures[0].install_sigint_handler(true);
     fixtures[1].install_sigint_handler(true);
     carrick_signal_linux::publish_process_signal(2);
-    for (context, continuation) in [
-        (&leader, continuations.remove(0)),
-        (&worker, continuations.remove(0)),
-    ] {
-        let event = SignalReadinessProbe::from_continuation(&continuation)
-            .event()
-            .expect("both host reads observe the broadcast wake");
-        assert!(matches!(event, ContinuationEvent::Signal));
-        let completed = continuation.resume(event, context).unwrap();
-        assert!(matches!(
-            completed.completion,
-            ContinuationCompletion::Errno(carrick_syscall_abi::LINUX_EINTR)
-        ));
-    }
+    let selected = continuations.remove(0);
+    let other = continuations.remove(0);
+    let event = SignalReadinessProbe::from_continuation(&selected)
+        .event()
+        .expect("one host read claims the process wake");
+    assert!(matches!(event, ContinuationEvent::Signal));
+    let completed = selected.resume(event, &leader).unwrap();
+    assert!(matches!(
+        completed.completion,
+        ContinuationCompletion::Errno(carrick_syscall_abi::LINUX_EINTR)
+    ));
+    assert_eq!(
+        SignalReadinessProbe::from_continuation(&other).event(),
+        None
+    );
     let queue = carrick_el1_abi::SharedSignalIngressQueue::new();
     let mut producer = super::super::signal_ingress_producer::HostSignalIngressProducer::new();
     assert_eq!(
@@ -800,15 +901,71 @@ fn serial_host_two_live_reads_share_one_process_signal_wake() {
     assert_eq!(fixtures[0].drain_and_deliver(&queue, &mut delivered).0, 1);
     assert_eq!(delivered.elr, 0x7000);
     assert_eq!(take_signal_copies().len(), 1);
-    let mut other = carrick_el1_abi::TrapFrame::default();
-    other.esr = 0xfffe;
-    other.elr = 0x500004;
-    other.far = 0x1234;
-    other.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
-    other.x[8] = 63;
-    assert_eq!(fixtures[1].drain_and_deliver(&queue, &mut other).0, 0);
-    assert_eq!((other.elr, other.x[0]), (0x500000, 0x1234));
+    assert_eq!(other.deadline(), None);
     assert!(take_signal_copies().is_empty());
+}
+
+#[test]
+fn serial_host_timed_recv_waiter_keeps_deadline_when_peer_claims_signal() {
+    let (kernel, leader) = bootstrap(153_820);
+    let worker = kernel
+        .reserve_thread_clone(
+            &leader,
+            ClonePlan::from_flags(
+                LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap()
+        .prepare(ThreadId::synthetic_for_tests(153_821))
+        .unwrap()
+        .commit()
+        .unwrap()
+        .into_context()
+        .unwrap();
+    let control = worker.thread().control_slot();
+    control.bind_zone_record(carrick_sched_core::RecordRef {
+        id: carrick_sched_core::RecordId::from_raw(7).unwrap(),
+        incarnation: 13,
+    });
+    let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
+    custody.commit_registration();
+    custody.commit_native_signal_owner();
+    let continuation = BlockedContinuation::from_dispatch_outcome(
+        DispatchOutcome::WaitOnFds {
+            fds: WaitFds::empty(),
+            timeout: Some(std::time::Duration::from_millis(80)),
+            sig_mask: WaitSigMask::NONE,
+            completion: FdWaitCompletion::Fd { on_timeout: 0 },
+        },
+        ContinuationCapture::new(
+            &worker,
+            publish(&worker, 0x721),
+            SyscallRequest::new(207, SyscallArgs([0; 6])), // recvfrom, SO_RCVTIMEO
+            RestartClass::RestartSyscall,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(!continuation.native_restart_eligible());
+    let deadline = continuation.deadline();
+    carrick_signal_linux::publish_process_signal(2);
+    assert!(carrick_signal_linux::has_unblocked_pending_for(
+        leader.thread().key().tid.raw(),
+        carrick_abi::SigBlockMask::NONE,
+    ));
+    assert_eq!(
+        SignalReadinessProbe::from_continuation(&continuation).event(),
+        None
+    );
+    assert_eq!(continuation.deadline(), deadline);
+    assert_eq!(
+        carrick_signal_linux::take_pending_event_for(leader.thread().key().tid.raw())
+            .unwrap()
+            .signum,
+        2
+    );
 }
 
 #[test]
