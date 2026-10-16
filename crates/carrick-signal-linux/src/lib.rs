@@ -447,11 +447,19 @@ pub fn has_pending_for(tid: i32) -> bool {
     thread_pending_has(tid)
 }
 
-/// Like [`has_pending_for`], but a signal blocked by `block_mask` does NOT
-/// count as deliverable-for-waking. SIGKILL/SIGSTOP can't be blocked, matching
-/// the kernel. The pure (no-glue) form used by the KVM backend; the HVF backend
-/// wraps it to also peek its xsignal ring.
+/// Pure eligibility query. A signal blocked by `block_mask` does not count;
+/// querying does not reserve a process-directed signal for this thread.
 pub fn has_unblocked_pending_for(tid: i32, block_mask: SigBlockMask) -> bool {
+    if thread_pending_deliverable(tid, block_mask) {
+        return true;
+    }
+    let owner = PROC_WAKE_OWNER.load(Ordering::SeqCst);
+    (owner == 0 || owner == tid) && set_is_deliverable(PROC_PENDING.load().bits(), block_mask)
+}
+
+/// Commit one interrupted waiter to a process-directed signal. Other
+/// waiters keep their continuation until this owner consumes or retires.
+pub fn claim_unblocked_pending_for(tid: i32, block_mask: SigBlockMask) -> bool {
     if thread_pending_deliverable(tid, block_mask) {
         return true;
     }
@@ -799,10 +807,37 @@ mod tests {
         let _lock = lock_test();
         clear_proc_pending();
         publish_process_signal(14);
-        assert!(has_unblocked_pending_for(991, SigBlockMask::NONE));
-        assert!(!has_unblocked_pending_for(992, SigBlockMask::NONE));
+        assert!(claim_unblocked_pending_for(991, SigBlockMask::NONE));
+        assert!(!claim_unblocked_pending_for(992, SigBlockMask::NONE));
         assert_eq!(take_pending_event_for(992), None);
         assert_eq!(take_pending_event_for(991).unwrap().signum, 14);
+        clear_proc_pending();
+    }
+
+    #[test]
+    fn non_consuming_pending_probe_cannot_withhold_process_signal() {
+        let _lock = lock_test();
+        clear_proc_pending();
+        publish_process_signal(14);
+        assert!(has_unblocked_pending_for(991, SigBlockMask::NONE));
+        assert_eq!(
+            take_pending_event_for(992).map(|event| event.signum),
+            Some(14),
+            "a query by a live non-consumer cannot reserve delivery"
+        );
+        clear_proc_pending();
+    }
+
+    #[test]
+    fn retiring_an_interrupted_non_consumer_releases_process_claim() {
+        let _lock = lock_test();
+        clear_proc_pending();
+        publish_process_signal(14);
+        assert!(claim_unblocked_pending_for(991, SigBlockMask::NONE));
+        assert!(!claim_unblocked_pending_for(992, SigBlockMask::NONE));
+        forget_thread(991);
+        assert!(claim_unblocked_pending_for(992, SigBlockMask::NONE));
+        assert_eq!(take_pending_event_for(992).unwrap().signum, 14);
         clear_proc_pending();
     }
 

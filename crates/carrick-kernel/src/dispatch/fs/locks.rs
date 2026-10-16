@@ -650,7 +650,7 @@ impl LogicalRecordLocks {
                 self.changed.notify_all();
                 return Ok(());
             }
-            if host_signal.has_unblocked_pending_for(tid.raw(), block_mask) {
+            if host_signal.claim_unblocked_pending_for(tid.raw(), block_mask) {
                 return Err(LINUX_EINTR);
             }
             state.wait_for(&self.changed, std::time::Duration::from_millis(10));
@@ -781,7 +781,7 @@ impl LogicalRecordLocks {
                 Err(errno) if errno == LINUX_EAGAIN => {}
                 settled => break settled,
             }
-            if host_signal.has_unblocked_pending_for(tid.raw(), block_mask) {
+            if host_signal.claim_unblocked_pending_for(tid.raw(), block_mask) {
                 self.retract_wait_locked(&mut state, wait);
                 break Err(LINUX_EINTR);
             }

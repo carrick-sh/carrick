@@ -1106,15 +1106,15 @@ impl<'a> SignalView<'a> {
         // persistent thread mask is folded in, not unioned again).
         let non_eintr = block_mask.non_eintr_union(wait_set);
         let non_eintr_block = SigBlockMask::blocking_all_of(non_eintr);
-        self.cross
-            .host_signal()
-            .has_unblocked_pending_for(tid.raw(), non_eintr_block)
-            || carrick_signal_linux::xsig::xsig_has_unblocked_for_self(non_eintr_block)
-            || self.has_deliverable_dispatch_pending_for_wait(
-                context,
-                tid,
-                carrick_abi::WaitSigMask::Replace(non_eintr),
-            )
+        self.has_deliverable_dispatch_pending_for_wait(
+            context,
+            tid,
+            carrick_abi::WaitSigMask::Replace(non_eintr),
+        ) || carrick_signal_linux::xsig::xsig_has_unblocked_for_self(non_eintr_block)
+            || self
+                .cross
+                .host_signal()
+                .claim_unblocked_pending_for(tid.raw(), non_eintr_block)
     }
 
     /// Convenience for tests that assert only the selected signum.
@@ -2014,10 +2014,11 @@ impl<'a> SignalView<'a> {
             // sigsuspend returns only after a caught/terminating signal. A
             // pending default-ignore SIGCHLD neither returns EINTR nor spins.
             let block_mask = SigBlockMask::blocking_all_of(suspend_mask.union(ignored));
-            let host_pending = this.cross.host_signal().has_unblocked_pending_for(
-                tid.raw(),
-                block_mask,
-            );
+            let host_pending = dispatcher_pending.is_empty()
+                && this
+                    .cross
+                    .host_signal()
+                    .claim_unblocked_pending_for(tid.raw(), block_mask);
             if dispatcher_pending.is_empty() && !host_pending {
                 return Ok(DispatchOutcome::WaitOnSignals {
                     wait_set: SigSet::EMPTY,
@@ -2261,7 +2262,7 @@ impl<'a> SignalView<'a> {
                 cx.kernel,
                 tid,
                 carrick_abi::WaitSigMask::Replace(SigSet::from_raw(block_mask.raw())),
-            ) || this.cross.host_signal().has_unblocked_pending_for(tid.raw(), block_mask)
+            ) || this.cross.host_signal().claim_unblocked_pending_for(tid.raw(), block_mask)
             {
                 return Ok(DispatchOutcome::errno(LINUX_EINTR));
             }
