@@ -173,6 +173,104 @@ impl ExecutionBinding {
     }
 }
 
+/// Exact task/execution/thread incarnation shared by a terminal receipt and
+/// an external event. A visible tid or MM key alone cannot authenticate either.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct EntryEventIdentity {
+    task: EntryTaskKey,
+    execution: SnapshotGeneration,
+    thread: EntryThreadGeneration,
+}
+
+impl EntryEventIdentity {
+    pub const fn from_parts(
+        task: EntryTaskKey,
+        execution: SnapshotGeneration,
+        thread: EntryThreadGeneration,
+    ) -> Option<Self> {
+        if task.raw() == 0 || execution.raw() == 0 || thread.raw() == 0 {
+            None
+        } else {
+            Some(Self {
+                task,
+                execution,
+                thread,
+            })
+        }
+    }
+
+    /// The caller already holds an execution binding; `issued` lets ingress
+    /// reject an unissued one before using it as an admission authority.
+    pub const fn from_binding(binding: ExecutionBinding) -> Self {
+        Self {
+            task: binding.task,
+            execution: binding.generation,
+            thread: binding.thread_generation,
+        }
+    }
+
+    pub const fn issued(self) -> bool {
+        self.task.raw() != 0 && self.execution.raw() != 0 && self.thread.raw() != 0
+    }
+
+    pub const fn matches(self, binding: ExecutionBinding) -> bool {
+        self.task.raw() == binding.task.raw()
+            && self.execution.raw() == binding.generation.raw()
+            && self.thread.raw() == binding.thread_generation.raw()
+    }
+
+    pub const fn task(self) -> EntryTaskKey {
+        self.task
+    }
+
+    pub const fn execution(self) -> SnapshotGeneration {
+        self.execution
+    }
+
+    pub const fn thread(self) -> EntryThreadGeneration {
+        self.thread
+    }
+}
+const _: () = {
+    assert!(core::mem::size_of::<EntryEventIdentity>() == 24);
+    assert!(core::mem::align_of::<EntryEventIdentity>() == 8);
+};
+
+#[cfg(test)]
+mod event_identity_tests {
+    use super::*;
+
+    #[test]
+    fn event_identity_rejects_reused_execution_or_thread_generation() {
+        let binding = ExecutionBinding {
+            task: EntryTaskKey::from_raw(41),
+            generation: SnapshotGeneration::from_raw(11),
+            mm: EntryMmKey::from_raw(301),
+            thread_generation: EntryThreadGeneration::from_raw(101),
+        };
+        let identity = EntryEventIdentity::from_binding(binding);
+        assert!(identity.issued());
+        assert!(identity.matches(binding));
+        assert!(!identity.matches(ExecutionBinding {
+            generation: SnapshotGeneration::from_raw(12),
+            ..binding
+        }));
+        assert!(!identity.matches(ExecutionBinding {
+            thread_generation: EntryThreadGeneration::from_raw(102),
+            ..binding
+        }));
+        assert!(
+            EntryEventIdentity::from_parts(
+                EntryTaskKey::from_raw(0),
+                binding.generation,
+                binding.thread_generation,
+            )
+            .is_none()
+        );
+    }
+}
+
 /// Exact native scheduler region/slot; core authenticates its live record.
 #[derive(Clone, Copy)]
 pub struct BornInZoneSource<'a, C: EntryContext = ThreadCtx> {
