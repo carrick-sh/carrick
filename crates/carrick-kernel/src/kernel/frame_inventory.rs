@@ -3094,7 +3094,10 @@ mod tests {
                 .settle(
                     &mut NoTableLedger,
                     parent_execution,
-                    &mut settlement,
+                    carrick_hal::fork_stock::ForkStockSettlementReceipt {
+                        record: &mut settlement,
+                        physical: (),
+                    },
                     |_| true,
                     |_| true,
                     |_| true,
