@@ -3270,7 +3270,7 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     /// Retain an exclusive runtime reservation before any native fork executes.
     fn install_native_fork_stock(
         &self,
-        _reservation: std::sync::Arc<dyn crate::fork_stock::NativeForkTableReservation>,
+        _reservation: crate::fork_stock::NativeForkStockResources,
     ) -> Result<(), crate::TrapError> {
         Err(crate::TrapError::Hypervisor(
             "native fork stock unavailable on this lane".into(),

@@ -1074,15 +1074,6 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
     })?;
     let (table, mm_backend) = MmResources::new_root(stage1_root, asids)
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-    let fork_arenas = engine.native_fork_table_arenas();
-    if fork_arenas != 0 {
-        let reservation = table
-            .reserve_native_fork_tables(fork_arenas)
-            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-        engine
-            .install_native_fork_stock(reservation)
-            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-    }
     let table = std::sync::Arc::new(table);
     let root_tid = identity.tid;
     let container = match dispatcher.installed_container() {
@@ -1137,6 +1128,18 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
                     .map(|_| ())
                     .map_err(|error| crate::trap::TrapError::Hypervisor(error.to_string()))
             })?;
+            let fork_arenas = engine.native_fork_table_arenas();
+            if fork_arenas != 0 {
+                let tables = table
+                    .reserve_native_fork_tables(fork_arenas)
+                    .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+                engine
+                    .install_native_fork_stock(carrick_hal::fork_stock::NativeForkStockResources {
+                        tables,
+                        inventory: kernel.physical_frame_inventory(),
+                    })
+                    .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+            }
             let prepared = ProcessContext::new(
                 Arc::clone(&table),
                 root_context.task_binding(),
