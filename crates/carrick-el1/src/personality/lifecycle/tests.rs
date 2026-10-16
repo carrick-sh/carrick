@@ -1220,8 +1220,8 @@ fn arm_sigaltstack_minimum_is_5120() {
     assert_eq!(w.venue.leader_slot().read_altstack().size, 5120);
 }
 
-/// sigaltstack(2): Linux treats input SS_ONSTACK as zero, and ignores the
-/// other flags when SS_DISABLE is present.
+/// sigaltstack(2): Linux treats input SS_ONSTACK as zero, accepts
+/// SS_DISABLE with SS_AUTODISARM, and rejects unknown bits.
 #[test]
 fn arm_sigaltstack_accepts_reported_and_disable_autodisarm_flags() {
     let mut w = World::new(LifecycleHatches::ON);
@@ -1238,6 +1238,11 @@ fn arm_sigaltstack_accepts_reported_and_disable_autodisarm_flags() {
     let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*disabled), 0]);
     assert_eq!(action, Action::Served);
     assert_eq!(frame.x[0] as i64, 0);
+    assert!(w.venue.leader_slot().read_altstack().is_disabled());
+    let invalid = Box::new(stack_t(0, SS_DISABLE | 0x8, 0));
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*invalid), 0]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(frame.x[0] as i64, -22);
     assert!(w.venue.leader_slot().read_altstack().is_disabled());
 }
 
