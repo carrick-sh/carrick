@@ -77,4 +77,25 @@ fn arm_native_wait_runs_ready_child_before_host_handoff() {
         fixture.zone.counters.lost_adoptions.load(Ordering::Acquire),
         0
     );
+
+    // SAFETY: this fixture owns the selected OnCpu record on this slot.
+    let child_context = unsafe { fixture.zone.record(child).ctx_mut() }
+        .address_context()
+        .unwrap();
+    let index = fixture.zone.spaces.find(identity.mm).unwrap();
+    let grant = fixture.zone.spaces.grant(index, identity.mm).unwrap();
+    assert_ne!(fixture.zone.slot(fixture.slot).mm(), identity.mm);
+    // SAFETY: this fixture owns the selected OnCpu record on this slot.
+    let observed = unsafe {
+        observed_entry_address(
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            },
+            &fixture.task,
+            grant.ttbr0,
+            child,
+        )
+    };
+    assert_eq!(observed, Ok(child_context));
 }
