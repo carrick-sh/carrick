@@ -39,6 +39,23 @@ struct QuarantinedChild {
 
 /// Bytes in one loaned page-table page.
 const TABLE_PAGE_BYTES: u64 = 4096;
+const CONTROL_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
+
+/// One exclusive physical destination for a fork child's kernel controls.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct ForkControlCapacity {
+    base: u64,
+}
+
+impl ForkControlCapacity {
+    pub fn new(base: u64) -> Option<Self> {
+        (base != 0 && base.is_multiple_of(CONTROL_WINDOW_BYTES)).then_some(Self { base })
+    }
+
+    pub fn base(self) -> u64 {
+        self.base
+    }
+}
 
 /// Admitted CPU execution context for physical grant authentication.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -399,6 +416,7 @@ pub struct PendingForkLoan<T> {
     pub child_tables: Vec<RootGpa>,
     pub parent_tables: Vec<RootGpa>,
     pub lifecycle: ForkLifecycleLoan,
+    pub control: ForkControlCapacity,
     pub tag: T,
 }
 
@@ -407,6 +425,7 @@ pub struct PendingForkLoan<T> {
 struct CommittedChild<T> {
     root: RootGpa,
     lifecycle: ForkLifecycleLoan,
+    control: ForkControlCapacity,
     tag: ChildTag<T>,
 }
 
@@ -527,7 +546,7 @@ impl core::fmt::Debug for NativeForkStockResources {
 #[derive(Debug)]
 pub struct ForkStock<T: ChildAddressTags> {
     carrier: NonZeroU64,
-    kernel_control_ipa: u64,
+    controls: Vec<ForkControlCapacity>,
     tables: Vec<RootGpa>,
     lifecycles: Vec<ForkLifecycleLoan>,
     pending: Vec<Option<PendingForkLoan<T::Tag>>>,
@@ -547,7 +566,9 @@ impl<T: ChildAddressTags> ForkStock<T> {
     pub fn new(carrier: NonZeroU64, kernel_control_ipa: u64, tags: T) -> Self {
         Self {
             carrier,
-            kernel_control_ipa,
+            controls: ForkControlCapacity::new(kernel_control_ipa)
+                .into_iter()
+                .collect(),
             tables: Vec::new(),
             lifecycles: Vec::new(),
             pending: Vec::new(),
@@ -590,6 +611,28 @@ impl<T: ChildAddressTags> ForkStock<T> {
     /// Reusable lifecycle records.
     pub fn lifecycle_stock(&self) -> &[ForkLifecycleLoan] {
         &self.lifecycles
+    }
+
+    /// Replace the initial capacity before a guest can borrow stock. The
+    /// carrier retains the physical backing of every supplied window.
+    pub fn install_control_capacity(
+        &mut self,
+        controls: Vec<ForkControlCapacity>,
+    ) -> Result<(), ForkStockServiceError> {
+        let mut unique = controls.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        if controls.is_empty()
+            || unique.len() != controls.len()
+            || !self.tables.is_empty()
+            || !self.lifecycles.is_empty()
+            || !self.children.is_empty()
+            || self.pending.iter().any(Option::is_some)
+        {
+            return Err(ForkStockServiceError::InvalidRecord);
+        }
+        self.controls = controls;
+        Ok(())
     }
 
     /// True when a fork can be admitted a lifecycle record right now.
@@ -767,6 +810,9 @@ impl<T: ChildAddressTags> ForkStock<T> {
         if self.lifecycles.is_empty() {
             return self.refuse_capacity(exchange, ForkCapacityResource::Lifecycle, execution.cpu);
         }
+        if self.controls.is_empty() {
+            return self.refuse_capacity(exchange, ForkCapacityResource::Control, execution.cpu);
+        }
         let Some((child_tables, parent_tables)) =
             take_fork_table_stock(&mut self.tables, request.child_bytes, request.parent_bytes)
         else {
@@ -795,6 +841,15 @@ impl<T: ChildAddressTags> ForkStock<T> {
                 self.refuse_capacity(exchange, ForkCapacityResource::Lifecycle, execution.cpu);
             return released.map_err(|_| ForkStockRefusal::Invalid).and(refused);
         };
+        let Some(control) = self.controls.pop() else {
+            self.tables.extend(child_tables);
+            self.tables.extend(parent_tables);
+            self.lifecycles.push(lifecycle);
+            let released = self.tags.release_unpublished(tag);
+            let refused =
+                self.refuse_capacity(exchange, ForkCapacityResource::Control, execution.cpu);
+            return released.map_err(|_| ForkStockRefusal::Invalid).and(refused);
+        };
         let id = self.next_loan;
         let child_base = child_tables[0].address().raw();
         let parent_base = parent_tables[0].address().raw();
@@ -804,6 +859,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
             child_tables,
             parent_tables,
             lifecycle,
+            control,
             tag,
         };
         let fresh = lifecycle_fresh(lifecycle);
@@ -811,7 +867,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
             .admit_loan(
                 child_base,
                 parent_base,
-                self.kernel_control_ipa,
+                control.base(),
                 id,
                 lifecycle,
                 T::wire(tag),
@@ -855,7 +911,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
         if !exchange.grant(
             child_base,
             parent_base,
-            self.kernel_control_ipa,
+            control.base(),
             id,
             lifecycle,
             T::wire(tag),
@@ -881,6 +937,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
             child_tables,
             parent_tables,
             lifecycle,
+            control,
             tag,
         });
         Ok(loan)
@@ -914,6 +971,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
         self.tables.extend(reserved.child_tables);
         self.tables.extend(reserved.parent_tables);
         self.lifecycles.push(reserved.lifecycle);
+        self.controls.push(reserved.control);
         self.tags
             .release_unpublished(reserved.tag)
             .map_err(|_| ForkStockRefusal::Invalid)
@@ -1023,6 +1081,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
             self.tables.extend(pending.child_tables);
             self.tables.extend(pending.parent_tables);
             self.lifecycles.push(pending.lifecycle);
+            self.controls.push(pending.control);
         } else {
             let completion =
                 self.validate_commit(execution, settlement, &is_resolvable, &is_clean)?;
@@ -1044,6 +1103,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
                 CommittedChild {
                     root: pending.child_tables[0],
                     lifecycle: pending.lifecycle,
+                    control: pending.control,
                     tag: ChildTag::bind(pending.tag, loan.request.child_mm),
                 },
             );
@@ -1176,6 +1236,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
                 self.tables.extend(pages);
             }
             self.lifecycles.push(child.lifecycle);
+            self.controls.push(child.control);
             self.quarantine.remove(&key);
             reclaimed += 1;
             self.counters.returned_children = self.counters.returned_children.saturating_add(1);
@@ -1205,6 +1266,7 @@ struct ReservedLoan<T> {
     child_tables: Vec<RootGpa>,
     parent_tables: Vec<RootGpa>,
     lifecycle: ForkLifecycleLoan,
+    control: ForkControlCapacity,
     tag: T,
 }
 

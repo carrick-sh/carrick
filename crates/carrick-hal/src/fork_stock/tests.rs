@@ -74,6 +74,15 @@ fn lifecycles(count: u64) -> Vec<ForkLifecycleLoan> {
 
 fn stock<T: ChildAddressTags>(tags: T, pages: u64, records: u64) -> ForkStock<T> {
     let mut stock = ForkStock::new(CARRIER, 0x1_0000_0000, tags);
+    if records != 0 {
+        stock
+            .install_control_capacity(
+                (0..records)
+                    .map(|n| ForkControlCapacity::new(0x1_0000_0000 + n * 0x20_0000).unwrap())
+                    .collect(),
+            )
+            .unwrap();
+    }
     stock
         .install(
             (0..pages).map(|n| page(0x20_0000 + n * 4096)).collect(),
