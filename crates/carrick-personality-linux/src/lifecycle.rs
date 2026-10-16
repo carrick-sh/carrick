@@ -731,13 +731,13 @@ fn serve_sigaltstack(
         }
         let [sp, flags, size] = stack_t_words(&bytes);
         let flags = flags as u32;
+        let accepted = SS_ONSTACK | SS_DISABLE | carrick_syscall_abi::LINUX_SS_AUTODISARM as u32;
+        if flags & !accepted != 0 {
+            return Some(Err(carrick_syscall_abi::LINUX_EINVAL));
+        }
         if flags & SS_DISABLE != 0 {
             Some(AltStack::DISABLED)
         } else {
-            let accepted = SS_ONSTACK | carrick_syscall_abi::LINUX_SS_AUTODISARM as u32;
-            if flags & !accepted != 0 {
-                return Some(Err(carrick_syscall_abi::LINUX_EINVAL));
-            }
             let stack = AltStack {
                 sp,
                 size,
