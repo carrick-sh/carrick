@@ -2,15 +2,11 @@
 
 use carrick_core_abi::{EntryEventIdentity, ExecutionBinding};
 use carrick_el1_abi::{
-    ExternalSignalRecord, ExternalSignalSource, Lifecycle, SignalEventGeneration,
-    SignalIngressAdmission, SignalIngressQueue,
+    ExternalSignalRecord, ExternalSignalSource, Lifecycle, SignalIngressAdmission,
+    SignalIngressQueue,
 };
 use carrick_personality_linux::signal::policy::Signal;
 use carrick_sched_core::RecordRef;
-use core::num::NonZeroU64;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static NEXT_EXTERNAL_EVENT: AtomicU64 = AtomicU64::new(1);
 
 /// Exact host observation of one ring-serving native member. Its construction
 /// comes from a captured KernelContext, not from a numeric Linux tid lookup.
@@ -103,11 +99,9 @@ impl HostSignalIngressProducer {
         let Some(target) = target else {
             return Ok(HostIngressStep::Idle);
         };
-        let generation = NEXT_EXTERNAL_EVENT
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|_| HostIngressError::EventGenerationExhausted)?;
+        let generation = queue
+            .issue_event_generation()
+            .ok_or(HostIngressError::EventGenerationExhausted)?;
         let signum = take_bridge_signal(target.bridge_thread.raw());
         if signum == 0 {
             return Ok(HostIngressStep::Idle);
@@ -118,9 +112,7 @@ impl HostSignalIngressProducer {
             EntryEventIdentity::from_binding(target.binding),
             target.binding,
             target.record,
-            SignalEventGeneration::new(
-                NonZeroU64::new(generation).ok_or(HostIngressError::EventGenerationExhausted)?,
-            ),
+            generation,
             signal,
             ExternalSignalSource::Terminal,
         );
