@@ -643,7 +643,7 @@ pub fn dispatch_irq(frame: &mut TrapFrame, counters: &Counters) -> Action {
 /// Unified entry dispatch (interrupts, lower-EL data aborts, and syscalls).
 pub fn dispatch_entry(frame: &mut TrapFrame, counters: &Counters) -> Action {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    if frame.esr == 0xfffe {
+    if matches!(frame.esr, 0xfffe | 0xfffd) {
         return arm_signal_user_return(frame);
     }
     let action = if frame.esr == 0 {
