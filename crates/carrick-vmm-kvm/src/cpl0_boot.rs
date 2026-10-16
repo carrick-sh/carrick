@@ -4613,7 +4613,7 @@ impl Cpl0Carrier {
         );
         let fork_stock = carrick_hal::fork_stock::ForkStock::new(
             vm.identity().nonzero(),
-            KERNEL_REGION_GPA,
+            carrick_hal::fork_stock::ForkControlCapacity::unused(KERNEL_REGION_GPA),
             carrick_hal::fork_stock::UntaggedRoots,
         );
         Ok(Self {

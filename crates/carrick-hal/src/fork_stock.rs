@@ -41,19 +41,35 @@ struct QuarantinedChild {
 const TABLE_PAGE_BYTES: u64 = 4096;
 const CONTROL_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
 
-/// One exclusive physical destination for a fork child's kernel controls.
+/// Physical control capacity is exclusive when the ISA copies a supervisor
+/// control window. x86 has no such alias; its nonzero wire base is unused by
+/// the shared fork walk and therefore consumes no physical control stock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct ForkControlCapacity {
-    base: u64,
+pub enum ForkControlCapacity {
+    Exclusive { base: u64 },
+    Unused { wire_base: u64 },
 }
 
 impl ForkControlCapacity {
-    pub fn new(base: u64) -> Option<Self> {
-        (base != 0 && base.is_multiple_of(CONTROL_WINDOW_BYTES)).then_some(Self { base })
+    pub fn exclusive(base: u64) -> Option<Self> {
+        (base != 0
+            && base.is_multiple_of(CONTROL_WINDOW_BYTES)
+            && base.checked_add(CONTROL_WINDOW_BYTES).is_some())
+        .then_some(Self::Exclusive { base })
+    }
+
+    pub fn unused(wire_base: u64) -> Option<Self> {
+        (wire_base != 0
+            && wire_base.is_multiple_of(CONTROL_WINDOW_BYTES)
+            && wire_base.checked_add(CONTROL_WINDOW_BYTES).is_some())
+        .then_some(Self::Unused { wire_base })
     }
 
     pub fn base(self) -> u64 {
-        self.base
+        match self {
+            Self::Exclusive { base } => base,
+            Self::Unused { wire_base } => wire_base,
+        }
     }
 }
 
@@ -547,6 +563,7 @@ impl core::fmt::Debug for NativeForkStockResources {
 pub struct ForkStock<T: ChildAddressTags> {
     carrier: NonZeroU64,
     controls: Vec<ForkControlCapacity>,
+    unused_control: Option<ForkControlCapacity>,
     tables: Vec<RootGpa>,
     lifecycles: Vec<ForkLifecycleLoan>,
     pending: Vec<Option<PendingForkLoan<T::Tag>>>,
@@ -563,12 +580,15 @@ pub struct ForkStock<T: ChildAddressTags> {
 }
 
 impl<T: ChildAddressTags> ForkStock<T> {
-    pub fn new(carrier: NonZeroU64, kernel_control_ipa: u64, tags: T) -> Self {
+    pub fn new(carrier: NonZeroU64, control: Option<ForkControlCapacity>, tags: T) -> Self {
         Self {
             carrier,
-            controls: ForkControlCapacity::new(kernel_control_ipa)
+            controls: control
+                .filter(|control| matches!(control, ForkControlCapacity::Exclusive { .. }))
                 .into_iter()
                 .collect(),
+            unused_control: control
+                .filter(|control| matches!(control, ForkControlCapacity::Unused { .. })),
             tables: Vec::new(),
             lifecycles: Vec::new(),
             pending: Vec::new(),
@@ -624,14 +644,19 @@ impl<T: ChildAddressTags> ForkStock<T> {
         unique.dedup();
         if controls.is_empty()
             || unique.len() != controls.len()
+            || controls
+                .iter()
+                .any(|control| !matches!(control, ForkControlCapacity::Exclusive { .. }))
             || !self.tables.is_empty()
             || !self.lifecycles.is_empty()
             || !self.children.is_empty()
+            || !self.committed_tables.is_empty()
             || self.pending.iter().any(Option::is_some)
         {
             return Err(ForkStockServiceError::InvalidRecord);
         }
         self.controls = controls;
+        self.unused_control = None;
         Ok(())
     }
 
@@ -810,7 +835,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
         if self.lifecycles.is_empty() {
             return self.refuse_capacity(exchange, ForkCapacityResource::Lifecycle, execution.cpu);
         }
-        if self.controls.is_empty() {
+        if self.controls.is_empty() && self.unused_control.is_none() {
             return self.refuse_capacity(exchange, ForkCapacityResource::Control, execution.cpu);
         }
         let Some((child_tables, parent_tables)) =
@@ -841,7 +866,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
                 self.refuse_capacity(exchange, ForkCapacityResource::Lifecycle, execution.cpu);
             return released.map_err(|_| ForkStockRefusal::Invalid).and(refused);
         };
-        let Some(control) = self.controls.pop() else {
+        let Some(control) = self.unused_control.or_else(|| self.controls.pop()) else {
             self.tables.extend(child_tables);
             self.tables.extend(parent_tables);
             self.lifecycles.push(lifecycle);
@@ -971,7 +996,9 @@ impl<T: ChildAddressTags> ForkStock<T> {
         self.tables.extend(reserved.child_tables);
         self.tables.extend(reserved.parent_tables);
         self.lifecycles.push(reserved.lifecycle);
-        self.controls.push(reserved.control);
+        if matches!(reserved.control, ForkControlCapacity::Exclusive { .. }) {
+            self.controls.push(reserved.control);
+        }
         self.tags
             .release_unpublished(reserved.tag)
             .map_err(|_| ForkStockRefusal::Invalid)
@@ -1081,7 +1108,9 @@ impl<T: ChildAddressTags> ForkStock<T> {
             self.tables.extend(pending.child_tables);
             self.tables.extend(pending.parent_tables);
             self.lifecycles.push(pending.lifecycle);
-            self.controls.push(pending.control);
+            if matches!(pending.control, ForkControlCapacity::Exclusive { .. }) {
+                self.controls.push(pending.control);
+            }
         } else {
             let completion =
                 self.validate_commit(execution, settlement, &is_resolvable, &is_clean)?;
@@ -1236,7 +1265,9 @@ impl<T: ChildAddressTags> ForkStock<T> {
                 self.tables.extend(pages);
             }
             self.lifecycles.push(child.lifecycle);
-            self.controls.push(child.control);
+            if matches!(child.control, ForkControlCapacity::Exclusive { .. }) {
+                self.controls.push(child.control);
+            }
             self.quarantine.remove(&key);
             reclaimed += 1;
             self.counters.returned_children = self.counters.returned_children.saturating_add(1);

@@ -73,12 +73,12 @@ fn lifecycles(count: u64) -> Vec<ForkLifecycleLoan> {
 }
 
 fn stock<T: ChildAddressTags>(tags: T, pages: u64, records: u64) -> ForkStock<T> {
-    let mut stock = ForkStock::new(CARRIER, 0x1_0000_0000, tags);
+    let mut stock = ForkStock::new(CARRIER, ForkControlCapacity::exclusive(0x1_0000_0000), tags);
     if records != 0 {
         stock
             .install_control_capacity(
                 (0..records)
-                    .map(|n| ForkControlCapacity::new(0x1_0000_0000 + n * 0x20_0000).unwrap())
+                    .map(|n| ForkControlCapacity::exclusive(0x1_0000_0000 + n * 0x20_0000).unwrap())
                     .collect(),
             )
             .unwrap();
@@ -593,7 +593,11 @@ fn x86_loan(
 fn kvm_lifecycle_window_cycles_exceed_stock_with_cleared_records() {
     let mut bytes = MetadataBytes::new();
     let window = bytes.window();
-    let mut stock = ForkStock::new(CARRIER, 0x1_0000_0000, UntaggedRoots);
+    let mut stock = ForkStock::new(
+        CARRIER,
+        ForkControlCapacity::unused(0x1_0000_0000),
+        UntaggedRoots,
+    );
     stock
         .install(
             (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
@@ -691,7 +695,11 @@ fn lifecycle_window_clear_refuses_graph_referenced_control_and_defers_reclaim() 
 fn kvm_unclearable_lifecycle_record_is_never_reissued_dirty() {
     let mut bytes = MetadataBytes::new();
     let window = bytes.window();
-    let mut stock = ForkStock::new(CARRIER, 0x1_0000_0000, UntaggedRoots);
+    let mut stock = ForkStock::new(
+        CARRIER,
+        ForkControlCapacity::unused(0x1_0000_0000),
+        UntaggedRoots,
+    );
     stock
         .install(
             (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
@@ -731,7 +739,11 @@ fn kvm_unclearable_lifecycle_record_is_never_reissued_dirty() {
 fn kvm_live_children_beyond_lifecycle_records_are_counted_refusals() {
     let mut bytes = MetadataBytes::new();
     let window = bytes.window();
-    let mut stock = ForkStock::new(CARRIER, 0x1_0000_0000, UntaggedRoots);
+    let mut stock = ForkStock::new(
+        CARRIER,
+        ForkControlCapacity::unused(0x1_0000_0000),
+        UntaggedRoots,
+    );
     stock
         .install(
             (0..32).map(|n| page(0x20_0000 + n * 4096)).collect(),

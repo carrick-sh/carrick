@@ -30,11 +30,7 @@ impl ForkStockHostCustody {
     }
     pub fn with_asids(carrier: NonZeroU64, asids: AsidAllocator) -> Self {
         Self {
-            owner: ForkStock::new(
-                carrier,
-                carrick_mem::memory::LINUX_KERNEL_REGION_BASE,
-                asids,
-            ),
+            owner: ForkStock::new(carrier, None, asids),
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             backing: None,
             run_failure: Default::default(),
@@ -97,7 +93,7 @@ impl ForkStockHostCustody {
                 };
             if ordinal < control_count {
                 controls.push(
-                    carrick_hal::fork_stock::ForkControlCapacity::new(base)
+                    carrick_hal::fork_stock::ForkControlCapacity::exclusive(base)
                         .ok_or_else(|| fail("unaligned fork control capacity"))?,
                 );
             } else {
