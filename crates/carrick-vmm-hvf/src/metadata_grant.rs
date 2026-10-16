@@ -1258,6 +1258,30 @@ fn complete_metadata_request(
     Ok(())
 }
 
+/// Native stock crossings retain an ABI stack, not a physical inventory row.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn service_native_fork_stock(
+    custody: &crate::trap::CarrierVmCustody,
+    generation: Option<crate::trap::CarrierVmGeneration>,
+    cpu: carrick_guest_arch::CpuId,
+    address: carrick_guest_arch::KernelVa,
+    requested_cpu: u64,
+    _ttbr0: u64,
+    _region: &[u8],
+) -> Result<[u64; 4], TrapError> {
+    service_metadata_operation(
+        custody,
+        generation,
+        cpu,
+        None,
+        GRANT_OP_FORK_STOCK,
+        address.raw(),
+        requested_cpu,
+        0,
+    )
+}
+
 /// Physical process crossings use HVC #6. Metadata allocation uses its mailbox.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn handle_metadata_grant_trap(
@@ -1317,7 +1341,32 @@ pub(crate) fn handle_metadata_grant_trap(
     } else {
         None
     };
-    let result = if matches!(
+    let result = if op == GRANT_OP_FORK_STOCK {
+        let pointer = carrick_el1_abi::get_el1_region_host_ptr();
+        if pointer == 0 {
+            [METADATA_GRANT_ERR_INVALID, 0, 0, 0]
+        } else {
+            // SAFETY: the stopped lane retains the initialized kernel ABI mapping.
+            let region = unsafe {
+                core::slice::from_raw_parts(
+                    pointer as *const u8,
+                    carrick_el1_abi::EL1_REGION_SIZE as usize,
+                )
+            };
+            let ttbr0 = vcpu
+                .get_sys_reg(applevisor::vcpu::SysReg::TTBR0_EL1)
+                .map_err(|error| TrapError::Hypervisor(format!("read fork root: {error}")))?;
+            service_native_fork_stock(
+                custody,
+                generation,
+                cpu,
+                carrick_guest_arch::KernelVa::new(arg1),
+                arg2,
+                ttbr0,
+                region,
+            )?
+        }
+    } else if matches!(
         op,
         carrick_el1_abi::GRANT_OP_CHILD_RETIRE | carrick_el1_abi::GRANT_OP_WAIT_CHANNEL_WAKE
     ) {
