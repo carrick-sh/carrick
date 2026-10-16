@@ -1144,29 +1144,8 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         address: UserVa,
         status: LinuxWaitStatus,
     ) -> Result<(), NativeProcessError> {
-        if self.task.mm.key.load(Ordering::Acquire) != parent.mm.raw().get() {
-            return Err(NativeProcessError::Stale);
-        }
-        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-        {
-            let ttbr0 = crate::isa::aarch64::hardware_live_ttbr();
-            if (ttbr0 & AARCH64_ROOT_ADDRESS_MASK) != parent.root.address().raw() {
-                return Err(NativeProcessError::Stale);
-            }
-        }
         let bytes = status.raw().to_ne_bytes();
-        let copied = unsafe {
-            crate::file::copy_to_user_guarded(
-                self.task,
-                address.raw() as *mut u8,
-                bytes.as_ptr(),
-                bytes.len(),
-            )
-        };
-        if !copied {
-            return Err(NativeProcessError::Fault);
-        }
-        Ok(())
+        self.copy_signal_bytes(parent, address, &bytes)
     }
 
     fn quarantine_prepared(&mut self, prepared: Self::PreparedMm) {
