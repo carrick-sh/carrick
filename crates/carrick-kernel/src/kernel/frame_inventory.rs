@@ -3014,7 +3014,11 @@ mod tests {
             )
         };
         let carrier = NonZeroU64::new(7).expect("carrier");
-        let mut stock = ForkStock::new(carrier, 0x1_0000_0000, UntaggedRoots);
+        let mut stock = ForkStock::new(
+            carrier,
+            carrick_hal::fork_stock::ForkControlCapacity::unused(0x1_0000_0000),
+            UntaggedRoots,
+        );
         stock
             .install(
                 (0..4)
