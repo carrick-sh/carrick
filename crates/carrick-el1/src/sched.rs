@@ -308,20 +308,30 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// runnable thread, or leave for the host when that thread needs its
     /// executor, or idle.
     pub(crate) fn run_next(&mut self, frame: &mut TrapFrame, timeout_result: u64) -> Served {
+        match self.run_ready(frame) {
+            Some(progress) => progress,
+            None => self.idle(frame, timeout_result),
+        }
+    }
+
+    /// Consume already-ready zone work after an owned native park. No work
+    /// leaves the caller's host handoff intact, so its execution capacity can
+    /// be released without sending a native child to a host-task adopter.
+    pub(crate) fn run_ready(&mut self, frame: &mut TrapFrame) -> Option<Served> {
         loop {
             if let Some(switched) = self.zone.switch_in_full(self.slot) {
                 match self.load(frame, switched) {
-                    LoadResult::Running => return Served::Returned { switched: true },
-                    LoadResult::NeedsHost => return self.service_exit(),
+                    LoadResult::Running => return Some(Served::Returned { switched: true }),
+                    LoadResult::NeedsHost => return Some(self.service_exit()),
                     LoadResult::Left => continue,
                 }
             }
             break;
         }
         if self.zone.head_needs_host(self.slot) {
-            return self.service_exit();
+            return Some(self.service_exit());
         }
-        self.idle(frame, timeout_result)
+        None
     }
 
     /// A thread EL1 just created (`clone`), unpublished and with the context
