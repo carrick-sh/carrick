@@ -9,6 +9,78 @@ use carrick_el1_abi::{
 use carrick_guest_arch::{ContextGeneration, FrameGpa, KernelVa, MmGeneration};
 use std::cell::RefCell;
 
+#[test]
+fn committed_child_retains_physical_custody_through_quarantine() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct PhysicalPin(Arc<AtomicUsize>);
+    impl Drop for PhysicalPin {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let mut stock: ForkStock<UntaggedRoots, PhysicalPin> = ForkStock::new(
+        CARRIER,
+        ForkControlCapacity::exclusive(0x1_0000_0000),
+        UntaggedRoots,
+    );
+    stock
+        .install(
+            (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            lifecycles(1),
+        )
+        .unwrap();
+    let parent = parent();
+    let mut exchange = ForkStockExchange::new(request(parent, 302, 2, 1)).unwrap();
+    let loan = stock
+        .loan(&mut NoTableLedger, parent, &mut exchange, |_| true)
+        .unwrap();
+    let completion = PortalForkCompletion {
+        request: loan.request,
+        // SAFETY: exact admitted child fixture.
+        child: unsafe {
+            El1MmHandle::from_admitted_owner(CARRIER, loan.request.child_mm, NonZeroU64::MIN)
+        },
+        parent_generation: ReservationGeneration::INITIAL,
+        child_tables_used: 4096,
+        parent_tables_used: 0,
+    };
+    let mut settlement =
+        ForkStockSettlement::new(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
+            .unwrap();
+    stock
+        .settle(
+            &mut NoTableLedger,
+            parent,
+            &mut settlement,
+            PhysicalPin(Arc::clone(&dropped)),
+            |_| true,
+            |_| true,
+            |_| true,
+        )
+        .unwrap();
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    let child = child_of(loan, 43);
+    let mut retire = NativeChildRetire::new(child.binding, child.context).unwrap();
+    stock.retire_child(child, &mut retire).unwrap();
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    stock
+        .reclaim(
+            &mut NoTableLedger,
+            mm(PARENT_MM),
+            absent,
+            |_| true,
+            |_| true,
+            |_| true,
+        )
+        .unwrap();
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+}
+
 const CARRIER: NonZeroU64 = NonZeroU64::new(7).unwrap();
 const PARENT_MM: u64 = 301;
 
@@ -127,6 +199,7 @@ fn commit<T: ChildAddressTags>(
         &mut NoTableLedger,
         exec,
         &mut settlement,
+        (),
         |_| true,
         |_| true,
         |_| true,
@@ -383,6 +456,7 @@ fn abort_returns_cleared_lifecycle_and_untouched_tables() {
             &mut NoTableLedger,
             parent(),
             &mut abort,
+            (),
             |_| true,
             |_| true,
             |_| false
@@ -396,6 +470,7 @@ fn abort_returns_cleared_lifecycle_and_untouched_tables() {
             &mut NoTableLedger,
             parent(),
             &mut abort,
+            (),
             |_| true,
             |_| true,
             |life| {
@@ -442,6 +517,7 @@ fn abort_settle_is_atomic_on_tag_release_failure() {
         &mut NoTableLedger,
         parent(),
         &mut abort,
+        (),
         |_| true,
         |_| true,
         |_| true,
@@ -464,6 +540,7 @@ fn abort_refuses_dirty_tables_and_subsequent_loan_refuses_until_scrubbed_and_abo
         &mut NoTableLedger,
         exec,
         &mut abort,
+        (),
         |_| true,
         |_| is_clean.get(),
         |_| true,
@@ -482,6 +559,7 @@ fn abort_refuses_dirty_tables_and_subsequent_loan_refuses_until_scrubbed_and_abo
         &mut NoTableLedger,
         exec,
         &mut abort,
+        (),
         |_| true,
         |_| is_clean.get(),
         |_| true,
@@ -519,6 +597,7 @@ fn commit_refuses_dirty_unused_tables() {
             &mut NoTableLedger,
             parent(),
             &mut settlement,
+            (),
             |_| true,
             |_| false,
             |_| true
@@ -1317,6 +1396,7 @@ fn second_root_reuses_carrier_fork_stock_after_first_root_exits() {
             &mut ledger,
             root1,
             &mut settlement1,
+            (),
             |_| true,
             |_| true,
             |_| true,
