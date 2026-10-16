@@ -1448,3 +1448,6 @@ contracts = ["kernel.x86.file-region"]
 path = "crates/carrick-hal/src/trap.rs"
 contracts = ["kernel.x86.file-region"]
 
+[[surfaces]]
+path = "crates/carrick-core/src/mm/transaction/user_write.rs"
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
