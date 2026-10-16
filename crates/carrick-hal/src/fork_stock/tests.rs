@@ -73,7 +73,16 @@ fn lifecycles(count: u64) -> Vec<ForkLifecycleLoan> {
 }
 
 fn stock<T: ChildAddressTags>(tags: T, pages: u64, records: u64) -> ForkStock<T> {
-    let mut stock = ForkStock::new(CARRIER, 0x1_0000_0000, tags);
+    let mut stock = ForkStock::new(CARRIER, ForkControlCapacity::exclusive(0x1_0000_0000), tags);
+    if records != 0 {
+        stock
+            .install_control_capacity(
+                (0..records)
+                    .map(|n| ForkControlCapacity::exclusive(0x1_0000_0000 + n * 0x20_0000).unwrap())
+                    .collect(),
+            )
+            .unwrap();
+    }
     stock
         .install(
             (0..pages).map(|n| page(0x20_0000 + n * 4096)).collect(),
@@ -204,6 +213,45 @@ fn sequential_cycles_beyond_stock<T: ChildAddressTags>(tags: T) -> ForkStock<T> 
     assert_eq!(counters.capacity_refusals, 0);
     assert_eq!(cleared.borrow().len(), cycles as usize);
     stock
+}
+
+#[test]
+fn arm_fork_children_receive_distinct_control_capacity() {
+    let mut stock = stock(AsidAllocator::with_limit_for_tests(2), 8, 2);
+    let first = loan(&mut stock, parent(), 302, 1, 1).unwrap();
+    commit(&mut stock, parent(), first, 1, 0).unwrap();
+    let second = loan(&mut stock, parent(), 303, 1, 1).unwrap();
+    assert_ne!(
+        first.request.child_tables.base,
+        second.request.child_tables.base
+    );
+    assert_ne!(
+        first.request.kernel_control_ipa, second.request.kernel_control_ipa,
+        "two live children must not copy their identity pages into one physical control window"
+    );
+}
+
+#[test]
+fn arm_control_windows_scale_past_eight_live_children() {
+    let mut stock = ForkStock::new(CARRIER, None, AsidAllocator::new());
+    stock
+        .install(
+            (0..64).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            lifecycles(12),
+        )
+        .unwrap();
+    let mut controls = std::collections::BTreeSet::new();
+    for child in 0..12 {
+        assert!(stock.needs_control_capacity());
+        stock
+            .provide_arm_control_capacity(0x1_0000_0000 + child * CONTROL_WINDOW_BYTES)
+            .unwrap();
+        let granted = loan(&mut stock, parent(), 302 + child, 1, 1).unwrap();
+        assert!(controls.insert(granted.request.kernel_control_ipa));
+        commit(&mut stock, parent(), granted, 1, 0).unwrap();
+    }
+    assert_eq!(stock.live_children(), 12);
+    assert_eq!(stock.counters().capacity_refusals, 0);
 }
 
 #[test]
@@ -568,7 +616,11 @@ fn x86_loan(
 fn kvm_lifecycle_window_cycles_exceed_stock_with_cleared_records() {
     let mut bytes = MetadataBytes::new();
     let window = bytes.window();
-    let mut stock = ForkStock::new(CARRIER, 0x1_0000_0000, UntaggedRoots);
+    let mut stock = ForkStock::new(
+        CARRIER,
+        ForkControlCapacity::unused(0x1_0000_0000),
+        UntaggedRoots,
+    );
     stock
         .install(
             (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
@@ -607,7 +659,11 @@ fn kvm_lifecycle_window_cycles_exceed_stock_with_cleared_records() {
 fn lifecycle_window_clear_refuses_graph_referenced_control_and_defers_reclaim() {
     let mut bytes = MetadataBytes::new();
     let window = bytes.window();
-    let mut stock = ForkStock::new(CARRIER, 0x1_0000_0000, UntaggedRoots);
+    let mut stock = ForkStock::new(
+        CARRIER,
+        ForkControlCapacity::unused(0x1_0000_0000),
+        UntaggedRoots,
+    );
     stock
         .install(
             (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
@@ -666,7 +722,11 @@ fn lifecycle_window_clear_refuses_graph_referenced_control_and_defers_reclaim() 
 fn kvm_unclearable_lifecycle_record_is_never_reissued_dirty() {
     let mut bytes = MetadataBytes::new();
     let window = bytes.window();
-    let mut stock = ForkStock::new(CARRIER, 0x1_0000_0000, UntaggedRoots);
+    let mut stock = ForkStock::new(
+        CARRIER,
+        ForkControlCapacity::unused(0x1_0000_0000),
+        UntaggedRoots,
+    );
     stock
         .install(
             (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
@@ -706,7 +766,11 @@ fn kvm_unclearable_lifecycle_record_is_never_reissued_dirty() {
 fn kvm_live_children_beyond_lifecycle_records_are_counted_refusals() {
     let mut bytes = MetadataBytes::new();
     let window = bytes.window();
-    let mut stock = ForkStock::new(CARRIER, 0x1_0000_0000, UntaggedRoots);
+    let mut stock = ForkStock::new(
+        CARRIER,
+        ForkControlCapacity::unused(0x1_0000_0000),
+        UntaggedRoots,
+    );
     stock
         .install(
             (0..32).map(|n| page(0x20_0000 + n * 4096)).collect(),

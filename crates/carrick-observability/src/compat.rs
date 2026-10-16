@@ -1026,6 +1026,7 @@ pub enum ForkCapacityResource {
     LoanIdentity = 4,
     AddressTag = 5,
     Ledger = 6,
+    Control = 7,
 }
 
 /// Occupancy proof from the drain immediately preceding admission.
