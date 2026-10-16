@@ -271,6 +271,22 @@ mod tests {
         assert_eq!(sp, 0x20000);
     }
     #[test]
+    fn arm_public_return_restores_saved_autodisarm_altstack() {
+        let mut signal = valid();
+        signal.ucontext.uc_stack = carrick_syscall_abi::LinuxSignalStack {
+            ss_sp: 0x10_0000,
+            ss_flags: carrick_syscall_abi::LINUX_SS_AUTODISARM as i32,
+            _pad0: 0,
+            ss_size: 8192,
+        };
+        let mut frame = TrapFrame::default();
+        let (_, _, restored_stack) =
+            restore(&mut frame, &signal, &mut [0; 528], UserVa::new(0x40000)).unwrap();
+        assert_eq!(restored_stack.sp, 0x10_0000);
+        assert_eq!(restored_stack.size, 8192);
+        assert_eq!(restored_stack.flags, carrick_syscall_abi::LINUX_SS_AUTODISARM as u32);
+    }
+    #[test]
     fn forged_ucontext_el1_is_refused_without_publication() {
         let mut signal = valid();
         signal.ucontext.uc_mcontext.pstate = 5;
