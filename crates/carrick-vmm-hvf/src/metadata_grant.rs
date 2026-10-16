@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// slice: a wire reply mutates its stopped CPU's stack while other CPUs may
 /// use disjoint atomic ABI records in the same mapping.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub(crate) struct RetainedAbiRegion<'a> {
     base: core::ptr::NonNull<u8>,
     _retained: core::marker::PhantomData<&'a core::cell::UnsafeCell<u8>>,
