@@ -54,12 +54,7 @@ impl ForkStockHostCustody {
         let mut arenas = Vec::new();
         let mut tables = Vec::new();
         let roots = resources.tables.arenas();
-        let control_count = roots.len() / 2;
-        if control_count == 0 {
-            return Err(fail("native fork stock has no per-child control capacity"));
-        }
-        let mut controls = Vec::new();
-        for (ordinal, root) in roots.iter().enumerate() {
+        for root in roots {
             let epoch = crate::trap::next_structural_epoch()?;
             let base = root.address().raw();
             let len = crate::frame_pool::ROOT_SLOT_SIZE;
@@ -94,25 +89,14 @@ impl ForkStockHostCustody {
                         custody, mapping, lease, perms, epoch, base, len,
                     )?
                 };
-            if ordinal < control_count {
-                controls.push(
-                    carrick_hal::fork_stock::ForkControlCapacity::exclusive(base)
-                        .ok_or_else(|| fail("unaligned fork control capacity"))?,
+            for offset in (0..len).step_by(4096) {
+                tables.push(
+                    RootGpa::page_aligned(FrameGpa::new(base + offset as u64))
+                        .ok_or_else(|| fail("unaligned fork arena"))?,
                 );
-            } else {
-                for offset in (0..len).step_by(4096) {
-                    tables.push(
-                        RootGpa::page_aligned(FrameGpa::new(base + offset as u64))
-                            .ok_or_else(|| fail("unaligned fork arena"))?,
-                    );
-                }
             }
             arenas.push(owner);
         }
-        stock
-            .owner
-            .install_control_capacity(controls)
-            .map_err(|error| fail(&format!("native fork control install: {error:?}")))?;
         let generation = custody
             .live_generation()
             .ok_or_else(|| fail("native fork stock has no live carrier"))?;
@@ -143,6 +127,52 @@ impl ForkStockHostCustody {
             resources,
             _arenas: arenas,
         });
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn ensure_control_capacity(
+        &mut self,
+        custody: &std::sync::Arc<CarrierVmCustody>,
+    ) -> Result<(), carrick_hal::TrapError> {
+        use carrick_hal::TrapError;
+        if !self.owner.needs_control_capacity() {
+            return Ok(());
+        }
+        if self.backing.is_none() {
+            return Err(TrapError::Hypervisor("native fork backing absent".into()));
+        }
+        let len = usize::try_from(carrick_el1_abi::AARCH64_KERNEL_CONTROL_SIZE)
+            .map_err(|_| TrapError::Hypervisor("native fork control size overflow".into()))?;
+        let mut lease = crate::trap::GlobalFrameStage2Lease::reserve(len as u64, len as u64)?;
+        let base = lease.base();
+        let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            len,
+            crate::host_mapping::HostMappingKind::PerMmKernelState,
+        )
+        .map_err(|error| TrapError::Hypervisor(format!("native fork control backing: {error}")))?;
+        let perms = u64::from(applevisor::memory::MemPerms::ReadWriteExec);
+        // SAFETY: the fresh IPA lease and mapping are retained by the owner.
+        let result =
+            unsafe { crate::trap::inventory_hv_vm_map(mapping.as_ptr().cast(), base, len, perms) };
+        if result != 0 {
+            return Err(TrapError::Hypervisor(format!(
+                "native fork control map: {result:#x}"
+            )));
+        }
+        lease.mark_mapped();
+        let epoch = crate::trap::next_structural_epoch()?;
+        let owner = crate::trap::StructuralBackingOwner::new_in(
+            custody, mapping, lease, perms, epoch, base, len,
+        )?;
+        self.owner
+            .provide_arm_control_capacity(base)
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("native fork control install: {error:?}"))
+            })?;
+        if let Some(backing) = self.backing.as_mut() {
+            backing._arenas.push(owner);
+        }
         Ok(())
     }
 
