@@ -11884,14 +11884,6 @@ fn owner_copyin_wait_retains_write_before_any_guest_result() {
     assert!(sibling.task().thread(sibling.thread().key().tid).is_some());
 }
 
-// Named control for replaying the production close/reuse witness on main.
-// The pre-fix path fails at its first owner suspension; the later assertions
-// pin the original description and reject a numeric-slot replay on this tree.
-#[test]
-fn main_owner_wait_fd_reuse_control_is_red() {
-    owner_copyin_wait_retains_write_before_any_guest_result();
-}
-
 #[test]
 fn write_bad_pointer_still_returns_efault() {
     struct BadPointer;
