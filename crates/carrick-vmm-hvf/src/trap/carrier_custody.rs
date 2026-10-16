@@ -1375,7 +1375,7 @@ impl CarrierVmCustody {
         carrick_core::mm::retirement::pin_record(
             record,
             identity,
-            CarrierPinVenue(std::sync::Arc::clone(self)),
+            CarrierPinVenue(std::sync::Arc::downgrade(self)),
         )
     }
 
@@ -1419,11 +1419,13 @@ impl CarrierVmCustody {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(::core::fmt::Debug)]
-pub(crate) struct CarrierPinVenue(std::sync::Arc<CarrierVmCustody>);
+pub(crate) struct CarrierPinVenue(std::sync::Weak<CarrierVmCustody>);
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl carrick_core::mm::retirement::RecordPinVenue for CarrierPinVenue {
     fn release_pin(&self, identity: CarrierStage2RecordIdentity) {
-        self.0.release_stage2_pin(identity);
+        if let Some(custody) = self.0.upgrade() {
+            custody.release_stage2_pin(identity);
+        }
     }
 }
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

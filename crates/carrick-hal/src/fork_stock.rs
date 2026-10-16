@@ -1350,7 +1350,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
     }
 }
 
-impl ForkStock<AsidAllocator> {
+impl<C> ForkStock<AsidAllocator, C> {
     /// Admit one newly mapped AArch64 control window before the next loan.
     /// The constructor is ISA-bound: `ForkStock<UntaggedRoots>` has no such
     /// method and cannot manufacture an exclusive capacity through `new`.
