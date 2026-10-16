@@ -528,7 +528,9 @@ impl SignalReadinessProbe {
         let host_signum = self.host_signal.take_pending_for(self.thread.tid.raw());
         if matches!(
             self.family,
-            ContinuationFamily::VforkParent | ContinuationFamily::PtraceStopSettle
+            ContinuationFamily::VforkParent
+                | ContinuationFamily::PtraceStopSettle
+                | ContinuationFamily::KillableOwnerZone
         ) {
             // A ptrace request waiting out its tracee's stop settlement is
             // killable-only for the same reason: it has performed nothing,

@@ -37,6 +37,11 @@ pub(super) enum OwnerMemoryAction {
     Retained,
 }
 
+enum ZoneWaitPolicy {
+    Ordinary(Option<std::time::Duration>),
+    KillableOwnerWrite,
+}
+
 thread_local! {
     /// The zone thread this executor thread took off its vCPU at the last
     /// exit (EL1 plan 1d): it claims that thread itself next, rather than
@@ -215,23 +220,6 @@ pub(super) fn owner_wait_interruption(
             Some(DispatchOutcome::Errno { errno: *errno })
         }
         _ => None,
-    }
-}
-
-fn owned_owner_wait_interruption(
-    completion: &carrick_kernel::kernel::continuation::ContinuationCompletion,
-    retained_copy: bool,
-    reserved_signum: Option<i32>,
-) -> Option<DispatchOutcome> {
-    // User-copy page waits are killable: an ordinary signal remains pending
-    // while the exact transfer retries its owner dependency. SIGKILL alone
-    // ends the wait; common signal delivery terminates the task.
-    if retained_copy && reserved_signum == Some(carrick_abi::LINUX_SIGKILL) {
-        Some(DispatchOutcome::errno(carrick_abi::LINUX_EINTR))
-    } else if !retained_copy {
-        owner_wait_interruption(completion)
-    } else {
-        None
     }
 }
 
@@ -430,7 +418,14 @@ where
         };
         let own = zone.record_ref(own);
         let request = SyscallRequest::new(98, carrick_observability::compat::SyscallArgs([0; 6]));
-        let exit = self.settle_into_zone(control, state, own, seq, timeout, request)?;
+        let exit = self.settle_into_zone(
+            control,
+            state,
+            own,
+            seq,
+            ZoneWaitPolicy::Ordinary(timeout),
+            request,
+        )?;
         Ok(Some(exit))
     }
 
@@ -507,7 +502,7 @@ where
         base: GuestCpuState,
         record: RecordRef,
         seq: u32,
-        timeout: Option<std::time::Duration>,
+        policy: ZoneWaitPolicy,
         request: SyscallRequest,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         let context = self
@@ -525,12 +520,11 @@ where
             carrick_kernel::kernel::continuation::RestartClass::Never,
         )
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-        let continuation =
-            carrick_kernel::kernel::continuation::BlockedContinuation::from_zone_park(
-                capture,
-                carrick_kernel::kernel::continuation::ZoneWait::new(record, seq),
-                timeout,
-            );
+        let wait = carrick_kernel::kernel::continuation::ZoneWait::new(record, seq);
+        let continuation = match policy {
+            ZoneWaitPolicy::KillableOwnerWrite => carrick_kernel::kernel::continuation::BlockedContinuation::from_killable_owner_zone_park(capture, wait),
+            ZoneWaitPolicy::Ordinary(timeout) => carrick_kernel::kernel::continuation::BlockedContinuation::from_zone_park(capture, wait, timeout),
+        };
         let binding = control.binding.ok_or_else(|| {
             RuntimeError::Configuration("EL1 zone settle without a task binding".to_owned())
         })?;
@@ -651,7 +645,14 @@ where
         engine.discard_terminal_syscall_continuation()?;
         self.state.retire_syscall()?;
         let record = zone.record_ref(record);
-        self.settle_into_zone(control, state, record, seq, timeout, request)
+        self.settle_into_zone(
+            control,
+            state,
+            record,
+            seq,
+            ZoneWaitPolicy::Ordinary(timeout),
+            request,
+        )
     }
 
     /// Enroll an exact EL1 owner release before surrendering the executor.
@@ -770,7 +771,11 @@ where
                             state,
                             zone.record_ref(record),
                             seq,
-                            None,
+                            if matches!(resume, OwnedSyscallResume::PreparedWrite(_)) {
+                                ZoneWaitPolicy::KillableOwnerWrite
+                            } else {
+                                ZoneWaitPolicy::Ordinary(None)
+                            },
                             request,
                         )?;
                         self.phase = HvpatchProductionPhase::ResumeOwnerZone { frame, resume };
@@ -848,11 +853,7 @@ where
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         let mut result = self.consume_owner_zone(control)?;
         let reserved_signum = result.reserved_signal().map(|signal| signal.signum());
-        let interruption = owned_owner_wait_interruption(
-            &result.completion,
-            matches!(resume, OwnedSyscallResume::PreparedWrite(_)),
-            reserved_signum,
-        );
+        let interruption = owner_wait_interruption(&result.completion);
         let reserved = result.take_reserved_signal();
         // The restored CPU still owns the pending syscall's EL1 trap frame.
         // Carry the reservation to common completion, which publishes the
@@ -1333,8 +1334,15 @@ where
                     self.state.retire_syscall()?;
                 }
                 let record = zone.record_ref(record);
-                self.settle_into_zone(control, state, record, seq, None, request)
-                    .map(IpcParkAttempt::Parked)
+                self.settle_into_zone(
+                    control,
+                    state,
+                    record,
+                    seq,
+                    ZoneWaitPolicy::Ordinary(None),
+                    request,
+                )
+                .map(IpcParkAttempt::Parked)
             }
             Err((host_ipc::ObjectWaitError::Changed, token)) => {
                 let token = host_ipc::from_sched_token(token).ok_or_else(|| {
@@ -1835,38 +1843,5 @@ mod ipc_tests {
         let (state, completed) = settle_served_state(syscall_state(226, 0x5000), None);
         assert!(!completed);
         assert_eq!(x0_x1(&state).0, 0x5000, "a forwarded call keeps its frame");
-    }
-
-    #[test]
-    fn retained_copyin_owner_wait_is_killable_only() {
-        use carrick_kernel::kernel::continuation::ContinuationCompletion;
-        let interrupted = ContinuationCompletion::Errno(carrick_abi::LINUX_EINTR);
-        assert_eq!(
-            super::owned_owner_wait_interruption(
-                &interrupted,
-                true,
-                Some(carrick_abi::LINUX_SIGUSR1)
-            ),
-            None,
-            "ordinary signal remains pending until the owned write completes",
-        );
-        assert_eq!(
-            super::owned_owner_wait_interruption(
-                &interrupted,
-                true,
-                Some(carrick_abi::LINUX_SIGKILL)
-            ),
-            Some(DispatchOutcome::errno(carrick_abi::LINUX_EINTR)),
-            "fatal signal ends the wait for terminal delivery",
-        );
-        assert_eq!(
-            super::owned_owner_wait_interruption(
-                &ContinuationCompletion::Redispatch,
-                true,
-                Some(carrick_abi::LINUX_SIGKILL),
-            ),
-            Some(DispatchOutcome::errno(carrick_abi::LINUX_EINTR)),
-            "fatal signal wins even when owner release races the wake",
-        );
     }
 }
