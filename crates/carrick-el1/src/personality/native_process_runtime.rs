@@ -25,7 +25,9 @@ use carrick_personality_linux::{
         IpcOutcome, LinuxMsginfo, LinuxMsqidDs, LinuxSembuf, LinuxSemidDs, LinuxSeminfo,
         MsgrcvResult, ProcessIpcVenue,
     },
-    lifecycle::{LifecycleOutcome, LinuxWaitOptions, ProcessNative, ProcessWaitPid},
+    lifecycle::{
+        LifecycleOutcome, LinuxWaitOptions, ProcessForkChildTid, ProcessNative, ProcessWaitPid,
+    },
 };
 #[cfg(test)]
 use carrick_sched_core::BoundedSpin;
@@ -430,6 +432,8 @@ pub struct NativeResources<'a, M, C: ProcessContext> {
     members: Vec<NativeMember<'a, C>>,
     mm: M,
     address: AddressContext<RootGpa>,
+    /// Consumed on the child's first return to user mode, after its MM split.
+    pending_child_tid: Option<UserVa>,
     signals: NativeProcessSignals<carrick_personality_linux::abi::signal::LinuxSiginfo>,
     _thread_claim: NativeClaim,
     channel: Option<Arc<WaitChannel>>,
@@ -1959,6 +1963,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             members,
             mm,
             address,
+            pending_child_tid: None,
             signals: NativeProcessSignals::fresh_root(key),
             _thread_claim: thread_claim,
             channel: None,
@@ -3457,6 +3462,34 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub fn resume_checkpoint(
         &mut self,
     ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureReason> {
+        // CLONE_CHILD_SETTID is an effect in the child's MM. The selected
+        // record now owns that MM, and no EL0 instruction has resumed yet.
+        let pending = {
+            let graph = self.runtime.graph.lock();
+            let resources = graph
+                .owner
+                .task(self.key)
+                .map_err(|_| NativeProcessError::Stale.run_failure_reason())?
+                .native()
+                .resources();
+            resources
+                .pending_child_tid
+                .map(|address| (resources.mm.clone(), address))
+        };
+        if let Some((mm, address)) = pending {
+            self.service
+                .copy_signal_bytes(&mm, address, &self.calling_tid.to_ne_bytes())
+                .map_err(NativeProcessError::run_failure_reason)?;
+            self.runtime
+                .graph
+                .lock()
+                .owner
+                .task_mut(self.key)
+                .map_err(|_| NativeProcessError::Stale.run_failure_reason())?
+                .native_mut()
+                .resources_mut()
+                .pending_child_tid = None;
+        }
         let outcome = self.resume_pending_lifecycle();
         if let Some(reason) = self.take_run_failure() {
             return Err(reason);
@@ -4007,6 +4040,60 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // check. Re-enrol on the channel and recheck under its lock.
         };
         let _identity = settled.identity();
+        let clear_child_tid = self.control.clear_child_tid();
+        if clear_child_tid != 0 {
+            let mm = self
+                .runtime
+                .graph
+                .lock()
+                .owner
+                .task(self.key)
+                .map_err(|_| NativeProcessError::Stale)?
+                .native()
+                .resources()
+                .mm
+                .clone();
+            if self
+                .service
+                .copy_signal_bytes(&mm, UserVa::new(clear_child_tid), &0_u32.to_ne_bytes())
+                .is_ok()
+            {
+                let zone = self.source.zone;
+                let guard = zone.short_lock(
+                    ZoneTables::<C>::bucket_of_with_context(self.binding.mm.raw(), clear_child_tid),
+                    &NativeBucketWait {
+                        lifetime: core::marker::PhantomData,
+                        #[cfg(test)]
+                        probe: self.publication_wait_probe,
+                    },
+                );
+                let mut effects = WakeEffects::default();
+                let wake = zone.wake_placed(
+                    &guard,
+                    self.binding.mm.raw(),
+                    clear_child_tid,
+                    carrick_personality_linux::thread::CHILD_TID_WAKE_MASK,
+                    carrick_personality_linux::thread::CHILD_TID_WAKE_COUNT,
+                    carrick_sched_core::Waker::El1 {
+                        slot: self.source.slot,
+                    },
+                    &mut [],
+                    &mut effects,
+                );
+                drop(guard);
+                if matches!(wake, Err(carrick_sched_core::WakeRefusal::Unplaceable)) {
+                    self.service.wake_unplaceable_wait(ProcessWaitChannel {
+                        mm: self.binding.mm,
+                        address: core::num::NonZeroU64::new(clear_child_tid)
+                            .ok_or(NativeProcessError::Quarantined)?,
+                    })?;
+                } else {
+                    wake.map_err(|_| NativeProcessError::Quarantined)?;
+                    self.service.wake_effects(effects);
+                }
+                self.control.set_clear_child_tid(0);
+            }
+        }
         let transaction = self
             .runtime
             .graph
@@ -4212,7 +4299,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         })
     }
     #[inline(never)]
-    fn fork_owned(&mut self) -> Result<u32, NativeProcessError> {
+    fn fork_owned(&mut self, child_tid: ProcessForkChildTid) -> Result<u32, NativeProcessError> {
         let (
             snapshot,
             permit,
@@ -4423,7 +4510,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .claim(lifecycle_entry)
                 .map_err(|_| NativeProcessError::Busy)?;
             if control
-                .reset_for_birth(blocked, 0, lifecycle_entry)
+                .reset_for_birth(
+                    blocked,
+                    if child_tid.clear {
+                        child_tid.address.raw()
+                    } else {
+                        0
+                    },
+                    lifecycle_entry,
+                )
                 .is_err()
             {
                 page.unclaim(claim)
@@ -4441,8 +4536,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     carrick_el1_abi::BornRecord {
                         caller_task: self.key.id.raw() as u64,
                         caller_serial: parent_identity.serial,
-                        clone_flags: 0,
-                        clear_child_tid: 0,
+                        clone_flags: child_tid.flags(),
+                        clear_child_tid: if child_tid.clear {
+                            child_tid.address.raw()
+                        } else {
+                            0
+                        },
                         blocked,
                     },
                 )
@@ -4547,6 +4646,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }],
             mm: self.service.prepared_mm(&prepared),
             address,
+            pending_child_tid: child_tid.set.then_some(child_tid.address),
             signals,
             _thread_claim: thread_claim,
             channel: None,
@@ -4688,8 +4788,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
     fn take_handoff_receipt(&mut self) -> Option<EntryHandoffReceipt<C>> {
         self.handoff.take()
     }
-    fn fork(&mut self) -> LifecycleOutcome {
-        match self.fork_owned() {
+    fn fork(&mut self, child_tid: ProcessForkChildTid) -> LifecycleOutcome {
+        match self.fork_owned(child_tid) {
             Ok(pid) => returned(i64::from(pid)),
             Err(error) => self.fail(error),
         }
@@ -6539,6 +6639,9 @@ mod tests {
         page: &'a ThreadLifecyclePage,
         controls: &'a [ThreadControlSlot],
         copies: Vec<LinuxWaitStatus>,
+        tid_words: BTreeMap<(u64, u64), u32>,
+        tid_wakes: usize,
+        tid_writes: Vec<(u64, u64, u32)>,
         refuse_copy: bool,
         on_signal_clock: Option<Box<dyn FnMut()>>,
     }
@@ -6548,7 +6651,7 @@ mod tests {
         type Born = AddressContext<RootGpa>;
         fn prepare_mm(
             &mut self,
-            _: &Self::Mm,
+            parent: &Self::Mm,
             _: ParkedContextWords,
             child: MmGeneration,
         ) -> Result<Self::PreparedMm, NativeProcessError> {
@@ -6561,6 +6664,11 @@ mod tests {
                 .spaces
                 .publish_closed(child.raw().get(), address.root.address().raw(), 0)
                 .ok_or(NativeProcessError::Exhausted)?;
+            for ((mm, va), value) in self.tid_words.clone() {
+                if mm == parent.mm.raw().get() {
+                    self.tid_words.insert((child.raw().get(), va), value);
+                }
+            }
             Ok(address)
         }
         fn prepared_mm(&self, p: &Self::PreparedMm) -> Self::Mm {
@@ -6608,6 +6716,21 @@ mod tests {
             self.copies.push(status);
             Ok(())
         }
+        fn copy_signal_bytes(
+            &mut self,
+            mm: &Self::Mm,
+            address: UserVa,
+            bytes: &[u8],
+        ) -> Result<(), NativeProcessError> {
+            let Some(word) = self.tid_words.get_mut(&(mm.mm.raw().get(), address.raw())) else {
+                return Err(NativeProcessError::Fault);
+            };
+            let bytes: [u8; 4] = bytes.try_into().map_err(|_| NativeProcessError::Fault)?;
+            *word = u32::from_ne_bytes(bytes);
+            self.tid_writes
+                .push((mm.mm.raw().get(), address.raw(), *word));
+            Ok(())
+        }
         fn signal_deadline(
             &mut self,
             nanos: u64,
@@ -6646,7 +6769,9 @@ mod tests {
             panic!("unexpected quarantine")
         }
         fn retire_mm(&mut self, _: Self::Mm) {}
-        fn wake_effects(&mut self, _: WakeEffects) {}
+        fn wake_effects(&mut self, _: WakeEffects) {
+            self.tid_wakes += 1;
+        }
     }
     fn words(address: AddressContext<RootGpa>) -> ParkedContextWords {
         let mut frame = [0; 20];
@@ -6671,6 +6796,168 @@ mod tests {
                 ZoneTables::<carrick_sched_core::ThreadCtx>::bucket_of(mm, address)
             );
         }
+    }
+    #[test]
+    fn process_clone_child_tid_lives_in_child_mm_and_clears_on_exit() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            Box::from_raw(ptr)
+        };
+        let page = ThreadLifecyclePage::new();
+        let control = ThreadControlSlot::new();
+        let child_page = ThreadLifecyclePage::new();
+        let child_controls = core::array::from_fn::<_, 9, _>(|_| ThreadControlSlot::new());
+        let task = CurrentTask::new();
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 5);
+        task.mm.key.store(1, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        task.publish_visible_pid(41);
+        task.publish_lifecycle(&page as *const _ as u64, &control as *const _ as u64);
+        let address = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+            mm: MmGeneration::new(NonZeroU64::MIN),
+            generation: ContextGeneration::new(NonZeroU64::MIN),
+        };
+        let slot = carrick_sched_core::SlotId::new(0);
+        let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 1).unwrap();
+        zone.current_or_new(
+            slot,
+            ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: 1,
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: &page as *const _ as u64,
+                control_slot: &control as *const _ as u64,
+            },
+        )
+        .unwrap();
+        let source = BornInZoneSource { zone: &zone, slot };
+        let runtime =
+            NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+                source,
+                &task,
+                &page,
+                &control,
+                address,
+                address,
+                words(address),
+            )
+            .unwrap();
+        let tid_va = UserVa::new(0x7000);
+        let mut service = Physical {
+            zone: &zone,
+            page: &child_page,
+            controls: &child_controls,
+            copies: Vec::new(),
+            tid_words: BTreeMap::from([((1, tid_va.raw()), 0xaaaa)]),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
+            refuse_copy: false,
+            on_signal_clock: None,
+        };
+        let mut parent = runtime
+            .enter(source, &task, words(address), &mut service)
+            .unwrap();
+        let LifecycleOutcome::Returned { result, .. } = parent.fork(ProcessForkChildTid {
+            address: tid_va,
+            set: true,
+            clear: true,
+        }) else {
+            panic!("clone process fork must return to parent");
+        };
+        assert_eq!(result.raw(), 42);
+        let root_key = runtime.graph.lock().root_key;
+        let child_key = runtime.namespace_child_key(root_key, 42).unwrap();
+        let child = runtime.task_binding(child_key).unwrap();
+        let child_mm = child.address.mm.raw().get();
+        assert_ne!(child_mm, 1);
+        assert_eq!(parent.service.tid_words[&(1, tid_va.raw())], 0xaaaa);
+        assert_eq!(parent.service.tid_words[&(child_mm, tid_va.raw())], 0xaaaa);
+        assert_eq!(child.words.syscall_return(), 0);
+        let parent_record = zone
+            .slot(slot)
+            .current()
+            .or_else(|| zone.slot(slot).host_record())
+            .unwrap();
+        drop(parent);
+        zone.requeue_preempted(slot, parent_record);
+        activate(&runtime, source, &task, child_key);
+        let child_words = runtime.task_binding(child_key).unwrap().words;
+        let mut child = runtime
+            .enter(source, &task, child_words, &mut service)
+            .unwrap();
+        assert!(matches!(
+            child.resume_checkpoint(),
+            Ok(NativeResume::NoPending)
+        ));
+        assert_eq!(child.service.tid_words[&(1, tid_va.raw())], 0xaaaa);
+        assert_eq!(child.service.tid_words[&(child_mm, tid_va.raw())], 42);
+        assert_eq!(child.service.tid_writes, [(child_mm, tid_va.raw(), 42)]);
+        assert_eq!(child.control.clear_child_tid(), tid_va.raw());
+        // A waiter on the child's private futex must become runnable at exit.
+        // Its key deliberately differs from the parent's identical VA.
+        let waiter = zone
+            .alloc_record(ThreadIdentity {
+                tid: 43,
+                serial: 103,
+                mm: child_mm,
+                file_table: 5,
+                generation: 12,
+                affinity: 1,
+                lifecycle_page: &child_page as *const _ as u64,
+                control_slot: &child_controls[1] as *const _ as u64,
+            })
+            .unwrap();
+        let guard = zone.short_lock(
+            ZoneTables::<ParkedContextWords>::bucket_of_with_context(child_mm, tid_va.raw()),
+            &NativeBucketWait {
+                lifetime: core::marker::PhantomData,
+                probe: None,
+            },
+        );
+        let sequence = zone.next_seq(waiter);
+        zone.enqueue(
+            &guard,
+            waiter,
+            sequence,
+            child_mm,
+            tid_va.raw(),
+            u32::MAX,
+            0,
+        )
+        .unwrap();
+        zone.publish_park(waiter, sequence);
+        drop(guard);
+        assert!(matches!(
+            zone.record(waiter).claim(),
+            carrick_sched_core::Claim::Parked { .. }
+        ));
+        assert!(matches!(
+            child.exit_group(0),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert_eq!(child.service.tid_words[&(child_mm, tid_va.raw())], 0);
+        assert_eq!(
+            child.service.tid_writes,
+            [(child_mm, tid_va.raw(), 42), (child_mm, tid_va.raw(), 0)]
+        );
+        assert_eq!(child.service.tid_words[&(1, tid_va.raw())], 0xaaaa);
+        assert!(child.service.tid_wakes >= 1);
+        assert!(matches!(
+            zone.record(waiter).claim(),
+            carrick_sched_core::Claim::Queued { .. }
+        ));
     }
     #[test]
     fn two_roots_in_one_carrier_have_independent_fork_and_wait_authority() {
@@ -6765,6 +7052,9 @@ mod tests {
                 page: &child_pages[0],
                 controls: &child_controls[0],
                 copies: Vec::new(),
+                tid_words: BTreeMap::new(),
+                tid_wakes: 0,
+                tid_writes: Vec::new(),
                 refuse_copy: false,
                 on_signal_clock: None,
             },
@@ -6773,6 +7063,9 @@ mod tests {
                 page: &child_pages[1],
                 controls: &child_controls[1],
                 copies: Vec::new(),
+                tid_words: BTreeMap::new(),
+                tid_wakes: 0,
+                tid_writes: Vec::new(),
                 refuse_copy: false,
                 on_signal_clock: None,
             },
@@ -6798,7 +7091,8 @@ mod tests {
                     &mut services[index],
                 )
                 .unwrap();
-            let LifecycleOutcome::Returned { result, .. } = entry.fork() else {
+            let LifecycleOutcome::Returned { result, .. } = entry.fork(ProcessForkChildTid::NONE)
+            else {
                 panic!("fork return");
             };
             assert_eq!(result.raw(), 42 + index as i64 * 10);
@@ -6994,6 +7288,9 @@ mod tests {
             page: &child_page,
             controls: &child_controls,
             copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
             refuse_copy: false,
             on_signal_clock: None,
         };
@@ -7007,7 +7304,8 @@ mod tests {
                 &mut service,
             )
             .unwrap();
-        let LifecycleOutcome::Returned { result, .. } = process.fork() else {
+        let LifecycleOutcome::Returned { result, .. } = process.fork(ProcessForkChildTid::NONE)
+        else {
             panic!("thread fork return");
         };
         assert_eq!(result.raw(), 42);
@@ -7204,6 +7502,9 @@ mod tests {
             page: &child_page,
             controls: &*child_controls,
             copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
             refuse_copy: false,
             on_signal_clock: None,
         };
@@ -7546,6 +7847,9 @@ mod tests {
             page: &child_page,
             controls: &*child_controls,
             copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
             refuse_copy: false,
             on_signal_clock: None,
         };
@@ -7666,6 +7970,9 @@ mod tests {
             page: &child_page,
             controls: &*child_controls,
             copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
             refuse_copy: false,
             on_signal_clock: None,
         };
@@ -7801,6 +8108,9 @@ mod tests {
                 page: &child_page,
                 controls: &*child_controls,
                 copies: Vec::new(),
+                tid_words: BTreeMap::new(),
+                tid_wakes: 0,
+                tid_writes: Vec::new(),
                 refuse_copy: false,
                 on_signal_clock: None,
             };
@@ -7953,7 +8263,7 @@ mod tests {
                 Err(carrick_el1_abi::TransitionError::GateClosed(_))
             ));
             assert!(
-                matches!(entry.fork(), LifecycleOutcome::Returned { result, .. } if result.raw() == -11)
+                matches!(entry.fork(ProcessForkChildTid::NONE), LifecycleOutcome::Returned { result, .. } if result.raw() == -11)
             );
             drop(entry);
             let selected = zone.switch_in_full(slot).unwrap();
@@ -8064,6 +8374,9 @@ mod tests {
             page: &child_page,
             controls: &*child_controls,
             copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
             refuse_copy: false,
             on_signal_clock: None,
         };
@@ -8247,6 +8560,9 @@ mod tests {
             page: &child_page,
             controls: &*child_controls,
             copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
             refuse_copy: false,
             on_signal_clock: None,
         };
@@ -8272,7 +8588,8 @@ mod tests {
                     )
                     .unwrap();
             }
-            let LifecycleOutcome::Returned { result, .. } = entry.fork() else {
+            let LifecycleOutcome::Returned { result, .. } = entry.fork(ProcessForkChildTid::NONE)
+            else {
                 panic!("fork return")
             };
             assert_eq!(result.raw(), 42);
@@ -8779,6 +9096,9 @@ mod tests {
             page: &child_page,
             controls: &*child_controls,
             copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
             refuse_copy: false,
             on_signal_clock: None,
         };
@@ -8818,7 +9138,8 @@ mod tests {
                 }),
             )
             .unwrap();
-        let LifecycleOutcome::Returned { result, .. } = root_entry.fork() else {
+        let LifecycleOutcome::Returned { result, .. } = root_entry.fork(ProcessForkChildTid::NONE)
+        else {
             panic!("parent fork")
         };
         let parent = runtime
@@ -8876,6 +9197,9 @@ mod tests {
             page: &grandchild_page,
             controls: &grandchild_controls,
             copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
             refuse_copy: false,
             on_signal_clock: None,
         };
@@ -8887,7 +9211,9 @@ mod tests {
                 .rt_sigaction(Signal::CHLD, Some(Action::default()))
                 .unwrap();
         }
-        let LifecycleOutcome::Returned { result, .. } = parent_entry.fork() else {
+        let LifecycleOutcome::Returned { result, .. } =
+            parent_entry.fork(ProcessForkChildTid::NONE)
+        else {
             panic!("child fork")
         };
         let child = runtime
@@ -8961,6 +9287,9 @@ mod tests {
                         page: &grandchild_page,
                         controls: &grandchild_controls,
                         copies: Vec::new(),
+                        tid_words: BTreeMap::new(),
+                        tid_wakes: 0,
+                        tid_writes: Vec::new(),
                         refuse_copy: false,
                         on_signal_clock: None,
                     };
@@ -9004,6 +9333,9 @@ mod tests {
             page: &grandchild_page,
             controls: &grandchild_controls,
             copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
             refuse_copy: false,
             on_signal_clock: None,
         };
@@ -9160,6 +9492,9 @@ mod tests {
             page: &child_page,
             controls: &*child_controls,
             copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
             refuse_copy: false,
             on_signal_clock: None,
         };
@@ -9170,7 +9505,8 @@ mod tests {
         let mut entry = runtime
             .enter(source, &task, words(address), &mut service)
             .unwrap();
-        let LifecycleOutcome::Returned { result, .. } = entry.fork() else {
+        let LifecycleOutcome::Returned { result, .. } = entry.fork(ProcessForkChildTid::NONE)
+        else {
             panic!("fork")
         };
         let child_pid = result.raw();
@@ -9337,6 +9673,9 @@ mod tests {
                 page: &child_page,
                 controls: &*child_controls,
                 copies: Vec::new(),
+                tid_words: BTreeMap::new(),
+                tid_wakes: 0,
+                tid_writes: Vec::new(),
                 refuse_copy: false,
                 on_signal_clock: None,
             };
@@ -9359,7 +9698,9 @@ mod tests {
                 let mut entry = runtime
                     .enter(source, &task, words(row_address), &mut service)
                     .unwrap();
-                let LifecycleOutcome::Returned { result, .. } = entry.fork() else {
+                let LifecycleOutcome::Returned { result, .. } =
+                    entry.fork(ProcessForkChildTid::NONE)
+                else {
                     panic!("fork")
                 };
                 let next = runtime
@@ -9556,6 +9897,9 @@ mod tests {
             page: &child_page,
             controls: &*child_controls,
             copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
             refuse_copy: false,
             on_signal_clock: None,
         };
@@ -9645,7 +9989,9 @@ mod tests {
 
         // Fork from thread 42: child process inherits thread 42's credentials and comm
         entry.set_calling_tid(42);
-        let child_pid = entry.fork_owned().expect("fork from thread 42 succeeds");
+        let child_pid = entry
+            .fork_owned(ProcessForkChildTid::NONE)
+            .expect("fork from thread 42 succeeds");
         drop(entry);
 
         let graph = runtime.graph.lock();
@@ -9737,6 +10083,9 @@ mod tests {
             page: &child_page,
             controls: &*child_controls,
             copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
             refuse_copy: false,
             on_signal_clock: None,
         };
@@ -9834,6 +10183,9 @@ mod tests {
             page: &child_page,
             controls: &*child_controls,
             copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
             refuse_copy: false,
             on_signal_clock: None,
         };
@@ -9961,6 +10313,9 @@ mod tests {
             page: &child_page,
             controls: &*child_controls,
             copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
             refuse_copy: false,
             on_signal_clock: None,
         };
@@ -10054,6 +10409,9 @@ mod tests {
             page: &child_page,
             controls: &*child_controls,
             copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
             refuse_copy: false,
             on_signal_clock: None,
         };
@@ -10077,7 +10435,9 @@ mod tests {
             .record;
 
         entry.set_calling_tid(41);
-        let child_pid = entry.fork_owned().expect("fork child succeeds") as i32;
+        let child_pid = entry
+            .fork_owned(ProcessForkChildTid::NONE)
+            .expect("fork child succeeds") as i32;
         drop(entry);
 
         zone.requeue_preempted(slot, parent_record.id);
@@ -10199,6 +10559,9 @@ mod tests {
             page: &child_page,
             controls: &*child_controls,
             copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
             refuse_copy: false,
             on_signal_clock: None,
         };
@@ -10229,7 +10592,9 @@ mod tests {
         );
 
         // 4. Another process without ptrace capability returns EPERM
-        let child_pid = entry.fork_owned().expect("fork child succeeds") as u32;
+        let child_pid = entry
+            .fork_owned(ProcessForkChildTid::NONE)
+            .expect("fork child succeeds") as u32;
         // Make caller unprivileged (drop CAP_SYS_PTRACE, uid 1000)
         use carrick_personality_linux::identity::ProcessIdentityVenue;
         entry.set_uid(1000).unwrap();
@@ -10631,6 +10996,9 @@ mod tests {
             page: &child_page,
             controls: &*child_controls,
             copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
             refuse_copy: false,
             on_signal_clock: None,
         };
@@ -10789,6 +11157,9 @@ mod tests {
             page: &child_page,
             controls: &*child_controls,
             copies: Vec::new(),
+            tid_words: BTreeMap::new(),
+            tid_wakes: 0,
+            tid_writes: Vec::new(),
             refuse_copy: false,
             on_signal_clock: None,
         };
@@ -11206,7 +11577,7 @@ mod tests {
 
         // 1. Injected failure at metadata validation (address.mm mismatch)
         entry.service.fail_context = true;
-        let outcome1 = entry.fork();
+        let outcome1 = entry.fork(ProcessForkChildTid::NONE);
         assert!(matches!(
             outcome1,
             LifecycleOutcome::Returned { result, .. } if result.raw() == NativeProcessError::Stale.errno()
@@ -11216,7 +11587,7 @@ mod tests {
         entry.service.fail_context = false;
 
         // Next fork succeeds!
-        let outcome2 = entry.fork();
+        let outcome2 = entry.fork(ProcessForkChildTid::NONE);
         let LifecycleOutcome::Returned { result: pid1, .. } = outcome2 else {
             panic!("expected fork success after metadata validation recovery");
         };
@@ -11226,7 +11597,7 @@ mod tests {
 
         // 2. Injected failure at fork_fd_table
         entry.service.fail_fd_table = true;
-        let outcome3 = entry.fork();
+        let outcome3 = entry.fork(ProcessForkChildTid::NONE);
         assert!(matches!(
             outcome3,
             LifecycleOutcome::Returned { result, .. } if result.raw() == NativeProcessError::Exhausted.errno()
@@ -11236,7 +11607,7 @@ mod tests {
         entry.service.fail_fd_table = false;
 
         // Next fork succeeds!
-        let outcome4 = entry.fork();
+        let outcome4 = entry.fork(ProcessForkChildTid::NONE);
         let LifecycleOutcome::Returned { result: pid2, .. } = outcome4 else {
             panic!("expected fork success after fd_table recovery");
         };
@@ -11246,7 +11617,7 @@ mod tests {
 
         // 3. Injected failure at commit_mm
         entry.service.fail_commit = true;
-        let outcome5 = entry.fork();
+        let outcome5 = entry.fork(ProcessForkChildTid::NONE);
         assert!(matches!(
             outcome5,
             LifecycleOutcome::Returned { result, .. } if result.raw() == NativeProcessError::Busy.errno()
@@ -11256,7 +11627,7 @@ mod tests {
         entry.service.fail_commit = false;
 
         // Next fork succeeds!
-        let outcome6 = entry.fork();
+        let outcome6 = entry.fork(ProcessForkChildTid::NONE);
         let LifecycleOutcome::Returned { result: pid3, .. } = outcome6 else {
             panic!("expected fork success after commit recovery");
         };
@@ -11280,7 +11651,7 @@ mod tests {
         }
         assert!(!filled_records.is_empty());
 
-        let outcome7 = entry.fork();
+        let outcome7 = entry.fork(ProcessForkChildTid::NONE);
         assert!(matches!(
             outcome7,
             LifecycleOutcome::Returned { result, .. } if result.raw() == NativeProcessError::Exhausted.errno()
@@ -11292,7 +11663,7 @@ mod tests {
         zone.free_record(filled_records.pop().unwrap());
 
         // Next fork succeeds!
-        let outcome8 = entry.fork();
+        let outcome8 = entry.fork(ProcessForkChildTid::NONE);
         let LifecycleOutcome::Returned { result: pid4, .. } = outcome8 else {
             panic!("expected fork success after alloc_record exhaustion recovery");
         };
