@@ -589,6 +589,14 @@ impl HostIpc {
         );
         queue
     }
+
+    #[cfg(feature = "test-support")]
+    pub fn test_wait_queue(
+        self: &std::sync::Arc<Self>,
+        object: IpcObjectHandle,
+    ) -> std::sync::Arc<crate::kernel::WaitQueue> {
+        self.wait_queue(object)
+    }
     pub(crate) fn subscribe_host(
         self: &std::sync::Arc<Self>,
         object: IpcObjectHandle,

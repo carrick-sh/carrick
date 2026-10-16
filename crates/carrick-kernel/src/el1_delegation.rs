@@ -108,6 +108,17 @@ pub fn settle_el1_boundary_for(
     settle_el1_boundary(slot, &kernel)
 }
 
+/// Service a poll-time host-work doorbell without taking the syscall's
+/// `ServedBoundary`. The ordinary forwarded syscall path still needs that
+/// receipt to distinguish a completed EL1 call from a host commit owed.
+pub fn settle_pending_host_work_for(slot: usize, dispatcher: &crate::dispatch::SyscallDispatcher) {
+    let kernel = std::sync::Arc::clone(dispatcher.kernel_binding.read().kernel());
+    let pending = carrick_el1_abi::take_pending_host_work(slot);
+    if pending {
+        deliver_boundary_wakes(&kernel, false, true);
+    }
+}
+
 /// Clear the recorded host virtual address of the EL1 kernel aperture.
 pub fn clear_el1_region_host_ptr() {
     recall_all_delegated();
