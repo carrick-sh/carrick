@@ -437,9 +437,6 @@ impl crate::personality::signal_delivery::SignalMachine<ParkedContextWords>
     fn restart_forwarded(&self, frame: &mut carrick_el1_abi::TrapFrame) -> Option<bool> {
         crate::personality::arm_signal::restart_forwarded_frame(frame)
     }
-    fn retry_spurious_forwarded(&self, frame: &mut carrick_el1_abi::TrapFrame) -> Option<bool> {
-        crate::personality::arm_signal::retry_spurious_forwarded_frame(frame)
-    }
     fn group_exit_custody(
         &self,
         _: &CurrentTask,
