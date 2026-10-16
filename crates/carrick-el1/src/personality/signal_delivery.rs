@@ -42,13 +42,31 @@ where
     S: NativeProcessService<'a, C, Mm = M>,
     A: SignalMachine<C>,
 {
+    let (_, slot) = task.lifecycle_refs()?;
+    deliver_signal_with_control(task, slot, process, frame, fpstate, machine)
+}
+
+pub fn deliver_signal_with_control<'a, M, C, S, A>(
+    task: &CurrentTask,
+    slot: &carrick_el1_abi::ThreadControlSlot,
+    process: &mut NativeProcessEntry<'_, 'a, M, C, S>,
+    frame: &mut <A::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
+    fpstate: &[u8],
+    machine: &mut A,
+) -> Option<CompletionRoute>
+where
+    M: Clone,
+    C: ProcessContext,
+    S: NativeProcessService<'a, C, Mm = M>,
+    A: SignalMachine<C>,
+{
     if !carrick_personality_linux::signal::signal_delivery_before_work(
         CompletionRoute::Served,
         &task.linux,
     ) {
         return None;
     }
-    let (_, slot) = task.lifecycle_refs()?;
+
     let mut thread_blocked =
         SigBlockMask::blocking_all_of(carrick_signal_core::SignalSet::from_bits(slot.blocked().0));
     let saved_mask = process.take_suspend_mask().unwrap_or(thread_blocked);
@@ -230,7 +248,11 @@ mod altstack_tests {
             true,
         );
         assert!(slot.read_altstack().is_disabled());
-        let restored = carrick_personality_linux::signal::restored_altstack(saved).unwrap();
+        let restored = carrick_personality_linux::signal::restored_altstack(
+            saved,
+            carrick_guest_arch::GuestIsa::Aarch64,
+        )
+        .unwrap();
         let flags = restored.flags;
         assert_eq!(flags, carrick_syscall_abi::LINUX_SS_AUTODISARM as u32);
     }
