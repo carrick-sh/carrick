@@ -2778,6 +2778,20 @@ mod layout_manifest {
     }
 
     #[test]
+    fn native_signal_owner_requires_explicit_graph_admission() {
+        let control = ThreadControlSlot::new();
+        control.reset_for_host_birth(BlockedMask(0)).unwrap();
+        let custody = carrick_core::lifecycle::MemberControlCustody::retain(&control).unwrap();
+        custody.commit_registration();
+        assert!(!control.native_signal_owner());
+        custody.commit_native_signal_owner();
+        assert!(control.native_signal_owner());
+        drop(custody);
+        control.reset_for_host_birth(BlockedMask(0)).unwrap();
+        assert!(!control.native_signal_owner());
+    }
+
+    #[test]
     fn thread_lifecycle_page() {
         assert_eq!(
             (
