@@ -77,6 +77,23 @@ pub fn registry() -> &'static NativeProcessRegistry<'static, Mm, Aarch64ParkedCo
     &REGISTRY
 }
 
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[inline(never)]
+fn drain_native_signal_ingress<'a, X: ForkStockCrossing>(
+    owner_registry: &NativeProcessRegistry<'a, Mm, Aarch64ParkedContext>,
+    source: BornInZoneSource<'a, Aarch64ParkedContext>,
+    service: &mut Aarch64NativeProcessService<'a, X>,
+) {
+    owner_registry
+        .drain_external_ingress(
+            source.zone,
+            crate::isa::signal_ingress_guest(),
+            source.slot,
+            service,
+        )
+        .unwrap_or_else(|_| fatal());
+}
+
 /// Re-enter the already admitted owner for a scheduler-selected record.
 /// The source and task outlive this call; the record has exclusive OnCpu
 /// custody until this checkpoint completes or parks again.
@@ -103,14 +120,7 @@ pub(super) fn resume_selected<'a, X: ForkStockCrossing>(
     task.publish_root_generation(address.generation);
     let words = *context;
     #[cfg(target_os = "none")]
-    owner_registry
-        .drain_external_ingress(
-            source.zone,
-            crate::isa::signal_ingress_guest(),
-            source.slot,
-            service,
-        )
-        .unwrap_or_else(|_| fatal());
+    drain_native_signal_ingress(owner_registry, source, service);
     let mut entry = runtime
         .enter_registered(owner_registry, source, task, address, words, service)
         .unwrap_or_else(|_| fatal());
@@ -374,14 +384,7 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
         address.generation.raw().get(),
     );
     #[cfg(target_os = "none")]
-    registry()
-        .drain_external_ingress(
-            source.zone,
-            crate::isa::signal_ingress_guest(),
-            source.slot,
-            service,
-        )
-        .unwrap_or_else(|_| fatal());
+    drain_native_signal_ingress(registry(), source, service);
     let (result, root_exit) = {
         let mut process =
             runtime.enter_registered(registry(), source, task, address, words, service)?;
