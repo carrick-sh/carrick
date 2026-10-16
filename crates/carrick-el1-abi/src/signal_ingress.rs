@@ -32,6 +32,7 @@ pub const fn signal_ingress_offsets_hash() -> u64 {
         core::mem::offset_of!(ExternalSignalRecord, scope) as u64,
         core::mem::offset_of!(ExternalSignalRecord, process_id) as u64,
         core::mem::offset_of!(ExternalSignalRecord, process_generation) as u64,
+        core::mem::offset_of!(ExternalSignalRecord, timer) as u64,
         core::mem::offset_of!(SignalIngressSlot, sequence) as u64,
         core::mem::offset_of!(SignalIngressSlot, record) as u64,
         core::mem::offset_of!(SharedSignalIngressQueue, head) as u64,
@@ -70,8 +71,17 @@ impl SignalEventGeneration {
 #[repr(u32)]
 pub enum ExternalSignalSource {
     Terminal = 1,
-    Timer = 2,
+    IntervalTimer = 2,
     HostFault = 3,
+    PosixTimer = 4,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct ExternalSignalTimerInfo {
+    pub id: i32,
+    pub overrun: i32,
+    pub value: i64,
 }
 
 /// The pending owner selected by the host facility, independent of which
@@ -98,6 +108,7 @@ pub struct ExternalSignalRecord {
     scope: ExternalSignalScope,
     process_id: carrick_core_abi::EntryTaskKey,
     process_generation: carrick_core_abi::SnapshotGeneration,
+    timer: ExternalSignalTimerInfo,
 }
 
 /// A producer retains this exact record when shared admission is full. The
@@ -146,6 +157,11 @@ impl ExternalSignalRecord {
             scope: ExternalSignalScope::Thread,
             process_id: binding.task,
             process_generation: binding.generation,
+            timer: ExternalSignalTimerInfo {
+                id: 0,
+                overrun: 0,
+                value: 0,
+            },
         }
     }
 
@@ -194,6 +210,15 @@ impl ExternalSignalRecord {
 
     pub const fn source(self) -> ExternalSignalSource {
         self.source
+    }
+
+    pub const fn with_timer_info(mut self, timer: ExternalSignalTimerInfo) -> Self {
+        self.timer = timer;
+        self
+    }
+
+    pub const fn timer_info(self) -> ExternalSignalTimerInfo {
+        self.timer
     }
 
     pub const fn event_generation(self) -> SignalEventGeneration {
