@@ -291,16 +291,17 @@ mod tests {
         let custody = CarrierVmCustody::new();
         let generation = custody.begin_create().unwrap();
         custody.commit_create(generation).unwrap();
-        let region = carrick_test_support::TestEl1Region::zeroed();
-        let physical = carrick_test_support::TestEl1Region::zeroed();
+        let mut region = carrick_test_support::TestEl1Region::zeroed();
+        let region_ptr = region.as_mut_ptr();
+        let mut physical = carrick_test_support::TestEl1Region::zeroed();
+        let physical_ptr = physical.as_mut_ptr();
         let mut exec = test_execution(41, 0, 301);
         exec.context.root = page(carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE);
         let ttbr0 = (1 << 48) | exec.context.root.address().raw();
         let slot = carrick_guest_arch::SlotId::new(0);
         // SAFETY: exclusively owned, aligned initialized ABI fixture storage.
         let zone = unsafe {
-            &*region
-                .as_ptr()
+            &*region_ptr
                 .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
                 .cast::<carrick_el1_abi::ZoneTables>()
         };
@@ -312,8 +313,7 @@ mod tests {
         zone.install_space(slot, 301).unwrap();
         // SAFETY: this stopped CPU's CurrentTask belongs to the fixture.
         let task = unsafe {
-            &*region
-                .as_ptr()
+            &*region_ptr
                 .add(carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize)
                 .cast::<carrick_el1_abi::CurrentTask>()
         };
@@ -341,7 +341,7 @@ mod tests {
                         vm_generation: generation,
                         ipa,
                         len,
-                        host_addr: unsafe { physical.as_ptr().add(offset) } as usize,
+                        host_addr: unsafe { physical_ptr.add(offset) } as usize,
                         mapped: true,
                         backend_map_installed: true,
                         release_ipa: false,
@@ -369,21 +369,21 @@ mod tests {
         let address = KernelVa::new(carrick_el1_abi::EL1_STACKS_BASE);
         let offset = (address.raw() - carrick_el1_abi::EL1_REGION_BASE) as usize;
         // SAFETY: aligned complete loan record on this CPU's retained fixture stack.
-        let record = unsafe {
-            &mut *region
-                .as_ptr()
-                .add(offset)
-                .cast_mut()
-                .cast::<ForkStockExchange>()
-        };
-        *record = ForkStockExchange::new(request).unwrap();
+        let record = unsafe { region_ptr.add(offset).cast::<ForkStockExchange>() };
+        unsafe {
+            record.write(ForkStockExchange::new(request).unwrap());
+        }
         assert!(
             custody
                 .stage2_record_covering(address.raw(), core::mem::size_of::<ForkStockExchange>())
                 .is_none()
         );
         let bytes = unsafe {
-            core::slice::from_raw_parts(region.as_ptr(), carrick_el1_abi::EL1_REGION_SIZE as usize)
+            crate::metadata_grant::RetainedAbiRegion::new(
+                region_ptr,
+                carrick_el1_abi::EL1_REGION_SIZE as usize,
+            )
+            .unwrap()
         };
         // A caller cannot redirect the crossing to another CPU, root or VM.
         for (requested_cpu, root, live) in [
@@ -403,7 +403,9 @@ mod tests {
             .unwrap();
             assert_eq!(reply[0], carrick_el1_abi::METADATA_GRANT_ERR_DENIED);
             assert!(custody.fork_stock.lock().owner.pending(exec.cpu).is_none());
-            *record = ForkStockExchange::new(request).unwrap();
+            unsafe {
+                record.write(ForkStockExchange::new(request).unwrap());
+            }
         }
         for bad in [
             KernelVa::new(address.raw() + 1),
@@ -429,13 +431,12 @@ mod tests {
             [carrick_el1_abi::METADATA_GRANT_SUCCESS, 0, 0, 0],
             "native loan must use retained KernelVa and live lane identity"
         );
-        let loan = record.take(request).unwrap().unwrap();
+        let loan = unsafe { &mut *record }.take(request).unwrap().unwrap();
         assert_eq!(loan.request.child_tables.base, stock_base);
         assert_eq!(loan.request.child_tables.len, 4 * 4096);
         assert_ne!(loan.lifecycle.page, KernelVa::new(0));
         // A real typed abort restores the HAL owner's stock and physical ledger.
-        let settlement =
-            record as *mut ForkStockExchange as *mut carrick_el1_abi::ForkStockSettlement;
+        let settlement = record.cast::<carrick_el1_abi::ForkStockSettlement>();
         unsafe {
             settlement.write(carrick_el1_abi::ForkStockSettlement::abort(loan));
         }

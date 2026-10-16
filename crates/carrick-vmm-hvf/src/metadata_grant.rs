@@ -17,6 +17,46 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+/// Raw view of the retained kernel ABI mapping. It carries no shared byte
+/// slice: a wire reply mutates its stopped CPU's stack while other CPUs may
+/// use disjoint atomic ABI records in the same mapping.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RetainedAbiRegion<'a> {
+    base: core::ptr::NonNull<u8>,
+    _retained: core::marker::PhantomData<&'a core::cell::UnsafeCell<u8>>,
+}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl<'a> RetainedAbiRegion<'a> {
+    /// # Safety
+    /// The caller retains an initialized EL1 mapping of `len` bytes through
+    /// `'a`. Only the synchronously stopped CPU may access its wire stack;
+    /// shared fixed records use their ABI atomics and ownership protocol.
+    pub(crate) unsafe fn new(base: *mut u8, len: usize) -> Option<Self> {
+        let base = core::ptr::NonNull::new(base)?;
+        if len != carrick_el1_abi::EL1_REGION_SIZE as usize {
+            return None;
+        }
+        Some(Self {
+            base,
+            _retained: core::marker::PhantomData,
+        })
+    }
+    fn record_ptr<T>(self, offset: usize) -> Option<*mut T> {
+        if offset.checked_add(core::mem::size_of::<T>())?
+            > carrick_el1_abi::EL1_REGION_SIZE as usize
+        {
+            return None;
+        }
+        // SAFETY: checked offset remains inside the retained mapping.
+        let pointer = unsafe { self.base.as_ptr().add(offset) };
+        pointer
+            .addr()
+            .is_multiple_of(core::mem::align_of::<T>())
+            .then_some(pointer.cast())
+    }
+}
+
 /// Runtime-owned handback venue for an already enrolled parent wait.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub trait NativeWaitChannelWake: std::fmt::Debug + Send + Sync {
@@ -32,7 +72,7 @@ fn terminal_child_execution(
     phase: carrick_sched_core::TerminalPhase,
 ) -> Option<crate::fork_stock::GrantExecution> {
     let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
-    let region = retained_abi_region()?;
+    let region = retained_abi_region(custody)?;
     let (task, zone) = stopped_records(region, cpu)?;
     let binding = carrick_core::entry::binding(&task.execution, &task.mm);
     let source = carrick_el1_abi::BornInZoneSource { zone, slot };
@@ -107,7 +147,7 @@ fn service_terminal_operation(
     {
         return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
     }
-    let Some(pointer) = retained_abi_region().and_then(|region| {
+    let Some(pointer) = retained_abi_region(custody).and_then(|region| {
         abi_stack_ptr::<NativeChildRetire>(region, cpu, carrick_guest_arch::KernelVa::new(args[0]))
     }) else {
         return [METADATA_GRANT_ERR_INVALID, 0, 0, 0];
@@ -1151,7 +1191,7 @@ pub(crate) fn service_native_fork_stock(
     address: carrick_guest_arch::KernelVa,
     requested_cpu: u64,
     ttbr0: u64,
-    region: &[u8],
+    region: RetainedAbiRegion<'_>,
 ) -> Result<[u64; 4], TrapError> {
     use crate::fork_stock::ForkStockHostCustody;
     if !request_has_live_vm(custody, generation) {
@@ -1187,25 +1227,13 @@ pub(crate) fn service_native_fork_stock(
                     exchange.refuse(ForkStockRefusal::Stale);
                     return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
                 };
-                let offset = carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize;
-                let Some(bytes) = region.get(
-                    offset
-                        ..offset
-                            + core::mem::size_of::<carrick_el1_abi::FrameGrantResidencyTable>(),
+                let Some(pointer) = region.record_ptr::<carrick_el1_abi::FrameGrantResidencyTable>(
+                    carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize,
                 ) else {
                     return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
                 };
-                if !bytes.as_ptr().addr().is_multiple_of(core::mem::align_of::<
-                    carrick_el1_abi::FrameGrantResidencyTable,
-                >()) {
-                    return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
-                }
-                // SAFETY: fixed aligned ABI record in the retained full region.
-                let residency = unsafe {
-                    &*bytes
-                        .as_ptr()
-                        .cast::<carrick_el1_abi::FrameGrantResidencyTable>()
-                };
+                // SAFETY: initialized fixed atomic ABI record in the retained region.
+                let residency = unsafe { &*pointer };
                 let Some(active) = carrick_el1_abi::ReservationMm::new(execution.binding.mm.raw())
                 else {
                     return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
@@ -1359,55 +1387,23 @@ pub(crate) fn handle_metadata_grant_trap(
     let arg3 = vcpu
         .get_reg(Reg::X3)
         .map_err(|e| TrapError::Hypervisor(format!("failed to read X3 for metadata grant: {e}")))?;
+    let region = retained_abi_region(custody);
     let execution = if op == GRANT_OP_ROOT_EXIT {
-        let ptr = carrick_el1_abi::get_el1_region_host_ptr();
-        let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize);
-        match (ptr, slot, carrick_el1_abi::zone_tables()) {
-            (ptr, Some(slot), Some(zone)) if ptr != 0 => {
-                // SAFETY: this stopped CPU retains the carrier's mapped ABI
-                // region and its host-published execution until trap completion.
-                let task = unsafe {
-                    &*((ptr
-                        + carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize
-                        + usize::from(slot.raw())
-                            * core::mem::size_of::<carrick_el1_abi::CurrentTask>())
-                        as *const carrick_el1_abi::CurrentTask)
-                };
-                let ttbr0 = vcpu
-                    .get_sys_reg(applevisor::vcpu::SysReg::TTBR0_EL1)
-                    .map_err(|error| {
-                        TrapError::Hypervisor(format!("read terminal root: {error}"))
-                    })?;
-                // SAFETY: the same retained ABI mapping owns this stopped CPU's stack.
-                let region = unsafe {
-                    core::slice::from_raw_parts(
-                        ptr as *const u8,
-                        carrick_el1_abi::EL1_REGION_SIZE as usize,
-                    )
-                };
-                root_execution(cpu, task, zone, ttbr0).zip(root_stack_record(
-                    region,
-                    cpu,
-                    carrick_guest_arch::KernelVa::new(arg1),
-                ))
-            }
-            _ => None,
-        }
+        let ttbr0 = vcpu
+            .get_sys_reg(applevisor::vcpu::SysReg::TTBR0_EL1)
+            .map_err(|error| TrapError::Hypervisor(format!("read terminal root: {error}")))?;
+        region.and_then(|region| {
+            stopped_execution(region, cpu, ttbr0).zip(root_stack_record(
+                region,
+                cpu,
+                carrick_guest_arch::KernelVa::new(arg1),
+            ))
+        })
     } else {
         None
     };
     let result = if op == GRANT_OP_FORK_STOCK {
-        let pointer = carrick_el1_abi::get_el1_region_host_ptr();
-        if pointer == 0 {
-            [METADATA_GRANT_ERR_INVALID, 0, 0, 0]
-        } else {
-            // SAFETY: the stopped lane retains the initialized kernel ABI mapping.
-            let region = unsafe {
-                core::slice::from_raw_parts(
-                    pointer as *const u8,
-                    carrick_el1_abi::EL1_REGION_SIZE as usize,
-                )
-            };
+        if let Some(region) = region {
             let ttbr0 = vcpu
                 .get_sys_reg(applevisor::vcpu::SysReg::TTBR0_EL1)
                 .map_err(|error| TrapError::Hypervisor(format!("read fork root: {error}")))?;
@@ -1420,6 +1416,8 @@ pub(crate) fn handle_metadata_grant_trap(
                 ttbr0,
                 region,
             )?
+        } else {
+            [METADATA_GRANT_ERR_INVALID, 0, 0, 0]
         }
     } else if matches!(
         op,
@@ -1471,11 +1469,11 @@ fn classify_metadata_trap(op: u64, reply: [u64; 4]) -> Result<MetadataTrapOutcom
 
 /// Read only a complete aligned terminal record on the stopped CPU's ABI stack.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn root_stack_record(
-    region: &[u8],
+fn root_stack_record<'a>(
+    region: RetainedAbiRegion<'a>,
     cpu: carrick_guest_arch::CpuId,
     address: carrick_guest_arch::KernelVa,
-) -> Option<&NativeRootExit> {
+) -> Option<&'a NativeRootExit> {
     let pointer = abi_stack_ptr::<NativeRootExit>(region, cpu, address)?;
     // SAFETY: complete aligned immutable record on a retained stopped stack.
     Some(unsafe { &*pointer })
@@ -1485,18 +1483,20 @@ fn root_stack_record(
 /// type cannot be passed to the physical table-frame resolver.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn abi_stack_ptr<T>(
-    region: &[u8],
+    region: RetainedAbiRegion<'_>,
     cpu: carrick_guest_arch::CpuId,
     address: carrick_guest_arch::KernelVa,
 ) -> Option<*mut T> {
+    if cpu.raw() >= carrick_el1_abi::EL1_STACK_SLOTS as u32 {
+        return None;
+    }
     let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
     let start =
         carrick_el1_abi::EL1_STACKS_BASE + u64::from(slot.raw()) * carrick_el1_abi::EL1_STACK_SIZE;
     let end = address
         .raw()
         .checked_add(core::mem::size_of::<T>() as u64)?;
-    if region.len() != carrick_el1_abi::EL1_REGION_SIZE as usize
-        || address.raw() < start
+    if address.raw() < start
         || end > start + carrick_el1_abi::EL1_STACK_SIZE
         || !address
             .raw()
@@ -1504,41 +1504,32 @@ pub(crate) fn abi_stack_ptr<T>(
     {
         return None;
     }
-    let offset = usize::try_from(
-        address
-            .raw()
-            .checked_sub(carrick_el1_abi::EL1_REGION_BASE)?,
+    region.record_ptr::<T>(
+        usize::try_from(
+            address
+                .raw()
+                .checked_sub(carrick_el1_abi::EL1_REGION_BASE)?,
+        )
+        .ok()?,
     )
-    .ok()?;
-    let bytes = region.get(offset..offset.checked_add(core::mem::size_of::<T>())?)?;
-    if !bytes
-        .as_ptr()
-        .addr()
-        .is_multiple_of(core::mem::align_of::<T>())
-    {
-        return None;
-    }
-    Some(bytes.as_ptr().cast_mut().cast())
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn retained_abi_region() -> Option<&'static [u8]> {
-    let pointer = carrick_el1_abi::get_el1_region_host_ptr();
-    if pointer == 0 {
-        return None;
-    }
-    // SAFETY: carrier retains the initialized ABI mapping through the synchronous trap.
-    Some(unsafe {
-        core::slice::from_raw_parts(
-            pointer as *const u8,
+pub(crate) fn retained_abi_region(
+    _custody: &crate::trap::CarrierVmCustody,
+) -> Option<RetainedAbiRegion<'_>> {
+    // SAFETY: the synchronous stopped lane retains this carrier's ABI mapping.
+    unsafe {
+        RetainedAbiRegion::new(
+            carrick_el1_abi::get_el1_region_host_ptr() as *mut u8,
             carrick_el1_abi::EL1_REGION_SIZE as usize,
         )
-    })
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn stopped_execution(
-    region: &[u8],
+    region: RetainedAbiRegion<'_>,
     cpu: carrick_guest_arch::CpuId,
     ttbr0: u64,
 ) -> Option<crate::fork_stock::GrantExecution> {
@@ -1547,32 +1538,21 @@ pub(crate) fn stopped_execution(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn stopped_records(
-    region: &[u8],
+fn stopped_records<'a>(
+    region: RetainedAbiRegion<'a>,
     cpu: carrick_guest_arch::CpuId,
-) -> Option<(&carrick_el1_abi::CurrentTask, &carrick_el1_abi::ZoneTables)> {
+) -> Option<(
+    &'a carrick_el1_abi::CurrentTask,
+    &'a carrick_el1_abi::ZoneTables,
+)> {
     let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
-    if region.len() != carrick_el1_abi::EL1_REGION_SIZE as usize
-        || !region
-            .as_ptr()
-            .addr()
-            .is_multiple_of(core::mem::align_of::<carrick_el1_abi::ZoneTables>())
-    {
-        return None;
-    }
     let task_offset = carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize
         + usize::from(slot.raw()) * core::mem::size_of::<carrick_el1_abi::CurrentTask>();
-    let task = region.get(
-        task_offset
-            ..task_offset.checked_add(core::mem::size_of::<carrick_el1_abi::CurrentTask>())?,
-    )?;
-    let zone = region.get(
-        carrick_el1_abi::EL1_ZONE_OFFSET as usize
-            ..(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
-                .checked_add(core::mem::size_of::<carrick_el1_abi::ZoneTables>())?,
-    )?;
-    // SAFETY: aligned complete initialized ABI objects retained by this stopped CPU.
-    Some(unsafe { (&*task.as_ptr().cast(), &*zone.as_ptr().cast()) })
+    let task = region.record_ptr::<carrick_el1_abi::CurrentTask>(task_offset)?;
+    let zone = region
+        .record_ptr::<carrick_el1_abi::ZoneTables>(carrick_el1_abi::EL1_ZONE_OFFSET as usize)?;
+    // SAFETY: initialized disjoint fixed ABI records; mutation uses their atomics.
+    Some(unsafe { (&*task, &*zone) })
 }
 
 /// Root retirement has released its record. Authenticate the stopped lane
@@ -1618,11 +1598,11 @@ mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn root_terminal_authentication_needs_no_parked_record_or_stock_row() {
-        let region = carrick_test_support::TestEl1Region::zeroed();
+        let mut region = carrick_test_support::TestEl1Region::zeroed();
+        let ptr = region.as_mut_ptr();
         // SAFETY: aligned retained zeroed ABI storage; all zone fields accept zero.
         let zone = unsafe {
-            &*region
-                .as_ptr()
+            &*ptr
                 .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
                 .cast::<carrick_el1_abi::ZoneTables>()
         };
@@ -1657,21 +1637,16 @@ mod tests {
         let offset = (address.raw() - carrick_el1_abi::EL1_REGION_BASE) as usize;
         // SAFETY: retained ABI storage is aligned; this fixture exclusively owns this stack.
         unsafe {
-            region
-                .as_ptr()
-                .add(offset)
-                .cast_mut()
-                .cast::<NativeRootExit>()
-                .write(
-                    NativeRootExit::new(
-                        execution.binding,
-                        carrick_sched_core::process::TerminationStatus::exited(7),
-                    )
-                    .unwrap(),
-                );
+            ptr.add(offset).cast::<NativeRootExit>().write(
+                NativeRootExit::new(
+                    execution.binding,
+                    carrick_sched_core::process::TerminationStatus::exited(7),
+                )
+                .unwrap(),
+            );
         }
         let bytes = unsafe {
-            core::slice::from_raw_parts(region.as_ptr(), carrick_el1_abi::EL1_REGION_SIZE as usize)
+            RetainedAbiRegion::new(ptr, carrick_el1_abi::EL1_REGION_SIZE as usize).unwrap()
         };
         let record = root_stack_record(bytes, cpu, address).unwrap();
         assert!(root_stack_record(bytes, carrick_guest_arch::CpuId::new(2), address).is_none());
