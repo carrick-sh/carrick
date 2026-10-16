@@ -477,8 +477,9 @@ pub fn proc_pending_fetch_or(bit: u64) {
                 Ordering::SeqCst,
             )
             .is_ok();
-        if claimed || (PROC_ORIGIN[index].load(Ordering::SeqCst) != ORIGIN_WRITING
-            && PROC_PENDING.load().bits() & lowest == 0)
+        if claimed
+            || (PROC_ORIGIN[index].load(Ordering::SeqCst) != ORIGIN_WRITING
+                && PROC_PENDING.load().bits() & lowest == 0)
         {
             // A failed claim with no pending bit raced a consumer that has
             // taken the old bit but has not cleared its origin yet. The new
@@ -766,10 +767,9 @@ mod tests {
         let _lock = lock_test();
         clear_proc_pending();
         publish_process_signal(10);
-        let first = take_proc_pending_event_in_after_take(
-            SigSet::EMPTY.complement(),
-            || publish_process_signal(10),
-        );
+        let first = take_proc_pending_event_in_after_take(SigSet::EMPTY.complement(), || {
+            publish_process_signal(10)
+        });
         assert_eq!(first.unwrap().signum, 10);
         assert_eq!(take_process_pending(), 10);
         assert_eq!(take_process_pending(), NO_PENDING_SIGNAL);
