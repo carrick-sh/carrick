@@ -22,6 +22,19 @@ pub use personality::{
     PersonalityAbi, TerminationKind, TerminationRequest, TerminationStatus, UserCopy,
 };
 
+/// Ring host work while the publishing task still owns the CPU slot.
+/// The host consumes the flags before this call returns to the guest.
+pub fn settle_owed_before_switch(
+    task: &carrick_el1_abi::CurrentTask,
+    mut pending: impl FnMut() -> bool,
+    ring: impl FnOnce(),
+) {
+    use core::sync::atomic::Ordering;
+    if pending() || task.linux.served_with_work.load(Ordering::Acquire) != 0 {
+        ring();
+    }
+}
+
 #[macro_export]
 macro_rules! export_carrier {
     ($personality:ty) => {

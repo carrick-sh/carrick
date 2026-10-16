@@ -382,6 +382,12 @@ impl ThreadControlSlot {
     pub fn reset_for_host_birth(&self, blocked: BlockedMask) -> Result<(), TransitionError> {
         self.reset(blocked, 0, None)
     }
+    /// Exclude graph retains while a returned lifecycle record is scrubbed.
+    pub fn reserve_reset_for_reclaim(
+        &self,
+    ) -> Result<carrick_core::lifecycle::MemberReset<'_>, TransitionError> {
+        self.host_exit_requested.reserve_reset()
+    }
     #[cfg(feature = "host-test")]
     pub fn reserve_reset_for_test(
         &self,

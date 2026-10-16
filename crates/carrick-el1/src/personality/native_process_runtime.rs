@@ -10707,8 +10707,8 @@ mod tests {
 
     struct FaultyPhysical<'a> {
         zone: &'a ZoneTables<ParkedContextWords>,
-        child_pages: Vec<ThreadLifecyclePage>,
-        child_controls: Vec<[ThreadControlSlot; 9]>,
+        child_pages: &'a [ThreadLifecyclePage],
+        child_controls: &'a [[ThreadControlSlot; 9]],
         active_loan: Option<usize>,
         next_page: usize,
         loan_in_flight: bool,
@@ -10767,12 +10767,9 @@ mod tests {
 
         fn child_lifecycle(&self, _: &Self::PreparedMm) -> NativeLifecycleResources<'a> {
             let idx = self.active_loan.expect("active loan for child_lifecycle");
-            // SAFETY: storage in child_pages and child_controls lives for 'a
-            unsafe {
-                NativeLifecycleResources {
-                    page: &*(&self.child_pages[idx] as *const _),
-                    controls: &*(&self.child_controls[idx][..] as *const _),
-                }
+            NativeLifecycleResources {
+                page: &self.child_pages[idx],
+                controls: &self.child_controls[idx],
             }
         }
 
@@ -10856,8 +10853,10 @@ mod tests {
                     .all(|control| !control.graph_referenced()),
                 "retiring a fork child MM must not leave control custody alive on its loaned stock"
             );
-            for control in &mut self.child_controls[index] {
-                *control = ThreadControlSlot::new();
+            for control in &self.child_controls[index] {
+                control
+                    .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
+                    .expect("unreferenced control resets through interior mutability");
             }
         }
 
@@ -10914,6 +10913,10 @@ mod tests {
         )
         .unwrap();
         let source = BornInZoneSource { zone: &zone, slot };
+        let child_pages: Vec<_> = (0..16).map(|_| ThreadLifecyclePage::new()).collect();
+        let child_controls: Vec<_> = (0..16)
+            .map(|_| core::array::from_fn(|_| ThreadControlSlot::new()))
+            .collect();
         let runtime =
             NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
@@ -10928,10 +10931,8 @@ mod tests {
 
         let mut service = FaultyPhysical {
             zone: &zone,
-            child_pages: (0..16).map(|_| ThreadLifecyclePage::new()).collect(),
-            child_controls: (0..16)
-                .map(|_| core::array::from_fn(|_| ThreadControlSlot::new()))
-                .collect(),
+            child_pages: &child_pages,
+            child_controls: &child_controls,
             active_loan: None,
             next_page: 0,
             loan_in_flight: false,
