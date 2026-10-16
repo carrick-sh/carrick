@@ -926,6 +926,13 @@ impl MmResources {
         ))
     }
 
+    pub(crate) fn reserve_native_fork_tables(
+        &self,
+        count: usize,
+    ) -> Result<Arc<super::stage1_mm::NativeForkTableReservation>, MmResourcesError> {
+        Ok(self.mm_pool.reserve_native_fork_tables(count)?)
+    }
+
     pub(crate) fn publish_root(&self, root: TaskKey) -> Result<(), MmResourcesError> {
         let mut state = self.state.lock();
         if state.leases.contains_key(&root) || state.retired.contains(&root) {

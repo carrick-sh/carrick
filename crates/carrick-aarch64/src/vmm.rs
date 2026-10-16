@@ -589,6 +589,22 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         None
     }
 
+    /// Number of existing stage-1 table arenas reserved for native fork stock.
+    fn native_fork_table_arenas(&self) -> usize {
+        0
+    }
+
+    /// Retain an exclusive runtime reservation before any native fork executes.
+    fn install_native_fork_stock(
+        &self,
+        _reservation: std::sync::Arc<dyn carrick_hal::fork_stock::NativeForkTableReservation>,
+    ) -> Result<(), carrick_hal::TrapError> {
+        Err(carrick_hal::TrapError::Hypervisor(
+            "native fork stock unavailable on this lane".into(),
+        ))
+    }
+
+    /// Exact carrier ASID allocator for stage-1 address spaces.
     fn carrier_asid_allocator(&self) -> Option<carrick_hal::asid::AsidAllocator> {
         None
     }
