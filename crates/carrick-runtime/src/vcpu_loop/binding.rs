@@ -4159,6 +4159,12 @@ where
         // EL1 still holds on-CPU mid-operation, and a suspension unloads it
         // (the reload then finds the slot still holding it).
         if !engine.el1_operation_suspended() {
+            if let Some(slot) = engine.mailbox_slot() {
+                // This poll owns the host-work boundary requested by EL1 or
+                // a kick. Consume only the pre-boundary hint: a concurrent
+                // publication after the swap stays set for the next exit.
+                let _ = carrick_el1_abi::take_pending_host_work(slot);
+            }
             if !self.phase.is_terminal_transition() {
                 self.state.publish_external_ingress(&self.kernel)?;
             }
