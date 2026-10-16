@@ -151,6 +151,8 @@ reason no semantic or work expectation changed. Broad globs and statements that
 performance is out of scope are invalid. If classification is uncertain, add or
 run the contract. `scripts/conformance/check-contract-change.py` automatically waives pure moves across files when every removed and added block matches verbatim in order (split only at blank lines, modulo indentation and with exact multiplicity) plus allowlisted `mod`/`use` declarations.
 
+For non-exempted changed guest surfaces, `scripts/conformance/check-contract-change.py` requires every contract mapped to the surface in `conformance-contracts/surfaces.toml` to have at least one bound test (`vm_free` or `embed`) that resolves at `HEAD` and belongs to a gated test lane in `[package.metadata.carrick.test-lanes]` (`host`, `kvm`, `integration`, `signed-cli`, or `signed-hvf`), printing `evidenced: <path> -> <contract>: <test>`. A binding added or changed in the diff only counts if the resolved test file is in the same crate and module subtree as the changed surface or mentions at least one non-trivial item identifier (`fn`, `struct`, `enum`, `type`, `const`, `static`, `trait`, `union`, `mod`, or `macro_rules!`) defined or modified in the surface's diff.
+
 ## Commands
 
 Use the repository recipes; they preserve signing, serialization, and test

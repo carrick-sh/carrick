@@ -110,7 +110,7 @@ class CheckContractChangeTest(unittest.TestCase):
         self.assertEqual(historical.returncode, 0, msg=historical.stderr)
         hosted = self.run_check(base_sha=pr_base, head_sha=merge_head)
         self.assertEqual(hosted.returncode, 1)
-        self.assertIn("uncovered guest surface", hosted.stderr)
+        self.assertIn("has no gated bound test for changed surface", hosted.stderr)
 
         receipt = self.repo / "docs" / "conformance-exemptions" / "reviewed.toml"
         receipt.write_text(receipt.read_text().replace(self.base_sha, pr_base).replace(reviewed_head, merge_head))
@@ -126,7 +126,7 @@ class CheckContractChangeTest(unittest.TestCase):
         subprocess.run(["git", "commit", "-am", "change reviewed source after PR review"], cwd=self.repo, check=True)
         hosted = self.run_check(base_sha=pr_base)
         self.assertEqual(hosted.returncode, 1)
-        self.assertIn("uncovered guest surface", hosted.stderr)
+        self.assertIn("has no gated bound test for changed surface", hosted.stderr)
 
     def test_committed_exemption_refuses_later_source_edit(self):
         self.commit_reviewed_exemption()
@@ -134,7 +134,7 @@ class CheckContractChangeTest(unittest.TestCase):
         subprocess.run(["git", "commit", "-am", "change source after review"], cwd=self.repo, check=True)
         result = self.run_check()
         self.assertEqual(result.returncode, 1)
-        self.assertIn("uncovered guest surface", result.stderr)
+        self.assertIn("has no gated bound test for changed surface", result.stderr)
 
     def test_committed_exemption_refuses_nonancestor_review(self):
         self.commit_reviewed_exemption()
@@ -146,7 +146,7 @@ class CheckContractChangeTest(unittest.TestCase):
         subprocess.run(["git", "commit", "-m", "same source in unrelated history"], cwd=self.repo, check=True)
         result = self.run_check()
         self.assertEqual(result.returncode, 1)
-        self.assertIn("uncovered guest surface", result.stderr)
+        self.assertIn("has no gated bound test for changed surface", result.stderr)
 
     def test_committed_exemption_refuses_rewritten_review(self):
         reviewed_head = self.commit_reviewed_exemption()
@@ -154,7 +154,7 @@ class CheckContractChangeTest(unittest.TestCase):
         subprocess.run(["git", "commit", "--amend", "-m", "rewrite reviewed head"], cwd=self.repo, check=True)
         result = self.run_check()
         self.assertEqual(result.returncode, 1)
-        self.assertIn("uncovered guest surface", result.stderr)
+        self.assertIn("has no gated bound test for changed surface", result.stderr)
 
     def test_one_later_edit_invalidates_the_entire_receipt(self):
         reviewed_head = self.commit_reviewed_exemption()
@@ -173,7 +173,7 @@ class CheckContractChangeTest(unittest.TestCase):
         self.assertEqual(unchanged.returncode, 0)
         result = self.run_check()
         self.assertEqual(result.returncode, 1)
-        self.assertIn("uncovered guest surface", result.stderr)
+        self.assertIn("has no gated bound test for changed surface", result.stderr)
 
     def test_committed_exemption_does_not_cover_another_surface(self):
         self.commit_reviewed_exemption()
@@ -192,6 +192,7 @@ class CheckContractChangeTest(unittest.TestCase):
         self.assertIn("other.rs", result.stderr)
 
     def test_descriptor_with_unrelated_filename_is_evidence(self):
+        self.seed_gated_futex_contracts()
         self.use_single_contract_surface()
         directory = self.repo / "conformance-contracts" / "contracts"
         descriptor = directory / "reviewed-contract.toml"
@@ -225,22 +226,32 @@ class CheckContractChangeTest(unittest.TestCase):
         self.assertIn("kernel.futex.contention", res.stderr)
 
     def test_2_modified_guest_file_plus_registered_binding_exits_0(self):
+        self.seed_gated_futex_contracts()
         self.guest_file.write_text("// modified futex implementation\n", encoding="utf-8")
-        self.vm_free_binding_file.write_text("// modified vm_free binding\n", encoding="utf-8")
+        self.vm_free_binding_file.write_text("#[test]\nfn futex_contention_contract() {}\n", encoding="utf-8")
         subprocess.run(["git", "commit", "-am", "modify guest and binding"], cwd=self.repo, check=True)
 
         res = self.run_check()
         self.assertEqual(res.returncode, 0, msg=f"stdout: {res.stdout}, stderr: {res.stderr}")
 
     def test_registered_plural_unit_test_file_is_evidence(self):
+        self.use_single_contract_surface()
         unit_path = "crates/carrick-kernel/src/dispatch/futex_tests.rs"
         unit = self.repo / unit_path
         unit.write_text("#[test] fn checks_futex() {}\n", encoding="utf-8")
-        with (self.repo / "conformance-contracts/surfaces.toml").open("a") as mapping:
+        with (self.repo / "conformance-contracts/surfaces.toml").open("a", encoding="utf-8") as mapping:
             mapping.write(
                 f'\n[[surfaces]]\npath = "{unit_path}"\n'
-                'contracts = ["kernel.futex.contention", "kernel.futex.requeue"]\n'
+                'contracts = ["kernel.futex.contention"]\n'
             )
+        contract_toml = self.repo / "conformance-contracts" / "contracts" / "futex-contention.toml"
+        contract_toml.write_text(
+            contract_toml.read_text(encoding="utf-8").replace(
+                'vm_free = "carrick-kernel-example::futex_contention_contract"',
+                'vm_free = "carrick-kernel::dispatch::futex_tests::checks_futex"',
+            ),
+            encoding="utf-8",
+        )
         self.guest_file.write_text("// modified futex implementation\n", encoding="utf-8")
         subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
         subprocess.run(["git", "commit", "-m", "modify guest and unit binding"], cwd=self.repo, check=True)
@@ -253,11 +264,19 @@ class CheckContractChangeTest(unittest.TestCase):
         unit = self.repo / unit_path
         unit.parent.mkdir(parents=True)
         unit.write_text("#[test] fn checks_futex() {}\n", encoding="utf-8")
-        with (self.repo / "conformance-contracts/surfaces.toml").open("a") as mapping:
+        with (self.repo / "conformance-contracts/surfaces.toml").open("a", encoding="utf-8") as mapping:
             mapping.write(
                 f'\n[[surfaces]]\npath = "{unit_path}"\n'
                 'contracts = ["kernel.futex.contention"]\n'
             )
+        contract_toml = self.repo / "conformance-contracts" / "contracts" / "futex-contention.toml"
+        contract_toml.write_text(
+            contract_toml.read_text(encoding="utf-8").replace(
+                'vm_free = "carrick-kernel-example::futex_contention_contract"',
+                'vm_free = "carrick-kernel::dispatch::futex::tests::checks_futex"',
+            ),
+            encoding="utf-8",
+        )
         self.guest_file.write_text("// modified futex implementation\n", encoding="utf-8")
         subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
         subprocess.run(["git", "commit", "-m", "modify guest and Rust tests module"], cwd=self.repo, check=True)
@@ -553,7 +572,7 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
 
         res = self.run_check()
         self.assertEqual(res.returncode, 1)
-        self.assertIn("uncovered guest surface", res.stderr)
+        self.assertIn("has no gated bound test for changed surface", res.stderr)
 
     def test_move_plus_added_non_declaration_line_in_either_file_fails(self):
         waiter_file = self.seed_extractable_futex()
@@ -586,7 +605,7 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
 
         res_source = self.run_check()
         self.assertEqual(res_source.returncode, 1)
-        self.assertIn("uncovered guest surface", res_source.stderr)
+        self.assertIn("has no gated bound test for changed surface", res_source.stderr)
 
         # Case 2: non-declaration line added in destination file (waiter.rs)
         subprocess.run(["git", "reset", "--hard", self.base_sha], cwd=self.repo, check=True)
@@ -618,7 +637,7 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
 
         res_dest = self.run_check()
         self.assertEqual(res_dest.returncode, 1)
-        self.assertIn("uncovered guest surface", res_dest.stderr)
+        self.assertIn("has no gated bound test for changed surface", res_dest.stderr)
 
     def test_duplicated_line_with_wrong_multiplicity_fails(self):
         waiter_file = self.seed_extractable_futex()
@@ -651,7 +670,7 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
 
         res = self.run_check()
         self.assertEqual(res.returncode, 1)
-        self.assertIn("uncovered guest surface", res.stderr)
+        self.assertIn("has no gated bound test for changed surface", res.stderr)
 
     def test_deletion_with_no_matching_addition_fails(self):
         waiter_file = self.seed_extractable_futex()
@@ -682,7 +701,7 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
 
         res = self.run_check()
         self.assertEqual(res.returncode, 1)
-        self.assertIn("uncovered guest surface", res.stderr)
+        self.assertIn("has no gated bound test for changed surface", res.stderr)
 
     def test_existing_byte_identical_rename_still_passes(self):
         self.seed_extractable_futex()
@@ -740,7 +759,7 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
 
         res = self.run_check(base_sha=base_sha)
         self.assertEqual(res.returncode, 1)
-        self.assertIn("uncovered guest surface", res.stderr)
+        self.assertIn("has no gated bound test for changed surface", res.stderr)
 
     def test_block_split_across_two_destination_files_passes(self):
         waiter_file = self.seed_extractable_futex()
@@ -849,8 +868,194 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
 
         res = self.run_check()
         self.assertEqual(res.returncode, 1)
-        self.assertIn("uncovered guest surface", res.stderr)
+        self.assertIn("has no gated bound test for changed surface", res.stderr)
+
+    def seed_gated_futex_contracts(self):
+        shutil.copy(
+            REPO_ROOT / "conformance-contracts" / "contracts" / "futex-requeue.toml",
+            self.repo / "conformance-contracts" / "contracts" / "futex-requeue.toml",
+        )
+        cargo_toml = self.repo / "crates" / "carrick-kernel-example" / "Cargo.toml"
+        cargo_toml.parent.mkdir(parents=True, exist_ok=True)
+        cargo_toml.write_text(
+            '[package]\nname = "carrick-kernel-example"\nversion = "0.1.0"\nedition = "2024"\n\n'
+            '[package.metadata.carrick.test-lanes]\n"*" = "host"\n',
+            encoding="utf-8",
+        )
+        semantics_main = self.repo / "crates" / "carrick-kernel-example" / "tests" / "semantics" / "main.rs"
+        semantics_main.parent.mkdir(parents=True, exist_ok=True)
+        semantics_main.write_text("mod futex_contention;\nmod futex_requeue;\n", encoding="utf-8")
+        self.vm_free_binding_file.write_text(
+            "#[test]\nfn futex_contention_contract() {}\n",
+            encoding="utf-8",
+        )
+        requeue_file = self.repo / "crates" / "carrick-kernel-example" / "tests" / "semantics" / "futex_requeue.rs"
+        requeue_file.write_text(
+            "#[test]\nfn futex_requeue_contract() {}\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "seed gated futex contracts and tests"], cwd=self.repo, check=True)
+        self.base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    def test_honest_refactor_multi_contract_with_existing_gated_bound_tests_passes(self):
+        self.seed_gated_futex_contracts()
+        self.guest_file.write_text("pub fn refactored_futex_dispatch() -> i32 { 42 }\n", encoding="utf-8")
+        subprocess.run(["git", "commit", "-am", "honest refactor touching multi-contract surface"], cwd=self.repo, check=True)
+
+        res = self.run_check()
+        self.assertEqual(res.returncode, 0, msg=f"stdout: {res.stdout}, stderr: {res.stderr}")
+        self.assertIn(
+            "evidenced: crates/carrick-kernel/src/dispatch/futex.rs -> kernel.futex.contention: carrick-kernel-example::futex_contention_contract",
+            res.stdout,
+        )
+        self.assertIn(
+            "evidenced: crates/carrick-kernel/src/dispatch/futex.rs -> kernel.futex.requeue: carrick-kernel-example::futex_requeue_contract",
+            res.stdout,
+        )
+
+    def test_contract_without_any_gated_bound_test_fails(self):
+        self.seed_gated_futex_contracts()
+        self.use_single_contract_surface()
+        cargo_toml = self.repo / "crates" / "carrick-kernel-example" / "Cargo.toml"
+        cargo_toml.write_text(
+            '[package]\nname = "carrick-kernel-example"\nversion = "0.1.0"\nedition = "2024"\n\n'
+            '[package.metadata.carrick.test-lanes]\nsemantics = { lane = "manual", reason = "not gated in CI" }\n',
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "mark test lane manual"], cwd=self.repo, check=True)
+        base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+        self.guest_file.write_text("pub fn changed_futex() {}\n", encoding="utf-8")
+        subprocess.run(["git", "commit", "-am", "modify surface with manual-only bound test"], cwd=self.repo, check=True)
+
+        res = self.run_check(base_sha=base_sha)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn(
+            "error: contract kernel.futex.contention has no gated bound test for changed surface crates/carrick-kernel/src/dispatch/futex.rs",
+            res.stderr,
+        )
+
+    def test_bound_test_missing_at_head_fails(self):
+        self.seed_gated_futex_contracts()
+        self.use_single_contract_surface()
+        self.vm_free_binding_file.write_text("// test function removed\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "remove bound test function"], cwd=self.repo, check=True)
+        base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+        self.guest_file.write_text("pub fn changed_futex() {}\n", encoding="utf-8")
+        subprocess.run(["git", "commit", "-am", "modify surface when bound test missing at HEAD"], cwd=self.repo, check=True)
+
+        res = self.run_check(base_sha=base_sha)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn(
+            "error: contract kernel.futex.contention has no gated bound test for changed surface crates/carrick-kernel/src/dispatch/futex.rs",
+            res.stderr,
+        )
+
+    def test_gaming_added_unrelated_binding_fails(self):
+        self.use_single_contract_surface()
+        contract_toml = self.repo / "conformance-contracts" / "contracts" / "futex-contention.toml"
+        contract_toml.write_text(
+            'schema_version = 1\n'
+            'id = "kernel.futex.contention"\n'
+            'title = "Futex contention"\n'
+            '[bindings]\n'
+            'docker = "probe:futexpingpong"\n',
+            encoding="utf-8",
+        )
+        unrelated_crate = self.repo / "crates" / "carrick-vmm-hvf"
+        (unrelated_crate / "src").mkdir(parents=True, exist_ok=True)
+        (unrelated_crate / "Cargo.toml").write_text(
+            '[package]\nname = "carrick-vmm-hvf"\nversion = "0.1.0"\nedition = "2024"\n\n'
+            '[package.metadata.carrick.test-lanes]\n"*" = "host"\n',
+            encoding="utf-8",
+        )
+        (unrelated_crate / "src" / "unrelated.rs").write_text(
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn completely_unrelated_test() {\n        assert_eq!(1 + 1, 2);\n    }\n}\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "seed contract without vm_free binding"], cwd=self.repo, check=True)
+        base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+        self.guest_file.write_text("pub fn futex_wake_waiters() -> i32 { 1 }\n", encoding="utf-8")
+        contract_toml.write_text(
+            'schema_version = 1\n'
+            'id = "kernel.futex.contention"\n'
+            'title = "Futex contention"\n'
+            '[bindings]\n'
+            'vm_free = "carrick-vmm-hvf::unrelated::tests::completely_unrelated_test"\n'
+            'docker = "probe:futexpingpong"\n',
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "commit", "-am", "game contract gate by adding unrelated binding"], cwd=self.repo, check=True)
+
+        res = self.run_check(base_sha=base_sha)
+        self.assertEqual(res.returncode, 1, msg=f"stdout: {res.stdout}, stderr: {res.stderr}")
+        self.assertIn(
+            "error: binding carrick-vmm-hvf::unrelated::tests::completely_unrelated_test added to kernel.futex.contention does not reference changed surface crates/carrick-kernel/src/dispatch/futex.rs",
+            res.stderr,
+        )
+
+    def test_added_binding_referencing_changed_item_passes(self):
+        self.use_single_contract_surface()
+        contract_toml = self.repo / "conformance-contracts" / "contracts" / "futex-contention.toml"
+        contract_toml.write_text(
+            'schema_version = 1\n'
+            'id = "kernel.futex.contention"\n'
+            'title = "Futex contention"\n'
+            '[bindings]\n'
+            'docker = "probe:futexpingpong"\n',
+            encoding="utf-8",
+        )
+        cargo_toml = self.repo / "crates" / "carrick-kernel-example" / "Cargo.toml"
+        cargo_toml.parent.mkdir(parents=True, exist_ok=True)
+        cargo_toml.write_text(
+            '[package]\nname = "carrick-kernel-example"\nversion = "0.1.0"\nedition = "2024"\n\n'
+            '[package.metadata.carrick.test-lanes]\n"*" = "host"\n',
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "seed contract without vm_free binding"], cwd=self.repo, check=True)
+        base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+        self.guest_file.write_text("pub fn futex_wake_waiters() -> i32 { 1 }\n", encoding="utf-8")
+        self.vm_free_binding_file.write_text(
+            "#[test]\nfn futex_contention_contract() {\n    let _ = futex_wake_waiters();\n}\n",
+            encoding="utf-8",
+        )
+        contract_toml.write_text(
+            'schema_version = 1\n'
+            'id = "kernel.futex.contention"\n'
+            'title = "Futex contention"\n'
+            '[bindings]\n'
+            'vm_free = "carrick-kernel-example::futex_contention_contract"\n'
+            'docker = "probe:futexpingpong"\n',
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "commit", "-am", "add binding referencing changed surface item"], cwd=self.repo, check=True)
+
+        res = self.run_check(base_sha=base_sha)
+        self.assertEqual(res.returncode, 0, msg=f"stdout: {res.stdout}, stderr: {res.stderr}")
+        self.assertIn(
+            "evidenced: crates/carrick-kernel/src/dispatch/futex.rs -> kernel.futex.contention: carrick-kernel-example::futex_contention_contract",
+            res.stdout,
+        )
 
 
 if __name__ == "__main__":
     unittest.main()
+
