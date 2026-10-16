@@ -141,6 +141,9 @@ impl AtomicTimerInfo {
     }
 }
 static PROC_TIMER_INFO: [AtomicTimerInfo; 64] = [const { AtomicTimerInfo::new() }; 64];
+/// One process-directed bridge event interrupts one host waiter. Publication
+/// still broadcasts a wake hint; the first unblocked waiter claims delivery.
+static PROC_WAKE_OWNER: AtomicI32 = AtomicI32::new(0);
 
 /// Thread-directed pending signals, keyed by guest tid. A process-directed
 /// signal (host `SIGINT`, `kill(pid)`) goes into the global `PROC_PENDING` mask
@@ -296,6 +299,7 @@ fn take_proc_pending_event_in_after_take(
     after_take: impl FnOnce(),
 ) -> Option<PendingSignalEvent> {
     let signum = PROC_PENDING.take(SignalSet::from_bits(wait_set.raw()))?;
+    PROC_WAKE_OWNER.store(0, Ordering::SeqCst);
     after_take();
     let index = (signum - 1) as usize;
     let origin = PROC_ORIGIN[index].load(Ordering::SeqCst);
@@ -359,6 +363,10 @@ pub fn take_pending_event_for(tid: i32) -> Option<PendingSignalEvent> {
                 origin: timer.map_or(PendingSignalOrigin::Host, PendingSignalOrigin::PosixTimer),
             });
         }
+    }
+    let owner = PROC_WAKE_OWNER.load(Ordering::SeqCst);
+    if owner != 0 && owner != tid {
+        return None;
     }
     take_proc_pending_event_in(SigSet::EMPTY.complement())
 }
@@ -444,10 +452,18 @@ pub fn has_pending_for(tid: i32) -> bool {
 /// the kernel. The pure (no-glue) form used by the KVM backend; the HVF backend
 /// wraps it to also peek its xsignal ring.
 pub fn has_unblocked_pending_for(tid: i32, block_mask: SigBlockMask) -> bool {
-    if set_is_deliverable(PROC_PENDING.load().bits(), block_mask) {
+    if thread_pending_deliverable(tid, block_mask) {
         return true;
     }
-    thread_pending_deliverable(tid, block_mask)
+    if !set_is_deliverable(PROC_PENDING.load().bits(), block_mask) {
+        return false;
+    }
+    let owner = PROC_WAKE_OWNER.load(Ordering::SeqCst);
+    owner == tid
+        || (owner == 0
+            && PROC_WAKE_OWNER
+                .compare_exchange(0, tid, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok())
 }
 
 /// True iff any process-directed signal is pending.
@@ -556,6 +572,7 @@ pub fn take_process_pending() -> i32 {
 /// Clear the process-directed pending mask (fork / supervisor-fork reinit).
 pub fn clear_proc_pending() {
     PROC_PENDING.clear();
+    PROC_WAKE_OWNER.store(0, Ordering::SeqCst);
     for origin in &PROC_ORIGIN {
         origin.store(ORIGIN_EMPTY, Ordering::SeqCst);
     }
@@ -565,6 +582,7 @@ pub fn clear_proc_pending() {
 /// exits so a recycled tid never inherits a stale signal). A forked child also
 /// clears the whole table via [`clear_thread_pending`].
 pub fn forget_thread(tid: i32) {
+    let _ = PROC_WAKE_OWNER.compare_exchange(tid, 0, Ordering::SeqCst, Ordering::SeqCst);
     let mut guard = lock_thread_pending();
     if let Some(map) = guard.as_mut() {
         map.remove(&tid);
@@ -773,6 +791,18 @@ mod tests {
         assert_eq!(first.unwrap().signum, 10);
         assert_eq!(take_process_pending(), 10);
         assert_eq!(take_process_pending(), NO_PENDING_SIGNAL);
+        clear_proc_pending();
+    }
+
+    #[test]
+    fn process_wake_claim_interrupts_only_one_unblocked_waiter() {
+        let _lock = lock_test();
+        clear_proc_pending();
+        publish_process_signal(14);
+        assert!(has_unblocked_pending_for(991, SigBlockMask::NONE));
+        assert!(!has_unblocked_pending_for(992, SigBlockMask::NONE));
+        assert_eq!(take_pending_event_for(992), None);
+        assert_eq!(take_pending_event_for(991).unwrap().signum, 14);
         clear_proc_pending();
     }
 
