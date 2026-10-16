@@ -173,6 +173,44 @@ impl<
     fn thread_exited(&mut self, verdict: carrick_core::terminal::RetirementVerdict) {
         if let Some(venue) = self.process_venue() {
             venue.retire_thread_verdict(verdict);
+            return;
+        }
+        // Admission may precede registration of the root owner. Its later
+        // Closing wait belongs to the lifecycle page, not this optional venue.
+        if let carrick_core::terminal::RetirementVerdict::RetireThread {
+            notification: Some(notification),
+            ..
+        } = verdict
+        {
+            let Some(zone) = &self.zone else {
+                self.fail_lifecycle(carrick_core_abi::NativeRunFailureReason::BirthSettlement);
+            };
+            let Some(slot) = self.frame.slot() else {
+                self.fail_lifecycle(carrick_core_abi::NativeRunFailureReason::BirthSettlement);
+            };
+            match notification.publish(zone.tables, slot, &carrick_sched_core::ShortLockSpin) {
+                Ok(effects) => {
+                    crate::sched::object_wait::deliver_wake_effects(zone.tables, slot, effects)
+                }
+                Err(carrick_sched_core::WakeRefusal::Unplaceable) => {
+                    use super::aarch64_process::ForkStockCrossing;
+                    let channel = super::native_process_runtime::ProcessWaitChannel {
+                        mm: notification.mm,
+                        address: notification.address,
+                    };
+                    if super::aarch64_process::HvcForkStockCrossing
+                        .cross_wait_channel_wake(channel, u64::from(slot.raw()))
+                        .is_err()
+                    {
+                        self.fail_lifecycle(
+                            carrick_core_abi::NativeRunFailureReason::BirthSettlement,
+                        );
+                    }
+                }
+                Err(_) => {
+                    self.fail_lifecycle(carrick_core_abi::NativeRunFailureReason::BirthSettlement)
+                }
+            }
         }
     }
     fn route_host_thread_exit(

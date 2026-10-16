@@ -2146,6 +2146,7 @@ fn arm_root_admission_imports_live_thread_membership_without_changing_census() {
                         carrick_core::terminal::RetirementVerdict::RetireThread {
                             identity,
                             requires_slot_absence: true,
+                            notification: None,
                         },
                     );
                 }
@@ -3106,18 +3107,27 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
     #[derive(Clone, Copy, Debug)]
     enum Siblings {
         Pooled,
+        PooledDifferentExecutionGeneration,
         AdoptedHostBorn,
         /// One owned member plus a host-born thread the owner never adopted.
         PooledAndUnadoptedHostBorn,
     }
     for siblings in [
         Siblings::Pooled,
+        Siblings::PooledDifferentExecutionGeneration,
         Siblings::AdoptedHostBorn,
         Siblings::PooledAndUnadoptedHostBorn,
     ] {
         let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
-        let pooled = (!matches!(siblings, Siblings::AdoptedHostBorn))
-            .then(|| imported_thread_with_identity(fixture, |_| {}));
+        let pooled = (!matches!(siblings, Siblings::AdoptedHostBorn)).then(|| {
+            imported_thread_with_identity(fixture, |identity| {
+                if matches!(siblings, Siblings::PooledDifferentExecutionGeneration) {
+                    // Host snapshot generations and process incarnations are
+                    // independent in production. The pool receipt remains 12.
+                    identity.generation = 1;
+                }
+            })
+        });
         let mut adopted_control = None;
         let mut unadopted_control = None;
         let mut service = fixture.process_service();
@@ -3130,7 +3140,7 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
             )
             .unwrap();
         match siblings {
-            Siblings::Pooled => {}
+            Siblings::Pooled | Siblings::PooledDifferentExecutionGeneration => {}
             Siblings::AdoptedHostBorn => {
                 let control = host_born_sibling(fixture, 42);
                 adopted_control = Some(control);
@@ -3970,6 +3980,150 @@ fn arm_closing_during_raw_exit_admission_settles_after_commit() {
         source,
         &fixture.task,
         selected.record,
+        root_service,
+    );
+    assert!(matches!(
+        super::aarch64_process::map_resume(resumed, root_service, &fixture.task, fixture.slot),
+        crate::sched::ResumeAction::Left
+    ));
+    assert_eq!(root_service.crossing.root_exits.load(Ordering::Acquire), 1);
+    assert_eq!(
+        root_service
+            .crossing
+            .root_exit_status
+            .load(Ordering::Acquire),
+        7
+    );
+}
+
+#[test]
+fn arm_unadopted_exit_wakes_closing_owner_without_process_venue() {
+    use carrick_el1_abi::Lifecycle;
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let (control, record) =
+        imported_thread_with_identity(fixture, |identity| identity.generation = 0);
+    let mut worker_service = fixture.process_service();
+    run_as(fixture, 42, 0, 102, control);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        record.id
+    );
+    let mut failed_frame = carrick_el1_abi::TrapFrame::default();
+    failed_frame.x[8] = 93;
+    assert!(
+        matches!(
+            arm_call(fixture, control, &mut worker_service, &mut failed_frame),
+            Err(NativeProcessError::Stale)
+        ),
+        "a Born sibling cannot register a group before its root owner exists"
+    );
+    fixture.zone.unswitch(fixture.slot, record.id);
+    run_as_leader(fixture);
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut worker_service,
+            |_| (),
+        )
+        .unwrap();
+    run_as(fixture, 42, 0, 102, control);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        record.id
+    );
+    let root_service: &'static mut Aarch64NativeProcessService<'static, TestStockCrossing> =
+        Box::leak(Box::new(fixture.process_service()));
+    let root_service_address = root_service as *mut _ as usize;
+    let fixture_address = fixture as *const Fixture as usize;
+    super::lifecycle::install_raw_exit_before_commit_hook(
+        fixture.page,
+        Box::new(move || {
+            // SAFETY: both allocations are leaked for this test and used
+            // sequentially while the outer raw-exit call owns this hook.
+            let fixture = unsafe { &*(fixture_address as *const Fixture) };
+            let service = unsafe {
+                &mut *(root_service_address
+                    as *mut Aarch64NativeProcessService<'static, TestStockCrossing>)
+            };
+            assert!(matches!(
+                fixture.page.state(control.entry().unwrap().index()),
+                Some((generation, carrick_el1_abi::EntryState::ExitingBorn
+                    | carrick_el1_abi::EntryState::ExitingPublished))
+                    if generation == control.entry().unwrap().generation()
+            ));
+            assert_eq!(
+                control.recorded_exit_kind(control.entry()),
+                carrick_core::lifecycle::MemberExitKind::Active
+            );
+            fixture.zone.clear_current(fixture.slot);
+            run_as_leader(fixture);
+            let mut frame = carrick_el1_abi::TrapFrame::default();
+            frame.x[0] = 7;
+            frame.x[8] = 94;
+            assert_eq!(
+                arm_call(fixture, fixture.control, service, &mut frame).unwrap(),
+                carrick_personality_linux::dispatch::CompletionRoute::Suspended
+            );
+            assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
+            run_as(fixture, 42, 0, 102, control);
+        }),
+    );
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[8] = 93;
+    let counters = Box::new(carrick_el1_abi::Counters::new());
+    let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
+    let mut cpu = crate::sched::FakeCpu::default();
+    let route = super::dispatch::dispatch_syscall_with_native(
+        &mut frame,
+        &counters,
+        core::slice::from_ref(&fixture.task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &cache,
+        Some(crate::Zone {
+            tables: fixture.zone,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+        }),
+        None,
+        Some(fixture),
+        None::<&mut dyn carrick_personality_linux::lifecycle::ProcessNative<Aarch64ParkedContext>>,
+        None,
+        None,
+        |_| core::ptr::null_mut(),
+    );
+    assert!(matches!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+            | carrick_personality_linux::dispatch::CompletionRoute::Served
+    ));
+    assert_eq!(
+        control.recorded_exit_kind(control.entry()),
+        carrick_core::lifecycle::MemberExitKind::InZone
+    );
+    assert_eq!(fixture.zone.counters.el1_wakes.load(Ordering::Acquire), 1);
+    let selected = fixture
+        .zone
+        .slot(fixture.slot)
+        .current()
+        .expect("the closing root is runnable");
+    run_as_leader(fixture);
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let runtime = registry()
+        .for_entry(source, &fixture.task, fixture.address)
+        .unwrap();
+    let resumed = super::aarch64_process::resume_selected(
+        &runtime,
+        registry(),
+        source,
+        &fixture.task,
+        selected,
         root_service,
     );
     assert!(matches!(

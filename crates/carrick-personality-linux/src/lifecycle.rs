@@ -1097,7 +1097,7 @@ fn serve_exit<'a>(
         native.task_state()?.mark_pending_host_work();
     }
     membership.publish();
-    native.thread_exited(custody.into_verdict());
+    native.thread_exited(custody.into_verdict(page));
     if !record.unadopted {
         // The retained runtime consumes this exact terminal handoff; another
         // guest task must not execute on the exiting job's host lease.

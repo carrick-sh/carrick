@@ -1224,6 +1224,13 @@ impl ThreadLifecyclePage {
     }
 }
 impl Lifecycle for ThreadLifecyclePage {
+    fn terminal_notification(&self) -> Option<carrick_core::terminal::TerminalNotification> {
+        let (mm, address) = self.exit_wait()?;
+        Some(carrick_core::terminal::TerminalNotification {
+            mm,
+            address: core::num::NonZeroU64::new(address)?,
+        })
+    }
     fn process_exit_custody(&self) -> &carrick_core::terminal::ProcessExitCustody {
         &self.terminal
     }

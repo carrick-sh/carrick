@@ -410,10 +410,11 @@ fn member_host_identity(
     control: &ThreadControlSlot,
     binding: ExecutionBinding,
 ) -> Result<carrick_core::terminal::HostThreadRetirementReceipt, NativeProcessError> {
-    if binding.generation.raw() == 0 {
-        // An in-zone member may enter before host adoption publishes its
-        // binding. The pool already owns its eventual exact host identity.
-        pool_host_identity(page, control.entry().ok_or(NativeProcessError::Stale)?)
+    if let Some(entry) = control.entry() {
+        // The pool owns the host process incarnation throughout adoption.
+        // A zone binding's generation versions its CPU snapshot; substituting
+        // it makes a genuine host retirement receipt impossible to satisfy.
+        pool_host_identity(page, entry)
     } else {
         Ok(carrick_core::terminal::HostThreadRetirementReceipt::from_binding(binding))
     }
@@ -4677,6 +4678,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let carrick_core::terminal::RetirementVerdict::RetireThread {
             identity,
             requires_slot_absence,
+            notification,
         } = verdict
         else {
             self.run_failure = Some(carrick_core_abi::NativeRunFailureReason::NativeStale);
@@ -4694,15 +4696,31 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return;
         };
         self.retire_thread_identity(tid);
-        self.wake_pending_exit_on_receipt();
-    }
-
-    fn wake_pending_exit_on_receipt(&mut self) {
-        // The shared pending-exit wake is consumed once, after all exact
-        // receipts and live membership have returned. A sibling's partial
-        // receipt alone does not make the parked owner runnable.
-        if self.lifecycle_admission_settled().is_err() {
-            self.run_failure = Some(carrick_core_abi::NativeRunFailureReason::BirthSettlement);
+        if let Some(notification) = notification {
+            let result = match notification.publish(
+                self.source.zone,
+                self.source.slot,
+                &NativeBucketWait {
+                    lifetime: core::marker::PhantomData,
+                    #[cfg(test)]
+                    probe: self.publication_wait_probe,
+                },
+            ) {
+                Ok(effects) => {
+                    self.service.wake_effects(effects);
+                    Ok(())
+                }
+                Err(carrick_sched_core::WakeRefusal::Unplaceable) => {
+                    self.service.wake_unplaceable_wait(ProcessWaitChannel {
+                        mm: notification.mm,
+                        address: notification.address,
+                    })
+                }
+                Err(_) => Err(NativeProcessError::Quarantined),
+            };
+            if result.is_err() {
+                self.run_failure = Some(carrick_core_abi::NativeRunFailureReason::BirthSettlement);
+            }
         }
     }
 
@@ -7663,7 +7681,7 @@ mod tests {
                 .unwrap_or_else(|_| panic!("last sibling must retire during close"));
                 membership.publish();
                 entry.retire_thread_identity(42);
-                entry.wake_pending_exit_on_receipt();
+                entry.lifecycle_admission_settled().unwrap();
                 assert_eq!(channel.generation.generation().raw(), 1);
                 assert_eq!(entry.take_run_failure(), None);
             }
