@@ -86,8 +86,25 @@ def match_allowlisted_decl_at(lines: list[str], index: int) -> int:
     return 0
 
 
-def classify_hunk_added_lines(raw_added: list[str]) -> tuple[Counter, Counter]:
-    """Classify a hunk's added lines into (required_move_counts, allowlisted_decl_counts)."""
+def classify_hunk_removed_blocks(raw_removed: list[str]) -> Counter:
+    """Split a hunk's removed lines at blank lines into ordered contiguous blocks."""
+    removed_blocks: Counter = Counter()
+    current: list[str] = []
+    for raw_line in raw_removed:
+        stripped = raw_line.strip()
+        if stripped == "":
+            if current:
+                removed_blocks[tuple(current)] += 1
+                current = []
+        else:
+            current.append(stripped)
+    if current:
+        removed_blocks[tuple(current)] += 1
+    return removed_blocks
+
+
+def classify_hunk_added_blocks(raw_added: list[str]) -> tuple[Counter, Counter]:
+    """Classify a hunk's added lines into (required_move_blocks, allowlisted_decl_blocks)."""
     stripped_lines = [line.strip() for line in raw_added]
     is_decl = [False] * len(stripped_lines)
 
@@ -120,20 +137,42 @@ def classify_hunk_added_lines(raw_added: list[str]) -> tuple[Counter, Counter]:
 
         i += 1
 
-    req_counts: Counter = Counter()
-    decl_counts: Counter = Counter()
+    req_blocks: Counter = Counter()
+    decl_blocks: Counter = Counter()
+    current_req: list[str] = []
+    current_decl: list[str] = []
+
+    def flush_req():
+        nonlocal current_req
+        if current_req:
+            req_blocks[tuple(current_req)] += 1
+            current_req = []
+
+    def flush_decl():
+        nonlocal current_decl
+        if current_decl:
+            decl_blocks[tuple(current_decl)] += 1
+            current_decl = []
+
     for line, decl in zip(stripped_lines, is_decl):
         if line == "":
+            flush_req()
+            flush_decl()
             continue
         if decl:
-            decl_counts[line] += 1
+            flush_req()
+            current_decl.append(line)
         else:
-            req_counts[line] += 1
-    return req_counts, decl_counts
+            flush_decl()
+            current_req.append(line)
+
+    flush_req()
+    flush_decl()
+    return req_blocks, decl_blocks
 
 
 def parse_file_diff(root: Path, base_sha: str, head_sha: str, path: str) -> tuple[Counter, Counter, Counter]:
-    """Return (removed_counts, required_added_counts, allowlisted_decl_added_counts) for path."""
+    """Return (removed_blocks, required_added_blocks, allowlisted_decl_added_blocks) for path."""
     res = subprocess.run(
         [
             "git",
@@ -158,12 +197,16 @@ def parse_file_diff(root: Path, base_sha: str, head_sha: str, path: str) -> tupl
     decl_added: Counter = Counter()
 
     in_hunk = False
+    current_hunk_removed: list[str] = []
     current_hunk_added: list[str] = []
 
     def flush_hunk():
-        nonlocal current_hunk_added
+        nonlocal current_hunk_removed, current_hunk_added
+        if current_hunk_removed:
+            removed.update(classify_hunk_removed_blocks(current_hunk_removed))
+            current_hunk_removed = []
         if current_hunk_added:
-            h_req, h_decl = classify_hunk_added_lines(current_hunk_added)
+            h_req, h_decl = classify_hunk_added_blocks(current_hunk_added)
             req_added.update(h_req)
             decl_added.update(h_decl)
             current_hunk_added = []
@@ -176,9 +219,7 @@ def parse_file_diff(root: Path, base_sha: str, head_sha: str, path: str) -> tupl
         if not in_hunk:
             continue
         if raw_line.startswith("-"):
-            stripped = raw_line[1:].strip()
-            if stripped != "":
-                removed[stripped] += 1
+            current_hunk_removed.append(raw_line[1:])
         elif raw_line.startswith("+"):
             current_hunk_added.append(raw_line[1:])
 
@@ -204,15 +245,15 @@ def detect_move_covered_files(
     candidates = set(file_diffs.keys())
     while candidates:
         # Phase 1: monotone per-file pruning. A file f can never be part of any
-        # valid move subset of `candidates` if it removes a line more times than
-        # all other candidates add it, or requires-adds a line more times than
+        # valid move subset of `candidates` if it removes a block more times than
+        # all other candidates add it, or requires-adds a block more times than
         # all other candidates remove it.
         monotone_bad: set[str] = set()
         for f in candidates:
             rem_f, req_f, _ = file_diffs[f]
-            for line, r_count in rem_f.items():
+            for block, r_count in rem_f.items():
                 other_add = sum(
-                    file_diffs[g][1][line] + file_diffs[g][2][line]
+                    file_diffs[g][1][block] + file_diffs[g][2][block]
                     for g in candidates
                     if g != f
                 )
@@ -221,8 +262,8 @@ def detect_move_covered_files(
                     break
             if f in monotone_bad:
                 continue
-            for line, a_count in req_f.items():
-                other_rem = sum(file_diffs[g][0][line] for g in candidates if g != f)
+            for block, a_count in req_f.items():
+                other_rem = sum(file_diffs[g][0][block] for g in candidates if g != f)
                 if a_count > other_rem:
                     monotone_bad.add(f)
                     break
@@ -232,38 +273,38 @@ def detect_move_covered_files(
             continue
 
         # Phase 2: exact multiplicity across the remaining candidates.
-        all_lines: set[str] = set()
+        all_blocks: set[tuple[str, ...]] = set()
         for f in candidates:
             rem, req, decl = file_diffs[f]
-            all_lines.update(rem.keys())
-            all_lines.update(req.keys())
-            all_lines.update(decl.keys())
+            all_blocks.update(rem.keys())
+            all_blocks.update(req.keys())
+            all_blocks.update(decl.keys())
 
         bad_files: set[str] = set()
-        for line in all_lines:
-            total_rem = sum(file_diffs[f][0][line] for f in candidates)
-            total_req = sum(file_diffs[f][1][line] for f in candidates)
+        for block in all_blocks:
+            total_rem = sum(file_diffs[f][0][block] for f in candidates)
+            total_req = sum(file_diffs[f][1][block] for f in candidates)
             caps = {
                 f: min(
-                    file_diffs[f][1][line] + file_diffs[f][2][line],
-                    max(0, total_rem - file_diffs[f][0][line]),
+                    file_diffs[f][1][block] + file_diffs[f][2][block],
+                    max(0, total_rem - file_diffs[f][0][block]),
                 )
                 for f in candidates
             }
             total_cap = sum(caps.values())
 
-            line_ok = total_req <= total_rem <= total_cap
-            if line_ok:
+            block_ok = total_req <= total_rem <= total_cap
+            if block_ok:
                 for f in candidates:
-                    r_f = file_diffs[f][0][line]
-                    a_f = file_diffs[f][1][line]
+                    r_f = file_diffs[f][0][block]
+                    a_f = file_diffs[f][1][block]
                     if r_f + a_f > total_rem or r_f > (total_cap - caps[f]):
-                        line_ok = False
+                        block_ok = False
                         break
 
-            if not line_ok:
+            if not block_ok:
                 for f in candidates:
-                    if file_diffs[f][0][line] > 0 or file_diffs[f][1][line] > 0:
+                    if file_diffs[f][0][block] > 0 or file_diffs[f][1][block] > 0:
                         bad_files.add(f)
 
         if not bad_files:
@@ -274,25 +315,25 @@ def detect_move_covered_files(
         return {}
 
     moved_counts: dict[str, int] = {f: 0 for f in candidates}
-    all_lines = set()
+    all_blocks = set()
     for f in candidates:
         rem, req, decl = file_diffs[f]
-        all_lines.update(rem.keys())
-        all_lines.update(req.keys())
-        all_lines.update(decl.keys())
+        all_blocks.update(rem.keys())
+        all_blocks.update(req.keys())
+        all_blocks.update(decl.keys())
 
-    for line in all_lines:
-        total_rem = sum(file_diffs[f][0][line] for f in candidates)
+    for block in all_blocks:
+        total_rem = sum(file_diffs[f][0][block] for f in candidates)
         if total_rem == 0:
             continue
         caps = {
             f: min(
-                file_diffs[f][1][line] + file_diffs[f][2][line],
-                max(0, total_rem - file_diffs[f][0][line]),
+                file_diffs[f][1][block] + file_diffs[f][2][block],
+                max(0, total_rem - file_diffs[f][0][block]),
             )
             for f in candidates
         }
-        matched_add = {f: file_diffs[f][1][line] for f in candidates}
+        matched_add = {f: file_diffs[f][1][block] for f in candidates}
         remaining = total_rem - sum(matched_add.values())
         for f in sorted(candidates):
             if remaining <= 0:
@@ -303,8 +344,9 @@ def detect_move_covered_files(
                 matched_add[f] += take
                 remaining -= take
 
+        block_len = len(block)
         for f in candidates:
-            moved_counts[f] += file_diffs[f][0][line] + matched_add[f]
+            moved_counts[f] += (file_diffs[f][0][block] + matched_add[f]) * block_len
 
     if sum(moved_counts.values()) == 0:
         return {}
