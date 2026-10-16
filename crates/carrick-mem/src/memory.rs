@@ -5217,15 +5217,13 @@ fn write_el1_hook(
                 enc_b(branch_to_capture as u64, mailbox_capture as u64),
             );
         }
-        HookEntry::Irq => {
+        HookEntry::Irq | HookEntry::SignalCheck => {
             // The EL0 boundary kick exit: ELR/SPSR_EL1 hold the interrupted
             // EL0 state, which the host's `hvc #4` decode makes the live PC
-            // and PSTATE.
+            // and PSTATE. A native signal checkpoint with newly owed host
+            // work needs this same boundary, never the fault-only `hvc #3`.
             emit(bytes, &mut cursor, AARCH64_HVC_KICK_OPCODE);
             emit(bytes, &mut cursor, AARCH64_ERET_OPCODE);
-        }
-        HookEntry::SignalCheck => {
-            emit(bytes, &mut cursor, AARCH64_HVC_FAULT_OPCODE);
         }
         HookEntry::Fault => {
             // The unhandled fault exit: restore registers, leave with hvc #2 to legacy_hvc
@@ -8248,6 +8246,23 @@ mod syscall_mailbox_tests {
         assert!(
             words[EL0_SIGNAL_HOOK_OFFSET / 4..EL0_FAULT_HOOK_OFFSET / 4]
                 .contains(&enc_ldr_xt_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_ARGS))
+        );
+    }
+
+    #[test]
+    fn pending_host_work_in_native_signal_hook_exits_as_kick() {
+        let bytes = el1_vectors_bytes_mailbox_configured(false, false, true);
+        let hook: Vec<u32> = bytes[EL0_SIGNAL_HOOK_OFFSET..EL0_FAULT_HOOK_OFFSET]
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("word")))
+            .collect();
+        assert!(hook.contains(&AARCH64_HVC_KICK_OPCODE));
+        assert_eq!(
+            hook.iter()
+                .filter(|opcode| **opcode == AARCH64_HVC_FAULT_OPCODE)
+                .count(),
+            1,
+            "only the unreachable idle-exit sentinel may fail as a fault"
         );
     }
 
