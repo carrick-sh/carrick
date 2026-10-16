@@ -938,7 +938,10 @@ pub fn copy_entry<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescripto
             .map_err(|_| ForkError::Core)?
             .raw();
             if !request.child_tables.contains(output) {
-                return Err(ForkError::NoMemory);
+                // The parent may map its whole primary table capacity. The
+                // child owns only its admitted stock; the unused alias tail
+                // must neither name the parent's tables nor demand more stock.
+                return Ok((descriptor, 0));
             }
             return Ok((descriptor, (descriptor & !B::ADDRESS_MASK) | output));
         }
