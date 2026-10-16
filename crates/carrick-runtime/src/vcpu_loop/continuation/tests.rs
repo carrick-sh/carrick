@@ -518,7 +518,7 @@ fn serial_host_periodic_process_timer_keeps_other_threads_sleep_deadline() {
     let deadline = continuation.deadline().unwrap();
     for _ in 0..3 {
         carrick_signal_linux::publish_process_timer_signal(14, None);
-        assert!(carrick_signal_linux::has_unblocked_pending_for(
+        assert!(carrick_signal_linux::claim_unblocked_pending_for(
             leader.thread().key().tid.raw(),
             carrick_abi::SigBlockMask::NONE,
         ));

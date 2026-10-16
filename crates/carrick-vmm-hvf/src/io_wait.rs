@@ -329,7 +329,7 @@ impl ThreadWaiter {
     }
 
     fn should_interrupt(&self, block_mask: carrick_abi::SigBlockMask) -> bool {
-        crate::host_signal::has_unblocked_pending_for(self.tid.raw(), block_mask)
+        crate::host_signal::claim_unblocked_pending_for(self.tid.raw(), block_mask)
             || crate::fork_quiesce::is_quiescing()
             || crate::fork_quiesce::exec_replacing_other_thread(self.tid)
     }
