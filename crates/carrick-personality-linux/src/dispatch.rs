@@ -1285,6 +1285,10 @@ mod ring_first_tests {
     }
 
     impl<'a> crate::lifecycle::LifecycleNative<'a> for CarrierOwned<'a> {
+        fn guest_isa(&self) -> carrick_guest_arch::GuestIsa {
+            carrick_guest_arch::GuestIsa::X86_64
+        }
+
         fn fail_lifecycle(&mut self, _: carrick_core_abi::NativeRunFailureReason) -> ! {
             panic!("unused lifecycle failure")
         }

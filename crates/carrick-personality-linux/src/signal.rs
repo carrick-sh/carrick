@@ -854,6 +854,15 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
     }
 }
 
+/// Linux signal-stack minimum for the actual guest ISA. The arm64 UAPI needs
+/// 5120 bytes; x86_64 retains its 2048-byte minimum.
+pub const fn minimum_signal_stack_size(isa: carrick_guest_arch::GuestIsa) -> u64 {
+    match isa {
+        carrick_guest_arch::GuestIsa::Aarch64 => 5120,
+        carrick_guest_arch::GuestIsa::X86_64 => 2048,
+    }
+}
+
 /// Snapshot uc_stack and choose the handler stack without changing the saved SP.
 pub fn delivery_stack(
     stack: crate::abi::thread::AltStack,
@@ -873,7 +882,7 @@ pub fn delivery_stack(
         ));
     }
     let top = stack.sp.checked_add(stack.size)?;
-    let already_on = interrupted_sp.raw() >= stack.sp && interrupted_sp.raw() < top;
+    let already_on = interrupted_sp.raw() > stack.sp && interrupted_sp.raw() <= top;
     let flags = stack.flags
         | if already_on {
             carrick_syscall_abi::LINUX_SS_ONSTACK as u32
@@ -922,4 +931,38 @@ pub trait SignalBackend: carrick_guest_arch::ArchTypes {
         fpstate: &mut [u8],
         copy_in: &mut dyn FnMut(&mut [u8], carrick_guest_arch::UserVa) -> bool,
     ) -> Result<carrick_signal_core::policy::SigBlockMask, Self::Error>;
+}
+
+#[cfg(test)]
+mod signal_stack_tests {
+    use super::*;
+    use carrick_guest_arch::{GuestIsa, UserVa};
+    use carrick_syscall_abi::LINUX_SS_ONSTACK;
+
+    /// sigaltstack(2), LTP sigaltstack02: arm64's minimum is 5120 while
+    /// x86_64 keeps its independent 2048-byte minimum.
+    #[test]
+    fn minimum_is_typed_by_guest_isa() {
+        assert_eq!(minimum_signal_stack_size(GuestIsa::Aarch64), 5120);
+        assert_eq!(minimum_signal_stack_size(GuestIsa::X86_64), 2048);
+    }
+
+    /// sigaltstack(2): for a downward-growing stack, its base is outside
+    /// and its initial top SP is inside the active alternate stack.
+    #[test]
+    fn delivery_stack_uses_open_base_closed_top() {
+        let retained = crate::abi::thread::AltStack {
+            sp: 0x10_0000,
+            size: 5120,
+            flags: 0,
+        };
+        let (base_sp, base) = delivery_stack(retained, UserVa::new(0x10_0000), true).unwrap();
+        let base_flags = base.ss_flags;
+        assert_eq!(base_flags, 0);
+        assert_eq!(base_sp.raw(), 0x10_0000 + 5120);
+        let (top_sp, top) = delivery_stack(retained, UserVa::new(0x10_0000 + 5120), true).unwrap();
+        let top_flags = top.ss_flags;
+        assert_eq!(top_flags, LINUX_SS_ONSTACK as i32);
+        assert_eq!(top_sp.raw(), 0x10_0000 + 5120);
+    }
 }

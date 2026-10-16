@@ -595,6 +595,10 @@ impl UserCopy for NativeLane<'_> {
     }
 }
 impl<'a> LifecycleNative<'a> for NativeLane<'a> {
+    fn guest_isa(&self) -> carrick_guest_arch::GuestIsa {
+        carrick_guest_arch::GuestIsa::X86_64
+    }
+
     fn fail_lifecycle(&mut self, reason: carrick_core_abi::NativeRunFailureReason) -> ! {
         (self.terminal_failure)(
             carrick_core::entry::binding(&self.task.execution, &self.task.mm),

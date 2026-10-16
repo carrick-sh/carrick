@@ -883,6 +883,13 @@ establish in-ring delivery or alternate-stack restoration.
 The ARM `sigaltstack` setup case of `kernel.el1.signal-delivery-owner`
 uses the VM-free `sigaltstack_serves_off_the_alternate_stack` witness. Native
 arm64 Docker oracle confirmation is still required at the atomic cutover.
+The arm64 minimum is 5120 bytes (5119 returns ENOMEM); x86_64 retains its
+separate 2048-byte minimum. Linux treats input SS_ONSTACK as a no-op and
+ignores SS_AUTODISARM when SS_DISABLE is set. For the downward-growing stack,
+the base SP is off-stack and the initial top SP is on-stack. The setup witnesses
+also require a new rt_sigprocmask mask to remain committed when writing oldset
+returns EFAULT, with any newly owed signal work preserved. These VM-free
+checks do not establish signed ARM delivery.
 Bad flags plus undersized
 storage return EINVAL (-22); undersized storage alone returns ENOMEM (-12);
 SS_DISABLE ignores size. Input and output may alias: the entire new stack is

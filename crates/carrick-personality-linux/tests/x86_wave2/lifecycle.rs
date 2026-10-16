@@ -194,6 +194,10 @@ impl UserCopy for Turn<'_> {
     }
 }
 impl<'a> LifecycleNative<'a> for Turn<'a> {
+    fn guest_isa(&self) -> carrick_guest_arch::GuestIsa {
+        carrick_guest_arch::GuestIsa::X86_64
+    }
+
     #[allow(clippy::panic)]
     fn fail_lifecycle(&mut self, reason: carrick_core_abi::NativeRunFailureReason) -> ! {
         std::panic::panic_any(reason)
