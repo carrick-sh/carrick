@@ -1157,6 +1157,11 @@ where
         let mut signal_interrupted_pc: Option<u64> = None;
 
         match outcome {
+            DispatchOutcome::WriteCopyInSuspended(_) => {
+                return Err(RuntimeError::Configuration(
+                    "owned write copy-in reached the retired single-thread loop".into(),
+                ));
+            }
             DispatchOutcome::OwnerMemoryWait { .. }
             | DispatchOutcome::OwnerMemorySupply { .. }
             | DispatchOutcome::OwnerPhysicalWait { .. } => {

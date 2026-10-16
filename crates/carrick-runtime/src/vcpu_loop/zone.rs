@@ -787,11 +787,19 @@ where
                 zone.free_record(record);
                 match action {
                     OwnerMemoryAction::Syscall(frame) => {
-                        let outcome = self.state.redispatch_threaded_syscall(
-                            &self.kernel,
-                            engine,
-                            control.submission.host_wait_context(),
-                        )?;
+                        let outcome = if self.state.pending_write_copy_in.is_some() {
+                            self.state.resume_write_copy_in(
+                                &self.kernel,
+                                engine,
+                                control.submission.host_wait_context(),
+                            )?
+                        } else {
+                            self.state.redispatch_threaded_syscall(
+                                &self.kernel,
+                                engine,
+                                control.submission.host_wait_context(),
+                            )?
+                        };
                         self.service_outcome(engine, control, frame, outcome)
                     }
                     OwnerMemoryAction::Retained => {
@@ -827,8 +835,16 @@ where
         // Dropping any later reservation requeues it through its authority.
         self.state.reserved_signal = self.state.reserved_signal.take().or(reserved);
         self.state.continuation_restart = None;
+        if interruption.is_some() {
+            self.state.pending_write_copy_in = None;
+        }
         let outcome = match interruption {
             Some(outcome) => outcome,
+            None if self.state.pending_write_copy_in.is_some() => self.state.resume_write_copy_in(
+                &self.kernel,
+                engine,
+                control.submission.host_wait_context(),
+            )?,
             None => self.state.redispatch_threaded_syscall(
                 &self.kernel,
                 engine,
