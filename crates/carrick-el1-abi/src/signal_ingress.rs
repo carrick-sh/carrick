@@ -453,7 +453,9 @@ mod tests {
         };
         queue.try_publish(event(1)).unwrap();
         queue.try_publish(event(2)).unwrap();
+        assert!(!queue.backpressure_waiting());
         let admission = queue.admit(event(3)).unwrap_err();
+        assert!(queue.backpressure_waiting());
         assert_eq!(admission.event(), event(3));
         let observed = admission.observed_drain();
         assert_eq!(queue.take(), Some(event(1)));
