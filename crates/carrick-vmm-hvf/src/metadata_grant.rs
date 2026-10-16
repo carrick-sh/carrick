@@ -1865,7 +1865,6 @@ fn diagnostic_identity(
     let grant = zone.spaces.grant(index, binding.mm.raw())?;
     let root = ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK;
     if !binding.issued()
-        || zone.slot(slot).mm() != binding.mm.raw()
         || zone.installed_space(slot) != binding.mm.raw()
         || root != grant.ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK
     {
