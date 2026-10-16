@@ -1218,13 +1218,42 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         let plan = match owner.prepare_fork(loan.request, scratch, &*live, self.worker()) {
             Ok(plan) => plan,
             Err(e) => {
+                #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+                let alias = {
+                    use carrick_mmu_core::aarch64::owner_fork::{
+                        STAGE1_TABLES_ALIAS_BASE, STAGE1_TABLES_PRIMARY_SIZE,
+                    };
+                    use carrick_mmu_core::owner_mmu::OwnerMmu;
+                    (e == carrick_core::mm::transaction::MmError::NoMemory
+                        && loan.request.child_tables.len < STAGE1_TABLES_PRIMARY_SIZE)
+                        .then(|| {
+                            let va = UserVa::new(
+                                STAGE1_TABLES_ALIAS_BASE + loan.request.child_tables.len,
+                            );
+                            (
+                                va,
+                                Aarch64Mmu::translate(
+                                    &*live,
+                                    parent.root,
+                                    va,
+                                    carrick_mmu_core::aarch64::LeafAccess::Read,
+                                    false,
+                                )
+                                .map(|translation| {
+                                    translation.map(|translation| translation.output)
+                                }),
+                            )
+                        })
+                };
+                #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+                let alias = None;
                 owner.spaces.free(index);
                 return Err(abandon_loan(
                     &self.crossing,
                     self.worker(),
                     &loan,
                     None,
-                    refused(NativeForkStage::Prepare, e),
+                    super::native_fork_refusal::refused_prepare(e, &loan.request, alias),
                 ));
             }
         };

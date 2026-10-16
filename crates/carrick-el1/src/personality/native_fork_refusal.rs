@@ -62,14 +62,40 @@ pub fn refused(
         cause: cause.into(),
     };
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    {
-        let mut diagnostic = carrick_el1_abi::NativeForkDiagnostic::new();
-        // Formatting is bounded, allocation-free, and only on refusal. It does
-        // not participate in the verdict or change the guest's errno.
-        let _ = core::fmt::write(&mut diagnostic, format_args!("{refusal:?}"));
-        crate::isa::aarch64::cross_hvc_fork_refusal(&diagnostic);
-    }
+    emit(format_args!("{refusal:?}"));
     super::native_process_runtime::NativeProcessError::ForkRefused(refusal)
+}
+
+/// Error-only alias observation alongside the typed Prepare refusal. It never
+/// changes the error, grants memory, or runs on a successful preparation.
+pub fn refused_prepare(
+    error: MmError,
+    request: &carrick_el1_abi::PortalForkRequest,
+    alias: Option<(
+        carrick_guest_arch::UserVa,
+        Result<Option<carrick_guest_arch::FrameGpa>, carrick_mmu_core::owner_mmu::OwnerMmuRefusal>,
+    )>,
+) -> super::native_process_runtime::NativeProcessError {
+    let refusal = NativeForkRefusal {
+        stage: NativeForkStage::Prepare,
+        cause: NativeForkCause::Mm(error),
+    };
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    emit(format_args!(
+        "{refusal:?}; child=0x{:x}+0x{:x}; alias={alias:?}",
+        request.child_tables.base, request.child_tables.len
+    ));
+    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    let _ = (request, alias);
+    super::native_process_runtime::NativeProcessError::ForkRefused(refusal)
+}
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+fn emit(arguments: core::fmt::Arguments<'_>) {
+    let mut diagnostic = carrick_el1_abi::NativeForkDiagnostic::new();
+    // Bounded, allocation-free and failure-only; no verdict depends on this reply.
+    let _ = core::fmt::write(&mut diagnostic, arguments);
+    crate::isa::aarch64::cross_hvc_fork_refusal(&diagnostic);
 }
 
 #[cfg(test)]
