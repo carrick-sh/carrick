@@ -981,6 +981,7 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// the remaining destination/count (and positioned source offset).
     pub(super) owner_read_progress: u64,
     pub(super) continuation_restart: Option<carrick_kernel::kernel::continuation::RestartDecision>,
+    pub(super) native_restart_eligible: Option<bool>,
     /// Consecutive identical (FAR, ESR) COW faults "successfully" resolved.
     /// A resolution that does not change the faulting translation refaults
     /// forever inside one quantum, starving this executor's command channel
@@ -1071,6 +1072,7 @@ where
             syscall_completion: SyscallCompletionOwnership::Idle,
             owner_read_progress: 0,
             continuation_restart: None,
+            native_restart_eligible: None,
             cow_refault_watch: None,
             reserved_signal: None,
             this_tid,
@@ -1388,6 +1390,15 @@ where
             .map_err(|error| {
                 RuntimeError::Configuration(format!("continuation event: {error:?}"))
             })?;
+        self.native_restart_eligible = matches!(
+            event,
+            carrick_kernel::kernel::continuation::ContinuationEvent::Signal
+        )
+        .then(|| {
+            lease
+                .blocked_continuation()
+                .is_some_and(|pending| pending.native_restart_eligible())
+        });
         let context = self.service_kernel_context.as_ref().ok_or_else(|| {
             RuntimeError::Configuration(
                 "persistent continuation resume lost exact Kernel context".to_owned(),
@@ -2296,8 +2307,12 @@ where
             context.thread().control_slot().native_signal_owner()
                 && carrick_el1_abi::Lifecycle::gate(&*context.lifecycle_page()).serves_ring()
         }) {
-            engine.complete_native_signal_return(value)?;
+            engine.complete_native_signal_return(
+                value,
+                self.native_restart_eligible.take().unwrap_or(true),
+            )?;
         } else {
+            self.native_restart_eligible = None;
             engine.complete_syscall(value)?;
         }
         let SyscallCompletionOwnership::Guest(completion) = std::mem::replace(

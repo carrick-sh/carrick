@@ -387,6 +387,32 @@ mod tests {
         }
     }
     #[test]
+    fn process_sigint_waits_for_unblocked_worker_and_survives_exec() {
+        let task = key(41, 11);
+        let signals = NativeProcessSignals::<u32>::fresh_root(task);
+        let main = carrick_sched_core::RecordRef {
+            id: carrick_sched_core::RecordId::from_raw(1).unwrap(),
+            incarnation: 7,
+        };
+        let worker = carrick_sched_core::RecordRef {
+            id: carrick_sched_core::RecordId::from_raw(2).unwrap(),
+            incarnation: 9,
+        };
+        let sigint = Signal::from_number(2).unwrap();
+        signals.enqueue(task, sigint, Some(77)).unwrap();
+        let blocked_main = SigBlockMask::blocking_all_of(SignalSet::EMPTY.with(sigint));
+        assert!(!signals.has_deliverable(main, blocked_main));
+        assert!(signals.take_deliverable(main, blocked_main).is_none());
+        signals.reset_for_exec();
+        assert_eq!(signals.pending_count(), 1);
+        assert!(signals.has_deliverable(worker, SigBlockMask::NONE));
+        let selected = signals
+            .take_deliverable(worker, SigBlockMask::NONE)
+            .unwrap();
+        assert_eq!((selected.0, selected.1), (sigint, Some(77)));
+        assert_eq!(signals.pending_count(), 0);
+    }
+    #[test]
     fn installing_ignore_discards_process_and_thread_pending() {
         let task = key(41, 11);
         let signals = NativeProcessSignals::<u32>::fresh_root(task);

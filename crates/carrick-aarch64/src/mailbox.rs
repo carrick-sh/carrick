@@ -168,6 +168,7 @@ pub enum MailboxResponseAction {
     RegistersPrepared = 2,
     NormalReturnAndArmPortal = 3,
     NativeSignalCheckpoint = 4,
+    NativeSignalCheckpointNoRestart = 5,
 }
 
 impl MailboxResponseAction {
@@ -213,6 +214,7 @@ impl TryFrom<u32> for MailboxResponseAction {
             2 => Ok(Self::RegistersPrepared),
             3 => Ok(Self::NormalReturnAndArmPortal),
             4 => Ok(Self::NativeSignalCheckpoint),
+            5 => Ok(Self::NativeSignalCheckpointNoRestart),
             unknown => Err(UnknownMailboxValue(unknown)),
         }
     }
@@ -467,6 +469,10 @@ mod tests {
         assert_eq!(MailboxResponseAction::RegistersPrepared.raw(), 2);
         assert_eq!(MailboxResponseAction::NormalReturnAndArmPortal.raw(), 3);
         assert_eq!(MailboxResponseAction::NativeSignalCheckpoint.raw(), 4);
+        assert_eq!(
+            MailboxResponseAction::NativeSignalCheckpointNoRestart.raw(),
+            5
+        );
 
         assert_eq!(MailboxState::try_from(3), Ok(MailboxState::ClockActive));
         assert_eq!(MailboxState::try_from(4), Err(UnknownMailboxValue(4)));
@@ -474,6 +480,10 @@ mod tests {
         assert_eq!(
             MailboxResponseAction::try_from(4),
             Ok(MailboxResponseAction::NativeSignalCheckpoint)
+        );
+        assert_eq!(
+            MailboxResponseAction::try_from(5),
+            Ok(MailboxResponseAction::NativeSignalCheckpointNoRestart)
         );
     }
 

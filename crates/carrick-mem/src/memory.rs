@@ -4792,7 +4792,7 @@ pub fn el1_vectors_bytes_shim_fd_ceiling() -> Vec<u8> {
 }
 
 const MAILBOX_HANDLER_OFFSET: usize = 0xA00;
-const MAILBOX_HANDLER_SIZE: usize = 0x200;
+const MAILBOX_HANDLER_SIZE: usize = 0x220;
 /// The ordinary request capture: the same offset in every mailbox image (the
 /// optional fstat guard and EL1 hook branch are NOP-padded when absent).
 const MAILBOX_CAPTURE_OFFSET: usize = MAILBOX_HANDLER_OFFSET + 44;
@@ -4967,7 +4967,32 @@ fn write_el1_hook(
         // An interrupt frame: syndrome 0 (an SVC's never is).
         HookEntry::Irq | HookEntry::SignalCheck => {
             if entry == HookEntry::SignalCheck {
-                emit(bytes, &mut cursor, enc_movz_w16(0xfffe) | 1); // mov w17, #0xfffe
+                // The host provides only restart eligibility; the native
+                // signal owner still decides whether SA_RESTART applies.
+                emit(
+                    bytes,
+                    &mut cursor,
+                    enc_ldr_wt_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_RESPONSE_ACTION),
+                );
+                emit(bytes, &mut cursor, enc_cmp_w16_imm(5) | (1 << 5)); // cmp w17, #5
+                let eligible_branch = cursor;
+                emit(bytes, &mut cursor, 0);
+                emit(bytes, &mut cursor, enc_movz_w16(0xfffd) | 1); // no restart
+                let store_branch = cursor;
+                emit(bytes, &mut cursor, 0);
+                let eligible = cursor;
+                emit(bytes, &mut cursor, enc_movz_w16(0xfffe) | 1);
+                let store = cursor;
+                put(
+                    bytes,
+                    eligible_branch,
+                    enc_bne(eligible_branch as u64, eligible as u64),
+                );
+                put(
+                    bytes,
+                    store_branch,
+                    enc_b(store_branch as u64, store as u64),
+                );
                 emit(bytes, &mut cursor, enc_str_xt_xn(17, 16, 264));
                 emit(
                     bytes,
@@ -5752,6 +5777,9 @@ fn el1_vectors_bytes_mailbox_with_layout(
     emit(&mut bytes, &mut cursor, enc_cmp_w16_imm(4));
     let native_signal_branch = cursor;
     emit(&mut bytes, &mut cursor, 0);
+    emit(&mut bytes, &mut cursor, enc_cmp_w16_imm(5));
+    let native_signal_no_restart_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
     let invalid_action_branch = cursor;
     emit(&mut bytes, &mut cursor, 0);
 
@@ -5965,6 +5993,14 @@ fn el1_vectors_bytes_mailbox_with_layout(
     );
     put(
         &mut bytes,
+        native_signal_no_restart_branch,
+        enc_beq(
+            native_signal_no_restart_branch as u64,
+            native_signal_return as u64,
+        ),
+    );
+    put(
+        &mut bytes,
         native_signal_hook_branch,
         enc_b(
             native_signal_hook_branch as u64,
@@ -5996,6 +6032,7 @@ fn el1_vectors_bytes_mailbox_with_layout(
     );
 
     debug_assert!(cursor <= MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE);
+    debug_assert!(MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE <= EL1_VECTOR_HOOK_OFFSET);
     if el1_enabled {
         write_el1_vector_hook(&mut bytes, EL1_VECTOR_HOOK_OFFSET, mailbox_capture, irq);
         write_el1_hook(
@@ -8195,9 +8232,18 @@ mod syscall_mailbox_tests {
             (EL0_SIGNAL_HOOK_OFFSET / 4) as i32,
             "the native response must enter EL1 before any ERET"
         );
+        assert_eq!(words[compare + 2], enc_cmp_w16_imm(5));
+        let no_restart_branch = words[compare + 3];
+        assert_eq!(no_restart_branch & 0xff00_001f, 0x5400_0000);
+        let no_restart_offset = (((no_restart_branch >> 5) & 0x7ffff) as i32) << 13 >> 13;
+        assert_eq!((compare + 3) as i32 + no_restart_offset, target);
         assert!(
             words[EL0_SIGNAL_HOOK_OFFSET / 4..EL0_FAULT_HOOK_OFFSET / 4]
                 .contains(&(enc_movz_w16(0xfffe) | 1))
+        );
+        assert!(
+            words[EL0_SIGNAL_HOOK_OFFSET / 4..EL0_FAULT_HOOK_OFFSET / 4]
+                .contains(&(enc_movz_w16(0xfffd) | 1))
         );
         assert!(
             words[EL0_SIGNAL_HOOK_OFFSET / 4..EL0_FAULT_HOOK_OFFSET / 4]
