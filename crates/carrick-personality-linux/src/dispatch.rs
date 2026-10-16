@@ -191,6 +191,9 @@ impl EntryCounters<'_> {
 /// Methods disappear with their named order; implementations never select a
 /// different family and never publish entry completion.
 pub trait PendingFamilies<'a, C: EntryContext + 'a = carrick_sched_core::ThreadCtx> {
+    fn resume_owned_continuation(&mut self) -> Option<LifecycleOutcome> {
+        None
+    }
     /// The native ABI and current venue jointly admit the poll family.
     fn may_serve_poll(&self) -> bool {
         false
@@ -1029,6 +1032,23 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
             return CompletionRoute::Forward;
         }
     };
+    if let Some(outcome) = pending.resume_owned_continuation() {
+        let returned = match outcome {
+            LifecycleOutcome::Returned { result, .. } => Some((result, original_argument0)),
+            LifecycleOutcome::HostCustody | LifecycleOutcome::Transferred { .. } => None,
+        };
+        return finish(
+            ordinal,
+            original_argument0,
+            FamilyRun {
+                completion: crate::lifecycle::lifecycle_effect(&outcome),
+                returned,
+                forward_reason: ForwardReason::FamilyFallback,
+            },
+            pending,
+            completion,
+        );
+    }
     if matches!(family, Family::Anonymous(_))
         && let Some(result) = pending.prepare_anonymous()
     {
