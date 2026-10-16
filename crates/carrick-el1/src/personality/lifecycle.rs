@@ -116,8 +116,8 @@ impl<
         }
         Ok(())
     }
-    fn process_fork(&mut self) -> Option<LifecycleOutcome> {
-        Some(self.process_venue()?.fork())
+    fn process_fork(&mut self, child_tid: ProcessForkChildTid) -> Option<LifecycleOutcome> {
+        Some(self.process_venue()?.fork(child_tid))
     }
     fn process_wait4(
         &mut self,
