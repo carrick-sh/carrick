@@ -461,6 +461,12 @@ fn host_slot_signal_is_reserved_and_cancelled_into_exact_kernel_ownership() {
 #[test]
 fn serial_host_periodic_process_timer_keeps_other_threads_sleep_deadline() {
     use carrick_abi::LinuxTimespec;
+    use carrick_core_abi::{
+        EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+    };
+    use carrick_el1::personality::native_process_runtime::host_test_support::{
+        NativeSignalFixture, take_signal_copies,
+    };
     use carrick_guest_mem::GuestMemory;
     use std::time::{Duration, Instant};
     use zerocopy::IntoBytes;
@@ -490,6 +496,23 @@ fn serial_host_periodic_process_timer_keeps_other_threads_sleep_deadline() {
     let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
     custody.commit_registration();
     custody.commit_native_signal_owner();
+    let leader_binding = ExecutionBinding {
+        task: EntryTaskKey::from_raw(leader.thread().key().tid.raw() as u64),
+        generation: EntryGeneration::from_raw(leader.task().key().serial.raw()),
+        mm: EntryMmKey::from_raw(leader.shared().mm().id().raw()),
+        thread_generation: EntryThreadGeneration::from_raw(leader.thread().key().serial.raw()),
+    };
+    let leader_fixture = NativeSignalFixture::new(
+        leader_binding,
+        EntryTaskKey::from_raw(leader.task().key().id.raw() as u64),
+    );
+    let leader_control = leader.thread().control_slot();
+    leader_control.bind_zone_record(leader_fixture.record());
+    let leader_custody =
+        carrick_core::lifecycle::MemberControlCustody::retain(leader_control).unwrap();
+    leader_custody.commit_registration();
+    leader_custody.commit_native_signal_owner();
+    leader_fixture.install_handler(14, false);
     let mut memory = carrick_kernel::dispatch::LinearMemory::new(0x10000, vec![0; 0x1000]);
     memory
         .write_bytes(0x10100, LinuxTimespec::new(0, 80_000_000).as_bytes())
@@ -516,7 +539,7 @@ fn serial_host_periodic_process_timer_keeps_other_threads_sleep_deadline() {
     )
     .unwrap();
     let deadline = continuation.deadline().unwrap();
-    for _ in 0..3 {
+    for tick in 0..3 {
         carrick_signal_linux::publish_process_timer_signal(14, None);
         assert!(carrick_signal_linux::claim_unblocked_pending_for(
             leader.thread().key().tid.raw(),
@@ -526,12 +549,37 @@ fn serial_host_periodic_process_timer_keeps_other_threads_sleep_deadline() {
             SignalReadinessProbe::from_continuation(&continuation).event(),
             None
         );
-        assert_eq!(
-            carrick_signal_linux::take_pending_event_for(leader.thread().key().tid.raw())
-                .unwrap()
-                .signum,
-            14
-        );
+        if tick == 0 {
+            let queue = carrick_el1_abi::SharedSignalIngressQueue::new();
+            let mut producer =
+                super::super::signal_ingress_producer::HostSignalIngressProducer::new();
+            assert_eq!(
+                producer
+                    .publish(
+                        &queue,
+                        super::super::signal_ingress_producer::HostIngressTarget::from_context(
+                            &leader
+                        ),
+                        carrick_signal_linux::take_pending_event_for,
+                    )
+                    .unwrap(),
+                super::super::signal_ingress_producer::HostIngressStep::Published
+            );
+            let mut frame = carrick_el1_abi::TrapFrame::default();
+            frame.esr = 0xfffd;
+            frame.elr = 0x400004;
+            frame.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
+            assert_eq!(leader_fixture.drain_and_deliver(&queue, &mut frame).0, 1);
+            assert_eq!(frame.elr, 0x7000, "SIGALRM handler runs on the leader");
+            assert_eq!(take_signal_copies().len(), 1);
+        } else {
+            assert_eq!(
+                carrick_signal_linux::take_pending_event_for(leader.thread().key().tid.raw())
+                    .unwrap()
+                    .signum,
+                14
+            );
+        }
         assert_eq!(continuation.deadline(), Some(deadline));
         std::thread::sleep(Duration::from_millis(15));
     }

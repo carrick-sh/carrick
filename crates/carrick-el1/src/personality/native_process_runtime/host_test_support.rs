@@ -169,6 +169,7 @@ pub struct NativeSignalFixture {
     address: AddressContext<RootGpa>,
     slot: SlotId,
     record: RecordRef,
+    handler_signum: core::sync::atomic::AtomicI32,
 }
 
 impl NativeSignalFixture {
@@ -265,6 +266,7 @@ impl NativeSignalFixture {
             address,
             slot,
             record,
+            handler_signum: core::sync::atomic::AtomicI32::new(2),
         }
     }
 
@@ -288,7 +290,12 @@ impl NativeSignalFixture {
     }
 
     pub fn install_sigint_handler(&self, restart: bool) {
+        self.install_handler(2, restart);
+    }
+
+    pub fn install_handler(&self, signum: i32, restart: bool) {
         use carrick_personality_linux::signal::ProcessSignals;
+        self.handler_signum.store(signum, Ordering::Release);
         let mut service = self.service();
         let mut entry = self
             .runtime
@@ -306,7 +313,7 @@ impl NativeSignalFixture {
             .unwrap();
         entry
             .rt_sigaction(
-                carrick_signal_core::policy::Signal::from_number(2).unwrap(),
+                carrick_signal_core::policy::Signal::from_number(signum).unwrap(),
                 Some(carrick_signal_core::policy::Action {
                     disposition: carrick_signal_core::policy::Disposition::Handler(
                         carrick_signal_core::policy::HandlerAddress(0x7000),
@@ -362,7 +369,10 @@ impl NativeSignalFixture {
         assert!(matches!(
             carrick_personality_linux::signal::ProcessSignals::rt_sigaction(
                 &mut entry,
-                carrick_signal_core::policy::Signal::from_number(2).unwrap(),
+                carrick_signal_core::policy::Signal::from_number(
+                    self.handler_signum.load(Ordering::Acquire),
+                )
+                .unwrap(),
                 None,
             )
             .unwrap()
