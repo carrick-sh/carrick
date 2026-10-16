@@ -2607,7 +2607,6 @@ fn arm_signal_setup_uses_one_native_owner() {
         (134, [13, 0, 0, 8, 0, 0], 0),
         (135, [0, 0, 0, 8, 0, 0], 0),
         (132, [0, 0, 0, 0, 0, 0], 0),
-        (133, [0, 0, 0, 7, 0, 0], -22),
     ] {
         let mut frame = carrick_el1_abi::TrapFrame::default();
         frame.x[..6].copy_from_slice(&args);
@@ -2620,6 +2619,12 @@ fn arm_signal_setup_uses_one_native_owner() {
         );
         assert_eq!(frame.x[0] as i64, expected, "ARM signal syscall {nr}");
     }
+}
+
+#[test]
+fn arm_signal_wait_stays_unported_until_owned_wait_slice() {
+    use carrick_personality_linux::dispatch::{Family, route_aarch64};
+    assert_eq!(route_aarch64(133, u64::MAX), Family::Unported);
 }
 
 #[cfg(test)]
