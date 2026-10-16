@@ -84,8 +84,12 @@ fn x86_sched_calls_route_to_neutral_sched_family() {
 }
 
 #[test]
-fn arm_sigreturn_stays_with_host_frame_owner() {
-    assert_eq!(route_aarch64(139, u64::MAX), Family::SignalReturn);
+fn arm_sigreturn_uses_the_native_signal_owner() {
+    // #323 pre-approved the ARM return through the retained signal owner.
+    assert_eq!(
+        route_aarch64(139, u64::MAX),
+        Family::Signal(carrick_personality_linux::signal::SignalCall::RtSigreturn)
+    );
     assert_eq!(
         carrick_personality_linux::dispatch::route_x86(139, u64::MAX),
         Family::Signal(carrick_personality_linux::signal::SignalCall::RtSigreturn)
@@ -102,14 +106,14 @@ fn pidfds_remain_unported_until_the_native_owner_exists() {
 }
 
 #[test]
-fn arm_signal_routes_match_preapproved_setup_and_host_return() {
+fn arm_signal_routes_match_preapproved_native_owner() {
     for ordinal in (129..=139).chain(core::iter::once(240)) {
         let expected = match ordinal {
             132 => Family::Lifecycle(LifecycleCall::SigAltStack),
             // #323 pre-approved ARM rt_sigaction for the native signal owner.
             134 => Family::Signal(carrick_personality_linux::signal::SignalCall::RtSigaction),
             135 => Family::Lifecycle(LifecycleCall::SigProcMask),
-            139 => Family::SignalReturn,
+            139 => Family::Signal(carrick_personality_linux::signal::SignalCall::RtSigreturn),
             _ => Family::Unported,
         };
         assert_eq!(
