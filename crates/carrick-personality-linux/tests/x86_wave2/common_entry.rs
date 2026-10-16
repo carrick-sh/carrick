@@ -785,25 +785,47 @@ fn common_linux_entry_calls_native_process_custody() {
         );
     }
     assert_eq!(process.visits, [57, 61, 231, 61, 57, 57, 57]);
-    for index in 1..6 {
+    // x86's decoder canonicalizes ctid from native arg3 to arg4. Linux
+    // ignores all unused registers for the bare SIGCHLD, zero-stack shape.
+    for index in 2..6 {
         let mut args = [17, 0, 0, 0, 0, 0];
         args[index] = 0x1000;
         let call = carrick_personality_linux::entry::decode_x86_64(56, args, 0x7fff0000);
         assert_eq!(
-            serve_full(&call, &world, &mut anonymous, Some(&mut process), None).0,
-            carrick_personality_linux::dispatch::CompletionRoute::Served
-        );
-        assert_eq!(
-            process.visits,
-            [57, 61, 231, 61, 57, 57, 57],
-            "unsupported clone shape must not call fork"
+            served_result(serve_full(
+                &call,
+                &world,
+                &mut anonymous,
+                Some(&mut process),
+                None,
+            )),
+            Some(42),
         );
     }
+    assert_eq!(process.visits.len(), 11);
+    let call = carrick_personality_linux::entry::decode_x86_64(
+        56,
+        [0x0120_0011, 0, 0x9000, 0x7000, 0xa000, 0xb000],
+        0x7fff0000,
+    );
+    assert_eq!(
+        served_result(serve_full(
+            &call,
+            &world,
+            &mut anonymous,
+            Some(&mut process),
+            None,
+        )),
+        Some(42),
+    );
+    assert_eq!(
+        process.fork_tids.last().unwrap().address,
+        UserVa::new(0x7000)
+    );
     for (flags, ctid) in [
         (0x0120_0011 | 0x400, 0x7000),
         (0x0120_0011 | 0x100, 0x7000),
         (0x0120_0012, 0x7000),
-        (0x0120_0011, 0),
     ] {
         let call = carrick_personality_linux::entry::decode_x86_64(
             56,
@@ -820,7 +842,7 @@ fn common_linux_entry_calls_native_process_custody() {
             )),
             Some(-38),
         );
-        assert_eq!(process.visits, [57, 61, 231, 61, 57, 57, 57]);
+        assert_eq!(process.visits.len(), 12);
     }
 }
 

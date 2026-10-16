@@ -534,18 +534,22 @@ pub fn invoke<'a>(
     {
         return Some(returned(SyscallResult::new(i64::from(tid)), false));
     }
-    // clone(2): only SIGCHLD with child-local TID effects is equivalent to
-    // fork here. CLONE_VM/THREAD, shared tables, other exit signals and extra
-    // arguments keep their existing thread-path refusal and errno.
+    // Without their flags, Linux ignores parent_tid, tls and child_tid.
+    // The ISA decoder has already canonicalized x86's native ctid arg3 to
+    // arg4, so both guest ISAs use this one process-fork matcher.
+    if call == LifecycleCall::Clone
+        && args[0] == carrick_signal_core::policy::Signal::CHLD.number() as u64
+        && args[1] == 0
+    {
+        return native.process_fork(ProcessForkChildTid::NONE);
+    }
+    // Child-local TID effects preserve fork's separate MM. All other clone
+    // sharing flags and exit signals stay on the existing thread/refusal path.
     if call == LifecycleCall::Clone
         && args[0] & !(CSIGNAL | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) == 0
         && args[0] & CSIGNAL == carrick_signal_core::policy::Signal::CHLD.number() as u64
+        && args[0] & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) != 0
         && args[1] == 0
-        && args[2] == 0
-        && args[3] == 0
-        && args[5] == 0
-        && ((args[0] & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) != 0 && args[4] != 0)
-            || (args[0] & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) == 0 && args[4] == 0))
     {
         return native.process_fork(ProcessForkChildTid {
             address: UserVa::new(args[4]),
