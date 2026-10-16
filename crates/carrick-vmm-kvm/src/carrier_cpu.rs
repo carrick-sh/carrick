@@ -96,7 +96,8 @@ impl CarrierCpuIo for KvmCpuIo {
 /// Physical doorbells remain distinct from the authenticated syscall trap.
 #[derive(Debug)]
 pub struct StoppedTaskExit {
-    pub state: X86ArchContext,
+    /// A maintenance-root work crossing has no task address context to save.
+    pub state: Option<X86ArchContext>,
     pub exit: CarrierRunExit,
 }
 
@@ -174,6 +175,7 @@ pub struct KvmCarrierCpu<I: CarrierCpuIo = KvmCpuIo> {
     neutral: X86VcpuSnapshot,
     custody: Custody,
     child_bindings: CarrierChildBindings,
+    maintenance_root: Option<RootGpa>,
 }
 impl KvmCarrierCpu<KvmCpuIo> {
     /// A scheduler fixture stops inside the native kernel, potentially after
@@ -302,7 +304,10 @@ impl KvmCarrierCpu<KvmCpuIo> {
                 .read_msr(0xc000_0084)
                 .map_err(|error| boundary_error(&error.to_string()))?,
         };
-        Self::new_with_children(
+        let maintenance_root = production_run
+            .maintenance_root
+            .ok_or_else(|| boundary_error("worker production run has no maintenance root"))?;
+        let mut cpu = Self::new_with_children(
             KvmCpuIo {
                 vcpu,
                 _vm: vm,
@@ -311,7 +316,9 @@ impl KvmCarrierCpu<KvmCpuIo> {
                 production_static: Some(static_state),
             },
             child_bindings,
-        )
+        )?;
+        cpu.maintenance_root = Some(maintenance_root);
+        Ok(cpu)
     }
 }
 impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
@@ -328,6 +335,7 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
             neutral,
             custody: Custody::Idle,
             child_bindings,
+            maintenance_root: None,
         })
     }
     pub fn register_child_binding(&mut self, binding: GuestArchBinding) -> Result<(), TrapError> {
@@ -423,6 +431,23 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
                 return Err(error);
             }
         };
+        if let CarrierRunExit::PhysicalDoorbell { port, .. } = &exit {
+            // Exit work can be published after the last child has left its
+            // process root. Only the boot-published maintenance root may
+            // serve that work; it is never a task snapshot or a child MM.
+            if *port == carrick_x86::cpl0_entry::WORK_PORT
+                && self
+                    .maintenance_root
+                    .is_some_and(|root| root.address().raw() == image.cr3)
+            {
+                self.custody = Custody::Loaded {
+                    binding,
+                    resume,
+                    pending_io,
+                };
+                return Ok(StoppedTaskExit { state: None, exit });
+            }
+        }
         let target_binding = match &exit {
             // CPL0 schedules descendants in-zone without changing the
             // executor's loaded task. Every physical crossing uses the
@@ -447,13 +472,14 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
                         None => {
                             self.custody = Custody::Poisoned;
                             return Err(boundary_error(&format!(
-                                "unregistered {} CR3: root {:#x}",
+                                "unregistered {} CR3: root {:#x}, port {port:#x}, rip {:#x}",
                                 if *port == carrick_el1_abi::NATIVE_CHILD_RETIRE_PORT {
                                     "child retire"
                                 } else {
                                     "physical crossing"
                                 },
-                                root_gpa.address().raw()
+                                root_gpa.address().raw(),
+                                image.rip,
                             )));
                         }
                     }
@@ -480,7 +506,10 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
             resume,
             pending_io,
         };
-        Ok(StoppedTaskExit { state, exit })
+        Ok(StoppedTaskExit {
+            state: Some(state),
+            exit,
+        })
     }
     pub fn save_and_detach(&mut self, task: TaskIdentity) -> Result<X86ArchContext, TrapError> {
         let (binding, resume, pending_io) = match self.custody {
@@ -665,9 +694,12 @@ mod tests {
         cpu.load(a.clone()).unwrap();
         let stopped = cpu.run_loaded(a.binding().task()).unwrap();
         assert_eq!(stopped.exit, CarrierRunExit::SyscallTrap);
-        assert_eq!(stopped.state.binding(), a.binding());
-        assert_eq!(stopped.state.state().gprs()[0], 0xabc);
-        assert_eq!(stopped.state.state().xsave(), a.state().xsave());
+        assert_eq!(stopped.state.as_ref().unwrap().binding(), a.binding());
+        assert_eq!(stopped.state.as_ref().unwrap().state().gprs()[0], 0xabc);
+        assert_eq!(
+            stopped.state.as_ref().unwrap().state().xsave(),
+            a.state().xsave()
+        );
         assert!(cpu.audit_idle().is_err());
         let detached = cpu.save_and_detach(a.binding().task()).unwrap();
         assert_eq!(detached.state().gprs()[0], 0xabc);
@@ -713,10 +745,53 @@ mod tests {
         // CPL0 may schedule the child without a host task handoff. This is
         // physical service, not a trap belonging to the executor's root MM.
         let stopped = cpu.run_loaded(root.binding().task()).unwrap();
-        assert_eq!(stopped.state.binding(), child.binding());
+        assert_eq!(stopped.state.as_ref().unwrap().binding(), child.binding());
         assert_eq!(
-            stopped.state.state().cr3(),
+            stopped.state.as_ref().unwrap().state().cr3(),
             child.binding().context().root.address().raw()
+        );
+    }
+
+    #[test]
+    fn maintenance_root_work_crossing_does_not_require_a_task_root() {
+        let root = context(1);
+        let maintenance = context(2);
+        let mut cpu = KvmCarrierCpu::new(ChildRetireIo {
+            image: root.hardware_image(),
+            child_image: maintenance.hardware_image(),
+            port: carrick_x86::cpl0_entry::WORK_PORT,
+        })
+        .unwrap();
+        cpu.maintenance_root = Some(maintenance.binding().context().root);
+        cpu.load(root.clone()).unwrap();
+        let stopped = cpu.run_loaded(root.binding().task()).unwrap();
+        assert!(stopped.state.is_none());
+        assert_eq!(
+            stopped.exit,
+            CarrierRunExit::PhysicalDoorbell {
+                port: carrick_x86::cpl0_entry::WORK_PORT,
+                data: vec![0, 0, 0, 0],
+            }
+        );
+    }
+
+    #[test]
+    fn maintenance_root_cannot_authenticate_other_physical_crossings() {
+        let root = context(1);
+        let maintenance = context(2);
+        let mut cpu = KvmCarrierCpu::new(ChildRetireIo {
+            image: root.hardware_image(),
+            child_image: maintenance.hardware_image(),
+            port: carrick_x86::cpl0_entry::OWNER_GRANT_PORT,
+        })
+        .unwrap();
+        cpu.maintenance_root = Some(maintenance.binding().context().root);
+        cpu.load(root.clone()).unwrap();
+        assert!(
+            cpu.run_loaded(root.binding().task())
+                .unwrap_err()
+                .to_string()
+                .contains("unregistered physical crossing CR3")
         );
     }
 
@@ -760,8 +835,11 @@ mod tests {
                 data: vec![0, 0, 0, 0],
             }
         );
-        assert_eq!(stopped.state.binding(), child.binding());
-        assert_eq!(stopped.state.state().cr3(), child_root.address().raw());
+        assert_eq!(stopped.state.as_ref().unwrap().binding(), child.binding());
+        assert_eq!(
+            stopped.state.as_ref().unwrap().state().cr3(),
+            child_root.address().raw()
+        );
     }
     #[test]
     fn unregistered_child_retire_cr3_refuses_with_typed_error() {
@@ -796,7 +874,7 @@ mod tests {
         cpu.load(root.clone()).unwrap();
         cpu.register_child_binding(child1.binding()).unwrap();
         let stopped = cpu.run_loaded(root.binding().task()).unwrap();
-        assert_eq!(stopped.state.binding(), child1.binding());
+        assert_eq!(stopped.state.as_ref().unwrap().binding(), child1.binding());
 
         // Unregister retired child1
         let unregistered = cpu.unregister_child_binding(child1_root).unwrap();
@@ -820,8 +898,8 @@ mod tests {
         cpu2.load(root.clone()).unwrap();
         cpu2.register_child_binding(child2.binding()).unwrap();
         let stopped = cpu2.run_loaded(root.binding().task()).unwrap();
-        assert_eq!(stopped.state.binding(), child2.binding());
-        assert_ne!(stopped.state.binding(), child1.binding());
+        assert_eq!(stopped.state.as_ref().unwrap().binding(), child2.binding());
+        assert_ne!(stopped.state.as_ref().unwrap().binding(), child1.binding());
     }
     #[test]
     fn save_and_detach_preserves_live_carrier_child_bindings() {
@@ -878,7 +956,7 @@ mod tests {
         cpu.audit_idle().unwrap();
         cpu.load(root.clone()).unwrap();
         let stopped = cpu.run_loaded(root.binding().task()).unwrap();
-        assert_eq!(stopped.state.binding(), child.binding());
+        assert_eq!(stopped.state.as_ref().unwrap().binding(), child.binding());
     }
     struct PendingIo {
         image: X86VcpuSnapshot,
@@ -927,7 +1005,10 @@ mod tests {
         .unwrap();
         cpu.load(a.clone()).unwrap();
         let stopped = cpu.run_loaded(a.binding().task()).unwrap();
-        assert_eq!(stopped.state.state().rip(), a.state().rip());
+        assert_eq!(
+            stopped.state.as_ref().unwrap().state().rip(),
+            a.state().rip()
+        );
         let saved = cpu.save_and_detach(a.binding().task()).unwrap();
         assert_eq!(saved.state().rip(), a.state().rip() + 2);
         assert_eq!(completions.get(), 1);
