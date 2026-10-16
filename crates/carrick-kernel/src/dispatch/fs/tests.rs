@@ -11699,3 +11699,90 @@ mod readonly_destination_offsets {
         }
     }
 }
+
+#[test]
+fn owner_copyin_wait_retains_write_before_any_guest_result() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{MemoryReadSuspension, MemoryReadWait, OwnedReadContinuation};
+    use std::cell::Cell;
+    use std::num::NonZeroU64;
+
+    struct SuspendedRead {
+        wait: MemoryReadSuspension,
+        starts: Cell<usize>,
+    }
+    impl carrick_guest_mem::GuestMemory for SuspendedRead {
+        fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+            self.starts.set(self.starts.get() + 1);
+            Err(MemoryError::ReadSuspended(Box::new(self.wait.clone())))
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            unreachable!("write preparation must only read its source")
+        }
+    }
+    impl carrick_guest_mem::CurrentMmMemory for SuspendedRead {}
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = dispatcher.capture_one_task_context().unwrap();
+    let sibling = root
+        .kernel()
+        .clone_thread(
+            &root,
+            crate::kernel::ClonePlan::from_flags(
+                carrick_abi::LinuxCloneFlags::THREAD
+                    | carrick_abi::LinuxCloneFlags::SIGHAND
+                    | carrick_abi::LinuxCloneFlags::VM,
+            )
+            .unwrap(),
+            carrick_hal::ThreadId::synthetic_for_tests(1505),
+            None,
+        )
+        .unwrap();
+    assert_ne!(root.thread().key(), sibling.thread().key());
+    // This test memory models the exact owner refusal while the sibling
+    // retains its reservation. The continuation already owns five bytes;
+    // a fresh read would lose that prefix and its transfer authority.
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(root.shared().mm().id().raw()).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Reservations,
+            7,
+        )
+    };
+    let continuation = OwnedReadContinuation::new((5_usize, b"preem".to_vec()));
+    let mut memory = SuspendedRead {
+        wait: MemoryReadSuspension {
+            wait: MemoryReadWait::Owner(wait),
+            continuation,
+        },
+        starts: Cell::new(0),
+    };
+    let outcome = dispatcher
+        .dispatch(
+            &root,
+            SyscallRequest::new(
+                carrick_abi::syscall::nr::WRITE.raw(),
+                SyscallArgs::from([1, 0x200120, 14, 0, 0, 0]),
+            ),
+            &mut memory,
+            &CompatReporter::default(),
+        )
+        .unwrap();
+    assert!(
+        !matches!(
+            outcome,
+            DispatchOutcome::Returned { .. } | DispatchOutcome::Errno { .. }
+        ),
+        "owner suspension must retain the write, not publish a guest result: {outcome:?}",
+    );
+    assert_eq!(
+        memory.starts.get(),
+        1,
+        "the suspended source must not restart"
+    );
+    assert!(sibling.task().thread(sibling.thread().key().tid).is_some());
+}
