@@ -31,7 +31,11 @@ pub mod sched;
 pub mod signal_delivery;
 pub mod thread_setup;
 
-#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+#[cfg(any(
+    test,
+    feature = "host-test",
+    all(target_os = "none", target_arch = "aarch64")
+))]
 pub mod arm_signal;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod x86_signal;

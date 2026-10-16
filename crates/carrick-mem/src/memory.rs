@@ -4969,10 +4969,16 @@ fn write_el1_hook(
             if entry == HookEntry::SignalCheck {
                 emit(bytes, &mut cursor, enc_movz_w16(0xfffe) | 1); // mov w17, #0xfffe
                 emit(bytes, &mut cursor, enc_str_xt_xn(17, 16, 264));
+                emit(
+                    bytes,
+                    &mut cursor,
+                    enc_ldr_xt_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_ARGS),
+                );
+                emit(bytes, &mut cursor, enc_str_xt_xn(17, 16, 280));
             } else {
                 emit(bytes, &mut cursor, enc_str_xt_xn(31, 16, 264));
+                emit(bytes, &mut cursor, enc_str_xt_xn(31, 16, 280));
             }
-            emit(bytes, &mut cursor, enc_str_xt_xn(31, 16, 280));
         }
     }
 
@@ -8151,6 +8157,51 @@ mod syscall_mailbox_tests {
                 .count()
                 >= 2,
             "invalid state and response action must each fail loud"
+        );
+    }
+
+    #[test]
+    fn forwarded_native_return_enters_el1_signal_checkpoint_before_eret() {
+        let bytes = el1_vectors_bytes_mailbox_configured(false, false, true);
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("word")))
+            .collect();
+        let hvc = words
+            [MAILBOX_HANDLER_OFFSET / 4..(MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE) / 4]
+            .iter()
+            .position(|word| *word == AARCH64_HVC_SYSCALL_OPCODE)
+            .map(|index| index + MAILBOX_HANDLER_OFFSET / 4)
+            .expect("forwarded syscall HVC");
+        let compare = words[hvc..(MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE) / 4]
+            .iter()
+            .position(|word| *word == enc_cmp_w16_imm(4))
+            .map(|index| index + hvc)
+            .expect("native checkpoint response action");
+        let branch = words[compare + 1];
+        assert_eq!(branch & 0xff00_001f, 0x5400_0000, "expected b.eq");
+        let offset = (((branch >> 5) & 0x7ffff) as i32) << 13 >> 13;
+        let target = (compare + 1) as i32 + offset;
+        assert_eq!(
+            words[target as usize],
+            enc_ldr_xt_sp(0, AARCH64_SYSCALL_MAILBOX_OFF_RETURN_VALUE)
+        );
+        assert_eq!(words[target as usize + 2], AARCH64_STLR_W16_X17_OPCODE);
+        let hook_branch = words[target as usize + 5];
+        assert_eq!(hook_branch & 0xfc00_0000, 0x1400_0000);
+        let displacement = ((hook_branch & 0x03ff_ffff) as i32) << 6 >> 6;
+        assert_eq!(
+            target + 5 + displacement,
+            (EL0_SIGNAL_HOOK_OFFSET / 4) as i32,
+            "the native response must enter EL1 before any ERET"
+        );
+        assert!(
+            words[EL0_SIGNAL_HOOK_OFFSET / 4..EL0_FAULT_HOOK_OFFSET / 4]
+                .contains(&(enc_movz_w16(0xfffe) | 1))
+        );
+        assert!(
+            words[EL0_SIGNAL_HOOK_OFFSET / 4..EL0_FAULT_HOOK_OFFSET / 4]
+                .contains(&enc_ldr_xt_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_ARGS))
         );
     }
 
