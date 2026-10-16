@@ -11605,31 +11605,35 @@ mod tests {
     #[test]
     fn test_blocked_ipc_returns_eintr_on_signal() {
         for operation in 0..4 {
-            blocked_ipc_signal_contract(operation, false);
+            blocked_ipc_signal_contract(operation, false, false);
         }
     }
     #[test]
+    fn external_sigint_reaches_blocked_native_guest_through_ingress() {
+        blocked_ipc_signal_contract(0, false, true);
+    }
+    #[test]
     fn bucket_contention_msgrcv() {
-        blocked_ipc_signal_contract(0, true);
+        blocked_ipc_signal_contract(0, true, false);
     }
     #[test]
     fn bucket_contention_semtimedop() {
-        blocked_ipc_signal_contract(3, true);
+        blocked_ipc_signal_contract(3, true, false);
     }
     #[test]
     fn arm_timed_semop_expires_at_shared_counter_deadline() {
-        blocked_ipc_signal_contract(4, false);
+        blocked_ipc_signal_contract(4, false, false);
     }
     #[test]
     fn msgrcv_resume_rejects_overflowing_msgp_and_restores_message() {
-        blocked_ipc_signal_contract(5, false);
-        blocked_ipc_signal_contract(7, false);
+        blocked_ipc_signal_contract(5, false, false);
+        blocked_ipc_signal_contract(7, false, false);
     }
     #[test]
     fn failed_ipc_enqueue_returns_timer_admission() {
-        blocked_ipc_signal_contract(6, false);
+        blocked_ipc_signal_contract(6, false, false);
     }
-    fn blocked_ipc_signal_contract(operation: u8, contended: bool) {
+    fn blocked_ipc_signal_contract(operation: u8, contended: bool, external: bool) {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
         let zone = unsafe {
@@ -11696,7 +11700,8 @@ mod tests {
         ));
         assert_eq!(page.live(), 2, "admission must not remove a live member");
         page.release_live(1).unwrap(); // fixture settles its bootstrap census
-        let runtime =
+        let registry = Box::leak(Box::new(NativeProcessRegistry::new()));
+        let runtime = Arc::new(
             NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
@@ -11706,7 +11711,13 @@ mod tests {
                 address,
                 words(address),
             )
-            .unwrap();
+            .unwrap(),
+        );
+        if external {
+            registry
+                .register_root(runtime.clone(), source, &task, address)
+                .unwrap();
+        }
         assert_eq!(page.live(), 1);
         let mut service = Physical {
             zone: &zone,
@@ -11724,9 +11735,22 @@ mod tests {
         use carrick_personality_linux::signal::{
             ProcessSignals, SignalInfo, SignalProcessSelector, SignalRequest,
         };
-        let mut entry = runtime
-            .enter(source, &task, words(address), &mut service)
-            .unwrap();
+        let mut entry = if external {
+            runtime
+                .enter_registered(
+                    &registry,
+                    source,
+                    &task,
+                    address,
+                    words(address),
+                    &mut service,
+                )
+                .unwrap()
+        } else {
+            runtime
+                .enter(source, &task, words(address), &mut service)
+                .unwrap()
+        };
         let queue = entry.msgget(0, 0o600).unwrap();
         let sem = entry.semget(0, 1, 0o600).unwrap();
         let initial_timer_nodes = zone.timer_node_count();
@@ -11863,14 +11887,36 @@ mod tests {
             );
             return;
         }
-        // Publish through the signal owner while execution capacity is released.
-        entry
-            .kill(
-                SignalProcessSelector::from_abi(41),
-                SignalRequest::from_abi(10).unwrap(),
-                SignalInfo::Generated(None),
-            )
-            .unwrap();
+        // Publish through the same signal owner while execution capacity is
+        // released, using the external transport for the SIGINT case.
+        if external {
+            let binding = crate::personality::common_entry::execution_binding(&task);
+            let queue = carrick_el1_abi::SharedSignalIngressQueue::new();
+            queue
+                .admit(carrick_el1_abi::ExternalSignalRecord::new(
+                    carrick_core_abi::EntryEventIdentity::from_binding(binding),
+                    binding,
+                    entry.record,
+                    carrick_el1_abi::SignalEventGeneration::new(NonZeroU64::MIN),
+                    carrick_signal_core::policy::Signal::from_number(2).unwrap(),
+                    carrick_el1_abi::ExternalSignalSource::Terminal,
+                ))
+                .unwrap();
+            assert_eq!(
+                registry
+                    .drain_external_ingress(&zone, &queue, slot, entry.service)
+                    .unwrap(),
+                1
+            );
+        } else {
+            entry
+                .kill(
+                    SignalProcessSelector::from_abi(41),
+                    SignalRequest::from_abi(10).unwrap(),
+                    SignalInfo::Generated(None),
+                )
+                .unwrap();
+        }
         let selected = zone
             .switch_in_full(slot)
             .expect("signal must wake the owned IPC continuation");
