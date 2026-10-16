@@ -1269,6 +1269,7 @@ mod ring_first_tests {
             )
         }
         fn set_current_blocked(&mut self, _mask: carrick_signal_core::policy::SigBlockMask) {}
+        fn set_current_altstack(&mut self, _stack: crate::abi::thread::AltStack) {}
         fn current_pid(&self) -> u32 {
             1
         }
@@ -1277,10 +1278,12 @@ mod ring_first_tests {
         }
         fn restore_signal_frame(
             &mut self,
-        ) -> Result<carrick_signal_core::policy::SigBlockMask, carrick_syscall_abi::LinuxErrno>
-        {
+        ) -> Result<crate::signal::RestoredSignalFrame, carrick_syscall_abi::LinuxErrno> {
             self.signal_restore_calls += 1;
-            Ok(self.current_blocked())
+            Ok(crate::signal::RestoredSignalFrame {
+                mask: self.current_blocked(),
+                stack: crate::abi::thread::AltStack::DISABLED,
+            })
         }
     }
 
