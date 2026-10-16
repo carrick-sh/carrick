@@ -389,9 +389,9 @@ test-kernel-semantics *ARGS:
 
 # Host unit/integration tests that do NOT need the HVF runtime or Docker.
 test-mm-owner *ARGS:
-    cargo test --locked -p carrick-core -p carrick-core-abi --lib
-    cargo test --locked -p carrick-core --doc
-    cargo test --locked -p carrick-core --test x86_acceleration {{ARGS}}
+    {{_admit}} {{_cargo}} test --locked -p carrick-core -p carrick-core-abi --lib
+    {{_admit}} {{_cargo}} test --locked -p carrick-core --doc
+    {{_admit}} {{_cargo}} test --locked -p carrick-core --test x86_acceleration {{ARGS}}
 
 # Host unit/harness tests without HVF guests or Docker. This ordered list is
 # the unsharded authority; check-test-shards compares the exact Cargo command
@@ -450,23 +450,23 @@ test *ARGS: _test-stdio
 test-shard-a *ARGS: _test-stdio
     {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-lanes -- --exclude-package=carrick-el1 {{ARGS}}
 
-# Workspace compilation no longer shares the critical-path job with host lanes.
-test-shard-e *ARGS: _test-stdio
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-workspace -- {{ARGS}}
-
+# Consolidates workspace, mm-owner, CLI, host, VFS, kernel, runtime, HVF and
+# EL1 unit selections into one test-batch shard so hosted macOS runs fit within
+# the 5-runner concurrency cap without recompiling overlapping crate graphs.
 test-shard-b *ARGS: _test-stdio
+    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-packages -- {{ARGS}}
+    # EL1 production-routing witnesses must not inherit kernel-example's or
+    # runtime's carrick-el1/host-test feature. Keep their original package selection.
+    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-lanes -- --package=carrick-el1 {{ARGS}}
+
+[private]
+_test-unit-packages *ARGS:
     just --justfile {{justfile()}} _test-unit-mm-owner {{ARGS}}
+    just --justfile {{justfile()}} _test-unit-workspace {{ARGS}}
     just --justfile {{justfile()}} _test-unit-cli {{ARGS}}
     just --justfile {{justfile()}} _test-unit-host {{ARGS}}
     just --justfile {{justfile()}} _test-unit-vfs {{ARGS}}
-    # EL1 production-routing witnesses must not inherit kernel-example's
-    # carrick-el1/host-test feature. Keep their original package selection.
-    just --justfile {{justfile()}} _test-unit-lanes --package=carrick-el1 {{ARGS}}
-
-test-shard-c *ARGS: _test-stdio
     just --justfile {{justfile()}} _test-unit-kernel {{ARGS}}
-
-test-shard-d *ARGS: _test-stdio
     just --justfile {{justfile()}} _test-unit-runtime {{ARGS}}
     just --justfile {{justfile()}} _test-unit-hvf {{ARGS}}
 
@@ -482,7 +482,7 @@ _test-stdio:
 
 [private]
 _test-unit-mm-owner *ARGS:
-    cargo test -p carrick-el1 --doc mm_portal
+    {{_admit}} {{_cargo}} test -p carrick-el1 --doc mm_portal
     # Shared owner witnesses and X1 use host-owned descriptors; no VM/Docker.
     just --justfile {{justfile()}} test-mm-owner {{ARGS}}
 
@@ -1239,29 +1239,49 @@ ci-macos-test recipe:
     echo "RLIMIT_NOFILE: soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
     exec just --justfile {{justfile()}} {{recipe}}
 
-# Only PRs may skip checks. Null-delimited paths and disabled rename detection
-# ensure deleting/renaming code into docs cannot hide a source change. Empty
-# diffs conservatively run everything; an invalid base fails the filter.
+# PRs and merge groups may skip heavy/macOS checks when every changed path in
+# the cumulative diff against base is documentation, workflow YAML, or xtask/CI
+# helper code that does not affect built guest/runtime artifacts. Null-delimited
+# paths and disabled rename detection ensure deleting/renaming code into docs
+# cannot hide a source change. Empty diffs and unknown paths conservatively run
+# everything; an invalid base fails the filter.
 ci-changes:
     #!/usr/bin/env bash
     set -euo pipefail
     heavy=true
     macos=true
     workflows=true
-    if [[ "${CI_EVENT:?}" == pull_request ]]; then
-        macos=false
+    if [[ "${CI_EVENT:?}" == pull_request || "${CI_EVENT:?}" == merge_group ]]; then
+        if [[ "${CI_EVENT}" == pull_request ]]; then
+            macos=false
+        fi
+        if ! git cat-file -e "${CI_BASE:?}^{commit}" 2>/dev/null; then
+            git fetch --no-tags origin "${CI_BASE}"
+        fi
         paths="$(mktemp)"
         trap 'rm -f "$paths"' EXIT
         git diff --no-renames --name-only -z "${CI_BASE:?}...HEAD" > "$paths"
+        if [[ "${CI_EVENT}" == merge_group && -n "${CI_BASE_REF:-}" ]]; then
+            if git cat-file -e "${CI_BASE_REF}^{commit}" 2>/dev/null; then
+                git diff --no-renames --name-only -z "${CI_BASE_REF}...HEAD" >> "$paths"
+            elif git remote get-url origin >/dev/null 2>&1; then
+                git fetch --no-tags origin "${CI_BASE_REF}"
+                git diff --no-renames --name-only -z "FETCH_HEAD...HEAD" >> "$paths"
+            else
+                git diff --no-renames --name-only -z "${CI_BASE_REF}...HEAD" >> "$paths"
+            fi
+        fi
         if [[ -s "$paths" ]]; then
             has_code=false
             has_workflows=false
             while IFS= read -r -d '' path; do
                 case "$path" in
+                    crates/carrick-xtask/src/ci_*|crates/carrick-xtask/src/commit_trailers.rs|crates/carrick-xtask/src/test_batch.rs|crates/carrick-xtask/src/test_lanes.rs|crates/carrick-xtask/src/test_shards.rs|crates/carrick-xtask/tests/ci_*|crates/carrick-xtask/tests/commit_trailers.rs|crates/carrick-xtask/tests/test_batch.rs|crates/carrick-xtask/tests/test_shards.rs|scripts/ci/*)
+                        ;;
                     crates/*|Cargo.*|justfile|scripts/*|rust-toolchain*|conformance*|fixtures/*)
                         has_code=true
                         ;;
-                    docs/*|*.md|LICENSE*)
+                    docs/*|.agents/*|*.md|LICENSE*)
                         ;;
                     .github/*)
                         has_workflows=true
@@ -1273,6 +1293,9 @@ ci-changes:
             done < "$paths"
             heavy="$has_code"
             workflows="$has_workflows"
+            if [[ "${CI_EVENT}" == merge_group ]]; then
+                macos="$has_code"
+            fi
         fi
     fi
     echo "heavy=$heavy" >> "${GITHUB_OUTPUT:?}"
@@ -1281,25 +1304,32 @@ ci-changes:
     echo "Run hosted checks: heavy=$heavy macos=$macos workflows=$workflows"
 
 # Fail closed: GitHub considers skipped required jobs successful on their own.
-# ci-ok depends on every job; only the filter can license a docs-only or workflow-only PR skip.
+# ci-ok depends on every job; only the filter or draft-PR gating can license skips.
 ci-results:
     #!/usr/bin/env bash
     set -euo pipefail
-    jq -e --arg event "${CI_EVENT:?}" '
+    jq -e --arg event "${CI_EVENT:?}" --arg draft "${CI_DRAFT:-false}" '
       .changes.result == "success" and
       (length > 1) and
       (. as $root |
-       if $root.changes.outputs.heavy == "true" and $root.changes.outputs.macos == "true" then
-         del(.changes) | all(.[]; .result == "success")
-       elif $event == "pull_request" then
-         (del(.changes) | with_entries(select(.key | startswith("macos-"))) | all(.[]; .result == "skipped")) and
-         (del(.changes) | with_entries(select((.key | startswith("macos-") | not) and .key != "actionlint" and .key != "linked-issue" and .key != "commit-trailers"))
-           | if ($root.changes.outputs.heavy // "true") == "true" then all(.[]; .result == "success")
+       if $event == "pull_request" or $event == "merge_group" then
+         (if $event == "pull_request" then ($root.changes.outputs.macos // "true") == "false"
+          else ($root.changes.outputs.macos // "true") == ($root.changes.outputs.heavy // "true") end) and
+         (del(.changes) | with_entries(select(.key | startswith("macos-")))
+           | if ($root.changes.outputs.macos // "true") == "true" and ($event != "pull_request" or $draft != "true") then all(.[]; .result == "success")
+             else all(.[]; .result == "skipped") end) and
+         (del(.changes).lint
+           | if ($root.changes.outputs.heavy // "true") == "true" then .result == "success"
+             else .result == "skipped" end) and
+         (del(.changes) | with_entries(select((.key | startswith("macos-") | not) and .key != "actionlint" and .key != "linked-issue" and .key != "commit-trailers" and .key != "lint"))
+           | if ($root.changes.outputs.heavy // "true") == "true" and ($event != "pull_request" or $draft != "true") then all(.[]; .result == "success")
              else all(.[]; .result == "skipped") end) and
          (.["linked-issue"].result == "success") and
          (.["commit-trailers"].result == "success") and
          (del(.changes).actionlint
            | if ($root.changes.outputs.workflows // "false") == "true" then .result == "success"
              else .result == "skipped" end)
+       elif $root.changes.outputs.heavy == "true" and $root.changes.outputs.macos == "true" then
+         del(.changes) | all(.[]; .result == "success")
        else false end)
     ' <<< "${CI_NEEDS:?}"
