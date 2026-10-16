@@ -513,16 +513,12 @@ pub fn invoke<'a>(
     {
         return Some(returned(SyscallResult::new(i64::from(tid)), false));
     }
+    // Without the corresponding CLONE_* flags, Linux ignores parent_tid,
+    // tls and child_tid. libc's fork wrapper only initializes flags and
+    // stack; stale argument registers must not turn that fork into ENOSYS.
     if call == LifecycleCall::Clone
-        && args
-            == [
-                carrick_signal_core::policy::Signal::CHLD.number() as u64,
-                0,
-                0,
-                0,
-                0,
-                0,
-            ]
+        && args[0] == carrick_signal_core::policy::Signal::CHLD.number() as u64
+        && args[1] == 0
     {
         return native.process_fork();
     }
