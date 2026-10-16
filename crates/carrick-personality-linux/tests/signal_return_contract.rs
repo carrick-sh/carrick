@@ -9,6 +9,7 @@ struct Native {
     invalid: bool,
     forced: bool,
     blocked: SigBlockMask,
+    altstack: carrick_personality_linux::abi::thread::AltStack,
     arm_frame: Option<arm::RtSigframe>,
 }
 impl UserCopy for Native {
@@ -68,12 +69,53 @@ fn restored_context_has_no_syscall_result() {
         invalid: false,
         forced: false,
         blocked: SigBlockMask::blocking_all_of(SignalSet::default()),
+        altstack: carrick_personality_linux::abi::thread::AltStack::DISABLED,
         arm_frame: None,
     };
     let outcome = invoke(SignalCall::RtSigreturn, &mut native).unwrap();
     assert!(!matches!(outcome, SignalOutcome::Returned { .. }));
     assert_eq!(native.accumulator, 0x1234_5678);
     assert_eq!(native.blocked.signals().bits(), 1 << 9);
+}
+
+#[test]
+fn sigreturn_restores_saved_autodisarm_stack_after_handler() {
+    use carrick_syscall_abi::{
+        LinuxFpsimdContext, LinuxSiginfo, LinuxSignalContext, LinuxSignalStack,
+    };
+    let mut context = LinuxSignalContext::empty();
+    context.pc = 0x10000;
+    context.sp = 0x20000;
+    let stack = LinuxSignalStack {
+        ss_sp: 0x10_0000,
+        ss_flags: carrick_syscall_abi::LINUX_SS_AUTODISARM as i32,
+        _pad0: 0,
+        ss_size: 8192,
+    };
+    let frame = arm::encode(
+        context,
+        stack,
+        SigBlockMask::NONE,
+        LinuxSiginfo::empty(),
+        Some(LinuxFpsimdContext::empty()),
+        None,
+    )
+    .unwrap()
+    .rt;
+    let mut native = Native {
+        accumulator: 139,
+        invalid: false,
+        forced: false,
+        blocked: SigBlockMask::NONE,
+        altstack: carrick_personality_linux::abi::thread::AltStack::DISABLED,
+        arm_frame: Some(frame),
+    };
+    assert_eq!(invoke(SignalCall::RtSigreturn, &mut native), Some(SignalOutcome::Restored));
+    let expected_sp = stack.ss_sp;
+    let expected_size = stack.ss_size;
+    assert_eq!(native.altstack.sp, expected_sp);
+    assert_eq!(native.altstack.size, expected_size);
+    assert_eq!(native.altstack.flags, carrick_syscall_abi::LINUX_SS_AUTODISARM as u32);
 }
 
 #[test]
@@ -102,6 +144,7 @@ fn invalid_signal_frame_is_not_an_errno_return() {
         invalid: true,
         forced: false,
         blocked: SigBlockMask::NONE,
+        altstack: carrick_personality_linux::abi::thread::AltStack::DISABLED,
         arm_frame: None,
     };
     let outcome = invoke(SignalCall::RtSigreturn, &mut native);
@@ -116,6 +159,7 @@ fn pidfd_send_signal_retains_host_owner() {
         invalid: false,
         forced: false,
         blocked: SigBlockMask::NONE,
+        altstack: carrick_personality_linux::abi::thread::AltStack::DISABLED,
         arm_frame: None,
     };
     assert_eq!(invoke(SignalCall::PidfdSendSignal, &mut native), None);
@@ -179,6 +223,7 @@ fn frame_masks_cross_as_blocked_domains() {
         invalid: false,
         forced: false,
         blocked: SigBlockMask::NONE,
+        altstack: carrick_personality_linux::abi::thread::AltStack::DISABLED,
         arm_frame: None,
     };
     assert_eq!(frame_mask(params), restored_mask(&mut native).unwrap());
@@ -221,6 +266,7 @@ fn public_arm_frame_preserves_same_entry_completion() {
             invalid: false,
             forced: false,
             blocked: SigBlockMask::NONE,
+            altstack: carrick_personality_linux::abi::thread::AltStack::DISABLED,
             arm_frame: Some(public),
         };
         let outcome = invoke(SignalCall::RtSigreturn, &mut native).unwrap();
