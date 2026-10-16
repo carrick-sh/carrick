@@ -652,6 +652,7 @@ mod tests {
             prepared: NoopPreparedResolver,
             spaces: &'a AddressSpaces,
             refuse: bool,
+            no_progress: bool,
             supplied: usize,
             copied: usize,
             settled: usize,
@@ -686,6 +687,9 @@ mod tests {
                 if self.refuse {
                     return Err(());
                 }
+                if self.no_progress {
+                    return if self.supplied <= 2 { Ok(()) } else { Err(()) };
+                }
                 self.cow.pool.publish(MM, GRANT, backing()).unwrap();
                 Ok(())
             }
@@ -707,7 +711,7 @@ mod tests {
                 true
             }
         }
-        for refuse in [true, false] {
+        for (refuse, no_progress) in [(true, false), (false, true), (false, false)] {
             let (arena, memory) = forked(true);
             let parent = memory.page(OLD);
             let pool = CowGrantPool::new();
@@ -731,6 +735,7 @@ mod tests {
                 prepared: NoopPreparedResolver,
                 spaces: &spaces,
                 refuse,
+                no_progress,
                 supplied: 0,
                 copied: 0,
                 settled: 0,
@@ -750,17 +755,22 @@ mod tests {
                 result,
                 if refuse {
                     Err(UserWriteError::Mechanics(()))
+                } else if no_progress {
+                    Err(UserWriteError::Busy)
                 } else {
                     Ok(())
                 }
             );
             assert_eq!(venue.supplied, 1);
-            assert_eq!(venue.copied, usize::from(!refuse));
+            assert_eq!(venue.copied, usize::from(!refuse && !no_progress));
             assert_eq!(venue.settled, if refuse { 1 } else { 2 });
-            assert_eq!(pool.declined()[CowDecline::PoolEmpty as usize], 1);
+            assert_eq!(
+                pool.declined()[CowDecline::PoolEmpty as usize],
+                if no_progress { 2 } else { 1 }
+            );
             assert_eq!(pool.ready(MM + 1).count(), 1);
             assert_eq!(memory.page(OLD), parent, "the parent bytes remain private");
-            if !refuse {
+            if !refuse && !no_progress {
                 assert_eq!(&memory.page(GRANT)[..4], &tid);
             }
         }
