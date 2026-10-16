@@ -210,6 +210,7 @@ pub fn dispatch_anonymous_with_reservations(
 /// The shared-record layout this image was built against; the image header
 /// points at it and the host refuses an image whose value differs
 /// (`carrick_el1_abi::check_image_abi`).
+#[cfg(target_os = "none")]
 #[unsafe(no_mangle)]
 #[used]
 pub static CARRICK_EL1_ABI_HASH: u64 = carrick_el1_abi::EL1_ABI_LAYOUT_HASH;
