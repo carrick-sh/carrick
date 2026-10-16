@@ -544,13 +544,6 @@ impl PersistentTerminal {
     }
 }
 
-fn settle_pending_host_work_at_poll(
-    slot: usize,
-    dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
-) {
-    carrick_kernel::el1_delegation::settle_pending_host_work_for(slot, dispatcher);
-}
-
 pub(crate) struct ProductionHvpatchLoopJob<E: ThreadedEngine> {
     pub(super) kernel: Kernel,
     pub(super) state: ThreadRuntimeState<E>,
@@ -4176,7 +4169,10 @@ where
         // (the reload then finds the slot still holding it).
         if !engine.el1_operation_suspended() {
             if let Some(slot) = engine.mailbox_slot() {
-                settle_pending_host_work_at_poll(slot, &self.kernel.dispatcher);
+                carrick_kernel::el1_delegation::settle_pending_host_work_for(
+                    slot,
+                    &self.kernel.dispatcher,
+                );
             }
             if !self.phase.is_terminal_transition() {
                 self.state.publish_external_ingress(&self.kernel)?;
@@ -6957,7 +6953,7 @@ mod tests {
 
         // Poll has reached the host boundary for an ordinary forwarded call.
         // The owed wake must be delivered before that call returns to EL0.
-        settle_pending_host_work_at_poll(SLOT, &dispatcher);
+        carrick_kernel::el1_delegation::settle_pending_host_work_for(SLOT, &dispatcher);
         assert!(!task.linux.has_pending_host_work());
         assert!(
             !owner.service_host_wake(object),
