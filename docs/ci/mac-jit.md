@@ -307,16 +307,17 @@ gh workflow run kernel-runtime.yml --repo carrick-sh/carrick --ref main
 
 The comparison runs in the hosted `hvf-gate`/`kvm-gate` jobs, never on the
 trusted hardware: a lane job only produces and uploads its receipt. The gate
-uses the live merge-queue base links for in-queue ancestors, and when a landed
-ancestor on `main` passed `kernel-runtime.yml` without a receipt via the
-trusted `changes` docs-only fast path (verified from the trusted run's
-published `ci-class-<sha>.json` artifact recording `hardware == false`),
-follows its first-parent commits on `main` (bounded to 16 hops) to the nearest
-published receipt. It waits up to 90 minutes only when the terminal
-receipt-producing ancestor's run is still in progress (polled every 60 s; job
-timeout 110 min). A missing queue link or expired receipt for an unreceipted
-non-fast-path merge-group ancestor fails closed immediately and names this
+uses the live merge-queue base links, not commit parents, for the chain. It
+waits up to 90 minutes only when the terminal receipt-producing ancestor's
+run is still in progress (polled every 60 s; job timeout 110 min). A missing
+queue link for an unreceipted merge-group ancestor fails immediately. A
+terminal ancestor that finished without a receipt fails closed and names this
 reseed command.
+
+Merge groups always run in full: every hardware and hosted job executes
+unconditionally with no docs-only or hardware skip. The docs-only fast path
+is restricted to `pull_request` CI runs (where only unreferenced prose changed),
+and draft PRs skip expensive jobs while keeping cheap Linux checks.
 
 ### Cumulative merge groups (#402)
 

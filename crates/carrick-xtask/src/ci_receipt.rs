@@ -453,101 +453,13 @@ fn validate_sha(sha: &str) -> Result<(), ReceiptError> {
     }
 }
 
-/// The artifact name `kernel-runtime.yml` `changes` uploads for a SHA.
-pub fn ci_class_artifact_name(sha: &str) -> String {
-    format!("ci-class-{sha}")
-}
-
-/// Find the non-expired `ci-class-<sha>` artifact in a run's artifact listing.
-pub fn find_ci_class_artifact(artifacts: &Value, sha: &str) -> Option<String> {
-    let target = ci_class_artifact_name(sha);
-    artifacts["artifacts"]
-        .as_array()?
-        .iter()
-        .filter(|a| a["expired"] == false)
-        .filter_map(|a| a["name"].as_str())
-        .find(|name| *name == target || name.starts_with(&format!("{target}-")))
-        .map(str::to_owned)
-}
-
-/// Verify from a downloaded `ci-class-<sha>.json` payload (`{heavy, hardware, macos}`)
-/// that the trusted run was classified as a fast-path skip (`hardware == false`).
-pub fn ci_class_proves_fast_path_skip(class_payload: &Value) -> bool {
-    class_payload["hardware"].as_bool() == Some(false)
-}
-
-fn download_and_verify_ci_class(
-    run_id: u64,
-    artifact_name: &str,
-    sha: &str,
-    scratch_root: &Path,
-) -> Result<bool, ReceiptError> {
-    let dir = scratch_root.join(format!("ci-class-{run_id}"));
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).map_err(|source| ReceiptError::Io {
-            path: dir.clone(),
-            source,
-        })?;
-    }
-    std::fs::create_dir_all(&dir).map_err(|source| ReceiptError::Io {
-        path: dir.clone(),
-        source,
-    })?;
-    let status = Command::new("gh")
-        .args([
-            "run",
-            "download",
-            &run_id.to_string(),
-            "--repo",
-            REPOSITORY,
-            "--name",
-            artifact_name,
-            "--dir",
-        ])
-        .arg(&dir)
-        .status()
-        .map_err(|source| ReceiptError::Io {
-            path: PathBuf::from("gh"),
-            source,
-        })?;
-    if !status.success() {
-        let _ = std::fs::remove_dir_all(&dir);
-        return Ok(false);
-    }
-    let primary = dir.join(format!("ci-class-{sha}.json"));
-    let fallback = dir.join("ci-class.json");
-    let file_path = if primary.is_file() {
-        primary
-    } else if fallback.is_file() {
-        fallback
-    } else {
-        let _ = std::fs::remove_dir_all(&dir);
-        return Ok(false);
-    };
-    let bytes = std::fs::read(&file_path).map_err(|source| ReceiptError::Io {
-        path: file_path.clone(),
-        source,
-    })?;
-    let _ = std::fs::remove_dir_all(&dir);
-    let Ok(payload) = serde_json::from_slice::<Value>(&bytes) else {
-        return Ok(false);
-    };
-    Ok(ci_class_proves_fast_path_skip(&payload))
-}
-
 /// One query round: this workflow's runs for the SHA and their artifacts.
 struct BaselineObservation {
     decision: Baseline,
     merge_group_run: bool,
-    fast_path_skip: bool,
-    no_runs: bool,
 }
 
-fn query_baseline(
-    lane: Lane,
-    sha: &str,
-    scratch_root: &Path,
-) -> Result<BaselineObservation, ReceiptError> {
+fn query_baseline(lane: Lane, sha: &str) -> Result<BaselineObservation, ReceiptError> {
     validate_sha(sha)?;
     let workflow = KERNEL_RUNTIME_WORKFLOW
         .rsplit('/')
@@ -569,51 +481,10 @@ fn query_baseline(
         ))?;
         pairs.push((run.clone(), artifacts));
     }
-    let decision = baseline_decision(&pairs, lane, sha);
-    let all_succeeded = !pairs.is_empty()
-        && pairs
-            .iter()
-            .all(|(run, _)| run["status"] == "completed" && run["conclusion"] == "success");
-    let mut fast_path_skip = false;
-    if decision == Baseline::Missing && all_succeeded {
-        fast_path_skip = true;
-        for (run, artifacts) in &pairs {
-            let (Some(id), Some(class_artifact)) =
-                (run["id"].as_u64(), find_ci_class_artifact(artifacts, sha))
-            else {
-                fast_path_skip = false;
-                break;
-            };
-            if !download_and_verify_ci_class(id, &class_artifact, sha, scratch_root)? {
-                fast_path_skip = false;
-                break;
-            }
-        }
-    }
     Ok(BaselineObservation {
-        decision,
+        decision: baseline_decision(&pairs, lane, sha),
         merge_group_run: pairs.iter().any(|(run, _)| run["event"] == "merge_group"),
-        fast_path_skip,
-        no_runs: pairs.is_empty(),
     })
-}
-
-fn commit_first_parent(sha: &str) -> Result<Option<String>, ReceiptError> {
-    let commit = gh_json(&format!("repos/{REPOSITORY}/commits/{sha}"))?;
-    let Some(parents) = commit["parents"].as_array() else {
-        return Err(ReceiptError::Baseline(format!(
-            "commit {sha} response has no parents array"
-        )));
-    };
-    let Some(parent) = parents.first() else {
-        return Ok(None);
-    };
-    let parent_sha = parent["sha"]
-        .as_str()
-        .ok_or_else(|| ReceiptError::Baseline(format!("commit {sha} parent SHA missing")))?
-        .to_ascii_lowercase();
-    validate_sha(&parent_sha)?;
-    Ok(Some(parent_sha))
 }
 
 /// The queue owns the relationship between each synthetic group head and its
@@ -689,8 +560,6 @@ fn reseed_hint(sha: &str) -> String {
     )
 }
 
-const MAX_FAST_PATH_PARENTS: usize = 16;
-
 fn download_baseline(
     lane: Lane,
     sha: &str,
@@ -702,14 +571,13 @@ fn download_baseline(
     let mut ancestor = sha.to_owned();
     let mut chain = None;
     let mut visited = BTreeSet::new();
-    let mut fast_path_hops = 0usize;
     let (run_id, name) = loop {
         if !visited.insert(ancestor.clone()) {
             return Err(ReceiptError::Baseline(format!(
                 "merge queue base chain cycles at {ancestor}"
             )));
         }
-        let observation = query_baseline(lane, &ancestor, dir)?;
+        let observation = query_baseline(lane, &ancestor)?;
         if let Baseline::Found(run, name) = &observation.decision {
             break (*run, name.clone());
         }
@@ -721,21 +589,7 @@ fn download_baseline(
                 "ancestor {ancestor} has no published {} receipt; following merge-queue base {base}",
                 lane.name()
             );
-            fast_path_hops = 0;
             ancestor = base.clone();
-            continue;
-        }
-        if observation.decision == Baseline::Missing
-            && fast_path_hops < MAX_FAST_PATH_PARENTS
-            && (observation.fast_path_skip || (fast_path_hops > 0 && observation.no_runs))
-            && let Some(parent) = commit_first_parent(&ancestor)?
-        {
-            println!(
-                "ancestor {ancestor} passed trusted-hardware without a {} receipt (docs/CI-only fast path); following first-parent commit {parent}",
-                lane.name()
-            );
-            fast_path_hops += 1;
-            ancestor = parent;
             continue;
         }
         if observation.merge_group_run {

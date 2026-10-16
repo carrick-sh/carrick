@@ -64,62 +64,12 @@ jobs:
             echo "run-id=" >> "$GITHUB_OUTPUT"
           fi
 
-  changes:
-    name: changes
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      heavy: ${{ steps.filter.outputs.heavy }}
-      macos: ${{ steps.filter.outputs.macos }}
-      workflows: ${{ steps.filter.outputs.workflows }}
-      hardware: ${{ steps.filter.outputs.hardware }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: just
-      - name: Install repository Rust toolchain
-        run: just ci-toolchain
-      - name: Configure persisted compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
-        with:
-          shared-key: changes-debug
-          cache-directories: ${{ env.SCCACHE_DIR }}
-          cache-workspace-crates: "true"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install per-user compiler cache
-        uses: taiki-e/install-action@v2
-        with:
-          tool: sccache@0.18.0
-      - name: Prebuild cached xtask admission helpers
-        run: just ci-prebuild-xtask
-      - name: Detect changed surfaces
-        id: filter
-        env:
-          CI_EVENT: ${{ github.event_name }}
-          CI_BASE: ${{ github.event.merge_group.base_sha }}
-          CI_BASE_REF: ${{ github.event.merge_group.base_ref }}
-          CI_CLASS_JSON: ${{ runner.temp }}/ci-class/ci-class-${{ github.sha }}.json
-        run: just ci-changes
-      - name: Upload classification receipt
-        uses: actions/upload-artifact@v4
-        with:
-          name: ci-class-${{ github.sha }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/ci-class/ci-class-${{ github.sha }}.json
-          if-no-files-found: error
-
   signed-fixtures:
     name: Linux ARM64 · exact-SHA signed fixtures
-    needs: [check-merge-group, changes]
+    needs: [check-merge-group]
     if: >-
       ${{ !cancelled() &&
           needs.check-merge-group.outputs.skip != 'true' &&
-          needs.changes.result == 'success' &&
-          needs.changes.outputs.hardware == 'true' &&
           vars.CARRICK_SELF_HOSTED == 'true' &&
           (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-24.04-arm
@@ -440,12 +390,10 @@ jobs:
   # queue refs, and fork PR code must not reach Willow either.
   kvm-tests:
     name: KVM · x86 kvm-lane tests
-    needs: [check-merge-group, changes]
+    needs: [check-merge-group]
     if: >-
       ${{ !cancelled() &&
           needs.check-merge-group.outputs.skip != 'true' &&
-          needs.changes.result == 'success' &&
-          needs.changes.outputs.hardware == 'true' &&
           vars.CARRICK_GCP_KVM == 'true' && vars.CARRICK_KVM_BACKEND != 'willow' &&
           (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-latest
@@ -526,12 +474,10 @@ jobs:
   # `ci_scaler::LABELS`; a test keeps them identical.
   kvm-tests-willow:
     name: KVM · x86 kvm-lane tests (Willow)
-    needs: [check-merge-group, changes]
+    needs: [check-merge-group]
     if: >-
       ${{ !cancelled() &&
           needs.check-merge-group.outputs.skip != 'true' &&
-          needs.changes.result == 'success' &&
-          needs.changes.outputs.hardware == 'true' &&
           vars.CARRICK_SELF_HOSTED_KVM == 'true' &&
           !(vars.CARRICK_GCP_KVM == 'true' && vars.CARRICK_KVM_BACKEND != 'willow') &&
           (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
@@ -703,7 +649,7 @@ jobs:
   trusted-hardware-ok:
     name: Trusted hardware OK
     if: ${{ always() }}
-    needs: [check-merge-group, changes, signed-fixtures, hvf-kernel, kvm-tests, kvm-tests-willow, hvf-gate, kvm-gate]
+    needs: [check-merge-group, signed-fixtures, hvf-kernel, kvm-tests, kvm-tests-willow, hvf-gate, kvm-gate]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -711,10 +657,6 @@ jobs:
         env:
           SKIPPED_BY_MERGE_GROUP: ${{ needs.check-merge-group.outputs.skip }}
           MERGE_GROUP_RUN_ID: ${{ needs.check-merge-group.outputs.run-id }}
-          CHANGES_RESULT: ${{ needs.changes.result }}
-          HEAVY: ${{ needs.changes.outputs.heavy }}
-          HARDWARE: ${{ needs.changes.outputs.hardware }}
-          SIGNED_FIXTURES: ${{ needs.signed-fixtures.result }}
           HVF: ${{ needs.hvf-kernel.result }}
           # The selected KVM backend's result (same expression as the lanes'
           # `if:`); the other backend's job is skipped by construction.
@@ -729,16 +671,6 @@ jobs:
           if [ "$SKIPPED_BY_MERGE_GROUP" = "true" ]; then
             echo "::notice title=Trusted hardware skipped::Commit $GITHUB_SHA was already verified by merge_group run $MERGE_GROUP_RUN_ID"
             echo "Skipped duplicate hardware run: merge_group run $MERGE_GROUP_RUN_ID passed for $GITHUB_SHA"
-            exit 0
-          fi
-          test "$CHANGES_RESULT" = success
-          if [ "$EVENT" = merge_group ] && [ "$HARDWARE" = false ]; then
-            echo "::notice title=Trusted hardware skipped (docs/ci-xtask-only)::Merge group $GITHUB_SHA has no hardware-affecting changes (hardware=false)"
-            test "$SIGNED_FIXTURES" = skipped
-            test "$HVF" = skipped
-            test "$KVM" = skipped
-            test "$HVF_GATE" = skipped
-            test "$KVM_GATE" = skipped
             exit 0
           fi
           echo "hvf-kernel=$HVF kvm($KVM_BACKEND)=$KVM hvf-gate=$HVF_GATE kvm-gate=$KVM_GATE"
