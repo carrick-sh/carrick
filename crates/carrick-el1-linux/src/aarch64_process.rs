@@ -125,6 +125,15 @@ pub(super) fn resume_selected<'a, X: ForkStockCrossing>(
     task.publish_visible_pid(visible_pid);
     task.publish_root_generation(address.generation);
     let words = *context;
+    #[cfg(target_os = "none")]
+    owner_registry
+        .drain_external_ingress(
+            source.zone,
+            crate::isa::signal_ingress_guest(),
+            source.slot,
+            service,
+        )
+        .unwrap_or_else(|_| fatal());
     let mut entry = runtime
         .enter_registered(owner_registry, source, task, address, words, service)
         .unwrap_or_else(|_| fatal());
@@ -399,6 +408,15 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
         address.mm.raw().get(),
         address.generation.raw().get(),
     );
+    #[cfg(target_os = "none")]
+    registry()
+        .drain_external_ingress(
+            source.zone,
+            crate::isa::signal_ingress_guest(),
+            source.slot,
+            service,
+        )
+        .unwrap_or_else(|_| fatal());
     let (result, root_exit) = {
         let mut process =
             runtime.enter_registered(registry(), source, task, address, words, service)?;
