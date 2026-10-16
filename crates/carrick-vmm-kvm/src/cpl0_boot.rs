@@ -1798,8 +1798,10 @@ impl ProductionCpuLease {
                 }
                 None => {
                     let binding = custody.binding(slot);
+                    let rip = lease.vcpu.get_gpr(X86Reg::Rip).unwrap_or(0);
+                    let rax = lease.vcpu.get_gpr(X86Reg::Rax).unwrap_or(0);
                     Err(fail(format!(
-                        "unexpected physical production port {port:#x}; outer fault active {}, address {:#x}, reason {}",
+                        "unexpected physical production port {port:#x} at rip {rip:#x} rax {rax:#x}; outer fault active {}, address {:#x}, reason {}",
                         binding.fault_active.load(Ordering::Acquire),
                         binding.fault_address.load(Ordering::Acquire),
                         binding.fault_reason.load(Ordering::Acquire),

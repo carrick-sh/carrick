@@ -2669,3 +2669,24 @@ fn unplaceable_parent_host_handback_consumes_one_park() {
     assert_eq!(zone.record(parent).entry_count(), 0);
     assert_eq!(zone.record(parent).handback(), Some(Handback::Woken));
 }
+
+#[test]
+fn unhome_preserves_distinct_slot_host_record() {
+    let zone = zone();
+    host_publish(&zone, SLOT, MM, Some(0), 1);
+    zone.enter_guest(SLOT);
+    let root = zone.current_or_new(SLOT, identity(41)).unwrap();
+    let child = zone.alloc_record(identity(42)).unwrap();
+    assert_eq!(zone.slot(SLOT).host_record(), Some(root));
+    assert_eq!(zone.record(root).home(), Some(SLOT));
+    assert_eq!(zone.unhome(SLOT, child, 3), None);
+    assert_eq!(zone.record(child).affinity.load(Ordering::Acquire), 3);
+    assert_eq!(
+        zone.slot(SLOT).host_record(),
+        Some(root),
+        "unhoming or updating affinity for a distinct record on SLOT must not clobber SLOT's home record"
+    );
+    assert_eq!(zone.unhome(SLOT, root, 1), None);
+    assert_eq!(zone.record(root).home(), None);
+    assert_eq!(zone.slot(SLOT).host_record(), None);
+}
