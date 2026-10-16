@@ -13,7 +13,7 @@ use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Transport protocol for the shared ARM EL1 / x86 CPL0 ingress record.
-pub const SIGNAL_INGRESS_PROTOCOL: u64 = 5;
+pub const SIGNAL_INGRESS_PROTOCOL: u64 = 6;
 
 /// Shared queue capacity; event producers must retain ownership on fullness.
 pub const SIGNAL_INGRESS_CAPACITY: usize = 64;
@@ -29,6 +29,9 @@ pub const fn signal_ingress_offsets_hash() -> u64 {
         core::mem::offset_of!(ExternalSignalRecord, event_generation) as u64,
         core::mem::offset_of!(ExternalSignalRecord, signal) as u64,
         core::mem::offset_of!(ExternalSignalRecord, source) as u64,
+        core::mem::offset_of!(ExternalSignalRecord, scope) as u64,
+        core::mem::offset_of!(ExternalSignalRecord, process_id) as u64,
+        core::mem::offset_of!(ExternalSignalRecord, process_generation) as u64,
         core::mem::offset_of!(SignalIngressSlot, sequence) as u64,
         core::mem::offset_of!(SignalIngressSlot, record) as u64,
         core::mem::offset_of!(SharedSignalIngressQueue, head) as u64,
@@ -71,6 +74,15 @@ pub enum ExternalSignalSource {
     HostFault = 3,
 }
 
+/// The pending owner selected by the host facility, independent of which
+/// thread happened to observe a process-directed event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ExternalSignalScope {
+    Process = 1,
+    Thread = 2,
+}
+
 /// Identity and source of one external event. The source-specific payload is
 /// added with the producer; this record does not authorize signal delivery by
 /// itself. In particular, a numeric Linux tid is never an identity check.
@@ -83,6 +95,9 @@ pub struct ExternalSignalRecord {
     event_generation: SignalEventGeneration,
     signal: Signal,
     source: ExternalSignalSource,
+    scope: ExternalSignalScope,
+    process_id: carrick_core_abi::EntryTaskKey,
+    process_generation: carrick_core_abi::EntryGeneration,
 }
 
 /// A producer retains this exact record when shared admission is full. The
@@ -128,7 +143,37 @@ impl ExternalSignalRecord {
             event_generation,
             signal,
             source,
+            scope: ExternalSignalScope::Thread,
+            process_id: binding.task,
+            process_generation: binding.generation,
         }
+    }
+
+    pub const fn process_directed(mut self) -> Self {
+        self.scope = ExternalSignalScope::Process;
+        self
+    }
+
+    pub const fn scope(self) -> ExternalSignalScope {
+        self.scope
+    }
+
+    pub const fn for_process(
+        mut self,
+        id: carrick_core_abi::EntryTaskKey,
+        generation: carrick_core_abi::EntryGeneration,
+    ) -> Self {
+        self.process_id = id;
+        self.process_generation = generation;
+        self
+    }
+
+    pub const fn process_id(self) -> carrick_core_abi::EntryTaskKey {
+        self.process_id
+    }
+
+    pub const fn process_generation(self) -> carrick_core_abi::EntryGeneration {
+        self.process_generation
     }
 
     pub const fn signal(self) -> Signal {

@@ -15,6 +15,8 @@ pub(crate) struct HostIngressTarget {
     binding: ExecutionBinding,
     record: RecordRef,
     bridge_thread: carrick_hal::ThreadId,
+    process_id: carrick_core_abi::EntryTaskKey,
+    process_generation: carrick_core_abi::EntryGeneration,
 }
 
 impl HostIngressTarget {
@@ -45,6 +47,12 @@ impl HostIngressTarget {
             binding,
             record: control.zone_record()?,
             bridge_thread: thread.registry_id(),
+            process_id: carrick_core_abi::EntryTaskKey::from_raw(
+                context.task().key().id.raw() as u64
+            ),
+            process_generation: carrick_core_abi::EntryGeneration::from_raw(
+                context.task().key().serial.raw(),
+            ),
         })
     }
 }
@@ -83,7 +91,7 @@ impl HostSignalIngressProducer {
         &mut self,
         queue: &SignalIngressQueue<N>,
         target: Option<HostIngressTarget>,
-        take_bridge_signal: impl FnOnce(i32) -> i32,
+        take_bridge_signal: impl FnOnce(i32) -> Option<carrick_hal::PendingSignalEvent>,
     ) -> Result<HostIngressStep, HostIngressError> {
         if let Some(pending) = self.pending.take() {
             if queue.drain_generation() == pending.observed_drain() {
@@ -102,13 +110,13 @@ impl HostSignalIngressProducer {
         let generation = queue
             .issue_event_generation()
             .ok_or(HostIngressError::EventGenerationExhausted)?;
-        let signum = take_bridge_signal(target.bridge_thread.raw());
-        if signum == 0 {
+        let Some(bridge_event) = take_bridge_signal(target.bridge_thread.raw()) else {
             return Ok(HostIngressStep::Idle);
-        }
+        };
+        let signum = bridge_event.signum;
         let signal =
             Signal::from_number(signum).ok_or(HostIngressError::InvalidBridgeSignal(signum))?;
-        let event = ExternalSignalRecord::new(
+        let mut event = ExternalSignalRecord::new(
             EntryEventIdentity::from_binding(target.binding),
             target.binding,
             target.record,
@@ -116,6 +124,11 @@ impl HostSignalIngressProducer {
             signal,
             ExternalSignalSource::Terminal,
         );
+        if bridge_event.scope == carrick_hal::PendingSignalScope::Process {
+            event = event
+                .process_directed()
+                .for_process(target.process_id, target.process_generation);
+        }
         match queue.admit(event) {
             Ok(()) => Ok(HostIngressStep::Published),
             Err(pending) => {
@@ -203,6 +216,8 @@ mod tests {
             binding,
             record,
             bridge_thread: carrick_hal::ThreadId::synthetic_for_tests(41),
+            process_id: EntryTaskKey::from_raw(41),
+            process_generation: EntryGeneration::from_raw(11),
         };
         let mut producer = HostSignalIngressProducer::new();
         let mut consumed = 0;
@@ -210,7 +225,10 @@ mod tests {
             producer
                 .publish(&queue, Some(target), |_| {
                     consumed += 1;
-                    2
+                    Some(carrick_hal::PendingSignalEvent {
+                        signum: 2,
+                        scope: carrick_hal::PendingSignalScope::Thread,
+                    })
                 })
                 .unwrap(),
             HostIngressStep::Parked
@@ -240,5 +258,42 @@ mod tests {
         assert_eq!(delivered.binding(), binding);
         assert_eq!(delivered.record(), record);
         assert!(queue.take().is_none());
+    }
+
+    #[test]
+    fn serial_host_process_sigint_keeps_process_scope_through_producer() {
+        let queue = SignalIngressQueue::<2>::new();
+        let binding = ExecutionBinding {
+            task: EntryTaskKey::from_raw(61),
+            generation: EntryGeneration::from_raw(11),
+            mm: EntryMmKey::from_raw(301),
+            thread_generation: EntryThreadGeneration::from_raw(101),
+        };
+        let target = HostIngressTarget {
+            binding,
+            record: RecordRef {
+                id: RecordId::from_raw(4).unwrap(),
+                incarnation: 9,
+            },
+            bridge_thread: carrick_hal::ThreadId::synthetic_for_tests(61),
+            process_id: EntryTaskKey::from_raw(61),
+            process_generation: EntryGeneration::from_raw(11),
+        };
+        carrick_signal_linux::publish_process_signal(2);
+        let mut producer = HostSignalIngressProducer::new();
+        assert_eq!(
+            producer
+                .publish(
+                    &queue,
+                    Some(target),
+                    carrick_signal_linux::take_pending_event_for
+                )
+                .unwrap(),
+            HostIngressStep::Published
+        );
+        assert_eq!(
+            queue.take().unwrap().scope(),
+            carrick_el1_abi::ExternalSignalScope::Process
+        );
     }
 }
