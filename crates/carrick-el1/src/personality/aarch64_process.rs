@@ -1206,7 +1206,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             return Err(NativeProcessError::Stale);
         }
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-        if !crate::substrate::file::prepare_cow_write(
+        if !crate::cow::prepare_cow_write(
             &crate::file::HardwareValidator,
             address.raw(),
             bytes.len(),

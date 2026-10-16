@@ -185,35 +185,6 @@ fn valid_lower_half_range(user_va: u64, len: usize) -> bool {
     carrick_guest_arch::lower_half_range(user_va, len)
 }
 
-/// Prepare every page of a user copy under the caller's exact MM owner.
-/// A COW miss is resolved at most once per page; the actual copy starts only
-/// after the whole range is writable, so a later page cannot leave a partial
-/// child-TID or signal-frame publication behind.
-#[cfg(any(test, target_os = "none"))]
-pub(crate) fn prepare_cow_write<V: MemoryValidator>(
-    validator: &V,
-    address: u64,
-    len: usize,
-    mut resolve: impl FnMut(u64) -> bool,
-) -> bool {
-    if !valid_lower_half_range(address, len) {
-        return false;
-    }
-    let mut checked = 0;
-    while checked < len {
-        let va = address + checked as u64;
-        let page_remaining = 4096 - (va as usize & 4095);
-        let chunk = core::cmp::min(len - checked, page_remaining);
-        if validator.writable_bytes(va, chunk) < chunk
-            && (!resolve(va) || validator.writable_bytes(va, chunk) < chunk)
-        {
-            return false;
-        }
-        checked += chunk;
-    }
-    true
-}
-
 #[cfg(not(target_os = "none"))]
 pub struct HardwareValidator;
 

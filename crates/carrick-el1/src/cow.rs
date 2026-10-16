@@ -15,6 +15,38 @@
 
 pub use carrick_core::mm::cow::{CowError, GuestCowOutcome};
 
+/// Prepare every page of a user copy under the caller's exact MM owner.
+/// A COW miss is resolved at most once per page; the actual copy starts only
+/// after the whole range is writable, so a later page cannot leave a partial
+/// child-TID or signal-frame publication behind.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(crate) fn prepare_cow_write<V: crate::substrate::file::MemoryValidator>(
+    validator: &V,
+    address: u64,
+    len: usize,
+    mut resolve: impl FnMut(u64) -> bool,
+) -> bool {
+    if !u64::try_from(len)
+        .ok()
+        .is_some_and(|len| carrick_guest_arch::lower_half_range(address, len))
+    {
+        return false;
+    }
+    let mut checked = 0;
+    while checked < len {
+        let va = address + checked as u64;
+        let page_remaining = 4096 - (va as usize & 4095);
+        let chunk = core::cmp::min(len - checked, page_remaining);
+        if validator.writable_bytes(va, chunk) < chunk
+            && (!resolve(va) || validator.writable_bytes(va, chunk) < chunk)
+        {
+            return false;
+        }
+        checked += chunk;
+    }
+    true
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Aarch64CowMmu;
 
@@ -612,7 +644,7 @@ mod tests {
         let address = VA + PAGE - 2;
         let bytes = 42_u32.to_ne_bytes();
 
-        assert!(crate::substrate::file::prepare_cow_write(
+        assert!(super::prepare_cow_write(
             &ArenaWrite(&child),
             address,
             bytes.len(),

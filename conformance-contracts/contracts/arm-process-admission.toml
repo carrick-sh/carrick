@@ -12,7 +12,7 @@ scale_points = [1, 2]
 rationale = "Admission creates one native process owner for the retained root and imports authenticated lifecycle members without creating host tasks or changing live membership. Re-entry retains that owner. The setup and no-child wait each dispatch once and request no fork stock. Unpublished admission-only home custody ends with the call, so ARM host reconciliation cannot mistake an ordinary returned call for a parked thread; a published handoff retains its record. The fixed lifecycle pool bounds the initial import scan; ordinary re-entry resolves the exact registry member. Signal resources are reachable from the native entry; ARM signal routing belongs to #285."
 
 [bindings]
-vm_free = "carrick-el1::personality::aarch64_process_tests::arm_root_setup_enters_production_process_venue"
+vm_free = "carrick-el1::personality::aarch64_process_tests::arm_root_setup_enters_production_process_venue; carrick-el1::personality::native_process_runtime::tests::process_clone_child_tid_lives_in_child_mm_and_clears_on_exit; carrick-el1::cow::tests::in_ring_copy_prepares_child_cow_and_keeps_parent_bytes"
 # The shared dispatch trait change defaults to no continuation-work exemption
 # for ARM. dispatch::ring_first_tests::strict_arm_preserves_family_declines_
 # handback_and_owed_work includes wait4 with owed work (native 260): it must
