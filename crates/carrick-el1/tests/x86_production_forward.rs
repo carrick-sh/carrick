@@ -509,7 +509,9 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
                 &mut service,
             )
             .unwrap();
-        let LifecycleOutcome::Returned { result, .. } = parent_entry.fork() else {
+        let LifecycleOutcome::Returned { result, .. } =
+            parent_entry.fork(carrick_personality_linux::lifecycle::ProcessForkChildTid::NONE)
+        else {
             panic!("expected fork success");
         };
         result.raw() as u32
