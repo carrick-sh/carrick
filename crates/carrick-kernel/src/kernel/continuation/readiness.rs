@@ -524,6 +524,34 @@ impl SignalReadinessProbe {
         {
             return Some(ContinuationEvent::Signal);
         }
+        if context.thread().control_slot().native_signal_owner() {
+            // This binding's bridge event belongs to native ingress. A
+            // readiness sample may wake the continuation, but importing it
+            // into a carrier ReservedSignal would create a second consumer
+            // and leave the native producer with no event to publish.
+            let persistent = SigSet::from_raw(context.thread().control_slot().blocked().0);
+            let blocked = match self.temporary.unwrap_or(WaitSigMask::NONE) {
+                WaitSigMask::Additive(extra) => persistent.union(extra),
+                WaitSigMask::Replace(mask) => mask,
+            };
+            let blocked = if matches!(
+                self.family,
+                ContinuationFamily::VforkParent | ContinuationFamily::PtraceStopSettle
+            ) {
+                SigSet::EMPTY
+                    .complement()
+                    .without(crate::linux_abi::LINUX_SIGKILL)
+            } else {
+                blocked
+            };
+            return self
+                .host_signal
+                .has_unblocked_pending_for(
+                    self.thread.tid.raw(),
+                    SigBlockMask::blocking_all_of(blocked),
+                )
+                .then_some(ContinuationEvent::Signal);
+        }
         let authority = context.signal_authority();
         let host_signum = self.host_signal.take_pending_for(self.thread.tid.raw());
         if matches!(
