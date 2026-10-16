@@ -102,9 +102,9 @@ pub(crate) fn deliver_on_user_return<X: super::aarch64_process::ForkStockCrossin
     use crate::sched::ThreadCpu;
     use zerocopy::IntoBytes;
 
-    if !process.signal_checkpoint_needed()
-        && !(frame.esr == 0xfffe
-            && frame.x[0] == carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64)
+    if !(process.signal_checkpoint_needed()
+        || (frame.esr == 0xfffe
+            && frame.x[0] == carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64))
     {
         return None;
     }
