@@ -710,6 +710,18 @@ pub fn carrier_enter<P: Personality>(
 
     let flow = personality.dispatch(call, &mut cx);
 
+    // A suspending or terminating task may have published host wakes after
+    // dispatch. Settle them before its per-CPU binding can be replaced.
+    if matches!(flow, ControlFlow::Suspend(_) | ControlFlow::Terminate(_)) {
+        crate::settle_owed_before_switch(
+            task,
+            || personality.has_pending_host_work(task),
+            || {
+                doorbell(WORK_PORT, frame);
+            },
+        );
+    }
+
     match flow {
         ControlFlow::Return(_) => {
             let _ =

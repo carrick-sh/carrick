@@ -717,9 +717,10 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         // context before publishing slot absence, so a concurrent fork that
         // reclaims this root page from quarantine after `leave_space` can
         // admit it for the next child without racing `LIVE_CONTEXTS`.
-        if !crate::retire_context_and_leave_space(mm, anonymous::retire_context, || {
-            carrick_x86_carrier::native_execution::leave_space(source)
-        }) {
+        if !anonymous::retire_context(mm) {
+            fatal();
+        }
+        if !carrick_x86_carrier::native_execution::leave_space(source) {
             fatal();
         }
         let roots = core::ptr::from_ref(owner.roots).addr();

@@ -341,12 +341,16 @@ impl LifecycleWindow {
                     controls_len / slot_size,
                 )
             };
-            if controls
+            // Hold every exclusive reservation until the entire record has
+            // been scrubbed. Any concurrent retain fails while these guards
+            // exist; a failed reservation drops those already acquired.
+            let Some(_resets) = controls
                 .iter()
-                .any(carrick_el1_abi::ThreadControlSlot::graph_referenced)
-            {
+                .map(|control| control.reserve_reset_for_reclaim().ok())
+                .collect::<Option<Vec<_>>>()
+            else {
                 return false;
-            }
+            };
             for (ptr, len) in ranges {
                 // SAFETY: in-window bytes of a record no live task or graph
                 // entry references.

@@ -5,6 +5,7 @@
 use carrick_el1::isa::x86::{self, context};
 use carrick_guest_arch::MmuBackend;
 use carrick_sched_core::SlotId;
+use carrick_x86_carrier::entry::{NativeFrame, notify_work};
 use carrick_x86_carrier::entry::{fatal_boot, user_fault_gate};
 use carrick_x86_carrier::native_execution::{leave_space, publish_root_exit, task};
 use core::sync::atomic::Ordering;
@@ -20,8 +21,7 @@ use crate::native_process;
 pub fn schedule(slot: SlotId) -> ! {
     let source = carrick_x86_carrier::native_execution::source(slot);
     let current = task();
-    current.linux.clear_pending_host_work();
-    current.linux.served_with_work.store(0, Ordering::Release);
+    settle_current_work(current);
     loop {
         expire_signal_timer(slot);
         if let Some(selected) = source.zone.switch_in_full(slot) {
@@ -43,6 +43,7 @@ pub fn schedule(slot: SlotId) -> ! {
                 .zone
                 .install_space(slot, state.address.mm.raw().get())
                 .unwrap_or_else(|| fatal_boot());
+            settle_current_work(current);
             current.set(
                 carrick_el1_abi::El1TaskId::from_linux_tid(
                     i32::try_from(identity.tid).unwrap_or_else(|_| fatal_boot()),
@@ -84,8 +85,7 @@ pub fn schedule(slot: SlotId) -> ! {
                         if let Some(status) = root_exit {
                             publish_root_exit(current, status.to_termination_status());
                         }
-                        current.linux.clear_pending_host_work();
-                        current.linux.served_with_work.store(0, Ordering::Release);
+                        settle_current_work(current);
                         leave_space(source);
                         continue;
                     }
@@ -133,8 +133,7 @@ pub fn schedule(slot: SlotId) -> ! {
                 }
             }
             if suspended {
-                current.linux.clear_pending_host_work();
-                current.linux.served_with_work.store(0, Ordering::Release);
+                settle_current_work(current);
                 continue;
             }
             carrick_x86_carrier::native_execution::migrate(slot);
@@ -143,8 +142,7 @@ pub fn schedule(slot: SlotId) -> ! {
                 Err(_) => fatal_boot(),
             }
         }
-        current.linux.clear_pending_host_work();
-        current.linux.served_with_work.store(0, Ordering::Release);
+        settle_current_work(current);
         leave_space(source);
         let dl = source.zone.timer_deadline(slot);
         if let Some(dl) = dl {
@@ -163,6 +161,16 @@ pub fn schedule(slot: SlotId) -> ! {
             let _ = carrick_el1::isa::x86::X86Backend.arm_timer(None);
         }
     }
+}
+
+/// Work published during resume is still owned by this task. The host work
+/// handler consumes both flags and drains global queues before slot handoff.
+fn settle_current_work(current: &carrick_el1_abi::CurrentTask) {
+    carrick_x86_carrier::settle_owed_before_switch(
+        current,
+        || current.linux.has_pending_host_work(),
+        || notify_work(&NativeFrame::default()),
+    );
 }
 
 /// Consume the shared timer claim; hardware only supplies a counter interrupt.

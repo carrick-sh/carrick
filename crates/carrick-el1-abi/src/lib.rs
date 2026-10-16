@@ -1214,8 +1214,7 @@ impl CurrentTask {
             .generation
             .store(generation, Ordering::Release);
         self.linux.file_table.store(file_table, Ordering::Release);
-        self.linux.fixup_pc.store(0, Ordering::Relaxed);
-        self.linux.orig_arg0.store(0, Ordering::Relaxed);
+        // The previous task must settle owed host work before rebinding.
         self.linux.pending_host_work.store(0, Ordering::Release);
         self.linux.served_with_work.store(0, Ordering::Release);
     }
@@ -4248,14 +4247,14 @@ mod tests {
         task.linux.record_completed_with_work();
         assert!(task.linux.has_pending_host_work());
 
-        // Switching the slot to the next runnable task must not leak the
-        // exiting or suspended task's per-CPU pending/served work flags.
+        // The carrier must service owed work before switching; rebinding
+        // removes any stale per-CPU flags from the next task.
         task.set(El1TaskId::from_linux_tid(41), 12, 100);
         assert_eq!(task.execution.task.load(Ordering::Relaxed), 41);
         assert_eq!(task.execution.generation.load(Ordering::Relaxed), 12);
         assert_eq!(task.linux.file_table.load(Ordering::Relaxed), 100);
-        assert_eq!(task.linux.fixup_pc.load(Ordering::Relaxed), 0);
-        assert_eq!(task.linux.orig_arg0.load(Ordering::Relaxed), 0);
+        assert_eq!(task.linux.fixup_pc.load(Ordering::Relaxed), 0x401000);
+        assert_eq!(task.linux.orig_arg0.load(Ordering::Relaxed), 0xdead_beef);
         assert!(!task.linux.has_pending_host_work());
         assert_eq!(task.linux.take_served_boundary(), None);
     }

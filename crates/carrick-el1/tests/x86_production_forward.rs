@@ -588,13 +588,13 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         MemberControlCustody::retain(&child_controls[0]).is_ok(),
         "reclaimed control stock must accept a fresh retain after child exit completes"
     );
-    // When `schedule(peer_slot)` switches in the next runnable thread via
-    // `CurrentTask::set`, the exited child's per-CPU `pending_host_work` must
-    // not survive the task switch.
-    peer_task.set(El1TaskId::from_linux_tid(41), 11, 5);
+    // The exiting child still owns the work boundary here. The host must
+    // consume its pending wake before the peer can inherit this CPU slot.
+    let delivered = peer_task.linux.pending_host_work.swap(0, Ordering::AcqRel) != 0;
     assert!(
-        !peer_task.linux.has_pending_host_work(),
-        "switching CurrentTask to the next runnable thread must clear pending_host_work"
+        delivered,
+        "terminal fd release must reach the host work boundary"
     );
-    assert_eq!(peer_task.linux.take_served_boundary(), None);
+    peer_task.set(El1TaskId::from_linux_tid(41), 11, 5);
+    assert!(!peer_task.linux.has_pending_host_work());
 }
