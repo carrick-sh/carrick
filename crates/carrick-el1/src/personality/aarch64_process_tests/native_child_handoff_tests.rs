@@ -39,6 +39,18 @@ fn arm_native_wait_runs_ready_child_before_host_handoff() {
     frame.x = [0; 31];
     frame.x[8] = 260;
     frame.x[0] = child_pid;
+    frame.x[2] = 1; // WNOHANG retains the parent's ordinary return.
+    arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap();
+    assert_eq!(frame.x[0], 0);
+    assert_eq!(
+        fixture.task.mm.key.load(Ordering::Acquire),
+        fixture.address.mm.raw().get()
+    );
+    assert_eq!(fixture.zone.runnable_head(fixture.slot), Some(child));
+
+    frame.x = [0; 31];
+    frame.x[8] = 260;
+    frame.x[0] = child_pid;
     let route = arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap();
     assert!(matches!(
         route,
