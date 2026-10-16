@@ -56,7 +56,20 @@ pub(crate) fn yield_host_effect() {
     }
 }
 
-pub(crate) fn cross_hvc_fork_stock(record_gpa: u64, cpu: u64) -> Result<(), ()> {
+/// A failure-only diagnostic; its reply never changes the original verdict.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub(crate) fn cross_hvc_fork_refusal(record: &carrick_el1_abi::NativeForkDiagnostic) {
+    // SAFETY: the synchronous crossing retains this aligned, bounded record.
+    unsafe {
+        core::arch::asm!("hvc #6",
+            inlateout("x0") carrick_el1_abi::GRANT_OP_FORK_REFUSAL => _,
+            inlateout("x1") record as *const _ as u64 => _,
+            inlateout("x2") 0u64 => _, inlateout("x3") 0u64 => _,
+            options(nostack));
+    }
+}
+
+pub(crate) fn cross_hvc_fork_stock(record_gpa: u64, cpu: u64) -> Result<(), u64> {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
         let mut status: u64 = carrick_el1_abi::GRANT_OP_FORK_STOCK;
@@ -71,7 +84,7 @@ pub(crate) fn cross_hvc_fork_stock(record_gpa: u64, cpu: u64) -> Result<(), ()> 
             );
         }
         if status != 0 {
-            return Err(());
+            return Err(status);
         }
         Ok(())
     }

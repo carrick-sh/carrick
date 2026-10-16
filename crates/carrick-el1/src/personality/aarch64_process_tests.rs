@@ -1,6 +1,9 @@
 //! Red-first VM-free tests for [`Aarch64NativeProcessService`] and the shared process owner.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+#[cfg(test)]
+mod native_child_handoff_tests;
+
 use super::aarch64_process::{Aarch64NativeProcessService, ForkStockCrossing};
 #[cfg(test)]
 use super::aarch64_process::{
@@ -22,7 +25,7 @@ use carrick_guest_arch::{
 };
 use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
 use carrick_mmu_core::owner_mmu::Aarch64Mmu;
-use carrick_personality_linux::lifecycle::{LifecycleOutcome, ProcessNative};
+use carrick_personality_linux::lifecycle::{LifecycleOutcome, ProcessForkChildTid, ProcessNative};
 #[cfg(test)]
 use carrick_personality_linux::lifecycle::{LinuxWaitOptions, LinuxWaitStatus, ProcessWaitPid};
 #[cfg(test)]
@@ -717,7 +720,7 @@ fn test_fork_child_gets_distinct_root_and_x0_zero() {
     let mut entry = runtime
         .enter(source, &fixture.task, parked, &mut service)
         .unwrap();
-    let outcome = entry.fork();
+    let outcome = entry.fork(ProcessForkChildTid::NONE);
     let LifecycleOutcome::Returned { result, .. } = outcome else {
         panic!("expected fork to return child pid");
     };
@@ -801,7 +804,7 @@ fn plain_fork_owns_an_independent_fd_table() {
     let mut entry = runtime
         .enter(source, &fixture.task, parked, &mut service)
         .unwrap();
-    let outcome = entry.fork();
+    let outcome = entry.fork(ProcessForkChildTid::NONE);
     let LifecycleOutcome::Returned { result, .. } = outcome else {
         panic!("expected fork to return child pid");
     };
@@ -897,7 +900,7 @@ fn test_fork_private_pages_cow_armed_in_both() {
     let mut entry = runtime
         .enter(source, &fixture.task, parked, &mut service)
         .unwrap();
-    let outcome = entry.fork();
+    let outcome = entry.fork(ProcessForkChildTid::NONE);
     let LifecycleOutcome::Returned { result, .. } = outcome else {
         panic!("expected fork to return child pid");
     };
@@ -987,7 +990,9 @@ fn test_wait4_consumes_zombie_once_with_exact_status() {
         let mut parent_entry = runtime
             .enter(source, &fixture.task, parked, &mut service)
             .unwrap();
-        let LifecycleOutcome::Returned { result, .. } = parent_entry.fork() else {
+        let LifecycleOutcome::Returned { result, .. } =
+            parent_entry.fork(ProcessForkChildTid::NONE)
+        else {
             panic!("expected fork return");
         };
         child_pid = result.raw() as u32;
@@ -1155,7 +1160,9 @@ fn arm_child_wait_wake(in_ring: bool, sibling: bool) {
         let mut parent_entry = runtime
             .enter(source, &fixture.task, parked, &mut service)
             .unwrap();
-        let LifecycleOutcome::Returned { result, .. } = parent_entry.fork() else {
+        let LifecycleOutcome::Returned { result, .. } =
+            parent_entry.fork(ProcessForkChildTid::NONE)
+        else {
             panic!("expected fork return");
         };
         child_pid = result.raw() as u32;
@@ -1462,7 +1469,7 @@ fn test_stock_loan_requested_and_settled_once() {
     let mut entry = runtime
         .enter(source, &fixture.task, parked, &mut service)
         .unwrap();
-    let outcome = entry.fork();
+    let outcome = entry.fork(ProcessForkChildTid::NONE);
     assert!(matches!(outcome, LifecycleOutcome::Returned { .. }));
 
     // Crossing facts: exactly one loan requested, exactly one committed, zero aborted
@@ -1675,7 +1682,7 @@ pub fn with_native_file_fork(
     let LifecycleOutcome::Returned { result, .. } = runtime
         .enter(source, &fixture.task, parked, &mut service)
         .unwrap()
-        .fork()
+        .fork(ProcessForkChildTid::NONE)
     else {
         panic!("native fork must publish a live child");
     };

@@ -980,6 +980,22 @@ pub(crate) fn service_metadata_operation(
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn report_stock_refusal(
+    exchange: &ForkStockExchange,
+    execution: Option<crate::fork_stock::GrantExecution>,
+    reason: &str,
+) {
+    let request = exchange.request();
+    carrick_observability::probes::el1_native_fork_stock_refusal(
+        reason,
+        &format!("{:?}", request.map(|r| r.binding)),
+        &format!("{:?}", execution.map(|e| e.binding)),
+        &format!("{:?}", request.map(|r| r.context)),
+        &format!("{:?}", execution.map(|e| e.context)),
+    );
+}
+
 #[cfg(all(
     feature = "metadata-grant-test-support",
     target_os = "macos",
@@ -1223,6 +1239,7 @@ pub(crate) fn service_native_fork_stock(
             // SAFETY: the synchronous crossing exclusively retains this complete wire record.
             let exchange = unsafe { &mut *pointer };
             let Some(execution) = execution else {
+                report_stock_refusal(exchange, None, "NoLiveExecution");
                 exchange.refuse(ForkStockRefusal::Stale);
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             };
@@ -1284,12 +1301,13 @@ pub(crate) fn service_native_fork_stock(
                 exchange.refuse(ForkStockRefusal::Capacity);
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             }
-            stock
-                .owner
-                .loan(&mut *ledger, execution, exchange, |life| {
-                    lifecycle_window(custody, life).is_some_and(|window| window.is_zero(life))
-                })
-                .is_ok()
+            let result = stock.owner.loan(&mut *ledger, execution, exchange, |life| {
+                lifecycle_window(custody, life).is_some_and(|window| window.is_zero(life))
+            });
+            if let Err(refusal) = result {
+                report_stock_refusal(exchange, Some(execution), &format!("{refusal:?}"));
+            }
+            result.is_ok()
         }
         Some(ForkStockKind::Commit | ForkStockKind::Abort) => {
             let Some(pointer) = abi_stack_ptr::<ForkStockSettlement>(region, cpu, address) else {
@@ -1578,6 +1596,15 @@ pub(crate) fn handle_metadata_grant_trap(
             .get_sys_reg(applevisor::vcpu::SysReg::TTBR0_EL1)
             .map_err(|e| TrapError::Hypervisor(format!("read COW supply root: {e}")))?;
         service_native_cow_supply(custody, region, cpu, ttbr0, arg1, arg2)?
+    } else if op == carrick_el1_abi::GRANT_OP_FORK_REFUSAL {
+        service_fork_refusal(
+            custody,
+            generation,
+            cpu,
+            carrick_guest_arch::KernelVa::new(arg1),
+            vcpu.get_sys_reg(applevisor::vcpu::SysReg::TTBR0_EL1)
+                .map_err(|e| TrapError::Hypervisor(format!("read diagnostic root: {e}")))?,
+        )
     } else if matches!(
         op,
         carrick_el1_abi::GRANT_OP_CHILD_RETIRE | carrick_el1_abi::GRANT_OP_WAIT_CHANNEL_WAKE
@@ -1598,6 +1625,57 @@ pub(crate) fn handle_metadata_grant_trap(
     vcpu.set_reg(Reg::X3, result[3])
         .map_err(|e| TrapError::Hypervisor(format!("set X3: {e}")))?;
     classify_metadata_trap(op, result)
+}
+
+/// Observe an authenticated stopped execution without granting or editing it.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn service_fork_refusal(
+    custody: &crate::trap::CarrierVmCustody,
+    generation: Option<crate::trap::CarrierVmGeneration>,
+    cpu: carrick_guest_arch::CpuId,
+    address: carrick_guest_arch::KernelVa,
+    ttbr0: u64,
+) -> [u64; 4] {
+    let Some(region) = retained_abi_region(custody) else {
+        return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    };
+    service_fork_refusal_using_region(custody, generation, cpu, address, ttbr0, region)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn service_fork_refusal_using_region(
+    custody: &crate::trap::CarrierVmCustody,
+    generation: Option<crate::trap::CarrierVmGeneration>,
+    cpu: carrick_guest_arch::CpuId,
+    address: carrick_guest_arch::KernelVa,
+    ttbr0: u64,
+    region: RetainedAbiRegion<'_>,
+) -> [u64; 4] {
+    let refused = [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    if !request_has_live_vm(custody, generation) {
+        return refused;
+    }
+    let Some((task, zone)) = stopped_records(region, cpu) else {
+        return refused;
+    };
+    let Some((binding, root)) = diagnostic_identity(cpu, task, zone, ttbr0) else {
+        return refused;
+    };
+    let Some(record) =
+        abi_stack_record::<carrick_el1_abi::NativeForkDiagnostic>(region, cpu, address)
+    else {
+        return refused;
+    };
+    let Some(message) = record.message() else {
+        return refused;
+    };
+    carrick_observability::probes::el1_native_fork_refusal(
+        cpu.raw(),
+        binding.mm.raw(),
+        root.address().raw(),
+        message,
+    );
+    [METADATA_GRANT_SUCCESS, 0, 0, 0]
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1635,6 +1713,17 @@ fn root_stack_record<'a>(
 ) -> Option<&'a NativeRootExit> {
     let pointer = abi_stack_ptr::<NativeRootExit>(region, cpu, address)?;
     // SAFETY: complete aligned immutable record on a retained stopped stack.
+    Some(unsafe { &*pointer })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn abi_stack_record<'a, T>(
+    region: RetainedAbiRegion<'a>,
+    cpu: carrick_guest_arch::CpuId,
+    address: carrick_guest_arch::KernelVa,
+) -> Option<&'a T> {
+    let pointer = abi_stack_ptr::<T>(region, cpu, address)?;
+    // SAFETY: complete aligned immutable record retained on the stopped CPU stack.
     Some(unsafe { &*pointer })
 }
 
@@ -1714,6 +1803,35 @@ fn stopped_records<'a>(
     Some(unsafe { (&*task, &*zone) })
 }
 
+/// Observation-only identity of a stopped lane. Unlike terminal custody,
+/// diagnostics need not have a published root incarnation.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn diagnostic_identity(
+    cpu: carrick_guest_arch::CpuId,
+    task: &carrick_el1_abi::CurrentTask,
+    zone: &carrick_el1_abi::ZoneTables,
+    ttbr0: u64,
+) -> Option<(
+    carrick_el1_abi::ExecutionBinding,
+    carrick_guest_arch::RootGpa,
+)> {
+    let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
+    let binding = carrick_core::entry::binding(&task.execution, &task.mm);
+    let index = zone.spaces.find(binding.mm.raw())?;
+    let grant = zone.spaces.grant(index, binding.mm.raw())?;
+    let root = ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK;
+    if !binding.issued()
+        || zone.installed_space(slot) != binding.mm.raw()
+        || root != grant.ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK
+    {
+        return None;
+    }
+    Some((
+        binding,
+        carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(root))?,
+    ))
+}
+
 /// Root retirement has released its record. Authenticate the stopped lane
 /// against its retained host execution, installed MM grant and hardware root.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1723,25 +1841,12 @@ fn root_execution(
     zone: &carrick_el1_abi::ZoneTables,
     ttbr0: u64,
 ) -> Option<crate::fork_stock::GrantExecution> {
-    let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
-    let binding = carrick_core::entry::binding(&task.execution, &task.mm);
-    let index = zone.spaces.find(binding.mm.raw())?;
-    let grant = zone.spaces.grant(index, binding.mm.raw())?;
-    let root = ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK;
-    if !binding.issued()
-        || zone.slot(slot).mm() != binding.mm.raw()
-        || zone.installed_space(slot) != binding.mm.raw()
-        || root != grant.ttbr0 & carrick_sched_core::AARCH64_ROOT_ADDRESS_MASK
-    {
-        return None;
-    }
+    let (binding, root) = diagnostic_identity(cpu, task, zone, ttbr0)?;
     Some(crate::fork_stock::GrantExecution::new(
         cpu,
         binding,
         carrick_guest_arch::AddressContext {
-            root: carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(
-                root,
-            ))?,
+            root,
             mm: carrick_guest_arch::MmGeneration::new(core::num::NonZeroU64::new(
                 binding.mm.raw(),
             )?),
@@ -1770,6 +1875,96 @@ mod tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
+    fn refusal_observation_reads_retained_abi_stack_without_physical_stock() {
+        use core::fmt::Write;
+        let mut region = carrick_test_support::TestEl1Region::zeroed();
+        let ptr = region.as_mut_ptr();
+        // SAFETY: exclusive aligned, zero-valid fixture ABI storage.
+        let zone = unsafe {
+            &*ptr
+                .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+                .cast::<carrick_el1_abi::ZoneTables>()
+        };
+        let cpu = carrick_guest_arch::CpuId::new(3);
+        let slot = carrick_guest_arch::SlotId::new(3);
+        let ttbr = (4 << 48) | 0x90000;
+        let space = zone.spaces.publish_closed(5, ttbr, ttbr).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 5);
+        // A native switch keeps the host-loaded MM distinct from the MM
+        // actually installed on the stopped vCPU.
+        zone.publish_slot(slot, 6, Some(3), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 5).unwrap();
+        // SAFETY: this CPU's fixed initialized CurrentTask record belongs to the fixture.
+        let task = unsafe {
+            &*ptr
+                .add(
+                    carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize
+                        + 3 * core::mem::size_of::<carrick_el1_abi::CurrentTask>(),
+                )
+                .cast::<carrick_el1_abi::CurrentTask>()
+        };
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 1);
+        task.mm.key.store(5, Ordering::Release);
+        task.mm.thread_generation.store(101, Ordering::Release);
+        assert!(task.root_generation().is_none());
+        let address = carrick_el1_abi::EL1_STACKS_BASE + 3 * carrick_el1_abi::EL1_STACK_SIZE;
+        let mut diagnostic = carrick_el1_abi::NativeForkDiagnostic::new();
+        write!(&mut diagnostic, "Census: Core").unwrap();
+        // SAFETY: aligned complete stack record in this exclusively owned ABI region.
+        unsafe {
+            ptr.add((address - carrick_el1_abi::EL1_REGION_BASE) as usize)
+                .cast::<carrick_el1_abi::NativeForkDiagnostic>()
+                .write(diagnostic);
+        }
+        let bytes = unsafe {
+            RetainedAbiRegion::new(ptr, carrick_el1_abi::EL1_REGION_SIZE as usize).unwrap()
+        };
+        let custody = crate::trap::CarrierVmCustody::new();
+        let generation = custody.begin_create().unwrap();
+        custody.commit_create(generation).unwrap();
+        assert!(
+            custody
+                .stage2_record_covering(
+                    address,
+                    core::mem::size_of::<carrick_el1_abi::NativeForkDiagnostic>()
+                )
+                .is_none(),
+            "ABI stacks are not physical fork-stock rows"
+        );
+        assert_eq!(
+            service_fork_refusal_using_region(
+                &custody,
+                Some(generation),
+                cpu,
+                carrick_guest_arch::KernelVa::new(address),
+                ttbr,
+                bytes
+            ),
+            [METADATA_GRANT_SUCCESS, 0, 0, 0]
+        );
+        for (wrong_cpu, wrong_address, wrong_ttbr) in [
+            (carrick_guest_arch::CpuId::new(2), address, ttbr),
+            (cpu, address + 1, ttbr),
+            (cpu, address, ttbr + 4096),
+        ] {
+            assert_eq!(
+                service_fork_refusal_using_region(
+                    &custody,
+                    Some(generation),
+                    wrong_cpu,
+                    carrick_guest_arch::KernelVa::new(wrong_address),
+                    wrong_ttbr,
+                    bytes
+                ),
+                [METADATA_GRANT_ERR_DENIED, 0, 0, 0]
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
     fn root_terminal_authentication_needs_no_parked_record_or_stock_row() {
         let mut region = carrick_test_support::TestEl1Region::zeroed();
         let ptr = region.as_mut_ptr();
@@ -1793,6 +1988,10 @@ mod tests {
         task.mm.key.store(5, Ordering::Release);
         task.mm.thread_generation.store(101, Ordering::Release);
         assert!(root_execution(cpu, &task, zone, ttbr).is_none());
+        assert!(
+            diagnostic_identity(cpu, &task, zone, ttbr).is_some(),
+            "refusal diagnostic must observe an initial root without granting custody"
+        );
         task.publish_root_generation(carrick_guest_arch::ContextGeneration::new(
             core::num::NonZeroU64::new(77).unwrap(),
         ));
@@ -1840,8 +2039,13 @@ mod tests {
 
         assert!(root_execution(cpu, &task, zone, ttbr + 4096).is_none());
         assert!(root_execution(carrick_guest_arch::CpuId::new(2), &task, zone, ttbr).is_none());
+        assert!(diagnostic_identity(cpu, &task, zone, ttbr + 4096).is_none());
+        assert!(
+            diagnostic_identity(carrick_guest_arch::CpuId::new(2), &task, zone, ttbr).is_none()
+        );
         task.execution.generation.store(0, Ordering::Release);
         assert!(root_execution(cpu, &task, zone, ttbr).is_none());
+        assert!(diagnostic_identity(cpu, &task, zone, ttbr).is_none());
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
