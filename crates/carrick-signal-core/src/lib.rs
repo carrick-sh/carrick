@@ -15,6 +15,36 @@ pub mod policy;
 pub mod timer;
 pub mod wait;
 
+/// Check whether a canonical Linux syscall number is restartable upon signal interruption or readiness wake.
+///
+/// Under Linux, a blocking syscall interrupted by a signal handler that specified
+/// `SA_RESTART` in its `sigaction` flags is automatically restarted rather than
+/// returning `-EINTR` (`signal(7)` "Interruption of system calls and library
+/// functions by signal handlers").
+///
+/// The decision to restart belongs to the syscall boundary: a syscall that
+/// blocks inside Carrick returns `-EINTR` to EL0 only when it is NOT
+/// restartable OR the signal handler that ran did not set `SA_RESTART`.
+/// System calls on "slow" devices (pipes, terminals, sockets without timeouts),
+/// file locking (flock, fcntl F_SETLKW), POSIX message queues, getrandom,
+/// and child waits (waitid, wait4) are restarted when `SA_RESTART` is set.
+///
+/// The `signal(7)` "never restarted" list is deliberately EXCLUDED, so those
+/// keep surfacing `EINTR` as Linux does: `poll`/`ppoll`, `select`/`pselect6`,
+/// `epoll_wait`/`epoll_pwait`, `nanosleep`/`clock_nanosleep`, `io_getevents`,
+/// `msgrcv`/`msgsnd`, `semop`/`semtimedop`, and the `sigsuspend`/
+/// `rt_sigtimedwait` family.
+///
+/// Dedicated socket calls require a blocked fd-wait continuation that proves
+/// [`wait::SocketWaitTimeout::Untimed`], so the number-only fallback returns
+/// `false` for them and only continuation-backed untimed socket waits restart.
+pub const fn is_restartable_syscall(nr: u64) -> bool {
+    matches!(
+        wait::classify_syscall_restart(nr, wait::SocketWaitTimeout::NotSocketWait),
+        wait::RestartClass::IfSaRestart
+    )
+}
+
 use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicU64, Ordering};
 

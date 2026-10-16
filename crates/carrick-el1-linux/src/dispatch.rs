@@ -694,7 +694,7 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
     }
     let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
     sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
-    let ttbr0 = crate::isa::aarch64::hardware_live_ttbr();
+    let ttbr0 = carrick_el1::isa::aarch64::hardware_live_ttbr();
     let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
         .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
     let delivered = super::aarch64_process::with_process_entry(

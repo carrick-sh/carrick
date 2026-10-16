@@ -1899,6 +1899,20 @@ mod tests {
     }
 
     #[test]
+    fn native_return_publishes_signal_checkpoint_action_with_result() {
+        let (mut binding, mut mailbox) = binding();
+        publish_valid_request(&binding, &mut mailbox);
+        binding.take_request().unwrap().expect("request");
+        binding.publish_native_signal_return(-4).unwrap();
+        assert_eq!(mailbox.return_value, (-4_i64) as u64);
+        assert_eq!(
+            mailbox.response_action,
+            MailboxResponseAction::NativeSignalCheckpoint.raw()
+        );
+        assert_eq!(binding.pending_normal_return().unwrap(), Some(-4));
+    }
+
+    #[test]
     fn transport_parser_is_explicit_and_defaults_to_mailbox() {
         assert_eq!(
             HvfSyscallTransport::parse(None).expect("default"),

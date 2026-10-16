@@ -1534,14 +1534,30 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         let signals = resources.signals().clone();
         let channel = resources.channel.clone();
         let wake_record = member.record;
+        let info = match event.source() {
+            carrick_el1_abi::ExternalSignalSource::IntervalTimer => Some(
+                carrick_syscall_abi::LinuxSiginfo::kernel(event.signal().number()),
+            ),
+            carrick_el1_abi::ExternalSignalSource::PosixTimer => {
+                let timer = event.timer_info();
+                Some(carrick_syscall_abi::LinuxSiginfo::timer(
+                    event.signal().number(),
+                    timer.id,
+                    timer.overrun,
+                    timer.value,
+                ))
+            }
+            carrick_el1_abi::ExternalSignalSource::Terminal
+            | carrick_el1_abi::ExternalSignalSource::HostFault => None,
+        };
         match event.scope() {
             carrick_el1_abi::ExternalSignalScope::Process => {
                 signals
-                    .enqueue(member.process, event.signal(), None)
+                    .enqueue(member.process, event.signal(), info)
                     .map_err(|_| NativeProcessError::Stale)?;
             }
             carrick_el1_abi::ExternalSignalScope::Thread => {
-                signals.enqueue_thread(member.record, event.signal(), None);
+                signals.enqueue_thread(member.record, event.signal(), info);
             }
         }
         let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
@@ -7095,6 +7111,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     }
 }
 
+#[cfg(any(test, feature = "host-test"))]
+pub mod host_test_support;
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -7159,172 +7178,10 @@ mod tests {
             .unwrap(),
         );
     }
+    use super::host_test_support::{Physical, words};
     use super::*;
     use carrick_guest_arch::{ContextGeneration, FrameGpa};
     use carrick_sched_core::ParkedContextWords;
-    struct Physical<'a> {
-        zone: &'a ZoneTables<ParkedContextWords>,
-        page: &'a ThreadLifecyclePage,
-        controls: &'a [ThreadControlSlot],
-        copies: Vec<LinuxWaitStatus>,
-        tid_words: BTreeMap<(u64, u64), u32>,
-        tid_wakes: usize,
-        tid_writes: Vec<(u64, u64, u32)>,
-        refuse_copy: bool,
-        child_copy_error: Option<NativeProcessError>,
-        on_signal_clock: Option<Box<dyn FnMut()>>,
-    }
-    impl<'a> NativeProcessService<'a, ParkedContextWords> for Physical<'a> {
-        type Mm = AddressContext<RootGpa>;
-        type PreparedMm = AddressContext<RootGpa>;
-        type Born = AddressContext<RootGpa>;
-        fn prepare_mm(
-            &mut self,
-            parent: &Self::Mm,
-            _: ParkedContextWords,
-            child: MmGeneration,
-        ) -> Result<Self::PreparedMm, NativeProcessError> {
-            let address = AddressContext {
-                root: RootGpa::page_aligned(FrameGpa::new(0x2000)).unwrap(),
-                mm: child,
-                generation: ContextGeneration::new(NonZeroU64::MIN),
-            };
-            self.zone
-                .spaces
-                .publish_closed(child.raw().get(), address.root.address().raw(), 0)
-                .ok_or(NativeProcessError::Exhausted)?;
-            for ((mm, va), value) in self.tid_words.clone() {
-                if mm == parent.mm.raw().get() {
-                    self.tid_words.insert((child.raw().get(), va), value);
-                }
-            }
-            Ok(address)
-        }
-        fn prepared_mm(&self, p: &Self::PreparedMm) -> Self::Mm {
-            *p
-        }
-        fn prepared_context(&self, p: &Self::PreparedMm) -> AddressContext<RootGpa> {
-            *p
-        }
-        fn child_lifecycle(&self, _: &Self::PreparedMm) -> NativeLifecycleResources<'a> {
-            NativeLifecycleResources {
-                page: self.page,
-                controls: self.controls,
-            }
-        }
-        fn commit_mm(
-            &mut self,
-            p: Self::PreparedMm,
-        ) -> Result<Self::Born, (NativeProcessError, Self::PreparedMm)> {
-            Ok(p)
-        }
-        fn abort_mm(
-            &mut self,
-            p: Self::PreparedMm,
-        ) -> Result<(), (NativeProcessError, Self::PreparedMm)> {
-            self.zone
-                .spaces
-                .free(self.zone.spaces.find(p.mm.raw().get()).unwrap());
-            Ok(())
-        }
-        fn settle_mm(&mut self, b: Self::Born) -> Result<(), (NativeProcessError, Self::Born)> {
-            self.zone
-                .spaces
-                .open(self.zone.spaces.find(b.mm.raw().get()).unwrap());
-            Ok(())
-        }
-        fn copy_status(
-            &mut self,
-            _: &Self::Mm,
-            _: UserVa,
-            status: LinuxWaitStatus,
-        ) -> Result<(), NativeProcessError> {
-            if self.refuse_copy {
-                return Err(NativeProcessError::Fault);
-            };
-            self.copies.push(status);
-            Ok(())
-        }
-        fn copy_signal_bytes(
-            &mut self,
-            mm: &Self::Mm,
-            address: UserVa,
-            bytes: &[u8],
-        ) -> Result<(), NativeProcessError> {
-            if let Some(error) = self.child_copy_error {
-                return Err(error);
-            }
-            let Some(word) = self.tid_words.get_mut(&(mm.mm.raw().get(), address.raw())) else {
-                return Err(NativeProcessError::Fault);
-            };
-            let bytes: [u8; 4] = bytes.try_into().map_err(|_| NativeProcessError::Fault)?;
-            *word = u32::from_ne_bytes(bytes);
-            self.tid_writes
-                .push((mm.mm.raw().get(), address.raw(), *word));
-            Ok(())
-        }
-        fn signal_deadline(
-            &mut self,
-            nanos: u64,
-        ) -> Result<carrick_guest_arch::Deadline, NativeProcessError> {
-            Ok(carrick_guest_arch::Deadline(
-                carrick_guest_arch::CounterTick::new(1000 + nanos),
-            ))
-        }
-        fn arm_signal_timer(
-            &mut self,
-            _: carrick_guest_arch::Deadline,
-        ) -> Result<(), NativeProcessError> {
-            Ok(())
-        }
-        fn signal_now(&mut self) -> Result<carrick_guest_arch::CounterTick, NativeProcessError> {
-            if let Some(mut hook) = self.on_signal_clock.take() {
-                hook();
-            }
-            let now = if self.zone.counters.el1_timeouts.load(Ordering::Acquire) == 0 {
-                1000
-            } else {
-                2000
-            };
-            Ok(carrick_guest_arch::CounterTick::new(now))
-        }
-        fn quarantine_prepared(&mut self, _: Self::PreparedMm) {
-            panic!("unexpected quarantine")
-        }
-        fn quarantine_fork(
-            &mut self,
-            _: NativeForkPreparation<'a, Self::Mm, Self::PreparedMm, ParkedContextWords>,
-        ) {
-            panic!("unexpected fork quarantine")
-        }
-        fn quarantine_born(&mut self, _: Self::Born) {
-            panic!("unexpected quarantine")
-        }
-        fn retire_mm(&mut self, _: Self::Mm) {}
-        fn wake_effects(&mut self, effects: WakeEffects) {
-            // Parent notification may request an SGI; the child's private
-            // futex waiter is the only queued-on-this-slot wake in this test.
-            if effects.queued_own {
-                self.tid_wakes += 1;
-            }
-        }
-        fn request_ingress_producer_boundary(&mut self) {}
-    }
-    fn words(address: AddressContext<RootGpa>) -> ParkedContextWords {
-        let mut frame = [0; 20];
-        frame[15] = 0x400000;
-        frame[16] = 0x23;
-        frame[17] = 0x202;
-        frame[18] = 0x800000;
-        frame[19] = 0x1b;
-        ParkedContextWords::from_parts(
-            frame,
-            address,
-            0x9000,
-            0,
-            [0; carrick_sched_core::X86_XSAVE_BYTES],
-        )
-    }
     #[test]
     fn compact_native_wait_bucket_uses_the_shared_hash_for_its_context_abi() {
         for (mm, address) in [(1, 0), (104, 0xffff_ffff_a800_0000), (u64::MAX, u64::MAX)] {
@@ -7628,6 +7485,10 @@ mod tests {
             carrick_signal_core::policy::Signal::from_number(2).unwrap(),
             carrick_el1_abi::ExternalSignalSource::Terminal,
         );
+        assert!(
+            !registry.signal_checkpoint_needed(&zone, first_record),
+            "empty native inbox skips the FP/SIMD save"
+        );
         let owner = registry
             .for_external_event(&zone, event)
             .expect("live ingress owner");
@@ -7696,10 +7557,12 @@ mod tests {
         );
         let signals = runtimes[0].current_signals(&tasks[0]).unwrap();
         assert!(signals.pending_set(first_record).contains(event.signal()));
+        assert!(registry.signal_checkpoint_needed(&zone, first_record));
         let _ = signals.take_deliverable(
             first_record,
             carrick_signal_core::policy::SigBlockMask::NONE,
         );
+        assert!(!registry.signal_checkpoint_needed(&zone, first_record));
         let queue = carrick_el1_abi::SharedSignalIngressQueue::new();
         queue.admit(stale).unwrap();
         assert_eq!(
