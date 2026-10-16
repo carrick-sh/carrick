@@ -7190,6 +7190,20 @@ mod tests {
                 on_signal_clock: None,
             },
         ];
+        assert!(registry
+            .admit_external_event(
+                &zone,
+                event,
+                carrick_sched_core::SlotId::new(0),
+                &mut services[0],
+            )
+            .unwrap());
+        let signals = runtimes[0].current_signals(&tasks[0]).unwrap();
+        assert!(signals.pending_set(first_record).contains(event.signal()));
+        let _ = signals.take_deliverable(
+            first_record,
+            carrick_signal_core::policy::SigBlockMask::NONE,
+        );
         let mut children = Vec::new();
         for index in 0..2 {
             let task = &tasks[index];
