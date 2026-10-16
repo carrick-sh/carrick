@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import tomllib
+from collections import Counter
 from pathlib import Path
 
 # Tooling, test, and host crates outside guest execution surfaces
@@ -21,9 +22,294 @@ NON_GUEST_CRATES = {
     "crates/carrick-xtask",
 }
 
+_VIS_PREFIX = r"(?:pub(?:\s*\(\s*(?:crate|super|self|in\s+[A-Za-z0-9_:]+)\s*\))?\s+)?"
+_MOD_DECL_RE = re.compile(rf"^{_VIS_PREFIX}mod\s+(?:r#)?[A-Za-z_][A-Za-z0-9_]*\s*;$")
+_USE_DECL_RE = re.compile(rf"^{_VIS_PREFIX}use\s+(.+)$")
+_USE_BODY_CHARS_RE = re.compile(r"^[A-Za-z0-9_:\s,\{\}\*#]+$")
+
 
 def is_full_sha(s: str) -> bool:
     return bool(re.fullmatch(r"[0-9a-fA-F]{40}", s))
+
+
+def is_comment_or_outer_attr(stripped: str) -> bool:
+    if stripped.startswith("//") and not stripped.startswith("//!"):
+        return True
+    if stripped.startswith("#[") and stripped.endswith("]"):
+        return True
+    return False
+
+
+def match_allowlisted_decl_at(lines: list[str], index: int) -> int:
+    """If lines[index:] starts with an allowlisted mod/use declaration, return the number of lines consumed."""
+    line = lines[index]
+    if _MOD_DECL_RE.match(line):
+        return 1
+
+    m = _USE_DECL_RE.match(line)
+    if not m:
+        return 0
+
+    rest = m.group(1).strip()
+    if rest.endswith(";"):
+        body = rest[:-1].strip()
+        if body and _USE_BODY_CHARS_RE.match(body) and body.count("{") == body.count("}"):
+            return 1
+        return 0
+
+    if not _USE_BODY_CHARS_RE.match(rest):
+        return 0
+    depth = rest.count("{") - rest.count("}")
+    if depth <= 0:
+        return 0
+
+    cursor = index + 1
+    while cursor < len(lines) and depth > 0:
+        cont = lines[cursor]
+        if not cont:
+            return 0
+        if cont.endswith(";"):
+            body = cont[:-1].strip()
+            if not body or not _USE_BODY_CHARS_RE.match(body):
+                return 0
+            depth += body.count("{") - body.count("}")
+            if depth == 0:
+                return (cursor - index) + 1
+            return 0
+        if not _USE_BODY_CHARS_RE.match(cont):
+            return 0
+        depth += cont.count("{") - cont.count("}")
+        if depth <= 0:
+            return 0
+        cursor += 1
+
+    return 0
+
+
+def classify_hunk_added_lines(raw_added: list[str]) -> tuple[Counter, Counter]:
+    """Classify a hunk's added lines into (required_move_counts, allowlisted_decl_counts)."""
+    stripped_lines = [line.strip() for line in raw_added]
+    is_decl = [False] * len(stripped_lines)
+
+    i = 0
+    n = len(stripped_lines)
+    while i < n:
+        if stripped_lines[i] == "":
+            i += 1
+            continue
+
+        # Check for a contiguous run of comments/outer attributes attached to a mod/use declaration.
+        j = i
+        while j < n and stripped_lines[j] != "" and is_comment_or_outer_attr(stripped_lines[j]):
+            j += 1
+
+        if j < n:
+            decl_len = match_allowlisted_decl_at(stripped_lines, j)
+            if decl_len > 0:
+                for k in range(i, j + decl_len):
+                    is_decl[k] = True
+                i = j + decl_len
+                continue
+
+        decl_len = match_allowlisted_decl_at(stripped_lines, i)
+        if decl_len > 0:
+            for k in range(i, i + decl_len):
+                is_decl[k] = True
+            i += decl_len
+            continue
+
+        i += 1
+
+    req_counts: Counter = Counter()
+    decl_counts: Counter = Counter()
+    for line, decl in zip(stripped_lines, is_decl):
+        if line == "":
+            continue
+        if decl:
+            decl_counts[line] += 1
+        else:
+            req_counts[line] += 1
+    return req_counts, decl_counts
+
+
+def parse_file_diff(root: Path, base_sha: str, head_sha: str, path: str) -> tuple[Counter, Counter, Counter]:
+    """Return (removed_counts, required_added_counts, allowlisted_decl_added_counts) for path."""
+    res = subprocess.run(
+        [
+            "git",
+            "--literal-pathspecs",
+            "diff",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "-U0",
+            base_sha,
+            head_sha,
+            "--",
+            path,
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    removed: Counter = Counter()
+    req_added: Counter = Counter()
+    decl_added: Counter = Counter()
+
+    in_hunk = False
+    current_hunk_added: list[str] = []
+
+    def flush_hunk():
+        nonlocal current_hunk_added
+        if current_hunk_added:
+            h_req, h_decl = classify_hunk_added_lines(current_hunk_added)
+            req_added.update(h_req)
+            decl_added.update(h_decl)
+            current_hunk_added = []
+
+    for raw_line in res.stdout.splitlines():
+        if raw_line.startswith("@@ "):
+            flush_hunk()
+            in_hunk = True
+            continue
+        if not in_hunk:
+            continue
+        if raw_line.startswith("-"):
+            stripped = raw_line[1:].strip()
+            if stripped != "":
+                removed[stripped] += 1
+        elif raw_line.startswith("+"):
+            current_hunk_added.append(raw_line[1:])
+
+    flush_hunk()
+    return removed, req_added, decl_added
+
+
+def detect_move_covered_files(
+    root: Path,
+    base_sha: str,
+    head_sha: str,
+    candidate_paths: set[str],
+) -> dict[str, int]:
+    """Return {path: moved_line_count} for files whose diff is a pure move."""
+    file_diffs: dict[str, tuple[Counter, Counter, Counter]] = {}
+    for path in sorted(candidate_paths):
+        if not path.endswith(".rs"):
+            continue
+        rem, req, decl = parse_file_diff(root, base_sha, head_sha, path)
+        if rem or req or decl:
+            file_diffs[path] = (rem, req, decl)
+
+    candidates = set(file_diffs.keys())
+    while candidates:
+        # Phase 1: monotone per-file pruning. A file f can never be part of any
+        # valid move subset of `candidates` if it removes a line more times than
+        # all other candidates add it, or requires-adds a line more times than
+        # all other candidates remove it.
+        monotone_bad: set[str] = set()
+        for f in candidates:
+            rem_f, req_f, _ = file_diffs[f]
+            for line, r_count in rem_f.items():
+                other_add = sum(
+                    file_diffs[g][1][line] + file_diffs[g][2][line]
+                    for g in candidates
+                    if g != f
+                )
+                if r_count > other_add:
+                    monotone_bad.add(f)
+                    break
+            if f in monotone_bad:
+                continue
+            for line, a_count in req_f.items():
+                other_rem = sum(file_diffs[g][0][line] for g in candidates if g != f)
+                if a_count > other_rem:
+                    monotone_bad.add(f)
+                    break
+
+        if monotone_bad:
+            candidates -= monotone_bad
+            continue
+
+        # Phase 2: exact multiplicity across the remaining candidates.
+        all_lines: set[str] = set()
+        for f in candidates:
+            rem, req, decl = file_diffs[f]
+            all_lines.update(rem.keys())
+            all_lines.update(req.keys())
+            all_lines.update(decl.keys())
+
+        bad_files: set[str] = set()
+        for line in all_lines:
+            total_rem = sum(file_diffs[f][0][line] for f in candidates)
+            total_req = sum(file_diffs[f][1][line] for f in candidates)
+            caps = {
+                f: min(
+                    file_diffs[f][1][line] + file_diffs[f][2][line],
+                    max(0, total_rem - file_diffs[f][0][line]),
+                )
+                for f in candidates
+            }
+            total_cap = sum(caps.values())
+
+            line_ok = total_req <= total_rem <= total_cap
+            if line_ok:
+                for f in candidates:
+                    r_f = file_diffs[f][0][line]
+                    a_f = file_diffs[f][1][line]
+                    if r_f + a_f > total_rem or r_f > (total_cap - caps[f]):
+                        line_ok = False
+                        break
+
+            if not line_ok:
+                for f in candidates:
+                    if file_diffs[f][0][line] > 0 or file_diffs[f][1][line] > 0:
+                        bad_files.add(f)
+
+        if not bad_files:
+            break
+        candidates -= bad_files
+
+    if not candidates:
+        return {}
+
+    moved_counts: dict[str, int] = {f: 0 for f in candidates}
+    all_lines = set()
+    for f in candidates:
+        rem, req, decl = file_diffs[f]
+        all_lines.update(rem.keys())
+        all_lines.update(req.keys())
+        all_lines.update(decl.keys())
+
+    for line in all_lines:
+        total_rem = sum(file_diffs[f][0][line] for f in candidates)
+        if total_rem == 0:
+            continue
+        caps = {
+            f: min(
+                file_diffs[f][1][line] + file_diffs[f][2][line],
+                max(0, total_rem - file_diffs[f][0][line]),
+            )
+            for f in candidates
+        }
+        matched_add = {f: file_diffs[f][1][line] for f in candidates}
+        remaining = total_rem - sum(matched_add.values())
+        for f in sorted(candidates):
+            if remaining <= 0:
+                break
+            spare = caps[f] - matched_add[f]
+            if spare > 0:
+                take = min(spare, remaining)
+                matched_add[f] += take
+                remaining -= take
+
+        for f in candidates:
+            moved_counts[f] += file_diffs[f][0][line] + matched_add[f]
+
+    if sum(moved_counts.values()) == 0:
+        return {}
+
+    return moved_counts
 
 
 def load_surfaces(root: Path):
@@ -188,6 +474,7 @@ def main():
     added_paths = set()
     modified_paths = set()
     byte_identical_renames = set()
+    byte_identical_rename_sources = set()
 
     for line in diff_res.stdout.splitlines():
         line = line.strip()
@@ -202,6 +489,7 @@ def main():
             all_diff_paths.add(new_path)
             if status == "R100":
                 byte_identical_renames.add(new_path)
+                byte_identical_rename_sources.add(old_path)
             else:
                 modified_paths.add(new_path)
         else:
@@ -213,13 +501,24 @@ def main():
             elif status != "D":
                 modified_paths.add(path)
 
+    move_candidates = all_diff_paths - byte_identical_renames - byte_identical_rename_sources
+    move_covered = detect_move_covered_files(root, base_sha, head_sha, move_candidates)
+    for path in sorted(move_covered):
+        print(f"move-covered: {path} ({move_covered[path]} moved lines)")
+
     # Load and validate exemptions
     exempted_paths = load_and_validate_exemptions(root, exemptions_dir, valid_contracts, all_diff_paths, base_sha, head_sha)
 
     # Check for unclassified new paths under crates/
     unclassified = []
     for path in added_paths:
-        if path.startswith("crates/") and path not in surfaces and path not in exempted_paths and path not in byte_identical_renames:
+        if (
+            path.startswith("crates/")
+            and path not in surfaces
+            and path not in exempted_paths
+            and path not in byte_identical_renames
+            and path not in move_covered
+        ):
             if not is_non_guest_path(path):
                 unclassified.append(path)
 
@@ -242,7 +541,7 @@ def main():
     # Check that each modified classified guest surface has evidence or is exempted
     uncovered = []
     for path in modified_paths:
-        if path in byte_identical_renames or path in exempted_paths:
+        if path in byte_identical_renames or path in move_covered or path in exempted_paths:
             continue
         if path in surfaces:
             cids = surfaces[path]

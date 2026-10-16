@@ -149,7 +149,7 @@ Only changes proven not to alter guest-visible behavior or cost qualify:
 An exemption names exact paths, revisions, affected contract families, and the
 reason no semantic or work expectation changed. Broad globs and statements that
 performance is out of scope are invalid. If classification is uncertain, add or
-run the contract.
+run the contract. `scripts/conformance/check-contract-change.py` automatically waives pure moves across files when every removed and added line matches verbatim (modulo indentation and multiplicity) plus allowlisted `mod`/`use` declarations.
 
 ## Commands
 
