@@ -9,7 +9,7 @@
 //! Every arm (`timer_settime`, including a disarm) and `timer_delete` runs
 //! under the slot's [`TransitionGate`], and a firing thread delivers only
 //! through `fire_if_current`, which checks its generation, charges any
-//! overrun and runs the delivery callback inside ONE gate hold. Once an arm or
+//! overrun, retires a one-shot, and runs the delivery callback inside ONE gate hold. Once an arm or
 //! delete returns, no firing thread of a superseded generation delivers or
 //! touches the slot (Linux: no expiry of the old setting generates a signal
 //! after `timer_settime`/`timer_delete` returns).
@@ -202,7 +202,7 @@ pub fn generation_matches(slot: &PosixTimerSlot, generation: u64) -> bool {
 
 /// Deliver one expiry for the firing thread of arm `generation`: if that arm
 /// is still live, charge `overrun` (a periodic expiry after the first) and
-/// run `on_fire`, all under the slot gate, so an arm or delete that returned
+/// retire a one-shot and run `on_fire`, all under the slot gate, so an arm or delete that returned
 /// before this call is never followed by a delivery or an overrun charge for
 /// the superseded setting. Returns [`FireOutcome::Retired`] when the arm is
 /// gone or `spec` was a one-shot (just delivered), else
@@ -221,6 +221,18 @@ fn fire_if_current(
     }
     if overrun {
         record_overrun(slot);
+    }
+    if spec.interval == 0 {
+        // The signal's observer must see the expired timer, including a new
+        // generation that retires this worker. The gate owns this transition
+        // against timer_settime/delete; the atomic stores precede publication.
+        slot.spec
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .spec
+            .value = 0;
+        slot.armed_at_ns.store(0, Ordering::SeqCst);
+        slot.generation.fetch_add(1, Ordering::SeqCst);
     }
     on_fire();
     if spec.interval == 0 {
@@ -362,6 +374,15 @@ pub fn exists(id: i32) -> bool {
     let mut guard = registry();
     let map = ensure_registry(&mut guard);
     map.contains_key(&id)
+}
+
+/// Whether `id` is currently armed (`false` for an unknown, disarmed, or
+/// expired one-shot timer).
+pub fn is_armed(id: i32) -> bool {
+    let mut guard = registry();
+    let map = ensure_registry(&mut guard);
+    map.get(&id)
+        .is_some_and(|s| s.armed_at_ns.load(Ordering::SeqCst) != 0)
 }
 
 /// Snapshot the overrun counter for `id`. Returns `None` for an unknown id.
@@ -575,6 +596,26 @@ mod tests {
             assert!(delete(id));
         });
         assert_eq!(fires, 0, "a POSIX timer fired after timer_delete returned");
+    }
+
+    #[test]
+    fn cpu_one_shot_is_retired_before_delivery() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let id = create_with_clock_kind(2, ClockKind::ProcessCpu, 27, None, 0);
+        let spec = TimerSpecNs {
+            value: 1_000,
+            interval: 0,
+        };
+        let armed = arm(id, spec).expect("arm");
+        let slot = &armed.slot;
+        let generation = armed.generation;
+        let outcome = fire_if_current(slot, generation, spec, false, &|| {
+            assert_eq!(slot.armed_at_ns.load(Ordering::Acquire), 0);
+            assert_ne!(slot.generation.load(Ordering::Acquire), generation);
+        });
+        assert_eq!(outcome, FireOutcome::Retired);
+        assert_eq!(remaining(id).expect("timer exists").value, 0);
+        assert!(delete(id));
     }
 
     #[test]
