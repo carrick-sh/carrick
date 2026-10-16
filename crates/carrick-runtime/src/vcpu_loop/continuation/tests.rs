@@ -756,8 +756,26 @@ fn serial_host_two_live_reads_share_one_process_signal_wake() {
     use carrick_el1::personality::native_process_runtime::host_test_support::{
         NativeSignalFixture, take_signal_copies,
     };
+    use carrick_guest_mem::GuestMemory;
 
     let (kernel, leader) = bootstrap(153_697);
+    let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
+    dispatcher
+        .activate_file_authority(Arc::clone(&leader.resources().files()))
+        .unwrap();
+    let mut memory = carrick_kernel::dispatch::LinearMemory::new(0x10000, vec![0; 0x1000]);
+    let reporter = crate::compat::CompatReporter::default();
+    let pair = dispatcher
+        .dispatch(
+            &leader,
+            SyscallRequest::new(59, SyscallArgs::from([0x10200, 0, 0, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert!(matches!(pair, DispatchOutcome::Returned { value: 0 }));
+    let pair = memory.read_bytes(0x10200, 8).unwrap();
+    let read_fd = i32::from_ne_bytes(pair[..4].try_into().unwrap()) as u64;
     let worker = kernel
         .reserve_thread_clone(
             &leader,
@@ -794,18 +812,18 @@ fn serial_host_two_live_reads_share_one_process_signal_wake() {
         let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
         custody.commit_registration();
         custody.commit_native_signal_owner();
+        let request = SyscallRequest::new(63, SyscallArgs::from([read_fd, 0x10300, 1, 0, 0, 0]));
+        let outcome = dispatcher
+            .dispatch(context, request, &mut memory, &reporter)
+            .unwrap();
+        assert!(matches!(outcome, DispatchOutcome::WaitOnFds { .. }));
         continuations.push(
             BlockedContinuation::from_dispatch_outcome(
-                DispatchOutcome::WaitOnFds {
-                    fds: WaitFds::empty(),
-                    timeout: None,
-                    sig_mask: WaitSigMask::NONE,
-                    completion: FdWaitCompletion::Fd { on_timeout: 0 },
-                },
+                outcome,
                 ContinuationCapture::new(
                     context,
                     generation,
-                    SyscallRequest::new(63, SyscallArgs([0x1234, 0, 0, 0, 0, 0])),
+                    request,
                     RestartClass::RestartSyscall,
                 )
                 .unwrap(),
