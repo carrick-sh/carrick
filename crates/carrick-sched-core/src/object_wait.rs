@@ -767,7 +767,13 @@ const OWNER_CONTINUATION: u32 = 4;
 const OWNER_EXCEPTION_ENTRY: u32 = 8;
 
 /// The entry whose native context the retained owner parked.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum OwnerEntry {
     /// The ISA saved the return PC after its syscall instruction.
     Syscall,
