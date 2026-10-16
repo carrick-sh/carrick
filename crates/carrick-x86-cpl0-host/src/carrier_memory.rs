@@ -866,6 +866,9 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         let residency = self.record_ptr::<carrick_el1_abi::FrameGrantResidencyTable>(
             FrameGpa::new(region.raw() + carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET),
         )?;
+        let ingress = self.record_ptr::<carrick_el1_abi::SharedSignalIngressQueue>(
+            FrameGpa::new(region.raw() + carrick_el1_abi::EL1_SIGNAL_INGRESS_OFFSET),
+        )?;
         let portal = self.record_ptr::<carrick_el1_abi::MmPortalSlots>(FrameGpa::new(
             region.raw() + carrick_el1_abi::EL1_MM_PORTAL_OFFSET,
         ))?;
@@ -873,6 +876,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         // both retained records have checked bounds and alignment.
         unsafe {
             carrick_el1_abi::FrameGrantResidencyTable::init_in_place(residency);
+            carrick_el1_abi::SharedSignalIngressQueue::initialize_at(ingress);
             portal.write(carrick_el1_abi::MmPortalSlots::new());
         }
         Ok(())
