@@ -2972,4 +2972,52 @@ mod tests {
         let core = fs::read_to_string(repo.join("crates/carrick-core/src/lifecycle.rs")).unwrap();
         assert!(core.contains("pub trait Lifecycle"));
     }
+
+    fn signal_delivery_owner_is_unique(shared: &str, x86: &str) -> bool {
+        let Some(wrapper) = x86
+            .split_once("pub(crate) fn deliver_signal_on_syscall_return(")
+            .and_then(|(_, rest)| rest.split_once("pub fn signal_user_return("))
+            .map(|(body, _)| body)
+        else {
+            return false;
+        };
+        shared.contains("process.take_deliverable_after_suspend(")
+            && shared.contains("policy::handler_block_mask(")
+            && shared.contains("process.force_sigsegv(")
+            && wrapper.contains(
+                "carrick_el1::personality::signal_delivery::deliver_signal_on_syscall_return(",
+            )
+            && [
+                "take_deliverable_after_suspend(",
+                "policy::handler_block_mask(",
+                "delivery_stack(",
+            ]
+            .into_iter()
+            .all(|selection| !x86.contains(selection))
+    }
+
+    #[test]
+    fn x86_signal_delivery_selects_through_one_shared_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let shared =
+            fs::read_to_string(repo.join("crates/carrick-el1/src/personality/signal_delivery.rs"))
+                .unwrap();
+        let x86 = fs::read_to_string(repo.join("crates/carrick-x86-cpl0/src/linux_personality.rs"))
+            .unwrap();
+        assert!(signal_delivery_owner_is_unique(&shared, &x86));
+        assert!(!signal_delivery_owner_is_unique(
+            &shared,
+            &x86.replace(
+                "pub fn signal_user_return(",
+                "process.take_deliverable_after_suspend(); pub fn signal_user_return(",
+            ),
+        ));
+        assert!(!signal_delivery_owner_is_unique(
+            &shared,
+            &x86.replace(
+                "carrick_el1::personality::signal_delivery::deliver_signal_on_syscall_return(",
+                "bypass_shared_signal_delivery(",
+            ),
+        ));
+    }
 }
