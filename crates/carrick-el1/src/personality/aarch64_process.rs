@@ -32,6 +32,7 @@ use core::sync::atomic::Ordering;
 
 use super::common_entry;
 use super::mm_portal::{LinuxForkPolicy, NativeForkPortal, UnpublishedEl1Child};
+use super::native_fork_refusal::{NativeForkStage, refused};
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 use super::native_process_runtime::NativeResume;
 use super::native_process_runtime::{
@@ -819,15 +820,6 @@ impl<'a, X: ForkStockCrossing> Aarch64NativeProcessService<'a, X> {
     }
 }
 
-#[allow(dead_code)]
-fn err(_loc: &'static str, _e: impl core::fmt::Debug) -> NativeProcessError {
-    NativeProcessError::Fault
-}
-
-fn error(e: impl core::fmt::Debug) -> NativeProcessError {
-    err("unspecified", e)
-}
-
 impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     for Aarch64NativeProcessService<'a, X>
 {
@@ -881,7 +873,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         };
         let capacity = owner
             .fork_mapping_count(mm, self.worker())
-            .map_err(|e| err("fork_mapping_count", e))?;
+            .map_err(|e| refused(NativeForkStage::MappingCount, e))?;
         let mut mappings = Vec::new();
         mappings
             .try_reserve_exact(capacity)
@@ -893,7 +885,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 .ok_or(NativeProcessError::Stale)?;
             let access = owner
                 .space_access(self.worker())
-                .map_err(|e| err("space_access", e))?;
+                .map_err(|e| refused(NativeForkStage::SpaceAccess, e))?;
             let _editor = access
                 .try_begin_edit(
                     index,
@@ -902,7 +894,9 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                         .ok_or(NativeProcessError::Stale)?,
                 )
                 .ok_or(NativeProcessError::Busy)?;
-            let mut root = owner.root(mm, self.worker()).map_err(|e| err("root", e))?;
+            let mut root = owner
+                .root(mm, self.worker())
+                .map_err(|e| refused(NativeForkStage::ParentRoot, e))?;
             if !root.fork_ready() {
                 return Err(NativeProcessError::Busy);
             }
@@ -914,7 +908,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                     mappings.push(mapping);
                 }
             })
-            .map_err(|e| err("observe_mappings", e))?;
+            .map_err(|e| refused(NativeForkStage::ObserveMappings, e))?;
             if full {
                 return Err(NativeProcessError::Exhausted);
             }
@@ -923,7 +917,9 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 mm,
                 incarnation: NonZeroU64::new(root.incarnation().raw())
                     .ok_or(NativeProcessError::Stale)?,
-                sequence: root.next_transfer_sequence().map_err(error)?,
+                sequence: root
+                    .next_transfer_sequence()
+                    .map_err(|e| refused(NativeForkStage::TransferSequence, e))?,
             };
             let mut count = ForkCensus {
                 child: 0,
@@ -949,7 +945,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 0,
                 &mut count,
             )
-            .map_err(|e| err("census_table", e))?;
+            .map_err(|e| refused(NativeForkStage::Census, e))?;
             (operation, root.generation(), count, root.layout())
         };
         let request = ForkStockRequest {
@@ -996,7 +992,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             .publish(index.index(), loan.request.child_mm, layout)
         {
             owner.spaces.free(index);
-            return Err(err("roots.publish", e));
+            return Err(refused(NativeForkStage::PublishRoot, e));
         }
         let scratch = ForkScratch::bounded(
             loan.request,
@@ -1006,12 +1002,12 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             count.live,
             count.custody,
         )
-        .map_err(|e| err("ForkScratch::bounded", e))?;
+        .map_err(|e| refused(NativeForkStage::Scratch, e))?;
         let plan = match owner.prepare_fork(loan.request, scratch, &*live, self.worker()) {
             Ok(plan) => plan,
             Err(e) => {
                 owner.spaces.free(index);
-                return Err(err("prepare_fork", e));
+                return Err(refused(NativeForkStage::Prepare, e));
             }
         };
         let mut custody = Vec::new();
@@ -1023,7 +1019,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             Ok(child) => child,
             Err(e) => {
                 owner.spaces.free(index);
-                return Err(err("publish_fork", e));
+                return Err(refused(NativeForkStage::Publish, e));
             }
         };
         let completion = child.completion();
@@ -1068,9 +1064,12 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         &mut self,
         mut prepared: Self::PreparedMm,
     ) -> Result<Self::Born, (NativeProcessError, Self::PreparedMm)> {
-        let result = self
-            .portal()
-            .and_then(|owner| prepared.child.commit(&owner, self.worker()).map_err(error));
+        let result = self.portal().and_then(|owner| {
+            prepared
+                .child
+                .commit(&owner, self.worker())
+                .map_err(|e| refused(NativeForkStage::Commit, e))
+        });
         match result {
             Ok(_) => Ok(Box::new(Born { prepared })),
             Err(e) => Err((e, prepared)),
@@ -1085,7 +1084,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             prepared
                 .child
                 .abort(&owner, &*prepared.words, self.worker())
-                .map_err(|e| err("child.abort", e))
+                .map_err(|e| refused(NativeForkStage::Abort, e))
         });
         let mut settlement = carrick_el1_abi::ForkStockSettlement::abort(prepared.loan);
         let _ = self.crossing.cross_fork_stock(
@@ -1132,7 +1131,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         };
         let access = match owner.space_access(self.worker()) {
             Ok(access) => access,
-            Err(e) => return Err((error(e), born)),
+            Err(e) => return Err((refused(NativeForkStage::OpenChildSpace, e), born)),
         };
         access.open(index);
         Ok(())

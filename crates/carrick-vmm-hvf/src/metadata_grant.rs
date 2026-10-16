@@ -1578,6 +1578,15 @@ pub(crate) fn handle_metadata_grant_trap(
             .get_sys_reg(applevisor::vcpu::SysReg::TTBR0_EL1)
             .map_err(|e| TrapError::Hypervisor(format!("read COW supply root: {e}")))?;
         service_native_cow_supply(custody, region, cpu, ttbr0, arg1, arg2)?
+    } else if op == carrick_el1_abi::GRANT_OP_FORK_REFUSAL {
+        service_fork_refusal(
+            custody,
+            generation,
+            cpu,
+            arg1,
+            vcpu.get_sys_reg(applevisor::vcpu::SysReg::TTBR0_EL1)
+                .map_err(|e| TrapError::Hypervisor(format!("read diagnostic root: {e}")))?,
+        )
     } else if matches!(
         op,
         carrick_el1_abi::GRANT_OP_CHILD_RETIRE | carrick_el1_abi::GRANT_OP_WAIT_CHANNEL_WAKE
@@ -1598,6 +1607,61 @@ pub(crate) fn handle_metadata_grant_trap(
     vcpu.set_reg(Reg::X3, result[3])
         .map_err(|e| TrapError::Hypervisor(format!("set X3: {e}")))?;
     classify_metadata_trap(op, result)
+}
+
+/// Observe an authenticated stopped execution without granting or editing it.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn service_fork_refusal(
+    custody: &crate::trap::CarrierVmCustody,
+    generation: Option<crate::trap::CarrierVmGeneration>,
+    cpu: carrick_guest_arch::CpuId,
+    address: u64,
+    ttbr0: u64,
+) -> [u64; 4] {
+    let refused = [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    let Some(slot) = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize) else {
+        return refused;
+    };
+    let start =
+        carrick_el1_abi::EL1_STACKS_BASE + u64::from(slot.raw()) * carrick_el1_abi::EL1_STACK_SIZE;
+    if !request_has_live_vm(custody, generation)
+        || address < start
+        || address
+            .checked_add(core::mem::size_of::<carrick_el1_abi::NativeForkDiagnostic>() as u64)
+            .is_none_or(|end| end > start + carrick_el1_abi::EL1_STACK_SIZE)
+    {
+        return refused;
+    }
+    let Some(zone) = carrick_el1_abi::zone_tables() else {
+        return refused;
+    };
+    let task_address = carrick_el1_abi::EL1_CURRENT_TASKS_BASE
+        + u64::from(cpu.raw()) * core::mem::size_of::<carrick_el1_abi::CurrentTask>() as u64;
+    let Ok(task) = crate::fork_stock::ForkStockHostCustody::resolve_record_ptr::<
+        carrick_el1_abi::CurrentTask,
+    >(custody, task_address) else {
+        return refused;
+    };
+    // SAFETY: the stopped CPU retains the resolved fixed CurrentTask record.
+    let Some(execution) = root_execution(cpu, unsafe { &*task }, zone, ttbr0) else {
+        return refused;
+    };
+    let Ok(record) = crate::fork_stock::ForkStockHostCustody::resolve_record_ptr::<
+        carrick_el1_abi::NativeForkDiagnostic,
+    >(custody, address) else {
+        return refused;
+    };
+    // SAFETY: range and alignment are checked; this synchronous crossing retains the stack.
+    let Some(message) = (unsafe { &*record }).message() else {
+        return refused;
+    };
+    carrick_observability::probes::el1_native_fork_refusal(
+        cpu.raw(),
+        execution.binding.mm.raw(),
+        execution.context.root.address().raw(),
+        message,
+    );
+    [METADATA_GRANT_SUCCESS, 0, 0, 0]
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
