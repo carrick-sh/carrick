@@ -233,6 +233,26 @@ mod tests {
     }
 
     #[test]
+    fn arm_restored_public_frame_replaces_gprs_and_fpsimd_in_live_context() {
+        let mut context = carrick_sched_core::ThreadCtx::ZERO;
+        let mut frame = TrapFrame::default();
+        frame.x[0] = 0x1234_5678;
+        frame.elr = 0x4000;
+        frame.spsr = 0;
+        let mut fp = LinuxFpsimdContext::empty();
+        fp.vregs[7] = 0x1234_5678_9abc_def0;
+        fp.fpsr = 0x55;
+        fp.fpcr = 0xaa;
+        apply_restored_context(&mut context, &frame, &fp, 0x8000);
+        assert_eq!(context.x[0], frame.x[0]);
+        assert_eq!(context.pc, frame.elr);
+        assert_eq!(context.sp_el0, 0x8000);
+        assert_eq!(context.v[7], fp.vregs[7]);
+        assert_eq!(context.fpsr, fp.fpsr as u64);
+        assert_eq!(context.fpcr, fp.fpcr as u64);
+    }
+
+    #[test]
     fn sigreturn_frame_allocation_failure_is_a_frame_error() {
         assert!(matches!(
             frame_copy_buffer(usize::MAX),
