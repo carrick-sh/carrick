@@ -43,7 +43,7 @@
     },
     {
       "crate_name": "carrick-x86-cpl0",
-      "ceiling": 11
+      "ceiling": 10
     },
     {
       "crate_name": "carrick-xtask",
