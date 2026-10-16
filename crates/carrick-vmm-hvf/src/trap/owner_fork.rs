@@ -24,6 +24,14 @@ pub struct ForkPhysicalRetention {
     selected: PortalForkCustody,
     _frames: Vec<(CarrierStage2Pin, Arc<GlobalFrameSharedMapping>)>,
 }
+impl core::fmt::Debug for ForkPhysicalRetention {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("ForkPhysicalRetention")
+            .field("selected", &self.selected)
+            .finish_non_exhaustive()
+    }
+}
 impl ForkPhysicalRetention {
     pub fn selected(&self) -> PortalForkCustody {
         self.selected

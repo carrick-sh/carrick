@@ -1107,6 +1107,7 @@ impl Cpl0HostCustody {
                 &mut NoTableLedger,
                 execution,
                 &mut record,
+                (),
                 |pages| tables_resolve(memory, pages),
                 |pages| tables_are_zero(memory, pages),
                 |lifecycle| window.clear(lifecycle),
