@@ -2292,7 +2292,7 @@ where
     pub(super) fn complete_returned(
         &mut self,
         engine: &mut E,
-        reporter: &CompatReporter,
+        kernel: &KernelState,
         value: i64,
     ) -> Result<i64, RuntimeError> {
         if !matches!(
@@ -2307,6 +2307,9 @@ where
             context.thread().control_slot().native_signal_owner()
                 && carrick_el1_abi::Lifecycle::gate(&*context.lifecycle_page()).serves_ring()
         }) {
+            // A synchronous host wait can observe the bridge after the poll
+            // boundary. Publish its event before the native return checkpoint.
+            self.publish_external_ingress(kernel)?;
             engine.complete_native_signal_return(
                 value,
                 self.native_restart_eligible.take().unwrap_or(true),
@@ -2321,17 +2324,17 @@ where
         ) else {
             unreachable!("guest completion ownership checked before engine completion")
         };
-        completion.publish_return(reporter, value);
+        completion.publish_return(&kernel.reporter, value);
         Ok(value)
     }
 
     pub(super) fn complete_errno(
         &mut self,
         engine: &mut E,
-        reporter: &CompatReporter,
+        kernel: &KernelState,
         errno: LinuxErrno,
     ) -> Result<i64, RuntimeError> {
-        self.complete_returned(engine, reporter, errno.guest_retval())
+        self.complete_returned(engine, kernel, errno.guest_retval())
     }
 
     pub(super) fn retire_syscall(&mut self) -> Result<(), RuntimeError> {

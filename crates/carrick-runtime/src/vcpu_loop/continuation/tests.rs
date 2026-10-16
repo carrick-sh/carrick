@@ -730,7 +730,147 @@ fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
             }
         );
         assert_eq!(carrick_signal_linux::take_pending_for(tid), 0);
+        if eligible {
+            // A broadcast wake can interrupt another forwarded waiter after
+            // the only process event has been consumed. The empty native
+            // checkpoint must replay its call without entering a handler.
+            let mut second = carrick_el1_abi::TrapFrame::default();
+            second.esr = 0xfffe;
+            second.elr = 0x500004;
+            second.far = 0x4321;
+            second.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
+            second.x[8] = nr;
+            let (drained, route) = fixture.drain_and_deliver(&queue, &mut second);
+            assert_eq!((drained, route), (0, None));
+            assert_eq!((second.elr, second.x[0]), (0x500000, 0x4321));
+            assert!(take_signal_copies().is_empty());
+        }
     }
+}
+
+#[test]
+fn serial_host_two_live_reads_share_one_process_signal_wake() {
+    use carrick_core_abi::{
+        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
+    };
+    use carrick_el1::personality::native_process_runtime::host_test_support::{
+        NativeSignalFixture, take_signal_copies,
+    };
+
+    let (kernel, leader) = bootstrap(153_697);
+    let worker = kernel
+        .reserve_thread_clone(
+            &leader,
+            ClonePlan::from_flags(
+                LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap()
+        .prepare(ThreadId::synthetic_for_tests(153_698))
+        .unwrap()
+        .commit()
+        .unwrap()
+        .into_context()
+        .unwrap();
+    assert_eq!(leader.task().key(), worker.task().key());
+    let mut continuations = Vec::new();
+    let mut fixtures = Vec::new();
+    for (context, marker) in [(&leader, 0x731), (&worker, 0x732)] {
+        let generation = publish(context, marker);
+        let binding = ExecutionBinding {
+            task: EntryTaskKey::from_raw(context.thread().key().tid.raw() as u64),
+            generation: SnapshotGeneration::from_raw(context.task().key().serial.raw()),
+            mm: EntryMmKey::from_raw(context.shared().mm().id().raw()),
+            thread_generation: EntryThreadGeneration::from_raw(context.thread().key().serial.raw()),
+        };
+        let fixture = NativeSignalFixture::new(
+            binding,
+            EntryTaskKey::from_raw(context.task().key().id.raw() as u64),
+        );
+        let control = context.thread().control_slot();
+        control.bind_zone_record(fixture.record());
+        let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
+        custody.commit_registration();
+        custody.commit_native_signal_owner();
+        continuations.push(
+            BlockedContinuation::from_dispatch_outcome(
+                DispatchOutcome::WaitOnFds {
+                    fds: WaitFds::empty(),
+                    timeout: None,
+                    sig_mask: WaitSigMask::NONE,
+                    completion: FdWaitCompletion::Fd { on_timeout: 0 },
+                },
+                ContinuationCapture::new(
+                    context,
+                    generation,
+                    SyscallRequest::new(63, SyscallArgs([0x1234, 0, 0, 0, 0, 0])),
+                    RestartClass::RestartSyscall,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        fixtures.push(fixture);
+    }
+    fixtures[0].install_sigint_handler(true);
+    fixtures[1].install_sigint_handler(true);
+    carrick_signal_linux::publish_process_signal(2);
+    for (context, continuation) in [
+        (&leader, continuations.remove(0)),
+        (&worker, continuations.remove(0)),
+    ] {
+        let event = SignalReadinessProbe::from_continuation(&continuation)
+            .event()
+            .expect("both host reads observe the broadcast wake");
+        assert!(matches!(event, ContinuationEvent::Signal));
+        let completed = continuation.resume(event, context).unwrap();
+        assert!(matches!(
+            completed.completion,
+            ContinuationCompletion::Errno(carrick_syscall_abi::LINUX_EINTR)
+        ));
+    }
+    let queue = carrick_el1_abi::SharedSignalIngressQueue::new();
+    let mut producer = super::super::signal_ingress_producer::HostSignalIngressProducer::new();
+    assert_eq!(
+        producer
+            .publish(
+                &queue,
+                super::super::signal_ingress_producer::HostIngressTarget::from_context(&leader),
+                carrick_signal_linux::take_pending_event_for,
+            )
+            .unwrap(),
+        super::super::signal_ingress_producer::HostIngressStep::Published
+    );
+    assert_eq!(
+        producer
+            .publish(
+                &queue,
+                super::super::signal_ingress_producer::HostIngressTarget::from_context(&worker),
+                carrick_signal_linux::take_pending_event_for,
+            )
+            .unwrap(),
+        super::super::signal_ingress_producer::HostIngressStep::Idle
+    );
+    let mut delivered = carrick_el1_abi::TrapFrame::default();
+    delivered.esr = 0xfffe;
+    delivered.elr = 0x400004;
+    delivered.far = 0x1234;
+    delivered.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
+    delivered.x[8] = 63;
+    assert_eq!(fixtures[0].drain_and_deliver(&queue, &mut delivered).0, 1);
+    assert_eq!(delivered.elr, 0x7000);
+    assert_eq!(take_signal_copies().len(), 1);
+    let mut other = carrick_el1_abi::TrapFrame::default();
+    other.esr = 0xfffe;
+    other.elr = 0x500004;
+    other.far = 0x1234;
+    other.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
+    other.x[8] = 63;
+    assert_eq!(fixtures[1].drain_and_deliver(&queue, &mut other).0, 0);
+    assert_eq!((other.elr, other.x[0]), (0x500000, 0x1234));
+    assert!(take_signal_copies().is_empty());
 }
 
 #[test]

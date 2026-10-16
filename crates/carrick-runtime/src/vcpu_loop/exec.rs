@@ -1320,7 +1320,7 @@ where
     ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
         match origin.0 {
             super::ExecCompletionOrigin::GuestSyscall => {
-                self.complete_errno(engine, &kernel.reporter, errno)?;
+                self.complete_errno(engine, kernel, errno)?;
             }
             super::ExecCompletionOrigin::InternalControl => {
                 self.finish_internal_control_exec()?;
@@ -2763,7 +2763,7 @@ pub(crate) mod tests {
                         assert_eq!(errno.guest_retval(), -9);
                         std::hint::black_box(
                             state
-                                .complete_errno(&mut engine, &kernel.reporter, errno)
+                                .complete_errno(&mut engine, &kernel, errno)
                                 .expect("production completion"),
                         );
                         if with_signals {
@@ -4429,7 +4429,7 @@ pub(crate) mod tests {
                     .unwrap()
             } else {
                 state
-                    .complete_returned(&mut engine, &kernel.reporter, value)
+                    .complete_returned(&mut engine, &kernel, value)
                     .unwrap()
             };
 
@@ -4441,12 +4441,63 @@ pub(crate) mod tests {
             assert_eq!(kernel.reporter.snapshot().summary.syscall_returns_ok, 1);
             assert!(
                 state
-                    .complete_returned(&mut engine, &kernel.reporter, value)
+                    .complete_returned(&mut engine, &kernel, value)
                     .is_err(),
                 "{case} completion token must be single-use"
             );
             assert_eq!(engine.completed_syscalls, vec![value], "{case}");
         }
+    }
+
+    #[test]
+    fn serial_host_synchronous_signal_return_publishes_bridge_before_native_checkpoint() {
+        struct IngressRegion(Box<carrick_test_support::TestEl1Region>);
+        impl Drop for IngressRegion {
+            fn drop(&mut self) {
+                assert!(carrick_el1_abi::clear_el1_region_host_ptr_if(
+                    self.0.as_ptr() as usize
+                ));
+            }
+        }
+        let mut region = IngressRegion(carrick_test_support::TestEl1Region::zeroed());
+        let ptr = unsafe {
+            region
+                .0
+                .as_mut_ptr()
+                .add(carrick_el1_abi::EL1_SIGNAL_INGRESS_OFFSET as usize)
+                .cast::<carrick_el1_abi::SharedSignalIngressQueue>()
+        };
+        // SAFETY: TestEl1Region provides ABI alignment and exclusively owns
+        // the reservation until the pointer is withdrawn by the guard.
+        unsafe { carrick_el1_abi::SharedSignalIngressQueue::initialize_at(ptr) };
+        carrick_el1_abi::record_el1_region_host_ptr(region.0.as_ptr() as usize);
+
+        let (kernel, context, mut state) =
+            typed_completion_fixture(72_424, SyscallDispatcher::new());
+        let control = context.thread().control_slot();
+        control.bind_zone_record(carrick_sched_core::RecordRef {
+            id: carrick_sched_core::RecordId::from_raw(4).unwrap(),
+            incarnation: 9,
+        });
+        let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
+        custody.commit_registration();
+        custody.commit_native_signal_owner();
+        install_typed_guest_completion(&kernel, &context, &mut state);
+        kernel.dispatcher.host_signal.publish_process_signal(2);
+        let mut engine = CrashCaptureTestEngine::default();
+        state
+            .complete_returned(
+                &mut engine,
+                &kernel,
+                carrick_syscall_abi::LINUX_EINTR.guest_retval(),
+            )
+            .unwrap();
+        let event = carrick_el1_abi::signal_ingress_host()
+            .unwrap()
+            .take()
+            .expect("synchronous host wait must publish before native checkpoint");
+        assert_eq!(event.signal().number(), 2);
+        assert_eq!(event.scope(), carrick_el1_abi::ExternalSignalScope::Process);
     }
 
     #[test]
@@ -7288,7 +7339,7 @@ pub(crate) mod tests {
                 );
                 assert_eq!(task.linux.orig_arg0.load(Ordering::Relaxed), args.0[0]);
                 state
-                    .complete_returned(&mut engine, &kernel.reporter, frame.x[0] as i64)
+                    .complete_returned(&mut engine, &kernel, frame.x[0] as i64)
                     .unwrap();
             }
             let returns: Vec<_> = audit
@@ -7315,7 +7366,7 @@ pub(crate) mod tests {
             assert_eq!(task.linux.take_served_boundary(), None);
             assert!(
                 state
-                    .complete_returned(&mut engine, &kernel.reporter, value)
+                    .complete_returned(&mut engine, &kernel, value)
                     .is_err()
             );
             assert_eq!(

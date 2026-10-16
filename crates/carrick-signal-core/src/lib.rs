@@ -45,6 +45,16 @@ pub const fn is_restartable_syscall(nr: u64) -> bool {
     )
 }
 
+/// The native forwarded-call owner has already excluded socket receive
+/// deadlines before it marks a return restart eligible. The carrier does not
+/// have that fd-specific fact, so its shared predicate excludes these calls.
+pub const fn is_native_restartable_syscall(nr: u64) -> bool {
+    matches!(
+        wait::classify_syscall_restart(nr, wait::SocketWaitTimeout::Untimed),
+        wait::RestartClass::IfSaRestart
+    )
+}
+
 use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicU64, Ordering};
 
