@@ -659,7 +659,7 @@ fn kvm_lifecycle_window_cycles_exceed_stock_with_cleared_records() {
 fn lifecycle_window_clear_refuses_graph_referenced_control_and_defers_reclaim() {
     let mut bytes = MetadataBytes::new();
     let window = bytes.window();
-    let mut stock = ForkStock::new(CARRIER, 0x1_0000_0000, UntaggedRoots);
+    let mut stock = ForkStock::new(CARRIER, None, UntaggedRoots);
     stock
         .install(
             (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
