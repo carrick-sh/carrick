@@ -34,6 +34,9 @@ carrick*:::el1-native-fork-stock-refusal
 carrick*:::trace-witness-exit
 /pid == $target/
 { printf("NATIVEFORK witness_wait_status=%d\n", (int32_t)arg0); exited=1; exit(0); }
+carrick*:::syscall-return
+/(pid == $target || progenyof($target)) && arg0 == 220/
+{ printf("NATIVEFORK clone_result=%lld\n", (int64_t)arg2); }
 proc:::exit
 /pid == $target/
 { exited=1; exit(0); }
