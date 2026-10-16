@@ -54,8 +54,8 @@ impl<'a> SignalNative<'a> for Native {
             let resume = arm::decode(frame.as_bytes(), UserVa::new(0x40000), true)
                 .map_err(|_| carrick_syscall_abi::LinuxErrno::new(14))?;
             self.accumulator = resume.regs[0];
-            let stack =
-                restored_altstack(resume.stack).ok_or(carrick_syscall_abi::LinuxErrno::new(14))?;
+            let stack = restored_altstack(resume.stack, carrick_guest_arch::GuestIsa::Aarch64)
+                .ok_or(carrick_syscall_abi::LinuxErrno::new(14))?;
             return Ok(RestoredSignalFrame {
                 mask: resume.mask,
                 stack,

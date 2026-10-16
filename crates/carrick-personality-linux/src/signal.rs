@@ -948,6 +948,7 @@ pub struct RestoredSignalFrame {
 /// `SS_ONSTACK` describes the interrupted SP, not a configuration bit.
 pub fn restored_altstack(
     stack: carrick_syscall_abi::LinuxSignalStack,
+    isa: carrick_guest_arch::GuestIsa,
 ) -> Option<crate::abi::thread::AltStack> {
     let flags = stack.ss_flags as u32;
     let on_stack = carrick_syscall_abi::LINUX_SS_ONSTACK as u32;
@@ -962,7 +963,9 @@ pub fn restored_altstack(
     if flags & disabled != 0 {
         return (flags == disabled).then_some(crate::abi::thread::AltStack::DISABLED);
     }
-    if stack.ss_size < 2048 || stack.ss_sp.checked_add(stack.ss_size).is_none() {
+    if stack.ss_size < minimum_signal_stack_size(isa)
+        || stack.ss_sp.checked_add(stack.ss_size).is_none()
+    {
         return None;
     }
     Some(crate::abi::thread::AltStack {

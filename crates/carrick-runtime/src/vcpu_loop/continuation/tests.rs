@@ -548,45 +548,91 @@ fn serial_host_periodic_process_timer_keeps_other_threads_sleep_deadline() {
 
 #[test]
 fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
-    let (_kernel, context) = bootstrap(153_694);
-    let generation = publish(&context, 0x709);
-    let control = context.thread().control_slot();
-    control.bind_zone_record(carrick_sched_core::RecordRef {
-        id: carrick_sched_core::RecordId::from_raw(7).unwrap(),
-        incarnation: 13,
-    });
-    let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
-    custody.commit_registration();
-    custody.commit_native_signal_owner();
-    let continuation = BlockedContinuation::from_dispatch_outcome(
-        DispatchOutcome::WaitOnFds {
-            fds: WaitFds::empty(),
-            timeout: None,
-            sig_mask: WaitSigMask::NONE,
-            completion: FdWaitCompletion::Fd { on_timeout: 0 },
-        },
-        capture(&context, generation),
-    )
-    .expect("forwarded read continuation");
-    let tid = context.thread().key().tid.raw();
-    carrick_signal_linux::publish_pending_for(tid, 2);
-    let event = SignalReadinessProbe::from_continuation(&continuation)
-        .event()
-        .expect("signal wakes forwarded read");
-    assert!(matches!(event, ContinuationEvent::Signal));
-    let queue = carrick_el1_abi::SignalIngressQueue::<2>::new();
-    let mut producer = super::super::signal_ingress_producer::HostSignalIngressProducer::new();
-    let target = super::super::signal_ingress_producer::HostIngressTarget::from_context(&context);
-    assert_eq!(
-        producer
-            .publish(&queue, target, carrick_signal_linux::take_pending_event_for)
-            .unwrap(),
-        super::super::signal_ingress_producer::HostIngressStep::Published
-    );
-    let event = queue.take().unwrap();
-    assert_eq!(event.signal().number(), 2);
-    assert_eq!(event.scope(), carrick_el1_abi::ExternalSignalScope::Thread);
-    assert_eq!(carrick_signal_linux::take_pending_for(tid), 0);
+    use carrick_core_abi::{
+        EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+    };
+    use carrick_el1::personality::native_process_runtime::host_test_support::{
+        NativeSignalFixture, take_signal_copies,
+    };
+    use carrick_personality_linux::signal::arm;
+
+    for (restart, tid_number) in [(false, 153_694), (true, 153_695)] {
+        let (_kernel, context) = bootstrap(tid_number);
+        let generation = publish(&context, 0x709);
+        let control = context.thread().control_slot();
+        let binding = ExecutionBinding {
+            task: EntryTaskKey::from_raw(context.thread().key().tid.raw() as u64),
+            generation: EntryGeneration::from_raw(context.task().key().serial.raw()),
+            mm: EntryMmKey::from_raw(context.shared().mm().id().raw()),
+            thread_generation: EntryThreadGeneration::from_raw(context.thread().key().serial.raw()),
+        };
+        let fixture = NativeSignalFixture::new(
+            binding,
+            EntryTaskKey::from_raw(context.task().key().id.raw() as u64),
+        );
+        control.bind_zone_record(fixture.record());
+        let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
+        custody.commit_registration();
+        custody.commit_native_signal_owner();
+        fixture.install_sigint_handler(restart);
+        let continuation = BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::WaitOnFds {
+                fds: WaitFds::empty(),
+                timeout: None,
+                sig_mask: WaitSigMask::NONE,
+                completion: FdWaitCompletion::Fd { on_timeout: 0 },
+            },
+            capture(&context, generation),
+        )
+        .expect("forwarded read continuation");
+        let tid = context.thread().key().tid.raw();
+        carrick_signal_linux::publish_process_signal(2);
+        let event = SignalReadinessProbe::from_continuation(&continuation)
+            .event()
+            .expect("signal wakes forwarded read");
+        assert!(matches!(event, ContinuationEvent::Signal));
+        let mut interrupted = continuation.resume(event, &context).unwrap();
+        assert!(interrupted.reserved_signal().is_none());
+        assert!(matches!(
+            interrupted.completion,
+            ContinuationCompletion::Errno(carrick_syscall_abi::LINUX_EINTR)
+        ));
+        assert!(interrupted.take_resume_effects().reserved_signal.is_none());
+        let queue = carrick_el1_abi::SharedSignalIngressQueue::new();
+        let mut producer = super::super::signal_ingress_producer::HostSignalIngressProducer::new();
+        let target =
+            super::super::signal_ingress_producer::HostIngressTarget::from_context(&context);
+        assert_eq!(
+            producer
+                .publish(&queue, target, carrick_signal_linux::take_pending_event_for)
+                .unwrap(),
+            super::super::signal_ingress_producer::HostIngressStep::Published
+        );
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.esr = 0xfffe;
+        frame.elr = 0x400004;
+        frame.far = 0x1234;
+        frame.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
+        frame.x[8] = 63; // AArch64 read
+        let (drained, route) = fixture.drain_and_deliver(&queue, &mut frame);
+        assert_eq!(drained, 1);
+        assert_eq!(route, None, "handler delivery continues toward EL0");
+        assert_eq!(frame.elr, 0x7000, "handler must run before return to EL0");
+        let copies = take_signal_copies();
+        assert_eq!(copies.len(), 1);
+        let (sp, bytes) = &copies[0];
+        let saved = arm::decode(bytes, *sp, true).unwrap();
+        assert_eq!(saved.pc.raw(), if restart { 0x400000 } else { 0x400004 });
+        assert_eq!(
+            saved.regs[0],
+            if restart {
+                0x1234
+            } else {
+                carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64
+            }
+        );
+        assert_eq!(carrick_signal_linux::take_pending_for(tid), 0);
+    }
 }
 
 #[test]
