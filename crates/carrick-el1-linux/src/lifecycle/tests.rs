@@ -843,6 +843,59 @@ fn sigprocmask_serves_block_setmask_and_query() {
     assert_eq!(action, Action::ServedWithWork);
 }
 
+/// sigprocmask(2): an oldset EFAULT is reported after the new mask is
+/// installed. The return fault cannot roll back the caller's mask.
+#[test]
+fn sigprocmask_oldset_fault_keeps_new_mask() {
+    let mut w = World::new(LifecycleHatches::ON);
+    let set = Box::new(SIGUSR1_BIT);
+    let old = Box::new(0x55_u64);
+    let mut frame = TrapFrame::default();
+    frame.x[..4].copy_from_slice(&[SIG_BLOCK, addr(&*set), addr(&*old), 8]);
+    frame.x[8] = SYS_RT_SIGPROCMASK as u64;
+    frame.slot = SLOT_IDX as u64;
+    let mut user = FaultingUser {
+        deny_out: std::vec![addr(&*old)],
+        ..FaultingUser::default()
+    };
+    assert_eq!(
+        serve_directly(&mut w, &mut frame, &mut user),
+        Some(Action::Served)
+    );
+    assert_eq!(frame.x[0] as i64, -14);
+    assert_eq!(*old, 0x55);
+    assert_eq!(w.venue.leader_slot().blocked(), BlockedMask(SIGUSR1_BIT));
+}
+
+/// sigprocmask(2): the oldset fault does not suppress work newly owed by
+/// unblocking an already pending signal.
+#[test]
+fn sigprocmask_oldset_fault_preserves_pending_signal_work() {
+    let mut w = World::new(LifecycleHatches::ON);
+    let slot = w.venue.leader_slot();
+    slot.init_blocked(BlockedMask(SIGUSR1_BIT));
+    let seen = slot
+        .pending()
+        .post_then_read_blocked(PendingSignals(SIGUSR1_BIT), slot);
+    assert_ne!(seen.0 & SIGUSR1_BIT, 0);
+    let set = Box::new(SIGUSR1_BIT);
+    let old = Box::new(0x55_u64);
+    let mut frame = TrapFrame::default();
+    frame.x[..4].copy_from_slice(&[SIG_UNBLOCK, addr(&*set), addr(&*old), 8]);
+    frame.x[8] = SYS_RT_SIGPROCMASK as u64;
+    frame.slot = SLOT_IDX as u64;
+    let mut user = FaultingUser {
+        deny_out: std::vec![addr(&*old)],
+        ..FaultingUser::default()
+    };
+    assert_eq!(
+        serve_directly(&mut w, &mut frame, &mut user),
+        Some(Action::ServedWithWork)
+    );
+    assert_eq!(frame.x[0] as i64, -14);
+    assert_eq!(w.venue.leader_slot().blocked(), BlockedMask(0));
+}
+
 #[test]
 fn sigprocmask_serves_errors_aliases_and_refuses_closed_services() {
     let mut set = Box::new(SIGUSR1_BIT);
@@ -1078,15 +1131,15 @@ fn sigaltstack_serves_off_the_alternate_stack() {
     // Linux error numbers stay in ring.
     for (bad, errno) in [
         (stack_t(0x20_0000, 0, 1024), -12),
-        (stack_t(0x20_0000, 1, 0x4000), -22),
-        (stack_t(0x20_0000, 1, 1024), -22),
+        (stack_t(0x20_0000, 4, 0x4000), -22),
+        (stack_t(0x20_0000, 4, 1024), -22),
     ] {
         let bad = Box::new(bad);
         let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*bad), 0]);
         assert_eq!(action, Action::Served);
         assert_eq!(frame.x[0] as i64, errno);
     }
-    let invalid = Box::new(stack_t(0x20_0000, 1, 1024));
+    let invalid = Box::new(stack_t(0x20_0000, 4, 1024));
     let bad_old = Box::new([0x55; 24]);
     let mut frame = TrapFrame::default();
     frame.x[..2].copy_from_slice(&[addr(&*invalid), addr(&*bad_old)]);
@@ -1151,6 +1204,63 @@ fn sigaltstack_serves_off_the_alternate_stack() {
     assert_eq!(action, Action::Served);
     assert_eq!(*old, *autodisarm);
     assert_eq!(w.served(SYS_SIGALTSTACK), 12);
+}
+
+/// sigaltstack(2), LTP sigaltstack02: arm64 requires 5120 bytes and returns
+/// ENOMEM one byte below the UAPI minimum.
+#[test]
+fn arm_sigaltstack_minimum_is_5120() {
+    let mut w = World::new(LifecycleHatches::ON);
+    for (size, expected) in [(5119, -12), (5120, 0)] {
+        let stack = Box::new(stack_t(0x10_0000, 0, size));
+        let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*stack), 0]);
+        assert_eq!(action, Action::Served);
+        assert_eq!(frame.x[0] as i64, expected, "size={size}");
+    }
+    assert_eq!(w.venue.leader_slot().read_altstack().size, 5120);
+}
+
+/// sigaltstack(2): Linux treats input SS_ONSTACK as zero, and ignores the
+/// other flags when SS_DISABLE is present.
+#[test]
+fn arm_sigaltstack_accepts_reported_and_disable_autodisarm_flags() {
+    let mut w = World::new(LifecycleHatches::ON);
+    let onstack = Box::new(stack_t(0x10_0000, 1, 5120));
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*onstack), 0]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(frame.x[0] as i64, 0);
+    assert_eq!(w.venue.leader_slot().read_altstack().flags, 0);
+    let disabled = Box::new(stack_t(
+        0,
+        SS_DISABLE | carrick_syscall_abi::LINUX_SS_AUTODISARM as u32,
+        0,
+    ));
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*disabled), 0]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(frame.x[0] as i64, 0);
+    assert!(w.venue.leader_slot().read_altstack().is_disabled());
+}
+
+/// sigaltstack(2): the downward-growing stack includes its initial top SP,
+/// while its base is already below the active stack.
+#[test]
+fn arm_sigaltstack_onstack_boundaries_use_open_base_closed_top() {
+    let mut w = World::new(LifecycleHatches::ON);
+    let stack = Box::new(stack_t(0x10_0000, 0, 5120));
+    let old = Box::new([0u8; 24]);
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*stack), 0]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(frame.x[0] as i64, 0);
+    w.cpu.regs.sp_el0 = 0x10_0000;
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[0, addr(&*old)]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(frame.x[0] as i64, 0);
+    assert_eq!(*old, stack_t(0x10_0000, 0, 5120));
+    w.cpu.regs.sp_el0 = 0x10_0000 + 5120;
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[0, addr(&*old)]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(frame.x[0] as i64, 0);
+    assert_eq!(*old, stack_t(0x10_0000, 1, 5120));
 }
 
 #[test]
