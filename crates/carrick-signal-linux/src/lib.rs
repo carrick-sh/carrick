@@ -38,7 +38,7 @@ pub use carrick_signal_core::pending_bit;
 use carrick_signal_core::{PendingSet, SignalSet};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU8, AtomicU64, Ordering};
 
 /// "No signal pending" sentinel. Chosen as `0` because Linux's
 /// `kill(pid, 0)` is documented as the null-signal probe; no real
@@ -53,9 +53,24 @@ pub enum PendingSignalScope {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingTimerInfo {
+    pub id: i32,
+    pub overrun: i32,
+    pub value: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingSignalOrigin {
+    Host,
+    IntervalTimer,
+    PosixTimer(PendingTimerInfo),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PendingSignalEvent {
     pub signum: i32,
     pub scope: PendingSignalScope,
+    pub origin: PendingSignalOrigin,
 }
 
 /// `THREAD_PENDING` bit for `signum` (bit `signum-1`), or 0 if out of range.
@@ -100,6 +115,31 @@ fn unmaskable() -> SignalSet {
 /// Same-signum repeats still coalesce (standard-signal semantics); RT-signal
 /// queue depth lives in the dispatcher's `rt_pending_counts`.
 static PROC_PENDING: PendingSet = PendingSet::new();
+// One atomic origin per standard signal. A 0 -> origin CAS selects the first
+// publisher; the bitmask remains the async-signal-safe wake/selection index.
+// The consumer clears the bit before clearing the origin, so a concurrent
+// publication while the old event is still pending coalesces into that event.
+const ORIGIN_EMPTY: u8 = 0;
+const ORIGIN_HOST: u8 = 1;
+const ORIGIN_ITIMER: u8 = 2;
+const ORIGIN_POSIX: u8 = 3;
+const ORIGIN_WRITING: u8 = 4;
+static PROC_ORIGIN: [AtomicU8; 64] = [const { AtomicU8::new(ORIGIN_EMPTY) }; 64];
+struct AtomicTimerInfo {
+    id: AtomicI32,
+    overrun: AtomicI32,
+    value: AtomicI64,
+}
+impl AtomicTimerInfo {
+    const fn new() -> Self {
+        Self {
+            id: AtomicI32::new(0),
+            overrun: AtomicI32::new(0),
+            value: AtomicI64::new(0),
+        }
+    }
+}
+static PROC_TIMER_INFO: [AtomicTimerInfo; 64] = [const { AtomicTimerInfo::new() }; 64];
 
 /// Thread-directed pending signals, keyed by guest tid. A process-directed
 /// signal (host `SIGINT`, `kill(pid)`) goes into the global `PROC_PENDING` mask
@@ -116,6 +156,7 @@ static PROC_PENDING: PendingSet = PendingSet::new();
 /// semantics); RT-signal queue depth lives in the dispatcher's
 /// `rt_pending_counts`, not here.
 static THREAD_PENDING: Mutex<Option<HashMap<i32, u64>>> = Mutex::new(None);
+static THREAD_TIMER_INFO: Mutex<Option<HashMap<(i32, i32), PendingTimerInfo>>> = Mutex::new(None);
 
 /// Lock-free MAY-HAVE-PENDING hint over `THREAD_PENDING`, bit `tid % 64`. The
 /// delivery cycle runs on EVERY syscall return / kick / sigreturn of every
@@ -217,6 +258,26 @@ pub fn publish_pending_for(tid: i32, signum: i32) {
     }
 }
 
+pub fn publish_pending_timer_for(tid: i32, signum: i32, info: PendingTimerInfo) {
+    let bit = thread_pending_bit(signum);
+    if bit == 0 {
+        return;
+    }
+    let mut guard = lock_thread_pending();
+    let map = guard.get_or_insert_with(HashMap::new);
+    let pending = map.entry(tid).or_insert(0);
+    if *pending & bit != 0 {
+        return;
+    }
+    THREAD_TIMER_INFO
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_with(HashMap::new)
+        .insert((tid, signum), info);
+    *pending |= bit;
+    THREAD_PENDING_TID_HINT.fetch_or(tid_hint_bit(tid), Ordering::SeqCst);
+}
+
 /// Pop the lowest pending process-directed signum from `PROC_PENDING` that is
 /// also in `wait_set` (pass `SigSet::EMPTY.complement()` to accept any).
 /// Returns `0` if none. `take_pending_for` can run concurrently on every vCPU
@@ -225,10 +286,30 @@ pub fn publish_pending_for(tid: i32, signum: i32) {
 /// observe and deliver the same pending bit at most once total. The store is a
 /// raw `AtomicU64` in wire form (bit `signum-1`); the typed set converts at the
 /// atomic load/CAS boundary.
+fn take_proc_pending_event_in(wait_set: SigSet) -> Option<PendingSignalEvent> {
+    let signum = PROC_PENDING.take(SignalSet::from_bits(wait_set.raw()))?;
+    let index = (signum - 1) as usize;
+    let origin = PROC_ORIGIN[index].load(Ordering::SeqCst);
+    let payload = PendingTimerInfo {
+        id: PROC_TIMER_INFO[index].id.load(Ordering::SeqCst),
+        overrun: PROC_TIMER_INFO[index].overrun.load(Ordering::SeqCst),
+        value: PROC_TIMER_INFO[index].value.load(Ordering::SeqCst),
+    };
+    PROC_ORIGIN[index].store(ORIGIN_EMPTY, Ordering::SeqCst);
+    let origin = match origin {
+        ORIGIN_ITIMER => PendingSignalOrigin::IntervalTimer,
+        ORIGIN_POSIX => PendingSignalOrigin::PosixTimer(payload),
+        _ => PendingSignalOrigin::Host,
+    };
+    Some(PendingSignalEvent {
+        signum,
+        scope: PendingSignalScope::Process,
+        origin,
+    })
+}
+
 fn take_proc_pending_in(wait_set: SigSet) -> i32 {
-    PROC_PENDING
-        .take(SignalSet::from_bits(wait_set.raw()))
-        .unwrap_or(NO_PENDING_SIGNAL)
+    take_proc_pending_event_in(wait_set).map_or(NO_PENDING_SIGNAL, |event| event.signum)
 }
 
 /// Drain the signal deliverable to `tid`: a thread-directed one for this tid
@@ -258,17 +339,19 @@ pub fn take_pending_event_for(tid: i32) -> Option<PendingSignalEvent> {
                 map.remove(&tid);
                 recompute_tid_hint(&guard);
             }
+            let timer = THREAD_TIMER_INFO
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+                .and_then(|map| map.remove(&(tid, signum)));
             return Some(PendingSignalEvent {
                 signum,
                 scope: PendingSignalScope::Thread,
+                origin: timer.map_or(PendingSignalOrigin::Host, PendingSignalOrigin::PosixTimer),
             });
         }
     }
-    let signum = take_proc_pending_in(SigSet::EMPTY.complement());
-    (signum != NO_PENDING_SIGNAL).then_some(PendingSignalEvent {
-        signum,
-        scope: PendingSignalScope::Process,
-    })
+    take_proc_pending_event_in(SigSet::EMPTY.complement())
 }
 
 /// Drain a signal pending for `tid` only if it intersects `wait_set`. Used by
@@ -293,6 +376,11 @@ pub fn take_pending_in_for(tid: i32, wait_set: SigSet) -> i32 {
                     map.remove(&tid);
                     recompute_tid_hint(&guard);
                 }
+                THREAD_TIMER_INFO
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_mut()
+                    .and_then(|map| map.remove(&(tid, signum)));
                 return signum;
             }
         }
@@ -368,7 +456,23 @@ pub fn proc_pending_mask() -> SigSet {
 /// form (bit `signum-1`, from [`pending_bit`]/[`thread_pending_bit`]): this is
 /// the async-signal-safe single-bit store op at the atomic boundary.
 pub fn proc_pending_fetch_or(bit: u64) {
-    PROC_PENDING.publish(SignalSet::from_bits(bit));
+    let mut remaining = bit;
+    while remaining != 0 {
+        let lowest = remaining & remaining.wrapping_neg();
+        let index = lowest.trailing_zeros() as usize;
+        if PROC_ORIGIN[index]
+            .compare_exchange(
+                ORIGIN_EMPTY,
+                ORIGIN_HOST,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            PROC_PENDING.publish(SignalSet::from_bits(lowest));
+        }
+        remaining &= !lowest;
+    }
 }
 
 /// Publish a process-directed `signum` into the pending mask (the pure store
@@ -376,8 +480,47 @@ pub fn proc_pending_fetch_or(bit: u64) {
 pub fn publish_process_signal(signum: i32) {
     let bit = thread_pending_bit(signum);
     if bit != 0 {
-        PROC_PENDING.publish(SignalSet::from_bits(bit));
+        proc_pending_fetch_or(bit);
     }
+}
+
+/// Timer publication keeps source and siginfo together with the pending bit.
+/// Timer callbacks run in normal host context; the async host signal path
+/// above remains lock-free. A previously pending standard signal wins and the
+/// second publication coalesces without overwriting its metadata.
+pub fn publish_process_timer_signal(signum: i32, info: Option<PendingTimerInfo>) {
+    let bit = thread_pending_bit(signum);
+    if bit == 0 {
+        return;
+    }
+    let index = (signum - 1) as usize;
+    if PROC_ORIGIN[index]
+        .compare_exchange(
+            ORIGIN_EMPTY,
+            ORIGIN_WRITING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return;
+    }
+    if let Some(info) = info {
+        PROC_TIMER_INFO[index].id.store(info.id, Ordering::SeqCst);
+        PROC_TIMER_INFO[index]
+            .overrun
+            .store(info.overrun, Ordering::SeqCst);
+        PROC_TIMER_INFO[index]
+            .value
+            .store(info.value, Ordering::SeqCst);
+    }
+    let origin = if info.is_some() {
+        ORIGIN_POSIX
+    } else {
+        ORIGIN_ITIMER
+    };
+    PROC_ORIGIN[index].store(origin, Ordering::SeqCst);
+    PROC_PENDING.publish(SignalSet::from_bits(bit));
 }
 
 /// Take (drain) the lowest process-directed pending signum, or `0` if none.
@@ -388,6 +531,9 @@ pub fn take_process_pending() -> i32 {
 /// Clear the process-directed pending mask (fork / supervisor-fork reinit).
 pub fn clear_proc_pending() {
     PROC_PENDING.clear();
+    for origin in &PROC_ORIGIN {
+        origin.store(ORIGIN_EMPTY, Ordering::SeqCst);
+    }
 }
 
 /// Drop any thread-directed pending entry for `tid` (called when a guest thread
@@ -397,6 +543,13 @@ pub fn forget_thread(tid: i32) {
     let mut guard = lock_thread_pending();
     if let Some(map) = guard.as_mut() {
         map.remove(&tid);
+    }
+    if let Some(map) = THREAD_TIMER_INFO
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+    {
+        map.retain(|(target, _), _| *target != tid);
     }
     recompute_tid_hint(&guard);
 }
@@ -408,6 +561,10 @@ pub fn clear_thread_pending() {
     if let Some(map) = guard.as_mut() {
         map.clear();
     }
+    THREAD_TIMER_INFO
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
     recompute_tid_hint(&guard);
 }
 
@@ -550,6 +707,51 @@ mod tests {
         let m = thread_pending_bit(take_process_pending());
         assert_eq!(m, pending_bit(15).unwrap());
         assert!(!has_process_pending());
+    }
+
+    #[test]
+    fn process_timer_metadata_survives_bridge_dequeue_and_standard_coalescing() {
+        let _lock = lock_test();
+        clear_proc_pending();
+        let timer = PendingTimerInfo {
+            id: 7,
+            overrun: 3,
+            value: 0x1234,
+        };
+        publish_process_timer_signal(14, Some(timer));
+        publish_process_signal(14); // coalesces without replacing SI_TIMER
+        assert_eq!(
+            take_pending_event_for(991),
+            Some(PendingSignalEvent {
+                signum: 14,
+                scope: PendingSignalScope::Process,
+                origin: PendingSignalOrigin::PosixTimer(timer),
+            })
+        );
+        assert_eq!(take_pending_event_for(991), None);
+        publish_process_timer_signal(14, None);
+        assert_eq!(
+            take_pending_event_for(991).unwrap().origin,
+            PendingSignalOrigin::IntervalTimer
+        );
+        clear_proc_pending();
+    }
+
+    #[test]
+    fn thread_timer_metadata_belongs_to_exact_tid() {
+        let _lock = lock_test();
+        let info = PendingTimerInfo {
+            id: 8,
+            overrun: 0,
+            value: 0x5678,
+        };
+        publish_pending_timer_for(987_654, 10, info);
+        assert_eq!(take_pending_event_for(987_655), None);
+        assert_eq!(
+            take_pending_event_for(987_654).unwrap().origin,
+            PendingSignalOrigin::PosixTimer(info)
+        );
+        clear_thread_pending();
     }
 
     /// The NEUTRAL clears the KVM (and HVF) `reset_after_supervisor_fork` runs in

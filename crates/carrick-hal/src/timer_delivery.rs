@@ -66,9 +66,23 @@ pub fn arm_fallback_posix_timer(
         let signum = armed.signum;
         let generation = armed.generation;
         let slot = armed.slot.clone();
+        let timer_slot = slot.clone();
+        let target_tid = armed.target_tid;
+        let value = armed.si_value;
         let kicker = Arc::clone(kicker);
         let on_fire = move || {
-            carrick_signal_linux::publish_process_signal(signum);
+            let info = carrick_signal_linux::PendingTimerInfo {
+                id,
+                overrun: timer_slot
+                    .overruns
+                    .load(std::sync::atomic::Ordering::SeqCst) as i32,
+                value,
+            };
+            if let Some(tid) = target_tid {
+                carrick_signal_linux::publish_pending_timer_for(tid, signum, info);
+            } else {
+                carrick_signal_linux::publish_process_timer_signal(signum, Some(info));
+            }
             kicker.kick_all();
         };
         let cpu_clock = posix_cpu_clock(slot.clock_kind);
