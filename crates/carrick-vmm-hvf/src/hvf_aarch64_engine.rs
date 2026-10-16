@@ -2174,13 +2174,13 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     }
 
     fn native_fork_table_arenas(&self) -> usize {
-        // Eight arenas from the existing pre-mapped carrier table pool, exclusively
-        // reserved by the runtime allocator; no overlapping host allocation.
-        8.min(crate::frame_pool::root_slot_pool_size() / crate::frame_pool::ROOT_SLOT_SIZE)
+        // Bounded stock from the existing runtime table arena allocator.
+        // The physical backing uses the same owners as host-created roots.
+        8
     }
     fn install_native_fork_stock(
         &self,
-        reservation: Arc<dyn carrick_hal::fork_stock::NativeForkTableReservation>,
+        reservation: carrick_hal::fork_stock::NativeForkStockResources,
     ) -> Result<(), TrapError> {
         crate::fork_stock::ForkStockHostCustody::install(
             &self.state.carrier_vm_custody(),

@@ -5295,7 +5295,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
     }
     fn install_native_fork_stock(
         &self,
-        reservation: std::sync::Arc<dyn carrick_hal::fork_stock::NativeForkTableReservation>,
+        reservation: carrick_hal::fork_stock::NativeForkStockResources,
     ) -> Result<(), carrick_hal::TrapError> {
         self.vm.install_native_fork_stock(reservation)
     }
