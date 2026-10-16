@@ -1,6 +1,9 @@
 //! Red-first VM-free tests for [`Aarch64NativeProcessService`] and the shared process owner.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+#[cfg(test)]
+mod native_child_handoff_tests;
+
 use super::aarch64_process::{Aarch64NativeProcessService, ForkStockCrossing};
 #[cfg(test)]
 use super::aarch64_process::{
