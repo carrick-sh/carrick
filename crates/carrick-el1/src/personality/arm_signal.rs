@@ -213,6 +213,13 @@ mod tests {
 
     #[test]
     fn arm_public_signal_frame_roundtrip_has_no_private_magic() {
+        assert_eq!(
+            carrick_personality_linux::dispatch::route_aarch64(139, u64::MAX),
+            carrick_personality_linux::dispatch::Family::Signal(
+                carrick_personality_linux::signal::SignalCall::RtSigreturn
+            ),
+            "native ARM return must stay in-ring, never reach carrier frame restoration"
+        );
         let signal = valid();
         assert_eq!(signal.as_bytes().len(), arm::PUBLIC_FRAME_LEN);
         let mut frame = TrapFrame::default();
