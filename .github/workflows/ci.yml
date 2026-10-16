@@ -38,7 +38,6 @@ jobs:
       heavy: ${{ steps.filter.outputs.heavy }}
       macos: ${{ steps.filter.outputs.macos }}
       workflows: ${{ steps.filter.outputs.workflows }}
-      hardware: ${{ steps.filter.outputs.hardware }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:

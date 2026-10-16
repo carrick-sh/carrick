@@ -162,10 +162,10 @@ fn referenced_docs_and_census_files_in_workspace_flip_to_heavy() {
             CiChangesOutputs {
                 heavy: true,
                 macos: true,
-                workflows: false,
+                workflows: true,
                 hardware: true,
             },
-            "merge_group touching `{referenced}` must set heavy=true, macos=true, hardware=true"
+            "merge_group touching `{referenced}` must set heavy=true, macos=true, workflows=true, hardware=true"
         );
     }
 
@@ -285,16 +285,16 @@ fn scripts_justfile_and_xtask_classify_as_full_heavy_macos_and_hardware() {
             CiChangesOutputs {
                 heavy: true,
                 macos: true,
-                workflows: false,
+                workflows: true,
                 hardware: true,
             },
-            "merge_group touching `{full_path}` must run heavy=true, macos=true, hardware=true"
+            "merge_group touching `{full_path}` must run heavy=true, macos=true, workflows=true, hardware=true"
         );
     }
 }
 
 #[test]
-fn prose_only_pr_and_merge_group_skip_heavy_macos_and_hardware() {
+fn prose_only_pr_skips_heavy_macos_and_hardware_but_merge_group_runs_full() {
     let repo = TempRepo::new(&[
         ("README.md", "updated readme"),
         ("docs/architecture.md", "some docs"),
@@ -308,7 +308,7 @@ fn prose_only_pr_and_merge_group_skip_heavy_macos_and_hardware() {
     );
     assert_eq!(
         repo.run_ci_changes("merge_group", None, None),
-        "heavy=false\nmacos=false\nworkflows=false\nhardware=false\n"
+        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\n"
     );
 }
 
@@ -347,13 +347,13 @@ fn unknown_or_rust_product_path_fails_safe_and_runs_everything() {
     );
     assert_eq!(
         rust_repo.run_ci_changes("merge_group", None, None),
-        "heavy=true\nmacos=true\nworkflows=false\nhardware=true\n"
+        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\n"
     );
 
     let unknown_repo = TempRepo::new(&[("Cargo.lock", "# lockfile\n")]);
     assert_eq!(
         unknown_repo.run_ci_changes("merge_group", None, None),
-        "heavy=true\nmacos=true\nworkflows=false\nhardware=true\n"
+        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\n"
     );
 }
 
@@ -396,11 +396,10 @@ fn cumulative_merge_group_diff_runs_everything_when_ahead_entry_touched_code() {
         base_sha: entry1_sha,
     };
 
-    // With CI_BASE_REF=main, the cumulative diff against main includes Entry 1's code change,
-    // so heavy, macos, and hardware must all be true!
+    // Merge group always runs everything: heavy, macos, workflows, and hardware are all true.
     assert_eq!(
         repo.run_ci_changes("merge_group", None, Some(&main_sha)),
-        "heavy=true\nmacos=true\nworkflows=false\nhardware=true\n"
+        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\n"
     );
 }
 
@@ -456,55 +455,58 @@ fn draft_pr_runs_cheap_linux_checks_and_ci_results_accepts_skipped_heavy_jobs() 
 }
 
 #[test]
-fn docs_only_merge_group_passes_ci_results_when_heavy_and_macos_are_skipped() {
-    let docs_mg_needs = r#"{
+fn merge_group_requires_full_suite_in_ci_results() {
+    let full_mg_needs = r#"{
       "changes": {
         "result": "success",
-        "outputs": { "heavy": "false", "macos": "false", "workflows": "false", "hardware": "false" }
+        "outputs": { "heavy": "true", "macos": "true", "workflows": "true", "hardware": "true" }
       },
-      "actionlint": { "result": "skipped" },
-      "linked-issue": { "result": "success" },
-      "commit-trailers": { "result": "success" },
-      "lint": { "result": "skipped" },
-      "portable": { "result": "skipped" },
-      "linux-doc": { "result": "skipped" },
-      "macos-clippy": { "result": "skipped" },
-      "macos-build": { "result": "skipped" },
-      "macos-unit-a": { "result": "skipped" },
-      "macos-unit-b": { "result": "skipped" },
-      "macos-integration": { "result": "skipped" },
-      "cross-check-freebsd": { "result": "skipped" },
-      "cross-check-netbsd": { "result": "skipped" },
-      "kernel-linux-native": { "result": "skipped" }
-    }"#;
-    assert!(
-        run_ci_results("merge_group", None, docs_mg_needs),
-        "docs-only merge_group must pass ci-results when heavy and macos jobs are skipped"
-    );
-
-    // If heavy is true on merge_group, macos=false must be rejected by ci-results.
-    let inconsistent_mg_needs = r#"{
-      "changes": {
-        "result": "success",
-        "outputs": { "heavy": "true", "macos": "false", "workflows": "false", "hardware": "true" }
-      },
-      "actionlint": { "result": "skipped" },
+      "actionlint": { "result": "success" },
       "linked-issue": { "result": "success" },
       "commit-trailers": { "result": "success" },
       "lint": { "result": "success" },
       "portable": { "result": "success" },
       "linux-doc": { "result": "success" },
-      "macos-clippy": { "result": "skipped" },
-      "macos-build": { "result": "skipped" },
-      "macos-unit-a": { "result": "skipped" },
-      "macos-unit-b": { "result": "skipped" },
-      "macos-integration": { "result": "skipped" },
+      "macos-clippy": { "result": "success" },
+      "macos-build": { "result": "success" },
+      "macos-unit-a": { "result": "success" },
+      "macos-unit-b": { "result": "success" },
+      "macos-integration": { "result": "success" },
+      "cross-check-linux": { "result": "success" },
       "cross-check-freebsd": { "result": "success" },
       "cross-check-netbsd": { "result": "success" },
       "kernel-linux-native": { "result": "success" }
     }"#;
     assert!(
-        !run_ci_results("merge_group", None, inconsistent_mg_needs),
-        "heavy=true merge_group must require macos=true in ci-results"
+        run_ci_results("merge_group", None, full_mg_needs),
+        "full merge_group must pass ci-results"
+    );
+
+    // Any skipped job on merge_group must be rejected by ci-results.
+    let skipped_macos_mg_needs = full_mg_needs.replace(
+        r#""macos-integration": { "result": "success" }"#,
+        r#""macos-integration": { "result": "skipped" }"#,
+    );
+    assert!(
+        !run_ci_results("merge_group", None, &skipped_macos_mg_needs),
+        "skipped macos job on merge_group must fail ci-results"
+    );
+
+    let skipped_heavy_mg_needs = full_mg_needs.replace(
+        r#""portable": { "result": "success" }"#,
+        r#""portable": { "result": "skipped" }"#,
+    );
+    assert!(
+        !run_ci_results("merge_group", None, &skipped_heavy_mg_needs),
+        "skipped heavy job on merge_group must fail ci-results"
+    );
+
+    let docs_mg_needs = full_mg_needs.replace(
+        r#""heavy": "true", "macos": "true""#,
+        r#""heavy": "false", "macos": "false""#,
+    );
+    assert!(
+        !run_ci_results("merge_group", None, &docs_mg_needs),
+        "docs-only merge_group must fail ci-results"
     );
 }

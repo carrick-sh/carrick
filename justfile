@@ -1244,17 +1244,14 @@ ci-results:
       .changes.result == "success" and
       (length > 1) and
       (. as $root |
-       if $event == "pull_request" or $event == "merge_group" then
-         (if $event == "pull_request" then ($root.changes.outputs.macos // "true") == "false"
-          else ($root.changes.outputs.macos // "true") == ($root.changes.outputs.heavy // "true") end) and
-         (del(.changes) | with_entries(select(.key | startswith("macos-")))
-           | if ($root.changes.outputs.macos // "true") == "true" and ($event != "pull_request" or $draft != "true") then all(.[]; .result == "success")
-             else all(.[]; .result == "skipped") end) and
+       if $event == "pull_request" then
+         ($root.changes.outputs.macos // "true") == "false" and
+         (del(.changes) | with_entries(select(.key | startswith("macos-"))) | all(.[]; .result == "skipped")) and
          (del(.changes).lint
            | if ($root.changes.outputs.heavy // "true") == "true" then .result == "success"
              else .result == "skipped" end) and
          (del(.changes) | with_entries(select((.key | startswith("macos-") | not) and .key != "actionlint" and .key != "linked-issue" and .key != "commit-trailers" and .key != "lint"))
-           | if ($root.changes.outputs.heavy // "true") == "true" and ($event != "pull_request" or $draft != "true") then all(.[]; .result == "success")
+           | if ($root.changes.outputs.heavy // "true") == "true" and $draft != "true" then all(.[]; .result == "success")
              else all(.[]; .result == "skipped") end) and
          (.["linked-issue"].result == "success") and
          (.["commit-trailers"].result == "success") and

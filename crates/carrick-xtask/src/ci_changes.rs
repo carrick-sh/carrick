@@ -568,8 +568,9 @@ pub fn evaluate_changes(
     changed_paths: Option<&[String]>,
     referenced_docs: &ReferencedDocs,
 ) -> CiChangesOutputs {
-    // Non-PR/non-merge_group events (schedule, workflow_dispatch, push) always run everything.
-    if event_name != "pull_request" && event_name != "merge_group" {
+    // Only pull_request events may use the docs-only fast path or draft skip.
+    // Merge groups, schedule, workflow_dispatch, and push always run everything.
+    if event_name != "pull_request" {
         return CiChangesOutputs {
             heavy: true,
             macos: true,
@@ -578,11 +579,10 @@ pub fn evaluate_changes(
         };
     }
 
-    let is_merge_group = event_name == "merge_group";
     let Some(paths) = changed_paths else {
         return CiChangesOutputs {
             heavy: true,
-            macos: is_merge_group,
+            macos: false,
             workflows: true,
             hardware: true,
         };
@@ -591,7 +591,7 @@ pub fn evaluate_changes(
     if paths.is_empty() {
         return CiChangesOutputs {
             heavy: true,
-            macos: is_merge_group,
+            macos: false,
             workflows: true,
             hardware: true,
         };
@@ -616,7 +616,7 @@ pub fn evaluate_changes(
     let _ = pr_draft;
     CiChangesOutputs {
         heavy,
-        macos: is_merge_group && heavy,
+        macos: false,
         workflows,
         hardware: heavy,
     }
@@ -626,16 +626,6 @@ fn git_commit_exists(repo_root: &Path, rev: &str) -> bool {
     Command::new("git")
         .current_dir(repo_root)
         .args(["cat-file", "-e", &format!("{rev}^{{commit}}")])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
-fn git_has_origin(repo_root: &Path) -> bool {
-    Command::new("git")
-        .current_dir(repo_root)
-        .args(["remote", "get-url", "origin"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -695,13 +685,13 @@ pub fn collect_changed_paths(
     base_ref: &str,
     head: &str,
 ) -> Result<Option<Vec<String>>, CiChangesError> {
-    if event != "pull_request" && event != "merge_group" {
+    if event != "pull_request" {
         return Ok(None);
     }
     let base = base.trim();
     if base.is_empty() {
         return Err(CiChangesError::Git(
-            "CI_BASE is required for pull_request and merge_group".into(),
+            "CI_BASE is required for pull_request".into(),
         ));
     }
     if !git_commit_exists(repo_root, base) {
@@ -709,17 +699,7 @@ pub fn collect_changed_paths(
     }
     let mut paths = Vec::new();
     git_diff_null_paths(repo_root, base, head, &mut paths)?;
-    let base_ref = base_ref.trim();
-    if event == "merge_group" && !base_ref.is_empty() {
-        if git_commit_exists(repo_root, base_ref) {
-            git_diff_null_paths(repo_root, base_ref, head, &mut paths)?;
-        } else if git_has_origin(repo_root) {
-            git_fetch_origin(repo_root, base_ref)?;
-            git_diff_null_paths(repo_root, "FETCH_HEAD", head, &mut paths)?;
-        } else {
-            git_diff_null_paths(repo_root, base_ref, head, &mut paths)?;
-        }
-    }
+    let _ = base_ref;
     Ok(Some(paths))
 }
 
