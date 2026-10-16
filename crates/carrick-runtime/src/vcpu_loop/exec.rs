@@ -7183,7 +7183,10 @@ pub(crate) mod tests {
             fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
                 self.binding
             }
-            fn fork(&mut self) -> LifecycleOutcome {
+            fn fork(
+                &mut self,
+                _: carrick_personality_linux::lifecycle::ProcessForkChildTid,
+            ) -> LifecycleOutcome {
                 self.calls += 1;
                 LifecycleOutcome::Returned {
                     result: SyscallResult::new(self.result),
@@ -7197,7 +7200,7 @@ pub(crate) mod tests {
                 _: LinuxWaitOptions,
                 _: UserVa,
             ) -> LifecycleOutcome {
-                self.fork()
+                self.fork(carrick_personality_linux::lifecycle::ProcessForkChildTid::NONE)
             }
             fn exit_group(&mut self, _: u8) -> LifecycleOutcome {
                 panic!("a terminal call does not return")
