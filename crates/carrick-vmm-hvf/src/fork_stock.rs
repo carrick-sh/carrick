@@ -331,7 +331,7 @@ mod tests {
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn native_stock_crossing_reads_kernel_stack_and_current_execution() {
-        let custody = CarrierVmCustody::new();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new());
         let generation = custody.begin_create().unwrap();
         custody.commit_create(generation).unwrap();
         let mut region = carrick_test_support::TestEl1Region::zeroed();
