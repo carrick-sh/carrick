@@ -154,6 +154,30 @@ pub(crate) fn cross_hvc_wait_channel_wake(mm: u64, address: u64, cpu: u64) -> Re
     }
 }
 
+/// Ask the stopped carrier to supply the COW page selected in this slot's
+/// portal record. The host authenticates that record against the live root.
+pub(crate) fn cross_hvc_cow_supply(address: u64, cpu: u64) -> Result<(), ()> {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    {
+        let mut status = carrick_el1_abi::GRANT_OP_COW_SUPPLY;
+        // SAFETY: the synchronous crossing retains this slot's published
+        // selection until the carrier consumes its exact record.
+        unsafe {
+            core::arch::asm!("hvc #6", inout("x0") status,
+                inlateout("x1") address => _, inlateout("x2") cpu => _,
+                inlateout("x3") 0u64 => _, options(nostack));
+        }
+        (status == carrick_el1_abi::METADATA_GRANT_SUCCESS)
+            .then_some(())
+            .ok_or(())
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    {
+        let _ = (address, cpu);
+        Err(())
+    }
+}
+
 /// An exact running task's bounded EL1 transfer.
 pub struct Aarch64UserTransfer {
     owner: core::ptr::NonNull<CurrentTask>,
