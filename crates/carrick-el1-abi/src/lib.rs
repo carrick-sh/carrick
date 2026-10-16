@@ -330,6 +330,65 @@ pub const GRANT_OP_COW_SUPPLY: u64 = 6;
 /// Runtime handback of a terminal child's unplaceable parent wait.
 pub const GRANT_OP_WAIT_CHANNEL_WAKE: u64 = 7;
 
+/// Failure-only native fork diagnostic. This crossing grants no authority.
+pub const GRANT_OP_FORK_REFUSAL: u64 = 8;
+
+/// Bounded debug rendering of a typed refusal, retained on the stopped EL1 stack.
+#[repr(C, align(64))]
+pub struct NativeForkDiagnostic {
+    bytes: [u8; 256],
+    len: u32,
+}
+
+impl Default for NativeForkDiagnostic {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NativeForkDiagnostic {
+    pub const fn new() -> Self {
+        Self {
+            bytes: [0; 256],
+            len: 0,
+        }
+    }
+
+    pub fn message(&self) -> Option<&str> {
+        core::str::from_utf8(self.bytes.get(..self.len as usize)?).ok()
+    }
+}
+
+impl core::fmt::Write for NativeForkDiagnostic {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        let start = self.len as usize;
+        let end = start.checked_add(text.len()).ok_or(core::fmt::Error)?;
+        let destination = self.bytes.get_mut(start..end).ok_or(core::fmt::Error)?;
+        destination.copy_from_slice(text.as_bytes());
+        self.len = end as u32;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod native_fork_diagnostic_tests {
+    use super::NativeForkDiagnostic;
+    use core::fmt::Write;
+
+    #[test]
+    fn diagnostic_is_bounded_and_rejects_malformed_wire_text() {
+        let mut record = NativeForkDiagnostic::new();
+        assert!(record.write_str(&"x".repeat(256)).is_ok());
+        assert!(record.write_str("y").is_err());
+        assert_eq!(record.message().map(str::len), Some(256));
+        record.len = 257;
+        assert_eq!(record.message(), None);
+        record.len = 1;
+        record.bytes[0] = 0xff;
+        assert_eq!(record.message(), None);
+    }
+}
+
 /// Metadata grant hypercall outcome: successful extent allocation or return.
 pub const METADATA_GRANT_SUCCESS: u64 = 0;
 
