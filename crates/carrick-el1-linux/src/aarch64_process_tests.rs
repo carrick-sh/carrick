@@ -3106,6 +3106,48 @@ fn arm_call(
     )
 }
 
+#[test]
+fn arm_signal_setup_uses_one_native_owner() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    let signal = carrick_signal_core::policy::Signal::from_number(13).unwrap();
+    let action = carrick_signal_core::policy::Action {
+        disposition: carrick_signal_core::policy::Disposition::Ignore,
+        ..Default::default()
+    };
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |process| {
+                process
+                    .signal_venue()
+                    .unwrap()
+                    .rt_sigaction(signal, Some(action))
+                    .unwrap();
+            },
+        )
+        .unwrap();
+    for (nr, args, expected) in [
+        (134, [13, 0, 0, 8, 0, 0], 0),
+        (135, [0, 0, 0, 8, 0, 0], 0),
+        (132, [0, 0, 0, 0, 0, 0], 0),
+        (133, [0, 0, 0, 7, 0, 0], -22),
+    ] {
+        let mut frame = carrick_el1_abi::TrapFrame::default();
+        frame.x[..6].copy_from_slice(&args);
+        frame.x[8] = nr;
+        let route = arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap();
+        assert_ne!(
+            route,
+            carrick_personality_linux::dispatch::CompletionRoute::Forward,
+            "ARM signal syscall {nr} escaped to the carrier"
+        );
+        assert_eq!(frame.x[0] as i64, expected, "ARM signal syscall {nr}");
+    }
+}
+
 #[cfg(test)]
 fn arm_route_action(
     fixture: &Fixture,
