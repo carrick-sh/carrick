@@ -7335,6 +7335,56 @@ mod tests {
             runtimes.push(runtime);
             addresses.push(address);
         }
+        // An ingress record authenticates the exact live native member, not
+        // just a tid shared by two roots or a recycled record slot.
+        let first_binding = crate::personality::common_entry::execution_binding(&tasks[0]);
+        let first_record = registry
+            .state
+            .lock()
+            .members
+            .iter()
+            .find(|(key, _)| key.task.id().raw() == 41)
+            .unwrap()
+            .1
+            .record;
+        let event = carrick_el1_abi::ExternalSignalRecord::new(
+            carrick_core_abi::EntryEventIdentity::from_binding(first_binding),
+            first_binding,
+            first_record,
+            carrick_el1_abi::SignalEventGeneration::new(NonZeroU64::MIN),
+            carrick_signal_core::policy::Signal::from_number(2).unwrap(),
+            carrick_el1_abi::ExternalSignalSource::Terminal,
+        );
+        let owner = registry
+            .for_external_event(&zone, event)
+            .expect("live ingress owner");
+        assert!(Arc::ptr_eq(&owner, &runtimes[0]));
+        let stale = carrick_el1_abi::ExternalSignalRecord::new(
+            event.identity(),
+            ExecutionBinding {
+                generation: carrick_core_abi::EntryGeneration::from_raw(
+                    first_binding.generation.raw() + 1,
+                ),
+                ..first_binding
+            },
+            first_record,
+            event.event_generation(),
+            event.signal(),
+            event.source(),
+        );
+        assert!(registry.for_external_event(&zone, stale).is_none());
+        let recycled = carrick_el1_abi::ExternalSignalRecord::new(
+            event.identity(),
+            first_binding,
+            RecordRef {
+                incarnation: first_record.incarnation + 1,
+                ..first_record
+            },
+            event.event_generation(),
+            event.signal(),
+            event.source(),
+        );
+        assert!(registry.for_external_event(&zone, recycled).is_none());
         let mut services = [
             Physical {
                 zone: &zone,
