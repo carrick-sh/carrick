@@ -4801,6 +4801,9 @@ const EL1_VECTOR_HOOK_OFFSET: usize = 0x1000;
 /// The EL0 IRQ hook ([`El1IrqMode::Gic`]): the lower-EL IRQ slot branches
 /// here, and it enters the EL1 image with an interrupt frame.
 const EL0_IRQ_HOOK_OFFSET: usize = 0x2000;
+/// Synthetic EL0 return checkpoint after a host-forwarded syscall. It shares
+/// the IRQ hook's 4 KiB code island but does not acknowledge a physical IRQ.
+const EL0_SIGNAL_HOOK_OFFSET: usize = 0x2800;
 /// The EL0 fault hook: the lower-EL sync slot branches here for EC 0x20
 /// instruction aborts and EC 0x24 data aborts,
 /// saving all architectural registers, ESR and FAR, calling the EL1 image, and forwarding
@@ -4837,6 +4840,7 @@ enum HookEntry {
     /// syndrome is 0, and a forward leaves through `hvc #4` at that EL0
     /// boundary.
     Irq,
+    SignalCheck,
     /// An EL0 instruction or data abort (EC 0x20 or 0x24): a forward restores all registers and
     /// leaves through `legacy_hvc` (`hvc #2`).
     Fault,
@@ -4961,8 +4965,13 @@ fn write_el1_hook(
             emit(bytes, &mut cursor, enc_str_xt_xn(17, 16, 280)); // far at offset 280
         }
         // An interrupt frame: syndrome 0 (an SVC's never is).
-        HookEntry::Irq => {
-            emit(bytes, &mut cursor, enc_str_xt_xn(31, 16, 264));
+        HookEntry::Irq | HookEntry::SignalCheck => {
+            if entry == HookEntry::SignalCheck {
+                emit(bytes, &mut cursor, enc_movz_w16(0xfffe) | 1); // mov w17, #0xfffe
+                emit(bytes, &mut cursor, enc_str_xt_xn(17, 16, 264));
+            } else {
+                emit(bytes, &mut cursor, enc_str_xt_xn(31, 16, 264));
+            }
             emit(bytes, &mut cursor, enc_str_xt_xn(31, 16, 280));
         }
     }
@@ -5183,6 +5192,9 @@ fn write_el1_hook(
             emit(bytes, &mut cursor, AARCH64_HVC_KICK_OPCODE);
             emit(bytes, &mut cursor, AARCH64_ERET_OPCODE);
         }
+        HookEntry::SignalCheck => {
+            emit(bytes, &mut cursor, AARCH64_HVC_FAULT_OPCODE);
+        }
         HookEntry::Fault => {
             // The unhandled fault exit: restore registers, leave with hvc #2 to legacy_hvc
             let branch_to_legacy = cursor;
@@ -5233,7 +5245,12 @@ fn write_el1_hook(
     }
 
     debug_assert!(
-        cursor <= hook_offset + 0x1000,
+        cursor
+            <= match entry {
+                HookEntry::Irq => EL0_SIGNAL_HOOK_OFFSET,
+                HookEntry::SignalCheck => EL0_FAULT_HOOK_OFFSET,
+                _ => hook_offset + 0x1000,
+            },
         "EL1 hook overruns its 4 KiB of the vector page"
     );
     frame_entry
@@ -5726,6 +5743,9 @@ fn el1_vectors_bytes_mailbox_with_layout(
     emit(&mut bytes, &mut cursor, enc_cmp_w16_imm(3));
     let arm_branch = cursor;
     emit(&mut bytes, &mut cursor, 0);
+    emit(&mut bytes, &mut cursor, enc_cmp_w16_imm(4));
+    let native_signal_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
     let invalid_action_branch = cursor;
     emit(&mut bytes, &mut cursor, 0);
 
@@ -5745,6 +5765,27 @@ fn el1_vectors_bytes_mailbox_with_layout(
         enc_ldr_xt_sp(0, AARCH64_SYSCALL_MAILBOX_OFF_RETURN_VALUE),
     );
     let armed_finalize_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+
+    let native_signal_return = cursor;
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_ldr_xt_sp(0, AARCH64_SYSCALL_MAILBOX_OFF_RETURN_VALUE),
+    );
+    emit(&mut bytes, &mut cursor, enc_movz_w16(0));
+    emit(&mut bytes, &mut cursor, AARCH64_STLR_W16_X17_OPCODE);
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_ldr_xt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X16),
+    );
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_ldr_xt_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X17),
+    );
+    let native_signal_hook_branch = cursor;
     emit(&mut bytes, &mut cursor, 0);
 
     let finalize = cursor;
@@ -5913,6 +5954,19 @@ fn el1_vectors_bytes_mailbox_with_layout(
     );
     put(
         &mut bytes,
+        native_signal_branch,
+        enc_beq(native_signal_branch as u64, native_signal_return as u64),
+    );
+    put(
+        &mut bytes,
+        native_signal_hook_branch,
+        enc_b(
+            native_signal_hook_branch as u64,
+            EL0_SIGNAL_HOOK_OFFSET as u64,
+        ),
+    );
+    put(
+        &mut bytes,
         invalid_action_branch,
         enc_b(invalid_action_branch as u64, invalid_action as u64),
     );
@@ -5944,6 +5998,13 @@ fn el1_vectors_bytes_mailbox_with_layout(
             legacy_hvc,
             irq,
             HookEntry::Fault,
+        );
+        write_el1_hook(
+            &mut bytes,
+            EL0_SIGNAL_HOOK_OFFSET,
+            legacy_hvc,
+            irq,
+            HookEntry::SignalCheck,
         );
         if irq == El1IrqMode::Gic {
             let _ = write_el0_irq_hook(&mut bytes, EL0_IRQ_HOOK_OFFSET);

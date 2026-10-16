@@ -642,6 +642,10 @@ pub fn dispatch_irq(frame: &mut TrapFrame, counters: &Counters) -> Action {
 
 /// Unified entry dispatch (interrupts, lower-EL data aborts, and syscalls).
 pub fn dispatch_entry(frame: &mut TrapFrame, counters: &Counters) -> Action {
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    if frame.esr == 0xfffe {
+        return arm_signal_user_return(frame);
+    }
     let action = if frame.esr == 0 {
         dispatch_irq(frame, counters)
     } else if matches!((frame.esr >> 26) & 0x3f, 0x20 | 0x24) {
@@ -680,6 +684,13 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
     };
     let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
     let source = carrick_el1_abi::BornInZoneSource { zone, slot };
+    if crate::isa::signal_ingress_guest().is_empty()
+        && control.zone_record().is_some_and(|record| {
+            !super::aarch64_process::registry().signal_checkpoint_needed(zone, record)
+        })
+    {
+        return Action::Served;
+    }
     let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
     sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
     let ttbr0 = crate::isa::aarch64::hardware_live_ttbr();
