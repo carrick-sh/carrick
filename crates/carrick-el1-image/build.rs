@@ -63,6 +63,11 @@ fn check_process_exit_frames(disassembly: &str) {
         ("::exit_with_status::", 0x600, true),
         ("::finish_exit::", 0x800, true),
         ("::aarch64_process::resume_selected::", 0xa00, true),
+        (
+            "::aarch64_process::drain_native_signal_ingress::",
+            0xa00,
+            true,
+        ),
         ("::resume_checkpoint::", 0x400, true),
         // The ARM codec is dormant until #323 routes rt_sigreturn in-ring.
         // Once linked, its frame must fit below the budget; #323 makes this
