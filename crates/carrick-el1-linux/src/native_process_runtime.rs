@@ -1484,7 +1484,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                 // SAFETY: an authenticated live or host-owned zone record
                 // retains its published control slot in lifecycle custody.
                 let control = unsafe { &*(control_address as *const ThreadControlSlot) };
-                if control.native_signal_owner() && control.zone_record() == Some(record) {
+                if control.native_signal_owner()
+                    && control.zone_record() == Some(record)
+                    && !control.forwarded_wait_mask_armed()
+                {
                     let pending = super::native_process_signals::pending_summary_word();
                     let blocked = control.blocked().0;
                     let forced = carrick_signal_core::policy::Signal::SEGV.bit()
@@ -2937,6 +2940,9 @@ impl<'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>
     /// Test pending native work before the ISA saves FP/SIMD for delivery.
     /// A suspended mask needs its restoration even if no signal is pending.
     pub fn signal_checkpoint_needed(&self) -> bool {
+        if self.control.forwarded_wait_mask_armed() {
+            return true;
+        }
         let graph = self.runtime.graph.lock();
         let Ok(row) = graph.owner.task(self.key) else {
             return true;
@@ -7205,7 +7211,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if old.is_some() {
             NATIVE_SUSPEND_MASKS.fetch_sub(1, Ordering::Release);
         }
-        old
+        old.or_else(|| {
+            self.control.take_forwarded_wait_mask().map(|saved| {
+                carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                    carrick_signal_core::SignalSet::from_bits(saved.0),
+                )
+            })
+        })
     }
 
     fn take_deliverable(

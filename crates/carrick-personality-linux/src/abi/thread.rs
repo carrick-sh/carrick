@@ -385,6 +385,9 @@ pub struct ThreadControlSlot {
     /// Namespace-visible identity, published before this incarnation is runnable.
     visible_tid: AtomicU32,
     blocked: AtomicU64,
+    /// A forwarded temporary wait mask is restored by the native checkpoint.
+    forwarded_saved_mask: AtomicU64,
+    forwarded_mask_armed: AtomicU32,
     /// Even = stable, odd = write in progress.
     alt_seq: AtomicU64,
     alt_sp: AtomicU64,
@@ -431,6 +434,8 @@ impl ThreadControlSlot {
         Self {
             visible_tid: AtomicU32::new(0),
             blocked: AtomicU64::new(0),
+            forwarded_saved_mask: AtomicU64::new(0),
+            forwarded_mask_armed: AtomicU32::new(0),
             alt_seq: AtomicU64::new(0),
             alt_sp: AtomicU64::new(0),
             alt_size: AtomicU64::new(0),
@@ -538,6 +543,8 @@ impl ThreadControlSlot {
         self.birth_thread.store(0, Ordering::Relaxed);
         self.birth_task.store(0, Ordering::Relaxed);
         self.birth_serial.clear(Ordering::Relaxed);
+        self.forwarded_saved_mask.store(0, Ordering::Relaxed);
+        self.forwarded_mask_armed.store(0, Ordering::Relaxed);
         // Keep the sequence even: a stale odd value would wedge readers.
         let seq = self.alt_seq.load(Ordering::Relaxed);
         self.alt_seq
@@ -669,6 +676,26 @@ impl ThreadControlSlot {
     /// read is needed because nothing can target a thread not yet Born.
     pub fn init_blocked(&self, mask: BlockedMask) {
         self.blocked.store(mask.0, Ordering::Release);
+    }
+
+    /// The owning host continuation enters a temporary-mask wait. Publish
+    /// the persistent mask before the temporary mask becomes visible to EL1.
+    pub fn arm_forwarded_wait_mask(&self, temporary: BlockedMask, original: BlockedMask) {
+        self.forwarded_saved_mask
+            .store(original.0, Ordering::Relaxed);
+        self.forwarded_mask_armed.store(1, Ordering::Release);
+        let _ = self.store_blocked_then_read_pending(temporary, &self.pending);
+    }
+
+    pub fn forwarded_wait_mask_armed(&self) -> bool {
+        self.forwarded_mask_armed.load(Ordering::Acquire) != 0
+    }
+
+    /// The native signal owner consumes the saved mask once, in the same
+    /// selection path as an in-ring sigsuspend mask.
+    pub fn take_forwarded_wait_mask(&self) -> Option<BlockedMask> {
+        (self.forwarded_mask_armed.swap(0, Ordering::AcqRel) != 0)
+            .then(|| BlockedMask(self.forwarded_saved_mask.load(Ordering::Acquire)))
     }
 
     /// Seqlock write. Only the owning thread may call this; concurrent

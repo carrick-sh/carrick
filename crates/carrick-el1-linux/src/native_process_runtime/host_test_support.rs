@@ -311,6 +311,10 @@ impl NativeSignalFixture {
         self.record
     }
 
+    pub fn control_slot(&self) -> &ThreadControlSlot {
+        self.control
+    }
+
     fn service(&self) -> Physical<'static> {
         Physical {
             zone: self.zone,
