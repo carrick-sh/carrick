@@ -1051,14 +1051,17 @@ impl ThreadLifecyclePage {
     }
 
     /// Publish the already-owned WaitChannel key before cancellation starts.
-    /// The address is released last so the host never reads a partial key.
+    /// The key publication and lookup join the live-count SeqCst order:
+    /// the enrolling owner must observe settlement, or the settling member
+    /// must observe this key. Acquire/release alone permits both to miss.
+    /// The address is stored last so readers never observe a partial key.
     pub fn publish_exit_wait(&self, mm: carrick_core_abi::entry::EntryMmKey, address: u64) {
         self.exit_wait_mm.store(mm.raw(), Ordering::Relaxed);
-        self.exit_wait_address.store(address, Ordering::Release);
+        self.exit_wait_address.store(address, Ordering::SeqCst);
     }
 
     pub fn exit_wait(&self) -> Option<(carrick_core_abi::entry::EntryMmKey, u64)> {
-        let address = self.exit_wait_address.load(Ordering::Acquire);
+        let address = self.exit_wait_address.load(Ordering::SeqCst);
         (address != 0).then(|| {
             (
                 carrick_core_abi::entry::EntryMmKey::from_raw(
@@ -1070,7 +1073,7 @@ impl ThreadLifecyclePage {
     }
 
     pub fn clear_exit_wait(&self) {
-        self.exit_wait_address.store(0, Ordering::Release);
+        self.exit_wait_address.store(0, Ordering::SeqCst);
     }
     fn activity(&self) -> Option<&ThreadLedgerActivity> {
         #[cfg(target_os = "none")]

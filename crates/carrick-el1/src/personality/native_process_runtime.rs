@@ -29,6 +29,7 @@ use carrick_personality_linux::{
 };
 #[cfg(test)]
 use carrick_sched_core::BoundedSpin;
+use carrick_sched_core::object_wait::OwnerEntry;
 use carrick_sched_core::process::{
     ChildExitSignal, TaskId, TaskIdentity, TaskKey, TaskRusage, TaskSerial, WaitTarget,
 };
@@ -516,6 +517,7 @@ enum OutstandingExitReceipt<'a> {
 
 struct PendingExit<'a> {
     status: LinuxWaitStatus,
+    entry: OwnerEntry,
     caller: Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
     channel: Arc<WaitChannel>,
     wake: Option<ExitWakeCustody>,
@@ -3389,8 +3391,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .pending_exit
             .get(&self.key)
             .filter(|pending| core::ptr::eq(pending.caller.control(), self.control))
-            .map(|p| p.status);
-        if let Some(status) = status {
+            .map(|p| (p.status, p.entry));
+        if let Some((status, entry)) = status {
             // SAFETY: this exact record is selected by the execution owner;
             // the same checkpoint serves in-zone and host re-entry.
             unsafe {
@@ -3399,7 +3401,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     .record(self.record.id)
                     .consume_owner_continuation();
             }
-            return Some(match self.exit_with_status(status) {
+            return Some(match self.exit_with_status(status, entry) {
                 Ok(outcome) => outcome,
                 Err(error) => self.run_failed(error.run_failure_reason()),
             });
@@ -3437,6 +3439,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         &mut self,
         page: &ThreadLifecyclePage,
         channel: &Arc<WaitChannel>,
+        entry: OwnerEntry,
     ) -> Result<Option<LifecycleOutcome>, NativeProcessError> {
         let zone = self.source.zone;
         let record = zone
@@ -3479,7 +3482,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // SAFETY: the current record remains owned until its guarded park CAS.
         unsafe {
             *zone.record(record).ctx_mut() = self.words;
-            zone.record(record).publish_owner_continuation();
+            zone.record(record).publish_owner_continuation(entry);
         }
         let receipt = carrick_core::entry::publish_handoff_park(
             start,
@@ -3498,7 +3501,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 
     #[inline(never)]
     fn exit_owned(&mut self, status: u8) -> Result<LifecycleOutcome, NativeProcessError> {
-        self.exit_with_status(LinuxWaitStatus::exited(status))
+        self.exit_with_status(LinuxWaitStatus::exited(status), OwnerEntry::Syscall)
     }
     pub fn exit_with_signal(&mut self, sig: u8) -> Result<LifecycleOutcome, NativeProcessError> {
         if self
@@ -3517,12 +3520,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             return Err(NativeProcessError::GroupExitCustody);
         }
         let wait_status = LinuxWaitStatus::signaled(sig, false);
-        self.exit_with_status(wait_status)
+        self.exit_with_status(wait_status, OwnerEntry::Exception)
     }
     #[inline(never)]
     fn begin_closing(
         &mut self,
         wait_status: LinuxWaitStatus,
+        entry: OwnerEntry,
     ) -> Result<(&'a ThreadLifecyclePage, Arc<WaitChannel>), NativeProcessError> {
         let registry = *self.runtime.registry.lock();
         let address = self
@@ -3756,6 +3760,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     self.key,
                     PendingExit {
                         status: wait_status,
+                        entry,
                         caller,
                         channel,
                         wake,
@@ -3793,9 +3798,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     }
 
     #[inline(never)]
-    pub fn exit_with_status(
+    fn exit_with_status(
         &mut self,
         wait_status: LinuxWaitStatus,
+        entry: OwnerEntry,
     ) -> Result<LifecycleOutcome, NativeProcessError> {
         let child_pid = self
             .runtime
@@ -3807,9 +3813,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .metadata()
             .namespace_pid;
         let root_exit = self.is_root_process();
-        let (page, channel) = self.begin_closing(wait_status)?;
+        let (page, channel) = self.begin_closing(wait_status, entry)?;
         let settled = loop {
-            if let Some(outcome) = self.park_pending_exit(page, &channel)? {
+            if let Some(outcome) = self.park_pending_exit(page, &channel, entry)? {
                 return Ok(outcome);
             }
             #[cfg(test)]
@@ -7679,6 +7685,16 @@ mod tests {
             assert!(entry.take_run_failure().is_none());
             assert!(entry.take_root_exit().is_none());
             assert!(entry.take_handoff_receipt().is_some());
+            assert_eq!(
+                zone.record(home).resume_disposition(),
+                carrick_sched_core::object_wait::ResumeDisposition::OwnerContinuation(
+                    if signal_exit {
+                        OwnerEntry::Exception
+                    } else {
+                        OwnerEntry::Syscall
+                    }
+                )
+            );
             assert_eq!(zone.slot(slot).queued(), 0);
             assert_eq!(
                 entry.thread_spawned(41, 42, &mut || panic!("terminal close admitted Born")),

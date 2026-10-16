@@ -998,7 +998,7 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
             carrick_guest_arch::GuestIsa::Aarch64 => route_aarch64(ordinal, control),
         }
     };
-    let completion = match pending.binding().and_then(|binding| {
+    let completion = pending.binding().and_then(|binding| {
         if let Some(token) = carrick_core::entry::admit(binding, pending.record_source()) {
             Some(CompletionAuthority::Entry(token))
         } else {
@@ -1007,7 +1007,30 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
                 .and_then(|source| carrick_core::entry::admit_born_in_zone(binding, source))
                 .map(CompletionAuthority::BornInZone)
         }
-    }) {
+    });
+    // Capture admission before the owner can transfer its record, but offer
+    // retained custody before any refusal can forward a fresh terminal call.
+    if let Some(outcome) = pending.resume_owned_continuation() {
+        let Some(completion) = completion else {
+            return CompletionRoute::InvalidCompletion;
+        };
+        let returned = match outcome {
+            LifecycleOutcome::Returned { result, .. } => Some((result, original_argument0)),
+            LifecycleOutcome::HostCustody | LifecycleOutcome::Transferred { .. } => None,
+        };
+        return finish(
+            ordinal,
+            original_argument0,
+            FamilyRun {
+                completion: crate::lifecycle::lifecycle_effect(&outcome),
+                returned,
+                forward_reason: ForwardReason::FamilyFallback,
+            },
+            pending,
+            completion,
+        );
+    }
+    let completion = match completion {
         Some(authority) => authority,
         None if family == Family::AllocatorControl => CompletionAuthority::AllocatorDiagnostic,
         None => {
@@ -1032,23 +1055,6 @@ pub fn dispatch<'a, C: EntryContext + 'a>(
             return CompletionRoute::Forward;
         }
     };
-    if let Some(outcome) = pending.resume_owned_continuation() {
-        let returned = match outcome {
-            LifecycleOutcome::Returned { result, .. } => Some((result, original_argument0)),
-            LifecycleOutcome::HostCustody | LifecycleOutcome::Transferred { .. } => None,
-        };
-        return finish(
-            ordinal,
-            original_argument0,
-            FamilyRun {
-                completion: crate::lifecycle::lifecycle_effect(&outcome),
-                returned,
-                forward_reason: ForwardReason::FamilyFallback,
-            },
-            pending,
-            completion,
-        );
-    }
     if matches!(family, Family::Anonymous(_))
         && let Some(result) = pending.prepare_anonymous()
     {
@@ -1150,6 +1156,45 @@ mod ring_first_tests {
         EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
     };
     use core::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn retained_owner_is_checked_before_unadmitted_forward() {
+        struct RetainedOwner {
+            resumed: bool,
+        }
+        impl<'a> PendingFamilies<'a> for RetainedOwner {
+            fn binding(&self) -> Option<ExecutionBinding> {
+                None
+            }
+            fn crossing_set(&self) -> HostCrossingSet {
+                HostCrossingSet::Aarch64
+            }
+            fn original_argument0(&self) -> u64 {
+                7
+            }
+            fn install_result(&mut self, _: SyscallResult) {
+                panic!("no user result for exit")
+            }
+            fn resume_owned_continuation(&mut self) -> Option<LifecycleOutcome> {
+                self.resumed = true;
+                Some(LifecycleOutcome::Transferred {
+                    progress: carrick_core::Served::Idle,
+                    result: SyscallResult::new(0),
+                })
+            }
+        }
+        let mut pending = RetainedOwner { resumed: false };
+        let route = dispatch(94, 0, &mut pending);
+        assert!(
+            pending.resumed,
+            "retained owner must precede host crossing admission"
+        );
+        assert_eq!(
+            route,
+            CompletionRoute::InvalidCompletion,
+            "missing completion authority must refuse, never replay exit_group"
+        );
+    }
 
     #[test]
     fn yield_without_a_scheduler_venue_still_completes_in_ring() {

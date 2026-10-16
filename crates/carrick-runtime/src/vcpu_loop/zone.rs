@@ -1070,7 +1070,10 @@ where
         }
         zone.free_record(record.id);
         self.state.service_kernel_context = Some(context.retain_exact());
-        if disposition == carrick_sched_core::object_wait::ResumeDisposition::OwnerContinuation {
+        if matches!(
+            disposition,
+            carrick_sched_core::object_wait::ResumeDisposition::OwnerContinuation(_)
+        ) {
             // The materializer restored the native entry. Let its owner finish
             // the retained operation before signal delivery can enter EL0.
             // Dropping an unconsumed reservation returns it to its authority.
