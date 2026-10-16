@@ -126,7 +126,32 @@ impl<
         options: LinuxWaitOptions,
         rusage: UserVa,
     ) -> Option<LifecycleOutcome> {
-        Some(self.process_venue()?.wait4(pid, status, options, rusage))
+        let mut outcome = self.process_venue()?.wait4(pid, status, options, rusage);
+        if let LifecycleOutcome::Transferred { progress, .. } = &mut outcome
+            && matches!(progress, carrick_core::Served::Idle)
+        {
+            let task_index = self.frame.task_index();
+            let slot = self.frame.slot();
+            if let (Some(zone), Some(frame)) = (self.zone.as_mut(), self.frame.arm_frame()) {
+                let task = self.current_tasks.get(task_index).unwrap_or_else(|| {
+                    super::dispatch::invalid_completion(
+                        super::dispatch::NativeInvariant::EntryBinding,
+                    )
+                });
+                let slot = slot.unwrap_or_else(|| {
+                    super::dispatch::invalid_completion(
+                        super::dispatch::NativeInvariant::EntryBinding,
+                    )
+                });
+                if let Some(ready) =
+                    native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
+                        .run_ready(frame)
+                {
+                    *progress = ready;
+                }
+            }
+        }
+        Some(outcome)
     }
     fn process_exit_group(&mut self, status: u8) -> Option<LifecycleOutcome> {
         Some(self.process_venue()?.exit_group(status))
