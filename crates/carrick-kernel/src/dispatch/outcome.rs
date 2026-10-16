@@ -339,7 +339,7 @@ fn drive_host_blocking_write(
         crate::probes::host_pipe_io(host_fd.as_raw_fd(), 1, n as i64);
         if let Err(errno) = n.host_syscall_errno() {
             if errno == LINUX_EAGAIN || errno == LINUX_EINTR {
-                if host_signal.has_unblocked_pending_for(write.tid.raw(), SigBlockMask::NONE) {
+                if host_signal.claim_unblocked_pending_for(write.tid.raw(), SigBlockMask::NONE) {
                     return BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(
                         write.offset(),
                     ));
@@ -362,7 +362,7 @@ fn drive_host_blocking_write(
                 write.committed_prefix + write.bytes.len(),
             ));
         }
-        if host_signal.has_unblocked_pending_for(write.tid.raw(), SigBlockMask::NONE) {
+        if host_signal.claim_unblocked_pending_for(write.tid.raw(), SigBlockMask::NONE) {
             return BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(write.offset()));
         }
     }
@@ -397,7 +397,7 @@ fn drive_in_memory_pipe_write(
         BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(
             write.committed_prefix + write.bytes.len(),
         ))
-    } else if host_signal.has_unblocked_pending_for(write.tid.raw(), SigBlockMask::NONE) {
+    } else if host_signal.claim_unblocked_pending_for(write.tid.raw(), SigBlockMask::NONE) {
         BlockingWriteStep::Done(DispatchOutcome::returned_len_or_errno(write.offset()))
     } else {
         BlockingWriteStep::Wait

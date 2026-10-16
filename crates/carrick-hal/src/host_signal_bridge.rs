@@ -92,6 +92,12 @@ pub trait HostSignalBridge: Send + Sync {
     /// entry. A blocked signal stays pending but must not break a wait.
     fn has_unblocked_pending_for(&self, tid: i32, block_mask: SigBlockMask) -> bool;
 
+    /// Claim a pending signal when this thread will actually interrupt its
+    /// wait. A plain eligibility query must not select a process wake owner.
+    fn claim_unblocked_pending_for(&self, tid: i32, block_mask: SigBlockMask) -> bool {
+        self.has_unblocked_pending_for(tid, block_mask)
+    }
+
     /// Dequeue the lowest pending signum deliverable to `tid`
     /// ([`NO_PENDING_SIGNAL`] if none).
     fn take_pending_for(&self, tid: i32) -> i32;
@@ -223,6 +229,13 @@ impl<G: HostSignalGlue> HostSignalBridge for GenericHostSignalBridge<G> {
             return true;
         }
         carrick_signal_linux::has_unblocked_pending_for(tid, block_mask)
+    }
+
+    fn claim_unblocked_pending_for(&self, tid: i32, block_mask: SigBlockMask) -> bool {
+        if carrick_signal_linux::xsig::xsig_has_unblocked_for_self(block_mask) {
+            return true;
+        }
+        carrick_signal_linux::claim_unblocked_pending_for(tid, block_mask)
     }
 
     fn take_pending_for(&self, tid: i32) -> i32 {
