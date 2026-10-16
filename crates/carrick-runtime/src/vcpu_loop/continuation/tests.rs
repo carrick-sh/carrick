@@ -779,9 +779,8 @@ fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
         );
         assert_eq!(carrick_signal_linux::take_pending_for(tid), 0);
         if eligible {
-            // A broadcast wake can interrupt another forwarded waiter after
-            // the only process event has been consumed. The empty native
-            // checkpoint must replay its call without entering a handler.
+            // A defensive empty checkpoint cannot invent a handler or rewind
+            // a completed forwarded return after the only event is consumed.
             let mut second = carrick_el1_abi::TrapFrame::default();
             second.esr = 0xfffe;
             second.elr = 0x500004;
@@ -790,7 +789,13 @@ fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
             second.x[8] = nr;
             let (drained, route) = fixture.drain_and_deliver(&queue, &mut second);
             assert_eq!((drained, route), (0, None));
-            assert_eq!((second.elr, second.x[0]), (0x500000, 0x4321));
+            assert_eq!(
+                (second.elr, second.x[0]),
+                (
+                    0x500004,
+                    carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64
+                )
+            );
             assert!(take_signal_copies().is_empty());
         }
     }
@@ -1115,7 +1120,7 @@ fn serial_host_timed_recv_waiter_keeps_deadline_when_peer_claims_signal() {
     assert!(!continuation.native_restart_eligible());
     let deadline = continuation.deadline();
     carrick_signal_linux::publish_process_signal(2);
-    assert!(carrick_signal_linux::has_unblocked_pending_for(
+    assert!(carrick_signal_linux::claim_unblocked_pending_for(
         leader.thread().key().tid.raw(),
         carrick_abi::SigBlockMask::NONE,
     ));
