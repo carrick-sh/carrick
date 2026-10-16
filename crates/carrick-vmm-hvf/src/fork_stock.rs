@@ -57,7 +57,13 @@ impl ForkStockHostCustody {
         }
         let mut arenas = Vec::new();
         let mut tables = Vec::new();
-        for root in resources.tables.arenas() {
+        let roots = resources.tables.arenas();
+        let control_count = roots.len() / 2;
+        if control_count == 0 {
+            return Err(fail("native fork stock has no per-child control capacity"));
+        }
+        let mut controls = Vec::new();
+        for (ordinal, root) in roots.iter().enumerate() {
             let epoch = crate::trap::next_structural_epoch()?;
             let base = root.address().raw();
             let len = crate::frame_pool::ROOT_SLOT_SIZE;
@@ -92,14 +98,25 @@ impl ForkStockHostCustody {
                         custody, mapping, lease, perms, epoch, base, len,
                     )?
                 };
-            for offset in (0..len).step_by(4096) {
-                tables.push(
-                    RootGpa::page_aligned(FrameGpa::new(base + offset as u64))
-                        .ok_or_else(|| fail("unaligned fork arena"))?,
+            if ordinal < control_count {
+                controls.push(
+                    carrick_hal::fork_stock::ForkControlCapacity::new(base)
+                        .ok_or_else(|| fail("unaligned fork control capacity"))?,
                 );
+            } else {
+                for offset in (0..len).step_by(4096) {
+                    tables.push(
+                        RootGpa::page_aligned(FrameGpa::new(base + offset as u64))
+                            .ok_or_else(|| fail("unaligned fork arena"))?,
+                    );
+                }
             }
             arenas.push(owner);
         }
+        stock
+            .owner
+            .install_control_capacity(controls)
+            .map_err(|error| fail(&format!("native fork control install: {error:?}")))?;
         let generation = custody
             .live_generation()
             .ok_or_else(|| fail("native fork stock has no live carrier"))?;
