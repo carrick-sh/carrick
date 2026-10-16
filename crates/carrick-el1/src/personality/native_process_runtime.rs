@@ -2092,8 +2092,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             binding,
             record: source.zone.record_ref(record),
             control,
-            _control_custody: carrick_core::lifecycle::MemberControlCustody::retain(control)
-                .map_err(|_| NativeProcessError::Stale)?,
+            _control_custody: Some(
+                carrick_core::lifecycle::MemberControlCustody::retain(control)
+                    .map_err(|_| NativeProcessError::Stale)?,
+            ),
             key,
             caller_address,
             words,
@@ -2132,8 +2134,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             binding,
             record,
             control: member_control,
-            _control_custody: carrick_core::lifecycle::MemberControlCustody::retain(member_control)
-                .map_err(|_| NativeProcessError::Stale)?,
+            _control_custody: Some(
+                carrick_core::lifecycle::MemberControlCustody::retain(member_control)
+                    .map_err(|_| NativeProcessError::Stale)?,
+            ),
             key: process,
             caller_address: address,
             words,
@@ -2325,7 +2329,7 @@ pub struct NativeProcessEntry<
     binding: ExecutionBinding,
     record: RecordRef,
     control: &'a ThreadControlSlot,
-    _control_custody: carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>,
+    _control_custody: Option<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
     key: TaskKey,
     caller_address: AddressContext<RootGpa>,
     words: C,
@@ -3890,6 +3894,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 );
             }
         });
+        // Graph removal (`publish_exit`) and member cancellation are complete.
+        // Unregister from `NativeProcessRegistry` and release all
+        // `MemberControlCustody` references (graph resources, registry member,
+        // and this entry) BEFORE `retire_mm` quarantines the child's fork stock
+        // and publishes slot absence (`leave_space`). Once slot absence is
+        // published, a concurrent `fork()` on another CPU can reclaim and zero
+        // or re-loan this child's `ThreadControlSlot` storage
+        // (`window.clear(lifecycle)`), so a later `MemberControlCustody::drop`
+        // (`fetch_sub(GRAPH_REFERENCE)`) would dirty the zeroed stock window
+        // or underflow the next child's control word into `RESETTING`.
+        if let Some(registry) = *self.runtime.registry.lock() {
+            registry.unregister_process(self.runtime, self.key);
+        }
+        drop(published.retiring);
+        drop(self._control_custody.take());
         // Only fork-born processes own stock to retire. The root is known by
         // graph position, not by the pid it shows in its namespace (a child
         // in a new PID namespace may show pid 1); it uses the root-exit
@@ -3903,6 +3922,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         {
             self.service.retire_mm(mm);
         }
+        self.service.retire_fd_table(file_table);
         // A parent may scan without waiting for our notification. Publish
         // status readiness only after the child stock and slot absence are
         // retired, so that scan cannot admit a fork against charged stock.
@@ -3989,14 +4009,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         for channel in channels {
             self.publish_channel(&channel)?;
         }
-        self.service.retire_fd_table(file_table);
-        drop(published.retiring);
         drop(autoreaped_receipt);
         if root_exit {
             self.root_exit = Some(wait_status);
-        }
-        if let Some(registry) = *self.runtime.registry.lock() {
-            registry.unregister_process(self.runtime, self.key);
         }
         Ok(LifecycleOutcome::Transferred {
             progress: carrick_core::Served::Idle,
@@ -10833,7 +10848,18 @@ mod tests {
             panic!("unexpected quarantine")
         }
 
-        fn retire_mm(&mut self, _: Self::Mm) {}
+        fn retire_mm(&mut self, mm: Self::Mm) {
+            let index = (mm.root.address().raw() - 0x2000) as usize / 0x1000;
+            assert!(
+                self.child_controls[index]
+                    .iter()
+                    .all(|control| !control.graph_referenced()),
+                "retiring a fork child MM must not leave control custody alive on its loaned stock"
+            );
+            for control in &mut self.child_controls[index] {
+                *control = ThreadControlSlot::new();
+            }
+        }
 
         fn wake_effects(&mut self, _: WakeEffects) {}
 

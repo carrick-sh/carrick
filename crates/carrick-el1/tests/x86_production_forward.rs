@@ -275,3 +275,280 @@ fn x86_unported_refusal_counts_native_ordinal_not_canonical_ordinal() {
     assert_eq!(counters.refused[102].load(Ordering::Relaxed), 1);
     assert_eq!(counters.refused[174].load(Ordering::Relaxed), 0);
 }
+
+#[test]
+fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
+    use carrick_core::lifecycle::MemberControlCustody;
+    use carrick_el1::personality::native_process_runtime::{
+        NativeForkPreparation, NativeLifecycleResources, NativeProcessError, NativeProcessRegistry,
+        NativeProcessRuntime, NativeProcessService,
+    };
+    use carrick_el1_abi::{
+        BornInZoneSource, ThreadControlSlot, ThreadIdentity, ThreadLifecyclePage,
+    };
+    use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
+    use carrick_mmu_core::x86::owner_mmu::X86Mmu;
+    use carrick_personality_linux::lifecycle::{LifecycleOutcome, LinuxWaitStatus, ProcessNative};
+    use carrick_sched_core::{ParkedContextWords, WakeEffects, X86_XSAVE_BYTES, ZoneTables};
+    use core::num::NonZeroU64;
+    use std::sync::Arc;
+
+    struct StockReclaimingService<'a> {
+        zone: &'a ZoneTables<ParkedContextWords>,
+        child_page: ThreadLifecyclePage,
+        child_controls: [ThreadControlSlot; 9],
+        retired_count: usize,
+    }
+
+    fn context_words(address: AddressContext<RootGpa>) -> ParkedContextWords {
+        ParkedContextWords::from_parts([0; 20], address, 0, 0, [0; X86_XSAVE_BYTES])
+    }
+
+    impl<'a> NativeProcessService<'a, ParkedContextWords> for StockReclaimingService<'a> {
+        type Mm = AddressContext<RootGpa>;
+        type PreparedMm = AddressContext<RootGpa>;
+        type Born = AddressContext<RootGpa>;
+
+        fn prepare_mm(
+            &mut self,
+            _: &Self::Mm,
+            _: ParkedContextWords,
+            child: MmGeneration,
+        ) -> Result<Self::PreparedMm, NativeProcessError> {
+            let address = AddressContext {
+                root: RootGpa::page_aligned(FrameGpa::new(0x2000)).unwrap(),
+                mm: child,
+                generation: ContextGeneration::new(NonZeroU64::MIN),
+            };
+            self.zone
+                .spaces
+                .publish_closed(child.raw().get(), address.root.address().raw(), 0)
+                .ok_or(NativeProcessError::Exhausted)?;
+            Ok(address)
+        }
+
+        fn prepared_mm(&self, p: &Self::PreparedMm) -> Self::Mm {
+            *p
+        }
+
+        fn prepared_context(&self, p: &Self::PreparedMm) -> AddressContext<RootGpa> {
+            *p
+        }
+
+        fn child_lifecycle(&self, _: &Self::PreparedMm) -> NativeLifecycleResources<'a> {
+            // SAFETY: `self` outlives every NativeProcessEntry in this test.
+            unsafe {
+                NativeLifecycleResources {
+                    page: &*(&self.child_page as *const _),
+                    controls: &*(&self.child_controls[..] as *const _),
+                }
+            }
+        }
+
+        fn commit_mm(
+            &mut self,
+            p: Self::PreparedMm,
+        ) -> Result<Self::Born, (NativeProcessError, Self::PreparedMm)> {
+            Ok(p)
+        }
+
+        fn abort_mm(
+            &mut self,
+            _: Self::PreparedMm,
+        ) -> Result<(), (NativeProcessError, Self::PreparedMm)> {
+            Ok(())
+        }
+
+        fn settle_mm(&mut self, b: Self::Born) -> Result<(), (NativeProcessError, Self::Born)> {
+            self.zone
+                .spaces
+                .open(self.zone.spaces.find(b.mm.raw().get()).unwrap());
+            Ok(())
+        }
+
+        fn copy_status(
+            &mut self,
+            _: &Self::Mm,
+            _: UserVa,
+            _: LinuxWaitStatus,
+        ) -> Result<(), NativeProcessError> {
+            Ok(())
+        }
+
+        fn quarantine_prepared(&mut self, _: Self::PreparedMm) {
+            panic!("unexpected quarantine");
+        }
+
+        fn quarantine_fork(
+            &mut self,
+            _: NativeForkPreparation<'a, Self::Mm, Self::PreparedMm, ParkedContextWords>,
+        ) {
+            panic!("unexpected fork quarantine");
+        }
+
+        fn quarantine_born(&mut self, _: Self::Born) {
+            panic!("unexpected quarantine");
+        }
+
+        fn retire_mm(&mut self, _: Self::Mm) {
+            assert!(
+                self.child_controls
+                    .iter()
+                    .all(|control| !control.graph_referenced()),
+                "retiring a fork child MM must not leave control custody alive on its loaned stock"
+            );
+            for control in &mut self.child_controls {
+                *control = ThreadControlSlot::new();
+            }
+            self.retired_count += 1;
+        }
+
+        fn wake_effects(&mut self, _: WakeEffects) {}
+    }
+
+    let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+    let zone = unsafe {
+        let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+        assert!(!ptr.is_null());
+        Box::from_raw(ptr)
+    };
+    let registry = Box::leak(Box::new(NativeProcessRegistry::<
+        AddressContext<RootGpa>,
+        ParkedContextWords,
+    >::new()));
+    let page = Box::new(ThreadLifecyclePage::new());
+    let control = Box::new(ThreadControlSlot::new());
+    let task = CurrentTask::new();
+    let peer_task = CurrentTask::new();
+    task.set(El1TaskId::from_linux_tid(41), 11, 5);
+    task.mm.key.store(1, Ordering::Release);
+    task.mm.thread_generation.store(101, Ordering::Release);
+    task.publish_visible_pid(41);
+    task.publish_lifecycle(&*page as *const _ as u64, &*control as *const _ as u64);
+    let address = AddressContext {
+        root: RootGpa::page_aligned(FrameGpa::new(0x1000)).unwrap(),
+        mm: MmGeneration::new(NonZeroU64::MIN),
+        generation: ContextGeneration::new(NonZeroU64::MIN),
+    };
+    let slot = SlotId::new(0);
+    let peer_slot = SlotId::new(1);
+    let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
+    zone.spaces.open(space);
+    zone.drive(slot, 1);
+    zone.publish_slot(slot, 1, Some(0), 1);
+    zone.enter_guest(slot);
+    zone.install_space(slot, 1).unwrap();
+    zone.drive(peer_slot, 2);
+    zone.publish_slot(peer_slot, 1, Some(1), 2);
+    zone.enter_guest(peer_slot);
+    zone.current_or_new(
+        slot,
+        ThreadIdentity {
+            tid: 41,
+            serial: 101,
+            mm: 1,
+            file_table: 5,
+            generation: 11,
+            affinity: 3,
+            lifecycle_page: &*page as *const _ as u64,
+            control_slot: &*control as *const _ as u64,
+        },
+    )
+    .unwrap();
+    let source = BornInZoneSource { zone: &zone, slot };
+    let mut service = StockReclaimingService {
+        zone: &zone,
+        child_page: ThreadLifecyclePage::new(),
+        child_controls: core::array::from_fn(|_| ThreadControlSlot::new()),
+        retired_count: 0,
+    };
+    let runtime = Arc::new(
+        NativeProcessRuntime::admit_fresh_root::<X86Mmu>(
+            source,
+            &task,
+            &page,
+            &control,
+            address,
+            address,
+            context_words(address),
+        )
+        .unwrap(),
+    );
+    registry
+        .register_root(runtime.clone(), source, &task, address)
+        .unwrap();
+    let child_pid = {
+        let mut parent_entry = runtime
+            .enter_registered(
+                registry,
+                source,
+                &task,
+                address,
+                context_words(address),
+                &mut service,
+            )
+            .unwrap();
+        let LifecycleOutcome::Returned { result, .. } = parent_entry.fork() else {
+            panic!("expected fork success");
+        };
+        result.raw() as u32
+    };
+    assert!(zone.enter_idle(peer_slot, true));
+    let mut effects = WakeEffects::default();
+    assert_eq!(zone.migrate_queued(slot, &mut effects), 1);
+    assert_eq!(effects.sgi_slots().collect::<Vec<_>>(), vec![peer_slot]);
+    zone.leave_idle(peer_slot);
+    let selected = zone.switch_in_full(peer_slot).unwrap();
+    let child_record = zone.record_ref(selected.record);
+    let state = unsafe { runtime.record_binding(child_record) }.unwrap();
+    let identity = zone.record(selected.record).identity();
+    zone.install_space(peer_slot, state.address.mm.raw().get())
+        .unwrap();
+    peer_task.set(
+        El1TaskId::from_linux_tid(i32::try_from(identity.tid).unwrap()),
+        identity.generation,
+        identity.file_table,
+    );
+    peer_task
+        .mm
+        .key
+        .store(state.address.mm.raw().get(), Ordering::Release);
+    peer_task
+        .mm
+        .thread_generation
+        .store(identity.serial, Ordering::Release);
+    peer_task.publish_visible_pid(child_pid);
+    peer_task.publish_lifecycle(identity.lifecycle_page, identity.control_slot);
+    let peer_source = BornInZoneSource {
+        zone: &zone,
+        slot: peer_slot,
+    };
+    {
+        let mut child_entry = runtime
+            .enter_registered(
+                registry,
+                peer_source,
+                &peer_task,
+                state.address,
+                state.words,
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            child_entry.exit_group(0),
+            LifecycleOutcome::Transferred {
+                progress: carrick_core::Served::Idle,
+                ..
+            }
+        ));
+    }
+    assert_eq!(service.retired_count, 1);
+    assert!(
+        !service.child_controls[0].graph_referenced(),
+        "dropping NativeProcessEntry after exit_group must not underflow reclaimed control stock"
+    );
+    assert!(
+        MemberControlCustody::retain(&service.child_controls[0]).is_ok(),
+        "reclaimed control stock must accept a fresh retain after child exit completes"
+    );
+}

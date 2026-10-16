@@ -3413,7 +3413,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             .filter(|ticket| self.timer_ticket_live(*ticket))
             .map(|ticket| (ticket.seq, ticket.deadline));
         self.timers.cancel_record(record);
-        s.host_record.store(NIL, Ordering::Release);
+        // Only clear `slot`'s host home if it still names `record`; unhoming or
+        // updating affinity for a distinct record on `slot` must not clobber a
+        // home record owned by `slot` (which would break authentication when
+        // that home thread resumes or parks on `slot`).
+        let _ =
+            s.host_record
+                .compare_exchange(record.raw(), NIL, Ordering::AcqRel, Ordering::Acquire);
         rec.home.store(0, Ordering::Release);
         timer
     }

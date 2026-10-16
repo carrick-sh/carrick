@@ -131,6 +131,7 @@ pub fn schedule(slot: SlotId) -> ! {
             if suspended {
                 continue;
             }
+            carrick_x86_carrier::native_execution::migrate(slot);
             match unsafe { context::resume_parked(words, state.address) } {
                 Ok(never) => match never {},
                 Err(_) => fatal_boot(),
