@@ -935,10 +935,10 @@ and [Arm's Linux Plumbers 2017 signal-frame diagrams](https://blog.linuxplumbers
 alongside sigreturn(2). This extraction changes no signal routing and does not
 establish in-ring delivery or alternate-stack restoration.
 
-`signal.arm.sigaltstack-setup` binds the native ARM `sigaltstack` owner to
-raw `syscall(SYS_sigaltstack)` observations from arm64 Docker `gcc:14`,
-kernel `7.0.14-linuxkit` (`scratchpad sigalt/p.c`). Its VM-free setup witness
-is `sigaltstack_serves_off_the_alternate_stack`. Bad flags plus undersized
+The ARM `sigaltstack` setup case of `kernel.el1.signal-delivery-owner`
+uses the VM-free `sigaltstack_serves_off_the_alternate_stack` witness. Native
+arm64 Docker oracle confirmation is still required at the atomic cutover.
+Bad flags plus undersized
 storage return EINVAL (-22); undersized storage alone returns ENOMEM (-12);
 SS_DISABLE ignores size. Input and output may alias: the entire new stack is
 read before the old stack is written, and the old value is returned while the
