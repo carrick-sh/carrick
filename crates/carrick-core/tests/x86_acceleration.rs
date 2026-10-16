@@ -1219,7 +1219,8 @@ mod fork_cow {
                 3,
                 TEST_ALIAS_BASE + 4096,
             ),
-            Err(ForkError::NoMemory)
+            Ok((descriptor, 0)),
+            "an alias beyond the admitted stock stays absent"
         );
     }
 

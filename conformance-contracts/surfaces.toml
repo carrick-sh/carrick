@@ -1099,6 +1099,14 @@ path = "crates/carrick-el1/src/isa/x86/fork_mm.rs"
 contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
 
 [[surfaces]]
+path = "crates/carrick-core/src/mm/fork.rs"
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.fork.stage1-image"]
+
+[[surfaces]]
+path = "crates/carrick-core/tests/aarch64_fork_geometry.rs"
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.fork.stage1-image"]
+
+[[surfaces]]
 path = "crates/carrick-core/src/mm/fork/reservation.rs"
 contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
 
