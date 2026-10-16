@@ -309,14 +309,14 @@ The comparison runs in the hosted `hvf-gate`/`kvm-gate` jobs, never on the
 trusted hardware: a lane job only produces and uploads its receipt. The gate
 uses the live merge-queue base links for in-queue ancestors, and when a landed
 ancestor on `main` passed `kernel-runtime.yml` without a receipt via the
-trusted `changes` fast path (`hardware == "false"`, verified from positive job
-evidence that `changes` succeeded and `signed-fixtures` or the lane's hardware
-jobs concluded `skipped`), follows its first-parent commits on `main` (bounded
-to 16 hops) to the nearest published receipt. It waits up to 90 minutes only
-when the terminal receipt-producing ancestor's run is still in progress (polled
-every 60 s; job timeout 110 min). A missing queue link or expired receipt for
-an unreceipted non-fast-path merge-group ancestor fails closed immediately and
-names this reseed command.
+trusted `changes` docs-only fast path (verified from the trusted run's
+published `ci-class-<sha>.json` artifact recording `hardware == false`),
+follows its first-parent commits on `main` (bounded to 16 hops) to the nearest
+published receipt. It waits up to 90 minutes only when the terminal
+receipt-producing ancestor's run is still in progress (polled every 60 s; job
+timeout 110 min). A missing queue link or expired receipt for an unreceipted
+non-fast-path merge-group ancestor fails closed immediately and names this
+reseed command.
 
 ### Cumulative merge groups (#402)
 

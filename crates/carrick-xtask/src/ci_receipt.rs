@@ -453,33 +453,86 @@ fn validate_sha(sha: &str) -> Result<(), ReceiptError> {
     }
 }
 
-/// Verify from a workflow run's `/jobs` listing that the run was a fast-path
-/// skip rather than a heavy run whose receipt artifact expired: `changes`
-/// succeeded, and `signed-fixtures` or the lane's hardware job (`hvf-kernel`
-/// for `Lane::Hvf`, `kvm-tests`/`kvm-tests-willow` for `Lane::Kvm`) concluded
-/// `skipped`.
-pub fn run_jobs_prove_fast_path_skip(jobs_payload: &Value, lane: Lane) -> bool {
-    let Some(jobs) = jobs_payload["jobs"].as_array() else {
-        return false;
+/// The artifact name `kernel-runtime.yml` `changes` uploads for a SHA.
+pub fn ci_class_artifact_name(sha: &str) -> String {
+    format!("ci-class-{sha}")
+}
+
+/// Find the non-expired `ci-class-<sha>` artifact in a run's artifact listing.
+pub fn find_ci_class_artifact(artifacts: &Value, sha: &str) -> Option<String> {
+    let target = ci_class_artifact_name(sha);
+    artifacts["artifacts"]
+        .as_array()?
+        .iter()
+        .filter(|a| a["expired"] == false)
+        .filter_map(|a| a["name"].as_str())
+        .find(|name| *name == target || name.starts_with(&format!("{target}-")))
+        .map(str::to_owned)
+}
+
+/// Verify from a downloaded `ci-class-<sha>.json` payload (`{heavy, hardware, macos}`)
+/// that the trusted run was classified as a fast-path skip (`hardware == false`).
+pub fn ci_class_proves_fast_path_skip(class_payload: &Value) -> bool {
+    class_payload["hardware"].as_bool() == Some(false)
+}
+
+fn download_and_verify_ci_class(
+    run_id: u64,
+    artifact_name: &str,
+    sha: &str,
+    scratch_root: &Path,
+) -> Result<bool, ReceiptError> {
+    let dir = scratch_root.join(format!("ci-class-{run_id}"));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).map_err(|source| ReceiptError::Io {
+            path: dir.clone(),
+            source,
+        })?;
+    }
+    std::fs::create_dir_all(&dir).map_err(|source| ReceiptError::Io {
+        path: dir.clone(),
+        source,
+    })?;
+    let status = Command::new("gh")
+        .args([
+            "run",
+            "download",
+            &run_id.to_string(),
+            "--repo",
+            REPOSITORY,
+            "--name",
+            artifact_name,
+            "--dir",
+        ])
+        .arg(&dir)
+        .status()
+        .map_err(|source| ReceiptError::Io {
+            path: PathBuf::from("gh"),
+            source,
+        })?;
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Ok(false);
+    }
+    let primary = dir.join(format!("ci-class-{sha}.json"));
+    let fallback = dir.join("ci-class.json");
+    let file_path = if primary.is_file() {
+        primary
+    } else if fallback.is_file() {
+        fallback
+    } else {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Ok(false);
     };
-    let job_conclusion = |name: &str| -> Option<&str> {
-        jobs.iter()
-            .find(|job| job["name"] == name)
-            .and_then(|job| job["conclusion"].as_str())
+    let bytes = std::fs::read(&file_path).map_err(|source| ReceiptError::Io {
+        path: file_path.clone(),
+        source,
+    })?;
+    let _ = std::fs::remove_dir_all(&dir);
+    let Ok(payload) = serde_json::from_slice::<Value>(&bytes) else {
+        return Ok(false);
     };
-    if job_conclusion("changes") != Some("success") {
-        return false;
-    }
-    if job_conclusion("signed-fixtures") == Some("skipped") {
-        return true;
-    }
-    match lane {
-        Lane::Hvf => job_conclusion("hvf-kernel") == Some("skipped"),
-        Lane::Kvm => {
-            job_conclusion("kvm-tests") == Some("skipped")
-                || job_conclusion("kvm-tests-willow") == Some("skipped")
-        }
-    }
+    Ok(ci_class_proves_fast_path_skip(&payload))
 }
 
 /// One query round: this workflow's runs for the SHA and their artifacts.
@@ -490,7 +543,11 @@ struct BaselineObservation {
     no_runs: bool,
 }
 
-fn query_baseline(lane: Lane, sha: &str) -> Result<BaselineObservation, ReceiptError> {
+fn query_baseline(
+    lane: Lane,
+    sha: &str,
+    scratch_root: &Path,
+) -> Result<BaselineObservation, ReceiptError> {
     validate_sha(sha)?;
     let workflow = KERNEL_RUNTIME_WORKFLOW
         .rsplit('/')
@@ -520,15 +577,14 @@ fn query_baseline(lane: Lane, sha: &str) -> Result<BaselineObservation, ReceiptE
     let mut fast_path_skip = false;
     if decision == Baseline::Missing && all_succeeded {
         fast_path_skip = true;
-        for (run, _) in &pairs {
-            let Some(id) = run["id"].as_u64() else {
+        for (run, artifacts) in &pairs {
+            let (Some(id), Some(class_artifact)) =
+                (run["id"].as_u64(), find_ci_class_artifact(artifacts, sha))
+            else {
                 fast_path_skip = false;
                 break;
             };
-            let jobs = gh_json(&format!(
-                "repos/{REPOSITORY}/actions/runs/{id}/jobs?per_page=100"
-            ))?;
-            if !run_jobs_prove_fast_path_skip(&jobs, lane) {
+            if !download_and_verify_ci_class(id, &class_artifact, sha, scratch_root)? {
                 fast_path_skip = false;
                 break;
             }
@@ -653,7 +709,7 @@ fn download_baseline(
                 "merge queue base chain cycles at {ancestor}"
             )));
         }
-        let observation = query_baseline(lane, &ancestor)?;
+        let observation = query_baseline(lane, &ancestor, dir)?;
         if let Baseline::Found(run, name) = &observation.decision {
             break (*run, name.clone());
         }

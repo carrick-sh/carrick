@@ -1,4 +1,5 @@
 use clap::Args;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
@@ -25,12 +26,18 @@ pub struct CiChangesArgs {
 
     #[arg(long, env = "GITHUB_OUTPUT")]
     pub github_output: Option<PathBuf>,
+
+    /// Optional JSON file path to write the classification (`{heavy, macos, workflows, hardware}`)
+    /// so `kernel-runtime.yml` can upload `ci-class-<sha>.json` as positive fast-path evidence.
+    #[arg(long, env = "CI_CLASS_JSON")]
+    pub json_out: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CiChangesOutputs {
     pub heavy: bool,
     pub macos: bool,
+    #[serde(default)]
     pub workflows: bool,
     pub hardware: bool,
 }
@@ -48,18 +55,13 @@ impl CiChangesOutputs {
 pub enum PathClass {
     /// True unreferenced prose (`*.md` under `docs/`, `.agents/`, or repo root, plus `LICENSE*`).
     Prose,
-    /// `crates/carrick-xtask/**`, `scripts/**`, `justfile`: runs heavy Linux (`lint`, `fmt`,
-    /// `clippy`, `check-test-shards`, xtask tests) with `macos=false` and `hardware=false`.
-    CiXtask,
-    /// `.github/workflows/ci.yml` or non-hardware `.github/*` config (e.g. `.github/actionlint.yaml`):
-    /// runs heavy Linux + macOS on `merge_group`, `workflows=true`, `hardware=false`.
-    WorkflowCi,
-    /// `.github/workflows/kernel-runtime.yml` or other `.github/**`: runs heavy Linux + hardware
-    /// lanes, `workflows=true`.
-    WorkflowHardware,
-    /// Code, Cargo manifests, or any referenced doc/agent file: runs all heavy, macOS (on
-    /// `merge_group`), and hardware lanes.
-    CodeOrReferencedDoc,
+    /// `.github/workflows/**` or `.github/actionlint.yaml`: runs the full heavy, macOS (on
+    /// `merge_group`), and hardware suite, plus `actionlint` (`workflows=true`).
+    Workflow,
+    /// Code, Cargo manifests, `justfile`, `scripts/**`, `crates/carrick-xtask/**`, other
+    /// `.github/**`, or any referenced doc/agent file: runs all heavy, macOS (on `merge_group`),
+    /// and hardware lanes.
+    Full,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -169,30 +171,133 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), CiChangesErro
     Ok(())
 }
 
-fn scan_rust_source(repo_root: &Path, file: &Path, content: &str, refs: &mut ReferencedDocs) {
+pub fn scan_rust_source(repo_root: &Path, file: &Path, content: &str, refs: &mut ReferencedDocs) {
     let stripped = strip_rust_comments(content);
     let file_dir = file.parent().unwrap_or(repo_root);
-    for literal in extract_rust_string_literals(&stripped) {
-        record_candidate_token(repo_root, Some(file_dir), &literal, refs);
+    for line in stripped.lines() {
+        let literals = extract_rust_string_literals(line);
+        let is_path_join_line = line.contains(".join(")
+            || line.contains("Path::new(")
+            || line.contains("PathBuf::from(")
+            || line.contains("read_to_string(")
+            || line.contains("fs::read(");
+        for literal in literals {
+            record_candidate_token(repo_root, Some(file_dir), &literal, is_path_join_line, refs);
+        }
     }
 }
 
-fn scan_script_or_workflow(content: &str, allow_root_md: bool, refs: &mut ReferencedDocs) {
+pub fn scan_script_or_workflow(content: &str, allow_root_md: bool, refs: &mut ReferencedDocs) {
     for line in content.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with('#') && !trimmed.starts_with("#!") {
             continue;
         }
+        // Check for path joins built from pieces in Python/shell scripts, e.g.
+        // `root / "docs" / "conformance-exemptions"` or `os.path.join(ROOT, "docs", "conformance-coverage.md")`.
+        scan_piecewise_path_joins(line, refs);
         for token in extract_path_like_tokens(line) {
             record_script_token(token, allow_root_md, refs);
         }
     }
 }
 
+fn scan_piecewise_path_joins(line: &str, refs: &mut ReferencedDocs) {
+    let literals = extract_double_or_single_quoted_literals(line);
+    for (idx, seg) in literals.iter().enumerate() {
+        if *seg != "docs" && *seg != ".agents" {
+            continue;
+        }
+        let is_join_context = line.contains("os.path.join")
+            || line.contains(".join(")
+            || line.contains(" / \"docs\"")
+            || line.contains(" / 'docs'")
+            || line.contains("\"/\"docs\"")
+            || line.contains(" / \".agents\"")
+            || line.contains(" / '.agents'");
+        if !is_join_context {
+            continue;
+        }
+        // Try to resolve literal segments immediately following `"docs"` or `".agents"` in the
+        // same join expression; if we cannot resolve a sub-path, mark the entire `docs` or
+        // `.agents` tree as referenced (fail-safe).
+        let mut parts = vec![seg.as_str()];
+        for next in literals.iter().skip(idx + 1) {
+            if next.is_empty() || next.contains(' ') || next.starts_with('-') {
+                break;
+            }
+            parts.push(next.as_str());
+        }
+        let has_dynamic_tail = is_unresolvable_piecewise_join(line, seg, parts.len() > 1);
+        if parts.len() > 1 && !has_dynamic_tail {
+            let joined = parts.join("/");
+            record_normalized_doc_ref(&joined, refs);
+        } else {
+            // A bare `docs` / `.agents` path segment with no resolved literal subpath, or a path
+            // join the classifier cannot statically resolve, counts as heavy for every `docs/**`
+            // or `.agents/**` file.
+            refs.dir_prefixes.insert((*seg).to_string());
+        }
+    }
+}
+
+fn is_unresolvable_piecewise_join(line: &str, seg: &str, has_following_literal: bool) -> bool {
+    if !has_following_literal {
+        return true;
+    }
+    let double_pat = format!("\"{seg}\"");
+    let single_pat = format!("'{seg}'");
+    let after = line
+        .split_once(&double_pat)
+        .or_else(|| line.split_once(&single_pat))
+        .map(|(_, rest)| rest.trim_start())
+        .unwrap_or("");
+    // After `"docs"`, if the next operator is `/` or `,`, check whether the operand is a string literal.
+    if let Some(rest) = after
+        .strip_prefix('/')
+        .or_else(|| after.strip_prefix(','))
+        .map(str::trim_start)
+    {
+        return !rest.starts_with('"') && !rest.starts_with('\'');
+    }
+    false
+}
+
+fn extract_double_or_single_quoted_literals(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let quote = bytes[i];
+        if quote == b'"' || quote == b'\'' {
+            i += 1;
+            let mut lit = String::new();
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    lit.push(bytes[i + 1] as char);
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == quote {
+                    i += 1;
+                    break;
+                }
+                lit.push(bytes[i] as char);
+                i += 1;
+            }
+            out.push(lit);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 fn record_candidate_token(
     repo_root: &Path,
     file_dir: Option<&Path>,
     raw: &str,
+    is_path_join_line: bool,
     refs: &mut ReferencedDocs,
 ) {
     let token = raw.trim().trim_matches(|c: char| {
@@ -215,6 +320,10 @@ fn record_candidate_token(
     }
 
     let cleaned = token.trim_start_matches("./");
+    if is_path_join_line && (cleaned == "docs" || cleaned == ".agents") {
+        refs.dir_prefixes.insert(cleaned.to_string());
+        return;
+    }
     if is_doc_or_agent_prefix_candidate(cleaned) {
         record_normalized_doc_ref(cleaned, refs);
     }
@@ -229,6 +338,15 @@ fn record_script_token(raw: &str, allow_root_md: bool, refs: &mut ReferencedDocs
     });
     let cleaned = token.trim_start_matches("./");
     if cleaned.contains("{{") || cleaned.contains("${") {
+        if let Some((prefix, _)) = cleaned
+            .split_once("${")
+            .or_else(|| cleaned.split_once("{{"))
+        {
+            let dir = prefix.trim_end_matches('/');
+            if dir == "docs" || dir == ".agents" || is_doc_or_agent_prefix_candidate(dir) {
+                refs.dir_prefixes.insert(dir.to_string());
+            }
+        }
         return;
     }
     if is_doc_or_agent_prefix_candidate(cleaned)
@@ -247,24 +365,31 @@ fn is_root_markdown_candidate(cleaned: &str) -> bool {
 }
 
 fn is_doc_or_agent_candidate(cleaned: &str) -> bool {
-    is_doc_or_agent_prefix_candidate(cleaned) || is_root_markdown_candidate(cleaned)
+    cleaned == "docs"
+        || cleaned == ".agents"
+        || is_doc_or_agent_prefix_candidate(cleaned)
+        || is_root_markdown_candidate(cleaned)
 }
 
 fn record_normalized_doc_ref(cleaned: &str, refs: &mut ReferencedDocs) {
     let cleaned = cleaned.split('#').next().unwrap_or(cleaned);
-    if cleaned.is_empty() || cleaned == "docs" || cleaned == ".agents" {
+    if cleaned.is_empty() {
+        return;
+    }
+    if cleaned == "docs" || cleaned == ".agents" {
+        refs.dir_prefixes.insert(cleaned.to_string());
         return;
     }
     if let Some((prefix, _)) = cleaned.split_once('*') {
         let dir = prefix.trim_end_matches('/');
-        if !dir.is_empty() && dir != "docs" && dir != ".agents" {
+        if !dir.is_empty() {
             refs.dir_prefixes.insert(dir.to_string());
         }
         return;
     }
     if cleaned.ends_with('/') {
         let dir = cleaned.trim_end_matches('/');
-        if !dir.is_empty() && dir != "docs" && dir != ".agents" {
+        if !dir.is_empty() {
             refs.dir_prefixes.insert(dir.to_string());
         }
         return;
@@ -403,7 +528,7 @@ fn extract_path_like_tokens(line: &str) -> Vec<&str> {
 pub fn classify_path(path: &str, referenced_docs: &ReferencedDocs) -> PathClass {
     let normalized = path.trim().trim_start_matches("./");
     if normalized.is_empty() {
-        return PathClass::CodeOrReferencedDoc;
+        return PathClass::Full;
     }
 
     // 1. Docs / agent instructions / root markdown / LICENSE:
@@ -413,40 +538,28 @@ pub fn classify_path(path: &str, referenced_docs: &ReferencedDocs) -> PathClass 
         || (!normalized.contains('/') && normalized.ends_with(".md"))
     {
         if referenced_docs.is_referenced(normalized) {
-            return PathClass::CodeOrReferencedDoc;
+            return PathClass::Full;
         }
         if normalized.ends_with(".md") {
             return PathClass::Prose;
         }
         // Non-markdown files under `docs/` or `.agents/` (e.g. `.tsv`, `.json`, `.py`, `.sh`)
         // fail safe as heavy even if a new reference pattern wasn't matched.
-        return PathClass::CodeOrReferencedDoc;
+        return PathClass::Full;
     }
     if !normalized.contains('/') && normalized.starts_with("LICENSE") {
         return PathClass::Prose;
     }
 
-    // 2. CI xtask & scripts (`crates/carrick-xtask/**`, `scripts/**`, `justfile`):
-    // Runs heavy Linux (`lint`, `fmt`, `clippy`, `check-test-shards`, xtask tests) with
-    // `macos=false` and `hardware=false`.
-    if normalized == "justfile"
-        || normalized.starts_with("crates/carrick-xtask/")
-        || normalized.starts_with("scripts/")
-    {
-        return PathClass::CiXtask;
+    // 2. Workflows (`.github/workflows/**`, `.github/actionlint.yaml`):
+    // Runs the full set plus `actionlint` (`workflows=true`).
+    if normalized.starts_with(".github/workflows/") || normalized == ".github/actionlint.yaml" {
+        return PathClass::Workflow;
     }
 
-    // 3. Workflows (`.github/workflows/**`, `.github/**`):
-    // Runs the lanes the workflow defines.
-    if normalized == ".github/workflows/ci.yml" || normalized == ".github/actionlint.yaml" {
-        return PathClass::WorkflowCi;
-    }
-    if normalized.starts_with(".github/") {
-        return PathClass::WorkflowHardware;
-    }
-
-    // 4. Fail-safe: any unknown or product/test path runs everything.
-    PathClass::CodeOrReferencedDoc
+    // 3. Everything else (`justfile`, `scripts/**`, `crates/**` including `carrick-xtask`,
+    // `.github/**`, and any unknown path) runs the full set as main does today.
+    PathClass::Full
 }
 
 pub fn evaluate_changes(
@@ -485,30 +598,17 @@ pub fn evaluate_changes(
     }
 
     let mut heavy = false;
-    let mut needs_macos = false;
     let mut workflows = false;
-    let mut hardware = false;
 
     for path in paths {
         match classify_path(path, referenced_docs) {
             PathClass::Prose => {}
-            PathClass::CiXtask => {
-                heavy = true;
-            }
-            PathClass::WorkflowCi => {
-                heavy = true;
-                needs_macos = true;
-                workflows = true;
-            }
-            PathClass::WorkflowHardware => {
+            PathClass::Workflow => {
                 heavy = true;
                 workflows = true;
-                hardware = true;
             }
-            PathClass::CodeOrReferencedDoc => {
+            PathClass::Full => {
                 heavy = true;
-                needs_macos = true;
-                hardware = true;
             }
         }
     }
@@ -516,9 +616,9 @@ pub fn evaluate_changes(
     let _ = pr_draft;
     CiChangesOutputs {
         heavy,
-        macos: is_merge_group && needs_macos,
+        macos: is_merge_group && heavy,
         workflows,
-        hardware,
+        hardware: heavy,
     }
 }
 
@@ -652,6 +752,22 @@ pub fn run<W: Write>(
                 path: output_path.clone(),
                 source,
             })?;
+    }
+    if let Some(json_path) = &args.json_out {
+        if let Some(parent) = json_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|source| CiChangesError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let json_bytes = serde_json::to_vec(&outputs)
+            .map_err(|source| CiChangesError::Git(format!("serialize ci-class.json: {source}")))?;
+        fs::write(json_path, json_bytes).map_err(|source| CiChangesError::Io {
+            path: json_path.clone(),
+            source,
+        })?;
     }
     writeln!(
         writer,

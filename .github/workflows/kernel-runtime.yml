@@ -103,7 +103,14 @@ jobs:
           CI_EVENT: ${{ github.event_name }}
           CI_BASE: ${{ github.event.merge_group.base_sha }}
           CI_BASE_REF: ${{ github.event.merge_group.base_ref }}
+          CI_CLASS_JSON: ${{ runner.temp }}/ci-class/ci-class-${{ github.sha }}.json
         run: just ci-changes
+      - name: Upload classification receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-class-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-class/ci-class-${{ github.sha }}.json
+          if-no-files-found: error
 
   signed-fixtures:
     name: Linux ARM64 · exact-SHA signed fixtures

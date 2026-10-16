@@ -420,7 +420,8 @@ prior, docs_head, candidate = (os.environ[k] for k in ('FAST_PRIOR', 'FAST_DOCS'
 docs_conclusion = os.environ.get('FAST_DOCS_CONCLUSION', 'success')
 docs_event = os.environ.get('FAST_DOCS_EVENT', 'push')
 docs_branch = 'gh-readonly-queue/main/pr-1' if docs_event == 'merge_group' else 'main'
-docs_hvf_job = os.environ.get('FAST_DOCS_HVF_JOB', 'skipped')
+docs_hardware = os.environ.get('FAST_DOCS_HARDWARE', 'false') == 'true'
+docs_hvf_job = 'success' if docs_hardware else 'skipped'
 args = sys.argv[1:]
 if args[:2] == ['api', 'graphql']:
     nodes = [] if os.environ.get('FAST_EMPTY_QUEUE') == '1' else [
@@ -439,21 +440,37 @@ elif args[0] == 'api' and '/runs?head_sha=' in args[-1]:
            'head_repository': {'full_name': 'carrick-sh/carrick'}}
     print(json.dumps({'workflow_runs': [run]}))
 elif args[0] == 'api' and '/artifacts?' in args[-1]:
-    names = [f'receipt-hvf-{prior}-1'] if '/runs/10/' in args[-1] else []
+    if '/runs/10/' in args[-1]:
+        names = [f'ci-class-{prior}-1', f'receipt-hvf-{prior}-1']
+    else:
+        names = [f'ci-class-{docs_head}-1']
     print(json.dumps({'artifacts': [{'name': name, 'expired': False} for name in names]}))
 elif args[0] == 'api' and '/runs/11/jobs?' in args[-1]:
+    # Real GitHub Actions jobs API payload uses display names (`name:` in kernel-runtime.yml).
     jobs = [
         {'name': 'changes', 'conclusion': 'success'},
-        {'name': 'signed-fixtures', 'conclusion': docs_hvf_job},
-        {'name': 'hvf-kernel', 'conclusion': docs_hvf_job},
+        {'name': 'Linux ARM64 · exact-SHA signed fixtures', 'conclusion': docs_hvf_job},
+        {'name': 'HVF · signed embed + cached probes', 'conclusion': docs_hvf_job},
+        {'name': 'KVM · x86 kvm-lane tests', 'conclusion': docs_hvf_job},
+        {'name': 'KVM · x86 kvm-lane tests (Willow)', 'conclusion': 'skipped'},
     ]
     print(json.dumps({'jobs': jobs}))
 elif args[0] == 'api' and f'/commits/{docs_head}' in args[-1]:
     print(json.dumps({'parents': [{'sha': prior}]}))
 elif args[:2] == ['run', 'download']:
+    name = args[args.index('--name') + 1]
     dest = pathlib.Path(args[args.index('--dir') + 1])
     dest.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(os.environ['FAST_BASE_RECEIPT'], dest / 'receipt.json')
+    if name.startswith(f'ci-class-{docs_head}'):
+        payload = {
+            'heavy': docs_hardware,
+            'macos': docs_hardware,
+            'workflows': False,
+            'hardware': docs_hardware,
+        }
+        (dest / f'ci-class-{docs_head}.json').write_text(json.dumps(payload))
+    else:
+        shutil.copyfile(os.environ['FAST_BASE_RECEIPT'], dest / 'receipt.json')
 else:
     raise SystemExit(f'unexpected gh invocation: {args}')
 "#,
@@ -545,8 +562,8 @@ else:
             .unwrap();
         assert!(!failed.status.success());
 
-        // A heavy merge_group ancestor whose receipt artifact expired (hvf-kernel concluded
-        // `success`, not `skipped`) must NOT hop to first-parent; it must fail closed on
+        // A heavy merge_group ancestor whose receipt artifact expired (`ci-class-<sha>.json`
+        // recorded `hardware=true`) must NOT hop to first-parent; it must fail closed on
         // #484's merge_group_run branch.
         let expired_heavy_mg = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
             .args([
@@ -573,7 +590,7 @@ else:
             .env("FAST_BASE_RECEIPT", &baseline_file)
             .env("FAST_EMPTY_QUEUE", "1")
             .env("FAST_DOCS_EVENT", "merge_group")
-            .env("FAST_DOCS_HVF_JOB", "success")
+            .env("FAST_DOCS_HARDWARE", "true")
             .output()
             .unwrap();
         assert!(!expired_heavy_mg.status.success());
