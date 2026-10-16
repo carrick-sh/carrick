@@ -1460,7 +1460,7 @@ fn lifecycle_window(
 pub(crate) fn handle_metadata_grant_trap(
     vcpu: &mut applevisor::vcpu::Vcpu,
     cpu: carrick_guest_arch::CpuId,
-    custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
+    custody: &Arc<crate::trap::CarrierVmCustody>,
     generation: Option<crate::trap::CarrierVmGeneration>,
 ) -> Result<MetadataTrapOutcome, TrapError> {
     use applevisor::vcpu::Reg;
