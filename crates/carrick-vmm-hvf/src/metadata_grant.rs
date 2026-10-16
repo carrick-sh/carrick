@@ -1181,6 +1181,16 @@ fn complete_metadata_request(
     Ok(())
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn fork_custody_in_retained_region(offset: usize, bytes: usize) -> bool {
+    // The EL1 allocator starts in retained bootstrap metadata, then uses the
+    // adjacent heap. A fork before heap expansion may select either range.
+    offset >= carrick_el1_abi::EL1_BOOTSTRAP_METADATA_OFFSET as usize
+        && offset
+            .checked_add(bytes)
+            .is_some_and(|end| end <= carrick_el1_abi::EL1_REGION_SIZE as usize)
+}
+
 /// Native stock crossings retain an ABI stack, not a physical inventory row.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[allow(clippy::too_many_arguments)]
@@ -1320,11 +1330,7 @@ pub(crate) fn service_native_fork_stock(
                     settlement.refuse(ForkStockRefusal::Inventory);
                     return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
                 };
-                if offset < carrick_el1_abi::EL1_HEAP_OFFSET as usize
-                    || offset
-                        .checked_add(bytes)
-                        .is_none_or(|end| end > carrick_el1_abi::EL1_REGION_SIZE as usize)
-                {
+                if !fork_custody_in_retained_region(offset, bytes) {
                     settlement.refuse(ForkStockRefusal::Inventory);
                     return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
                 }
@@ -1684,6 +1690,20 @@ fn root_execution(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn fork_custody_accepts_retained_bootstrap_metadata_and_rejects_abi_stacks() {
+        let bootstrap = carrick_el1_abi::EL1_BOOTSTRAP_METADATA_OFFSET as usize;
+        let heap = carrick_el1_abi::EL1_HEAP_OFFSET as usize;
+        let limit = carrick_el1_abi::EL1_REGION_SIZE as usize;
+        assert!(fork_custody_in_retained_region(bootstrap, 32));
+        assert!(fork_custody_in_retained_region(heap - 32, 32));
+        assert!(fork_custody_in_retained_region(heap, 32));
+        assert!(!fork_custody_in_retained_region(bootstrap - 32, 32));
+        assert!(!fork_custody_in_retained_region(limit - 16, 32));
+        assert!(!fork_custody_in_retained_region(usize::MAX, 32));
+    }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
