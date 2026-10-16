@@ -61,7 +61,10 @@ impl ProcessExitCustody {
         }
     }
 
-    fn caller_reserved(&self) -> bool {
+    /// Whether process custody has consumed the caller's live membership.
+    /// Wait-key publication is notification plumbing and cannot choose the
+    /// remaining members' retirement floor.
+    pub fn caller_reserved(&self) -> bool {
         use core::sync::atomic::Ordering;
         loop {
             match self.begun.load(Ordering::Acquire) {
@@ -612,6 +615,34 @@ impl TerminalCustody<Thread, Live> {
     }
 }
 
+/// Reserve one exiting member using the neutral process owner's phase.
+/// A host member and an in-zone member obey the same floor, including when
+/// the root reserves its caller before publishing the exit wait channel.
+pub fn reserve_thread_exit_membership(
+    page: &impl Lifecycle,
+) -> Result<NonfinalExitMembership<'_>, MembershipFloor> {
+    reserve_thread_exit_membership_with(page, || {})
+}
+
+fn reserve_thread_exit_membership_with(
+    page: &impl Lifecycle,
+    after_phase_observation: impl FnOnce(),
+) -> Result<NonfinalExitMembership<'_>, MembershipFloor> {
+    let caller_reserved = page.process_exit_custody().caller_reserved();
+    after_phase_observation();
+    if caller_reserved {
+        page.reserve_cancelled_member_exit()
+    } else {
+        match page.reserve_nonfinal_exit() {
+            // The root may reserve its caller after our phase observation.
+            Err(_) if page.process_exit_custody().caller_reserved() => {
+                page.reserve_cancelled_member_exit()
+            }
+            result => result,
+        }
+    }
+}
+
 impl TerminalCustody<Thread, Exiting> {
     pub fn route_to_host(self) -> RetirementVerdict {
         RetirementVerdict::RetireThreadOnHost {
@@ -643,20 +674,7 @@ impl TerminalCustody<Thread, Exiting> {
         ),
         (Self, MembershipFloor),
     > {
-        let caller_reserved = page.process_exit_custody().caller_reserved();
-        after_phase_observation();
-        let membership = match if caller_reserved {
-            page.reserve_cancelled_member_exit()
-        } else {
-            match page.reserve_nonfinal_exit() {
-                // The root can claim and publish its caller between our
-                // first phase observation and the floor-one reservation.
-                Err(_) if page.process_exit_custody().caller_reserved() => {
-                    page.reserve_cancelled_member_exit()
-                }
-                result => result,
-            }
-        } {
+        let membership = match reserve_thread_exit_membership_with(page, after_phase_observation) {
             Ok(membership) => membership,
             Err(error) => return Err((self, error)),
         };
