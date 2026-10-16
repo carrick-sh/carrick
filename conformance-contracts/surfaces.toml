@@ -1029,6 +1029,10 @@ path = "crates/carrick-el1-linux/src/native_process_runtime.rs"
 contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.short-lock", "process.native.terminal-child", "process.native.arm-admission"]
 
 [[surfaces]]
+path = "crates/carrick-el1-linux/src/native_process_runtime/host_test_support.rs"
+contracts = ["kernel.el1.signal-delivery-owner", "kernel.el1.thread-lifecycle"]
+
+[[surfaces]]
 path = "crates/carrick-el1-linux/src/fork_loan.rs"
 contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
 

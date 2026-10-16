@@ -587,7 +587,7 @@ mod tests {
 ))]
 use carrick_guest_arch::UserVa;
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::FromBytes;
 
 /// The Linux signal-frame codec over the neutral ARM backend's types.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
