@@ -1924,10 +1924,12 @@ mod tests {
         let generation = custody.begin_create().unwrap();
         custody.commit_create(generation).unwrap();
         assert!(
-            crate::fork_stock::ForkStockHostCustody::resolve_record_ptr::<
-                carrick_el1_abi::NativeForkDiagnostic,
-            >(&custody, address)
-            .is_err(),
+            custody
+                .stage2_record_covering(
+                    address,
+                    core::mem::size_of::<carrick_el1_abi::NativeForkDiagnostic>()
+                )
+                .is_none(),
             "ABI stacks are not physical fork-stock rows"
         );
         assert_eq!(
