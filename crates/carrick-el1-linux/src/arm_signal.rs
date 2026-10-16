@@ -57,11 +57,19 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
 
 /// The synthetic mailbox checkpoint puts the original syscall arg0 in FAR;
 /// no guest fault uses FAR on this entry. A handler with SA_RESTART rewinds
-/// the interrupted SVC only for the shared restartable-call policy.
+/// the interrupted SVC only for the shared restartable-call policy. The
+/// restart-eligible mailbox marker authenticates the continuation's untimed
+/// wait; a timed wait uses the distinct no-restart marker.
 pub(crate) fn restart_forwarded_frame(frame: &mut TrapFrame) -> Option<bool> {
     if frame.esr != 0xfffe
         || frame.x[0] != carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64
-        || !carrick_signal_core::is_restartable_syscall(frame.x[8])
+        || !matches!(
+            carrick_signal_core::wait::classify_syscall_restart(
+                frame.x[8],
+                carrick_signal_core::wait::SocketWaitTimeout::Untimed,
+            ),
+            carrick_signal_core::wait::RestartClass::IfSaRestart
+        )
     {
         return None;
     }
@@ -249,6 +257,30 @@ mod tests {
         assert_eq!(restart_forwarded_frame(&mut read), Some(true));
         assert_eq!(read.x[0], 0x1234);
         assert_eq!(read.elr, 0x8000);
+
+        let mut timed_recv = TrapFrame::default();
+        timed_recv.esr = 0xfffd; // host continuation with SO_RCVTIMEO
+        timed_recv.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
+        timed_recv.x[8] = 207; // ARM recvfrom
+        timed_recv.far = 0x1234;
+        timed_recv.elr = 0x8004;
+        assert_eq!(restart_forwarded_frame(&mut timed_recv), None);
+        assert_eq!(
+            timed_recv.x[0],
+            carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64
+        );
+        assert_eq!(timed_recv.elr, 0x8004);
+
+        for nr in [202, 242, 207, 212] {
+            let mut socket = TrapFrame::default();
+            socket.esr = 0xfffe;
+            socket.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
+            socket.x[8] = nr;
+            socket.far = 0x5678;
+            socket.elr = 0x9004;
+            assert_eq!(restart_forwarded_frame(&mut socket), Some(true));
+            assert_eq!((socket.x[0], socket.elr), (0x5678, 0x9000));
+        }
 
         let mut ppoll = TrapFrame::default();
         ppoll.esr = 0xfffe;
@@ -549,6 +581,7 @@ mod tests {
 }
 
 #[cfg(any(
+    test,
     feature = "host-test",
     all(target_os = "none", target_arch = "aarch64")
 ))]
@@ -633,6 +666,7 @@ impl carrick_personality_linux::signal::SignalBackend for LinuxAarch64Backend {
 
 /// Shared frame publication for the native backend and its host-path witness.
 #[cfg(any(
+    test,
     feature = "host-test",
     all(target_os = "none", target_arch = "aarch64")
 ))]

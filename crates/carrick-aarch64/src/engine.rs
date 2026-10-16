@@ -5280,9 +5280,15 @@ fn seed_sibling_snapshot(
 }
 
 impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
-    fn complete_native_signal_return(&mut self, value: i64) -> Result<(), TrapError> {
+    fn complete_native_signal_return(
+        &mut self,
+        value: i64,
+        restart_eligible: bool,
+    ) -> Result<(), TrapError> {
         self.pending_resume_pc = None;
-        self.vcpu.get_mut().complete_native_signal_return(value)
+        self.vcpu
+            .get_mut()
+            .complete_native_signal_return(value, restart_eligible)
     }
 
     fn el1_switchable_roots(&self) -> Option<(u64, u64)> {

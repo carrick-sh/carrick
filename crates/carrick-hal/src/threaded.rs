@@ -3239,7 +3239,11 @@ impl HvpatchVerifiedChildKernelBinding {
 pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     /// A ring-owned signal binding must checkpoint delivery after a host
     /// forwarded completion and before the next EL0 instruction.
-    fn complete_native_signal_return(&mut self, value: i64) -> Result<(), TrapError> {
+    fn complete_native_signal_return(
+        &mut self,
+        value: i64,
+        _restart_eligible: bool,
+    ) -> Result<(), TrapError> {
         self.complete_syscall(value)
     }
     /// Commit a host-loaded in-kernel home only after exact MM occupancy has
