@@ -449,6 +449,13 @@ pub struct PendingForkLoan<T> {
     pub tag: T,
 }
 
+/// The stopped lane's wire settlement and the physical custody it hands to
+/// the committed child as one operation. Abort drops the unused custody.
+pub struct ForkStockSettlementReceipt<'a, C> {
+    pub record: &'a mut ForkStockSettlement,
+    pub physical: C,
+}
+
 /// A settled child whose memory is live in the guest owner graph.
 #[derive(Debug)]
 struct CommittedChild<T, C> {
@@ -1094,12 +1101,15 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         &mut self,
         ledger: &mut impl ForkTableLedger,
         execution: GrantExecution,
-        settlement: &mut ForkStockSettlement,
-        physical: C,
+        receipt: ForkStockSettlementReceipt<'_, C>,
         is_resolvable: impl Fn(&[RootGpa]) -> bool,
         is_clean: impl Fn(&[RootGpa]) -> bool,
         clear_lifecycle: impl FnOnce(ForkLifecycleLoan) -> bool,
     ) -> Result<(), ForkStockServiceError> {
+        let ForkStockSettlementReceipt {
+            record: settlement,
+            physical,
+        } = receipt;
         let loan = self.settlement_loan(execution)?;
         let index = cpu_index(execution.cpu).ok_or(ForkStockServiceError::NoPendingLoan)?;
         let pending = self.pending[index]

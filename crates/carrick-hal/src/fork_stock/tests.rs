@@ -56,8 +56,10 @@ fn committed_child_retains_physical_custody_through_quarantine() {
         .settle(
             &mut NoTableLedger,
             parent,
-            &mut settlement,
-            PhysicalPin(Arc::clone(&dropped)),
+            ForkStockSettlementReceipt {
+                record: &mut settlement,
+                physical: PhysicalPin(Arc::clone(&dropped)),
+            },
             |_| true,
             |_| true,
             |_| true,
@@ -198,8 +200,10 @@ fn commit<T: ChildAddressTags>(
     stock.settle(
         &mut NoTableLedger,
         exec,
-        &mut settlement,
-        (),
+        ForkStockSettlementReceipt {
+            record: &mut settlement,
+            physical: (),
+        },
         |_| true,
         |_| true,
         |_| true,
@@ -455,8 +459,10 @@ fn abort_returns_cleared_lifecycle_and_untouched_tables() {
         stock.settle(
             &mut NoTableLedger,
             parent(),
-            &mut abort,
-            (),
+            ForkStockSettlementReceipt {
+                record: &mut abort,
+                physical: ()
+            },
             |_| true,
             |_| true,
             |_| false
@@ -469,8 +475,10 @@ fn abort_returns_cleared_lifecycle_and_untouched_tables() {
         .settle(
             &mut NoTableLedger,
             parent(),
-            &mut abort,
-            (),
+            ForkStockSettlementReceipt {
+                record: &mut abort,
+                physical: (),
+            },
             |_| true,
             |_| true,
             |life| {
@@ -516,8 +524,10 @@ fn abort_settle_is_atomic_on_tag_release_failure() {
     let result = stock.settle(
         &mut NoTableLedger,
         parent(),
-        &mut abort,
-        (),
+        ForkStockSettlementReceipt {
+            record: &mut abort,
+            physical: (),
+        },
         |_| true,
         |_| true,
         |_| true,
@@ -539,8 +549,10 @@ fn abort_refuses_dirty_tables_and_subsequent_loan_refuses_until_scrubbed_and_abo
     let result = stock.settle(
         &mut NoTableLedger,
         exec,
-        &mut abort,
-        (),
+        ForkStockSettlementReceipt {
+            record: &mut abort,
+            physical: (),
+        },
         |_| true,
         |_| is_clean.get(),
         |_| true,
@@ -558,8 +570,10 @@ fn abort_refuses_dirty_tables_and_subsequent_loan_refuses_until_scrubbed_and_abo
     let result = stock.settle(
         &mut NoTableLedger,
         exec,
-        &mut abort,
-        (),
+        ForkStockSettlementReceipt {
+            record: &mut abort,
+            physical: (),
+        },
         |_| true,
         |_| is_clean.get(),
         |_| true,
@@ -596,8 +610,10 @@ fn commit_refuses_dirty_unused_tables() {
         stock.settle(
             &mut NoTableLedger,
             parent(),
-            &mut settlement,
-            (),
+            ForkStockSettlementReceipt {
+                record: &mut settlement,
+                physical: ()
+            },
             |_| true,
             |_| false,
             |_| true

@@ -1106,8 +1106,10 @@ impl Cpl0HostCustody {
             .settle(
                 &mut NoTableLedger,
                 execution,
-                &mut record,
-                (),
+                carrick_hal::fork_stock::ForkStockSettlementReceipt {
+                    record: &mut record,
+                    physical: (),
+                },
                 |pages| tables_resolve(memory, pages),
                 |pages| tables_are_zero(memory, pages),
                 |lifecycle| window.clear(lifecycle),
