@@ -50,8 +50,9 @@ pub struct Thread;
 /// The neutral process terminal owner records the one physical-retirement
 /// publication. An executor failure after normal publication reuses that
 /// receipt; it cannot manufacture a second one from a later member snapshot.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub enum ProcessPhysicalPublication<C> {
+    #[default]
     Unpublished,
     Published(C),
 }
@@ -70,12 +71,6 @@ mod process_physical_publication_tests {
         assert_eq!(owner.published(), Some(&vec![11, 12]));
         assert!(owner.publish(vec![13]).is_err());
         assert_eq!(owner.published(), Some(&vec![11, 12]));
-    }
-}
-
-impl<C> Default for ProcessPhysicalPublication<C> {
-    fn default() -> Self {
-        Self::Unpublished
     }
 }
 
