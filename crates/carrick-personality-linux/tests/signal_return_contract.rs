@@ -33,6 +33,9 @@ impl<'a> SignalNative<'a> for Native {
     fn set_current_blocked(&mut self, mask: SigBlockMask) {
         self.blocked = mask;
     }
+    fn set_current_altstack(&mut self, stack: carrick_personality_linux::abi::thread::AltStack) {
+        self.altstack = stack;
+    }
     fn current_pid(&self) -> u32 {
         1
     }
@@ -45,21 +48,27 @@ impl<'a> SignalNative<'a> for Native {
     }
     fn restore_signal_frame(
         &mut self,
-    ) -> Result<carrick_signal_core::policy::SigBlockMask, carrick_syscall_abi::LinuxErrno> {
+    ) -> Result<RestoredSignalFrame, carrick_syscall_abi::LinuxErrno> {
         if let Some(frame) = &self.arm_frame {
             use zerocopy::IntoBytes;
             let resume = arm::decode(frame.as_bytes(), UserVa::new(0x40000), true)
                 .map_err(|_| carrick_syscall_abi::LinuxErrno::new(14))?;
             self.accumulator = resume.regs[0];
-            return Ok(resume.mask);
+            let stack =
+                restored_altstack(resume.stack).ok_or(carrick_syscall_abi::LinuxErrno::new(14))?;
+            return Ok(RestoredSignalFrame {
+                mask: resume.mask,
+                stack,
+            });
         }
         if self.invalid {
             return Err(carrick_syscall_abi::LinuxErrno::new(14));
         }
         self.accumulator = 0x1234_5678;
-        Ok(SigBlockMask::blocking_all_of(
-            carrick_signal_core::SignalSet::from_bits(1 << 9),
-        ))
+        Ok(RestoredSignalFrame {
+            mask: SigBlockMask::blocking_all_of(carrick_signal_core::SignalSet::from_bits(1 << 9)),
+            stack: self.altstack,
+        })
     }
 }
 #[test]
@@ -110,12 +119,18 @@ fn sigreturn_restores_saved_autodisarm_stack_after_handler() {
         altstack: carrick_personality_linux::abi::thread::AltStack::DISABLED,
         arm_frame: Some(frame),
     };
-    assert_eq!(invoke(SignalCall::RtSigreturn, &mut native), Some(SignalOutcome::Restored));
+    assert_eq!(
+        invoke(SignalCall::RtSigreturn, &mut native),
+        Some(SignalOutcome::Restored)
+    );
     let expected_sp = stack.ss_sp;
     let expected_size = stack.ss_size;
     assert_eq!(native.altstack.sp, expected_sp);
     assert_eq!(native.altstack.size, expected_size);
-    assert_eq!(native.altstack.flags, carrick_syscall_abi::LINUX_SS_AUTODISARM as u32);
+    assert_eq!(
+        native.altstack.flags,
+        carrick_syscall_abi::LINUX_SS_AUTODISARM as u32
+    );
 }
 
 #[test]
@@ -207,7 +222,7 @@ fn frame_masks_cross_as_blocked_domains() {
         params.mask
     }
     fn restored_mask(native: &mut Native) -> Result<SigBlockMask, carrick_syscall_abi::LinuxErrno> {
-        native.restore_signal_frame()
+        Ok(native.restore_signal_frame()?.mask)
     }
     let mask = SigBlockMask::blocking_all_of(carrick_signal_core::SignalSet::from_bits(1 << 9));
     let params = carrick_personality_linux::signal::SignalFrameParams {

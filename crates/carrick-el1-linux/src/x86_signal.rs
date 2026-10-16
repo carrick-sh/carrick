@@ -188,7 +188,7 @@ impl SignalBackend for LinuxX86Backend {
         frame: &mut NativeFrame,
         fpstate: &mut [u8],
         copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool,
-    ) -> Result<carrick_signal_core::policy::SigBlockMask, Self::Error> {
+    ) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, Self::Error> {
         let uc_addr = UserVa::new(frame.rsp);
         let mut uc_bytes = [0u8; core::mem::size_of::<Ucontext>()];
         if !copy_in(&mut uc_bytes, uc_addr) {
@@ -197,6 +197,8 @@ impl SignalBackend for LinuxX86Backend {
         let Ok(uc) = Ucontext::read_from_bytes(&uc_bytes) else {
             return Err(ArchError::InvalidFrame);
         };
+        let stack = carrick_personality_linux::signal::restored_altstack(uc.uc_stack)
+            .ok_or(ArchError::InvalidFrame)?;
 
         let flags = carrick_sched_core::signal_return_flags(frame.r11, uc.uc_mcontext.eflags);
         if !carrick_sched_core::valid_user_return_words(
@@ -285,8 +287,11 @@ impl SignalBackend for LinuxX86Backend {
         frame.user_rcx = uc.uc_mcontext.rcx;
         frame.rsp = uc.uc_mcontext.rsp;
 
-        Ok(carrick_signal_core::policy::SigBlockMask::blocking_all_of(
-            carrick_signal_core::SignalSet::from_bits(uc.uc_sigmask),
-        ))
+        Ok(carrick_personality_linux::signal::RestoredSignalFrame {
+            mask: carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                carrick_signal_core::SignalSet::from_bits(uc.uc_sigmask),
+            ),
+            stack,
+        })
     }
 }

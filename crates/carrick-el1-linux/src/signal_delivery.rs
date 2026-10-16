@@ -77,9 +77,10 @@ where
                     thread_blocked,
                 );
             }
+            let interrupted_sp = machine.user_sp(frame);
             let selected_stack = carrick_personality_linux::signal::delivery_stack(
                 slot.read_altstack(),
-                machine.user_sp(frame),
+                interrupted_sp,
                 action.flags.on_stack,
             );
             let Some((sp, stack)) = selected_stack else {
@@ -130,6 +131,7 @@ where
                     thread_blocked,
                 );
             }
+            commit_handler_stack(slot, stack, sp, interrupted_sp, action.flags.on_stack);
             let mask = policy::handler_block_mask(sig, action, thread_blocked);
             let _ = slot.store_blocked_then_read_pending(
                 BlockedMask(mask.signals().bits()),
@@ -137,6 +139,21 @@ where
             );
             None
         }
+    }
+}
+
+fn commit_handler_stack(
+    slot: &carrick_el1_abi::ThreadControlSlot,
+    saved: carrick_syscall_abi::LinuxSignalStack,
+    selected_sp: UserVa,
+    interrupted_sp: UserVa,
+    on_stack: bool,
+) {
+    if on_stack
+        && selected_sp != interrupted_sp
+        && (saved.ss_flags as u32 & carrick_syscall_abi::LINUX_SS_AUTODISARM as u32) != 0
+    {
+        slot.write_altstack(carrick_personality_linux::abi::thread::AltStack::DISABLED);
     }
 }
 
@@ -171,4 +188,38 @@ where
     let mask = blocked.signals().without(Signal::SEGV);
     let _ = slot.store_blocked_then_read_pending(BlockedMask(mask.bits()), slot.pending());
     deliver_signal_on_syscall_return(task, process, frame, fpstate, machine)
+}
+
+#[cfg(test)]
+mod altstack_tests {
+    use super::*;
+    use carrick_personality_linux::abi::thread::AltStack;
+
+    #[test]
+    fn caught_onstack_handler_disarms_only_after_switching_stacks() {
+        let slot = carrick_el1_abi::ThreadControlSlot::new();
+        let setting = AltStack {
+            sp: 0x10_0000,
+            size: 8192,
+            flags: carrick_syscall_abi::LINUX_SS_AUTODISARM as u32,
+        };
+        slot.write_altstack(setting);
+        let (_, saved) = carrick_personality_linux::signal::delivery_stack(
+            setting,
+            UserVa::new(0x20_0000),
+            true,
+        )
+        .unwrap();
+        commit_handler_stack(
+            &slot,
+            saved,
+            UserVa::new(0x10_2000),
+            UserVa::new(0x20_0000),
+            true,
+        );
+        assert!(slot.read_altstack().is_disabled());
+        let restored = carrick_personality_linux::signal::restored_altstack(saved).unwrap();
+        let flags = restored.flags;
+        assert_eq!(flags, carrick_syscall_abi::LINUX_SS_AUTODISARM as u32);
+    }
 }
