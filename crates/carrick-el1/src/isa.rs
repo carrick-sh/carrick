@@ -132,8 +132,6 @@ pub mod x86_user_tables;
 #[cfg(any(target_arch = "x86_64", test))]
 #[path = "isa/x86/initial_mm.rs"]
 pub mod x86_initial_mm;
-#[path = "isa/x86/live_context.rs"]
-pub mod x86_live_context;
 
 /// Architectural user stack pointer for AArch64.
 ///
