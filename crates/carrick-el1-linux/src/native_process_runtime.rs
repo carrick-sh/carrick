@@ -7716,6 +7716,40 @@ mod tests {
             first_record,
             carrick_signal_core::policy::SigBlockMask::NONE,
         );
+        // A queued process event may retain the pre-exec record while the
+        // process task serial remains live. Admission must select that task
+        // through the durable process key, not the obsolete record.
+        let process_event = carrick_el1_abi::ExternalSignalRecord::new(
+            event.identity(),
+            event.binding(),
+            RecordRef {
+                incarnation: first_record.incarnation + 1,
+                ..first_record
+            },
+            carrick_el1_abi::SignalEventGeneration::new(NonZeroU64::new(3).unwrap()),
+            event.signal(),
+            event.source(),
+        )
+        .process_directed()
+        .for_process(first_binding.task, first_binding.generation);
+        assert!(registry.for_external_event(&zone, process_event).is_some());
+        queue.admit(process_event).unwrap();
+        assert_eq!(
+            registry
+                .drain_external_ingress(
+                    &zone,
+                    &queue,
+                    carrick_sched_core::SlotId::new(0),
+                    &mut services[0],
+                )
+                .unwrap(),
+            1
+        );
+        assert!(signals.pending_set(first_record).contains(event.signal()));
+        let _ = signals.take_deliverable(
+            first_record,
+            carrick_signal_core::policy::SigBlockMask::NONE,
+        );
         let mut children = Vec::new();
         for index in 0..2 {
             let task = &tasks[index];
