@@ -6632,15 +6632,56 @@ mod tests {
                 on_signal_clock: None,
             },
         ];
-        assert!(registry
-            .admit_external_event(
-                &zone,
-                event,
-                carrick_sched_core::SlotId::new(0),
-                &mut services[0],
-            )
-            .unwrap());
+        assert!(
+            registry
+                .admit_external_event(
+                    &zone,
+                    event,
+                    carrick_sched_core::SlotId::new(0),
+                    &mut services[0],
+                )
+                .unwrap()
+        );
         let signals = runtimes[0].current_signals(&tasks[0]).unwrap();
+        assert!(signals.pending_set(first_record).contains(event.signal()));
+        let _ = signals.take_deliverable(
+            first_record,
+            carrick_signal_core::policy::SigBlockMask::NONE,
+        );
+        let queue = carrick_el1_abi::SharedSignalIngressQueue::new();
+        queue.admit(stale).unwrap();
+        assert_eq!(
+            registry
+                .drain_external_ingress(
+                    &zone,
+                    &queue,
+                    carrick_sched_core::SlotId::new(0),
+                    &mut services[0],
+                )
+                .unwrap(),
+            0
+        );
+        assert!(!signals.pending_set(first_record).contains(event.signal()));
+        let queued = carrick_el1_abi::ExternalSignalRecord::new(
+            event.identity(),
+            event.binding(),
+            event.record(),
+            carrick_el1_abi::SignalEventGeneration::new(NonZeroU64::new(2).unwrap()),
+            event.signal(),
+            event.source(),
+        );
+        queue.admit(queued).unwrap();
+        assert_eq!(
+            registry
+                .drain_external_ingress(
+                    &zone,
+                    &queue,
+                    carrick_sched_core::SlotId::new(0),
+                    &mut services[0],
+                )
+                .unwrap(),
+            1
+        );
         assert!(signals.pending_set(first_record).contains(event.signal()));
         let _ = signals.take_deliverable(
             first_record,
