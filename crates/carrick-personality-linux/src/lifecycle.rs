@@ -536,14 +536,15 @@ pub fn invoke<'a>(
     }
     // clone(2): only SIGCHLD with child-local TID effects is equivalent to
     // fork here. CLONE_VM/THREAD, shared tables, other exit signals and extra
-    // arguments keep their existing thread-path refusal and errno.
+    // arguments keep their existing thread-path refusal and errno. clone(2)
+    // has five arguments on AArch64; x5 is outside its ABI and may contain
+    // caller-saved residue, so it cannot participate in admission.
     if call == LifecycleCall::Clone
         && args[0] & !(CSIGNAL | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) == 0
         && args[0] & CSIGNAL == carrick_signal_core::policy::Signal::CHLD.number() as u64
         && args[1] == 0
         && args[2] == 0
         && args[3] == 0
-        && args[5] == 0
         && ((args[0] & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) != 0 && args[4] != 0)
             || (args[0] & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) == 0 && args[4] == 0))
     {

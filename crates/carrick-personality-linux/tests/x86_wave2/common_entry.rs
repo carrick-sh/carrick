@@ -759,10 +759,11 @@ fn common_linux_entry_calls_native_process_custody() {
         (0x0120_0011, true, true),
     ] {
         // x86 raw clone puts ctid in arg3; the decoder restores the shared
-        // canonical arg4 position used by the ARM personality.
+        // canonical arg4 position used by the ARM personality. The sixth
+        // register is outside clone(2)'s ABI and may hold caller residue.
         let call = carrick_personality_linux::entry::decode_x86_64(
             56,
-            [flags, 0, 0, 0x7000, 0, 0],
+            [flags, 0, 0, 0x7000, 0, 0xfeed],
             0x7fff0000,
         );
         assert_eq!(
@@ -785,7 +786,7 @@ fn common_linux_entry_calls_native_process_custody() {
         );
     }
     assert_eq!(process.visits, [57, 61, 231, 61, 57, 57, 57]);
-    for index in 1..6 {
+    for index in 1..5 {
         let mut args = [17, 0, 0, 0, 0, 0];
         args[index] = 0x1000;
         let call = carrick_personality_linux::entry::decode_x86_64(56, args, 0x7fff0000);
