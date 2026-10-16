@@ -692,7 +692,8 @@ fn serve_sigaltstack(
         let [sp, flags, size] = stack_t_words(&bytes);
         let flags = flags as u32;
         let accepted = SS_ONSTACK | SS_DISABLE | carrick_syscall_abi::LINUX_SS_AUTODISARM as u32;
-        if flags & !accepted != 0 {
+        if flags & !accepted != 0 || flags & (SS_DISABLE | SS_ONSTACK) == (SS_DISABLE | SS_ONSTACK)
+        {
             return Some(Err(carrick_syscall_abi::LINUX_EINVAL));
         }
         if flags & SS_DISABLE != 0 {

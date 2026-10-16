@@ -23,6 +23,7 @@ const SIG_SETMASK: u64 = 2;
 const UNBLOCKABLE: u64 = 0x0004_0100;
 
 const SS_DISABLE: u32 = 2;
+const SS_ONSTACK: u32 = 1;
 
 use crate::personality::dispatch::{Zone, dispatch_syscall_with_lifecycle};
 use crate::personality::sched::{FakeCpu, HardwareUserWord, SYS_FUTEX};
@@ -1241,6 +1242,11 @@ fn arm_sigaltstack_accepts_reported_and_disable_autodisarm_flags() {
     assert!(w.venue.leader_slot().read_altstack().is_disabled());
     let invalid = Box::new(stack_t(0, SS_DISABLE | 0x8, 0));
     let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*invalid), 0]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(frame.x[0] as i64, -22);
+    assert!(w.venue.leader_slot().read_altstack().is_disabled());
+    let contradictory = Box::new(stack_t(0, SS_DISABLE | SS_ONSTACK, 0));
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*contradictory), 0]);
     assert_eq!(action, Action::Served);
     assert_eq!(frame.x[0] as i64, -22);
     assert!(w.venue.leader_slot().read_altstack().is_disabled());
