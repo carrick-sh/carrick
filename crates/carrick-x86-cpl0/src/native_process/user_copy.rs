@@ -1,6 +1,8 @@
 //! Native process user-copy mechanics.
 use super::*;
-use carrick_core::mm::transaction::{SelectionVenues, UserWriteError, UserWriteRequest, UserWriteVenue};
+use carrick_core::mm::transaction::{
+    SelectionVenues, UserWriteError, UserWriteRequest, UserWriteVenue,
+};
 use carrick_el1_abi::KernelFaultVenues;
 
 /// Physical crossings and ISA byte access for the shared native-write protocol.
@@ -76,7 +78,7 @@ impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
 }
 
 impl Service {
-    fn copy_user_bytes(
+    pub(super) fn copy_user_bytes(
         &mut self,
         mm: &Mm,
         address: UserVa,
