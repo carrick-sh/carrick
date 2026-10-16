@@ -173,12 +173,21 @@ fn parse(record: Vec<String>, meta: &Value) -> Result<Lane> {
 
 pub fn run(root: &Path, args: TestBatchArgs) -> Result<()> {
     let root = root.canonicalize()?;
-    // The exact-coverage gate captures the source commands, not a new inventory.
-    if std::env::var_os("CARRICK_TEST_CAPTURE").is_some() {
+    // The exact-coverage gate captures the source commands and their batch grouping
+    // so check-test-shards can verify both command selections and per-binary features.
+    if let Some(capture) = std::env::var_os("CARRICK_TEST_CAPTURE") {
+        let batch_unit = format!(
+            "batch:{}:{}:{}",
+            std::process::id(),
+            args.recipe,
+            args.args.join(" ")
+        );
         let status = Command::new("just")
             .arg(&args.recipe)
             .args(&args.args)
             .current_dir(&root)
+            .env("CARRICK_TEST_CAPTURE", capture)
+            .env("CARRICK_TEST_BATCH_UNIT", batch_unit)
             .status()?;
         return if status.success() {
             Ok(())

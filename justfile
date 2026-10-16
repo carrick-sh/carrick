@@ -201,8 +201,10 @@ clippy *ARGS:
     # shared x86/aarch64 engines, this host's VMM backend) under the backend feature
     # set, so the kvm/bhyve/nvmm code the macOS gate never sees is linted too. Scoping
     # to -p carrick-cli {{_platform_features}} keeps HVF/macos-defaults out (a root
-    # --workspace --features is rejected on a virtual workspace).
-    exec {{_admit}} {{_cargo}} clippy -p carrick-cli {{_platform_features}} --all-targets --keep-going {{ARGS}} -- -D warnings
+    # --workspace --features is rejected on a virtual workspace). Also lint
+    # carrick-xtask so CI/xtask changes are clippy-gated on Linux.
+    {{_admit}} {{_cargo}} clippy -p carrick-cli {{_platform_features}} --all-targets --keep-going {{ARGS}} -- -D warnings
+    exec {{_admit}} {{_cargo}} clippy -p carrick-xtask --all-targets --keep-going {{ARGS}} -- -D warnings
 
 # Lint all GitHub Actions workflow files with actionlint.
 actionlint *ARGS:
@@ -395,31 +397,20 @@ test-mm-owner *ARGS:
 
 # Host unit/harness tests without HVF guests or Docker. This ordered list is
 # the unsharded authority; check-test-shards compares the exact Cargo command
-# multiset (including features, filters, serial threads and stack budgets).
+# multiset and per-binary feature sets (including filters, serial threads and
+# stack budgets).
 test *ARGS: _test-stdio
     #!/usr/bin/env bash
     set -euo pipefail
     just --justfile {{justfile()}} _test-unit-mm-owner {{ARGS}}
-    just --justfile {{justfile()}} _test-unit-workspace {{ARGS}}
+    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-workspace -- {{ARGS}}
     if [ "{{_test_host}}" = "macos" ]; then
         # Integration targets (`tests/*.rs`) are invisible to `--lib --bins`;
         # a test moved out of `src/` used to leave every gate silently. The
-        # host-lane selection is DERIVED from Cargo metadata: every test target
-        # not declared in another lane under `[package.metadata.carrick.test-lanes]`
-        # (carrick-xtask `test_lanes.rs`) runs here, and `lint-domains-source`
-        # runs `test-lanes check`, which fails on any target no gate runs.
-        selections="$({{_admit}} {{_cargo}} run -q --locked -p carrick-xtask -- test-lanes args --lane host)"
-        # Every selection runs; the recipe fails after the last one, naming each red.
-        red=()
-        while IFS= read -r selection; do
-            [ -n "$selection" ] || continue
-            {{_admit}} {{_cargo}} test --no-fail-fast $selection {{ARGS}} -- --skip serial_host </dev/null || red+=("$selection")
-            env RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test --no-fail-fast $selection {{ARGS}} serial_host </dev/null || red+=("$selection (serial_host)")
-        done <<< "$selections"
-        if [ "${#red[@]}" -ne 0 ]; then
-            printf 'test: red host-lane selection: %s\n' "${red[@]}" >&2
-            exit 1
-        fi
+        # host-lane selection is DERIVED from Cargo metadata (`test-lanes args --lane host`
+        # via `_test-unit-lanes`), and `lint-domains-source` runs `test-lanes check`.
+        {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-lanes -- --exclude-package=carrick-el1 {{ARGS}}
+        just --justfile {{justfile()}} _test-unit-lanes --package=carrick-el1 {{ARGS}}
         just --justfile {{justfile()}} _test-unit-cli {{ARGS}}
         just --justfile {{justfile()}} _test-unit-host {{ARGS}}
         just --justfile {{justfile()}} _test-unit-vfs {{ARGS}}
@@ -430,20 +421,8 @@ test *ARGS: _test-stdio
         just --justfile {{justfile()}} _test-unit-cli {{ARGS}}
         just --justfile {{justfile()}} _test-unit-host {{ARGS}}
         just --justfile {{justfile()}} _test-unit-runtime {{ARGS}}
-        # Derived host-lane integration targets, as on macOS; packages whose
-        # default features select platform-macos get this host's backend features.
-        selections="$({{_admit}} {{_cargo}} run -q --locked -p carrick-xtask -- test-lanes args --lane host --platform-features "{{_platform_features}}")"
-        # Every selection runs; the recipe fails after the last one, naming each red.
-        red=()
-        while IFS= read -r selection; do
-            [ -n "$selection" ] || continue
-            {{_admit}} {{_cargo}} test --no-fail-fast $selection {{ARGS}} -- --skip serial_host </dev/null || red+=("$selection")
-            env RUST_TEST_THREADS=1 {{_admit}} {{_cargo}} test --no-fail-fast $selection {{ARGS}} serial_host </dev/null || red+=("$selection (serial_host)")
-        done <<< "$selections"
-        if [ "${#red[@]}" -ne 0 ]; then
-            printf 'test: red host-lane selection: %s\n' "${red[@]}" >&2
-            exit 1
-        fi
+        {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-lanes -- --exclude-package=carrick-el1 {{ARGS}}
+        just --justfile {{justfile()}} _test-unit-lanes --package=carrick-el1 {{ARGS}}
     fi
 
 # Unit groups are whole Cargo selections: newly added tests stay selected.
@@ -451,26 +430,26 @@ test-shard-a *ARGS: _test-stdio
     {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-lanes -- --exclude-package=carrick-el1 {{ARGS}}
 
 # Consolidates workspace, mm-owner, CLI, host, VFS, kernel, runtime, HVF and
-# EL1 unit selections into one test-batch shard so hosted macOS runs fit within
-# the 5-runner concurrency cap without recompiling overlapping crate graphs.
+# EL1 unit selections into one shard so hosted macOS runs fit within the
+# 5-runner concurrency cap while keeping each package's compile-time feature set.
 test-shard-b *ARGS: _test-stdio
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-packages -- {{ARGS}}
-    # EL1 production-routing witnesses must not inherit kernel-example's or
-    # runtime's carrick-el1/host-test feature. Keep their original package selection.
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-lanes -- --package=carrick-el1 {{ARGS}}
-
-[private]
-_test-unit-packages *ARGS:
     just --justfile {{justfile()}} _test-unit-mm-owner {{ARGS}}
-    just --justfile {{justfile()}} _test-unit-workspace {{ARGS}}
+    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- test-batch _test-unit-workspace -- {{ARGS}}
     just --justfile {{justfile()}} _test-unit-cli {{ARGS}}
     just --justfile {{justfile()}} _test-unit-host {{ARGS}}
     just --justfile {{justfile()}} _test-unit-vfs {{ARGS}}
+    # EL1 production-routing witnesses must not inherit kernel-example's or
+    # runtime's carrick-el1/host-test feature. Keep their original package selection.
+    just --justfile {{justfile()}} _test-unit-lanes --package=carrick-el1 {{ARGS}}
     just --justfile {{justfile()}} _test-unit-kernel {{ARGS}}
     just --justfile {{justfile()}} _test-unit-runtime {{ARGS}}
     just --justfile {{justfile()}} _test-unit-hvf {{ARGS}}
 
-# Fail on missing, duplicate or changed selections, plus missing workflow jobs.
+# Run carrick-xtask unit and CI gate tests on Linux so ci-xtask changes are verified even when macos=false.
+test-xtask *ARGS:
+    {{_admit}} {{_cargo}} test --locked -p carrick-xtask --lib --bins --test test_batch --test ci_cache --test ci_changes --test ci_receipt --test ci_scaler --test ci_scaler_hook --test ci_scaler_mac --test commit_trailers --test cli {{ARGS}}
+
+# Fail on missing, duplicate or changed selections or per-binary features, plus missing workflow jobs.
 check-test-shards:
     cargo test --locked -p carrick-xtask --test test_shards
     cargo run --locked -p carrick-xtask -- check-test-shards
@@ -1239,69 +1218,22 @@ ci-macos-test recipe:
     echo "RLIMIT_NOFILE: soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
     exec just --justfile {{justfile()}} {{recipe}}
 
-# PRs and merge groups may skip heavy/macOS checks when every changed path in
-# the cumulative diff against base is documentation, workflow YAML, or xtask/CI
-# helper code that does not affect built guest/runtime artifacts. Null-delimited
-# paths and disabled rename detection ensure deleting/renaming code into docs
-# cannot hide a source change. Empty diffs and unknown paths conservatively run
-# everything; an invalid base fails the filter.
+# PRs and merge groups classify changed paths via `carrick-xtask ci-changes`,
+# which derives referenced `docs/` / `.agents/` / `*.md` paths from source,
+# scripts, workflows and justfile, splits `ci-xtask` (`heavy=true, macos=false,
+# hardware=false`) from `workflows` (`ci.yml` vs `kernel-runtime.yml`), and
+# leaves `heavy=false` only for unreferenced prose.
 ci-changes:
     #!/usr/bin/env bash
     set -euo pipefail
-    heavy=true
-    macos=true
-    workflows=true
-    if [[ "${CI_EVENT:?}" == pull_request || "${CI_EVENT:?}" == merge_group ]]; then
-        if [[ "${CI_EVENT}" == pull_request ]]; then
-            macos=false
-        fi
-        if ! git cat-file -e "${CI_BASE:?}^{commit}" 2>/dev/null; then
-            git fetch --no-tags origin "${CI_BASE}"
-        fi
-        paths="$(mktemp)"
-        trap 'rm -f "$paths"' EXIT
-        git diff --no-renames --name-only -z "${CI_BASE:?}...HEAD" > "$paths"
-        if [[ "${CI_EVENT}" == merge_group && -n "${CI_BASE_REF:-}" ]]; then
-            if git cat-file -e "${CI_BASE_REF}^{commit}" 2>/dev/null; then
-                git diff --no-renames --name-only -z "${CI_BASE_REF}...HEAD" >> "$paths"
-            elif git remote get-url origin >/dev/null 2>&1; then
-                git fetch --no-tags origin "${CI_BASE_REF}"
-                git diff --no-renames --name-only -z "FETCH_HEAD...HEAD" >> "$paths"
-            else
-                git diff --no-renames --name-only -z "${CI_BASE_REF}...HEAD" >> "$paths"
-            fi
-        fi
-        if [[ -s "$paths" ]]; then
-            has_code=false
-            has_workflows=false
-            while IFS= read -r -d '' path; do
-                case "$path" in
-                    crates/carrick-xtask/src/ci_*|crates/carrick-xtask/src/commit_trailers.rs|crates/carrick-xtask/src/test_batch.rs|crates/carrick-xtask/src/test_lanes.rs|crates/carrick-xtask/src/test_shards.rs|crates/carrick-xtask/tests/ci_*|crates/carrick-xtask/tests/commit_trailers.rs|crates/carrick-xtask/tests/test_batch.rs|crates/carrick-xtask/tests/test_shards.rs|scripts/ci/*)
-                        ;;
-                    crates/*|Cargo.*|justfile|scripts/*|rust-toolchain*|conformance*|fixtures/*)
-                        has_code=true
-                        ;;
-                    docs/*|.agents/*|*.md|LICENSE*)
-                        ;;
-                    .github/*)
-                        has_workflows=true
-                        ;;
-                    *)
-                        has_code=true
-                        ;;
-                esac
-            done < "$paths"
-            heavy="$has_code"
-            workflows="$has_workflows"
-            if [[ "${CI_EVENT}" == merge_group ]]; then
-                macos="$has_code"
-            fi
-        fi
+    : "${GITHUB_OUTPUT:?}"
+    if [[ -n "${CARRICK_XTASK_BIN:-}" ]]; then
+        exec "$CARRICK_XTASK_BIN" --root . ci-changes
+    elif [[ -x target/debug/carrick-xtask ]]; then
+        exec target/debug/carrick-xtask --root . ci-changes
+    else
+        exec {{_admit}} {{_cargo}} run -q --locked -p carrick-xtask -- --root . ci-changes
     fi
-    echo "heavy=$heavy" >> "${GITHUB_OUTPUT:?}"
-    echo "macos=$macos" >> "${GITHUB_OUTPUT:?}"
-    echo "workflows=$workflows" >> "${GITHUB_OUTPUT:?}"
-    echo "Run hosted checks: heavy=$heavy macos=$macos workflows=$workflows"
 
 # Fail closed: GitHub considers skipped required jobs successful on their own.
 # ci-ok depends on every job; only the filter or draft-PR gating can license skips.
@@ -1314,7 +1246,7 @@ ci-results:
       (. as $root |
        if $event == "pull_request" or $event == "merge_group" then
          (if $event == "pull_request" then ($root.changes.outputs.macos // "true") == "false"
-          else ($root.changes.outputs.macos // "true") == ($root.changes.outputs.heavy // "true") end) and
+          else (($root.changes.outputs.macos // "true") == "false" or ($root.changes.outputs.heavy // "true") == "true") end) and
          (del(.changes) | with_entries(select(.key | startswith("macos-")))
            | if ($root.changes.outputs.macos // "true") == "true" and ($event != "pull_request" or $draft != "true") then all(.[]; .result == "success")
              else all(.[]; .result == "skipped") end) and

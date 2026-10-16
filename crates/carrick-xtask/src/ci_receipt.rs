@@ -453,6 +453,35 @@ fn validate_sha(sha: &str) -> Result<(), ReceiptError> {
     }
 }
 
+/// Verify from a workflow run's `/jobs` listing that the run was a fast-path
+/// skip rather than a heavy run whose receipt artifact expired: `changes`
+/// succeeded, and `signed-fixtures` or the lane's hardware job (`hvf-kernel`
+/// for `Lane::Hvf`, `kvm-tests`/`kvm-tests-willow` for `Lane::Kvm`) concluded
+/// `skipped`.
+pub fn run_jobs_prove_fast_path_skip(jobs_payload: &Value, lane: Lane) -> bool {
+    let Some(jobs) = jobs_payload["jobs"].as_array() else {
+        return false;
+    };
+    let job_conclusion = |name: &str| -> Option<&str> {
+        jobs.iter()
+            .find(|job| job["name"] == name)
+            .and_then(|job| job["conclusion"].as_str())
+    };
+    if job_conclusion("changes") != Some("success") {
+        return false;
+    }
+    if job_conclusion("signed-fixtures") == Some("skipped") {
+        return true;
+    }
+    match lane {
+        Lane::Hvf => job_conclusion("hvf-kernel") == Some("skipped"),
+        Lane::Kvm => {
+            job_conclusion("kvm-tests") == Some("skipped")
+                || job_conclusion("kvm-tests-willow") == Some("skipped")
+        }
+    }
+}
+
 /// One query round: this workflow's runs for the SHA and their artifacts.
 struct BaselineObservation {
     decision: Baseline,
@@ -483,12 +512,30 @@ fn query_baseline(lane: Lane, sha: &str) -> Result<BaselineObservation, ReceiptE
         ))?;
         pairs.push((run.clone(), artifacts));
     }
-    let fast_path_skip = !pairs.is_empty()
+    let decision = baseline_decision(&pairs, lane, sha);
+    let all_succeeded = !pairs.is_empty()
         && pairs
             .iter()
             .all(|(run, _)| run["status"] == "completed" && run["conclusion"] == "success");
+    let mut fast_path_skip = false;
+    if decision == Baseline::Missing && all_succeeded {
+        fast_path_skip = true;
+        for (run, _) in &pairs {
+            let Some(id) = run["id"].as_u64() else {
+                fast_path_skip = false;
+                break;
+            };
+            let jobs = gh_json(&format!(
+                "repos/{REPOSITORY}/actions/runs/{id}/jobs?per_page=100"
+            ))?;
+            if !run_jobs_prove_fast_path_skip(&jobs, lane) {
+                fast_path_skip = false;
+                break;
+            }
+        }
+    }
     Ok(BaselineObservation {
-        decision: baseline_decision(&pairs, lane, sha),
+        decision,
         merge_group_run: pairs.iter().any(|(run, _)| run["event"] == "merge_group"),
         fast_path_skip,
         no_runs: pairs.is_empty(),

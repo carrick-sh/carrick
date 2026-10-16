@@ -72,6 +72,7 @@ jobs:
       heavy: ${{ steps.filter.outputs.heavy }}
       macos: ${{ steps.filter.outputs.macos }}
       workflows: ${{ steps.filter.outputs.workflows }}
+      hardware: ${{ steps.filter.outputs.hardware }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -80,6 +81,22 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - name: Configure persisted compiler cache
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: changes-debug
+          cache-directories: ${{ env.SCCACHE_DIR }}
+          cache-workspace-crates: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install per-user compiler cache
+        uses: taiki-e/install-action@v2
+        with:
+          tool: sccache@0.18.0
+      - name: Prebuild cached xtask admission helpers
+        run: just ci-prebuild-xtask
       - name: Detect changed surfaces
         id: filter
         env:
@@ -95,7 +112,7 @@ jobs:
       ${{ !cancelled() &&
           needs.check-merge-group.outputs.skip != 'true' &&
           needs.changes.result == 'success' &&
-          needs.changes.outputs.heavy == 'true' &&
+          needs.changes.outputs.hardware == 'true' &&
           vars.CARRICK_SELF_HOSTED == 'true' &&
           (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-24.04-arm
@@ -421,7 +438,7 @@ jobs:
       ${{ !cancelled() &&
           needs.check-merge-group.outputs.skip != 'true' &&
           needs.changes.result == 'success' &&
-          needs.changes.outputs.heavy == 'true' &&
+          needs.changes.outputs.hardware == 'true' &&
           vars.CARRICK_GCP_KVM == 'true' && vars.CARRICK_KVM_BACKEND != 'willow' &&
           (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-latest
@@ -507,7 +524,7 @@ jobs:
       ${{ !cancelled() &&
           needs.check-merge-group.outputs.skip != 'true' &&
           needs.changes.result == 'success' &&
-          needs.changes.outputs.heavy == 'true' &&
+          needs.changes.outputs.hardware == 'true' &&
           vars.CARRICK_SELF_HOSTED_KVM == 'true' &&
           !(vars.CARRICK_GCP_KVM == 'true' && vars.CARRICK_KVM_BACKEND != 'willow') &&
           (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
@@ -689,6 +706,7 @@ jobs:
           MERGE_GROUP_RUN_ID: ${{ needs.check-merge-group.outputs.run-id }}
           CHANGES_RESULT: ${{ needs.changes.result }}
           HEAVY: ${{ needs.changes.outputs.heavy }}
+          HARDWARE: ${{ needs.changes.outputs.hardware }}
           SIGNED_FIXTURES: ${{ needs.signed-fixtures.result }}
           HVF: ${{ needs.hvf-kernel.result }}
           # The selected KVM backend's result (same expression as the lanes'
@@ -707,8 +725,8 @@ jobs:
             exit 0
           fi
           test "$CHANGES_RESULT" = success
-          if [ "$EVENT" = merge_group ] && [ "$HEAVY" = false ]; then
-            echo "::notice title=Trusted hardware skipped (docs/CI-only)::Merge group $GITHUB_SHA has no code changes (heavy=false)"
+          if [ "$EVENT" = merge_group ] && [ "$HARDWARE" = false ]; then
+            echo "::notice title=Trusted hardware skipped (docs/ci-xtask-only)::Merge group $GITHUB_SHA has no hardware-affecting changes (hardware=false)"
             test "$SIGNED_FIXTURES" = skipped
             test "$HVF" = skipped
             test "$KVM" = skipped
