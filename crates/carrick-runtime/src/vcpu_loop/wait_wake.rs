@@ -264,9 +264,9 @@ impl ProcessPhysicalRetirement {
         make_completions: impl FnOnce() -> Result<Vec<continuation::LogicalJobCompletion>, RuntimeError>,
     ) -> Result<bool, RuntimeError> {
         let mut publication = self.state.publication.lock();
-        if publication.completions.published().is_some() {
+        let Some(owner) = publication.completions.claim_owner() else {
             return Ok(false);
-        }
+        };
         let completions = make_completions()?;
         if completions.is_empty() {
             return Err(RuntimeError::Configuration(
@@ -274,11 +274,7 @@ impl ProcessPhysicalRetirement {
                     .to_owned(),
             ));
         }
-        publication.completions.publish(completions).map_err(|_| {
-            RuntimeError::Configuration(
-                "HVPatch process physical-retirement receipt was published twice".to_owned(),
-            )
-        })?;
+        owner.publish(completions);
         self.state.changed.notify_all();
         Ok(true)
     }
