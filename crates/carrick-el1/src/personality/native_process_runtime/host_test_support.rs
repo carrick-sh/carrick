@@ -482,8 +482,7 @@ impl carrick_personality_linux::signal::SignalBackend for HostArmBackend {
     }
 }
 
-#[test]
-fn serial_host_empty_signal_checkpoint_takes_no_registry_or_graph_lock() {
+pub fn empty_signal_checkpoint_lock_witness() {
     use carrick_core_abi::{EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration};
     let binding = ExecutionBinding {
         task: EntryTaskKey::from_raw(123_450),
