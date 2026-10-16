@@ -30,4 +30,7 @@ pub use error::MmError;
 pub mod owner;
 pub use owner::*;
 
+mod user_write;
+pub use user_write::{UserWriteError, UserWriteRequest, UserWriteVenue};
+
 pub use crate::mm::frames::{GrantTarget, grant_target};
