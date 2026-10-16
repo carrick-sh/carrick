@@ -736,7 +736,7 @@ fn spawn_signal_pump_inner(
                                 &carrick_hal::timer_delivery::GuestCpuSampler,
                                 |signum| {
                                     crate::probes::itimer_fire(signum, 0);
-                                    crate::host_signal::publish_process_signal(signum);
+                                    crate::host_signal::publish_process_timer_signal(signum, None);
                                 },
                             );
                         }

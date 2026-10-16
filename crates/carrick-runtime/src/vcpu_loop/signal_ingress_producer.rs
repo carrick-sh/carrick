@@ -116,14 +116,33 @@ impl HostSignalIngressProducer {
         let signum = bridge_event.signum;
         let signal =
             Signal::from_number(signum).ok_or(HostIngressError::InvalidBridgeSignal(signum))?;
+        let (source, timer) = match bridge_event.origin {
+            carrick_hal::PendingSignalOrigin::Host => (
+                ExternalSignalSource::Terminal,
+                carrick_el1_abi::ExternalSignalTimerInfo::default(),
+            ),
+            carrick_hal::PendingSignalOrigin::IntervalTimer => (
+                ExternalSignalSource::IntervalTimer,
+                carrick_el1_abi::ExternalSignalTimerInfo::default(),
+            ),
+            carrick_hal::PendingSignalOrigin::PosixTimer(info) => (
+                ExternalSignalSource::PosixTimer,
+                carrick_el1_abi::ExternalSignalTimerInfo {
+                    id: info.id,
+                    overrun: info.overrun,
+                    value: info.value,
+                },
+            ),
+        };
         let mut event = ExternalSignalRecord::new(
             EntryEventIdentity::from_binding(target.binding),
             target.binding,
             target.record,
             generation,
             signal,
-            ExternalSignalSource::Terminal,
-        );
+            source,
+        )
+        .with_timer_info(timer);
         if bridge_event.scope == carrick_hal::PendingSignalScope::Process {
             event = event
                 .process_directed()
@@ -228,6 +247,7 @@ mod tests {
                     Some(carrick_hal::PendingSignalEvent {
                         signum: 2,
                         scope: carrick_hal::PendingSignalScope::Thread,
+                        origin: carrick_hal::PendingSignalOrigin::Host,
                     })
                 })
                 .unwrap(),
@@ -295,5 +315,28 @@ mod tests {
             queue.take().unwrap().scope(),
             carrick_el1_abi::ExternalSignalScope::Process
         );
+
+        let timer = carrick_signal_linux::PendingTimerInfo {
+            id: 9,
+            overrun: 2,
+            value: 0x1234,
+        };
+        carrick_signal_linux::publish_process_timer_signal(14, Some(timer));
+        assert_eq!(
+            producer
+                .publish(
+                    &queue,
+                    Some(target),
+                    carrick_signal_linux::take_pending_event_for
+                )
+                .unwrap(),
+            HostIngressStep::Published
+        );
+        let event = queue.take().unwrap();
+        assert_eq!(event.scope(), carrick_el1_abi::ExternalSignalScope::Process);
+        assert_eq!(event.source(), ExternalSignalSource::PosixTimer);
+        assert_eq!(event.timer_info().id, timer.id);
+        assert_eq!(event.timer_info().overrun, timer.overrun);
+        assert_eq!(event.timer_info().value, timer.value);
     }
 }

@@ -49,7 +49,7 @@ pub fn spawn_fallback_timer(which: usize, generation: u64, spec: TimerSpecNs) {
                 || {
                     let signum = signum_for(which);
                     crate::probes::itimer_fire(signum, 1);
-                    crate::host_signal::publish_process_signal(signum);
+                    crate::host_signal::publish_process_timer_signal(signum, None);
                 },
             );
         });

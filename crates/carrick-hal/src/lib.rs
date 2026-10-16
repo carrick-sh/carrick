@@ -113,7 +113,7 @@ pub use guest_timer_bridge::{NullGuestTimerBridge, NullTimerFiring};
 pub mod host_signal_bridge;
 pub use host_signal_bridge::{
     GenericHostSignalBridge, HostSignalBridge, NO_PENDING_SIGNAL, PendingSignalEvent,
-    PendingSignalScope, WaitFd,
+    PendingSignalOrigin, PendingSignalScope, PendingTimerInfo, WaitFd,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use host_signal_bridge::{NullHostSignalBridge, NullHostSignalGlue};

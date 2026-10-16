@@ -34,7 +34,9 @@ use carrick_abi::{SigBlockMask, SigSet};
 use carrick_signal_linux::HostSignalGlue;
 
 pub use carrick_signal_linux::NO_PENDING_SIGNAL;
-pub use carrick_signal_linux::{PendingSignalEvent, PendingSignalScope};
+pub use carrick_signal_linux::{
+    PendingSignalEvent, PendingSignalOrigin, PendingSignalScope, PendingTimerInfo,
+};
 
 /// One host fd (plus poll events) a blocking wait parks on. `anchored` marks a
 /// descriptor the waiter must NOT pin (dup) because the caller already holds
@@ -102,6 +104,7 @@ pub trait HostSignalBridge: Send + Sync {
         (signum != NO_PENDING_SIGNAL).then_some(PendingSignalEvent {
             signum,
             scope: PendingSignalScope::Thread,
+            origin: PendingSignalOrigin::Host,
         })
     }
 

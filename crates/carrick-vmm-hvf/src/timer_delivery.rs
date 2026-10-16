@@ -42,18 +42,27 @@ impl TimerFiring for HvfTimerFiring {
     /// target falls back to the process-directed publication. The kqueue
     /// signal pump then kicks the targeted or in-guest vCPU. The thread name
     /// is the lane's existing fixed `carrick-posix-timer` (not per-`id`), so
-    /// `_id` stays unused and every existing trace/debugger filter keeps
-    /// matching.
-    fn spawn_posix_firing(_id: i32, armed: &PosixArm, spec: TimerSpecNs) {
+    /// every existing trace/debugger filter keeps matching. The timer id and
+    /// sigevent value remain in the ingress event's SI_TIMER payload.
+    fn spawn_posix_firing(id: i32, armed: &PosixArm, spec: TimerSpecNs) {
         let signum = armed.signum;
         let generation = armed.generation;
         let slot = armed.slot.clone();
+        let timer_slot = slot.clone();
         let target_tid = armed.target_tid;
+        let value = armed.si_value;
         let on_fire = move || {
+            let info = carrick_signal_linux::PendingTimerInfo {
+                id,
+                overrun: timer_slot
+                    .overruns
+                    .load(std::sync::atomic::Ordering::SeqCst) as i32,
+                value,
+            };
             if let Some(tid) = target_tid {
-                crate::host_signal::publish_pending_for(tid, signum);
+                crate::host_signal::publish_thread_timer_signal(tid, signum, info);
             } else {
-                crate::host_signal::publish_process_signal(signum);
+                crate::host_signal::publish_process_timer_signal(signum, Some(info));
             }
         };
         let _ = std::thread::Builder::new()
@@ -73,7 +82,7 @@ impl TimerFiring for HvfTimerFiring {
     /// Publish a process-directed signal from a host-side producer: the
     /// kqueue signal pump wakes parked waiters and kicks any in-guest vCPU.
     fn deliver(signum: i32) {
-        crate::host_signal::publish_process_signal(signum);
+        crate::host_signal::publish_process_timer_signal(signum, None);
     }
 
     fn delivery() -> Option<Arc<dyn TimerDelivery>> {
