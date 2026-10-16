@@ -459,6 +459,37 @@ fn host_slot_signal_is_reserved_and_cancelled_into_exact_kernel_ownership() {
 }
 
 #[test]
+fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
+    let (_kernel, context) = bootstrap(153_694);
+    let generation = publish(&context, 0x709);
+    let control = context.thread().control_slot();
+    let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
+    custody.commit_registration();
+    custody.commit_native_signal_owner();
+    let continuation = BlockedContinuation::from_dispatch_outcome(
+        DispatchOutcome::WaitOnFds {
+            fds: WaitFds::empty(),
+            timeout: None,
+            sig_mask: WaitSigMask::NONE,
+            completion: FdWaitCompletion::Fd { on_timeout: 0 },
+        },
+        capture(&context, generation),
+    )
+    .expect("forwarded read continuation");
+    let tid = context.thread().key().tid.raw();
+    carrick_signal_linux::publish_pending_for(tid, 2);
+    let event = SignalReadinessProbe::from_continuation(&continuation)
+        .event()
+        .expect("signal wakes forwarded read");
+    assert!(matches!(event, ContinuationEvent::Signal));
+    assert_eq!(
+        carrick_signal_linux::take_pending_for(tid),
+        2,
+        "native ingress remains the one consumer of the bridge event"
+    );
+}
+
+#[test]
 fn realtime_host_slot_import_preserves_fifo_multiplicity_and_exact_cancellation_requeue() {
     let (kernel, context) = bootstrap(15_468);
     let generation = publish(&context, 0x913);
