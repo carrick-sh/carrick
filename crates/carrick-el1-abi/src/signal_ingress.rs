@@ -4,7 +4,7 @@
 //! The native owner compares every identity component with current custody
 //! before interpreting the source or admitting it to a pending queue.
 
-use carrick_core_abi::ExecutionBinding;
+use carrick_core_abi::{EntryEventIdentity, ExecutionBinding};
 use carrick_sched_core::RecordRef;
 use carrick_signal_core::policy::Signal;
 use core::cell::UnsafeCell;
@@ -13,28 +13,28 @@ use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Transport protocol for the shared ARM EL1 / x86 CPL0 ingress record.
-pub const SIGNAL_INGRESS_PROTOCOL: u64 = 2;
+pub const SIGNAL_INGRESS_PROTOCOL: u64 = 3;
 
 /// Shared queue capacity; event producers must retain ownership on fullness.
 pub const SIGNAL_INGRESS_CAPACITY: usize = 64;
 
-pub type SharedSignalIngressQueue<I> = SignalIngressQueue<I, SIGNAL_INGRESS_CAPACITY>;
+pub type SharedSignalIngressQueue = SignalIngressQueue<SIGNAL_INGRESS_CAPACITY>;
 
 /// Field offsets participate in the image/host ABI check, not only sizes.
-pub const fn signal_ingress_offsets_hash<I: Copy + Eq + Send>() -> u64 {
+pub const fn signal_ingress_offsets_hash() -> u64 {
     let offsets = [
-        core::mem::offset_of!(ExternalSignalRecord<I>, identity) as u64,
-        core::mem::offset_of!(ExternalSignalRecord<I>, binding) as u64,
-        core::mem::offset_of!(ExternalSignalRecord<I>, record) as u64,
-        core::mem::offset_of!(ExternalSignalRecord<I>, event_generation) as u64,
-        core::mem::offset_of!(ExternalSignalRecord<I>, signal) as u64,
-        core::mem::offset_of!(ExternalSignalRecord<I>, source) as u64,
-        core::mem::offset_of!(SignalIngressSlot<I>, sequence) as u64,
-        core::mem::offset_of!(SignalIngressSlot<I>, record) as u64,
-        core::mem::offset_of!(SharedSignalIngressQueue<I>, head) as u64,
-        core::mem::offset_of!(SharedSignalIngressQueue<I>, tail) as u64,
-        core::mem::offset_of!(SharedSignalIngressQueue<I>, drain_generation) as u64,
-        core::mem::offset_of!(SharedSignalIngressQueue<I>, slots) as u64,
+        core::mem::offset_of!(ExternalSignalRecord, identity) as u64,
+        core::mem::offset_of!(ExternalSignalRecord, binding) as u64,
+        core::mem::offset_of!(ExternalSignalRecord, record) as u64,
+        core::mem::offset_of!(ExternalSignalRecord, event_generation) as u64,
+        core::mem::offset_of!(ExternalSignalRecord, signal) as u64,
+        core::mem::offset_of!(ExternalSignalRecord, source) as u64,
+        core::mem::offset_of!(SignalIngressSlot, sequence) as u64,
+        core::mem::offset_of!(SignalIngressSlot, record) as u64,
+        core::mem::offset_of!(SharedSignalIngressQueue, head) as u64,
+        core::mem::offset_of!(SharedSignalIngressQueue, tail) as u64,
+        core::mem::offset_of!(SharedSignalIngressQueue, drain_generation) as u64,
+        core::mem::offset_of!(SharedSignalIngressQueue, slots) as u64,
     ];
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     let mut index = 0;
@@ -74,8 +74,8 @@ pub enum ExternalSignalSource {
 /// itself. In particular, a numeric Linux tid is never an identity check.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
-pub struct ExternalSignalRecord<I: Copy + Eq + Send> {
-    identity: I,
+pub struct ExternalSignalRecord {
+    identity: EntryEventIdentity,
     binding: ExecutionBinding,
     record: RecordRef,
     event_generation: SignalEventGeneration,
@@ -87,13 +87,13 @@ pub struct ExternalSignalRecord<I: Copy + Eq + Send> {
 /// observed drain generation lets its host continuation subscribe before
 /// parking without losing a drain that races the full result.
 #[derive(Debug, Eq, PartialEq)]
-pub struct SignalIngressAdmission<I: Copy + Eq + Send> {
-    event: ExternalSignalRecord<I>,
+pub struct SignalIngressAdmission {
+    event: ExternalSignalRecord,
     observed_drain: u64,
 }
 
-impl<I: Copy + Eq + Send> SignalIngressAdmission<I> {
-    pub const fn event(&self) -> ExternalSignalRecord<I> {
+impl SignalIngressAdmission {
+    pub const fn event(&self) -> ExternalSignalRecord {
         self.event
     }
 
@@ -101,18 +101,18 @@ impl<I: Copy + Eq + Send> SignalIngressAdmission<I> {
         self.observed_drain
     }
 
-    pub fn retry<const N: usize>(self, queue: &SignalIngressQueue<I, N>) -> Result<(), Self> {
+    pub fn retry<const N: usize>(self, queue: &SignalIngressQueue<N>) -> Result<(), Self> {
         queue.admit(self.event)
     }
 
-    pub const fn into_event(self) -> ExternalSignalRecord<I> {
+    pub const fn into_event(self) -> ExternalSignalRecord {
         self.event
     }
 }
 
-impl<I: Copy + Eq + Send> ExternalSignalRecord<I> {
+impl ExternalSignalRecord {
     pub const fn new(
-        identity: I,
+        identity: EntryEventIdentity,
         binding: ExecutionBinding,
         record: RecordRef,
         event_generation: SignalEventGeneration,
@@ -133,6 +133,18 @@ impl<I: Copy + Eq + Send> ExternalSignalRecord<I> {
         self.signal
     }
 
+    pub const fn identity(self) -> EntryEventIdentity {
+        self.identity
+    }
+
+    pub const fn binding(self) -> ExecutionBinding {
+        self.binding
+    }
+
+    pub const fn record(self) -> RecordRef {
+        self.record
+    }
+
     pub const fn source(self) -> ExternalSignalSource {
         self.source
     }
@@ -143,41 +155,50 @@ impl<I: Copy + Eq + Send> ExternalSignalRecord<I> {
 
     /// Authentication is an exact match with live owner custody, including
     /// the record incarnation. The caller must obtain these values afresh.
-    pub fn matches_live(self, identity: I, binding: ExecutionBinding, record: RecordRef) -> bool {
-        self.identity == identity && self.binding == binding && self.record == record
+    pub fn matches_live(
+        self,
+        identity: EntryEventIdentity,
+        binding: ExecutionBinding,
+        record: RecordRef,
+    ) -> bool {
+        self.identity.issued()
+            && self.identity == identity
+            && self.identity.matches(binding)
+            && self.binding == binding
+            && self.record == record
     }
 }
 
 #[repr(C)]
-struct SignalIngressSlot<I: Copy + Eq + Send> {
+struct SignalIngressSlot {
     sequence: AtomicU64,
-    record: UnsafeCell<MaybeUninit<ExternalSignalRecord<I>>>,
+    record: UnsafeCell<MaybeUninit<ExternalSignalRecord>>,
 }
 
 // The sequence publishes exclusive ownership before either side touches the
 // record. A producer writes only after claiming its head position, and a
 // consumer reads only after claiming its tail position.
-unsafe impl<I: Copy + Eq + Send> Sync for SignalIngressSlot<I> {}
+unsafe impl Sync for SignalIngressSlot {}
 
 /// Bounded multi-producer/multi-consumer transport for external signal events.
 /// Fullness returns the event to its producer; no event is dropped or copied
 /// into a second pending authority. The caller owns its backpressure wait.
 #[repr(C)]
-pub struct SignalIngressQueue<I: Copy + Eq + Send, const N: usize> {
+pub struct SignalIngressQueue<const N: usize> {
     head: AtomicU64,
     tail: AtomicU64,
     drain_generation: AtomicU64,
-    slots: [SignalIngressSlot<I>; N],
+    slots: [SignalIngressSlot; N],
 }
 
 #[cfg(not(target_os = "none"))]
-impl<I: Copy + Eq + Send, const N: usize> Default for SignalIngressQueue<I, N> {
+impl<const N: usize> Default for SignalIngressQueue<N> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<I: Copy + Eq + Send, const N: usize> SignalIngressQueue<I, N> {
+impl<const N: usize> SignalIngressQueue<N> {
     /// Initialize a fresh shared reservation before either side publishes its
     /// address. Writes each slot directly, without a queue-sized stack value.
     ///
@@ -192,7 +213,7 @@ impl<I: Copy + Eq + Send, const N: usize> SignalIngressQueue<I, N> {
             core::ptr::addr_of_mut!((*ptr).head).write(AtomicU64::new(0));
             core::ptr::addr_of_mut!((*ptr).tail).write(AtomicU64::new(0));
             core::ptr::addr_of_mut!((*ptr).drain_generation).write(AtomicU64::new(0));
-            let slots = core::ptr::addr_of_mut!((*ptr).slots).cast::<SignalIngressSlot<I>>();
+            let slots = core::ptr::addr_of_mut!((*ptr).slots).cast::<SignalIngressSlot>();
             for index in 0..N {
                 slots.add(index).write(SignalIngressSlot {
                     sequence: AtomicU64::new(index as u64),
@@ -225,7 +246,7 @@ impl<I: Copy + Eq + Send, const N: usize> SignalIngressQueue<I, N> {
     /// Capture the drain generation before attempting admission. A caller
     /// that parks on fullness retains the event and can compare this epoch
     /// after subscribing to the host wake source.
-    pub fn admit(&self, event: ExternalSignalRecord<I>) -> Result<(), SignalIngressAdmission<I>> {
+    pub fn admit(&self, event: ExternalSignalRecord) -> Result<(), SignalIngressAdmission> {
         let observed_drain = self.drain_generation();
         self.try_publish(event)
             .map_err(|event| SignalIngressAdmission {
@@ -235,10 +256,7 @@ impl<I: Copy + Eq + Send, const N: usize> SignalIngressQueue<I, N> {
     }
 
     /// Publish once. On full, the exact event remains owned by the caller.
-    pub fn try_publish(
-        &self,
-        event: ExternalSignalRecord<I>,
-    ) -> Result<(), ExternalSignalRecord<I>> {
+    pub fn try_publish(&self, event: ExternalSignalRecord) -> Result<(), ExternalSignalRecord> {
         let mut position = self.head.load(Ordering::Relaxed);
         loop {
             let slot = &self.slots[position as usize & (N - 1)];
@@ -271,7 +289,7 @@ impl<I: Copy + Eq + Send, const N: usize> SignalIngressQueue<I, N> {
 
     /// Claim one published record. A concurrent unpublished producer does not
     /// make a partly written record visible.
-    pub fn take(&self) -> Option<ExternalSignalRecord<I>> {
+    pub fn take(&self) -> Option<ExternalSignalRecord> {
         let mut position = self.tail.load(Ordering::Relaxed);
         loop {
             let slot = &self.slots[position as usize & (N - 1)];
@@ -308,17 +326,15 @@ impl<I: Copy + Eq + Send, const N: usize> SignalIngressQueue<I, N> {
 mod tests {
     extern crate std;
     use super::*;
-    use carrick_core_abi::{EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration};
+    use carrick_core_abi::{EntryMmKey, EntryTaskKey, EntryThreadGeneration, SnapshotGeneration};
     use carrick_sched_core::RecordId;
-    use carrick_sched_core::process::{TaskId, TaskKey, TaskSerial};
-    use core::num::NonZeroI32;
 
     #[test]
     fn shared_ingress_initializes_in_place_before_publication() {
-        let mut storage = core::mem::MaybeUninit::<SignalIngressQueue<TaskKey, 2>>::uninit();
+        let mut storage = core::mem::MaybeUninit::<SignalIngressQueue<2>>::uninit();
         // SAFETY: this aligned storage is exclusively owned until initialization
         // returns; the test retains it for every queue access.
-        unsafe { SignalIngressQueue::<TaskKey, 2>::initialize_at(storage.as_mut_ptr()) };
+        unsafe { SignalIngressQueue::<2>::initialize_at(storage.as_mut_ptr()) };
         // SAFETY: initialization completed before creating this reference.
         let queue = unsafe { storage.assume_init_ref() };
         assert_eq!(queue.drain_generation(), 0);
@@ -327,13 +343,9 @@ mod tests {
 
     #[test]
     fn external_event_rejects_reused_task_binding_and_record() {
-        let task = TaskKey {
-            id: TaskId::from_registry_allocation(NonZeroI32::new(41).unwrap()),
-            serial: TaskSerial::from_registry_allocation(NonZeroU64::new(7).unwrap()),
-        };
         let binding = ExecutionBinding {
             task: EntryTaskKey::from_raw(41),
-            generation: EntryGeneration::from_raw(11),
+            generation: SnapshotGeneration::from_raw(11),
             mm: EntryMmKey::from_raw(301),
             thread_generation: EntryThreadGeneration::from_raw(101),
         };
@@ -341,33 +353,38 @@ mod tests {
             id: RecordId::from_raw(4).unwrap(),
             incarnation: 9,
         };
+        let identity = EntryEventIdentity::from_binding(binding);
         let event = ExternalSignalRecord::new(
-            task,
+            identity,
             binding,
             record,
             SignalEventGeneration::new(NonZeroU64::new(1).unwrap()),
             Signal::SEGV,
             ExternalSignalSource::HostFault,
         );
-        assert!(event.matches_live(task, binding, record));
+        assert!(event.matches_live(identity, binding, record));
+        assert!(
+            !event.matches_live(
+                EntryEventIdentity::from_parts(
+                    binding.task,
+                    SnapshotGeneration::from_raw(12),
+                    binding.thread_generation,
+                )
+                .unwrap(),
+                binding,
+                record
+            )
+        );
         assert!(!event.matches_live(
-            TaskKey {
-                serial: TaskSerial::from_registry_allocation(NonZeroU64::new(8).unwrap()),
-                ..task
-            },
-            binding,
-            record
-        ));
-        assert!(!event.matches_live(
-            task,
+            identity,
             ExecutionBinding {
-                generation: EntryGeneration::from_raw(12),
+                generation: SnapshotGeneration::from_raw(12),
                 ..binding
             },
             record
         ));
         assert!(!event.matches_live(
-            task,
+            identity,
             binding,
             RecordRef {
                 incarnation: 10,
@@ -378,14 +395,10 @@ mod tests {
 
     #[test]
     fn full_ingress_returns_owned_event_and_preserves_fifo_order() {
-        let queue = SignalIngressQueue::<TaskKey, 2>::new();
-        let task = TaskKey {
-            id: TaskId::from_registry_allocation(NonZeroI32::new(41).unwrap()),
-            serial: TaskSerial::from_registry_allocation(NonZeroU64::new(7).unwrap()),
-        };
+        let queue = SignalIngressQueue::<2>::new();
         let binding = ExecutionBinding {
             task: EntryTaskKey::from_raw(41),
-            generation: EntryGeneration::from_raw(11),
+            generation: SnapshotGeneration::from_raw(11),
             mm: EntryMmKey::from_raw(301),
             thread_generation: EntryThreadGeneration::from_raw(101),
         };
@@ -393,9 +406,10 @@ mod tests {
             id: RecordId::from_raw(4).unwrap(),
             incarnation: 9,
         };
+        let identity = EntryEventIdentity::from_binding(binding);
         let make = |generation| {
             ExternalSignalRecord::new(
-                task,
+                identity,
                 binding,
                 record,
                 SignalEventGeneration::new(NonZeroU64::new(generation).unwrap()),
@@ -415,14 +429,10 @@ mod tests {
 
     #[test]
     fn full_queue_retains_owned_admission_until_drain() {
-        let queue = SignalIngressQueue::<TaskKey, 2>::new();
-        let task = TaskKey {
-            id: TaskId::from_registry_allocation(NonZeroI32::new(41).unwrap()),
-            serial: TaskSerial::from_registry_allocation(NonZeroU64::new(7).unwrap()),
-        };
+        let queue = SignalIngressQueue::<2>::new();
         let binding = ExecutionBinding {
             task: EntryTaskKey::from_raw(41),
-            generation: EntryGeneration::from_raw(11),
+            generation: SnapshotGeneration::from_raw(11),
             mm: EntryMmKey::from_raw(301),
             thread_generation: EntryThreadGeneration::from_raw(101),
         };
@@ -430,9 +440,10 @@ mod tests {
             id: RecordId::from_raw(4).unwrap(),
             incarnation: 9,
         };
+        let identity = EntryEventIdentity::from_binding(binding);
         let event = |generation| {
             ExternalSignalRecord::new(
-                task,
+                identity,
                 binding,
                 record,
                 SignalEventGeneration::new(NonZeroU64::new(generation).unwrap()),
@@ -461,7 +472,7 @@ mod tests {
 
         const PER_PRODUCER: u64 = 128;
         const TOTAL: usize = (PER_PRODUCER * 2) as usize;
-        let queue = Arc::new(SharedSignalIngressQueue::<TaskKey>::new());
+        let queue = Arc::new(SharedSignalIngressQueue::new());
         let received = Arc::new(Mutex::new(std::vec::Vec::new()));
         let deadline = Instant::now() + Duration::from_secs(5);
         thread::scope(|scope| {
@@ -489,13 +500,9 @@ mod tests {
             for producer in 0..2u64 {
                 let queue = queue.clone();
                 scope.spawn(move || {
-                    let task = TaskKey {
-                        id: TaskId::from_registry_allocation(NonZeroI32::new(41).unwrap()),
-                        serial: TaskSerial::from_registry_allocation(NonZeroU64::new(7).unwrap()),
-                    };
                     let binding = ExecutionBinding {
                         task: EntryTaskKey::from_raw(41),
-                        generation: EntryGeneration::from_raw(11),
+                        generation: SnapshotGeneration::from_raw(11),
                         mm: EntryMmKey::from_raw(301),
                         thread_generation: EntryThreadGeneration::from_raw(101),
                     };
@@ -503,10 +510,11 @@ mod tests {
                         id: RecordId::from_raw(4).unwrap(),
                         incarnation: 9,
                     };
+                    let identity = EntryEventIdentity::from_binding(binding);
                     for index in 0..PER_PRODUCER {
                         let generation = producer * PER_PRODUCER + index + 1;
                         let mut pending = ExternalSignalRecord::new(
-                            task,
+                            identity,
                             binding,
                             record,
                             SignalEventGeneration::new(NonZeroU64::new(generation).unwrap()),

@@ -149,8 +149,8 @@ pub const EL1_FRAME_GRANT_RESIDENCY_OFFSET: u64 = EL1_CURRENT_TASKS_OFFSET + 0x3
 pub const EL1_FRAME_GRANT_RESIDENCY_BASE: u64 = EL1_REGION_BASE + EL1_FRAME_GRANT_RESIDENCY_OFFSET;
 
 /// One shared external-signal ingress reservation in either ISA's kernel
-/// region, after the frame residency inventory. Its concrete identity type
-/// is supplied by the live native thread-custody protocol.
+/// region, after the frame residency inventory. The record carries the exact
+/// neutral identity also used by terminal retirement receipts.
 pub const EL1_SIGNAL_INGRESS_OFFSET: u64 = (EL1_FRAME_GRANT_RESIDENCY_OFFSET
     + core::mem::size_of::<FrameGrantResidencyTable>() as u64
     + 63)
@@ -705,6 +705,11 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         EL1_RESERVATIONS_END,
         RESERVATION_PROTOCOL_VERSION,
         SIGNAL_INGRESS_PROTOCOL,
+        core::mem::size_of::<ExternalSignalRecord>() as u64,
+        core::mem::align_of::<ExternalSignalRecord>() as u64,
+        core::mem::size_of::<SharedSignalIngressQueue>() as u64,
+        core::mem::align_of::<SharedSignalIngressQueue>() as u64,
+        signal_ingress_offsets_hash(),
         EL1_SIGNAL_INGRESS_OFFSET,
         EL1_SIGNAL_INGRESS_RESERVED_SIZE,
         SIGNAL_INGRESS_CAPACITY as u64,
@@ -2724,6 +2729,13 @@ const _: () = assert!(
     EL1_SIGNAL_INGRESS_OFFSET + EL1_SIGNAL_INGRESS_RESERVED_SIZE
         <= EL1_CURRENT_TASKS_OFFSET + EL1_CURRENT_TASKS_SIZE
 );
+const _: () = assert!(
+    core::mem::size_of::<SharedSignalIngressQueue>() as u64 <= EL1_SIGNAL_INGRESS_RESERVED_SIZE
+);
+const _: () = assert!(
+    EL1_SIGNAL_INGRESS_OFFSET
+        .is_multiple_of(core::mem::align_of::<SharedSignalIngressQueue>() as u64)
+);
 const _: () = assert!(EL1_SIGNAL_INGRESS_OFFSET.is_multiple_of(64));
 const _: () =
     assert!(EL1_CURRENT_TASKS_OFFSET + EL1_CURRENT_TASKS_SIZE <= EL1_BOOTSTRAP_METADATA_OFFSET);
@@ -3914,7 +3926,7 @@ impl Default for InotifyNameCache {
 }
 
 const _: () = {
-    assert!(EL1_ABI_LAYOUT_HASH == 0xb11080e85dc02178);
+    assert!(EL1_ABI_LAYOUT_HASH == 0xaffb575b54170429);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);
