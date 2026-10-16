@@ -446,9 +446,6 @@ impl crate::signal_delivery::SignalMachine<ParkedContextWords> for HostArmSignal
     fn restart_forwarded(&self, frame: &mut carrick_el1_abi::TrapFrame) -> Option<bool> {
         crate::arm_signal::restart_forwarded_frame(frame)
     }
-    fn retry_spurious_forwarded(&self, frame: &mut carrick_el1_abi::TrapFrame) -> Option<bool> {
-        crate::arm_signal::retry_spurious_forwarded_frame(frame)
-    }
     fn group_exit_custody(
         &self,
         _: &CurrentTask,

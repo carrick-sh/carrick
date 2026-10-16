@@ -749,6 +749,42 @@ fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
 }
 
 #[test]
+fn serial_host_empty_native_checkpoint_returns_one_forwarded_eintr() {
+    use carrick_core_abi::{
+        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
+    };
+    use carrick_el1::personality::native_process_runtime::host_test_support::NativeSignalFixture;
+
+    let fixture = NativeSignalFixture::new(
+        ExecutionBinding {
+            task: EntryTaskKey::from_raw(153_830),
+            generation: SnapshotGeneration::from_raw(1),
+            mm: EntryMmKey::from_raw(1),
+            thread_generation: EntryThreadGeneration::from_raw(1),
+        },
+        EntryTaskKey::from_raw(153_830),
+    );
+    fixture.install_sigint_handler(true);
+    let queue = carrick_el1_abi::SharedSignalIngressQueue::new();
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.esr = 0xfffe;
+    frame.elr = 0x400004;
+    frame.far = 0x1234;
+    frame.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
+    frame.x[8] = 63;
+    let (drained, route) = fixture.drain_and_deliver(&queue, &mut frame);
+    assert_eq!((drained, route), (0, None));
+    assert_eq!(
+        frame.elr, 0x400004,
+        "no signal may rewind the ordinary call"
+    );
+    assert_eq!(
+        frame.x[0],
+        carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64
+    );
+}
+
+#[test]
 fn serial_host_ppoll_temporary_mask_delivers_then_restores_blocked_sigint() {
     use carrick_core_abi::{
         EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
