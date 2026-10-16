@@ -129,6 +129,10 @@ impl SignalIngressAdmission {
         self.observed_drain
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "full admission retains the exact no_std event without an EL1 allocation"
+    )]
     pub fn retry<const N: usize>(self, queue: &SignalIngressQueue<N>) -> Result<(), Self> {
         queue.admit(self.event)
     }
@@ -343,6 +347,10 @@ impl<const N: usize> SignalIngressQueue<N> {
     /// Capture the drain generation before attempting admission. A caller
     /// that parks on fullness retains the event and can compare this epoch
     /// after subscribing to the host wake source.
+    #[expect(
+        clippy::result_large_err,
+        reason = "a full ring returns owned event and drain generation without allocating"
+    )]
     pub fn admit(&self, event: ExternalSignalRecord) -> Result<(), SignalIngressAdmission> {
         let observed_drain = self.drain_generation();
         self.try_publish(event).map_err(|event| {
@@ -355,6 +363,10 @@ impl<const N: usize> SignalIngressQueue<N> {
     }
 
     /// Publish once. On full, the exact event remains owned by the caller.
+    #[expect(
+        clippy::result_large_err,
+        reason = "a full ring returns the exact event to its producer without allocating"
+    )]
     pub fn try_publish(&self, event: ExternalSignalRecord) -> Result<(), ExternalSignalRecord> {
         let mut position = self.head.load(Ordering::Relaxed);
         loop {
