@@ -1185,7 +1185,7 @@ fn complete_metadata_request(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn service_native_fork_stock(
-    custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
+    custody: &Arc<crate::trap::CarrierVmCustody>,
     generation: Option<crate::trap::CarrierVmGeneration>,
     cpu: carrick_guest_arch::CpuId,
     address: carrick_guest_arch::KernelVa,
@@ -1293,10 +1293,94 @@ pub(crate) fn service_native_fork_stock(
             };
             let mut stock = custody.fork_stock.lock();
             let mut ledger = custody.el1_frame_grants.lock();
+            let physical = if kind == Some(ForkStockKind::Commit) {
+                use carrick_aarch64::fork::ForkCustody;
+                let loan = stock.owner.settlement_loan(execution);
+                let Some((request, address, count)) = loan.ok().and_then(|loan| {
+                    settlement
+                        .request(loan)
+                        .map(|(_, address, count)| (loan.request, address, count))
+                }) else {
+                    settlement.refuse(ForkStockRefusal::Invalid);
+                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+                };
+                let Some(count) = usize::try_from(count).ok() else {
+                    settlement.refuse(ForkStockRefusal::Inventory);
+                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+                };
+                let Some(bytes) = count.checked_mul(32) else {
+                    settlement.refuse(ForkStockRefusal::Inventory);
+                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+                };
+                let Some(offset) = address
+                    .raw()
+                    .checked_sub(carrick_el1_abi::EL1_REGION_BASE)
+                    .and_then(|offset| usize::try_from(offset).ok())
+                else {
+                    settlement.refuse(ForkStockRefusal::Inventory);
+                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+                };
+                if offset < carrick_el1_abi::EL1_HEAP_OFFSET as usize
+                    || offset
+                        .checked_add(bytes)
+                        .is_none_or(|end| end > carrick_el1_abi::EL1_REGION_SIZE as usize)
+                {
+                    settlement.refuse(ForkStockRefusal::Inventory);
+                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+                }
+                let authority = custody
+                    .guest_cow_state(execution.binding.mm.raw())
+                    .ok()
+                    .flatten()
+                    .and_then(|state| state.cow_runtime.read().clone())
+                    .map(|runtime| runtime.authority);
+                let source = Arc::new(move |handle, generation| {
+                    authority
+                        .as_ref()
+                        .is_some_and(|authority| authority.retains_host_backing(handle, generation))
+                });
+                let owner = crate::trap::ForkPhysicalCustody::new(Arc::clone(custody), source);
+                let mut retained = Vec::new();
+                if retained.try_reserve_exact(count).is_err() {
+                    settlement.refuse(ForkStockRefusal::Capacity);
+                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+                }
+                for index in 0..count {
+                    let Some(row_offset) = index
+                        .checked_mul(32)
+                        .and_then(|index| offset.checked_add(index))
+                    else {
+                        settlement.refuse(ForkStockRefusal::Inventory);
+                        return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+                    };
+                    let Some(pointer) = region.record_ptr::<[u64; 4]>(row_offset) else {
+                        settlement.refuse(ForkStockRefusal::Inventory);
+                        return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+                    };
+                    // SAFETY: this complete row lies in the stopped CPU's retained
+                    // EL1 allocation, checked above against the region bounds.
+                    let words = unsafe { *pointer };
+                    let Some(selected) = carrick_el1_abi::PortalForkCustody::decode(words) else {
+                        settlement.refuse(ForkStockRefusal::Inventory);
+                        return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+                    };
+                    match owner.retain(request, selected) {
+                        Ok(Some(pin)) => retained.push(pin),
+                        _ => {
+                            settlement.refuse(ForkStockRefusal::Inventory);
+                            return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+                        }
+                    }
+                }
+                retained
+            } else {
+                Vec::new()
+            };
             match stock.owner.settle(
                 &mut *ledger,
                 execution,
                 settlement,
+                physical,
                 |pages| {
                     pages.iter().all(|page| {
                         ForkStockHostCustody::physical_ptr::<[u8; 4096]>(custody, page.address())
