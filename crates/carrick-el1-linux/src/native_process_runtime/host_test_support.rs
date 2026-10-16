@@ -191,7 +191,6 @@ pub struct NativeSignalFixture {
     registry: &'static NativeProcessRegistry<'static, AddressContext<RootGpa>, ParkedContextWords>,
     runtime: Arc<NativeProcessRuntime<'static, AddressContext<RootGpa>, ParkedContextWords>>,
     task: &'static CurrentTask,
-    page: &'static ThreadLifecyclePage,
     control: &'static ThreadControlSlot,
     child_page: &'static ThreadLifecyclePage,
     child_controls: &'static [ThreadControlSlot; 9],
@@ -273,13 +272,21 @@ impl NativeSignalFixture {
         registry
             .register_root(runtime.clone(), source, task, address)
             .unwrap();
-        let record = control.zone_record().unwrap();
+        let record = registry
+            .state
+            .lock()
+            .members
+            .values()
+            .next()
+            .unwrap()
+            .record;
+        control.bind_zone_record(record);
+        task.publish_lifecycle(page as *const _ as u64, control as *const _ as u64);
         Self {
             zone,
             registry,
             runtime,
             task,
-            page,
             control,
             child_page,
             child_controls,
@@ -371,12 +378,31 @@ impl NativeSignalFixture {
                 &mut service,
             )
             .unwrap();
+        assert!(
+            !self.task.linux.has_pending_host_work(),
+            "host work blocks signal delivery"
+        );
+        assert!(
+            entry.signal_checkpoint_needed(),
+            "admitted signal is not pending for owner"
+        );
+        assert!(matches!(
+            carrick_personality_linux::signal::ProcessSignals::rt_sigaction(
+                &mut entry,
+                carrick_signal_core::policy::Signal::from_number(2).unwrap(),
+                None,
+            )
+            .unwrap()
+            .disposition,
+            carrick_signal_core::policy::Disposition::Handler(_)
+        ));
         let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
         let mut machine = HostArmSignalMachine {
             backend: HostArmBackend,
         };
-        let route = crate::signal_delivery::deliver_signal_on_syscall_return(
+        let route = crate::signal_delivery::deliver_signal_with_control(
             self.task,
+            self.control,
             &mut entry,
             frame,
             fp.as_bytes(),

@@ -197,8 +197,11 @@ impl SignalBackend for LinuxX86Backend {
         let Ok(uc) = Ucontext::read_from_bytes(&uc_bytes) else {
             return Err(ArchError::InvalidFrame);
         };
-        let stack = carrick_personality_linux::signal::restored_altstack(uc.uc_stack)
-            .ok_or(ArchError::InvalidFrame)?;
+        let stack = carrick_personality_linux::signal::restored_altstack(
+            uc.uc_stack,
+            carrick_guest_arch::GuestIsa::X86_64,
+        )
+        .ok_or(ArchError::InvalidFrame)?;
 
         let flags = carrick_sched_core::signal_return_flags(frame.r11, uc.uc_mcontext.eflags);
         if !carrick_sched_core::valid_user_return_words(
