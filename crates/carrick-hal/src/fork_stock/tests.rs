@@ -207,6 +207,22 @@ fn sequential_cycles_beyond_stock<T: ChildAddressTags>(tags: T) -> ForkStock<T> 
 }
 
 #[test]
+fn arm_fork_children_receive_distinct_control_capacity() {
+    let mut stock = stock(AsidAllocator::with_limit_for_tests(2), 8, 2);
+    let first = loan(&mut stock, parent(), 302, 1, 1).unwrap();
+    commit(&mut stock, parent(), first, 1, 0).unwrap();
+    let second = loan(&mut stock, parent(), 303, 1, 1).unwrap();
+    assert_ne!(
+        first.request.child_tables.base,
+        second.request.child_tables.base
+    );
+    assert_ne!(
+        first.request.kernel_control_ipa, second.request.kernel_control_ipa,
+        "two live children must not copy their identity pages into one physical control window"
+    );
+}
+
+#[test]
 fn untagged_sequential_fork_retire_cycles_exceed_stock() {
     sequential_cycles_beyond_stock(UntaggedRoots);
 }
