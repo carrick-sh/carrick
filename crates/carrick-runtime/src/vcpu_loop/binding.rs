@@ -5676,18 +5676,30 @@ where
             });
 
         if receipt.claim == ProcessExitClaim::Owner {
-            publish_unexpected_executor_failure_retirement(
-                &self.kernel,
-                &self.state.threads,
-                &self.completion,
-            )
-            .unwrap_or_else(|failure| {
-                tracing::error!(%failure, "publish unexpected executor-failure retirement");
-                carrick_fatal!(
-                    "kernel::terminal_settlement",
-                    "publish unexpected executor-failure retirement failed: {failure}"
-                );
-            });
+            if self
+                .kernel
+                .process_physical_retirement
+                .failure_needs_publication()
+            {
+                publish_unexpected_executor_failure_retirement(
+                    &self.kernel,
+                    &self.state.threads,
+                    &self.completion,
+                )
+                .unwrap_or_else(|failure| {
+                    tracing::error!(%failure, "publish unexpected executor-failure retirement");
+                    carrick_fatal!(
+                        "kernel::terminal_settlement",
+                        "publish unexpected executor-failure retirement failed: {failure}"
+                    );
+                });
+            } else {
+                // The normal terminal owner already published its exact member
+                // receipt before this retained owner failed. Preserve it and
+                // report the executor's original failure through the process
+                // terminal, rather than rebuilding and publishing it again.
+                self.kernel.publish_process_terminal(Err(()));
+            }
         } else {
             let kernel = Arc::clone(&self.kernel);
             let threads = self.state.threads.clone();
