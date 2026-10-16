@@ -12,10 +12,9 @@ rationale = "One checked venue names the shared ABI object/open/fd/name/cache al
 structural_budgets = []
 
 [bindings]
-# The linux_personality.rs change adds only the wait4 pre-dispatch work
-# selector and the continuation settlement capability. Neither touches file
-# region custody or descriptor operations. The owned wait4 witness and live
-# KVM wait4/pingpong runs cover the affected entry behavior.
+# The signal-delivery move in linux_personality.rs changes no file-region
+# custody or descriptor operation. The file_region suite remains the positive
+# venue/descriptor witness; x86 machine-frame conversion stays in this adapter.
 vm_free = "carrick-x86-cpl0::file_region:: layout_alignment_capacity_and_extent, stdio_parity_and_closed_descriptor_stays_closed, record_beyond_fifteen_uses_shared_capacity, foreign_retired_and_two_carriers, fork_dup_lookup_and_retire_preserve_live_parent, unpublished_is_distinct_from_retired (all prefixed file_region_); carrick-el1-abi::tests::fd_map_waiter_does_no_rmw_while_lock_is_observed_held"
 
 [bindings.unresolved]

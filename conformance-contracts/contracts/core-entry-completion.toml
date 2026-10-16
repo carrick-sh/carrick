@@ -34,6 +34,9 @@ private wire exports preserves native completion: a valid public frame
 restores its accumulator and blocked mask without a syscall result; a malformed
 frame forces SIGSEGV without publishing either, and both retain the same-entry
 return-work route. This binding does not change ARM production routing.
+Moving x86 signal selection into the shared EL1 owner preserves the completed
+syscall's single return route and keeps the x86 machine frame conversion in its
+ISA adapter. The existing return-work and x86 context witnesses still apply.
 """
 
 [bindings]
