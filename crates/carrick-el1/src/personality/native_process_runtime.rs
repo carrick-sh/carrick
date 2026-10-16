@@ -752,7 +752,7 @@ impl<'a, M: Clone, C: ProcessContext> Clone for NativeOwnerMember<'a, M, C> {
 struct NativeRegistryState<'a, M: Clone, C: ProcessContext> {
     members: BTreeMap<NativeExecutionKey, NativeOwnerMember<'a, M, C>>,
     groups: BTreeMap<NativeGroupKey, (Arc<NativeProcessRuntime<'a, M, C>>, TaskKey)>,
-    records: BTreeMap<NativeRecordKey, Arc<NativeProcessRuntime<'a, M, C>>>,
+    records: BTreeMap<NativeRecordKey, NativeExecutionKey>,
     by_process: BTreeMap<(usize, TaskKey), (NativeGroupKey, Vec<NativeExecutionKey>)>,
 }
 
@@ -995,7 +995,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         state
             .by_process
             .insert((key.carrier, process), (group_key, vec![key]));
-        state.records.insert(record_key, runtime.clone());
+        state.records.insert(record_key, key);
         *runtime.registry.lock() = Some(self);
         Ok(())
     }
@@ -1144,7 +1144,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .records
             .remove(&Self::record_key(source.zone, old_record));
         state.members.insert(key, member);
-        state.records.insert(record_key, runtime.clone());
+        state.records.insert(record_key, key);
         drop(graph);
         Ok(Some(runtime))
     }
@@ -1173,11 +1173,37 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         zone: &ZoneTables<C>,
         record: RecordRef,
     ) -> Option<Arc<NativeProcessRuntime<'a, M, C>>> {
-        self.state
-            .lock()
-            .records
-            .get(&Self::record_key(zone, record))
-            .cloned()
+        let state = self.state.lock();
+        let key = state.records.get(&Self::record_key(zone, record))?;
+        state.members.get(key).map(|member| member.runtime.clone())
+    }
+
+    /// Resolve one ingress event through the exact live member index. A tid,
+    /// MM, or record slot on its own is never authority to admit a signal.
+    pub fn for_external_event(
+        &self,
+        zone: &ZoneTables<C>,
+        event: carrick_el1_abi::ExternalSignalRecord,
+    ) -> Option<Arc<NativeProcessRuntime<'a, M, C>>> {
+        let state = self.state.lock();
+        let key = state.records.get(&Self::record_key(zone, event.record()))?;
+        let member = state.members.get(key)?;
+        let binding = key.binding();
+        if !event.matches_live(
+            carrick_core_abi::EntryEventIdentity::from_binding(binding),
+            binding,
+            member.record,
+        ) || !signal_record_exists(zone, member.record)
+        {
+            return None;
+        }
+        let graph = member.runtime.graph.lock();
+        let row = graph.owner.task(member.process).ok()?;
+        let resources = row.native().resources();
+        if !resources.page.gate().serves_ring() || resources.address != member.address {
+            return None;
+        }
+        Some(member.runtime.clone())
     }
 
     /// The exact admitted process address for a published thread-group
@@ -1273,7 +1299,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             (child_key.carrier, child.child),
             (group_key, vec![child_key]),
         );
-        state.records.insert(record_key, runtime);
+        state.records.insert(record_key, child_key);
         Ok(())
     }
 
@@ -1428,7 +1454,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .ok_or(NativeProcessError::Stale)?
             .1
             .push(key);
-        state.records.insert(record_key, runtime.clone());
+        state.records.insert(record_key, key);
         drop(state);
         if closing {
             let wait = NativeBucketWait {
