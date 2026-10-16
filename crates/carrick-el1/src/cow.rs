@@ -612,7 +612,7 @@ mod tests {
         let address = VA + PAGE - 2;
         let bytes = 42_u32.to_ne_bytes();
 
-        assert!(crate::file::prepare_cow_write(
+        assert!(crate::substrate::file::prepare_cow_write(
             &ArenaWrite(&child),
             address,
             bytes.len(),

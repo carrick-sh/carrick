@@ -661,6 +661,11 @@ these effects. The VM-free bindings are
 processes and terminal effects. The signed bindings are the five EL1 cases
 named by #491; the Docker oracle for this exact flag family remains a
 separate, serialized authority check.
+The ring copy preflights each target page under the child's exact MM grant,
+resolving at most one COW miss per page before publishing any bytes. The
+VM-free `in_ring_copy_prepares_child_cow_and_keeps_parent_bytes` binding checks
+a copy spanning two COW pages, the child's private bytes, unchanged parent
+bytes, and the compound grant's single resolution.
 
 `kernel.process.exit-owner` covers reserved exit topology. Linux authority is
 exit(2), wait(2), PR_SET_CHILD_SUBREAPER and SIGCHLD's SIG_IGN/SA_NOCLDWAIT

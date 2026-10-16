@@ -729,6 +729,48 @@ impl<'a, X: ForkStockCrossing> Aarch64NativeProcessService<'a, X> {
             self.zone,
         ))
     }
+
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    fn resolve_copy_cow(&self, mm: &Mm, far: u64) -> bool {
+        use crate::fault::{CowResolution, CowResolver, HardwareCowResolver};
+
+        let key = mm.mm.raw().get();
+        let live = crate::isa::aarch64::hardware_live_ttbr();
+        if self.task.mm.key.load(Ordering::Acquire) != key
+            || live & AARCH64_ROOT_ADDRESS_MASK != mm.root.address().raw()
+        {
+            return false;
+        }
+        let Ok(portal) = self.portal() else {
+            return false;
+        };
+        let Some(index) = portal.spaces.find(key) else {
+            return false;
+        };
+        let Some(grant) = portal.spaces.grant(index, key) else {
+            return false;
+        };
+        if grant.ttbr0 & AARCH64_ROOT_ADDRESS_MASK != mm.root.address().raw() {
+            return false;
+        }
+        let Ok(access) = portal.space_access(self.worker()) else {
+            return false;
+        };
+        let Some(owner) = NonZeroU64::new(u64::from(self.worker()) + 1) else {
+            return false;
+        };
+        let Some(_editor) =
+            access.try_begin_edit_bounded(index, key, owner, carrick_el1_abi::EL1_GUEST_LOCK_SPINS)
+        else {
+            return false;
+        };
+        let mut resolver = HardwareCowResolver {
+            service_slot: Some(carrick_el1_abi::SlotId::new(self.slot.raw())),
+            completion: None,
+            publication: None,
+        };
+        resolver.resolve_cow_outcome(grant.ttbr0, key, far) == CowResolution::Resolved
+    }
 }
 
 #[allow(dead_code)]
@@ -1162,6 +1204,15 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     ) -> Result<(), NativeProcessError> {
         if self.task.mm.key.load(Ordering::Acquire) != mm.mm.raw().get() {
             return Err(NativeProcessError::Stale);
+        }
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        if !crate::substrate::file::prepare_cow_write(
+            &crate::file::HardwareValidator,
+            address.raw(),
+            bytes.len(),
+            |far| self.resolve_copy_cow(mm, far),
+        ) {
+            return Err(NativeProcessError::Fault);
         }
         let mut copy = crate::file::ValidatedCopy {
             task: self.task,
