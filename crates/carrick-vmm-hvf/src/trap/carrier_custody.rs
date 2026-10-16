@@ -4429,6 +4429,22 @@ mod carrier_vm_custody_tests {
     }
 
     #[test]
+    fn retained_stage2_pin_does_not_keep_its_carrier_alive() {
+        let (custody, generation) = live_custody();
+        let identity = custody
+            .register_stage2_record(stage2_spec(generation, 71))
+            .expect("register stage-2 record");
+        let pin = custody.pin_stage2_record(identity).expect("pin record");
+        let weak = std::sync::Arc::downgrade(&custody);
+        drop(custody);
+        assert!(
+            weak.upgrade().is_none(),
+            "a pin retained by fork stock must not cycle the carrier"
+        );
+        drop(pin);
+    }
+
+    #[test]
     fn successful_vm_destroy_terminalizes_generation_without_post_destroy_unmap() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let (custody, generation) = live_custody();
