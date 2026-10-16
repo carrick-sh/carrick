@@ -20,6 +20,12 @@ pub trait SignalMachine<C> {
         frame: &mut <Self::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
         original: C,
     ) -> bool;
+    fn restart_forwarded(
+        &self,
+        _frame: &mut <Self::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
+    ) -> Option<bool> {
+        None
+    }
     fn group_exit_custody(&self, task: &CurrentTask) -> CompletionRoute;
 }
 
@@ -63,10 +69,16 @@ where
             }
         }
         policy::Disposition::Handler(handler) => {
-            if let Some(original) = process.take_interrupted_child_wait()
-                && action.flags.restart
-                && !machine.restart(frame, original)
-            {
+            let restarted = if action.flags.restart {
+                if let Some(original) = process.take_interrupted_child_wait() {
+                    Some(machine.restart(frame, original))
+                } else {
+                    machine.restart_forwarded(frame)
+                }
+            } else {
+                None
+            };
+            if restarted == Some(false) {
                 return force_delivery_fault(
                     task,
                     process,
