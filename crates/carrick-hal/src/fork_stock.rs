@@ -39,37 +39,50 @@ struct QuarantinedChild {
 
 /// Bytes in one loaned page-table page.
 const TABLE_PAGE_BYTES: u64 = 4096;
-const CONTROL_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
+const CONTROL_WINDOW_BYTES: u64 = carrick_el1_abi::AARCH64_KERNEL_CONTROL_SIZE as u64;
 
 /// Physical control capacity is exclusive when the ISA copies a supervisor
 /// control window. x86 has no such alias; its nonzero wire base is unused by
 /// the shared fork walk and therefore consumes no physical control stock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub enum ForkControlCapacity {
-    Exclusive { base: u64 },
-    Unused { wire_base: u64 },
+enum ControlKind {
+    Exclusive,
+    Unused,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct ForkControlCapacity {
+    base: u64,
+    kind: ControlKind,
 }
 
 impl ForkControlCapacity {
-    pub fn exclusive(base: u64) -> Option<Self> {
+    fn exclusive(base: u64) -> Option<Self> {
         (base != 0
             && base.is_multiple_of(CONTROL_WINDOW_BYTES)
             && base.checked_add(CONTROL_WINDOW_BYTES).is_some())
-        .then_some(Self::Exclusive { base })
+        .then_some(Self {
+            base,
+            kind: ControlKind::Exclusive,
+        })
     }
 
     pub fn unused(wire_base: u64) -> Option<Self> {
         (wire_base != 0
             && wire_base.is_multiple_of(CONTROL_WINDOW_BYTES)
             && wire_base.checked_add(CONTROL_WINDOW_BYTES).is_some())
-        .then_some(Self::Unused { wire_base })
+        .then_some(Self {
+            base: wire_base,
+            kind: ControlKind::Unused,
+        })
     }
 
     pub fn base(self) -> u64 {
-        match self {
-            Self::Exclusive { base } => base,
-            Self::Unused { wire_base } => wire_base,
-        }
+        self.base
+    }
+
+    fn is_exclusive(self) -> bool {
+        self.kind == ControlKind::Exclusive
     }
 }
 
@@ -592,11 +605,10 @@ impl<T: ChildAddressTags> ForkStock<T> {
         Self {
             carrier,
             controls: control
-                .filter(|control| matches!(control, ForkControlCapacity::Exclusive { .. }))
+                .filter(|control| control.is_exclusive())
                 .into_iter()
                 .collect(),
-            unused_control: control
-                .filter(|control| matches!(control, ForkControlCapacity::Unused { .. })),
+            unused_control: control.filter(|control| !control.is_exclusive()),
             tables: Vec::new(),
             lifecycles: Vec::new(),
             pending: Vec::new(),
@@ -643,7 +655,8 @@ impl<T: ChildAddressTags> ForkStock<T> {
 
     /// Replace the initial capacity before a guest can borrow stock. The
     /// carrier retains the physical backing of every supplied window.
-    pub fn install_control_capacity(
+    #[cfg(test)]
+    pub(crate) fn install_control_capacity(
         &mut self,
         controls: Vec<ForkControlCapacity>,
     ) -> Result<(), ForkStockServiceError> {
@@ -652,9 +665,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
         unique.dedup();
         if controls.is_empty()
             || unique.len() != controls.len()
-            || controls
-                .iter()
-                .any(|control| !matches!(control, ForkControlCapacity::Exclusive { .. }))
+            || controls.iter().any(|control| !control.is_exclusive())
             || !self.tables.is_empty()
             || !self.lifecycles.is_empty()
             || !self.children.is_empty()
@@ -671,6 +682,11 @@ impl<T: ChildAddressTags> ForkStock<T> {
     /// True when a fork can be admitted a lifecycle record right now.
     pub fn lifecycle_available(&self) -> bool {
         !self.lifecycles.is_empty()
+    }
+
+    /// Whether the next loan needs another ISA control window.
+    pub fn needs_control_capacity(&self) -> bool {
+        self.controls.is_empty() && self.unused_control.is_none()
     }
 
     pub fn pending(&self, cpu: CpuId) -> Option<&PendingForkLoan<T::Tag>> {
@@ -1004,7 +1020,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
         self.tables.extend(reserved.child_tables);
         self.tables.extend(reserved.parent_tables);
         self.lifecycles.push(reserved.lifecycle);
-        if matches!(reserved.control, ForkControlCapacity::Exclusive { .. }) {
+        if reserved.control.is_exclusive() {
             self.controls.push(reserved.control);
         }
         self.tags
@@ -1116,7 +1132,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
             self.tables.extend(pending.child_tables);
             self.tables.extend(pending.parent_tables);
             self.lifecycles.push(pending.lifecycle);
-            if matches!(pending.control, ForkControlCapacity::Exclusive { .. }) {
+            if pending.control.is_exclusive() {
                 self.controls.push(pending.control);
             }
         } else {
@@ -1285,7 +1301,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
             }
             if let Some(child) = child {
                 self.lifecycles.push(child.lifecycle);
-                if matches!(child.control, ForkControlCapacity::Exclusive { .. }) {
+                if child.control.is_exclusive() {
                     self.controls.push(child.control);
                 }
                 self.counters.returned_children = self.counters.returned_children.saturating_add(1);
@@ -1313,6 +1329,28 @@ impl<T: ChildAddressTags> ForkStock<T> {
                 self.quarantine.remove(&key);
             }
         }
+    }
+}
+
+impl ForkStock<AsidAllocator> {
+    /// Admit one newly mapped AArch64 control window before the next loan.
+    /// The constructor is ISA-bound: `ForkStock<UntaggedRoots>` has no such
+    /// method and cannot manufacture an exclusive capacity through `new`.
+    pub fn provide_arm_control_capacity(&mut self, base: u64) -> Result<(), ForkStockServiceError> {
+        let control =
+            ForkControlCapacity::exclusive(base).ok_or(ForkStockServiceError::InvalidRecord)?;
+        if self.controls.contains(&control)
+            || self
+                .pending
+                .iter()
+                .flatten()
+                .any(|loan| loan.control == control)
+            || self.children.values().any(|child| child.control == control)
+        {
+            return Err(ForkStockServiceError::InvalidRecord);
+        }
+        self.controls.push(control);
+        Ok(())
     }
 }
 

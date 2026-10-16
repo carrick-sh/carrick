@@ -1185,7 +1185,7 @@ fn complete_metadata_request(
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn service_native_fork_stock(
-    custody: &crate::trap::CarrierVmCustody,
+    custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
     generation: Option<crate::trap::CarrierVmGeneration>,
     cpu: carrick_guest_arch::CpuId,
     address: carrick_guest_arch::KernelVa,
@@ -1269,6 +1269,10 @@ pub(crate) fn service_native_fork_stock(
                     exchange.refuse(ForkStockRefusal::Inventory);
                     return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
                 }
+            }
+            if stock.ensure_control_capacity(custody).is_err() {
+                exchange.refuse(ForkStockRefusal::Capacity);
+                return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             }
             stock
                 .owner
@@ -1370,7 +1374,7 @@ fn lifecycle_window(
 pub(crate) fn handle_metadata_grant_trap(
     vcpu: &mut applevisor::vcpu::Vcpu,
     cpu: carrick_guest_arch::CpuId,
-    custody: &crate::trap::CarrierVmCustody,
+    custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
     generation: Option<crate::trap::CarrierVmGeneration>,
 ) -> Result<MetadataTrapOutcome, TrapError> {
     use applevisor::vcpu::Reg;
