@@ -333,6 +333,13 @@ pub trait Aarch64Vcpu {
         Ok(())
     }
 
+    /// Complete a forwarded syscall through the native EL1 signal checkpoint
+    /// before restoring EL0. Register-return test backends retain their
+    /// ordinary completion; the mailbox backend selects its checkpoint action.
+    fn complete_native_signal_return(&mut self, return_value: i64) -> Result<(), TrapError> {
+        self.complete_syscall_return(return_value)
+    }
+
     /// Return an ordinary syscall result still owned by a backend response
     /// mailbox. Register-return backends keep the default: x0 is already live.
     fn pending_syscall_return(&self) -> Result<Option<i64>, TrapError> {
