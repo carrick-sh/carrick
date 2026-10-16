@@ -533,7 +533,10 @@ impl Kernel {
             .map_err(|TaskParticipantError::UnknownThread { .. }| {
                 KernelOperationError::UnknownThread(context.thread.key().tid)
             })?;
-        let ring_closing = context.lifecycle_page().exit_wait().is_some();
+        let ring_closing = context
+            .lifecycle_page()
+            .process_exit_custody()
+            .caller_reserved();
         if !ring_closing && !exit_participants.permits_nonfinal_exit() {
             return Err(KernelOperationError::LastThreadRequiresTaskExit(
                 context.thread.key().tid,
@@ -556,12 +559,8 @@ impl Kernel {
             None
         } else {
             Some(
-                (if ring_closing {
-                    lifecycle.reserve_cancelled_member_exit()
-                } else {
-                    lifecycle.reserve_nonfinal_exit()
-                })
-                .map_err(|_| KernelOperationError::LastThreadRequiresTaskExit(tid))?,
+                carrick_core::terminal::reserve_thread_exit_membership(&*lifecycle)
+                    .map_err(|_| KernelOperationError::LastThreadRequiresTaskExit(tid))?,
             )
         };
         check_failpoint(failpoint, KernelFailpoint::AfterMembershipReserve)?;
@@ -1364,6 +1363,53 @@ mod tests {
                 .fork_barrier_participants(sibling.thread().key()),
             Err(TaskParticipantError::UnknownThread { .. })
         ));
+    }
+
+    #[test]
+    fn host_sibling_exit_after_caller_reservation_before_wait_key_releases_membership() {
+        use carrick_core::terminal::{Live, Process, TerminalCustody};
+        use carrick_el1_abi::Lifecycle;
+        use carrick_guest_arch::{
+            AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa,
+        };
+        use carrick_sched_core::process::{TaskId, TaskKey, TaskSerial, TerminationStatus};
+        use std::num::{NonZeroI32, NonZeroU64};
+
+        let (kernel, leader) = bootstrap(19_427);
+        let sibling = clone_sibling(&kernel, &leader, 19_428);
+        let page = leader.lifecycle_page();
+        assert!(leader.exact_thread_is_live() && sibling.exact_thread_is_live());
+        assert_eq!(page.live(), 2);
+        let admission = TerminalCustody::<Process, Live>::close_admission(&*page);
+        let _closing = TerminalCustody::<Process, Live>::begin_exit(
+            admission,
+            TaskKey {
+                id: TaskId::from_registry_allocation(NonZeroI32::new(19_427).unwrap()),
+                serial: TaskSerial::from_raw_u64(leader.task().key().serial.raw()).unwrap(),
+            },
+            AddressContext {
+                root: RootGpa::page_aligned(FrameGpa::new(0x10000)).unwrap(),
+                mm: MmGeneration::new(NonZeroU64::new(leader.shared().mm().id().raw()).unwrap()),
+                generation: ContextGeneration::new(NonZeroU64::new(1).unwrap()),
+            },
+            TerminationStatus::exited(0),
+        )
+        .expect("root reserves its caller before publishing the exit wait key");
+        assert_eq!(page.live(), 1);
+        assert!(
+            page.exit_wait().is_none(),
+            "the root has not published its wait key yet"
+        );
+        kernel
+            .exit_thread(&sibling, None)
+            .expect("the sibling is nonfinal under the neutral owner's reservation");
+        assert_eq!(
+            page.live(),
+            0,
+            "the completed sibling must release its own membership"
+        );
+        assert!(!sibling.exact_thread_is_live());
+        assert!(leader.exact_thread_is_live());
     }
 
     #[test]
