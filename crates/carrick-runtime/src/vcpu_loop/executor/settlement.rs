@@ -509,7 +509,11 @@ where
     let result = fail_running(scheduler, running, reason, receipts);
     resolver.retire(thread, generation);
     if let Some(binding) = binding {
-        binding.after_executor_failure_settlement();
+        let detail = match &result {
+            Some(error) => format!("{reason:?}: {error}"),
+            None => format!("{reason:?}"),
+        };
+        binding.after_executor_failure_settlement(detail);
     }
     result
 }

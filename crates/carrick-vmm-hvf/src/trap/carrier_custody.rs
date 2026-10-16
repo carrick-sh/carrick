@@ -1375,7 +1375,7 @@ impl CarrierVmCustody {
         carrick_core::mm::retirement::pin_record(
             record,
             identity,
-            CarrierPinVenue(std::sync::Arc::clone(self)),
+            CarrierPinVenue(std::sync::Arc::downgrade(self)),
         )
     }
 
@@ -1419,11 +1419,13 @@ impl CarrierVmCustody {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(::core::fmt::Debug)]
-pub(crate) struct CarrierPinVenue(std::sync::Arc<CarrierVmCustody>);
+pub(crate) struct CarrierPinVenue(std::sync::Weak<CarrierVmCustody>);
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl carrick_core::mm::retirement::RecordPinVenue for CarrierPinVenue {
     fn release_pin(&self, identity: CarrierStage2RecordIdentity) {
-        self.0.release_stage2_pin(identity);
+        if let Some(custody) = self.0.upgrade() {
+            custody.release_stage2_pin(identity);
+        }
     }
 }
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4426,6 +4428,22 @@ mod carrier_vm_custody_tests {
             CarrierStage2RetireOutcome::RetiredUnmapped
         );
         assert_eq!(unmap_calls.get(), 1);
+    }
+
+    #[test]
+    fn retained_stage2_pin_does_not_keep_its_carrier_alive() {
+        let (custody, generation) = live_custody();
+        let identity = custody
+            .register_stage2_record(stage2_spec(generation, 71))
+            .expect("register stage-2 record");
+        let pin = custody.pin_stage2_record(identity).expect("pin record");
+        let weak = std::sync::Arc::downgrade(&custody);
+        drop(custody);
+        assert!(
+            weak.upgrade().is_none(),
+            "a pin retained by fork stock must not cycle the carrier"
+        );
+        drop(pin);
     }
 
     #[test]
