@@ -1507,6 +1507,64 @@ fn retained_dynamic_metadata(
 
 /// Physical process crossings use HVC #6. Metadata allocation uses its mailbox.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn service_native_cow_supply(
+    custody: &Arc<crate::trap::CarrierVmCustody>,
+    region: Option<RetainedAbiRegion<'_>>,
+    cpu: carrick_guest_arch::CpuId,
+    ttbr0: u64,
+    address: u64,
+    claimed_cpu: u64,
+) -> Result<[u64; 4], TrapError> {
+    let denied = [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
+    let Some(region) = region else {
+        return Ok(denied);
+    };
+    if claimed_cpu != u64::from(cpu.raw()) {
+        return Ok(denied);
+    }
+    let Some(execution) = stopped_execution(region, cpu, ttbr0) else {
+        return Ok(denied);
+    };
+    let Some(pointer) = region.record_ptr::<carrick_el1_abi::MmPortalSlots>(
+        carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize,
+    ) else {
+        return Ok(denied);
+    };
+    // SAFETY: the retained ABI mapping owns this atomic portal record while
+    // the stopped CPU owns its slot's selection.
+    let slots = unsafe { &*pointer };
+    let Some(slot) = slots.grant(cpu.raw() as usize) else {
+        return Ok(denied);
+    };
+    let mm = execution.binding.mm.raw();
+    let Some((_, window)) = slot.pending_cow_fault_selection(mm, address) else {
+        return Ok(denied);
+    };
+    if slots.carrier() != Some(window.operation.carrier)
+        || window.operation.carrier != custody.transfer_carrier
+        || window.fault_page != address & !4095
+    {
+        return Ok(denied);
+    }
+    let Some(pool) = carrick_el1_abi::cow_grant_pool_host() else {
+        return Ok(denied);
+    };
+    let Ok(Some(state)) = custody.guest_cow_state(mm) else {
+        return Ok(denied);
+    };
+    let supplied = pool.ready(mm).next().is_some()
+        || crate::trap::refill_guest_cow_pool(&state, custody, pool, address, |candidate| {
+            candidate == mm && slots.carrier() == Some(window.operation.carrier)
+        })?
+        || pool.ready(mm).next().is_some();
+    if !supplied || !slot.take_cow_fault_selection(window) {
+        return Ok(denied);
+    }
+    Ok([METADATA_GRANT_SUCCESS, 0, 0, 0])
+}
+
+/// Physical process crossings use HVC #6. Metadata allocation uses its mailbox.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn handle_metadata_grant_trap(
     vcpu: &mut applevisor::vcpu::Vcpu,
     cpu: carrick_guest_arch::CpuId,
@@ -1559,6 +1617,11 @@ pub(crate) fn handle_metadata_grant_trap(
         } else {
             [METADATA_GRANT_ERR_INVALID, 0, 0, 0]
         }
+    } else if op == carrick_el1_abi::GRANT_OP_COW_SUPPLY {
+        let ttbr0 = vcpu
+            .get_sys_reg(applevisor::vcpu::SysReg::TTBR0_EL1)
+            .map_err(|e| TrapError::Hypervisor(format!("read COW supply root: {e}")))?;
+        service_native_cow_supply(custody, region, cpu, ttbr0, arg1, arg2)?
     } else if matches!(
         op,
         carrick_el1_abi::GRANT_OP_CHILD_RETIRE | carrick_el1_abi::GRANT_OP_WAIT_CHANNEL_WAKE
