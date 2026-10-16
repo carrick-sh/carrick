@@ -371,6 +371,13 @@ impl<const N: usize> SignalIngressQueue<N> {
         self.drain_generation.load(Ordering::Acquire)
     }
 
+    /// An empty snapshot permits the guest to skip signal frame preparation.
+    /// A concurrent publication is followed by a host-work kick; observing a
+    /// claimed but unpublished head merely takes the slow path conservatively.
+    pub fn is_empty(&self) -> bool {
+        self.head.load(Ordering::Acquire) == self.tail.load(Ordering::Acquire)
+    }
+
     /// A producer retained an owned admission after observing full capacity.
     pub fn backpressure_waiting(&self) -> bool {
         self.backpressure.load(Ordering::Acquire) != 0

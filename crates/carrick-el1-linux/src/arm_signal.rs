@@ -65,6 +65,9 @@ pub(crate) fn deliver_on_user_return<X: super::aarch64_process::ForkStockCrossin
     use crate::sched::ThreadCpu;
     use zerocopy::IntoBytes;
 
+    if !process.signal_checkpoint_needed() {
+        return None;
+    }
     let mut saved = crate::rust_alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
     crate::sched::HardwareCpu.save(frame, &mut saved);
     let mut fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
