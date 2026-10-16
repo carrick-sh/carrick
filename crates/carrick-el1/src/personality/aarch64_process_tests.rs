@@ -1829,6 +1829,79 @@ fn arm_root_setup_enters_production_process_venue() {
 }
 
 #[test]
+fn arm_signal_setup_then_plain_fork_returns_one_child() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let crossing = Box::leak(Box::new(TestStockCrossing::new(&[
+        0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+    ])));
+    let words = Box::leak(Box::new(fixture.tables.live(&fixture.maintenance)));
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &*crossing,
+    )
+    .with_words(&*words);
+    let ttbr0 = (u64::from(asid(1).raw()) << 48) | fixture.address.root.address().raw();
+    let counters = carrick_el1_abi::Counters::new();
+    let cache = carrick_el1_abi::InotifyNameCache::new();
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    let mask = Box::new(u64::MAX);
+    let old_mask = Box::new(core::cell::UnsafeCell::new(0xdead_beef_u64));
+    for (nr, args, expected) in [
+        (
+            135,
+            [
+                0,
+                &*mask as *const u64 as u64,
+                old_mask.get() as u64,
+                8,
+                0,
+                0,
+            ],
+            0,
+        ),
+        // musl's _Fork sets only x0/x1. Linux ignores x2..x5 without their
+        // matching CLONE_* flags; the preceding sigprocmask leaves them live.
+        (220, [17, 0, 0xdead_beef, 8, 0x1234, 0x5678], 42),
+    ] {
+        frame.x[..6].copy_from_slice(&args);
+        frame.x[8] = nr;
+        let route = super::dispatch::dispatch_arm_syscall_with_native_process(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            None::<crate::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
+            None,
+            Some(&*fixture),
+            fixture.page,
+            fixture.control,
+            ThreadCtx::ZERO,
+            ttbr0,
+            &mut service,
+            |_| core::ptr::null_mut(),
+        )
+        .unwrap();
+        assert_eq!(
+            route,
+            carrick_personality_linux::dispatch::CompletionRoute::WithWork
+        );
+        assert_eq!(frame.x[0] as i64, expected, "syscall {nr}");
+    }
+    // SAFETY: the owned cell outlives the production UserCopy call and no
+    // concurrent actor can write it in this single-threaded fixture.
+    assert_eq!(unsafe { *old_mask.get() }, 0);
+    assert_eq!(service.crossing.loans_requested.load(Ordering::Acquire), 1);
+}
+
+#[test]
 fn arm_returned_process_call_is_not_a_zone_park() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let source = BornInZoneSource {
