@@ -1576,6 +1576,7 @@ impl BlockedContinuation {
             DispatchOutcome::Returned { .. }
             | DispatchOutcome::SchedulerYield
             | DispatchOutcome::Errno { .. }
+            | DispatchOutcome::WriteCopyInSuspended(_)
             | DispatchOutcome::OwnerMemoryWait { .. }
             | DispatchOutcome::OwnerMemorySupply { .. }
             | DispatchOutcome::OwnerPhysicalWait { .. }

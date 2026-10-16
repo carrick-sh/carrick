@@ -45,6 +45,80 @@ enum WriteSource<'a> {
     Guest(&'a carrick_guest_mem::HostRead),
 }
 
+/// A single write's source transfer and exact destination. The functional
+/// lease keeps the description live if its numeric slot is closed or reused.
+pub struct OwnedWriteCopyIn {
+    target: WriteTarget,
+    suspension: carrick_guest_mem::MemoryReadSuspension,
+}
+
+struct WriteTarget {
+    fd: i32,
+    length: usize,
+    tid: crate::thread::ThreadId,
+    thread: crate::kernel::ThreadKey,
+    open_file: Option<OpenFile>,
+    slot_authority: Option<crate::kernel::objects::FileSlotAuthority>,
+    io_lease: Option<crate::kernel::objects::FileDescriptionFdLease>,
+    stdio_was_closed: bool,
+}
+
+impl std::fmt::Debug for OwnedWriteCopyIn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedWriteCopyIn")
+            .field("wait", &self.suspension.wait)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for OwnedWriteCopyIn {
+    fn eq(&self, other: &Self) -> bool {
+        self.suspension.continuation == other.suspension.continuation
+    }
+}
+impl Eq for OwnedWriteCopyIn {}
+
+impl OwnedWriteCopyIn {
+    pub fn wait(&self) -> &carrick_guest_mem::MemoryReadWait {
+        &self.suspension.wait
+    }
+}
+
+impl SyscallDispatcher {
+    /// Resume only this retained write's copy-in and completion. The saved
+    /// request supplies syscall identity; the captured target supplies the
+    /// description, so the numeric fd is never resolved again.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume_owned_write_copy_in<M: CurrentMmMemory>(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+        request: SyscallRequest,
+        pending: Box<OwnedWriteCopyIn>,
+        memory: &mut M,
+        reporter: &CompatReporter,
+        thread: Option<ThreadCtx<'_>>,
+        route: OrdinaryDispatchRoute<'_, '_>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        if request.number != carrick_abi::syscall::nr::WRITE {
+            tracing::error!("write completion belongs to a different syscall");
+            return Err(DispatchError::Errno(carrick_abi::LINUX_EIO));
+        }
+        let mut cx = SyscallCtx {
+            host_wait: route.host_wait,
+            kernel,
+            request,
+            memory,
+            reporter,
+            thread,
+            execution_lease: route.lease,
+            mm_executor: route.mm_executor,
+        };
+        resources::with_captured_resources(kernel, || {
+            self.fs_view().resume_write_copy_in(&mut cx, pending)
+        })
+    }
+}
+
 impl WriteSource<'_> {
     fn len(&self) -> usize {
         match self {
@@ -327,6 +401,58 @@ fn writev_pipe_fault_boundary(
 }
 
 impl<'a> FsView<'a> {
+    fn suspend_write_copy_in(
+        &self,
+        target: WriteTarget,
+        suspension: carrick_guest_mem::MemoryReadSuspension,
+    ) -> DispatchOutcome {
+        DispatchOutcome::WriteCopyInSuspended(Box::new(OwnedWriteCopyIn { target, suspension }))
+    }
+
+    pub(in crate::dispatch) fn resume_write_copy_in<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        mut pending: Box<OwnedWriteCopyIn>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        if pending.target.thread != cx.kernel.thread().key() {
+            tracing::error!("resumed write under a different thread authority");
+            return Err(DispatchError::Errno(carrick_abi::LINUX_EIO));
+        }
+        let bytes = match cx
+            .memory
+            .resume_read(pending.suspension.continuation.clone())
+        {
+            Ok(bytes) => bytes,
+            Err(MemoryError::ReadSuspended(suspension)) => {
+                pending.suspension = *suspension;
+                return Ok(DispatchOutcome::WriteCopyInSuspended(pending));
+            }
+            Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+        };
+        let WriteTarget {
+            fd,
+            length,
+            tid,
+            open_file,
+            slot_authority,
+            io_lease,
+            stdio_was_closed,
+            ..
+        } = pending.target;
+        self.write(
+            cx,
+            fd,
+            length,
+            tid,
+            open_file,
+            slot_authority,
+            None,
+            false,
+            &bytes,
+            io_lease,
+            stdio_was_closed,
+        )
+    }
     /// The RLIMIT_FSIZE soft cap the guest set via setrlimit/prlimit64, or
     /// `None` when unset / RLIM_INFINITY. A write whose bytes would land past
     /// this offset is EFBIG + SIGXFSZ on Linux (llseek01). Stored in the
@@ -543,6 +669,591 @@ impl<'a> FsView<'a> {
             }
             Err(errno) => DispatchOutcome::errno(errno),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        fd: i32,
+        length: usize,
+        tid: crate::thread::ThreadId,
+        open_file: Option<OpenFile>,
+        slot_authority: Option<crate::kernel::objects::FileSlotAuthority>,
+        direct: Option<carrick_guest_mem::HostRead>,
+        zero_copy_host_file: bool,
+        bytes: &[u8],
+        retained_io_lease: Option<crate::kernel::objects::FileDescriptionFdLease>,
+        stdio_was_closed: bool,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let this = self;
+        let nonblocking = open_file.as_ref().is_some_and(|of| {
+            LinuxOpenFlags::from_bits_truncate(of.description.common().status_flags())
+                .contains(LinuxOpenFlags::NONBLOCK)
+        });
+
+        #[cfg(feature = "trace-io")]
+        if !bytes.is_empty() {
+            let has = open_file.is_some();
+            eprintln!(
+                "[WRDBG] guest_fd={fd} in_table={has} n={} bytes={:02x?}",
+                bytes.len(),
+                &bytes[..bytes.len().min(48)]
+            );
+        }
+
+        // Check open_files FIRST: dup3 may have redirected fd 1/2 to
+        // a pipe, an eventfd, or some other resource. Only after we've
+        // confirmed there's no open description do we fall back to the
+        // dispatcher's built-in stdout/stderr buffers.
+        if let Some(open_file) = open_file {
+            if cx.can_host_wait() {
+                super::resources::stage_io_rearm(
+                    cx.kernel,
+                    crate::dispatch::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
+                )?;
+            }
+            let Some(io_lease) =
+                retained_io_lease.or_else(|| open_file.description.retain_fd_lease())
+            else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            let Some(mut open) =
+                crate::kernel::FileDescription::write_for_io(&open_file.description)
+            else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            if matches!(&*open, OpenDescription::HostFile { .. }) {
+                drop(io_lease);
+                let source = match (&direct, zero_copy_host_file) {
+                    (Some(read), true) => WriteSource::Guest(read),
+                    _ => WriteSource::Staged(bytes),
+                };
+                return this.write_host_file(
+                    cx,
+                    fd,
+                    tid,
+                    source,
+                    &open_file,
+                    &mut open,
+                    nonblocking,
+                    slot_authority,
+                );
+            }
+            // The description stopped being a host file after the
+            // zero-copy decision: stage the payload privately now.
+            let late_buf;
+            let bytes: &[u8] = match (&direct, zero_copy_host_file) {
+                (Some(read), true) => {
+                    let mut staged = vec![0_u8; length];
+                    read.copy_into(&mut staged);
+                    late_buf = staged;
+                    &late_buf
+                }
+                _ => bytes,
+            };
+            // Take an inner scope so the borrow on the description ends
+            // before we touch this.fs.rootfs_vfs.overlay (writable File path below).
+            enum FileWriteback {
+                Range {
+                    path: String,
+                    offset: usize,
+                    bytes: Vec<u8>,
+                    final_size: usize,
+                },
+            }
+            let outcome: DispatchOutcome;
+            let writeback: Option<FileWriteback>;
+            let modified_path;
+            {
+                modified_path = this.file_write_notification_path(&open, length);
+                match &mut *open {
+                    OpenDescription::SyntheticDevice { kind, .. } => match kind {
+                        carrick_vfs::SyntheticDeviceKind::Full => {
+                            return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
+                        }
+                        _ => {
+                            return Ok(DispatchOutcome::returned_len_or_errno(bytes.len()));
+                        }
+                    },
+                    OpenDescription::VirtualConsole { console, .. } => {
+                        console.write(bytes);
+                        return Ok(DispatchOutcome::returned_len_or_errno(bytes.len()));
+                    }
+                    OpenDescription::EventFd { state, .. } => {
+                        let outcome = write_eventfd(this, bytes, state);
+                        if !nonblocking
+                            && matches!(
+                                outcome,
+                                DispatchOutcome::Errno {
+                                    errno: LINUX_EAGAIN
+                                }
+                            )
+                        {
+                            let Ok(value) = LinuxEventfdValue::read_from_bytes(bytes) else {
+                                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                            };
+                            return Ok(DispatchOutcome::BlockingWrite(BlockingWrite::eventfd(
+                                Arc::clone(state),
+                                io_lease,
+                                value.value,
+                                tid,
+                            )));
+                        }
+                        return Ok(outcome);
+                    }
+                    OpenDescription::PipeWriter { pipe, .. } => {
+                        let pipe = Arc::clone(pipe);
+                        let flags = open_file.description.common().status_flags();
+                        drop(open);
+                        let Some(wait_authority) = slot_authority.map(WaitFdAuthority::logical)
+                        else {
+                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                        };
+                        let outcome = write_pipe(
+                            bytes,
+                            &pipe,
+                            flags,
+                            PipeWriteOperation {
+                                writer_lease: io_lease,
+                                tid,
+                                authority: wait_authority,
+                                is_interrupted: || {
+                                    this.has_deliverable_dispatch_pending_for_wait(
+                                        cx.kernel,
+                                        tid,
+                                        carrick_abi::WaitSigMask::NONE,
+                                    )
+                                },
+                                notification: Some(PipeWriteNotification::new(
+                                    this.captured_file_table().epoll_wake_handle(),
+                                    Arc::clone(cx.kernel.kernel()),
+                                    fd,
+                                )),
+                            },
+                        );
+                        if let DispatchOutcome::Returned { value } = outcome {
+                            if value > 0 {
+                                this.notify_inmem_epoll();
+                                this.fasync_notify_after_write(cx.kernel, fd, value);
+                            }
+                        }
+                        return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
+                    }
+                    OpenDescription::HostPipe {
+                        base,
+                        host_fd,
+                        is_read_end,
+                        pipe_id,
+                        pty,
+                        bidirectional,
+                        write_kind,
+                        stdio_stream,
+                        ..
+                    } => {
+                        if let Some(stream) = *stdio_stream {
+                            if stream == 0 {
+                                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                            }
+                            if !this.io.inherits_host_stdio() {
+                                let rearm_target = Arc::clone(&open_file.description);
+                                drop(open);
+                                drop(io_lease);
+                                drop(open_file);
+                                return this.write_owned_stdio_sink(
+                                    cx,
+                                    stream,
+                                    bytes.to_vec(),
+                                    Some(rearm_target),
+                                );
+                            }
+                        }
+                        // pty ends and O_RDWR FIFOs are bidirectional; only
+                        // real one-way pipe ends are gated by is_read_end.
+                        #[cfg(feature = "trace-tty")]
+                        if bytes.contains(&0x0a) {
+                            let hf = host_fd.raw();
+                            let tt = unsafe { libc::isatty(hf) };
+                            eprintln!(
+                                "[PTYWRDBG] guest_fd={fd} desc_host_fd={hf} isatty={tt} pty={:?} is_read_end={is_read_end} bidir={bidirectional}",
+                                pty.as_ref().map(|r| r.is_master)
+                            );
+                        }
+                        if *is_read_end && pty.is_none() && !*bidirectional {
+                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                        }
+                        let (bytes_to_write, consumed_count) = if let Some(PtyRole {
+                            index,
+                            is_master: true,
+                        }) = pty
+                        {
+                            let orig_len = bytes.len();
+                            let forwarded = crate::kernel::tty::process_master_write(
+                                cx.kernel.container().tty_registry(),
+                                crate::kernel::tty::TtyKey::Pty(*index),
+                                host_fd.raw(),
+                                bytes,
+                            );
+                            let consumed = orig_len - forwarded.len();
+                            (std::borrow::Cow::Owned(forwarded), consumed)
+                        } else {
+                            (std::borrow::Cow::Borrowed(bytes), 0)
+                        };
+                        let out = if bytes_to_write.is_empty() && consumed_count > 0 {
+                            DispatchOutcome::returned_len_or_errno(consumed_count)
+                        } else {
+                            let Some(wait_authority) = slot_authority.map(WaitFdAuthority::logical)
+                            else {
+                                drop(open);
+                                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                            };
+                            let host_wait_runner = this.host_wait_runner_for_ctx(cx);
+                            let host_wait_ref =
+                                host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
+                            let res = write_host_pipe(
+                                bytes_to_write.as_ref(),
+                                HostPipeWriteTarget::new(
+                                    host_fd.raw(),
+                                    Some(host_fd.clone()),
+                                    nonblocking,
+                                    *write_kind,
+                                    tid,
+                                    wait_authority,
+                                    this.cross.host_signal(),
+                                )
+                                .with_pipe_state(this.host_pipe_capacity_state(
+                                    base,
+                                    *pipe_id,
+                                    *is_read_end,
+                                    *bidirectional,
+                                    host_fd.raw(),
+                                ))
+                                .with_sigpipe(true)
+                                .with_host_wait(host_wait_ref),
+                            )?;
+                            match res {
+                                DispatchOutcome::Returned { value } => {
+                                    let total = usize::try_from(value)
+                                        .ok()
+                                        .and_then(|v| v.checked_add(consumed_count));
+                                    match total {
+                                        Some(t) => DispatchOutcome::returned_len_or_errno(t),
+                                        None => DispatchOutcome::errno(LINUX_EOVERFLOW),
+                                    }
+                                }
+                                other => {
+                                    if consumed_count > 0 {
+                                        DispatchOutcome::returned_len_or_errno(consumed_count)
+                                    } else {
+                                        other
+                                    }
+                                }
+                            }
+                        };
+                        // Signal-driven I/O: a write that added bytes makes the
+                        // pipe's read end readable — the FASYNC readiness edge.
+                        // Deliver the read end's owner signal (default SIGIO)
+                        // via the fork-coherent registry (LTP fcntl31).
+                        let written = match &out {
+                            DispatchOutcome::Returned { value } => *value,
+                            _ => 0,
+                        };
+                        let key_fd = fd;
+                        drop(open);
+                        this.fasync_notify_after_write(cx.kernel, key_fd, written);
+                        return Ok(this.raise_sigpipe_on_epipe(cx, out));
+                    }
+                    OpenDescription::HostSocket { host_fd, type_, .. } => {
+                        // write(2) on a connected socket maps directly to a
+                        // host write(2). Unconnected sockets will surface
+                        // their own ENOTCONN via the host.
+                        let Some(wait_authority) = slot_authority.map(WaitFdAuthority::logical)
+                        else {
+                            drop(open);
+                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                        };
+                        let outbound_flow = open_file.description.common().outbound_flow();
+                        let creds = this.cred_snapshot();
+                        let task_id = u32::try_from(cx.kernel.task().key().id.raw()).unwrap_or(0);
+                        let pid = crate::namespace::pid::ns_self_pid_for(cx.kernel, task_id) as i32;
+                        let my_cred = crate::kernel::SocketPeerCred {
+                            pid: crate::dispatch::abi_args::NsPid(pid),
+                            uid: creds.ruid,
+                            gid: creds.rgid,
+                        };
+                        let is_stream = *type_ == carrick_abi::LINUX_SOCK_STREAM;
+                        let host_wait_runner = this.host_wait_runner_for_ctx(cx);
+                        let host_wait_ref =
+                            host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
+                        let out = write_host_pipe(
+                            bytes,
+                            HostPipeWriteTarget::new(
+                                host_fd.raw(),
+                                Some(host_fd.clone()),
+                                nonblocking,
+                                HostWriteKind::SocketLike,
+                                tid,
+                                wait_authority,
+                                this.cross.host_signal(),
+                            )
+                            .with_socket_flow(outbound_flow, Some(my_cred), is_stream)
+                            .with_host_wait(host_wait_ref),
+                        )?;
+                        // Signal-driven I/O readiness edge on the socket peer.
+                        let written = match &out {
+                            DispatchOutcome::Returned { value } => *value,
+                            _ => 0,
+                        };
+                        let key_fd = fd;
+                        drop(open);
+                        this.fasync_notify_after_write(cx.kernel, key_fd, written);
+                        return Ok(out);
+                    }
+                    OpenDescription::InMemorySocket { socket, .. } => {
+                        let socket = Arc::clone(socket);
+                        drop(open);
+                        match socket.send_stream(bytes, Vec::new()) {
+                            Ok(written) => {
+                                this.notify_inmem_epoll();
+                                return Ok(DispatchOutcome::returned_len_or_errno(written));
+                            }
+                            Err(LINUX_EAGAIN) if !nonblocking => {
+                                return Ok(crate::dispatch::net::wait_in_memory_slot(
+                                    &this.captured_file_table(),
+                                    fd,
+                                    libc::POLLOUT,
+                                    socket.get_sndtimeo(),
+                                ));
+                            }
+                            Err(LINUX_EPIPE) => {
+                                let outcome = DispatchOutcome::errno(LINUX_EPIPE);
+                                return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
+                            }
+                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                        }
+                    }
+                    OpenDescription::Packet { socket, .. } => {
+                        let socket = Arc::clone(socket);
+                        drop(open);
+                        return Ok(socket.sendto(cx.memory, bytes, 0, 0, 0));
+                    }
+                    OpenDescription::HostFile { .. } => {
+                        unreachable!("host files are handled under shared description authority")
+                    }
+                    OpenDescription::InMemoryFile {
+                        path,
+                        contents,
+                        offset,
+                        writable,
+                        max_size,
+                        ..
+                    } => {
+                        if !*writable {
+                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                        }
+                        let write_offset = if LinuxOpenFlags::from_bits_truncate(
+                            open_file.description.common().status_flags(),
+                        )
+                        .contains(LinuxOpenFlags::APPEND)
+                        {
+                            contents.read().len()
+                        } else {
+                            *offset
+                        };
+                        let bytes = match this.fsize_write_len(cx, write_offset as u64, bytes.len())
+                        {
+                            Ok(len) => &bytes[..len.min(bytes.len())],
+                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                        };
+                        let end = match write_offset.checked_add(bytes.len()) {
+                            Some(e) => e,
+                            None => return Ok(DispatchOutcome::errno(LINUX_EFBIG)),
+                        };
+                        if end > *max_size {
+                            return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                        }
+                        let mut data = contents.write();
+                        if data.write_range(write_offset, bytes).is_err() {
+                            return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                        }
+                        *offset = end;
+                        this.fs.rootfs_vfs.notify_inode_changed(path, None);
+                        outcome = DispatchOutcome::returned_len_or_errno(bytes.len());
+                        writeback = None;
+                    }
+                    OpenDescription::File {
+                        path,
+                        contents,
+                        offset,
+                        writable,
+                        metadata,
+                        ..
+                    } => {
+                        if !*writable {
+                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                        }
+                        let cur_len = match contents.len() {
+                            Ok(l) => l as usize,
+                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                        };
+                        // memfd write seals: F_SEAL_WRITE → EPERM; F_SEAL_GROW
+                        // → EPERM when the write would extend the file.
+                        if let Err(errno) = memfd_seal_write_check(
+                            open_file.description.common().seals(),
+                            *offset,
+                            bytes.len(),
+                            cur_len,
+                        ) {
+                            return Ok(DispatchOutcome::errno(errno));
+                        }
+                        let bytes = match this.fsize_write_len(cx, *offset as u64, bytes.len()) {
+                            Ok(len) => &bytes[..len.min(bytes.len())],
+                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                        };
+                        let write_offset = *offset;
+                        let written = match write_into_file_contents(contents, offset, bytes) {
+                            Ok(n) => n,
+                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                        };
+                        let new_len = match contents.len() {
+                            Ok(l) => l as usize,
+                            Err(errno) if written == 0 => {
+                                return Ok(DispatchOutcome::errno(errno));
+                            }
+                            Err(_) => cur_len.max(write_offset.saturating_add(written)),
+                        };
+                        metadata.size = new_len;
+                        outcome = DispatchOutcome::returned_len_or_errno(written);
+                        writeback = (!is_anon_overlay_path(path)).then(|| FileWriteback::Range {
+                            path: path.clone(),
+                            offset: write_offset,
+                            bytes: bytes[..written.min(bytes.len())].to_vec(),
+                            final_size: new_len,
+                        });
+                    }
+                    OpenDescription::SyntheticFile { path, .. }
+                        if crate::vfs::proc::is_userns_map_path(path) =>
+                    {
+                        // Writing /proc/self/{uid_map,gid_map,setgroups}:
+                        // the user-namespace map writers enforce the
+                        // write-once / setgroups-gate / ≤5-line rules
+                        // (docs/namespaces-design.md §4.3).
+                        // The map named by /proc/self/uid_map is the
+                        // CALLER's own, and the privilege verdict is read
+                        // from the caller's own capability set — both off
+                        // its task, so one guest process cannot rewrite
+                        // another's maps.
+                        let task = cx.kernel.task();
+                        let privileged = task.caps().is_map_write_privileged();
+                        let result = task.with_user_ns(|ns| {
+                            crate::vfs::proc::write_userns_map(ns, privileged, path, bytes)
+                        });
+                        let outcome = match result {
+                            Ok(n) => DispatchOutcome::returned_len_or_errno(n),
+                            Err(errno) => DispatchOutcome::errno(errno),
+                        };
+                        drop(open);
+                        this.notify_file_write_result(
+                            cx.kernel,
+                            modified_path.as_deref(),
+                            &outcome,
+                        );
+                        return Ok(outcome);
+                    }
+                    OpenDescription::SyntheticFile { path, .. }
+                        if crate::vfs::proc::is_writable_tunable_path(path) =>
+                    {
+                        // oom_score_adj PERSISTS the value (per-process,
+                        // fork-inherited): tst_test's OOM protection
+                        // (tst_memutils.c) writes -1000 to /proc/<pid>/oom_score_adj
+                        // then reads it back, and every test that enables it TBROKs
+                        // in setup otherwise. The rest (oom_adj/loginuid/
+                        // timerslack_ns) carrick has no live state for, so
+                        // accept-and-ignore.
+                        //
+                        // The VFS parses and validates; applying it is the
+                        // dispatcher's job because only here is it known
+                        // which backend owns per-process state. The write
+                        // may name ANOTHER process, so it cannot be routed
+                        // to "the current one" — LTP writes the library
+                        // process's file from the test child.
+                        let parsed = crate::vfs::proc::parse_tunable_write(path, bytes);
+                        let outcome = match parsed {
+                            Err(errno) => DispatchOutcome::errno(errno),
+                            Ok(crate::vfs::proc::TunableWrite::Ignored) => {
+                                DispatchOutcome::returned_len_or_errno(bytes.len())
+                            }
+                            Ok(crate::vfs::proc::TunableWrite::OomScoreAdj { pid, value }) => {
+                                let target = match pid {
+                                    Some(pid) => {
+                                        crate::namespace::pid::ns_to_kernel_for(cx.kernel, pid)
+                                    }
+                                    None => u32::try_from(cx.kernel.task().key().id.raw()).ok(),
+                                };
+                                match this.hvpatch_process() {
+                                    Some(process) => {
+                                        if target.is_some_and(|target| {
+                                            process
+                                                .kernel_graph()
+                                                .registry()
+                                                .set_oom_score_adj(target, value)
+                                        }) {
+                                            DispatchOutcome::returned_len_or_errno(bytes.len())
+                                        } else {
+                                            // The process exited between
+                                            // open(2) and write(2).
+                                            DispatchOutcome::errno(LINUX_ESRCH)
+                                        }
+                                    }
+                                    None => {
+                                        crate::vfs::proc::set_single_process_oom_score_adj(value);
+                                        DispatchOutcome::returned_len_or_errno(bytes.len())
+                                    }
+                                }
+                            }
+                        };
+                        drop(open);
+                        this.notify_file_write_result(
+                            cx.kernel,
+                            modified_path.as_deref(),
+                            &outcome,
+                        );
+                        return Ok(outcome);
+                    }
+                    // write(2) on a perf event fd is EINVAL (verified
+                    // against the Docker oracle), not EBADF.
+                    OpenDescription::PerfEvent { .. } => {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    }
+                    _ => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
+                }
+                drop(open);
+            }
+            if let Some(FileWriteback::Range {
+                path,
+                offset,
+                bytes,
+                final_size,
+            }) = writeback
+            {
+                let _ = this
+                    .fs
+                    .rootfs_vfs
+                    .write_file_range(&path, offset, &bytes, final_size);
+            }
+            this.notify_file_write_result(cx.kernel, modified_path.as_deref(), &outcome);
+            return Ok(outcome);
+        }
+        // A stdio fd the guest explicitly closed (and did not reopen) is
+        // genuinely closed: write is EBADF, not a host-stream/buffer write.
+        if stdio_was_closed {
+            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+        }
+        // Bare stdio goes to the run's sink exactly like writev does —
+        // never buffered when the sink is live: busybox ash writes its
+        // post-Enter newline to fd 2 via write(2), and buffering it left
+        // the newline stuck until exit.
+        this.write_owned_stdio_sink(cx, fd, bytes.to_vec(), None)
     }
 
     define_syscall! {
@@ -2861,7 +3572,7 @@ impl<'a> FsView<'a> {
 
         }
 
-        fn write(this, cx, fd: Fd, buf: GuestPtr, count: u64) {
+        fn write_dispatch(this, cx, fd: Fd, buf: GuestPtr, count: u64) {
             let fd = fd.0;
             let (open_file, slot_authority) = match this.open_file_with_authority(fd) {
                 Some((of, auth)) => (Some(of), Some(auth)),
@@ -2961,6 +3672,23 @@ impl<'a> FsView<'a> {
                         .inspect_kind(|open| matches!(open, OpenDescription::HostFile { .. }))
                         .unwrap_or(false)
                 });
+            let io_lease = match open_file.as_ref() {
+                Some(file) => match file.description.retain_fd_lease() {
+                    Some(lease) => Some(lease),
+                    None => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
+                },
+                None => None,
+            };
+            let target = WriteTarget {
+                fd,
+                length,
+                tid,
+                thread: cx.kernel.thread().key(),
+                open_file,
+                slot_authority,
+                io_lease,
+                stdio_was_closed: this.stdio_is_closed(fd),
+            };
             let bytes: &[u8] = if length == 0 || zero_copy_host_file {
                 &[]
             } else if let Some(read) = &direct {
@@ -2971,10 +3699,22 @@ impl<'a> FsView<'a> {
             } else if length <= STACK_WRITE_LIMIT {
                 match (*cx.memory).read_into(address, &mut stack_buf[..length]) {
                     Ok(()) => &stack_buf[..length],
+                    Err(MemoryError::ReadSuspended(suspension)) => {
+                        return Ok(this.suspend_write_copy_in(
+                            target,
+                            *suspension,
+                        ));
+                    }
                     Err(_) => match (*cx.memory).read_bytes_prefix(address, length) {
                         Ok(prefix) if !prefix.is_empty() => {
                             heap_buf = prefix;
                             &heap_buf
+                        }
+                        Err(MemoryError::ReadSuspended(suspension)) => {
+                            return Ok(this.suspend_write_copy_in(
+                                target,
+                                *suspension,
+                            ));
                         }
                         _ => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
                     },
@@ -2985,564 +3725,26 @@ impl<'a> FsView<'a> {
                         heap_buf = v;
                         &heap_buf
                     }
+                    Err(MemoryError::ReadSuspended(suspension)) => {
+                        return Ok(this.suspend_write_copy_in(
+                            target,
+                            *suspension,
+                        ));
+                    }
                     Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
                 }
             };
-
-            let nonblocking = open_file
-                .as_ref()
-                .is_some_and(|of| {
-                    LinuxOpenFlags::from_bits_truncate(of.description.common().status_flags())
-                        .contains(LinuxOpenFlags::NONBLOCK)
-                });
-
-            #[cfg(feature = "trace-io")]
-            if !bytes.is_empty() {
-                let has = open_file.is_some();
-                eprintln!(
-                    "[WRDBG] guest_fd={fd} in_table={has} n={} bytes={:02x?}",
-                    bytes.len(),
-                    &bytes[..bytes.len().min(48)]
-                );
-            }
-
-            // Check open_files FIRST: dup3 may have redirected fd 1/2 to
-            // a pipe, an eventfd, or some other resource. Only after we've
-            // confirmed there's no open description do we fall back to the
-            // dispatcher's built-in stdout/stderr buffers.
-            if let Some(open_file) = open_file {
-                if cx.can_host_wait() {
-                    super::resources::stage_io_rearm(
-                        cx.kernel,
-                        crate::dispatch::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
-                    )?;
-                }
-                let Some(io_lease) = open_file.description.retain_fd_lease() else {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                };
-                let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description) else {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                };
-                if matches!(&*open, OpenDescription::HostFile { .. }) {
-                    drop(io_lease);
-                    let source = match (&direct, zero_copy_host_file) {
-                        (Some(read), true) => WriteSource::Guest(read),
-                        _ => WriteSource::Staged(bytes),
-                    };
-                    return this.write_host_file(
-                        cx,
-                        fd,
-                        tid,
-                        source,
-                        &open_file,
-                        &mut open,
-                        nonblocking,
-                        slot_authority,
-                    );
-                }
-                // The description stopped being a host file after the
-                // zero-copy decision: stage the payload privately now.
-                let late_buf;
-                let bytes: &[u8] = match (&direct, zero_copy_host_file) {
-                    (Some(read), true) => {
-                        let mut staged = vec![0_u8; length];
-                        read.copy_into(&mut staged);
-                        late_buf = staged;
-                        &late_buf
-                    }
-                    _ => bytes,
-                };
-                // Take an inner scope so the borrow on the description ends
-                // before we touch this.fs.rootfs_vfs.overlay (writable File path below).
-                enum FileWriteback {
-                    Range {
-                        path: String,
-                        offset: usize,
-                        bytes: Vec<u8>,
-                        final_size: usize,
-                    },
-                }
-                let outcome: DispatchOutcome;
-                let writeback: Option<FileWriteback>;
-                let modified_path;
-                {
-                    modified_path = this.file_write_notification_path(&open, length);
-                    match &mut *open {
-                        OpenDescription::SyntheticDevice { kind, .. } => {
-                            match kind {
-                                carrick_vfs::SyntheticDeviceKind::Full => {
-                                    return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
-                                }
-                                _ => {
-                                    return Ok(DispatchOutcome::returned_len_or_errno(
-                                        bytes.len(),
-                                    ));
-                                }
-                            }
-                        }
-                        OpenDescription::VirtualConsole { console, .. } => {
-                            console.write(bytes);
-                            return Ok(DispatchOutcome::returned_len_or_errno(bytes.len()));
-                        }
-                        OpenDescription::EventFd { state, .. } => {
-                            let outcome = write_eventfd(this, bytes, state);
-                            if !nonblocking && matches!(outcome, DispatchOutcome::Errno { errno: LINUX_EAGAIN }) {
-                                let Ok(value) = LinuxEventfdValue::read_from_bytes(bytes) else {
-                                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                                };
-                                return Ok(DispatchOutcome::BlockingWrite(BlockingWrite::eventfd(
-                                    Arc::clone(state), io_lease, value.value, tid,
-                                )));
-                            }
-                            return Ok(outcome);
-                        }
-                        OpenDescription::PipeWriter { pipe, .. } => {
-                            let pipe = Arc::clone(pipe);
-                            let flags = open_file.description.common().status_flags();
-                            drop(open);
-                            let Some(wait_authority) = this
-                                .captured_slot_authority(fd)
-                                .map(WaitFdAuthority::logical)
-                            else {
-                                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                            };
-                            let outcome = write_pipe(
-                                bytes,
-                                &pipe,
-                                flags,
-                                PipeWriteOperation {
-                                    writer_lease: io_lease,
-                                    tid,
-                                    authority: wait_authority,
-                                    is_interrupted: || {
-                                        this.has_deliverable_dispatch_pending_for_wait(
-                                            cx.kernel,
-                                            tid,
-                                            carrick_abi::WaitSigMask::NONE,
-                                        )
-                                    },
-                                    notification: Some(PipeWriteNotification::new(
-                                        this.captured_file_table().epoll_wake_handle(),
-                                        Arc::clone(cx.kernel.kernel()),
-                                        fd,
-                                    )),
-                                },
-                            );
-                            if let DispatchOutcome::Returned { value } = outcome {
-                                if value > 0 {
-                                    this.notify_inmem_epoll();
-                                    this.fasync_notify_after_write(cx.kernel, fd, value);
-                                }
-                            }
-                            return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
-                        }
-                        OpenDescription::HostPipe {
-                            base,
-                            host_fd,
-                            is_read_end,
-                            pipe_id,
-                            pty,
-                            bidirectional,
-                            write_kind,
-                            stdio_stream,
-                            ..
-                        } => {
-                            if let Some(stream) = *stdio_stream {
-                                if stream == 0 {
-                                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                                }
-                                if !this.io.inherits_host_stdio() {
-                                    let rearm_target = Arc::clone(&open_file.description);
-                                    drop(open);
-                                    drop(io_lease);
-                                    drop(open_file);
-                                    return this.write_owned_stdio_sink(cx, stream, bytes.to_vec(), Some(rearm_target));
-                                }
-                            }
-                            // pty ends and O_RDWR FIFOs are bidirectional; only
-                            // real one-way pipe ends are gated by is_read_end.
-                            #[cfg(feature = "trace-tty")]
-                            if bytes.contains(&0x0a) {
-                                let hf = host_fd.raw();
-                                let tt = unsafe { libc::isatty(hf) };
-                                eprintln!(
-                                    "[PTYWRDBG] guest_fd={fd} desc_host_fd={hf} isatty={tt} pty={:?} is_read_end={is_read_end} bidir={bidirectional}",
-                                    pty.as_ref().map(|r| r.is_master)
-                                );
-                            }
-                            if *is_read_end && pty.is_none() && !*bidirectional {
-                                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                            }
-                            let (bytes_to_write, consumed_count) = if let Some(PtyRole { index, is_master: true }) = pty {
-                                let orig_len = bytes.len();
-                                let forwarded = crate::kernel::tty::process_master_write(cx.kernel.container().tty_registry(),
-                                    crate::kernel::tty::TtyKey::Pty(*index),
-                                    host_fd.raw(),
-                                    bytes,
-                                );
-                                let consumed = orig_len - forwarded.len();
-                                (std::borrow::Cow::Owned(forwarded), consumed)
-                            } else {
-                                (std::borrow::Cow::Borrowed(bytes), 0)
-                            };
-                            let out = if bytes_to_write.is_empty() && consumed_count > 0 {
-                                DispatchOutcome::returned_len_or_errno(consumed_count)
-                            } else {
-                                let Some(wait_authority) = this
-                                    .captured_slot_authority(fd)
-                                    .map(WaitFdAuthority::logical)
-                                else {
-                                    drop(open);
-                                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                                };
-                                let host_wait_runner = this.host_wait_runner_for_ctx(cx);
-                                let host_wait_ref =
-                                    host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
-                                let res = write_host_pipe(
-                                    bytes_to_write.as_ref(),
-                                    HostPipeWriteTarget::new(
-                                        host_fd.raw(),
-                                        Some(host_fd.clone()),
-                                        nonblocking,
-                                        *write_kind,
-                                        tid,
-                                        wait_authority,
-                                        this.cross.host_signal(),
-                                    )
-                                    .with_pipe_state(this.host_pipe_capacity_state(
-                                        base,
-                                        *pipe_id,
-                                        *is_read_end,
-                                        *bidirectional,
-                                        host_fd.raw(),
-                                    ))
-                                    .with_sigpipe(true)
-                                    .with_host_wait(host_wait_ref),
-                                )?;
-                                match res {
-                                    DispatchOutcome::Returned { value } => {
-                                        let total = usize::try_from(value)
-                                            .ok()
-                                            .and_then(|v| v.checked_add(consumed_count));
-                                        match total {
-                                            Some(t) => DispatchOutcome::returned_len_or_errno(t),
-                                            None => DispatchOutcome::errno(LINUX_EOVERFLOW),
-                                        }
-                                    }
-                                    other => {
-                                        if consumed_count > 0 {
-                                            DispatchOutcome::returned_len_or_errno(consumed_count)
-                                        } else {
-                                            other
-                                        }
-                                    }
-                                }
-                            };
-                            // Signal-driven I/O: a write that added bytes makes the
-                            // pipe's read end readable — the FASYNC readiness edge.
-                            // Deliver the read end's owner signal (default SIGIO)
-                            // via the fork-coherent registry (LTP fcntl31).
-                            let written = match &out {
-                                DispatchOutcome::Returned { value } => *value,
-                                _ => 0,
-                            };
-                            let key_fd = fd;
-                            drop(open);
-                            this.fasync_notify_after_write(cx.kernel, key_fd, written);
-                            return Ok(this.raise_sigpipe_on_epipe(cx, out));
-                        }
-                        OpenDescription::HostSocket { host_fd, type_, .. } => {
-                            // write(2) on a connected socket maps directly to a
-                            // host write(2). Unconnected sockets will surface
-                            // their own ENOTCONN via the host.
-                            let Some(wait_authority) = this
-                                .captured_slot_authority(fd)
-                                .map(WaitFdAuthority::logical)
-                            else {
-                                drop(open);
-                                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                            };
-                            let outbound_flow = open_file.description.common().outbound_flow();
-                            let creds = this.cred_snapshot();
-                            let task_id = u32::try_from(cx.kernel.task().key().id.raw()).unwrap_or(0);
-                            let pid = crate::namespace::pid::ns_self_pid_for(cx.kernel, task_id) as i32;
-                            let my_cred = crate::kernel::SocketPeerCred {
-                                pid: crate::dispatch::abi_args::NsPid(pid),
-                                uid: creds.ruid,
-                                gid: creds.rgid,
-                            };
-                            let is_stream = *type_ == carrick_abi::LINUX_SOCK_STREAM;
-                            let host_wait_runner = this.host_wait_runner_for_ctx(cx);
-                            let host_wait_ref =
-                                host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
-                            let out = write_host_pipe(
-                                bytes,
-                                HostPipeWriteTarget::new(
-                                    host_fd.raw(),
-                                    Some(host_fd.clone()),
-                                    nonblocking,
-                                    HostWriteKind::SocketLike,
-                                    tid,
-                                    wait_authority,
-                                    this.cross.host_signal(),
-                                )
-                                .with_socket_flow(outbound_flow, Some(my_cred), is_stream)
-                                .with_host_wait(host_wait_ref),
-                            )?;
-                            // Signal-driven I/O readiness edge on the socket peer.
-                            let written = match &out {
-                                DispatchOutcome::Returned { value } => *value,
-                                _ => 0,
-                            };
-                            let key_fd = fd;
-                            drop(open);
-                            this.fasync_notify_after_write(cx.kernel, key_fd, written);
-                            return Ok(out);
-                        }
-                        OpenDescription::InMemorySocket { socket, .. } => {
-                            let socket = Arc::clone(socket);
-                            drop(open);
-                            match socket.send_stream(bytes, Vec::new()) {
-                                Ok(written) => {
-                                    this.notify_inmem_epoll();
-                                    return Ok(DispatchOutcome::returned_len_or_errno(
-                                        written,
-                                    ));
-                                }
-                                Err(LINUX_EAGAIN) if !nonblocking => {
-                                    return Ok(crate::dispatch::net::wait_in_memory_slot(
-                                        &this.captured_file_table(),
-                                        fd, libc::POLLOUT,
-                                        socket.get_sndtimeo(),
-                                    ));
-                                }
-                                Err(LINUX_EPIPE) => {
-                                    let outcome = DispatchOutcome::errno(LINUX_EPIPE);
-                                    return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
-                                }
-                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                            }
-                        }
-                        OpenDescription::Packet { socket, .. } => {
-                            let socket = Arc::clone(socket);
-                            drop(open);
-                            return Ok(socket.sendto(cx.memory, bytes, 0, 0, 0));
-                        }
-                        OpenDescription::HostFile { .. } => {
-                            unreachable!("host files are handled under shared description authority")
-                        }
-                        OpenDescription::InMemoryFile {
-                            path,
-                            contents,
-                            offset,
-                            writable,
-                            max_size,
-                            ..
-                        } => {
-                            if !*writable {
-                                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                            }
-                            let write_offset = if LinuxOpenFlags::from_bits_truncate(
-                                open_file.description.common().status_flags(),
-                            )
-                            .contains(LinuxOpenFlags::APPEND)
-                            {
-                                contents.read().len()
-                            } else {
-                                *offset
-                            };
-                            let bytes = match this.fsize_write_len(cx, write_offset as u64, bytes.len()) {
-                                Ok(len) => &bytes[..len.min(bytes.len())],
-                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                            };
-                            let end = match write_offset.checked_add(bytes.len()) {
-                                Some(e) => e,
-                                None => return Ok(DispatchOutcome::errno(LINUX_EFBIG)),
-                            };
-                            if end > *max_size {
-                                return Ok(DispatchOutcome::errno(LINUX_EFBIG));
-                            }
-                            let mut data = contents.write();
-                            if data.write_range(write_offset, bytes).is_err() {
-                                return Ok(DispatchOutcome::errno(LINUX_EFBIG));
-                            }
-                            *offset = end;
-                            this.fs.rootfs_vfs.notify_inode_changed(path, None);
-                            outcome = DispatchOutcome::returned_len_or_errno(bytes.len());
-                            writeback = None;
-                        }
-                        OpenDescription::File {
-                            path,
-                            contents,
-                            offset,
-                            writable,
-                            metadata,
-                            ..
-                        } => {
-                            if !*writable {
-                                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                            }
-                            let cur_len = match contents.len() {
-                                Ok(l) => l as usize,
-                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                            };
-                            // memfd write seals: F_SEAL_WRITE → EPERM; F_SEAL_GROW
-                            // → EPERM when the write would extend the file.
-                            if let Err(errno) = memfd_seal_write_check(
-                                open_file.description.common().seals(),
-                                *offset,
-                                bytes.len(),
-                                cur_len,
-                            ) {
-                                return Ok(DispatchOutcome::errno(errno));
-                            }
-                            let bytes = match this.fsize_write_len(cx, *offset as u64, bytes.len()) {
-                                Ok(len) => &bytes[..len.min(bytes.len())],
-                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                            };
-                            let write_offset = *offset;
-                            let written = match write_into_file_contents(contents, offset, bytes) {
-                                Ok(n) => n,
-                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                            };
-                            let new_len = match contents.len() {
-                                Ok(l) => l as usize,
-                                Err(errno) if written == 0 => {
-                                    return Ok(DispatchOutcome::errno(errno));
-                                }
-                                Err(_) => cur_len.max(write_offset.saturating_add(written)),
-                            };
-                            metadata.size = new_len;
-                            outcome = DispatchOutcome::returned_len_or_errno(written);
-                            writeback = (!is_anon_overlay_path(path)).then(|| {
-                                FileWriteback::Range {
-                                    path: path.clone(),
-                                    offset: write_offset,
-                                    bytes: bytes[..written.min(bytes.len())].to_vec(),
-                                    final_size: new_len,
-                                }
-                            });
-                        }
-                        OpenDescription::SyntheticFile { path, .. }
-                            if crate::vfs::proc::is_userns_map_path(path) =>
-                        {
-                            // Writing /proc/self/{uid_map,gid_map,setgroups}:
-                            // the user-namespace map writers enforce the
-                            // write-once / setgroups-gate / ≤5-line rules
-                            // (docs/namespaces-design.md §4.3).
-                            // The map named by /proc/self/uid_map is the
-                            // CALLER's own, and the privilege verdict is read
-                            // from the caller's own capability set — both off
-                            // its task, so one guest process cannot rewrite
-                            // another's maps.
-                            let task = cx.kernel.task();
-                            let privileged = task.caps().is_map_write_privileged();
-                            let result = task.with_user_ns(|ns| {
-                                crate::vfs::proc::write_userns_map(ns, privileged, path, bytes)
-                            });
-                            let outcome = match result {
-                                Ok(n) => DispatchOutcome::returned_len_or_errno(n),
-                                Err(errno) => DispatchOutcome::errno(errno),
-                            };
-                            drop(open);
-                            this.notify_file_write_result(cx.kernel, modified_path.as_deref(), &outcome);
-                            return Ok(outcome);
-                        }
-                        OpenDescription::SyntheticFile { path, .. }
-                            if crate::vfs::proc::is_writable_tunable_path(path) =>
-                        {
-                            // oom_score_adj PERSISTS the value (per-process,
-                            // fork-inherited): tst_test's OOM protection
-                            // (tst_memutils.c) writes -1000 to /proc/<pid>/oom_score_adj
-                            // then reads it back, and every test that enables it TBROKs
-                            // in setup otherwise. The rest (oom_adj/loginuid/
-                            // timerslack_ns) carrick has no live state for, so
-                            // accept-and-ignore.
-                            //
-                            // The VFS parses and validates; applying it is the
-                            // dispatcher's job because only here is it known
-                            // which backend owns per-process state. The write
-                            // may name ANOTHER process, so it cannot be routed
-                            // to "the current one" — LTP writes the library
-                            // process's file from the test child.
-                            let parsed =
-                                crate::vfs::proc::parse_tunable_write(path, bytes);
-                            let outcome = match parsed {
-                                Err(errno) => DispatchOutcome::errno(errno),
-                                Ok(crate::vfs::proc::TunableWrite::Ignored) => {
-                                    DispatchOutcome::returned_len_or_errno(bytes.len())
-                                }
-                                Ok(crate::vfs::proc::TunableWrite::OomScoreAdj {
-                                    pid,
-                                    value,
-                                }) => {
-                                    let target = match pid {
-                                        Some(pid) => crate::namespace::pid::ns_to_kernel_for(
-                                            cx.kernel, pid,
-                                        ),
-                                        None => u32::try_from(cx.kernel.task().key().id.raw()).ok(),
-                                    };
-                                    match this.hvpatch_process() {
-                                        Some(process) => {
-                                            if target.is_some_and(|target| process
-                                                .kernel_graph()
-                                                .registry()
-                                                .set_oom_score_adj(target, value)
-                                            ) {
-                                                DispatchOutcome::returned_len_or_errno(bytes.len())
-                                            } else {
-                                                // The process exited between
-                                                // open(2) and write(2).
-                                                DispatchOutcome::errno(LINUX_ESRCH)
-                                            }
-                                        }
-                                        None => {
-                                            crate::vfs::proc::set_single_process_oom_score_adj(
-                                                value,
-                                            );
-                                            DispatchOutcome::returned_len_or_errno(bytes.len())
-                                        }
-                                    }
-                                }
-                            };
-                            drop(open);
-                            this.notify_file_write_result(cx.kernel, modified_path.as_deref(), &outcome);
-                            return Ok(outcome);
-                        }
-                        // write(2) on a perf event fd is EINVAL (verified
-                        // against the Docker oracle), not EBADF.
-                        OpenDescription::PerfEvent { .. } => {
-                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                        }
-                        _ => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
-                    }
-                    drop(open);
-                }
-                if let Some(FileWriteback::Range {
-                    path,
-                    offset,
-                    bytes,
-                    final_size,
-                }) = writeback
-                {
-                    let _ = this
-                        .fs
-                        .rootfs_vfs
-                        .write_file_range(&path, offset, &bytes, final_size);
-                }
-                this.notify_file_write_result(cx.kernel, modified_path.as_deref(), &outcome);
-                return Ok(outcome);
-            }
-            // A stdio fd the guest explicitly closed (and did not reopen) is
-            // genuinely closed: write is EBADF, not a host-stream/buffer write.
-            if this.stdio_is_closed(fd) {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            }
-            // Bare stdio goes to the run's sink exactly like writev does —
-            // never buffered when the sink is live: busybox ash writes its
-            // post-Enter newline to fd 2 via write(2), and buffering it left
-            // the newline stuck until exit.
-            this.write_owned_stdio_sink(cx, fd, bytes.to_vec(), None)
+            let WriteTarget {
+                open_file,
+                slot_authority,
+                io_lease,
+                stdio_was_closed,
+                ..
+            } = target;
+            this.write(
+                cx, fd, length, tid, open_file, slot_authority, direct,
+                zero_copy_host_file, bytes, io_lease, stdio_was_closed,
+            )
 
         }
 

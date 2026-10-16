@@ -973,6 +973,9 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// syscall still owns its single terminal return; redispatch uses only
     /// the remaining destination/count (and positioned source offset).
     pub(super) owner_read_progress: u64,
+    /// The write's original description and owner transfer remain with this
+    /// syscall completion while its execution lease is released.
+    pub(super) pending_write_copy_in: Option<Box<carrick_kernel::dispatch::OwnedWriteCopyIn>>,
     pub(super) continuation_restart: Option<carrick_kernel::kernel::continuation::RestartDecision>,
     /// Consecutive identical (FAR, ESR) COW faults "successfully" resolved.
     /// A resolution that does not change the faulting translation refaults
@@ -1062,6 +1065,7 @@ where
             committed_exec_context_for_test: None,
             syscall_completion: SyscallCompletionOwnership::Idle,
             owner_read_progress: 0,
+            pending_write_copy_in: None,
             continuation_restart: None,
             cow_refault_watch: None,
             reserved_signal: None,
@@ -1677,6 +1681,55 @@ where
         result
     }
 
+    fn resume_write_copy_in(
+        &mut self,
+        kernel: &Kernel,
+        engine: &mut E,
+        host_wait: Option<carrick_kernel::dispatch::HostWaitContext<'_>>,
+    ) -> Result<DispatchOutcome, RuntimeError> {
+        let pending = self.pending_write_copy_in.take().ok_or_else(|| {
+            RuntimeError::Configuration("write copy-in lost its owned transfer".to_owned())
+        })?;
+        let request = self
+            .syscall_completion
+            .guest("write copy-in lost syscall completion")?
+            .syscall()
+            .request;
+        let context = self
+            .service_kernel_context
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Configuration("write copy-in lost context".to_owned()))?
+            .retain_exact();
+        let mut executor = self.guest_execution.take().ok_or_else(|| {
+            RuntimeError::Configuration("write copy-in lost MM executor".to_owned())
+        })?;
+        let lease_guard = self.execution_lease.lock();
+        let lease = lease_guard.as_ref();
+        let work_scope = kernel.dispatcher.work_scope();
+        let thread = ThreadCtx::new(self.this_tid, &self.registry, &self.futex)
+            .with_zone(zone::zone_for(self.zone_mm));
+        let thread = if let Some(ref scope) = work_scope {
+            thread.with_work_scope(scope)
+        } else {
+            thread
+        };
+        let result = kernel.dispatcher.resume_owned_write_copy_in(
+            &context,
+            request,
+            pending,
+            engine,
+            &kernel.reporter,
+            Some(thread),
+            OrdinaryDispatchRoute {
+                host_wait,
+                lease,
+                mm_executor: Some(&mut executor),
+            },
+        );
+        self.guest_execution = Some(executor);
+        Ok(result?)
+    }
+
     fn redispatch_threaded_syscall_for_executor(
         &mut self,
         kernel: &Kernel,
@@ -2201,6 +2254,7 @@ where
 
     pub(super) fn retire_syscall(&mut self) -> Result<(), RuntimeError> {
         self.owner_read_progress = 0;
+        self.pending_write_copy_in = None;
         match std::mem::replace(
             &mut self.syscall_completion,
             SyscallCompletionOwnership::Idle,

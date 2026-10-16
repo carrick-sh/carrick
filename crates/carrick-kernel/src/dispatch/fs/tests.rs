@@ -11708,16 +11708,36 @@ fn owner_copyin_wait_retains_write_before_any_guest_result() {
     use std::num::NonZeroU64;
 
     struct SuspendedRead {
-        wait: MemoryReadSuspension,
+        wait: PortalOwnerWait,
         starts: Cell<usize>,
+        resumes: Cell<usize>,
     }
     impl carrick_guest_mem::GuestMemory for SuspendedRead {
         fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
             self.starts.set(self.starts.get() + 1);
-            Err(MemoryError::ReadSuspended(Box::new(self.wait.clone())))
+            Err(MemoryError::ReadSuspended(Box::new(MemoryReadSuspension {
+                wait: MemoryReadWait::Owner(self.wait),
+                continuation: OwnedReadContinuation::new(b"preem".to_vec()),
+            })))
         }
         fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
             unreachable!("write preparation must only read its source")
+        }
+        fn resume_read(&self, continuation: OwnedReadContinuation) -> Result<Vec<u8>, MemoryError> {
+            let mut prefix = continuation.take::<Vec<u8>>().expect("exact transfer");
+            let resumed = self.resumes.get();
+            self.resumes.set(resumed + 1);
+            if resumed == 0 {
+                assert_eq!(prefix, b"preem");
+                prefix.extend_from_slice(b"ption");
+                return Err(MemoryError::ReadSuspended(Box::new(MemoryReadSuspension {
+                    wait: MemoryReadWait::Owner(self.wait),
+                    continuation: OwnedReadContinuation::new(prefix),
+                })));
+            }
+            assert_eq!(prefix, b"preemption");
+            prefix.extend_from_slice(b"-505");
+            Ok(prefix)
         }
     }
     impl carrick_guest_mem::CurrentMmMemory for SuspendedRead {}
@@ -11739,9 +11759,6 @@ fn owner_copyin_wait_retains_write_before_any_guest_result() {
         )
         .unwrap();
     assert_ne!(root.thread().key(), sibling.thread().key());
-    // This test memory models the exact owner refusal while the sibling
-    // retains its reservation. The continuation already owns five bytes;
-    // a fresh read would lose that prefix and its transfer authority.
     let wait = unsafe {
         PortalOwnerWait::from_owner(
             El1MmHandle::from_admitted_owner(
@@ -11753,36 +11770,129 @@ fn owner_copyin_wait_retains_write_before_any_guest_result() {
             7,
         )
     };
-    let continuation = OwnedReadContinuation::new((5_usize, b"preem".to_vec()));
     let mut memory = SuspendedRead {
-        wait: MemoryReadSuspension {
-            wait: MemoryReadWait::Owner(wait),
-            continuation,
-        },
+        wait,
         starts: Cell::new(0),
+        resumes: Cell::new(0),
     };
-    let outcome = dispatcher
-        .dispatch(
-            &root,
-            SyscallRequest::new(
-                carrick_abi::syscall::nr::WRITE.raw(),
-                SyscallArgs::from([1, 0x200120, 14, 0, 0, 0]),
-            ),
-            &mut memory,
-            &CompatReporter::default(),
-        )
-        .unwrap();
-    assert!(
-        !matches!(
-            outcome,
-            DispatchOutcome::Returned { .. } | DispatchOutcome::Errno { .. }
-        ),
-        "owner suspension must retain the write, not publish a guest result: {outcome:?}",
+    let original = Arc::new(parking_lot::RwLock::new(carrick_vfs::SparseBuffer::from(
+        Vec::new(),
+    )));
+    let make_file = |path: &str, contents: Arc<parking_lot::RwLock<carrick_vfs::SparseBuffer>>| {
+        OpenDescription::InMemoryFile {
+            base: OpenDescriptionBase::new(LINUX_O_WRONLY),
+            path: path.to_owned(),
+            contents,
+            offset: 0,
+            writable: true,
+            max_size: 100,
+        }
+    };
+    let fd = match dispatcher.install_fd(make_file("/original", Arc::clone(&original)), 0) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("install original: {other:?}"),
+    };
+    let request = SyscallRequest::new(
+        carrick_abi::syscall::nr::WRITE.raw(),
+        SyscallArgs::from([fd as u64, 0x200120, 14, 0, 0, 0]),
     );
+    let reporter = CompatReporter::default();
+    let first = dispatcher
+        .dispatch(&root, request, &mut memory, &reporter)
+        .unwrap();
+    let DispatchOutcome::WriteCopyInSuspended(first) = first else {
+        panic!("owner suspension must retain write: {first:?}");
+    };
+    assert_eq!(first.wait(), &MemoryReadWait::Owner(wait));
+    assert_eq!(memory.starts.get(), 1);
+    assert_eq!(original.read().len(), 0);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &root,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::CLOSE.raw(),
+                    SyscallArgs::from([fd as u64, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    let replacement = Arc::new(parking_lot::RwLock::new(carrick_vfs::SparseBuffer::from(
+        Vec::new(),
+    )));
+    let reused = match dispatcher.install_fd(make_file("/replacement", Arc::clone(&replacement)), 0)
+    {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("install replacement: {other:?}"),
+    };
+    assert_eq!(reused, fd, "numeric fd must be reused during owner wait");
+
+    let resume = |pending, memory: &mut SuspendedRead| {
+        dispatcher
+            .resume_owned_write_copy_in(
+                &root,
+                request,
+                pending,
+                memory,
+                &reporter,
+                None,
+                crate::dispatch::OrdinaryDispatchRoute {
+                    host_wait: None,
+                    lease: None,
+                    mm_executor: None,
+                },
+            )
+            .unwrap()
+    };
+    let second = resume(first, &mut memory);
+    let DispatchOutcome::WriteCopyInSuspended(second) = second else {
+        panic!("second owner wait must retain same operation: {second:?}");
+    };
+    assert_eq!(second.wait(), &MemoryReadWait::Owner(wait));
+    assert_eq!(original.read().len(), 0);
+    let final_outcome = resume(second, &mut memory);
+    assert_eq!(final_outcome, DispatchOutcome::Returned { value: 14 });
+    assert_eq!(original.read().read_range(0, 14), b"preemption-505");
+    assert_eq!(replacement.read().len(), 0);
     assert_eq!(
         memory.starts.get(),
         1,
-        "the suspended source must not restart"
+        "copy-in must not restart at byte zero"
     );
+    assert_eq!(memory.resumes.get(), 2);
     assert!(sibling.task().thread(sibling.thread().key().tid).is_some());
+}
+
+#[test]
+fn write_bad_pointer_still_returns_efault() {
+    struct BadPointer;
+    impl carrick_guest_mem::GuestMemory for BadPointer {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::OutOfBounds { address, length })
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            unreachable!()
+        }
+    }
+    impl carrick_guest_mem::CurrentMmMemory for BadPointer {}
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = dispatcher.capture_one_task_context().unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &root,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::WRITE.raw(),
+                    SyscallArgs::from([1, 0x200120, 14, 0, 0, 0])
+                ),
+                &mut BadPointer,
+                &CompatReporter::default(),
+            )
+            .unwrap(),
+        DispatchOutcome::errno(LINUX_EFAULT),
+    );
 }

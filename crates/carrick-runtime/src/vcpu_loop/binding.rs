@@ -3265,6 +3265,30 @@ where
         frame: carrick_hal::RawSyscall,
         outcome: DispatchOutcome,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        if let DispatchOutcome::WriteCopyInSuspended(pending) = outcome {
+            let wait = pending.wait().clone();
+            if self.state.pending_write_copy_in.replace(pending).is_some() {
+                return Err(RuntimeError::Configuration(
+                    "write copy-in replaced a live transfer".to_owned(),
+                )
+                .into());
+            }
+            let wait_outcome = match wait {
+                carrick_guest_mem::MemoryReadWait::Owner(wait) => {
+                    DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+                }
+                carrick_guest_mem::MemoryReadWait::Supply(request) => {
+                    DispatchOutcome::OwnerMemorySupply {
+                        request,
+                        committed: 0,
+                    }
+                }
+                carrick_guest_mem::MemoryReadWait::Physical(wait) => {
+                    DispatchOutcome::OwnerPhysicalWait { wait, committed: 0 }
+                }
+            };
+            return self.service_outcome(engine, control, frame, wait_outcome);
+        }
         if let DispatchOutcome::OwnerMemorySupply { request, committed } = outcome {
             self.state.owner_read_progress = self
                 .state
@@ -3285,11 +3309,19 @@ where
                 };
                 return self.service_outcome(engine, control, frame, outcome);
             }
-            let outcome = self.state.redispatch_threaded_syscall(
-                &self.kernel,
-                engine,
-                control.submission.host_wait_context(),
-            )?;
+            let outcome = if self.state.pending_write_copy_in.is_some() {
+                self.state.resume_write_copy_in(
+                    &self.kernel,
+                    engine,
+                    control.submission.host_wait_context(),
+                )?
+            } else {
+                self.state.redispatch_threaded_syscall(
+                    &self.kernel,
+                    engine,
+                    control.submission.host_wait_context(),
+                )?
+            };
             return self.service_outcome(engine, control, frame, outcome);
         }
         if let DispatchOutcome::OwnerMemoryWait { wait, committed } = outcome {
@@ -3321,11 +3353,19 @@ where
             let (subscription, ready) = wait.0.enroll(wake);
             if ready || wait.0.is_ready() {
                 drop(subscription);
-                let outcome = self.state.redispatch_threaded_syscall(
-                    &self.kernel,
-                    engine,
-                    control.submission.host_wait_context(),
-                )?;
+                let outcome = if self.state.pending_write_copy_in.is_some() {
+                    self.state.resume_write_copy_in(
+                        &self.kernel,
+                        engine,
+                        control.submission.host_wait_context(),
+                    )?
+                } else {
+                    self.state.redispatch_threaded_syscall(
+                        &self.kernel,
+                        engine,
+                        control.submission.host_wait_context(),
+                    )?
+                };
                 return self.service_outcome(engine, control, frame, outcome);
             }
             self.phase = HvpatchProductionPhase::ResumeOwnerPhysical {
@@ -4386,11 +4426,19 @@ where
                         ));
                     }
                     drop(_subscription);
-                    let outcome = self.state.redispatch_threaded_syscall(
-                        &self.kernel,
-                        engine,
-                        control.submission.host_wait_context(),
-                    )?;
+                    let outcome = if self.state.pending_write_copy_in.is_some() {
+                        self.state.resume_write_copy_in(
+                            &self.kernel,
+                            engine,
+                            control.submission.host_wait_context(),
+                        )?
+                    } else {
+                        self.state.redispatch_threaded_syscall(
+                            &self.kernel,
+                            engine,
+                            control.submission.host_wait_context(),
+                        )?
+                    };
                     return self.service_outcome(engine, control, frame, outcome);
                 }
                 HvpatchProductionPhase::ResumeFaultPhysical {
