@@ -232,6 +232,29 @@ fn arm_fork_children_receive_distinct_control_capacity() {
 }
 
 #[test]
+fn arm_control_windows_scale_past_eight_live_children() {
+    let mut stock = ForkStock::new(CARRIER, None, AsidAllocator::new());
+    stock
+        .install(
+            (0..64).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            lifecycles(12),
+        )
+        .unwrap();
+    let mut controls = std::collections::BTreeSet::new();
+    for child in 0..12 {
+        assert!(stock.needs_control_capacity());
+        stock
+            .provide_arm_control_capacity(0x1_0000_0000 + child * CONTROL_WINDOW_BYTES)
+            .unwrap();
+        let granted = loan(&mut stock, parent(), 302 + child, 1, 1).unwrap();
+        assert!(controls.insert(granted.request.kernel_control_ipa));
+        commit(&mut stock, parent(), granted, 1, 0).unwrap();
+    }
+    assert_eq!(stock.live_children(), 12);
+    assert_eq!(stock.counters().capacity_refusals, 0);
+}
+
+#[test]
 fn untagged_sequential_fork_retire_cycles_exceed_stock() {
     sequential_cycles_beyond_stock(UntaggedRoots);
 }
