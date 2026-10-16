@@ -586,7 +586,10 @@ pub(crate) trait ProductionHvpatchLoopPoll: Send {
     /// again and no other publisher is left for it.
     fn after_reaped_settlement(&mut self);
 
-    fn after_executor_failure_settlement(&mut self) -> continuation::ExecutorFailureSettlement;
+    fn after_executor_failure_settlement(
+        &mut self,
+        detail: String,
+    ) -> continuation::ExecutorFailureSettlement;
 
     fn take_address_space_retirement(
         &mut self,
@@ -1107,9 +1110,8 @@ where
             ),
             PersistentTerminal::Error(error) => {
                 // The owner's failure would otherwise vanish: its sibling job
-                // result is not the launch result, so this arm's Err(()) was
-                // the only externally visible trace ("sibling-owned process
-                // termination failed" with no cause). Name the cause here.
+                // result is not the launch result. Preserve its cause in the
+                // process terminal publication as well as the diagnostic.
                 //
                 // The guest pid belongs in the line for the same reason: a
                 // `cpython-importlib` wedge left one zombie at `127 << 8` and
@@ -1125,7 +1127,7 @@ where
                     %error,
                     "HVPatch terminal owner publishes failure"
                 );
-                (127, 127 << 8, Err(()))
+                (127, 127 << 8, Err(error.to_string()))
             }
             PersistentTerminal::Outcome {
                 outcome: VcpuLoopOutcome::ThreadDone,
@@ -5589,7 +5591,10 @@ where
         self.publish_lost_claim_terminal_result();
     }
 
-    fn after_executor_failure_settlement(&mut self) -> continuation::ExecutorFailureSettlement {
+    fn after_executor_failure_settlement(
+        &mut self,
+        detail: String,
+    ) -> continuation::ExecutorFailureSettlement {
         // The failed executor will not run this task again: its vCPU must not
         // stay occupied by it.
         self.end_residency();
@@ -5680,6 +5685,7 @@ where
                 &self.kernel,
                 &self.state.threads,
                 &self.completion,
+                detail,
             )
             .unwrap_or_else(|failure| {
                 tracing::error!(%failure, "publish unexpected executor-failure retirement");
@@ -5705,7 +5711,7 @@ where
                         .and_then(|()| sibling_stop.publish(&kernel))
                         .and_then(|()| {
                             publish_unexpected_executor_failure_retirement(
-                                &kernel, &threads, &current,
+                                &kernel, &threads, &current, detail,
                             )
                         })
                     {
@@ -5982,9 +5988,12 @@ impl<E: 'static> continuation::PersistentQuantumJob for HvpatchLoopJob<E> {
         }
     }
 
-    fn after_executor_failure_settlement(&mut self) -> continuation::ExecutorFailureSettlement {
+    fn after_executor_failure_settlement(
+        &mut self,
+        detail: String,
+    ) -> continuation::ExecutorFailureSettlement {
         match self.production.as_mut() {
-            Some(production) => production.after_executor_failure_settlement(),
+            Some(production) => production.after_executor_failure_settlement(detail),
             None => continuation::ExecutorFailureSettlement::PublishCurrent,
         }
     }
@@ -7583,6 +7592,13 @@ mod tests {
         assert!(
             late_completion.is_finished(),
             "post-stop admitted clone must be included in the exact member snapshot"
+        );
+        assert_eq!(
+            kernel
+                .take_process_terminal()
+                .expect("terminal publication"),
+            Some(Err("SnapshotRestoreFailed".to_owned())),
+            "the process owner must preserve the executor failure reason"
         );
         assert!(
             !registry.is_live(late_tid),
