@@ -367,7 +367,13 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
     control: &'static ThreadControlSlot,
     service: &mut Aarch64NativeProcessService<'static, X>,
     dispatch: impl FnOnce(
-        &mut dyn carrick_personality_linux::lifecycle::ProcessNative<Aarch64ParkedContext>,
+        &mut super::native_process_runtime::NativeProcessEntry<
+            '_,
+            'static,
+            Mm,
+            Aarch64ParkedContext,
+            Aarch64NativeProcessService<'static, X>,
+        >,
     ) -> R,
 ) -> Result<R, NativeProcessError> {
     let record = process_record_for_call(source, task, native, ttbr0, control)?;

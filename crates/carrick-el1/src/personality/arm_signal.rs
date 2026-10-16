@@ -7,6 +7,83 @@ use carrick_personality_linux::signal::arm::{self, RtSigframe};
 #[cfg(not(target_os = "none"))]
 use std::vec::Vec;
 
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+struct ArmSignalMachine {
+    backend: crate::isa::aarch64::Aarch64Backend,
+    user_sp: carrick_guest_arch::UserVa,
+}
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedContext>
+    for ArmSignalMachine
+{
+    type Backend = crate::isa::aarch64::Aarch64Backend;
+
+    fn backend(&mut self) -> &mut Self::Backend {
+        &mut self.backend
+    }
+
+    fn user_sp(&self, _frame: &TrapFrame) -> carrick_guest_arch::UserVa {
+        self.user_sp
+    }
+
+    fn restart(
+        &self,
+        frame: &mut TrapFrame,
+        original: carrick_sched_core::Aarch64ParkedContext,
+    ) -> bool {
+        frame.x[0] = original.syscall_return();
+        if let Some(pc) = frame.elr.checked_sub(4) {
+            frame.elr = pc;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn group_exit_custody(
+        &self,
+        _task: &carrick_el1_abi::CurrentTask,
+    ) -> carrick_personality_linux::dispatch::CompletionRoute {
+        carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion
+    }
+}
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[inline(never)]
+pub(crate) fn deliver_on_user_return<X: super::aarch64_process::ForkStockCrossing>(
+    task: &carrick_el1_abi::CurrentTask,
+    process: &mut super::native_process_runtime::NativeProcessEntry<
+        '_,
+        'static,
+        super::aarch64_process::Mm,
+        carrick_sched_core::Aarch64ParkedContext,
+        super::aarch64_process::Aarch64NativeProcessService<'static, X>,
+    >,
+    frame: &mut TrapFrame,
+) -> Option<carrick_personality_linux::dispatch::CompletionRoute> {
+    use crate::sched::ThreadCpu;
+    use zerocopy::IntoBytes;
+
+    let mut saved = crate::rust_alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
+    crate::sched::HardwareCpu.save(frame, &mut saved);
+    let mut fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+    fp.vregs = saved.native.v;
+    fp.fpsr = saved.native.fpsr as u32;
+    fp.fpcr = saved.native.fpcr as u32;
+    let sp = unsafe { crate::isa::aarch64::signal_stack() };
+    super::signal_delivery::deliver_signal_on_syscall_return(
+        task,
+        process,
+        frame,
+        fp.as_bytes(),
+        &mut ArmSignalMachine {
+            backend: crate::isa::aarch64::Aarch64Backend,
+            user_sp: sp,
+        },
+    )
+}
+
 pub(crate) fn restore(
     frame: &mut TrapFrame,
     signal: &RtSigframe,
@@ -36,6 +113,55 @@ fn frame_copy_buffer(len: usize) -> Result<Vec<u8>, ArchError> {
     // bytes. Allocation failure takes the ordinary sigreturn failure path.
     bytes.resize(len, 0);
     Ok(bytes)
+}
+
+/// Apply the already validated public return state to the next hardware
+/// context. The ISA leaf loads this context only after every copy and record
+/// check has succeeded, so a malformed frame publishes no partial registers.
+pub(crate) fn apply_restored_context(
+    context: &mut carrick_sched_core::ThreadCtx,
+    frame: &TrapFrame,
+    fp: &carrick_syscall_abi::LinuxFpsimdContext,
+    sp: u64,
+) {
+    context.x = frame.x;
+    context.pc = frame.elr;
+    context.pstate = frame.spsr;
+    context.sp_el0 = sp;
+    context.v = fp.vregs;
+    context.fpsr = u64::from(fp.fpsr);
+    context.fpcr = u64::from(fp.fpcr);
+}
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[inline(never)]
+pub(crate) fn restore_live_arm_signal_frame(
+    frame: &mut TrapFrame,
+    copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
+) -> Result<carrick_signal_core::policy::SigBlockMask, carrick_syscall_abi::LinuxErrno> {
+    use crate::sched::ThreadCpu;
+    use carrick_personality_linux::signal::SignalBackend;
+    use zerocopy::IntoBytes;
+
+    // The audited switch leaf is the sole reader/writer of EL0 FP/SIMD.
+    // Retain the context off the 16 KiB EL1 stack until validation commits.
+    let mut saved = crate::rust_alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
+    crate::sched::HardwareCpu.save(frame, &mut saved);
+    let mut fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+    fp.vregs = saved.native.v;
+    fp.fpsr = saved.native.fpsr as u32;
+    fp.fpcr = saved.native.fpcr as u32;
+    let mask = crate::isa::aarch64::Aarch64Backend
+        .restore_signal_frame(frame, fp.as_mut_bytes(), &mut |dst, src| {
+            copy_in.copy_in(dst, src)
+        })
+        .map_err(|_| carrick_syscall_abi::LINUX_EFAULT)?;
+    // restore_signal_frame validates and then publishes SP_EL0. Re-read it
+    // only after success; a failed copy leaves the saved hardware untouched.
+    let restored_sp = unsafe { crate::isa::aarch64::signal_stack().raw() };
+    apply_restored_context(&mut saved.native, frame, &fp, restored_sp);
+    crate::sched::HardwareCpu.load(frame, &saved);
+    Ok(mask)
 }
 
 pub(crate) fn build(
@@ -247,9 +373,12 @@ mod tests {
         assert_eq!(context.x[0], frame.x[0]);
         assert_eq!(context.pc, frame.elr);
         assert_eq!(context.sp_el0, 0x8000);
-        assert_eq!(context.v[7], fp.vregs[7]);
-        assert_eq!(context.fpsr, fp.fpsr as u64);
-        assert_eq!(context.fpcr, fp.fpcr as u64);
+        let expected_v = fp.vregs[7];
+        let expected_fpsr = fp.fpsr;
+        let expected_fpcr = fp.fpcr;
+        assert_eq!(context.v[7], expected_v);
+        assert_eq!(context.fpsr, u64::from(expected_fpsr));
+        assert_eq!(context.fpcr, u64::from(expected_fpcr));
     }
 
     #[test]
