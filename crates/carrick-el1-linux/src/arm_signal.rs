@@ -45,10 +45,6 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
         restart_forwarded_frame(frame)
     }
 
-    fn retry_spurious_forwarded(&self, frame: &mut TrapFrame) -> Option<bool> {
-        retry_spurious_forwarded_frame(frame)
-    }
-
     fn group_exit_custody(
         &self,
         _task: &carrick_el1_abi::CurrentTask,
@@ -69,18 +65,12 @@ pub(crate) fn restart_forwarded_frame(frame: &mut TrapFrame) -> Option<bool> {
     {
         return None;
     }
-    retry_spurious_forwarded_frame(frame)
+    rewind_forwarded_frame(frame)
 }
 
-/// A broadcast host wake did not select this thread for delivery. No handler
-/// ran, so even a syscall that normally returns EINTR must resume its wait.
-pub(crate) fn retry_spurious_forwarded_frame(frame: &mut TrapFrame) -> Option<bool> {
-    if frame.esr != 0xfffe
-        || frame.x[0] != carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64
-        || !carrick_signal_core::is_native_restartable_syscall(frame.x[8])
-    {
-        return None;
-    }
+/// Only a selected SA_RESTART handler may rewind its interrupted SVC. An
+/// empty checkpoint returns the host result once, without replay.
+fn rewind_forwarded_frame(frame: &mut TrapFrame) -> Option<bool> {
     let Some(pc) = frame.elr.checked_sub(4) else {
         return Some(false);
     };
@@ -473,19 +463,6 @@ mod tests {
         assert_eq!(ppoll.elr, 0x9004);
     }
 
-    #[test]
-    fn spurious_checkpoint_never_rewinds_a_relative_timeout() {
-        for nr in [101, 115, 72, 73, 74, 22] {
-            let mut frame = TrapFrame::default();
-            frame.esr = 0xfffe;
-            frame.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
-            frame.x[8] = nr;
-            frame.far = 0x1234;
-            frame.elr = 0x8004;
-            assert_eq!(retry_spurious_forwarded_frame(&mut frame), None, "nr={nr}");
-            assert_eq!(frame.elr, 0x8004);
-        }
-    }
     fn valid() -> RtSigframe {
         let mut signal = RtSigframe {
             siginfo: carrick_syscall_abi::LinuxSiginfo::empty(),

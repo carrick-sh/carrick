@@ -26,12 +26,6 @@ pub trait SignalMachine<C> {
     ) -> Option<bool> {
         None
     }
-    fn retry_spurious_forwarded(
-        &self,
-        _frame: &mut <Self::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
-    ) -> Option<bool> {
-        None
-    }
     fn group_exit_custody(&self, task: &CurrentTask) -> CompletionRoute;
 }
 
@@ -77,17 +71,8 @@ where
         SigBlockMask::blocking_all_of(carrick_signal_core::SignalSet::from_bits(slot.blocked().0));
     let saved_mask = process.take_suspend_mask().unwrap_or(thread_blocked);
     slot.init_blocked(BlockedMask(saved_mask.signals().bits()));
-    let Some((sig, info, action)) =
-        process.take_deliverable_after_suspend(&mut thread_blocked, saved_mask)
-    else {
-        // A process signal wakes every host waiter, but only one native
-        // thread consumes it. The other completed EINTR is not a Linux
-        // interruption: replay the forwarded call before returning to EL0.
-        return match machine.retry_spurious_forwarded(frame) {
-            Some(false) => Some(CompletionRoute::InvalidCompletion),
-            _ => None,
-        };
-    };
+    let (sig, info, action) =
+        process.take_deliverable_after_suspend(&mut thread_blocked, saved_mask)?;
     match action.disposition {
         policy::Disposition::Ignore => None,
         policy::Disposition::Default => {
