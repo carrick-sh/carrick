@@ -181,3 +181,58 @@ fn capture_owns_its_helper_when_a_build_replaces_the_running_binary() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn merging_shards_into_test_batch_with_differing_features_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("alpha/src")).unwrap();
+    std::fs::create_dir_all(dir.path().join("beta/src")).unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"alpha\", \"beta\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("alpha/Cargo.toml"),
+        "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\ndefault = []\nhost-test = []\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("alpha/src/lib.rs"), "").unwrap();
+    std::fs::write(
+        dir.path().join("beta/Cargo.toml"),
+        "[package]\nname = \"beta\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dev-dependencies]\nalpha = { path = \"../alpha\", features = [\"host-test\"] }\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("beta/src/lib.rs"), "").unwrap();
+    std::fs::write(
+        dir.path().join("justfile"),
+        r#"
+test:
+    cargo test -p alpha --lib
+    cargo test -p beta --lib
+
+batched:
+    cargo test -p alpha --lib
+    cargo test -p beta --lib
+
+test-shard-a:
+    cargo run -p carrick-xtask -- test-batch batched
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .args(["--root", dir.path().to_str().unwrap(), "check-test-shards"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "batching alpha with beta must fail when beta dev-dependencies enable alpha/host-test"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("shard per-binary feature sets differ")
+            && stderr.contains("alpha/host-test"),
+        "expected per-binary feature diff naming alpha/host-test, got: {stderr}"
+    );
+}

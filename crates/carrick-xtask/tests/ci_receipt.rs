@@ -418,9 +418,12 @@ else:
 import json, os, pathlib, shutil, sys
 prior, docs_head, candidate = (os.environ[k] for k in ('FAST_PRIOR', 'FAST_DOCS', 'FAST_CAND'))
 docs_conclusion = os.environ.get('FAST_DOCS_CONCLUSION', 'success')
+docs_event = os.environ.get('FAST_DOCS_EVENT', 'push')
+docs_branch = 'gh-readonly-queue/main/pr-1' if docs_event == 'merge_group' else 'main'
+docs_hvf_job = os.environ.get('FAST_DOCS_HVF_JOB', 'skipped')
 args = sys.argv[1:]
 if args[:2] == ['api', 'graphql']:
-    nodes = [
+    nodes = [] if os.environ.get('FAST_EMPTY_QUEUE') == '1' else [
         {'position': 1, 'baseCommit': {'oid': docs_head}, 'headCommit': {'oid': candidate}},
     ]
     print(json.dumps({'data': {'repository': {'mergeQueue': {'entries': {'pageInfo': {'hasNextPage': False}, 'nodes': nodes}}}}}))
@@ -428,7 +431,9 @@ elif args[0] == 'api' and '/runs?head_sha=' in args[-1]:
     sha = args[-1].split('head_sha=')[1].split('&')[0]
     run = {'id': {prior: 10, docs_head: 11}[sha], 'status': 'completed',
            'conclusion': 'success' if sha == prior else docs_conclusion,
-           'event': 'push', 'head_branch': 'main', 'head_sha': sha,
+           'event': 'push' if sha == prior else docs_event,
+           'head_branch': 'main' if sha == prior else docs_branch,
+           'head_sha': sha,
            'path': '.github/workflows/kernel-runtime.yml',
            'repository': {'full_name': 'carrick-sh/carrick'},
            'head_repository': {'full_name': 'carrick-sh/carrick'}}
@@ -436,6 +441,13 @@ elif args[0] == 'api' and '/runs?head_sha=' in args[-1]:
 elif args[0] == 'api' and '/artifacts?' in args[-1]:
     names = [f'receipt-hvf-{prior}-1'] if '/runs/10/' in args[-1] else []
     print(json.dumps({'artifacts': [{'name': name, 'expired': False} for name in names]}))
+elif args[0] == 'api' and '/runs/11/jobs?' in args[-1]:
+    jobs = [
+        {'name': 'changes', 'conclusion': 'success'},
+        {'name': 'signed-fixtures', 'conclusion': docs_hvf_job},
+        {'name': 'hvf-kernel', 'conclusion': docs_hvf_job},
+    ]
+    print(json.dumps({'jobs': jobs}))
 elif args[0] == 'api' and f'/commits/{docs_head}' in args[-1]:
     print(json.dumps({'parents': [{'sha': prior}]}))
 elif args[:2] == ['run', 'download']:
@@ -532,6 +544,46 @@ else:
             .output()
             .unwrap();
         assert!(!failed.status.success());
+
+        // A heavy merge_group ancestor whose receipt artifact expired (hvf-kernel concluded
+        // `success`, not `skipped`) must NOT hop to first-parent; it must fail closed on
+        // #484's merge_group_run branch.
+        let expired_heavy_mg = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .args([
+                "ci-receipt",
+                "gate",
+                "--lane",
+                "hvf",
+                "--base-sha",
+                &docs_head,
+            ])
+            .arg("--candidate-dir")
+            .arg(&candidate_dir)
+            .args(["--candidate-sha", &cand_sha, "--run-attempt", "1"])
+            .arg("--download-dir")
+            .arg(dir.path().join("download-expired-mg"))
+            .args(["--wait-minutes", "0"])
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("FAST_PRIOR", &prior)
+            .env("FAST_DOCS", &docs_head)
+            .env("FAST_CAND", &cand_sha)
+            .env("FAST_BASE_RECEIPT", &baseline_file)
+            .env("FAST_EMPTY_QUEUE", "1")
+            .env("FAST_DOCS_EVENT", "merge_group")
+            .env("FAST_DOCS_HVF_JOB", "success")
+            .output()
+            .unwrap();
+        assert!(!expired_heavy_mg.status.success());
+        let stderr = String::from_utf8_lossy(&expired_heavy_mg.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "merge-group ancestor {docs_head} has no published hvf receipt and no live queue base link"
+            )),
+            "expected #484 fail-closed merge-group error, got: {stderr}"
+        );
     }
 }
 

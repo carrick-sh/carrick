@@ -370,6 +370,19 @@ fn recipe_text(root: &Path, justfile: &str, recipe: &str) -> Option<String> {
             text.push_str(&source.replace("\\\n", " "));
         }
     }
+    let subrecipes: BTreeSet<String> = text
+        .split(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+        .filter(|token| token.starts_with("_test-"))
+        .map(str::to_owned)
+        .collect();
+    for sub in subrecipes {
+        if sub != recipe
+            && let Some(sub_text) = recipe_text(root, justfile, &sub)
+        {
+            text.push('\n');
+            text.push_str(&sub_text);
+        }
+    }
     Some(text)
 }
 

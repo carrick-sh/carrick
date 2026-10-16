@@ -1,5 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use carrick_xtask::ci_changes::{
+    CiChangesOutputs, PathClass, ReferencedDocs, classify_path, evaluate_changes,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::process::Command;
@@ -92,6 +95,7 @@ impl TestRepo {
             .args(["ci-changes"])
             .env("CI_EVENT", event)
             .env("CI_BASE", &self.base_commit)
+            .env("CARRICK_XTASK_BIN", env!("CARGO_BIN_EXE_carrick-xtask"))
             .env("GITHUB_OUTPUT", &output_file)
             .status()
             .unwrap();
@@ -110,6 +114,72 @@ impl TestRepo {
 }
 
 #[test]
+fn referenced_docs_and_census_files_in_workspace_flip_to_heavy() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let refs = ReferencedDocs::discover(&root).unwrap();
+
+    // Every doc/agent path compiled or read by code, tests, scripts, or justfile must be heavy
+    for referenced in [
+        "docs/design/arm-ring-first-flip.tsv",
+        "docs/design/arm-ring-first-flip.md",
+        "docs/design/arm-fork-stock-crossing.md",
+        "docs/support-matrix.md",
+        "docs/superpowers/plans/2026-08-12-per-run-file-authority-atomic-migration.md",
+        "docs/perf-results/2026-10-16-sample.jsonl",
+        "docs/conformance-contracts.md",
+        "AGENTS.md",
+        ".agents/skills/carrick-conformance-contract/SKILL.md",
+    ] {
+        assert_eq!(
+            classify_path(referenced, &refs),
+            PathClass::CodeOrReferencedDoc,
+            "referenced doc/agent path `{referenced}` must be classified as CodeOrReferencedDoc"
+        );
+        let pr_out = evaluate_changes(
+            "pull_request",
+            false,
+            Some(&[referenced.to_string()]),
+            &refs,
+        );
+        assert_eq!(
+            pr_out,
+            CiChangesOutputs {
+                heavy: true,
+                macos: false,
+                workflows: false,
+                hardware: true,
+            },
+            "PR touching `{referenced}` must set heavy=true, hardware=true"
+        );
+        let mg_out = evaluate_changes("merge_group", false, Some(&[referenced.to_string()]), &refs);
+        assert_eq!(
+            mg_out,
+            CiChangesOutputs {
+                heavy: true,
+                macos: true,
+                workflows: false,
+                hardware: true,
+            },
+            "merge_group touching `{referenced}` must set heavy=true, macos=true, hardware=true"
+        );
+    }
+
+    // True unreferenced prose stays Prose (heavy=false)
+    for prose in [
+        "README.md",
+        "docs/architecture.md",
+        ".agents/skills/carrick-stacked-prs/SKILL.md",
+        "LICENSE-MIT",
+    ] {
+        assert_eq!(
+            classify_path(prose, &refs),
+            PathClass::Prose,
+            "unreferenced prose `{prose}` must be classified as Prose"
+        );
+    }
+}
+
+#[test]
 fn docs_only_pr_classifies_as_not_heavy_and_not_workflows() {
     let repo = TestRepo::new();
     let outputs = repo.evaluate(
@@ -123,48 +193,104 @@ fn docs_only_pr_classifies_as_not_heavy_and_not_workflows() {
     assert_eq!(outputs.get("heavy").map(|s| s.as_str()), Some("false"));
     assert_eq!(outputs.get("macos").map(|s| s.as_str()), Some("false"));
     assert_eq!(outputs.get("workflows").map(|s| s.as_str()), Some("false"));
+    assert_eq!(outputs.get("hardware").map(|s| s.as_str()), Some("false"));
 }
 
 #[test]
-fn workflow_only_pr_classifies_as_workflows_and_not_heavy() {
+fn workflow_changes_run_heavy_and_defined_lanes() {
     let repo = TestRepo::new();
-    let outputs = repo.evaluate(
+    // ci.yml -> heavy=true, macos=false on PR (true on merge_group), workflows=true, hardware=false
+    let ci_pr = repo.evaluate(
         "pull_request",
         &[
             (".github/workflows/ci.yml", "# workflow edit"),
             (".github/actionlint.yaml", "# actionlint edit"),
         ],
     );
-    assert_eq!(outputs.get("heavy").map(|s| s.as_str()), Some("false"));
-    assert_eq!(outputs.get("macos").map(|s| s.as_str()), Some("false"));
-    assert_eq!(outputs.get("workflows").map(|s| s.as_str()), Some("true"));
-}
+    assert_eq!(ci_pr.get("heavy").map(|s| s.as_str()), Some("true"));
+    assert_eq!(ci_pr.get("macos").map(|s| s.as_str()), Some("false"));
+    assert_eq!(ci_pr.get("workflows").map(|s| s.as_str()), Some("true"));
+    assert_eq!(ci_pr.get("hardware").map(|s| s.as_str()), Some("false"));
 
-#[test]
-fn docs_and_workflows_pr_classifies_as_workflows_and_not_heavy() {
-    let repo = TestRepo::new();
-    let outputs = repo.evaluate(
-        "pull_request",
-        &[
-            ("docs/index.md", "docs"),
-            (".github/workflows/ci.yml", "# workflow edit"),
-        ],
+    let ci_mg = repo.evaluate(
+        "merge_group",
+        &[(".github/workflows/ci.yml", "# workflow edit")],
     );
-    assert_eq!(outputs.get("heavy").map(|s| s.as_str()), Some("false"));
-    assert_eq!(outputs.get("macos").map(|s| s.as_str()), Some("false"));
-    assert_eq!(outputs.get("workflows").map(|s| s.as_str()), Some("true"));
+    assert_eq!(ci_mg.get("heavy").map(|s| s.as_str()), Some("true"));
+    assert_eq!(ci_mg.get("macos").map(|s| s.as_str()), Some("true"));
+    assert_eq!(ci_mg.get("workflows").map(|s| s.as_str()), Some("true"));
+    assert_eq!(ci_mg.get("hardware").map(|s| s.as_str()), Some("false"));
+
+    // kernel-runtime.yml -> heavy=true, macos=false, workflows=true, hardware=true
+    let kr_mg = repo.evaluate(
+        "merge_group",
+        &[(
+            ".github/workflows/kernel-runtime.yml",
+            "# hardware workflow edit",
+        )],
+    );
+    assert_eq!(kr_mg.get("heavy").map(|s| s.as_str()), Some("true"));
+    assert_eq!(kr_mg.get("macos").map(|s| s.as_str()), Some("false"));
+    assert_eq!(kr_mg.get("workflows").map(|s| s.as_str()), Some("true"));
+    assert_eq!(kr_mg.get("hardware").map(|s| s.as_str()), Some("true"));
 }
 
 #[test]
-fn code_changes_under_crates_classify_as_heavy() {
+fn ci_xtask_and_scripts_run_heavy_linux_without_macos_or_hardware() {
     let repo = TestRepo::new();
-    let outputs = repo.evaluate(
+    for path in [
+        "crates/carrick-xtask/src/ci_receipt.rs",
+        "crates/carrick-xtask/src/test_batch.rs",
+        "crates/carrick-xtask/src/test_lanes.rs",
+        "crates/carrick-xtask/src/test_shards.rs",
+        "scripts/ci/require-linked-issue.sh",
+        "justfile",
+    ] {
+        let content = if path == "justfile" {
+            let existing = fs::read_to_string(repo.dir.path().join("justfile")).unwrap();
+            format!("{existing}\n# comment\n")
+        } else {
+            "// ci-xtask change\n".to_string()
+        };
+        let mg = repo.evaluate("merge_group", &[(path, &content)]);
+        assert_eq!(
+            mg.get("heavy").map(|s| s.as_str()),
+            Some("true"),
+            "{path} must set heavy=true"
+        );
+        assert_eq!(
+            mg.get("macos").map(|s| s.as_str()),
+            Some("false"),
+            "{path} must set macos=false"
+        );
+        assert_eq!(
+            mg.get("hardware").map(|s| s.as_str()),
+            Some("false"),
+            "{path} must set hardware=false"
+        );
+    }
+}
+
+#[test]
+fn code_changes_under_crates_classify_as_heavy_macos_and_hardware() {
+    let repo = TestRepo::new();
+    let pr = repo.evaluate(
         "pull_request",
         &[("crates/carrick-kernel/src/lib.rs", "pub fn dummy() {}")],
     );
-    assert_eq!(outputs.get("heavy").map(|s| s.as_str()), Some("true"));
-    assert_eq!(outputs.get("macos").map(|s| s.as_str()), Some("false"));
-    assert_eq!(outputs.get("workflows").map(|s| s.as_str()), Some("false"));
+    assert_eq!(pr.get("heavy").map(|s| s.as_str()), Some("true"));
+    assert_eq!(pr.get("macos").map(|s| s.as_str()), Some("false"));
+    assert_eq!(pr.get("workflows").map(|s| s.as_str()), Some("false"));
+    assert_eq!(pr.get("hardware").map(|s| s.as_str()), Some("true"));
+
+    let mg = repo.evaluate(
+        "merge_group",
+        &[("crates/carrick-kernel/src/lib.rs", "pub fn dummy() {}")],
+    );
+    assert_eq!(mg.get("heavy").map(|s| s.as_str()), Some("true"));
+    assert_eq!(mg.get("macos").map(|s| s.as_str()), Some("true"));
+    assert_eq!(mg.get("workflows").map(|s| s.as_str()), Some("false"));
+    assert_eq!(mg.get("hardware").map(|s| s.as_str()), Some("true"));
 }
 
 #[test]
@@ -208,6 +334,7 @@ fn code_plus_workflow_changes_classify_as_heavy_and_workflows() {
     assert_eq!(outputs.get("heavy").map(|s| s.as_str()), Some("true"));
     assert_eq!(outputs.get("macos").map(|s| s.as_str()), Some("false"));
     assert_eq!(outputs.get("workflows").map(|s| s.as_str()), Some("true"));
+    assert_eq!(outputs.get("hardware").map(|s| s.as_str()), Some("true"));
 }
 
 #[test]
@@ -229,6 +356,11 @@ fn non_pr_events_run_all_matrix() {
             outputs.get("workflows").map(|s| s.as_str()),
             Some("true"),
             "event {event} must run workflows"
+        );
+        assert_eq!(
+            outputs.get("hardware").map(|s| s.as_str()),
+            Some("true"),
+            "event {event} must run hardware"
         );
     }
 }
@@ -257,20 +389,27 @@ fn workflow_wiring_and_ci_results_consistency() {
         "ci-ok must depend on actionlint"
     );
 
-    // changes job must output heavy, macos, and workflows
+    // changes job must output heavy, macos, workflows, and hardware
     let outputs = &jobs["changes"]["outputs"];
     assert!(outputs["heavy"].as_str().is_some());
     assert!(outputs["macos"].as_str().is_some());
     assert!(outputs["workflows"].as_str().is_some());
+    assert!(outputs["hardware"].as_str().is_some());
 
-    // lint must run on draft PRs too (with fmt, clippy, and lint-domains-source), while
+    // lint must run on draft PRs too (with fmt, clippy, test-xtask, and lint-domains-source), while
     // expensive Linux/cross and hosted macOS jobs gate on non-draft PRs.
     assert_eq!(
         jobs["lint"]["if"].as_str(),
         Some("needs.changes.outputs.heavy == 'true'")
     );
     let lint_steps = jobs["lint"]["steps"].as_vec().unwrap();
-    for cmd in ["just fmt-check", "just clippy", "just lint-domains-source"] {
+    for cmd in [
+        "just check-test-shards",
+        "just test-xtask",
+        "just fmt-check",
+        "just clippy",
+        "just lint-domains-source",
+    ] {
         assert!(
             lint_steps.iter().any(|s| s["run"].as_str() == Some(cmd)),
             "lint job must run `{cmd}`"
@@ -298,7 +437,7 @@ fn workflow_wiring_and_ci_results_consistency() {
         );
     }
 
-    // kernel-runtime.yml must also wire the trusted changes job to skip hardware lanes on docs/CI-only merge groups
+    // kernel-runtime.yml must also wire the trusted changes job to skip hardware lanes when hardware == 'false'
     let kr_workflow =
         fs::read_to_string(root.join(".github/workflows/kernel-runtime.yml")).unwrap();
     let kr_docs = yaml_rust2::YamlLoader::load_from_str(&kr_workflow).unwrap();
@@ -307,7 +446,7 @@ fn workflow_wiring_and_ci_results_consistency() {
         kr_jobs["changes"]["runs-on"].as_str(),
         Some("ubuntu-latest")
     );
-    assert!(kr_jobs["changes"]["outputs"]["heavy"].as_str().is_some());
+    assert!(kr_jobs["changes"]["outputs"]["hardware"].as_str().is_some());
     for lane_job in ["signed-fixtures", "kvm-tests", "kvm-tests-willow"] {
         let needs = kr_jobs[lane_job]["needs"].as_vec().unwrap();
         assert!(
@@ -316,8 +455,8 @@ fn workflow_wiring_and_ci_results_consistency() {
         );
         let cond = kr_jobs[lane_job]["if"].as_str().unwrap();
         assert!(
-            cond.contains("needs.changes.outputs.heavy == 'true'"),
-            "{lane_job} must gate on needs.changes.outputs.heavy == 'true'"
+            cond.contains("needs.changes.outputs.hardware == 'true'"),
+            "{lane_job} must gate on needs.changes.outputs.hardware == 'true'"
         );
     }
     let ok_needs = kr_jobs["trusted-hardware-ok"]["needs"].as_vec().unwrap();
@@ -325,14 +464,13 @@ fn workflow_wiring_and_ci_results_consistency() {
 }
 
 #[test]
-fn docs_and_agents_and_xtask_ci_only_merge_group_skips_heavy_and_macos() {
+fn prose_only_merge_group_skips_heavy_and_macos() {
     let repo = TestRepo::new();
     let docs_mg = repo.evaluate(
         "merge_group",
         &[
             ("docs/architecture.md", "architecture guide"),
             (".agents/skills/carrick-stacked-prs/SKILL.md", "skill doc"),
-            (".agents/config.toml", "agent config"),
             ("README.md", "updated readme"),
             ("LICENSE-MIT", "license text"),
         ],
@@ -340,41 +478,13 @@ fn docs_and_agents_and_xtask_ci_only_merge_group_skips_heavy_and_macos() {
     assert_eq!(docs_mg.get("heavy").map(|s| s.as_str()), Some("false"));
     assert_eq!(docs_mg.get("macos").map(|s| s.as_str()), Some("false"));
     assert_eq!(docs_mg.get("workflows").map(|s| s.as_str()), Some("false"));
+    assert_eq!(docs_mg.get("hardware").map(|s| s.as_str()), Some("false"));
 
-    let ci_only_mg = repo.evaluate(
-        "merge_group",
-        &[
-            (".github/workflows/ci.yml", "# workflow edit"),
-            ("crates/carrick-xtask/src/ci_receipt.rs", "// xtask ci edit"),
-            ("crates/carrick-xtask/src/test_shards.rs", "// shards edit"),
-            ("crates/carrick-xtask/tests/ci_changes.rs", "// test edit"),
-            ("scripts/ci/require-linked-issue.sh", "#!/bin/sh\n"),
-        ],
-    );
-    assert_eq!(ci_only_mg.get("heavy").map(|s| s.as_str()), Some("false"));
-    assert_eq!(ci_only_mg.get("macos").map(|s| s.as_str()), Some("false"));
-    assert_eq!(
-        ci_only_mg.get("workflows").map(|s| s.as_str()),
-        Some("true")
-    );
-
-    // Non-CI xtask modules that affect acceptance or fixture bundles must still run heavy + macos
-    for non_ci_xtask in [
-        "crates/carrick-xtask/src/accept.rs",
-        "crates/carrick-xtask/src/fixtures.rs",
-    ] {
-        let out = repo.evaluate("merge_group", &[(non_ci_xtask, "// non-ci xtask")]);
-        assert_eq!(
-            out.get("heavy").map(|s| s.as_str()),
-            Some("true"),
-            "{non_ci_xtask}"
-        );
-        assert_eq!(
-            out.get("macos").map(|s| s.as_str()),
-            Some("true"),
-            "{non_ci_xtask}"
-        );
-    }
+    // Non-markdown files under docs/ or .agents/ fail safe as heavy + macos + hardware
+    let non_md_mg = repo.evaluate("merge_group", &[(".agents/config.toml", "agent config")]);
+    assert_eq!(non_md_mg.get("heavy").map(|s| s.as_str()), Some("true"));
+    assert_eq!(non_md_mg.get("macos").map(|s| s.as_str()), Some("true"));
+    assert_eq!(non_md_mg.get("hardware").map(|s| s.as_str()), Some("true"));
 }
 
 #[test]
@@ -418,6 +528,7 @@ fn cumulative_merge_group_with_shallower_code_and_deeper_docs_runs_heavy_and_mac
         .env("CI_EVENT", "merge_group")
         .env("CI_BASE", &entry_1_sha)
         .env("CI_BASE_REF", &repo.base_commit)
+        .env("CARRICK_XTASK_BIN", env!("CARGO_BIN_EXE_carrick-xtask"))
         .env("GITHUB_OUTPUT", &output_file)
         .status()
         .unwrap();
@@ -425,6 +536,7 @@ fn cumulative_merge_group_with_shallower_code_and_deeper_docs_runs_heavy_and_mac
     let output_str = fs::read_to_string(&output_file).unwrap();
     assert!(output_str.contains("heavy=true"), "{output_str}");
     assert!(output_str.contains("macos=true"), "{output_str}");
+    assert!(output_str.contains("hardware=true"), "{output_str}");
 }
 
 #[test]
@@ -455,6 +567,25 @@ fn ci_results_accepts_fast_path_merge_group_and_rejects_unlicensed_skips() {
             "commit-trailers": {"result": "success"},
             "lint": {"result": "skipped"},
             "portable": {"result": "skipped"},
+            "macos-clippy": {"result": "skipped"},
+            "macos-build": {"result": "skipped"},
+            "macos-unit-a": {"result": "skipped"},
+            "macos-unit-b": {"result": "skipped"},
+            "macos-integration": {"result": "skipped"}
+        })
+    ));
+
+    // ci-xtask merge_group: heavy=true, macos=false, workflows=false -> linux heavy succeeds, macos-* skipped
+    assert!(run_results(
+        "merge_group",
+        "false",
+        serde_json::json!({
+            "changes": {"result": "success", "outputs": {"heavy": "true", "macos": "false", "workflows": "false"}},
+            "actionlint": {"result": "skipped"},
+            "linked-issue": {"result": "success"},
+            "commit-trailers": {"result": "success"},
+            "lint": {"result": "success"},
+            "portable": {"result": "success"},
             "macos-clippy": {"result": "skipped"},
             "macos-build": {"result": "skipped"},
             "macos-unit-a": {"result": "skipped"},
