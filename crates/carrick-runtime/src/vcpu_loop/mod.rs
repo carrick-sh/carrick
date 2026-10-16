@@ -2392,6 +2392,10 @@ pub(super) use carrick_kernel::kernel::continuation::is_restartable_syscall;
 /// Run signal delivery for one iteration of the multi-threaded vCPU loop. Returns
 /// `Some(outcome)` when a default-action (terminate) signal fires and the process
 /// should end; `None` to keep running.
+fn carrier_signal_selection_permitted(native_signal_owner: bool) -> bool {
+    !native_signal_owner
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn service_signals_threaded<E: ThreadedEngine>(
     kernel: &Kernel,
@@ -2405,6 +2409,16 @@ pub(super) fn service_signals_threaded<E: ThreadedEngine>(
     reserved_signal: Option<carrick_kernel::kernel::continuation::ReservedSignal>,
     traps: usize,
 ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
+    if !carrier_signal_selection_permitted(context.thread().control_slot().native_signal_owner()) {
+        // Native bindings have one retained signal owner. A reserved carrier
+        // signal cannot silently be consumed by that owner's old selector.
+        if reserved_signal.is_some() {
+            return Err(RuntimeError::Configuration(
+                "reserved carrier signal reached a native signal binding".to_owned(),
+            ));
+        }
+        return Ok(None);
+    }
     {
         let restart = continuation_restart.map(|decision| {
             decision == carrick_kernel::kernel::continuation::RestartDecision::Restart
