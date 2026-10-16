@@ -403,6 +403,136 @@ else:
             );
         }
     }
+
+    #[test]
+    fn fast_path_docs_commit_on_main_walks_first_parent_for_baseline_receipt() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let fake_gh = bin.join("gh");
+        std::fs::write(
+            &fake_gh,
+            r#"#!/usr/bin/env python3
+import json, os, pathlib, shutil, sys
+prior, docs_head, candidate = (os.environ[k] for k in ('FAST_PRIOR', 'FAST_DOCS', 'FAST_CAND'))
+docs_conclusion = os.environ.get('FAST_DOCS_CONCLUSION', 'success')
+args = sys.argv[1:]
+if args[:2] == ['api', 'graphql']:
+    nodes = [
+        {'position': 1, 'baseCommit': {'oid': docs_head}, 'headCommit': {'oid': candidate}},
+    ]
+    print(json.dumps({'data': {'repository': {'mergeQueue': {'entries': {'pageInfo': {'hasNextPage': False}, 'nodes': nodes}}}}}))
+elif args[0] == 'api' and '/runs?head_sha=' in args[-1]:
+    sha = args[-1].split('head_sha=')[1].split('&')[0]
+    run = {'id': {prior: 10, docs_head: 11}[sha], 'status': 'completed',
+           'conclusion': 'success' if sha == prior else docs_conclusion,
+           'event': 'push', 'head_branch': 'main', 'head_sha': sha,
+           'path': '.github/workflows/kernel-runtime.yml',
+           'repository': {'full_name': 'carrick-sh/carrick'},
+           'head_repository': {'full_name': 'carrick-sh/carrick'}}
+    print(json.dumps({'workflow_runs': [run]}))
+elif args[0] == 'api' and '/artifacts?' in args[-1]:
+    names = [f'receipt-hvf-{prior}-1'] if '/runs/10/' in args[-1] else []
+    print(json.dumps({'artifacts': [{'name': name, 'expired': False} for name in names]}))
+elif args[0] == 'api' and f'/commits/{docs_head}' in args[-1]:
+    print(json.dumps({'parents': [{'sha': prior}]}))
+elif args[:2] == ['run', 'download']:
+    dest = pathlib.Path(args[args.index('--dir') + 1])
+    dest.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(os.environ['FAST_BASE_RECEIPT'], dest / 'receipt.json')
+else:
+    raise SystemExit(f'unexpected gh invocation: {args}')
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_gh).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_gh, permissions).unwrap();
+
+        let prior = "1".repeat(40);
+        let docs_head = "2".repeat(40);
+        let cand_sha = "3".repeat(40);
+        let mut baseline = receipt(vec![]);
+        baseline.head = prior.clone();
+        let baseline_file = dir.path().join("base.json");
+        std::fs::write(&baseline_file, serde_json::to_vec(&baseline).unwrap()).unwrap();
+        let mut candidate = baseline;
+        candidate.head = cand_sha.clone();
+        let candidate_dir = dir.path().join("candidate");
+        let candidate_artifact = candidate_dir.join(artifact_name(Lane::Hvf, &cand_sha, 1));
+        std::fs::create_dir_all(&candidate_artifact).unwrap();
+        std::fs::write(
+            candidate_artifact.join("receipt.json"),
+            serde_json::to_vec(&candidate).unwrap(),
+        )
+        .unwrap();
+
+        let ok = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .args([
+                "ci-receipt",
+                "gate",
+                "--lane",
+                "hvf",
+                "--base-sha",
+                &docs_head,
+            ])
+            .arg("--candidate-dir")
+            .arg(&candidate_dir)
+            .args(["--candidate-sha", &cand_sha, "--run-attempt", "1"])
+            .arg("--download-dir")
+            .arg(dir.path().join("download-ok"))
+            .args(["--wait-minutes", "0"])
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("FAST_PRIOR", &prior)
+            .env("FAST_DOCS", &docs_head)
+            .env("FAST_CAND", &cand_sha)
+            .env("FAST_BASE_RECEIPT", &baseline_file)
+            .output()
+            .unwrap();
+        assert!(
+            ok.status.success(),
+            "{}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&ok.stdout)
+                .contains(&format!("receipt diff against {prior}: 0 NEW"))
+        );
+
+        // Failed runs without a receipt must NOT walk first-parent history; they fail closed.
+        let failed = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .args([
+                "ci-receipt",
+                "gate",
+                "--lane",
+                "hvf",
+                "--base-sha",
+                &docs_head,
+            ])
+            .arg("--candidate-dir")
+            .arg(&candidate_dir)
+            .args(["--candidate-sha", &cand_sha, "--run-attempt", "1"])
+            .arg("--download-dir")
+            .arg(dir.path().join("download-failed"))
+            .args(["--wait-minutes", "0"])
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("FAST_PRIOR", &prior)
+            .env("FAST_DOCS", &docs_head)
+            .env("FAST_CAND", &cand_sha)
+            .env("FAST_BASE_RECEIPT", &baseline_file)
+            .env("FAST_DOCS_CONCLUSION", "failure")
+            .output()
+            .unwrap();
+        assert!(!failed.status.success());
+    }
 }
 
 #[test]

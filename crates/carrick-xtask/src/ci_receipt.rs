@@ -457,6 +457,8 @@ fn validate_sha(sha: &str) -> Result<(), ReceiptError> {
 struct BaselineObservation {
     decision: Baseline,
     merge_group_run: bool,
+    fast_path_skip: bool,
+    no_runs: bool,
 }
 
 fn query_baseline(lane: Lane, sha: &str) -> Result<BaselineObservation, ReceiptError> {
@@ -481,10 +483,34 @@ fn query_baseline(lane: Lane, sha: &str) -> Result<BaselineObservation, ReceiptE
         ))?;
         pairs.push((run.clone(), artifacts));
     }
+    let fast_path_skip = !pairs.is_empty()
+        && pairs
+            .iter()
+            .all(|(run, _)| run["status"] == "completed" && run["conclusion"] == "success");
     Ok(BaselineObservation {
         decision: baseline_decision(&pairs, lane, sha),
         merge_group_run: pairs.iter().any(|(run, _)| run["event"] == "merge_group"),
+        fast_path_skip,
+        no_runs: pairs.is_empty(),
     })
+}
+
+fn commit_first_parent(sha: &str) -> Result<Option<String>, ReceiptError> {
+    let commit = gh_json(&format!("repos/{REPOSITORY}/commits/{sha}"))?;
+    let Some(parents) = commit["parents"].as_array() else {
+        return Err(ReceiptError::Baseline(format!(
+            "commit {sha} response has no parents array"
+        )));
+    };
+    let Some(parent) = parents.first() else {
+        return Ok(None);
+    };
+    let parent_sha = parent["sha"]
+        .as_str()
+        .ok_or_else(|| ReceiptError::Baseline(format!("commit {sha} parent SHA missing")))?
+        .to_ascii_lowercase();
+    validate_sha(&parent_sha)?;
+    Ok(Some(parent_sha))
 }
 
 /// The queue owns the relationship between each synthetic group head and its
@@ -560,6 +586,8 @@ fn reseed_hint(sha: &str) -> String {
     )
 }
 
+const MAX_FAST_PATH_PARENTS: usize = 16;
+
 fn download_baseline(
     lane: Lane,
     sha: &str,
@@ -571,6 +599,7 @@ fn download_baseline(
     let mut ancestor = sha.to_owned();
     let mut chain = None;
     let mut visited = BTreeSet::new();
+    let mut fast_path_hops = 0usize;
     let (run_id, name) = loop {
         if !visited.insert(ancestor.clone()) {
             return Err(ReceiptError::Baseline(format!(
@@ -589,7 +618,21 @@ fn download_baseline(
                 "ancestor {ancestor} has no published {} receipt; following merge-queue base {base}",
                 lane.name()
             );
+            fast_path_hops = 0;
             ancestor = base.clone();
+            continue;
+        }
+        if observation.decision == Baseline::Missing
+            && fast_path_hops < MAX_FAST_PATH_PARENTS
+            && (observation.fast_path_skip || (fast_path_hops > 0 && observation.no_runs))
+            && let Some(parent) = commit_first_parent(&ancestor)?
+        {
+            println!(
+                "ancestor {ancestor} passed trusted-hardware without a {} receipt (docs/CI-only fast path); following first-parent commit {parent}",
+                lane.name()
+            );
+            fast_path_hops += 1;
+            ancestor = parent;
             continue;
         }
         if observation.merge_group_run {

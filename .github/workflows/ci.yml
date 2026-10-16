@@ -66,7 +66,8 @@ jobs:
         id: filter
         env:
           CI_EVENT: ${{ github.event_name }}
-          CI_BASE: ${{ github.event.pull_request.base.sha }}
+          CI_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          CI_BASE_REF: ${{ github.event.merge_group.base_ref }}
         run: just ci-changes
       - name: Compiler cache statistics
         if: ${{ always() }}
@@ -196,6 +197,9 @@ jobs:
       - name: Formatting
         if: ${{ !cancelled() }}
         run: just fmt-check
+      - name: Clippy (no-panic gate)
+        if: ${{ !cancelled() }}
+        run: just clippy
       - name: Dependency audit
         if: ${{ !cancelled() }}
         run: just deny
@@ -220,7 +224,7 @@ jobs:
 
   portable:
     needs: changes
-    if: needs.changes.outputs.heavy == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -268,7 +272,7 @@ jobs:
 
   linux-doc:
     needs: changes
-    if: needs.changes.outputs.heavy == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -310,7 +314,7 @@ jobs:
 
   macos-clippy:
     needs: changes
-    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -354,7 +358,7 @@ jobs:
 
   macos-build:
     needs: changes
-    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -395,7 +399,7 @@ jobs:
 
   macos-unit-a:
     needs: changes
-    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -429,45 +433,9 @@ jobs:
         if: ${{ always() }}
         run: just build-cache
 
-  macos-unit-e:
-    needs: changes
-    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
-    runs-on: macos-15
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: just
-      - name: Install repository Rust toolchain
-        run: just ci-toolchain
-      - name: Configure persisted compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
-        with:
-          shared-key: ${{ github.job }}-debug
-          cache-directories: ${{ env.SCCACHE_DIR }}
-          cache-workspace-crates: "true"
-          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
-      - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: sccache@0.18.0
-      - name: Prebuild cached xtask admission helpers
-        run: just ci-prebuild-xtask
-      - name: Unit tests shard E (workspace)
-        if: ${{ !cancelled() }}
-        run: just ci-macos-test test-shard-e
-
-      - name: Compiler cache statistics
-        if: ${{ always() }}
-        run: just build-cache
-
   macos-unit-b:
     needs: changes
-    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -493,7 +461,7 @@ jobs:
           tool: sccache@0.18.0
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
-      - name: Unit tests shard B (mm-owner + CLI + host + VFS + EL1)
+      - name: Unit tests shard B (workspace + mm-owner + CLI + host + VFS + kernel + runtime + HVF + EL1)
         if: ${{ !cancelled() }}
         run: just ci-macos-test test-shard-b
 
@@ -501,81 +469,9 @@ jobs:
         if: ${{ always() }}
         run: just build-cache
 
-  macos-unit-c:
-    needs: changes
-    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
-    runs-on: macos-15
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: just
-      - name: Install repository Rust toolchain
-        run: just ci-toolchain
-      - name: Configure persisted compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
-        with:
-          shared-key: ${{ github.job }}-debug
-          cache-directories: ${{ env.SCCACHE_DIR }}
-          cache-workspace-crates: "true"
-          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
-      - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: sccache@0.18.0
-      - name: Prebuild cached xtask admission helpers
-        run: just ci-prebuild-xtask
-      - name: Unit tests shard C (kernel)
-        if: ${{ !cancelled() }}
-        run: just ci-macos-test test-shard-c
-
-      - name: Compiler cache statistics
-        if: ${{ always() }}
-        run: just build-cache
-
-  macos-unit-d:
-    needs: changes
-    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
-    runs-on: macos-15
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: just
-      - name: Install repository Rust toolchain
-        run: just ci-toolchain
-      - name: Configure persisted compiler cache
-        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
-        with:
-          shared-key: ${{ github.job }}-debug
-          cache-directories: ${{ env.SCCACHE_DIR }}
-          cache-workspace-crates: "true"
-          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
-      - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: sccache@0.18.0
-      - name: Prebuild cached xtask admission helpers
-        run: just ci-prebuild-xtask
-      - name: Unit tests shard D (runtime + HVF)
-        if: ${{ !cancelled() }}
-        run: just ci-macos-test test-shard-d
-
-      - name: Compiler cache statistics
-        if: ${{ always() }}
-        run: just build-cache
-
   macos-integration:
     needs: changes
-    if: needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -611,7 +507,7 @@ jobs:
 
   cross-check-linux:
     needs: changes
-    if: needs.changes.outputs.heavy == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -672,7 +568,7 @@ jobs:
 
   kernel-linux-native:
     needs: changes
-    if: needs.changes.outputs.heavy == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
@@ -708,7 +604,7 @@ jobs:
 
   cross-check-freebsd:
     needs: changes
-    if: needs.changes.outputs.heavy == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -771,7 +667,7 @@ jobs:
 
   cross-check-netbsd:
     needs: changes
-    if: needs.changes.outputs.heavy == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -842,9 +738,6 @@ jobs:
       - macos-build
       - macos-unit-a
       - macos-unit-b
-      - macos-unit-c
-      - macos-unit-d
-      - macos-unit-e
       - macos-integration
       - cross-check-linux
       - kernel-linux-native
@@ -862,5 +755,6 @@ jobs:
       - name: Require every applicable job to succeed
         env:
           CI_EVENT: ${{ github.event_name }}
+          CI_DRAFT: ${{ github.event.pull_request.draft }}
           CI_NEEDS: ${{ toJSON(needs) }}
         run: just ci-results
