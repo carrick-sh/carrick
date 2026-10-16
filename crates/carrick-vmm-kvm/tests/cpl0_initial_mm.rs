@@ -218,6 +218,24 @@ fn run_until_wait_enrolled_with_boundary(
     });
 }
 
+fn run_idle_peer_until_kick(peer: &mut carrick_vmm_kvm::cpl0_boot::ProductionCpuLease) {
+    use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
+    for _ in 0..128 {
+        match peer.fixture_run_idle_peer().expect("idle peer progress") {
+            CarrierRunExit::Kick => return,
+            exit @ CarrierRunExit::PhysicalDoorbell { .. } => {
+                assert!(
+                    peer.service_idle_peer_doorbell(&exit, |_, _| {})
+                        .expect("idle peer physical service")
+                        .is_none()
+                );
+            }
+            other => panic!("unexpected idle peer exit: {other:?}"),
+        }
+    }
+    panic!("idle peer kick budget");
+}
+
 #[test]
 fn native_runtime_wait_wakes_once_only_after_real_mm_retirement() {
     use carrick_sched_core::Claim;
@@ -249,7 +267,7 @@ fn native_runtime_wait_wakes_once_only_after_real_mm_retirement() {
             } else {
                 assert!(
                     child
-                        .service_idle_peer_doorbell(&exit)
+                        .service_idle_peer_doorbell(&exit, |_, _| {})
                         .expect("peer physical service")
                         .is_none()
                 );
@@ -287,7 +305,7 @@ fn native_runtime_wait_wakes_once_only_after_real_mm_retirement() {
     );
     assert!(
         child
-            .service_idle_peer_doorbell(&retiring)
+            .service_idle_peer_doorbell(&retiring, |_, _| {})
             .expect("retire physical MM")
             .is_none()
     );
@@ -307,7 +325,7 @@ fn native_runtime_wait_wakes_once_only_after_real_mm_retirement() {
             } else {
                 assert!(
                     child
-                        .service_idle_peer_doorbell(&exit)
+                        .service_idle_peer_doorbell(&exit, |_, _| {})
                         .expect("peer completion")
                         .is_none()
                 );
@@ -338,6 +356,71 @@ fn native_runtime_wait_wakes_once_only_after_real_mm_retirement() {
     drop(next_retire);
 }
 
+#[test]
+fn work_port_services_bound_tasks_on_loaded_and_idle_peer_lanes() {
+    use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
+    let elf = native_exit_fixture("native_exit_order.S");
+    let (parts, root_tid) = native_exit_workers(&elf);
+    let (root, factory) = parts.into_factory();
+    let child_tid = carrick_el1_abi::El1TaskId::from_linux_tid(root_tid.raw() as i32 + 1);
+    let mut parent = factory.claim(0).expect("root executor");
+    let mut peer = factory.claim(1).expect("idle peer executor");
+    let task = root.binding().task();
+    parent.cpu_mut().load(root).expect("load root");
+    run_to_marker(&mut parent, task, 1, &factory);
+
+    factory
+        .fixture_mark_current_host_work(carrick_guest_arch::CpuId::new(0))
+        .expect("publish root work");
+    let mut loaded_deliveries = Vec::new();
+    for _ in 0..128 {
+        let exit = parent
+            .fixture_run_loaded(task)
+            .expect("loaded boundary")
+            .exit;
+        if let CarrierRunExit::PhysicalDoorbell { port, .. } = exit {
+            parent
+                .service_physical_doorbell(task, &exit, |served, pending| {
+                    loaded_deliveries.push((served, pending));
+                })
+                .expect("loaded service");
+            if port == carrick_x86::cpl0_entry::WORK_PORT {
+                break;
+            }
+        }
+    }
+    assert_eq!(loaded_deliveries.len(), 1);
+    assert!(loaded_deliveries[0].1, "loaded task's host work delivered");
+
+    factory
+        .fixture_place_native_thread(child_tid, carrick_guest_arch::CpuId::new(1))
+        .expect("place child on peer");
+    // Enter once to bind the child, then publish a host wake against that
+    // exact task while the vCPU is stopped at a real physical doorbell.
+    let first = peer.fixture_run_idle_peer().expect("bind idle peer child");
+    assert!(matches!(first, CarrierRunExit::PhysicalDoorbell { .. }));
+    peer.service_idle_peer_doorbell(&first, |_, _| {})
+        .expect("first peer service");
+    factory
+        .fixture_mark_current_host_work(carrick_guest_arch::CpuId::new(1))
+        .expect("publish peer work");
+    let mut idle_deliveries = Vec::new();
+    for _ in 0..128 {
+        let exit = peer.fixture_run_idle_peer().expect("idle peer boundary");
+        if let CarrierRunExit::PhysicalDoorbell { port, .. } = exit {
+            peer.service_idle_peer_doorbell(&exit, |served, pending| {
+                idle_deliveries.push((served, pending));
+            })
+            .expect("idle peer service");
+            if port == carrick_x86::cpl0_entry::WORK_PORT {
+                break;
+            }
+        }
+    }
+    assert_eq!(idle_deliveries.len(), 1);
+    assert!(idle_deliveries[0].1, "idle peer's host work delivered");
+}
+
 fn peer_retirement(
     peer: &mut carrick_vmm_kvm::cpl0_boot::ProductionCpuLease,
 ) -> carrick_vmm_kvm::carrier_cpu::CarrierRunExit {
@@ -357,7 +440,7 @@ fn peer_retirement(
                 Some(exit)
             } else {
                 assert!(
-                    peer.service_idle_peer_doorbell(&exit)
+                    peer.service_idle_peer_doorbell(&exit, |_, _| {})
                         .expect("physical service")
                         .is_none()
                 );
@@ -370,7 +453,6 @@ fn peer_retirement(
 fn native_autoreap_waits_for_every_mm(flags: &[&str]) {
     use carrick_hal::VcpuKick;
     use carrick_sched_core::Claim;
-    use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
     let elf = native_exit_fixture_with_flags("native_autoreap_exit.S", flags);
     let (parts, root_tid) = native_exit_workers(&elf);
     let (root, factory) = parts.into_factory();
@@ -410,7 +492,7 @@ fn native_autoreap_waits_for_every_mm(flags: &[&str]) {
         Claim::Queued { slot, .. } if slot == carrick_sched_core::SlotId::new(1)
     ));
     assert!(
-        peer.service_idle_peer_doorbell(&first_retire)
+        peer.service_idle_peer_doorbell(&first_retire, |_, _| {})
             .expect("first MM retirement")
             .is_none()
     );
@@ -429,7 +511,7 @@ fn native_autoreap_waits_for_every_mm(flags: &[&str]) {
     assert_eq!(claim, Claim::Parked { seq: 2 });
     assert_eq!(wakes, 1);
     assert!(
-        peer.service_idle_peer_doorbell(&second_retire)
+        peer.service_idle_peer_doorbell(&second_retire, |_, _| {})
             .expect("last MM retirement")
             .is_none()
     );
@@ -463,12 +545,9 @@ fn native_autoreap_waits_for_every_mm(flags: &[&str]) {
                 std::thread::yield_now();
             }
         });
-        let exit = peer
-            .fixture_run_idle_peer()
-            .expect("finish last native exit");
+        run_idle_peer_until_kick(&mut peer);
         stopped.store(true, std::sync::atomic::Ordering::Release);
         assert!(watcher.join().expect("bounded completion observer"));
-        assert_eq!(exit, CarrierRunExit::Kick);
     });
     // Actual wait returns -10 only now, followed by another successful fork.
     run_to_marker(&mut parent, task, 3, &factory);
@@ -532,7 +611,7 @@ fn child_born_on_idle_peer_can_fault_and_retire_on_root_executor() {
             stock_crossings += 1;
         }
         assert!(
-            peer.service_idle_peer_doorbell(&exit)
+            peer.service_idle_peer_doorbell(&exit, |_, _| {})
                 .expect("peer fork service")
                 .is_none()
         );
@@ -551,7 +630,7 @@ fn child_born_on_idle_peer_can_fault_and_retire_on_root_executor() {
                 Some(exit)
             } else {
                 assert!(
-                    peer.service_idle_peer_doorbell(&exit)
+                    peer.service_idle_peer_doorbell(&exit, |_, _| {})
                         .expect("peer physical completion")
                         .is_none()
                 );
@@ -1135,7 +1214,7 @@ fn file_region_guest_fork_dup_and_child_retirement_preserve_parent() {
         .expect("both live tables in retained region");
     run_until_wait_enrolled(&mut parent, task, &factory, root_tid, false);
     assert!(
-        peer.service_idle_peer_doorbell(&retiring)
+        peer.service_idle_peer_doorbell(&retiring, |_, _| {})
             .expect("real MM retirement")
             .is_none()
     );
@@ -1159,9 +1238,8 @@ fn file_region_guest_fork_dup_and_child_retirement_preserve_parent() {
             kick.kick();
             true
         });
-        let exit = peer.fixture_run_idle_peer();
+        run_idle_peer_until_kick(&mut peer);
         stopped.store(true, Ordering::Release);
-        exit.expect("finish child exit");
         assert!(
             watcher.join().expect("idle watcher"),
             "child retirement deadline"

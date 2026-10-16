@@ -1522,6 +1522,7 @@ impl ProductionCpuLease {
     pub fn service_idle_peer_doorbell(
         &mut self,
         exit: &CarrierRunExit,
+        on_work: impl FnOnce(bool, bool),
     ) -> Result<Option<PhysicalProcessExit>, TrapError> {
         let CarrierRunExit::PhysicalDoorbell { port, .. } = exit else {
             return Err(fail("idle peer service requires physical doorbell"));
@@ -1530,6 +1531,7 @@ impl ProductionCpuLease {
             ._custody
             .lock()
             .map_err(|_| fail("physical custody poisoned"))?;
+        let mut work_flags = None;
         let (exit, register_child, unregister_child) = self.cpu.with_idle_peer_vcpu(|vcpu| {
             let lease = StoppedCpuLease {
                 cpu: carrick_guest_arch::CpuId::new(1),
@@ -1580,6 +1582,12 @@ impl ProductionCpuLease {
                         .service_root_exit(&lease)
                         .map(|status| (Some(PhysicalProcessExit::Exited(status)), None, None))
                 }
+                WORK_PORT => {
+                    work_flags = Some(take_production_work_boundary(
+                        &custody.task(lease.cpu).linux,
+                    )?);
+                    Ok((None, None, None))
+                }
                 _ => Err(fail("unexpected idle peer physical doorbell")),
             }
         })?;
@@ -1592,6 +1600,10 @@ impl ProductionCpuLease {
         }
         if let Some(PhysicalProcessExit::Exited(_) | PhysicalProcessExit::RunFailed(_)) = exit {
             self.cpu.clear_child_bindings()?;
+        }
+        drop(custody);
+        if let Some((served, pending)) = work_flags {
+            on_work(served, pending);
         }
         Ok(exit)
     }
@@ -2104,6 +2116,23 @@ impl ProductionCpuFactory {
             .binding(carrick_guest_arch::CpuId::new(index as u32))
             .pending_irqs
             .load(Ordering::Acquire))
+    }
+
+    /// Publish owed work on the stopped slot's bound task for a live KVM
+    /// doorbell witness. The next guest boundary must service this exact bit.
+    pub fn fixture_mark_current_host_work(
+        &self,
+        slot: carrick_guest_arch::CpuId,
+    ) -> Result<(), TrapError> {
+        if slot.raw() >= 2 {
+            return Err(fail("unknown CPL0 CPU slot"));
+        }
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        custody.task(slot).linux.mark_pending_host_work();
+        Ok(())
     }
 
     pub fn user_fault_state(&self, index: usize) -> Result<(u64, u64, u64, u64, u64), TrapError> {

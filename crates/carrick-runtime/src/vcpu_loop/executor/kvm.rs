@@ -1120,7 +1120,24 @@ impl PersistentExecutor for KvmPersistentExecutor {
         }
         match self.physical.run_idle_peer()? {
             exit @ CarrierRunExit::PhysicalDoorbell { .. } => {
-                if let Some(status) = self.physical.service_idle_peer_doorbell(&exit)? {
+                let kernel = self.scheduler.kernel();
+                if matches!(
+                    exit,
+                    CarrierRunExit::PhysicalDoorbell {
+                        port: carrick_x86::cpl0_entry::WORK_PORT,
+                        ..
+                    }
+                ) {
+                    kernel.settle_thread_ledger();
+                }
+                if let Some(status) =
+                    self.physical
+                        .service_idle_peer_doorbell(&exit, |served, pending| {
+                            carrick_kernel::el1_delegation::deliver_boundary_wakes(
+                                kernel, served, pending,
+                            );
+                        })?
+                {
                     let exits = self.exits.load(Ordering::Acquire);
                     self.publish_exit(status.into_initial_process_exit(exits))?;
                 }
