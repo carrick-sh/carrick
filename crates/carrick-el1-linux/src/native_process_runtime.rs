@@ -7231,6 +7231,10 @@ mod tests {
     use carrick_guest_arch::{ContextGeneration, FrameGpa};
     use carrick_sched_core::ParkedContextWords;
     #[test]
+    fn serial_host_empty_signal_checkpoint_takes_no_registry_or_graph_lock() {
+        super::host_test_support::empty_signal_checkpoint_lock_witness();
+    }
+    #[test]
     fn compact_native_wait_bucket_uses_the_shared_hash_for_its_context_abi() {
         for (mm, address) in [(1, 0), (104, 0xffff_ffff_a800_0000), (u64::MAX, u64::MAX)] {
             assert_eq!(
