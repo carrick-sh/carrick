@@ -980,6 +980,22 @@ pub(crate) fn service_metadata_operation(
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn report_stock_refusal(
+    exchange: &ForkStockExchange,
+    execution: Option<crate::fork_stock::GrantExecution>,
+    reason: &str,
+) {
+    let request = exchange.request();
+    carrick_observability::probes::el1_native_fork_stock_refusal(
+        reason,
+        &format!("{:?}", request.map(|r| r.binding)),
+        &format!("{:?}", execution.map(|e| e.binding)),
+        &format!("{:?}", request.map(|r| r.context)),
+        &format!("{:?}", execution.map(|e| e.context)),
+    );
+}
+
 #[cfg(all(
     feature = "metadata-grant-test-support",
     target_os = "macos",
@@ -1307,6 +1323,7 @@ pub(crate) fn service_native_fork_stock(
             // SAFETY: the synchronous crossing exclusively retains this complete wire record.
             let exchange = unsafe { &mut *pointer };
             let Some(execution) = execution else {
+                report_stock_refusal(exchange, None, "NoLiveExecution");
                 exchange.refuse(ForkStockRefusal::Stale);
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             };
@@ -1368,12 +1385,14 @@ pub(crate) fn service_native_fork_stock(
                 exchange.refuse(ForkStockRefusal::Capacity);
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             }
-            stock
+            let result = stock
                 .owner
                 .loan(&mut *ledger, execution, exchange, |life| {
                     lifecycle_window(custody, life).is_some_and(|window| window.is_zero(life))
                 })
-                .is_ok()
+;
+            if let Err(refusal) = result { report_stock_refusal(exchange, Some(execution), &format!("{refusal:?}")); }
+            result.is_ok()
         }
         Some(ForkStockKind::Reserve | ForkStockKind::Commit | ForkStockKind::Abort) => {
             let Some(pointer) = abi_stack_ptr::<ForkStockSettlement>(region, cpu, address) else {
