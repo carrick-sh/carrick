@@ -96,12 +96,34 @@ fn main() {
         unsafe {
             if cross {
                 let pid = libc::fork();
+                if pid < 0 {
+                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    eprintln!("icache_reuse_fork_failed errno={errno}");
+                    std::process::exit(2);
+                }
                 if pid == 0 {
                     run_old_code(a);
                     libc::_exit(0);
                 }
                 let mut status = 0;
-                while libc::waitpid(pid, &mut status, 0) < 0 {}
+                let mut retries = 0;
+                loop {
+                    let waited = libc::waitpid(pid, &mut status, 0);
+                    if waited >= 0 {
+                        break;
+                    }
+                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    if errno == libc::EINTR && retries < 1000 {
+                        retries += 1;
+                        continue;
+                    }
+                    eprintln!("icache_reuse_waitpid_failed errno={errno}");
+                    std::process::exit(3);
+                }
+                if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+                    eprintln!("icache_reuse_child_failed status={status}");
+                    std::process::exit(4);
+                }
             } else {
                 run_old_code(a);
             }
