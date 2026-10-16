@@ -11751,7 +11751,8 @@ fn owner_copyin_wait_retains_write_before_any_guest_result() {
             crate::kernel::ClonePlan::from_flags(
                 carrick_abi::LinuxCloneFlags::THREAD
                     | carrick_abi::LinuxCloneFlags::SIGHAND
-                    | carrick_abi::LinuxCloneFlags::VM,
+                    | carrick_abi::LinuxCloneFlags::VM
+                    | carrick_abi::LinuxCloneFlags::FILES,
             )
             .unwrap(),
             carrick_hal::ThreadId::synthetic_for_tests(1505),
@@ -11807,10 +11808,20 @@ fn owner_copyin_wait_retains_write_before_any_guest_result() {
     assert_eq!(memory.starts.get(), 1);
     assert_eq!(original.read().len(), 0);
 
+    let replacement = Arc::new(parking_lot::RwLock::new(carrick_vfs::SparseBuffer::from(
+        Vec::new(),
+    )));
+    let replacement_fd =
+        match dispatcher.install_fd(make_file("/replacement", Arc::clone(&replacement)), 0) {
+            DispatchOutcome::Returned { value } => value as i32,
+            other => panic!("install replacement: {other:?}"),
+        };
+    assert_ne!(replacement_fd, fd);
+
     assert_eq!(
         dispatcher
             .dispatch(
-                &root,
+                &sibling,
                 SyscallRequest::new(
                     carrick_abi::syscall::nr::CLOSE.raw(),
                     SyscallArgs::from([fd as u64, 0, 0, 0, 0, 0]),
@@ -11821,15 +11832,21 @@ fn owner_copyin_wait_retains_write_before_any_guest_result() {
             .unwrap(),
         DispatchOutcome::Returned { value: 0 },
     );
-    let replacement = Arc::new(parking_lot::RwLock::new(carrick_vfs::SparseBuffer::from(
-        Vec::new(),
-    )));
-    let reused = match dispatcher.install_fd(make_file("/replacement", Arc::clone(&replacement)), 0)
-    {
-        DispatchOutcome::Returned { value } => value as i32,
-        other => panic!("install replacement: {other:?}"),
-    };
-    assert_eq!(reused, fd, "numeric fd must be reused during owner wait");
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &sibling,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::DUP3.raw(),
+                    SyscallArgs::from([replacement_fd as u64, fd as u64, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: fd as i64 },
+        "sibling must reuse the writer's numeric slot",
+    );
 
     let resume = |pending, memory: &mut SuspendedRead| {
         dispatcher

@@ -3819,7 +3819,7 @@ pub(crate) mod tests {
             let blocked_exit = {
                 let mut control =
                     executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
-                job.service_outcome(&mut engine, &mut control, frame, outcome)
+                job.route_outcome(&mut engine, &mut control, frame, outcome)
                     .expect("production continuation capture")
             };
             let executor::ExecutorExit::BlockedContinuation {
@@ -4068,7 +4068,7 @@ pub(crate) mod tests {
             let mut next_exit = {
                 let mut control =
                     executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
-                job.service_outcome(&mut engine, &mut control, frame, outcome)
+                job.route_outcome(&mut engine, &mut control, frame, outcome)
                     .expect("initial production continuation")
             };
             let wait_service = runtime.continuation_services(root.kernel()).1;
@@ -4324,7 +4324,7 @@ pub(crate) mod tests {
         let blocked_exit = {
             let mut control =
                 executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
-            job.service_outcome(
+            job.route_outcome(
                 &mut engine,
                 &mut control,
                 frame,
@@ -5077,7 +5077,7 @@ pub(crate) mod tests {
         let mut engine = CrashCaptureTestEngine::default();
         let first = match origin {
             ExecCompletionOrigin::GuestSyscall => job
-                .service_outcome(
+                .route_outcome(
                     &mut engine,
                     &mut control,
                     execve_test_frame(),
@@ -6147,7 +6147,7 @@ pub(crate) mod tests {
         let mut engine = CrashCaptureTestEngine::default();
 
         let error = job
-            .service_outcome(
+            .route_outcome(
                 &mut engine,
                 &mut control,
                 execve_test_frame(),
@@ -6288,7 +6288,7 @@ pub(crate) mod tests {
         let mut engine = CrashCaptureTestEngine::default();
 
         let first = job
-            .service_outcome(
+            .route_outcome(
                 &mut engine,
                 &mut control,
                 execve_test_frame(),
@@ -6465,7 +6465,7 @@ pub(crate) mod tests {
         let mut engine = CrashCaptureTestEngine::default();
 
         let error = job
-            .service_outcome(
+            .route_outcome(
                 &mut engine,
                 &mut control,
                 frame,

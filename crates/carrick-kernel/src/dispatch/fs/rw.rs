@@ -114,7 +114,9 @@ impl SyscallDispatcher {
             mm_executor: route.mm_executor,
         };
         resources::with_captured_resources(kernel, || {
-            self.fs_view().resume_write_copy_in(&mut cx, pending)
+            let outcome = self.fs_view().resume_write_copy_in(&mut cx, pending)?;
+            self.complete_io_rearm(kernel, &request, &outcome);
+            Ok(outcome)
         })
     }
 }

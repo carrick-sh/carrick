@@ -2586,6 +2586,74 @@ mod overlay_dispatch_tests {
         (h, epfd, writer, event_addr)
     }
 
+    #[test]
+    fn resumed_copyin_write_completes_epollet_socket_rearm() {
+        use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+        use carrick_guest_mem::{
+            CurrentMmMemory, GuestMemory, MemoryError, MemoryReadSuspension, MemoryReadWait,
+            OwnedReadContinuation,
+        };
+        use std::num::NonZeroU64;
+
+        struct SuspendedByte(PortalOwnerWait);
+        impl GuestMemory for SuspendedByte {
+            fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+                Err(MemoryError::ReadSuspended(Box::new(MemoryReadSuspension {
+                    wait: MemoryReadWait::Owner(self.0),
+                    continuation: OwnedReadContinuation::new(Vec::<u8>::new()),
+                })))
+            }
+            fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+                unreachable!()
+            }
+            fn resume_read(&self, continuation: OwnedReadContinuation) -> Result<Vec<u8>, MemoryError> {
+                assert!(continuation.take::<Vec<u8>>().unwrap().is_empty());
+                Ok(vec![b'x'])
+            }
+        }
+        impl CurrentMmMemory for SuspendedByte {}
+
+        let (mut h, epfd, writer, _) = staged_write_fixture();
+        let epoll = h.dispatcher.open_file(epfd as i32).unwrap();
+        let context = h.dispatcher.capture_one_task_context().unwrap();
+        let wait = unsafe {
+            PortalOwnerWait::from_owner(
+                El1MmHandle::from_admitted_owner(
+                    NonZeroU64::new(1).unwrap(),
+                    ReservationMm::new(context.shared().mm().id().raw()).unwrap(),
+                    NonZeroU64::new(3).unwrap(),
+                ),
+                PortalWaitCause::Reservations,
+                7,
+            )
+        };
+        let mut memory = SuspendedByte(wait);
+        let request = SyscallRequest::new(
+            64,
+            SyscallArgs::from([writer as u64, MEM_BASE, 1, 0, 0, 0]),
+        );
+        let first = h.dispatcher.dispatch(&context, request, &mut memory, &h.reporter).unwrap();
+        let DispatchOutcome::WriteCopyInSuspended(pending) = first else {
+            panic!("copy-in must suspend: {first:?}");
+        };
+        assert_eq!(staged_write_state(&epoll, writer).0, LINUX_EPOLLOUT);
+        let completed = h.dispatcher.resume_owned_write_copy_in(
+            &context,
+            request,
+            pending,
+            &mut memory,
+            &h.reporter,
+            None,
+            OrdinaryDispatchRoute {
+                host_wait: None,
+                lease: None,
+                mm_executor: None,
+            },
+        ).unwrap();
+        assert_eq!(completed, DispatchOutcome::Returned { value: 1 });
+        assert_eq!(staged_write_state(&epoll, writer).0 & LINUX_EPOLLOUT, 0);
+    }
+
     fn set_epoll_latch(epoll: &OpenFile, target: i32, ready: u32, read_avail: u64) {
         let mut open = crate::kernel::FileDescription::write_for_io(&epoll.description).unwrap();
         let OpenDescription::Epoll { interest, .. } = &mut *open else {
