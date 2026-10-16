@@ -96,7 +96,10 @@ pub trait GuestDispatchFrame: SyscallFrame {
     fn restore_signal_frame(
         &mut self,
         copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
-    ) -> Result<carrick_signal_core::policy::SigBlockMask, carrick_syscall_abi::LinuxErrno> {
+    ) -> Result<
+        carrick_personality_linux::signal::RestoredSignalFrame,
+        carrick_syscall_abi::LinuxErrno,
+    > {
         let _ = copy_in;
         Err(carrick_personality_linux::abi::signal::LINUX_ENOSYS)
     }
@@ -160,7 +163,10 @@ impl GuestDispatchFrame for TrapFrame {
     fn restore_signal_frame(
         &mut self,
         copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
-    ) -> Result<carrick_signal_core::policy::SigBlockMask, carrick_syscall_abi::LinuxErrno> {
+    ) -> Result<
+        carrick_personality_linux::signal::RestoredSignalFrame,
+        carrick_syscall_abi::LinuxErrno,
+    > {
         super::arm_signal::restore_live_arm_signal_frame(self, copy_in)
     }
     fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {

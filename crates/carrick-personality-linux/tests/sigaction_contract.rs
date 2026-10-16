@@ -35,6 +35,7 @@ impl<'a> SignalNative<'a> for Native {
         SigBlockMask::NONE
     }
     fn set_current_blocked(&mut self, _: SigBlockMask) {}
+    fn set_current_altstack(&mut self, _: carrick_personality_linux::abi::thread::AltStack) {}
     fn current_pid(&self) -> u32 {
         1
     }
@@ -43,7 +44,10 @@ impl<'a> SignalNative<'a> for Native {
     }
     fn restore_signal_frame(
         &mut self,
-    ) -> Result<carrick_signal_core::policy::SigBlockMask, carrick_syscall_abi::LinuxErrno> {
+    ) -> Result<
+        carrick_personality_linux::signal::RestoredSignalFrame,
+        carrick_syscall_abi::LinuxErrno,
+    > {
         Err(carrick_syscall_abi::LinuxErrno::new(14))
     }
 }
@@ -195,7 +199,7 @@ fn signal_owner_admits_validated_requests_and_selectors() {
     );
     assert_eq!(result.unwrap_err().get(), 22);
     let restored: Result<
-        carrick_signal_core::policy::SigBlockMask,
+        carrick_personality_linux::signal::RestoredSignalFrame,
         carrick_syscall_abi::LinuxErrno,
     > = native.restore_signal_frame();
     assert_eq!(restored.unwrap_err().get(), 14);
