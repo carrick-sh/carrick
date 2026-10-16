@@ -1361,7 +1361,7 @@ impl<'a> NetView<'a> {
         let fd = fd.0;
         let addr_addr = addr.0;
         let addrlen_addr = addrlen.0;
-        let (host_fd, family, type_, protocol, inzone_listener) = {
+        let (host_fd, family, type_, protocol, inzone_listener, accept_timeout) = {
             let Some(open_file) = self.open_file(fd) else {
                 return DispatchOutcome::errno(LINUX_EBADF);
             };
@@ -1386,12 +1386,13 @@ impl<'a> NetView<'a> {
                     *type_,
                     *protocol,
                     base.inzone_listener(),
+                    base.recv_timeout(),
                 ),
                 Some(OpenDescription::InMemorySocket { base, socket }) => {
                     let family = socket.family();
                     let type_ = socket.socket_type;
                     let protocol = socket.protocol;
-                    (None, family, type_, protocol, base.inzone_listener())
+                    (None, family, type_, protocol, base.inzone_listener(), None)
                 }
                 _ => {
                     return DispatchOutcome::errno(LINUX_ENOTSOCK);
@@ -1471,9 +1472,6 @@ impl<'a> NetView<'a> {
         let nonblocking = self.io_is_nonblocking(fd, 0);
         // SO_RCVTIMEO bounds a blocking accept and makes an interrupted wait
         // non-restartable even when the handler requests SA_RESTART.
-        let accept_timeout = self.open_file(fd).and_then(|file| {
-            crate::kernel::FileDescription::inspect(&file.description)?.recv_timeout()
-        });
         let accepted_source = std::cell::RefCell::new(None::<Vec<u8>>);
         // SO_REUSEPORT: Darwin parks EVERY incoming connection on the last
         // socket that bound the addr:port, so this member's own host socket is
