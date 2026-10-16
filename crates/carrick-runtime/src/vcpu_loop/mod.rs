@@ -397,6 +397,7 @@ pub(crate) use exec::{
 };
 pub(crate) mod quiesce;
 mod signal;
+mod signal_ingress_producer;
 mod threads;
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use threads::enroll_persistent_process_member;
