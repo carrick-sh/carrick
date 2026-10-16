@@ -1205,6 +1205,9 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     fn wake_effects(&mut self, effects: WakeEffects) {
         crate::sched::object_wait::deliver_wake_effects(self.zone, self.slot, effects);
     }
+    fn request_ingress_producer_boundary(&mut self) {
+        self.task.linux.mark_pending_host_work();
+    }
     fn fork_fd_table(
         &mut self,
         parent_table: u64,

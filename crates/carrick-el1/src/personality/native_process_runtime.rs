@@ -275,6 +275,8 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     fn quarantine_born(&mut self, born: Self::Born);
     fn retire_mm(&mut self, mm: Self::Mm);
     fn wake_effects(&mut self, effects: WakeEffects);
+    /// A guest drain opened ingress capacity for an owned host admission.
+    fn request_ingress_producer_boundary(&mut self);
     fn wake_unplaceable_wait(
         &mut self,
         _channel: ProcessWaitChannel,
@@ -1064,6 +1066,12 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .insert((key.carrier, process), (group_key, vec![key]));
         state.records.insert(record_key, key);
         *runtime.registry.lock() = Some(self);
+        state
+            .members
+            .get(&key)
+            .ok_or(NativeProcessError::Stale)?
+            .control
+            .commit_native_signal_owner();
         Ok(())
     }
 
@@ -1355,13 +1363,18 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         service: &mut S,
     ) -> Result<usize, NativeProcessError> {
         let mut admitted = 0;
+        let mut drained = false;
         for _ in 0..carrick_el1_abi::SIGNAL_INGRESS_CAPACITY {
             let Some(event) = queue.take() else {
                 break;
             };
+            drained = true;
             if self.admit_external_event(zone, event, publishing_slot, service)? {
                 admitted += 1;
             }
+        }
+        if drained && queue.backpressure_waiting() {
+            service.request_ingress_producer_boundary();
         }
         Ok(admitted)
     }
@@ -1460,6 +1473,12 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             (group_key, vec![child_key]),
         );
         state.records.insert(record_key, child_key);
+        state
+            .members
+            .get(&child_key)
+            .ok_or(NativeProcessError::Stale)?
+            .control
+            .commit_native_signal_owner();
         Ok(())
     }
 
@@ -1615,6 +1634,12 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .1
             .push(key);
         state.records.insert(record_key, key);
+        state
+            .members
+            .get(&key)
+            .ok_or(NativeProcessError::Stale)?
+            .control
+            .commit_native_signal_owner();
         drop(state);
         if closing {
             let wait = NativeBucketWait {
@@ -6568,6 +6593,7 @@ mod tests {
         }
         fn retire_mm(&mut self, _: Self::Mm) {}
         fn wake_effects(&mut self, _: WakeEffects) {}
+        fn request_ingress_producer_boundary(&mut self) {}
     }
     fn words(address: AddressContext<RootGpa>) -> ParkedContextWords {
         let mut frame = [0; 20];
@@ -11154,6 +11180,7 @@ mod tests {
         }
 
         fn wake_effects(&mut self, _: WakeEffects) {}
+        fn request_ingress_producer_boundary(&mut self) {}
 
         fn fork_fd_table(&mut self, _: u64, _: u64) -> Result<(), NativeProcessError> {
             if self.fail_fd_table {
