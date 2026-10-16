@@ -87,6 +87,10 @@ impl<
             PortalTransferIntent::UserWrite,
             slot,
         )?;
+        // One successful supply must make the next selection advance this
+        // continuation. A venue that merely acknowledges the crossing may
+        // not keep an EL1 worker inside an unbounded selection loop.
+        let mut awaiting_supply_progress = false;
         while !continuation.is_complete() {
             let venues = venue.selection_venues();
             if venues.slot != slot {
@@ -97,9 +101,15 @@ impl<
                 .settle_completions(&request)
                 .map_err(UserWriteError::Mechanics)?;
             match step {
-                TransferStep::CowSupply(window) => venue
-                    .supply_cow(window)
-                    .map_err(UserWriteError::Mechanics)?,
+                TransferStep::CowSupply(window) => {
+                    if awaiting_supply_progress {
+                        return Err(UserWriteError::Busy);
+                    }
+                    venue
+                        .supply_cow(window)
+                        .map_err(UserWriteError::Mechanics)?;
+                    awaiting_supply_progress = true;
+                }
                 TransferStep::Selected(selected) => {
                     let fence = self
                         .revalidate(&continuation, selected, words, slot)?
@@ -119,6 +129,7 @@ impl<
                         return Err(UserWriteError::Fault);
                     }
                     fence.complete(&mut continuation)?;
+                    awaiting_supply_progress = false;
                 }
                 TransferStep::Supply(_) => return Err(UserWriteError::UnsupportedSupply),
                 TransferStep::Suspended => return Err(UserWriteError::Busy),
