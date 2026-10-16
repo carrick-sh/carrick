@@ -714,6 +714,12 @@ impl<
         }
     }
 
+    fn set_current_altstack(&mut self, stack: carrick_personality_linux::abi::thread::AltStack) {
+        if let Some(thread) = self.thread() {
+            thread.slot.write_altstack(stack);
+        }
+    }
+
     fn current_pid(&self) -> u32 {
         self.process_pid().unwrap_or(0)
     }
@@ -726,7 +732,10 @@ impl<
 
     fn restore_signal_frame(
         &mut self,
-    ) -> Result<carrick_signal_core::policy::SigBlockMask, carrick_syscall_abi::LinuxErrno> {
+    ) -> Result<
+        carrick_personality_linux::signal::RestoredSignalFrame,
+        carrick_syscall_abi::LinuxErrno,
+    > {
         let task_idx = self.frame.task_index();
         #[cfg(test)]
         if let Some(user) = &mut self.lifecycle_user {
