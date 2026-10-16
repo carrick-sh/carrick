@@ -1118,6 +1118,125 @@ mod tests {
 
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn native_stock_crossing_reads_kernel_stack_and_current_execution() {
+        let custody = CarrierVmCustody::new();
+        let generation = custody.begin_create().unwrap();
+        custody.commit_create(generation).unwrap();
+        let region = carrick_test_support::TestEl1Region::zeroed();
+        let physical = carrick_test_support::TestEl1Region::zeroed();
+        let mut exec = test_execution(41, 0, 301);
+        exec.context.root = page(carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE);
+        let ttbr0 = (1 << 48) | exec.context.root.address().raw();
+        let slot = carrick_guest_arch::SlotId::new(0);
+        // SAFETY: exclusively owned, aligned initialized ABI fixture storage.
+        let zone = unsafe {
+            &*region
+                .as_ptr()
+                .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+                .cast::<carrick_el1_abi::ZoneTables>()
+        };
+        let space = zone.spaces.publish_closed(301, ttbr0, ttbr0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 301);
+        zone.publish_slot(slot, 301, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 301).unwrap();
+        // SAFETY: this stopped CPU's CurrentTask belongs to the fixture.
+        let task = unsafe {
+            &*region
+                .as_ptr()
+                .add(carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize)
+                .cast::<carrick_el1_abi::CurrentTask>()
+        };
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 1);
+        task.mm
+            .key
+            .store(301, core::sync::atomic::Ordering::Release);
+        task.mm
+            .thread_generation
+            .store(101, core::sync::atomic::Ordering::Release);
+        task.publish_root_generation(exec.context.generation);
+        let stock_base = carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE + 0x20_0000;
+        for (ipa, len, offset, id) in [
+            (stock_base, 0x8000, 0usize, 1),
+            (
+                carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE,
+                0x10000,
+                0x10000,
+                2,
+            ),
+        ] {
+            custody
+                .publish_stage2_record_using(
+                    crate::trap::CarrierStage2RecordSpec {
+                        vm_generation: generation,
+                        ipa,
+                        len,
+                        host_addr: unsafe { physical.as_ptr().add(offset) } as usize,
+                        mapped: true,
+                        backend_map_installed: true,
+                        release_ipa: false,
+                        perms: 3,
+                        logical_owner: Some(crate::trap::CarrierLogicalOwner { id, generation: 1 }),
+                    },
+                    || 0,
+                )
+                .unwrap();
+        }
+        {
+            let mut stock = custody.fork_stock.lock();
+            stock.carrier = NonZeroU64::new(7).unwrap();
+            stock.grant_tables = (0..8)
+                .map(|index| page(stock_base + index * 4096))
+                .collect();
+            assert!(
+                stock.active_execution_for_cpu(exec.cpu).is_none(),
+                "production never seeds the old execution cache"
+            );
+        }
+        let request = test_request(exec, 302, 4, 1);
+        let address = KernelVa::new(carrick_el1_abi::EL1_STACKS_BASE);
+        let offset = (address.raw() - carrick_el1_abi::EL1_REGION_BASE) as usize;
+        // SAFETY: aligned complete loan record on this CPU's retained fixture stack.
+        let record = unsafe {
+            &mut *region
+                .as_ptr()
+                .add(offset)
+                .cast_mut()
+                .cast::<ForkStockExchange>()
+        };
+        *record = ForkStockExchange::new(request).unwrap();
+        assert!(
+            ForkStockHostCustody::resolve_record_ptr::<ForkStockExchange>(&custody, address.raw())
+                .is_err(),
+            "ABI records are not physical table stock"
+        );
+        let bytes = unsafe {
+            core::slice::from_raw_parts(region.as_ptr(), carrick_el1_abi::EL1_REGION_SIZE as usize)
+        };
+        let reply = crate::metadata_grant::service_native_fork_stock(
+            &custody,
+            Some(generation),
+            exec.cpu,
+            address,
+            0,
+            ttbr0,
+            bytes,
+        )
+        .unwrap();
+        assert_eq!(
+            reply,
+            [carrick_el1_abi::METADATA_GRANT_SUCCESS, 0, 0, 0],
+            "native loan must use retained KernelVa and live lane identity"
+        );
+        let loan = record.take(request).unwrap().unwrap();
+        assert_eq!(loan.request.child_tables.base, stock_base);
+        assert_eq!(loan.request.child_tables.len, 4 * 4096);
+        assert_ne!(loan.lifecycle.page, KernelVa::new(0));
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn dispatcher_fork_stock_round_trip_and_settlement() {
         let custody = CarrierVmCustody::new();
         let generation = custody.begin_create().unwrap();
