@@ -47,6 +47,10 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
         restart_forwarded_frame(frame)
     }
 
+    fn retry_spurious_forwarded(&self, frame: &mut TrapFrame) -> Option<bool> {
+        retry_spurious_forwarded_frame(frame)
+    }
+
     fn group_exit_custody(
         &self,
         _task: &carrick_el1_abi::CurrentTask,
@@ -61,8 +65,17 @@ impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedCont
 pub(crate) fn restart_forwarded_frame(frame: &mut TrapFrame) -> Option<bool> {
     if frame.esr != 0xfffe
         || frame.x[0] != carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64
-        || !carrick_signal_core::is_restartable_syscall(frame.x[8])
+        || !carrick_signal_core::is_native_restartable_syscall(frame.x[8])
     {
+        return None;
+    }
+    retry_spurious_forwarded_frame(frame)
+}
+
+/// A broadcast host wake did not select this thread for delivery. No handler
+/// ran, so even a syscall that normally returns EINTR must resume its wait.
+pub(crate) fn retry_spurious_forwarded_frame(frame: &mut TrapFrame) -> Option<bool> {
+    if frame.esr != 0xfffe || frame.x[0] != carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64 {
         return None;
     }
     let Some(pc) = frame.elr.checked_sub(4) else {
@@ -89,7 +102,10 @@ pub(crate) fn deliver_on_user_return<X: super::aarch64_process::ForkStockCrossin
     use crate::sched::ThreadCpu;
     use zerocopy::IntoBytes;
 
-    if !process.signal_checkpoint_needed() {
+    if !process.signal_checkpoint_needed()
+        && !(frame.esr == 0xfffe
+            && frame.x[0] == carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64)
+    {
         return None;
     }
     let mut saved = crate::rust_alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);

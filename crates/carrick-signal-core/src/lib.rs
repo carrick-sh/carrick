@@ -59,12 +59,6 @@ pub fn is_restartable_syscall(nr: u64) -> bool {
         | 287 // pwritev2
         | 29  // ioctl (on a slow device)
         | 56  // openat (blocks opening a FIFO)
-        // Blocking socket calls; the continuation owner excludes a caller
-        // deadline (SO_RCVTIMEO) before handing native restart eligibility on.
-        | 202 // accept
-        | 242 // accept4
-        | 207 // recvfrom
-        | 212 // recvmsg
         // Advisory file locking: flock, and fcntl's F_SETLKW. fcntl is listed
         // whole because the blocking lock commands are the only ones that can
         // return EINTR.
@@ -78,6 +72,13 @@ pub fn is_restartable_syscall(nr: u64) -> bool {
         | 95  // waitid
         | 260 // wait4
     )
+}
+
+/// The native forwarded-call owner has already excluded socket receive
+/// deadlines before it marks a return restart eligible. The carrier does not
+/// have that fd-specific fact, so its shared predicate excludes these calls.
+pub fn is_native_restartable_syscall(nr: u64) -> bool {
+    is_restartable_syscall(nr) || matches!(nr, 202 | 242 | 207 | 212)
 }
 
 use alloc::collections::VecDeque;

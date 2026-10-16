@@ -46,7 +46,7 @@ use carrick_sched_core::{
 };
 use core::{
     num::{NonZeroU32, NonZeroU64},
-    sync::atomic::Ordering,
+    sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
 
@@ -58,6 +58,7 @@ pub enum NativeResume {
     Left(Option<LinuxWaitStatus>),
     Invalid,
 }
+static NATIVE_SUSPEND_MASKS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 const LOCK_SPINS: u32 = 100_000;
 
@@ -713,6 +714,11 @@ struct Graph<'a, M: Clone, C: ProcessContext> {
     uts: carrick_personality_linux::sysinfo::LinuxUtsname,
     ipc: Arc<SpinLock<IpcNamespace>>,
 }
+impl<'a, M: Clone, C: ProcessContext> Drop for Graph<'a, M, C> {
+    fn drop(&mut self) {
+        NATIVE_SUSPEND_MASKS.fetch_sub(self.suspend_masks.len(), Ordering::Release);
+    }
+}
 pub struct NativeProcessRuntime<'a, M: Clone, C: ProcessContext> {
     graph: SpinLock<Graph<'a, M, C>>,
     zone: &'a ZoneTables<C>,
@@ -1258,6 +1264,23 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
     /// authority used by the delivery owner; a stale record is never treated
     /// as an empty signal set.
     pub fn signal_checkpoint_needed(&self, zone: &ZoneTables<C>, record: RecordRef) -> bool {
+        if NATIVE_SUSPEND_MASKS.load(Ordering::Acquire) == 0 && signal_record_exists(zone, record) {
+            let control_address = zone.record(record.id).identity().control_slot;
+            if control_address != 0 {
+                // SAFETY: an authenticated live or host-owned zone record
+                // retains its published control slot in lifecycle custody.
+                let control = unsafe { &*(control_address as *const ThreadControlSlot) };
+                if control.native_signal_owner() && control.zone_record() == Some(record) {
+                    let pending = super::native_process_signals::pending_summary_word();
+                    let blocked = control.blocked().0;
+                    let forced = carrick_signal_core::policy::Signal::SEGV.bit()
+                        | carrick_signal_core::policy::Signal::KILL.bit();
+                    if pending & (!blocked | forced) == 0 {
+                        return false;
+                    }
+                }
+            }
+        }
         let state = self.state.lock();
         let Some(key) = state.records.get(&Self::record_key(zone, record)) else {
             return true;
@@ -6497,11 +6520,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         mask: carrick_signal_core::policy::SigBlockMask,
         original: carrick_signal_core::policy::SigBlockMask,
     ) -> Result<bool, carrick_syscall_abi::LinuxErrno> {
-        self.runtime
+        if self
+            .runtime
             .graph
             .lock()
             .suspend_masks
-            .insert(self.record, original);
+            .insert(self.record, original)
+            .is_none()
+        {
+            NATIVE_SUSPEND_MASKS.fetch_add(1, Ordering::Release);
+        }
         loop {
             let graph = self.runtime.graph.lock();
             let row = graph
@@ -6529,14 +6557,27 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Ok(true) => return Ok(true),
                 Ok(false) => continue,
                 Err(error) => {
-                    self.runtime.graph.lock().suspend_masks.remove(&self.record);
+                    if self
+                        .runtime
+                        .graph
+                        .lock()
+                        .suspend_masks
+                        .remove(&self.record)
+                        .is_some()
+                    {
+                        NATIVE_SUSPEND_MASKS.fetch_sub(1, Ordering::Release);
+                    }
                     return Err(carrick_syscall_abi::LinuxErrno::new(-error.errno() as i32));
                 }
             }
         }
     }
     fn take_suspend_mask(&mut self) -> Option<carrick_signal_core::policy::SigBlockMask> {
-        self.runtime.graph.lock().suspend_masks.remove(&self.record)
+        let old = self.runtime.graph.lock().suspend_masks.remove(&self.record);
+        if old.is_some() {
+            NATIVE_SUSPEND_MASKS.fetch_sub(1, Ordering::Release);
+        }
+        old
     }
 
     fn take_deliverable(

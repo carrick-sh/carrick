@@ -350,9 +350,10 @@ impl NativeSignalFixture {
             !self.task.linux.has_pending_host_work(),
             "host work blocks signal delivery"
         );
-        assert!(
+        assert_eq!(
             entry.signal_checkpoint_needed(),
-            "admitted signal is not pending for owner"
+            drained != 0,
+            "native checkpoint must match admitted signal work"
         );
         assert!(matches!(
             carrick_personality_linux::signal::ProcessSignals::rt_sigaction(
@@ -400,6 +401,9 @@ impl crate::personality::signal_delivery::SignalMachine<ParkedContextWords>
     fn restart_forwarded(&self, frame: &mut carrick_el1_abi::TrapFrame) -> Option<bool> {
         crate::personality::arm_signal::restart_forwarded_frame(frame)
     }
+    fn retry_spurious_forwarded(&self, frame: &mut carrick_el1_abi::TrapFrame) -> Option<bool> {
+        crate::personality::arm_signal::retry_spurious_forwarded_frame(frame)
+    }
     fn group_exit_custody(
         &self,
         _: &CurrentTask,
@@ -444,4 +448,72 @@ impl carrick_personality_linux::signal::SignalBackend for HostArmBackend {
     ) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, Self::Error> {
         Err(crate::isa::ArchError::Unbound)
     }
+}
+
+#[test]
+fn serial_host_empty_signal_checkpoint_takes_no_registry_or_graph_lock() {
+    use carrick_core_abi::{EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration};
+    let binding = ExecutionBinding {
+        task: EntryTaskKey::from_raw(123_450),
+        generation: EntryGeneration::from_raw(11),
+        mm: EntryMmKey::from_raw(1),
+        thread_generation: EntryThreadGeneration::from_raw(101),
+    };
+    let fixture = NativeSignalFixture::new(binding, EntryTaskKey::from_raw(123_450));
+    let registry_guard = fixture.registry.state.lock();
+    let graph_guard = fixture.runtime.graph.lock();
+    std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::channel();
+        let fixture = &fixture;
+        scope.spawn(move || {
+            let needed = fixture
+                .registry
+                .signal_checkpoint_needed(fixture.zone, fixture.record);
+            let _ = send.send(needed);
+        });
+        let without_locks = receive.recv_timeout(std::time::Duration::from_secs(5)).ok();
+        drop(graph_guard);
+        drop(registry_guard);
+        assert_eq!(
+            without_locks,
+            Some(false),
+            "empty IRQ checkpoint acquired an owner lock"
+        );
+    });
+
+    let signal = carrick_signal_core::policy::Signal::from_number(10).unwrap();
+    fixture
+        .control
+        .init_blocked(carrick_el1_abi::BlockedMask(signal.bit()));
+    let signals = fixture.runtime.current_signals(fixture.task).unwrap();
+    let process = fixture.runtime.graph.lock().root_key;
+    signals.enqueue(process, signal, None).unwrap();
+    let registry_guard = fixture.registry.state.lock();
+    let graph_guard = fixture.runtime.graph.lock();
+    std::thread::scope(|scope| {
+        let (send, receive) = std::sync::mpsc::channel();
+        let fixture = &fixture;
+        scope.spawn(move || {
+            let needed = fixture
+                .registry
+                .signal_checkpoint_needed(fixture.zone, fixture.record);
+            let _ = send.send(needed);
+        });
+        let without_locks = receive.recv_timeout(std::time::Duration::from_secs(5)).ok();
+        drop(graph_guard);
+        drop(registry_guard);
+        assert_eq!(
+            without_locks,
+            Some(false),
+            "blocked pending signal acquired an owner lock"
+        );
+    });
+    fixture
+        .control
+        .init_blocked(carrick_el1_abi::BlockedMask(0));
+    assert!(
+        fixture
+            .registry
+            .signal_checkpoint_needed(fixture.zone, fixture.record)
+    );
 }

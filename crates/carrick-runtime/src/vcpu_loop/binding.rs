@@ -932,8 +932,7 @@ where
         match prepared {
             quiesce::PreparedInProcessFork::Complete(Some(value)) => {
                 if frame.is_some() {
-                    self.state
-                        .complete_returned(engine, &self.kernel.reporter, value)?;
+                    self.state.complete_returned(engine, &self.kernel, value)?;
                 }
                 if frame.is_none() {
                     return self.finish_control_quantum(engine, control, deferred_resume_blocked);
@@ -3031,15 +3030,12 @@ where
         let (completed_internal_tid, completed_visible_tid, completed_errno) = match spawned {
             threads::CloneThreadSpawn::Started { internal, visible } => {
                 self.state
-                    .complete_returned(engine, &self.kernel.reporter, i64::from(visible))?;
+                    .complete_returned(engine, &self.kernel, i64::from(visible))?;
                 (internal.raw(), visible, 0)
             }
             threads::CloneThreadSpawn::Errno(errno) => {
-                self.state.complete_returned(
-                    engine,
-                    &self.kernel.reporter,
-                    errno.guest_retval(),
-                )?;
+                self.state
+                    .complete_returned(engine, &self.kernel, errno.guest_retval())?;
                 (
                     self.state.this_tid.raw(),
                     self.state.this_tid.raw(),
@@ -3448,8 +3444,7 @@ where
                     .ok_or_else(|| {
                         RuntimeError::Configuration("owner read return overflow".to_owned())
                     })?;
-                self.state
-                    .complete_returned(engine, &self.kernel.reporter, value)?;
+                self.state.complete_returned(engine, &self.kernel, value)?;
                 self.state.trace_syscall_return(self.traps, Some(value));
                 // Self-directed signals (e.g. raise(SIGABRT)) posted during syscall handling must be serviced before returning to guest EL0, otherwise the thread resumes execution and runs subsequent instructions (like _exit(99)) before any asynchronous kick can arrive.
                 let context = self
@@ -3478,9 +3473,7 @@ where
                 executor::ExecutorExit::Syscall
             }
             DispatchOutcome::Errno { errno } => {
-                let value = self
-                    .state
-                    .complete_errno(engine, &self.kernel.reporter, errno)?;
+                let value = self.state.complete_errno(engine, &self.kernel, errno)?;
                 self.state.trace_syscall_return(self.traps, Some(value));
                 let context = self
                     .state
@@ -3508,8 +3501,7 @@ where
                 executor::ExecutorExit::Syscall
             }
             DispatchOutcome::SchedulerYield => {
-                self.state
-                    .complete_returned(engine, &self.kernel.reporter, 0)?;
+                self.state.complete_returned(engine, &self.kernel, 0)?;
                 // Linux delivers pending signals on the return-to-user edge of
                 // EVERY syscall — sched_yield included. This arm skipped the
                 // service, so a thread looping on sched_yield NEVER took a
@@ -3757,19 +3749,13 @@ where
                 let (completed_internal_tid, completed_visible_tid, completed_errno) = match spawned
                 {
                     threads::CloneThreadSpawn::Started { internal, visible } => {
-                        self.state.complete_returned(
-                            engine,
-                            &self.kernel.reporter,
-                            i64::from(visible),
-                        )?;
+                        self.state
+                            .complete_returned(engine, &self.kernel, i64::from(visible))?;
                         (internal.raw(), visible, 0)
                     }
                     threads::CloneThreadSpawn::Errno(errno) => {
-                        self.state.complete_returned(
-                            engine,
-                            &self.kernel.reporter,
-                            errno.guest_retval(),
-                        )?;
+                        self.state
+                            .complete_returned(engine, &self.kernel, errno.guest_retval())?;
                         (
                             self.state.this_tid.raw(),
                             self.state.this_tid.raw(),
@@ -3839,9 +3825,7 @@ where
                 if tso && let Some(binding) = control.binding {
                     binding.withdraw_address_space();
                 }
-                let value = self
-                    .state
-                    .complete_returned(engine, &self.kernel.reporter, 0)?;
+                let value = self.state.complete_returned(engine, &self.kernel, 0)?;
                 let context = self
                     .state
                     .service_kernel_context
@@ -3935,8 +3919,7 @@ where
                     target.location,
                     count,
                 );
-                self.state
-                    .complete_returned(engine, &self.kernel.reporter, value)?;
+                self.state.complete_returned(engine, &self.kernel, value)?;
                 self.state.trace_syscall_return(self.traps, Some(value));
                 let context = self
                     .state
@@ -3997,8 +3980,7 @@ where
                     requeued,
                 );
                 let value = i64::from(woken + requeued);
-                self.state
-                    .complete_returned(engine, &self.kernel.reporter, value)?;
+                self.state.complete_returned(engine, &self.kernel, value)?;
                 self.state.trace_syscall_return(self.traps, Some(value));
                 let context = self
                     .state
