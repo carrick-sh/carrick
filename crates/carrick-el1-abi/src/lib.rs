@@ -3015,6 +3015,20 @@ pub fn frame_grant_residency_host() -> Option<&'static FrameGrantResidencyTable>
     })
 }
 
+/// Host view of the retained external-signal ingress reservation. The region
+/// owner initializes the queue before publishing the aperture pointer.
+pub fn signal_ingress_host() -> Option<&'static SharedSignalIngressQueue> {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 {
+        return None;
+    }
+    // SAFETY: the region owner keeps this mapping alive until it clears the
+    // aperture pointer; the queue uses atomic slot publication throughout.
+    Some(unsafe {
+        &*((ptr + EL1_SIGNAL_INGRESS_OFFSET as usize) as *const SharedSignalIngressQueue)
+    })
+}
+
 /// Guest view of the shared metadata mailbox. Call only while executing in
 /// the installed Carrick EL1 image.
 #[cfg(target_os = "none")]
