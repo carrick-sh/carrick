@@ -9,7 +9,7 @@ structural_budgets = []
 rationale = "The exact-generation zombie is the single reap authority. A consuming wait adds its own process CPU, including threads, plus already-reaped descendants to the parent once. The returned receipt carries that same total. Observing a zombie and repeating a consumed wait never charge the parent. Rendering two timevals adds constant work and no population scan. The VM-free binding asserts exact CPU totals and exactly-once charge directly."
 
 [bindings]
-vm_free = "carrick-kernel::dispatch::proc::kernel_process_dispatch_tests::wait4_preserves_subtree_usage_and_charges_children_once; carrick-el1::personality::process_owner::tests::pending_reparented_child_charges_adopter_once_and_never_departed_parent"
+vm_free = "carrick-kernel::dispatch::proc::kernel_process_dispatch_tests::wait4_preserves_subtree_usage_and_charges_children_once; carrick-el1::personality::process_owner::tests::pending_reparented_child_charges_adopter_once_and_never_departed_parent; carrick-el1::cow::tests::native_child_tid_copy_supplies_its_empty_cow_pool_before_writing (x86 native user-write adapter now invokes the same neutral supply/continuation owner; this binding is limited to the moved copy path and does not promote unrelated wait, completion, or file-region acceptance)"
 embed = "carrick-conformance-next::generic_probe_shard_1 filtered to childrusage, arm64 gnu and musl"
 
 [bindings.unresolved]

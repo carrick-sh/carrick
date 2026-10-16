@@ -17,7 +17,7 @@ scale_points = [1, 2, 4]
 rationale = "A zombie process remains a member of its process group until reaped, allowing waitpid/wait4 with negative PID to reap it; waiting on a nonexistent process group returns ECHILD."
 
 [bindings]
-vm_free = "carrick-kernel-example::semantics::pgrp::zombie_keeps_process_group_membership_until_reaped; carrick-el1::personality::process_owner::tests::pending_reparented_zombie_keeps_process_group_until_adopter_reaps"
+vm_free = "carrick-kernel-example::semantics::pgrp::zombie_keeps_process_group_membership_until_reaped; carrick-el1::personality::process_owner::tests::pending_reparented_zombie_keeps_process_group_until_adopter_reaps; carrick-el1::cow::tests::native_child_tid_copy_supplies_its_empty_cow_pool_before_writing (x86 native user-write adapter now invokes the same neutral supply/continuation owner; this binding is limited to the moved copy path and does not promote unrelated wait, completion, or file-region acceptance)"
 embed = "carrick-embed::wait_process_group"
 docker = "probe:kernelidentity"
 ecosystem = ["ltp:waitpid04", "ltp:wait401"]
