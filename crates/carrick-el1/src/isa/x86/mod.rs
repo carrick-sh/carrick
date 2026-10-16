@@ -6,10 +6,10 @@ use super::ArchError;
 pub mod context;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod fork_mm;
+pub mod live_context;
 pub use super::x86_initial_mm as initial_mm;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub mod interrupt;
-pub mod live_context;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(super) mod mmu;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]

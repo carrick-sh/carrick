@@ -56,6 +56,14 @@ pub fn settle_el1_boundary(
     boundary
 }
 
+/// Service host work after the source boundary consumes its task's flags.
+/// Ledger publication precedes IPC, recall and inotify wake delivery. An
+/// owner that publishes more work while this runs marks a later boundary.
+pub fn settle_host_work_boundary(kernel: &crate::kernel::Kernel, served: bool, pending: bool) {
+    kernel.settle_thread_ledger();
+    deliver_boundary_wakes(kernel, served, pending);
+}
+
 /// Publish wakes after the stopped carrier has consumed its exact task's
 /// completed-work and pending-work flags. Both ARM mailboxes and x86 CPL0
 /// work doorbells use this host side of the in-zone completion boundary.

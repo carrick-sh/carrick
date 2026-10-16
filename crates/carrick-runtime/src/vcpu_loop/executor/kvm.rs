@@ -705,19 +705,16 @@ impl PersistentExecutor for KvmPersistentExecutor {
                 TrapError::Hypervisor(format!("KVM stopped run boundary: {error}"))
             })?;
             match &stopped.exit {
-                CarrierRunExit::PhysicalDoorbell { port, .. } => {
+                CarrierRunExit::PhysicalDoorbell { .. } => {
                     let binding = self.binding.as_ref().ok_or_else(|| {
                         TrapError::Hypervisor("KVM doorbell lost task binding".into())
                     })?;
                     let kernel = binding.kernel_binding.kernel();
-                    if *port == carrick_x86::cpl0_entry::WORK_PORT {
-                        kernel.settle_thread_ledger();
-                    }
                     let status = self.physical.service_physical_doorbell(
                         task,
                         &stopped.exit,
                         |served, pending| {
-                            carrick_kernel::el1_delegation::deliver_boundary_wakes(
+                            carrick_kernel::el1_delegation::settle_host_work_boundary(
                                 kernel, served, pending,
                             );
                         },
@@ -1121,19 +1118,10 @@ impl PersistentExecutor for KvmPersistentExecutor {
         match self.physical.run_idle_peer()? {
             exit @ CarrierRunExit::PhysicalDoorbell { .. } => {
                 let kernel = self.scheduler.kernel();
-                if matches!(
-                    exit,
-                    CarrierRunExit::PhysicalDoorbell {
-                        port: carrick_x86::cpl0_entry::WORK_PORT,
-                        ..
-                    }
-                ) {
-                    kernel.settle_thread_ledger();
-                }
                 if let Some(status) =
                     self.physical
                         .service_idle_peer_doorbell(&exit, |served, pending| {
-                            carrick_kernel::el1_delegation::deliver_boundary_wakes(
+                            carrick_kernel::el1_delegation::settle_host_work_boundary(
                                 kernel, served, pending,
                             );
                         })?
