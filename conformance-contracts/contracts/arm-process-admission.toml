@@ -25,7 +25,11 @@ vm_free = "carrick-el1::personality::aarch64_process_tests::arm_root_setup_enter
 # arm_root_entry_refuses_wrong_binding_and_root_incarnation
 # arm_born_thread_uses_native_owner_without_an_execution_generation; arm_returned_process_call_is_not_a_zone_park
 # carrick-vmm-hvf::metadata_grant::tests::authenticated_root_exit_is_terminal; root_terminal_authentication_needs_no_parked_record_or_stock_row
-# carrick-vmm-hvf::fork_stock::tests::dispatcher_root_exit_success_and_stale_refusal
+# carrick-vmm-hvf::fork_stock::tests::native_stock_crossing_reads_kernel_stack_and_current_execution
+# authenticates retained stack records against the live CPU/MM/root, with typed
+# stale refusals and exactly-once abort through the shared HAL owner.
+# carrick-runtime::hvpatch::stage1_mm::tests::native_stock_reservation_excludes_host_roots_until_backing_retires
+# proves the production slot reservation excludes simultaneous host allocation.
 # The EL1 ABI hash export is guest-image-only. That guard fixes the main
 # host-test duplicate symbol (#485) without changing ARM root admission;
 # the full 500-test EL1 host-test lib, including the admission witness above,

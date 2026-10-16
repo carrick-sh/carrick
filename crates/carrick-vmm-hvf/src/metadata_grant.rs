@@ -32,30 +32,23 @@ fn terminal_child_execution(
     phase: carrick_sched_core::TerminalPhase,
 ) -> Option<crate::fork_stock::GrantExecution> {
     let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
-    let zone = carrick_el1_abi::zone_tables()?;
-    let gpa = carrick_el1_abi::EL1_CURRENT_TASKS_BASE.checked_add(
-        u64::from(cpu.raw()) * core::mem::size_of::<carrick_el1_abi::CurrentTask>() as u64,
-    )?;
-    let pointer = crate::fork_stock::ForkStockHostCustody::resolve_record_ptr::<
-        carrick_el1_abi::CurrentTask,
-    >(custody, gpa)
-    .ok()?;
-    // SAFETY: this stopped CPU owns its fixed CurrentTask slot.
-    let task = unsafe { &*pointer };
+    let region = retained_abi_region()?;
+    let (task, zone) = stopped_records(region, cpu)?;
     let binding = carrick_core::entry::binding(&task.execution, &task.mm);
     let source = carrick_el1_abi::BornInZoneSource { zone, slot };
     if !carrick_core::entry::terminal_matches(binding, source, phase) {
         return None;
     }
     let stock = custody.fork_stock.lock();
-    let mm = carrick_sched_core::AddressSpaceKey::from_raw(binding.mm.raw())?;
-    let context = *stock.committed_children.get(&mm)?;
-    if !stock.committed_asids.contains_key(&binding.mm.raw())
-        || stock.retired_children.contains(&mm)
-            != (phase == carrick_sched_core::TerminalPhase::Retired)
-    {
+    let mm = carrick_el1_abi::ReservationMm::new(binding.mm.raw())?;
+    if stock.owner.is_quarantined(mm) != (phase == carrick_sched_core::TerminalPhase::Retired) {
         return None;
     }
+    let context = carrick_guest_arch::AddressContext {
+        root: stock.owner.child_root(mm)?,
+        mm: carrick_guest_arch::MmGeneration::new(core::num::NonZeroU64::new(mm.raw())?),
+        generation: task.root_generation()?,
+    };
     Some(crate::fork_stock::GrantExecution::new(
         cpu, binding, context,
     ))
@@ -114,9 +107,9 @@ fn service_terminal_operation(
     {
         return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
     }
-    let Ok(pointer) = crate::fork_stock::ForkStockHostCustody::resolve_record_ptr::<
-        NativeChildRetire,
-    >(custody, args[0]) else {
+    let Some(pointer) = retained_abi_region().and_then(|region| {
+        abi_stack_ptr::<NativeChildRetire>(region, cpu, carrick_guest_arch::KernelVa::new(args[0]))
+    }) else {
         return [METADATA_GRANT_ERR_INVALID, 0, 0, 0];
     };
     // SAFETY: the synchronous crossing retains the caller's aligned wire record.
@@ -124,7 +117,8 @@ fn service_terminal_operation(
     if custody
         .fork_stock
         .lock()
-        .service_child_retire(execution, retire)
+        .owner
+        .retire_child(execution, retire)
         .is_err()
     {
         return [METADATA_GRANT_ERR_DENIED, 0, 0, 0];
@@ -922,117 +916,6 @@ pub(crate) fn service_metadata_operation(
             BYTES_RETURNED.fetch_add(size as u64, Ordering::Relaxed);
         }
         Ok([status, 0, 0, 0])
-    } else if op == GRANT_OP_FORK_STOCK {
-        let record_gpa = arg1;
-        if !record_gpa.is_multiple_of(64) {
-            return Ok([METADATA_GRANT_ERR_ALIGNMENT, 0, 0, 0]);
-        }
-        let Ok(record_ptr) =
-            crate::fork_stock::ForkStockHostCustody::resolve_record_ptr::<u64>(custody, record_gpa)
-        else {
-            return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
-        };
-        let tag = unsafe { *record_ptr };
-
-        // Foreign or out-of-range guest-supplied CPU index is refused immediately.
-        if arg2 != 0 && arg2 != cpu.raw() as u64 {
-            match ForkStockKind::decode(tag) {
-                Some(ForkStockKind::Loan) => {
-                    let exchange = unsafe { &mut *record_ptr.cast::<ForkStockExchange>() };
-                    exchange.refuse(ForkStockRefusal::Stale);
-                }
-                Some(ForkStockKind::Commit | ForkStockKind::Abort) => {
-                    let settlement = unsafe { &mut *record_ptr.cast::<ForkStockSettlement>() };
-                    settlement.refuse(ForkStockRefusal::Stale);
-                }
-                None => {}
-            }
-            return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
-        }
-
-        let execution = custody.fork_stock.lock().active_execution_for_cpu(cpu);
-
-        match ForkStockKind::decode(tag) {
-            Some(ForkStockKind::Loan) => {
-                let exchange = unsafe { &mut *record_ptr.cast::<ForkStockExchange>() };
-                let Some(execution) = execution else {
-                    exchange.refuse(ForkStockRefusal::Stale);
-                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
-                };
-                let mut fork_stock = custody.fork_stock.lock();
-                let mut ledger = custody.el1_frame_grants.lock();
-                match fork_stock.service_loan(&mut ledger, execution, exchange) {
-                    Ok(_loan) => Ok([METADATA_GRANT_SUCCESS, 0, 0, 0]),
-                    Err(_refusal) => Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]),
-                }
-            }
-            Some(ForkStockKind::Commit | ForkStockKind::Abort) => {
-                let settlement = unsafe { &mut *record_ptr.cast::<ForkStockSettlement>() };
-                let Some(execution) = execution else {
-                    settlement.refuse(ForkStockRefusal::Stale);
-                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
-                };
-                let is_resolvable = |pages: &[carrick_guest_arch::RootGpa]| -> bool {
-                    for page in pages {
-                        if crate::fork_stock::ForkStockHostCustody::resolve_record_ptr::<u8>(
-                            custody,
-                            page.address().raw(),
-                        )
-                        .is_err()
-                        {
-                            return false;
-                        }
-                    }
-                    true
-                };
-                let is_clean = |pages: &[carrick_guest_arch::RootGpa]| -> bool {
-                    for page in pages {
-                        match crate::fork_stock::ForkStockHostCustody::resolve_record_ptr::<u8>(
-                            custody,
-                            page.address().raw(),
-                        ) {
-                            Ok(ptr) => {
-                                let slice = unsafe { core::slice::from_raw_parts(ptr, 4096) };
-                                if slice.iter().any(|&b| b != 0) {
-                                    return false;
-                                }
-                            }
-                            Err(_) => return false,
-                        }
-                    }
-                    true
-                };
-                let mut fork_stock = custody.fork_stock.lock();
-                let mut ledger = custody.el1_frame_grants.lock();
-                match fork_stock.service_settlement(
-                    &mut ledger,
-                    execution,
-                    settlement,
-                    is_resolvable,
-                    is_clean,
-                ) {
-                    Ok(()) => Ok([METADATA_GRANT_SUCCESS, 0, 0, 0]),
-                    Err(e) => {
-                        let refusal = match e {
-                            crate::fork_stock::ForkStockServiceError::StaleExecution => {
-                                ForkStockRefusal::Stale
-                            }
-                            crate::fork_stock::ForkStockServiceError::NoPendingLoan
-                            | crate::fork_stock::ForkStockServiceError::LoanMismatch
-                            | crate::fork_stock::ForkStockServiceError::ExposedDirtyTable
-                            | crate::fork_stock::ForkStockServiceError::InvalidRecord
-                            | crate::fork_stock::ForkStockServiceError::MemoryAccessFailed
-                            | crate::fork_stock::ForkStockServiceError::Asid(_) => {
-                                ForkStockRefusal::Invalid
-                            }
-                        };
-                        settlement.refuse(refusal);
-                        Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0])
-                    }
-                }
-            }
-            None => Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]),
-        }
     } else if op == GRANT_OP_ROOT_EXIT {
         let record_va = carrick_guest_arch::KernelVa::new(arg1);
         if !record_va.raw().is_multiple_of(64) {
@@ -1267,19 +1150,127 @@ pub(crate) fn service_native_fork_stock(
     cpu: carrick_guest_arch::CpuId,
     address: carrick_guest_arch::KernelVa,
     requested_cpu: u64,
-    _ttbr0: u64,
-    _region: &[u8],
+    ttbr0: u64,
+    region: &[u8],
 ) -> Result<[u64; 4], TrapError> {
-    service_metadata_operation(
-        custody,
-        generation,
-        cpu,
-        None,
-        GRANT_OP_FORK_STOCK,
-        address.raw(),
-        requested_cpu,
+    use crate::fork_stock::ForkStockHostCustody;
+    if !request_has_live_vm(custody, generation) {
+        return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+    }
+    let Some(tag) = abi_stack_ptr::<u64>(region, cpu, address) else {
+        return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
+    };
+    // SAFETY: complete aligned tag on this stopped CPU's retained stack.
+    let kind = ForkStockKind::decode(unsafe { *tag });
+    let execution = (requested_cpu == u64::from(cpu.raw()))
+        .then(|| stopped_execution(region, cpu, ttbr0))
+        .flatten();
+    let reply = match kind {
+        Some(ForkStockKind::Loan) => {
+            let Some(pointer) = abi_stack_ptr::<ForkStockExchange>(region, cpu, address) else {
+                return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
+            };
+            // SAFETY: the synchronous crossing exclusively retains this complete wire record.
+            let exchange = unsafe { &mut *pointer };
+            let Some(execution) = execution else {
+                exchange.refuse(ForkStockRefusal::Stale);
+                return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+            };
+            let mut stock = custody.fork_stock.lock();
+            let mut ledger = custody.el1_frame_grants.lock();
+            stock
+                .owner
+                .loan(&mut *ledger, execution, exchange, |life| {
+                    lifecycle_window(custody, life).is_some_and(|window| window.is_zero(life))
+                })
+                .is_ok()
+        }
+        Some(ForkStockKind::Commit | ForkStockKind::Abort) => {
+            let Some(pointer) = abi_stack_ptr::<ForkStockSettlement>(region, cpu, address) else {
+                return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
+            };
+            // SAFETY: the same full stack-record custody as the loan.
+            let settlement = unsafe { &mut *pointer };
+            let Some(execution) = execution else {
+                settlement.refuse(ForkStockRefusal::Stale);
+                return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+            };
+            let mut stock = custody.fork_stock.lock();
+            let mut ledger = custody.el1_frame_grants.lock();
+            match stock.owner.settle(
+                &mut *ledger,
+                execution,
+                settlement,
+                |pages| {
+                    pages.iter().all(|page| {
+                        ForkStockHostCustody::physical_ptr::<[u8; 4096]>(custody, page.address())
+                            .is_ok()
+                    })
+                },
+                |pages| ForkStockHostCustody::tables_clean(custody, pages),
+                |life| lifecycle_window(custody, life).is_some_and(|window| window.clear(life)),
+            ) {
+                Ok(()) => true,
+                Err(error) => {
+                    settlement.refuse(
+                        if error == carrick_hal::fork_stock::ForkStockServiceError::StaleExecution {
+                            ForkStockRefusal::Stale
+                        } else {
+                            ForkStockRefusal::Invalid
+                        },
+                    );
+                    false
+                }
+            }
+        }
+        None => return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]),
+    };
+    Ok([
+        if reply {
+            METADATA_GRANT_SUCCESS
+        } else {
+            METADATA_GRANT_ERR_DENIED
+        },
         0,
-    )
+        0,
+        0,
+    ])
+}
+
+/// Dynamic metadata is explicitly identity-mapped by this module's extent
+/// owner. Validate that venue before projecting its KernelVa into that mapping.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn lifecycle_window(
+    custody: &crate::trap::CarrierVmCustody,
+    life: carrick_el1_abi::ForkLifecycleLoan,
+) -> Option<carrick_hal::fork_stock::LifecycleWindow> {
+    if carrick_el1_abi::ForkLifecycleLoan::new(life.page, life.controls)? != life {
+        return None;
+    }
+    let identity = custody.stage2_record_covering(
+        life.page.raw(),
+        core::mem::size_of::<carrick_el1_abi::ThreadLifecyclePage>(),
+    )?;
+    let state = custody.state.lock();
+    let record = state.stage2_records.get(&identity.record_id)?;
+    if record.snapshot.ipa < EL1_DYNAMIC_METADATA_BASE
+        || record
+            .snapshot
+            .ipa
+            .checked_add(record.snapshot.len as u64)?
+            > EL1_DYNAMIC_METADATA_BASE + EL1_DYNAMIC_METADATA_SIZE
+    {
+        return None;
+    }
+    let host = core::ptr::NonNull::new(record.snapshot.host_addr as *mut u8)?;
+    // SAFETY: retained metadata aperture backing owns the identity-mapped range.
+    Some(unsafe {
+        carrick_hal::fork_stock::LifecycleWindow::new(
+            host,
+            record.snapshot.ipa,
+            record.snapshot.len as u64,
+        )
+    })
 }
 
 /// Physical process crossings use HVC #6. Metadata allocation uses its mailbox.
@@ -1421,21 +1412,31 @@ fn root_stack_record(
     cpu: carrick_guest_arch::CpuId,
     address: carrick_guest_arch::KernelVa,
 ) -> Option<&NativeRootExit> {
+    let pointer = abi_stack_ptr::<NativeRootExit>(region, cpu, address)?;
+    // SAFETY: complete aligned immutable record on a retained stopped stack.
+    Some(unsafe { &*pointer })
+}
+
+/// Resolve only this CPU's complete aligned kernel-stack record. The address
+/// type cannot be passed to the physical table-frame resolver.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn abi_stack_ptr<T>(
+    region: &[u8],
+    cpu: carrick_guest_arch::CpuId,
+    address: carrick_guest_arch::KernelVa,
+) -> Option<*mut T> {
     let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
     let start =
         carrick_el1_abi::EL1_STACKS_BASE + u64::from(slot.raw()) * carrick_el1_abi::EL1_STACK_SIZE;
     let end = address
         .raw()
-        .checked_add(core::mem::size_of::<NativeRootExit>() as u64)?;
-    if address.raw() < start
+        .checked_add(core::mem::size_of::<T>() as u64)?;
+    if region.len() != carrick_el1_abi::EL1_REGION_SIZE as usize
+        || address.raw() < start
         || end > start + carrick_el1_abi::EL1_STACK_SIZE
         || !address
             .raw()
-            .is_multiple_of(core::mem::align_of::<NativeRootExit>() as u64)
-        || !region
-            .as_ptr()
-            .addr()
-            .is_multiple_of(core::mem::align_of::<NativeRootExit>())
+            .is_multiple_of(core::mem::align_of::<T>() as u64)
     {
         return None;
     }
@@ -1445,10 +1446,69 @@ fn root_stack_record(
             .checked_sub(carrick_el1_abi::EL1_REGION_BASE)?,
     )
     .ok()?;
-    let bytes = region.get(offset..offset.checked_add(core::mem::size_of::<NativeRootExit>())?)?;
-    // SAFETY: checked alignment, bounds and initialized ABI stack storage; the
-    // stopped CPU and retained region keep this wire record frozen for the call.
-    Some(unsafe { &*bytes.as_ptr().cast::<NativeRootExit>() })
+    let bytes = region.get(offset..offset.checked_add(core::mem::size_of::<T>())?)?;
+    if !bytes
+        .as_ptr()
+        .addr()
+        .is_multiple_of(core::mem::align_of::<T>())
+    {
+        return None;
+    }
+    Some(bytes.as_ptr().cast_mut().cast())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn retained_abi_region() -> Option<&'static [u8]> {
+    let pointer = carrick_el1_abi::get_el1_region_host_ptr();
+    if pointer == 0 {
+        return None;
+    }
+    // SAFETY: carrier retains the initialized ABI mapping through the synchronous trap.
+    Some(unsafe {
+        core::slice::from_raw_parts(
+            pointer as *const u8,
+            carrick_el1_abi::EL1_REGION_SIZE as usize,
+        )
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn stopped_execution(
+    region: &[u8],
+    cpu: carrick_guest_arch::CpuId,
+    ttbr0: u64,
+) -> Option<crate::fork_stock::GrantExecution> {
+    let (task, zone) = stopped_records(region, cpu)?;
+    root_execution(cpu, task, zone, ttbr0)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn stopped_records(
+    region: &[u8],
+    cpu: carrick_guest_arch::CpuId,
+) -> Option<(&carrick_el1_abi::CurrentTask, &carrick_el1_abi::ZoneTables)> {
+    let slot = carrick_guest_arch::SlotId::from_index(cpu.raw() as usize)?;
+    if region.len() != carrick_el1_abi::EL1_REGION_SIZE as usize
+        || !region
+            .as_ptr()
+            .addr()
+            .is_multiple_of(core::mem::align_of::<carrick_el1_abi::ZoneTables>())
+    {
+        return None;
+    }
+    let task_offset = carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize
+        + usize::from(slot.raw()) * core::mem::size_of::<carrick_el1_abi::CurrentTask>();
+    let task = region.get(
+        task_offset
+            ..task_offset.checked_add(core::mem::size_of::<carrick_el1_abi::CurrentTask>())?,
+    )?;
+    let zone = region.get(
+        carrick_el1_abi::EL1_ZONE_OFFSET as usize
+            ..(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+                .checked_add(core::mem::size_of::<carrick_el1_abi::ZoneTables>())?,
+    )?;
+    // SAFETY: aligned complete initialized ABI objects retained by this stopped CPU.
+    Some(unsafe { (&*task.as_ptr().cast(), &*zone.as_ptr().cast()) })
 }
 
 /// Root retirement has released its record. Authenticate the stopped lane

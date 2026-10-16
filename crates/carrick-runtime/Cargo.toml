@@ -72,6 +72,7 @@ carrick-el1 = { path = "../carrick-el1" }
 carrick-personality-linux = { path = "../carrick-personality-linux" }
 carrick-core = { path = "../carrick-core" }
 carrick-core-abi = { path = "../carrick-core-abi" }
+carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-hal = { path = "../carrick-hal" }
 carrick-kernel = { path = "../carrick-kernel" }
 carrick-portable = { path = "../carrick-portable" }
@@ -154,7 +155,6 @@ applevisor-sys.workspace = true
 mach2.workspace = true
 
 [dev-dependencies]
-carrick-guest-arch = { path = "../carrick-guest-arch" }
 wait-timeout = "0.2.1"
 loom = "=0.7.2"
 carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }
