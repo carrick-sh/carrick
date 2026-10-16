@@ -254,10 +254,19 @@ struct ProcessPhysicalRetirementState {
 #[derive(Default)]
 struct ProcessPhysicalRetirementPublication {
     exit_started: bool,
-    completions: Option<Vec<continuation::LogicalJobCompletion>>,
+    completions:
+        carrick_core::terminal::ProcessPhysicalPublication<Vec<continuation::LogicalJobCompletion>>,
 }
 
 impl ProcessPhysicalRetirement {
+    pub(crate) fn failure_needs_publication(&self) -> bool {
+        self.state
+            .publication
+            .lock()
+            .completions
+            .failure_needs_publication()
+    }
+
     pub(crate) fn begin_process_exit(&self) {
         let mut publication = self.state.publication.lock();
         publication.exit_started = true;
@@ -275,12 +284,11 @@ impl ProcessPhysicalRetirement {
             ));
         }
         let mut publication = self.state.publication.lock();
-        if publication.completions.is_some() {
+        if publication.completions.publish(completions).is_err() {
             return Err(RuntimeError::Configuration(
                 "HVPatch process physical-retirement receipt was published twice".to_owned(),
             ));
         }
-        publication.completions = Some(completions);
         self.state.changed.notify_all();
         Ok(())
     }
@@ -292,7 +300,7 @@ impl ProcessPhysicalRetirement {
     pub(crate) fn wait_if_exit_started_or_published(&self) -> Result<(), RuntimeError> {
         let must_wait = {
             let publication = self.state.publication.lock();
-            publication.exit_started || publication.completions.is_some()
+            publication.exit_started || publication.completions.published().is_some()
         };
         if must_wait { self.wait() } else { Ok(()) }
     }
@@ -304,7 +312,7 @@ impl ProcessPhysicalRetirement {
         let completions = {
             let mut publication = self.state.publication.lock();
             let mut deadline = None;
-            while publication.completions.is_none() {
+            while publication.completions.published().is_none() {
                 if !publication.exit_started {
                     self.state.changed.wait(&mut publication);
                     continue;
@@ -322,7 +330,7 @@ impl ProcessPhysicalRetirement {
                     .changed
                     .wait_for(&mut publication, remaining)
                     .timed_out()
-                    && publication.completions.is_none()
+                    && publication.completions.published().is_none()
                 {
                     return Err(RuntimeError::CarrierFailed(
                         "HVPatch terminal physical-retirement receipt was not published".to_owned(),
@@ -331,7 +339,7 @@ impl ProcessPhysicalRetirement {
             }
             publication
                 .completions
-                .as_ref()
+                .published()
                 .unwrap_or_else(|| carrick_fatal!("kernel::terminal_settlement", "A notified physical-retirement wait without its completion receipt is a torn terminal publication"))
                 .clone()
         };
