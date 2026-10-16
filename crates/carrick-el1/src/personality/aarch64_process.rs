@@ -1291,7 +1291,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                     publication: None,
                 },
             };
-            return owner
+            owner
                 .write_user_bytes(
                     UserWriteRequest {
                         handle,
@@ -1309,7 +1309,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                     UserWriteError::InvalidSource => NativeProcessError::Invalid,
                     UserWriteError::Fault => NativeProcessError::Fault,
                     UserWriteError::UnsupportedSupply => NativeProcessError::Unsupported,
-                });
+                })
         }
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         {
