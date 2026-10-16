@@ -957,6 +957,8 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// Exact authority captured at the current syscall boundary. Lifecycle
     /// outcomes consume it rather than recapturing a newer registry generation.
     pub(super) service_kernel_context: Option<carrick_kernel::kernel::KernelContext>,
+    /// Retains the exact external event while shared ingress has no capacity.
+    pub(super) external_signals: signal_ingress_producer::HostSignalIngressProducer,
     /// The zone key (address-space id) of the task this job has loaded,
     /// when the carrier runs the in-guest zone; refreshed from the loaded
     /// task binding at every poll ([`zone`]). It keys this job's IPC and
@@ -1059,6 +1061,7 @@ where
             linux_tid,
             fatal_image_generation,
             service_kernel_context: None,
+            external_signals: signal_ingress_producer::HostSignalIngressProducer::new(),
             zone_mm: None,
             pending_ipc_park: None,
             #[cfg(test)]
@@ -1085,6 +1088,25 @@ where
             thread_exit_retry_subscription: None,
             _engine: std::marker::PhantomData,
         }
+    }
+
+    fn publish_external_ingress(&mut self, kernel: &KernelState) -> Result<(), RuntimeError> {
+        let target = self
+            .service_kernel_context
+            .as_ref()
+            .and_then(signal_ingress_producer::HostIngressTarget::from_context);
+        if target.is_none() && self.external_signals.pending_event().is_none() {
+            return Ok(());
+        }
+        let queue = carrick_el1_abi::signal_ingress_host().ok_or_else(|| {
+            RuntimeError::Configuration("native signal ingress has no shared reservation".into())
+        })?;
+        self.external_signals
+            .publish(queue, target, |tid| {
+                kernel.dispatcher.host_signal.take_pending_for(tid)
+            })
+            .map_err(|error| RuntimeError::Configuration(format!("external ingress: {error:?}")))?;
+        Ok(())
     }
 
     #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]

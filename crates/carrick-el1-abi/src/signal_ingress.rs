@@ -13,7 +13,7 @@ use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Transport protocol for the shared ARM EL1 / x86 CPL0 ingress record.
-pub const SIGNAL_INGRESS_PROTOCOL: u64 = 3;
+pub const SIGNAL_INGRESS_PROTOCOL: u64 = 4;
 
 /// Shared queue capacity; event producers must retain ownership on fullness.
 pub const SIGNAL_INGRESS_CAPACITY: usize = 64;
@@ -34,6 +34,7 @@ pub const fn signal_ingress_offsets_hash() -> u64 {
         core::mem::offset_of!(SharedSignalIngressQueue, head) as u64,
         core::mem::offset_of!(SharedSignalIngressQueue, tail) as u64,
         core::mem::offset_of!(SharedSignalIngressQueue, drain_generation) as u64,
+        core::mem::offset_of!(SharedSignalIngressQueue, backpressure) as u64,
         core::mem::offset_of!(SharedSignalIngressQueue, slots) as u64,
     ];
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -188,6 +189,9 @@ pub struct SignalIngressQueue<const N: usize> {
     head: AtomicU64,
     tail: AtomicU64,
     drain_generation: AtomicU64,
+    /// Sticky until queue reset: a full admission needs a host boundary when
+    /// any guest consumer frees space. Only event drains pay that boundary.
+    backpressure: AtomicU64,
     slots: [SignalIngressSlot; N],
 }
 
@@ -213,6 +217,7 @@ impl<const N: usize> SignalIngressQueue<N> {
             core::ptr::addr_of_mut!((*ptr).head).write(AtomicU64::new(0));
             core::ptr::addr_of_mut!((*ptr).tail).write(AtomicU64::new(0));
             core::ptr::addr_of_mut!((*ptr).drain_generation).write(AtomicU64::new(0));
+            core::ptr::addr_of_mut!((*ptr).backpressure).write(AtomicU64::new(0));
             let slots = core::ptr::addr_of_mut!((*ptr).slots).cast::<SignalIngressSlot>();
             for index in 0..N {
                 slots.add(index).write(SignalIngressSlot {
@@ -232,6 +237,7 @@ impl<const N: usize> SignalIngressQueue<N> {
             head: AtomicU64::new(0),
             tail: AtomicU64::new(0),
             drain_generation: AtomicU64::new(0),
+            backpressure: AtomicU64::new(0),
             slots: core::array::from_fn(|index| SignalIngressSlot {
                 sequence: AtomicU64::new(index as u64),
                 record: UnsafeCell::new(MaybeUninit::uninit()),
@@ -243,16 +249,23 @@ impl<const N: usize> SignalIngressQueue<N> {
         self.drain_generation.load(Ordering::Acquire)
     }
 
+    /// A producer retained an owned admission after observing full capacity.
+    pub fn backpressure_waiting(&self) -> bool {
+        self.backpressure.load(Ordering::Acquire) != 0
+    }
+
     /// Capture the drain generation before attempting admission. A caller
     /// that parks on fullness retains the event and can compare this epoch
     /// after subscribing to the host wake source.
     pub fn admit(&self, event: ExternalSignalRecord) -> Result<(), SignalIngressAdmission> {
         let observed_drain = self.drain_generation();
-        self.try_publish(event)
-            .map_err(|event| SignalIngressAdmission {
+        self.try_publish(event).map_err(|event| {
+            self.backpressure.store(1, Ordering::Release);
+            SignalIngressAdmission {
                 event,
                 observed_drain,
-            })
+            }
+        })
     }
 
     /// Publish once. On full, the exact event remains owned by the caller.
