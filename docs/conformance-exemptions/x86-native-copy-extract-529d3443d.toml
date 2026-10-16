@@ -1,0 +1,15 @@
+schema = "carrick.conformance-exemption.v1"
+base = "3c6de31b7da9435aebb1a38d39b6f5877c450656"
+head = "529d3443d06b18f79e4328fd03b35f5906090bc2"
+contracts = [
+  "kernel.el1.thread-lifecycle",
+  "core.entry.completion",
+  "kernel.wait.process-group",
+  "kernel.wait.child-rusage",
+  "kernel.x86.file-region",
+]
+paths = [
+  "crates/carrick-x86-cpl0/src/native_process.rs",
+  "crates/carrick-x86-cpl0/src/native_process/user_copy.rs",
+]
+rationale = "The #231 owner decision of 2026-10-16 grants a one-time exemption for the #491 x86 native-copy pure extract. The existing copy body is moved verbatim; the only non-moved Rust lines are the new function signature, its impl wrapper, one delegating call, and module/import wiring. No guest result, selection, supply, copy, or work unit changes in this layer."
