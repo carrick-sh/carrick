@@ -7,6 +7,10 @@
  * and requested/cached address contexts as five bounded Debug strings.
  * Root-prepublish is the positive control when a corrected fork succeeds.
  * The diagnostic is failure-only, bounded, and grants no memory authority.
+ * A Prepare/NoMemory record also observes the first primary alias beyond
+ * the admitted child table prefix using the existing owner translation.
+ * Perturbation on that refusal: one bounded four-level descriptor lookup;
+ * successful fork preparation performs no added observation.
  * Perturbation: scalar lifecycle records plus one bounded string on refusal;
  * no descriptor walks, stacks, logging, or workload changes.
  * The 300s bound includes the signed runner's cached build/sign/negative control.
