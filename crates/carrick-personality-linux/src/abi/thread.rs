@@ -52,7 +52,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 /// Protocol revision, folded into the image ABI layout hash.
 pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 14;
 
-pub use carrick_core::lifecycle::{ClaimedEntry, ExitAdmission, Lifecycle};
+pub use carrick_core::lifecycle::{ClaimedEntry, ExitAdmission, Lifecycle, MemberControlCustody};
 pub use carrick_core_abi::lifecycle::*;
 
 /// Pool entries per process: a task holds up to four identities ahead of use.

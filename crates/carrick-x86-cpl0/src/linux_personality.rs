@@ -984,9 +984,7 @@ impl Personality for LinuxPersonality {
             let root_exit = process.take_root_exit();
             (route, root_exit)
         };
-        if !matches!(route, CompletionRoute::Suspended) {
-            migrate(slot);
-        }
+        crate::migrate_on_completion(route, || migrate(slot));
 
         match route {
             CompletionRoute::Served => ControlFlow::Return(()),

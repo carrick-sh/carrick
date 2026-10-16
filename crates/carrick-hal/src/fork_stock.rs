@@ -318,11 +318,38 @@ impl LifecycleWindow {
         })
     }
 
-    /// Zero the record. False when it lies outside the window.
+    /// Zero the record when none of its thread control slots is still
+    /// referenced by the process graph. False when it lies outside the window
+    /// or any control slot is still graph-referenced.
     pub fn clear(self, lifecycle: ForkLifecycleLoan) -> bool {
         self.ranges(lifecycle).is_some_and(|ranges| {
+            let (controls_ptr, controls_len) = ranges[1];
+            let slot_size = core::mem::size_of::<carrick_el1_abi::ThreadControlSlot>();
+            if !controls_ptr
+                .addr()
+                .is_multiple_of(core::mem::align_of::<carrick_el1_abi::ThreadControlSlot>())
+                || !controls_len.is_multiple_of(slot_size)
+            {
+                return false;
+            }
+            // SAFETY: `ranges` verified the control array lies within the
+            // retained metadata window and the pointer is aligned for
+            // `ThreadControlSlot`, whose fields are all atomic.
+            let controls = unsafe {
+                core::slice::from_raw_parts(
+                    controls_ptr.cast::<carrick_el1_abi::ThreadControlSlot>(),
+                    controls_len / slot_size,
+                )
+            };
+            if controls
+                .iter()
+                .any(carrick_el1_abi::ThreadControlSlot::graph_referenced)
+            {
+                return false;
+            }
             for (ptr, len) in ranges {
-                // SAFETY: in-window bytes of a record no live task owns.
+                // SAFETY: in-window bytes of a record no live task or graph
+                // entry references.
                 unsafe { core::ptr::write_bytes(ptr, 0, len) };
             }
             true

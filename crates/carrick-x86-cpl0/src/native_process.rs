@@ -717,12 +717,9 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         // context before publishing slot absence, so a concurrent fork that
         // reclaims this root page from quarantine after `leave_space` can
         // admit it for the next child without racing `LIVE_CONTEXTS`.
-        if !anonymous::retire_context(mm) {
-            fatal();
-        }
-        // Absence is published only after CR3 left the retired root; the
-        // host drains this MM's quarantine on a later stopped crossing.
-        if !carrick_x86_carrier::native_execution::leave_space(source) {
+        if !crate::retire_context_and_leave_space(mm, anonymous::retire_context, || {
+            carrick_x86_carrier::native_execution::leave_space(source)
+        }) {
             fatal();
         }
         let roots = core::ptr::from_ref(owner.roots).addr();
@@ -782,6 +779,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             carrick_el1::isa::x86::context::current_cpu_binding().unwrap_or_else(|| fatal());
         let files = crate::linux_personality::file_tables(binding);
         carrick_el1::personality::file_table::retire_fd_map(files.fd_map(), files.opens(), table);
+        self.task.linux.mark_pending_host_work();
     }
 }
 

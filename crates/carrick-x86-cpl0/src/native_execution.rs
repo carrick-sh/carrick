@@ -20,6 +20,8 @@ use crate::native_process;
 pub fn schedule(slot: SlotId) -> ! {
     let source = carrick_x86_carrier::native_execution::source(slot);
     let current = task();
+    current.linux.clear_pending_host_work();
+    current.linux.served_with_work.store(0, Ordering::Release);
     loop {
         expire_signal_timer(slot);
         if let Some(selected) = source.zone.switch_in_full(slot) {
@@ -82,6 +84,8 @@ pub fn schedule(slot: SlotId) -> ! {
                         if let Some(status) = root_exit {
                             publish_root_exit(current, status.to_termination_status());
                         }
+                        current.linux.clear_pending_host_work();
+                        current.linux.served_with_work.store(0, Ordering::Release);
                         leave_space(source);
                         continue;
                     }
@@ -129,6 +133,8 @@ pub fn schedule(slot: SlotId) -> ! {
                 }
             }
             if suspended {
+                current.linux.clear_pending_host_work();
+                current.linux.served_with_work.store(0, Ordering::Release);
                 continue;
             }
             carrick_x86_carrier::native_execution::migrate(slot);
@@ -137,6 +143,8 @@ pub fn schedule(slot: SlotId) -> ! {
                 Err(_) => fatal_boot(),
             }
         }
+        current.linux.clear_pending_host_work();
+        current.linux.served_with_work.store(0, Ordering::Release);
         leave_space(source);
         let dl = source.zone.timer_deadline(slot);
         if let Some(dl) = dl {
