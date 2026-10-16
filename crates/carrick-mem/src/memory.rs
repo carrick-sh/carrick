@@ -4798,6 +4798,7 @@ const MAILBOX_HANDLER_SIZE: usize = 0x220;
 const MAILBOX_CAPTURE_OFFSET: usize = MAILBOX_HANDLER_OFFSET + 44;
 
 const EL1_VECTOR_HOOK_OFFSET: usize = 0x1000;
+const _: () = assert!(MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE <= EL1_VECTOR_HOOK_OFFSET);
 /// The EL0 IRQ hook ([`El1IrqMode::Gic`]): the lower-EL IRQ slot branches
 /// here, and it enters the EL1 image with an interrupt frame.
 const EL0_IRQ_HOOK_OFFSET: usize = 0x2000;
@@ -6032,7 +6033,6 @@ fn el1_vectors_bytes_mailbox_with_layout(
     );
 
     debug_assert!(cursor <= MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE);
-    debug_assert!(MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE <= EL1_VECTOR_HOOK_OFFSET);
     if el1_enabled {
         write_el1_vector_hook(&mut bytes, EL1_VECTOR_HOOK_OFFSET, mailbox_capture, irq);
         write_el1_hook(
