@@ -1220,9 +1220,9 @@ ci-macos-test recipe:
 
 # PRs and merge groups classify changed paths via `carrick-xtask ci-changes`,
 # which derives referenced `docs/` / `.agents/` / `*.md` paths from source,
-# scripts, workflows and justfile, splits `ci-xtask` (`heavy=true, macos=false,
-# hardware=false`) from `workflows` (`ci.yml` vs `kernel-runtime.yml`), and
-# leaves `heavy=false` only for unreferenced prose.
+# scripts, workflows and justfile, and leaves `heavy=false` only for
+# unreferenced prose (`justfile`, `scripts/**`, `crates/**`, and `.github/**`
+# run the full set).
 ci-changes:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -1246,7 +1246,7 @@ ci-results:
       (. as $root |
        if $event == "pull_request" or $event == "merge_group" then
          (if $event == "pull_request" then ($root.changes.outputs.macos // "true") == "false"
-          else (($root.changes.outputs.macos // "true") == "false" or ($root.changes.outputs.heavy // "true") == "true") end) and
+          else ($root.changes.outputs.macos // "true") == ($root.changes.outputs.heavy // "true") end) and
          (del(.changes) | with_entries(select(.key | startswith("macos-")))
            | if ($root.changes.outputs.macos // "true") == "true" and ($event != "pull_request" or $draft != "true") then all(.[]; .result == "success")
              else all(.[]; .result == "skipped") end) and
