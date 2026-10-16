@@ -1840,6 +1840,21 @@ impl BlockedContinuation {
         &self.state().authority
     }
 
+    /// The native signal owner decides SA_RESTART after selecting the handler;
+    /// this only carries the interrupted operation's restart eligibility.
+    /// A socket operation with SO_RCVTIMEO has a caller deadline and Linux
+    /// leaves it interrupted even when the handler requests SA_RESTART.
+    pub fn native_restart_eligible(&self) -> bool {
+        self.authority().restart_class() != RestartClass::Never
+            && !matches!(
+                &self.state().detail,
+                ContinuationDetail::Fds {
+                    caller_deadline: Some(_),
+                    ..
+                }
+            )
+    }
+
     /// The lease at `generation` held this continuation and settled without
     /// consuming it; the continuation now answers to that lease. See
     /// [`ContinuationAuthority::rebind_execution_generation`].

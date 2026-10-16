@@ -1028,8 +1028,19 @@ impl MailboxBinding {
         self.publish_return_with_action(value, MailboxResponseAction::NormalReturn)
     }
 
-    pub fn publish_native_signal_return(&mut self, value: i64) -> Result<(), MailboxConsumeError> {
-        self.publish_return_with_action(value, MailboxResponseAction::NativeSignalCheckpoint)
+    pub fn publish_native_signal_return(
+        &mut self,
+        value: i64,
+        restart_eligible: bool,
+    ) -> Result<(), MailboxConsumeError> {
+        self.publish_return_with_action(
+            value,
+            if restart_eligible {
+                MailboxResponseAction::NativeSignalCheckpoint
+            } else {
+                MailboxResponseAction::NativeSignalCheckpointNoRestart
+            },
+        )
     }
 
     fn publish_return_with_action(
@@ -1127,7 +1138,8 @@ impl MailboxBinding {
             Ok(
                 MailboxResponseAction::NormalReturn
                 | MailboxResponseAction::NormalReturnAndArmPortal
-                | MailboxResponseAction::NativeSignalCheckpoint,
+                | MailboxResponseAction::NativeSignalCheckpoint
+                | MailboxResponseAction::NativeSignalCheckpointNoRestart,
             ) => Ok(Some(value as i64)),
             Ok(MailboxResponseAction::RegistersPrepared) => Ok(None),
             Err(unknown) => Err(MailboxConsumeError::Protocol(
@@ -1899,13 +1911,22 @@ mod tests {
         let (mut binding, mut mailbox) = binding();
         publish_valid_request(&binding, &mut mailbox);
         binding.take_request().unwrap().expect("request");
-        binding.publish_native_signal_return(-4).unwrap();
+        binding.publish_native_signal_return(-4, true).unwrap();
         assert_eq!(mailbox.return_value, (-4_i64) as u64);
         assert_eq!(
             mailbox.response_action,
             MailboxResponseAction::NativeSignalCheckpoint.raw()
         );
         assert_eq!(binding.pending_normal_return().unwrap(), Some(-4));
+        let (mut no_restart_binding, mut no_restart_mailbox) = binding();
+        publish_valid_request(&no_restart_binding, &mut no_restart_mailbox);
+        no_restart_binding
+            .publish_native_signal_return(-4, false)
+            .unwrap();
+        assert_eq!(
+            no_restart_mailbox.response_action,
+            MailboxResponseAction::NativeSignalCheckpointNoRestart.raw()
+        );
     }
 
     #[test]

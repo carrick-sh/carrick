@@ -250,6 +250,30 @@ mod tests {
         assert_eq!(read.x[0], 0x1234);
         assert_eq!(read.elr, 0x8000);
 
+        let mut timed_recv = TrapFrame::default();
+        timed_recv.esr = 0xfffd; // host continuation with SO_RCVTIMEO
+        timed_recv.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
+        timed_recv.x[8] = 207; // ARM recvfrom
+        timed_recv.far = 0x1234;
+        timed_recv.elr = 0x8004;
+        assert_eq!(restart_forwarded_frame(&mut timed_recv), None);
+        assert_eq!(
+            timed_recv.x[0],
+            carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64
+        );
+        assert_eq!(timed_recv.elr, 0x8004);
+
+        for nr in [202, 242, 207, 212] {
+            let mut socket = TrapFrame::default();
+            socket.esr = 0xfffe;
+            socket.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
+            socket.x[8] = nr;
+            socket.far = 0x5678;
+            socket.elr = 0x9004;
+            assert_eq!(restart_forwarded_frame(&mut socket), Some(true));
+            assert_eq!((socket.x[0], socket.elr), (0x5678, 0x9000));
+        }
+
         let mut ppoll = TrapFrame::default();
         ppoll.esr = 0xfffe;
         ppoll.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
@@ -549,6 +573,7 @@ mod tests {
 }
 
 #[cfg(any(
+    test,
     feature = "host-test",
     all(target_os = "none", target_arch = "aarch64")
 ))]
@@ -605,6 +630,7 @@ impl carrick_personality_linux::signal::SignalBackend for crate::isa::aarch64::A
 
 /// Shared frame publication for the native backend and its host-path witness.
 #[cfg(any(
+    test,
     feature = "host-test",
     all(target_os = "none", target_arch = "aarch64")
 ))]

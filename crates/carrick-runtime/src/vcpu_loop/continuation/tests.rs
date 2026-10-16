@@ -556,7 +556,11 @@ fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
     };
     use carrick_personality_linux::signal::arm;
 
-    for (restart, tid_number) in [(false, 153_694), (true, 153_695)] {
+    for (restart, eligible, nr, tid_number) in [
+        (false, true, 63, 153_694),
+        (true, true, 63, 153_695),
+        (true, false, 207, 153_696),
+    ] {
         let (_kernel, context) = bootstrap(tid_number);
         let generation = publish(&context, 0x709);
         let control = context.thread().control_slot();
@@ -578,13 +582,20 @@ fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
         let continuation = BlockedContinuation::from_dispatch_outcome(
             DispatchOutcome::WaitOnFds {
                 fds: WaitFds::empty(),
-                timeout: None,
+                timeout: (!eligible).then_some(std::time::Duration::from_secs(5)),
                 sig_mask: WaitSigMask::NONE,
                 completion: FdWaitCompletion::Fd { on_timeout: 0 },
             },
-            capture(&context, generation),
+            ContinuationCapture::new(
+                &context,
+                generation,
+                SyscallRequest::new(nr, SyscallArgs([0x1234, 0, 0, 0, 0, 0])),
+                RestartClass::RestartSyscall,
+            )
+            .unwrap(),
         )
         .expect("forwarded read continuation");
+        assert_eq!(continuation.native_restart_eligible(), eligible);
         let tid = context.thread().key().tid.raw();
         carrick_signal_linux::publish_process_signal(2);
         let event = SignalReadinessProbe::from_continuation(&continuation)
@@ -609,11 +620,11 @@ fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
             super::super::signal_ingress_producer::HostIngressStep::Published
         );
         let mut frame = carrick_el1_abi::TrapFrame::default();
-        frame.esr = 0xfffe;
+        frame.esr = if eligible { 0xfffe } else { 0xfffd };
         frame.elr = 0x400004;
         frame.far = 0x1234;
         frame.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
-        frame.x[8] = 63; // AArch64 read
+        frame.x[8] = nr;
         let (drained, route) = fixture.drain_and_deliver(&queue, &mut frame);
         assert_eq!(drained, 1);
         assert_eq!(route, None, "handler delivery continues toward EL0");
@@ -622,10 +633,17 @@ fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
         assert_eq!(copies.len(), 1);
         let (sp, bytes) = &copies[0];
         let saved = arm::decode(bytes, *sp, true).unwrap();
-        assert_eq!(saved.pc.raw(), if restart { 0x400000 } else { 0x400004 });
+        assert_eq!(
+            saved.pc.raw(),
+            if restart && eligible {
+                0x400000
+            } else {
+                0x400004
+            }
+        );
         assert_eq!(
             saved.regs[0],
-            if restart {
+            if restart && eligible {
                 0x1234
             } else {
                 carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64

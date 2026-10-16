@@ -59,6 +59,12 @@ pub fn is_restartable_syscall(nr: u64) -> bool {
         | 287 // pwritev2
         | 29  // ioctl (on a slow device)
         | 56  // openat (blocks opening a FIFO)
+        // Blocking socket calls; the continuation owner excludes a caller
+        // deadline (SO_RCVTIMEO) before handing native restart eligibility on.
+        | 202 // accept
+        | 242 // accept4
+        | 207 // recvfrom
+        | 212 // recvmsg
         // Advisory file locking: flock, and fcntl's F_SETLKW. fcntl is listed
         // whole because the blocking lock commands are the only ones that can
         // return EINTR.

@@ -336,7 +336,11 @@ pub trait Aarch64Vcpu {
     /// Complete a forwarded syscall through the native EL1 signal checkpoint
     /// before restoring EL0. Register-return test backends retain their
     /// ordinary completion; the mailbox backend selects its checkpoint action.
-    fn complete_native_signal_return(&mut self, return_value: i64) -> Result<(), TrapError> {
+    fn complete_native_signal_return(
+        &mut self,
+        return_value: i64,
+        _restart_eligible: bool,
+    ) -> Result<(), TrapError> {
         self.complete_syscall_return(return_value)
     }
 
