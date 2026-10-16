@@ -322,6 +322,9 @@ pub struct PostMortem {
     /// The kernel graph, in the same projection `carrick debug hvpatch-kernel`
     /// serves — so the two views can never disagree about shape.
     pub kernel: Option<KernelDebugSnapshot>,
+    /// Lock-free EL1 slot and record census, including work owed to idle vCPUs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone_census: Option<String>,
     /// What is WRONG with that graph. A dangling alias-registry row lands
     /// here instead of destroying the capture.
     pub findings: Vec<String>,
@@ -397,6 +400,18 @@ impl PostMortem {
         let event_ring_high_rate = ring_records(crate::event_ring::drain_recent_high_rate(
             EVENT_RING_RECORDS,
         ));
+        let zone_census = carrick_el1_abi::zone_tables().and_then(|zone| {
+            let mut census = String::new();
+            if zone.write_census(&mut census).is_err() {
+                truncated.push(Truncated {
+                    section: "zone_census".to_owned(),
+                    reason: "EL1 zone census formatting failed".to_owned(),
+                });
+                None
+            } else {
+                Some(census)
+            }
+        });
 
         Self {
             schema: POST_MORTEM_SCHEMA.to_owned(),
@@ -407,6 +422,7 @@ impl PostMortem {
                 .unwrap_or(0),
             reason,
             kernel: kernel_snapshot,
+            zone_census,
             findings,
             event_ring,
             event_ring_high_rate,
