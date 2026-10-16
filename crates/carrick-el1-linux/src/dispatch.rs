@@ -685,7 +685,9 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
     };
     let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
     let source = carrick_el1_abi::BornInZoneSource { zone, slot };
-    if carrick_el1::isa::signal_ingress_guest().is_empty()
+    if !(frame.esr == 0xfffe
+        && frame.x[0] == carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64)
+        && carrick_el1::isa::signal_ingress_guest().is_empty()
         && control.zone_record().is_some_and(|record| {
             !super::aarch64_process::registry().signal_checkpoint_needed(zone, record)
         })

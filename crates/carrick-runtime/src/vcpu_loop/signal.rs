@@ -1844,7 +1844,7 @@ where
         } else {
             crate::linux_abi::LINUX_ESRCH.guest_retval()
         };
-        self.complete_returned(engine, &kernel.reporter, retval)
+        self.complete_returned(engine, kernel, retval)
     }
 }
 
