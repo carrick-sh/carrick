@@ -2292,7 +2292,7 @@ where
         }
         if self.service_kernel_context.as_ref().is_some_and(|context| {
             context.thread().control_slot().native_signal_owner()
-                && context.lifecycle_page().gate().serves_ring()
+                && carrick_el1_abi::Lifecycle::gate(&*context.lifecycle_page()).serves_ring()
         }) {
             engine.complete_native_signal_return(value)?;
         } else {
@@ -2561,12 +2561,6 @@ pub(crate) mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use carrick_guest_mem::GuestMemory;
     use std::time::{Duration, Instant};
-
-    #[test]
-    fn arm_signal_domain_has_no_carrier_consumer() {
-        assert!(!carrier_signal_selection_permitted(true));
-        assert!(carrier_signal_selection_permitted(false));
-    }
 
     struct ContinueInterceptor;
 

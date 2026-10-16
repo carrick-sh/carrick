@@ -942,15 +942,9 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
                         "native signal checkpoint publication failed: {error}"
                     ))
                 }),
-            HvfSyscallTransport::Legacy => {
-                // The legacy return vehicle keeps the register result, then
-                // enters the regular EL1 vector on its next boundary.
-                hvf_set_reg(&live.inner, carrick_hal::Reg::X(0), return_value as u64)
-                    .map_err(os_to_trap)?;
-                live.mailbox.publish_registers_prepared().map_err(|error| {
-                    TrapError::Hypervisor(format!("legacy native return: {error}"))
-                })
-            }
+            HvfSyscallTransport::Legacy => Err(TrapError::Hypervisor(
+                "native signal checkpoint requires mailbox transport".to_owned(),
+            )),
         }
     }
 

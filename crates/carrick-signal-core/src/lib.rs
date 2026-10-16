@@ -15,6 +15,65 @@ pub mod policy;
 pub mod timer;
 pub mod wait;
 
+/// Check whether a canonical Linux syscall number is restartable upon signal interruption or readiness wake.
+///
+/// Under Linux, a blocking syscall interrupted by a signal handler that specified
+/// `SA_RESTART` in its `sigaction` flags is automatically restarted rather than
+/// returning `-EINTR` (`signal(7)` "Interruption of system calls and library
+/// functions by signal handlers").
+///
+/// The decision to restart belongs to the syscall boundary: a syscall that
+/// blocks inside Carrick returns `-EINTR` to EL0 only when it is NOT
+/// restartable OR the signal handler that ran did not set `SA_RESTART`.
+/// System calls on "slow" devices (pipes, terminals, sockets without timeouts),
+/// file locking (flock, fcntl F_SETLKW), POSIX message queues, getrandom,
+/// and child waits (waitid, wait4) are restarted when `SA_RESTART` is set.
+///
+/// The `signal(7)` "never restarted" list is deliberately EXCLUDED, so those
+/// keep surfacing `EINTR` as Linux does: `poll`/`ppoll`, `select`/`pselect6`,
+/// `epoll_wait`/`epoll_pwait`, `nanosleep`/`clock_nanosleep`, `io_getevents`,
+/// `msgrcv`/`msgsnd`, `semop`/`semtimedop`, and the `sigsuspend`/
+/// `rt_sigtimedwait` family.
+///
+/// Socket calls (`accept`, `connect`, the `recv`/`send` families) are also
+/// absent, and that is a KNOWN REMAINING GAP rather than a judgement that they
+/// do not restart — they do, but only when the socket carries no
+/// `SO_RCVTIMEO`/`SO_SNDTIMEO`. This decision point sees only the syscall
+/// NUMBER, not the fd, so honouring that exclusion needs the timeout plumbed
+/// through first; restarting unconditionally would re-block a timeout socket
+/// that Linux would have failed with `EINTR`.
+pub fn is_restartable_syscall(nr: u64) -> bool {
+    matches!(
+        nr,
+        // Reads and writes on "slow" devices — pipes, terminals, sockets. On a
+        // regular file these never return EINTR, so listing them is harmless.
+        63  // read
+        | 64  // write
+        | 65  // readv
+        | 66  // writev
+        | 67  // pread64
+        | 68  // pwrite64
+        | 69  // preadv
+        | 70  // pwritev
+        | 286 // preadv2
+        | 287 // pwritev2
+        | 29  // ioctl (on a slow device)
+        | 56  // openat (blocks opening a FIFO)
+        // Advisory file locking: flock, and fcntl's F_SETLKW. fcntl is listed
+        // whole because the blocking lock commands are the only ones that can
+        // return EINTR.
+        | 32  // flock
+        | 25  // fcntl
+        // POSIX message queues.
+        | 182 // mq_timedsend
+        | 183 // mq_timedreceive
+        | 278 // getrandom
+        // Waits.
+        | 95  // waitid
+        | 260 // wait4
+    )
+}
+
 use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicU64, Ordering};
 
