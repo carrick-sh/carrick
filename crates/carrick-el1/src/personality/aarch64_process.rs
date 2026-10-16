@@ -450,7 +450,7 @@ pub(super) unsafe fn observed_entry_address(
         && identity.generation == binding.generation.raw()
         && identity.serial == binding.thread_generation.raw()
         && identity.mm == binding.mm.raw()
-        && source.zone.slot(source.slot).mm() == binding.mm.raw()
+        && source.zone.installed_space(source.slot) == binding.mm.raw()
         && address.mm.raw().get() == binding.mm.raw()
         && address.root.address().raw() == ttbr0 & AARCH64_ROOT_ADDRESS_MASK)
         .then_some(address)
