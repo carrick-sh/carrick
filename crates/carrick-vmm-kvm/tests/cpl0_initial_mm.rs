@@ -664,7 +664,7 @@ fn child_born_on_idle_peer_can_fault_and_retire_on_root_executor() {
                 }
             ) {
                 assert_ne!(
-                    stopped.state.binding().task(),
+                    stopped.state.as_ref().unwrap().binding().task(),
                     task,
                     "physical image must belong to the grandchild"
                 );

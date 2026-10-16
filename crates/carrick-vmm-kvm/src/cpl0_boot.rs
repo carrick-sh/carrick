@@ -857,6 +857,7 @@ pub(crate) struct ProductionRunContext {
     actual_run: Arc<[AtomicU32; 2]>,
     file_execution: Arc<RwLock<()>>,
     slot: usize,
+    pub(crate) maintenance_root: Option<RootGpa>,
 }
 
 impl ProductionRunContext {
@@ -2406,6 +2407,7 @@ pub(crate) struct Cpl0HostCustody {
     prepare_table_stock: Option<anonymous_owner::PrepareTableStock>,
     /// The ISA-neutral fork stock, loans and child quarantine.
     fork_stock: carrick_hal::fork_stock::ForkStock<carrick_hal::fork_stock::UntaggedRoots>,
+    pub(super) maintenance_root: Option<RootGpa>,
     anonymous_next_gpa: FrameGpa,
     anonymous_pending: [Option<anonymous_owner::PendingGrant>; 2],
     owner_grant_crossings: u64,
@@ -2493,6 +2495,7 @@ impl Cpl0HostCustody {
             actual_run: Arc::clone(&self.actual_run),
             file_execution: Arc::clone(&self.files.execution),
             slot,
+            maintenance_root: self.maintenance_root,
         })
     }
 
@@ -4632,6 +4635,7 @@ impl Cpl0Carrier {
                 initial_task: None,
                 prepare_table_stock: None,
                 fork_stock,
+                maintenance_root: None,
                 anonymous_next_gpa: FrameGpa::new(0x2_0000_0000),
                 anonymous_pending: [None, None],
                 owner_grant_crossings: 0,

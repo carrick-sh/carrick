@@ -728,6 +728,7 @@ impl Cpl0HostCustody {
         retained_cow_zone(&self.ram)?
             .spaces
             .set_idle_ttbr(maintenance.address().raw());
+        self.maintenance_root = Some(maintenance);
         self.fork_stock
             .install(tables, lifecycles)
             .map_err(|e| fail(format!("fork stock install: {e:?}")))
