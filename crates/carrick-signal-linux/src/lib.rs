@@ -117,8 +117,9 @@ fn unmaskable() -> SignalSet {
 static PROC_PENDING: PendingSet = PendingSet::new();
 // One atomic origin per standard signal. A 0 -> origin CAS selects the first
 // publisher; the bitmask remains the async-signal-safe wake/selection index.
-// The consumer clears the bit before clearing the origin, so a concurrent
-// publication while the old event is still pending coalesces into that event.
+// The consumer clears the bit before clearing the origin. A host publisher
+// that finds an old origin after the bit was taken republishes the bit, so a
+// new signal cannot disappear in that dequeue window.
 const ORIGIN_EMPTY: u8 = 0;
 const ORIGIN_HOST: u8 = 1;
 const ORIGIN_ITIMER: u8 = 2;
@@ -287,7 +288,15 @@ pub fn publish_pending_timer_for(tid: i32, signum: i32, info: PendingTimerInfo) 
 /// raw `AtomicU64` in wire form (bit `signum-1`); the typed set converts at the
 /// atomic load/CAS boundary.
 fn take_proc_pending_event_in(wait_set: SigSet) -> Option<PendingSignalEvent> {
+    take_proc_pending_event_in_after_take(wait_set, || {})
+}
+
+fn take_proc_pending_event_in_after_take(
+    wait_set: SigSet,
+    after_take: impl FnOnce(),
+) -> Option<PendingSignalEvent> {
     let signum = PROC_PENDING.take(SignalSet::from_bits(wait_set.raw()))?;
+    after_take();
     let index = (signum - 1) as usize;
     let origin = PROC_ORIGIN[index].load(Ordering::SeqCst);
     let payload = PendingTimerInfo {
@@ -460,15 +469,21 @@ pub fn proc_pending_fetch_or(bit: u64) {
     while remaining != 0 {
         let lowest = remaining & remaining.wrapping_neg();
         let index = lowest.trailing_zeros() as usize;
-        if PROC_ORIGIN[index]
+        let claimed = PROC_ORIGIN[index]
             .compare_exchange(
                 ORIGIN_EMPTY,
                 ORIGIN_HOST,
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             )
-            .is_ok()
+            .is_ok();
+        if claimed || (PROC_ORIGIN[index].load(Ordering::SeqCst) != ORIGIN_WRITING
+            && PROC_PENDING.load().bits() & lowest == 0)
         {
+            // A failed claim with no pending bit raced a consumer that has
+            // taken the old bit but has not cleared its origin yet. The new
+            // bit survives that consumer's origin cleanup; it defaults to a
+            // host origin if the old event owned timer metadata.
             PROC_PENDING.publish(SignalSet::from_bits(lowest));
         }
         remaining &= !lowest;
@@ -494,16 +509,25 @@ pub fn publish_process_timer_signal(signum: i32, info: Option<PendingTimerInfo>)
         return;
     }
     let index = (signum - 1) as usize;
-    if PROC_ORIGIN[index]
-        .compare_exchange(
-            ORIGIN_EMPTY,
-            ORIGIN_WRITING,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        )
-        .is_err()
-    {
-        return;
+    loop {
+        if PROC_ORIGIN[index]
+            .compare_exchange(
+                ORIGIN_EMPTY,
+                ORIGIN_WRITING,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            break;
+        }
+        if PROC_PENDING.load().bits() & bit != 0 {
+            return;
+        }
+        // The prior dequeue owns its timer payload until origin cleanup.
+        // Timer callbacks run in normal host context and may wait for that
+        // small critical section; the async host signal path never waits.
+        std::hint::spin_loop();
     }
     if let Some(info) = info {
         PROC_TIMER_INFO[index].id.store(info.id, Ordering::SeqCst);
@@ -734,6 +758,21 @@ mod tests {
             take_pending_event_for(991).unwrap().origin,
             PendingSignalOrigin::IntervalTimer
         );
+        clear_proc_pending();
+    }
+
+    #[test]
+    fn process_publish_during_dequeue_remains_pending() {
+        let _lock = lock_test();
+        clear_proc_pending();
+        publish_process_signal(10);
+        let first = take_proc_pending_event_in_after_take(
+            SigSet::EMPTY.complement(),
+            || publish_process_signal(10),
+        );
+        assert_eq!(first.unwrap().signum, 10);
+        assert_eq!(take_process_pending(), 10);
+        assert_eq!(take_process_pending(), NO_PENDING_SIGNAL);
         clear_proc_pending();
     }
 
