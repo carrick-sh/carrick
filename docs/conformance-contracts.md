@@ -678,6 +678,21 @@ thread membership remains allowed. `process::birth::tests` binds these rules,
 including dropped admission, external peer roots, a genuine exit reservation
 red-first refusal and zero identity reads across 512 unrelated tasks.
 
+`kernel.process.fork-child-tid` covers `clone(SIGCHLD | CLONE_CHILD_SETTID |
+CLONE_CHILD_CLEARTID, ..., ctid)` as a process fork. Linux authority is
+[clone(2)](https://man7.org/linux/man-pages/man2/clone.2.html) and
+[set_tid_address(2)](https://man7.org/linux/man-pages/man2/set_tid_address.2.html):
+the child sees its TID at `ctid` before returning to user mode, the parent's
+private word is unchanged, and child exit zeros the word and wakes its futex.
+One process birth, at most one child-MM TID store, and at most one clear and
+wake are the work budget; the fork never scans or writes the parent's MM for
+these effects. The VM-free bindings are
+`common_linux_entry_calls_native_process_custody` for admission and
+`process_clone_child_tid_lives_in_child_mm_and_clears_on_exit` for two live
+processes and terminal effects. The signed bindings are the five EL1 cases
+named by #491; the Docker oracle for this exact flag family remains a
+separate, serialized authority check.
+
 `kernel.process.exit-owner` covers reserved exit topology. Linux authority is
 exit(2), wait(2), PR_SET_CHILD_SUBREAPER and SIGCHLD's SIG_IGN/SA_NOCLDWAIT
 rules. The shared registry chooses exact-generation live ancestry, reparents

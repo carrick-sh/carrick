@@ -1295,7 +1295,7 @@ fn process_native_hooks_require_every_execution_identity_component() {
         fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
             self.binding
         }
-        fn fork(&mut self) -> LifecycleOutcome {
+        fn fork(&mut self, _child_tid: ProcessForkChildTid) -> LifecycleOutcome {
             self.calls += 1;
             LifecycleOutcome::Returned {
                 result: SyscallResult::new(43),
@@ -1383,7 +1383,7 @@ fn process_native_hooks_require_every_execution_identity_component() {
         );
         native.frame.x[0] = 0;
         let results = [
-            LifecycleNative::process_fork(&mut native),
+            LifecycleNative::process_fork(&mut native, ProcessForkChildTid::NONE),
             LifecycleNative::process_wait4(
                 &mut native,
                 ProcessWaitPid::from_syscall_argument(u64::MAX),
@@ -1520,7 +1520,7 @@ fn clone_uses_the_exact_stamped_dispatch_identity() {
         fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
             self.binding
         }
-        fn fork(&mut self) -> LifecycleOutcome {
+        fn fork(&mut self, _child_tid: ProcessForkChildTid) -> LifecycleOutcome {
             panic!("unexpected fork")
         }
         fn wait4(
@@ -1600,7 +1600,7 @@ fn clone_refuses_missing_dispatch_identity_without_registering() {
         fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
             self.binding
         }
-        fn fork(&mut self) -> LifecycleOutcome {
+        fn fork(&mut self, _child_tid: ProcessForkChildTid) -> LifecycleOutcome {
             panic!("unexpected fork")
         }
         fn wait4(
@@ -1677,7 +1677,7 @@ fn clone_missing_nonleader_identity_cannot_inherit_leader() {
         fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
             self.binding
         }
-        fn fork(&mut self) -> LifecycleOutcome {
+        fn fork(&mut self, _child_tid: ProcessForkChildTid) -> LifecycleOutcome {
             panic!("unexpected fork")
         }
         fn wait4(
@@ -1764,7 +1764,7 @@ fn clone_stamped_nonleader_inherits_the_calling_thread() {
         fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
             self.binding
         }
-        fn fork(&mut self) -> LifecycleOutcome {
+        fn fork(&mut self, _child_tid: ProcessForkChildTid) -> LifecycleOutcome {
             panic!("unexpected fork")
         }
         fn wait4(
@@ -1846,7 +1846,7 @@ impl<C: carrick_el1_abi::EntryContext> ProcessNative<C> for IdentityOwner {
     fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
         self.0
     }
-    fn fork(&mut self) -> LifecycleOutcome {
+    fn fork(&mut self, _child_tid: ProcessForkChildTid) -> LifecycleOutcome {
         panic!("unexpected fork")
     }
     fn wait4(
@@ -2098,7 +2098,7 @@ fn clone_terminal_close_rolls_back_before_owned_exit_settlement() {
         fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
             self.binding
         }
-        fn fork(&mut self) -> LifecycleOutcome {
+        fn fork(&mut self, _child_tid: ProcessForkChildTid) -> LifecycleOutcome {
             panic!("unexpected fork")
         }
         fn wait4(
@@ -2233,7 +2233,7 @@ fn clone_queue_publication_can_reenter_the_process_graph_after_unlock() {
         fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
             self.binding
         }
-        fn fork(&mut self) -> LifecycleOutcome {
+        fn fork(&mut self, _child_tid: ProcessForkChildTid) -> LifecycleOutcome {
             panic!("unexpected fork")
         }
         fn wait4(
@@ -2431,7 +2431,7 @@ fn clone_terminal_failure_witness(mode: u8) {
         fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
             self.binding
         }
-        fn fork(&mut self) -> LifecycleOutcome {
+        fn fork(&mut self, _child_tid: ProcessForkChildTid) -> LifecycleOutcome {
             panic!("unexpected fork")
         }
         fn wait4(
@@ -2632,7 +2632,7 @@ fn arm_dispatch_consumes_native_run_failure_before_return() {
         fn binding(&self) -> carrick_el1_abi::ExecutionBinding {
             self.binding
         }
-        fn fork(&mut self) -> LifecycleOutcome {
+        fn fork(&mut self, _child_tid: ProcessForkChildTid) -> LifecycleOutcome {
             panic!("unexpected fork")
         }
         fn wait4(

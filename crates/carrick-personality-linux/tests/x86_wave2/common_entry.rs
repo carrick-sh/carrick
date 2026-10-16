@@ -635,18 +635,22 @@ pub(super) fn x4_linux_common_entry() {
 
 #[test]
 fn common_linux_entry_calls_native_process_custody() {
-    use carrick_personality_linux::lifecycle::{LifecycleOutcome, ProcessNative, ProcessWaitPid};
+    use carrick_personality_linux::lifecycle::{
+        LifecycleOutcome, ProcessForkChildTid, ProcessNative, ProcessWaitPid,
+    };
     struct Process {
         binding: carrick_core_abi::ExecutionBinding,
         visits: std::vec::Vec<u64>,
+        fork_tids: std::vec::Vec<ProcessForkChildTid>,
         idle: bool,
     }
     impl ProcessNative for Process {
         fn binding(&self) -> carrick_core_abi::ExecutionBinding {
             self.binding
         }
-        fn fork(&mut self) -> LifecycleOutcome {
+        fn fork(&mut self, child_tid: ProcessForkChildTid) -> LifecycleOutcome {
             self.visits.push(57);
+            self.fork_tids.push(child_tid);
             LifecycleOutcome::Returned {
                 result: SyscallResult::new(42),
                 work: false,
@@ -688,6 +692,7 @@ fn common_linux_entry_calls_native_process_custody() {
     let mut process = Process {
         binding: execution_binding(&world.tasks[0]),
         visits: std::vec::Vec::new(),
+        fork_tids: std::vec::Vec::new(),
         idle: false,
     };
     let mut anonymous = AnonymousBreak;
@@ -746,41 +751,85 @@ fn common_linux_entry_calls_native_process_custody() {
     );
     assert_eq!(process.visits, [57, 61, 231, 61]);
     process.binding = execution_binding(&world.tasks[0]);
-    // A child stack makes this a thread-shaped clone, never a plain fork.
-    let call =
-        carrick_personality_linux::entry::decode_x86_64(56, [17, 0x1000, 0, 0, 0, 0], 0x7fff0000);
-    assert_eq!(
-        serve_full(&call, &world, &mut anonymous, Some(&mut process), None).0,
-        carrick_personality_linux::dispatch::CompletionRoute::Served
-    );
-    assert_eq!(
-        process.visits,
-        [57, 61, 231, 61],
-        "clone with a child stack must not call fork"
-    );
-    // clone(2): with flags == SIGCHLD, parent_tid, child_tid and tls are
-    // ignored (no CLONE_PARENT_SETTID/CHILD_SETTID/SETTLS), so stale values
-    // in those registers (musl's _Fork leaves them live) still mean fork().
-    let call = carrick_personality_linux::entry::decode_x86_64(
-        56,
-        [17, 0, 0x1000, 0x1000, 0x1000, 0x1000],
-        0x7fff0000,
-    );
-    assert_eq!(
-        serve_full(&call, &world, &mut anonymous, Some(&mut process), None).0,
-        carrick_personality_linux::dispatch::CompletionRoute::Served
-    );
-    assert_eq!(
-        process.visits.last(),
-        Some(&57),
-        "ignored clone registers must not refuse a plain fork"
-    );
+    // clone(2): the child TID output belongs to the new address space.
+    // Admission must reach the one process-fork owner, not the thread path.
+    for (flags, set, clear) in [
+        (0x0100_0011, true, false),
+        (0x0020_0011, false, true),
+        (0x0120_0011, true, true),
+    ] {
+        // x86 raw clone puts ctid in arg3; the decoder restores the shared
+        // canonical arg4 position used by the ARM personality.
+        let call = carrick_personality_linux::entry::decode_x86_64(
+            56,
+            [flags, 0, 0, 0x7000, 0, 0],
+            0x7fff0000,
+        );
+        assert_eq!(
+            served_result(serve_full(
+                &call,
+                &world,
+                &mut anonymous,
+                Some(&mut process),
+                None,
+            )),
+            Some(42),
+        );
+        assert_eq!(
+            process.fork_tids.last().copied(),
+            Some(ProcessForkChildTid {
+                address: UserVa::new(0x7000),
+                set,
+                clear
+            }),
+        );
+    }
+    assert_eq!(process.visits, [57, 61, 231, 61, 57, 57, 57]);
+    for index in 1..6 {
+        let mut args = [17, 0, 0, 0, 0, 0];
+        args[index] = 0x1000;
+        let call = carrick_personality_linux::entry::decode_x86_64(56, args, 0x7fff0000);
+        assert_eq!(
+            serve_full(&call, &world, &mut anonymous, Some(&mut process), None).0,
+            carrick_personality_linux::dispatch::CompletionRoute::Served
+        );
+        assert_eq!(
+            process.visits,
+            [57, 61, 231, 61, 57, 57, 57],
+            "unsupported clone shape must not call fork"
+        );
+    }
+    for (flags, ctid) in [
+        (0x0120_0011 | 0x400, 0x7000),
+        (0x0120_0011 | 0x100, 0x7000),
+        (0x0120_0012, 0x7000),
+        (0x0120_0011, 0),
+    ] {
+        let call = carrick_personality_linux::entry::decode_x86_64(
+            56,
+            [flags, 0, 0, ctid, 0, 0],
+            0x7fff0000,
+        );
+        assert_eq!(
+            served_result(serve_full(
+                &call,
+                &world,
+                &mut anonymous,
+                Some(&mut process),
+                None,
+            )),
+            Some(-38),
+        );
+        assert_eq!(process.visits, [57, 61, 231, 61, 57, 57, 57]);
+    }
 }
 
 #[test]
 fn compact_common_entry_suspends_only_after_authenticated_park() {
     use carrick_core_abi::{BornInZoneSource, EntryHandoffReceipt};
-    use carrick_personality_linux::lifecycle::{LifecycleOutcome, ProcessNative, ProcessWaitPid};
+    use carrick_personality_linux::lifecycle::{
+        LifecycleOutcome, ProcessForkChildTid, ProcessNative, ProcessWaitPid,
+    };
     use carrick_sched_core::{
         ExecutionSlot, ParkedContextWords, SlotId, ThreadIdentity, ZoneTables,
     };
@@ -798,7 +847,7 @@ fn compact_common_entry_suspends_only_after_authenticated_park() {
         fn take_handoff_receipt(&mut self) -> Option<EntryHandoffReceipt<ParkedContextWords>> {
             self.receipt.take()
         }
-        fn fork(&mut self) -> LifecycleOutcome {
+        fn fork(&mut self, _child_tid: ProcessForkChildTid) -> LifecycleOutcome {
             panic!("wrong lifecycle family")
         }
         fn exit_group(&mut self, _: u8) -> LifecycleOutcome {
