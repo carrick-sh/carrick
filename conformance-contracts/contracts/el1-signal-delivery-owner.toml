@@ -5,7 +5,7 @@ guest_surfaces = ["signal:asynchronous-delivery", "syscall:rt_sigreturn", "sysca
 semantic_authority = ["public arm64 SVE ABI signal handling/return documentation", "Arm Linux Plumbers 2017 signal-frame diagrams", "man 7 signal", "man 2 sigaction", "man 2 sigreturn", "man 2 tgkill", "man 2 kill", "man 2 rt_sigqueueinfo"]
 fixture = "VM-free scoped two-owner seam; see M2-M5 witness ledger"
 scale_points = [1, 8, 32, 128]
-rationale = "Two live tasks with separate containers retain independent realtime queues. Clearing shared pending summary leaves host payload authority; this preparation witness does not treat summary clear as a valid delivery transaction. FIFO and lifecycle reducers remain positive semantic requirements. Exact routing population work and EL1 frame ownership remain unresolved; signed EL0 frame semantics are bound separately."
+rationale = "Two live tasks with separate containers retain independent realtime queues. Clearing shared pending summary leaves host payload authority; this preparation witness does not treat summary clear as a valid delivery transaction. FIFO and lifecycle reducers remain positive semantic requirements. X86 action selection, handler-frame admission and mask publication now run in one shared EL1 signal_delivery owner; its ISA adapter retains frame conversion and group-exit custody. ARM production ingress and return remain unresolved, so this move makes no ARM cutover claim. Exact routing population work and EL1 frame ownership remain unresolved; signed EL0 frame semantics are bound separately."
 structural_budgets = []
 
 [bindings]
