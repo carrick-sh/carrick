@@ -110,6 +110,23 @@ impl Aarch64ParkedContext {
     pub fn generation(&self) -> u64 {
         self.generation
     }
+
+    /// Lower retained owner custody to the same native entry instruction.
+    /// The original arguments survive; the entry consumes the continuation
+    /// before dispatching any new operation.
+    pub fn host_resume(
+        &self,
+        disposition: crate::object_wait::ResumeDisposition,
+    ) -> Option<ThreadCtx> {
+        let mut native = self.native;
+        if disposition == crate::object_wait::ResumeDisposition::OwnerContinuation {
+            native.pc = native.pc.checked_sub(4)?;
+            if native.pc == 0 || !native.pc.is_multiple_of(4) || native.pstate & 0xf != 0 {
+                return None;
+            }
+        }
+        Some(native)
+    }
 }
 
 impl carrick_guest_arch::ProcessContext for Aarch64ParkedContext {

@@ -1058,7 +1058,10 @@ where
                 .into());
             }
         };
-        if let Some(value) = x0 {
+        let disposition = rec.resume_disposition();
+        if disposition == carrick_sched_core::object_wait::ResumeDisposition::UserReturn
+            && let Some(value) = x0
+        {
             engine
                 .set_reg(carrick_hal::Reg::X(0), value as u64)
                 .map_err(|error| {
@@ -1067,6 +1070,12 @@ where
         }
         zone.free_record(record.id);
         self.state.service_kernel_context = Some(context.retain_exact());
+        if disposition == carrick_sched_core::object_wait::ResumeDisposition::OwnerContinuation {
+            // The materializer restored the native entry. Let its owner finish
+            // the retained operation before signal delivery can enter EL0.
+            // Dropping an unconsumed reservation returns it to its authority.
+            return Ok(executor::ExecutorExit::Syscall);
+        }
         let pc = engine.current_pc()?;
         if let Some(outcome) = service_signals_threaded(
             &self.kernel,

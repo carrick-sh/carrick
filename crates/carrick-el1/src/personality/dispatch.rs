@@ -995,6 +995,9 @@ impl<
     Context: DispatchContext,
 > PendingFamilies<'a, Context> for El1PendingFamilies<'a, F, C, U, G, Context>
 {
+    fn resume_owned_continuation(&mut self) -> Option<lifecycle::LifecycleOutcome> {
+        self.process.as_deref_mut()?.resume_owned_continuation()
+    }
     fn may_serve_poll(&self) -> bool {
         self.frame.may_serve_poll()
     }

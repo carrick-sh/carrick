@@ -157,7 +157,11 @@ fn materialize_zone_in(
     // SAFETY: the host owns the record (checked above); its context is
     // frozen until the loader frees it.
     let parked = unsafe { *rec.ctx_mut() };
-    let ctx = parked.native;
+    let ctx = parked
+        .host_resume(rec.resume_disposition())
+        .ok_or_else(|| {
+            TrapError::Hypervisor("owned zone continuation lost its native entry".to_owned())
+        })?;
     let mut state = (**base).clone();
     state.gprs = ctx.x;
     state.ttbr0 = parked.root();
@@ -244,6 +248,33 @@ mod tests {
     #[test]
     fn guest_zone_wait_resumes_el0_without_replaying_the_completed_syscall() {
         exercise_zone_wakes(false);
+    }
+
+    #[test]
+    fn native_terminal_host_wake_does_not_return_after_exit_group() {
+        let mut native = carrick_el1_abi::ThreadCtx::ZERO;
+        native.pc = 0x4004;
+        native.x[0] = 7;
+        native.x[8] = 94;
+        carrick_el1::personality::aarch64_process_tests::with_native_terminal_host_handback(
+            native,
+            |zone, record| {
+                let restored = materialize_zone_in(zone, &pending_read(), record).unwrap();
+                let GuestCpuState::Aarch64V1(cpu) = restored else {
+                    panic!("AArch64 owner");
+                };
+                assert_ne!(
+                    (cpu.pc, cpu.pstate & 0xf),
+                    (native.pc, 0),
+                    "terminal readiness must re-enter retained owner custody, never return from exit_group to EL0"
+                );
+                let mut restored = native;
+                restored.pc = cpu.pc;
+                restored.pstate = cpu.pstate;
+                restored.x = cpu.gprs;
+                restored
+            },
+        );
     }
 
     fn exercise_zone_wakes(host_owned: bool) -> (Box<ZoneTables>, RecordRef) {

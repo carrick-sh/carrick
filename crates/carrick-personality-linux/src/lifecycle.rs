@@ -199,6 +199,11 @@ pub type RobustSlotReader<'r> =
 /// Native process custody supplied by the execution lane. Registry decisions
 /// remain in the shared scheduler owner; this adapter retains machine context.
 pub trait ProcessNative<C: carrick_core_abi::EntryContext = carrick_sched_core::ThreadCtx> {
+    /// Resume this exact thread's retained operation before a new syscall is
+    /// dispatched. Readiness alone cannot authorize a user return.
+    fn resume_owned_continuation(&mut self) -> Option<LifecycleOutcome> {
+        None
+    }
     fn take_handoff_receipt(&mut self) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
         None
     }

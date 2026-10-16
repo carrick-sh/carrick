@@ -62,12 +62,13 @@ const fn cause_queue_index(index: usize, cause: spaces::notification::SpaceWaitC
         ORIGINAL_OBJECT_WAIT_QUEUES + (cause as usize - 1) * spaces::ADDRESS_SPACES + index
     }
 }
-pub const OBJECT_WAIT_PROTOCOL: u64 = 9;
+pub const OBJECT_WAIT_PROTOCOL: u64 = 10;
 pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
     let words = [
         OBJECT_WAIT_PROTOCOL,
         OBJECT_EXPIRED as u64,
         OBJECT_HOST_CONTINUATION as u64,
+        OWNER_CONTINUATION as u64,
         ADMISSION_PENDING as u64,
         ADMISSION_CUSTODY as u64,
         ADMISSION_POSTED as u64,
@@ -761,6 +762,14 @@ const NOTIFY_PENDING: u32 = 4;
 const ADMISSION_PENDING: u32 = 8;
 const OBJECT_EXPIRED: u32 = 1;
 const OBJECT_HOST_CONTINUATION: u32 = 2;
+const OWNER_CONTINUATION: u32 = 4;
+
+/// The owner decides whether a readiness notification completes a user call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResumeDisposition {
+    UserReturn,
+    OwnerContinuation,
+}
 // `prev` is not a queue backlink while an admission handback is Transferring.
 // These bits couple its original publication to its after-unlock delivery.
 const ADMISSION_CUSTODY: u32 = 1 << 31;
@@ -792,8 +801,9 @@ pub(super) struct ObjectRecord {
     prev: AtomicU32,
     next: AtomicU32,
     /// Completion flags: bit 0 means the deadline ended the park; bit 1
-    /// retains a host syscall continuation. Reset for each allocation and
-    /// object park; read by the adapter after it takes the operation token.
+    /// retains a host syscall continuation; bit 2 requires the native owner's
+    /// continuation checkpoint before returning to userspace. Reset for each
+    /// allocation and object park; read after taking the operation token.
     expired: AtomicU32,
     generation: AtomicU64,
     operation: AtomicU64,
@@ -1311,6 +1321,34 @@ pub struct ObjectQueueCensus {
 }
 
 impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
+    /// Readiness resumes retained owner custody, not a completed user call.
+    ///
+    /// # Safety
+    /// The caller exclusively owns this record and has retained the operation
+    /// in its native owner before publishing the park.
+    pub unsafe fn publish_owner_continuation(&self) {
+        self.object
+            .expired
+            .fetch_or(OWNER_CONTINUATION, Ordering::Release);
+    }
+
+    pub fn resume_disposition(&self) -> ResumeDisposition {
+        if self.object.expired.load(Ordering::Acquire) & OWNER_CONTINUATION != 0 {
+            ResumeDisposition::OwnerContinuation
+        } else {
+            ResumeDisposition::UserReturn
+        }
+    }
+
+    /// # Safety
+    /// The caller owns the selected record and is consuming its retained
+    /// native continuation before any user return or subsequent park.
+    pub unsafe fn consume_owner_continuation(&self) {
+        self.object
+            .expired
+            .fetch_and(!OWNER_CONTINUATION, Ordering::AcqRel);
+    }
+
     /// This record's object-wait registration, if it has one or owns a
     /// pending object operation.
     pub fn object_wait_census(&self) -> Option<ObjectWaitCensus> {

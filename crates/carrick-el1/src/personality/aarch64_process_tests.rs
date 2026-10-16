@@ -1601,6 +1601,168 @@ fn terminal_retirement_cannot_retire_a_reused_record_or_slot_generation() {
     ));
 }
 
+/// Hand a real pending terminal owner back to the host after its sibling retires.
+/// The callback exercises the host's register materialization on that exact record.
+pub fn with_native_terminal_host_handback(
+    native: ThreadCtx,
+    witness: impl FnOnce(&ZoneTables<Aarch64ParkedContext>, carrick_el1_abi::RecordRef) -> ThreadCtx,
+) {
+    use carrick_el1_abi::Lifecycle;
+    let fixture = Fixture::with_file_table(0x10000, asid(1), 5);
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let parked = Aarch64ParkedContext::from_parts(native, fixture.address);
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
+    let sibling = ThreadControlSlot::new();
+    sibling
+        .reset_for_host_birth(carrick_el1_abi::BlockedMask(0))
+        .unwrap();
+    assert!(sibling.publish_visible_tid(42));
+    sibling.publish_host_birth_identity(carrick_el1_abi::ExecutionBinding {
+        task: carrick_el1_abi::EntryTaskKey::from_raw(42),
+        generation: carrick_el1_abi::EntryGeneration::from_raw(12),
+        mm: carrick_el1_abi::EntryMmKey::from_raw(1),
+        thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(102),
+    });
+    let birth = fixture.page.reserve_host_birth().unwrap();
+    fixture.page.thread_born().unwrap();
+    assert!(
+        fixture
+            .page
+            .publish_host_birth(birth, sibling.host_birth_identity().unwrap())
+    );
+    assert_eq!(fixture.page.live(), 2);
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        TestStockCrossing::new(&[]),
+    );
+    let mut entry = runtime
+        .enter(source, &fixture.task, parked, &mut service)
+        .unwrap();
+    assert!(matches!(
+        entry.exit_group(7),
+        LifecycleOutcome::Transferred { .. }
+    ));
+    let (mm, address) = fixture.page.exit_wait().unwrap();
+    fixture
+        .page
+        .reserve_cancelled_member_exit()
+        .unwrap()
+        .publish();
+    fixture
+        .page
+        .publish_exact_host_retirement(&sibling, sibling.host_birth_identity().unwrap());
+    assert_eq!(fixture.page.live(), 0);
+    let guard = fixture
+        .zone
+        .lock(
+            ZoneTables::<Aarch64ParkedContext>::bucket_of_with_context(mm.raw(), address),
+            &carrick_sched_core::ShortLockSpin,
+        )
+        .unwrap();
+    let mut transfers = Vec::new();
+    assert_eq!(
+        fixture.zone.wake_host(
+            &guard,
+            mm.raw(),
+            address,
+            u32::MAX,
+            1,
+            false,
+            &mut |transfer| transfers.push(transfer),
+            &mut |_| panic!("host handback requested"),
+        ),
+        1
+    );
+    drop(guard);
+    let record = transfers
+        .pop()
+        .unwrap()
+        .finish(&carrick_sched_core::ShortLockSpin)
+        .unwrap();
+    assert!(transfers.is_empty());
+    assert!(matches!(
+        fixture.zone.record(record.id).claim(),
+        carrick_el1_abi::Claim::Host { .. }
+    ));
+    drop(entry);
+    let mut resumed = witness(fixture.zone, record);
+    assert_eq!(
+        resumed.pc + 4,
+        native.pc,
+        "host re-enters the same native instruction"
+    );
+    assert_eq!(
+        resumed.x[0], 7,
+        "readiness does not replace the retained status"
+    );
+    let identity = fixture.zone.record(record.id).identity();
+    fixture.zone.free_record(record.id);
+    let replacement = fixture.zone.current_or_new(fixture.slot, identity).unwrap();
+    assert_eq!(
+        fixture.zone.record(replacement).resume_disposition(),
+        carrick_sched_core::object_wait::ResumeDisposition::UserReturn
+    );
+    // Execute the re-entry SVC: its architectural return PC is post-instruction.
+    resumed.pc += 4;
+    let words = Aarch64ParkedContext::from_parts(resumed, fixture.address);
+    let mut entry = runtime
+        .enter(source, &fixture.task, words, &mut service)
+        .unwrap();
+    let counters = Box::new(carrick_el1_abi::Counters::new());
+    let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
+    let mut frame = carrick_el1_abi::TrapFrame {
+        x: resumed.x,
+        elr: resumed.pc,
+        slot: fixture.slot.index() as u64,
+        ..Default::default()
+    };
+    let route = super::dispatch::dispatch_syscall_with_native(
+        &mut frame,
+        &counters,
+        core::slice::from_ref(&fixture.task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &cache,
+        None::<crate::Zone<'_, crate::sched::FakeCpu, crate::sched::HardwareUserWord>>,
+        None,
+        Some(&fixture),
+        Some(&mut entry),
+        Some(source),
+        None,
+        |_| core::ptr::null_mut(),
+    );
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+    );
+    assert_eq!(
+        entry.take_root_exit(),
+        Some(carrick_personality_linux::lifecycle::LinuxWaitStatus::exited(7))
+    );
+    assert!(
+        entry.resume_owned_continuation().is_none(),
+        "terminal custody is consumed once"
+    );
+}
+
 /// Runs the production native fork/exit owners over caller-owned file tables.
 /// Only MMU stock supply is simulated; files use real VFS admission and custody.
 pub fn with_native_file_fork(

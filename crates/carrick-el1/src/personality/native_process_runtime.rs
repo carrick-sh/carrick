@@ -516,6 +516,7 @@ enum OutstandingExitReceipt<'a> {
 
 struct PendingExit<'a> {
     status: LinuxWaitStatus,
+    caller: Arc<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
     channel: Arc<WaitChannel>,
     wake: Option<ExitWakeCustody>,
     outstanding: Vec<OutstandingExitReceipt<'a>>,
@@ -2085,6 +2086,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .ok_or(NativeProcessError::Stale)?;
         row.credentials_for(calling_tid)
             .map_err(|_| NativeProcessError::Stale)?;
+        let owner_continuation = graph
+            .pending_exit
+            .get(&key)
+            .is_some_and(|pending| core::ptr::eq(pending.caller.control(), control));
         drop(graph);
         Ok(NativeProcessEntry {
             runtime: self,
@@ -2111,6 +2116,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             calling_tid,
             slot,
             interrupted_child_wait: None,
+            owner_continuation,
         })
     }
     /// Enter through the exact process registry. A non-leader thread retains
@@ -2126,7 +2132,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
         words: C,
         service: &'r mut S,
     ) -> Result<NativeProcessEntry<'r, 'a, M, C, S>, NativeProcessError> {
-        let (binding, record, member_control, process, calling_tid) =
+        let (binding, record, member_control, process, calling_tid, owner_continuation) =
             self.authenticate_registered(registry, source, current, address, &words)?;
         Ok(NativeProcessEntry {
             runtime: self,
@@ -2153,6 +2159,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             calling_tid,
             slot: Some(member_control),
             interrupted_child_wait: None,
+            owner_continuation,
         })
     }
 
@@ -2171,6 +2178,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             &'a ThreadControlSlot,
             TaskKey,
             u32,
+            bool,
         ),
         NativeProcessError,
     > {
@@ -2237,6 +2245,10 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             .ok_or(NativeProcessError::Stale)?;
         row.credentials_for(calling_tid)
             .map_err(|_| NativeProcessError::Stale)?;
+        let owner_continuation = graph
+            .pending_exit
+            .get(&member.process)
+            .is_some_and(|pending| core::ptr::eq(pending.caller.control(), member_control));
         drop(graph);
         Ok((
             binding,
@@ -2244,6 +2256,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             member_control,
             member.process,
             calling_tid,
+            owner_continuation,
         ))
     }
     pub fn namespace_child_key(&self, caller: TaskKey, visible: u32) -> Option<TaskKey> {
@@ -2345,6 +2358,9 @@ pub struct NativeProcessEntry<
     calling_tid: u32,
     slot: Option<&'a ThreadControlSlot>,
     interrupted_child_wait: Option<Box<C>>,
+    // Captured by native admission under its existing graph guard. Ordinary
+    // syscall dispatch does not acquire another graph lock for this checkpoint.
+    owner_continuation: bool,
 }
 // Enrollment and committed settlement wait only for another party's short
 // bucket section. No graph guard is retained while acquiring this lock.
@@ -3372,8 +3388,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .lock()
             .pending_exit
             .get(&self.key)
+            .filter(|pending| core::ptr::eq(pending.caller.control(), self.control))
             .map(|p| p.status);
         if let Some(status) = status {
+            // SAFETY: this exact record is selected by the execution owner;
+            // the same checkpoint serves in-zone and host re-entry.
+            unsafe {
+                self.source
+                    .zone
+                    .record(self.record.id)
+                    .consume_owner_continuation();
+            }
             return Some(match self.exit_with_status(status) {
                 Ok(outcome) => outcome,
                 Err(error) => self.run_failed(error.run_failure_reason()),
@@ -3384,6 +3409,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 
     /// The ISA execution lane's single checkpoint after selecting a parked
     /// record. The owner consumes its continuation before any EL0 return.
+    #[inline(never)]
     pub fn resume_checkpoint(
         &mut self,
     ) -> Result<NativeResume, carrick_core_abi::NativeRunFailureReason> {
@@ -3451,7 +3477,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         zone.enqueue(&guard, record, sequence, channel.mm, address, u32::MAX, 0)
             .map_err(|_| NativeProcessError::Quarantined)?;
         // SAFETY: the current record remains owned until its guarded park CAS.
-        unsafe { *zone.record(record).ctx_mut() = self.words };
+        unsafe {
+            *zone.record(record).ctx_mut() = self.words;
+            zone.record(record).publish_owner_continuation();
+        }
         let receipt = carrick_core::entry::publish_handoff_park(
             start,
             &guard,
@@ -3694,6 +3723,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 // Every fallible retain precedes consumption. A refusal
                 // drops preparation with admission still closed and no begun
                 // claim or caller live unit consumed.
+                let caller = retain_member_control(self.control)?;
                 let custody = carrick_core::terminal::TerminalCustody::<
                     carrick_core::terminal::Process,
                     carrick_core::terminal::Live,
@@ -3726,6 +3756,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     self.key,
                     PendingExit {
                         status: wait_status,
+                        caller,
                         channel,
                         wake,
                         outstanding,
@@ -4470,6 +4501,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> ProcessNative<C>
     for NativeProcessEntry<'_, 'a, M, C, S>
 {
+    fn resume_owned_continuation(&mut self) -> Option<LifecycleOutcome> {
+        core::mem::take(&mut self.owner_continuation)
+            .then(|| self.resume_pending_lifecycle())
+            .flatten()
+    }
     fn take_run_failure(&mut self) -> Option<carrick_core_abi::NativeRunFailureReason> {
         self.run_failure.take()
     }
