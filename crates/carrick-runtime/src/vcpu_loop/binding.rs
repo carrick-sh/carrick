@@ -544,6 +544,13 @@ impl PersistentTerminal {
     }
 }
 
+fn settle_pending_host_work_at_poll(
+    slot: usize,
+    dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
+) {
+    carrick_kernel::el1_delegation::settle_pending_host_work_for(slot, dispatcher);
+}
+
 pub(crate) struct ProductionHvpatchLoopJob<E: ThreadedEngine> {
     pub(super) kernel: Kernel,
     pub(super) state: ThreadRuntimeState<E>,
@@ -4167,10 +4174,7 @@ where
         // (the reload then finds the slot still holding it).
         if !engine.el1_operation_suspended() {
             if let Some(slot) = engine.mailbox_slot() {
-                // This poll owns the host-work boundary requested by EL1 or
-                // a kick. Consume only the pre-boundary hint: a concurrent
-                // publication after the swap stays set for the next exit.
-                let _ = carrick_el1_abi::take_pending_host_work(slot);
+                settle_pending_host_work_at_poll(slot, &self.kernel.dispatcher);
             }
             if !self.phase.is_terminal_transition() {
                 self.state.publish_external_ingress(&self.kernel)?;
@@ -6915,6 +6919,85 @@ mod tests {
             panic!("owner route lost the exact transfer");
         };
         assert_eq!(pending.wait(), &MemoryReadWait::Owner(wait));
+    }
+
+    #[test]
+    fn serial_host_poll_boundary_delivers_owed_ipc_wake_before_forwarded_return() {
+        use carrick_el1_abi::ipc::{EventMode, IpcBacking};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ClearEl1Region;
+        impl Drop for ClearEl1Region {
+            fn drop(&mut self) {
+                carrick_el1_abi::record_el1_region_host_ptr(0);
+            }
+        }
+
+        const SLOT: usize = 3;
+        let region = carrick_test_support::TestEl1Region::zeroed();
+        carrick_el1_abi::record_el1_region_host_ptr(region.as_ptr() as usize);
+        let _clear = ClearEl1Region;
+        let at = region.as_ptr() as usize
+            + carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize
+            + SLOT * core::mem::size_of::<carrick_el1_abi::CurrentTask>();
+        // SAFETY: the aligned test region owns a complete zeroed CurrentTask.
+        let task = unsafe { &*(at as *const carrick_el1_abi::CurrentTask) };
+        let mut dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let owner = context.kernel().ipc().unwrap();
+        let object = owner.create_eventfd(0, EventMode::Counter).unwrap();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&wakes);
+        let queue = owner.test_wait_queue(object);
+        let reader = queue.enroll_callback(move |_| {
+            seen.fetch_add(1, Ordering::Relaxed);
+        });
+        let mut guard = owner
+            .region()
+            .lock(object, &carrick_kernel::el1_zone::HostLockWait)
+            .unwrap();
+        let step = guard.eventfd().unwrap().try_write(1);
+        assert!(guard.publish(step.wake).host_owed);
+        drop(guard);
+        task.linux.mark_pending_host_work();
+        task.linux.record_commit_owed(0xfeed);
+        assert_eq!(wakes.load(Ordering::Relaxed), 0);
+
+        // Poll has reached the host boundary for an ordinary forwarded call.
+        // The owed wake must be delivered before that call returns to EL0.
+        settle_pending_host_work_at_poll(SLOT, &dispatcher);
+        assert!(!task.linux.has_pending_host_work());
+        assert!(
+            !owner.service_host_wake(object),
+            "poll boundary left the eventfd wake owed"
+        );
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            task.linux.take_served_boundary(),
+            Some(carrick_el1_abi::ServedBoundary::ReplayOriginal { x0: 0xfeed })
+        );
+        assert_eq!(task.linux.take_served_boundary(), None);
+        let mut memory = carrick_kernel::dispatch::LinearMemory::new(0x10000, vec![0; 0x1000]);
+        let outcome = dispatcher
+            .dispatch(
+                &context,
+                carrick_kernel::dispatch::SyscallRequest::new(
+                    178,
+                    crate::compat::SyscallArgs::from([0; 6]),
+                ),
+                &mut memory,
+                &crate::compat::CompatReporter::default(),
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            carrick_kernel::dispatch::DispatchOutcome::Returned { value }
+                if value == i64::from(context.thread().key().tid.raw())
+        ));
+        drop(reader);
+        owner
+            .release(IpcBacking::EventFd { object }.encode())
+            .unwrap();
     }
 
     #[test]
