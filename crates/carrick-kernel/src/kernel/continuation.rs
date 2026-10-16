@@ -1078,6 +1078,7 @@ impl Drop for ContinuationState {
 #[derive(Debug)]
 pub enum BlockedContinuation {
     ZoneFutexWait(ContinuationState),
+    KillableOwnerZone(ContinuationState),
     FutexWait(ContinuationState),
     FutexWaitv(ContinuationState),
     SharedFutexWait(ContinuationState),
@@ -1103,6 +1104,7 @@ pub enum BlockedContinuation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContinuationFamily {
     ZoneFutexWait,
+    KillableOwnerZone,
     FutexWait,
     FutexWaitv,
     SharedFutexWait,
@@ -1131,6 +1133,7 @@ impl ContinuationFamily {
     pub const fn event_code(self) -> u8 {
         match self {
             Self::ZoneFutexWait => 22,
+            Self::KillableOwnerZone => 24,
             Self::FutexWait => 1,
             Self::FutexWaitv => 2,
             Self::SharedFutexWait => 3,
@@ -1160,6 +1163,7 @@ impl ContinuationFamily {
     pub(crate) const fn wire_name(self) -> &'static str {
         match self {
             Self::ZoneFutexWait => "zone-futex-wait",
+            Self::KillableOwnerZone => "killable-owner-zone",
             Self::FutexWait => "futex-wait",
             Self::FutexWaitv => "futex-waitv",
             Self::SharedFutexWait => "shared-futex-wait",
@@ -1668,6 +1672,15 @@ impl BlockedContinuation {
         })
     }
 
+    /// An owned write waits for its page owner without consuming ordinary
+    /// signals. Only SIGKILL can end this zone park before owner release.
+    pub fn from_killable_owner_zone_park(capture: ContinuationCapture, wait: ZoneWait) -> Self {
+        let Self::ZoneFutexWait(state) = Self::from_zone_park(capture, wait, None) else {
+            unreachable!()
+        };
+        Self::KillableOwnerZone(state)
+    }
+
     /// Retain child TID publication or clearing on the exact zone wait service.
     /// No syscall request, guest output, or restart is invented.
     pub fn from_retained_memory_zone_park(
@@ -1695,6 +1708,7 @@ impl BlockedContinuation {
     pub(crate) fn state(&self) -> &ContinuationState {
         match self {
             Self::ZoneFutexWait(state)
+            | Self::KillableOwnerZone(state)
             | Self::FutexWait(state)
             | Self::FutexWaitv(state)
             | Self::SharedFutexWait(state)
@@ -1721,6 +1735,7 @@ impl BlockedContinuation {
     fn state_mut(&mut self) -> &mut ContinuationState {
         match self {
             Self::ZoneFutexWait(state)
+            | Self::KillableOwnerZone(state)
             | Self::FutexWait(state)
             | Self::FutexWaitv(state)
             | Self::SharedFutexWait(state)
@@ -1747,6 +1762,7 @@ impl BlockedContinuation {
     pub const fn family(&self) -> ContinuationFamily {
         match self {
             Self::ZoneFutexWait(_) => ContinuationFamily::ZoneFutexWait,
+            Self::KillableOwnerZone(_) => ContinuationFamily::KillableOwnerZone,
             Self::FutexWait(_) => ContinuationFamily::FutexWait,
             Self::FutexWaitv(_) => ContinuationFamily::FutexWaitv,
             Self::SharedFutexWait(_) => ContinuationFamily::SharedFutexWait,
@@ -1790,6 +1806,7 @@ impl BlockedContinuation {
             self,
             Self::VforkParent(_)
                 | Self::ZoneFutexWait(_)
+                | Self::KillableOwnerZone(_)
                 | Self::FutexWait(_)
                 | Self::FutexWaitv(_)
                 | Self::SharedFutexWait(_)
@@ -2322,7 +2339,10 @@ impl BlockedContinuation {
                     None => match family {
                         // How a zone wait ended is the record's handback, which the
                         // runtime applies; `Return(0)` only names "woken".
-                        ContinuationFamily::ZoneFutexWait => ContinuationCompletion::Return(0),
+                        ContinuationFamily::ZoneFutexWait
+                        | ContinuationFamily::KillableOwnerZone => {
+                            ContinuationCompletion::Return(0)
+                        }
                         ContinuationFamily::FutexWait => ContinuationCompletion::Return(0),
                         ContinuationFamily::FutexWaitv => {
                             let index = match &self.state().detail {
@@ -2423,6 +2443,7 @@ impl BlockedContinuation {
                 },
                 ContinuationEvent::Timeout => match family {
                     ContinuationFamily::ZoneFutexWait
+                    | ContinuationFamily::KillableOwnerZone
                     | ContinuationFamily::FutexWait
                     | ContinuationFamily::FutexWaitv
                     | ContinuationFamily::SharedFutexWait

@@ -712,7 +712,7 @@ fn outcome_for(
         ContinuationFamily::PtraceStopSettle => {
             panic!("a ptrace settlement wait names an exact tracee and tracer precheck")
         }
-        ContinuationFamily::ZoneFutexWait => {
+        ContinuationFamily::ZoneFutexWait | ContinuationFamily::KillableOwnerZone => {
             panic!("a zone futex wait is constructed from the zone record it parked in")
         }
     }
@@ -723,6 +723,7 @@ fn continuation_family_event_codes_are_stable_unique_and_nonzero() {
     let mut families = DISPATCH_FAMILIES.to_vec();
     families.push(ContinuationFamily::VforkParent);
     families.push(ContinuationFamily::ZoneFutexWait);
+    families.push(ContinuationFamily::KillableOwnerZone);
     families.push(ContinuationFamily::PtraceStopSettle);
     let mut codes = families
         .into_iter()
@@ -738,7 +739,7 @@ fn continuation_family_event_codes_are_stable_unique_and_nonzero() {
     assert_eq!(
         codes,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
         ]
     );
 }
@@ -7415,6 +7416,98 @@ fn terminal_zone_capture_has_no_syscall_and_keeps_signals_pending() {
     assert_eq!(result.restart(), RestartDecision::NoRestart);
     assert!(result.reserved_signal().is_none());
     assert!(context.signal_authority().thread_pending().contains(10));
+}
+
+#[test]
+fn retained_write_owner_park_ignores_two_signals_until_release_but_kill_wakes() {
+    for (case, fatal) in [(15_460, false), (15_461, true)] {
+        let (kernel, context) = bootstrap(case);
+        let generation = publish(&context, case as u64);
+        let service = CarrierWaitService::new(Arc::new(Scheduler::new(Arc::clone(&kernel))));
+        let wait = ZoneWait::new(carrick_el1_abi::RecordRef::PLACEHOLDER, 1);
+        let mut write =
+            BlockedContinuation::from_killable_owner_zone_park(capture(&context, generation), wait);
+        let mut registration = service.prepare_registration(&write);
+        service.enroll(&mut registration).expect("park owned write");
+        let token = registration.wake_token();
+        let mut wakes = 0;
+        for signum in [carrick_abi::LINUX_SIGUSR1, carrick_abi::LINUX_SIGUSR2] {
+            context.signal_authority().enqueue_thread_standard(
+                crate::kernel::LinuxSignal::for_signal_number(signum).unwrap(),
+                None,
+            );
+            context.task().wake();
+            service.publish_signal_for_thread(context.thread().key());
+            if await_event_timeout(&service, token, Duration::from_millis(20)).is_some() {
+                wakes += 1;
+            }
+            assert_eq!(wakes, 0, "ordinary signal woke and re-parked owned write");
+        }
+        if fatal {
+            context.signal_authority().enqueue_thread_standard(
+                crate::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGKILL).unwrap(),
+                None,
+            );
+            context.task().wake();
+            service.publish_signal_for_thread(context.thread().key());
+            let event = await_event_timeout(&service, token, Duration::from_secs(1))
+                .expect("SIGKILL must wake")
+                .expect("kill event");
+            wakes += 1;
+            assert!(
+                matches!(&event, ContinuationEvent::ReservedSignal(signal) if signal.signum() == carrick_abi::LINUX_SIGKILL)
+            );
+            write.attach_registration(registration).unwrap();
+            let result = write.resume(event, &context).unwrap();
+            assert_eq!(
+                result.completion,
+                ContinuationCompletion::Errno(carrick_abi::LINUX_EINTR)
+            );
+            assert_eq!(wakes, 1);
+        } else {
+            assert!(
+                context
+                    .signal_authority()
+                    .thread_pending()
+                    .contains(carrick_abi::LINUX_SIGUSR1)
+            );
+            assert!(
+                context
+                    .signal_authority()
+                    .thread_pending()
+                    .contains(carrick_abi::LINUX_SIGUSR2)
+            );
+            service.publish_ready(token);
+            let event = await_event_timeout(&service, token, Duration::from_secs(1))
+                .expect("owner release must wake")
+                .expect("release event");
+            wakes += 1;
+            write.zone_wait().unwrap().mark_consumed();
+            write.attach_registration(registration).unwrap();
+            let result = write.resume(event, &context).unwrap();
+            assert_eq!(result.completion, ContinuationCompletion::Return(0));
+            assert_eq!(wakes, 1);
+            assert!(
+                context
+                    .signal_authority()
+                    .thread_pending()
+                    .contains(carrick_abi::LINUX_SIGUSR1)
+            );
+            assert!(
+                context
+                    .signal_authority()
+                    .thread_pending()
+                    .contains(carrick_abi::LINUX_SIGUSR2)
+            );
+            for signum in [carrick_abi::LINUX_SIGUSR1, carrick_abi::LINUX_SIGUSR2] {
+                let mask = SigSet::from_raw(1_u64 << (signum - 1));
+                assert!(
+                    context.signal_authority().take_lowest_in(mask).is_some(),
+                    "signal must remain deliverable after write completion"
+                );
+            }
+        }
+    }
 }
 
 #[test]
