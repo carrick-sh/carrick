@@ -10705,7 +10705,7 @@ mod tests {
         }
     }
     #[test]
-    fn external_sigint_reaches_blocked_native_guest_through_ingress() {
+    fn admitted_ingress_record_interrupts_native_ipc_wait() {
         blocked_ipc_signal_contract(0, false, true);
     }
     #[test]

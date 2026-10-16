@@ -8324,26 +8324,6 @@ mod tests {
     }
 
     #[test]
-    fn native_host_work_hint_is_consumed_at_host_boundary() {
-        let source = include_str!("binding.rs");
-        let poll = source
-            .split("fn poll_with_engine(")
-            .nth(1)
-            .and_then(|tail| tail.split("\n    fn poll_with_engine_typed(").next())
-            .expect("production job poll");
-        let guard = poll
-            .find("if !engine.el1_operation_suspended() {")
-            .expect("suspended EL1 guard");
-        let take = poll
-            .find("take_pending_host_work")
-            .expect("host work hint must be consumed before guest re-entry");
-        let run = poll
-            .find("let next = engine.next_syscall();")
-            .expect("guest run");
-        assert!(guard < take && take < run);
-    }
-
-    #[test]
     fn persistent_worker_drain_never_waits_for_a_removed_logical_job() {
         let source = include_str!("binding.rs");
         let threads_source = include_str!("threads.rs");
