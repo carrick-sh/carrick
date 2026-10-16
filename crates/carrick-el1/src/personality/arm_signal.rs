@@ -587,7 +587,7 @@ mod tests {
 ))]
 use carrick_guest_arch::UserVa;
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::FromBytes;
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl carrick_personality_linux::signal::SignalBackend for crate::isa::aarch64::Aarch64Backend {
