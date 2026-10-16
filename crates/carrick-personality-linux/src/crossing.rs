@@ -435,14 +435,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ring_first_census_host_files_and_signal_return_are_admitted() {
-        for ordinal in [213, 223, 281, 139, 230, 231] {
+    fn ring_first_census_host_files_are_admitted_but_signal_return_is_owned() {
+        for ordinal in [213, 223, 281, 230, 231] {
             assert!(
                 HostCrossingSet::Aarch64.is_allowed(CanonicalNr::new(ordinal)),
                 "ARM fallback ordinal={ordinal}"
             );
             assert!(!HostCrossingSet::X86.is_allowed(CanonicalNr::new(ordinal)));
         }
+        assert!(!HostCrossingSet::Aarch64.is_allowed(nr::RT_SIGRETURN));
     }
 
     #[test]
