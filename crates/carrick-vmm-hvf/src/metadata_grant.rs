@@ -1379,8 +1379,10 @@ pub(crate) fn service_native_fork_stock(
             match stock.owner.settle(
                 &mut *ledger,
                 execution,
-                settlement,
-                physical,
+                carrick_hal::fork_stock::ForkStockSettlementReceipt {
+                    record: settlement,
+                    physical,
+                },
                 |pages| {
                     pages.iter().all(|page| {
                         ForkStockHostCustody::physical_ptr::<[u8; 4096]>(custody, page.address())
