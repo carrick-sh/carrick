@@ -413,6 +413,286 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
         res = self.run_check(head_sha=committed_head)
         self.assertEqual(res.returncode, 0, msg=f"stdout: {res.stdout}, stderr: {res.stderr}")
 
+    def seed_extractable_futex(self):
+        self.use_single_contract_surface()
+        with (self.repo / "conformance-contracts" / "surfaces.toml").open("a", encoding="utf-8") as f:
+            f.write(
+                '\n[[surfaces]]\n'
+                'path = "crates/carrick-kernel/src/dispatch/waiter.rs"\n'
+                'contracts = ["kernel.futex.contention"]\n'
+            )
+        self.guest_file.write_text(
+            "pub struct Futex;\n\n"
+            "impl Futex {\n"
+            "    pub fn entry() -> i32 {\n"
+            "        park_waiter(1)\n"
+            "    }\n\n"
+            "    pub fn indented_helper(val: i32) -> i32 {\n"
+            "        let stepped = val + 1;\n"
+            "        stepped\n"
+            "    }\n"
+            "}\n\n"
+            "pub fn park_waiter(val: i32) -> i32 {\n"
+            "    let next = val + 1;\n"
+            "    next\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "seed extractable futex"], cwd=self.repo, check=True)
+        self.base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        return self.guest_file.with_name("waiter.rs")
+
+    def test_pure_move_into_new_module_passes(self):
+        waiter_file = self.seed_extractable_futex()
+        self.guest_file.write_text(
+            "// attached module comment\n"
+            "#[cfg(not(test))]\n"
+            "pub(crate) mod waiter;\n"
+            "pub use waiter::park_waiter;\n\n"
+            "pub struct Futex;\n\n"
+            "impl Futex {\n"
+            "    pub fn entry() -> i32 {\n"
+            "        park_waiter(1)\n"
+            "    }\n\n"
+            "    pub fn indented_helper(val: i32) -> i32 {\n"
+            "        let stepped = val + 1;\n"
+            "        stepped\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        waiter_file.write_text(
+            "use core::cmp::max;\n\n"
+            "pub fn park_waiter(val: i32) -> i32 {\n"
+            "    let next = val + 1;\n"
+            "    next\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "pure move park_waiter to waiter module"], cwd=self.repo, check=True)
+
+        res = self.run_check()
+        self.assertEqual(res.returncode, 0, msg=f"stdout: {res.stdout}, stderr: {res.stderr}")
+        self.assertIn(
+            "move-covered: crates/carrick-kernel/src/dispatch/futex.rs (4 moved lines)",
+            res.stdout,
+        )
+        self.assertIn(
+            "move-covered: crates/carrick-kernel/src/dispatch/waiter.rs (4 moved lines)",
+            res.stdout,
+        )
+
+    def test_move_plus_reindentation_passes(self):
+        waiter_file = self.seed_extractable_futex()
+        self.guest_file.write_text(
+            "mod waiter;\n"
+            "use waiter::indented_helper;\n\n"
+            "pub struct Futex;\n\n"
+            "impl Futex {\n"
+            "    pub fn entry() -> i32 {\n"
+            "        park_waiter(1)\n"
+            "    }\n"
+            "}\n\n"
+            "pub fn park_waiter(val: i32) -> i32 {\n"
+            "    let next = val + 1;\n"
+            "    next\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        waiter_file.write_text(
+            "pub fn indented_helper(val: i32) -> i32 {\n"
+            "    let stepped = val + 1;\n"
+            "    stepped\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "move and unindent helper"], cwd=self.repo, check=True)
+
+        res = self.run_check()
+        self.assertEqual(res.returncode, 0, msg=f"stdout: {res.stdout}, stderr: {res.stderr}")
+        self.assertIn(
+            "move-covered: crates/carrick-kernel/src/dispatch/futex.rs (4 moved lines)",
+            res.stdout,
+        )
+        self.assertIn(
+            "move-covered: crates/carrick-kernel/src/dispatch/waiter.rs (4 moved lines)",
+            res.stdout,
+        )
+
+    def test_move_with_one_identifier_changed_fails(self):
+        waiter_file = self.seed_extractable_futex()
+        self.guest_file.write_text(
+            "pub mod waiter;\n"
+            "pub use waiter::park_waiter;\n\n"
+            "pub struct Futex;\n\n"
+            "impl Futex {\n"
+            "    pub fn entry() -> i32 {\n"
+            "        park_waiter(1)\n"
+            "    }\n\n"
+            "    pub fn indented_helper(val: i32) -> i32 {\n"
+            "        let stepped = val + 1;\n"
+            "        stepped\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        waiter_file.write_text(
+            "pub fn park_waiter(val: i32) -> i32 {\n"
+            "    let renamed_next = val + 1;\n"
+            "    next\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "move with renamed identifier"], cwd=self.repo, check=True)
+
+        res = self.run_check()
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("uncovered guest surface", res.stderr)
+
+    def test_move_plus_added_non_declaration_line_in_either_file_fails(self):
+        waiter_file = self.seed_extractable_futex()
+        # Case 1: non-declaration line added in source file (futex.rs)
+        self.guest_file.write_text(
+            "pub mod waiter;\n"
+            "pub use waiter::park_waiter;\n"
+            "pub const EXTRA_IN_SOURCE: i32 = 1;\n\n"
+            "pub struct Futex;\n\n"
+            "impl Futex {\n"
+            "    pub fn entry() -> i32 {\n"
+            "        park_waiter(1)\n"
+            "    }\n\n"
+            "    pub fn indented_helper(val: i32) -> i32 {\n"
+            "        let stepped = val + 1;\n"
+            "        stepped\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        waiter_file.write_text(
+            "pub fn park_waiter(val: i32) -> i32 {\n"
+            "    let next = val + 1;\n"
+            "    next\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "move plus non-decl in source"], cwd=self.repo, check=True)
+
+        res_source = self.run_check()
+        self.assertEqual(res_source.returncode, 1)
+        self.assertIn("uncovered guest surface", res_source.stderr)
+
+        # Case 2: non-declaration line added in destination file (waiter.rs)
+        subprocess.run(["git", "reset", "--hard", self.base_sha], cwd=self.repo, check=True)
+        self.guest_file.write_text(
+            "pub mod waiter;\n"
+            "pub use waiter::park_waiter;\n\n"
+            "pub struct Futex;\n\n"
+            "impl Futex {\n"
+            "    pub fn entry() -> i32 {\n"
+            "        park_waiter(1)\n"
+            "    }\n\n"
+            "    pub fn indented_helper(val: i32) -> i32 {\n"
+            "        let stepped = val + 1;\n"
+            "        stepped\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        waiter_file.write_text(
+            "pub fn park_waiter(val: i32) -> i32 {\n"
+            "    let next = val + 1;\n"
+            "    next\n"
+            "}\n"
+            "pub const EXTRA_IN_DEST: i32 = 2;\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "move plus non-decl in dest"], cwd=self.repo, check=True)
+
+        res_dest = self.run_check()
+        self.assertEqual(res_dest.returncode, 1)
+        self.assertIn("uncovered guest surface", res_dest.stderr)
+
+    def test_duplicated_line_with_wrong_multiplicity_fails(self):
+        waiter_file = self.seed_extractable_futex()
+        self.guest_file.write_text(
+            "pub mod waiter;\n"
+            "pub use waiter::park_waiter;\n\n"
+            "pub struct Futex;\n\n"
+            "impl Futex {\n"
+            "    pub fn entry() -> i32 {\n"
+            "        park_waiter(1)\n"
+            "    }\n\n"
+            "    pub fn indented_helper(val: i32) -> i32 {\n"
+            "        let stepped = val + 1;\n"
+            "        stepped\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        # `let next = val + 1;` removed once, added twice
+        waiter_file.write_text(
+            "pub fn park_waiter(val: i32) -> i32 {\n"
+            "    let next = val + 1;\n"
+            "    let next = val + 1;\n"
+            "    next\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "duplicate moved line"], cwd=self.repo, check=True)
+
+        res = self.run_check()
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("uncovered guest surface", res.stderr)
+
+    def test_deletion_with_no_matching_addition_fails(self):
+        waiter_file = self.seed_extractable_futex()
+        self.guest_file.write_text(
+            "pub mod waiter;\n"
+            "pub use waiter::park_waiter;\n\n"
+            "pub struct Futex;\n\n"
+            "impl Futex {\n"
+            "    pub fn entry() -> i32 {\n"
+            "        park_waiter(1)\n"
+            "    }\n\n"
+            "    pub fn indented_helper(val: i32) -> i32 {\n"
+            "        let stepped = val + 1;\n"
+            "        stepped\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        # Missing `let next = val + 1;` in destination
+        waiter_file.write_text(
+            "pub fn park_waiter(val: i32) -> i32 {\n"
+            "    next\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "drop one line during move"], cwd=self.repo, check=True)
+
+        res = self.run_check()
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("uncovered guest surface", res.stderr)
+
+    def test_existing_byte_identical_rename_still_passes(self):
+        self.seed_extractable_futex()
+        renamed = self.guest_file.with_name("futex_byte_identical.rs")
+        subprocess.run(["git", "mv", str(self.guest_file), str(renamed)], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "byte-identical rename of seeded futex"], cwd=self.repo, check=True)
+
+        res = self.run_check()
+        self.assertEqual(res.returncode, 0, msg=f"stdout: {res.stdout}, stderr: {res.stderr}")
+
 
 if __name__ == "__main__":
     unittest.main()
