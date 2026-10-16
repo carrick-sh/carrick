@@ -2173,6 +2173,21 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.cow_authority.clone()
     }
 
+    fn native_fork_table_arenas(&self) -> usize {
+        // Eight arenas from the existing pre-mapped carrier table pool, exclusively
+        // reserved by the runtime allocator; no overlapping host allocation.
+        8.min(crate::frame_pool::root_slot_pool_size() / crate::frame_pool::ROOT_SLOT_SIZE)
+    }
+    fn install_native_fork_stock(
+        &self,
+        reservation: Arc<dyn carrick_hal::fork_stock::NativeForkTableReservation>,
+    ) -> Result<(), TrapError> {
+        crate::fork_stock::ForkStockHostCustody::install(
+            &self.state.carrier_vm_custody(),
+            reservation,
+        )
+    }
+
     fn carrier_asid_allocator(&self) -> Option<carrick_hal::asid::AsidAllocator> {
         Some(self.state.carrier_vm_custody().asids.clone())
     }

@@ -64,9 +64,9 @@ pub(crate) fn cross_hvc_fork_stock(record_gpa: u64, cpu: u64) -> Result<(), ()> 
             core::arch::asm!(
                 "hvc #6",
                 inout("x0") status,
-                in("x1") record_gpa,
-                in("x2") cpu,
-                in("x3") 0u64,
+                inlateout("x1") record_gpa => _,
+                inlateout("x2") cpu => _,
+                inlateout("x3") 0u64 => _,
                 options(nostack)
             );
         }
@@ -90,9 +90,9 @@ pub(crate) fn cross_hvc_root_exit(record_gpa: u64, cpu: u64) -> Result<(), ()> {
             core::arch::asm!(
                 "hvc #6",
                 inout("x0") status,
-                in("x1") record_gpa,
-                in("x2") cpu,
-                in("x3") 0u64,
+                inlateout("x1") record_gpa => _,
+                inlateout("x2") cpu => _,
+                inlateout("x3") 0u64 => _,
                 options(nostack)
             );
         }
@@ -116,9 +116,9 @@ pub(crate) fn cross_hvc_child_retire(record_gpa: u64, cpu: u64) -> Result<(), ()
             core::arch::asm!(
                 "hvc #6",
                 inout("x0") status,
-                in("x1") record_gpa,
-                in("x2") cpu,
-                in("x3") 0u64,
+                inlateout("x1") record_gpa => _,
+                inlateout("x2") cpu => _,
+                inlateout("x3") 0u64 => _,
                 options(nostack)
             );
         }

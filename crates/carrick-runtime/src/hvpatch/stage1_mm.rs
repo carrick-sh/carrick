@@ -563,7 +563,58 @@ impl carrick_mmu_core::aarch64::TableArenaSource for Stage1MmTableArenaSource {
     }
 }
 
+/// Exclusive table arenas held out of the runtime allocator while EL1's
+/// shared fork-stock owner can issue their pages.
+#[derive(Debug)]
+pub(crate) struct NativeForkTableReservation {
+    pool: Stage1MmPool,
+    slots: Vec<Stage1RootSlot>,
+    arenas: Vec<carrick_guest_arch::RootGpa>,
+}
+impl carrick_hal::fork_stock::NativeForkTableReservation for NativeForkTableReservation {
+    fn arenas(&self) -> &[carrick_guest_arch::RootGpa] {
+        &self.arenas
+    }
+}
+impl Drop for NativeForkTableReservation {
+    fn drop(&mut self) {
+        self.pool
+            .inner
+            .lock()
+            .free_root_slots
+            .extend(self.slots.drain(..));
+    }
+}
+
 impl Stage1MmPool {
+    pub(crate) fn reserve_native_fork_tables(
+        &self,
+        count: usize,
+    ) -> Result<Arc<NativeForkTableReservation>, Stage1MmError> {
+        let mut inner = self.inner.lock();
+        if inner.free_root_slots.len() < count {
+            return Err(Stage1MmError::RootSlotExhausted);
+        }
+        let slots: Vec<_> = inner.free_root_slots.iter().take(count).copied().collect();
+        let arenas = slots
+            .iter()
+            .map(|slot| {
+                carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(
+                    slot.base(),
+                ))
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or(Stage1MmError::RootSlotExhausted)?;
+        for slot in &slots {
+            inner.free_root_slots.remove(slot);
+        }
+        Ok(Arc::new(NativeForkTableReservation {
+            pool: self.clone(),
+            slots,
+            arenas,
+        }))
+    }
+
     #[cfg(test)]
     pub(crate) fn new_root_for_tests(
         stage1_root: u64,
@@ -1498,6 +1549,38 @@ mod tests {
                 NonZeroU64::new(1).unwrap(),
             ),
         }
+    }
+
+    #[test]
+    fn native_stock_reservation_excludes_host_roots_until_backing_retires() {
+        use carrick_hal::fork_stock::NativeForkTableReservation as _;
+        let (pool, _) = Stage1MmPool::new_root_for_tests(0x8000, 8).unwrap();
+        let reservation = pool
+            .reserve_native_fork_tables(STAGE1_ROOT_SLOT_COUNT as usize - 1)
+            .unwrap();
+        let child = pool.prepare_child().unwrap();
+        assert!(
+            !reservation
+                .arenas()
+                .iter()
+                .any(|arena| arena.address().raw() == child.root_slot().unwrap().base())
+        );
+        assert!(matches!(
+            pool.prepare_child(),
+            Err(Stage1MmError::RootSlotExhausted)
+        ));
+        let retained = Arc::clone(&reservation);
+        drop(reservation);
+        assert!(matches!(
+            pool.prepare_child(),
+            Err(Stage1MmError::RootSlotExhausted)
+        ));
+        drop(retained);
+        assert!(pool.prepare_child().is_ok());
+        assert_eq!(
+            pool.inner.lock().free_root_slots.len(),
+            STAGE1_ROOT_SLOT_COUNT as usize - 1
+        );
     }
 
     #[test]
