@@ -17,6 +17,7 @@ pub enum NativeForkStage {
     Commit,
     Abort,
     OpenChildSpace,
+    StockCrossing,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,6 +25,10 @@ pub enum NativeForkCause {
     Mm(MmError),
     Reservation(Refusal),
     Fork(ForkError),
+    StockCrossing {
+        status: u64,
+        reply: Option<carrick_el1_abi::ForkStockRefusal>,
+    },
 }
 
 impl From<MmError> for NativeForkCause {

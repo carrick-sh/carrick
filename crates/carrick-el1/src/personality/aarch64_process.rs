@@ -703,8 +703,32 @@ impl ForkStockCrossing for HvcForkStockCrossing {
     fn cross_fork_stock(&self, record_gpa: u64, cpu: u64) -> Result<(), NativeProcessError> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         {
-            crate::isa::aarch64::cross_hvc_fork_stock(record_gpa, cpu)
-                .map_err(|_| NativeProcessError::Fault)
+            crate::isa::aarch64::cross_hvc_fork_stock(record_gpa, cpu).map_err(|status| {
+                // SAFETY: the synchronous crossing retains its owned,
+                // aligned loan or settlement record on this EL1 stack.
+                let tag = unsafe { *(record_gpa as *const u64) };
+                let reply = if carrick_el1_abi::ForkStockKind::decode(tag)
+                    == Some(carrick_el1_abi::ForkStockKind::Loan)
+                {
+                    // Only consume an already refused reply. A malformed
+                    // transport status must not consume a successful loan.
+                    let exchange = unsafe { &mut *(record_gpa as *mut ForkStockExchange) };
+                    if exchange.status == 2 {
+                        exchange
+                            .request()
+                            .and_then(|request| exchange.take(request))
+                            .and_then(Result::err)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                refused(
+                    NativeForkStage::StockCrossing,
+                    super::native_fork_refusal::NativeForkCause::StockCrossing { status, reply },
+                )
+            })
         }
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         {
