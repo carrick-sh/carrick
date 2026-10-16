@@ -8337,7 +8337,9 @@ mod tests {
         let take = poll
             .find("take_pending_host_work")
             .expect("host work hint must be consumed before guest re-entry");
-        let run = poll.find("let next = engine.next_syscall();").expect("guest run");
+        let run = poll
+            .find("let next = engine.next_syscall();")
+            .expect("guest run");
         assert!(guard < take && take < run);
     }
 
