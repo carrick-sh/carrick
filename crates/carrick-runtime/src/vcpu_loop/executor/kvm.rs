@@ -55,6 +55,7 @@ use super::{
 };
 use super::{PersistentTaskBinding, TaskBindingDirectory, TaskBindingResolver, TaskLoadIdentity};
 
+use super::super::signal_ingress_producer::{HostIngressTarget, HostSignalIngressProducer};
 use carrick_hal::x8664_arch::{SyscallNorm, X8664GuestArch};
 use carrick_kernel::compat::CompatReporter;
 use carrick_kernel::dispatch::{
@@ -308,6 +309,7 @@ impl PersistentExecutorFactory for KvmPersistentExecutorFactory {
             completion_sent: false,
             host_objects: Arc::clone(&self.host_objects),
             bound_host_fds: Arc::clone(&self.bound_host_fds),
+            external_signals: HostSignalIngressProducer::new(),
             idle_kick: carrick_vmm_kvm::KvmKickHandle::for_current_thread(),
         })
     }
@@ -329,6 +331,7 @@ pub(crate) struct KvmPersistentExecutor {
     completion_sent: bool,
     host_objects: Arc<Mutex<[u32; 3]>>,
     bound_host_fds: Arc<BoundHostFds>,
+    external_signals: HostSignalIngressProducer,
 }
 
 struct RetainedForward {
@@ -572,6 +575,22 @@ impl PersistentExecutor for KvmPersistentExecutor {
                 binding.arch().task(),
             )
             .admit(lease.thread_key(), lease.generation(), self.task)?;
+            let context = binding.fresh_context()?;
+            let target = HostIngressTarget::from_context(&context);
+            let host_signal = Arc::clone(
+                &self
+                    .dispatcher
+                    .lock()
+                    .map_err(|_| TrapError::Hypervisor("KVM dispatcher poisoned".into()))?
+                    .host_signal,
+            );
+            self.external_signals
+                .publish(self.physical.signal_ingress()?, target, |tid| {
+                    host_signal.take_pending_for(tid)
+                })
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!("KVM external ingress: {error:?}"))
+                })?;
             if let Some(binding) = self.binding.as_ref().cloned()
                 && submission
                     .execution_lease_mut()?

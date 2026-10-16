@@ -703,6 +703,9 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         }
         deliver_wakes(effects);
     }
+    fn request_ingress_producer_boundary(&mut self) {
+        self.task.linux.mark_pending_host_work();
+    }
     fn child_file_table(&self, _parent_table: u64, issued: u64) -> u64 {
         issued
     }
