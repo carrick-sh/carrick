@@ -641,7 +641,7 @@ impl Fixture {
             self.page,
             control,
             service,
-            dispatch,
+            |process| dispatch(process),
         )
     }
     #[cfg(test)]

@@ -69,10 +69,14 @@ fn check_process_exit_frames(disassembly: &str) {
             true,
         ),
         ("::resume_checkpoint::", 0x400, true),
-        // The ARM codec is dormant until #323 routes rt_sigreturn in-ring.
-        // Once linked, its frame must fit below the budget; #323 makes this
-        // symbol required as part of the atomic signal-owner cutover.
-        ("Aarch64Backend$GT$::restore_signal_frame::", 0x1300, false),
+        (
+            "::arm_signal::restore_live_arm_signal_frame::",
+            0x1300,
+            true,
+        ),
+        ("::arm_signal::deliver_on_user_return::", 0x1000, true),
+        ("::dispatch::arm_signal_user_return::", 0x1000, true),
+        ("Aarch64Backend$GT$::restore_signal_frame::", 0x1300, true),
     ];
     for (symbol, ceiling, required) in budgets {
         let mut found = false;

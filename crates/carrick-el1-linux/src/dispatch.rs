@@ -157,6 +157,13 @@ impl GuestDispatchFrame for TrapFrame {
     fn arm_frame_ref(&self) -> Option<&TrapFrame> {
         Some(self)
     }
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    fn restore_signal_frame(
+        &mut self,
+        copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
+    ) -> Result<carrick_signal_core::policy::SigBlockMask, carrick_syscall_abi::LinuxErrno> {
+        super::arm_signal::restore_live_arm_signal_frame(self, copy_in)
+    }
     fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
         None
     }
@@ -426,6 +433,7 @@ where
         zone: service.zone,
         slot: service.slot,
     };
+    let task = service.task;
     super::aarch64_process::with_process_entry(
         source,
         service.task,
@@ -435,7 +443,7 @@ where
         control,
         service,
         |process| {
-            dispatch_syscall_with_native(
+            let route = dispatch_syscall_with_native(
                 frame,
                 counters,
                 current_tasks,
@@ -451,7 +459,17 @@ where
                 Some(source),
                 None,
                 cache_lookup,
-            )
+            );
+            #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+            if route == carrick_personality_linux::dispatch::CompletionRoute::Served
+                && let Some(delivery) =
+                    super::arm_signal::deliver_on_user_return(task, process, frame)
+            {
+                return delivery;
+            }
+            #[cfg(test)]
+            let _ = task;
+            route
         },
     )
 }
@@ -464,7 +482,7 @@ pub(super) fn arm_process_call_claimed(
 ) -> bool {
     nr == 435
         || (nr == 220 && flags & 0x0001_0000 == 0)
-        || (matches!(nr, 260 | 93 | 94 | 95 | 58) && registered())
+        || (matches!(nr, 260 | 93 | 94 | 95 | 58 | 139) && registered())
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
@@ -619,13 +637,65 @@ pub fn dispatch_irq(frame: &mut TrapFrame, counters: &Counters) -> Action {
 
 /// Unified entry dispatch (interrupts, lower-EL data aborts, and syscalls).
 pub fn dispatch_entry(frame: &mut TrapFrame, counters: &Counters) -> Action {
-    if frame.esr == 0 {
-        return dispatch_irq(frame, counters);
+    let action = if frame.esr == 0 {
+        dispatch_irq(frame, counters)
+    } else if matches!((frame.esr >> 26) & 0x3f, 0x20 | 0x24) {
+        dispatch_fault(frame, counters)
+    } else {
+        dispatch_syscall(frame, counters)
+    };
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    if action == Action::Served
+        && (frame.esr == 0 || matches!((frame.esr >> 26) & 0x3f, 0x20 | 0x24))
+    {
+        return arm_signal_user_return(frame);
     }
-    if matches!((frame.esr >> 26) & 0x3f, 0x20 | 0x24) {
-        return dispatch_fault(frame, counters);
+    action
+}
+
+/// The one native signal checkpoint at the actual EL0 return boundary. The
+/// syscall work ledger and scheduler resume result have already settled here;
+/// IRQ, fault and SVC returns all pass through the same owner.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[inline(never)]
+fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
+    let current_tasks: &'static [CurrentTask; EL1_STACK_SLOTS as usize] =
+        unsafe { &*(EL1_CURRENT_TASKS_BASE as *const [CurrentTask; EL1_STACK_SLOTS as usize]) };
+    let Some(task) = current_tasks.get(frame.slot as usize) else {
+        return Action::Served;
+    };
+    let Some((page, control)) = task.lifecycle_refs() else {
+        return Action::Served;
+    };
+    if !control.native_signal_owner() || !carrick_el1_abi::Lifecycle::gate(page).serves_ring() {
+        return Action::Served;
     }
-    dispatch_syscall(frame, counters)
+    let Some(slot) = SlotId::from_index(frame.slot as usize) else {
+        invalid_completion(NativeInvariant::EntryBinding)
+    };
+    let zone: &'static ZoneTables = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
+    let source = carrick_el1_abi::BornInZoneSource { zone, slot };
+    let mut saved = alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
+    sched::ThreadCpu::save(&mut sched::HardwareCpu, frame, &mut saved);
+    let ttbr0 = crate::isa::aarch64::hardware_live_ttbr();
+    let mut service = super::aarch64_process::Aarch64NativeProcessService::new(task, slot)
+        .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
+    let delivered = super::aarch64_process::with_process_entry(
+        source,
+        task,
+        saved.native,
+        ttbr0,
+        page,
+        control,
+        &mut service,
+        |process| super::arm_signal::deliver_on_user_return(task, process, frame),
+    )
+    .unwrap_or_else(|_| invalid_completion(NativeInvariant::EntryBinding));
+    match delivered {
+        None | Some(carrick_personality_linux::dispatch::CompletionRoute::Served) => Action::Served,
+        Some(carrick_personality_linux::dispatch::CompletionRoute::Suspended) => Action::Idle,
+        Some(_) => invalid_completion(NativeInvariant::EntryBinding),
+    }
 }
 
 /// [`dispatch_irq`] with explicitly supplied tables (EL1 and host tests).
