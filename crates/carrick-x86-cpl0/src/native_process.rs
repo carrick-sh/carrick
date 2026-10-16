@@ -54,6 +54,17 @@ fn drain_retired_spaces(owner: &Portal, worker: u32) -> Result<(), NativeProcess
 pub(super) fn registry() -> &'static NativeProcessRegistry<'static, Mm, ParkedContextWords> {
     &REGISTRY
 }
+pub(super) fn drain_external_ingress(
+    source: BornInZoneSource<'static, ParkedContextWords>,
+    service: &mut Service,
+) -> Result<usize, NativeProcessError> {
+    REGISTRY.drain_external_ingress(
+        source.zone,
+        carrick_el1::isa::signal_ingress_guest(),
+        source.slot,
+        service,
+    )
+}
 pub(super) fn runtime(
     source: BornInZoneSource<'static, ParkedContextWords>,
     task: &'static CurrentTask,

@@ -407,6 +407,8 @@ pub fn signal_user_return(
         let _copy_gate = user_fault_gate::install();
         let words = capture(frame, xsave);
         let mut service = native_process::Service::new(task, slot);
+        native_process::drain_external_ingress(source, &mut service)
+            .unwrap_or_else(|_| fatal_boot());
         let (process_runtime, address) =
             native_process::runtime(source, task).unwrap_or_else(|_| fatal_boot());
         let mut process = process_runtime
@@ -495,6 +497,8 @@ pub fn signal_irq_return(
     {
         let _copy_gate = user_fault_gate::install();
         let mut service = native_process::Service::new(task, slot);
+        native_process::drain_external_ingress(source, &mut service)
+            .unwrap_or_else(|_| fatal_boot());
         let (process_runtime, runtime_address) =
             native_process::runtime(source, task).unwrap_or_else(|_| fatal_boot());
         let mut process = process_runtime
@@ -927,6 +931,8 @@ impl Personality for LinuxPersonality {
         admit_stdio_cached(binding, task, &files);
         let file_table = task.linux.file_table.load(Ordering::Acquire).max(1);
         let mut service = native_process::Service::new(task, slot);
+        native_process::drain_external_ingress(source, &mut service)
+            .unwrap_or_else(|_| fatal_boot());
         let (route, root_exit) = {
             let (runtime, address) =
                 native_process::runtime(source, task).unwrap_or_else(|_| fatal_boot());
