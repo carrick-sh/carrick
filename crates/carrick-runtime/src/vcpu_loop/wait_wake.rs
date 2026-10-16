@@ -259,12 +259,28 @@ struct ProcessPhysicalRetirementPublication {
 }
 
 impl ProcessPhysicalRetirement {
-    pub(crate) fn failure_needs_publication(&self) -> bool {
-        self.state
-            .publication
-            .lock()
-            .completions
-            .failure_needs_publication()
+    pub(crate) fn publish_failure_if_absent(
+        &self,
+        make_completions: impl FnOnce() -> Result<Vec<continuation::LogicalJobCompletion>, RuntimeError>,
+    ) -> Result<bool, RuntimeError> {
+        let mut publication = self.state.publication.lock();
+        if publication.completions.published().is_some() {
+            return Ok(false);
+        }
+        let completions = make_completions()?;
+        if completions.is_empty() {
+            return Err(RuntimeError::Configuration(
+                "HVPatch terminal physical-retirement receipt omitted every process member"
+                    .to_owned(),
+            ));
+        }
+        publication.completions.publish(completions).map_err(|_| {
+            RuntimeError::Configuration(
+                "HVPatch process physical-retirement receipt was published twice".to_owned(),
+            )
+        })?;
+        self.state.changed.notify_all();
+        Ok(true)
     }
 
     pub(crate) fn begin_process_exit(&self) {
@@ -1447,6 +1463,33 @@ mod tests {
                 .contains("terminal physical-retirement receipt was not published"),
             "unexpected invariant: {error}"
         );
+    }
+
+    #[test]
+    fn failure_settlement_reuses_normal_physical_retirement_receipt() {
+        let retirement = ProcessPhysicalRetirement::default();
+        let normal = continuation::LogicalJobCompletion::pending();
+        retirement
+            .publish(vec![normal.clone()])
+            .expect("normal receipt");
+        let mut rebuilt = false;
+        assert!(
+            !retirement
+                .publish_failure_if_absent(|| {
+                    rebuilt = true;
+                    Ok(vec![continuation::LogicalJobCompletion::pending()])
+                })
+                .expect("reuse normal receipt")
+        );
+        assert!(
+            !rebuilt,
+            "failure settlement must not drain members a second time"
+        );
+        normal.publish();
+        normal.publish_physical_retirement_for_test();
+        retirement
+            .wait()
+            .expect("normal receipt remains authoritative");
     }
 
     #[test]
