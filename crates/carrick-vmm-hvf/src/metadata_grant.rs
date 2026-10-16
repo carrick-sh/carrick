@@ -1178,6 +1178,70 @@ pub(crate) fn service_native_fork_stock(
             };
             let mut stock = custody.fork_stock.lock();
             let mut ledger = custody.el1_frame_grants.lock();
+            if stock.owner.has_quarantine() {
+                let Some(inventory) = stock.inventory() else {
+                    exchange.refuse(ForkStockRefusal::Inventory);
+                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+                };
+                let Some((_, zone)) = stopped_records(region, cpu) else {
+                    exchange.refuse(ForkStockRefusal::Stale);
+                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+                };
+                let offset = carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize;
+                let Some(bytes) = region.get(
+                    offset
+                        ..offset
+                            + core::mem::size_of::<carrick_el1_abi::FrameGrantResidencyTable>(),
+                ) else {
+                    return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
+                };
+                if !bytes.as_ptr().addr().is_multiple_of(core::mem::align_of::<
+                    carrick_el1_abi::FrameGrantResidencyTable,
+                >()) {
+                    return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
+                }
+                // SAFETY: fixed aligned ABI record in the retained full region.
+                let residency = unsafe {
+                    &*bytes
+                        .as_ptr()
+                        .cast::<carrick_el1_abi::FrameGrantResidencyTable>()
+                };
+                let Some(active) = carrick_el1_abi::ReservationMm::new(execution.binding.mm.raw())
+                else {
+                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+                };
+                let reclaimed = stock.owner.reclaim(
+                    &mut *ledger,
+                    active,
+                    |mm| {
+                        // The neutral guest MM owner retires the reservation root
+                        // before freeing its space entry. An absent slot alone is
+                        // insufficient to reuse still-published table storage.
+                        if zone.spaces.find(mm.raw()).is_some() {
+                            return None;
+                        }
+                        carrick_hal::fork_stock::SlotAbsence::scan(
+                            mm,
+                            (0..carrick_sched_core::ZONE_SLOTS)
+                                .filter_map(carrick_guest_arch::SlotId::from_index)
+                                .map(|slot| zone.installed_space(slot)),
+                        )
+                    },
+                    |pages| ForkStockHostCustody::clear_tables(custody, pages),
+                    |life| lifecycle_window(custody, life).is_some_and(|window| window.clear(life)),
+                    |absence| {
+                        carrick_hal::fork_stock::release_child_mm(
+                            &*inventory,
+                            residency,
+                            absence.mm(),
+                        )
+                    },
+                );
+                if reclaimed.is_err() {
+                    exchange.refuse(ForkStockRefusal::Inventory);
+                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
+                }
+            }
             stock
                 .owner
                 .loan(&mut *ledger, execution, exchange, |life| {

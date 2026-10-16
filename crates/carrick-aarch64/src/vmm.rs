@@ -597,7 +597,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// Retain an exclusive runtime reservation before any native fork executes.
     fn install_native_fork_stock(
         &self,
-        _reservation: std::sync::Arc<dyn carrick_hal::fork_stock::NativeForkTableReservation>,
+        _reservation: carrick_hal::fork_stock::NativeForkStockResources,
     ) -> Result<(), carrick_hal::TrapError> {
         Err(carrick_hal::TrapError::Hypervisor(
             "native fork stock unavailable on this lane".into(),

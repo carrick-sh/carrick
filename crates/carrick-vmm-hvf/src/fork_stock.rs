@@ -21,7 +21,7 @@ pub struct ForkStockHostCustody {
 #[derive(Debug)]
 struct NativeForkBacking {
     _arenas: Vec<std::sync::Arc<crate::trap::StructuralBackingOwner>>,
-    _reservation: std::sync::Arc<dyn carrick_hal::fork_stock::NativeForkTableReservation>,
+    resources: carrick_hal::fork_stock::NativeForkStockResources,
 }
 
 impl ForkStockHostCustody {
@@ -43,44 +43,69 @@ impl ForkStockHostCustody {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(crate) fn install(
         custody: &std::sync::Arc<CarrierVmCustody>,
-        reservation: std::sync::Arc<dyn carrick_hal::fork_stock::NativeForkTableReservation>,
+        resources: carrick_hal::fork_stock::NativeForkStockResources,
     ) -> Result<(), carrick_hal::TrapError> {
         use carrick_hal::TrapError;
         let fail = |message: &str| TrapError::Hypervisor(message.into());
-        let pool = custody
-            .root_slot_pool()
-            .ok_or_else(|| fail("native fork requires carrier root-slot backing"))?;
+        let pool = custody.root_slot_pool();
         let mut stock = custody.fork_stock.lock();
         if stock.backing.is_some() {
             return Err(fail("native fork stock already installed"));
         }
         let mut arenas = Vec::new();
         let mut tables = Vec::new();
-        for root in reservation.arenas() {
-            let arena = pool
-                .allocate_slot_at(root.address().raw())
-                .ok_or_else(|| fail("reserved fork arena unavailable"))?;
-            // The shared owner can populate every page; pool recycling must clear all of it.
-            arena.record_populated_prefix(arena.len());
-            for offset in (0..arena.len()).step_by(4096) {
+        for root in resources.tables.arenas() {
+            let base = root.address().raw();
+            let len = crate::frame_pool::ROOT_SLOT_SIZE;
+            let perms = u64::from(applevisor::memory::MemPerms::ReadWriteExec);
+            let mut lease = crate::trap::GlobalFrameStage2Lease::fixed(base, len as u64);
+            let owner =
+                if let Some(arena) = pool.as_ref().and_then(|pool| pool.allocate_slot_at(base)) {
+                    // The shared owner can populate every page, so pool recycling
+                    // must clear the whole arena rather than a host-observed prefix.
+                    arena.record_populated_prefix(len);
+                    lease.mark_pre_mapped();
+                    crate::trap::StructuralBackingOwner::new_pooled_root_in(
+                        custody,
+                        arena,
+                        lease,
+                        perms,
+                        crate::trap::next_structural_epoch()?,
+                        base,
+                        len,
+                    )?
+                } else {
+                    // Same retained structural backing used by host roots outside
+                    // the optional pre-map (including its existing =0 opt-out).
+                    let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                        len,
+                        crate::host_mapping::HostMappingKind::PerMmKernelState,
+                    )
+                    .map_err(|error| fail(&format!("native fork arena backing: {error}")))?;
+                    // SAFETY: exclusively reserved physical slot and retained aligned mapping.
+                    let result = unsafe {
+                        crate::trap::inventory_hv_vm_map(mapping.as_ptr().cast(), base, len, perms)
+                    };
+                    if result != 0 {
+                        return Err(fail(&format!("native fork arena map: {result:#x}")));
+                    }
+                    lease.mark_mapped();
+                    crate::trap::StructuralBackingOwner::new_in(
+                        custody,
+                        mapping,
+                        lease,
+                        perms,
+                        crate::trap::next_structural_epoch()?,
+                        base,
+                        len,
+                    )?
+                };
+            for offset in (0..len).step_by(4096) {
                 tables.push(
-                    RootGpa::page_aligned(FrameGpa::new(arena.ipa() + offset as u64))
+                    RootGpa::page_aligned(FrameGpa::new(base + offset as u64))
                         .ok_or_else(|| fail("unaligned fork arena"))?,
                 );
             }
-            let base = arena.ipa();
-            let len = arena.len();
-            let mut lease = crate::trap::GlobalFrameStage2Lease::fixed(base, len as u64);
-            lease.mark_pre_mapped();
-            let owner = crate::trap::StructuralBackingOwner::new_pooled_root_in(
-                custody,
-                arena,
-                lease,
-                7,
-                crate::trap::next_structural_epoch()?,
-                base,
-                len,
-            )?;
             arenas.push(owner);
         }
         let generation = custody
@@ -110,10 +135,19 @@ impl ForkStockHostCustody {
             .install(tables, lifecycles)
             .map_err(|error| fail(&format!("native fork stock install: {error:?}")))?;
         stock.backing = Some(NativeForkBacking {
-            _reservation: reservation,
+            resources,
             _arenas: arenas,
         });
         Ok(())
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn inventory(
+        &self,
+    ) -> Option<std::sync::Arc<dyn carrick_hal::PhysicalFrameInventory>> {
+        Some(std::sync::Arc::clone(
+            &self.backing.as_ref()?.resources.inventory,
+        ))
     }
 
     pub fn asids(&self) -> &AsidAllocator {
@@ -173,6 +207,25 @@ impl ForkStockHostCustody {
             .ok_or(ForkStockServiceError::MemoryAccessFailed)?;
         Ok(host as *mut T)
     }
+    pub(crate) fn clear_tables(custody: &CarrierVmCustody, pages: &[RootGpa]) -> bool {
+        // Resolve every complete frame before clearing any of them.
+        let Some(pointers) = pages
+            .iter()
+            .map(|page| Self::physical_ptr::<[u8; 4096]>(custody, page.address()).ok())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+        for pointer in pointers {
+            // SAFETY: the HAL owner issued these quarantined frames only after
+            // the neutral MM owner retired and every slot published absence.
+            unsafe {
+                pointer.write([0; 4096]);
+            }
+        }
+        true
+    }
+
     pub(crate) fn tables_clean(custody: &CarrierVmCustody, pages: &[RootGpa]) -> bool {
         pages.iter().all(|page| {
             Self::physical_ptr::<[u8; 4096]>(custody, page.address())
