@@ -580,6 +580,64 @@ mod tests {
         (arena, memory)
     }
 
+    struct ArenaWrite<'a>(&'a Arena);
+
+    impl crate::file::MemoryValidator for ArenaWrite<'_> {
+        fn writable_bytes(&self, address: u64, len: usize) -> usize {
+            if !(VA..VA + 4 * PAGE).contains(&address) || len as u64 > PAGE - (address & (PAGE - 1))
+            {
+                return 0;
+            }
+            if self.0.leaf(address) & (0b11 << 6) == AP_RW_EL0 {
+                len
+            } else {
+                0
+            }
+        }
+
+        fn readable_bytes(&self, _address: u64, _len: usize) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn in_ring_copy_prepares_child_cow_and_keeps_parent_bytes() {
+        let (child, memory) = forked(true);
+        let parent_first = memory.page(OLD);
+        let parent_second = memory.page(OLD + PAGE);
+        let pool = CowGrantPool::new();
+        pool.publish(MM, GRANT, backing()).unwrap();
+        let invalidations = Cell::new(0);
+        let mut resolutions = 0;
+        let address = VA + PAGE - 2;
+        let bytes = 42_u32.to_ne_bytes();
+
+        assert!(crate::file::prepare_cow_write(
+            &ArenaWrite(&child),
+            address,
+            bytes.len(),
+            |far| {
+                resolutions += 1;
+                matches!(
+                    resolve(&child, &memory, &pool, far, &invalidations),
+                    GuestCowOutcome::Resolved(_)
+                )
+            }
+        ));
+        assert_eq!(resolutions, 1, "the compound COW resolves both pages");
+        let first_child_ipa = child.leaf(VA) & PA;
+        let second_child_ipa = child.leaf(VA + PAGE) & PA;
+        assert_ne!(first_child_ipa, OLD);
+        assert_ne!(second_child_ipa, OLD + PAGE);
+        memory.0.borrow_mut().get_mut(&first_child_ipa).unwrap()[4094..]
+            .copy_from_slice(&bytes[..2]);
+        memory.0.borrow_mut().get_mut(&second_child_ipa).unwrap()[..2].copy_from_slice(&bytes[2..]);
+        assert_eq!(memory.page(OLD), parent_first);
+        assert_eq!(memory.page(OLD + PAGE), parent_second);
+        assert_eq!(&memory.page(first_child_ipa)[4094..], &bytes[..2]);
+        assert_eq!(&memory.page(second_child_ipa)[..2], &bytes[2..]);
+    }
+
     fn resolve(
         arena: &Arena,
         memory: &Memory,
