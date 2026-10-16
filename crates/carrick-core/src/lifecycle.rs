@@ -253,6 +253,9 @@ pub fn retire_host_member(
 /// The exact page owns the storage and retains its ledger notification authority.
 /// Linux payload initialization happens between reserve and release publication.
 pub trait Lifecycle {
+    fn terminal_notification(&self) -> Option<crate::terminal::TerminalNotification> {
+        None
+    }
     fn pool_control_disposition(&self, entry: EntryRef) -> PoolControlDisposition {
         if self
             .state(entry.index())

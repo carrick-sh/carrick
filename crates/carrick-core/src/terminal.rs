@@ -7,7 +7,7 @@ use core::marker::PhantomData;
 use core::num::{NonZeroI32, NonZeroU64};
 
 use carrick_core_abi::entry::{
-    EntryGeneration, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+    EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
 };
 use carrick_core_abi::lifecycle::EntryRef;
 use carrick_guest_arch::{AddressContext, RootGpa};
@@ -392,6 +392,44 @@ const _: () = {
 };
 
 #[must_use]
+pub struct TerminalNotification {
+    pub mm: EntryMmKey,
+    pub address: NonZeroU64,
+}
+
+impl TerminalNotification {
+    /// Final membership progress owes the closing object's waiter a publication
+    /// even if this member entered before the process owner was registered.
+    /// The waiter still authenticates all exact retirement receipts.
+    pub fn publish<C: carrick_core_abi::entry::EntryContext>(
+        &self,
+        zone: &carrick_sched_core::ZoneTables<C>,
+        slot: carrick_sched_core::SlotId,
+        wait: &impl carrick_sched_core::ShortLockWait,
+    ) -> Result<carrick_sched_core::WakeEffects, carrick_sched_core::WakeRefusal> {
+        let guard = zone.short_lock(
+            carrick_sched_core::ZoneTables::<C>::bucket_of_with_context(
+                self.mm.raw(),
+                self.address.get(),
+            ),
+            wait,
+        );
+        let mut effects = carrick_sched_core::WakeEffects::default();
+        zone.wake_placed(
+            &guard,
+            self.mm.raw(),
+            self.address.get(),
+            u32::MAX,
+            1,
+            carrick_sched_core::Waker::El1 { slot },
+            &mut [],
+            &mut effects,
+        )?;
+        Ok(effects)
+    }
+}
+
+#[must_use]
 pub enum RetirementVerdict {
     RetireThreadOnHost {
         identity: ThreadTerminalIdentity,
@@ -399,6 +437,7 @@ pub enum RetirementVerdict {
     RetireThread {
         identity: ThreadTerminalIdentity,
         requires_slot_absence: bool,
+        notification: Option<TerminalNotification>,
     },
     CancelMembers {
         process: ProcessTerminalIdentity,
@@ -632,10 +671,13 @@ impl TerminalCustody<Thread, Exiting> {
 }
 
 impl TerminalCustody<Thread, Terminal> {
-    pub fn into_verdict(self) -> RetirementVerdict {
+    pub fn into_verdict(self, page: &impl Lifecycle) -> RetirementVerdict {
         RetirementVerdict::RetireThread {
             identity: self.identity,
             requires_slot_absence: self.identity.entry.is_some(),
+            notification: (page.live() == 0 && page.claimed_count() == 0)
+                .then(|| page.terminal_notification())
+                .flatten(),
         }
     }
 }
