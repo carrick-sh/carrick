@@ -164,8 +164,13 @@ fn materialize_zone_in(
         })?;
     let mut state = (**base).clone();
     state.gprs = ctx.x;
-    state.ttbr0 = parked.root();
-    state.ttbr1 = parked.root();
+    // Zone settlement retained this job's translation state through its
+    // stage-1 lease, even if EL1 switched to another task or the idle root.
+    // The record owns the EL0 registers, not a hardware TTBR: scheduler-only
+    // saves can leave its address metadata empty, and native lifecycle saves
+    // carry a physical root without ASID bits. Preserve the task-owned TTBR
+    // and use that same authority for both halves of its address space.
+    state.ttbr1 = base.ttbr0;
     state.pc = ctx.pc;
     state.pstate = ctx.pstate;
     state.trap_pc = ctx.pc;
@@ -213,6 +218,8 @@ mod tests {
             panic!("AArch64 fixture");
         };
         let mut cpu = (*cpu).clone();
+        cpu.ttbr0 = (1 << 48) | 0x10000;
+        cpu.ttbr1 = cpu.ttbr0;
         cpu.trap_pc = 0x8000;
         cpu.trap_pstate = 0x3c5;
         cpu.pending_resume_pc = Some(0x4004);
@@ -267,6 +274,11 @@ mod tests {
                     (cpu.pc, cpu.pstate & 0xf),
                     (native.pc, 0),
                     "terminal readiness must re-enter retained owner custody, never return from exit_group to EL0"
+                );
+                assert_eq!(
+                    (cpu.ttbr0, cpu.ttbr1),
+                    ((1 << 48) | 0x10000, (1 << 48) | 0x10000),
+                    "a physical parked root must not erase the task's ASID"
                 );
                 let mut restored = native;
                 restored.pc = cpu.pc;
@@ -356,6 +368,11 @@ mod tests {
                 assert!(cpu.last_syscall_nr.is_none());
                 assert_eq!((cpu.trap_pc, cpu.trap_pstate), (ctx.pc, ctx.pstate));
                 assert_eq!(cpu.gprs, ctx.x);
+                assert_eq!(
+                    (cpu.ttbr0, cpu.ttbr1),
+                    ((1 << 48) | 0x10000, (1 << 48) | 0x10000),
+                    "a scheduler-only save has no translation authority"
+                );
             }
             let rec = zone.record(record);
             assert_eq!(rec.object_host_continuation(), host_owned);
