@@ -1385,6 +1385,10 @@ impl carrick_hal::HostSignalBridge for HvfHostSignal {
         take_pending_for(tid)
     }
 
+    fn take_pending_event_for(&self, tid: i32) -> Option<carrick_hal::PendingSignalEvent> {
+        carrick_signal_linux::take_pending_event_for(tid)
+    }
+
     fn take_pending_in_for(&self, tid: i32, wait_set: carrick_abi::SigSet) -> i32 {
         take_pending_in_for(tid, wait_set)
     }
