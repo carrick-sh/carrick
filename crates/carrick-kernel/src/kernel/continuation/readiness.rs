@@ -546,7 +546,7 @@ impl SignalReadinessProbe {
             };
             return self
                 .host_signal
-                .has_unblocked_pending_for(
+                .claim_unblocked_pending_for(
                     self.thread.tid.raw(),
                     SigBlockMask::blocking_all_of(blocked),
                 )

@@ -584,6 +584,13 @@ pub fn has_unblocked_pending_for(tid: i32, block_mask: carrick_abi::SigBlockMask
     carrick_signal_linux::has_unblocked_pending_for(tid, block_mask)
 }
 
+pub fn claim_unblocked_pending_for(tid: i32, block_mask: carrick_abi::SigBlockMask) -> bool {
+    if carrick_signal_linux::xsig::xsig_has_unblocked_for_self(block_mask) {
+        return true;
+    }
+    carrick_signal_linux::claim_unblocked_pending_for(tid, block_mask)
+}
+
 /// Process-wide self-pipe used to wake threads parked in a blocking-I/O
 /// `kevent()` (see `io_wait`) the instant a signal becomes pending. The signal
 /// handler writes one byte (async-signal-safe); every thread's kqueue watches
@@ -1404,6 +1411,10 @@ pub struct HvfHostSignal;
 impl carrick_hal::HostSignalBridge for HvfHostSignal {
     fn has_unblocked_pending_for(&self, tid: i32, block_mask: carrick_abi::SigBlockMask) -> bool {
         has_unblocked_pending_for(tid, block_mask)
+    }
+
+    fn claim_unblocked_pending_for(&self, tid: i32, block_mask: carrick_abi::SigBlockMask) -> bool {
+        claim_unblocked_pending_for(tid, block_mask)
     }
 
     fn take_pending_for(&self, tid: i32) -> i32 {

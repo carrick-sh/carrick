@@ -925,7 +925,7 @@ fn write_host_pipe_payload(
                     // same way the EAGAIN branch does.
                     if block_until_complete && offset > 0 {
                         if host_signal
-                            .has_unblocked_pending_for(tid.raw(), carrick_abi::SigBlockMask::NONE)
+                            .claim_unblocked_pending_for(tid.raw(), carrick_abi::SigBlockMask::NONE)
                         {
                             return Ok(DispatchOutcome::returned_len_or_errno(offset));
                         }
@@ -1085,7 +1085,7 @@ fn write_host_pipe_payload(
                 }
                 if block_until_complete && offset > 0 {
                     if host_signal
-                        .has_unblocked_pending_for(tid.raw(), carrick_abi::SigBlockMask::NONE)
+                        .claim_unblocked_pending_for(tid.raw(), carrick_abi::SigBlockMask::NONE)
                     {
                         return Ok(DispatchOutcome::returned_len_or_errno(offset));
                     }
@@ -1116,8 +1116,9 @@ fn write_host_pipe_payload(
                 // A signal that arrives mid-write interrupts it on Linux,
                 // returning the partial count; check between chunks so a long
                 // write doesn't ignore an armed alarm (or a pending quiesce).
-                if host_signal.has_unblocked_pending_for(tid.raw(), carrick_abi::SigBlockMask::NONE)
-                    || crate::fork_quiesce::is_quiescing()
+                if crate::fork_quiesce::is_quiescing()
+                    || host_signal
+                        .claim_unblocked_pending_for(tid.raw(), carrick_abi::SigBlockMask::NONE)
                 {
                     if crate::fork_quiesce::is_quiescing() {
                         return match BlockingWrite::from_vec(
