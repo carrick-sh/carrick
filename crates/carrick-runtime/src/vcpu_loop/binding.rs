@@ -4159,6 +4159,9 @@ where
         // EL1 still holds on-CPU mid-operation, and a suspension unloads it
         // (the reload then finds the slot still holding it).
         if !engine.el1_operation_suspended() {
+            if !self.phase.is_terminal_transition() {
+                self.state.publish_external_ingress(&self.kernel)?;
+            }
             if !self.phase.is_terminal_transition()
                 && self
                     .state

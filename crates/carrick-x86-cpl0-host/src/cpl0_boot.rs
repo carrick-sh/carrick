@@ -1289,6 +1289,22 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         self.cpu.physical_slot()
     }
 
+    /// Host view of the one ingress reservation while this physical lease
+    /// pins its carrier. The queue uses atomic slot publication on both sides.
+    pub fn signal_ingress(&self) -> Result<&carrick_el1_abi::SharedSignalIngressQueue, TrapError> {
+        let custody = self
+            ._custody
+            .lock()
+            .map_err(|_| fail("CPL0 signal ingress custody poisoned"))?;
+        let queue = custody.metadata::<carrick_el1_abi::SharedSignalIngressQueue>(
+            carrick_el1_abi::EL1_SIGNAL_INGRESS_OFFSET,
+        ) as *const _;
+        drop(custody);
+        // SAFETY: this lease retains the carrier custody and its mapped ABI
+        // region through the returned borrow; queue access is atomic.
+        Ok(unsafe { &*queue })
+    }
+
     pub fn fixture_run_until_native_kick(
         &mut self,
         task: carrick_guest_arch::TaskIdentity,

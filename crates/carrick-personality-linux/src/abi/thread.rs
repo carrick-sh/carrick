@@ -485,6 +485,9 @@ impl ThreadControlSlot {
     pub fn graph_referenced(&self) -> bool {
         self.host_exit_requested.custody().referenced()
     }
+    pub fn native_signal_owner(&self) -> bool {
+        self.host_exit_requested.custody().native_signal_owner()
+    }
     pub fn graph_unregister_receipt(&self) -> bool {
         self.host_exit_requested.custody().unregister_receipt()
     }

@@ -73,7 +73,8 @@ const IN_ZONE_COMMITTED: u32 = 4;
 const HOST_RETIRING: u32 = 8;
 
 const GRAPH_REGISTERED: u32 = 16;
-const GRAPH_REFERENCE: u32 = 32;
+const NATIVE_SIGNAL_OWNER: u32 = 32;
+const GRAPH_REFERENCE: u32 = 64;
 const RESETTING: u32 = 1 << 31;
 const REFERENCES: u32 = RESETTING - GRAPH_REFERENCE;
 
@@ -101,6 +102,11 @@ impl MemberExitCustody {
     }
     pub fn referenced(&self) -> bool {
         self.word.load(Ordering::Acquire) & REFERENCES != 0
+    }
+    /// The native graph has accepted signal delivery for this exact member.
+    /// This bit is distinct from generic graph registration and host receipts.
+    pub fn native_signal_owner(&self) -> bool {
+        self.word.load(Ordering::Acquire) & NATIVE_SIGNAL_OWNER != 0
     }
     pub fn unregister_receipt(&self) -> bool {
         self.word.load(Ordering::Acquire) & (GRAPH_REGISTERED | REFERENCES) == GRAPH_REGISTERED
@@ -181,6 +187,13 @@ impl<'a, T: MemberControl + ?Sized> MemberControlCustody<'a, T> {
             .exit_custody()
             .word
             .fetch_or(GRAPH_REGISTERED, Ordering::Release);
+    }
+    /// Publish only after the native registry can authenticate this member.
+    pub fn commit_native_signal_owner(&self) {
+        self.control
+            .exit_custody()
+            .word
+            .fetch_or(NATIVE_SIGNAL_OWNER, Ordering::Release);
     }
     pub fn control(&self) -> &'a T {
         self.control
