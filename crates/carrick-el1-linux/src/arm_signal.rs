@@ -1,10 +1,12 @@
 //! Pure ARM frame publication used by the native backend and VM-free tests.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 use crate::rust_alloc::vec::Vec;
 use carrick_el1::isa::ArchError;
 use carrick_el1_abi::TrapFrame;
-use carrick_personality_linux::signal::arm::{self, RtSigframe};
-#[cfg(not(target_os = "none"))]
+use carrick_personality_linux::signal::arm;
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+use carrick_personality_linux::signal::arm::RtSigframe;
+#[cfg(test)]
 use std::vec::Vec;
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -109,6 +111,7 @@ pub(crate) fn deliver_on_user_return<X: super::aarch64_process::ForkStockCrossin
     )
 }
 
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 pub(crate) fn restore(
     frame: &mut TrapFrame,
     signal: &RtSigframe,
@@ -118,8 +121,11 @@ pub(crate) fn restore(
     use zerocopy::IntoBytes;
     let resume =
         arm::decode(signal.as_bytes(), signal_sp, true).map_err(|_| ArchError::InvalidFrame)?;
-    let stack = carrick_personality_linux::signal::restored_altstack(resume.stack)
-        .ok_or(ArchError::InvalidFrame)?;
+    let stack = carrick_personality_linux::signal::restored_altstack(
+        resume.stack,
+        carrick_guest_arch::GuestIsa::Aarch64,
+    )
+    .ok_or(ArchError::InvalidFrame)?;
     let fp = resume.fpsimd.ok_or(ArchError::InvalidFrame)?;
     if fpstate.len() != fp.as_bytes().len() {
         return Err(ArchError::InvalidFrame);
@@ -131,6 +137,7 @@ pub(crate) fn restore(
     Ok((resume.mask.signals().bits(), resume.sp.raw(), stack))
 }
 
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 fn frame_copy_buffer(len: usize) -> Result<Vec<u8>, ArchError> {
     let mut bytes = Vec::new();
     bytes
@@ -145,6 +152,7 @@ fn frame_copy_buffer(len: usize) -> Result<Vec<u8>, ArchError> {
 /// Apply the already validated public return state to the next hardware
 /// context. The ISA leaf loads this context only after every copy and record
 /// check has succeeded, so a malformed frame publishes no partial registers.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 pub(crate) fn apply_restored_context(
     context: &mut carrick_sched_core::ThreadCtx,
     frame: &TrapFrame,
@@ -595,7 +603,31 @@ impl carrick_personality_linux::signal::SignalBackend for LinuxAarch64Backend {
         _fpstate: &mut [u8],
         copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool,
     ) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, Self::Error> {
-        restore_arm_signal_frame(frame, _fpstate, copy_in)
+        let sp_val = unsafe { carrick_el1::isa::aarch64::signal_stack().raw() };
+        let sp = UserVa::new(sp_val);
+        // A public frame is over 4 KiB. Keep the admitted copy off the 16 KiB
+        // EL1 stack and borrow it throughout decode.
+        let mut bytes = frame_copy_buffer(arm::PUBLIC_FRAME_LEN)?;
+        if !copy_in(&mut bytes, sp) {
+            return Err(ArchError::InvalidFrame);
+        }
+        let Some(sigframe) = RtSigframe::ref_from_bytes(&bytes).ok() else {
+            return Err(ArchError::InvalidFrame);
+        };
+
+        let (mask, saved_sp, stack) = restore(frame, sigframe, _fpstate, sp)?;
+
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        unsafe {
+            carrick_el1::isa::aarch64::set_signal_stack(UserVa::new(saved_sp));
+        }
+
+        Ok(carrick_personality_linux::signal::RestoredSignalFrame {
+            mask: carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                carrick_signal_core::SignalSet::from_bits(mask),
+            ),
+            stack,
+        })
     }
 }
 
@@ -639,41 +671,4 @@ pub(crate) fn setup_arm_signal_frame(
     }
 
     Ok(UserVa::new(new_sp))
-}
-
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
-fn restore_arm_signal_frame(
-    frame: &mut TrapFrame,
-    _fpstate: &mut [u8],
-    copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool,
-) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, ArchError> {
-    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    let sp_val = { unsafe { carrick_el1::isa::aarch64::signal_stack().raw() } };
-    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-    let sp_val = 0u64;
-
-    let sp = UserVa::new(sp_val);
-    // A public frame is over 4 KiB. Keep the admitted copy off the 16 KiB
-    // EL1 stack and borrow it throughout decode.
-    let mut bytes = frame_copy_buffer(arm::PUBLIC_FRAME_LEN)?;
-    if !copy_in(&mut bytes, sp) {
-        return Err(ArchError::InvalidFrame);
-    }
-    let Some(sigframe) = RtSigframe::ref_from_bytes(&bytes).ok() else {
-        return Err(ArchError::InvalidFrame);
-    };
-
-    let (mask, saved_sp, stack) = restore(frame, sigframe, _fpstate, sp)?;
-
-    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    unsafe {
-        carrick_el1::isa::aarch64::set_signal_stack(UserVa::new(saved_sp));
-    }
-
-    Ok(carrick_personality_linux::signal::RestoredSignalFrame {
-        mask: carrick_signal_core::policy::SigBlockMask::blocking_all_of(
-            carrick_signal_core::SignalSet::from_bits(mask),
-        ),
-        stack,
-    })
 }
