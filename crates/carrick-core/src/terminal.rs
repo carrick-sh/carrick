@@ -7,7 +7,8 @@ use core::marker::PhantomData;
 use core::num::{NonZeroI32, NonZeroU64};
 
 use carrick_core_abi::entry::{
-    EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+    EntryEventIdentity, EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration,
+    ExecutionBinding,
 };
 use carrick_core_abi::lifecycle::EntryRef;
 use carrick_guest_arch::{AddressContext, RootGpa};
@@ -347,11 +348,7 @@ pub struct CompletedMemberReceipts {
 /// Host retirement's exact acknowledgement of an adopted member. A visible
 /// tid is never sufficient: its execution or thread generation may be reused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HostThreadRetirementReceipt {
-    task: EntryTaskKey,
-    execution: EntryGeneration,
-    thread: EntryThreadGeneration,
-}
+pub struct HostThreadRetirementReceipt(EntryEventIdentity);
 
 impl HostThreadRetirementReceipt {
     pub fn from_parts(
@@ -359,33 +356,25 @@ impl HostThreadRetirementReceipt {
         execution: EntryGeneration,
         thread: EntryThreadGeneration,
     ) -> Option<Self> {
-        (task.raw() != 0 && execution.raw() != 0 && thread.raw() != 0).then_some(Self {
-            task,
-            execution,
-            thread,
-        })
+        EntryEventIdentity::from_parts(task, execution, thread).map(Self)
     }
 
     pub fn from_binding(binding: ExecutionBinding) -> Self {
-        Self {
-            task: binding.task,
-            execution: binding.generation,
-            thread: binding.thread_generation,
-        }
+        Self(EntryEventIdentity::from_binding(binding))
     }
 
     pub fn matches(self, binding: ExecutionBinding) -> bool {
-        self == Self::from_binding(binding)
+        self.0.matches(binding)
     }
 
     pub fn task(self) -> EntryTaskKey {
-        self.task
+        self.0.task()
     }
     pub fn execution(self) -> EntryGeneration {
-        self.execution
+        self.0.execution()
     }
     pub fn thread(self) -> EntryThreadGeneration {
-        self.thread
+        self.0.thread()
     }
 }
 
