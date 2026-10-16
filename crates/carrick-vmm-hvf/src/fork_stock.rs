@@ -12,7 +12,7 @@ use carrick_hal::fork_stock::{ForkStock, ForkTableLedger};
 
 #[derive(Debug)]
 pub struct ForkStockHostCustody {
-    pub(crate) owner: ForkStock<AsidAllocator>,
+    pub(crate) owner: ForkStock<AsidAllocator, Vec<crate::trap::ForkPhysicalRetention>>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     backing: Option<NativeForkBacking>,
     run_failure: carrick_core_abi::NativeRunFailureConsumer,

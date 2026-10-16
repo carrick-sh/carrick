@@ -450,12 +450,15 @@ pub struct PendingForkLoan<T> {
 }
 
 /// A settled child whose memory is live in the guest owner graph.
-#[derive(Clone, Copy, Debug)]
-struct CommittedChild<T> {
+#[derive(Debug)]
+struct CommittedChild<T, C> {
     root: RootGpa,
     lifecycle: ForkLifecycleLoan,
     control: ForkControlCapacity,
     tag: ChildTag<T>,
+    /// Carrier authenticated physical allocations inherited by this MM.
+    /// They stay pinned through quarantine and drop only after neutral release.
+    _physical: C,
 }
 
 /// Monotonic counters for diagnostics and the counted-`EAGAIN` contract.
@@ -573,7 +576,7 @@ impl core::fmt::Debug for NativeForkStockResources {
 
 /// The carrier's bounded fork stock, pending loans and child quarantine.
 #[derive(Debug)]
-pub struct ForkStock<T: ChildAddressTags> {
+pub struct ForkStock<T: ChildAddressTags, C = ()> {
     carrier: NonZeroU64,
     controls: Vec<ForkControlCapacity>,
     unused_control: Option<ForkControlCapacity>,
@@ -581,7 +584,7 @@ pub struct ForkStock<T: ChildAddressTags> {
     lifecycles: Vec<ForkLifecycleLoan>,
     pending: Vec<Option<PendingForkLoan<T::Tag>>>,
     next_loan: NonZeroU64,
-    children: BTreeMap<MmKey, CommittedChild<T::Tag>>,
+    children: BTreeMap<MmKey, CommittedChild<T::Tag, C>>,
     /// Table pages each live MM consumed, as a child or as a fork parent.
     committed_tables: BTreeMap<MmKey, Vec<RootGpa>>,
     /// Quarantined children; `true` once their carrier release succeeded,
@@ -592,7 +595,7 @@ pub struct ForkStock<T: ChildAddressTags> {
     counters: ForkStockCounters,
 }
 
-impl<T: ChildAddressTags> ForkStock<T> {
+impl<T: ChildAddressTags, C> ForkStock<T, C> {
     pub fn new(carrier: NonZeroU64, control: Option<ForkControlCapacity>, tags: T) -> Self {
         Self {
             carrier,
@@ -1092,6 +1095,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
         ledger: &mut impl ForkTableLedger,
         execution: GrantExecution,
         settlement: &mut ForkStockSettlement,
+        physical: C,
         is_resolvable: impl Fn(&[RootGpa]) -> bool,
         is_clean: impl Fn(&[RootGpa]) -> bool,
         clear_lifecycle: impl FnOnce(ForkLifecycleLoan) -> bool,
@@ -1150,6 +1154,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
                     lifecycle: pending.lifecycle,
                     control: pending.control,
                     tag: ChildTag::bind(pending.tag, loan.request.child_mm),
+                    _physical: physical,
                 },
             );
             self.committed_tables
@@ -1237,7 +1242,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
         let mut reclaimed = 0;
         for (key, absence) in candidates {
             let mm = key.mm().ok_or(ForkStockServiceError::InvalidRecord)?;
-            let child = *self
+            let child = self
                 .children
                 .get(&key)
                 .ok_or(ForkStockServiceError::InvalidRecord)?;
@@ -1273,7 +1278,10 @@ impl<T: ChildAddressTags> ForkStock<T> {
                 self.counters.reclaim_deferrals = self.counters.reclaim_deferrals.saturating_add(1);
                 continue;
             }
-            self.children.remove(&key);
+            let child = self
+                .children
+                .remove(&key)
+                .ok_or(ForkStockServiceError::InvalidRecord)?;
             if let Some(pages) = self.committed_tables.remove(&key) {
                 for page in &pages {
                     ledger.give_back(*page, mm);
