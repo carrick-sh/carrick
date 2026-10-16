@@ -463,6 +463,10 @@ fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
     let (_kernel, context) = bootstrap(153_694);
     let generation = publish(&context, 0x709);
     let control = context.thread().control_slot();
+    control.bind_zone_record(carrick_sched_core::RecordRef {
+        id: carrick_sched_core::RecordId::from_raw(7).unwrap(),
+        incarnation: 13,
+    });
     let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
     custody.commit_registration();
     custody.commit_native_signal_owner();
@@ -482,11 +486,19 @@ fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
         .event()
         .expect("signal wakes forwarded read");
     assert!(matches!(event, ContinuationEvent::Signal));
+    let queue = carrick_el1_abi::SignalIngressQueue::<2>::new();
+    let mut producer = super::super::signal_ingress_producer::HostSignalIngressProducer::new();
+    let target = super::super::signal_ingress_producer::HostIngressTarget::from_context(&context);
     assert_eq!(
-        carrick_signal_linux::take_pending_for(tid),
-        2,
-        "native ingress remains the one consumer of the bridge event"
+        producer
+            .publish(&queue, target, carrick_signal_linux::take_pending_event_for)
+            .unwrap(),
+        super::super::signal_ingress_producer::HostIngressStep::Published
     );
+    let event = queue.take().unwrap();
+    assert_eq!(event.signal().number(), 2);
+    assert_eq!(event.scope(), carrick_el1_abi::ExternalSignalScope::Thread);
+    assert_eq!(carrick_signal_linux::take_pending_for(tid), 0);
 }
 
 #[test]
