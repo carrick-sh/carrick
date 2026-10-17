@@ -638,6 +638,12 @@ fn child_born_on_idle_peer_can_fault_and_retire_on_root_executor() {
             }
         })
         .expect("peer parent marker");
+    let peer_task = peer.idle_peer_task().expect("idle peer child task");
+    assert_ne!(peer_task, task);
+    assert!(
+        peer.capture_forward(task, |_, _| Ok(())).is_err(),
+        "idle peer forward must refuse a mismatched task generation"
+    );
     assert_eq!(
         peer.fixture_idle_peer_write(&peer_marker)
             .expect("peer stdout"),
@@ -1291,4 +1297,13 @@ fn file_region_guest_fork_dup_and_child_retirement_preserve_parent() {
             }
         })
         .expect("parent survives child file-table retirement");
+}
+
+#[test]
+fn idle_peer_syscall_trap_hands_task_back_to_host_and_delivers_stdout() {
+    let elf = native_exit_fixture("../../../carrick-cli/tests/fixtures/x86_child_last_writer.S");
+    let outcome = run_pool_fixture(&elf, 32);
+    assert_eq!(outcome.run.exit_code, 7);
+    assert_eq!(outcome.run.stdout, b"E\n");
+    assert!(outcome.run.stderr.is_empty());
 }
