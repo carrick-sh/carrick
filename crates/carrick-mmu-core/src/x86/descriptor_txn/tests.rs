@@ -544,6 +544,54 @@ fn cow_classifiers_agree_on_non_writable_ancestor_refusal() {
 }
 
 #[test]
+fn already_writable_large_leaf_recognized_without_cow() {
+    use crate::owner_mmu::OwnerMmu;
+    use crate::x86::owner_mmu::X86Mmu;
+
+    let (words, va, _, _) = raw_translation(LeafSize::Block2M);
+
+    // Witness (a): An already-writable 2 MiB leaf needs no COW work.
+    // X86Mmu::classify_cow succeeds (Ok(())), and classify_guest_cow_write
+    // returns Err(CowClass::AlreadyWritable).
+    assert_eq!(
+        X86Mmu::classify_cow(&words, root(0x1000), UserVa::new(va + 0x1000), false),
+        Ok(())
+    );
+    assert_eq!(
+        classify_guest_cow_write(&words, root(0x1000), UserVa::new(va + 0x1000), false),
+        Err(CowClass::AlreadyWritable)
+    );
+}
+
+#[test]
+fn non_writable_ancestor_large_leaf_is_refused() {
+    use crate::owner_mmu::{OwnerMmu, OwnerMmuRefusal};
+    use crate::x86::owner_mmu::X86Mmu;
+
+    for size in [LeafSize::Block2M, LeafSize::Block1G] {
+        let (words, va, _, path) = raw_translation(size);
+
+        // Clear WRITE on the PML4 ancestor entry.
+        let ancestor_pa = path[0];
+        let original = words.words.borrow()[&ancestor_pa];
+        words
+            .words
+            .borrow_mut()
+            .insert(ancestor_pa, original & !WRITE);
+
+        // Witness (b): Both classifiers refuse a large leaf when an ancestor is non-writable.
+        assert_eq!(
+            X86Mmu::classify_cow(&words, root(0x1000), UserVa::new(va + 0x1000), false),
+            Err(OwnerMmuRefusal::Protection)
+        );
+        assert_eq!(
+            classify_guest_cow_write(&words, root(0x1000), UserVa::new(va + 0x1000), false),
+            Err(CowClass::NoWriteIntent)
+        );
+    }
+}
+
+#[test]
 fn lower_half_supervisor_and_upper_half_user_leaves_are_refused_before_stores() {
     for (va, user) in [(0x4000, false), (0xffff_8000_0000_4000, true)] {
         let words = Words::new();
