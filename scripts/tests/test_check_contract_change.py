@@ -2455,6 +2455,70 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
                 self.assertEqual(res.returncode, 1, msg=f"expr={body_expr!r}\nstdout: {res.stdout}\nstderr: {res.stderr}")
                 self.assertIn("does not reference changed surface", res.stderr)
 
+    def test_comma_separated_bindings_not_doctest_cfg_and_enclosing_impl_relevance(self):
+        """Comma-separated top-level bindings, #[cfg(not(doctest))] modules, and body-only edits inside impl/fn resolve and match enclosing declarations."""
+        self.use_single_contract_surface()
+        (self.repo / "crates" / "carrick-kernel" / "src" / "dispatch" / "mod.rs").write_text(
+            "#[cfg(not(doctest))]\npub mod futex;\n",
+            encoding="utf-8",
+        )
+        self.guest_file.write_text(
+            "pub struct FutexQueue;\n"
+            "impl FutexQueue {\n"
+            "    pub fn check_perm(&self) -> i32 {\n"
+            "        1\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        contract_toml = self.repo / "conformance-contracts" / "contracts" / "futex-contention.toml"
+        contract_toml.write_text(
+            'schema_version = 1\n'
+            'id = "kernel.futex.contention"\n'
+            'title = "Futex contention"\n'
+            '[bindings]\n'
+            'docker = "probe:futex"\n',
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "seed impl FutexQueue"], cwd=self.repo, check=True)
+        base_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+
+        # Modify only the body inside `check_perm` (not its `fn` or `impl` header line) and bind comma-separated tests
+        self.guest_file.write_text(
+            "pub struct FutexQueue;\n"
+            "impl FutexQueue {\n"
+            "    pub fn check_perm(&self) -> i32 {\n"
+            "        2\n"
+            "    }\n"
+            "}\n"
+            "#[cfg(test)]\n"
+            "mod tests {\n"
+            "    use super::*;\n"
+            "    #[test]\n"
+            "    fn perm_check_a() { assert_eq!(FutexQueue.check_perm(), 2); }\n"
+            "    #[test]\n"
+            "    fn perm_check_b() { assert_eq!(FutexQueue.check_perm(), 2); }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        contract_toml.write_text(
+            'schema_version = 1\n'
+            'id = "kernel.futex.contention"\n'
+            'title = "Futex contention"\n'
+            '[bindings]\n'
+            'vm_free = "carrick-kernel::dispatch::futex::tests::perm_check_a, carrick-kernel::dispatch::futex::tests::{perm_check_b}"\n',
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "commit", "-am", "edit body and add comma-separated bindings"], cwd=self.repo, check=True)
+        res = self.run_check(base_sha=base_sha)
+        self.assertEqual(res.returncode, 0, msg=f"stdout: {res.stdout}\nstderr: {res.stderr}")
+        self.assertIn(
+            "evidenced: crates/carrick-kernel/src/dispatch/futex.rs -> kernel.futex.contention: carrick-kernel::dispatch::futex::tests::perm_check_a",
+            res.stdout,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
+

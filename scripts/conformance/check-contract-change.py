@@ -456,6 +456,202 @@ _TYPE_MOD_DECL_RE = re.compile(
 )
 _MACRO_DECL_RE = re.compile(r"\bmacro_rules!\s*(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\b")
 
+_IMPL_DECL_RE = re.compile(
+    r"\b(?:unsafe\s+)?impl(?:\s*<[^>]*>)?\s+(?:[A-Za-z0-9_:]+(?:\s*<[^>]*>)?\s+for\s+)?(?:[A-Za-z0-9_]+::)*(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\b"
+)
+_CHANGED_EXPR_IDENT_RE = re.compile(
+    r"(?:::|\.\s*)(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\b"
+    r"|\b(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(|::)"
+)
+_COMMON_EXPR_IDENTS = _RUST_KEYWORDS | _GENERIC_ITEM_NAMES | {
+    "u8",
+    "u16",
+    "u32",
+    "u64",
+    "u128",
+    "usize",
+    "i8",
+    "i16",
+    "i32",
+    "i64",
+    "i128",
+    "isize",
+    "bool",
+    "str",
+    "char",
+    "f32",
+    "f64",
+    "len",
+    "is_empty",
+    "unwrap",
+    "expect",
+    "ok",
+    "err",
+    "some",
+    "none",
+    "map",
+    "map_err",
+    "map_or",
+    "map_or_else",
+    "and_then",
+    "or_else",
+    "unwrap_or",
+    "unwrap_or_else",
+    "unwrap_or_default",
+    "ok_or",
+    "ok_or_else",
+    "is_some",
+    "is_some_and",
+    "is_none",
+    "is_ok",
+    "is_err",
+    "as_ref",
+    "as_mut",
+    "as_deref",
+    "as_deref_mut",
+    "as_slice",
+    "as_mut_slice",
+    "as_bytes",
+    "as_str",
+    "as_ptr",
+    "as_mut_ptr",
+    "to_vec",
+    "to_string",
+    "to_owned",
+    "to_le_bytes",
+    "to_be_bytes",
+    "to_ne_bytes",
+    "from_le_bytes",
+    "from_be_bytes",
+    "from_ne_bytes",
+    "iter",
+    "iter_mut",
+    "into_iter",
+    "collect",
+    "filter",
+    "filter_map",
+    "find",
+    "find_map",
+    "any",
+    "all",
+    "chain",
+    "zip",
+    "enumerate",
+    "take",
+    "skip",
+    "copied",
+    "cloned",
+    "flatten",
+    "push",
+    "pop",
+    "insert",
+    "remove",
+    "contains",
+    "get",
+    "get_mut",
+    "set",
+    "lock",
+    "read",
+    "write",
+    "flush",
+    "close",
+    "clone",
+    "copy",
+    "raw",
+    "bits",
+    "from_bits",
+    "from_bits_truncate",
+    "from_bits_retain",
+    "from_raw",
+    "into_raw",
+    "empty",
+    "all",
+    "min",
+    "max",
+    "clamp",
+    "saturating_add",
+    "saturating_sub",
+    "saturating_mul",
+    "checked_add",
+    "checked_sub",
+    "checked_mul",
+    "wrapping_add",
+    "wrapping_sub",
+    "cast",
+    "transmute",
+    "size_of",
+    "align_of",
+    "zeroed",
+    "null",
+    "null_mut",
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "debug_assert",
+    "debug_assert_eq",
+    "debug_assert_ne",
+    "panic",
+    "unreachable",
+    "todo",
+    "unimplemented",
+    "format",
+    "vec",
+    "println",
+    "eprintln",
+    "dbg",
+    "matches",
+    "cfg",
+    "Some",
+    "None",
+    "Ok",
+    "Err",
+    "Box",
+    "Arc",
+    "Rc",
+    "Weak",
+    "Vec",
+    "String",
+    "Option",
+    "Result",
+    "Mutex",
+    "RwLock",
+    "RefCell",
+    "Cell",
+    "OnceLock",
+    "LazyLock",
+    "Duration",
+    "Instant",
+    "Layout",
+    "NonNull",
+    "PhantomData",
+    "Ordering",
+    "AtomicUsize",
+    "AtomicU64",
+    "AtomicU32",
+    "AtomicU16",
+    "AtomicU8",
+    "AtomicIsize",
+    "AtomicI64",
+    "AtomicI32",
+    "AtomicBool",
+    "Path",
+    "PathBuf",
+    "OsStr",
+    "OsString",
+    "CStr",
+    "CString",
+    "Cow",
+    "BTreeMap",
+    "BTreeSet",
+    "HashMap",
+    "HashSet",
+    "VecDeque",
+    "std",
+    "core",
+    "alloc",
+    "libc",
+}
+
 _TEST_ATTR_RE = re.compile(r"#\s*\[\s*(?:[\w:]+::)?(?:test|test_case|rstest)\b")
 _IGNORE_ATTR_RE = re.compile(r"#\s*\[\s*(?:ignore\b|cfg_attr\s*\([^\]]*\bignore\b)")
 _CFG_OPEN_RE = re.compile(r"#\s*!?\s*\[\s*cfg\s*\(")
@@ -742,7 +938,7 @@ def _is_cfg_expr_decidable(expr: str) -> bool:
         if op == "not" and len(args) != 1:
             return False
         return all(_is_cfg_expr_decidable(a) for a in args)
-    if expr in ("test", "unix", "windows", "debug_assertions"):
+    if expr in ("test", "doctest", "unix", "windows", "debug_assertions"):
         return True
     kv = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([^"]*)"$', expr)
     if kv:
@@ -1032,12 +1228,21 @@ def _split_top_level_semicolons(raw: str) -> list[str]:
     parts: list[str] = []
     cur: list[str] = []
     depth = 0
-    for ch in raw:
+    for idx, ch in enumerate(raw):
         if ch in "({":
             depth += 1
         elif ch in ")}":
             depth = max(0, depth - 1)
-        if ch == ";" and depth == 0:
+        if depth == 0 and (
+            ch == ";"
+            or (
+                ch == ","
+                and re.match(
+                    r"^\s*(?:carrick-|probe:|ltp:|go:|cpython:|node:)",
+                    raw[idx + 1 :],
+                )
+            )
+        ):
             parts.append("".join(cur).strip())
             cur = []
         else:
@@ -1400,6 +1605,8 @@ def _eval_cfg_expr(
             )
     if expr == "test":
         return test_flag
+    if expr == "doctest":
+        return False
     if expr == "unix":
         return target_os in ("macos", "linux", "freebsd", "netbsd")
     if expr == "windows":
@@ -2505,7 +2712,14 @@ def resolve_binding_at_view(
 def _extract_code_decl_identifiers(code_line: str) -> set[str]:
     """Extract declared item identifiers from a comment/string-stripped Rust code line."""
     found: set[str] = set()
-    for regex in (_FN_DECL_RE, _STATIC_DECL_RE, _CONST_DECL_RE, _TYPE_MOD_DECL_RE, _MACRO_DECL_RE):
+    for regex in (
+        _FN_DECL_RE,
+        _STATIC_DECL_RE,
+        _CONST_DECL_RE,
+        _TYPE_MOD_DECL_RE,
+        _MACRO_DECL_RE,
+        _IMPL_DECL_RE,
+    ):
         for m in regex.finditer(code_line):
             ident = m.group(1)
             if (
@@ -2516,6 +2730,88 @@ def _extract_code_decl_identifiers(code_line: str) -> set[str]:
             ):
                 found.add(ident)
     return found
+
+
+def _extract_code_expr_identifiers(code_line: str) -> set[str]:
+    """Extract non-generic domain call/method/path identifiers from a changed code line."""
+    found: set[str] = set()
+    for m in _CHANGED_EXPR_IDENT_RE.finditer(code_line):
+        ident = m.group(1) or m.group(2)
+        if (
+            ident
+            and len(ident) > 1
+            and ident not in _COMMON_EXPR_IDENTS
+            and not ident.startswith("_")
+        ):
+            found.add(ident)
+    return found
+
+
+def _compute_enclosing_decl_spans(stripped_lines: list[str]) -> list[tuple[int, int, str]]:
+    """Return `(start_line_1idx, end_line_1idx, ident)` for declarations and `impl` blocks in `stripped_lines`."""
+    if not stripped_lines:
+        return []
+    text = "\n".join(stripped_lines)
+    n = len(text)
+    line_starts: list[int] = [0]
+    for idx, ch in enumerate(text):
+        if ch == "\n":
+            line_starts.append(idx + 1)
+
+    def char_to_line(pos: int) -> int:
+        lo, hi = 0, len(line_starts)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if line_starts[mid] <= pos:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
+
+    spans: list[tuple[int, int, str]] = []
+    for regex in (
+        _FN_DECL_RE,
+        _STATIC_DECL_RE,
+        _CONST_DECL_RE,
+        _TYPE_MOD_DECL_RE,
+        _MACRO_DECL_RE,
+        _IMPL_DECL_RE,
+    ):
+        for m in regex.finditer(text):
+            ident = m.group(1)
+            if (
+                not ident
+                or ident in _RUST_KEYWORDS
+                or ident in _GENERIC_ITEM_NAMES
+                or ident.startswith("_")
+            ):
+                continue
+            start_line = char_to_line(m.start())
+            pos = m.end()
+            while pos < n:
+                ch = text[pos]
+                if ch == "(":
+                    c_idx = _find_matching_delim(text, pos, "(", ")")
+                    if c_idx == -1:
+                        break
+                    pos = c_idx + 1
+                    continue
+                if ch == "[":
+                    c_idx = _find_matching_delim(text, pos, "[", "]")
+                    if c_idx == -1:
+                        break
+                    pos = c_idx + 1
+                    continue
+                if ch == ";":
+                    spans.append((start_line, char_to_line(pos), ident))
+                    break
+                if ch == "{":
+                    close_b = _find_matching_brace(text, pos)
+                    end_line = char_to_line(close_b) if close_b != -1 else len(stripped_lines)
+                    spans.append((start_line, end_line, ident))
+                    break
+                pos += 1
+    return spans
 
 
 def _tokenize_code_line(code_line: str) -> tuple[str, ...]:
@@ -2549,6 +2845,9 @@ def extract_changed_surface_items(
             head_view.read_comments_stripped_rust(surface_path),
         ).splitlines()
 
+    base_spans = _compute_enclosing_decl_spans(base_stripped_lines)
+    head_spans = _compute_enclosing_decl_spans(head_stripped_lines)
+
     if old_surface_path and old_surface_path != surface_path and base_view.is_file(old_surface_path):
         diff_cmd = [
             "git",
@@ -2581,8 +2880,8 @@ def extract_changed_surface_items(
     old_line_no = 0
     new_line_no = 0
     in_hunk = False
-    hunk_old_lines: list[str] = []
-    hunk_new_lines: list[str] = []
+    hunk_old_lines: list[tuple[int, str]] = []
+    hunk_new_lines: list[tuple[int, str]] = []
 
     def flush_hunk():
         nonlocal hunk_old_lines, hunk_new_lines
@@ -2590,43 +2889,51 @@ def extract_changed_surface_items(
             return
         old_toks_flat: list[str] = []
         new_toks_flat: list[str] = []
-        old_by_norm: list[tuple[tuple[str, ...], str]] = []
-        new_by_norm: list[tuple[tuple[str, ...], str]] = []
-        for oline in hunk_old_lines:
+        old_by_norm: list[tuple[tuple[str, ...], str, int]] = []
+        new_by_norm: list[tuple[tuple[str, ...], str, int]] = []
+        for lno, oline in hunk_old_lines:
             toks = _tokenize_code_line(oline)
             old_toks_flat.extend(toks)
-            old_by_norm.append((toks, oline))
-        for nline in hunk_new_lines:
+            old_by_norm.append((toks, oline, lno))
+        for lno, nline in hunk_new_lines:
             toks = _tokenize_code_line(nline)
             new_toks_flat.extend(toks)
-            new_by_norm.append((toks, nline))
+            new_by_norm.append((toks, nline, lno))
 
         hunk_old_lines = []
         hunk_new_lines = []
         if old_toks_flat == new_toks_flat:
             return
 
-        old_counts = Counter(toks for toks, _ in old_by_norm if toks)
-        new_counts = Counter(toks for toks, _ in new_by_norm if toks)
+        old_counts = Counter(toks for toks, _, _ in old_by_norm if toks)
+        new_counts = Counter(toks for toks, _, _ in new_by_norm if toks)
         common = old_counts & new_counts
 
         rem_skip = Counter(common)
-        for toks, oline in old_by_norm:
+        for toks, oline, lno in old_by_norm:
             if not toks:
                 continue
             if rem_skip[toks] > 0:
                 rem_skip[toks] -= 1
                 continue
             items.update(_extract_code_decl_identifiers(oline))
+            items.update(_extract_code_expr_identifiers(oline))
+            for s_line, e_line, s_ident in base_spans:
+                if s_line <= lno <= e_line:
+                    items.add(s_ident)
 
         add_skip = Counter(common)
-        for toks, nline in new_by_norm:
+        for toks, nline, lno in new_by_norm:
             if not toks:
                 continue
             if add_skip[toks] > 0:
                 add_skip[toks] -= 1
                 continue
             items.update(_extract_code_decl_identifiers(nline))
+            items.update(_extract_code_expr_identifiers(nline))
+            for s_line, e_line, s_ident in head_spans:
+                if s_line <= lno <= e_line:
+                    items.add(s_ident)
 
     for raw_line in res.stdout.splitlines():
         if raw_line.startswith("@@ "):
@@ -2641,15 +2948,15 @@ def extract_changed_surface_items(
             continue
         if raw_line.startswith("-"):
             if 1 <= old_line_no <= len(base_stripped_lines):
-                hunk_old_lines.append(base_stripped_lines[old_line_no - 1])
+                hunk_old_lines.append((old_line_no, base_stripped_lines[old_line_no - 1]))
             else:
-                hunk_old_lines.append(strip_rust_comments_and_strings(raw_line[1:]))
+                hunk_old_lines.append((old_line_no, strip_rust_comments_and_strings(raw_line[1:])))
             old_line_no += 1
         elif raw_line.startswith("+"):
             if 1 <= new_line_no <= len(head_stripped_lines):
-                hunk_new_lines.append(head_stripped_lines[new_line_no - 1])
+                hunk_new_lines.append((new_line_no, head_stripped_lines[new_line_no - 1]))
             else:
-                hunk_new_lines.append(strip_rust_comments_and_strings(raw_line[1:]))
+                hunk_new_lines.append((new_line_no, strip_rust_comments_and_strings(raw_line[1:])))
             new_line_no += 1
 
     flush_hunk()
