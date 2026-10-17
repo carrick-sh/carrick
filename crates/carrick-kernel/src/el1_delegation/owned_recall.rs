@@ -574,6 +574,13 @@ pub(super) fn test_drain_external() {
     driver().drain_external();
 }
 #[cfg(test)]
+pub(super) fn test_drain_external_at(region: usize) {
+    let _drain = APERTURE_DRAIN.lock();
+    for handle in unsafe { pending_at(region) }.take() {
+        settle_open_release(region, handle);
+    }
+}
+#[cfg(test)]
 pub(super) fn completed_schedule_is_ignored(request: &OwnedRecallRequest) -> bool {
     let job = request.job.as_ref().expect("test started an actual recall");
     job.wait();
@@ -607,3 +614,6 @@ pub(super) fn observe_run_finished(request: &OwnedRecallRequest) -> std::sync::m
     ));
     rx
 }
+
+#[cfg(test)]
+mod zone_file_service_tests;

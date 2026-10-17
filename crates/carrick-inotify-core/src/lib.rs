@@ -14,6 +14,13 @@ pub const LINUX_IN_EXCL_UNLINK: u32 = 0x0400_0000;
 pub const LINUX_IN_MASK_CREATE: u32 = 0x1000_0000;
 pub const LINUX_IN_MASK_ADD: u32 = 0x2000_0000;
 pub const LINUX_IN_ONESHOT: u32 = 0x8000_0000;
+/// Watch mask modifier flags that require host forwarding / recall.
+pub const UNSUPPORTED_INOTIFY_MASK_FLAGS: u32 = LINUX_IN_MASK_ADD
+    | LINUX_IN_MASK_CREATE
+    | LINUX_IN_ONESHOT
+    | LINUX_IN_EXCL_UNLINK
+    | LINUX_IN_DONT_FOLLOW
+    | LINUX_IN_ONLYDIR;
 /// Linux errno representation in inotify core.
 #[repr(transparent)]
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Default, Debug)]

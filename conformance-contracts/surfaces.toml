@@ -118,7 +118,7 @@ contracts = ["kernel.futex.requeue"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/objects.rs"
-contracts = ["kernel.fork.filetable"]
+contracts = ["kernel.fork.filetable", "core.personality.files", "kernel.el1.open-lifetime"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/objects/task.rs"
@@ -1390,15 +1390,35 @@ contracts = ["kernel.fork.stage1-image", "kernel.mm.carrier-window-isolation"]
 
 [[surfaces]]
 path = "crates/carrick-el1-abi/src/open_lifetime.rs"
-contracts = ["kernel.el1.open-lifetime"]
+contracts = ["kernel.el1.open-lifetime", "core.personality.files"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/el1_delegation.rs"
-contracts = ["kernel.el1.open-lifetime", "kernel.el1.files", "kernel.el1.files.shared-inode"]
+contracts = ["kernel.el1.open-lifetime", "kernel.el1.files", "kernel.el1.files.shared-inode", "core.personality.files"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/el1_delegation/owned_recall.rs"
-contracts = ["kernel.el1.open-lifetime", "kernel.el1.files"]
+contracts = ["kernel.el1.open-lifetime", "kernel.el1.files", "core.personality.files"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/file.rs"
+contracts = ["core.personality.files", "kernel.el1.files", "kernel.el1.inotify"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/personality/file.rs"
+contracts = ["core.personality.files", "kernel.el1.files", "kernel.el1.inotify"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/substrate/mod.rs"
+contracts = ["core.personality.files"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/substrate/zone_file_service.rs"
+contracts = ["core.personality.files", "kernel.el1.open-lifetime"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/el1_delegation/owned_recall/zone_file_service_tests.rs"
+contracts = ["core.personality.files", "kernel.el1.open-lifetime", "kernel.el1.files"]
 
 [[surfaces]]
 path = "crates/carrick-core-abi/src/root_exit.rs"
@@ -1410,7 +1430,7 @@ contracts = ["core.entry.completion"]
 
 [[surfaces]]
 path = "crates/carrick-el1/src/personality/dispatch.rs"
-contracts = ["process.native.arm-admission", "core.entry.completion"]
+contracts = ["process.native.arm-admission", "core.entry.completion", "core.personality.files"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/trap.rs"

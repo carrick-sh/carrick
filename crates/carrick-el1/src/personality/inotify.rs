@@ -5,24 +5,14 @@ use carrick_el1_abi::{
     EL1_GUEST_LOCK_SPINS, FdMapSlot, InotifyNameCache, MAX_DELEGATED_FILES, MAX_DELEGATED_INOTIFY,
     MAX_NAME_CACHE_PATH_LEN, fd_map_lookup_inotify, hash_path,
 };
-use carrick_inotify_core::{
-    LINUX_IN_DONT_FOLLOW, LINUX_IN_EXCL_UNLINK, LINUX_IN_IGNORED, LINUX_IN_MASK_ADD,
-    LINUX_IN_MASK_CREATE, LINUX_IN_ONESHOT, LINUX_IN_ONLYDIR,
-};
+use carrick_inotify_core::LINUX_IN_IGNORED;
+pub use carrick_inotify_core::UNSUPPORTED_INOTIFY_MASK_FLAGS;
 use core::sync::atomic::Ordering;
 
 use crate::file::{MemoryValidator, copy_from_user_guarded, copy_to_user_guarded};
 
 /// Non-blocking flag for inotify file descriptor (O_NONBLOCK = 04000 octal = 0x800).
 pub const O_NONBLOCK: u32 = 0x0000_0800;
-
-/// Unsupported mask flags in-guest that require host forwarding / recall.
-pub const UNSUPPORTED_INOTIFY_MASK_FLAGS: u32 = LINUX_IN_MASK_ADD
-    | LINUX_IN_MASK_CREATE
-    | LINUX_IN_ONESHOT
-    | LINUX_IN_EXCL_UNLINK
-    | LINUX_IN_DONT_FOLLOW
-    | LINUX_IN_ONLYDIR;
 
 /// Service `inotify_add_watch(fd, pathname, mask)` (nr 27) at EL1.
 #[allow(clippy::too_many_arguments)]

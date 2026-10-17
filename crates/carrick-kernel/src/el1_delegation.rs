@@ -1641,17 +1641,14 @@ fn delegate_transaction(
     );
     file.state.store(DELEGATED_STATE_GUEST, Ordering::Release);
     drop(file_guard);
-    let key = OpenReferenceKey {
-        handle: open_handle,
-        incarnation: open_generation,
-    };
     record.bind_host_fd(
         HostBoundFd::new(host_fd.raw()).unwrap_or_else(|| unreachable!("retained host fd")),
     );
-    let published = description.publish_open_reference(key, || {
-        if !record.lifetime.initialize(open_generation, true) {
-            return false;
-        }
+    let published = description.publish_open_reference(|| {
+        // SAFETY: `region_ptr` is the retained EL1 region of this carrier.
+        let admitted = unsafe {
+            admit_open_file_in_region(region_ptr, open_handle as usize - 1, open_generation, true)
+        }?;
         if !fd_map_publish(
             region_ptr,
             file_table.raw(),
@@ -1660,12 +1657,12 @@ fn delegate_transaction(
             open_handle,
             open_generation,
         ) {
-            return false;
+            return None;
         }
         ALLOCATED_OPEN_FILES.lock()[open_handle as usize - 1].description =
             Some(Arc::downgrade(description));
         description.set_delegation_handle(open_handle);
-        true
+        Some(admitted)
     });
     if !published {
         let mut file_guard = lock_delegated_file(file, handle);
@@ -1748,17 +1745,14 @@ fn join_transaction(
     let inode_generation = file.generation.load(Ordering::Acquire);
     init_open_file(record, handle, inode_generation, generation, offset, flags);
     drop(file_guard);
-    let key = OpenReferenceKey {
-        handle: open_handle,
-        incarnation: generation,
-    };
     record.bind_host_fd(
         HostBoundFd::new(host_fd.raw()).unwrap_or_else(|| unreachable!("retained host fd")),
     );
-    if !description.publish_open_reference(key, || {
-        if !record.lifetime.initialize(generation, true) {
-            return false;
-        }
+    if !description.publish_open_reference(|| {
+        // SAFETY: `region_ptr` is the retained EL1 region of this carrier.
+        let admitted = unsafe {
+            admit_open_file_in_region(region_ptr, open_handle as usize - 1, generation, true)
+        }?;
         if !fd_map_publish(
             region_ptr,
             file_table.raw(),
@@ -1767,12 +1761,12 @@ fn join_transaction(
             open_handle,
             generation,
         ) {
-            return false;
+            return None;
         }
         ALLOCATED_OPEN_FILES.lock()[open_handle as usize - 1].description =
             Some(Arc::downgrade(description));
         description.set_delegation_handle(open_handle);
-        true
+        Some(admitted)
     }) {
         let file_guard = lock_delegated_file(file, handle);
         retire_open_file(region_ptr, open_handle);

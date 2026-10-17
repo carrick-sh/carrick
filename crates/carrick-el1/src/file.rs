@@ -2,7 +2,8 @@
 
 use carrick_el1_abi::{
     CurrentTask, DELEGATED_FILE_MAX_SIZE, DELEGATED_FLAG_APPEND, DELEGATED_FLAG_READABLE,
-    DELEGATED_FLAG_WRITABLE, DELEGATED_PAGE_SIZE, DelegatedFile, DelegatedOpenFile,
+    DELEGATED_FLAG_WRITABLE, DELEGATED_PAGE_SIZE, DELEGATED_STATE_GUEST, DelegatedFile,
+    DelegatedInotify, DelegatedOpenFile, EL1_GUEST_LOCK_SPINS, MAX_DELEGATED_MARKS_PER_FILE,
 };
 use core::sync::atomic::Ordering;
 
@@ -379,18 +380,17 @@ pub unsafe fn read_with(
         return Ok(0);
     }
     let cur_off = open.offset.load(Ordering::Acquire);
-    let size = file.size.load(Ordering::Acquire);
-    if cur_off >= size {
+    // SAFETY: forwarded from the caller.
+    let src = unsafe { resident_at(file, cache_base, cur_off, count) };
+    if src.is_empty() {
         return Ok(0);
     }
-    let avail = core::cmp::min(count, (size - cur_off) as usize);
-    // SAFETY: [cur_off, cur_off + avail) lies below size <= the slot size.
-    let src = unsafe { core::slice::from_raw_parts(cache_base.add(cur_off as usize), avail) };
     if !user.copy_out(buf_va, src) {
         return Err(FileError::Forward);
     }
-    open.offset.store(cur_off + avail as u64, Ordering::Release);
-    Ok(avail as i64)
+    open.offset
+        .store(cur_off + src.len() as u64, Ordering::Release);
+    Ok(src.len() as i64)
 }
 
 /// `pread64` on a delegated object, for any caller holding its lock.
@@ -417,22 +417,80 @@ pub unsafe fn pread64_with(
     if count == 0 {
         return Ok(0);
     }
-    let off = offset as u64;
-    let size = file.size.load(Ordering::Acquire);
-    if off >= size {
+    // SAFETY: forwarded from the caller.
+    let src = unsafe { resident_at(file, cache_base, offset as u64, count) };
+    if src.is_empty() {
         return Ok(0);
     }
-    let avail = core::cmp::min(count, (size - off) as usize);
-    // SAFETY: [off, off + avail) lies below size <= the slot size.
-    let src = unsafe { core::slice::from_raw_parts(cache_base.add(off as usize), avail) };
     if !user.copy_out(buf_va, src) {
         return Err(FileError::Forward);
     }
-    Ok(avail as i64)
+    Ok(src.len() as i64)
 }
 
-/// Copy `count` user bytes into the cache at `at`, zero any gap past the old
-/// size, and publish size, dirty and zero-filled state.
+/// The resident bytes at `offset`: at most `count`, none at or beyond EOF.
+///
+/// # Safety
+///
+/// As for [`read_with`]; the borrow ends before the object lock is released.
+pub unsafe fn resident_at<'c>(
+    file: &DelegatedFile,
+    cache_base: *const u8,
+    offset: u64,
+    count: usize,
+) -> &'c [u8] {
+    let size = file.size.load(Ordering::Acquire);
+    if offset >= size {
+        return &[];
+    }
+    let avail = core::cmp::min(count, (size - offset) as usize);
+    // SAFETY: [offset, offset + avail) lies below size <= the slot size.
+    unsafe { core::slice::from_raw_parts(cache_base.add(offset as usize), avail) }
+}
+
+/// Where a positional store lands. `End` is selected from the size published
+/// under the same object lock as the store, so concurrent appenders cannot
+/// overwrite each other.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoreAt {
+    Offset(u64),
+    End,
+}
+
+/// Store `count` bytes produced by `fill` at `at`, for any caller holding the
+/// object lock. Returns the selected offset. A store past the resident slot is
+/// `Forward`: the host owns bytes the zone cannot hold.
+///
+/// # Safety
+///
+/// As for [`read_with`].
+pub unsafe fn store_with(
+    file: &DelegatedFile,
+    cache_base: *mut u8,
+    at: StoreAt,
+    count: usize,
+    fill: impl FnOnce(&mut [u8]) -> bool,
+) -> Result<u64, FileError> {
+    let start = match at {
+        StoreAt::Offset(offset) => offset,
+        StoreAt::End => file.size.load(Ordering::Acquire),
+    };
+    if count == 0 {
+        return Ok(start);
+    }
+    let Some(end) = start.checked_add(count as u64) else {
+        return Err(FileError::OffsetOverflow);
+    };
+    if end > DELEGATED_FILE_MAX_SIZE {
+        return Err(FileError::Forward);
+    }
+    // SAFETY: bounds checked above; the caller holds the lock.
+    unsafe { store_at(file, cache_base, start, count, fill)? };
+    Ok(start)
+}
+
+/// Copy `count` bytes from `fill` into the cache at `at`, zero any gap past
+/// the old size, and publish size, dirty and zero-filled state.
 ///
 /// # Safety
 ///
@@ -441,13 +499,12 @@ unsafe fn store_at(
     file: &DelegatedFile,
     cache_base: *mut u8,
     at: u64,
-    buf_va: u64,
     count: usize,
-    user: &mut impl UserCopy,
+    fill: impl FnOnce(&mut [u8]) -> bool,
 ) -> Result<u64, FileError> {
     // SAFETY: [at, at + count) lies inside the slot (checked by the caller).
     let dst = unsafe { core::slice::from_raw_parts_mut(cache_base.add(at as usize), count) };
-    if !user.copy_in(dst, buf_va) {
+    if !fill(dst) {
         return Err(FileError::Forward);
     }
     let delivered_end = at + count as u64;
@@ -501,7 +558,11 @@ pub unsafe fn write_with(
         return Err(FileError::Forward);
     }
     // SAFETY: bounds checked above; the caller holds the lock.
-    let delivered_end = unsafe { store_at(file, cache_base, cur_off, buf_va, count, user)? };
+    let delivered_end = unsafe {
+        store_at(file, cache_base, cur_off, count, |dst| {
+            user.copy_in(dst, buf_va)
+        })?
+    };
     open.offset.store(delivered_end, Ordering::Release);
     Ok(count as i64)
 }
@@ -538,7 +599,11 @@ pub unsafe fn pwrite64_with(
         return Err(FileError::Forward);
     }
     // SAFETY: bounds checked above; the caller holds the lock.
-    unsafe { store_at(file, cache_base, off, buf_va, count, user)? };
+    unsafe {
+        store_at(file, cache_base, off, count, |dst| {
+            user.copy_in(dst, buf_va)
+        })?
+    };
     Ok(count as i64)
 }
 
@@ -598,4 +663,107 @@ pub enum SeekFrom {
     Start,
     Current,
     End,
+}
+
+/// How a file operation acquires the watch instances that mark the inode.
+/// The guest tries for a bounded spin budget and refuses if contended; the host
+/// waits because it is the terminal fallback.
+pub trait InstanceLockPolicy {
+    fn acquire(&self, instance: &DelegatedInotify) -> bool;
+}
+
+/// Guest policy: take the watch instance lock only if it becomes free within
+/// the bounded spin budget.
+pub struct TryInstanceLock;
+
+impl InstanceLockPolicy for TryInstanceLock {
+    fn acquire(&self, instance: &DelegatedInotify) -> bool {
+        instance.lock_guest_bounded(EL1_GUEST_LOCK_SPINS)
+    }
+}
+
+/// Data notification event produced when a file operation moves bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileDataEvent {
+    None,
+    Access,
+    Modify,
+}
+
+impl FileDataEvent {
+    const fn mask(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Access => 0x01,
+            Self::Modify => 0x02,
+        }
+    }
+}
+
+/// Run `op` on a locked `file` while holding every watch instance that marks it
+/// for `event`, then queue `event` on each matching watch if `op` moved bytes.
+/// If any matching watch instance is not guest-resident, has spilled, or cannot
+/// be locked under `locks`, releases any acquired locks and returns
+/// `Err(unsupported)` before `op` runs.
+pub fn with_data_marks<T, E: Copy>(
+    file: &DelegatedFile,
+    watches: &[DelegatedInotify],
+    event: FileDataEvent,
+    locks: &impl InstanceLockPolicy,
+    unsupported: E,
+    moved: impl FnOnce(&T) -> bool,
+    op: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let mask = event.mask();
+    let mut locked = [0u32; MAX_DELEGATED_MARKS_PER_FILE];
+    let mut num_locked = 0;
+    let mut lock_failed = false;
+    if mask != 0 && file.has_marks() {
+        file.for_each_mark(|m| {
+            if lock_failed || m.inotify_handle == 0 {
+                return;
+            }
+            if (m.mask & mask) == 0 || locked[..num_locked].contains(&m.inotify_handle) {
+                return;
+            }
+            match watches.get((m.inotify_handle - 1) as usize) {
+                Some(watch)
+                    if watch.state.load(Ordering::Acquire) == DELEGATED_STATE_GUEST
+                        && watch.spilled.load(Ordering::Acquire) == 0
+                        && locks.acquire(watch) =>
+                {
+                    locked[num_locked] = m.inotify_handle;
+                    num_locked += 1;
+                }
+                _ => lock_failed = true,
+            }
+        });
+    }
+    let release = |locked: &[u32]| {
+        for &h in locked {
+            if let Some(watch) = watches.get((h - 1) as usize) {
+                watch.unlock();
+            }
+        }
+    };
+    if lock_failed {
+        release(&locked[..num_locked]);
+        return Err(unsupported);
+    }
+    let outcome = op();
+    if mask != 0
+        && let Ok(ref value) = outcome
+        && moved(value)
+    {
+        file.for_each_mark(|m| {
+            if (m.mask & mask) != 0
+                && m.inotify_handle != 0
+                && let Some(watch) = watches.get((m.inotify_handle - 1) as usize)
+            {
+                watch.push_record(m.wd, mask, 0, None);
+            }
+        });
+    }
+    release(&locked[..num_locked]);
+    outcome
 }
