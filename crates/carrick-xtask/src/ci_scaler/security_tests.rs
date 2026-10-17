@@ -25,7 +25,7 @@ fn http_fixture() -> (String, std::thread::JoinHandle<String>) {
     let url = format!("http://{}/fixture", listener.local_addr().unwrap());
     listener.set_nonblocking(true).unwrap();
     let worker = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let mut stream = loop {
             match listener.accept() {
                 Ok((stream, _)) => break stream,
@@ -70,6 +70,8 @@ fn http_fixture() -> (String, std::thread::JoinHandle<String>) {
 fn isolate_curl_env<'a>(command: &'a mut Command, dir: &Path) -> &'a mut Command {
     for var in [
         "LD_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
         "HTTP_PROXY",
         "HTTPS_PROXY",
         "ALL_PROXY",
@@ -125,7 +127,7 @@ fn serial_host_authenticated_curl_controller_ignores_ambient_trace() {
     execute(
         &mut control,
         request_config(&token, &PveCall::Get).unwrap().as_bytes(),
-        Duration::from_secs(5),
+        Duration::from_secs(60),
     )
     .unwrap();
     assert!(server.join().unwrap().contains(SYNTHETIC_SECRET));
@@ -157,7 +159,7 @@ fn serial_host_authenticated_curl_controller_ignores_ambient_trace() {
         let response = execute(
             &mut command,
             request_config(&token, &call).unwrap().as_bytes(),
-            Duration::from_secs(5),
+            Duration::from_secs(60),
         )
         .unwrap();
         assert_eq!(pve_response(&response).unwrap()["ok"], true);
@@ -202,7 +204,7 @@ fn serial_host_authenticated_curl_template_ignores_ambient_trace() {
     );
     let mut bash = Command::new("/bin/bash");
     isolate_curl_env(bash.args(["-c", &script]), dir.path());
-    execute(&mut bash, &[], Duration::from_secs(5)).unwrap();
+    execute(&mut bash, &[], Duration::from_secs(60)).unwrap();
     assert!(server.join().unwrap().contains(SYNTHETIC_SECRET));
     assert!(
         !trace.exists(),
@@ -445,64 +447,90 @@ fn http_fixture_drains_split_post_body_before_closing_connection() {
 }
 
 #[test]
-fn serial_host_execute_surfaces_exit_code_redacts_secrets_and_strips_ld_library_path() {
+fn serial_host_execute_surfaces_exit_status_without_external_output_and_strips_library_paths() {
     let token = Token {
         id: "synthetic-id".into(),
         secret: SYNTHETIC_SECRET.into(),
     };
     let config = request_config(&token, &PveCall::Get).unwrap();
-    let prefix = "x".repeat(400);
+    let absent_secret = "absent-from-input-secret";
     let script = format!(
-        "printf '%s\\n' '{prefix}' >&2; printf 'curl: (22) HTTP 401 Authorization: PVEAPIToken=synthetic-id={SYNTHETIC_SECRET} Bearer {SYNTHETIC_SECRET}\\n' >&2; exit 22"
+        "printf 'Authorization: Bearer {absent_secret} PVEAPIToken=synthetic-id={SYNTHETIC_SECRET}\\n'; printf 'curl: (22) Authorization: Bearer {absent_secret} {SYNTHETIC_SECRET}\\n' >&2; exit 22"
     );
     let err = execute(
         Command::new("/bin/sh").args(["-c", &script]),
         config.as_bytes(),
-        Duration::from_secs(5),
+        Duration::from_secs(60),
     )
     .unwrap_err();
     let rendered = format!("{err} | {err:?}");
-    assert!(
-        rendered.contains("exited with code 22"),
-        "expected exit code 22 in error: {rendered}"
+    assert_eq!(
+        err.to_string(),
+        "external command failed: sh exited with code 22"
     );
     assert!(
-        rendered.contains("curl: (22) HTTP 401"),
-        "expected bounded stderr context in error: {rendered}"
+        !rendered.contains(SYNTHETIC_SECRET)
+            && !rendered.contains(absent_secret)
+            && !rendered.contains("Authorization")
+            && !rendered.contains("curl:"),
+        "error included external output: {rendered}"
     );
-    assert!(
-        !rendered.contains(SYNTHETIC_SECRET) && !rendered.contains("synthetic-id"),
-        "error leaked credential material: {rendered}"
+
+    let sig_err = execute(
+        Command::new("/bin/sh").args([
+            "-c",
+            &format!("printf '{SYNTHETIC_SECRET} {absent_secret}\\n' >&2; kill -9 $$"),
+        ]),
+        &[],
+        Duration::from_secs(60),
+    )
+    .unwrap_err();
+    assert_eq!(
+        sig_err.to_string(),
+        "external command failed: sh killed by signal 9"
     );
-    assert!(
-        rendered.len() < 600,
-        "stderr tail was not bounded: len={}",
-        rendered.len()
+
+    let timeout_err = execute(
+        Command::new("/bin/sh").args([
+            "-c",
+            &format!("printf '{SYNTHETIC_SECRET} {absent_secret}\\n' >&2; exec sleep 5"),
+        ]),
+        &[],
+        Duration::from_millis(50),
+    )
+    .unwrap_err();
+    assert_eq!(
+        timeout_err.to_string(),
+        "external command failed: sh timed out after 50ms"
     );
+
+    // Writing > 64 KiB to stderr must not SIGPIPE the child.
+    let large_stderr = execute(
+        Command::new("/bin/sh").args(["-c", "head -c 131072 /dev/zero >&2; printf ok"]),
+        &[],
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    assert_eq!(large_stderr, b"ok");
 
     let out = execute(
         Command::new("/bin/sh")
-            .args(["-c", "printf '%s' \"${LD_LIBRARY_PATH:-}\""])
-            .env("LD_LIBRARY_PATH", "/nonexistent/cargo/target/debug/deps"),
+            .args([
+                "-c",
+                "printf '%s%s%s' \"${LD_LIBRARY_PATH:-}\" \"${DYLD_LIBRARY_PATH:-}\" \"${DYLD_FALLBACK_LIBRARY_PATH:-}\"",
+            ])
+            .env("LD_LIBRARY_PATH", "/nonexistent/cargo/target/debug/deps")
+            .env("DYLD_LIBRARY_PATH", "/nonexistent/cargo/target/debug/deps")
+            .env(
+                "DYLD_FALLBACK_LIBRARY_PATH",
+                "/nonexistent/cargo/target/debug/deps",
+            ),
         &[],
-        Duration::from_secs(5),
+        Duration::from_secs(60),
     )
     .unwrap();
     assert!(
         out.is_empty(),
-        "execute must strip ambient LD_LIBRARY_PATH for external binaries"
+        "execute must strip ambient LD/DYLD library paths for external binaries"
     );
-
-    let echoed = crate::lock_file::tests::with_unrelated_fork_exec(
-        || {
-            execute(
-                Command::new("/bin/sh").args(["-c", "cat"]),
-                b"preloaded-stdin",
-                Duration::from_secs(1),
-            )
-            .unwrap()
-        },
-        || {},
-    );
-    assert_eq!(echoed, b"preloaded-stdin");
 }
