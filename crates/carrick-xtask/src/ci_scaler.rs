@@ -69,6 +69,9 @@ pub enum ScalerError {
     // Never include external output: API/runner responses may contain secrets.
     #[error("external operation failed: {0}")]
     External(&'static str),
+    // Bounded, credential-redacted command status/stderr diagnostic.
+    #[error("external command failed: {0}")]
+    CommandFailed(String),
     // Contains only a validated HTTP status and parameter names, never values.
     #[error("PVE rejected request: {0}")]
     PveRejected(String),
@@ -1003,21 +1006,140 @@ fn now() -> Result<u64, ScalerError> {
         .map_err(|_| ScalerError::Guard("system clock before epoch"))
 }
 
+const STDERR_CAPTURE_LIMIT: u64 = 64 * 1024;
+const STDERR_SUMMARY_LIMIT: usize = 240;
+
+fn redact_prefix(text: &str, prefix: &str, replacement: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let needle = prefix.to_ascii_lowercase();
+    while let Some(pos) = rest.to_ascii_lowercase().find(&needle) {
+        out.push_str(&rest[..pos]);
+        out.push_str(replacement);
+        let after = &rest[pos + prefix.len()..];
+        let trimmed = after.trim_start_matches([' ', '\t']);
+        let end = trimmed
+            .find([' ', '\t', '\r', '\n', '"', '\'', ';', ','])
+            .unwrap_or(trimmed.len());
+        rest = &trimmed[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn redact_stderr(stderr: &[u8], input: &[u8]) -> String {
+    let mut text = String::from_utf8_lossy(stderr).into_owned();
+    if let Ok(input_str) = std::str::from_utf8(input) {
+        let mut tokens: Vec<&str> = input_str
+            .split([
+                ' ', '\t', '\r', '\n', '"', '\'', '=', ':', ';', ',', '{', '}', '[', ']',
+            ])
+            .filter(|tok| {
+                tok.len() >= 4
+                    && !matches!(
+                        *tok,
+                        "header"
+                            | "data"
+                            | "Authorization"
+                            | "authorization"
+                            | "PVEAPIToken"
+                            | "Bearer"
+                            | "bearer"
+                            | "Content-Type"
+                            | "application"
+                            | "application/json"
+                            | "json"
+                            | "true"
+                            | "false"
+                            | "null"
+                    )
+            })
+            .collect();
+        tokens.sort_by_key(|tok| std::cmp::Reverse(tok.len()));
+        tokens.dedup();
+        for tok in tokens {
+            text = text.replace(tok, "<redacted>");
+        }
+    }
+    for (prefix, replacement) in [
+        ("PVEAPIToken=", "PVEAPIToken=<redacted>"),
+        ("Authorization:", "Authorization: <redacted>"),
+        ("Bearer ", "Bearer <redacted>"),
+        ("value\":", "value\":<redacted>"),
+        ("secret\":", "secret\":<redacted>"),
+        ("token\":", "token\":<redacted>"),
+        ("full-tokenid\":", "full-tokenid\":<redacted>"),
+        ("ghp_", "<redacted>"),
+        ("gho_", "<redacted>"),
+        ("ghu_", "<redacted>"),
+        ("ghs_", "<redacted>"),
+        ("ghr_", "<redacted>"),
+        ("github_pat_", "<redacted>"),
+    ] {
+        text = redact_prefix(&text, prefix, replacement);
+    }
+    let mut normalized = String::with_capacity(text.len());
+    let mut prev_space = false;
+    for ch in text.chars() {
+        if ch.is_ascii_graphic() {
+            normalized.push(ch);
+            prev_space = false;
+        } else if !prev_space && !normalized.is_empty() {
+            normalized.push(' ');
+            prev_space = true;
+        }
+    }
+    let trimmed = normalized.trim();
+    if trimmed.len() <= STDERR_SUMMARY_LIMIT {
+        trimmed.to_owned()
+    } else {
+        format!("...{}", &trimmed[trimmed.len() - STDERR_SUMMARY_LIMIT..])
+    }
+}
+
 // Capture output in memory, never in a command log or a tempfile. Bounds apply
 // to every external command (including gh and ssh), not just guest readiness.
 fn execute(command: &mut Command, input: &[u8], limit: Duration) -> Result<Vec<u8>, ScalerError> {
-    use std::os::unix::process::CommandExt;
-    let deadline = Instant::now() + limit;
-    let mut child = command
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    let program = Path::new(command.get_program())
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("command")
+        .to_owned();
+    // External host tools (curl, gh, ssh, lvs, bash) must resolve shared
+    // libraries via /etc/ld.so.cache rather than scanning Cargo's target/debug/deps
+    // directory when xtask or its test binary runs under cargo.
+    command
+        .env_remove("LD_LIBRARY_PATH")
         .process_group(0)
-        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    let large_input = if input.is_empty() {
+        command.stdin(Stdio::null());
+        false
+    } else if input.len() <= 4096 {
+        let (reader, mut writer) = std::io::pipe()?;
+        writer.write_all(input)?;
+        drop(writer);
+        command.stdin(Stdio::from(reader));
+        false
+    } else {
+        command.stdin(Stdio::piped());
+        true
+    };
+    let deadline = Instant::now() + limit;
+    let mut child = command.spawn()?;
+    if !large_input {
+        command.stdin(Stdio::null());
+    }
     let pgid = i32::try_from(child.id()).map_err(|_| ScalerError::External("process group ID"))?;
-    let mut stdin = child.stdin.take().ok_or(ScalerError::External("stdin"))?;
-    let data = input.to_vec();
-    let input_thread = std::thread::spawn(move || stdin.write_all(&data));
+    let input_thread = if large_input {
+        let mut stdin = child.stdin.take().ok_or(ScalerError::External("stdin"))?;
+        let data = input.to_vec();
+        Some(std::thread::spawn(move || stdin.write_all(&data)))
+    } else {
+        None
+    };
     let stdout = child.stdout.take().ok_or(ScalerError::External("stdout"))?;
     let (output_tx, output_rx) = std::sync::mpsc::channel();
     let output_thread = std::thread::spawn(move || {
@@ -1028,13 +1150,24 @@ fn execute(command: &mut Command, input: &[u8], limit: Duration) -> Result<Vec<u
             .map(|_| bytes);
         let _ = output_tx.send(result);
     });
+    let stderr = child.stderr.take().ok_or(ScalerError::External("stderr"))?;
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+    let stderr_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stderr
+            .take(STDERR_CAPTURE_LIMIT)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = stderr_tx.send(result);
+    });
     let (wait_tx, wait_rx) = std::sync::mpsc::channel();
     let wait_thread = std::thread::spawn(move || {
         let _ = wait_tx.send(child.wait());
     });
     let status = wait_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
     let output = output_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
-    if status.is_err() || output.is_err() {
+    let stderr_out = stderr_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    if status.is_err() || output.is_err() || stderr_out.is_err() {
         // This invocation owns a fresh process group, including pipe holders.
         unsafe {
             libc::kill(-pgid, libc::SIGKILL);
@@ -1046,17 +1179,65 @@ fn execute(command: &mut Command, input: &[u8], limit: Duration) -> Result<Vec<u
     output_thread
         .join()
         .map_err(|_| ScalerError::External("output reader"))?;
-    let write = input_thread
+    stderr_thread
         .join()
-        .map_err(|_| ScalerError::External("input writer"))?;
-    if !matches!(&status, Ok(Ok(s)) if s.success()) {
-        return Err(ScalerError::External(
-            "command exit/timeout (output suppressed)",
-        ));
+        .map_err(|_| ScalerError::External("stderr reader"))?;
+    let write = match input_thread {
+        Some(thread) => thread
+            .join()
+            .map_err(|_| ScalerError::External("input writer"))?,
+        None => Ok(()),
+    };
+    let stderr_timed_out = stderr_out.is_err();
+    let stderr_bytes = stderr_out
+        .or_else(|_| stderr_rx.try_recv())
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    let format_with_stderr = |reason: String| {
+        let redacted = redact_stderr(&stderr_bytes, input);
+        if redacted.is_empty() {
+            ScalerError::CommandFailed(format!("{reason} (stderr empty)"))
+        } else {
+            ScalerError::CommandFailed(format!("{reason}; stderr: {redacted}"))
+        }
+    };
+    match &status {
+        Ok(Ok(s)) if s.success() => {}
+        Ok(Ok(s)) => {
+            let reason = if let Some(code) = s.code() {
+                format!("{program} exited with code {code}")
+            } else if let Some(sig) = s.signal() {
+                format!("{program} killed by signal {sig}")
+            } else {
+                format!("{program} exited unsuccessfully")
+            };
+            return Err(format_with_stderr(reason));
+        }
+        Ok(Err(err)) => {
+            return Err(format_with_stderr(format!("{program} wait error: {err}")));
+        }
+        Err(_) => {
+            return Err(format_with_stderr(format!(
+                "{program} timed out after {}ms",
+                limit.as_millis()
+            )));
+        }
     }
     write?;
+    if stderr_timed_out {
+        return Err(format_with_stderr(format!(
+            "{program} stderr timed out after {}ms",
+            limit.as_millis()
+        )));
+    }
     output
-        .map_err(|_| ScalerError::External("command output timeout"))?
+        .map_err(|_| {
+            format_with_stderr(format!(
+                "{program} stdout timed out after {}ms",
+                limit.as_millis()
+            ))
+        })?
         .map_err(ScalerError::Io)
 }
 

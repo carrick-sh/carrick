@@ -4,6 +4,21 @@ use super::*;
 
 const SYNTHETIC_SECRET: &str = "synthetic-never-a-real-credential";
 
+fn request_complete(request: &[u8]) -> Option<usize> {
+    let header_end = request.windows(4).position(|part| part == b"\r\n\r\n")? + 4;
+    let headers = std::str::from_utf8(&request[..header_end]).ok()?;
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    Some(header_end + content_length)
+}
+
 fn http_fixture() -> (String, std::thread::JoinHandle<String>) {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -32,7 +47,7 @@ fn http_fixture() -> (String, std::thread::JoinHandle<String>) {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let mut request = vec![];
-        while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+        while request_complete(&request).is_none_or(|total| request.len() < total) {
             let mut chunk = [0; 4096];
             let count = stream.read(&mut chunk).unwrap();
             assert!(count > 0 && request.len() < 16384);
@@ -45,9 +60,32 @@ fn http_fixture() -> (String, std::thread::JoinHandle<String>) {
             body.len()
         )
         .unwrap();
+        stream.flush().unwrap();
+        let _ = stream.shutdown(std::net::Shutdown::Write);
         String::from_utf8(request).unwrap()
     });
     (url, worker)
+}
+
+fn isolate_curl_env<'a>(command: &'a mut Command, dir: &Path) -> &'a mut Command {
+    for var in [
+        "LD_LIBRARY_PATH",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        command.env_remove(var);
+    }
+    command
+        .current_dir(dir)
+        .env("HOME", dir)
+        .env("CURL_HOME", dir)
+        .env("TMPDIR", dir)
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
 }
 
 fn ambient_trace(dir: &Path) -> PathBuf {
@@ -83,10 +121,7 @@ fn serial_host_authenticated_curl_controller_ignores_ambient_trace() {
         .map(|arg| arg.to_owned())
         .collect();
     control = Command::new("curl");
-    control
-        .args(args)
-        .env("CURL_HOME", dir.path())
-        .env("NO_PROXY", "127.0.0.1");
+    isolate_curl_env(control.args(args), dir.path());
     execute(
         &mut control,
         request_config(&token, &PveCall::Get).unwrap().as_bytes(),
@@ -118,9 +153,7 @@ fn serial_host_authenticated_curl_controller_ignores_ambient_trace() {
     ] {
         let (url, server) = http_fixture();
         let mut command = pve_curl(&call, &super::site::WILLOW.api_resolve(), None, &url);
-        command
-            .env("CURL_HOME", dir.path())
-            .env("NO_PROXY", "127.0.0.1");
+        isolate_curl_env(&mut command, dir.path());
         let response = execute(
             &mut command,
             request_config(&token, &call).unwrap().as_bytes(),
@@ -167,15 +200,9 @@ fn serial_host_authenticated_curl_template_ignores_ambient_trace() {
     let script = format!(
         "set -euo pipefail\napi_host=site.invalid\napi_ca_args=()\npve_call() {{\n{function}\n}}\npve_call POST /fixture\n"
     );
-    execute(
-        Command::new("/bin/bash")
-            .args(["-c", &script])
-            .env("CURL_HOME", dir.path())
-            .env("NO_PROXY", "127.0.0.1"),
-        &[],
-        Duration::from_secs(5),
-    )
-    .unwrap();
+    let mut bash = Command::new("/bin/bash");
+    isolate_curl_env(bash.args(["-c", &script]), dir.path());
+    execute(&mut bash, &[], Duration::from_secs(5)).unwrap();
     assert!(server.join().unwrap().contains(SYNTHETIC_SECRET));
     assert!(
         !trace.exists(),
@@ -384,4 +411,98 @@ fn teardown_requires_durable_license_and_all_ownership_guards() {
         assert!(continue_teardown(&mut api, &mut ledger, &mut row, dir.path(), &path).is_err());
         assert!(api.events.is_empty());
     }
+}
+
+#[test]
+fn http_fixture_drains_split_post_body_before_closing_connection() {
+    let (url, server) = http_fixture();
+    let addr = url
+        .strip_prefix("http://")
+        .unwrap()
+        .strip_suffix("/fixture")
+        .unwrap();
+    let mut client = std::net::TcpStream::connect(addr).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    write!(
+        client,
+        "POST /fixture HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: PVEAPIToken=synthetic={SYNTHETIC_SECRET}\r\nContent-Length: 2\r\n\r\n"
+    )
+    .unwrap();
+    client.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(25));
+    client.write_all(b"{}").unwrap();
+    client.flush().unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    assert!(response.contains("HTTP/1.1 200 OK"));
+    let captured = server.join().unwrap();
+    assert!(
+        captured.ends_with("\r\n\r\n{}"),
+        "fixture closed before reading Content-Length body: {captured:?}"
+    );
+}
+
+#[test]
+fn serial_host_execute_surfaces_exit_code_redacts_secrets_and_strips_ld_library_path() {
+    let token = Token {
+        id: "synthetic-id".into(),
+        secret: SYNTHETIC_SECRET.into(),
+    };
+    let config = request_config(&token, &PveCall::Get).unwrap();
+    let prefix = "x".repeat(400);
+    let script = format!(
+        "printf '%s\\n' '{prefix}' >&2; printf 'curl: (22) HTTP 401 Authorization: PVEAPIToken=synthetic-id={SYNTHETIC_SECRET} Bearer {SYNTHETIC_SECRET}\\n' >&2; exit 22"
+    );
+    let err = execute(
+        Command::new("/bin/sh").args(["-c", &script]),
+        config.as_bytes(),
+        Duration::from_secs(5),
+    )
+    .unwrap_err();
+    let rendered = format!("{err} | {err:?}");
+    assert!(
+        rendered.contains("exited with code 22"),
+        "expected exit code 22 in error: {rendered}"
+    );
+    assert!(
+        rendered.contains("curl: (22) HTTP 401"),
+        "expected bounded stderr context in error: {rendered}"
+    );
+    assert!(
+        !rendered.contains(SYNTHETIC_SECRET) && !rendered.contains("synthetic-id"),
+        "error leaked credential material: {rendered}"
+    );
+    assert!(
+        rendered.len() < 600,
+        "stderr tail was not bounded: len={}",
+        rendered.len()
+    );
+
+    let out = execute(
+        Command::new("/bin/sh")
+            .args(["-c", "printf '%s' \"${LD_LIBRARY_PATH:-}\""])
+            .env("LD_LIBRARY_PATH", "/nonexistent/cargo/target/debug/deps"),
+        &[],
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    assert!(
+        out.is_empty(),
+        "execute must strip ambient LD_LIBRARY_PATH for external binaries"
+    );
+
+    let echoed = crate::lock_file::tests::with_unrelated_fork_exec(
+        || {
+            execute(
+                Command::new("/bin/sh").args(["-c", "cat"]),
+                b"preloaded-stdin",
+                Duration::from_secs(1),
+            )
+            .unwrap()
+        },
+        || {},
+    );
+    assert_eq!(echoed, b"preloaded-stdin");
 }
