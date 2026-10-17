@@ -409,6 +409,8 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
 
         fn wake_effects(&mut self, _: WakeEffects) {}
 
+        fn request_ingress_producer_boundary(&mut self) {}
+
         fn child_file_table(&self, _parent_table: u64, issued: u64) -> u64 {
             issued
         }
