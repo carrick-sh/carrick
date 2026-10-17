@@ -133,9 +133,12 @@ impl OwnerMmu for X86Mmu {
             Ok(_) | Err(CowClass::AlreadyWritable) => Ok(()),
             Err(CowClass::ExecutableDenied) => Err(OwnerMmuRefusal::ExecutableCow),
             Err(CowClass::Unreachable) => Err(OwnerMmuRefusal::Unreachable),
-            Err(CowClass::Unmapped | CowClass::NotCowArmed | CowClass::NoWriteIntent) => {
-                Err(OwnerMmuRefusal::Protection)
-            }
+            Err(
+                CowClass::Unmapped
+                | CowClass::NotCowArmed
+                | CowClass::NoWriteIntent
+                | CowClass::AncestorNotWritable,
+            ) => Err(OwnerMmuRefusal::Protection),
         }
     }
 }
