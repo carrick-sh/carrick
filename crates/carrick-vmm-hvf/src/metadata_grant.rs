@@ -1191,6 +1191,62 @@ fn fork_custody_in_retained_region(offset: usize, bytes: usize) -> bool {
             .is_some_and(|end| end <= carrick_el1_abi::EL1_REGION_SIZE as usize)
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retain_fork_custody_rows(
+    custody: &Arc<crate::trap::CarrierVmCustody>,
+    region: RetainedAbiRegion<'_>,
+    parent_mm: u64,
+    request: ForkStockRequest,
+    address: carrick_guest_arch::KernelVa,
+    count: u64,
+) -> Result<Vec<crate::trap::ForkPhysicalRetention>, ForkStockRefusal> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let Ok(count) = usize::try_from(count) else {
+        return Err(ForkStockRefusal::Invalid);
+    };
+    let Some(bytes) = count.checked_mul(core::mem::size_of::<[u64; 4]>()) else {
+        return Err(ForkStockRefusal::Invalid);
+    };
+    let Some(offset) = address
+        .raw()
+        .checked_sub(carrick_el1_abi::EL1_METADATA_BASE)
+        .and_then(|offset| usize::try_from(offset).ok())
+    else {
+        return Err(ForkStockRefusal::Invalid);
+    };
+    if offset % core::mem::align_of::<[u64; 4]>() != 0
+        || !fork_custody_in_retained_region(offset, bytes)
+    {
+        return Err(ForkStockRefusal::Invalid);
+    };
+    let Some(pointer) = region.slice_ptr(offset, bytes) else {
+        return Err(ForkStockRefusal::Invalid);
+    };
+    let mut retained = Vec::new();
+    if retained.try_reserve_exact(count).is_err() {
+        return Err(ForkStockRefusal::Capacity);
+    }
+    let owner = crate::trap::CarrierPinVenue::with_weak(Arc::downgrade(custody), parent_mm);
+    // SAFETY: retained EL1 region slice checked for alignment and bounds.
+    let rows = unsafe { core::slice::from_raw_parts(pointer as *const [u64; 4], count) };
+    for &words in rows {
+        let Some(selected) = carrick_el1_abi::PortalForkCustody::from_words(words) else {
+            return Err(ForkStockRefusal::Invalid);
+        };
+        let Some(pin) =
+            <crate::trap::CarrierPinVenue as carrick_hal::fork_stock::ForkPhysicalCustodyOwner>::retain(
+                &owner, request, selected,
+            )
+        else {
+            return Err(ForkStockRefusal::Inventory);
+        };
+        retained.push(pin);
+    }
+    Ok(retained)
+}
+
 /// Native stock crossings retain an ABI stack, not a physical inventory row.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[allow(clippy::too_many_arguments)]
@@ -1291,7 +1347,7 @@ pub(crate) fn service_native_fork_stock(
                 })
                 .is_ok()
         }
-        Some(ForkStockKind::Commit | ForkStockKind::Abort) => {
+        Some(ForkStockKind::Reserve | ForkStockKind::Commit | ForkStockKind::Abort) => {
             let Some(pointer) = abi_stack_ptr::<ForkStockSettlement>(region, cpu, address) else {
                 return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
             };
@@ -1302,112 +1358,88 @@ pub(crate) fn service_native_fork_stock(
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             };
             let mut stock = custody.fork_stock.lock();
-            let mut ledger = custody.el1_frame_grants.lock();
-            let physical = if kind == Some(ForkStockKind::Commit) {
-                use carrick_aarch64::fork::ForkCustody;
-                let loan = stock.owner.settlement_loan(execution);
-                let Some((request, address, count)) = loan.ok().and_then(|loan| {
-                    settlement
-                        .request(loan)
-                        .map(|(_, address, count)| (loan.request, address, count))
-                }) else {
-                    settlement.refuse(ForkStockRefusal::Invalid);
-                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
-                };
-                let Some(count) = usize::try_from(count).ok() else {
-                    settlement.refuse(ForkStockRefusal::Inventory);
-                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
-                };
-                let Some(bytes) = count.checked_mul(32) else {
-                    settlement.refuse(ForkStockRefusal::Inventory);
-                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
-                };
-                let Some(offset) = address
-                    .raw()
-                    .checked_sub(carrick_el1_abi::EL1_REGION_BASE)
-                    .and_then(|offset| usize::try_from(offset).ok())
-                else {
-                    settlement.refuse(ForkStockRefusal::Inventory);
-                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
-                };
-                if !fork_custody_in_retained_region(offset, bytes) {
-                    settlement.refuse(ForkStockRefusal::Inventory);
-                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
-                }
-                let authority = custody
-                    .guest_cow_state(execution.binding.mm.raw())
-                    .ok()
-                    .flatten()
-                    .and_then(|state| state.cow_runtime.read().clone())
-                    .map(|runtime| runtime.authority);
-                let source = Arc::new(move |handle, generation| {
-                    authority
-                        .as_ref()
-                        .is_some_and(|authority| authority.retains_host_backing(handle, generation))
-                });
-                let owner = crate::trap::ForkPhysicalCustody::new(Arc::clone(custody), source);
-                let mut retained = Vec::new();
-                if retained.try_reserve_exact(count).is_err() {
-                    settlement.refuse(ForkStockRefusal::Capacity);
-                    return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
-                }
-                for index in 0..count {
-                    let Some(row_offset) = index
-                        .checked_mul(32)
-                        .and_then(|index| offset.checked_add(index))
-                    else {
-                        settlement.refuse(ForkStockRefusal::Inventory);
-                        return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
-                    };
-                    let Some(pointer) = region.record_ptr::<[u64; 4]>(row_offset) else {
-                        settlement.refuse(ForkStockRefusal::Inventory);
-                        return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
-                    };
-                    // SAFETY: this complete row lies in the stopped CPU's retained
-                    // EL1 allocation, checked above against the region bounds.
-                    let words = unsafe { *pointer };
-                    let Some(selected) = carrick_el1_abi::PortalForkCustody::decode(words) else {
-                        settlement.refuse(ForkStockRefusal::Inventory);
-                        return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
-                    };
-                    match owner.retain(request, selected) {
-                        Ok(Some(pin)) => retained.push(pin),
-                        _ => {
-                            settlement.refuse(ForkStockRefusal::Inventory);
-                            return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
-                        }
+            if kind == Some(ForkStockKind::Reserve) {
+                stock
+                    .owner
+                    .reserve_custody(
+                        execution,
+                        settlement,
+                        |pages| {
+                            pages.iter().all(|page| {
+                                ForkStockHostCustody::physical_ptr::<[u8; 4096]>(
+                                    custody,
+                                    page.address(),
+                                )
+                                .is_ok()
+                            })
+                        },
+                        |pages| ForkStockHostCustody::tables_clean(custody, pages),
+                        |request, address, count| {
+                            retain_fork_custody_rows(
+                                custody,
+                                region,
+                                execution.binding.mm.raw(),
+                                request,
+                                address,
+                                count,
+                            )
+                        },
+                    )
+                    .is_ok()
+            } else if kind == Some(ForkStockKind::Commit) {
+                let mut ledger = custody.el1_frame_grants.lock();
+                match stock
+                    .owner
+                    .commit_admitted(&mut *ledger, execution, settlement)
+                {
+                    Ok(()) => true,
+                    Err(error) => {
+                        settlement.refuse(
+                            if error
+                                == carrick_hal::fork_stock::ForkStockServiceError::StaleExecution
+                            {
+                                ForkStockRefusal::Stale
+                            } else {
+                                ForkStockRefusal::Invalid
+                            },
+                        );
+                        false
                     }
                 }
-                retained
             } else {
-                Vec::new()
-            };
-            match stock.owner.settle(
-                &mut *ledger,
-                execution,
-                carrick_hal::fork_stock::ForkStockSettlementReceipt {
-                    record: settlement,
-                    physical,
-                },
-                |pages| {
-                    pages.iter().all(|page| {
-                        ForkStockHostCustody::physical_ptr::<[u8; 4096]>(custody, page.address())
+                let mut ledger = custody.el1_frame_grants.lock();
+                match stock.owner.settle(
+                    &mut *ledger,
+                    execution,
+                    carrick_hal::fork_stock::ForkStockSettlementReceipt {
+                        record: settlement,
+                        physical: Vec::new(),
+                    },
+                    |pages| {
+                        pages.iter().all(|page| {
+                            ForkStockHostCustody::physical_ptr::<[u8; 4096]>(
+                                custody,
+                                page.address(),
+                            )
                             .is_ok()
-                    })
-                },
-                |pages| ForkStockHostCustody::tables_clean(custody, pages),
-                |life| lifecycle_window(custody, life).is_some_and(|window| window.clear(life)),
-            ) {
-                Ok(()) => true,
-                Err(error) => {
-                    settlement.refuse(
-                        if error == carrick_hal::fork_stock::ForkStockServiceError::StaleExecution {
-                            ForkStockRefusal::Stale
-                        } else {
-                            ForkStockRefusal::Invalid
-                        },
-                    );
-                    false
+                        })
+                    },
+                    |pages| ForkStockHostCustody::tables_clean(custody, pages),
+                    |life| lifecycle_window(custody, life).is_some_and(|window| window.clear(life)),
+                ) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        settlement.refuse(
+                            if error
+                                == carrick_hal::fork_stock::ForkStockServiceError::StaleExecution
+                            {
+                                ForkStockRefusal::Stale
+                            } else {
+                                ForkStockRefusal::Invalid
+                            },
+                        );
+                        false
+                    }
                 }
             }
         }

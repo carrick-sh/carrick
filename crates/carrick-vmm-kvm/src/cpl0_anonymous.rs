@@ -856,7 +856,9 @@ impl Cpl0HostCustody {
             ) => {
                 return self.settle_fork_stock(lease, execution, address);
             }
-            None => return Err(fail("physical fork stock unknown record tag")),
+            Some(carrick_el1_abi::ForkStockKind::Reserve) | None => {
+                return Err(fail("physical fork stock unknown record tag"));
+            }
         }
         let physical =
             self.stack_record_physical::<ForkStockExchange>(lease, execution.context, address)?;

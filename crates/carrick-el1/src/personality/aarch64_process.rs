@@ -452,12 +452,122 @@ pub(super) unsafe fn observed_entry_address(
         .ok_or(NativeProcessError::Stale)
 }
 
+pub struct AdmittedCustodyToken {
+    commit: ForkStockSettlement,
+    index: carrick_sched_core::SpaceIndex,
+}
+
+impl core::fmt::Debug for AdmittedCustodyToken {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AdmittedCustodyToken")
+            .field("index", &self.index)
+            .finish()
+    }
+}
+
+impl AdmittedCustodyToken {
+    fn reserve<X: ForkStockCrossing>(
+        crossing: &X,
+        worker: u32,
+        loan: ForkStockLoan,
+        completion: carrick_el1_abi::PortalForkCompletion,
+        rows: &[PortalForkCustody],
+        index: carrick_sched_core::SpaceIndex,
+    ) -> Result<Box<Self>, NativeProcessError> {
+        let mut boxed = Vec::new();
+        boxed
+            .try_reserve_exact(1)
+            .map_err(|_| NativeProcessError::Exhausted)?;
+        let mut custody = Vec::new();
+        custody
+            .try_reserve_exact(rows.len())
+            .map_err(|_| NativeProcessError::Exhausted)?;
+        custody.extend(rows.iter().copied().map(PortalForkCustody::words));
+        let mut reserve = ForkStockSettlement::reserve(
+            loan,
+            completion,
+            KernelVa::new(custody.as_ptr() as u64),
+            custody.len() as u64,
+        )
+        .ok_or(NativeProcessError::Stale)?;
+        let crossed =
+            crossing.cross_fork_stock(&raw mut reserve as *mut _ as u64, u64::from(worker));
+        match reserve.take(loan) {
+            Some(Ok(())) => {
+                crossed?;
+            }
+            Some(Err(carrick_el1_abi::ForkStockRefusal::Capacity)) => {
+                return Err(NativeProcessError::Exhausted);
+            }
+            Some(Err(carrick_el1_abi::ForkStockRefusal::Stale)) => {
+                return Err(NativeProcessError::Stale);
+            }
+            Some(Err(carrick_el1_abi::ForkStockRefusal::Inventory)) => {
+                return Err(NativeProcessError::Busy);
+            }
+            Some(Err(carrick_el1_abi::ForkStockRefusal::Invalid)) => {
+                return Err(NativeProcessError::Invalid);
+            }
+            None => {
+                crossed?;
+                return Err(NativeProcessError::Stale);
+            }
+        }
+        let commit = ForkStockSettlement::commit_reserved(loan, completion)
+            .ok_or(NativeProcessError::Stale)?;
+        boxed.push(Self { commit, index });
+        let raw = Box::into_raw(boxed.into_boxed_slice()).cast::<Self>();
+        // SAFETY: `boxed` had length and capacity 1, so `raw` is a valid Box<Self> allocation.
+        Ok(unsafe { Box::from_raw(raw) })
+    }
+
+    #[allow(clippy::boxed_local)]
+    fn consume<X: ForkStockCrossing>(
+        mut self: Box<Self>,
+        crossing: &X,
+        slot: SlotId,
+        zone: &ZoneTables<Aarch64ParkedContext>,
+    ) {
+        let _ =
+            crossing.cross_fork_stock(&raw mut self.commit as *mut _ as u64, u64::from(slot.raw()));
+        carrick_core::wait::space_access(zone, slot, release).open(self.index);
+    }
+}
+
+fn abort_loan<X: ForkStockCrossing>(crossing: &X, worker: u32, loan: &ForkStockLoan) -> bool {
+    // SAFETY: the loan never published a birth; no reader remains.
+    unsafe { super::fork_loan::clear_lifecycle(loan) };
+    let mut settlement = carrick_el1_abi::ForkStockSettlement::abort(*loan);
+    let _ = crossing.cross_fork_stock(&raw mut settlement as *mut _ as u64, u64::from(worker));
+    matches!(settlement.take(*loan), Some(Ok(())))
+}
+
+fn abandon_loan<X: ForkStockCrossing>(
+    crossing: &X,
+    worker: u32,
+    loan: &ForkStockLoan,
+    scrub: Option<&(dyn LiveDescriptorWords + '_)>,
+    error: NativeProcessError,
+) -> NativeProcessError {
+    if let Some(words) = scrub
+        && !super::fork_loan::scrub_tables(words, loan)
+    {
+        return NativeProcessError::Quarantined;
+    }
+    if abort_loan(crossing, worker, loan) {
+        error
+    } else {
+        NativeProcessError::Quarantined
+    }
+}
+
 pub struct Prepared<'a> {
     pub loan: ForkStockLoan,
     pub child: UnpublishedEl1Child<Aarch64Mmu>,
     pub words: PreparedWords<'a>,
     pub address: Mm,
     pub custody: Vec<PortalForkCustody>,
+    pub admitted: Box<AdmittedCustodyToken>,
 }
 
 impl core::fmt::Debug for Prepared<'_> {
@@ -466,18 +576,19 @@ impl core::fmt::Debug for Prepared<'_> {
             .field("loan", &self.loan)
             .field("address", &self.address)
             .field("custody", &self.custody)
+            .field("admitted", &self.admitted)
             .finish()
     }
 }
 
-pub struct Born<'a> {
-    pub prepared: Prepared<'a>,
+pub struct Born {
+    pub admitted: Box<AdmittedCustodyToken>,
 }
 
-impl core::fmt::Debug for Born<'_> {
+impl core::fmt::Debug for Born {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Born")
-            .field("prepared", &self.prepared)
+            .field("admitted", &self.admitted)
             .finish()
     }
 }
@@ -775,7 +886,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
 {
     type Mm = Mm;
     type PreparedMm = Prepared<'a>;
-    type Born = Box<Born<'a>>;
+    type Born = Born;
 
     /// The HVC root exit crossing becomes the host's whole-process terminal
     /// (`TrapError::NativeRootExit`), which ends every host and zone thread.
@@ -909,12 +1020,20 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 .max(4096),
         };
         let mut exchange = ForkStockExchange::new(request).ok_or(NativeProcessError::Invalid)?;
-        self.crossing
-            .cross_fork_stock(&raw mut exchange as *mut _ as u64, u64::from(self.worker()))?;
-        let loan = exchange
-            .take(request)
-            .ok_or(NativeProcessError::Stale)?
-            .map_err(|_| NativeProcessError::Exhausted)?;
+        let crossed = self
+            .crossing
+            .cross_fork_stock(&raw mut exchange as *mut _ as u64, u64::from(self.worker()));
+        let loan = match exchange.take(request) {
+            Some(Ok(loan)) => {
+                crossed?;
+                loan
+            }
+            Some(Err(_)) => return Err(NativeProcessError::Exhausted),
+            None => {
+                crossed?;
+                return Err(NativeProcessError::Stale);
+            }
+        };
         if loan.lifecycle.page.raw() == self.task.metadata.lifecycle_page.load(Ordering::Acquire) {
             return Err(NativeProcessError::Stale);
         }
@@ -926,55 +1045,145 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 controls.add(index).write(ThreadControlSlot::new());
             }
         }
-        let asid = loan.asid.ok_or(NativeProcessError::Stale)?;
+        let Some(asid) = loan.asid else {
+            return Err(abandon_loan(
+                &self.crossing,
+                self.worker(),
+                &loan,
+                None,
+                NativeProcessError::Stale,
+            ));
+        };
         let ttbr0 = (u64::from(asid.raw()) << 48)
             | (loan.request.child_tables.base & AARCH64_ROOT_ADDRESS_MASK);
-        let index = owner
+        let Some(index) = owner
             .spaces
             .publish_closed(child_mm.raw().get(), ttbr0, ttbr0)
-            .ok_or(NativeProcessError::Exhausted)?;
+        else {
+            return Err(abandon_loan(
+                &self.crossing,
+                self.worker(),
+                &loan,
+                None,
+                NativeProcessError::Exhausted,
+            ));
+        };
         if let Err(e) = owner
             .roots
             .publish(index.index(), loan.request.child_mm, layout)
         {
             owner.spaces.free(index);
-            return Err(err("roots.publish", e));
+            return Err(abandon_loan(
+                &self.crossing,
+                self.worker(),
+                &loan,
+                None,
+                err("roots.publish", e),
+            ));
         }
-        let scratch = ForkScratch::bounded(
+        let scratch = match ForkScratch::bounded(
             loan.request,
             mappings.len(),
             count.child,
             count.parent,
             count.live,
             count.custody,
-        )
-        .map_err(|e| err("ForkScratch::bounded", e))?;
+        ) {
+            Ok(scratch) => scratch,
+            Err(e) => {
+                owner.spaces.free(index);
+                return Err(abandon_loan(
+                    &self.crossing,
+                    self.worker(),
+                    &loan,
+                    None,
+                    err("ForkScratch::bounded", e),
+                ));
+            }
+        };
         let plan = match owner.prepare_fork(loan.request, scratch, &*live, self.worker()) {
             Ok(plan) => plan,
             Err(e) => {
                 owner.spaces.free(index);
-                return Err(err("prepare_fork", e));
+                return Err(abandon_loan(
+                    &self.crossing,
+                    self.worker(),
+                    &loan,
+                    None,
+                    err("prepare_fork", e),
+                ));
             }
         };
         let mut custody = Vec::new();
-        custody
-            .try_reserve_exact(plan.custody().len())
-            .map_err(|_| NativeProcessError::Exhausted)?;
+        if custody.try_reserve_exact(plan.custody().len()).is_err() {
+            owner.spaces.free(index);
+            return Err(abandon_loan(
+                &self.crossing,
+                self.worker(),
+                &loan,
+                None,
+                NativeProcessError::Exhausted,
+            ));
+        }
         custody.extend_from_slice(plan.custody());
-        let child = match owner.publish_fork(plan, &*live, self.worker()) {
+        let mut child = match owner.publish_fork(plan, &*live, self.worker()) {
             Ok(child) => child,
             Err(e) => {
                 owner.spaces.free(index);
-                return Err(err("publish_fork", e));
+                if matches!(e, carrick_core::mm::transaction::MmError::Core) {
+                    return Err(NativeProcessError::Quarantined);
+                }
+                return Err(abandon_loan(
+                    &self.crossing,
+                    self.worker(),
+                    &loan,
+                    Some(&*live),
+                    err("publish_fork", e),
+                ));
             }
         };
         let completion = child.completion();
+        let Some(root) = RootGpa::page_aligned(FrameGpa::new(
+            loan.request.child_tables.base & AARCH64_ROOT_ADDRESS_MASK,
+        )) else {
+            if child.abort(&owner, &*live, self.worker()).is_err() {
+                return Err(NativeProcessError::Quarantined);
+            }
+            owner.spaces.free(index);
+            return Err(abandon_loan(
+                &self.crossing,
+                self.worker(),
+                &loan,
+                Some(&*live),
+                NativeProcessError::Stale,
+            ));
+        };
+        let admitted = match AdmittedCustodyToken::reserve(
+            &self.crossing,
+            self.worker(),
+            loan,
+            completion,
+            &custody,
+            index,
+        ) {
+            Ok(admitted) => admitted,
+            Err(e) => {
+                if child.abort(&owner, &*live, self.worker()).is_err() {
+                    return Err(NativeProcessError::Quarantined);
+                }
+                owner.spaces.free(index);
+                return Err(abandon_loan(
+                    &self.crossing,
+                    self.worker(),
+                    &loan,
+                    Some(&*live),
+                    e,
+                ));
+            }
+        };
         let address = AddressContext {
             mm: child_mm,
-            root: RootGpa::page_aligned(FrameGpa::new(
-                loan.request.child_tables.base & AARCH64_ROOT_ADDRESS_MASK,
-            ))
-            .ok_or(NativeProcessError::Stale)?,
+            root,
             generation: ContextGeneration::new(completion.child.incarnation()),
         };
         Ok(Prepared {
@@ -983,6 +1192,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             words: live,
             address,
             custody,
+            admitted,
         })
     }
 
@@ -1014,7 +1224,9 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             .portal()
             .and_then(|owner| prepared.child.commit(&owner, self.worker()).map_err(error));
         match result {
-            Ok(_) => Ok(Box::new(Born { prepared })),
+            Ok(_) => Ok(Born {
+                admitted: prepared.admitted,
+            }),
             Err(e) => Err((e, prepared)),
         }
     }
@@ -1023,60 +1235,28 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
         &mut self,
         mut prepared: Self::PreparedMm,
     ) -> Result<(), (NativeProcessError, Self::PreparedMm)> {
-        let result = self.portal().and_then(|owner| {
-            prepared
-                .child
-                .abort(&owner, &*prepared.words, self.worker())
-                .map_err(|e| err("child.abort", e))
-        });
-        let mut settlement = carrick_el1_abi::ForkStockSettlement::abort(prepared.loan);
-        let _ = self.crossing.cross_fork_stock(
-            &raw mut settlement as *mut _ as u64,
-            u64::from(self.worker()),
-        );
-        let _ = settlement.take(prepared.loan);
-        match result {
-            Ok(()) => Ok(()),
-            Err(e) => Err((e, prepared)),
+        let owner = match self.portal() {
+            Ok(owner) => owner,
+            Err(e) => return Err((e, prepared)),
+        };
+        if let Err(e) = prepared
+            .child
+            .abort(&owner, &*prepared.words, self.worker())
+        {
+            return Err((err("child.abort", e), prepared));
         }
+        owner.spaces.free(prepared.admitted.index);
+        if !super::fork_loan::scrub_tables(&*prepared.words, &prepared.loan) {
+            return Err((NativeProcessError::Quarantined, prepared));
+        }
+        if !abort_loan(&self.crossing, self.worker(), &prepared.loan) {
+            return Err((NativeProcessError::Quarantined, prepared));
+        }
+        Ok(())
     }
 
     fn settle_mm(&mut self, born: Self::Born) -> Result<(), (NativeProcessError, Self::Born)> {
-        let p = &born.prepared;
-        let mut custody = Vec::new();
-        if custody.try_reserve_exact(p.custody.len()).is_err() {
-            return Err((NativeProcessError::Exhausted, born));
-        }
-        custody.extend(p.custody.iter().copied().map(PortalForkCustody::words));
-        let Some(mut settlement) = ForkStockSettlement::new(
-            p.loan,
-            p.child.completion(),
-            KernelVa::new(custody.as_ptr() as u64),
-            custody.len() as u64,
-        ) else {
-            return Err((NativeProcessError::Stale, born));
-        };
-        if let Err(e) = self.crossing.cross_fork_stock(
-            &raw mut settlement as *mut _ as u64,
-            u64::from(self.worker()),
-        ) {
-            return Err((e, born));
-        }
-        if !matches!(settlement.take(p.loan), Some(Ok(()))) {
-            return Err((NativeProcessError::Quarantined, born));
-        }
-        let owner = match self.portal() {
-            Ok(owner) => owner,
-            Err(error) => return Err((error, born)),
-        };
-        let Some(index) = owner.spaces.find(p.address.mm.raw().get()) else {
-            return Err((NativeProcessError::Stale, born));
-        };
-        let access = match owner.space_access(self.worker()) {
-            Ok(access) => access,
-            Err(e) => return Err((error(e), born)),
-        };
-        access.open(index);
+        born.admitted.consume(&self.crossing, self.slot, self.zone);
         Ok(())
     }
 
