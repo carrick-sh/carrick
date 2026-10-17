@@ -613,6 +613,27 @@ fn inherited_inventory_edges_authorize_only_selected_child_pages() {
         len: PAGE,
         shared: false,
     };
+    let projection = authority.physical_projection(Arc::clone(&ids));
+    assert!(matches!(
+        memory.select_inherited_frames(
+            AddressContext {
+                generation: ContextGeneration::new(nz(2)),
+                ..contexts[0]
+            },
+            selection,
+            &*projection
+        ),
+        Err(InheritedFrameSelectionError::Invariant(_))
+    ));
+    let empty_inventory = Arc::new(FrameInventoryAuthority::new());
+    assert!(matches!(
+        memory.select_inherited_frames(
+            contexts[0],
+            selection,
+            &*empty_inventory.physical_projection(Arc::clone(&ids))
+        ),
+        Err(InheritedFrameSelectionError::MappingGone)
+    ));
     let edge = memory
         .select_inherited_frames(
             contexts[0],

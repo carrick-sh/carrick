@@ -22,6 +22,18 @@ impl std::fmt::Display for MemoryError {
     }
 }
 impl std::error::Error for MemoryError {}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum InheritedFrameSelectionError {
+    MappingGone,
+    Invariant(MemoryError),
+}
+
+impl From<MemoryError> for InheritedFrameSelectionError {
+    fn from(error: MemoryError) -> Self {
+        Self::Invariant(error)
+    }
+}
 fn inherited_leaf_names(entry: u64, size: u64, gpa: FrameGpa) -> bool {
     let state = entry & (PRESENT | PREPARED);
     (state == PRESENT || state == PREPARED)
@@ -926,10 +938,10 @@ impl CarrierMemory {
         parent: AddressContext<RootGpa>,
         selection: carrick_el1_abi::PortalForkCustody,
         authority: &dyn carrick_hal::PhysicalFrameInventory,
-    ) -> Result<Vec<InheritedFrameEdge>, MemoryError> {
+    ) -> Result<Vec<InheritedFrameEdge>, InheritedFrameSelectionError> {
         self.admit()?;
         if self.root(parent.mm.raw()) != Some(parent) {
-            return Err(error("stale inherited source root"));
+            return Err(error("stale inherited source root").into());
         }
         let carrick_el1_abi::PortalForkCustody::Frame {
             va,
@@ -938,7 +950,7 @@ impl CarrierMemory {
             shared,
         } = selection
         else {
-            return Err(error("inheritance requires selected frame custody"));
+            return Err(error("inheritance requires selected frame custody").into());
         };
         if len == 0
             || !va.is_multiple_of(PAGE)
@@ -947,13 +959,22 @@ impl CarrierMemory {
             || va.checked_add(len).is_none()
             || ipa.checked_add(len).is_none()
         {
-            return Err(error("invalid inherited physical span"));
+            return Err(error("invalid inherited physical span").into());
         }
         let mut edges = Vec::new();
         for offset in (0..len).step_by(PAGE as usize) {
             let gpa = FrameGpa::new(ipa + offset);
             let span = PageSpan::new(va + offset, PAGE);
             let identity = self.frame_identity(parent.mm.raw(), gpa)?;
+            let bound = authority.bind(parent.into());
+            if bound
+                .live_mapping_row(carrick_hal::MappingId::from_kernel_allocation(
+                    identity.mapping_id,
+                ))
+                .is_none()
+            {
+                return Err(InheritedFrameSelectionError::MappingGone);
+            }
             let slot = self
                 .locate(gpa, PAGE as usize)
                 .ok_or_else(|| error("inherited registration absent"))?;
@@ -961,7 +982,7 @@ impl CarrierMemory {
                 .named_leaf_resident(parent, span, gpa)
                 .ok_or_else(|| error("selected source does not name retained storage"))?;
             if !inventory_page_live(authority, parent.into(), identity, gpa) {
-                return Err(error("selected source is not a live inventoried page"));
+                return Err(error("selected source is not a live inventoried page").into());
             }
             edges.push(InheritedFrameEdge {
                 handle: slot.handle,
