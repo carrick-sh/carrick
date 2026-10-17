@@ -210,9 +210,18 @@ pub const X86_CPL0_SUPERVISOR_IMAGE_BASE: u64 = 0xffff_ffff_8000_0000;
 /// Guest-physical base shared by the CPL0 image loader and fixture table grant.
 pub const X86_CPL0_SUPERVISOR_IMAGE_GPA: u64 = 0x10_0000;
 pub const X86_CPL0_SUPERVISOR_IMAGE_SIZE: u64 = 0x20_0000;
+/// Offset of the CPL0 IRQ header record within the supervisor image.
+pub const X86_CPL0_IRQ_HEADER_OFFSET: u64 = 0;
+/// Virtual address of the CPL0 IRQ header record.
+pub const X86_CPL0_IRQ_HEADER_VA: u64 = X86_CPL0_SUPERVISOR_IMAGE_BASE + X86_CPL0_IRQ_HEADER_OFFSET;
+/// Guest-physical address of the CPL0 IRQ header record.
+pub const X86_CPL0_IRQ_HEADER_GPA: u64 = X86_CPL0_SUPERVISOR_IMAGE_GPA + X86_CPL0_IRQ_HEADER_OFFSET;
 const _: () = {
     assert!(X86_CPL0_SUPERVISOR_IMAGE_SIZE.is_power_of_two());
     assert!(X86_CPL0_SUPERVISOR_IMAGE_SIZE.is_multiple_of(4096));
+    assert!(X86_CPL0_IRQ_HEADER_OFFSET < X86_CPL0_SUPERVISOR_IMAGE_SIZE);
+    assert!(X86_CPL0_IRQ_HEADER_GPA == 0x10_0000);
+    assert!(X86_CPL0_IRQ_HEADER_VA == 0xffff_ffff_8000_0000);
 };
 /// CPL0's one upper-half supervisor window for retained physical pages.
 pub const X86_CPL0_DIRECT_VA: u64 = 0xffff_ffff_9000_0000;

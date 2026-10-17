@@ -4,6 +4,7 @@ SECTIONS {
     . = 0xffffffff80000000;
     /* Keep fixed boot records ahead of variable code/data growth. */
     .irq_header : { KEEP(*(.irq_header)) }
+    ASSERT(ADDR(.irq_header) == CARRICK_X86_CPL0_IRQ_HEADER_VA, "CPL0 .irq_header must match CARRICK_X86_CPL0_IRQ_HEADER_VA")
     .initial_boot_header 0xffffffff80001000 : { KEEP(*(.initial_boot_header)) }
     .progress_header 0xffffffff80002000 : { KEEP(*(.progress_header)) }
     . = 0xffffffff80003000;
