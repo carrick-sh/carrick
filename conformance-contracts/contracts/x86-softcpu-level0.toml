@@ -1,0 +1,25 @@
+schema_version = 1
+id = "x86.softcpu.level0"
+title = "Level 0 x86_64 copy-through binary translation executes user code and surfaces typed architectural faults over SoftMmuMemory without host signals"
+guest_surfaces = ["isa:x86_64", "vmm:soft", "fault:page-fault", "fault:invalid-opcode", "fault:general-protection", "fault:divide-error"]
+semantic_authority = [
+  "Intel SDM Vol. 3A Ch. 6: Interrupt and Exception Handling (#DE vector 0, #UD vector 6, #GP vector 13, #PF vector 14 error-code bits P/W/U/RSVD/I/PK)",
+  "AMD64 Architecture Programmer's Manual Vol. 2: canonical 48-bit virtual addresses and page-translation fault ordering",
+  "native x86_64 host CPU differential execution of randomized ALU, memory, and stack basic blocks",
+]
+fixture = "carrick-softcpu-x86::softcpu_level0"
+scale_points = [1, 200]
+structural_budgets = []
+rationale = "Level 0 same-ISA copy-through binary translation in carrick-softcpu-x86 translates guest virtual addresses exclusively through the per-CPU SoftTlb, SoftWalker, and SoftMmuMemory without mapping guest virtual addresses into the host address space or installing host signal handlers (SIGSEGV/SIGFPE/SIGILL/SIGBUS). Every memory access, page-straddling bounce-buffer access, instruction fetch, and division surfaces exact architectural #PF (with CR2 and P/W/U/I/PK error code), #UD, #GP(0), or #DE exits while preserving guest GPRs, RFLAGS, and uncommitted page bytes on fault."
+
+[bindings]
+vm_free = "carrick-softcpu-x86::softcpu_level0::{retired_fixtures_run_over_soft_memory,page_fault_witnesses_read_write_ro_nx_smap_and_straddle_fetch,invalid_opcode_witnesses_ud2_and_bad_encodings,general_protection_witnesses_non_canonical_and_unaligned_sse,general_protection_witnesses_privileged_at_cpl3_and_sensitive_at_cpl0,divide_error_witnesses_div_idiv_zero_overflow_and_fault_priority,page_crossing_bounce_buffer_handles_read_write_rmw_and_second_page_fault_atomicity,virtualized_r14_r15_and_fs_gs_bases_work_transparently,cflow_call_and_ret_fault_atomicity_preserves_rsp_and_rip,string_instructions_rep_movsb_stosb_cmpsb_work_across_pages,frame_keyed_code_page_invalidation_evicts_alias_va_writes,differential_property_tests_match_native_host_x86_64_cpu}"
+
+[bindings.unresolved]
+embed_structural = "Soft-CPU CPL0 ring, carrier, and CLI integration land in slices #582-#584; slice #581 validates Level 0 DBT VM-free over SoftMmuMemory and differentially against the host x86_64 CPU."
+docker = "Docker is unavailable on the x86 worker; differential testing runs the identical x86_64 instruction blocks directly on the host x86_64 CPU."
+
+[runtime_ratio]
+maximum = 2.0
+statistic = "p50"
+minimum_samples = 20

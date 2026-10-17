@@ -1,6 +1,6 @@
 # Carrick Crate Map
 
-Carrick is a 53-crate Cargo workspace. The product path is:
+Carrick is a 54-crate Cargo workspace. The product path is:
 
 ```text
 carrick-cli   -> carrick-engine -> { carrick-image, carrick-runtime -> carrick-kernel -> carrick-vfs } -> carrick-spec
@@ -88,6 +88,7 @@ lifecycle semantics.
 | `carrick-aarch64` | Shared AArch64 engine (`Aarch64EngineCore`) used by the HVF AArch64 path (and shared with the KVM AArch64 lane). |
 | `carrick-el1` | Carrick guest EL1 kernel image body: neutral mechanisms and Linux personality compiled into AArch64 EL1 and x86_64 CPL0 images. |
 | `carrick-el1-image` | Precompiled in-guest EL1 kernel binary image embedded into the host runtime. |
+| `carrick-softcpu-x86` | Level 0 same-ISA copy-through dynamic binary translation engine for x86_64: `iced-x86` classifier, basic-block planner, control-flow resolver, inline soft-TLB probes over `SoftMmuMemory`, per-CPU page-crossing bounce buffer, and typed `#PF`/`#UD`/`#GP`/`#DE`/syscall/sensitive-op exit protocol without host signals or guest VA aliasing. |
 | `carrick-vmm-bhyve` | FreeBSD/bhyve backend; x86_64 lane through the shared x86 engine plus bhyve-specific host/VMM glue. |
 | `carrick-vmm-hvf` | macOS Hypervisor.framework backend; mature AArch64 stage-1/stage-2 projection, vCPU execution and coordination, fault/syscall exits, and observability probes. |
 | `carrick-vmm-kvm` | Linux/KVM backend; AArch64 KVM support, x86_64 lane, KVM kick/futex/fork/timer/signal glue, standalone target-host runners. |
