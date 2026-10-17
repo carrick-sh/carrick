@@ -354,92 +354,22 @@ def detect_move_covered_files(
     return moved_counts
 
 
-def is_test_or_probe_path(path: str) -> bool:
-    return (
-        "/tests/" in path
-        or "conformance-probes/" in path
-        or path.endswith(("/tests.rs", "_test.rs", "_tests.rs"))
-    )
+_CRATE_FILE_CLASS_CACHE: dict[tuple[int, str], tuple[set[str], set[str], set[str]]] = {}
+_FINGERPRINT_META_SEP = "\n/*__CONTRACT_FINGERPRINT_META__*/\n"
 
 
 GATED_TEST_LANES = {"host", "kvm", "integration", "signed-cli", "signed-hvf"}
 KNOWN_TEST_LANES = GATED_TEST_LANES | {"manual"}
 
-_RUST_KEYWORDS = {
-    "as",
-    "async",
-    "await",
-    "break",
-    "const",
-    "continue",
-    "crate",
-    "dyn",
-    "else",
-    "enum",
-    "extern",
-    "false",
-    "fn",
-    "for",
-    "gen",
-    "if",
-    "impl",
-    "in",
-    "let",
-    "loop",
-    "macro_rules",
-    "match",
-    "mod",
-    "move",
-    "mut",
-    "pub",
-    "raw",
-    "ref",
-    "return",
-    "safe",
-    "self",
-    "Self",
-    "static",
-    "struct",
-    "super",
-    "trait",
-    "true",
-    "try",
-    "type",
-    "union",
-    "unsafe",
-    "use",
-    "where",
-    "while",
-    "yield",
-    "_",
-}
-
-_GENERIC_ITEM_NAMES = {
-    "new",
-    "default",
-    "from",
-    "into",
-    "try_from",
-    "try_into",
-    "drop",
-    "fmt",
-    "clone",
-    "eq",
-    "ne",
-    "cmp",
-    "partial_cmp",
-    "hash",
-    "deref",
-    "deref_mut",
-    "index",
-    "index_mut",
-    "next",
-    "poll",
-    "run",
-    "main",
-    "test",
-    "tests",
-}
+_RUST_KEYWORDS = set(
+    "as async await break const continue crate dyn else enum extern false fn for gen if impl in "
+    "let loop macro_rules match mod move mut pub raw ref return safe self Self static struct "
+    "super trait true try type union unsafe use where while yield _".split()
+)
+_GENERIC_ITEM_NAMES = set(
+    "new default from into try_from try_into drop fmt clone eq ne cmp partial_cmp hash deref "
+    "deref_mut index index_mut next poll run main test tests".split()
+)
 
 _VIS_MOD_PREFIX = r"(?:\bpub(?:\s*\([^)]*\))?\s+)?"
 _FN_DECL_RE = re.compile(
@@ -458,6 +388,7 @@ _MACRO_DECL_RE = re.compile(r"\bmacro_rules!\s*(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\b
 
 _TEST_ATTR_RE = re.compile(r"#\s*\[\s*(?:[\w:]+::)?(?:test|test_case|rstest)\b")
 _IGNORE_ATTR_RE = re.compile(r"#\s*\[\s*(?:ignore\b|cfg_attr\s*\([^\]]*\bignore\b)")
+_SHOULD_PANIC_ATTR_RE = re.compile(r"#\s*!?\s*\[\s*(?:should_panic\b|cfg_attr\s*\([^\]]*\bshould_panic\b)")
 _CFG_OPEN_RE = re.compile(r"#\s*!?\s*\[\s*cfg\s*\(")
 
 
@@ -728,20 +659,99 @@ def _cfg_is_test_only(expr: str) -> bool:
     return not _can_cfg_be_true_without_test(expr)
 
 
+def _is_cfg_expr_decidable(expr: str) -> bool:
+    """Return True if every atom in `expr` is a supported, statically decidable CI cfg predicate."""
+    expr = expr.strip()
+    if not expr:
+        return False
+    m = re.match(r"^(all|any|not)\s*\((.*)\)\s*$", expr, re.S)
+    if m:
+        op = m.group(1)
+        args = _split_cfg_top_level_commas(m.group(2))
+        if not args:
+            return False
+        if op == "not" and len(args) != 1:
+            return False
+        return all(_is_cfg_expr_decidable(a) for a in args)
+    if expr in ("test", "unix", "windows", "debug_assertions"):
+        return True
+    kv = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([^"]*)"$', expr)
+    if kv:
+        return kv.group(1) in {
+            "target_os",
+            "target_arch",
+            "target_family",
+            "target_pointer_width",
+            "target_endian",
+            "feature",
+        }
+    return False
+
+
+def _extract_cfg_from_attr_body(content: str, cond_prefix: list[str]) -> tuple[list[str], list[str]]:
+    """Parse the inside of `#[...]` or `#![...]` for `cfg(...)` and `cfg_attr(...)`.
+
+    Returns `(cfg_exprs, conditional_test_preds)`. Uses `"__invalid_cfg__"` to fail closed on
+    malformed or undecidable `cfg` / `cfg_attr` predicates.
+    """
+    content = content.strip()
+    m_cfg = re.match(r"^cfg\s*\((.*)\)\s*$", content, re.S)
+    if m_cfg:
+        inner = m_cfg.group(1).strip()
+        if not _is_cfg_expr_decidable(inner):
+            return (["__invalid_cfg__"], [])
+        if not cond_prefix:
+            return ([inner], [])
+        cond_all = cond_prefix[0] if len(cond_prefix) == 1 else f"all({', '.join(cond_prefix)})"
+        return ([f"any(not({cond_all}), {inner})"], [])
+
+    m_ca = re.match(r"^cfg_attr\s*\((.*)\)\s*$", content, re.S)
+    if m_ca:
+        parts = _split_cfg_top_level_commas(m_ca.group(1))
+        if len(parts) < 2:
+            return (["__invalid_cfg__"], [])
+        pred = parts[0].strip()
+        if not _is_cfg_expr_decidable(pred):
+            return (["__invalid_cfg__"], [])
+        new_prefix = cond_prefix + [pred]
+        cfgs: list[str] = []
+        test_preds: list[str] = []
+        for sub in parts[1:]:
+            sub_s = sub.strip()
+            if re.match(r"^(?:[\w:]+::)?(?:test|test_case|rstest)\b", sub_s):
+                cond_all = new_prefix[0] if len(new_prefix) == 1 else f"all({', '.join(new_prefix)})"
+                test_preds.append(cond_all)
+            elif sub_s.startswith(("cfg", "cfg_attr")) and "(" in sub_s:
+                sub_cfgs, sub_tests = _extract_cfg_from_attr_body(sub_s, new_prefix)
+                cfgs.extend(sub_cfgs)
+                test_preds.extend(sub_tests)
+        return (cfgs, test_preds)
+
+    return ([], [])
+
+
 def _extract_cfg_exprs(attr_text: str, inner_only: bool = False) -> list[str]:
-    """Extract `expr` from `#[cfg(expr)]` (or `#![cfg(expr)]` if `inner_only=True`)."""
+    """Extract `expr` from `#[cfg(expr)]` / `#[cfg_attr(...)]` (or `#![...]` if `inner_only=True`)."""
     exprs: list[str] = []
-    pat = re.compile(r"#\s*!\s*\[\s*cfg\s*\(") if inner_only else _CFG_OPEN_RE
-    for m in pat.finditer(attr_text):
-        is_inner = "!" in m.group(0)
-        if inner_only and not is_inner:
-            continue
-        if not inner_only and is_inner:
-            continue
-        open_paren = m.end() - 1
-        close_paren = _find_matching_delim(attr_text, open_paren, "(", ")")
-        if close_paren != -1:
-            exprs.append(attr_text[open_paren + 1 : close_paren].strip())
+    attr_open_re = re.compile(r"#\s*(!?)\s*\[")
+    pos = 0
+    n = len(attr_text)
+    while pos < n:
+        m = attr_open_re.search(attr_text, pos)
+        if not m:
+            break
+        is_inner = m.group(1) == "!"
+        open_bracket = m.end() - 1
+        close_bracket = _find_matching_delim(attr_text, open_bracket, "[", "]")
+        if close_bracket == -1:
+            if (inner_only and is_inner) or (not inner_only and not is_inner):
+                exprs.append("__invalid_cfg__")
+            break
+        if (inner_only and is_inner) or (not inner_only and not is_inner):
+            body = attr_text[open_bracket + 1 : close_bracket].strip()
+            cfgs, _ = _extract_cfg_from_attr_body(body, [])
+            exprs.extend(cfgs)
+        pos = close_bracket + 1
     return exprs
 
 
@@ -803,6 +813,8 @@ class RepoView:
         self._blob_cache: dict[str, bytes] = {}
         self._stripped_cache: dict[str, str] = {}
         self._comments_stripped_cache: dict[str, str] = {}
+        self._cargo_toml_cache: dict[str, dict | None] = {}
+        self._ignored_allowlist_cache: list[tuple[str, str | None]] | None = None
 
     def _ensure_tree_index(self):
         if self._files is not None:
@@ -1062,12 +1074,16 @@ def _discover_ignored_test_allowlist(view: RepoView) -> list[tuple[str, str | No
     """Discover `(pkg_name, filter_substring_or_None)` from `justfile` recipes that CI workflows actually invoke
     (transitively) and that execute `scripts/test-signed.sh` with `--ignored` or `--include-ignored`.
     """
+    if view._ignored_allowlist_cache is not None:
+        return view._ignored_allowlist_cache
     if not view.is_file("justfile"):
+        view._ignored_allowlist_cache = []
         return []
     workflow_files = view.glob_files(".github/workflows", ".yml") + view.glob_files(
         ".github/workflows", ".yaml"
     )
     if not workflow_files:
+        view._ignored_allowlist_cache = []
         return []
 
     justfile_text = view.read_text("justfile")
@@ -1185,6 +1201,7 @@ def _discover_ignored_test_allowlist(view: RepoView) -> list[tuple[str, str | No
             if flt and flt.startswith("-"):
                 flt = None
             allowed.append((pkg, flt))
+    view._ignored_allowlist_cache = allowed
     return allowed
 
 
@@ -1197,18 +1214,25 @@ def _is_ignored_test_allowed(view: RepoView, pkg_name: str, fn_name: str) -> boo
 
 
 def _load_crate_cargo_toml(view: RepoView, pkg_name: str) -> dict | None:
+    if pkg_name in view._cargo_toml_cache:
+        return view._cargo_toml_cache[pkg_name]
     cargo_toml = f"crates/{pkg_name}/Cargo.toml"
     if not view.is_file(cargo_toml):
+        view._cargo_toml_cache[pkg_name] = None
         return None
     try:
         data = tomllib.loads(view.read_text(cargo_toml))
     except Exception:
+        view._cargo_toml_cache[pkg_name] = None
         return None
     if not isinstance(data, dict):
+        view._cargo_toml_cache[pkg_name] = None
         return None
     pkg_table = data.get("package")
     if not isinstance(pkg_table, dict) or pkg_table.get("name") != pkg_name:
+        view._cargo_toml_cache[pkg_name] = None
         return None
+    view._cargo_toml_cache[pkg_name] = data
     return data
 
 
@@ -1353,12 +1377,113 @@ def _compute_brace_depths(text: str) -> list[int]:
     depths = [0] * (len(text) + 1)
     for idx, ch in enumerate(text):
         depths[idx] = depth
-        if ch == "{":
+        if ch in "{([":
             depth += 1
-        elif ch == "}":
+        elif ch in "})]":
             depth = max(0, depth - 1)
     depths[len(text)] = depth
     return depths
+
+
+def _blank_macro_defs(scope_stripped: str, scope_comments_stripped: str) -> tuple[str, str]:
+    """Blank out `macro_rules! <name> { ... }`, `( ... );`, and `[ ... ];` bodies so items inside
+    macro definitions are never mistaken for real module or test items. Fails closed to end-of-scope
+    if delimiters are unbalanced.
+    """
+    macro_re = re.compile(r"\bmacro_rules!\s*(?:r#)?[A-Za-z_][A-Za-z0-9_]*\s*([{(\[])")
+    if not macro_re.search(scope_stripped):
+        return (scope_stripped, scope_comments_stripped)
+    s_chars = list(scope_stripped)
+    cs_chars = list(scope_comments_stripped)
+    pairs = {"{": "}", "(": ")", "[": "]"}
+    pos = 0
+    n = len(scope_stripped)
+    while pos < n:
+        m = macro_re.search(scope_stripped, pos)
+        if not m:
+            break
+        open_idx = m.end() - 1
+        open_ch = m.group(1)
+        close_ch = pairs[open_ch]
+        close_idx = _find_matching_delim(scope_stripped, open_idx, open_ch, close_ch)
+        end_idx = n if close_idx == -1 else close_idx + 1
+        while end_idx < n and scope_stripped[end_idx] in " \t":
+            end_idx += 1
+        if end_idx < n and scope_stripped[end_idx] == ";":
+            end_idx += 1
+        for i in range(m.start(), end_idx):
+            if s_chars[i] != "\n":
+                s_chars[i] = " "
+            if i < len(cs_chars) and cs_chars[i] != "\n":
+                cs_chars[i] = " "
+        pos = end_idx
+    return ("".join(s_chars), "".join(cs_chars))
+
+
+def _extract_scope_inner_attrs(scope_stripped: str, scope_comments_stripped: str) -> str:
+    """Return all `#![...]` attributes at delimiter depth 0 of `scope_stripped` (excluding nested modules/items)."""
+    s, cs = _blank_macro_defs(scope_stripped, scope_comments_stripped)
+    depths = _compute_brace_depths(s)
+    inner_re = re.compile(r"#\s*!\s*\[")
+    parts: list[str] = []
+    pos = 0
+    n = len(s)
+    while pos < n:
+        m = inner_re.search(s, pos)
+        if not m:
+            break
+        if depths[m.start()] != 0:
+            pos = m.end()
+            continue
+        open_b = m.end() - 1
+        close_b = _find_matching_delim(cs, open_b, "[", "]")
+        if close_b == -1:
+            parts.append("#![cfg(__invalid_cfg__)]")
+            break
+        parts.append(cs[m.start() : close_b + 1])
+        pos = close_b + 1
+    return "\n".join(parts)
+
+
+def _extract_test_and_cfg_exprs(attrs_cs: str) -> tuple[bool, list[str]]:
+    """Return `(is_test_fn, cfg_exprs)` from outer `#[...]` attributes on a function."""
+    has_unconditional_test = False
+    all_cfgs: list[str] = []
+    all_test_preds: list[str] = []
+    attr_open_re = re.compile(r"#\s*(!?)\s*\[")
+    pos = 0
+    n = len(attrs_cs)
+    while pos < n:
+        m = attr_open_re.search(attrs_cs, pos)
+        if not m:
+            break
+        is_inner = m.group(1) == "!"
+        open_b = m.end() - 1
+        close_b = _find_matching_delim(attrs_cs, open_b, "[", "]")
+        if close_b == -1:
+            if not is_inner:
+                all_cfgs.append("__invalid_cfg__")
+            break
+        if not is_inner:
+            body = attrs_cs[open_b + 1 : close_b].strip()
+            if re.match(r"^(?:[\w:]+::)?(?:test|test_case|rstest)\b", body):
+                has_unconditional_test = True
+            else:
+                cfgs, test_preds = _extract_cfg_from_attr_body(body, [])
+                all_cfgs.extend(cfgs)
+                all_test_preds.extend(test_preds)
+        pos = close_b + 1
+
+    if not has_unconditional_test and not all_test_preds:
+        return (False, all_cfgs)
+    if not has_unconditional_test:
+        cond_test = (
+            all_test_preds[0]
+            if len(all_test_preds) == 1
+            else f"any({', '.join(all_test_preds)})"
+        )
+        all_cfgs.append(cond_test)
+    return (True, all_cfgs)
 
 
 def _find_inline_mods(
@@ -1370,6 +1495,9 @@ def _find_inline_mods(
 
     Returns list of `(attrs_from_comments_stripped, body_stripped, body_comments_stripped)`.
     """
+    scope_stripped, scope_comments_stripped = _blank_macro_defs(
+        scope_stripped, scope_comments_stripped
+    )
     pattern = re.compile(
         rf"(?:^|[;\}}\s])((?:#\s*\[[^\]]*\]\s*)*){_VIS_MOD_PREFIX}\bmod\s+(?:r#)?{re.escape(mod_name)}\s*\{{",
         re.M,
@@ -1402,6 +1530,9 @@ def _find_out_of_line_mods(
 
     Returns list of `attrs_from_comments_stripped`.
     """
+    scope_stripped, scope_comments_stripped = _blank_macro_defs(
+        scope_stripped, scope_comments_stripped
+    )
     pattern = re.compile(
         rf"(?:^|[;\}}\s])((?:#\s*\[[^\]]*\]\s*)*){_VIS_MOD_PREFIX}\bmod\s+(?:r#)?{re.escape(mod_name)}\s*;",
         re.M,
@@ -1434,28 +1565,35 @@ def _extract_top_level_test_fns(
     scope_stripped: str,
     scope_comments_stripped: str,
     enclosing_attrs_cs: str = "",
-) -> dict[str, tuple[bool, list[str], str]]:
+) -> dict[str, tuple[bool, list[str], str, str]]:
     """Find all `#[test]`-attributed `fn <name>` at brace depth 0 of `scope_stripped`.
 
-    Returns `{fn_name: (is_ignored, fn_cfg_exprs, fn_body_only_stripped)}`.
+    Rejects `#[should_panic]` tests. Returns `{fn_name: (is_ignored, fn_cfg_exprs, fn_body_only_stripped, attrs_cs)}`.
     """
+    if _SHOULD_PANIC_ATTR_RE.search(enclosing_attrs_cs):
+        return {}
+    scope_stripped, scope_comments_stripped = _blank_macro_defs(
+        scope_stripped, scope_comments_stripped
+    )
     depths = _compute_brace_depths(scope_stripped)
     fn_pattern = re.compile(
         rf"((?:#\s*\[[^\]]*\]\s*)+){_VIS_MOD_PREFIX}"
         rf"(?:\b(?:default|const|async|unsafe|extern(?:\s*\"[^\"]*\")?)\s+)*"
         rf"\bfn\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\b"
     )
-    results: dict[str, tuple[bool, list[str], str]] = {}
+    results: dict[str, tuple[bool, list[str], str, str]] = {}
     enclosing_ignored = bool(_IGNORE_ATTR_RE.search(enclosing_attrs_cs))
     for m in fn_pattern.finditer(scope_stripped):
         if depths[m.start()] != 0:
             continue
         attrs_cs = scope_comments_stripped[m.start(1) : m.end(1)]
+        if _SHOULD_PANIC_ATTR_RE.search(attrs_cs):
+            continue
         fn_name = m.group(2)
-        if not _TEST_ATTR_RE.search(attrs_cs):
+        is_test, fn_cfgs = _extract_test_and_cfg_exprs(attrs_cs)
+        if not is_test:
             continue
         is_ignored = enclosing_ignored or bool(_IGNORE_ATTR_RE.search(attrs_cs))
-        fn_cfgs = _extract_cfg_exprs(attrs_cs)
         open_brace = scope_stripped.find("{", m.end())
         if open_brace == -1:
             continue
@@ -1463,7 +1601,7 @@ def _extract_top_level_test_fns(
         if close_brace == -1:
             continue
         fn_body_only = scope_stripped[open_brace : close_brace + 1]
-        results[fn_name] = (is_ignored, fn_cfgs, fn_body_only)
+        results[fn_name] = (is_ignored, fn_cfgs, fn_body_only, attrs_cs)
     return results
 
 
@@ -1479,6 +1617,9 @@ def _extract_non_test_fns(
 
     Returns `{fn_name: [(cfg_context, fn_body_only_stripped), ...]}`.
     """
+    scope_stripped, scope_comments_stripped = _blank_macro_defs(
+        scope_stripped, scope_comments_stripped
+    )
     depths = _compute_brace_depths(scope_stripped)
     fn_pattern = re.compile(
         rf"(?:^|[;\}}\s])((?:#\s*\[[^\]]*\]\s*)*){_VIS_MOD_PREFIX}"
@@ -1491,9 +1632,9 @@ def _extract_non_test_fns(
         if depths[m.start(1)] != 0:
             continue
         attrs_cs = scope_comments_stripped[m.start(1) : m.end(1)]
-        if _TEST_ATTR_RE.search(attrs_cs):
+        is_test, fn_cfgs = _extract_test_and_cfg_exprs(attrs_cs)
+        if is_test:
             continue
-        fn_cfgs = _extract_cfg_exprs(attrs_cs)
         if not _are_cfgs_active_in_ci(view, pkg_name, lane, accum_cfgs + fn_cfgs):
             continue
         fn_name = m.group(2)
@@ -1548,9 +1689,18 @@ def _scope_valid_test_fn_bodies(
     accum_cfgs: list[str],
     enclosing_attrs_cs: str = "",
 ) -> list[str] | None:
-    """Return list of runnable `#[test]` function `{ ... }` bodies (plus 1-level local helpers) for `fn_name`
-    (or all in scope if `fn_name` is None), or None if no runnable CI-compiled `#[test]` function matches.
+    """Return list of runnable `#[test]` function `{ ... }` bodies (plus 1-level local helpers and
+    fingerprint metadata) for `fn_name` (or all in scope if `fn_name` is None), or None if no runnable
+    CI-compiled `#[test]` function matches.
     """
+    scope_stripped, scope_comments_stripped = _blank_macro_defs(
+        scope_stripped, scope_comments_stripped
+    )
+    scope_inner_attrs = _extract_scope_inner_attrs(scope_stripped, scope_comments_stripped)
+    if _SHOULD_PANIC_ATTR_RE.search(scope_inner_attrs):
+        return None
+    scope_inner_cfgs = _extract_cfg_exprs(scope_inner_attrs, inner_only=True)
+    accum_cfgs = accum_cfgs + scope_inner_cfgs
     if not _are_cfgs_active_in_ci(view, pkg_name, lane, accum_cfgs):
         return None
     test_fns = _extract_top_level_test_fns(
@@ -1562,23 +1712,27 @@ def _scope_valid_test_fn_bodies(
     if fn_name is not None:
         if fn_name not in test_fns:
             return None
-        is_ignored, fn_cfgs, fn_body = test_fns[fn_name]
+        is_ignored, fn_cfgs, fn_body, fn_attrs_cs = test_fns[fn_name]
         if not _are_cfgs_active_in_ci(view, pkg_name, lane, accum_cfgs + fn_cfgs):
             return None
         if is_ignored and not _is_ignored_test_allowed(view, pkg_name, fn_name):
             return None
-        return [_expand_body_with_one_level_helpers(
+        expanded = _expand_body_with_one_level_helpers(
             view, pkg_name, lane, accum_cfgs + fn_cfgs, fn_body, local_helpers
-        )]
+        )
+        return [f"{expanded}{_FINGERPRINT_META_SEP}{enclosing_attrs_cs}\n{scope_inner_attrs}\n{fn_attrs_cs}"]
 
     bodies: list[str] = []
-    for name, (is_ignored, fn_cfgs, fn_body) in sorted(test_fns.items()):
+    for name, (is_ignored, fn_cfgs, fn_body, fn_attrs_cs) in sorted(test_fns.items()):
         if not _are_cfgs_active_in_ci(view, pkg_name, lane, accum_cfgs + fn_cfgs):
             continue
         if not is_ignored or _is_ignored_test_allowed(view, pkg_name, name):
-            bodies.append(_expand_body_with_one_level_helpers(
+            expanded = _expand_body_with_one_level_helpers(
                 view, pkg_name, lane, accum_cfgs + fn_cfgs, fn_body, local_helpers
-            ))
+            )
+            bodies.append(
+                f"{expanded}{_FINGERPRINT_META_SEP}{enclosing_attrs_cs}\n{scope_inner_attrs}\n{fn_attrs_cs}"
+            )
 
     depths = _compute_brace_depths(scope_stripped)
     mod_iter = re.finditer(
@@ -1592,23 +1746,29 @@ def _scope_valid_test_fn_bodies(
         for sub_attrs_cs, sub_s, sub_cs in _find_inline_mods(
             scope_stripped, scope_comments_stripped, sub_name
         ):
-            sub_cfgs = accum_cfgs + _extract_cfg_exprs(sub_attrs_cs)
+            sub_inner_attrs = _extract_scope_inner_attrs(sub_s, sub_cs)
+            if _SHOULD_PANIC_ATTR_RE.search(sub_inner_attrs):
+                continue
+            sub_inner_cfgs = _extract_cfg_exprs(sub_inner_attrs, inner_only=True)
+            sub_cfgs = accum_cfgs + _extract_cfg_exprs(sub_attrs_cs) + sub_inner_cfgs
             if not _are_cfgs_active_in_ci(view, pkg_name, lane, sub_cfgs):
                 continue
-            sub_fns = _extract_top_level_test_fns(
-                sub_s, sub_cs, enclosing_attrs_cs + "\n" + sub_attrs_cs
-            )
+            sub_enclosing_attrs = f"{enclosing_attrs_cs}\n{scope_inner_attrs}\n{sub_attrs_cs}\n{sub_inner_attrs}"
+            sub_fns = _extract_top_level_test_fns(sub_s, sub_cs, sub_enclosing_attrs)
             sub_helpers = {
                 **local_helpers,
                 **_extract_non_test_fns(sub_s, sub_cs, view, pkg_name, lane, sub_cfgs),
             }
-            for name, (is_ignored, fn_cfgs, fn_body) in sorted(sub_fns.items()):
+            for name, (is_ignored, fn_cfgs, fn_body, fn_attrs_cs) in sorted(sub_fns.items()):
                 if not _are_cfgs_active_in_ci(view, pkg_name, lane, sub_cfgs + fn_cfgs):
                     continue
                 if not is_ignored or _is_ignored_test_allowed(view, pkg_name, name):
-                    bodies.append(_expand_body_with_one_level_helpers(
+                    expanded = _expand_body_with_one_level_helpers(
                         view, pkg_name, lane, sub_cfgs + fn_cfgs, fn_body, sub_helpers
-                    ))
+                    )
+                    bodies.append(
+                        f"{expanded}{_FINGERPRINT_META_SEP}{sub_enclosing_attrs}\n{fn_attrs_cs}"
+                    )
 
     return bodies if bodies else None
 
@@ -1857,113 +2017,64 @@ def _scope_declares_mod(scope_s: str, scope_cs: str, mod_name: str) -> bool:
 
 
 def _resolve_in_module_tree(
-    view: RepoView,
-    pkg_name: str,
-    lane: str,
-    root_files: list[str],
-    segments: list[str],
-    require_test_module_for_root: bool,
+    view: RepoView, pkg_name: str, lane: str, root_files: list[str], segments: list[str],
+    require_test_module_for_root: bool, require_leaf: bool = False,
 ) -> tuple[str, list[str]] | None:
-    """Resolve `segments` starting from `root_files` via explicit `mod` declarations and active CI `cfg`s
-    to `(file_rel_path, runnable_test_fn_bodies)`.
-    """
+    """Resolve `segments` starting from `root_files` via explicit `mod` declarations and active CI `cfg`s."""
     for rf in root_files:
         if not view.is_file(rf):
             continue
         rf_s = view.read_stripped_rust(rf)
         rf_cs = view.read_comments_stripped_rust(rf)
-        rf_inner_cfgs = _extract_cfg_exprs(rf_cs, inner_only=True)
+        rf_inner_cfgs = _extract_cfg_exprs(_extract_scope_inner_attrs(rf_s, rf_cs), inner_only=True)
         rf_mod_dir = rf.rsplit("/", 1)[0] if "/" in rf else ""
         visited: set[tuple[str, str, str, tuple[str, ...], frozenset[str]]] = set()
 
         def walk(
-            cur_file: str,
-            cur_mod_dir: str,
-            is_file_scope: bool,
-            scope_s: str,
-            scope_cs: str,
-            rem_segments: list[str],
-            accum_cfgs: list[str],
-            enclosing_attrs_cs: str,
-            entered_test_mod: bool,
+            cur_file: str, cur_mod_dir: str, is_file_scope: bool, scope_s: str, scope_cs: str,
+            rem_segments: list[str], accum_cfgs: list[str], enclosing_attrs_cs: str, entered_test_mod: bool,
         ) -> tuple[str, list[str]] | None:
             if not _are_cfgs_active_in_ci(view, pkg_name, lane, accum_cfgs):
                 return None
-            state_key = (
-                cur_file, cur_mod_dir, scope_cs, tuple(rem_segments), frozenset(accum_cfgs)
-            )
+            state_key = (cur_file, cur_mod_dir, scope_cs, tuple(rem_segments), frozenset(accum_cfgs))
             if state_key in visited:
                 return None
             visited.add(state_key)
 
-            in_test_context = (
-                entered_test_mod
-                or not require_test_module_for_root
-                or "/tests/" in f"/{cur_file}"
-                or cur_file.endswith(("/tests.rs", "_test.rs", "_tests.rs"))
-            )
+            in_test_context = entered_test_mod or not require_test_module_for_root
 
             if not rem_segments:
-                if not in_test_context:
+                if require_leaf or not in_test_context:
                     return None
                 bodies = _scope_valid_test_fn_bodies(
-                    view,
-                    pkg_name,
-                    lane,
-                    scope_s,
-                    scope_cs,
-                    None,
-                    accum_cfgs,
-                    enclosing_attrs_cs,
+                    view, pkg_name, lane, scope_s, scope_cs, None, accum_cfgs, enclosing_attrs_cs,
                 )
-                if bodies:
-                    return (cur_file, bodies)
-                return None
+                return (cur_file, bodies) if bodies else None
 
             if len(rem_segments) == 1 and in_test_context:
                 fn_bodies = _scope_valid_test_fn_bodies(
-                    view,
-                    pkg_name,
-                    lane,
-                    scope_s,
-                    scope_cs,
-                    rem_segments[0],
-                    accum_cfgs,
-                    enclosing_attrs_cs,
+                    view, pkg_name, lane, scope_s, scope_cs, rem_segments[0], accum_cfgs, enclosing_attrs_cs,
                 )
                 if fn_bodies:
                     return (cur_file, fn_bodies)
 
             seg = rem_segments[0]
             next_rem = rem_segments[1:]
-            seg_is_test_name = seg == "tests" or seg.endswith(("_test", "_tests"))
 
             # 1. Try inline `mod <seg> { ... }` in `scope_s`
             inline_mods = _find_inline_mods(scope_s, scope_cs, seg)
             for attrs_cs, body_s, body_cs in inline_mods:
-                mod_cfgs = _extract_cfg_exprs(attrs_cs)
-                mod_is_test = (
-                    entered_test_mod
-                    or seg_is_test_name
-                    or any(_cfg_is_test_only(e) for e in mod_cfgs)
-                )
+                inner_mod_cfgs = _extract_cfg_exprs(_extract_scope_inner_attrs(body_s, body_cs), inner_only=True)
+                mod_cfgs = _extract_cfg_exprs(attrs_cs) + inner_mod_cfgs
+                mod_is_test = entered_test_mod or any(_cfg_is_test_only(e) for e in mod_cfgs)
                 explicit_inline_path = _extract_path_attr(view, pkg_name, lane, attrs_cs)
                 if explicit_inline_path is not None:
-                    inline_mod_dir = os.path.normpath(
-                        f"{cur_mod_dir}/{explicit_inline_path}"
-                    ).replace("\\", "/")
+                    inline_mod_dir = os.path.normpath(f"{cur_mod_dir}/{explicit_inline_path}").replace("\\", "/")
                 else:
                     inline_mod_dir = f"{cur_mod_dir}/{seg}" if cur_mod_dir else seg
                 res = walk(
-                    cur_file,
-                    inline_mod_dir,
-                    False,
-                    body_s,
-                    body_cs,
-                    next_rem,
-                    accum_cfgs + mod_cfgs,
-                    enclosing_attrs_cs + "\n" + attrs_cs,
-                    mod_is_test,
+                    cur_file, inline_mod_dir, False, body_s, body_cs, next_rem,
+                    accum_cfgs + mod_cfgs, enclosing_attrs_cs + "\n" + attrs_cs, mod_is_test,
                 )
                 if res is not None:
                     return res
@@ -1974,36 +2085,18 @@ def _resolve_in_module_tree(
                 mod_cfgs = _extract_cfg_exprs(attrs_cs)
                 if not _are_cfgs_active_in_ci(view, pkg_name, lane, accum_cfgs + mod_cfgs):
                     continue
-                mod_is_test = (
-                    entered_test_mod
-                    or seg_is_test_name
-                    or any(_cfg_is_test_only(e) for e in mod_cfgs)
-                )
+                mod_is_test = entered_test_mod or any(_cfg_is_test_only(e) for e in mod_cfgs)
                 for child_file in _resolve_child_mod_files(
-                    view, pkg_name, lane, cur_file, cur_mod_dir, seg, attrs_cs,
-                    is_file_scope,
+                    view, pkg_name, lane, cur_file, cur_mod_dir, seg, attrs_cs, is_file_scope,
                 ):
                     child_s = view.read_stripped_rust(child_file)
                     child_cs = view.read_comments_stripped_rust(child_file)
-                    inner_cfgs = _extract_cfg_exprs(child_cs, inner_only=True)
-                    child_is_test = mod_is_test or any(
-                        _cfg_is_test_only(e) for e in inner_cfgs
-                    )
-                    child_mod_dir = (
-                        child_file.rsplit("/", 1)[0]
-                        if child_file.endswith("/mod.rs")
-                        else child_file[:-3]
-                    )
+                    inner_cfgs = _extract_cfg_exprs(_extract_scope_inner_attrs(child_s, child_cs), inner_only=True)
+                    child_is_test = mod_is_test or any(_cfg_is_test_only(e) for e in inner_cfgs)
+                    child_mod_dir = child_file.rsplit("/", 1)[0] if child_file.endswith("/mod.rs") else child_file[:-3]
                     res = walk(
-                        child_file,
-                        child_mod_dir,
-                        True,
-                        child_s,
-                        child_cs,
-                        next_rem,
-                        accum_cfgs + mod_cfgs + inner_cfgs,
-                        enclosing_attrs_cs + "\n" + attrs_cs,
-                        child_is_test,
+                        child_file, child_mod_dir, True, child_s, child_cs, next_rem,
+                        accum_cfgs + mod_cfgs + inner_cfgs, enclosing_attrs_cs + "\n" + attrs_cs, child_is_test,
                     )
                     if res is not None:
                         return res
@@ -2013,9 +2106,7 @@ def _resolve_in_module_tree(
                 return None
 
             # 3. Try `pub use` module re-exports in `scope_s`
-            for use_attrs_cs, is_crate_root, new_rem in _find_use_reexports(
-                scope_s, scope_cs, rem_segments
-            ):
+            for use_attrs_cs, is_crate_root, new_rem in _find_use_reexports(scope_s, scope_cs, rem_segments):
                 if not new_rem:
                     continue
                 target_s = rf_s if is_crate_root else scope_s
@@ -2025,32 +2116,16 @@ def _resolve_in_module_tree(
                 use_cfgs = _extract_cfg_exprs(use_attrs_cs)
                 if not _are_cfgs_active_in_ci(view, pkg_name, lane, accum_cfgs + use_cfgs):
                     continue
-                use_is_test = entered_test_mod or any(
-                    _cfg_is_test_only(e) for e in use_cfgs
-                )
+                use_is_test = entered_test_mod or any(_cfg_is_test_only(e) for e in use_cfgs)
                 if is_crate_root:
                     res = walk(
-                        rf,
-                        rf_mod_dir,
-                        True,
-                        rf_s,
-                        rf_cs,
-                        new_rem,
-                        accum_cfgs + use_cfgs,
-                        enclosing_attrs_cs + "\n" + use_attrs_cs,
-                        use_is_test,
+                        rf, rf_mod_dir, True, rf_s, rf_cs, new_rem,
+                        accum_cfgs + use_cfgs, enclosing_attrs_cs + "\n" + use_attrs_cs, use_is_test,
                     )
                 else:
                     res = walk(
-                        cur_file,
-                        cur_mod_dir,
-                        is_file_scope,
-                        scope_s,
-                        scope_cs,
-                        new_rem,
-                        accum_cfgs + use_cfgs,
-                        enclosing_attrs_cs + "\n" + use_attrs_cs,
-                        use_is_test,
+                        cur_file, cur_mod_dir, is_file_scope, scope_s, scope_cs, new_rem,
+                        accum_cfgs + use_cfgs, enclosing_attrs_cs + "\n" + use_attrs_cs, use_is_test,
                     )
                 if res is not None:
                     return res
@@ -2058,14 +2133,7 @@ def _resolve_in_module_tree(
             return None
 
         res = walk(
-            rf,
-            rf_mod_dir,
-            True,
-            rf_s,
-            rf_cs,
-            segments,
-            rf_inner_cfgs,
-            "",
+            rf, rf_mod_dir, True, rf_s, rf_cs, segments, rf_inner_cfgs, "",
             any(_cfg_is_test_only(e) for e in rf_inner_cfgs),
         )
         if res is not None:
@@ -2075,16 +2143,9 @@ def _resolve_in_module_tree(
 
 
 def _resolve_contract_helper_binding(
-    view: RepoView,
-    pkg_name: str,
-    contract_fn: str,
-    int_targets: dict[str, str],
+    view: RepoView, pkg_name: str, contract_fn: str, int_targets: dict[str, str],
 ) -> tuple[str, str, str, list[str]] | None:
-    """Resolve `<pkg>::<contract_fn>` or `<pkg>::contracts::<contract_fn>` defined in `src/contracts.rs`
-    (or `src/contracts/*.rs` declared via `mod` from `src/contracts.rs`) when called inside a runnable
-    `#[test]` function's own body (or a 1-level local helper called by that `#[test]`) in a gated
-    integration test target.
-    """
+    """Resolve `<pkg>::<contract_fn>` or `<pkg>::contracts::<contract_fn>` defined in `src/contracts.rs`."""
     crate_dir = f"crates/{pkg_name}"
     lib_rs = f"{crate_dir}/src/lib.rs"
     if not view.is_file(lib_rs):
@@ -2095,10 +2156,7 @@ def _resolve_contract_helper_binding(
     contracts_mod_attrs = _find_out_of_line_mods(lib_s, lib_cs, "contracts")
     if not contracts_mod_attrs:
         return None
-    if not any(
-        _are_cfgs_active_in_ci(view, pkg_name, lib_lane, _extract_cfg_exprs(a))
-        for a in contracts_mod_attrs
-    ):
+    if not any(_are_cfgs_active_in_ci(view, pkg_name, lib_lane, _extract_cfg_exprs(a)) for a in contracts_mod_attrs):
         return None
 
     contract_files: list[str] = []
@@ -2108,14 +2166,10 @@ def _resolve_contract_helper_binding(
         rc_s = view.read_stripped_rust(root_contracts)
         rc_cs = view.read_comments_stripped_rust(root_contracts)
         rc_mod_dir = root_contracts[:-3]
-        for m in re.finditer(
-            rf"{_VIS_MOD_PREFIX}\bmod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;", rc_s
-        ):
+        for m in re.finditer(rf"{_VIS_MOD_PREFIX}\bmod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;", rc_s):
             sub_name = m.group(1)
             for sub_attrs in _find_out_of_line_mods(rc_s, rc_cs, sub_name):
-                if _are_cfgs_active_in_ci(
-                    view, pkg_name, lib_lane, _extract_cfg_exprs(sub_attrs)
-                ):
+                if _are_cfgs_active_in_ci(view, pkg_name, lib_lane, _extract_cfg_exprs(sub_attrs)):
                     for cf in _resolve_child_mod_files(
                         view, pkg_name, lib_lane, root_contracts, rc_mod_dir, sub_name, sub_attrs
                     ):
@@ -2125,22 +2179,25 @@ def _resolve_contract_helper_binding(
         return None
 
     contract_fn_body: str | None = None
+    contract_fn_attrs_cs: str = ""
     callee_names: set[str] = {contract_fn}
     pub_fn_re = re.compile(
-        rf"\bpub(?:\s*\([^)]*\))?\s+(?:async\s+|unsafe\s+|const\s+)*fn\s+(?:r#)?{re.escape(contract_fn)}\b"
+        rf"((?:#\s*\[[^\]]*\]\s*)*)\bpub(?:\s*\([^)]*\))?\s+(?:async\s+|unsafe\s+|const\s+)*fn\s+(?:r#)?{re.escape(contract_fn)}\b"
     )
     for cf in contract_files:
         stripped = view.read_stripped_rust(cf)
+        cs = view.read_comments_stripped_rust(cf)
         m = pub_fn_re.search(stripped)
         if m:
+            contract_fn_attrs_cs = cs[m.start(1) : m.end(1)]
+            if _SHOULD_PANIC_ATTR_RE.search(contract_fn_attrs_cs):
+                return None
             open_brace = stripped.find("{", m.end())
             if open_brace != -1:
                 close_brace = _find_matching_brace(stripped, open_brace)
                 if close_brace != -1:
                     contract_fn_body = stripped[open_brace : close_brace + 1]
-                    for helper_m in re.finditer(
-                        r"\b(run_[A-Za-z0-9_]*_contract)\s*\(", contract_fn_body
-                    ):
+                    for helper_m in re.finditer(r"\b(run_[A-Za-z0-9_]*_contract)\s*\(", contract_fn_body):
                         callee_names.add(helper_m.group(1))
             break
 
@@ -2149,8 +2206,7 @@ def _resolve_contract_helper_binding(
 
     names_alt = "|".join(re.escape(n) for n in sorted(callee_names))
     call_in_test_re = re.compile(
-        rf"(?:(?<![.\w:])|(?:[\w:]+::))\b(?:{names_alt})\s*\("
-        rf"|\.\s*map\s*\(\s*(?:[\w:]+::)?(?:{names_alt})\s*\)"
+        rf"(?:(?<![.\w:])|(?:[\w:]+::))\b(?:{names_alt})\s*\(|\.\s*map\s*\(\s*(?:[\w:]+::)?(?:{names_alt})\s*\)"
     )
     for tname, tfile in sorted(int_targets.items()):
         tlane = get_target_lane(view, pkg_name, tname)
@@ -2158,14 +2214,12 @@ def _resolve_contract_helper_binding(
             continue
         t_stripped = view.read_stripped_rust(tfile)
         t_cs = view.read_comments_stripped_rust(tfile)
-        t_inner_cfgs = _extract_cfg_exprs(t_cs, inner_only=True)
+        t_inner_cfgs = _extract_cfg_exprs(_extract_scope_inner_attrs(t_stripped, t_cs), inner_only=True)
         if not _are_cfgs_active_in_ci(view, pkg_name, tlane, t_inner_cfgs):
             continue
         test_fns = _extract_top_level_test_fns(t_stripped, t_cs)
-        t_helpers = _extract_non_test_fns(
-            t_stripped, t_cs, view, pkg_name, tlane, t_inner_cfgs
-        )
-        for fn_name, (is_ignored, fn_cfgs, fn_body) in sorted(test_fns.items()):
+        t_helpers = _extract_non_test_fns(t_stripped, t_cs, view, pkg_name, tlane, t_inner_cfgs)
+        for fn_name, (is_ignored, fn_cfgs, fn_body, fn_attrs_cs) in sorted(test_fns.items()):
             if not _are_cfgs_active_in_ci(view, pkg_name, tlane, t_inner_cfgs + fn_cfgs):
                 continue
             if is_ignored and not _is_ignored_test_allowed(view, pkg_name, fn_name):
@@ -2174,74 +2228,56 @@ def _resolve_contract_helper_binding(
                 view, pkg_name, tlane, t_inner_cfgs + fn_cfgs, fn_body, t_helpers
             )
             if call_in_test_re.search(expanded_test_body):
-                return (pkg_name, tname, tfile, [contract_fn_body])
+                meta = f"{contract_fn_attrs_cs}\n{t_cs}\n{fn_attrs_cs}\n{expanded_test_body}"
+                return (pkg_name, tname, tfile, [f"{contract_fn_body}{_FINGERPRINT_META_SEP}{meta}"])
 
     return None
 
 
 def resolve_binding_at_view(
-    view: RepoView, spec: str
+    view: RepoView, spec: str, require_leaf: bool = False
 ) -> tuple[str, str, str, list[str]] | None:
     """Resolve `pkg::...` at `view` to `(pkg_name, target_name, test_file_rel_path, ref_stripped_texts)` or None."""
     parts = [p.strip() for p in spec.split("::") if p.strip()]
     if len(parts) < 2:
         return None
-    pkg_name = parts[0]
-    rest = parts[1:]
+    pkg_name, rest = parts[0], parts[1:]
     if _load_crate_cargo_toml(view, pkg_name) is None:
         return None
 
     crate_dir = f"crates/{pkg_name}"
     src_dir = f"{crate_dir}/src"
 
-    # 1. Try resolving in the `lib` (or `bin`) target under `crates/<pkg>/src/`
     lib_lane = get_target_lane(view, pkg_name, "lib")
     if view.is_dir(src_dir) and lib_lane is not None:
-        lib_roots = [f"{src_dir}/lib.rs", f"{src_dir}/main.rs"]
         res = _resolve_in_module_tree(
-            view,
-            pkg_name,
-            lib_lane,
-            lib_roots,
-            rest,
-            require_test_module_for_root=True,
+            view, pkg_name, lib_lane, [f"{src_dir}/lib.rs", f"{src_dir}/main.rs"], rest,
+            require_test_module_for_root=True, require_leaf=require_leaf,
         )
         if res is not None:
-            test_file, fn_bodies = res
-            return (pkg_name, "lib", test_file, fn_bodies)
+            return (pkg_name, "lib", res[0], res[1])
 
-    # 2. Try resolving in an integration test target (`crates/<pkg>/tests/...`)
     int_targets = _discover_integration_targets(view, pkg_name)
     if int_targets is None:
         return None
 
-    # 2a. Explicit integration target name in `rest[0]` (or `rest[1]` when `rest[0] == "tests"`)
     target_candidate = None
     after_target: list[str] = []
     if rest[0] in int_targets:
-        target_candidate = rest[0]
-        after_target = rest[1:]
+        target_candidate, after_target = rest[0], rest[1:]
     elif rest[0] == "tests" and len(rest) >= 2 and rest[1] in int_targets:
-        target_candidate = rest[1]
-        after_target = rest[2:]
+        target_candidate, after_target = rest[1], rest[2:]
 
     if target_candidate is not None:
         tlane = get_target_lane(view, pkg_name, target_candidate)
         if tlane is not None:
-            root_tf = int_targets[target_candidate]
             res = _resolve_in_module_tree(
-                view,
-                pkg_name,
-                tlane,
-                [root_tf],
-                after_target,
-                require_test_module_for_root=False,
+                view, pkg_name, tlane, [int_targets[target_candidate]], after_target,
+                require_test_module_for_root=False, require_leaf=require_leaf,
             )
             if res is not None:
-                test_file, fn_bodies = res
-                return (pkg_name, target_candidate, test_file, fn_bodies)
+                return (pkg_name, target_candidate, res[0], res[1])
 
-    # 2b. 2-part binding `<pkg>::<fn_name>` (or `<pkg>::contracts::<fn_name>`)
     if len(rest) == 1:
         fn_name = rest[0]
         for tname, root_tf in sorted(int_targets.items()):
@@ -2249,17 +2285,11 @@ def resolve_binding_at_view(
             if tlane is None:
                 continue
             res = _resolve_in_module_tree(
-                view,
-                pkg_name,
-                tlane,
-                [root_tf],
-                [fn_name],
-                require_test_module_for_root=False,
+                view, pkg_name, tlane, [root_tf], [fn_name],
+                require_test_module_for_root=False, require_leaf=require_leaf,
             )
             if res is not None:
-                test_file, fn_bodies = res
-                return (pkg_name, tname, test_file, fn_bodies)
-
+                return (pkg_name, tname, res[0], res[1])
         helper_res = _resolve_contract_helper_binding(view, pkg_name, fn_name, int_targets)
         if helper_res is not None:
             return helper_res
@@ -2271,48 +2301,13 @@ def resolve_binding_at_view(
     return None
 
 
-def is_same_crate_and_module_subtree(surface_path: str, test_file: str) -> bool:
-    """Return True only when `test_file` is the direct dedicated unit-test module file for a non-root leaf `surface_path`.
-
-    `lib.rs`, `main.rs`, `mod.rs`, `test_file == surface_path`, and deeper files under `<stem>/tests/...`
-    are excluded and must reference a changed code identifier in the bound test function's body.
-    """
-    if not (surface_path.startswith("crates/") and test_file.startswith("crates/")):
-        return False
-    if test_file == surface_path:
-        return False
-    s_parts = surface_path.split("/")
-    t_parts = test_file.split("/")
-    if len(s_parts) < 3 or len(t_parts) < 3 or s_parts[1] != t_parts[1]:
-        return False
-    crate_src = f"crates/{s_parts[1]}/src/"
-    if not (surface_path.startswith(crate_src) and test_file.startswith(crate_src)):
-        return False
-    if surface_path in (f"{crate_src}lib.rs", f"{crate_src}main.rs") or surface_path.endswith("/mod.rs"):
-        return False
-    if surface_path.endswith(".rs"):
-        stem_prefix = surface_path[:-3]
-        return test_file in (
-            f"{stem_prefix}/tests.rs",
-            f"{stem_prefix}/tests/mod.rs",
-            f"{stem_prefix}_tests.rs",
-            f"{stem_prefix}_test.rs",
-        )
-    return False
-
-
 def _extract_code_decl_identifiers(code_line: str) -> set[str]:
     """Extract declared item identifiers from a comment/string-stripped Rust code line."""
     found: set[str] = set()
     for regex in (_FN_DECL_RE, _STATIC_DECL_RE, _CONST_DECL_RE, _TYPE_MOD_DECL_RE, _MACRO_DECL_RE):
         for m in regex.finditer(code_line):
             ident = m.group(1)
-            if (
-                ident
-                and ident not in _RUST_KEYWORDS
-                and ident not in _GENERIC_ITEM_NAMES
-                and not ident.startswith("_")
-            ):
+            if ident and ident not in _RUST_KEYWORDS and ident not in _GENERIC_ITEM_NAMES and not ident.startswith("_"):
                 found.add(ident)
     return found
 
@@ -2322,55 +2317,31 @@ def _tokenize_code_line(code_line: str) -> tuple[str, ...]:
 
 
 def extract_changed_surface_items(
-    root: Path,
-    base_view: RepoView,
-    head_view: RepoView,
-    base_sha: str,
-    head_sha: str,
-    surface_path: str,
-    old_surface_path: str | None = None,
+    root: Path, base_view: RepoView, head_view: RepoView, base_sha: str, head_sha: str,
+    surface_path: str, old_surface_path: str | None = None,
 ) -> set[str]:
-    """Extract function, type, const, static, trait, module, or macro identifiers defined or modified
-    by actual CODE token changes in `surface_path`'s diff (lines whose only change is a comment or
-    whitespace contribute nothing).
-    """
+    """Extract item identifiers defined or modified by actual CODE token changes in `surface_path`'s diff."""
     base_path = old_surface_path or surface_path
     base_stripped_lines: list[str] = []
     if base_view.is_file(base_path):
         base_stripped_lines = strip_cfg_test_blocks(
-            base_view.read_stripped_rust(base_path),
-            base_view.read_comments_stripped_rust(base_path),
+            base_view.read_stripped_rust(base_path), base_view.read_comments_stripped_rust(base_path),
         ).splitlines()
     head_stripped_lines: list[str] = []
     if head_view.is_file(surface_path):
         head_stripped_lines = strip_cfg_test_blocks(
-            head_view.read_stripped_rust(surface_path),
-            head_view.read_comments_stripped_rust(surface_path),
+            head_view.read_stripped_rust(surface_path), head_view.read_comments_stripped_rust(surface_path),
         ).splitlines()
 
     if old_surface_path and old_surface_path != surface_path and base_view.is_file(old_surface_path):
         diff_cmd = [
-            "git",
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "-U0",
-            f"{base_sha}:{old_surface_path}",
-            f"{head_sha}:{surface_path}",
+            "git", "diff", "--no-ext-diff", "--no-textconv", "-U0",
+            f"{base_sha}:{old_surface_path}", f"{head_sha}:{surface_path}",
         ]
     else:
         diff_cmd = [
-            "git",
-            "--literal-pathspecs",
-            "diff",
-            "--no-renames",
-            "--no-ext-diff",
-            "--no-textconv",
-            "-U0",
-            base_sha,
-            head_sha,
-            "--",
-            surface_path,
+            "git", "--literal-pathspecs", "diff", "--no-renames", "--no-ext-diff", "--no-textconv",
+            "-U0", base_sha, head_sha, "--", surface_path,
         ]
     res = subprocess.run(diff_cmd, cwd=root, capture_output=True, text=True, check=False)
     if res.returncode not in (0, 1):
@@ -2455,6 +2426,40 @@ def extract_changed_surface_items(
     return items
 
 
+def _strip_non_semantic_ident_occurrences(text: str) -> str:
+    """Blank out `stringify!(...)` / `stringify![...]` / `stringify!{...}` invocations and local
+    `let [mut] <ident>` binding names so non-call/non-use identifier occurrences do not satisfy
+    surface relevance. (Full semantic call-graph / rustc symbol resolution is tracked in #537.)
+    """
+    text = text.split(_FINGERPRINT_META_SEP, 1)[0]
+    chars = list(text)
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    stringify_re = re.compile(r"\b(?:[\w:]+::)?stringify!\s*([(\[{])")
+    pos = 0
+    n = len(text)
+    while pos < n:
+        m = stringify_re.search(text, pos)
+        if not m:
+            break
+        open_idx = m.end() - 1
+        open_ch = m.group(1)
+        close_idx = _find_matching_delim(text, open_idx, open_ch, pairs[open_ch])
+        end_idx = n if close_idx == -1 else close_idx + 1
+        for i in range(m.start(), end_idx):
+            if chars[i] != "\n":
+                chars[i] = " "
+        pos = end_idx
+
+    s = "".join(chars)
+    # Blank out simple local variable pattern names in `let [mut] <ident>` (not followed by `::`, `{`, or `(`).
+    let_pat_re = re.compile(r"\blet\s+(?:mut\s+)?((?:r#)?[A-Za-z_][A-Za-z0-9_]*)\b(?!\s*(?:::|\{|\())")
+    chars = list(s)
+    for m in let_pat_re.finditer(s):
+        for i in range(m.start(1), m.end(1)):
+            chars[i] = " "
+    return "".join(chars)
+
+
 def bound_test_references_surface(
     root: Path,
     base_view: RepoView,
@@ -2468,8 +2473,6 @@ def bound_test_references_surface(
     renamed_modified_paths: dict[str, str],
 ) -> bool:
     """Return True if a newly added/changed bound test references `surface_path` inside its own body."""
-    if is_same_crate_and_module_subtree(surface_path, test_file):
-        return True
     if surface_path not in surface_items_cache:
         surface_items_cache[surface_path] = extract_changed_surface_items(
             root,
@@ -2483,9 +2486,10 @@ def bound_test_references_surface(
     items = surface_items_cache[surface_path]
     if not items or not ref_texts:
         return False
+    cleaned_texts = [_strip_non_semantic_ident_occurrences(txt) for txt in ref_texts]
     for ident in items:
         pat = re.compile(rf"\b{re.escape(ident)}\b")
-        if any(pat.search(txt) for txt in ref_texts):
+        if any(pat.search(txt) for txt in cleaned_texts):
             return True
     return False
 
@@ -2558,25 +2562,103 @@ def load_and_validate_exemptions(root: Path, exemptions_dir: Path, valid_contrac
     return exempted_paths
 
 
-def is_non_guest_path(path: str) -> bool:
-    if not path.endswith(".rs"):
+def _classify_crate_rust_files(view: RepoView, pkg_name: str) -> tuple[set[str], set[str], set[str]]:
+    key = (id(view), pkg_name)
+    if key in _CRATE_FILE_CLASS_CACHE:
+        return _CRATE_FILE_CLASS_CACHE[key]
+    crate_dir = f"crates/{pkg_name}"
+    prod_files, cfg_test_files, int_test_files = set(), set(), set()
+    data = _load_crate_cargo_toml(view, pkg_name)
+    lib_lane = get_target_lane(view, pkg_name, "lib") or "host"
+    root_candidates: list[str] = [f"{crate_dir}/src/lib.rs", f"{crate_dir}/src/main.rs"]
+    if isinstance(data, dict):
+        lib_tbl = data.get("lib")
+        if isinstance(lib_tbl, dict) and isinstance(lib_tbl.get("path"), str):
+            root_candidates.append(f"{crate_dir}/{lib_tbl['path'].lstrip('/')}")
+        for b in data.get("bin") or []:
+            if isinstance(b, dict) and isinstance(b.get("path"), str):
+                root_candidates.append(f"{crate_dir}/{b['path'].lstrip('/')}")
+    visited_scopes: set[tuple[str, str, bool, str, bool]] = set()
+    inline_pat = re.compile(rf"((?:#\s*\[[^\]]*\]\s*)*){_VIS_MOD_PREFIX}\bmod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*\{{", re.M)
+    out_pat = re.compile(rf"(?:^|[;\}}\s])((?:#\s*\[[^\]]*\]\s*)*){_VIS_MOD_PREFIX}\bmod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;", re.M)
+
+    def walk_scope(cur_file: str, cur_mod_dir: str, is_file_scope: bool, scope_s: str, scope_cs: str, in_test_cfg: bool) -> None:
+        s, cs = _blank_macro_defs(scope_s, scope_cs)
+        state = (cur_file, cur_mod_dir, is_file_scope, cs, in_test_cfg)
+        if state in visited_scopes:
+            return
+        visited_scopes.add(state)
+        depths = _compute_brace_depths(s)
+        for m in inline_pat.finditer(s):
+            if depths[m.start(1)] != 0:
+                continue
+            seg = m.group(2)
+            for attrs_cs, body_s, body_cs in _find_inline_mods(s, cs, seg):
+                mod_cfgs = _extract_cfg_exprs(attrs_cs) + _extract_cfg_exprs(_extract_scope_inner_attrs(body_s, body_cs), inner_only=True)
+                sub_is_test = in_test_cfg or any(_cfg_is_test_only(e) for e in mod_cfgs)
+                explicit_p = _extract_path_attr(view, pkg_name, lib_lane, attrs_cs)
+                inline_dir = os.path.normpath(f"{cur_mod_dir}/{explicit_p}").replace("\\", "/") if explicit_p is not None else (f"{cur_mod_dir}/{seg}" if cur_mod_dir else seg)
+                walk_scope(cur_file, inline_dir, False, body_s, body_cs, sub_is_test)
+        for m in out_pat.finditer(s):
+            if depths[m.start(1)] != 0:
+                continue
+            seg, attrs_cs = m.group(2), cs[m.start(1) : m.end(1)]
+            mod_is_test = in_test_cfg or any(_cfg_is_test_only(e) for e in _extract_cfg_exprs(attrs_cs))
+            for child_file in _resolve_child_mod_files(view, pkg_name, lib_lane, cur_file, cur_mod_dir, seg, attrs_cs, is_file_scope):
+                child_s, child_cs = view.read_stripped_rust(child_file), view.read_comments_stripped_rust(child_file)
+                inner_cfgs = _extract_cfg_exprs(_extract_scope_inner_attrs(child_s, child_cs), inner_only=True)
+                child_is_test = mod_is_test or any(_cfg_is_test_only(e) for e in inner_cfgs)
+                (cfg_test_files if child_is_test else prod_files).add(child_file)
+                child_mod_dir = child_file.rsplit("/", 1)[0] if child_file.endswith("/mod.rs") else child_file[:-3]
+                walk_scope(child_file, child_mod_dir, True, child_s, child_cs, child_is_test)
+
+    for rf in dict.fromkeys(root_candidates):
+        if not view.is_file(rf):
+            continue
+        rf_s, rf_cs = view.read_stripped_rust(rf), view.read_comments_stripped_rust(rf)
+        rf_is_test = any(_cfg_is_test_only(e) for e in _extract_cfg_exprs(_extract_scope_inner_attrs(rf_s, rf_cs), inner_only=True))
+        (cfg_test_files if rf_is_test else prod_files).add(rf)
+        walk_scope(rf, rf.rsplit("/", 1)[0] if "/" in rf else "", True, rf_s, rf_cs, rf_is_test)
+
+    int_targets = _discover_integration_targets(view, pkg_name)
+    if int_targets:
+        int_test_files.update(int_targets.values())
+    if (data.get("package", {}).get("autotests", True) if isinstance(data, dict) else True) is not False:
+        int_test_files.update(view.glob_files(f"{crate_dir}/tests", ".rs"))
+    _CRATE_FILE_CLASS_CACHE[key] = (prod_files, cfg_test_files, int_test_files)
+    return prod_files, cfg_test_files, int_test_files
+
+
+def is_test_only_rust_file(view: RepoView, path: str) -> bool:
+    if path.startswith("conformance-probes/"):
         return True
-    if "/tests/" in path:
+    if not path.startswith("crates/") or not path.endswith(".rs"):
+        return False
+    parts = path.split("/")
+    if len(parts) < 3:
+        return False
+    prod_files, cfg_test_files, int_test_files = _classify_crate_rust_files(view, parts[1])
+    if path in prod_files:
+        return False
+    if path in cfg_test_files or path in int_test_files:
         return True
-    for non_guest in NON_GUEST_CRATES:
-        if path.startswith(non_guest + "/") or path == non_guest:
+    if view.is_file(path):
+        inner_cfgs = _extract_cfg_exprs(_extract_scope_inner_attrs(view.read_stripped_rust(path), view.read_comments_stripped_rust(path)), inner_only=True)
+        if any(_cfg_is_test_only(e) for e in inner_cfgs):
             return True
     return False
 
 
+def is_non_guest_path(view: RepoView, path: str) -> bool:
+    if not path.endswith(".rs"):
+        return True
+    if any(path.startswith(ng + "/") or path == ng for ng in NON_GUEST_CRATES):
+        return True
+    return is_test_only_rust_file(view, path)
+
+
 def _git_rev_parse(root: Path, rev: str) -> str:
-    res = subprocess.run(
-        ["git", "rev-parse", "--verify", f"{rev}^{{commit}}"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    res = subprocess.run(["git", "rev-parse", "--verify", f"{rev}^{{commit}}"], cwd=root, capture_output=True, text=True, check=False)
     if res.returncode != 0:
         sys.stderr.write(f"error: unable to resolve git revision {rev!r}: {res.stderr.strip()}\n")
         sys.exit(1)
@@ -2657,17 +2739,15 @@ def main():
     # Load and validate exemptions
     exempted_paths = load_and_validate_exemptions(root, exemptions_dir, valid_contracts, all_diff_paths, base_sha, head_sha)
 
-    # Check for unclassified new or R<100 renamed paths under crates/
+    # Check for unclassified new or renamed paths under crates/ (including R100 renames)
     unclassified = []
-    for path in sorted(added_paths | set(renamed_modified_paths.keys())):
+    for path in sorted(added_paths | set(renamed_modified_paths.keys()) | byte_identical_renames):
         if (
             path.startswith("crates/")
             and path not in surfaces
             and path not in exempted_paths
-            and path not in byte_identical_renames
-            and path not in move_covered
         ):
-            if not is_non_guest_path(path):
+            if not is_non_guest_path(head_view, path):
                 unclassified.append(path)
 
     if unclassified:
@@ -2676,18 +2756,14 @@ def main():
 
     errors: list[str] = []
 
-    # P1-2 & P1-4a: Check for dropped contract mappings on existing, renamed, or deleted surfaces
+    # P1-2, P1-4a & N3: Check for dropped contract mappings on existing, renamed (including R100), moved, or deleted surfaces
     remapped_on_added: set[str] = {
         c for ap in added_paths for c in surfaces.get(ap, [])
     }
     for base_path, base_cids in sorted(base_surfaces.items()):
-        if not base_cids or is_test_or_probe_path(base_path):
+        if not base_cids or not base_view.is_file(base_path) or is_test_only_rust_file(base_view, base_path):
             continue
-        if (
-            base_path in byte_identical_rename_sources
-            or base_path in exempted_paths
-            or base_path in move_covered
-        ):
+        if base_path in exempted_paths:
             continue
         if base_path in deleted_paths:
             dropped = [c for c in base_cids if c not in remapped_on_added]
@@ -2697,12 +2773,7 @@ def main():
                 )
             continue
         target_path = rename_old_to_new.get(base_path, base_path)
-        if (
-            target_path in byte_identical_renames
-            or target_path in exempted_paths
-            or target_path in move_covered
-            or is_test_or_probe_path(target_path)
-        ):
+        if target_path in exempted_paths:
             continue
         if not head_view.is_file(target_path):
             continue
@@ -2713,10 +2784,8 @@ def main():
                 f"error: surface {target_path} dropped contract mapping(s) in surfaces.toml: {dropped}"
             )
 
-    # P1-2: Flag any stale surfaces.toml entry whose path no longer exists at HEAD
+    # P1-2: Flag any stale surfaces.toml entry whose path no longer exists at HEAD (including R100 rename sources)
     for s_path in sorted(surfaces):
-        if s_path in byte_identical_rename_sources:
-            continue
         if not head_view.is_file(s_path):
             if (
                 base_view.is_file(s_path)
@@ -2733,28 +2802,37 @@ def main():
     base_contracts = (
         load_contracts_from_view(base_view) if any_contract_toml_changed else contracts
     )
-    binding_resolution_cache: dict[str, tuple[str, str, str, list[str]] | None] = {}
+    head_binding_cache: dict[tuple[str, bool], tuple[str, str, str, list[str]] | None] = {}
+    base_binding_cache: dict[str, tuple[str, str, str, list[str]] | None] = {}
     surface_items_cache: dict[str, set[str]] = {}
     evidenced_lines: list[str] = []
 
-    def resolve_gated_binding(b_spec: str) -> tuple[str, str, str, list[str]] | None:
-        if b_spec not in binding_resolution_cache:
-            resolved = resolve_binding_at_view(head_view, b_spec)
-            if resolved is not None:
-                pkg_name, target_name, _, _ = resolved
-                if not is_target_in_gated_lane(head_view, pkg_name, target_name):
-                    resolved = None
-            binding_resolution_cache[b_spec] = resolved
-        return binding_resolution_cache[b_spec]
+    def resolve_head_gated_binding(b_spec: str, require_leaf: bool = False) -> tuple[str, str, str, list[str]] | None:
+        key = (b_spec, require_leaf)
+        if key not in head_binding_cache:
+            resolved = resolve_binding_at_view(head_view, b_spec, require_leaf=require_leaf)
+            if resolved is not None and not is_target_in_gated_lane(head_view, resolved[0], resolved[1]):
+                resolved = None
+            head_binding_cache[key] = resolved
+        return head_binding_cache[key]
+
+    def resolve_base_gated_binding(b_spec: str) -> tuple[str, str, str, list[str]] | None:
+        if b_spec not in base_binding_cache:
+            resolved = resolve_binding_at_view(base_view, b_spec, require_leaf=False)
+            if resolved is not None and not is_target_in_gated_lane(base_view, resolved[0], resolved[1]):
+                resolved = None
+            base_binding_cache[b_spec] = resolved
+        return base_binding_cache[b_spec]
+
+    def normalize_ref_tokens(ref_texts: list[str]) -> tuple[tuple[str, ...], ...]:
+        return tuple(_tokenize_code_line(t) for t in ref_texts)
 
     active_surfaces_by_cid: dict[str, list[str]] = {}
     active_modified_surfaces: list[str] = []
     for path in sorted(modified_paths):
         if path in byte_identical_renames or path in move_covered or path in exempted_paths:
             continue
-        if is_test_or_probe_path(path):
-            continue
-        if path not in surfaces:
+        if is_test_only_rust_file(head_view, path) or path not in surfaces:
             continue
         active_modified_surfaces.append(path)
         for cid in surfaces[path]:
@@ -2765,6 +2843,12 @@ def main():
             contract_data = contracts.get(cid, {})
             head_bindings = extract_contract_test_bindings(contract_data)
             base_bindings = set(extract_contract_test_bindings(base_contracts.get(cid, {})))
+            removed_bindings = sorted(base_bindings - set(head_bindings))
+
+            for rem_spec in removed_bindings:
+                errors.append(
+                    f"error: binding {rem_spec} removed from {cid} while mapped surface {path} changed"
+                )
 
             existing_valid: list[str] = []
             added_valid_for_path: list[str] = []
@@ -2772,62 +2856,51 @@ def main():
             added_unresolved: list[str] = []
 
             for b_spec in head_bindings:
-                resolved = resolve_gated_binding(b_spec)
-                if resolved is None:
-                    if b_spec not in base_bindings:
-                        added_unresolved.append(b_spec)
-                    continue
-                _, _, test_file, ref_texts = resolved
                 if b_spec in base_bindings:
-                    existing_valid.append(b_spec)
+                    base_resolved = resolve_base_gated_binding(b_spec)
+                    head_resolved_any = resolve_head_gated_binding(b_spec, require_leaf=False)
+                    if base_resolved is not None:
+                        if head_resolved_any is None:
+                            continue
+                        if normalize_ref_tokens(base_resolved[3]) == normalize_ref_tokens(head_resolved_any[3]):
+                            existing_valid.append(b_spec)
+                            continue
+                    elif head_resolved_any is None:
+                        continue
+
+                resolved_leaf = resolve_head_gated_binding(b_spec, require_leaf=True)
+                if resolved_leaf is None:
+                    added_unresolved.append(b_spec)
+                    continue
+                _, _, test_file, ref_texts = resolved_leaf
+                if bound_test_references_surface(
+                    root, base_view, head_view, base_sha, head_sha, path,
+                    test_file, ref_texts, surface_items_cache, renamed_modified_paths,
+                ):
+                    added_valid_for_path.append(b_spec)
                 else:
-                    if bound_test_references_surface(
-                        root,
-                        base_view,
-                        head_view,
-                        base_sha,
-                        head_sha,
-                        path,
-                        test_file,
-                        ref_texts,
-                        surface_items_cache,
-                        renamed_modified_paths,
-                    ):
-                        added_valid_for_path.append(b_spec)
-                    else:
-                        # Check if this added binding references ANY changed surface of `cid`
-                        other_surfaces = active_surfaces_by_cid.get(cid, [])
-                        refs_any = any(
-                            other_p != path
-                            and bound_test_references_surface(
-                                root,
-                                base_view,
-                                head_view,
-                                base_sha,
-                                head_sha,
-                                other_p,
-                                test_file,
-                                ref_texts,
-                                surface_items_cache,
-                                renamed_modified_paths,
-                            )
-                            for other_p in other_surfaces
+                    other_surfaces = active_surfaces_by_cid.get(cid, [])
+                    refs_any = any(
+                        other_p != path and bound_test_references_surface(
+                            root, base_view, head_view, base_sha, head_sha, other_p,
+                            test_file, ref_texts, surface_items_cache, renamed_modified_paths,
                         )
-                        if not refs_any:
-                            added_invalid_for_all.append(b_spec)
+                        for other_p in other_surfaces
+                    )
+                    if not refs_any:
+                        added_invalid_for_all.append(b_spec)
 
             for unres_spec in added_unresolved:
                 errors.append(
                     f"error: binding {unres_spec} added to {cid} does not resolve to a gated bound test for changed surface {path}"
                 )
-
             for bad_spec in added_invalid_for_all:
                 errors.append(
                     f"error: binding {bad_spec} added to {cid} does not reference changed surface {path}"
                 )
 
             valid_tests = existing_valid + added_valid_for_path
-            if valid_tests and not added_invalid_for_all and not added_unresolved:
+            if valid_tests and not added_invalid_for_all and not added_unresolved and not removed_bindings:
                 evidenced_lines.append(f"evidenced: {path} -> {cid}: {valid_tests[0]}")
             elif not valid_tests:
                 errors.append(f"error: contract {cid} has no gated bound test for changed surface {path}")
