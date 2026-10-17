@@ -626,12 +626,12 @@ contract class (§6), `--vcpu auto` resolution (§4.6), CPUID pinning (§4.3.5).
 
 **Phase 1: substrate (VM-free, every host).**
 
-- 1a `carrick-softmmu`: `LinearPlacement`, `SoftTlb` with the CPL/AC tag,
+- 1a (#580) `carrick-softmmu`: `LinearPlacement`, `SoftTlb` with the CPL/AC tag,
   walker binding with the hardware permission model, MMIO holes. Witness:
   unit tests over `Vec<AtomicU64>` tables including SMAP, NX, USER and
   reserved-bit cases; a two-thread test that an `invlpg`-style eviction and a
   root switch flush exactly what hardware would.
-- 1b `carrick-softcpu-x86` Level 0 for user mode: classifier, planner, probe,
+- 1b (#581) `carrick-softcpu-x86` Level 0 for user mode: classifier, planner, probe,
   exit protocol, bounce path, `#PF`/`#UD`/`#GP`/`#DE` surfaced as typed
   exits; the retired fixture ELFs under the reused loader harness; the
   differential harness with its first property suites.
