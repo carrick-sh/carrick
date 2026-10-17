@@ -372,6 +372,17 @@ impl WorkerKick {
         Ok(())
     }
 
+    /// Force the worker out of any guest run it is in when the pool shuts
+    /// down. A guest that halts in-zone (a parent in `wait4` whose child the
+    /// run already failed) never exits on its own, so the join would wait
+    /// forever; `need_resched` covers a kick that lands before guest entry.
+    pub(crate) fn interrupt_for_shutdown(&self) {
+        self.need_resched.store(true, Ordering::Release);
+        if let Some(hardware) = self.hardware.lock().as_ref() {
+            hardware.handle.kick();
+        }
+    }
+
     /// Publish (or end) the executor's wait in the guest. Sequentially
     /// consistent: a waker either sees the flag and forces the vCPU out, or
     /// published its work before the executor's re-scan that follows.
@@ -1185,6 +1196,13 @@ where
             .kernel()
             .unregister_debug_aux_provider(self.debug_aux_registration);
         self.scheduler.close();
+        for kick in self
+            .handles
+            .iter()
+            .filter_map(|handle| handle.kick.as_ref())
+        {
+            kick.interrupt_for_shutdown();
+        }
         let mut failures = Vec::new();
         if let Err(error) = self
             .resolver
