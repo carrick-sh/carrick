@@ -1157,6 +1157,16 @@ impl ContinuationFamily {
         }
     }
 
+    /// Waits that Linux performs in `TASK_KILLABLE`: only `SIGKILL` may
+    /// interrupt them, while caught signals and non-fatal default actions stay
+    /// pending until the wait completes.
+    pub const fn is_kill_only_wait(self) -> bool {
+        matches!(
+            self,
+            Self::VforkParent | Self::PtraceStopSettle | Self::KillableOwnerZone
+        )
+    }
+
     /// Stable snapshot spelling. Same rule as `event_code`: a wedge snapshot
     /// outlives the build that produced it, so the name is written out rather
     /// than derived from the Rust variant.

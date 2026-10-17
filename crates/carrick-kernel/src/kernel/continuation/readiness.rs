@@ -534,10 +534,7 @@ impl SignalReadinessProbe {
                 WaitSigMask::Additive(extra) => persistent.union(extra),
                 WaitSigMask::Replace(mask) => mask,
             };
-            let blocked = if matches!(
-                self.family,
-                ContinuationFamily::VforkParent | ContinuationFamily::PtraceStopSettle
-            ) {
+            let blocked = if self.family.is_kill_only_wait() {
                 SigSet::EMPTY
                     .complement()
                     .without(crate::linux_abi::LINUX_SIGKILL)
@@ -554,12 +551,7 @@ impl SignalReadinessProbe {
         }
         let authority = context.signal_authority();
         let host_signum = self.host_signal.take_pending_for(self.thread.tid.raw());
-        if matches!(
-            self.family,
-            ContinuationFamily::VforkParent
-                | ContinuationFamily::PtraceStopSettle
-                | ContinuationFamily::KillableOwnerZone
-        ) {
+        if self.family.is_kill_only_wait() {
             // A ptrace request waiting out its tracee's stop settlement is
             // killable-only for the same reason: it has performed nothing,
             // and ptrace(2) never fails it with EINTR.
