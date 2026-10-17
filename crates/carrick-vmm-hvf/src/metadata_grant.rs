@@ -1212,15 +1212,33 @@ fn retain_fork_custody_rows(
     let Some(bytes) = count.checked_mul(row_bytes) else {
         return Err(ForkStockRefusal::Invalid);
     };
-    let Some(offset) = address
+    if !address
         .raw()
-        .checked_sub(carrick_el1_abi::EL1_REGION_BASE)
-        .and_then(|offset| usize::try_from(offset).ok())
-    else {
+        .is_multiple_of(core::mem::align_of::<[u64; 4]>() as u64)
+    {
         return Err(ForkStockRefusal::Invalid);
+    }
+    let rows = if address.raw() >= EL1_DYNAMIC_METADATA_BASE {
+        let (host, base, _) =
+            retained_dynamic_metadata(custody, address, bytes).ok_or(ForkStockRefusal::Invalid)?;
+        let offset =
+            usize::try_from(address.raw() - base).map_err(|_| ForkStockRefusal::Invalid)?;
+        // SAFETY: the common metadata venue checked the entire custody array.
+        unsafe { host.as_ptr().add(offset).cast::<[u64; 4]>() }
+    } else {
+        let offset = address
+            .raw()
+            .checked_sub(carrick_el1_abi::EL1_REGION_BASE)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .filter(|offset| fork_custody_in_retained_region(*offset, bytes))
+            .ok_or(ForkStockRefusal::Invalid)?;
+        region
+            .record_ptr::<[u64; 4]>(offset)
+            .ok_or(ForkStockRefusal::Invalid)?
     };
-    if !offset.is_multiple_of(core::mem::align_of::<[u64; 4]>())
-        || !fork_custody_in_retained_region(offset, bytes)
+    if !rows
+        .addr()
+        .is_multiple_of(core::mem::align_of::<[u64; 4]>())
     {
         return Err(ForkStockRefusal::Invalid);
     }
@@ -1242,15 +1260,9 @@ fn retain_fork_custody_rows(
     );
     let physical = crate::trap::ForkPhysicalCustody::new(Arc::clone(custody), source);
     for index in 0..count {
-        let Some(row_offset) = offset.checked_add(index * row_bytes) else {
-            return Err(ForkStockRefusal::Invalid);
-        };
-        let Some(row) = region.record_ptr::<[u64; 4]>(row_offset) else {
-            return Err(ForkStockRefusal::Invalid);
-        };
         // SAFETY: the synchronous stopped-CPU crossing exclusively retains the
-        // aligned four-word record inside the checked EL1 metadata/heap range.
-        let words = unsafe { *row };
+        // aligned array in the checked fixed region or dynamic metadata grant.
+        let words = unsafe { *rows.add(index) };
         let Some(selected) = carrick_el1_abi::PortalForkCustody::decode(words) else {
             return Err(ForkStockRefusal::Invalid);
         };
@@ -1462,10 +1474,22 @@ fn lifecycle_window(
     if carrick_el1_abi::ForkLifecycleLoan::new(life.page, life.controls)? != life {
         return None;
     }
-    let identity = custody.stage2_record_covering(
-        life.page.raw(),
+    let (host, base, len) = retained_dynamic_metadata(
+        custody,
+        life.page,
         core::mem::size_of::<carrick_el1_abi::ThreadLifecyclePage>(),
     )?;
+    // SAFETY: the common metadata venue retains this identity-mapped range.
+    Some(unsafe { carrick_hal::fork_stock::LifecycleWindow::new(host, base, len as u64) })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retained_dynamic_metadata(
+    custody: &crate::trap::CarrierVmCustody,
+    address: carrick_guest_arch::KernelVa,
+    len: usize,
+) -> Option<(core::ptr::NonNull<u8>, u64, usize)> {
+    let identity = custody.stage2_record_covering(address.raw(), len)?;
     let state = custody.state.lock();
     let record = state.stage2_records.get(&identity.record_id)?;
     if record.snapshot.ipa < EL1_DYNAMIC_METADATA_BASE
@@ -1478,14 +1502,7 @@ fn lifecycle_window(
         return None;
     }
     let host = core::ptr::NonNull::new(record.snapshot.host_addr as *mut u8)?;
-    // SAFETY: retained metadata aperture backing owns the identity-mapped range.
-    Some(unsafe {
-        carrick_hal::fork_stock::LifecycleWindow::new(
-            host,
-            record.snapshot.ipa,
-            record.snapshot.len as u64,
-        )
-    })
+    Some((host, record.snapshot.ipa, record.snapshot.len))
 }
 
 /// Physical process crossings use HVC #6. Metadata allocation uses its mailbox.

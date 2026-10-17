@@ -575,7 +575,6 @@ pub struct Prepared<'a> {
     pub child: UnpublishedEl1Child<Aarch64Mmu>,
     pub words: PreparedWords<'a>,
     pub address: Mm,
-    pub custody: Vec<PortalForkCustody>,
     pub admitted: Box<AdmittedCustodyToken>,
 }
 
@@ -584,7 +583,6 @@ impl core::fmt::Debug for Prepared<'_> {
         f.debug_struct("Prepared")
             .field("loan", &self.loan)
             .field("address", &self.address)
-            .field("custody", &self.custody)
             .field("admitted", &self.admitted)
             .finish()
     }
@@ -1200,7 +1198,6 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             child,
             words: live,
             address,
-            custody,
             admitted,
         })
     }
