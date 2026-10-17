@@ -351,7 +351,10 @@ fn exhausted_wait_entries_leave_record_capacity_unchanged() {
 fn wait4_zeroes_the_full_rusage_record() {
     let mut elf = fork_wait_elf();
     let start = 0xb0 + 18;
-    // Save child PID, fill all 144 rusage bytes, and restore wait's PID.
+    // Save child PID, fill all 144 rusage bytes with 0xa5, and restore wait's PID.
+    // Native Linux populates real usage fields (ru_utime, ru_minflt, ru_nvcsw) and
+    // zeroes untracked fields; the stopped CPL0 fixture writes zeros as an honest
+    // approximation of CPU/fault counters (#576). Both overwrite every sentinel byte.
     let fill = [
         0x89, 0xfb, 0x48, 0x8d, 0xbc, 0x24, 0x00, 0xff, 0xff, 0xff, 0xb9, 144, 0, 0, 0, 0xb0, 0xa5,
         0xf3, 0xaa, 0x89, 0xdf,
@@ -369,8 +372,8 @@ fn wait4_zeroes_the_full_rusage_record() {
         .expect("wait4")
         + 7;
     let check = [
-        0x48, 0x8d, 0xbc, 0x24, 0x00, 0xff, 0xff, 0xff, 0xb9, 144, 0, 0, 0, 0x31, 0xc0, 0xf3, 0xae,
-        0x75, 0,
+        0x48, 0x8d, 0xbc, 0x24, 0x00, 0xff, 0xff, 0xff, 0xb9, 144, 0, 0, 0, 0xb0, 0xa5, 0xf2, 0xae,
+        0x74, 0,
     ];
     elf.splice(wait_end..wait_end, check);
     elf[0xb0 + 15] += (fill.len() + lea.len() - 3 + check.len()) as u8;
@@ -389,9 +392,10 @@ fn wait4_zeroes_the_full_rusage_record() {
 }
 
 #[test]
-fn wait4_rejects_unwritable_rusage_without_writing_status() {
+fn wait4_writes_status_before_unwritable_rusage_efault() {
     let mut elf = fork_wait_elf();
-    let sentinel = [0xc7, 0x44, 0x24, 0xf8, 0xa5, 0xa5, 0xa5, 0xa5];
+    // Save child PID in EBX and pre-fill status at [rsp - 8] with 0xa5a5a5a5.
+    let sentinel = [0x89, 0xfb, 0xc7, 0x44, 0x24, 0xf8, 0xa5, 0xa5, 0xa5, 0xa5];
     elf.splice(0xb0 + 18..0xb0 + 18, sentinel);
     let r10 = elf
         .windows(3)
@@ -405,27 +409,41 @@ fn wait4_rejects_unwritable_rusage_without_writing_status() {
         .position(|b| b == [0xb8, 61, 0, 0, 0, 0x0f, 0x05])
         .expect("wait4")
         + 7;
-    // Require EFAULT and exit immediately: no child completion was consumed.
+    // Linux kernel_wait4 reaps the child and writes *stat_addr before copying
+    // rusage out: wait4 returns -EFAULT, a second wait4(child, NULL, 0, NULL)
+    // returns -ECHILD, and the tail reads WEXITSTATUS(status) == 3 -> exits 7.
     let check = [
-        0x83, 0xf8, 0xf2, 0x75, 22, 0x81, 0x7c, 0x24, 0xf8, 0xa5, 0xa5, 0xa5, 0xa5, 0x75, 12, 0xbf,
-        7, 0, 0, 0, 0xb8, 231, 0, 0, 0, 0x0f, 0x05, 0xbf, 9, 0, 0, 0, 0xb8, 231, 0, 0, 0, 0x0f,
-        0x05,
+        0x83, 0xf8, 0xf2, 0x75, 0, 0x89, 0xdf, 0x31, 0xf6, 0x31, 0xd2, 0x45, 0x31, 0xd2, 0xb8, 61,
+        0, 0, 0, 0x0f, 0x05, 0x83, 0xf8, 0xf6, 0x75, 0,
     ];
     elf.splice(wait_end..wait_end, check);
     elf[0xb0 + 15] += (sentinel.len() + pointer.len() - 3 + check.len()) as u8;
+    let failure = elf
+        .windows(7)
+        .position(|b| b == [0xbf, 9, 0, 0, 0, 0xb8, 231])
+        .expect("failure");
+    for branch in [wait_end + 4, wait_end + check.len() - 1] {
+        elf[branch] = (failure - branch - 1) as u8;
+    }
     let size = elf.len() as u64;
     elf[96..104].copy_from_slice(&size.to_le_bytes());
     let program = initial_process_program(&elf);
     let mut carrier =
         Cpl0Carrier::boot_lifecycle(physical_inventory(), &image(), [&program, &program])
             .expect("KVM");
-    assert_eq!(carrier.observe(0).expect("rusage EFAULT").result, 7);
+    assert_eq!(
+        carrier
+            .observe(0)
+            .expect("status before rusage EFAULT")
+            .result,
+        7
+    );
     assert_eq!(
         carrier
             .lifecycle_state(0)
-            .expect("child not retired")
+            .expect("child retired")
             .retirements,
-        0
+        1
     );
 }
 

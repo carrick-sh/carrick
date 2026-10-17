@@ -84,6 +84,26 @@ impl Drop for PendingWaitRecord<'_> {
     }
 }
 
+/// Signed 32-bit guest syscall return value carried through a `carrick-sched-core`
+/// wait entry's `u32` wake-result slot (`0`, a positive PID, or a negative
+/// `-errno` such as `-EFAULT`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WakeRetval(i32);
+
+impl WakeRetval {
+    pub fn from_guest_retval(retval: i64) -> Option<Self> {
+        i32::try_from(retval).ok().map(Self)
+    }
+
+    pub const fn to_slot(self) -> u32 {
+        self.0 as u32
+    }
+
+    pub const fn from_slot(slot: u32) -> i64 {
+        (slot as i32) as i64
+    }
+}
+
 /// Owned exclusion for child exit publication and wait enrollment. The
 /// constructor is the only way to acquire this exact MM's child-wait bucket.
 pub struct ChildWaitGuard<'a> {
@@ -109,7 +129,7 @@ impl<'a> ChildWaitGuard<'a> {
         &self,
         record: carrick_sched_core::RecordId,
         seq: u32,
-        child_pid: u32,
+        wake_result: WakeRetval,
     ) -> Result<(), carrick_sched_core::Exhausted> {
         self.bucket.zone().enqueue(
             &self.bucket,
@@ -118,7 +138,7 @@ impl<'a> ChildWaitGuard<'a> {
             self.parent_mm.raw(),
             CHILD_WAIT_KEY,
             u32::MAX,
-            child_pid,
+            wake_result.to_slot(),
         )
     }
 }
@@ -306,6 +326,17 @@ mod process_exit_tests {
         assert!(record.reap(&guard, 3).is_some());
         assert_eq!(record.exited_status(), None);
         assert!(record.reap(&guard, 3).is_none());
+    }
+
+    #[test]
+    fn wake_retval_round_trips_pid_zero_efault_and_refuses_out_of_range() {
+        use super::WakeRetval;
+        for expected in [42_i64, 0_i64, carrick_abi::LINUX_EFAULT.guest_retval()] {
+            let encoded = WakeRetval::from_guest_retval(expected).expect("in-range wake retval");
+            assert_eq!(WakeRetval::from_slot(encoded.to_slot()), expected);
+        }
+        assert_eq!(WakeRetval::from_guest_retval(i64::from(i32::MAX) + 1), None);
+        assert_eq!(WakeRetval::from_guest_retval(i64::from(i32::MIN) - 1), None);
     }
 }
 
@@ -509,7 +540,8 @@ impl NativeLane<'_> {
         let _ = grant;
         *self.frame = context.frame;
         if let Some(result) = switched.result {
-            self.frame.rax = result;
+            let slot = u32::try_from(result).ok()?;
+            self.frame.rax = WakeRetval::from_slot(slot) as u64;
         }
         self.task
             .execution
@@ -853,26 +885,31 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         let Some(outputs) = crate::process::prepare_wait_outputs(self, status, rusage) else {
             return returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval());
         };
+        let wait_result = outputs.result(child_pid);
         if let Some(code) = code {
             let Some(child) = crate::process::child_exit().reap(&guard, code) else {
                 return returned(carrick_syscall_abi::LINUX_ECHILD.guest_retval());
             };
             outputs.complete(child);
-            return returned(child_pid as i64);
+            return returned(wait_result);
         }
         let Some(pending) = PendingWaitRecord::acquire(self.zone, self.lane.slot, self.lane.parent)
         else {
             return returned(carrick_syscall_abi::LINUX_EAGAIN.guest_retval());
         };
         let record = pending.record;
-        let child_index = committed(
+        let _ = committed(
             u32::try_from(child_pid).ok(),
+            LifecycleInvariant::WaitEnrollment,
+        );
+        let wake_result = committed(
+            WakeRetval::from_guest_retval(wait_result),
             LifecycleInvariant::WaitEnrollment,
         );
         let reference = self.zone.record_ref(record);
         let xsave = self.xsave.clone();
         let mut saved_frame = *self.frame;
-        saved_frame.rax = child_pid;
+        saved_frame.rax = wait_result as u64;
         let context = NativeBirthContext {
             record: Some(reference),
             frame: saved_frame,
@@ -891,10 +928,10 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             return returned(carrick_syscall_abi::LINUX_EAGAIN.guest_retval());
         };
         let seq = self.zone.next_seq(record);
-        if guard.enroll(record, seq, child_index).is_err() {
+        if guard.enroll(record, seq, wake_result).is_err() {
             return returned(carrick_syscall_abi::LINUX_EAGAIN.guest_retval());
         }
-        self.frame.rax = child_pid;
+        self.frame.rax = wait_result as u64;
         self.lane.contexts[0] = context;
         crate::process::publish_wait_outputs(outputs);
         self.handoff = Some(committed(
