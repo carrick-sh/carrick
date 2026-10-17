@@ -132,6 +132,15 @@ impl<X: ForkStockCrossing> crate::sched::ThreadCpu for ResumeCpu<'_, '_, X> {
 const VA: u64 = 0x4000_0000;
 const IPA: u64 = 0x9000_0000;
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum CommitFault {
+    None,
+    Refusal,
+    Crossing,
+    MissingReply,
+}
+
 struct TestStockCrossing {
     fd_map: Vec<carrick_el1_abi::FdMapSlot>,
     open_table: Vec<carrick_el1_abi::DelegatedOpenFile>,
@@ -143,6 +152,8 @@ struct TestStockCrossing {
     settlements_aborted: AtomicUsize,
     reserved_custody_rows: AtomicUsize,
     refuse_reserve: std::sync::Mutex<Option<ForkStockRefusal>>,
+    #[cfg(test)]
+    commit_fault: std::sync::Mutex<CommitFault>,
     pending_loan: std::sync::Mutex<Option<ForkStockLoan>>,
     retirements: AtomicUsize,
     zone: std::sync::Mutex<Option<&'static ZoneTables<Aarch64ParkedContext>>>,
@@ -174,6 +185,8 @@ impl TestStockCrossing {
             settlements_aborted: AtomicUsize::new(0),
             reserved_custody_rows: AtomicUsize::new(0),
             refuse_reserve: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            commit_fault: std::sync::Mutex::new(CommitFault::None),
             pending_loan: std::sync::Mutex::new(None),
             retirements: AtomicUsize::new(0),
             zone: std::sync::Mutex::new(None),
@@ -373,7 +386,17 @@ impl ForkStockCrossing for TestStockCrossing {
             Some(ForkStockKind::Commit) => {
                 self.settlements_committed.fetch_add(1, Ordering::AcqRel);
                 let settlement = unsafe { &mut *(record_gpa as *mut ForkStockSettlement) };
-                if let Some(loan) = *self.pending_loan.lock().unwrap()
+                #[cfg(test)]
+                match *self.commit_fault.lock().unwrap() {
+                    CommitFault::Refusal => {
+                        settlement.refuse(ForkStockRefusal::Invalid);
+                        return Ok(());
+                    }
+                    CommitFault::Crossing => return Err(NativeProcessError::Fault),
+                    CommitFault::MissingReply => return Ok(()),
+                    CommitFault::None => {}
+                }
+                if let Some(loan) = self.pending_loan.lock().unwrap().take()
                     && !settlement.accept(loan)
                 {
                     return Err(NativeProcessError::Invalid);
@@ -1612,6 +1635,64 @@ fn fork_reservation_refusal_from_concurrent_munmap_rolls_back_without_quarantine
     assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 2);
     assert_eq!(crossing.settlements_reserved.load(Ordering::Acquire), 2);
     assert_eq!(crossing.settlements_committed.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn fork_commit_refusal_after_admitted_reservation_fails_closed_without_opening_child_space() {
+    assert_commit_fault_keeps_child_closed(CommitFault::Refusal);
+}
+
+#[test]
+fn fork_commit_crossing_failure_keeps_child_closed() {
+    assert_commit_fault_keeps_child_closed(CommitFault::Crossing);
+}
+
+#[test]
+fn fork_commit_missing_reply_keeps_child_closed() {
+    assert_commit_fault_keeps_child_closed(CommitFault::MissingReply);
+}
+
+#[cfg(test)]
+fn assert_commit_fault_keeps_child_closed(fault: CommitFault) {
+    let fixture = Fixture::new(0x10000, asid(1));
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let initial_stock = [
+        0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+    ];
+    let crossing = TestStockCrossing::new(&initial_stock);
+    *crossing.commit_fault.lock().unwrap() = fault;
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::new(1).unwrap(),
+        &crossing,
+    )
+    .with_words(&words);
+
+    let child_mm = MmGeneration::new(NonZeroU64::new(2).unwrap());
+    let prepared = service
+        .prepare_mm(&fixture.address, parked, child_mm)
+        .unwrap();
+    let born = service.commit_mm(prepared).unwrap();
+    let (error, born) = service
+        .settle_mm(born)
+        .expect_err("unacknowledged Commit must not settle a published child");
+    assert_eq!(error, NativeProcessError::Quarantined);
+    assert_eq!(crossing.settlements_reserved.load(Ordering::Acquire), 1);
+    assert_eq!(crossing.settlements_committed.load(Ordering::Acquire), 1);
+    assert_eq!(crossing.settlements_aborted.load(Ordering::Acquire), 0);
+    assert!(
+        fixture.zone.spaces.find(2).is_some(),
+        "closed child space was published during prepare"
+    );
+    assert!(
+        !fixture.zone.spaces.is_open(2),
+        "refused Commit must never open the child's space gate"
+    );
+    drop(born);
 }
 
 #[test]
