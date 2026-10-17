@@ -301,8 +301,9 @@ fn file_region_guest_stdio_parity_and_two_carrier_independence() {
 
 #[test]
 fn file_region_guest_closes_record_beyond_fifteen() {
+    use carrick_core_abi::OpenRelease;
     use carrick_el1::personality::file_table::{admit_host_fd, admit_stdio};
-    use carrick_el1_abi::{DELEGATED_FLAG_READABLE, OpenRelease, fd_map_lookup};
+    use carrick_el1_abi::{DELEGATED_FLAG_READABLE, fd_map_lookup};
     use std::os::fd::AsRawFd;
     use std::sync::atomic::Ordering;
     let program = file_region_program(3, 19); // close(fd 19)

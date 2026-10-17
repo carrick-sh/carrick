@@ -22,6 +22,7 @@
 
 pub use carrick_guest_arch::ContextGeneration;
 
+use carrick_core_abi::OpenLifetime;
 mod open_lifetime;
 pub use open_lifetime::*;
 mod cow_grants;
