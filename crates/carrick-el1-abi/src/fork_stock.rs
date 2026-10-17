@@ -29,6 +29,7 @@ pub const NATIVE_CHILD_RETIRE_PORT: u16 = 0xd6;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ForkStockKind {
     Loan,
+    Reserve,
     Commit,
     Abort,
 }
@@ -37,13 +38,14 @@ impl ForkStockKind {
     pub const fn word(self) -> u64 {
         match self {
             Self::Loan => 0x4352_464b_4c4f_414e,
+            Self::Reserve => 0x4352_464b_5253_5256,
             Self::Commit => 0x4352_464b_434f_4d4d,
             Self::Abort => 0x4352_464b_4142_4f52,
         }
     }
 
     pub fn decode(word: u64) -> Option<Self> {
-        [Self::Loan, Self::Commit, Self::Abort]
+        [Self::Loan, Self::Reserve, Self::Commit, Self::Abort]
             .into_iter()
             .find(|kind| kind.word() == word)
     }
@@ -549,6 +551,30 @@ impl ForkStockSettlement {
         Self::with_child_identity(loan, completion, custody, count, 0, 0)
     }
 
+    pub fn reserve(
+        loan: ForkStockLoan,
+        completion: crate::PortalForkCompletion,
+        custody: KernelVa,
+        count: u64,
+    ) -> Option<Self> {
+        Self::with_kind(
+            ForkStockKind::Reserve,
+            loan,
+            completion,
+            custody,
+            count,
+            0,
+            0,
+        )
+    }
+
+    pub fn commit_reserved(
+        loan: ForkStockLoan,
+        completion: crate::PortalForkCompletion,
+    ) -> Option<Self> {
+        Self::new(loan, completion, KernelVa::new(0), 0)
+    }
+
     pub fn with_child_identity(
         loan: ForkStockLoan,
         completion: crate::PortalForkCompletion,
@@ -557,7 +583,28 @@ impl ForkStockSettlement {
         child_task: u64,
         child_execution: u64,
     ) -> Option<Self> {
-        if completion.request != loan.request
+        Self::with_kind(
+            ForkStockKind::Commit,
+            loan,
+            completion,
+            custody,
+            count,
+            child_task,
+            child_execution,
+        )
+    }
+
+    fn with_kind(
+        kind: ForkStockKind,
+        loan: ForkStockLoan,
+        completion: crate::PortalForkCompletion,
+        custody: KernelVa,
+        count: u64,
+        child_task: u64,
+        child_execution: u64,
+    ) -> Option<Self> {
+        if !matches!(kind, ForkStockKind::Reserve | ForkStockKind::Commit)
+            || completion.request != loan.request
             || count.checked_mul(32).is_none()
             || !custody.raw().is_multiple_of(8)
             || custody.raw().checked_add(count.checked_mul(32)?).is_none()
@@ -566,7 +613,7 @@ impl ForkStockSettlement {
         }
         let mut words = [0; 16];
         words[..8].copy_from_slice(&[
-            ForkStockKind::Commit.word(),
+            kind.word(),
             loan.id.get(),
             completion.child.incarnation().get(),
             completion.parent_generation.raw(),
@@ -578,7 +625,7 @@ impl ForkStockSettlement {
         words[10] = child_task;
         words[11] = child_execution;
         let result = Self { words };
-        result.request(loan)?;
+        result.decode_completion(kind, loan)?;
         Some(result)
     }
 
@@ -595,12 +642,27 @@ impl ForkStockSettlement {
         Self { words }
     }
 
+    pub fn reservation(
+        &self,
+        loan: ForkStockLoan,
+    ) -> Option<(crate::PortalForkCompletion, KernelVa, u64)> {
+        self.decode_completion(ForkStockKind::Reserve, loan)
+    }
+
     pub fn request(
         &self,
         loan: ForkStockLoan,
     ) -> Option<(crate::PortalForkCompletion, KernelVa, u64)> {
+        self.decode_completion(ForkStockKind::Commit, loan)
+    }
+
+    fn decode_completion(
+        &self,
+        expected: ForkStockKind,
+        loan: ForkStockLoan,
+    ) -> Option<(crate::PortalForkCompletion, KernelVa, u64)> {
         let w = self.words;
-        if ForkStockKind::decode(w[0]) != Some(ForkStockKind::Commit) || w[1] != loan.id.get() {
+        if ForkStockKind::decode(w[0]) != Some(expected) || w[1] != loan.id.get() {
             return None;
         }
         let completion = crate::PortalForkCompletion {
@@ -638,7 +700,11 @@ impl ForkStockSettlement {
     }
 
     pub fn accept(&mut self, loan: ForkStockLoan) -> bool {
-        if self.words[8] != 0 || (self.request(loan).is_none() && !self.abort_matches(loan)) {
+        if self.words[8] != 0
+            || (self.request(loan).is_none()
+                && self.reservation(loan).is_none()
+                && !self.abort_matches(loan))
+        {
             return false;
         }
         self.words[8] = 1;
@@ -660,7 +726,10 @@ impl ForkStockSettlement {
     }
 
     pub fn take(&mut self, loan: ForkStockLoan) -> Option<Result<(), ForkStockRefusal>> {
-        if self.request(loan).is_none() && !self.abort_matches(loan) {
+        if self.request(loan).is_none()
+            && self.reservation(loan).is_none()
+            && !self.abort_matches(loan)
+        {
             return None;
         }
         let result = match self.words[8] {
@@ -890,6 +959,23 @@ mod tests {
         assert!(record.accept(loan));
         assert_eq!(record.take(loan), Some(Ok(())));
         assert!(record.take(loan).is_none());
+        let mut reserve =
+            ForkStockSettlement::reserve(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 1)
+                .unwrap();
+        assert!(reserve.reservation(foreign).is_none());
+        assert!(reserve.request(loan).is_none());
+        assert!(reserve.reservation(loan).is_some());
+        assert!(reserve.accept(loan));
+        assert_eq!(reserve.take(loan), Some(Ok(())));
+        assert!(reserve.take(loan).is_none());
+        let mut commit_reserved = ForkStockSettlement::commit_reserved(loan, completion).unwrap();
+        assert!(commit_reserved.reservation(loan).is_none());
+        assert_eq!(
+            commit_reserved.request(loan),
+            Some((completion, KernelVa::new(0), 0))
+        );
+        assert!(commit_reserved.accept(loan));
+        assert_eq!(commit_reserved.take(loan), Some(Ok(())));
         let mut abort = ForkStockSettlement::abort(loan);
         assert!(!abort.abort_matches(foreign));
         assert!(abort.accept(loan));
@@ -901,6 +987,10 @@ mod tests {
         assert_eq!(
             ForkStockKind::decode(ForkStockKind::Loan.word()),
             Some(ForkStockKind::Loan)
+        );
+        assert_eq!(
+            ForkStockKind::decode(ForkStockKind::Reserve.word()),
+            Some(ForkStockKind::Reserve)
         );
         assert!(ForkStockKind::decode(0).is_none());
         let mut exchange = ForkStockExchange::new(request()).unwrap();
