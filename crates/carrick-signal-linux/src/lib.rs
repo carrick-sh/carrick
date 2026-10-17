@@ -485,6 +485,16 @@ pub fn thread_pending_has(tid: i32) -> bool {
         .is_some_and(|&mask| mask != 0)
 }
 
+fn effective_wait_block_mask(tid: i32, block_mask: SigBlockMask) -> SigBlockMask {
+    let effective = carrick_signal_core::wait::wait_effective_block_mask(
+        carrick_signal_core::policy::SigBlockMask::blocking_all_of(SignalSet::from_bits(
+            block_mask.raw(),
+        )),
+        carrick_signal_core::wait::non_interrupting_for(tid),
+    );
+    SigBlockMask::blocking_all_of(SigSet::from_raw(effective.signals().bits()))
+}
+
 /// True iff a thread-directed signal for `tid` is pending AND deliverable given
 /// `block_mask`. A blocked signal does not count, except SIGKILL/SIGSTOP which
 /// can never be blocked.
@@ -493,6 +503,7 @@ pub fn thread_pending_deliverable(tid: i32, block_mask: SigBlockMask) -> bool {
     if THREAD_PENDING_TID_HINT.load(Ordering::SeqCst) & tid_hint_bit(tid) == 0 {
         return false;
     }
+    let block_mask = effective_wait_block_mask(tid, block_mask);
     let mut guard = lock_thread_pending();
     guard
         .as_mut()
@@ -513,6 +524,7 @@ pub fn has_pending_for(tid: i32) -> bool {
 /// Pure eligibility query. A signal blocked by `block_mask` does not count;
 /// querying does not reserve a process-directed signal for this thread.
 pub fn has_unblocked_pending_for(tid: i32, block_mask: SigBlockMask) -> bool {
+    let block_mask = effective_wait_block_mask(tid, block_mask);
     if thread_pending_deliverable(tid, block_mask) {
         return true;
     }
@@ -523,6 +535,7 @@ pub fn has_unblocked_pending_for(tid: i32, block_mask: SigBlockMask) -> bool {
 /// Commit one interrupted waiter to a process-directed signal. Other
 /// waiters keep their continuation until this owner consumes or retires.
 pub fn claim_unblocked_pending_for(tid: i32, block_mask: SigBlockMask) -> bool {
+    let block_mask = effective_wait_block_mask(tid, block_mask);
     if thread_pending_deliverable(tid, block_mask) {
         return true;
     }
@@ -617,6 +630,7 @@ fn clear_proc_pending_guarded(origins: &mut MutexGuard<'_, ProcessOrigins>) {
 /// exits so a recycled tid never inherits a stale signal). A forked child also
 /// clears the whole table via [`clear_thread_pending`].
 pub fn forget_thread(tid: i32) {
+    carrick_signal_core::wait::clear_non_interrupting_for(tid);
     {
         let _custody = lock_process_custody();
         let _ = PROC_WAKE_OWNER.compare_exchange(tid, 0, Ordering::SeqCst, Ordering::SeqCst);
@@ -638,6 +652,7 @@ pub fn forget_thread(tid: i32) {
 /// Clear the entire thread-directed pending table (fork reinit: the child is
 /// single-threaded, so inherited sibling-directed entries are stale).
 pub fn clear_thread_pending() {
+    carrick_signal_core::wait::clear_all_non_interrupting();
     let mut guard = lock_thread_pending();
     if let Some(map) = guard.as_mut() {
         map.clear();

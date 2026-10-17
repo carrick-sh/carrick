@@ -779,8 +779,8 @@ fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
         );
         assert_eq!(carrick_signal_linux::take_pending_for(tid), 0);
         if eligible {
-            // A defensive empty checkpoint cannot invent a handler or rewind
-            // a completed forwarded return after the only event is consumed.
+            // An interrupted restart-class checkpoint with no handler to run
+            // must transparently rewind its SVC instead of returning EINTR.
             let mut second = carrick_el1_abi::TrapFrame::default();
             second.esr = 0xfffe;
             second.elr = 0x500004;
@@ -789,20 +789,14 @@ fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
             second.x[8] = nr;
             let (drained, route) = fixture.drain_and_deliver(&queue, &mut second);
             assert_eq!((drained, route), (0, None));
-            assert_eq!(
-                (second.elr, second.x[0]),
-                (
-                    0x500004,
-                    carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64
-                )
-            );
+            assert_eq!((second.elr, second.x[0]), (0x500000, 0x4321));
             assert!(take_signal_copies().is_empty());
         }
     }
 }
 
 #[test]
-fn serial_host_empty_native_checkpoint_returns_one_forwarded_eintr() {
+fn serial_host_empty_native_checkpoint_restarts_forwarded_read() {
     use carrick_core_abi::{
         EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
     };
@@ -828,13 +822,330 @@ fn serial_host_empty_native_checkpoint_returns_one_forwarded_eintr() {
     let (drained, route) = fixture.drain_and_deliver(&queue, &mut frame);
     assert_eq!((drained, route), (0, None));
     assert_eq!(
-        frame.elr, 0x400004,
-        "no signal may rewind the ordinary call"
+        frame.elr, 0x400000,
+        "an empty 0xfffe checkpoint must transparently restart the read"
+    );
+    assert_eq!(frame.x[0], 0x1234);
+}
+
+#[test]
+fn serial_host_native_owned_write_park_ignores_caught_sigalrm_until_sigkill() {
+    use carrick_core_abi::{
+        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
+    };
+    use carrick_el1_linux::native_process_runtime::host_test_support::NativeSignalFixture;
+
+    let (_kernel, context) = bootstrap(153_831);
+    let generation = publish(&context, 0x741);
+    let control = context.thread().control_slot();
+    let binding = ExecutionBinding {
+        task: EntryTaskKey::from_raw(context.thread().key().tid.raw() as u64),
+        generation: SnapshotGeneration::from_raw(context.task().key().serial.raw()),
+        mm: EntryMmKey::from_raw(context.shared().mm().id().raw()),
+        thread_generation: EntryThreadGeneration::from_raw(context.thread().key().serial.raw()),
+    };
+    let fixture = NativeSignalFixture::new(
+        binding,
+        EntryTaskKey::from_raw(context.task().key().id.raw() as u64),
+    );
+    control.bind_zone_record(fixture.record());
+    let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
+    custody.commit_registration();
+    custody.commit_native_signal_owner();
+    fixture.install_handler(14, false);
+    let wait = carrick_kernel::kernel::continuation::ZoneWait::new(fixture.record(), 1);
+    let write = BlockedContinuation::from_killable_owner_zone_park(
+        ContinuationCapture::new(
+            &context,
+            generation,
+            SyscallRequest::new(64, SyscallArgs([1, 0x1000, 16, 0, 0, 0])),
+            RestartClass::Never,
+        )
+        .unwrap(),
+        wait,
+    );
+    let tid = context.thread().key().tid.raw();
+    carrick_signal_linux::publish_process_timer_signal(14, None);
+    let probe = SignalReadinessProbe::from_continuation(&write);
+    assert_eq!(
+        probe.event(),
+        None,
+        "SIGALRM with a handler must not wake a parked owned write"
+    );
+    assert!(
+        carrick_signal_linux::claim_unblocked_pending_for(tid + 1, carrick_abi::SigBlockMask::NONE,),
+        "owned write park must not consume PROC_WAKE_OWNER for SIGALRM"
     );
     assert_eq!(
-        frame.x[0],
-        carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64
+        carrick_signal_linux::take_pending_event_for(tid + 1)
+            .unwrap()
+            .signum,
+        14
     );
+    carrick_signal_linux::publish_process_signal(carrick_abi::LINUX_SIGKILL);
+    assert_eq!(
+        probe.event(),
+        Some(ContinuationEvent::Signal),
+        "SIGKILL must wake a parked owned write"
+    );
+    assert_eq!(
+        carrick_signal_linux::take_pending_event_for(tid)
+            .unwrap()
+            .signum,
+        carrick_abi::LINUX_SIGKILL
+    );
+}
+
+#[test]
+fn serial_host_ignored_sigint_does_not_interrupt_forwarded_read() {
+    use carrick_core_abi::{
+        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
+    };
+    use carrick_el1_linux::native_process_runtime::host_test_support::NativeSignalFixture;
+
+    let (_kernel, context) = bootstrap(153_832);
+    let generation = publish(&context, 0x742);
+    let control = context.thread().control_slot();
+    let binding = ExecutionBinding {
+        task: EntryTaskKey::from_raw(context.thread().key().tid.raw() as u64),
+        generation: SnapshotGeneration::from_raw(context.task().key().serial.raw()),
+        mm: EntryMmKey::from_raw(context.shared().mm().id().raw()),
+        thread_generation: EntryThreadGeneration::from_raw(context.thread().key().serial.raw()),
+    };
+    let fixture = NativeSignalFixture::new(
+        binding,
+        EntryTaskKey::from_raw(context.task().key().id.raw() as u64),
+    );
+    control.bind_zone_record(fixture.record());
+    let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
+    custody.commit_registration();
+    custody.commit_native_signal_owner();
+    fixture.ignore_signal(2);
+    let continuation = BlockedContinuation::from_dispatch_outcome(
+        DispatchOutcome::WaitOnFds {
+            fds: WaitFds::empty(),
+            timeout: None,
+            sig_mask: WaitSigMask::NONE,
+            completion: FdWaitCompletion::Fd { on_timeout: 0 },
+        },
+        ContinuationCapture::new(
+            &context,
+            generation,
+            SyscallRequest::new(63, SyscallArgs([0x1234, 0, 0, 0, 0, 0])),
+            RestartClass::RestartSyscall,
+        )
+        .unwrap(),
+    )
+    .expect("forwarded read continuation");
+    let tid = context.thread().key().tid.raw();
+    carrick_signal_linux::publish_process_signal(2);
+    assert_eq!(
+        SignalReadinessProbe::from_continuation(&continuation).event(),
+        None,
+        "a background job with SIGINT ignored must not wake with EINTR on Ctrl-C"
+    );
+    assert_eq!(carrick_signal_linux::take_pending_for(tid), 2);
+}
+
+#[test]
+fn serial_host_sibling_stealing_process_sigint_restarts_blocked_read() {
+    use carrick_core_abi::{
+        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
+    };
+    use carrick_el1_linux::native_process_runtime::host_test_support::{
+        NativeSignalFixture, take_signal_copies,
+    };
+
+    let (_kernel, context) = bootstrap(153_833);
+    let generation = publish(&context, 0x743);
+    let control = context.thread().control_slot();
+    let binding = ExecutionBinding {
+        task: EntryTaskKey::from_raw(context.thread().key().tid.raw() as u64),
+        generation: SnapshotGeneration::from_raw(context.task().key().serial.raw()),
+        mm: EntryMmKey::from_raw(context.shared().mm().id().raw()),
+        thread_generation: EntryThreadGeneration::from_raw(context.thread().key().serial.raw()),
+    };
+    let fixture = NativeSignalFixture::new(
+        binding,
+        EntryTaskKey::from_raw(context.task().key().id.raw() as u64),
+    );
+    control.bind_zone_record(fixture.record());
+    let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
+    custody.commit_registration();
+    custody.commit_native_signal_owner();
+    fixture.install_sigint_handler(true);
+    let continuation = BlockedContinuation::from_dispatch_outcome(
+        DispatchOutcome::WaitOnFds {
+            fds: WaitFds::empty(),
+            timeout: None,
+            sig_mask: WaitSigMask::NONE,
+            completion: FdWaitCompletion::Fd { on_timeout: 0 },
+        },
+        ContinuationCapture::new(
+            &context,
+            generation,
+            SyscallRequest::new(63, SyscallArgs([0x1234, 0, 0, 0, 0, 0])),
+            RestartClass::RestartSyscall,
+        )
+        .unwrap(),
+    )
+    .expect("forwarded read continuation");
+    carrick_signal_linux::publish_process_signal(2);
+    let event = SignalReadinessProbe::from_continuation(&continuation)
+        .event()
+        .expect("caught SIGINT wakes forwarded read");
+    let interrupted = continuation.resume(event, &context).unwrap();
+    assert!(matches!(
+        interrupted.completion,
+        ContinuationCompletion::Errno(carrick_syscall_abi::LINUX_EINTR)
+    ));
+    let queue = carrick_el1_abi::SharedSignalIngressQueue::new();
+    let mut producer = super::super::signal_ingress_producer::HostSignalIngressProducer::new();
+    let target = super::super::signal_ingress_producer::HostIngressTarget::from_context(&context);
+    assert_eq!(
+        producer
+            .publish(&queue, target, carrick_signal_linux::take_pending_event_for)
+            .unwrap(),
+        super::super::signal_ingress_producer::HostIngressStep::Published
+    );
+    // A running sibling hits an IRQ checkpoint after ingress drains; it must not
+    // cause the blocked thread's 0xfffe checkpoint to return EINTR with no handler.
+    let (drained, _stolen) = fixture.drain_and_steal_on_sibling(&queue);
+    assert_eq!(drained, 1);
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.esr = 0xfffe;
+    frame.elr = 0x400004;
+    frame.far = 0x1234;
+    frame.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
+    frame.x[8] = 63;
+    let (_, route) = fixture.drain_and_deliver(&queue, &mut frame);
+    assert_eq!(route, None);
+    assert_ne!(
+        frame.x[0],
+        carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64,
+        "blocked read must never return EINTR when a sibling raced the checkpoint"
+    );
+    let _ = take_signal_copies();
+
+    // Even when a process-scope signal in the process pending set is taken by a
+    // sibling before the blocked thread's 0xfffe checkpoint runs, the blocked
+    // read must transparently restart.
+    assert!(fixture.enqueue_process_signal_and_steal_on_sibling(2));
+    let mut stolen_frame = carrick_el1_abi::TrapFrame::default();
+    stolen_frame.esr = 0xfffe;
+    stolen_frame.elr = 0x400004;
+    stolen_frame.far = 0x1234;
+    stolen_frame.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
+    stolen_frame.x[8] = 63;
+    let (drained, route) = fixture.drain_and_deliver(&queue, &mut stolen_frame);
+    assert_eq!((drained, route), (0, None));
+    assert_eq!(
+        (stolen_frame.elr, stolen_frame.x[0]),
+        (0x400000, 0x1234),
+        "sibling steal must transparently restart the blocked read"
+    );
+    assert!(take_signal_copies().is_empty());
+}
+
+#[test]
+fn serial_host_pselect_stolen_signal_restores_mask_before_guest_sigprocmask() {
+    use carrick_core_abi::{
+        EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding, SnapshotGeneration,
+    };
+    use carrick_el1_linux::native_process_runtime::host_test_support::{
+        NativeSignalFixture, take_signal_copies,
+    };
+    use carrick_guest_mem::GuestMemory;
+    use carrick_personality_linux::abi::thread::BlockedMask;
+
+    let (_kernel, context) = bootstrap(153_834);
+    let control = context.thread().control_slot();
+    control.init_blocked(BlockedMask(2)); // persistent SIGINT block
+    context.signal_authority().set_blocked(SigSet::from_raw(2));
+    let binding = ExecutionBinding {
+        task: EntryTaskKey::from_raw(context.thread().key().tid.raw() as u64),
+        generation: SnapshotGeneration::from_raw(context.task().key().serial.raw()),
+        mm: EntryMmKey::from_raw(context.shared().mm().id().raw()),
+        thread_generation: EntryThreadGeneration::from_raw(context.thread().key().serial.raw()),
+    };
+    let fixture = NativeSignalFixture::new(
+        binding,
+        EntryTaskKey::from_raw(context.task().key().id.raw() as u64),
+    );
+    fixture.install_sigint_handler(false);
+    fixture.control_slot().init_blocked(BlockedMask(2));
+    control.bind_zone_record(fixture.record());
+    let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
+    custody.commit_registration();
+    custody.commit_native_signal_owner();
+    let mut memory = carrick_kernel::dispatch::LinearMemory::new(0x10000, vec![0; 0x1000]);
+    memory.write_bytes(0x10100, &0u64.to_ne_bytes()).unwrap();
+    let request = SyscallRequest::new(73, SyscallArgs::from([0, 0, 0, 0x10100, 8, 0]));
+    let outcome = carrick_kernel::dispatch::SyscallDispatcher::new()
+        .dispatch(
+            &context,
+            request,
+            &mut memory,
+            &crate::compat::CompatReporter::default(),
+        )
+        .unwrap();
+    let continuation = BlockedContinuation::from_dispatch_outcome(
+        outcome,
+        ContinuationCapture::new(
+            &context,
+            publish(&context, 0x744),
+            request,
+            RestartClass::Never,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let masks = continuation.signal_masks();
+    carrick_signal_linux::publish_process_signal(2);
+    let event = SignalReadinessProbe::from_continuation(&continuation)
+        .event()
+        .expect("temporary pselect/ppoll mask admits SIGINT");
+    let completed = continuation.resume(event, &context).unwrap();
+    assert!(matches!(
+        completed.completion,
+        ContinuationCompletion::Errno(carrick_syscall_abi::LINUX_EINTR)
+    ));
+    let _ = carrick_signal_linux::take_pending_event_for(context.thread().key().tid.raw());
+    super::super::arm_native_forwarded_wait_mask(fixture.control_slot(), masks);
+    assert!(fixture.control_slot().forwarded_wait_mask_armed());
+    // The signal was stolen by a sibling before the checkpoint ran. The
+    // registry's locked predicate must still demand a checkpoint so the
+    // temporary mask does not outlive pselect/ppoll return.
+    assert!(
+        fixture.registry_signal_checkpoint_needed(),
+        "armed forwarded wait mask must require a native return checkpoint"
+    );
+    let queue = carrick_el1_abi::SharedSignalIngressQueue::new();
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.esr = 0xfffd;
+    frame.elr = 0x400004;
+    frame.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
+    frame.x[8] = 73;
+    let (drained, route) = fixture.drain_and_deliver(&queue, &mut frame);
+    assert_eq!((drained, route), (0, None));
+    assert!(!fixture.control_slot().forwarded_wait_mask_armed());
+    assert_eq!(fixture.control_slot().blocked(), BlockedMask(2));
+
+    // Guest subsequently calls sigprocmask(SIG_SETMASK, X); X must stick across
+    // later signal checkpoints instead of being overwritten by the stale mask.
+    let new_mask = BlockedMask(1 << (10 - 1));
+    fixture.set_blocked_mask(new_mask);
+    assert_eq!(fixture.control_slot().blocked(), new_mask);
+    let mut later = carrick_el1_abi::TrapFrame::default();
+    later.esr = 0xfffd;
+    later.elr = 0x400008;
+    let _ = fixture.drain_and_deliver(&queue, &mut later);
+    assert_eq!(
+        fixture.control_slot().blocked(),
+        new_mask,
+        "guest sigprocmask(SIG_SETMASK, X) after pselect must stick"
+    );
+    assert!(take_signal_copies().is_empty());
 }
 
 #[test]
