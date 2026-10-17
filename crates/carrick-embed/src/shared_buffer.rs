@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use carrick_guest_mem::{HostVa, SharedFutexLocation};
-use carrick_kernel::kernel::container::{Container, ContainerId, RunId};
+use carrick_kernel::kernel::container::{ContainerId, RunId};
 
 /// Errors encountered during [`SharedBuffer`] or [`SharedBufferLease`] operations.
 #[derive(Debug, thiserror::Error)]
@@ -57,9 +57,13 @@ pub enum SharedBufferError {
 /// a time; preparing a new container with the same buffer advances its binding
 /// generation and invalidates leases minted for earlier bindings.
 ///
-/// Clones share the same mapping, so the public API exposes only atomic copy
-/// and word operations (`read_into`, `write_from`, [`SharedAtomicU32`]) and has
-/// no safe slice accessors (`as_slice`/`as_mut_slice` are absent):
+/// Byte-range copies ([`Self::read_into`], [`Self::write_from`]) use `Relaxed`
+/// 32-bit atomic word operations, so callers must publish and observe payload
+/// updates through [`SharedAtomicU32`] `Release`/`Acquire` operations (or futex
+/// synchronization).
+///
+/// Removal note: `as_slice`, `as_mut_slice`, and `AsRef<[u8]>` are intentionally
+/// absent because clones share the same `MAP_SHARED` mapping:
 /// ```compile_fail
 /// use carrick_embed::SharedBuffer;
 /// let buf = SharedBuffer::new(4096).unwrap();
@@ -223,14 +227,24 @@ impl SharedBuffer {
         self.inner.file.as_raw_fd()
     }
 
-    /// Copy bytes from shared memory using 32-bit atomic loads.
+    /// Copy bytes from shared memory using `Relaxed` 32-bit atomic loads.
+    ///
+    /// Callers must synchronize with concurrent writers via [`SharedAtomicU32`]
+    /// `Release`/`Acquire` operations or futex waits.
     pub fn read_into(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SharedBufferError> {
         self.inner.read_into(offset, buf)
     }
 
-    /// Copy bytes into shared memory using 32-bit atomic writes.
+    /// Copy bytes into shared memory using `Relaxed` 32-bit atomic writes.
+    ///
+    /// Callers must publish written bytes to concurrent readers via
+    /// [`SharedAtomicU32`] `Release`/`Acquire` operations or futex wakes.
     pub fn write_from(&self, offset: usize, data: &[u8]) -> Result<usize, SharedBufferError> {
         self.inner.write_from(offset, data)
+    }
+
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 
     pub(crate) fn bind_generation(&self) -> u64 {
@@ -252,24 +266,6 @@ impl SharedBuffer {
             container_id,
             generation,
             retired: Arc::new(AtomicBool::new(false)),
-            current_generation: Arc::clone(&self.inner.generation),
-        }
-    }
-
-    /// Mint a lease bound to a live [`Container`] kernel object and the buffer's current binding generation.
-    pub fn lease_for_container(
-        &self,
-        container: &Arc<Container>,
-        shared_futex: carrick_thread::platform_futex::SharedFutexTable,
-    ) -> SharedBufferLease {
-        let generation = self.inner.current_generation();
-        SharedBufferLease {
-            inner: Arc::clone(&self.inner),
-            shared_futex,
-            run_id: container.run_id().clone(),
-            container_id: container.id(),
-            generation,
-            retired: container.retirement_token(),
             current_generation: Arc::clone(&self.inner.generation),
         }
     }
@@ -402,13 +398,19 @@ impl SharedBufferLease {
         Ok(())
     }
 
-    /// Read bytes into `buf` with 32-bit atomic loads.
+    /// Read bytes into `buf` with `Relaxed` 32-bit atomic loads.
+    ///
+    /// Callers must synchronize with concurrent writers via [`SharedAtomicU32`]
+    /// `Release`/`Acquire` operations or futex waits.
     pub fn read_into(&self, offset: usize, buf: &mut [u8]) -> Result<usize, SharedBufferError> {
         self.validate_access()?;
         self.inner.read_into(offset, buf)
     }
 
-    /// Write bytes from `data` with 32-bit atomic writes.
+    /// Write bytes from `data` with `Relaxed` 32-bit atomic writes.
+    ///
+    /// Callers must publish written bytes to concurrent readers via
+    /// [`SharedAtomicU32`] `Release`/`Acquire` operations or futex wakes.
     pub fn write_from(&self, offset: usize, data: &[u8]) -> Result<usize, SharedBufferError> {
         self.validate_access()?;
         self.inner.write_from(offset, data)
