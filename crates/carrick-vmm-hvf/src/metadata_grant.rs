@@ -982,16 +982,18 @@ pub(crate) fn service_metadata_operation(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn report_stock_refusal(
-    exchange: &ForkStockExchange,
+    request: Option<(
+        carrick_core_abi::ExecutionBinding,
+        carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
+    )>,
     execution: Option<crate::fork_stock::GrantExecution>,
     reason: &str,
 ) {
-    let request = exchange.request();
     carrick_observability::probes::el1_native_fork_stock_refusal(
         reason,
-        &format!("{:?}", request.map(|r| r.binding)),
+        &format!("{:?}", request.map(|r| r.0)),
         &format!("{:?}", execution.map(|e| e.binding)),
-        &format!("{:?}", request.map(|r| r.context)),
+        &format!("{:?}", request.map(|r| r.1)),
         &format!("{:?}", execution.map(|e| e.context)),
     );
 }
@@ -1323,7 +1325,11 @@ pub(crate) fn service_native_fork_stock(
             // SAFETY: the synchronous crossing exclusively retains this complete wire record.
             let exchange = unsafe { &mut *pointer };
             let Some(execution) = execution else {
-                report_stock_refusal(exchange, None, "NoLiveExecution");
+                report_stock_refusal(
+                    exchange.request().map(|r| (r.binding, r.context)),
+                    None,
+                    "NoLiveExecution",
+                );
                 exchange.refuse(ForkStockRefusal::Stale);
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             };
@@ -1389,7 +1395,11 @@ pub(crate) fn service_native_fork_stock(
                 lifecycle_window(custody, life).is_some_and(|window| window.is_zero(life))
             });
             if let Err(refusal) = result {
-                report_stock_refusal(exchange, Some(execution), &format!("{refusal:?}"));
+                report_stock_refusal(
+                    exchange.request().map(|r| (r.binding, r.context)),
+                    Some(execution),
+                    &format!("{refusal:?}"),
+                );
             }
             result.is_ok()
         }
@@ -1400,40 +1410,44 @@ pub(crate) fn service_native_fork_stock(
             // SAFETY: the same full stack-record custody as the loan.
             let settlement = unsafe { &mut *pointer };
             let Some(execution) = execution else {
+                if kind == Some(ForkStockKind::Reserve) {
+                    report_stock_refusal(None, None, "Reserve: NoLiveExecution");
+                }
                 settlement.refuse(ForkStockRefusal::Stale);
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             };
             let mut stock = custody.fork_stock.lock();
             if kind == Some(ForkStockKind::Reserve) {
                 let inventory = stock.inventory();
-                stock
-                    .owner
-                    .reserve_custody(
-                        execution,
-                        settlement,
-                        |pages| {
-                            pages.iter().all(|page| {
-                                ForkStockHostCustody::physical_ptr::<[u8; 4096]>(
-                                    custody,
-                                    page.address(),
-                                )
-                                .is_ok()
-                            })
-                        },
-                        |pages| ForkStockHostCustody::tables_clean(custody, pages),
-                        |request, address, count| {
-                            retain_fork_custody_rows(
+                let result = stock.owner.reserve_custody(
+                    execution,
+                    settlement,
+                    |pages| {
+                        pages.iter().all(|page| {
+                            ForkStockHostCustody::physical_ptr::<[u8; 4096]>(
                                 custody,
-                                inventory,
-                                region,
-                                execution.context,
-                                request,
-                                address,
-                                count,
+                                page.address(),
                             )
-                        },
-                    )
-                    .is_ok()
+                            .is_ok()
+                        })
+                    },
+                    |pages| ForkStockHostCustody::tables_clean(custody, pages),
+                    |request, address, count| {
+                        retain_fork_custody_rows(
+                            custody,
+                            inventory,
+                            region,
+                            execution.context,
+                            request,
+                            address,
+                            count,
+                        )
+                    },
+                );
+                if let Err(refusal) = &result {
+                    report_stock_refusal(None, Some(execution), &format!("Reserve: {refusal:?}"));
+                }
+                result.is_ok()
             } else {
                 let mut ledger = custody.el1_frame_grants.lock();
                 match stock.owner.settle(

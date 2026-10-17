@@ -502,17 +502,11 @@ impl AdmittedCustodyToken {
             Some(Ok(())) => {
                 crossed?;
             }
-            Some(Err(carrick_el1_abi::ForkStockRefusal::Capacity)) => {
-                return Err(NativeProcessError::Exhausted);
-            }
-            Some(Err(carrick_el1_abi::ForkStockRefusal::Stale)) => {
-                return Err(NativeProcessError::Stale);
-            }
-            Some(Err(carrick_el1_abi::ForkStockRefusal::Inventory)) => {
-                return Err(NativeProcessError::Busy);
-            }
-            Some(Err(carrick_el1_abi::ForkStockRefusal::Invalid)) => {
-                return Err(NativeProcessError::Invalid);
+            Some(Err(reply)) => {
+                return Err(refused(
+                    NativeForkStage::Reserve,
+                    super::native_fork_refusal::NativeForkCause::StockReservation(reply),
+                ));
             }
             None => {
                 crossed?;
@@ -736,9 +730,8 @@ impl ForkStockCrossing for HvcForkStockCrossing {
                 // SAFETY: the synchronous crossing retains its owned,
                 // aligned loan or settlement record on this EL1 stack.
                 let tag = unsafe { *(record_gpa as *const u64) };
-                let reply = if carrick_el1_abi::ForkStockKind::decode(tag)
-                    == Some(carrick_el1_abi::ForkStockKind::Loan)
-                {
+                let kind = carrick_el1_abi::ForkStockKind::decode(tag);
+                let reply = if kind == Some(carrick_el1_abi::ForkStockKind::Loan) {
                     // Only consume an already refused reply. A malformed
                     // transport status must not consume a successful loan.
                     let exchange = unsafe { &mut *(record_gpa as *mut ForkStockExchange) };
@@ -754,7 +747,11 @@ impl ForkStockCrossing for HvcForkStockCrossing {
                     None
                 };
                 refused(
-                    NativeForkStage::StockCrossing,
+                    if kind == Some(carrick_el1_abi::ForkStockKind::Reserve) {
+                        NativeForkStage::Reserve
+                    } else {
+                        NativeForkStage::StockCrossing
+                    },
                     super::native_fork_refusal::NativeForkCause::StockCrossing { status, reply },
                 )
             })
