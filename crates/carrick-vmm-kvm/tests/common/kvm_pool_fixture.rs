@@ -3,7 +3,7 @@ use carrick_vmm_kvm::cpl0_boot::{Cpl0Carrier, InitialReservationLimits, InitialT
 
 #[path = "physical_inventory.rs"]
 mod physical_inventory;
-use physical_inventory::physical_inventory;
+pub(crate) use physical_inventory::physical_inventory;
 
 pub fn run_pool_fixture(
     elf: &[u8],

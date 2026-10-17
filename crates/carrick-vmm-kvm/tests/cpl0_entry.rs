@@ -8,10 +8,6 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::needless_range_loop)]
 
-#[path = "common/physical_inventory.rs"]
-mod physical_inventory;
-use physical_inventory::physical_inventory;
-
 use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
 use carrick_mmu_core::x86::descriptor_txn::Access;
 use carrick_sched_core::{ParkedContextWords, SlotId, ThreadIdentity, ZoneTables};
@@ -28,7 +24,7 @@ use carrick_x86::cpl0_scheduler::{
     ContextBinding, InterruptFrame, NativeContext, XsaveArea, admit_context, park_native_context,
     restore_native_context,
 };
-use kvm_pool_fixture::run_pool_fixture;
+use kvm_pool_fixture::{physical_inventory, run_pool_fixture};
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 
