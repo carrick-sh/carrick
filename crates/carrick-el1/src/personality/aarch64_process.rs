@@ -453,6 +453,7 @@ pub(super) unsafe fn observed_entry_address(
 }
 
 pub struct AdmittedCustodyToken {
+    loan: ForkStockLoan,
     commit: ForkStockSettlement,
     index: carrick_sched_core::SpaceIndex,
 }
@@ -515,7 +516,11 @@ impl AdmittedCustodyToken {
         }
         let commit = ForkStockSettlement::commit_reserved(loan, completion)
             .ok_or(NativeProcessError::Stale)?;
-        boxed.push(Self { commit, index });
+        boxed.push(Self {
+            loan,
+            commit,
+            index,
+        });
         let raw = Box::into_raw(boxed.into_boxed_slice()).cast::<Self>();
         // SAFETY: `boxed` had length and capacity 1, so `raw` is a valid Box<Self> allocation.
         Ok(unsafe { Box::from_raw(raw) })
@@ -527,10 +532,14 @@ impl AdmittedCustodyToken {
         crossing: &X,
         slot: SlotId,
         zone: &ZoneTables<Aarch64ParkedContext>,
-    ) {
-        let _ =
+    ) -> Result<(), Box<Self>> {
+        let crossed =
             crossing.cross_fork_stock(&raw mut self.commit as *mut _ as u64, u64::from(slot.raw()));
+        if crossed.is_err() || !matches!(self.commit.take(self.loan), Some(Ok(()))) {
+            return Err(self);
+        }
         carrick_core::wait::space_access(zone, slot, release).open(self.index);
+        Ok(())
     }
 }
 
@@ -1256,7 +1265,9 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     }
 
     fn settle_mm(&mut self, born: Self::Born) -> Result<(), (NativeProcessError, Self::Born)> {
-        born.admitted.consume(&self.crossing, self.slot, self.zone);
+        if let Err(admitted) = born.admitted.consume(&self.crossing, self.slot, self.zone) {
+            return Err((NativeProcessError::Quarantined, Born { admitted }));
+        }
         Ok(())
     }
 
@@ -1306,7 +1317,9 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
 
     fn quarantine_born(&mut self, born: Self::Born) {
         core::mem::forget(born);
-        fatal();
+        super::dispatch::invalid_completion(super::dispatch::NativeInvariant::PhysicalCustody(
+            "admitted fork custody commit refused",
+        ));
     }
 
     fn retire_mm(&mut self, mm: Self::Mm) {
