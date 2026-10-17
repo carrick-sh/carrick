@@ -1696,13 +1696,24 @@ pub(in crate::dispatch) fn read_linux_sockaddr(
     memory: &impl CurrentMmMemory,
     addr: u64,
     addrlen: u32,
-    _family_hint: i32,
+    family_hint: i32,
 ) -> Result<Vec<u8>, LinuxErrno> {
     if addr == 0 || addrlen < 2 {
         return Err(LINUX_EINVAL);
     }
     let len = addrlen as usize;
     let bytes = memory.read_bytes(addr, len).map_err(|_| LINUX_EFAULT)?;
+    read_linux_sockaddr_from_bytes(&bytes, family_hint)
+}
+
+pub(in crate::dispatch) fn read_linux_sockaddr_from_bytes(
+    bytes: &[u8],
+    _family_hint: i32,
+) -> Result<Vec<u8>, LinuxErrno> {
+    let len = bytes.len();
+    if len < 2 {
+        return Err(LINUX_EINVAL);
+    }
     let family = u16::from_ne_bytes([bytes[0], bytes[1]]) as i32;
     match family {
         LINUX_AF_INET => {

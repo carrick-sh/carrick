@@ -2654,6 +2654,274 @@ mod overlay_dispatch_tests {
         assert_eq!(staged_write_state(&epoll, writer).0 & LINUX_EPOLLOUT, 0);
     }
 
+    #[test]
+    fn resumed_copyin_write_completes_epollet_socket_rearm_across_fd_reuse_and_host_wait() {
+        use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+        use carrick_guest_mem::{
+            CurrentMmMemory, GuestMemory, MemoryError, MemoryReadSuspension, MemoryReadWait,
+            OwnedReadContinuation,
+        };
+        use std::num::NonZeroU64;
+
+        #[derive(Debug, Default)]
+        struct NoopKick(parking_lot::Mutex<Option<crate::kernel::ExecutorBinding>>);
+        impl crate::kernel::ExecutorKick for NoopKick {
+            fn try_bind(&self, binding: crate::kernel::ExecutorBinding) -> bool {
+                let mut current = self.0.lock();
+                if current.is_some() {
+                    return false;
+                }
+                *current = Some(binding);
+                true
+            }
+            fn unbind(&self, binding: crate::kernel::ExecutorBinding) {
+                let mut current = self.0.lock();
+                if *current == Some(binding) {
+                    *current = None;
+                }
+            }
+            fn rebind_exact_with(
+                &self,
+                old: crate::kernel::ExecutorBinding,
+                new: crate::kernel::ExecutorBinding,
+                publish: &mut dyn FnMut() -> bool,
+            ) -> bool {
+                let mut current = self.0.lock();
+                if *current != Some(old) || !publish() {
+                    return false;
+                }
+                *current = Some(new);
+                true
+            }
+            fn deliver_exact(&self, _token: crate::kernel::ExecutorKickToken) -> bool {
+                false
+            }
+            fn current_binding(&self) -> Option<crate::kernel::ExecutorBinding> {
+                *self.0.lock()
+            }
+        }
+
+        struct SuspendedByte(PortalOwnerWait);
+        impl GuestMemory for SuspendedByte {
+            fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+                Err(MemoryError::ReadSuspended(Box::new(MemoryReadSuspension {
+                    wait: MemoryReadWait::Owner(self.0),
+                    continuation: OwnedReadContinuation::new(Vec::<u8>::new()),
+                })))
+            }
+            fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+                unreachable!()
+            }
+            fn resume_read(&self, continuation: OwnedReadContinuation) -> Result<Vec<u8>, MemoryError> {
+                assert!(continuation.take::<Vec<u8>>().unwrap().is_empty());
+                Ok(vec![b'x'])
+            }
+        }
+        impl CurrentMmMemory for SuspendedByte {}
+
+        for has_host_wait in [true, false] {
+            let (mut h, epfd, writer, event_addr) = staged_write_fixture();
+            // Keep an extra fd to the original writer description so closing `writer`
+            // does not drop the description from epoll interest.
+            let _keep_orig = returned(h.call(23, [writer as u64, 0, 0, 0, 0, 0]));
+            let pair_addr = h.reserve(8);
+            assert_eq!(
+                returned(h.call(
+                    199,
+                    [
+                        LINUX_AF_UNIX as u64,
+                        LINUX_SOCK_STREAM as u64 | LINUX_O_NONBLOCK,
+                        0,
+                        pair_addr,
+                        0,
+                        0,
+                    ],
+                )),
+                0,
+            );
+            let pair = h.memory.read_bytes(pair_addr, 8).unwrap();
+            let repl_writer = i32::from_le_bytes(pair[..4].try_into().unwrap());
+            assert_eq!(
+                returned(h.call(
+                    21,
+                    [epfd, LINUX_EPOLL_CTL_ADD, repl_writer as u64, event_addr, 0, 0],
+                )),
+                0,
+            );
+            let epoll = h.dispatcher.open_file(epfd as i32).unwrap();
+            set_write_latch(&epoll, repl_writer);
+
+            let context = h.dispatcher.capture_one_task_context().unwrap();
+            let sibling = context
+                .kernel()
+                .clone_thread(
+                    &context,
+                    crate::kernel::ClonePlan::from_flags(
+                        carrick_abi::LinuxCloneFlags::THREAD
+                            | carrick_abi::LinuxCloneFlags::SIGHAND
+                            | carrick_abi::LinuxCloneFlags::VM
+                            | carrick_abi::LinuxCloneFlags::FILES,
+                    )
+                    .unwrap(),
+                    carrick_hal::ThreadId::synthetic_for_tests(1520),
+                    None,
+                )
+                .unwrap();
+            let mm = context.shared().mm().id();
+            context
+                .thread()
+                .publish_initial_task_state(crate::kernel::objects::MigratableTaskState {
+                    cpu: carrick_hal::threaded::GuestCpuState::from_aarch64_v1(
+                        carrick_hal::threaded::Aarch64TaskCpuStateV1 {
+                            gprs: [0; 31],
+                            pc: 0,
+                            pstate: 0,
+                            trap_pc: 0,
+                            trap_pstate: 0,
+                            sp_el0: 0,
+                            elr_el1: 0,
+                            spsr_el1: 0,
+                            ttbr0: 0,
+                            ttbr1: 0,
+                            tcr: 0,
+                            sctlr_el1: 0,
+                            mair_el1: 0,
+                            vbar_el1: 0,
+                            cpacr_el1: 0,
+                            cntkctl_el1: 0,
+                            tpidr_el1: 0,
+                            actlr_el1: 0,
+                            tpidr_el0: 0,
+                            tpidrro_el0: 0,
+                            contextidr_el1: 0,
+                            vregs: [0; 32],
+                            fpsr: 0,
+                            fpcr: 0,
+                            pending_resume_pc: None,
+                            last_syscall_nr: Some(64),
+                            last_syscall_orig_x0: 0,
+                            last_fault_esr: 0,
+                            last_exit_class: 0,
+                            is_forked_child: false,
+                            syscall_continuation: None,
+                            mm_generation: mm.raw(),
+                            asid_generation: mm.raw(),
+                        },
+                    ),
+                    mm,
+                    asid_generation: mm.raw(),
+                })
+                .unwrap();
+            let scheduler = crate::kernel::Scheduler::new_with_policy(
+                Arc::clone(context.kernel()),
+                Arc::new(carrick_hal::GuestCpuPolicy::new(1)),
+            );
+            let registration = scheduler
+                .register_executor(Arc::new(NoopKick::default()))
+                .unwrap();
+            scheduler.make_runnable(context.thread().key()).unwrap();
+            let mut running = scheduler.take(&registration).unwrap();
+            let registry: Arc<dyn carrick_hal::VcpuRegistry> =
+                Arc::new(carrick_hal::GenericVcpuRegistry::new());
+            let mut executor = h
+                .dispatcher
+                .enter_mm_executor_for_thread(
+                    Some(context.thread().clone()),
+                    registry,
+                    carrick_hal::ThreadId::synthetic_for_tests(1521),
+                    crate::kernel::execution_slot_for_current_thread(None).unwrap(),
+                )
+                .unwrap();
+            let wait = unsafe {
+                PortalOwnerWait::from_owner(
+                    El1MmHandle::from_admitted_owner(
+                        NonZeroU64::new(1).unwrap(),
+                        ReservationMm::new(context.shared().mm().id().raw()).unwrap(),
+                        NonZeroU64::new(3).unwrap(),
+                    ),
+                    PortalWaitCause::Reservations,
+                    7,
+                )
+            };
+            let mut memory = SuspendedByte(wait);
+            let request = SyscallRequest::new(
+                64,
+                SyscallArgs::from([writer as u64, MEM_BASE, 1, 0, 0, 0]),
+            );
+            let first = h
+                .dispatcher
+                .dispatch(&context, request, &mut memory, &h.reporter)
+                .unwrap();
+            let DispatchOutcome::WriteCopyInSuspended(pending) = first else {
+                panic!("copy-in must suspend (has_host_wait={has_host_wait}): {first:?}");
+            };
+            assert_eq!(
+                h.dispatcher
+                    .dispatch(
+                        &sibling,
+                        SyscallRequest::new(57, SyscallArgs::from([writer as u64, 0, 0, 0, 0, 0])),
+                        &mut memory,
+                        &h.reporter,
+                    )
+                    .unwrap(),
+                DispatchOutcome::Returned { value: 0 },
+            );
+            assert_eq!(
+                h.dispatcher
+                    .dispatch(
+                        &sibling,
+                        SyscallRequest::new(
+                            24,
+                            SyscallArgs::from([repl_writer as u64, writer as u64, 0, 0, 0, 0]),
+                        ),
+                        &mut memory,
+                        &h.reporter,
+                    )
+                    .unwrap(),
+                DispatchOutcome::Returned {
+                    value: writer as i64,
+                },
+            );
+            assert_eq!(staged_write_state(&epoll, writer).0, LINUX_EPOLLOUT);
+            assert_eq!(staged_write_state(&epoll, repl_writer).0, LINUX_EPOLLOUT);
+            let completed = h
+                .dispatcher
+                .resume_owned_write_copy_in(
+                    &context,
+                    request,
+                    pending,
+                    &mut memory,
+                    &h.reporter,
+                    None,
+                    OrdinaryDispatchRoute {
+                        host_wait: has_host_wait.then_some(HostWaitContext {
+                            scheduler: &scheduler,
+                            registration: &registration,
+                        }),
+                        lease: has_host_wait.then(|| running.lease()),
+                        mm_executor: has_host_wait.then_some(&mut executor),
+                    },
+                )
+                .unwrap();
+            assert_eq!(completed, DispatchOutcome::Returned { value: 1 });
+            assert_eq!(
+                staged_write_state(&epoll, writer).0 & LINUX_EPOLLOUT,
+                0,
+                "original socket latch must be cleared (has_host_wait={has_host_wait})"
+            );
+            assert_eq!(
+                staged_write_state(&epoll, repl_writer).0 & LINUX_EPOLLOUT,
+                LINUX_EPOLLOUT,
+                "replacement socket latch must not be cleared (has_host_wait={has_host_wait})"
+            );
+            drop(executor);
+            context
+                .thread()
+                .yield_from_executor(running.take_lease())
+                .unwrap();
+        }
+    }
+
     fn set_epoll_latch(epoll: &OpenFile, target: i32, ready: u32, read_avail: u64) {
         let mut open = crate::kernel::FileDescription::write_for_io(&epoll.description).unwrap();
         let OpenDescription::Epoll { interest, .. } = &mut *open else {

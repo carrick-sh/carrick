@@ -11913,3 +11913,1843 @@ fn write_bad_pointer_still_returns_efault() {
         DispatchOutcome::errno(LINUX_EFAULT),
     );
 }
+
+#[test]
+fn owner_copyin_wait_retains_writev_and_partial_iov_progress_across_fd_reuse() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{MemoryReadSuspension, MemoryReadWait, OwnedReadContinuation};
+    use std::cell::Cell;
+    use std::num::NonZeroU64;
+
+    const IOV_ADDR: u64 = 0x100000;
+    const BUF0_ADDR: u64 = 0x200000;
+    const BUF1_ADDR: u64 = 0x201000;
+
+    struct VectoredSuspendedRead {
+        wait: PortalOwnerWait,
+        buf0_reads: Cell<usize>,
+        buf1_starts: Cell<usize>,
+        buf1_resumes: Cell<usize>,
+    }
+    impl carrick_guest_mem::GuestMemory for VectoredSuspendedRead {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            match (address, length) {
+                (IOV_ADDR, 16) => {
+                    let mut bytes = Vec::with_capacity(16);
+                    bytes.extend_from_slice(&BUF0_ADDR.to_ne_bytes());
+                    bytes.extend_from_slice(&6_u64.to_ne_bytes());
+                    Ok(bytes)
+                }
+                (addr, 16) if addr == IOV_ADDR + 16 => {
+                    let mut bytes = Vec::with_capacity(16);
+                    bytes.extend_from_slice(&BUF1_ADDR.to_ne_bytes());
+                    bytes.extend_from_slice(&10_u64.to_ne_bytes());
+                    Ok(bytes)
+                }
+                (BUF0_ADDR, 6) => {
+                    self.buf0_reads.set(self.buf0_reads.get() + 1);
+                    Ok(b"first-".to_vec())
+                }
+                (BUF1_ADDR, 10) => {
+                    self.buf1_starts.set(self.buf1_starts.get() + 1);
+                    Err(MemoryError::ReadSuspended(Box::new(MemoryReadSuspension {
+                        wait: MemoryReadWait::Owner(self.wait),
+                        continuation: OwnedReadContinuation::new(b"sec".to_vec()),
+                    })))
+                }
+                _ => Err(MemoryError::OutOfBounds { address, length }),
+            }
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            unreachable!()
+        }
+        fn resume_read(&self, continuation: OwnedReadContinuation) -> Result<Vec<u8>, MemoryError> {
+            let mut prefix = continuation.take::<Vec<u8>>().expect("exact transfer");
+            let resumed = self.buf1_resumes.get();
+            self.buf1_resumes.set(resumed + 1);
+            if resumed == 0 {
+                assert_eq!(prefix, b"sec");
+                prefix.extend_from_slice(b"ond");
+                return Err(MemoryError::ReadSuspended(Box::new(MemoryReadSuspension {
+                    wait: MemoryReadWait::Owner(self.wait),
+                    continuation: OwnedReadContinuation::new(prefix),
+                })));
+            }
+            assert_eq!(prefix, b"second");
+            prefix.extend_from_slice(b"-510");
+            Ok(prefix)
+        }
+    }
+    impl carrick_guest_mem::CurrentMmMemory for VectoredSuspendedRead {}
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = dispatcher.capture_one_task_context().unwrap();
+    let sibling = root
+        .kernel()
+        .clone_thread(
+            &root,
+            crate::kernel::ClonePlan::from_flags(
+                carrick_abi::LinuxCloneFlags::THREAD
+                    | carrick_abi::LinuxCloneFlags::SIGHAND
+                    | carrick_abi::LinuxCloneFlags::VM
+                    | carrick_abi::LinuxCloneFlags::FILES,
+            )
+            .unwrap(),
+            carrick_hal::ThreadId::synthetic_for_tests(1510),
+            None,
+        )
+        .unwrap();
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(root.shared().mm().id().raw()).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Reservations,
+            7,
+        )
+    };
+    let mut memory = VectoredSuspendedRead {
+        wait,
+        buf0_reads: Cell::new(0),
+        buf1_starts: Cell::new(0),
+        buf1_resumes: Cell::new(0),
+    };
+    let original = Arc::new(parking_lot::RwLock::new(carrick_vfs::SparseBuffer::from(
+        Vec::new(),
+    )));
+    let replacement = Arc::new(parking_lot::RwLock::new(carrick_vfs::SparseBuffer::from(
+        Vec::new(),
+    )));
+    let make_file = |path: &str, contents: Arc<parking_lot::RwLock<carrick_vfs::SparseBuffer>>| {
+        OpenDescription::InMemoryFile {
+            base: OpenDescriptionBase::new(LINUX_O_WRONLY),
+            path: path.to_owned(),
+            contents,
+            offset: 0,
+            writable: true,
+            max_size: 100,
+        }
+    };
+    let fd = match dispatcher.install_fd(make_file("/original", Arc::clone(&original)), 0) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("install original: {other:?}"),
+    };
+    let replacement_fd =
+        match dispatcher.install_fd(make_file("/replacement", Arc::clone(&replacement)), 0) {
+            DispatchOutcome::Returned { value } => value as i32,
+            other => panic!("install replacement: {other:?}"),
+        };
+    let request = SyscallRequest::new(
+        carrick_abi::syscall::nr::WRITEV.raw(),
+        SyscallArgs::from([fd as u64, IOV_ADDR, 2, 0, 0, 0]),
+    );
+    let reporter = CompatReporter::default();
+    let first = dispatcher
+        .dispatch(&root, request, &mut memory, &reporter)
+        .unwrap();
+    let DispatchOutcome::WriteCopyInSuspended(first) = first else {
+        panic!("writev owner suspension on second iovec must suspend: {first:?}");
+    };
+    assert_eq!(first.wait(), &MemoryReadWait::Owner(wait));
+    assert_eq!(memory.buf0_reads.get(), 1);
+    assert_eq!(memory.buf1_starts.get(), 1);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &sibling,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::CLOSE.raw(),
+                    SyscallArgs::from([fd as u64, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &sibling,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::DUP3.raw(),
+                    SyscallArgs::from([replacement_fd as u64, fd as u64, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: fd as i64 },
+    );
+
+    let resume = |pending, memory: &mut VectoredSuspendedRead| {
+        dispatcher
+            .resume_owned_write_copy_in(
+                &root,
+                request,
+                pending,
+                memory,
+                &reporter,
+                None,
+                crate::dispatch::OrdinaryDispatchRoute {
+                    host_wait: None,
+                    lease: None,
+                    mm_executor: None,
+                },
+            )
+            .unwrap()
+    };
+    let second = resume(first, &mut memory);
+    let DispatchOutcome::WriteCopyInSuspended(second) = second else {
+        panic!("second owner wait on writev must retain same operation: {second:?}");
+    };
+    assert_eq!(second.wait(), &MemoryReadWait::Owner(wait));
+    let final_outcome = resume(second, &mut memory);
+    assert_eq!(final_outcome, DispatchOutcome::Returned { value: 16 });
+    assert_eq!(original.read().read_range(0, 16), b"first-second-510");
+    assert_eq!(replacement.read().len(), 0);
+    assert_eq!(
+        memory.buf0_reads.get(),
+        1,
+        "completed first iovec must not be re-read or duplicated"
+    );
+    assert_eq!(memory.buf1_starts.get(), 1);
+    assert_eq!(memory.buf1_resumes.get(), 2);
+}
+
+#[test]
+fn writev_bad_pointer_still_returns_efault() {
+    const IOV_ADDR: u64 = 0x100000;
+    struct BadIovPayload;
+    impl carrick_guest_mem::GuestMemory for BadIovPayload {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            if address == IOV_ADDR && length == 16 {
+                let mut bytes = Vec::with_capacity(16);
+                bytes.extend_from_slice(&0x200000_u64.to_ne_bytes());
+                bytes.extend_from_slice(&8_u64.to_ne_bytes());
+                return Ok(bytes);
+            }
+            Err(MemoryError::OutOfBounds { address, length })
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            unreachable!()
+        }
+    }
+    impl carrick_guest_mem::CurrentMmMemory for BadIovPayload {}
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = dispatcher.capture_one_task_context().unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &root,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::WRITEV.raw(),
+                    SyscallArgs::from([1, IOV_ADDR, 1, 0, 0, 0]),
+                ),
+                &mut BadIovPayload,
+                &CompatReporter::default(),
+            )
+            .unwrap(),
+        DispatchOutcome::errno(LINUX_EFAULT),
+    );
+}
+
+#[test]
+fn owner_copyin_wait_retains_pwritev_and_partial_iov_progress_across_fd_reuse() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{MemoryReadSuspension, MemoryReadWait, OwnedReadContinuation};
+    use std::cell::Cell;
+    use std::num::NonZeroU64;
+
+    const IOV_ADDR: u64 = 0x100000;
+    const BUF0_ADDR: u64 = 0x200000;
+    const BUF1_ADDR: u64 = 0x201000;
+
+    struct PwritevSuspendedRead {
+        wait: PortalOwnerWait,
+        buf0_reads: Cell<usize>,
+        buf1_starts: Cell<usize>,
+        buf1_resumes: Cell<usize>,
+    }
+    impl carrick_guest_mem::GuestMemory for PwritevSuspendedRead {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            match (address, length) {
+                (IOV_ADDR, 16) => {
+                    let mut bytes = Vec::with_capacity(16);
+                    bytes.extend_from_slice(&BUF0_ADDR.to_ne_bytes());
+                    bytes.extend_from_slice(&5_u64.to_ne_bytes());
+                    Ok(bytes)
+                }
+                (addr, 16) if addr == IOV_ADDR + 16 => {
+                    let mut bytes = Vec::with_capacity(16);
+                    bytes.extend_from_slice(&BUF1_ADDR.to_ne_bytes());
+                    bytes.extend_from_slice(&8_u64.to_ne_bytes());
+                    Ok(bytes)
+                }
+                (BUF0_ADDR, 5) => {
+                    self.buf0_reads.set(self.buf0_reads.get() + 1);
+                    Ok(b"head-".to_vec())
+                }
+                (BUF1_ADDR, 8) => {
+                    self.buf1_starts.set(self.buf1_starts.get() + 1);
+                    Err(MemoryError::ReadSuspended(Box::new(MemoryReadSuspension {
+                        wait: MemoryReadWait::Owner(self.wait),
+                        continuation: OwnedReadContinuation::new(b"ta".to_vec()),
+                    })))
+                }
+                _ => Err(MemoryError::OutOfBounds { address, length }),
+            }
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            unreachable!()
+        }
+        fn resume_read(&self, continuation: OwnedReadContinuation) -> Result<Vec<u8>, MemoryError> {
+            let mut prefix = continuation.take::<Vec<u8>>().expect("exact transfer");
+            let resumed = self.buf1_resumes.get();
+            self.buf1_resumes.set(resumed + 1);
+            if resumed == 0 {
+                assert_eq!(prefix, b"ta");
+                prefix.extend_from_slice(b"il");
+                return Err(MemoryError::ReadSuspended(Box::new(MemoryReadSuspension {
+                    wait: MemoryReadWait::Owner(self.wait),
+                    continuation: OwnedReadContinuation::new(prefix),
+                })));
+            }
+            assert_eq!(prefix, b"tail");
+            prefix.extend_from_slice(b"-510");
+            Ok(prefix)
+        }
+    }
+    impl carrick_guest_mem::CurrentMmMemory for PwritevSuspendedRead {}
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = dispatcher.capture_one_task_context().unwrap();
+    let sibling = root
+        .kernel()
+        .clone_thread(
+            &root,
+            crate::kernel::ClonePlan::from_flags(
+                carrick_abi::LinuxCloneFlags::THREAD
+                    | carrick_abi::LinuxCloneFlags::SIGHAND
+                    | carrick_abi::LinuxCloneFlags::VM
+                    | carrick_abi::LinuxCloneFlags::FILES,
+            )
+            .unwrap(),
+            carrick_hal::ThreadId::synthetic_for_tests(1511),
+            None,
+        )
+        .unwrap();
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(root.shared().mm().id().raw()).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Reservations,
+            7,
+        )
+    };
+    let mut memory = PwritevSuspendedRead {
+        wait,
+        buf0_reads: Cell::new(0),
+        buf1_starts: Cell::new(0),
+        buf1_resumes: Cell::new(0),
+    };
+    let original = Arc::new(parking_lot::RwLock::new(carrick_vfs::SparseBuffer::from(
+        b"0123".to_vec(),
+    )));
+    let replacement = Arc::new(parking_lot::RwLock::new(carrick_vfs::SparseBuffer::from(
+        Vec::new(),
+    )));
+    let make_file = |path: &str, contents: Arc<parking_lot::RwLock<carrick_vfs::SparseBuffer>>| {
+        OpenDescription::InMemoryFile {
+            base: OpenDescriptionBase::new(LINUX_O_WRONLY),
+            path: path.to_owned(),
+            contents,
+            offset: 0,
+            writable: true,
+            max_size: 100,
+        }
+    };
+    let fd = match dispatcher.install_fd(make_file("/original", Arc::clone(&original)), 0) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("install original: {other:?}"),
+    };
+    let replacement_fd =
+        match dispatcher.install_fd(make_file("/replacement", Arc::clone(&replacement)), 0) {
+            DispatchOutcome::Returned { value } => value as i32,
+            other => panic!("install replacement: {other:?}"),
+        };
+    let request = SyscallRequest::new(
+        carrick_abi::syscall::nr::PWRITEV.raw(),
+        SyscallArgs::from([fd as u64, IOV_ADDR, 2, 4, 0, 0]),
+    );
+    let reporter = CompatReporter::default();
+    let first = dispatcher
+        .dispatch(&root, request, &mut memory, &reporter)
+        .unwrap();
+    let DispatchOutcome::WriteCopyInSuspended(first) = first else {
+        panic!("pwritev owner suspension on second iovec must suspend: {first:?}");
+    };
+    assert_eq!(first.wait(), &MemoryReadWait::Owner(wait));
+    assert_eq!(memory.buf0_reads.get(), 1);
+    assert_eq!(memory.buf1_starts.get(), 1);
+    assert_eq!(original.read().len(), 4);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &sibling,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::CLOSE.raw(),
+                    SyscallArgs::from([fd as u64, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &sibling,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::DUP3.raw(),
+                    SyscallArgs::from([replacement_fd as u64, fd as u64, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: fd as i64 },
+    );
+
+    let resume = |pending, memory: &mut PwritevSuspendedRead| {
+        dispatcher
+            .resume_owned_write_copy_in(
+                &root,
+                request,
+                pending,
+                memory,
+                &reporter,
+                None,
+                crate::dispatch::OrdinaryDispatchRoute {
+                    host_wait: None,
+                    lease: None,
+                    mm_executor: None,
+                },
+            )
+            .unwrap()
+    };
+    let second = resume(first, &mut memory);
+    let DispatchOutcome::WriteCopyInSuspended(second) = second else {
+        panic!("second owner wait on pwritev must retain same operation: {second:?}");
+    };
+    let final_outcome = resume(second, &mut memory);
+    assert_eq!(final_outcome, DispatchOutcome::Returned { value: 13 });
+    assert_eq!(original.read().read_range(0, 17), b"0123head-tail-510");
+    assert_eq!(replacement.read().len(), 0);
+    assert_eq!(memory.buf0_reads.get(), 1);
+    assert_eq!(memory.buf1_starts.get(), 1);
+    assert_eq!(memory.buf1_resumes.get(), 2);
+}
+
+#[test]
+fn pwritev_bad_pointer_still_returns_efault() {
+    const IOV_ADDR: u64 = 0x100000;
+    struct BadPwritevPayload;
+    impl carrick_guest_mem::GuestMemory for BadPwritevPayload {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            if address == IOV_ADDR && length == 16 {
+                let mut bytes = Vec::with_capacity(16);
+                bytes.extend_from_slice(&0x200000_u64.to_ne_bytes());
+                bytes.extend_from_slice(&8_u64.to_ne_bytes());
+                return Ok(bytes);
+            }
+            Err(MemoryError::OutOfBounds { address, length })
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            unreachable!()
+        }
+    }
+    impl carrick_guest_mem::CurrentMmMemory for BadPwritevPayload {}
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = dispatcher.capture_one_task_context().unwrap();
+    let contents = Arc::new(parking_lot::RwLock::new(carrick_vfs::SparseBuffer::from(
+        Vec::new(),
+    )));
+    let fd = match dispatcher.install_fd(
+        OpenDescription::InMemoryFile {
+            base: OpenDescriptionBase::new(LINUX_O_WRONLY),
+            path: "/f".to_owned(),
+            contents,
+            offset: 0,
+            writable: true,
+            max_size: 100,
+        },
+        0,
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("install fd: {other:?}"),
+    };
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &root,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::PWRITEV.raw(),
+                    SyscallArgs::from([fd, IOV_ADDR, 1, 0, 0, 0]),
+                ),
+                &mut BadPwritevPayload,
+                &CompatReporter::default(),
+            )
+            .unwrap(),
+        DispatchOutcome::errno(LINUX_EFAULT),
+    );
+}
+
+#[test]
+fn owner_copyin_wait_retains_pwrite64_across_fd_reuse() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{MemoryReadSuspension, MemoryReadWait, OwnedReadContinuation};
+    use std::cell::Cell;
+    use std::num::NonZeroU64;
+
+    struct SuspendedPwrite64Read {
+        wait: PortalOwnerWait,
+        starts: Cell<usize>,
+        resumes: Cell<usize>,
+    }
+    impl carrick_guest_mem::GuestMemory for SuspendedPwrite64Read {
+        fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+            self.starts.set(self.starts.get() + 1);
+            Err(MemoryError::ReadSuspended(Box::new(MemoryReadSuspension {
+                wait: MemoryReadWait::Owner(self.wait),
+                continuation: OwnedReadContinuation::new(b"preem".to_vec()),
+            })))
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            unreachable!()
+        }
+        fn resume_read(&self, continuation: OwnedReadContinuation) -> Result<Vec<u8>, MemoryError> {
+            let mut prefix = continuation.take::<Vec<u8>>().expect("exact transfer");
+            let resumed = self.resumes.get();
+            self.resumes.set(resumed + 1);
+            if resumed == 0 {
+                assert_eq!(prefix, b"preem");
+                prefix.extend_from_slice(b"ption");
+                return Err(MemoryError::ReadSuspended(Box::new(MemoryReadSuspension {
+                    wait: MemoryReadWait::Owner(self.wait),
+                    continuation: OwnedReadContinuation::new(prefix),
+                })));
+            }
+            assert_eq!(prefix, b"preemption");
+            prefix.extend_from_slice(b"-510");
+            Ok(prefix)
+        }
+    }
+    impl carrick_guest_mem::CurrentMmMemory for SuspendedPwrite64Read {}
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = dispatcher.capture_one_task_context().unwrap();
+    let sibling = root
+        .kernel()
+        .clone_thread(
+            &root,
+            crate::kernel::ClonePlan::from_flags(
+                carrick_abi::LinuxCloneFlags::THREAD
+                    | carrick_abi::LinuxCloneFlags::SIGHAND
+                    | carrick_abi::LinuxCloneFlags::VM
+                    | carrick_abi::LinuxCloneFlags::FILES,
+            )
+            .unwrap(),
+            carrick_hal::ThreadId::synthetic_for_tests(1512),
+            None,
+        )
+        .unwrap();
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(root.shared().mm().id().raw()).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Reservations,
+            7,
+        )
+    };
+    let mut memory = SuspendedPwrite64Read {
+        wait,
+        starts: Cell::new(0),
+        resumes: Cell::new(0),
+    };
+    let original = Arc::new(parking_lot::RwLock::new(carrick_vfs::SparseBuffer::from(
+        b"01234567".to_vec(),
+    )));
+    let replacement = Arc::new(parking_lot::RwLock::new(carrick_vfs::SparseBuffer::from(
+        Vec::new(),
+    )));
+    let make_file = |path: &str, contents: Arc<parking_lot::RwLock<carrick_vfs::SparseBuffer>>| {
+        OpenDescription::InMemoryFile {
+            base: OpenDescriptionBase::new(LINUX_O_WRONLY),
+            path: path.to_owned(),
+            contents,
+            offset: 0,
+            writable: true,
+            max_size: 100,
+        }
+    };
+    let fd = match dispatcher.install_fd(make_file("/original", Arc::clone(&original)), 0) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("install original: {other:?}"),
+    };
+    let replacement_fd =
+        match dispatcher.install_fd(make_file("/replacement", Arc::clone(&replacement)), 0) {
+            DispatchOutcome::Returned { value } => value as i32,
+            other => panic!("install replacement: {other:?}"),
+        };
+    let request = SyscallRequest::new(
+        carrick_abi::syscall::nr::PWRITE64.raw(),
+        SyscallArgs::from([fd as u64, 0x200120, 14, 8, 0, 0]),
+    );
+    let reporter = CompatReporter::default();
+    let first = dispatcher
+        .dispatch(&root, request, &mut memory, &reporter)
+        .unwrap();
+    let DispatchOutcome::WriteCopyInSuspended(first) = first else {
+        panic!("pwrite64 owner suspension must retain operation: {first:?}");
+    };
+    assert_eq!(first.wait(), &MemoryReadWait::Owner(wait));
+    assert_eq!(memory.starts.get(), 1);
+    assert_eq!(original.read().len(), 8);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &sibling,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::CLOSE.raw(),
+                    SyscallArgs::from([fd as u64, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &sibling,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::DUP3.raw(),
+                    SyscallArgs::from([replacement_fd as u64, fd as u64, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: fd as i64 },
+    );
+
+    let resume = |pending, memory: &mut SuspendedPwrite64Read| {
+        dispatcher
+            .resume_owned_write_copy_in(
+                &root,
+                request,
+                pending,
+                memory,
+                &reporter,
+                None,
+                crate::dispatch::OrdinaryDispatchRoute {
+                    host_wait: None,
+                    lease: None,
+                    mm_executor: None,
+                },
+            )
+            .unwrap()
+    };
+    let second = resume(first, &mut memory);
+    let DispatchOutcome::WriteCopyInSuspended(second) = second else {
+        panic!("second owner wait on pwrite64 must retain same operation: {second:?}");
+    };
+    let final_outcome = resume(second, &mut memory);
+    assert_eq!(final_outcome, DispatchOutcome::Returned { value: 14 });
+    assert_eq!(original.read().read_range(0, 22), b"01234567preemption-510");
+    assert_eq!(replacement.read().len(), 0);
+    assert_eq!(memory.starts.get(), 1);
+    assert_eq!(memory.resumes.get(), 2);
+}
+
+#[test]
+fn pwrite64_bad_pointer_still_returns_efault() {
+    struct BadPointer;
+    impl carrick_guest_mem::GuestMemory for BadPointer {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::OutOfBounds { address, length })
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            unreachable!()
+        }
+    }
+    impl carrick_guest_mem::CurrentMmMemory for BadPointer {}
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = dispatcher.capture_one_task_context().unwrap();
+    let contents = Arc::new(parking_lot::RwLock::new(carrick_vfs::SparseBuffer::from(
+        Vec::new(),
+    )));
+    let fd = match dispatcher.install_fd(
+        OpenDescription::InMemoryFile {
+            base: OpenDescriptionBase::new(LINUX_O_WRONLY),
+            path: "/f".to_owned(),
+            contents,
+            offset: 0,
+            writable: true,
+            max_size: 100,
+        },
+        0,
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("install fd: {other:?}"),
+    };
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &root,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::PWRITE64.raw(),
+                    SyscallArgs::from([fd, 0x200120, 14, 0, 0, 0]),
+                ),
+                &mut BadPointer,
+                &CompatReporter::default(),
+            )
+            .unwrap(),
+        DispatchOutcome::errno(LINUX_EFAULT),
+    );
+}
+
+#[test]
+fn owner_copyin_wait_retains_sendto_across_fd_reuse() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{MemoryReadSuspension, MemoryReadWait, OwnedReadContinuation};
+    use std::cell::Cell;
+    use std::num::NonZeroU64;
+
+    struct SuspendedSendtoRead {
+        wait: PortalOwnerWait,
+        starts: Cell<usize>,
+        resumes: Cell<usize>,
+    }
+    impl carrick_guest_mem::GuestMemory for SuspendedSendtoRead {
+        fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+            self.starts.set(self.starts.get() + 1);
+            Err(MemoryError::ReadSuspended(Box::new(MemoryReadSuspension {
+                wait: MemoryReadWait::Owner(self.wait),
+                continuation: OwnedReadContinuation::new(b"send".to_vec()),
+            })))
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            unreachable!()
+        }
+        fn resume_read(&self, continuation: OwnedReadContinuation) -> Result<Vec<u8>, MemoryError> {
+            let mut prefix = continuation.take::<Vec<u8>>().expect("exact transfer");
+            let resumed = self.resumes.get();
+            self.resumes.set(resumed + 1);
+            if resumed == 0 {
+                assert_eq!(prefix, b"send");
+                prefix.extend_from_slice(b"to");
+                return Err(MemoryError::ReadSuspended(Box::new(MemoryReadSuspension {
+                    wait: MemoryReadWait::Owner(self.wait),
+                    continuation: OwnedReadContinuation::new(prefix),
+                })));
+            }
+            assert_eq!(prefix, b"sendto");
+            prefix.extend_from_slice(b"-510");
+            Ok(prefix)
+        }
+    }
+    impl carrick_guest_mem::CurrentMmMemory for SuspendedSendtoRead {}
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = dispatcher.capture_one_task_context().unwrap();
+    let sibling = root
+        .kernel()
+        .clone_thread(
+            &root,
+            crate::kernel::ClonePlan::from_flags(
+                carrick_abi::LinuxCloneFlags::THREAD
+                    | carrick_abi::LinuxCloneFlags::SIGHAND
+                    | carrick_abi::LinuxCloneFlags::VM
+                    | carrick_abi::LinuxCloneFlags::FILES,
+            )
+            .unwrap(),
+            carrick_hal::ThreadId::synthetic_for_tests(1513),
+            None,
+        )
+        .unwrap();
+    let (orig_writer, orig_reader) = crate::dispatch::net::unix_pure::PureSocketInner::pair(
+        carrick_abi::LINUX_SOCK_STREAM,
+        Default::default(),
+        Default::default(),
+    );
+    let (repl_writer, repl_reader) = crate::dispatch::net::unix_pure::PureSocketInner::pair(
+        carrick_abi::LINUX_SOCK_STREAM,
+        Default::default(),
+        Default::default(),
+    );
+    let fd = match dispatcher.install_fd(
+        OpenDescription::InMemorySocket {
+            base: OpenDescriptionBase::new(LINUX_O_RDWR),
+            socket: Arc::clone(&orig_writer),
+        },
+        0,
+    ) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("install orig socket: {other:?}"),
+    };
+    let replacement_fd = match dispatcher.install_fd(
+        OpenDescription::InMemorySocket {
+            base: OpenDescriptionBase::new(LINUX_O_RDWR),
+            socket: Arc::clone(&repl_writer),
+        },
+        0,
+    ) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("install repl socket: {other:?}"),
+    };
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(root.shared().mm().id().raw()).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Reservations,
+            7,
+        )
+    };
+    let mut memory = SuspendedSendtoRead {
+        wait,
+        starts: Cell::new(0),
+        resumes: Cell::new(0),
+    };
+    let request = SyscallRequest::new(
+        carrick_abi::syscall::nr::SENDTO.raw(),
+        SyscallArgs::from([fd as u64, 0x200120, 10, 0, 0, 0]),
+    );
+    let reporter = CompatReporter::default();
+    let first = dispatcher
+        .dispatch(&root, request, &mut memory, &reporter)
+        .unwrap();
+    let DispatchOutcome::WriteCopyInSuspended(first) = first else {
+        panic!("sendto owner suspension must retain operation: {first:?}");
+    };
+    assert_eq!(first.wait(), &MemoryReadWait::Owner(wait));
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &sibling,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::CLOSE.raw(),
+                    SyscallArgs::from([fd as u64, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &sibling,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::DUP3.raw(),
+                    SyscallArgs::from([replacement_fd as u64, fd as u64, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: fd as i64 },
+    );
+
+    let resume = |pending, memory: &mut SuspendedSendtoRead| {
+        dispatcher
+            .resume_owned_write_copy_in(
+                &root,
+                request,
+                pending,
+                memory,
+                &reporter,
+                None,
+                crate::dispatch::OrdinaryDispatchRoute {
+                    host_wait: None,
+                    lease: None,
+                    mm_executor: None,
+                },
+            )
+            .unwrap()
+    };
+    let second = resume(first, &mut memory);
+    let DispatchOutcome::WriteCopyInSuspended(second) = second else {
+        panic!("second owner wait on sendto must retain same operation: {second:?}");
+    };
+    let final_outcome = resume(second, &mut memory);
+    assert_eq!(final_outcome, DispatchOutcome::Returned { value: 10 });
+    let mut recv_buf = [0_u8; 16];
+    let (read_n, _) = orig_reader.recv_stream(&mut recv_buf, 0).unwrap();
+    assert_eq!(&recv_buf[..read_n], b"sendto-510");
+    assert_eq!(
+        repl_reader.recv_stream(&mut recv_buf, 0).err(),
+        Some(LINUX_EAGAIN)
+    );
+    assert_eq!(memory.starts.get(), 1);
+    assert_eq!(memory.resumes.get(), 2);
+}
+
+#[test]
+fn sendto_bad_pointer_still_returns_efault() {
+    struct BadPointer;
+    impl carrick_guest_mem::GuestMemory for BadPointer {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::OutOfBounds { address, length })
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            unreachable!()
+        }
+    }
+    impl carrick_guest_mem::CurrentMmMemory for BadPointer {}
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = dispatcher.capture_one_task_context().unwrap();
+    let (writer, _reader) = crate::dispatch::net::unix_pure::PureSocketInner::pair(
+        carrick_abi::LINUX_SOCK_STREAM,
+        Default::default(),
+        Default::default(),
+    );
+    let fd = match dispatcher.install_fd(
+        OpenDescription::InMemorySocket {
+            base: OpenDescriptionBase::new(LINUX_O_RDWR),
+            socket: writer,
+        },
+        0,
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("install socket: {other:?}"),
+    };
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &root,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::SENDTO.raw(),
+                    SyscallArgs::from([fd, 0x200120, 10, 0, 0, 0]),
+                ),
+                &mut BadPointer,
+                &CompatReporter::default(),
+            )
+            .unwrap(),
+        DispatchOutcome::errno(LINUX_EFAULT),
+    );
+}
+
+#[test]
+fn owner_copyin_wait_retains_sendmsg_and_partial_iov_progress_across_fd_reuse() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{MemoryReadSuspension, MemoryReadWait, OwnedReadContinuation};
+    use std::cell::Cell;
+    use std::num::NonZeroU64;
+
+    const MSG_ADDR: u64 = 0x090000;
+    const IOV_ADDR: u64 = 0x100000;
+    const BUF0_ADDR: u64 = 0x200000;
+    const BUF1_ADDR: u64 = 0x201000;
+
+    struct SendmsgSuspendedRead {
+        wait: PortalOwnerWait,
+        buf0_reads: Cell<usize>,
+        buf1_starts: Cell<usize>,
+        buf1_resumes: Cell<usize>,
+    }
+    impl carrick_guest_mem::GuestMemory for SendmsgSuspendedRead {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            match (address, length) {
+                (MSG_ADDR, 56) => {
+                    let mut msg = [0_u8; 56];
+                    msg[16..24].copy_from_slice(&IOV_ADDR.to_ne_bytes());
+                    msg[24..32].copy_from_slice(&2_u64.to_ne_bytes());
+                    Ok(msg.to_vec())
+                }
+                (IOV_ADDR, 16) => {
+                    let mut bytes = Vec::with_capacity(16);
+                    bytes.extend_from_slice(&BUF0_ADDR.to_ne_bytes());
+                    bytes.extend_from_slice(&4_u64.to_ne_bytes());
+                    Ok(bytes)
+                }
+                (addr, 16) if addr == IOV_ADDR + 16 => {
+                    let mut bytes = Vec::with_capacity(16);
+                    bytes.extend_from_slice(&BUF1_ADDR.to_ne_bytes());
+                    bytes.extend_from_slice(&7_u64.to_ne_bytes());
+                    Ok(bytes)
+                }
+                (BUF0_ADDR, 4) => {
+                    self.buf0_reads.set(self.buf0_reads.get() + 1);
+                    Ok(b"msg-".to_vec())
+                }
+                (BUF1_ADDR, 7) => {
+                    self.buf1_starts.set(self.buf1_starts.get() + 1);
+                    Err(MemoryError::ReadSuspended(Box::new(MemoryReadSuspension {
+                        wait: MemoryReadWait::Owner(self.wait),
+                        continuation: OwnedReadContinuation::new(b"pa".to_vec()),
+                    })))
+                }
+                _ => Err(MemoryError::OutOfBounds { address, length }),
+            }
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            unreachable!()
+        }
+        fn resume_read(&self, continuation: OwnedReadContinuation) -> Result<Vec<u8>, MemoryError> {
+            let mut prefix = continuation.take::<Vec<u8>>().expect("exact transfer");
+            let resumed = self.buf1_resumes.get();
+            self.buf1_resumes.set(resumed + 1);
+            if resumed == 0 {
+                assert_eq!(prefix, b"pa");
+                prefix.extend_from_slice(b"rt");
+                return Err(MemoryError::ReadSuspended(Box::new(MemoryReadSuspension {
+                    wait: MemoryReadWait::Owner(self.wait),
+                    continuation: OwnedReadContinuation::new(prefix),
+                })));
+            }
+            assert_eq!(prefix, b"part");
+            prefix.extend_from_slice(b"510");
+            Ok(prefix)
+        }
+    }
+    impl carrick_guest_mem::CurrentMmMemory for SendmsgSuspendedRead {}
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = dispatcher.capture_one_task_context().unwrap();
+    let sibling = root
+        .kernel()
+        .clone_thread(
+            &root,
+            crate::kernel::ClonePlan::from_flags(
+                carrick_abi::LinuxCloneFlags::THREAD
+                    | carrick_abi::LinuxCloneFlags::SIGHAND
+                    | carrick_abi::LinuxCloneFlags::VM
+                    | carrick_abi::LinuxCloneFlags::FILES,
+            )
+            .unwrap(),
+            carrick_hal::ThreadId::synthetic_for_tests(1514),
+            None,
+        )
+        .unwrap();
+    let (orig_writer, orig_reader) = crate::dispatch::net::unix_pure::PureSocketInner::pair(
+        carrick_abi::LINUX_SOCK_STREAM,
+        Default::default(),
+        Default::default(),
+    );
+    let (repl_writer, repl_reader) = crate::dispatch::net::unix_pure::PureSocketInner::pair(
+        carrick_abi::LINUX_SOCK_STREAM,
+        Default::default(),
+        Default::default(),
+    );
+    let fd = match dispatcher.install_fd(
+        OpenDescription::InMemorySocket {
+            base: OpenDescriptionBase::new(LINUX_O_RDWR),
+            socket: Arc::clone(&orig_writer),
+        },
+        0,
+    ) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("install orig socket: {other:?}"),
+    };
+    let replacement_fd = match dispatcher.install_fd(
+        OpenDescription::InMemorySocket {
+            base: OpenDescriptionBase::new(LINUX_O_RDWR),
+            socket: Arc::clone(&repl_writer),
+        },
+        0,
+    ) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("install repl socket: {other:?}"),
+    };
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(root.shared().mm().id().raw()).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Reservations,
+            7,
+        )
+    };
+    let mut memory = SendmsgSuspendedRead {
+        wait,
+        buf0_reads: Cell::new(0),
+        buf1_starts: Cell::new(0),
+        buf1_resumes: Cell::new(0),
+    };
+    let request = SyscallRequest::new(
+        carrick_abi::syscall::nr::SENDMSG.raw(),
+        SyscallArgs::from([fd as u64, MSG_ADDR, 0, 0, 0, 0]),
+    );
+    let reporter = CompatReporter::default();
+    let first = dispatcher
+        .dispatch(&root, request, &mut memory, &reporter)
+        .unwrap();
+    let DispatchOutcome::WriteCopyInSuspended(first) = first else {
+        panic!("sendmsg owner suspension must retain operation: {first:?}");
+    };
+    assert_eq!(first.wait(), &MemoryReadWait::Owner(wait));
+    assert_eq!(memory.buf0_reads.get(), 1);
+    assert_eq!(memory.buf1_starts.get(), 1);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &sibling,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::CLOSE.raw(),
+                    SyscallArgs::from([fd as u64, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &sibling,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::DUP3.raw(),
+                    SyscallArgs::from([replacement_fd as u64, fd as u64, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: fd as i64 },
+    );
+
+    let resume = |pending, memory: &mut SendmsgSuspendedRead| {
+        dispatcher
+            .resume_owned_write_copy_in(
+                &root,
+                request,
+                pending,
+                memory,
+                &reporter,
+                None,
+                crate::dispatch::OrdinaryDispatchRoute {
+                    host_wait: None,
+                    lease: None,
+                    mm_executor: None,
+                },
+            )
+            .unwrap()
+    };
+    let second = resume(first, &mut memory);
+    let DispatchOutcome::WriteCopyInSuspended(second) = second else {
+        panic!("second owner wait on sendmsg must retain same operation: {second:?}");
+    };
+    let final_outcome = resume(second, &mut memory);
+    assert_eq!(final_outcome, DispatchOutcome::Returned { value: 11 });
+    let mut recv_buf = [0_u8; 16];
+    let (read_n, _) = orig_reader.recv_stream(&mut recv_buf, 0).unwrap();
+    assert_eq!(&recv_buf[..read_n], b"msg-part510");
+    assert_eq!(
+        repl_reader.recv_stream(&mut recv_buf, 0).err(),
+        Some(LINUX_EAGAIN)
+    );
+    assert_eq!(memory.buf0_reads.get(), 1);
+    assert_eq!(memory.buf1_starts.get(), 1);
+    assert_eq!(memory.buf1_resumes.get(), 2);
+}
+
+#[test]
+fn sendmsg_bad_pointer_still_returns_efault() {
+    struct BadPointer;
+    impl carrick_guest_mem::GuestMemory for BadPointer {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::OutOfBounds { address, length })
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            unreachable!()
+        }
+    }
+    impl carrick_guest_mem::CurrentMmMemory for BadPointer {}
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = dispatcher.capture_one_task_context().unwrap();
+    let (writer, _reader) = crate::dispatch::net::unix_pure::PureSocketInner::pair(
+        carrick_abi::LINUX_SOCK_STREAM,
+        Default::default(),
+        Default::default(),
+    );
+    let fd = match dispatcher.install_fd(
+        OpenDescription::InMemorySocket {
+            base: OpenDescriptionBase::new(LINUX_O_RDWR),
+            socket: writer,
+        },
+        0,
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("install socket: {other:?}"),
+    };
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &root,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::SENDMSG.raw(),
+                    SyscallArgs::from([fd, 0x090000, 0, 0, 0, 0]),
+                ),
+                &mut BadPointer,
+                &CompatReporter::default(),
+            )
+            .unwrap(),
+        DispatchOutcome::errno(LINUX_EFAULT),
+    );
+}
+
+#[test]
+fn owner_copyin_write_post_resume_helpers_ignore_reused_fd() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{MemoryReadSuspension, MemoryReadWait, OwnedReadContinuation};
+    use std::num::NonZeroU64;
+
+    struct OneSuspendRead(PortalOwnerWait);
+    impl carrick_guest_mem::GuestMemory for OneSuspendRead {
+        fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::ReadSuspended(Box::new(MemoryReadSuspension {
+                wait: MemoryReadWait::Owner(self.0),
+                continuation: OwnedReadContinuation::new(b"x".to_vec()),
+            })))
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            unreachable!()
+        }
+        fn resume_read(&self, continuation: OwnedReadContinuation) -> Result<Vec<u8>, MemoryError> {
+            Ok(continuation.take::<Vec<u8>>().unwrap())
+        }
+    }
+    impl carrick_guest_mem::CurrentMmMemory for OneSuspendRead {}
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = dispatcher.capture_one_task_context().unwrap();
+    let sibling = root
+        .kernel()
+        .clone_thread(
+            &root,
+            crate::kernel::ClonePlan::from_flags(
+                carrick_abi::LinuxCloneFlags::THREAD
+                    | carrick_abi::LinuxCloneFlags::SIGHAND
+                    | carrick_abi::LinuxCloneFlags::VM
+                    | carrick_abi::LinuxCloneFlags::FILES,
+            )
+            .unwrap(),
+            carrick_hal::ThreadId::synthetic_for_tests(1515),
+            None,
+        )
+        .unwrap();
+    let (orig_writer, _orig_reader) = crate::dispatch::net::unix_pure::PureSocketInner::pair(
+        carrick_abi::LINUX_SOCK_STREAM,
+        Default::default(),
+        Default::default(),
+    );
+    let (repl_writer, _repl_reader) = crate::dispatch::net::unix_pure::PureSocketInner::pair(
+        carrick_abi::LINUX_SOCK_STREAM,
+        Default::default(),
+        Default::default(),
+    );
+    // Fill orig_writer so the blocking write after resume parks on EAGAIN -> WaitOnFds.
+    orig_writer
+        .send_stream(&vec![b'f'; 256 * 1024], Vec::new())
+        .unwrap();
+    assert_eq!(orig_writer.send_stream(b"x", Vec::new()), Err(LINUX_EAGAIN));
+
+    let fd = match dispatcher.install_fd(
+        OpenDescription::InMemorySocket {
+            base: OpenDescriptionBase::new(LINUX_O_RDWR),
+            socket: Arc::clone(&orig_writer),
+        },
+        0,
+    ) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("install orig socket: {other:?}"),
+    };
+    let orig_authority = dispatcher.captured_slot_authority(fd).unwrap();
+    let replacement_fd = match dispatcher.install_fd(
+        OpenDescription::InMemorySocket {
+            base: OpenDescriptionBase::new(LINUX_O_RDWR),
+            socket: Arc::clone(&repl_writer),
+        },
+        0,
+    ) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("install repl socket: {other:?}"),
+    };
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(root.shared().mm().id().raw()).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Reservations,
+            7,
+        )
+    };
+    let mut memory = OneSuspendRead(wait);
+    let request = SyscallRequest::new(
+        carrick_abi::syscall::nr::WRITE.raw(),
+        SyscallArgs::from([fd as u64, 0x200120, 1, 0, 0, 0]),
+    );
+    let reporter = CompatReporter::default();
+    let first = dispatcher
+        .dispatch(&root, request, &mut memory, &reporter)
+        .unwrap();
+    let DispatchOutcome::WriteCopyInSuspended(pending) = first else {
+        panic!("write copy-in must suspend: {first:?}");
+    };
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &sibling,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::CLOSE.raw(),
+                    SyscallArgs::from([fd as u64, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &sibling,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::DUP3.raw(),
+                    SyscallArgs::from([replacement_fd as u64, fd as u64, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: fd as i64 },
+    );
+    let repl_authority = dispatcher.captured_slot_authority(fd).unwrap();
+    assert_ne!(orig_authority, repl_authority);
+
+    let outcome = dispatcher
+        .resume_owned_write_copy_in(
+            &root,
+            request,
+            pending,
+            &mut memory,
+            &reporter,
+            None,
+            crate::dispatch::OrdinaryDispatchRoute {
+                host_wait: None,
+                lease: None,
+                mm_executor: None,
+            },
+        )
+        .unwrap();
+    let DispatchOutcome::WaitOnFds { fds, .. } = outcome else {
+        panic!("blocking in-memory socket write must park on WaitOnFds: {outcome:?}");
+    };
+    assert_eq!(
+        fds.logical_authorities_for_test(),
+        vec![orig_authority],
+        "resumed write wait must retain original slot authority rather than re-resolving reused fd"
+    );
+}
+
+#[test]
+fn owner_copyin_wait_retains_writev_across_iovec_array_suspension_and_fd_reuse() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{MemoryReadSuspension, MemoryReadWait, OwnedReadContinuation};
+    use std::cell::Cell;
+    use std::num::NonZeroU64;
+
+    const IOV_ADDR: u64 = 0x100000;
+    const BUF0_ADDR: u64 = 0x200000;
+    const BUF1_ADDR: u64 = 0x201000;
+
+    struct WritevIovecArraySuspendedRead {
+        wait: PortalOwnerWait,
+        iov0_starts: Cell<usize>,
+        iov0_resumes: Cell<usize>,
+        iov1_reads: Cell<usize>,
+    }
+    impl carrick_guest_mem::GuestMemory for WritevIovecArraySuspendedRead {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            match (address, length) {
+                (IOV_ADDR, 16) => {
+                    self.iov0_starts.set(self.iov0_starts.get() + 1);
+                    let mut bytes = Vec::with_capacity(16);
+                    bytes.extend_from_slice(&BUF0_ADDR.to_ne_bytes());
+                    bytes.extend_from_slice(&6_u64.to_ne_bytes());
+                    Err(MemoryError::ReadSuspended(Box::new(MemoryReadSuspension {
+                        wait: MemoryReadWait::Owner(self.wait),
+                        continuation: OwnedReadContinuation::new(bytes),
+                    })))
+                }
+                (addr, 16) if addr == IOV_ADDR + 16 => {
+                    self.iov1_reads.set(self.iov1_reads.get() + 1);
+                    let mut bytes = Vec::with_capacity(16);
+                    bytes.extend_from_slice(&BUF1_ADDR.to_ne_bytes());
+                    bytes.extend_from_slice(&10_u64.to_ne_bytes());
+                    Ok(bytes)
+                }
+                (BUF0_ADDR, 6) => Ok(b"first-".to_vec()),
+                (BUF1_ADDR, 10) => Ok(b"second-510".to_vec()),
+                _ => Err(MemoryError::OutOfBounds { address, length }),
+            }
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            unreachable!()
+        }
+        fn resume_read(&self, continuation: OwnedReadContinuation) -> Result<Vec<u8>, MemoryError> {
+            self.iov0_resumes.set(self.iov0_resumes.get() + 1);
+            Ok(continuation.take::<Vec<u8>>().expect("exact iovec entry"))
+        }
+    }
+    impl carrick_guest_mem::CurrentMmMemory for WritevIovecArraySuspendedRead {}
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = dispatcher.capture_one_task_context().unwrap();
+    let sibling = root
+        .kernel()
+        .clone_thread(
+            &root,
+            crate::kernel::ClonePlan::from_flags(
+                carrick_abi::LinuxCloneFlags::THREAD
+                    | carrick_abi::LinuxCloneFlags::SIGHAND
+                    | carrick_abi::LinuxCloneFlags::VM
+                    | carrick_abi::LinuxCloneFlags::FILES,
+            )
+            .unwrap(),
+            carrick_hal::ThreadId::synthetic_for_tests(1516),
+            None,
+        )
+        .unwrap();
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(root.shared().mm().id().raw()).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Reservations,
+            7,
+        )
+    };
+    let mut memory = WritevIovecArraySuspendedRead {
+        wait,
+        iov0_starts: Cell::new(0),
+        iov0_resumes: Cell::new(0),
+        iov1_reads: Cell::new(0),
+    };
+    let original = Arc::new(parking_lot::RwLock::new(carrick_vfs::SparseBuffer::from(
+        Vec::new(),
+    )));
+    let replacement = Arc::new(parking_lot::RwLock::new(carrick_vfs::SparseBuffer::from(
+        Vec::new(),
+    )));
+    let make_file = |path: &str, contents: Arc<parking_lot::RwLock<carrick_vfs::SparseBuffer>>| {
+        OpenDescription::InMemoryFile {
+            base: OpenDescriptionBase::new(LINUX_O_WRONLY),
+            path: path.to_owned(),
+            contents,
+            offset: 0,
+            writable: true,
+            max_size: 100,
+        }
+    };
+    let fd = match dispatcher.install_fd(make_file("/original", Arc::clone(&original)), 0) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("install original: {other:?}"),
+    };
+    let replacement_fd =
+        match dispatcher.install_fd(make_file("/replacement", Arc::clone(&replacement)), 0) {
+            DispatchOutcome::Returned { value } => value as i32,
+            other => panic!("install replacement: {other:?}"),
+        };
+    let request = SyscallRequest::new(
+        carrick_abi::syscall::nr::WRITEV.raw(),
+        SyscallArgs::from([fd as u64, IOV_ADDR, 2, 0, 0, 0]),
+    );
+    let reporter = CompatReporter::default();
+    let first = dispatcher
+        .dispatch(&root, request, &mut memory, &reporter)
+        .unwrap();
+    let DispatchOutcome::WriteCopyInSuspended(pending) = first else {
+        panic!("writev owner suspension on iovec array must suspend: {first:?}");
+    };
+    assert_eq!(pending.wait(), &MemoryReadWait::Owner(wait));
+    assert_eq!(memory.iov0_starts.get(), 1);
+    assert_eq!(memory.iov1_reads.get(), 0);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &sibling,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::CLOSE.raw(),
+                    SyscallArgs::from([fd as u64, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &sibling,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::DUP3.raw(),
+                    SyscallArgs::from([replacement_fd as u64, fd as u64, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: fd as i64 },
+    );
+
+    let final_outcome = dispatcher
+        .resume_owned_write_copy_in(
+            &root,
+            request,
+            pending,
+            &mut memory,
+            &reporter,
+            None,
+            crate::dispatch::OrdinaryDispatchRoute {
+                host_wait: None,
+                lease: None,
+                mm_executor: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(final_outcome, DispatchOutcome::Returned { value: 16 });
+    assert_eq!(original.read().read_range(0, 16), b"first-second-510");
+    assert_eq!(replacement.read().len(), 0);
+    assert_eq!(memory.iov0_starts.get(), 1);
+    assert_eq!(memory.iov0_resumes.get(), 1);
+    assert_eq!(memory.iov1_reads.get(), 1);
+}
+
+#[test]
+fn owner_copyin_wait_retains_pwritev_across_iovec_array_suspension_and_fd_reuse() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{MemoryReadSuspension, MemoryReadWait, OwnedReadContinuation};
+    use std::cell::Cell;
+    use std::num::NonZeroU64;
+
+    const IOV_ADDR: u64 = 0x100000;
+    const BUF0_ADDR: u64 = 0x200000;
+    const BUF1_ADDR: u64 = 0x201000;
+
+    struct PwritevIovecArraySuspendedRead {
+        wait: PortalOwnerWait,
+        iov0_starts: Cell<usize>,
+        iov0_resumes: Cell<usize>,
+        iov1_reads: Cell<usize>,
+    }
+    impl carrick_guest_mem::GuestMemory for PwritevIovecArraySuspendedRead {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            match (address, length) {
+                (IOV_ADDR, 16) => {
+                    self.iov0_starts.set(self.iov0_starts.get() + 1);
+                    let mut bytes = Vec::with_capacity(16);
+                    bytes.extend_from_slice(&BUF0_ADDR.to_ne_bytes());
+                    bytes.extend_from_slice(&5_u64.to_ne_bytes());
+                    Err(MemoryError::ReadSuspended(Box::new(MemoryReadSuspension {
+                        wait: MemoryReadWait::Owner(self.wait),
+                        continuation: OwnedReadContinuation::new(bytes),
+                    })))
+                }
+                (addr, 16) if addr == IOV_ADDR + 16 => {
+                    self.iov1_reads.set(self.iov1_reads.get() + 1);
+                    let mut bytes = Vec::with_capacity(16);
+                    bytes.extend_from_slice(&BUF1_ADDR.to_ne_bytes());
+                    bytes.extend_from_slice(&8_u64.to_ne_bytes());
+                    Ok(bytes)
+                }
+                (BUF0_ADDR, 5) => Ok(b"head-".to_vec()),
+                (BUF1_ADDR, 8) => Ok(b"tail-510".to_vec()),
+                _ => Err(MemoryError::OutOfBounds { address, length }),
+            }
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            unreachable!()
+        }
+        fn resume_read(&self, continuation: OwnedReadContinuation) -> Result<Vec<u8>, MemoryError> {
+            self.iov0_resumes.set(self.iov0_resumes.get() + 1);
+            Ok(continuation.take::<Vec<u8>>().expect("exact iovec entry"))
+        }
+    }
+    impl carrick_guest_mem::CurrentMmMemory for PwritevIovecArraySuspendedRead {}
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = dispatcher.capture_one_task_context().unwrap();
+    let sibling = root
+        .kernel()
+        .clone_thread(
+            &root,
+            crate::kernel::ClonePlan::from_flags(
+                carrick_abi::LinuxCloneFlags::THREAD
+                    | carrick_abi::LinuxCloneFlags::SIGHAND
+                    | carrick_abi::LinuxCloneFlags::VM
+                    | carrick_abi::LinuxCloneFlags::FILES,
+            )
+            .unwrap(),
+            carrick_hal::ThreadId::synthetic_for_tests(1517),
+            None,
+        )
+        .unwrap();
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(root.shared().mm().id().raw()).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Reservations,
+            7,
+        )
+    };
+    let mut memory = PwritevIovecArraySuspendedRead {
+        wait,
+        iov0_starts: Cell::new(0),
+        iov0_resumes: Cell::new(0),
+        iov1_reads: Cell::new(0),
+    };
+    let original = Arc::new(parking_lot::RwLock::new(carrick_vfs::SparseBuffer::from(
+        b"0123".to_vec(),
+    )));
+    let replacement = Arc::new(parking_lot::RwLock::new(carrick_vfs::SparseBuffer::from(
+        Vec::new(),
+    )));
+    let make_file = |path: &str, contents: Arc<parking_lot::RwLock<carrick_vfs::SparseBuffer>>| {
+        OpenDescription::InMemoryFile {
+            base: OpenDescriptionBase::new(LINUX_O_WRONLY),
+            path: path.to_owned(),
+            contents,
+            offset: 0,
+            writable: true,
+            max_size: 100,
+        }
+    };
+    let fd = match dispatcher.install_fd(make_file("/original", Arc::clone(&original)), 0) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("install original: {other:?}"),
+    };
+    let replacement_fd =
+        match dispatcher.install_fd(make_file("/replacement", Arc::clone(&replacement)), 0) {
+            DispatchOutcome::Returned { value } => value as i32,
+            other => panic!("install replacement: {other:?}"),
+        };
+    let request = SyscallRequest::new(
+        carrick_abi::syscall::nr::PWRITEV.raw(),
+        SyscallArgs::from([fd as u64, IOV_ADDR, 2, 4, 0, 0]),
+    );
+    let reporter = CompatReporter::default();
+    let first = dispatcher
+        .dispatch(&root, request, &mut memory, &reporter)
+        .unwrap();
+    let DispatchOutcome::WriteCopyInSuspended(pending) = first else {
+        panic!("pwritev owner suspension on iovec array must suspend: {first:?}");
+    };
+    assert_eq!(pending.wait(), &MemoryReadWait::Owner(wait));
+    assert_eq!(memory.iov0_starts.get(), 1);
+    assert_eq!(memory.iov1_reads.get(), 0);
+    assert_eq!(original.read().len(), 4);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &sibling,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::CLOSE.raw(),
+                    SyscallArgs::from([fd as u64, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                &sibling,
+                SyscallRequest::new(
+                    carrick_abi::syscall::nr::DUP3.raw(),
+                    SyscallArgs::from([replacement_fd as u64, fd as u64, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: fd as i64 },
+    );
+
+    let final_outcome = dispatcher
+        .resume_owned_write_copy_in(
+            &root,
+            request,
+            pending,
+            &mut memory,
+            &reporter,
+            None,
+            crate::dispatch::OrdinaryDispatchRoute {
+                host_wait: None,
+                lease: None,
+                mm_executor: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(final_outcome, DispatchOutcome::Returned { value: 13 });
+    assert_eq!(original.read().read_range(0, 17), b"0123head-tail-510");
+    assert_eq!(replacement.read().len(), 0);
+    assert_eq!(memory.iov0_starts.get(), 1);
+    assert_eq!(memory.iov0_resumes.get(), 1);
+    assert_eq!(memory.iov1_reads.get(), 1);
+}
+
+#[test]
+fn owner_copyin_writev_bounded_gather_resume_fault_writes_readable_prefix() {
+    use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+    use carrick_guest_mem::{MemoryReadSuspension, MemoryReadWait, OwnedReadContinuation};
+    use std::num::NonZeroU64;
+
+    const IOV_ADDR: u64 = 0x100000;
+    const BUF0_ADDR: u64 = 0x200000;
+    const BUF1_ADDR: u64 = 0x201000;
+
+    struct BoundedGatherResumeFaultRead {
+        wait: PortalOwnerWait,
+    }
+    impl carrick_guest_mem::GuestMemory for BoundedGatherResumeFaultRead {
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            match (address, length) {
+                (IOV_ADDR, 16) => {
+                    let mut bytes = Vec::with_capacity(16);
+                    bytes.extend_from_slice(&BUF0_ADDR.to_ne_bytes());
+                    bytes.extend_from_slice(&6_u64.to_ne_bytes());
+                    Ok(bytes)
+                }
+                (addr, 16) if addr == IOV_ADDR + 16 => {
+                    let mut bytes = Vec::with_capacity(16);
+                    bytes.extend_from_slice(&BUF1_ADDR.to_ne_bytes());
+                    bytes.extend_from_slice(&6_u64.to_ne_bytes());
+                    Ok(bytes)
+                }
+                (BUF0_ADDR, 6) => Ok(b"prefix".to_vec()),
+                (BUF1_ADDR, 6) => Err(MemoryError::ReadSuspended(Box::new(MemoryReadSuspension {
+                    wait: MemoryReadWait::Owner(self.wait),
+                    continuation: OwnedReadContinuation::new(Vec::<u8>::new()),
+                }))),
+                _ => Err(MemoryError::OutOfBounds { address, length }),
+            }
+        }
+        fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+            unreachable!()
+        }
+        fn resume_read(
+            &self,
+            _continuation: OwnedReadContinuation,
+        ) -> Result<Vec<u8>, MemoryError> {
+            Err(MemoryError::OutOfBounds {
+                address: BUF1_ADDR,
+                length: 6,
+            })
+        }
+    }
+    impl carrick_guest_mem::CurrentMmMemory for BoundedGatherResumeFaultRead {}
+
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = dispatcher.capture_one_task_context().unwrap();
+    let wait = unsafe {
+        PortalOwnerWait::from_owner(
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(root.shared().mm().id().raw()).unwrap(),
+                NonZeroU64::new(3).unwrap(),
+            ),
+            PortalWaitCause::Reservations,
+            7,
+        )
+    };
+    let mut memory = BoundedGatherResumeFaultRead { wait };
+    let mut pipe_fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
+    let read_end = HostFdRef::new(pipe_fds[0]);
+    let write_desc = OpenDescription::HostPipe {
+        base: OpenDescriptionBase::new(LINUX_O_WRONLY),
+        host_fd: HostFdRef::new(pipe_fds[1]),
+        is_read_end: false,
+        pipe_id: 510,
+        pty: None,
+        bidirectional: false,
+        write_kind: HostWriteKind::PipeLike,
+        stdio_stream: None,
+    };
+    let fd = match dispatcher.install_fd(write_desc, 0) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("install host pipe write end: {other:?}"),
+    };
+    let request = SyscallRequest::new(
+        carrick_abi::syscall::nr::WRITEV.raw(),
+        SyscallArgs::from([fd as u64, IOV_ADDR, 2, 0, 0, 0]),
+    );
+    let reporter = CompatReporter::default();
+    let first = dispatcher
+        .dispatch(&root, request, &mut memory, &reporter)
+        .unwrap();
+    let DispatchOutcome::WriteCopyInSuspended(pending) = first else {
+        panic!("bounded gather writev must suspend on second iovec: {first:?}");
+    };
+    let outcome = dispatcher
+        .resume_owned_write_copy_in(
+            &root,
+            request,
+            pending,
+            &mut memory,
+            &reporter,
+            None,
+            crate::dispatch::OrdinaryDispatchRoute {
+                host_wait: None,
+                lease: None,
+                mm_executor: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Returned { value: 6 },
+        "fault on later iovec after resume must write readable prefix (writev07 shape)"
+    );
+    let mut read_buf = [0u8; 6];
+    let n = unsafe { libc::read(read_end.raw(), read_buf.as_mut_ptr().cast(), read_buf.len()) };
+    assert_eq!(n, 6);
+    assert_eq!(&read_buf, b"prefix");
+}

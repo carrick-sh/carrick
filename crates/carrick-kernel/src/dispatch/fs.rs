@@ -132,11 +132,11 @@ syscall_table! {
     nr::READ => read,
     nr::WRITE => write_dispatch,
     nr::READV => readv,
-    nr::WRITEV => writev,
+    nr::WRITEV => writev_dispatch,
     nr::PREAD64 => pread64,
-    nr::PWRITE64 => pwrite64,
+    nr::PWRITE64 => pwrite64_dispatch,
     nr::PREADV => preadv,
-    nr::PWRITEV => pwritev,
+    nr::PWRITEV => pwritev_dispatch,
     nr::SENDFILE => sendfile,
     nr::VMSPLICE => vmsplice,
     nr::SPLICE => splice,
@@ -164,7 +164,7 @@ syscall_table! {
     // ignore the trailing flags. (A future RWF_APPEND need would want its own
     // pwritev2 handler that writes at EOF.)
     nr::PREADV2 => preadv,
-    nr::PWRITEV2 => pwritev,
+    nr::PWRITEV2 => pwritev_dispatch,
     nr::STATX => statx,
     nr::CLOSE_RANGE => close_range,
     nr::OPENAT2 => openat2,
@@ -310,10 +310,21 @@ pub(super) struct GatheredIovecBytes {
     pub(super) faulted: bool,
 }
 
-pub(super) fn gather_bounded_iovec_bytes(
+pub(super) enum GatheredIovecOutcome {
+    Ready(GatheredIovecBytes),
+    Suspended {
+        bytes: Vec<u8>,
+        next_iovec: usize,
+        suspension: Box<carrick_guest_mem::MemoryReadSuspension>,
+    },
+}
+
+pub(super) fn gather_bounded_iovec_bytes_from(
     memory: &impl CurrentMmMemory,
     iovecs: &[LinuxIovec],
-) -> Result<Option<GatheredIovecBytes>, LinuxErrno> {
+    start_iovec: usize,
+    mut bytes: Vec<u8>,
+) -> Result<Option<GatheredIovecOutcome>, LinuxErrno> {
     let mut total = 0usize;
     for iovec in iovecs {
         let len = usize::try_from(iovec.iov_len).map_err(|_| LINUX_EINVAL)?;
@@ -323,9 +334,12 @@ pub(super) fn gather_bounded_iovec_bytes(
         }
     }
 
-    let mut bytes = Vec::with_capacity(total);
+    if bytes.capacity() < total {
+        bytes.reserve(total - bytes.len());
+    }
     let mut faulted = false;
-    for iovec in iovecs {
+    for (offset, iovec) in iovecs[start_iovec..].iter().enumerate() {
+        let index = start_iovec + offset;
         let len = usize::try_from(iovec.iov_len).map_err(|_| LINUX_EINVAL)?;
         // A zero-length segment is never dereferenced, so a `{NULL, 0}` entry
         // must be skipped rather than faulted.
@@ -337,13 +351,39 @@ pub(super) fn gather_bounded_iovec_bytes(
         // have performed (LTP `writev07` writes 4x64 bytes with the SECOND
         // iovec on a PROT_NONE page and requires the return value 64, the file
         // content, and the advanced offset).
-        let Ok(chunk) = memory.read_bytes(iovec.iov_base, len) else {
-            faulted = true;
-            break;
-        };
-        bytes.extend_from_slice(&chunk);
+        match memory.read_bytes(iovec.iov_base, len) {
+            Ok(chunk) => bytes.extend_from_slice(&chunk),
+            Err(MemoryError::ReadSuspended(suspension)) => {
+                return Ok(Some(GatheredIovecOutcome::Suspended {
+                    bytes,
+                    next_iovec: index + 1,
+                    suspension,
+                }));
+            }
+            Err(_) => {
+                faulted = true;
+                break;
+            }
+        }
     }
-    Ok(Some(GatheredIovecBytes { bytes, faulted }))
+    Ok(Some(GatheredIovecOutcome::Ready(GatheredIovecBytes {
+        bytes,
+        faulted,
+    })))
+}
+
+pub(super) fn gather_bounded_iovec_bytes(
+    memory: &impl CurrentMmMemory,
+    iovecs: &[LinuxIovec],
+) -> Result<Option<GatheredIovecBytes>, LinuxErrno> {
+    match gather_bounded_iovec_bytes_from(memory, iovecs, 0, Vec::new())? {
+        Some(GatheredIovecOutcome::Ready(gathered)) => Ok(Some(gathered)),
+        Some(GatheredIovecOutcome::Suspended { bytes, .. }) => Ok(Some(GatheredIovecBytes {
+            bytes,
+            faulted: true,
+        })),
+        None => Ok(None),
+    }
 }
 
 /// Linux path-length limits enforced at the guest syscall/API input boundary:
@@ -2450,11 +2490,11 @@ forward_fs_handlers! {
     read,
     write_dispatch,
     readv,
-    writev,
+    writev_dispatch,
     pread64,
-    pwrite64,
+    pwrite64_dispatch,
     preadv,
-    pwritev,
+    pwritev_dispatch,
     readlinkat,
     newfstatat,
     fstat,
