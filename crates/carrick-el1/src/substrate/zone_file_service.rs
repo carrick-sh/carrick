@@ -54,7 +54,7 @@ pub trait ZoneFileVenue {
     fn terminal_queued(&self, key: OpenReferenceKey);
 
     /// Observe one open-record lookup and any [`OpenReferenceWork`] CAS
-    /// attempts on its [`OpenLifetime`]. Default no-op in production.
+    /// attempts on its [`OpenLifetime`](carrick_el1_abi::OpenLifetime). Default no-op in production.
     fn observe_record(&self, _handle: u32, _work: OpenReferenceWork) {}
 }
 
