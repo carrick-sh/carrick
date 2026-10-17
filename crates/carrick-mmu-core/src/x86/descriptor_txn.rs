@@ -1078,14 +1078,14 @@ pub fn classify_guest_cow_write<W: LiveDescriptorWords + ?Sized>(
             FaultClass::NotPresent => CowClass::Unmapped,
             _ => CowClass::Unreachable,
         })?;
-    if leaf.size != PAGE {
-        return Err(CowClass::Unmapped);
-    }
     if !leaf.ancestors_writable {
         return Err(CowClass::NoWriteIntent);
     }
     if leaf.descriptor & WRITE != 0 {
         return Err(CowClass::AlreadyWritable);
+    }
+    if leaf.size != PAGE {
+        return Err(CowClass::Unmapped);
     }
     if leaf.descriptor & COW == 0 {
         return Err(CowClass::NotCowArmed);
