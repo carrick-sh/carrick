@@ -466,6 +466,38 @@ impl WaitFds {
         };
         Ok(self)
     }
+
+    pub(in crate::dispatch) fn with_captured_slot(
+        mut self,
+        slot: Option<FileSlotAuthority>,
+    ) -> Result<Self, LinuxErrno> {
+        let Some(slot) = slot else {
+            return Err(LINUX_EBADF);
+        };
+        let (registrations, unclassified) = classify_adapter_slots(&self.fds, vec![slot]);
+        self.authority = WaitFdAuthority::Logical {
+            registrations,
+            unclassified,
+            watched: Vec::new(),
+        };
+        Ok(self)
+    }
+
+    pub(crate) fn with_captured_redispatch_and_watched_slot(
+        mut self,
+        slot: Option<FileSlotAuthority>,
+    ) -> Result<Self, LinuxErrno> {
+        let Some(slot) = slot else {
+            return Err(LINUX_EBADF);
+        };
+        let (registrations, unclassified) = classify_adapter_slots(&self.fds, vec![slot]);
+        self.authority = WaitFdAuthority::Logical {
+            registrations,
+            unclassified,
+            watched: vec![WatchedSlot::new(slot)],
+        };
+        Ok(self)
+    }
 }
 
 fn capture_slots(

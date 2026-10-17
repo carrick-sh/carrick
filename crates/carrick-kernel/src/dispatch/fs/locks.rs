@@ -1345,6 +1345,7 @@ impl<'a> FsView<'a> {
         &self,
         context: &crate::kernel::KernelContext,
         fd: i32,
+        open_file: &OpenFile,
         written: i64,
     ) {
         if written <= 0 {
@@ -1355,16 +1356,15 @@ impl<'a> FsView<'a> {
         if !carrick_signal_linux::fasync::any_armed() {
             return;
         }
-        let Some(pipe_id) = self.host_pipe_pipe_id(fd) else {
+        let Some(pipe_id) = self.fasync_pipe_id_for_open_file(open_file) else {
             return;
         };
         fasync_notify_pipe_write(context.kernel(), pipe_id, fd, written as usize);
     }
 }
 
-/// Publish a pipe readiness edge from retained operation identity. Unlike
-/// `fasync_notify_after_write`, this never resolves a
-/// numeric guest fd after the operation has parked.
+/// Publish a pipe readiness edge from retained operation identity. This never
+/// resolves a numeric guest fd after the operation has been prepared or parked.
 pub(in crate::dispatch) fn fasync_notify_pipe_write(
     kernel: &Arc<crate::kernel::Kernel>,
     pipe_id: u64,

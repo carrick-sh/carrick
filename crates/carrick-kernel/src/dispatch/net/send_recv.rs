@@ -92,13 +92,98 @@ mod host_dgram_msg_trunc_tests {
     }
 }
 
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
+pub(in crate::dispatch) enum SendtoCopyInPhase {
+    DestCheck {
+        buf_addr: u64,
+    },
+    Payload,
+    ConnectedDestCheck {
+        payload: Vec<u8>,
+        is_unix_stream: bool,
+    },
+    Sockaddr {
+        payload: Vec<u8>,
+        family: i32,
+    },
+}
+
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
+pub(in crate::dispatch) enum SendmsgCopyInPhase {
+    Msghdr,
+    Iovecs {
+        msg: LinuxMsghdr,
+        iovecs: Vec<LinuxIovec>,
+        total: u64,
+    },
+    Payload {
+        msg: LinuxMsghdr,
+        iovecs: Vec<LinuxIovec>,
+        next_iovec: usize,
+        data: Vec<u8>,
+    },
+    Sockaddr {
+        msg: LinuxMsghdr,
+        data: Vec<u8>,
+        family: i32,
+    },
+    Control {
+        msg: LinuxMsghdr,
+        data: Vec<u8>,
+        host_addr: Option<Vec<u8>>,
+    },
+}
+
+fn decode_kernel_struct<T: KernelAbi + zerocopy::FromBytes>(
+    bytes: &[u8],
+    offset: usize,
+) -> Option<T> {
+    let slice = bytes.get(offset..offset.checked_add(T::ABI_SIZE)?)?;
+    let mut value = <T as zerocopy::FromZeros>::new_zeroed();
+    value.as_mut_bytes()[..T::ABI_SIZE].copy_from_slice(slice);
+    Some(value)
+}
+
 impl<'a> NetView<'a> {
-    fn host_socket_send_view(&self, fd: i32) -> Result<SocketSendView, LinuxErrno> {
-        let (host_fd, family) = self.host_socket_lookup(fd)?;
-        let (cork_enabled, has_pending_cork) = self.open_file(fd).map_or((false, false), |of| {
-            let cork = of.description.common().cork();
+    fn open_file_with_slot_and_io_lease(
+        &self,
+        fd: i32,
+    ) -> (
+        Option<OpenFile>,
+        Option<crate::kernel::objects::FileSlotAuthority>,
+        Option<crate::kernel::objects::FileDescriptionFdLease>,
+    ) {
+        let (open_file, slot_authority) = crate::kernel::FileSlotNumber::for_open_fd(fd)
+            .ok()
+            .and_then(|number| {
+                self.captured_file_table()
+                    .capture_open_slot_authority(number)
+            })
+            .unzip();
+        let io_lease = open_file
+            .as_ref()
+            .and_then(|file| file.description.retain_fd_lease());
+        (open_file, slot_authority, io_lease)
+    }
+
+    fn host_socket_send_view_for_open_file(
+        &self,
+        open_file: &OpenFile,
+    ) -> Result<SocketSendView, LinuxErrno> {
+        let (host_fd, family) = open_file
+            .description
+            .inspect_kind(|open| match open {
+                OpenDescription::HostSocket {
+                    host_fd, family, ..
+                } => Some((host_fd.view(), *family)),
+                _ => None,
+            })
+            .flatten()
+            .ok_or(LINUX_ENOTSOCK)?;
+        let (cork_enabled, has_pending_cork) = {
+            let cork = open_file.description.common().cork();
             (cork.enabled, !cork.buffer.is_empty())
-        });
+        };
         Ok(SocketSendView {
             host_fd,
             family,
@@ -107,9 +192,10 @@ impl<'a> NetView<'a> {
         })
     }
 
-    fn send_in_memory_stream(
+    fn send_in_memory_stream_for_open_file(
         &self,
-        fd: i32,
+        open_file: &OpenFile,
+        slot_authority: Option<crate::kernel::objects::FileSlotAuthority>,
         socket: &PureSocketInner,
         data: &[u8],
         rights: Vec<Arc<OpenFile>>,
@@ -118,24 +204,18 @@ impl<'a> NetView<'a> {
         let is_ip = matches!(socket.family(), LINUX_AF_INET | LINUX_AF_INET6);
         let is_msg_more =
             is_ip && LinuxMsgFlags::from_bits_retain(flags).contains(LinuxMsgFlags::MORE);
-        let (is_cork_enabled, has_pending_cork) =
-            self.open_file(fd).map_or((false, false), |open_file| {
-                let cork = open_file.description.common().cork();
-                (cork.is_enabled(), cork.has_pending())
-            });
+        let (is_cork_enabled, has_pending_cork) = {
+            let cork = open_file.description.common().cork();
+            (cork.is_enabled(), cork.has_pending())
+        };
 
         if is_cork_enabled || is_msg_more {
-            if let Some(open_file) = self.open_file(fd) {
-                open_file.description.common().cork().stage(data, None);
-            }
+            open_file.description.common().cork().stage(data, None);
             return DispatchOutcome::returned_len(data.len()).map_err(DispatchError::from);
         }
 
         let pending_cork = has_pending_cork
-            .then(|| {
-                self.open_file(fd)
-                    .and_then(|open_file| open_file.description.common().cork().take())
-            })
+            .then(|| open_file.description.common().cork().take())
             .flatten();
         let current_payload_len = data.len();
         let combined = pending_cork.map(|(mut pending, _)| {
@@ -146,7 +226,7 @@ impl<'a> NetView<'a> {
             .as_ref()
             .map_or(0, |bytes| bytes.len() - current_payload_len);
         let send_data = combined.as_deref().unwrap_or(data);
-        let nonblocking = self.io_is_nonblocking(fd, flags);
+        let nonblocking = self.open_file_is_nonblocking(open_file, flags);
         let outcome = match socket.send_stream(send_data, rights) {
             Ok(written) => {
                 self.notify_inmem_epoll();
@@ -154,13 +234,23 @@ impl<'a> NetView<'a> {
             }
             Err(LINUX_EAGAIN) if !nonblocking => {
                 if cork_len > 0 {
-                    self.restore_cork_prefix(fd, &send_data[..cork_len]);
+                    self.restore_cork_prefix_for_open_file(open_file, &send_data[..cork_len]);
                 }
-                return Ok(self.wait_in_memory_slot(fd, libc::POLLOUT, socket.get_sndtimeo()));
+                return Ok(self.wait_in_memory_captured_slot(
+                    slot_authority,
+                    libc::POLLOUT,
+                    socket.get_sndtimeo(),
+                ));
             }
             Err(errno) => DispatchOutcome::errno(errno),
         };
-        Ok(self.settle_cork_send(fd, outcome, combined.as_deref(), cork_len, nonblocking))
+        Ok(self.settle_cork_send_for_open_file(
+            open_file,
+            outcome,
+            combined.as_deref(),
+            cork_len,
+            nonblocking,
+        ))
     }
 
     /// `sendmmsg(sockfd, msgvec, vlen, flags)` — Linux's batched
@@ -192,7 +282,7 @@ impl<'a> NetView<'a> {
                     return DispatchOutcome::errno(LINUX_EFAULT);
                 }
             };
-            let outcome = match self.sendmsg_inner(context, fd, entry, flags, &*memory) {
+            let outcome = match self.sendmsg_inner(context, fd, entry, flags, None, &*memory) {
                 Ok(o) => o,
                 // Surface the REAL errno the single-message path carries (a bad
                 // fd is EBADF, not the blanket EFAULT — sendmmsg02). The
@@ -332,89 +422,155 @@ impl<'a> NetView<'a> {
             let flags = flags as i32;
             let dest_addr = dest_addr.0;
             let dest_len = addrlen as u32;
+            let (open_file, slot_authority, io_lease) =
+                this.open_file_with_slot_and_io_lease(fd);
+            let target = crate::dispatch::fs::rw::WriteTarget {
+                fd,
+                tid: cx.tid(),
+                thread: cx.kernel.thread().key(),
+                open_file,
+                slot_authority,
+                io_lease,
+                stdio_was_closed: false,
+            };
             // AF_NETLINK send: treat the payload as an rtnetlink request and
             // queue a synthetic dump reply for the next recv.
-            if this.fd_is_netlink(fd) {
+            if target
+                .open_file
+                .as_ref()
+                .is_some_and(Self::open_file_is_netlink)
+            {
                 let bytes = match cx.memory.read_bytes(buf_addr, len) {
                     Ok(b) => b,
+                    Err(carrick_guest_mem::MemoryError::ReadSuspended(suspension)) => {
+                        return Ok(DispatchOutcome::WriteCopyInSuspended(Box::new(
+                            crate::dispatch::fs::rw::OwnedWriteCopyIn {
+                                target,
+                                op: crate::dispatch::fs::rw::OwnedCopyInOperation::Sendto {
+                                    len,
+                                    flags,
+                                    dest_addr,
+                                    dest_len,
+                                    phase: SendtoCopyInPhase::Payload,
+                                },
+                                suspension: *suspension,
+                            },
+                        )));
+                    }
                     Err(_) => {
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
                 };
-                return Ok(this.netlink_send(cx.kernel, fd, &bytes));
+                let Some(ref of) = target.open_file else {
+                    return Err(DispatchError::Errno(LINUX_EBADF));
+                };
+                return Ok(this.netlink_send(
+                    cx.kernel,
+                    of,
+                    &bytes,
+                ));
             }
-            let memory = &*cx.memory;
-            if let Some(open_file) = this.open_file(fd)
-                && let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description)
-            {
+            enum SpecialSendSocket {
+                Packet(Arc<crate::dispatch::net::packet::PacketSocket>),
+                InMemory(Arc<PureSocketInner>),
+            }
+            let special_socket = target.open_file.as_ref().and_then(|open_file| {
+                let open = crate::kernel::FileDescription::inspect(&open_file.description)?;
                 match &*open {
                     OpenDescription::Packet { socket, .. } => {
-                        let socket = Arc::clone(socket);
-                        drop(open);
-                        let bytes = match cx.memory.read_bytes(buf_addr, len) {
-                            Ok(b) => b,
-                            Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
-                        };
-                        return Ok(socket.sendto(&mut *cx.memory, &bytes, flags, dest_addr, dest_len as u64));
+                        Some(SpecialSendSocket::Packet(Arc::clone(socket)))
                     }
                     OpenDescription::InMemorySocket { socket, .. } => {
-                        let socket = Arc::clone(socket);
-                        drop(open);
-                        // A destination on a connected stream is ignored by
-                        // Linux, but `move_addr_to_kernel` still validates it
-                        // first: a negative or oversized addrlen is EINVAL and
-                        // an unreadable address with a positive addrlen is
-                        // EFAULT, before any byte is queued (probe
-                        // `streamdestmatrix`, cases 2.8-2.10). A NULL pointer
-                        // means "no address" whatever the length says (2.11).
-                        if dest_addr != 0 {
-                            if (dest_len as i32) < 0 || dest_len as usize > LINUX_SOCKADDR_STORAGE_MAX {
-                                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                            }
-                            if dest_len > 0 && memory.read_bytes(dest_addr, dest_len as usize).is_err() {
-                                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                            }
-                        }
-                        let bytes = match memory.read_bytes(buf_addr, len) {
-                            Ok(b) => b,
-                            Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
-                        };
-                        if (flags & LinuxMsgFlags::OOB.bits()) != 0 {
-                            if socket.family() == LINUX_AF_UNIX {
-                                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                            }
-                            if socket.socket_type != LINUX_SOCK_STREAM {
-                                return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
-                            }
-                            match socket.send_oob(&bytes) {
-                                Ok(written) => {
-                                    this.notify_inmem_epoll();
-                                    return Ok(DispatchOutcome::returned_len(written)?);
-                                }
-                                Err(LINUX_EPIPE) => {
-                                    let outcome = DispatchOutcome::errno(LINUX_EPIPE);
-                                    if (flags & LINUX_MSG_NOSIGNAL) == 0 {
-                                        return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
-                                    } else {
-                                        return Ok(outcome);
-                                    }
-                                }
-                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                            }
-                        }
-                        let outcome = this.send_in_memory_stream(fd, &socket, &bytes, Vec::new(), flags)?;
-                        if outcome == DispatchOutcome::errno(LINUX_EPIPE)
-                            && (flags & LINUX_MSG_NOSIGNAL) == 0
-                        {
-                            return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
-                        }
-                        return Ok(outcome);
+                        Some(SpecialSendSocket::InMemory(Arc::clone(socket)))
                     }
-                    _ => {}
+                    _ => None,
                 }
+            });
+            match special_socket {
+                Some(SpecialSendSocket::Packet(socket)) => {
+                    let bytes = match cx.memory.read_bytes(buf_addr, len) {
+                        Ok(b) => b,
+                        Err(carrick_guest_mem::MemoryError::ReadSuspended(suspension)) => {
+                            return Ok(DispatchOutcome::WriteCopyInSuspended(Box::new(
+                                crate::dispatch::fs::rw::OwnedWriteCopyIn {
+                                    target,
+                                    op: crate::dispatch::fs::rw::OwnedCopyInOperation::Sendto {
+                                        len,
+                                        flags,
+                                        dest_addr,
+                                        dest_len,
+                                        phase: SendtoCopyInPhase::Payload,
+                                    },
+                                    suspension: *suspension,
+                                },
+                            )));
+                        }
+                        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                    };
+                    return Ok(socket.sendto(&mut *cx.memory, &bytes, flags, dest_addr, dest_len as u64));
+                }
+                Some(SpecialSendSocket::InMemory(socket)) => {
+                    // A destination on a connected stream is ignored by
+                    // Linux, but `move_addr_to_kernel` still validates it
+                    // first: a negative or oversized addrlen is EINVAL and
+                    // an unreadable address with a positive addrlen is
+                    // EFAULT, before any byte is queued (probe
+                    // `streamdestmatrix`, cases 2.8-2.10). A NULL pointer
+                    // means "no address" whatever the length says (2.11).
+                    const LINUX_SOCKADDR_STORAGE_MAX: usize = 128;
+                    if dest_addr != 0 {
+                        if (dest_len as i32) < 0 || dest_len as usize > LINUX_SOCKADDR_STORAGE_MAX {
+                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                        }
+                        if dest_len > 0 {
+                            match cx.memory.read_bytes(dest_addr, dest_len as usize) {
+                                Ok(_) => {}
+                                Err(carrick_guest_mem::MemoryError::ReadSuspended(suspension)) => {
+                                    return Ok(DispatchOutcome::WriteCopyInSuspended(Box::new(
+                                        crate::dispatch::fs::rw::OwnedWriteCopyIn {
+                                            target,
+                                            op: crate::dispatch::fs::rw::OwnedCopyInOperation::Sendto {
+                                                len,
+                                                flags,
+                                                dest_addr,
+                                                dest_len,
+                                                phase: SendtoCopyInPhase::DestCheck { buf_addr },
+                                            },
+                                            suspension: *suspension,
+                                        },
+                                    )));
+                                }
+                                Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                            }
+                        }
+                    }
+                    let bytes = match cx.memory.read_bytes(buf_addr, len) {
+                        Ok(b) => b,
+                        Err(carrick_guest_mem::MemoryError::ReadSuspended(suspension)) => {
+                            return Ok(DispatchOutcome::WriteCopyInSuspended(Box::new(
+                                crate::dispatch::fs::rw::OwnedWriteCopyIn {
+                                    target,
+                                    op: crate::dispatch::fs::rw::OwnedCopyInOperation::Sendto {
+                                        len,
+                                        flags,
+                                        dest_addr,
+                                        dest_len,
+                                        phase: SendtoCopyInPhase::Payload,
+                                    },
+                                    suspension: *suspension,
+                                },
+                            )));
+                        }
+                        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                    };
+                    return this.complete_in_memory_sendto(cx, &target, &socket, &bytes, flags);
+                }
+                None => {}
             }
-            let send_view = this.host_socket_send_view(fd)?;
-            let (host_fd, family) = (send_view.host_fd, send_view.family);
+            let Some(ref open_file) = target.open_file else {
+                return Err(DispatchError::Errno(LINUX_EBADF));
+            };
+            let send_view = this.host_socket_send_view_for_open_file(open_file)?;
             // Zero-copy when the whole buffer is one contiguous mapped region
             // (send straight out of guest memory); otherwise snapshot it. The
             // admitted source retains its exact backing until this handler
@@ -422,339 +578,42 @@ impl<'a> NetView<'a> {
             // host send. It is resolved per dispatch — blocking_io's op is
             // FnOnce and an EAGAIN re-dispatches the whole handler, so it never
             // outlives a lock-releasing wait.
-            let zc_read = memory.host_read(buf_addr, len);
+            let zc_read = cx.memory.host_read(buf_addr, len);
             let send_copy: Option<Vec<u8>> = if zc_read.is_some() {
                 None
             } else {
-                match memory.read_bytes(buf_addr, len) {
+                match cx.memory.read_bytes(buf_addr, len) {
                     Ok(b) => Some(b),
+                    Err(carrick_guest_mem::MemoryError::ReadSuspended(suspension)) => {
+                        return Ok(DispatchOutcome::WriteCopyInSuspended(Box::new(
+                            crate::dispatch::fs::rw::OwnedWriteCopyIn {
+                                target,
+                                op: crate::dispatch::fs::rw::OwnedCopyInOperation::Sendto {
+                                    len,
+                                    flags,
+                                    dest_addr,
+                                    dest_len,
+                                    phase: SendtoCopyInPhase::Payload,
+                                },
+                                suspension: *suspension,
+                            },
+                        )));
+                    }
                     Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
                 }
             };
-            let data_ptr: *const u8 = match (&zc_read, &send_copy) {
-                (Some(read), _) => read.as_ptr(),
-                (None, Some(b)) => b.as_ptr(),
-                (None, None) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
-            };
-            let (guest_domain, guest_type, guest_protocol) =
-                match this.socket_guest_domain_type_and_protocol(fd) {
-                    Some(triple) => (Some(triple.0), Some(triple.1), Some(triple.2)),
-                    None => (None, None, None),
-                };
-            let is_stream = guest_type == Some(libc::SOCK_STREAM);
-            let is_sctp_stream = is_stream && guest_protocol == Some(LINUX_IPPROTO_SCTP);
-            let is_unix_stream = is_stream && guest_domain == Some(libc::AF_UNIX);
-            let host_stream_connected = is_stream && host_socket_is_connected(host_fd.get());
-            let is_connected_stream = is_stream
-                && !is_unix_stream
-                && !is_sctp_stream
-                && host_stream_connected;
-
-            // Linux move_addr_to_kernel bound: sizeof(struct sockaddr_storage) = 128
-            const LINUX_SOCKADDR_STORAGE_MAX: usize = 128;
-
-            // Read the destination sockaddr (if any) from guest memory up front,
-            // then send with MSG_DONTWAIT through blocking_io: a full socket buffer
-            // (EAGAIN) on a blocking fd waits for POLLOUT losslessly.
-            let mut host_addr = if dest_addr == 0 {
-                None
-            } else {
-                // Linux's move_addr_to_kernel rejects a negative addrlen or
-                // addrlen > sizeof(sockaddr_storage) (128) with EINVAL before
-                // touching the buffer (sendto01 "invalid to buffer length",
-                // tolen = -1).
-                if (dest_len as i32) < 0 || dest_len as usize > LINUX_SOCKADDR_STORAGE_MAX {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                }
-                if is_connected_stream {
-                    // On connected TCP / non-UNIX stream sockets, Linux ignores
-                    // dest_addr after move_addr_to_kernel validation, while Darwin
-                    // sendto with an address would fail with EISCONN. Send implicitly.
-                    if dest_len > 0 && memory.read_bytes(dest_addr, dest_len as usize).is_err() {
-                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                    }
-                    None
-                } else if is_unix_stream && host_socket_is_connected(host_fd.get()) {
-                    // Connected AF_UNIX stream returns EISCONN if dest_len > 0.
-                    // A zero length means no effective destination.
-                    if dest_len > 0 {
-                        if memory.read_bytes(dest_addr, dest_len as usize).is_err() {
-                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
-                        }
-                        return Ok(DispatchOutcome::errno(LINUX_EISCONN));
-                    }
-                    None
-                } else {
-                    // UDP, unconnected sockets, etc. parse destination sockaddr.
-                    match read_linux_sockaddr(memory, dest_addr, dest_len, family) {
-                        Ok(b) => Some(b),
-                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                    }
-                }
-            };
-            if is_stream && !is_unix_stream && !is_sctp_stream && !host_stream_connected {
-                let outcome = DispatchOutcome::errno(LINUX_EPIPE);
-                if flags & LINUX_MSG_NOSIGNAL == 0 {
-                    return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
-                }
-                return Ok(outcome);
-            }
-            if !is_connected_stream
-                && family == LINUX_AF_INET
-                && let Some(protocol) = this.socket_port_protocol(fd)
-                && let Some(requested) = host_addr
-                    .as_deref()
-                    .and_then(host_sockaddr_to_socket_addr)
-                    .or_else(|| this.connected_guest_peer_addr(fd))
-            {
-                if let Ok(bytes) = memory.read_bytes(buf_addr, len)
-                    && this.maybe_queue_icmp_echo_reply(fd, &bytes, requested)
-                {
-                    return Ok(DispatchOutcome::returned_len(len)?);
-                }
-                if protocol == PortProtocol::Udp
-                    && this.socket_guest_type(fd) == Some(LINUX_SOCK_DGRAM)
-                    && let Ok(bytes) = memory.read_bytes(buf_addr, len)
-                    && this.maybe_queue_dns_response(fd, &bytes, requested)
-                {
-                    return Ok(DispatchOutcome::returned_len(len)?);
-                }
-                match this.network.provider.resolve_connect(
-                    this.network.spec.namespace_id.as_ref(),
-                    GuestSocketAddr(requested),
-                    protocol,
-                ) {
-                    Ok(ConnectTarget::Host(host)) => {
-                        if let Some(mapped) = socket_addr_to_host_sockaddr(host.0) {
-                            host_addr = Some(mapped);
-                        }
-                    }
-                    // InZone is TCP-only (v1); UDP loopback falls through to
-                    // host socket path unchanged.
-                    Ok(ConnectTarget::InZone { .. }) => {}
-                    Ok(ConnectTarget::Unchanged) => {}
-                    Ok(ConnectTarget::Denied(errno))
-                        if errno == carrick_abi::LINUX_ECONNREFUSED
-                            && protocol == PortProtocol::Udp
-                            && this.socket_guest_type(fd) == Some(LINUX_SOCK_DGRAM) =>
-                    {
-                        // The datagram is dropped (nothing listens on the
-                        // bridge-local target), but Linux still reports the
-                        // send as successful. For a CONNECTED socket the
-                        // asynchronous ICMP unreachable must then surface as
-                        // POLLERR + recv ECONNREFUSED — arm the pending error
-                        // exactly like a delivered ICMP would (the connect
-                        // path already staged error_after_send).
-                        if dest_addr == 0 {
-                            this.queue_socket_error_after_send(fd);
-                        }
-                        return Ok(DispatchOutcome::returned_len(len)?);
-                    }
-                    Ok(ConnectTarget::Intercept(_)) => {
-                        return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ECONNREFUSED))
-                    }
-                    Ok(ConnectTarget::Denied(errno)) => return Ok(DispatchOutcome::errno(errno)),
-                    Err(_) => return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ECONNREFUSED)),
-                }
-            }
-            // On connected SCTP stream sockets (backed by host TCP), clear host_addr
-            // after address validation / provider routing so Darwin sends implicitly.
-            let mut host_addr = if is_sctp_stream && host_socket_is_connected(host_fd.get()) {
-                None
-            } else {
-                host_addr
-            };
-            // MSG_MORE corks only the IP transports (UDP datagrams and TCP
-            // streams). The native-arm64 Docker oracle for `socketcredmore`
-            // shows an AF_UNIX SOCK_DGRAM send with MSG_MORE going out at once.
-            let is_msg_more = carrick_abi::LinuxMsgFlags::from_bits_retain(flags)
-                .contains(carrick_abi::LinuxMsgFlags::MORE)
-                && matches!(send_view.family, LINUX_AF_INET | LINUX_AF_INET6);
-            let (is_cork_enabled, has_pending_cork) =
-                (send_view.cork_enabled, send_view.has_pending_cork);
-
-            if is_cork_enabled || is_msg_more {
-                let mut data = vec![0_u8; len];
-                copy_send_payload(&zc_read, send_copy.as_deref(), &mut data);
-                if let Some(open_file) = this.open_file(fd) {
-                    open_file
-                        .description
-                        .common()
-                        .cork()
-                        .stage(&data, host_addr.as_deref());
-                }
-                return Ok(DispatchOutcome::returned_len(len)?);
-            }
-
-            let pending_cork_data = if has_pending_cork {
-                this.open_file(fd).and_then(|open_file| {
-                    open_file.description.common().cork().take()
-                })
-            } else {
-                None
-            };
-
-            let (combined_buf, current_payload_len) = if let Some((mut buf, dest)) = pending_cork_data {
-                if host_addr.is_none() {
-                    host_addr = dest;
-                }
-                let cur = len;
-                let staged = buf.len();
-                buf.resize(staged + len, 0);
-                copy_send_payload(&zc_read, send_copy.as_deref(), &mut buf[staged..]);
-                (Some(buf), cur)
-            } else {
-                (None, len)
-            };
-
-            let (data_ptr, len) = if let Some(ref buf) = combined_buf {
-                (buf.as_ptr(), buf.len())
-            } else {
-                (data_ptr, len)
-            };
-
-            let nonblocking = this.io_is_nonblocking(fd, flags);
-            let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
-            let connected_send = dest_addr == 0;
-            // Resolve the error-queue shadow BEFORE entering the I/O closure:
-            // it needs this socket's own bound address, and the closure cannot
-            // borrow `this`.
-            let recverr_send_fd = match (&host_addr, recverr::is_enabled(host_fd.get())) {
-                (Some(dest), true) => host_sockaddr_bytes(host_fd.get())
-                    .and_then(|local| recverr::shadow_for_send(host_fd.get(), &local, dest)),
-                _ => None,
-            };
-            let outbound_flow = this.open_file(fd).and_then(|f| f.description.common().outbound_flow());
-            let creds = this.cross.cred_snapshot();
-            let my_cred = current_task_default_send_cred(&creds, cx.kernel);
-            let send_to = this
-                .open_file(fd)
-                .and_then(|f| crate::kernel::FileDescription::inspect(&f.description)?.send_timeout());
-            let outcome = this.blocking_io(fd, host_fd.get(), IoDir::Write, nonblocking, send_to, || {
-                // Re-stated locally (idempotent) so the non-blocking guarantee
-                // is visible at every send site below: both the real socket and
-                // the error-queue shadow are O_NONBLOCK, and MSG_DONTWAIT keeps
-                // that true per call.
-                let host_flags = host_flags | libc::MSG_DONTWAIT;
-                let (n_res, pending_sctp) = if let Some(flow) = &outbound_flow {
-                    let mut ledger = flow.lock_ledger();
-                    let pending_sctp = if is_sctp_stream {
-                        sctp::begin_send(host_fd.get(), len)
-                    } else {
-                        None
-                    };
-                    let n = match &host_addr {
-                        None => unsafe {
-                            libc::sendto(
-                                host_fd.get(),
-                                data_ptr as *const _,
-                                len,
-                                host_flags,
-                                std::ptr::null(),
-                                0,
-                            )
-                        },
-                        Some(a) => {
-                            match recverr_send_fd {
-                                Some(shadow) => unsafe {
-                                    libc::sendto(
-                                        shadow,
-                                        data_ptr as *const _,
-                                        len,
-                                        host_flags,
-                                        std::ptr::null(),
-                                        0,
-                                    )
-                                },
-                                None => unsafe {
-                                    libc::sendto(
-                                        host_fd.get(),
-                                        data_ptr as *const _,
-                                        len,
-                                        host_flags,
-                                        a.as_ptr() as *const _,
-                                        a.len() as u32,
-                                    )
-                                },
-                            }
-                        }
-                    };
-                    let n_res = match n.host_syscall_errno().map(|value| value as i64) {
-                        Err(LINUX_ENOTCONN) if is_stream => Err(LINUX_EPIPE),
-                        other => other,
-                    };
-                    if let Ok(sent) = n_res && (sent > 0 || !is_stream) {
-                        if is_stream {
-                            ledger.push_stream_bytes(sent as usize, my_cred);
-                        } else {
-                            ledger.push_dgram(sent as usize, my_cred);
-                        }
-                    }
-                    (n_res, pending_sctp)
-                } else {
-                    let pending_sctp = if is_sctp_stream {
-                        sctp::begin_send(host_fd.get(), len)
-                    } else {
-                        None
-                    };
-                    let n = match &host_addr {
-                        None => unsafe {
-                            libc::sendto(
-                                host_fd.get(),
-                                data_ptr as *const _,
-                                len,
-                                host_flags,
-                                std::ptr::null(),
-                                0,
-                            )
-                        },
-                        Some(a) => {
-                            match recverr_send_fd {
-                                Some(shadow) => unsafe {
-                                    libc::sendto(
-                                        shadow,
-                                        data_ptr as *const _,
-                                        len,
-                                        host_flags,
-                                        std::ptr::null(),
-                                        0,
-                                    )
-                                },
-                                None => unsafe {
-                                    libc::sendto(
-                                        host_fd.get(),
-                                        data_ptr as *const _,
-                                        len,
-                                        host_flags,
-                                        a.as_ptr() as *const _,
-                                        a.len() as u32,
-                                    )
-                                },
-                            }
-                        }
-                    };
-                    let n_res = match n.host_syscall_errno().map(|value| value as i64) {
-                        Err(LINUX_ENOTCONN) if is_stream => Err(LINUX_EPIPE),
-                        other => other,
-                    };
-                    (n_res, pending_sctp)
-                };
-                if let Some(pending) = pending_sctp {
-                    pending.settle(n_res.as_ref().ok().map(|sent| *sent.max(&0) as usize));
-                }
-                n_res
-            });
-            if connected_send && matches!(outcome, DispatchOutcome::Returned { value } if value >= 0) {
-                this.queue_socket_error_after_send(fd);
-            }
-            let final_outcome = this.settle_cork_send(
-                fd,
-                outcome,
-                combined_buf.as_deref(),
-                len - current_payload_len,
-                nonblocking,
-            );
-            Ok(final_outcome)
+            this.complete_host_sendto(
+                cx,
+                target,
+                send_view,
+                zc_read,
+                send_copy,
+                len,
+                flags,
+                dest_addr,
+                dest_len,
+                None,
+            )
         }
 
         fn recvfrom(this, cx, fd: Fd, buf: GuestPtr, len: u64, flags: u64, src_addr: GuestPtr, addrlen: GuestPtr) {
@@ -1226,7 +1085,14 @@ impl<'a> NetView<'a> {
         }
 
         fn sendmsg(this, cx, fd: Fd, msg: GuestPtr, flags: u64) {
-            let outcome = this.sendmsg_inner(cx.kernel, fd.0, msg.0, flags as i32, &*cx.memory)?;
+            let outcome = this.sendmsg_inner(
+                cx.kernel,
+                fd.0,
+                msg.0,
+                flags as i32,
+                Some((cx.kernel.thread().key(), cx.tid())),
+                &*cx.memory,
+            )?;
             if (flags as i32 & LINUX_MSG_NOSIGNAL) == 0 {
                 Ok(this.raise_sigpipe_on_epipe(cx, outcome))
             } else {
@@ -1247,34 +1113,1031 @@ impl<'a> NetView<'a> {
         }
     }
 
+    pub(in crate::dispatch) fn resume_net_copy_in<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        mut pending: Box<crate::dispatch::fs::rw::OwnedWriteCopyIn>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        if pending.target.thread != cx.kernel.thread().key() {
+            tracing::error!("resumed net copy-in under a different thread authority");
+            return Err(DispatchError::Errno(carrick_abi::LINUX_EIO));
+        }
+        let bytes = match cx
+            .memory
+            .resume_read(pending.suspension.continuation.clone())
+        {
+            Ok(bytes) => bytes,
+            Err(carrick_guest_mem::MemoryError::ReadSuspended(suspension)) => {
+                pending.suspension = *suspension;
+                return Ok(DispatchOutcome::WriteCopyInSuspended(pending));
+            }
+            Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+        };
+        match pending.op {
+            crate::dispatch::fs::rw::OwnedCopyInOperation::Sendto {
+                len,
+                flags,
+                dest_addr,
+                dest_len,
+                phase,
+            } => self.resume_sendto_copy_in(
+                cx,
+                pending.target,
+                len,
+                flags,
+                dest_addr,
+                dest_len,
+                phase,
+                bytes,
+            ),
+            crate::dispatch::fs::rw::OwnedCopyInOperation::Sendmsg { flags, phase } => {
+                let outcome =
+                    self.resume_sendmsg_copy_in(cx, pending.target, flags, phase, bytes)?;
+                if (flags & LINUX_MSG_NOSIGNAL) == 0 {
+                    Ok(self.raise_sigpipe_on_epipe(cx, outcome))
+                } else {
+                    Ok(outcome)
+                }
+            }
+            _ => {
+                tracing::error!("net copy-in resume received non-socket operation");
+                Err(DispatchError::Errno(carrick_abi::LINUX_EIO))
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resume_sendto_copy_in<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        target: crate::dispatch::fs::rw::WriteTarget,
+        len: usize,
+        flags: i32,
+        dest_addr: u64,
+        dest_len: u32,
+        phase: SendtoCopyInPhase,
+        bytes: Vec<u8>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let payload = match phase {
+            SendtoCopyInPhase::DestCheck { buf_addr } => {
+                match cx.memory.read_bytes(buf_addr, len) {
+                    Ok(b) => b,
+                    Err(carrick_guest_mem::MemoryError::ReadSuspended(suspension)) => {
+                        return Ok(DispatchOutcome::WriteCopyInSuspended(Box::new(
+                            crate::dispatch::fs::rw::OwnedWriteCopyIn {
+                                target,
+                                op: crate::dispatch::fs::rw::OwnedCopyInOperation::Sendto {
+                                    len,
+                                    flags,
+                                    dest_addr,
+                                    dest_len,
+                                    phase: SendtoCopyInPhase::Payload,
+                                },
+                                suspension: *suspension,
+                            },
+                        )));
+                    }
+                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                }
+            }
+            SendtoCopyInPhase::Payload => bytes,
+            SendtoCopyInPhase::ConnectedDestCheck {
+                payload,
+                is_unix_stream,
+            } => {
+                if is_unix_stream {
+                    return Ok(DispatchOutcome::errno(LINUX_EISCONN));
+                }
+                let Some(ref open_file) = target.open_file else {
+                    return Err(DispatchError::Errno(LINUX_EBADF));
+                };
+                let send_view = self.host_socket_send_view_for_open_file(open_file)?;
+                return self.complete_host_sendto(
+                    cx,
+                    target,
+                    send_view,
+                    None,
+                    Some(payload),
+                    len,
+                    flags,
+                    dest_addr,
+                    dest_len,
+                    Some(None),
+                );
+            }
+            SendtoCopyInPhase::Sockaddr { payload, family } => {
+                let host_addr = match read_linux_sockaddr_from_bytes(&bytes, family) {
+                    Ok(addr) => Some(addr),
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                };
+                let Some(ref open_file) = target.open_file else {
+                    return Err(DispatchError::Errno(LINUX_EBADF));
+                };
+                let send_view = self.host_socket_send_view_for_open_file(open_file)?;
+                return self.complete_host_sendto(
+                    cx,
+                    target,
+                    send_view,
+                    None,
+                    Some(payload),
+                    len,
+                    flags,
+                    dest_addr,
+                    dest_len,
+                    Some(host_addr),
+                );
+            }
+        };
+
+        if let Some(ref of) = target.open_file
+            && Self::open_file_is_netlink(of)
+        {
+            return Ok(self.netlink_send(cx.kernel, of, &payload));
+        }
+        enum ResumedSendSocket {
+            Packet(Arc<crate::dispatch::net::packet::PacketSocket>),
+            InMemory(Arc<PureSocketInner>),
+        }
+        let special_socket = target.open_file.as_ref().and_then(|open_file| {
+            open_file
+                .description
+                .inspect_kind(|open| match open {
+                    OpenDescription::Packet { socket, .. } => {
+                        Some(ResumedSendSocket::Packet(Arc::clone(socket)))
+                    }
+                    OpenDescription::InMemorySocket { socket, .. } => {
+                        Some(ResumedSendSocket::InMemory(Arc::clone(socket)))
+                    }
+                    _ => None,
+                })
+                .flatten()
+        });
+        match special_socket {
+            Some(ResumedSendSocket::Packet(socket)) => {
+                return Ok(socket.sendto(
+                    &mut *cx.memory,
+                    &payload,
+                    flags,
+                    dest_addr,
+                    dest_len as u64,
+                ));
+            }
+            Some(ResumedSendSocket::InMemory(socket)) => {
+                return self.complete_in_memory_sendto(cx, &target, &socket, &payload, flags);
+            }
+            None => {}
+        }
+        let Some(ref open_file) = target.open_file else {
+            return Err(DispatchError::Errno(LINUX_EBADF));
+        };
+        let send_view = self.host_socket_send_view_for_open_file(open_file)?;
+        self.complete_host_sendto(
+            cx,
+            target,
+            send_view,
+            None,
+            Some(payload),
+            len,
+            flags,
+            dest_addr,
+            dest_len,
+            None,
+        )
+    }
+
+    fn complete_in_memory_sendto<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        target: &crate::dispatch::fs::rw::WriteTarget,
+        socket: &PureSocketInner,
+        bytes: &[u8],
+        flags: i32,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let Some(ref open_file) = target.open_file else {
+            return Err(DispatchError::Errno(LINUX_EBADF));
+        };
+        if (flags & LinuxMsgFlags::OOB.bits()) != 0 {
+            if socket.family() == LINUX_AF_UNIX {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            if socket.socket_type != LINUX_SOCK_STREAM {
+                return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
+            }
+            match socket.send_oob(bytes) {
+                Ok(written) => {
+                    self.notify_inmem_epoll();
+                    return Ok(DispatchOutcome::returned_len(written)?);
+                }
+                Err(LINUX_EPIPE) => {
+                    let outcome = DispatchOutcome::errno(LINUX_EPIPE);
+                    if (flags & LINUX_MSG_NOSIGNAL) == 0 {
+                        return Ok(self.raise_sigpipe_on_epipe(cx, outcome));
+                    } else {
+                        return Ok(outcome);
+                    }
+                }
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            }
+        }
+        let outcome = self.send_in_memory_stream_for_open_file(
+            open_file,
+            target.slot_authority,
+            socket,
+            bytes,
+            Vec::new(),
+            flags,
+        )?;
+        if outcome == DispatchOutcome::errno(LINUX_EPIPE) && (flags & LINUX_MSG_NOSIGNAL) == 0 {
+            return Ok(self.raise_sigpipe_on_epipe(cx, outcome));
+        }
+        Ok(outcome)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn complete_host_sendto<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        target: crate::dispatch::fs::rw::WriteTarget,
+        send_view: SocketSendView,
+        zc_read: Option<carrick_guest_mem::HostRead>,
+        send_copy: Option<Vec<u8>>,
+        len: usize,
+        flags: i32,
+        dest_addr: u64,
+        dest_len: u32,
+        resolved_host_addr: Option<Option<Vec<u8>>>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let Some(open_file) = target.open_file.clone() else {
+            return Err(DispatchError::Errno(LINUX_EBADF));
+        };
+        let (host_fd, family) = (send_view.host_fd, send_view.family);
+        let data_ptr: *const u8 = match (&zc_read, &send_copy) {
+            (Some(read), _) => read.as_ptr(),
+            (None, Some(b)) => b.as_ptr(),
+            (None, None) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+        };
+        let (guest_domain, guest_type, guest_protocol) =
+            match Self::socket_guest_domain_type_and_protocol_for_open_file(&open_file) {
+                Some(triple) => (Some(triple.0), Some(triple.1), Some(triple.2)),
+                None => (None, None, None),
+            };
+        let is_stream = guest_type == Some(libc::SOCK_STREAM);
+        let is_sctp_stream = is_stream && guest_protocol == Some(LINUX_IPPROTO_SCTP);
+        let is_unix_stream = is_stream && guest_domain == Some(libc::AF_UNIX);
+        let host_stream_connected = is_stream && host_socket_is_connected(host_fd.get());
+        let is_connected_stream =
+            is_stream && !is_unix_stream && !is_sctp_stream && host_stream_connected;
+
+        let mut host_addr = if let Some(addr) = resolved_host_addr {
+            addr
+        } else if dest_addr == 0 {
+            None
+        } else {
+            if (dest_len as i32) < 0 || dest_len as usize > LINUX_SOCKADDR_STORAGE_SIZE {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
+            if is_connected_stream {
+                if dest_len > 0 {
+                    match cx.memory.read_bytes(dest_addr, dest_len as usize) {
+                        Ok(_) => {}
+                        Err(carrick_guest_mem::MemoryError::ReadSuspended(suspension)) => {
+                            let mut payload = vec![0u8; len];
+                            copy_send_payload(&zc_read, send_copy.as_deref(), &mut payload);
+                            return Ok(DispatchOutcome::WriteCopyInSuspended(Box::new(
+                                crate::dispatch::fs::rw::OwnedWriteCopyIn {
+                                    target,
+                                    op: crate::dispatch::fs::rw::OwnedCopyInOperation::Sendto {
+                                        len,
+                                        flags,
+                                        dest_addr,
+                                        dest_len,
+                                        phase: SendtoCopyInPhase::ConnectedDestCheck {
+                                            payload,
+                                            is_unix_stream: false,
+                                        },
+                                    },
+                                    suspension: *suspension,
+                                },
+                            )));
+                        }
+                        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                    }
+                }
+                None
+            } else if is_unix_stream && host_socket_is_connected(host_fd.get()) {
+                if dest_len > 0 {
+                    match cx.memory.read_bytes(dest_addr, dest_len as usize) {
+                        Ok(_) => return Ok(DispatchOutcome::errno(LINUX_EISCONN)),
+                        Err(carrick_guest_mem::MemoryError::ReadSuspended(suspension)) => {
+                            let mut payload = vec![0u8; len];
+                            copy_send_payload(&zc_read, send_copy.as_deref(), &mut payload);
+                            return Ok(DispatchOutcome::WriteCopyInSuspended(Box::new(
+                                crate::dispatch::fs::rw::OwnedWriteCopyIn {
+                                    target,
+                                    op: crate::dispatch::fs::rw::OwnedCopyInOperation::Sendto {
+                                        len,
+                                        flags,
+                                        dest_addr,
+                                        dest_len,
+                                        phase: SendtoCopyInPhase::ConnectedDestCheck {
+                                            payload,
+                                            is_unix_stream: true,
+                                        },
+                                    },
+                                    suspension: *suspension,
+                                },
+                            )));
+                        }
+                        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                    }
+                }
+                None
+            } else {
+                let raw = match cx.memory.read_bytes(
+                    dest_addr,
+                    (dest_len as usize).min(LINUX_SOCKADDR_STORAGE_SIZE),
+                ) {
+                    Ok(raw) => raw,
+                    Err(carrick_guest_mem::MemoryError::ReadSuspended(suspension)) => {
+                        let mut payload = vec![0u8; len];
+                        copy_send_payload(&zc_read, send_copy.as_deref(), &mut payload);
+                        return Ok(DispatchOutcome::WriteCopyInSuspended(Box::new(
+                            crate::dispatch::fs::rw::OwnedWriteCopyIn {
+                                target,
+                                op: crate::dispatch::fs::rw::OwnedCopyInOperation::Sendto {
+                                    len,
+                                    flags,
+                                    dest_addr,
+                                    dest_len,
+                                    phase: SendtoCopyInPhase::Sockaddr { payload, family },
+                                },
+                                suspension: *suspension,
+                            },
+                        )));
+                    }
+                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                };
+                match read_linux_sockaddr_from_bytes(&raw, family) {
+                    Ok(b) => Some(b),
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                }
+            }
+        };
+        if is_stream && !is_unix_stream && !is_sctp_stream && !host_stream_connected {
+            let outcome = DispatchOutcome::errno(LINUX_EPIPE);
+            if flags & LINUX_MSG_NOSIGNAL == 0 {
+                return Ok(self.raise_sigpipe_on_epipe(cx, outcome));
+            }
+            return Ok(outcome);
+        }
+        if !is_connected_stream
+            && family == LINUX_AF_INET
+            && let Some(protocol) = Self::socket_port_protocol_for_open_file(&open_file)
+            && let Some(requested) = host_addr
+                .as_deref()
+                .and_then(host_sockaddr_to_socket_addr)
+                .or_else(|| self.connected_guest_peer_addr_for_host_fd(host_fd))
+        {
+            let mut payload_bytes = vec![0u8; len];
+            copy_send_payload(&zc_read, send_copy.as_deref(), &mut payload_bytes);
+            if self.maybe_queue_icmp_echo_reply(&open_file, &payload_bytes, requested) {
+                return Ok(DispatchOutcome::returned_len(len)?);
+            }
+            if protocol == PortProtocol::Udp
+                && Self::socket_guest_type_for_open_file(&open_file) == Some(LINUX_SOCK_DGRAM)
+                && self.maybe_queue_dns_response(&open_file, &payload_bytes, requested)
+            {
+                return Ok(DispatchOutcome::returned_len(len)?);
+            }
+            match self.network.provider.resolve_connect(
+                self.network_namespace_id(),
+                GuestSocketAddr(requested),
+                protocol,
+            ) {
+                Ok(ConnectTarget::Host(host)) => {
+                    if let Some(mapped) = socket_addr_to_host_sockaddr(host.0) {
+                        host_addr = Some(mapped);
+                    }
+                }
+                Ok(ConnectTarget::InZone { .. }) => {}
+                Ok(ConnectTarget::Unchanged) => {}
+                Ok(ConnectTarget::Denied(errno))
+                    if errno == carrick_abi::LINUX_ECONNREFUSED
+                        && protocol == PortProtocol::Udp
+                        && Self::socket_guest_type_for_open_file(&open_file)
+                            == Some(LINUX_SOCK_DGRAM) =>
+                {
+                    if dest_addr == 0 {
+                        self.queue_socket_error_after_send(&open_file);
+                    }
+                    return Ok(DispatchOutcome::returned_len(len)?);
+                }
+                Ok(ConnectTarget::Intercept(_)) => {
+                    return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ECONNREFUSED));
+                }
+                Ok(ConnectTarget::Denied(errno)) => return Ok(DispatchOutcome::errno(errno)),
+                Err(_) => return Ok(DispatchOutcome::errno(carrick_abi::LINUX_ECONNREFUSED)),
+            }
+        }
+        let mut host_addr = if is_sctp_stream && host_socket_is_connected(host_fd.get()) {
+            None
+        } else {
+            host_addr
+        };
+        let is_msg_more = carrick_abi::LinuxMsgFlags::from_bits_retain(flags)
+            .contains(carrick_abi::LinuxMsgFlags::MORE)
+            && matches!(send_view.family, LINUX_AF_INET | LINUX_AF_INET6);
+        let (is_cork_enabled, has_pending_cork) =
+            (send_view.cork_enabled, send_view.has_pending_cork);
+
+        if is_cork_enabled || is_msg_more {
+            let mut data = vec![0_u8; len];
+            copy_send_payload(&zc_read, send_copy.as_deref(), &mut data);
+            open_file
+                .description
+                .common()
+                .cork()
+                .stage(&data, host_addr.as_deref());
+            return Ok(DispatchOutcome::returned_len(len)?);
+        }
+
+        let pending_cork_data = if has_pending_cork {
+            open_file.description.common().cork().take()
+        } else {
+            None
+        };
+
+        let (combined_buf, current_payload_len) = if let Some((mut buf, dest)) = pending_cork_data {
+            if host_addr.is_none() {
+                host_addr = dest;
+            }
+            let cur = len;
+            let staged = buf.len();
+            buf.resize(staged + len, 0);
+            copy_send_payload(&zc_read, send_copy.as_deref(), &mut buf[staged..]);
+            (Some(buf), cur)
+        } else {
+            (None, len)
+        };
+
+        let (data_ptr, len) = if let Some(ref buf) = combined_buf {
+            (buf.as_ptr(), buf.len())
+        } else {
+            (data_ptr, len)
+        };
+
+        let nonblocking = self.open_file_is_nonblocking(&open_file, flags);
+        let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
+        let connected_send = dest_addr == 0;
+        let recverr_send_fd = match (&host_addr, recverr::is_enabled(host_fd.get())) {
+            (Some(dest), true) => host_sockaddr_bytes(host_fd.get())
+                .and_then(|local| recverr::shadow_for_send(host_fd.get(), &local, dest)),
+            _ => None,
+        };
+        let outbound_flow = open_file.description.common().outbound_flow();
+        let creds = self.cross.cred_snapshot();
+        let my_cred = current_task_default_send_cred(&creds, cx.kernel);
+        let send_to = open_file
+            .description
+            .inspect_kind(|d| d.send_timeout())
+            .flatten();
+        let outcome = self.blocking_io_with_slot(
+            target.slot_authority,
+            host_fd.get(),
+            IoDir::Write,
+            nonblocking,
+            send_to,
+            || {
+                let host_flags = host_flags | libc::MSG_DONTWAIT;
+                let (n_res, pending_sctp) = if let Some(flow) = &outbound_flow {
+                    let mut ledger = flow.lock_ledger();
+                    let pending_sctp = if is_sctp_stream {
+                        sctp::begin_send(host_fd.get(), len)
+                    } else {
+                        None
+                    };
+                    let n = match &host_addr {
+                        None => unsafe {
+                            libc::sendto(
+                                host_fd.get(),
+                                data_ptr as *const _,
+                                len,
+                                host_flags,
+                                std::ptr::null(),
+                                0,
+                            )
+                        },
+                        Some(a) => match recverr_send_fd {
+                            Some(shadow) => unsafe {
+                                libc::sendto(
+                                    shadow,
+                                    data_ptr as *const _,
+                                    len,
+                                    host_flags,
+                                    std::ptr::null(),
+                                    0,
+                                )
+                            },
+                            None => unsafe {
+                                libc::sendto(
+                                    host_fd.get(),
+                                    data_ptr as *const _,
+                                    len,
+                                    host_flags,
+                                    a.as_ptr() as *const _,
+                                    a.len() as u32,
+                                )
+                            },
+                        },
+                    };
+                    let n_res = match n.host_syscall_errno().map(|value| value as i64) {
+                        Err(LINUX_ENOTCONN) if is_stream => Err(LINUX_EPIPE),
+                        other => other,
+                    };
+                    if let Ok(sent) = n_res
+                        && (sent > 0 || !is_stream)
+                    {
+                        if is_stream {
+                            ledger.push_stream_bytes(sent as usize, my_cred);
+                        } else {
+                            ledger.push_dgram(sent as usize, my_cred);
+                        }
+                    }
+                    (n_res, pending_sctp)
+                } else {
+                    let pending_sctp = if is_sctp_stream {
+                        sctp::begin_send(host_fd.get(), len)
+                    } else {
+                        None
+                    };
+                    let n = match &host_addr {
+                        None => unsafe {
+                            libc::sendto(
+                                host_fd.get(),
+                                data_ptr as *const _,
+                                len,
+                                host_flags,
+                                std::ptr::null(),
+                                0,
+                            )
+                        },
+                        Some(a) => match recverr_send_fd {
+                            Some(shadow) => unsafe {
+                                libc::sendto(
+                                    shadow,
+                                    data_ptr as *const _,
+                                    len,
+                                    host_flags,
+                                    std::ptr::null(),
+                                    0,
+                                )
+                            },
+                            None => unsafe {
+                                libc::sendto(
+                                    host_fd.get(),
+                                    data_ptr as *const _,
+                                    len,
+                                    host_flags,
+                                    a.as_ptr() as *const _,
+                                    a.len() as u32,
+                                )
+                            },
+                        },
+                    };
+                    let n_res = match n.host_syscall_errno().map(|value| value as i64) {
+                        Err(LINUX_ENOTCONN) if is_stream => Err(LINUX_EPIPE),
+                        other => other,
+                    };
+                    (n_res, pending_sctp)
+                };
+                if let Some(pending) = pending_sctp {
+                    pending.settle(n_res.as_ref().ok().map(|sent| *sent.max(&0) as usize));
+                }
+                n_res
+            },
+        );
+        if connected_send && matches!(outcome, DispatchOutcome::Returned { value } if value >= 0) {
+            self.queue_socket_error_after_send(&open_file);
+        }
+        let final_outcome = self.settle_cork_send_for_open_file(
+            &open_file,
+            outcome,
+            combined_buf.as_deref(),
+            len - current_payload_len,
+            nonblocking,
+        );
+        Ok(final_outcome)
+    }
+
+    fn network_namespace_id(&self) -> Option<&carrick_spec::NetworkNamespaceId> {
+        self.network.spec.namespace_id.as_ref()
+    }
+
     fn sendmsg_inner(
         &self,
         context: &crate::kernel::KernelContext,
         fd: i32,
         msg_addr: u64,
         flags: i32,
+        suspend_ctx: Option<(crate::kernel::ThreadKey, crate::thread::ThreadId)>,
         memory: &impl CurrentMmMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let is_netlink = self.fd_is_netlink(fd);
-        if let Some(open_file) = self.open_file(fd)
-            && let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description)
-            && let OpenDescription::InMemorySocket { socket, .. } = &*open
-        {
-            let socket = Arc::clone(socket);
-            drop(open);
-            let msg = read_linux_msghdr(memory, msg_addr)?;
-            let iovecs = read_iovecs(memory, msg.iov, msg.iovlen as usize)?;
-            let mut data = Vec::new();
-            for iov in iovecs {
-                if iov.iov_len == 0 {
-                    continue;
-                }
-                let chunk = match memory.read_bytes(iov.iov_base, iov.iov_len as usize) {
-                    Ok(b) => b,
-                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
-                };
-                data.extend_from_slice(&chunk);
+        let (open_file, slot_authority, io_lease) = self.open_file_with_slot_and_io_lease(fd);
+        let is_netlink = open_file.as_ref().is_some_and(Self::open_file_is_netlink);
+        let is_in_memory = open_file.as_ref().is_some_and(|of| {
+            crate::kernel::FileDescription::inspect(&of.description)
+                .is_some_and(|open| matches!(&*open, OpenDescription::InMemorySocket { .. }))
+        });
+        if !is_netlink && !is_in_memory {
+            let Some(ref of) = open_file else {
+                return Err(DispatchError::Errno(LINUX_EBADF));
+            };
+            let _ = self.host_socket_send_view_for_open_file(of)?;
+        }
+
+        let make_target = |(thread, tid): (crate::kernel::ThreadKey, crate::thread::ThreadId)| {
+            crate::dispatch::fs::rw::WriteTarget {
+                fd,
+                tid,
+                thread,
+                open_file: open_file.clone(),
+                slot_authority,
+                io_lease: io_lease.clone(),
+                stdio_was_closed: false,
             }
+        };
+
+        let msg_bytes = match memory.read_bytes(msg_addr, <LinuxMsghdr as KernelAbi>::ABI_SIZE) {
+            Ok(bytes) => bytes,
+            Err(carrick_guest_mem::MemoryError::ReadSuspended(suspension)) => {
+                if let Some(ctx_ids) = suspend_ctx {
+                    return Ok(DispatchOutcome::WriteCopyInSuspended(Box::new(
+                        crate::dispatch::fs::rw::OwnedWriteCopyIn {
+                            target: make_target(ctx_ids),
+                            op: crate::dispatch::fs::rw::OwnedCopyInOperation::Sendmsg {
+                                flags,
+                                phase: SendmsgCopyInPhase::Msghdr,
+                            },
+                            suspension: *suspension,
+                        },
+                    )));
+                }
+                return Err(DispatchError::Errno(LINUX_EFAULT));
+            }
+            Err(_) => return Err(DispatchError::Errno(LINUX_EFAULT)),
+        };
+        let msg = decode_kernel_struct::<LinuxMsghdr>(&msg_bytes, 0)
+            .ok_or(DispatchError::Errno(LINUX_EFAULT))?;
+        self.sendmsg_from_msghdr(
+            context,
+            fd,
+            flags,
+            open_file,
+            slot_authority,
+            io_lease,
+            suspend_ctx,
+            msg,
+            memory,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sendmsg_from_msghdr(
+        &self,
+        context: &crate::kernel::KernelContext,
+        fd: i32,
+        flags: i32,
+        open_file: Option<OpenFile>,
+        slot_authority: Option<crate::kernel::objects::FileSlotAuthority>,
+        io_lease: Option<crate::kernel::objects::FileDescriptionFdLease>,
+        suspend_ctx: Option<(crate::kernel::ThreadKey, crate::thread::ThreadId)>,
+        msg: LinuxMsghdr,
+        memory: &impl CurrentMmMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let iovcnt = msg.iovlen as usize;
+        if iovcnt > carrick_abi::LINUX_IOV_MAX {
+            return Err(DispatchError::Errno(LINUX_EINVAL));
+        }
+        self.sendmsg_gather_iovecs(
+            context,
+            fd,
+            flags,
+            open_file,
+            slot_authority,
+            io_lease,
+            suspend_ctx,
+            msg,
+            Vec::with_capacity(iovcnt),
+            0,
+            memory,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sendmsg_gather_iovecs(
+        &self,
+        context: &crate::kernel::KernelContext,
+        fd: i32,
+        flags: i32,
+        open_file: Option<OpenFile>,
+        slot_authority: Option<crate::kernel::objects::FileSlotAuthority>,
+        io_lease: Option<crate::kernel::objects::FileDescriptionFdLease>,
+        suspend_ctx: Option<(crate::kernel::ThreadKey, crate::thread::ThreadId)>,
+        msg: LinuxMsghdr,
+        mut iovecs: Vec<LinuxIovec>,
+        mut total: u64,
+        memory: &impl CurrentMmMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let iovcnt = msg.iovlen as usize;
+        const SSIZE_MAX: u64 = i64::MAX as u64;
+        let size = <LinuxIovec as KernelAbi>::ABI_SIZE;
+        while iovecs.len() < iovcnt {
+            let index = iovecs.len();
+            let offset = index
+                .checked_mul(size)
+                .and_then(|offset| u64::try_from(offset).ok())
+                .ok_or(DispatchError::Errno(LINUX_EINVAL))?;
+            let iovec_address = msg
+                .iov
+                .checked_add(offset)
+                .ok_or(DispatchError::Errno(LINUX_EFAULT))?;
+            if iovec_address == 0 {
+                return Err(DispatchError::Errno(LINUX_EFAULT));
+            }
+            let iov_bytes = match memory.read_bytes(iovec_address, size) {
+                Ok(bytes) => bytes,
+                Err(carrick_guest_mem::MemoryError::ReadSuspended(suspension)) => {
+                    if let Some((thread, tid)) = suspend_ctx {
+                        return Ok(DispatchOutcome::WriteCopyInSuspended(Box::new(
+                            crate::dispatch::fs::rw::OwnedWriteCopyIn {
+                                target: crate::dispatch::fs::rw::WriteTarget {
+                                    fd,
+                                    tid,
+                                    thread,
+                                    open_file,
+                                    slot_authority,
+                                    io_lease,
+                                    stdio_was_closed: false,
+                                },
+                                op: crate::dispatch::fs::rw::OwnedCopyInOperation::Sendmsg {
+                                    flags,
+                                    phase: SendmsgCopyInPhase::Iovecs { msg, iovecs, total },
+                                },
+                                suspension: *suspension,
+                            },
+                        )));
+                    }
+                    return Err(DispatchError::Errno(LINUX_EFAULT));
+                }
+                Err(_) => return Err(DispatchError::Errno(LINUX_EFAULT)),
+            };
+            let iovec = decode_kernel_struct::<LinuxIovec>(&iov_bytes, 0)
+                .ok_or(DispatchError::Errno(LINUX_EFAULT))?;
+            if iovec.iov_len > SSIZE_MAX {
+                return Err(DispatchError::Errno(LINUX_EINVAL));
+            }
+            total = total
+                .checked_add(iovec.iov_len)
+                .ok_or(DispatchError::Errno(LINUX_EINVAL))?;
+            if total > SSIZE_MAX {
+                return Err(DispatchError::Errno(LINUX_EINVAL));
+            }
+            iovecs.push(iovec);
+        }
+        self.sendmsg_gather_payload(
+            context,
+            fd,
+            flags,
+            open_file,
+            slot_authority,
+            io_lease,
+            suspend_ctx,
+            msg,
+            iovecs,
+            0,
+            Vec::new(),
+            memory,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sendmsg_gather_payload(
+        &self,
+        context: &crate::kernel::KernelContext,
+        fd: i32,
+        flags: i32,
+        open_file: Option<OpenFile>,
+        slot_authority: Option<crate::kernel::objects::FileSlotAuthority>,
+        io_lease: Option<crate::kernel::objects::FileDescriptionFdLease>,
+        suspend_ctx: Option<(crate::kernel::ThreadKey, crate::thread::ThreadId)>,
+        msg: LinuxMsghdr,
+        iovecs: Vec<LinuxIovec>,
+        start_iovec: usize,
+        mut data: Vec<u8>,
+        memory: &impl CurrentMmMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        for (offset, iov) in iovecs[start_iovec..].iter().enumerate() {
+            let idx = start_iovec + offset;
+            // An empty iovec contributes nothing — and its base is allowed to be
+            // NULL (libuv sends a zero-length datagram as uv_buf_init(NULL, 0)).
+            // read_bytes(NULL, 0) would otherwise fault, so skip it.
+            if iov.iov_len == 0 {
+                continue;
+            }
+            match memory.read_bytes(iov.iov_base, iov.iov_len as usize) {
+                Ok(chunk) => data.extend_from_slice(&chunk),
+                Err(carrick_guest_mem::MemoryError::ReadSuspended(suspension)) => {
+                    if let Some((thread, tid)) = suspend_ctx {
+                        return Ok(DispatchOutcome::WriteCopyInSuspended(Box::new(
+                            crate::dispatch::fs::rw::OwnedWriteCopyIn {
+                                target: crate::dispatch::fs::rw::WriteTarget {
+                                    fd,
+                                    tid,
+                                    thread,
+                                    open_file,
+                                    slot_authority,
+                                    io_lease,
+                                    stdio_was_closed: false,
+                                },
+                                op: crate::dispatch::fs::rw::OwnedCopyInOperation::Sendmsg {
+                                    flags,
+                                    phase: SendmsgCopyInPhase::Payload {
+                                        msg,
+                                        iovecs,
+                                        next_iovec: idx + 1,
+                                        data,
+                                    },
+                                },
+                                suspension: *suspension,
+                            },
+                        )));
+                    }
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                }
+                Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+            }
+        }
+        self.complete_sendmsg_after_payload(
+            context,
+            fd,
+            flags,
+            open_file,
+            slot_authority,
+            io_lease,
+            suspend_ctx,
+            msg,
+            data,
+            None,
+            None,
+            memory,
+        )
+    }
+
+    fn resume_sendmsg_copy_in<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        target: crate::dispatch::fs::rw::WriteTarget,
+        flags: i32,
+        phase: SendmsgCopyInPhase,
+        bytes: Vec<u8>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let suspend_ctx = Some((target.thread, target.tid));
+        match phase {
+            SendmsgCopyInPhase::Msghdr => {
+                let msg = decode_kernel_struct::<LinuxMsghdr>(&bytes, 0)
+                    .ok_or(DispatchError::Errno(LINUX_EFAULT))?;
+                self.sendmsg_from_msghdr(
+                    cx.kernel,
+                    target.fd,
+                    flags,
+                    target.open_file,
+                    target.slot_authority,
+                    target.io_lease,
+                    suspend_ctx,
+                    msg,
+                    &*cx.memory,
+                )
+            }
+            SendmsgCopyInPhase::Iovecs {
+                msg,
+                mut iovecs,
+                mut total,
+            } => {
+                const SSIZE_MAX: u64 = i64::MAX as u64;
+                let iovec = decode_kernel_struct::<LinuxIovec>(&bytes, 0)
+                    .ok_or(DispatchError::Errno(LINUX_EFAULT))?;
+                if iovec.iov_len > SSIZE_MAX {
+                    return Err(DispatchError::Errno(LINUX_EINVAL));
+                }
+                total = total
+                    .checked_add(iovec.iov_len)
+                    .ok_or(DispatchError::Errno(LINUX_EINVAL))?;
+                if total > SSIZE_MAX {
+                    return Err(DispatchError::Errno(LINUX_EINVAL));
+                }
+                iovecs.push(iovec);
+                self.sendmsg_gather_iovecs(
+                    cx.kernel,
+                    target.fd,
+                    flags,
+                    target.open_file,
+                    target.slot_authority,
+                    target.io_lease,
+                    suspend_ctx,
+                    msg,
+                    iovecs,
+                    total,
+                    &*cx.memory,
+                )
+            }
+            SendmsgCopyInPhase::Payload {
+                msg,
+                iovecs,
+                next_iovec,
+                mut data,
+            } => {
+                data.extend_from_slice(&bytes);
+                self.sendmsg_gather_payload(
+                    cx.kernel,
+                    target.fd,
+                    flags,
+                    target.open_file,
+                    target.slot_authority,
+                    target.io_lease,
+                    suspend_ctx,
+                    msg,
+                    iovecs,
+                    next_iovec,
+                    data,
+                    &*cx.memory,
+                )
+            }
+            SendmsgCopyInPhase::Sockaddr { msg, data, family } => {
+                let host_addr = match read_linux_sockaddr_from_bytes(&bytes, family) {
+                    Ok(addr) => Some(addr),
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                };
+                self.complete_sendmsg_after_payload(
+                    cx.kernel,
+                    target.fd,
+                    flags,
+                    target.open_file,
+                    target.slot_authority,
+                    target.io_lease,
+                    suspend_ctx,
+                    msg,
+                    data,
+                    Some(host_addr),
+                    None,
+                    &*cx.memory,
+                )
+            }
+            SendmsgCopyInPhase::Control {
+                msg,
+                data,
+                host_addr,
+            } => self.complete_sendmsg_after_payload(
+                cx.kernel,
+                target.fd,
+                flags,
+                target.open_file,
+                target.slot_authority,
+                target.io_lease,
+                suspend_ctx,
+                msg,
+                data,
+                Some(host_addr),
+                Some(bytes),
+                &*cx.memory,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn complete_sendmsg_after_payload(
+        &self,
+        context: &crate::kernel::KernelContext,
+        fd: i32,
+        flags: i32,
+        open_file: Option<OpenFile>,
+        slot_authority: Option<crate::kernel::objects::FileSlotAuthority>,
+        io_lease: Option<crate::kernel::objects::FileDescriptionFdLease>,
+        suspend_ctx: Option<(crate::kernel::ThreadKey, crate::thread::ThreadId)>,
+        msg: LinuxMsghdr,
+        mut data: Vec<u8>,
+        resolved_host_addr: Option<Option<Vec<u8>>>,
+        resolved_control: Option<Vec<u8>>,
+        memory: &impl CurrentMmMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        if let Some(ref of) = open_file
+            && let Some(socket) = of
+                .description
+                .inspect_kind(|open| match open {
+                    OpenDescription::InMemorySocket { socket, .. } => Some(Arc::clone(socket)),
+                    _ => None,
+                })
+                .flatten()
+        {
             if (flags & LinuxMsgFlags::OOB.bits()) != 0 {
                 if socket.family() == LINUX_AF_UNIX {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -1290,72 +2153,125 @@ impl<'a> NetView<'a> {
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 }
             }
-            return self.send_in_memory_stream(fd, &socket, &data, Vec::new(), flags);
+            return self.send_in_memory_stream_for_open_file(
+                of,
+                slot_authority,
+                &socket,
+                &data,
+                Vec::new(),
+                flags,
+            );
         }
-        let send_view = if is_netlink {
+
+        if let Some(ref of) = open_file
+            && Self::open_file_is_netlink(of)
+        {
+            return Ok(self.netlink_send(context, of, &data));
+        }
+
+        let Some(ref of) = open_file else {
+            return Err(DispatchError::Errno(LINUX_EBADF));
+        };
+        let send_view = self.host_socket_send_view_for_open_file(of)?;
+        let (host_fd, family) = (send_view.host_fd, send_view.family);
+
+        let mut host_addr = if let Some(addr) = resolved_host_addr {
+            addr
+        } else if msg.name == 0 || msg.namelen == 0 {
             None
         } else {
-            Some(self.host_socket_send_view(fd)?)
-        };
-        let (host_fd, family) = send_view.map_or((HostFd(-1), LINUX_AF_NETLINK), |view| {
-            (view.host_fd, view.family)
-        });
-        let msg = read_linux_msghdr(memory, msg_addr)?;
-        let iovecs = read_iovecs(memory, msg.iov, msg.iovlen as usize)?;
-        // Pack iovecs into a single contiguous send. Simple and avoids
-        // having to keep guest pointers alive across the FFI call.
-        let mut data = Vec::new();
-        for iov in iovecs {
-            // An empty iovec contributes nothing — and its base is allowed to be
-            // NULL (libuv sends a zero-length datagram as uv_buf_init(NULL, 0)).
-            // read_bytes(NULL, 0) would otherwise fault, so skip it.
-            if iov.iov_len == 0 {
-                continue;
+            if msg.namelen < 2 {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let chunk = match memory.read_bytes(iov.iov_base, iov.iov_len as usize) {
-                Ok(b) => b,
-                Err(_) => {
+            let raw = match memory.read_bytes(msg.name, msg.namelen as usize) {
+                Ok(raw) => raw,
+                Err(carrick_guest_mem::MemoryError::ReadSuspended(suspension)) => {
+                    if let Some((thread, tid)) = suspend_ctx {
+                        return Ok(DispatchOutcome::WriteCopyInSuspended(Box::new(
+                            crate::dispatch::fs::rw::OwnedWriteCopyIn {
+                                target: crate::dispatch::fs::rw::WriteTarget {
+                                    fd,
+                                    tid,
+                                    thread,
+                                    open_file,
+                                    slot_authority,
+                                    io_lease,
+                                    stdio_was_closed: false,
+                                },
+                                op: crate::dispatch::fs::rw::OwnedCopyInOperation::Sendmsg {
+                                    flags,
+                                    phase: SendmsgCopyInPhase::Sockaddr { msg, data, family },
+                                },
+                                suspension: *suspension,
+                            },
+                        )));
+                    }
                     return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                 }
+                Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
             };
-            data.extend_from_slice(&chunk);
-        }
-        // AF_NETLINK: parse the assembled request and queue a synthetic
-        // dump reply, ignoring the destination sockaddr (always the kernel).
-        if is_netlink {
-            return Ok(self.netlink_send(context, fd, &data));
-        }
-        let mut host_addr = if msg.name == 0 || msg.namelen == 0 {
-            None
-        } else {
-            match read_linux_sockaddr(memory, msg.name, msg.namelen, family) {
+            match read_linux_sockaddr_from_bytes(&raw, family) {
                 Ok(b) => Some(b),
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             }
         };
+
         // MSG_MORE corks only the IP transports; see the sendto arm.
         let is_msg_more = carrick_abi::LinuxMsgFlags::from_bits_retain(flags)
             .contains(carrick_abi::LinuxMsgFlags::MORE)
             && matches!(family, LINUX_AF_INET | LINUX_AF_INET6);
-        let (is_cork_enabled, has_pending_cork) = send_view.map_or((false, false), |view| {
-            (view.cork_enabled, view.has_pending_cork)
-        });
+        let (is_cork_enabled, has_pending_cork) =
+            (send_view.cork_enabled, send_view.has_pending_cork);
 
         if is_cork_enabled || is_msg_more {
             let data_len = data.len();
-            if let Some(open_file) = self.open_file(fd) {
-                open_file
-                    .description
-                    .common()
-                    .cork()
-                    .stage(&data, host_addr.as_deref());
-            }
+            of.description
+                .common()
+                .cork()
+                .stage(&data, host_addr.as_deref());
             return Ok(DispatchOutcome::returned_len(data_len)?);
         }
 
+        let control_raw = if let Some(raw) = resolved_control {
+            Some(raw)
+        } else if msg.control != 0 && msg.controllen > 0 {
+            match memory.read_bytes(msg.control, msg.controllen as usize) {
+                Ok(raw) => Some(raw),
+                Err(carrick_guest_mem::MemoryError::ReadSuspended(suspension)) => {
+                    if let Some((thread, tid)) = suspend_ctx {
+                        return Ok(DispatchOutcome::WriteCopyInSuspended(Box::new(
+                            crate::dispatch::fs::rw::OwnedWriteCopyIn {
+                                target: crate::dispatch::fs::rw::WriteTarget {
+                                    fd,
+                                    tid,
+                                    thread,
+                                    open_file,
+                                    slot_authority,
+                                    io_lease,
+                                    stdio_was_closed: false,
+                                },
+                                op: crate::dispatch::fs::rw::OwnedCopyInOperation::Sendmsg {
+                                    flags,
+                                    phase: SendmsgCopyInPhase::Control {
+                                        msg,
+                                        data,
+                                        host_addr,
+                                    },
+                                },
+                                suspension: *suspension,
+                            },
+                        )));
+                    }
+                    return Err(DispatchError::Errno(LINUX_EFAULT));
+                }
+                Err(_) => return Err(DispatchError::Errno(LINUX_EFAULT)),
+            }
+        } else {
+            None
+        };
+
         let pending_cork_data = if has_pending_cork {
-            self.open_file(fd)
-                .and_then(|open_file| open_file.description.common().cork().take())
+            of.description.common().cork().take()
         } else {
             None
         };
@@ -1369,15 +2285,15 @@ impl<'a> NetView<'a> {
             data = buf;
         }
         if family == LINUX_AF_INET
-            && self.socket_guest_type(fd) == Some(LINUX_SOCK_DGRAM)
+            && Self::socket_guest_type_for_open_file(of) == Some(LINUX_SOCK_DGRAM)
             && let Some(requested) = host_addr
                 .as_deref()
                 .and_then(host_sockaddr_to_socket_addr)
-                .or_else(|| self.connected_guest_peer_addr(fd))
+                .or_else(|| self.connected_guest_peer_addr_for_host_fd(host_fd))
         {
-            if self.maybe_queue_icmp_echo_reply(fd, &data, requested)
-                || self.socket_port_protocol(fd) == Some(PortProtocol::Udp)
-                    && self.maybe_queue_dns_response(fd, &data, requested)
+            if self.maybe_queue_icmp_echo_reply(of, &data, requested)
+                || Self::socket_port_protocol_for_open_file(of) == Some(PortProtocol::Udp)
+                    && self.maybe_queue_dns_response(of, &data, requested)
             {
                 return Ok(DispatchOutcome::returned_len(data.len())?);
             }
@@ -1391,8 +2307,7 @@ impl<'a> NetView<'a> {
         // fds named by `host_control` and un-parks them if the send fails.
         let mut rights = scm_rights::InFlightRights::new();
         let mut explicit_creds = None;
-        if msg.control != 0 && msg.controllen > 0 {
-            let raw = memory.read_bytes(msg.control, msg.controllen as usize)?;
+        if let Some(raw) = control_raw {
             let creds = self.cross.cred_snapshot();
             match support::validate_and_extract_scm_credentials(&raw, context, &creds) {
                 Ok(creds) => explicit_creds = creds,
@@ -1420,13 +2335,13 @@ impl<'a> NetView<'a> {
                 host_control.extend_from_slice(&build_host_ipv6_cmsgs(&ipv6));
             }
         }
-        let nonblocking = self.io_is_nonblocking(fd, flags);
+        let nonblocking = self.open_file_is_nonblocking(of, flags);
         let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
         // A guest SCTP stream is backed by TCP, which carries no message
         // boundaries; record where each message ends so the receiver can report
         // MSG_EOR the way Linux does.
         let (guest_domain, guest_type, guest_protocol) =
-            match self.socket_guest_domain_type_and_protocol(fd) {
+            match Self::socket_guest_domain_type_and_protocol_for_open_file(of) {
                 Some(triple) => (Some(triple.0), Some(triple.1), Some(triple.2)),
                 None => (None, None, None),
             };
@@ -1436,9 +2351,7 @@ impl<'a> NetView<'a> {
         if is_unix_stream && host_addr.is_some() && host_socket_is_connected(host_fd.get()) {
             return Ok(DispatchOutcome::errno(LINUX_EISCONN));
         }
-        let send_to = self
-            .open_file(fd)
-            .and_then(|f| crate::kernel::FileDescription::inspect(&f.description)?.send_timeout());
+        let send_to = of.description.inspect_kind(|d| d.send_timeout()).flatten();
         // `uv_udp_send` lowers to sendmsg, not sendto, so this path needs the
         // routing just as much as `sendto` does.
         let recverr_send_fd = match (&host_addr, recverr::is_enabled(host_fd.get())) {
@@ -1446,14 +2359,12 @@ impl<'a> NetView<'a> {
                 .and_then(|local| recverr::shadow_for_send(host_fd.get(), &local, dest)),
             _ => None,
         };
-        let outbound_flow = self
-            .open_file(fd)
-            .and_then(|f| f.description.common().outbound_flow());
+        let outbound_flow = of.description.common().outbound_flow();
         let creds = self.cross.cred_snapshot();
         let my_cred =
             explicit_creds.unwrap_or_else(|| current_task_default_send_cred(&creds, context));
-        let outcome = self.blocking_io(
-            fd,
+        let outcome = self.blocking_io_with_slot(
+            slot_authority,
             host_fd.get(),
             IoDir::Write,
             nonblocking,
@@ -1533,8 +2444,8 @@ impl<'a> NetView<'a> {
         } else {
             rights.abort();
         }
-        let final_outcome = self.settle_cork_send(
-            fd,
+        let final_outcome = self.settle_cork_send_for_open_file(
+            of,
             outcome,
             Some(&data),
             data.len() - current_payload_len,
@@ -1559,9 +2470,9 @@ impl<'a> NetView<'a> {
     /// sees `EAGAIN`. Unsent corked bytes go back to the front of the cork
     /// buffer so the next send or the close-time flush still delivers them
     /// in order.
-    fn settle_cork_send(
+    fn settle_cork_send_for_open_file(
         &self,
-        fd: i32,
+        open_file: &OpenFile,
         outcome: DispatchOutcome,
         combined: Option<&[u8]>,
         cork_len: usize,
@@ -1571,7 +2482,7 @@ impl<'a> NetView<'a> {
             if cork_len > 0
                 && let Some(combined) = combined
             {
-                self.restore_cork_prefix(fd, &combined[..cork_len]);
+                self.restore_cork_prefix_for_open_file(open_file, &combined[..cork_len]);
             }
             return outcome;
         };
@@ -1581,7 +2492,7 @@ impl<'a> NetView<'a> {
         let sent = value as usize;
         if sent < cork_len {
             if let Some(combined) = combined {
-                self.restore_cork_prefix(fd, &combined[sent..cork_len]);
+                self.restore_cork_prefix_for_open_file(open_file, &combined[sent..cork_len]);
             }
             return if nonblocking {
                 DispatchOutcome::errno(LINUX_EAGAIN)
@@ -1597,13 +2508,11 @@ impl<'a> NetView<'a> {
     }
 
     /// Put not-yet-accepted corked bytes back ahead of anything corked since.
-    fn restore_cork_prefix(&self, fd: i32, unsent: &[u8]) {
+    fn restore_cork_prefix_for_open_file(&self, open_file: &OpenFile, unsent: &[u8]) {
         if unsent.is_empty() {
             return;
         }
-        if let Some(open_file) = self.open_file(fd) {
-            open_file.description.common().cork().restore_prefix(unsent);
-        }
+        open_file.description.common().cork().restore_prefix(unsent);
     }
 
     /// Serve one `recvmsg(MSG_ERRQUEUE)` from this socket's modelled Linux

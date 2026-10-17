@@ -1026,10 +1026,8 @@ impl<'a> NetView<'a> {
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    pub(super) fn queue_socket_error_after_send(&self, fd: i32) {
-        if let Some(open_file) = self.open_file(fd)
-            && let Some(mut open) =
-                crate::kernel::FileDescription::write_for_io(&open_file.description)
+    pub(super) fn queue_socket_error_after_send(&self, open_file: &OpenFile) {
+        if let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description)
             && let OpenDescription::HostSocket { base, .. } = &mut *open
             && let Some(errno) = base.socket_error_after_send()
         {
@@ -1166,50 +1164,79 @@ impl<'a> NetView<'a> {
     /// with a host SOCK_STREAM, so the host's SO_TYPE would mis-report it.
     pub(in crate::dispatch) fn socket_guest_type(&self, fd: i32) -> Option<i32> {
         let open_file = self.open_file(fd)?;
-        let open = crate::kernel::FileDescription::inspect(&open_file.description)?;
-        match &*open {
-            OpenDescription::HostSocket { type_, .. } => Some(*type_),
-            OpenDescription::Netlink { sock_type, .. } => Some(*sock_type),
-            OpenDescription::Packet { socket, .. } => Some(socket.sock_type),
-            _ => None,
-        }
+        Self::socket_guest_type_for_open_file(&open_file)
+    }
+
+    pub(in crate::dispatch) fn socket_guest_type_for_open_file(
+        open_file: &OpenFile,
+    ) -> Option<i32> {
+        open_file
+            .description
+            .inspect_kind(|open| match open {
+                OpenDescription::HostSocket { type_, .. } => Some(*type_),
+                OpenDescription::Netlink { sock_type, .. } => Some(*sock_type),
+                OpenDescription::Packet { socket, .. } => Some(socket.sock_type),
+                _ => None,
+            })
+            .flatten()
     }
 
     pub(super) fn socket_guest_domain_type_and_protocol(&self, fd: i32) -> Option<(i32, i32, i32)> {
         let open_file = self.open_file(fd)?;
-        let open = crate::kernel::FileDescription::inspect(&open_file.description)?;
-        match &*open {
-            OpenDescription::HostSocket {
-                family,
-                type_,
-                protocol,
-                ..
-            } => Some((*family, *type_, *protocol)),
-            OpenDescription::Netlink {
-                sock_type,
-                protocol,
-                ..
-            } => Some((LINUX_AF_NETLINK, *sock_type, *protocol)),
-            OpenDescription::Packet { socket, .. } => {
-                Some((LINUX_AF_PACKET, socket.sock_type, socket.protocol as i32))
-            }
-            _ => None,
-        }
+        Self::socket_guest_domain_type_and_protocol_for_open_file(&open_file)
+    }
+
+    pub(super) fn socket_guest_domain_type_and_protocol_for_open_file(
+        open_file: &OpenFile,
+    ) -> Option<(i32, i32, i32)> {
+        open_file
+            .description
+            .inspect_kind(|open| match open {
+                OpenDescription::HostSocket {
+                    family,
+                    type_,
+                    protocol,
+                    ..
+                } => Some((*family, *type_, *protocol)),
+                OpenDescription::Netlink {
+                    sock_type,
+                    protocol,
+                    ..
+                } => Some((LINUX_AF_NETLINK, *sock_type, *protocol)),
+                OpenDescription::Packet { socket, .. } => {
+                    Some((LINUX_AF_PACKET, socket.sock_type, socket.protocol as i32))
+                }
+                _ => None,
+            })
+            .flatten()
     }
 
     pub(in crate::dispatch) fn socket_guest_protocol(&self, fd: i32) -> Option<i32> {
         let open_file = self.open_file(fd)?;
-        let open = crate::kernel::FileDescription::inspect(&open_file.description)?;
-        match &*open {
-            OpenDescription::HostSocket { protocol, .. } => Some(*protocol),
-            OpenDescription::Netlink { protocol, .. } => Some(*protocol),
-            OpenDescription::Packet { socket, .. } => Some(socket.protocol as i32),
-            _ => None,
-        }
+        Self::socket_guest_protocol_for_open_file(&open_file)
+    }
+
+    pub(in crate::dispatch) fn socket_guest_protocol_for_open_file(
+        open_file: &OpenFile,
+    ) -> Option<i32> {
+        open_file
+            .description
+            .inspect_kind(|open| match open {
+                OpenDescription::HostSocket { protocol, .. } => Some(*protocol),
+                OpenDescription::Netlink { protocol, .. } => Some(*protocol),
+                OpenDescription::Packet { socket, .. } => Some(socket.protocol as i32),
+                _ => None,
+            })
+            .flatten()
     }
 
     pub(super) fn socket_port_protocol(&self, fd: i32) -> Option<PortProtocol> {
-        match self.socket_guest_type(fd)? {
+        let open_file = self.open_file(fd)?;
+        Self::socket_port_protocol_for_open_file(&open_file)
+    }
+
+    pub(super) fn socket_port_protocol_for_open_file(open_file: &OpenFile) -> Option<PortProtocol> {
+        match Self::socket_guest_type_for_open_file(open_file)? {
             LINUX_SOCK_STREAM => Some(PortProtocol::Tcp),
             LINUX_SOCK_DGRAM => Some(PortProtocol::Udp),
             _ => None,
@@ -1218,12 +1245,12 @@ impl<'a> NetView<'a> {
 
     pub(in crate::dispatch) fn maybe_queue_icmp_echo_reply(
         &self,
-        fd: i32,
+        open_file: &OpenFile,
         request: &[u8],
         requested: std::net::SocketAddr,
     ) -> bool {
-        if self.socket_guest_protocol(fd) != Some(LINUX_IPPROTO_ICMP)
-            || self.socket_guest_type(fd) != Some(LINUX_SOCK_DGRAM)
+        if Self::socket_guest_protocol_for_open_file(open_file) != Some(LINUX_IPPROTO_ICMP)
+            || Self::socket_guest_type_for_open_file(open_file) != Some(LINUX_SOCK_DGRAM)
             || !requested.ip().is_loopback()
             || request.len() < 8
             || request[0] != LINUX_ICMP_ECHO_REQUEST
@@ -1239,12 +1266,12 @@ impl<'a> NetView<'a> {
         response[2..4].fill(0);
         let checksum = internet_checksum(&response);
         response[2..4].copy_from_slice(&checksum.to_be_bytes());
-        self.queue_synthetic_datagram(fd, response, source)
+        self.queue_synthetic_datagram(open_file, response, source)
     }
 
     pub(in crate::dispatch) fn maybe_queue_dns_response(
         &self,
-        fd: i32,
+        open_file: &OpenFile,
         request: &[u8],
         requested: std::net::SocketAddr,
     ) -> bool {
@@ -1265,24 +1292,17 @@ impl<'a> NetView<'a> {
         }) else {
             return false;
         };
-        self.queue_synthetic_datagram(fd, response, source)
+        self.queue_synthetic_datagram(open_file, response, source)
     }
 
-    /// Park a datagram carrick produced in-process on `fd`'s synthetic receive
-    /// queue and publish the readiness change.
-    ///
-    /// The host kernel never sees these bytes, so nothing on an epoll
-    /// instance's kqueue fires for them: a waiter already parked in
-    /// `epoll_wait` must be pulsed through `notify_inmem_epoll`, after which
-    /// its re-sample (`epoll_ready_events`) reports the queue as EPOLLIN. A
-    /// `recvfrom`/`recvmsg` issued after the send needs no wake -- it drains
-    /// this queue before touching the host fd (`synthetic_datagram_drain`).
-    /// Every in-process datagram producer (ICMP echo, the DNS gateway) goes
-    /// through here so none can forget the broadcast again.
-    fn queue_synthetic_datagram(&self, fd: i32, payload: Vec<u8>, source: Vec<u8>) -> bool {
-        let Some(open_file) = self.open_file(fd) else {
-            return false;
-        };
+    /// Park a datagram carrick produced in-process on `open_file`'s synthetic
+    /// receive queue and publish the readiness change.
+    fn queue_synthetic_datagram(
+        &self,
+        open_file: &OpenFile,
+        payload: Vec<u8>,
+        source: Vec<u8>,
+    ) -> bool {
         {
             let Some(mut open) =
                 crate::kernel::FileDescription::write_for_io(&open_file.description)
@@ -1315,8 +1335,10 @@ impl<'a> NetView<'a> {
             && matches!(addr.ip(), std::net::IpAddr::V4(ip) if ip == self.network.spec.gateway_v4)
     }
 
-    pub(super) fn connected_guest_peer_addr(&self, fd: i32) -> Option<std::net::SocketAddr> {
-        let (host_fd, _family) = self.host_socket_lookup(fd).ok()?;
+    pub(super) fn connected_guest_peer_addr_for_host_fd(
+        &self,
+        host_fd: HostFd,
+    ) -> Option<std::net::SocketAddr> {
         self.network
             .provider
             .guest_visible_peer_addr(crate::network::SocketKey::for_host_fd(host_fd.get()))

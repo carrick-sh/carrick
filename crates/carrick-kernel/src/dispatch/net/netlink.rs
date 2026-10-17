@@ -48,18 +48,22 @@ impl<'a> NetView<'a> {
         })
     }
 
+    pub(in crate::dispatch) fn open_file_is_netlink(open_file: &OpenFile) -> bool {
+        open_file
+            .description
+            .inspect_kind(|open| matches!(open, OpenDescription::Netlink { .. }))
+            .unwrap_or(false)
+    }
+
     /// Handle a netlink "send": parse the request and queue a synthetic
     /// rtnetlink dump reply (or a bare NLMSG_DONE for requests we don't
     /// specifically model). Returns the number of bytes "sent".
     pub(in crate::dispatch) fn netlink_send(
         &self,
         context: &crate::kernel::KernelContext,
-        fd: i32,
+        open_file: &OpenFile,
         request: &[u8],
     ) -> DispatchOutcome {
-        let Some(open_file) = self.open_file(fd) else {
-            return DispatchOutcome::errno(LINUX_EBADF);
-        };
         let reply = {
             let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description) else {
                 return DispatchOutcome::errno(LINUX_ENOTSOCK);

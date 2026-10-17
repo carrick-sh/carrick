@@ -38,6 +38,15 @@ enum PwritevPayloads {
     Staged(Vec<Vec<u8>>),
 }
 
+enum PwritevPrepareOutcome {
+    Ready(PwritevPayloads),
+    Suspended {
+        staged_iovecs: Vec<Vec<u8>>,
+        next_iovec: usize,
+        suspension: Box<carrick_guest_mem::MemoryReadSuspension>,
+    },
+}
+
 /// The payload of one `write(2)` to a host file: a private staged copy, or an
 /// admitted guest source written through raw pointers (never a slice).
 enum WriteSource<'a> {
@@ -45,22 +54,106 @@ enum WriteSource<'a> {
     Guest(&'a carrick_guest_mem::HostRead),
 }
 
-/// A single write's source transfer and exact destination. The functional
-/// lease keeps the description live if its numeric slot is closed or reused.
+/// A single copy-in write's source transfer, progress, and exact destination.
+/// The functional lease keeps the description live if its numeric slot is
+/// closed or reused while suspended on an owner-memory wait.
 pub struct OwnedWriteCopyIn {
-    target: WriteTarget,
-    suspension: carrick_guest_mem::MemoryReadSuspension,
+    pub(in crate::dispatch) target: WriteTarget,
+    pub(in crate::dispatch) op: OwnedCopyInOperation,
+    pub(in crate::dispatch) suspension: carrick_guest_mem::MemoryReadSuspension,
 }
 
-struct WriteTarget {
-    fd: i32,
-    length: usize,
-    tid: crate::thread::ThreadId,
-    thread: crate::kernel::ThreadKey,
-    open_file: Option<OpenFile>,
-    slot_authority: Option<crate::kernel::objects::FileSlotAuthority>,
-    io_lease: Option<crate::kernel::objects::FileDescriptionFdLease>,
-    stdio_was_closed: bool,
+#[derive(::core::clone::Clone)]
+pub(in crate::dispatch) struct WriteTarget {
+    pub(in crate::dispatch) fd: i32,
+    pub(in crate::dispatch) tid: crate::thread::ThreadId,
+    pub(in crate::dispatch) thread: crate::kernel::ThreadKey,
+    pub(in crate::dispatch) open_file: Option<OpenFile>,
+    pub(in crate::dispatch) slot_authority: Option<crate::kernel::objects::FileSlotAuthority>,
+    pub(in crate::dispatch) io_lease: Option<crate::kernel::objects::FileDescriptionFdLease>,
+    pub(in crate::dispatch) stdio_was_closed: bool,
+}
+
+pub(in crate::dispatch) enum OwnedCopyInOperation {
+    Write {
+        length: usize,
+    },
+    Pwrite64 {
+        length: usize,
+        offset: i64,
+    },
+    Writev(WritevCopyInState),
+    Pwritev {
+        offset: i64,
+        write_at_current: bool,
+        phase: PwritevCopyInPhase,
+    },
+    Sendto {
+        len: usize,
+        flags: i32,
+        dest_addr: u64,
+        dest_len: u32,
+        phase: crate::dispatch::net::send_recv::SendtoCopyInPhase,
+    },
+    Sendmsg {
+        flags: i32,
+        phase: crate::dispatch::net::send_recv::SendmsgCopyInPhase,
+    },
+}
+
+pub(in crate::dispatch) enum PwritevCopyInPhase {
+    Iovecs {
+        iov_addr: u64,
+        iovcnt: usize,
+        iovecs: Vec<LinuxIovec>,
+        total: u64,
+    },
+    Payloads {
+        iovecs: Vec<LinuxIovec>,
+        staged_iovecs: Vec<Vec<u8>>,
+        next_iovec: usize,
+    },
+}
+
+pub(in crate::dispatch) struct WritevCopyInState {
+    pub(in crate::dispatch) iovecs: Vec<LinuxIovec>,
+    pub(in crate::dispatch) nonblocking: bool,
+    pub(in crate::dispatch) phase: WritevCopyInPhase,
+}
+
+pub(in crate::dispatch) enum WritevCopyInPhase {
+    Iovecs {
+        iov_addr: u64,
+        iovcnt: usize,
+        total: u64,
+    },
+    EventFd {
+        state: Arc<EventFdState>,
+        index: usize,
+        total: usize,
+    },
+    EventFdTail {
+        state: Arc<EventFdState>,
+        first_value: u64,
+        next_iovec: usize,
+        tail: Vec<u8>,
+        total: usize,
+    },
+    BoundedGather {
+        next_iovec: usize,
+        gathered: Vec<u8>,
+    },
+    PerIovec {
+        iovec_index: usize,
+        total: usize,
+    },
+    BlockingWriteTail {
+        write: BlockingWrite,
+        current_iovec_len: usize,
+        next_iovec: usize,
+        tail: Vec<u8>,
+        total: usize,
+    },
 }
 
 impl std::fmt::Debug for OwnedWriteCopyIn {
@@ -99,7 +192,29 @@ impl SyscallDispatcher {
         thread: Option<ThreadCtx<'_>>,
         route: OrdinaryDispatchRoute<'_, '_>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        if request.number != carrick_abi::syscall::nr::WRITE {
+        let expected_match = matches!(
+            (request.number, &pending.op),
+            (
+                carrick_abi::syscall::nr::WRITE,
+                OwnedCopyInOperation::Write { .. },
+            ) | (
+                carrick_abi::syscall::nr::WRITEV,
+                OwnedCopyInOperation::Writev(_),
+            ) | (
+                carrick_abi::syscall::nr::PWRITE64,
+                OwnedCopyInOperation::Pwrite64 { .. },
+            ) | (
+                carrick_abi::syscall::nr::PWRITEV | carrick_abi::syscall::nr::PWRITEV2,
+                OwnedCopyInOperation::Pwritev { .. },
+            ) | (
+                carrick_abi::syscall::nr::SENDTO,
+                OwnedCopyInOperation::Sendto { .. },
+            ) | (
+                carrick_abi::syscall::nr::SENDMSG,
+                OwnedCopyInOperation::Sendmsg { .. },
+            )
+        );
+        if !expected_match {
             tracing::error!("write completion belongs to a different syscall");
             return Err(DispatchError::Errno(carrick_abi::LINUX_EIO));
         }
@@ -114,7 +229,18 @@ impl SyscallDispatcher {
             mm_executor: route.mm_executor,
         };
         resources::with_captured_resources(kernel, || {
-            let outcome = self.fs_view().resume_write_copy_in(&mut cx, pending)?;
+            let rearm_target = pending
+                .target
+                .open_file
+                .as_ref()
+                .map(|open_file| Arc::clone(&open_file.description));
+            resources::stage_io_rearm(kernel, crate::dispatch::net::IoRearm::write(rearm_target))?;
+            let outcome = match &pending.op {
+                OwnedCopyInOperation::Sendto { .. } | OwnedCopyInOperation::Sendmsg { .. } => {
+                    self.net_view().resume_net_copy_in(&mut cx, pending)?
+                }
+                _ => self.fs_view().resume_write_copy_in(&mut cx, pending)?,
+            };
             self.complete_io_rearm(kernel, &request, &outcome);
             Ok(outcome)
         })
@@ -146,10 +272,78 @@ fn retained_executable_bytes(
         })
 }
 
+enum ReadIovecsOutcome {
+    Ready(Vec<LinuxIovec>),
+    Suspended {
+        iovecs: Vec<LinuxIovec>,
+        total: u64,
+        suspension: Box<carrick_guest_mem::MemoryReadSuspension>,
+    },
+}
+
+fn push_resumed_iovec(
+    bytes: &[u8],
+    iovecs: &mut Vec<LinuxIovec>,
+    total: &mut u64,
+) -> Result<(), LinuxErrno> {
+    const SSIZE_MAX: u64 = i64::MAX as u64;
+    let size = core::mem::size_of::<LinuxIovec>();
+    let iovec = bytes
+        .get(..size)
+        .and_then(|slice| LinuxIovec::read_from_bytes(slice).ok())
+        .ok_or(LINUX_EFAULT)?;
+    if iovec.iov_len > SSIZE_MAX {
+        return Err(LINUX_EINVAL);
+    }
+    *total = total.checked_add(iovec.iov_len).ok_or(LINUX_EINVAL)?;
+    if *total > SSIZE_MAX {
+        return Err(LINUX_EINVAL);
+    }
+    iovecs.push(iovec);
+    Ok(())
+}
+
+fn read_iovecs_from(
+    memory: &impl CurrentMmMemory,
+    address: u64,
+    count: usize,
+    mut iovecs: Vec<LinuxIovec>,
+    mut total: u64,
+) -> Result<ReadIovecsOutcome, LinuxErrno> {
+    if count > LINUX_IOV_MAX {
+        return Err(LINUX_EINVAL);
+    }
+    let size = core::mem::size_of::<LinuxIovec>();
+    while iovecs.len() < count {
+        let index = iovecs.len();
+        let offset = index
+            .checked_mul(size)
+            .and_then(|offset| u64::try_from(offset).ok())
+            .ok_or(LINUX_EINVAL)?;
+        let iovec_address = address.checked_add(offset).ok_or(LINUX_EFAULT)?;
+        if iovec_address == 0 {
+            return Err(LINUX_EFAULT);
+        }
+        let iov_bytes = match memory.read_bytes(iovec_address, size) {
+            Ok(bytes) => bytes,
+            Err(MemoryError::ReadSuspended(suspension)) => {
+                return Ok(ReadIovecsOutcome::Suspended {
+                    iovecs,
+                    total,
+                    suspension,
+                });
+            }
+            Err(_) => return Err(LINUX_EFAULT),
+        };
+        push_resumed_iovec(&iov_bytes, &mut iovecs, &mut total)?;
+    }
+    Ok(ReadIovecsOutcome::Ready(iovecs))
+}
+
 fn prepare_pwritev_payloads(
     memory: &impl CurrentMmMemory,
     iovecs: &[LinuxIovec],
-) -> Result<PwritevPayloads, LinuxErrno> {
+) -> Result<PwritevPrepareOutcome, LinuxErrno> {
     let mut borrowed_iovecs = Vec::with_capacity(iovecs.len());
     let mut reads = Vec::with_capacity(iovecs.len());
     let mut all_borrowed = true;
@@ -169,16 +363,24 @@ fn prepare_pwritev_payloads(
         reads.push(read);
     }
     if all_borrowed {
-        return Ok(PwritevPayloads::Borrowed {
+        return Ok(PwritevPrepareOutcome::Ready(PwritevPayloads::Borrowed {
             iovecs: borrowed_iovecs,
             reads,
-        });
+        }));
     }
     drop(reads);
 
-    let mut staged_iovecs = Vec::with_capacity(iovecs.len());
-    let mut faulted = false;
-    for iovec in iovecs {
+    stage_pwritev_payloads_from(memory, iovecs, Vec::with_capacity(iovecs.len()), 0)
+}
+
+fn stage_pwritev_payloads_from(
+    memory: &impl CurrentMmMemory,
+    iovecs: &[LinuxIovec],
+    mut staged_iovecs: Vec<Vec<u8>>,
+    start_index: usize,
+) -> Result<PwritevPrepareOutcome, LinuxErrno> {
+    for (offset, iovec) in iovecs[start_index..].iter().enumerate() {
+        let idx = start_index + offset;
         let iov_len = usize::try_from(iovec.iov_len).map_err(|_| LINUX_EINVAL)?;
         // A zero-length iovec segment is permitted and must NOT fault, even
         // with a NULL/invalid base.
@@ -186,16 +388,21 @@ fn prepare_pwritev_payloads(
             staged_iovecs.push(Vec::new());
             continue;
         }
-        let Ok(bytes) = memory.read_bytes(iovec.iov_base, iov_len) else {
-            faulted = true;
-            break;
-        };
-        staged_iovecs.push(bytes);
+        match memory.read_bytes(iovec.iov_base, iov_len) {
+            Ok(bytes) => staged_iovecs.push(bytes),
+            Err(MemoryError::ReadSuspended(suspension)) => {
+                return Ok(PwritevPrepareOutcome::Suspended {
+                    staged_iovecs,
+                    next_iovec: idx + 1,
+                    suspension,
+                });
+            }
+            Err(_) => return Err(LINUX_EFAULT),
+        }
     }
-    if faulted {
-        return Err(LINUX_EFAULT);
-    }
-    Ok(PwritevPayloads::Staged(staged_iovecs))
+    Ok(PwritevPrepareOutcome::Ready(PwritevPayloads::Staged(
+        staged_iovecs,
+    )))
 }
 
 struct PreparedReadvTargets {
@@ -406,9 +613,14 @@ impl<'a> FsView<'a> {
     fn suspend_write_copy_in(
         &self,
         target: WriteTarget,
+        op: OwnedCopyInOperation,
         suspension: carrick_guest_mem::MemoryReadSuspension,
     ) -> DispatchOutcome {
-        DispatchOutcome::WriteCopyInSuspended(Box::new(OwnedWriteCopyIn { target, suspension }))
+        DispatchOutcome::WriteCopyInSuspended(Box::new(OwnedWriteCopyIn {
+            target,
+            op,
+            suspension,
+        }))
     }
 
     pub(in crate::dispatch) fn resume_write_copy_in<M: CurrentMmMemory>(
@@ -429,32 +641,205 @@ impl<'a> FsView<'a> {
                 pending.suspension = *suspension;
                 return Ok(DispatchOutcome::WriteCopyInSuspended(pending));
             }
-            Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+            Err(_) => {
+                return match pending.op {
+                    OwnedCopyInOperation::Writev(WritevCopyInState {
+                        phase:
+                            WritevCopyInPhase::EventFd { total, .. }
+                            | WritevCopyInPhase::PerIovec { total, .. },
+                        ..
+                    }) if total > 0 => Ok(DispatchOutcome::returned_len_or_errno(total)),
+                    OwnedCopyInOperation::Writev(WritevCopyInState {
+                        nonblocking,
+                        phase: WritevCopyInPhase::BoundedGather { gathered, .. },
+                        ..
+                    }) => {
+                        let faulted = gathered.is_empty();
+                        self.complete_bounded_host_writev(
+                            cx,
+                            &pending.target,
+                            nonblocking,
+                            gathered,
+                            faulted,
+                        )
+                    }
+                    OwnedCopyInOperation::Writev(WritevCopyInState {
+                        phase:
+                            WritevCopyInPhase::EventFdTail {
+                                state,
+                                first_value,
+                                tail,
+                                total,
+                                ..
+                            },
+                        ..
+                    }) => {
+                        let Some(lease) = pending.target.io_lease.or_else(|| {
+                            pending
+                                .target
+                                .open_file
+                                .as_ref()?
+                                .description
+                                .retain_fd_lease()
+                        }) else {
+                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                        };
+                        Ok(DispatchOutcome::BlockingWrite(
+                            BlockingWrite::eventfd(state, lease, first_value, pending.target.tid)
+                                .with_writev_tail(tail, total),
+                        ))
+                    }
+                    OwnedCopyInOperation::Writev(WritevCopyInState {
+                        phase:
+                            WritevCopyInPhase::BlockingWriteTail {
+                                write,
+                                current_iovec_len,
+                                tail,
+                                total,
+                                ..
+                            },
+                        ..
+                    }) => {
+                        let boundary =
+                            writev_pipe_fault_boundary(total, current_iovec_len, tail.len());
+                        let write = match &write.target {
+                            crate::dispatch::outcome::BlockingWriteTarget::InMemoryPipe(_) => {
+                                write.with_in_memory_pipe_writev_boundary(tail, total, boundary)
+                            }
+                            crate::dispatch::outcome::BlockingWriteTarget::Host(_) => {
+                                write.with_writev_tail(tail, total)
+                            }
+                            crate::dispatch::outcome::BlockingWriteTarget::EventFd(_) => write,
+                        };
+                        Ok(DispatchOutcome::BlockingWrite(write))
+                    }
+                    _ => Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                };
+            }
         };
-        let WriteTarget {
-            fd,
-            length,
-            tid,
-            open_file,
-            slot_authority,
-            io_lease,
-            stdio_was_closed,
-            ..
-        } = pending.target;
-        self.write(
-            cx,
-            fd,
-            length,
-            tid,
-            open_file,
-            slot_authority,
-            None,
-            false,
-            &bytes,
-            io_lease,
-            stdio_was_closed,
-        )
+        match pending.op {
+            OwnedCopyInOperation::Write { length } => {
+                let WriteTarget {
+                    fd,
+                    tid,
+                    open_file,
+                    slot_authority,
+                    io_lease,
+                    stdio_was_closed,
+                    ..
+                } = pending.target;
+                self.write(
+                    cx,
+                    fd,
+                    length,
+                    tid,
+                    open_file,
+                    slot_authority,
+                    None,
+                    false,
+                    &bytes,
+                    io_lease,
+                    stdio_was_closed,
+                )
+            }
+            OwnedCopyInOperation::Pwrite64 { length, offset } => {
+                self.pwrite64(cx, pending.target, bytes, length, offset)
+            }
+            OwnedCopyInOperation::Writev(state) => {
+                self.resume_writev_copy_in(cx, pending.target, state, bytes)
+            }
+            OwnedCopyInOperation::Pwritev {
+                offset,
+                write_at_current,
+                phase,
+            } => match phase {
+                PwritevCopyInPhase::Iovecs {
+                    iov_addr,
+                    iovcnt,
+                    mut iovecs,
+                    mut total,
+                } => {
+                    if let Err(errno) = push_resumed_iovec(&bytes, &mut iovecs, &mut total) {
+                        return Ok(DispatchOutcome::errno(errno));
+                    }
+                    let iovecs =
+                        match read_iovecs_from(&*cx.memory, iov_addr, iovcnt, iovecs, total) {
+                            Ok(ReadIovecsOutcome::Ready(iovecs)) => iovecs,
+                            Ok(ReadIovecsOutcome::Suspended {
+                                iovecs,
+                                total,
+                                suspension,
+                            }) => {
+                                return Ok(self.suspend_write_copy_in(
+                                    pending.target,
+                                    OwnedCopyInOperation::Pwritev {
+                                        offset,
+                                        write_at_current,
+                                        phase: PwritevCopyInPhase::Iovecs {
+                                            iov_addr,
+                                            iovcnt,
+                                            iovecs,
+                                            total,
+                                        },
+                                    },
+                                    *suspension,
+                                ));
+                            }
+                            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                        };
+                    self.pwritev_from_iovecs(cx, pending.target, iovecs, offset, write_at_current)
+                }
+                PwritevCopyInPhase::Payloads {
+                    iovecs,
+                    mut staged_iovecs,
+                    next_iovec,
+                } => {
+                    staged_iovecs.push(bytes);
+                    let payloads = match stage_pwritev_payloads_from(
+                        &*cx.memory,
+                        &iovecs,
+                        staged_iovecs,
+                        next_iovec,
+                    ) {
+                        Ok(PwritevPrepareOutcome::Ready(payloads)) => payloads,
+                        Ok(PwritevPrepareOutcome::Suspended {
+                            staged_iovecs,
+                            next_iovec,
+                            suspension,
+                        }) => {
+                            return Ok(self.suspend_write_copy_in(
+                                pending.target,
+                                OwnedCopyInOperation::Pwritev {
+                                    offset,
+                                    write_at_current,
+                                    phase: PwritevCopyInPhase::Payloads {
+                                        iovecs,
+                                        staged_iovecs,
+                                        next_iovec,
+                                    },
+                                },
+                                *suspension,
+                            ));
+                        }
+                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                    };
+                    self.pwritev(
+                        cx,
+                        pending.target,
+                        iovecs,
+                        payloads,
+                        offset,
+                        write_at_current,
+                    )
+                }
+            },
+            OwnedCopyInOperation::Sendto { .. } | OwnedCopyInOperation::Sendmsg { .. } => {
+                tracing::error!("fs copy-in resume received socket operation");
+                Err(DispatchError::Errno(carrick_abi::LINUX_EIO))
+            }
+        }
     }
+
     /// The RLIMIT_FSIZE soft cap the guest set via setrlimit/prlimit64, or
     /// `None` when unset / RLIM_INFINITY. A write whose bytes would land past
     /// this offset is EFBIG + SIGXFSZ on Linux (llseek01). Stored in the
@@ -493,7 +878,6 @@ impl<'a> FsView<'a> {
     fn write_host_file<M: CurrentMmMemory>(
         &self,
         cx: &mut SyscallCtx<'_, M>,
-        fd: i32,
         tid: crate::thread::ThreadId,
         source: WriteSource<'_>,
         open_file: &OpenFile,
@@ -554,34 +938,18 @@ impl<'a> FsView<'a> {
             let host_wait_ref = host_wait_runner
                 .as_ref()
                 .map(|runner| runner as &dyn HostWaitRunner);
-            let target = match slot_authority {
-                Some(slot) => HostPipeWriteTarget::new(
-                    raw_fd,
-                    None,
-                    nonblocking,
-                    HostWriteKind::RegularFile,
-                    tid,
-                    slot,
-                    self.cross.host_signal(),
-                ),
-                None => {
-                    let Some(wait_authority) = self
-                        .captured_slot_authority(fd)
-                        .map(WaitFdAuthority::logical)
-                    else {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    };
-                    HostPipeWriteTarget::new(
-                        raw_fd,
-                        None,
-                        nonblocking,
-                        HostWriteKind::RegularFile,
-                        tid,
-                        wait_authority,
-                        self.cross.host_signal(),
-                    )
-                }
-            }
+            let Some(slot) = slot_authority else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            let target = HostPipeWriteTarget::new(
+                raw_fd,
+                None,
+                nonblocking,
+                HostWriteKind::RegularFile,
+                tid,
+                slot,
+                self.cross.host_signal(),
+            )
             .with_host_wait(host_wait_ref);
             let out = match source {
                 WriteSource::Staged(bytes) => write_host_pipe(&bytes[..write_len], target)?,
@@ -733,7 +1101,6 @@ impl<'a> FsView<'a> {
                 };
                 return this.write_host_file(
                     cx,
-                    fd,
                     tid,
                     source,
                     &open_file,
@@ -837,7 +1204,7 @@ impl<'a> FsView<'a> {
                         if let DispatchOutcome::Returned { value } = outcome {
                             if value > 0 {
                                 this.notify_inmem_epoll();
-                                this.fasync_notify_after_write(cx.kernel, fd, value);
+                                this.fasync_notify_after_write(cx.kernel, fd, &open_file, value);
                             }
                         }
                         return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
@@ -960,9 +1327,8 @@ impl<'a> FsView<'a> {
                             DispatchOutcome::Returned { value } => *value,
                             _ => 0,
                         };
-                        let key_fd = fd;
                         drop(open);
-                        this.fasync_notify_after_write(cx.kernel, key_fd, written);
+                        this.fasync_notify_after_write(cx.kernel, fd, &open_file, written);
                         return Ok(this.raise_sigpipe_on_epipe(cx, out));
                     }
                     OpenDescription::HostSocket { host_fd, type_, .. } => {
@@ -1006,9 +1372,8 @@ impl<'a> FsView<'a> {
                             DispatchOutcome::Returned { value } => *value,
                             _ => 0,
                         };
-                        let key_fd = fd;
                         drop(open);
-                        this.fasync_notify_after_write(cx.kernel, key_fd, written);
+                        this.fasync_notify_after_write(cx.kernel, fd, &open_file, written);
                         return Ok(out);
                     }
                     OpenDescription::InMemorySocket { socket, .. } => {
@@ -1020,9 +1385,8 @@ impl<'a> FsView<'a> {
                                 return Ok(DispatchOutcome::returned_len_or_errno(written));
                             }
                             Err(LINUX_EAGAIN) if !nonblocking => {
-                                return Ok(crate::dispatch::net::wait_in_memory_slot(
-                                    &this.captured_file_table(),
-                                    fd,
+                                return Ok(crate::dispatch::net::wait_in_memory_captured_slot(
+                                    slot_authority,
                                     libc::POLLOUT,
                                     socket.get_sndtimeo(),
                                 ));
@@ -2963,12 +3327,14 @@ impl<'a> FsView<'a> {
 
         }
 
-        fn pwrite64(this, cx, fd: Fd, buf: GuestPtr, count: u64, offset: u64) {
+        fn pwrite64_dispatch(this, cx, fd: Fd, buf: GuestPtr, count: u64, offset: u64) {
+            let fd = fd.0;
+            let (open_file, slot_authority) = this.open_file_with_authority(fd).unzip();
             // A delegated file's forwarded operation is served on the host
             // against the delegated object, with the code EL1 runs; the object
             // stays delegated. Only what that cannot serve exactly falls
             // through to the path below, whose accessor recalls first.
-            if let Some(delegated) = this.open_file(fd.0)
+            if let Some(ref delegated) = open_file
                 && delegated.description.delegation_handle() != 0
                 && let Some(outcome) = crate::el1_delegation::serve_on_host(
                     &delegated.description,
@@ -2980,14 +3346,18 @@ impl<'a> FsView<'a> {
                 return Ok(outcome);
             }
 
-            let fd: Fd = fd;
-            // An O_PATH descriptor is not open for I/O (open13 → EBADF).
-            if this.fd_is_o_path(fd.0) {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            }
-            // memfd_secret: no file write method → EINVAL (memfdsecret probe).
-            if this.fd_is_secretmem(fd.0) {
-                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            if let Some(ref of) = open_file {
+                let common = of.description.common();
+                // An O_PATH descriptor is not open for I/O (open13 → EBADF).
+                if LinuxOpenFlags::from_bits_truncate(common.status_flags())
+                    .contains(LinuxOpenFlags::PATH)
+                {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                }
+                // memfd_secret: no file write method → EINVAL (memfdsecret probe).
+                if common.secretmem() {
+                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                }
             }
             let address = buf.0;
             let length =
@@ -2997,6 +3367,18 @@ impl<'a> FsView<'a> {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let tid = Self::ctx_tid(cx);
+            let io_lease = open_file
+                .as_ref()
+                .and_then(|file| file.description.retain_fd_lease());
+            let target = WriteTarget {
+                fd,
+                tid,
+                thread: cx.kernel.thread().key(),
+                open_file,
+                slot_authority,
+                io_lease,
+                stdio_was_closed: this.stdio_is_closed(fd),
+            };
             // A zero-length write never accesses the buffer — `pwrite(fd, NULL,
             // 0)` returns 0, NOT EFAULT (Linux checks count before touching the
             // buffer; LTP pwrite03). Only read guest memory when count > 0.
@@ -3005,233 +3387,37 @@ impl<'a> FsView<'a> {
             } else {
                 match (*cx.memory).read_bytes_prefix(address, length) {
                     Ok(b) => b,
+                    Err(MemoryError::ReadSuspended(suspension)) => {
+                        return Ok(this.suspend_write_copy_in(
+                            target,
+                            OwnedCopyInOperation::Pwrite64 { length, offset },
+                            *suspension,
+                        ));
+                    }
                     Err(_) => {
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
                 }
             };
-            if is_stdio_fd(fd.0) {
-                return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
-            }
-            let Some(open_file) = this.open_file(fd.0) else {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            };
-            if cx.can_host_wait() {
-                super::resources::stage_io_rearm(
-                    cx.kernel,
-                    crate::dispatch::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
-                )?;
-            }
-            let Some(open) = crate::kernel::FileDescription::write_for_io(&open_file.description) else {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            };
-            // An O_APPEND fd forces EVERY write to EOF, ignoring the supplied
-            // offset (pwrite04). macOS pwrite() on an O_APPEND fd returns EINVAL,
-            // so seek-to-end then write() instead (matching the plain write()
-            // append path).
-            let is_append = LinuxOpenFlags::from_bits_truncate(
-                open_file.description.common().status_flags(),
-            )
-            .contains(LinuxOpenFlags::APPEND);
-            if let OpenDescription::SyntheticDevice { kind, .. } = &*open {
-                match kind {
-                    carrick_vfs::SyntheticDeviceKind::Full => {
-                        return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
-                    }
-                    _ => {
-                        return Ok(DispatchOutcome::returned_len_or_errno(length));
-                    }
-                }
-            }
-            // Real host file: positional write via libc::pwrite (visible
-            // across fork; kernel offset untouched).
-            if matches!(&*open, OpenDescription::HostFile { .. }) {
-                let outcome = {
-                    let Some(host_io) = HostFileIo::from_read(&open) else {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    };
-                    if !host_io.is_writable() {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    }
-                    let raw_fd = host_io.raw();
-                    let old_len = if !is_append {
-                        let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                        if unsafe { libc::fstat(raw_fd, &mut st) } == 0 {
-                            Some(st.st_size as u64)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                    let Some(wait_authority) = this
-                        .captured_slot_authority(fd.0)
-                        .map(WaitFdAuthority::logical)
-                    else {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    };
-                    let host_wait_runner = this.host_wait_runner_for_ctx(cx);
-                    let host_wait_ref = host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
-                    let outcome = write_host_pipe_owned_at(
-                        bytes,
-                        offset,
-                        HostPipeWriteTarget::new(
-                            raw_fd,
-                            None,
-                            false,
-                            HostWriteKind::RegularFile,
-                            tid,
-                            wait_authority,
-                            this.cross.host_signal(),
-                        )
-                        .with_append(is_append)
-                        .with_host_wait(host_wait_ref),
-                    )?;
-                    if let DispatchOutcome::Returned { value } = outcome && value > 0 {
-                        if let Some(old_len) = old_len {
-                            punch_unwritten_host_blocks(raw_fd, old_len, offset as u64)?;
-                        }
-                        this.invalidate_dentry_host_fd(raw_fd);
-                        let write_offset = if is_append {
-                            let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                            if unsafe { libc::fstat(raw_fd, &mut st) } == 0 {
-                                (st.st_size as u64).saturating_sub(value as u64)
-                            } else {
-                                offset as u64
-                            }
-                        } else {
-                            offset as u64
-                        };
-                        this.fs
-                            .record_host_sparse_write(host_io.host_fd_ref(), write_offset, value as usize);
-                    }
-                    outcome
-                };
-                return Ok(outcome);
-            }
-            // In-memory File (memfd / O_TMPFILE fallback): positional write into
-            // the cached contents, honoring memfd write/grow seals. Previously an
-            // unconditional EBADF (memfd_create01 CHECK_MFD_*_BY_WRITE pwrites).
-            let is_inmem_file = matches!(&*open, OpenDescription::File { .. } | OpenDescription::InMemoryFile { .. });
-            drop(open);
-            if is_inmem_file {
-                let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description) else {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                };
-                if let OpenDescription::InMemoryFile {
-                    path,
-                    contents,
-                    writable,
-                    max_size,
-                    ..
-                } = &mut *open
-                {
-                    if !*writable {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    }
-                    let mut data = contents.write();
-                    let write_at = if is_append {
-                        data.len()
-                    } else {
-                        offset as usize
-                    };
-                    let end = match write_at.checked_add(bytes.len()) {
-                        Some(e) => e,
-                        None => return Ok(DispatchOutcome::errno(LINUX_EFBIG)),
-                    };
-                    if end > *max_size {
-                        return Ok(DispatchOutcome::errno(LINUX_EFBIG));
-                    }
-                    if data.write_range(write_at, &bytes).is_err() {
-                        return Ok(DispatchOutcome::errno(LINUX_EFBIG));
-                    }
-                    this.fs.rootfs_vfs.notify_inode_changed(path, None);
-                    return Ok(DispatchOutcome::returned_len_or_errno(bytes.len()));
-                }
-                if let OpenDescription::File { contents, .. } = &mut *open {
-                    let cur_len = match contents.len() {
-                        Ok(l) => l as usize,
-                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                    };
-                    let write_at = if is_append {
-                        cur_len
-                    } else {
-                        offset as usize
-                    };
-                    if let Err(errno) = memfd_seal_write_check(
-                        open_file.description.common().seals(),
-                        write_at,
-                        bytes.len(),
-                        cur_len,
-                    ) {
-                        return Ok(DispatchOutcome::errno(errno));
-                    }
-                    let written = match commit_bytes_at_offset(
-                        &mut open,
-                        write_at as u64,
-                        &bytes,
-                        Some(&this.fs.rootfs_vfs),
-                    ) {
-                        Ok(n) => n,
-                        Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                    };
-                    let outcome = DispatchOutcome::returned_len_or_errno(written);
-                    return Ok(outcome);
-                }
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            }
-            let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description) else {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            };
-            let errno = match &*open {
-                OpenDescription::Closed { .. }
-                | OpenDescription::File { .. }
-                | OpenDescription::InMemoryFile { .. }
-                | OpenDescription::SyntheticFile { .. }
-                | OpenDescription::ProcExecutable { .. } => LINUX_EBADF,
-                OpenDescription::HostFile { writable, .. } if !*writable => LINUX_EBADF,
-                OpenDescription::HostFile { .. } => LINUX_EINVAL,
-                OpenDescription::Directory { .. } => LINUX_EISDIR,
-                // A pipe end is ESPIPE for pwrite/pread regardless of its
-                // direction: Linux refuses positional I/O on an unseekable
-                // description before it looks at the open mode (oracle line
-                // `pwrite_pipe_read_end_espipe` in `pipeextra`).
-                OpenDescription::PipeReader { .. }
-                | OpenDescription::PipeWriter { .. }
-                | OpenDescription::HostPipe { .. }
-                | OpenDescription::EventFd { .. }
-                | OpenDescription::TimerFd { .. }
-                | OpenDescription::HostSocket { .. }
-                | OpenDescription::SignalFd { .. }
-                | OpenDescription::PerfEvent { .. }
-                | OpenDescription::FsContext { .. }
-                | OpenDescription::Mqueue { .. }
-                | OpenDescription::BpfMap { .. }
-                | OpenDescription::BpfProg { .. }
-                | OpenDescription::Netlink { .. }
-                | OpenDescription::Epoll { .. }
-                | OpenDescription::Pidfd { .. }
-                | OpenDescription::Inotify { .. }
-                | OpenDescription::SyntheticDevice { .. }
-                | OpenDescription::VirtualConsole { .. }
-                | OpenDescription::Fanotify { .. }
-                | OpenDescription::InMemorySocket { .. }
-                | OpenDescription::Packet { .. } => LINUX_ESPIPE,
-            };
-            Ok(DispatchOutcome::errno(errno))
-
+            this.pwrite64(cx, target, bytes, length, offset)
         }
 
-        fn pwritev(this, cx, fd: Fd, iov: GuestPtr, vlen: u64, pos_l: u64, pos_h: u64, rwf: u64) {
-
-            let fd: Fd = fd;
+        fn pwritev_dispatch(this, cx, fd: Fd, iov: GuestPtr, vlen: u64, pos_l: u64, pos_h: u64, rwf: u64) {
+            let fd = fd.0;
+            let (open_file, slot_authority) = this.open_file_with_authority(fd).unzip();
             // memfd_secret: no file write method → EINVAL (memfdsecret probe).
-            if this.fd_is_secretmem(fd.0) {
+            if open_file
+                .as_ref()
+                .is_some_and(|of| of.description.common().secretmem())
+            {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let iov = iov.0;
             let iovcnt =
                 usize::try_from(vlen).map_err(|_| DispatchError::LengthTooLarge(vlen))?;
+            if iovcnt > LINUX_IOV_MAX {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            }
             let tid = Self::ctx_tid(cx);
             let offset = i64::from_ne_bytes(pos_l.to_ne_bytes());
             // pwritev2 (canonical 287) treats offset == -1 as "use (and advance)
@@ -3253,333 +3439,47 @@ impl<'a> FsView<'a> {
             {
                 return Ok(DispatchOutcome::errno(LINUX_EOPNOTSUPP));
             }
-            let (iovecs, payloads) = {
-                let memory = &*cx.memory;
-                let iovecs = read_iovecs(memory, iov, iovcnt)?;
-                if offset < 0 && !write_at_current {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                }
-                let payloads = match prepare_pwritev_payloads(memory, &iovecs) {
-                    Ok(payloads) => payloads,
-                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                };
-                (iovecs, payloads)
+            let io_lease = open_file
+                .as_ref()
+                .and_then(|file| file.description.retain_fd_lease());
+            let target = WriteTarget {
+                fd,
+                tid,
+                thread: cx.kernel.thread().key(),
+                open_file,
+                slot_authority,
+                io_lease,
+                stdio_was_closed: this.stdio_is_closed(fd),
             };
-            if is_stdio_fd(fd.0) {
-                return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
-            }
-            let Some(open_file) = this.open_file(fd.0) else {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            let iovecs = match read_iovecs_from(&*cx.memory, iov, iovcnt, Vec::with_capacity(iovcnt), 0)? {
+                ReadIovecsOutcome::Ready(iovecs) => iovecs,
+                ReadIovecsOutcome::Suspended {
+                    iovecs,
+                    total,
+                    suspension,
+                } => {
+                    return Ok(this.suspend_write_copy_in(
+                        target,
+                        OwnedCopyInOperation::Pwritev {
+                            offset,
+                            write_at_current,
+                            phase: PwritevCopyInPhase::Iovecs {
+                                iov_addr: iov,
+                                iovcnt,
+                                iovecs,
+                                total,
+                            },
+                        },
+                        *suspension,
+                    ));
+                }
             };
-            if cx.can_host_wait() {
-                super::resources::stage_io_rearm(
-                    cx.kernel,
-                    crate::dispatch::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
-                )?;
-            }
-            let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description) else {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
-            };
-            // An O_APPEND fd writes at EOF regardless of the offset, but pwritev
-            // (like pwrite) MUST leave the file offset untouched. Save the
-            // offset, seek to EOF, then write via writev()/write() (macOS rejects
-            // pwritev() on an O_APPEND fd with EINVAL), and restore the offset
-            // afterward.
-            let is_append = LinuxOpenFlags::from_bits_truncate(
-                open_file.description.common().status_flags(),
-            )
-            .contains(LinuxOpenFlags::APPEND);
-            if let OpenDescription::SyntheticDevice { kind, .. } = &*open {
-                match kind {
-                    carrick_vfs::SyntheticDeviceKind::Full => {
-                        return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
-                    }
-                    _ => {
-                        let mut total = 0i64;
-                        for iov in &iovecs {
-                            total += iov.iov_len as i64;
-                        }
-                        return Ok(DispatchOutcome::Returned { value: total });
-                    }
-                }
-            }
-            if let OpenDescription::InMemoryFile {
-                contents,
-                writable,
-                offset: current_offset,
-                max_size,
-                ..
-            } = &mut *open
-            {
-                if !*writable {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                }
-                let mut data = contents.write();
-                let mut cur = if is_append {
-                    data.len()
-                } else if write_at_current {
-                    *current_offset
-                } else {
-                    offset as usize
-                };
-                let mut total = 0i64;
-                if let PwritevPayloads::Borrowed { reads, .. } = &payloads {
-                    for read in reads {
-                        let len = read.len();
-                        if len == 0 {
-                            continue;
-                        }
-                        // Raw copy out of the retained guest source: never a
-                        // Rust slice over memory other vCPUs may write.
-                        let mut owned = vec![0_u8; len];
-                        read.copy_into(&mut owned);
-                        let buf = owned.as_slice();
-                        let end = match cur.checked_add(len) {
-                            Some(e) => e,
-                            None => {
-                                if total > 0 {
-                                    break;
-                                }
-                                return Ok(DispatchOutcome::errno(LINUX_EFBIG));
-                            }
-                        };
-                        if end > *max_size {
-                            if total > 0 {
-                                break;
-                            }
-                            return Ok(DispatchOutcome::errno(LINUX_EFBIG));
-                        }
-                        if data.write_range(cur, buf).is_err() {
-                            if total > 0 {
-                                break;
-                            }
-                            return Ok(DispatchOutcome::errno(LINUX_EFBIG));
-                        }
-                        cur = end;
-                        total += len as i64;
-                    }
-                } else if let PwritevPayloads::Staged(staged_iovecs) = &payloads {
-                    for buf in staged_iovecs {
-                        let len = buf.len();
-                        if len == 0 {
-                            continue;
-                        }
-                        let end = match cur.checked_add(len) {
-                            Some(e) => e,
-                            None => {
-                                if total > 0 {
-                                    break;
-                                }
-                                return Ok(DispatchOutcome::errno(LINUX_EFBIG));
-                            }
-                        };
-                        if end > *max_size {
-                            if total > 0 {
-                                break;
-                            }
-                            return Ok(DispatchOutcome::errno(LINUX_EFBIG));
-                        }
-                        if data.write_range(cur, buf).is_err() {
-                            if total > 0 {
-                                break;
-                            }
-                            return Ok(DispatchOutcome::errno(LINUX_EFBIG));
-                        }
-                        cur = end;
-                        total += len as i64;
-                    }
-                }
-                drop(data);
-                if write_at_current {
-                    *current_offset = cur;
-                }
-                return Ok(DispatchOutcome::Returned { value: total });
-            }
-            if matches!(&*open, OpenDescription::HostFile { .. }) {
-                let (hfd, is_append, old_len, at_current) = {
-                    let Some(host_io) = HostFileIo::from_read(&open) else {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    };
-                    if !host_io.is_writable() {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    }
-                    let hfd = host_io.raw();
-                    let at_current = write_at_current || is_append;
-                    if at_current {
-                        host_io.record_sequential_io();
-                    }
-                    let old_len = if !at_current {
-                        let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                        if unsafe { libc::fstat(hfd, &mut st) } == 0 {
-                            Some(st.st_size as u64)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                    (hfd, is_append, old_len, at_current)
-                };
-                let saved_offset =
-                    is_append.then(|| unsafe { libc::lseek(hfd, 0, libc::SEEK_CUR) });
-                if is_append {
-                    unsafe { libc::lseek(hfd, 0, libc::SEEK_END) };
-                }
-                let restore_offset = |saved: Option<i64>| {
-                    if let Some(s) = saved
-                        && s >= 0
-                    {
-                        unsafe { libc::lseek(hfd, s, libc::SEEK_SET) };
-                    }
-                };
-                let host_wait_runner = this.host_wait_runner_for_ctx(cx);
-                let host_wait_ref = host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
-                if let PwritevPayloads::Borrowed {
-                    iovecs: borrowed_iovecs,
-                    reads: _retained,
-                } = &payloads
-                {
-                    if borrowed_iovecs.is_empty() {
-                        return Ok(DispatchOutcome::Returned { value: 0 });
-                    }
-                    let iovcnt =
-                        i32::try_from(borrowed_iovecs.len()).map_err(|_| LINUX_EINVAL)?;
-                    let mut n = 0;
-                    let mut write = || {
-                        n = unsafe {
-                            if at_current {
-                                libc::writev(hfd, borrowed_iovecs.as_ptr(), iovcnt)
-                            } else {
-                                libc::pwritev(
-                                    hfd,
-                                    borrowed_iovecs.as_ptr(),
-                                    iovcnt,
-                                    offset as libc::off_t,
-                                )
-                            }
-                        };
-                    };
-                    // Retained HostRead owners stay live while the caller
-                    // releases its execution capacity for the host syscall.
-                    let result = if let Some(runner) = host_wait_ref {
-                        runner.run_with_host_wait(&mut write)
-                    } else {
-                        write();
-                        Ok(())
-                    };
-                    restore_offset(saved_offset);
-                    result?;
-                    let n = n.host_syscall_errno()?;
-                    if n > 0 {
-                        if let Some(old_len) = old_len {
-                            punch_unwritten_host_blocks(hfd, old_len, offset as u64)?;
-                        }
-                        this.invalidate_dentry_host_fd(hfd);
-                    }
-                    return Ok(DispatchOutcome::returned_isize_or_errno(n));
-                }
-                let Some(wait_authority) = this
-                    .captured_slot_authority(fd.0)
-                    .map(WaitFdAuthority::logical)
-                else {
-                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                };
-                let mut total = 0i64;
-                let mut cur = offset;
-                let PwritevPayloads::Staged(staged_iovecs) = &payloads else {
-                    return Ok(DispatchOutcome::errno(LINUX_EINVAL));
-                };
-                for buf in staged_iovecs {
-                    if buf.is_empty() {
-                        continue;
-                    }
-                    let len = buf.len();
-                    let target = HostPipeWriteTarget::new(
-                        hfd,
-                        None,
-                        false,
-                        HostWriteKind::RegularFile,
-                        tid,
-                        wait_authority.clone(),
-                        this.cross.host_signal(),
-                    )
-                    .with_append(is_append)
-                    .with_host_wait(host_wait_ref);
-                    let outcome = if at_current {
-                        write_host_pipe(buf, target)?
-                    } else {
-                        write_host_pipe_at(buf, cur, target)?
-                    };
-                    match outcome {
-                        DispatchOutcome::Returned { value } => {
-                            total += value;
-                            cur += value;
-                            if (value as usize) < len {
-                                break;
-                            }
-                        }
-                        DispatchOutcome::Errno { errno } => {
-                            restore_offset(saved_offset);
-                            return Ok(DispatchOutcome::errno(errno));
-                        }
-                        other => {
-                            restore_offset(saved_offset);
-                            return Ok(other);
-                        }
-                    }
-                }
-                restore_offset(saved_offset);
-                if total > 0 {
-                    if let Some(old_len) = old_len {
-                        punch_unwritten_host_blocks(hfd, old_len, offset as u64)?;
-                    }
-                    this.invalidate_dentry_host_fd(hfd);
-                }
-                return Ok(DispatchOutcome::Returned { value: total });
-            }
-            let errno = match &*open {
-                OpenDescription::Closed { .. }
-                | OpenDescription::File { .. }
-                | OpenDescription::InMemoryFile { .. }
-                | OpenDescription::SyntheticFile { .. }
-                | OpenDescription::ProcExecutable { .. } => LINUX_EBADF,
-                OpenDescription::HostFile { writable, .. } if !*writable => LINUX_EBADF,
-                OpenDescription::HostFile { .. } => LINUX_EINVAL,
-                OpenDescription::Directory { .. } => LINUX_EISDIR,
-                // Same rule as `pwrite64`: any pipe end is ESPIPE for positional
-                // I/O (oracle `pipeblockedge` line `pwritev2_pipe_espipe`).
-                OpenDescription::PipeReader { .. }
-                | OpenDescription::PipeWriter { .. }
-                | OpenDescription::HostPipe { .. }
-                | OpenDescription::EventFd { .. }
-                | OpenDescription::TimerFd { .. }
-                | OpenDescription::HostSocket { .. }
-                | OpenDescription::SignalFd { .. }
-                | OpenDescription::PerfEvent { .. }
-                | OpenDescription::FsContext { .. }
-                | OpenDescription::Mqueue { .. }
-                | OpenDescription::BpfMap { .. }
-                | OpenDescription::BpfProg { .. }
-                | OpenDescription::Netlink { .. }
-                | OpenDescription::Epoll { .. }
-                | OpenDescription::Pidfd { .. }
-                | OpenDescription::Inotify { .. }
-                | OpenDescription::SyntheticDevice { .. }
-                | OpenDescription::VirtualConsole { .. }
-                | OpenDescription::Fanotify { .. }
-                | OpenDescription::InMemorySocket { .. }
-                | OpenDescription::Packet { .. } => LINUX_ESPIPE,
-            };
-            Ok(DispatchOutcome::errno(errno))
-
+            this.pwritev_from_iovecs(cx, target, iovecs, offset, write_at_current)
         }
 
         fn write_dispatch(this, cx, fd: Fd, buf: GuestPtr, count: u64) {
             let fd = fd.0;
-            let (open_file, slot_authority) = match this.open_file_with_authority(fd) {
-                Some((of, auth)) => (Some(of), Some(auth)),
-                None => (this.open_file(fd), None),
-            };
+            let (open_file, slot_authority) = this.open_file_with_authority(fd).unzip();
 
             // A delegated file's forwarded operation is served on the host
             // against the delegated object, with the code EL1 runs; the object
@@ -3674,16 +3574,11 @@ impl<'a> FsView<'a> {
                         .inspect_kind(|open| matches!(open, OpenDescription::HostFile { .. }))
                         .unwrap_or(false)
                 });
-            let io_lease = match open_file.as_ref() {
-                Some(file) => match file.description.retain_fd_lease() {
-                    Some(lease) => Some(lease),
-                    None => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
-                },
-                None => None,
-            };
+            let io_lease = open_file
+                .as_ref()
+                .and_then(|file| file.description.retain_fd_lease());
             let target = WriteTarget {
                 fd,
-                length,
                 tid,
                 thread: cx.kernel.thread().key(),
                 open_file,
@@ -3704,6 +3599,7 @@ impl<'a> FsView<'a> {
                     Err(MemoryError::ReadSuspended(suspension)) => {
                         return Ok(this.suspend_write_copy_in(
                             target,
+                            OwnedCopyInOperation::Write { length },
                             *suspension,
                         ));
                     }
@@ -3715,6 +3611,7 @@ impl<'a> FsView<'a> {
                         Err(MemoryError::ReadSuspended(suspension)) => {
                             return Ok(this.suspend_write_copy_in(
                                 target,
+                                OwnedCopyInOperation::Write { length },
                                 *suspension,
                             ));
                         }
@@ -3730,6 +3627,7 @@ impl<'a> FsView<'a> {
                     Err(MemoryError::ReadSuspended(suspension)) => {
                         return Ok(this.suspend_write_copy_in(
                             target,
+                            OwnedCopyInOperation::Write { length },
                             *suspension,
                         ));
                     }
@@ -3750,263 +3648,1358 @@ impl<'a> FsView<'a> {
 
         }
 
-        fn writev(this, cx, fd: Fd, iov: GuestPtr, vlen: u64) {
-
+        fn writev_dispatch(this, cx, fd: Fd, iov: GuestPtr, vlen: u64) {
             let fd = fd.0;
             let tid = Self::ctx_tid(cx);
+            let (open_file, slot_authority) = this.open_file_with_authority(fd).unzip();
             // memfd_secret: no file write method → EINVAL (memfdsecret probe).
-            if this.fd_is_secretmem(fd) {
+            if open_file
+                .as_ref()
+                .is_some_and(|of| of.description.common().secretmem())
+            {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let iov = iov.0;
             let iovcnt =
                 usize::try_from(vlen).map_err(|_| DispatchError::LengthTooLarge(vlen))?;
-            let iovecs = read_iovecs(&*cx.memory, iov, iovcnt)?;
-            // A stdio fd the guest explicitly closed (and did not reopen) is
-            // genuinely closed: writev is EBADF, not a host-stream/buffer write.
-            if this.stdio_is_closed(fd) {
-                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            if iovcnt > LINUX_IOV_MAX {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let nonblocking = this.io_is_nonblocking(fd, 0);
+            let stdio_was_closed = this.stdio_is_closed(fd);
+            let nonblocking = open_file.as_ref().is_some_and(|of| {
+                LinuxOpenFlags::from_bits_truncate(of.description.common().status_flags())
+                    .contains(LinuxOpenFlags::NONBLOCK)
+            });
+            let io_lease = open_file
+                .as_ref()
+                .and_then(|file| file.description.retain_fd_lease());
+            let target = WriteTarget {
+                fd,
+                tid,
+                thread: cx.kernel.thread().key(),
+                open_file,
+                slot_authority,
+                io_lease,
+                stdio_was_closed,
+            };
+            let iovecs = match read_iovecs_from(&*cx.memory, iov, iovcnt, Vec::with_capacity(iovcnt), 0)? {
+                ReadIovecsOutcome::Ready(iovecs) => iovecs,
+                ReadIovecsOutcome::Suspended {
+                    iovecs,
+                    total,
+                    suspension,
+                } => {
+                    return Ok(this.suspend_write_copy_in(
+                        target,
+                        OwnedCopyInOperation::Writev(WritevCopyInState {
+                            iovecs,
+                            nonblocking,
+                            phase: WritevCopyInPhase::Iovecs {
+                                iov_addr: iov,
+                                iovcnt,
+                                total,
+                            },
+                        }),
+                        *suspension,
+                    ));
+                }
+            };
+            this.writev_from_iovecs(cx, target, iovecs, nonblocking)
+        }
 
-            // eventfd's legacy vector write is one scalar counter operation
-            // per iovec, including invalid zero/short segments. It is not a
-            // concatenated byte stream. Reuse the scalar object and owned wait.
-            if let Some(file) = this.open_file(fd) {
-                let state = crate::kernel::FileDescription::read_for_io(&file.description).and_then(|open| match &*open {
+    }
+
+    fn pwritev_from_iovecs<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        target: WriteTarget,
+        iovecs: Vec<LinuxIovec>,
+        offset: i64,
+        write_at_current: bool,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        if offset < 0 && !write_at_current {
+            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+        }
+        let payloads = match prepare_pwritev_payloads(&*cx.memory, &iovecs) {
+            Ok(PwritevPrepareOutcome::Ready(payloads)) => payloads,
+            Ok(PwritevPrepareOutcome::Suspended {
+                staged_iovecs,
+                next_iovec,
+                suspension,
+            }) => {
+                return Ok(self.suspend_write_copy_in(
+                    target,
+                    OwnedCopyInOperation::Pwritev {
+                        offset,
+                        write_at_current,
+                        phase: PwritevCopyInPhase::Payloads {
+                            iovecs,
+                            staged_iovecs,
+                            next_iovec,
+                        },
+                    },
+                    *suspension,
+                ));
+            }
+            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+        };
+        self.pwritev(cx, target, iovecs, payloads, offset, write_at_current)
+    }
+
+    fn writev_from_iovecs<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        target: WriteTarget,
+        iovecs: Vec<LinuxIovec>,
+        nonblocking: bool,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        // A stdio fd the guest explicitly closed (and did not reopen) is
+        // genuinely closed: writev is EBADF, not a host-stream/buffer write.
+        if target.stdio_was_closed {
+            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+        }
+
+        // eventfd's legacy vector write is one scalar counter operation
+        // per iovec, including invalid zero/short segments. It is not a
+        // concatenated byte stream. Reuse the scalar object and owned wait.
+        if let Some(ref file) = target.open_file {
+            let state = file
+                .description
+                .inspect_kind(|open| match open {
                     OpenDescription::EventFd { state, .. } => Some(Arc::clone(state)),
                     _ => None,
-                });
-                if let Some(state) = state {
-                    let Some(lease) = file.description.retain_fd_lease() else {
-                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                    };
-                    let length = iovecs.iter().try_fold(0u64, |n, i| n.checked_add(i.iov_len).ok_or(LINUX_EINVAL))?;
-                    if length == 0 { return Ok(DispatchOutcome::Returned { value: 0 }); }
-                    let mut total = 0usize;
-                    for (index, iovec) in iovecs.iter().enumerate() {
-                        if iovec.iov_len != 8 {
-                            return Ok(if total == 0 { DispatchOutcome::errno(LINUX_EINVAL) } else { DispatchOutcome::returned_len_or_errno(total) });
-                        }
-                        let bytes = match cx.memory.read_bytes(iovec.iov_base, 8) {
-                            Ok(bytes) => bytes,
-                            Err(_) => return Ok(if total == 0 { DispatchOutcome::errno(LINUX_EFAULT) } else { DispatchOutcome::returned_len_or_errno(total) }),
-                        };
-                        let outcome = write_eventfd(this, &bytes, &state);
-                        match outcome {
-                            DispatchOutcome::Returned { value: 8 } => total += 8,
-                            DispatchOutcome::Errno { errno: LINUX_EAGAIN } if !nonblocking => {
-                                let value = LinuxEventfdValue::read_from_bytes(&bytes).map_err(|_| LINUX_EINVAL)?.value;
-                                // Capture only complete scalar values through
-                                // the first error boundary. The parked operation
-                                // owns the same description and committed prefix.
-                                let mut tail = Vec::new();
-                                for next in &iovecs[index + 1..] {
-                                    if next.iov_len != 8 { break; }
-                                    let Ok(bytes) = cx.memory.read_bytes(next.iov_base, 8) else { break; };
-                                    tail.extend_from_slice(&bytes);
-                                }
-                                return Ok(DispatchOutcome::BlockingWrite(BlockingWrite::eventfd(Arc::clone(&state), lease, value, tid).with_writev_tail(tail, total)));
-                            }
-                            other => return Ok(if total == 0 { other } else { DispatchOutcome::returned_len_or_errno(total) }),
-                        }
-                    }
-                    return Ok(DispatchOutcome::returned_len_or_errno(total));
+                })
+                .flatten();
+            if let Some(state) = state {
+                let length = iovecs
+                    .iter()
+                    .try_fold(0u64, |n, i| n.checked_add(i.iov_len).ok_or(LINUX_EINVAL))?;
+                if length == 0 {
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                return self.writev_eventfd_from(cx, target, iovecs, nonblocking, state, 0, 0);
+            }
+        }
+
+        if let Some(ref open_file) = target.open_file
+            && cx.can_host_wait()
+        {
+            super::resources::stage_io_rearm(
+                cx.kernel,
+                crate::dispatch::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
+            )?;
+        }
+
+        if self.has_bounded_host_writev_target(cx, target.open_file.as_ref())?
+            && let Some(outcome) =
+                super::gather_bounded_iovec_bytes_from(&*cx.memory, &iovecs, 0, Vec::new())?
+        {
+            match outcome {
+                super::GatheredIovecOutcome::Ready(GatheredIovecBytes { bytes, faulted }) => {
+                    return self.complete_bounded_host_writev(
+                        cx,
+                        &target,
+                        nonblocking,
+                        bytes,
+                        faulted,
+                    );
+                }
+                super::GatheredIovecOutcome::Suspended {
+                    bytes: gathered,
+                    next_iovec,
+                    suspension,
+                } => {
+                    return Ok(self.suspend_write_copy_in(
+                        target,
+                        OwnedCopyInOperation::Writev(WritevCopyInState {
+                            iovecs,
+                            nonblocking,
+                            phase: WritevCopyInPhase::BoundedGather {
+                                gathered,
+                                next_iovec,
+                            },
+                        }),
+                        *suspension,
+                    ));
                 }
             }
+        }
 
-            struct HostWritevTarget {
-                host_fd: i32,
-                host_fd_owner: Option<HostFdRef>,
-                write_kind: HostWriteKind,
-                pipe_state: Option<(i64, usize)>,
-                sigpipe_on_epipe: bool,
-                append: bool,
-                socket_flow: Option<Arc<crate::kernel::UnixFlow>>,
-                socket_cred: Option<crate::kernel::SocketPeerCred>,
-                is_stream: bool,
+        self.writev(cx, target, iovecs, nonblocking, 0, 0, None)
+    }
+
+    fn pwrite64<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        target: WriteTarget,
+        bytes: Vec<u8>,
+        length: usize,
+        offset: i64,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        if is_stdio_fd(target.fd) {
+            return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
+        }
+        let Some(open_file) = target.open_file else {
+            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+        };
+        if cx.can_host_wait() {
+            super::resources::stage_io_rearm(
+                cx.kernel,
+                crate::dispatch::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
+            )?;
+        }
+        let Some(open) = crate::kernel::FileDescription::write_for_io(&open_file.description)
+        else {
+            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+        };
+        // An O_APPEND fd forces EVERY write to EOF, ignoring the supplied
+        // offset (pwrite04). macOS pwrite() on an O_APPEND fd returns EINVAL,
+        // so seek-to-end then write() instead (matching the plain write()
+        // append path).
+        let is_append =
+            LinuxOpenFlags::from_bits_truncate(open_file.description.common().status_flags())
+                .contains(LinuxOpenFlags::APPEND);
+        if let OpenDescription::SyntheticDevice { kind, .. } = &*open {
+            match kind {
+                carrick_vfs::SyntheticDeviceKind::Full => {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
+                }
+                _ => {
+                    return Ok(DispatchOutcome::returned_len_or_errno(length));
+                }
             }
-
-            let host_target = if let Some(open_file) = this.open_file(fd) {
-                if cx.can_host_wait() {
-                    super::resources::stage_io_rearm(
-                        cx.kernel,
-                        crate::dispatch::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
-                    )?;
-                }
-                let open = crate::kernel::FileDescription::read_for_io(&open_file.description);
-                match open.as_deref() {
-                    Some(OpenDescription::HostPipe {
-                        base,
-                        host_fd,
-                        is_read_end,
-                        pipe_id,
-                        pty,
-                        bidirectional,
-                        write_kind,
-                        ..
-                    }) => {
-                        // pty ends and O_RDWR FIFOs are bidirectional; only
-                        // real one-way pipe ends gate on is_read_end.
-                        if *is_read_end && pty.is_none() && !*bidirectional {
-                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                        }
-                        Some(HostWritevTarget {
-                            host_fd: host_fd.raw(),
-                            host_fd_owner: Some(host_fd.clone()),
-                            write_kind: *write_kind,
-                            pipe_state: this.host_pipe_capacity_state(
-                                base,
-                                *pipe_id,
-                                *is_read_end,
-                                *bidirectional,
-                                host_fd.raw(),
-                            ),
-                            sigpipe_on_epipe: true,
-                            append: false,
-                            socket_flow: None,
-                            socket_cred: None,
-                            is_stream: false,
-                        })
-                    }
-                    Some(OpenDescription::HostSocket { host_fd, type_, .. }) => {
-                        let outbound_flow = open_file.description.common().outbound_flow();
-                        let creds = this.cred_snapshot();
-                        let task_id = u32::try_from(cx.kernel.task().key().id.raw()).unwrap_or(0);
-                        let pid = crate::namespace::pid::ns_self_pid_for(cx.kernel, task_id) as i32;
-                        let my_cred = crate::kernel::SocketPeerCred {
-                            pid: crate::dispatch::abi_args::NsPid(pid),
-                            uid: creds.ruid,
-                            gid: creds.rgid,
-                        };
-                        let is_stream = *type_ == carrick_abi::LINUX_SOCK_STREAM;
-                        Some(HostWritevTarget {
-                            host_fd: host_fd.raw(),
-                            host_fd_owner: Some(host_fd.clone()),
-                            write_kind: HostWriteKind::SocketLike,
-                            pipe_state: None,
-                            sigpipe_on_epipe: false,
-                            append: false,
-                            socket_flow: outbound_flow,
-                            socket_cred: Some(my_cred),
-                            is_stream,
-                        })
-                    }
-                    Some(OpenDescription::HostFile {
-                        host_fd, writable, ..
-                    }) => {
-                        if !*writable {
-                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                        }
-                        Some(HostWritevTarget {
-                            host_fd: host_fd.raw(),
-                            host_fd_owner: Some(host_fd.clone()),
-                            write_kind: HostWriteKind::RegularFile,
-                            pipe_state: None,
-                            sigpipe_on_epipe: false,
-                            append: LinuxOpenFlags::from_bits_truncate(
-                                open_file.description.common().status_flags(),
-                            )
-                            .contains(LinuxOpenFlags::APPEND),
-                            socket_flow: None,
-                            socket_cred: None,
-                            is_stream: false,
-                        })
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
-
-            if let Some(target) = host_target
-                && let Some(GatheredIovecBytes { bytes, faulted }) =
-                    gather_bounded_iovec_bytes(&*cx.memory, &iovecs)?
-            {
-                if bytes.is_empty() {
-                    // Nothing transferable: EFAULT only if the emptiness came
-                    // from an unreadable segment. An all-zero-length list is a
-                    // legitimate 0-byte write.
-                    return if faulted {
-                        Ok(DispatchOutcome::errno(LINUX_EFAULT))
-                    } else {
-                        Ok(DispatchOutcome::Returned { value: 0 })
-                    };
-                }
-                if target.append {
-                    unsafe { libc::lseek(target.host_fd, 0, libc::SEEK_END) };
-                }
-                let old_len = if target.write_kind == HostWriteKind::RegularFile && !target.append {
-                    let pos = unsafe { libc::lseek(target.host_fd, 0, libc::SEEK_CUR) };
-                    if pos >= 0 {
-                        let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                        if unsafe { libc::fstat(target.host_fd, &mut st) } == 0 && (pos as u64) > st.st_size as u64 {
-                            Some((st.st_size as u64, pos as u64))
-                        } else {
-                            None
-                        }
+        }
+        // Real host file: positional write via libc::pwrite (visible
+        // across fork; kernel offset untouched).
+        if matches!(&*open, OpenDescription::HostFile { .. }) {
+            let outcome = {
+                let Some(host_io) = HostFileIo::from_read(&open) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
+                if !host_io.is_writable() {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
+                let raw_fd = host_io.raw();
+                let old_len = if !is_append {
+                    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                    if unsafe { libc::fstat(raw_fd, &mut st) } == 0 {
+                        Some(st.st_size as u64)
                     } else {
                         None
                     }
                 } else {
                     None
                 };
-                let Some(wait_authority) = this
-                    .captured_slot_authority(fd)
-                    .map(WaitFdAuthority::logical)
+                let Some(wait_authority) = target.slot_authority.map(WaitFdAuthority::logical)
                 else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
-                let host_wait_runner = this.host_wait_runner_for_ctx(cx);
-                let host_wait_ref =
-                    host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
-                if let Some(owner) = target.host_fd_owner.as_ref()
-                    && target.write_kind == HostWriteKind::RegularFile
-                {
-                    owner.record_sequential_io();
-                }
-                let outcome = write_host_pipe_owned(
+                let host_wait_runner = self.host_wait_runner_for_ctx(cx);
+                let host_wait_ref = host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
+                let outcome = write_host_pipe_owned_at(
                     bytes,
+                    offset,
                     HostPipeWriteTarget::new(
-                        target.host_fd,
-                        target.host_fd_owner.clone(),
-                        nonblocking,
-                        target.write_kind,
-                        tid,
+                        raw_fd,
+                        None,
+                        false,
+                        HostWriteKind::RegularFile,
+                        target.tid,
                         wait_authority,
-                        this.cross.host_signal(),
+                        self.cross.host_signal(),
                     )
-                    .with_pipe_state(target.pipe_state)
-                    .with_sigpipe(target.sigpipe_on_epipe)
-                    .with_socket_flow(target.socket_flow, target.socket_cred, target.is_stream)
+                    .with_append(is_append)
                     .with_host_wait(host_wait_ref),
                 )?;
-                if let DispatchOutcome::Returned { value } = outcome && value > 0 {
-                    if let Some((old_len, pos)) = old_len {
-                        punch_unwritten_host_blocks(target.host_fd, old_len, pos)?;
+                if let DispatchOutcome::Returned { value } = outcome
+                    && value > 0
+                {
+                    if let Some(old_len) = old_len {
+                        punch_unwritten_host_blocks(raw_fd, old_len, offset as u64)?;
                     }
-                    this.invalidate_dentry_host_fd(target.host_fd);
+                    self.invalidate_dentry_host_fd(raw_fd);
+                    let write_offset = if is_append {
+                        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                        if unsafe { libc::fstat(raw_fd, &mut st) } == 0 {
+                            (st.st_size as u64).saturating_sub(value as u64)
+                        } else {
+                            offset as u64
+                        }
+                    } else {
+                        offset as u64
+                    };
+                    self.fs.record_host_sparse_write(
+                        host_io.host_fd_ref(),
+                        write_offset,
+                        value as usize,
+                    );
                 }
-                return if target.sigpipe_on_epipe {
-                    Ok(this.raise_sigpipe_on_epipe(cx, outcome))
+                outcome
+            };
+            return Ok(outcome);
+        }
+        // In-memory File (memfd / O_TMPFILE fallback): positional write into
+        // the cached contents, honoring memfd write/grow seals. Previously an
+        // unconditional EBADF (memfd_create01 CHECK_MFD_*_BY_WRITE pwrites).
+        let is_inmem_file = matches!(
+            &*open,
+            OpenDescription::File { .. } | OpenDescription::InMemoryFile { .. }
+        );
+        drop(open);
+        if is_inmem_file {
+            let Some(mut open) =
+                crate::kernel::FileDescription::write_for_io(&open_file.description)
+            else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            if let OpenDescription::InMemoryFile {
+                path,
+                contents,
+                writable,
+                max_size,
+                ..
+            } = &mut *open
+            {
+                if !*writable {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                }
+                let mut data = contents.write();
+                let write_at = if is_append {
+                    data.len()
                 } else {
-                    Ok(outcome)
+                    offset as usize
                 };
+                let end = match write_at.checked_add(bytes.len()) {
+                    Some(e) => e,
+                    None => return Ok(DispatchOutcome::errno(LINUX_EFBIG)),
+                };
+                if end > *max_size {
+                    return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                }
+                if data.write_range(write_at, &bytes).is_err() {
+                    return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                }
+                self.fs.rootfs_vfs.notify_inode_changed(path, None);
+                return Ok(DispatchOutcome::returned_len_or_errno(bytes.len()));
             }
+            if let OpenDescription::File { contents, .. } = &mut *open {
+                let cur_len = match contents.len() {
+                    Ok(l) => l as usize,
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                };
+                let write_at = if is_append { cur_len } else { offset as usize };
+                if let Err(errno) = memfd_seal_write_check(
+                    open_file.description.common().seals(),
+                    write_at,
+                    bytes.len(),
+                    cur_len,
+                ) {
+                    return Ok(DispatchOutcome::errno(errno));
+                }
+                let written = match commit_bytes_at_offset(
+                    &mut open,
+                    write_at as u64,
+                    &bytes,
+                    Some(&self.fs.rootfs_vfs),
+                ) {
+                    Ok(n) => n,
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                };
+                let outcome = DispatchOutcome::returned_len_or_errno(written);
+                return Ok(outcome);
+            }
+            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+        }
+        let Some(open) = crate::kernel::FileDescription::inspect(&open_file.description) else {
+            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+        };
+        let errno = match &*open {
+            OpenDescription::Closed { .. }
+            | OpenDescription::File { .. }
+            | OpenDescription::InMemoryFile { .. }
+            | OpenDescription::SyntheticFile { .. }
+            | OpenDescription::ProcExecutable { .. } => LINUX_EBADF,
+            OpenDescription::HostFile { writable, .. } if !*writable => LINUX_EBADF,
+            OpenDescription::HostFile { .. } => LINUX_EINVAL,
+            OpenDescription::Directory { .. } => LINUX_EISDIR,
+            // A pipe end is ESPIPE for pwrite/pread regardless of its
+            // direction: Linux refuses positional I/O on an unseekable
+            // description before it looks at the open mode (oracle line
+            // `pwrite_pipe_read_end_espipe` in `pipeextra`).
+            OpenDescription::PipeReader { .. }
+            | OpenDescription::PipeWriter { .. }
+            | OpenDescription::HostPipe { .. }
+            | OpenDescription::EventFd { .. }
+            | OpenDescription::TimerFd { .. }
+            | OpenDescription::HostSocket { .. }
+            | OpenDescription::SignalFd { .. }
+            | OpenDescription::PerfEvent { .. }
+            | OpenDescription::FsContext { .. }
+            | OpenDescription::Mqueue { .. }
+            | OpenDescription::BpfMap { .. }
+            | OpenDescription::BpfProg { .. }
+            | OpenDescription::Netlink { .. }
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::Pidfd { .. }
+            | OpenDescription::Inotify { .. }
+            | OpenDescription::SyntheticDevice { .. }
+            | OpenDescription::VirtualConsole { .. }
+            | OpenDescription::Fanotify { .. }
+            | OpenDescription::InMemorySocket { .. }
+            | OpenDescription::Packet { .. } => LINUX_ESPIPE,
+        };
+        Ok(DispatchOutcome::errno(errno))
+    }
 
-            let mut total = 0usize;
-            for (iovec_index, iovec) in iovecs.iter().enumerate() {
-                let iov_base = iovec.iov_base;
-                let iov_len = usize::try_from(iovec.iov_len)
-                    .map_err(|_| DispatchError::LengthTooLarge(iovec.iov_len))?;
-                // A zero-length iovec is a no-op regardless of its base — Linux
-                // never dereferences it, so a {NULL, 0} entry must be skipped,
-                // not EFAULTed (LTP writev01 "NULL and zero length iovec").
-                if iov_len == 0 {
+    fn pwritev<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        target: WriteTarget,
+        iovecs: Vec<LinuxIovec>,
+        payloads: PwritevPayloads,
+        offset: i64,
+        write_at_current: bool,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        if is_stdio_fd(target.fd) {
+            return Ok(DispatchOutcome::errno(LINUX_ESPIPE));
+        }
+        let Some(open_file) = target.open_file else {
+            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+        };
+        if cx.can_host_wait() {
+            super::resources::stage_io_rearm(
+                cx.kernel,
+                crate::dispatch::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
+            )?;
+        }
+        let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description)
+        else {
+            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+        };
+        // An O_APPEND fd writes at EOF regardless of the offset, but pwritev
+        // (like pwrite) MUST leave the file offset untouched. Save the
+        // offset, seek to EOF, then write via writev()/write() (macOS rejects
+        // pwritev() on an O_APPEND fd with EINVAL), and restore the offset
+        // afterward.
+        let is_append =
+            LinuxOpenFlags::from_bits_truncate(open_file.description.common().status_flags())
+                .contains(LinuxOpenFlags::APPEND);
+        if let OpenDescription::SyntheticDevice { kind, .. } = &*open {
+            match kind {
+                carrick_vfs::SyntheticDeviceKind::Full => {
+                    return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
+                }
+                _ => {
+                    let mut total = 0i64;
+                    for iov in &iovecs {
+                        total += iov.iov_len as i64;
+                    }
+                    return Ok(DispatchOutcome::Returned { value: total });
+                }
+            }
+        }
+        if let OpenDescription::InMemoryFile {
+            contents,
+            writable,
+            offset: current_offset,
+            max_size,
+            ..
+        } = &mut *open
+        {
+            if !*writable {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            }
+            let mut data = contents.write();
+            let mut cur = if is_append {
+                data.len()
+            } else if write_at_current {
+                *current_offset
+            } else {
+                offset as usize
+            };
+            let mut total = 0i64;
+            if let PwritevPayloads::Borrowed { reads, .. } = &payloads {
+                for read in reads {
+                    let len = read.len();
+                    if len == 0 {
+                        continue;
+                    }
+                    // Raw copy out of the retained guest source: never a
+                    // Rust slice over memory other vCPUs may write.
+                    let mut owned = vec![0_u8; len];
+                    read.copy_into(&mut owned);
+                    let buf = owned.as_slice();
+                    let end = match cur.checked_add(len) {
+                        Some(e) => e,
+                        None => {
+                            if total > 0 {
+                                break;
+                            }
+                            return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                        }
+                    };
+                    if end > *max_size {
+                        if total > 0 {
+                            break;
+                        }
+                        return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                    }
+                    if data.write_range(cur, buf).is_err() {
+                        if total > 0 {
+                            break;
+                        }
+                        return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                    }
+                    cur = end;
+                    total += len as i64;
+                }
+            } else if let PwritevPayloads::Staged(staged_iovecs) = &payloads {
+                for buf in staged_iovecs {
+                    let len = buf.len();
+                    if len == 0 {
+                        continue;
+                    }
+                    let end = match cur.checked_add(len) {
+                        Some(e) => e,
+                        None => {
+                            if total > 0 {
+                                break;
+                            }
+                            return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                        }
+                    };
+                    if end > *max_size {
+                        if total > 0 {
+                            break;
+                        }
+                        return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                    }
+                    if data.write_range(cur, buf).is_err() {
+                        if total > 0 {
+                            break;
+                        }
+                        return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                    }
+                    cur = end;
+                    total += len as i64;
+                }
+            }
+            drop(data);
+            if write_at_current {
+                *current_offset = cur;
+            }
+            return Ok(DispatchOutcome::Returned { value: total });
+        }
+        if matches!(&*open, OpenDescription::HostFile { .. }) {
+            let (hfd, is_append, old_len, at_current) = {
+                let Some(host_io) = HostFileIo::from_read(&open) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                };
+                if !host_io.is_writable() {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                }
+                let hfd = host_io.raw();
+                let at_current = write_at_current || is_append;
+                if at_current {
+                    host_io.record_sequential_io();
+                }
+                let old_len = if !at_current {
+                    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                    if unsafe { libc::fstat(hfd, &mut st) } == 0 {
+                        Some(st.st_size as u64)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                (hfd, is_append, old_len, at_current)
+            };
+            let saved_offset = is_append.then(|| unsafe { libc::lseek(hfd, 0, libc::SEEK_CUR) });
+            if is_append {
+                unsafe { libc::lseek(hfd, 0, libc::SEEK_END) };
+            }
+            let restore_offset = |saved: Option<i64>| {
+                if let Some(s) = saved
+                    && s >= 0
+                {
+                    unsafe { libc::lseek(hfd, s, libc::SEEK_SET) };
+                }
+            };
+            let host_wait_runner = self.host_wait_runner_for_ctx(cx);
+            let host_wait_ref = host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
+            if let PwritevPayloads::Borrowed {
+                iovecs: borrowed_iovecs,
+                reads: _retained,
+            } = &payloads
+            {
+                if borrowed_iovecs.is_empty() {
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                let iovcnt = i32::try_from(borrowed_iovecs.len()).map_err(|_| LINUX_EINVAL)?;
+                let mut n = 0;
+                let mut write = || {
+                    n = unsafe {
+                        if at_current {
+                            libc::writev(hfd, borrowed_iovecs.as_ptr(), iovcnt)
+                        } else {
+                            libc::pwritev(
+                                hfd,
+                                borrowed_iovecs.as_ptr(),
+                                iovcnt,
+                                offset as libc::off_t,
+                            )
+                        }
+                    };
+                };
+                // Retained HostRead owners stay live while the caller
+                // releases its execution capacity for the host syscall.
+                let result = if let Some(runner) = host_wait_ref {
+                    runner.run_with_host_wait(&mut write)
+                } else {
+                    write();
+                    Ok(())
+                };
+                restore_offset(saved_offset);
+                result?;
+                let n = n.host_syscall_errno()?;
+                if n > 0 {
+                    if let Some(old_len) = old_len {
+                        punch_unwritten_host_blocks(hfd, old_len, offset as u64)?;
+                    }
+                    self.invalidate_dentry_host_fd(hfd);
+                }
+                return Ok(DispatchOutcome::returned_isize_or_errno(n));
+            }
+            let Some(wait_authority) = target.slot_authority.map(WaitFdAuthority::logical) else {
+                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+            };
+            let mut total = 0i64;
+            let mut cur = offset;
+            let PwritevPayloads::Staged(staged_iovecs) = &payloads else {
+                return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+            };
+            for buf in staged_iovecs {
+                if buf.is_empty() {
                     continue;
                 }
-                let mut bytes = match (*cx.memory).read_bytes(iov_base, iov_len) {
+                let len = buf.len();
+                let pipe_target = HostPipeWriteTarget::new(
+                    hfd,
+                    None,
+                    false,
+                    HostWriteKind::RegularFile,
+                    target.tid,
+                    wait_authority.clone(),
+                    self.cross.host_signal(),
+                )
+                .with_append(is_append)
+                .with_host_wait(host_wait_ref);
+                let outcome = if at_current {
+                    write_host_pipe(buf, pipe_target)?
+                } else {
+                    write_host_pipe_at(buf, cur, pipe_target)?
+                };
+                match outcome {
+                    DispatchOutcome::Returned { value } => {
+                        total += value;
+                        cur += value;
+                        if (value as usize) < len {
+                            break;
+                        }
+                    }
+                    DispatchOutcome::Errno { errno } => {
+                        restore_offset(saved_offset);
+                        return Ok(DispatchOutcome::errno(errno));
+                    }
+                    other => {
+                        restore_offset(saved_offset);
+                        return Ok(other);
+                    }
+                }
+            }
+            restore_offset(saved_offset);
+            if total > 0 {
+                if let Some(old_len) = old_len {
+                    punch_unwritten_host_blocks(hfd, old_len, offset as u64)?;
+                }
+                self.invalidate_dentry_host_fd(hfd);
+            }
+            return Ok(DispatchOutcome::Returned { value: total });
+        }
+        let errno = match &*open {
+            OpenDescription::Closed { .. }
+            | OpenDescription::File { .. }
+            | OpenDescription::InMemoryFile { .. }
+            | OpenDescription::SyntheticFile { .. }
+            | OpenDescription::ProcExecutable { .. } => LINUX_EBADF,
+            OpenDescription::HostFile { writable, .. } if !*writable => LINUX_EBADF,
+            OpenDescription::HostFile { .. } => LINUX_EINVAL,
+            OpenDescription::Directory { .. } => LINUX_EISDIR,
+            // Same rule as `pwrite64`: any pipe end is ESPIPE for positional
+            // I/O (oracle `pipeblockedge` line `pwritev2_pipe_espipe`).
+            OpenDescription::PipeReader { .. }
+            | OpenDescription::PipeWriter { .. }
+            | OpenDescription::HostPipe { .. }
+            | OpenDescription::EventFd { .. }
+            | OpenDescription::TimerFd { .. }
+            | OpenDescription::HostSocket { .. }
+            | OpenDescription::SignalFd { .. }
+            | OpenDescription::PerfEvent { .. }
+            | OpenDescription::FsContext { .. }
+            | OpenDescription::Mqueue { .. }
+            | OpenDescription::BpfMap { .. }
+            | OpenDescription::BpfProg { .. }
+            | OpenDescription::Netlink { .. }
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::Pidfd { .. }
+            | OpenDescription::Inotify { .. }
+            | OpenDescription::SyntheticDevice { .. }
+            | OpenDescription::VirtualConsole { .. }
+            | OpenDescription::Fanotify { .. }
+            | OpenDescription::InMemorySocket { .. }
+            | OpenDescription::Packet { .. } => LINUX_ESPIPE,
+        };
+        Ok(DispatchOutcome::errno(errno))
+    }
+
+    fn resume_writev_copy_in<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        target: WriteTarget,
+        state: WritevCopyInState,
+        bytes: Vec<u8>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let WritevCopyInState {
+            mut iovecs,
+            nonblocking,
+            phase,
+        } = state;
+        match phase {
+            WritevCopyInPhase::Iovecs {
+                iov_addr,
+                iovcnt,
+                mut total,
+            } => {
+                if let Err(errno) = push_resumed_iovec(&bytes, &mut iovecs, &mut total) {
+                    return Ok(DispatchOutcome::errno(errno));
+                }
+                let iovecs = match read_iovecs_from(&*cx.memory, iov_addr, iovcnt, iovecs, total)? {
+                    ReadIovecsOutcome::Ready(iovecs) => iovecs,
+                    ReadIovecsOutcome::Suspended {
+                        iovecs,
+                        total,
+                        suspension,
+                    } => {
+                        return Ok(self.suspend_write_copy_in(
+                            target,
+                            OwnedCopyInOperation::Writev(WritevCopyInState {
+                                iovecs,
+                                nonblocking,
+                                phase: WritevCopyInPhase::Iovecs {
+                                    iov_addr,
+                                    iovcnt,
+                                    total,
+                                },
+                            }),
+                            *suspension,
+                        ));
+                    }
+                };
+                self.writev_from_iovecs(cx, target, iovecs, nonblocking)
+            }
+            WritevCopyInPhase::EventFd {
+                state,
+                index,
+                total,
+            } => {
+                if bytes.len() != 8 {
+                    return Ok(if total == 0 {
+                        DispatchOutcome::errno(LINUX_EFAULT)
+                    } else {
+                        DispatchOutcome::returned_len_or_errno(total)
+                    });
+                }
+                self.apply_writev_eventfd_segment(
+                    cx,
+                    target,
+                    iovecs,
+                    nonblocking,
+                    state,
+                    index,
+                    total,
+                    bytes,
+                )
+            }
+            WritevCopyInPhase::EventFdTail {
+                state,
+                first_value,
+                mut tail,
+                next_iovec,
+                total,
+            } => {
+                if bytes.len() != 8 {
+                    let Some(lease) = target
+                        .io_lease
+                        .or_else(|| target.open_file.as_ref()?.description.retain_fd_lease())
+                    else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
+                    return Ok(DispatchOutcome::BlockingWrite(
+                        BlockingWrite::eventfd(state, lease, first_value, target.tid)
+                            .with_writev_tail(tail, total),
+                    ));
+                }
+                tail.extend_from_slice(&bytes);
+                self.stage_writev_eventfd_tail_from(
+                    cx,
+                    target,
+                    iovecs,
+                    nonblocking,
+                    state,
+                    first_value,
+                    tail,
+                    next_iovec,
+                    total,
+                )
+            }
+            WritevCopyInPhase::BoundedGather {
+                mut gathered,
+                next_iovec,
+            } => {
+                let expected_len = usize::try_from(iovecs[next_iovec - 1].iov_len)
+                    .map_err(|_| DispatchError::LengthTooLarge(iovecs[next_iovec - 1].iov_len))?;
+                gathered.extend_from_slice(&bytes);
+                if bytes.len() < expected_len {
+                    let faulted = gathered.is_empty();
+                    return self.complete_bounded_host_writev(
+                        cx,
+                        &target,
+                        nonblocking,
+                        gathered,
+                        faulted,
+                    );
+                }
+                match super::gather_bounded_iovec_bytes_from(
+                    &*cx.memory,
+                    &iovecs,
+                    next_iovec,
+                    gathered,
+                )? {
+                    Some(super::GatheredIovecOutcome::Ready(GatheredIovecBytes {
+                        bytes,
+                        faulted,
+                    })) => {
+                        self.complete_bounded_host_writev(cx, &target, nonblocking, bytes, faulted)
+                    }
+                    Some(super::GatheredIovecOutcome::Suspended {
+                        bytes: gathered,
+                        next_iovec,
+                        suspension,
+                    }) => Ok(self.suspend_write_copy_in(
+                        target,
+                        OwnedCopyInOperation::Writev(WritevCopyInState {
+                            iovecs,
+                            nonblocking,
+                            phase: WritevCopyInPhase::BoundedGather {
+                                gathered,
+                                next_iovec,
+                            },
+                        }),
+                        *suspension,
+                    )),
+                    None => Err(DispatchError::Errno(LINUX_EINVAL)),
+                }
+            }
+            WritevCopyInPhase::PerIovec { iovec_index, total } => {
+                let expected_len = usize::try_from(iovecs[iovec_index].iov_len)
+                    .map_err(|_| DispatchError::LengthTooLarge(iovecs[iovec_index].iov_len))?;
+                if bytes.len() < expected_len {
+                    if total > 0 {
+                        return Ok(DispatchOutcome::returned_len_or_errno(total));
+                    }
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                }
+                self.writev(
+                    cx,
+                    target,
+                    iovecs,
+                    nonblocking,
+                    iovec_index,
+                    total,
+                    Some(bytes),
+                )
+            }
+            WritevCopyInPhase::BlockingWriteTail {
+                write,
+                current_iovec_len,
+                mut tail,
+                next_iovec,
+                total,
+            } => {
+                let expected_len = usize::try_from(iovecs[next_iovec - 1].iov_len)
+                    .map_err(|_| DispatchError::LengthTooLarge(iovecs[next_iovec - 1].iov_len))?;
+                if bytes.len() < expected_len {
+                    let boundary = writev_pipe_fault_boundary(total, current_iovec_len, tail.len());
+                    let write = match &write.target {
+                        crate::dispatch::outcome::BlockingWriteTarget::InMemoryPipe(_) => {
+                            write.with_in_memory_pipe_writev_boundary(tail, total, boundary)
+                        }
+                        crate::dispatch::outcome::BlockingWriteTarget::Host(_) => {
+                            write.with_writev_tail(tail, total)
+                        }
+                        crate::dispatch::outcome::BlockingWriteTarget::EventFd(_) => write,
+                    };
+                    return Ok(DispatchOutcome::BlockingWrite(write));
+                }
+                tail.extend_from_slice(&bytes);
+                self.stage_writev_blocking_tail_from(
+                    cx,
+                    target,
+                    iovecs,
+                    nonblocking,
+                    write,
+                    current_iovec_len,
+                    tail,
+                    next_iovec,
+                    total,
+                )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn writev_eventfd_from<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        target: WriteTarget,
+        iovecs: Vec<LinuxIovec>,
+        nonblocking: bool,
+        state: Arc<EventFdState>,
+        start_index: usize,
+        mut total: usize,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        for index in start_index..iovecs.len() {
+            let iovec = iovecs[index];
+            if iovec.iov_len != 8 {
+                return Ok(if total == 0 {
+                    DispatchOutcome::errno(LINUX_EINVAL)
+                } else {
+                    DispatchOutcome::returned_len_or_errno(total)
+                });
+            }
+            let bytes = match cx.memory.read_bytes(iovec.iov_base, 8) {
+                Ok(bytes) => bytes,
+                Err(MemoryError::ReadSuspended(suspension)) => {
+                    return Ok(self.suspend_write_copy_in(
+                        target,
+                        OwnedCopyInOperation::Writev(WritevCopyInState {
+                            iovecs,
+                            nonblocking,
+                            phase: WritevCopyInPhase::EventFd {
+                                state,
+                                index,
+                                total,
+                            },
+                        }),
+                        *suspension,
+                    ));
+                }
+                Err(_) => {
+                    return Ok(if total == 0 {
+                        DispatchOutcome::errno(LINUX_EFAULT)
+                    } else {
+                        DispatchOutcome::returned_len_or_errno(total)
+                    });
+                }
+            };
+            let outcome = write_eventfd(self, &bytes, &state);
+            match outcome {
+                DispatchOutcome::Returned { value: 8 } => total += 8,
+                DispatchOutcome::Errno {
+                    errno: LINUX_EAGAIN,
+                } if !nonblocking => {
+                    let first_value = LinuxEventfdValue::read_from_bytes(&bytes)
+                        .map_err(|_| LINUX_EINVAL)?
+                        .value;
+                    return self.stage_writev_eventfd_tail_from(
+                        cx,
+                        target,
+                        iovecs,
+                        nonblocking,
+                        state,
+                        first_value,
+                        Vec::new(),
+                        index + 1,
+                        total,
+                    );
+                }
+                other => {
+                    return Ok(if total == 0 {
+                        other
+                    } else {
+                        DispatchOutcome::returned_len_or_errno(total)
+                    });
+                }
+            }
+        }
+        Ok(DispatchOutcome::returned_len_or_errno(total))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_writev_eventfd_segment<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        target: WriteTarget,
+        iovecs: Vec<LinuxIovec>,
+        nonblocking: bool,
+        state: Arc<EventFdState>,
+        index: usize,
+        mut total: usize,
+        bytes: Vec<u8>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let outcome = write_eventfd(self, &bytes, &state);
+        match outcome {
+            DispatchOutcome::Returned { value: 8 } => {
+                total += 8;
+                self.writev_eventfd_from(cx, target, iovecs, nonblocking, state, index + 1, total)
+            }
+            DispatchOutcome::Errno {
+                errno: LINUX_EAGAIN,
+            } if !nonblocking => {
+                let first_value = LinuxEventfdValue::read_from_bytes(&bytes)
+                    .map_err(|_| LINUX_EINVAL)?
+                    .value;
+                self.stage_writev_eventfd_tail_from(
+                    cx,
+                    target,
+                    iovecs,
+                    nonblocking,
+                    state,
+                    first_value,
+                    Vec::new(),
+                    index + 1,
+                    total,
+                )
+            }
+            other => Ok(if total == 0 {
+                other
+            } else {
+                DispatchOutcome::returned_len_or_errno(total)
+            }),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stage_writev_eventfd_tail_from<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        target: WriteTarget,
+        iovecs: Vec<LinuxIovec>,
+        nonblocking: bool,
+        state: Arc<EventFdState>,
+        first_value: u64,
+        mut tail: Vec<u8>,
+        start_index: usize,
+        total: usize,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        // Capture only complete scalar values through the first error boundary.
+        // The parked operation owns the same description and committed prefix.
+        for index in start_index..iovecs.len() {
+            let next = iovecs[index];
+            if next.iov_len != 8 {
+                break;
+            }
+            match cx.memory.read_bytes(next.iov_base, 8) {
+                Ok(bytes) => tail.extend_from_slice(&bytes),
+                Err(MemoryError::ReadSuspended(suspension)) => {
+                    return Ok(self.suspend_write_copy_in(
+                        target,
+                        OwnedCopyInOperation::Writev(WritevCopyInState {
+                            iovecs,
+                            nonblocking,
+                            phase: WritevCopyInPhase::EventFdTail {
+                                state,
+                                first_value,
+                                tail,
+                                next_iovec: index + 1,
+                                total,
+                            },
+                        }),
+                        *suspension,
+                    ));
+                }
+                Err(_) => break,
+            }
+        }
+        let Some(lease) = target
+            .io_lease
+            .or_else(|| target.open_file.as_ref()?.description.retain_fd_lease())
+        else {
+            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+        };
+        Ok(DispatchOutcome::BlockingWrite(
+            BlockingWrite::eventfd(state, lease, first_value, target.tid)
+                .with_writev_tail(tail, total),
+        ))
+    }
+
+    fn has_bounded_host_writev_target<M: CurrentMmMemory>(
+        &self,
+        _cx: &SyscallCtx<'_, M>,
+        open_file: Option<&OpenFile>,
+    ) -> Result<bool, LinuxErrno> {
+        let Some(open_file) = open_file else {
+            return Ok(false);
+        };
+        open_file
+            .description
+            .inspect_kind(|open| match open {
+                OpenDescription::HostPipe {
+                    is_read_end,
+                    pty,
+                    bidirectional,
+                    ..
+                } => {
+                    if *is_read_end && pty.is_none() && !*bidirectional {
+                        return Err(LINUX_EBADF);
+                    }
+                    Ok(true)
+                }
+                OpenDescription::HostSocket { .. } => Ok(true),
+                OpenDescription::HostFile { writable, .. } => {
+                    if !*writable {
+                        return Err(LINUX_EBADF);
+                    }
+                    Ok(true)
+                }
+                _ => Ok(false),
+            })
+            .unwrap_or(Ok(false))
+    }
+
+    fn complete_bounded_host_writev<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        target: &WriteTarget,
+        nonblocking: bool,
+        bytes: Vec<u8>,
+        faulted: bool,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        struct HostWritevTarget {
+            host_fd: i32,
+            host_fd_owner: Option<HostFdRef>,
+            write_kind: HostWriteKind,
+            pipe_state: Option<(i64, usize)>,
+            sigpipe_on_epipe: bool,
+            append: bool,
+            socket_flow: Option<Arc<crate::kernel::UnixFlow>>,
+            socket_cred: Option<crate::kernel::SocketPeerCred>,
+            is_stream: bool,
+        }
+
+        let Some(ref open_file) = target.open_file else {
+            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+        };
+        let Some(host_target_res) = open_file.description.inspect_kind(|open| match open {
+            OpenDescription::HostPipe {
+                base,
+                host_fd,
+                is_read_end,
+                pipe_id,
+                pty,
+                bidirectional,
+                write_kind,
+                ..
+            } => {
+                if *is_read_end && pty.is_none() && !*bidirectional {
+                    return Err(LINUX_EBADF);
+                }
+                Ok(HostWritevTarget {
+                    host_fd: host_fd.raw(),
+                    host_fd_owner: Some(host_fd.clone()),
+                    write_kind: *write_kind,
+                    pipe_state: self.host_pipe_capacity_state(
+                        base,
+                        *pipe_id,
+                        *is_read_end,
+                        *bidirectional,
+                        host_fd.raw(),
+                    ),
+                    sigpipe_on_epipe: true,
+                    append: false,
+                    socket_flow: None,
+                    socket_cred: None,
+                    is_stream: false,
+                })
+            }
+            OpenDescription::HostSocket { host_fd, type_, .. } => {
+                let outbound_flow = open_file.description.common().outbound_flow();
+                let creds = self.cred_snapshot();
+                let task_id = u32::try_from(cx.kernel.task().key().id.raw()).unwrap_or(0);
+                let pid = crate::namespace::pid::ns_self_pid_for(cx.kernel, task_id) as i32;
+                let my_cred = crate::kernel::SocketPeerCred {
+                    pid: crate::dispatch::abi_args::NsPid(pid),
+                    uid: creds.ruid,
+                    gid: creds.rgid,
+                };
+                let is_stream = *type_ == carrick_abi::LINUX_SOCK_STREAM;
+                Ok(HostWritevTarget {
+                    host_fd: host_fd.raw(),
+                    host_fd_owner: Some(host_fd.clone()),
+                    write_kind: HostWriteKind::SocketLike,
+                    pipe_state: None,
+                    sigpipe_on_epipe: false,
+                    append: false,
+                    socket_flow: outbound_flow,
+                    socket_cred: Some(my_cred),
+                    is_stream,
+                })
+            }
+            OpenDescription::HostFile {
+                host_fd, writable, ..
+            } => {
+                if !*writable {
+                    return Err(LINUX_EBADF);
+                }
+                Ok(HostWritevTarget {
+                    host_fd: host_fd.raw(),
+                    host_fd_owner: Some(host_fd.clone()),
+                    write_kind: HostWriteKind::RegularFile,
+                    pipe_state: None,
+                    sigpipe_on_epipe: false,
+                    append: LinuxOpenFlags::from_bits_truncate(
+                        open_file.description.common().status_flags(),
+                    )
+                    .contains(LinuxOpenFlags::APPEND),
+                    socket_flow: None,
+                    socket_cred: None,
+                    is_stream: false,
+                })
+            }
+            _ => Err(LINUX_EBADF),
+        }) else {
+            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+        };
+        let host_target = match host_target_res {
+            Ok(host_target) => host_target,
+            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+        };
+
+        if bytes.is_empty() {
+            // Nothing transferable: EFAULT only if the emptiness came
+            // from an unreadable segment. An all-zero-length list is a
+            // legitimate 0-byte write.
+            return if faulted {
+                Ok(DispatchOutcome::errno(LINUX_EFAULT))
+            } else {
+                Ok(DispatchOutcome::Returned { value: 0 })
+            };
+        }
+        if host_target.append {
+            unsafe { libc::lseek(host_target.host_fd, 0, libc::SEEK_END) };
+        }
+        let old_len = if host_target.write_kind == HostWriteKind::RegularFile && !host_target.append
+        {
+            let pos = unsafe { libc::lseek(host_target.host_fd, 0, libc::SEEK_CUR) };
+            if pos >= 0 {
+                let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                if unsafe { libc::fstat(host_target.host_fd, &mut st) } == 0
+                    && (pos as u64) > st.st_size as u64
+                {
+                    Some((st.st_size as u64, pos as u64))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let Some(wait_authority) = target.slot_authority.map(WaitFdAuthority::logical) else {
+            return Ok(DispatchOutcome::errno(LINUX_EBADF));
+        };
+        let host_wait_runner = self.host_wait_runner_for_ctx(cx);
+        let host_wait_ref = host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
+        if let Some(owner) = host_target.host_fd_owner.as_ref()
+            && host_target.write_kind == HostWriteKind::RegularFile
+        {
+            owner.record_sequential_io();
+        }
+        let outcome = write_host_pipe_owned(
+            bytes,
+            HostPipeWriteTarget::new(
+                host_target.host_fd,
+                host_target.host_fd_owner.clone(),
+                nonblocking,
+                host_target.write_kind,
+                target.tid,
+                wait_authority,
+                self.cross.host_signal(),
+            )
+            .with_pipe_state(host_target.pipe_state)
+            .with_sigpipe(host_target.sigpipe_on_epipe)
+            .with_socket_flow(
+                host_target.socket_flow,
+                host_target.socket_cred,
+                host_target.is_stream,
+            )
+            .with_host_wait(host_wait_ref),
+        )?;
+        if let DispatchOutcome::Returned { value } = outcome
+            && value > 0
+        {
+            if let Some((old_len, pos)) = old_len {
+                punch_unwritten_host_blocks(host_target.host_fd, old_len, pos)?;
+            }
+            self.invalidate_dentry_host_fd(host_target.host_fd);
+        }
+        if host_target.sigpipe_on_epipe {
+            Ok(self.raise_sigpipe_on_epipe(cx, outcome))
+        } else {
+            Ok(outcome)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn writev<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        target: WriteTarget,
+        iovecs: Vec<LinuxIovec>,
+        nonblocking: bool,
+        start_index: usize,
+        mut total: usize,
+        mut pre_read_first_segment: Option<Vec<u8>>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        for iovec_index in start_index..iovecs.len() {
+            let iovec = iovecs[iovec_index];
+            let iov_base = iovec.iov_base;
+            let iov_len = usize::try_from(iovec.iov_len)
+                .map_err(|_| DispatchError::LengthTooLarge(iovec.iov_len))?;
+            // A zero-length iovec is a no-op regardless of its base — Linux
+            // never dereferences it, so a {NULL, 0} entry must be skipped,
+            // not EFAULTed (LTP writev01 "NULL and zero length iovec").
+            if iov_len == 0 {
+                continue;
+            }
+            let mut bytes = if let Some(resumed_bytes) = pre_read_first_segment.take() {
+                resumed_bytes
+            } else {
+                match (*cx.memory).read_bytes(iov_base, iov_len) {
                     Ok(bytes) => bytes,
+                    Err(MemoryError::ReadSuspended(suspension)) => {
+                        return Ok(self.suspend_write_copy_in(
+                            target,
+                            OwnedCopyInOperation::Writev(WritevCopyInState {
+                                iovecs,
+                                nonblocking,
+                                phase: WritevCopyInPhase::PerIovec { iovec_index, total },
+                            }),
+                            *suspension,
+                        ));
+                    }
                     Err(_) => {
                         // Bytes already written are already visible in the
                         // file, so reporting EFAULT here would both lose the
@@ -4014,497 +5007,537 @@ impl<'a> FsView<'a> {
                         // nothing was written. Report the short count instead;
                         // EFAULT is correct only when nothing moved.
                         if total > 0 {
-                            break;
+                            return Ok(DispatchOutcome::returned_len_or_errno(total));
                         }
                         return Ok(DispatchOutcome::errno(LINUX_EFAULT));
                     }
+                }
+            };
+            // Preserve this before any destination arm takes ownership of
+            // `bytes`; a parked in-memory pipe continuation uses it to
+            // compute the aggregate copy boundary after a later iovec fault.
+            let current_iovec_len = bytes.len();
+            // Mirror `write`: check open_file FIRST so post-dup3
+            // redirects (eg `dup3(pipe_write, 1)`) actually plumb
+            // through the redirected description rather than the
+            // built-in stdout buffer.
+            if let Some(ref open_file) = target.open_file {
+                let Some(io_lease) = target
+                    .io_lease
+                    .clone()
+                    .or_else(|| open_file.description.retain_fd_lease())
+                else {
+                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
-                // Preserve this before any destination arm takes ownership of
-                // `bytes`; a parked in-memory pipe continuation uses it to
-                // compute the aggregate copy boundary after a later iovec fault.
-                let current_iovec_len = bytes.len();
-                // Mirror `write`: check open_files FIRST so post-dup3
-                // redirects (eg `dup3(pipe_write, 1)`) actually plumb
-                // through the redirected description rather than the
-                // built-in stdout buffer.
-                if let Some(open_file) = this.open_file(fd) {
-                    let Some(io_lease) = open_file.description.retain_fd_lease() else {
+                enum FileWriteback {
+                    Range {
+                        path: String,
+                        offset: usize,
+                        bytes: Vec<u8>,
+                        final_size: usize,
+                    },
+                }
+                let outcome: DispatchOutcome;
+                let writeback: Option<FileWriteback>;
+                {
+                    let Some(mut open) =
+                        crate::kernel::FileDescription::write_for_io(&open_file.description)
+                    else {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
-                    enum FileWriteback {
-                        Range {
-                            path: String,
-                            offset: usize,
-                            bytes: Vec<u8>,
-                            final_size: usize,
-                        },
-                    }
-                    let outcome: DispatchOutcome;
-                    let writeback: Option<FileWriteback>;
-                    {
-                        let Some(mut open) = crate::kernel::FileDescription::write_for_io(&open_file.description) else {
-                            return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                        };
-                        match &mut *open {
-                            OpenDescription::SyntheticDevice { kind, .. } => {
-                                match kind {
-                                    carrick_vfs::SyntheticDeviceKind::Full => {
-                                        return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
-                                    }
-                                    _ => {
-                                        outcome = DispatchOutcome::returned_len_or_errno(
-                                            bytes.len(),
-                                        );
-                                        writeback = None;
-                                    }
-                                }
+                    match &mut *open {
+                        OpenDescription::SyntheticDevice { kind, .. } => match kind {
+                            carrick_vfs::SyntheticDeviceKind::Full => {
+                                return Ok(DispatchOutcome::errno(LINUX_ENOSPC));
                             }
-                            OpenDescription::VirtualConsole { console, .. } => {
-                                console.write(&bytes);
+                            _ => {
                                 outcome = DispatchOutcome::returned_len_or_errno(bytes.len());
                                 writeback = None;
                             }
-                            OpenDescription::PipeWriter { pipe, .. } => {
-                                let pipe = Arc::clone(pipe);
-                                let Some(wait_authority) = this
-                                    .captured_slot_authority(fd)
-                                    .map(WaitFdAuthority::logical)
-                                else {
-                                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                                };
-                                let tid = cx.tid();
-                                let flags = open_file.description.common().status_flags();
-                                drop(open);
-                                outcome = write_pipe(
-                                    &bytes,
-                                    &pipe,
-                                    flags,
-                                    PipeWriteOperation {
-                                        writer_lease: io_lease,
-                                        tid,
-                                        authority: wait_authority,
-                                        is_interrupted: || {
-                                            this.has_deliverable_dispatch_pending_for_wait(
-                                                cx.kernel,
-                                                tid,
-                                                carrick_abi::WaitSigMask::NONE,
-                                            )
-                                        },
-                                        notification: Some(PipeWriteNotification::new(
-                                            this.captured_file_table().epoll_wake_handle(),
-                                            Arc::clone(cx.kernel.kernel()),
-                                            fd,
-                                        )),
-                                    },
-                                );
-                                writeback = None;
-                            }
-                            OpenDescription::HostPipe {
-                                base,
-                                host_fd,
-                                is_read_end,
-                                pipe_id,
-                                pty,
-                                bidirectional,
-                                write_kind,
-                                stdio_stream,
-                                ..
-                            } => {
-                                if let Some(stream) = *stdio_stream {
-                                    if stream == 0 {
-                                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                                    }
-                                    if !this.io.inherits_host_stdio() {
-                                        drop(open);
-                                        return Ok(this.write_stdio_sink(stream, &bytes));
-                                    }
-                                }
-                                // pty ends and O_RDWR FIFOs are bidirectional;
-                                // only real one-way pipe ends gate on is_read_end.
-                                if *is_read_end && pty.is_none() && !*bidirectional {
-                                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                                }
-                                let (bytes_to_write, consumed_count) = if let Some(PtyRole { index, is_master: true }) = pty {
-                                    let orig_len = bytes.len();
-                                    let forwarded = crate::kernel::tty::process_master_write(cx.kernel.container().tty_registry(),
-                                        crate::kernel::tty::TtyKey::Pty(*index),
-                                        host_fd.raw(),
-                                        &bytes,
-                                    );
-                                    let consumed = orig_len - forwarded.len();
-                                    (forwarded, consumed)
-                                } else {
-                                    (bytes, 0)
-                                };
-                                outcome = if bytes_to_write.is_empty() && consumed_count > 0 {
-                                    DispatchOutcome::returned_len_or_errno(consumed_count)
-                                } else {
-                                    let Some(wait_authority) = this
-                                        .captured_slot_authority(fd)
-                                        .map(WaitFdAuthority::logical)
-                                    else {
-                                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                                    };
-                                    let host_wait_runner = this.host_wait_runner_for_ctx(cx);
-                                    let host_wait_ref =
-                                        host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
-                                    let res = write_host_pipe_owned(
-                                        bytes_to_write,
-                                        HostPipeWriteTarget::new(
-                                            host_fd.raw(),
-                                            Some(host_fd.clone()),
-                                            nonblocking,
-                                            *write_kind,
+                        },
+                        OpenDescription::VirtualConsole { console, .. } => {
+                            console.write(&bytes);
+                            outcome = DispatchOutcome::returned_len_or_errno(bytes.len());
+                            writeback = None;
+                        }
+                        OpenDescription::PipeWriter { pipe, .. } => {
+                            let pipe = Arc::clone(pipe);
+                            let Some(wait_authority) =
+                                target.slot_authority.map(WaitFdAuthority::logical)
+                            else {
+                                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                            };
+                            let tid = cx.tid();
+                            let flags = open_file.description.common().status_flags();
+                            drop(open);
+                            outcome = write_pipe(
+                                &bytes,
+                                &pipe,
+                                flags,
+                                PipeWriteOperation {
+                                    writer_lease: io_lease,
+                                    tid,
+                                    authority: wait_authority,
+                                    is_interrupted: || {
+                                        self.has_deliverable_dispatch_pending_for_wait(
+                                            cx.kernel,
                                             tid,
-                                            wait_authority,
-                                            this.cross.host_signal(),
+                                            carrick_abi::WaitSigMask::NONE,
                                         )
-                                        .with_pipe_state(this.host_pipe_capacity_state(
-                                            base,
-                                            *pipe_id,
-                                            *is_read_end,
-                                            *bidirectional,
-                                            host_fd.raw(),
-                                        ))
-                                        .with_sigpipe(true)
-                                        .with_host_wait(host_wait_ref),
-                                    )?;
-                                    match res {
-                                        DispatchOutcome::Returned { value } => {
-                                            let total = usize::try_from(value)
-                                                .ok()
-                                                .and_then(|v| v.checked_add(consumed_count));
-                                            match total {
-                                                Some(t) => DispatchOutcome::returned_len_or_errno(t),
-                                                None => DispatchOutcome::errno(LINUX_EOVERFLOW),
-                                            }
-                                        }
-                                        other => {
-                                            if consumed_count > 0 {
-                                                DispatchOutcome::returned_len_or_errno(consumed_count)
-                                            } else {
-                                                other
-                                            }
-                                        }
-                                    }
-                                };
-                                writeback = None;
+                                    },
+                                    notification: Some(PipeWriteNotification::new(
+                                        self.captured_file_table().epoll_wake_handle(),
+                                        Arc::clone(cx.kernel.kernel()),
+                                        target.fd,
+                                    )),
+                                },
+                            );
+                            writeback = None;
+                        }
+                        OpenDescription::HostPipe {
+                            base,
+                            host_fd,
+                            is_read_end,
+                            pipe_id,
+                            pty,
+                            bidirectional,
+                            write_kind,
+                            stdio_stream,
+                            ..
+                        } => {
+                            if let Some(stream) = *stdio_stream {
+                                if stream == 0 {
+                                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                                }
+                                if !self.io.inherits_host_stdio() {
+                                    drop(open);
+                                    return Ok(self.write_stdio_sink(stream, &bytes));
+                                }
                             }
-                            OpenDescription::HostSocket { host_fd, type_, .. } => {
-                                let Some(wait_authority) = this
-                                    .captured_slot_authority(fd)
-                                    .map(WaitFdAuthority::logical)
+                            // pty ends and O_RDWR FIFOs are bidirectional;
+                            // only real one-way pipe ends gate on is_read_end.
+                            if *is_read_end && pty.is_none() && !*bidirectional {
+                                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                            }
+                            let (bytes_to_write, consumed_count) = if let Some(PtyRole {
+                                index,
+                                is_master: true,
+                            }) = pty
+                            {
+                                let orig_len = bytes.len();
+                                let forwarded = crate::kernel::tty::process_master_write(
+                                    cx.kernel.container().tty_registry(),
+                                    crate::kernel::tty::TtyKey::Pty(*index),
+                                    host_fd.raw(),
+                                    &bytes,
+                                );
+                                let consumed = orig_len - forwarded.len();
+                                (forwarded, consumed)
+                            } else {
+                                (bytes, 0)
+                            };
+                            outcome = if bytes_to_write.is_empty() && consumed_count > 0 {
+                                DispatchOutcome::returned_len_or_errno(consumed_count)
+                            } else {
+                                let Some(wait_authority) =
+                                    target.slot_authority.map(WaitFdAuthority::logical)
                                 else {
                                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                                 };
-                                let outbound_flow = open_file.description.common().outbound_flow();
-                                let creds = this.cred_snapshot();
-                                let task_id = u32::try_from(cx.kernel.task().key().id.raw()).unwrap_or(0);
-                                let pid = crate::namespace::pid::ns_self_pid_for(cx.kernel, task_id) as i32;
-                                let my_cred = crate::kernel::SocketPeerCred {
-                                    pid: crate::dispatch::abi_args::NsPid(pid),
-                                    uid: creds.ruid,
-                                    gid: creds.rgid,
-                                };
-                                let is_stream = *type_ == carrick_abi::LINUX_SOCK_STREAM;
-                                let host_wait_runner = this.host_wait_runner_for_ctx(cx);
+                                let host_wait_runner = self.host_wait_runner_for_ctx(cx);
                                 let host_wait_ref =
                                     host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
-                                outcome = write_host_pipe_owned(
-                                    bytes,
+                                let res = write_host_pipe_owned(
+                                    bytes_to_write,
                                     HostPipeWriteTarget::new(
                                         host_fd.raw(),
                                         Some(host_fd.clone()),
                                         nonblocking,
-                                        HostWriteKind::SocketLike,
-                                        tid,
+                                        *write_kind,
+                                        target.tid,
                                         wait_authority,
-                                        this.cross.host_signal(),
+                                        self.cross.host_signal(),
                                     )
-                                    .with_socket_flow(outbound_flow, Some(my_cred), is_stream)
+                                    .with_pipe_state(self.host_pipe_capacity_state(
+                                        base,
+                                        *pipe_id,
+                                        *is_read_end,
+                                        *bidirectional,
+                                        host_fd.raw(),
+                                    ))
+                                    .with_sigpipe(true)
                                     .with_host_wait(host_wait_ref),
                                 )?;
-                                writeback = None;
-                            }
-                            OpenDescription::InMemorySocket { socket, .. } => {
-                                let socket = Arc::clone(socket);
-                                match socket.send_stream(&bytes, Vec::new()) {
-                                    Ok(written) => {
-                                        this.notify_inmem_epoll();
-                                        outcome = DispatchOutcome::returned_len_or_errno(written);
+                                match res {
+                                    DispatchOutcome::Returned { value } => {
+                                        let total = usize::try_from(value)
+                                            .ok()
+                                            .and_then(|v| v.checked_add(consumed_count));
+                                        match total {
+                                            Some(t) => DispatchOutcome::returned_len_or_errno(t),
+                                            None => DispatchOutcome::errno(LINUX_EOVERFLOW),
+                                        }
                                     }
-                                    Err(LINUX_EAGAIN) if !nonblocking => {
-                                        outcome = crate::dispatch::net::wait_in_memory_slot(
-                                            &this.captured_file_table(),
-                                            fd, libc::POLLOUT,
-                                            socket.get_sndtimeo(),
-                                        );
-                                    }
-                                    Err(LINUX_EPIPE) => {
-                                        outcome = DispatchOutcome::errno(LINUX_EPIPE);
-                                    }
-                                    Err(errno) => {
-                                        outcome = DispatchOutcome::errno(errno);
+                                    other => {
+                                        if consumed_count > 0 {
+                                            DispatchOutcome::returned_len_or_errno(consumed_count)
+                                        } else {
+                                            other
+                                        }
                                     }
                                 }
-                                writeback = None;
-                            }
-                            OpenDescription::HostFile {
-                                host_fd, writable, ..
-                            } => {
-                                if !*writable {
-                                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                                }
-                                // Mirror `write`(64): O_APPEND seeks to EOF, then
-                                // libc::write to the real fd advances the shared
-                                // kernel offset (visible across fork and to the
-                                // readv that follows).
-                                if LinuxOpenFlags::from_bits_truncate(
-                                    open_file.description.common().status_flags(),
+                            };
+                            writeback = None;
+                        }
+                        OpenDescription::HostSocket { host_fd, type_, .. } => {
+                            let Some(wait_authority) =
+                                target.slot_authority.map(WaitFdAuthority::logical)
+                            else {
+                                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                            };
+                            let outbound_flow = open_file.description.common().outbound_flow();
+                            let creds = self.cred_snapshot();
+                            let task_id =
+                                u32::try_from(cx.kernel.task().key().id.raw()).unwrap_or(0);
+                            let pid =
+                                crate::namespace::pid::ns_self_pid_for(cx.kernel, task_id) as i32;
+                            let my_cred = crate::kernel::SocketPeerCred {
+                                pid: crate::dispatch::abi_args::NsPid(pid),
+                                uid: creds.ruid,
+                                gid: creds.rgid,
+                            };
+                            let is_stream = *type_ == carrick_abi::LINUX_SOCK_STREAM;
+                            let host_wait_runner = self.host_wait_runner_for_ctx(cx);
+                            let host_wait_ref =
+                                host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
+                            outcome = write_host_pipe_owned(
+                                bytes,
+                                HostPipeWriteTarget::new(
+                                    host_fd.raw(),
+                                    Some(host_fd.clone()),
+                                    nonblocking,
+                                    HostWriteKind::SocketLike,
+                                    target.tid,
+                                    wait_authority,
+                                    self.cross.host_signal(),
                                 )
-                                .contains(LinuxOpenFlags::APPEND)
-                                {
-                                    unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) };
+                                .with_socket_flow(outbound_flow, Some(my_cred), is_stream)
+                                .with_host_wait(host_wait_ref),
+                            )?;
+                            writeback = None;
+                        }
+                        OpenDescription::InMemorySocket { socket, .. } => {
+                            let socket = Arc::clone(socket);
+                            match socket.send_stream(&bytes, Vec::new()) {
+                                Ok(written) => {
+                                    self.notify_inmem_epoll();
+                                    outcome = DispatchOutcome::returned_len_or_errno(written);
                                 }
-                                let Some(wait_authority) = this
-                                    .captured_slot_authority(fd)
-                                    .map(WaitFdAuthority::logical)
-                                    else {
-                                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                                    };
-                                let raw_fd = host_fd.raw();
-                                let host_fd_owner = host_fd.clone();
-                                host_fd_owner.record_sequential_io();
-                                let host_wait_runner = this.host_wait_runner_for_ctx(cx);
-                                let host_wait_ref =
-                                    host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
-                                outcome = write_host_pipe_owned(
-                                    bytes,
-                                    HostPipeWriteTarget::new(
-                                        raw_fd,
-                                        Some(host_fd_owner),
-                                        nonblocking,
-                                        HostWriteKind::RegularFile,
-                                        tid,
-                                        wait_authority,
-                                        this.cross.host_signal(),
-                                    )
-                                    .with_host_wait(host_wait_ref),
-                                )?;
-                                if let DispatchOutcome::Returned { value } = outcome && value > 0 {
-                                    this.invalidate_dentry_host_fd(raw_fd);
+                                Err(LINUX_EAGAIN) if !nonblocking => {
+                                    outcome = crate::dispatch::net::wait_in_memory_captured_slot(
+                                        target.slot_authority,
+                                        libc::POLLOUT,
+                                        socket.get_sndtimeo(),
+                                    );
                                 }
-                                writeback = None;
+                                Err(LINUX_EPIPE) => {
+                                    outcome = DispatchOutcome::errno(LINUX_EPIPE);
+                                }
+                                Err(errno) => {
+                                    outcome = DispatchOutcome::errno(errno);
+                                }
                             }
-                            OpenDescription::InMemoryFile {
-                                path,
-                                contents,
-                                offset,
-                                writable,
-                                max_size,
-                                ..
-                            } => {
-                                if !*writable {
-                                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                                }
-                                let mut data = contents.write();
-                                let write_offset = if LinuxOpenFlags::from_bits_truncate(
-                                    open_file.description.common().status_flags(),
+                            writeback = None;
+                        }
+                        OpenDescription::HostFile {
+                            host_fd, writable, ..
+                        } => {
+                            if !*writable {
+                                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                            }
+                            // Mirror `write`(64): O_APPEND seeks to EOF, then
+                            // libc::write to the real fd advances the shared
+                            // kernel offset (visible across fork and to the
+                            // readv that follows).
+                            if LinuxOpenFlags::from_bits_truncate(
+                                open_file.description.common().status_flags(),
+                            )
+                            .contains(LinuxOpenFlags::APPEND)
+                            {
+                                unsafe { libc::lseek(host_fd.raw(), 0, libc::SEEK_END) };
+                            }
+                            let Some(wait_authority) =
+                                target.slot_authority.map(WaitFdAuthority::logical)
+                            else {
+                                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                            };
+                            let raw_fd = host_fd.raw();
+                            let host_fd_owner = host_fd.clone();
+                            host_fd_owner.record_sequential_io();
+                            let host_wait_runner = self.host_wait_runner_for_ctx(cx);
+                            let host_wait_ref =
+                                host_wait_runner.as_ref().map(|r| r as &dyn HostWaitRunner);
+                            outcome = write_host_pipe_owned(
+                                bytes,
+                                HostPipeWriteTarget::new(
+                                    raw_fd,
+                                    Some(host_fd_owner),
+                                    nonblocking,
+                                    HostWriteKind::RegularFile,
+                                    target.tid,
+                                    wait_authority,
+                                    self.cross.host_signal(),
                                 )
-                                .contains(LinuxOpenFlags::APPEND)
-                                {
-                                    data.len()
-                                } else {
-                                    *offset
-                                };
-                                let end = match write_offset.checked_add(bytes.len()) {
-                                    Some(e) => e,
-                                    None => return Ok(DispatchOutcome::errno(LINUX_EFBIG)),
-                                };
-                                if end > *max_size {
-                                    return Ok(DispatchOutcome::errno(LINUX_EFBIG));
-                                }
-                                if data.write_range(write_offset, &bytes).is_err() {
-                                    return Ok(DispatchOutcome::errno(LINUX_EFBIG));
-                                }
-                                *offset = end;
-                                this.fs.rootfs_vfs.notify_inode_changed(path, None);
-                                outcome = DispatchOutcome::returned_len_or_errno(bytes.len());
-                                writeback = None;
+                                .with_host_wait(host_wait_ref),
+                            )?;
+                            if let DispatchOutcome::Returned { value } = outcome
+                                && value > 0
+                            {
+                                self.invalidate_dentry_host_fd(raw_fd);
                             }
-                            OpenDescription::File {
-                                path,
-                                contents,
-                                offset,
-                                writable,
-                                metadata,
-                                ..
-                            } => {
-                                if !*writable {
-                                    return Ok(DispatchOutcome::errno(LINUX_EBADF));
-                                }
-                                let cur_len = match contents.len() {
-                                    Ok(l) => l as usize,
-                                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                                };
-                                if let Err(errno) = memfd_seal_write_check(
-                                    open_file.description.common().seals(),
-                                    *offset,
-                                    bytes.len(),
-                                    cur_len,
-                                ) {
+                            writeback = None;
+                        }
+                        OpenDescription::InMemoryFile {
+                            path,
+                            contents,
+                            offset,
+                            writable,
+                            max_size,
+                            ..
+                        } => {
+                            if !*writable {
+                                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                            }
+                            let mut data = contents.write();
+                            let write_offset = if LinuxOpenFlags::from_bits_truncate(
+                                open_file.description.common().status_flags(),
+                            )
+                            .contains(LinuxOpenFlags::APPEND)
+                            {
+                                data.len()
+                            } else {
+                                *offset
+                            };
+                            let end = match write_offset.checked_add(bytes.len()) {
+                                Some(e) => e,
+                                None => return Ok(DispatchOutcome::errno(LINUX_EFBIG)),
+                            };
+                            if end > *max_size {
+                                return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                            }
+                            if data.write_range(write_offset, &bytes).is_err() {
+                                return Ok(DispatchOutcome::errno(LINUX_EFBIG));
+                            }
+                            *offset = end;
+                            self.fs.rootfs_vfs.notify_inode_changed(path, None);
+                            outcome = DispatchOutcome::returned_len_or_errno(bytes.len());
+                            writeback = None;
+                        }
+                        OpenDescription::File {
+                            path,
+                            contents,
+                            offset,
+                            writable,
+                            metadata,
+                            ..
+                        } => {
+                            if !*writable {
+                                return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                            }
+                            let cur_len = match contents.len() {
+                                Ok(l) => l as usize,
+                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            };
+                            if let Err(errno) = memfd_seal_write_check(
+                                open_file.description.common().seals(),
+                                *offset,
+                                bytes.len(),
+                                cur_len,
+                            ) {
+                                return Ok(DispatchOutcome::errno(errno));
+                            }
+                            let write_offset = *offset;
+                            let written = match write_into_file_contents(contents, offset, &bytes) {
+                                Ok(n) => n,
+                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            };
+                            bytes.truncate(written);
+                            let new_len = match contents.len() {
+                                Ok(l) => l as usize,
+                                Err(errno) if written == 0 => {
                                     return Ok(DispatchOutcome::errno(errno));
                                 }
-                                let write_offset = *offset;
-                                let written = match write_into_file_contents(contents, offset, &bytes) {
-                                    Ok(n) => n,
-                                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
-                                };
-                                bytes.truncate(written);
-                                let new_len = match contents.len() {
-                                    Ok(l) => l as usize,
-                                    Err(errno) if written == 0 => {
-                                        return Ok(DispatchOutcome::errno(errno));
-                                    }
-                                    Err(_) => cur_len.max(write_offset.saturating_add(written)),
-                                };
-                                metadata.size = new_len;
-                                outcome = DispatchOutcome::returned_len_or_errno(written);
-                                writeback = (!is_anon_overlay_path(path)).then(|| {
-                                    FileWriteback::Range {
-                                        path: path.clone(),
-                                        offset: write_offset,
-                                        bytes,
-                                        final_size: new_len,
-                                    }
+                                Err(_) => cur_len.max(write_offset.saturating_add(written)),
+                            };
+                            metadata.size = new_len;
+                            outcome = DispatchOutcome::returned_len_or_errno(written);
+                            writeback =
+                                (!is_anon_overlay_path(path)).then(|| FileWriteback::Range {
+                                    path: path.clone(),
+                                    offset: write_offset,
+                                    bytes,
+                                    final_size: new_len,
                                 });
-                            }
-                            _ => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
                         }
+                        _ => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
                     }
-                    if let Some(FileWriteback::Range {
-                        path,
-                        offset,
-                        bytes,
-                        final_size,
-                    }) = writeback
-                    {
-                        let _ = this
-                            .fs
-                            .rootfs_vfs
-                            .write_file_range(&path, offset, &bytes, final_size);
+                }
+                if let Some(FileWriteback::Range {
+                    path,
+                    offset,
+                    bytes,
+                    final_size,
+                }) = writeback
+                {
+                    let _ = self
+                        .fs
+                        .rootfs_vfs
+                        .write_file_range(&path, offset, &bytes, final_size);
+                }
+                if let DispatchOutcome::BlockingWrite(write) = outcome {
+                    return self.stage_writev_blocking_tail_from(
+                        cx,
+                        target,
+                        iovecs,
+                        nonblocking,
+                        write,
+                        current_iovec_len,
+                        Vec::new(),
+                        iovec_index + 1,
+                        total,
+                    );
+                }
+                let DispatchOutcome::Returned { value } = outcome else {
+                    // EAGAIN/EPIPE on this iovec. writev(2) is atomic across
+                    // iovecs: if EARLIER iovecs were already written (total >
+                    // 0), return that short count — NOT the error, which
+                    // would discard bytes already sent and make the caller
+                    // re-send from offset 0 (libuv's stream flow control then
+                    // never completes a write: ipc_heavy_traffic_deadlock_bug,
+                    // bw stuck at 0). Only surface the error when nothing has
+                    // been written yet.
+                    //
+                    // For EPIPE specifically with nothing written: a broken
+                    // pipe/socket (read end closed) → EPIPE AND a SIGPIPE on
+                    // the writer, same as write(2) (busybox `yes | head`
+                    // wants exit 141, write05).
+                    if total > 0 {
+                        return Ok(DispatchOutcome::returned_len_or_errno(total));
                     }
-                    if let DispatchOutcome::BlockingWrite(write) = outcome {
-                        // `write_pipe` has committed a prefix of this iovec.
-                        // The continuation must retain the rest of the writev
-                        // aggregate in-order; completing only this iovec would
-                        // report a short count after the reactor has delivered
-                        // later bytes.  Stage the tail exactly once at the park
-                        // boundary, after the ordinary sequential reads have
-                        // already established this iovec's prefix.
-                        let mut tail = Vec::new();
-                        for remaining in iovecs.iter().skip(iovec_index + 1) {
-                            let remaining_len = usize::try_from(remaining.iov_len).map_err(|_| {
-                                DispatchError::LengthTooLarge(remaining.iov_len)
-                            })?;
-                            if remaining_len == 0 {
-                                continue;
-                            }
-                            match (*cx.memory).read_bytes(remaining.iov_base, remaining_len) {
-                                Ok(bytes) => tail.extend_from_slice(&bytes),
-                                Err(_) => {
-                                    // The pipe iterator commits full guest-page
-                                    // copy blocks across the writev aggregate.
-                                    // A fault discards only the incomplete final
-                                    // block, not every valid later iovec. Keep
-                                    // the staged suffix through that aggregate
-                                    // boundary. The boundary may cut the staged
-                                    // suffix of the current iovec; only bytes at
-                                    // or before the continuation offset were
-                                    // already committed and are irreversible.
-                                    let boundary = writev_pipe_fault_boundary(
-                                        total,
-                                        current_iovec_len,
-                                        tail.len(),
-                                    );
-                                    let write = match &write.target {
-                                        crate::dispatch::outcome::BlockingWriteTarget::InMemoryPipe(_) => {
-                                            write.with_in_memory_pipe_writev_boundary(
-                                                tail, total, boundary,
-                                            )
-                                        }
-                                        crate::dispatch::outcome::BlockingWriteTarget::Host(_) => {
-                                            write.with_writev_tail(tail, total)
-                                        }
-                                        // Eventfd owns one scalar operation, not a byte stream.
-                                        crate::dispatch::outcome::BlockingWriteTarget::EventFd(_) => write,
-                                    };
-                                    return Ok(DispatchOutcome::BlockingWrite(write));
-                                }
-                            }
-                        }
-                        let boundary = total
-                            .saturating_add(current_iovec_len)
-                            .saturating_add(tail.len());
-                        let write = match &write.target {
-                            crate::dispatch::outcome::BlockingWriteTarget::InMemoryPipe(_) => {
-                                write.with_in_memory_pipe_writev_boundary(tail, total, boundary)
-                            }
-                            crate::dispatch::outcome::BlockingWriteTarget::Host(_) => {
-                                write.with_writev_tail(tail, total)
-                            }
-                            crate::dispatch::outcome::BlockingWriteTarget::EventFd(_) => write,
-                        };
-                        return Ok(DispatchOutcome::BlockingWrite(write));
-                    }
-                    let DispatchOutcome::Returned { value } = outcome else {
-                        // EAGAIN/EPIPE on this iovec. writev(2) is atomic across
-                        // iovecs: if EARLIER iovecs were already written (total >
-                        // 0), return that short count — NOT the error, which
-                        // would discard bytes already sent and make the caller
-                        // re-send from offset 0 (libuv's stream flow control then
-                        // never completes a write: ipc_heavy_traffic_deadlock_bug,
-                        // bw stuck at 0). Only surface the error when nothing has
-                        // been written yet.
-                        //
-                        // For EPIPE specifically with nothing written: a broken
-                        // pipe/socket (read end closed) → EPIPE AND a SIGPIPE on
-                        // the writer, same as write(2) (busybox `yes | head`
-                        // wants exit 141, write05).
-                        if total > 0 {
-                            return Ok(DispatchOutcome::returned_len_or_errno(total));
-                        }
-                        return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
-                    };
+                    return Ok(self.raise_sigpipe_on_epipe(cx, outcome));
+                };
+                total = total
+                    .checked_add(value as usize)
+                    .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
+                // A SHORT write on this iovec (host send buffer full) ends the
+                // writev: the rest of this iovec and all later iovecs are
+                // unsent. Returning the partial `total` is correct writev(2)
+                // semantics; continuing would write a later iovec AFTER an
+                // unfilled earlier one — a gap/reorder in the byte stream.
+                if (value as usize) < iov_len {
+                    return Ok(DispatchOutcome::returned_len_or_errno(total));
+                }
+                continue;
+            }
+            // Full write loop per iovec — never drop the tail on an
+            // O_NONBLOCK slave; a hard error ends the writev.
+            match self.write_stdio_sink(target.fd, &bytes) {
+                DispatchOutcome::Returned { value } => {
                     total = total
                         .checked_add(value as usize)
                         .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
-                    // A SHORT write on this iovec (host send buffer full) ends the
-                    // writev: the rest of this iovec and all later iovecs are
-                    // unsent. Returning the partial `total` is correct writev(2)
-                    // semantics; continuing would write a later iovec AFTER an
-                    // unfilled earlier one — a gap/reorder in the byte stream.
-                    if (value as usize) < iov_len {
-                        return Ok(DispatchOutcome::returned_len_or_errno(total));
-                    }
-                    continue;
                 }
-                // Full write loop per iovec — never drop the tail on an
-                // O_NONBLOCK slave; a hard error ends the writev.
-                match this.write_stdio_sink(fd, &bytes) {
-                    DispatchOutcome::Returned { value } => {
-                        total = total
-                            .checked_add(value as usize)
-                            .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
-                    }
-                    other => return Ok(other),
-                }
+                other => return Ok(other),
             }
-
-            Ok(DispatchOutcome::returned_len_or_errno(total))
-
         }
 
+        Ok(DispatchOutcome::returned_len_or_errno(total))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stage_writev_blocking_tail_from<M: CurrentMmMemory>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        target: WriteTarget,
+        iovecs: Vec<LinuxIovec>,
+        nonblocking: bool,
+        write: BlockingWrite,
+        current_iovec_len: usize,
+        mut tail: Vec<u8>,
+        start_index: usize,
+        total: usize,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        // `write_pipe` has committed a prefix of this iovec.
+        // The continuation must retain the rest of the writev
+        // aggregate in-order; completing only this iovec would
+        // report a short count after the reactor has delivered
+        // later bytes. Stage the tail exactly once at the park
+        // boundary, after the ordinary sequential reads have
+        // already established this iovec's prefix.
+        for rem_index in start_index..iovecs.len() {
+            let remaining = iovecs[rem_index];
+            let remaining_len = usize::try_from(remaining.iov_len)
+                .map_err(|_| DispatchError::LengthTooLarge(remaining.iov_len))?;
+            if remaining_len == 0 {
+                continue;
+            }
+            match (*cx.memory).read_bytes(remaining.iov_base, remaining_len) {
+                Ok(bytes) => tail.extend_from_slice(&bytes),
+                Err(MemoryError::ReadSuspended(suspension)) => {
+                    return Ok(self.suspend_write_copy_in(
+                        target,
+                        OwnedCopyInOperation::Writev(WritevCopyInState {
+                            iovecs,
+                            nonblocking,
+                            phase: WritevCopyInPhase::BlockingWriteTail {
+                                write,
+                                current_iovec_len,
+                                tail,
+                                next_iovec: rem_index + 1,
+                                total,
+                            },
+                        }),
+                        *suspension,
+                    ));
+                }
+                Err(_) => {
+                    // The pipe iterator commits full guest-page
+                    // copy blocks across the writev aggregate.
+                    // A fault discards only the incomplete final
+                    // block, not every valid later iovec. Keep
+                    // the staged suffix through that aggregate
+                    // boundary. The boundary may cut the staged
+                    // suffix of the current iovec; only bytes at
+                    // or before the continuation offset were
+                    // already committed and are irreversible.
+                    let boundary = writev_pipe_fault_boundary(total, current_iovec_len, tail.len());
+                    let write = match &write.target {
+                        crate::dispatch::outcome::BlockingWriteTarget::InMemoryPipe(_) => {
+                            write.with_in_memory_pipe_writev_boundary(tail, total, boundary)
+                        }
+                        crate::dispatch::outcome::BlockingWriteTarget::Host(_) => {
+                            write.with_writev_tail(tail, total)
+                        }
+                        // Eventfd owns one scalar operation, not a byte stream.
+                        crate::dispatch::outcome::BlockingWriteTarget::EventFd(_) => write,
+                    };
+                    return Ok(DispatchOutcome::BlockingWrite(write));
+                }
+            }
+        }
+        let boundary = total
+            .saturating_add(current_iovec_len)
+            .saturating_add(tail.len());
+        let write = match &write.target {
+            crate::dispatch::outcome::BlockingWriteTarget::InMemoryPipe(_) => {
+                write.with_in_memory_pipe_writev_boundary(tail, total, boundary)
+            }
+            crate::dispatch::outcome::BlockingWriteTarget::Host(_) => {
+                write.with_writev_tail(tail, total)
+            }
+            crate::dispatch::outcome::BlockingWriteTarget::EventFd(_) => write,
+        };
+        Ok(DispatchOutcome::BlockingWrite(write))
     }
 }
 

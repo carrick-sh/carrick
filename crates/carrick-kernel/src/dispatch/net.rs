@@ -338,7 +338,7 @@ pub(super) mod recverr;
 pub(super) mod reuseport;
 pub(super) mod scm_rights;
 pub(super) mod sctp;
-mod send_recv;
+pub(in crate::dispatch) mod send_recv;
 mod sockopt;
 pub(super) mod support;
 
@@ -973,6 +973,27 @@ impl<'a> NetView<'a> {
     where
         F: FnOnce() -> Result<i64, LinuxErrno>,
     {
+        let slot = crate::kernel::FileSlotNumber::for_open_fd(guest_fd)
+            .ok()
+            .and_then(|number| {
+                self.captured_file_table()
+                    .capture_slot_or_stdio_authority(number)
+            });
+        self.blocking_io_with_slot(slot, host_fd, dir, nonblocking, timeout, op)
+    }
+
+    pub(in crate::dispatch::net) fn blocking_io_with_slot<F>(
+        &self,
+        slot: Option<crate::kernel::objects::FileSlotAuthority>,
+        host_fd: i32,
+        dir: IoDir,
+        nonblocking: bool,
+        timeout: Option<std::time::Duration>,
+        op: F,
+    ) -> DispatchOutcome
+    where
+        F: FnOnce() -> Result<i64, LinuxErrno>,
+    {
         match op() {
             Ok(n) => DispatchOutcome::Returned { value: n },
             Err(e) if e == LINUX_EAGAIN => {
@@ -988,9 +1009,7 @@ impl<'a> NetView<'a> {
                     // interruptible); on WaitResult::TimedOut the run-loops
                     // return on_timeout = -EAGAIN, matching the Linux SO_*TIMEO
                     // recv/send result.
-                    let files = self.captured_file_table();
-                    let fds = match WaitFds::raw_one(host_fd, dir.events())
-                        .with_guest_slots(&files, [guest_fd])
+                    let fds = match WaitFds::raw_one(host_fd, dir.events()).with_captured_slot(slot)
                     {
                         Ok(fds) => fds,
                         Err(errno) => return DispatchOutcome::errno(errno),
@@ -1023,6 +1042,24 @@ impl<'a> NetView<'a> {
         timeout: Option<std::time::Duration>,
     ) -> DispatchOutcome {
         wait_in_memory_slot(&self.captured_file_table(), guest_fd, events, timeout)
+    }
+
+    pub(in crate::dispatch) fn wait_in_memory_captured_slot(
+        &self,
+        slot: Option<crate::kernel::objects::FileSlotAuthority>,
+        events: i16,
+        timeout: Option<std::time::Duration>,
+    ) -> DispatchOutcome {
+        wait_in_memory_captured_slot(slot, events, timeout)
+    }
+
+    #[inline]
+    pub(super) fn open_file_is_nonblocking(&self, open_file: &OpenFile, msg_flags: i32) -> bool {
+        carrick_abi::LinuxOpenFlags::from_bits_truncate(
+            open_file.description.common().status_flags(),
+        )
+        .contains(carrick_abi::LinuxOpenFlags::NONBLOCK)
+            || LinuxMsgFlags::from_bits_retain(msg_flags).contains(LinuxMsgFlags::DONTWAIT)
     }
 
     /// Whether a host-I/O op on `fd` with these guest `msg_flags` should report
@@ -3742,8 +3779,10 @@ impl SyscallDispatcher {
         request: &[u8],
         requested: std::net::SocketAddr,
     ) -> bool {
-        self.net_view()
-            .maybe_queue_icmp_echo_reply(fd, request, requested)
+        self.open_file(fd).is_some_and(|of| {
+            self.net_view()
+                .maybe_queue_icmp_echo_reply(&of, request, requested)
+        })
     }
 
     #[inline]
@@ -3753,8 +3792,10 @@ impl SyscallDispatcher {
         request: &[u8],
         requested: std::net::SocketAddr,
     ) -> bool {
-        self.net_view()
-            .maybe_queue_dns_response(fd, request, requested)
+        self.open_file(fd).is_some_and(|of| {
+            self.net_view()
+                .maybe_queue_dns_response(&of, request, requested)
+        })
     }
 
     #[inline]
@@ -3785,6 +3826,25 @@ pub(in crate::dispatch) fn wait_in_memory_slot(
         [guest_fd],
         [guest_fd],
     ) {
+        Ok(fds) => fds,
+        Err(errno) => return DispatchOutcome::errno(errno),
+    };
+    DispatchOutcome::WaitOnFds {
+        fds,
+        timeout,
+        sig_mask: carrick_abi::WaitSigMask::NONE,
+        completion: FdWaitCompletion::Fd {
+            on_timeout: LINUX_EAGAIN.guest_retval(),
+        },
+    }
+}
+
+pub(in crate::dispatch) fn wait_in_memory_captured_slot(
+    slot: Option<crate::kernel::objects::FileSlotAuthority>,
+    events: i16,
+    timeout: Option<std::time::Duration>,
+) -> DispatchOutcome {
+    let fds = match WaitFds::raw_one(-1, events).with_captured_redispatch_and_watched_slot(slot) {
         Ok(fds) => fds,
         Err(errno) => return DispatchOutcome::errno(errno),
     };
