@@ -207,6 +207,19 @@ clippy *ARGS:
     {{_admit}} {{_cargo}} clippy -p carrick-cli {{_platform_features}} --all-targets --keep-going {{ARGS}} -- -D warnings
     exec {{_admit}} {{_cargo}} clippy -p carrick-xtask --all-targets --keep-going {{ARGS}} -- -D warnings
 
+# Lint the Linux platform closure and freestanding x86 CPL0 crates across all
+# targets (`tests/`, `benches/`, `examples/`, unit tests). `_platform_crates`
+# derives the `platform-linux` closure from `carrick-cli` and `{{_platform_features}}`;
+# `carrick-embed` is linted over `--lib --bins --examples` because its `tests/`
+# are macOS `signed-hvf` targets (`tests/el1_sched.rs` calls HVF-only
+# `carrick_runtime::trap::alias_retirement_census`).
+clippy-linux *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    pkgs="$(just --justfile {{justfile()}} _platform_crates | sed -E 's/-p carrick-embed //g')"
+    {{_admit}} {{_cargo}} clippy $pkgs -p carrick-x86-cpl0 -p carrick-x86-carrier -p carrick-conformance-next {{_platform_features}} --all-targets --keep-going {{ARGS}} -- -D warnings
+    exec {{_admit}} {{_cargo}} clippy -p carrick-embed {{_platform_features}} --lib --bins --examples --keep-going {{ARGS}} -- -D warnings
+
 # Lint all GitHub Actions workflow files with actionlint.
 actionlint *ARGS:
     actionlint {{ARGS}} .github/workflows/*.yml

@@ -218,6 +218,9 @@ jobs:
       - name: Clippy (no-panic gate)
         if: ${{ !cancelled() }}
         run: just clippy
+      - name: Clippy Linux crates (all targets)
+        if: ${{ !cancelled() }}
+        run: just clippy-linux
       - name: Dependency audit
         if: ${{ !cancelled() }}
         run: just deny
