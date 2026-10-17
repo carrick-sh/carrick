@@ -90,12 +90,21 @@ pub enum RestartClass {
 }
 
 impl RestartClass {
-    pub fn for_syscall(nr: u64) -> Self {
-        if is_restartable_syscall(nr) {
-            Self::RestartSyscall
-        } else {
-            Self::Never
+    pub const fn for_syscall_wait(
+        nr: u64,
+        socket_timeout: carrick_signal_core::wait::SocketWaitTimeout,
+    ) -> Self {
+        match carrick_signal_core::wait::classify_syscall_restart(nr, socket_timeout) {
+            carrick_signal_core::wait::RestartClass::IfSaRestart => Self::RestartSyscall,
+            carrick_signal_core::wait::RestartClass::Never => Self::Never,
         }
+    }
+
+    pub const fn for_syscall(nr: u64) -> Self {
+        Self::for_syscall_wait(
+            nr,
+            carrick_signal_core::wait::SocketWaitTimeout::NotSocketWait,
+        )
     }
 }
 
@@ -1244,21 +1253,29 @@ impl BlockedContinuation {
         outcome: DispatchOutcome,
         mut capture: ContinuationCapture,
     ) -> Result<Self, ContinuationBuildError> {
-        // The dispatcher owns the SO_RCVTIMEO/SO_SNDTIMEO (or recvmmsg)
-        // deadline. A socket syscall with that deadline must expose EINTR to
-        // the handler even when SA_RESTART was requested (signal(7)).
+        // The dispatcher publishes SO_RCVTIMEO/SO_SNDTIMEO on the fd wait, while
+        // recvmmsg carries its per-call timeout pointer in args[4] without
+        // bounding the first-datagram fd wait. Route blocked fd waits through
+        // the shared carrick-signal-core restart authority so untimed socket
+        // waits restart under SA_RESTART and any socket or recvmmsg deadline
+        // forces EINTR (signal(7)).
         if let ContinuationOrigin::Syscall(frame) = capture.origin
-            && is_timeout_sensitive_socket_call(frame.request().number.raw())
-            && matches!(
-                &outcome,
-                DispatchOutcome::WaitOnFds {
-                    timeout: Some(_),
-                    completion: FdWaitCompletion::Fd { .. },
-                    ..
-                }
-            )
+            && let DispatchOutcome::WaitOnFds {
+                timeout,
+                completion: FdWaitCompletion::Fd { .. },
+                ..
+            } = &outcome
         {
-            capture.restart = RestartClass::Never;
+            let request = frame.request();
+            if carrick_signal_core::wait::is_timeout_sensitive_socket_call(request.number.raw()) {
+                let socket_timeout = carrick_signal_core::wait::SocketWaitTimeout::for_fd_wait(
+                    request.number.raw(),
+                    request.args.0,
+                    timeout.is_some(),
+                );
+                capture.restart =
+                    RestartClass::for_syscall_wait(request.number.raw(), socket_timeout);
+            }
         }
         let parent_task = capture.task;
         let persistent_signal_mask = capture.persistent_signal_mask;
@@ -2800,64 +2817,12 @@ pub enum BlockingWriteOutcome {
 /// `msgrcv`/`msgsnd`, `semop`/`semtimedop`, and the `sigsuspend`/
 /// `rt_sigtimedwait` family.
 ///
-/// Socket timeout exclusions are applied when the blocked outcome is captured,
-/// where the dispatcher-published deadline is available.
-pub fn is_restartable_syscall(nr: u64) -> bool {
-    is_socket_restart_syscall(nr)
-        || matches!(
-            nr,
-            // Reads and writes on "slow" devices — pipes, terminals, sockets. On a
-            // regular file these never return EINTR, so listing them is harmless.
-            63  // read
-        | 64  // write
-        | 65  // readv
-        | 66  // writev
-        | 67  // pread64
-        | 68  // pwrite64
-        | 69  // preadv
-        | 70  // pwritev
-        | 286 // preadv2
-        | 287 // pwritev2
-        | 29  // ioctl (on a slow device)
-        | 56  // openat (blocks opening a FIFO)
-        // Advisory file locking: flock, and fcntl's F_SETLKW. fcntl is listed
-        // whole because the blocking lock commands are the only ones that can
-        // return EINTR.
-        | 32  // flock
-        | 25  // fcntl
-        // POSIX message queues.
-        | 182 // mq_timedsend
-        | 183 // mq_timedreceive
-        | 278 // getrandom
-        // Waits.
-        | 95  // waitid
-        | 260 // wait4
-        )
-}
-
-fn is_socket_restart_syscall(number: u64) -> bool {
-    use carrick_abi::syscall::nr;
-    [
-        nr::ACCEPT,
-        nr::ACCEPT4,
-        nr::CONNECT,
-        nr::RECVFROM,
-        nr::RECVMSG,
-        nr::RECVMMSG,
-        nr::SENDTO,
-        nr::SENDMSG,
-        nr::SENDMMSG,
-    ]
-    .iter()
-    .any(|candidate| candidate.raw() == number)
-}
-
-fn is_timeout_sensitive_socket_call(number: u64) -> bool {
-    use carrick_abi::syscall::nr;
-    is_socket_restart_syscall(number)
-        || [nr::READ, nr::READV, nr::WRITE, nr::WRITEV]
-            .iter()
-            .any(|candidate| candidate.raw() == number)
+/// Dedicated socket calls require a blocked fd-wait continuation that proves
+/// [`carrick_signal_core::wait::SocketWaitTimeout::Untimed`], so the
+/// number-only fallback returns `false` for them and only continuation-backed
+/// untimed socket waits restart.
+pub const fn is_restartable_syscall(nr: u64) -> bool {
+    matches!(RestartClass::for_syscall(nr), RestartClass::RestartSyscall)
 }
 
 /// Raise SIGPIPE on the task when a blocking write encounters EPIPE and SIGPIPE is not ignored.

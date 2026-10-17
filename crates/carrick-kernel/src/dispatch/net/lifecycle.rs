@@ -710,8 +710,9 @@ impl<'a> NetView<'a> {
             .ok_or(LINUX_ENOTSOCK)
     }
 
-    /// Read the per-description `connect_in_progress` flag for `fd` (false if the
-    /// fd is missing or not a HostSocket). See `OpenDescriptionBase.connect_in_progress`.
+    /// Read the per-description `connect_in_progress` flag and `SO_SNDTIMEO`
+    /// deadline for `fd` (`(false, None)` if the fd is missing or not a
+    /// HostSocket). See `OpenDescriptionBase.connect_in_progress`.
     fn socket_connect_in_progress(&self, fd: i32) -> (bool, Option<std::time::Duration>) {
         self.open_file(fd)
             .and_then(|of| {

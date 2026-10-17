@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 
 use crate::identity::{LinuxCapabilitySet, TaskCredentials};
 use crate::identity::{TaskGid, TaskUid};
-use carrick_core::ipc_permissions::{IpcGroupId, IpcPermission, IpcUserId};
+use carrick_core::ipc_permissions::{IpcMode, IpcPermission};
 pub use carrick_syscall_abi::ipc::{
     IPC_CREAT, IPC_EXCL, IPC_NOWAIT, IPC_PRIVATE, IPC_STAT, LinuxIpcPerm, LinuxMsginfo,
     LinuxMsqidDs, LinuxSembuf, LinuxSemidDs, LinuxSeminfo, MSG_EXCEPT, MSG_NOERROR, MSG_STAT,
@@ -90,23 +90,20 @@ impl IpcPerm {
     /// - Else other bits are checked.
     pub fn check_perm(&self, creds: &TaskCredentials, req_mode: u16) -> Result<(), IpcError> {
         let permission = IpcPermission {
-            uid: IpcUserId::new(self.uid.raw()),
-            cuid: IpcUserId::new(self.cuid.raw()),
-            gid: IpcGroupId::new(self.gid.raw()),
-            cgid: IpcGroupId::new(self.cgid.raw()),
-            mode: self.mode,
+            uid: self.uid,
+            cuid: self.cuid,
+            gid: self.gid,
+            cgid: self.cgid,
+            mode: IpcMode::from_raw(self.mode),
         };
         permission
             .allows(
-                IpcUserId::new(creds.euid.raw()),
-                |group| {
-                    let group = TaskGid::new(group.raw());
-                    creds.egid == group || creds.groups.contains(&group)
-                },
+                creds.euid,
+                |group| creds.egid == group || creds.groups.contains(&group),
                 creds
                     .cap_effective
                     .contains(LinuxCapabilitySet::CAP_IPC_OWNER),
-                req_mode,
+                IpcMode::from_raw(req_mode),
             )
             .then_some(())
             .ok_or(IpcError::PermissionDenied)

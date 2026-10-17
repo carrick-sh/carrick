@@ -1827,6 +1827,10 @@ pub struct SignalView<'a> {
 pub(in crate::dispatch) trait IpcCrossSubsystem {
     fn host_signal(&self) -> &dyn HostSignalBridge;
     fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials>;
+    fn current_groups_for(
+        &self,
+        credentials: &crate::kernel::Credentials,
+    ) -> Vec<carrick_abi::NsGid>;
     fn identity_pid(&self) -> u32;
     fn hvpatch_process(&self) -> Option<Arc<dyn crate::kernel::CarrierProcess>>;
     fn is_forked_guest_process(&self) -> bool;
@@ -1877,6 +1881,12 @@ impl IpcCrossSubsystem for SyscallDispatcher {
     }
     fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials> {
         self.cred_snapshot()
+    }
+    fn current_groups_for(
+        &self,
+        credentials: &crate::kernel::Credentials,
+    ) -> Vec<carrick_abi::NsGid> {
+        self.current_groups_for(credentials)
     }
     fn identity_pid(&self) -> u32 {
         self.identity_pid()
@@ -1969,6 +1979,14 @@ impl<'a> IpcView<'a> {
     #[inline]
     pub(in crate::dispatch) fn cred_snapshot(&self) -> Arc<crate::kernel::Credentials> {
         self.cross.cred_snapshot()
+    }
+
+    #[inline]
+    pub(in crate::dispatch) fn current_groups_for(
+        &self,
+        credentials: &crate::kernel::Credentials,
+    ) -> Vec<carrick_abi::NsGid> {
+        self.cross.current_groups_for(credentials)
     }
 
     #[inline]

@@ -1,15 +1,15 @@
 schema_version = 1
 id = "kernel.ipc.permission-classes"
 title = "SysV IPC access uses owner, creator, group and other classes"
-guest_surfaces = ["syscall:shmat", "syscall:semop", "syscall:msgsnd", "syscall:msgrcv"]
-semantic_authority = ["Linux ipcperms(5): owner uid/cuid, group gid/cgid including supplementary groups, then other; CAP_IPC_OWNER bypasses access permission and denial returns EACCES (13)."]
+guest_surfaces = ["syscall:shmget", "syscall:shmat", "syscall:shmctl", "syscall:semop", "syscall:msgsnd", "syscall:msgrcv"]
+semantic_authority = ["Linux ipcperms(5): owner uid/cuid, group gid/cgid including supplementary groups and launch-time /etc/group fallback, then other; CAP_IPC_OWNER bypasses access permission and denial returns EACCES (13)."]
 fixture = "unit:ipc_perm_accepts_creator_and_supplementary_group_but_not_other"
 scale_points = [1]
 structural_budgets = []
-rationale = "The EL1 IPC namespace and kernel dispatcher consume one shared permission decision. A task's effective credentials decide its class exactly once; permission checks must not clone IPC objects or create a second access path."
+rationale = "The EL1 IPC namespace and kernel dispatcher consume one shared permission decision over typed IpcMode bitflags and domain-specific UID/GID types. A task's effective credentials and supplementary groups (including launch-time /etc/group fallback) decide its class exactly once, and CAP_IPC_OWNER (not raw euid 0) grants the privilege bypass."
 
 [bindings]
-vm_free = "carrick-core::ipc_permissions::tests::owner_group_and_other_are_exclusive_classes"
+vm_free = "carrick-core::ipc_permissions::tests::owner_group_and_other_are_exclusive_classes, carrick-personality-linux::ipc::namespace::tests::ipc_perm_accepts_creator_and_supplementary_group_but_not_other, carrick-kernel::dispatch::sysv::ipc_set_tests::{shm_permission_uses_creator_group_and_supplementary_membership,shm_permission_falls_back_to_etc_group_membership_when_override_absent,shm_permission_honors_cap_ipc_owner_rather_than_raw_euid_root}"
 
 [bindings.unresolved]
 embed_structural = "Signed two-task IPC binding belongs to the director gate."

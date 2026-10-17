@@ -405,54 +405,17 @@ impl SyscallDispatcher {
         }
     }
 
-    /// The supplementary group list `getgroups(2)` reports: the primary egid
-    /// plus every group in the guest's `/etc/group` that lists the current user
-    /// (resolved from `/etc/passwd` by euid) as a member — the same set runc
-    /// derives, so `id` matches Docker. Falls back to just the egid when the
-    /// files are absent/unreadable.
-    fn supplementary_groups_from_files(
+    pub(super) fn current_groups(&self) -> Vec<NsGid> {
+        self.current_groups_for(&self.cred_snapshot())
+    }
+
+    pub(super) fn current_groups_for(
         &self,
         credentials: &crate::kernel::Credentials,
     ) -> Vec<NsGid> {
-        let c = credentials;
-        let (euid, egid) = (c.euid, c.egid);
-        let mut gids: Vec<NsGid> = vec![egid];
-        // uid -> username via /etc/passwd (name:passwd:uid:gid:...).
-        let username = self.read_exec_file("/etc/passwd").and_then(|b| {
-            String::from_utf8_lossy(&b).lines().find_map(|line| {
-                let f: Vec<&str> = line.split(':').collect();
-                if f.len() >= 3 && f[2].parse::<u32>().ok() == Some(euid.raw()) {
-                    Some(f[0].to_string())
-                } else {
-                    None
-                }
-            })
-        });
-        // Groups that name the user as a member (name:passwd:gid:m1,m2,...).
-        if let (Some(user), Some(group)) = (username, self.read_exec_file("/etc/group")) {
-            for line in String::from_utf8_lossy(&group).lines() {
-                let f: Vec<&str> = line.split(':').collect();
-                if f.len() < 4 {
-                    continue;
-                }
-                let Ok(gid) = f[2].parse::<u32>() else {
-                    continue;
-                };
-                let gid = NsGid::new(gid);
-                if !gids.contains(&gid) && f[3].split(',').any(|m| !m.is_empty() && m == user) {
-                    gids.push(gid);
-                }
-            }
-        }
-        gids
-    }
-
-    pub(super) fn current_groups(&self) -> Vec<NsGid> {
-        let credentials = self.cred_snapshot();
-        match credentials.supplementary_groups_override() {
-            Some(groups) => groups.to_vec(),
-            None => self.supplementary_groups_from_files(&credentials),
-        }
+        resolve_current_groups(credentials, |path| {
+            self.read_exec_file_head(path, 64 * 1024)
+        })
     }
 
     /// Publish the mature one-task adapter's leader credential for peer host
@@ -1760,4 +1723,51 @@ pub(super) fn has_effective_capability(
     capability: u32,
 ) -> bool {
     kernel.task().caps().effective & (1_u64 << capability) != 0
+}
+
+/// The supplementary group list `getgroups(2)` reports: the explicit
+/// `setgroups(2)` override when present, or the primary egid plus every group
+/// in the guest's `/etc/group` that lists the current user (resolved from
+/// `/etc/passwd` by euid) as a member — the same set runc derives, so `id`
+/// matches Docker. Falls back to just the egid when the files are
+/// absent/unreadable.
+pub(super) fn resolve_current_groups(
+    credentials: &crate::kernel::Credentials,
+    mut read_etc_file: impl FnMut(&str) -> Option<Vec<u8>>,
+) -> Vec<NsGid> {
+    match credentials.supplementary_groups_override() {
+        Some(groups) => groups.to_vec(),
+        None => {
+            let (euid, egid) = (credentials.euid, credentials.egid);
+            let mut gids: Vec<NsGid> = vec![egid];
+            // uid -> username via /etc/passwd (name:passwd:uid:gid:...).
+            let username = read_etc_file("/etc/passwd").and_then(|b| {
+                String::from_utf8_lossy(&b).lines().find_map(|line| {
+                    let f: Vec<&str> = line.split(':').collect();
+                    if f.len() >= 3 && f[2].parse::<u32>().ok() == Some(euid.raw()) {
+                        Some(f[0].to_string())
+                    } else {
+                        None
+                    }
+                })
+            });
+            // Groups that name the user as a member (name:passwd:gid:m1,m2,...).
+            if let (Some(user), Some(group)) = (username, read_etc_file("/etc/group")) {
+                for line in String::from_utf8_lossy(&group).lines() {
+                    let f: Vec<&str> = line.split(':').collect();
+                    if f.len() < 4 {
+                        continue;
+                    }
+                    let Ok(gid) = f[2].parse::<u32>() else {
+                        continue;
+                    };
+                    let gid = NsGid::new(gid);
+                    if !gids.contains(&gid) && f[3].split(',').any(|m| !m.is_empty() && m == user) {
+                        gids.push(gid);
+                    }
+                }
+            }
+            gids
+        }
+    }
 }

@@ -29,7 +29,7 @@ pub(crate) use super::dispatcher::IpcView;
 use super::*;
 use crate::linux_abi::{LINUX_EIO, LINUX_ENOMSG, LINUX_ENOSPC, LinuxErrno};
 use carrick_abi::{NsGid, NsUid};
-use carrick_core::ipc_permissions::{IpcGroupId, IpcPermission, IpcUserId};
+use carrick_core::ipc_permissions::{IpcMode, IpcPermission};
 use carrick_fatal::carrick_fatal;
 use carrick_vfs::ProcMapSharing;
 use carrick_vfs::errno::HostSyscallResult as _;
@@ -334,32 +334,49 @@ impl ShmPermMode {
     }
 }
 
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
+pub(super) struct IpcAccessSubject {
+    euid: NsUid,
+    egid: NsGid,
+    groups: Vec<NsGid>,
+    has_cap_ipc_owner: bool,
+}
+
+impl IpcAccessSubject {
+    fn from_credentials_with_groups(
+        creds: &crate::kernel::Credentials,
+        groups: Vec<NsGid>,
+        has_cap_ipc_owner: bool,
+    ) -> Self {
+        Self {
+            euid: creds.euid,
+            egid: creds.egid,
+            groups,
+            has_cap_ipc_owner,
+        }
+    }
+}
+
 fn ipc_allows(
     mode: ShmPermMode,
     uid: NsUid,
     cuid: NsUid,
     gid: NsGid,
     cgid: NsGid,
-    creds: &crate::kernel::Credentials,
-    requested_mode: u16,
+    subject: &IpcAccessSubject,
+    requested_mode: IpcMode,
 ) -> bool {
     IpcPermission {
-        uid: IpcUserId::new(uid.raw()),
-        cuid: IpcUserId::new(cuid.raw()),
-        gid: IpcGroupId::new(gid.raw()),
-        cgid: IpcGroupId::new(cgid.raw()),
-        mode: mode.perms() as u16,
+        uid,
+        cuid,
+        gid,
+        cgid,
+        mode: IpcMode::from_raw(mode.perms() as u16),
     }
     .allows(
-        IpcUserId::new(creds.euid.raw()),
-        |group| {
-            let group = NsGid::new(group.raw());
-            creds.egid == group
-                || creds
-                    .supplementary_groups_override()
-                    .is_some_and(|groups| groups.contains(&group))
-        },
-        creds.euid.is_root(),
+        subject.euid,
+        |group| subject.egid == group || subject.groups.contains(&group),
+        subject.has_cap_ipc_owner,
         requested_mode,
     )
 }
@@ -406,15 +423,27 @@ impl ShmSegment {
         creds.euid.is_root() || creds.euid == self.uid || creds.euid == self.cuid
     }
 
-    fn can_read(&self, creds: &crate::kernel::Credentials) -> bool {
+    fn can_read(&self, subject: &IpcAccessSubject) -> bool {
         ipc_allows(
-            self.mode, self.uid, self.cuid, self.gid, self.cgid, creds, 0o400,
+            self.mode,
+            self.uid,
+            self.cuid,
+            self.gid,
+            self.cgid,
+            subject,
+            IpcMode::OWNER_READ,
         )
     }
 
-    fn can_write(&self, creds: &crate::kernel::Credentials) -> bool {
+    fn can_write(&self, subject: &IpcAccessSubject) -> bool {
         ipc_allows(
-            self.mode, self.uid, self.cuid, self.gid, self.cgid, creds, 0o200,
+            self.mode,
+            self.uid,
+            self.cuid,
+            self.gid,
+            self.cgid,
+            subject,
+            IpcMode::OWNER_WRITE,
         )
     }
 }
@@ -786,15 +815,27 @@ impl SemSet {
         creds.euid.is_root() || creds.euid == self.uid || creds.euid == self.cuid
     }
 
-    fn can_read(&self, creds: &crate::kernel::Credentials) -> bool {
+    fn can_read(&self, subject: &IpcAccessSubject) -> bool {
         ipc_allows(
-            self.mode, self.uid, self.cuid, self.gid, self.cgid, creds, 0o400,
+            self.mode,
+            self.uid,
+            self.cuid,
+            self.gid,
+            self.cgid,
+            subject,
+            IpcMode::OWNER_READ,
         )
     }
 
-    fn can_write(&self, creds: &crate::kernel::Credentials) -> bool {
+    fn can_write(&self, subject: &IpcAccessSubject) -> bool {
         ipc_allows(
-            self.mode, self.uid, self.cuid, self.gid, self.cgid, creds, 0o200,
+            self.mode,
+            self.uid,
+            self.cuid,
+            self.gid,
+            self.cgid,
+            subject,
+            IpcMode::OWNER_WRITE,
         )
     }
 
@@ -1049,7 +1090,7 @@ impl Default for SysvProcessAttachments {
 
 struct MsgReceiveRequest<'a> {
     id: MsgQueueId,
-    creds: &'a crate::kernel::Credentials,
+    subject: &'a IpcAccessSubject,
     msgp: u64,
     msgsz: usize,
     wanted: MsgType,
@@ -1071,23 +1112,23 @@ impl SysvIpcService {
 
     fn msgget(
         state: &mut SysvShmState,
-        creds: &crate::kernel::Credentials,
+        subject: &IpcAccessSubject,
         key: MsgKey,
         flags: u64,
     ) -> Result<MsgQueueId, LinuxErrno> {
-        msgget_open(state, creds, key, flags)
+        msgget_open(state, subject, key, flags)
     }
 
     fn msgsnd(
         shared: &carrick_thread::platform_futex::SharedFutexTable,
         namespace: &SysvIpcNamespace,
         id: MsgQueueId,
-        creds: &crate::kernel::Credentials,
+        subject: &IpcAccessSubject,
         msg_type: MsgType,
         payload: &[u8],
         operator: i32,
     ) -> Result<bool, LinuxErrno> {
-        msg_queue_try_send(shared, namespace, id, creds, msg_type, payload, operator)
+        msg_queue_try_send(shared, namespace, id, subject, msg_type, payload, operator)
     }
 
     fn msgrcv<M: CurrentMmMemory>(
@@ -1202,21 +1243,16 @@ struct MsgQueueEntry {
 }
 
 impl MsgQueueFile {
-    fn new(
-        id: MsgQueueId,
-        key: i32,
-        mode: ShmPermMode,
-        creds: &crate::kernel::Credentials,
-    ) -> Self {
+    fn new(id: MsgQueueId, key: i32, mode: ShmPermMode, subject: &IpcAccessSubject) -> Self {
         let now = unix_now_secs();
         Self {
             id,
             key,
             mode,
-            uid: creds.euid,
-            gid: creds.egid,
-            cuid: creds.euid,
-            cgid: creds.egid,
+            uid: subject.euid,
+            gid: subject.egid,
+            cuid: subject.euid,
+            cgid: subject.egid,
             qbytes: LINUX_MSGMNB,
             cbytes: 0,
             stime: 0,
@@ -1233,15 +1269,27 @@ impl MsgQueueFile {
         creds.euid.is_root() || creds.euid == self.uid || creds.euid == self.cuid
     }
 
-    fn can_read(&self, creds: &crate::kernel::Credentials) -> bool {
+    fn can_read(&self, subject: &IpcAccessSubject) -> bool {
         ipc_allows(
-            self.mode, self.uid, self.cuid, self.gid, self.cgid, creds, 0o400,
+            self.mode,
+            self.uid,
+            self.cuid,
+            self.gid,
+            self.cgid,
+            subject,
+            IpcMode::OWNER_READ,
         )
     }
 
-    fn can_write(&self, creds: &crate::kernel::Credentials) -> bool {
+    fn can_write(&self, subject: &IpcAccessSubject) -> bool {
         ipc_allows(
-            self.mode, self.uid, self.cuid, self.gid, self.cgid, creds, 0o200,
+            self.mode,
+            self.uid,
+            self.cuid,
+            self.gid,
+            self.cgid,
+            subject,
+            IpcMode::OWNER_WRITE,
         )
     }
 
@@ -1773,7 +1821,7 @@ fn active_shm_segment_for_path<'a>(state: &'a SysvShmState, path: &Path) -> Opti
 /// would name the carrier rather than the creator.
 pub(super) fn shmget_open(
     state: &mut SysvShmState,
-    creds: &crate::kernel::Credentials,
+    subject: &IpcAccessSubject,
     key: i32,
     size: usize,
     flags: u64,
@@ -1802,8 +1850,8 @@ pub(super) fn shmget_open(
             }
             let wants_read = flags & 0o400 != 0;
             let wants_write = flags & 0o200 != 0;
-            if (wants_read && !existing.can_read(creds))
-                || (wants_write && !existing.can_write(creds))
+            if (wants_read && !existing.can_read(subject))
+                || (wants_write && !existing.can_write(subject))
             {
                 return Err(crate::linux_abi::LINUX_EACCES);
             }
@@ -1875,10 +1923,10 @@ pub(super) fn shmget_open(
             key,
             size: actual_size,
             mode,
-            uid: creds.euid,
-            gid: creds.egid,
-            cuid: creds.euid,
-            cgid: creds.egid,
+            uid: subject.euid,
+            gid: subject.egid,
+            cuid: subject.euid,
+            cgid: subject.egid,
             nattch: 0,
             ctime: now,
             atime: 0,
@@ -1899,7 +1947,7 @@ pub(super) fn shmget_open(
 /// returns, but cannot invalidate this already-authorized attach.
 pub(super) fn reserve_shmat(
     namespace: &std::sync::Arc<SysvIpcNamespace>,
-    creds: &crate::kernel::Credentials,
+    subject: &IpcAccessSubject,
     shmid: i32,
     needs_write: bool,
 ) -> Result<(i32, usize, PendingShmat), LinuxErrno> {
@@ -1911,7 +1959,7 @@ pub(super) fn reserve_shmat(
         if segment.removed {
             return Err(crate::linux_abi::LINUX_EINVAL);
         }
-        if !segment.can_read(creds) || (needs_write && !segment.can_write(creds)) {
+        if !segment.can_read(subject) || (needs_write && !segment.can_write(subject)) {
             return Err(LINUX_EACCES);
         }
         let pending_attaches = segment
@@ -2025,6 +2073,21 @@ fn sysvipc_msg_table(namespace: &SysvIpcNamespace) -> String {
 // ===================================================================
 
 impl<'a> IpcView<'a> {
+    pub(in crate::dispatch::sysv) fn ipc_access_subject(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+        creds: &crate::kernel::Credentials,
+    ) -> IpcAccessSubject {
+        IpcAccessSubject::from_credentials_with_groups(
+            creds,
+            self.current_groups_for(creds),
+            crate::dispatch::creds::has_effective_capability(
+                kernel,
+                crate::namespace::process::CAP_IPC_OWNER,
+            ),
+        )
+    }
+
     pub(in crate::dispatch::sysv) fn lock_sysv_process(&self) -> SysvProcessGuard<'a> {
         let guard = (*self.sysv_process).lock();
         SysvProcessGuard::new(guard, self.sysv)
@@ -2222,9 +2285,10 @@ impl<'a> IpcView<'a> {
             let key = key as i32;
             let size = size as usize;
             let creds = this.cred_snapshot();
+            let subject = this.ipc_access_subject(cx.kernel, &creds);
             let creator = this.identity_pid() as i32;
             this.sysv.with_state_mut(|state| {
-                match shmget_open(state, &creds, key, size, flags, creator) {
+                match shmget_open(state, &subject, key, size, flags, creator) {
                     Ok(shmid) => Ok(DispatchOutcome::returned_i32(shmid)),
                     Err(errno) => Ok(DispatchOutcome::errno(errno)),
                 }
@@ -2248,10 +2312,11 @@ impl<'a> IpcView<'a> {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
             let creds = this.cred_snapshot();
+            let subject = this.ipc_access_subject(cx.kernel, &creds);
             let lpid = this.identity_pid() as i32;
             let needs_write = !attach_flags.contains(ShmAttachFlags::RDONLY);
             let (host_fd, size, reservation) =
-                match reserve_shmat(this.sysv, &creds, shmid, needs_write) {
+                match reserve_shmat(this.sysv, &subject, shmid, needs_write) {
                     Ok(v) => v,
                     Err(errno) => return Ok(DispatchOutcome::errno(errno)),
                 };
@@ -2452,6 +2517,7 @@ impl<'a> IpcView<'a> {
         fn shmctl(this, cx, shmid: u64, cmd: u64, buf: u64) {
             let shmid = shmid as i32;
             let creds = this.cred_snapshot();
+            let subject = this.ipc_access_subject(cx.kernel, &creds);
             match cmd {
                 LINUX_IPC_RMID => this.sysv.with_state_mut(|state| {
                     let Some(segment) = state.segments.get(&shmid).filter(|segment| !segment.removed)
@@ -2473,7 +2539,7 @@ impl<'a> IpcView<'a> {
                     let Some(segment) = segment else {
                         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                     };
-                    if !segment.can_read(&creds) {
+                    if !segment.can_read(&subject) {
                         return Ok(DispatchOutcome::errno(LINUX_EACCES));
                     }
                     if buf == 0 {
@@ -2618,14 +2684,14 @@ impl<'a> IpcView<'a> {
         /// msgget(key, msgflg): allocate/look up a Carrick-owned Linux SysV
         /// message queue in this run's IPC namespace.
         fn msgget(this, cx, key: u64, msgflg: u64) {
-            let _ = cx;
             let creds = this.cred_snapshot();
+            let subject = this.ipc_access_subject(cx.kernel, &creds);
             let key = match MsgKey::from_syscall_arg(key) {
                 Ok(key) => key,
                 Err(errno) => return Ok(DispatchOutcome::errno(errno)),
             };
             this.sysv.with_state_mut(|state| {
-                match SysvIpcService::msgget(state, &creds, key, msgflg) {
+                match SysvIpcService::msgget(state, &subject, key, msgflg) {
                     Ok(id) => Ok(DispatchOutcome::Returned { value: id.as_i64() }),
                     Err(errno) => Ok(DispatchOutcome::errno(errno)),
                 }
@@ -2661,6 +2727,7 @@ impl<'a> IpcView<'a> {
             let payload = buf[8..].to_vec();
             let flags = MsgOpFlags::from_bits_retain(msgflg);
             let creds = this.cred_snapshot();
+            let subject = this.ipc_access_subject(cx.kernel, &creds);
             let operator = this.identity_pid() as i32;
             let tid = cx.tid();
             let _block_state = (!flags.contains(MsgOpFlags::NOWAIT))
@@ -2677,7 +2744,7 @@ impl<'a> IpcView<'a> {
                     cx.kernel.kernel().shared_futex(),
                     this.sysv,
                     msqid,
-                    &creds,
+                    &subject,
                     msg_type,
                     &payload,
                     operator,
@@ -2698,7 +2765,7 @@ impl<'a> IpcView<'a> {
                                 cx.kernel.kernel().shared_futex(),
                                 this.sysv,
                                 msqid,
-                                &creds,
+                                &subject,
                                 msg_type,
                                 &payload,
                                 operator,
@@ -2755,6 +2822,7 @@ impl<'a> IpcView<'a> {
             }
             let msgtyp = MsgType::from_syscall_arg(msgtyp);
             let creds = this.cred_snapshot();
+            let subject = this.ipc_access_subject(cx.kernel, &creds);
             let operator = this.identity_pid() as i32;
             let tid = cx.tid();
             let _block_state = (!flags.contains(MsgOpFlags::NOWAIT))
@@ -2772,7 +2840,7 @@ impl<'a> IpcView<'a> {
                     cx,
                     MsgReceiveRequest {
                         id: msqid,
-                        creds: &creds,
+                        subject: &subject,
                         msgp: msgp.0,
                         msgsz: sz,
                         wanted: msgtyp,
@@ -2797,7 +2865,7 @@ impl<'a> IpcView<'a> {
                                 cx,
                                 MsgReceiveRequest {
                                     id: msqid,
-                                    creds: &creds,
+                                    subject: &subject,
                                     msgp: msgp.0,
                                     msgsz: sz,
                                     wanted: msgtyp,
@@ -2846,7 +2914,6 @@ impl<'a> IpcView<'a> {
         /// semaphore set.  The namespace is Carrick-owned so it remains
         /// coherent across HVPatch logical processes without host SysV state.
         fn semget(this, cx, key: u64, nsems: u64, semflg: u64) {
-            let _ = cx;
             // Linux caps nsems at SEMMSL (default 32000): nsems > SEMMSL → EINVAL
             // (LTP semget02). macOS has a much smaller limit and returns ENOSPC
             // for the same over-large request, so validate against the Linux
@@ -2862,6 +2929,7 @@ impl<'a> IpcView<'a> {
             let create = create_flags.contains(IpcCreateFlags::CREAT);
             let exclusive = create_flags.contains(IpcCreateFlags::EXCL);
             let creds = this.cred_snapshot();
+            let subject = this.ipc_access_subject(cx.kernel, &creds);
             let existing_outcome = this.sysv.with_state(|state| {
                 if key != LINUX_IPC_PRIVATE
                     && let Some(guest_semid) = state.sem_keys.get(&key).copied()
@@ -2875,8 +2943,8 @@ impl<'a> IpcView<'a> {
                     }
                     let wants_read = semflg & 0o400 != 0;
                     let wants_write = semflg & 0o200 != 0;
-                    if (wants_read && !existing.can_read(&creds))
-                        || (wants_write && !existing.can_write(&creds))
+                    if (wants_read && !existing.can_read(&subject))
+                        || (wants_write && !existing.can_write(&subject))
                     {
                         return Some(Ok(DispatchOutcome::errno(LINUX_EACCES)));
                     }
@@ -3039,6 +3107,15 @@ forward_sysv_mutation_handlers! {
 
 impl SyscallDispatcher {
     #[cfg(test)]
+    pub(in crate::dispatch::sysv) fn ipc_access_subject(
+        &self,
+        kernel: &crate::kernel::KernelContext,
+        creds: &crate::kernel::Credentials,
+    ) -> IpcAccessSubject {
+        self.ipc_view().ipc_access_subject(kernel, creds)
+    }
+
+    #[cfg(test)]
     pub(in crate::dispatch::sysv) fn lock_sysv_process(&self) -> SysvProcessGuard<'_> {
         self.ipc_view().lock_sysv_process()
     }
@@ -3134,7 +3211,7 @@ impl SyscallDispatcher {
 
 fn msgget_open(
     state: &mut SysvShmState,
-    creds: &crate::kernel::Credentials,
+    subject: &IpcAccessSubject,
     key: MsgKey,
     flags: u64,
 ) -> Result<MsgQueueId, LinuxErrno> {
@@ -3156,7 +3233,9 @@ fn msgget_open(
             let queue = entry.queue.lock();
             let wants_read = flags & 0o400 != 0;
             let wants_write = flags & 0o200 != 0;
-            if (wants_read && !queue.can_read(creds)) || (wants_write && !queue.can_write(creds)) {
+            if (wants_read && !queue.can_read(subject))
+                || (wants_write && !queue.can_write(subject))
+            {
                 return Err(LINUX_EACCES);
             }
             return Ok(id);
@@ -3194,7 +3273,7 @@ fn msgget_open(
     } else {
         path
     };
-    let queue = MsgQueueFile::new(id, key.raw(), mode, creds);
+    let queue = MsgQueueFile::new(id, key.raw(), mode, subject);
     ::std::fs::write(&path, queue.serialize()).map_err(|_| LINUX_EIO)?;
     state.message_queues.insert(
         id,
@@ -3210,7 +3289,7 @@ fn msg_queue_try_send(
     shared: &carrick_thread::platform_futex::SharedFutexTable,
     namespace: &SysvIpcNamespace,
     id: MsgQueueId,
-    creds: &crate::kernel::Credentials,
+    subject: &IpcAccessSubject,
     msg_type: MsgType,
     payload: &[u8],
     operator: i32,
@@ -3219,7 +3298,7 @@ fn msg_queue_try_send(
         .with_state(|state| state.message_queues.get(&id).cloned())
         .ok_or(LINUX_EINVAL)?;
     let mut queue = entry.queue.lock();
-    if !queue.can_write(creds) {
+    if !queue.can_write(subject) {
         return Err(LINUX_EACCES);
     }
     let payload_len = payload.len() as u64;
@@ -3286,7 +3365,7 @@ fn msg_queue_receive<M: CurrentMmMemory>(
 ) -> Result<Option<usize>, LinuxErrno> {
     let MsgReceiveRequest {
         id,
-        creds,
+        subject,
         msgp,
         msgsz,
         wanted,
@@ -3297,7 +3376,7 @@ fn msg_queue_receive<M: CurrentMmMemory>(
         .with_state(|state| state.message_queues.get(&id).cloned())
         .ok_or(LINUX_EINVAL)?;
     let mut queue = entry.queue.lock();
-    if !queue.can_read(creds) {
+    if !queue.can_read(subject) {
         return Err(LINUX_EACCES);
     }
     if queue.messages.is_empty() {
@@ -3393,7 +3472,7 @@ fn msg_stat_by_index<M: CurrentMmMemory>(
     cx: &mut SyscallCtx<M>,
     selector: u64,
     buf: u64,
-    creds: &crate::kernel::Credentials,
+    subject: &IpcAccessSubject,
     enforce_read_permission: bool,
 ) -> Result<DispatchOutcome, LinuxErrno> {
     if buf == 0 {
@@ -3410,7 +3489,7 @@ fn msg_stat_by_index<M: CurrentMmMemory>(
         .with_state(|state| state.message_queues.get(&id).cloned())
         .ok_or(LINUX_EINVAL)?;
     let queue = entry.queue.lock();
-    if enforce_read_permission && !queue.can_read(creds) {
+    if enforce_read_permission && !queue.can_read(subject) {
         return Err(LINUX_EACCES);
     }
     if buf != 0 {
@@ -3429,6 +3508,7 @@ fn sysv_msgctl<M: CurrentMmMemory>(
     buf: u64,
 ) -> Result<DispatchOutcome, LinuxErrno> {
     let creds = this.cred_snapshot();
+    let subject = this.ipc_access_subject(cx.kernel, &creds);
     match cmd {
         LINUX_IPC_INFO | LINUX_MSG_INFO => {
             let metrics = msg_queue_metrics(this.sysv);
@@ -3436,7 +3516,7 @@ fn sysv_msgctl<M: CurrentMmMemory>(
             return DispatchOutcome::returned_len(metrics.queues.saturating_sub(1));
         }
         LINUX_MSG_STAT | LINUX_MSG_STAT_ANY => {
-            return msg_stat_by_index(this.sysv, cx, msqid, buf, &creds, cmd == LINUX_MSG_STAT);
+            return msg_stat_by_index(this.sysv, cx, msqid, buf, &subject, cmd == LINUX_MSG_STAT);
         }
         _ => {}
     }
@@ -3480,7 +3560,7 @@ fn sysv_msgctl<M: CurrentMmMemory>(
                 .with_state(|state| state.message_queues.get(&msqid).cloned())
                 .ok_or(LINUX_EINVAL)?;
             let queue = entry.queue.lock();
-            if !queue.can_read(&creds) {
+            if !queue.can_read(&subject) {
                 return Err(LINUX_EACCES);
             }
             cx.memory
@@ -4015,7 +4095,8 @@ impl<'a> IpcView<'a> {
             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
         };
         let creds = self.cred_snapshot();
-        if !sem_set.can_write(&creds) {
+        let subject = self.ipc_access_subject(cx.kernel, &creds);
+        if !sem_set.can_write(&subject) {
             return Ok(DispatchOutcome::errno(LINUX_EACCES));
         }
         let logical_operator = self
@@ -4041,6 +4122,7 @@ impl<'a> IpcView<'a> {
         arg: u64,
         creds: &crate::kernel::Credentials,
     ) -> Result<DispatchOutcome, DispatchError> {
+        let subject = self.ipc_access_subject(cx.kernel, creds);
         match cmd {
             LINUX_IPC_INFO | LINUX_SEM_INFO => {
                 return self.write_sem_info(cx, arg);
@@ -4054,7 +4136,7 @@ impl<'a> IpcView<'a> {
                 } else {
                     SemStatSelector::StatIndex(index)
                 };
-                return self.write_sem_stat(cx, selector, arg, creds);
+                return self.write_sem_stat(cx, selector, arg, &subject);
             }
             _ => {}
         }
@@ -4131,7 +4213,7 @@ impl<'a> IpcView<'a> {
                     let Some(meta) = state.semaphores.get(&guest_semid) else {
                         return Err(LINUX_EINVAL);
                     };
-                    if !meta.can_read(creds) {
+                    if !meta.can_read(&subject) {
                         return Err(LINUX_EACCES);
                     }
                     Ok(LinuxSemidDs {
@@ -4174,7 +4256,7 @@ impl<'a> IpcView<'a> {
                     if idx >= meta.nsems {
                         return Err(LINUX_EINVAL);
                     }
-                    if !meta.can_read(creds) {
+                    if !meta.can_read(&subject) {
                         return Err(LINUX_EACCES);
                     }
                     Ok(meta.values.lock()[idx])
@@ -4199,7 +4281,7 @@ impl<'a> IpcView<'a> {
                     if idx >= meta.nsems {
                         return (Err(LINUX_EINVAL), None);
                     }
-                    if !meta.can_write(creds) {
+                    if !meta.can_write(&subject) {
                         return (Err(LINUX_EACCES), None);
                     }
                     meta.values.lock()[idx] = val as u16;
@@ -4228,7 +4310,7 @@ impl<'a> IpcView<'a> {
                     if idx >= meta.nsems {
                         return Err(LINUX_EINVAL);
                     }
-                    if !meta.can_read(creds) {
+                    if !meta.can_read(&subject) {
                         return Err(LINUX_EACCES);
                     }
                     Ok(meta.logical_last_operator(semnum).unwrap_or(0))
@@ -4251,7 +4333,7 @@ impl<'a> IpcView<'a> {
                     if idx >= meta.nsems {
                         return Err(LINUX_EINVAL);
                     }
-                    if !meta.can_read(creds) {
+                    if !meta.can_read(&subject) {
                         return Err(LINUX_EACCES);
                     }
                     Ok(meta
@@ -4276,7 +4358,7 @@ impl<'a> IpcView<'a> {
                     if idx >= meta.nsems {
                         return Err(LINUX_EINVAL);
                     }
-                    if !meta.can_read(creds) {
+                    if !meta.can_read(&subject) {
                         return Err(LINUX_EACCES);
                     }
                     Ok(meta
@@ -4295,7 +4377,7 @@ impl<'a> IpcView<'a> {
                     let Some(meta) = state.semaphores.get(&guest_semid) else {
                         return Err(LINUX_EINVAL);
                     };
-                    if !meta.can_read(creds) {
+                    if !meta.can_read(&subject) {
                         return Err(LINUX_EACCES);
                     }
                     Ok(meta.values.lock().clone())
@@ -4326,7 +4408,7 @@ impl<'a> IpcView<'a> {
                     let Some(meta) = state.semaphores.get(&guest_semid) else {
                         return Err(LINUX_EINVAL);
                     };
-                    if !meta.can_write(creds) {
+                    if !meta.can_write(&subject) {
                         return Err(LINUX_EACCES);
                     }
                     if meta.removed.load(std::sync::atomic::Ordering::Acquire) {
@@ -4374,7 +4456,7 @@ impl<'a> IpcView<'a> {
                     {
                         return (Err(crate::linux_abi::LINUX_EIDRM), None);
                     }
-                    if !meta.can_write(creds) {
+                    if !meta.can_write(&subject) {
                         return (Err(LINUX_EACCES), None);
                     }
                     *meta.values.lock() = vals;
@@ -4446,7 +4528,7 @@ impl<'a> IpcView<'a> {
         cx: &mut SyscallCtx<M>,
         selector: SemStatSelector,
         arg: u64,
-        creds: &crate::kernel::Credentials,
+        subject: &IpcAccessSubject,
     ) -> Result<DispatchOutcome, DispatchError> {
         let meta_opt = self.sysv.with_state(|state| {
             state
@@ -4458,7 +4540,7 @@ impl<'a> IpcView<'a> {
         let Some((guest_semid, meta)) = meta_opt else {
             return Ok(DispatchOutcome::errno(LINUX_EINVAL));
         };
-        if selector.enforces_read_permission() && !meta.can_read(creds) {
+        if selector.enforces_read_permission() && !meta.can_read(subject) {
             return Ok(DispatchOutcome::errno(LINUX_EACCES));
         }
 
@@ -4611,15 +4693,157 @@ mod ipc_set_tests {
                 creds.set_supplementary_groups(vec![NsGid::new(2002)]);
             })
             .unwrap();
+        member.task().with_caps(|caps| {
+            caps.effective = 0;
+            caps.permitted = 0;
+        });
         let creds = member.resources().credentials();
+        let subject = dispatcher.ipc_access_subject(&member, &creds);
         let state = dispatcher.sysv.state.lock();
         let segment = state.segments.get(&shmid).unwrap();
-        assert!(segment.can_read(&creds), "creator group read must succeed");
         assert!(
-            !segment.can_write(&creds),
+            segment.can_read(&subject),
+            "creator group read must succeed"
+        );
+        assert!(
+            !segment.can_write(&subject),
             "creator group write must fail with EACCES (13)"
         );
         assert_eq!(LINUX_EACCES.guest_retval(), -13);
+    }
+
+    #[test]
+    fn shm_permission_falls_back_to_etc_group_membership_when_override_absent() {
+        let dispatcher = SyscallDispatcher::new();
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .set_file_contents(
+                "/etc/passwd",
+                b"app:x:1003:2003::/home/app:/bin/sh\n".to_vec(),
+            )
+            .expect("write /etc/passwd");
+        dispatcher
+            .fs
+            .rootfs_vfs
+            .overlay
+            .set_file_contents("/etc/group", b"shmgrp:x:2002:app\n".to_vec())
+            .expect("write /etc/group");
+
+        let shmid = 4_897;
+        let _backing = insert_test_shm_segment(&dispatcher, shmid, LINUX_PAGE_SIZE as usize);
+        {
+            let mut state = dispatcher.sysv.state.lock();
+            let segment = state.segments.get_mut(&shmid).unwrap();
+            segment.mode = ShmPermMode::requested(0o040);
+            segment.uid = NsUid::new(1001);
+            segment.cuid = NsUid::new(1002);
+            segment.gid = NsGid::new(2002);
+            segment.cgid = NsGid::new(2001);
+        }
+
+        let root = dispatcher.capture_one_task_context().unwrap();
+        let member = root
+            .kernel()
+            .update_credentials(&root, |creds| {
+                creds.seed_identity(NsUid::new(1003), NsGid::new(2003));
+            })
+            .unwrap();
+        member.task().with_caps(|caps| {
+            caps.effective = 0;
+            caps.permitted = 0;
+        });
+        let creds = member.resources().credentials();
+        assert!(
+            creds.supplementary_groups_override().is_none(),
+            "launch-time identity leaves supplementary_groups_override unset"
+        );
+
+        let reporter = CompatReporter::default();
+        let mut memory = LinearMemory::new(0x10000, vec![0; 0x200]);
+        let outcome = dispatcher
+            .dispatch_normalized(
+                &member,
+                SyscallRequest::new(
+                    195,
+                    SyscallArgs::from([shmid as u64, LINUX_IPC_STAT, 0x10000, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+                None,
+            )
+            .expect("shmctl is a claimed syscall")
+            .expect("shmctl IPC_STAT must not be a fatal DispatchError");
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Returned { value: 0 },
+            "launch-time /etc/group membership must grant group read on 0o040 segment"
+        );
+    }
+
+    #[test]
+    fn shm_permission_honors_cap_ipc_owner_rather_than_raw_euid_root() {
+        let dispatcher = SyscallDispatcher::new();
+        let shmid = 4_896;
+        let _backing = insert_test_shm_segment(&dispatcher, shmid, LINUX_PAGE_SIZE as usize);
+        {
+            let mut state = dispatcher.sysv.state.lock();
+            let segment = state.segments.get_mut(&shmid).unwrap();
+            segment.mode = ShmPermMode::requested(0o000);
+            segment.uid = NsUid::new(1001);
+            segment.cuid = NsUid::new(1001);
+            segment.gid = NsGid::new(2001);
+            segment.cgid = NsGid::new(2001);
+        }
+
+        let root = dispatcher.capture_one_task_context().unwrap();
+        let unprivileged_root = root
+            .kernel()
+            .update_credentials(&root, |creds| {
+                creds.set_uid_triple(NsUid::ROOT, NsUid::ROOT, NsUid::ROOT);
+                creds.set_gid_triple(NsGid::ROOT, NsGid::ROOT, NsGid::ROOT);
+            })
+            .unwrap();
+        unprivileged_root.task().with_caps(|caps| {
+            caps.effective &= !(1_u64 << crate::namespace::process::CAP_IPC_OWNER);
+        });
+        let creds = unprivileged_root.resources().credentials();
+        let subject_without_cap = dispatcher.ipc_access_subject(&unprivileged_root, &creds);
+        {
+            let state = dispatcher.sysv.state.lock();
+            let segment = state.segments.get(&shmid).unwrap();
+            assert!(
+                !segment.can_read(&subject_without_cap),
+                "euid 0 without CAP_IPC_OWNER must not bypass mode 0o000"
+            );
+            assert!(
+                !segment.can_write(&subject_without_cap),
+                "euid 0 without CAP_IPC_OWNER must not bypass mode 0o000"
+            );
+        }
+
+        let cap_holder = unprivileged_root
+            .kernel()
+            .update_credentials(&unprivileged_root, |creds| {
+                creds.seed_identity(NsUid::new(1003), NsGid::new(2003));
+            })
+            .unwrap();
+        cap_holder.task().with_caps(|caps| {
+            caps.effective = 1_u64 << crate::namespace::process::CAP_IPC_OWNER;
+        });
+        let cap_creds = cap_holder.resources().credentials();
+        let subject_with_cap = dispatcher.ipc_access_subject(&cap_holder, &cap_creds);
+        let state = dispatcher.sysv.state.lock();
+        let segment = state.segments.get(&shmid).unwrap();
+        assert!(
+            segment.can_read(&subject_with_cap),
+            "CAP_IPC_OWNER must bypass mode 0o000 even for non-root euid"
+        );
+        assert!(
+            segment.can_write(&subject_with_cap),
+            "CAP_IPC_OWNER must bypass mode 0o000 even for non-root euid"
+        );
     }
 
     #[test]
@@ -4835,13 +5059,15 @@ mod ipc_set_tests {
         let shmid = 4904;
         let va = crate::memory::LINUX_HIGH_VA_THRESHOLD;
         let _backing = insert_test_shm_segment(&dispatcher, shmid, LINUX_PAGE_SIZE as usize);
+        let context = dispatcher.capture_one_task_context().unwrap();
         let creds = dispatcher.cred_snapshot();
-        let (fd, _, reservation) = reserve_shmat(&dispatcher.sysv, &creds, shmid, true)
+        let subject = dispatcher.ipc_access_subject(&context, &creds);
+        let (fd, _, reservation) = reserve_shmat(&dispatcher.sysv, &subject, shmid, true)
             .expect("reserve exact segment generation");
         unsafe { libc::close(fd) };
         shmctl_rmid(&mut dispatcher.sysv.state.lock(), shmid).expect("tombstone segment");
         assert_eq!(
-            reserve_shmat(&dispatcher.sysv, &creds, shmid, true).unwrap_err(),
+            reserve_shmat(&dispatcher.sysv, &subject, shmid, true).unwrap_err(),
             LINUX_EINVAL,
             "the tombstoned id rejects new attaches",
         );
@@ -6233,9 +6459,11 @@ mod ipc_set_tests {
         #[test]
         fn message_queue_hot_path_does_not_rewrite_identity_file() {
             let dispatcher = SyscallDispatcher::new();
+            let context = dispatcher.capture_one_task_context().unwrap();
             let creds = dispatcher.cred_snapshot();
+            let subject = dispatcher.ipc_access_subject(&context, &creds);
             let id = dispatcher.sysv.with_state_mut(|state| {
-                msgget_open(state, &creds, MsgKey::PRIVATE, 0o600).expect("create message queue")
+                msgget_open(state, &subject, MsgKey::PRIVATE, 0o600).expect("create message queue")
             });
             let path = lookup_msg_queue_path(id).expect("queue identity path");
             let identity_len = std::fs::metadata(&path)
@@ -6247,7 +6475,7 @@ mod ipc_set_tests {
                     &dispatcher.shared_futex(),
                     &dispatcher.sysv,
                     id,
-                    &creds,
+                    &subject,
                     MsgType::from_msgbuf(1).unwrap(),
                     b"payload",
                     7,
@@ -6273,16 +6501,25 @@ mod ipc_set_tests {
             SysvShmState::ensure_dir();
             let path = PathBuf::from(SHM_DIR).join(SysvShmState::key_name(key));
             let _ = std::fs::remove_file(&path);
+            let context = dispatcher.capture_one_task_context().unwrap();
             let creds = dispatcher.cred_snapshot();
+            let subject = dispatcher.ipc_access_subject(&context, &creds);
             let flags = IpcCreateFlags::CREAT.bits() | 0o600;
             let shmid = dispatcher.sysv.with_state_mut(|state| {
-                shmget_open(state, &creds, key, LINUX_PAGE_SIZE as usize, flags, 1)
+                shmget_open(state, &subject, key, LINUX_PAGE_SIZE as usize, flags, 1)
                     .expect("create test segment")
             });
 
             let error = dispatcher.sysv.with_state_mut(|state| {
-                shmget_open(state, &creds, key, (LINUX_PAGE_SIZE * 2) as usize, flags, 1)
-                    .expect_err("larger lookup must fail")
+                shmget_open(
+                    state,
+                    &subject,
+                    key,
+                    (LINUX_PAGE_SIZE * 2) as usize,
+                    flags,
+                    1,
+                )
+                .expect_err("larger lookup must fail")
             });
             assert_eq!(error, LINUX_EINVAL);
             dispatcher

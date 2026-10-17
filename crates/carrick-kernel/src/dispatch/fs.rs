@@ -610,47 +610,9 @@ impl<'a> FsView<'a> {
     }
 
     pub(super) fn current_groups(&self) -> Vec<carrick_abi::NsGid> {
-        let credentials = self.cred_snapshot();
-        match credentials.supplementary_groups_override() {
-            Some(groups) => groups.to_vec(),
-            None => {
-                let egid = credentials.egid;
-                let mut gids: Vec<carrick_abi::NsGid> = vec![egid];
-                let euid = credentials.euid;
-                let username =
-                    self.read_exec_file_head("/etc/passwd", 64 * 1024)
-                        .and_then(|passwd| {
-                            String::from_utf8_lossy(&passwd).lines().find_map(|line| {
-                                let f: Vec<&str> = line.split(':').collect();
-                                if f.len() >= 3 && f[2].parse::<u32>().ok() == Some(euid.raw()) {
-                                    Some(f[0].to_string())
-                                } else {
-                                    None
-                                }
-                            })
-                        });
-                if let (Some(user), Some(group)) =
-                    (username, self.read_exec_file_head("/etc/group", 64 * 1024))
-                {
-                    for line in String::from_utf8_lossy(&group).lines() {
-                        let f: Vec<&str> = line.split(':').collect();
-                        if f.len() < 4 {
-                            continue;
-                        }
-                        let Ok(gid) = f[2].parse::<u32>() else {
-                            continue;
-                        };
-                        let gid = carrick_abi::NsGid::new(gid);
-                        if !gids.contains(&gid)
-                            && f[3].split(',').any(|m| !m.is_empty() && m == user)
-                        {
-                            gids.push(gid);
-                        }
-                    }
-                }
-                gids
-            }
-        }
+        super::creds::resolve_current_groups(&self.cred_snapshot(), |path| {
+            self.read_exec_file_head(path, 64 * 1024)
+        })
     }
 
     #[inline]

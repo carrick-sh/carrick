@@ -1,15 +1,15 @@
 schema_version = 1
 id = "kernel.signal.socket-restart"
 title = "Interrupted blocking socket calls restart only without socket timeouts"
-guest_surfaces = ["syscall:accept", "syscall:connect", "syscall:recvfrom", "syscall:recvmsg", "syscall:sendto", "syscall:sendmsg", "syscall:read", "syscall:write"]
-semantic_authority = ["Linux signal(7), Interruption of system calls: blocking socket calls restart with SA_RESTART except calls with SO_RCVTIMEO or SO_SNDTIMEO, which return EINTR (4).", "Linux socket(7): a timed blocking connect returns EINPROGRESS on timeout."]
+guest_surfaces = ["syscall:accept", "syscall:accept4", "syscall:connect", "syscall:recvfrom", "syscall:recvmsg", "syscall:recvmmsg", "syscall:sendto", "syscall:sendmsg", "syscall:sendmmsg", "syscall:read", "syscall:write"]
+semantic_authority = ["Linux signal(7), Interruption of system calls: blocking socket calls restart with SA_RESTART except calls with SO_RCVTIMEO, SO_SNDTIMEO, or a recvmmsg timeout pointer, which return EINTR (4).", "Linux sendmmsg(2): once at least one message has been sent, a later blocked entry returns the partial count rather than blocking or resending.", "Linux socket(7): a timed blocking connect returns EINPROGRESS on timeout."]
 fixture = "unit:socket_waits_restart_with_sa_restart_except_timed_calls"
 scale_points = [1]
 structural_budgets = []
-rationale = "The syscall continuation must use the dispatcher's single published socket deadline to classify signal restart. It must not add polling, retries, or a second timeout authority."
+rationale = "The syscall continuation and number-only fallback share one RestartClass policy in carrick-signal-core::wait, and sendmmsg returns partial progress once sent > 0 instead of re-entering WaitOnFds from entry 0."
 
 [bindings]
-vm_free = "carrick-kernel::kernel::continuation::tests::{socket_waits_restart_with_sa_restart_except_timed_calls,socket_timeout_forces_eintr_even_with_restart_action}"
+vm_free = "carrick-signal-core::wait::tests::socket_calls_restart_only_when_proven_untimed, carrick-kernel::kernel::continuation::tests::{socket_waits_restart_with_sa_restart_except_timed_calls,socket_timeout_forces_eintr_even_with_restart_action}, carrick-kernel::dispatch::net::send_recv::inet_in_memory_socket_tests::{sendmmsg_returns_partial_count_when_later_entry_blocks,recvmmsg_with_timeout_pointer_fails_eintr_under_sa_restart}"
 
 [bindings.unresolved]
 embed_structural = "Signed HVF binding belongs to the director gate."
