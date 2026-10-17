@@ -1705,11 +1705,7 @@ where
             threads::PersistentThreadExitDisposition::Done(
                 outcome @ VcpuLoopOutcome::ProcessExit(_),
             ) => {
-                let ring_closing = context.lifecycle_page().exit_wait().is_some();
                 self.publish_host_thread_retirement(&context);
-                if ring_closing {
-                    return Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)));
-                }
                 self.terminal_runtime = PersistentTerminalRuntimeState::Withdrawn;
                 self.begin_persistent_process_terminal(
                     engine,
@@ -4182,7 +4178,10 @@ where
                                 .is_some_and(|identity| {
                                     context.lifecycle_page().host_birth_requested(identity)
                                 }))
-                            && context.lifecycle_page().exit_wait().is_some()
+                            && carrick_el1_abi::Lifecycle::process_exit_custody(
+                                &*context.lifecycle_page(),
+                            )
+                            .caller_reserved()
                     })
             {
                 // A host-born member can be cancelled before its first EL1
