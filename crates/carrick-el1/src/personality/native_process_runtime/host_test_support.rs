@@ -361,6 +361,94 @@ impl NativeSignalFixture {
             .unwrap();
     }
 
+    pub fn ignore_signal(&self, signum: i32) {
+        use carrick_personality_linux::signal::ProcessSignals;
+        self.handler_signum.store(0, Ordering::Release);
+        let mut service = self.service();
+        let mut entry = self
+            .runtime
+            .enter_registered(
+                self.registry,
+                BornInZoneSource {
+                    zone: self.zone,
+                    slot: self.slot,
+                },
+                self.task,
+                self.address,
+                words(self.address),
+                &mut service,
+            )
+            .unwrap();
+        entry
+            .rt_sigaction(
+                carrick_signal_core::policy::Signal::from_number(signum).unwrap(),
+                Some(carrick_signal_core::policy::Action {
+                    disposition: carrick_signal_core::policy::Disposition::Ignore,
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+    }
+
+    pub fn registry_signal_checkpoint_needed(&self) -> bool {
+        self.registry
+            .signal_checkpoint_needed(self.zone, self.record)
+    }
+
+    pub fn set_blocked_mask(&self, mask: carrick_personality_linux::abi::thread::BlockedMask) {
+        let _ = self
+            .control
+            .store_blocked_then_read_pending(mask, self.control.pending());
+    }
+
+    pub fn drain_and_steal_on_sibling(
+        &self,
+        queue: &carrick_el1_abi::SharedSignalIngressQueue,
+    ) -> (usize, bool) {
+        let mut service = self.service();
+        let drained = self
+            .registry
+            .drain_external_ingress(self.zone, queue, self.slot, &mut service)
+            .unwrap();
+        let signals = self.runtime.current_signals(self.task).unwrap();
+        let sibling_record = RecordRef {
+            id: carrick_sched_core::RecordId::from_raw(self.record.id.raw() + 1).unwrap(),
+            incarnation: 1,
+        };
+        let stolen = signals
+            .take_deliverable(
+                sibling_record,
+                carrick_signal_core::policy::SigBlockMask::NONE,
+            )
+            .is_some();
+        (drained, stolen)
+    }
+
+    pub fn enqueue_process_signal_and_steal_on_sibling(&self, signum: i32) -> bool {
+        let signals = self.runtime.current_signals(self.task).unwrap();
+        let process_key = self
+            .registry
+            .state
+            .lock()
+            .members
+            .values()
+            .next()
+            .unwrap()
+            .process;
+        let signal = carrick_signal_core::policy::Signal::from_number(signum).unwrap();
+        signals.enqueue(process_key, signal, None).unwrap();
+        let sibling_record = RecordRef {
+            id: carrick_sched_core::RecordId::from_raw(self.record.id.raw() + 1).unwrap(),
+            incarnation: 1,
+        };
+        signals
+            .take_deliverable(
+                sibling_record,
+                carrick_signal_core::policy::SigBlockMask::NONE,
+            )
+            .is_some()
+    }
+
     pub fn drain_and_deliver(
         &self,
         queue: &carrick_el1_abi::SharedSignalIngressQueue,
@@ -393,24 +481,32 @@ impl NativeSignalFixture {
             !self.task.linux.has_pending_host_work(),
             "host work blocks signal delivery"
         );
+        let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+            carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
+        );
+        let deliverable = self
+            .runtime
+            .current_signals(self.task)
+            .unwrap()
+            .has_deliverable(self.record, blocked);
         assert_eq!(
             entry.signal_checkpoint_needed(),
-            drained != 0,
+            drained != 0 || deliverable || self.control.forwarded_wait_mask_armed(),
             "native checkpoint must match admitted signal work"
         );
-        assert!(matches!(
-            carrick_personality_linux::signal::ProcessSignals::rt_sigaction(
-                &mut entry,
-                carrick_signal_core::policy::Signal::from_number(
-                    self.handler_signum.load(Ordering::Acquire),
+        let signum = self.handler_signum.load(Ordering::Acquire);
+        if signum != 0 {
+            assert!(matches!(
+                carrick_personality_linux::signal::ProcessSignals::rt_sigaction(
+                    &mut entry,
+                    carrick_signal_core::policy::Signal::from_number(signum).unwrap(),
+                    None,
                 )
-                .unwrap(),
-                None,
-            )
-            .unwrap()
-            .disposition,
-            carrick_signal_core::policy::Disposition::Handler(_)
-        ));
+                .unwrap()
+                .disposition,
+                carrick_signal_core::policy::Disposition::Handler(_)
+            ));
+        }
         let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
         let mut machine = HostArmSignalMachine {
             backend: HostArmBackend,
@@ -557,5 +653,9 @@ pub fn empty_signal_checkpoint_lock_witness() {
         fixture
             .registry
             .signal_checkpoint_needed(fixture.zone, fixture.record)
+    );
+    let _ = signals.take_deliverable(
+        fixture.record,
+        carrick_signal_core::policy::SigBlockMask::NONE,
     );
 }

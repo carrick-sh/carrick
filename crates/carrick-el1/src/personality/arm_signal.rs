@@ -70,8 +70,8 @@ pub(crate) fn restart_forwarded_frame(frame: &mut TrapFrame) -> Option<bool> {
     rewind_forwarded_frame(frame)
 }
 
-/// Only a selected SA_RESTART handler may rewind its interrupted SVC. An
-/// empty checkpoint returns the host result once, without replay.
+/// Rewind an interrupted restart-class forwarded SVC for `SA_RESTART` or when
+/// no handler runs at the checkpoint (`WaitDecision::Continue`).
 fn rewind_forwarded_frame(frame: &mut TrapFrame) -> Option<bool> {
     let Some(pc) = frame.elr.checked_sub(4) else {
         return Some(false);
