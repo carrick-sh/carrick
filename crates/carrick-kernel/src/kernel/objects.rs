@@ -1087,7 +1087,7 @@ impl DescriptionCommon {
 
 #[derive(Debug, Default)]
 struct DescriptionLifecycle {
-    shared_open: Option<carrick_el1_abi::OpenReferenceKey>,
+    shared_open: Option<carrick_core_abi::OpenReferenceKey>,
     mapping_refs: usize,
     terminal_finalizers: Vec<Arc<dyn FileDescriptionFinalizer>>,
 }
@@ -1312,7 +1312,7 @@ impl FileDescription {
 
     pub(crate) fn publish_open_reference(
         &self,
-        key: carrick_el1_abi::OpenReferenceKey,
+        key: carrick_core_abi::OpenReferenceKey,
         publish: impl FnOnce() -> bool,
     ) -> bool {
         let mut lifecycle = self.lifecycle_transition.lock();
@@ -1322,10 +1322,10 @@ impl FileDescription {
         lifecycle.shared_open = Some(key);
         true
     }
-    pub(crate) fn open_reference(&self) -> Option<carrick_el1_abi::OpenReferenceKey> {
+    pub(crate) fn open_reference(&self) -> Option<carrick_core_abi::OpenReferenceKey> {
         self.lifecycle_transition.lock().shared_open
     }
-    pub(crate) fn retire_open_reference(&self, key: carrick_el1_abi::OpenReferenceKey) {
+    pub(crate) fn retire_open_reference(&self, key: carrick_core_abi::OpenReferenceKey) {
         let mut lifecycle = self.lifecycle_transition.lock();
         if lifecycle.shared_open == Some(key) {
             lifecycle.shared_open = None;

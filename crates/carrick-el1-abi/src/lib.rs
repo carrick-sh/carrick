@@ -22,6 +22,7 @@
 
 pub use carrick_guest_arch::ContextGeneration;
 
+use carrick_core_abi::OpenLifetime;
 mod open_lifetime;
 pub use open_lifetime::*;
 mod cow_grants;
@@ -3846,7 +3847,7 @@ impl Default for InotifyNameCache {
 }
 
 const _: () = {
-    assert!(EL1_ABI_LAYOUT_HASH == 0x511e505623bce97f);
+    assert!(EL1_ABI_LAYOUT_HASH == 0x15d6d174b10f9d0d);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);

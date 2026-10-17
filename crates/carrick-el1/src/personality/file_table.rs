@@ -33,8 +33,9 @@ pub use carrick_syscall_abi::{
 // lock word. The x86 host shares it; ARM host delegation has its own Mutex.
 // No crossing or wait occurs while held.
 
-pub use carrick_el1_abi::OpenReferenceKey as ReleasedDescription;
-use carrick_el1_abi::{OpenReferenceWork, OpenRelease, queue_open_release};
+pub use carrick_core_abi::OpenReferenceKey as ReleasedDescription;
+use carrick_core_abi::{OpenReferenceWork, OpenRelease};
+use carrick_el1_abi::queue_open_release;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GuestDescriptorChange {

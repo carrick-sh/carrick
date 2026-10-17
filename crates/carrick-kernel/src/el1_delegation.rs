@@ -13,6 +13,7 @@ use parking_lot::Mutex;
 use std::sync::atomic::Ordering;
 
 use carrick_abi::*;
+use carrick_core_abi::{OpenReferenceKey, OpenRelease};
 use carrick_el1_abi::*;
 use carrick_fatal::carrick_fatal;
 

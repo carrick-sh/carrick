@@ -53,6 +53,7 @@ conformance-metrics = ["carrick-kernel/conformance-metrics", "carrick-observabil
 [dev-dependencies]
 carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-core = { path = "../carrick-core", features = ["host-test"] }
+carrick-fd-core = { path = "../carrick-fd-core", features = ["test-support"] }
 carrick-sched-core = { path = "../carrick-sched-core" }
 carrick-personality-linux = { path = "../carrick-personality-linux" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
