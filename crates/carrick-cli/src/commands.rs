@@ -1498,6 +1498,21 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                                 capture_status,
                             )?;
                             eprintln!("{}", summary.render_human());
+                        } else if requested_profile
+                            == crate::trace_profile::TraceProfileKind::HvpatchSchedulerTerminal
+                        {
+                            if summary_jsonl.is_some() {
+                                bail!(
+                                    "scheduler terminal profile retains raw diagnostic evidence only"
+                                );
+                            }
+                            if custom_trace_report_is_rejected(report, true) {
+                                bail!("scheduler terminal capture was lossy or incomplete");
+                            }
+                            eprintln!(
+                                "scheduler terminal raw script sha256={}",
+                                requested_profile.script_sha256()
+                            );
                         } else {
                             if requested_profile
                                 != crate::trace_profile::TraceProfileKind::HvpatchMmReuseIsolation

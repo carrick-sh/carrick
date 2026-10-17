@@ -238,6 +238,7 @@ impl V2ProfileAuthority {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum TraceProfileKind {
     HvpatchMmReuseIsolation,
+    HvpatchSchedulerTerminal,
     HvpatchCarrierCpuLowRate,
     HvpatchCarrierCpuAttribution,
     HvpatchExitAttribution,
@@ -252,6 +253,7 @@ pub(crate) enum TraceProfileKind {
 }
 
 impl TraceProfileKind {
+    #[allow(dead_code)]
     pub(crate) fn script_sha256(self) -> String {
         #[cfg(any(target_os = "macos", target_os = "freebsd"))]
         {
@@ -259,12 +261,29 @@ impl TraceProfileKind {
         }
         #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
         {
-            String::new()
+            match self {
+                Self::HvpatchMmReuseIsolation => format!(
+                    "{:x}",
+                    Sha256::digest(
+                        include_str!("../../../scripts/dtrace/hvpatch-mm-reuse-isolation.d")
+                            .as_bytes()
+                    )
+                ),
+                Self::HvpatchSchedulerTerminal => format!(
+                    "{:x}",
+                    Sha256::digest(
+                        include_str!("../../../scripts/dtrace/hvpatch-scheduler-terminal.d")
+                            .as_bytes()
+                    )
+                ),
+                _ => String::new(),
+            }
         }
     }
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::HvpatchMmReuseIsolation => "hvpatch-mm-reuse-isolation",
+            Self::HvpatchSchedulerTerminal => "hvpatch-scheduler-terminal",
             Self::HvpatchCarrierCpuLowRate => "hvpatch-carrier-cpu-low-rate",
             Self::HvpatchCarrierCpuAttribution => "hvpatch-carrier-cpu-attribution",
             Self::HvpatchExitAttribution => "hvpatch-exit-attribution",
@@ -295,6 +314,7 @@ impl TraceProfileKind {
             }
             Self::HvpatchCarrierCpuLowRate
             | Self::HvpatchMmReuseIsolation
+            | Self::HvpatchSchedulerTerminal
             | Self::HvpatchInotify09Population
             | Self::HostNamespaceWork
             | Self::HvpatchFrameCow
@@ -310,6 +330,9 @@ impl TraceProfileKind {
         match self {
             Self::HvpatchMmReuseIsolation => {
                 include_str!("../../../scripts/dtrace/hvpatch-mm-reuse-isolation.d")
+            }
+            Self::HvpatchSchedulerTerminal => {
+                include_str!("../../../scripts/dtrace/hvpatch-scheduler-terminal.d")
             }
             Self::HvpatchCarrierCpuLowRate => {
                 carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_CARRIER_CPU_LOW_RATE_D
@@ -347,6 +370,7 @@ impl TraceProfileKind {
     fn parse_protocol(value: &str) -> Result<Self> {
         match value {
             "hvpatch-mm-reuse-isolation" => Ok(Self::HvpatchMmReuseIsolation),
+            "hvpatch-scheduler-terminal" => Ok(Self::HvpatchSchedulerTerminal),
             "hvpatch-carrier-cpu-low-rate" => Ok(Self::HvpatchCarrierCpuLowRate),
             "hvpatch-carrier-cpu-attribution" => Ok(Self::HvpatchCarrierCpuAttribution),
             "hvpatch-exit-attribution" => Ok(Self::HvpatchExitAttribution),
@@ -565,6 +589,10 @@ mod tests {
                 "hvpatch-mm-reuse-isolation",
             ),
             (
+                TraceProfileKind::HvpatchSchedulerTerminal,
+                "hvpatch-scheduler-terminal",
+            ),
+            (
                 TraceProfileKind::HvpatchCarrierCpuLowRate,
                 "hvpatch-carrier-cpu-low-rate",
             ),
@@ -599,5 +627,14 @@ mod tests {
             assert_eq!(TraceProfileKind::parse_protocol(expected).unwrap(), kind);
             assert!(!kind.requires_runtime_profile());
         }
+        assert_eq!(
+            TraceProfileKind::HvpatchSchedulerTerminal.script_sha256(),
+            format!(
+                "{:x}",
+                Sha256::digest(include_bytes!(
+                    "../../../scripts/dtrace/hvpatch-scheduler-terminal.d"
+                ))
+            )
+        );
     }
 }
