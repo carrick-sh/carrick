@@ -90,6 +90,24 @@ pub(super) fn resume_selected<'a, X: ForkStockCrossing>(
     record: RecordId,
     service: &mut Aarch64NativeProcessService<'a, X>,
 ) -> NativeResume {
+    if owner_registry
+        .for_record(source.zone, source.zone.record_ref(record))
+        .is_none()
+        && matches!(
+            source.zone.record(record).resume_disposition(),
+            carrick_sched_core::object_wait::ResumeDisposition::OwnerContinuation(_)
+        )
+    {
+        // SAFETY: switch_in_full gave this slot exclusive record custody.
+        unsafe {
+            source.zone.record(record).consume_owner_continuation();
+        }
+        let _ =
+            source
+                .zone
+                .release_current(source.slot, record, &carrick_sched_core::ShortLockSpin);
+        return NativeResume::Left(None);
+    }
     // The scheduler publishes the execution identity; the native owner also
     // owns the namespace PID and MM incarnation for this selected record.
     // SAFETY: switch_in_full gave this slot exclusive record custody.
@@ -122,6 +140,17 @@ pub fn resume_production(
     record: RecordId,
 ) -> crate::sched::ResumeAction {
     let Some(runtime) = registry().for_record(zone, zone.record_ref(record)) else {
+        if matches!(
+            zone.record(record).resume_disposition(),
+            carrick_sched_core::object_wait::ResumeDisposition::OwnerContinuation(_)
+        ) {
+            // SAFETY: this exact record is selected by the execution owner.
+            unsafe {
+                zone.record(record).consume_owner_continuation();
+            }
+            let _ = zone.release_current(slot, record, &carrick_sched_core::ShortLockSpin);
+            return crate::sched::ResumeAction::Left;
+        }
         return crate::sched::ResumeAction::NoPending;
     };
     let source = BornInZoneSource { zone, slot };

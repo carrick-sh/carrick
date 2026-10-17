@@ -1931,6 +1931,43 @@ impl super::thread_setup::LifecycleVenue for Fixture {
     ) -> Option<&ThreadControlSlot> {
         None
     }
+    fn wake_unplaceable_wait(
+        &self,
+        channel: super::native_process_runtime::ProcessWaitChannel,
+        _slot: SlotId,
+    ) -> Result<(), super::native_process_runtime::NativeProcessError> {
+        let mut transfers = Vec::new();
+        let guard = self
+            .zone
+            .lock(
+                ZoneTables::<Aarch64ParkedContext>::bucket_of_with_context(
+                    channel.mm.raw(),
+                    channel.address.get(),
+                ),
+                &carrick_sched_core::ShortLockSpin,
+            )
+            .unwrap();
+        let _ = self.zone.wake_host(
+            &guard,
+            channel.mm.raw(),
+            channel.address.get(),
+            u32::MAX,
+            u32::MAX,
+            false,
+            &mut |transfer| transfers.push(transfer),
+            &mut |_| panic!("must hand back unplaceable wait to host"),
+        );
+        drop(guard);
+        for transfer in transfers {
+            assert!(
+                transfer
+                    .finish(&carrick_sched_core::ShortLockSpin)
+                    .is_some()
+            );
+        }
+        self.task.linux.mark_pending_host_work();
+        Ok(())
+    }
 }
 
 #[test]
@@ -2128,9 +2165,33 @@ fn imported_thread_with_identity(
 }
 
 #[cfg(test)]
+fn imported_thread_on_slot(
+    fixture: &Fixture,
+    slot: SlotId,
+    edit: impl FnOnce(&mut carrick_sched_core::ThreadIdentity),
+) -> (&'static ThreadControlSlot, carrick_sched_core::RecordRef) {
+    imported_thread_on_control_and_slot(
+        fixture,
+        Box::leak(Box::new(ThreadControlSlot::new())),
+        slot,
+        edit,
+    )
+}
+
+#[cfg(test)]
 fn imported_thread_on_control(
     fixture: &Fixture,
     control: &'static ThreadControlSlot,
+    edit: impl FnOnce(&mut carrick_sched_core::ThreadIdentity),
+) -> (&'static ThreadControlSlot, carrick_sched_core::RecordRef) {
+    imported_thread_on_control_and_slot(fixture, control, fixture.slot, edit)
+}
+
+#[cfg(test)]
+fn imported_thread_on_control_and_slot(
+    fixture: &Fixture,
+    control: &'static ThreadControlSlot,
+    slot: SlotId,
     edit: impl FnOnce(&mut carrick_sched_core::ThreadIdentity),
 ) -> (&'static ThreadControlSlot, carrick_sched_core::RecordRef) {
     use carrick_el1_abi::Lifecycle;
@@ -2188,7 +2249,7 @@ fn imported_thread_on_control(
             },
         )
         .unwrap();
-    fixture.zone.requeue_preempted(fixture.slot, record);
+    fixture.zone.requeue_preempted(slot, record);
     (control, reference)
 }
 
@@ -5029,4 +5090,366 @@ fn arm_exit_group_waits_for_winning_host_fork_publication() {
 #[test]
 fn arm_exit_group_waits_for_losing_host_fork_backend_rollback() {
     arm_exit_group_host_fork_race(4);
+}
+
+#[test]
+fn arm_concurrent_exit_group_callers_wake_all_and_settle_owner() {
+    use carrick_el1_abi::Lifecycle;
+
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let slot2 = SlotId::new(1);
+    fixture.zone.drive(slot2, 2);
+    fixture.zone.publish_slot(slot2, 1, Some(1), 1);
+    fixture.zone.enter_guest(slot2);
+    fixture.zone.install_space(slot2, 1).unwrap();
+    let (control2, record2) = imported_thread_on_slot(fixture, slot2, |id| id.affinity = u64::MAX);
+    let control3: &'static ThreadControlSlot = Box::leak(Box::new(ThreadControlSlot::new()));
+    let entry3 = fixture
+        .page
+        .stock(
+            1,
+            carrick_el1_abi::EntryIdentity {
+                tid: 43,
+                visible_tid: 43,
+                thread_serial: 103,
+                execution: carrick_core_abi::entry::EntryGeneration::from_raw(13),
+                uid_credit: 0,
+            },
+        )
+        .unwrap();
+    fixture
+        .page
+        .bind_control_address(entry3, control3 as *const _ as u64)
+        .unwrap();
+    let record3 = fixture
+        .zone
+        .alloc_record(carrick_sched_core::ThreadIdentity {
+            tid: 43,
+            serial: 103,
+            mm: 1,
+            file_table: 5,
+            generation: 0,
+            affinity: 1,
+            lifecycle_page: fixture.page as *const _ as u64,
+            control_slot: control3 as *const _ as u64,
+        })
+        .unwrap();
+    let reference3 = fixture.zone.record_ref(record3);
+    unsafe {
+        *fixture.zone.record(record3).ctx_mut() =
+            Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    }
+    control3
+        .reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry3)
+        .unwrap();
+    assert!(control3.publish_visible_tid(43));
+    control3.bind_zone_record(reference3);
+    let claim3 = fixture.page.claim_any().unwrap();
+    fixture.page.thread_born().unwrap();
+    fixture
+        .page
+        .record_born(
+            claim3,
+            carrick_el1_abi::BornRecord {
+                caller_task: 41,
+                caller_serial: 101,
+                clone_flags: 0x0001_0000,
+                clear_child_tid: 0,
+                blocked: carrick_el1_abi::BlockedMask(0),
+            },
+        )
+        .unwrap();
+    fixture.zone.requeue_preempted(fixture.slot, record3);
+
+    let service: &'static mut Aarch64NativeProcessService<'static, TestStockCrossing> =
+        Box::leak(Box::new(fixture.process_service()));
+    let service2: &'static mut Aarch64NativeProcessService<'static, TestStockCrossing> =
+        Box::leak(Box::new(Aarch64NativeProcessService::with_crossing(
+            &fixture.task,
+            slot2,
+            fixture.zone,
+            fixture.region.table(),
+            NonZeroU64::MIN,
+            TestStockCrossing::new(&[]),
+        )));
+    run_as_leader(fixture);
+    fixture
+        .enter(fixture.control, fixture_ttbr0(fixture), service, |_| ())
+        .unwrap();
+
+    // Admit and register sibling 2 (tid 42) on slot2, keeping it OnCpu on slot2
+    // while leader initiates group exit on slot 0.
+    assert_eq!(
+        fixture.zone.switch_in_full(slot2).unwrap().record,
+        record2.id
+    );
+    run_as(fixture, 42, 12, 102, control2);
+    fixture
+        .enter(control2, fixture_ttbr0(fixture), service2, |_| ())
+        .unwrap();
+
+    // Switch in unadopted sibling 3 (tid 43) on slot 0 to begin raw SYS_exit(0)
+    // while the admission gate is open; pause it after begin_exit and before commit.
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        record3
+    );
+    run_as(fixture, 43, 0, 103, control3);
+    let service_address = service as *mut _ as usize;
+    let service2_address = service2 as *mut _ as usize;
+    let fixture_address = fixture as *const Fixture as usize;
+    super::lifecycle::install_raw_exit_before_commit_hook(
+        fixture.page,
+        Box::new(move || {
+            // SAFETY: all allocations are leaked for this test and accessed
+            // sequentially while the outer raw-exit call runs this hook.
+            let fixture = unsafe { &*(fixture_address as *const Fixture) };
+            let service = unsafe {
+                &mut *(service_address
+                    as *mut Aarch64NativeProcessService<'static, TestStockCrossing>)
+            };
+            fixture.zone.clear_current(fixture.slot);
+
+            let source = BornInZoneSource {
+                zone: fixture.zone,
+                slot: fixture.slot,
+            };
+            run_as_leader(fixture);
+            let runtime = registry()
+                .for_entry(source, &fixture.task, fixture.address)
+                .unwrap();
+            let runtime_for_hook = runtime.clone();
+            runtime.install_pool_control_hook(Box::new(move || {
+                runtime_for_hook.install_closing_race_hook(Box::new(move || {
+                    // 2. Sibling 2 (tid 42), still OnCpu on slot2, concurrently
+                    //    calls exit_group(9) right after pending_exit is published
+                    //    and registry_state dropped, before leader's cancel_members
+                    //    and park_pending_exit. Sibling 2 therefore parks FIRST at
+                    //    the head of the exit-wait channel.
+                    let fixture = unsafe { &*(fixture_address as *const Fixture) };
+                    let service2 = unsafe {
+                        &mut *(service2_address
+                            as *mut Aarch64NativeProcessService<'static, TestStockCrossing>)
+                    };
+                    run_as(fixture, 42, 12, 102, control2);
+                    let mut sibling2_exit_frame = carrick_el1_abi::TrapFrame::default();
+                    sibling2_exit_frame.x[0] = 9;
+                    sibling2_exit_frame.x[8] = 94;
+                    assert_eq!(
+                        arm_call(fixture, control2, service2, &mut sibling2_exit_frame).unwrap(),
+                        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+                    );
+                    assert_eq!(fixture.zone.counters.el1_wakes.load(Ordering::Acquire), 0);
+                    run_as_leader(fixture);
+                }));
+            }));
+
+            // 1. Leader (tid 41) calls exit_group(7) on slot 0, becomes the closing
+            //    owner, and parks on the exit-wait channel BEHIND sibling 2
+            //    ([sibling 2, leader]) while sibling 3 is still uncommitted.
+            let mut leader_exit_frame = carrick_el1_abi::TrapFrame::default();
+            leader_exit_frame.x[0] = 7;
+            leader_exit_frame.x[8] = 94;
+            assert_eq!(
+                arm_call(fixture, fixture.control, service, &mut leader_exit_frame).unwrap(),
+                carrick_personality_linux::dispatch::CompletionRoute::Suspended
+            );
+            assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
+
+            run_as(fixture, 43, 0, 103, control3);
+        }),
+    );
+
+    // 3. Sibling 3 (tid 43) commits raw SYS_exit(0). Its terminal notification
+    //    must bump wake_generation to 1 and wake ALL waiters (both sibling 2
+    //    at the head of the channel and leader behind it).
+    let mut raw_exit_frame = carrick_el1_abi::TrapFrame::default();
+    raw_exit_frame.x[8] = 93;
+    let counters = Box::new(carrick_el1_abi::Counters::new());
+    let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
+    let mut cpu = crate::sched::FakeCpu::default();
+    let route = super::dispatch::dispatch_syscall_with_native(
+        &mut raw_exit_frame,
+        &counters,
+        core::slice::from_ref(&fixture.task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &cache,
+        Some(crate::Zone {
+            tables: fixture.zone,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+        }),
+        None,
+        Some(fixture),
+        None::<&mut dyn carrick_personality_linux::lifecycle::ProcessNative<Aarch64ParkedContext>>,
+        None,
+        None,
+        |_| core::ptr::null_mut(),
+    );
+    assert!(matches!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+            | carrick_personality_linux::dispatch::CompletionRoute::Served
+    ));
+    assert_eq!(fixture.zone.counters.el1_wakes.load(Ordering::Acquire), 2);
+
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    run_as_leader(fixture);
+    let runtime = registry()
+        .for_entry(source, &fixture.task, fixture.address)
+        .unwrap();
+
+    // Sibling 2 was at the head of the channel; sibling 3's SYS_exit(0)
+    // run_next switched it into fixture.slot. Resuming it must retire its
+    // record via Left(None) (never NoPending) without settling root exit.
+    let first_woken = fixture
+        .zone
+        .slot(fixture.slot)
+        .current()
+        .expect("sibling 2 woken from channel head");
+    assert_eq!(first_woken, record2.id);
+    run_as(fixture, 42, 12, 102, control2);
+    let resumed_sibling2 = super::aarch64_process::resume_selected(
+        &runtime,
+        registry(),
+        source,
+        &fixture.task,
+        first_woken,
+        service,
+    );
+    assert!(
+        matches!(
+            resumed_sibling2,
+            super::native_process_runtime::NativeResume::Left(None)
+        ),
+        "second exit_group caller must retire via Left(None)"
+    );
+    assert!(matches!(
+        super::aarch64_process::map_resume(resumed_sibling2, service, &fixture.task, fixture.slot,),
+        crate::sched::ResumeAction::Left
+    ));
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
+    assert_eq!(service2.crossing.root_exits.load(Ordering::Acquire), 0);
+
+    // Leader was behind sibling 2 on the channel; it must ALSO have been woken
+    // by u32::MAX and must now settle group exit with leader's status 7.
+    let second_woken = fixture
+        .zone
+        .switch_in_full(fixture.slot)
+        .expect("owner must not stay parked while second caller absorbs wake")
+        .record;
+    run_as_leader(fixture);
+    let resumed_leader = super::aarch64_process::resume_selected(
+        &runtime,
+        registry(),
+        source,
+        &fixture.task,
+        second_woken,
+        service,
+    );
+    assert!(matches!(
+        super::aarch64_process::map_resume(resumed_leader, service, &fixture.task, fixture.slot,),
+        crate::sched::ResumeAction::Left
+    ));
+    assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 1);
+    assert_eq!(service.crossing.root_exit_status.load(Ordering::Acquire), 7);
+    assert_eq!(fixture.page.live(), 0);
+}
+
+#[test]
+fn arm_unadopted_exit_wakes_unplaceable_closing_owner_without_process_venue() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let (control, record) =
+        imported_thread_with_identity(fixture, |identity| identity.generation = 0);
+    let mut worker_service = fixture.process_service();
+    run_as_leader(fixture);
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut worker_service,
+            |_| (),
+        )
+        .unwrap();
+    let leader_record = fixture.control.zone_record().unwrap().id;
+    run_as(fixture, 42, 0, 102, control);
+    assert_eq!(
+        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        record.id
+    );
+    let root_service: &'static mut Aarch64NativeProcessService<'static, TestStockCrossing> =
+        Box::leak(Box::new(fixture.process_service()));
+    let root_service_address = root_service as *mut _ as usize;
+    let fixture_address = fixture as *const Fixture as usize;
+    super::lifecycle::install_raw_exit_before_commit_hook(
+        fixture.page,
+        Box::new(move || {
+            let fixture = unsafe { &*(fixture_address as *const Fixture) };
+            let service = unsafe {
+                &mut *(root_service_address
+                    as *mut Aarch64NativeProcessService<'static, TestStockCrossing>)
+            };
+            fixture.zone.clear_current(fixture.slot);
+            run_as_leader(fixture);
+            let mut frame = carrick_el1_abi::TrapFrame::default();
+            frame.x[0] = 7;
+            frame.x[8] = 94;
+            assert_eq!(
+                arm_call(fixture, fixture.control, service, &mut frame).unwrap(),
+                carrick_personality_linux::dispatch::CompletionRoute::Suspended
+            );
+            assert_eq!(service.crossing.root_exits.load(Ordering::Acquire), 0);
+            // Make the parked closing owner unplaceable in the zone so the
+            // unadopted sibling's venue-absent terminal notification must take
+            // the unplaceable host-handback branch.
+            fixture.zone.unhome(fixture.slot, leader_record, 1);
+            fixture.zone.publish_slot(fixture.slot, 0, Some(0), 1);
+            fixture.zone.release_space(fixture.slot);
+            run_as(fixture, 42, 0, 102, control);
+        }),
+    );
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[8] = 93;
+    let counters = Box::new(carrick_el1_abi::Counters::new());
+    let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
+    let mut cpu = crate::sched::FakeCpu::default();
+    let route = super::dispatch::dispatch_syscall_with_native(
+        &mut frame,
+        &counters,
+        core::slice::from_ref(&fixture.task),
+        &[],
+        &[],
+        &[],
+        &[],
+        &cache,
+        Some(crate::Zone {
+            tables: fixture.zone,
+            cpu: &mut cpu,
+            user: &crate::sched::HardwareUserWord,
+        }),
+        None,
+        Some(fixture),
+        None::<&mut dyn carrick_personality_linux::lifecycle::ProcessNative<Aarch64ParkedContext>>,
+        None,
+        None,
+        |_| core::ptr::null_mut(),
+    );
+    assert!(matches!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended
+            | carrick_personality_linux::dispatch::CompletionRoute::Served
+    ));
+    assert!(
+        matches!(
+            fixture.zone.record(leader_record).claim(),
+            carrick_el1_abi::Claim::Host { .. }
+        ),
+        "venue-absent unplaceable wake must hand the closing owner back to host"
+    );
 }
