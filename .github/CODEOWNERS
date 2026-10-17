@@ -10,3 +10,4 @@
 **/fork_stock.rs                                              @tjfontaine
 **/x86_fork_stock.rs                                          @tjfontaine
 /.github/workflows/                                           @tjfontaine
+/conformance-contracts/                                       @tjfontaine
