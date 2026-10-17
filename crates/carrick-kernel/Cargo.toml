@@ -51,6 +51,7 @@ loom = []
 
 [dependencies]
 carrick-core = { path = "../carrick-core" }
+carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-personality-linux = { path = "../carrick-personality-linux" }
 carrick-fatal.workspace = true
 carrick-abi = { path = "../carrick-abi" }

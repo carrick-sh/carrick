@@ -21,19 +21,20 @@
 //! F4's counted host crossing and owned continuation; until then they are
 //! refused with `Unsupported` rather than served by a second implementation.
 //!
-//! [`OpenLifetime`]: carrick_el1_abi::OpenLifetime
+//! [`OpenLifetime`]: carrick_core_abi::OpenLifetime
 use super::file::{self, FileDataEvent, FileError, StoreAt, TryInstanceLock};
 use super::file_notification::FileAccess;
 use carrick_core::file::{
     FileAttributes, FileKind, FileOperation, FilePin, FilePinKey, FileRoot, FileService, IoError,
     NamePath, OpenOutcome, OpenRequest, WriteAt,
 };
+use carrick_core_abi::{OpenReferenceKey, OpenReferenceWork, OpenRelease};
 use carrick_el1_abi::{
     AdmittedOpenReference, DELEGATED_FILE_MAX_SIZE, DELEGATED_FLAG_APPEND, DELEGATED_FLAG_READABLE,
     DELEGATED_FLAG_WRITABLE, DelegatedFile, DelegatedInotify, DelegatedOpenFile, EL1_CACHE_OFFSET,
     EL1_INOTIFY_TABLE_OFFSET, EL1_OBJECT_TABLE_OFFSET, EL1_OPEN_FILE_TABLE_OFFSET, EL1_ZONE_OFFSET,
-    MAX_DELEGATED_FILES, MAX_DELEGATED_INOTIFY, MAX_ZONE_OPEN_FILES, OpenReferenceKey,
-    OpenReferenceWork, OpenRelease, SlotId, ZoneTables, queue_open_release,
+    MAX_DELEGATED_FILES, MAX_DELEGATED_INOTIFY, MAX_ZONE_OPEN_FILES, SlotId, ZoneTables,
+    queue_open_release,
 };
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -54,7 +55,7 @@ pub trait ZoneFileVenue {
     fn terminal_queued(&self, key: OpenReferenceKey);
 
     /// Observe one open-record lookup and any [`OpenReferenceWork`] CAS
-    /// attempts on its [`OpenLifetime`](carrick_el1_abi::OpenLifetime). Default no-op in production.
+    /// attempts on its [`OpenLifetime`](carrick_core_abi::OpenLifetime). Default no-op in production.
     fn observe_record(&self, _handle: u32, _work: OpenReferenceWork) {}
 }
 
