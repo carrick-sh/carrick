@@ -76,6 +76,9 @@ pub fn run(args: SupervisorArgs) -> Result<i32, HostLeaseError> {
         crate::host_lease::ScopeIdentity::writer(&writer).map_err(HostLeaseError::ChildWait)?;
     let lease =
         HostLease::acquire_supervised(args.mode, identity, |delay| events.wait_owner(delay))?;
+    if let Some(fd) = lease.connection_fd() {
+        events.watch_lease(fd).map_err(HostLeaseError::ChildWait)?;
+    }
     if args.check_load {
         crate::host_load::check()?;
     }
@@ -136,7 +139,8 @@ pub fn run(args: SupervisorArgs) -> Result<i32, HostLeaseError> {
         #[cfg(target_os = "macos")]
         cancelled: std::collections::BTreeMap::new(),
     };
-    let supervision = supervise_worker(&mut events, workload.child.id() as libc::pid_t);
+    let supervision = supervise_worker(&mut events, workload.child.id() as libc::pid_t)
+        .and_then(|()| lease.check_connection());
 
     // On owner death AND normal command exit, terminate remaining run-scoped
     // descendants. Retain exclusion across this whole operation and EOF.
@@ -145,7 +149,9 @@ pub fn run(args: SupervisorArgs) -> Result<i32, HostLeaseError> {
     let status = complete_cleanup("reap worker", || cleanup.wait_child(&mut workload.child))?;
     workload.reaped = true;
     #[cfg(target_os = "linux")]
-    complete_cleanup("reap descendants", || reap_descendants(&mut cleanup))?;
+    complete_cleanup("reap descendants", || {
+        reap_descendants_except(&mut cleanup, lease.connection_pid())
+    })?;
     let mut bytes = [0; 256];
     complete_cleanup("workload lifetime EOF", || {
         loop {
@@ -165,6 +171,9 @@ pub fn run(args: SupervisorArgs) -> Result<i32, HostLeaseError> {
     #[cfg(target_os = "macos")]
     complete_cleanup("reap guardian", || guardian.finish(&mut cleanup))?;
     supervision.map_err(HostLeaseError::ChildWait)?;
+    lease
+        .check_connection()
+        .map_err(HostLeaseError::ChildWait)?;
     drop(lease);
     Ok(extract_exit_code(&status))
 }
@@ -586,15 +595,27 @@ impl Drop for Workload {
 }
 
 #[cfg(target_os = "linux")]
-fn reap_descendants(cleanup: &mut Cleanup) -> io::Result<()> {
-    reap_descendants_with(cleanup, || {
+fn reap_descendants_except(
+    cleanup: &mut Cleanup,
+    custodian: Option<libc::pid_t>,
+) -> io::Result<()> {
+    reap_descendants_with_custodian(cleanup, custodian, || {
         std::fs::read_to_string("/proc/thread-self/children")
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn reap_descendants_with(
     cleanup: &mut Cleanup,
+    mut read_children: impl FnMut() -> io::Result<String>,
+) -> io::Result<()> {
+    reap_descendants_with_custodian(cleanup, None, &mut read_children)
+}
+
+#[cfg(target_os = "linux")]
+fn reap_descendants_with_custodian(
+    cleanup: &mut Cleanup,
+    custodian: Option<libc::pid_t>,
     mut read_children: impl FnMut() -> io::Result<String>,
 ) -> io::Result<()> {
     loop {
@@ -602,14 +623,21 @@ fn reap_descendants_with(
         // Optional cancellation optimisation only. Procfs may be absent, lack
         // CONFIG_PROC_CHILDREN, or belong to an ancestor PID namespace.
         if let Ok(children) = read_children() {
+            let mut only_custodian = custodian.is_some();
+            let mut reaped_children = false;
             for pid in children.split_whitespace() {
                 cleanup.deadline.remaining()?;
                 let pid: libc::pid_t = pid
                     .parse()
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                if Some(pid) == custodian {
+                    continue;
+                }
+                only_custodian = false;
                 // A waitable adopted child pins the PID until we reap it.
                 let reaped = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
                 if reaped == pid {
+                    reaped_children = true;
                     continue;
                 }
                 if reaped < 0 {
@@ -632,6 +660,15 @@ fn reap_descendants_with(
                         _ => return Err(error),
                     }
                 }
+            }
+            // SSH is custody, not workload. With no other children, adoption
+            // and reaping have closed the workload population. Without procfs,
+            // a remote lease fails the bounded cleanup rather than unlocking.
+            if only_custodian {
+                return Ok(());
+            }
+            if custodian.is_some() && reaped_children {
+                continue;
             }
         }
         // POSIX subreaper wait is release authority, independent of procfs.
@@ -661,6 +698,7 @@ struct ExitEvents {
     owner: OwnedFd,
     worker: Option<OwnedFd>,
     cancellation: CancellationSignals,
+    lease: Option<libc::c_int>,
 }
 
 #[cfg(target_os = "linux")]
@@ -673,10 +711,15 @@ impl ExitEvents {
             owner: Self::pidfd(owner)?,
             worker: None,
             cancellation: CancellationSignals::new()?,
+            lease: None,
         })
     }
     fn watch_worker(&mut self, worker: libc::pid_t) -> io::Result<()> {
         self.worker = Some(Self::pidfd(worker)?);
+        Ok(())
+    }
+    fn watch_lease(&mut self, fd: libc::c_int) -> io::Result<()> {
+        self.lease = Some(fd);
         Ok(())
     }
     fn owner_dead(&mut self) -> io::Result<bool> {
@@ -702,6 +745,13 @@ impl ExitEvents {
         if let Some(worker) = &self.worker {
             events.push(libc::pollfd {
                 fd: worker.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
+        if let Some(fd) = self.lease {
+            events.push(libc::pollfd {
+                fd,
                 events: libc::POLLIN,
                 revents: 0,
             });
@@ -799,6 +849,27 @@ impl ExitEvents {
     }
     fn watch_worker(&mut self, worker: libc::pid_t) -> io::Result<()> {
         self.watch(worker)
+    }
+    fn watch_lease(&mut self, fd: libc::c_int) -> io::Result<()> {
+        // SAFETY: lease custody keeps this descriptor open until cleanup ends.
+        let mut event = unsafe { std::mem::zeroed::<libc::kevent>() };
+        event.ident = fd as _;
+        event.filter = libc::EVFILT_READ;
+        event.flags = libc::EV_ADD | libc::EV_ENABLE;
+        if unsafe {
+            libc::kevent(
+                self.queue.as_raw_fd(),
+                &event,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
     fn owner_dead(&mut self) -> io::Result<bool> {
         self.poll(Some(std::time::Duration::ZERO))
