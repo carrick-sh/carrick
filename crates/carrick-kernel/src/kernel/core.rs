@@ -535,6 +535,7 @@ pub struct Kernel {
     object_ids: Arc<ObjectIdRegistry>,
     boot_launch: Mutex<super::boot_launch::BootLaunchAuthority>,
     frame_inventory: Arc<FrameInventoryAuthority>,
+    physical_frame_inventory: Arc<super::frame_inventory::PhysicalInventoryProjection>,
     shared_futex: carrick_thread::platform_futex::SharedFutexTable,
     fd_ceiling: Arc<super::FdCeilingAuthority>,
     hvpatch_child_token_issuer: Arc<carrick_hal::HvpatchChildTokenIssuer>,
@@ -1509,15 +1510,20 @@ impl Kernel {
         );
         let (hvpatch_child_token_issuer, hvpatch_child_token_verifier) =
             carrick_hal::HvpatchChildTokenIssuer::new_pair();
+        let object_ids = Arc::new(object_ids);
+        let frame_inventory = Arc::new(FrameInventoryAuthority::new());
+        let physical_frame_inventory =
+            frame_inventory.new_physical_projection(Arc::clone(&object_ids));
         let kernel = Arc::new(Self {
             population_origin: bootstrap.population_origin,
             domain: Arc::new(KernelDomain),
             host_signal: bootstrap.host_signal,
             registry,
             ids,
-            object_ids: Arc::new(object_ids),
+            object_ids,
             boot_launch: Mutex::default(),
-            frame_inventory: Arc::new(FrameInventoryAuthority::new()),
+            frame_inventory,
+            physical_frame_inventory,
             shared_futex: bootstrap.shared_futex,
             fd_ceiling,
             ipc: Mutex::new(None),
@@ -2402,8 +2408,7 @@ impl Kernel {
 
     /// Project this carrier's sole physical inventory and ID source.
     pub fn physical_frame_inventory(&self) -> Arc<dyn carrick_hal::PhysicalFrameInventory> {
-        self.frame_inventory
-            .physical_projection(Arc::clone(&self.object_ids))
+        Arc::clone(&self.physical_frame_inventory) as Arc<dyn carrick_hal::PhysicalFrameInventory>
     }
 
     #[allow(dead_code)] // consumed by the HVPatch carrier-directory publication slice

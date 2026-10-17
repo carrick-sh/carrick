@@ -49,7 +49,10 @@ impl ForkStockHostCustody {
         let fail = |message: &str| TrapError::Hypervisor(message.into());
         let pool = custody.root_slot_pool();
         let mut stock = custody.fork_stock.lock();
-        if stock.backing.is_some() {
+        if let Some(existing) = stock.backing.as_ref() {
+            if existing.resources.matches(&resources) {
+                return Ok(());
+            }
             return Err(fail("native fork stock already installed"));
         }
         let mut arenas = Vec::new();

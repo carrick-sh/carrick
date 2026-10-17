@@ -908,13 +908,30 @@ impl MmResources {
         crate::probes::hvpatch_mm_lease_relation(event);
     }
 
+    #[cfg(test)]
     pub(crate) fn new_root(
         stage1_root: u64,
         asids: AsidAllocator,
     ) -> Result<(Self, Arc<Stage1MmBackend>), MmResourcesError> {
         let (mm_pool, root_mm) = Stage1MmPool::with_allocator(stage1_root, asids)?;
+        Ok(Self::from_root(mm_pool, root_mm))
+    }
+
+    pub(crate) fn new_carrier_root(
+        carrier: &crate::carrier::CarrierRuntime,
+        stage1_root: u64,
+        asids: AsidAllocator,
+    ) -> Result<(Self, Arc<Stage1MmBackend>), MmResourcesError> {
+        let (mm_pool, root_mm) = carrier.allocate_stage1_root(stage1_root, asids)?;
+        Ok(Self::from_root(mm_pool, root_mm))
+    }
+
+    fn from_root(
+        mm_pool: Stage1MmPool,
+        root_mm: Arc<Stage1MmLease>,
+    ) -> (Self, Arc<Stage1MmBackend>) {
         let backend = root_mm.backend();
-        Ok((
+        (
             Self {
                 state: Mutex::new(MmResourceState::default()),
                 exec_reservation_settled: Condvar::new(),
@@ -923,7 +940,7 @@ impl MmResources {
                 next_exec_reservation: AtomicU64::new(1),
             },
             backend,
-        ))
+        )
     }
 
     pub(crate) fn reserve_native_fork_tables(
@@ -931,6 +948,17 @@ impl MmResources {
         count: usize,
     ) -> Result<Arc<super::stage1_mm::NativeForkTableReservation>, MmResourcesError> {
         Ok(self.mm_pool.reserve_native_fork_tables(count)?)
+    }
+
+    pub(crate) fn native_fork_stock_resources(
+        &self,
+        kernel: &carrick_kernel::kernel::Kernel,
+        count: usize,
+    ) -> Result<carrick_hal::fork_stock::NativeForkStockResources, MmResourcesError> {
+        Ok(carrick_hal::fork_stock::NativeForkStockResources {
+            tables: self.reserve_native_fork_tables(count)?,
+            inventory: kernel.physical_frame_inventory(),
+        })
     }
 
     pub(crate) fn publish_root(&self, root: TaskKey) -> Result<(), MmResourcesError> {
