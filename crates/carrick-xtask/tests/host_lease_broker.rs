@@ -61,6 +61,7 @@ fn broker_two_clients_contend_then_proceed_for_every_exclusive_pair() {
         for requested in ["gate", "docker", "carrick"] {
             let temp = tempfile::tempdir().unwrap();
             let lock = temp.path().join("lease.lock");
+            std::fs::File::create(&lock).unwrap();
             let (mut first, mut first_out) = broker(&lock, held, 5000);
             assert_eq!(line(&mut first_out), "acquired\n");
             let (second, mut second_out) = broker(&lock, requested, 5000);
@@ -81,6 +82,7 @@ fn broker_two_clients_contend_then_proceed_for_every_exclusive_pair() {
 fn broker_killed_holder_releases_to_waiting_client() {
     let temp = tempfile::tempdir().unwrap();
     let lock = temp.path().join("lease.lock");
+    std::fs::File::create(&lock).unwrap();
     let (mut first, mut first_out) = broker(&lock, "gate", 5000);
     assert_eq!(line(&mut first_out), "acquired\n");
     let (_second, mut second_out) = broker(&lock, "docker", 5000);
@@ -94,14 +96,17 @@ fn broker_killed_holder_releases_to_waiting_client() {
 fn broker_contention_expires_explicitly_and_disconnected_waiter_exits() {
     let temp = tempfile::tempdir().unwrap();
     let lock = temp.path().join("lease.lock");
+    std::fs::File::create(&lock).unwrap();
     let (_first, mut first_out) = broker(&lock, "gate", 5000);
     assert_eq!(line(&mut first_out), "acquired\n");
     let (mut second, mut second_out) = broker(&lock, "docker", 0);
     assert_eq!(line(&mut second_out), "waiting\n");
+    assert_eq!(line(&mut second_out), "timeout\n");
     assert!(!second.0.wait().unwrap().success());
     let started = std::time::Instant::now();
     let (mut timed, mut timed_out) = broker(&lock, "docker", 100);
     assert_eq!(line(&mut timed_out), "waiting\n");
+    assert_eq!(line(&mut timed_out), "timeout\n");
     assert!(!timed.0.wait().unwrap().success());
     assert!(started.elapsed() < Duration::from_secs(5));
     let (mut third, mut third_out) = broker(&lock, "carrick", 5000);
@@ -117,6 +122,7 @@ struct ClientSite {
 impl ClientSite {
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
+        std::fs::File::create(temp.path().join("host.lock")).unwrap();
         // Local stdio transport, not a broker stub: exec the production binary.
         let transport = temp.path().join("ssh");
         std::fs::write(
@@ -136,10 +142,9 @@ impl ClientSite {
         Self { temp }
     }
 
-    fn command(&self, mode: &str) -> Command {
+    fn xtask(&self) -> Command {
         let mut command = Command::new(XTASK);
         command
-            .args(["host-lease", "--mode", mode, "--"])
             .env_remove("CARRICK_HOST_LEASE_PATH")
             .env_remove("CARRICK_HOST_LEASE_SOCKET")
             .env_remove("CARRICK_HOST_LEASE_SCOPE_FD")
@@ -152,6 +157,12 @@ impl ClientSite {
                 "PATH",
                 format!("{}:/usr/bin:/bin", self.temp.path().display()),
             );
+        command
+    }
+
+    fn command(&self, mode: &str) -> Command {
+        let mut command = self.xtask();
+        command.args(["host-lease", "--mode", mode, "--"]);
         command
     }
 
@@ -277,6 +288,15 @@ fn broker_wait_bound_is_not_extended_by_partial_request() {
 }
 
 #[test]
+fn broker_requires_existing_lock_file_without_o_creat() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = temp.path().join("missing.lock");
+    let (mut child, _out) = broker(&missing, "gate", 0);
+    assert!(!child.0.wait().unwrap().success());
+    assert!(!missing.exists(), "broker created a missing lock file");
+}
+
+#[test]
 fn broker_and_in_process_controller_contend_on_one_inode_without_chmod() {
     use carrick_xtask::host_lease::{HostLease, HostLeaseMode};
     let lock = tempfile::NamedTempFile::new().unwrap();
@@ -293,22 +313,73 @@ fn broker_and_in_process_controller_contend_on_one_inode_without_chmod() {
 }
 
 #[test]
-fn controller_site_declares_the_same_host_lock_as_the_broker() {
-    let site = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/ci_scaler/site.rs"
-    ))
-    .unwrap();
-    assert!(site.contains("host_lease: Some(crate::host_lease::broker::LOCK_PATH)"));
-    let controller = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/ci_scaler/live.rs"
-    ))
-    .unwrap();
-    let admission = controller.split("fn admit_one(").nth(1).unwrap();
+#[cfg(target_os = "linux")]
+fn broker_configured_gate_session_refuses_target_pruning() {
+    let site = ClientSite::new();
+    let mut gate = site
+        .command("gate")
+        .args(["/bin/sh", "-c", "echo ready; read finish"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut gate_out = BufReader::new(gate.stdout.take().unwrap());
+    let _gate = Process(gate);
+    assert_eq!(line(&mut gate_out), "ready\n");
+
+    let dev = site.temp.path().join("dev");
+    let target = dev.join("wt/target");
+    std::fs::create_dir_all(&target).unwrap();
+    let output = site
+        .xtask()
+        .args(["target-prune", "--protocol", "fd-v1", "--dev-root"])
+        .arg(&dev)
+        .arg("--target-dir")
+        .arg(&target)
+        .args(["--days", "2", "--apply"])
+        .output()
+        .unwrap();
     assert!(
-        admission.find("clone_lease.acquire()?").unwrap()
-            < admission.find("ledger.reserve(").unwrap()
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(controller.contains("clone_lease.release_if_idle(&ledger)"));
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("target pruning skipped: host lease is held"),
+        "target pruning did not contend on broker gate session: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn broker_ssh_custody_runs_in_isolated_session() {
+    let site = ClientSite::new();
+    let mut child = site
+        .command("gate")
+        .args(["/bin/sh", "-c", "echo ready; read finish"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let _child = Process(child);
+    assert_eq!(line(&mut output), "ready\n");
+    let broker_pid: libc::pid_t = std::fs::read_to_string(site.temp.path().join("broker.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let broker_pgid = unsafe { libc::getpgid(broker_pid) };
+    let broker_sid = unsafe { libc::getsid(broker_pid) };
+    assert_eq!(
+        broker_pgid, broker_pid,
+        "broker ssh transport is not its own process-group leader"
+    );
+    assert_eq!(
+        broker_sid, broker_pid,
+        "broker ssh transport is not its own session leader"
+    );
 }

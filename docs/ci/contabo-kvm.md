@@ -133,13 +133,14 @@ broker, its binary, keys or lock file. The four workers remain CCD-pinned;
 there is no dedicated quiet CCD (#564 owner decision).
 
 `just lease carrick` shares the physical lock; `gate` and `docker` exclude all
-other leases. The broker holds a real flock on
-`/run/carrick/host-lease.lock` for the SSH session lifetime. Requests are bounded
-JSON on stdin (`mode`, `wait_ms`); stdout is only `waiting` then `acquired`, or
-just `acquired` when uncontended. Invalid requests, excess waits, timeouts and
-transport failures exit nonzero, never skip or use a local fallback. One
-`HOST_LEASE_WAIT_LIMIT` (one hour) bounds admission, including the client's
-transport startup. The broker's initial request deadline is five seconds.
+other leases. The broker holds a real flock on an existing regular file at
+`/run/carrick/host-lease.lock` (never `O_CREAT`) for the SSH session lifetime.
+Requests are bounded JSON on stdin (`mode`, `wait_ms`); stdout is `waiting` then
+`acquired` (or `waiting` then `timeout` on wait expiry), or just `acquired` when
+uncontended. Invalid requests, excess waits, timeouts and transport failures
+exit nonzero, never skip or use a local fallback. One `HOST_LEASE_WAIT_LIMIT`
+(one hour) bounds admission; the broker's initial request and client transport
+validation deadlines are five seconds.
 
 ### Host installation (root on carrick-ctb)
 
@@ -159,9 +160,10 @@ transport startup. The broker's initial request deadline is five seconds.
 
    Run `systemd-tmpfiles --create /etc/tmpfiles.d/carrick-host-lease.conf`.
    The directory is not writable by the broker account: it cannot replace the
-   lock inode. The broker does not chmod an existing lock. **Never unlink or
-   replace a live lock**; tmpfiles `f` preserves it. The root controller opens
-   this exact path directly, independent of VM client configuration.
+   lock inode. The broker requires an existing regular file and does not create
+   or chmod the lock. **Never unlink or replace a live lock**; tmpfiles `f`
+   preserves it. The root controller opens this exact path directly, independent
+   of VM client configuration.
 3. Generate a separate Ed25519 key **on each worker/oracle**, not on a CI clone,
    with no passphrase for unattended gates. Transfer only the public keys to
    the host. Keep each private key readable only by the VM's gate user
@@ -198,12 +200,15 @@ transport startup. The broker's initial request deadline is five seconds.
    source or authentication mechanism admits this account. Keep the current
    administration connection open. No worker applies these changes.
 5. Deploy the updated standing-controller binary and restart it only after
-   draining its active clones. It acquires `gate` before reservation/clone POST,
-   retains it through boot, execution, recovery and teardown, and releases only
-   once every ledger row is destroyed. An idle controller holds no lease.
-   Contention uses the same one-hour limit and stops the controller explicitly.
-   Willow's admission is unchanged. Resource and trusted-ref checks still run;
-   a job is re-vetted after waiting for the lock.
+   draining its active clones. After trusted-ref and resource admission checks
+   pass, it acquires `gate` immediately before `ledger.reserve`, retains it
+   through clone POST, boot, execution, recovery and teardown, and releases on
+   any non-reserving path or once every ledger row is destroyed. An idle
+   controller holds no lease. Active-ledger recovery uses a zero-wait try: if
+   contended, it refuses new admission, reconciles immediately to reap/quarantine
+   surviving clones without booting unstarted ones, and retries on the next pass.
+   Lease contention backs off without terminating the standing controller.
+   Willow's admission is unchanged.
 
 ### VM client installation (owner/director)
 
@@ -214,7 +219,8 @@ fingerprint through the existing trusted administration channel, never trust
 an unauthenticated `ssh-keyscan` alone. All three files and their directory
 must be protected from unrelated users. The client disables ambient SSH
 configuration, multiplexing, agent use and forwarding, and requires the pinned
-host key. It uses the existing `just lease` and acceptance entry points.
+host key. It uses the existing `just lease`, `accept`, `impact`, `fixtures
+restore`/`prepare`, and `target-prune` (`try_exclusive`) entry points.
 Build commands needing isolation must also run under `just lease carrick`.
 The lease is cooperative: unwrapped builds are not stopped by flock.
 
@@ -235,12 +241,17 @@ and reuse one SSH session. A `gate` may contain either mode without downgrading;
 ### Failure model and qualification
 
 EOF or a killed broker/SSH connection releases flock. During contention the
-broker observes stdin closure rather than waiting out the hour. Lost client
-connections cancel supervised work and report a failed run; SSH keepalives
-bound detection of dead peers. This is not a partition-proof fencing service:
-the remote lock may release before cancellation finishes, and a controller
-crash releases its in-process lease while a clone could still be running.
-Drain/reconcile surviving clones before admitting manual gates after a
+broker observes stdin closure rather than waiting out the hour. The supervisor
+spawns `ssh` in its own session (`setsid`) so group-directed signals to the
+supervisor's process group do not drop broker custody before the five-second
+workload cleanup completes. Lost client connections cancel supervised work and
+report a failed run; the client's keepalive window (`ServerAliveInterval=2`,
+`ServerAliveCountMax=3` = 6 s) is strictly shorter than the server's
+(`ClientAliveInterval 5`, `ClientAliveCountMax 3` = 15 s) minus the five-second
+cleanup limit (`6 s < 15 s - 5 s = 10 s`). This is not a partition-proof fencing
+service: the remote lock may release before cancellation finishes, and a
+controller crash releases its in-process lease while a clone could still be
+running. Drain/reconcile surviving clones before admitting manual gates after a
 controller failure. Do not claim crash-proof quietness or adversarial isolation.
 Remote supervised cleanup on Linux requires procfs child enumeration to exclude
 the custody SSH process from workload cancellation; unavailable enumeration

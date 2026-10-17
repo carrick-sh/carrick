@@ -354,19 +354,26 @@ where
     };
     if std::env::var_os("CARRICK_HOST_LEASE_SOCKET").is_none() {
         let mode = match &cli.command {
-            Commands::Accept(_) => Some(crate::host_lease::HostLeaseMode::Gate),
+            Commands::Accept(_) => Some((crate::host_lease::HostLeaseMode::Gate, true)),
+            Commands::Fixtures(args) => match &args.action {
+                crate::fixtures::FixturesAction::Restore { .. }
+                | crate::fixtures::FixturesAction::Prepare { .. } => {
+                    Some((crate::host_lease::HostLeaseMode::Gate, false))
+                }
+                _ => None,
+            },
             Commands::Impact(args) => match &args.action {
                 crate::impact::Action::Carrick { .. } => {
-                    Some(crate::host_lease::HostLeaseMode::Carrick)
+                    Some((crate::host_lease::HostLeaseMode::Carrick, true))
                 }
                 crate::impact::Action::Docker { .. } => {
-                    Some(crate::host_lease::HostLeaseMode::Docker)
+                    Some((crate::host_lease::HostLeaseMode::Docker, true))
                 }
                 _ => None,
             },
             _ => None,
         };
-        if let Some(mode) = mode {
+        if let Some((mode, check_load)) = mode {
             let mut command = vec![
                 std::env::current_exe()
                     .map_err(|source| CliError::Io {
@@ -376,7 +383,7 @@ where
                     .into_os_string(),
             ];
             command.extend(argv.into_iter().skip(1));
-            let code = crate::host_lease::run_command(mode, true, &command)?;
+            let code = crate::host_lease::run_command(mode, check_load, &command)?;
             std::process::exit(code);
         }
     }

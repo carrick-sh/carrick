@@ -81,7 +81,7 @@ impl Config {
             "-o",
             "ConnectTimeout=10",
             "-o",
-            "ServerAliveInterval=5",
+            "ServerAliveInterval=2",
             "-o",
             "ServerAliveCountMax=3",
             "-i",
@@ -91,6 +91,18 @@ impl Config {
             self.known_hosts_file.display()
         ));
         command.arg(&self.broker);
+        // Isolate SSH custody in its own session so group-directed signals to
+        // the supervisor's process group cannot drop broker custody before
+        // workload cancellation and reaping complete.
+        // SAFETY: setsid is async-signal-safe before exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         command
     }
 }
@@ -212,10 +224,16 @@ pub fn run(args: BrokerArgs) -> Result<(), HostLeaseError> {
             }
             ready(input.as_raw_fd(), delay)
         });
-        // Zero-wait contention still acknowledges that it reached the lock.
-        if matches!(lease, Err(HostLeaseError::Timeout { .. })) && !waiting {
+        // Zero-wait contention still acknowledges that it reached the lock
+        // and reports wait expiry explicitly before closing.
+        if matches!(lease, Err(HostLeaseError::Timeout { .. })) {
+            if !waiting {
+                output
+                    .write_all(b"waiting\n")
+                    .map_err(HostLeaseError::ChildWait)?;
+            }
             output
-                .write_all(b"waiting\n")
+                .write_all(b"timeout\n")
                 .map_err(HostLeaseError::ChildWait)?;
             output.flush().map_err(HostLeaseError::ChildWait)?;
         }
@@ -240,61 +258,92 @@ pub(super) struct Session {
     child: Child,
     input: Option<ChildStdin>,
     output: ChildStdout,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    reaped: AtomicBool,
 }
 
 impl Session {
     pub(super) fn connect(
         config: &Config,
         mode: HostLeaseMode,
+        limit: Duration,
         mut wait: impl FnMut(Duration) -> io::Result<bool>,
-    ) -> io::Result<Self> {
+    ) -> Result<Self, HostLeaseError> {
         let mut child = config
             .command()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .spawn()?;
+            .spawn()
+            .map_err(HostLeaseError::ChildWait)?;
         let input = child
             .stdin
             .take()
-            .ok_or_else(|| io::Error::other("broker stdin"))?;
+            .ok_or_else(|| HostLeaseError::ChildWait(io::Error::other("broker stdin")))?;
         let output = child
             .stdout
             .take()
-            .ok_or_else(|| io::Error::other("broker stdout"))?;
+            .ok_or_else(|| HostLeaseError::ChildWait(io::Error::other("broker stdout")))?;
         let mut session = Self {
             child,
             input: Some(input),
             output,
+            reaped: AtomicBool::new(false),
         };
         let mut request = serde_json::to_vec(&Request {
             mode,
-            wait_ms: HOST_LEASE_WAIT_LIMIT.as_millis() as u64,
-        })?;
+            wait_ms: limit.as_millis().min(u64::MAX as u128) as u64,
+        })
+        .map_err(|e| HostLeaseError::ChildWait(io::Error::other(e)))?;
         request.push(b'\n');
         session
             .input
             .as_mut()
-            .ok_or_else(|| io::Error::other("broker stdin"))?
-            .write_all(&request)?;
-        let start = Instant::now();
+            .ok_or_else(|| HostLeaseError::ChildWait(io::Error::other("broker stdin")))?
+            .write_all(&request)
+            .map_err(HostLeaseError::ChildWait)?;
+        let mut waiting_since: Option<Instant> = None;
         loop {
-            let reply = read_line(
-                &mut session.output,
-                HOST_LEASE_WAIT_LIMIT.saturating_sub(start.elapsed()),
-                &mut wait,
-            )?;
+            let reply_limit = match waiting_since {
+                Some(start) => limit
+                    .saturating_sub(start.elapsed())
+                    .saturating_add(VALIDATION_LIMIT),
+                None => VALIDATION_LIMIT,
+            };
+            let reply = match read_line(&mut session.output, reply_limit, &mut wait) {
+                Ok(reply) => reply,
+                Err(error)
+                    if error.kind() == io::ErrorKind::TimedOut && waiting_since.is_some() =>
+                {
+                    return Err(HostLeaseError::Timeout {
+                        path: PathBuf::from(&config.broker),
+                        mode,
+                        limit,
+                    });
+                }
+                Err(error) => return Err(HostLeaseError::ChildWait(error)),
+            };
             match reply.as_slice() {
                 b"acquired" => break,
-                b"waiting" => eprintln!(
-                    "host-lease: waiting for {mode} at {} (HOST_LEASE_WAIT_LIMIT: {HOST_LEASE_WAIT_LIMIT:?})",
-                    config.broker
-                ),
+                b"waiting" => {
+                    waiting_since.get_or_insert_with(Instant::now);
+                    eprintln!(
+                        "host-lease: waiting for {mode} at {} (HOST_LEASE_WAIT_LIMIT: {limit:?})",
+                        config.broker
+                    );
+                }
+                b"timeout" => {
+                    return Err(HostLeaseError::Timeout {
+                        path: PathBuf::from(&config.broker),
+                        mode,
+                        limit,
+                    });
+                }
                 _ => {
-                    return Err(io::Error::new(
+                    return Err(HostLeaseError::ChildWait(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "invalid broker reply",
-                    ));
+                    )));
                 }
             }
         }
@@ -307,8 +356,8 @@ impl Session {
     }
 
     #[cfg(target_os = "linux")]
-    pub(super) fn pid(&self) -> libc::pid_t {
-        self.child.id() as libc::pid_t
+    pub(super) fn custody(&self) -> (libc::pid_t, &AtomicBool) {
+        (self.child.id() as libc::pid_t, &self.reaped)
     }
 
     pub(super) fn check(&self) -> io::Result<()> {
@@ -325,8 +374,10 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         drop(self.input.take());
-        // Do not leave a multiplexed/background SSH connection holding custody.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if !self.reaped.load(Ordering::Acquire) {
+            // Do not leave a multiplexed/background SSH connection holding custody.
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 }
