@@ -529,11 +529,14 @@ impl SignalReadinessProbe {
             // readiness sample may wake the continuation, but importing it
             // into a carrier ReservedSignal would create a second consumer
             // and leave the native producer with no event to publish.
-            let persistent = SigSet::from_raw(context.thread().control_slot().blocked().0);
+            let slot = context.thread().control_slot();
+            let persistent = SigSet::from_raw(slot.blocked().0);
+            let non_interrupting = SigSet::from_raw(slot.non_interrupting().0);
             let blocked = match self.temporary.unwrap_or(WaitSigMask::NONE) {
                 WaitSigMask::Additive(extra) => persistent.union(extra),
                 WaitSigMask::Replace(mask) => mask,
-            };
+            }
+            .union(non_interrupting);
             let blocked = if self.family.is_kill_only_wait() {
                 SigSet::EMPTY
                     .complement()

@@ -1034,6 +1034,9 @@ impl<'a> SignalView<'a> {
         sig_mask: carrick_abi::WaitSigMask,
     ) -> bool {
         use carrick_abi::WaitSigMask;
+        if context.thread().control_slot().native_signal_owner() {
+            return false;
+        }
         if !Self::signal_dispatch_pending_possible(context, tid) {
             return false;
         }

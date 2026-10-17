@@ -1046,7 +1046,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             for (key, record, visible_tid) in &completed {
                 if let Some(tid) = visible_tid {
                     row.remove_thread(*tid);
+                    if let Ok(tid) = i32::try_from(*tid) {
+                        carrick_signal_core::wait::clear_non_interrupting_for(tid);
+                    }
                 }
+                carrick_signal_core::wait::clear_non_interrupting_for(key.task.id().raw());
                 row.native_mut().resources_mut().members.retain(|member| {
                     member.record != *record && member.thread.id() != key.task.id()
                 });
@@ -1509,7 +1513,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         let Ok(row) = graph.owner.task(member.process) else {
             return true;
         };
-        if graph.suspend_masks.contains_key(&record) {
+        if graph.suspend_masks.contains_key(&record) || member.control.forwarded_wait_mask_armed() {
             return true;
         }
         let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
@@ -1548,14 +1552,26 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         // A process-directed event may outlive the polling thread or an
         // execve MM replacement. Authenticate the observed execution identity
         // and the durable process birth serial in their respective domains,
-        // then choose a surviving member of that exact process. The original
-        // thread record is only an observation, never the target owner.
+        // then choose a surviving member of that exact process. When the
+        // observing thread is still a live member of this process and does
+        // not block the signal, honour its wait-interruption claim first.
         let target = event.process_target()?;
         if !event.identity().issued()
             || !event.identity().matches(event.binding())
             || !event.binding().issued()
         {
             return None;
+        }
+        if let Some(member) = Self::external_member(state, zone, event)
+            && member.process.id.raw() as u64 == target.id().raw()
+            && member.process.serial == target.birth().task_serial()
+        {
+            let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                carrick_signal_core::SignalSet::from_bits(member.control.blocked().0),
+            );
+            if !blocked.contains(event.signal()) {
+                return Some(member);
+            }
         }
         let carrier = core::ptr::from_ref(zone).addr();
         let (_, keys) = state
@@ -1615,6 +1631,8 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         let Some(member) = Self::external_event_member(&state, zone, event) else {
             return Ok(false);
         };
+        let claimed_by_member = Self::external_member(&state, zone, event)
+            .is_some_and(|claimed| claimed.record == member.record);
         let graph = member.runtime.graph.lock();
         let Ok(row) = graph.owner.task(member.process) else {
             return Ok(false);
@@ -1642,19 +1660,24 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             carrick_el1_abi::ExternalSignalSource::Terminal
             | carrick_el1_abi::ExternalSignalSource::HostFault => None,
         };
+        let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+            carrick_signal_core::SignalSet::from_bits(member.control.blocked().0),
+        );
+        let action = signals.action(event.signal());
+        let reserve_for_claimed_member = claimed_by_member
+            && !blocked.contains(event.signal())
+            && carrick_signal_core::policy::action_interrupts_wait(event.signal(), action);
         match event.scope() {
-            carrick_el1_abi::ExternalSignalScope::Process => {
+            carrick_el1_abi::ExternalSignalScope::Process if !reserve_for_claimed_member => {
                 signals
                     .enqueue(member.process, event.signal(), info)
                     .map_err(|_| NativeProcessError::Stale)?;
             }
-            carrick_el1_abi::ExternalSignalScope::Thread => {
+            carrick_el1_abi::ExternalSignalScope::Process
+            | carrick_el1_abi::ExternalSignalScope::Thread => {
                 signals.enqueue_thread(member.record, event.signal(), info);
             }
         }
-        let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
-            carrick_signal_core::SignalSet::from_bits(member.control.blocked().0),
-        );
         let interrupt = signals.has_deliverable(member.record, blocked);
         let ipc_channel = if interrupt {
             match graph.pending.get(&member.process) {
@@ -1953,6 +1976,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
                     expected_host: host_identity,
                 });
             }
+            row.native().resources().sync_non_interrupting_signals();
             graph.pending_exit.contains_key(&process)
         };
         state.members.insert(
@@ -2160,6 +2184,7 @@ pub struct NativeRecordBinding<M, C: ProcessContext> {
 fn custody<'a, M: Clone, C: ProcessContext>(
     resources: NativeResources<'a, M, C>,
 ) -> Custody<'a, M, C> {
+    resources.sync_non_interrupting_signals();
     let mut custody = RetainedProcessCustody::new(resources);
     let channel = Arc::new(WaitChannel {
         generation: custody.wake(),
@@ -2184,6 +2209,28 @@ impl<M, C: ProcessContext> NativeResources<'_, M, C> {
         &mut self,
     ) -> &mut NativeProcessSignals<carrick_personality_linux::abi::signal::LinuxSiginfo> {
         &mut self.signals
+    }
+    pub fn sync_non_interrupting_signals(&self) {
+        let non_interrupting = self.signals.non_interrupting_signals();
+        let mask = carrick_el1_abi::BlockedMask(non_interrupting.bits());
+        self.control.set_non_interrupting(mask);
+        if let Some(tid) = self.control.visible_tid()
+            && let Ok(tid) = i32::try_from(tid)
+        {
+            carrick_signal_core::wait::publish_non_interrupting_for(tid, non_interrupting);
+        }
+        for member in &self.members {
+            member.control.set_non_interrupting(mask);
+            carrick_signal_core::wait::publish_non_interrupting_for(
+                member.thread.id().raw(),
+                non_interrupting,
+            );
+            if let Some(tid) = member.control.visible_tid()
+                && let Ok(tid) = i32::try_from(tid)
+            {
+                carrick_signal_core::wait::publish_non_interrupting_for(tid, non_interrupting);
+            }
+        }
     }
 }
 impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
@@ -3339,10 +3386,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .owner
             .task(self.key)
             .map_err(|_| carrick_syscall_abi::LINUX_ESRCH)?;
-        row.native()
-            .resources()
+        let resources = row.native().resources();
+        resources
             .signals()
             .force_sigsegv(self.record, blocked, Some(info));
+        resources.sync_non_interrupting_signals();
         Ok(())
     }
 
@@ -6862,11 +6910,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let esrch = carrick_personality_linux::abi::signal::LINUX_ESRCH;
         let graph = self.runtime.graph.lock();
         let row = graph.owner.task(self.key).map_err(|_| esrch)?;
-        let signals = row.native().resources().signals();
+        let resources = row.native().resources();
+        let signals = resources.signals();
         if let Some(new_action) = act {
-            signals
+            let old = signals
                 .install_action(self.key, signal, new_action)
-                .map_err(|_| einval)
+                .map_err(|_| einval)?;
+            resources.sync_non_interrupting_signals();
+            Ok(old)
         } else {
             Ok(signals.action(signal))
         }

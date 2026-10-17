@@ -420,6 +420,9 @@ pub struct ThreadControlSlot {
     birth_task: AtomicU64,
     birth_serial: carrick_core_abi::entry::AtomicBirthSerial,
     birth_thread: AtomicU64,
+    /// Signals whose current action (`SIG_IGN` or default-ignore) cannot
+    /// interrupt a blocking wait on this thread.
+    non_interrupting: AtomicU64,
 }
 
 impl ThreadControlSlot {
@@ -455,6 +458,7 @@ impl ThreadControlSlot {
             birth_task: AtomicU64::new(0),
             birth_serial: carrick_core_abi::entry::AtomicBirthSerial::new(),
             birth_thread: AtomicU64::new(0),
+            non_interrupting: AtomicU64::new(0),
         }
     }
 
@@ -543,6 +547,7 @@ impl ThreadControlSlot {
         self.birth_thread.store(0, Ordering::Relaxed);
         self.birth_task.store(0, Ordering::Relaxed);
         self.birth_serial.clear(Ordering::Relaxed);
+        self.non_interrupting.store(0, Ordering::Relaxed);
         self.forwarded_saved_mask.store(0, Ordering::Relaxed);
         self.forwarded_mask_armed.store(0, Ordering::Relaxed);
         // Keep the sequence even: a stale odd value would wedge readers.
@@ -676,6 +681,16 @@ impl ThreadControlSlot {
     /// read is needed because nothing can target a thread not yet Born.
     pub fn init_blocked(&self, mask: BlockedMask) {
         self.blocked.store(mask.0, Ordering::Release);
+    }
+
+    /// Signals whose current sighand disposition cannot interrupt a blocking wait.
+    pub fn non_interrupting(&self) -> BlockedMask {
+        BlockedMask(self.non_interrupting.load(Ordering::Acquire))
+    }
+
+    /// Publish the sighand's current non-interrupting signal mask on this slot.
+    pub fn set_non_interrupting(&self, mask: BlockedMask) {
+        self.non_interrupting.store(mask.0, Ordering::Release);
     }
 
     /// The owning host continuation enters a temporary-mask wait. Publish
@@ -2823,6 +2838,7 @@ mod layout_manifest {
                      birth_task: _,
                      birth_serial: _,
                      birth_thread: _,
+                     non_interrupting: _,
                  }: ThreadControlSlot| {};
         field!(ThreadControlSlot, visible_tid, AtomicU32, 0, 4, 4);
         field!(ThreadControlSlot, blocked, AtomicU64, 8, 8, 8);
@@ -2868,6 +2884,7 @@ mod layout_manifest {
             8
         );
         field!(ThreadControlSlot, birth_thread, AtomicU64, 160, 8, 8);
+        field!(ThreadControlSlot, non_interrupting, AtomicU64, 168, 8, 8);
     }
 
     #[test]
