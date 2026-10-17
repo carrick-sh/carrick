@@ -517,7 +517,7 @@ jobs:
         run: |
           set -euo pipefail
           # Persistent workspaces: a stale receipt must not stand in for this run.
-          rm -rf target/ci-receipts
+          rm -rf target/ci-receipts target/el1-gate
           mkdir -p target/ci-receipts
           status=0
           just accept --profile kvm --receipt target/ci-receipts/receipt.json || status=$?
@@ -536,6 +536,16 @@ jobs:
           name: receipt-kvm-${{ github.sha }}-${{ github.run_attempt }}
           path: target/ci-receipts/receipt.json
           if-no-files-found: error
+
+      # `xtask accept --profile kvm` writes per-step logs (e.g.
+      # `01-kvm-tests.log`) under `target/el1-gate/<short-sha>/`.
+      - name: Upload step logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: kvm-logs-${{ github.sha }}-${{ github.run_attempt }}
+          path: target/el1-gate/
+          if-no-files-found: ignore
 
   # Hosted merge-queue gates. They run the BASE commit's xtask in a clean
   # checkout of the base (its own .cargo config, working directory and
