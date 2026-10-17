@@ -1,0 +1,4 @@
+# Trusted control-plane identities, read from reviewed main, never a worker head.
+# Owner and director currently share one login; worker Apps are never allowlisted.
+allowlist = ["tjfontaine"]
+repositories = ["carrick-sh/carrick", "carrick-sh/carrick-nt"]

@@ -1,0 +1,206 @@
+{
+  "issue": {
+    "id": 5899990572,
+    "node_id": "I_kwDOSp-Ujc8AAAABX7gkmQ",
+    "number": 572,
+    "title": "design: pull-based work claiming",
+    "state": "open",
+    "locked": false,
+    "author_association": "MEMBER",
+    "created_at": "2026-10-17T17:00:46Z",
+    "updated_at": "2026-10-17T17:05:00Z",
+    "url": "https://api.github.com/repos/carrick-sh/carrick/issues/572",
+    "html_url": "https://github.com/carrick-sh/carrick/issues/572",
+    "user": {
+      "login": "tjfontaine",
+      "id": 146447,
+      "node_id": "MDQ6VXNlcjE0NjQ0Nw==",
+      "avatar_url": "https://avatars.githubusercontent.com/u/146447?v=4",
+      "type": "User",
+      "site_admin": false
+    },
+    "labels": [
+      {
+        "id": 12629900001,
+        "node_id": "LA_kwDOSp-Ujc8AAAAC8M0001",
+        "url": "https://api.github.com/repos/carrick-sh/carrick/labels/ready",
+        "name": "ready",
+        "color": "0E8A16",
+        "default": false,
+        "description": "Claimable only with trusted label provenance and a valid work-order v1"
+      },
+      {
+        "id": 12629900002,
+        "node_id": "LA_kwDOSp-Ujc8AAAAC8M0002",
+        "url": "https://api.github.com/repos/carrick-sh/carrick/labels/route:infra",
+        "name": "route:infra",
+        "color": "5319E7",
+        "default": false,
+        "description": "Hosts, CI and scripts; no guest-visible change"
+      }
+    ]
+  },
+  "permission": {
+    "permission": "admin",
+    "role_name": "admin",
+    "user": {
+      "login": "tjfontaine",
+      "id": 146447,
+      "node_id": "MDQ6VXNlcjE0NjQ0Nw==",
+      "avatar_url": "https://avatars.githubusercontent.com/u/146447?v=4",
+      "type": "User",
+      "site_admin": false
+    }
+  },
+  "comments_list": [
+    {
+      "id": 6237219430,
+      "node_id": "IC_kwDOSp-Ujc8AAAABc8RqZg",
+      "url": "https://api.github.com/repos/carrick-sh/carrick/issues/comments/6237219430",
+      "html_url": "https://github.com/carrick-sh/carrick/issues/572#issuecomment-6237219430",
+      "issue_url": "https://api.github.com/repos/carrick-sh/carrick/issues/572",
+      "author_association": "MEMBER",
+      "created_at": "2026-10-17T17:03:53Z",
+      "updated_at": "2026-10-17T17:03:53Z",
+      "body": "work-order v1\n```yaml\nacceptance:\n  red_first: cargo test --locked -p carrick-xtask --test claims\n  checks:\n    - Two concurrent claimants produce exactly one winner.\nfence:\n  - crates/carrick-xtask/**\nroute: infra\ndepends: []\nbase: main\ngates: [portable]\nsize_budget: 4000\ndecisions:\n  - https://github.com/carrick-sh/carrick/issues/231#issuecomment-1\n```",
+      "user": {
+        "avatar_url": "https://avatars.githubusercontent.com/u/146447?v=4",
+        "events_url": "https://api.github.com/users/tjfontaine/events{/privacy}",
+        "followers_url": "https://api.github.com/users/tjfontaine/followers",
+        "following_url": "https://api.github.com/users/tjfontaine/following{/other_user}",
+        "gists_url": "https://api.github.com/users/tjfontaine/gists{/gist_id}",
+        "gravatar_id": "",
+        "html_url": "https://github.com/tjfontaine",
+        "id": 146447,
+        "login": "tjfontaine",
+        "node_id": "MDQ6VXNlcjE0NjQ0Nw==",
+        "organizations_url": "https://api.github.com/users/tjfontaine/orgs",
+        "received_events_url": "https://api.github.com/users/tjfontaine/received_events",
+        "repos_url": "https://api.github.com/users/tjfontaine/repos",
+        "site_admin": false,
+        "starred_url": "https://api.github.com/users/tjfontaine/starred{/owner}{/repo}",
+        "subscriptions_url": "https://api.github.com/users/tjfontaine/subscriptions",
+        "type": "User",
+        "url": "https://api.github.com/users/tjfontaine",
+        "user_view_type": "public"
+      },
+      "reactions": {
+        "url": "https://api.github.com/repos/carrick-sh/carrick/issues/comments/6237219430/reactions",
+        "total_count": 0,
+        "+1": 0,
+        "-1": 0,
+        "laugh": 0,
+        "hooray": 0,
+        "confused": 0,
+        "heart": 0,
+        "rocket": 0,
+        "eyes": 0
+      },
+      "performed_via_github_app": null,
+      "minimized": null,
+      "pin": null
+    }
+  ],
+  "comment_single": {
+    "url": "https://api.github.com/repos/carrick-sh/carrick/issues/comments/6237219430",
+    "html_url": "https://github.com/carrick-sh/carrick/issues/572#issuecomment-6237219430",
+    "issue_url": "https://api.github.com/repos/carrick-sh/carrick/issues/572",
+    "id": 6237219430,
+    "node_id": "IC_kwDOSp-Ujc8AAAABc8RqZg",
+    "user": {
+      "login": "tjfontaine",
+      "id": 146447,
+      "node_id": "MDQ6VXNlcjE0NjQ0Nw==",
+      "avatar_url": "https://avatars.githubusercontent.com/u/146447?u=65aa32de458a02a3aab68e10b7a2c24c671fcd76&v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/tjfontaine",
+      "html_url": "https://github.com/tjfontaine",
+      "followers_url": "https://api.github.com/users/tjfontaine/followers",
+      "following_url": "https://api.github.com/users/tjfontaine/following{/other_user}",
+      "gists_url": "https://api.github.com/users/tjfontaine/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/tjfontaine/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/tjfontaine/subscriptions",
+      "organizations_url": "https://api.github.com/users/tjfontaine/orgs",
+      "repos_url": "https://api.github.com/users/tjfontaine/repos",
+      "events_url": "https://api.github.com/users/tjfontaine/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/tjfontaine/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "created_at": "2026-10-17T17:03:53Z",
+    "updated_at": "2026-10-17T17:03:53Z",
+    "author_association": "MEMBER",
+    "body": "work-order v1\n```yaml\nacceptance:\n  red_first: cargo test --locked -p carrick-xtask --test claims\n  checks:\n    - Two concurrent claimants produce exactly one winner.\nfence:\n  - crates/carrick-xtask/**\nroute: infra\ndepends: []\nbase: main\ngates: [portable]\nsize_budget: 4000\ndecisions:\n  - https://github.com/carrick-sh/carrick/issues/231#issuecomment-1\n```",
+    "reactions": {
+      "url": "https://api.github.com/repos/carrick-sh/carrick/issues/comments/6237219430/reactions",
+      "total_count": 0,
+      "+1": 0,
+      "-1": 0,
+      "laugh": 0,
+      "hooray": 0,
+      "confused": 0,
+      "heart": 0,
+      "rocket": 0,
+      "eyes": 0
+    },
+    "performed_via_github_app": null,
+    "minimized": null,
+    "pin": null
+  },
+  "events": [
+    {
+      "id": 33530773906,
+      "node_id": "ATPVTE_lADOSp-Ujc8AAAABX7gkms8AAAAHzpcBkg",
+      "url": "https://api.github.com/repos/carrick-sh/carrick/issues/events/33530773906",
+      "actor": {
+        "login": "tjfontaine",
+        "id": 146447,
+        "avatar_url": "https://avatars.githubusercontent.com/u/146447?v=4"
+      },
+      "event": "added_to_project_v2",
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-10-17T17:00:47Z"
+    },
+    {
+      "id": 33530774001,
+      "node_id": "LE_lADOSp-Ujc8AAAABX7gkms8AAAAHzpcB01",
+      "url": "https://api.github.com/repos/carrick-sh/carrick/issues/events/33530774001",
+      "actor": {
+        "login": "tjfontaine",
+        "id": 146447,
+        "avatar_url": "https://avatars.githubusercontent.com/u/146447?v=4"
+      },
+      "event": "labeled",
+      "label": {
+        "name": "route:infra",
+        "color": "5319E7"
+      },
+      "created_at": "2026-10-17T17:04:00Z"
+    },
+    {
+      "id": 33530774002,
+      "node_id": "LE_lADOSp-Ujc8AAAABX7gkms8AAAAHzpcB02",
+      "url": "https://api.github.com/repos/carrick-sh/carrick/issues/events/33530774002",
+      "actor": {
+        "login": "tjfontaine",
+        "id": 146447,
+        "avatar_url": "https://avatars.githubusercontent.com/u/146447?v=4"
+      },
+      "event": "labeled",
+      "label": {
+        "name": "ready",
+        "color": "0E8A16"
+      },
+      "created_at": "2026-10-17T17:04:01Z"
+    }
+  ],
+  "graphql_unedited": {
+    "data": {
+      "node": {
+        "lastEditedAt": null
+      }
+    }
+  }
+}
