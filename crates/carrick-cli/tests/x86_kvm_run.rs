@@ -1577,8 +1577,10 @@ fn run_mounted_binary_with_capture(
     let capture = capture.expect("run KVM deadline capture");
     assert!(
         capture.status.success(),
-        "KVM deadline capture {} failed: {}",
+        "KVM deadline capture {} failed (child status {:?}, child stderr {:?}): {}",
         capture_path.display(),
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&capture.stderr)
     );
     eprintln!("KVM deadline capture: {}", capture_path.display());
