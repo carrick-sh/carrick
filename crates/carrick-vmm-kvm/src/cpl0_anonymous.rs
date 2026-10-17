@@ -2012,7 +2012,7 @@ mod custody_tests {
         };
         assert!(boot.lifecycles.iter().all(|life| window.is_zero(*life)));
         let carrier = NonZeroU64::new(7).unwrap();
-        let mut stock = ForkStock::new(
+        let mut stock: ForkStock<UntaggedRoots, ()> = ForkStock::new(
             carrier,
             carrick_hal::fork_stock::ForkControlCapacity::unused(KERNEL_REGION_GPA),
             UntaggedRoots,
