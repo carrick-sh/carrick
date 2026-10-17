@@ -833,43 +833,53 @@ impl CarrierVmCustody {
         &self,
         generation: CarrierVmGeneration,
     ) -> Result<(), CarrierVmCustodyError> {
-        // Match grant publication/return: aperture precedes lifecycle state.
-        let mut metadata = self.metadata_aperture.lock();
-        let mut state = self.state.lock();
-        match state.lifecycle {
-            CarrierVmLifecycle::Destroying(current) if current == generation => {
-                for record in state
-                    .stage2_records
-                    .values_mut()
-                    .filter(|record| record.snapshot.vm_generation == generation)
-                {
-                    carrick_core::mm::retirement::terminalize_record(record);
+        let destroyed_stock = {
+            // Match grant publication/return: aperture precedes lifecycle state.
+            let mut metadata = self.metadata_aperture.lock();
+            let mut state = self.state.lock();
+            match state.lifecycle {
+                CarrierVmLifecycle::Destroying(current) if current == generation => {
+                    for record in state
+                        .stage2_records
+                        .values_mut()
+                        .filter(|record| record.snapshot.vm_generation == generation)
+                    {
+                        carrick_core::mm::retirement::terminalize_record(record);
+                    }
+                    if let CarrierFramePoolState::Active(pool) = std::mem::replace(
+                        &mut *self.frame_pool.lock(),
+                        CarrierFramePoolState::Uninitialized,
+                    ) {
+                        pool.forget_backend_mapping();
+                    }
+                    if let CarrierRootSlotPoolState::Active(pool) = std::mem::replace(
+                        &mut *self.root_slot_pool.lock(),
+                        CarrierRootSlotPoolState::Uninitialized,
+                    ) {
+                        pool.forget_backend_mapping();
+                    }
+                    metadata.release_destroyed_vm(generation.0, |identity| {
+                        let _ = state.remove_record(identity.record_id);
+                    });
+                    state.lifecycle = CarrierVmLifecycle::Vacant;
+                    std::mem::replace(
+                        &mut *self.fork_stock.lock(),
+                        crate::fork_stock::ForkStockHostCustody::with_asids(
+                            self.transfer_carrier,
+                            self.asids.clone(),
+                        ),
+                    )
                 }
-                if let CarrierFramePoolState::Active(pool) = std::mem::replace(
-                    &mut *self.frame_pool.lock(),
-                    CarrierFramePoolState::Uninitialized,
-                ) {
-                    pool.forget_backend_mapping();
+                CarrierVmLifecycle::Destroying(_) | CarrierVmLifecycle::Live(_) => {
+                    return Err(CarrierVmCustodyError::StaleGeneration);
                 }
-                if let CarrierRootSlotPoolState::Active(pool) = std::mem::replace(
-                    &mut *self.root_slot_pool.lock(),
-                    CarrierRootSlotPoolState::Uninitialized,
-                ) {
-                    pool.forget_backend_mapping();
+                CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Creating(_) => {
+                    return Err(CarrierVmCustodyError::LifecycleConflict);
                 }
-                metadata.release_destroyed_vm(generation.0, |identity| {
-                    let _ = state.remove_record(identity.record_id);
-                });
-                state.lifecycle = CarrierVmLifecycle::Vacant;
-                Ok(())
             }
-            CarrierVmLifecycle::Destroying(_) | CarrierVmLifecycle::Live(_) => {
-                Err(CarrierVmCustodyError::StaleGeneration)
-            }
-            CarrierVmLifecycle::Vacant | CarrierVmLifecycle::Creating(_) => {
-                Err(CarrierVmCustodyError::LifecycleConflict)
-            }
-        }
+        };
+        drop(destroyed_stock);
+        Ok(())
     }
 
     pub(crate) fn frame_pool(
@@ -1375,7 +1385,7 @@ impl CarrierVmCustody {
         carrick_core::mm::retirement::pin_record(
             record,
             identity,
-            CarrierPinVenue(std::sync::Arc::clone(self)),
+            CarrierPinVenue(std::sync::Arc::downgrade(self)),
         )
     }
 
@@ -1419,11 +1429,13 @@ impl CarrierVmCustody {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(::core::fmt::Debug)]
-pub(crate) struct CarrierPinVenue(std::sync::Arc<CarrierVmCustody>);
+pub(crate) struct CarrierPinVenue(std::sync::Weak<CarrierVmCustody>);
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl carrick_core::mm::retirement::RecordPinVenue for CarrierPinVenue {
     fn release_pin(&self, identity: CarrierStage2RecordIdentity) {
-        self.0.release_stage2_pin(identity);
+        if let Some(custody) = self.0.upgrade() {
+            custody.release_stage2_pin(identity);
+        }
     }
 }
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -4426,6 +4438,212 @@ mod carrier_vm_custody_tests {
             CarrierStage2RetireOutcome::RetiredUnmapped
         );
         assert_eq!(unmap_calls.get(), 1);
+    }
+
+    #[test]
+    fn retained_stage2_pin_does_not_keep_its_carrier_alive() {
+        let (custody, generation) = live_custody();
+        let identity = custody
+            .register_stage2_record(stage2_spec(generation, 71))
+            .expect("register stage-2 record");
+        let pin = custody.pin_stage2_record(identity).expect("pin record");
+        let weak = std::sync::Arc::downgrade(&custody);
+        drop(custody);
+        assert!(
+            weak.upgrade().is_none(),
+            "a pin retained by fork stock must not cycle the carrier"
+        );
+        drop(pin);
+    }
+
+    #[test]
+    fn committed_child_in_fork_stock_drops_with_carrier_and_releases_stage2_pins_on_destroy() {
+        use carrick_aarch64::fork::ForkCustody;
+        use carrick_el1_abi::{
+            EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+            ForkLifecycleLoan, ForkStockExchange, ForkStockRequest, ForkStockSettlement,
+            PortalForkCompletion, PortalForkCustody, PortalOperation, ReservationGeneration,
+            ReservationMm,
+        };
+        use carrick_guest_arch::{
+            AddressContext, ContextGeneration, CpuId, FrameGpa, KernelVa, MmGeneration, RootGpa,
+        };
+        use core::num::NonZeroU64;
+
+        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let settle_child_with_retained_frame =
+            |custody: &std::sync::Arc<CarrierVmCustody>, ipa: u64| {
+                let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                    0x4000,
+                    crate::host_mapping::HostMappingKind::PerMmKernelState,
+                )
+                .expect("allocate global owner mapping");
+                let mut lease = super::GlobalFrameStage2Lease::fixed(ipa, 0x4000);
+                lease.mark_test_mapped_without_backend();
+                super::register_global_frame_host_owner_in(
+                    custody,
+                    lease,
+                    mapping,
+                    u64::from(applevisor::memory::MemPerms::ReadWrite),
+                )
+                .expect("register global frame owner");
+                let identity = custody
+                    .stage2_record_covering(ipa, 1)
+                    .expect("registered stage-2 record");
+                let stock_base = carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE + 0x20_0000;
+                {
+                    let mut stock = custody.fork_stock.lock();
+                    stock.owner.set_carrier(custody.transfer_carrier);
+                    stock
+                        .owner
+                        .install(
+                            (0..4)
+                                .map(|i| {
+                                    RootGpa::page_aligned(FrameGpa::new(stock_base + i * 4096))
+                                        .expect("page aligned")
+                                })
+                                .collect(),
+                            vec![ForkLifecycleLoan::ARM_DEFAULT],
+                        )
+                        .expect("install fork stock");
+                    stock
+                        .owner
+                        .provide_arm_control_capacity(0x5000_0000)
+                        .expect("provide control window");
+                }
+                let exec = carrick_hal::fork_stock::GrantExecution::new(
+                    CpuId::new(0),
+                    ExecutionBinding {
+                        task: EntryTaskKey::from_raw(41),
+                        generation: EntryGeneration::from_raw(11),
+                        mm: EntryMmKey::from_raw(301),
+                        thread_generation: EntryThreadGeneration::from_raw(101),
+                    },
+                    AddressContext {
+                        mm: MmGeneration::new(NonZeroU64::new(301).expect("nonzero")),
+                        root: RootGpa::page_aligned(FrameGpa::new(
+                            carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE,
+                        ))
+                        .expect("page aligned"),
+                        generation: ContextGeneration::new(NonZeroU64::MIN),
+                    },
+                );
+                let req = ForkStockRequest {
+                    binding: exec.binding,
+                    context: exec.context,
+                    operation: PortalOperation {
+                        carrier: custody.transfer_carrier,
+                        mm: ReservationMm::new(301).expect("mm"),
+                        incarnation: NonZeroU64::MIN,
+                        sequence: NonZeroU64::new(2).expect("seq"),
+                    },
+                    parent_generation: ReservationGeneration::INITIAL,
+                    child_mm: ReservationMm::new(302).expect("child mm"),
+                    child_bytes: 4096,
+                    parent_bytes: 4096,
+                };
+                let mut exchange = ForkStockExchange::new(req).expect("exchange");
+                let loan = {
+                    let mut stock = custody.fork_stock.lock();
+                    let mut ledger = custody.el1_frame_grants.lock();
+                    stock
+                        .owner
+                        .loan(&mut *ledger, exec, &mut exchange, |_| true)
+                        .expect("grant loan")
+                };
+                let selected = PortalForkCustody::Frame {
+                    va: 0x7000,
+                    ipa,
+                    len: 4096,
+                    shared: false,
+                };
+                let physical_owner = super::ForkPhysicalCustody::new(
+                    std::sync::Arc::clone(custody),
+                    std::sync::Arc::new(|_, _| false),
+                );
+                let retained = physical_owner
+                    .retain(loan.request, selected)
+                    .expect("retain frame")
+                    .expect("frame pin");
+                assert_eq!(
+                    custody
+                        .stage2_record_snapshot(identity.record_id)
+                        .expect("record snapshot")
+                        .pin_count,
+                    1
+                );
+                let completion = PortalForkCompletion {
+                    request: loan.request,
+                    child: unsafe {
+                        carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                            custody.transfer_carrier,
+                            loan.request.child_mm,
+                            NonZeroU64::MIN,
+                        )
+                    },
+                    parent_generation: ReservationGeneration::new(2).expect("gen"),
+                    child_tables_used: 4096,
+                    parent_tables_used: 4096,
+                };
+                let mut reserve =
+                    ForkStockSettlement::reserve(loan, completion, KernelVa::new(0x1000), 1)
+                        .expect("reserve settlement");
+                {
+                    let mut stock = custody.fork_stock.lock();
+                    stock
+                        .owner
+                        .reserve_custody(
+                            exec,
+                            &mut reserve,
+                            |_| true,
+                            |_| true,
+                            |_, _, _| Ok(vec![retained]),
+                        )
+                        .expect("reserve custody");
+                    let mut commit =
+                        ForkStockSettlement::commit_reserved(loan, completion).expect("commit");
+                    let mut ledger = custody.el1_frame_grants.lock();
+                    stock
+                        .owner
+                        .commit_admitted(&mut *ledger, exec, &mut commit)
+                        .expect("commit admitted child");
+                    assert_eq!(stock.owner.live_children(), 1);
+                }
+                identity
+            };
+
+        let (custody, _) = live_custody();
+        let _ = settle_child_with_retained_frame(&custody, 0xa091_0000_0000);
+        let weak = std::sync::Arc::downgrade(&custody);
+        drop(custody);
+        assert!(
+            weak.upgrade().is_none(),
+            "committed child in fork_stock must not cycle CarrierVmCustody"
+        );
+
+        let (custody, _) = live_custody();
+        let identity = settle_child_with_retained_frame(&custody, 0xa091_1000_0000);
+        assert_eq!(custody.fork_stock.lock().owner.live_children(), 1);
+        destroy_vm_with_custody_using(&custody, "test destroy", || 0, || {})
+            .expect("destroy VM with live committed child");
+        assert_eq!(
+            custody.fork_stock.lock().owner.live_children(),
+            0,
+            "VM destroy must drain committed fork_stock children"
+        );
+        assert_eq!(
+            custody
+                .stage2_record_snapshot(identity.record_id)
+                .expect("terminalized record snapshot")
+                .pin_count,
+            0,
+            "draining fork_stock on VM destroy must release retained stage-2 pins"
+        );
+        assert_eq!(
+            custody.claim_terminal_stage2_release(identity),
+            Ok(None),
+            "fixed test lease owns no IPA allocation to release"
+        );
     }
 
     #[test]

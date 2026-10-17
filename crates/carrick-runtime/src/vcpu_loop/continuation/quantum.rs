@@ -73,7 +73,7 @@ pub(crate) trait PersistentQuantumJob: Send + 'static {
         self.after_terminal_settlement();
     }
 
-    fn after_executor_failure_settlement(&mut self) -> ExecutorFailureSettlement {
+    fn after_executor_failure_settlement(&mut self, _detail: String) -> ExecutorFailureSettlement {
         self.after_terminal_settlement();
         ExecutorFailureSettlement::PublishCurrent
     }
@@ -144,8 +144,8 @@ impl HvpatchTaskQuantum {
         self.completion.publish();
     }
 
-    pub(crate) fn after_executor_failure_settlement(&self) {
-        match self.job.lock().after_executor_failure_settlement() {
+    pub(crate) fn after_executor_failure_settlement(&self, detail: String) {
+        match self.job.lock().after_executor_failure_settlement(detail) {
             ExecutorFailureSettlement::PublishCurrent => self.completion.publish(),
             // Fail closed on the one shape that cannot be recovered later: an
             // unpublished job whose executor is gone has no remaining
@@ -480,7 +480,7 @@ impl HvpatchTaskBinding {
         }
     }
 
-    pub(crate) fn after_executor_failure_settlement(&self) {
+    pub(crate) fn after_executor_failure_settlement(&self, detail: String) {
         let publish_logical_result = {
             let mut generation = self.terminal_generation.lock();
             match *generation {
@@ -496,7 +496,7 @@ impl HvpatchTaskBinding {
             }
         };
         if publish_logical_result {
-            self.quantum.after_executor_failure_settlement();
+            self.quantum.after_executor_failure_settlement(detail);
         }
     }
 

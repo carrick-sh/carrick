@@ -46,6 +46,65 @@ fn task_id_from_binding(binding: ExecutionBinding) -> Option<TaskId> {
 }
 
 pub struct Thread;
+
+/// The neutral process terminal owner records the one physical-retirement
+/// publication. An executor failure after normal publication reuses that
+/// receipt; it cannot manufacture a second one from a later member snapshot.
+#[derive(Debug, Default)]
+pub enum ProcessPhysicalPublication<C> {
+    #[default]
+    Unpublished,
+    Published(C),
+}
+
+#[derive(Debug)]
+pub struct ProcessPhysicalPublicationOwner<'a, C>(&'a mut ProcessPhysicalPublication<C>);
+
+impl<C> ProcessPhysicalPublicationOwner<'_, C> {
+    pub fn publish(self, completion: C) {
+        *self.0 = ProcessPhysicalPublication::Published(completion);
+    }
+}
+
+#[cfg(test)]
+mod process_physical_publication_tests {
+    use super::ProcessPhysicalPublication;
+    use alloc::vec;
+
+    #[test]
+    fn failure_after_normal_retirement_reuses_exact_receipt() {
+        let mut owner = ProcessPhysicalPublication::default();
+        owner
+            .claim_owner()
+            .expect("initial publication owner")
+            .publish(vec![11_u32, 12]);
+        assert!(owner.claim_owner().is_none());
+        assert_eq!(owner.published(), Some(&vec![11, 12]));
+        assert!(owner.publish(vec![13]).is_err());
+        assert_eq!(owner.published(), Some(&vec![11, 12]));
+    }
+}
+
+impl<C> ProcessPhysicalPublication<C> {
+    pub fn claim_owner(&mut self) -> Option<ProcessPhysicalPublicationOwner<'_, C>> {
+        matches!(self, Self::Unpublished).then_some(ProcessPhysicalPublicationOwner(self))
+    }
+
+    pub fn publish(&mut self, completion: C) -> Result<(), C> {
+        let Some(owner) = self.claim_owner() else {
+            return Err(completion);
+        };
+        owner.publish(completion);
+        Ok(())
+    }
+
+    pub fn published(&self) -> Option<&C> {
+        match self {
+            Self::Unpublished => None,
+            Self::Published(completion) => Some(completion),
+        }
+    }
+}
 /// One process incarnation owns exactly one terminal admission claim.
 #[repr(C)]
 #[derive(::core::fmt::Debug, ::core::default::Default)]

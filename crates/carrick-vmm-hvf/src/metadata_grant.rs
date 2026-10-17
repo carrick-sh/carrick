@@ -1181,11 +1181,105 @@ fn complete_metadata_request(
     Ok(())
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn fork_custody_in_retained_region(offset: usize, bytes: usize) -> bool {
+    // The EL1 allocator starts in retained bootstrap metadata, then uses the
+    // adjacent heap. A fork before heap expansion may select either range.
+    offset >= carrick_el1_abi::EL1_BOOTSTRAP_METADATA_OFFSET as usize
+        && offset
+            .checked_add(bytes)
+            .is_some_and(|end| end <= carrick_el1_abi::EL1_REGION_SIZE as usize)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retain_fork_custody_rows(
+    custody: &Arc<crate::trap::CarrierVmCustody>,
+    inventory: Option<Arc<dyn carrick_hal::PhysicalFrameInventory>>,
+    region: RetainedAbiRegion<'_>,
+    parent: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
+    request: carrick_el1_abi::PortalForkRequest,
+    address: carrick_guest_arch::KernelVa,
+    count: u64,
+) -> Result<Vec<crate::trap::ForkPhysicalRetention>, ForkStockRefusal> {
+    use carrick_aarch64::fork::ForkCustody;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let Ok(count) = usize::try_from(count) else {
+        return Err(ForkStockRefusal::Invalid);
+    };
+    let row_bytes = core::mem::size_of::<[u64; 4]>();
+    let Some(bytes) = count.checked_mul(row_bytes) else {
+        return Err(ForkStockRefusal::Invalid);
+    };
+    if !address
+        .raw()
+        .is_multiple_of(core::mem::align_of::<[u64; 4]>() as u64)
+    {
+        return Err(ForkStockRefusal::Invalid);
+    }
+    let rows = if address.raw() >= EL1_DYNAMIC_METADATA_BASE {
+        let (host, base, _) =
+            retained_dynamic_metadata(custody, address, bytes).ok_or(ForkStockRefusal::Invalid)?;
+        let offset =
+            usize::try_from(address.raw() - base).map_err(|_| ForkStockRefusal::Invalid)?;
+        // SAFETY: the common metadata venue checked the entire custody array.
+        unsafe { host.as_ptr().add(offset).cast::<[u64; 4]>() }
+    } else {
+        let offset = address
+            .raw()
+            .checked_sub(carrick_el1_abi::EL1_REGION_BASE)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .filter(|offset| fork_custody_in_retained_region(*offset, bytes))
+            .ok_or(ForkStockRefusal::Invalid)?;
+        region
+            .record_ptr::<[u64; 4]>(offset)
+            .ok_or(ForkStockRefusal::Invalid)?
+    };
+    if !rows
+        .addr()
+        .is_multiple_of(core::mem::align_of::<[u64; 4]>())
+    {
+        return Err(ForkStockRefusal::Invalid);
+    }
+    let mut retained = Vec::new();
+    if retained.try_reserve_exact(count).is_err() {
+        return Err(ForkStockRefusal::Capacity);
+    }
+    let source = Arc::new(
+        move |handle: core::num::NonZeroU64, generation: core::num::NonZeroU64| {
+            let Some(inventory) = inventory.as_ref() else {
+                return false;
+            };
+            let view = inventory.bind(parent.into());
+            let id = carrick_hal::MappingId::from_kernel_allocation(handle);
+            let generation = carrick_hal::MappingGeneration::from_backend_counter(generation);
+            view.live_mapping_row(id)
+                .is_some_and(|row| row.generation == generation)
+        },
+    );
+    let physical = crate::trap::ForkPhysicalCustody::new(Arc::clone(custody), source);
+    for index in 0..count {
+        // SAFETY: the synchronous stopped-CPU crossing exclusively retains the
+        // aligned array in the checked fixed region or dynamic metadata grant.
+        let words = unsafe { *rows.add(index) };
+        let Some(selected) = carrick_el1_abi::PortalForkCustody::decode(words) else {
+            return Err(ForkStockRefusal::Invalid);
+        };
+        let pin = match physical.retain(request, selected) {
+            Ok(Some(pin)) => pin,
+            Ok(None) | Err(_) => return Err(ForkStockRefusal::Inventory),
+        };
+        retained.push(pin);
+    }
+    Ok(retained)
+}
+
 /// Native stock crossings retain an ABI stack, not a physical inventory row.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn service_native_fork_stock(
-    custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
+    custody: &Arc<crate::trap::CarrierVmCustody>,
     generation: Option<crate::trap::CarrierVmGeneration>,
     cpu: carrick_guest_arch::CpuId,
     address: carrick_guest_arch::KernelVa,
@@ -1281,7 +1375,7 @@ pub(crate) fn service_native_fork_stock(
                 })
                 .is_ok()
         }
-        Some(ForkStockKind::Commit | ForkStockKind::Abort) => {
+        Some(ForkStockKind::Reserve | ForkStockKind::Commit | ForkStockKind::Abort) => {
             let Some(pointer) = abi_stack_ptr::<ForkStockSettlement>(region, cpu, address) else {
                 return Ok([METADATA_GRANT_ERR_INVALID, 0, 0, 0]);
             };
@@ -1292,30 +1386,67 @@ pub(crate) fn service_native_fork_stock(
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             };
             let mut stock = custody.fork_stock.lock();
-            let mut ledger = custody.el1_frame_grants.lock();
-            match stock.owner.settle(
-                &mut *ledger,
-                execution,
-                settlement,
-                |pages| {
-                    pages.iter().all(|page| {
-                        ForkStockHostCustody::physical_ptr::<[u8; 4096]>(custody, page.address())
-                            .is_ok()
-                    })
-                },
-                |pages| ForkStockHostCustody::tables_clean(custody, pages),
-                |life| lifecycle_window(custody, life).is_some_and(|window| window.clear(life)),
-            ) {
-                Ok(()) => true,
-                Err(error) => {
-                    settlement.refuse(
-                        if error == carrick_hal::fork_stock::ForkStockServiceError::StaleExecution {
-                            ForkStockRefusal::Stale
-                        } else {
-                            ForkStockRefusal::Invalid
+            if kind == Some(ForkStockKind::Reserve) {
+                let inventory = stock.inventory();
+                stock
+                    .owner
+                    .reserve_custody(
+                        execution,
+                        settlement,
+                        |pages| {
+                            pages.iter().all(|page| {
+                                ForkStockHostCustody::physical_ptr::<[u8; 4096]>(
+                                    custody,
+                                    page.address(),
+                                )
+                                .is_ok()
+                            })
                         },
-                    );
-                    false
+                        |pages| ForkStockHostCustody::tables_clean(custody, pages),
+                        |request, address, count| {
+                            retain_fork_custody_rows(
+                                custody,
+                                inventory,
+                                region,
+                                execution.context,
+                                request,
+                                address,
+                                count,
+                            )
+                        },
+                    )
+                    .is_ok()
+            } else {
+                let mut ledger = custody.el1_frame_grants.lock();
+                match stock.owner.settle(
+                    &mut *ledger,
+                    execution,
+                    settlement,
+                    |pages| {
+                        pages.iter().all(|page| {
+                            ForkStockHostCustody::physical_ptr::<[u8; 4096]>(
+                                custody,
+                                page.address(),
+                            )
+                            .is_ok()
+                        })
+                    },
+                    |pages| ForkStockHostCustody::tables_clean(custody, pages),
+                    |life| lifecycle_window(custody, life).is_some_and(|window| window.clear(life)),
+                ) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        settlement.refuse(
+                            if error
+                                == carrick_hal::fork_stock::ForkStockServiceError::StaleExecution
+                            {
+                                ForkStockRefusal::Stale
+                            } else {
+                                ForkStockRefusal::Invalid
+                            },
+                        );
+                        false
+                    }
                 }
             }
         }
@@ -1343,10 +1474,22 @@ fn lifecycle_window(
     if carrick_el1_abi::ForkLifecycleLoan::new(life.page, life.controls)? != life {
         return None;
     }
-    let identity = custody.stage2_record_covering(
-        life.page.raw(),
+    let (host, base, len) = retained_dynamic_metadata(
+        custody,
+        life.page,
         core::mem::size_of::<carrick_el1_abi::ThreadLifecyclePage>(),
     )?;
+    // SAFETY: the common metadata venue retains this identity-mapped range.
+    Some(unsafe { carrick_hal::fork_stock::LifecycleWindow::new(host, base, len as u64) })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn retained_dynamic_metadata(
+    custody: &crate::trap::CarrierVmCustody,
+    address: carrick_guest_arch::KernelVa,
+    len: usize,
+) -> Option<(core::ptr::NonNull<u8>, u64, usize)> {
+    let identity = custody.stage2_record_covering(address.raw(), len)?;
     let state = custody.state.lock();
     let record = state.stage2_records.get(&identity.record_id)?;
     if record.snapshot.ipa < EL1_DYNAMIC_METADATA_BASE
@@ -1359,14 +1502,7 @@ fn lifecycle_window(
         return None;
     }
     let host = core::ptr::NonNull::new(record.snapshot.host_addr as *mut u8)?;
-    // SAFETY: retained metadata aperture backing owns the identity-mapped range.
-    Some(unsafe {
-        carrick_hal::fork_stock::LifecycleWindow::new(
-            host,
-            record.snapshot.ipa,
-            record.snapshot.len as u64,
-        )
-    })
+    Some((host, record.snapshot.ipa, record.snapshot.len))
 }
 
 /// Physical process crossings use HVC #6. Metadata allocation uses its mailbox.
@@ -1374,7 +1510,7 @@ fn lifecycle_window(
 pub(crate) fn handle_metadata_grant_trap(
     vcpu: &mut applevisor::vcpu::Vcpu,
     cpu: carrick_guest_arch::CpuId,
-    custody: &std::sync::Arc<crate::trap::CarrierVmCustody>,
+    custody: &Arc<crate::trap::CarrierVmCustody>,
     generation: Option<crate::trap::CarrierVmGeneration>,
 ) -> Result<MetadataTrapOutcome, TrapError> {
     use applevisor::vcpu::Reg;
@@ -1598,6 +1734,20 @@ fn root_execution(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn fork_custody_accepts_retained_bootstrap_metadata_and_rejects_abi_stacks() {
+        let bootstrap = carrick_el1_abi::EL1_BOOTSTRAP_METADATA_OFFSET as usize;
+        let heap = carrick_el1_abi::EL1_HEAP_OFFSET as usize;
+        let limit = carrick_el1_abi::EL1_REGION_SIZE as usize;
+        assert!(fork_custody_in_retained_region(bootstrap, 32));
+        assert!(fork_custody_in_retained_region(heap - 32, 32));
+        assert!(fork_custody_in_retained_region(heap, 32));
+        assert!(!fork_custody_in_retained_region(bootstrap - 32, 32));
+        assert!(!fork_custody_in_retained_region(limit - 16, 32));
+        assert!(!fork_custody_in_retained_region(usize::MAX, 32));
+    }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]

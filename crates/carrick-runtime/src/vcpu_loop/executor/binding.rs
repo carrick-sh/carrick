@@ -51,7 +51,7 @@ pub trait PersistentTaskBinding {
         self.after_terminal_settlement();
     }
 
-    fn after_executor_failure_settlement(&self) {
+    fn after_executor_failure_settlement(&self, _detail: String) {
         self.after_terminal_settlement();
     }
 
@@ -138,8 +138,10 @@ impl PersistentTaskBinding for crate::vcpu_loop::continuation::HvpatchTaskBindin
         crate::vcpu_loop::continuation::HvpatchTaskBinding::after_reaped_settlement(self);
     }
 
-    fn after_executor_failure_settlement(&self) {
-        crate::vcpu_loop::continuation::HvpatchTaskBinding::after_executor_failure_settlement(self);
+    fn after_executor_failure_settlement(&self, detail: String) {
+        crate::vcpu_loop::continuation::HvpatchTaskBinding::after_executor_failure_settlement(
+            self, detail,
+        );
     }
 
     fn address_space_is_retiring(&self) -> bool {

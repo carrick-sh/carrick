@@ -132,14 +132,28 @@ impl<X: ForkStockCrossing> crate::sched::ThreadCpu for ResumeCpu<'_, '_, X> {
 const VA: u64 = 0x4000_0000;
 const IPA: u64 = 0x9000_0000;
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum CommitFault {
+    None,
+    Refusal,
+    Crossing,
+    MissingReply,
+}
+
 struct TestStockCrossing {
     fd_map: Vec<carrick_el1_abi::FdMapSlot>,
     open_table: Vec<carrick_el1_abi::DelegatedOpenFile>,
     grant_tables: std::sync::Mutex<Vec<RootGpa>>,
     total_returned_pages: AtomicU64,
     loans_requested: AtomicUsize,
+    settlements_reserved: AtomicUsize,
     settlements_committed: AtomicUsize,
     settlements_aborted: AtomicUsize,
+    reserved_custody_rows: AtomicUsize,
+    refuse_reserve: std::sync::Mutex<Option<ForkStockRefusal>>,
+    #[cfg(test)]
+    commit_fault: std::sync::Mutex<CommitFault>,
     pending_loan: std::sync::Mutex<Option<ForkStockLoan>>,
     retirements: AtomicUsize,
     zone: std::sync::Mutex<Option<&'static ZoneTables<Aarch64ParkedContext>>>,
@@ -166,8 +180,13 @@ impl TestStockCrossing {
             ),
             total_returned_pages: AtomicU64::new(0),
             loans_requested: AtomicUsize::new(0),
+            settlements_reserved: AtomicUsize::new(0),
             settlements_committed: AtomicUsize::new(0),
             settlements_aborted: AtomicUsize::new(0),
+            reserved_custody_rows: AtomicUsize::new(0),
+            refuse_reserve: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            commit_fault: std::sync::Mutex::new(CommitFault::None),
             pending_loan: std::sync::Mutex::new(None),
             retirements: AtomicUsize::new(0),
             zone: std::sync::Mutex::new(None),
@@ -344,10 +363,40 @@ impl ForkStockCrossing for TestStockCrossing {
                 );
                 Ok(())
             }
+            Some(ForkStockKind::Reserve) => {
+                self.settlements_reserved.fetch_add(1, Ordering::AcqRel);
+                let settlement = unsafe { &mut *(record_gpa as *mut ForkStockSettlement) };
+                if let Some(refusal) = self.refuse_reserve.lock().unwrap().take() {
+                    settlement.refuse(refusal);
+                    return Err(NativeProcessError::Fault);
+                }
+                let Some(loan) = *self.pending_loan.lock().unwrap() else {
+                    return Err(NativeProcessError::Invalid);
+                };
+                let Some((_completion, _address, count)) = settlement.reservation(loan) else {
+                    return Err(NativeProcessError::Invalid);
+                };
+                if !settlement.accept(loan) {
+                    return Err(NativeProcessError::Invalid);
+                }
+                self.reserved_custody_rows
+                    .store(count as usize, Ordering::Release);
+                Ok(())
+            }
             Some(ForkStockKind::Commit) => {
                 self.settlements_committed.fetch_add(1, Ordering::AcqRel);
                 let settlement = unsafe { &mut *(record_gpa as *mut ForkStockSettlement) };
-                if let Some(loan) = *self.pending_loan.lock().unwrap()
+                #[cfg(test)]
+                match *self.commit_fault.lock().unwrap() {
+                    CommitFault::Refusal => {
+                        settlement.refuse(ForkStockRefusal::Invalid);
+                        return Ok(());
+                    }
+                    CommitFault::Crossing => return Err(NativeProcessError::Fault),
+                    CommitFault::MissingReply => return Ok(()),
+                    CommitFault::None => {}
+                }
+                if let Some(loan) = self.pending_loan.lock().unwrap().take()
                     && !settlement.accept(loan)
                 {
                     return Err(NativeProcessError::Invalid);
@@ -356,6 +405,7 @@ impl ForkStockCrossing for TestStockCrossing {
             }
             Some(ForkStockKind::Abort) => {
                 self.settlements_aborted.fetch_add(1, Ordering::AcqRel);
+                self.reserved_custody_rows.store(0, Ordering::Release);
                 let settlement = unsafe { &mut *(record_gpa as *mut ForkStockSettlement) };
                 if let Some(loan) = self.pending_loan.lock().unwrap().take() {
                     if !settlement.accept(loan) {
@@ -1510,6 +1560,139 @@ fn test_abort_after_stock_loan_returns_every_page_once() {
         initial_stock.len()
     );
     assert_eq!(crossing.total_returned_pages.load(Ordering::Acquire), 5);
+}
+
+#[test]
+fn fork_reservation_refusal_from_concurrent_munmap_rolls_back_without_quarantine() {
+    let fixture = Fixture::new(0x10000, asid(1));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut native = ThreadCtx::ZERO;
+    native.x[0] = 99;
+    let parked = Aarch64ParkedContext::from_parts(native, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let runtime = NativeProcessRuntime::admit_fresh_root::<Aarch64Mmu>(
+        source,
+        &fixture.task,
+        fixture.page,
+        fixture.control,
+        fixture.address,
+        fixture.address,
+        parked,
+    )
+    .unwrap();
+
+    let initial_stock = [
+        0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+    ];
+    let crossing = TestStockCrossing::new(&initial_stock);
+    *crossing.refuse_reserve.lock().unwrap() = Some(ForkStockRefusal::Inventory);
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::new(1).unwrap(),
+        &crossing,
+    )
+    .with_words(&words);
+
+    let mut entry = runtime
+        .enter(source, &fixture.task, parked, &mut service)
+        .unwrap();
+    let refused = entry.fork();
+    assert!(
+        matches!(
+            refused,
+            LifecycleOutcome::Returned { result, .. } if result.raw() == NativeProcessError::Busy.errno()
+        ),
+        "munmap-during-fork reservation refusal must roll back to a counted EAGAIN failure"
+    );
+    assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 1);
+    assert_eq!(crossing.settlements_reserved.load(Ordering::Acquire), 1);
+    assert_eq!(crossing.settlements_aborted.load(Ordering::Acquire), 1);
+    assert_eq!(crossing.settlements_committed.load(Ordering::Acquire), 0);
+    assert!(crossing.pending_loan.lock().unwrap().is_none());
+    assert_eq!(
+        crossing.grant_tables.lock().unwrap().len(),
+        initial_stock.len(),
+        "aborted reservation must scrub and return every loaned table page"
+    );
+    assert_eq!(crossing.total_returned_pages.load(Ordering::Acquire), 5);
+    assert!(
+        fixture.zone.spaces.find(2).is_none(),
+        "aborted reservation must free the closed child space"
+    );
+
+    // A subsequent fork on the same CPU succeeds using the returned stock.
+    let second = entry.fork();
+    assert!(
+        matches!(second, LifecycleOutcome::Returned { result, .. } if result.raw() > 0),
+        "subsequent fork after rolled-back reservation must succeed"
+    );
+    assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 2);
+    assert_eq!(crossing.settlements_reserved.load(Ordering::Acquire), 2);
+    assert_eq!(crossing.settlements_committed.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn fork_commit_refusal_after_admitted_reservation_fails_closed_without_opening_child_space() {
+    assert_commit_fault_keeps_child_closed(CommitFault::Refusal);
+}
+
+#[test]
+fn fork_commit_crossing_failure_keeps_child_closed() {
+    assert_commit_fault_keeps_child_closed(CommitFault::Crossing);
+}
+
+#[test]
+fn fork_commit_missing_reply_keeps_child_closed() {
+    assert_commit_fault_keeps_child_closed(CommitFault::MissingReply);
+}
+
+#[cfg(test)]
+fn assert_commit_fault_keeps_child_closed(fault: CommitFault) {
+    let fixture = Fixture::new(0x10000, asid(1));
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let initial_stock = [
+        0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+    ];
+    let crossing = TestStockCrossing::new(&initial_stock);
+    *crossing.commit_fault.lock().unwrap() = fault;
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::new(1).unwrap(),
+        &crossing,
+    )
+    .with_words(&words);
+
+    let child_mm = MmGeneration::new(NonZeroU64::new(2).unwrap());
+    let prepared = service
+        .prepare_mm(&fixture.address, parked, child_mm)
+        .unwrap();
+    let born = service.commit_mm(prepared).unwrap();
+    let (error, born) = service
+        .settle_mm(born)
+        .expect_err("unacknowledged Commit must not settle a published child");
+    assert_eq!(error, NativeProcessError::Quarantined);
+    assert_eq!(crossing.settlements_reserved.load(Ordering::Acquire), 1);
+    assert_eq!(crossing.settlements_committed.load(Ordering::Acquire), 1);
+    assert_eq!(crossing.settlements_aborted.load(Ordering::Acquire), 0);
+    assert!(
+        fixture.zone.spaces.find(2).is_some(),
+        "closed child space was published during prepare"
+    );
+    assert!(
+        !fixture.zone.spaces.is_open(2),
+        "refused Commit must never open the child's space gate"
+    );
+    drop(born);
 }
 
 #[test]

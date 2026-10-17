@@ -9,6 +9,202 @@ use carrick_el1_abi::{
 use carrick_guest_arch::{ContextGeneration, FrameGpa, KernelVa, MmGeneration};
 use std::cell::RefCell;
 
+#[test]
+fn committed_child_retains_physical_custody_through_quarantine() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct PhysicalPin(Arc<AtomicUsize>);
+    impl Drop for PhysicalPin {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let mut stock: ForkStock<UntaggedRoots, PhysicalPin> = ForkStock::new(
+        CARRIER,
+        ForkControlCapacity::exclusive(0x1_0000_0000),
+        UntaggedRoots,
+    );
+    stock
+        .install(
+            (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            lifecycles(1),
+        )
+        .unwrap();
+    let parent = parent();
+    let mut exchange = ForkStockExchange::new(request(parent, 302, 2, 1)).unwrap();
+    let loan = stock
+        .loan(&mut NoTableLedger, parent, &mut exchange, |_| true)
+        .unwrap();
+    let completion = PortalForkCompletion {
+        request: loan.request,
+        // SAFETY: exact admitted child fixture.
+        child: unsafe {
+            El1MmHandle::from_admitted_owner(CARRIER, loan.request.child_mm, NonZeroU64::MIN)
+        },
+        parent_generation: ReservationGeneration::INITIAL,
+        child_tables_used: 4096,
+        parent_tables_used: 0,
+    };
+    let mut reserve =
+        ForkStockSettlement::reserve(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
+            .unwrap();
+    stock
+        .reserve_custody(
+            parent,
+            &mut reserve,
+            |_| true,
+            |_| true,
+            |_, _, _| Ok(PhysicalPin(Arc::clone(&dropped))),
+        )
+        .unwrap();
+    let mut settlement = ForkStockSettlement::commit_reserved(loan, completion).unwrap();
+    stock
+        .settle(
+            &mut NoTableLedger,
+            parent,
+            &mut settlement,
+            |_| true,
+            |_| true,
+            |_| true,
+        )
+        .unwrap();
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    let child = child_of(loan, 43);
+    let mut retire = NativeChildRetire::new(child.binding, child.context).unwrap();
+    stock.retire_child(child, &mut retire).unwrap();
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    stock
+        .reclaim(
+            &mut NoTableLedger,
+            mm(PARENT_MM),
+            absent,
+            |_| true,
+            |_| true,
+            |_| true,
+        )
+        .unwrap();
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn committed_child_weak_pin_venue_drops_carrier_without_reclaim_and_releases_on_drain() {
+    use std::sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Debug)]
+    struct CarrierFixture {
+        pin_count: AtomicUsize,
+        stock: Mutex<ForkStock<UntaggedRoots, WeakCarrierPin>>,
+    }
+
+    #[derive(Debug)]
+    struct WeakCarrierPin(Weak<CarrierFixture>);
+
+    impl Drop for WeakCarrierPin {
+        fn drop(&mut self) {
+            if let Some(carrier) = self.0.upgrade() {
+                carrier.pin_count.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    let make_carrier = || {
+        let carrier = Arc::new(CarrierFixture {
+            pin_count: AtomicUsize::new(0),
+            stock: Mutex::new(ForkStock::new(
+                CARRIER,
+                ForkControlCapacity::exclusive(0x1_0000_0000),
+                UntaggedRoots,
+            )),
+        });
+        {
+            let mut stock = carrier.stock.lock().unwrap();
+            stock
+                .install(
+                    (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+                    lifecycles(1),
+                )
+                .unwrap();
+        }
+        carrier.pin_count.fetch_add(1, Ordering::SeqCst);
+        let pin = WeakCarrierPin(Arc::downgrade(&carrier));
+        assert_eq!(carrier.pin_count.load(Ordering::SeqCst), 1);
+        let parent = parent();
+        let mut exchange = ForkStockExchange::new(request(parent, 302, 2, 1)).unwrap();
+        let loan = carrier
+            .stock
+            .lock()
+            .unwrap()
+            .loan(&mut NoTableLedger, parent, &mut exchange, |_| true)
+            .unwrap();
+        let completion = PortalForkCompletion {
+            request: loan.request,
+            // SAFETY: exact admitted child fixture.
+            child: unsafe {
+                El1MmHandle::from_admitted_owner(CARRIER, loan.request.child_mm, NonZeroU64::MIN)
+            },
+            parent_generation: ReservationGeneration::INITIAL,
+            child_tables_used: 4096,
+            parent_tables_used: 0,
+        };
+        let mut reserve =
+            ForkStockSettlement::reserve(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
+                .unwrap();
+        carrier
+            .stock
+            .lock()
+            .unwrap()
+            .reserve_custody(parent, &mut reserve, |_| true, |_| true, |_, _, _| Ok(pin))
+            .unwrap();
+        let mut settlement = ForkStockSettlement::commit_reserved(loan, completion).unwrap();
+        carrier
+            .stock
+            .lock()
+            .unwrap()
+            .settle(
+                &mut NoTableLedger,
+                parent,
+                &mut settlement,
+                |_| true,
+                |_| true,
+                |_| true,
+            )
+            .unwrap();
+        assert_eq!(carrier.stock.lock().unwrap().live_children(), 1);
+        carrier
+    };
+
+    // 1. Dropping the carrier with a committed child still in stock drops the carrier immediately.
+    let carrier = make_carrier();
+    let weak = Arc::downgrade(&carrier);
+    drop(carrier);
+    assert!(
+        weak.upgrade().is_none(),
+        "committed child retaining a Weak pin venue must not cycle the carrier"
+    );
+
+    // 2. Draining fork stock on VM destroy releases the committed child's stage-2 pin.
+    let carrier = make_carrier();
+    assert_eq!(carrier.pin_count.load(Ordering::SeqCst), 1);
+    let drained = std::mem::replace(
+        &mut *carrier.stock.lock().unwrap(),
+        ForkStock::new(CARRIER, None, UntaggedRoots),
+    );
+    drop(drained);
+    assert_eq!(carrier.stock.lock().unwrap().live_children(), 0);
+    assert_eq!(
+        carrier.pin_count.load(Ordering::SeqCst),
+        0,
+        "draining fork stock at teardown must release committed-child stage-2 pins"
+    );
+}
+
 const CARRIER: NonZeroU64 = NonZeroU64::new(7).unwrap();
 const PARENT_MM: u64 = 301;
 
@@ -120,9 +316,13 @@ fn commit<T: ChildAddressTags>(
         child_tables_used: child_used * 4096,
         parent_tables_used: parent_used * 4096,
     };
-    let mut settlement =
-        ForkStockSettlement::new(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
+    let mut reserve =
+        ForkStockSettlement::reserve(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
             .unwrap();
+    stock
+        .reserve_custody(exec, &mut reserve, |_| true, |_| true, |_, _, _| Ok(()))
+        .map_err(|_| ForkStockServiceError::InvalidRecord)?;
+    let mut settlement = ForkStockSettlement::commit_reserved(loan, completion).unwrap();
     stock.settle(
         &mut NoTableLedger,
         exec,
@@ -511,19 +711,32 @@ fn commit_refuses_dirty_unused_tables() {
         child_tables_used: 4096,
         parent_tables_used: 0,
     };
-    let mut settlement =
-        ForkStockSettlement::new(granted, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
+    let mut reserve =
+        ForkStockSettlement::reserve(granted, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
             .unwrap();
+    assert_eq!(
+        stock
+            .reserve_custody(
+                parent(),
+                &mut reserve,
+                |_| true,
+                |_| false,
+                |_, _, _| Ok(())
+            )
+            .unwrap_err(),
+        ForkStockRefusal::Invalid
+    );
+    let mut settlement = ForkStockSettlement::commit_reserved(granted, completion).unwrap();
     assert_eq!(
         stock.settle(
             &mut NoTableLedger,
             parent(),
             &mut settlement,
             |_| true,
-            |_| false,
+            |_| true,
             |_| true
         ),
-        Err(ForkStockServiceError::ExposedDirtyTable)
+        Err(ForkStockServiceError::InvalidRecord)
     );
     assert!(stock.pending(CpuId::new(0)).is_some());
 }
@@ -1107,11 +1320,40 @@ fn second_candidate_refusal_keeps_first_candidate_released_and_returned() {
     assert_eq!(stock.counters().returned_children, 1);
 }
 
-/// A carrier that must publish other state (KVM attaches inherited frames)
-/// validates the whole commit first, so nothing is published for a commit
-/// the stock would refuse.
 #[test]
-fn validate_commit_refuses_before_any_carrier_publication() {
+fn unreserved_commit_cannot_bypass_physical_custody_admission() {
+    let mut stock = stock(UntaggedRoots, 4, 1);
+    let granted = loan(&mut stock, parent(), 302, 2, 1).unwrap();
+    let completion = PortalForkCompletion {
+        request: granted.request,
+        child: unsafe {
+            El1MmHandle::from_admitted_owner(CARRIER, granted.request.child_mm, NonZeroU64::MIN)
+        },
+        parent_generation: ReservationGeneration::new(2).unwrap(),
+        child_tables_used: 4096,
+        parent_tables_used: 0,
+    };
+    let mut commit = ForkStockSettlement::commit_reserved(granted, completion).unwrap();
+    assert_eq!(
+        stock.settle(
+            &mut NoTableLedger,
+            parent(),
+            &mut commit,
+            |_| true,
+            |_| true,
+            |_| true,
+        ),
+        Err(ForkStockServiceError::InvalidRecord),
+        "every Commit must consume pre-publication physical custody admission"
+    );
+    assert_eq!(stock.live_children(), 0);
+    assert!(stock.pending(parent().cpu).is_some());
+}
+
+/// Reservation validates the whole completion before retaining physical custody,
+/// and committing without an admitted reservation is refused.
+#[test]
+fn reserve_custody_refuses_invalid_completion_before_retaining_physical_custody() {
     let mut stock = stock(UntaggedRoots, 4, 1);
     let granted = loan(&mut stock, parent(), 302, 2, 1).unwrap();
     let completion = PortalForkCompletion {
@@ -1124,21 +1366,55 @@ fn validate_commit_refuses_before_any_carrier_publication() {
         child_tables_used: 4096,
         parent_tables_used: 0,
     };
-    let settlement =
-        ForkStockSettlement::new(granted, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
+    let mut reserve_dirty =
+        ForkStockSettlement::reserve(granted, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
             .unwrap();
     assert_eq!(
-        stock.validate_commit(parent(), &settlement, |_| true, |_| false),
-        Err(ForkStockServiceError::ExposedDirtyTable)
+        stock
+            .reserve_custody(
+                parent(),
+                &mut reserve_dirty,
+                |_| true,
+                |_| false,
+                |_, _, _| panic!("retain_physical must not run when unused tables are dirty")
+            )
+            .unwrap_err(),
+        ForkStockRefusal::Invalid
     );
+    let mut reserve_unresolvable =
+        ForkStockSettlement::reserve(granted, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
+            .unwrap();
     assert_eq!(
-        stock.validate_commit(parent(), &settlement, |_| false, |_| true),
-        Err(ForkStockServiceError::MemoryAccessFailed)
+        stock
+            .reserve_custody(
+                parent(),
+                &mut reserve_unresolvable,
+                |_| false,
+                |_| true,
+                |_, _, _| panic!("retain_physical must not run when tables are unresolvable")
+            )
+            .unwrap_err(),
+        ForkStockRefusal::Inventory
     );
     assert!(stock.pending(CpuId::new(0)).is_some(), "nothing consumed");
+    let mut unreserved_commit = ForkStockSettlement::commit_reserved(granted, completion).unwrap();
     assert_eq!(
-        stock.validate_commit(parent(), &settlement, |_| true, |_| true),
-        Ok(completion)
+        stock.commit_admitted(&mut NoTableLedger, parent(), &mut unreserved_commit),
+        Err(ForkStockServiceError::InvalidRecord)
+    );
+    let mut reserve_ok =
+        ForkStockSettlement::reserve(granted, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
+            .unwrap();
+    assert!(
+        stock
+            .reserve_custody(
+                parent(),
+                &mut reserve_ok,
+                |_| true,
+                |_| true,
+                |_, _, _| Ok(())
+            )
+            .is_ok()
     );
 }
 
@@ -1212,4 +1488,219 @@ fn refusal_reports_installed_quarantine_and_exact_lifecycle_resource() {
     );
     assert!(cleared.borrow().is_empty());
     assert_eq!(stock.counters().capacity_refusals, 1);
+}
+
+#[test]
+fn reserve_custody_refuses_retired_munmap_backing_and_rolls_back_earlier_pins() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct PhysicalPin(Arc<AtomicUsize>);
+    impl Drop for PhysicalPin {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let dropped_first = Arc::new(AtomicUsize::new(0));
+    let mut stock: ForkStock<UntaggedRoots, Vec<PhysicalPin>> = ForkStock::new(
+        CARRIER,
+        ForkControlCapacity::exclusive(0x1_0000_0000),
+        UntaggedRoots,
+    );
+    stock
+        .install(
+            (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            lifecycles(1),
+        )
+        .unwrap();
+    let exec = parent();
+    let mut exchange = ForkStockExchange::new(request(exec, 302, 2, 1)).unwrap();
+    let granted = stock
+        .loan(&mut NoTableLedger, exec, &mut exchange, |_| true)
+        .unwrap();
+    let completion = PortalForkCompletion {
+        request: granted.request,
+        // SAFETY: exact admitted child fixture.
+        child: unsafe {
+            El1MmHandle::from_admitted_owner(CARRIER, granted.request.child_mm, NonZeroU64::MIN)
+        },
+        parent_generation: ReservationGeneration::INITIAL,
+        child_tables_used: 4096,
+        parent_tables_used: 0,
+    };
+    let mut reserve =
+        ForkStockSettlement::reserve(granted, completion, KernelVa::new(0xffff_8000_0001_0000), 2)
+            .unwrap();
+    let result = stock.reserve_custody(
+        exec,
+        &mut reserve,
+        |_| true,
+        |_| true,
+        |_req, _addr, count| {
+            assert_eq!(count, 2);
+            let _pin = PhysicalPin(Arc::clone(&dropped_first));
+            // Second mapping's stage-2 record entered RetirementRequested from concurrent munmap.
+            Err(ForkStockRefusal::Inventory)
+        },
+    );
+    assert_eq!(result.unwrap_err(), ForkStockRefusal::Inventory);
+    assert_eq!(
+        reserve.take(granted),
+        Some(Err(ForkStockRefusal::Inventory))
+    );
+    assert_eq!(
+        dropped_first.load(Ordering::SeqCst),
+        1,
+        "earlier pin in the batch must be dropped immediately when reservation refuses"
+    );
+    assert_eq!(stock.counters().inventory_refusals, 1);
+    assert!(
+        stock
+            .pending(CpuId::new(0))
+            .unwrap()
+            .admitted_custody()
+            .is_none()
+    );
+    assert_eq!(stock.live_children(), 0);
+
+    // The guest scrubs and aborts the loan back to stock.
+    let mut abort = ForkStockSettlement::abort(granted);
+    stock
+        .settle(
+            &mut NoTableLedger,
+            exec,
+            &mut abort,
+            |_| true,
+            |_| true,
+            |_| true,
+        )
+        .unwrap();
+    assert!(stock.pending(CpuId::new(0)).is_none());
+    assert_eq!(stock.table_stock().len(), 4);
+    assert!(stock.lifecycle_available());
+}
+
+#[test]
+fn admitted_custody_token_drops_reserved_pins_on_abort_and_consumes_infallibly_on_commit() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct PhysicalPin(Arc<AtomicUsize>);
+    impl Drop for PhysicalPin {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let mut stock: ForkStock<UntaggedRoots, Vec<PhysicalPin>> = ForkStock::new(
+        CARRIER,
+        ForkControlCapacity::exclusive(0x1_0000_0000),
+        UntaggedRoots,
+    );
+    stock
+        .install(
+            (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            lifecycles(1),
+        )
+        .unwrap();
+    let exec = parent();
+
+    // 1. Reserve custody, then abort before commit: reserved pins drop on abort.
+    let mut exchange = ForkStockExchange::new(request(exec, 302, 2, 1)).unwrap();
+    let granted = stock
+        .loan(&mut NoTableLedger, exec, &mut exchange, |_| true)
+        .unwrap();
+    let completion = PortalForkCompletion {
+        request: granted.request,
+        // SAFETY: exact admitted child fixture.
+        child: unsafe {
+            El1MmHandle::from_admitted_owner(CARRIER, granted.request.child_mm, NonZeroU64::MIN)
+        },
+        parent_generation: ReservationGeneration::INITIAL,
+        child_tables_used: 4096,
+        parent_tables_used: 0,
+    };
+    let mut reserve =
+        ForkStockSettlement::reserve(granted, completion, KernelVa::new(0xffff_8000_0001_0000), 1)
+            .unwrap();
+    stock
+        .reserve_custody(
+            exec,
+            &mut reserve,
+            |_| true,
+            |_| true,
+            |_, _, _| Ok(vec![PhysicalPin(Arc::clone(&dropped))]),
+        )
+        .unwrap();
+    assert_eq!(reserve.take(granted), Some(Ok(())));
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    let mut abort = ForkStockSettlement::abort(granted);
+    stock
+        .settle(
+            &mut NoTableLedger,
+            exec,
+            &mut abort,
+            |_| true,
+            |_| true,
+            |_| true,
+        )
+        .unwrap();
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        1,
+        "aborting a loan with reserved custody must drop its physical pins"
+    );
+
+    // 2. Reserve custody, then commit_admitted: consumes the admitted custody into CommittedChild.
+    let mut exchange = ForkStockExchange::new(request(exec, 303, 2, 1)).unwrap();
+    let granted = stock
+        .loan(&mut NoTableLedger, exec, &mut exchange, |_| true)
+        .unwrap();
+    let completion = PortalForkCompletion {
+        request: granted.request,
+        // SAFETY: exact admitted child fixture.
+        child: unsafe {
+            El1MmHandle::from_admitted_owner(CARRIER, granted.request.child_mm, NonZeroU64::MIN)
+        },
+        parent_generation: ReservationGeneration::INITIAL,
+        child_tables_used: 4096,
+        parent_tables_used: 0,
+    };
+    let mut reserve =
+        ForkStockSettlement::reserve(granted, completion, KernelVa::new(0xffff_8000_0001_0000), 1)
+            .unwrap();
+    stock
+        .reserve_custody(
+            exec,
+            &mut reserve,
+            |_| true,
+            |_| true,
+            |_, _, _| Ok(vec![PhysicalPin(Arc::clone(&dropped))]),
+        )
+        .unwrap();
+    let mut commit = ForkStockSettlement::commit_reserved(granted, completion).unwrap();
+    stock
+        .commit_admitted(&mut NoTableLedger, exec, &mut commit)
+        .unwrap();
+    assert_eq!(commit.take(granted), Some(Ok(())));
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    let child = child_of(granted, 44);
+    let mut retire = NativeChildRetire::new(child.binding, child.context).unwrap();
+    stock.retire_child(child, &mut retire).unwrap();
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    stock
+        .reclaim(
+            &mut NoTableLedger,
+            mm(PARENT_MM),
+            absent,
+            |_| true,
+            |_| true,
+            |_| true,
+        )
+        .unwrap();
+    assert_eq!(dropped.load(Ordering::SeqCst), 2);
 }

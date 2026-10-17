@@ -254,10 +254,31 @@ struct ProcessPhysicalRetirementState {
 #[derive(Default)]
 struct ProcessPhysicalRetirementPublication {
     exit_started: bool,
-    completions: Option<Vec<continuation::LogicalJobCompletion>>,
+    completions:
+        carrick_core::terminal::ProcessPhysicalPublication<Vec<continuation::LogicalJobCompletion>>,
 }
 
 impl ProcessPhysicalRetirement {
+    pub(crate) fn publish_failure_if_absent(
+        &self,
+        make_completions: impl FnOnce() -> Result<Vec<continuation::LogicalJobCompletion>, RuntimeError>,
+    ) -> Result<bool, RuntimeError> {
+        let mut publication = self.state.publication.lock();
+        let Some(owner) = publication.completions.claim_owner() else {
+            return Ok(false);
+        };
+        let completions = make_completions()?;
+        if completions.is_empty() {
+            return Err(RuntimeError::Configuration(
+                "HVPatch terminal physical-retirement receipt omitted every process member"
+                    .to_owned(),
+            ));
+        }
+        owner.publish(completions);
+        self.state.changed.notify_all();
+        Ok(true)
+    }
+
     pub(crate) fn begin_process_exit(&self) {
         let mut publication = self.state.publication.lock();
         publication.exit_started = true;
@@ -275,12 +296,11 @@ impl ProcessPhysicalRetirement {
             ));
         }
         let mut publication = self.state.publication.lock();
-        if publication.completions.is_some() {
+        if publication.completions.publish(completions).is_err() {
             return Err(RuntimeError::Configuration(
                 "HVPatch process physical-retirement receipt was published twice".to_owned(),
             ));
         }
-        publication.completions = Some(completions);
         self.state.changed.notify_all();
         Ok(())
     }
@@ -292,7 +312,7 @@ impl ProcessPhysicalRetirement {
     pub(crate) fn wait_if_exit_started_or_published(&self) -> Result<(), RuntimeError> {
         let must_wait = {
             let publication = self.state.publication.lock();
-            publication.exit_started || publication.completions.is_some()
+            publication.exit_started || publication.completions.published().is_some()
         };
         if must_wait { self.wait() } else { Ok(()) }
     }
@@ -304,7 +324,7 @@ impl ProcessPhysicalRetirement {
         let completions = {
             let mut publication = self.state.publication.lock();
             let mut deadline = None;
-            while publication.completions.is_none() {
+            while publication.completions.published().is_none() {
                 if !publication.exit_started {
                     self.state.changed.wait(&mut publication);
                     continue;
@@ -322,7 +342,7 @@ impl ProcessPhysicalRetirement {
                     .changed
                     .wait_for(&mut publication, remaining)
                     .timed_out()
-                    && publication.completions.is_none()
+                    && publication.completions.published().is_none()
                 {
                     return Err(RuntimeError::CarrierFailed(
                         "HVPatch terminal physical-retirement receipt was not published".to_owned(),
@@ -331,7 +351,7 @@ impl ProcessPhysicalRetirement {
             }
             publication
                 .completions
-                .as_ref()
+                .published()
                 .unwrap_or_else(|| carrick_fatal!("kernel::terminal_settlement", "A notified physical-retirement wait without its completion receipt is a torn terminal publication"))
                 .clone()
         };
@@ -1439,6 +1459,33 @@ mod tests {
                 .contains("terminal physical-retirement receipt was not published"),
             "unexpected invariant: {error}"
         );
+    }
+
+    #[test]
+    fn failure_settlement_reuses_normal_physical_retirement_receipt() {
+        let retirement = ProcessPhysicalRetirement::default();
+        let normal = continuation::LogicalJobCompletion::pending();
+        retirement
+            .publish(vec![normal.clone()])
+            .expect("normal receipt");
+        let mut rebuilt = false;
+        assert!(
+            !retirement
+                .publish_failure_if_absent(|| {
+                    rebuilt = true;
+                    Ok(vec![continuation::LogicalJobCompletion::pending()])
+                })
+                .expect("reuse normal receipt")
+        );
+        assert!(
+            !rebuilt,
+            "failure settlement must not drain members a second time"
+        );
+        normal.publish();
+        normal.publish_physical_retirement_for_test();
+        retirement
+            .wait()
+            .expect("normal receipt remains authoritative");
     }
 
     #[test]

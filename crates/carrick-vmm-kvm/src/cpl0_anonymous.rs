@@ -381,6 +381,18 @@ fn release_retired_child(
         .map_err(|e| fail(e.to_string()))
 }
 
+fn rollback_fork_parent_residency(
+    residency: &carrick_el1_abi::FrameGrantResidencyTable,
+    publications: &[(usize, carrick_el1_abi::FrameGrantResidencyIdentity)],
+) -> Result<(), TrapError> {
+    for &(slot, identity) in publications.iter().rev() {
+        if !residency.retire(slot, identity) {
+            return Err(fail("physical fork parent residency rollback"));
+        }
+    }
+    Ok(())
+}
+
 /// The fork stock exactly as KVM boot stocks it.
 pub(super) struct BootForkStock {
     /// The dedicated maintenance-root grant (`MAINTENANCE_ROOT_TABLE_CREDITS`).
@@ -851,12 +863,18 @@ impl Cpl0HostCustody {
         let (_, tag) = unsafe { self.read_stack_record::<u64>(lease, execution.context, address) }?;
         match carrick_el1_abi::ForkStockKind::decode(tag) {
             Some(carrick_el1_abi::ForkStockKind::Loan) => {}
+            Some(carrick_el1_abi::ForkStockKind::Reserve) => {
+                self.reserve_fork_stock(lease, execution, address)?;
+                return Ok(None);
+            }
             Some(
                 carrick_el1_abi::ForkStockKind::Commit | carrick_el1_abi::ForkStockKind::Abort,
             ) => {
                 return self.settle_fork_stock(lease, execution, address);
             }
-            None => return Err(fail("physical fork stock unknown record tag")),
+            None => {
+                return Err(fail("physical fork stock unknown record tag"));
+            }
         }
         let physical =
             self.stack_record_physical::<ForkStockExchange>(lease, execution.context, address)?;
@@ -901,13 +919,335 @@ impl Cpl0HostCustody {
         Ok(None)
     }
 
+    fn reserve_fork_stock(
+        &mut self,
+        lease: &StoppedCpuLease<'_>,
+        execution: GrantExecution,
+        address: u64,
+    ) -> Result<(), TrapError> {
+        use carrick_el1_abi::{ForkStockRefusal, ForkStockSettlement, PortalForkCustody};
+        let loan = self
+            .fork_stock
+            .settlement_loan(execution)
+            .map_err(|e| fail(format!("physical fork reservation: {e:?}")))?;
+        let (physical, mut record) = unsafe {
+            self.read_stack_record::<ForkStockSettlement>(lease, execution.context, address)
+        }?;
+        let (completion, custody, count) = record
+            .reservation(loan)
+            .ok_or_else(|| fail("physical fork reservation receipt"))?;
+        let len = count
+            .checked_mul(32)
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| fail("physical fork custody length"))?;
+        let wire = self.read_kernel_pod_bytes(execution.context, custody, len, 8)?;
+        let frame_inventory = Arc::clone(&self.frame_inventory);
+        let mut trap_error: Option<TrapError> = None;
+        let inventory_published = std::cell::Cell::new(false);
+        let root_installed = std::cell::Cell::new(false);
+        let mut parent_residency = Vec::new();
+        let refused = {
+            let vm = std::cell::RefCell::new(&mut self._vm);
+            self.fork_stock
+                .reserve_custody(
+                    execution,
+                    &mut record,
+                    |pages| tables_resolve(&vm.borrow(), pages),
+                    |pages| tables_are_zero(&vm.borrow(), pages),
+                    |_request, _custody_va, _count| {
+                        let mut vm = vm.borrow_mut();
+                        let child = AddressContext {
+                            mm: carrick_guest_arch::MmGeneration::new(
+                                NonZeroU64::new(loan.request.child_mm.raw()).ok_or_else(|| {
+                                    trap_error = Some(fail("physical child MM"));
+                                    ForkStockRefusal::Invalid
+                                })?,
+                            ),
+                            root: RootGpa::page_aligned(FrameGpa::new(
+                                loan.request.child_tables.base,
+                            ))
+                            .ok_or_else(|| {
+                                trap_error = Some(fail("physical child root"));
+                                ForkStockRefusal::Invalid
+                            })?,
+                            generation: carrick_guest_arch::ContextGeneration::new(
+                                completion.child.incarnation(),
+                            ),
+                        };
+                        let mut edges = Vec::new();
+                        let mut spans = std::collections::BTreeSet::new();
+                        for words in wire.chunks_exact(32) {
+                            let words = std::array::from_fn(|i| {
+                                u64::from_ne_bytes(std::array::from_fn(|byte| words[i * 8 + byte]))
+                            });
+                            let selected = PortalForkCustody::decode(words).ok_or_else(|| {
+                                trap_error = Some(fail("physical fork custody encoding"));
+                                ForkStockRefusal::Invalid
+                            })?;
+                            let selected_edges = vm
+                                .select_inherited_frames(
+                                    execution.context,
+                                    selected,
+                                    &*frame_inventory,
+                                )
+                                .map_err(|error| match error {
+                                    crate::carrier_memory::InheritedFrameSelectionError::MappingGone => {
+                                        ForkStockRefusal::Inventory
+                                    }
+                                    crate::carrier_memory::InheritedFrameSelectionError::Invariant(
+                                        error,
+                                    ) => {
+                                        trap_error = Some(fail(error.to_string()));
+                                        ForkStockRefusal::Invalid
+                                    }
+                                })?;
+                            for edge in selected_edges {
+                                if !spans.insert(edge.span().va) {
+                                    trap_error =
+                                        Some(fail("physical fork duplicate inherited page"));
+                                    return Err(ForkStockRefusal::Invalid);
+                                }
+                                edges.push(edge);
+                            }
+                        }
+                        let parent_inventory = frame_inventory.bind(execution.context.into());
+                        let child_inventory = frame_inventory.bind(child.into());
+                        parent_residency
+                            .try_reserve_exact(edges.len())
+                            .map_err(|_| ForkStockRefusal::Capacity)?;
+                        let mut rows = std::collections::BTreeMap::new();
+                        for edge in &edges {
+                            let identity = edge.identity();
+                            let mapping = MappingId::from_kernel_allocation(identity.mapping_id);
+                            let Some(row) = parent_inventory.live_mapping_row(mapping) else {
+                                return Err(ForkStockRefusal::Inventory);
+                            };
+                            if row.frame != FrameId::from_kernel_allocation(identity.frame_id)
+                                || row.generation
+                                    != MappingGeneration::from_backend_counter(
+                                        identity.owner_generation,
+                                    )
+                                || edge.physical().raw() < row.gpa.0
+                                || edge.physical().raw().checked_add(4096).is_none_or(|end| {
+                                    row.gpa
+                                        .0
+                                        .checked_add(row.length.raw())
+                                        .is_none_or(|limit| end > limit)
+                                })
+                            {
+                                trap_error = Some(fail("physical fork source mapping identity"));
+                                return Err(ForkStockRefusal::Invalid);
+                            }
+                            rows.insert(identity.mapping_id, row);
+                        }
+                        let capacity = FrameEventCapacity::for_event_count(
+                            rows.len().checked_mul(2).ok_or_else(|| {
+                                trap_error = Some(fail("physical fork inventory capacity"));
+                                ForkStockRefusal::Invalid
+                            })?,
+                        )
+                        .map_err(|e| {
+                            trap_error = Some(fail(e.to_string()));
+                            ForkStockRefusal::Invalid
+                        })?;
+                        let mut reservation = child_inventory
+                            .reserve(0, rows.len(), capacity.get())
+                            .map_err(|e| {
+                                trap_error = Some(fail(e.to_string()));
+                                ForkStockRefusal::Inventory
+                            })?;
+                        let transaction = reservation.transaction();
+                        let generation = MappingGeneration::from_backend_counter(NonZeroU64::MIN);
+                        let mut mappings = std::collections::BTreeMap::new();
+                        for (source, row) in &rows {
+                            let mapping = reservation.claim_mapping().map_err(|e| {
+                                trap_error = Some(fail(e.to_string()));
+                                ForkStockRefusal::Inventory
+                            })?;
+                            reservation
+                                .push(FrameInventoryEvent::PrepareMapping {
+                                    transaction,
+                                    frame: row.frame,
+                                    mapping,
+                                    generation,
+                                    gpa: row.gpa,
+                                    length: row.length,
+                                    permissions: row.permissions,
+                                })
+                                .map_err(|e| {
+                                    trap_error = Some(fail(e.to_string()));
+                                    ForkStockRefusal::Inventory
+                                })?;
+                            reservation
+                                .push(FrameInventoryEvent::PublishMapping {
+                                    transaction,
+                                    mapping,
+                                    generation,
+                                })
+                                .map_err(|e| {
+                                    trap_error = Some(fail(e.to_string()));
+                                    ForkStockRefusal::Inventory
+                                })?;
+                            mappings.insert(*source, mapping);
+                        }
+                        let receipt = child_inventory
+                            .apply_with_receipt(reservation.commit(()))
+                            .map_err(|e| {
+                                trap_error = Some(fail(e.to_string()));
+                                ForkStockRefusal::Inventory
+                            })?;
+                        inventory_published.set(true);
+                        vm.install_root(child.mm.raw(), child).map_err(|e| {
+                            trap_error = Some(fail(e.to_string()));
+                            ForkStockRefusal::Inventory
+                        })?;
+                        root_installed.set(true);
+                        let mut resident_windows = std::collections::BTreeSet::new();
+                        for edge in &edges {
+                            let source = edge.identity();
+                            let mapping = mappings.get(&source.mapping_id).ok_or_else(|| {
+                                trap_error = Some(fail("physical fork mapping selection"));
+                                ForkStockRefusal::Invalid
+                            })?;
+                            let identity = BackingIdentity {
+                                frame_id: source.frame_id,
+                                mapping_id: NonZeroU64::new(mapping.raw()).ok_or_else(|| {
+                                    trap_error = Some(fail("physical fork mapping identity"));
+                                    ForkStockRefusal::Invalid
+                                })?,
+                                owner_generation: NonZeroU64::MIN,
+                                inventory_revision: NonZeroU64::new(receipt.revision())
+                                    .ok_or_else(|| {
+                                        trap_error = Some(fail("physical fork inventory revision"));
+                                        ForkStockRefusal::Invalid
+                                    })?,
+                            };
+                            vm.attach_inherited_frame(
+                                child,
+                                edge,
+                                identity,
+                                &receipt,
+                                &*frame_inventory,
+                            )
+                            .map_err(|e| {
+                                trap_error = Some(fail(e.to_string()));
+                                ForkStockRefusal::Inventory
+                            })?;
+                            // SAFETY: same retained kernel region as the original COW pool.
+                            let residency = unsafe {
+                                vm.retained_record::<carrick_el1_abi::FrameGrantResidencyTable>(
+                                    FrameGpa::new(
+                                        KERNEL_REGION_GPA
+                                            + carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET,
+                                    ),
+                                )
+                            }
+                            .map_err(|e| {
+                                trap_error = Some(fail(e.to_string()));
+                                ForkStockRefusal::Inventory
+                            })?;
+                            let parent =
+                                residency.lookup(execution.context.mm.raw().get(), edge.span().va);
+                            let mut resident = parent.map(|page| page.identity).unwrap_or(
+                                carrick_el1_abi::FrameGrantResidencyIdentity {
+                                    mm_key: execution.context.mm.raw().get(),
+                                    semantic_base: edge.span().va,
+                                    physical_ipa: edge.physical().raw(),
+                                    len: 4096,
+                                    frame_id: source.frame_id.get(),
+                                    mapping_id: source.mapping_id.get(),
+                                    owner_generation: source.owner_generation.get(),
+                                    inventory_revision: source.inventory_revision.get(),
+                                },
+                            );
+                            if parent.is_none() {
+                                let slot = residency.publish(resident).ok_or_else(|| {
+                                    trap_error =
+                                        Some(fail("physical fork source residency capacity"));
+                                    ForkStockRefusal::Inventory
+                                })?;
+                                parent_residency.push((slot, resident));
+                                let page = residency
+                                    .lookup(resident.mm_key, edge.span().va)
+                                    .ok_or_else(|| {
+                                        trap_error = Some(fail(
+                                            "physical fork source residency publication",
+                                        ));
+                                        ForkStockRefusal::Inventory
+                                    })?;
+                                if edge.is_resident() && !residency.record_commit(page) {
+                                    trap_error = Some(fail("physical fork source commit proof"));
+                                    return Err(ForkStockRefusal::Inventory);
+                                }
+                            }
+                            resident.mm_key = child.mm.raw().get();
+                            resident.mapping_id = identity.mapping_id.get();
+                            resident.owner_generation = identity.owner_generation.get();
+                            resident.inventory_revision = identity.inventory_revision.get();
+                            if resident_windows.insert(resident.semantic_base) {
+                                residency.publish(resident).ok_or_else(|| {
+                                    trap_error =
+                                        Some(fail("physical fork child residency capacity"));
+                                    ForkStockRefusal::Inventory
+                                })?;
+                            }
+                            let page = residency
+                                .lookup(resident.mm_key, edge.span().va)
+                                .ok_or_else(|| {
+                                    trap_error =
+                                        Some(fail("physical fork child residency publication"));
+                                    ForkStockRefusal::Inventory
+                                })?;
+                            if page.expected_ipa != edge.physical().raw()
+                                || (edge.is_resident() && !residency.record_commit(page))
+                            {
+                                trap_error = Some(fail("physical fork child commit proof"));
+                                return Err(ForkStockRefusal::Inventory);
+                            }
+                        }
+                        Ok(())
+                    },
+                )
+                .is_err()
+        };
+        if refused && !parent_residency.is_empty() {
+            rollback_fork_parent_residency(self.cow_residency()?, &parent_residency)?;
+        }
+        if refused && inventory_published.get() {
+            if root_installed.get() {
+                let absence = SlotAbsence::scan(loan.request.child_mm, [])
+                    .ok_or_else(|| fail("unpublished child MM slot absence"))?;
+                release_retired_child(&mut self._vm, &*frame_inventory, &absence)?;
+            } else if !carrick_hal::fork_stock::release_child_mm(
+                &*frame_inventory,
+                self.cow_residency()?,
+                loan.request.child_mm,
+            ) {
+                return Err(fail("unpublished child inventory rollback"));
+            }
+        }
+        if let Some(err) = trap_error {
+            return Err(err);
+        }
+        // SAFETY: settlement is a fully initialized array of sixteen u64 words.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&raw const record).cast::<u8>(),
+                size_of::<ForkStockSettlement>(),
+            )
+        };
+        self._vm
+            .write(physical, bytes)
+            .map_err(|e| fail(e.to_string()))
+    }
+
     fn settle_fork_stock(
         &mut self,
         lease: &StoppedCpuLease<'_>,
         execution: GrantExecution,
         address: u64,
     ) -> Result<Option<GuestArchBinding>, TrapError> {
-        use carrick_el1_abi::{ForkStockSettlement, PortalForkCustody};
+        use carrick_el1_abi::ForkStockSettlement;
         let loan = self
             .fork_stock
             .settlement_loan(execution)
@@ -915,26 +1255,17 @@ impl Cpl0HostCustody {
         let (physical, mut record) = unsafe {
             self.read_stack_record::<ForkStockSettlement>(lease, execution.context, address)
         }?;
-        // An early abort licenses only untouched cold table stock, which the
-        // shared settlement proves zero; a restored descriptor tree would
-        // need its own exact guest receipt. A commit first attaches the
-        // child's inherited frames and residency.
-        let mut committed_child = None;
-        if !record.abort_matches(loan) {
-            // Validate the whole commit before attaching any inherited
-            // frame, so nothing is published for a refused commit.
-            self.fork_stock
-                .validate_commit(
-                    execution,
-                    &record,
-                    |pages| tables_resolve(&self._vm, pages),
-                    |pages| tables_are_zero(&self._vm, pages),
-                )
-                .map_err(|e| fail(format!("physical fork settlement: {e:?}")))?;
-            let (completion, custody, count) = record
+        let had_admitted = self
+            .fork_stock
+            .pending(execution.cpu)
+            .and_then(|pending| pending.admitted_custody())
+            .is_some();
+        let is_abort = record.abort_matches(loan);
+        let committed_child = if !is_abort {
+            let (completion, _custody, _count) = record
                 .request(loan)
                 .ok_or_else(|| fail("physical fork settlement receipt"))?;
-            let child = AddressContext {
+            Some(AddressContext {
                 mm: carrick_guest_arch::MmGeneration::new(
                     NonZeroU64::new(loan.request.child_mm.raw())
                         .ok_or_else(|| fail("physical child MM"))?,
@@ -944,162 +1275,10 @@ impl Cpl0HostCustody {
                 generation: carrick_guest_arch::ContextGeneration::new(
                     completion.child.incarnation(),
                 ),
-            };
-            committed_child = Some(child);
-            let len = count
-                .checked_mul(32)
-                .and_then(|n| usize::try_from(n).ok())
-                .ok_or_else(|| fail("physical fork custody length"))?;
-            let wire = self.read_kernel_pod_bytes(execution.context, custody, len, 8)?;
-            let mut edges = Vec::new();
-            let mut spans = std::collections::BTreeSet::new();
-            for words in wire.chunks_exact(32) {
-                let words = std::array::from_fn(|i| {
-                    u64::from_ne_bytes(std::array::from_fn(|byte| words[i * 8 + byte]))
-                });
-                let selected = PortalForkCustody::decode(words)
-                    .ok_or_else(|| fail("physical fork custody encoding"))?;
-                let selected_edges = self
-                    ._vm
-                    .select_inherited_frames(execution.context, selected, &*self.frame_inventory)
-                    .map_err(|e| fail(e.to_string()))?;
-                for edge in selected_edges {
-                    if !spans.insert(edge.span().va) {
-                        return Err(fail("physical fork duplicate inherited page"));
-                    }
-                    edges.push(edge);
-                }
-            }
-            let parent_inventory = self.frame_inventory.bind(execution.context.into());
-            let child_inventory = self.frame_inventory.bind(child.into());
-            let mut rows = std::collections::BTreeMap::new();
-            for edge in &edges {
-                let identity = edge.identity();
-                let mapping = MappingId::from_kernel_allocation(identity.mapping_id);
-                let row = parent_inventory
-                    .live_mapping_row(mapping)
-                    .ok_or_else(|| fail("physical fork source mapping absent"))?;
-                if row.frame != FrameId::from_kernel_allocation(identity.frame_id)
-                    || row.generation
-                        != MappingGeneration::from_backend_counter(identity.owner_generation)
-                    || edge.physical().raw() < row.gpa.0
-                    || edge.physical().raw().checked_add(4096).is_none_or(|end| {
-                        row.gpa
-                            .0
-                            .checked_add(row.length.raw())
-                            .is_none_or(|limit| end > limit)
-                    })
-                {
-                    return Err(fail("physical fork source mapping identity"));
-                }
-                rows.insert(identity.mapping_id, row);
-            }
-            let capacity = FrameEventCapacity::for_event_count(
-                rows.len()
-                    .checked_mul(2)
-                    .ok_or_else(|| fail("physical fork inventory capacity"))?,
-            )
-            .map_err(|e| fail(e.to_string()))?;
-            let mut reservation = child_inventory
-                .reserve(0, rows.len(), capacity.get())
-                .map_err(|e| fail(e.to_string()))?;
-            let transaction = reservation.transaction();
-            let generation = MappingGeneration::from_backend_counter(NonZeroU64::MIN);
-            let mut mappings = std::collections::BTreeMap::new();
-            for (source, row) in &rows {
-                let mapping = reservation
-                    .claim_mapping()
-                    .map_err(|e| fail(e.to_string()))?;
-                reservation
-                    .push(FrameInventoryEvent::PrepareMapping {
-                        transaction,
-                        frame: row.frame,
-                        mapping,
-                        generation,
-                        gpa: row.gpa,
-                        length: row.length,
-                        permissions: row.permissions,
-                    })
-                    .map_err(|e| fail(e.to_string()))?;
-                reservation
-                    .push(FrameInventoryEvent::PublishMapping {
-                        transaction,
-                        mapping,
-                        generation,
-                    })
-                    .map_err(|e| fail(e.to_string()))?;
-                mappings.insert(*source, mapping);
-            }
-            let receipt = child_inventory
-                .apply_with_receipt(reservation.commit(()))
-                .map_err(|e| fail(e.to_string()))?;
-            self._vm
-                .install_root(child.mm.raw(), child)
-                .map_err(|e| fail(e.to_string()))?;
-            let mut resident_windows = std::collections::BTreeSet::new();
-            for edge in &edges {
-                let source = edge.identity();
-                let mapping = mappings
-                    .get(&source.mapping_id)
-                    .ok_or_else(|| fail("physical fork mapping selection"))?;
-                let identity = BackingIdentity {
-                    frame_id: source.frame_id,
-                    mapping_id: NonZeroU64::new(mapping.raw())
-                        .ok_or_else(|| fail("physical fork mapping identity"))?,
-                    owner_generation: NonZeroU64::MIN,
-                    inventory_revision: NonZeroU64::new(receipt.revision())
-                        .ok_or_else(|| fail("physical fork inventory revision"))?,
-                };
-                self._vm
-                    .attach_inherited_frame(child, edge, identity, &receipt, &*self.frame_inventory)
-                    .map_err(|e| fail(e.to_string()))?;
-                let parent = self
-                    .cow_residency()?
-                    .lookup(execution.context.mm.raw().get(), edge.span().va);
-                let mut resident = parent.map(|page| page.identity).unwrap_or(
-                    carrick_el1_abi::FrameGrantResidencyIdentity {
-                        mm_key: execution.context.mm.raw().get(),
-                        semantic_base: edge.span().va,
-                        physical_ipa: edge.physical().raw(),
-                        len: 4096,
-                        frame_id: source.frame_id.get(),
-                        mapping_id: source.mapping_id.get(),
-                        owner_generation: source.owner_generation.get(),
-                        inventory_revision: source.inventory_revision.get(),
-                    },
-                );
-                if parent.is_none() {
-                    self.cow_residency()?
-                        .publish(resident)
-                        .ok_or_else(|| fail("physical fork source residency capacity"))?;
-                    let page = self
-                        .cow_residency()?
-                        .lookup(resident.mm_key, edge.span().va)
-                        .ok_or_else(|| fail("physical fork source residency publication"))?;
-                    if edge.is_resident() && !self.cow_residency()?.record_commit(page) {
-                        return Err(fail("physical fork source commit proof"));
-                    }
-                }
-                resident.mm_key = child.mm.raw().get();
-                resident.mapping_id = identity.mapping_id.get();
-                resident.owner_generation = identity.owner_generation.get();
-                resident.inventory_revision = identity.inventory_revision.get();
-                if resident_windows.insert(resident.semantic_base) {
-                    self.cow_residency()?
-                        .publish(resident)
-                        .ok_or_else(|| fail("physical fork child residency capacity"))?;
-                }
-                let page = self
-                    .cow_residency()?
-                    .lookup(resident.mm_key, edge.span().va)
-                    .ok_or_else(|| fail("physical fork child residency publication"))?;
-                if page.expected_ipa != edge.physical().raw()
-                    || (edge.is_resident() && !self.cow_residency()?.record_commit(page))
-                {
-                    return Err(fail("physical fork child commit proof"));
-                }
-            }
-        }
+            })
+        } else {
+            None
+        };
         let window = self.lifecycle_window();
         let memory = &self._vm;
         self.fork_stock
@@ -1112,6 +1291,11 @@ impl Cpl0HostCustody {
                 |lifecycle| window.clear(lifecycle),
             )
             .map_err(|e: ForkStockServiceError| fail(format!("physical fork settlement: {e:?}")))?;
+        if is_abort && had_admitted {
+            let absence = SlotAbsence::scan(loan.request.child_mm, [])
+                .ok_or_else(|| fail("aborted child MM slot absence"))?;
+            release_retired_child(&mut self._vm, &*self.frame_inventory, &absence)?;
+        }
         // SAFETY: settlement is a fully initialized array of sixteen u64 words.
         let bytes = unsafe {
             std::slice::from_raw_parts(
@@ -1880,7 +2064,7 @@ mod custody_tests {
         };
         assert!(boot.lifecycles.iter().all(|life| window.is_zero(*life)));
         let carrier = NonZeroU64::new(7).unwrap();
-        let mut stock = ForkStock::new(
+        let mut stock: ForkStock<UntaggedRoots, ()> = ForkStock::new(
             carrier,
             carrick_hal::fork_stock::ForkControlCapacity::unused(KERNEL_REGION_GPA),
             UntaggedRoots,
@@ -2334,5 +2518,49 @@ mod custody_tests {
             ..receipt
         };
         assert!(!exact_cow_receipt(alias, 0x401000, source, &alias_receipt));
+    }
+    #[test]
+    fn refused_fork_retires_only_its_new_parent_residency_rows() {
+        let mut storage = Box::<carrick_el1_abi::FrameGrantResidencyTable>::new_uninit();
+        // SAFETY: typed allocation supplies the complete table's alignment and size.
+        let residency = unsafe {
+            carrick_el1_abi::FrameGrantResidencyTable::init_in_place(storage.as_mut_ptr());
+            storage.assume_init()
+        };
+        let existing = carrick_el1_abi::FrameGrantResidencyIdentity {
+            mm_key: 301,
+            semantic_base: 0x400000,
+            physical_ipa: 0x800000,
+            len: 4096,
+            mapping_id: 1,
+            frame_id: 1,
+            owner_generation: 1,
+            inventory_revision: 1,
+        };
+        residency.publish(existing).unwrap();
+        let added = carrick_el1_abi::FrameGrantResidencyIdentity {
+            semantic_base: 0x401000,
+            physical_ipa: 0x801000,
+            mapping_id: 2,
+            frame_id: 2,
+            ..existing
+        };
+        let slot = residency.publish(added).unwrap();
+        let page = residency.lookup(added.mm_key, added.semantic_base).unwrap();
+        assert!(residency.record_commit(page));
+        rollback_fork_parent_residency(&residency, &[(slot, added)]).unwrap();
+        assert!(
+            residency
+                .lookup(added.mm_key, added.semantic_base)
+                .is_none()
+        );
+        assert_eq!(
+            residency
+                .lookup(existing.mm_key, existing.semantic_base)
+                .unwrap()
+                .identity,
+            existing
+        );
+        assert!(residency.publish(added).is_some());
     }
 }

@@ -5302,7 +5302,10 @@ pub(crate) mod tests {
             let mut case = pending_exec_drain_test_case(pid, origin);
 
             assert_eq!(
-                ProductionHvpatchLoopPoll::after_executor_failure_settlement(&mut case.job),
+                ProductionHvpatchLoopPoll::after_executor_failure_settlement(
+                    &mut case.job,
+                    "injected executor failure".to_owned(),
+                ),
                 continuation::ExecutorFailureSettlement::PublishCurrent,
                 "the executor that owns the pending exec must settle itself"
             );
@@ -5377,7 +5380,10 @@ pub(crate) mod tests {
         );
 
         assert_eq!(
-            ProductionHvpatchLoopPoll::after_executor_failure_settlement(&mut job),
+            ProductionHvpatchLoopPoll::after_executor_failure_settlement(
+                &mut job,
+                "injected executor failure".to_owned(),
+            ),
             continuation::ExecutorFailureSettlement::PublishCurrent,
             "a job that cannot prove an owner will publish it must publish itself"
         );

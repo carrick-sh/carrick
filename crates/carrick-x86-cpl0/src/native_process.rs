@@ -196,7 +196,6 @@ pub(super) struct Prepared {
     child: UnpublishedEl1Child<X86Mmu>,
     words: InitialWords,
     address: Mm,
-    custody: Vec<PortalForkCustody>,
 }
 pub(super) struct Born {
     prepared: Prepared,
@@ -229,7 +228,7 @@ impl Service {
         mapping_count: usize,
         count: ForkCensus,
         child_mm: MmGeneration,
-    ) -> Result<(UnpublishedEl1Child<X86Mmu>, Mm, Vec<PortalForkCustody>), NativeProcessError> {
+    ) -> Result<(UnpublishedEl1Child<X86Mmu>, Mm), NativeProcessError> {
         let abandon = |error| abandon_loan(&loan, None, error);
         // SAFETY: the physical owner loaned zero exclusive cold metadata.
         // Guest shared records alone initialize census and issue identities.
@@ -271,8 +270,8 @@ impl Service {
         custody
             .try_reserve_exact(plan.custody().len())
             .map_err(|_| free(NativeProcessError::Exhausted))?;
-        custody.extend_from_slice(plan.custody());
-        let child = match owner.publish_fork(plan, live, self.worker()) {
+        custody.extend(plan.custody().iter().copied().map(PortalForkCustody::words));
+        let mut child = match owner.publish_fork(plan, live, self.worker()) {
             Ok(child) => child,
             Err(e) => {
                 owner.spaces.free(index);
@@ -287,12 +286,45 @@ impl Service {
                 return Err(abandon_loan(&loan, Some(live), error(e)));
             }
         };
+        let abort_published = |child: &mut UnpublishedEl1Child<X86Mmu>, err: NativeProcessError| {
+            abort_child(owner, self.worker(), child, live, &loan)
+                .map_or(NativeProcessError::Quarantined, |()| err)
+        };
+        let Some(mut reserve) = ForkStockSettlement::reserve(
+            loan,
+            child.completion(),
+            KernelVa::new(custody.as_ptr() as u64),
+            custody.len() as u64,
+        ) else {
+            return Err(abort_published(&mut child, NativeProcessError::Stale));
+        };
+        // SAFETY: exact completion and original four-word custody records remain
+        // owned across the stopped crossing; graph and MM editors were released.
+        unsafe {
+            core::arch::asm!("out dx, eax", in("dx") FORK_STOCK_PORT, in("rax") &raw mut reserve, options(nostack));
+        }
+        match reserve.take(loan) {
+            Some(Ok(())) => {}
+            Some(Err(carrick_el1_abi::ForkStockRefusal::Capacity)) => {
+                return Err(abort_published(&mut child, NativeProcessError::Exhausted));
+            }
+            Some(Err(carrick_el1_abi::ForkStockRefusal::Inventory)) => {
+                return Err(abort_published(&mut child, NativeProcessError::Busy));
+            }
+            Some(Err(carrick_el1_abi::ForkStockRefusal::Stale)) => {
+                return Err(abort_published(&mut child, NativeProcessError::Stale));
+            }
+            Some(Err(carrick_el1_abi::ForkStockRefusal::Invalid)) => {
+                return Err(abort_published(&mut child, NativeProcessError::Invalid));
+            }
+            None => return Err(abort_published(&mut child, NativeProcessError::Quarantined)),
+        }
         let address = AddressContext {
             mm: child_mm,
             root,
             generation: ContextGeneration::new(child.completion().child.incarnation()),
         };
-        Ok((child, address, custody))
+        Ok((child, address))
     }
 }
 
@@ -319,16 +351,39 @@ fn abandon_loan(
     scrub: Option<&InitialWords>,
     error: NativeProcessError,
 ) -> NativeProcessError {
+    return_loan(loan, scrub).err().unwrap_or(error)
+}
+
+fn return_loan(
+    loan: &ForkStockLoan,
+    scrub: Option<&InitialWords>,
+) -> Result<(), NativeProcessError> {
     if let Some(words) = scrub
         && !carrick_el1::personality::fork_loan::scrub_tables(words, loan)
     {
-        return NativeProcessError::Quarantined;
+        return Err(NativeProcessError::Quarantined);
     }
     if abort_loan(loan) {
-        error
+        Ok(())
     } else {
-        NativeProcessError::Quarantined
+        Err(NativeProcessError::Quarantined)
     }
+}
+
+fn abort_child(
+    owner: &Portal,
+    worker: u32,
+    child: &mut UnpublishedEl1Child<X86Mmu>,
+    words: &InitialWords,
+    loan: &ForkStockLoan,
+) -> Result<(), NativeProcessError> {
+    child.abort(owner, words, worker).map_err(error)?;
+    let index = owner
+        .spaces
+        .find(child.completion().child.mm().raw())
+        .ok_or(NativeProcessError::Stale)?;
+    owner.spaces.free(index);
+    return_loan(loan, Some(words))
 }
 
 impl NativeProcessService<'static, ParkedContextWords> for Service {
@@ -448,14 +503,13 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         if loan.lifecycle.page.raw() == self.task.metadata.lifecycle_page.load(Ordering::Acquire) {
             return Err(NativeProcessError::Stale);
         }
-        let (child, address, custody) =
+        let (child, address) =
             self.prepare_loaned(&owner, loan, &live, layout, mappings.len(), count, child_mm)?;
         Ok(Prepared {
             loan,
             child,
             words: live,
             address,
-            custody,
         })
     }
     fn prepared_mm(&self, p: &Prepared) -> Mm {
@@ -511,22 +565,8 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         }
     }
     fn abort_mm(&mut self, mut p: Prepared) -> Result<(), (NativeProcessError, Prepared)> {
-        let result = portal().and_then(|owner| {
-            p.child
-                .abort(&owner, &p.words, self.worker())
-                .map_err(error)
-        });
-        if let Ok(owner) = portal()
-            && let Some(index) = owner.spaces.find(p.child.completion().child.mm().raw())
-        {
-            owner.spaces.free(index);
-        }
-        if !carrick_el1::personality::fork_loan::scrub_tables(&p.words, &p.loan) {
-            return Err((NativeProcessError::Quarantined, p));
-        }
-        if !abort_loan(&p.loan) {
-            return Err((NativeProcessError::Quarantined, p));
-        }
+        let result = portal()
+            .and_then(|owner| abort_child(&owner, self.worker(), &mut p.child, &p.words, &p.loan));
         match result {
             Ok(()) => Ok(()),
             Err(e) => Err((e, p)),
@@ -684,23 +724,16 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
 
 fn settle(born: Box<Born>, worker: u32) -> Result<(), (NativeProcessError, Box<Born>)> {
     let p = &born.prepared;
-    let mut custody = Vec::new();
-    if custody.try_reserve_exact(p.custody.len()).is_err() {
-        return Err((NativeProcessError::Exhausted, born));
-    }
-    custody.extend(p.custody.iter().copied().map(PortalForkCustody::words));
-    let Some(mut exchange) = ForkStockSettlement::with_child_identity(
+    let Some(mut exchange) = ForkStockSettlement::commit_reserved_with_child_identity(
         p.loan,
         p.child.completion(),
-        KernelVa::new(custody.as_ptr() as u64),
-        custody.len() as u64,
         born.child_task,
         born.child_execution,
     ) else {
         return Err((NativeProcessError::Stale, born));
     };
-    // SAFETY: exact completion and original four-word custody records remain
-    // owned across the stopped crossing; graph and MM editors were released.
+    // SAFETY: exact completion record remains owned across the stopped crossing;
+    // graph and MM editors were released.
     unsafe {
         core::arch::asm!("out dx, eax", in("dx") FORK_STOCK_PORT, in("rax") &raw mut exchange, options(nostack));
     }
