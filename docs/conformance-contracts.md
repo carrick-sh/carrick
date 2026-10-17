@@ -1257,3 +1257,33 @@ refusal restores parent outputs and pidfd state before returning EAGAIN (11).
 One page-local claim and one gate observation suffice; no population scan,
 retry, polling or child cancellation is introduced. Signed HVF execution remains
 the director's gate.
+
+## Software vCPU linear placement, SoftTlb, and x86-64 walker (`softmmu.x86.tlb-walker`, #580)
+
+Surface: `carrick-softmmu` (`LinearPlacement`, `MmioHoles`, `SoftTlb`,
+`SoftWalker`, and `VecGuestMemory`). Architectural authority: Intel SDM Vol. 3
+§4.5 (4-Level Paging) and §4.10.4 (TLB invalidation). `LinearPlacement::host`
+is the single GPA-to-host pointer conversion in the workspace, accepting only
+authenticated `FrameGpa` or `RootGpa` via the sealed `PlacementGpa` trait and
+refusing MMIO holes (default xAPIC `0xfee0_0000..0xfee0_1000`) and out-of-span
+extents. `SoftTlb` provides three 1024-entry direct-mapped planes (`read`,
+`write`, `exec`) with 16-byte `SoftTlbEntry { tag, addend }` records tagged by
+`va_page | cpl_bit | ac_bit`. `SoftWalker` binds
+`carrick_mmu_core::x86::descriptor_txn::translate_leaf` over
+`LiveDescriptorWords` while enforcing hardware non-present precedence (`P == 0`
+ignores bits `63:1`), `MAXPHYADDR`-parameterised reserved-bit checks on bits
+`[51:MAXPHYADDR]`, hardware-ignored bits `58:52` (e.g. bit 55) and `62:59`
+(when `PKE == 0`), `NX` reserved-bit faults when `EFER.NXE == 0`, SMAP (`CPL0`
+data access to user pages with `RFLAGS.AC == 0`), SMEP (`CPL0` instruction
+fetch from user pages even when `AC == 1`), COW write classification,
+`(Stage1Gpa, OwnerGeneration) -> FrameGpa` extent authentication, and code-page
+write invalidation.
+
+VM-free bindings in `crates/carrick-softmmu/tests/softmmu_contract.rs` cover
+all permission and fault classes, red-first witnesses against bare
+`translate_leaf` (non-present entries with upper bits, present entries with
+hardware-ignored bit 55, `MAXPHYADDR` boundary at 36/48/52, and SMAP/SMEP),
+cross-page split accesses, MMIO hole exclusion, code-page generation bumping,
+and a two-thread `invlpg` + `mov cr3` shootdown test over shared atomic page
+tables.
+
