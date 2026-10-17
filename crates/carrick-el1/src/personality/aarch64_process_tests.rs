@@ -1609,7 +1609,7 @@ fn fork_reservation_refusal_from_concurrent_munmap_rolls_back_without_quarantine
     let mut entry = runtime
         .enter(source, &fixture.task, parked, &mut service)
         .unwrap();
-    let refused = entry.fork();
+    let refused = entry.fork(ProcessForkChildTid::NONE);
     assert!(
         matches!(
             refused,
@@ -1634,7 +1634,7 @@ fn fork_reservation_refusal_from_concurrent_munmap_rolls_back_without_quarantine
     );
 
     // A subsequent fork on the same CPU succeeds using the returned stock.
-    let second = entry.fork();
+    let second = entry.fork(ProcessForkChildTid::NONE);
     assert!(
         matches!(second, LifecycleOutcome::Returned { result, .. } if result.raw() > 0),
         "subsequent fork after rolled-back reservation must succeed"
