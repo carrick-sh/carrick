@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -43,6 +44,15 @@ class CheckContractChangeTest(unittest.TestCase):
         self.vm_free_binding_file.parent.mkdir(parents=True, exist_ok=True)
         self.vm_free_binding_file.write_text("// vm_free binding\n", encoding="utf-8")
 
+        kernel_cargo = self.repo / "crates" / "carrick-kernel" / "Cargo.toml"
+        kernel_cargo.write_text(
+            '[package]\nname = "carrick-kernel"\nversion = "0.1.0"\nedition = "2024"\n',
+            encoding="utf-8",
+        )
+        (self.repo / "crates" / "carrick-kernel" / "src" / "lib.rs").write_text(
+            "pub mod dispatch;\n", encoding="utf-8"
+        )
+
         # Initial commit (base)
         subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
         subprocess.run(["git", "commit", "-m", "initial commit"], cwd=self.repo, check=True)
@@ -63,8 +73,16 @@ class CheckContractChangeTest(unittest.TestCase):
         (self.repo / "conformance-contracts" / "surfaces.toml").write_text(
             '[[surfaces]]\n'
             'path = "crates/carrick-kernel/src/dispatch/futex.rs"\n'
-            'contracts = ["kernel.futex.contention"]\n'
+            'contracts = ["kernel.futex.contention"]\n',
+            encoding="utf-8",
         )
+        subprocess.run(["git", "add", "conformance-contracts/surfaces.toml"], cwd=self.repo, check=True)
+        diff_res = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=self.repo)
+        if diff_res.returncode != 0:
+            subprocess.run(["git", "commit", "-m", "use single contract surface"], cwd=self.repo, check=True)
+            self.base_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=self.repo, check=True, capture_output=True, text=True
+            ).stdout.strip()
 
     def commit_reviewed_exemption(self):
         self.use_single_contract_surface()
@@ -882,16 +900,28 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
             '[package.metadata.carrick.test-lanes]\n"*" = "host"\n',
             encoding="utf-8",
         )
-        semantics_main = self.repo / "crates" / "carrick-kernel-example" / "tests" / "semantics" / "main.rs"
-        semantics_main.parent.mkdir(parents=True, exist_ok=True)
-        semantics_main.write_text("mod futex_contention;\nmod futex_requeue;\n", encoding="utf-8")
-        self.vm_free_binding_file.write_text(
-            "#[test]\nfn futex_contention_contract() {}\n",
+        lib_rs = self.repo / "crates" / "carrick-kernel-example" / "src" / "lib.rs"
+        lib_rs.parent.mkdir(parents=True, exist_ok=True)
+        lib_rs.write_text(
+            "pub mod contracts;\n"
+            "pub use contracts::{futex_contention_contract, futex_requeue_contract};\n",
             encoding="utf-8",
         )
-        requeue_file = self.repo / "crates" / "carrick-kernel-example" / "tests" / "semantics" / "futex_requeue.rs"
-        requeue_file.write_text(
-            "#[test]\nfn futex_requeue_contract() {}\n",
+        contracts_rs = self.repo / "crates" / "carrick-kernel-example" / "src" / "contracts.rs"
+        contracts_rs.write_text(
+            "pub fn futex_contention_contract() {}\n"
+            "pub fn futex_requeue_contract() {}\n",
+            encoding="utf-8",
+        )
+        contracts_test = self.repo / "crates" / "carrick-kernel-example" / "tests" / "contracts.rs"
+        contracts_test.parent.mkdir(parents=True, exist_ok=True)
+        contracts_test.write_text(
+            "#[test]\nfn futex_contention_contract_is_semantically_exact_and_linear() {\n"
+            "    carrick_kernel_example::futex_contention_contract();\n"
+            "}\n\n"
+            "#[test]\nfn futex_requeue_contract_is_semantically_exact_and_linear() {\n"
+            "    carrick_kernel_example::futex_requeue_contract();\n"
+            "}\n",
             encoding="utf-8",
         )
         subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
@@ -922,7 +952,7 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
         cargo_toml = self.repo / "crates" / "carrick-kernel-example" / "Cargo.toml"
         cargo_toml.write_text(
             '[package]\nname = "carrick-kernel-example"\nversion = "0.1.0"\nedition = "2024"\n\n'
-            '[package.metadata.carrick.test-lanes]\nsemantics = { lane = "manual", reason = "not gated in CI" }\n',
+            '[package.metadata.carrick.test-lanes]\ncontracts = { lane = "manual", reason = "not gated in CI" }\n',
             encoding="utf-8",
         )
         subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
@@ -944,7 +974,8 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
     def test_bound_test_missing_at_head_fails(self):
         self.seed_gated_futex_contracts()
         self.use_single_contract_surface()
-        self.vm_free_binding_file.write_text("// test function removed\n", encoding="utf-8")
+        contracts_test = self.repo / "crates" / "carrick-kernel-example" / "tests" / "contracts.rs"
+        contracts_test.write_text("// test function removed\n", encoding="utf-8")
         subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
         subprocess.run(["git", "commit", "-m", "remove bound test function"], cwd=self.repo, check=True)
         base_sha = subprocess.run(
@@ -979,6 +1010,7 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
             '[package.metadata.carrick.test-lanes]\n"*" = "host"\n',
             encoding="utf-8",
         )
+        (unrelated_crate / "src" / "lib.rs").write_text("pub mod unrelated;\n", encoding="utf-8")
         (unrelated_crate / "src" / "unrelated.rs").write_text(
             "#[cfg(test)]\nmod tests {\n    #[test]\n    fn completely_unrelated_test() {\n        assert_eq!(1 + 1, 2);\n    }\n}\n",
             encoding="utf-8",
@@ -1026,6 +1058,9 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
             '[package.metadata.carrick.test-lanes]\n"*" = "host"\n',
             encoding="utf-8",
         )
+        semantics_main = self.repo / "crates" / "carrick-kernel-example" / "tests" / "semantics" / "main.rs"
+        semantics_main.parent.mkdir(parents=True, exist_ok=True)
+        semantics_main.write_text("mod futex_contention;\n", encoding="utf-8")
         subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
         subprocess.run(["git", "commit", "-m", "seed contract without vm_free binding"], cwd=self.repo, check=True)
         base_sha = subprocess.run(
@@ -1042,7 +1077,7 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
             'id = "kernel.futex.contention"\n'
             'title = "Futex contention"\n'
             '[bindings]\n'
-            'vm_free = "carrick-kernel-example::futex_contention_contract"\n'
+            'vm_free = "carrick-kernel-example::semantics::futex_contention::futex_contention_contract"\n'
             'docker = "probe:futexpingpong"\n',
             encoding="utf-8",
         )
@@ -1051,8 +1086,426 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
         res = self.run_check(base_sha=base_sha)
         self.assertEqual(res.returncode, 0, msg=f"stdout: {res.stdout}, stderr: {res.stderr}")
         self.assertIn(
-            "evidenced: crates/carrick-kernel/src/dispatch/futex.rs -> kernel.futex.contention: carrick-kernel-example::futex_contention_contract",
+            "evidenced: crates/carrick-kernel/src/dispatch/futex.rs -> kernel.futex.contention: carrick-kernel-example::semantics::futex_contention::futex_contention_contract",
             res.stdout,
+        )
+
+    def test_bypass_bfake_production_fn_in_surface_file_fails(self):
+        """Repro Bfake (P0-1): binding a production fn in the surface file itself via a fake `::tests::` segment must fail."""
+        self.use_single_contract_surface()
+        self.guest_file.write_text("pub(crate) fn dispatch_futex_pi() -> i32 { 0 }\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "seed production fn in futex.rs"], cwd=self.repo, check=True)
+        base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+        self.guest_file.write_text(
+            "pub(crate) fn dispatch_futex_pi() -> i32 { 1 }\n// modified\n", encoding="utf-8"
+        )
+        contract_toml = self.repo / "conformance-contracts" / "contracts" / "futex-contention.toml"
+        contract_toml.write_text(
+            contract_toml.read_text(encoding="utf-8").replace(
+                'vm_free = "carrick-kernel-example::futex_contention_contract"',
+                'vm_free = "carrick-kernel-example::futex_contention_contract; carrick-kernel::dispatch::futex::tests::dispatch_futex_pi"',
+            ),
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "commit", "-am", "attempt Bfake bypass"], cwd=self.repo, check=True)
+
+        res = self.run_check(base_sha=base_sha)
+        self.assertEqual(res.returncode, 1, msg=f"stdout: {res.stdout}, stderr: {res.stderr}")
+        self.assertIn(
+            "error: contract kernel.futex.contention has no gated bound test for changed surface crates/carrick-kernel/src/dispatch/futex.rs",
+            res.stderr,
+        )
+
+    def test_bypass_c_comment_and_keyword_chain_prose_match_fails(self):
+        """Repro C (P0-2): comments (`// This fn is ...`) and keyword chains (`pub const fn`, `static mut`) must not match unrelated tests."""
+        self.use_single_contract_surface()
+        contract_toml = self.repo / "conformance-contracts" / "contracts" / "futex-contention.toml"
+        contract_toml.write_text(
+            'schema_version = 1\n'
+            'id = "kernel.futex.contention"\n'
+            'title = "Futex contention"\n'
+            '[bindings]\n'
+            'docker = "probe:futexpingpong"\n',
+            encoding="utf-8",
+        )
+        gic_crate = self.repo / "crates" / "carrick-vmm-hvf"
+        (gic_crate / "src").mkdir(parents=True, exist_ok=True)
+        (gic_crate / "Cargo.toml").write_text(
+            '[package]\nname = "carrick-vmm-hvf"\nversion = "0.1.0"\nedition = "2024"\n\n'
+            '[package.metadata.carrick.test-lanes]\n"*" = "signed-hvf"\n',
+            encoding="utf-8",
+        )
+        (gic_crate / "src" / "lib.rs").write_text("pub mod gic;\n", encoding="utf-8")
+        (gic_crate / "src" / "gic.rs").write_text(
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn mpidr_carries_res1_and_sgi_addressable_affinity() {\n"
+            "        // Affinity is checked with const and mut locals.\n"
+            "        const X: u32 = 1;\n"
+            "        let mut y = X;\n"
+            "        y += 1;\n"
+            "        assert_eq!(y, 2);\n"
+            "    }\n}\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "seed gic test"], cwd=self.repo, check=True)
+        base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+        self.guest_file.write_text(
+            "// This fn is the threaded entry.\n"
+            "const _: () = ();\n"
+            "pub const fn futex_real_const_helper() -> u32 { 7 }\n"
+            "static mut FUTEX_REAL_COUNTER: u32 = 0;\n",
+            encoding="utf-8",
+        )
+        contract_toml.write_text(
+            'schema_version = 1\n'
+            'id = "kernel.futex.contention"\n'
+            'title = "Futex contention"\n'
+            '[bindings]\n'
+            'vm_free = "carrick-vmm-hvf::gic::tests::mpidr_carries_res1_and_sgi_addressable_affinity"\n'
+            'docker = "probe:futexpingpong"\n',
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "commit", "-am", "attempt Repro C bypass"], cwd=self.repo, check=True)
+
+        res = self.run_check(base_sha=base_sha)
+        self.assertEqual(res.returncode, 1, msg=f"stdout: {res.stdout}, stderr: {res.stderr}")
+        self.assertIn(
+            "error: binding carrick-vmm-hvf::gic::tests::mpidr_carries_res1_and_sgi_addressable_affinity added to kernel.futex.contention does not reference changed surface crates/carrick-kernel/src/dispatch/futex.rs",
+            res.stderr,
+        )
+
+    def test_bypass_d_dropping_contract_from_surface_in_same_pr_fails(self):
+        """Repro D (P1-4a): removing a contract from a surface in surfaces.toml in the same PR must fail."""
+        self.guest_file.write_text("pub fn modified_futex() {}\n", encoding="utf-8")
+        (self.repo / "conformance-contracts" / "surfaces.toml").write_text(
+            '[[surfaces]]\n'
+            'path = "crates/carrick-kernel/src/dispatch/futex.rs"\n'
+            'contracts = []\n',
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "commit", "-am", "drop contracts from surfaces.toml"], cwd=self.repo, check=True)
+
+        res = self.run_check()
+        self.assertEqual(res.returncode, 1, msg=f"stdout: {res.stdout}, stderr: {res.stderr}")
+        self.assertIn("crates/carrick-kernel/src/dispatch/futex.rs", res.stderr)
+
+    def test_bypass_e_modified_rename_to_unmapped_path_fails(self):
+        """Repro E (P1-4b): R<100 rename of a guest file to an unmapped path must fail as unclassified."""
+        self.guest_file.write_text(
+            "".join(f"pub fn line_{i}() -> usize {{ {i} }}\n" for i in range(40)),
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "commit", "-am", "seed 40-line futex.rs"], cwd=self.repo, check=True)
+        base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+        new_path = self.guest_file.with_name("futex_impl.rs")
+        subprocess.run(["git", "mv", str(self.guest_file), str(new_path)], cwd=self.repo, check=True)
+        new_path.write_text(
+            new_path.read_text(encoding="utf-8") + "pub fn added_behavior() {}\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "commit", "-am", "R<100 rename to unmapped futex_impl.rs"], cwd=self.repo, check=True)
+
+        res = self.run_check(base_sha=base_sha)
+        self.assertEqual(res.returncode, 1, msg=f"stdout: {res.stdout}, stderr: {res.stderr}")
+        self.assertIn("unclassified", res.stderr)
+        self.assertIn("crates/carrick-kernel/src/dispatch/futex_impl.rs", res.stderr)
+
+    def test_bypass_f_ignored_test_in_non_ignored_lane_fails(self):
+        """Repro F (P0-3): an #[ignore]d test in a lane that does not pass --ignored must be rejected."""
+        self.use_single_contract_surface()
+        self.guest_file.write_text("pub fn futex_wake_waiters() -> i32 { 1 }\n", encoding="utf-8")
+        unit_test = self.guest_file.with_name("futex_tests.rs")
+        unit_test.write_text(
+            "#[test]\n#[ignore = \"never runs in CI\"]\nfn futex_witness_never_runs() {\n"
+            "    let _ = futex_wake_waiters();\n"
+            "    panic!(\"never executed\");\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        with (self.repo / "conformance-contracts/surfaces.toml").open("a", encoding="utf-8") as mapping:
+            mapping.write(
+                '\n[[surfaces]]\npath = "crates/carrick-kernel/src/dispatch/futex_tests.rs"\n'
+                'contracts = ["kernel.futex.contention"]\n'
+            )
+        contract_toml = self.repo / "conformance-contracts" / "contracts" / "futex-contention.toml"
+        contract_toml.write_text(
+            contract_toml.read_text(encoding="utf-8").replace(
+                'vm_free = "carrick-kernel-example::futex_contention_contract"',
+                'vm_free = "carrick-kernel::dispatch::futex_tests::futex_witness_never_runs"',
+            ),
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "bind #[ignore] test"], cwd=self.repo, check=True)
+
+        res = self.run_check()
+        self.assertEqual(res.returncode, 1, msg=f"stdout: {res.stdout}, stderr: {res.stderr}")
+        self.assertIn(
+            "error: contract kernel.futex.contention has no gated bound test for changed surface crates/carrick-kernel/src/dispatch/futex.rs",
+            res.stderr,
+        )
+
+    def test_ignored_test_in_signed_recipe_passing_ignored_passes(self):
+        """P0-3 positive control: an #[ignore]d test matched by a justfile recipe that passes --ignored counts."""
+        self.use_single_contract_surface()
+        (self.repo / "justfile").write_text(
+            "test-hvf-trap-engine:\n"
+            "    ./scripts/test-signed.sh carrick-vmm-hvf trap_engine_hvf_ --ignored --nocapture\n",
+            encoding="utf-8",
+        )
+        hvf_dir = self.repo / "crates" / "carrick-vmm-hvf"
+        (hvf_dir / "tests").mkdir(parents=True, exist_ok=True)
+        (hvf_dir / "Cargo.toml").write_text(
+            '[package]\nname = "carrick-vmm-hvf"\nversion = "0.1.0"\nedition = "2024"\n\n'
+            '[package.metadata.carrick.test-lanes]\n"*" = "signed-hvf"\n',
+            encoding="utf-8",
+        )
+        (hvf_dir / "tests" / "trap_engine_hvf.rs").write_text(
+            "#[test]\n#[ignore = \"requires signed HVF execution through just test-hvf-trap-engine\"]\n"
+            "fn trap_engine_hvf_boots_and_handles_getpid() {\n"
+            "    let _ = futex_wake_waiters();\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        contract_toml = self.repo / "conformance-contracts" / "contracts" / "futex-contention.toml"
+        contract_toml.write_text(
+            'schema_version = 1\n'
+            'id = "kernel.futex.contention"\n'
+            'title = "Futex contention"\n'
+            '[bindings]\n'
+            'embed = "carrick-vmm-hvf::trap_engine_hvf::trap_engine_hvf_boots_and_handles_getpid"\n'
+            'docker = "probe:futexpingpong"\n',
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "seed trap_engine_hvf ignored lane"], cwd=self.repo, check=True)
+        base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+        self.guest_file.write_text("pub fn futex_wake_waiters() -> i32 { 1 }\n", encoding="utf-8")
+        subprocess.run(["git", "commit", "-am", "edit futex with trap_engine_hvf ignored test"], cwd=self.repo, check=True)
+
+        res = self.run_check(base_sha=base_sha)
+        self.assertEqual(res.returncode, 0, msg=f"stdout: {res.stdout}, stderr: {res.stderr}")
+        self.assertIn(
+            "evidenced: crates/carrick-kernel/src/dispatch/futex.rs -> kernel.futex.contention: carrick-vmm-hvf::trap_engine_hvf::trap_engine_hvf_boots_and_handles_getpid",
+            res.stdout,
+        )
+
+    def test_missing_or_malformed_cargo_toml_fails_closed(self):
+        """P1-2: missing Cargo.toml or malformed test-lanes table must fail closed."""
+        self.seed_gated_futex_contracts()
+        self.use_single_contract_surface()
+        cargo_toml = self.repo / "crates" / "carrick-kernel-example" / "Cargo.toml"
+        cargo_toml.write_text(
+            '[package]\nname = "carrick-kernel-example"\nversion = "0.1.0"\nedition = "2024"\n\n'
+            '[package.metadata.carrick]\ntest-lanes = "not-a-table"\n',
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "malformed test-lanes"], cwd=self.repo, check=True)
+        base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+        self.guest_file.write_text("pub fn changed_futex() {}\n", encoding="utf-8")
+        subprocess.run(["git", "commit", "-am", "modify surface with malformed test-lanes"], cwd=self.repo, check=True)
+
+        res = self.run_check(base_sha=base_sha)
+        self.assertEqual(res.returncode, 1, msg=f"stdout: {res.stdout}, stderr: {res.stderr}")
+        self.assertIn("has no gated bound test", res.stderr)
+
+    def test_lib_or_mod_change_does_not_admit_unrelated_subtree_test(self):
+        """P1-3: editing lib.rs or mod.rs must not admit an unrelated test in the crate that references no changed item."""
+        lib_path = "crates/carrick-kernel/src/lib.rs"
+        other_test_path = "crates/carrick-kernel/src/other/tests.rs"
+        (self.repo / other_test_path).parent.mkdir(parents=True, exist_ok=True)
+        (self.repo / other_test_path).write_text(
+            "#[test]\nfn unrelated_other_unit_test() { assert_eq!(2 + 2, 4); }\n",
+            encoding="utf-8",
+        )
+        (self.repo / "conformance-contracts" / "surfaces.toml").write_text(
+            f'[[surfaces]]\npath = "{lib_path}"\ncontracts = ["kernel.futex.contention"]\n'
+            f'[[surfaces]]\npath = "{other_test_path}"\ncontracts = ["kernel.futex.contention"]\n',
+            encoding="utf-8",
+        )
+        contract_toml = self.repo / "conformance-contracts" / "contracts" / "futex-contention.toml"
+        contract_toml.write_text(
+            'schema_version = 1\n'
+            'id = "kernel.futex.contention"\n'
+            'title = "Futex contention"\n'
+            '[bindings]\n'
+            'docker = "probe:futexpingpong"\n',
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "seed lib.rs surface and unrelated unit test"], cwd=self.repo, check=True)
+        base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+        (self.repo / lib_path).write_text(
+            "pub mod dispatch;\npub mod other;\npub fn newly_added_root_fn() -> u32 { 99 }\n",
+            encoding="utf-8",
+        )
+        contract_toml.write_text(
+            'schema_version = 1\n'
+            'id = "kernel.futex.contention"\n'
+            'title = "Futex contention"\n'
+            '[bindings]\n'
+            'vm_free = "carrick-kernel::other::tests::unrelated_other_unit_test"\n'
+            'docker = "probe:futexpingpong"\n',
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "commit", "-am", "edit lib.rs and bind unrelated unit test"], cwd=self.repo, check=True)
+
+        res = self.run_check(base_sha=base_sha)
+        self.assertEqual(res.returncode, 1, msg=f"stdout: {res.stdout}, stderr: {res.stderr}")
+        self.assertIn(
+            "error: binding carrick-kernel::other::tests::unrelated_other_unit_test added to kernel.futex.contention does not reference changed surface crates/carrick-kernel/src/lib.rs",
+            res.stderr,
+        )
+
+    def test_multi_surface_honest_added_binding_for_x_preserves_y_with_existing_evidence(self):
+        """P2: an honest added binding for surface X must not fail contract C on surface Y when Y has pre-existing evidence."""
+        self.seed_gated_futex_contracts()
+        surface_y = self.guest_file.with_name("other_futex.rs")
+        surface_y.write_text("pub fn existing_other_futex() -> i32 { 1 }\n", encoding="utf-8")
+        (self.repo / "conformance-contracts" / "surfaces.toml").write_text(
+            '[[surfaces]]\n'
+            'path = "crates/carrick-kernel/src/dispatch/futex.rs"\n'
+            'contracts = ["kernel.futex.contention"]\n'
+            '[[surfaces]]\n'
+            'path = "crates/carrick-kernel/src/dispatch/other_futex.rs"\n'
+            'contracts = ["kernel.futex.contention"]\n',
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "seed two surfaces sharing kernel.futex.contention"], cwd=self.repo, check=True)
+        base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+        # Modify both surfaces, and add a new unit test binding that references futex.rs's new item
+        self.guest_file.write_text("pub fn new_futex_x_item() -> i32 { 2 }\n", encoding="utf-8")
+        surface_y.write_text("pub fn existing_other_futex() -> i32 { 3 }\n", encoding="utf-8")
+        unit_test = self.guest_file.with_name("futex_tests.rs")
+        unit_test.write_text(
+            "#[test]\nfn test_new_futex_x_item() { let _ = new_futex_x_item(); }\n",
+            encoding="utf-8",
+        )
+        with (self.repo / "conformance-contracts/surfaces.toml").open("a", encoding="utf-8") as mapping:
+            mapping.write(
+                '\n[[surfaces]]\npath = "crates/carrick-kernel/src/dispatch/futex_tests.rs"\n'
+                'contracts = ["kernel.futex.contention"]\n'
+            )
+        contract_toml = self.repo / "conformance-contracts" / "contracts" / "futex-contention.toml"
+        contract_toml.write_text(
+            contract_toml.read_text(encoding="utf-8").replace(
+                'vm_free = "carrick-kernel-example::futex_contention_contract"',
+                'vm_free = "carrick-kernel-example::futex_contention_contract; carrick-kernel::dispatch::futex_tests::test_new_futex_x_item"',
+            ),
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "modify both surfaces and add binding for X"], cwd=self.repo, check=True)
+
+        res = self.run_check(base_sha=base_sha)
+        self.assertEqual(res.returncode, 0, msg=f"stdout: {res.stdout}, stderr: {res.stderr}")
+
+    def test_dirty_worktree_not_read_as_head(self):
+        """P2: files must be read from the git tree at HEAD, not uncommitted worktree edits."""
+        self.use_single_contract_surface()
+        self.guest_file.write_text("pub fn futex_changed() -> i32 { 1 }\n", encoding="utf-8")
+        subprocess.run(["git", "commit", "-am", "commit without resolvable bound test"], cwd=self.repo, check=True)
+
+        # Write a valid test in the dirty worktree WITHOUT committing it
+        cargo_toml = self.repo / "crates" / "carrick-kernel-example" / "Cargo.toml"
+        cargo_toml.parent.mkdir(parents=True, exist_ok=True)
+        cargo_toml.write_text(
+            '[package]\nname = "carrick-kernel-example"\nversion = "0.1.0"\nedition = "2024"\n',
+            encoding="utf-8",
+        )
+        contracts_rs = self.repo / "crates" / "carrick-kernel-example" / "src" / "contracts.rs"
+        contracts_rs.parent.mkdir(parents=True, exist_ok=True)
+        contracts_rs.write_text("pub fn futex_contention_contract() {}\n", encoding="utf-8")
+        contracts_test = self.repo / "crates" / "carrick-kernel-example" / "tests" / "contracts.rs"
+        contracts_test.parent.mkdir(parents=True, exist_ok=True)
+        contracts_test.write_text(
+            "#[test]\nfn runs_futex() { futex_contention_contract(); }\n", encoding="utf-8"
+        )
+
+        res = self.run_check()
+        self.assertEqual(res.returncode, 1, msg=f"stdout: {res.stdout}, stderr: {res.stderr}")
+        self.assertIn("has no gated bound test", res.stderr)
+
+    def test_real_tree_futex_comment_edit_passes_and_gic_gaming_fails(self):
+        """Real-tree verification: comment-only edit to dispatch/futex.rs passes via carrick-kernel-example::futex_*_contract, and GIC-for-futex fails."""
+        for rel in (
+            "crates/carrick-kernel/Cargo.toml",
+            "crates/carrick-kernel/src/dispatch/futex.rs",
+            "crates/carrick-kernel-example/Cargo.toml",
+            "crates/carrick-kernel-example/src/lib.rs",
+            "crates/carrick-kernel-example/src/contracts.rs",
+            "crates/carrick-kernel-example/tests/contracts.rs",
+            "crates/carrick-vmm-hvf/Cargo.toml",
+            "crates/carrick-vmm-hvf/src/lib.rs",
+            "crates/carrick-vmm-hvf/src/gic.rs",
+            "conformance-contracts/contracts/futex-contention.toml",
+            "conformance-contracts/contracts/futex-requeue.toml",
+            "conformance-contracts/surfaces.toml",
+        ):
+            dst = self.repo / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(REPO_ROOT / rel, dst)
+
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "seed real-tree futex and gic files"], cwd=self.repo, check=True)
+        base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+        # 1. Comment-only edit to dispatch/futex.rs must pass via carrick-kernel-example::futex_*_contract
+        self.guest_file.write_text(
+            self.guest_file.read_text(encoding="utf-8") + "// This fn is the threaded entry.\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "commit", "-am", "comment-only edit on real futex.rs"], cwd=self.repo, check=True)
+        res_pass = self.run_check(base_sha=base_sha)
+        self.assertEqual(res_pass.returncode, 0, msg=f"stdout: {res_pass.stdout}, stderr: {res_pass.stderr}")
+        self.assertIn(
+            "evidenced: crates/carrick-kernel/src/dispatch/futex.rs -> kernel.futex.contention: carrick-kernel-example::futex_contention_contract",
+            res_pass.stdout,
+        )
+        self.assertIn(
+            "evidenced: crates/carrick-kernel/src/dispatch/futex.rs -> kernel.futex.requeue: carrick-kernel-example::futex_requeue_contract",
+            res_pass.stdout,
+        )
+
+        # 2. Replacing futex bindings with the unrelated GIC test must fail
+        for cfile in ("futex-contention.toml", "futex-requeue.toml"):
+            p = self.repo / "conformance-contracts" / "contracts" / cfile
+            txt = p.read_text(encoding="utf-8")
+            txt = re.sub(r'^vm_free = .*$', 'vm_free = "carrick-vmm-hvf::gic::tests::mpidr_carries_res1_and_sgi_addressable_affinity"', txt, flags=re.M)
+            txt = re.sub(r'^embed = .*$', '', txt, flags=re.M)
+            p.write_text(txt, encoding="utf-8")
+        subprocess.run(["git", "commit", "-am", "attempt GIC-test-for-futex bypass"], cwd=self.repo, check=True)
+        res_fail = self.run_check(base_sha=base_sha)
+        self.assertEqual(res_fail.returncode, 1, msg=f"stdout: {res_fail.stdout}, stderr: {res_fail.stderr}")
+        self.assertIn(
+            "does not reference changed surface crates/carrick-kernel/src/dispatch/futex.rs",
+            res_fail.stderr,
         )
 
 
