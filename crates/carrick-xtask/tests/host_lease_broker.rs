@@ -99,6 +99,11 @@ fn broker_contention_expires_explicitly_and_disconnected_waiter_exits() {
     let (mut second, mut second_out) = broker(&lock, "docker", 0);
     assert_eq!(line(&mut second_out), "waiting\n");
     assert!(!second.0.wait().unwrap().success());
+    let started = std::time::Instant::now();
+    let (mut timed, mut timed_out) = broker(&lock, "docker", 100);
+    assert_eq!(line(&mut timed_out), "waiting\n");
+    assert!(!timed.0.wait().unwrap().success());
+    assert!(started.elapsed() < Duration::from_secs(5));
     let (mut third, mut third_out) = broker(&lock, "carrick", 5000);
     assert_eq!(line(&mut third_out), "waiting\n");
     drop(third.0.stdin.take());
@@ -150,6 +155,7 @@ impl ClientSite {
         command
     }
 
+    #[cfg(target_os = "linux")]
     fn sessions(&self) -> usize {
         std::fs::read_to_string(self.temp.path().join("sessions"))
             .unwrap()
@@ -159,6 +165,7 @@ impl ClientSite {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn broker_client_nested_gate_reuses_one_session_and_shared_cannot_upgrade() {
     for (outer, inner, success) in [("gate", "carrick", true), ("carrick", "gate", false)] {
         let site = ClientSite::new();
@@ -193,6 +200,7 @@ fn broker_client_nested_gate_reuses_one_session_and_shared_cannot_upgrade() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn broker_client_connection_loss_cancels_workload_and_fails() {
     let site = ClientSite::new();
     let mut child = site
@@ -266,4 +274,41 @@ fn broker_wait_bound_is_not_extended_by_partial_request() {
     drop(child.0.stdin.take());
     assert!(!child.0.wait().unwrap().success());
     assert!(!lock.exists());
+}
+
+#[test]
+fn broker_and_in_process_controller_contend_on_one_inode_without_chmod() {
+    use carrick_xtask::host_lease::{HostLease, HostLeaseMode};
+    let lock = tempfile::NamedTempFile::new().unwrap();
+    let lease = HostLease::acquire_path(lock.path(), HostLeaseMode::Gate).unwrap();
+    std::fs::set_permissions(lock.path(), std::fs::Permissions::from_mode(0o660)).unwrap();
+    let (_client, mut output) = broker(lock.path(), "docker", 5000);
+    assert_eq!(line(&mut output), "waiting\n");
+    drop(lease);
+    assert_eq!(line(&mut output), "acquired\n");
+    assert_eq!(
+        std::fs::metadata(lock.path()).unwrap().permissions().mode() & 0o777,
+        0o660
+    );
+}
+
+#[test]
+fn controller_site_declares_the_same_host_lock_as_the_broker() {
+    let site = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/ci_scaler/site.rs"
+    ))
+    .unwrap();
+    assert!(site.contains("host_lease: Some(crate::host_lease::broker::LOCK_PATH)"));
+    let controller = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/ci_scaler/live.rs"
+    ))
+    .unwrap();
+    let admission = controller.split("fn admit_one(").nth(1).unwrap();
+    assert!(
+        admission.find("clone_lease.acquire()?").unwrap()
+            < admission.find("ledger.reserve(").unwrap()
+    );
+    assert!(controller.contains("clone_lease.release_if_idle(&ledger)"));
 }
