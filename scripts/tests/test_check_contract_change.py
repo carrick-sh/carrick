@@ -1149,6 +1149,53 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
                        cwd=self.repo, check=True, capture_output=True)
         self.assertEqual(self.run_check().returncode, 1)
 
+    def test_helper_implementation_must_overlap_the_bound_test_cfg(self):
+        self.seed_gated_futex_contracts()
+        tests = self.repo / "crates/carrick-kernel-example/tests/contracts.rs"
+        for macos_calls_contract in (True, False):
+            helper_bodies = (
+                ("", "carrick_kernel_example::futex_contention_contract();")
+                if macos_calls_contract else
+                ("carrick_kernel_example::futex_contention_contract();", "")
+            )
+            for reverse in (False, True):
+                with self.subTest(macos_calls_contract=macos_calls_contract, reverse=reverse):
+                    helpers = [
+                        f'#[cfg(target_os = "{os_name}")]\nfn observations() {{ {body} }}\n'
+                        for os_name, body in zip(("linux", "macos"), helper_bodies)
+                    ]
+                    tests.write_text(
+                        "".join(reversed(helpers) if reverse else helpers)
+                        + '#[cfg(target_os = "linux")]\n'
+                        "#[test] fn bound_test() { observations(); }\n"
+                        "#[test] fn requeue() { carrick_kernel_example::futex_requeue_contract(); }\n"
+                    )
+                    self.guest_file.write_text(
+                        f"pub fn changed_futex() -> u64 {{ {int(reverse)} }}\n"
+                    )
+                    subprocess.run(["git", "commit", "-am", "test conditional helper variants"],
+                                   cwd=self.repo, check=True, capture_output=True)
+                    result = self.run_check()
+                    self.assertEqual(result.returncode, int(macos_calls_contract),
+                                     msg=f"{result.stdout}\n{result.stderr}")
+
+    def test_conditional_inline_modules_are_distinct_resolution_scopes(self):
+        for first_cfg in ('all(test, target_os = "macos")',
+                          'all(test, feature = "never_enabled")'):
+            with self.subTest(first_cfg=first_cfg):
+                self.seed_resolution_case(
+                    {
+                        "src/lib.rs": "mod dispatch;\n"
+                                      f"#[cfg({first_cfg})] mod tests {{\n"
+                                      "#[test] fn other_witness() {} }\n"
+                                      '#[cfg(all(test, target_os = "linux"))] mod tests {\n'
+                                      "#[test] fn bound_test() {} }\n",
+                    },
+                    "carrick-kernel::tests::bound_test",
+                )
+                result = self.run_check()
+                self.assertEqual(result.returncode, 0, msg=result.stderr)
+
     def test_called_local_helper_can_reference_changed_surface(self):
         self.seed_resolution_case(
             {

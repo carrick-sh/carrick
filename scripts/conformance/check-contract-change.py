@@ -1474,10 +1474,10 @@ def _extract_non_test_fns(
     pkg_name: str,
     lane: str,
     accum_cfgs: list[str],
-) -> dict[str, str]:
+) -> dict[str, list[tuple[list[str], str]]]:
     """Find all non-`#[test]` `fn <name>` at brace depth 0 of `scope_stripped` whose `#[cfg]`s are active in CI.
 
-    Returns `{fn_name: fn_body_only_stripped}`.
+    Returns `{fn_name: [(cfg_context, fn_body_only_stripped), ...]}`.
     """
     depths = _compute_brace_depths(scope_stripped)
     fn_pattern = re.compile(
@@ -1486,7 +1486,7 @@ def _extract_non_test_fns(
         rf"\bfn\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\b",
         re.M,
     )
-    results: dict[str, str] = {}
+    results: dict[str, list[tuple[list[str], str]]] = {}
     for m in fn_pattern.finditer(scope_stripped):
         if depths[m.start(1)] != 0:
             continue
@@ -1503,7 +1503,9 @@ def _extract_non_test_fns(
         close_brace = _find_matching_brace(scope_stripped, open_brace)
         if close_brace == -1:
             continue
-        results[fn_name] = scope_stripped[open_brace : close_brace + 1]
+        results.setdefault(fn_name, []).append(
+            (accum_cfgs + fn_cfgs, scope_stripped[open_brace : close_brace + 1])
+        )
     return results
 
 
@@ -1517,15 +1519,22 @@ def _body_calls_fn(body: str, callee_name: str) -> bool:
 
 
 def _expand_body_with_one_level_helpers(
-    fn_body: str, local_helpers: dict[str, str]
+    view: RepoView,
+    pkg_name: str,
+    lane: str,
+    fn_cfgs: list[str],
+    fn_body: str,
+    local_helpers: dict[str, list[tuple[list[str], str]]],
 ) -> str:
     """Append bodies of functions in `local_helpers` that are directly called by `fn_body` (one level only)."""
     if not local_helpers:
         return fn_body
     parts = [fn_body]
-    for hname, hbody in sorted(local_helpers.items()):
+    for hname, variants in sorted(local_helpers.items()):
         if _body_calls_fn(fn_body, hname):
-            parts.append(hbody)
+            for helper_cfgs, hbody in variants:
+                if _are_cfgs_active_in_ci(view, pkg_name, lane, fn_cfgs + helper_cfgs):
+                    parts.append(hbody)
     return "\n".join(parts)
 
 
@@ -1558,14 +1567,18 @@ def _scope_valid_test_fn_bodies(
             return None
         if is_ignored and not _is_ignored_test_allowed(view, pkg_name, fn_name):
             return None
-        return [_expand_body_with_one_level_helpers(fn_body, local_helpers)]
+        return [_expand_body_with_one_level_helpers(
+            view, pkg_name, lane, accum_cfgs + fn_cfgs, fn_body, local_helpers
+        )]
 
     bodies: list[str] = []
     for name, (is_ignored, fn_cfgs, fn_body) in sorted(test_fns.items()):
         if not _are_cfgs_active_in_ci(view, pkg_name, lane, accum_cfgs + fn_cfgs):
             continue
         if not is_ignored or _is_ignored_test_allowed(view, pkg_name, name):
-            bodies.append(_expand_body_with_one_level_helpers(fn_body, local_helpers))
+            bodies.append(_expand_body_with_one_level_helpers(
+                view, pkg_name, lane, accum_cfgs + fn_cfgs, fn_body, local_helpers
+            ))
 
     depths = _compute_brace_depths(scope_stripped)
     mod_iter = re.finditer(
@@ -1593,7 +1606,9 @@ def _scope_valid_test_fn_bodies(
                 if not _are_cfgs_active_in_ci(view, pkg_name, lane, sub_cfgs + fn_cfgs):
                     continue
                 if not is_ignored or _is_ignored_test_allowed(view, pkg_name, name):
-                    bodies.append(_expand_body_with_one_level_helpers(fn_body, sub_helpers))
+                    bodies.append(_expand_body_with_one_level_helpers(
+                        view, pkg_name, lane, sub_cfgs + fn_cfgs, fn_body, sub_helpers
+                    ))
 
     return bodies if bodies else None
 
@@ -1859,7 +1874,7 @@ def _resolve_in_module_tree(
         rf_cs = view.read_comments_stripped_rust(rf)
         rf_inner_cfgs = _extract_cfg_exprs(rf_cs, inner_only=True)
         rf_mod_dir = rf.rsplit("/", 1)[0] if "/" in rf else ""
-        visited: set[tuple[str, str, tuple[str, ...]]] = set()
+        visited: set[tuple[str, str, str, tuple[str, ...], frozenset[str]]] = set()
 
         def walk(
             cur_file: str,
@@ -1872,13 +1887,14 @@ def _resolve_in_module_tree(
             enclosing_attrs_cs: str,
             entered_test_mod: bool,
         ) -> tuple[str, list[str]] | None:
-            state_key = (cur_file, cur_mod_dir, tuple(rem_segments))
+            if not _are_cfgs_active_in_ci(view, pkg_name, lane, accum_cfgs):
+                return None
+            state_key = (
+                cur_file, cur_mod_dir, scope_cs, tuple(rem_segments), frozenset(accum_cfgs)
+            )
             if state_key in visited:
                 return None
             visited.add(state_key)
-
-            if not _are_cfgs_active_in_ci(view, pkg_name, lane, accum_cfgs):
-                return None
 
             in_test_context = (
                 entered_test_mod
@@ -2154,7 +2170,9 @@ def _resolve_contract_helper_binding(
                 continue
             if is_ignored and not _is_ignored_test_allowed(view, pkg_name, fn_name):
                 continue
-            expanded_test_body = _expand_body_with_one_level_helpers(fn_body, t_helpers)
+            expanded_test_body = _expand_body_with_one_level_helpers(
+                view, pkg_name, tlane, t_inner_cfgs + fn_cfgs, fn_body, t_helpers
+            )
             if call_in_test_re.search(expanded_test_body):
                 return (pkg_name, tname, tfile, [contract_fn_body])
 

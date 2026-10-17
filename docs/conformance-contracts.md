@@ -160,7 +160,9 @@ glob re-exports, including when its requested child is absent. A test may call
 a contract through one directly called, CI-active local helper. For a bound
 test's relevance check, the same one-level expansion includes directly called
 local helpers, but never uncalled helpers, disabled helpers, or recursive
-helper chains. Contract-function bindings still use only the contract
+helper chains. Conditional helper implementations must be active in the same
+CI environment as the bound test; declaration order does not select a helper.
+Contract-function bindings still use only the contract
 function's body for relevance. Identifier matching is textual, not Rust name
 resolution; closing the common-name ambiguity remains follow-up #537.
 Existing annotated bindings may also name a supplemental control with
