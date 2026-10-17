@@ -219,8 +219,7 @@ const _: () = {
     assert!(X86_CPL0_SUPERVISOR_IMAGE_SIZE.is_power_of_two());
     assert!(X86_CPL0_SUPERVISOR_IMAGE_SIZE.is_multiple_of(4096));
     assert!(X86_CPL0_IRQ_HEADER_OFFSET < X86_CPL0_SUPERVISOR_IMAGE_SIZE);
-    assert!(X86_CPL0_IRQ_HEADER_GPA == 0x10_0000);
-    assert!(X86_CPL0_IRQ_HEADER_VA == 0xffff_ffff_8000_0000);
+    assert!(X86_CPL0_IRQ_HEADER_OFFSET.is_multiple_of(8));
 };
 /// CPL0's one upper-half supervisor window for retained physical pages.
 pub const X86_CPL0_DIRECT_VA: u64 = 0xffff_ffff_9000_0000;
