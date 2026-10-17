@@ -3172,6 +3172,12 @@ impl HvfVmState {
         if !task.persistent_vm_lifecycle {
             return Ok(None);
         }
+        if let Some(mm) = task
+            .cow_identity
+            .and_then(|identity| carrick_el1_abi::ReservationMm::new(identity.mm))
+        {
+            custody.fork_stock.lock().owner.retire_exited_root(mm);
+        }
         let authority = task.cow_authority.as_ref().cloned().ok_or_else(|| {
             TrapError::Hypervisor(
                 "HVPatch process retirement has no frame inventory authority".to_owned(),

@@ -425,6 +425,7 @@ pub(crate) struct Stage1MmPool {
 struct Stage1MmPoolInner {
     asids: AsidAllocator,
     free_root_slots: BTreeSet<Stage1RootSlot>,
+    native_fork_tables: Option<std::sync::Weak<NativeForkTableReservation>>,
     #[cfg(test)]
     root_nonce_exhausted: bool,
 }
@@ -578,11 +579,9 @@ impl carrick_hal::fork_stock::NativeForkTableReservation for NativeForkTableRese
 }
 impl Drop for NativeForkTableReservation {
     fn drop(&mut self) {
-        self.pool
-            .inner
-            .lock()
-            .free_root_slots
-            .extend(self.slots.drain(..));
+        let mut inner = self.pool.inner.lock();
+        inner.native_fork_tables = None;
+        inner.free_root_slots.extend(self.slots.drain(..));
     }
 }
 
@@ -592,6 +591,16 @@ impl Stage1MmPool {
         count: usize,
     ) -> Result<Arc<NativeForkTableReservation>, Stage1MmError> {
         let mut inner = self.inner.lock();
+        if let Some(existing) = inner
+            .native_fork_tables
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        {
+            if existing.arenas.len() == count {
+                return Ok(existing);
+            }
+            return Err(Stage1MmError::RootSlotExhausted);
+        }
         if inner.free_root_slots.len() < count {
             return Err(Stage1MmError::RootSlotExhausted);
         }
@@ -608,11 +617,13 @@ impl Stage1MmPool {
         for slot in &slots {
             inner.free_root_slots.remove(slot);
         }
-        Ok(Arc::new(NativeForkTableReservation {
+        let reservation = Arc::new(NativeForkTableReservation {
             pool: self.clone(),
             slots,
             arenas,
-        }))
+        });
+        inner.native_fork_tables = Some(Arc::downgrade(&reservation));
+        Ok(reservation)
     }
 
     #[cfg(test)]
@@ -635,6 +646,7 @@ impl Stage1MmPool {
                 inner: Arc::new(Mutex::new(Stage1MmPoolInner {
                     asids,
                     free_root_slots: (0..STAGE1_ROOT_SLOT_COUNT).map(Stage1RootSlot).collect(),
+                    native_fork_tables: None,
                     #[cfg(test)]
                     root_nonce_exhausted: false,
                 })),
@@ -643,7 +655,6 @@ impl Stage1MmPool {
         ))
     }
 
-    #[cfg(test)]
     pub(crate) fn allocate_root(
         &self,
         stage1_root: u64,
@@ -2646,5 +2657,115 @@ mod tests {
         asids.acknowledge_tlb_flush(retired).expect("ack flush");
         let recycled = asids.allocate().expect("reallocated after retire");
         assert_eq!(recycled.asid(), child_asid);
+    }
+
+    #[test]
+    fn carrier_second_root_reuses_stage1_mm_pool_and_native_fork_table_reservation() {
+        use carrick_kernel::kernel::container::{Container, LaunchContext, RunId};
+        let _serial = crate::carrier::tests::TEST_LOCK.lock();
+        let carrier = crate::carrier::CarrierRuntime::new_for_tests().expect("test carrier");
+        let asids = AsidAllocator::new();
+        let launch = |tag: &str| LaunchContext::unmanaged(RunId::new(format!("stage1-mm-{tag}")));
+
+        let (first_root, first_backend) =
+            MmResources::new_carrier_root(&carrier, 0x8000, asids.clone()).expect("first root");
+        let first_bootstrap = carrick_kernel::kernel::RootBootstrap::with_mm_backend(
+            6_100,
+            carrick_hal::ThreadId::synthetic_for_tests(6_100),
+            first_backend,
+            "first-root".to_owned(),
+            Arc::new(carrick_hal::NullHostSignalBridge::default()),
+        )
+        .expect("first bootstrap")
+        .with_container(Arc::new(Container::new(launch("first"))));
+        let (first_kernel_root, first_resources) = carrier
+            .boot_kernel_root_prepared(first_bootstrap, |kernel, _, _| {
+                first_root
+                    .native_fork_stock_resources(kernel, 1)
+                    .map_err(|error| {
+                        carrick_kernel::run_result::RuntimeError::Configuration(error.to_string())
+                    })
+            })
+            .expect("boot first root");
+        carrier
+            .claim_kernel_activation(first_kernel_root.context().task().key())
+            .expect("claim first root activation")
+            .expect("first root activation")
+            .commit();
+
+        let (second_root, second_backend) =
+            MmResources::new_carrier_root(&carrier, 0x8000, asids).expect("second root");
+        let second_bootstrap = carrick_kernel::kernel::RootBootstrap::with_mm_backend(
+            6_101,
+            carrick_hal::ThreadId::synthetic_for_tests(6_101),
+            second_backend,
+            "second-root".to_owned(),
+            Arc::new(carrick_hal::NullHostSignalBridge::default()),
+        )
+        .expect("second bootstrap")
+        .with_container(Arc::new(Container::new(launch("second"))));
+        let (second_kernel_root, second_resources) = carrier
+            .boot_kernel_root_prepared(second_bootstrap, |kernel, _, _| {
+                second_root
+                    .native_fork_stock_resources(kernel, 1)
+                    .map_err(|error| {
+                        carrick_kernel::run_result::RuntimeError::Configuration(error.to_string())
+                    })
+            })
+            .expect("boot second root");
+
+        assert_eq!(
+            first_resources.tables.arenas(),
+            second_resources.tables.arenas()
+        );
+        assert!(
+            Arc::ptr_eq(&first_resources.inventory, &second_resources.inventory),
+            "second root in the same carrier must reuse the carrier kernel's physical frame inventory"
+        );
+        assert!(
+            first_resources.matches(&second_resources),
+            "second root in the same carrier must produce matching NativeForkStockResources"
+        );
+
+        let child = second_root.prepare_child().expect("second root child");
+        assert_ne!(
+            child.binding().stage1_root.gpa().0,
+            first_resources.tables.arenas()[0].address().raw(),
+            "second root child must not collide with the carrier's reserved fork-table arena"
+        );
+
+        drop(second_kernel_root);
+        drop(first_kernel_root);
+        drop(carrier);
+
+        let other_carrier =
+            crate::carrier::CarrierRuntime::new_for_tests().expect("other test carrier");
+        let (other_root, other_backend) =
+            MmResources::new_carrier_root(&other_carrier, 0x8000, AsidAllocator::new())
+                .expect("other root");
+        let other_bootstrap = carrick_kernel::kernel::RootBootstrap::with_mm_backend(
+            6_102,
+            carrick_hal::ThreadId::synthetic_for_tests(6_102),
+            other_backend,
+            "other-root".to_owned(),
+            Arc::new(carrick_hal::NullHostSignalBridge::default()),
+        )
+        .expect("other bootstrap")
+        .with_container(Arc::new(Container::new(LaunchContext::unmanaged(
+            RunId::new("stage1-mm-other"),
+        ))));
+        let (_, other_resources) = other_carrier
+            .boot_kernel_root_prepared(other_bootstrap, |kernel, _, _| {
+                other_root
+                    .native_fork_stock_resources(kernel, 1)
+                    .map_err(|error| {
+                        carrick_kernel::run_result::RuntimeError::Configuration(error.to_string())
+                    })
+            })
+            .expect("boot other root");
+        assert!(
+            !first_resources.matches(&other_resources),
+            "a distinct carrier's kernel inventory must not match the first carrier's fork stock"
+        );
     }
 }

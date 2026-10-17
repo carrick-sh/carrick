@@ -436,6 +436,8 @@ struct CarrierInner {
     /// The scheduling policy an embedder installed for this carrier's run
     /// queue, read once when the carrier boots its kernel runtime.
     scheduling_policy: parking_lot::Mutex<Option<Arc<dyn carrick_hal::SchedulingPolicy>>>,
+    /// Carrier-wide stage-1 root-slot and ASID pool shared across container roots.
+    stage1_mm_pool: parking_lot::Mutex<Option<crate::hvpatch::Stage1MmPool>>,
     lifecycle: crate::vm_lifecycle::VmLifecycleWindow,
     implicit_hold: parking_lot::Mutex<Option<Arc<CarrierInner>>>,
 }
@@ -466,6 +468,26 @@ impl CarrierRuntime {
         &self,
     ) -> Arc<carrick_vfs::fs_resolve_cache::BindCacheCohorts> {
         Arc::clone(&self.inner.bind_cache_cohorts)
+    }
+    pub(crate) fn allocate_stage1_root(
+        &self,
+        stage1_root: u64,
+        asids: carrick_hal::asid::AsidAllocator,
+    ) -> Result<
+        (
+            crate::hvpatch::Stage1MmPool,
+            Arc<crate::hvpatch::Stage1MmLease>,
+        ),
+        crate::hvpatch::Stage1MmError,
+    > {
+        let mut slot = self.inner.stage1_mm_pool.lock();
+        if let Some(pool) = slot.as_ref() {
+            let root = pool.allocate_root(stage1_root)?;
+            return Ok((pool.clone(), root));
+        }
+        let (pool, root) = crate::hvpatch::Stage1MmPool::with_allocator(stage1_root, asids)?;
+        *slot = Some(pool.clone());
+        Ok((pool, root))
     }
     /// Install the scheduling policy this carrier's run queue will use.
     ///
@@ -533,6 +555,7 @@ impl CarrierRuntime {
             changed: parking_lot::Condvar::new(),
             kernel_runtime: parking_lot::Mutex::new(CarrierKernelRuntimeSlot::Vacant),
             scheduling_policy: parking_lot::Mutex::new(None),
+            stage1_mm_pool: parking_lot::Mutex::new(None),
             kernel_runtime_changed: parking_lot::Condvar::new(),
             lifecycle,
             implicit_hold: parking_lot::Mutex::new(None),
@@ -783,6 +806,7 @@ impl CarrierRuntime {
             let previous = std::mem::replace(&mut *slot, CarrierKernelRuntimeSlot::Booting(None));
             drop(slot);
             drop(previous);
+            *self.inner.stage1_mm_pool.lock() = None;
             *self.inner.kernel_runtime.lock() = CarrierKernelRuntimeSlot::Vacant;
             self.inner.kernel_runtime_changed.notify_all();
         }
@@ -803,6 +827,7 @@ impl CarrierRuntime {
             let previous = std::mem::replace(&mut *slot, CarrierKernelRuntimeSlot::Booting(None));
             drop(slot);
             drop(previous);
+            *self.inner.stage1_mm_pool.lock() = None;
             *self.inner.kernel_runtime.lock() = CarrierKernelRuntimeSlot::Vacant;
             self.inner.kernel_runtime_changed.notify_all();
         }
@@ -818,6 +843,7 @@ impl CarrierRuntime {
             let previous = std::mem::replace(&mut *slot, CarrierKernelRuntimeSlot::Booting(None));
             drop(slot);
             drop(previous);
+            *self.inner.stage1_mm_pool.lock() = None;
             *self.inner.kernel_runtime.lock() = CarrierKernelRuntimeSlot::Vacant;
             self.inner.kernel_runtime_changed.notify_all();
         }
@@ -1066,6 +1092,7 @@ impl CarrierRuntime {
         self.inner.changed.notify_all();
         let snapshot = self.snapshot_locked(&state);
         drop(state);
+        *self.inner.stage1_mm_pool.lock() = None;
         let _ = self.inner.implicit_hold.lock().take();
         Ok(snapshot)
     }
@@ -1731,10 +1758,10 @@ pub fn exit_explicit_carrier(carrier: &CarrierRuntime, status: i32) -> ! {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    pub(crate) static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     #[test]
     fn serial_host_watchdog_scope_survives_unprepared_and_successive_carriers() {

@@ -52,12 +52,12 @@ pub(crate) use mm_resources::{
     ExecMmDispositionKind, ExecMmReservation, ExecSettlementEnrollment, ExecSettlementSubscription,
     MmResourcesError, RetiredStage1Mm,
 };
-pub(crate) use stage1_mm::{
-    CowInvalidationObserver, Stage1MmLease, Stage1MmRetirement, Stage1RootRetirementReceipt,
-    Stage1RootRetirementTicket,
-};
 #[cfg(test)]
-pub(crate) use stage1_mm::{Stage1MmPool, complete_root_for_test};
+pub(crate) use stage1_mm::complete_root_for_test;
+pub(crate) use stage1_mm::{
+    CowInvalidationObserver, Stage1MmError, Stage1MmLease, Stage1MmPool, Stage1MmRetirement,
+    Stage1RootRetirementReceipt, Stage1RootRetirementTicket,
+};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use mm_resources::OwnerSetEditHold;
@@ -1072,7 +1072,7 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
     let asids = engine.carrier_asid_allocator().ok_or_else(|| {
         RuntimeError::Configuration("backend missing carrier ASID allocator for HVPatch".to_owned())
     })?;
-    let (table, mm_backend) = MmResources::new_root(stage1_root, asids)
+    let (table, mm_backend) = MmResources::new_carrier_root(carrier, stage1_root, asids)
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
     let table = std::sync::Arc::new(table);
     let root_tid = identity.tid;
@@ -1130,14 +1130,11 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
             })?;
             let fork_arenas = engine.native_fork_table_arenas();
             if fork_arenas != 0 {
-                let tables = table
-                    .reserve_native_fork_tables(fork_arenas)
+                let resources = table
+                    .native_fork_stock_resources(kernel, fork_arenas)
                     .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
                 engine
-                    .install_native_fork_stock(carrick_hal::fork_stock::NativeForkStockResources {
-                        tables,
-                        inventory: kernel.physical_frame_inventory(),
-                    })
+                    .install_native_fork_stock(resources)
                     .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
             }
             let prepared = ProcessContext::new(

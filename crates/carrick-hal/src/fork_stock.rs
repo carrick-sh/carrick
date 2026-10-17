@@ -514,6 +514,14 @@ pub struct NativeForkStockResources {
     pub tables: std::sync::Arc<dyn NativeForkTableReservation>,
     pub inventory: std::sync::Arc<dyn crate::PhysicalFrameInventory>,
 }
+impl NativeForkStockResources {
+    /// True when both resource bundles name the same carrier's reserved
+    /// fork-table arenas and physical frame inventory.
+    pub fn matches(&self, other: &Self) -> bool {
+        self.tables.arenas() == other.tables.arenas()
+            && std::sync::Arc::ptr_eq(&self.inventory, &other.inventory)
+    }
+}
 impl core::fmt::Debug for NativeForkStockResources {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
@@ -1051,10 +1059,12 @@ impl<T: ChildAddressTags> ForkStock<T> {
                 .entry(child_key)
                 .or_default()
                 .extend(pending.child_tables);
-            self.committed_tables
-                .entry(parent_key)
-                .or_default()
-                .extend(pending.parent_tables);
+            if !pending.parent_tables.is_empty() {
+                self.committed_tables
+                    .entry(parent_key)
+                    .or_default()
+                    .extend(pending.parent_tables);
+            }
             for page in &unused_child {
                 ledger.give_back(*page, loan.request.child_mm);
             }
@@ -1106,7 +1116,8 @@ impl<T: ChildAddressTags> ForkStock<T> {
     /// before anything reenters the reusable stock. A child whose release,
     /// clear or tag retirement fails is deferred (counted, still
     /// quarantined, retried at the next drain); only a broken custody
-    /// invariant (a quarantined MM with no committed child) is an error.
+    /// invariant (a quarantined MM with neither a committed child nor
+    /// borrowed parent tables) is an error.
     pub fn reclaim(
         &mut self,
         ledger: &mut impl ForkTableLedger,
@@ -1132,10 +1143,10 @@ impl<T: ChildAddressTags> ForkStock<T> {
         let mut reclaimed = 0;
         for (key, absence) in candidates {
             let mm = key.mm().ok_or(ForkStockServiceError::InvalidRecord)?;
-            let child = *self
-                .children
-                .get(&key)
-                .ok_or(ForkStockServiceError::InvalidRecord)?;
+            let child = self.children.get(&key).copied();
+            if child.is_none() && !self.committed_tables.contains_key(&key) {
+                return Err(ForkStockServiceError::InvalidRecord);
+            }
             let pages = self
                 .committed_tables
                 .get(&key)
@@ -1148,21 +1159,29 @@ impl<T: ChildAddressTags> ForkStock<T> {
             // a failed step defers only this child: it stays quarantined, its
             // stock stays held, the deferral is counted, and the next drain
             // retries it. Guest behaviour never turns into a carrier fault.
-            let deferred = if self
-                .quarantine
-                .get(&key)
-                .is_some_and(|state| !state.released)
-                && !release(&absence)
-            {
-                true
+            let deferred = if let Some(child) = child {
+                if self
+                    .quarantine
+                    .get(&key)
+                    .is_some_and(|state| !state.released)
+                    && !release(&absence)
+                {
+                    true
+                } else {
+                    self.quarantine
+                        .get_mut(&key)
+                        .ok_or(ForkStockServiceError::InvalidRecord)?
+                        .released = true;
+                    !clear_tables(pages)
+                        || !clear_lifecycle(child.lifecycle)
+                        || self.tags.retire(child.tag, absence).is_err()
+                }
             } else {
                 self.quarantine
                     .get_mut(&key)
                     .ok_or(ForkStockServiceError::InvalidRecord)?
                     .released = true;
                 !clear_tables(pages)
-                    || !clear_lifecycle(child.lifecycle)
-                    || self.tags.retire(child.tag, absence).is_err()
             };
             if deferred {
                 self.counters.reclaim_deferrals = self.counters.reclaim_deferrals.saturating_add(1);
@@ -1175,21 +1194,32 @@ impl<T: ChildAddressTags> ForkStock<T> {
                 }
                 self.tables.extend(pages);
             }
-            self.lifecycles.push(child.lifecycle);
+            if let Some(child) = child {
+                self.lifecycles.push(child.lifecycle);
+                self.counters.returned_children = self.counters.returned_children.saturating_add(1);
+            }
             self.quarantine.remove(&key);
             reclaimed += 1;
-            self.counters.returned_children = self.counters.returned_children.saturating_add(1);
         }
         Ok(reclaimed)
     }
 
-    /// The container root exited and the VM ends with it: forget its custody.
-    /// Its tag is never reissued, so no absence proof (impossible while the
-    /// root is still installed on the exiting CPU) is needed.
+    /// The container root exited: retire any child entry and quarantine any
+    /// borrowed parent fork tables so the next drain clears and returns them
+    /// once the root leaves its execution slot. Its tag is owned by the host
+    /// root MM rather than the fork stock.
     pub fn retire_exited_root(&mut self, mm: ReservationMm) {
         if let Some(key) = MmKey::of(mm) {
             self.children.remove(&key);
-            self.quarantine.remove(&key);
+            if self
+                .committed_tables
+                .get(&key)
+                .is_some_and(|pages| !pages.is_empty())
+            {
+                self.quarantine.entry(key).or_default();
+            } else {
+                self.quarantine.remove(&key);
+            }
         }
     }
 }

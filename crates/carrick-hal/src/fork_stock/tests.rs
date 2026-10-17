@@ -1149,3 +1149,147 @@ fn refusal_reports_installed_quarantine_and_exact_lifecycle_resource() {
     assert!(cleared.borrow().is_empty());
     assert_eq!(stock.counters().capacity_refusals, 1);
 }
+
+#[derive(Default)]
+struct RecordingLedger {
+    live: std::collections::BTreeSet<(RootGpa, u64)>,
+}
+
+impl ForkTableLedger for RecordingLedger {
+    fn grant(&mut self, page: RootGpa, mm: ReservationMm) -> bool {
+        self.live.insert((page, mm.raw()))
+    }
+
+    fn give_back(&mut self, page: RootGpa, mm: ReservationMm) {
+        assert!(
+            self.live.remove(&(page, mm.raw())),
+            "unexpected give_back {page:?} {mm:?}"
+        );
+    }
+}
+
+#[derive(Debug)]
+struct TestTableReservation(Vec<RootGpa>);
+
+impl NativeForkTableReservation for TestTableReservation {
+    fn arenas(&self) -> &[RootGpa] {
+        &self.0
+    }
+}
+
+struct DummyInventory;
+
+#[allow(clippy::unimplemented)]
+impl crate::PhysicalFrameInventory for DummyInventory {
+    fn bind(&self, _owner: crate::GuestFrameOwner) -> std::sync::Arc<dyn crate::FrameCowAuthority> {
+        unimplemented!()
+    }
+
+    fn allocate_backing_ids(
+        &self,
+    ) -> Result<(crate::FrameId, crate::MappingId), Box<dyn std::error::Error + Send + Sync>> {
+        Err("unused in test".into())
+    }
+
+    fn retire_mm(
+        &self,
+        _mm: carrick_guest_arch::MmGeneration,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(0)
+    }
+}
+
+#[test]
+fn second_root_reuses_carrier_fork_stock_after_first_root_exits() {
+    let tables = std::sync::Arc::new(TestTableReservation(vec![page(0x9a00_0000_0000)]));
+    let inventory: std::sync::Arc<dyn crate::PhysicalFrameInventory> =
+        std::sync::Arc::new(DummyInventory);
+    let first_resources = NativeForkStockResources {
+        tables: tables.clone(),
+        inventory: std::sync::Arc::clone(&inventory),
+    };
+    let second_resources = NativeForkStockResources {
+        tables,
+        inventory: std::sync::Arc::clone(&inventory),
+    };
+    let foreign_tables = NativeForkStockResources {
+        tables: std::sync::Arc::new(TestTableReservation(vec![page(0x9a00_0040_0000)])),
+        inventory: std::sync::Arc::clone(&inventory),
+    };
+    let foreign_inventory = NativeForkStockResources {
+        tables: std::sync::Arc::new(TestTableReservation(vec![page(0x9a00_0000_0000)])),
+        inventory: std::sync::Arc::new(DummyInventory),
+    };
+    assert!(first_resources.matches(&second_resources));
+    assert!(!first_resources.matches(&foreign_tables));
+    assert!(!first_resources.matches(&foreign_inventory));
+
+    let mut stock = stock(UntaggedRoots, 2, 1);
+    let mut ledger = RecordingLedger::default();
+    let root1 = execution(41, 0, PARENT_MM, 0x1000);
+    let mut exchange1 = ForkStockExchange::new(request(root1, 302, 1, 1)).unwrap();
+    let granted1 = stock
+        .loan(&mut ledger, root1, &mut exchange1, |_| true)
+        .unwrap();
+    let completion1 = PortalForkCompletion {
+        request: granted1.request,
+        // SAFETY: test receipt for the exact admitted loan.
+        child: unsafe {
+            El1MmHandle::from_admitted_owner(CARRIER, granted1.request.child_mm, NonZeroU64::MIN)
+        },
+        parent_generation: ReservationGeneration::INITIAL,
+        child_tables_used: 4096,
+        parent_tables_used: 4096,
+    };
+    let mut settlement1 = ForkStockSettlement::new(
+        granted1,
+        completion1,
+        KernelVa::new(0xffff_8000_0001_0000),
+        0,
+    )
+    .unwrap();
+    stock
+        .settle(
+            &mut ledger,
+            root1,
+            &mut settlement1,
+            |_| true,
+            |_| true,
+            |_| true,
+        )
+        .unwrap();
+    assert!(stock.table_stock().is_empty());
+
+    retire(&mut stock, child_of(granted1, 900)).unwrap();
+    stock.retire_exited_root(mm(PARENT_MM));
+    assert!(stock.is_quarantined(mm(302)));
+    assert!(stock.is_quarantined(mm(PARENT_MM)));
+
+    let root2_mm = 401;
+    let root2 = execution(51, 0, root2_mm, 0x2000);
+    let released = RefCell::new(Vec::new());
+    let reclaimed = stock
+        .reclaim(
+            &mut ledger,
+            mm(root2_mm),
+            absent,
+            |_| true,
+            |_| true,
+            |absence| {
+                released.borrow_mut().push(absence.mm());
+                true
+            },
+        )
+        .unwrap();
+    assert_eq!(reclaimed, 2);
+    assert_eq!(*released.borrow(), vec![mm(302)]);
+    assert!(ledger.live.is_empty());
+    assert_eq!(stock.table_stock().len(), 2);
+    assert!(stock.lifecycle_available());
+
+    let mut exchange2 = ForkStockExchange::new(request(root2, 402, 1, 1)).unwrap();
+    let granted2 = stock
+        .loan(&mut ledger, root2, &mut exchange2, |_| true)
+        .unwrap();
+    assert_eq!(granted2.request.child_mm, mm(402));
+}

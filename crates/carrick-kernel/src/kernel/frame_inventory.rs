@@ -106,7 +106,8 @@ pub struct FrameInventoryAuthority {
 
 /// A projection of the existing inventory and object ID source, never a
 /// second inventory. Bindings retain exact MM identity across publication.
-struct PhysicalInventoryProjection {
+#[derive(Debug)]
+pub(super) struct PhysicalInventoryProjection {
     inventory: std::sync::Arc<FrameInventoryAuthority>,
     ids: std::sync::Arc<ObjectIdRegistry>,
 }
@@ -116,14 +117,21 @@ struct PhysicalInventoryBinding {
     mm: FrameOwner,
 }
 impl FrameInventoryAuthority {
-    pub fn physical_projection(
+    pub(super) fn new_physical_projection(
         self: &std::sync::Arc<Self>,
         ids: std::sync::Arc<ObjectIdRegistry>,
-    ) -> std::sync::Arc<dyn carrick_hal::PhysicalFrameInventory> {
+    ) -> std::sync::Arc<PhysicalInventoryProjection> {
         std::sync::Arc::new(PhysicalInventoryProjection {
             inventory: std::sync::Arc::clone(self),
             ids,
         })
+    }
+
+    pub fn physical_projection(
+        self: &std::sync::Arc<Self>,
+        ids: std::sync::Arc<ObjectIdRegistry>,
+    ) -> std::sync::Arc<dyn carrick_hal::PhysicalFrameInventory> {
+        self.new_physical_projection(ids)
     }
 }
 impl carrick_hal::PhysicalFrameInventory for PhysicalInventoryProjection {
