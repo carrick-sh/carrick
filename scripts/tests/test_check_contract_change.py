@@ -1,3 +1,4 @@
+import importlib.util
 import os
 import re
 import shutil
@@ -5,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -957,6 +959,193 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
             res.stdout,
         )
 
+    def seed_resolution_case(self, files, binding):
+        self.use_single_contract_surface()
+        self.guest_file.write_text("pub fn changed_futex() -> u64 { 1 }\n", encoding="utf-8")
+        for path, source in files.items():
+            target = self.repo / "crates" / "carrick-kernel" / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(source, encoding="utf-8")
+        contract = self.repo / "conformance-contracts/contracts/futex-contention.toml"
+        contract.write_text(
+            'schema_version = 1\nid = "kernel.futex.contention"\n'
+            'title = "Futex contention"\n[bindings]\n'
+            f'vm_free = "{binding}"\n',
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "seed resolution case"],
+                       cwd=self.repo, check=True, capture_output=True)
+        self.base_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True
+        ).strip()
+        self.guest_file.write_text("pub fn changed_futex() -> u64 { 2 }\n", encoding="utf-8")
+        subprocess.run(["git", "commit", "-am", "change guest surface"],
+                       cwd=self.repo, check=True, capture_output=True)
+
+    def test_inline_test_module_follows_out_of_line_child(self):
+        self.seed_resolution_case(
+            {
+                "src/lib.rs": "mod dispatch;\nmod witness;\n",
+                "src/witness.rs": "#[cfg(test)] mod tests { mod native_floor; }\n",
+                "src/witness/tests/native_floor.rs": "#[test] fn bound_test() {}\n",
+            },
+            "carrick-kernel::witness::tests::native_floor::bound_test",
+        )
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        child = self.repo / "crates/carrick-kernel/src/witness/tests/native_floor.rs"
+        child.write_text('#![cfg(feature = "never_enabled")]\n#[test] fn bound_test() {}\n')
+        subprocess.run(["git", "commit", "-am", "disable inline child"],
+                       cwd=self.repo, check=True, capture_output=True)
+        self.assertEqual(self.run_check().returncode, 1)
+
+    def test_reexported_path_test_module_resolves(self):
+        self.seed_resolution_case(
+            {
+                "src/lib.rs": "mod dispatch;\nmod personality;\npub use personality::{sched};\n",
+                "src/personality.rs": '#[path = "sched.rs"] pub mod sched;\n',
+                "src/sched.rs": '#[cfg(test)] #[path = "sched/tests.rs"] mod tests;\n',
+                "src/sched/tests.rs": "#[test] fn bound_test() {}\n",
+            },
+            "carrick-kernel::sched::tests::bound_test",
+        )
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        root = self.repo / "crates/carrick-kernel/src/lib.rs"
+        root.write_text(
+            'mod dispatch;\nmod personality;\n'
+            '#[cfg(feature = "never_enabled")] pub use personality::{sched};\n'
+        )
+        subprocess.run(["git", "commit", "-am", "disable reexport"],
+                       cwd=self.repo, check=True, capture_output=True)
+        self.assertEqual(self.run_check().returncode, 1)
+
+    def test_module_reexport_spellings_and_cycles(self):
+        for export in (
+            "pub use self::personality::sched;",
+            "pub use crate::personality::sched as sched;",
+            "pub use personality::*;",
+        ):
+            with self.subTest(export=export):
+                self.seed_resolution_case(
+                    {
+                        "src/lib.rs": f"mod dispatch;\nmod personality;\n{export}\n",
+                        "src/personality.rs": "pub mod sched;\n",
+                        "src/personality/sched.rs": "#[cfg(test)] mod tests {\n"
+                                                   "#[test] fn bound_test() {} }\n",
+                    },
+                    "carrick-kernel::sched::tests::bound_test",
+                )
+                result = self.run_check()
+                self.assertEqual(result.returncode, 0, msg=result.stderr)
+        root = self.repo / "crates/carrick-kernel/src/lib.rs"
+        root.write_text("mod dispatch;\nmod personality;\npub use personality::*;\n")
+        module = self.repo / "crates/carrick-kernel/src/personality.rs"
+        module.write_text("pub use crate::personality::*;\n")
+        subprocess.run(["git", "commit", "-am", "cyclic reexport cannot resolve"],
+                       cwd=self.repo, check=True, capture_output=True)
+        self.assertEqual(self.run_check().returncode, 1)
+
+    def test_declared_module_does_not_fall_back_through_glob_reexports(self):
+        self.seed_resolution_case(
+            {
+                "src/lib.rs": "mod dispatch;\nmod witness;\npub use witness::*;\n",
+                "src/witness.rs": "#[cfg(test)] mod tests {}\npub use crate::witness::*;\n",
+            },
+            "carrick-kernel::witness::tests::missing",
+        )
+        spec = importlib.util.spec_from_file_location("contract_checker", SCRIPT_PATH)
+        checker = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = checker
+        self.addCleanup(sys.modules.pop, spec.name)
+        spec.loader.exec_module(checker)
+        view = checker.RepoView(self.repo, "HEAD")
+        with patch.object(checker, "_find_use_reexports",
+                          wraps=checker._find_use_reexports) as reexports:
+            self.assertIsNone(checker.resolve_binding_at_view(
+                view, "carrick-kernel::witness::tests::missing"
+            ))
+        self.assertEqual(reexports.call_count, 1)
+
+    def test_path_attribute_does_not_use_nonexistent_file_relative_fallback(self):
+        self.seed_resolution_case(
+            {
+                "src/lib.rs": "mod dispatch;\nmod witness;\n",
+                "src/witness.rs": '#[cfg(test)] #[path = "missing.rs"] mod tests;\n',
+                "src/witness/missing.rs": "#[test] fn bound_test() {}\n",
+            },
+            "carrick-kernel::witness::tests::bound_test",
+        )
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1, msg=result.stdout)
+
+    def test_contract_called_through_one_local_helper_resolves(self):
+        self.seed_gated_futex_contracts()
+        tests = self.repo / "crates/carrick-kernel-example/tests/contracts.rs"
+        tests.write_text(
+            "fn observations() { carrick_kernel_example::futex_contention_contract(); }\n"
+            "#[test] fn bound_test() { observations(); }\n"
+            "#[test] fn requeue() { carrick_kernel_example::futex_requeue_contract(); }\n"
+        )
+        subprocess.run(["git", "commit", "-am", "call contract through one helper"],
+                       cwd=self.repo, check=True, capture_output=True)
+        self.base_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True
+        ).strip()
+        self.guest_file.write_text("pub fn changed_futex() -> u64 { 2 }\n")
+        subprocess.run(["git", "commit", "-am", "change guest surface"],
+                       cwd=self.repo, check=True, capture_output=True)
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        tests.write_text(tests.read_text().replace("bound_test() { observations(); }",
+                                                  "bound_test() { assert!(true); }"))
+        subprocess.run(["git", "commit", "-am", "stop calling helper"],
+                       cwd=self.repo, check=True, capture_output=True)
+        self.assertEqual(self.run_check().returncode, 1)
+
+    def test_called_local_helper_can_reference_changed_surface(self):
+        self.seed_resolution_case(
+            {
+                "src/lib.rs": "mod dispatch;\n#[cfg(test)] mod tests;\n",
+                "src/tests.rs": "fn helper() { changed_futex(); }\n"
+                                "#[test] fn bound_test() { helper(); }\n",
+            },
+            "carrick-kernel::tests::bound_test",
+        )
+        # Make this an added binding so the relevance check must inspect the helper.
+        contract = "conformance-contracts/contracts/futex-contention.toml"
+        base_contract = (self.repo / contract).read_text()
+        (self.repo / contract).write_text(base_contract.replace(
+            'vm_free = "carrick-kernel::tests::bound_test"', 'docker = "probe:futex"'
+        ))
+        subprocess.run(["git", "commit", "-am", "remove binding before addition"],
+                       cwd=self.repo, check=True, capture_output=True)
+        self.base_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True
+        ).strip()
+        (self.repo / contract).write_text(base_contract)
+        self.guest_file.write_text("pub fn changed_futex() -> u64 { 3 }\n")
+        subprocess.run(["git", "commit", "-am", "add relevant helper binding"],
+                       cwd=self.repo, check=True, capture_output=True)
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        tests = self.repo / "crates/carrick-kernel/src/tests.rs"
+        for source in (
+            '#[cfg(feature = "never_enabled")] fn helper() { changed_futex(); }\n'
+            "#[test] fn bound_test() { helper(); }\n",
+            "fn helper() { changed_futex(); }\n"
+            "#[test] fn bound_test() { other::helper(); }\n",
+            "fn helper() { changed_futex(); }\nfn indirect() { helper(); }\n"
+            "#[test] fn bound_test() { indirect(); }\n",
+        ):
+            with self.subTest(source=source):
+                tests.write_text(source)
+                subprocess.run(["git", "commit", "-am", "exclude inactive or indirect helper"],
+                               cwd=self.repo, check=True, capture_output=True)
+                result = self.run_check()
+                self.assertEqual(result.returncode, 1, msg=result.stdout)
+
     def test_contract_without_any_gated_bound_test_fails(self):
         self.seed_gated_futex_contracts()
         self.use_single_contract_surface()
@@ -1863,5 +2052,3 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
 
 if __name__ == "__main__":
     unittest.main()
-
-

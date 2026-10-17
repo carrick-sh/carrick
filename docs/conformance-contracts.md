@@ -153,6 +153,17 @@ run the contract. `scripts/conformance/check-contract-change.py` automatically w
 
 For non-exempted changed guest surfaces, `scripts/conformance/check-contract-change.py` reads the git trees at `base` and `head` directly and requires every contract mapped to the surface in `conformance-contracts/surfaces.toml` to have at least one bound test (`vm_free` or `embed`) that resolves at `HEAD` and belongs to a gated test lane in `[package.metadata.carrick.test-lanes]` (`host`, `kvm`, `integration`, `signed-cli`, or `signed-hvf`, validated fail-closed against `Cargo.toml`), printing `evidenced: <path> -> <contract>: <test>`. Every `surfaces.toml` entry must exist at `HEAD` (stale entries fail closed), and deleting a mapped surface without an exemption or re-mapping onto an added surface fails closed. A binding must resolve along an explicit chain of `mod` declarations from the crate or test-target root whose `#[cfg(...)]` attributes are active in CI (rejecting disabled features, non-CI `target_os`/`target_arch`, and `cfg` expressions excluding `test`) to a `#[test]` function (or a `pub fn` in `src/contracts.rs` called inside a `#[test]` function's own body in a gated integration test target), never a production function or the changed surface file itself. `#[ignore]`d tests are rejected unless a `justfile` recipe transitively invoked by `.github/workflows/*.yml` passes `--ignored` for that crate and test filter. Any binding added in the diff that fails to resolve is an error, and an added or modified binding only counts for a surface if it is in the surface's dedicated leaf unit-test file (`<stem>/tests.rs`, `<stem>_tests.rs`, `<stem>_test.rs`; never `lib.rs` or `mod.rs`) or the bound test function's own `{ ... }` body (or `<contract_fn>`'s own body) references a non-keyword item identifier (`fn`, `struct`, `enum`, `type`, `const`, `static`, `trait`, `union`, `mod`, or `macro_rules!`) defined or modified on a line with changed code tokens (excluding comment/whitespace-only line edits and `#[cfg(test)]` / `#[cfg(all(test, ...))]` items) in the surface's diff.
 
+Module resolution follows children of inline test modules, local module
+re-exports, and `#[path]` declarations using their Rust-relative directory,
+not a search for a matching filename. A declared module takes precedence over
+glob re-exports, including when its requested child is absent. A test may call
+a contract through one directly called, CI-active local helper. For a bound
+test's relevance check, the same one-level expansion includes directly called
+local helpers, but never uncalled helpers, disabled helpers, or recursive
+helper chains. Contract-function bindings still use only the contract
+function's body for relevance. Identifier matching is textual, not Rust name
+resolution; closing the common-name ambiguity remains follow-up #537.
+
 ## Commands
 
 Use the repository recipes; they preserve signing, serialization, and test

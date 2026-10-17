@@ -1448,6 +1448,68 @@ def _extract_top_level_test_fns(
     return results
 
 
+def _extract_non_test_fns(
+    scope_stripped: str,
+    scope_comments_stripped: str,
+    view: RepoView,
+    pkg_name: str,
+    lane: str,
+    accum_cfgs: list[str],
+) -> dict[str, str]:
+    """Find all non-`#[test]` `fn <name>` at brace depth 0 of `scope_stripped` whose `#[cfg]`s are active in CI.
+
+    Returns `{fn_name: fn_body_only_stripped}`.
+    """
+    depths = _compute_brace_depths(scope_stripped)
+    fn_pattern = re.compile(
+        rf"(?:^|[;\}}\s])((?:#\s*\[[^\]]*\]\s*)*){_VIS_MOD_PREFIX}"
+        rf"(?:\b(?:default|const|async|unsafe|extern(?:\s*\"[^\"]*\")?)\s+)*"
+        rf"\bfn\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\b",
+        re.M,
+    )
+    results: dict[str, str] = {}
+    for m in fn_pattern.finditer(scope_stripped):
+        if depths[m.start(1)] != 0:
+            continue
+        attrs_cs = scope_comments_stripped[m.start(1) : m.end(1)]
+        if _TEST_ATTR_RE.search(attrs_cs):
+            continue
+        fn_cfgs = _extract_cfg_exprs(attrs_cs)
+        if not _are_cfgs_active_in_ci(view, pkg_name, lane, accum_cfgs + fn_cfgs):
+            continue
+        fn_name = m.group(2)
+        open_brace = scope_stripped.find("{", m.end())
+        if open_brace == -1:
+            continue
+        close_brace = _find_matching_brace(scope_stripped, open_brace)
+        if close_brace == -1:
+            continue
+        results[fn_name] = scope_stripped[open_brace : close_brace + 1]
+    return results
+
+
+def _body_calls_fn(body: str, callee_name: str) -> bool:
+    esc = re.escape(callee_name)
+    pat = re.compile(
+        rf"(?:(?<![.\w:])|(?:self|super|crate)::)\b{esc}\s*\("
+        rf"|\.\s*(?:map|and_then|or_else|filter|inspect|flat_map)\s*\(\s*(?:[\w:]+::)?{esc}\s*\)"
+    )
+    return bool(pat.search(body))
+
+
+def _expand_body_with_one_level_helpers(
+    fn_body: str, local_helpers: dict[str, str]
+) -> str:
+    """Append bodies of functions in `local_helpers` that are directly called by `fn_body` (one level only)."""
+    if not local_helpers:
+        return fn_body
+    parts = [fn_body]
+    for hname, hbody in sorted(local_helpers.items()):
+        if _body_calls_fn(fn_body, hname):
+            parts.append(hbody)
+    return "\n".join(parts)
+
+
 def _scope_valid_test_fn_bodies(
     view: RepoView,
     pkg_name: str,
@@ -1458,13 +1520,16 @@ def _scope_valid_test_fn_bodies(
     accum_cfgs: list[str],
     enclosing_attrs_cs: str = "",
 ) -> list[str] | None:
-    """Return list of runnable `#[test]` function `{ ... }` bodies for `fn_name` (or all in scope if `fn_name` is None),
-    or None if no runnable CI-compiled `#[test]` function matches.
+    """Return list of runnable `#[test]` function `{ ... }` bodies (plus 1-level local helpers) for `fn_name`
+    (or all in scope if `fn_name` is None), or None if no runnable CI-compiled `#[test]` function matches.
     """
     if not _are_cfgs_active_in_ci(view, pkg_name, lane, accum_cfgs):
         return None
     test_fns = _extract_top_level_test_fns(
         scope_stripped, scope_comments_stripped, enclosing_attrs_cs
+    )
+    local_helpers = _extract_non_test_fns(
+        scope_stripped, scope_comments_stripped, view, pkg_name, lane, accum_cfgs
     )
     if fn_name is not None:
         if fn_name not in test_fns:
@@ -1474,14 +1539,14 @@ def _scope_valid_test_fn_bodies(
             return None
         if is_ignored and not _is_ignored_test_allowed(view, pkg_name, fn_name):
             return None
-        return [fn_body]
+        return [_expand_body_with_one_level_helpers(fn_body, local_helpers)]
 
     bodies: list[str] = []
     for name, (is_ignored, fn_cfgs, fn_body) in sorted(test_fns.items()):
         if not _are_cfgs_active_in_ci(view, pkg_name, lane, accum_cfgs + fn_cfgs):
             continue
         if not is_ignored or _is_ignored_test_allowed(view, pkg_name, name):
-            bodies.append(fn_body)
+            bodies.append(_expand_body_with_one_level_helpers(fn_body, local_helpers))
 
     depths = _compute_brace_depths(scope_stripped)
     mod_iter = re.finditer(
@@ -1501,11 +1566,15 @@ def _scope_valid_test_fn_bodies(
             sub_fns = _extract_top_level_test_fns(
                 sub_s, sub_cs, enclosing_attrs_cs + "\n" + sub_attrs_cs
             )
+            sub_helpers = {
+                **local_helpers,
+                **_extract_non_test_fns(sub_s, sub_cs, view, pkg_name, lane, sub_cfgs),
+            }
             for name, (is_ignored, fn_cfgs, fn_body) in sorted(sub_fns.items()):
                 if not _are_cfgs_active_in_ci(view, pkg_name, lane, sub_cfgs + fn_cfgs):
                     continue
                 if not is_ignored or _is_ignored_test_allowed(view, pkg_name, name):
-                    bodies.append(fn_body)
+                    bodies.append(_expand_body_with_one_level_helpers(fn_body, sub_helpers))
 
     return bodies if bodies else None
 
@@ -1641,25 +1710,116 @@ def _resolve_child_mod_files(
     pkg_name: str,
     lane: str,
     cur_file: str,
-    is_cur_file_mod_root: bool,
+    cur_mod_dir: str,
     seg: str,
     attrs_cs: str,
+    is_file_scope: bool = True,
 ) -> list[str]:
     parent_dir = cur_file.rsplit("/", 1)[0] if "/" in cur_file else ""
     explicit_path = _extract_path_attr(view, pkg_name, lane, attrs_cs)
     if explicit_path is not None:
-        base = parent_dir if is_cur_file_mod_root else cur_file[:-3]
-        for candidate_base in ([parent_dir, base] if parent_dir != base else [parent_dir]):
-            joined = os.path.normpath(f"{candidate_base}/{explicit_path}").replace("\\", "/")
-            if view.is_file(joined):
-                return [joined]
-        return []
-    mod_dir = parent_dir if is_cur_file_mod_root else cur_file[:-3]
+        base = parent_dir if is_file_scope else cur_mod_dir
+        joined = os.path.normpath(f"{base}/{explicit_path}").replace("\\", "/")
+        return [joined] if view.is_file(joined) else []
     out: list[str] = []
-    for cand in (f"{mod_dir}/{seg}.rs", f"{mod_dir}/{seg}/mod.rs"):
-        if view.is_file(cand):
+    for cand in (f"{cur_mod_dir}/{seg}.rs", f"{cur_mod_dir}/{seg}/mod.rs"):
+        if view.is_file(cand) and cand not in out:
             out.append(cand)
     return out
+
+
+def _find_use_reexports(
+    scope_stripped: str,
+    scope_comments_stripped: str,
+    rem_segments: list[str],
+) -> list[tuple[str, bool, list[str]]]:
+    """Find `pub use` items at brace depth 0 of `scope_stripped` that alias `rem_segments[0]`
+    or glob-re-export (`*`) an intra-crate module path.
+
+    Returns list of `(attrs_from_comments_stripped, is_crate_root, new_rem_segments)`.
+    """
+    if not rem_segments:
+        return []
+    seg = rem_segments[0]
+    next_rem = rem_segments[1:]
+    depths = _compute_brace_depths(scope_stripped)
+    use_re = re.compile(
+        rf"(?:^|[;\}}\s])((?:#\s*\[[^\]]*\]\s*)*)\bpub(?:\s*\([^)]*\))?\s+use\s+([^;]+);",
+        re.M,
+    )
+    results: list[tuple[str, bool, list[str]]] = []
+
+    def normalize_prefix(raw_segs: list[str]) -> tuple[bool, list[str]] | None:
+        if not raw_segs:
+            return None
+        if raw_segs[0] == "crate":
+            rest = raw_segs[1:]
+            return (True, rest) if rest else None
+        if raw_segs[0] == "self":
+            rest = raw_segs[1:]
+            return (False, rest) if rest else None
+        if raw_segs[0] == "super":
+            return None
+        return (False, raw_segs)
+
+    for m in use_re.finditer(scope_stripped):
+        if depths[m.start(1)] != 0:
+            continue
+        attrs_cs = scope_comments_stripped[m.start(1) : m.end(1)]
+        tree = re.sub(r"\s+", " ", m.group(2).strip()).lstrip(":")
+
+        bm = re.match(r"^([A-Za-z0-9_:]+)::\s*\{([^{}]+)\}\s*$", tree)
+        if bm:
+            prefix_segs = [s.strip() for s in bm.group(1).split("::") if s.strip()]
+            norm = normalize_prefix(prefix_segs)
+            if norm is None:
+                continue
+            is_root, clean_prefix = norm
+            for raw_item in bm.group(2).split(","):
+                item = raw_item.strip()
+                if not item:
+                    continue
+                if " as " in item:
+                    orig, alias = [p.strip() for p in item.split(" as ", 1)]
+                else:
+                    orig = alias = item
+                if alias == seg:
+                    target_segs = clean_prefix + ([] if orig == "self" else [orig])
+                    if target_segs:
+                        results.append((attrs_cs, is_root, target_segs + next_rem))
+            continue
+
+        gm = re.match(r"^([A-Za-z0-9_:]+)::\s*\*\s*$", tree)
+        if gm:
+            prefix_segs = [s.strip() for s in gm.group(1).split("::") if s.strip()]
+            norm = normalize_prefix(prefix_segs)
+            if norm is not None:
+                is_root, clean_prefix = norm
+                results.append((attrs_cs, is_root, clean_prefix + rem_segments))
+            continue
+
+        sm = re.match(
+            r"^([A-Za-z0-9_:]+)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?\s*$", tree
+        )
+        if sm:
+            path_segs = [s.strip() for s in sm.group(1).split("::") if s.strip()]
+            if len(path_segs) < 2:
+                continue
+            alias = sm.group(2).strip() if sm.group(2) else path_segs[-1]
+            if alias == seg:
+                norm = normalize_prefix(path_segs)
+                if norm is not None:
+                    is_root, clean_path = norm
+                    results.append((attrs_cs, is_root, clean_path + next_rem))
+
+    return results
+
+
+def _scope_declares_mod(scope_s: str, scope_cs: str, mod_name: str) -> bool:
+    return bool(
+        _find_inline_mods(scope_s, scope_cs, mod_name)
+        or _find_out_of_line_mods(scope_s, scope_cs, mod_name)
+    )
 
 
 def _resolve_in_module_tree(
@@ -1673,88 +1833,109 @@ def _resolve_in_module_tree(
     """Resolve `segments` starting from `root_files` via explicit `mod` declarations and active CI `cfg`s
     to `(file_rel_path, runnable_test_fn_bodies)`.
     """
+    for rf in root_files:
+        if not view.is_file(rf):
+            continue
+        rf_s = view.read_stripped_rust(rf)
+        rf_cs = view.read_comments_stripped_rust(rf)
+        rf_inner_cfgs = _extract_cfg_exprs(rf_cs, inner_only=True)
+        rf_mod_dir = rf.rsplit("/", 1)[0] if "/" in rf else ""
+        visited: set[tuple[str, str, tuple[str, ...]]] = set()
 
-    def walk(
-        cur_file: str,
-        is_mod_root: bool,
-        scope_s: str,
-        scope_cs: str,
-        is_file_scope: bool,
-        rem_segments: list[str],
-        accum_cfgs: list[str],
-        enclosing_attrs_cs: str,
-        entered_test_mod: bool,
-    ) -> tuple[str, list[str]] | None:
-        if not _are_cfgs_active_in_ci(view, pkg_name, lane, accum_cfgs):
-            return None
-
-        in_test_context = (
-            entered_test_mod
-            or not require_test_module_for_root
-            or "/tests/" in f"/{cur_file}"
-            or cur_file.endswith(("/tests.rs", "_test.rs", "_tests.rs"))
-        )
-
-        if not rem_segments:
-            if not in_test_context:
+        def walk(
+            cur_file: str,
+            cur_mod_dir: str,
+            is_file_scope: bool,
+            scope_s: str,
+            scope_cs: str,
+            rem_segments: list[str],
+            accum_cfgs: list[str],
+            enclosing_attrs_cs: str,
+            entered_test_mod: bool,
+        ) -> tuple[str, list[str]] | None:
+            state_key = (cur_file, cur_mod_dir, tuple(rem_segments))
+            if state_key in visited:
                 return None
-            bodies = _scope_valid_test_fn_bodies(
-                view,
-                pkg_name,
-                lane,
-                scope_s,
-                scope_cs,
-                None,
-                accum_cfgs,
-                enclosing_attrs_cs,
-            )
-            if bodies:
-                return (cur_file, bodies)
-            return None
+            visited.add(state_key)
 
-        if len(rem_segments) == 1 and in_test_context:
-            fn_bodies = _scope_valid_test_fn_bodies(
-                view,
-                pkg_name,
-                lane,
-                scope_s,
-                scope_cs,
-                rem_segments[0],
-                accum_cfgs,
-                enclosing_attrs_cs,
-            )
-            if fn_bodies:
-                return (cur_file, fn_bodies)
+            if not _are_cfgs_active_in_ci(view, pkg_name, lane, accum_cfgs):
+                return None
 
-        seg = rem_segments[0]
-        next_rem = rem_segments[1:]
-        seg_is_test_name = seg == "tests" or seg.endswith(("_test", "_tests"))
-
-        # 1. Try inline `mod <seg> { ... }` in `scope_s`
-        for attrs_cs, body_s, body_cs in _find_inline_mods(scope_s, scope_cs, seg):
-            mod_cfgs = _extract_cfg_exprs(attrs_cs)
-            mod_is_test = (
+            in_test_context = (
                 entered_test_mod
-                or seg_is_test_name
-                or any(_cfg_is_test_only(e) for e in mod_cfgs)
+                or not require_test_module_for_root
+                or "/tests/" in f"/{cur_file}"
+                or cur_file.endswith(("/tests.rs", "_test.rs", "_tests.rs"))
             )
-            res = walk(
-                cur_file,
-                False,
-                body_s,
-                body_cs,
-                False,
-                next_rem,
-                accum_cfgs + mod_cfgs,
-                enclosing_attrs_cs + "\n" + attrs_cs,
-                mod_is_test,
-            )
-            if res is not None:
-                return res
 
-        # 2. Try out-of-line `mod <seg>;` when in a file scope
-        if is_file_scope:
-            for attrs_cs in _find_out_of_line_mods(scope_s, scope_cs, seg):
+            if not rem_segments:
+                if not in_test_context:
+                    return None
+                bodies = _scope_valid_test_fn_bodies(
+                    view,
+                    pkg_name,
+                    lane,
+                    scope_s,
+                    scope_cs,
+                    None,
+                    accum_cfgs,
+                    enclosing_attrs_cs,
+                )
+                if bodies:
+                    return (cur_file, bodies)
+                return None
+
+            if len(rem_segments) == 1 and in_test_context:
+                fn_bodies = _scope_valid_test_fn_bodies(
+                    view,
+                    pkg_name,
+                    lane,
+                    scope_s,
+                    scope_cs,
+                    rem_segments[0],
+                    accum_cfgs,
+                    enclosing_attrs_cs,
+                )
+                if fn_bodies:
+                    return (cur_file, fn_bodies)
+
+            seg = rem_segments[0]
+            next_rem = rem_segments[1:]
+            seg_is_test_name = seg == "tests" or seg.endswith(("_test", "_tests"))
+
+            # 1. Try inline `mod <seg> { ... }` in `scope_s`
+            inline_mods = _find_inline_mods(scope_s, scope_cs, seg)
+            for attrs_cs, body_s, body_cs in inline_mods:
+                mod_cfgs = _extract_cfg_exprs(attrs_cs)
+                mod_is_test = (
+                    entered_test_mod
+                    or seg_is_test_name
+                    or any(_cfg_is_test_only(e) for e in mod_cfgs)
+                )
+                explicit_inline_path = _extract_path_attr(view, pkg_name, lane, attrs_cs)
+                if explicit_inline_path is not None:
+                    inline_mod_dir = os.path.normpath(
+                        f"{cur_mod_dir}/{explicit_inline_path}"
+                    ).replace("\\", "/")
+                else:
+                    inline_mod_dir = f"{cur_mod_dir}/{seg}" if cur_mod_dir else seg
+                res = walk(
+                    cur_file,
+                    inline_mod_dir,
+                    False,
+                    body_s,
+                    body_cs,
+                    next_rem,
+                    accum_cfgs + mod_cfgs,
+                    enclosing_attrs_cs + "\n" + attrs_cs,
+                    mod_is_test,
+                )
+                if res is not None:
+                    return res
+
+            # 2. Try out-of-line `mod <seg>;` in `scope_s` (both file scope and inline mod scope)
+            out_of_line_mods = _find_out_of_line_mods(scope_s, scope_cs, seg)
+            for attrs_cs in out_of_line_mods:
                 mod_cfgs = _extract_cfg_exprs(attrs_cs)
                 if not _are_cfgs_active_in_ci(view, pkg_name, lane, accum_cfgs + mod_cfgs):
                     continue
@@ -1764,7 +1945,8 @@ def _resolve_in_module_tree(
                     or any(_cfg_is_test_only(e) for e in mod_cfgs)
                 )
                 for child_file in _resolve_child_mod_files(
-                    view, pkg_name, lane, cur_file, is_mod_root, seg, attrs_cs
+                    view, pkg_name, lane, cur_file, cur_mod_dir, seg, attrs_cs,
+                    is_file_scope,
                 ):
                     child_s = view.read_stripped_rust(child_file)
                     child_cs = view.read_comments_stripped_rust(child_file)
@@ -1772,12 +1954,17 @@ def _resolve_in_module_tree(
                     child_is_test = mod_is_test or any(
                         _cfg_is_test_only(e) for e in inner_cfgs
                     )
+                    child_mod_dir = (
+                        child_file.rsplit("/", 1)[0]
+                        if child_file.endswith("/mod.rs")
+                        else child_file[:-3]
+                    )
                     res = walk(
                         child_file,
-                        child_file.endswith("/mod.rs"),
+                        child_mod_dir,
+                        True,
                         child_s,
                         child_cs,
-                        True,
                         next_rem,
                         accum_cfgs + mod_cfgs + inner_cfgs,
                         enclosing_attrs_cs + "\n" + attrs_cs,
@@ -1786,20 +1973,61 @@ def _resolve_in_module_tree(
                     if res is not None:
                         return res
 
-        return None
+            # A declared module owns this name; a glob cannot replace its missing child.
+            if inline_mods or out_of_line_mods:
+                return None
 
-    for rf in root_files:
-        if not view.is_file(rf):
-            continue
-        rf_s = view.read_stripped_rust(rf)
-        rf_cs = view.read_comments_stripped_rust(rf)
-        rf_inner_cfgs = _extract_cfg_exprs(rf_cs, inner_only=True)
+            # 3. Try `pub use` module re-exports in `scope_s`
+            for use_attrs_cs, is_crate_root, new_rem in _find_use_reexports(
+                scope_s, scope_cs, rem_segments
+            ):
+                if not new_rem:
+                    continue
+                target_s = rf_s if is_crate_root else scope_s
+                target_cs = rf_cs if is_crate_root else scope_cs
+                if not _scope_declares_mod(target_s, target_cs, new_rem[0]):
+                    continue
+                use_cfgs = _extract_cfg_exprs(use_attrs_cs)
+                if not _are_cfgs_active_in_ci(view, pkg_name, lane, accum_cfgs + use_cfgs):
+                    continue
+                use_is_test = entered_test_mod or any(
+                    _cfg_is_test_only(e) for e in use_cfgs
+                )
+                if is_crate_root:
+                    res = walk(
+                        rf,
+                        rf_mod_dir,
+                        True,
+                        rf_s,
+                        rf_cs,
+                        new_rem,
+                        accum_cfgs + use_cfgs,
+                        enclosing_attrs_cs + "\n" + use_attrs_cs,
+                        use_is_test,
+                    )
+                else:
+                    res = walk(
+                        cur_file,
+                        cur_mod_dir,
+                        is_file_scope,
+                        scope_s,
+                        scope_cs,
+                        new_rem,
+                        accum_cfgs + use_cfgs,
+                        enclosing_attrs_cs + "\n" + use_attrs_cs,
+                        use_is_test,
+                    )
+                if res is not None:
+                    return res
+
+            return None
+
         res = walk(
             rf,
+            rf_mod_dir,
             True,
             rf_s,
             rf_cs,
-            True,
             segments,
             rf_inner_cfgs,
             "",
@@ -1819,7 +2047,8 @@ def _resolve_contract_helper_binding(
 ) -> tuple[str, str, str, list[str]] | None:
     """Resolve `<pkg>::<contract_fn>` or `<pkg>::contracts::<contract_fn>` defined in `src/contracts.rs`
     (or `src/contracts/*.rs` declared via `mod` from `src/contracts.rs`) when called inside a runnable
-    `#[test]` function's own body in a gated integration test target.
+    `#[test]` function's own body (or a 1-level local helper called by that `#[test]`) in a gated
+    integration test target.
     """
     crate_dir = f"crates/{pkg_name}"
     lib_rs = f"{crate_dir}/src/lib.rs"
@@ -1843,6 +2072,7 @@ def _resolve_contract_helper_binding(
         contract_files.append(root_contracts)
         rc_s = view.read_stripped_rust(root_contracts)
         rc_cs = view.read_comments_stripped_rust(root_contracts)
+        rc_mod_dir = root_contracts[:-3]
         for m in re.finditer(
             rf"{_VIS_MOD_PREFIX}\bmod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;", rc_s
         ):
@@ -1852,7 +2082,7 @@ def _resolve_contract_helper_binding(
                     view, pkg_name, lib_lane, _extract_cfg_exprs(sub_attrs)
                 ):
                     for cf in _resolve_child_mod_files(
-                        view, pkg_name, lib_lane, root_contracts, False, sub_name, sub_attrs
+                        view, pkg_name, lib_lane, root_contracts, rc_mod_dir, sub_name, sub_attrs
                     ):
                         if cf not in contract_files:
                             contract_files.append(cf)
@@ -1883,7 +2113,10 @@ def _resolve_contract_helper_binding(
         return None
 
     names_alt = "|".join(re.escape(n) for n in sorted(callee_names))
-    call_in_test_re = re.compile(rf"\b(?:{names_alt})\s*\(|\.\s*map\s*\(\s*(?:[\w:]+::)?(?:{names_alt})\s*\)")
+    call_in_test_re = re.compile(
+        rf"(?:(?<![.\w:])|(?:[\w:]+::))\b(?:{names_alt})\s*\("
+        rf"|\.\s*map\s*\(\s*(?:[\w:]+::)?(?:{names_alt})\s*\)"
+    )
     for tname, tfile in sorted(int_targets.items()):
         tlane = get_target_lane(view, pkg_name, tname)
         if tlane is None or tlane not in GATED_TEST_LANES:
@@ -1894,12 +2127,16 @@ def _resolve_contract_helper_binding(
         if not _are_cfgs_active_in_ci(view, pkg_name, tlane, t_inner_cfgs):
             continue
         test_fns = _extract_top_level_test_fns(t_stripped, t_cs)
+        t_helpers = _extract_non_test_fns(
+            t_stripped, t_cs, view, pkg_name, tlane, t_inner_cfgs
+        )
         for fn_name, (is_ignored, fn_cfgs, fn_body) in sorted(test_fns.items()):
             if not _are_cfgs_active_in_ci(view, pkg_name, tlane, t_inner_cfgs + fn_cfgs):
                 continue
             if is_ignored and not _is_ignored_test_allowed(view, pkg_name, fn_name):
                 continue
-            if call_in_test_re.search(fn_body):
+            expanded_test_body = _expand_body_with_one_level_helpers(fn_body, t_helpers)
+            if call_in_test_re.search(expanded_test_body):
                 return (pkg_name, tname, tfile, [contract_fn_body])
 
     return None
@@ -2572,4 +2809,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
