@@ -1645,6 +1645,46 @@ fn fork_reservation_refusal_from_concurrent_munmap_rolls_back_without_quarantine
 }
 
 #[test]
+fn fork_reserve_refusal_retains_diagnostic_stage_and_retryable_errno() {
+    let fixture = Fixture::new(0x10000, asid(1));
+    let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let words = fixture.tables.live(&fixture.maintenance);
+    let crossing = TestStockCrossing::new(&[
+        0x20000, 0x21000, 0x22000, 0x23000, 0x24000, 0x25000, 0x26000, 0x27000,
+    ]);
+    *crossing.refuse_reserve.lock().unwrap() = Some(ForkStockRefusal::Inventory);
+    let mut service = Aarch64NativeProcessService::with_crossing(
+        &fixture.task,
+        fixture.slot,
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        &crossing,
+    )
+    .with_words(&words);
+    let error = service
+        .prepare_mm(
+            &fixture.address,
+            parked,
+            MmGeneration::new(NonZeroU64::new(2).unwrap()),
+        )
+        .expect_err("reservation refusal must stop preparation");
+    assert_eq!(error.errno(), NativeProcessError::Busy.errno());
+    let NativeProcessError::ForkRefused(refusal) = error else {
+        panic!("Reserve refusal lost its diagnostic stage: {error:?}");
+    };
+    assert_eq!(
+        refusal.stage,
+        super::native_fork_refusal::NativeForkStage::Reserve
+    );
+    assert_eq!(
+        refusal.cause,
+        super::native_fork_refusal::NativeForkCause::StockReservation(ForkStockRefusal::Inventory)
+    );
+    assert_eq!(crossing.settlements_aborted.load(Ordering::Acquire), 1);
+}
+
+#[test]
 fn fork_commit_refusal_after_admitted_reservation_fails_closed_without_opening_child_space() {
     assert_commit_fault_keeps_child_closed(CommitFault::Refusal);
 }
