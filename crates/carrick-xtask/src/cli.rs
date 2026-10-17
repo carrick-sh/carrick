@@ -20,6 +20,10 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    #[command(about = "Acquire and renew CAS leases over refs/claims/*")]
+    Claims(crate::claims::ClaimsArgs),
+    #[command(about = "Lint work-order v1 schema and GitHub provenance")]
+    Workorder(crate::workorder::WorkOrderArgs),
     #[command(about = "Compare guest asm source between two git revisions")]
     AsmDiff(crate::asm_diff::AsmDiffArgs),
     #[command(about = "Display repository information as JSON")]
@@ -182,6 +186,10 @@ pub struct RepoInfo {
 
 #[derive(Debug, Error)]
 pub enum CliError {
+    #[error("claims: {0}")]
+    Claims(#[from] crate::claims::ClaimError),
+    #[error("work order: {0}")]
+    Workorder(#[from] crate::workorder::WorkOrderError),
     #[error("asm diff: {0}")]
     AsmDiff(#[from] crate::asm_diff::AsmDiffError),
     #[error("ci-scaler: {0}")]
@@ -373,6 +381,16 @@ where
         }
     }
     match cli.command {
+        Commands::Workorder(args) => {
+            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
+            crate::workorder::run(&root, args, writer)?;
+            Ok(())
+        }
+        Commands::Claims(args) => {
+            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
+            crate::claims::run(&root, args, writer)?;
+            Ok(())
+        }
         Commands::TestBatch(args) => {
             let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
             crate::test_batch::run(&root, args).map_err(|e| CliError::TestShards(e.to_string()))

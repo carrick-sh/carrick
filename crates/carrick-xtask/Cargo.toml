@@ -30,10 +30,8 @@ proc-macro2 = { version = "1.0", features = ["span-locations"] }
 syn = { version = "2.0", features = ["full", "visit", "extra-traits"] }
 quote = "1.0"
 toml.workspace = true
+yaml-rust2 = { version = "0.13", default-features = false }
 
 carrick-conformance = { path = "../carrick-conformance" }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-portable = { path = "../carrick-portable" }
-
-[dev-dependencies]
-yaml-rust2 = { version = "0.13", default-features = false }

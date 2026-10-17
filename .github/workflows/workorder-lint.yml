@@ -1,0 +1,35 @@
+name: Work-order lint
+
+on:
+  issues:
+    types: [labeled]
+
+# Public checkout; no contents, workflow, administration or project permission.
+permissions:
+  issues: write
+
+concurrency:
+  group: workorder-lint-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: >-
+      contains(github.event.issue.labels.*.name, 'ready') ||
+      startsWith(github.event.label.name, 'route:')
+    steps:
+      # issues events use the trusted default branch, never an issue-supplied ref.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Build trusted linter
+        run: cargo build --locked -p carrick-xtask
+      - name: Validate schema and provenance and post ok/fail
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ github.event.issue.number }}
+        run: >-
+          target/debug/carrick-xtask workorder lint "$ISSUE"
+          --repo "$GITHUB_REPOSITORY" --post
