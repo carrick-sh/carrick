@@ -190,6 +190,88 @@ fn shared_buffer_lease_after_retirement_fails_closed() {
     ));
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PongObservation {
+    CompletedRound,
+    GuestExitedEarly,
+    NeedsWait(u32),
+}
+
+fn observe_pong_round(
+    lease: &carrick_embed::SharedBufferLease,
+    pong: &carrick_embed::SharedAtomicU32,
+    pong_word: *const AtomicU32,
+    round: u32,
+    before_retirement_check: impl FnOnce(),
+) -> PongObservation {
+    let pong_value = match pong.load(Ordering::Acquire) {
+        Ok(value) => value,
+        Err(SharedBufferError::Retired { .. }) => unsafe { (*pong_word).load(Ordering::Acquire) },
+        Err(error) => panic!("read pong round {round} failed: {error}"),
+    };
+    if pong_value & !GUEST_DONE == round {
+        return PongObservation::CompletedRound;
+    }
+    before_retirement_check();
+    if pong_value & GUEST_DONE != 0 || lease.is_retired() {
+        let final_pong = unsafe { (*pong_word).load(Ordering::Acquire) };
+        if final_pong & !GUEST_DONE == round {
+            return PongObservation::CompletedRound;
+        }
+        return PongObservation::GuestExitedEarly;
+    }
+    PongObservation::NeedsWait(pong_value)
+}
+
+/// Deterministic witness for the final-round preemption window: if the host reads `pong = 99`
+/// via a live lease and is preempted while the guest writes `pong = 100`, sets `GUEST_DONE`,
+/// and retires the lease before the host checks `lease.is_retired()`, re-loading `pong` raw
+/// once recognizes the completed round instead of reporting a false early exit.
+#[test]
+fn pong_observation_reloads_when_retirement_races_final_store() {
+    let buf = SharedBuffer::new(4096).expect("allocate shared buffer");
+    let retired = Arc::new(AtomicBool::new(false));
+    let current_gen = Arc::new(AtomicU64::new(1));
+    let lease = buf.lease_with_witness(
+        RunId::new("pong-retirement-race"),
+        ContainerId::allocate(),
+        1,
+        Arc::clone(&retired),
+        current_gen,
+        carrick_thread::platform_futex::SharedFutexTable::new(),
+    );
+
+    let pong = lease.atomic_u32(4).expect("pong word");
+    pong.store(99, Ordering::Release).expect("seed round 99");
+    let pong_word = unsafe {
+        lease
+            .as_ptr()
+            .expect("validated base pointer")
+            .add(4)
+            .cast::<AtomicU32>()
+    };
+
+    let outcome = observe_pong_round(&lease, &pong, pong_word, 100, || {
+        unsafe {
+            (*pong_word).store(100 | GUEST_DONE, Ordering::Release);
+        }
+        retired.store(true, Ordering::Release);
+    });
+    assert_eq!(outcome, PongObservation::CompletedRound);
+
+    // Conversely, if the guest genuinely exits before writing round 100, the reload
+    // still observes 99 and classifies the retirement as an early guest exit.
+    retired.store(false, Ordering::Release);
+    pong.store(99, Ordering::Release).expect("reset round 99");
+    let early_exit = observe_pong_round(&lease, &pong, pong_word, 100, || {
+        unsafe {
+            (*pong_word).fetch_or(GUEST_DONE, Ordering::AcqRel);
+        }
+        retired.store(true, Ordering::Release);
+    });
+    assert_eq!(early_exit, PongObservation::GuestExitedEarly);
+}
+
 /// Shared futex pingpong latency benchmark: 100 rounds of bidirectional handoff crossing hypervisor boundary.
 #[test]
 fn shared_buffer_futex_pingpong_latency() {
@@ -273,19 +355,11 @@ fn shared_buffer_futex_pingpong_latency() {
         // `prepared.execute()` retires the lease as soon as the container finishes,
         // which can race the final round's pong read or an early guest exit.
         loop {
-            let pong_value = match pong.load(Ordering::Acquire) {
-                Ok(value) => value,
-                Err(SharedBufferError::Retired { .. }) => unsafe {
-                    (*pong_word).load(Ordering::Acquire)
-                },
-                Err(error) => panic!("read pong round {round} failed: {error}"),
+            let pong_value = match observe_pong_round(&lease, &pong, pong_word, round, || {}) {
+                PongObservation::CompletedRound => break,
+                PongObservation::GuestExitedEarly => fail_before_pong(guest_handle, round),
+                PongObservation::NeedsWait(value) => value,
             };
-            if pong_value & !GUEST_DONE == round {
-                break;
-            }
-            if pong_value & GUEST_DONE != 0 || lease.is_retired() {
-                fail_before_pong(guest_handle, round);
-            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(
                 !remaining.is_zero(),

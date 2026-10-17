@@ -47,13 +47,18 @@ impl PreparedContainer {
     ) -> Self {
         let launch = carrier.lease.launch().clone();
         let retired = Arc::new(AtomicBool::new(false));
-        let shared_buffers = shared_buffers
-            .into_iter()
-            .map(|(name, buffer)| {
-                let generation = buffer.bind_generation();
-                (name, buffer, generation)
-            })
-            .collect();
+        let mut bound_buffers: Vec<(String, SharedBuffer, u64)> =
+            Vec::with_capacity(shared_buffers.len());
+        for (name, buffer) in shared_buffers {
+            let generation = bound_buffers
+                .iter()
+                .find_map(|(_, existing, generation)| {
+                    buffer.ptr_eq(existing).then_some(*generation)
+                })
+                .unwrap_or_else(|| buffer.bind_generation());
+            bound_buffers.push((name, buffer, generation));
+        }
+        let shared_buffers = bound_buffers;
         let auditors = Arc::new(carrick_kernel::observe::AuditorChain::new(auditors));
         let work_scope = carrier.work_scope.clone();
         Self {
