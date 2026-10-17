@@ -1222,15 +1222,30 @@ fn shared_endpoint_dir() -> PathBuf {
     // one suite's published-port relay onto the other suite's target listener:
     // one client gets its reply from the wrong process while its own listener
     // never accepts (a hang in `server.join()`), and the other sees the
-    // discarded connection as ECONNRESET. Give the unit tests a process-private
-    // subdirectory so no concurrently running test binary can alias them. This
-    // keeps coverage identical -- every provider and fork child in the test
-    // process resolves the same directory, so the fork-coherence paths still
-    // exercise real files -- and it keeps test files out of the directory that
-    // real runs scan.
+    // Give each unit-test process a `test-<pid>` root (so the cross-process
+    // sweeper can still reclaim a crashed test binary's whole tree with one
+    // liveness check on `<pid>`), and give each test thread within that
+    // process its own subdirectory so parallel `#[test]` threads calling
+    // `SocketNamespaceProvider::new` cannot sweep or overwrite one another's
+    // records. Multiple providers created on the same test thread (and any
+    // child `fork()`ed from it) still resolve the same directory.
     #[cfg(test)]
-    let dir = dir.join(format!("{PER_PROCESS_DIR_PREFIX}{}", std::process::id()));
+    let dir = dir
+        .join(format!("{PER_PROCESS_DIR_PREFIX}{}", std::process::id()))
+        .join(test_thread_endpoint_subdir());
     dir
+}
+
+#[cfg(test)]
+fn test_thread_endpoint_subdir() -> String {
+    static NEXT_TEST_THREAD_ID: AtomicU64 = AtomicU64::new(1);
+    thread_local! {
+        static TEST_THREAD_SUBDIR: String = format!(
+            "thread-{}",
+            NEXT_TEST_THREAD_ID.fetch_add(1, Ordering::Relaxed)
+        );
+    }
+    TEST_THREAD_SUBDIR.with(Clone::clone)
 }
 
 /// Reclaim dead-owner records in the machine-global endpoint namespace, once
@@ -1780,16 +1795,16 @@ fn write_endpoint_file(
     host_addr: HostSocketAddr,
 ) -> Result<Vec<(PathBuf, String)>, String> {
     let _fork_gate = fork_gate.lock().unwrap_or_else(|p| p.into_inner());
-    let scope_dir = endpoint_scope_dir(endpoint_dir, &endpoint.scope);
-    let path = endpoint_path(endpoint_dir, endpoint);
-    let contents = encode_endpoint_record(endpoint_dir, &path, host_addr.0, namespace_id);
-    write_record(&scope_dir, &path, &contents)
-        .map_err(|e| format!("failed to record socket namespace endpoint: {e}"))?;
     let reverse_path = reverse_endpoint_path(endpoint_dir, host_addr, endpoint.protocol);
     let reverse_contents =
         encode_endpoint_record(endpoint_dir, &reverse_path, endpoint.addr.0, namespace_id);
     write_record(endpoint_dir, &reverse_path, &reverse_contents)
         .map_err(|e| format!("failed to record socket namespace reverse endpoint: {e}"))?;
+    let scope_dir = endpoint_scope_dir(endpoint_dir, &endpoint.scope);
+    let path = endpoint_path(endpoint_dir, endpoint);
+    let contents = encode_endpoint_record(endpoint_dir, &path, host_addr.0, namespace_id);
+    write_record(&scope_dir, &path, &contents)
+        .map_err(|e| format!("failed to record socket namespace endpoint: {e}"))?;
     Ok(vec![(path, contents), (reverse_path, reverse_contents)])
 }
 
@@ -1852,17 +1867,7 @@ fn read_endpoint_file_trusting(
             }
             raw.lines().next()?.trim().parse().ok().map(HostSocketAddr)
         }
-        NamespaceFile::Stale(raw) => {
-            if let Ok(host_addr) = raw.lines().next()?.trim().parse::<SocketAddr>() {
-                let reverse_path = reverse_endpoint_path(
-                    endpoint_dir,
-                    HostSocketAddr(host_addr),
-                    endpoint.protocol,
-                );
-                let _ = read_namespace_file(&reverse_path);
-            }
-            None
-        }
+        NamespaceFile::Stale(_) => None,
     }
 }
 
@@ -1910,6 +1915,44 @@ fn read_live_namespace_file(path: &Path) -> Option<String> {
     }
 }
 
+fn forward_endpoint_protocol(path: &Path) -> Option<PortProtocol> {
+    let name = path.file_name()?.to_str()?;
+    if !(name.starts_with("bridge-") || name.starts_with("ns-")) {
+        return None;
+    }
+    if name.ends_with("-tcp") {
+        Some(PortProtocol::Tcp)
+    } else if name.ends_with("-udp") {
+        Some(PortProtocol::Udp)
+    } else {
+        None
+    }
+}
+
+fn endpoint_root_for_record(path: &Path) -> Option<&Path> {
+    let parent = path.parent()?;
+    if parent
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(PRIVATE_REALM_PREFIX))
+    {
+        parent.parent()
+    } else {
+        Some(parent)
+    }
+}
+
+fn reclaim_paired_reverse_record(forward_path: &Path, raw: &str) {
+    if let Some(protocol) = forward_endpoint_protocol(forward_path)
+        && let Some(endpoint_dir) = endpoint_root_for_record(forward_path)
+        && let Some(first_line) = raw.lines().next()
+        && let Ok(host_addr) = first_line.trim().parse::<SocketAddr>()
+    {
+        let reverse_path = reverse_endpoint_path(endpoint_dir, HostSocketAddr(host_addr), protocol);
+        let _ = read_namespace_file(&reverse_path);
+    }
+}
+
 fn read_namespace_file(path: &Path) -> Option<NamespaceFile> {
     let raw = fs::read_to_string(path).ok()?;
     let owner_pid = raw.lines().find_map(|line| line.strip_prefix("pid="))?;
@@ -1917,6 +1960,11 @@ fn read_namespace_file(path: &Path) -> Option<NamespaceFile> {
     if process_is_alive(owner_pid) {
         return Some(NamespaceFile::Live(raw));
     }
+    // Reclaim any paired reverse record BEFORE unlinking the forward record:
+    // the forward record is the only pointer to its reverse record's host port,
+    // so unlinking the forward record first lets a concurrent lookup observe
+    // ENOENT and return while the reverse record is still on disk.
+    reclaim_paired_reverse_record(path, &raw);
     // Reclaim, but only the bytes this verdict was reached from: the dead
     // owner's successor may have renamed a live record in while this read was
     // off the CPU, and unlinking that would destroy a live publication.
@@ -4515,6 +4563,93 @@ mod tests {
             !reverse_file.exists(),
             "paired reverse endpoint file should be reclaimed"
         );
+    }
+
+    #[test]
+    fn stale_endpoint_reclaim_survives_concurrent_test_sweep_and_pairs_reverse_unlink() {
+        let (seeded_tx, seeded_rx) = std::sync::mpsc::sync_channel(1);
+        let (swept_tx, swept_rx) = std::sync::mpsc::sync_channel(1);
+        let sweeper = thread::spawn(move || {
+            let other = SocketNamespaceProvider::new();
+            seeded_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("wait for stale endpoint seed");
+            reclaim_stale_endpoint_records(&other.endpoint_dir, usize::MAX);
+            swept_tx.send(()).expect("report sweep completion");
+        });
+
+        let provider = SocketNamespaceProvider::new();
+        let peer_addr = guest(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(172, 31, 42, 19)),
+            8080,
+        ));
+        let peer = VirtualEndpoint {
+            scope: bridge_scope(BridgeId::new("stale-pair-witness"), None, peer_addr),
+            addr: peer_addr,
+            protocol: PortProtocol::Tcp,
+        };
+        let reserved = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("reserve port");
+        let host_addr = host(reserved.local_addr().expect("reserved addr"));
+        let endpoint_file = endpoint_path(&provider.endpoint_dir, &peer);
+        let reverse_file = reverse_endpoint_path(&provider.endpoint_dir, host_addr, peer.protocol);
+        fs::create_dir_all(&*provider.endpoint_dir).expect("endpoint dir");
+        fs::write(&endpoint_file, format!("{}\npid=0\n", host_addr.0)).expect("endpoint file");
+        seeded_tx.send(()).expect("signal stale endpoint seed");
+        swept_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("wait for concurrent sweep");
+        fs::write(&reverse_file, format!("{}\npid=0\n", peer.addr.0)).expect("reverse file");
+        sweeper.join().expect("sweeper thread");
+
+        let resolved = provider
+            .resolve_registered_connect(
+                &BridgeId::new("stale-pair-witness"),
+                None,
+                peer.addr,
+                peer.protocol,
+            )
+            .expect("resolve stale endpoint");
+        assert_eq!(resolved, None);
+        assert!(
+            !endpoint_file.exists(),
+            "stale endpoint file should be reclaimed"
+        );
+        assert!(
+            !reverse_file.exists(),
+            "paired reverse endpoint file should be reclaimed"
+        );
+
+        let root = reclaim_fixture_root("stale-pair-sweep");
+        let sweep_provider = SocketNamespaceProvider::with_endpoint_root(&root);
+        let sweep_endpoint = endpoint_path(&root, &peer);
+        let sweep_reverse = reverse_endpoint_path(&root, host_addr, peer.protocol);
+        fs::write(&sweep_endpoint, format!("{}\npid=0\n", host_addr.0)).expect("sweep endpoint");
+        fs::write(&sweep_reverse, format!("{}\npid=0\n", peer.addr.0)).expect("sweep reverse");
+        assert_eq!(
+            read_namespace_file(&sweep_endpoint),
+            Some(NamespaceFile::Stale(format!("{}\npid=0\n", host_addr.0)))
+        );
+        assert_eq!(
+            sweep_provider
+                .resolve_registered_connect(
+                    &BridgeId::new("stale-pair-witness"),
+                    None,
+                    peer.addr,
+                    peer.protocol,
+                )
+                .expect("resolve after forward reclaim"),
+            None
+        );
+        assert!(
+            !sweep_endpoint.exists(),
+            "stale forward endpoint file should be reclaimed"
+        );
+        assert!(
+            !sweep_reverse.exists(),
+            "reclaiming stale forward endpoint record must also reclaim paired reverse record"
+        );
+        let _ = fs::remove_dir_all(&root);
+        drop(reserved);
     }
 
     #[test]
