@@ -746,20 +746,35 @@ fn common_linux_entry_calls_native_process_custody() {
     );
     assert_eq!(process.visits, [57, 61, 231, 61]);
     process.binding = execution_binding(&world.tasks[0]);
-    for index in 1..6 {
-        let mut args = [17, 0, 0, 0, 0, 0];
-        args[index] = 0x1000;
-        let call = carrick_personality_linux::entry::decode_x86_64(56, args, 0x7fff0000);
-        assert_eq!(
-            serve_full(&call, &world, &mut anonymous, Some(&mut process), None).0,
-            carrick_personality_linux::dispatch::CompletionRoute::Served
-        );
-        assert_eq!(
-            process.visits,
-            [57, 61, 231, 61],
-            "unsupported clone shape must not call fork"
-        );
-    }
+    // A child stack makes this a thread-shaped clone, never a plain fork.
+    let call =
+        carrick_personality_linux::entry::decode_x86_64(56, [17, 0x1000, 0, 0, 0, 0], 0x7fff0000);
+    assert_eq!(
+        serve_full(&call, &world, &mut anonymous, Some(&mut process), None).0,
+        carrick_personality_linux::dispatch::CompletionRoute::Served
+    );
+    assert_eq!(
+        process.visits,
+        [57, 61, 231, 61],
+        "clone with a child stack must not call fork"
+    );
+    // clone(2): with flags == SIGCHLD, parent_tid, child_tid and tls are
+    // ignored (no CLONE_PARENT_SETTID/CHILD_SETTID/SETTLS), so stale values
+    // in those registers (musl's _Fork leaves them live) still mean fork().
+    let call = carrick_personality_linux::entry::decode_x86_64(
+        56,
+        [17, 0, 0x1000, 0x1000, 0x1000, 0x1000],
+        0x7fff0000,
+    );
+    assert_eq!(
+        serve_full(&call, &world, &mut anonymous, Some(&mut process), None).0,
+        carrick_personality_linux::dispatch::CompletionRoute::Served
+    );
+    assert_eq!(
+        process.visits.last(),
+        Some(&57),
+        "ignored clone registers must not refuse a plain fork"
+    );
 }
 
 #[test]
