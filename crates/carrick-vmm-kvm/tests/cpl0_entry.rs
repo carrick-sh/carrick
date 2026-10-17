@@ -921,7 +921,7 @@ fn x4_linux_common_entry() {
             thread_generation: EntryThreadGeneration::from_raw(101 + task as u64),
         });
         for (task, binding) in bindings.into_iter().enumerate() {
-            carrier.bind_execution(task, binding).unwrap();
+            carrier.bind_execution(task, binding, 5).unwrap();
         }
         let mut heads = [(0, 0); 2];
         let mut entries = [0; 2];
@@ -980,7 +980,7 @@ fn x4_linux_common_entry() {
         let peer = program(&[(0xbeef, 24)]);
         let mut carrier =
             Cpl0Carrier::boot(physical_inventory(), &image(), [&code, &peer]).unwrap();
-        carrier.bind_execution(0, binding).unwrap();
+        carrier.bind_execution(0, binding, 5).unwrap();
         if native == 273 {
             carrier.unload_execution(0).unwrap();
             let err = carrier

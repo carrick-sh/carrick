@@ -19,8 +19,8 @@ use core::sync::atomic::Ordering;
 #[cfg(any(test, feature = "host-test"))]
 use crate::lock::SpinLock;
 use carrick_el1_abi::{
-    DELEGATED_FLAG_READABLE, DELEGATED_FLAG_WRITABLE, DELEGATED_STATE_GUEST, DelegatedFile,
-    DelegatedOpenFile, FD_MAP_CAPACITY, FdMapSlot, HostBoundFd, HostObjectBinding,
+    DELEGATED_FLAG_READABLE, DELEGATED_FLAG_WRITABLE, DELEGATED_STATE_DEAD, DELEGATED_STATE_GUEST,
+    DelegatedFile, DelegatedOpenFile, FD_MAP_CAPACITY, FdMapSlot, HostBoundFd, HostObjectBinding,
     HostReadinessEntry, fd_map_lookup, lock_fd_map,
 };
 use carrick_sched_core::{SlotId, ZoneTables};
@@ -307,6 +307,46 @@ pub struct PollFd {
     pub revents: i16,
 }
 
+fn claim_open_record<'a>(
+    open_table: &'a [DelegatedOpenFile],
+    object_table: &'a [DelegatedFile],
+    flags: u32,
+) -> Option<(u32, u64, &'a DelegatedOpenFile)> {
+    for (idx, (open_file, obj)) in open_table.iter().zip(object_table.iter()).enumerate() {
+        let state = open_file.state.load(Ordering::Acquire);
+        let prev_gen = open_file.generation.load(Ordering::Acquire);
+        let reclaimable = state == DELEGATED_STATE_DEAD
+            || (prev_gen != 0 && open_file.lifetime.is_terminal(prev_gen));
+        if !reclaimable {
+            continue;
+        }
+        let next_gen = prev_gen.checked_add(1)?;
+        if !open_file.lifetime.initialize(next_gen, false) {
+            continue;
+        }
+        let handle = (idx + 1) as u32;
+        let inode_gen = obj
+            .generation
+            .load(Ordering::Acquire)
+            .checked_add(1)?
+            .max(next_gen);
+        obj.inode.set(0, 0);
+        obj.generation.store(inode_gen, Ordering::Relaxed);
+        obj.state.store(DELEGATED_STATE_GUEST, Ordering::Release);
+
+        open_file.clear_host_fd();
+        open_file.flags.store(flags, Ordering::Relaxed);
+        open_file.generation.store(next_gen, Ordering::Relaxed);
+        open_file.inode_handle.store(handle, Ordering::Relaxed);
+        open_file
+            .inode_generation
+            .store(inode_gen, Ordering::Relaxed);
+        open_file.offset.store(0, Ordering::Relaxed);
+        return Some((handle, next_gen, open_file));
+    }
+    None
+}
+
 /// Admits standard descriptors 0..2 as host-backed open descriptions in the
 /// existing zone tables for `file_table`.
 ///
@@ -344,39 +384,22 @@ pub fn admit_stdio(
         let Some(slot) = fd_map.iter().take(FD_MAP_CAPACITY).find(|s| s.try_claim()) else {
             continue;
         };
-        let handle = (fd + 1) as u32;
-        if (handle as usize) <= open_table.len() && (handle as usize) <= object_table.len() {
-            let obj = &object_table[(handle - 1) as usize];
-            let open_file = &open_table[(handle - 1) as usize];
-            obj.inode.set(0, 0);
-            obj.generation.store(1, Ordering::Relaxed);
-            obj.state.store(DELEGATED_STATE_GUEST, Ordering::Release);
-
-            let flags = if fd == 0 {
-                DELEGATED_FLAG_READABLE
-            } else {
-                DELEGATED_FLAG_WRITABLE
-            };
-            if open_file.generation.load(Ordering::Acquire) == 0 {
-                assert!(open_file.lifetime.initialize(1, false));
-            } else if !open_file.lifetime.retain(1) {
-                slot.clear();
-                continue;
-            }
-            open_file.flags.store(flags, Ordering::Relaxed);
-            open_file.generation.store(1, Ordering::Relaxed);
-            open_file.inode_handle.store(handle, Ordering::Relaxed);
-            open_file.inode_generation.store(1, Ordering::Relaxed);
-            open_file.offset.store(0, Ordering::Relaxed);
-            open_file.bind_host_object(binding);
-            open_file
-                .state
-                .store(DELEGATED_STATE_GUEST, Ordering::Release);
-
-            slot.set(file_table, ufd, handle, 1);
+        let flags = if fd == 0 {
+            DELEGATED_FLAG_READABLE
         } else {
+            DELEGATED_FLAG_WRITABLE
+        };
+        let Some((handle, incarnation, open_file)) =
+            claim_open_record(open_table, object_table, flags)
+        else {
             slot.clear();
-        }
+            continue;
+        };
+        open_file.bind_host_object(binding);
+        open_file
+            .state
+            .store(DELEGATED_STATE_GUEST, Ordering::Release);
+        slot.set(file_table, ufd, handle, incarnation);
     }
 }
 
@@ -404,36 +427,17 @@ pub fn admit_host_fd(
         .take(FD_MAP_CAPACITY)
         .find(|s| s.try_claim())?;
 
-    let Some((idx, open_file)) = open_table
-        .iter()
-        .enumerate()
-        .find(|(_, o)| o.state.load(Ordering::Acquire) == 0)
+    let Some((handle, incarnation, open_file)) = claim_open_record(open_table, object_table, flags)
     else {
         slot.clear();
         return None;
     };
-    let Some(obj) = object_table.get(idx) else {
-        slot.clear();
-        return None;
-    };
-
-    let handle = (idx + 1) as u32;
-    obj.inode.set(0, 0);
-    obj.generation.store(1, Ordering::Relaxed);
-    obj.state.store(DELEGATED_STATE_GUEST, Ordering::Release);
-
-    assert!(open_file.lifetime.initialize(1, false));
-    open_file.flags.store(flags, Ordering::Relaxed);
-    open_file.generation.store(1, Ordering::Relaxed);
-    open_file.inode_handle.store(handle, Ordering::Relaxed);
-    open_file.inode_generation.store(1, Ordering::Relaxed);
-    open_file.offset.store(0, Ordering::Relaxed);
     open_file.bind_host_fd(host_fd);
     open_file
         .state
         .store(DELEGATED_STATE_GUEST, Ordering::Release);
 
-    slot.set(file_table, ufd, handle, 1);
+    slot.set(file_table, ufd, handle, incarnation);
     Some(handle)
 }
 
@@ -988,12 +992,16 @@ mod tests {
             10,
             [false, true, false],
         );
-        assert!(
+        assert_eq!(
             close_host_binding(&fd_map, &open_table, 10, 1)
                 .unwrap()
-                .release
-                .is_some()
+                .release,
+            Some(ReleasedDescription {
+                handle: 1,
+                incarnation: 1,
+            })
         );
+        assert!(open_table[0].lifetime.is_terminal(1));
         admit_stdio(
             &fd_map,
             &open_table,
@@ -1001,8 +1009,12 @@ mod tests {
             11,
             [false, true, false],
         );
-        assert!(fd_map_lookup(&fd_map, 11, 1).is_none());
-        assert!(open_table[1].lifetime.is_terminal(1));
+        let (handle, slot_idx) = fd_map_lookup(&fd_map, 11, 1).expect("fresh table stdout");
+        assert_eq!(handle, 1);
+        assert_eq!(fd_map[slot_idx].incarnation.load(Ordering::Acquire), 2);
+        assert_eq!(open_table[0].lifetime.ring_references(1), None);
+        assert!(!open_table[0].lifetime.retain(1));
+        assert_eq!(open_table[0].lifetime.ring_references(2), Some(1));
     }
 
     #[test]
@@ -1531,5 +1543,263 @@ mod tests {
         let (ready, out_pfds) = continuation.complete(&fd_map, &open_table, &object_table, None);
         assert_eq!(out_pfds.len(), 1);
         assert!(ready >= 0);
+    }
+
+    #[test]
+    fn retire_fd_map_two_live_processes_releases_last_refs_and_reclaims_records() {
+        let (fd_map, open_table, object_table) = setup_tables();
+        let parent_table = 10;
+        let child_table = 11;
+
+        let shared_handle = admit_host_fd(
+            &fd_map,
+            &open_table,
+            &object_table,
+            parent_table,
+            3,
+            30,
+            DELEGATED_FLAG_READABLE,
+        )
+        .expect("admit shared fd in parent");
+        let parent_private_handle = admit_host_fd(
+            &fd_map,
+            &open_table,
+            &object_table,
+            parent_table,
+            4,
+            31,
+            DELEGATED_FLAG_READABLE,
+        )
+        .expect("admit parent-only fd");
+
+        assert!(fork_fd_map(&fd_map, &open_table, parent_table, child_table));
+        assert_eq!(
+            close_host_binding(&fd_map, &open_table, child_table, 4),
+            Some(GuestDescriptorChange {
+                fd: 4,
+                release: None,
+            })
+        );
+        let child_private_handle = admit_host_fd(
+            &fd_map,
+            &open_table,
+            &object_table,
+            child_table,
+            5,
+            32,
+            DELEGATED_FLAG_WRITABLE,
+        )
+        .expect("admit child-only fd");
+
+        assert_eq!(
+            open_table[(shared_handle - 1) as usize]
+                .lifetime
+                .ring_references(1),
+            Some(2)
+        );
+        assert_eq!(
+            open_table[(parent_private_handle - 1) as usize]
+                .lifetime
+                .ring_references(1),
+            Some(1)
+        );
+        assert_eq!(
+            open_table[(child_private_handle - 1) as usize]
+                .lifetime
+                .ring_references(1),
+            Some(1)
+        );
+
+        // Retiring the child table must release its reference on the shared open
+        // record (keeping it live for the parent) and terminally release its
+        // private open record so the slot can be reclaimed without leaking.
+        retire_fd_map(&fd_map, &open_table, child_table);
+
+        assert_eq!(
+            open_table[(shared_handle - 1) as usize]
+                .lifetime
+                .ring_references(1),
+            Some(1)
+        );
+        assert_eq!(
+            open_table[(parent_private_handle - 1) as usize]
+                .lifetime
+                .ring_references(1),
+            Some(1)
+        );
+        assert!(
+            open_table[(child_private_handle - 1) as usize]
+                .lifetime
+                .is_terminal(1)
+        );
+
+        let reclaimed_handle = admit_host_fd(
+            &fd_map,
+            &open_table,
+            &object_table,
+            parent_table,
+            6,
+            33,
+            DELEGATED_FLAG_READABLE,
+        )
+        .expect("reclaim retired child open record");
+        assert_eq!(reclaimed_handle, child_private_handle);
+        assert_eq!(
+            open_table[(reclaimed_handle - 1) as usize]
+                .generation
+                .load(Ordering::Acquire),
+            2
+        );
+        assert_eq!(
+            open_table[(reclaimed_handle - 1) as usize]
+                .lifetime
+                .ring_references(2),
+            Some(1)
+        );
+
+        // Retiring the parent table releases the last references on the shared,
+        // parent-private, and reclaimed open records.
+        retire_fd_map(&fd_map, &open_table, parent_table);
+        assert!(
+            open_table[(shared_handle - 1) as usize]
+                .lifetime
+                .is_terminal(1)
+        );
+        assert!(
+            open_table[(parent_private_handle - 1) as usize]
+                .lifetime
+                .is_terminal(1)
+        );
+        assert!(
+            open_table[(reclaimed_handle - 1) as usize]
+                .lifetime
+                .is_terminal(2)
+        );
+    }
+
+    #[test]
+    fn admit_stdio_claims_from_shared_allocator_without_rebinding_reused_handles() {
+        let (fd_map, open_table, object_table) = setup_tables();
+
+        // Case 1: handle 1..=3 are initially admitted as stdio for table 10, then
+        // retired and reused by table 12 for host fds. Fresh table 11 admitting
+        // stdio must claim through the shared allocator and never rebind table 12's
+        // descriptors to stdin/stdout/stderr.
+        admit_stdio(&fd_map, &open_table, &object_table, 10, [true, true, true]);
+        retire_fd_map(&fd_map, &open_table, 10);
+
+        let reused_h1 = admit_host_fd(
+            &fd_map,
+            &open_table,
+            &object_table,
+            12,
+            3,
+            40,
+            DELEGATED_FLAG_READABLE,
+        )
+        .expect("reuse handle 1 for table 12 host fd 40");
+        let reused_h2 = admit_host_fd(
+            &fd_map,
+            &open_table,
+            &object_table,
+            12,
+            4,
+            41,
+            DELEGATED_FLAG_WRITABLE,
+        )
+        .expect("reuse handle 2 for table 12 host fd 41");
+        assert_eq!(reused_h1, 1);
+        assert_eq!(reused_h2, 2);
+
+        admit_stdio(&fd_map, &open_table, &object_table, 11, [true, true, true]);
+
+        // Table 12's host fds on handles 1 and 2 must remain bound to 40 and 41.
+        assert_eq!(
+            open_table[(reused_h1 - 1) as usize]
+                .host_fd()
+                .expect("table 12 host fd 40 preserved")
+                .raw(),
+            40
+        );
+        assert_eq!(
+            open_table[(reused_h1 - 1) as usize]
+                .host_object()
+                .and_then(HostObjectBinding::stdio_fd),
+            None
+        );
+        assert_eq!(
+            open_table[(reused_h2 - 1) as usize]
+                .host_fd()
+                .expect("table 12 host fd 41 preserved")
+                .raw(),
+            41
+        );
+        assert_eq!(
+            open_table[(reused_h2 - 1) as usize]
+                .host_object()
+                .and_then(HostObjectBinding::stdio_fd),
+            None
+        );
+
+        // Table 11 must have all three stdio descriptors admitted on distinct handles.
+        for (fd, expected_binding) in [
+            (0, HostObjectBinding::STDIN),
+            (1, HostObjectBinding::STDOUT),
+            (2, HostObjectBinding::STDERR),
+        ] {
+            let (handle, slot_idx) =
+                fd_map_lookup(&fd_map, 11, fd).expect("fresh table 11 stdio admitted");
+            assert_ne!(handle, reused_h1);
+            assert_ne!(handle, reused_h2);
+            let open = &open_table[(handle - 1) as usize];
+            assert_eq!(open.host_object(), Some(expected_binding));
+            assert_eq!(
+                open.generation.load(Ordering::Acquire),
+                fd_map[slot_idx].incarnation.load(Ordering::Acquire)
+            );
+            assert!(open.is_bound_to(&object_table[(handle - 1) as usize]));
+        }
+
+        // Case 2: even at generation 1, if table 20 claims handle 1 via admit_host_fd
+        // before stdio is admitted, admit_stdio must not overwrite handle 1.
+        let (fd_map2, open_table2, object_table2) = setup_tables();
+        let h1 = admit_host_fd(
+            &fd_map2,
+            &open_table2,
+            &object_table2,
+            20,
+            5,
+            50,
+            DELEGATED_FLAG_READABLE,
+        )
+        .expect("table 20 claims handle 1 first");
+        assert_eq!(h1, 1);
+
+        admit_stdio(
+            &fd_map2,
+            &open_table2,
+            &object_table2,
+            20,
+            [true, true, true],
+        );
+        assert_eq!(
+            open_table2[0]
+                .host_fd()
+                .expect("table 20 host fd 50 preserved at generation 1")
+                .raw(),
+            50
+        );
+        assert_eq!(
+            open_table2[0]
+                .host_object()
+                .and_then(HostObjectBinding::stdio_fd),
+            None
+        );
+        let (stdin_h, _) = fd_map_lookup(&fd_map2, 20, 0).expect("table 20 stdin");
+        assert_ne!(stdin_h, 1);
+        assert_eq!(
+            open_table2[(stdin_h - 1) as usize].host_object(),
+            Some(HostObjectBinding::STDIN)
+        );
     }
 }
