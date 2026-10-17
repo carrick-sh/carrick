@@ -4521,8 +4521,10 @@ mod carrier_vm_custody_tests {
                     },
                     AddressContext {
                         mm: MmGeneration::new(NonZeroU64::new(301).expect("nonzero")),
-                        root: RootGpa::page_aligned(FrameGpa::new(stock_base))
-                            .expect("page aligned"),
+                        root: RootGpa::page_aligned(FrameGpa::new(
+                            carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE,
+                        ))
+                        .expect("page aligned"),
                         generation: ContextGeneration::new(NonZeroU64::MIN),
                     },
                 );
@@ -4639,10 +4641,8 @@ mod carrier_vm_custody_tests {
         );
         assert_eq!(
             custody.claim_terminal_stage2_release(identity),
-            Some(CarrierStage2UnmapTarget {
-                ipa: identity.ipa,
-                len: identity.len,
-            })
+            Ok(None),
+            "fixed test lease owns no IPA allocation to release"
         );
     }
 

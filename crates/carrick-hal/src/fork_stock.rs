@@ -480,13 +480,6 @@ impl<T, C> PendingForkLoan<T, C> {
     }
 }
 
-/// The stopped lane's wire settlement and the physical custody it hands to
-/// the committed child as one operation. Abort drops the unused custody.
-pub struct ForkStockSettlementReceipt<'a, C> {
-    pub record: &'a mut ForkStockSettlement,
-    pub physical: C,
-}
-
 /// A settled child whose memory is live in the guest owner graph.
 #[derive(Debug)]
 struct CommittedChild<T, C> {
@@ -1140,25 +1133,6 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         Ok((child_key, parent_key, child_used, parent_used))
     }
 
-    /// Every check a commit settlement must pass, without consuming the
-    /// loan. A carrier that publishes its own state for the child (KVM
-    /// inherited frames) calls this first so nothing is published for a
-    /// commit the stock would refuse; `settle` runs the same checks.
-    pub fn validate_commit(
-        &self,
-        execution: GrantExecution,
-        settlement: &ForkStockSettlement,
-        is_resolvable: impl Fn(&[RootGpa]) -> bool,
-        is_clean: impl Fn(&[RootGpa]) -> bool,
-    ) -> Result<carrick_el1_abi::PortalForkCompletion, ForkStockServiceError> {
-        let loan = self.settlement_loan(execution)?;
-        let (completion, _custody, _count) = settlement
-            .request(loan)
-            .ok_or(ForkStockServiceError::LoanMismatch)?;
-        self.validate_completion(execution, completion, is_resolvable, is_clean)?;
-        Ok(completion)
-    }
-
     /// Validate a prepared child's table completion and retain its inherited
     /// physical custody into an [`AdmittedForkCustody`] token on the pending
     /// loan before child publication. Any refusal leaves the loan pending so
@@ -1314,8 +1288,8 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
     }
 
     /// Settle an outstanding loan: an exact abort returns every untouched
-    /// page and the lifecycle record; a commit charges used pages to the
-    /// child and parent and returns the unused suffixes.
+    /// page and the lifecycle record; a commit consumes the admitted custody
+    /// token reserved during preparation and returns the unused suffixes.
     ///
     /// `is_resolvable` proves the host can reach each loaned page,
     /// `is_clean` that pages returning to stock are zero, and
@@ -1325,15 +1299,11 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         &mut self,
         ledger: &mut impl ForkTableLedger,
         execution: GrantExecution,
-        receipt: ForkStockSettlementReceipt<'_, C>,
+        settlement: &mut ForkStockSettlement,
         is_resolvable: impl Fn(&[RootGpa]) -> bool,
         is_clean: impl Fn(&[RootGpa]) -> bool,
         clear_lifecycle: impl FnOnce(ForkLifecycleLoan) -> bool,
     ) -> Result<(), ForkStockServiceError> {
-        let ForkStockSettlementReceipt {
-            record: settlement,
-            physical,
-        } = receipt;
         let loan = self.settlement_loan(execution)?;
         let index = cpu_index(execution.cpu).ok_or(ForkStockServiceError::NoPendingLoan)?;
         let pending = self.pending[index]
@@ -1370,35 +1340,8 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
                 return Err(ForkStockServiceError::InvalidRecord);
             }
             Ok(())
-        } else if pending.admitted.is_some() {
-            drop(physical);
-            self.commit_admitted(ledger, execution, settlement)
         } else {
-            let (completion, _, _) = settlement
-                .request(loan)
-                .ok_or(ForkStockServiceError::LoanMismatch)?;
-            let (child_key, parent_key, child_used, parent_used) =
-                self.validate_completion(execution, completion, &is_resolvable, &is_clean)?;
-            if !settlement.accept(loan) {
-                return Err(ForkStockServiceError::InvalidRecord);
-            }
-            let pending = self.pending[index]
-                .take()
-                .ok_or(ForkStockServiceError::NoPendingLoan)?;
-            self.consume_admitted(
-                ledger,
-                pending,
-                AdmittedForkCustody {
-                    loan_id: loan.id,
-                    child_key,
-                    parent_key,
-                    child_used,
-                    parent_used,
-                    completion,
-                    physical,
-                },
-            );
-            Ok(())
+            self.commit_admitted(ledger, execution, settlement)
         }
     }
 

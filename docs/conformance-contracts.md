@@ -442,6 +442,19 @@ same-VA isolation. Lookup work follows the physical extent index and selected
 records, without scanning other MM populations. Signed fork acceptance remains
 required.
 
+Native fork stock reserves that same physical custody before child publication.
+`native_stock_reserve_refuses_retiring_stage2_record_and_rolls_back_earlier_pin`
+drives the HVF stock crossing and the stage-2 retirement owner without booting a
+VM: retirement before Reserve refuses admission, drops earlier row pins, and
+permits a clean Abort and subsequent fork; retirement after Reserve cannot
+revoke the admitted child's pin. Commit only consumes that reservation, never
+reconstructs custody. The HAL binding
+`unreserved_commit_cannot_bypass_physical_custody_admission` rejects the former
+inline-Commit path. ARM settlement keeps the child space closed on a typed
+Commit refusal, failed crossing, or missing acknowledgment; these are invariant
+faults after publication, not successful forks. These host witnesses do not
+replace signed guest or KVM acceptance.
+
 Owner-selected fork leaves retain the parent's exact physical inventory extent
 once per extent, independent of the selected leaf count. A 4 KiB semantic leaf
 must not shrink a 16 KiB compound's custody to 4 KiB: child bootstrap COW and
