@@ -83,6 +83,117 @@ fn committed_child_retains_physical_custody_through_quarantine() {
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
 }
 
+#[test]
+fn committed_child_weak_pin_venue_drops_carrier_without_reclaim_and_releases_on_drain() {
+    use std::sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Debug)]
+    struct CarrierFixture {
+        pin_count: AtomicUsize,
+        stock: Mutex<ForkStock<UntaggedRoots, WeakCarrierPin>>,
+    }
+
+    #[derive(Debug)]
+    struct WeakCarrierPin(Weak<CarrierFixture>);
+
+    impl Drop for WeakCarrierPin {
+        fn drop(&mut self) {
+            if let Some(carrier) = self.0.upgrade() {
+                carrier.pin_count.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    let make_carrier = || {
+        let carrier = Arc::new(CarrierFixture {
+            pin_count: AtomicUsize::new(0),
+            stock: Mutex::new(ForkStock::new(
+                CARRIER,
+                ForkControlCapacity::exclusive(0x1_0000_0000),
+                UntaggedRoots,
+            )),
+        });
+        {
+            let mut stock = carrier.stock.lock().unwrap();
+            stock
+                .install(
+                    (0..4).map(|n| page(0x20_0000 + n * 4096)).collect(),
+                    lifecycles(1),
+                )
+                .unwrap();
+        }
+        carrier.pin_count.fetch_add(1, Ordering::SeqCst);
+        let pin = WeakCarrierPin(Arc::downgrade(&carrier));
+        assert_eq!(carrier.pin_count.load(Ordering::SeqCst), 1);
+        let parent = parent();
+        let mut exchange = ForkStockExchange::new(request(parent, 302, 2, 1)).unwrap();
+        let loan = carrier
+            .stock
+            .lock()
+            .unwrap()
+            .loan(&mut NoTableLedger, parent, &mut exchange, |_| true)
+            .unwrap();
+        let completion = PortalForkCompletion {
+            request: loan.request,
+            // SAFETY: exact admitted child fixture.
+            child: unsafe {
+                El1MmHandle::from_admitted_owner(CARRIER, loan.request.child_mm, NonZeroU64::MIN)
+            },
+            parent_generation: ReservationGeneration::INITIAL,
+            child_tables_used: 4096,
+            parent_tables_used: 0,
+        };
+        let mut settlement =
+            ForkStockSettlement::new(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
+                .unwrap();
+        carrier
+            .stock
+            .lock()
+            .unwrap()
+            .settle(
+                &mut NoTableLedger,
+                parent,
+                ForkStockSettlementReceipt {
+                    record: &mut settlement,
+                    physical: pin,
+                },
+                |_| true,
+                |_| true,
+                |_| true,
+            )
+            .unwrap();
+        assert_eq!(carrier.stock.lock().unwrap().live_children(), 1);
+        carrier
+    };
+
+    // 1. Dropping the carrier with a committed child still in stock drops the carrier immediately.
+    let carrier = make_carrier();
+    let weak = Arc::downgrade(&carrier);
+    drop(carrier);
+    assert!(
+        weak.upgrade().is_none(),
+        "committed child retaining a Weak pin venue must not cycle the carrier"
+    );
+
+    // 2. Draining fork stock on VM destroy releases the committed child's stage-2 pin.
+    let carrier = make_carrier();
+    assert_eq!(carrier.pin_count.load(Ordering::SeqCst), 1);
+    let drained = std::mem::replace(
+        &mut *carrier.stock.lock().unwrap(),
+        ForkStock::new(CARRIER, None, UntaggedRoots),
+    );
+    drop(drained);
+    assert_eq!(carrier.stock.lock().unwrap().live_children(), 0);
+    assert_eq!(
+        carrier.pin_count.load(Ordering::SeqCst),
+        0,
+        "draining fork stock at teardown must release committed-child stage-2 pins"
+    );
+}
+
 const CARRIER: NonZeroU64 = NonZeroU64::new(7).unwrap();
 const PARENT_MM: u64 = 301;
 
