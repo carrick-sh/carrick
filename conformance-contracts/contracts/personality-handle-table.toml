@@ -5,10 +5,10 @@ guest_surfaces = ["personality:handle-table"]
 semantic_authority = ["Issue #225, #231 and #554 owner rulings: neutral handle-table seam built on carrick-fd-core and OpenLifetime"]
 fixture = "carrick-kernel-example:personality_handle_table"
 scale_points = [1, 8, 64]
-rationale = "Additive personality seam on carrick-fd-core and carrick-core-abi::OpenLifetime: repr(C) shared-memory handle slots, 64-ary hierarchical free-slot bitmap, retained #[must_use] ObjectGuard pins on the single OpenLifetime word, and permanent slot retirement with lowered capacity on Generation::MAX exhaustion across close and inherit."
+rationale = "Additive personality seam on carrick-fd-core and carrick-core-abi::OpenLifetime: repr(C) shared-memory handle slots, 64-ary hierarchical free-slot bitmap, retained #[must_use] ObjectGuard pins on the single OpenLifetime word, permanent slot retirement with lowered capacity on Generation::MAX exhaustion across close/exit/inherit, and TaskKey-indexed TaskHandleHost."
 structural_budgets = []
 [bindings]
-vm_free = "carrick-fd-core::tests::{handle_slot_generation_exhaustion_retires_slot_on_close_exit_and_inherit,handle_pin_overflow_returns_pin_overflow_without_side_effects,handle_raw_guard_double_release_fails_closed,handle_concurrent_guards_exceed_eight_and_churn_without_exhaustion,inherit_filter_parent_close_or_destroy_finalizes_every_object_exactly_once,handle_write_paths_all_or_nothing_and_finalizer_lock_free_get_under_spin}; carrick-kernel-example::personality_handle_table"
+vm_free = "carrick-fd-core::tests::{handle_slot_generation_exhaustion_retires_slot_on_close_exit_and_inherit,handle_pin_overflow_returns_pin_overflow_without_side_effects,handle_raw_guard_double_release_fails_closed,handle_concurrent_guards_exceed_eight_and_churn_without_exhaustion,task_exit_contended_preserves_binding_until_retry_finalizes_once,inherit_filter_parent_close_or_exit_finalizes_every_object_exactly_once,handle_write_paths_all_or_nothing_and_finalizer_lock_free_get_under_spin,task_bound_table_refuses_direct_destroy_and_exit_task_allows_reattach_and_finalizer_lock_free_lookup,task_handle_host_constant_time_bucket_lookup_and_churn_beyond_max_tasks}; carrick-kernel-example::personality_handle_table"
 [bindings.unresolved]
 embed_structural = "Additive personality seam; real non-Linux personality consumers bind in follow-up slices."
 docker = "Neutral personality handle seam introduces no Linux syscall behaviour change."

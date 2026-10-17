@@ -461,6 +461,7 @@ impl Table<'_> {
 pub(crate) const TABLE_FREE: u32 = 0;
 pub(crate) const TABLE_LIVE: u32 = 1;
 pub(crate) const TABLE_LIVE_HANDLES: u32 = 2;
+pub(crate) const TABLE_BOUND_TASK: u32 = 4;
 pub(crate) const FREE_INDEX: u64 = u32::MAX as u64;
 const REF: u64 = 1 << 32;
 const PIN: u64 = 1;
@@ -636,7 +637,7 @@ pub struct Core<const T: usize> {
 }
 
 /// Layout facts a shared-memory venue folds into its ABI layout hash.
-pub const LAYOUT_FACTS: [u64; 27] = [
+pub const LAYOUT_FACTS: [u64; 43] = [
     core::mem::size_of::<TableRecord>() as u64,
     core::mem::align_of::<TableRecord>() as u64,
     core::mem::size_of::<OfdRecord>() as u64,
@@ -653,6 +654,7 @@ pub const LAYOUT_FACTS: [u64; 27] = [
     core::mem::offset_of!(Core<1>, object_count) as u64,
     core::mem::offset_of!(TableRecord, retired) as u64,
     TABLE_LIVE_HANDLES as u64,
+    TABLE_BOUND_TASK as u64,
     core::mem::size_of::<handle::ObjectRecord>() as u64,
     core::mem::align_of::<handle::ObjectRecord>() as u64,
     core::mem::offset_of!(handle::ObjectRecord, lifetime) as u64,
@@ -664,6 +666,21 @@ pub const LAYOUT_FACTS: [u64; 27] = [
     handle::HANDLE_SLOT_RETIRED,
     handle::HANDLE_SLOT_OBJECT_MASK,
     handle::HANDLE_SLOT_GENERATION_SHIFT,
+    core::mem::size_of::<handle::TaskBucket>() as u64,
+    core::mem::align_of::<handle::TaskBucket>() as u64,
+    core::mem::offset_of!(handle::TaskBucket, head) as u64,
+    core::mem::offset_of!(handle::TaskBucket, seq) as u64,
+    core::mem::size_of::<handle::TaskBindingRecord>() as u64,
+    core::mem::align_of::<handle::TaskBindingRecord>() as u64,
+    core::mem::offset_of!(handle::TaskBindingRecord, task_id) as u64,
+    core::mem::offset_of!(handle::TaskBindingRecord, hash_next) as u64,
+    core::mem::offset_of!(handle::TaskBindingRecord, task_serial) as u64,
+    core::mem::offset_of!(handle::TaskBindingRecord, table_authority) as u64,
+    core::mem::offset_of!(handle::TaskBindingRecord, table_index) as u64,
+    core::mem::offset_of!(handle::TaskBindingRecord, table_generation) as u64,
+    core::mem::size_of::<handle::TaskHandleCore<1>>() as u64,
+    core::mem::align_of::<handle::TaskHandleCore<1>>() as u64,
+    core::mem::offset_of!(handle::TaskHandleCore<1>, bindings) as u64,
 ];
 
 #[cfg(not(all(test, feature = "loom")))]
@@ -674,6 +691,7 @@ const _: () = {
     assert!(core::mem::offset_of!(Core<1>, object_count) == 40);
     assert!(core::mem::offset_of!(Core<1>, tables) == 64);
     assert!(TABLE_LIVE_HANDLES == 2);
+    assert!(TABLE_BOUND_TASK == 4);
 };
 
 /// A tagged lock-free stack of free record indices, for venue record arrays
