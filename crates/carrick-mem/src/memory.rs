@@ -5079,7 +5079,9 @@ fn write_el1_hook(
     emit(bytes, &mut cursor, enc_ldr_xt_xn(1, 16, 248)); // elr
     emit(bytes, &mut cursor, 0xD518_4021); // msr elr_el1, x1
     emit(bytes, &mut cursor, enc_ldr_xt_xn(1, 16, 256)); // spsr
-    if irq == El1IrqMode::Gic {
+    // DIAGNOSTIC #489 A/B: retain the pre-checkpoint EL0 IRQ mask only for
+    // the SignalCheck served return. Never land this branch.
+    if irq == El1IrqMode::Gic && entry != HookEntry::SignalCheck {
         emit(bytes, &mut cursor, enc_movz_xn(2, 0x80, 0)); // mov x2, #PSTATE.I
         emit(bytes, &mut cursor, enc_bic_xd_xn_xm(1, 1, 2)); // bic x1, x1, x2
     }
