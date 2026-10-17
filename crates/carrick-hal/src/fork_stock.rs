@@ -501,6 +501,28 @@ pub fn take_fork_table_stock(
     Some((child_tables, parent_tables))
 }
 
+/// Runtime reservation of root-table arenas from the carrier's existing
+/// stage-1 slot allocator. Holding it excludes those arenas from host-created
+/// address spaces; the backend retains it for the entire stock lifetime.
+pub trait NativeForkTableReservation: core::fmt::Debug + Send + Sync {
+    fn arenas(&self) -> &[RootGpa];
+}
+
+/// Existing runtime table reservation and physical inventory for one carrier.
+/// The backend retains both until all fork stock and quarantined children end.
+pub struct NativeForkStockResources {
+    pub tables: std::sync::Arc<dyn NativeForkTableReservation>,
+    pub inventory: std::sync::Arc<dyn crate::PhysicalFrameInventory>,
+}
+impl core::fmt::Debug for NativeForkStockResources {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("NativeForkStockResources")
+            .field("tables", &self.tables)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The carrier's bounded fork stock, pending loans and child quarantine.
 #[derive(Debug)]
 pub struct ForkStock<T: ChildAddressTags> {
@@ -586,6 +608,11 @@ impl<T: ChildAddressTags> ForkStock<T> {
 
     pub fn child_tag(&self, mm: ReservationMm) -> Option<T::Tag> {
         Some(self.children.get(&MmKey::of(mm)?)?.tag.tag())
+    }
+
+    /// Committed physical root, for authenticating a stopped child lane.
+    pub fn child_root(&self, mm: ReservationMm) -> Option<RootGpa> {
+        Some(self.children.get(&MmKey::of(mm)?)?.root)
     }
 
     pub fn child_lifecycle(&self, mm: ReservationMm) -> Option<ForkLifecycleLoan> {

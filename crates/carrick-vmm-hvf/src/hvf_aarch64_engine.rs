@@ -2173,6 +2173,21 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.cow_authority.clone()
     }
 
+    fn native_fork_table_arenas(&self) -> usize {
+        // Bounded stock from the existing runtime table arena allocator.
+        // The physical backing uses the same owners as host-created roots.
+        8
+    }
+    fn install_native_fork_stock(
+        &self,
+        reservation: carrick_hal::fork_stock::NativeForkStockResources,
+    ) -> Result<(), TrapError> {
+        crate::fork_stock::ForkStockHostCustody::install(
+            &self.state.carrier_vm_custody(),
+            reservation,
+        )
+    }
+
     fn carrier_asid_allocator(&self) -> Option<carrick_hal::asid::AsidAllocator> {
         Some(self.state.carrier_vm_custody().asids.clone())
     }

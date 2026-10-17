@@ -358,6 +358,7 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
     };
     let (runtime, address) =
         admit_entry_runtime(source, task, &native, ttbr0, record, page, control)?;
+    task.publish_root_generation(address.generation);
     let words = Aarch64ParkedContext::from_register(
         native,
         ttbr0,

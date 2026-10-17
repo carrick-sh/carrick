@@ -5290,6 +5290,16 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vm.foreign_mm_endpoint()
     }
 
+    fn native_fork_table_arenas(&self) -> usize {
+        self.vm.native_fork_table_arenas()
+    }
+    fn install_native_fork_stock(
+        &self,
+        reservation: carrick_hal::fork_stock::NativeForkStockResources,
+    ) -> Result<(), carrick_hal::TrapError> {
+        self.vm.install_native_fork_stock(reservation)
+    }
+
     fn carrier_asid_allocator(&self) -> Option<carrick_hal::asid::AsidAllocator> {
         self.vm.carrier_asid_allocator()
     }

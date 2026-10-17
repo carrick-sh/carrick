@@ -8389,30 +8389,35 @@ impl HvfInner {
                                 "native run failure crossing has no leased CPU".into(),
                             )
                         })?;
-                    let record_gpa = vcpu.get_reg(Reg::X1).map_err(hvf_error)?;
-                    if !record_gpa.is_multiple_of(64) {
-                        return Err(TrapError::Hypervisor(
-                            "unaligned native run failure record".into(),
-                        ));
-                    }
-                    let record_ptr = crate::fork_stock::ForkStockHostCustody::resolve_record_ptr::<
+                    let address = carrick_guest_arch::KernelVa::new(
+                        vcpu.get_reg(Reg::X1).map_err(hvf_error)?,
+                    );
+                    let region =
+                        crate::metadata_grant::retained_abi_region(custody).ok_or_else(|| {
+                            TrapError::Hypervisor(
+                                "native run failure has no retained ABI region".into(),
+                            )
+                        })?;
+                    let pointer = crate::metadata_grant::abi_stack_ptr::<
                         carrick_core_abi::NativeRunFailure,
-                    >(custody, record_gpa)
-                    .map_err(|_| {
-                        TrapError::Hypervisor(
-                            "native run failure record lacks physical custody".into(),
-                        )
+                    >(region, cpu, address)
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor("native run failure outside stopped CPU stack".into())
                     })?;
-                    // SAFETY: stopped lane retains the aligned initialized record;
-                    // exact mapped physical custody was resolved above.
-                    let record = unsafe { &*record_ptr };
+                    let ttbr = vcpu.get_sys_reg(SysReg::TTBR0_EL1).map_err(hvf_error)?;
+                    let execution = crate::metadata_grant::stopped_execution(region, cpu, ttbr)
+                        .ok_or_else(|| {
+                            TrapError::Hypervisor("native run failure has no live execution".into())
+                        })?;
+                    // SAFETY: complete aligned wire record retained by the stopped CPU.
+                    let record = unsafe { &*pointer };
                     let (reason, crossings) = custody
                         .fork_stock
                         .lock()
-                        .service_run_failure(cpu, record)
+                        .service_run_failure(execution, record)
                         .map_err(|_| {
                             TrapError::Hypervisor(
-                                "native run failure record has stale execution binding".into(),
+                                "native run failure has stale execution binding".into(),
                             )
                         })?;
                     // Runtime propagates this named error through carrier cleanup;
