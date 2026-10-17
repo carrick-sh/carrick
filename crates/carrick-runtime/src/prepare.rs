@@ -260,13 +260,16 @@ fn run_prepared_kvm_pool_with_debug(
     )?;
     let (completed_tx, completed_rx) = std::sync::mpsc::channel();
     let factory = Arc::new(executor::kvm::KvmPersistentExecutorFactory::new(
-        Arc::clone(&physical),
-        Arc::clone(&dispatcher),
-        Arc::clone(&reporter),
-        completed_tx,
-        max_traps,
-        Arc::clone(&stats),
-        Arc::clone(&scheduler),
+        executor::kvm::KvmPersistentExecutorConfig {
+            physical: Arc::clone(&physical),
+            dispatcher: Arc::clone(&dispatcher),
+            reporter: Arc::clone(&reporter),
+            completed: completed_tx,
+            max_exits: max_traps,
+            stats: Arc::clone(&stats),
+            scheduler: Arc::clone(&scheduler),
+            root_binding: Arc::clone(&binding),
+        },
     )?);
     let pool = executor::ExecutorPool::start(
         executor::ExecutorPoolConfig {

@@ -1757,6 +1757,11 @@ fn mounted_static_x86_exiting_last_writer_reaches_host_eof() {
 }
 
 #[test]
+fn mounted_static_x86_forked_child_last_writer_reaches_host_eof() {
+    compare_mounted_assembly_with_native("x86_child_last_writer.S", b"E\n");
+}
+
+#[test]
 fn mounted_static_x86_signal_thread_identity_matches_native() {
     compare_mounted_assembly_with_native("x86_signal_thread_identity.S", b"T\n");
 }
