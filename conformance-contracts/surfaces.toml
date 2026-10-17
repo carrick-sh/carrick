@@ -1448,3 +1448,28 @@ contracts = ["kernel.x86.file-region"]
 path = "crates/carrick-hal/src/trap.rs"
 contracts = ["kernel.x86.file-region"]
 
+[[surfaces]]
+path = "crates/carrick-softmmu/src/lib.rs"
+contracts = ["softmmu.x86.tlb-walker"]
+
+[[surfaces]]
+path = "crates/carrick-softmmu/src/domains.rs"
+contracts = ["softmmu.x86.tlb-walker"]
+
+[[surfaces]]
+path = "crates/carrick-softmmu/src/placement.rs"
+contracts = ["softmmu.x86.tlb-walker"]
+
+[[surfaces]]
+path = "crates/carrick-softmmu/src/tlb.rs"
+contracts = ["softmmu.x86.tlb-walker"]
+
+[[surfaces]]
+path = "crates/carrick-softmmu/src/walker.rs"
+contracts = ["softmmu.x86.tlb-walker"]
+
+[[surfaces]]
+path = "crates/carrick-softmmu/tests/softmmu_contract.rs"
+contracts = ["softmmu.x86.tlb-walker"]
+
+

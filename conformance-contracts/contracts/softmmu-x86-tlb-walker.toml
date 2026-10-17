@@ -1,0 +1,40 @@
+schema_version = 1
+id = "softmmu.x86.tlb-walker"
+title = "Software vCPU linear guest-physical placement, per-CPU SoftTlb, and stage-1 x86-64 walker binding"
+guest_surfaces = ["vmm:soft", "mm:softmmu", "mm:x86-stage1-walker", "tlb:soft-tlb"]
+semantic_authority = [
+  "Intel SDM Vol. 3 §4.5 (4-Level Paging): non-present entries ignore bits 63:1 (P=0, RSVD=0); present entries reserve bits [51:MAXPHYADDR], ignore bits 58:52 (and 62:59 when PKE=0), reserve bit 63 (XD/NX) only when EFER.NXE=0, reserve PML4E.PS and unaligned huge-page physical bits, and enforce USER, WRITE, NX, SMAP (CPL0 data access to user pages with RFLAGS.AC=0) and SMEP (CPL0 instruction fetch from user pages regardless of AC)",
+  "Intel SDM Vol. 3 §4.10.4 (Invalidation of TLBs and Paging-Structure Caches): INVLPG invalidates TLB entries for the target linear page; MOV to CR3 flushes all non-global TLB entries",
+  "Carrick #578 / #580: LinearPlacement::host is the sole GPA-to-host pointer conversion, restricted by type to authenticated FrameGpa / RootGpa and excluding MMIO holes (0xfee0_0000..0xfee0_1000)",
+]
+fixture = "carrick-softmmu::tests::softmmu_contract"
+scale_points = [1, 2, 1024]
+structural_budgets = []
+rationale = """
+`LinearPlacement::host` is the only place in the workspace that converts an
+authenticated guest-physical address (`FrameGpa` or `RootGpa`, via the sealed
+`PlacementGpa` trait) into a `HostVa` (`host = gpa + K`). Unauthenticated
+`Stage1Gpa`, `GuestVa`, and `UserVa` do not implement `PlacementGpa` and are
+rejected at compile time; raw `base + gpa` pointer arithmetic outside
+`LinearPlacement::host` is rejected by `.semgrep/typed-domains.yml`.
+`MmioHoles` excludes MMIO ranges (default xAPIC `0xfee0_0000..0xfee0_1000`) from
+placement and `SoftTlb` fills so MMIO accesses always trap to device models.
+
+`SoftTlb` holds three 1024-entry direct-mapped planes (`read`, `write`, `exec`)
+with 16-byte `SoftTlbEntry { tag, addend }` records (`tag = va_page | cpl_bit |
+ac_bit`, `addend = host_page.wrapping_sub(va_page)`). `SoftWalker` binds
+`carrick_mmu_core::x86::descriptor_txn::translate_leaf` over
+`LiveDescriptorWords` while enforcing hardware x86-64 precedence (`P == 0`
+before reserved-bit checks), `MAXPHYADDR`-parameterised reserved bits
+`[51:MAXPHYADDR]`, hardware-ignored bits `58:52` (e.g. bit 55), SMAP/SMEP,
+COW write classification, `(Stage1Gpa, OwnerGeneration) -> FrameGpa` extent
+authentication, and code-page generation invalidation on writes.
+"""
+
+[bindings]
+vm_free = "carrick-softmmu::softmmu_contract::linear_placement_enforces_alignment_bounds_and_mmio_holes; red_first_non_present_precedence_and_reserved_bits_on_present_entries; red_first_smap_and_smep_enforced_across_tlb_and_walker; permission_classes_not_present_write_cow_nx_and_upper_half_va; mmio_hole_and_extent_generation_authentication_and_code_page_tracking; page_crossing_access_misses_tlb_and_validates_both_pages; two_thread_invlpg_eviction_and_cr3_root_switch_flush_match_hardware"
+
+[bindings.unresolved]
+embed_structural = "Software vCPU carrier integration (`carrick-vmm-soft`) lands in slices 2-3 of #578; slice 1a (#580) is the standalone `no_std` MMU/TLB crate."
+signed = "Linux worker cannot run signed HVF tests; `carrick-softmmu` is the hypervisor-free x86-64 software MMU substrate."
+docker = "Architectural x86-64 paging and TLB contract uses Intel SDM Vol. 3 §§4.5, 4.10.4 authority; full ELF workload parity against Docker lands in slices 3-4 of #578."

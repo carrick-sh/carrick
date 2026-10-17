@@ -1,6 +1,6 @@
 # Carrick Crate Map
 
-Carrick is a 52-crate Cargo workspace. The product path is:
+Carrick is a 53-crate Cargo workspace. The product path is:
 
 ```text
 carrick-cli   -> carrick-engine -> { carrick-image, carrick-runtime -> carrick-kernel -> carrick-vfs } -> carrick-spec
@@ -63,6 +63,7 @@ lists it). Do not read the crate map as a completed neutral/Linux layering.
 | `carrick-sched-core` | `no_std` in-guest scheduling core shared by guest EL1 and the host: the zone of futex-parked threads (records whose claim word names their one owner, hash-bucket wait queues, per-vCPU-slot run queues), laid out `repr(C)` in the shared EL1 region. |
 | `carrick-signal-core` | Platform-neutral pending-signal bookkeeping. |
 | `carrick-signal-linux` | Linux signal policy and host-venue pending bookkeeping shared across backends. |
+| `carrick-softmmu` | `no_std` + `alloc` linear guest-physical placement (`LinearPlacement`, the sole `Gpa -> HostVa` conversion), direct-mapped 1024-entry `read`/`write`/`exec` software TLB (`SoftTlb` tagged by `va_page | cpl_bit | ac_bit`), MMIO holes, and stage-1 walker binding (`SoftWalker`) with hardware x86-64 permission semantics (`USER`, `NX`, `SMAP`, `SMEP`, `COW`, reserved bits) for the software vCPU. |
 | `carrick-syscall-abi` | Guest-safe Linux syscall numbering, canonical tables, and wait-option domains. |
 | `carrick-thread` | Thread registry, private-futex park table, and fork/page-table quiesce barriers. |
 | `carrick-timer-core` | Platform-neutral interval/POSIX timer slot bookkeeping and timer due-time decisions. |

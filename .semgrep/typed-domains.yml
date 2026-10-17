@@ -307,4 +307,24 @@ rules:
       private const SYS_* or LINUX_* constants outside of carrick-abi. Look up
       syscalls by name or use the typed constants provided by carrick-abi.
 
-
+  # Pin the Gpa -> HostVa placement conversion to LinearPlacement::host (#580).
+  - id: carrick-softmmu-linear-placement-only
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "crates/carrick-softmmu/**/*.rs"
+        - "crates/carrick-softcpu-x86/**/*.rs"
+        - "crates/carrick-vmm-soft/**/*.rs"
+      exclude:
+        - "crates/carrick-softmmu/src/placement.rs"
+    patterns:
+      - pattern-either:
+          - pattern: HostVa($...ARGS)
+          - pattern: HostVa::new($...ARGS)
+          - pattern: HostVa::from_raw($...ARGS)
+    message: |
+      `LinearPlacement::host` in `crates/carrick-softmmu/src/placement.rs` is
+      the only allowed `Gpa -> HostVa` conversion. Do not construct `HostVa`
+      outside `LinearPlacement::host`; authenticate `Stage1Gpa -> FrameGpa`
+      through the extent table and call `placement.host(frame_gpa)`.
