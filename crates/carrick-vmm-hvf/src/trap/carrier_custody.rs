@@ -4583,26 +4583,28 @@ mod carrier_vm_custody_tests {
                     child_tables_used: 4096,
                     parent_tables_used: 4096,
                 };
-                let mut settlement =
-                    ForkStockSettlement::new(loan, completion, KernelVa::new(0x1000), 1)
-                        .expect("settlement");
+                let mut reserve =
+                    ForkStockSettlement::reserve(loan, completion, KernelVa::new(0x1000), 1)
+                        .expect("reserve settlement");
                 {
                     let mut stock = custody.fork_stock.lock();
+                    stock
+                        .owner
+                        .reserve_custody(
+                            exec,
+                            &mut reserve,
+                            |_| true,
+                            |_| true,
+                            |_, _, _| Ok(vec![retained]),
+                        )
+                        .expect("reserve custody");
+                    let mut commit =
+                        ForkStockSettlement::commit_reserved(loan, completion).expect("commit");
                     let mut ledger = custody.el1_frame_grants.lock();
                     stock
                         .owner
-                        .settle(
-                            &mut *ledger,
-                            exec,
-                            carrick_hal::fork_stock::ForkStockSettlementReceipt {
-                                record: &mut settlement,
-                                physical: vec![retained],
-                            },
-                            |_| true,
-                            |_| true,
-                            |_| true,
-                        )
-                        .expect("settle child");
+                        .commit_admitted(&mut *ledger, exec, &mut commit)
+                        .expect("commit admitted child");
                     assert_eq!(stock.owner.live_children(), 1);
                 }
                 identity
