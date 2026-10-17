@@ -150,7 +150,7 @@ pub fn run(args: SupervisorArgs) -> Result<i32, HostLeaseError> {
     workload.reaped = true;
     #[cfg(target_os = "linux")]
     complete_cleanup("reap descendants", || {
-        reap_descendants_except(&mut cleanup, lease.connection_pid())
+        reap_descendants_except(&mut cleanup, lease.connection_custody())
     })?;
     let mut bytes = [0; 256];
     complete_cleanup("workload lifetime EOF", || {
@@ -597,7 +597,7 @@ impl Drop for Workload {
 #[cfg(target_os = "linux")]
 fn reap_descendants_except(
     cleanup: &mut Cleanup,
-    custodian: Option<libc::pid_t>,
+    custodian: Option<(libc::pid_t, &std::sync::atomic::AtomicBool)>,
 ) -> io::Result<()> {
     reap_descendants_with_custodian(cleanup, custodian, || {
         std::fs::read_to_string("/proc/thread-self/children")
@@ -615,22 +615,23 @@ fn reap_descendants_with(
 #[cfg(target_os = "linux")]
 fn reap_descendants_with_custodian(
     cleanup: &mut Cleanup,
-    custodian: Option<libc::pid_t>,
+    custodian: Option<(libc::pid_t, &std::sync::atomic::AtomicBool)>,
     mut read_children: impl FnMut() -> io::Result<String>,
 ) -> io::Result<()> {
+    let custodian_pid = custodian.map(|(pid, _)| pid);
     loop {
         cleanup.deadline.remaining()?;
         // Optional cancellation optimisation only. Procfs may be absent, lack
         // CONFIG_PROC_CHILDREN, or belong to an ancestor PID namespace.
         if let Ok(children) = read_children() {
-            let mut only_custodian = custodian.is_some();
+            let mut only_custodian = custodian_pid.is_some();
             let mut reaped_children = false;
             for pid in children.split_whitespace() {
                 cleanup.deadline.remaining()?;
                 let pid: libc::pid_t = pid
                     .parse()
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                if Some(pid) == custodian {
+                if Some(pid) == custodian_pid {
                     continue;
                 }
                 only_custodian = false;
@@ -667,7 +668,7 @@ fn reap_descendants_with_custodian(
             if only_custodian {
                 return Ok(());
             }
-            if custodian.is_some() && reaped_children {
+            if custodian_pid.is_some() && reaped_children {
                 continue;
             }
         }
@@ -676,6 +677,11 @@ fn reap_descendants_with_custodian(
         // when live descendants cannot be discovered or cannot be killed.
         let reaped = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
         if reaped > 0 {
+            if let Some((pid, flag)) = custodian
+                && reaped == pid
+            {
+                flag.store(true, std::sync::atomic::Ordering::Release);
+            }
             continue;
         }
         if reaped < 0 {

@@ -1069,6 +1069,7 @@ fn reconcile_all(
     dir: &Path,
     path: &Path,
     approval: (u64, &Admission),
+    lease_ready: bool,
 ) -> Result<Pass, ScalerError> {
     let active: Vec<Record> = ledger
         .rows
@@ -1079,7 +1080,7 @@ fn reconcile_all(
     let mut finished = 0;
     let mut first_error = None;
     for row in active {
-        match reconcile_one(pve, gh, ledger, dir, path, approval, row) {
+        match reconcile_one(pve, gh, ledger, dir, path, approval, row, lease_ready) {
             Ok(true) => finished += 1,
             Ok(false) => {}
             Err(error @ ScalerError::CpuCeiling { .. }) => return Err(error),
@@ -1094,6 +1095,7 @@ fn reconcile_all(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reconcile_one(
     pve: &Pve,
     gh: &Github,
@@ -1102,6 +1104,7 @@ fn reconcile_one(
     path: &Path,
     approval: (u64, &Admission),
     mut row: Record,
+    lease_ready: bool,
 ) -> Result<bool, ScalerError> {
     let present = pve.inventory()?.iter().any(|v| v.id == row.vm.get());
     let task = match &row.task {
@@ -1154,7 +1157,7 @@ fn reconcile_one(
                 None,
                 false,
             )?;
-            if pending_owned_job(&row, &job, &run, approval.1) {
+            if lease_ready && pending_owned_job(&row, &job, &run, approval.1) {
                 println!(
                     "vm={} resuming completed clone in place; error history retained",
                     row.vm.get()
@@ -1203,7 +1206,9 @@ fn reconcile_one(
         // one-use runner has written its exit status: nothing is live.
         assignment = Assignment::Completed;
     }
-    if reap_decision(&row, now()?, assignment) == Reap::Destroy {
+    if reap_decision(&row, now()?, assignment) == Reap::Destroy
+        || (!lease_ready && assignment == Assignment::Unassigned)
+    {
         return cleanup(pve, gh, ledger, &mut row, dir, path, assignment);
     }
     Ok(false)
@@ -1589,6 +1594,31 @@ impl CloneLease {
         Ok(())
     }
 
+    fn try_recover(&mut self, ledger: &Ledger) -> Result<bool, ScalerError> {
+        if ledger.rows.iter().all(|row| row.state == State::Destroyed) {
+            return Ok(true);
+        }
+        let Some(path) = self.path.as_deref() else {
+            return Ok(true);
+        };
+        if self.held.is_some() {
+            return Ok(true);
+        }
+        match crate::host_lease::HostLease::acquire_broker_path(
+            path,
+            crate::host_lease::HostLeaseMode::Gate,
+            Duration::ZERO,
+            |_| Ok(false),
+        ) {
+            Ok(lease) => {
+                self.held = Some(lease);
+                Ok(true)
+            }
+            Err(crate::host_lease::HostLeaseError::Timeout { .. }) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn release_if_idle(&mut self, ledger: &Ledger) {
         if ledger.rows.iter().all(|row| row.state == State::Destroyed) {
             self.held = None;
@@ -1686,12 +1716,22 @@ pub(super) fn controller(
     };
     loop {
         ledger.refresh()?;
-        if ledger.rows.iter().any(|row| row.state != State::Destroyed) {
-            // Recovery must regain physical-host admission before boot/reap.
-            clone_lease.acquire()?;
+        let lease_ready = clone_lease.try_recover(&ledger)?;
+        if !lease_ready {
+            eprintln!(
+                "host lease contended during active-ledger recovery; refusing admission and reconciling surviving clones"
+            );
         }
-        if reconcile.elapsed() >= Duration::from_secs(60) {
-            let pass = reconcile_all(&pve, &gh, &mut ledger, dir, &path, (group, admission))?;
+        if !lease_ready || reconcile.elapsed() >= Duration::from_secs(60) {
+            let pass = reconcile_all(
+                &pve,
+                &gh,
+                &mut ledger,
+                dir,
+                &path,
+                (group, admission),
+                lease_ready,
+            )?;
             if pass.finished > 0 && one_job {
                 ledger.refresh()?;
                 return one_job_result(ledger.rows.last());
@@ -1701,9 +1741,11 @@ pub(super) fn controller(
                     eprintln!("reconcile failed: {error}; admission frozen for active ledger");
                     true
                 }
-                None => false,
+                None => !lease_ready,
             };
-            reconcile = Instant::now();
+            if lease_ready {
+                reconcile = Instant::now();
+            }
         }
         clone_lease.release_if_idle(&ledger);
         let active = ledger
@@ -1723,10 +1765,10 @@ pub(super) fn controller(
             ) {
                 Ok(()) => backoff.reset(),
                 Err(error @ ScalerError::CpuCeiling { .. }) => return Err(error),
-                Err(error @ ScalerError::HostLease(_)) => return Err(error),
                 Err(error) => {
-                    // Transient GitHub/PVE failures never end the controller.
+                    // Transient GitHub/PVE/lease contention failures never end the controller.
                     eprintln!("admission pass failed: {error}; backing off");
+                    clone_lease.release_if_idle(&ledger);
                     frozen = true;
                     backoff.grow();
                     admit_after = Instant::now() + backoff.delay();
@@ -1763,6 +1805,36 @@ fn select_demand(
     assignment::admit_demand(ledger, path, demand, vet, cancel)
 }
 
+fn reserve_admitted_clone(
+    ledger: &mut Ledger,
+    path: &Path,
+    job: JobKey,
+    limit: Concurrency,
+    clone_lease: &mut CloneLease,
+    admit: impl FnOnce() -> Result<bool, ScalerError>,
+    inventory: impl FnOnce() -> Result<Vec<PoolMember>, ScalerError>,
+) -> Result<Option<Record>, ScalerError> {
+    let result = (|| -> Result<Option<Record>, ScalerError> {
+        if !admit()? {
+            return Ok(None);
+        }
+        let inventory = inventory()?;
+        ledger.refresh()?;
+        if ledger.served(job) {
+            return Ok(None);
+        }
+        // Acquire the physical-host lock only immediately before ledger.reserve.
+        clone_lease.acquire()?;
+        let row = ledger.reserve(job, &inventory, now()?, limit)?;
+        ledger.save(path)?; // Must reach durable storage before clone.
+        Ok(Some(row))
+    })();
+    if !matches!(result, Ok(Some(_))) {
+        clone_lease.release_if_idle(ledger);
+    }
+    result
+}
+
 fn admit_one(
     pve: &Pve,
     gh: &Github,
@@ -1783,28 +1855,32 @@ fn admit_one(
     else {
         return Ok(());
     };
-    // Take the same flock as the SSH broker before reservation or clone POST.
-    // Re-vet below: the lease may have waited up to HOST_LEASE_WAIT_LIMIT.
-    clone_lease.acquire()?;
-    gh.vet(approval.1, job)?;
-    if !resource_admission(pve)? {
+    let Some(mut row) = reserve_admitted_clone(
+        ledger,
+        path,
+        job,
+        limit,
+        clone_lease,
+        || {
+            gh.vet(approval.1, job)?;
+            resource_admission(pve)
+        },
+        || pve.inventory(),
+    )?
+    else {
         return Ok(());
-    }
-    let inventory = pve.inventory()?;
-    ledger.refresh()?;
-    if ledger.served(job) {
-        return Ok(());
-    }
-    let mut row = ledger.reserve(job, &inventory, now()?, limit)?;
-    ledger.save(path)?; // Must reach durable storage before clone.
+    };
     println!("reserved vm={} job={}", row.vm.get(), job.job.0);
     if let Err(error) = provision(pve, gh, ledger, &mut row, dir, path, approval) {
         row.failure = Some(error.to_string());
         update(ledger, &row, path)?;
         if retire_superseded_reservation(pve, gh, ledger, &mut row, dir, path, &error)? {
+            clone_lease.release_if_idle(ledger);
             return Ok(());
         }
-        return provision_failure(ledger, job, error, path, |run| gh.cancel_run(run));
+        let outcome = provision_failure(ledger, job, error, path, |run| gh.cancel_run(run));
+        clone_lease.release_if_idle(ledger);
+        return outcome;
     }
     Ok(())
 }
@@ -1869,6 +1945,11 @@ mod tests {
             path: Some(lock.clone()),
             held: None,
         };
+        assert!(
+            lease.acquire().is_err(),
+            "missing broker lock file must fail closed without O_CREAT"
+        );
+        std::fs::File::create(&lock).unwrap();
         lease.acquire().unwrap();
         let independent = std::fs::File::open(&lock).unwrap();
         assert!(matches!(
@@ -1886,6 +1967,146 @@ mod tests {
         ledger.rows[0].state = State::Destroyed;
         lease.release_if_idle(&ledger);
         independent.try_lock().unwrap();
+    }
+
+    #[test]
+    fn admit_early_returns_never_hold_or_leak_clone_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock = temp.path().join("host.lock");
+        std::fs::File::create(&lock).unwrap();
+        let path = temp.path().join("ledger.json");
+        let job = JobKey {
+            run: RunId(10),
+            attempt: 1,
+            job: JobId(20),
+        };
+
+        // 1. Early return when resource_admission is false: neither waits on
+        // a contended lock nor retains an existing idle lease across POLL.
+        let mut ledger = Ledger::default();
+        let external = std::fs::File::open(&lock).unwrap();
+        external.try_lock().unwrap();
+        let mut lease = CloneLease {
+            path: Some(lock.clone()),
+            held: None,
+        };
+        let reserved = reserve_admitted_clone(
+            &mut ledger,
+            &path,
+            job,
+            Concurrency::ONE,
+            &mut lease,
+            || Ok(false),
+            || panic!("inventory must not be queried when resource_admission is false"),
+        )
+        .unwrap();
+        assert!(reserved.is_none());
+        assert!(lease.held.is_none());
+        drop(external);
+
+        lease.acquire().unwrap();
+        let reserved = reserve_admitted_clone(
+            &mut ledger,
+            &path,
+            job,
+            Concurrency::ONE,
+            &mut lease,
+            || Ok(false),
+            || Ok(Vec::new()),
+        )
+        .unwrap();
+        assert!(reserved.is_none());
+        assert!(
+            lease.held.is_none(),
+            "resource_admission=false retained clone lease on idle ledger"
+        );
+        let probe = std::fs::File::open(&lock).unwrap();
+        probe.try_lock().unwrap();
+        drop(probe);
+
+        // 2. Early return when ledger.served(job) is true: neither waits on
+        // a contended lock nor retains an existing idle lease across POLL.
+        ledger.refused.push(job);
+        let external = std::fs::File::open(&lock).unwrap();
+        external.try_lock().unwrap();
+        let reserved = reserve_admitted_clone(
+            &mut ledger,
+            &path,
+            job,
+            Concurrency::ONE,
+            &mut lease,
+            || Ok(true),
+            || Ok(Vec::new()),
+        )
+        .unwrap();
+        assert!(reserved.is_none());
+        assert!(lease.held.is_none());
+        drop(external);
+
+        lease.acquire().unwrap();
+        let reserved = reserve_admitted_clone(
+            &mut ledger,
+            &path,
+            job,
+            Concurrency::ONE,
+            &mut lease,
+            || Ok(true),
+            || Ok(Vec::new()),
+        )
+        .unwrap();
+        assert!(reserved.is_none());
+        assert!(
+            lease.held.is_none(),
+            "ledger.served(job)=true retained clone lease on idle ledger"
+        );
+        let probe = std::fs::File::open(&lock).unwrap();
+        probe.try_lock().unwrap();
+        drop(probe);
+
+        // 3. Admitted reservation acquires immediately before ledger.reserve.
+        ledger.refused.clear();
+        let reserved = reserve_admitted_clone(
+            &mut ledger,
+            &path,
+            job,
+            Concurrency::ONE,
+            &mut lease,
+            || Ok(true),
+            || Ok(Vec::new()),
+        )
+        .unwrap();
+        assert!(reserved.is_some());
+        assert!(lease.held.is_some());
+        let probe = std::fs::File::open(&lock).unwrap();
+        assert!(matches!(
+            probe.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+    }
+
+    #[test]
+    fn recovery_try_recover_is_zero_wait_when_contended_and_acquires_when_free() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock = temp.path().join("host.lock");
+        std::fs::File::create(&lock).unwrap();
+        let mut ledger = Ledger::default();
+        ledger.rows.push(row());
+        let mut lease = CloneLease {
+            path: Some(lock.clone()),
+            held: None,
+        };
+        let contender = std::fs::File::open(&lock).unwrap();
+        contender.try_lock().unwrap();
+        let started = Instant::now();
+        assert!(
+            !lease.try_recover(&ledger).unwrap(),
+            "contended recovery must return false without waiting"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(lease.held.is_none());
+        drop(contender);
+        assert!(lease.try_recover(&ledger).unwrap());
+        assert!(lease.held.is_some());
     }
 
     #[test]

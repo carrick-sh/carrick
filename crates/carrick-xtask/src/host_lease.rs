@@ -241,7 +241,9 @@ fn read_validation_identity_until(
 impl HostLease {
     /// Claim an idle host directly, without waiting or inherited admission.
     pub fn try_exclusive(path: &Path) -> Result<Option<Self>, HostLeaseError> {
-        match Self::acquire_path_with_limit(path, HostLeaseMode::Gate, Duration::ZERO) {
+        match Self::acquire_configured(path, HostLeaseMode::Gate, Duration::ZERO, None, |_| {
+            Ok(false)
+        }) {
             Ok(lease) => Ok(Some(lease)),
             Err(HostLeaseError::Timeout { .. }) => Ok(None),
             Err(error) => Err(error),
@@ -260,7 +262,15 @@ impl HostLease {
                 "obsolete fd handoff; restart the outer lease runner".into(),
             ));
         }
-        Self::acquire_configured(&path, mode, None, |duration| {
+        if broker::Config::load()
+            .map_err(HostLeaseError::ChildWait)?
+            .is_some()
+        {
+            return Err(HostLeaseError::Inherited(
+                "configured broker lease requires lease-supervisor custody".into(),
+            ));
+        }
+        Self::acquire_path_with_wait(&path, mode, HOST_LEASE_WAIT_LIMIT, None, |duration| {
             std::thread::sleep(duration);
             Ok(false)
         })
@@ -307,18 +317,19 @@ impl HostLease {
         let path = std::env::var_os("CARRICK_HOST_LEASE_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_LOCK_PATH));
-        Self::acquire_configured(&path, mode, Some(scope), wait)
+        Self::acquire_configured(&path, mode, HOST_LEASE_WAIT_LIMIT, Some(scope), wait)
     }
 
     fn acquire_configured(
         path: &Path,
         mode: HostLeaseMode,
+        limit: Duration,
         scope: Option<ScopeIdentity>,
         wait: impl FnMut(Duration) -> io::Result<bool>,
     ) -> Result<Self, HostLeaseError> {
         let config = broker::Config::load().map_err(HostLeaseError::ChildWait)?;
         let Some(config) = config else {
-            return Self::acquire_path_with_wait(path, mode, HOST_LEASE_WAIT_LIMIT, scope, wait);
+            return Self::acquire_path_with_wait(path, mode, limit, scope, wait);
         };
         if !cfg!(target_os = "linux") {
             return Err(HostLeaseError::Inherited(
@@ -330,8 +341,7 @@ impl HostLease {
                 "CARRICK_HOST_LEASE_PATH cannot override a configured broker".into(),
             ));
         }
-        let session =
-            broker::Session::connect(&config, mode, wait).map_err(HostLeaseError::ChildWait)?;
+        let session = broker::Session::connect(&config, mode, limit, wait)?;
         Self::serve_custody(
             Path::new(broker::LOCK_PATH),
             mode,
@@ -395,9 +405,6 @@ impl HostLease {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o660)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path)
             .map_err(|source| HostLeaseError::Io {
@@ -667,10 +674,10 @@ impl HostLease {
     }
 
     #[cfg(target_os = "linux")]
-    pub(crate) fn connection_pid(&self) -> Option<libc::pid_t> {
+    pub(crate) fn connection_custody(&self) -> Option<(libc::pid_t, &AtomicBool)> {
         match &self._holder.as_ref()?.custody {
             LeaseCustody::Local(_) => None,
-            LeaseCustody::Broker(session) => Some(session.pid()),
+            LeaseCustody::Broker(session) => Some(session.custody()),
         }
     }
 
