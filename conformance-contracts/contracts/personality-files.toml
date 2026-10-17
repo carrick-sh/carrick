@@ -2,13 +2,13 @@ schema_version = 1
 id = "core.personality.files"
 title = "Neutral file service vocabulary"
 guest_surfaces = ["personality:files"]
-semantic_authority = ["Issue #224 owner decisions: capability authorization and owned continuations; director F0 scope decision: types and API only"]
-fixture = "carrick-core:file::tests"
-scale_points = [1]
-rationale = "F0 establishes types without a file implementation. Pure type tests prove validated components, request construction and exhaustive errors. Behavioral red-first evidence belongs to F1/F4 against the real backend."
+semantic_authority = ["Issue #224 owner decisions: capability authorization and owned continuations; Issue #383 F1b real ZoneFileService and positional contract"]
+fixture = "carrick-kernel:el1_delegation::owned_recall::zone_file_service_tests::serial_host"
+scale_points = [1, 16, 512]
+rationale = "F0 establishes capability-authorized types without a file implementation. F1b implements carrick_el1::substrate::ZoneFileService over real VFS-admitted delegated records, shared DelegatedFile data-mark admission (file::with_data_marks), unforgeable AdmittedOpenReference admission tokens, caller-owned ZonePinTable allocator state across service rebuilds, and the shared ZoneFile positional core: authenticated carrier-scoped pin keys, coherent positional read/write/EOF/End-append across two live pins with preserved cursors, stale/replayed/foreign key refusal, demoted Unsupported vs generation-changed Stale refusal, shared queue_open_release terminal handoff, rollback on pin capacity exhaustion, single-record/single-slot work at adversarial populations 1/16/512, and touched-page/byte bounds at spans 0/4096/65536. append_contract_unit_with_forced_flag is a positional-contract unit test only; end-to-end append admission (#574) and neutral Open belong to F3/F4 (#384/#224)."
 structural_budgets = []
 [bindings]
-vm_free = "carrick-core::file::tests"
+vm_free = "carrick-core::file::tests; carrick-kernel::el1_delegation::owned_recall::zone_file_service_tests::serial_host::{zone_file_create_write_read_two_live_pins_are_coherent_and_preserve_cursors,zone_file_append_across_two_live_pins_never_overwrites,zone_file_replayed_and_foreign_pins_are_stale_and_spare_live_peers,zone_file_pin_exhaustion_rolls_back_and_retired_handles_refuse_old_keys,zone_file_pin_release_visits_one_record_at_each_population,zone_file_positional_io_visits_only_touched_pages_and_bytes,zone_file_marked_inode_queues_read_and_write_events_and_refuses_busy_or_spilled_watches,zone_file_drop_and_rebuild_over_same_storage_preserves_live_pins_and_never_overwrites_slot,zone_file_demoted_inode_is_unsupported_while_generation_change_is_stale}"
 [bindings.unresolved]
-embed_structural = "Real zone/crossing backend witnesses belong to F1/F4."
-docker = "No Linux lowering or backend implementation is added in F0."
+embed_structural = "Director-owned ARM signed regression gate on F1b; production non-Linux guest Open/CaseFold/append-admission bindings belong to F3/F4 (#384, #574)."
+docker = "Positional pread/pwrite/EOF/append authority is public man pages; neutral capability Open and CaseFold belong to F4 (#224)."

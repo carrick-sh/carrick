@@ -7,9 +7,8 @@ use crate::file::UserCopy;
 use crate::memory;
 use carrick_el1_abi::{
     Action, Counters, CurrentTask, DELEGATED_STATE_GUEST, DelegatedFile, DelegatedInotify,
-    DelegatedOpenFile, EL1_GUEST_LOCK_SPINS, FdMapSlot, InotifyNameCache, MAX_DELEGATED_FILES,
-    MAX_DELEGATED_MARKS_PER_FILE, MAX_ZONE_OPEN_FILES, SlotId, TrapFrame, ZoneTables,
-    fd_map_lookup,
+    DelegatedOpenFile, FdMapSlot, InotifyNameCache, MAX_DELEGATED_FILES, MAX_ZONE_OPEN_FILES,
+    SlotId, TrapFrame, ZoneTables, fd_map_lookup,
 };
 #[cfg(target_os = "none")]
 use carrick_el1_abi::{
@@ -2036,21 +2035,7 @@ where
     outcome.ok()
 }
 
-/// How the caller acquires the inotify instances that mark a file it is
-/// writing. EL1 never waits (a busy instance forwards the syscall); the host
-/// waits, because it has nowhere else to send the operation.
-pub trait InstanceLockPolicy {
-    fn acquire(&self, instance: &DelegatedInotify) -> bool;
-}
-
-/// EL1: take the instance lock only if it is free.
-pub struct TryInstanceLock;
-
-impl InstanceLockPolicy for TryInstanceLock {
-    fn acquire(&self, instance: &DelegatedInotify) -> bool {
-        instance.lock_guest_bounded(EL1_GUEST_LOCK_SPINS)
-    }
-}
+pub use file::{InstanceLockPolicy, TryInstanceLock};
 
 /// Serve one read, write, lseek, pread64 or pwrite64 on a delegated file whose
 /// object lock the caller holds, running the single implementation shared by
@@ -2072,91 +2057,44 @@ pub unsafe fn serve_locked_file_op(
     user: &mut impl file::UserCopy,
     locks: &impl InstanceLockPolicy,
 ) -> Result<i64, Action> {
-    let file = zone_file.inode;
-    // The data event this operation produces on a marking watch: IN_MODIFY
-    // for a write, IN_ACCESS for a read (inotify(7)), each only when bytes
-    // moved.
-    let event: u32 = match nr {
-        64 | 68 => 0x02, // LINUX_IN_MODIFY
-        63 | 67 => 0x01, // LINUX_IN_ACCESS
-        _ => 0,
+    let event = match nr {
+        64 | 68 => file::FileDataEvent::Modify,
+        63 | 67 => file::FileDataEvent::Access,
+        _ => file::FileDataEvent::None,
     };
-    let mut locked = [0u32; MAX_DELEGATED_MARKS_PER_FILE];
-    let mut num_locked = 0;
-    let mut lock_failed = false;
-    if event != 0 && file.has_marks() {
-        file.for_each_mark(|m| {
-            if lock_failed
-                || (m.mask & event) == 0
-                || m.inotify_handle == 0
-                || locked[..num_locked].contains(&m.inotify_handle)
-            {
-                return;
+    file::with_data_marks(
+        zone_file.inode,
+        inotify_table,
+        event,
+        locks,
+        Action::Forward,
+        |&moved| moved > 0,
+        // SAFETY: forwarded from the caller's contract.
+        || unsafe {
+            match nr {
+                62 => file::el1_lseek(zone_file, args[0] as i64, args[1] as u32),
+                63 => file::read_with(zone_file, cache_ptr, args[0], args[1] as usize, user),
+                64 => file::write_with(zone_file, cache_ptr, args[0], args[1] as usize, user),
+                67 => file::pread64_with(
+                    zone_file,
+                    cache_ptr,
+                    args[0],
+                    args[1] as usize,
+                    args[2] as i64,
+                    user,
+                ),
+                68 => file::pwrite64_with(
+                    zone_file,
+                    cache_ptr,
+                    args[0],
+                    args[1] as usize,
+                    args[2] as i64,
+                    user,
+                ),
+                _ => Err(Action::Forward),
             }
-            match inotify_table.get((m.inotify_handle - 1) as usize) {
-                Some(ino)
-                    if ino.state.load(Ordering::Acquire) == DELEGATED_STATE_GUEST
-                        && ino.spilled.load(Ordering::Acquire) == 0
-                        && locks.acquire(ino) =>
-                {
-                    locked[num_locked] = m.inotify_handle;
-                    num_locked += 1;
-                }
-                _ => lock_failed = true,
-            }
-        });
-    }
-    let release = |locked: &[u32]| {
-        for &h in locked {
-            if let Some(ino) = inotify_table.get((h - 1) as usize) {
-                ino.unlock();
-            }
-        }
-    };
-    if lock_failed {
-        release(&locked[..num_locked]);
-        return Err(Action::Forward);
-    }
-    // SAFETY: forwarded from the caller's contract.
-    let outcome = unsafe {
-        match nr {
-            62 => file::el1_lseek(zone_file, args[0] as i64, args[1] as u32),
-            63 => file::read_with(zone_file, cache_ptr, args[0], args[1] as usize, user),
-            64 => file::write_with(zone_file, cache_ptr, args[0], args[1] as usize, user),
-            67 => file::pread64_with(
-                zone_file,
-                cache_ptr,
-                args[0],
-                args[1] as usize,
-                args[2] as i64,
-                user,
-            ),
-            68 => file::pwrite64_with(
-                zone_file,
-                cache_ptr,
-                args[0],
-                args[1] as usize,
-                args[2] as i64,
-                user,
-            ),
-            _ => Err(Action::Forward),
-        }
-    };
-    if event != 0
-        && let Ok(moved) = outcome
-        && moved > 0
-    {
-        file.for_each_mark(|m| {
-            if (m.mask & event) != 0
-                && m.inotify_handle != 0
-                && let Some(ino) = inotify_table.get((m.inotify_handle - 1) as usize)
-            {
-                ino.push_record(m.wd, event, 0, None);
-            }
-        });
-    }
-    release(&locked[..num_locked]);
-    outcome
+        },
+    )
 }
 
 #[cfg(test)]

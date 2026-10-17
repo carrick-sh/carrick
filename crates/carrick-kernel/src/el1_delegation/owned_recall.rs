@@ -607,3 +607,6 @@ pub(super) fn observe_run_finished(request: &OwnedRecallRequest) -> std::sync::m
     ));
     rx
 }
+
+#[cfg(test)]
+mod zone_file_service_tests;

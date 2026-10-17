@@ -10,6 +10,22 @@ pub struct OpenReferenceKey {
     pub incarnation: u64,
 }
 
+/// Admission-issued witness that one open record was initialized in `OpenLifetime`.
+/// Callers cannot construct this type from raw `(handle, incarnation)` numbers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdmittedOpenReference(OpenReferenceKey);
+impl AdmittedOpenReference {
+    pub const fn key(self) -> OpenReferenceKey {
+        self.0
+    }
+    pub const fn handle(self) -> u32 {
+        self.0.handle
+    }
+    pub const fn incarnation(self) -> u64 {
+        self.0.incarnation
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OpenRelease {
     Live,
@@ -51,6 +67,21 @@ impl OpenLifetime {
                 Ordering::Acquire,
             )
             .is_ok()
+    }
+    /// Initialize an unpublished or retired record and issue its unforgeable
+    /// admission witness.
+    pub fn initialize_admitted(
+        &self,
+        handle: u32,
+        incarnation: u64,
+        host: bool,
+    ) -> Option<AdmittedOpenReference> {
+        (handle != 0 && self.initialize(incarnation, host)).then_some(AdmittedOpenReference(
+            OpenReferenceKey {
+                handle,
+                incarnation,
+            },
+        ))
     }
     /// # Safety
     /// Admission has published no root, fd view, or owned ring reference.
@@ -107,8 +138,18 @@ impl OpenLifetime {
         }
     }
     pub fn retain(&self, incarnation: u64) -> bool {
-        self.update(incarnation, |low| (low & COUNT < COUNT).then_some(low + 1))
-            == OpenRelease::Live
+        self.retain_observed(incarnation, |_| {})
+    }
+    pub fn retain_observed(
+        &self,
+        incarnation: u64,
+        observe: impl FnMut(OpenReferenceWork),
+    ) -> bool {
+        self.update_observed(
+            incarnation,
+            |low| (low & COUNT < COUNT).then_some(low + 1),
+            observe,
+        ) == OpenRelease::Live
     }
     pub fn release(&self, incarnation: u64) -> OpenRelease {
         self.release_observed(incarnation, |_| {})
