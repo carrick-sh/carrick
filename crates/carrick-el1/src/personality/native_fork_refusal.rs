@@ -14,6 +14,7 @@ pub enum NativeForkStage {
     Scratch,
     Prepare,
     Publish,
+    Reserve,
     Commit,
     Abort,
     OpenChildSpace,
@@ -25,6 +26,7 @@ pub enum NativeForkCause {
     Mm(MmError),
     Reservation(Refusal),
     Fork(ForkError),
+    StockReservation(carrick_el1_abi::ForkStockRefusal),
     StockCrossing {
         status: u64,
         reply: Option<carrick_el1_abi::ForkStockRefusal>,
@@ -51,6 +53,20 @@ impl From<ForkError> for NativeForkCause {
 pub struct NativeForkRefusal {
     pub stage: NativeForkStage,
     pub cause: NativeForkCause,
+}
+
+impl NativeForkRefusal {
+    pub fn error(self) -> super::native_process_runtime::NativeProcessError {
+        use super::native_process_runtime::NativeProcessError as E;
+        use carrick_el1_abi::ForkStockRefusal as R;
+        match self.cause {
+            NativeForkCause::StockReservation(R::Invalid) => E::Invalid,
+            NativeForkCause::StockReservation(R::Stale) => E::Stale,
+            NativeForkCause::StockReservation(R::Capacity) => E::Exhausted,
+            NativeForkCause::StockReservation(R::Inventory) => E::Busy,
+            _ => E::Fault,
+        }
+    }
 }
 
 pub fn refused(
@@ -116,5 +132,23 @@ mod tests {
         assert_eq!(error.errno(), -14);
         assert_ne!(error, refused(NativeForkStage::Prepare, ForkError::Core));
         assert_ne!(error, refused(NativeForkStage::Census, ForkError::Stale));
+    }
+
+    #[test]
+    fn reserve_diagnostics_preserve_each_stock_refusal_encoding() {
+        use carrick_el1_abi::ForkStockRefusal as R;
+        for (reply, error) in [
+            (R::Invalid, NativeProcessError::Invalid),
+            (R::Stale, NativeProcessError::Stale),
+            (R::Capacity, NativeProcessError::Exhausted),
+            (R::Inventory, NativeProcessError::Busy),
+        ] {
+            let diagnostic = refused(
+                NativeForkStage::Reserve,
+                NativeForkCause::StockReservation(reply),
+            );
+            assert_eq!(diagnostic.errno(), error.errno());
+            assert_eq!(diagnostic.run_failure_reason(), error.run_failure_reason());
+        }
     }
 }
