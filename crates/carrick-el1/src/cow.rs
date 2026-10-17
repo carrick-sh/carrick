@@ -232,6 +232,7 @@ impl carrick_core::mm::cow::OwnerCowMmu for X86CowMmu {
             Err(reason) => CowClassifyOutcome::Declined(match reason {
                 CowClass::Unmapped => carrick_el1_abi::CowDecline::Unmapped,
                 CowClass::NotCowArmed => carrick_el1_abi::CowDecline::NotCowArmed,
+                CowClass::AncestorNotWritable => carrick_el1_abi::CowDecline::NotEl1Private,
                 CowClass::NoWriteIntent => carrick_el1_abi::CowDecline::NoWriteIntent,
                 CowClass::ExecutableDenied => carrick_el1_abi::CowDecline::Executable,
                 CowClass::Unreachable => carrick_el1_abi::CowDecline::Unreachable,

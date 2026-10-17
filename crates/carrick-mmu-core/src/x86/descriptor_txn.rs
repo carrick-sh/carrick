@@ -1043,6 +1043,7 @@ pub enum CowClass {
     Unmapped,
     NotCowArmed,
     NoWriteIntent,
+    AncestorNotWritable,
     AlreadyWritable,
     ExecutableDenied,
     Unreachable,
@@ -1057,14 +1058,6 @@ pub struct CowRun {
     pub executable: bool,
 }
 
-impl CowRun {
-    #[inline]
-    #[must_use]
-    pub const fn user_va(&self) -> UserVa {
-        UserVa::new(self.va)
-    }
-}
-
 /// Classify one CPL3 COW write through the live PML4. The exact-MM editor
 /// remains held by the caller through the eventual copy and repoint.
 pub fn classify_guest_cow_write<W: LiveDescriptorWords + ?Sized>(
@@ -1075,11 +1068,11 @@ pub fn classify_guest_cow_write<W: LiveDescriptorWords + ?Sized>(
 ) -> Result<CowRun, CowClass> {
     let leaf =
         translate_leaf(words, root, far, Access::Read, true).map_err(|reason| match reason {
-            FaultClass::NotPresent => CowClass::Unmapped,
+            FaultClass::NotPresent | FaultClass::Protection => CowClass::Unmapped,
             _ => CowClass::Unreachable,
         })?;
     if !leaf.ancestors_writable {
-        return Err(CowClass::NoWriteIntent);
+        return Err(CowClass::AncestorNotWritable);
     }
     if leaf.descriptor & WRITE != 0 {
         return Err(CowClass::AlreadyWritable);
