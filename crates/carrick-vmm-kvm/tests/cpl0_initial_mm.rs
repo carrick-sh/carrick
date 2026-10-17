@@ -1248,18 +1248,16 @@ fn file_region_guest_fork_dup_and_child_retirement_preserve_parent() {
     run_to_marker(&mut parent, task, 2, &factory);
     factory
         .with_stopped_file_tables(|tables| {
-            // Returning to the real idle peer admits its bootstrap table (2),
-            // in addition to the parent's two references. Count it explicitly
-            // rather than treating the peer's stdout as a child lifetime leak.
-            let idle_stdout = fd_map_lookup(tables.fd_map(), 2, 1).expect("idle peer stdout");
-            assert_ne!(parent_table, 2);
+            // The parent owns its issued file table (2) before and after
+            // wait4; retiring the child table leaves only the parent's two
+            // references (stdout and dup(stdout)).
+            assert_eq!(parent_table, 2);
             assert_ne!(child_table, 2);
-            assert_eq!(idle_stdout.0, stdout);
             assert_eq!(
                 tables.opens()[stdout as usize - 1]
                     .lifetime
                     .ring_references(incarnation),
-                Some(3)
+                Some(2)
             );
             assert_eq!(
                 tables.fd_map()[child_slot]

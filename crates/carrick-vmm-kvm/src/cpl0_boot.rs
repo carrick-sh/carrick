@@ -3777,6 +3777,7 @@ impl Cpl0Carrier {
                 mm: carrick_el1_abi::EntryMmKey::from_raw(mm.raw()),
                 thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(serial),
             },
+            file_table,
         )?;
         self.task(0).publish_visible_pid(tid as u32);
         zone.current_or_new(
@@ -5235,11 +5236,13 @@ impl Cpl0Carrier {
         &mut self,
         index: usize,
         binding: carrick_el1_abi::ExecutionBinding,
+        file_table: u64,
     ) -> Result<(), TrapError> {
         if index >= 2
             || !binding.issued()
             || binding.mm.raw() == 0
             || binding.thread_generation.raw() == 0
+            || file_table == 0
         {
             return Err(fail("invalid CPL0 fixture execution binding"));
         }
@@ -5267,7 +5270,11 @@ impl Cpl0Carrier {
             return Err(fail("fixture visible task publication"));
         }
         let task = self.task(index);
-        task.set(El1TaskId::from_linux_tid(tid), binding.generation.raw(), 5);
+        task.set(
+            El1TaskId::from_linux_tid(tid),
+            binding.generation.raw(),
+            file_table,
+        );
         task.mm.key.store(binding.mm.raw(), Ordering::Release);
         task.mm
             .thread_generation
@@ -6509,7 +6516,7 @@ impl Cpl0Carrier {
                     101 + index as u64,
                 ),
             };
-            carrier.bind_execution(index, binding)?;
+            carrier.bind_execution(index, binding, 5)?;
             let root = if index == 0 {
                 LAYOUT.pml4_base
             } else {
