@@ -423,7 +423,7 @@ impl TerminalNotification {
             self.mm.raw(),
             self.address.get(),
             u32::MAX,
-            1,
+            u32::MAX,
             carrick_sched_core::Waker::El1 { slot },
             &mut [],
             &mut effects,

@@ -11,6 +11,16 @@ pub trait LifecycleVenue {
     fn thread<'a>(&'a self, task: &'a CurrentTask) -> Option<LifecycleThread<'a>>;
     /// The control slot a thread born into `entry` of `page` will own.
     fn born_slot(&self, page: &ThreadLifecyclePage, entry: EntryRef) -> Option<&ThreadControlSlot>;
+    /// Wake a closing wait channel that had no placeable EL1 slot.
+    fn wake_unplaceable_wait(
+        &self,
+        channel: super::native_process_runtime::ProcessWaitChannel,
+        slot: carrick_el1_abi::SlotId,
+    ) -> Result<(), super::native_process_runtime::NativeProcessError> {
+        use super::aarch64_process::ForkStockCrossing;
+        super::aarch64_process::HvcForkStockCrossing
+            .cross_wait_channel_wake(channel, u64::from(slot.raw()))
+    }
 }
 
 /// Production venue: addresses are guest-kernel-only retained metadata,

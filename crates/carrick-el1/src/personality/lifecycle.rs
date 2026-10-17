@@ -15,17 +15,20 @@ pub use carrick_personality_linux::lifecycle::*;
 pub use carrick_personality_linux::thread::{LifecycleThread, SYS_SET_ROBUST_LIST};
 
 #[cfg(test)]
-type RawExitBeforeCommitHook = Option<(usize, std::boxed::Box<dyn FnOnce() + Send>)>;
+type RawExitBeforeCommitHook = std::vec::Vec<(usize, std::boxed::Box<dyn FnOnce() + Send>)>;
 #[cfg(test)]
 static RAW_EXIT_BEFORE_COMMIT_HOOK: crate::lock::SpinLock<RawExitBeforeCommitHook> =
-    crate::lock::SpinLock::new(None);
+    crate::lock::SpinLock::new(std::vec::Vec::new());
 
 #[cfg(test)]
 pub(super) fn install_raw_exit_before_commit_hook(
     page: &ThreadLifecyclePage,
     hook: std::boxed::Box<dyn FnOnce() + Send>,
 ) {
-    *RAW_EXIT_BEFORE_COMMIT_HOOK.lock() = Some((page as *const _ as usize, hook));
+    let page_address = page as *const _ as usize;
+    let mut hooks = RAW_EXIT_BEFORE_COMMIT_HOOK.lock();
+    hooks.retain(|(existing, _)| *existing != page_address);
+    hooks.push((page_address, hook));
 }
 
 impl<
@@ -188,28 +191,25 @@ impl<
             let Some(slot) = self.frame.slot() else {
                 self.fail_lifecycle(carrick_core_abi::NativeRunFailureReason::BirthSettlement);
             };
-            match notification.publish(zone.tables, slot, &carrick_sched_core::ShortLockSpin) {
-                Ok(effects) => {
-                    crate::sched::object_wait::deliver_wake_effects(zone.tables, slot, effects)
-                }
-                Err(carrick_sched_core::WakeRefusal::Unplaceable) => {
-                    use super::aarch64_process::ForkStockCrossing;
-                    let channel = super::native_process_runtime::ProcessWaitChannel {
-                        mm: notification.mm,
-                        address: notification.address,
-                    };
-                    if super::aarch64_process::HvcForkStockCrossing
-                        .cross_wait_channel_wake(channel, u64::from(slot.raw()))
-                        .is_err()
-                    {
-                        self.fail_lifecycle(
-                            carrick_core_abi::NativeRunFailureReason::BirthSettlement,
-                        );
+            let lifecycle = self.lifecycle;
+            if super::native_process_runtime::publish_terminal_notification(
+                &notification,
+                zone.tables,
+                slot,
+                &carrick_sched_core::ShortLockSpin,
+                |channel| {
+                    if let Some(venue) = lifecycle {
+                        venue.wake_unplaceable_wait(channel, slot)
+                    } else {
+                        use super::aarch64_process::ForkStockCrossing;
+                        super::aarch64_process::HvcForkStockCrossing
+                            .cross_wait_channel_wake(channel, u64::from(slot.raw()))
                     }
-                }
-                Err(_) => {
-                    self.fail_lifecycle(carrick_core_abi::NativeRunFailureReason::BirthSettlement)
-                }
+                },
+            )
+            .is_err()
+            {
+                self.fail_lifecycle(carrick_core_abi::NativeRunFailureReason::BirthSettlement);
             }
         }
     }
@@ -435,12 +435,11 @@ impl<
                     .lifecycle_page
                     .load(core::sync::atomic::Ordering::Acquire) as usize;
             let hook = {
-                let mut slot = RAW_EXIT_BEFORE_COMMIT_HOOK.lock();
-                if slot.as_ref().is_some_and(|(page, _)| *page == page_address) {
-                    slot.take().map(|(_, hook)| hook)
-                } else {
-                    None
-                }
+                let mut hooks = RAW_EXIT_BEFORE_COMMIT_HOOK.lock();
+                hooks
+                    .iter()
+                    .position(|(page, _)| *page == page_address)
+                    .map(|index| hooks.swap_remove(index).1)
             };
             if let Some(hook) = hook {
                 hook();
