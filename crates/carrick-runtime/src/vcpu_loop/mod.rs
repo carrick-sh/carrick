@@ -1021,6 +1021,28 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     pub(super) _engine: std::marker::PhantomData<fn() -> E>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeReturnCheckpoint {
+    Direct,
+    Signal { restart_eligible: bool },
+}
+
+fn native_return_checkpoint(
+    native_signal_owner: bool,
+    ingress: signal_ingress_producer::HostIngressStep,
+    restart_eligible: Option<bool>,
+) -> NativeReturnCheckpoint {
+    if native_signal_owner
+        && (restart_eligible.is_some() || ingress != signal_ingress_producer::HostIngressStep::Idle)
+    {
+        NativeReturnCheckpoint::Signal {
+            restart_eligible: restart_eligible.unwrap_or(true),
+        }
+    } else {
+        NativeReturnCheckpoint::Direct
+    }
+}
+
 /// The host wait's mask was temporary, but native delivery owns the handler
 /// and sigreturn. Carry the saved persistent mask into that one checkpoint.
 fn arm_native_forwarded_wait_mask(
@@ -1108,13 +1130,16 @@ where
         }
     }
 
-    fn publish_external_ingress(&mut self, kernel: &KernelState) -> Result<(), RuntimeError> {
+    fn publish_external_ingress(
+        &mut self,
+        kernel: &KernelState,
+    ) -> Result<signal_ingress_producer::HostIngressStep, RuntimeError> {
         let target = self
             .service_kernel_context
             .as_ref()
             .and_then(signal_ingress_producer::HostIngressTarget::from_context);
         if target.is_none() && self.external_signals.pending_event().is_none() {
-            return Ok(());
+            return Ok(signal_ingress_producer::HostIngressStep::Idle);
         }
         let queue = carrick_el1_abi::signal_ingress_host().ok_or_else(|| {
             RuntimeError::Configuration("native signal ingress has no shared reservation".into())
@@ -1123,8 +1148,7 @@ where
             .publish(queue, target, |tid| {
                 kernel.dispatcher.host_signal.take_pending_event_for(tid)
             })
-            .map_err(|error| RuntimeError::Configuration(format!("external ingress: {error:?}")))?;
-        Ok(())
+            .map_err(|error| RuntimeError::Configuration(format!("external ingress: {error:?}")))
     }
 
     #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
@@ -2340,20 +2364,26 @@ where
                 "threaded syscall completed without guest completion ownership".to_owned(),
             ));
         }
-        if self.service_kernel_context.as_ref().is_some_and(|context| {
+        let native_signal_owner = self.service_kernel_context.as_ref().is_some_and(|context| {
             context.thread().control_slot().native_signal_owner()
                 && carrick_el1_abi::Lifecycle::gate(&*context.lifecycle_page()).serves_ring()
-        }) {
+        });
+        let ingress = if native_signal_owner {
             // A synchronous host wait can observe the bridge after the poll
             // boundary. Publish its event before the native return checkpoint.
-            self.publish_external_ingress(kernel)?;
-            engine.complete_native_signal_return(
-                value,
-                self.native_restart_eligible.take().unwrap_or(true),
-            )?;
+            self.publish_external_ingress(kernel)?
         } else {
-            self.native_restart_eligible = None;
-            engine.complete_syscall(value)?;
+            signal_ingress_producer::HostIngressStep::Idle
+        };
+        match native_return_checkpoint(
+            native_signal_owner,
+            ingress,
+            self.native_restart_eligible.take(),
+        ) {
+            NativeReturnCheckpoint::Direct => engine.complete_syscall(value)?,
+            NativeReturnCheckpoint::Signal { restart_eligible } => {
+                engine.complete_native_signal_return(value, restart_eligible)?;
+            }
         }
         let SyscallCompletionOwnership::Guest(completion) = std::mem::replace(
             &mut self.syscall_completion,
@@ -2618,6 +2648,37 @@ pub(crate) mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use carrick_guest_mem::GuestMemory;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn empty_native_forwarded_return_has_one_direct_completion() {
+        assert_eq!(
+            native_return_checkpoint(true, signal_ingress_producer::HostIngressStep::Idle, None,),
+            NativeReturnCheckpoint::Direct,
+            "a signal-free forwarded return must not arm another EL1 checkpoint or kick"
+        );
+        assert_eq!(
+            native_return_checkpoint(
+                true,
+                signal_ingress_producer::HostIngressStep::Idle,
+                Some(false),
+            ),
+            NativeReturnCheckpoint::Signal {
+                restart_eligible: false,
+            },
+            "a signal-interrupted continuation retains its native checkpoint"
+        );
+        assert_eq!(
+            native_return_checkpoint(
+                true,
+                signal_ingress_producer::HostIngressStep::Published,
+                None,
+            ),
+            NativeReturnCheckpoint::Signal {
+                restart_eligible: true,
+            },
+            "new ingress published at completion retains its native checkpoint"
+        );
+    }
 
     struct ContinueInterceptor;
 
