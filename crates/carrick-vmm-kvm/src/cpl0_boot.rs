@@ -1089,6 +1089,26 @@ struct ForwardExecution {
     context: AddressContext<RootGpa>,
 }
 
+impl ForwardExecution {
+    /// Authenticate the CR3-registered carrier binding against the execution
+    /// the stopped CPU's own lifecycle record names: the address context and
+    /// the execution generation must be the same issue. The record's task key
+    /// is the guest tid, a different domain from the binding's host task
+    /// serial, so the generation is the comparable identity.
+    fn authenticate(
+        &self,
+        binding: carrick_hal::guest_arch_binding::GuestArchBinding,
+        refusal: &str,
+    ) -> Result<(), TrapError> {
+        if binding.context() != self.context
+            || binding.task().execution.raw().get() != self.binding.generation.raw()
+        {
+            return Err(fail(refusal));
+        }
+        Ok(())
+    }
+}
+
 fn admit_forward_execution(
     cpu: carrick_guest_arch::CpuId,
     binding_cpu: carrick_guest_arch::CpuId,
@@ -1207,6 +1227,63 @@ mod forward_execution_tests {
         assert_eq!(admitted.cpu.raw(), 1);
         assert_eq!(admitted.binding, binding);
         assert_eq!(admitted.context, context);
+    }
+
+    fn carrier_binding(
+        context: AddressContext<RootGpa>,
+        execution: u64,
+    ) -> carrick_hal::guest_arch_binding::GuestArchBinding {
+        carrick_hal::guest_arch_binding::GuestArchBinding::x86(
+            carrick_guest_arch::TaskIdentity {
+                carrier: carrick_guest_arch::CarrierGeneration::new(
+                    NonZeroU64::new(5).expect("carrier"),
+                ),
+                task: carrick_guest_arch::TaskSerial::new(NonZeroU64::new(77).expect("serial")),
+                execution: carrick_guest_arch::ExecutionGeneration::new(
+                    NonZeroU64::new(execution).expect("execution"),
+                ),
+            },
+            context,
+        )
+    }
+
+    /// Every forward phase (idle-peer identity, capture, completion) admits a
+    /// CR3-registered binding through this one comparison; a binding whose
+    /// address context or execution generation names another issue of the
+    /// task must not be served as the stopped execution.
+    #[test]
+    fn forward_binding_authentication_requires_exact_context_and_generation() {
+        let (binding, context) = execution();
+        let cpu = carrick_guest_arch::CpuId::new(1);
+        let admitted =
+            admit_forward_execution(cpu, cpu, binding, context, context.root, context.generation)
+                .expect("exact lane1 owner");
+        admitted
+            .authenticate(carrier_binding(context, 12), "exact")
+            .expect("exact binding");
+        assert!(
+            admitted
+                .authenticate(carrier_binding(context, 13), "stale generation")
+                .is_err()
+        );
+        let other_root = AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(0x6000)).expect("aligned root"),
+            ..context
+        };
+        assert!(
+            admitted
+                .authenticate(carrier_binding(other_root, 12), "other root")
+                .is_err()
+        );
+        let other_incarnation = AddressContext {
+            generation: ContextGeneration::new(NonZeroU64::new(8).expect("incarnation")),
+            ..context
+        };
+        assert!(
+            admitted
+                .authenticate(carrier_binding(other_incarnation, 12), "other incarnation")
+                .is_err()
+        );
     }
 }
 
@@ -1414,11 +1491,7 @@ impl ProductionCpuLease {
         })?;
         drop(custody);
         let binding = self.cpu.registered_task_binding(execution.context.root)?;
-        if binding.context() != execution.context
-            || binding.task().execution.raw().get() != execution.binding.generation.raw()
-        {
-            return Err(fail("idle peer forward binding mismatch"));
-        }
+        execution.authenticate(binding, "idle peer forward binding mismatch")?;
         Ok(binding.task())
     }
 
@@ -1609,7 +1682,7 @@ impl ProductionCpuLease {
             self.cpu.unregister_child_binding(live_root)?;
             retire_result?;
         }
-        if let Some(PhysicalProcessExit::RunFailed(_)) = exit {
+        if let Some(PhysicalProcessExit::Exited(_) | PhysicalProcessExit::RunFailed(_)) = exit {
             self.cpu.clear_child_bindings()?;
         }
         drop(custody);
@@ -1659,16 +1732,18 @@ impl ProductionCpuLease {
             let frame = unsafe { *ptr };
             let mut venue = ForwardVenue::new(&mut custody, StoppedCpuLease { cpu: slot, vcpu })?;
             let execution = venue.execution;
-            if active_binding.context() != execution.context
-                || active_binding.task().execution.raw().get() != execution.binding.generation.raw()
-            {
-                return Err(fail("forward capture MM binding mismatch"));
-            }
+            execution.authenticate(active_binding, "forward capture MM binding mismatch")?;
             let result = forward(&mut venue, &frame)?;
             custody.host_forwards = custody
                 .host_forwards
                 .checked_add(1)
                 .ok_or_else(|| fail("host forward counter exhausted"))?;
+            if slot == carrick_guest_arch::CpuId::new(1) {
+                custody.idle_peer_forwards = custody
+                    .idle_peer_forwards
+                    .checked_add(1)
+                    .ok_or_else(|| fail("idle peer forward counter exhausted"))?;
+            }
             Ok((
                 result,
                 ProductionForwardFrame {
@@ -1703,11 +1778,10 @@ impl ProductionCpuLease {
             let current = ForwardVenue::new(&mut custody, lease)?.execution;
             if current.binding != token.execution.binding
                 || current.context != token.execution.context
-                || active_binding.context() != current.context
-                || active_binding.task().execution.raw().get() != current.binding.generation.raw()
             {
                 return Err(fail("forward completion MM binding changed"));
             }
+            current.authenticate(active_binding, "forward completion MM binding changed")?;
             let stack_end = checked_stack_end(custody.binding(token.slot).kernel_stack)
                 .ok_or_else(|| fail("forward completion kernel stack overflow"))?;
             let gpa =
@@ -1846,7 +1920,7 @@ impl ProductionCpuLease {
             self.cpu.unregister_child_binding(live_root)?;
             retire_result?;
         }
-        if let Some(PhysicalProcessExit::RunFailed(_)) = exit {
+        if let Some(PhysicalProcessExit::Exited(_) | PhysicalProcessExit::RunFailed(_)) = exit {
             self.cpu.clear_child_bindings()?;
         }
         drop(custody);
@@ -2278,6 +2352,15 @@ impl ProductionCpuFactory {
         ))
     }
 
+    /// Host forwards served for a task stopped on the idle peer (CPU 1).
+    pub fn idle_peer_forward_witness(&self) -> Result<u64, TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        Ok(custody.idle_peer_forwards)
+    }
+
     pub fn anonymous_private_pages(&self) -> Result<u64, TrapError> {
         let custody = self
             .custody
@@ -2493,6 +2576,9 @@ pub(crate) struct Cpl0HostCustody {
     run_failure_crossings: u64,
     metadata_base: RetainedMetadataPtr,
     host_forwards: u64,
+    /// Host forwards captured from a task stopped on the idle peer (CPU 1),
+    /// so a fixture can prove where EL1 placed the forwarding task.
+    idle_peer_forwards: u64,
     host_yields: u64,
     kicks: u64,
     work_exits: u64,
@@ -4723,6 +4809,7 @@ impl Cpl0Carrier {
                 run_failure_crossings: 0,
                 metadata_base,
                 host_forwards: 0,
+                idle_peer_forwards: 0,
                 host_yields: 0,
                 kicks: 0,
                 work_exits: 0,

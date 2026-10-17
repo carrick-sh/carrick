@@ -1299,11 +1299,143 @@ fn file_region_guest_fork_dup_and_child_retirement_preserve_parent() {
         .expect("parent survives child file-table retirement");
 }
 
+/// #143: the forked child's SyscallTrap stops the idle peer (CPU 1) and is
+/// handed back to the host. Root affinity 2 makes EL1 queue the inherited
+/// child only on CPU 1, so the idle-peer lane, not a timing race, serves it.
 #[test]
 fn idle_peer_syscall_trap_hands_task_back_to_host_and_delivers_stdout() {
-    let elf = native_exit_fixture("../../../carrick-cli/tests/fixtures/x86_child_last_writer.S");
-    let outcome = run_pool_fixture(&elf, 32);
+    let elf = native_exit_fixture("../../../carrick-cli/tests/fixtures/x86_forked_child_stdout.S");
+    let outcome = kvm_pool_fixture::try_run_pool_fixture_with_root_affinity(
+        &elf,
+        32,
+        kvm_pool_fixture::ROOT_AFFINITY_IDLE_PEER,
+    )
+    .expect("idle peer handback run");
     assert_eq!(outcome.run.exit_code, 7);
-    assert_eq!(outcome.run.stdout, b"E\n");
+    assert_eq!(outcome.run.stdout, b"E");
     assert!(outcome.run.stderr.is_empty());
+    assert!(
+        outcome
+            .physical
+            .idle_peer_forward_witness()
+            .expect("idle peer forward witness")
+            >= 1,
+        "the child's write must be served from the idle peer"
+    );
+}
+
+/// Ruling 3 on #542: every idle-lane early return completes the run. With a
+/// three-exit budget the idle peer exhausts it while servicing the child's
+/// forward; before the single `settle_lane` path that early return skipped
+/// the `Err` completion and the run hung, and before the shutdown kick the
+/// root vCPU stayed in `KVM_RUN` under the halted parent.
+#[test]
+fn idle_lane_exit_budget_failure_completes_the_run() {
+    let elf = native_exit_fixture("../../../carrick-cli/tests/fixtures/x86_forked_child_stdout.S");
+    match kvm_pool_fixture::try_run_pool_fixture_with_root_affinity(
+        &elf,
+        3,
+        kvm_pool_fixture::ROOT_AFFINITY_IDLE_PEER,
+    ) {
+        Ok(outcome) => panic!(
+            "a three-exit budget cannot finish the forked run, got exit {}",
+            outcome.run.exit_code
+        ),
+        Err(error) => assert!(
+            error.to_string().contains("KVM guest exit budget exceeded"),
+            "expected the exit budget failure, got {error}"
+        ),
+    }
+}
+
+fn forward_authority_fixture(variant: &str) -> Vec<u8> {
+    native_exit_fixture_with_flags(
+        "../../../carrick-cli/tests/fixtures/x86_forked_child_forward_authority.S",
+        &[&format!("-D{variant}")],
+    )
+}
+
+/// Ruling 2 on #542: a forked child's forward never borrows the root's host
+/// `KernelContext`. The child's `read(0)` needs a host task context the
+/// child does not own, so the run is refused, typed and counted, before any
+/// forward token is taken. Before the ruling the root's context served it
+/// and the run exited 7.
+#[test]
+fn in_zone_child_host_read_is_refused_not_served_under_root_context() {
+    let elf = forward_authority_fixture("CHILD_STDIN_READ");
+    let error = match kvm_pool_fixture::try_run_pool_fixture_with_root_affinity(
+        &elf,
+        64,
+        kvm_pool_fixture::ROOT_AFFINITY_IDLE_PEER,
+    ) {
+        Ok(outcome) => panic!(
+            "the child's read was served under another task's authority: exit {}",
+            outcome.run.exit_code
+        ),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        error.contains("x86 syscall 0 from an in-zone child needs a host task context")
+            && error.contains("\"authority_host_task_context\": 1"),
+        "{error}"
+    );
+}
+
+/// Ruling 2 on #542: a child's blocking wait never parks on another task's
+/// lease. The child's `ppoll` on never-readable stdout must wait 50 ms; with
+/// no lease of its own the run is refused before any forward token is taken.
+/// Before the ruling the idle lane failed only after taking the token.
+#[test]
+fn in_zone_child_blocking_wait_is_refused_before_any_token() {
+    let elf = forward_authority_fixture("CHILD_POLL_WAIT");
+    let error = match kvm_pool_fixture::try_run_pool_fixture_with_root_affinity(
+        &elf,
+        64,
+        kvm_pool_fixture::ROOT_AFFINITY_IDLE_PEER,
+    ) {
+        Ok(outcome) => panic!(
+            "the child's wait parked on another task's lease: exit {}",
+            outcome.run.exit_code
+        ),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        error.contains("a blocking wait needs the stopped task's own execution lease")
+            && error.contains("\"authority_blocking_wait\": 1"),
+        "{error}"
+    );
+}
+
+/// Ruling 2 on #542: only the root's exit publishes the run's exit. The
+/// child's `exit_group(3)` is reaped by the waiting parent as status 3<<8 and
+/// the run exits with the parent's 7.
+#[test]
+fn in_zone_child_exit_is_reaped_by_parent_not_published_as_run_exit() {
+    let elf = forward_authority_fixture("CHILD_EXIT_STATUS");
+    let outcome = kvm_pool_fixture::try_run_pool_fixture_with_root_affinity(
+        &elf,
+        64,
+        kvm_pool_fixture::ROOT_AFFINITY_IDLE_PEER,
+    )
+    .expect("child exit run");
+    assert_eq!(outcome.run.exit_code, 7);
+    assert!(outcome.run.stdout.is_empty());
+}
+
+/// Ruling 2 on #542 (director correction): a child's write to fd 1 is not
+/// assumed to be host stdout. After `dup2(2, 1)` in the child, fd 1 resolves
+/// through the child's own table to the stderr binding, so "P" reaches stderr
+/// and stdout stays empty.
+#[test]
+fn in_zone_child_stdout_write_resolves_through_childs_own_table() {
+    let elf = forward_authority_fixture("CHILD_STDOUT_REDIRECT");
+    let outcome = kvm_pool_fixture::try_run_pool_fixture_with_root_affinity(
+        &elf,
+        64,
+        kvm_pool_fixture::ROOT_AFFINITY_IDLE_PEER,
+    )
+    .expect("child redirect run");
+    assert_eq!(outcome.run.exit_code, 7);
+    assert!(outcome.run.stdout.is_empty(), "{:?}", outcome.run.stdout);
+    assert_eq!(outcome.run.stderr, b"P");
 }
