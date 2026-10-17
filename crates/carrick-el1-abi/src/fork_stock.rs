@@ -542,15 +542,6 @@ pub struct ForkStockSettlement {
 }
 
 impl ForkStockSettlement {
-    pub fn new(
-        loan: ForkStockLoan,
-        completion: crate::PortalForkCompletion,
-        custody: KernelVa,
-        count: u64,
-    ) -> Option<Self> {
-        Self::with_child_identity(loan, completion, custody, count, 0, 0)
-    }
-
     pub fn reserve(
         loan: ForkStockLoan,
         completion: crate::PortalForkCompletion,
@@ -581,30 +572,12 @@ impl ForkStockSettlement {
         child_task: u64,
         child_execution: u64,
     ) -> Option<Self> {
-        Self::with_child_identity(
-            loan,
-            completion,
-            KernelVa::new(0),
-            0,
-            child_task,
-            child_execution,
-        )
-    }
-
-    pub fn with_child_identity(
-        loan: ForkStockLoan,
-        completion: crate::PortalForkCompletion,
-        custody: KernelVa,
-        count: u64,
-        child_task: u64,
-        child_execution: u64,
-    ) -> Option<Self> {
         Self::with_kind(
             ForkStockKind::Commit,
             loan,
             completion,
-            custody,
-            count,
+            KernelVa::new(0),
+            0,
             child_task,
             child_execution,
         )
@@ -964,9 +937,7 @@ mod tests {
             child_tables_used: 4096,
             parent_tables_used: 0,
         };
-        let mut record =
-            ForkStockSettlement::new(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 1)
-                .unwrap();
+        let mut record = ForkStockSettlement::commit_reserved(loan, completion).unwrap();
         let foreign = ForkStockLoan {
             id: NonZeroU64::new(2).unwrap(),
             ..loan
@@ -1305,7 +1276,7 @@ mod tests {
             parent_tables_used: 4096,
         };
         let settlement =
-            ForkStockSettlement::new(loan, completion, KernelVa::new(0xffff_8000), 2).unwrap();
+            ForkStockSettlement::reserve(loan, completion, KernelVa::new(0xffff_8000), 2).unwrap();
         let s_bytes = unsafe {
             core::slice::from_raw_parts(
                 (&raw const settlement).cast::<u8>(),
@@ -1314,7 +1285,7 @@ mod tests {
         };
         assert_eq!(
             u64::from_ne_bytes(s_bytes[0..8].try_into().unwrap()),
-            ForkStockKind::Commit.word()
+            ForkStockKind::Reserve.word()
         );
         assert_eq!(
             u64::from_ne_bytes(s_bytes[8..16].try_into().unwrap()),
