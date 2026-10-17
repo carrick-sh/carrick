@@ -7222,7 +7222,8 @@ mod cpl0_layout_tests {
         let image = carrick_mem::x86_initial_image::prepare_x86_elf(&program).unwrap();
         let initial_break = image.regions.iter().map(|region| region.end).max().unwrap();
         assert_eq!(initial_break, 0x88_0013_1000);
-        assert!(initial_break > 0x4000_0000 && initial_break > INITIAL_STACK_TOP);
+        assert!(initial_break > 0x4000_0000);
+        assert!(initial_break > INITIAL_STACK_TOP);
         let layout = initial_reservation_layout(
             UserVa::new(initial_break),
             UserVa::new(INITIAL_STACK_TOP),
@@ -7361,11 +7362,11 @@ mod cpl0_layout_tests {
         assert!(LAYOUT.pml4_base.is_multiple_of(4096));
 
         // Strict non-overlap: image ends at or before fixture process tables (0x30_0000)
-        assert!(IMAGE_GPA + IMAGE_SIZE <= 0x30_0000);
+        const { assert!(IMAGE_GPA + IMAGE_SIZE <= 0x30_0000) };
         // Image exclusive end <= GDT base
-        assert!(IMAGE_GPA + IMAGE_SIZE <= LAYOUT.gdt_base);
+        const { assert!(IMAGE_GPA + IMAGE_SIZE <= LAYOUT.gdt_base) };
         // Ordering: GDT base < PML4 base < fault structures < metadata
-        assert!(LAYOUT.gdt_base < LAYOUT.pml4_base);
+        const { assert!(LAYOUT.gdt_base < LAYOUT.pml4_base) };
         assert!(LAYOUT.pml4_base + carrick_x86::X86_PML4_CAPACITY as u64 <= META_GPA);
 
         let stub_start = carrick_x86::fault_stub_base(LAYOUT);
