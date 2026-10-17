@@ -12,7 +12,7 @@ pub const STUB_SIZE: u64 = 0x4000;
 /// with no observer, seccomp, trap budget, or pending mandatory boundary.
 pub const CLOCK_GATE_OFFSET: u64 = 16;
 const ACTIVE: u16 = AARCH64_SYSCALL_MAILBOX_CLOCK_ACTIVE as u16;
-const ENTRY: usize = 0xC00;
+const ENTRY: usize = MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE;
 const TMP16: u64 = mailbox_offset(core::mem::offset_of!(Aarch64SyscallMailbox, clock_tmp_x16));
 const TMP17: u64 = mailbox_offset(core::mem::offset_of!(Aarch64SyscallMailbox, clock_tmp_x17));
 const MARKER: u16 = 0xC10C;
@@ -74,6 +74,12 @@ struct Code<'a> {
 }
 impl Code<'_> {
     fn emit(&mut self, op: u32) {
+        assert_eq!(
+            &self.bytes[self.pc..self.pc + 4],
+            &AARCH64_NOP_OPCODE.to_le_bytes(),
+            "the clock handler overlaps emitted vector code at {:#x}",
+            self.pc
+        );
         self.bytes[self.pc..self.pc + 4].copy_from_slice(&op.to_le_bytes());
         self.pc += 4;
     }
@@ -223,7 +229,7 @@ pub(super) fn install(bytes: &mut [u8], dispatch: usize) -> ClockHandlerLayout {
     c.restore_frame();
     c.restore_regs(false);
     c.emit(enc_b(c.pc as u64, MAILBOX_HANDLER_OFFSET as u64));
-    assert!(c.pc <= LINUX_EL1_VECTORS_SIZE as usize);
+    assert!(c.pc <= EL1_VECTOR_HOOK_OFFSET);
     ClockHandlerLayout {
         start: LINUX_EL1_VECTORS_BASE + ENTRY as u64,
         completion: LINUX_EL1_VECTORS_BASE + completion as u64,
