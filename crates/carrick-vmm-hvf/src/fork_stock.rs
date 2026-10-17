@@ -511,6 +511,15 @@ mod tests {
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn native_stock_reserve_refuses_retiring_stage2_record_and_rolls_back_earlier_pin() {
+        native_stock_retirement_race(false);
+    }
+
+    #[test]
+    fn native_stock_reserve_accepts_custody_in_dynamic_metadata() {
+        native_stock_retirement_race(true);
+    }
+
+    fn native_stock_retirement_race(dynamic_custody: bool) {
         let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let custody = std::sync::Arc::new(CarrierVmCustody::new());
         let generation = custody.begin_create().unwrap();
@@ -655,7 +664,17 @@ mod tests {
         );
 
         let custody_offset = carrick_el1_abi::EL1_BOOTSTRAP_METADATA_OFFSET as usize;
-        let custody_va = KernelVa::new(carrick_el1_abi::EL1_REGION_BASE + custody_offset as u64);
+        let (custody_va, custody_ptr) = if dynamic_custody {
+            (
+                KernelVa::new(carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE + 0x8000),
+                unsafe { physical_ptr.add(0x18000) },
+            )
+        } else {
+            (
+                KernelVa::new(carrick_el1_abi::EL1_REGION_BASE + custody_offset as u64),
+                unsafe { region_ptr.add(custody_offset) },
+            )
+        };
         let rows = [
             carrick_el1_abi::PortalForkCustody::Frame {
                 va: 0x40_0000,
@@ -672,12 +691,9 @@ mod tests {
             }
             .words(),
         ];
-        // SAFETY: aligned 2-row custody array in retained bootstrap metadata.
+        // SAFETY: aligned two-row array in the selected retained metadata grant.
         unsafe {
-            region_ptr
-                .add(custody_offset)
-                .cast::<[[u64; 4]; 2]>()
-                .write(rows);
+            custody_ptr.cast::<[[u64; 4]; 2]>().write(rows);
         }
 
         let completion_for =

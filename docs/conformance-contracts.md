@@ -466,6 +466,13 @@ Commit refusal, failed crossing, or missing acknowledgment; these are invariant
 faults after publication, not successful forks. These host witnesses do not
 replace signed guest or KVM acceptance.
 
+Custody arrays may be allocated in either the fixed EL1 bootstrap/heap region
+or a retained dynamic metadata grant. The dynamic path shares the lifecycle
+record venue, rather than imposing a fixed-region-only allocation limit.
+`native_stock_reserve_accepts_custody_in_dynamic_metadata` drives the production
+stock service with its four-word custody array in a dynamic grant, including
+retirement refusal, rollback and successful subsequent Reserve/Commit.
+
 Owner-selected fork leaves retain the parent's exact physical inventory extent
 once per extent, independent of the selected leaf count. A 4 KiB semantic leaf
 must not shrink a 16 KiB compound's custody to 4 KiB: child bootstrap COW and
