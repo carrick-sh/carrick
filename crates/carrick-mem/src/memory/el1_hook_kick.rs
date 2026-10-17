@@ -116,6 +116,8 @@ struct Machine {
     irq_frames: usize,
     /// The EL1 image saw an owner-routed instruction or data abort.
     fault_frames: usize,
+    /// The EL1 image ran the generated forwarded-return signal checkpoint.
+    signal_frames: usize,
 }
 
 impl Machine {
@@ -156,6 +158,7 @@ impl Machine {
             kick_acknowledged: false,
             irq_frames: 0,
             fault_frames: 0,
+            signal_frames: 0,
         }
     }
 
@@ -180,6 +183,7 @@ impl Machine {
             kick_acknowledged: false,
             irq_frames: 0,
             fault_frames: 0,
+            signal_frames: 0,
         }
     }
 
@@ -191,6 +195,44 @@ impl Machine {
             spsr: EL0_DAIF_MASKED & !PSTATE_I,
             ..Self::syscall(El1IrqMode::Gic)
         }
+    }
+
+    /// Enter the production mailbox at its native forwarded-return target.
+    fn native_signal_return(response_action: u64, image: Image) -> Self {
+        let mut m = Self::full_vector_page(El1IrqMode::Gic);
+        let words: Vec<u32> = m
+            .bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("word")))
+            .collect();
+        let native_signal_return = words
+            .windows(3)
+            .position(|window| {
+                window
+                    == [
+                        enc_ldr_xt_sp(0, AARCH64_SYSCALL_MAILBOX_OFF_RETURN_VALUE),
+                        enc_movz_w16(0),
+                        AARCH64_STLR_W16_X17_OPCODE,
+                    ]
+            })
+            .expect("native signal return sequence")
+            * 4;
+        m.pc = native_signal_return;
+        m.image = image;
+        m.regs[17] = m.sp + AARCH64_SYSCALL_MAILBOX_OFF_STATE as u64;
+        m.mem.insert(
+            m.sp + AARCH64_SYSCALL_MAILBOX_OFF_RESPONSE_ACTION as u64,
+            response_action,
+        );
+        m.mem.insert(
+            m.sp + AARCH64_SYSCALL_MAILBOX_OFF_RETURN_VALUE as u64,
+            0x5E4E,
+        );
+        m.mem
+            .insert(m.sp + AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X16 as u64, 0xAB10);
+        m.mem
+            .insert(m.sp + AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X17 as u64, 0xAB11);
+        m
     }
 
     fn pending_host_work_addr() -> u64 {
@@ -252,6 +294,7 @@ impl Machine {
         let frame = self.regs[0];
         let esr = self.read(frame + 264);
         let irq = esr == 0;
+        let signal = matches!(esr, 0xfffe | 0xfffd);
         let is_fault = matches!((esr >> 26) & 0x3F, 0x20 | 0x24);
         if is_fault {
             self.fault_frames += 1;
@@ -263,6 +306,9 @@ impl Machine {
                 self.kick_acknowledged = true;
                 self.mem.insert(Self::pending_host_work_addr(), 1);
             }
+        }
+        if signal {
+            self.signal_frames += 1;
         }
         let pending = self.read(Self::pending_host_work_addr()) != 0;
         self.regs[0] = if is_fault || pending {
@@ -394,6 +440,10 @@ impl Machine {
                 let addr = self.xn_sp(rn) + u64::from((op >> 10) & 0xFFF) * 8;
                 let v = self.read(addr);
                 self.set_xd_zr(rd, v);
+            } else if op & 0xFFC0_0000 == 0xB940_0000 {
+                let addr = self.xn_sp(rn) + u64::from((op >> 10) & 0xFFF) * 4;
+                let v = self.read(addr) & 0xFFFF_FFFF;
+                self.set_xd_zr(rd, v);
             } else if op & 0xFFFF_FC00 == 0x88DF_FC00 {
                 let v = self.read(self.xn_sp(rn)) & 0xFFFF_FFFF;
                 self.set_xd_zr(rd, v);
@@ -402,6 +452,9 @@ impl Machine {
                     .insert(self.xn_sp(rn), self.xn_zr(rd) & 0xFFFF_FFFF);
             } else if op & 0xFF80_0000 == 0xD280_0000 {
                 let shift = ((op >> 21) & 3) * 16;
+                self.set_xd_zr(rd, u64::from((op >> 5) & 0xFFFF) << shift);
+            } else if op & 0xFF80_0000 == 0x5280_0000 {
+                let shift = ((op >> 21) & 1) * 16;
                 self.set_xd_zr(rd, u64::from((op >> 5) & 0xFFFF) << shift);
             } else if op & 0xFF80_0000 == 0xF280_0000 {
                 let shift = ((op >> 21) & 3) * 16;
@@ -416,6 +469,8 @@ impl Machine {
                 self.set_xd_sp(rd, v);
             } else if op & 0xFFC0_0000 == 0xF100_0000 && rd == 31 {
                 self.equal = self.xn_sp(rn) == u64::from((op >> 10) & 0xFFF);
+            } else if op & 0xFFC0_0000 == 0x7100_0000 && rd == 31 {
+                self.equal = self.xn_sp(rn) & 0xFFFF_FFFF == u64::from((op >> 10) & 0xFFF);
             } else if op & 0xFFE0_FC1F == 0xEB00_001F {
                 // cmp xN, xM
                 self.equal = self.xn_zr(rn) == self.xn_zr(rm);
@@ -724,6 +779,62 @@ fn gic_irq_hook_idle_action_leaves_through_the_idle_exit() {
             sp: LINUX_SYSCALL_MAILBOX_BASE + SLOT * 256
         }
     );
+    assert_eq!(m.irq_frames, 1);
+}
+
+/// A native forwarded return enters the generated SignalCheck exactly once.
+/// With no deliverable signal, it either resumes EL0 or yields the executor;
+/// a kick at any emitted instruction still reaches the host or EL0 boundary.
+#[test]
+fn native_forwarded_return_checks_signals_once_without_losing_kicks() {
+    for response_action in [4, 5] {
+        for image in [Image::Serve, Image::Idle] {
+            let machine = || Machine::native_signal_return(response_action, image);
+            let mut m = machine();
+            let exit = m.run(None);
+            assert_eq!(m.signal_frames, 1, "action {response_action}, {image:?}");
+            match image {
+                Image::Serve => assert_eq!(
+                    exit,
+                    Exit::Eret {
+                        spsr: EL0_DAIF_MASKED & !PSTATE_I,
+                        elr: GUEST_ELR,
+                    }
+                ),
+                Image::Idle => assert_eq!(
+                    exit,
+                    Exit::Idle {
+                        sp: LINUX_SYSCALL_MAILBOX_BASE + SLOT * 256,
+                    }
+                ),
+                Image::SwitchIn => unreachable!(),
+            }
+            let lost = lost_kicks(machine);
+            assert!(
+                lost.is_empty(),
+                "action {response_action}, {image:?} lost owed kicks at {lost:?}"
+            );
+        }
+    }
+}
+
+/// The exact idle-entry PC observed by the signed trace must surface already
+/// published host work instead of re-entering or parking in the scheduler.
+#[test]
+fn idle_entry_with_pending_host_work_leaves_through_kick_exit() {
+    let entry = (el1_idle_entry_va() - LINUX_EL1_VECTORS_BASE) as usize;
+    assert_eq!(entry, EL0_IRQ_HOOK_OFFSET + 0xd8);
+    let frame = el1_slot_frame_va(SLOT as usize);
+    let mut m = Machine {
+        pc: entry,
+        ..Machine::el0_irq()
+    };
+    m.regs[16] = frame;
+    m.mem.insert(frame + 272, SLOT);
+    m.mem.insert(frame + 264, 0);
+    m.mem.insert(frame + 248, 0);
+    m.mem.insert(Machine::pending_host_work_addr(), 1);
+    assert_eq!(m.run(None), Exit::Kick { spsr: 0, elr: 0 });
     assert_eq!(m.irq_frames, 1);
 }
 
