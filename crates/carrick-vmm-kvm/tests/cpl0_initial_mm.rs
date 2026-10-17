@@ -1318,6 +1318,32 @@ fn idle_peer_syscall_trap_hands_task_back_to_host_and_delivers_stdout() {
     );
 }
 
+/// #143: when root affinity is 1 (CPU 0 only), the forked child inherits
+/// affinity 1 and runs on CPU 0 after the parent enters CPL0 `wait4`. Its
+/// `SyscallTrap` deterministically crosses the loaded-lane `SyscallTrap` arm
+/// in `carrier_cpu.rs` and `with_forward_vcpu` (with zero idle-peer forwards).
+#[test]
+fn loaded_lane_child_syscall_trap_hands_task_back_to_host_and_delivers_stdout() {
+    let elf = native_exit_fixture("../../../carrick-cli/tests/fixtures/x86_forked_child_stdout.S");
+    let outcome = kvm_pool_fixture::try_run_pool_fixture_with_root_affinity(
+        &elf,
+        32,
+        kvm_pool_fixture::ROOT_AFFINITY_LOADED,
+    )
+    .expect("loaded lane child handback run");
+    assert_eq!(outcome.run.exit_code, 7);
+    assert_eq!(outcome.run.stdout, b"E");
+    assert!(outcome.run.stderr.is_empty());
+    assert_eq!(
+        outcome
+            .physical
+            .idle_peer_forward_witness()
+            .expect("idle peer forward witness"),
+        0,
+        "affinity 1 must route the child's SyscallTrap through the loaded lane on CPU 0"
+    );
+}
+
 /// Ruling 3 on #542: every idle-lane early return completes the run. With a
 /// three-exit budget the idle peer exhausts it while servicing the child's
 /// forward; before the single `settle_lane` path that early return skipped
@@ -1326,11 +1352,19 @@ fn idle_peer_syscall_trap_hands_task_back_to_host_and_delivers_stdout() {
 #[test]
 fn idle_lane_exit_budget_failure_completes_the_run() {
     let elf = native_exit_fixture("../../../carrick-cli/tests/fixtures/x86_forked_child_stdout.S");
-    match kvm_pool_fixture::try_run_pool_fixture_with_root_affinity(
-        &elf,
-        3,
-        kvm_pool_fixture::ROOT_AFFINITY_IDLE_PEER,
-    ) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = kvm_pool_fixture::try_run_pool_fixture_with_root_affinity(
+            &elf,
+            3,
+            kvm_pool_fixture::ROOT_AFFINITY_IDLE_PEER,
+        );
+        let _ = tx.send(result);
+    });
+    let result = rx.recv_timeout(std::time::Duration::from_secs(30)).expect(
+        "idle-lane exit-budget failure must complete within 30s deadline instead of hanging",
+    );
+    match result {
         Ok(outcome) => panic!(
             "a three-exit budget cannot finish the forked run, got exit {}",
             outcome.run.exit_code
@@ -1357,7 +1391,7 @@ fn forward_authority_fixture(variant: &str) -> Vec<u8> {
 #[test]
 fn in_zone_child_host_read_is_refused_not_served_under_root_context() {
     let elf = forward_authority_fixture("CHILD_STDIN_READ");
-    let error = match kvm_pool_fixture::try_run_pool_fixture_with_root_affinity(
+    let failure = match kvm_pool_fixture::try_run_pool_fixture_with_typed_failure(
         &elf,
         64,
         kvm_pool_fixture::ROOT_AFFINITY_IDLE_PEER,
@@ -1366,12 +1400,13 @@ fn in_zone_child_host_read_is_refused_not_served_under_root_context() {
             "the child's read was served under another task's authority: exit {}",
             outcome.run.exit_code
         ),
-        Err(error) => error.to_string(),
+        Err(failure) => failure,
     };
-    assert!(
-        error.contains("x86 syscall 0 from an in-zone child needs a host task context")
-            && error.contains("\"authority_host_task_context\": 1"),
-        "{error}"
+    assert_eq!(
+        failure.authority_refusals,
+        vec![carrick_runtime::prepare::ForwardAuthorityRefusal::HostTaskContext { native: 0 }],
+        "unexpected refusal error: {}",
+        failure.error
     );
 }
 
@@ -1382,7 +1417,7 @@ fn in_zone_child_host_read_is_refused_not_served_under_root_context() {
 #[test]
 fn in_zone_child_blocking_wait_is_refused_before_any_token() {
     let elf = forward_authority_fixture("CHILD_POLL_WAIT");
-    let error = match kvm_pool_fixture::try_run_pool_fixture_with_root_affinity(
+    let failure = match kvm_pool_fixture::try_run_pool_fixture_with_typed_failure(
         &elf,
         64,
         kvm_pool_fixture::ROOT_AFFINITY_IDLE_PEER,
@@ -1391,12 +1426,13 @@ fn in_zone_child_blocking_wait_is_refused_before_any_token() {
             "the child's wait parked on another task's lease: exit {}",
             outcome.run.exit_code
         ),
-        Err(error) => error.to_string(),
+        Err(failure) => failure,
     };
-    assert!(
-        error.contains("a blocking wait needs the stopped task's own execution lease")
-            && error.contains("\"authority_blocking_wait\": 1"),
-        "{error}"
+    assert_eq!(
+        failure.authority_refusals,
+        vec![carrick_runtime::prepare::ForwardAuthorityRefusal::BlockingWait],
+        "unexpected refusal error: {}",
+        failure.error
     );
 }
 
@@ -1432,4 +1468,61 @@ fn in_zone_child_stdout_write_resolves_through_childs_own_table() {
     assert_eq!(outcome.run.exit_code, 7);
     assert!(outcome.run.stdout.is_empty(), "{:?}", outcome.run.stdout);
     assert_eq!(outcome.run.stderr, b"P");
+}
+
+/// Ruling 2 on #542 (dup2-onto-pipe witness): the parent creates a pipe with
+/// `pipe2`, the child redirects fd 1 onto the pipe's write end via
+/// `dup2(p[1], 1)` and calls `write(1, "P", 1)`, and the parent reads the pipe
+/// and writes what it read to stdout before `wait4`. The byte arrives at host
+/// stdout exactly once via the parent's read of the pipe, never directly from
+/// the child's `write(1)`.
+///
+/// Workaround for #599 (tested without workarounds in the ignored witness
+/// below): x86 CPL0 does not yet cross `pipe2` (`crossing.rs:289` `x86 = false`),
+/// and `ForwardVenue::write_bytes_raw` (`cpl0_boot.rs:6444`) requires
+/// `Access::Write` on an already-writable stage-1 PTE rather than breaking a
+/// post-`fork` COW page on a host-forwarded `read`. This test therefore
+/// pre-admits the pipe pair on the initial root task and touches `buffer` in
+/// user mode after `fork` so CPL0 breaks COW before the parent's `read`.
+#[test]
+fn in_zone_child_dup2_onto_pipe_writes_to_pipe_not_host_stdout() {
+    let elf = forward_authority_fixture("CHILD_PIPE_DUP2_STDOUT");
+    let outcome = kvm_pool_fixture::try_run_pool_fixture_with_admitted_pipe(
+        &elf,
+        64,
+        kvm_pool_fixture::ROOT_AFFINITY_IDLE_PEER,
+    )
+    .expect("child dup2 onto pipe run");
+    assert_eq!(outcome.run.exit_code, 7);
+    assert_eq!(outcome.run.stdout, b"P");
+    assert!(outcome.run.stderr.is_empty());
+    assert!(
+        outcome
+            .physical
+            .idle_peer_forward_witness()
+            .expect("idle peer forward witness")
+            >= 1,
+        "the child's pipe write must be served from the idle peer"
+    );
+}
+
+/// Un-workarounded witness for #599: in-guest `pipe2` (currently `-ENOSYS`) and
+/// parent `read(pipefd[0], buffer, 1)` into an unfaulted post-`fork` COW `.data`
+/// page (currently `-EFAULT` in `ForwardVenue::write_bytes_raw`).
+#[test]
+#[ignore = "#599"]
+fn in_zone_child_pipe2_and_unfaulted_cow_read_matches_native_oracle() {
+    let elf = native_exit_fixture_with_flags(
+        "../../../carrick-cli/tests/fixtures/x86_forked_child_forward_authority.S",
+        &["-DCHILD_PIPE_DUP2_STDOUT", "-DCHILD_PIPE_UNFAULTED_COW"],
+    );
+    let outcome = kvm_pool_fixture::try_run_pool_fixture_with_root_affinity(
+        &elf,
+        64,
+        kvm_pool_fixture::ROOT_AFFINITY_IDLE_PEER,
+    )
+    .expect("child raw pipe2 and unfaulted COW read run");
+    assert_eq!(outcome.run.exit_code, 7);
+    assert_eq!(outcome.run.stdout, b"P");
+    assert!(outcome.run.stderr.is_empty());
 }

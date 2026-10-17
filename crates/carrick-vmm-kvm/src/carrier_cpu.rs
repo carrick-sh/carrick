@@ -662,17 +662,28 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
                 }
             }
             CarrierRunExit::SyscallTrap => {
-                if let Some(root_gpa) = RootGpa::page_aligned(FrameGpa::new(image.cr3 & !0xfff))
-                    && root_gpa != binding.context().root
-                {
-                    self.child_bindings
-                        .get(root_gpa)
-                        .inspect_err(|_| {
-                            self.custody = Custody::Poisoned;
-                        })?
-                        .unwrap_or(binding)
-                } else {
+                let root_gpa = RootGpa::page_aligned(FrameGpa::new(image.cr3 & !0xfff))
+                    .ok_or_else(|| {
+                        self.custody = Custody::Poisoned;
+                        boundary_error("unaligned forward CR3")
+                    })?;
+                if root_gpa == binding.context().root {
                     binding
+                } else {
+                    let child = self.child_bindings.get(root_gpa).inspect_err(|_| {
+                        self.custody = Custody::Poisoned;
+                    })?;
+                    match child {
+                        Some(child) => child,
+                        None => {
+                            self.custody = Custody::Poisoned;
+                            return Err(boundary_error(&format!(
+                                "unregistered forward CR3: root {:#x}, rip {:#x}",
+                                root_gpa.address().raw(),
+                                image.rip,
+                            )));
+                        }
+                    }
                 }
             }
             _ => binding,
@@ -917,9 +928,14 @@ mod tests {
         }
         fn run(&mut self) -> Result<VcpuExit, TrapError> {
             self.image = self.child_image.clone();
+            let data = if self.port == carrick_x86::cpl0_entry::FORWARD_PORT {
+                vec![0]
+            } else {
+                vec![0, 0, 0, 0]
+            };
             Ok(VcpuExit::IoOut {
                 port: self.port,
-                data: vec![0, 0, 0, 0],
+                data,
             })
         }
         fn complete_pending_io(&mut self) -> Result<(), TrapError> {
@@ -1052,6 +1068,24 @@ mod tests {
         let err = cpu.run_loaded(root.binding().task()).unwrap_err();
         assert!(
             err.to_string().contains("unregistered child retire CR3"),
+            "unexpected error: {err:?}"
+        );
+        assert!(matches!(cpu.custody, Custody::Poisoned));
+    }
+    #[test]
+    fn unregistered_forward_cr3_refuses_with_typed_error() {
+        let root = context(1);
+        let unregistered_child = context(2);
+        let mut cpu = KvmCarrierCpu::new(ChildRetireIo {
+            image: context(1).hardware_image(),
+            child_image: unregistered_child.hardware_image(),
+            port: carrick_x86::cpl0_entry::FORWARD_PORT,
+        })
+        .unwrap();
+        cpu.load(root.clone()).unwrap();
+        let err = cpu.run_loaded(root.binding().task()).unwrap_err();
+        assert!(
+            err.to_string().contains("unregistered forward CR3"),
             "unexpected error: {err:?}"
         );
         assert!(matches!(cpu.custody, Custody::Poisoned));

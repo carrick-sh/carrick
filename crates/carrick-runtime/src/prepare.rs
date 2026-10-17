@@ -123,6 +123,9 @@ mod initial_x86_forward_tests {
 pub struct Runtime;
 
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+pub use crate::vcpu_loop::executor::kvm::ForwardAuthorityRefusal;
+
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
 pub struct PreparedKvmPoolOutcome {
     pub run: RunResult,
     pub physical: Arc<carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory>,
@@ -143,6 +146,38 @@ impl KvmPhysicalDebug {
         }
     }
 }
+
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+#[derive(Debug)]
+pub struct PreparedKvmPoolFailure {
+    pub error: RuntimeError,
+    pub authority_refusals: Vec<ForwardAuthorityRefusal>,
+}
+
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+impl std::fmt::Display for PreparedKvmPoolFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, formatter)
+    }
+}
+
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+impl From<RuntimeError> for PreparedKvmPoolFailure {
+    fn from(error: RuntimeError) -> Self {
+        Self {
+            error,
+            authority_refusals: Vec::new(),
+        }
+    }
+}
+
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+impl From<carrick_hal::TrapError> for PreparedKvmPoolFailure {
+    fn from(error: carrick_hal::TrapError) -> Self {
+        Self::from(RuntimeError::from(error))
+    }
+}
+
 
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
 impl carrick_kernel::kernel::debug::PhysicalCaptureProvider for KvmPhysicalDebug {
@@ -204,6 +239,17 @@ pub fn run_prepared_kvm_pool(
 ) -> Result<PreparedKvmPoolOutcome, RuntimeError> {
     let debug_server = install_kvm_debug_server(&dispatcher);
     run_prepared_kvm_pool_with_debug(machine, root_context, dispatcher, max_traps, debug_server)
+        .map_err(|failure| failure.error)
+}
+
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+pub fn try_run_prepared_kvm_pool(
+    machine: carrick_vmm_kvm::cpl0_boot::Cpl0Carrier,
+    root_context: carrick_kernel::kernel::KernelContext,
+    dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
+    max_traps: usize,
+) -> Result<PreparedKvmPoolOutcome, PreparedKvmPoolFailure> {
+    run_prepared_kvm_pool_with_debug(machine, root_context, dispatcher, max_traps, None)
 }
 
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
@@ -213,7 +259,7 @@ fn run_prepared_kvm_pool_with_debug(
     dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
     max_traps: usize,
     debug_server: Option<PreparedKvmDebugServer>,
-) -> Result<PreparedKvmPoolOutcome, RuntimeError> {
+) -> Result<PreparedKvmPoolOutcome, PreparedKvmPoolFailure> {
     use crate::vcpu_loop::executor::{self, PersistentTaskBinding};
     use carrick_hal::threaded::GuestCpuState;
     use carrick_kernel::kernel::objects::MigratableTaskState;
@@ -299,19 +345,30 @@ fn run_prepared_kvm_pool_with_debug(
     drop(factory);
     let completion = completed_rx.recv();
     let shutdown = pool.shutdown();
+    let authority_refusals = stats.authority_refusals().unwrap_or_default();
     let outcome = completion
-        .map_err(|error| RuntimeError::Configuration(format!("KVM executor completion: {error}")))?
+        .map_err(|error| PreparedKvmPoolFailure {
+            error: RuntimeError::Configuration(format!("KVM executor completion: {error}")),
+            authority_refusals: authority_refusals.clone(),
+        })?
         .map_err(|error| {
             // A failed run never reaches the execution witness below, so its
             // forward refusals ride on the failure itself.
-            match stats.snapshot() {
+            let runtime_error = match stats.snapshot() {
                 Ok((_, refusals)) if !refusals.is_empty() => {
                     RuntimeError::Configuration(format!("{error}; forward refusals {refusals:?}"))
                 }
                 _ => RuntimeError::Configuration(error),
+            };
+            PreparedKvmPoolFailure {
+                error: runtime_error,
+                authority_refusals: authority_refusals.clone(),
             }
         })?;
-    shutdown.map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+    shutdown.map_err(|error| PreparedKvmPoolFailure {
+        error: RuntimeError::Configuration(error.to_string()),
+        authority_refusals,
+    })?;
     let (guest_entries, portal_exits) = physical.initial_execution_witness()?;
     let physical_crossing_families: Vec<_> = physical
         .physical_crossing_counts()?
@@ -388,9 +445,9 @@ fn run_prepared_kvm_pool_with_debug(
         }
         carrick_vmm_kvm::cpl0_boot::InitialProcessExit::Fault { record, exits } => {
             if record.cs & 3 != 3 {
-                return Err(RuntimeError::Unsupported(format!(
-                    "CPL0 kernel fault: {record:?}"
-                )));
+                return Err(
+                    RuntimeError::Unsupported(format!("CPL0 kernel fault: {record:?}")).into(),
+                );
             }
             let (signal, _) = record.linux_signal().ok_or_else(|| {
                 RuntimeError::Unsupported(format!("unclassified x86 user fault: {record:?}"))

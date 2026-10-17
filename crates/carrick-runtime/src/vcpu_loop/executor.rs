@@ -1376,6 +1376,18 @@ where
                             ExecutorPoolEvent::SettledBlocked { thread, generation }
                         })
                 }
+                ExecutorExit::Preempted
+                    if kick.is_shutdown_interrupted()
+                        && running.thread().affinity().is_allowed(guest_cpu) =>
+                {
+                    drop(submission_authority);
+                    scheduler
+                        .settle_blocked(running, BlockedReason::HostWait)
+                        .map(|disposition| {
+                            reaped_settlement = disposition == SettlementDisposition::TargetReaped;
+                            ExecutorPoolEvent::SettledBlocked { thread, generation }
+                        })
+                }
                 ExecutorExit::Yielded | ExecutorExit::Preempted => {
                     let disposition = scheduler
                         .settle_runnable_successor(running)

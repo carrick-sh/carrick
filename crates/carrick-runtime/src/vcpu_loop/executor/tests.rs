@@ -518,7 +518,18 @@ impl TaskBindingResolver<FakeBinding> for FakeFactory {
         if let Some(dir) = self.directory.lock().as_ref() {
             dir.cancel_dormant(scheduler, failure)
         } else {
-            Ok(0)
+            let candidates: Vec<_> = self.authorities.lock().keys().copied().collect();
+            let mut cancelled = 0usize;
+            for (thread, generation) in candidates {
+                if scheduler
+                    .fail_blocked_exact(thread, generation, failure)
+                    .map_err(|error| TrapError::Hypervisor(error.to_string()))?
+                {
+                    self.authorities.lock().remove(&(thread, generation));
+                    cancelled += 1;
+                }
+            }
+            Ok(cancelled)
         }
     }
 
@@ -1098,7 +1109,10 @@ impl PersistentExecutor for FakeExecutor {
                 }
             }
             Step::Yield => Ok(ExecutorExit::Yielded),
-            Step::Preempt => Ok(ExecutorExit::Preempted),
+            Step::Preempt => {
+                need_resched.store(false, Ordering::Release);
+                Ok(ExecutorExit::Preempted)
+            }
             Step::Exit => {
                 self.exit_seen = true;
                 Ok(ExecutorExit::Exited)
@@ -8092,4 +8106,116 @@ fn preemption_driver_worker_failure_allows_clean_shutdown() {
         .expect_err("panicked worker must cause shutdown error");
     assert_eq!(err.retired_workers(), 1);
     assert!(!scheduler.is_preemption_driver_attached());
+}
+
+#[test]
+fn shutdown_kick_wakes_guest_parked_worker_and_treats_preemption_after_close_as_clean_stop() {
+    // Part (a): without the shutdown kick, a worker parked in guest at shutdown
+    // does not join when the queue closes; it stays stuck until its bounded
+    // guest-compute deadline fails the worker.
+    {
+        let (kernel, parked) = bootstrap(68_106);
+        let scheduler = Arc::new(single_cpu_scheduler(kernel));
+        let factory = Arc::new(FakeFactory::default());
+        let entered = Arc::new(Barrier::new(2));
+        let binding = FakeBinding::new(501, [Step::ComputeUntilKick]);
+        *binding.entered.lock() = Some(Arc::clone(&entered));
+        factory.install(&parked, binding);
+        let mut pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
+        pool.disable_shutdown_kick_for_test();
+        let authority = enqueue_root(&scheduler, &parked, publish(&parked, 501));
+        entered.wait();
+        drop(authority);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let join_handle = thread::spawn(move || {
+            let _ = tx.send(pool.shutdown());
+        });
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "worker parked in guest at shutdown must not join without the shutdown kick"
+        );
+        let err = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("bounded guest-park deadline completes")
+            .expect_err("without shutdown kick, guest-parked worker hits its bounded deadline");
+        assert!(
+            err.to_string()
+                .contains("fake compute task was never kicked"),
+            "unexpected error without shutdown kick: {err}"
+        );
+        join_handle.join().expect("shutdown thread joins");
+    }
+
+    // Part (a, positive) & Part (b): with the shutdown kick enabled, a worker
+    // parked/running in guest compute at shutdown while another task has already
+    // succeeded is interrupted by the kick, joins promptly, and settles its
+    // kick-induced Preempted exit after close as a clean stop (never requeueing
+    // into the closing/closed scheduler or turning the completed run into a failure).
+    {
+        let (kernel, root) = bootstrap(68_107);
+        root.thread()
+            .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+        let peer = sibling(&kernel, &root, 68_108);
+        peer.thread()
+            .set_affinity(CpuAffinity::single(GuestCpuId::new(1)));
+        let scheduler = Arc::new(Scheduler::new_with_policy(
+            kernel,
+            Arc::new(GuestCpuPolicy::new(2)),
+        ));
+        let factory = Arc::new(FakeFactory::default());
+        let (root_settled_tx, root_settled_rx) = std::sync::mpsc::channel();
+        let root_binding = FakeBinding::new(502, [Step::Exit]);
+        root_binding.notify_on_terminal_settlement(root_settled_tx);
+        factory.install(&root, root_binding);
+
+        let peer_entered = Arc::new(Barrier::new(2));
+        let peer_binding = FakeBinding::new(503, [Step::ComputeUntilKick, Step::ComputeUntilKick]);
+        *peer_binding.entered.lock() = Some(Arc::clone(&peer_entered));
+        factory.install(&peer, peer_binding);
+
+        let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 2);
+        pool.submit_root(Arc::clone(root.thread()), publish(&root, 502))
+            .expect("submit root task");
+        pool.submit_root(Arc::clone(peer.thread()), publish(&peer, 503))
+            .expect("submit peer guest-compute task");
+
+        root_settled_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("root task completes before shutdown");
+        peer_entered.wait();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let join_handle = thread::spawn(move || {
+            let _ = tx.send(pool.shutdown());
+        });
+        let report = rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("shutdown kick wakes guest-parked worker within bounded deadline")
+            .expect("kick-induced preemption after close must be treated as a clean stop");
+        join_handle.join().expect("shutdown thread joins");
+
+        assert_eq!(report.joined(), 2);
+        assert!(matches!(
+            root.thread().execution_state(),
+            ThreadExecutionState::Exited { .. }
+        ));
+        let events = factory.events.lock();
+        let peer_runs = events
+            .iter()
+            .filter(|event| {
+                event.kind == BackendEventKind::Run
+                    && event
+                        .task
+                        .is_some_and(|(key, _)| key == peer.thread().key())
+            })
+            .count();
+        assert_eq!(
+            peer_runs, 1,
+            "shutdown-kicked task must stop cleanly after close instead of requeueing for a second quantum"
+        );
+    }
 }

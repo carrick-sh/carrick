@@ -1082,30 +1082,67 @@ pub struct EntryState {
 #[path = "cpl0_anonymous.rs"]
 mod anonymous_owner;
 
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
+pub enum ForwardBindingRefusal {
+    ContextMismatch,
+    GenerationMismatch,
+    TaskIdMismatch {
+        stopped: carrick_el1_abi::EntryTaskKey,
+        expected: carrick_el1_abi::EntryTaskKey,
+    },
+}
+
 #[derive(::core::clone::Clone, ::core::marker::Copy)]
 struct ForwardExecution {
     cpu: carrick_guest_arch::CpuId,
     binding: carrick_el1_abi::ExecutionBinding,
+    leader_task: carrick_el1_abi::EntryTaskKey,
     context: AddressContext<RootGpa>,
 }
 
 impl ForwardExecution {
     /// Authenticate the CR3-registered carrier binding against the execution
-    /// the stopped CPU's own lifecycle record names: the address context and
-    /// the execution generation must be the same issue. The record's task key
-    /// is the guest tid, a different domain from the binding's host task
-    /// serial, so the generation is the comparable identity.
+    /// the stopped CPU's own lifecycle record names: the address context, the
+    /// execution generation, and the process leader task key must match. A
+    /// `CLONE_VM` sibling sharing the root's `CR3` and `INITIAL` generation has
+    /// a distinct stopped `binding.task` from `leader_task` and is refused.
+    fn authenticate_typed(
+        &self,
+        binding: carrick_hal::guest_arch_binding::GuestArchBinding,
+    ) -> Result<(), ForwardBindingRefusal> {
+        if binding.context() != self.context {
+            return Err(ForwardBindingRefusal::ContextMismatch);
+        }
+        if binding.task().execution.raw().get() != self.binding.generation.raw() {
+            return Err(ForwardBindingRefusal::GenerationMismatch);
+        }
+        if self.binding.task != self.leader_task {
+            return Err(ForwardBindingRefusal::TaskIdMismatch {
+                stopped: self.binding.task,
+                expected: self.leader_task,
+            });
+        }
+        Ok(())
+    }
+
+    fn with_leader_task(mut self, leader_task: carrick_el1_abi::EntryTaskKey) -> Self {
+        self.leader_task = leader_task;
+        self
+    }
+
     fn authenticate(
         &self,
         binding: carrick_hal::guest_arch_binding::GuestArchBinding,
         refusal: &str,
     ) -> Result<(), TrapError> {
-        if binding.context() != self.context
-            || binding.task().execution.raw().get() != self.binding.generation.raw()
-        {
-            return Err(fail(refusal));
-        }
-        Ok(())
+        self.authenticate_typed(binding)
+            .map_err(|reason| fail(format!("{refusal}: {reason:?}")))
     }
 }
 
@@ -1129,6 +1166,7 @@ fn admit_forward_execution(
     Ok(ForwardExecution {
         cpu,
         binding,
+        leader_task: binding.task,
         context,
     })
 }
@@ -1226,6 +1264,7 @@ mod forward_execution_tests {
                 .expect("exact lane1 owner");
         assert_eq!(admitted.cpu.raw(), 1);
         assert_eq!(admitted.binding, binding);
+        assert_eq!(admitted.leader_task, binding.task);
         assert_eq!(admitted.context, context);
     }
 
@@ -1250,17 +1289,26 @@ mod forward_execution_tests {
     /// Every forward phase (idle-peer identity, capture, completion) admits a
     /// CR3-registered binding through this one comparison; a binding whose
     /// address context or execution generation names another issue of the
-    /// task must not be served as the stopped execution.
+    /// task, or a `CLONE_VM` sibling sharing the root's CR3 and generation,
+    /// must not be served as the stopped execution.
     #[test]
-    fn forward_binding_authentication_requires_exact_context_and_generation() {
+    fn forward_binding_authentication_requires_exact_context_generation_and_task_id() {
         let (binding, context) = execution();
         let cpu = carrick_guest_arch::CpuId::new(1);
         let admitted =
             admit_forward_execution(cpu, cpu, binding, context, context.root, context.generation)
                 .expect("exact lane1 owner");
+        assert_eq!(
+            admitted.authenticate_typed(carrier_binding(context, 12)),
+            Ok(())
+        );
         admitted
             .authenticate(carrier_binding(context, 12), "exact")
             .expect("exact binding");
+        assert_eq!(
+            admitted.authenticate_typed(carrier_binding(context, 13)),
+            Err(ForwardBindingRefusal::GenerationMismatch)
+        );
         assert!(
             admitted
                 .authenticate(carrier_binding(context, 13), "stale generation")
@@ -1270,6 +1318,10 @@ mod forward_execution_tests {
             root: RootGpa::page_aligned(FrameGpa::new(0x6000)).expect("aligned root"),
             ..context
         };
+        assert_eq!(
+            admitted.authenticate_typed(carrier_binding(other_root, 12)),
+            Err(ForwardBindingRefusal::ContextMismatch)
+        );
         assert!(
             admitted
                 .authenticate(carrier_binding(other_root, 12), "other root")
@@ -1279,10 +1331,47 @@ mod forward_execution_tests {
             generation: ContextGeneration::new(NonZeroU64::new(8).expect("incarnation")),
             ..context
         };
+        assert_eq!(
+            admitted.authenticate_typed(carrier_binding(other_incarnation, 12)),
+            Err(ForwardBindingRefusal::ContextMismatch)
+        );
         assert!(
             admitted
                 .authenticate(carrier_binding(other_incarnation, 12), "other incarnation")
                 .is_err()
+        );
+        // Ruling 4 thread clause: a CLONE_VM sibling sharing root CR3 + INITIAL
+        // generation has a distinct stopped task key from the leader's task key.
+        let sibling_binding = carrick_el1_abi::ExecutionBinding {
+            task: carrick_el1_abi::EntryTaskKey::from_raw(43),
+            ..binding
+        };
+        let sibling_admitted = admit_forward_execution(
+            cpu,
+            cpu,
+            sibling_binding,
+            context,
+            context.root,
+            context.generation,
+        )
+        .expect("admitted stopped execution")
+        .with_leader_task(binding.task);
+        assert_eq!(
+            sibling_admitted.authenticate_typed(carrier_binding(context, 12)),
+            Err(ForwardBindingRefusal::TaskIdMismatch {
+                stopped: carrick_el1_abi::EntryTaskKey::from_raw(43),
+                expected: carrick_el1_abi::EntryTaskKey::from_raw(42),
+            })
+        );
+        let err = sibling_admitted
+            .authenticate(
+                carrier_binding(context, 12),
+                "idle peer forward binding mismatch",
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("TaskIdMismatch"),
+            "unexpected error: {err:?}"
         );
     }
 }
@@ -2697,6 +2786,14 @@ impl<'a> ForwardVenue<'a> {
             NonZeroU64::new(native.mm_owner_generation.load(Ordering::Acquire))
                 .ok_or_else(|| fail("stopped forward address incarnation"))?,
         );
+        let leader_task = match custody.initial_task {
+            Some(initial) if context.mm == initial.mm => {
+                carrick_el1_abi::EntryTaskKey::from_raw(initial.thread.tid)
+            }
+            _ => task.visible_pid().map_or(binding.task, |pid| {
+                carrick_el1_abi::EntryTaskKey::from_raw(u64::from(pid))
+            }),
+        };
         let execution = admit_forward_execution(
             cpu,
             carrick_guest_arch::CpuId::new(native.cpu_slot),
@@ -2704,7 +2801,8 @@ impl<'a> ForwardVenue<'a> {
             context,
             root,
             generation,
-        )?;
+        )?
+        .with_leader_task(leader_task);
         Ok(Self {
             custody,
             lease,
@@ -2714,6 +2812,93 @@ impl<'a> ForwardVenue<'a> {
 
     pub fn cpu(&self) -> carrick_guest_arch::CpuId {
         self.execution.cpu
+    }
+
+    /// Resolve a writable guest descriptor in the stopped task's own CPL0 file
+    /// table to its bound [`carrick_el1_abi::HostObjectBinding`].
+    pub fn stopped_task_host_object(
+        &self,
+        guest_fd: i32,
+    ) -> Result<Option<carrick_el1_abi::HostObjectBinding>, TrapError> {
+        let file_table = self
+            .custody
+            .task(self.execution.cpu)
+            .linux
+            .file_table
+            .load(Ordering::Acquire)
+            .max(1);
+        let region = self.custody.binding(self.execution.cpu).file_region;
+        let tables = self
+            .custody
+            .files
+            .registration
+            .tables(region)
+            .map_err(|error| fail(format!("stopped task file tables: {error:?}")))?;
+        let _guard = carrick_el1_abi::lock_fd_map(tables.fd_map());
+        let Some((handle, _)) =
+            carrick_el1_abi::fd_map_lookup(tables.fd_map(), file_table, guest_fd)
+        else {
+            return Ok(None);
+        };
+        if handle == 0 {
+            return Ok(None);
+        }
+        Ok(tables
+            .opens()
+            .get((handle - 1) as usize)
+            .filter(|open| {
+                open.state.load(Ordering::Acquire) == carrick_el1_abi::DELEGATED_STATE_GUEST
+                    && open.flags.load(Ordering::Acquire) & carrick_el1_abi::DELEGATED_FLAG_WRITABLE
+                        != 0
+            })
+            .and_then(carrick_el1_abi::DelegatedOpenFile::host_object))
+    }
+
+    /// Authenticate that the stopped task's own CPL0 file table holds a live
+    /// writable open description bound to `expected`.
+    pub fn stopped_task_has_writable_host_object(
+        &self,
+        expected: carrick_el1_abi::HostObjectBinding,
+    ) -> Result<bool, TrapError> {
+        let file_table = self
+            .custody
+            .task(self.execution.cpu)
+            .linux
+            .file_table
+            .load(Ordering::Acquire)
+            .max(1);
+        let region = self.custody.binding(self.execution.cpu).file_region;
+        let tables = self
+            .custody
+            .files
+            .registration
+            .tables(region)
+            .map_err(|error| fail(format!("stopped task file tables: {error:?}")))?;
+        let _guard = carrick_el1_abi::lock_fd_map(tables.fd_map());
+        Ok(tables
+            .fd_map()
+            .iter()
+            .take(carrick_el1_abi::FD_MAP_CAPACITY)
+            .any(|slot| {
+                let inc = slot.incarnation.load(Ordering::Acquire);
+                if inc == 0
+                    || inc == carrick_el1_abi::FdMapSlot::CLAIMED
+                    || slot.file_table.load(Ordering::Relaxed) != file_table
+                {
+                    return false;
+                }
+                let handle = slot.handle.load(Ordering::Relaxed);
+                handle
+                    .checked_sub(1)
+                    .and_then(|idx| tables.opens().get(idx as usize))
+                    .is_some_and(|open| {
+                        open.state.load(Ordering::Acquire) == carrick_el1_abi::DELEGATED_STATE_GUEST
+                            && open.flags.load(Ordering::Acquire)
+                                & carrick_el1_abi::DELEGATED_FLAG_WRITABLE
+                                != 0
+                            && open.host_object() == Some(expected)
+                    })
+            }))
     }
 }
 
@@ -3866,6 +4051,13 @@ impl Cpl0Carrier {
         let serial = task.map_or(101, |root| root.thread.serial);
         let generation = task.map_or(11, |root| root.thread.generation);
         let file_table = task.map_or(5, |root| root.thread.file_table);
+        let affinity = task.map_or(3, |root| {
+            if root.thread.affinity == 0 {
+                3
+            } else {
+                root.thread.affinity
+            }
+        });
         self.bind_execution(
             0,
             carrick_el1_abi::ExecutionBinding {
@@ -3876,6 +4068,10 @@ impl Cpl0Carrier {
             },
             file_table,
         )?;
+        self.task(0)
+            .linux
+            .file_table
+            .store(file_table, Ordering::Release);
         self.task(0).publish_visible_pid(tid as u32);
         zone.current_or_new(
             slot,
@@ -3885,12 +4081,64 @@ impl Cpl0Carrier {
                 mm: mm.raw(),
                 file_table,
                 generation,
-                affinity: 3,
+                affinity,
                 lifecycle_page: METADATA_VA,
                 control_slot: METADATA_VA + CONTROL_OFFSET,
             },
         )
         .map_err(|_| fail("production scheduler record exhausted"))?;
+        Ok(())
+    }
+
+    /// Admit a host pipe pair into the initial task's CPL0 file table while
+    /// all vCPUs are stopped before the pool starts.
+    pub fn admit_initial_pipe_fds(&mut self, read_fd: i32, write_fd: i32) -> Result<(), TrapError> {
+        let file_table = self
+            .custody
+            .initial_task
+            .map_or(5, |root| root.thread.file_table)
+            .max(1);
+        let binding = self.file_region_binding();
+        let tables = self
+            .file_tables(binding)
+            .map_err(|error| fail(format!("initial pipe file tables: {error:?}")))?;
+        carrick_el1::personality::file_table::admit_stdio(
+            tables.fd_map(),
+            tables.opens(),
+            tables.objects(),
+            file_table,
+            [true; 3],
+        );
+        let read_admitted = carrick_el1::personality::file_table::admit_host_fd(
+            tables.fd_map(),
+            tables.opens(),
+            tables.objects(),
+            file_table,
+            read_fd,
+            read_fd,
+            carrick_el1_abi::DELEGATED_FLAG_READABLE,
+        );
+        if read_admitted.is_none() {
+            return Err(fail("failed to admit initial pipe read fd"));
+        }
+        let write_admitted = carrick_el1::personality::file_table::admit_host_fd(
+            tables.fd_map(),
+            tables.opens(),
+            tables.objects(),
+            file_table,
+            write_fd,
+            write_fd,
+            carrick_el1_abi::DELEGATED_FLAG_WRITABLE,
+        );
+        if write_admitted.is_none() {
+            let _ = carrick_el1::personality::file_table::close_host_binding(
+                tables.fd_map(),
+                tables.opens(),
+                file_table,
+                read_fd,
+            );
+            return Err(fail("failed to admit initial pipe write fd"));
+        }
         Ok(())
     }
 
