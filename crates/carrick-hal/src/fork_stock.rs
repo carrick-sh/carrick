@@ -39,6 +39,52 @@ struct QuarantinedChild {
 
 /// Bytes in one loaned page-table page.
 const TABLE_PAGE_BYTES: u64 = 4096;
+const CONTROL_WINDOW_BYTES: u64 = carrick_el1_abi::AARCH64_KERNEL_CONTROL_SIZE as u64;
+
+/// Physical control capacity is exclusive when the ISA copies a supervisor
+/// control window. x86 has no such alias; its nonzero wire base is unused by
+/// the shared fork walk and therefore consumes no physical control stock.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum ControlKind {
+    Exclusive,
+    Unused,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct ForkControlCapacity {
+    base: u64,
+    kind: ControlKind,
+}
+
+impl ForkControlCapacity {
+    fn exclusive(base: u64) -> Option<Self> {
+        (base != 0
+            && base.is_multiple_of(CONTROL_WINDOW_BYTES)
+            && base.checked_add(CONTROL_WINDOW_BYTES).is_some())
+        .then_some(Self {
+            base,
+            kind: ControlKind::Exclusive,
+        })
+    }
+
+    pub fn unused(wire_base: u64) -> Option<Self> {
+        (wire_base != 0
+            && wire_base.is_multiple_of(CONTROL_WINDOW_BYTES)
+            && wire_base.checked_add(CONTROL_WINDOW_BYTES).is_some())
+        .then_some(Self {
+            base: wire_base,
+            kind: ControlKind::Unused,
+        })
+    }
+
+    pub fn base(self) -> u64 {
+        self.base
+    }
+
+    fn is_exclusive(self) -> bool {
+        self.kind == ControlKind::Exclusive
+    }
+}
 
 /// Admitted CPU execution context for physical grant authentication.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -399,6 +445,7 @@ pub struct PendingForkLoan<T> {
     pub child_tables: Vec<RootGpa>,
     pub parent_tables: Vec<RootGpa>,
     pub lifecycle: ForkLifecycleLoan,
+    pub control: ForkControlCapacity,
     pub tag: T,
 }
 
@@ -407,6 +454,7 @@ pub struct PendingForkLoan<T> {
 struct CommittedChild<T> {
     root: RootGpa,
     lifecycle: ForkLifecycleLoan,
+    control: ForkControlCapacity,
     tag: ChildTag<T>,
 }
 
@@ -527,7 +575,8 @@ impl core::fmt::Debug for NativeForkStockResources {
 #[derive(Debug)]
 pub struct ForkStock<T: ChildAddressTags> {
     carrier: NonZeroU64,
-    kernel_control_ipa: u64,
+    controls: Vec<ForkControlCapacity>,
+    unused_control: Option<ForkControlCapacity>,
     tables: Vec<RootGpa>,
     lifecycles: Vec<ForkLifecycleLoan>,
     pending: Vec<Option<PendingForkLoan<T::Tag>>>,
@@ -544,10 +593,14 @@ pub struct ForkStock<T: ChildAddressTags> {
 }
 
 impl<T: ChildAddressTags> ForkStock<T> {
-    pub fn new(carrier: NonZeroU64, kernel_control_ipa: u64, tags: T) -> Self {
+    pub fn new(carrier: NonZeroU64, control: Option<ForkControlCapacity>, tags: T) -> Self {
         Self {
             carrier,
-            kernel_control_ipa,
+            controls: control
+                .filter(|control| control.is_exclusive())
+                .into_iter()
+                .collect(),
+            unused_control: control.filter(|control| !control.is_exclusive()),
             tables: Vec::new(),
             lifecycles: Vec::new(),
             pending: Vec::new(),
@@ -592,9 +645,40 @@ impl<T: ChildAddressTags> ForkStock<T> {
         &self.lifecycles
     }
 
+    /// Replace the initial capacity before a guest can borrow stock. The
+    /// carrier retains the physical backing of every supplied window.
+    #[cfg(test)]
+    pub(crate) fn install_control_capacity(
+        &mut self,
+        controls: Vec<ForkControlCapacity>,
+    ) -> Result<(), ForkStockServiceError> {
+        let mut unique = controls.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        if controls.is_empty()
+            || unique.len() != controls.len()
+            || controls.iter().any(|control| !control.is_exclusive())
+            || !self.tables.is_empty()
+            || !self.lifecycles.is_empty()
+            || !self.children.is_empty()
+            || !self.committed_tables.is_empty()
+            || self.pending.iter().any(Option::is_some)
+        {
+            return Err(ForkStockServiceError::InvalidRecord);
+        }
+        self.controls = controls;
+        self.unused_control = None;
+        Ok(())
+    }
+
     /// True when a fork can be admitted a lifecycle record right now.
     pub fn lifecycle_available(&self) -> bool {
         !self.lifecycles.is_empty()
+    }
+
+    /// Whether the next loan needs another ISA control window.
+    pub fn needs_control_capacity(&self) -> bool {
+        self.controls.is_empty() && self.unused_control.is_none()
     }
 
     pub fn pending(&self, cpu: CpuId) -> Option<&PendingForkLoan<T::Tag>> {
@@ -767,6 +851,9 @@ impl<T: ChildAddressTags> ForkStock<T> {
         if self.lifecycles.is_empty() {
             return self.refuse_capacity(exchange, ForkCapacityResource::Lifecycle, execution.cpu);
         }
+        if self.controls.is_empty() && self.unused_control.is_none() {
+            return self.refuse_capacity(exchange, ForkCapacityResource::Control, execution.cpu);
+        }
         let Some((child_tables, parent_tables)) =
             take_fork_table_stock(&mut self.tables, request.child_bytes, request.parent_bytes)
         else {
@@ -795,6 +882,15 @@ impl<T: ChildAddressTags> ForkStock<T> {
                 self.refuse_capacity(exchange, ForkCapacityResource::Lifecycle, execution.cpu);
             return released.map_err(|_| ForkStockRefusal::Invalid).and(refused);
         };
+        let Some(control) = self.unused_control.or_else(|| self.controls.pop()) else {
+            self.tables.extend(child_tables);
+            self.tables.extend(parent_tables);
+            self.lifecycles.push(lifecycle);
+            let released = self.tags.release_unpublished(tag);
+            let refused =
+                self.refuse_capacity(exchange, ForkCapacityResource::Control, execution.cpu);
+            return released.map_err(|_| ForkStockRefusal::Invalid).and(refused);
+        };
         let id = self.next_loan;
         let child_base = child_tables[0].address().raw();
         let parent_base = parent_tables[0].address().raw();
@@ -804,6 +900,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
             child_tables,
             parent_tables,
             lifecycle,
+            control,
             tag,
         };
         let fresh = lifecycle_fresh(lifecycle);
@@ -811,7 +908,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
             .admit_loan(
                 child_base,
                 parent_base,
-                self.kernel_control_ipa,
+                control.base(),
                 id,
                 lifecycle,
                 T::wire(tag),
@@ -855,7 +952,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
         if !exchange.grant(
             child_base,
             parent_base,
-            self.kernel_control_ipa,
+            control.base(),
             id,
             lifecycle,
             T::wire(tag),
@@ -881,6 +978,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
             child_tables,
             parent_tables,
             lifecycle,
+            control,
             tag,
         });
         Ok(loan)
@@ -914,6 +1012,9 @@ impl<T: ChildAddressTags> ForkStock<T> {
         self.tables.extend(reserved.child_tables);
         self.tables.extend(reserved.parent_tables);
         self.lifecycles.push(reserved.lifecycle);
+        if reserved.control.is_exclusive() {
+            self.controls.push(reserved.control);
+        }
         self.tags
             .release_unpublished(reserved.tag)
             .map_err(|_| ForkStockRefusal::Invalid)
@@ -1023,6 +1124,9 @@ impl<T: ChildAddressTags> ForkStock<T> {
             self.tables.extend(pending.child_tables);
             self.tables.extend(pending.parent_tables);
             self.lifecycles.push(pending.lifecycle);
+            if pending.control.is_exclusive() {
+                self.controls.push(pending.control);
+            }
         } else {
             let completion =
                 self.validate_commit(execution, settlement, &is_resolvable, &is_clean)?;
@@ -1044,6 +1148,7 @@ impl<T: ChildAddressTags> ForkStock<T> {
                 CommittedChild {
                     root: pending.child_tables[0],
                     lifecycle: pending.lifecycle,
+                    control: pending.control,
                     tag: ChildTag::bind(pending.tag, loan.request.child_mm),
                 },
             );
@@ -1176,6 +1281,9 @@ impl<T: ChildAddressTags> ForkStock<T> {
                 self.tables.extend(pages);
             }
             self.lifecycles.push(child.lifecycle);
+            if child.control.is_exclusive() {
+                self.controls.push(child.control);
+            }
             self.quarantine.remove(&key);
             reclaimed += 1;
             self.counters.returned_children = self.counters.returned_children.saturating_add(1);
@@ -1194,6 +1302,28 @@ impl<T: ChildAddressTags> ForkStock<T> {
     }
 }
 
+impl ForkStock<AsidAllocator> {
+    /// Admit one newly mapped AArch64 control window before the next loan.
+    /// The constructor is ISA-bound: `ForkStock<UntaggedRoots>` has no such
+    /// method and cannot manufacture an exclusive capacity through `new`.
+    pub fn provide_arm_control_capacity(&mut self, base: u64) -> Result<(), ForkStockServiceError> {
+        let control =
+            ForkControlCapacity::exclusive(base).ok_or(ForkStockServiceError::InvalidRecord)?;
+        if self.controls.contains(&control)
+            || self
+                .pending
+                .iter()
+                .flatten()
+                .any(|loan| loan.control == control)
+            || self.children.values().any(|child| child.control == control)
+        {
+            return Err(ForkStockServiceError::InvalidRecord);
+        }
+        self.controls.push(control);
+        Ok(())
+    }
+}
+
 fn cpu_index(cpu: CpuId) -> Option<usize> {
     usize::try_from(cpu.raw()).ok()
 }
@@ -1205,6 +1335,7 @@ struct ReservedLoan<T> {
     child_tables: Vec<RootGpa>,
     parent_tables: Vec<RootGpa>,
     lifecycle: ForkLifecycleLoan,
+    control: ForkControlCapacity,
     tag: T,
 }
 

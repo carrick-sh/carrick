@@ -8107,7 +8107,7 @@ impl HvfInner {
     pub(crate) fn run_to_exit(
         vcpu: &mut applevisor::vcpu::Vcpu,
         mailbox: &mut MailboxBinding,
-        custody: &CarrierVmCustody,
+        custody: &std::sync::Arc<CarrierVmCustody>,
         vm_generation: Option<CarrierVmGeneration>,
     ) -> Result<carrick_aarch64::Aarch64Exit, TrapError> {
         // The slot runs (odd sequence) for exactly this call: a host thread
@@ -8132,7 +8132,7 @@ impl HvfInner {
     fn run_to_exit_inner(
         vcpu: &mut applevisor::vcpu::Vcpu,
         mailbox: &mut MailboxBinding,
-        custody: &CarrierVmCustody,
+        custody: &std::sync::Arc<CarrierVmCustody>,
         vm_generation: Option<CarrierVmGeneration>,
         kick_armed: &mut bool,
     ) -> Result<carrick_aarch64::Aarch64Exit, TrapError> {

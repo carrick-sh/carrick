@@ -1880,7 +1880,11 @@ mod custody_tests {
         };
         assert!(boot.lifecycles.iter().all(|life| window.is_zero(*life)));
         let carrier = NonZeroU64::new(7).unwrap();
-        let mut stock = ForkStock::new(carrier, KERNEL_REGION_GPA, UntaggedRoots);
+        let mut stock = ForkStock::new(
+            carrier,
+            carrick_hal::fork_stock::ForkControlCapacity::unused(KERNEL_REGION_GPA),
+            UntaggedRoots,
+        );
         stock.install(boot.tables, boot.lifecycles).unwrap();
         let exec = execution();
         let request = ForkStockRequest {
