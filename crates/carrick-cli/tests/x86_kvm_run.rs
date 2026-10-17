@@ -1757,8 +1757,8 @@ fn mounted_static_x86_exiting_last_writer_reaches_host_eof() {
 }
 
 #[test]
-fn mounted_static_x86_forked_child_last_writer_reaches_host_eof() {
-    compare_mounted_assembly_with_native("x86_child_last_writer.S", b"E\n");
+fn mounted_static_x86_forked_child_stdout_matches_native_while_parent_waits() {
+    compare_mounted_assembly_with_native("x86_forked_child_stdout.S", b"E");
 }
 
 #[test]

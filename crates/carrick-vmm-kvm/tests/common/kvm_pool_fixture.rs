@@ -40,6 +40,36 @@ pub fn try_run_program_with(
     carrick_runtime::prepare::PreparedKvmPoolOutcome,
     carrick_kernel::run_result::RuntimeError,
 > {
+    try_run_program_with_root_affinity(program, max_exits, ROOT_AFFINITY_ANY, configure)
+}
+
+/// The root may run on either guest CPU.
+pub const ROOT_AFFINITY_ANY: u64 = 3;
+/// Only the idle peer (CPU 1) may schedule the root once it leaves CPU 0;
+/// its forked children inherit the mask, so EL1 queues them only there.
+pub const ROOT_AFFINITY_IDLE_PEER: u64 = 2;
+
+pub fn try_run_pool_fixture_with_root_affinity(
+    elf: &[u8],
+    max_exits: usize,
+    affinity: u64,
+) -> Result<
+    carrick_runtime::prepare::PreparedKvmPoolOutcome,
+    carrick_kernel::run_result::RuntimeError,
+> {
+    let program = carrick_mem::elf::ElfProgram::load(elf, 62, &|_| None).expect("ELF program");
+    try_run_program_with_root_affinity(&program, max_exits, affinity, |_| {})
+}
+
+pub fn try_run_program_with_root_affinity(
+    program: &carrick_mem::elf::ElfProgram<'_>,
+    max_exits: usize,
+    affinity: u64,
+    configure: impl FnOnce(&mut Cpl0Carrier),
+) -> Result<
+    carrick_runtime::prepare::PreparedKvmPoolOutcome,
+    carrick_kernel::run_result::RuntimeError,
+> {
     let image = prepare_x86_elf(program).expect("x86 ELF program");
     let extent =
         Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("bounded initial extent");
@@ -58,7 +88,7 @@ pub fn try_run_program_with(
                 mm: 0,
                 file_table: root.resources().files().id().raw(),
                 generation: carrick_kernel::kernel::objects::ExecutionGeneration::INITIAL.raw(),
-                affinity: 3,
+                affinity,
                 lifecycle_page: 0,
                 control_slot: 0,
             },

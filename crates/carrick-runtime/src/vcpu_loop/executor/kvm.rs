@@ -214,10 +214,20 @@ impl KvmForwardStats {
             crate::prepare::InitialForwardClass::Host(_) => &self.host,
             crate::prepare::InitialForwardClass::Refuse(_) => &self.refusal,
         };
+        Self::count(map, class.family())
+    }
+
+    /// Refusals of a forward the stopped task's authority cannot serve are
+    /// counted beside the ENOSYS refusals, so a refused run shows them.
+    fn record_authority_refusal(&self, refusal: ForwardAuthorityRefusal) -> Result<(), TrapError> {
+        Self::count(&self.refusal, refusal.family())
+    }
+
+    fn count(map: &Mutex<KvmForwardCounts>, family: &'static str) -> Result<(), TrapError> {
         let mut map = map
             .lock()
             .map_err(|_| TrapError::Hypervisor("KVM forward counters poisoned".into()))?;
-        let count = map.entry(class.family()).or_default();
+        let count = map.entry(family).or_default();
         *count = count
             .checked_add(1)
             .ok_or_else(|| TrapError::Hypervisor("KVM forward counter overflow".into()))?;
@@ -386,6 +396,65 @@ enum ForwardDecision {
     Blocked(ForwardRequest, Box<DispatchOutcome>),
 }
 
+/// Whose authority a stopped forward runs under, from the CR3-authenticated
+/// task identity the carrier resolved for the stopping CPU. Only the task
+/// whose [`KvmTaskBinding`] this executor holds has a host `KernelContext`
+/// and (on a loaded lane) a host execution lease. A CPL0-forked child has
+/// neither: its fd table, credentials and waits live in the ring, and the
+/// root's context or lease must never stand in for them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForwardAuthority {
+    Task,
+    InZoneChild,
+}
+
+impl ForwardAuthority {
+    fn of(task: TaskIdentity, binding: &KvmTaskBinding) -> Self {
+        if task == binding.arch().task() {
+            Self::Task
+        } else {
+            Self::InZoneChild
+        }
+    }
+}
+
+/// A forward refused before any forward token is taken, because serving it
+/// would borrow an authority the stopped task does not own. The run fails
+/// closed with this reason; owned host context and parking for in-zone
+/// children is follow-up work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForwardAuthorityRefusal {
+    /// The call needs a host task context (fd table, offsets, credentials)
+    /// that an in-zone child does not have.
+    HostTaskContext { native: u64 },
+    /// The call must wait, and a wait parks only on the waiting task's own
+    /// execution lease; this executor holds none for the stopped task.
+    BlockingWait,
+}
+
+impl ForwardAuthorityRefusal {
+    const fn family(self) -> &'static str {
+        match self {
+            Self::HostTaskContext { .. } => "authority_host_task_context",
+            Self::BlockingWait => "authority_blocking_wait",
+        }
+    }
+}
+
+impl std::fmt::Display for ForwardAuthorityRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HostTaskContext { native } => write!(
+                formatter,
+                "forward refused: x86 syscall {native} from an in-zone child needs a host task context it does not own"
+            ),
+            Self::BlockingWait => formatter.write_str(
+                "forward refused: a blocking wait needs the stopped task's own execution lease",
+            ),
+        }
+    }
+}
+
 impl KvmPersistentExecutor {
     fn sample_host_readiness(
         venue: &mut carrick_vmm_kvm::cpl0_boot::ForwardVenue<'_>,
@@ -519,6 +588,14 @@ impl KvmPersistentExecutor {
         submission: Option<&mut ExecutorSubmissionContext<'_>>,
     ) -> Result<ExecutorExit, TrapError> {
         let binding = self.binding.as_ref().unwrap_or(&self.root_binding);
+        let authority = ForwardAuthority::of(task, binding);
+        // Only the bound task may park, and only on the lease this lane holds.
+        let can_block = authority == ForwardAuthority::Task && submission.is_some();
+        let stats = &self.stats;
+        let refuse = |refusal: ForwardAuthorityRefusal| -> Result<ForwardDecision, TrapError> {
+            stats.record_authority_refusal(refusal)?;
+            Err(TrapError::Hypervisor(refusal.to_string()))
+        };
         let mut dispatcher = self
             .dispatcher
             .lock()
@@ -615,6 +692,7 @@ impl KvmPersistentExecutor {
                     )),
                     HostReadinessStep::Wait(fds) => {
                         match Self::host_readiness_wait(readiness, fds) {
+                            Some(_) if !can_block => refuse(ForwardAuthorityRefusal::BlockingWait),
                             Some(outcome) => Ok(ForwardDecision::Blocked(
                                 ForwardRequest::HostReadiness(readiness),
                                 Box::new(outcome),
@@ -647,6 +725,41 @@ impl KvmPersistentExecutor {
                 }
             };
             let class = crate::prepare::classify_initial_x86_forward(raw.native_number, raw.args);
+            if authority == ForwardAuthority::InZoneChild
+                && matches!(class, crate::prepare::InitialForwardClass::Host(_))
+            {
+                // The ring resolves a write to fd 0..=2 through the child's
+                // own file table before it forwards anything: a binding to a
+                // different stdio stream crosses as `HostObjectWriteCrossing`,
+                // an unbound or non-host fd is answered in-ring, and only a
+                // write whose fd is bound to the same-numbered host stdio
+                // stream reaches here raw (`linux_personality.rs`,
+                // `CompletionRoute::Forward`). That is the one raw call served
+                // without a host task context; it is the same service as the
+                // binding-keyed crossing.
+                let stdio_fd = raw.args[0];
+                if raw.number.0 == carrick_personality_linux::crossing::nr::WRITE.raw()
+                    && (stdio_fd == 1 || stdio_fd == 2)
+                {
+                    let length = usize::try_from(raw.args[2]).map_err(|_| {
+                        TrapError::Hypervisor("in-zone stdio write length overflow".into())
+                    })?;
+                    let bytes = venue
+                        .read_bytes_prefix(raw.args[1], length)
+                        .map_err(|error| {
+                            TrapError::Hypervisor(format!("in-zone stdio write copy: {error}"))
+                        })?;
+                    self.stats.record(class)?;
+                    return Ok(ForwardDecision::Immediate(
+                        InitialSyscallDisposition::Return(
+                            dispatcher.forward_stdio_bytes(stdio_fd as i32, &bytes),
+                        ),
+                    ));
+                }
+                return refuse(ForwardAuthorityRefusal::HostTaskContext {
+                    native: raw.native_number.0,
+                });
+            }
             self.stats.record(class)?;
             match class {
                 crate::prepare::InitialForwardClass::Host(_) => {}
@@ -680,6 +793,7 @@ impl KvmPersistentExecutor {
                         GuestExitStatus::from_linux_code(code),
                     )))
                 }
+                _ if !can_block => refuse(ForwardAuthorityRefusal::BlockingWait),
                 other => Ok(ForwardDecision::Blocked(
                     ForwardRequest::Syscall(request),
                     Box::new(other),
@@ -690,9 +804,7 @@ impl KvmPersistentExecutor {
         match decision {
             ForwardDecision::Blocked(request, outcome) => {
                 let submission = submission.ok_or_else(|| {
-                    TrapError::Hypervisor(
-                        "idle KVM peer forward cannot block without a host task lease".into(),
-                    )
+                    TrapError::Hypervisor(ForwardAuthorityRefusal::BlockingWait.to_string())
                 })?;
                 return Self::block_forward(binding, submission, request, *outcome, Some(token));
             }
@@ -716,6 +828,257 @@ impl KvmPersistentExecutor {
         // carrier's physical coordinator.
         self.scheduler.poke_executor_control();
         Ok(ExecutorExit::Syscall)
+    }
+
+    /// The single terminal path for every executor lane: a lane error that
+    /// ends the run reaches the run's completion receiver exactly once, so no
+    /// early return can leave `prepare` waiting on a retired worker.
+    fn settle_lane<T>(&mut self, result: Result<T, TrapError>) -> Result<T, TrapError> {
+        if let Err(error) = &result
+            && !self.completion_sent
+        {
+            let _ = self.completed.send(Err(error.to_string()));
+            self.completion_sent = true;
+        }
+        result
+    }
+
+    fn run_loaded_lane(
+        &mut self,
+        need_resched: &AtomicBool,
+        submission: &mut ExecutorSubmissionContext<'_>,
+    ) -> Result<ExecutorExit, TrapError> {
+        if need_resched.load(Ordering::Acquire) {
+            return Ok(ExecutorExit::Preempted);
+        }
+        let task = self.task()?;
+        let binding = self
+            .binding
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("KVM forward lost task binding".into()))?;
+        let lease = submission.execution_lease_mut()?;
+        ForwardOwner::new(
+            binding.thread,
+            self.loaded_generation.ok_or_else(|| {
+                TrapError::Hypervisor("KVM forward has no loaded lease generation".into())
+            })?,
+            binding.arch().task(),
+        )
+        .admit(lease.thread_key(), lease.generation(), self.task)?;
+        if let Some(binding) = self.binding.as_ref().cloned()
+            && submission
+                .execution_lease_mut()?
+                .blocked_continuation()
+                .is_some()
+        {
+            let retained = binding
+                .retained
+                .lock()
+                .map_err(|_| TrapError::Hypervisor("KVM retained frame poisoned".into()))?
+                .take()
+                .ok_or_else(|| {
+                    TrapError::Hypervisor("KVM blocked task lost forward frame".into())
+                })?;
+            let context = binding.fresh_context()?;
+            let event = submission
+                .execution_lease_mut()?
+                .blocked_continuation()
+                .ok_or_else(|| TrapError::Hypervisor("KVM continuation vanished".into()))?
+                .ready_event()
+                .map_err(|error| TrapError::Hypervisor(format!("KVM wake event: {error:?}")))?;
+            let mut result =
+                resume_continuation(submission.execution_lease_mut()?, event, &context)
+                    .map_err(|error| TrapError::Hypervisor(format!("KVM resume: {error:?}")))?;
+            let restart = match route_kvm_resume_effects(result.take_resume_effects()) {
+                KvmResumeEffect::Continue(restart) => restart,
+                KvmResumeEffect::Refuse(errno) => {
+                    self.physical
+                        .complete_forward(task, retained.frame, errno.guest_retval())?;
+                    return Ok(ExecutorExit::Syscall);
+                }
+            };
+            if restart == Some(carrick_kernel::kernel::continuation::RestartDecision::Restart)
+                && matches!(
+                    result.completion,
+                    carrick_kernel::kernel::continuation::ContinuationCompletion::Errno(
+                        carrick_abi::LINUX_EINTR
+                    )
+                )
+            {
+                result.completion =
+                    carrick_kernel::kernel::continuation::ContinuationCompletion::Redispatch;
+            }
+            let mut dispatcher = self
+                .dispatcher
+                .lock()
+                .map_err(|_| TrapError::Hypervisor("KVM dispatcher poisoned".into()))?;
+            let outcome = self
+                .physical
+                .with_retained_forward(task, &retained.frame, |venue| {
+                    let folded = fold_continuation_completion(
+                        result.completion,
+                        &dispatcher,
+                        &context,
+                        venue,
+                    )
+                    .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+                    match folded {
+                        Some(outcome) => Ok(outcome),
+                        None if let ForwardRequest::HostReadiness(readiness) = retained.request => {
+                            match Self::sample_host_readiness(
+                                venue,
+                                readiness,
+                                &self.bound_host_fds,
+                            )? {
+                                HostReadinessStep::Ready(value) => {
+                                    Ok(DispatchOutcome::Returned { value })
+                                }
+                                HostReadinessStep::Wait(fds) => {
+                                    Ok(Self::host_readiness_wait(readiness, fds)
+                                        .unwrap_or(DispatchOutcome::Returned { value: 0 }))
+                                }
+                            }
+                        }
+                        None => dispatcher
+                            .dispatch(
+                                &context,
+                                retained.request.syscall().ok_or_else(|| {
+                                    TrapError::Hypervisor(
+                                        "readiness request lacks its owner".into(),
+                                    )
+                                })?,
+                                venue,
+                                &self.reporter,
+                            )
+                            .map_err(|error| TrapError::Hypervisor(error.to_string())),
+                    }
+                })?;
+            drop(dispatcher);
+            match outcome {
+                DispatchOutcome::Returned { value } => {
+                    self.physical
+                        .complete_forward(task, retained.frame, value)?;
+                    return Ok(ExecutorExit::Syscall);
+                }
+                DispatchOutcome::Errno { errno } => {
+                    self.physical
+                        .complete_forward(task, retained.frame, errno.guest_retval())?;
+                    return Ok(ExecutorExit::Syscall);
+                }
+                other => {
+                    let mut slot = binding
+                        .retained
+                        .lock()
+                        .map_err(|_| TrapError::Hypervisor("KVM retained frame poisoned".into()))?;
+                    let request = retained.request;
+                    *slot = Some(retained);
+                    drop(slot);
+                    return Self::block_forward(&binding, submission, request, other, None);
+                }
+            }
+        }
+        let exited = self
+            .exits
+            .fetch_add(1, Ordering::AcqRel)
+            .checked_add(1)
+            .ok_or_else(|| TrapError::Hypervisor("KVM exit count overflow".into()))?;
+        if exited > self.max_exits {
+            return Err(TrapError::Hypervisor(
+                "KVM guest exit budget exceeded".into(),
+            ));
+        }
+        let stopped =
+            self.physical.cpu_mut().run_loaded(task).map_err(|error| {
+                TrapError::Hypervisor(format!("KVM stopped run boundary: {error}"))
+            })?;
+        match &stopped.exit {
+            CarrierRunExit::PhysicalDoorbell { .. } => {
+                let binding = self.binding.as_ref().ok_or_else(|| {
+                    TrapError::Hypervisor("KVM doorbell lost task binding".into())
+                })?;
+                let kernel = binding.kernel_binding.kernel();
+                let status = self.physical.service_physical_doorbell(
+                    task,
+                    &stopped.exit,
+                    |served, pending| {
+                        carrick_kernel::el1_delegation::settle_host_work_boundary(
+                            kernel, served, pending,
+                        );
+                    },
+                )?;
+                self.scheduler.poke_executor_control();
+                if let Some(status) = status {
+                    self.publish_exit(status.into_initial_process_exit(exited))?;
+                    Ok(ExecutorExit::Exited)
+                } else {
+                    Ok(ExecutorExit::ResumeEl1)
+                }
+            }
+            CarrierRunExit::SyscallTrap => {
+                let forward_task = stopped
+                    .state
+                    .as_ref()
+                    .map_or(task, |state| state.binding().task());
+                self.service_syscall_trap(forward_task, exited, Some(submission))
+            }
+            CarrierRunExit::Kick => Ok(ExecutorExit::Preempted),
+            CarrierRunExit::FaultDoorbellWord(first) => {
+                let record = self.physical.capture_fault_record(task, *first)?;
+                self.publish_exit(InitialProcessExit::Fault {
+                    record,
+                    exits: exited,
+                })?;
+                Ok(ExecutorExit::Exited)
+            }
+            CarrierRunExit::FaultException { .. } | CarrierRunExit::Halt => {
+                Err(TrapError::Hypervisor("unexpected KVM task exit".into()))
+            }
+        }
+    }
+
+    /// The idle peer's guest wait. It owns no host task lease; see
+    /// [`Self::service_syscall_trap`] for what it may serve.
+    fn run_idle_lane(&mut self) -> Result<GuestIdleExit, TrapError> {
+        if !self.physical.is_idle_peer_slot() {
+            return Ok(GuestIdleExit::Unsupported);
+        }
+        match self.physical.run_idle_peer()? {
+            exit @ CarrierRunExit::PhysicalDoorbell { .. } => {
+                let kernel = self.scheduler.kernel();
+                if let Some(status) =
+                    self.physical
+                        .service_idle_peer_doorbell(&exit, |served, pending| {
+                            carrick_kernel::el1_delegation::settle_host_work_boundary(
+                                kernel, served, pending,
+                            );
+                        })?
+                {
+                    let exits = self.exits.load(Ordering::Acquire);
+                    self.publish_exit(status.into_initial_process_exit(exits))?;
+                }
+                Ok(GuestIdleExit::Idle)
+            }
+            CarrierRunExit::SyscallTrap => {
+                let exited = self
+                    .exits
+                    .fetch_add(1, Ordering::AcqRel)
+                    .checked_add(1)
+                    .ok_or_else(|| TrapError::Hypervisor("KVM exit count overflow".into()))?;
+                if exited > self.max_exits {
+                    return Err(TrapError::Hypervisor(
+                        "KVM guest exit budget exceeded".into(),
+                    ));
+                }
+                let task = self.physical.idle_peer_task()?;
+                self.service_syscall_trap(task, exited, None)?;
+                Ok(GuestIdleExit::Idle)
+            }
+            CarrierRunExit::Halt => Ok(GuestIdleExit::Unsupported),
+            CarrierRunExit::Kick => Ok(GuestIdleExit::Idle),
+            other => Err(TrapError::Hypervisor(format!(
+                "idle KVM peer needs a host task handback: {other:?}"
+            ))),
+        }
     }
 }
 
@@ -768,207 +1131,8 @@ impl PersistentExecutor for KvmPersistentExecutor {
         need_resched: &AtomicBool,
         submission: &mut ExecutorSubmissionContext<'_>,
     ) -> Result<ExecutorExit, TrapError> {
-        let result = (|| {
-            if need_resched.load(Ordering::Acquire) {
-                return Ok(ExecutorExit::Preempted);
-            }
-            let task = self.task()?;
-            let binding = self
-                .binding
-                .as_ref()
-                .ok_or_else(|| TrapError::Hypervisor("KVM forward lost task binding".into()))?;
-            let lease = submission.execution_lease_mut()?;
-            ForwardOwner::new(
-                binding.thread,
-                self.loaded_generation.ok_or_else(|| {
-                    TrapError::Hypervisor("KVM forward has no loaded lease generation".into())
-                })?,
-                binding.arch().task(),
-            )
-            .admit(lease.thread_key(), lease.generation(), self.task)?;
-            if let Some(binding) = self.binding.as_ref().cloned()
-                && submission
-                    .execution_lease_mut()?
-                    .blocked_continuation()
-                    .is_some()
-            {
-                let retained = binding
-                    .retained
-                    .lock()
-                    .map_err(|_| TrapError::Hypervisor("KVM retained frame poisoned".into()))?
-                    .take()
-                    .ok_or_else(|| {
-                        TrapError::Hypervisor("KVM blocked task lost forward frame".into())
-                    })?;
-                let context = binding.fresh_context()?;
-                let event = submission
-                    .execution_lease_mut()?
-                    .blocked_continuation()
-                    .ok_or_else(|| TrapError::Hypervisor("KVM continuation vanished".into()))?
-                    .ready_event()
-                    .map_err(|error| TrapError::Hypervisor(format!("KVM wake event: {error:?}")))?;
-                let mut result =
-                    resume_continuation(submission.execution_lease_mut()?, event, &context)
-                        .map_err(|error| TrapError::Hypervisor(format!("KVM resume: {error:?}")))?;
-                let restart = match route_kvm_resume_effects(result.take_resume_effects()) {
-                    KvmResumeEffect::Continue(restart) => restart,
-                    KvmResumeEffect::Refuse(errno) => {
-                        self.physical.complete_forward(
-                            task,
-                            retained.frame,
-                            errno.guest_retval(),
-                        )?;
-                        return Ok(ExecutorExit::Syscall);
-                    }
-                };
-                if restart == Some(carrick_kernel::kernel::continuation::RestartDecision::Restart)
-                    && matches!(
-                        result.completion,
-                        carrick_kernel::kernel::continuation::ContinuationCompletion::Errno(
-                            carrick_abi::LINUX_EINTR
-                        )
-                    )
-                {
-                    result.completion =
-                        carrick_kernel::kernel::continuation::ContinuationCompletion::Redispatch;
-                }
-                let mut dispatcher = self
-                    .dispatcher
-                    .lock()
-                    .map_err(|_| TrapError::Hypervisor("KVM dispatcher poisoned".into()))?;
-                let outcome =
-                    self.physical
-                        .with_retained_forward(task, &retained.frame, |venue| {
-                            let folded = fold_continuation_completion(
-                                result.completion,
-                                &dispatcher,
-                                &context,
-                                venue,
-                            )
-                            .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
-                            match folded {
-                                Some(outcome) => Ok(outcome),
-                                None if let ForwardRequest::HostReadiness(readiness) =
-                                    retained.request =>
-                                {
-                                    match Self::sample_host_readiness(
-                                        venue,
-                                        readiness,
-                                        &self.bound_host_fds,
-                                    )? {
-                                        HostReadinessStep::Ready(value) => {
-                                            Ok(DispatchOutcome::Returned { value })
-                                        }
-                                        HostReadinessStep::Wait(fds) => {
-                                            Ok(Self::host_readiness_wait(readiness, fds)
-                                                .unwrap_or(DispatchOutcome::Returned { value: 0 }))
-                                        }
-                                    }
-                                }
-                                None => dispatcher
-                                    .dispatch(
-                                        &context,
-                                        retained.request.syscall().ok_or_else(|| {
-                                            TrapError::Hypervisor(
-                                                "readiness request lacks its owner".into(),
-                                            )
-                                        })?,
-                                        venue,
-                                        &self.reporter,
-                                    )
-                                    .map_err(|error| TrapError::Hypervisor(error.to_string())),
-                            }
-                        })?;
-                drop(dispatcher);
-                match outcome {
-                    DispatchOutcome::Returned { value } => {
-                        self.physical
-                            .complete_forward(task, retained.frame, value)?;
-                        return Ok(ExecutorExit::Syscall);
-                    }
-                    DispatchOutcome::Errno { errno } => {
-                        self.physical.complete_forward(
-                            task,
-                            retained.frame,
-                            errno.guest_retval(),
-                        )?;
-                        return Ok(ExecutorExit::Syscall);
-                    }
-                    other => {
-                        let mut slot = binding.retained.lock().map_err(|_| {
-                            TrapError::Hypervisor("KVM retained frame poisoned".into())
-                        })?;
-                        let request = retained.request;
-                        *slot = Some(retained);
-                        drop(slot);
-                        return Self::block_forward(&binding, submission, request, other, None);
-                    }
-                }
-            }
-            let exited = self
-                .exits
-                .fetch_add(1, Ordering::AcqRel)
-                .checked_add(1)
-                .ok_or_else(|| TrapError::Hypervisor("KVM exit count overflow".into()))?;
-            if exited > self.max_exits {
-                return Err(TrapError::Hypervisor(
-                    "KVM guest exit budget exceeded".into(),
-                ));
-            }
-            let stopped = self.physical.cpu_mut().run_loaded(task).map_err(|error| {
-                TrapError::Hypervisor(format!("KVM stopped run boundary: {error}"))
-            })?;
-            match &stopped.exit {
-                CarrierRunExit::PhysicalDoorbell { .. } => {
-                    let binding = self.binding.as_ref().ok_or_else(|| {
-                        TrapError::Hypervisor("KVM doorbell lost task binding".into())
-                    })?;
-                    let kernel = binding.kernel_binding.kernel();
-                    let status = self.physical.service_physical_doorbell(
-                        task,
-                        &stopped.exit,
-                        |served, pending| {
-                            carrick_kernel::el1_delegation::settle_host_work_boundary(
-                                kernel, served, pending,
-                            );
-                        },
-                    )?;
-                    self.scheduler.poke_executor_control();
-                    if let Some(status) = status {
-                        self.publish_exit(status.into_initial_process_exit(exited))?;
-                        Ok(ExecutorExit::Exited)
-                    } else {
-                        Ok(ExecutorExit::ResumeEl1)
-                    }
-                }
-                CarrierRunExit::SyscallTrap => {
-                    let forward_task = stopped
-                        .state
-                        .as_ref()
-                        .map_or(task, |state| state.binding().task());
-                    self.service_syscall_trap(forward_task, exited, Some(submission))
-                }
-                CarrierRunExit::Kick => Ok(ExecutorExit::Preempted),
-                CarrierRunExit::FaultDoorbellWord(first) => {
-                    let record = self.physical.capture_fault_record(task, *first)?;
-                    self.publish_exit(InitialProcessExit::Fault {
-                        record,
-                        exits: exited,
-                    })?;
-                    Ok(ExecutorExit::Exited)
-                }
-                CarrierRunExit::FaultException { .. } | CarrierRunExit::Halt => {
-                    Err(TrapError::Hypervisor("unexpected KVM task exit".into()))
-                }
-            }
-        })();
-        if let Err(error) = &result {
-            if !self.completion_sent {
-                let _ = self.completed.send(Err(error.to_string()));
-                self.completion_sent = true;
-            }
-        }
-        result
+        let result = self.run_loaded_lane(need_resched, submission);
+        self.settle_lane(result)
     }
 
     fn take_cpu_receipt(&mut self) -> ExecutorCpuReceipt {
@@ -1083,53 +1247,8 @@ impl PersistentExecutor for KvmPersistentExecutor {
     }
 
     fn wait_in_guest(&mut self) -> Result<GuestIdleExit, TrapError> {
-        if !self.physical.is_idle_peer_slot() {
-            return Ok(GuestIdleExit::Unsupported);
-        }
-        let result = match self.physical.run_idle_peer()? {
-            exit @ CarrierRunExit::PhysicalDoorbell { .. } => {
-                let kernel = self.scheduler.kernel();
-                if let Some(status) =
-                    self.physical
-                        .service_idle_peer_doorbell(&exit, |served, pending| {
-                            carrick_kernel::el1_delegation::settle_host_work_boundary(
-                                kernel, served, pending,
-                            );
-                        })?
-                {
-                    let exits = self.exits.load(Ordering::Acquire);
-                    self.publish_exit(status.into_initial_process_exit(exits))?;
-                }
-                Ok(GuestIdleExit::Idle)
-            }
-            CarrierRunExit::SyscallTrap => {
-                let exited = self
-                    .exits
-                    .fetch_add(1, Ordering::AcqRel)
-                    .checked_add(1)
-                    .ok_or_else(|| TrapError::Hypervisor("KVM exit count overflow".into()))?;
-                if exited > self.max_exits {
-                    return Err(TrapError::Hypervisor(
-                        "KVM guest exit budget exceeded".into(),
-                    ));
-                }
-                let task = self.physical.idle_peer_task()?;
-                self.service_syscall_trap(task, exited, None)?;
-                Ok(GuestIdleExit::Idle)
-            }
-            CarrierRunExit::Halt => Ok(GuestIdleExit::Unsupported),
-            CarrierRunExit::Kick => Ok(GuestIdleExit::Idle),
-            other => Err(TrapError::Hypervisor(format!(
-                "idle KVM peer needs a host task handback: {other:?}"
-            ))),
-        };
-        if let Err(error) = &result {
-            if !self.completion_sent {
-                let _ = self.completed.send(Err(error.to_string()));
-                self.completion_sent = true;
-            }
-        }
-        result
+        let result = self.run_idle_lane();
+        self.settle_lane(result)
     }
 }
 
