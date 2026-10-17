@@ -5,10 +5,20 @@ pub const RESCHED_VECTOR: u8 = 0xe2;
 pub const SHOOTDOWN_VECTOR: u8 = 0xe3;
 pub const PAGE_FAULT_VECTOR: u8 = 14;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
-pub const IRQ_HEADER_GPA: u64 = 0x10_0000;
+/// Offset of the CPL0 IRQ header record within the supervisor image.
+pub const IRQ_HEADER_OFFSET: u64 = carrick_el1_abi::X86_CPL0_IRQ_HEADER_OFFSET;
+
+/// Guest-physical address of the native IRQ header record, derived from the
+/// supervisor image layout (base GPA plus IRQ header section offset).
+pub const IRQ_HEADER_GPA: u64 = carrick_el1_abi::X86_CPL0_IRQ_HEADER_GPA;
+
 pub const IRQ_HEADER_MAGIC: u64 = 0x3151_5249_4c50_4358;
 pub const LAPIC_BASE: u64 = 0xfee0_0000;
 pub const LAPIC_VA: u64 = 0xffff_ffff_d000_0000;
+
+const _: () = {
+    assert!(IRQ_HEADER_GPA == carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_GPA + IRQ_HEADER_OFFSET);
+};
 
 #[repr(transparent)]
 #[derive(
@@ -54,4 +64,31 @@ impl InterruptMask {
 #[cfg(not(target_os = "none"))]
 pub fn interrupt_gate(entry: u64) -> [u8; 16] {
     crate::fault::interrupt_gate_bytes(entry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn irq_header_gpa_derived_from_supervisor_layout() {
+        assert_eq!(
+            IRQ_HEADER_GPA,
+            carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_GPA
+                + carrick_el1_abi::X86_CPL0_IRQ_HEADER_OFFSET
+        );
+        assert_eq!(
+            IRQ_HEADER_OFFSET,
+            carrick_el1_abi::X86_CPL0_IRQ_HEADER_OFFSET
+        );
+    }
+
+    #[test]
+    fn guest_interrupts_has_no_stale_irq_header_gpa() {
+        const GUEST_INTERRUPTS: &str = include_str!("../../carrick-el1/src/isa/x86/interrupts.rs");
+        assert!(
+            !GUEST_INTERRUPTS.contains("IRQ_HEADER_GPA"),
+            "guest carrick-el1/src/isa/x86/interrupts.rs still contains stale IRQ_HEADER_GPA"
+        );
+    }
 }
