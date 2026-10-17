@@ -1,0 +1,12 @@
+{
+  "name": "carrick-workers",
+  "url": "https://github.com/carrick-sh/carrick",
+  "description": "Short-lived per-host worker identity for pull-based Carrick work",
+  "public": false,
+  "default_permissions": {
+    "contents": "write",
+    "pull_requests": "write",
+    "issues": "write"
+  },
+  "default_events": []
+}
