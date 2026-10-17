@@ -669,6 +669,11 @@ pub fn dispatch_entry(frame: &mut TrapFrame, counters: &Counters) -> Action {
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline(never)]
 fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
+    // DIAGNOSTIC #489 A/B: bypass checkpoint ownership work only for the
+    // generated forwarded-return SignalCheck entry. Never land this branch.
+    if matches!(frame.esr, 0xfffe | 0xfffd) {
+        return Action::Served;
+    }
     let current_tasks: &'static [CurrentTask; EL1_STACK_SLOTS as usize] =
         unsafe { &*(EL1_CURRENT_TASKS_BASE as *const [CurrentTask; EL1_STACK_SLOTS as usize]) };
     let Some(task) = current_tasks.get(frame.slot as usize) else {
