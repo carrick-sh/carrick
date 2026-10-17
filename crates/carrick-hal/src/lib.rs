@@ -112,7 +112,8 @@ pub use guest_timer_bridge::{NullGuestTimerBridge, NullTimerFiring};
 /// The dispatcher's seam onto the backend's host-signal plumbing.
 pub mod host_signal_bridge;
 pub use host_signal_bridge::{
-    GenericHostSignalBridge, HostSignalBridge, NO_PENDING_SIGNAL, WaitFd,
+    GenericHostSignalBridge, HostSignalBridge, NO_PENDING_SIGNAL, PendingSignalEvent,
+    PendingSignalOrigin, PendingSignalScope, PendingTimerInfo, WaitFd,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use host_signal_bridge::{NullHostSignalBridge, NullHostSignalGlue};

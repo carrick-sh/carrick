@@ -170,7 +170,7 @@ pub fn register_kicker(
 /// arm/disarm only).
 pub fn deliver(signum: i32) {
     if let Some(d) = crate::guest_timer_bridge::lock().as_ref() {
-        carrick_signal_linux::publish_process_signal(signum);
+        carrick_signal_linux::publish_process_timer_signal(signum, None);
         d.kicker.kick_all();
         (d.wake)();
     }

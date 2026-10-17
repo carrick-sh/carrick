@@ -368,6 +368,19 @@ pub fn publish_pending_for(tid: i32, signum: i32) {
 pub fn publish_pending_for_with_wake(tid: i32, signum: i32, wake: PublicationWake) {
     crate::probes::signal_publish(tid, signum, 1);
     carrick_signal_linux::publish_pending_for(tid, signum);
+    notify_published_thread_signal(tid, wake);
+}
+
+pub fn publish_thread_timer_signal(
+    tid: i32,
+    signum: i32,
+    info: carrick_signal_linux::PendingTimerInfo,
+) {
+    carrick_signal_linux::publish_pending_timer_for(tid, signum, info);
+    notify_published_thread_signal(tid, PublicationWake::SignalPump);
+}
+
+fn notify_published_thread_signal(tid: i32, wake: PublicationWake) {
     carrick_el1_abi::mark_pending_host_work_for_task(carrick_el1_abi::El1TaskId::from_linux_tid(
         tid,
     ));
@@ -569,6 +582,13 @@ pub fn has_unblocked_pending_for(tid: i32, block_mask: carrick_abi::SigBlockMask
         return true;
     }
     carrick_signal_linux::has_unblocked_pending_for(tid, block_mask)
+}
+
+pub fn claim_unblocked_pending_for(tid: i32, block_mask: carrick_abi::SigBlockMask) -> bool {
+    if carrick_signal_linux::xsig::xsig_has_unblocked_for_self(block_mask) {
+        return true;
+    }
+    carrick_signal_linux::claim_unblocked_pending_for(tid, block_mask)
 }
 
 /// Process-wide self-pipe used to wake threads parked in a blocking-I/O
@@ -1103,6 +1123,18 @@ pub fn publish_process_signal_with_wake(signum: i32, wake: PublicationWake) {
     if bit != 0 {
         proc_pending_fetch_or(bit);
     }
+    notify_published_process_signal(wake);
+}
+
+pub fn publish_process_timer_signal(
+    signum: i32,
+    info: Option<carrick_signal_linux::PendingTimerInfo>,
+) {
+    carrick_signal_linux::publish_process_timer_signal(signum, info);
+    notify_published_process_signal(PublicationWake::SignalPump);
+}
+
+fn notify_published_process_signal(wake: PublicationWake) {
     carrick_el1_abi::mark_pending_host_work_all();
     notify_waiters_fallback();
     if wake == PublicationWake::SignalPump {
@@ -1381,8 +1413,16 @@ impl carrick_hal::HostSignalBridge for HvfHostSignal {
         has_unblocked_pending_for(tid, block_mask)
     }
 
+    fn claim_unblocked_pending_for(&self, tid: i32, block_mask: carrick_abi::SigBlockMask) -> bool {
+        claim_unblocked_pending_for(tid, block_mask)
+    }
+
     fn take_pending_for(&self, tid: i32) -> i32 {
         take_pending_for(tid)
+    }
+
+    fn take_pending_event_for(&self, tid: i32) -> Option<carrick_hal::PendingSignalEvent> {
+        carrick_signal_linux::take_pending_event_for(tid)
     }
 
     fn take_pending_in_for(&self, tid: i32, wait_set: carrick_abi::SigSet) -> i32 {

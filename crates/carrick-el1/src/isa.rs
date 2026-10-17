@@ -95,6 +95,20 @@ pub fn frame_grant_residency_guest() -> &'static carrick_el1_abi::FrameGrantResi
     unsafe { &*(venues.residency.raw() as *const carrick_el1_abi::FrameGrantResidencyTable) }
 }
 
+/// ISA-neutral view of the one retained external-signal ingress queue.
+#[cfg(target_os = "none")]
+pub fn signal_ingress_guest() -> &'static carrick_el1_abi::SharedSignalIngressQueue {
+    #[cfg(target_arch = "aarch64")]
+    type Native = aarch64::Aarch64Backend;
+    #[cfg(target_arch = "x86_64")]
+    type Native = x86::X86Backend;
+    let layout = <Native as carrick_guest_arch::LayoutBackend>::KERNEL_LAYOUT;
+    let address = layout.region.raw() + carrick_el1_abi::EL1_SIGNAL_INGRESS_OFFSET;
+    // SAFETY: boot maps and initializes this aligned reservation before any
+    // guest CPU enters; the mapping is retained until all guest CPUs stop.
+    unsafe { &*(address as *const carrick_el1_abi::SharedSignalIngressQueue) }
+}
+
 #[cfg(test)]
 mod layout_tests {
     #[test]

@@ -17,6 +17,7 @@ use crate::SignalSet;
 
 /// Validated Linux kernel signal (1..=64), not libc's adjusted SIGRTMIN.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(transparent)]
 pub struct Signal(u8);
 
 impl Signal {

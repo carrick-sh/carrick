@@ -459,6 +459,137 @@ fn host_slot_signal_is_reserved_and_cancelled_into_exact_kernel_ownership() {
 }
 
 #[test]
+fn serial_host_periodic_process_timer_keeps_other_threads_sleep_deadline() {
+    use carrick_abi::LinuxTimespec;
+    use carrick_guest_mem::GuestMemory;
+    use std::time::{Duration, Instant};
+    use zerocopy::IntoBytes;
+
+    let (kernel, leader) = bootstrap(153_799);
+    let sleeper = kernel
+        .reserve_thread_clone(
+            &leader,
+            ClonePlan::from_flags(
+                LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap()
+        .prepare(ThreadId::synthetic_for_tests(153_800))
+        .unwrap()
+        .commit()
+        .unwrap()
+        .into_context()
+        .unwrap();
+    let control = sleeper.thread().control_slot();
+    control.bind_zone_record(carrick_sched_core::RecordRef {
+        id: carrick_sched_core::RecordId::from_raw(7).unwrap(),
+        incarnation: 13,
+    });
+    let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
+    custody.commit_registration();
+    custody.commit_native_signal_owner();
+    let mut memory = carrick_kernel::dispatch::LinearMemory::new(0x10000, vec![0; 0x1000]);
+    memory
+        .write_bytes(0x10100, LinuxTimespec::new(0, 80_000_000).as_bytes())
+        .unwrap();
+    let request = SyscallRequest::new(101, SyscallArgs::from([0x10100, 0, 0, 0, 0, 0]));
+    let outcome = carrick_kernel::dispatch::SyscallDispatcher::new()
+        .dispatch(
+            &sleeper,
+            request,
+            &mut memory,
+            &crate::compat::CompatReporter::default(),
+        )
+        .unwrap();
+    assert!(matches!(outcome, DispatchOutcome::WaitOnSleep { .. }));
+    let continuation = BlockedContinuation::from_dispatch_outcome(
+        outcome,
+        ContinuationCapture::new(
+            &sleeper,
+            publish(&sleeper, 0x719),
+            request,
+            RestartClass::Never,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let deadline = continuation.deadline().unwrap();
+    for _ in 0..3 {
+        carrick_signal_linux::publish_process_timer_signal(14, None);
+        assert!(carrick_signal_linux::claim_unblocked_pending_for(
+            leader.thread().key().tid.raw(),
+            carrick_abi::SigBlockMask::NONE,
+        ));
+        assert_eq!(
+            SignalReadinessProbe::from_continuation(&continuation).event(),
+            None
+        );
+        assert_eq!(
+            carrick_signal_linux::take_pending_event_for(leader.thread().key().tid.raw())
+                .unwrap()
+                .signum,
+            14
+        );
+        assert_eq!(continuation.deadline(), Some(deadline));
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+    assert!(Instant::now() >= deadline);
+    assert!(matches!(
+        continuation
+            .resume(ContinuationEvent::Timeout, &sleeper)
+            .unwrap()
+            .completion,
+        ContinuationCompletion::ReturnWithGuestWrites(0, _)
+    ));
+}
+
+#[test]
+fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
+    let (_kernel, context) = bootstrap(153_694);
+    let generation = publish(&context, 0x709);
+    let control = context.thread().control_slot();
+    control.bind_zone_record(carrick_sched_core::RecordRef {
+        id: carrick_sched_core::RecordId::from_raw(7).unwrap(),
+        incarnation: 13,
+    });
+    let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
+    custody.commit_registration();
+    custody.commit_native_signal_owner();
+    let continuation = BlockedContinuation::from_dispatch_outcome(
+        DispatchOutcome::WaitOnFds {
+            fds: WaitFds::empty(),
+            timeout: None,
+            sig_mask: WaitSigMask::NONE,
+            completion: FdWaitCompletion::Fd { on_timeout: 0 },
+        },
+        capture(&context, generation),
+    )
+    .expect("forwarded read continuation");
+    let tid = context.thread().key().tid.raw();
+    carrick_signal_linux::publish_pending_for(tid, 2);
+    let event = SignalReadinessProbe::from_continuation(&continuation)
+        .event()
+        .expect("signal wakes forwarded read");
+    assert!(matches!(event, ContinuationEvent::Signal));
+    let queue = carrick_el1_abi::SignalIngressQueue::<2>::new();
+    let mut producer = super::super::signal_ingress_producer::HostSignalIngressProducer::new();
+    let target = super::super::signal_ingress_producer::HostIngressTarget::from_context(&context);
+    assert_eq!(
+        producer
+            .publish(&queue, target, carrick_signal_linux::take_pending_event_for)
+            .unwrap(),
+        super::super::signal_ingress_producer::HostIngressStep::Published
+    );
+    let event = queue.take().unwrap();
+    assert_eq!(event.signal().number(), 2);
+    assert_eq!(event.scope(), carrick_el1_abi::ExternalSignalScope::Thread);
+    assert_eq!(carrick_signal_linux::take_pending_for(tid), 0);
+}
+
+#[test]
 fn realtime_host_slot_import_preserves_fifo_multiplicity_and_exact_cancellation_requeue() {
     let (kernel, context) = bootstrap(15_468);
     let generation = publish(&context, 0x913);

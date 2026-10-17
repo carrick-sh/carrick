@@ -66,6 +66,8 @@ pub fn schedule(slot: SlotId) -> ! {
             }
             let mut words = state.words;
             let mut service = native_process::Service::new(current, slot);
+            native_process::drain_external_ingress(source, &mut service)
+                .unwrap_or_else(|_| fatal_boot());
             let mut suspended = false;
             {
                 let _copy_gate = user_fault_gate::install();

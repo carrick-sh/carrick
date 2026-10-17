@@ -7511,6 +7511,55 @@ fn retained_write_owner_park_ignores_two_signals_until_release_but_kill_wakes() 
 }
 
 #[test]
+fn serial_host_native_signal_owner_killable_owner_write_ignores_sigalrm_until_sigkill() {
+    let (_kernel, context) = bootstrap(15_462);
+    let generation = publish(&context, 15_462);
+    let control = context.thread().control_slot();
+    let custody = carrick_core::lifecycle::MemberControlCustody::retain(control).unwrap();
+    custody.commit_registration();
+    custody.commit_native_signal_owner();
+    let sigalrm =
+        crate::kernel::LinuxSignal::for_signal_number(carrick_abi::LINUX_SIGALRM).unwrap();
+    let mut action = carrick_abi::LinuxSigaction::empty();
+    action.sa_handler = 0x7000;
+    context.signal_authority().install_action(sigalrm, action);
+    let wait = ZoneWait::new(carrick_el1_abi::RecordRef::PLACEHOLDER, 1);
+    let write =
+        BlockedContinuation::from_killable_owner_zone_park(capture(&context, generation), wait);
+    let tid = context.thread().key().tid.raw();
+    let _ = carrick_signal_linux::take_pending_event_for(tid);
+    carrick_signal_linux::publish_process_timer_signal(carrick_abi::LINUX_SIGALRM, None);
+    let probe = SignalReadinessProbe::from_continuation(&write);
+    assert_eq!(
+        probe.event(),
+        None,
+        "caught SIGALRM must not wake a native killable-owner write park"
+    );
+    assert!(
+        carrick_signal_linux::claim_unblocked_pending_for(tid + 1, carrick_abi::SigBlockMask::NONE,),
+        "killable-owner write park must not consume PROC_WAKE_OWNER for SIGALRM"
+    );
+    assert_eq!(
+        carrick_signal_linux::take_pending_event_for(tid + 1)
+            .unwrap()
+            .signum,
+        carrick_abi::LINUX_SIGALRM
+    );
+    carrick_signal_linux::publish_process_signal(carrick_abi::LINUX_SIGKILL);
+    assert_eq!(
+        probe.event(),
+        Some(ContinuationEvent::Signal),
+        "SIGKILL must wake a native killable-owner write park"
+    );
+    assert_eq!(
+        carrick_signal_linux::take_pending_event_for(tid)
+            .unwrap()
+            .signum,
+        carrick_abi::LINUX_SIGKILL
+    );
+}
+
+#[test]
 fn terminal_zone_capture_rejects_another_threads_execution_lease() {
     let (_kernel, context) = bootstrap(15_400);
     let (_other_kernel, other) = bootstrap(15_401);

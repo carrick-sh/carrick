@@ -54,6 +54,17 @@ fn drain_retired_spaces(owner: &Portal, worker: u32) -> Result<(), NativeProcess
 pub(super) fn registry() -> &'static NativeProcessRegistry<'static, Mm, ParkedContextWords> {
     &REGISTRY
 }
+pub(super) fn drain_external_ingress(
+    source: BornInZoneSource<'static, ParkedContextWords>,
+    service: &mut Service,
+) -> Result<usize, NativeProcessError> {
+    REGISTRY.drain_external_ingress(
+        source.zone,
+        carrick_el1::isa::signal_ingress_guest(),
+        source.slot,
+        service,
+    )
+}
 pub(super) fn runtime(
     source: BornInZoneSource<'static, ParkedContextWords>,
     task: &'static CurrentTask,
@@ -651,6 +662,9 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             effects.request_reschedule(self.slot);
         }
         deliver_wakes(effects);
+    }
+    fn request_ingress_producer_boundary(&mut self) {
+        self.task.linux.mark_pending_host_work();
     }
     fn child_file_table(&self, _parent_table: u64, issued: u64) -> u64 {
         issued

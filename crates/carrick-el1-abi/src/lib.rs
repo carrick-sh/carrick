@@ -51,6 +51,8 @@ pub use mm_portal_grant::*;
 
 mod reservations;
 pub use reservations::*;
+mod signal_ingress;
+pub use signal_ingress::*;
 mod thread_lifecycle;
 pub use thread_lifecycle::*;
 mod service_copy;
@@ -143,6 +145,17 @@ pub const EL1_FRAME_GRANT_MAILBOX_BASE: u64 = EL1_REGION_BASE + EL1_FRAME_GRANT_
 /// otherwise unused tail of the current-task area, after the mailboxes.
 pub const EL1_FRAME_GRANT_RESIDENCY_OFFSET: u64 = EL1_CURRENT_TASKS_OFFSET + 0x30_000;
 pub const EL1_FRAME_GRANT_RESIDENCY_BASE: u64 = EL1_REGION_BASE + EL1_FRAME_GRANT_RESIDENCY_OFFSET;
+
+/// One shared external-signal ingress reservation in either ISA's kernel
+/// region, after the frame residency inventory. The record carries the exact
+/// neutral identity also used by terminal retirement receipts.
+pub const EL1_SIGNAL_INGRESS_OFFSET: u64 = (EL1_FRAME_GRANT_RESIDENCY_OFFSET
+    + core::mem::size_of::<FrameGrantResidencyTable>() as u64
+    + 63)
+    & !63;
+pub const EL1_SIGNAL_INGRESS_RESERVED_SIZE: u64 = 0x4000;
+pub const EL1_SIGNAL_INGRESS_BASE: u64 = EL1_REGION_BASE + EL1_SIGNAL_INGRESS_OFFSET;
+pub const X86_CPL0_SIGNAL_INGRESS_BASE: u64 = X86_CPL0_REGION_BASE + EL1_SIGNAL_INGRESS_OFFSET;
 
 /// Guest VA/IPA base of the 2 MiB AArch64 kernel control window (L1 index 180).
 pub const AARCH64_KERNEL_CONTROL_BASE: u64 =
@@ -628,6 +641,15 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         EL1_RESERVATIONS_OFFSET,
         EL1_RESERVATIONS_END,
         RESERVATION_PROTOCOL_VERSION,
+        SIGNAL_INGRESS_PROTOCOL,
+        core::mem::size_of::<ExternalSignalRecord>() as u64,
+        core::mem::align_of::<ExternalSignalRecord>() as u64,
+        core::mem::size_of::<SharedSignalIngressQueue>() as u64,
+        core::mem::align_of::<SharedSignalIngressQueue>() as u64,
+        signal_ingress_offsets_hash(),
+        EL1_SIGNAL_INGRESS_OFFSET,
+        EL1_SIGNAL_INGRESS_RESERVED_SIZE,
+        SIGNAL_INGRESS_CAPACITY as u64,
         MM_PORTAL_PROTOCOL,
         MM_TRANSFER_LAYOUT_HASH,
         MM_PORTAL_BIND_ESR,
@@ -2630,6 +2652,18 @@ const _: () = assert!(
     EL1_FRAME_GRANT_RESIDENCY_OFFSET + core::mem::size_of::<FrameGrantResidencyTable>() as u64
         <= EL1_CURRENT_TASKS_OFFSET + EL1_CURRENT_TASKS_SIZE
 );
+const _: () = assert!(
+    EL1_SIGNAL_INGRESS_OFFSET + EL1_SIGNAL_INGRESS_RESERVED_SIZE
+        <= EL1_CURRENT_TASKS_OFFSET + EL1_CURRENT_TASKS_SIZE
+);
+const _: () = assert!(
+    core::mem::size_of::<SharedSignalIngressQueue>() as u64 <= EL1_SIGNAL_INGRESS_RESERVED_SIZE
+);
+const _: () = assert!(
+    EL1_SIGNAL_INGRESS_OFFSET
+        .is_multiple_of(core::mem::align_of::<SharedSignalIngressQueue>() as u64)
+);
+const _: () = assert!(EL1_SIGNAL_INGRESS_OFFSET.is_multiple_of(64));
 const _: () =
     assert!(EL1_CURRENT_TASKS_OFFSET + EL1_CURRENT_TASKS_SIZE <= EL1_BOOTSTRAP_METADATA_OFFSET);
 const _: () =
@@ -2917,6 +2951,20 @@ pub fn frame_grant_residency_host() -> Option<&'static FrameGrantResidencyTable>
     // only atomics and its layout is checked against the image hash.
     Some(unsafe {
         &*((ptr + EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize) as *const FrameGrantResidencyTable)
+    })
+}
+
+/// Host view of the retained external-signal ingress reservation. The region
+/// owner initializes the queue before publishing the aperture pointer.
+pub fn signal_ingress_host() -> Option<&'static SharedSignalIngressQueue> {
+    let ptr = get_el1_region_host_ptr();
+    if ptr == 0 {
+        return None;
+    }
+    // SAFETY: the region owner keeps this mapping alive until it clears the
+    // aperture pointer; the queue uses atomic slot publication throughout.
+    Some(unsafe {
+        &*((ptr + EL1_SIGNAL_INGRESS_OFFSET as usize) as *const SharedSignalIngressQueue)
     })
 }
 
@@ -3846,7 +3894,7 @@ impl Default for InotifyNameCache {
 }
 
 const _: () = {
-    assert!(EL1_ABI_LAYOUT_HASH == 0xd4dbcc99b24622c2);
+    assert!(EL1_ABI_LAYOUT_HASH == 0x64dbf6bba8eed1e5);
     assert!(core::mem::size_of::<ApertureControl>() == 64);
     assert!(core::mem::align_of::<ApertureControl>() == 64);
     assert!(core::mem::offset_of!(DelegatedOpenFile, lifetime) == 40);

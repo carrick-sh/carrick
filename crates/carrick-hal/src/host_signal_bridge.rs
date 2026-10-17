@@ -34,6 +34,9 @@ use carrick_abi::{SigBlockMask, SigSet};
 use carrick_signal_linux::HostSignalGlue;
 
 pub use carrick_signal_linux::NO_PENDING_SIGNAL;
+pub use carrick_signal_linux::{
+    PendingSignalEvent, PendingSignalOrigin, PendingSignalScope, PendingTimerInfo,
+};
 
 /// One host fd (plus poll events) a blocking wait parks on. `anchored` marks a
 /// descriptor the waiter must NOT pin (dup) because the caller already holds
@@ -89,9 +92,27 @@ pub trait HostSignalBridge: Send + Sync {
     /// entry. A blocked signal stays pending but must not break a wait.
     fn has_unblocked_pending_for(&self, tid: i32, block_mask: SigBlockMask) -> bool;
 
+    /// Claim a pending signal when this thread will actually interrupt its
+    /// wait. A plain eligibility query must not select a process wake owner.
+    fn claim_unblocked_pending_for(&self, tid: i32, block_mask: SigBlockMask) -> bool {
+        self.has_unblocked_pending_for(tid, block_mask)
+    }
+
     /// Dequeue the lowest pending signum deliverable to `tid`
     /// ([`NO_PENDING_SIGNAL`] if none).
     fn take_pending_for(&self, tid: i32) -> i32;
+
+    /// Native ingress's scoped dequeue. Product backends preserve the
+    /// process/thread distinction; other bridge implementations keep their
+    /// existing thread-directed test semantics by default.
+    fn take_pending_event_for(&self, tid: i32) -> Option<PendingSignalEvent> {
+        let signum = self.take_pending_for(tid);
+        (signum != NO_PENDING_SIGNAL).then_some(PendingSignalEvent {
+            signum,
+            scope: PendingSignalScope::Thread,
+            origin: PendingSignalOrigin::Host,
+        })
+    }
 
     /// Dequeue the lowest pending signum for `tid` that is in `wait_set`
     /// ([`NO_PENDING_SIGNAL`] if none) — the `sigwait`/`rt_sigtimedwait` form.
@@ -210,8 +231,19 @@ impl<G: HostSignalGlue> HostSignalBridge for GenericHostSignalBridge<G> {
         carrick_signal_linux::has_unblocked_pending_for(tid, block_mask)
     }
 
+    fn claim_unblocked_pending_for(&self, tid: i32, block_mask: SigBlockMask) -> bool {
+        if carrick_signal_linux::xsig::xsig_has_unblocked_for_self(block_mask) {
+            return true;
+        }
+        carrick_signal_linux::claim_unblocked_pending_for(tid, block_mask)
+    }
+
     fn take_pending_for(&self, tid: i32) -> i32 {
         carrick_signal_linux::take_pending_for(tid)
+    }
+
+    fn take_pending_event_for(&self, tid: i32) -> Option<PendingSignalEvent> {
+        carrick_signal_linux::take_pending_event_for(tid)
     }
 
     fn take_pending_in_for(&self, tid: i32, wait_set: SigSet) -> i32 {

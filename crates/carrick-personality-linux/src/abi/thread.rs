@@ -397,6 +397,9 @@ impl ThreadControlSlot {
     pub fn graph_referenced(&self) -> bool {
         self.host_exit_requested.custody().referenced()
     }
+    pub fn native_signal_owner(&self) -> bool {
+        self.host_exit_requested.custody().native_signal_owner()
+    }
     pub fn graph_unregister_receipt(&self) -> bool {
         self.host_exit_requested.custody().unregister_receipt()
     }
@@ -2098,6 +2101,20 @@ mod layout_manifest {
         field!(ThreadControlSlot, retired_task, AtomicU64, 104, 8, 8);
         field!(ThreadControlSlot, retired_execution, AtomicU64, 112, 8, 8);
         field!(ThreadControlSlot, retired_thread, AtomicU64, 120, 8, 8);
+    }
+
+    #[test]
+    fn native_signal_owner_requires_explicit_graph_admission() {
+        let control = ThreadControlSlot::new();
+        control.reset_for_host_birth(BlockedMask(0)).unwrap();
+        let custody = carrick_core::lifecycle::MemberControlCustody::retain(&control).unwrap();
+        custody.commit_registration();
+        assert!(!control.native_signal_owner());
+        custody.commit_native_signal_owner();
+        assert!(control.native_signal_owner());
+        drop(custody);
+        control.reset_for_host_birth(BlockedMask(0)).unwrap();
+        assert!(!control.native_signal_owner());
     }
 
     #[test]

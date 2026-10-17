@@ -41,7 +41,9 @@ use carrick_sched_core::process::{
     },
     wait::{TaskWakeGeneration, WaitJobControl, WaitPrecheck, WaitQuery, WaitSelection},
 };
-use carrick_sched_core::{Handback, RecordRef, ThreadIdentity, WakeEffects, Waker, ZoneTables};
+use carrick_sched_core::{
+    Handback, RecordRef, SlotId, ThreadIdentity, WakeEffects, Waker, ZoneTables,
+};
 use core::{
     num::{NonZeroU32, NonZeroU64},
     sync::atomic::Ordering,
@@ -69,6 +71,71 @@ fn signal_record_exists<C: ProcessContext>(zone: &ZoneTables<C>, record: RecordR
         && retained.home().is_some_and(|slot| {
             zone.slot(slot).current().is_none() && zone.slot(slot).host_record() == Some(record.id)
         })
+}
+
+fn request_signal_reschedule<'a, C: ProcessContext, S: NativeProcessService<'a, C>>(
+    zone: &ZoneTables<C>,
+    service: &mut S,
+    record: RecordRef,
+) {
+    if !signal_record_exists(zone, record) {
+        return;
+    }
+    let owned = zone.record(record.id);
+    let target = match owned.claim() {
+        carrick_sched_core::Claim::OnCpu { slot, .. }
+        | carrick_sched_core::Claim::OnCpuRequested { slot, .. } => Some(slot),
+        carrick_sched_core::Claim::Free => owned.home(),
+        _ => None,
+    };
+    if let Some(slot) = target {
+        let mut effects = WakeEffects::default();
+        effects.request_reschedule(slot);
+        service.wake_effects(effects);
+    }
+}
+
+fn publish_signal_channel<'a, C: ProcessContext, S: NativeProcessService<'a, C>>(
+    zone: &'a ZoneTables<C>,
+    slot: SlotId,
+    service: &mut S,
+    channel: &Arc<WaitChannel>,
+    #[cfg(test)] probe: Option<&(dyn Fn(u32) + Sync)>,
+) -> Result<(), NativeProcessError> {
+    let address = WaitChannel::address(channel);
+    let guard = zone.short_lock(
+        ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
+        &NativeBucketWait {
+            lifetime: core::marker::PhantomData,
+            #[cfg(test)]
+            probe,
+        },
+    );
+    channel
+        .generation
+        .publish()
+        .map_err(|_| NativeProcessError::Exhausted)?;
+    let mut effects = WakeEffects::default();
+    let wake = zone.wake_placed(
+        &guard,
+        channel.mm,
+        address,
+        u32::MAX,
+        u32::MAX,
+        Waker::El1 { slot },
+        &mut [],
+        &mut effects,
+    );
+    drop(guard);
+    if matches!(wake, Err(carrick_sched_core::WakeRefusal::Unplaceable)) {
+        return service.wake_unplaceable_wait(ProcessWaitChannel {
+            mm: carrick_el1_abi::EntryMmKey::from_raw(channel.mm),
+            address: core::num::NonZeroU64::new(address).ok_or(NativeProcessError::Quarantined)?,
+        });
+    }
+    wake.map_err(|_| NativeProcessError::Quarantined)?;
+    service.wake_effects(effects);
+    Ok(())
 }
 
 fn owned_control<'a>(
@@ -208,6 +275,8 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     fn quarantine_born(&mut self, born: Self::Born);
     fn retire_mm(&mut self, mm: Self::Mm);
     fn wake_effects(&mut self, effects: WakeEffects);
+    /// A guest drain opened ingress capacity for an owned host admission.
+    fn request_ingress_producer_boundary(&mut self);
     fn wake_unplaceable_wait(
         &mut self,
         _channel: ProcessWaitChannel,
@@ -752,7 +821,7 @@ impl<'a, M: Clone, C: ProcessContext> Clone for NativeOwnerMember<'a, M, C> {
 struct NativeRegistryState<'a, M: Clone, C: ProcessContext> {
     members: BTreeMap<NativeExecutionKey, NativeOwnerMember<'a, M, C>>,
     groups: BTreeMap<NativeGroupKey, (Arc<NativeProcessRuntime<'a, M, C>>, TaskKey)>,
-    records: BTreeMap<NativeRecordKey, Arc<NativeProcessRuntime<'a, M, C>>>,
+    records: BTreeMap<NativeRecordKey, NativeExecutionKey>,
     by_process: BTreeMap<(usize, TaskKey), (NativeGroupKey, Vec<NativeExecutionKey>)>,
 }
 
@@ -995,8 +1064,14 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         state
             .by_process
             .insert((key.carrier, process), (group_key, vec![key]));
-        state.records.insert(record_key, runtime.clone());
+        state.records.insert(record_key, key);
         *runtime.registry.lock() = Some(self);
+        state
+            .members
+            .get(&key)
+            .ok_or(NativeProcessError::Stale)?
+            .control
+            .commit_native_signal_owner();
         Ok(())
     }
 
@@ -1144,7 +1219,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .records
             .remove(&Self::record_key(source.zone, old_record));
         state.members.insert(key, member);
-        state.records.insert(record_key, runtime.clone());
+        state.records.insert(record_key, key);
         drop(graph);
         Ok(Some(runtime))
     }
@@ -1173,11 +1248,135 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
         zone: &ZoneTables<C>,
         record: RecordRef,
     ) -> Option<Arc<NativeProcessRuntime<'a, M, C>>> {
-        self.state
-            .lock()
-            .records
-            .get(&Self::record_key(zone, record))
-            .cloned()
+        let state = self.state.lock();
+        let key = state.records.get(&Self::record_key(zone, record))?;
+        state.members.get(key).map(|member| member.runtime.clone())
+    }
+
+    fn external_member<'s>(
+        state: &'s NativeRegistryState<'a, M, C>,
+        zone: &ZoneTables<C>,
+        event: carrick_el1_abi::ExternalSignalRecord,
+    ) -> Option<&'s NativeOwnerMember<'a, M, C>> {
+        let key = state.records.get(&Self::record_key(zone, event.record()))?;
+        let member = state.members.get(key)?;
+        let binding = key.binding();
+        (event.matches_live(
+            carrick_core_abi::EntryEventIdentity::from_binding(binding),
+            binding,
+            member.record,
+        ) && signal_record_exists(zone, member.record))
+        .then_some(member)
+    }
+
+    /// Resolve one ingress event through the exact live member index. A tid,
+    /// MM, or record slot on its own is never authority to admit a signal.
+    pub fn for_external_event(
+        &self,
+        zone: &ZoneTables<C>,
+        event: carrick_el1_abi::ExternalSignalRecord,
+    ) -> Option<Arc<NativeProcessRuntime<'a, M, C>>> {
+        let state = self.state.lock();
+        let member = Self::external_member(&state, zone, event)?;
+        let graph = member.runtime.graph.lock();
+        let row = graph.owner.task(member.process).ok()?;
+        let resources = row.native().resources();
+        if !resources.page.gate().serves_ring() || resources.address != member.address {
+            return None;
+        }
+        Some(member.runtime.clone())
+    }
+
+    /// Consume one authenticated external event into the native pending owner.
+    /// Admission and the live lifecycle check share the registry guard, so a
+    /// recycled member cannot receive an event between lookup and enqueue.
+    pub fn admit_external_event<S: NativeProcessService<'a, C, Mm = M>>(
+        &self,
+        zone: &'a ZoneTables<C>,
+        event: carrick_el1_abi::ExternalSignalRecord,
+        publishing_slot: SlotId,
+        service: &mut S,
+    ) -> Result<bool, NativeProcessError> {
+        let state = self.state.lock();
+        let Some(member) = Self::external_member(&state, zone, event) else {
+            return Ok(false);
+        };
+        let graph = member.runtime.graph.lock();
+        let Ok(row) = graph.owner.task(member.process) else {
+            return Ok(false);
+        };
+        let resources = row.native().resources();
+        if !resources.page.gate().serves_ring() || resources.address != member.address {
+            return Ok(false);
+        }
+        let signals = resources.signals().clone();
+        let channel = resources.channel.clone();
+        signals.enqueue_thread(member.record, event.signal(), None);
+        let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+            carrick_signal_core::SignalSet::from_bits(member.control.blocked().0),
+        );
+        let interrupt = signals.has_deliverable(member.record, blocked);
+        let ipc_channel = if interrupt {
+            match graph.pending.get(&member.process) {
+                Some(PendingContinuation::Ipc(pending)) => Some(pending.channel.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        drop(graph);
+        drop(state);
+        if let Some(channel) = ipc_channel {
+            publish_signal_channel(
+                zone,
+                publishing_slot,
+                service,
+                &channel,
+                #[cfg(test)]
+                None,
+            )?;
+        }
+        if interrupt {
+            request_signal_reschedule(zone, service, event.record());
+        }
+        if let Some(channel) = channel {
+            publish_signal_channel(
+                zone,
+                publishing_slot,
+                service,
+                &channel,
+                #[cfg(test)]
+                None,
+            )?;
+        }
+        Ok(true)
+    }
+
+    /// Drain the one shared transport at a guest boundary. Every published
+    /// record is claimed once; stale bindings are refused without selecting a
+    /// different task by numeric signal target.
+    pub fn drain_external_ingress<S: NativeProcessService<'a, C, Mm = M>>(
+        &self,
+        zone: &'a ZoneTables<C>,
+        queue: &carrick_el1_abi::SharedSignalIngressQueue,
+        publishing_slot: SlotId,
+        service: &mut S,
+    ) -> Result<usize, NativeProcessError> {
+        let mut admitted = 0;
+        let mut drained = false;
+        for _ in 0..carrick_el1_abi::SIGNAL_INGRESS_CAPACITY {
+            let Some(event) = queue.take() else {
+                break;
+            };
+            drained = true;
+            if self.admit_external_event(zone, event, publishing_slot, service)? {
+                admitted += 1;
+            }
+        }
+        if drained && queue.backpressure_waiting() {
+            service.request_ingress_producer_boundary();
+        }
+        Ok(admitted)
     }
 
     /// The exact admitted process address for a published thread-group
@@ -1273,7 +1472,13 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             (child_key.carrier, child.child),
             (group_key, vec![child_key]),
         );
-        state.records.insert(record_key, runtime);
+        state.records.insert(record_key, child_key);
+        state
+            .members
+            .get(&child_key)
+            .ok_or(NativeProcessError::Stale)?
+            .control
+            .commit_native_signal_owner();
         Ok(())
     }
 
@@ -1428,7 +1633,13 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .ok_or(NativeProcessError::Stale)?
             .1
             .push(key);
-        state.records.insert(record_key, runtime.clone());
+        state.records.insert(record_key, key);
+        state
+            .members
+            .get(&key)
+            .ok_or(NativeProcessError::Stale)?
+            .control
+            .commit_native_signal_owner();
         drop(state);
         if closing {
             let wait = NativeBucketWait {
@@ -2561,21 +2772,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     // retain their pending signals until their owner resumes; an IPI does not
     // cancel their operation or release its queue/timer custody.
     fn interrupt_signal_record(&mut self, record: RecordRef) {
-        if !signal_record_exists(self.source.zone, record) {
-            return;
-        }
-        let owned = self.source.zone.record(record.id);
-        let target = match owned.claim() {
-            carrick_sched_core::Claim::OnCpu { slot, .. }
-            | carrick_sched_core::Claim::OnCpuRequested { slot, .. } => Some(slot),
-            carrick_sched_core::Claim::Free => owned.home(),
-            _ => None,
-        };
-        if let Some(slot) = target {
-            let mut effects = WakeEffects::default();
-            effects.request_reschedule(slot);
-            self.service.wake_effects(effects);
-        }
+        request_signal_reschedule(self.source.zone, self.service, record);
     }
 
     pub fn take_root_exit(&mut self) -> Option<LinuxWaitStatus> {
@@ -3323,44 +3520,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         self.interrupted_child_wait.take().map(|words| *words)
     }
     fn publish_channel(&mut self, channel: &Arc<WaitChannel>) -> Result<(), NativeProcessError> {
-        let zone = self.source.zone;
-        let address = WaitChannel::address(channel);
-        let guard = zone.short_lock(
-            ZoneTables::<C>::bucket_of_with_context(channel.mm, address),
-            &NativeBucketWait {
-                lifetime: core::marker::PhantomData,
-                #[cfg(test)]
-                probe: self.publication_wait_probe,
-            },
-        );
-        channel
-            .generation
-            .publish()
-            .map_err(|_| NativeProcessError::Exhausted)?;
-        let mut effects = WakeEffects::default();
-        let wake = zone.wake_placed(
-            &guard,
-            channel.mm,
-            address,
-            u32::MAX,
-            u32::MAX,
-            Waker::El1 {
-                slot: self.source.slot,
-            },
-            &mut [],
-            &mut effects,
-        );
-        drop(guard);
-        if matches!(wake, Err(carrick_sched_core::WakeRefusal::Unplaceable)) {
-            return self.service.wake_unplaceable_wait(ProcessWaitChannel {
-                mm: carrick_el1_abi::EntryMmKey::from_raw(channel.mm),
-                address: core::num::NonZeroU64::new(address)
-                    .ok_or(NativeProcessError::Quarantined)?,
-            });
-        }
-        wake.map_err(|_| NativeProcessError::Quarantined)?;
-        self.service.wake_effects(effects);
-        Ok(())
+        publish_signal_channel(
+            self.source.zone,
+            self.source.slot,
+            self.service,
+            channel,
+            #[cfg(test)]
+            self.publication_wait_probe,
+        )
     }
     /// Resume owned lifecycle custody before the execution lane returns to EL0.
     /// Exit keeps its original status and cannot become a guest syscall return.
@@ -6426,6 +6593,7 @@ mod tests {
         }
         fn retire_mm(&mut self, _: Self::Mm) {}
         fn wake_effects(&mut self, _: WakeEffects) {}
+        fn request_ingress_producer_boundary(&mut self) {}
     }
     fn words(address: AddressContext<RootGpa>) -> ParkedContextWords {
         let mut frame = [0; 20];
@@ -6538,6 +6706,56 @@ mod tests {
             runtimes.push(runtime);
             addresses.push(address);
         }
+        // An ingress record authenticates the exact live native member, not
+        // just a tid shared by two roots or a recycled record slot.
+        let first_binding = crate::personality::common_entry::execution_binding(&tasks[0]);
+        let first_record = registry
+            .state
+            .lock()
+            .members
+            .iter()
+            .find(|(key, _)| key.task.id().raw() == 41)
+            .unwrap()
+            .1
+            .record;
+        let event = carrick_el1_abi::ExternalSignalRecord::new(
+            carrick_core_abi::EntryEventIdentity::from_binding(first_binding),
+            first_binding,
+            first_record,
+            carrick_el1_abi::SignalEventGeneration::new(NonZeroU64::MIN),
+            carrick_signal_core::policy::Signal::from_number(2).unwrap(),
+            carrick_el1_abi::ExternalSignalSource::Terminal,
+        );
+        let owner = registry
+            .for_external_event(&zone, event)
+            .expect("live ingress owner");
+        assert!(Arc::ptr_eq(&owner, &runtimes[0]));
+        let stale = carrick_el1_abi::ExternalSignalRecord::new(
+            event.identity(),
+            ExecutionBinding {
+                generation: carrick_core_abi::EntryGeneration::from_raw(
+                    first_binding.generation.raw() + 1,
+                ),
+                ..first_binding
+            },
+            first_record,
+            event.event_generation(),
+            event.signal(),
+            event.source(),
+        );
+        assert!(registry.for_external_event(&zone, stale).is_none());
+        let recycled = carrick_el1_abi::ExternalSignalRecord::new(
+            event.identity(),
+            first_binding,
+            RecordRef {
+                incarnation: first_record.incarnation + 1,
+                ..first_record
+            },
+            event.event_generation(),
+            event.signal(),
+            event.source(),
+        );
+        assert!(registry.for_external_event(&zone, recycled).is_none());
         let mut services = [
             Physical {
                 zone: &zone,
@@ -6556,6 +6774,61 @@ mod tests {
                 on_signal_clock: None,
             },
         ];
+        assert!(
+            registry
+                .admit_external_event(
+                    &zone,
+                    event,
+                    carrick_sched_core::SlotId::new(0),
+                    &mut services[0],
+                )
+                .unwrap()
+        );
+        let signals = runtimes[0].current_signals(&tasks[0]).unwrap();
+        assert!(signals.pending_set(first_record).contains(event.signal()));
+        let _ = signals.take_deliverable(
+            first_record,
+            carrick_signal_core::policy::SigBlockMask::NONE,
+        );
+        let queue = carrick_el1_abi::SharedSignalIngressQueue::new();
+        queue.admit(stale).unwrap();
+        assert_eq!(
+            registry
+                .drain_external_ingress(
+                    &zone,
+                    &queue,
+                    carrick_sched_core::SlotId::new(0),
+                    &mut services[0],
+                )
+                .unwrap(),
+            0
+        );
+        assert!(!signals.pending_set(first_record).contains(event.signal()));
+        let queued = carrick_el1_abi::ExternalSignalRecord::new(
+            event.identity(),
+            event.binding(),
+            event.record(),
+            carrick_el1_abi::SignalEventGeneration::new(NonZeroU64::new(2).unwrap()),
+            event.signal(),
+            event.source(),
+        );
+        queue.admit(queued).unwrap();
+        assert_eq!(
+            registry
+                .drain_external_ingress(
+                    &zone,
+                    &queue,
+                    carrick_sched_core::SlotId::new(0),
+                    &mut services[0],
+                )
+                .unwrap(),
+            1
+        );
+        assert!(signals.pending_set(first_record).contains(event.signal()));
+        let _ = signals.take_deliverable(
+            first_record,
+            carrick_signal_core::policy::SigBlockMask::NONE,
+        );
         let mut children = Vec::new();
         for index in 0..2 {
             let task = &tasks[index];
@@ -10428,31 +10701,35 @@ mod tests {
     #[test]
     fn test_blocked_ipc_returns_eintr_on_signal() {
         for operation in 0..4 {
-            blocked_ipc_signal_contract(operation, false);
+            blocked_ipc_signal_contract(operation, false, false);
         }
     }
     #[test]
+    fn admitted_ingress_record_interrupts_native_ipc_wait() {
+        blocked_ipc_signal_contract(0, false, true);
+    }
+    #[test]
     fn bucket_contention_msgrcv() {
-        blocked_ipc_signal_contract(0, true);
+        blocked_ipc_signal_contract(0, true, false);
     }
     #[test]
     fn bucket_contention_semtimedop() {
-        blocked_ipc_signal_contract(3, true);
+        blocked_ipc_signal_contract(3, true, false);
     }
     #[test]
     fn arm_timed_semop_expires_at_shared_counter_deadline() {
-        blocked_ipc_signal_contract(4, false);
+        blocked_ipc_signal_contract(4, false, false);
     }
     #[test]
     fn msgrcv_resume_rejects_overflowing_msgp_and_restores_message() {
-        blocked_ipc_signal_contract(5, false);
-        blocked_ipc_signal_contract(7, false);
+        blocked_ipc_signal_contract(5, false, false);
+        blocked_ipc_signal_contract(7, false, false);
     }
     #[test]
     fn failed_ipc_enqueue_returns_timer_admission() {
-        blocked_ipc_signal_contract(6, false);
+        blocked_ipc_signal_contract(6, false, false);
     }
-    fn blocked_ipc_signal_contract(operation: u8, contended: bool) {
+    fn blocked_ipc_signal_contract(operation: u8, contended: bool, external: bool) {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: the aligned allocation owns the complete zero-valid compact zone.
         let zone = unsafe {
@@ -10514,7 +10791,8 @@ mod tests {
         ));
         assert_eq!(page.live(), 2, "admission must not remove a live member");
         page.release_live(1).unwrap(); // fixture settles its bootstrap census
-        let runtime =
+        let registry = Box::leak(Box::new(NativeProcessRegistry::new()));
+        let runtime = Arc::new(
             NativeProcessRuntime::admit_fresh_root::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
                 source,
                 &task,
@@ -10524,7 +10802,13 @@ mod tests {
                 address,
                 words(address),
             )
-            .unwrap();
+            .unwrap(),
+        );
+        if external {
+            registry
+                .register_root(runtime.clone(), source, &task, address)
+                .unwrap();
+        }
         assert_eq!(page.live(), 1);
         let mut service = Physical {
             zone: &zone,
@@ -10538,9 +10822,22 @@ mod tests {
         use carrick_personality_linux::signal::{
             ProcessSignals, SignalInfo, SignalProcessSelector, SignalRequest,
         };
-        let mut entry = runtime
-            .enter(source, &task, words(address), &mut service)
-            .unwrap();
+        let mut entry = if external {
+            runtime
+                .enter_registered(
+                    &registry,
+                    source,
+                    &task,
+                    address,
+                    words(address),
+                    &mut service,
+                )
+                .unwrap()
+        } else {
+            runtime
+                .enter(source, &task, words(address), &mut service)
+                .unwrap()
+        };
         let queue = entry.msgget(0, 0o600).unwrap();
         let sem = entry.semget(0, 1, 0o600).unwrap();
         let initial_timer_nodes = zone.timer_node_count();
@@ -10677,14 +10974,36 @@ mod tests {
             );
             return;
         }
-        // Publish through the signal owner while execution capacity is released.
-        entry
-            .kill(
-                SignalProcessSelector::from_abi(41),
-                SignalRequest::from_abi(10).unwrap(),
-                SignalInfo::Generated(None),
-            )
-            .unwrap();
+        // Publish through the same signal owner while execution capacity is
+        // released, using the external transport for the SIGINT case.
+        if external {
+            let binding = crate::personality::common_entry::execution_binding(&task);
+            let queue = carrick_el1_abi::SharedSignalIngressQueue::new();
+            queue
+                .admit(carrick_el1_abi::ExternalSignalRecord::new(
+                    carrick_core_abi::EntryEventIdentity::from_binding(binding),
+                    binding,
+                    entry.record,
+                    carrick_el1_abi::SignalEventGeneration::new(NonZeroU64::MIN),
+                    carrick_signal_core::policy::Signal::from_number(2).unwrap(),
+                    carrick_el1_abi::ExternalSignalSource::Terminal,
+                ))
+                .unwrap();
+            assert_eq!(
+                registry
+                    .drain_external_ingress(&zone, &queue, slot, entry.service)
+                    .unwrap(),
+                1
+            );
+        } else {
+            entry
+                .kill(
+                    SignalProcessSelector::from_abi(41),
+                    SignalRequest::from_abi(10).unwrap(),
+                    SignalInfo::Generated(None),
+                )
+                .unwrap();
+        }
         let selected = zone
             .switch_in_full(slot)
             .expect("signal must wake the owned IPC continuation");
@@ -10861,6 +11180,7 @@ mod tests {
         }
 
         fn wake_effects(&mut self, _: WakeEffects) {}
+        fn request_ingress_producer_boundary(&mut self) {}
 
         fn fork_fd_table(&mut self, _: u64, _: u64) -> Result<(), NativeProcessError> {
             if self.fail_fd_table {
