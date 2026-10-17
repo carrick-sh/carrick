@@ -129,23 +129,14 @@ impl OwnerMmu for X86Mmu {
         va: UserVa,
         executable_publication: bool,
     ) -> Result<(), OwnerMmuRefusal> {
-        let leaf = translate_leaf(words, root, va, Access::Read, true).map_err(|e| match e {
-            FaultClass::Reserved => OwnerMmuRefusal::Unreachable,
-            _ => OwnerMmuRefusal::Protection,
-        })?;
-        if !leaf.ancestors_writable {
-            return Err(OwnerMmuRefusal::Protection);
+        match classify_guest_cow_write(words, root, va, executable_publication) {
+            Ok(_) | Err(CowClass::AlreadyWritable) => Ok(()),
+            Err(CowClass::ExecutableDenied) => Err(OwnerMmuRefusal::ExecutableCow),
+            Err(CowClass::Unreachable) => Err(OwnerMmuRefusal::Unreachable),
+            Err(CowClass::Unmapped | CowClass::NotCowArmed | CowClass::NoWriteIntent) => {
+                Err(OwnerMmuRefusal::Protection)
+            }
         }
-        if leaf.descriptor & WRITE != 0 {
-            return Ok(());
-        }
-        if leaf.size != PAGE || leaf.descriptor & (COW | MAY_WRITE) != COW | MAY_WRITE {
-            return Err(OwnerMmuRefusal::Protection);
-        }
-        if leaf.executable && !executable_publication {
-            return Err(OwnerMmuRefusal::ExecutableCow);
-        }
-        Ok(())
     }
 }
 
