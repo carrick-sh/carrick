@@ -163,6 +163,10 @@ local helpers, but never uncalled helpers, disabled helpers, or recursive
 helper chains. Contract-function bindings still use only the contract
 function's body for relevance. Identifier matching is textual, not Rust name
 resolution; closing the common-name ambiguity remains follow-up #537.
+Existing annotated bindings may also name a supplemental control with
+`including <test_name>` or a semicolon followed by `<test_name>` in the same
+test module. Those controls still require exact module resolution, active CI
+cfgs, runnable-test gating, and the usual added-binding relevance check.
 
 ## Commands
 

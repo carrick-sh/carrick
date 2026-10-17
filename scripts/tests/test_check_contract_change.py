@@ -1080,6 +1080,51 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
         result = self.run_check()
         self.assertEqual(result.returncode, 1, msg=result.stdout)
 
+    def test_annotated_binding_including_control_resolves(self):
+        self.seed_resolution_case(
+            {
+                "src/lib.rs": "mod dispatch;\n#[cfg(test)] mod tests;\n",
+                "src/tests.rs": '#[cfg(feature = "conformance-metrics")]\n'
+                                "#[test] fn cost_contract() {}\n"
+                                "#[test] fn revocation_control() {}\n",
+            },
+            "carrick-kernel::tests::cost_contract (conformance-metrics), "
+            "plus revocation controls including revocation_control",
+        )
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("carrick-kernel::tests::revocation_control", result.stdout)
+        tests = self.repo / "crates/carrick-kernel/src/tests.rs"
+        tests.write_text(tests.read_text().replace(
+            "#[test] fn revocation_control", '#[cfg(feature = "never_enabled")]\n'
+            "#[test] fn revocation_control"
+        ))
+        subprocess.run(["git", "commit", "-am", "disable supplemental control"],
+                       cwd=self.repo, check=True, capture_output=True)
+        self.assertEqual(self.run_check().returncode, 1)
+
+    def test_annotated_binding_semicolon_control_resolves(self):
+        self.seed_resolution_case(
+            {
+                "src/lib.rs": "mod dispatch;\n#[cfg(test)] mod tests;\n",
+                "src/tests.rs": '#[cfg(feature = "conformance-metrics")]\n'
+                                "#[test] fn cost_contract() {}\n"
+                                "#[test] fn host_execution_control() {}\n",
+            },
+            "carrick-kernel::tests::cost_contract (conformance-metrics); "
+            "host_execution_control supplies supplemental host execution semantics",
+        )
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("carrick-kernel::tests::host_execution_control", result.stdout)
+        tests = self.repo / "crates/carrick-kernel/src/tests.rs"
+        tests.write_text(tests.read_text().replace(
+            "#[test] fn host_execution_control", "#[test] #[ignore] fn host_execution_control"
+        ))
+        subprocess.run(["git", "commit", "-am", "ignore supplemental control"],
+                       cwd=self.repo, check=True, capture_output=True)
+        self.assertEqual(self.run_check().returncode, 1)
+
     def test_contract_called_through_one_local_helper_resolves(self):
         self.seed_gated_futex_contracts()
         tests = self.repo / "crates/carrick-kernel-example/tests/contracts.rs"
