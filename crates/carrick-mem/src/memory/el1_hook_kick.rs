@@ -116,6 +116,8 @@ struct Machine {
     irq_frames: usize,
     /// The EL1 image saw an owner-routed instruction or data abort.
     fault_frames: usize,
+    /// The EL1 image saw a native forwarded-return signal checkpoint frame.
+    signal_check_frames: Vec<(u64, u64)>,
 }
 
 impl Machine {
@@ -156,6 +158,7 @@ impl Machine {
             kick_acknowledged: false,
             irq_frames: 0,
             fault_frames: 0,
+            signal_check_frames: Vec::new(),
         }
     }
 
@@ -180,6 +183,21 @@ impl Machine {
             kick_acknowledged: false,
             irq_frames: 0,
             fault_frames: 0,
+            signal_check_frames: Vec::new(),
+        }
+    }
+
+    /// The production mailbox + clock vector page (`with_el1_vectors_mailbox_clock`).
+    fn full_clock_vector_page(irq: El1IrqMode) -> Self {
+        let mut bytes = el1_vectors_bytes_mailbox_irq(true, true, true, irq);
+        let dispatch = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET;
+        const ESR_GUARD_LEN: usize = 6 * 4;
+        let mailbox_entry = dispatch + ESR_GUARD_LEN + (IDENTITY_SYSCALLS.len() + 2) * 8;
+        el1_clock::install(&mut bytes, mailbox_entry);
+        Self {
+            bytes,
+            pc: AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET,
+            ..Self::full_vector_page(irq)
         }
     }
 
@@ -251,10 +269,15 @@ impl Machine {
     fn el1_image(&mut self) {
         let frame = self.regs[0];
         let esr = self.read(frame + 264);
+        let far = self.read(frame + 280);
         let irq = esr == 0;
+        let signal_check = matches!(esr, 0xfffe | 0xfffd);
         let is_fault = matches!((esr >> 26) & 0x3F, 0x20 | 0x24);
         if is_fault {
             self.fault_frames += 1;
+        }
+        if signal_check {
+            self.signal_check_frames.push((esr, far));
         }
         if irq {
             self.irq_frames += 1;
@@ -275,7 +298,7 @@ impl Machine {
             self.mem.insert(frame + 256, EL0_DAIF_MASKED);
             0
         } else {
-            if !irq {
+            if !irq && !signal_check {
                 self.mem.insert(frame, 0x5E4E);
             }
             0
@@ -387,20 +410,27 @@ impl Machine {
                 if self.xn_zr(rd) & 0xFFFF_FFFF == 0 {
                     self.pc = (pc as i64 + i64::from(d) * 4) as usize;
                 }
-            } else if op & 0xFFC0_0000 == 0xF900_0000 {
-                let addr = self.xn_sp(rn) + u64::from((op >> 10) & 0xFFF) * 8;
-                self.mem.insert(addr, self.xn_zr(rd));
-            } else if op & 0xFFC0_0000 == 0xF940_0000 {
-                let addr = self.xn_sp(rn) + u64::from((op >> 10) & 0xFFF) * 8;
+            } else if op & 0xFFC0_0000 == 0xF900_0000 || op & 0xFFC0_0000 == 0xB900_0000 {
+                let scale = if op >> 30 == 3 { 8 } else { 4 };
+                let addr = self.xn_sp(rn) + u64::from((op >> 10) & 0xFFF) * scale;
+                let v = if scale == 4 {
+                    self.xn_zr(rd) & 0xFFFF_FFFF
+                } else {
+                    self.xn_zr(rd)
+                };
+                self.mem.insert(addr, v);
+            } else if op & 0xFFC0_0000 == 0xF940_0000 || op & 0xFFC0_0000 == 0xB940_0000 {
+                let scale = if op >> 30 == 3 { 8 } else { 4 };
+                let addr = self.xn_sp(rn) + u64::from((op >> 10) & 0xFFF) * scale;
                 let v = self.read(addr);
-                self.set_xd_zr(rd, v);
+                self.set_xd_zr(rd, if scale == 4 { v & 0xFFFF_FFFF } else { v });
             } else if op & 0xFFFF_FC00 == 0x88DF_FC00 {
                 let v = self.read(self.xn_sp(rn)) & 0xFFFF_FFFF;
                 self.set_xd_zr(rd, v);
             } else if op & 0xFFFF_FC00 == 0x889F_FC00 {
                 self.mem
                     .insert(self.xn_sp(rn), self.xn_zr(rd) & 0xFFFF_FFFF);
-            } else if op & 0xFF80_0000 == 0xD280_0000 {
+            } else if op & 0xFF80_0000 == 0xD280_0000 || op & 0xFF80_0000 == 0x5280_0000 {
                 let shift = ((op >> 21) & 3) * 16;
                 self.set_xd_zr(rd, u64::from((op >> 5) & 0xFFFF) << shift);
             } else if op & 0xFF80_0000 == 0xF280_0000 {
@@ -414,8 +444,15 @@ impl Machine {
             } else if op & 0xFFC0_0000 == 0xD100_0000 {
                 let v = self.xn_sp(rn) - u64::from((op >> 10) & 0xFFF);
                 self.set_xd_sp(rd, v);
-            } else if op & 0xFFC0_0000 == 0xF100_0000 && rd == 31 {
-                self.equal = self.xn_sp(rn) == u64::from((op >> 10) & 0xFFF);
+            } else if (op & 0xFFC0_0000 == 0xF100_0000 || op & 0xFFC0_0000 == 0x7100_0000)
+                && rd == 31
+            {
+                let lhs = if op >> 31 == 0 {
+                    self.xn_sp(rn) & 0xFFFF_FFFF
+                } else {
+                    self.xn_sp(rn)
+                };
+                self.equal = lhs == u64::from((op >> 10) & 0xFFF);
             } else if op & 0xFFE0_FC1F == 0xEB00_001F {
                 // cmp xN, xM
                 self.equal = self.xn_zr(rn) == self.xn_zr(rm);
@@ -834,4 +871,56 @@ fn instruction_abort_enters_owner_fault_hook_then_forwards_to_host() {
         m.fault_frames, 1,
         "instruction abort must enter the EL1 owner hook"
     );
+}
+
+#[test]
+fn forwarded_return_and_non_svc_sync_trap_on_clock_vector_page() {
+    let hvc_return = (mailbox_resume_layout().hvc_return - LINUX_EL1_VECTORS_BASE) as usize;
+    for (action, expected_esr) in [(4_u64, 0xfffe_u64), (5_u64, 0xfffd_u64)] {
+        let mut m = Machine::full_clock_vector_page(El1IrqMode::Gic);
+        let original = m.regs;
+        m.pc = hvc_return;
+        m.mem.insert(m.sp + AARCH64_SYSCALL_MAILBOX_OFF_STATE, 2);
+        m.mem
+            .insert(m.sp + AARCH64_SYSCALL_MAILBOX_OFF_RESPONSE_ACTION, action);
+        m.mem
+            .insert(m.sp + AARCH64_SYSCALL_MAILBOX_OFF_RETURN_VALUE, 0x2a);
+        m.mem
+            .insert(m.sp + AARCH64_SYSCALL_MAILBOX_OFF_ARGS, 0x1111_2222);
+        let exit = m.run(None);
+        assert_eq!(
+            exit,
+            Exit::Eret {
+                spsr: EL0_DAIF_MASKED & !PSTATE_I,
+                elr: GUEST_ELR,
+            },
+            "forwarded return with no deliverable signal must ERET once (action={action})"
+        );
+        assert_eq!(m.signal_check_frames, vec![(expected_esr, 0x1111_2222)]);
+        assert_eq!(m.regs[0], 0x2a);
+        assert_eq!(m.regs[1..], original[1..]);
+        assert_eq!(m.read(m.sp + AARCH64_SYSCALL_MAILBOX_OFF_STATE), 0);
+
+        // Immediately after the forwarded return, a non-SVC, non-abort lower-EL
+        // synchronous exception (e.g., ld-linux MRS MIDR_EL1, EC = 0x18) enters
+        // the lower-EL sync slot and must reach the host legacy HVC rather than
+        // looping back into the clock handler at the end of not_data_abort.
+        let esr_sys64 = (0x18_u64 << 26) | (1 << 25) | 0x30_0000;
+        let post_return_regs = m.regs;
+        m.pc = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET;
+        m.elr = GUEST_ELR + 4;
+        m.spsr = EL0_DAIF_MASKED & !PSTATE_I;
+        m.esr = esr_sys64;
+        m.retired = 0;
+        let sync_exit = m.run(None);
+        assert_eq!(
+            sync_exit,
+            Exit::Host,
+            "non-SVC, non-abort lower-EL sync exception on clock vector page must reach host HVC"
+        );
+        assert_eq!(m.signal_check_frames.len(), 1);
+        assert_eq!(m.elr, GUEST_ELR + 4);
+        assert_eq!(m.esr, esr_sys64);
+        assert_eq!(m.regs, post_return_regs);
+    }
 }
