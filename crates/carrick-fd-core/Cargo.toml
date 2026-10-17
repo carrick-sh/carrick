@@ -8,11 +8,13 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-sched-core = { path = "../carrick-sched-core" }
 
 [features]
 # Substitutions exist only in this crate's unit-test target, never the ABI.
 loom = []
+test-support = []
 
 [dev-dependencies]
 loom = "=0.7.2"

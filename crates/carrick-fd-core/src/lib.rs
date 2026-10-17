@@ -16,6 +16,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 #[cfg(all(test, feature = "loom"))]
 use loom::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
+pub mod handle;
+
 #[cfg(test)]
 extern crate std;
 #[cfg(all(test, not(feature = "loom")))]
@@ -25,10 +27,10 @@ mod tests;
 mod loom_models;
 
 #[cfg(not(all(test, feature = "loom")))]
-static NEXT_AUTHORITY: AtomicU64 = AtomicU64::new(1);
+pub(crate) static NEXT_AUTHORITY: AtomicU64 = AtomicU64::new(1);
 #[cfg(all(test, feature = "loom"))]
 loom::lazy_static! {
-    static ref NEXT_AUTHORITY: AtomicU64 = AtomicU64::new(1);
+    pub(crate) static ref NEXT_AUTHORITY: AtomicU64 = AtomicU64::new(1);
 }
 
 /// Guest descriptor number, including invalid negative syscall arguments.
@@ -94,11 +96,11 @@ pub enum Error {
     PinRaced(RawOfdPin),
 }
 /// Generation-checked identity; IDs from another Core are rejected.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct TableId {
-    authority: u64,
-    index: usize,
-    generation: u64,
+    pub(crate) authority: u64,
+    pub(crate) index: usize,
+    pub(crate) generation: u64,
 }
 /// Plain-data form of a [`TableId`] for shared records (e.g. a task's
 /// published file table). [`TableId::from_raw`] rebuilds the id; every use
@@ -227,10 +229,10 @@ const fn decode_entry(word: u64) -> Option<Entry> {
 /// under the owning table's lock.
 #[repr(transparent)]
 #[derive(Debug, Default)]
-pub struct DescriptorSlot(AtomicU64);
+pub struct DescriptorSlot(pub(crate) AtomicU64);
 
 // Representation limit of the signed descriptor ABI, not a resource policy.
-const MAX_DESCRIPTORS: usize = i32::MAX as usize + 1;
+pub(crate) const MAX_DESCRIPTORS: usize = i32::MAX as usize + 1;
 const MAX_LEVELS: usize = usize::BITS as usize / 6 + 1;
 
 /// Number of u64 words needed for all levels of a 64-way free-slot bitmap.
@@ -285,6 +287,9 @@ impl Extent {
 pub trait SlotBacking {
     fn resolve(&self, extent: Extent) -> Option<(&[DescriptorSlot], &[AtomicU64])>;
     fn ofd(&self, index: usize) -> Option<&OfdRecord>;
+    fn object(&self, _index: usize) -> Option<&handle::ObjectRecord> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -297,11 +302,11 @@ std::thread_local! {
 /// A view of one table's slots and free bitmap. Built per operation from the
 /// resolved extent while the table's lock is held; never persisted.
 pub struct TableStorage<'a> {
-    entries: &'a [DescriptorSlot],
-    bitmap: &'a [AtomicU64],
+    pub(crate) entries: &'a [DescriptorSlot],
+    pub(crate) bitmap: &'a [AtomicU64],
     offsets: [usize; MAX_LEVELS],
     sizes: [usize; MAX_LEVELS],
-    levels: usize,
+    pub(crate) levels: usize,
 }
 impl<'a> TableStorage<'a> {
     pub fn new(entries: &'a [DescriptorSlot], bitmap: &'a [AtomicU64]) -> Result<Self, Error> {
@@ -328,7 +333,7 @@ impl<'a> TableStorage<'a> {
     pub fn capacity(&self) -> usize {
         self.entries.len()
     }
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             entries: &[],
             bitmap: &[],
@@ -350,13 +355,13 @@ impl<'a> TableStorage<'a> {
             .store(encode_entry(entry), Ordering::Relaxed);
         self.mark_free(fd, entry.is_none());
     }
-    fn clear(&self) {
+    pub(crate) fn clear(&self) {
         for slot in self.entries {
             slot.0.store(0, Ordering::Relaxed);
         }
         self.rebuild();
     }
-    fn rebuild(&self) {
+    pub(crate) fn rebuild(&self) {
         for word in &self.bitmap[..bitmap_words(self.capacity())] {
             word.store(0, Ordering::Relaxed);
         }
@@ -374,7 +379,7 @@ impl<'a> TableStorage<'a> {
             }
         }
     }
-    fn mark_free(&self, mut bit: usize, mut free: bool) {
+    pub(crate) fn mark_free(&self, mut bit: usize, mut free: bool) {
         for level in 0..self.levels {
             let word = bit / 64;
             let cell = &self.bitmap[self.offsets[level] + word];
@@ -391,7 +396,7 @@ impl<'a> TableStorage<'a> {
     }
     // Search one partial word, ascend to a nonempty sibling and descend.
     // At most 2*levels-1 word reads, independent of occupancy or hole position.
-    fn next_bit(&self, level: usize, min: usize, reads: &mut usize) -> Option<usize> {
+    pub(crate) fn next_bit(&self, level: usize, min: usize, reads: &mut usize) -> Option<usize> {
         let word = min / 64;
         if level >= self.levels || word >= self.sizes[level] {
             return None;
@@ -453,11 +458,56 @@ impl Table<'_> {
     }
 }
 
-const TABLE_FREE: u32 = 0;
-const TABLE_LIVE: u32 = 1;
-const FREE_INDEX: u64 = u32::MAX as u64;
+pub(crate) const TABLE_FREE: u32 = 0;
+pub(crate) const TABLE_LIVE: u32 = 1;
+pub(crate) const TABLE_LIVE_HANDLES: u32 = 2;
+pub(crate) const FREE_INDEX: u64 = u32::MAX as u64;
 const REF: u64 = 1 << 32;
 const PIN: u64 = 1;
+
+/// One shared-memory sequence word for lock-free seqlock readers.
+///
+/// Writers call [`SeqWord::begin_write`] (storing an odd sequence and issuing
+/// a release fence so subsequent relaxed stores cannot be reordered before the
+/// odd transition) and [`SeqWord::end_write`] (storing the next even sequence
+/// with release ordering). Readers call `load(Ordering::Acquire)` and validate
+/// after their relaxed reads with [`SeqWord::unchanged_since`] (which issues
+/// an acquire fence before re-reading the sequence word).
+#[repr(transparent)]
+#[derive(Debug, Default)]
+pub(crate) struct SeqWord(pub(crate) AtomicU64);
+
+impl SeqWord {
+    #[inline]
+    pub(crate) fn load(&self, order: Ordering) -> u64 {
+        self.0.load(order)
+    }
+
+    #[cfg(all(test, not(feature = "loom")))]
+    #[inline]
+    pub(crate) fn store(&self, val: u64, order: Ordering) {
+        self.0.store(val, order);
+    }
+
+    #[inline]
+    pub(crate) fn begin_write(&self) {
+        let seq = self.0.load(Ordering::Relaxed);
+        self.0.store(seq | 1, Ordering::Relaxed);
+        fence(Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn end_write(&self) {
+        let seq = self.0.load(Ordering::Relaxed);
+        self.0.store((seq | 1) + 1, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn unchanged_since(&self, seq: u64) -> bool {
+        fence(Ordering::Acquire);
+        self.0.load(Ordering::Relaxed) == seq
+    }
+}
 
 /// One table identity in shared memory. `lock` serializes every operation
 /// that changes the table's slots; the other words are written only under
@@ -469,33 +519,29 @@ const PIN: u64 = 1;
 #[repr(C, align(64))]
 #[derive(Debug, Default)]
 pub struct TableRecord {
-    lock: AtomicU32,
-    state: AtomicU32,
-    generation: AtomicU64,
-    limit: AtomicU64,
-    extent_token: AtomicU64,
-    extent_capacity: AtomicU64,
-    next_free: AtomicU64,
-    seq: AtomicU64,
-    _reserved: u64,
+    pub(crate) lock: AtomicU32,
+    pub(crate) state: AtomicU32,
+    pub(crate) generation: AtomicU64,
+    pub(crate) limit: AtomicU64,
+    pub(crate) extent_token: AtomicU64,
+    pub(crate) extent_capacity: AtomicU64,
+    pub(crate) next_free: AtomicU64,
+    pub(crate) seq: SeqWord,
+    pub(crate) retired: AtomicU64,
 }
 impl TableRecord {
     /// Under the table lock, before changing `state`, `generation` or the
     /// extent: lookups from here on retry.
-    fn begin_write(&self) {
-        let seq = self.seq.load(Ordering::Relaxed);
-        self.seq.store(seq | 1, Ordering::Relaxed);
-        fence(Ordering::Release);
+    pub(crate) fn begin_write(&self) {
+        self.seq.begin_write();
     }
     /// Under the table lock, after the change: publish it.
-    fn end_write(&self) {
-        let seq = self.seq.load(Ordering::Relaxed);
-        self.seq.store((seq | 1) + 1, Ordering::Release);
+    pub(crate) fn end_write(&self) {
+        self.seq.end_write();
     }
     /// A lookup that began at `seq` saw no concurrent writer.
-    fn unchanged_since(&self, seq: u64) -> bool {
-        fence(Ordering::Acquire);
-        self.seq.load(Ordering::Relaxed) == seq
+    pub(crate) fn unchanged_since(&self, seq: u64) -> bool {
+        self.seq.unchanged_since(seq)
     }
 }
 
@@ -575,32 +621,191 @@ fn decode_mode(mode: u64, immutable: u64) -> (AccessMode, StatusFlags) {
 /// Not Clone: copying the authority would duplicate backing ownership.
 #[repr(C, align(64))]
 pub struct Core<const T: usize> {
-    identity: AtomicU64,
-    free_tables: AtomicU64,
-    free_ofds: AtomicU64,
+    pub(crate) identity: AtomicU64,
+    pub(crate) free_tables: AtomicU64,
+    pub(crate) free_ofds: AtomicU64,
     /// OFD records published by the venue ([`Authority::publish_ofds`]):
     /// indices below it resolve; it only grows.
-    ofd_count: AtomicU64,
-    _reserved: [u64; 4],
-    tables: [TableRecord; T],
+    pub(crate) ofd_count: AtomicU64,
+    pub(crate) free_objects: AtomicU64,
+    /// Personality object records published by the venue
+    /// ([`Authority::publish_objects`]): indices below it resolve; it only grows.
+    pub(crate) object_count: AtomicU64,
+    _reserved: [u64; 2],
+    pub(crate) tables: [TableRecord; T],
+}
+
+const fn str_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Named layout facts a shared-memory venue folds into its ABI layout hash.
+pub const NAMED_LAYOUT_FACTS: [(&str, u64); 37] = [
+    (
+        "TableRecord.size",
+        core::mem::size_of::<TableRecord>() as u64,
+    ),
+    (
+        "TableRecord.align",
+        core::mem::align_of::<TableRecord>() as u64,
+    ),
+    ("OfdRecord.size", core::mem::size_of::<OfdRecord>() as u64),
+    ("OfdRecord.align", core::mem::align_of::<OfdRecord>() as u64),
+    (
+        "DescriptorSlot.size",
+        core::mem::size_of::<DescriptorSlot>() as u64,
+    ),
+    (
+        "TableRecord.extent_capacity",
+        core::mem::offset_of!(TableRecord, extent_capacity) as u64,
+    ),
+    (
+        "OfdRecord.holds",
+        core::mem::offset_of!(OfdRecord, holds) as u64,
+    ),
+    (
+        "OfdRecord.mode",
+        core::mem::offset_of!(OfdRecord, mode) as u64,
+    ),
+    ("SLOT_CLOEXEC", SLOT_CLOEXEC),
+    ("MODE_MUTABLE", MODE_MUTABLE),
+    (
+        "Core.ofd_count",
+        core::mem::offset_of!(Core<1>, ofd_count) as u64,
+    ),
+    (
+        "TableRecord.seq",
+        core::mem::offset_of!(TableRecord, seq) as u64,
+    ),
+    ("Core.tables", core::mem::offset_of!(Core<1>, tables) as u64),
+    (
+        "Core.free_objects",
+        core::mem::offset_of!(Core<1>, free_objects) as u64,
+    ),
+    (
+        "Core.object_count",
+        core::mem::offset_of!(Core<1>, object_count) as u64,
+    ),
+    (
+        "TableRecord.retired",
+        core::mem::offset_of!(TableRecord, retired) as u64,
+    ),
+    ("TABLE_LIVE_HANDLES", TABLE_LIVE_HANDLES as u64),
+    (
+        "ObjectRecord.size",
+        core::mem::size_of::<handle::ObjectRecord>() as u64,
+    ),
+    (
+        "ObjectRecord.align",
+        core::mem::align_of::<handle::ObjectRecord>() as u64,
+    ),
+    (
+        "ObjectRecord.lifetime",
+        core::mem::offset_of!(handle::ObjectRecord, lifetime) as u64,
+    ),
+    (
+        "ObjectRecord.incarnation",
+        core::mem::offset_of!(handle::ObjectRecord, incarnation) as u64,
+    ),
+    (
+        "ObjectRecord.backing",
+        core::mem::offset_of!(handle::ObjectRecord, backing) as u64,
+    ),
+    (
+        "ObjectRecord.next_free",
+        core::mem::offset_of!(handle::ObjectRecord, next_free) as u64,
+    ),
+    (
+        "RawObjectGuard.size",
+        core::mem::size_of::<handle::RawObjectGuard>() as u64,
+    ),
+    (
+        "RawObjectGuard.align",
+        core::mem::align_of::<handle::RawObjectGuard>() as u64,
+    ),
+    (
+        "RawObjectGuard.authority",
+        core::mem::offset_of!(handle::RawObjectGuard, authority) as u64,
+    ),
+    (
+        "RawObjectGuard.incarnation",
+        core::mem::offset_of!(handle::RawObjectGuard, incarnation) as u64,
+    ),
+    (
+        "RawObjectGuard.backing",
+        core::mem::offset_of!(handle::RawObjectGuard, backing) as u64,
+    ),
+    (
+        "RawObjectGuard.object_index",
+        core::mem::offset_of!(handle::RawObjectGuard, object_index) as u64,
+    ),
+    (
+        "RawObjectGuard.slot",
+        core::mem::offset_of!(handle::RawObjectGuard, slot) as u64,
+    ),
+    (
+        "RawObjectGuard.slot_generation",
+        core::mem::offset_of!(handle::RawObjectGuard, slot_generation) as u64,
+    ),
+    (
+        "RawObjectGuard.flags_bits",
+        core::mem::offset_of!(handle::RawObjectGuard, flags_bits) as u64,
+    ),
+    ("HANDLE_SLOT_CLOEXEC", handle::HANDLE_SLOT_CLOEXEC),
+    ("HANDLE_SLOT_INHERITABLE", handle::HANDLE_SLOT_INHERITABLE),
+    ("HANDLE_SLOT_RETIRED", handle::HANDLE_SLOT_RETIRED),
+    ("HANDLE_SLOT_OBJECT_MASK", handle::HANDLE_SLOT_OBJECT_MASK),
+    (
+        "HANDLE_SLOT_GENERATION_SHIFT",
+        handle::HANDLE_SLOT_GENERATION_SHIFT,
+    ),
+];
+
+/// Look up a layout fact in [`NAMED_LAYOUT_FACTS`] by name at compile time.
+pub const fn layout_fact(name: &str) -> Option<u64> {
+    let mut i = 0;
+    while i < NAMED_LAYOUT_FACTS.len() {
+        if str_eq(NAMED_LAYOUT_FACTS[i].0, name) {
+            return Some(NAMED_LAYOUT_FACTS[i].1);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Layout facts a shared-memory venue folds into its ABI layout hash.
-pub const LAYOUT_FACTS: [u64; 13] = [
-    core::mem::size_of::<TableRecord>() as u64,
-    core::mem::align_of::<TableRecord>() as u64,
-    core::mem::size_of::<OfdRecord>() as u64,
-    core::mem::align_of::<OfdRecord>() as u64,
-    core::mem::size_of::<DescriptorSlot>() as u64,
-    core::mem::offset_of!(TableRecord, extent_capacity) as u64,
-    core::mem::offset_of!(OfdRecord, holds) as u64,
-    core::mem::offset_of!(OfdRecord, mode) as u64,
-    SLOT_CLOEXEC,
-    MODE_MUTABLE,
-    core::mem::offset_of!(Core<1>, ofd_count) as u64,
-    core::mem::offset_of!(TableRecord, seq) as u64,
-    core::mem::offset_of!(Core<1>, tables) as u64,
-];
+pub const LAYOUT_FACTS: [u64; NAMED_LAYOUT_FACTS.len()] = {
+    let mut out = [0u64; NAMED_LAYOUT_FACTS.len()];
+    let mut i = 0;
+    while i < NAMED_LAYOUT_FACTS.len() {
+        out[i] = NAMED_LAYOUT_FACTS[i].1;
+        i += 1;
+    }
+    out
+};
+
+#[cfg(not(all(test, feature = "loom")))]
+const _: () = {
+    assert!(matches!(layout_fact("TableRecord.size"), Some(64)));
+    assert!(matches!(layout_fact("TableRecord.align"), Some(64)));
+    assert!(matches!(layout_fact("TableRecord.retired"), Some(56)));
+    assert!(matches!(layout_fact("Core.free_objects"), Some(32)));
+    assert!(matches!(layout_fact("Core.object_count"), Some(40)));
+    assert!(matches!(layout_fact("Core.tables"), Some(64)));
+    assert!(matches!(layout_fact("TABLE_LIVE_HANDLES"), Some(2)));
+};
 
 /// A tagged lock-free stack of free record indices, for venue record arrays
 /// in shared memory: `head` holds the ABA tag (high 32 bits) and the top
@@ -666,7 +871,9 @@ impl<const T: usize> Core<T> {
             free_tables: AtomicU64::new(0),
             free_ofds: AtomicU64::new(0),
             ofd_count: AtomicU64::new(0),
-            _reserved: [0; 4],
+            free_objects: AtomicU64::new(0),
+            object_count: AtomicU64::new(0),
+            _reserved: [0; 2],
             tables: core::array::from_fn(|_| TableRecord::default()),
         };
         let identity = NEXT_AUTHORITY
@@ -707,6 +914,11 @@ impl<const T: usize> Core<T> {
         self.ofd_count.load(Ordering::Acquire) as usize
     }
 
+    /// Personality object records the venue has published (indices `0..object_count`).
+    pub fn object_count(&self) -> usize {
+        self.object_count.load(Ordering::Acquire) as usize
+    }
+
     /// Operate on this core with a venue's slot resolution and lock policy.
     pub fn bind<'a, B: SlotBacking, W: LockWait>(
         &'a self,
@@ -726,9 +938,9 @@ impl<const T: usize> Core<T> {
 /// lock-free words. No operation allocates, sleeps or calls out except the
 /// release callbacks documented per method.
 pub struct Authority<'a, B: SlotBacking, W: LockWait, const T: usize> {
-    core: &'a Core<T>,
-    backing: &'a B,
-    wait: W,
+    pub(crate) core: &'a Core<T>,
+    pub(crate) backing: &'a B,
+    pub(crate) wait: W,
 }
 
 /// An authenticated slot-table mutation scope. Drop releases its one table
@@ -793,8 +1005,8 @@ impl<B: SlotBacking, W: LockWait, const T: usize> SlotTableTransaction<'_, '_, B
     }
 }
 
-struct Locked<'a> {
-    record: &'a TableRecord,
+pub(crate) struct Locked<'a> {
+    pub(crate) record: &'a TableRecord,
 }
 impl Drop for Locked<'_> {
     fn drop(&mut self) {
@@ -818,14 +1030,14 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             after_first_publication: None,
         })
     }
-    fn identity(&self) -> Result<u64, Error> {
+    pub(crate) fn identity(&self) -> Result<u64, Error> {
         match self.core.identity.load(Ordering::Acquire) {
             0 => Err(Error::StaleTable),
             id => Ok(id),
         }
     }
 
-    fn acquire(&self, record: &'a TableRecord) -> Result<Locked<'a>, Error> {
+    pub(crate) fn acquire(&self, record: &'a TableRecord) -> Result<Locked<'a>, Error> {
         let mut attempt: u32 = 0;
         loop {
             if record
@@ -842,7 +1054,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         }
     }
 
-    fn storage(&self, extent: Extent) -> Result<TableStorage<'a>, Error> {
+    pub(crate) fn storage(&self, extent: Extent) -> Result<TableStorage<'a>, Error> {
         if extent.capacity == 0 {
             return Ok(TableStorage::empty());
         }
@@ -853,7 +1065,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         TableStorage::new(entries, bitmap).map_err(|_| Error::BadBacking)
     }
 
-    fn record_extent(record: &TableRecord) -> Extent {
+    pub(crate) fn record_extent(record: &TableRecord) -> Extent {
         Extent {
             token: record.extent_token.load(Ordering::Relaxed),
             capacity: record.extent_capacity.load(Ordering::Relaxed),
@@ -1067,6 +1279,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         let generation = record.generation.load(Ordering::Relaxed) + 1;
         record.begin_write();
         record.limit.store(limit as u64, Ordering::Relaxed);
+        record.retired.store(0, Ordering::Relaxed);
         record.extent_token.store(storage.token, Ordering::Relaxed);
         record
             .extent_capacity
@@ -1081,7 +1294,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         }
     }
 
-    fn pop_table(&self) -> Result<usize, Error> {
+    pub(crate) fn pop_table(&self) -> Result<usize, Error> {
         let tables = &self.core.tables;
         pop(&self.core.free_tables, |i| {
             tables.get(i).map(|t| t.next_free.load(Ordering::Relaxed))
@@ -1089,7 +1302,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         .ok_or(Error::NoMemory)
     }
 
-    fn push_table(&self, index: usize) {
+    pub(crate) fn push_table(&self, index: usize) {
         let record = &self.core.tables[index];
         // Exhausted table IDs fail closed: the slot is never reused.
         if record.generation.load(Ordering::Relaxed) < u64::MAX {

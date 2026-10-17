@@ -744,7 +744,7 @@ contracts = ["kernel.mm.carrier-window-isolation", "kernel.fork.stage1-image"]
 
 [[surfaces]]
 path = "crates/carrick-fd-core/src/tests.rs"
-contracts = ["kernel.fork.filetable", "kernel.el1.ipc-fd-authority"]
+contracts = ["kernel.fork.filetable", "kernel.el1.ipc-fd-authority", "core.personality.handle-table"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/objects/ipc.rs"
@@ -1535,3 +1535,27 @@ contracts = ["x86.softcpu.level0"]
 [[surfaces]]
 path = "crates/carrick-softcpu-x86/tests/softcpu_level0.rs"
 contracts = ["x86.softcpu.level0"]
+
+[[surfaces]]
+path = "crates/carrick-core-abi/src/lib.rs"
+contracts = ["core.personality.handle-table"]
+
+[[surfaces]]
+path = "crates/carrick-core-abi/src/open_lifetime.rs"
+contracts = ["core.personality.handle-table"]
+
+[[surfaces]]
+path = "crates/carrick-fd-core/src/lib.rs"
+contracts = ["kernel.fork.filetable", "kernel.el1.ipc-fd-authority", "core.personality.handle-table"]
+
+[[surfaces]]
+path = "crates/carrick-fd-core/src/handle.rs"
+contracts = ["core.personality.handle-table"]
+
+[[surfaces]]
+path = "crates/carrick-fd-core/src/loom_models.rs"
+contracts = ["core.personality.handle-table"]
+
+[[surfaces]]
+path = "crates/carrick-kernel-example/tests/personality_handle_table.rs"
+contracts = ["core.personality.handle-table"]

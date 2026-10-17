@@ -596,6 +596,7 @@ dependencies = [
 name = "carrick-fd-core"
 version = "0.1.0"
 dependencies = [
+ "carrick-core-abi",
  "carrick-sched-core",
  "loom",
 ]
@@ -726,6 +727,7 @@ dependencies = [
  "carrick-abi",
  "carrick-conformance-contract",
  "carrick-core",
+ "carrick-core-abi",
  "carrick-el1",
  "carrick-el1-abi",
  "carrick-fatal",
@@ -789,6 +791,7 @@ dependencies = [
  "carrick-core",
  "carrick-core-abi",
  "carrick-el1-abi",
+ "carrick-fd-core",
  "carrick-guest-arch",
  "carrick-guest-mem",
  "carrick-hal",
