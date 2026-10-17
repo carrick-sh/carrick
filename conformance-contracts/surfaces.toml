@@ -1499,3 +1499,39 @@ contracts = ["softmmu.x86.tlb-walker"]
 [[surfaces]]
 path = "crates/carrick-mmu-core/src/x86/descriptor_txn/tests.rs"
 contracts = ["softmmu.x86.tlb-walker"]
+
+[[surfaces]]
+path = "crates/carrick-softcpu-x86/src/lib.rs"
+contracts = ["x86.softcpu.level0"]
+
+[[surfaces]]
+path = "crates/carrick-softcpu-x86/src/mmu.rs"
+contracts = ["x86.softcpu.level0"]
+
+[[surfaces]]
+path = "crates/carrick-softcpu-x86/src/decode.rs"
+contracts = ["x86.softcpu.level0"]
+
+[[surfaces]]
+path = "crates/carrick-softcpu-x86/src/block.rs"
+contracts = ["x86.softcpu.level0"]
+
+[[surfaces]]
+path = "crates/carrick-softcpu-x86/src/cflow.rs"
+contracts = ["x86.softcpu.level0"]
+
+[[surfaces]]
+path = "crates/carrick-softcpu-x86/src/context.rs"
+contracts = ["x86.softcpu.level0"]
+
+[[surfaces]]
+path = "crates/carrick-softcpu-x86/src/emit.rs"
+contracts = ["x86.softcpu.level0"]
+
+[[surfaces]]
+path = "crates/carrick-softcpu-x86/src/cpu.rs"
+contracts = ["x86.softcpu.level0"]
+
+[[surfaces]]
+path = "crates/carrick-softcpu-x86/tests/softcpu_level0.rs"
+contracts = ["x86.softcpu.level0"]
