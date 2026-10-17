@@ -18,6 +18,7 @@ use crate::dispatch::SharedFutexTarget;
 #[test]
 fn socket_waits_restart_with_sa_restart_except_timed_calls() {
     use carrick_abi::syscall::nr;
+    use carrick_signal_core::wait::SocketWaitTimeout;
 
     for number in [
         nr::ACCEPT,
@@ -32,8 +33,20 @@ fn socket_waits_restart_with_sa_restart_except_timed_calls() {
     ] {
         assert_eq!(
             RestartClass::for_syscall(number.raw()),
+            RestartClass::Never,
+            "socket syscall {} must not restart without continuation timeout proof",
+            number.raw()
+        );
+        assert_eq!(
+            RestartClass::for_syscall_wait(number.raw(), SocketWaitTimeout::Untimed),
             RestartClass::RestartSyscall,
-            "socket syscall {} must restart after SA_RESTART",
+            "untimed socket syscall {} must restart after SA_RESTART",
+            number.raw()
+        );
+        assert_eq!(
+            RestartClass::for_syscall_wait(number.raw(), SocketWaitTimeout::Timed),
+            RestartClass::Never,
+            "timed socket syscall {} must fail with EINTR",
             number.raw()
         );
     }
@@ -46,31 +59,65 @@ fn socket_waits_restart_with_sa_restart_except_timed_calls() {
 fn socket_timeout_forces_eintr_even_with_restart_action() {
     let (_kernel, context) = bootstrap(15_371);
     let generation = publish(&context, 0x705);
-    for (number, timeout) in [
+    for (number, timeout, arg4, expected) in [
         (
             carrick_abi::syscall::nr::RECVFROM,
             Some(Duration::from_secs(1)),
+            0,
+            RestartClass::Never,
         ),
         (
             carrick_abi::syscall::nr::SENDTO,
             Some(Duration::from_secs(1)),
+            0,
+            RestartClass::Never,
         ),
         (
             carrick_abi::syscall::nr::CONNECT,
             Some(Duration::from_secs(1)),
+            0,
+            RestartClass::Never,
         ),
-        (carrick_abi::syscall::nr::READ, Some(Duration::from_secs(1))),
+        (
+            carrick_abi::syscall::nr::READ,
+            Some(Duration::from_secs(1)),
+            0,
+            RestartClass::Never,
+        ),
         (
             carrick_abi::syscall::nr::WRITE,
             Some(Duration::from_secs(1)),
+            0,
+            RestartClass::Never,
         ),
-        (carrick_abi::syscall::nr::RECVFROM, None),
+        (
+            carrick_abi::syscall::nr::RECVFROM,
+            None,
+            0,
+            RestartClass::RestartSyscall,
+        ),
+        (
+            carrick_abi::syscall::nr::RECVMMSG,
+            None,
+            0,
+            RestartClass::RestartSyscall,
+        ),
+        (
+            carrick_abi::syscall::nr::RECVMMSG,
+            None,
+            0x2000,
+            RestartClass::Never,
+        ),
     ] {
+        let req = crate::dispatch::SyscallRequest::new(
+            number.raw(),
+            crate::compat::SyscallArgs::from([0, 0, 0, 0, arg4, 0]),
+        );
         let capture = ContinuationCapture::new(
             &context,
             generation,
-            request(number.raw()),
-            RestartClass::RestartSyscall,
+            req,
+            RestartClass::for_syscall(number.raw()),
         )
         .unwrap();
         let continuation = BlockedContinuation::from_dispatch_outcome(
@@ -85,11 +132,6 @@ fn socket_timeout_forces_eintr_even_with_restart_action() {
             capture,
         )
         .unwrap();
-        let expected = if timeout.is_some() {
-            RestartClass::Never
-        } else {
-            RestartClass::RestartSyscall
-        };
         assert_eq!(continuation.authority().restart_class(), expected);
     }
     assert_eq!(LINUX_EINTR.guest_retval(), -4);

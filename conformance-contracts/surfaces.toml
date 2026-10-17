@@ -73,12 +73,16 @@ path = "crates/carrick-personality-linux/src/ipc/namespace.rs"
 contracts = ["kernel.ipc.permission-classes"]
 
 [[surfaces]]
-path = "crates/carrick-vfs/src/copyfile_policy.rs"
-contracts = ["kernel.file.copyfile-accounting"]
+path = "crates/carrick-kernel/src/dispatch/creds.rs"
+contracts = ["kernel.ipc.permission-classes"]
 
 [[surfaces]]
-path = "crates/carrick-vfs/src/darwin_fs.rs"
-contracts = ["kernel.file.copyfile-accounting"]
+path = "crates/carrick-kernel/src/dispatch/fs.rs"
+contracts = ["kernel.ipc.permission-classes"]
+
+[[surfaces]]
+path = "crates/carrick-signal-core/src/wait.rs"
+contracts = ["kernel.signal.socket-restart"]
 
 [[surfaces]]
 path = "crates/carrick-thread/src/platform_futex.rs"
@@ -210,7 +214,7 @@ contracts = ["kernel.fork.stage1-image", "kernel.transport.exit-overhead", "kern
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/dispatcher.rs"
-contracts = ["kernel.fork.stage1-image"]
+contracts = ["kernel.fork.stage1-image", "kernel.ipc.permission-classes"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/kernel_context.rs"
@@ -444,7 +448,7 @@ contracts = ["kernel.mm.syscall-code-write"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/net/send_recv.rs"
-contracts = ["kernel.mm.syscall-code-write"]
+contracts = ["kernel.mm.syscall-code-write", "kernel.signal.socket-restart"]
 
 [[surfaces]]
 path = "crates/carrick-runtime/src/runtime.rs"

@@ -279,6 +279,9 @@ impl<'a> NetView<'a> {
             let entry = match msgvec.checked_add(i as u64 * MMSGHDR_SIZE) {
                 Some(a) => a,
                 None => {
+                    if sent > 0 {
+                        return DispatchOutcome::returned_i32(sent);
+                    }
                     return DispatchOutcome::errno(LINUX_EFAULT);
                 }
             };
@@ -289,9 +292,9 @@ impl<'a> NetView<'a> {
                 // `match outcome` below keeps the multi-message semantics: a
                 // failure after >=1 success still returns the count.
                 Err(DispatchError::Errno(errno)) => DispatchOutcome::Errno { errno },
-                Err(_) => {
-                    return DispatchOutcome::errno(LINUX_EFAULT);
-                }
+                Err(_) => DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                },
             };
             match outcome {
                 DispatchOutcome::Returned { value } => {
@@ -300,9 +303,19 @@ impl<'a> NetView<'a> {
                         .write_bytes(entry + MSG_LEN_OFFSET, &len_u32.to_le_bytes())
                         .is_err()
                     {
+                        if sent > 0 {
+                            return DispatchOutcome::returned_i32(sent);
+                        }
                         return DispatchOutcome::errno(LINUX_EFAULT);
                     }
                     sent += 1;
+                }
+                // Once >=1 message has been sent, a blocked later entry must
+                // return the partial count rather than parking on WaitOnFds
+                // (which would lose `sent` and cause SA_RESTART or wake
+                // redispatch to restart from entry 0 and resend datagrams).
+                DispatchOutcome::WaitOnFds { .. } if sent > 0 => {
+                    return DispatchOutcome::returned_i32(sent);
                 }
                 DispatchOutcome::Errno { errno } => {
                     if sent > 0 {
@@ -3570,6 +3583,180 @@ mod inet_in_memory_socket_tests {
             .unwrap();
         assert_eq!(out_normal, DispatchOutcome::Returned { value: 12 });
         assert_eq!(&memory.read_bytes(base, 12).unwrap(), b"peek-payload");
+    }
+
+    #[test]
+    fn sendmmsg_returns_partial_count_when_later_entry_blocks() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let (s1, s2) = PureSocketInner::pair_with_family(
+            LINUX_AF_INET,
+            LINUX_SOCK_STREAM,
+            LINUX_IPPROTO_TCP,
+            LinuxUcred::default(),
+            LinuxUcred::default(),
+        );
+        s1.state.lock().so_sndbuf = 4;
+        s1.state.lock().so_sndbuf_explicit = Some(4);
+        s2.state.lock().so_rcvbuf = 4;
+        s2.state.lock().so_rcvbuf_explicit = Some(4);
+
+        let fd = dispatcher
+            .install_fd_at_or_above(
+                3,
+                OpenFile::from_open_description_with_status_flags(
+                    Arc::new(RwLock::new(OpenDescription::InMemorySocket {
+                        base: OpenDescriptionBase::new(0),
+                        socket: Arc::clone(&s1),
+                    })),
+                    LINUX_O_RDWR,
+                    0,
+                ),
+            )
+            .unwrap();
+
+        let base = 0x3000u64;
+        let mut memory = LinearMemory::new(base, vec![0u8; 0x1000]);
+        let payload0 = base + 0x100;
+        let payload1 = base + 0x110;
+        memory.write_bytes(payload0, b"msg1").unwrap();
+        memory.write_bytes(payload1, b"msg2").unwrap();
+
+        let iov0 = base + 0x200;
+        let iov1 = base + 0x210;
+        memory.write_bytes(iov0, &payload0.to_le_bytes()).unwrap();
+        memory.write_bytes(iov0 + 8, &4u64.to_le_bytes()).unwrap();
+        memory.write_bytes(iov1, &payload1.to_le_bytes()).unwrap();
+        memory.write_bytes(iov1 + 8, &4u64.to_le_bytes()).unwrap();
+
+        let msgvec = base + 0x300;
+        let mmsghdr_size = <LinuxMmsghdr as KernelAbi>::ABI_SIZE as u64;
+        let msg_len_offset = <LinuxMsghdr as KernelAbi>::ABI_SIZE as u64;
+        memory
+            .write_bytes(msgvec + 16, &iov0.to_le_bytes())
+            .unwrap();
+        memory
+            .write_bytes(msgvec + 24, &1u64.to_le_bytes())
+            .unwrap();
+        memory
+            .write_bytes(msgvec + mmsghdr_size + 16, &iov1.to_le_bytes())
+            .unwrap();
+        memory
+            .write_bytes(msgvec + mmsghdr_size + 24, &1u64.to_le_bytes())
+            .unwrap();
+
+        let reporter = CompatReporter::default();
+        let outcome = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(269, SyscallArgs::from([fd as u64, msgvec, 2, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Returned { value: 1 },
+            "sendmmsg must return the partial count once >=1 entry has been sent rather than WaitOnFds"
+        );
+        let msg0_len = u32::from_le_bytes(
+            memory
+                .read_bytes(msgvec + msg_len_offset, 4)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(msg0_len, 4);
+
+        let mut received = [0u8; 8];
+        let (n, _) = s2.recv_stream(&mut received, 0).unwrap();
+        assert_eq!(&received[..n], b"msg1");
+    }
+
+    #[test]
+    fn recvmmsg_with_timeout_pointer_fails_eintr_under_sa_restart() {
+        let mut dispatcher = SyscallDispatcher::new();
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let reporter = CompatReporter::default();
+        let (s1, _s2) = PureSocketInner::pair_with_family(
+            LINUX_AF_INET,
+            LINUX_SOCK_STREAM,
+            LINUX_IPPROTO_TCP,
+            LinuxUcred::default(),
+            LinuxUcred::default(),
+        );
+        let fd = dispatcher
+            .install_fd_at_or_above(
+                3,
+                OpenFile::from_open_description_with_status_flags(
+                    Arc::new(RwLock::new(OpenDescription::InMemorySocket {
+                        base: OpenDescriptionBase::new(0),
+                        socket: Arc::clone(&s1),
+                    })),
+                    LINUX_O_RDWR,
+                    0,
+                ),
+            )
+            .unwrap();
+
+        let base = 0x3000u64;
+        let mut memory = LinearMemory::new(base, vec![0u8; 0x1000]);
+        let buf_addr = base + 0x100;
+        let iov_addr = base + 0x200;
+        let msgvec_addr = base + 0x300;
+        let ts_addr = base + 0x400;
+
+        memory
+            .write_bytes(iov_addr, &buf_addr.to_le_bytes())
+            .unwrap();
+        memory
+            .write_bytes(iov_addr + 8, &4u64.to_le_bytes())
+            .unwrap();
+        memory
+            .write_bytes(msgvec_addr + 16, &iov_addr.to_le_bytes())
+            .unwrap();
+        memory
+            .write_bytes(msgvec_addr + 24, &1u64.to_le_bytes())
+            .unwrap();
+        // Valid non-NULL struct timespec { tv_sec: 1, tv_nsec: 0 }.
+        memory.write_bytes(ts_addr, &1i64.to_le_bytes()).unwrap();
+
+        let request = SyscallRequest::new(
+            243,
+            SyscallArgs::from([fd as u64, msgvec_addr, 1, 0, ts_addr, 0]),
+        );
+        let outcome = dispatcher
+            .dispatch(&context, request, &mut memory, &reporter)
+            .unwrap();
+        let DispatchOutcome::WaitOnFds { timeout, .. } = outcome else {
+            panic!("blocking recvmmsg on empty socket must park on WaitOnFds, got {outcome:?}");
+        };
+        let socket_timeout = carrick_signal_core::wait::SocketWaitTimeout::for_fd_wait(
+            request.number.raw(),
+            request.args.0,
+            timeout.is_some(),
+        );
+        assert_eq!(
+            socket_timeout,
+            carrick_signal_core::wait::SocketWaitTimeout::Timed
+        );
+        assert_eq!(
+            crate::kernel::continuation::RestartClass::for_syscall_wait(
+                request.number.raw(),
+                socket_timeout
+            ),
+            crate::kernel::continuation::RestartClass::Never,
+            "recvmmsg with a non-NULL timeout pointer must classify as RestartClass::Never"
+        );
+        assert_eq!(
+            carrick_signal_core::wait::interrupted_wait(
+                carrick_signal_core::wait::RestartClass::Never,
+                carrick_signal_core::wait::WaitProgress::Blocked,
+                Some(true),
+            ),
+            carrick_signal_core::wait::WaitDecision::Eintr,
+            "recvmmsg with a non-NULL timeout pointer must fail with EINTR even under SA_RESTART"
+        );
     }
 }
 

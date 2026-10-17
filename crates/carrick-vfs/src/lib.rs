@@ -31,7 +31,6 @@ pub mod apfs {
         carrick_spec::FsBackendKind::Host
     }
 }
-pub mod copyfile_policy;
 #[cfg(target_os = "macos")]
 pub mod darwin_fs;
 pub mod fs_backend;
