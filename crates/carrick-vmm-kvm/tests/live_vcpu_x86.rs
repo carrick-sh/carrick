@@ -27,7 +27,7 @@ fn kvm_available() -> bool {
     let present = Path::new("/dev/kvm").exists();
     assert!(
         present || !kvm_required(),
-        "CARRICK_REQUIRE_KVM=1 but /dev/kvm is absent: the KVM gate must not skip"
+        "CARRICK_REQUIRE_KVM=1 but /dev/kvm is absent: the KVM gate (`just test-kvm`) must not skip"
     );
     present
 }
@@ -257,12 +257,12 @@ fn test_m2_musl_static_hello() {
     );
     assert!(
         fixture.exists() || !kvm_required(),
-        "CARRICK_REQUIRE_KVM=1 but the musl hello fixture is not built: {}",
+        "CARRICK_REQUIRE_KVM=1 but the musl hello fixture is not built (run `just test-kvm`): {}",
         fixture.display()
     );
     if !fixture.exists() {
         eprintln!(
-            "SKIP: fixture not built — run: \
+            "SKIP: fixture not built — run `just test-kvm` or: \
              cargo build --release \
              --manifest-path crates/carrick-vmm-bhyve/fixtures/hello-x86_64/Cargo.toml \
              --target x86_64-unknown-linux-musl"

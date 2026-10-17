@@ -399,8 +399,17 @@ struct PreparedParentOutput {
 pub(crate) struct PreparedWaitOutputs {
     status: Option<PreparedParentOutput>,
     rusage: Option<PreparedParentOutput>,
+    rusage_efault: bool,
 }
 impl PreparedWaitOutputs {
+    pub(crate) fn result(&self, child_pid: u64) -> i64 {
+        if self.rusage_efault {
+            carrick_syscall_abi::LINUX_EFAULT.guest_retval()
+        } else {
+            child_pid as i64
+        }
+    }
+
     pub(crate) fn complete(self, child: crate::lifecycle::ReapedChild) {
         if child.parent_mm().raw() != PARENT_MM {
             crate::fixture_personality::lifecycle_invariant_error(
@@ -454,16 +463,19 @@ pub(crate) fn prepare_wait_outputs(
     } else {
         Some(prepare_parent_output(lane, status, 4)?)
     };
-    let rusage = if rusage.raw() == 0 {
-        None
+    let (rusage, rusage_efault) = if rusage.raw() == 0 {
+        (None, false)
     } else {
-        Some(prepare_parent_output(
-            lane,
-            rusage,
-            carrick_syscall_abi::LINUX_RUSAGE_BYTES,
-        )?)
+        match prepare_parent_output(lane, rusage, carrick_syscall_abi::LINUX_RUSAGE_BYTES) {
+            Some(output) => (Some(output), false),
+            None => (None, true),
+        }
     };
-    Some(PreparedWaitOutputs { status, rusage })
+    Some(PreparedWaitOutputs {
+        status,
+        rusage,
+        rusage_efault,
+    })
 }
 fn prepare_parent_output(
     lane: &mut crate::lifecycle::NativeLane<'_>,
