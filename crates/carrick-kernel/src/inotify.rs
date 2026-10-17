@@ -78,13 +78,7 @@ const UNCONDITIONAL_EVENT_BITS: u32 = carrick_abi::LINUX_IN_IGNORED
     | carrick_abi::LINUX_IN_Q_OVERFLOW
     | carrick_abi::LINUX_IN_UNMOUNT;
 
-/// Unsupported mask flags in-guest that require host forwarding / recall.
-pub(crate) const UNSUPPORTED_INOTIFY_MASK_FLAGS: u32 = carrick_abi::LINUX_IN_MASK_ADD
-    | carrick_abi::LINUX_IN_MASK_CREATE
-    | carrick_abi::LINUX_IN_ONESHOT
-    | carrick_abi::LINUX_IN_EXCL_UNLINK
-    | carrick_abi::LINUX_IN_DONT_FOLLOW
-    | carrick_abi::LINUX_IN_ONLYDIR;
+pub(crate) use carrick_inotify_core::UNSUPPORTED_INOTIFY_MASK_FLAGS;
 
 /// macOS analogue producing the [`VnodeEvents`] the [`EventMultiplexer`]
 /// register API consumes. Requests the kqueue `NOTE_*` set corresponding to the

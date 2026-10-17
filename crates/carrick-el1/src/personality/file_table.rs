@@ -68,7 +68,16 @@ fn release_reference_observed(
     let record = open_table.get(key.handle.checked_sub(1)? as usize)?;
     match record.lifetime.release_observed(key.incarnation, observe) {
         OpenRelease::Terminal => {
-            queue_open_release(key);
+            #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+            let region = carrick_el1_abi::EL1_REGION_BASE as usize;
+            #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+            // F3 (#384) must wire region-indexed terminal retirement and its host drain.
+            // F2 handles name carrier-local records, but the x86 host only consumes
+            // explicit stdio release crossings, not exit-time pending release keys.
+            let region = 0;
+            #[cfg(not(target_os = "none"))]
+            let region = carrick_el1_abi::get_el1_region_host_ptr();
+            queue_open_release(region, key);
             carrick_el1_abi::mark_pending_host_work_for_file_tables(&[file_table]);
             Some(key)
         }

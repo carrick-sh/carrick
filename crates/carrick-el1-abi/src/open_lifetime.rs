@@ -10,6 +10,67 @@ pub struct OpenReferenceKey {
     pub incarnation: u64,
 }
 
+/// Admission-issued witness that one open record was initialized in the
+/// region's `DelegatedOpenFile` table, deriving its 1-based handle from the
+/// record's index in `DelegatedOpenFile[]`.
+///
+/// Callers cannot construct this type outside [`admit_open_file_in_region`],
+/// even after a glob import:
+///
+/// ```compile_fail
+/// use carrick_el1_abi::*;
+/// let key = OpenReferenceKey { handle: 5, incarnation: 7 };
+/// let _ = AdmittedOpenReference(key);
+/// ```
+///
+/// ```compile_fail
+/// use carrick_el1_abi::*;
+/// let key = OpenReferenceKey { handle: 5, incarnation: 7 };
+/// let _ = AdmittedOpenReference { 0: key };
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdmittedOpenReference(OpenReferenceKey);
+impl AdmittedOpenReference {
+    pub const fn key(self) -> OpenReferenceKey {
+        self.0
+    }
+    pub const fn handle(self) -> u32 {
+        self.0.handle
+    }
+    pub const fn incarnation(self) -> u64 {
+        self.0.incarnation
+    }
+}
+
+/// Initialize the open record at `index` in `region`'s `DelegatedOpenFile`
+/// table and mint its [`AdmittedOpenReference`], deriving the 1-based handle
+/// from `index`.
+///
+/// # Safety
+/// `region` is the aligned base of a retained supervisor region.
+pub unsafe fn admit_open_file_in_region(
+    region: usize,
+    index: usize,
+    incarnation: u64,
+    host: bool,
+) -> Option<AdmittedOpenReference> {
+    if region == 0 || index >= super::MAX_ZONE_OPEN_FILES {
+        return None;
+    }
+    let table_ptr = (region + super::EL1_OPEN_FILE_TABLE_OFFSET as usize)
+        as *const [super::DelegatedOpenFile; super::MAX_ZONE_OPEN_FILES];
+    // SAFETY: caller retains the aligned supervisor region.
+    let record = &unsafe { &*table_ptr }[index];
+    let handle = (index + 1) as u32;
+    record
+        .lifetime
+        .initialize(incarnation, host)
+        .then_some(AdmittedOpenReference(OpenReferenceKey {
+            handle,
+            incarnation,
+        }))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OpenRelease {
     Live,
@@ -107,8 +168,18 @@ impl OpenLifetime {
         }
     }
     pub fn retain(&self, incarnation: u64) -> bool {
-        self.update(incarnation, |low| (low & COUNT < COUNT).then_some(low + 1))
-            == OpenRelease::Live
+        self.retain_observed(incarnation, |_| {})
+    }
+    pub fn retain_observed(
+        &self,
+        incarnation: u64,
+        observe: impl FnMut(OpenReferenceWork),
+    ) -> bool {
+        self.update_observed(
+            incarnation,
+            |low| (low & COUNT < COUNT).then_some(low + 1),
+            observe,
+        ) == OpenRelease::Live
     }
     pub fn release(&self, incarnation: u64) -> OpenRelease {
         self.release_observed(incarnation, |_| {})
@@ -164,6 +235,14 @@ impl OpenReferencePending {
             self.ready.store(true, Ordering::Release);
         }
     }
+    pub fn is_marked(&self, handle: u32) -> bool {
+        let Some(index) = handle.checked_sub(1).map(|h| h as usize) else {
+            return false;
+        };
+        index < super::MAX_ZONE_OPEN_FILES
+            && self.ready.load(Ordering::Acquire)
+            && (self.words[index / 64].load(Ordering::Acquire) & (1 << (index % 64))) != 0
+    }
     pub fn clear(&self, handle: u32) {
         if let Some(index) = handle.checked_sub(1).map(|h| h as usize)
             && index < super::MAX_ZONE_OPEN_FILES
@@ -209,17 +288,9 @@ pub unsafe fn pending_at<'a>(region: usize) -> &'a OpenReferencePending {
     unsafe { &*((region + OPEN_REFERENCE_PENDING_OFFSET as usize) as *const OpenReferencePending) }
 }
 
-/// Publish only a terminal key. Slot reuse clears its owed edge before allocation.
-pub fn queue_open_release(key: OpenReferenceKey) {
-    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    let region = super::EL1_REGION_BASE as usize;
-    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-    // F3 (#384) must wire region-indexed terminal retirement and its host drain.
-    // F2 handles name carrier-local records, but the x86 host only consumes
-    // explicit stdio release crossings, not exit-time pending release keys.
-    let region = 0;
-    #[cfg(not(target_os = "none"))]
-    let region = super::get_el1_region_host_ptr();
+/// Publish only a terminal key in `region`. Slot reuse clears its owed edge
+/// before allocation.
+pub fn queue_open_release(region: usize, key: OpenReferenceKey) {
     if region != 0 {
         // SAFETY: entry/host aperture admission retains this region.
         unsafe { pending_at(region) }.mark(key);
@@ -251,6 +322,35 @@ mod tests {
         assert_eq!(lifetime.release(8), OpenRelease::Terminal);
     }
     #[test]
+    fn admit_open_file_in_region_mints_handle_and_refuses_live_record() {
+        let len = (super::super::EL1_OPEN_FILE_TABLE_OFFSET
+            + super::super::EL1_OPEN_FILE_TABLE_SIZE) as usize;
+        let layout = std::alloc::Layout::from_size_align(len, 64).unwrap();
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!ptr.is_null());
+        let base = ptr as usize;
+        assert_eq!(unsafe { admit_open_file_in_region(0, 0, 1, true) }, None);
+        assert_eq!(
+            unsafe { admit_open_file_in_region(base, super::super::MAX_ZONE_OPEN_FILES, 1, true) },
+            None
+        );
+        assert_eq!(unsafe { admit_open_file_in_region(base, 4, 0, true) }, None);
+        let admitted = unsafe { admit_open_file_in_region(base, 4, 7, true) }.unwrap();
+        assert_eq!(admitted.handle(), 5);
+        assert_eq!(admitted.incarnation(), 7);
+        // Re-admitting the same index while the record is still live is refused.
+        assert_eq!(unsafe { admit_open_file_in_region(base, 4, 8, true) }, None);
+        let table_ptr = (base + super::super::EL1_OPEN_FILE_TABLE_OFFSET as usize)
+            as *const [super::super::DelegatedOpenFile; super::super::MAX_ZONE_OPEN_FILES];
+        let record = &unsafe { &*table_ptr }[4];
+        assert_eq!(record.lifetime.release_host(7), OpenRelease::Terminal);
+        assert_eq!(unsafe { admit_open_file_in_region(base, 4, 7, true) }, None);
+        let next = unsafe { admit_open_file_in_region(base, 4, 8, false) }.unwrap();
+        assert_eq!(next.handle(), 5);
+        assert_eq!(next.incarnation(), 8);
+        unsafe { std::alloc::dealloc(ptr, layout) };
+    }
+    #[test]
     fn terminal_index_is_exact_and_coalesces_owed_edges() {
         let pending = OpenReferencePending::new();
         for handle in [1, 16, 512] {
@@ -260,14 +360,18 @@ mod tests {
             };
             pending.mark(key);
             pending.mark(key);
+            assert!(pending.is_marked(handle));
         }
         assert_eq!(pending.take().collect::<std::vec::Vec<_>>(), [1, 16, 512]);
+        assert!(!pending.is_marked(1));
         assert!(pending.take().next().is_none());
         pending.mark(OpenReferenceKey {
             handle: 1,
             incarnation: 7,
         });
+        assert!(pending.is_marked(1));
         pending.clear(1);
+        assert!(!pending.is_marked(1));
         assert!(pending.take().next().is_none());
     }
 }

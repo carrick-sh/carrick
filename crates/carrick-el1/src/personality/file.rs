@@ -3,7 +3,8 @@
 pub use crate::substrate::file::SIMULATE_COPY_FAULT;
 use crate::substrate::file::{self as core_file, FileError, SeekFrom};
 pub use crate::substrate::file::{
-    HardwareValidator, MemoryValidator, UserCopy, ValidatedCopy, ZoneFile,
+    FileDataEvent, HardwareValidator, InstanceLockPolicy, MemoryValidator, TryInstanceLock,
+    UserCopy, ValidatedCopy, ZoneFile, with_data_marks,
 };
 pub(crate) use crate::substrate::file::{copy_from_user_guarded, copy_to_user_guarded};
 use carrick_el1_abi::Action;

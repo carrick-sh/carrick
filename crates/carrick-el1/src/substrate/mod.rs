@@ -6,3 +6,4 @@ pub mod ipc;
 #[path = "../sched.rs"]
 pub mod sched;
 pub mod watches;
+pub mod zone_file_service;
