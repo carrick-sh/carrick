@@ -3083,28 +3083,37 @@ mod tests {
                 child_tables_used: 4096,
                 parent_tables_used: 0,
             };
-            let mut settlement = carrick_el1_abi::ForkStockSettlement::new(
+            let mut reserve = carrick_el1_abi::ForkStockSettlement::reserve(
                 loan,
                 completion,
                 carrick_guest_arch::KernelVa::new(0xffff_8000_0001_0000),
                 0,
             )
-            .expect("settlement");
+            .expect("reservation");
+            stock
+                .reserve_custody(
+                    parent_execution,
+                    &mut reserve,
+                    |_| true,
+                    |_| true,
+                    |_, _, _| Ok(()),
+                )
+                .expect("reserve custody");
+            let mut settlement =
+                carrick_el1_abi::ForkStockSettlement::commit_reserved(loan, completion)
+                    .expect("settlement");
             stock
                 .settle(
                     &mut NoTableLedger,
                     parent_execution,
-                    carrick_hal::fork_stock::ForkStockSettlementReceipt {
-                        record: &mut settlement,
-                        physical: (),
-                    },
+                    &mut settlement,
                     |_| true,
                     |_| true,
                     |_| true,
                 )
                 .expect("commit");
 
-            // Carrier per-child state as the KVM settle publishes it.
+            // Carrier per-child state retained by KVM reservation.
             let child = inventory.bind(mm_generation(child_mm));
             let mut reservation = child.reserve(1, 2, 4).expect("child reserve");
             let transaction = reservation.transaction();

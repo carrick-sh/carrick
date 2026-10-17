@@ -572,7 +572,23 @@ impl ForkStockSettlement {
         loan: ForkStockLoan,
         completion: crate::PortalForkCompletion,
     ) -> Option<Self> {
-        Self::new(loan, completion, KernelVa::new(0), 0)
+        Self::commit_reserved_with_child_identity(loan, completion, 0, 0)
+    }
+
+    pub fn commit_reserved_with_child_identity(
+        loan: ForkStockLoan,
+        completion: crate::PortalForkCompletion,
+        child_task: u64,
+        child_execution: u64,
+    ) -> Option<Self> {
+        Self::with_child_identity(
+            loan,
+            completion,
+            KernelVa::new(0),
+            0,
+            child_task,
+            child_execution,
+        )
     }
 
     pub fn with_child_identity(

@@ -49,17 +49,24 @@ fn committed_child_retains_physical_custody_through_quarantine() {
         child_tables_used: 4096,
         parent_tables_used: 0,
     };
-    let mut settlement =
-        ForkStockSettlement::new(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
+    let mut reserve =
+        ForkStockSettlement::reserve(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
             .unwrap();
+    stock
+        .reserve_custody(
+            parent,
+            &mut reserve,
+            |_| true,
+            |_| true,
+            |_, _, _| Ok(PhysicalPin(Arc::clone(&dropped))),
+        )
+        .unwrap();
+    let mut settlement = ForkStockSettlement::commit_reserved(loan, completion).unwrap();
     stock
         .settle(
             &mut NoTableLedger,
             parent,
-            ForkStockSettlementReceipt {
-                record: &mut settlement,
-                physical: PhysicalPin(Arc::clone(&dropped)),
-            },
+            &mut settlement,
             |_| true,
             |_| true,
             |_| true,
@@ -146,9 +153,16 @@ fn committed_child_weak_pin_venue_drops_carrier_without_reclaim_and_releases_on_
             child_tables_used: 4096,
             parent_tables_used: 0,
         };
-        let mut settlement =
-            ForkStockSettlement::new(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
+        let mut reserve =
+            ForkStockSettlement::reserve(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
                 .unwrap();
+        carrier
+            .stock
+            .lock()
+            .unwrap()
+            .reserve_custody(parent, &mut reserve, |_| true, |_| true, |_, _, _| Ok(pin))
+            .unwrap();
+        let mut settlement = ForkStockSettlement::commit_reserved(loan, completion).unwrap();
         carrier
             .stock
             .lock()
@@ -156,10 +170,7 @@ fn committed_child_weak_pin_venue_drops_carrier_without_reclaim_and_releases_on_
             .settle(
                 &mut NoTableLedger,
                 parent,
-                ForkStockSettlementReceipt {
-                    record: &mut settlement,
-                    physical: pin,
-                },
+                &mut settlement,
                 |_| true,
                 |_| true,
                 |_| true,
@@ -305,16 +316,17 @@ fn commit<T: ChildAddressTags>(
         child_tables_used: child_used * 4096,
         parent_tables_used: parent_used * 4096,
     };
-    let mut settlement =
-        ForkStockSettlement::new(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
+    let mut reserve =
+        ForkStockSettlement::reserve(loan, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
             .unwrap();
+    stock
+        .reserve_custody(exec, &mut reserve, |_| true, |_| true, |_, _, _| Ok(()))
+        .map_err(|_| ForkStockServiceError::InvalidRecord)?;
+    let mut settlement = ForkStockSettlement::commit_reserved(loan, completion).unwrap();
     stock.settle(
         &mut NoTableLedger,
         exec,
-        ForkStockSettlementReceipt {
-            record: &mut settlement,
-            physical: (),
-        },
+        &mut settlement,
         |_| true,
         |_| true,
         |_| true,
@@ -570,10 +582,7 @@ fn abort_returns_cleared_lifecycle_and_untouched_tables() {
         stock.settle(
             &mut NoTableLedger,
             parent(),
-            ForkStockSettlementReceipt {
-                record: &mut abort,
-                physical: ()
-            },
+            &mut abort,
             |_| true,
             |_| true,
             |_| false
@@ -586,10 +595,7 @@ fn abort_returns_cleared_lifecycle_and_untouched_tables() {
         .settle(
             &mut NoTableLedger,
             parent(),
-            ForkStockSettlementReceipt {
-                record: &mut abort,
-                physical: (),
-            },
+            &mut abort,
             |_| true,
             |_| true,
             |life| {
@@ -635,10 +641,7 @@ fn abort_settle_is_atomic_on_tag_release_failure() {
     let result = stock.settle(
         &mut NoTableLedger,
         parent(),
-        ForkStockSettlementReceipt {
-            record: &mut abort,
-            physical: (),
-        },
+        &mut abort,
         |_| true,
         |_| true,
         |_| true,
@@ -660,10 +663,7 @@ fn abort_refuses_dirty_tables_and_subsequent_loan_refuses_until_scrubbed_and_abo
     let result = stock.settle(
         &mut NoTableLedger,
         exec,
-        ForkStockSettlementReceipt {
-            record: &mut abort,
-            physical: (),
-        },
+        &mut abort,
         |_| true,
         |_| is_clean.get(),
         |_| true,
@@ -681,10 +681,7 @@ fn abort_refuses_dirty_tables_and_subsequent_loan_refuses_until_scrubbed_and_abo
     let result = stock.settle(
         &mut NoTableLedger,
         exec,
-        ForkStockSettlementReceipt {
-            record: &mut abort,
-            physical: (),
-        },
+        &mut abort,
         |_| true,
         |_| is_clean.get(),
         |_| true,
@@ -714,22 +711,32 @@ fn commit_refuses_dirty_unused_tables() {
         child_tables_used: 4096,
         parent_tables_used: 0,
     };
-    let mut settlement =
-        ForkStockSettlement::new(granted, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
+    let mut reserve =
+        ForkStockSettlement::reserve(granted, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
             .unwrap();
+    assert_eq!(
+        stock
+            .reserve_custody(
+                parent(),
+                &mut reserve,
+                |_| true,
+                |_| false,
+                |_, _, _| Ok(())
+            )
+            .unwrap_err(),
+        ForkStockRefusal::Invalid
+    );
+    let mut settlement = ForkStockSettlement::commit_reserved(granted, completion).unwrap();
     assert_eq!(
         stock.settle(
             &mut NoTableLedger,
             parent(),
-            ForkStockSettlementReceipt {
-                record: &mut settlement,
-                physical: ()
-            },
+            &mut settlement,
             |_| true,
-            |_| false,
+            |_| true,
             |_| true
         ),
-        Err(ForkStockServiceError::ExposedDirtyTable)
+        Err(ForkStockServiceError::InvalidRecord)
     );
     assert!(stock.pending(CpuId::new(0)).is_some());
 }
@@ -1313,11 +1320,40 @@ fn second_candidate_refusal_keeps_first_candidate_released_and_returned() {
     assert_eq!(stock.counters().returned_children, 1);
 }
 
-/// A carrier that must publish other state (KVM attaches inherited frames)
-/// validates the whole commit first, so nothing is published for a commit
-/// the stock would refuse.
 #[test]
-fn validate_commit_refuses_before_any_carrier_publication() {
+fn unreserved_commit_cannot_bypass_physical_custody_admission() {
+    let mut stock = stock(UntaggedRoots, 4, 1);
+    let granted = loan(&mut stock, parent(), 302, 2, 1).unwrap();
+    let completion = PortalForkCompletion {
+        request: granted.request,
+        child: unsafe {
+            El1MmHandle::from_admitted_owner(CARRIER, granted.request.child_mm, NonZeroU64::MIN)
+        },
+        parent_generation: ReservationGeneration::new(2).unwrap(),
+        child_tables_used: 4096,
+        parent_tables_used: 0,
+    };
+    let mut commit = ForkStockSettlement::commit_reserved(granted, completion).unwrap();
+    assert_eq!(
+        stock.settle(
+            &mut NoTableLedger,
+            parent(),
+            &mut commit,
+            |_| true,
+            |_| true,
+            |_| true,
+        ),
+        Err(ForkStockServiceError::InvalidRecord),
+        "every Commit must consume pre-publication physical custody admission"
+    );
+    assert_eq!(stock.live_children(), 0);
+    assert!(stock.pending(parent().cpu).is_some());
+}
+
+/// Reservation validates the whole completion before retaining physical custody,
+/// and committing without an admitted reservation is refused.
+#[test]
+fn reserve_custody_refuses_invalid_completion_before_retaining_physical_custody() {
     let mut stock = stock(UntaggedRoots, 4, 1);
     let granted = loan(&mut stock, parent(), 302, 2, 1).unwrap();
     let completion = PortalForkCompletion {
@@ -1330,21 +1366,55 @@ fn validate_commit_refuses_before_any_carrier_publication() {
         child_tables_used: 4096,
         parent_tables_used: 0,
     };
-    let settlement =
-        ForkStockSettlement::new(granted, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
+    let mut reserve_dirty =
+        ForkStockSettlement::reserve(granted, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
             .unwrap();
     assert_eq!(
-        stock.validate_commit(parent(), &settlement, |_| true, |_| false),
-        Err(ForkStockServiceError::ExposedDirtyTable)
+        stock
+            .reserve_custody(
+                parent(),
+                &mut reserve_dirty,
+                |_| true,
+                |_| false,
+                |_, _, _| panic!("retain_physical must not run when unused tables are dirty")
+            )
+            .unwrap_err(),
+        ForkStockRefusal::Invalid
     );
+    let mut reserve_unresolvable =
+        ForkStockSettlement::reserve(granted, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
+            .unwrap();
     assert_eq!(
-        stock.validate_commit(parent(), &settlement, |_| false, |_| true),
-        Err(ForkStockServiceError::MemoryAccessFailed)
+        stock
+            .reserve_custody(
+                parent(),
+                &mut reserve_unresolvable,
+                |_| false,
+                |_| true,
+                |_, _, _| panic!("retain_physical must not run when tables are unresolvable")
+            )
+            .unwrap_err(),
+        ForkStockRefusal::Inventory
     );
     assert!(stock.pending(CpuId::new(0)).is_some(), "nothing consumed");
+    let mut unreserved_commit = ForkStockSettlement::commit_reserved(granted, completion).unwrap();
     assert_eq!(
-        stock.validate_commit(parent(), &settlement, |_| true, |_| true),
-        Ok(completion)
+        stock.commit_admitted(&mut NoTableLedger, parent(), &mut unreserved_commit),
+        Err(ForkStockServiceError::InvalidRecord)
+    );
+    let mut reserve_ok =
+        ForkStockSettlement::reserve(granted, completion, KernelVa::new(0xffff_8000_0001_0000), 0)
+            .unwrap();
+    assert!(
+        stock
+            .reserve_custody(
+                parent(),
+                &mut reserve_ok,
+                |_| true,
+                |_| true,
+                |_, _, _| Ok(())
+            )
+            .is_ok()
     );
 }
 
@@ -1470,8 +1540,7 @@ fn reserve_custody_refuses_retired_munmap_backing_and_rolls_back_earlier_pins() 
         |_| true,
         |_req, _addr, count| {
             assert_eq!(count, 2);
-            let mut pins = Vec::new();
-            pins.push(PhysicalPin(Arc::clone(&dropped_first)));
+            let _pin = PhysicalPin(Arc::clone(&dropped_first));
             // Second mapping's stage-2 record entered RetirementRequested from concurrent munmap.
             Err(ForkStockRefusal::Inventory)
         },
@@ -1502,10 +1571,7 @@ fn reserve_custody_refuses_retired_munmap_backing_and_rolls_back_earlier_pins() 
         .settle(
             &mut NoTableLedger,
             exec,
-            ForkStockSettlementReceipt {
-                record: &mut abort,
-                physical: Vec::new(),
-            },
+            &mut abort,
             |_| true,
             |_| true,
             |_| true,
@@ -1577,10 +1643,7 @@ fn admitted_custody_token_drops_reserved_pins_on_abort_and_consumes_infallibly_o
         .settle(
             &mut NoTableLedger,
             exec,
-            ForkStockSettlementReceipt {
-                record: &mut abort,
-                physical: Vec::new(),
-            },
+            &mut abort,
             |_| true,
             |_| true,
             |_| true,
@@ -1733,7 +1796,7 @@ fn second_root_reuses_carrier_fork_stock_after_first_root_exits() {
         child_tables_used: 4096,
         parent_tables_used: 4096,
     };
-    let mut settlement1 = ForkStockSettlement::new(
+    let mut reserve1 = ForkStockSettlement::reserve(
         granted1,
         completion1,
         KernelVa::new(0xffff_8000_0001_0000),
@@ -1741,13 +1804,14 @@ fn second_root_reuses_carrier_fork_stock_after_first_root_exits() {
     )
     .unwrap();
     stock
+        .reserve_custody(root1, &mut reserve1, |_| true, |_| true, |_, _, _| Ok(()))
+        .unwrap();
+    let mut settlement1 = ForkStockSettlement::commit_reserved(granted1, completion1).unwrap();
+    stock
         .settle(
             &mut ledger,
             root1,
-            ForkStockSettlementReceipt {
-                record: &mut settlement1,
-                physical: (),
-            },
+            &mut settlement1,
             |_| true,
             |_| true,
             |_| true,
