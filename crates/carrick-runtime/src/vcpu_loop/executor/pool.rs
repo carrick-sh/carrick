@@ -297,6 +297,7 @@ pub(crate) struct WorkerKick {
     pub(crate) binding: Mutex<Option<ExecutorBinding>>,
     pub(crate) hardware: Mutex<Option<ExactHardwareKick>>,
     pub(crate) need_resched: AtomicBool,
+    shutdown_interrupted: AtomicBool,
     /// The executor waits for work in the guest's scheduler (EL1 plan 1d):
     /// a scheduler wake reaches it by forcing its vCPU out.
     guest_idle: AtomicBool,
@@ -328,6 +329,7 @@ impl WorkerKick {
             binding: Mutex::new(None),
             hardware: Mutex::new(None),
             need_resched: AtomicBool::new(false),
+            shutdown_interrupted: AtomicBool::new(false),
             guest_idle: AtomicBool::new(false),
             receipts,
             #[cfg(test)]
@@ -377,10 +379,16 @@ impl WorkerKick {
     /// run already failed) never exits on its own, so the join would wait
     /// forever; `need_resched` covers a kick that lands before guest entry.
     pub(crate) fn interrupt_for_shutdown(&self) {
+        self.shutdown_interrupted.store(true, Ordering::Release);
         self.need_resched.store(true, Ordering::Release);
         if let Some(hardware) = self.hardware.lock().as_ref() {
             hardware.handle.kick();
         }
+    }
+
+    pub(crate) fn is_shutdown_interrupted(&self) -> bool {
+        self.shutdown_interrupted.load(Ordering::Acquire)
+            && self.need_resched.load(Ordering::Acquire)
     }
 
     /// Publish (or end) the executor's wait in the guest. Sequentially
@@ -408,6 +416,7 @@ impl ExecutorKick for WorkerKick {
             return false;
         }
         self.need_resched.store(false, Ordering::Release);
+        self.shutdown_interrupted.store(false, Ordering::Release);
         *current = Some(binding);
         true
     }
@@ -417,6 +426,7 @@ impl ExecutorKick for WorkerKick {
         if *current == Some(binding) {
             *current = None;
             self.need_resched.store(false, Ordering::Release);
+            self.shutdown_interrupted.store(false, Ordering::Release);
         }
     }
 
@@ -853,6 +863,8 @@ where
     _debug_aux_provider: Arc<dyn carrick_kernel::kernel::debug::KernelDebugAuxProvider>,
     debug_aux_registration: carrick_kernel::kernel::core::DebugAuxProviderRegistration,
     pub(crate) control: Arc<PoolControl>,
+    #[cfg(test)]
+    skip_shutdown_kick: bool,
 }
 
 struct DebugAuxProviderPublication {
@@ -1185,7 +1197,14 @@ where
             _debug_aux_provider: debug_aux_provider,
             debug_aux_registration,
             control,
+            #[cfg(test)]
+            skip_shutdown_kick: false,
         })
+    }
+
+    #[cfg(test)]
+    pub fn disable_shutdown_kick_for_test(&mut self) {
+        self.skip_shutdown_kick = true;
     }
 
     pub fn shutdown(mut self) -> Result<ExecutorPoolReport, ExecutorPoolShutdownError> {
@@ -1196,12 +1215,18 @@ where
             .kernel()
             .unregister_debug_aux_provider(self.debug_aux_registration);
         self.scheduler.close();
-        for kick in self
-            .handles
-            .iter()
-            .filter_map(|handle| handle.kick.as_ref())
-        {
-            kick.interrupt_for_shutdown();
+        #[cfg(test)]
+        let kick_workers = !self.skip_shutdown_kick;
+        #[cfg(not(test))]
+        let kick_workers = true;
+        if kick_workers {
+            for kick in self
+                .handles
+                .iter()
+                .filter_map(|handle| handle.kick.as_ref())
+            {
+                kick.interrupt_for_shutdown();
+            }
         }
         let mut failures = Vec::new();
         if let Err(error) = self

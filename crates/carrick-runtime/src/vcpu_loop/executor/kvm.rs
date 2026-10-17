@@ -206,6 +206,7 @@ type KvmForwardCounts = BTreeMap<&'static str, u64>;
 pub(crate) struct KvmForwardStats {
     host: Mutex<KvmForwardCounts>,
     refusal: Mutex<KvmForwardCounts>,
+    authority_refusals: Mutex<Vec<ForwardAuthorityRefusal>>,
 }
 
 impl KvmForwardStats {
@@ -220,6 +221,10 @@ impl KvmForwardStats {
     /// Refusals of a forward the stopped task's authority cannot serve are
     /// counted beside the ENOSYS refusals, so a refused run shows them.
     fn record_authority_refusal(&self, refusal: ForwardAuthorityRefusal) -> Result<(), TrapError> {
+        self.authority_refusals
+            .lock()
+            .map_err(|_| TrapError::Hypervisor("KVM forward counters poisoned".into()))?
+            .push(refusal);
         Self::count(&self.refusal, refusal.family())
     }
 
@@ -246,6 +251,14 @@ impl KvmForwardStats {
             .map_err(|_| TrapError::Hypervisor("KVM forward counters poisoned".into()))?
             .clone();
         Ok((host, refusal))
+    }
+
+    pub(crate) fn authority_refusals(&self) -> Result<Vec<ForwardAuthorityRefusal>, TrapError> {
+        Ok(self
+            .authority_refusals
+            .lock()
+            .map_err(|_| TrapError::Hypervisor("KVM forward counters poisoned".into()))?
+            .clone())
     }
 }
 
@@ -423,7 +436,7 @@ impl ForwardAuthority {
 /// closed with this reason; owned host context and parking for in-zone
 /// children is follow-up work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ForwardAuthorityRefusal {
+pub enum ForwardAuthorityRefusal {
     /// The call needs a host task context (fd table, offsets, credentials)
     /// that an in-zone child does not have.
     HostTaskContext { native: u64 },
@@ -629,25 +642,76 @@ impl KvmPersistentExecutor {
             if frame.rax == carrick_el1_abi::HostObjectWriteCrossing::NUMBER
                 && frame.rcx == carrick_el1_abi::HostObjectWriteCrossing::FRAME_TAG
             {
-                let binding = carrick_el1_abi::HostObjectBinding::from_encoded(frame.rdi as u32)
+                let object = carrick_el1_abi::HostObjectBinding::from_encoded(frame.rdi as u32)
                     .filter(|_| frame.rdi <= u64::from(u32::MAX))
-                    .and_then(carrick_el1_abi::HostObjectBinding::stdio_fd)
-                    .filter(|fd| *fd == 1 || *fd == 2)
                     .ok_or_else(|| {
                         TrapError::Hypervisor("invalid host object write binding".into())
                     })?;
-                let length = usize::try_from(frame.rdx).map_err(|_| {
-                    TrapError::Hypervisor("host object write length overflow".into())
-                })?;
-                let bytes = venue
-                    .read_bytes_prefix(frame.rsi, length)
-                    .map_err(|error| {
-                        TrapError::Hypervisor(format!("host object write copy: {error}"))
+                if !venue.stopped_task_has_writable_host_object(object)? {
+                    return Err(TrapError::Hypervisor(
+                        "unauthenticated host object write binding".into(),
+                    ));
+                }
+                if let Some(stdio_fd) = object.stdio_fd().filter(|fd| *fd == 1 || *fd == 2) {
+                    let length = usize::try_from(frame.rdx).map_err(|_| {
+                        TrapError::Hypervisor("host object write length overflow".into())
                     })?;
-                return Ok(ForwardDecision::Immediate(
-                    InitialSyscallDisposition::Return(
-                        dispatcher.forward_stdio_bytes(binding, &bytes),
-                    ),
+                    let bytes = venue
+                        .read_bytes_prefix(frame.rsi, length)
+                        .map_err(|error| {
+                            TrapError::Hypervisor(format!("host object write copy: {error}"))
+                        })?;
+                    return Ok(ForwardDecision::Immediate(
+                        InitialSyscallDisposition::Return(
+                            dispatcher.forward_stdio_bytes(stdio_fd, &bytes),
+                        ),
+                    ));
+                }
+                if let Some(host_fd) = object.host_fd() {
+                    let fd_arg = u64::try_from(host_fd.raw()).map_err(|_| {
+                        TrapError::Hypervisor("negative host object write fd".into())
+                    })?;
+                    let kernel = binding.fresh_context()?;
+                    let SyscallNorm::Plain(raw) =
+                        X8664GuestArch::normalize_syscall(&carrick_guest_mem::X8664SyscallFrame {
+                            rax: 1,
+                            rdi: fd_arg,
+                            rsi: frame.rsi,
+                            rdx: frame.rdx,
+                            r10: 0,
+                            r8: 0,
+                            r9: 0,
+                        })
+                    else {
+                        return Err(TrapError::Hypervisor(
+                            "unexpected arch_prctl normalizing x86 write".into(),
+                        ));
+                    };
+                    let request =
+                        SyscallRequest::from_raw(raw).with_current_guest_sp(Some(frame.rsp));
+                    let outcome = dispatcher
+                        .dispatch(&kernel, request, venue, &self.reporter)
+                        .map_err(|error| {
+                            TrapError::Hypervisor(format!(
+                                "dispatch x86 host object write: {error}"
+                            ))
+                        })?;
+                    return match outcome {
+                        DispatchOutcome::Returned { value } => Ok(ForwardDecision::Immediate(
+                            InitialSyscallDisposition::Return(value),
+                        )),
+                        DispatchOutcome::Errno { errno } => Ok(ForwardDecision::Immediate(
+                            InitialSyscallDisposition::Refused(errno),
+                        )),
+                        _ if !can_block => refuse(ForwardAuthorityRefusal::BlockingWait),
+                        other => Ok(ForwardDecision::Blocked(
+                            ForwardRequest::Syscall(request),
+                            Box::new(other),
+                        )),
+                    };
+                }
+                return Err(TrapError::Hypervisor(
+                    "invalid host object write binding".into(),
                 ));
             }
             if frame.rax == carrick_el1_abi::HostReadinessCrossing::NUMBER
@@ -728,33 +792,80 @@ impl KvmPersistentExecutor {
             if authority == ForwardAuthority::InZoneChild
                 && matches!(class, crate::prepare::InitialForwardClass::Host(_))
             {
-                // The ring resolves a write to fd 0..=2 through the child's
-                // own file table before it forwards anything: a binding to a
-                // different stdio stream crosses as `HostObjectWriteCrossing`,
-                // an unbound or non-host fd is answered in-ring, and only a
-                // write whose fd is bound to the same-numbered host stdio
-                // stream reaches here raw (`linux_personality.rs`,
-                // `CompletionRoute::Forward`). That is the one raw call served
-                // without a host task context; it is the same service as the
-                // binding-keyed crossing.
-                let stdio_fd = raw.args[0];
+                // Resolve a raw write from an in-zone child through the
+                // stopped child's own CPL0 file table rather than assuming fd
+                // 1 or 2 is host stdio; only a live writable binding to host
+                // stdout or stderr is served here.
+                let write_fd_arg = raw.args[0];
+                let write_buf_arg = raw.args[1];
+                let write_len_arg = raw.args[2];
                 if raw.number.0 == carrick_personality_linux::crossing::nr::WRITE.raw()
-                    && (stdio_fd == 1 || stdio_fd == 2)
+                    && let Ok(guest_fd) = i32::try_from(write_fd_arg)
+                    && let Some(object) = venue.stopped_task_host_object(guest_fd)?
                 {
-                    let length = usize::try_from(raw.args[2]).map_err(|_| {
-                        TrapError::Hypervisor("in-zone stdio write length overflow".into())
-                    })?;
-                    let bytes = venue
-                        .read_bytes_prefix(raw.args[1], length)
-                        .map_err(|error| {
-                            TrapError::Hypervisor(format!("in-zone stdio write copy: {error}"))
+                    if let Some(stdio_fd) = object.stdio_fd().filter(|fd| *fd == 1 || *fd == 2) {
+                        let length = usize::try_from(write_len_arg).map_err(|_| {
+                            TrapError::Hypervisor("in-zone stdio write length overflow".into())
                         })?;
-                    self.stats.record(class)?;
-                    return Ok(ForwardDecision::Immediate(
-                        InitialSyscallDisposition::Return(
-                            dispatcher.forward_stdio_bytes(stdio_fd as i32, &bytes),
-                        ),
-                    ));
+                        let bytes =
+                            venue
+                                .read_bytes_prefix(write_buf_arg, length)
+                                .map_err(|error| {
+                                    TrapError::Hypervisor(format!(
+                                        "in-zone stdio write copy: {error}"
+                                    ))
+                                })?;
+                        self.stats.record(class)?;
+                        return Ok(ForwardDecision::Immediate(
+                            InitialSyscallDisposition::Return(
+                                dispatcher.forward_stdio_bytes(stdio_fd, &bytes),
+                            ),
+                        ));
+                    }
+                    if let Some(host_fd) = object.host_fd() {
+                        let fd_arg = u64::try_from(host_fd.raw()).map_err(|_| {
+                            TrapError::Hypervisor("negative host object write fd".into())
+                        })?;
+                        let kernel = binding.fresh_context()?;
+                        let SyscallNorm::Plain(host_raw) = X8664GuestArch::normalize_syscall(
+                            &carrick_guest_mem::X8664SyscallFrame {
+                                rax: 1,
+                                rdi: fd_arg,
+                                rsi: write_buf_arg,
+                                rdx: write_len_arg,
+                                r10: 0,
+                                r8: 0,
+                                r9: 0,
+                            },
+                        ) else {
+                            return Err(TrapError::Hypervisor(
+                                "unexpected arch_prctl normalizing x86 write".into(),
+                            ));
+                        };
+                        let request = SyscallRequest::from_raw(host_raw)
+                            .with_current_guest_sp(Some(frame.rsp));
+                        self.stats.record(class)?;
+                        let outcome = dispatcher
+                            .dispatch(&kernel, request, venue, &self.reporter)
+                            .map_err(|error| {
+                                TrapError::Hypervisor(format!(
+                                    "dispatch x86 in-zone host object write: {error}"
+                                ))
+                            })?;
+                        return match outcome {
+                            DispatchOutcome::Returned { value } => Ok(ForwardDecision::Immediate(
+                                InitialSyscallDisposition::Return(value),
+                            )),
+                            DispatchOutcome::Errno { errno } => Ok(ForwardDecision::Immediate(
+                                InitialSyscallDisposition::Refused(errno),
+                            )),
+                            _ if !can_block => refuse(ForwardAuthorityRefusal::BlockingWait),
+                            other => Ok(ForwardDecision::Blocked(
+                                ForwardRequest::Syscall(request),
+                                Box::new(other),
+                            )),
+                        };
+                    }
                 }
                 return refuse(ForwardAuthorityRefusal::HostTaskContext {
                     native: raw.native_number.0,
