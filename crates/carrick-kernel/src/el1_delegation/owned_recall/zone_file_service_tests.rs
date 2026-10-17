@@ -12,13 +12,14 @@ mod serial_host {
     use crate::kernel::{FileTableId, RlimitSet};
     use carrick_abi::LINUX_O_RDWR;
     use carrick_core::file::{FileOperation, FilePin, FilePinKey, FileService, IoError, WriteAt};
+    use carrick_core_abi::{OpenReferenceKey, OpenReferenceWork};
     use carrick_el1::substrate::zone_file_service::{
         ZoneFileService, ZoneFileTables, ZoneFileVenue, ZonePinSlice, ZonePinSlots, ZonePinStorage,
         ZonePinTable,
     };
     use carrick_el1_abi::{
-        AdmittedOpenReference, DELEGATED_FLAG_APPEND, DelegatedOpenFile, OpenReferenceKey,
-        OpenReferenceWork, SlotId, get_el1_region_host_ptr,
+        AdmittedOpenReference, DELEGATED_FLAG_APPEND, DelegatedOpenFile, SlotId,
+        get_el1_region_host_ptr,
     };
     use std::cell::Cell;
     use std::sync::Arc;
