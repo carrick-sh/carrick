@@ -2,16 +2,12 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::expect_used, clippy::panic)]
 
-#[path = "common/physical_inventory.rs"]
-mod physical_inventory;
-use physical_inventory::physical_inventory;
-
 use carrick_mem::x86_initial_image::prepare_x86_elf;
 use carrick_vmm_kvm::cpl0_boot::{Cpl0Carrier, InitialReservationLimits, InitialTaskBinding};
 #[path = "common/kvm_pool_fixture.rs"]
 mod kvm_pool_fixture;
 use carrick_x86::cpl0_entry::OBSERVE_INITIAL_MM;
-use kvm_pool_fixture::{run_pool_fixture, run_pool_fixture_with};
+use kvm_pool_fixture::{physical_inventory, run_pool_fixture, run_pool_fixture_with};
 use std::path::PathBuf;
 
 const ELF_X86_64_MACHINE: u16 = 62;
