@@ -16,6 +16,23 @@
 
 set -eu
 
+saw_ref=0
+non_claim_ref=0
+while IFS=' ' read -r local_ref local_sha remote_ref remote_sha; do
+    if [ -z "${local_ref}${local_sha}${remote_ref}${remote_sha}" ]; then
+        continue
+    fi
+    saw_ref=1
+    case "$remote_ref" in
+        refs/claims/?*) ;;
+        *) non_claim_ref=1 ;;
+    esac
+done
+
+if [ "$saw_ref" -eq 1 ] && [ "$non_claim_ref" -eq 0 ]; then
+    exit 0
+fi
+
 root=$(git rev-parse --show-toplevel)
 cd "$root"
 
