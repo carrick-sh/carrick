@@ -437,9 +437,33 @@ impl MmKey {
     }
 }
 
+/// Admitted physical custody reserved for a pending fork loan during
+/// preparation, before child publication. Consumed infallibly when the
+/// child commits, or dropped on abort to release its physical pins.
+#[derive(Debug)]
+pub struct AdmittedForkCustody<C> {
+    loan_id: NonZeroU64,
+    child_key: MmKey,
+    parent_key: MmKey,
+    child_used: usize,
+    parent_used: usize,
+    completion: carrick_el1_abi::PortalForkCompletion,
+    physical: C,
+}
+
+impl<C> AdmittedForkCustody<C> {
+    pub fn completion(&self) -> carrick_el1_abi::PortalForkCompletion {
+        self.completion
+    }
+
+    pub fn physical(&self) -> &C {
+        &self.physical
+    }
+}
+
 /// Outstanding physical loan held by one stopped CPU.
-#[derive(Clone, Debug)]
-pub struct PendingForkLoan<T> {
+#[derive(Debug)]
+pub struct PendingForkLoan<T, C = ()> {
     pub loan: ForkStockLoan,
     pub execution: GrantExecution,
     pub child_tables: Vec<RootGpa>,
@@ -447,6 +471,13 @@ pub struct PendingForkLoan<T> {
     pub lifecycle: ForkLifecycleLoan,
     pub control: ForkControlCapacity,
     pub tag: T,
+    admitted: Option<AdmittedForkCustody<C>>,
+}
+
+impl<T, C> PendingForkLoan<T, C> {
+    pub fn admitted_custody(&self) -> Option<&AdmittedForkCustody<C>> {
+        self.admitted.as_ref()
+    }
 }
 
 /// The stopped lane's wire settlement and the physical custody it hands to
@@ -597,7 +628,7 @@ pub struct ForkStock<T: ChildAddressTags, C = ()> {
     unused_control: Option<ForkControlCapacity>,
     tables: Vec<RootGpa>,
     lifecycles: Vec<ForkLifecycleLoan>,
-    pending: Vec<Option<PendingForkLoan<T::Tag>>>,
+    pending: Vec<Option<PendingForkLoan<T::Tag, C>>>,
     next_loan: NonZeroU64,
     children: BTreeMap<MmKey, CommittedChild<T::Tag, C>>,
     /// Table pages each live MM consumed, as a child or as a fork parent.
@@ -699,7 +730,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         self.controls.is_empty() && self.unused_control.is_none()
     }
 
-    pub fn pending(&self, cpu: CpuId) -> Option<&PendingForkLoan<T::Tag>> {
+    pub fn pending(&self, cpu: CpuId) -> Option<&PendingForkLoan<T::Tag, C>> {
         self.pending.get(cpu_index(cpu)?)?.as_ref()
     }
 
@@ -834,6 +865,22 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         Err(refusal)
     }
 
+    fn refuse_settlement(
+        &mut self,
+        settlement: &mut ForkStockSettlement,
+        refusal: ForkStockRefusal,
+    ) -> ForkStockRefusal {
+        let counter = match refusal {
+            ForkStockRefusal::Capacity => &mut self.counters.capacity_refusals,
+            ForkStockRefusal::Stale => &mut self.counters.stale_refusals,
+            ForkStockRefusal::Invalid => &mut self.counters.invalid_refusals,
+            ForkStockRefusal::Inventory => &mut self.counters.inventory_refusals,
+        };
+        *counter = counter.saturating_add(1);
+        settlement.refuse(refusal);
+        refusal
+    }
+
     /// Service a stopped-CPU loan request. `lifecycle_fresh` lets the host
     /// prove the issued record is cleared storage before the guest owns it;
     /// a stale record refuses with [`ForkStockRefusal::Inventory`].
@@ -857,7 +904,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             return self.refuse(exchange, ForkStockRefusal::Invalid);
         };
         if index >= self.pending.len() {
-            self.pending.resize(index + 1, None);
+            self.pending.resize_with(index + 1, || None);
         }
         if self.pending[index].is_some() {
             return self.refuse_capacity(
@@ -998,6 +1045,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             lifecycle,
             control,
             tag,
+            admitted: None,
         });
         Ok(loan)
     }
@@ -1052,17 +1100,13 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         Ok(pending.loan)
     }
 
-    /// Every check a commit settlement must pass, without consuming the
-    /// loan. A carrier that publishes its own state for the child (KVM
-    /// inherited frames) calls this first so nothing is published for a
-    /// commit the stock would refuse; `settle` runs the same checks.
-    pub fn validate_commit(
+    fn validate_completion(
         &self,
         execution: GrantExecution,
-        settlement: &ForkStockSettlement,
+        completion: carrick_el1_abi::PortalForkCompletion,
         is_resolvable: impl Fn(&[RootGpa]) -> bool,
         is_clean: impl Fn(&[RootGpa]) -> bool,
-    ) -> Result<carrick_el1_abi::PortalForkCompletion, ForkStockServiceError> {
+    ) -> Result<(MmKey, MmKey, usize, usize), ForkStockServiceError> {
         let loan = self.settlement_loan(execution)?;
         let pending = self
             .pending(execution.cpu)
@@ -1070,9 +1114,6 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         if !is_resolvable(&pending.child_tables) || !is_resolvable(&pending.parent_tables) {
             return Err(ForkStockServiceError::MemoryAccessFailed);
         }
-        let (completion, _custody, _count) = settlement
-            .request(loan)
-            .ok_or(ForkStockServiceError::LoanMismatch)?;
         let child_used = usize::try_from(completion.child_tables_used / TABLE_PAGE_BYTES)
             .map_err(|_| ForkStockServiceError::InvalidRecord)?;
         let parent_used = usize::try_from(completion.parent_tables_used / TABLE_PAGE_BYTES)
@@ -1090,11 +1131,186 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         }
         let child_key =
             MmKey::of(loan.request.child_mm).ok_or(ForkStockServiceError::InvalidRecord)?;
+        let parent_key =
+            MmKey::of(loan.request.operation.mm).ok_or(ForkStockServiceError::InvalidRecord)?;
         if self.children.contains_key(&child_key) || self.committed_tables.contains_key(&child_key)
         {
             return Err(ForkStockServiceError::InvalidRecord);
         }
+        Ok((child_key, parent_key, child_used, parent_used))
+    }
+
+    /// Every check a commit settlement must pass, without consuming the
+    /// loan. A carrier that publishes its own state for the child (KVM
+    /// inherited frames) calls this first so nothing is published for a
+    /// commit the stock would refuse; `settle` runs the same checks.
+    pub fn validate_commit(
+        &self,
+        execution: GrantExecution,
+        settlement: &ForkStockSettlement,
+        is_resolvable: impl Fn(&[RootGpa]) -> bool,
+        is_clean: impl Fn(&[RootGpa]) -> bool,
+    ) -> Result<carrick_el1_abi::PortalForkCompletion, ForkStockServiceError> {
+        let loan = self.settlement_loan(execution)?;
+        let (completion, _custody, _count) = settlement
+            .request(loan)
+            .ok_or(ForkStockServiceError::LoanMismatch)?;
+        self.validate_completion(execution, completion, is_resolvable, is_clean)?;
         Ok(completion)
+    }
+
+    /// Validate a prepared child's table completion and retain its inherited
+    /// physical custody into an [`AdmittedForkCustody`] token on the pending
+    /// loan before child publication. Any refusal leaves the loan pending so
+    /// the guest can scrub and abort it into a counted fork failure.
+    pub fn reserve_custody(
+        &mut self,
+        execution: GrantExecution,
+        settlement: &mut ForkStockSettlement,
+        is_resolvable: impl Fn(&[RootGpa]) -> bool,
+        is_clean: impl Fn(&[RootGpa]) -> bool,
+        retain_physical: impl FnOnce(
+            carrick_el1_abi::PortalForkRequest,
+            carrick_guest_arch::KernelVa,
+            u64,
+        ) -> Result<C, ForkStockRefusal>,
+    ) -> Result<&AdmittedForkCustody<C>, ForkStockRefusal> {
+        let loan = match self.settlement_loan(execution) {
+            Ok(loan) => loan,
+            Err(ForkStockServiceError::StaleExecution) => {
+                return Err(self.refuse_settlement(settlement, ForkStockRefusal::Stale));
+            }
+            Err(_) => {
+                return Err(self.refuse_settlement(settlement, ForkStockRefusal::Invalid));
+            }
+        };
+        let Some(index) = cpu_index(execution.cpu) else {
+            return Err(self.refuse_settlement(settlement, ForkStockRefusal::Invalid));
+        };
+        if self
+            .pending
+            .get(index)
+            .and_then(Option::as_ref)
+            .is_none_or(|pending| pending.admitted.is_some())
+        {
+            return Err(self.refuse_settlement(settlement, ForkStockRefusal::Invalid));
+        }
+        let Some((completion, custody_va, count)) = settlement.reservation(loan) else {
+            return Err(self.refuse_settlement(settlement, ForkStockRefusal::Invalid));
+        };
+        let (child_key, parent_key, child_used, parent_used) =
+            match self.validate_completion(execution, completion, is_resolvable, is_clean) {
+                Ok(validated) => validated,
+                Err(ForkStockServiceError::MemoryAccessFailed) => {
+                    return Err(self.refuse_settlement(settlement, ForkStockRefusal::Inventory));
+                }
+                Err(ForkStockServiceError::StaleExecution) => {
+                    return Err(self.refuse_settlement(settlement, ForkStockRefusal::Stale));
+                }
+                Err(_) => {
+                    return Err(self.refuse_settlement(settlement, ForkStockRefusal::Invalid));
+                }
+            };
+        let physical = match retain_physical(loan.request, custody_va, count) {
+            Ok(physical) => physical,
+            Err(refusal) => return Err(self.refuse_settlement(settlement, refusal)),
+        };
+        if !settlement.accept(loan) {
+            return Err(self.refuse_settlement(settlement, ForkStockRefusal::Invalid));
+        }
+        if self.pending[index].is_none() {
+            return Err(self.refuse_settlement(settlement, ForkStockRefusal::Invalid));
+        }
+        let Some(pending) = self.pending[index].as_mut() else {
+            return Err(ForkStockRefusal::Invalid);
+        };
+        Ok(pending.admitted.insert(AdmittedForkCustody {
+            loan_id: loan.id,
+            child_key,
+            parent_key,
+            child_used,
+            parent_used,
+            completion,
+            physical,
+        }))
+    }
+
+    fn consume_admitted(
+        &mut self,
+        ledger: &mut impl ForkTableLedger,
+        mut pending: PendingForkLoan<T::Tag, C>,
+        admitted: AdmittedForkCustody<C>,
+    ) {
+        let loan = pending.loan;
+        let unused_child: Vec<_> = pending.child_tables.drain(admitted.child_used..).collect();
+        let unused_parent: Vec<_> = pending
+            .parent_tables
+            .drain(admitted.parent_used..)
+            .collect();
+        self.children.insert(
+            admitted.child_key,
+            CommittedChild {
+                root: pending.child_tables[0],
+                lifecycle: pending.lifecycle,
+                control: pending.control,
+                tag: ChildTag::bind(pending.tag, loan.request.child_mm),
+                _physical: admitted.physical,
+            },
+        );
+        self.committed_tables
+            .entry(admitted.child_key)
+            .or_default()
+            .extend(pending.child_tables);
+        if !pending.parent_tables.is_empty() {
+            self.committed_tables
+                .entry(admitted.parent_key)
+                .or_default()
+                .extend(pending.parent_tables);
+        }
+        for page in &unused_child {
+            ledger.give_back(*page, loan.request.child_mm);
+        }
+        for page in &unused_parent {
+            ledger.give_back(*page, loan.request.operation.mm);
+        }
+        self.tables.extend(unused_child);
+        self.tables.extend(unused_parent);
+    }
+
+    /// Consume the [`AdmittedForkCustody`] token reserved during preparation
+    /// and commit the child into carrier custody.
+    pub fn commit_admitted(
+        &mut self,
+        ledger: &mut impl ForkTableLedger,
+        execution: GrantExecution,
+        settlement: &mut ForkStockSettlement,
+    ) -> Result<(), ForkStockServiceError> {
+        let loan = self.settlement_loan(execution)?;
+        let index = cpu_index(execution.cpu).ok_or(ForkStockServiceError::NoPendingLoan)?;
+        let (completion, _, count) = settlement
+            .request(loan)
+            .ok_or(ForkStockServiceError::LoanMismatch)?;
+        if count != 0 {
+            return Err(ForkStockServiceError::InvalidRecord);
+        }
+        let admitted_matches = self.pending[index]
+            .as_ref()
+            .and_then(|pending| pending.admitted.as_ref())
+            .is_some_and(|admitted| {
+                admitted.loan_id == loan.id && admitted.completion == completion
+            });
+        if !admitted_matches || !settlement.accept(loan) {
+            return Err(ForkStockServiceError::InvalidRecord);
+        }
+        let Some(mut pending) = self.pending[index].take() else {
+            return Err(ForkStockServiceError::InvalidRecord);
+        };
+        let Some(admitted) = pending.admitted.take() else {
+            self.pending[index] = Some(pending);
+            return Err(ForkStockServiceError::InvalidRecord);
+        };
+        self.consume_admitted(ledger, pending, admitted);
+        Ok(())
     }
 
     /// Settle an outstanding loan: an exact abort returns every untouched
@@ -1137,6 +1353,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             let pending = self.pending[index]
                 .take()
                 .ok_or(ForkStockServiceError::NoPendingLoan)?;
+            drop(pending.admitted);
             for page in &pending.child_tables {
                 ledger.give_back(*page, loan.request.child_mm);
             }
@@ -1149,55 +1366,40 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             if pending.control.is_exclusive() {
                 self.controls.push(pending.control);
             }
+            if !settlement.accept(loan) {
+                return Err(ForkStockServiceError::InvalidRecord);
+            }
+            Ok(())
+        } else if pending.admitted.is_some() {
+            drop(physical);
+            self.commit_admitted(ledger, execution, settlement)
         } else {
-            let completion =
-                self.validate_commit(execution, settlement, &is_resolvable, &is_clean)?;
-            let child_used = usize::try_from(completion.child_tables_used / TABLE_PAGE_BYTES)
-                .map_err(|_| ForkStockServiceError::InvalidRecord)?;
-            let parent_used = usize::try_from(completion.parent_tables_used / TABLE_PAGE_BYTES)
-                .map_err(|_| ForkStockServiceError::InvalidRecord)?;
-            let child_key =
-                MmKey::of(loan.request.child_mm).ok_or(ForkStockServiceError::InvalidRecord)?;
-            let parent_key =
-                MmKey::of(loan.request.operation.mm).ok_or(ForkStockServiceError::InvalidRecord)?;
-            let mut pending = self.pending[index]
+            let (completion, _, _) = settlement
+                .request(loan)
+                .ok_or(ForkStockServiceError::LoanMismatch)?;
+            let (child_key, parent_key, child_used, parent_used) =
+                self.validate_completion(execution, completion, &is_resolvable, &is_clean)?;
+            if !settlement.accept(loan) {
+                return Err(ForkStockServiceError::InvalidRecord);
+            }
+            let pending = self.pending[index]
                 .take()
                 .ok_or(ForkStockServiceError::NoPendingLoan)?;
-            let unused_child: Vec<_> = pending.child_tables.drain(child_used..).collect();
-            let unused_parent: Vec<_> = pending.parent_tables.drain(parent_used..).collect();
-            self.children.insert(
-                child_key,
-                CommittedChild {
-                    root: pending.child_tables[0],
-                    lifecycle: pending.lifecycle,
-                    control: pending.control,
-                    tag: ChildTag::bind(pending.tag, loan.request.child_mm),
-                    _physical: physical,
+            self.consume_admitted(
+                ledger,
+                pending,
+                AdmittedForkCustody {
+                    loan_id: loan.id,
+                    child_key,
+                    parent_key,
+                    child_used,
+                    parent_used,
+                    completion,
+                    physical,
                 },
             );
-            self.committed_tables
-                .entry(child_key)
-                .or_default()
-                .extend(pending.child_tables);
-            if !pending.parent_tables.is_empty() {
-                self.committed_tables
-                    .entry(parent_key)
-                    .or_default()
-                    .extend(pending.parent_tables);
-            }
-            for page in &unused_child {
-                ledger.give_back(*page, loan.request.child_mm);
-            }
-            for page in &unused_parent {
-                ledger.give_back(*page, loan.request.operation.mm);
-            }
-            self.tables.extend(unused_child);
-            self.tables.extend(unused_parent);
+            Ok(())
         }
-        if !settlement.accept(loan) {
-            return Err(ForkStockServiceError::InvalidRecord);
-        }
-        Ok(())
     }
 
     /// The executing child has left the shared owner graph: quarantine its
