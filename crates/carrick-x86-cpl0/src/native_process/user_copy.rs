@@ -1,7 +1,81 @@
-//! Native process copy mechanics, moved verbatim from the process adapter.
+//! Native process user-copy mechanics.
 use super::*;
-use carrick_core::mm::transaction::{SelectionVenues, TransferStep};
+use carrick_core::mm::transaction::{
+    SelectionVenues, UserWriteError, UserWriteRequest, UserWriteVenue,
+};
 use carrick_el1_abi::KernelFaultVenues;
+
+/// Physical crossings and ISA byte access for the shared native-write protocol.
+struct NativeWriteVenue<'a> {
+    task: &'a CurrentTask,
+    address: UserVa,
+    slot: SlotId,
+    pool: &'a carrick_el1_abi::CowGrantPool,
+    slots: &'a MmPortalSlots,
+    prepared: carrick_el1::fault::X86PreparedResolver<'a, InitialWords>,
+    cow: carrick_el1::fault::X86CowResolver<'a, InitialWords>,
+}
+impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
+    type Prepared = carrick_el1::fault::X86PreparedResolver<'a, InitialWords>;
+    type Cow = carrick_el1::fault::X86CowResolver<'a, InitialWords>;
+    type Error = NativeProcessError;
+
+    fn selection_venues(&mut self) -> SelectionVenues<'_, Self::Prepared, Self::Cow> {
+        let residency = self.cow.residency;
+        SelectionVenues {
+            prepared: &mut self.prepared,
+            cow: &mut self.cow,
+            residency,
+            slot: u32::from(self.slot.raw()),
+        }
+    }
+    fn settle_completions(&mut self, request: &UserWriteRequest<'_>) -> Result<(), Self::Error> {
+        if self.pool.has_completions_for(request.handle.mm().raw()) {
+            carrick_x86_carrier::entry::cross_owner_grant(
+                carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
+                self.address,
+            );
+        }
+        Ok(())
+    }
+    fn supply_cow(
+        &mut self,
+        window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Result<(), Self::Error> {
+        if !self
+            .slots
+            .grant(usize::from(self.slot.raw()))
+            .ok_or(NativeProcessError::Stale)?
+            .publish_cow_fault_selection(window.operation.sequence.get(), window)
+        {
+            return Err(NativeProcessError::Busy);
+        }
+        carrick_x86_carrier::entry::cross_owner_grant(
+            carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
+            self.address,
+        );
+        Ok(())
+    }
+    fn copy(
+        &mut self,
+        fence: &carrick_core::mm::transfer::ValidatedChunk<'_, ParkedContextWords>,
+        bytes: &[u8],
+    ) -> bool {
+        let selected = fence.selected();
+        // SAFETY: the shared exact-MM fence retains this user-write span;
+        // the protocol supplies exactly its bounded source bytes.
+        unsafe {
+            carrick_el1::isa::x86::user_access::copy(
+                self.task,
+                selected.va.raw() as *mut u8,
+                bytes.as_ptr(),
+                bytes.len(),
+                selected.va.raw(),
+                true,
+            )
+        }
+    }
+}
 
 impl Service {
     pub(super) fn copy_user_bytes(
@@ -19,15 +93,6 @@ impl Service {
         let handle = owner
             .admitted_handle(mm_key, self.worker())
             .map_err(error)?;
-        let mut continuation = owner
-            .begin(
-                handle,
-                carrick_core::mm::transfer::GuestVa::new(address.raw()),
-                bytes.len() as u64,
-                carrick_el1_abi::PortalTransferIntent::UserWrite,
-                self.worker(),
-            )
-            .map_err(error)?;
         let venues = KernelFaultVenues::derive(carrick_el1::isa::x86_kernel_layout())
             .and_then(KernelFaultVenues::require_upper_half)
             .ok_or(NativeProcessError::Stale)?;
@@ -40,80 +105,42 @@ impl Service {
                 &*(carrick_el1::isa::x86_kernel_layout().portal.raw() as *const MmPortalSlots),
             )
         };
-        while !continuation.is_complete() {
-            // SAFETY: select acquires the exact editor before using this leaf.
-            let mut prepared = unsafe {
-                carrick_el1::fault::X86PreparedResolver::under_editor(mm.mm.raw(), &words)
-            };
-            let mut cow = carrick_el1::fault::X86CowResolver {
+        // SAFETY: the shared protocol acquires this MM's exact editor for
+        // every selection before invoking the prepared resolver.
+        let prepared =
+            unsafe { carrick_el1::fault::X86PreparedResolver::under_editor(mm.mm.raw(), &words) };
+        let mut venue = NativeWriteVenue {
+            task: self.task,
+            address,
+            slot: self.slot,
+            pool,
+            slots,
+            prepared,
+            cow: carrick_el1::fault::X86CowResolver {
                 words: &words,
                 pool,
                 residency,
                 completion: None,
-            };
-            let step = owner
-                .select(
-                    &continuation,
-                    &words,
-                    SelectionVenues {
-                        prepared: &mut prepared,
-                        cow: &mut cow,
-                        residency,
-                        slot: self.worker(),
-                    },
-                )
-                .map_err(error)?;
-            if pool.has_completions_for(mm.mm.raw().get()) {
-                carrick_x86_carrier::entry::cross_owner_grant(
-                    carrick_guest_arch::CpuId::new(self.worker()),
+            },
+        };
+        owner
+            .write_user_bytes(
+                UserWriteRequest {
+                    handle,
                     address,
-                );
-            }
-            match step {
-                TransferStep::CowSupply(window) => {
-                    if !slots
-                        .grant(usize::from(self.slot.raw()))
-                        .ok_or(NativeProcessError::Stale)?
-                        .publish_cow_fault_selection(window.operation.sequence.get(), window)
-                    {
-                        return Err(NativeProcessError::Busy);
-                    }
-                    carrick_x86_carrier::entry::cross_owner_grant(
-                        carrick_guest_arch::CpuId::new(self.worker()),
-                        address,
-                    );
-                }
-                TransferStep::Selected(selected) => {
-                    let fence = owner
-                        .revalidate(&continuation, selected, &words, self.worker())
-                        .map_err(error)?
-                        .ok_or(NativeProcessError::Busy)?;
-                    let offset = usize::try_from(continuation.offset())
-                        .map_err(|_| NativeProcessError::Invalid)?;
-                    let count =
-                        usize::try_from(selected.len).map_err(|_| NativeProcessError::Invalid)?;
-                    // SAFETY: shared exact-MM fence retains the authorized
-                    // user-write span; kernel bytes are live for this call.
-                    let copied = unsafe {
-                        carrick_el1::isa::x86::user_access::copy(
-                            self.task,
-                            selected.va.raw() as *mut u8,
-                            bytes.as_ptr().add(offset),
-                            count,
-                            selected.va.raw(),
-                            true,
-                        )
-                    };
-                    if !copied {
-                        return Err(NativeProcessError::Fault);
-                    }
-                    fence.complete(&mut continuation).map_err(error)?;
-                }
-                TransferStep::Supply(_) => return Err(NativeProcessError::Unsupported),
-                TransferStep::Suspended => return Err(NativeProcessError::Busy),
-                TransferStep::Complete => break,
-            }
-        }
-        Ok(())
+                    bytes,
+                    slot: self.slot,
+                },
+                &words,
+                &mut venue,
+            )
+            .map_err(|failure| match failure {
+                UserWriteError::Owner(owner) => error(owner),
+                UserWriteError::Mechanics(error) => error,
+                UserWriteError::Busy => NativeProcessError::Busy,
+                UserWriteError::InvalidSource => NativeProcessError::Invalid,
+                UserWriteError::Fault => NativeProcessError::Fault,
+                UserWriteError::UnsupportedSupply => NativeProcessError::Unsupported,
+            })
     }
 }

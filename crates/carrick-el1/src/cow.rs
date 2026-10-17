@@ -605,6 +605,178 @@ mod tests {
     }
 
     #[test]
+    fn native_child_tid_copy_supplies_its_empty_cow_pool_before_writing() {
+        use crate::personality::mm_portal::test_support::{Region, admit_kind, nodes};
+        use carrick_core::mm::transaction::{
+            SelectionVenues, UserWriteError, UserWriteRequest, UserWriteVenue,
+        };
+        use carrick_core::mm::transfer::ValidatedChunk;
+        use carrick_el1_abi::{Aarch64ParkedContext, PortalGrantWindow};
+
+        struct TypedCow<'a> {
+            arena: &'a Arena,
+            memory: &'a Memory,
+            pool: &'a CowGrantPool,
+            residency: &'a FrameGrantResidencyTable,
+        }
+        impl CowResolver for TypedCow<'_> {
+            fn resolve_cow(&mut self, _: u64, _: u64, _: u64) -> bool {
+                panic!("the owner must retain the typed supply outcome")
+            }
+            fn resolve_cow_outcome(
+                &mut self,
+                root: u64,
+                mm: u64,
+                far: u64,
+            ) -> crate::fault::CowResolution {
+                let words = self.arena.words();
+                let outcome = resolve_guest_cow(
+                    &GuestCowVenue {
+                        publish_executable: None,
+                        words: &words,
+                        root: SubstrateGpa(root & PA),
+                        pool: self.pool,
+                        residency: self.residency,
+                        copy_window: CowCopyWindow::target(&words, SubstrateGpa(root & PA)),
+                    },
+                    mm,
+                    far,
+                    |from, to| self.memory.copy_through(self.arena, from, to),
+                    || {},
+                );
+                crate::fault::handle_cow_outcome(outcome, &mut None)
+            }
+        }
+        struct CopyVenue<'a> {
+            cow: TypedCow<'a>,
+            prepared: NoopPreparedResolver,
+            spaces: &'a AddressSpaces,
+            refuse: bool,
+            no_progress: bool,
+            supplied: usize,
+            copied: usize,
+            settled: usize,
+        }
+        impl<'a> UserWriteVenue<Aarch64ParkedContext> for CopyVenue<'a> {
+            type Prepared = NoopPreparedResolver;
+            type Cow = TypedCow<'a>;
+            type Error = ();
+            fn selection_venues(&mut self) -> SelectionVenues<'_, Self::Prepared, Self::Cow> {
+                let residency = self.cow.residency;
+                SelectionVenues {
+                    prepared: &mut self.prepared,
+                    cow: &mut self.cow,
+                    residency,
+                    slot: 0,
+                }
+            }
+            fn settle_completions(&mut self, request: &UserWriteRequest<'_>) -> Result<(), ()> {
+                assert_eq!(request.handle.mm().raw(), MM);
+                self.settled += 1;
+                Ok(())
+            }
+            fn supply_cow(&mut self, window: PortalGrantWindow) -> Result<(), ()> {
+                self.supplied += 1;
+                assert_eq!(window.operation.mm.raw(), MM);
+                assert_eq!(window.fault_page, VA);
+                assert_eq!(window.range.len(), 4096);
+                // Physical supply cannot run while the selection retains an editor.
+                let index = self.spaces.find(MM).unwrap();
+                let editor = self.spaces.try_begin_edit(index, MM, nz(2)).unwrap();
+                drop(editor);
+                if self.refuse {
+                    return Err(());
+                }
+                if self.no_progress {
+                    return if self.supplied <= 2 { Ok(()) } else { Err(()) };
+                }
+                self.cow.pool.publish(MM, GRANT, backing()).unwrap();
+                Ok(())
+            }
+            fn copy(
+                &mut self,
+                fence: &ValidatedChunk<'_, Aarch64ParkedContext>,
+                bytes: &[u8],
+            ) -> bool {
+                let selected = fence.selected();
+                assert_eq!(selected.handle().mm().raw(), MM);
+                assert_eq!(selected.va.raw(), VA);
+                assert_eq!(selected.ipa, GRANT);
+                assert_eq!(bytes.len(), 4);
+                let index = self.spaces.find(MM).unwrap();
+                assert!(self.spaces.try_begin_edit(index, MM, nz(2)).is_none());
+                self.cow.memory.0.borrow_mut().get_mut(&GRANT).unwrap()[..bytes.len()]
+                    .copy_from_slice(bytes);
+                self.copied += 1;
+                true
+            }
+        }
+        for (refuse, no_progress) in [(true, false), (false, true), (false, false)] {
+            let (arena, memory) = forked(true);
+            let parent = memory.page(OLD);
+            let pool = CowGrantPool::new();
+            // A parent grant cannot satisfy the selected child's demand.
+            pool.publish(MM + 1, GRANT + COW_GRANT_SIZE, backing())
+                .unwrap();
+            let region = Region::new();
+            let spaces = AddressSpaces::new();
+            let mm = admit_kind(&region, &spaces, MM, ROOT | ASID, 4, 0, false);
+            let view = nodes(&region);
+            let portal =
+                crate::personality::mm_portal::MmPortal::new(nz(1), region.table(), &spaces, &view);
+            let residency = residency_table();
+            let mut venue = CopyVenue {
+                cow: TypedCow {
+                    arena: &arena,
+                    memory: &memory,
+                    pool: &pool,
+                    residency: &residency,
+                },
+                prepared: NoopPreparedResolver,
+                spaces: &spaces,
+                refuse,
+                no_progress,
+                supplied: 0,
+                copied: 0,
+                settled: 0,
+            };
+            let tid = 2_u32.to_ne_bytes();
+            let result = portal.write_user_bytes(
+                UserWriteRequest {
+                    handle: portal.admitted_handle(mm, 0).unwrap(),
+                    address: carrick_guest_arch::UserVa::new(VA),
+                    bytes: &tid,
+                    slot: carrick_guest_arch::SlotId::new(0),
+                },
+                &arena.words(),
+                &mut venue,
+            );
+            assert_eq!(
+                result,
+                if refuse {
+                    Err(UserWriteError::Mechanics(()))
+                } else if no_progress {
+                    Err(UserWriteError::Busy)
+                } else {
+                    Ok(())
+                }
+            );
+            assert_eq!(venue.supplied, 1);
+            assert_eq!(venue.copied, usize::from(!refuse && !no_progress));
+            assert_eq!(venue.settled, if refuse { 1 } else { 2 });
+            assert_eq!(
+                pool.declined()[CowDecline::PoolEmpty as usize],
+                if no_progress { 2 } else { 1 }
+            );
+            assert_eq!(pool.ready(MM + 1).count(), 1);
+            assert_eq!(memory.page(OLD), parent, "the parent bytes remain private");
+            if !refuse && !no_progress {
+                assert_eq!(&memory.page(GRANT)[..4], &tid);
+            }
+        }
+    }
+
+    #[test]
     fn maintenance_copy_failed_alias_install_restores_before_slot_reuse() {
         use carrick_el1_abi::{
             EL1_CARRIER_MAINT_ROOT_BASE as SERVICE_ROOT, EL1_SERVICE_COPY_TABLE_BASE,
