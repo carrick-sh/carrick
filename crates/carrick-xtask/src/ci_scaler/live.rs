@@ -1566,6 +1566,36 @@ fn revet_assignments(
 /// Controller poll period; admission retries back off separately.
 const POLL: Duration = Duration::from_secs(30);
 
+struct CloneLease {
+    path: Option<PathBuf>,
+    held: Option<crate::host_lease::HostLease>,
+}
+
+impl CloneLease {
+    fn acquire(&mut self) -> Result<(), ScalerError> {
+        if let Some(path) = self.path.as_deref()
+            && self.held.is_none()
+        {
+            self.held = Some(crate::host_lease::HostLease::acquire_broker_path(
+                path,
+                crate::host_lease::HostLeaseMode::Gate,
+                crate::host_lease::HOST_LEASE_WAIT_LIMIT,
+                |delay| {
+                    std::thread::sleep(delay);
+                    Ok(false)
+                },
+            )?);
+        }
+        Ok(())
+    }
+
+    fn release_if_idle(&mut self, ledger: &Ledger) {
+        if ledger.rows.iter().all(|row| row.state == State::Destroyed) {
+            self.held = None;
+        }
+    }
+}
+
 /// Foreground Willow controller. The pilot admission always runs with one
 /// clone; standing mode is bounded by `limit` (at most two clones).
 pub(super) fn controller(
@@ -1625,6 +1655,10 @@ pub(super) fn controller(
     let gh = Github;
     let path = dir.join("ledger.json");
     let mut ledger = Ledger::load(&path)?;
+    let mut clone_lease = CloneLease {
+        path: pve.site.host_lease.map(PathBuf::from),
+        held: None,
+    };
     let mut reconcile = Instant::now() - Duration::from_secs(60);
     let mut frozen = true;
     let mut backoff = Backoff::default();
@@ -1652,6 +1686,10 @@ pub(super) fn controller(
     };
     loop {
         ledger.refresh()?;
+        if ledger.rows.iter().any(|row| row.state != State::Destroyed) {
+            // Recovery must regain physical-host admission before boot/reap.
+            clone_lease.acquire()?;
+        }
         if reconcile.elapsed() >= Duration::from_secs(60) {
             let pass = reconcile_all(&pve, &gh, &mut ledger, dir, &path, (group, admission))?;
             if pass.finished > 0 && one_job {
@@ -1667,6 +1705,7 @@ pub(super) fn controller(
             };
             reconcile = Instant::now();
         }
+        clone_lease.release_if_idle(&ledger);
         let active = ledger
             .rows
             .iter()
@@ -1680,10 +1719,11 @@ pub(super) fn controller(
                 dir,
                 &path,
                 (group, admission),
-                limit,
+                (limit, &mut clone_lease),
             ) {
                 Ok(()) => backoff.reset(),
                 Err(error @ ScalerError::CpuCeiling { .. }) => return Err(error),
+                Err(error @ ScalerError::HostLease(_)) => return Err(error),
                 Err(error) => {
                     // Transient GitHub/PVE failures never end the controller.
                     eprintln!("admission pass failed: {error}; backing off");
@@ -1730,8 +1770,9 @@ fn admit_one(
     dir: &Path,
     path: &Path,
     approval: (u64, &Admission),
-    limit: Concurrency,
+    capacity: (Concurrency, &mut CloneLease),
 ) -> Result<(), ScalerError> {
+    let (limit, clone_lease) = capacity;
     let Some(job) = select_demand(
         ledger,
         path,
@@ -1742,6 +1783,10 @@ fn admit_one(
     else {
         return Ok(());
     };
+    // Take the same flock as the SSH broker before reservation or clone POST.
+    // Re-vet below: the lease may have waited up to HOST_LEASE_WAIT_LIMIT.
+    clone_lease.acquire()?;
+    gh.vet(approval.1, job)?;
     if !resource_admission(pve)? {
         return Ok(());
     }
@@ -1816,6 +1861,33 @@ mod security_tests;
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    #[test]
+    fn clone_lease_spans_active_ledger_and_releases_only_when_idle() {
+        let temp = tempfile::tempdir().unwrap();
+        let lock = temp.path().join("host.lock");
+        let mut lease = CloneLease {
+            path: Some(lock.clone()),
+            held: None,
+        };
+        lease.acquire().unwrap();
+        let independent = std::fs::File::open(&lock).unwrap();
+        assert!(matches!(
+            independent.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        let mut ledger = Ledger::default();
+        ledger.rows.push(row());
+        lease.release_if_idle(&ledger);
+        lease.acquire().unwrap(); // Existing admission never reacquires/upgrades.
+        assert!(matches!(
+            independent.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        ledger.rows[0].state = State::Destroyed;
+        lease.release_if_idle(&ledger);
+        independent.try_lock().unwrap();
+    }
+
     #[test]
     fn superseded_during_provision_releases_only_a_pre_jit_reservation() {
         let mut row = row();

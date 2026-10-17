@@ -125,7 +125,8 @@ build-cache:
 xtask *ARGS:
     {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- {{ARGS}}
 
-# Host flock; cancels on runner death or TERM/INT/HUP; cleanup failure releases with error.
+# Physical-host lease (site SSH broker when configured, otherwise local flock).
+# Cancels on runner death or TERM/INT/HUP; cleanup failure releases with error.
 # One five-second cleanup deadline; owner SIGKILL releases immediately.
 # Darwin cannot contain detached descendants closing every scope fd; see docs/host-lease-containment-follow-up.md.
 [positional-arguments]
