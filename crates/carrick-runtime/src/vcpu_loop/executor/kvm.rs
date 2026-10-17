@@ -80,6 +80,7 @@ pub(crate) struct KvmPersistentExecutorFactory {
     max_exits: usize,
     stats: Arc<KvmForwardStats>,
     scheduler: Arc<Scheduler>,
+    root_binding: Arc<KvmTaskBinding>,
     host_objects: Arc<Mutex<[u32; 3]>>,
     bound_host_fds: Arc<BoundHostFds>,
 }
@@ -238,18 +239,22 @@ impl KvmForwardStats {
     }
 }
 
+pub(crate) struct KvmPersistentExecutorConfig {
+    pub(crate) physical: Arc<ProductionCpuFactory>,
+    pub(crate) dispatcher: Arc<Mutex<SyscallDispatcher>>,
+    pub(crate) reporter: Arc<CompatReporter>,
+    pub(crate) completed: mpsc::Sender<Result<InitialProcessExit, String>>,
+    pub(crate) max_exits: usize,
+    pub(crate) stats: Arc<KvmForwardStats>,
+    pub(crate) scheduler: Arc<Scheduler>,
+    pub(crate) root_binding: Arc<KvmTaskBinding>,
+}
+
 impl KvmPersistentExecutorFactory {
-    pub(crate) fn new(
-        physical: Arc<ProductionCpuFactory>,
-        dispatcher: Arc<Mutex<SyscallDispatcher>>,
-        reporter: Arc<CompatReporter>,
-        completed: mpsc::Sender<Result<InitialProcessExit, String>>,
-        max_exits: usize,
-        stats: Arc<KvmForwardStats>,
-        scheduler: Arc<Scheduler>,
-    ) -> Result<Self, TrapError> {
+    pub(crate) fn new(config: KvmPersistentExecutorConfig) -> Result<Self, TrapError> {
         let bound_host_fds = {
-            let dispatcher = dispatcher
+            let dispatcher = config
+                .dispatcher
                 .lock()
                 .map_err(|_| TrapError::Hypervisor("KVM dispatcher poisoned".into()))?;
             Arc::new(BoundHostFds::from_readiness([
@@ -259,14 +264,15 @@ impl KvmPersistentExecutorFactory {
             ])?)
         };
         Ok(Self {
-            physical,
-            dispatcher,
-            reporter,
-            completed,
+            physical: config.physical,
+            dispatcher: config.dispatcher,
+            reporter: config.reporter,
+            completed: config.completed,
             exits: Arc::new(AtomicUsize::new(0)),
-            max_exits,
-            stats,
-            scheduler,
+            max_exits: config.max_exits,
+            stats: config.stats,
+            scheduler: config.scheduler,
+            root_binding: config.root_binding,
             host_objects: Arc::new(Mutex::new([1; 3])),
             bound_host_fds,
         })
@@ -302,6 +308,7 @@ impl PersistentExecutorFactory for KvmPersistentExecutorFactory {
             max_exits: self.max_exits,
             stats: Arc::clone(&self.stats),
             scheduler: Arc::clone(&self.scheduler),
+            root_binding: Arc::clone(&self.root_binding),
             binding: None,
             task: None,
             loaded_generation: None,
@@ -323,6 +330,7 @@ pub(crate) struct KvmPersistentExecutor {
     max_exits: usize,
     stats: Arc<KvmForwardStats>,
     scheduler: Arc<Scheduler>,
+    root_binding: Arc<KvmTaskBinding>,
     binding: Option<Arc<KvmTaskBinding>>,
     task: Option<TaskIdentity>,
     loaded_generation: Option<ExecutionGeneration>,
@@ -502,6 +510,212 @@ impl KvmPersistentExecutor {
             .map_err(|_| TrapError::Hypervisor("KVM completion receiver closed".into()))?;
         self.completion_sent = true;
         Ok(())
+    }
+
+    fn service_syscall_trap(
+        &mut self,
+        task: TaskIdentity,
+        exited: usize,
+        submission: Option<&mut ExecutorSubmissionContext<'_>>,
+    ) -> Result<ExecutorExit, TrapError> {
+        let binding = self.binding.as_ref().unwrap_or(&self.root_binding);
+        let mut dispatcher = self
+            .dispatcher
+            .lock()
+            .map_err(|_| TrapError::Hypervisor("KVM dispatcher poisoned".into()))?;
+        let (decision, token) = self.physical.capture_forward(task, |venue, frame| {
+            if frame.rax == carrick_el1_abi::HostObjectReleaseCrossing::NUMBER
+                && frame.rcx == carrick_el1_abi::HostObjectReleaseCrossing::FRAME_TAG
+            {
+                let binding = carrick_el1_abi::HostObjectBinding::from_encoded(frame.rdi as u32)
+                    .filter(|_| frame.rdi <= u64::from(u32::MAX))
+                    .and_then(carrick_el1_abi::HostObjectBinding::stdio_fd)
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor("invalid host object release binding".into())
+                    })?;
+                if frame.rsi != binding as u64 + 1 || frame.rdx != 1 {
+                    return Err(TrapError::Hypervisor(
+                        "host object release identity mismatch".into(),
+                    ));
+                }
+                let mut refs = self.host_objects.lock().map_err(|_| {
+                    TrapError::Hypervisor("host object release owner poisoned".into())
+                })?;
+                let count = &mut refs[binding as usize];
+                *count = count
+                    .checked_sub(1)
+                    .ok_or_else(|| TrapError::Hypervisor("duplicate host object release".into()))?;
+                return Ok(ForwardDecision::Immediate(
+                    InitialSyscallDisposition::Return(0),
+                ));
+            }
+            if frame.rax == carrick_el1_abi::HostObjectWriteCrossing::NUMBER
+                && frame.rcx == carrick_el1_abi::HostObjectWriteCrossing::FRAME_TAG
+            {
+                let binding = carrick_el1_abi::HostObjectBinding::from_encoded(frame.rdi as u32)
+                    .filter(|_| frame.rdi <= u64::from(u32::MAX))
+                    .and_then(carrick_el1_abi::HostObjectBinding::stdio_fd)
+                    .filter(|fd| *fd == 1 || *fd == 2)
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor("invalid host object write binding".into())
+                    })?;
+                let length = usize::try_from(frame.rdx).map_err(|_| {
+                    TrapError::Hypervisor("host object write length overflow".into())
+                })?;
+                let bytes = venue
+                    .read_bytes_prefix(frame.rsi, length)
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!("host object write copy: {error}"))
+                    })?;
+                return Ok(ForwardDecision::Immediate(
+                    InitialSyscallDisposition::Return(
+                        dispatcher.forward_stdio_bytes(binding, &bytes),
+                    ),
+                ));
+            }
+            if frame.rax == carrick_el1_abi::HostReadinessCrossing::NUMBER
+                && carrick_el1_abi::HostReadinessCrossing::is_crossing(frame.rcx)
+            {
+                let sig_mask = match frame.r8 {
+                    carrick_el1_abi::HostReadinessCrossing::MASK_NONE => {
+                        carrick_abi::WaitSigMask::NONE
+                    }
+                    carrick_el1_abi::HostReadinessCrossing::MASK_REPLACE => {
+                        carrick_abi::WaitSigMask::Replace(carrick_abi::SigSet::from_raw(frame.r10))
+                    }
+                    _ => {
+                        return Ok(ForwardDecision::Immediate(
+                            InitialSyscallDisposition::Refused(carrick_abi::LINUX_EINVAL),
+                        ));
+                    }
+                };
+                let count = usize::try_from(frame.rsi)
+                    .map_err(|_| TrapError::Hypervisor("host readiness count overflow".into()))?;
+                let Some(timeout) = carrick_el1_abi::HostReadinessTimeout::from_wire(frame.rdx)
+                else {
+                    return Ok(ForwardDecision::Immediate(
+                        InitialSyscallDisposition::Refused(carrick_abi::LINUX_EINVAL),
+                    ));
+                };
+                let timeout_ms = timeout.millis();
+                let deadline = (timeout_ms >= 0).then(|| {
+                    std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64)
+                });
+                let readiness = HostReadinessRequest {
+                    address: frame.rdi,
+                    count,
+                    deadline,
+                    sig_mask,
+                };
+                self.stats
+                    .record(crate::prepare::InitialForwardClass::Host("readiness"))?;
+                return match Self::sample_host_readiness(venue, readiness, &self.bound_host_fds)? {
+                    HostReadinessStep::Ready(value) => Ok(ForwardDecision::Immediate(
+                        InitialSyscallDisposition::Return(value),
+                    )),
+                    HostReadinessStep::Wait(fds) => {
+                        match Self::host_readiness_wait(readiness, fds) {
+                            Some(outcome) => Ok(ForwardDecision::Blocked(
+                                ForwardRequest::HostReadiness(readiness),
+                                Box::new(outcome),
+                            )),
+                            None => Ok(ForwardDecision::Immediate(
+                                InitialSyscallDisposition::Return(0),
+                            )),
+                        }
+                    }
+                };
+            }
+            let syscall = carrick_guest_mem::X8664SyscallFrame {
+                rax: frame.rax,
+                rdi: frame.rdi,
+                rsi: frame.rsi,
+                rdx: frame.rdx,
+                r10: frame.r10,
+                r8: frame.r8,
+                r9: frame.r9,
+            };
+            let raw = match X8664GuestArch::normalize_syscall(&syscall) {
+                SyscallNorm::Plain(raw) => raw,
+                SyscallNorm::ArchPrctl { code, addr } => {
+                    let value = carrick_personality_linux::arch_prctl::service_arch_prctl(
+                        venue, code, addr,
+                    )?;
+                    return Ok(ForwardDecision::Immediate(
+                        InitialSyscallDisposition::Return(value),
+                    ));
+                }
+            };
+            let class = crate::prepare::classify_initial_x86_forward(raw.native_number, raw.args);
+            self.stats.record(class)?;
+            match class {
+                crate::prepare::InitialForwardClass::Host(_) => {}
+                refusal @ crate::prepare::InitialForwardClass::Refuse(_) => {
+                    self.reporter
+                        .record(carrick_kernel::compat::CompatEvent::partial_syscall(
+                            raw.number.0,
+                            format!("x86_native_{}", raw.native_number.0),
+                            carrick_kernel::compat::SyscallArgs::new(raw.args),
+                            format!("cpl0_{}_owner_unbound", refusal.family()),
+                        ));
+                    return Ok(ForwardDecision::Immediate(
+                        InitialSyscallDisposition::Refused(carrick_abi::LINUX_ENOSYS),
+                    ));
+                }
+            }
+            let kernel = binding.fresh_context()?;
+            let request = SyscallRequest::from_raw(raw).with_current_guest_sp(Some(frame.rsp));
+            let outcome = dispatcher
+                .dispatch(&kernel, request, venue, &self.reporter)
+                .map_err(|error| TrapError::Hypervisor(format!("dispatch x86 syscall: {error}")))?;
+            match outcome {
+                DispatchOutcome::Returned { value } => Ok(ForwardDecision::Immediate(
+                    InitialSyscallDisposition::Return(value),
+                )),
+                DispatchOutcome::Errno { errno } => Ok(ForwardDecision::Immediate(
+                    InitialSyscallDisposition::Refused(errno),
+                )),
+                DispatchOutcome::Exit { code } | DispatchOutcome::ThreadExit { code } => {
+                    Ok(ForwardDecision::Immediate(InitialSyscallDisposition::Exit(
+                        GuestExitStatus::from_linux_code(code),
+                    )))
+                }
+                other => Ok(ForwardDecision::Blocked(
+                    ForwardRequest::Syscall(request),
+                    Box::new(other),
+                )),
+            }
+        })?;
+        drop(dispatcher);
+        match decision {
+            ForwardDecision::Blocked(request, outcome) => {
+                let submission = submission.ok_or_else(|| {
+                    TrapError::Hypervisor(
+                        "idle KVM peer forward cannot block without a host task lease".into(),
+                    )
+                })?;
+                return Self::block_forward(binding, submission, request, *outcome, Some(token));
+            }
+            ForwardDecision::Immediate(InitialSyscallDisposition::Return(value)) => {
+                self.physical.complete_forward(task, token, value)?
+            }
+            ForwardDecision::Immediate(InitialSyscallDisposition::Refused(errno)) => self
+                .physical
+                .complete_forward(task, token, errno.guest_retval())?,
+            ForwardDecision::Immediate(InitialSyscallDisposition::Exit(status)) => {
+                self.publish_exit(InitialProcessExit::Exited {
+                    code: status.code(),
+                    exits: exited,
+                })?;
+                return Ok(ExecutorExit::Exited);
+            }
+        }
+        // A physical peer parked after HLT may have acquired an
+        // interrupt while this CPU stayed in the guest. The stopped
+        // forward is the same bounded inspection point used by the
+        // carrier's physical coordinator.
+        self.scheduler.poke_executor_control();
+        Ok(ExecutorExit::Syscall)
     }
 }
 
@@ -728,254 +942,11 @@ impl PersistentExecutor for KvmPersistentExecutor {
                     }
                 }
                 CarrierRunExit::SyscallTrap => {
-                    let binding = self.binding.as_ref().ok_or_else(|| {
-                        TrapError::Hypervisor("KVM forward lost task binding".into())
-                    })?;
-                    let mut dispatcher = self
-                        .dispatcher
-                        .lock()
-                        .map_err(|_| TrapError::Hypervisor("KVM dispatcher poisoned".into()))?;
-                    let (decision, token) =
-                        self.physical.capture_forward(task, |venue, frame| {
-                            if frame.rax == carrick_el1_abi::HostObjectReleaseCrossing::NUMBER
-                                && frame.rcx
-                                    == carrick_el1_abi::HostObjectReleaseCrossing::FRAME_TAG
-                            {
-                                let binding = carrick_el1_abi::HostObjectBinding::from_encoded(
-                                    frame.rdi as u32,
-                                )
-                                .filter(|_| frame.rdi <= u64::from(u32::MAX))
-                                .and_then(carrick_el1_abi::HostObjectBinding::stdio_fd)
-                                .ok_or_else(|| {
-                                    TrapError::Hypervisor(
-                                        "invalid host object release binding".into(),
-                                    )
-                                })?;
-                                if frame.rsi != binding as u64 + 1 || frame.rdx != 1 {
-                                    return Err(TrapError::Hypervisor(
-                                        "host object release identity mismatch".into(),
-                                    ));
-                                }
-                                let mut refs = self.host_objects.lock().map_err(|_| {
-                                    TrapError::Hypervisor(
-                                        "host object release owner poisoned".into(),
-                                    )
-                                })?;
-                                let count = &mut refs[binding as usize];
-                                *count = count.checked_sub(1).ok_or_else(|| {
-                                    TrapError::Hypervisor("duplicate host object release".into())
-                                })?;
-                                return Ok(ForwardDecision::Immediate(
-                                    InitialSyscallDisposition::Return(0),
-                                ));
-                            }
-                            if frame.rax == carrick_el1_abi::HostObjectWriteCrossing::NUMBER
-                                && frame.rcx == carrick_el1_abi::HostObjectWriteCrossing::FRAME_TAG
-                            {
-                                let binding = carrick_el1_abi::HostObjectBinding::from_encoded(
-                                    frame.rdi as u32,
-                                )
-                                .filter(|_| frame.rdi <= u64::from(u32::MAX))
-                                .and_then(carrick_el1_abi::HostObjectBinding::stdio_fd)
-                                .filter(|fd| *fd == 1 || *fd == 2)
-                                .ok_or_else(|| {
-                                    TrapError::Hypervisor(
-                                        "invalid host object write binding".into(),
-                                    )
-                                })?;
-                                let length = usize::try_from(frame.rdx).map_err(|_| {
-                                    TrapError::Hypervisor(
-                                        "host object write length overflow".into(),
-                                    )
-                                })?;
-                                let bytes = venue.read_bytes_prefix(frame.rsi, length).map_err(
-                                    |error| {
-                                        TrapError::Hypervisor(format!(
-                                            "host object write copy: {error}"
-                                        ))
-                                    },
-                                )?;
-                                return Ok(ForwardDecision::Immediate(
-                                    InitialSyscallDisposition::Return(
-                                        dispatcher.forward_stdio_bytes(binding, &bytes),
-                                    ),
-                                ));
-                            }
-                            if frame.rax == carrick_el1_abi::HostReadinessCrossing::NUMBER
-                                && carrick_el1_abi::HostReadinessCrossing::is_crossing(frame.rcx)
-                            {
-                                let sig_mask = match frame.r8 {
-                                    carrick_el1_abi::HostReadinessCrossing::MASK_NONE => {
-                                        carrick_abi::WaitSigMask::NONE
-                                    }
-                                    carrick_el1_abi::HostReadinessCrossing::MASK_REPLACE => {
-                                        carrick_abi::WaitSigMask::Replace(
-                                            carrick_abi::SigSet::from_raw(frame.r10),
-                                        )
-                                    }
-                                    _ => {
-                                        return Ok(ForwardDecision::Immediate(
-                                            InitialSyscallDisposition::Refused(
-                                                carrick_abi::LINUX_EINVAL,
-                                            ),
-                                        ));
-                                    }
-                                };
-                                let count = usize::try_from(frame.rsi).map_err(|_| {
-                                    TrapError::Hypervisor("host readiness count overflow".into())
-                                })?;
-                                let Some(timeout) =
-                                    carrick_el1_abi::HostReadinessTimeout::from_wire(frame.rdx)
-                                else {
-                                    return Ok(ForwardDecision::Immediate(
-                                        InitialSyscallDisposition::Refused(
-                                            carrick_abi::LINUX_EINVAL,
-                                        ),
-                                    ));
-                                };
-                                let timeout_ms = timeout.millis();
-                                let deadline = (timeout_ms >= 0).then(|| {
-                                    std::time::Instant::now()
-                                        + std::time::Duration::from_millis(timeout_ms as u64)
-                                });
-                                let readiness = HostReadinessRequest {
-                                    address: frame.rdi,
-                                    count,
-                                    deadline,
-                                    sig_mask,
-                                };
-                                self.stats
-                                    .record(crate::prepare::InitialForwardClass::Host(
-                                        "readiness",
-                                    ))?;
-                                return match Self::sample_host_readiness(
-                                    venue,
-                                    readiness,
-                                    &self.bound_host_fds,
-                                )? {
-                                    HostReadinessStep::Ready(value) => {
-                                        Ok(ForwardDecision::Immediate(
-                                            InitialSyscallDisposition::Return(value),
-                                        ))
-                                    }
-                                    HostReadinessStep::Wait(fds) => {
-                                        match Self::host_readiness_wait(readiness, fds) {
-                                            Some(outcome) => Ok(ForwardDecision::Blocked(
-                                                ForwardRequest::HostReadiness(readiness),
-                                                Box::new(outcome),
-                                            )),
-                                            None => Ok(ForwardDecision::Immediate(
-                                                InitialSyscallDisposition::Return(0),
-                                            )),
-                                        }
-                                    }
-                                };
-                            }
-                            let syscall = carrick_guest_mem::X8664SyscallFrame {
-                                rax: frame.rax,
-                                rdi: frame.rdi,
-                                rsi: frame.rsi,
-                                rdx: frame.rdx,
-                                r10: frame.r10,
-                                r8: frame.r8,
-                                r9: frame.r9,
-                            };
-                            let raw = match X8664GuestArch::normalize_syscall(&syscall) {
-                                SyscallNorm::Plain(raw) => raw,
-                                SyscallNorm::ArchPrctl { code, addr } => {
-                                    let value =
-                                        carrick_personality_linux::arch_prctl::service_arch_prctl(
-                                            venue, code, addr,
-                                        )?;
-                                    return Ok(ForwardDecision::Immediate(
-                                        InitialSyscallDisposition::Return(value),
-                                    ));
-                                }
-                            };
-                            let class = crate::prepare::classify_initial_x86_forward(
-                                raw.native_number,
-                                raw.args,
-                            );
-                            self.stats.record(class)?;
-                            match class {
-                                crate::prepare::InitialForwardClass::Host(_) => {}
-                                refusal @ crate::prepare::InitialForwardClass::Refuse(_) => {
-                                    self.reporter.record(
-                                        carrick_kernel::compat::CompatEvent::partial_syscall(
-                                            raw.number.0,
-                                            format!("x86_native_{}", raw.native_number.0),
-                                            carrick_kernel::compat::SyscallArgs::new(raw.args),
-                                            format!("cpl0_{}_owner_unbound", refusal.family()),
-                                        ),
-                                    );
-                                    return Ok(ForwardDecision::Immediate(
-                                        InitialSyscallDisposition::Refused(
-                                            carrick_abi::LINUX_ENOSYS,
-                                        ),
-                                    ));
-                                }
-                            }
-                            let kernel = binding.fresh_context()?;
-                            let request = SyscallRequest::from_raw(raw)
-                                .with_current_guest_sp(Some(frame.rsp));
-                            let outcome = dispatcher
-                                .dispatch(&kernel, request, venue, &self.reporter)
-                                .map_err(|error| {
-                                    TrapError::Hypervisor(format!("dispatch x86 syscall: {error}"))
-                                })?;
-                            match outcome {
-                                DispatchOutcome::Returned { value } => {
-                                    Ok(ForwardDecision::Immediate(
-                                        InitialSyscallDisposition::Return(value),
-                                    ))
-                                }
-                                DispatchOutcome::Errno { errno } => Ok(ForwardDecision::Immediate(
-                                    InitialSyscallDisposition::Refused(errno),
-                                )),
-                                DispatchOutcome::Exit { code }
-                                | DispatchOutcome::ThreadExit { code } => {
-                                    Ok(ForwardDecision::Immediate(InitialSyscallDisposition::Exit(
-                                        GuestExitStatus::from_linux_code(code),
-                                    )))
-                                }
-                                other => Ok(ForwardDecision::Blocked(
-                                    ForwardRequest::Syscall(request),
-                                    Box::new(other),
-                                )),
-                            }
-                        })?;
-                    drop(dispatcher);
-                    match decision {
-                        ForwardDecision::Blocked(request, outcome) => {
-                            return Self::block_forward(
-                                binding,
-                                submission,
-                                request,
-                                *outcome,
-                                Some(token),
-                            );
-                        }
-                        ForwardDecision::Immediate(InitialSyscallDisposition::Return(value)) => {
-                            self.physical.complete_forward(task, token, value)?
-                        }
-                        ForwardDecision::Immediate(InitialSyscallDisposition::Refused(errno)) => {
-                            self.physical
-                                .complete_forward(task, token, errno.guest_retval())?
-                        }
-                        ForwardDecision::Immediate(InitialSyscallDisposition::Exit(status)) => {
-                            self.publish_exit(InitialProcessExit::Exited {
-                                code: status.code(),
-                                exits: exited,
-                            })?;
-                            return Ok(ExecutorExit::Exited);
-                        }
-                    }
-                    // A physical peer parked after HLT may have acquired an
-                    // interrupt while this CPU stayed in the guest. The stopped
-                    // forward is the same bounded inspection point used by the
-                    // carrier's physical coordinator.
-                    self.scheduler.poke_executor_control();
-                    Ok(ExecutorExit::Syscall)
+                    let forward_task = stopped
+                        .state
+                        .as_ref()
+                        .map_or(task, |state| state.binding().task());
+                    self.service_syscall_trap(forward_task, exited, Some(submission))
                 }
                 CarrierRunExit::Kick => Ok(ExecutorExit::Preempted),
                 CarrierRunExit::FaultDoorbellWord(first) => {
@@ -1115,7 +1086,7 @@ impl PersistentExecutor for KvmPersistentExecutor {
         if !self.physical.is_idle_peer_slot() {
             return Ok(GuestIdleExit::Unsupported);
         }
-        match self.physical.run_idle_peer()? {
+        let result = match self.physical.run_idle_peer()? {
             exit @ CarrierRunExit::PhysicalDoorbell { .. } => {
                 let kernel = self.scheduler.kernel();
                 if let Some(status) =
@@ -1131,12 +1102,34 @@ impl PersistentExecutor for KvmPersistentExecutor {
                 }
                 Ok(GuestIdleExit::Idle)
             }
+            CarrierRunExit::SyscallTrap => {
+                let exited = self
+                    .exits
+                    .fetch_add(1, Ordering::AcqRel)
+                    .checked_add(1)
+                    .ok_or_else(|| TrapError::Hypervisor("KVM exit count overflow".into()))?;
+                if exited > self.max_exits {
+                    return Err(TrapError::Hypervisor(
+                        "KVM guest exit budget exceeded".into(),
+                    ));
+                }
+                let task = self.physical.idle_peer_task()?;
+                self.service_syscall_trap(task, exited, None)?;
+                Ok(GuestIdleExit::Idle)
+            }
             CarrierRunExit::Halt => Ok(GuestIdleExit::Unsupported),
             CarrierRunExit::Kick => Ok(GuestIdleExit::Idle),
             other => Err(TrapError::Hypervisor(format!(
                 "idle KVM peer needs a host task handback: {other:?}"
             ))),
+        };
+        if let Err(error) = &result {
+            if !self.completion_sent {
+                let _ = self.completed.send(Err(error.to_string()));
+                self.completion_sent = true;
+            }
         }
+        result
     }
 }
 

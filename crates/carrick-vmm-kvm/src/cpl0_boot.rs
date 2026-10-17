@@ -1388,36 +1388,38 @@ impl ProductionCpuLease {
         if *exit != CarrierRunExit::SyscallTrap {
             return Err(fail("idle peer fixture requires write crossing"));
         }
+        let task = self.idle_peer_task()?;
+        let (bytes, token) = self.capture_forward(task, |venue, frame| {
+            if (frame.rax, frame.rdi, frame.rdx) != (1, 1, 1) {
+                return Err(fail("peer fixture only receives one stdout byte"));
+            }
+            venue
+                .read_bytes_raw(frame.rsi, 1)
+                .map_err(|error| fail(error.to_string()))
+        })?;
+        self.complete_forward(task, token, 1)?;
+        Ok(bytes)
+    }
+
+    /// Resolve and authenticate the exact guest task stopped on the idle peer.
+    /// The physical peer slot itself is never a task identity.
+    pub fn idle_peer_task(&mut self) -> Result<carrick_guest_arch::TaskIdentity, TrapError> {
         let mut custody = self
             ._custody
             .lock()
             .map_err(|_| fail("physical custody poisoned"))?;
-        self.cpu.with_idle_peer_vcpu(|vcpu| {
+        let execution = self.cpu.with_idle_peer_vcpu(|vcpu| {
             let slot = carrick_guest_arch::CpuId::new(1);
-            let address = vcpu.get_gpr(X86Reg::Rax)?;
-            let stack_end = checked_stack_end(custody.binding(slot).kernel_stack)
-                .ok_or_else(|| fail("peer fixture stack overflow"))?;
-            let gpa = checked_private_stack_frame_gpa(stack_end, address, size_of::<NativeFrame>())
-                .ok_or_else(|| fail("peer fixture frame outside stack"))?;
-            let ptr = custody
-                .ram
-                .host_ptr(gpa, size_of::<NativeFrame>())
-                .ok_or_else(|| fail("peer fixture frame backing"))?
-                .cast::<NativeFrame>();
-            // SAFETY: this exclusive stopped CPU owns its retained private stack.
-            let mut frame = unsafe { *ptr };
-            if (frame.rax, frame.rdi, frame.rdx) != (1, 1, 1) {
-                return Err(fail("peer fixture only receives one stdout byte"));
-            }
-            let venue = ForwardVenue::new(&mut custody, StoppedCpuLease { cpu: slot, vcpu })?;
-            let bytes = venue
-                .read_bytes_raw(frame.rsi, 1)
-                .map_err(|error| fail(error.to_string()))?;
-            frame.rax = 1;
-            // SAFETY: the same stopped CPU still exclusively owns this frame.
-            unsafe { ptr.write(frame) };
-            Ok(bytes)
-        })
+            Ok(ForwardVenue::new(&mut custody, StoppedCpuLease { cpu: slot, vcpu })?.execution)
+        })?;
+        drop(custody);
+        let binding = self.cpu.registered_task_binding(execution.context.root)?;
+        if binding.context() != execution.context
+            || binding.task().execution.raw().get() != execution.binding.generation.raw()
+        {
+            return Err(fail("idle peer forward binding mismatch"));
+        }
+        Ok(binding.task())
     }
 
     pub fn save_kernel_stack(
@@ -1607,7 +1609,7 @@ impl ProductionCpuLease {
             self.cpu.unregister_child_binding(live_root)?;
             retire_result?;
         }
-        if let Some(PhysicalProcessExit::Exited(_) | PhysicalProcessExit::RunFailed(_)) = exit {
+        if let Some(PhysicalProcessExit::RunFailed(_)) = exit {
             self.cpu.clear_child_bindings()?;
         }
         drop(custody);
@@ -1641,7 +1643,7 @@ impl ProductionCpuLease {
             ._custody
             .lock()
             .map_err(|_| fail("physical custody poisoned"))?;
-        self.cpu.with_stopped_vcpu(task, |vcpu| {
+        self.cpu.with_forward_vcpu(task, |vcpu, active_binding| {
             let address = vcpu.get_gpr(X86Reg::Rax)?;
             let stack_end = checked_stack_end(custody.binding(slot).kernel_stack)
                 .ok_or_else(|| fail("forward kernel stack overflow"))?;
@@ -1657,6 +1659,11 @@ impl ProductionCpuLease {
             let frame = unsafe { *ptr };
             let mut venue = ForwardVenue::new(&mut custody, StoppedCpuLease { cpu: slot, vcpu })?;
             let execution = venue.execution;
+            if active_binding.context() != execution.context
+                || active_binding.task().execution.raw().get() != execution.binding.generation.raw()
+            {
+                return Err(fail("forward capture MM binding mismatch"));
+            }
             let result = forward(&mut venue, &frame)?;
             custody.host_forwards = custody
                 .host_forwards
@@ -1688,7 +1695,7 @@ impl ProductionCpuLease {
             ._custody
             .lock()
             .map_err(|_| fail("physical custody poisoned"))?;
-        self.cpu.with_stopped_vcpu(task, |vcpu| {
+        self.cpu.with_forward_vcpu(task, |vcpu, active_binding| {
             let lease = StoppedCpuLease {
                 cpu: token.slot,
                 vcpu,
@@ -1696,6 +1703,8 @@ impl ProductionCpuLease {
             let current = ForwardVenue::new(&mut custody, lease)?.execution;
             if current.binding != token.execution.binding
                 || current.context != token.execution.context
+                || active_binding.context() != current.context
+                || active_binding.task().execution.raw().get() != current.binding.generation.raw()
             {
                 return Err(fail("forward completion MM binding changed"));
             }
@@ -1837,7 +1846,7 @@ impl ProductionCpuLease {
             self.cpu.unregister_child_binding(live_root)?;
             retire_result?;
         }
-        if let Some(PhysicalProcessExit::Exited(_) | PhysicalProcessExit::RunFailed(_)) = exit {
+        if let Some(PhysicalProcessExit::RunFailed(_)) = exit {
             self.cpu.clear_child_bindings()?;
         }
         drop(custody);
@@ -3127,6 +3136,7 @@ impl Cpl0Carrier {
             crate::KvmVm::from_shared_vm(shared_vm.clone()),
             LAYOUT,
             runs[0].clone(),
+            binding,
             children.clone(),
         )?;
         let second = KvmCarrierCpu::from_production(
@@ -3134,6 +3144,7 @@ impl Cpl0Carrier {
             crate::KvmVm::from_shared_vm(shared_vm),
             LAYOUT,
             runs[1].clone(),
+            binding,
             children,
         )?;
         Ok(ProductionWorkerParts {

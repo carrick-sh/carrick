@@ -246,6 +246,7 @@ pub struct KvmCarrierCpu<I: CarrierCpuIo = KvmCpuIo> {
     io: I,
     neutral: X86VcpuSnapshot,
     custody: Custody,
+    root_binding: Option<GuestArchBinding>,
     child_bindings: CarrierChildBindings,
     maintenance_root: Option<RootGpa>,
     debug: Option<Arc<CarrierCpuDebug>>,
@@ -345,6 +346,64 @@ impl KvmCarrierCpu<KvmCpuIo> {
         }
         service(&mut self.io.vcpu)
     }
+    pub(crate) fn registered_task_binding(
+        &self,
+        root_gpa: RootGpa,
+    ) -> Result<GuestArchBinding, TrapError> {
+        if let Custody::Loaded { binding, .. } = self.custody
+            && binding.context().root == root_gpa
+        {
+            return Ok(binding);
+        }
+        if let Some(binding) = self.root_binding
+            && binding.context().root == root_gpa
+        {
+            return Ok(binding);
+        }
+        self.child_bindings
+            .get(root_gpa)?
+            .ok_or_else(|| boundary_error("unregistered forward CR3"))
+    }
+    pub(crate) fn with_forward_vcpu<R>(
+        &mut self,
+        task: TaskIdentity,
+        service: impl FnOnce(&mut crate::KvmVcpu, GuestArchBinding) -> Result<R, TrapError>,
+    ) -> Result<R, TrapError> {
+        if self.physical_slot() == Some(carrick_guest_arch::CpuId::new(1))
+            && matches!(self.custody, Custody::Idle)
+        {
+            self.audit_unloaded_peer()?;
+        } else if !matches!(self.custody, Custody::Loaded { .. }) {
+            return Err(boundary_error(
+                "physical service requires its loaded task generation",
+            ));
+        }
+        let active = if self.io.production_run.is_some() {
+            let live_root = self.io.vcpu.get_gpr(carrick_x86::X86Reg::Cr3)? & !0xfff;
+            let root_gpa = RootGpa::page_aligned(FrameGpa::new(live_root))
+                .ok_or_else(|| boundary_error("unaligned forward CR3"))?;
+            let active = self.registered_task_binding(root_gpa)?;
+            if active.task() != task {
+                return Err(boundary_error(
+                    "physical service requires its loaded task generation",
+                ));
+            }
+            active
+        } else {
+            let Custody::Loaded { binding, .. } = self.custody else {
+                return Err(boundary_error(
+                    "physical service requires its loaded task generation",
+                ));
+            };
+            if binding.task() != task {
+                return Err(boundary_error(
+                    "physical service requires its loaded task generation",
+                ));
+            }
+            binding
+        };
+        service(&mut self.io.vcpu, active)
+    }
     pub fn physical_slot(&self) -> Option<carrick_guest_arch::CpuId> {
         self.io
             .production_run
@@ -374,6 +433,7 @@ impl KvmCarrierCpu<KvmCpuIo> {
         vm: crate::KvmVm,
         layout: BringupLayout,
         production_run: crate::cpl0_boot::ProductionRunContext,
+        root_binding: GuestArchBinding,
         child_bindings: CarrierChildBindings,
     ) -> Result<Self, TrapError> {
         let static_state = ProductionCpuStatic {
@@ -404,6 +464,7 @@ impl KvmCarrierCpu<KvmCpuIo> {
             },
             child_bindings,
         )?;
+        cpu.root_binding = Some(root_binding);
         cpu.maintenance_root = Some(maintenance_root);
         Ok(cpu)
     }
@@ -421,6 +482,7 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
             io,
             neutral,
             custody: Custody::Idle,
+            root_binding: None,
             child_bindings,
             maintenance_root: None,
             debug: None,
@@ -597,6 +659,20 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
                             )));
                         }
                     }
+                }
+            }
+            CarrierRunExit::SyscallTrap | CarrierRunExit::Kick => {
+                if let Some(root_gpa) = RootGpa::page_aligned(FrameGpa::new(image.cr3 & !0xfff))
+                    && root_gpa != binding.context().root
+                {
+                    self.child_bindings
+                        .get(root_gpa)
+                        .inspect_err(|_| {
+                            self.custody = Custody::Poisoned;
+                        })?
+                        .unwrap_or(binding)
+                } else {
+                    binding
                 }
             }
             _ => binding,
