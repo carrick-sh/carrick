@@ -130,12 +130,34 @@ pub struct PreparedKvmPoolOutcome {
 }
 
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
-struct KvmPhysicalDebug(Arc<carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory>);
+#[derive(Default)]
+struct KvmPhysicalDebug {
+    physical: std::sync::OnceLock<Arc<carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory>>,
+}
+
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+impl KvmPhysicalDebug {
+    fn attach(&self, physical: &Arc<carrick_vmm_kvm::cpl0_boot::ProductionCpuFactory>) {
+        if self.physical.set(Arc::clone(physical)).is_ok() {
+            physical.attach_debug();
+        }
+    }
+}
 
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
 impl carrick_kernel::kernel::debug::PhysicalCaptureProvider for KvmPhysicalDebug {
     fn capture(&self) -> carrick_kernel::kernel::debug::PhysicalCapture {
-        let capture = self.0.capture_physical_state();
+        let Some(physical) = self.physical.get() else {
+            return carrick_kernel::kernel::debug::PhysicalCapture {
+                zone_census: String::new(),
+                vcpus: Vec::new(),
+                host_threads: Vec::new(),
+                unavailable: vec![
+                    "kvm physical carrier still preparing before worker handoff".to_owned(),
+                ],
+            };
+        };
+        let capture = physical.capture_physical_state();
         carrick_kernel::kernel::debug::PhysicalCapture {
             zone_census: capture.zone_census,
             vcpus: capture.vcpus,
@@ -146,11 +168,51 @@ impl carrick_kernel::kernel::debug::PhysicalCaptureProvider for KvmPhysicalDebug
 }
 
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+type PreparedKvmDebugServer = (
+    carrick_kernel::kernel::KernelDebugServer,
+    Arc<KvmPhysicalDebug>,
+);
+
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+fn install_kvm_debug_server(
+    dispatcher: &carrick_kernel::dispatch::SyscallDispatcher,
+) -> Option<PreparedKvmDebugServer> {
+    let context = dispatcher.capture_one_task_context().ok()?;
+    let run_id = dispatcher
+        .container()
+        .launch()
+        .carrier_scope_id
+        .as_str()
+        .to_owned();
+    let physical_debug = Arc::new(KvmPhysicalDebug::default());
+    let provider: Arc<dyn carrick_kernel::kernel::debug::PhysicalCaptureProvider> =
+        Arc::clone(&physical_debug) as _;
+    let server = carrick_kernel::kernel::KernelDebugServer::install(
+        Arc::clone(context.kernel()),
+        &run_id,
+        Some(provider),
+    )?;
+    Some((server, physical_debug))
+}
+
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
 pub fn run_prepared_kvm_pool(
     machine: carrick_vmm_kvm::cpl0_boot::Cpl0Carrier,
     root_context: carrick_kernel::kernel::KernelContext,
     dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
     max_traps: usize,
+) -> Result<PreparedKvmPoolOutcome, RuntimeError> {
+    let debug_server = install_kvm_debug_server(&dispatcher);
+    run_prepared_kvm_pool_with_debug(machine, root_context, dispatcher, max_traps, debug_server)
+}
+
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+fn run_prepared_kvm_pool_with_debug(
+    machine: carrick_vmm_kvm::cpl0_boot::Cpl0Carrier,
+    root_context: carrick_kernel::kernel::KernelContext,
+    dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
+    max_traps: usize,
+    debug_server: Option<PreparedKvmDebugServer>,
 ) -> Result<PreparedKvmPoolOutcome, RuntimeError> {
     use crate::vcpu_loop::executor::{self, PersistentTaskBinding};
     use carrick_hal::threaded::GuestCpuState;
@@ -161,22 +223,10 @@ pub fn run_prepared_kvm_pool(
     let physical = Arc::new(physical);
     let reporter = Arc::new(carrick_kernel::compat::CompatReporter::default());
     let stats = Arc::new(executor::kvm::KvmForwardStats::default());
-    let run_id = dispatcher
-        .container()
-        .launch()
-        .carrier_scope_id
-        .as_str()
-        .to_owned();
-    let physical_debug: Arc<dyn carrick_kernel::kernel::debug::PhysicalCaptureProvider> =
-        Arc::new(KvmPhysicalDebug(Arc::clone(&physical)));
-    let _debug_server = carrick_kernel::kernel::KernelDebugServer::install(
-        Arc::clone(root_context.kernel()),
-        &run_id,
-        Some(physical_debug),
-    );
-    if _debug_server.is_some() {
-        physical.attach_debug();
+    if let Some((_, ref physical_debug)) = debug_server {
+        physical_debug.attach(&physical);
     }
+    let _debug_server = debug_server;
     let dispatcher = Arc::new(std::sync::Mutex::new(dispatcher));
     root_context
         .thread()
@@ -574,6 +624,8 @@ pub struct PreparedRun {
     debug_state_path: Option<PathBuf>,
     root: RootBacking,
     dispatcher: SyscallDispatcher,
+    #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+    kvm_debug: Option<PreparedKvmDebugServer>,
     interactive_session: Option<InteractiveSession>,
     carrier: crate::carrier::CarrierRuntime,
     carrier_lease: crate::carrier::CarrierLease,
@@ -1124,6 +1176,13 @@ fn prepare_with_lease(
         None
     };
 
+    #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+    let kvm_debug = if plan.page.backend == ExecutionBackend::KvmX86Cpl0 {
+        install_kvm_debug_server(&dispatcher)
+    } else {
+        None
+    };
+
     let ExecutionPlan { env, .. } = plan;
     Ok(PreparedRun {
         arm_ring_first: spec.arm_ring_first,
@@ -1142,6 +1201,8 @@ fn prepare_with_lease(
         interactive_session,
         carrier,
         carrier_lease,
+        #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+        kvm_debug,
     })
 }
 
@@ -1198,6 +1259,8 @@ impl PreparedRun {
             interactive_session,
             carrier,
             carrier_lease,
+            #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+            kvm_debug,
         } = self;
         #[cfg(feature = "platform-macos")]
         debug_assert_eq!(backend, ExecutionBackend::HvfAarch64);
@@ -1300,8 +1363,14 @@ impl PreparedRun {
                 data: dispatcher.launch_resource_limit(carrick_abi::LinuxResource::Data),
             };
             machine.load_guest_mm(&image, &argv, &env, limits)?;
-            run_prepared_kvm_pool(machine, root_context, dispatcher, max_traps)
-                .map(|outcome| outcome.run)
+            run_prepared_kvm_pool_with_debug(
+                machine,
+                root_context,
+                dispatcher,
+                max_traps,
+                kvm_debug,
+            )
+            .map(|outcome| outcome.run)
         } else {
             Err(RuntimeError::Unsupported(format!(
                 "Linux execution backend {backend:?} is not available"

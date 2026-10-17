@@ -25,7 +25,14 @@ const HOST_INTERNAL_FD_MIN_FALLBACK: i32 = 2048;
 const HOST_INTERNAL_FD_TARGET: libc::rlim_t = (HOST_INTERNAL_FD_MIN as libc::rlim_t) + 16;
 static NOFILE_RAISE_ATTEMPTED: AtomicU8 = AtomicU8::new(0);
 
-fn ensure_internal_fd_range() {
+/// Ensure `RLIMIT_NOFILE` covers the internal-fd range and pre-expand the
+/// process fdtable while the carrier is still single-threaded (`files->count == 1`).
+///
+/// On Linux, growing the kernel `fdtable` from its initial 64-entry array up to
+/// [`HOST_INTERNAL_FD_MIN`] after a background thread (such as
+/// `carrick-fs-cleanup`) has been spawned forces `expand_fdtable` to block in
+/// `synchronize_rcu()`, which can stall for seconds under host CPU load.
+pub fn ensure_internal_fd_range() {
     if NOFILE_RAISE_ATTEMPTED
         .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -34,24 +41,43 @@ fn ensure_internal_fd_range() {
     }
 
     let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
-        return;
-    }
-    let mut limit = unsafe { limit.assume_init() };
-    if limit.rlim_cur >= HOST_INTERNAL_FD_TARGET {
-        return;
-    }
-    let desired = if limit.rlim_max == libc::RLIM_INFINITY {
-        HOST_INTERNAL_FD_TARGET
-    } else {
-        HOST_INTERNAL_FD_TARGET.min(limit.rlim_max)
-    };
-    if desired > limit.rlim_cur {
-        limit.rlim_cur = desired;
-        unsafe {
-            libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } == 0 {
+        let mut limit = unsafe { limit.assume_init() };
+        if limit.rlim_cur < HOST_INTERNAL_FD_TARGET {
+            let desired = if limit.rlim_max == libc::RLIM_INFINITY {
+                HOST_INTERNAL_FD_TARGET
+            } else {
+                HOST_INTERNAL_FD_TARGET.min(limit.rlim_max)
+            };
+            if desired > limit.rlim_cur {
+                limit.rlim_cur = desired;
+                unsafe {
+                    libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+                }
+            }
         }
     }
+
+    for probe_src in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        if unsafe { libc::fcntl(probe_src, libc::F_GETFD) } < 0 {
+            continue;
+        }
+        for floor in [HOST_INTERNAL_FD_MIN, HOST_INTERNAL_FD_MIN_FALLBACK] {
+            let duped = unsafe { libc::fcntl(probe_src, libc::F_DUPFD_CLOEXEC, floor) };
+            if duped >= 0 {
+                unsafe {
+                    libc::close(duped);
+                }
+                return;
+            }
+        }
+        break;
+    }
+}
+
+/// Returns `true` once [`ensure_internal_fd_range`] has run in this process.
+pub fn is_internal_fd_range_ensured() -> bool {
+    NOFILE_RAISE_ATTEMPTED.load(Ordering::SeqCst) != 0
 }
 
 /// Dup `fd` to the lowest free number at or above [`HOST_INTERNAL_FD_MIN`]
@@ -88,6 +114,29 @@ pub fn relocate_internal_fd(fd: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ensure_internal_fd_range_pre_expands_table_without_leaking_probe_fd() {
+        ensure_internal_fd_range();
+        assert!(
+            is_internal_fd_range_ensured(),
+            "ensure_internal_fd_range must record completion"
+        );
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe failed");
+        let [read_end, write_end] = fds;
+        let duped =
+            duplicate_internal_fd(read_end).expect("duplicate_internal_fd after pre-expansion");
+        assert!(
+            duped >= HOST_INTERNAL_FD_MIN || duped >= HOST_INTERNAL_FD_MIN_FALLBACK,
+            "duped fd {duped} below both floors"
+        );
+        unsafe {
+            libc::close(duped);
+            libc::close(read_end);
+            libc::close(write_end);
+        }
+    }
 
     /// `relocate_internal_fd` moves a low fd above the floor and closes the
     /// original.

@@ -607,6 +607,7 @@ impl CarrierRuntime {
         if self.ensure_current_process().is_err() {
             return;
         }
+        carrick_host::internal_fd::ensure_internal_fd_range();
         crate::memory::init_alias_ipa_allocator();
         carrick_vfs::fs_resolve_cache::init();
     }
@@ -3099,5 +3100,16 @@ mod tests {
                     .contains(&crate::vm_lifecycle::VmLifecycleViolation::EventCapacityExceeded)
             );
         }
+    }
+
+    #[test]
+    fn initialize_facilities_ensures_internal_fd_range_before_container_boot() {
+        let _serial = TEST_LOCK.lock();
+        let carrier = CarrierRuntime::new_for_tests().expect("carrier");
+        carrier.initialize_facilities();
+        assert!(
+            carrick_host::internal_fd::is_internal_fd_range_ensured(),
+            "CarrierRuntime::initialize_facilities must pre-expand the internal fd range before background threads spawn"
+        );
     }
 }
