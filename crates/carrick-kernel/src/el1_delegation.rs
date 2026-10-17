@@ -93,9 +93,8 @@ pub fn settle_el1_boundary_for(
 /// receipt to distinguish a completed EL1 call from a host commit owed.
 pub fn settle_pending_host_work_for(slot: usize, dispatcher: &crate::dispatch::SyscallDispatcher) {
     let kernel = std::sync::Arc::clone(dispatcher.kernel_binding.read().kernel());
-    let pending = carrick_el1_abi::take_pending_host_work(slot);
-    if pending {
-        deliver_boundary_wakes(&kernel, false, true);
+    if carrick_el1_abi::take_pending_host_work(slot) {
+        settle_host_work_boundary(&kernel, false, true);
     }
 }
 

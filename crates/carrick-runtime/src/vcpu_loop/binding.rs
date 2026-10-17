@@ -6947,14 +6947,75 @@ mod tests {
         let step = guard.eventfd().unwrap().try_write(1);
         assert!(guard.publish(step.wake).host_owed);
         drop(guard);
+        use carrick_el1_abi::Lifecycle;
+        let _sibling = context
+            .kernel()
+            .reserve_thread_clone(
+                &context,
+                carrick_kernel::kernel::ClonePlan::from_flags(
+                    carrick_abi::LinuxCloneFlags::THREAD
+                        | carrick_abi::LinuxCloneFlags::SIGHAND
+                        | carrick_abi::LinuxCloneFlags::VM,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap()
+            .prepare(ThreadId::synthetic_for_tests(9_102))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .start_thread()
+            .unwrap()
+            .into_context();
+        let page = context.thread().control_lease().lifecycle();
+        let claim = page.claim_any().unwrap();
+        let entry = claim.entry();
+        let identity = page.identity(entry).unwrap();
+        let born_tid =
+            carrick_kernel::kernel::LinuxTid::from_abi_positive(identity.tid as i32).unwrap();
+        page.thread_born().unwrap();
+        let caller = context.thread().key();
+        page.record_born(
+            claim,
+            carrick_el1_abi::BornRecord {
+                caller_task: carrick_el1_abi::El1TaskId::from_linux_tid(caller.tid.raw()).raw(),
+                caller_serial: caller.serial.raw(),
+                clone_flags: (carrick_abi::LinuxCloneFlags::THREAD
+                    | carrick_abi::LinuxCloneFlags::SIGHAND
+                    | carrick_abi::LinuxCloneFlags::VM
+                    | carrick_abi::LinuxCloneFlags::FS
+                    | carrick_abi::LinuxCloneFlags::FILES)
+                    .bits(),
+                clear_child_tid: 0,
+                blocked: carrick_el1_abi::BlockedMask(0),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            page.state(entry.index()),
+            Some((entry.generation(), carrick_el1_abi::EntryState::Born))
+        );
         task.linux.mark_pending_host_work();
         task.linux.record_commit_owed(0xfeed);
         assert_eq!(wakes.load(Ordering::Relaxed), 0);
 
         // Poll has reached the host boundary for an ordinary forwarded call.
-        // The owed wake must be delivered before that call returns to EL0.
+        // The thread ledger must settle before owed wakes are delivered.
         carrick_kernel::el1_delegation::settle_pending_host_work_for(SLOT, &dispatcher);
         assert!(!task.linux.has_pending_host_work());
+        assert_eq!(
+            page.state(entry.index()),
+            Some((entry.generation(), carrick_el1_abi::EntryState::Published)),
+            "poll host-work boundary must settle the thread ledger before wake delivery"
+        );
+        assert!(
+            context
+                .kernel()
+                .context(context.task().key().id, born_tid)
+                .is_ok(),
+            "settled EL1 birth must be published in the kernel graph"
+        );
         assert!(
             !owner.service_host_wake(object),
             "poll boundary left the eventfd wake owed"
