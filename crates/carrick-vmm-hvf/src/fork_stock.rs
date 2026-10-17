@@ -410,6 +410,10 @@ mod tests {
                     vec![ForkLifecycleLoan::ARM_DEFAULT],
                 )
                 .unwrap();
+            stock
+                .owner
+                .provide_arm_control_capacity(0x5000_0000)
+                .unwrap();
         }
         let request = test_request(exec, 302, 4, 1);
         let address = KernelVa::new(carrick_el1_abi::EL1_STACKS_BASE);
@@ -502,5 +506,335 @@ mod tests {
         assert_eq!(stock.owner.table_stock().len(), 8);
         assert!(stock.owner.lifecycle_available());
         assert!(stock.owner.pending(exec.cpu).is_none());
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn native_stock_reserve_refuses_retiring_stage2_record_and_rolls_back_earlier_pin() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = std::sync::Arc::new(CarrierVmCustody::new());
+        let generation = custody.begin_create().unwrap();
+        custody.commit_create(generation).unwrap();
+        let mut region = carrick_test_support::TestEl1Region::zeroed();
+        let region_ptr = region.as_mut_ptr();
+        let mut physical = carrick_test_support::TestEl1Region::zeroed();
+        let physical_ptr = physical.as_mut_ptr();
+        let mut exec = test_execution(41, 0, 301);
+        exec.context.root = page(carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE);
+        let ttbr0 = (1 << 48) | exec.context.root.address().raw();
+        let slot = carrick_guest_arch::SlotId::new(0);
+        // SAFETY: exclusively owned, aligned initialized ABI fixture storage.
+        let zone = unsafe {
+            &*region_ptr
+                .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+                .cast::<carrick_el1_abi::ZoneTables>()
+        };
+        let space = zone.spaces.publish_closed(301, ttbr0, ttbr0).unwrap();
+        zone.spaces.open(space);
+        zone.drive(slot, 301);
+        zone.publish_slot(slot, 301, Some(0), 1);
+        zone.enter_guest(slot);
+        zone.install_space(slot, 301).unwrap();
+        // SAFETY: this stopped CPU's CurrentTask belongs to the fixture.
+        let task = unsafe {
+            &*region_ptr
+                .add(carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize)
+                .cast::<carrick_el1_abi::CurrentTask>()
+        };
+        task.set(carrick_el1_abi::El1TaskId::from_linux_tid(41), 11, 1);
+        task.mm
+            .key
+            .store(301, core::sync::atomic::Ordering::Release);
+        task.mm
+            .thread_generation
+            .store(101, core::sync::atomic::Ordering::Release);
+        task.publish_root_generation(exec.context.generation);
+        let stock_base = carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE + 0x20_0000;
+        for (ipa, len, offset, id) in [
+            (stock_base, 0x8000, 0usize, 1),
+            (
+                carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE,
+                0x10000,
+                0x10000,
+                2,
+            ),
+        ] {
+            custody
+                .publish_stage2_record_using(
+                    crate::trap::CarrierStage2RecordSpec {
+                        vm_generation: generation,
+                        ipa,
+                        len,
+                        host_addr: unsafe { physical_ptr.add(offset) } as usize,
+                        mapped: true,
+                        backend_map_installed: true,
+                        release_ipa: false,
+                        perms: 3,
+                        logical_owner: Some(crate::trap::CarrierLogicalOwner { id, generation: 1 }),
+                    },
+                    || 0,
+                )
+                .unwrap();
+        }
+        {
+            let mut stock = custody.fork_stock.lock();
+            stock.owner.set_carrier(custody.transfer_carrier);
+            stock
+                .owner
+                .install(
+                    (0..8)
+                        .map(|index| page(stock_base + index * 4096))
+                        .collect(),
+                    vec![ForkLifecycleLoan::ARM_DEFAULT],
+                )
+                .unwrap();
+            stock
+                .owner
+                .provide_arm_control_capacity(0x5000_0000)
+                .unwrap();
+        }
+        let ipa_a = 0xa090_1000_0000;
+        let ipa_b = ipa_a + 0x4000;
+        let mut owners = Vec::new();
+        for ipa in [ipa_a, ipa_b] {
+            let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                0x4000,
+                crate::host_mapping::HostMappingKind::PerMmKernelState,
+            )
+            .unwrap();
+            let mut lease = crate::trap::GlobalFrameStage2Lease::fixed(ipa, 0x4000);
+            lease.mark_test_mapped_without_backend();
+            let owner = crate::trap::StructuralBackingOwner::new_in(
+                &custody,
+                mapping,
+                lease,
+                u64::from(applevisor::memory::MemPerms::ReadWrite),
+                crate::trap::next_structural_epoch().unwrap(),
+                ipa,
+                0x4000,
+            )
+            .unwrap();
+            owners.push(owner);
+        }
+        let owner_a = &owners[0];
+        let owner_b = &owners[1];
+
+        let mut request = test_request(exec, 302, 4, 1);
+        request.operation.carrier = custody.transfer_carrier;
+        let address = KernelVa::new(carrick_el1_abi::EL1_STACKS_BASE);
+        let offset = (address.raw() - carrick_el1_abi::EL1_REGION_BASE) as usize;
+        // SAFETY: aligned complete loan record on this CPU's retained fixture stack.
+        let record = unsafe { region_ptr.add(offset).cast::<ForkStockExchange>() };
+        unsafe {
+            record.write(ForkStockExchange::new(request).unwrap());
+        }
+        let bytes = unsafe {
+            crate::metadata_grant::RetainedAbiRegion::new(
+                region_ptr,
+                carrick_el1_abi::EL1_REGION_SIZE as usize,
+            )
+            .unwrap()
+        };
+        let reply = crate::metadata_grant::service_native_fork_stock(
+            &custody,
+            Some(generation),
+            exec.cpu,
+            address,
+            0,
+            ttbr0,
+            bytes,
+        )
+        .unwrap();
+        assert_eq!(reply[0], carrick_el1_abi::METADATA_GRANT_SUCCESS);
+        let loan = unsafe { &mut *record }.take(request).unwrap().unwrap();
+
+        // The same retirement entry point used by munmap wins before Reserve.
+        assert_eq!(
+            custody.request_stage2_record_retirement(owner_b.record_identity()),
+            crate::trap::CarrierStage2RetireOutcome::DeferredActivePins
+        );
+
+        let custody_offset = carrick_el1_abi::EL1_BOOTSTRAP_METADATA_OFFSET as usize;
+        let custody_va = KernelVa::new(carrick_el1_abi::EL1_REGION_BASE + custody_offset as u64);
+        let rows = [
+            carrick_el1_abi::PortalForkCustody::Frame {
+                va: 0x40_0000,
+                ipa: ipa_a,
+                len: 4096,
+                shared: false,
+            }
+            .words(),
+            carrick_el1_abi::PortalForkCustody::Frame {
+                va: 0x40_1000,
+                ipa: ipa_b,
+                len: 4096,
+                shared: false,
+            }
+            .words(),
+        ];
+        // SAFETY: aligned 2-row custody array in retained bootstrap metadata.
+        unsafe {
+            region_ptr
+                .add(custody_offset)
+                .cast::<[[u64; 4]; 2]>()
+                .write(rows);
+        }
+
+        let completion_for =
+            |loan: carrick_el1_abi::ForkStockLoan| carrick_el1_abi::PortalForkCompletion {
+                request: loan.request,
+                child: unsafe {
+                    carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                        custody.transfer_carrier,
+                        loan.request.child_mm,
+                        NonZeroU64::MIN,
+                    )
+                },
+                parent_generation: ReservationGeneration::new(2).unwrap(),
+                child_tables_used: 4096,
+                parent_tables_used: 4096,
+            };
+
+        let settlement = record.cast::<carrick_el1_abi::ForkStockSettlement>();
+        unsafe {
+            settlement.write(
+                carrick_el1_abi::ForkStockSettlement::reserve(
+                    loan,
+                    completion_for(loan),
+                    custody_va,
+                    2,
+                )
+                .unwrap(),
+            );
+        }
+        let reply = crate::metadata_grant::service_native_fork_stock(
+            &custody,
+            Some(generation),
+            exec.cpu,
+            address,
+            0,
+            ttbr0,
+            bytes,
+        )
+        .unwrap();
+        assert_eq!(reply[0], carrick_el1_abi::METADATA_GRANT_ERR_DENIED);
+        assert_eq!(
+            unsafe { &mut *settlement }.take(loan),
+            Some(Err(carrick_el1_abi::ForkStockRefusal::Inventory)),
+            "Reserve must refuse when a selected stage-2 record is retiring"
+        );
+        assert_eq!(
+            custody
+                .stage2_record_snapshot(owner_a.record_identity().record_id)
+                .unwrap()
+                .pin_count,
+            0,
+            "earlier pinned frame must roll back when a later frame fails to pin"
+        );
+        assert_eq!(custody.fork_stock.lock().owner.live_children(), 0);
+
+        // Abort the loan after the refused reservation and prove a subsequent
+        // fork against the live frame succeeds end-to-end.
+        unsafe {
+            settlement.write(carrick_el1_abi::ForkStockSettlement::abort(loan));
+        }
+        let reply = crate::metadata_grant::service_native_fork_stock(
+            &custody,
+            Some(generation),
+            exec.cpu,
+            address,
+            0,
+            ttbr0,
+            bytes,
+        )
+        .unwrap();
+        assert_eq!(reply[0], carrick_el1_abi::METADATA_GRANT_SUCCESS);
+        assert_eq!(unsafe { &mut *settlement }.take(loan), Some(Ok(())));
+
+        let mut next_request = test_request(exec, 303, 4, 1);
+        next_request.operation.carrier = custody.transfer_carrier;
+        unsafe {
+            record.write(ForkStockExchange::new(next_request).unwrap());
+        }
+        let reply = crate::metadata_grant::service_native_fork_stock(
+            &custody,
+            Some(generation),
+            exec.cpu,
+            address,
+            0,
+            ttbr0,
+            bytes,
+        )
+        .unwrap();
+        assert_eq!(reply[0], carrick_el1_abi::METADATA_GRANT_SUCCESS);
+        let next_loan = unsafe { &mut *record }.take(next_request).unwrap().unwrap();
+        unsafe {
+            settlement.write(
+                carrick_el1_abi::ForkStockSettlement::reserve(
+                    next_loan,
+                    completion_for(next_loan),
+                    custody_va,
+                    1,
+                )
+                .unwrap(),
+            );
+        }
+        let reply = crate::metadata_grant::service_native_fork_stock(
+            &custody,
+            Some(generation),
+            exec.cpu,
+            address,
+            0,
+            ttbr0,
+            bytes,
+        )
+        .unwrap();
+        assert_eq!(reply[0], carrick_el1_abi::METADATA_GRANT_SUCCESS);
+        assert_eq!(unsafe { &mut *settlement }.take(next_loan), Some(Ok(())));
+        assert_eq!(
+            custody
+                .stage2_record_snapshot(owner_a.record_identity().record_id)
+                .unwrap()
+                .pin_count,
+            1
+        );
+        assert_eq!(
+            custody.request_stage2_record_retirement(owner_a.record_identity()),
+            crate::trap::CarrierStage2RetireOutcome::DeferredActivePins,
+            "retirement after Reserve cannot revoke the admitted child's backing"
+        );
+
+        unsafe {
+            settlement.write(
+                carrick_el1_abi::ForkStockSettlement::commit_reserved_with_child_identity(
+                    next_loan,
+                    completion_for(next_loan),
+                    42,
+                    102,
+                )
+                .unwrap(),
+            );
+        }
+        let reply = crate::metadata_grant::service_native_fork_stock(
+            &custody,
+            Some(generation),
+            exec.cpu,
+            address,
+            0,
+            ttbr0,
+            bytes,
+        )
+        .unwrap();
+        assert_eq!(reply[0], carrick_el1_abi::METADATA_GRANT_SUCCESS);
+        assert_eq!(unsafe { &mut *settlement }.take(next_loan), Some(Ok(())));
+        assert_eq!(custody.fork_stock.lock().owner.live_children(), 1);
+        assert_eq!(
+            custody
+                .stage2_record_snapshot(owner_a.record_identity().record_id)
+                .unwrap()
+                .pin_count,
+            1,
+            "committed child MM retains its stage-2 pin until MM retirement"
+        );
     }
 }

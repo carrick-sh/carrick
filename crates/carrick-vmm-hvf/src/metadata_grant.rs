@@ -1194,53 +1194,69 @@ fn fork_custody_in_retained_region(offset: usize, bytes: usize) -> bool {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn retain_fork_custody_rows(
     custody: &Arc<crate::trap::CarrierVmCustody>,
+    inventory: Option<Arc<dyn carrick_hal::PhysicalFrameInventory>>,
     region: RetainedAbiRegion<'_>,
-    parent_mm: u64,
-    request: ForkStockRequest,
+    parent: carrick_guest_arch::AddressContext<carrick_guest_arch::RootGpa>,
+    request: carrick_el1_abi::PortalForkRequest,
     address: carrick_guest_arch::KernelVa,
     count: u64,
 ) -> Result<Vec<crate::trap::ForkPhysicalRetention>, ForkStockRefusal> {
+    use carrick_aarch64::fork::ForkCustody;
     if count == 0 {
         return Ok(Vec::new());
     }
     let Ok(count) = usize::try_from(count) else {
         return Err(ForkStockRefusal::Invalid);
     };
-    let Some(bytes) = count.checked_mul(core::mem::size_of::<[u64; 4]>()) else {
+    let row_bytes = core::mem::size_of::<[u64; 4]>();
+    let Some(bytes) = count.checked_mul(row_bytes) else {
         return Err(ForkStockRefusal::Invalid);
     };
     let Some(offset) = address
         .raw()
-        .checked_sub(carrick_el1_abi::EL1_METADATA_BASE)
+        .checked_sub(carrick_el1_abi::EL1_REGION_BASE)
         .and_then(|offset| usize::try_from(offset).ok())
     else {
         return Err(ForkStockRefusal::Invalid);
     };
-    if offset % core::mem::align_of::<[u64; 4]>() != 0
+    if !offset.is_multiple_of(core::mem::align_of::<[u64; 4]>())
         || !fork_custody_in_retained_region(offset, bytes)
     {
         return Err(ForkStockRefusal::Invalid);
-    };
-    let Some(pointer) = region.slice_ptr(offset, bytes) else {
-        return Err(ForkStockRefusal::Invalid);
-    };
+    }
     let mut retained = Vec::new();
     if retained.try_reserve_exact(count).is_err() {
         return Err(ForkStockRefusal::Capacity);
     }
-    let owner = crate::trap::CarrierPinVenue::with_weak(Arc::downgrade(custody), parent_mm);
-    // SAFETY: retained EL1 region slice checked for alignment and bounds.
-    let rows = unsafe { core::slice::from_raw_parts(pointer as *const [u64; 4], count) };
-    for &words in rows {
-        let Some(selected) = carrick_el1_abi::PortalForkCustody::from_words(words) else {
+    let source = Arc::new(
+        move |handle: core::num::NonZeroU64, generation: core::num::NonZeroU64| {
+            let Some(inventory) = inventory.as_ref() else {
+                return false;
+            };
+            let view = inventory.bind(parent.into());
+            let id = carrick_hal::MappingId::from_kernel_allocation(handle);
+            let generation = carrick_hal::MappingGeneration::from_backend_counter(generation);
+            view.live_mapping_row(id)
+                .is_some_and(|row| row.generation == generation)
+        },
+    );
+    let physical = crate::trap::ForkPhysicalCustody::new(Arc::clone(custody), source);
+    for index in 0..count {
+        let Some(row_offset) = offset.checked_add(index * row_bytes) else {
             return Err(ForkStockRefusal::Invalid);
         };
-        let Some(pin) =
-            <crate::trap::CarrierPinVenue as carrick_hal::fork_stock::ForkPhysicalCustodyOwner>::retain(
-                &owner, request, selected,
-            )
-        else {
-            return Err(ForkStockRefusal::Inventory);
+        let Some(row) = region.record_ptr::<[u64; 4]>(row_offset) else {
+            return Err(ForkStockRefusal::Invalid);
+        };
+        // SAFETY: the synchronous stopped-CPU crossing exclusively retains the
+        // aligned four-word record inside the checked EL1 metadata/heap range.
+        let words = unsafe { *row };
+        let Some(selected) = carrick_el1_abi::PortalForkCustody::decode(words) else {
+            return Err(ForkStockRefusal::Invalid);
+        };
+        let pin = match physical.retain(request, selected) {
+            Ok(Some(pin)) => pin,
+            Ok(None) | Err(_) => return Err(ForkStockRefusal::Inventory),
         };
         retained.push(pin);
     }
@@ -1359,6 +1375,7 @@ pub(crate) fn service_native_fork_stock(
             };
             let mut stock = custody.fork_stock.lock();
             if kind == Some(ForkStockKind::Reserve) {
+                let inventory = stock.inventory();
                 stock
                     .owner
                     .reserve_custody(
@@ -1377,8 +1394,9 @@ pub(crate) fn service_native_fork_stock(
                         |request, address, count| {
                             retain_fork_custody_rows(
                                 custody,
+                                inventory,
                                 region,
-                                execution.binding.mm.raw(),
+                                execution.context,
                                 request,
                                 address,
                                 count,
@@ -1386,35 +1404,12 @@ pub(crate) fn service_native_fork_stock(
                         },
                     )
                     .is_ok()
-            } else if kind == Some(ForkStockKind::Commit) {
-                let mut ledger = custody.el1_frame_grants.lock();
-                match stock
-                    .owner
-                    .commit_admitted(&mut *ledger, execution, settlement)
-                {
-                    Ok(()) => true,
-                    Err(error) => {
-                        settlement.refuse(
-                            if error
-                                == carrick_hal::fork_stock::ForkStockServiceError::StaleExecution
-                            {
-                                ForkStockRefusal::Stale
-                            } else {
-                                ForkStockRefusal::Invalid
-                            },
-                        );
-                        false
-                    }
-                }
             } else {
                 let mut ledger = custody.el1_frame_grants.lock();
                 match stock.owner.settle(
                     &mut *ledger,
                     execution,
-                    carrick_hal::fork_stock::ForkStockSettlementReceipt {
-                        record: settlement,
-                        physical: Vec::new(),
-                    },
+                    settlement,
                     |pages| {
                         pages.iter().all(|page| {
                             ForkStockHostCustody::physical_ptr::<[u8; 4096]>(
