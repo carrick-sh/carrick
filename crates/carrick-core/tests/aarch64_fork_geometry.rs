@@ -671,3 +671,89 @@ fn test_arm_fork_break_before_make_on_block_split() {
         );
     }
 }
+
+#[test]
+fn arm_fork_aliases_only_the_admitted_child_table_prefix() {
+    let memory = TestMemory::new();
+    let [root, l1, l2, l3] = [0x100000, 0x101000, 0x102000, 0x103000];
+    memory.store(root, l1 | TYPE_TABLE_OR_PAGE);
+    memory.store(
+        l1 + ((KERNEL_CONTROL_BASE >> SHIFTS[1]) & 511) * 8,
+        l2 | TYPE_TABLE_OR_PAGE,
+    );
+    memory.store(l2, l3 | TYPE_TABLE_OR_PAGE);
+    let first_alias = STAGE1_TABLES_ALIAS_OFFSET / GRANULE_SIZE;
+    let aliases = STAGE1_TABLES_PRIMARY_SIZE / GRANULE_SIZE;
+    for page in 0..aliases {
+        memory.store(
+            l3 + (first_alias + page) * 8,
+            (root + page * GRANULE_SIZE) | KERNEL_PAGE_FLAGS,
+        );
+    }
+    let before = memory.snapshot();
+    let mut count = ForkCensus {
+        child: 0,
+        parent: 0,
+        live: 0,
+        custody: 0,
+    };
+    census_table::<Aarch64Mmu, _, _>(&LinuxForkPolicy, &memory, &[], root, 0, 0, &mut count)
+        .unwrap();
+    let request = PortalForkRequest {
+        child_tables: PortalForkTableArena::new(0x400000, count.child as u64 * 8).unwrap(),
+        parent_tables: PortalForkTableArena::new(0x500000, (count.parent as u64 * 8).max(4096))
+            .unwrap(),
+        ..sample_arm_request(1)
+    };
+    assert!(request.child_tables.len < STAGE1_TABLES_PRIMARY_SIZE);
+    let mut scratch = ForkScratch::bounded(
+        request,
+        0,
+        count.child,
+        count.parent,
+        count.live,
+        count.custody,
+    )
+    .unwrap();
+    copy_table::<Aarch64Mmu, _, _>(
+        &LinuxForkPolicy,
+        &memory,
+        request,
+        &mut scratch,
+        ForkTableCursor {
+            table: root,
+            level: 0,
+            base: 0,
+            child_offset: 0,
+        },
+    )
+    .unwrap();
+    let table_offset =
+        |word: u64| ((word & Aarch64Mmu::ADDRESS_MASK) - request.child_tables.base) as usize / 8;
+    let child_l1 = table_offset(scratch.child[0]);
+    let child_l2 =
+        table_offset(scratch.child[child_l1 + ((KERNEL_CONTROL_BASE >> SHIFTS[1]) & 511) as usize]);
+    let child_l3 = table_offset(scratch.child[child_l2]);
+    for page in 0..aliases {
+        let descriptor = scratch.child[child_l3 + (first_alias + page) as usize];
+        if page * GRANULE_SIZE < request.child_tables.len {
+            assert_eq!(
+                descriptor,
+                (request.child_tables.base + page * GRANULE_SIZE) | KERNEL_PAGE_FLAGS
+            );
+        } else {
+            assert_eq!(
+                descriptor, 0,
+                "ungranted alias page {page} must stay inaccessible"
+            );
+        }
+    }
+    assert_eq!(
+        scratch.child_used, count.child,
+        "exact census budget, no alias-tail allocation"
+    );
+    assert_eq!(scratch.parent_used, count.parent);
+    assert_eq!(scratch.reads.len(), count.live);
+    assert!(scratch.custody.is_empty());
+    assert_eq!(memory.snapshot(), before, "parent aliases remain unchanged");
+}
