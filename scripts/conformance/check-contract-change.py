@@ -1005,7 +1005,14 @@ def _expand_single_binding_clause(clause: str) -> list[str]:
 
     # Strip trailing prose after `(something)` if followed by `, plus ...`
     if "(" in clause:
-        clause = clause[: clause.find("(")].strip().rstrip(":")
+        prefix, annotation = clause.split("(", 1)
+        expanded = _expand_single_binding_clause(prefix.strip().rstrip(":"))
+        if expanded:
+            module = expanded[0].rsplit("::", 1)[0]
+            for control in re.findall(r"\bincluding\s+([A-Za-z_][A-Za-z0-9_]*)\b", annotation):
+                if "_" in control:
+                    expanded.append(f"{module}::{control}")
+        return expanded
 
     cleaned = re.sub(r"\s+", "", clause)
     if re.match(r"^carrick-[A-Za-z0-9_-]+(?:::[A-Za-z0-9_]+)+$", cleaned):
@@ -1015,8 +1022,20 @@ def _expand_single_binding_clause(clause: str) -> list[str]:
 
 def expand_binding_spec(raw: str) -> list[str]:
     out: list[str] = []
+    last_module: str | None = None
     for clause in _split_top_level_semicolons(raw):
-        out.extend(_expand_single_binding_clause(clause))
+        expanded = _expand_single_binding_clause(clause)
+        if expanded:
+            out.extend(expanded)
+            last_module = expanded[0].rsplit("::", 1)[0]
+        elif (
+            last_module
+            and "tests" in last_module.split("::")
+            and "conformance-metrics" not in clause
+        ):
+            control = re.match(r"^([a-z][a-z0-9_]*_[a-z0-9_]+)\b", clause)
+            if control:
+                out.append(f"{last_module}::{control.group(1)}")
     return out
 
 
