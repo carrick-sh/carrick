@@ -335,6 +335,9 @@ pub struct ThreadControlSlot {
     retired_task: AtomicU64,
     retired_execution: AtomicU64,
     retired_thread: AtomicU64,
+    /// Signals whose current action (`SIG_IGN` or default-ignore) cannot
+    /// interrupt a blocking wait on this thread.
+    non_interrupting: AtomicU64,
 }
 
 impl ThreadControlSlot {
@@ -367,6 +370,7 @@ impl ThreadControlSlot {
             retired_task: AtomicU64::new(0),
             retired_execution: AtomicU64::new(0),
             retired_thread: AtomicU64::new(0),
+            non_interrupting: AtomicU64::new(0),
         }
     }
 
@@ -452,6 +456,7 @@ impl ThreadControlSlot {
         self.zone_seq.store(0, Ordering::Relaxed);
         self.pending.clear(PendingSignals(u64::MAX));
         self.blocked.store(blocked.0, Ordering::Relaxed);
+        self.non_interrupting.store(0, Ordering::Relaxed);
         self.forwarded_saved_mask.store(0, Ordering::Relaxed);
         self.forwarded_mask_armed.store(0, Ordering::Relaxed);
         // Keep the sequence even: a stale odd value would wedge readers.
@@ -544,6 +549,16 @@ impl ThreadControlSlot {
     /// read is needed because nothing can target a thread not yet Born.
     pub fn init_blocked(&self, mask: BlockedMask) {
         self.blocked.store(mask.0, Ordering::Release);
+    }
+
+    /// Signals whose current sighand disposition cannot interrupt a blocking wait.
+    pub fn non_interrupting(&self) -> BlockedMask {
+        BlockedMask(self.non_interrupting.load(Ordering::Acquire))
+    }
+
+    /// Publish the sighand's current non-interrupting signal mask on this slot.
+    pub fn set_non_interrupting(&self, mask: BlockedMask) {
+        self.non_interrupting.store(mask.0, Ordering::Release);
     }
 
     /// The owning host continuation enters a temporary-mask wait. Publish
@@ -2104,6 +2119,7 @@ mod layout_manifest {
                      retired_task: _,
                      retired_execution: _,
                      retired_thread: _,
+                     non_interrupting: _,
                  }: ThreadControlSlot| {};
         field!(ThreadControlSlot, visible_tid, AtomicU32, 0, 4, 4);
         field!(ThreadControlSlot, blocked, AtomicU64, 8, 8, 8);
@@ -2132,6 +2148,7 @@ mod layout_manifest {
         field!(ThreadControlSlot, retired_task, AtomicU64, 120, 8, 8);
         field!(ThreadControlSlot, retired_execution, AtomicU64, 128, 8, 8);
         field!(ThreadControlSlot, retired_thread, AtomicU64, 136, 8, 8);
+        field!(ThreadControlSlot, non_interrupting, AtomicU64, 144, 8, 8);
     }
 
     #[test]

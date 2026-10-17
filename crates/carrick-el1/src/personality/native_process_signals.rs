@@ -242,6 +242,14 @@ impl<T> NativeProcessSignals<T> {
     pub fn action(&self, signal: Signal) -> Action {
         self.resources.lock().actions.action(signal)
     }
+    pub fn non_interrupting_signals(&self) -> SignalSet {
+        let resources = self.resources.lock();
+        let mut set = resources.actions.non_interrupting_signals();
+        if !resources.forced_segv.is_empty() {
+            set = set.without(Signal::SEGV);
+        }
+        set
+    }
     pub fn enqueue(
         &self,
         key: TaskKey,
@@ -298,11 +306,9 @@ impl<T> NativeProcessSignals<T> {
                 return false;
             };
             let action = resources.actions.action(signal);
-            let ignored = action.disposition == Disposition::Ignore
-                || (action.disposition == Disposition::Default
-                    && carrick_signal_core::policy::default_delivery(signal)
-                        == carrick_signal_core::policy::Delivery::Ignore);
-            if !ignored && !awaits_stop_custody(action, signal) {
+            if carrick_signal_core::policy::action_interrupts_wait(signal, action)
+                && !awaits_stop_custody(action, signal)
+            {
                 return true;
             }
             selected = selected.without(signal);

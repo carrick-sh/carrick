@@ -233,6 +233,33 @@ impl ActionTable {
             }
         }
     }
+
+    /// Signals whose current action cannot interrupt a blocking wait.
+    pub fn non_interrupting_signals(&self) -> SignalSet {
+        let mut set = SignalSet::EMPTY;
+        let mut number = 1;
+        while number <= 64 {
+            if let Some(signal) = Signal::from_number(number)
+                && !action_interrupts_wait(signal, self.action(signal))
+            {
+                set = set.with(signal);
+            }
+            number += 1;
+        }
+        set
+    }
+}
+
+/// True iff delivering `signal` under `action` can interrupt a blocking
+/// userspace wait (caught handler, default termination, or default stop/continue).
+/// Ignored signals and default-ignore signals (`SIGCHLD`, `SIGURG`, `SIGWINCH`)
+/// never interrupt a wait with `EINTR`.
+pub const fn action_interrupts_wait(signal: Signal, action: Action) -> bool {
+    match action.disposition {
+        Disposition::Ignore => false,
+        Disposition::Default => !matches!(default_delivery(signal), Delivery::Ignore),
+        Disposition::Handler(_) => true,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -71,10 +71,34 @@ where
         SigBlockMask::blocking_all_of(carrick_signal_core::SignalSet::from_bits(slot.blocked().0));
     let saved_mask = process.take_suspend_mask().unwrap_or(thread_blocked);
     slot.init_blocked(BlockedMask(saved_mask.signals().bits()));
-    let (sig, info, action) =
-        process.take_deliverable_after_suspend(&mut thread_blocked, saved_mask)?;
+    let rewind_interrupted_wait =
+        |process: &mut NativeProcessEntry<'_, 'a, M, C, S>,
+         frame: &mut <A::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
+         machine: &mut A| {
+            if let Some(original) = process.take_interrupted_child_wait() {
+                Some(machine.restart(frame, original))
+            } else {
+                machine.restart_forwarded(frame)
+            }
+        };
+    let Some((sig, info, action)) =
+        process.take_deliverable_after_suspend(&mut thread_blocked, saved_mask)
+    else {
+        let _ = rewind_interrupted_wait(process, frame, machine);
+        return None;
+    };
     match action.disposition {
-        policy::Disposition::Ignore => None,
+        policy::Disposition::Ignore => {
+            if carrick_signal_core::wait::interrupted_wait(
+                carrick_signal_core::wait::RestartClass::IfSaRestart,
+                carrick_signal_core::wait::WaitProgress::Blocked,
+                None,
+            ) == carrick_signal_core::wait::WaitDecision::Continue
+            {
+                let _ = rewind_interrupted_wait(process, frame, machine);
+            }
+            None
+        }
         policy::Disposition::Default => {
             if let policy::Delivery::Terminate { .. } = policy::default_delivery(sig) {
                 Some(match process.exit_with_signal(sig.number() as u8) {
@@ -83,16 +107,25 @@ where
                     Err(_) => CompletionRoute::InvalidCompletion,
                 })
             } else {
+                if carrick_signal_core::wait::interrupted_wait(
+                    carrick_signal_core::wait::RestartClass::IfSaRestart,
+                    carrick_signal_core::wait::WaitProgress::Blocked,
+                    None,
+                ) == carrick_signal_core::wait::WaitDecision::Continue
+                {
+                    let _ = rewind_interrupted_wait(process, frame, machine);
+                }
                 None
             }
         }
         policy::Disposition::Handler(handler) => {
-            let restarted = if action.flags.restart {
-                if let Some(original) = process.take_interrupted_child_wait() {
-                    Some(machine.restart(frame, original))
-                } else {
-                    machine.restart_forwarded(frame)
-                }
+            let restarted = if carrick_signal_core::wait::interrupted_wait(
+                carrick_signal_core::wait::RestartClass::IfSaRestart,
+                carrick_signal_core::wait::WaitProgress::Blocked,
+                Some(action.flags.restart),
+            ) == carrick_signal_core::wait::WaitDecision::Restart
+            {
+                rewind_interrupted_wait(process, frame, machine)
             } else {
                 None
             };
