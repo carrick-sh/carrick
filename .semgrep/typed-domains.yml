@@ -307,4 +307,39 @@ rules:
       private const SYS_* or LINUX_* constants outside of carrick-abi. Look up
       syscalls by name or use the typed constants provided by carrick-abi.
 
+  # Pin the Gpa -> HostVa placement conversion to LinearPlacement::host (#580).
+  - id: carrick-softmmu-linear-placement-only
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "crates/carrick-softmmu/**/*.rs"
+        - "crates/carrick-softcpu-x86/**/*.rs"
+        - "crates/carrick-vmm-soft/**/*.rs"
+      exclude:
+        - "crates/carrick-softmmu/src/placement.rs"
+    patterns:
+      - pattern-either:
+          - pattern: HostVa($...ARGS)
+          - pattern: HostVa::new($...ARGS)
+          - pattern: HostVa::from_raw($...ARGS)
+    message: |
+      `LinearPlacement::host` in `crates/carrick-softmmu/src/placement.rs` is
+      the only allowed `AuthenticatedGpa -> HostVa` conversion. Do not construct
+      `HostVa` outside `LinearPlacement::host`; authenticate `Stage1Gpa ->
+      AuthenticatedGpa` through `ExtentTable` and call `placement.host(auth_gpa)`.
+
+  # Forbid laundering unauthenticated GPAs via FrameGpa::new inside carrick-softmmu (#580).
+  - id: carrick-softmmu-no-frame-gpa-new
+    languages: [rust]
+    severity: ERROR
+    paths:
+      include:
+        - "crates/carrick-softmmu/src/**/*.rs"
+    patterns:
+      - pattern: FrameGpa::new($...ARGS)
+    message: |
+      Do not call `FrameGpa::new` in `carrick-softmmu/src/`: `Stage1Gpa` must be
+      authenticated by `ExtentTable` into an `AuthenticatedGpa` before calling
+      `LinearPlacement::host`.
 

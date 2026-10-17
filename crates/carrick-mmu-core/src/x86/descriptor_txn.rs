@@ -388,7 +388,7 @@ fn validate_output(output: FrameGpa, len: u64, alignment: u64) -> Result<(), Des
     }
     Ok(())
 }
-fn level_bytes(level: usize) -> u64 {
+const fn level_bytes(level: usize) -> u64 {
     1u64 << (39 - level * 9)
 }
 fn leaf_output(entry: u64, level: usize) -> u64 {
@@ -399,9 +399,9 @@ fn permissions(p: Permissions) -> u64 {
         | (if p.executable { 0 } else { NX })
         | (if p.user { USER } else { 0 })
 }
-const ACCESSED: u64 = 1 << 5;
-const DIRTY: u64 = 1 << 6;
-const PAT_LARGE: u64 = 1 << 12;
+pub const ACCESSED: u64 = 1 << 5;
+pub const DIRTY: u64 = 1 << 6;
+pub const PAT_LARGE: u64 = 1 << 12;
 const FLAGS: u64 = PRESENT
     | WRITE
     | USER
@@ -953,14 +953,175 @@ pub fn translate<W: LiveDescriptorWords + ?Sized>(
     translate_leaf(words, root, va, access, user).map(|leaf| leaf.output)
 }
 
+/// Default `MAXPHYADDR` for the pinned x86-64-v3 guest CPUID view (`48` physical address bits).
+pub const DEFAULT_MAX_PHY_ADDR: u8 = 48;
+
+/// Minimum architectural `MAXPHYADDR` in 64-bit paging (`32`).
+pub const MIN_MAX_PHY_ADDR: u8 = 32;
+
+/// Maximum architectural `MAXPHYADDR` in 64-bit 4-level paging (`52`).
+pub const MAX_MAX_PHY_ADDR: u8 = 52;
+
+/// Compute the mask of reserved physical-address bits `[51 : max_phy_addr]` for a given
+/// `max_phy_addr` (`32..=52`), per Intel SDM Vol. 3A §4.5.
+#[inline]
+pub const fn reserved_phyaddr_mask(max_phy_addr: u8) -> u64 {
+    let clamped = if max_phy_addr < MIN_MAX_PHY_ADDR {
+        MIN_MAX_PHY_ADDR
+    } else if max_phy_addr > MAX_MAX_PHY_ADDR {
+        MAX_MAX_PHY_ADDR
+    } else {
+        max_phy_addr
+    };
+    if clamped >= MAX_MAX_PHY_ADDR {
+        0
+    } else {
+        let width = (MAX_MAX_PHY_ADDR - clamped) as u32;
+        ((1u64 << width) - 1) << (clamped as u32)
+    }
+}
+
+/// Return `true` if a **present** (`P == 1`) paging-structure entry at `level` (`0 = PML4 .. 3 = PT`)
+/// has any hardware-reserved bit set under `(max_phy_addr, nxe)` per Intel SDM Vol. 3A §4.5.
+///
+/// Hardware ignores software-available bits `8..=11` on both leaf and non-leaf entries and bits
+/// `52..=62` on all entries (when `CR4.PKE == 0`).
+#[inline]
+pub const fn has_hardware_reserved_bits_when_present(
+    entry: u64,
+    level: usize,
+    max_phy_addr: u8,
+    nxe: bool,
+) -> bool {
+    if (entry & reserved_phyaddr_mask(max_phy_addr)) != 0 {
+        return true;
+    }
+    if !nxe && (entry & NX) != 0 {
+        return true;
+    }
+    if level == 0 && (entry & HUGE) != 0 {
+        return true;
+    }
+    if (level == 1 || level == 2) && (entry & HUGE) != 0 {
+        let unaligned_mask = (level_bytes(level) - 1) & ADDRESS & !PAT_LARGE;
+        if (entry & unaligned_mask) != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Hardware walk configuration for [`translate_leaf_hardware`] (Intel SDM Vol. 3A §4.5–§4.8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HardwareWalkConfig {
+    /// Physical address width (`32..=52`; bits `[51 : max_phy_addr]` are reserved on present entries).
+    pub max_phy_addr: u8,
+    /// `IA32_EFER.NXE` (`false` makes bit 63 reserved; `true` enables execute-disable).
+    pub nxe: bool,
+    /// `CR0.WP` (`false` allows supervisor writes to read-only pages).
+    pub cr0_wp: bool,
+    /// `CR4.SMEP` (`true` faults supervisor instruction fetches from effective-user pages).
+    pub cr4_smep: bool,
+    /// `CR4.SMAP` (`true` faults supervisor data accesses to effective-user pages when `rflags_ac == false`).
+    pub cr4_smap: bool,
+    /// `RFLAGS.AC` (`true` permits supervisor data accesses to user pages when `cr4_smap == true`).
+    pub rflags_ac: bool,
+    /// When `true`, atomically sets `ACCESSED` on every walked entry and `DIRTY` on leaf writes via CAS.
+    pub update_ad: bool,
+}
+
+impl HardwareWalkConfig {
+    /// Standard hardware walk configuration (`MAXPHYADDR = 48`, `NXE = WP = SMEP = SMAP = update_ad = true`, `AC = false`).
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            max_phy_addr: DEFAULT_MAX_PHY_ADDR,
+            nxe: true,
+            cr0_wp: true,
+            cr4_smep: true,
+            cr4_smap: true,
+            rflags_ac: false,
+            update_ad: true,
+        }
+    }
+}
+
+impl Default for HardwareWalkConfig {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Detailed hardware translation stop classification returned by [`translate_leaf_hardware`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HardwareFaultClass {
+    /// Linear address is non-canonical under 48-bit 4-level paging (`#GP(0)` / `#SS(0)`, never `#PF`).
+    NonCanonical,
+    /// Descriptor word load or CAS failed in the underlying [`LiveDescriptorWords`] store.
+    DescriptorLoad(DescriptorRefusal),
+    /// Entry at some walked level had `PRESENT == 0` (`#PF` with `P = 0`).
+    NotPresent,
+    /// Present entry had a hardware-reserved bit set (`#PF` with `P = 1, RSVD = 1`).
+    Reserved,
+    /// Page-level `U/S` or `W/R` permission check failed (`#PF` with `P = 1`).
+    Protection,
+    /// Write hit a read-only leaf armed with the software `COW` bit (`#PF` with `P = 1, W/R = 1`).
+    CowWrite,
+    /// Instruction fetch hit an entry with `NX == 1` when `EFER.NXE == 1` (`#PF` with `P = 1, I/D = 1`).
+    Nx,
+    /// Supervisor instruction fetch hit an effective-user page when `CR4.SMEP == 1` (`#PF` with `P = 1, I/D = 1`).
+    Smep,
+    /// Supervisor data access hit an effective-user page when `CR4.SMAP == 1 && RFLAGS.AC == 0` (`#PF` with `P = 1`).
+    Smap,
+    /// Atomic `ACCESSED`/`DIRTY` `compare_exchange` exceeded [`MAX_AD_CAS_RETRIES`] material-change restarts.
+    AdCasRetryExhausted {
+        /// Number of failed material-change walk restarts (`MAX_AD_CAS_RETRIES`).
+        retries: usize,
+    },
+}
+
+impl HardwareFaultClass {
+    /// Project a hardware fault class onto the ring-level [`FaultClass`].
+    #[inline]
+    pub const fn to_fault_class(self) -> FaultClass {
+        match self {
+            Self::NotPresent => FaultClass::NotPresent,
+            Self::CowWrite => FaultClass::CowWrite,
+            Self::Protection | Self::Smep | Self::Smap => FaultClass::Protection,
+            Self::Nx => FaultClass::Nx,
+            Self::NonCanonical
+            | Self::DescriptorLoad(_)
+            | Self::Reserved
+            | Self::AdCasRetryExhausted { .. } => FaultClass::Reserved,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TranslatedLeaf {
     pub output: FrameGpa,
     pub executable: bool,
     pub ancestors_writable: bool,
+    pub effective_user: bool,
+    pub effective_writable: bool,
     pub descriptor: u64,
     pub size: u64,
 }
+
+#[derive(Clone, Copy)]
+enum WalkMode<'a> {
+    Ring,
+    Hardware(&'a HardwareWalkConfig),
+}
+
+/// Livelock bound on full-walk restarts triggered by material descriptor edits during `A`/`D` CAS.
+///
+/// Same-word `fetch_or` CAS retries continue in place whenever `PRESENT`, the output address, and
+/// permission/structural bits (`WRITE | USER | HUGE | NX`) are unchanged (e.g., a peer toggling
+/// software-ignored bits or `ACCESSED`/`DIRTY`), so benign contention never consumes this cap;
+/// only a material PTE change or a broken store failing CAS on an unchanged word increments it.
+pub const MAX_AD_CAS_RETRIES: usize = 64;
 
 /// Read one terminal word, including a prepared non-present leaf. This is
 /// observation only; it never grants backing or descriptor-write authority.
@@ -986,6 +1147,181 @@ pub fn read_terminal_descriptor<W: LiveDescriptorWords + ?Sized>(
     }
     Err(DescriptorRefusal::MissingTable)
 }
+
+fn walk_leaf_inner<W: LiveDescriptorWords + ?Sized>(
+    words: &W,
+    root: RootGpa,
+    va: UserVa,
+    access: Access,
+    user: bool,
+    mode: WalkMode<'_>,
+) -> Result<TranslatedLeaf, HardwareFaultClass> {
+    if !canonical(va.raw()) {
+        return Err(HardwareFaultClass::NonCanonical);
+    }
+    if let WalkMode::Hardware(cfg) = mode
+        && (root.address().raw() & reserved_phyaddr_mask(cfg.max_phy_addr)) != 0
+    {
+        return Err(HardwareFaultClass::Reserved);
+    }
+
+    let mut retries = 0usize;
+    'walk: loop {
+        let mut table = root.address().raw();
+        let mut executable = true;
+        let mut ancestors_writable = true;
+        let mut effective_user = true;
+        let mut walked_slots = [(0u64, 0u64); 4];
+
+        for level in 0..4 {
+            let slot_pa = table + ((va.raw() >> (39 - level * 9)) & 511) * 8;
+            let mut entry = words
+                .load(slot_pa)
+                .map_err(HardwareFaultClass::DescriptorLoad)?;
+            walked_slots[level] = (slot_pa, entry);
+
+            match mode {
+                WalkMode::Ring => {
+                    validate_entry(entry, level).map_err(|_| HardwareFaultClass::Reserved)?;
+                    if entry & PRESENT == 0 {
+                        return Err(HardwareFaultClass::NotPresent);
+                    }
+                    executable &= entry & NX == 0;
+                    effective_user &= entry & USER != 0;
+                    if user && entry & USER == 0 {
+                        return Err(HardwareFaultClass::Protection);
+                    }
+                    if access == Access::Execute && entry & NX != 0 {
+                        return Err(HardwareFaultClass::Nx);
+                    }
+                    if access == Access::Write && entry & WRITE == 0 {
+                        return Err(if entry & COW != 0 {
+                            HardwareFaultClass::CowWrite
+                        } else {
+                            HardwareFaultClass::Protection
+                        });
+                    }
+                }
+                WalkMode::Hardware(cfg) => {
+                    if entry & PRESENT == 0 {
+                        return Err(HardwareFaultClass::NotPresent);
+                    }
+                    if has_hardware_reserved_bits_when_present(
+                        entry,
+                        level,
+                        cfg.max_phy_addr,
+                        cfg.nxe,
+                    ) {
+                        return Err(HardwareFaultClass::Reserved);
+                    }
+                    executable &= entry & NX == 0;
+                    effective_user &= entry & USER != 0;
+                }
+            }
+
+            if level == 3 || entry & HUGE != 0 {
+                let effective_writable = ancestors_writable && (entry & WRITE != 0);
+                if let WalkMode::Hardware(cfg) = mode {
+                    if user {
+                        if !effective_user {
+                            return Err(HardwareFaultClass::Protection);
+                        }
+                        if access == Access::Execute && !executable {
+                            return Err(HardwareFaultClass::Nx);
+                        }
+                        if access == Access::Write && !effective_writable {
+                            return Err(if ancestors_writable && (entry & COW != 0) {
+                                HardwareFaultClass::CowWrite
+                            } else {
+                                HardwareFaultClass::Protection
+                            });
+                        }
+                    } else if access == Access::Execute {
+                        if cfg.cr4_smep && effective_user {
+                            return Err(HardwareFaultClass::Smep);
+                        }
+                        if !executable {
+                            return Err(HardwareFaultClass::Nx);
+                        }
+                    } else {
+                        if cfg.cr4_smap && !cfg.rflags_ac && effective_user {
+                            return Err(HardwareFaultClass::Smap);
+                        }
+                        if access == Access::Write && cfg.cr0_wp && !effective_writable {
+                            return Err(if ancestors_writable && (entry & COW != 0) {
+                                HardwareFaultClass::CowWrite
+                            } else {
+                                HardwareFaultClass::Protection
+                            });
+                        }
+                    }
+
+                    if cfg.update_ad {
+                        const MATERIAL_AD_MASK: u64 = PRESENT | WRITE | USER | HUGE | ADDRESS | NX;
+                        walked_slots[level] = (slot_pa, entry);
+                        for (i, &(pa, mut cur)) in walked_slots[..=level].iter().enumerate() {
+                            let needed = ACCESSED
+                                | if i == level && access == Access::Write {
+                                    DIRTY
+                                } else {
+                                    0
+                                };
+                            while cur & needed != needed {
+                                if words
+                                    .compare_exchange(pa, cur, cur | needed)
+                                    .map_err(HardwareFaultClass::DescriptorLoad)?
+                                {
+                                    cur |= needed;
+                                    break;
+                                }
+                                let next =
+                                    words.load(pa).map_err(HardwareFaultClass::DescriptorLoad)?;
+                                if (next & MATERIAL_AD_MASK) != (cur & MATERIAL_AD_MASK) {
+                                    if retries >= MAX_AD_CAS_RETRIES {
+                                        return Err(HardwareFaultClass::AdCasRetryExhausted {
+                                            retries,
+                                        });
+                                    }
+                                    retries += 1;
+                                    continue 'walk;
+                                }
+                                if next == cur {
+                                    if retries >= MAX_AD_CAS_RETRIES {
+                                        return Err(HardwareFaultClass::AdCasRetryExhausted {
+                                            retries,
+                                        });
+                                    }
+                                    retries += 1;
+                                }
+                                cur = next;
+                            }
+                            if i == level {
+                                entry = cur;
+                            }
+                        }
+                    }
+                }
+
+                return Ok(TranslatedLeaf {
+                    output: FrameGpa::new(
+                        leaf_output(entry, level) + (va.raw() & (level_bytes(level) - 1)),
+                    ),
+                    executable,
+                    ancestors_writable,
+                    effective_user,
+                    effective_writable,
+                    descriptor: entry,
+                    size: level_bytes(level),
+                });
+            }
+
+            ancestors_writable &= entry & WRITE != 0;
+            table = entry & ADDRESS;
+        }
+        return Err(HardwareFaultClass::Reserved);
+    }
+}
+
 pub fn translate_leaf<W: LiveDescriptorWords + ?Sized>(
     words: &W,
     root: RootGpa,
@@ -993,49 +1329,26 @@ pub fn translate_leaf<W: LiveDescriptorWords + ?Sized>(
     access: Access,
     user: bool,
 ) -> Result<TranslatedLeaf, FaultClass> {
-    if !canonical(va.raw()) {
-        return Err(FaultClass::Reserved);
-    }
-    let mut table = root.address().raw();
-    let mut executable = true;
-    let mut ancestors_writable = true;
-    for level in 0..4 {
-        let entry = words
-            .load(table + ((va.raw() >> (39 - level * 9)) & 511) * 8)
-            .map_err(|_| FaultClass::Reserved)?;
-        validate_entry(entry, level).map_err(|_| FaultClass::Reserved)?;
-        if entry & PRESENT == 0 {
-            return Err(FaultClass::NotPresent);
-        }
-        executable &= entry & NX == 0;
-        if user && entry & USER == 0 {
-            return Err(FaultClass::Protection);
-        }
-        if access == Access::Execute && entry & NX != 0 {
-            return Err(FaultClass::Nx);
-        }
-        if access == Access::Write && entry & WRITE == 0 {
-            return Err(if entry & COW != 0 {
-                FaultClass::CowWrite
-            } else {
-                FaultClass::Protection
-            });
-        }
-        if level == 3 || entry & HUGE != 0 {
-            return Ok(TranslatedLeaf {
-                output: FrameGpa::new(
-                    leaf_output(entry, level) + (va.raw() & (level_bytes(level) - 1)),
-                ),
-                executable,
-                ancestors_writable,
-                descriptor: entry,
-                size: level_bytes(level),
-            });
-        }
-        ancestors_writable &= entry & WRITE != 0;
-        table = entry & ADDRESS;
-    }
-    Err(FaultClass::Reserved)
+    walk_leaf_inner(words, root, va, access, user, WalkMode::Ring)
+        .map_err(HardwareFaultClass::to_fault_class)
+}
+
+/// Hardware-mode 4-level page-table walk sharing the single walk loop of [`translate_leaf`].
+///
+/// Loads each walked descriptor word once per attempt, enforces hardware reserved-bit and
+/// non-leaf/leaf ignored-bit rules (`MAXPHYADDR`, `EFER.NXE`), evaluates `CR0.WP`, `CR4.SMEP`,
+/// and `CR4.SMAP` (with `RFLAGS.AC`), and atomically sets `ACCESSED` on every walked level and
+/// `DIRTY` on leaf writes via `compare_exchange` (restarting the walk if a concurrent PTE update
+/// causes the CAS to fail).
+pub fn translate_leaf_hardware<W: LiveDescriptorWords + ?Sized>(
+    words: &W,
+    root: RootGpa,
+    va: UserVa,
+    access: Access,
+    user: bool,
+    config: &HardwareWalkConfig,
+) -> Result<TranslatedLeaf, HardwareFaultClass> {
+    walk_leaf_inner(words, root, va, access, user, WalkMode::Hardware(config))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

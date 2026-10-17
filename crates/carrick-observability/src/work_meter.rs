@@ -136,10 +136,12 @@ pub enum WorkMetric {
     ChildExitNotificationWakeDeliveries,
     /// Exact retained pool cells acquired by lifecycle state transitions.
     LifecycleEntryVisits,
+    /// Stage-1 paging descriptor words loaded on an uncontended software TLB miss.
+    DescriptorLoadsPerMiss,
 }
 
 impl WorkMetric {
-    pub const COUNT: usize = 54;
+    pub const COUNT: usize = 55;
     pub const ALL: [WorkMetric; Self::COUNT] = [
         Self::KernelDispatches,
         Self::KernelRedispatches,
@@ -195,6 +197,7 @@ impl WorkMetric {
         Self::ChildExitNotificationWakeAttempts,
         Self::ChildExitNotificationWakeDeliveries,
         Self::LifecycleEntryVisits,
+        Self::DescriptorLoadsPerMiss,
     ];
 }
 
