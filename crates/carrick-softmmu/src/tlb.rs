@@ -16,7 +16,7 @@
 //!   path and bump the page's code generation before writing.
 //! - Page-crossing accesses (`va.crosses_page(len)`) never hit [`SoftTlb`].
 
-use core::mem::{offset_of, size_of};
+use core::mem::size_of;
 
 use crate::domains::{
     Access, Cpl, CpuAccessMode, GuestVa, PAGE_BASE_MASK_4K, PAGE_SHIFT_4K, PAGE_SIZE_4K,
@@ -60,11 +60,11 @@ impl SoftTlbEntry {
     /// Byte size of one [`SoftTlbEntry`] (`16`).
     pub const SIZE: usize = size_of::<Self>();
 
-    /// Byte offset of `tag` within [`SoftTlbEntry`] (`0`).
-    pub const TAG_OFFSET: usize = offset_of!(Self, tag);
+    /// Byte offset of `tag` within `#[repr(C)]` [`SoftTlbEntry`] (`0`).
+    pub const TAG_OFFSET: usize = 0;
 
-    /// Byte offset of `addend` within [`SoftTlbEntry`] (`8`).
-    pub const ADDEND_OFFSET: usize = offset_of!(Self, addend);
+    /// Byte offset of `addend` within `#[repr(C)]` [`SoftTlbEntry`] (`8`).
+    pub const ADDEND_OFFSET: usize = size_of::<u64>();
 
     /// An invalidated [`SoftTlbEntry`].
     pub const INVALID: Self = Self {
@@ -184,14 +184,14 @@ const _: () = {
 };
 
 impl SoftTlb {
-    /// Byte offset of the `read` plane within [`SoftTlb`] (`0`).
-    pub const READ_PLANE_OFFSET: usize = offset_of!(Self, read);
+    /// Byte offset of the `read` plane within `#[repr(C)]` [`SoftTlb`] (`0`).
+    pub const READ_PLANE_OFFSET: usize = 0;
 
-    /// Byte offset of the `write` plane within [`SoftTlb`] (`16384`).
-    pub const WRITE_PLANE_OFFSET: usize = offset_of!(Self, write);
+    /// Byte offset of the `write` plane within `#[repr(C)]` [`SoftTlb`] (`16384`).
+    pub const WRITE_PLANE_OFFSET: usize = SoftTlbPlane::BYTE_SIZE;
 
-    /// Byte offset of the `exec` plane within [`SoftTlb`] (`32768`).
-    pub const EXEC_PLANE_OFFSET: usize = offset_of!(Self, exec);
+    /// Byte offset of the `exec` plane within `#[repr(C)]` [`SoftTlb`] (`32768`).
+    pub const EXEC_PLANE_OFFSET: usize = 2 * SoftTlbPlane::BYTE_SIZE;
 
     /// Construct an empty [`SoftTlb`] with all entries marked [`TLB_TAG_INVALID`].
     #[inline]
