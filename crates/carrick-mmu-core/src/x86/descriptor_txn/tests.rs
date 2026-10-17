@@ -495,6 +495,54 @@ fn cow_classifier_names_only_the_faulting_armed_user_page() {
         Err(CowClass::Unmapped)
     );
 }
+
+#[test]
+fn cow_classifiers_agree_on_non_writable_ancestor_refusal() {
+    use crate::owner_mmu::{OwnerMmu, OwnerMmuRefusal};
+    use crate::x86::owner_mmu::X86Mmu;
+
+    for ancestor_pa in [0x1000, 0x2000, 0x3000] {
+        let words = Words::new();
+        assert!(matches!(
+            apply(
+                &words,
+                map(0x4000, 0x8000, PAGE, LeafSize::Page),
+                &[root(0x2000), root(0x3000), root(0x4000)]
+            ),
+            DescriptorOutcome::Applied { .. }
+        ));
+        assert!(matches!(
+            apply(
+                &words,
+                DescriptorOp::ArmCow(PageSpan::new(0x4000, PAGE)),
+                &[]
+            ),
+            DescriptorOutcome::Applied { .. }
+        ));
+
+        // Clear WRITE on the ancestor entry so the ancestor table is non-writable.
+        let original = words.words.borrow()[&ancestor_pa];
+        words
+            .words
+            .borrow_mut()
+            .insert(ancestor_pa, original & !WRITE);
+
+        // X86Mmu::classify_cow already refuses because !leaf.ancestors_writable.
+        assert_eq!(
+            X86Mmu::classify_cow(&words, root(0x1000), UserVa::new(0x4008), false),
+            Err(OwnerMmuRefusal::Protection),
+            "X86Mmu::classify_cow must refuse non-writable ancestor at pa {ancestor_pa:#x}"
+        );
+
+        // classify_guest_cow_write must also refuse when an ancestor is non-writable.
+        assert_eq!(
+            classify_guest_cow_write(&words, root(0x1000), UserVa::new(0x4008), false),
+            Err(CowClass::NoWriteIntent),
+            "classify_guest_cow_write must refuse non-writable ancestor at pa {ancestor_pa:#x}"
+        );
+    }
+}
+
 #[test]
 fn lower_half_supervisor_and_upper_half_user_leaves_are_refused_before_stores() {
     for (va, user) in [(0x4000, false), (0xffff_8000_0000_4000, true)] {

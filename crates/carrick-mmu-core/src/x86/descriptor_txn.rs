@@ -1057,6 +1057,14 @@ pub struct CowRun {
     pub executable: bool,
 }
 
+impl CowRun {
+    #[inline]
+    #[must_use]
+    pub const fn user_va(&self) -> UserVa {
+        UserVa::new(self.va)
+    }
+}
+
 /// Classify one CPL3 COW write through the live PML4. The exact-MM editor
 /// remains held by the caller through the eventual copy and repoint.
 pub fn classify_guest_cow_write<W: LiveDescriptorWords + ?Sized>(
@@ -1072,6 +1080,9 @@ pub fn classify_guest_cow_write<W: LiveDescriptorWords + ?Sized>(
         })?;
     if leaf.size != PAGE {
         return Err(CowClass::Unmapped);
+    }
+    if !leaf.ancestors_writable {
+        return Err(CowClass::NoWriteIntent);
     }
     if leaf.descriptor & WRITE != 0 {
         return Err(CowClass::AlreadyWritable);
