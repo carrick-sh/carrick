@@ -287,15 +287,8 @@ impl Service {
             }
         };
         let abort_published = |child: &mut UnpublishedEl1Child<X86Mmu>, err: NativeProcessError| {
-            let abort_result = child.abort(owner, live, self.worker());
-            owner.spaces.free(index);
-            if abort_result.is_err()
-                || !carrick_el1::personality::fork_loan::scrub_tables(live, &loan)
-                || !abort_loan(&loan)
-            {
-                return NativeProcessError::Quarantined;
-            }
-            err
+            abort_child(owner, self.worker(), child, live, &loan)
+                .map_or(NativeProcessError::Quarantined, |()| err)
         };
         let Some(mut reserve) = ForkStockSettlement::reserve(
             loan,
@@ -358,16 +351,39 @@ fn abandon_loan(
     scrub: Option<&InitialWords>,
     error: NativeProcessError,
 ) -> NativeProcessError {
+    return_loan(loan, scrub).err().unwrap_or(error)
+}
+
+fn return_loan(
+    loan: &ForkStockLoan,
+    scrub: Option<&InitialWords>,
+) -> Result<(), NativeProcessError> {
     if let Some(words) = scrub
         && !carrick_el1::personality::fork_loan::scrub_tables(words, loan)
     {
-        return NativeProcessError::Quarantined;
+        return Err(NativeProcessError::Quarantined);
     }
     if abort_loan(loan) {
-        error
+        Ok(())
     } else {
-        NativeProcessError::Quarantined
+        Err(NativeProcessError::Quarantined)
     }
+}
+
+fn abort_child(
+    owner: &Portal,
+    worker: u32,
+    child: &mut UnpublishedEl1Child<X86Mmu>,
+    words: &InitialWords,
+    loan: &ForkStockLoan,
+) -> Result<(), NativeProcessError> {
+    child.abort(owner, words, worker).map_err(error)?;
+    let index = owner
+        .spaces
+        .find(child.completion().child.mm().raw())
+        .ok_or(NativeProcessError::Stale)?;
+    owner.spaces.free(index);
+    return_loan(loan, Some(words))
 }
 
 impl NativeProcessService<'static, ParkedContextWords> for Service {
@@ -549,22 +565,8 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
         }
     }
     fn abort_mm(&mut self, mut p: Prepared) -> Result<(), (NativeProcessError, Prepared)> {
-        let result = portal().and_then(|owner| {
-            p.child
-                .abort(&owner, &p.words, self.worker())
-                .map_err(error)
-        });
-        if let Ok(owner) = portal()
-            && let Some(index) = owner.spaces.find(p.child.completion().child.mm().raw())
-        {
-            owner.spaces.free(index);
-        }
-        if !carrick_el1::personality::fork_loan::scrub_tables(&p.words, &p.loan) {
-            return Err((NativeProcessError::Quarantined, p));
-        }
-        if !abort_loan(&p.loan) {
-            return Err((NativeProcessError::Quarantined, p));
-        }
+        let result = portal()
+            .and_then(|owner| abort_child(&owner, self.worker(), &mut p.child, &p.words, &p.loan));
         match result {
             Ok(()) => Ok(()),
             Err(e) => Err((e, p)),
