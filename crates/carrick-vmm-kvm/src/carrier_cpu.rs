@@ -661,7 +661,7 @@ impl<I: CarrierCpuIo> KvmCarrierCpu<I> {
                     }
                 }
             }
-            CarrierRunExit::SyscallTrap | CarrierRunExit::Kick => {
+            CarrierRunExit::SyscallTrap => {
                 if let Some(root_gpa) = RootGpa::page_aligned(FrameGpa::new(image.cr3 & !0xfff))
                     && root_gpa != binding.context().root
                 {

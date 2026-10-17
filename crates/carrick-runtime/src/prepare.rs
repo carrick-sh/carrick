@@ -301,7 +301,16 @@ fn run_prepared_kvm_pool_with_debug(
     let shutdown = pool.shutdown();
     let outcome = completion
         .map_err(|error| RuntimeError::Configuration(format!("KVM executor completion: {error}")))?
-        .map_err(RuntimeError::Configuration)?;
+        .map_err(|error| {
+            // A failed run never reaches the execution witness below, so its
+            // forward refusals ride on the failure itself.
+            match stats.snapshot() {
+                Ok((_, refusals)) if !refusals.is_empty() => {
+                    RuntimeError::Configuration(format!("{error}; forward refusals {refusals:?}"))
+                }
+                _ => RuntimeError::Configuration(error),
+            }
+        })?;
     shutdown.map_err(|error| RuntimeError::Configuration(error.to_string()))?;
     let (guest_entries, portal_exits) = physical.initial_execution_witness()?;
     let physical_crossing_families: Vec<_> = physical
