@@ -1324,3 +1324,83 @@ fn unable_to_restore_a_published_word_is_indeterminate() {
         DescriptorOutcome::Indeterminate(DescriptorRefusal::Contended)
     );
 }
+
+#[test]
+fn hardware_walk_ignores_nonleaf_bits_8_to_11_and_leaf_bits_52_to_62_and_sets_ad() {
+    let (words, va, output, path) = raw_translation(LeafSize::Page);
+    let mut map = words.words.borrow_mut();
+    for (pa, bit) in [
+        (path[0], PREPARED),
+        (path[1], COW),
+        (path[2], MAY_WRITE),
+        (path[3], 1u64 << 55),
+    ] {
+        let prev = map[&pa];
+        map.insert(pa, prev | bit);
+    }
+    drop(map);
+
+    let u_va = UserVa::new(va + 8);
+    assert_eq!(
+        translate_leaf(&words, root(0x1000), u_va, Access::Read, true),
+        Err(FaultClass::Reserved)
+    );
+
+    words.reads.set(0);
+    let cfg = HardwareWalkConfig::new();
+    let r = translate_leaf_hardware(&words, root(0x1000), u_va, Access::Read, true, &cfg).unwrap();
+    assert_eq!(
+        (words.reads.get(), r.output),
+        (4, FrameGpa::new(output + 8))
+    );
+    assert!(r.effective_user && r.effective_writable);
+    assert_eq!(
+        r.descriptor & ((1u64 << 55) | ACCESSED | DIRTY),
+        (1u64 << 55) | ACCESSED
+    );
+    for &pa in &path {
+        assert_ne!(words.words.borrow()[&pa] & ACCESSED, 0);
+    }
+    assert_eq!(words.words.borrow()[&path[3]] & DIRTY, 0);
+
+    words.reads.set(0);
+    words.stores.set(0);
+    let w = translate_leaf_hardware(&words, root(0x1000), u_va, Access::Write, true, &cfg).unwrap();
+    assert_eq!((words.reads.get(), words.stores.get()), (4, 1));
+    assert_eq!(w.descriptor & (ACCESSED | DIRTY), ACCESSED | DIRTY);
+    assert_ne!(words.words.borrow()[&path[3]] & DIRTY, 0);
+}
+
+#[test]
+fn hardware_walk_enforces_cr0_wp_cr4_smep_cr4_smap_and_nxe() {
+    let (words, va, output, path) = raw_translation(LeafSize::Page);
+    let leaf_pa = path[3];
+    let base_leaf = words.words.borrow()[&leaf_pa];
+    words.words.borrow_mut().insert(leaf_pa, base_leaf & !WRITE);
+    let hw = |acc, c: &HardwareWalkConfig| {
+        translate_leaf_hardware(&words, root(0x1000), UserVa::new(va), acc, false, c)
+    };
+
+    let mut cfg = HardwareWalkConfig::new();
+    cfg.cr4_smap = false;
+    assert_eq!(hw(Access::Write, &cfg), Err(HardwareFaultClass::Protection));
+    cfg.cr0_wp = false;
+    let wp0_leaf = hw(Access::Write, &cfg).unwrap();
+    assert_eq!(
+        (wp0_leaf.output, wp0_leaf.effective_writable),
+        (FrameGpa::new(output), false)
+    );
+    assert_ne!(words.words.borrow()[&leaf_pa] & (ACCESSED | DIRTY), 0);
+
+    cfg.cr0_wp = true;
+    cfg.cr4_smep = true;
+    assert_eq!(hw(Access::Execute, &cfg), Err(HardwareFaultClass::Smep));
+    cfg.cr4_smep = false;
+    assert!(hw(Access::Execute, &cfg).is_ok());
+
+    cfg.cr4_smap = true;
+    cfg.rflags_ac = false;
+    assert_eq!(hw(Access::Read, &cfg), Err(HardwareFaultClass::Smap));
+    cfg.cr4_smap = false;
+    assert!(hw(Access::Read, &cfg).is_ok());
+}

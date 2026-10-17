@@ -1,0 +1,59 @@
+schema_version = 1
+id = "softmmu.x86.tlb-walker"
+title = "Software vCPU linear guest-physical placement, per-CPU SoftTlb, and stage-1 x86-64 walker binding"
+guest_surfaces = ["vmm:soft", "mm:softmmu", "mm:x86-stage1-walker", "tlb:soft-tlb"]
+semantic_authority = [
+  "Intel SDM Vol. 3 §4.5–§4.8 (4-Level Paging): non-canonical linear addresses raise #GP(0) or #SS(0) (never #PF); non-present entries ignore bits 63:1 (P=0, RSVD=0); present entries reserve bits [51:MAXPHYADDR], ignore bits 11:8 on non-leaf and leaf entries and bits 58:52 (and 62:59 when PKE=0) on all entries, reserve bit 63 (XD/NX) only when EFER.NXE=0, reserve PML4E.PS and unaligned huge-page physical bits, enforce USER, WRITE with CR0.WP, NX with EFER.NXE, CR4.SMAP (with RFLAGS.AC) and CR4.SMEP, set I/D in #PF error codes only when NXE=1 or SMEP=1, and atomically set ACCESSED on walked levels and DIRTY on leaf writes",
+  "Intel SDM Vol. 3 §4.10.4 (Invalidation of TLBs and Paging-Structure Caches): INVLPG invalidates TLB entries for the target 4 KiB page and all sibling entries filled from a 2 MiB or 1 GiB leaf covering that address; MOV to CR3 flushes all non-global TLB entries",
+  "Carrick #578 / #580: LinearPlacement::host is the sole GPA-to-host pointer conversion, restricted by type to ExtentTable-issued AuthenticatedGpa and excluding MMIO holes (0xfee0_0000..0xfee0_1000)",
+]
+fixture = "carrick-softmmu::tests::softmmu_contract"
+scale_points = [1, 16, 256]
+rationale = """
+`LinearPlacement::host` is the only place in the workspace that converts an
+extent-authenticated guest-physical address (`AuthenticatedGpa`, via the sealed
+`PlacementGpa` trait) into a `HostVa` (`host = gpa + K`). Unauthenticated
+`Stage1Gpa`, `FrameGpa`, `RootGpa`, `GuestVa`, and `UserVa` do not implement
+`PlacementGpa` and are rejected at compile time; calling `FrameGpa::new` in
+`carrick-softmmu/src/` or constructing `HostVa` outside `LinearPlacement::host`
+is rejected by `.semgrep/typed-domains.yml`. `MmioHoles` excludes MMIO ranges
+(default xAPIC `0xfee0_0000..0xfee0_1000`) from placement and `SoftTlb` fills so
+MMIO accesses return a non-fault `Mmio` outcome rather than `#PF`.
+
+`SoftTlb` holds three 1024-entry direct-mapped planes (`read`, `write`, `exec`)
+with 16-byte `SoftTlbEntry { tag, addend }` records and per-slot leaf shifts so
+`SoftTlb::evict_va` (`invlpg`) invalidates all sibling slots of a 2 MiB or 1 GiB
+leaf; `SoftTlb::fill_plane*` are `pub(crate)` so only `SoftWalker` can populate
+TLB entries, and `Execute` walks fill only `exec` (never `read`, preserving
+`CR4.SMAP` on subsequent supervisor data reads). `SoftWalker` requires a
+registered `RootGpa -> OwnerGeneration` binding (`expected_generation` returns
+`None` for unregistered roots; `set_root_generation` refuses overwriting a live
+root without a flush), drops `LiveDescriptorWords` from `SoftMmuMemory`, and
+uses the crate-owned `AuthenticatedDescriptorWords` adapter to perform atomic
+`AtomicU64` accesses directly at `LinearPlacement::host(table_frame) + (pa &
+0xfff)`. `SoftWalker` binds
+`carrick_mmu_core::x86::descriptor_txn::translate_leaf_hardware` in a single
+4-level walk (one load per walked level, `fetch_or` same-word CAS retries when
+`PRESENT`, output address, and permission bits are unchanged, walk restart only
+on a material descriptor change, and typed `AdCasRetryExhausted` counted in
+`SoftWalkerStats` if the livelock cap is reached), authenticates `[leaf_base,
+leaf_base + leaf.size)` to mint `AuthenticatedGpa`, requires TLB shootdowns on
+`ExtentTable` retirement/replacement, and invalidates write-plane entries across
+CPUs when an authenticated frame becomes a code page.
+"""
+
+[bindings]
+vm_free = "carrick-softmmu::softmmu_contract::linear_placement_enforces_alignment_bounds_and_mmio_holes; huge_page_authentication_2m_and_1g_at_zero_page_and_tail_offsets; invlpg_on_large_page_evicts_all_sibling_slots; red_first_non_present_precedence_ignored_nonleaf_bits_and_reserved_bits; cr_gating_smep_smap_wp_and_id_error_code_bit; fault_classes_non_canonical_gp_ss_mmio_non_fault_and_descriptor_load; hardware_accessed_and_dirty_bits_updated_via_cas; frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal; permission_classes_not_present_write_cow_nx_and_upper_half_va; page_crossing_access_misses_tlb_and_validates_both_pages; concurrent_pte_writer_snapshot_consistency_and_structural_budgets; two_thread_invlpg_eviction_and_cr3_root_switch_flush_match_hardware"
+
+[bindings.unresolved]
+embed_structural = "Software vCPU carrier integration (`carrick-vmm-soft`) lands in slices 2-3 of #578; slice 1a (#580) is the standalone `no_std` MMU/TLB crate."
+signed = "Linux worker cannot run signed HVF tests; `carrick-softmmu` is the hypervisor-free x86-64 software MMU substrate."
+docker = "Architectural x86-64 paging and TLB contract uses Intel SDM Vol. 3 §§4.5–4.8, 4.10.4 authority; full ELF workload parity against Docker lands in slices 3-4 of #578."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "descriptor_loads_per_miss"
+base = 4
+per_unit = 0
+layers = ["vm-free"]
+rationale = "On an uncontended soft-TLB miss, translate_leaf_hardware loads each walked paging level exactly once through the descriptor storage (2 loads for a 1 GiB leaf, 3 loads for a 2 MiB leaf, 4 loads for a 4 KiB leaf), independent of the number of unrelated page-table branches or registered physical extents n (1, 16, 256)."

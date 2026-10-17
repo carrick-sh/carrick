@@ -1,0 +1,21 @@
+[package]
+name = "carrick-softmmu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Platform-neutral linear guest-physical placement, software TLB and stage-1 walker binding for Carrick's software vCPU."
+
+[lib]
+name = "carrick_softmmu"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+carrick-core-abi = { path = "../carrick-core-abi" }
+carrick-guest-arch = { path = "../carrick-guest-arch" }
+carrick-mmu-core = { path = "../carrick-mmu-core" }
+
+[dev-dependencies]
+carrick-conformance-contract = { path = "../carrick-conformance-contract" }

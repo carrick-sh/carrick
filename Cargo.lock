@@ -989,6 +989,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-softmmu"
+version = "0.1.0"
+dependencies = [
+ "carrick-conformance-contract",
+ "carrick-core-abi",
+ "carrick-guest-arch",
+ "carrick-mmu-core",
+]
+
+[[package]]
 name = "carrick-spec"
 version = "0.1.0"
 dependencies = [
