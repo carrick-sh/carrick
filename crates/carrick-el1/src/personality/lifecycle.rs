@@ -104,6 +104,17 @@ impl<
     Context: super::dispatch::DispatchContext,
 > LifecycleNative<'a> for El1PendingFamilies<'a, F, C, U, G, Context>
 {
+    fn guest_isa(&self) -> carrick_guest_arch::GuestIsa {
+        match self.frame.crossing_set() {
+            carrick_personality_linux::crossing::HostCrossingSet::Aarch64 => {
+                carrick_guest_arch::GuestIsa::Aarch64
+            }
+            carrick_personality_linux::crossing::HostCrossingSet::X86 => {
+                carrick_guest_arch::GuestIsa::X86_64
+            }
+        }
+    }
+
     fn fail_lifecycle(&mut self, reason: carrick_core_abi::NativeRunFailureReason) -> ! {
         let binding = LifecycleNative::binding(self).unwrap_or_else(|| {
             super::dispatch::invalid_completion(super::dispatch::NativeInvariant::EntryBinding)
@@ -621,9 +632,6 @@ impl<
     fn process_signals(
         &mut self,
     ) -> Option<&mut dyn carrick_personality_linux::signal::ProcessSignals> {
-        if self.frame.arm_scheduler() {
-            return None;
-        }
         self.process.as_deref_mut().and_then(|p| p.signal_venue())
     }
 

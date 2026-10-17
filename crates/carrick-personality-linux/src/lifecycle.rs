@@ -325,6 +325,7 @@ pub trait LifecycleNative<'a>: UserCopy {
     }
 
     fn arguments(&self) -> [u64; 6];
+    fn guest_isa(&self) -> carrick_guest_arch::GuestIsa;
     fn binding(&self) -> Option<ExecutionBinding>;
     fn task_state(&self) -> Option<&'a crate::abi::entry::LinuxTaskState>;
     fn process_pid(&self) -> Option<u32> {
@@ -450,7 +451,6 @@ const UNBLOCKABLE: u64 = 0x0004_0100;
 // sigaltstack(2).
 const SS_ONSTACK: u32 = 1;
 const SS_DISABLE: u32 = 2;
-const MINSIGSTKSZ: u64 = 2048;
 /// `sizeof(stack_t)` on arm64: `ss_sp`, `ss_flags` (+4 pad), `ss_size`.
 const STACK_T_SIZE: usize = 24;
 
@@ -561,14 +561,17 @@ pub fn invoke<'a>(
                 false,
             ))
         }
-        LifecycleCall::SigProcMask => {
-            let work = serve_sigprocmask(args, thread, native)?;
-            Some(returned(SyscallResult::new(0), work))
-        }
+        LifecycleCall::SigProcMask => Some(match serve_sigprocmask(args, thread, native)? {
+            Ok(work) => returned(SyscallResult::new(0), work),
+            Err((errno, work)) => returned(SyscallResult::new(errno.guest_retval()), work),
+        }),
         LifecycleCall::SigAltStack => {
             let sp = native.user_sp().map(UserVa::raw);
-            serve_sigaltstack(args, thread, native, sp)?;
-            Some(returned(SyscallResult::new(0), false))
+            let isa = native.guest_isa();
+            Some(match serve_sigaltstack(args, thread, native, sp, isa)? {
+                Ok(()) => returned(SyscallResult::new(0), false),
+                Err(errno) => returned(SyscallResult::new(errno.guest_retval()), false),
+            })
         }
         LifecycleCall::Clone => {
             let visible = serve_clone(args, thread, native)?;
@@ -606,10 +609,6 @@ pub fn invoke<'a>(
     }
 }
 
-fn ranges_overlap(a: u64, a_len: u64, b: u64, b_len: u64) -> bool {
-    a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
-}
-
 /// `rt_sigprocmask(how, set, oldset, sigsetsize)`. `Some(work)`: served
 /// (result 0); `work` when a pending signal may now be deliverable to this
 /// thread, or must move to a sibling because this thread just blocked it.
@@ -617,90 +616,96 @@ pub fn serve_sigprocmask(
     args: [u64; 6],
     thread: LifecycleThread<'_>,
     user: &mut (impl UserCopy + ?Sized),
-) -> Option<bool> {
+) -> Option<Result<bool, (carrick_syscall_abi::LinuxErrno, bool)>> {
     let [how, set, oldset, size] = [args[0], args[1], args[2], args[3]];
-    if !setup_open(thread.page) || size != RT_SIGSET_SIZE {
+    if !setup_open(thread.page) {
         return None;
     }
-    // Linux reads the new set before it writes the old one; the host lane
-    // writes first. An aliased pair would see two answers: the host decides.
-    if set != 0 && oldset != 0 && ranges_overlap(set, RT_SIGSET_SIZE, oldset, RT_SIGSET_SIZE) {
-        return None;
+    if size != RT_SIGSET_SIZE {
+        return Some(Err((carrick_syscall_abi::LINUX_EINVAL, false)));
     }
     // The owning thread is the only writer of its mask.
     let old = thread.slot.blocked();
     let new = if set != 0 {
         let mut bytes = [0u8; 8];
         if !user.copy_in(&mut bytes, UserVa::new(set)) {
-            return None;
+            return Some(Err((carrick_syscall_abi::LINUX_EFAULT, false)));
         }
         let bits = u64::from_le_bytes(bytes);
         let mask = match how {
             SIG_BLOCK => old.0 | bits,
             SIG_UNBLOCK => old.0 & !bits,
             SIG_SETMASK => bits,
-            _ => return None,
+            _ => return Some(Err((carrick_syscall_abi::LINUX_EINVAL, false))),
         };
         Some(BlockedMask(mask & !UNBLOCKABLE))
     } else {
         None
     };
-    if oldset != 0 && !user.copy_out(UserVa::new(oldset), &old.0.to_le_bytes()) {
-        return None;
-    }
-    let Some(new) = new else {
-        return Some(false);
+    let work = if let Some(new) = new {
+        let (prev, pending) = thread
+            .slot
+            .store_blocked_then_read_pending(new, thread.slot.pending());
+        let pending = pending.0 | thread.page.pending().load().0;
+        let deliverable = pending & !new.0;
+        let newly_blocked = pending & new.0 & !prev.0;
+        deliverable | newly_blocked != 0
+    } else {
+        false
     };
-    let (prev, pending) = thread
-        .slot
-        .store_blocked_then_read_pending(new, thread.slot.pending());
-    let pending = pending.0 | thread.page.pending().load().0;
-    let deliverable = pending & !new.0;
-    let newly_blocked = pending & new.0 & !prev.0;
-    Some(deliverable | newly_blocked != 0)
+    if oldset != 0 && !user.copy_out(UserVa::new(oldset), &old.0.to_le_bytes()) {
+        return Some(Err((carrick_syscall_abi::LINUX_EFAULT, work)));
+    }
+    Some(Ok(work))
 }
 
 /// `sigaltstack(ss, old_ss)`. `sp` is the caller's stack pointer, when
-/// known. Served only when the caller is certainly not running on its
-/// alternate stack (the host decides that case: it tracks handler frames).
+/// known. An active alternate stack rejects changes before touching either
+/// userspace argument, while a query may still report `SS_ONSTACK`.
 fn serve_sigaltstack(
     args: [u64; 6],
     thread: LifecycleThread<'_>,
     user: &mut (impl UserCopy + ?Sized),
     sp: Option<u64>,
-) -> Option<()> {
+    isa: carrick_guest_arch::GuestIsa,
+) -> Option<Result<(), carrick_syscall_abi::LinuxErrno>> {
     let [ss, old_ss] = [args[0], args[1]];
     if !setup_open(thread.page) {
         return None;
     }
-    let size = STACK_T_SIZE as u64;
-    if ss != 0 && old_ss != 0 && ranges_overlap(ss, size, old_ss, size) {
-        return None;
-    }
     let current = thread.slot.read_altstack();
-    if !current.is_disabled() {
+    let on_stack = if !current.is_disabled() {
         let sp = sp?;
         let top = current.sp.checked_add(current.size)?;
-        if sp > current.sp && sp <= top {
-            return None;
-        }
+        sp > current.sp && sp <= top
+    } else {
+        false
+    };
+    if ss != 0 && on_stack {
+        return Some(Err(carrick_syscall_abi::LINUX_EPERM));
     }
     let replacement = if ss != 0 {
         let mut bytes = [0u8; STACK_T_SIZE];
         if !user.copy_in(&mut bytes, UserVa::new(ss)) {
-            return None;
+            return Some(Err(carrick_syscall_abi::LINUX_EFAULT));
         }
         let [sp, flags, size] = stack_t_words(&bytes);
         let flags = flags as u32;
-        if flags & !SS_DISABLE != 0 {
-            return None;
+        let accepted = SS_ONSTACK | SS_DISABLE | carrick_syscall_abi::LINUX_SS_AUTODISARM as u32;
+        if flags & !accepted != 0 || flags & (SS_DISABLE | SS_ONSTACK) == (SS_DISABLE | SS_ONSTACK)
+        {
+            return Some(Err(carrick_syscall_abi::LINUX_EINVAL));
         }
         if flags & SS_DISABLE != 0 {
             Some(AltStack::DISABLED)
         } else {
-            let stack = AltStack { sp, size, flags };
-            if stack.size < MINSIGSTKSZ {
-                return None;
+            let stack = AltStack {
+                sp,
+                size,
+                flags: flags & !SS_ONSTACK,
+            };
+            if stack.size < crate::signal::minimum_signal_stack_size(isa) {
+                return Some(Err(carrick_syscall_abi::LINUX_ENOMEM));
             }
             Some(stack)
         }
@@ -711,20 +716,23 @@ fn serve_sigaltstack(
         let (sp, flags, size) = if current.is_disabled() {
             (0, SS_DISABLE, 0)
         } else {
-            // Not on the alternate stack (checked above): no SS_ONSTACK.
-            (current.sp, current.flags & !SS_ONSTACK, current.size)
+            (
+                current.sp,
+                current.flags | if on_stack { SS_ONSTACK } else { 0 },
+                current.size,
+            )
         };
         if !user.copy_out(
             UserVa::new(old_ss),
             &stack_t_bytes([sp, u64::from(flags), size]),
         ) {
-            return None;
+            return Some(Err(carrick_syscall_abi::LINUX_EFAULT));
         }
     }
     if let Some(stack) = replacement {
         thread.slot.write_altstack(stack);
     }
-    Some(())
+    Some(Ok(()))
 }
 
 /// The preimage of one clone tid output (`CloneTidOutputTransaction`): the

@@ -619,13 +619,13 @@ fn serve_family<'a, C: EntryContext + 'a>(
 /// EL1 traits until orders 6-9 move their semantic bodies; they never choose
 /// another family or own completion.
 pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
-    // Preserve the existing ARM lifecycle owners and carrier frame handback.
-    // Only x86 binds the new signal family; strict ARM refusals stay intact.
+    // Native ARM signal calls share the process owner used by x86.
     match ordinal {
         132 => Family::Lifecycle(LifecycleCall::SigAltStack),
         135 => Family::Lifecycle(LifecycleCall::SigProcMask),
+        134 => Family::Signal(crate::signal::SignalCall::RtSigaction),
         139 => Family::SignalReturn,
-        129..=131 | 133 | 134 | 136..=138 | 240 => Family::Unported,
+        129..=131 | 133 | 136..=138 | 240 => Family::Unported,
         _ => route_shared(ordinal, allocator_control),
     }
 }
@@ -1285,6 +1285,10 @@ mod ring_first_tests {
     }
 
     impl<'a> crate::lifecycle::LifecycleNative<'a> for CarrierOwned<'a> {
+        fn guest_isa(&self) -> carrick_guest_arch::GuestIsa {
+            carrick_guest_arch::GuestIsa::X86_64
+        }
+
         fn fail_lifecycle(&mut self, _: carrick_core_abi::NativeRunFailureReason) -> ! {
             panic!("unused lifecycle failure")
         }

@@ -23,6 +23,7 @@ const SIG_SETMASK: u64 = 2;
 const UNBLOCKABLE: u64 = 0x0004_0100;
 
 const SS_DISABLE: u32 = 2;
+const SS_ONSTACK: u32 = 1;
 
 use crate::personality::dispatch::{Zone, dispatch_syscall_with_lifecycle};
 use crate::personality::sched::{FakeCpu, HardwareUserWord, SYS_FUTEX};
@@ -843,9 +844,62 @@ fn sigprocmask_serves_block_setmask_and_query() {
     assert_eq!(action, Action::ServedWithWork);
 }
 
+/// sigprocmask(2): an oldset EFAULT is reported after the new mask is
+/// installed. The return fault cannot roll back the caller's mask.
 #[test]
-fn sigprocmask_forwards_errors_aliases_and_closed_services() {
+fn sigprocmask_oldset_fault_keeps_new_mask() {
+    let mut w = World::new(LifecycleHatches::ON);
     let set = Box::new(SIGUSR1_BIT);
+    let old = Box::new(0x55_u64);
+    let mut frame = TrapFrame::default();
+    frame.x[..4].copy_from_slice(&[SIG_BLOCK, addr(&*set), addr(&*old), 8]);
+    frame.x[8] = SYS_RT_SIGPROCMASK as u64;
+    frame.slot = SLOT_IDX as u64;
+    let mut user = FaultingUser {
+        deny_out: std::vec![addr(&*old)],
+        ..FaultingUser::default()
+    };
+    assert_eq!(
+        serve_directly(&mut w, &mut frame, &mut user),
+        Some(Action::Served)
+    );
+    assert_eq!(frame.x[0] as i64, -14);
+    assert_eq!(*old, 0x55);
+    assert_eq!(w.venue.leader_slot().blocked(), BlockedMask(SIGUSR1_BIT));
+}
+
+/// sigprocmask(2): the oldset fault does not suppress work newly owed by
+/// unblocking an already pending signal.
+#[test]
+fn sigprocmask_oldset_fault_preserves_pending_signal_work() {
+    let mut w = World::new(LifecycleHatches::ON);
+    let slot = w.venue.leader_slot();
+    slot.init_blocked(BlockedMask(SIGUSR1_BIT));
+    let seen = slot
+        .pending()
+        .post_then_read_blocked(PendingSignals(SIGUSR1_BIT), slot);
+    assert_ne!(seen.0 & SIGUSR1_BIT, 0);
+    let set = Box::new(SIGUSR1_BIT);
+    let old = Box::new(0x55_u64);
+    let mut frame = TrapFrame::default();
+    frame.x[..4].copy_from_slice(&[SIG_UNBLOCK, addr(&*set), addr(&*old), 8]);
+    frame.x[8] = SYS_RT_SIGPROCMASK as u64;
+    frame.slot = SLOT_IDX as u64;
+    let mut user = FaultingUser {
+        deny_out: std::vec![addr(&*old)],
+        ..FaultingUser::default()
+    };
+    assert_eq!(
+        serve_directly(&mut w, &mut frame, &mut user),
+        Some(Action::ServedWithWork)
+    );
+    assert_eq!(frame.x[0] as i64, -14);
+    assert_eq!(w.venue.leader_slot().blocked(), BlockedMask(0));
+}
+
+#[test]
+fn sigprocmask_serves_errors_aliases_and_refuses_closed_services() {
+    let mut set = Box::new(SIGUSR1_BIT);
     let old = Box::new(0x55_u64);
     let cases: [(LifecycleHatches, [u64; 4], bool); 5] = [
         (
@@ -878,27 +932,55 @@ fn sigprocmask_forwards_errors_aliases_and_closed_services() {
         ),
     ];
     for (hatches, args, close) in cases {
+        *set = SIGUSR1_BIT;
         let mut w = World::new(hatches);
         if close {
             w.page().close();
         }
         let (action, frame) = w.syscall(SYS_RT_SIGPROCMASK, &args);
-        assert_eq!(action, Action::Forward, "{args:x?}");
-        assert_eq!(&frame.x[..4], &args);
-        assert_eq!(w.venue.leader_slot().blocked(), BlockedMask(0));
+        if hatches.sigmask && !close {
+            assert_eq!(action, Action::Served, "{args:x?}");
+            assert_eq!(
+                frame.x[0] as i64,
+                if args[3] != 8 || args[0] == 7 { -22 } else { 0 }
+            );
+        } else {
+            assert_eq!(action, Action::Forward, "{args:x?}");
+            assert_eq!(&frame.x[..4], &args);
+        }
+        assert_eq!(
+            w.venue.leader_slot().blocked(),
+            BlockedMask(if args[1] == args[2] && action == Action::Served {
+                SIGUSR1_BIT
+            } else {
+                0
+            })
+        );
         assert_eq!(*old, 0x55);
-        assert_eq!(*set, SIGUSR1_BIT);
+        assert_eq!(
+            *set,
+            if args[1] == args[2] && action == Action::Served {
+                0
+            } else {
+                SIGUSR1_BIT
+            }
+        );
     }
     // A set EL1 cannot read: the host answers (EFAULT or the fault-in).
     let mut w = World::new(LifecycleHatches::ON);
     let mut frame = TrapFrame::default();
     frame.x[..4].copy_from_slice(&[SIG_BLOCK, addr(&*set), addr(&*old), 8]);
     frame.x[8] = SYS_RT_SIGPROCMASK as u64;
+    frame.slot = SLOT_IDX as u64;
     let mut user = FaultingUser {
         deny_in: std::vec![addr(&*set)],
         ..FaultingUser::default()
     };
-    assert_eq!(serve_directly(&mut w, &mut frame, &mut user), None);
+    assert_eq!(
+        serve_directly(&mut w, &mut frame, &mut user),
+        Some(Action::Served)
+    );
+    assert_eq!(frame.x[0] as i64, -14);
     assert_eq!(*old, 0x55);
 }
 
@@ -958,6 +1040,7 @@ fn run_sigprocmask_dekker_storm(process: bool) {
                     thread,
                     &mut FaultingUser::default(),
                 )
+                .unwrap()
                 .unwrap(),
             );
             end.wait();
@@ -1010,26 +1093,185 @@ fn sigaltstack_serves_off_the_alternate_stack() {
     let (action, _) = w.syscall(SYS_SIGALTSTACK, &[0, addr(&*old)]);
     assert_eq!(action, Action::Served);
     assert_eq!(*old, stack_t(0x10_0000, 0, 0x4000));
-    // Running on it (a handler): the host decides SS_ONSTACK and EPERM.
+    // Running on it (a handler): the retained slot reports SS_ONSTACK and
+    // refuses replacement with EPERM.
     w.cpu.regs.sp_el0 = 0x10_2000;
     let (action, _) = w.syscall(SYS_SIGALTSTACK, &[0, addr(&*old)]);
-    assert_eq!(action, Action::Forward);
-    w.cpu.regs.sp_el0 = 0x2222_0000;
-    // Errors and aliases stay on the host.
-    for bad in [stack_t(0x20_0000, 0, 1024), stack_t(0x20_0000, 1, 0x4000)] {
-        let bad = Box::new(bad);
-        let (action, _) = w.syscall(SYS_SIGALTSTACK, &[addr(&*bad), 0]);
-        assert_eq!(action, Action::Forward);
+    assert_eq!(action, Action::Served);
+    assert_eq!(*old, stack_t(0x10_0000, 1, 0x4000));
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*new), 0]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(frame.x[0] as i64, -1);
+    for change in [
+        stack_t(0x20_0000, 0, 0x4000),
+        stack_t(0x20_0000, 1, 1024),
+        stack_t(0x20_0000, 0, 1024),
+        stack_t(0, SS_DISABLE, 0),
+    ] {
+        let change = Box::new(change);
+        let bad_old = Box::new([0x55; 24]);
+        let mut frame = TrapFrame::default();
+        frame.x[..2].copy_from_slice(&[addr(&*change), addr(&*bad_old)]);
+        frame.x[8] = SYS_SIGALTSTACK as u64;
+        frame.slot = SLOT_IDX as u64;
+        let mut user = FaultingUser {
+            deny_out: std::vec![addr(&*bad_old)],
+            ..FaultingUser::default()
+        };
+        assert_eq!(
+            serve_directly(&mut w, &mut frame, &mut user),
+            Some(Action::Served)
+        );
+        assert_eq!(
+            frame.x[0] as i64, -1,
+            "active stack change precedes flags, size and output fault"
+        );
+        assert_eq!(*bad_old, [0x55; 24]);
     }
-    let (action, _) = w.syscall(SYS_SIGALTSTACK, &[addr(&*new), addr(&*new)]);
-    assert_eq!(action, Action::Forward);
+    w.cpu.regs.sp_el0 = 0x2222_0000;
+    // Linux error numbers stay in ring.
+    for (bad, errno) in [
+        (stack_t(0x20_0000, 0, 1024), -12),
+        (stack_t(0x20_0000, 4, 0x4000), -22),
+        (stack_t(0x20_0000, 4, 1024), -22),
+    ] {
+        let bad = Box::new(bad);
+        let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*bad), 0]);
+        assert_eq!(action, Action::Served);
+        assert_eq!(frame.x[0] as i64, errno);
+    }
+    let invalid = Box::new(stack_t(0x20_0000, 4, 1024));
+    let bad_old = Box::new([0x55; 24]);
+    let mut frame = TrapFrame::default();
+    frame.x[..2].copy_from_slice(&[addr(&*invalid), addr(&*bad_old)]);
+    frame.x[8] = SYS_SIGALTSTACK as u64;
+    frame.slot = SLOT_IDX as u64;
+    let mut user = FaultingUser {
+        deny_out: std::vec![addr(&*bad_old)],
+        ..FaultingUser::default()
+    };
+    assert_eq!(
+        serve_directly(&mut w, &mut frame, &mut user),
+        Some(Action::Served)
+    );
+    assert_eq!(frame.x[0] as i64, -22);
+    assert_eq!(*bad_old, [0x55; 24]);
+    for (ss, old_ss, deny_in, deny_out) in [
+        (addr(&*new), 0, true, false),
+        (0, addr(&*bad_old), false, true),
+    ] {
+        let mut frame = TrapFrame::default();
+        frame.x[..2].copy_from_slice(&[ss, old_ss]);
+        frame.x[8] = SYS_SIGALTSTACK as u64;
+        frame.slot = SLOT_IDX as u64;
+        let mut user = FaultingUser {
+            deny_in: if deny_in { std::vec![ss] } else { Vec::new() },
+            deny_out: if deny_out {
+                std::vec![old_ss]
+            } else {
+                Vec::new()
+            },
+        };
+        assert_eq!(
+            serve_directly(&mut w, &mut frame, &mut user),
+            Some(Action::Served)
+        );
+        assert_eq!(frame.x[0] as i64, -14);
+    }
+    let alias = Box::new(stack_t(0x30_0000, 0, 0x4000));
+    let (action, _) = w.syscall(SYS_SIGALTSTACK, &[addr(&*alias), addr(&*alias)]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(*alias, stack_t(0x10_0000, 0, 0x4000));
+    assert_eq!(w.venue.leader_slot().read_altstack().sp, 0x30_0000);
     // Disable, returning the old one.
-    let off = Box::new(stack_t(0, SS_DISABLE, 0));
+    let off = Box::new(stack_t(0, SS_DISABLE, 1024));
     let (action, _) = w.syscall(SYS_SIGALTSTACK, &[addr(&*off), addr(&*old)]);
     assert_eq!(action, Action::Served);
-    assert_eq!(*old, stack_t(0x10_0000, 0, 0x4000));
+    assert_eq!(*old, stack_t(0x30_0000, 0, 0x4000));
     assert!(w.venue.leader_slot().read_altstack().is_disabled());
-    assert_eq!(w.served(SYS_SIGALTSTACK), 4);
+    let autodisarm = Box::new(stack_t(
+        0x40_0000,
+        carrick_syscall_abi::LINUX_SS_AUTODISARM as u32,
+        0x4000,
+    ));
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*autodisarm), 0]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(frame.x[0], 0);
+    assert_eq!(
+        w.venue.leader_slot().read_altstack().flags,
+        carrick_syscall_abi::LINUX_SS_AUTODISARM as u32
+    );
+    let (action, _) = w.syscall(SYS_SIGALTSTACK, &[0, addr(&*old)]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(*old, *autodisarm);
+    assert_eq!(w.served(SYS_SIGALTSTACK), 12);
+}
+
+/// sigaltstack(2), LTP sigaltstack02: arm64 requires 5120 bytes and returns
+/// ENOMEM one byte below the UAPI minimum.
+#[test]
+fn arm_sigaltstack_minimum_is_5120() {
+    let mut w = World::new(LifecycleHatches::ON);
+    for (size, expected) in [(5119, -12), (5120, 0)] {
+        let stack = Box::new(stack_t(0x10_0000, 0, size));
+        let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*stack), 0]);
+        assert_eq!(action, Action::Served);
+        assert_eq!(frame.x[0] as i64, expected, "size={size}");
+    }
+    assert_eq!(w.venue.leader_slot().read_altstack().size, 5120);
+}
+
+/// sigaltstack(2): Linux treats input SS_ONSTACK as zero, accepts
+/// SS_DISABLE with SS_AUTODISARM, and rejects unknown bits.
+#[test]
+fn arm_sigaltstack_accepts_reported_and_disable_autodisarm_flags() {
+    let mut w = World::new(LifecycleHatches::ON);
+    let onstack = Box::new(stack_t(0x10_0000, 1, 5120));
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*onstack), 0]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(frame.x[0] as i64, 0);
+    assert_eq!(w.venue.leader_slot().read_altstack().flags, 0);
+    let disabled = Box::new(stack_t(
+        0,
+        SS_DISABLE | carrick_syscall_abi::LINUX_SS_AUTODISARM as u32,
+        0,
+    ));
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*disabled), 0]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(frame.x[0] as i64, 0);
+    assert!(w.venue.leader_slot().read_altstack().is_disabled());
+    let invalid = Box::new(stack_t(0, SS_DISABLE | 0x8, 0));
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*invalid), 0]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(frame.x[0] as i64, -22);
+    assert!(w.venue.leader_slot().read_altstack().is_disabled());
+    let contradictory = Box::new(stack_t(0, SS_DISABLE | SS_ONSTACK, 0));
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*contradictory), 0]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(frame.x[0] as i64, -22);
+    assert!(w.venue.leader_slot().read_altstack().is_disabled());
+}
+
+/// sigaltstack(2): the downward-growing stack includes its initial top SP,
+/// while its base is already below the active stack.
+#[test]
+fn arm_sigaltstack_onstack_boundaries_use_open_base_closed_top() {
+    let mut w = World::new(LifecycleHatches::ON);
+    let stack = Box::new(stack_t(0x10_0000, 0, 5120));
+    let old = Box::new([0u8; 24]);
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[addr(&*stack), 0]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(frame.x[0] as i64, 0);
+    w.cpu.regs.sp_el0 = 0x10_0000;
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[0, addr(&*old)]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(frame.x[0] as i64, 0);
+    assert_eq!(*old, stack_t(0x10_0000, 0, 5120));
+    w.cpu.regs.sp_el0 = 0x10_0000 + 5120;
+    let (action, frame) = w.syscall(SYS_SIGALTSTACK, &[0, addr(&*old)]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(frame.x[0] as i64, 0);
+    assert_eq!(*old, stack_t(0x10_0000, 1, 5120));
 }
 
 #[test]

@@ -880,6 +880,30 @@ and [Arm's Linux Plumbers 2017 signal-frame diagrams](https://blog.linuxplumbers
 alongside sigreturn(2). This extraction changes no signal routing and does not
 establish in-ring delivery or alternate-stack restoration.
 
+The ARM `sigaltstack` setup case of `kernel.el1.signal-delivery-owner`
+uses the VM-free `sigaltstack_serves_off_the_alternate_stack` witness. Native
+arm64 Docker oracle confirmation is still required at the atomic cutover.
+The arm64 minimum is 5120 bytes (5119 returns ENOMEM); x86_64 retains its
+separate 2048-byte minimum. Linux treats input SS_ONSTACK as a no-op and
+ignores SS_AUTODISARM when SS_DISABLE is set. For the downward-growing stack,
+the base SP is off-stack and the initial top SP is on-stack. The setup witnesses
+also require a new rt_sigprocmask mask to remain committed when writing oldset
+returns EFAULT, with any newly owed signal work preserved. These VM-free
+checks do not establish signed ARM delivery.
+Bad flags plus undersized
+storage return EINVAL (-22); undersized storage alone returns ENOMEM (-12);
+SS_DISABLE ignores size. Input and output may alias: the entire new stack is
+read before the old stack is written, and the old value is returned while the
+new value is installed. Bad input and output pointers return EFAULT (-14).
+Bad flags beat a bad output pointer with EINVAL, and output remains untouched
+on validation errors. While executing on the alternate stack, *every* change
+(valid, bad flags, undersized, or disable) returns EPERM (-1), even with a bad
+output pointer; no output is written. An on-stack query reports SS_ONSTACK.
+SS_AUTODISARM is accepted and is returned in the old flags at bit 31. The
+structural budget is one fixed-size input read, one fixed-size output write,
+and one slot publication after validation; active-stack refusal performs no
+user copy, carrier handback, task scan, allocation, or wait.
+
 ## Signal return result ownership
 
 `signal.return.no-result` owns successful in-ring `rt_sigreturn` completion.
