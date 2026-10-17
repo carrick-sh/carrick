@@ -3953,38 +3953,6 @@ mod tests {
     }
 
     #[test]
-    fn test_dentry_cache_5000_dirs_preserves_earlier_entry() {
-        let tmp = tempdir().unwrap();
-        let backend = HostFsBackend::from_path(tmp.path()).unwrap();
-        let cache = DentryCache::new(false, std::sync::Arc::clone(backend.cache_coherence()));
-
-        for i in 0..5000 {
-            let dir_name = format!("dir_{i}");
-            let disk_dir = tmp.path().join(&dir_name);
-            fs::create_dir_all(&disk_dir).unwrap();
-            let file_name = "file.txt";
-            fs::write(disk_dir.join(file_name), b"test").unwrap();
-
-            let guest_dir = format!("/dir_{i}");
-            let guest_file = format!("/dir_{i}/file.txt");
-            cache.entry_created(&guest_dir, None);
-            cache.entry_created(&guest_file, None);
-            assert!(cache.stat(&guest_file, true, &backend, None).is_ok());
-        }
-
-        // Target file right before the 4096th directory (i = 4094)
-        let target_file = "/dir_4094/file.txt";
-        let target_dir = "/dir_4094";
-        // Check if it's cached in path_to_dir_id and entries
-        let dir_id = cache.path_to_dir_id.read().get(target_dir).copied();
-        assert!(
-            dir_id.is_some(),
-            "dir_4094 should still be cached in path_to_dir_id"
-        );
-        assert!(cache.stat(target_file, true, &backend, None).is_ok());
-    }
-
-    #[test]
     fn test_dentry_cache_memory_bounded_eviction_leaf_first() {
         let tmp = tempdir().unwrap();
         let backend = HostFsBackend::from_path(tmp.path()).unwrap();
@@ -4731,5 +4699,103 @@ mod tests {
                 .size,
             3
         );
+    }
+
+    mod serial_host {
+        use super::*;
+
+        /// RAII guard that restores the process's original `RLIMIT_NOFILE` soft limit on drop.
+        struct NofileGuard {
+            saved: libc::rlimit,
+        }
+
+        impl Drop for NofileGuard {
+            fn drop(&mut self) {
+                // SAFETY: Restoring previously read valid rlimit.
+                unsafe {
+                    libc::setrlimit(libc::RLIMIT_NOFILE, &self.saved);
+                }
+            }
+        }
+
+        /// Ensure the process's `RLIMIT_NOFILE` soft limit is at least `needed`.
+        ///
+        /// If the current soft limit is lower than `needed`, raises it up to `needed`
+        /// (clamped to the hard limit) and returns an RAII guard that restores the
+        /// original soft limit when dropped.
+        ///
+        /// If the hard limit is strictly less than `needed`, fails explicitly with a clear
+        /// message rather than skipping.
+        #[track_caller]
+        fn ensure_nofile_limit(needed: u64) -> NofileGuard {
+            let mut saved: libc::rlimit = unsafe { core::mem::zeroed() };
+            if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut saved) } != 0 {
+                panic!(
+                    "ensure_nofile_limit: failed to get RLIMIT_NOFILE: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            #[allow(clippy::unnecessary_cast)]
+            let cur_soft = saved.rlim_cur as u64;
+            #[allow(clippy::unnecessary_cast)]
+            let cur_hard = saved.rlim_max as u64;
+
+            if cur_soft >= needed {
+                return NofileGuard { saved };
+            }
+
+            if cur_hard < needed {
+                panic!(
+                    "ensure_nofile_limit: RLIMIT_NOFILE hard limit is too low: needed {needed}, but hard limit is {cur_hard} (soft limit {cur_soft})"
+                );
+            }
+
+            #[allow(clippy::unnecessary_cast)]
+            let target = needed.min(cur_hard) as libc::rlim_t;
+            let raised = libc::rlimit {
+                rlim_cur: target,
+                rlim_max: saved.rlim_max,
+            };
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } != 0 {
+                panic!(
+                    "ensure_nofile_limit: failed to raise RLIMIT_NOFILE soft limit to {needed} (hard limit is {cur_hard}): {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            NofileGuard { saved }
+        }
+
+        #[test]
+        fn test_dentry_cache_5000_dirs_preserves_earlier_entry() {
+            let _guard = ensure_nofile_limit(8192);
+            let tmp = tempdir().unwrap();
+            let backend = HostFsBackend::from_path(tmp.path()).unwrap();
+            let cache = DentryCache::new(false, std::sync::Arc::clone(backend.cache_coherence()));
+
+            for i in 0..5000 {
+                let dir_name = format!("dir_{i}");
+                let disk_dir = tmp.path().join(&dir_name);
+                fs::create_dir_all(&disk_dir).unwrap();
+                let file_name = "file.txt";
+                fs::write(disk_dir.join(file_name), b"test").unwrap();
+
+                let guest_dir = format!("/dir_{i}");
+                let guest_file = format!("/dir_{i}/file.txt");
+                cache.entry_created(&guest_dir, None);
+                cache.entry_created(&guest_file, None);
+                assert!(cache.stat(&guest_file, true, &backend, None).is_ok());
+            }
+
+            // Target file right before the 4096th directory (i = 4094)
+            let target_file = "/dir_4094/file.txt";
+            let target_dir = "/dir_4094";
+            // Check if it's cached in path_to_dir_id and entries
+            let dir_id = cache.path_to_dir_id.read().get(target_dir).copied();
+            assert!(
+                dir_id.is_some(),
+                "dir_4094 should still be cached in path_to_dir_id"
+            );
+            assert!(cache.stat(target_file, true, &backend, None).is_ok());
+        }
     }
 }
