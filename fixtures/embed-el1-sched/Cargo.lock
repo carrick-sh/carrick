@@ -57,6 +57,7 @@ dependencies = [
 name = "carrick-fd-core"
 version = "0.1.0"
 dependencies = [
+ "carrick-core-abi",
  "carrick-sched-core",
 ]
 

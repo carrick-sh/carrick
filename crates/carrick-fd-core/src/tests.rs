@@ -2,7 +2,7 @@
 
 use super::*;
 use std::sync::{Mutex, OnceLock};
-use std::{boxed::Box, vec::Vec};
+use std::{boxed::Box, vec, vec::Vec};
 
 // The red commit used two single installs here; the owner now uses one
 // typed transaction without a temporary fd, host type or second table.
@@ -117,17 +117,31 @@ fn arena() -> &'static Mutex<Vec<Backing>> {
 /// records (a venue that never grows past them).
 pub(crate) struct TestArena {
     ofds: &'static [OfdRecord],
+    objects: &'static [ObjectRecord],
 }
 impl TestArena {
     /// A leaked venue holding `ofds` zeroed OFD records.
     pub(crate) fn with_ofds(ofds: usize) -> &'static Self {
+        Self::with_ofds_and_objects(ofds, 0)
+    }
+    /// A leaked venue holding `ofds` OFD records and `objects` object records.
+    pub(crate) fn with_ofds_and_objects(ofds: usize, objects: usize) -> &'static Self {
         let records: &'static [OfdRecord] = Box::leak(
             (0..ofds)
                 .map(|_| OfdRecord::default())
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         );
-        Box::leak(Box::new(Self { ofds: records }))
+        let obj_records: &'static [ObjectRecord] = Box::leak(
+            (0..objects)
+                .map(|_| ObjectRecord::default())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        Box::leak(Box::new(Self {
+            ofds: records,
+            objects: obj_records,
+        }))
     }
 }
 fn resolve_extent(extent: Extent) -> Option<Backing> {
@@ -143,6 +157,9 @@ impl SlotBacking for TestArena {
     }
     fn ofd(&self, index: usize) -> Option<&OfdRecord> {
         self.ofds.get(index)
+    }
+    fn object(&self, index: usize) -> Option<&ObjectRecord> {
+        self.objects.get(index)
     }
 }
 pub(crate) fn storage(capacity: usize) -> Extent {
@@ -165,6 +182,7 @@ pub(crate) fn storage(capacity: usize) -> Extent {
         capacity: capacity as u64,
     }
 }
+#[derive(Clone, Copy)]
 pub(crate) struct Spin;
 impl LockWait for Spin {
     fn wait(&self, _attempt: u32) -> bool {
@@ -178,6 +196,15 @@ pub(crate) fn core_with<const T: usize>(ofds: usize) -> (&'static Core<T>, &'sta
     let core: &'static Core<T> = Box::leak(Box::new(Core::new().unwrap()));
     let arena = TestArena::with_ofds(ofds);
     core.bind(arena, Spin).publish_ofds(ofds).unwrap();
+    (core, arena)
+}
+/// A published core with `objects` published object records, and its venue.
+pub(crate) fn core_with_objects<const T: usize>(
+    objects: usize,
+) -> (&'static Core<T>, &'static TestArena) {
+    let core: &'static Core<T> = Box::leak(Box::new(Core::new().unwrap()));
+    let arena = TestArena::with_ofds_and_objects(0, objects);
+    core.bind(arena, Spin).publish_objects(objects).unwrap();
     (core, arena)
 }
 /// `T` table identities and `O` OFD records, never grown.
@@ -1376,4 +1403,381 @@ fn b_prep_pair_population_has_logarithmic_search_and_balanced_holds() {
         }
         assert_eq!(releases, 2 * population);
     }
+}
+
+// ---- contract core.personality.handle-table (unit bindings) ----
+
+use crate::handle::*;
+
+#[test]
+fn handle_slot_generation_exhaustion_retires_slot_on_close_exit_and_inherit() {
+    let (core, arena) = core_with_objects::<4>(8);
+    let c = core.bind(arena, Spin);
+    let table = c.create_handle_table(4, &mut storage(4)).unwrap();
+
+    // Seed slot 0 and slot 1 at Generation::MAX before inserting handles.
+    c.seed_handle_slot_generation(table, SlotIndex::new(0), Generation::MAX)
+        .unwrap();
+    c.seed_handle_slot_generation(table, SlotIndex::new(1), Generation::MAX)
+        .unwrap();
+
+    let h0 = c
+        .insert_handle(table, BackingToken(10), HandleFlags::new(true, false))
+        .unwrap();
+    assert_eq!(h0.slot(), SlotIndex::new(0));
+    assert_eq!(h0.generation(), Generation::MAX);
+    assert_eq!(c.handle_table_capacity(table), Ok(4));
+
+    // 1. Exhaustion on close_handle: releases object, retires slot 0 permanently, lowers capacity.
+    assert_eq!(c.close_handle(table, h0), Ok(Some(BackingToken(10))));
+    assert_eq!(c.handle_table_capacity(table), Ok(3));
+    assert_eq!(c.handle_table_retired_count(table), Ok(1));
+
+    let h1 = c
+        .insert_handle(table, BackingToken(20), HandleFlags::new(true, false))
+        .unwrap();
+    assert_eq!(
+        h1.slot(),
+        SlotIndex::new(1),
+        "retired slot 0 is never reused"
+    );
+    assert_eq!(h1.generation(), Generation::MAX);
+
+    // Even after growing the table (which rebuilds the bitmap), slot 0 stays retired.
+    let mut larger = storage(8);
+    c.grow_handle_table(table, &mut larger).unwrap();
+    assert_eq!(c.handle_table_capacity(table), Ok(3));
+    let h2 = c
+        .insert_handle(table, BackingToken(21), HandleFlags::new(true, false))
+        .unwrap();
+    assert_eq!(
+        h2.slot(),
+        SlotIndex::new(2),
+        "retired slot 0 remains non-allocatable after grow"
+    );
+    assert_eq!(c.close_handle(table, h2), Ok(Some(BackingToken(21))));
+
+    // 2. Exhaustion on inherit_handle_table when slot 1 is at Generation::MAX and filtered out.
+    let child = c
+        .inherit_handle_table(
+            table,
+            |_pin, _token, _flags| false,
+            &mut storage(8),
+            |_| panic!("unexpected rollback release"),
+        )
+        .unwrap();
+    // Child inherited retired slot 0 AND retired filtered-out slot 1 (at Generation::MAX).
+    assert_eq!(c.handle_table_capacity(child), Ok(2));
+    assert_eq!(c.handle_table_retired_count(child), Ok(2));
+    let child_h = c
+        .insert_handle(child, BackingToken(30), HandleFlags::default())
+        .unwrap();
+    assert_eq!(
+        child_h.slot(),
+        SlotIndex::new(2),
+        "child skips both retired slot 0 and exhausted filtered slot 1"
+    );
+
+    // 3. Exhaustion on close_all_handles (task exit path) in parent:
+    let mut parent_released = Vec::new();
+    c.close_all_handles(table, |tok| parent_released.push(tok))
+        .unwrap();
+    assert_eq!(parent_released, vec![BackingToken(20)]);
+    // Parent had slot 0 retired, and now slot 1 also retired on close_all_handles!
+    assert_eq!(c.handle_table_capacity(table), Ok(2));
+    assert_eq!(c.handle_table_retired_count(table), Ok(2));
+
+    let mut child_released = Vec::new();
+    c.destroy_handle_table(child, |tok| child_released.push(tok))
+        .unwrap();
+    assert_eq!(child_released, vec![BackingToken(30)]);
+    c.destroy_handle_table(table, |_| {}).unwrap();
+}
+
+#[test]
+fn handle_pin_overflow_returns_pin_overflow_without_side_effects() {
+    let (core, arena) = core_with_objects::<2>(4);
+    let c = core.bind(arena, Spin);
+    let table = c.create_handle_table(4, &mut storage(4)).unwrap();
+    let h = c
+        .insert_handle(table, BackingToken(55), HandleFlags::new(true, false))
+        .unwrap();
+
+    // Saturate the OpenLifetime pin count to MAX_OBJECT_PINS (0x7fff_ffff).
+    let saved = arena.objects[0]
+        .lifetime_word_for_test()
+        .load(Ordering::Relaxed);
+    let saturated = (saved & !(MAX_OBJECT_PINS as u64)) | (MAX_OBJECT_PINS as u64);
+    arena.objects[0]
+        .lifetime_word_for_test()
+        .store(saturated, Ordering::Release);
+
+    assert_eq!(c.get_handle(table, h), Err(HandleError::PinOverflow));
+    assert_eq!(
+        c.get_handle_pin(table, h.pin()),
+        Err(HandleError::PinOverflow)
+    );
+    assert_eq!(c.duplicate_handle(table, h), Err(HandleError::PinOverflow));
+    let mut child_ext = storage(4);
+    assert_eq!(
+        c.inherit_handle_table(table, |_, _, _| true, &mut child_ext, |_| {}),
+        Err(HandleError::PinOverflow)
+    );
+
+    // Restore the original lifetime word and close cleanly.
+    arena.objects[0]
+        .lifetime_word_for_test()
+        .store(saved, Ordering::Release);
+    assert_eq!(c.close_handle(table, h), Ok(Some(BackingToken(55))));
+    c.destroy_handle_table(table, |_| {}).unwrap();
+}
+
+#[test]
+fn handle_raw_guard_double_release_fails_closed() {
+    let (core, arena) = core_with_objects::<2>(4);
+    let c = core.bind(arena, Spin);
+    let table = c.create_handle_table(4, &mut storage(4)).unwrap();
+    let h = c
+        .insert_handle(table, BackingToken(77), HandleFlags::default())
+        .unwrap();
+    let h_dup = c.duplicate_handle(table, h).unwrap();
+    let guard = c.get_handle(table, h).unwrap();
+    assert_eq!(
+        c.close_handle(table, h),
+        Ok(None),
+        "duplicate slot and guard retain object across close of original"
+    );
+
+    // 1. Continuation-slot take(): moving out of a continuation slot zeroes it
+    // (slot_generation == 0), and a second `from_raw(slot.take())` fails closed.
+    let mut continuation_slot = guard.into_raw();
+    let forged_dup = continuation_slot.forged_copy_for_test();
+    let first_guard = ObjectGuard::from_raw(continuation_slot.take()).unwrap();
+    assert_eq!(
+        ObjectGuard::from_raw(continuation_slot.take()),
+        Err(HandleError::Stale),
+        "zeroed continuation slot after take() must be rejected by from_raw"
+    );
+    assert_eq!(
+        ObjectGuard::from_raw(RawObjectGuard::default()),
+        Err(HandleError::Stale),
+        "default zeroed RawObjectGuard must be rejected by from_raw"
+    );
+
+    // First release of the guard drops the guard's reference while `h_dup` stays live.
+    assert_eq!(c.release_handle_pin(first_guard), Ok(None));
+
+    // 2. P1-A witness: even if unsafe/corrupted memory duplicates a RawObjectGuard
+    // while duplicate slot `h_dup` is still alive, releasing the duplicate must fail
+    // closed with `Stale` and leave `h_dup`'s reference intact.
+    let forged_guard = ObjectGuard::from_raw(forged_dup).unwrap();
+    assert_eq!(
+        c.release_handle_pin(forged_guard),
+        Err(HandleError::Stale),
+        "forged double release must not steal live slot reference"
+    );
+    let h_reused = c
+        .insert_handle(table, BackingToken(88), HandleFlags::default())
+        .unwrap();
+    let dup_guard = c.get_handle(table, h_dup).unwrap();
+    assert_eq!(dup_guard.backing(), BackingToken(77));
+    assert_eq!(c.release_handle_pin(dup_guard), Ok(None));
+    assert_eq!(c.close_handle(table, h_dup), Ok(Some(BackingToken(77))));
+    assert_eq!(c.close_handle(table, h_reused), Ok(Some(BackingToken(88))));
+    c.destroy_handle_table(table, |_| {}).unwrap();
+}
+
+#[test]
+fn handle_concurrent_guards_exceed_eight_and_churn_without_exhaustion() {
+    let (core, arena) = core_with_objects::<2>(4);
+    let c = core.bind(arena, Spin);
+    let table = c.create_handle_table(4, &mut storage(4)).unwrap();
+    let h = c
+        .insert_handle(table, BackingToken(99), HandleFlags::default())
+        .unwrap();
+
+    // P1-1 witness: hold 16 concurrent guards on one object (> 8), bounded only
+    // by MAX_OBJECT_PINS.
+    let mut guards = Vec::with_capacity(16);
+    for i in 0..16 {
+        let g = if i % 2 == 0 {
+            c.get_handle(table, h).unwrap()
+        } else {
+            c.retain_handle_pin(&guards[0]).unwrap()
+        };
+        assert_eq!(g.backing(), BackingToken(99));
+        guards.push(g);
+    }
+    assert_eq!(c.handle_pin_count(&guards[0]), Ok(17));
+
+    // Churn guard acquire/release cycles to verify no counter exhausts over time.
+    for _ in 0..256 {
+        let g = c.get_handle(table, h).unwrap();
+        let raw = g.into_raw();
+        let restored = ObjectGuard::from_raw(raw).unwrap();
+        assert_eq!(c.release_handle_pin(restored), Ok(None));
+    }
+
+    // Close the table slot while all 16 guards are still active.
+    assert_eq!(c.close_handle(table, h), Ok(None));
+    for g in guards.drain(..15) {
+        assert_eq!(c.release_handle_pin(g), Ok(None));
+    }
+    let last = guards.pop().unwrap();
+    assert_eq!(c.release_handle_pin(last), Ok(Some(BackingToken(99))));
+    c.destroy_handle_table(table, |_| {}).unwrap();
+}
+
+#[test]
+fn inherit_filter_parent_close_or_destroy_finalizes_every_object_exactly_once() {
+    let (core, arena) = core_with_objects::<4>(8);
+    let c = core.bind(arena, Spin);
+    let parent = c.create_handle_table(4, &mut storage(4)).unwrap();
+    c.insert_handle(parent, BackingToken(100), HandleFlags::INHERITABLE)
+        .unwrap();
+    c.insert_handle(parent, BackingToken(200), HandleFlags::INHERITABLE)
+        .unwrap();
+
+    // Parent is destroyed inside the inherit filter after slot 0 was already retained for child.
+    let mut destroy_finalized = Vec::new();
+    let mut rollback_finalized = Vec::new();
+    let mut child_ext = storage(4);
+    let res = c.inherit_handle_table(
+        parent,
+        |pin, _tok, _flags| {
+            if pin.slot == SlotIndex::new(1) {
+                c.destroy_handle_table(parent, |b| destroy_finalized.push(b))
+                    .unwrap();
+            }
+            true
+        },
+        &mut child_ext,
+        |b| rollback_finalized.push(b),
+    );
+    assert_eq!(res, Err(HandleError::Stale));
+    let mut finalized = [destroy_finalized, rollback_finalized].concat();
+    finalized.sort_by_key(|b| b.0);
+    assert_eq!(
+        finalized,
+        vec![BackingToken(100), BackingToken(200)],
+        "P1-C witness: parent destroy in filter must finalize slot 0's token on rollback"
+    );
+}
+
+#[test]
+fn handle_write_paths_all_or_nothing_and_finalizer_lock_free_get_under_spin() {
+    let (core, arena) = core_with_objects::<2>(4);
+    let c = core.bind(arena, Spin);
+    // Only 2 objects published initially.
+    arena.objects[2].incarnation.store(0, Ordering::Relaxed);
+    arena.objects[3].incarnation.store(0, Ordering::Relaxed);
+    core.object_count.store(2, Ordering::Release);
+
+    let table = c.create_handle_table(4, &mut storage(4)).unwrap();
+    // 1. alloc_object pushes back the popped index on lifetime.initialize failure.
+    let saved_word = arena.objects[0]
+        .lifetime_word_for_test()
+        .load(Ordering::Relaxed);
+    arena.objects[0]
+        .lifetime_word_for_test()
+        .store((1u64 << 32) | 1, Ordering::Release);
+    assert_eq!(
+        c.insert_handle(table, BackingToken(1), HandleFlags::default()),
+        Err(HandleError::BadBacking)
+    );
+    arena.objects[0]
+        .lifetime_word_for_test()
+        .store(saved_word, Ordering::Release);
+    let h0 = c
+        .insert_handle(table, BackingToken(10), HandleFlags::CLOSE_ON_EXEC)
+        .unwrap();
+    let _h1 = c
+        .insert_handle(table, BackingToken(20), HandleFlags::CLOSE_ON_EXEC)
+        .unwrap();
+    assert_eq!(
+        c.insert_handle(table, BackingToken(30), HandleFlags::default()),
+        Err(HandleError::NeedsObjects)
+    );
+
+    // 2. All-or-nothing write paths (exec_handle_table, close_all_handles, destroy_handle_table):
+    // if slot 1's object fails validation, slot 0 must NOT be closed and `seq` must stay even.
+    let saved_obj1 = arena.objects[1]
+        .lifetime_word_for_test()
+        .load(Ordering::Relaxed);
+    arena.objects[1]
+        .lifetime_word_for_test()
+        .store(0, Ordering::Release);
+    assert_eq!(
+        c.exec_handle_table(table, |_| panic!("must not release on validation failure")),
+        Err(HandleError::Stale)
+    );
+    assert_eq!(
+        c.close_all_handles(table, |_| panic!("must not release on validation failure")),
+        Err(HandleError::Stale)
+    );
+    assert_eq!(
+        c.destroy_handle_table(table, |_| panic!("must not release on validation failure")),
+        Err(HandleError::Stale)
+    );
+    assert_eq!(
+        core.tables[table.index].seq.load(Ordering::Acquire) & 1,
+        0,
+        "failed write path must leave table seq even"
+    );
+    let g0 = c.get_handle(table, h0).unwrap();
+    assert_eq!(g0.backing(), BackingToken(10));
+    assert_eq!(c.release_handle_pin(g0), Ok(None));
+
+    arena.objects[1]
+        .lifetime_word_for_test()
+        .store(saved_obj1, Ordering::Release);
+
+    // 3. P2 witness: finalizers in exec_handle_table, close_all_handles, and
+    // destroy_handle_table run after `end_write` (`seq` even) so a finalizer
+    // performing a lock-free `get_handle` on the same table completes under `Spin`.
+    let mut exec_released = Vec::new();
+    c.exec_handle_table(table, |tok| {
+        assert_eq!(
+            core.tables[table.index].seq.load(Ordering::Acquire) & 1,
+            0,
+            "exec_handle_table finalizer must run with seq even"
+        );
+        // Lock-free get_handle on the just-closed handle completes under Spin.
+        assert_eq!(c.get_handle(table, h0), Err(HandleError::Stale));
+        exec_released.push(tok);
+    })
+    .unwrap();
+    assert_eq!(exec_released, vec![BackingToken(10), BackingToken(20)]);
+
+    let h2 = c
+        .insert_handle(table, BackingToken(30), HandleFlags::default())
+        .unwrap();
+    let mut close_all_released = Vec::new();
+    c.close_all_handles(table, |tok| {
+        assert_eq!(
+            core.tables[table.index].seq.load(Ordering::Acquire) & 1,
+            0,
+            "close_all_handles finalizer must run with seq even"
+        );
+        assert_eq!(c.get_handle(table, h2), Err(HandleError::Stale));
+        close_all_released.push(tok);
+    })
+    .unwrap();
+    assert_eq!(close_all_released, vec![BackingToken(30)]);
+
+    let h3 = c
+        .insert_handle(table, BackingToken(40), HandleFlags::default())
+        .unwrap();
+    let mut destroy_released = Vec::new();
+    c.destroy_handle_table(table, |tok| {
+        assert_eq!(
+            core.tables[table.index].seq.load(Ordering::Acquire) & 1,
+            0,
+            "destroy_handle_table finalizer must run with seq even"
+        );
+        assert_eq!(c.get_handle(table, h3), Err(HandleError::Stale));
+        destroy_released.push(tok);
+    })
+    .unwrap();
+    assert_eq!(destroy_released, vec![BackingToken(40)]);
 }
