@@ -1391,13 +1391,14 @@ mod tests {
             "shbuf-test:latest",
             r#"{"architecture":"arm64","os":"linux","config":{"Cmd":["/bin/true"]}}"#,
         );
-        let mut buf = crate::SharedBuffer::new(4096).expect("create buffer");
-        buf.as_mut_slice()[..11].copy_from_slice(b"embed_shbuf");
+        let buf = crate::SharedBuffer::new(4096).expect("create buffer");
+        buf.write_from(0, b"embed_shbuf").unwrap();
 
         let prepared = ContainerBuilder::from_image("shbuf-test:latest")
             .image_store(store)
             .pull_policy(PullPolicy::Never)
             .shared_buffer("tensor_mem", &buf)
+            .shared_buffer("tensor_alias", &buf)
             .prepare()
             .await
             .expect("prepare succeeds with shared buffer");
@@ -1405,14 +1406,51 @@ mod tests {
         let lease = prepared
             .shared_buffer_lease("tensor_mem")
             .expect("lease for registered buffer");
+        let alias_lease = prepared
+            .shared_buffer_lease("tensor_alias")
+            .expect("lease for alias registered buffer");
         assert_eq!(lease.len(), buf.len());
         let mut data = [0u8; 11];
-        lease.read_at(0, &mut data).unwrap();
+        lease.read_into(0, &mut data).unwrap();
         assert_eq!(&data, b"embed_shbuf");
+        assert_eq!(lease.current_container_generation(), lease.generation());
+        assert_eq!(alias_lease.generation(), lease.generation());
+        assert!(lease.validate_access().is_ok());
+        assert!(alias_lease.validate_access().is_ok());
+
+        // Minting another lease on the same buffer observes the bound generation
+        // without invalidating the live prepared lease.
+        let extra_lease = buf.lease(
+            prepared.launch().run_id.clone(),
+            prepared.launch().container_id,
+            carrick_thread::platform_futex::SharedFutexTable::new(),
+        );
+        assert_eq!(extra_lease.generation(), lease.generation());
+        assert!(extra_lease.validate_access().is_ok());
+        assert!(lease.validate_access().is_ok());
 
         assert!(matches!(
             prepared.shared_buffer_lease("nonexistent"),
             Err(crate::SharedBufferError::NotFound(_))
+        ));
+
+        drop(prepared);
+        let rebound = ContainerBuilder::from_image("shbuf-test:latest")
+            .image_store(ImageStore::new(tmp.path()))
+            .pull_policy(PullPolicy::Never)
+            .shared_buffer("tensor_mem", &buf)
+            .prepare()
+            .await
+            .expect("prepare next container with the same buffer");
+        let next = rebound.shared_buffer_lease("tensor_mem").unwrap();
+        assert!(next.validate_access().is_ok());
+        assert!(matches!(
+            lease.validate_access(),
+            Err(crate::SharedBufferError::GenerationMismatch { .. })
+        ));
+        assert!(matches!(
+            extra_lease.validate_access(),
+            Err(crate::SharedBufferError::GenerationMismatch { .. })
         ));
     }
 }
