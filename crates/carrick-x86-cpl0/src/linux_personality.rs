@@ -266,7 +266,7 @@ impl GuestDispatchFrame for NativeDispatch<'_> {
     fn restore_signal_frame(
         &mut self,
         copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
-    ) -> Result<carrick_personality_linux::signal::policy::SigBlockMask, LinuxErrno> {
+    ) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, LinuxErrno> {
         let mut backend = carrick_el1::isa::x86::X86Backend;
         carrick_personality_linux::signal::SignalBackend::restore_signal_frame(
             &mut backend,

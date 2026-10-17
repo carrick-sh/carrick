@@ -1361,7 +1361,7 @@ impl<'a> NetView<'a> {
         let fd = fd.0;
         let addr_addr = addr.0;
         let addrlen_addr = addrlen.0;
-        let (host_fd, family, type_, protocol, inzone_listener) = {
+        let (host_fd, family, type_, protocol, inzone_listener, accept_timeout) = {
             let Some(open_file) = self.open_file(fd) else {
                 return DispatchOutcome::errno(LINUX_EBADF);
             };
@@ -1386,12 +1386,13 @@ impl<'a> NetView<'a> {
                     *type_,
                     *protocol,
                     base.inzone_listener(),
+                    base.recv_timeout(),
                 ),
                 Some(OpenDescription::InMemorySocket { base, socket }) => {
                     let family = socket.family();
                     let type_ = socket.socket_type;
                     let protocol = socket.protocol;
-                    (None, family, type_, protocol, base.inzone_listener())
+                    (None, family, type_, protocol, base.inzone_listener(), None)
                 }
                 _ => {
                     return DispatchOutcome::errno(LINUX_ENOTSOCK);
@@ -1469,7 +1470,8 @@ impl<'a> NetView<'a> {
         // run in the closure (no &self); the fd is installed AFTER (the
         // install needs &self, which blocking_io's &self closure can't hold).
         let nonblocking = self.io_is_nonblocking(fd, 0);
-        // accept(2) has no SO_*TIMEO bound on Linux — no per-fd timeout.
+        // SO_RCVTIMEO bounds a blocking accept and makes an interrupted wait
+        // non-restartable even when the handler requests SA_RESTART.
         let accepted_source = std::cell::RefCell::new(None::<Vec<u8>>);
         // SO_REUSEPORT: Darwin parks EVERY incoming connection on the last
         // socket that bound the addr:port, so this member's own host socket is
@@ -1481,36 +1483,43 @@ impl<'a> NetView<'a> {
         let accept_targets: Vec<i32> = std::iter::once(host_fd)
             .chain(reuseport::steal_targets(host_fd))
             .collect();
-        let outcome = self.blocking_io(fd, host_fd, IoDir::Read, nonblocking, None, || {
-            let mut last = Err(LINUX_EAGAIN);
-            for target in accept_targets {
-                let mut sa_storage = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
-                let mut sa_len: libc::socklen_t = sa_storage.len() as libc::socklen_t;
-                let new_host = unsafe {
-                    libc::accept(
-                        target,
-                        sa_storage.as_mut_ptr() as *mut _,
-                        &mut sa_len as *mut _,
-                    )
-                };
-                match new_host.host_syscall_errno() {
-                    Ok(new_host) => {
-                        if addr_addr != 0 && addrlen_addr != 0 {
-                            let used = (sa_len as usize).min(sa_storage.len());
-                            accepted_source
-                                .borrow_mut()
-                                .replace(sa_storage[..used].to_vec());
+        let outcome = self.blocking_io(
+            fd,
+            host_fd,
+            IoDir::Read,
+            nonblocking,
+            accept_timeout,
+            || {
+                let mut last = Err(LINUX_EAGAIN);
+                for target in accept_targets {
+                    let mut sa_storage = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
+                    let mut sa_len: libc::socklen_t = sa_storage.len() as libc::socklen_t;
+                    let new_host = unsafe {
+                        libc::accept(
+                            target,
+                            sa_storage.as_mut_ptr() as *mut _,
+                            &mut sa_len as *mut _,
+                        )
+                    };
+                    match new_host.host_syscall_errno() {
+                        Ok(new_host) => {
+                            if addr_addr != 0 && addrlen_addr != 0 {
+                                let used = (sa_len as usize).min(sa_storage.len());
+                                accepted_source
+                                    .borrow_mut()
+                                    .replace(sa_storage[..used].to_vec());
+                            }
+                            return Ok(new_host as i64);
                         }
-                        return Ok(new_host as i64);
+                        // Only an empty queue is worth trying the next member for.
+                        // Any other errno is this accept's real answer.
+                        Err(e) if e == LINUX_EAGAIN => last = Err(e),
+                        Err(e) => return Err(e),
                     }
-                    // Only an empty queue is worth trying the next member for.
-                    // Any other errno is this accept's real answer.
-                    Err(e) if e == LINUX_EAGAIN => last = Err(e),
-                    Err(e) => return Err(e),
                 }
-            }
-            last
-        });
+                last
+            },
+        );
         let outcome = match outcome {
             DispatchOutcome::WaitOnFds {
                 fds: _,

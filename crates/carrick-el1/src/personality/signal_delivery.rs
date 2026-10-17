@@ -20,11 +20,35 @@ pub trait SignalMachine<C> {
         frame: &mut <Self::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
         original: C,
     ) -> bool;
+    fn restart_forwarded(
+        &self,
+        _frame: &mut <Self::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
+    ) -> Option<bool> {
+        None
+    }
     fn group_exit_custody(&self, task: &CurrentTask) -> CompletionRoute;
 }
 
 pub fn deliver_signal_on_syscall_return<'a, M, C, S, A>(
     task: &CurrentTask,
+    process: &mut NativeProcessEntry<'_, 'a, M, C, S>,
+    frame: &mut <A::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
+    fpstate: &[u8],
+    machine: &mut A,
+) -> Option<CompletionRoute>
+where
+    M: Clone,
+    C: ProcessContext,
+    S: NativeProcessService<'a, C, Mm = M>,
+    A: SignalMachine<C>,
+{
+    let (_, slot) = task.lifecycle_refs()?;
+    deliver_signal_with_control(task, slot, process, frame, fpstate, machine)
+}
+
+pub fn deliver_signal_with_control<'a, M, C, S, A>(
+    task: &CurrentTask,
+    slot: &carrick_el1_abi::ThreadControlSlot,
     process: &mut NativeProcessEntry<'_, 'a, M, C, S>,
     frame: &mut <A::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
     fpstate: &[u8],
@@ -42,15 +66,39 @@ where
     ) {
         return None;
     }
-    let (_, slot) = task.lifecycle_refs()?;
+
     let mut thread_blocked =
         SigBlockMask::blocking_all_of(carrick_signal_core::SignalSet::from_bits(slot.blocked().0));
     let saved_mask = process.take_suspend_mask().unwrap_or(thread_blocked);
     slot.init_blocked(BlockedMask(saved_mask.signals().bits()));
-    let (sig, info, action) =
-        process.take_deliverable_after_suspend(&mut thread_blocked, saved_mask)?;
+    let rewind_interrupted_wait =
+        |process: &mut NativeProcessEntry<'_, 'a, M, C, S>,
+         frame: &mut <A::Backend as carrick_guest_arch::ArchTypes>::NativeFrame,
+         machine: &mut A| {
+            if let Some(original) = process.take_interrupted_child_wait() {
+                Some(machine.restart(frame, original))
+            } else {
+                machine.restart_forwarded(frame)
+            }
+        };
+    let Some((sig, info, action)) =
+        process.take_deliverable_after_suspend(&mut thread_blocked, saved_mask)
+    else {
+        let _ = rewind_interrupted_wait(process, frame, machine);
+        return None;
+    };
     match action.disposition {
-        policy::Disposition::Ignore => None,
+        policy::Disposition::Ignore => {
+            if carrick_signal_core::wait::interrupted_wait(
+                carrick_signal_core::wait::RestartClass::IfSaRestart,
+                carrick_signal_core::wait::WaitProgress::Blocked,
+                None,
+            ) == carrick_signal_core::wait::WaitDecision::Continue
+            {
+                let _ = rewind_interrupted_wait(process, frame, machine);
+            }
+            None
+        }
         policy::Disposition::Default => {
             if let policy::Delivery::Terminate { .. } = policy::default_delivery(sig) {
                 Some(match process.exit_with_signal(sig.number() as u8) {
@@ -59,14 +107,29 @@ where
                     Err(_) => CompletionRoute::InvalidCompletion,
                 })
             } else {
+                if carrick_signal_core::wait::interrupted_wait(
+                    carrick_signal_core::wait::RestartClass::IfSaRestart,
+                    carrick_signal_core::wait::WaitProgress::Blocked,
+                    None,
+                ) == carrick_signal_core::wait::WaitDecision::Continue
+                {
+                    let _ = rewind_interrupted_wait(process, frame, machine);
+                }
                 None
             }
         }
         policy::Disposition::Handler(handler) => {
-            if let Some(original) = process.take_interrupted_child_wait()
-                && action.flags.restart
-                && !machine.restart(frame, original)
+            let restarted = if carrick_signal_core::wait::interrupted_wait(
+                carrick_signal_core::wait::RestartClass::IfSaRestart,
+                carrick_signal_core::wait::WaitProgress::Blocked,
+                Some(action.flags.restart),
+            ) == carrick_signal_core::wait::WaitDecision::Restart
             {
+                rewind_interrupted_wait(process, frame, machine)
+            } else {
+                None
+            };
+            if restarted == Some(false) {
                 return force_delivery_fault(
                     task,
                     process,
@@ -77,9 +140,10 @@ where
                     thread_blocked,
                 );
             }
+            let interrupted_sp = machine.user_sp(frame);
             let selected_stack = carrick_personality_linux::signal::delivery_stack(
                 slot.read_altstack(),
-                machine.user_sp(frame),
+                interrupted_sp,
                 action.flags.on_stack,
             );
             let Some((sp, stack)) = selected_stack else {
@@ -130,6 +194,7 @@ where
                     thread_blocked,
                 );
             }
+            commit_handler_stack(slot, stack, sp, interrupted_sp, action.flags.on_stack);
             let mask = policy::handler_block_mask(sig, action, thread_blocked);
             let _ = slot.store_blocked_then_read_pending(
                 BlockedMask(mask.signals().bits()),
@@ -137,6 +202,21 @@ where
             );
             None
         }
+    }
+}
+
+fn commit_handler_stack(
+    slot: &carrick_el1_abi::ThreadControlSlot,
+    saved: carrick_syscall_abi::LinuxSignalStack,
+    selected_sp: UserVa,
+    interrupted_sp: UserVa,
+    on_stack: bool,
+) {
+    if on_stack
+        && selected_sp != interrupted_sp
+        && (saved.ss_flags as u32 & carrick_syscall_abi::LINUX_SS_AUTODISARM as u32) != 0
+    {
+        slot.write_altstack(carrick_personality_linux::abi::thread::AltStack::DISABLED);
     }
 }
 
@@ -171,4 +251,42 @@ where
     let mask = blocked.signals().without(Signal::SEGV);
     let _ = slot.store_blocked_then_read_pending(BlockedMask(mask.bits()), slot.pending());
     deliver_signal_on_syscall_return(task, process, frame, fpstate, machine)
+}
+
+#[cfg(test)]
+mod altstack_tests {
+    use super::*;
+    use carrick_personality_linux::abi::thread::AltStack;
+
+    #[test]
+    fn caught_onstack_handler_disarms_only_after_switching_stacks() {
+        let slot = carrick_el1_abi::ThreadControlSlot::new();
+        let setting = AltStack {
+            sp: 0x10_0000,
+            size: 8192,
+            flags: carrick_syscall_abi::LINUX_SS_AUTODISARM as u32,
+        };
+        slot.write_altstack(setting);
+        let (_, saved) = carrick_personality_linux::signal::delivery_stack(
+            setting,
+            UserVa::new(0x20_0000),
+            true,
+        )
+        .unwrap();
+        commit_handler_stack(
+            &slot,
+            saved,
+            UserVa::new(0x10_2000),
+            UserVa::new(0x20_0000),
+            true,
+        );
+        assert!(slot.read_altstack().is_disabled());
+        let restored = carrick_personality_linux::signal::restored_altstack(
+            saved,
+            carrick_guest_arch::GuestIsa::Aarch64,
+        )
+        .unwrap();
+        let flags = restored.flags;
+        assert_eq!(flags, carrick_syscall_abi::LINUX_SS_AUTODISARM as u32);
+    }
 }

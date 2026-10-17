@@ -977,6 +977,7 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// the remaining destination/count (and positioned source offset).
     pub(super) owner_read_progress: u64,
     pub(super) continuation_restart: Option<carrick_kernel::kernel::continuation::RestartDecision>,
+    pub(super) native_restart_eligible: Option<bool>,
     /// Consecutive identical (FAR, ESR) COW faults "successfully" resolved.
     /// A resolution that does not change the faulting translation refaults
     /// forever inside one quantum, starving this executor's command channel
@@ -1018,6 +1019,26 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// The engine is passed as `&mut E` to each method, so no field owns it; this
     /// pins the generic parameter to the struct.
     pub(super) _engine: std::marker::PhantomData<fn() -> E>,
+}
+
+/// The host wait's mask was temporary, but native delivery owns the handler
+/// and sigreturn. Carry the saved persistent mask into that one checkpoint.
+fn arm_native_forwarded_wait_mask(
+    control: &carrick_personality_linux::abi::thread::ThreadControlSlot,
+    masks: carrick_kernel::kernel::continuation::SignalMaskContinuationState,
+) {
+    let Some(temporary) = masks.temporary() else {
+        return;
+    };
+    let effective = match temporary {
+        carrick_abi::WaitSigMask::Additive(extra) => masks.persistent().union(extra),
+        carrick_abi::WaitSigMask::Replace(replacement) => replacement,
+    };
+    let original = masks.restore_after_signal().unwrap_or(masks.persistent());
+    control.arm_forwarded_wait_mask(
+        carrick_personality_linux::abi::thread::BlockedMask(effective.raw()),
+        carrick_personality_linux::abi::thread::BlockedMask(original.raw()),
+    );
 }
 
 impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E>
@@ -1067,6 +1088,7 @@ where
             syscall_completion: SyscallCompletionOwnership::Idle,
             owner_read_progress: 0,
             continuation_restart: None,
+            native_restart_eligible: None,
             cow_refault_watch: None,
             reserved_signal: None,
             this_tid,
@@ -1384,6 +1406,25 @@ where
             .map_err(|error| {
                 RuntimeError::Configuration(format!("continuation event: {error:?}"))
             })?;
+        let forwarded_masks = matches!(
+            event,
+            carrick_kernel::kernel::continuation::ContinuationEvent::Signal
+        )
+        .then(|| {
+            lease
+                .blocked_continuation()
+                .map(|pending| pending.signal_masks())
+        })
+        .flatten();
+        self.native_restart_eligible = matches!(
+            event,
+            carrick_kernel::kernel::continuation::ContinuationEvent::Signal
+        )
+        .then(|| {
+            lease
+                .blocked_continuation()
+                .is_some_and(|pending| pending.native_restart_eligible())
+        });
         let context = self.service_kernel_context.as_ref().ok_or_else(|| {
             RuntimeError::Configuration(
                 "persistent continuation resume lost exact Kernel context".to_owned(),
@@ -1412,6 +1453,15 @@ where
         let effects = result.take_resume_effects();
         self.continuation_restart = effects.restart;
         self.reserved_signal = effects.reserved_signal;
+        if matches!(
+            &result.completion,
+            carrick_kernel::kernel::continuation::ContinuationCompletion::Errno(errno)
+                if *errno == carrick_syscall_abi::LINUX_EINTR
+        ) && context.thread().control_slot().native_signal_owner()
+            && let Some(masks) = forwarded_masks
+        {
+            arm_native_forwarded_wait_mask(context.thread().control_slot(), masks);
+        }
 
         carrick_kernel::kernel::continuation::fold_continuation_completion(
             result.completion,
@@ -2279,7 +2329,7 @@ where
     pub(super) fn complete_returned(
         &mut self,
         engine: &mut E,
-        reporter: &CompatReporter,
+        kernel: &KernelState,
         value: i64,
     ) -> Result<i64, RuntimeError> {
         if !matches!(
@@ -2290,24 +2340,38 @@ where
                 "threaded syscall completed without guest completion ownership".to_owned(),
             ));
         }
-        engine.complete_syscall(value)?;
+        if self.service_kernel_context.as_ref().is_some_and(|context| {
+            context.thread().control_slot().native_signal_owner()
+                && carrick_el1_abi::Lifecycle::gate(&*context.lifecycle_page()).serves_ring()
+        }) {
+            // A synchronous host wait can observe the bridge after the poll
+            // boundary. Publish its event before the native return checkpoint.
+            self.publish_external_ingress(kernel)?;
+            engine.complete_native_signal_return(
+                value,
+                self.native_restart_eligible.take().unwrap_or(true),
+            )?;
+        } else {
+            self.native_restart_eligible = None;
+            engine.complete_syscall(value)?;
+        }
         let SyscallCompletionOwnership::Guest(completion) = std::mem::replace(
             &mut self.syscall_completion,
             SyscallCompletionOwnership::Idle,
         ) else {
             unreachable!("guest completion ownership checked before engine completion")
         };
-        completion.publish_return(reporter, value);
+        completion.publish_return(&kernel.reporter, value);
         Ok(value)
     }
 
     pub(super) fn complete_errno(
         &mut self,
         engine: &mut E,
-        reporter: &CompatReporter,
+        kernel: &KernelState,
         errno: LinuxErrno,
     ) -> Result<i64, RuntimeError> {
-        self.complete_returned(engine, reporter, errno.guest_retval())
+        self.complete_returned(engine, kernel, errno.guest_retval())
     }
 
     pub(super) fn retire_syscall(&mut self) -> Result<(), RuntimeError> {
@@ -2390,6 +2454,10 @@ pub(super) use carrick_kernel::kernel::continuation::is_restartable_syscall;
 /// Run signal delivery for one iteration of the multi-threaded vCPU loop. Returns
 /// `Some(outcome)` when a default-action (terminate) signal fires and the process
 /// should end; `None` to keep running.
+fn carrier_signal_selection_permitted(native_signal_owner: bool) -> bool {
+    !native_signal_owner
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn service_signals_threaded<E: ThreadedEngine>(
     kernel: &Kernel,
@@ -2403,6 +2471,16 @@ pub(super) fn service_signals_threaded<E: ThreadedEngine>(
     reserved_signal: Option<carrick_kernel::kernel::continuation::ReservedSignal>,
     traps: usize,
 ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
+    if !carrier_signal_selection_permitted(context.thread().control_slot().native_signal_owner()) {
+        // Native bindings have one retained signal owner. A reserved carrier
+        // signal cannot silently be consumed by that owner's old selector.
+        if reserved_signal.is_some() {
+            return Err(RuntimeError::Configuration(
+                "reserved carrier signal reached a native signal binding".to_owned(),
+            ));
+        }
+        return Ok(None);
+    }
     {
         let restart = continuation_restart.map(|decision| {
             decision == carrick_kernel::kernel::continuation::RestartDecision::Restart

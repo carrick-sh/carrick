@@ -1,21 +1,140 @@
 //! Pure ARM frame publication used by the native backend and VM-free tests.
 use crate::isa::ArchError;
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 use crate::rust_alloc::vec::Vec;
 use carrick_el1_abi::TrapFrame;
-use carrick_personality_linux::signal::arm::{self, RtSigframe};
-#[cfg(not(target_os = "none"))]
+use carrick_personality_linux::signal::arm;
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+use carrick_personality_linux::signal::arm::RtSigframe;
+#[cfg(test)]
 use std::vec::Vec;
 
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+struct ArmSignalMachine {
+    backend: crate::isa::aarch64::Aarch64Backend,
+    user_sp: carrick_guest_arch::UserVa,
+}
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+impl super::signal_delivery::SignalMachine<carrick_sched_core::Aarch64ParkedContext>
+    for ArmSignalMachine
+{
+    type Backend = crate::isa::aarch64::Aarch64Backend;
+
+    fn backend(&mut self) -> &mut Self::Backend {
+        &mut self.backend
+    }
+
+    fn user_sp(&self, _frame: &TrapFrame) -> carrick_guest_arch::UserVa {
+        self.user_sp
+    }
+
+    fn restart(
+        &self,
+        frame: &mut TrapFrame,
+        original: carrick_sched_core::Aarch64ParkedContext,
+    ) -> bool {
+        frame.x[0] = original.syscall_return();
+        if let Some(pc) = frame.elr.checked_sub(4) {
+            frame.elr = pc;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn restart_forwarded(&self, frame: &mut TrapFrame) -> Option<bool> {
+        restart_forwarded_frame(frame)
+    }
+
+    fn group_exit_custody(
+        &self,
+        _task: &carrick_el1_abi::CurrentTask,
+    ) -> carrick_personality_linux::dispatch::CompletionRoute {
+        carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion
+    }
+}
+
+/// The synthetic mailbox checkpoint puts the original syscall arg0 in FAR;
+/// no guest fault uses FAR on this entry. A handler with SA_RESTART rewinds
+/// the interrupted SVC only for the shared restartable-call policy.
+pub(crate) fn restart_forwarded_frame(frame: &mut TrapFrame) -> Option<bool> {
+    if frame.esr != 0xfffe
+        || frame.x[0] != carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64
+        || !carrick_signal_core::is_native_restartable_syscall(frame.x[8])
+    {
+        return None;
+    }
+    rewind_forwarded_frame(frame)
+}
+
+/// Rewind an interrupted restart-class forwarded SVC for `SA_RESTART` or when
+/// no handler runs at the checkpoint (`WaitDecision::Continue`).
+fn rewind_forwarded_frame(frame: &mut TrapFrame) -> Option<bool> {
+    let Some(pc) = frame.elr.checked_sub(4) else {
+        return Some(false);
+    };
+    frame.x[0] = frame.far;
+    frame.elr = pc;
+    Some(true)
+}
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[inline(never)]
+pub(crate) fn deliver_on_user_return<X: super::aarch64_process::ForkStockCrossing>(
+    task: &carrick_el1_abi::CurrentTask,
+    process: &mut super::native_process_runtime::NativeProcessEntry<
+        '_,
+        'static,
+        super::aarch64_process::Mm,
+        carrick_sched_core::Aarch64ParkedContext,
+        super::aarch64_process::Aarch64NativeProcessService<'static, X>,
+    >,
+    frame: &mut TrapFrame,
+) -> Option<carrick_personality_linux::dispatch::CompletionRoute> {
+    use crate::sched::ThreadCpu;
+    use zerocopy::IntoBytes;
+
+    if !(process.signal_checkpoint_needed()
+        || (frame.esr == 0xfffe
+            && frame.x[0] == carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64))
+    {
+        return None;
+    }
+    let mut saved = crate::rust_alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
+    crate::sched::HardwareCpu.save(frame, &mut saved);
+    let mut fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+    fp.vregs = saved.native.v;
+    fp.fpsr = saved.native.fpsr as u32;
+    fp.fpcr = saved.native.fpcr as u32;
+    let sp = unsafe { crate::isa::aarch64::signal_stack() };
+    super::signal_delivery::deliver_signal_on_syscall_return(
+        task,
+        process,
+        frame,
+        fp.as_bytes(),
+        &mut ArmSignalMachine {
+            backend: crate::isa::aarch64::Aarch64Backend,
+            user_sp: sp,
+        },
+    )
+}
+
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 pub(crate) fn restore(
     frame: &mut TrapFrame,
     signal: &RtSigframe,
     fpstate: &mut [u8],
     signal_sp: carrick_guest_arch::UserVa,
-) -> Result<(u64, u64), ArchError> {
+) -> Result<(u64, u64, carrick_personality_linux::abi::thread::AltStack), ArchError> {
     use zerocopy::IntoBytes;
     let resume =
         arm::decode(signal.as_bytes(), signal_sp, true).map_err(|_| ArchError::InvalidFrame)?;
+    let stack = carrick_personality_linux::signal::restored_altstack(
+        resume.stack,
+        carrick_guest_arch::GuestIsa::Aarch64,
+    )
+    .ok_or(ArchError::InvalidFrame)?;
     let fp = resume.fpsimd.ok_or(ArchError::InvalidFrame)?;
     if fpstate.len() != fp.as_bytes().len() {
         return Err(ArchError::InvalidFrame);
@@ -24,9 +143,10 @@ pub(crate) fn restore(
     frame.x = resume.regs;
     frame.elr = resume.pc.raw();
     frame.spsr = resume.pstate;
-    Ok((resume.mask.signals().bits(), resume.sp.raw()))
+    Ok((resume.mask.signals().bits(), resume.sp.raw(), stack))
 }
 
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 fn frame_copy_buffer(len: usize) -> Result<Vec<u8>, ArchError> {
     let mut bytes = Vec::new();
     bytes
@@ -36,6 +156,57 @@ fn frame_copy_buffer(len: usize) -> Result<Vec<u8>, ArchError> {
     // bytes. Allocation failure takes the ordinary sigreturn failure path.
     bytes.resize(len, 0);
     Ok(bytes)
+}
+
+/// Apply the already validated public return state to the next hardware
+/// context. The ISA leaf loads this context only after every copy and record
+/// check has succeeded, so a malformed frame publishes no partial registers.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(crate) fn apply_restored_context(
+    context: &mut carrick_sched_core::ThreadCtx,
+    frame: &TrapFrame,
+    fp: &carrick_syscall_abi::LinuxFpsimdContext,
+    sp: u64,
+) {
+    context.x = frame.x;
+    context.pc = frame.elr;
+    context.pstate = frame.spsr;
+    context.sp_el0 = sp;
+    context.v = fp.vregs;
+    context.fpsr = u64::from(fp.fpsr);
+    context.fpcr = u64::from(fp.fpcr);
+}
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[inline(never)]
+pub(crate) fn restore_live_arm_signal_frame(
+    frame: &mut TrapFrame,
+    copy_in: &mut dyn carrick_personality_linux::lifecycle::UserCopy,
+) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, carrick_syscall_abi::LinuxErrno>
+{
+    use crate::sched::ThreadCpu;
+    use carrick_personality_linux::signal::SignalBackend;
+    use zerocopy::IntoBytes;
+
+    // The audited switch leaf is the sole reader/writer of EL0 FP/SIMD.
+    // Retain the context off the 16 KiB EL1 stack until validation commits.
+    let mut saved = crate::rust_alloc::boxed::Box::new(carrick_el1_abi::Aarch64ParkedContext::ZERO);
+    crate::sched::HardwareCpu.save(frame, &mut saved);
+    let mut fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+    fp.vregs = saved.native.v;
+    fp.fpsr = saved.native.fpsr as u32;
+    fp.fpcr = saved.native.fpcr as u32;
+    let mask = crate::isa::aarch64::Aarch64Backend
+        .restore_signal_frame(frame, fp.as_mut_bytes(), &mut |dst, src| {
+            copy_in.copy_in(dst, src)
+        })
+        .map_err(|_| carrick_syscall_abi::LINUX_EFAULT)?;
+    // restore_signal_frame validates and then publishes SP_EL0. Re-read it
+    // only after success; a failed copy leaves the saved hardware untouched.
+    let restored_sp = unsafe { crate::isa::aarch64::signal_stack().raw() };
+    apply_restored_context(&mut saved.native, frame, &fp, restored_sp);
+    crate::sched::HardwareCpu.load(frame, &saved);
+    Ok(mask)
 }
 
 pub(crate) fn build(
@@ -75,6 +246,53 @@ mod tests {
     use carrick_guest_arch::UserVa;
     use carrick_syscall_abi::LinuxFpsimdContext;
     use zerocopy::IntoBytes;
+
+    #[test]
+    fn forwarded_read_restart_replays_original_arg_only_at_native_checkpoint() {
+        let mut read = TrapFrame::default();
+        read.esr = 0xfffe;
+        read.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
+        read.x[8] = 63; // ARM read
+        read.far = 0x1234; // mailbox arg0, not a fault address
+        read.elr = 0x8004;
+        assert_eq!(restart_forwarded_frame(&mut read), Some(true));
+        assert_eq!(read.x[0], 0x1234);
+        assert_eq!(read.elr, 0x8000);
+
+        let mut timed_recv = TrapFrame::default();
+        timed_recv.esr = 0xfffd; // host continuation with SO_RCVTIMEO
+        timed_recv.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
+        timed_recv.x[8] = 207; // ARM recvfrom
+        timed_recv.far = 0x1234;
+        timed_recv.elr = 0x8004;
+        assert_eq!(restart_forwarded_frame(&mut timed_recv), None);
+        assert_eq!(
+            timed_recv.x[0],
+            carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64
+        );
+        assert_eq!(timed_recv.elr, 0x8004);
+
+        for nr in [202, 242, 207, 212] {
+            let mut socket = TrapFrame::default();
+            socket.esr = 0xfffe;
+            socket.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
+            socket.x[8] = nr;
+            socket.far = 0x5678;
+            socket.elr = 0x9004;
+            assert_eq!(restart_forwarded_frame(&mut socket), Some(true));
+            assert_eq!((socket.x[0], socket.elr), (0x5678, 0x9000));
+        }
+
+        let mut ppoll = TrapFrame::default();
+        ppoll.esr = 0xfffe;
+        ppoll.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
+        ppoll.x[8] = 73; // ARM ppoll always returns EINTR
+        ppoll.far = 0x5678;
+        ppoll.elr = 0x9004;
+        assert_eq!(restart_forwarded_frame(&mut ppoll), None);
+        assert_eq!(ppoll.elr, 0x9004);
+    }
+
     fn valid() -> RtSigframe {
         let mut signal = RtSigframe {
             siginfo: carrick_syscall_abi::LinuxSiginfo::empty(),
@@ -139,10 +357,29 @@ mod tests {
     fn ucontext_is_the_resume_authority() {
         let signal = valid();
         let mut frame = TrapFrame::default();
-        let (_, sp) = restore(&mut frame, &signal, &mut [0; 528], UserVa::new(0x40000)).unwrap();
+        let (_, sp, _) = restore(&mut frame, &signal, &mut [0; 528], UserVa::new(0x40000)).unwrap();
         assert_eq!(frame.x[0], 0x1234);
         assert_eq!(frame.elr, 0x10000);
         assert_eq!(sp, 0x20000);
+    }
+    #[test]
+    fn arm_public_return_restores_saved_autodisarm_altstack() {
+        let mut signal = valid();
+        signal.ucontext.uc_stack = carrick_syscall_abi::LinuxSignalStack {
+            ss_sp: 0x10_0000,
+            ss_flags: carrick_syscall_abi::LINUX_SS_AUTODISARM as i32,
+            _pad0: 0,
+            ss_size: 8192,
+        };
+        let mut frame = TrapFrame::default();
+        let (_, _, restored_stack) =
+            restore(&mut frame, &signal, &mut [0; 528], UserVa::new(0x40000)).unwrap();
+        let sp = restored_stack.sp;
+        let size = restored_stack.size;
+        let flags = restored_stack.flags;
+        assert_eq!(sp, 0x10_0000);
+        assert_eq!(size, 8192);
+        assert_eq!(flags, carrick_syscall_abi::LINUX_SS_AUTODISARM as u32);
     }
     #[test]
     fn forged_ucontext_el1_is_refused_without_publication() {
@@ -213,16 +450,46 @@ mod tests {
 
     #[test]
     fn arm_public_signal_frame_roundtrip_has_no_private_magic() {
+        assert_eq!(
+            carrick_personality_linux::dispatch::route_aarch64(139, u64::MAX),
+            carrick_personality_linux::dispatch::Family::Signal(
+                carrick_personality_linux::signal::SignalCall::RtSigreturn
+            ),
+            "native ARM return must stay in-ring, never reach carrier frame restoration"
+        );
         let signal = valid();
         assert_eq!(signal.as_bytes().len(), arm::PUBLIC_FRAME_LEN);
         let mut frame = TrapFrame::default();
         let mut output = [0; 528];
-        let (_, sp) = restore(&mut frame, &signal, &mut output, UserVa::new(0x40000))
+        let (_, sp, _) = restore(&mut frame, &signal, &mut output, UserVa::new(0x40000))
             .expect("a public Linux ucontext has no private authentication trailer");
         assert_eq!(frame.x[0], 0x1234);
         assert_eq!(frame.elr, 0x10000);
         assert_eq!(sp, 0x20000);
         assert_eq!(output.as_slice(), LinuxFpsimdContext::empty().as_bytes());
+    }
+
+    #[test]
+    fn arm_restored_public_frame_replaces_gprs_and_fpsimd_in_live_context() {
+        let mut context = carrick_sched_core::ThreadCtx::ZERO;
+        let mut frame = TrapFrame::default();
+        frame.x[0] = 0x1234_5678;
+        frame.elr = 0x4000;
+        frame.spsr = 0;
+        let mut fp = LinuxFpsimdContext::empty();
+        fp.vregs[7] = 0x1234_5678_9abc_def0;
+        fp.fpsr = 0x55;
+        fp.fpcr = 0xaa;
+        apply_restored_context(&mut context, &frame, &fp, 0x8000);
+        assert_eq!(context.x[0], frame.x[0]);
+        assert_eq!(context.pc, frame.elr);
+        assert_eq!(context.sp_el0, 0x8000);
+        let expected_v = fp.vregs[7];
+        let expected_fpsr = fp.fpsr;
+        let expected_fpcr = fp.fpcr;
+        assert_eq!(context.v[7], expected_v);
+        assert_eq!(context.fpsr, u64::from(expected_fpsr));
+        assert_eq!(context.fpcr, u64::from(expected_fpcr));
     }
 
     #[test]
@@ -292,6 +559,13 @@ mod tests {
     }
 
     #[test]
+    fn arm_public_return_rejects_invalid_altstack_before_register_publication() {
+        let mut signal = valid();
+        signal.ucontext.uc_stack.ss_flags = 0x4000;
+        refused_without_publication(signal);
+    }
+
+    #[test]
     fn arm_public_signal_frame_half_terminator_is_refused() {
         let mut signal = valid();
         signal.ucontext.uc_mcontext.__reserved[532..536].copy_from_slice(&16_u32.to_le_bytes());
@@ -308,10 +582,14 @@ mod tests {
     }
 }
 
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[cfg(any(
+    test,
+    feature = "host-test",
+    all(target_os = "none", target_arch = "aarch64")
+))]
 use carrick_guest_arch::UserVa;
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::FromBytes;
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl carrick_personality_linux::signal::SignalBackend for crate::isa::aarch64::Aarch64Backend {
@@ -323,33 +601,7 @@ impl carrick_personality_linux::signal::SignalBackend for crate::isa::aarch64::A
         _fpstate: &[u8],
         copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
     ) -> Result<UserVa, Self::Error> {
-        let (sp, sigframe) = build(frame, params, siginfo, _fpstate)?;
-        let new_sp = sp.raw();
-
-        let frame_bytes = sigframe.as_bytes();
-        if !copy_out(UserVa::new(new_sp), frame_bytes) {
-            return Err(ArchError::InvalidFrame);
-        }
-
-        let info_addr = new_sp;
-        let uc_addr = new_sp + arm::UCONTEXT_OFFSET as u64;
-
-        frame.elr = params.handler.raw();
-        frame.x[0] = params.signal.number() as u64;
-        frame.x[1] = info_addr;
-        frame.x[2] = uc_addr;
-        frame.x[29] = new_sp + arm::FRAME_RECORD_OFFSET as u64;
-        frame.x[30] = params.restorer.map_or(
-            carrick_syscall_abi::LINUX_SIGRETURN_TRAMPOLINE_BASE,
-            UserVa::raw,
-        );
-
-        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-        unsafe {
-            crate::isa::aarch64::set_signal_stack(UserVa::new(new_sp));
-        }
-
-        Ok(UserVa::new(new_sp))
+        setup_arm_signal_frame(frame, params, siginfo, _fpstate, copy_out)
     }
 
     fn restore_signal_frame(
@@ -357,12 +609,8 @@ impl carrick_personality_linux::signal::SignalBackend for crate::isa::aarch64::A
         frame: &mut TrapFrame,
         _fpstate: &mut [u8],
         copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool,
-    ) -> Result<carrick_signal_core::policy::SigBlockMask, Self::Error> {
-        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-        let sp_val = { unsafe { crate::isa::aarch64::signal_stack().raw() } };
-        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
-        let sp_val = 0u64;
-
+    ) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, Self::Error> {
+        let sp_val = unsafe { crate::isa::aarch64::signal_stack().raw() };
         let sp = UserVa::new(sp_val);
         // A public frame is over 4 KiB. Keep the admitted copy off the 16 KiB
         // EL1 stack and borrow it throughout decode.
@@ -374,15 +622,61 @@ impl carrick_personality_linux::signal::SignalBackend for crate::isa::aarch64::A
             return Err(ArchError::InvalidFrame);
         };
 
-        let (mask, saved_sp) = restore(frame, sigframe, _fpstate, sp)?;
+        let (mask, saved_sp, stack) = restore(frame, sigframe, _fpstate, sp)?;
 
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         unsafe {
             crate::isa::aarch64::set_signal_stack(UserVa::new(saved_sp));
         }
 
-        Ok(carrick_signal_core::policy::SigBlockMask::blocking_all_of(
-            carrick_signal_core::SignalSet::from_bits(mask),
-        ))
+        Ok(carrick_personality_linux::signal::RestoredSignalFrame {
+            mask: carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                carrick_signal_core::SignalSet::from_bits(mask),
+            ),
+            stack,
+        })
     }
+}
+
+/// Shared frame publication for the native backend and its host-path witness.
+#[cfg(any(
+    test,
+    feature = "host-test",
+    all(target_os = "none", target_arch = "aarch64")
+))]
+pub(crate) fn setup_arm_signal_frame(
+    frame: &mut TrapFrame,
+    params: carrick_personality_linux::signal::SignalFrameParams,
+    siginfo: Option<&[u8]>,
+    fpstate: &[u8],
+    copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
+) -> Result<UserVa, ArchError> {
+    use zerocopy::IntoBytes;
+    let (sp, sigframe) = build(frame, params, siginfo, fpstate)?;
+    let new_sp = sp.raw();
+
+    let frame_bytes = sigframe.as_bytes();
+    if !copy_out(UserVa::new(new_sp), frame_bytes) {
+        return Err(ArchError::InvalidFrame);
+    }
+
+    let info_addr = new_sp;
+    let uc_addr = new_sp + arm::UCONTEXT_OFFSET as u64;
+
+    frame.elr = params.handler.raw();
+    frame.x[0] = params.signal.number() as u64;
+    frame.x[1] = info_addr;
+    frame.x[2] = uc_addr;
+    frame.x[29] = new_sp + arm::FRAME_RECORD_OFFSET as u64;
+    frame.x[30] = params.restorer.map_or(
+        carrick_syscall_abi::LINUX_SIGRETURN_TRAMPOLINE_BASE,
+        UserVa::raw,
+    );
+
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    unsafe {
+        crate::isa::aarch64::set_signal_stack(UserVa::new(new_sp));
+    }
+
+    Ok(UserVa::new(new_sp))
 }

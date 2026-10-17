@@ -298,7 +298,6 @@ host_crossings! {
     Execveat = nr::EXECVEAT, false, Permanent;
     Mlockall = nr::MLOCKALL, false, Temporary;
     Munlockall = nr::MUNLOCKALL, false, Temporary;
-    RtSigreturn = nr::RT_SIGRETURN, false, Temporary;
     Exit = nr::EXIT, true, Terminal;
     ExitGroup = nr::EXIT_GROUP, true, Terminal;
 }
@@ -435,14 +434,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ring_first_census_host_files_and_signal_return_are_admitted() {
-        for ordinal in [213, 223, 281, 139, 230, 231] {
+    fn ring_first_census_host_files_are_admitted_but_signal_return_is_owned() {
+        for ordinal in [213, 223, 281, 230, 231] {
             assert!(
                 HostCrossingSet::Aarch64.is_allowed(CanonicalNr::new(ordinal)),
                 "ARM fallback ordinal={ordinal}"
             );
             assert!(!HostCrossingSet::X86.is_allowed(CanonicalNr::new(ordinal)));
         }
+        assert!(!HostCrossingSet::Aarch64.is_allowed(nr::RT_SIGRETURN));
     }
 
     #[test]
@@ -534,7 +534,7 @@ mod tests {
 
     #[test]
     fn test_aarch64_crossings_exact() {
-        assert_eq!(HOST_CROSSINGS.iter().flatten().count(), 124);
+        assert_eq!(HOST_CROSSINGS.iter().flatten().count(), 123);
         for (crossing, _, _) in HOST_CROSSINGS.iter().flatten() {
             let nr = crossing.canonical();
             assert!(
@@ -553,6 +553,7 @@ mod tests {
             CanonicalNr(124), // sched_yield
             CanonicalNr(132), // sigaltstack
             CanonicalNr(135), // rt_sigprocmask
+            CanonicalNr(139), // rt_sigreturn
             CanonicalNr(172), // getpid
             CanonicalNr(178), // gettid
             CanonicalNr(214), // brk

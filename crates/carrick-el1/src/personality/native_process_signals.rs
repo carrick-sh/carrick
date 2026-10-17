@@ -13,6 +13,8 @@ use carrick_signal_core::policy::{
     Action, ActionError, ActionInheritance, ActionTable, ChildEvent, ChildInterest, Disposition,
     SigBlockMask, SighandSharing, Signal, child_decision,
 };
+use core::ops::Deref;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// The retained thread control authority supplies the live typed mask.
 pub trait BlockedMaskSource {
@@ -42,6 +44,86 @@ struct SignalResources<T> {
     thread_pending: Vec<(carrick_sched_core::RecordRef, PendingSignals<T>)>,
     forced_segv: Vec<carrick_sched_core::RecordRef>,
 }
+
+// The summary is conservative across native processes: a signal in another
+// process may cause an extra slow checkpoint, but an empty/unblocked word can
+// never hide work from the exact owner. Mutations serialize here; IRQ/fault
+// return reads only the published atomic word.
+static SUMMARY_COUNTS: SpinLock<[u64; 64]> = SpinLock::new([0; 64]);
+static SUMMARY_WORD: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn pending_summary_word() -> u64 {
+    SUMMARY_WORD.load(Ordering::Acquire)
+}
+
+fn publish_summary_delta(before: u64, after: u64) {
+    if before == after {
+        return;
+    }
+    let mut counts = SUMMARY_COUNTS.lock();
+    let mut changed = before ^ after;
+    while changed != 0 {
+        let bit = changed & changed.wrapping_neg();
+        let index = bit.trailing_zeros() as usize;
+        if after & bit != 0 {
+            counts[index] = counts[index].saturating_add(1);
+        } else {
+            counts[index] = counts[index].saturating_sub(1);
+        }
+        changed &= !bit;
+    }
+    let mut word = 0;
+    for (index, count) in counts.iter().enumerate() {
+        if *count != 0 {
+            word |= 1u64 << index;
+        }
+    }
+    SUMMARY_WORD.store(word, Ordering::Release);
+}
+
+struct SignalShared<T> {
+    state: SpinLock<SignalResources<T>>,
+    summary: AtomicU64,
+}
+
+impl<T> SignalShared<T> {
+    fn new(resources: SignalResources<T>) -> Self {
+        let shared = Self {
+            state: SpinLock::new(resources),
+            summary: AtomicU64::new(0),
+        };
+        {
+            let state = shared.state.lock();
+            shared.refresh_summary(&state);
+        }
+        shared
+    }
+
+    fn refresh_summary(&self, resources: &SignalResources<T>) {
+        let mut present = resources.inbox.pending().present().bits();
+        for (_, pending) in &resources.thread_pending {
+            present |= pending.present().bits();
+        }
+        for _ in &resources.forced_segv {
+            present |= Signal::SEGV.bit();
+        }
+        let before = self.summary.swap(present, Ordering::Relaxed);
+        publish_summary_delta(before, present);
+    }
+}
+
+impl<T> Deref for SignalShared<T> {
+    type Target = SpinLock<SignalResources<T>>;
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl<T> Drop for SignalShared<T> {
+    fn drop(&mut self) {
+        publish_summary_delta(self.summary.load(Ordering::Relaxed), 0);
+    }
+}
 // Default stops await process-owner stop/wait-event custody. Both wait
 // interruption and dequeue selection must leave them pending.
 fn awaits_stop_custody(action: Action, signal: Signal) -> bool {
@@ -52,7 +134,7 @@ fn awaits_stop_custody(action: Action, signal: Signal) -> bool {
 /// One actual sighand and pending owner, retained by exact task handles.
 pub struct NativeProcessSignals<T> {
     key: TaskKey,
-    resources: Arc<SpinLock<SignalResources<T>>>,
+    resources: Arc<SignalShared<T>>,
 }
 impl<T> Clone for NativeProcessSignals<T> {
     fn clone(&self) -> Self {
@@ -73,7 +155,7 @@ impl<T> NativeProcessSignals<T> {
     pub fn fresh_root(key: TaskKey) -> Self {
         Self {
             key,
-            resources: Arc::new(SpinLock::new(SignalResources {
+            resources: Arc::new(SignalShared::new(SignalResources {
                 actions: ActionTable::default(),
                 inbox: SignalInbox::new(key),
                 thread_pending: Vec::new(),
@@ -110,6 +192,7 @@ impl<T> NativeProcessSignals<T> {
                 }
             }
             thread_pending.retain(|(_, pending)| !pending.is_empty());
+            self.resources.refresh_summary(&resources);
         }
         Ok(old)
     }
@@ -154,9 +237,18 @@ impl<T> NativeProcessSignals<T> {
             pending.enqueue(signal, info);
             resources.thread_pending.push((tid, pending));
         }
+        self.resources.refresh_summary(&resources);
     }
     pub fn action(&self, signal: Signal) -> Action {
         self.resources.lock().actions.action(signal)
+    }
+    pub fn non_interrupting_signals(&self) -> SignalSet {
+        let resources = self.resources.lock();
+        let mut set = resources.actions.non_interrupting_signals();
+        if !resources.forced_segv.is_empty() {
+            set = set.without(Signal::SEGV);
+        }
+        set
     }
     pub fn enqueue(
         &self,
@@ -164,7 +256,10 @@ impl<T> NativeProcessSignals<T> {
         signal: Signal,
         info: Option<T>,
     ) -> Result<EnqueueOutcome, StaleTarget> {
-        self.resources.lock().inbox.enqueue_for(key, signal, info)
+        let mut resources = self.resources.lock();
+        let outcome = resources.inbox.enqueue_for(key, signal, info);
+        self.resources.refresh_summary(&resources);
+        outcome
     }
     pub fn enqueue_thread(
         &self,
@@ -173,14 +268,16 @@ impl<T> NativeProcessSignals<T> {
         info: Option<T>,
     ) -> EnqueueOutcome {
         let mut res = self.resources.lock();
-        if let Some((_, p)) = res.thread_pending.iter_mut().find(|(t, _)| *t == tid) {
+        let outcome = if let Some((_, p)) = res.thread_pending.iter_mut().find(|(t, _)| *t == tid) {
             p.enqueue(signal, info)
         } else {
             let mut p = PendingSignals::default();
             let outcome = p.enqueue(signal, info);
             res.thread_pending.push((tid, p));
             outcome
-        }
+        };
+        self.resources.refresh_summary(&res);
+        outcome
     }
     pub fn pending_set(&self, tid: carrick_sched_core::RecordRef) -> SignalSet {
         let resources = self.resources.lock();
@@ -209,11 +306,9 @@ impl<T> NativeProcessSignals<T> {
                 return false;
             };
             let action = resources.actions.action(signal);
-            let ignored = action.disposition == Disposition::Ignore
-                || (action.disposition == Disposition::Default
-                    && carrick_signal_core::policy::default_delivery(signal)
-                        == carrick_signal_core::policy::Delivery::Ignore);
-            if !ignored && !awaits_stop_custody(action, signal) {
+            if carrick_signal_core::policy::action_interrupts_wait(signal, action)
+                && !awaits_stop_custody(action, signal)
+            {
                 return true;
             }
             selected = selected.without(signal);
@@ -264,10 +359,12 @@ impl<T> NativeProcessSignals<T> {
             if !thread_pending.is_empty() {
                 resources.thread_pending.push((tid, thread_pending));
             }
+            self.resources.refresh_summary(&resources);
             let delivery = delivery?;
             let signal = delivery.entry.signal;
             if signal == Signal::SEGV {
                 resources.forced_segv.retain(|id| *id != tid);
+                self.resources.refresh_summary(&resources);
             }
             let action = resources.actions.action(signal);
             if action.disposition == Disposition::Ignore
@@ -301,6 +398,7 @@ impl<T> NativeProcessSignals<T> {
         if !thread_pending.is_empty() {
             resources.thread_pending.push((tid, thread_pending));
         }
+        self.resources.refresh_summary(&resources);
         let delivery = delivery?;
         Some((delivery.entry.signal, delivery.entry.info))
     }
@@ -320,7 +418,7 @@ impl<T> NativeProcessSignals<T> {
         };
         Some(Self {
             key: child,
-            resources: Arc::new(SpinLock::new(SignalResources {
+            resources: Arc::new(SignalShared::new(SignalResources {
                 actions,
                 inbox: source.inbox.for_fork(child),
                 thread_pending: Vec::new(),
@@ -385,6 +483,32 @@ mod tests {
             id: carrick_personality_linux::identity::task_id_from_linux_pid(raw).unwrap(),
             serial: TaskSerial::from_raw_u64(serial).unwrap(),
         }
+    }
+    #[test]
+    fn process_sigint_waits_for_unblocked_worker_and_survives_exec() {
+        let task = key(41, 11);
+        let signals = NativeProcessSignals::<u32>::fresh_root(task);
+        let main = carrick_sched_core::RecordRef {
+            id: carrick_sched_core::RecordId::from_raw(1).unwrap(),
+            incarnation: 7,
+        };
+        let worker = carrick_sched_core::RecordRef {
+            id: carrick_sched_core::RecordId::from_raw(2).unwrap(),
+            incarnation: 9,
+        };
+        let sigint = Signal::from_number(2).unwrap();
+        signals.enqueue(task, sigint, Some(77)).unwrap();
+        let blocked_main = SigBlockMask::blocking_all_of(SignalSet::EMPTY.with(sigint));
+        assert!(!signals.has_deliverable(main, blocked_main));
+        assert!(signals.take_deliverable(main, blocked_main).is_none());
+        signals.reset_for_exec();
+        assert_eq!(signals.pending_count(), 1);
+        assert!(signals.has_deliverable(worker, SigBlockMask::NONE));
+        let selected = signals
+            .take_deliverable(worker, SigBlockMask::NONE)
+            .unwrap();
+        assert_eq!((selected.0, selected.1), (sigint, Some(77)));
+        assert_eq!(signals.pending_count(), 0);
     }
     #[test]
     fn installing_ignore_discards_process_and_thread_pending() {

@@ -931,6 +931,27 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
         result
     }
 
+    fn complete_native_signal_return(
+        &mut self,
+        return_value: i64,
+        restart_eligible: bool,
+    ) -> Result<(), TrapError> {
+        let live = self.live_mut()?;
+        match live.mailbox.transport() {
+            HvfSyscallTransport::Mailbox => live
+                .mailbox
+                .publish_native_signal_return(return_value, restart_eligible)
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!(
+                        "native signal checkpoint publication failed: {error}"
+                    ))
+                }),
+            HvfSyscallTransport::Legacy => Err(TrapError::Hypervisor(
+                "native signal checkpoint requires mailbox transport".to_owned(),
+            )),
+        }
+    }
+
     fn pending_syscall_return(&self) -> Result<Option<i64>, TrapError> {
         let HvfVcpuBacking::Live(live) = &self.backing else {
             return Ok(None);

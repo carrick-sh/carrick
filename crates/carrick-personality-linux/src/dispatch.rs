@@ -624,7 +624,7 @@ pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
         132 => Family::Lifecycle(LifecycleCall::SigAltStack),
         135 => Family::Lifecycle(LifecycleCall::SigProcMask),
         134 => Family::Signal(crate::signal::SignalCall::RtSigaction),
-        139 => Family::SignalReturn,
+        139 => Family::Signal(crate::signal::SignalCall::RtSigreturn),
         129..=131 | 133 | 136..=138 | 240 => Family::Unported,
         _ => route_shared(ordinal, allocator_control),
     }
@@ -1269,6 +1269,7 @@ mod ring_first_tests {
             )
         }
         fn set_current_blocked(&mut self, _mask: carrick_signal_core::policy::SigBlockMask) {}
+        fn set_current_altstack(&mut self, _stack: crate::abi::thread::AltStack) {}
         fn current_pid(&self) -> u32 {
             1
         }
@@ -1277,10 +1278,12 @@ mod ring_first_tests {
         }
         fn restore_signal_frame(
             &mut self,
-        ) -> Result<carrick_signal_core::policy::SigBlockMask, carrick_syscall_abi::LinuxErrno>
-        {
+        ) -> Result<crate::signal::RestoredSignalFrame, carrick_syscall_abi::LinuxErrno> {
             self.signal_restore_calls += 1;
-            Ok(self.current_blocked())
+            Ok(crate::signal::RestoredSignalFrame {
+                mask: self.current_blocked(),
+                stack: crate::abi::thread::AltStack::DISABLED,
+            })
         }
     }
 
@@ -1469,7 +1472,7 @@ mod ring_first_tests {
             (98, false, true, CompletionRoute::Forward),
             (98, true, true, CompletionRoute::Forward),
             (222, true, true, CompletionRoute::Forward),
-            (139, false, false, CompletionRoute::Forward),
+            (139, false, false, CompletionRoute::Served),
             (220, false, false, CompletionRoute::Forward),
             (260, false, false, CompletionRoute::Forward),
             (260, true, false, CompletionRoute::WithWork),

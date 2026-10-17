@@ -4792,15 +4792,19 @@ pub fn el1_vectors_bytes_shim_fd_ceiling() -> Vec<u8> {
 }
 
 const MAILBOX_HANDLER_OFFSET: usize = 0xA00;
-const MAILBOX_HANDLER_SIZE: usize = 0x200;
+const MAILBOX_HANDLER_SIZE: usize = 0x220;
 /// The ordinary request capture: the same offset in every mailbox image (the
 /// optional fstat guard and EL1 hook branch are NOP-padded when absent).
 const MAILBOX_CAPTURE_OFFSET: usize = MAILBOX_HANDLER_OFFSET + 44;
 
 const EL1_VECTOR_HOOK_OFFSET: usize = 0x1000;
+const _: () = assert!(MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE <= EL1_VECTOR_HOOK_OFFSET);
 /// The EL0 IRQ hook ([`El1IrqMode::Gic`]): the lower-EL IRQ slot branches
 /// here, and it enters the EL1 image with an interrupt frame.
 const EL0_IRQ_HOOK_OFFSET: usize = 0x2000;
+/// Synthetic EL0 return checkpoint after a host-forwarded syscall. It shares
+/// the IRQ hook's 4 KiB code island but does not acknowledge a physical IRQ.
+const EL0_SIGNAL_HOOK_OFFSET: usize = 0x2800;
 /// The EL0 fault hook: the lower-EL sync slot branches here for EC 0x20
 /// instruction aborts and EC 0x24 data aborts,
 /// saving all architectural registers, ESR and FAR, calling the EL1 image, and forwarding
@@ -4837,6 +4841,7 @@ enum HookEntry {
     /// syndrome is 0, and a forward leaves through `hvc #4` at that EL0
     /// boundary.
     Irq,
+    SignalCheck,
     /// An EL0 instruction or data abort (EC 0x20 or 0x24): a forward restores all registers and
     /// leaves through `legacy_hvc` (`hvc #2`).
     Fault,
@@ -4961,9 +4966,45 @@ fn write_el1_hook(
             emit(bytes, &mut cursor, enc_str_xt_xn(17, 16, 280)); // far at offset 280
         }
         // An interrupt frame: syndrome 0 (an SVC's never is).
-        HookEntry::Irq => {
-            emit(bytes, &mut cursor, enc_str_xt_xn(31, 16, 264));
-            emit(bytes, &mut cursor, enc_str_xt_xn(31, 16, 280));
+        HookEntry::Irq | HookEntry::SignalCheck => {
+            if entry == HookEntry::SignalCheck {
+                // The host provides only restart eligibility; the native
+                // signal owner still decides whether SA_RESTART applies.
+                emit(
+                    bytes,
+                    &mut cursor,
+                    enc_ldr_wt_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_RESPONSE_ACTION),
+                );
+                emit(bytes, &mut cursor, enc_cmp_w16_imm(5) | (1 << 5)); // cmp w17, #5
+                let eligible_branch = cursor;
+                emit(bytes, &mut cursor, 0);
+                emit(bytes, &mut cursor, enc_movz_w16(0xfffd) | 1); // no restart
+                let store_branch = cursor;
+                emit(bytes, &mut cursor, 0);
+                let eligible = cursor;
+                emit(bytes, &mut cursor, enc_movz_w16(0xfffe) | 1);
+                let store = cursor;
+                put(
+                    bytes,
+                    eligible_branch,
+                    enc_bne(eligible_branch as u64, eligible as u64),
+                );
+                put(
+                    bytes,
+                    store_branch,
+                    enc_b(store_branch as u64, store as u64),
+                );
+                emit(bytes, &mut cursor, enc_str_xt_xn(17, 16, 264));
+                emit(
+                    bytes,
+                    &mut cursor,
+                    enc_ldr_xt_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_ARGS),
+                );
+                emit(bytes, &mut cursor, enc_str_xt_xn(17, 16, 280));
+            } else {
+                emit(bytes, &mut cursor, enc_str_xt_xn(31, 16, 264));
+                emit(bytes, &mut cursor, enc_str_xt_xn(31, 16, 280));
+            }
         }
     }
 
@@ -5176,10 +5217,11 @@ fn write_el1_hook(
                 enc_b(branch_to_capture as u64, mailbox_capture as u64),
             );
         }
-        HookEntry::Irq => {
+        HookEntry::Irq | HookEntry::SignalCheck => {
             // The EL0 boundary kick exit: ELR/SPSR_EL1 hold the interrupted
             // EL0 state, which the host's `hvc #4` decode makes the live PC
-            // and PSTATE.
+            // and PSTATE. A native signal checkpoint with newly owed host
+            // work needs this same boundary, never the fault-only `hvc #3`.
             emit(bytes, &mut cursor, AARCH64_HVC_KICK_OPCODE);
             emit(bytes, &mut cursor, AARCH64_ERET_OPCODE);
         }
@@ -5233,7 +5275,12 @@ fn write_el1_hook(
     }
 
     debug_assert!(
-        cursor <= hook_offset + 0x1000,
+        cursor
+            <= match entry {
+                HookEntry::Irq => EL0_SIGNAL_HOOK_OFFSET,
+                HookEntry::SignalCheck => EL0_FAULT_HOOK_OFFSET,
+                _ => hook_offset + 0x1000,
+            },
         "EL1 hook overruns its 4 KiB of the vector page"
     );
     frame_entry
@@ -5726,6 +5773,12 @@ fn el1_vectors_bytes_mailbox_with_layout(
     emit(&mut bytes, &mut cursor, enc_cmp_w16_imm(3));
     let arm_branch = cursor;
     emit(&mut bytes, &mut cursor, 0);
+    emit(&mut bytes, &mut cursor, enc_cmp_w16_imm(4));
+    let native_signal_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+    emit(&mut bytes, &mut cursor, enc_cmp_w16_imm(5));
+    let native_signal_no_restart_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
     let invalid_action_branch = cursor;
     emit(&mut bytes, &mut cursor, 0);
 
@@ -5745,6 +5798,27 @@ fn el1_vectors_bytes_mailbox_with_layout(
         enc_ldr_xt_sp(0, AARCH64_SYSCALL_MAILBOX_OFF_RETURN_VALUE),
     );
     let armed_finalize_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
+
+    let native_signal_return = cursor;
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_ldr_xt_sp(0, AARCH64_SYSCALL_MAILBOX_OFF_RETURN_VALUE),
+    );
+    emit(&mut bytes, &mut cursor, enc_movz_w16(0));
+    emit(&mut bytes, &mut cursor, AARCH64_STLR_W16_X17_OPCODE);
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_ldr_xt_sp(16, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X16),
+    );
+    emit(
+        &mut bytes,
+        &mut cursor,
+        enc_ldr_xt_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X17),
+    );
+    let native_signal_hook_branch = cursor;
     emit(&mut bytes, &mut cursor, 0);
 
     let finalize = cursor;
@@ -5913,6 +5987,27 @@ fn el1_vectors_bytes_mailbox_with_layout(
     );
     put(
         &mut bytes,
+        native_signal_branch,
+        enc_beq(native_signal_branch as u64, native_signal_return as u64),
+    );
+    put(
+        &mut bytes,
+        native_signal_no_restart_branch,
+        enc_beq(
+            native_signal_no_restart_branch as u64,
+            native_signal_return as u64,
+        ),
+    );
+    put(
+        &mut bytes,
+        native_signal_hook_branch,
+        enc_b(
+            native_signal_hook_branch as u64,
+            EL0_SIGNAL_HOOK_OFFSET as u64,
+        ),
+    );
+    put(
+        &mut bytes,
         invalid_action_branch,
         enc_b(invalid_action_branch as u64, invalid_action as u64),
     );
@@ -5944,6 +6039,13 @@ fn el1_vectors_bytes_mailbox_with_layout(
             legacy_hvc,
             irq,
             HookEntry::Fault,
+        );
+        write_el1_hook(
+            &mut bytes,
+            EL0_SIGNAL_HOOK_OFFSET,
+            legacy_hvc,
+            irq,
+            HookEntry::SignalCheck,
         );
         if irq == El1IrqMode::Gic {
             let _ = write_el0_irq_hook(&mut bytes, EL0_IRQ_HOOK_OFFSET);
@@ -8090,6 +8192,77 @@ mod syscall_mailbox_tests {
                 .count()
                 >= 2,
             "invalid state and response action must each fail loud"
+        );
+    }
+
+    #[test]
+    fn forwarded_native_return_enters_el1_signal_checkpoint_before_eret() {
+        let bytes = el1_vectors_bytes_mailbox_configured(false, false, true);
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("word")))
+            .collect();
+        let hvc = words
+            [MAILBOX_HANDLER_OFFSET / 4..(MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE) / 4]
+            .iter()
+            .position(|word| *word == AARCH64_HVC_SYSCALL_OPCODE)
+            .map(|index| index + MAILBOX_HANDLER_OFFSET / 4)
+            .expect("forwarded syscall HVC");
+        let compare = words[hvc..(MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE) / 4]
+            .iter()
+            .position(|word| *word == enc_cmp_w16_imm(4))
+            .map(|index| index + hvc)
+            .expect("native checkpoint response action");
+        let branch = words[compare + 1];
+        assert_eq!(branch & 0xff00_001f, 0x5400_0000, "expected b.eq");
+        let offset = (((branch >> 5) & 0x7ffff) as i32) << 13 >> 13;
+        let target = (compare + 1) as i32 + offset;
+        assert_eq!(
+            words[target as usize],
+            enc_ldr_xt_sp(0, AARCH64_SYSCALL_MAILBOX_OFF_RETURN_VALUE)
+        );
+        assert_eq!(words[target as usize + 2], AARCH64_STLR_W16_X17_OPCODE);
+        let hook_branch = words[target as usize + 5];
+        assert_eq!(hook_branch & 0xfc00_0000, 0x1400_0000);
+        let displacement = ((hook_branch & 0x03ff_ffff) as i32) << 6 >> 6;
+        assert_eq!(
+            target + 5 + displacement,
+            (EL0_SIGNAL_HOOK_OFFSET / 4) as i32,
+            "the native response must enter EL1 before any ERET"
+        );
+        assert_eq!(words[compare + 2], enc_cmp_w16_imm(5));
+        let no_restart_branch = words[compare + 3];
+        assert_eq!(no_restart_branch & 0xff00_001f, 0x5400_0000);
+        let no_restart_offset = (((no_restart_branch >> 5) & 0x7ffff) as i32) << 13 >> 13;
+        assert_eq!((compare + 3) as i32 + no_restart_offset, target);
+        assert!(
+            words[EL0_SIGNAL_HOOK_OFFSET / 4..EL0_FAULT_HOOK_OFFSET / 4]
+                .contains(&(enc_movz_w16(0xfffe) | 1))
+        );
+        assert!(
+            words[EL0_SIGNAL_HOOK_OFFSET / 4..EL0_FAULT_HOOK_OFFSET / 4]
+                .contains(&(enc_movz_w16(0xfffd) | 1))
+        );
+        assert!(
+            words[EL0_SIGNAL_HOOK_OFFSET / 4..EL0_FAULT_HOOK_OFFSET / 4]
+                .contains(&enc_ldr_xt_sp(17, AARCH64_SYSCALL_MAILBOX_OFF_ARGS))
+        );
+    }
+
+    #[test]
+    fn pending_host_work_in_native_signal_hook_exits_as_kick() {
+        let bytes = el1_vectors_bytes_mailbox_configured(false, false, true);
+        let hook: Vec<u32> = bytes[EL0_SIGNAL_HOOK_OFFSET..EL0_FAULT_HOOK_OFFSET]
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().expect("word")))
+            .collect();
+        assert!(hook.contains(&AARCH64_HVC_KICK_OPCODE));
+        assert_eq!(
+            hook.iter()
+                .filter(|opcode| **opcode == AARCH64_HVC_FAULT_OPCODE)
+                .count(),
+            1,
+            "only the unreachable idle-exit sentinel may fail as a fault"
         );
     }
 

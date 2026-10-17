@@ -460,6 +460,7 @@ pub trait SignalNative<'a>: crate::lifecycle::UserCopy {
     fn process_signals(&mut self) -> Option<&mut dyn ProcessSignals>;
     fn current_blocked(&self) -> carrick_signal_core::policy::SigBlockMask;
     fn set_current_blocked(&mut self, mask: carrick_signal_core::policy::SigBlockMask);
+    fn set_current_altstack(&mut self, stack: crate::abi::thread::AltStack);
     fn current_pid(&self) -> u32;
     fn current_tid(&self) -> u32;
     fn current_uid(&self) -> u32 {
@@ -467,7 +468,7 @@ pub trait SignalNative<'a>: crate::lifecycle::UserCopy {
     }
     fn restore_signal_frame(
         &mut self,
-    ) -> Result<carrick_signal_core::policy::SigBlockMask, carrick_syscall_abi::LinuxErrno>;
+    ) -> Result<RestoredSignalFrame, carrick_syscall_abi::LinuxErrno>;
     fn force_sigsegv(&mut self) -> bool {
         let blocked = self.current_blocked();
         let forced = self
@@ -628,8 +629,9 @@ pub fn invoke(call: SignalCall, native: &mut dyn SignalNative<'_>) -> Option<Sig
         SignalCall::RtSigreturn => {
             let res = native.restore_signal_frame();
             match res {
-                Ok(new_mask) => {
-                    native.set_current_blocked(new_mask);
+                Ok(restored) => {
+                    native.set_current_altstack(restored.stack);
+                    native.set_current_blocked(restored.mask);
                     Some(SignalOutcome::Restored)
                 }
                 Err(_) => native.force_sigsegv().then_some(SignalOutcome::Restored),
@@ -930,7 +932,47 @@ pub trait SignalBackend: carrick_guest_arch::ArchTypes {
         frame: &mut Self::NativeFrame,
         fpstate: &mut [u8],
         copy_in: &mut dyn FnMut(&mut [u8], carrick_guest_arch::UserVa) -> bool,
-    ) -> Result<carrick_signal_core::policy::SigBlockMask, Self::Error>;
+    ) -> Result<RestoredSignalFrame, Self::Error>;
+}
+
+/// The validated public frame's two thread-level signal settings. ISA
+/// decoders construct this before publishing machine registers; the shared
+/// owner commits both settings after the frame copy succeeds.
+#[derive(Debug)]
+pub struct RestoredSignalFrame {
+    pub mask: carrick_signal_core::policy::SigBlockMask,
+    pub stack: crate::abi::thread::AltStack,
+}
+
+/// Normalize the public `uc_stack` snapshot into the retained thread setting.
+/// `SS_ONSTACK` describes the interrupted SP, not a configuration bit.
+pub fn restored_altstack(
+    stack: carrick_syscall_abi::LinuxSignalStack,
+    isa: carrick_guest_arch::GuestIsa,
+) -> Option<crate::abi::thread::AltStack> {
+    let flags = stack.ss_flags as u32;
+    let on_stack = carrick_syscall_abi::LINUX_SS_ONSTACK as u32;
+    let disabled = carrick_syscall_abi::LINUX_SS_DISABLE as u32;
+    let autodisarm = carrick_syscall_abi::LINUX_SS_AUTODISARM as u32;
+    if flags & !(on_stack | disabled | autodisarm) != 0 {
+        return None;
+    }
+    if flags == 0 && stack.ss_sp == 0 && stack.ss_size == 0 {
+        return Some(crate::abi::thread::AltStack::DISABLED);
+    }
+    if flags & disabled != 0 {
+        return (flags == disabled).then_some(crate::abi::thread::AltStack::DISABLED);
+    }
+    if stack.ss_size < minimum_signal_stack_size(isa)
+        || stack.ss_sp.checked_add(stack.ss_size).is_none()
+    {
+        return None;
+    }
+    Some(crate::abi::thread::AltStack {
+        sp: stack.ss_sp,
+        size: stack.ss_size,
+        flags: flags & autodisarm,
+    })
 }
 
 #[cfg(test)]

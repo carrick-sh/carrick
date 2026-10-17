@@ -745,6 +745,7 @@ dependencies = [
  "carrick-personality-linux",
  "carrick-portable",
  "carrick-sched-core",
+ "carrick-signal-core",
  "carrick-signal-linux",
  "carrick-spec",
  "carrick-test-support",

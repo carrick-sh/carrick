@@ -306,6 +306,9 @@ pub struct ThreadControlSlot {
     /// Namespace-visible identity, published before this incarnation is runnable.
     visible_tid: AtomicU32,
     blocked: AtomicU64,
+    /// A forwarded temporary wait mask is restored by the native checkpoint.
+    forwarded_saved_mask: AtomicU64,
+    forwarded_mask_armed: AtomicU32,
     /// Even = stable, odd = write in progress.
     alt_seq: AtomicU64,
     alt_sp: AtomicU64,
@@ -332,6 +335,9 @@ pub struct ThreadControlSlot {
     retired_task: AtomicU64,
     retired_execution: AtomicU64,
     retired_thread: AtomicU64,
+    /// Signals whose current action (`SIG_IGN` or default-ignore) cannot
+    /// interrupt a blocking wait on this thread.
+    non_interrupting: AtomicU64,
 }
 
 impl ThreadControlSlot {
@@ -346,6 +352,8 @@ impl ThreadControlSlot {
         Self {
             visible_tid: AtomicU32::new(0),
             blocked: AtomicU64::new(0),
+            forwarded_saved_mask: AtomicU64::new(0),
+            forwarded_mask_armed: AtomicU32::new(0),
             alt_seq: AtomicU64::new(0),
             alt_sp: AtomicU64::new(0),
             alt_size: AtomicU64::new(0),
@@ -362,6 +370,7 @@ impl ThreadControlSlot {
             retired_task: AtomicU64::new(0),
             retired_execution: AtomicU64::new(0),
             retired_thread: AtomicU64::new(0),
+            non_interrupting: AtomicU64::new(0),
         }
     }
 
@@ -447,6 +456,9 @@ impl ThreadControlSlot {
         self.zone_seq.store(0, Ordering::Relaxed);
         self.pending.clear(PendingSignals(u64::MAX));
         self.blocked.store(blocked.0, Ordering::Relaxed);
+        self.non_interrupting.store(0, Ordering::Relaxed);
+        self.forwarded_saved_mask.store(0, Ordering::Relaxed);
+        self.forwarded_mask_armed.store(0, Ordering::Relaxed);
         // Keep the sequence even: a stale odd value would wedge readers.
         let seq = self.alt_seq.load(Ordering::Relaxed);
         self.alt_seq
@@ -537,6 +549,36 @@ impl ThreadControlSlot {
     /// read is needed because nothing can target a thread not yet Born.
     pub fn init_blocked(&self, mask: BlockedMask) {
         self.blocked.store(mask.0, Ordering::Release);
+    }
+
+    /// Signals whose current sighand disposition cannot interrupt a blocking wait.
+    pub fn non_interrupting(&self) -> BlockedMask {
+        BlockedMask(self.non_interrupting.load(Ordering::Acquire))
+    }
+
+    /// Publish the sighand's current non-interrupting signal mask on this slot.
+    pub fn set_non_interrupting(&self, mask: BlockedMask) {
+        self.non_interrupting.store(mask.0, Ordering::Release);
+    }
+
+    /// The owning host continuation enters a temporary-mask wait. Publish
+    /// the persistent mask before the temporary mask becomes visible to EL1.
+    pub fn arm_forwarded_wait_mask(&self, temporary: BlockedMask, original: BlockedMask) {
+        self.forwarded_saved_mask
+            .store(original.0, Ordering::Relaxed);
+        self.forwarded_mask_armed.store(1, Ordering::Release);
+        let _ = self.store_blocked_then_read_pending(temporary, &self.pending);
+    }
+
+    pub fn forwarded_wait_mask_armed(&self) -> bool {
+        self.forwarded_mask_armed.load(Ordering::Acquire) != 0
+    }
+
+    /// The native signal owner consumes the saved mask once, in the same
+    /// selection path as an in-ring sigsuspend mask.
+    pub fn take_forwarded_wait_mask(&self) -> Option<BlockedMask> {
+        (self.forwarded_mask_armed.swap(0, Ordering::AcqRel) != 0)
+            .then(|| BlockedMask(self.forwarded_saved_mask.load(Ordering::Acquire)))
     }
 
     /// Seqlock write. Only the owning thread may call this; concurrent
@@ -776,7 +818,7 @@ impl LifecycleHatches {
             | (if self.sigmask { SERVING_SIGMASK } else { 0 })
     }
 }
-const _: () = assert!(core::mem::size_of::<ThreadControlSlot>() == 128);
+const _: () = assert!(core::mem::size_of::<ThreadControlSlot>() == 192);
 const _: () = assert!(core::mem::size_of::<PoolEntry>() == 80);
 
 /// Linux keeps the last thread's exit with the terminal runtime owner.
@@ -2053,12 +2095,14 @@ mod layout_manifest {
                 size_of::<ThreadControlSlot>(),
                 align_of::<ThreadControlSlot>()
             ),
-            (128, 64)
+            (192, 64)
         );
         // Exhaustive pattern makes newly added fields require a manifest entry.
         let _ = |ThreadControlSlot {
                      visible_tid: _,
                      blocked: _,
+                     forwarded_saved_mask: _,
+                     forwarded_mask_armed: _,
                      alt_seq: _,
                      alt_sp: _,
                      alt_size: _,
@@ -2075,32 +2119,36 @@ mod layout_manifest {
                      retired_task: _,
                      retired_execution: _,
                      retired_thread: _,
+                     non_interrupting: _,
                  }: ThreadControlSlot| {};
         field!(ThreadControlSlot, visible_tid, AtomicU32, 0, 4, 4);
         field!(ThreadControlSlot, blocked, AtomicU64, 8, 8, 8);
-        field!(ThreadControlSlot, alt_seq, AtomicU64, 16, 8, 8);
-        field!(ThreadControlSlot, alt_sp, AtomicU64, 24, 8, 8);
-        field!(ThreadControlSlot, alt_size, AtomicU64, 32, 8, 8);
-        field!(ThreadControlSlot, alt_flags, AtomicU32, 40, 4, 4);
-        field!(ThreadControlSlot, robust_len, AtomicU32, 44, 4, 4);
-        field!(ThreadControlSlot, robust_head, AtomicU64, 48, 8, 8);
-        field!(ThreadControlSlot, clear_child_tid, AtomicU64, 56, 8, 8);
-        field!(ThreadControlSlot, entry, AtomicU64, 64, 8, 8);
-        field!(ThreadControlSlot, pending, PendingSummary, 72, 8, 8);
-        field!(ThreadControlSlot, zone_seq, AtomicU64, 80, 8, 8);
-        field!(ThreadControlSlot, zone_incarnation, AtomicU64, 88, 8, 8);
-        field!(ThreadControlSlot, zone_id, AtomicU32, 96, 4, 4);
+        field!(ThreadControlSlot, forwarded_saved_mask, AtomicU64, 16, 8, 8);
+        field!(ThreadControlSlot, forwarded_mask_armed, AtomicU32, 24, 4, 4);
+        field!(ThreadControlSlot, alt_seq, AtomicU64, 32, 8, 8);
+        field!(ThreadControlSlot, alt_sp, AtomicU64, 40, 8, 8);
+        field!(ThreadControlSlot, alt_size, AtomicU64, 48, 8, 8);
+        field!(ThreadControlSlot, alt_flags, AtomicU32, 56, 4, 4);
+        field!(ThreadControlSlot, robust_len, AtomicU32, 60, 4, 4);
+        field!(ThreadControlSlot, robust_head, AtomicU64, 64, 8, 8);
+        field!(ThreadControlSlot, clear_child_tid, AtomicU64, 72, 8, 8);
+        field!(ThreadControlSlot, entry, AtomicU64, 80, 8, 8);
+        field!(ThreadControlSlot, pending, PendingSummary, 88, 8, 8);
+        field!(ThreadControlSlot, zone_seq, AtomicU64, 96, 8, 8);
+        field!(ThreadControlSlot, zone_incarnation, AtomicU64, 104, 8, 8);
+        field!(ThreadControlSlot, zone_id, AtomicU32, 112, 4, 4);
         field!(
             ThreadControlSlot,
             host_exit_requested,
             carrick_core::lifecycle::MemberControlAuthority,
-            100,
+            116,
             4,
             4
         );
-        field!(ThreadControlSlot, retired_task, AtomicU64, 104, 8, 8);
-        field!(ThreadControlSlot, retired_execution, AtomicU64, 112, 8, 8);
-        field!(ThreadControlSlot, retired_thread, AtomicU64, 120, 8, 8);
+        field!(ThreadControlSlot, retired_task, AtomicU64, 120, 8, 8);
+        field!(ThreadControlSlot, retired_execution, AtomicU64, 128, 8, 8);
+        field!(ThreadControlSlot, retired_thread, AtomicU64, 136, 8, 8);
+        field!(ThreadControlSlot, non_interrupting, AtomicU64, 144, 8, 8);
     }
 
     #[test]
