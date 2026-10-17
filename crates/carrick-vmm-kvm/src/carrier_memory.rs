@@ -23,7 +23,7 @@ impl std::fmt::Display for MemoryError {
 }
 impl std::error::Error for MemoryError {}
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub enum InheritedFrameSelectionError {
     MappingGone,
     Invariant(MemoryError),
