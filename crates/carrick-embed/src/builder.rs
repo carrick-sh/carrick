@@ -1411,6 +1411,17 @@ mod tests {
         assert_eq!(&data, b"embed_shbuf");
         assert_eq!(lease.current_container_generation(), lease.generation());
 
+        // Minting another lease on the same buffer observes the bound generation
+        // without invalidating the live prepared lease.
+        let extra_lease = buf.lease(
+            prepared.launch().run_id.clone(),
+            prepared.launch().container_id,
+            carrick_thread::platform_futex::SharedFutexTable::new(),
+        );
+        assert_eq!(extra_lease.generation(), lease.generation());
+        assert!(extra_lease.validate_access().is_ok());
+        assert!(lease.validate_access().is_ok());
+
         assert!(matches!(
             prepared.shared_buffer_lease("nonexistent"),
             Err(crate::SharedBufferError::NotFound(_))
@@ -1428,6 +1439,10 @@ mod tests {
         assert!(next.validate_access().is_ok());
         assert!(matches!(
             lease.validate_access(),
+            Err(crate::SharedBufferError::GenerationMismatch { .. })
+        ));
+        assert!(matches!(
+            extra_lease.validate_access(),
             Err(crate::SharedBufferError::GenerationMismatch { .. })
         ));
     }

@@ -53,16 +53,17 @@ pub enum SharedBufferError {
 
 /// A host-created, page-aligned shared memory buffer backed by a real host file descriptor.
 ///
-/// Clones share the same mapping, so creating mutable slice views from safe
-/// code must remain impossible:
+/// One [`SharedBuffer`] is bound to at most one [`crate::PreparedContainer`] at
+/// a time; preparing a new container with the same buffer advances its binding
+/// generation and invalidates leases minted for earlier bindings.
+///
+/// Clones share the same mapping, so the public API exposes only atomic copy
+/// and word operations (`read_into`, `write_from`, [`SharedAtomicU32`]) and has
+/// no safe slice accessors (`as_slice`/`as_mut_slice` are absent):
 /// ```compile_fail
 /// use carrick_embed::SharedBuffer;
-/// let mut first = SharedBuffer::new(4096).unwrap();
-/// let mut second = first.clone();
-/// let a: &mut [u8] = first.as_mut_slice();
-/// let b: &mut [u8] = second.as_mut_slice();
-/// a[0] = 1;
-/// b[0] = 2;
+/// let buf = SharedBuffer::new(4096).unwrap();
+/// let slice: &[u8] = buf.as_ref();
 /// ```
 #[derive(Clone, Debug)]
 pub struct SharedBuffer {
@@ -153,6 +154,10 @@ impl SharedBufferInner {
         unsafe { &*self.ptr.as_ptr().add(aligned_offset).cast::<AtomicU32>() }
     }
 
+    fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
     fn bind_generation(&self) -> u64 {
         self.generation.fetch_add(1, Ordering::AcqRel) + 1
     }
@@ -232,14 +237,14 @@ impl SharedBuffer {
         self.inner.bind_generation()
     }
 
-    /// Mint a lease scoped to a container and execution generation.
+    /// Mint a lease scoped to a container and the buffer's current binding generation.
     pub fn lease(
         &self,
         run_id: RunId,
         container_id: ContainerId,
         shared_futex: carrick_thread::platform_futex::SharedFutexTable,
     ) -> SharedBufferLease {
-        let generation = self.bind_generation();
+        let generation = self.inner.current_generation();
         SharedBufferLease {
             inner: Arc::clone(&self.inner),
             shared_futex,
@@ -251,13 +256,13 @@ impl SharedBuffer {
         }
     }
 
-    /// Mint a lease bound to a live [`Container`] kernel object.
+    /// Mint a lease bound to a live [`Container`] kernel object and the buffer's current binding generation.
     pub fn lease_for_container(
         &self,
         container: &Arc<Container>,
         shared_futex: carrick_thread::platform_futex::SharedFutexTable,
     ) -> SharedBufferLease {
-        let generation = self.bind_generation();
+        let generation = self.inner.current_generation();
         SharedBufferLease {
             inner: Arc::clone(&self.inner),
             shared_futex,
@@ -583,6 +588,62 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_partial_write_from_and_atomic_u32_preserve_neighboring_bytes() {
+        let buf = SharedBuffer::new(4096).expect("allocate shared buffer");
+        let lease = buf.lease(
+            RunId::new("concurrent-word"),
+            ContainerId::allocate(),
+            carrick_thread::platform_futex::SharedFutexTable::new(),
+        );
+        let word = lease.atomic_u32(0).expect("atomic word at 0");
+        word.store(0, Ordering::Relaxed).unwrap();
+
+        let writer_buf = buf.clone();
+        let writer = thread::spawn(move || {
+            for i in 0..500u16 {
+                let b = (i & 0xFF) as u8;
+                // Write only byte 1 of word 0 (preserving bytes 0, 2, 3).
+                writer_buf.write_from(1, &[b]).unwrap();
+            }
+        });
+
+        let atomic_worker = word.clone();
+        let bit_setter = thread::spawn(move || {
+            for i in 0..500u32 {
+                let mask = if cfg!(target_endian = "little") {
+                    ((i & 0x7F) << 24) | 0x01
+                } else {
+                    (i & 0x7F) | (0x01 << 24)
+                };
+                atomic_worker.fetch_or(mask, Ordering::AcqRel).unwrap();
+            }
+        });
+
+        writer.join().expect("writer join");
+        bit_setter.join().expect("bit_setter join");
+
+        // Final write of known value into byte 1, and known bit into byte 3 / byte 0.
+        buf.write_from(1, &[0x5A]).unwrap();
+        let final_mask = u32::from_ne_bytes([0x01, 0x00, 0x00, 0x80]);
+        word.fetch_or(final_mask, Ordering::AcqRel).unwrap();
+
+        let mut bytes = [0u8; 4];
+        buf.read_into(0, &mut bytes).unwrap();
+        assert_eq!(bytes[1], 0x5A, "partial write_from byte must be preserved");
+        assert_eq!(bytes[2], 0x00, "untouched byte 2 must remain zero");
+        assert_ne!(
+            bytes[0] & 0x01,
+            0,
+            "atomic_u32 bit in byte 0 must be preserved"
+        );
+        assert_ne!(
+            bytes[3] & 0x80,
+            0,
+            "atomic_u32 bit in byte 3 must be preserved"
+        );
+    }
+
+    #[test]
     fn test_shared_buffer_lease_lifecycle_and_fail_closed_retirement() {
         let buf = SharedBuffer::new(4096).expect("allocate shared buffer");
         let run_id = RunId::new("lifecycle-run");
@@ -697,15 +758,38 @@ mod tests {
     }
 
     #[test]
-    fn rebinding_a_buffer_to_a_new_container_invalidates_its_prior_lease() {
+    fn minting_leases_observes_generation_and_only_binding_advances_it() {
         let buf = SharedBuffer::new(4096).expect("allocate shared buffer");
         let futex = carrick_thread::platform_futex::SharedFutexTable::new();
-        let first = buf.lease(RunId::new("first"), ContainerId::allocate(), futex.clone());
+        let first_gen = buf.bind_generation();
+        assert_eq!(first_gen, 1);
+
+        let lease_a = buf.lease(RunId::new("first"), ContainerId::allocate(), futex.clone());
+        let lease_b = buf.lease(RunId::new("second"), ContainerId::allocate(), futex.clone());
+        assert_eq!(lease_a.generation(), 1);
+        assert_eq!(lease_b.generation(), 1);
+        assert!(lease_a.validate_access().is_ok());
+        assert!(lease_b.validate_access().is_ok());
+
+        // A new container binding advances the generation and invalidates earlier leases.
+        let next_gen = buf.bind_generation();
+        assert_eq!(next_gen, 2);
         let next = buf.lease(RunId::new("next"), ContainerId::allocate(), futex);
+        assert_eq!(next.generation(), 2);
         assert!(next.validate_access().is_ok());
         assert!(matches!(
-            first.validate_access(),
-            Err(SharedBufferError::GenerationMismatch { .. })
+            lease_a.validate_access(),
+            Err(SharedBufferError::GenerationMismatch {
+                expected: 1,
+                actual: 2
+            })
+        ));
+        assert!(matches!(
+            lease_b.validate_access(),
+            Err(SharedBufferError::GenerationMismatch {
+                expected: 1,
+                actual: 2
+            })
         ));
     }
 

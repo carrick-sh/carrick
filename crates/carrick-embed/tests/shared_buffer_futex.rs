@@ -8,7 +8,7 @@
 mod common;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -24,18 +24,20 @@ const GUEST_DONE: u32 = 1 << 31;
 // Publish container completion on the same futex the host awaits for pong.
 // The guard also runs when the guest runner unwinds.
 struct GuestCompletion {
-    buffer: SharedBuffer,
+    _buffer: SharedBuffer,
+    pong_word: *const AtomicU32,
     pong_location: carrick_hal::SharedFutexLocation,
     futex: carrick_thread::platform_futex::SharedFutexTable,
 }
 
+// SAFETY: `_buffer` keeps the `MAP_SHARED` mapping alive for the lifetime of `GuestCompletion`,
+// and `pong_word` points to the 4-byte aligned word at offset 4 inside that mapping.
+unsafe impl Send for GuestCompletion {}
+
 impl Drop for GuestCompletion {
     fn drop(&mut self) {
-        let mut word = [0; 4];
-        if self.buffer.read_into(4, &mut word).is_ok() {
-            let done = u32::from_ne_bytes(word) | GUEST_DONE;
-            let _ = self.buffer.write_from(4, &done.to_ne_bytes());
-        }
+        let pong = unsafe { &*self.pong_word };
+        pong.fetch_or(GUEST_DONE, Ordering::AcqRel);
         let _ = self.futex.table().wake(
             carrick_thread::platform_futex::carrier_shared_futex_key(self.pong_location),
             1,
@@ -235,9 +237,13 @@ fn shared_buffer_futex_pingpong_latency() {
         .write_from(4, &0u32.to_ne_bytes())
         .expect("write pong initial");
 
+    let base_ptr = lease.as_ptr().expect("validated base pointer");
+    let pong_word = unsafe { base_ptr.add(4).cast::<AtomicU32>() };
+    let pong_location = lease.shared_futex_location(4).expect("pong location");
     let completion = GuestCompletion {
-        buffer: buf.clone(),
-        pong_location: lease.shared_futex_location(4).expect("pong location"),
+        _buffer: buf.clone(),
+        pong_word,
+        pong_location,
         futex: carrier.shared_futex().clone(),
     };
     let guest_handle = thread::spawn(move || {
@@ -251,17 +257,33 @@ fn shared_buffer_futex_pingpong_latency() {
     let pong = lease.atomic_u32(4).expect("pong word");
     let ping = lease.atomic_u32(0).expect("ping word");
     for round in 1..=ROUNDS {
-        // Host writes round to ping (offset 0) and wakes guest
-        ping.store(round, Ordering::Release).expect("write ping");
-        let _ = lease.futex_wake(0, 1);
+        // Host writes round to ping (offset 0) and wakes guest. If the guest
+        // already exited and retired the lease before this round, report its exit.
+        match ping.store(round, Ordering::Release) {
+            Ok(()) => {}
+            Err(SharedBufferError::Retired { .. }) => fail_before_pong(guest_handle, round),
+            Err(error) => panic!("write ping round {round} failed: {error}"),
+        }
+        match lease.futex_wake(0, 1) {
+            Ok(_) | Err(SharedBufferError::Retired { .. }) => {}
+            Err(error) => panic!("futex wake for ping round {round} failed: {error}"),
+        }
 
-        // Host waits for guest to echo round on pong (offset 4)
+        // Host waits for guest to echo round on pong (offset 4).
+        // `prepared.execute()` retires the lease as soon as the container finishes,
+        // which can race the final round's pong read or an early guest exit.
         loop {
-            let pong_value = pong.load(Ordering::Acquire).expect("read pong");
+            let pong_value = match pong.load(Ordering::Acquire) {
+                Ok(value) => value,
+                Err(SharedBufferError::Retired { .. }) => unsafe {
+                    (*pong_word).load(Ordering::Acquire)
+                },
+                Err(error) => panic!("read pong round {round} failed: {error}"),
+            };
             if pong_value & !GUEST_DONE == round {
                 break;
             }
-            if pong_value & GUEST_DONE != 0 {
+            if pong_value & GUEST_DONE != 0 || lease.is_retired() {
                 fail_before_pong(guest_handle, round);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -270,7 +292,9 @@ fn shared_buffer_futex_pingpong_latency() {
                 "timed out waiting for pong round {round}"
             );
             match lease.futex_wait(4, pong_value, Some(remaining)) {
-                Ok(()) | Err(SharedBufferError::TimedOut) => {}
+                Ok(())
+                | Err(SharedBufferError::TimedOut)
+                | Err(SharedBufferError::Retired { .. }) => {}
                 Err(error) => panic!("futex wait for pong round {round} failed: {error}"),
             }
         }
