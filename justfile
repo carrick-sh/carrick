@@ -1218,7 +1218,9 @@ ci-freebsd-sysroot:
     mkdir -p "${FBSD_SYSROOT:?}"
     # archive.freebsd.org was unreachable from every network on 2026-10-18 and
     # failed every merge group; the pinned digest (from the release MANIFEST)
-    # makes any mirror acceptable. A new FBSD_VERSION needs a new digest.
+    # makes any mirror acceptable. Our own copy is the GitHub release
+    # `ci-sysroot-freebsd-<version>` (upload base.txz + MANIFEST there for a
+    # new version); a new FBSD_VERSION needs a new digest and release.
     case "${FBSD_VERSION:?}" in
         14.3-RELEASE) want=e38b5cf756d60086a6c2f736eff19cc7685f7e2313e31d14342fc8df57200a92 ;;
         *) echo "::error::no pinned base.txz sha256 for FreeBSD ${FBSD_VERSION}" >&2; exit 1 ;;
@@ -1226,8 +1228,10 @@ ci-freebsd-sysroot:
     ok=
     for url in \
         "https://archive.freebsd.org/old-releases/amd64/${FBSD_VERSION}/base.txz" \
+        "https://github.com/carrick-sh/carrick/releases/download/ci-sysroot-freebsd-${FBSD_VERSION}/base.txz" \
         "https://download.freebsd.org/releases/amd64/${FBSD_VERSION}/base.txz" \
-        "https://mirror.math.princeton.edu/pub/FreeBSD/releases/amd64/${FBSD_VERSION}/base.txz"; do
+        "https://mirror.math.princeton.edu/pub/FreeBSD/releases/amd64/${FBSD_VERSION}/base.txz" \
+        "https://ftp.jaist.ac.jp/pub/FreeBSD/releases/amd64/${FBSD_VERSION}/base.txz"; do
         if curl -fSL --connect-timeout 20 --max-time 600 --retry 2 --retry-all-errors "$url" -o "$archive" \
             && echo "$want  $archive" | sha256sum -c --quiet -; then
             ok=1
