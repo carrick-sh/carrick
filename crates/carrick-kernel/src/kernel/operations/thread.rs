@@ -306,10 +306,23 @@ impl PreparedThreadClone {
             thread: self.reservation.caller.key(),
             generation: self.reservation.caller.execution_state().generation(),
         };
+        let page = self.reservation.caller.control_lease().lifecycle();
+        let mut owed = None;
         let publication = {
             let mut state = kernel.registry().settled().write();
-            self.publish_reserved(&mut state, PublicationLane::HostClone { host_birth })?
+            self.publish_reserved(
+                &mut state,
+                PublicationLane::HostClone {
+                    host_birth: host_birth.then_some(&mut owed),
+                },
+            )
         };
+        // A host-birth claim backed out under the registry lock owes the
+        // closing owner its exit wake, delivered with no lock held.
+        if let Some(owed) = owed {
+            super::super::thread_ledger::deliver_owed_exit_wake(&page, owed);
+        }
+        let publication = publication?;
         let published = publication.finish();
         #[cfg(all(debug_assertions, feature = "schedule-hooks"))]
         if let Some(context) = published.context() {
@@ -452,20 +465,31 @@ impl PreparedThreadClone {
             .transpose()?
             .flatten();
         check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
-        let host_birth = if matches!(lane, PublicationLane::HostClone { host_birth: true }) {
-            Some(
-                thread
-                    .control_lease()
-                    .lifecycle()
-                    .reserve_host_birth()
-                    .ok_or(KernelOperationError::HostBirthCapacity)?,
-            )
+        let host_birth = if let PublicationLane::HostClone {
+            host_birth: Some(owed),
+        } = &mut lane
+        {
+            match thread.control_lease().lifecycle().reserve_host_birth() {
+                Ok(index) => Some(index),
+                Err(refusal) => {
+                    if let carrick_el1_abi::HostBirthRefusal::Closed(wake) = refusal {
+                        **owed = Some(wake);
+                    }
+                    return Err(KernelOperationError::HostBirthCapacity);
+                }
+            }
         } else {
             None
         };
         if pid_identity.is_some_and(|identity| !identity.commit()) {
-            if let Some(index) = host_birth {
-                thread
+            if let (
+                Some(index),
+                PublicationLane::HostClone {
+                    host_birth: Some(owed),
+                },
+            ) = (host_birth, &mut lane)
+            {
+                **owed = thread
                     .control_lease()
                     .lifecycle()
                     .cancel_host_birth_claim(index);
@@ -511,7 +535,12 @@ impl PreparedThreadClone {
                 } else {
                     publication_valid = false;
                 }
-            } else if matches!(lane, PublicationLane::HostClone { host_birth: true }) {
+            } else if matches!(
+                lane,
+                PublicationLane::HostClone {
+                    host_birth: Some(_)
+                }
+            ) {
                 publication_valid = false;
             }
             if page.gate().is_terminal() {
@@ -566,7 +595,12 @@ impl PreparedThreadClone {
 /// [`PreparedThreadClone::publish_reserved`].
 #[derive(Debug)]
 pub(in crate::kernel) enum PublicationLane<'a> {
-    HostClone { host_birth: bool },
+    /// A host clone. `host_birth` is the slot that receives the exit wake a
+    /// rolled-back host-birth claim owes; the caller delivers it after the
+    /// registry lock drops (`thread_ledger::deliver_owed_exit_wake`).
+    HostClone {
+        host_birth: Option<&'a mut Option<carrick_el1_abi::OwedExitWake>>,
+    },
     Settle,
     AbiBorn(&'a mut crate::kernel::revision_capacity::RevisionReservation),
 }
@@ -1128,6 +1162,76 @@ mod tests {
         assert_eq!(page.host_birth_claimed_count(), 0);
         assert_eq!(page.live(), 1 + carrick_el1_abi::THREAD_POOL_ENTRIES as u32);
         assert_eq!(root.task().thread_count_for_test(), 1 + children.len());
+    }
+
+    /// #641: a host birth that claims a slot and then sees Closing puts the
+    /// claim back. The Closing owner may already have observed that claim
+    /// (`claimed_count` > 0) and parked on its exit channel; the rollback
+    /// makes its readiness true, so the rollback owes the channel wake, as
+    /// EL1's clone rollback does (`lifecycle_admission_settled`).
+    #[test]
+    fn host_birth_rollback_after_close_wakes_parked_exit_owner() {
+        use carrick_el1_abi::{Claim, ThreadIdentity, ZoneTables};
+        let (kernel, root) = bootstrap(191);
+        let plan = ClonePlan::from_flags(
+            LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+        )
+        .expect("thread plan");
+        let zone: &'static ZoneTables = {
+            let layout = std::alloc::Layout::new::<ZoneTables>();
+            // SAFETY: all-zero is the valid empty zone; leaked for 'static.
+            unsafe {
+                let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
+                assert!(!ptr.is_null());
+                &*ptr
+            }
+        };
+        let (mm, address) = (0x77, 0x2d04_713e_b0);
+        let page = root.lifecycle_page();
+        // The closing owner published its exit channel and parked on it.
+        page.close();
+        page.publish_exit_wait(carrick_el1_abi::EntryMmKey::from_raw(mm), address);
+        let owner = zone
+            .alloc_record(ThreadIdentity {
+                tid: 1,
+                serial: 6,
+                mm,
+                file_table: 1,
+                generation: 1,
+                affinity: 0,
+                lifecycle_page: 0,
+                control_slot: 0,
+            })
+            .unwrap();
+        let seq = zone.next_seq(owner);
+        {
+            let guard = zone
+                .lock(
+                    ZoneTables::bucket_of_with_context(mm, address),
+                    &crate::el1_zone::HostLockWait,
+                )
+                .unwrap();
+            zone.enqueue(&guard, owner, seq, mm, address, u32::MAX, 0)
+                .unwrap();
+            zone.publish_park(owner, seq);
+        }
+        let result = crate::el1_zone::with_test_zone(zone, || {
+            kernel
+                .reserve_thread_clone(&root, plan, None)?
+                .prepare(ThreadId::synthetic_for_tests(8_950))?
+                .commit_for_el1()
+                .map(|_| ())
+        });
+        assert!(matches!(
+            result,
+            Err(KernelOperationError::HostBirthCapacity)
+        ));
+        assert_eq!(page.host_birth_claimed_count(), 0);
+        assert_ne!(
+            zone.record(owner).claim(),
+            Claim::Parked { seq },
+            "host-birth rollback after close left the exit owner parked"
+        );
     }
 
     #[test]
