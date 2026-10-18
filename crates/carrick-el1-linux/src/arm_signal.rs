@@ -385,8 +385,10 @@ mod tests {
 
     #[test]
     fn forwarded_read_restart_replays_original_arg_only_at_native_checkpoint() {
-        let mut read = TrapFrame::default();
-        read.esr = 0xfffe;
+        let mut read = TrapFrame {
+            esr: 0xfffe,
+            ..Default::default()
+        };
         read.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
         read.x[8] = 63; // ARM read
         read.far = 0x1234; // mailbox arg0, not a fault address
@@ -395,8 +397,10 @@ mod tests {
         assert_eq!(read.x[0], 0x1234);
         assert_eq!(read.elr, 0x8000);
 
-        let mut timed_recv = TrapFrame::default();
-        timed_recv.esr = 0xfffd; // host continuation with SO_RCVTIMEO
+        let mut timed_recv = TrapFrame {
+            esr: 0xfffd, // host continuation with SO_RCVTIMEO
+            ..Default::default()
+        };
         timed_recv.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
         timed_recv.x[8] = 207; // ARM recvfrom
         timed_recv.far = 0x1234;
@@ -409,8 +413,10 @@ mod tests {
         assert_eq!(timed_recv.elr, 0x8004);
 
         for nr in [202, 242, 207, 212] {
-            let mut socket = TrapFrame::default();
-            socket.esr = 0xfffe;
+            let mut socket = TrapFrame {
+                esr: 0xfffe,
+                ..Default::default()
+            };
             socket.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
             socket.x[8] = nr;
             socket.far = 0x5678;
@@ -419,8 +425,10 @@ mod tests {
             assert_eq!((socket.x[0], socket.elr), (0x5678, 0x9000));
         }
 
-        let mut ppoll = TrapFrame::default();
-        ppoll.esr = 0xfffe;
+        let mut ppoll = TrapFrame {
+            esr: 0xfffe,
+            ..Default::default()
+        };
         ppoll.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
         ppoll.x[8] = 73; // ARM ppoll always returns EINTR
         ppoll.far = 0x5678;
