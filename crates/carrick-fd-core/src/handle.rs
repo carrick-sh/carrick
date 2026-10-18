@@ -1753,7 +1753,19 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
                                             Err(HandleError::PinOverflow) => {
                                                 Err(HandleError::PinOverflow)
                                             }
-                                            Err(_) => Ok(None),
+                                            Err(_) => {
+                                                let word = match entry.generation.next() {
+                                                    Some(next) => encode_vacant_slot(next),
+                                                    None => {
+                                                        child_retired += 1;
+                                                        encode_retired_slot()
+                                                    }
+                                                };
+                                                child.entries[slot]
+                                                    .0
+                                                    .store(word, Ordering::Relaxed);
+                                                Ok(None)
+                                            }
                                         }
                                     }
                                     Err(err) => Err(err),
