@@ -25,6 +25,11 @@ use crate::{
     TableStorage,
 };
 
+#[cfg(all(test, not(feature = "loom")))]
+std::thread_local! {
+    pub(crate) static AFTER_HANDLE_SLOT_STORE: core::cell::RefCell<Option<std::boxed::Box<dyn FnOnce()>>> = const { core::cell::RefCell::new(None) };
+}
+
 /// Maximum reference/pin count representable in the low 31 bits of [`OpenLifetime`].
 pub const MAX_OBJECT_PINS: u32 = (1u32 << 31) - 1;
 
@@ -1091,7 +1096,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         slot: SlotIndex,
         generation: Generation,
     ) -> Result<(), HandleError> {
-        let (guard, t) = self.lock_handle_table(table)?;
+        let (_guard, t) = self.lock_handle_table(table)?;
         let idx = slot.as_usize();
         if idx >= t.limit {
             return Err(HandleError::InvalidHandle);
@@ -1101,12 +1106,10 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         }
         match decode_handle_slot(t.storage.entries[idx].0.load(Ordering::Relaxed)) {
             SlotState::Vacant { .. } => {
-                guard.record.begin_write();
                 t.storage.entries[idx]
                     .0
                     .store(encode_vacant_slot(generation), Ordering::Release);
                 t.storage.mark_free(idx, true);
-                guard.record.end_write();
                 Ok(())
             }
             SlotState::Occupied(_) | SlotState::Retired => Err(HandleError::InvalidHandle),
@@ -1124,7 +1127,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         backing: BackingToken,
         flags: HandleFlags,
     ) -> Result<Handle, HandleError> {
-        let (guard, t) = self.lock_handle_table(table)?;
+        let (_guard, t) = self.lock_handle_table(table)?;
         let slot = t.allocate()?;
         let next_generation =
             match decode_handle_slot(t.storage.entries[slot].0.load(Ordering::Relaxed)) {
@@ -1137,12 +1140,16 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             generation: next_generation,
             flags,
         };
-        guard.record.begin_write();
         t.storage.entries[slot]
             .0
             .store(encode_occupied_slot(entry), Ordering::Release);
+        #[cfg(all(test, not(feature = "loom")))]
+        AFTER_HANDLE_SLOT_STORE.with(|hook| {
+            if let Some(probe) = hook.borrow_mut().take() {
+                probe();
+            }
+        });
         t.storage.mark_free(slot, false);
-        guard.record.end_write();
         Ok(Handle::new(
             table,
             ObjectPin::new(SlotIndex(slot as u32), next_generation),
@@ -1164,8 +1171,8 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
     /// [`ObjectGuard`].
     ///
     /// Takes no table lock: validates `handle.table == table`, reads the slot
-    /// and object incarnation under the table's sequence counter, and retains a
-    /// hold in [`OpenLifetime`] before returning the guard.
+    /// and object incarnation with exact-slot validation (the sequence protects
+    /// only table-wide changes), and retains a hold in [`OpenLifetime`] before returning the guard.
     pub fn get_handle(&self, table: TableId, handle: Handle) -> Result<ObjectGuard, HandleError> {
         if handle.table != table {
             return Err(HandleError::Stale);
@@ -1350,17 +1357,15 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         if handle.table != table {
             return Err(HandleError::Stale);
         }
-        let (guard, t) = self.lock_handle_table(table)?;
+        let (_guard, t) = self.lock_handle_table(table)?;
         let mut entry = t.occupied_entry(handle.pin.slot)?;
         if entry.generation != handle.pin.generation {
             return Err(HandleError::Stale);
         }
         entry.flags = flags;
-        guard.record.begin_write();
         t.storage.entries[handle.pin.slot.as_usize()]
             .0
             .store(encode_occupied_slot(entry), Ordering::Release);
-        guard.record.end_write();
         Ok(())
     }
 
@@ -1389,7 +1394,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         if handle.table != table {
             return Err(HandleError::Stale);
         }
-        let (guard, t) = self.lock_handle_table(table)?;
+        let (_guard, t) = self.lock_handle_table(table)?;
         let source = t.occupied_entry(handle.pin.slot)?;
         if source.generation != handle.pin.generation {
             return Err(HandleError::Stale);
@@ -1408,12 +1413,10 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             generation: next_generation,
             flags: override_flags.unwrap_or(source.flags),
         };
-        guard.record.begin_write();
         t.storage.entries[new_slot]
             .0
             .store(encode_occupied_slot(new_entry), Ordering::Release);
         t.storage.mark_free(new_slot, false);
-        guard.record.end_write();
         Ok(Handle::new(
             table,
             ObjectPin::new(SlotIndex(new_slot as u32), next_generation),
@@ -1448,9 +1451,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
                 return Err(HandleError::Stale);
             }
             let slot_idx = handle.pin.slot.as_usize();
-            guard.record.begin_write();
             retire_or_free_slot(guard.record, &t.storage, slot_idx, entry.generation);
-            guard.record.end_write();
             drop(guard);
             (entry.object_index, incarnation)
         };
