@@ -979,7 +979,10 @@ impl DrainWork {
     }
 
     fn is_empty(&self) -> bool {
-        self.0.load(Ordering::SeqCst) == 0
+        let empty = self.0.load(Ordering::SeqCst) == 0;
+        #[cfg(test)]
+        tests::after_first_drain_work_sample();
+        empty
     }
 }
 
@@ -1431,10 +1434,7 @@ impl RunQueueInner {
     fn drain_ready(&self) -> bool {
         // Close excludes new wake admissions. An existing wake must publish
         // its work before releasing admission, so sample that gate first.
-        let drained = self.active_wake_admissions() == 0 && self.drain_work.is_empty();
-        #[cfg(test)]
-        tests::during_drain_observation();
-        drained
+        self.active_wake_admissions() == 0 && self.drain_work.is_empty()
     }
 
     fn retain_queued_work(&self) {
@@ -5757,7 +5757,7 @@ mod tests {
         static AUTHORITY_RELEASED: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     }
 
-    pub(super) fn during_drain_observation() {
+    pub(super) fn after_first_drain_work_sample() {
         let gate = DRAIN_OBSERVATION_GATE.with_borrow_mut(|configured| {
             let gate = configured.as_mut()?;
             if gate.skip > 0 {
