@@ -56,13 +56,22 @@ It is entered only after the owner/App guard. Required environment secrets:
 
 | Secret | Purpose |
 |---|---|
-| `CARRICK_WORKERS_APP_ID` | carrick-workers App ID |
-| `CARRICK_WORKERS_PRIVATE_KEY` | App signing key, used only by token mint steps |
-| `CODEX_AUTH_JSON` | Owner's refreshed Codex cached auth JSON |
-| `AGY_AUTH_FILES_JSON` | JSON object mapping AGY auth basenames to opaque file contents |
+| `AGENT_DIRECTOR_TOKEN` | Short-lived installation token for agy-director, contents:read |
+| `AGENT_WORKER_TOKEN` | Short-lived installation token for carrick, contents/issues/pull_requests:write |
+| `CODEX_AUTH_JSON` | Raw contents of the owner's refreshed ~/.codex/auth.json |
+| `AGY_OAUTH_TOKEN` | Raw contents of ~/.gemini/antigravity-cli/antigravity-oauth-token |
 
-The AGY object must include `antigravity-oauth-token`, `jetski_state.pbtxt`
-and `installation_id`; `settings.json` is optional. Other filenames are refused.
+The App private key stays on the Mac. It must never be a GitHub secret or
+reach a runner. The workflow does not mint installation tokens. The Mac's
+`sh.carrick.agent-secrets` launchd job mints and publishes these two narrowly
+scoped, one-hour tokens every 15 minutes, giving a new job at least 45 minutes
+of token life. Bootstrap receives `AGENT_DIRECTOR_TOKEN` as `GH_TOKEN` only
+for the private launcher checkout; worker execution and PR publication receive
+`AGENT_WORKER_TOKEN` as `GH_TOKEN`.
+
+AGY receives only its raw OAuth token file at
+`~/.gemini/antigravity-cli/antigravity-oauth-token` in the isolated job home.
+No JSON file bundle, jetski state or installation ID is required.
 Only the selected backend's files are materialized. The job-scoped home has
 mode 0700; auth files have mode 0600 and cannot overwrite an existing file.
 Codex uses file credential storage in that home. Agent auth, provider logs,
@@ -71,12 +80,22 @@ state, outside Cargo caches and uploaded artifacts. The always-run cleanup
 removes the entire state. Runner cancellation still depends on Actions running
 cleanup; the Contabo provider also destroys its one-job VM.
 
-Two short-lived App tokens are minted separately: read-only contents access
-to `agy-director` for bootstrap, then contents/issues/PR write access to
-`carrick` for the worker and publisher. The worker receives no private-repo
-write token or App signing key. Token lifetime bounds the 30-minute agent
-turn and 40-minute worker/publication step. No token or auth file is printed,
-cached, uploaded or written back to the owner.
+The **whole worker job is capped at 40 minutes**, including checkout, toolchain
+setup, driver build, bootstrap, execution, publication and cleanup. The run
+step is also capped at 40 minutes. The first step stamps the job start time;
+setup time is deducted from the nominal 30-minute agent turn, its outer
+custody deadline is minute 32, and authenticated publication stops by minute
+39. This leaves margin against the 45-minute minimum token lifetime. Slow
+setup shortens the turn or fails as host/infra rather than starting a fresh
+30-minute budget after setup.
+
+Bootstrap and worker startup validate their token against the target repository.
+Rejected/expired tokens and unavailable GitHub access fail with a **host/infra**
+message naming the affected secret and the Mac refresher. Remote command
+failures recheck token access for the same diagnosis. A rejected worker token
+cannot publish its own issue comment; the local result and recovery artifacts
+remain available. Tokens and auth files are never printed, cached, uploaded
+or written back to the owner.
 
 The source of truth is the owner's Mac login state. The owner signs into
 codex/agy there; its launchd refresher refreshes locally and pushes updated

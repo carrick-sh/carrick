@@ -198,11 +198,28 @@ pub fn valid_branch(branch: &str) -> bool {
 }
 
 fn command(root: &Path, program: &str, args: &[&str]) -> Result<String, ScalerError> {
-    let bytes = crate::ci_scaler::execute(
+    let remote =
+        program == "gh" || (program == "git" && matches!(args.first(), Some(&"fetch" | &"push")));
+    let mut limit = std::time::Duration::from_secs(120);
+    if remote {
+        limit = limit.min(crate::agent_runner::job_remaining(39)?);
+    }
+    let output = crate::ci_scaler::execute(
         Command::new(program).args(args).current_dir(root),
         &[],
-        std::time::Duration::from_secs(120),
-    )?;
+        limit,
+    );
+    let bytes = match output {
+        Err(error) if remote => {
+            return Err(crate::agent_runner::check_token(
+                root,
+                crate::agent_runner::TokenScope::Worker,
+            )
+            .err()
+            .unwrap_or(error));
+        }
+        result => result?,
+    };
     String::from_utf8(bytes).map_err(|_| ScalerError::Guard("command output is not UTF-8"))
 }
 fn git(root: &Path, args: &[&str]) -> Result<String, ScalerError> {
@@ -376,6 +393,9 @@ fn agent(
         dispatch.issue, dispatch.branch, dispatch.tier.coauthor, dispatch.brief
     );
     std::fs::write(&prompt_file, prompt)?;
+    // Deduct checkout/build/bootstrap time rather than starting a fresh
+    // 30-minute turn against a token snapshot taken at job admission.
+    let turn_timeout = format!("{}s", crate::agent_runner::job_remaining(30)?.as_secs());
     let mut command = Command::new(std::env::current_exe()?);
     command
         .args([
@@ -405,7 +425,7 @@ fn agent(
         .arg(schema_path)
         .args([
             "--timeout",
-            "30m",
+            &turn_timeout,
             "--no-profile",
             "--backend",
             &dispatch.tier.backend,
@@ -441,7 +461,7 @@ fn agent(
         .stdin(Stdio::null())
         .stdout(std::fs::File::create(state.join("agent.out"))?)
         .stderr(std::fs::File::create(state.join("agent.err"))?);
-    let code = wait_agent(&mut command, std::time::Duration::from_secs(32 * 60))?;
+    let code = wait_agent(&mut command, crate::agent_runner::job_remaining(32)?)?;
     let contract = read_contract(&result).unwrap_or_else(|error| Contract {
         status: ContractStatus::Failed,
         summary: format!("No valid worker contract: {error}"),
@@ -702,7 +722,7 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
     }
     if !std::env::var("GH_TOKEN").is_ok_and(|token| !token.is_empty()) {
         return Err(ScalerError::Guard(
-            "runner must provide GH_TOKEN from the carrick-workers App",
+            "host/infra: missing AGENT_WORKER_TOKEN supplied as GH_TOKEN",
         ));
     }
     let root = root.canonicalize()?;
@@ -726,6 +746,7 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
     let mut exit = 1;
     let mut errors = Vec::new();
     let outcome = (|| -> Result<(), ScalerError> {
+        crate::agent_runner::check_token(&root, crate::agent_runner::TokenScope::Worker)?;
         if setup_status != "success/success" {
             contract.summary = format!("Worker setup did not complete: {setup_status}");
             return Err(ScalerError::Guard(

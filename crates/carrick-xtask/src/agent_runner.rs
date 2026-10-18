@@ -42,14 +42,75 @@ struct Tool {
 }
 
 fn invoke(dir: &Path, program: &str, args: &[&str]) -> Result<(), ScalerError> {
-    execute(
+    let result = execute(
         std::process::Command::new(program)
             .args(args)
             .current_dir(dir),
         &[],
         std::time::Duration::from_secs(120),
-    )?;
+    );
+    if let Err(error) = result {
+        if program == "git" && args.first() == Some(&"fetch") {
+            return Err(check_token(dir, TokenScope::Director)
+                .err()
+                .unwrap_or(error));
+        }
+        return Err(error);
+    }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum TokenScope {
+    Director,
+    Worker,
+}
+
+pub(crate) fn check_token(root: &Path, scope: TokenScope) -> Result<(), ScalerError> {
+    let (repository, message) = match scope {
+        TokenScope::Director => (
+            "carrick-sh/agy-director",
+            "host/infra: AGENT_DIRECTOR_TOKEN rejected or expired, or GitHub access unavailable; check the Mac agent-secrets refresher and runner connectivity",
+        ),
+        TokenScope::Worker => (
+            "carrick-sh/carrick",
+            "host/infra: AGENT_WORKER_TOKEN rejected or expired, or GitHub access unavailable; check the Mac agent-secrets refresher and runner connectivity",
+        ),
+    };
+    if !std::env::var("GH_TOKEN").is_ok_and(|token| !token.is_empty()) {
+        return Err(ScalerError::Guard(message));
+    }
+    execute(
+        std::process::Command::new("gh")
+            .args(["api", &format!("repos/{repository}")])
+            .current_dir(root),
+        &[],
+        std::time::Duration::from_secs(30).min(job_remaining(39)?),
+    )
+    .map_err(|_| ScalerError::Guard(message))?;
+    Ok(())
+}
+
+/// All authenticated work ends before the job's 40-minute cap. The Mac
+/// supplies at least 45 minutes of token life when the job starts.
+pub(crate) fn job_remaining(minutes: u64) -> Result<std::time::Duration, ScalerError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| ScalerError::Guard("host/infra: invalid runner clock"))?
+        .as_secs();
+    let started = std::env::var("CARRICK_AGENT_JOB_STARTED_AT")
+        .ok()
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .map_err(|_| ScalerError::Guard("host/infra: invalid dispatch job start time"))?
+        .unwrap_or(now);
+    let seconds = started.saturating_add(minutes * 60).saturating_sub(now);
+    if started > now || seconds == 0 {
+        return Err(ScalerError::Guard(
+            "host/infra: dispatch token window exhausted; start a fresh job after the Mac agent-secrets refresh",
+        ));
+    }
+    Ok(std::time::Duration::from_secs(seconds))
 }
 
 pub(crate) fn state() -> Result<PathBuf, ScalerError> {
@@ -138,6 +199,7 @@ fn extract(tool: &Tool, archive: &Path, bin: &Path) -> Result<(), ScalerError> {
 }
 
 fn bootstrap(root: &Path) -> Result<(), ScalerError> {
+    check_token(root, TokenScope::Director)?;
     let state = state()?;
     private_dir(&state)?;
     let bin = state.join("bin");
@@ -240,37 +302,15 @@ fn auth(event: &Path) -> Result<(), ScalerError> {
             b"cli_auth_credentials_store = \"file\"\n",
         )?;
     } else {
-        let raw = std::env::var("AGY_AUTH_FILES_JSON")
-            .map_err(|_| ScalerError::Guard("missing AGY_AUTH_FILES_JSON"))?;
-        // Opaque file contents; parse errors must never include the secret input.
-        let files: BTreeMap<String, String> = serde_json::from_str(&raw)
-            .map_err(|_| ScalerError::Guard("invalid AGY_AUTH_FILES_JSON"))?;
-        if ![
-            "antigravity-oauth-token",
-            "jetski_state.pbtxt",
-            "installation_id",
-        ]
-        .iter()
-        .all(|key| files.get(*key).is_some_and(|v| !v.is_empty()))
-            || files.keys().any(|key| {
-                !matches!(
-                    key.as_str(),
-                    "antigravity-oauth-token"
-                        | "jetski_state.pbtxt"
-                        | "installation_id"
-                        | "settings.json"
-                )
-            })
-        {
-            return Err(ScalerError::Guard("invalid agy auth file set"));
-        }
+        let raw = std::env::var("AGY_OAUTH_TOKEN")
+            .ok()
+            .filter(|token| !token.is_empty())
+            .ok_or(ScalerError::Guard("missing AGY_OAUTH_TOKEN"))?;
         let gemini = home.join(".gemini");
         private_dir(&gemini)?;
         let agy = gemini.join("antigravity-cli");
         private_dir(&agy)?;
-        for (name, data) in files {
-            secret_file(&agy.join(name), data.as_bytes())?;
-        }
+        secret_file(&agy.join("antigravity-oauth-token"), raw.as_bytes())?;
     }
     Ok(())
 }

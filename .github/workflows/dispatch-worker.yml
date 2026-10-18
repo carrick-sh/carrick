@@ -28,8 +28,10 @@ jobs:
     needs: guard
     runs-on: [carrick-agent]
     environment: agent-dispatch
-    timeout-minutes: 75
+    timeout-minutes: 40
     steps:
+      - name: Start the bounded token window
+        run: echo "CARRICK_AGENT_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         timeout-minutes: 5
         with:
@@ -50,42 +52,23 @@ jobs:
         id: driver
         timeout-minutes: 10
         run: cargo build --locked --release -p carrick-xtask
-      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
-        id: director-token
-        with:
-          app-id: ${{ secrets.CARRICK_WORKERS_APP_ID }}
-          private-key: ${{ secrets.CARRICK_WORKERS_PRIVATE_KEY }}
-          owner: carrick-sh
-          repositories: agy-director
-          permission-contents: read
       - name: Bootstrap pinned agent tools and private foreground launcher
         id: bootstrap
         timeout-minutes: 10
         env:
-          GH_TOKEN: ${{ steps.director-token.outputs.token }}
+          GH_TOKEN: ${{ secrets.AGENT_DIRECTOR_TOKEN }}
         run: target/release/carrick-xtask agent-runner bootstrap
       - name: Materialize selected provider credentials
         id: auth
         env:
           CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
-          AGY_AUTH_FILES_JSON: ${{ secrets.AGY_AUTH_FILES_JSON }}
+          AGY_OAUTH_TOKEN: ${{ secrets.AGY_OAUTH_TOKEN }}
         run: target/release/carrick-xtask agent-runner auth --event "$GITHUB_EVENT_PATH"
-      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
-        id: worker-token
-        if: ${{ !cancelled() && steps.driver.outcome == 'success' }}
-        with:
-          app-id: ${{ secrets.CARRICK_WORKERS_APP_ID }}
-          private-key: ${{ secrets.CARRICK_WORKERS_PRIVATE_KEY }}
-          owner: carrick-sh
-          repositories: carrick
-          permission-contents: write
-          permission-issues: write
-          permission-pull-requests: write
       - name: Run worker and publish draft PR and contract
-        if: ${{ !cancelled() && steps.worker-token.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.driver.outcome == 'success' }}
         timeout-minutes: 40
         env:
-          GH_TOKEN: ${{ steps.worker-token.outputs.token }}
+          GH_TOKEN: ${{ secrets.AGENT_WORKER_TOKEN }}
         run: >-
           target/release/carrick-xtask dispatch-worker run --event "$GITHUB_EVENT_PATH"
           --setup-status '${{ steps.bootstrap.outcome }}/${{ steps.auth.outcome }}'

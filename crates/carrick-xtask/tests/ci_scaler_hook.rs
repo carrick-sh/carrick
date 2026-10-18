@@ -231,6 +231,9 @@ fn dispatch_foreground_publishes_success_failure_and_timeout() {
         "collision",
         "push-failure",
         "setup-failed",
+        "aged-job",
+        "token-rejected",
+        "token-expired-on-push",
     ] {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
@@ -285,11 +288,19 @@ fn dispatch_foreground_publishes_success_failure_and_timeout() {
         );
         let scripts = [
             ("git", r#"#!/bin/sh
-if [ "$1" = push ] && [ "$TEST_CASE" = push-failure ]; then exit 77; fi
+if [ "$1" = push ]; then
+  if [ "$TEST_CASE" = push-failure ]; then exit 77; fi
+  if [ "$TEST_CASE" = token-expired-on-push ]; then touch "$TEST_ROOT/token-expired"; exit 77; fi
+fi
 exec /usr/bin/git "$@"
 "#.to_owned()),
             ("gh", r#"#!/bin/sh
 case "$1 $2" in
+  'api repos/carrick-sh/carrick')
+    if [ "$TEST_CASE" = token-rejected ] || [ -e "$TEST_ROOT/token-expired" ]; then
+      echo 'HTTP 401: Bad credentials fixture-only-secret' >&2; exit 1
+    fi
+    echo '{"full_name":"carrick-sh/carrick"}' ;;
   'auth setup-git') exit 0 ;;
   'pr list')
     if [ "$TEST_CASE" = update ]; then
@@ -304,6 +315,7 @@ case "$1 $2" in
     cp "$last" "$TEST_ROOT/pr-body.md"
     echo 'https://github.com/carrick-sh/carrick/pull/999' ;;
   'issue comment')
+    if [ "$TEST_CASE" = token-rejected ] || [ -e "$TEST_ROOT/token-expired" ]; then exit 1; fi
     for arg in "$@"; do last=$arg; done
     cp "$last" "$TEST_ROOT/comment.md" ;;
   *) exit 91 ;;
@@ -314,6 +326,7 @@ if [ "$TEST_CASE" = agy ]; then
   test "$AGY_BIN" = "$TEST_ROOT/carrick-agent-42-1/bin/agy" || exit 96
 fi
 while [ "$#" -gt 0 ]; do
+  if [ "$1" = --timeout ]; then shift; printf '%s' "$1" > "$TEST_ROOT/turn-timeout"; fi
   if [ "$1" = --result-file ]; then shift; result=$1; fi
   shift
 done
@@ -382,6 +395,15 @@ printf '%s\n' '{"status":"SUCCESS","transport":{"exit_code":0,"timed_out":false}
             .env("HOME", root)
             .env("GH_TOKEN", "fixture-only")
             .env("GITHUB_TRIGGERING_ACTOR", "tjfontaine")
+            .env(
+                "CARRICK_AGENT_JOB_STARTED_AT",
+                (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    - if case == "aged-job" { 1200 } else { 0 })
+                .to_string(),
+            )
             .env("GITHUB_RUN_ID", "42")
             .env("GITHUB_RUN_ATTEMPT", "1")
             .env("RUNNER_TEMP", root)
@@ -412,7 +434,7 @@ printf '%s\n' '{"status":"SUCCESS","transport":{"exit_code":0,"timed_out":false}
             .unwrap();
         assert_eq!(
             output.status.success(),
-            matches!(case, "done" | "update" | "agy"),
+            matches!(case, "done" | "update" | "agy" | "aged-job"),
             "{case}: {output:?}"
         );
         let receipt: serde_json::Value = serde_json::from_slice(
@@ -421,9 +443,30 @@ printf '%s\n' '{"status":"SUCCESS","transport":{"exit_code":0,"timed_out":false}
         .unwrap();
         assert_eq!(
             receipt["success"],
-            matches!(case, "done" | "update" | "agy"),
+            matches!(case, "done" | "update" | "agy" | "aged-job"),
             "{case}: {receipt}"
         );
+        if matches!(case, "token-rejected" | "token-expired-on-push") {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("host/infra"), "{stderr}");
+            assert!(stderr.contains("AGENT_WORKER_TOKEN"), "{stderr}");
+            assert!(!stderr.contains("fixture-only-secret"));
+            assert!(receipt["pr"].is_null());
+            if case == "token-rejected" {
+                assert!(receipt["sha"].is_null());
+            } else {
+                assert!(checkout.join("dispatch-result/work.bundle").is_file());
+            }
+            continue;
+        }
+        if case == "aged-job" {
+            let timeout = std::fs::read_to_string(root.join("turn-timeout")).unwrap();
+            assert!(
+                timeout.ends_with('s'),
+                "setup time was not deducted: {timeout}"
+            );
+            assert!(timeout.trim_end_matches('s').parse::<u64>().unwrap() <= 600);
+        }
         if case == "setup-failed" {
             assert!(receipt["pr"].is_null());
             assert!(
@@ -525,12 +568,16 @@ fn agent_auth_is_job_scoped_private_and_always_cleanable() {
             "action":"labeled","sender":{"login":"tjfontaine","type":"User"},
             "label":{"name":label},"issue":{"number":634,"title":"Fixture","body":"## Brief\nImplement fixture"}}).to_string()).unwrap();
         let invoke = |args: &[&str]| {
-            Command::new(xtask).args(args)
-            .env("RUNNER_TEMP", temp.path()).env("GITHUB_RUN_ID", "42").env("GITHUB_RUN_ATTEMPT", "1")
-            .env("GITHUB_TRIGGERING_ACTOR", "tjfontaine")
-            .env("CODEX_AUTH_JSON", r#"{"access_token":"fixture-secret"}"#)
-            .env("AGY_AUTH_FILES_JSON", r#"{"antigravity-oauth-token":"fixture-secret","jetski_state.pbtxt":"opaque","installation_id":"fixture"}"#)
-            .output().unwrap()
+            Command::new(xtask)
+                .args(args)
+                .env("RUNNER_TEMP", temp.path())
+                .env("GITHUB_RUN_ID", "42")
+                .env("GITHUB_RUN_ATTEMPT", "1")
+                .env("GITHUB_TRIGGERING_ACTOR", "tjfontaine")
+                .env("CODEX_AUTH_JSON", r#"{"access_token":"fixture-secret"}"#)
+                .env("AGY_OAUTH_TOKEN", "fixture-secret\nraw")
+                .output()
+                .unwrap()
         };
         let output = invoke(&["agent-runner", "auth", "--event", event.to_str().unwrap()]);
         assert!(output.status.success(), "{output:?}");
@@ -542,6 +589,13 @@ fn agent_auth_is_job_scoped_private_and_always_cleanable() {
             home.join(".gemini/antigravity-cli/antigravity-oauth-token")
         };
         assert_eq!(auth.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        if backend == "agy" {
+            assert_eq!(std::fs::read(&auth).unwrap(), b"fixture-secret\nraw");
+            assert_eq!(
+                std::fs::read_dir(auth.parent().unwrap()).unwrap().count(),
+                1
+            );
+        }
         assert_eq!(home.join(".codex").exists(), backend == "codex");
         assert_eq!(home.join(".gemini").exists(), backend == "agy");
         assert!(
@@ -553,4 +607,42 @@ fn agent_auth_is_job_scoped_private_and_always_cleanable() {
         assert!(!state.exists());
         assert!(invoke(&["agent-runner", "cleanup"]).status.success());
     }
+}
+
+#[test]
+fn rejected_director_token_stops_bootstrap_before_downloads() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    for (name, source) in [
+        (
+            "gh",
+            "#!/bin/sh\ntest \"$1 $2\" = 'api repos/carrick-sh/agy-director' || exit 91\necho 'HTTP 401: expired fixture-only-secret' >&2\nexit 1\n",
+        ),
+        (
+            "curl",
+            "#!/bin/sh\ntouch \"$RUNNER_TEMP/download-started\"\nexit 91\n",
+        ),
+    ] {
+        let path = bin.join(name);
+        std::fs::write(&path, source).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .args(["agent-runner", "bootstrap"])
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("GH_TOKEN", "fixture-only-secret")
+        .env("RUNNER_TEMP", temp.path())
+        .env("GITHUB_RUN_ID", "42")
+        .env("GITHUB_RUN_ATTEMPT", "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("host/infra"), "{stderr}");
+    assert!(stderr.contains("AGENT_DIRECTOR_TOKEN"), "{stderr}");
+    assert!(!stderr.contains("fixture-only-secret"));
+    assert!(!temp.path().join("download-started").exists());
+    assert!(!temp.path().join("carrick-agent-42-1").exists());
 }
