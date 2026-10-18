@@ -467,6 +467,8 @@ mod tests {
     fn context(run: u64, event: &str, git_ref: &str, sha: &str) -> JobContext {
         JobContext {
             repository: REPOSITORY.into(),
+            actor: "tjfontaine".into(),
+            triggering_actor: "tjfontaine".into(),
             event: event.into(),
             workflow_ref: format!("{REPOSITORY}/{KERNEL_RUNTIME_WORKFLOW}@{git_ref}"),
             git_ref: git_ref.into(),

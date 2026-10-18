@@ -693,6 +693,8 @@ fn run_user_dir_is_private_persistent_and_never_follows_a_symlink() {
 fn admitted_a_serves_re_vetted_b_but_refuses_untrusted_assignment() {
     let context = JobContext {
         repository: "carrick-sh/carrick".into(),
+        actor: "tjfontaine".into(),
+        triggering_actor: "tjfontaine".into(),
         event: "push".into(),
         workflow_ref: "carrick-sh/carrick/.github/workflows/kernel-runtime.yml@refs/heads/main"
             .into(),
@@ -779,6 +781,8 @@ fn alternate_assignment_is_durable_and_deduplicated_without_consuming_reservatio
 fn actual_assignment_requires_unique_runner_identity_and_exact_hvf_labels() {
     let context = JobContext {
         repository: "carrick-sh/carrick".into(),
+        actor: "tjfontaine".into(),
+        triggering_actor: "tjfontaine".into(),
         event: "push".into(),
         workflow_ref: "carrick-sh/carrick/.github/workflows/kernel-runtime.yml@refs/heads/main"
             .into(),
@@ -840,6 +844,8 @@ fn assignment_without_approval_or_during_drain_fails_closed() {
     .unwrap();
     let context = JobContext {
         repository: "carrick-sh/carrick".into(),
+        actor: "tjfontaine".into(),
+        triggering_actor: "tjfontaine".into(),
         event: "push".into(),
         workflow_ref: "carrick-sh/carrick/.github/workflows/kernel-runtime.yml@refs/heads/main"
             .into(),

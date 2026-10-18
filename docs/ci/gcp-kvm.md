@@ -157,3 +157,11 @@ edit is needed. Going back to Willow also requires its standing controller
 - **Reproduce the VM side** by printing the startup script
   (`scripts/ci/gcp-kvm-run.sh startup-script` with the required environment)
   and running it as root on a nested-KVM Debian 13 VM.
+
+## Required owner-applied WIF narrowing
+
+The owner must narrow the GCP Workload Identity Federation provider to
+`refs/heads/main` and the kernel-runtime `job_workflow_ref`
+(`carrick-sh/carrick/.github/workflows/kernel-runtime.yml@refs/heads/main`).
+Remove admission of merge-queue refs. This is an infrastructure prerequisite;
+this repository change does **not** apply or attest to the provider update.

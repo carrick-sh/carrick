@@ -881,8 +881,7 @@ fn boot_and_register(
         }
     }
     // Re-vet the reserved run now and bind the runner to it: the hook admits
-    // this run, attempt and SHA (and, for a merge group, only groups whose
-    // pull-request heads all live in this repository). A standing clone that
+    // this run, attempt, SHA and owner-only dispatch actors. A standing clone that
     // GitHub assigns another job asks the controller to re-vet that one.
     let policy = gh.vet(admission, row.key)?;
     // The job-start hook reads this root-owned policy; jobs cannot write it.
@@ -2152,6 +2151,8 @@ mod tests {
         // The real hook rendezvous writes run B's request (and then waits).
         let b = JobContext {
             repository: REPOSITORY.into(),
+            actor: "tjfontaine".into(),
+            triggering_actor: "tjfontaine".into(),
             event: "workflow_dispatch".into(),
             workflow_ref: format!("{REPOSITORY}/{KERNEL_RUNTIME_WORKFLOW}@refs/heads/main"),
             git_ref: "refs/heads/main".into(),

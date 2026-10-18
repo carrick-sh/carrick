@@ -30,6 +30,7 @@ pub use mac::{
 
 pub const POOL: &str = "carrick-ci";
 pub const REPOSITORY: &str = "carrick-sh/carrick";
+pub const DISPATCH_OWNER: &str = "tjfontaine";
 /// The one KVM runner label set: Willow clones register with exactly these,
 /// and every workflow job they serve names exactly these in `runs-on`.
 pub const LABELS: [&str; 4] = ["self-hosted", "Linux", "X64", "willow-kvm"];
@@ -422,6 +423,9 @@ impl Admission {
                     && run["path"] == KERNEL_RUNTIME_WORKFLOW
                     && run["head_sha"].as_str().is_some_and(full_sha)
                     && standing_event_ref(event, branch)
+                    && (event != "workflow_dispatch"
+                        || (run["actor"]["login"] == DISPATCH_OWNER
+                            && run["triggering_actor"]["login"] == DISPATCH_OWNER))
             }
         }
     }
@@ -441,6 +445,9 @@ impl Admission {
                 }
                 Self::Standing => {
                     standing_event_ref(&context.event, branch)
+                        && (context.event != "workflow_dispatch"
+                            || (context.actor == DISPATCH_OWNER
+                                && context.triggering_actor == DISPATCH_OWNER))
                         && context.workflow_ref
                             == format!("{REPOSITORY}/{KERNEL_RUNTIME_WORKFLOW}@{}", context.git_ref)
                 }
@@ -556,6 +563,10 @@ pub fn recovery_decision(row: &Record, present: bool, task: TaskState, now: u64)
 pub struct JobContext {
     pub repository: String,
     pub event: String,
+    #[serde(default)]
+    pub actor: String,
+    #[serde(default)]
+    pub triggering_actor: String,
     pub workflow_ref: String,
     pub git_ref: String,
     pub sha: String,
@@ -578,7 +589,7 @@ pub enum JobPolicy {
     /// The historical pilot: [`Admission::Pilot`] for one approved SHA.
     Pilot { sha: String },
     /// [`Admission::Standing`] restricted to the one run the controller
-    /// vetted (repository, workflow, event, ref, merge-group PR heads).
+    /// vetted (repository, workflow, event, ref and dispatch actors).
     Bound(RunBinding),
 }
 impl JobPolicy {
@@ -719,7 +730,7 @@ pub enum ScalerAction {
         one_job: bool,
     },
     /// Standing Willow mode ON Willow: serve kernel-runtime.yml KVM jobs for
-    /// merge groups into main, pushes to main and dispatches on main.
+    /// pushes to main and owner dispatches on main.
     Standing {
         #[arg(long, default_value = "/root/carrick-ci/state")]
         state_dir: PathBuf,
@@ -854,6 +865,8 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
             let context = JobContext {
                 repository: get("GITHUB_REPOSITORY")?,
                 event: get("GITHUB_EVENT_NAME")?,
+                actor: get("GITHUB_ACTOR")?,
+                triggering_actor: get("GITHUB_TRIGGERING_ACTOR")?,
                 workflow_ref: get("GITHUB_WORKFLOW_REF")?,
                 git_ref: get("GITHUB_REF")?,
                 sha: get("GITHUB_SHA")?,

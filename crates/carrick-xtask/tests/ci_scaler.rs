@@ -354,6 +354,8 @@ fn pilot_job_start_rejects_wrong_repository_event_ref_and_sha() {
     let pilot = Admission::pilot(&sha).unwrap();
     let mut context = JobContext {
         repository: "carrick-sh/carrick".into(),
+        actor: "tjfontaine".into(),
+        triggering_actor: "tjfontaine".into(),
         event: "workflow_dispatch".into(),
         workflow_ref:
             "carrick-sh/carrick/.github/workflows/willow-pilot.yml@refs/heads/work/willow-pilot"
@@ -385,6 +387,8 @@ fn pilot_job_start_rejects_wrong_repository_event_ref_and_sha() {
 fn standing_context(event: &str, git_ref: &str) -> JobContext {
     JobContext {
         repository: REPOSITORY.into(),
+        actor: "tjfontaine".into(),
+        triggering_actor: "tjfontaine".into(),
         event: event.into(),
         workflow_ref: format!("{REPOSITORY}/{KERNEL_RUNTIME_WORKFLOW}@{git_ref}"),
         git_ref: git_ref.into(),
@@ -492,6 +496,8 @@ fn standing_run(event: &str, branch: &str) -> serde_json::Value {
         "path": KERNEL_RUNTIME_WORKFLOW,
         "repository": {"full_name": REPOSITORY},
         "head_repository": {"full_name": REPOSITORY},
+        "actor": {"login": "tjfontaine"},
+        "triggering_actor": {"login": "tjfontaine"},
     })
 }
 
@@ -923,4 +929,35 @@ fn serial_host_aggregate_requires_push_gates_and_allows_owner_seeding() {
             "{event}: hvf={hvf} kvm={kvm} hvf-gate={hvf_gate} kvm-gate={kvm_gate}"
         );
     }
+}
+
+#[test]
+fn owner_dispatch_requires_both_original_and_triggering_actor() {
+    for (actor, triggering, accepted) in [
+        ("tjfontaine", "tjfontaine", true),
+        ("someone-else", "tjfontaine", false),
+        ("tjfontaine", "someone-else", false),
+        ("", "tjfontaine", false),
+        ("tjfontaine", "", false),
+    ] {
+        let mut run = standing_run("workflow_dispatch", "main");
+        run["actor"] = serde_json::json!({"login":actor});
+        run["triggering_actor"] = serde_json::json!({"login":triggering});
+        assert_eq!(
+            Admission::Standing.admits_run(&run),
+            accepted,
+            "run: {actor}/{triggering}"
+        );
+        let mut value =
+            serde_json::to_value(standing_context("workflow_dispatch", "refs/heads/main")).unwrap();
+        value["actor"] = actor.into();
+        value["triggering_actor"] = triggering.into();
+        let context: JobContext = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            Admission::Standing.authorize(&context).is_ok(),
+            accepted,
+            "hook: {actor}/{triggering}"
+        );
+    }
+    assert!(Admission::Standing.admits_run(&standing_run("push", "main")));
 }
