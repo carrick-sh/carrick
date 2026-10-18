@@ -763,6 +763,87 @@ pub struct QueueRow {
     pub(crate) closing_authorized: bool,
 }
 
+#[derive(Debug)]
+struct QueuedRow {
+    row: QueueRow,
+    obligation: DrainObligation,
+}
+
+impl std::ops::Deref for QueuedRow {
+    type Target = QueueRow;
+    fn deref(&self) -> &QueueRow {
+        &self.row
+    }
+}
+
+#[derive(Debug)]
+struct ClaimedRow {
+    row: QueueRow,
+    obligation: DrainObligation,
+}
+
+impl std::ops::Deref for ClaimedRow {
+    type Target = QueueRow;
+    fn deref(&self) -> &QueueRow {
+        &self.row
+    }
+}
+
+impl QueuedRow {
+    fn claim(self, queue: &RunQueueInner) -> ClaimedRow {
+        let Self {
+            row,
+            mut obligation,
+        } = self;
+        queue.claimed.fetch_add(1, Ordering::SeqCst);
+        queue.claim_boundaries.fetch_add(1, Ordering::SeqCst);
+        queue.total_queued.fetch_sub(1, Ordering::SeqCst);
+        obligation.phase = DrainPhase::Claimed;
+        ClaimedRow { row, obligation }
+    }
+}
+
+#[derive(Debug)]
+enum DrainPhase {
+    Authority,
+    Queued,
+    Claimed,
+}
+
+/// Non-cloneable custody of one conserved drain obligation. Queued-to-claimed
+/// transfer moves this value; dropping its final owner retires the obligation.
+#[derive(Debug)]
+struct DrainObligation {
+    work: Arc<DrainWork>,
+    queue: Weak<RunQueueInner>,
+    phase: DrainPhase,
+}
+
+impl DrainObligation {
+    fn retain(queue: &RunQueueInner, phase: DrainPhase) -> Self {
+        queue.drain_work.retain();
+        Self {
+            work: Arc::clone(&queue.drain_work),
+            queue: Weak::clone(&queue.self_weak),
+            phase,
+        }
+    }
+}
+
+impl Drop for DrainObligation {
+    fn drop(&mut self) {
+        if let Some(queue) = self.queue.upgrade() {
+            match self.phase {
+                DrainPhase::Authority => queue.release_authority(),
+                DrainPhase::Queued => queue.release_queued(),
+                DrainPhase::Claimed => queue.finish_claim(),
+            }
+        } else {
+            self.work.release();
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct QueuedDemand {
     pub affinity: carrick_hal::CpuAffinity,
@@ -773,7 +854,7 @@ pub(crate) struct QueuedDemand {
 /// lifecycle (close/drain) and is never taken to enqueue or claim.
 #[derive(Debug, Default)]
 struct GuestCpuLocalState {
-    rows: VecDeque<QueueRow>,
+    rows: VecDeque<QueuedRow>,
     /// Executors parked on this CPU's condvar. Exact: incremented and
     /// decremented under this lock, so `close` can snapshot it.
     waiters: usize,
@@ -939,7 +1020,7 @@ struct QueueKeyShard {
     /// CPU queue. A service record in an EL1 run queue names each; the
     /// executor of the vCPU EL1 runs it on claims it by exact key
     /// ([`Scheduler::take_zone`]). Counted in `total_queued`.
-    zone_held: BTreeMap<QueueKey, QueueRow>,
+    zone_held: BTreeMap<QueueKey, QueuedRow>,
 }
 
 impl QueueKeyShard {
@@ -975,7 +1056,15 @@ impl DrainWork {
     }
 
     fn release(&self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        if self
+            .0
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_sub(1)
+            })
+            .is_err()
+        {
+            carrick_fatal!("kernel::run_queue", "drain work count underflow");
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -1103,7 +1192,8 @@ pub(crate) struct RunQueueInner {
     #[cfg(test)]
     steal_scan_visits: AtomicUsize,
     active_authorities: AtomicUsize,
-    drain_work: DrainWork,
+    drain_work: Arc<DrainWork>,
+    self_weak: Weak<RunQueueInner>,
     close_epoch: AtomicU64,
     /// Carrier-wide exact-key dedup, sharded so a wake never contends with an
     /// unrelated wake. A key may be queued on only one CPU at a time; work
@@ -1437,9 +1527,16 @@ impl RunQueueInner {
         self.active_wake_admissions() == 0 && self.drain_work.is_empty()
     }
 
-    fn retain_queued_work(&self) {
-        self.drain_work.retain();
+    fn retain_queued_row(&self, row: QueueRow) -> QueuedRow {
+        let obligation = DrainObligation::retain(self, DrainPhase::Queued);
         self.total_queued.fetch_add(1, Ordering::SeqCst);
+        QueuedRow { row, obligation }
+    }
+
+    fn release_queued(&self) {
+        self.total_queued.fetch_sub(1, Ordering::SeqCst);
+        self.drain_work.release();
+        self.settle_close_if_closing();
     }
 
     fn maybe_finish_close(&self, state: &mut RunQueueState) {
@@ -1501,10 +1598,9 @@ impl RunQueueInner {
                 return Ok(EnqueueOutcome::Deferred);
             }
             drop(shard);
-            local.rows.push_back(row);
+            local.rows.push_back(self.retain_queued_row(row));
             cpu.depth.store(local.rows.len(), Ordering::Release);
             self.host_queued.fetch_add(1, Ordering::SeqCst);
-            self.retain_queued_work();
             local.wake_ticket = local.wake_ticket.wrapping_add(1);
             local.waiters > 0
         };
@@ -1570,10 +1666,9 @@ impl RunQueueInner {
                 row
             };
             drop(shard);
-            local.rows.push_back(publishable);
+            local.rows.push_back(self.retain_queued_row(publishable));
             cpu.depth.store(local.rows.len(), Ordering::Release);
             self.host_queued.fetch_add(1, Ordering::SeqCst);
-            self.retain_queued_work();
             local.wake_ticket = local.wake_ticket.wrapping_add(1);
             local.waiters > 0
         };
@@ -1609,8 +1704,7 @@ impl RunQueueInner {
                 shard.deferred.insert(key, row);
                 return EnqueueOutcome::Deferred;
             }
-            shard.zone_held.insert(key, row);
-            self.retain_queued_work();
+            shard.zone_held.insert(key, self.retain_queued_row(row));
         }
         self.place_zone_row(&thread, key);
         self.note_zone_runnable(&thread);
@@ -1643,8 +1737,9 @@ impl RunQueueInner {
                 shard.queued.insert(key);
                 row
             };
-            shard.zone_held.insert(key, publishable);
-            self.retain_queued_work();
+            shard
+                .zone_held
+                .insert(key, self.retain_queued_row(publishable));
         }
         self.place_zone_row(&thread, key);
         self.note_zone_runnable(&thread);
@@ -1731,18 +1826,14 @@ impl RunQueueInner {
     }
 
     /// Take the held row of exact `key` for a claim (EL1 plan 1d).
-    fn take_zone_row(&self, key: QueueKey) -> Option<QueueRow> {
+    fn take_zone_row(&self, key: QueueKey) -> Option<ClaimedRow> {
         let row = {
             let mut shard = self.shard(key).lock();
             let row = shard.zone_held.remove(&key)?;
             shard.queued.remove(&key);
             row
         };
-        // The claim is counted before the queue total drops (`finish_removal`).
-        self.claimed.fetch_add(1, Ordering::SeqCst);
-        self.claim_boundaries.fetch_add(1, Ordering::SeqCst);
-        self.total_queued.fetch_sub(1, Ordering::SeqCst);
-        Some(row)
+        Some(row.claim(self))
     }
 
     /// Nudge one idle CPU other than `origin` so it re-runs its steal scan —
@@ -1785,12 +1876,11 @@ impl RunQueueInner {
 
     /// Pop `cpu`'s FIFO head (or the policy's choice), accounting the claim.
     /// Pop `cpu`'s FIFO head (or the policy's choice), accounting the claim.
-    fn pop_local(&self, cpu: &GuestCpu) -> Option<QueueRow> {
+    fn pop_local(&self, cpu: &GuestCpu) -> Option<ClaimedRow> {
         if !self.policy.inspects_queues() {
             let mut local = cpu.state.lock();
             let row = local.rows.pop_front()?;
-            self.finish_removal(&mut local, cpu, row.key);
-            return Some(row);
+            return Some(self.finish_removal(&mut local, cpu, row));
         }
 
         // Custom pick: snapshot under lock, invoke policy callback outside lock,
@@ -1837,25 +1927,27 @@ impl RunQueueInner {
         // If stale or unpicked, take current FIFO head (index 0).
         let pos = position.unwrap_or(0);
         let row = local.rows.remove(pos)?;
-        self.finish_removal(&mut local, cpu, row.key);
-        Some(row)
+        Some(self.finish_removal(&mut local, cpu, row))
     }
 
     /// Taking a row transfers its drain obligation to the claim. The separate
     /// diagnostic counts may overlap, but never decide whether close drained.
-    fn finish_removal(&self, local: &mut GuestCpuLocalState, cpu: &GuestCpu, key: QueueKey) {
+    fn finish_removal(
+        &self,
+        local: &mut GuestCpuLocalState,
+        cpu: &GuestCpu,
+        row: QueuedRow,
+    ) -> ClaimedRow {
         crate::el1_zone::count_host_queue_claim();
-        self.claimed.fetch_add(1, Ordering::SeqCst);
-        self.claim_boundaries.fetch_add(1, Ordering::SeqCst);
-        self.shard(key).lock().queued.remove(&key);
+        self.shard(row.key).lock().queued.remove(&row.key);
         cpu.depth.store(local.rows.len(), Ordering::Release);
         self.host_queued.fetch_sub(1, Ordering::SeqCst);
-        self.total_queued.fetch_sub(1, Ordering::SeqCst);
+        row.claim(self)
     }
 
     /// `findrunnable`'s steal: an idle CPU takes work from the longest queue,
     /// honouring the stolen task's affinity mask.
-    fn try_steal(&self, stealer: GuestCpuId) -> Option<QueueRow> {
+    fn try_steal(&self, stealer: GuestCpuId) -> Option<ClaimedRow> {
         // Zone-held rows count towards lifecycle drain but cannot appear on a
         // host CPU queue. This also avoids allocating/sorting a victim list
         // twice on every empty executor handoff.
@@ -1892,13 +1984,12 @@ impl RunQueueInner {
                 continue;
             };
             let row = local.rows.remove(position)?;
-            self.finish_removal(&mut local, victim, row.key);
-            return Some(row);
+            return Some(self.finish_removal(&mut local, victim, row));
         }
         None
     }
 
-    fn policy_steal(&self, stealer: GuestCpuId) -> Option<QueueRow> {
+    fn policy_steal(&self, stealer: GuestCpuId) -> Option<ClaimedRow> {
         struct CpuStealSnapshot {
             cpu: GuestCpuId,
             queued: Vec<SchedThreadId>,
@@ -1954,8 +2045,7 @@ impl RunQueueInner {
             .iter()
             .position(|row| row.key == expected_key && row.thread.affinity().is_allowed(stealer))?;
         let row = local.rows.remove(position)?;
-        self.finish_removal(&mut local, victim, row.key);
-        Some(row)
+        Some(self.finish_removal(&mut local, victim, row))
     }
 
     fn finish_claim(&self) {
@@ -1970,11 +2060,7 @@ impl RunQueueInner {
         self.settle_close_if_closing();
     }
 
-    fn release_authority(&self, key: QueueKey) {
-        // Clear the gate BEFORE the count drops: once the count reaches zero a
-        // close may finish, and a gate (or a row deferred behind one) outliving
-        // its authority would be reachable by nothing.
-        self.clear_unpublished(key);
+    fn release_authority(&self) {
         if self.active_authorities.fetch_sub(1, Ordering::SeqCst) == 0 {
             carrick_fatal!(
                 "kernel::run_queue",
@@ -1990,8 +2076,10 @@ impl RunQueueInner {
     /// Admit one authority. The lifecycle check and the increment are one
     /// transaction under the carrier lock, so a `close` can never observe a
     /// drained queue while an admission is in flight.
-    fn admit_authority(&self) -> Result<(), RunQueueError> {
-        let state = self.state.lock();
+    fn admit_authority_locked(
+        &self,
+        state: &RunQueueState,
+    ) -> Result<DrainObligation, RunQueueError> {
         if state.lifecycle == QueueLifecycle::Closed {
             return Err(RunQueueError::Closed);
         }
@@ -2004,18 +2092,21 @@ impl RunQueueInner {
         {
             return Err(RunQueueError::SubmissionRejected);
         }
-        self.drain_work.retain();
-        drop(state);
-        Ok(())
+        Ok(DrainObligation::retain(self, DrainPhase::Authority))
+    }
+
+    fn admit_authority(&self) -> Result<DrainObligation, RunQueueError> {
+        let state = self.state.lock();
+        self.admit_authority_locked(&state)
     }
 
     /// Admit one authority whose exact key is not published yet. Marking the
     /// gate is part of the admission, so an admitted authority never exists
     /// without it.
-    fn admit_unpublished_authority(&self, key: QueueKey) -> Result<(), RunQueueError> {
-        self.admit_authority()?;
+    fn admit_unpublished_authority(&self, key: QueueKey) -> Result<DrainObligation, RunQueueError> {
+        let obligation = self.admit_authority()?;
         self.mark_unpublished(key);
-        Ok(())
+        Ok(obligation)
     }
 
     pub(crate) fn snapshot_queued_demands(&self) -> Vec<QueuedDemand> {
@@ -2034,7 +2125,7 @@ impl RunQueueInner {
 
 /// What one pass of `take_row_bound` found.
 enum BoundTake {
-    Row(QueueRow),
+    Row(ClaimedRow),
     /// A host-wait slot was released: scan again.
     Released,
     /// Nothing to take; a blocking caller would park here.
@@ -2107,7 +2198,7 @@ pub struct SubmissionAuthority {
     queue: Weak<RunQueueInner>,
     kernel: Weak<Kernel>,
     key: QueueKey,
-    active: bool,
+    obligation: Option<DrainObligation>,
 }
 
 impl SubmissionAuthority {
@@ -2120,7 +2211,16 @@ impl SubmissionAuthority {
     }
 
     pub const fn is_active(&self) -> bool {
-        self.active
+        self.obligation.is_some()
+    }
+
+    fn retire(&mut self) {
+        if let Some(obligation) = self.obligation.take() {
+            if let Some(queue) = self.queue.upgrade() {
+                queue.clear_unpublished(self.key);
+            }
+            drop(obligation);
+        }
     }
 
     pub fn rollover_exact(
@@ -2135,7 +2235,7 @@ impl SubmissionAuthority {
             .raw()
             .checked_add(1)
             .is_some_and(|next| next == successor_generation.raw());
-        if !self.active
+        if !self.is_active()
             || self.key.thread != predecessor_thread
             || self.key.generation != predecessor_generation
             || predecessor_thread != successor_thread
@@ -2187,10 +2287,7 @@ impl SubmissionAuthority {
         let thread = self.thread_key();
         let mut authority =
             self.rollover_exact(scheduler, thread, predecessor, thread, successor)?;
-        if let Some(queue) = authority.queue.upgrade() {
-            queue.release_authority(authority.key);
-        }
-        authority.active = false;
+        authority.retire();
         Ok(authority)
     }
 
@@ -2202,7 +2299,7 @@ impl SubmissionAuthority {
         successor_thread: ThreadKey,
         successor_generation: ExecutionGeneration,
     ) -> Result<Self, (RunQueueError, Self)> {
-        if !self.active
+        if !self.is_active()
             || self.key.thread != predecessor_thread
             || self.key.generation != predecessor_generation
         {
@@ -2236,7 +2333,7 @@ impl SubmissionAuthority {
         predecessor: ExecutionGeneration,
         successor: ExecutionGeneration,
     ) -> Result<Self, (RunQueueError, Self)> {
-        if self.active
+        if self.is_active()
             || self.generation() != predecessor
             || predecessor.raw().checked_add(1) != Some(successor.raw())
         {
@@ -2256,11 +2353,12 @@ impl SubmissionAuthority {
         {
             return Err((RunQueueError::AuthorityMismatch, self));
         }
-        if let Err(error) = queue.admit_authority() {
-            return Err((error, self));
-        }
+        let obligation = match queue.admit_authority() {
+            Ok(obligation) => obligation,
+            Err(error) => return Err((error, self)),
+        };
         self.key.generation = successor;
-        self.active = true;
+        self.obligation = Some(obligation);
         Ok(self)
     }
 
@@ -2269,7 +2367,7 @@ impl SubmissionAuthority {
         thread: ThreadKey,
         generation: ExecutionGeneration,
     ) -> Result<Self, RunQueueError> {
-        if !self.active {
+        if !self.is_active() {
             return Err(RunQueueError::AuthorityMismatch);
         }
         let kernel = self.kernel.upgrade().ok_or(RunQueueError::Closed)?;
@@ -2282,12 +2380,12 @@ impl SubmissionAuthority {
                 generation,
                 || {
                     let key = QueueKey { thread, generation };
-                    queue.admit_unpublished_authority(key)?;
+                    let obligation = queue.admit_unpublished_authority(key)?;
                     Ok(Self {
                         queue: Arc::downgrade(&queue),
                         kernel: Arc::downgrade(&kernel),
                         key,
-                        active: true,
+                        obligation: Some(obligation),
                     })
                 },
             )
@@ -2335,19 +2433,19 @@ impl SubmissionAuthority {
             &mut dyn FnMut() -> Result<Self, RunQueueError>,
         ) -> Option<Result<Self, RunQueueError>>,
     ) -> Result<Self, RunQueueError> {
-        if !self.active {
+        if !self.is_active() {
             return Err(RunQueueError::AuthorityMismatch);
         }
         let kernel = self.kernel.upgrade().ok_or(RunQueueError::Closed)?;
         let queue = self.queue.upgrade().ok_or(RunQueueError::Closed)?;
         let mut commit = || {
             let key = QueueKey { thread, generation };
-            queue.admit_unpublished_authority(key)?;
+            let obligation = queue.admit_unpublished_authority(key)?;
             Ok(Self {
                 queue: Arc::downgrade(&queue),
                 kernel: Arc::downgrade(&kernel),
                 key,
-                active: true,
+                obligation: Some(obligation),
             })
         };
         validate(&kernel, &mut commit).unwrap_or(Err(RunQueueError::AuthorityMismatch))
@@ -2441,13 +2539,7 @@ impl SubmissionPublication {
 
 impl Drop for SubmissionAuthority {
     fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        if let Some(queue) = self.queue.upgrade() {
-            queue.release_authority(self.key);
-        }
-        self.active = false;
+        self.retire();
     }
 }
 
@@ -2527,7 +2619,7 @@ impl RunQueue {
             .map(|_| Mutex::new(QueueKeyShard::default()))
             .collect();
         Self {
-            inner: Arc::new(RunQueueInner {
+            inner: Arc::new_cyclic(|self_weak| RunQueueInner {
                 state: Mutex::new(RunQueueState::default()),
                 changed: Condvar::new(),
                 lifecycle: AtomicU8::new(QueueLifecycle::Open as u8),
@@ -2541,7 +2633,8 @@ impl RunQueue {
                 #[cfg(test)]
                 steal_scan_visits: AtomicUsize::new(0),
                 active_authorities: AtomicUsize::new(0),
-                drain_work: DrainWork::default(),
+                drain_work: Arc::new(DrainWork::default()),
+                self_weak: self_weak.clone(),
                 close_epoch: AtomicU64::new(0),
                 keys,
                 online: (0..ncpu).map(|_| AtomicUsize::new(0)).collect(),
@@ -2582,7 +2675,7 @@ impl RunQueue {
             let Some(index) = local.rows.iter().position(|row| row.key == key) else {
                 continue;
             };
-            local.rows.remove(index);
+            let row = local.rows.remove(index);
             {
                 let mut shard = self.inner.shard(key).lock();
                 shard.queued.remove(&key);
@@ -2590,23 +2683,19 @@ impl RunQueue {
             }
             cpu.depth.store(local.rows.len(), Ordering::Release);
             self.inner.host_queued.fetch_sub(1, Ordering::SeqCst);
-            self.inner.total_queued.fetch_sub(1, Ordering::SeqCst);
-            self.inner.drain_work.release();
             drop(local);
-            self.inner.settle_close_if_closing();
+            drop(row);
             return true;
         }
         // A row the guest schedules is on no CPU queue but counted; its
         // service record is discarded when an executor reaches it.
         {
             let mut shard = self.inner.shard(key).lock();
-            if shard.zone_held.remove(&key).is_some() {
+            if let Some(row) = shard.zone_held.remove(&key) {
                 shard.queued.remove(&key);
                 RunQueueInner::retire_gates(&mut shard, key);
                 drop(shard);
-                self.inner.total_queued.fetch_sub(1, Ordering::SeqCst);
-                self.inner.drain_work.release();
-                self.inner.settle_close_if_closing();
+                drop(row);
                 return true;
             }
         }
@@ -2644,20 +2733,14 @@ impl RunQueue {
         {
             return Err(RunQueueError::SubmissionRejected);
         }
-        self.inner
-            .active_authorities
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-                count.checked_add(1)
-            })
-            .map_err(|_| RunQueueError::SubmissionRejected)?;
-        self.inner.drain_work.retain();
+        let obligation = self.inner.admit_authority_locked(&state)?;
         drop(state);
         self.inner.mark_unpublished(key);
         Ok(SubmissionAuthority {
             queue: Arc::downgrade(&self.inner),
             kernel: Arc::downgrade(kernel),
             key,
-            active: true,
+            obligation: Some(obligation),
         })
     }
 
@@ -2672,7 +2755,7 @@ impl RunQueue {
         &self,
         executor: &ExecutorRegistration,
         auditors: Option<&crate::observe::AuditorChain>,
-    ) -> Result<QueueRow, RunQueueError> {
+    ) -> Result<ClaimedRow, RunQueueError> {
         loop {
             if executor.in_host_wait() {
                 return Err(RunQueueError::ExecutorBusy);
@@ -2693,7 +2776,7 @@ impl RunQueue {
         &self,
         executor: &ExecutorRegistration,
         auditors: Option<&crate::observe::AuditorChain>,
-    ) -> Result<Option<QueueRow>, RunQueueError> {
+    ) -> Result<Option<ClaimedRow>, RunQueueError> {
         loop {
             if executor.in_host_wait() {
                 return Err(RunQueueError::ExecutorBusy);
@@ -2851,8 +2934,8 @@ impl RunQueue {
         &self,
         idle: &mut IdleAnnouncement<'_>,
         cpu: GuestCpuId,
-        row: QueueRow,
-    ) -> QueueRow {
+        row: ClaimedRow,
+    ) -> ClaimedRow {
         if idle.is_held() {
             // Release BEFORE reading the queue total. The two are `SeqCst`
             // and so is `enqueue`'s (`total_queued` add, then idle load):
@@ -3024,10 +3107,11 @@ impl RunQueue {
     fn claim_row(
         &self,
         executor: &ExecutorRegistration,
-        row: QueueRow,
+        row: ClaimedRow,
         recorder: Option<&dyn DiscardRecorder>,
         auditors: Option<&crate::observe::AuditorChain>,
     ) -> Option<QueueClaim> {
+        let ClaimedRow { row, obligation } = row;
         let observed_state = row.thread.execution_diagnostic();
         if row.thread.key() != row.key.thread
             || row.thread.execution_state().generation() != Some(row.key.generation)
@@ -3055,7 +3139,6 @@ impl RunQueue {
                     crate::observe::WakeRejectionReason::StaleGeneration,
                 );
             }
-            self.inner.finish_claim();
             return None;
         }
         let cpu = executor.bound_cpu().unwrap_or(GuestCpuId::new(0));
@@ -3079,7 +3162,6 @@ impl RunQueue {
                         crate::observe::WakeRejectionReason::StaleGeneration,
                     );
                 }
-                self.inner.finish_claim();
                 return None;
             }
             Err(ThreadExecutionError::AffinityExcluded { .. }) => {
@@ -3089,7 +3171,6 @@ impl RunQueue {
                 // wake coalesces normally; it must never become a discarded
                 // or stranded task merely because its placement changed.
                 let _ = self.inner.enqueue(row, true, None);
-                self.inner.finish_claim();
                 return None;
             }
             Err(error) => {
@@ -3102,11 +3183,14 @@ impl RunQueue {
                         format!("claim_error: {error}"),
                     );
                 }
-                self.inner.finish_claim();
                 return None;
             }
         };
-        Some(QueueClaim { row, lease })
+        Some(QueueClaim {
+            row,
+            lease,
+            obligation,
+        })
     }
 
     pub fn close(&self) {
@@ -3282,6 +3366,7 @@ impl RunQueue {
 pub struct QueueClaim {
     row: QueueRow,
     lease: ThreadExecutionLease,
+    obligation: DrainObligation,
 }
 
 pub struct RunnableThread {
@@ -3290,7 +3375,7 @@ pub struct RunnableThread {
     binding: ExecutorBinding,
     lease: Option<ThreadExecutionLease>,
     queue: Weak<RunQueueInner>,
-    active_claim: bool,
+    claim: Option<DrainObligation>,
     /// The guest CPU this claim runs on. This is the SAME value published to
     /// the thread's `last_cpu` and read back by the guest through
     /// `sched_getcpu`, so an observer that reports it is reporting the guest's
@@ -3398,13 +3483,7 @@ impl RunnableThread {
     }
 
     fn finish_claim(&mut self) {
-        if !self.active_claim {
-            return;
-        }
-        if let Some(queue) = self.queue.upgrade() {
-            queue.finish_claim();
-        }
-        self.active_claim = false;
+        drop(self.claim.take());
     }
 }
 
@@ -3437,7 +3516,7 @@ impl Drop for RunnableThread {
         // whatever state `begin_switch_out` last wrote. Record it before the
         // count drops so a post-mortem names the strand instead of showing an
         // unexplained gap after `HVPEXEC_BOUNDARY`.
-        if self.active_claim {
+        if self.claim.is_some() {
             crate::event_ring::rec_hvpatch_settle_step(
                 self.key.thread.tid.raw(),
                 self.key.generation.raw(),
@@ -4606,7 +4685,11 @@ impl Scheduler {
         executor: &ExecutorRegistration,
         claim: QueueClaim,
     ) -> Result<RunnableThread, RunQueueError> {
-        let QueueClaim { row, lease } = claim;
+        let QueueClaim {
+            row,
+            lease,
+            obligation,
+        } = claim;
         let binding = ExecutorBinding {
             executor: executor.id,
             executor_epoch: lease.executor_epoch(),
@@ -4615,7 +4698,6 @@ impl Scheduler {
         };
         if let Err(error) = self.executors.bind(executor, binding) {
             drop(lease);
-            self.queue.inner.finish_claim();
             return Err(error);
         }
         // A spare running on a lent CPU whose owner became ready to return
@@ -4671,7 +4753,7 @@ impl Scheduler {
             binding,
             lease: Some(lease),
             queue: Arc::downgrade(&self.queue.inner),
-            active_claim: true,
+            claim: Some(obligation),
             guest_cpu: bound_cpu,
         })
     }
@@ -5716,24 +5798,14 @@ impl Scheduler {
     /// what IS and IS NOT stealable without blocking in `take`.
     #[cfg(test)]
     pub(crate) fn steal_probe(&self, cpu: GuestCpuId) -> Option<ThreadKey> {
-        let row = self.queue.inner.try_steal(cpu)?;
+        let ClaimedRow { row, obligation } = self.queue.inner.try_steal(cpu)?;
         let key = row.key;
         let closing_authorized = row.closing_authorized;
-        let thread = Arc::clone(&row.thread);
-        drop(row);
         self.queue
             .inner
-            .enqueue(
-                QueueRow {
-                    key,
-                    thread,
-                    closing_authorized,
-                },
-                closing_authorized,
-                None,
-            )
+            .enqueue(row, closing_authorized, None)
             .expect("restore the probed row");
-        self.queue.inner.finish_claim();
+        drop(obligation);
         Some(key.thread)
     }
 }
@@ -8232,14 +8304,13 @@ mod tests {
                 shard.queued.insert(key);
                 shard.zone_held.insert(
                     key,
-                    super::QueueRow {
+                    inner.retain_queued_row(super::QueueRow {
                         key,
                         thread: Arc::clone(root.thread()),
                         closing_authorized: false,
-                    },
+                    }),
                 );
             }
-            inner.retain_queued_work();
             for _ in 0..16 {
                 assert!(inner.try_steal(GuestCpuId::new(0)).is_none());
             }
@@ -8283,14 +8354,13 @@ mod tests {
             shard.queued.insert(key);
             shard.zone_held.insert(
                 key,
-                super::QueueRow {
+                inner.retain_queued_row(super::QueueRow {
                     key,
                     thread: Arc::clone(root.thread()),
                     closing_authorized: false,
-                },
+                }),
             );
         }
-        inner.retain_queued_work();
         inner.place_zone_row(root.thread(), key);
         // The wedge census names the row, its owner and its state.
         let summary = scheduler.scheduler_summary();
@@ -9604,6 +9674,38 @@ mod tests {
     }
 
     #[test]
+    fn drain_work_is_owned_by_an_unactivated_queue_claim() {
+        let (kernel, root) = bootstrap(12_557);
+        publish(&root, 17);
+        let scheduler = Scheduler::new(kernel);
+        let authority = scheduler
+            .admit_root(
+                root.thread().key(),
+                root.thread().execution_state().generation().unwrap(),
+            )
+            .unwrap();
+        authority
+            .publish(&scheduler, Arc::clone(root.thread()))
+            .unwrap();
+        drop(authority);
+        let registration = scheduler
+            .register_executor(Arc::new(RecordingKick::default()))
+            .unwrap();
+        let claim = scheduler.queue.take(&registration, None, None).unwrap();
+        scheduler.close();
+        assert_eq!(
+            scheduler.queue.inner.state.lock().lifecycle,
+            super::QueueLifecycle::Closing
+        );
+        drop(claim);
+        assert_eq!(
+            scheduler.queue.inner.state.lock().lifecycle,
+            super::QueueLifecycle::Closed
+        );
+        assert_eq!(scheduler.claimed(), 0);
+    }
+
+    #[test]
     fn controller_close_normal_wake_and_exit() {
         let (kernel, root) = bootstrap(12_551);
         publish(&root, 11);
@@ -9935,6 +10037,38 @@ mod tests {
     }
     mod serial_host {
         use super::*;
+
+        #[test]
+        fn drain_work_double_release_is_fatal() {
+            const CHILD: &str = "CARRICK_TEST_DRAIN_WORK_DOUBLE_RELEASE";
+            if std::env::var_os(CHILD).is_some() {
+                let work = super::super::DrainWork::default();
+                work.retain();
+                work.release();
+                work.release();
+                return;
+            }
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "kernel::scheduler::tests::serial_host::drain_work_double_release_is_fatal",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                output.status.signal(),
+                Some(libc::SIGABRT),
+                "double release must be fatal: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("carrick fatal [kernel::run_queue]: drain work count underflow")
+            );
+        }
 
         struct ZoneRegion {
             pointer: std::ptr::NonNull<u8>,
