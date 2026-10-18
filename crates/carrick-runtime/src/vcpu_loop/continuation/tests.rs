@@ -565,9 +565,11 @@ fn serial_host_periodic_process_timer_keeps_other_threads_sleep_deadline() {
                     .unwrap(),
                 super::super::signal_ingress_producer::HostIngressStep::Published
             );
-            let mut frame = carrick_el1_abi::TrapFrame::default();
-            frame.esr = 0xfffd;
-            frame.elr = 0x400004;
+            let mut frame = carrick_el1_abi::TrapFrame {
+                esr: 0xfffd,
+                elr: 0x400004,
+                ..Default::default()
+            };
             frame.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
             assert_eq!(leader_fixture.drain_and_deliver(&queue, &mut frame).0, 1);
             assert_eq!(frame.elr, 0x7000, "SIGALRM handler runs on the leader");
@@ -781,10 +783,12 @@ fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
         if eligible {
             // An interrupted restart-class checkpoint with no handler to run
             // must transparently rewind its SVC instead of returning EINTR.
-            let mut second = carrick_el1_abi::TrapFrame::default();
-            second.esr = 0xfffe;
-            second.elr = 0x500004;
-            second.far = 0x4321;
+            let mut second = carrick_el1_abi::TrapFrame {
+                esr: 0xfffe,
+                elr: 0x500004,
+                far: 0x4321,
+                ..Default::default()
+            };
             second.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
             second.x[8] = nr;
             let (drained, route) = fixture.drain_and_deliver(&queue, &mut second);
@@ -813,10 +817,12 @@ fn serial_host_empty_native_checkpoint_restarts_forwarded_read() {
     );
     fixture.install_sigint_handler(true);
     let queue = carrick_el1_abi::SharedSignalIngressQueue::new();
-    let mut frame = carrick_el1_abi::TrapFrame::default();
-    frame.esr = 0xfffe;
-    frame.elr = 0x400004;
-    frame.far = 0x1234;
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr: 0xfffe,
+        elr: 0x400004,
+        far: 0x1234,
+        ..Default::default()
+    };
     frame.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
     frame.x[8] = 63;
     let (drained, route) = fixture.drain_and_deliver(&queue, &mut frame);
@@ -1012,10 +1018,12 @@ fn serial_host_sibling_stealing_process_sigint_restarts_blocked_read() {
     // cause the blocked thread's 0xfffe checkpoint to return EINTR with no handler.
     let (drained, _stolen) = fixture.drain_and_steal_on_sibling(&queue);
     assert_eq!(drained, 1);
-    let mut frame = carrick_el1_abi::TrapFrame::default();
-    frame.esr = 0xfffe;
-    frame.elr = 0x400004;
-    frame.far = 0x1234;
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr: 0xfffe,
+        elr: 0x400004,
+        far: 0x1234,
+        ..Default::default()
+    };
     frame.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
     frame.x[8] = 63;
     let (_, route) = fixture.drain_and_deliver(&queue, &mut frame);
@@ -1031,10 +1039,12 @@ fn serial_host_sibling_stealing_process_sigint_restarts_blocked_read() {
     // sibling before the blocked thread's 0xfffe checkpoint runs, the blocked
     // read must transparently restart.
     assert!(fixture.enqueue_process_signal_and_steal_on_sibling(2));
-    let mut stolen_frame = carrick_el1_abi::TrapFrame::default();
-    stolen_frame.esr = 0xfffe;
-    stolen_frame.elr = 0x400004;
-    stolen_frame.far = 0x1234;
+    let mut stolen_frame = carrick_el1_abi::TrapFrame {
+        esr: 0xfffe,
+        elr: 0x400004,
+        far: 0x1234,
+        ..Default::default()
+    };
     stolen_frame.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
     stolen_frame.x[8] = 63;
     let (drained, route) = fixture.drain_and_deliver(&queue, &mut stolen_frame);
@@ -1121,9 +1131,11 @@ fn serial_host_pselect_stolen_signal_restores_mask_before_guest_sigprocmask() {
         "armed forwarded wait mask must require a native return checkpoint"
     );
     let queue = carrick_el1_abi::SharedSignalIngressQueue::new();
-    let mut frame = carrick_el1_abi::TrapFrame::default();
-    frame.esr = 0xfffd;
-    frame.elr = 0x400004;
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr: 0xfffd,
+        elr: 0x400004,
+        ..Default::default()
+    };
     frame.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
     frame.x[8] = 73;
     let (drained, route) = fixture.drain_and_deliver(&queue, &mut frame);
@@ -1136,9 +1148,11 @@ fn serial_host_pselect_stolen_signal_restores_mask_before_guest_sigprocmask() {
     let new_mask = BlockedMask(1 << (10 - 1));
     fixture.set_blocked_mask(new_mask);
     assert_eq!(fixture.control_slot().blocked(), new_mask);
-    let mut later = carrick_el1_abi::TrapFrame::default();
-    later.esr = 0xfffd;
-    later.elr = 0x400008;
+    let mut later = carrick_el1_abi::TrapFrame {
+        esr: 0xfffd,
+        elr: 0x400008,
+        ..Default::default()
+    };
     let _ = fixture.drain_and_deliver(&queue, &mut later);
     assert_eq!(
         fixture.control_slot().blocked(),
@@ -1233,9 +1247,11 @@ fn serial_host_ppoll_temporary_mask_delivers_then_restores_blocked_sigint() {
             .unwrap(),
         super::super::signal_ingress_producer::HostIngressStep::Published
     );
-    let mut frame = carrick_el1_abi::TrapFrame::default();
-    frame.esr = 0xfffd;
-    frame.elr = 0x400004;
+    let mut frame = carrick_el1_abi::TrapFrame {
+        esr: 0xfffd,
+        elr: 0x400004,
+        ..Default::default()
+    };
     frame.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
     frame.x[8] = 73;
     assert_eq!(fixture.drain_and_deliver(&queue, &mut frame).0, 1);
@@ -1372,10 +1388,12 @@ fn serial_host_two_live_reads_share_one_process_signal_wake() {
             .unwrap(),
         super::super::signal_ingress_producer::HostIngressStep::Idle
     );
-    let mut delivered = carrick_el1_abi::TrapFrame::default();
-    delivered.esr = 0xfffe;
-    delivered.elr = 0x400004;
-    delivered.far = 0x1234;
+    let mut delivered = carrick_el1_abi::TrapFrame {
+        esr: 0xfffe,
+        elr: 0x400004,
+        far: 0x1234,
+        ..Default::default()
+    };
     delivered.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
     delivered.x[8] = 63;
     assert_eq!(fixtures[0].drain_and_deliver(&queue, &mut delivered).0, 1);
