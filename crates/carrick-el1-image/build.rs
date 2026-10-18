@@ -55,6 +55,9 @@ fn find_sysroot_tool(tool: &str, sysroot: &str, host: &str) -> PathBuf {
 /// Tail-call wrappers do not stand in for their callee's budget.
 fn check_process_exit_frames(disassembly: &str) {
     let budgets = [
+        // Runtime table construction must stay in-place on the heap, never
+        // materialize the pending-fork array on a 16 KiB EL1 stack.
+        ("::PendingForkStorage::initialize::", 0x100, true),
         ("::dispatch::dispatch_syscall::", 0x600, true),
         ("::aarch64_process::admit_entry_runtime::", 0x1200, true),
         ("::exit_with_status::", 0x600, true),
@@ -148,9 +151,29 @@ fn check_process_exit_frames(disassembly: &str) {
     }
 }
 
-fn check_no_fp_simd_instructions(llvm_objdump: &Path, elf_path: &Path) {
+/// The CEL1 header stores this same linker expression. The end symbol includes
+/// trailing .bss and alignment that are absent from the flat file.
+pub(crate) fn loaded_image_size(symbols: &str) -> Result<u64, String> {
+    let address = |name: &str| -> Result<u64, String> {
+        let line = symbols
+            .lines()
+            .find(|line| line.split_whitespace().next_back() == Some(name))
+            .ok_or_else(|| format!("missing EL1 linker symbol {name}"))?;
+        let value = line.split_whitespace().next().unwrap_or_default();
+        u64::from_str_radix(value, 16)
+            .map_err(|error| format!("invalid EL1 linker symbol {name}: {error}"))
+    };
+    let start = address("_image_start")?;
+    let end = address("_image_end")?;
+    end.checked_sub(start)
+        .filter(|size| *size != 0)
+        .ok_or_else(|| "invalid EL1 loaded image extent".to_owned())
+}
+
+fn check_no_fp_simd_instructions(llvm_objdump: &Path, elf_path: &Path) -> u64 {
     let output = Command::new(llvm_objdump)
         .arg("-d")
+        .arg("--syms")
         .arg("--no-show-raw-insn")
         .arg("--demangle")
         .arg(elf_path)
@@ -293,6 +316,7 @@ fn check_no_fp_simd_instructions(llvm_objdump: &Path, elf_path: &Path) {
             violations.join("\n  ")
         );
     }
+    loaded_image_size(&stdout).unwrap_or_else(|error| panic!("{error}"))
 }
 
 fn main() {
@@ -352,7 +376,7 @@ fn main() {
     let bin_path = Path::new(&out_dir).join("carrick-el1.bin");
 
     // Verify that no FP/SIMD instructions or register references exist in the ELF
-    check_no_fp_simd_instructions(&llvm_objdump, &elf_path);
+    let image_size = check_no_fp_simd_instructions(&llvm_objdump, &elf_path);
 
     // Convert ELF executable to raw binary using rust-objcopy -O binary
     let mut objcopy_cmd = Command::new(&rust_objcopy);
@@ -366,6 +390,17 @@ fn main() {
     if !objcopy_status.success() {
         panic!("rust-objcopy failed (exit code: {objcopy_status})");
     }
+
+    // Reuse the existing artifact inspection, with no additional host file
+    // access. Keep the report tied to the ABI's image limit.
+    let limit = carrick_el1_abi::EL1_IMAGE_SIZE;
+    let headroom = limit
+        .checked_sub(image_size)
+        .expect("EL1 image exceeds the ABI image budget");
+    // Cargo warnings are visible in ordinary CI builds without `-vv`.
+    println!(
+        "cargo:warning=EL1 image budget: {image_size} bytes loaded / {limit} bytes; {headroom} bytes headroom"
+    );
 
     println!("cargo:rerun-if-changed=../carrick-el1/src");
     println!("cargo:rerun-if-changed=../carrick-el1/link.ld");

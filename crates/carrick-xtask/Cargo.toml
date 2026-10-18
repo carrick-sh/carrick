@@ -35,3 +35,7 @@ yaml-rust2 = { version = "0.13", default-features = false }
 carrick-conformance = { path = "../carrick-conformance" }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-portable = { path = "../carrick-portable" }
+
+[dev-dependencies]
+# The sysroot test imports the EL1 image build script and its ABI image limit.
+carrick-el1-abi = { path = "../carrick-el1-abi" }
