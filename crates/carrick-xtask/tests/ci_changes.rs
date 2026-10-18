@@ -62,6 +62,16 @@ impl TempRepo {
     }
 
     fn run_ci_changes(&self, event: &str, draft: Option<&str>, base_ref: Option<&str>) -> String {
+        self.run_ci_changes_with_env(event, draft, base_ref, &[])
+    }
+
+    fn run_ci_changes_with_env(
+        &self,
+        event: &str,
+        draft: Option<&str>,
+        base_ref: Option<&str>,
+        extra_env: &[(&str, &str)],
+    ) -> String {
         let output_file = self.dir.path().join("github_output.txt");
         let class_json = self.dir.path().join("ci-class.json");
         let _ = fs::remove_file(&output_file);
@@ -70,6 +80,10 @@ impl TempRepo {
         cmd.arg("--root")
             .arg(self.dir.path())
             .arg("ci-changes")
+            .env_remove("CI_DRAFT")
+            .env_remove("CI_BASE_REF")
+            .env_remove("CI_HEAD_REF")
+            .env_remove("GITHUB_STEP_SUMMARY")
             .env("CI_EVENT", event)
             .env("CI_BASE", &self.base_sha)
             .env("GITHUB_OUTPUT", &output_file)
@@ -79,6 +93,9 @@ impl TempRepo {
         }
         if let Some(br) = base_ref {
             cmd.env("CI_BASE_REF", br);
+        }
+        for (k, v) in extra_env {
+            cmd.env(k, v);
         }
         let out = cmd.output().expect("carrick-xtask ci-changes");
         assert!(
@@ -90,12 +107,26 @@ impl TempRepo {
         let written_json: CiChangesOutputs =
             serde_json::from_slice(&fs::read(&class_json).expect("ci-class.json")).unwrap();
         let text = fs::read_to_string(&output_file).expect("read GITHUB_OUTPUT");
-        assert_eq!(text, written_json.format_github_output());
+        let text_without_child_pr: String = text
+            .lines()
+            .filter(|line| !line.starts_with("child_pr="))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_eq!(text_without_child_pr, written_json.format_github_output());
         text
     }
 }
 
 fn run_ci_results(event: &str, draft: Option<&str>, ci_needs_json: &str) -> bool {
+    run_ci_results_with_env(event, draft, ci_needs_json, &[]).0
+}
+
+fn run_ci_results_with_env(
+    event: &str,
+    draft: Option<&str>,
+    ci_needs_json: &str,
+    extra_env: &[(&str, &str)],
+) -> (bool, String) {
     let justfile = workspace_root().join("justfile");
     let mut cmd = Command::new("just");
     cmd.arg("--justfile")
@@ -103,13 +134,23 @@ fn run_ci_results(event: &str, draft: Option<&str>, ci_needs_json: &str) -> bool
         .arg("--working-directory")
         .arg(workspace_root())
         .arg("ci-results")
+        .env_remove("CI_DRAFT")
+        .env_remove("CI_LOWER_LAYER")
+        .env_remove("CI_CHILD_PR")
+        .env_remove("GITHUB_STEP_SUMMARY")
         .env("CI_EVENT", event)
         .env("CI_NEEDS", ci_needs_json);
     if let Some(d) = draft {
         cmd.env("CI_DRAFT", d);
     }
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
     let out = cmd.output().expect("just ci-results");
-    out.status.success()
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
 }
 
 #[test]
@@ -143,6 +184,7 @@ fn referenced_docs_and_census_files_in_workspace_flip_to_heavy() {
         let pr_out = evaluate_changes(
             "pull_request",
             false,
+            false,
             Some(&[referenced.to_string()]),
             &refs,
         );
@@ -153,10 +195,17 @@ fn referenced_docs_and_census_files_in_workspace_flip_to_heavy() {
                 macos: false,
                 workflows: false,
                 hardware: true,
+                lower_layer: false,
             },
             "PR touching `{referenced}` must set heavy=true, hardware=true"
         );
-        let mg_out = evaluate_changes("merge_group", false, Some(&[referenced.to_string()]), &refs);
+        let mg_out = evaluate_changes(
+            "merge_group",
+            false,
+            false,
+            Some(&[referenced.to_string()]),
+            &refs,
+        );
         assert_eq!(
             mg_out,
             CiChangesOutputs {
@@ -164,6 +213,7 @@ fn referenced_docs_and_census_files_in_workspace_flip_to_heavy() {
                 macos: true,
                 workflows: true,
                 hardware: true,
+                lower_layer: false,
             },
             "merge_group touching `{referenced}` must set heavy=true, macos=true, workflows=true, hardware=true"
         );
@@ -268,7 +318,13 @@ fn scripts_justfile_and_xtask_classify_as_full_heavy_macos_and_hardware() {
             PathClass::Full,
             "`{full_path}` must classify as Full so heavy, macos, and hardware all run"
         );
-        let pr_out = evaluate_changes("pull_request", false, Some(&[full_path.to_string()]), &refs);
+        let pr_out = evaluate_changes(
+            "pull_request",
+            false,
+            false,
+            Some(&[full_path.to_string()]),
+            &refs,
+        );
         assert_eq!(
             pr_out,
             CiChangesOutputs {
@@ -276,10 +332,17 @@ fn scripts_justfile_and_xtask_classify_as_full_heavy_macos_and_hardware() {
                 macos: false,
                 workflows: false,
                 hardware: true,
+                lower_layer: false,
             },
             "PR touching `{full_path}` must run heavy=true, hardware=true"
         );
-        let mg_out = evaluate_changes("merge_group", false, Some(&[full_path.to_string()]), &refs);
+        let mg_out = evaluate_changes(
+            "merge_group",
+            false,
+            false,
+            Some(&[full_path.to_string()]),
+            &refs,
+        );
         assert_eq!(
             mg_out,
             CiChangesOutputs {
@@ -287,6 +350,7 @@ fn scripts_justfile_and_xtask_classify_as_full_heavy_macos_and_hardware() {
                 macos: true,
                 workflows: true,
                 hardware: true,
+                lower_layer: false,
             },
             "merge_group touching `{full_path}` must run heavy=true, macos=true, workflows=true, hardware=true"
         );
@@ -304,11 +368,11 @@ fn prose_only_pr_skips_heavy_macos_and_hardware_but_merge_group_runs_full() {
 
     assert_eq!(
         repo.run_ci_changes("pull_request", Some("false"), None),
-        "heavy=false\nmacos=false\nworkflows=false\nhardware=false\n"
+        "heavy=false\nmacos=false\nworkflows=false\nhardware=false\nlower_layer=false\n"
     );
     assert_eq!(
         repo.run_ci_changes("merge_group", None, None),
-        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\n"
+        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
     );
 }
 
@@ -317,11 +381,11 @@ fn workflows_run_full_heavy_macos_hardware_plus_actionlint() {
     let ci_yml_repo = TempRepo::new(&[(".github/workflows/ci.yml", "name: CI\n")]);
     assert_eq!(
         ci_yml_repo.run_ci_changes("pull_request", Some("false"), None),
-        "heavy=true\nmacos=false\nworkflows=true\nhardware=true\n"
+        "heavy=true\nmacos=false\nworkflows=true\nhardware=true\nlower_layer=false\n"
     );
     assert_eq!(
         ci_yml_repo.run_ci_changes("merge_group", None, None),
-        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\n"
+        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
     );
 
     let kr_yml_repo = TempRepo::new(&[(
@@ -330,11 +394,11 @@ fn workflows_run_full_heavy_macos_hardware_plus_actionlint() {
     )]);
     assert_eq!(
         kr_yml_repo.run_ci_changes("pull_request", Some("false"), None),
-        "heavy=true\nmacos=false\nworkflows=true\nhardware=true\n"
+        "heavy=true\nmacos=false\nworkflows=true\nhardware=true\nlower_layer=false\n"
     );
     assert_eq!(
         kr_yml_repo.run_ci_changes("merge_group", None, None),
-        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\n"
+        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
     );
 }
 
@@ -343,17 +407,17 @@ fn unknown_or_rust_product_path_fails_safe_and_runs_everything() {
     let rust_repo = TempRepo::new(&[("crates/carrick-kernel/src/lib.rs", "pub fn f() {}\n")]);
     assert_eq!(
         rust_repo.run_ci_changes("pull_request", Some("false"), None),
-        "heavy=true\nmacos=false\nworkflows=false\nhardware=true\n"
+        "heavy=true\nmacos=false\nworkflows=false\nhardware=true\nlower_layer=false\n"
     );
     assert_eq!(
         rust_repo.run_ci_changes("merge_group", None, None),
-        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\n"
+        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
     );
 
     let unknown_repo = TempRepo::new(&[("Cargo.lock", "# lockfile\n")]);
     assert_eq!(
         unknown_repo.run_ci_changes("merge_group", None, None),
-        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\n"
+        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
     );
 }
 
@@ -399,7 +463,7 @@ fn cumulative_merge_group_diff_runs_everything_when_ahead_entry_touched_code() {
     // Merge group always runs everything: heavy, macos, workflows, and hardware are all true.
     assert_eq!(
         repo.run_ci_changes("merge_group", None, Some(&main_sha)),
-        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\n"
+        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
     );
 }
 
@@ -412,13 +476,13 @@ fn draft_pr_runs_cheap_linux_checks_and_ci_results_accepts_skipped_heavy_jobs() 
 
     assert_eq!(
         repo.run_ci_changes("pull_request", Some("true"), None),
-        "heavy=true\nmacos=false\nworkflows=false\nhardware=true\n"
+        "heavy=true\nmacos=false\nworkflows=false\nhardware=true\nlower_layer=false\n"
     );
 
     let draft_needs = r#"{
       "changes": {
         "result": "success",
-        "outputs": { "heavy": "true", "macos": "false", "workflows": "false", "hardware": "true" }
+        "outputs": { "heavy": "true", "macos": "false", "workflows": "false", "hardware": "true", "lower_layer": "false" }
       },
       "actionlint": { "result": "skipped" },
       "linked-issue": { "result": "success" },
@@ -455,12 +519,221 @@ fn draft_pr_runs_cheap_linux_checks_and_ci_results_accepts_skipped_heavy_jobs() 
     );
 }
 
+#[cfg(unix)]
+fn write_mock_gh(bin_dir: &Path, body: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let gh_path = bin_dir.join("gh");
+    fs::write(&gh_path, body).expect("write mock gh");
+    let mut perms = fs::metadata(&gh_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&gh_path, perms).unwrap();
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{old_path}", bin_dir.display())
+}
+
+#[test]
+#[cfg(unix)]
+fn stack_layer_detection_and_ci_results_gating() {
+    let refs = ReferencedDocs::default();
+    let code_paths = vec!["crates/carrick-kernel/src/lib.rs".to_string()];
+
+    // 1. Unit-level evaluate_changes checks:
+    // Lower layer on pull_request -> lower_layer=true, heavy=true (so lint still runs, expensive jobs gated by lower_layer != 'true').
+    assert_eq!(
+        evaluate_changes("pull_request", false, true, Some(&code_paths), &refs),
+        CiChangesOutputs {
+            heavy: true,
+            macos: false,
+            workflows: false,
+            hardware: true,
+            lower_layer: true,
+        }
+    );
+    // Top layer on pull_request -> lower_layer=false, heavy=true.
+    assert_eq!(
+        evaluate_changes("pull_request", false, false, Some(&code_paths), &refs),
+        CiChangesOutputs {
+            heavy: true,
+            macos: false,
+            workflows: false,
+            hardware: true,
+            lower_layer: false,
+        }
+    );
+    // merge_group, push, schedule with a child -> lower_layer=false, full suite.
+    for non_pr_event in ["merge_group", "push", "schedule"] {
+        assert_eq!(
+            evaluate_changes(non_pr_event, false, true, Some(&code_paths), &refs),
+            CiChangesOutputs {
+                heavy: true,
+                macos: true,
+                workflows: true,
+                hardware: true,
+                lower_layer: false,
+            },
+            "{non_pr_event} with a child must run full suite with lower_layer=false"
+        );
+    }
+
+    // 2. Subprocess ci-changes checks with mock gh:
+    let repo = TempRepo::new(&[("crates/carrick-kernel/src/lib.rs", "pub fn layer() {}\n")]);
+    let bin_dir = tempfile::tempdir().expect("mock gh bin dir");
+    let summary_file = repo.dir.path().join("step_summary.md");
+
+    // 2a. Lower layer (child PR #610 open against work/layer-1)
+    let path_with_child = write_mock_gh(
+        bin_dir.path(),
+        "#!/usr/bin/env bash\nprintf '[{\"number\":610,\"state\":\"open\",\"base\":{\"ref\":\"work/layer-1\"}}]\\n'\n",
+    );
+    let _ = fs::remove_file(&summary_file);
+    let out_lower = repo.run_ci_changes_with_env(
+        "pull_request",
+        Some("false"),
+        None,
+        &[
+            ("CI_HEAD_REF", "work/layer-1"),
+            ("PATH", &path_with_child),
+            ("GITHUB_STEP_SUMMARY", summary_file.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(
+        out_lower,
+        "heavy=true\nmacos=false\nworkflows=false\nhardware=true\nlower_layer=true\nchild_pr=610\n"
+    );
+    let summary_text = fs::read_to_string(&summary_file).expect("step summary written");
+    assert!(
+        summary_text.contains("lower stack layer: child PR #610"),
+        "expected lower stack layer reason in summary, got: {summary_text}"
+    );
+
+    // 2b. Top layer (no open child PR)
+    let path_top = write_mock_gh(bin_dir.path(), "#!/usr/bin/env bash\nprintf '[]\\n'\n");
+    let _ = fs::remove_file(&summary_file);
+    let out_top = repo.run_ci_changes_with_env(
+        "pull_request",
+        Some("false"),
+        None,
+        &[
+            ("CI_HEAD_REF", "work/layer-top"),
+            ("PATH", &path_top),
+            ("GITHUB_STEP_SUMMARY", summary_file.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(
+        out_top,
+        "heavy=true\nmacos=false\nworkflows=false\nhardware=true\nlower_layer=false\n"
+    );
+    assert!(
+        !summary_file.exists(),
+        "top layer should not write lower stack layer summary"
+    );
+
+    // 2c. Lookup error fails closed to full suite (heavy=true, lower_layer=false) even on prose-only PR
+    let path_err = write_mock_gh(
+        bin_dir.path(),
+        "#!/usr/bin/env bash\necho 'HTTP 502 Bad Gateway' >&2\nexit 1\n",
+    );
+    let out_err = repo.run_ci_changes_with_env(
+        "pull_request",
+        Some("false"),
+        None,
+        &[("CI_HEAD_REF", "work/layer-1"), ("PATH", &path_err)],
+    );
+    assert_eq!(
+        out_err,
+        "heavy=true\nmacos=false\nworkflows=false\nhardware=true\nlower_layer=false\n"
+    );
+    let prose_repo = TempRepo::new(&[("docs/unreferenced-note.md", "prose only\n")]);
+    let out_prose_err = prose_repo.run_ci_changes_with_env(
+        "pull_request",
+        Some("false"),
+        None,
+        &[("CI_HEAD_REF", "work/layer-prose"), ("PATH", &path_err)],
+    );
+    assert_eq!(
+        out_prose_err,
+        "heavy=true\nmacos=false\nworkflows=false\nhardware=true\nlower_layer=false\n",
+        "child lookup error on prose PR must fail closed to heavy=true, hardware=true, lower_layer=false"
+    );
+
+    // 2d. merge_group with a child PR still runs full suite
+    let out_mg_with_child = repo.run_ci_changes_with_env(
+        "merge_group",
+        None,
+        None,
+        &[("CI_HEAD_REF", "work/layer-1"), ("PATH", &path_with_child)],
+    );
+    assert_eq!(
+        out_mg_with_child,
+        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
+    );
+
+    // 3. ci-results check: lower layer passes with skipped heavy jobs and writes reason to summary;
+    // top layer does not.
+    let lower_layer_needs = r#"{
+      "changes": {
+        "result": "success",
+        "outputs": {
+          "heavy": "true",
+          "macos": "false",
+          "workflows": "false",
+          "hardware": "true",
+          "lower_layer": "true",
+          "child_pr": "610"
+        }
+      },
+      "actionlint": { "result": "skipped" },
+      "linked-issue": { "result": "success" },
+      "commit-trailers": { "result": "success" },
+      "lint": { "result": "success" },
+      "portable": { "result": "skipped" },
+      "linux-doc": { "result": "skipped" },
+      "macos-clippy": { "result": "skipped" },
+      "macos-build": { "result": "skipped" },
+      "macos-unit-a": { "result": "skipped" },
+      "macos-unit-b": { "result": "skipped" },
+      "macos-integration": { "result": "skipped" },
+      "cross-check-linux": { "result": "skipped" },
+      "cross-check-freebsd": { "result": "skipped" },
+      "cross-check-netbsd": { "result": "skipped" },
+      "kernel-linux-native": { "result": "skipped" }
+    }"#;
+    let ci_ok_summary = repo.dir.path().join("ci_ok_summary.md");
+    let _ = fs::remove_file(&ci_ok_summary);
+    let (ok_lower, stdout_lower) = run_ci_results_with_env(
+        "pull_request",
+        Some("false"),
+        lower_layer_needs,
+        &[("GITHUB_STEP_SUMMARY", ci_ok_summary.to_str().unwrap())],
+    );
+    assert!(
+        ok_lower,
+        "lower layer PR with passing cheap checks and skipped heavy jobs must pass ci-results"
+    );
+    assert!(
+        stdout_lower.contains("lower stack layer: child PR #610"),
+        "ci-results stdout must report lower stack layer reason, got: {stdout_lower}"
+    );
+    let ci_ok_summary_text = fs::read_to_string(&ci_ok_summary).expect("ci-ok step summary");
+    assert!(
+        ci_ok_summary_text.contains("lower stack layer: child PR #610"),
+        "ci-results step summary must contain lower stack layer reason, got: {ci_ok_summary_text}"
+    );
+
+    let top_layer_needs_with_skips =
+        lower_layer_needs.replace(r#""lower_layer": "true""#, r#""lower_layer": "false""#);
+    assert!(
+        !run_ci_results("pull_request", Some("false"), &top_layer_needs_with_skips),
+        "top layer PR with skipped heavy jobs must fail ci-results"
+    );
+}
+
 #[test]
 fn merge_group_requires_full_suite_in_ci_results() {
     let full_mg_needs = r#"{
       "changes": {
         "result": "success",
-        "outputs": { "heavy": "true", "macos": "true", "workflows": "true", "hardware": "true" }
+        "outputs": { "heavy": "true", "macos": "true", "workflows": "true", "hardware": "true", "lower_layer": "false" }
       },
       "actionlint": { "result": "success" },
       "linked-issue": { "result": "success" },

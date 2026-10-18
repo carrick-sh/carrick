@@ -21,11 +21,20 @@ pub struct CiChangesArgs {
     #[arg(long, env = "CI_BASE_REF", default_value = "")]
     pub base_ref: String,
 
+    #[arg(long, env = "CI_HEAD_REF", default_value = "")]
+    pub head_ref: String,
+
+    #[arg(long, env = "CI_REPO", default_value = "carrick-sh/carrick")]
+    pub repo: String,
+
     #[arg(long, default_value = "HEAD")]
     pub head: String,
 
     #[arg(long, env = "GITHUB_OUTPUT")]
     pub github_output: Option<PathBuf>,
+
+    #[arg(long, env = "GITHUB_STEP_SUMMARY")]
+    pub step_summary: Option<PathBuf>,
 
     /// Optional JSON file path to write the classification (`{heavy, macos, workflows, hardware}`)
     /// so `kernel-runtime.yml` can upload `ci-class-<sha>.json` as positive fast-path evidence.
@@ -40,13 +49,15 @@ pub struct CiChangesOutputs {
     #[serde(default)]
     pub workflows: bool,
     pub hardware: bool,
+    #[serde(default)]
+    pub lower_layer: bool,
 }
 
 impl CiChangesOutputs {
     pub fn format_github_output(&self) -> String {
         format!(
-            "heavy={}\nmacos={}\nworkflows={}\nhardware={}\n",
-            self.heavy, self.macos, self.workflows, self.hardware
+            "heavy={}\nmacos={}\nworkflows={}\nhardware={}\nlower_layer={}\n",
+            self.heavy, self.macos, self.workflows, self.hardware, self.lower_layer
         )
     }
 }
@@ -565,10 +576,11 @@ pub fn classify_path(path: &str, referenced_docs: &ReferencedDocs) -> PathClass 
 pub fn evaluate_changes(
     event_name: &str,
     pr_draft: bool,
+    has_child_layer: bool,
     changed_paths: Option<&[String]>,
     referenced_docs: &ReferencedDocs,
 ) -> CiChangesOutputs {
-    // Only pull_request events may use the docs-only fast path or draft skip.
+    // Only pull_request events may use the docs-only fast path, draft skip, or lower-layer skip.
     // Merge groups, schedule, workflow_dispatch, and push always run everything.
     if event_name != "pull_request" {
         return CiChangesOutputs {
@@ -576,6 +588,7 @@ pub fn evaluate_changes(
             macos: true,
             workflows: true,
             hardware: true,
+            lower_layer: false,
         };
     }
 
@@ -585,6 +598,7 @@ pub fn evaluate_changes(
             macos: false,
             workflows: true,
             hardware: true,
+            lower_layer: false,
         };
     };
 
@@ -594,6 +608,7 @@ pub fn evaluate_changes(
             macos: false,
             workflows: true,
             hardware: true,
+            lower_layer: false,
         };
     }
 
@@ -619,7 +634,72 @@ pub fn evaluate_changes(
         macos: false,
         workflows,
         hardware: heavy,
+        lower_layer: has_child_layer,
     }
+}
+
+pub fn lookup_child_pr(repo: &str, head_ref: &str) -> Result<Option<u64>, CiChangesError> {
+    let head_ref = head_ref.trim();
+    if head_ref.is_empty() {
+        return Ok(None);
+    }
+    let repo = if repo.trim().is_empty() {
+        "carrick-sh/carrick"
+    } else {
+        repo.trim()
+    };
+    let mut cmd = Command::new("gh");
+    cmd.args([
+        "api",
+        "--method",
+        "GET",
+        "-f",
+        "state=open",
+        "-f",
+        &format!("base={head_ref}"),
+        "-f",
+        "per_page=100",
+        &format!("repos/{repo}/pulls"),
+    ]);
+    if let Ok(token) = std::env::var("GITHUB_TOKEN")
+        && !token.is_empty()
+        && std::env::var_os("GH_TOKEN").is_none()
+    {
+        cmd.env("GH_TOKEN", token);
+    }
+    let output = cmd.output().map_err(|source| CiChangesError::Io {
+        path: PathBuf::from("gh"),
+        source,
+    })?;
+    if !output.status.success() {
+        return Err(CiChangesError::Git(format!(
+            "gh api repos/{repo}/pulls?state=open&base={head_ref} failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|source| {
+        CiChangesError::Git(format!(
+            "parse gh api repos/{repo}/pulls response: {source}"
+        ))
+    })?;
+    let prs = value.as_array().ok_or_else(|| {
+        CiChangesError::Git("gh api pulls response is not a JSON array".to_string())
+    })?;
+    let mut child_numbers = Vec::new();
+    for pr in prs {
+        if pr["state"].as_str().is_some_and(|s| s != "open") {
+            continue;
+        }
+        if pr["base"]["ref"].as_str().is_some_and(|r| r != head_ref) {
+            continue;
+        }
+        let number = pr["number"].as_u64().ok_or_else(|| {
+            CiChangesError::Git("pull request entry missing numeric number".to_string())
+        })?;
+        child_numbers.push(number);
+    }
+    Ok(child_numbers.into_iter().min())
 }
 
 fn git_commit_exists(repo_root: &Path, rev: &str) -> bool {
@@ -716,8 +796,43 @@ pub fn run<W: Write>(
     let pr_draft = args.draft.trim() == "true";
     let changed_paths =
         collect_changed_paths(repo_root, event, &args.base, &args.base_ref, &args.head)?;
-    let outputs = evaluate_changes(event, pr_draft, changed_paths.as_deref(), &referenced_docs);
-    let formatted = outputs.format_github_output();
+    let mut lookup_failed = false;
+    let child_pr = if event == "pull_request" && !args.head_ref.trim().is_empty() {
+        match lookup_child_pr(&args.repo, &args.head_ref) {
+            Ok(pr) => pr,
+            Err(err) => {
+                lookup_failed = true;
+                writeln!(
+                    writer,
+                    "Child PR lookup failed ({err}); failing closed to full suite"
+                )
+                .map_err(|source| CiChangesError::Io {
+                    path: PathBuf::from("stdout"),
+                    source,
+                })?;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let has_child_layer = child_pr.is_some();
+    let mut outputs = evaluate_changes(
+        event,
+        pr_draft,
+        has_child_layer,
+        changed_paths.as_deref(),
+        &referenced_docs,
+    );
+    if lookup_failed {
+        outputs.heavy = true;
+        outputs.hardware = true;
+        outputs.lower_layer = false;
+    }
+    let mut formatted = outputs.format_github_output();
+    if let Some(pr_num) = child_pr {
+        formatted.push_str(&format!("child_pr={pr_num}\n"));
+    }
     if let Some(output_path) = &args.github_output {
         let mut file = fs::OpenOptions::new()
             .create(true)
@@ -749,10 +864,31 @@ pub fn run<W: Write>(
             source,
         })?;
     }
+    if let Some(pr_num) = child_pr {
+        let reason = format!("lower stack layer: child PR #{pr_num}");
+        writeln!(writer, "{reason}").map_err(|source| CiChangesError::Io {
+            path: PathBuf::from("stdout"),
+            source,
+        })?;
+        if let Some(summary_path) = &args.step_summary {
+            let mut summary_file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(summary_path)
+                .map_err(|source| CiChangesError::Io {
+                    path: summary_path.clone(),
+                    source,
+                })?;
+            writeln!(summary_file, "{reason}").map_err(|source| CiChangesError::Io {
+                path: summary_path.clone(),
+                source,
+            })?;
+        }
+    }
     writeln!(
         writer,
-        "Run hosted checks: heavy={} macos={} workflows={} hardware={}",
-        outputs.heavy, outputs.macos, outputs.workflows, outputs.hardware
+        "Run hosted checks: heavy={} macos={} workflows={} hardware={} lower_layer={}",
+        outputs.heavy, outputs.macos, outputs.workflows, outputs.hardware, outputs.lower_layer
     )
     .map_err(|source| CiChangesError::Io {
         path: PathBuf::from("stdout"),
