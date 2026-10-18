@@ -474,3 +474,86 @@ fn task_bucket_rebind_never_exposes_torn_table_id_to_lock_free_lookup() {
         assert_eq!(host.table_id(t0), Ok(table2));
     });
 }
+
+#[test]
+fn task_cross_bucket_recycle_authenticates_original_bucket_sequence() {
+    model(|| {
+        let tasks = Arc::new(TaskHandleCore::<3>::new().unwrap());
+        let backing = Arc::new(HandleLoomBacking::default());
+        let host = tasks.bind(&*backing, YieldWait);
+        let old_task = loom_task_key(1, 1); // bucket 2
+        let new_task = loom_task_key(2, 1); // bucket 1
+        let anchor = loom_task_key(4, 1); // bucket 1, forces a cross-bucket next link
+        tasks.core().tables[0]
+            .generation
+            .store(10, Ordering::Relaxed);
+        tasks.core().tables[2]
+            .generation
+            .store(28, Ordering::Relaxed);
+        let old_table = host
+            .create_task_table(
+                old_task,
+                1,
+                &mut Extent {
+                    token: 1,
+                    capacity: 1,
+                },
+            )
+            .unwrap();
+        let anchor_table = host
+            .create_task_table(
+                anchor,
+                1,
+                &mut Extent {
+                    token: 2,
+                    capacity: 1,
+                },
+            )
+            .unwrap();
+        let new_table = host
+            .authority()
+            .create_handle_table(
+                1,
+                &mut Extent {
+                    token: 3,
+                    capacity: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(tasks.buckets[2].head.load(Ordering::Relaxed), 1);
+        assert_eq!(tasks.buckets[1].head.load(Ordering::Relaxed), 2);
+        let writer_tasks = tasks.clone();
+        let writer_backing = backing.clone();
+        let writer = thread::spawn(move || {
+            let h = writer_tasks.bind(&*writer_backing, YieldWait);
+            h.exit_task(old_task, |_| {}).unwrap();
+            h.attach_task_table(new_task, new_table).unwrap();
+            // The same binding record now links into the other bucket.
+            assert_eq!(writer_tasks.buckets[1].head.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                writer_tasks.bindings[0].hash_next.load(Ordering::Relaxed),
+                2
+            );
+        });
+        let reader_tasks = tasks.clone();
+        let reader_backing = backing.clone();
+        let reader = thread::spawn(move || {
+            let h = reader_tasks.bind(&*reader_backing, NoWait);
+            for (task, expected) in [(old_task, old_table), (new_task, new_table)] {
+                match h.table_id(task) {
+                    Ok(table) => assert_eq!(
+                        table, expected,
+                        "cross-bucket recycled binding exposed a foreign table"
+                    ),
+                    Err(HandleError::Stale | HandleError::Contended) => {}
+                    Err(other) => panic!("unexpected lookup error: {other:?}"),
+                }
+            }
+        });
+        writer.join().unwrap();
+        reader.join().unwrap();
+        assert_eq!(host.table_id(old_task), Err(HandleError::Stale));
+        assert_eq!(host.table_id(new_task), Ok(new_table));
+        assert_eq!(host.table_id(anchor), Ok(anchor_table));
+    });
+}
