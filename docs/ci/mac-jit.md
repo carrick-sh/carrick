@@ -29,7 +29,8 @@ Demand (`Admission::Standing`, `crates/carrick-xtask/src/ci_scaler.rs`):
 - runs of `.github/workflows/kernel-runtime.yml` in `carrick-sh/carrick`
   (run and head repository), listed through the workflow's own runs
   endpoint;
-- event `push` or owner `workflow_dispatch` on `main`; merge groups,
+- event `push` or owner `workflow_dispatch` on `main` (both `actor` and
+  `triggering_actor` must be `tjfontaine` for dispatch); merge groups,
   pull requests and schedules are refused;
 - job labels exactly `HVF_LABELS` = `self-hosted, macOS, ARM64, carrick-hvf`.
   The closure job uses `HVF_CLOSURE_LABELS` (`carrick-hvf-closure`) and is
@@ -39,12 +40,30 @@ Demand (`Admission::Standing`, `crates/carrick-xtask/src/ci_scaler.rs`):
   closure job stays queued (GitHub cancels it after 24 hours).
 
 Before minting a runner the controller re-reads the run (`Github::vet`):
-same trusted main admission, same attempt and exact SHA. Demand serves every
-main push oldest first, then owner dispatches. A newer push never displaces
-an older pending push: every landed commit needs its own receipt to maintain
-the parent baseline chain. Per-job refusals are logged and recorded durably,
-then the controller considers the next job in the same pass. API failures
-back off. Refusals survive restarts; a new run attempt is vetted afresh.
+same trusted main admission, same attempt and exact SHA. Both controllers
+serve the **newest queued main push first**, then owner dispatches. They
+coalesce queued pushes on every poll, including while busy. Before cancelling
+an older run, each controller fsyncs a supersession entry in its own ledger
+and logs `superseded by <newer sha>`. That run is permanently ineligible for
+local JIT minting and hook approval, including reruns. Its commits remain
+visible through the receipt gate's range report.
+
+Supersession and hook approval share the controller's admission lock. Approval
+is durable before the hook is released; an already approved local run cannot
+be superseded. Every assignment, including the reserved job, must rendezvous.
+The cancellation POST is cleanup outside that lock: a fresh all-lane jobs GET
+must show the target queued and no started hardware job (HVF, standing KVM
+or hosted GCP KVM). Observed started work prevents the POST. The controllers
+have separate authorities; there is no cross-controller acknowledgement.
+**A superseded job never starts through our admission; a raced cancellation
+can only affect a superseded run.** Another controller can start that run
+between GET and POST; scoped cleanup uses its run ID. This does not guarantee
+that running work can never be cancelled in that window.
+
+Per-job refusals are logged and recorded durably, then the controller considers
+the next job in the same pass. API failures back off and leave supersession
+intents durable for restart/retry. Refused assignment keys are attempt-specific;
+superseded runs remain refused across attempts.
 
 GitHub does not bind a JIT registration to the reserved job: a compatible
 job from another run may be assigned. The mac hook therefore re-vets the
@@ -59,7 +78,8 @@ job from another run may be assigned. The mac hook therefore re-vets the
    assigned to this runner id, checks exact HVF labels, and re-vets the actual
    run with `Github::vet`, including main push or owner dispatch admission.
 3. The controller fsyncs the true job id and full run/attempt/job key into its
-   ledger **before** publishing `approved-policy` through
+   ledger, including the approval decision, **before** publishing
+   `approved-policy` through
    `mac-quiesce --assignment --approve`. That root-owned policy binds approval
    to the actual run/attempt/SHA. The hook verifies it and marks job-started
    under the same flock before returning to the runner.
@@ -238,8 +258,9 @@ Administration). Only the encoded JIT config travels over SSH stdin.
 Stale-run cancellation uses the existing classic/OAuth `repo` scope. A
 fine-grained token needs **Actions: write** for
 [workflow-run cancellation](https://docs.github.com/en/rest/actions/workflow-runs#cancel-a-workflow-run);
-an Actions-read-only token still skips and ignores refused jobs, without
-expanding its permissions.
+a token without that permission cannot complete coalescing cleanup. The
+controller logs the failure, retains the pending intent and withholds local
+admission for the superseded run; it does not silently skip cancellation.
 
 Start the controller with the runner-tree pin:
 
@@ -252,8 +273,8 @@ cargo run --locked --release -p carrick-xtask -- ci-scaler mac-jit \
 `--host` defaults to `rentamac@cloudmac`; `--one-job` exits after one cleaned
 up lifecycle (for qualification). A second instance on the same ledger
 refuses to start. GitHub, SSH and parse failures back off (30 s doubling to
-10 min) and the loop continues. Per-job admission refusals and failed
-stale-run cancellation do not grow the backoff. An actual-assignment
+10 min) and the loop continues. Per-job admission refusals do not grow the backoff. Cancellation failures
+are logged and pending intents are retried on subsequent coalescing passes. An actual-assignment
 refusal is recorded once and approval is withheld; the existing hook
 deadline kills the rejected runner session before any workflow step. A dedicated
 assignment worker continues serving while the lifecycle loop backs off or
@@ -265,7 +286,8 @@ at most 4096 job keys; eviction never bypasses vetting.
 ## Seeding baselines
 
 `kernel-runtime.yml` runs the HVF lane and selected KVM backend once per
-landed commit on `push` to `main`. Owner `workflow_dispatch` on `main` also
+main push event on `push` to `main`, subject to queued-push coalescing. A
+single push can land several commits. Owner `workflow_dispatch` on `main` also
 runs both lanes to seed receipts. Neither pull requests, merge groups nor
 schedules run this workflow. The optional full-conformance `hvf-closure` job
 runs only on owner dispatch with its enable variable and dedicated runner.

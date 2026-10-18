@@ -1740,21 +1740,31 @@ pub(super) fn controller(
             }
         }
         clone_lease.release_if_idle(&ledger);
+        let demand = if matches!(admission, Admission::Standing) {
+            gh.coalesced_demand(&mut ledger, &path, &LABELS)
+        } else {
+            gh.demand(admission, &LABELS)
+        };
+        if let Err(error) = &demand {
+            eprintln!("queued push coalescing failed: {error}");
+        }
         let active = ledger
             .rows
             .iter()
             .filter(|r| r.state != State::Destroyed)
             .count();
         if !frozen && active < usize::from(limit.get()) && Instant::now() >= admit_after {
-            match admit_one(
-                &pve,
-                &gh,
-                &mut ledger,
-                dir,
-                &path,
-                (group, admission),
-                (limit, &mut clone_lease),
-            ) {
+            match demand.and_then(|demand| {
+                admit_one(
+                    &pve,
+                    &gh,
+                    &mut ledger,
+                    dir,
+                    &path,
+                    (group, admission, demand),
+                    (limit, &mut clone_lease),
+                )
+            }) {
                 Ok(()) => backoff.reset(),
                 Err(error @ ScalerError::CpuCeiling { .. }) => return Err(error),
                 Err(error) => {
@@ -1832,12 +1842,13 @@ fn admit_one(
     ledger: &mut Ledger,
     dir: &Path,
     path: &Path,
-    approval: (u64, &Admission),
+    demand: (u64, &Admission, Vec<JobKey>),
     capacity: (Concurrency, &mut CloneLease),
 ) -> Result<(), ScalerError> {
     let (limit, clone_lease) = capacity;
-    let Some(job) = select_demand(ledger, path, gh.demand(approval.1, &LABELS)?, |job| {
-        gh.vet(approval.1, job).map(|_| job)
+    let (group, admission, demand) = demand;
+    let Some(job) = select_demand(ledger, path, demand, |job| {
+        gh.vet(admission, job).map(|_| job)
     })?
     else {
         return Ok(());
@@ -1849,7 +1860,7 @@ fn admit_one(
         limit,
         clone_lease,
         || {
-            gh.vet(approval.1, job)?;
+            gh.vet(admission, job)?;
             resource_admission(pve)
         },
         || pve.inventory(),
@@ -1858,7 +1869,7 @@ fn admit_one(
         return Ok(());
     };
     println!("reserved vm={} job={}", row.vm.get(), job.job.0);
-    if let Err(error) = provision(pve, gh, ledger, &mut row, dir, path, approval) {
+    if let Err(error) = provision(pve, gh, ledger, &mut row, dir, path, (group, admission)) {
         row.failure = Some(error.to_string());
         update(ledger, &row, path)?;
         clone_lease.release_if_idle(ledger);

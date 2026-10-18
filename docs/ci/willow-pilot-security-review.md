@@ -139,7 +139,8 @@ Retained properties:
   group/other writable; the hook reads no job-settable environment.
 - **Secrets**: the PVE token stays on Willow; the standing controller's
   GitHub credential is a fine-grained, single-repository token with
-  Administration (runner registration) and Actions read only
+  Administration (runner registration) and Actions read/write (superseded-run
+  cancellation)
   ([creation steps](willow-pilot.md#github-credential-for-standing-mode)),
   forwarded through SSH stdin. cloudmac receives only JIT material.
 - **Bounded API use**: demand lists one workflow's runs; assignment reads
@@ -208,7 +209,7 @@ Departures from the Willow procedure, and their reasons:
   (`/var/lib/systemd/credential.secret`) alone, on unencrypted media; root
   on the host can decrypt it. The token is the owner's existing one rather
   than the minimal fine-grained token described in willow-pilot.md. Replace
-  it with that token (Administration read/write and Actions read on
+  it with that token (Administration read/write and Actions read/write on
   `carrick-sh/carrick` only) when convenient; the unit needs no other change.
 - **Clones use static addresses on a private NAT bridge shared with the
   agent workers.** The host runs no DHCP or DNS service for them and opens no

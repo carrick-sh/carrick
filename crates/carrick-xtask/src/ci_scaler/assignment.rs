@@ -25,13 +25,18 @@ use serde_json::Value;
 pub(super) struct Publication<T> {
     committed: std::sync::Arc<std::sync::Mutex<T>>,
     assignments_only: bool,
+    admission: std::sync::Arc<std::sync::Mutex<()>>,
 }
 impl<T: Clone> Publication<T> {
     pub(super) fn new(value: T) -> Self {
         Self {
             committed: std::sync::Arc::new(std::sync::Mutex::new(value)),
             assignments_only: false,
+            admission: std::sync::Arc::new(std::sync::Mutex::new(())),
         }
+    }
+    pub(super) fn admission_lock(&self) -> std::sync::Arc<std::sync::Mutex<()>> {
+        self.admission.clone()
     }
     pub(super) fn snapshot(&self) -> Result<T, ScalerError> {
         self.committed
@@ -43,6 +48,7 @@ impl<T: Clone> Publication<T> {
         Self {
             committed: self.committed.clone(),
             assignments_only: true,
+            admission: self.admission.clone(),
         }
     }
     pub(super) fn commit(
@@ -153,11 +159,10 @@ pub(super) fn hook_script(command: &str) -> Result<String, ScalerError> {
     Ok(source.replace(HOOK_COMMAND, command))
 }
 
-/// The hook a standing KVM clone runs. The root-owned reservation policy
-/// admits the run the clone was minted for; any other assignment is admitted
-/// only after the controller re-vets it, else the session is killed.
+/// Every standing KVM assignment, including the reserved run, rendezvouses
+/// with the controller so a durable supersession can withhold approval.
 pub fn standing_hook_script() -> Result<String, ScalerError> {
-    hook_script(&format!("{HOOK_COMMAND} || {HOOK_COMMAND} --controller"))
+    hook_script(&format!("{HOOK_COMMAND} --controller"))
 }
 
 /// Credential-free rendezvous: publish the actual context, then wait for a
@@ -291,11 +296,159 @@ pub fn assigned_job_key(
     })
 }
 
+/// A cancellation intent reaches disk before the remote mutation. Pending
+/// intents are revalidated after restart. Observed started hardware blocks
+/// the POST; another controller can still start it between GET and POST.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum CancellationOutcome {
+    Cancelled,
+    NotCancelled,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct SupersededPush {
+    pub key: JobKey,
+    pub sha: String,
+    pub reason: String,
+    pub outcome: Option<CancellationOutcome>,
+}
+
+pub(super) fn prioritize_demand(mut demand: Vec<super::github::QueuedJob>) -> Vec<JobKey> {
+    let newest = demand
+        .iter()
+        .filter(|job| job.event == "push")
+        .map(|job| job.key.run.0)
+        .max();
+    demand.retain(|job| job.event != "push" || Some(job.key.run.0) == newest);
+    demand.sort_by_key(|job| {
+        (
+            job.event != "push",
+            std::cmp::Reverse(job.key.run.0),
+            job.key.job.0,
+        )
+    });
+    demand.dedup_by_key(|job| job.key.job.0);
+    demand.into_iter().map(|job| job.key).collect()
+}
+
+pub(super) fn run_superseded(entries: &[SupersededPush], key: JobKey) -> bool {
+    entries.iter().any(|entry| entry.key.run == key.run)
+}
+pub(super) fn merge_superseded(target: &mut Vec<SupersededPush>, source: &[SupersededPush]) {
+    for other in source {
+        if let Some(entry) = target
+            .iter_mut()
+            .find(|entry| entry.key.run == other.key.run && entry.key.attempt == other.key.attempt)
+        {
+            if entry.outcome.is_none() {
+                entry.outcome.clone_from(&other.outcome);
+            }
+        } else {
+            target.push(other.clone());
+        }
+    }
+}
+
+/// Supersession and local approval share one admission lock. Durable intent
+/// closes local admission before the API POST; network cleanup happens after
+/// releasing the lock, so it cannot starve approval of the winning push.
+pub(super) fn coalesce_demand(
+    ledger: &mut impl Refusals,
+    mut demand: Vec<super::github::QueuedJob>,
+    path: &Path,
+    mut cancel: impl FnMut(&SupersededPush) -> Result<CancellationOutcome, ScalerError>,
+) -> Result<Vec<JobKey>, ScalerError> {
+    let admission = ledger.admission_lock();
+    let journal = {
+        let _guard = admission
+            .as_ref()
+            .map(|lock| {
+                lock.lock()
+                    .map_err(|_| ScalerError::Guard("controller admission poisoned"))
+            })
+            .transpose()?;
+        ledger.refresh()?;
+        let mut journal = ledger.superseded().to_vec();
+        let mut added = Vec::new();
+        if let Some(newest) = demand
+            .iter()
+            .filter(|job| job.event == "push")
+            .max_by_key(|job| job.key.run.0)
+        {
+            for job in demand
+                .iter()
+                .filter(|job| job.event == "push" && job.key.run.0 < newest.key.run.0)
+            {
+                if ledger.has_approved_run(job.key)
+                    || journal.iter().any(|entry| {
+                        entry.key.run == job.key.run && entry.key.attempt == job.key.attempt
+                    })
+                {
+                    continue;
+                }
+                let entry = SupersededPush {
+                    key: job.key,
+                    sha: job.sha.clone(),
+                    reason: format!("superseded by {}", newest.sha),
+                    outcome: None,
+                };
+                added.push(entry.clone());
+                journal.push(entry);
+            }
+        }
+        if !added.is_empty() {
+            *ledger.superseded_mut() = journal.clone();
+            ledger.persist(path)?;
+            for entry in added {
+                eprintln!(
+                    "run={} attempt={} {}; local admission durably closed",
+                    entry.key.run.0, entry.key.attempt, entry.reason
+                );
+            }
+        }
+        journal
+    };
+    for entry in journal.iter().filter(|entry| entry.outcome.is_none()) {
+        let outcome = cancel(entry)?;
+        let _guard = admission
+            .as_ref()
+            .map(|lock| {
+                lock.lock()
+                    .map_err(|_| ScalerError::Guard("controller admission poisoned"))
+            })
+            .transpose()?;
+        ledger.refresh()?;
+        let recorded = ledger
+            .superseded_mut()
+            .iter_mut()
+            .find(|recorded| {
+                recorded.key.run == entry.key.run && recorded.key.attempt == entry.key.attempt
+            })
+            .ok_or(ScalerError::Guard(
+                "unfinished supersession lost from ledger",
+            ))?;
+        recorded.outcome = Some(outcome.clone());
+        ledger.persist(path)?;
+        eprintln!(
+            "run={} attempt={} {}; {outcome:?}",
+            entry.key.run.0, entry.key.attempt, entry.reason
+        );
+    }
+    ledger.refresh()?;
+    demand.retain(|job| !run_superseded(ledger.superseded(), job.key));
+    Ok(prioritize_demand(demand))
+}
+
 /// A controller ledger that records per-job refusals durably.
 pub(super) trait Refusals {
     fn served(&self, key: JobKey) -> bool;
     fn refused(&self) -> &[JobKey];
     fn refused_mut(&mut self) -> &mut Vec<JobKey>;
+    fn superseded(&self) -> &[SupersededPush];
+    fn superseded_mut(&mut self) -> &mut Vec<SupersededPush>;
+    fn has_approved_run(&self, key: JobKey) -> bool;
+    fn mark_approved(&mut self, key: JobKey, path: &Path) -> Result<(), ScalerError>;
+    fn admission_lock(&self) -> Option<std::sync::Arc<std::sync::Mutex<()>>>;
+    fn refresh(&mut self) -> Result<(), ScalerError>;
     fn persist(&self, path: &Path) -> Result<(), ScalerError>;
 }
 
@@ -403,6 +556,15 @@ pub(super) fn serve_assignment<L: Refusals>(
     path: &Path,
     record: impl FnOnce(&mut L, JobKey) -> Result<(), ScalerError>,
 ) -> Result<Revetted, ScalerError> {
+    let admission = ledger.admission_lock();
+    let _guard = admission
+        .as_ref()
+        .map(|lock| {
+            lock.lock()
+                .map_err(|_| ScalerError::Guard("controller admission poisoned"))
+        })
+        .transpose()?;
+    ledger.refresh()?;
     let Some(request) = exchange.read()? else {
         return Ok(Revetted::Idle);
     };
@@ -412,6 +574,18 @@ pub(super) fn serve_assignment<L: Refusals>(
     let jobs = api.run_jobs(RunId(context.run_id), context.run_attempt)?;
     let key = assigned_job_key(&context, runner, labels, &jobs)?;
     record(ledger, key)?; // True assignment is durable BEFORE steps may run.
+    if run_superseded(ledger.superseded(), key) {
+        refuse(
+            ledger,
+            key,
+            &ScalerError::Guard("run superseded before admission"),
+            path,
+        )?;
+        return Ok(Revetted::Refused(key));
+    }
+    if request.approved {
+        ledger.mark_approved(key, path)?;
+    }
     if request.approved || request.finished {
         return Ok(Revetted::Recorded(key));
     }
@@ -430,6 +604,7 @@ pub(super) fn serve_assignment<L: Refusals>(
         refuse(ledger, key, &error, path)?;
         return Ok(Revetted::Refused(key));
     }
+    ledger.mark_approved(key, path)?;
     exchange.approve(&policy)?;
     Ok(Revetted::Approved(key, policy))
 }
@@ -447,20 +622,17 @@ mod tests {
         super::super::github::QueuedJob {
             key: key(context, job),
             event: context.event.clone(),
+            sha: context.sha.clone(),
         }
     }
 
     #[test]
-    fn every_main_push_remains_eligible_oldest_first() {
-        let older = key(&run_a(), 11);
+    fn newer_main_push_coalesces_older_queued_work() {
         let newer_context = context(30, "push", "refs/heads/main", &"c".repeat(40));
         let newer = key(&newer_context, 31);
         assert_eq!(
-            super::super::mac::prioritize_demand(vec![
-                queued(&newer_context, 31),
-                queued(&run_a(), 11)
-            ]),
-            vec![older, newer]
+            prioritize_demand(vec![queued(&newer_context, 31), queued(&run_a(), 11)]),
+            vec![newer]
         );
     }
 
@@ -911,5 +1083,156 @@ mod tests {
         untrusted.event = "pull_request".into();
         assert!(parse_request(&serde_json::to_vec(&untrusted).unwrap()).is_err());
         assert!(parse_request(b"{").is_err());
+    }
+    fn push_demand(context: &JobContext, job: u64) -> super::super::github::QueuedJob {
+        super::super::github::QueuedJob {
+            key: key(context, job),
+            event: "push".into(),
+            sha: context.sha.clone(),
+        }
+    }
+    #[test]
+    fn ci_scaler_superseded_runs_are_never_reserved_in_either_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let older = context(10, "push", "refs/heads/main", &"a".repeat(40));
+        let newer = context(30, "push", "refs/heads/main", &"c".repeat(40));
+        let demand = vec![push_demand(&older, 11), push_demand(&newer, 31)];
+        let mut kvm = Ledger::default();
+        let path = dir.path().join("kvm.json");
+        coalesce_demand(&mut kvm, demand.clone(), &path, |_| {
+            Ok(CancellationOutcome::Cancelled)
+        })
+        .unwrap();
+        assert!(
+            Ledger::load(&path)
+                .unwrap()
+                .reserve(key(&older, 11), &[], 100, Concurrency::ONE)
+                .is_err()
+        );
+        assert!(
+            Ledger::load(&path)
+                .unwrap()
+                .reserve(
+                    JobKey {
+                        attempt: 2,
+                        ..key(&older, 11)
+                    },
+                    &[],
+                    100,
+                    Concurrency::ONE
+                )
+                .is_err()
+        );
+        let mut mac = super::super::mac::MacLedger::default();
+        let path = dir.path().join("mac.json");
+        coalesce_demand(&mut mac, demand, &path, |_| {
+            // Observing started work prevents API cancellation, but does not
+            // reopen local admission for the already superseded run.
+            Ok(CancellationOutcome::NotCancelled)
+        })
+        .unwrap();
+        assert!(
+            super::super::mac::MacLedger::load(&path)
+                .unwrap()
+                .reserve(key(&older, 11), 100)
+                .is_err()
+        );
+    }
+    #[test]
+    fn ci_scaler_superseded_assignment_is_refused_even_from_a_stale_worker_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut lifecycle, mut row, path) = minted_for_a(dir.path());
+        let publication = Publication::new(lifecycle.clone());
+        lifecycle.publication = Some(publication.clone());
+        let mut worker = publication.snapshot().unwrap();
+        worker.publication = Some(publication.worker());
+        let b = context(20, "push", "refs/heads/main", &"b".repeat(40));
+        let newer = context(30, "push", "refs/heads/main", &"c".repeat(40));
+        let admission = publication.admission_lock();
+        coalesce_demand(
+            &mut lifecycle,
+            vec![push_demand(&b, 21), push_demand(&newer, 31)],
+            &path,
+            |_| {
+                assert!(
+                    admission.try_lock().is_ok(),
+                    "network cleanup must not hold admission"
+                );
+                Ok(CancellationOutcome::Cancelled)
+            },
+        )
+        .unwrap();
+        let gh = FakeGithub {
+            vet: RefCell::new(None),
+        };
+        let mut guest = guest_asking(b);
+        assert_eq!(
+            serve(&gh, &mut guest, &mut worker, &mut row, &path).unwrap(),
+            Revetted::Refused(key_b())
+        );
+        assert!(guest.approved.is_empty());
+        assert!(Ledger::load(&path).unwrap().served(key_b()));
+    }
+    #[test]
+    fn ci_scaler_approval_is_durable_and_excludes_a_run_from_later_supersession() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut worker, mut row, path) = minted_for_a(dir.path());
+        let publication = Publication::new(worker.clone());
+        worker.publication = Some(publication.worker());
+        let mut stale = publication.snapshot().unwrap();
+        stale.publication = Some(publication.clone());
+        let b = context(20, "push", "refs/heads/main", &"b".repeat(40));
+        struct LockedGuest {
+            inner: FakeGuest,
+            admission: std::sync::Arc<std::sync::Mutex<()>>,
+            path: PathBuf,
+        }
+        impl AssignmentExchange for LockedGuest {
+            fn read(&mut self) -> Result<Option<AssignmentRequest>, ScalerError> {
+                self.inner.read()
+            }
+            fn approve(&mut self, policy: &JobPolicy) -> Result<(), ScalerError> {
+                assert!(
+                    self.admission.try_lock().is_err(),
+                    "approval must hold the supersession admission lock"
+                );
+                assert!(
+                    Ledger::load(&self.path).unwrap().rows[0].approved,
+                    "approval must already be durable before hook release"
+                );
+                self.inner.approve(policy)
+            }
+        }
+        let mut guest = LockedGuest {
+            inner: guest_asking(b.clone()),
+            admission: publication.admission_lock(),
+            path: path.clone(),
+        };
+        let gh = FakeGithub::vetting(Ok(bound(&b)));
+        serve_assignment(
+            &gh,
+            &mut guest,
+            &LABELS,
+            row.runner,
+            &mut worker,
+            &path,
+            |ledger, key| {
+                row.assigned = Some(key.job);
+                row.assigned_key = Some(key);
+                ledger.rows[0] = row.clone();
+                ledger.save(&path)
+            },
+        )
+        .unwrap();
+        let newer = context(30, "push", "refs/heads/main", &"c".repeat(40));
+        coalesce_demand(
+            &mut stale,
+            vec![push_demand(&b, 21), push_demand(&newer, 31)],
+            &path,
+            |_| panic!("an already approved run is never cancelled by this controller"),
+        )
+        .unwrap();
+        assert!(Ledger::load(&path).unwrap().superseded.is_empty());
+        assert_eq!(guest.inner.approved.len(), 1);
     }
 }
