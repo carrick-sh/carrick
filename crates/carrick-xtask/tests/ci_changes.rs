@@ -837,3 +837,50 @@ fn fork_prs_never_look_up_child_layers() {
         assert!(!child_lookup_allowed(event, "work/x-1", repo, repo));
     }
 }
+
+/// `just ci-results` requires every heavy pull-request job except `lint` (and
+/// the `macos-*` jobs, which never run on pull requests) to be skipped on a
+/// lower stack layer. A heavy job without the matching `lower_layer` guard runs
+/// anyway and turns `ci-ok` red on every lower layer, which blocks the stack.
+#[test]
+fn every_heavy_pr_job_skips_on_lower_stack_layers() {
+    let workflow = fs::read_to_string(workspace_root().join(".github/workflows/ci.yml")).unwrap();
+    let mut unguarded = Vec::new();
+    let mut job: Option<String> = None;
+    let mut in_jobs = false;
+    for line in workflow.lines() {
+        if line == "jobs:" {
+            in_jobs = true;
+            continue;
+        }
+        if !in_jobs {
+            continue;
+        }
+        if let Some(name) = line
+            .strip_prefix("  ")
+            .filter(|rest| !rest.starts_with(' '))
+            .and_then(|rest| rest.strip_suffix(':'))
+        {
+            job = Some(name.to_owned());
+            continue;
+        }
+        let Some(condition) = line.trim_start().strip_prefix("if:") else {
+            continue;
+        };
+        let Some(name) = job.as_deref() else {
+            continue;
+        };
+        if name == "lint" || name.starts_with("macos-") {
+            continue;
+        }
+        if condition.contains("needs.changes.outputs.heavy == 'true'")
+            && !condition.contains("needs.changes.outputs.lower_layer != 'true'")
+        {
+            unguarded.push(name.to_owned());
+        }
+    }
+    assert!(
+        unguarded.is_empty(),
+        "heavy jobs without a lower_layer guard: {unguarded:?}"
+    );
+}
