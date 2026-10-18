@@ -1,0 +1,152 @@
+name: Signed gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number, or main to publish a baseline
+        required: true
+        type: string
+      sha:
+        description: Exact full commit SHA (current PR head or a main ancestor)
+        required: true
+        type: string
+  pull_request_target:
+    types: [labeled]
+
+permissions: {}
+
+jobs:
+  authorize:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'gate:signed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      sha: ${{ steps.request.outputs.sha }}
+      base: ${{ steps.request.outputs.base }}
+      main: ${{ steps.request.outputs.main }}
+    steps:
+      - name: Refuse unauthorized actors before checking out code
+        env:
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          case "$ACTOR" in tjfontaine|'carrick-workers[bot]') ;; *) exit 1 ;; esac
+          case "$TRIGGERING_ACTOR" in tjfontaine|'carrick-workers[bot]') ;; *) exit 1 ;; esac
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Authorize exact SHA and retrieve merge-base baseline
+        id: request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          cargo run --locked -p carrick-xtask -- signed-gate prepare
+          --event "$GITHUB_EVENT_PATH" --output "$RUNNER_TEMP/request"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-request-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/request/
+          if-no-files-found: error
+
+  gate:
+    needs: authorize
+    runs-on: [self-hosted, macOS, ARM64, carrick-signed-gate]
+    timeout-minutes: 240
+    # GitHub has not assigned runner.name when it evaluates concurrency.
+    # The runner schedules one job at a time; execute holds the per-host gate
+    # lease across restore/build/accept/identity inspection. This additional
+    # group suppresses duplicate requests for one SHA across both Macs.
+    concurrency:
+      group: signed-gate-${{ needs.authorize.outputs.sha }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: signed-request-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/request
+      - name: Execute approved SHA in a fresh detached worktree
+        env:
+          CARRICK_RUN_ID: signed-gate-${{ github.run_id }}-${{ github.run_attempt }}
+          # Local immutable bundle path, configured separately on each Mac.
+          # No API credential is passed to candidate code.
+          CARRICK_SIGNED_FIXTURE_BUNDLE: ${{ vars.CARRICK_SIGNED_FIXTURE_BUNDLE }}
+        run: >-
+          cargo run --locked -p carrick-xtask -- signed-gate execute
+          --request "$RUNNER_TEMP/request/request.json" --output "$RUNNER_TEMP/signed-result"
+      - name: Upload receipt, artifact identity and step logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-result-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/signed-result/
+          if-no-files-found: warn
+          retention-days: 30
+
+  publish:
+    needs: [authorize, gate]
+    if: always() && needs.authorize.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+      statuses: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: signed-request-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/request
+      - name: Download execution evidence when available
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-result-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/signed-result
+      - name: Compare typed receipts and publish verdict
+        id: verdict
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EXECUTION_RESULT: ${{ needs.gate.result }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/signed-result"
+          cargo run --locked -p carrick-xtask -- signed-gate publish \
+            --request "$RUNNER_TEMP/request/request.json" --results "$RUNNER_TEMP/signed-result" \
+            --run-url "$RUN_URL" --execution-result "$EXECUTION_RESULT"
+      - name: Publish admitted main baseline
+        if: needs.authorize.outputs.main == 'true' && steps.verdict.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-baseline-${{ needs.authorize.outputs.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/signed-result/candidate.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Upload comparison and publication log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-verdict-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/request/
+            ${{ runner.temp }}/signed-result/diff.json
+            ${{ runner.temp }}/signed-result/comment.md
+          if-no-files-found: warn
+          retention-days: 30

@@ -28,6 +28,8 @@ pub mod provision;
 mod prune_fs;
 pub mod remote_accept;
 pub mod remote_lock;
+pub mod signed_gate;
+pub mod signed_receipt;
 mod target_prune;
 pub mod terminal_custody;
 pub mod test_batch;

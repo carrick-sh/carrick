@@ -674,6 +674,16 @@ pub struct ReceiptArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum ReceiptAction {
+    /// Strict signed comparison including populations, with a nonzero FAIL exit.
+    SignedDiff {
+        #[arg(long)]
+        base: PathBuf,
+        #[arg(long)]
+        candidate: PathBuf,
+        /// Also write the complete structured comparison as JSON.
+        #[arg(long)]
+        json: Option<PathBuf>,
+    },
     /// Print NEW/FIXED failures of CANDIDATE against BASELINE.
     Diff {
         #[arg(long)]
@@ -713,6 +723,29 @@ pub enum ReceiptAction {
 
 pub fn run(args: ReceiptArgs) -> Result<(), ReceiptError> {
     match args.action {
+        ReceiptAction::SignedDiff {
+            base,
+            candidate,
+            json,
+        } => {
+            let result = crate::signed_receipt::compare(&load(&base)?, &load(&candidate)?)?;
+            println!("{}", result.markdown());
+            if let Some(path) = json {
+                let bytes =
+                    serde_json::to_vec_pretty(&result).map_err(|source| ReceiptError::Parse {
+                        path: path.clone(),
+                        source,
+                    })?;
+                std::fs::write(&path, bytes).map_err(|source| ReceiptError::Io { path, source })?;
+            }
+            if !result.passed {
+                return Err(ReceiptError::New {
+                    count: result.new.len(),
+                    base: result.base,
+                });
+            }
+            Ok(())
+        }
         ReceiptAction::Diff {
             baseline,
             candidate,

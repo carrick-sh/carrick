@@ -448,7 +448,7 @@ test-shard-b *ARGS: _test-stdio
 
 # Run carrick-xtask unit and CI gate tests on Linux so ci-xtask changes are verified even when macos=false.
 test-xtask *ARGS:
-    {{_admit}} {{_cargo}} test --locked -p carrick-xtask --lib --bins --test test_batch --test ci_cache --test ci_changes --test ci_receipt --test ci_scaler --test ci_scaler_hook --test ci_scaler_mac --test commit_trailers --test cli --test claims --test workorder {{ARGS}}
+    {{_admit}} {{_cargo}} test --locked -p carrick-xtask --lib --bins --test test_batch --test ci_cache --test ci_changes --test ci_receipt --test signed_receipt --test ci_scaler --test ci_scaler_hook --test ci_scaler_mac --test commit_trailers --test cli --test claims --test workorder {{ARGS}}
 
 # Fail on missing, duplicate or changed selections or per-binary features, plus missing workflow jobs.
 check-test-shards:

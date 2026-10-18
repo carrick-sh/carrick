@@ -39,6 +39,8 @@ pub enum Commands {
     CiScaler(crate::ci_scaler::ScalerArgs),
     #[command(about = "Compare trusted-runner accept receipts against a per-SHA baseline")]
     CiReceipt(crate::ci_receipt::ReceiptArgs),
+    #[command(about = "Authorize, execute and publish the on-demand signed Actions gate")]
+    SignedGate(crate::signed_gate::SignedGateArgs),
     #[command(about = "Classify CI diff paths and derive referenced doc/agent dependencies")]
     CiChanges(crate::ci_changes::CiChangesArgs),
     #[command(about = "Census clean landed worktrees; dry-run unless --apply")]
@@ -426,6 +428,11 @@ where
         }
         Commands::CiScaler(args) => {
             crate::ci_scaler::run(args)?;
+            Ok(())
+        }
+        Commands::SignedGate(args) => {
+            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
+            crate::signed_gate::run(&root, args)?;
             Ok(())
         }
         Commands::CiReceipt(args) => {
