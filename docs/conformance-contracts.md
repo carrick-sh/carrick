@@ -1301,6 +1301,17 @@ until that shutdown. Logical failure publication must not retain a binding
 whose physical receipt the carrier is waiting for. This retirement gap was
 already present before native signal setup allowed these guests to progress.
 
+The VM-free bindings
+`abandoned_running_lease_drains_and_closes_its_lifecycle_window` and
+`abandoned_implicit_lease_stays_reachable_until_process_shutdown` cover a
+running lease dropped before normal container retirement. Its custody passes
+to carrier teardown: join workers, retire the exact container graph, destroy
+once, then finalize the lifecycle window. The implicit owner stays reachable
+until this completes. Failure stays visible, and a subsequent carrier can
+acquire a new window. Actual HVF destruction and root-slot pool invalidation
+remain signed bindings; the production HVF custody owner invalidates that
+pool only after successful VM destruction.
+
 ## Host fork versus terminal close (`kernel.el1.thread-lifecycle`, #441)
 
 An admitted host fork either loses to terminal close before its commit gate
