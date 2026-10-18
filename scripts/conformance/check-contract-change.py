@@ -3039,29 +3039,159 @@ def extract_changed_surface_items(
     return items
 
 
-def _strip_non_semantic_ident_occurrences(text: str) -> str:
-    """Blank out `stringify!(...)` / `stringify![...]` / `stringify!{...}` invocations and local
-    `let [mut] <ident>` binding names so non-call/non-use identifier occurrences do not satisfy
-    surface relevance. (Full semantic call-graph / rustc symbol resolution is tracked in #537.)
+_KNOWN_EXEC_MACROS = frozenset({
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "debug_assert",
+    "debug_assert_eq",
+    "debug_assert_ne",
+    "matches",
+    "vec",
+    "format",
+    "format_args",
+    "write",
+    "writeln",
+    "print",
+    "println",
+    "eprint",
+    "eprintln",
+    "dbg",
+    "panic",
+})
+
+
+def _strip_non_semantic_ident_occurrences(
+    text: str, extra_local_macros: set[str] | None = None
+) -> str:
+    """Blank out non-executing macro invocations (such as `stringify!(...)` or `nop!{ assert!(...) }`),
+    `if false { ... }` / `while false { ... }` blocks, uncalled closures, and local `let [mut] <ident>`
+    binding names so non-executing identifier mentions do not satisfy surface relevance.
+    (Full semantic call-graph / rustc symbol resolution is tracked in #537.)
     """
     text = text.split(_FINGERPRINT_META_SEP, 1)[0]
+    defined_macros = set(
+        re.findall(r"\bmacro_rules!\s*(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\b", text)
+    )
+    if extra_local_macros:
+        defined_macros.update(extra_local_macros)
+    text, _ = _blank_macro_defs(text, text)
+
     chars = list(text)
     pairs = {"(": ")", "[": "]", "{": "}"}
-    stringify_re = re.compile(r"\b(?:[\w:]+::)?stringify!\s*([(\[{])")
+    macro_call_re = re.compile(r"\b(?:[\w:]+::)?(?:r#)?([A-Za-z_][A-Za-z0-9_]*)!\s*([(\[{])")
     pos = 0
     n = len(text)
     while pos < n:
-        m = stringify_re.search(text, pos)
+        m = macro_call_re.search(text, pos)
         if not m:
             break
+        mname = m.group(1)
+        if mname in _KNOWN_EXEC_MACROS and mname not in defined_macros:
+            pos = m.end()
+            continue
         open_idx = m.end() - 1
-        open_ch = m.group(1)
+        open_ch = m.group(2)
         close_idx = _find_matching_delim(text, open_idx, open_ch, pairs[open_ch])
         end_idx = n if close_idx == -1 else close_idx + 1
         for i in range(m.start(), end_idx):
             if chars[i] != "\n":
                 chars[i] = " "
         pos = end_idx
+
+    s = "".join(chars)
+    chars = list(s)
+    false_cond_re = re.compile(r"\b(?:if|while)\s+(?:\(\s*)*(?:false|!\s*true)\b[^{;]*\{")
+    pos = 0
+    n = len(s)
+    while pos < n:
+        m = false_cond_re.search(s, pos)
+        if not m:
+            break
+        open_brace = m.end() - 1
+        close_brace = _find_matching_brace(s, open_brace)
+        end_idx = n if close_brace == -1 else close_brace + 1
+        for i in range(m.start(), end_idx):
+            if chars[i] != "\n":
+                chars[i] = " "
+        pos = end_idx
+
+    s = "".join(chars)
+    chars = list(s)
+    closure_re = re.compile(r"(?:\bmove\s+)?(\|\s*\||\|[^|;{}]*\|)")
+    let_closure_re = re.compile(
+        r"\blet\s+(?:mut\s+)?(_|(?:r#)?[A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=;{}]+)?=\s*$"
+    )
+    pos = 0
+    n = len(s)
+    while pos < n:
+        m = closure_re.search(s, pos)
+        if not m:
+            break
+        prefix = s[: m.start()]
+        r_prefix = prefix.rstrip()
+        lm = let_closure_re.search(prefix)
+        var_name: str | None = None
+        is_stmt_closure = False
+        is_paren_closure = False
+        if lm is not None:
+            var_name = lm.group(1)
+            is_stmt_closure = True
+        elif not r_prefix or r_prefix[-1] in "{;":
+            is_stmt_closure = True
+        elif r_prefix[-1] == "(":
+            before_paren = r_prefix[:-1].rstrip()
+            if not before_paren or before_paren[-1] in "{;":
+                is_stmt_closure = True
+                is_paren_closure = True
+
+        if not is_stmt_closure:
+            pos = m.end()
+            continue
+
+        body_pos = m.end()
+        while body_pos < n and s[body_pos] in " \t\r\n":
+            body_pos += 1
+        if s.startswith("->", body_pos):
+            brace_idx = s.find("{", body_pos + 2)
+            if brace_idx != -1:
+                body_pos = brace_idx
+        if body_pos < n and s[body_pos] == "{":
+            close_b = _find_matching_brace(s, body_pos)
+            closure_end = n if close_b == -1 else close_b + 1
+        else:
+            d = 0
+            idx = body_pos
+            while idx < n:
+                ch = s[idx]
+                if ch in "([{":
+                    d += 1
+                elif ch in ")]}":
+                    if d == 0:
+                        break
+                    d -= 1
+                elif ch == ";" and d == 0:
+                    break
+                idx += 1
+            closure_end = idx
+
+        after = s[closure_end:].lstrip()
+        invoked_immediately = after.startswith("(") or (
+            is_paren_closure and after.startswith(")") and after[1:].lstrip().startswith("(")
+        )
+        if invoked_immediately:
+            pos = closure_end
+            continue
+        if var_name is not None and var_name != "_":
+            v_clean = var_name[2:] if var_name.startswith("r#") else var_name
+            if re.search(rf"\b(?:r#)?{re.escape(v_clean)}\s*\(", s[closure_end:]):
+                pos = closure_end
+                continue
+
+        for i in range(m.start(), closure_end):
+            if chars[i] != "\n":
+                chars[i] = " "
+        pos = closure_end
 
     s = "".join(chars)
     # Blank out simple local variable pattern names in `let [mut] <ident>` (not followed by `::`, `{`, or `(`).
@@ -3099,7 +3229,15 @@ def bound_test_references_surface(
     items = surface_items_cache[surface_path]
     if not items or not ref_texts:
         return False
-    cleaned_texts = [_strip_non_semantic_ident_occurrences(txt) for txt in ref_texts]
+    file_macros: set[str] = set()
+    if head_view.is_file(test_file):
+        file_macros.update(
+            re.findall(
+                r"\bmacro_rules!\s*(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\b",
+                head_view.read_stripped_rust(test_file),
+            )
+        )
+    cleaned_texts = [_strip_non_semantic_ident_occurrences(txt, file_macros) for txt in ref_texts]
     for ident in items:
         pat = re.compile(rf"\b{re.escape(ident)}\b")
         if any(pat.search(txt) for txt in cleaned_texts):

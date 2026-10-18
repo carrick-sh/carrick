@@ -2533,6 +2533,35 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
         res_c = self.run_check(base_sha=base_b)
         self.assertEqual(res_c.returncode, 1, msg=f"case c stdout: {res_c.stdout}\nstderr: {res_c.stderr}")
 
+    def test_new5_non_executing_mentions_nop_macro_if_false_and_uncalled_closure_fail(self):
+        """NEW-5: non-executing mentions in nop!{ assert!(...) }, if false {}, while false {}, or uncalled closures must fail relevance."""
+        for label, body_code in (
+            ("nop_macro", "macro_rules! nop { ($($t:tt)*) => {}; }\n        nop!{ assert_eq!(super::futex_target_fn(), 1); }"),
+            ("if_false", "if false { assert_eq!(super::futex_target_fn(), 1); }"),
+            ("while_false", "while false { assert_eq!(super::futex_target_fn(), 1); }"),
+            ("let_underscore_closure", "let _ = || { assert_eq!(super::futex_target_fn(), 1); };"),
+            ("let_unused_closure", "let c = |x: i32| assert_eq!(super::futex_target_fn(), x);"),
+            ("bare_closure_stmt", "|| { assert_eq!(super::futex_target_fn(), 1); };"),
+        ):
+            with self.subTest(label=label):
+                self.use_single_contract_surface()
+                self.guest_file.write_text("// base futex\n", encoding="utf-8")
+                self._write_futex_contract('docker = "probe:futex"\n')
+                base_sha = self._commit_all(f"reset base for new5 {label}", allow_empty=True)
+                self.guest_file.write_text(
+                    "pub fn futex_target_fn() -> i32 { 1 }\n"
+                    "#[cfg(test)]\nmod tests {\n"
+                    "    #[test]\n"
+                    f"    fn fake_witness() {{\n        {body_code}\n    }}\n"
+                    "}\n",
+                    encoding="utf-8",
+                )
+                self._write_futex_contract('vm_free = "carrick-kernel::dispatch::futex::tests::fake_witness"\n')
+                self._commit_all(f"new5 non-executing mention {label}")
+                res = self.run_check(base_sha=base_sha)
+                self.assertEqual(res.returncode, 1, msg=f"label={label}\nstdout: {res.stdout}\nstderr: {res.stderr}")
+                self.assertIn("does not reference changed surface", res.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
