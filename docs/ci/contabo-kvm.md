@@ -88,8 +88,9 @@ The approval decision is durable under the same admission lock as supersession,
 so an already approved local run cannot be superseded.
 
 Cancellation is cleanup after releasing that lock. Before POST, a fresh GET
-of all jobs in the run must show the target queued and no in-progress job;
-other hardware in either lane (including GCP KVM) must be unstarted or completed.
+of all jobs in the run must show the target queued or waiting and no in-progress
+job; other hardware (including GCP KVM) must be queued, waiting or completed.
+A populated `started_at` on a queued job does not mean it is running.
 Observed running work defers cleanup, retaining the intent across polls and
 restarts. Completed work does not prevent cancelling a superseded queued lane.
 Each controller applies this rule independently, without a cross-controller
@@ -97,7 +98,9 @@ acknowledgement protocol. **A superseded job never starts through our admission;
 a raced cancellation can only affect a superseded run.** Another lane can
 start between GET and POST; this bound does not promise never to cancel
 running work. Cleanup is scoped to the superseded run ID. Pending intents
-survive API errors and restarts, and the receipt gate reports skipped commits
+survive API errors and restarts. Per-entry cleanup errors log Deferred without
+blocking newest-push admission; a 404 settles the entry as Gone. The receipt
+gate reports skipped commits
 as a range. Deploying this policy requires updated controllers and hooks.
 
 On push, a selector built from trusted event.before walks back at most 50

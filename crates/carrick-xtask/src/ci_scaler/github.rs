@@ -38,7 +38,10 @@ impl Github {
         } else {
             vec![]
         };
-        let output = execute(&mut cmd, &input, Duration::from_secs(60))?;
+        let output = execute_with_failure(&mut cmd, &input, Duration::from_secs(60), |bytes| {
+            let body: Value = serde_json::from_slice(bytes).ok()?;
+            (body["status"] == "404" || body["status"] == 404).then_some(ScalerError::GithubGone)
+        })?;
         if method == "DELETE"
             || (method == "POST" && endpoint.ends_with("/cancel") && output.is_empty())
         {
@@ -165,63 +168,71 @@ impl Github {
         mut request: impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
     ) -> Result<assignment::CancellationOutcome, ScalerError> {
         use assignment::CancellationOutcome::{Cancelled, Deferred, NotCancelled};
-        let run = request(
-            "GET",
-            &format!("repos/{REPOSITORY}/actions/runs/{}", entry.key.run.0),
-            None,
-            false,
-        )?;
-        if !Admission::Standing.admits_run(&run)
-            || run["event"] != "push"
-            || run["id"].as_u64() != Some(entry.key.run.0)
-            || run["run_attempt"].as_u64() != Some(u64::from(entry.key.attempt))
-            || run["head_sha"] != entry.sha
-            || !matches!(run["status"].as_str(), Some("queued" | "in_progress"))
-        {
-            return Ok(NotCancelled);
-        }
-        let data = request(
-            "GET",
-            &format!(
-                "repos/{REPOSITORY}/actions/runs/{}/attempts/{}/jobs?per_page=100",
-                entry.key.run.0, entry.key.attempt
-            ),
-            None,
-            true,
-        )?;
-        let jobs = pages(&data, "jobs")?;
-        if !jobs.iter().any(|job| {
-            job["id"].as_u64() == Some(entry.key.job.0)
-                && job["status"] == "queued"
-                && job.get("started_at") == Some(&Value::Null)
-        }) {
-            return Ok(NotCancelled);
-        }
-        // A queued KVM job may share a run with an already running HVF job,
-        // and vice versa. Include hosted GCP KVM, not only JIT runner labels.
-        for job in &jobs {
-            if job["status"] == "in_progress" {
-                return Ok(Deferred);
-            }
-            let Some(labels) = job["labels"].as_array() else {
-                return Ok(NotCancelled);
-            };
-            let hardware = labels.iter().any(|label| label == "self-hosted")
-                || job["name"] == "KVM · x86 kvm-lane tests";
-            if hardware
-                && job["status"] != "completed"
-                && (job["status"] != "queued" || job.get("started_at") != Some(&Value::Null))
+        let result = (|| {
+            let run = request(
+                "GET",
+                &format!("repos/{REPOSITORY}/actions/runs/{}", entry.key.run.0),
+                None,
+                false,
+            )?;
+            if !Admission::Standing.admits_run(&run)
+                || run["event"] != "push"
+                || run["id"].as_u64() != Some(entry.key.run.0)
+                || run["run_attempt"].as_u64() != Some(u64::from(entry.key.attempt))
+                || run["head_sha"] != entry.sha
+                || !matches!(
+                    run["status"].as_str(),
+                    Some("queued" | "waiting" | "in_progress")
+                )
             {
-                return Ok(Deferred);
+                return Ok(NotCancelled);
             }
+            let data = request(
+                "GET",
+                &format!(
+                    "repos/{REPOSITORY}/actions/runs/{}/attempts/{}/jobs?per_page=100",
+                    entry.key.run.0, entry.key.attempt
+                ),
+                None,
+                true,
+            )?;
+            let jobs = pages(&data, "jobs")?;
+            if !jobs.iter().any(|job| {
+                job["id"].as_u64() == Some(entry.key.job.0)
+                    && matches!(job["status"].as_str(), Some("queued" | "waiting"))
+            }) {
+                return Ok(NotCancelled);
+            }
+            // A queued KVM job may share a run with an already running HVF job,
+            // and vice versa. Include hosted GCP KVM, not only JIT runner labels.
+            for job in &jobs {
+                if job["status"] == "in_progress" {
+                    return Ok(Deferred);
+                }
+                let Some(labels) = job["labels"].as_array() else {
+                    return Ok(NotCancelled);
+                };
+                let hardware = labels.iter().any(|label| label == "self-hosted")
+                    || job["name"] == "KVM · x86 kvm-lane tests";
+                if hardware
+                    && job["status"] != "completed"
+                    && !matches!(job["status"].as_str(), Some("queued" | "waiting"))
+                {
+                    return Ok(Deferred);
+                }
+            }
+            request(
+                "POST",
+                &format!("repos/{REPOSITORY}/actions/runs/{}/cancel", entry.key.run.0),
+                None,
+                false,
+            )?;
+            Ok(Cancelled)
+        })();
+        match result {
+            Err(ScalerError::GithubGone) => Ok(assignment::CancellationOutcome::Gone),
+            result => result,
         }
-        request(
-            "POST",
-            &format!("repos/{REPOSITORY}/actions/runs/{}/cancel", entry.key.run.0),
-            None,
-            false,
-        )?;
-        Ok(Cancelled)
     }
     /// Mint one-use JIT material for `name`. The returned encoded config is
     /// the only GitHub-derived secret a runner host ever receives.
@@ -586,7 +597,7 @@ mod tests {
         assert_eq!(result, CancellationOutcome::NotCancelled);
     }
     #[test]
-    fn cancellation_intent_survives_api_failure_and_restart_rechecks_running_state() {
+    fn cancel_error_does_not_block_newest_admission_and_is_retried_after_restart() {
         use super::super::assignment::{CancellationOutcome, coalesce_demand};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.json");
@@ -602,18 +613,27 @@ mod tests {
                 sha: format!("{n:040x}"),
             })
             .collect::<Vec<_>>();
-        assert!(
-            coalesce_demand(&mut ledger, demand.clone(), &path, |_| Err(
-                ScalerError::External("Actions unavailable")
-            ))
-            .is_err()
-        );
+        let ordered = coalesce_demand(&mut ledger, demand.clone(), &path, |_| {
+            Err(ScalerError::External("Actions unavailable"))
+        })
+        .unwrap();
+        let admitted = assignment::admit_demand(&mut ledger, &path, ordered, Ok)
+            .unwrap()
+            .unwrap();
+        assert_eq!(admitted.run, RunId(3));
+        assert!(ledger.reserve(admitted, &[], 100, Concurrency::ONE).is_ok());
         let pending: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(
             pending["superseded"][0]["reason"],
             format!("superseded by {:040x}", 3)
         );
-        assert!(pending["superseded"][0]["outcome"].is_null());
+        assert!(
+            pending["superseded"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry["outcome"] == "Deferred")
+        );
         let mut checked = Vec::new();
         let mut ledger = Ledger::load(&path).unwrap();
         let selected = coalesce_demand(&mut ledger, demand, &path, |entry| {
@@ -715,5 +735,66 @@ mod tests {
             Ledger::load(&path).unwrap().superseded[0].outcome,
             Some(CancellationOutcome::Cancelled)
         );
+    }
+    fn cleanup_entry() -> assignment::SupersededPush {
+        assignment::SupersededPush {
+            key: JobKey {
+                run: RunId(1),
+                attempt: 1,
+                job: JobId(1),
+            },
+            sha: format!("{:040x}", 1),
+            reason: format!("superseded by {:040x}", 3),
+            outcome: None,
+        }
+    }
+    #[test]
+    fn queued_or_waiting_job_with_started_at_populated_is_cancelled_by_status() {
+        for status in ["queued", "waiting"] {
+            let mut posted = false;
+            let outcome =
+                Github::cancel_superseded_with(&cleanup_entry(), |method, endpoint, _, _| {
+                    if method == "GET" && endpoint.ends_with("/jobs?per_page=100") {
+                        let mut job = hardware_job(1, &HVF_LABELS, status);
+                        job["started_at"] = "2026-10-18T00:00:00Z".into();
+                        Ok(json!([{"jobs":[job]}]))
+                    } else if method == "GET" {
+                        Ok(push_run(1))
+                    } else {
+                        assert_eq!(method, "POST");
+                        posted = true;
+                        Ok(Value::Null)
+                    }
+                })
+                .unwrap();
+            assert_eq!(outcome, assignment::CancellationOutcome::Cancelled);
+            assert!(posted, "status={status} must permit cancellation");
+        }
+    }
+    #[test]
+    fn serial_host_github_404_settles_cleanup_as_gone_without_leaking_response_body() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let gh = dir.path().join("gh");
+        for status in ["404", "403"] {
+            std::fs::write(&gh,format!("#!/bin/sh\nprintf '%s' '{{\"message\":\"sensitive-body\",\"status\":\"{status}\"}}'\nexit 1\n")).unwrap();
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let decision = Github::cancel_superseded_with(
+                &cleanup_entry(),
+                |method, endpoint, body, paginate| {
+                    Github::request_command(Command::new(&gh), method, endpoint, body, paginate)
+                },
+            );
+            if status == "404" {
+                assert!(decision.is_ok(), "{decision:?}");
+                assert_eq!(
+                    serde_json::to_value(decision.unwrap()).unwrap(),
+                    json!("Gone")
+                );
+            } else {
+                let error = decision.unwrap_err().to_string();
+                assert!(!error.contains("sensitive-body"), "{error}");
+            }
+        }
     }
 }
