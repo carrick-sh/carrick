@@ -6,8 +6,8 @@
 //! job-start hook therefore publishes the actual run through a credential-free
 //! rendezvous (`assignment.json` in the runner's state directory) and waits.
 //! The credential-holding controller authenticates the request by runner id,
-//! re-vets that run exactly as it vets demand (same admission, attempt and,
-//! for a merge group, in-repository pull-request heads), records the actual
+//! re-vets that run exactly as it vets demand (same main admission and
+//! attempt), records the actual
 //! job durably and only then publishes a root-owned `approved-policy` bound to
 //! the actual run, attempt and SHA. A refused assignment is recorded once and
 //! gets no approval: the hook's deadline kills the session before any step.
@@ -306,7 +306,6 @@ pub(super) fn admit_demand<T>(
     path: &Path,
     demand: Vec<JobKey>,
     mut admit: impl FnMut(JobKey) -> Result<T, ScalerError>,
-    mut cancel: impl FnMut(RunId) -> Result<(), ScalerError>,
 ) -> Result<Option<T>, ScalerError> {
     for job in demand {
         if ledger.served(job) {
@@ -314,11 +313,8 @@ pub(super) fn admit_demand<T>(
         }
         match admit(job) {
             Ok(vetted) => return Ok(Some(vetted)),
-            Err(ScalerError::SupersededMergeGroup { successor }) => {
-                skip_superseded(job, &successor);
-            }
-            Err(error @ (ScalerError::Guard(_) | ScalerError::StaleMergeGroup)) => {
-                refuse(ledger, job, &error, path, &mut cancel)?;
+            Err(error @ ScalerError::Guard(_)) => {
+                refuse(ledger, job, &error, path)?;
             }
             Err(error) => return Err(error),
         }
@@ -326,28 +322,13 @@ pub(super) fn admit_demand<T>(
     Ok(None)
 }
 
-/// A superseded reservation is a temporary skip, never a durable refusal:
-/// the same job can become eligible when its successor fails or leaves.
-pub(super) fn skip_superseded(key: JobKey, successor: &str) {
-    eprintln!(
-        "run={} superseded by queued descendant {successor}; skipping reservation",
-        key.run.0
-    );
-}
-
-/// Record and log a per-job refusal once; a new attempt has a new key. A
-/// merge group that left the queue is also cancelled, best effort.
+/// Record and log a per-job refusal once; a new attempt has a new key.
 pub(super) fn refuse(
     ledger: &mut impl Refusals,
     key: JobKey,
     error: &ScalerError,
     path: &Path,
-    cancel: &mut impl FnMut(RunId) -> Result<(), ScalerError>,
 ) -> Result<(), ScalerError> {
-    if let ScalerError::SupersededMergeGroup { successor } = error {
-        skip_superseded(key, successor);
-        return Ok(());
-    }
     if ledger.refused().contains(&key) {
         return Ok(());
     }
@@ -362,16 +343,6 @@ pub(super) fn refuse(
         "run={} attempt={} job={} refused: {error}; skipping",
         key.run.0, key.attempt, key.job.0
     );
-    if matches!(error, ScalerError::StaleMergeGroup) {
-        // Cancellation is best effort: insufficient permission or a run
-        // finishing concurrently must not starve another admitted job.
-        if let Err(error) = cancel(key.run) {
-            eprintln!(
-                "run={} merge-group cancellation unavailable (Actions write required): {error}; ignored",
-                key.run.0
-            );
-        }
-    }
     Ok(())
 }
 
@@ -396,7 +367,6 @@ pub(super) trait AssignmentApi {
     fn run_jobs(&self, run: RunId, attempt: u32) -> Result<Vec<Value>, ScalerError>;
     /// The same standing vet that admits demand.
     fn revet(&self, key: JobKey) -> Result<JobPolicy, ScalerError>;
-    fn cancel(&self, run: RunId) -> Result<(), ScalerError>;
 }
 impl AssignmentApi for Github {
     fn run_jobs(&self, run: RunId, attempt: u32) -> Result<Vec<Value>, ScalerError> {
@@ -404,9 +374,6 @@ impl AssignmentApi for Github {
     }
     fn revet(&self, key: JobKey) -> Result<JobPolicy, ScalerError> {
         self.vet_assignment(key)
-    }
-    fn cancel(&self, run: RunId) -> Result<(), ScalerError> {
-        self.cancel_run(run)
     }
 }
 
@@ -453,14 +420,14 @@ pub(super) fn serve_assignment<L: Refusals>(
     }
     let policy = match api.revet(key) {
         Ok(policy) => policy,
-        Err(error @ (ScalerError::Guard(_) | ScalerError::StaleMergeGroup)) => {
-            refuse(ledger, key, &error, path, &mut |run| api.cancel(run))?;
+        Err(error @ ScalerError::Guard(_)) => {
+            refuse(ledger, key, &error, path)?;
             return Ok(Revetted::Refused(key));
         }
         Err(error) => return Err(error),
     };
     if let Err(error) = policy.authorize(&context) {
-        refuse(ledger, key, &error, path, &mut |_| Ok(()))?;
+        refuse(ledger, key, &error, path)?;
         return Ok(Revetted::Refused(key));
     }
     exchange.approve(&policy)?;
@@ -480,71 +447,20 @@ mod tests {
         super::super::github::QueuedJob {
             key: key(context, job),
             event: context.event.clone(),
-            sha: context.sha.clone(),
         }
     }
 
     #[test]
-    fn pending_merge_group_outranks_and_blocks_main_push() {
-        let group = key(&run_b(), 21);
-        let demand = super::super::mac::prioritize_demand(
-            vec![queued(&run_a(), 11), queued(&run_b(), 21)],
-            &[],
-        );
-        assert_eq!(demand, vec![group]);
-    }
-
-    #[test]
-    fn pending_group_base_push_is_required_before_group() {
-        // The merge-group job's base SHA is the push run's head SHA. Its
-        // receipt gate cannot finish until this push publishes a receipt.
-        let base_push = key(&run_a(), 11);
-        let group = key(&run_b(), 21);
-        let newer = context(30, "push", "refs/heads/main", &"c".repeat(40));
-        let jobs = vec![
-            queued(&run_a(), 11),
-            queued(&run_b(), 21),
-            queued(&newer, 31),
-        ];
-        let queue = json!({"data":{"repository":{"mergeQueue":{"entries":{
-            "pageInfo":{"hasNextPage":false},
-            "nodes":[{"position":1,
-                "baseCommit":{"oid":run_a().sha},
-                "headCommit":{"oid":run_b().sha},
-                "pullRequest":{"headRepository":{"nameWithOwner":REPOSITORY}}
-            }]
-        }}}}});
-        let required = super::super::github::required_base_pushes(&jobs, &queue, |key, sha| {
-            assert_eq!(key, base_push);
-            assert_eq!(sha, run_a().sha);
-            Ok(false)
-        })
-        .unwrap();
-        let demand = super::super::mac::prioritize_demand(jobs.clone(), &required);
-        assert_eq!(demand, vec![base_push, group]);
-        let received =
-            super::super::github::required_base_pushes(&jobs, &queue, |_, _| Ok(true)).unwrap();
-        assert!(received.is_empty());
-        assert_eq!(
-            super::super::mac::prioritize_demand(jobs, &received),
-            vec![group]
-        );
-    }
-
-    #[test]
-    fn newer_main_push_temporarily_supersedes_older_pending_push() {
+    fn every_main_push_remains_eligible_oldest_first() {
         let older = key(&run_a(), 11);
-        let newer = key(&context(30, "push", "refs/heads/main", &"c".repeat(40)), 31);
         let newer_context = context(30, "push", "refs/heads/main", &"c".repeat(40));
-        let demand = super::super::mac::prioritize_demand(
-            vec![queued(&run_a(), 11), queued(&newer_context, 31)],
-            &[],
-        );
-        assert_eq!(demand, vec![newer]);
+        let newer = key(&newer_context, 31);
         assert_eq!(
-            super::super::mac::prioritize_demand(vec![queued(&run_a(), 11)], &[]),
-            vec![older],
-            "older push resumes when its successor leaves the queue"
+            super::super::mac::prioritize_demand(vec![
+                queued(&newer_context, 31),
+                queued(&run_a(), 11)
+            ]),
+            vec![older, newer]
         );
     }
 
@@ -563,14 +479,9 @@ mod tests {
     fn run_a() -> JobContext {
         context(10, "push", "refs/heads/main", &"a".repeat(40))
     }
-    /// Run B: a merge group GitHub assigned to that clone instead.
+    /// Run B: an owner dispatch GitHub assigned to that clone instead.
     fn run_b() -> JobContext {
-        context(
-            20,
-            "merge_group",
-            "refs/heads/gh-readonly-queue/main/pr-328-6c3b23300",
-            &"b".repeat(40),
-        )
+        context(20, "workflow_dispatch", "refs/heads/main", &"b".repeat(40))
     }
     fn key(context: &JobContext, job: u64) -> JobKey {
         JobKey {
@@ -590,13 +501,11 @@ mod tests {
     /// GitHub for the fixture: B's KVM job runs on this clone's runner.
     struct FakeGithub {
         vet: RefCell<Option<Result<JobPolicy, ScalerError>>>,
-        cancelled: RefCell<Vec<RunId>>,
     }
     impl FakeGithub {
         fn vetting(result: Result<JobPolicy, ScalerError>) -> Self {
             Self {
                 vet: RefCell::new(Some(result)),
-                cancelled: RefCell::new(Vec::new()),
             }
         }
     }
@@ -618,10 +527,6 @@ mod tests {
                 .borrow_mut()
                 .take()
                 .unwrap_or_else(|| panic!("re-vetted twice"))
-        }
-        fn cancel(&self, run: RunId) -> Result<(), ScalerError> {
-            self.cancelled.borrow_mut().push(run);
-            Ok(())
         }
     }
     fn key_b() -> JobKey {
@@ -777,7 +682,6 @@ mod tests {
             newest,
             &ScalerError::Guard("fixture refusal"),
             &path,
-            &mut |_| Ok(()),
         )
         .unwrap();
         let restored = Ledger::load(&path).unwrap();
@@ -887,83 +791,14 @@ mod tests {
         assert_eq!(ledger.rows[0].assigned_key, Some(key_b()));
         assert!(ledger.served(key_b()));
         assert!(!ledger.served(key(&run_a(), 11)));
-        assert!(gh.cancelled.borrow().is_empty());
-    }
-
-    #[test]
-    fn superseded_demand_is_temporary_and_failure_restores_service() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ledger.json");
-        let mut ledger = Ledger::default();
-        let keys: Vec<_> = (1..=3)
-            .map(|n| JobKey {
-                run: RunId(n),
-                attempt: 1,
-                job: JobId(n),
-            })
-            .collect();
-        let mut cancelled = Vec::new();
-        let selected = admit_demand(
-            &mut ledger,
-            &path,
-            keys.clone(),
-            |key| {
-                if key.run.0 < 3 {
-                    Err(ScalerError::SupersededMergeGroup {
-                        successor: "deepest".into(),
-                    })
-                } else {
-                    Ok(key)
-                }
-            },
-            |run| {
-                cancelled.push(run);
-                Err(ScalerError::External("Actions read-only"))
-            },
-        )
-        .unwrap();
-        assert_eq!(selected, Some(keys[2]));
-        assert!(cancelled.is_empty());
-        assert!(ledger.refused.is_empty());
-        // The same attempt becomes eligible when its successor fails/ejects.
-        assert_eq!(
-            admit_demand(&mut ledger, &path, keys[..2].to_vec(), Ok, |_| panic!(
-                "eligible demand must not be cancelled"
-            ))
-            .unwrap(),
-            Some(keys[0])
-        );
-    }
-
-    #[test]
-    fn superseded_refusal_records_nothing_durable() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ledger.json");
-        let mut ledger = Ledger::default();
-        refuse(
-            &mut ledger,
-            key_b(),
-            &ScalerError::SupersededMergeGroup {
-                successor: "deeper".into(),
-            },
-            &path,
-            &mut |_| panic!("supersession must never cancel"),
-        )
-        .unwrap();
-        assert!(ledger.refused.is_empty());
-        assert!(!path.exists());
     }
 
     #[test]
     fn ci_scaler_standing_refuses_inadmissible_run_b_and_re_serves_run_a() {
         for refusal in [
-            ScalerError::StaleMergeGroup,
-            ScalerError::Guard("merge group contains a pull request from another repository"),
+            ScalerError::Guard("run event is not admitted"),
+            ScalerError::Guard("run is from another repository"),
         ] {
-            let stale = matches!(
-                refusal,
-                ScalerError::StaleMergeGroup | ScalerError::SupersededMergeGroup { .. }
-            );
             let dir = tempfile::tempdir().unwrap();
             let (mut ledger, mut row, path) = minted_for_a(dir.path());
             let gh = FakeGithub::vetting(Err(refusal));
@@ -972,10 +807,6 @@ mod tests {
             assert_eq!(outcome, Revetted::Refused(key_b()));
             // No approval: the hook's deadline kills B before any step.
             assert!(guest.approved.is_empty());
-            assert_eq!(
-                *gh.cancelled.borrow(),
-                if stale { vec![RunId(20)] } else { vec![] }
-            );
             // A restart re-reads the request but never re-vets or approves B.
             let mut ledger = Ledger::load(&path).unwrap();
             assert_eq!(
@@ -1045,7 +876,6 @@ mod tests {
         let (mut ledger, mut row, path) = minted_for_a(dir.path());
         let gh = FakeGithub {
             vet: RefCell::new(None),
-            cancelled: RefCell::new(Vec::new()),
         };
         for (approved, finished) in [(true, false), (false, true)] {
             let mut guest = guest_asking(run_b());

@@ -13,8 +13,8 @@ director's Mac                                cloudmac
 carrick-xtask ci-scaler mac-jit               rentamac (SSH login, no privileges beyond:)
   gh: queued jobs of kernel-runtime.yml         sudo -n carrick-xtask ci-scaler mac-run-once ...   (root)
       with exactly HVF_LABELS                     verify runner tree == pinned manifest
-  gh: re-vet the run; merge group PR heads        write root-owned run/<name>/{policy,admit-job.sh}
-      must all be carrick-sh/carrick              reservation = "standing run=R attempt=A sha=S"
+  gh: re-vet main push or owner dispatch         write root-owned run/<name>/{policy,admit-job.sh}
+                                                 reservation = "standing run=R attempt=A sha=S"
   gh: generate-jitconfig (one-use) --stdin-->     setsid; drop to carrick-ci; Runner.Listener run
   ledger: ~/.carrick-ci/mac-jit                   JIT via ACTIONS_RUNNER_INPUT_JITCONFIG (never argv)
                                                   hook: request actual run; await controller approval
@@ -29,47 +29,22 @@ Demand (`Admission::Standing`, `crates/carrick-xtask/src/ci_scaler.rs`):
 - runs of `.github/workflows/kernel-runtime.yml` in `carrick-sh/carrick`
   (run and head repository), listed through the workflow's own runs
   endpoint;
-- event `merge_group` on `gh-readonly-queue/main/*`, or `push` /
-  `workflow_dispatch` on `main`;
+- event `push` or owner `workflow_dispatch` on `main`; merge groups,
+  pull requests and schedules are refused;
 - job labels exactly `HVF_LABELS` = `self-hosted, macOS, ARM64, carrick-hvf`.
   The closure job uses `HVF_CLOSURE_LABELS` (`carrick-hvf-closure`) and is
-  never served by `mac-jit`, so it cannot occupy the merge-queue runner.
+  never served by `mac-jit`, so it cannot occupy the main-push runner.
   **Nothing serves that label today:** an owner-started dedicated runner
   with exactly those labels is required, and until one exists a dispatched
   closure job stays queued (GitHub cancels it after 24 hours).
 
-Before minting a runner the controller re-reads the run (`Github::vet`): same
-admission, same attempt, and for a merge group every pull request in the
-group (its queue entry and every entry ahead of it, from the GraphQL
-`mergeQueue` listing) must have its head repository equal to
-`carrick-sh/carrick`. A group with a fork pull request is refused.
-
-Demand is served in priority order: a pending main push needed for a group's
-missing base receipt, admitted live merge groups, then the newest pending
-main push when no group is pending, then owner `workflow_dispatch` runs on main.
-While a merge-group HVF job is pending, a main-push job is offered a runner
-only when its head SHA is the group's `base_sha` and that push run has not
-published an HVF receipt. The group's hosted `hvf-gate` waits for that base
-receipt; its producer runs before the group, even when a newer main push is
-queued. The controller obtains the base from `baseCommit.oid` in the existing
-merge-queue GraphQL observation and reuses that observation when vetting the
-group. Other main pushes are deferred while groups are pending. A newer main
-push temporarily supersedes older pending pushes unless an older push is a
-group's missing base-receipt producer. These skips do not cancel a run or
-enter the durable refusal ledger: a push becomes eligible again when the
-higher-priority demand leaves the queue. A per-job refusal never aborts the
-pass: the controller records and logs it once per
-run/attempt/job key, then considers the next job in the same pass. Refusals
-survive restarts; a re-run's new attempt is vetted afresh. Vetting happens
-before reserving a runner, so a refused job cannot occupy cloudmac's budget.
-
-When a merge group's SHA is absent from two consecutive complete, successful queue
-listings, the controller also requests cancellation of its workflow run.
-A truncated queue listing is retried without a durable refusal.
-A fork-head refusal, truncated queue listing or API/parse failure does not
-trigger cancellation. Cancellation is best effort and attempted once for
-the refused job: a denied or failed cancellation leaves the job ignored
-and does not prevent serving live demand.
+Before minting a runner the controller re-reads the run (`Github::vet`):
+same trusted main admission, same attempt and exact SHA. Demand serves every
+main push oldest first, then owner dispatches. A newer push never displaces
+an older pending push: every landed commit needs its own receipt to maintain
+the parent baseline chain. Per-job refusals are logged and recorded durably,
+then the controller considers the next job in the same pass. API failures
+back off. Refusals survive restarts; a new run attempt is vetted afresh.
 
 GitHub does not bind a JIT registration to the reserved job: a compatible
 job from another run may be assigned. The mac hook therefore re-vets the
@@ -82,7 +57,7 @@ job from another run may be assigned. The mac hook therefore re-vets the
 2. Through the existing root-only `mac-quiesce --assignment` command, the
    controller reads that request. It finds the unique job in that run/attempt
    assigned to this runner id, checks exact HVF labels, and re-vets the actual
-   run with `Github::vet`, including same-repository merge-group PR heads.
+   run with `Github::vet`, including main push or owner dispatch admission.
 3. The controller fsyncs the true job id and full run/attempt/job key into its
    ledger **before** publishing `approved-policy` through
    `mac-quiesce --assignment --approve`. That root-owned policy binds approval
@@ -92,14 +67,12 @@ job from another run may be assigned. The mac hook therefore re-vets the
 No GitHub credential reaches cloudmac. The runner user can request admission,
 but cannot write approval. Drain and approval share the admission flock;
 restart can republish the same approval but cannot replace it with another
-run. Once approval exists, reconciliation does not re-vet a completed merge
-group that may already have left the queue. An actual job B is deduplicated
+run. Once approval exists, reconciliation does not re-vet a completed run. An actual job B is deduplicated
 while the unserved reservation A remains eligible for another runner; a
 runner assigned another job neither holds A nor consumes one of A's serves.
-A refused actual assignment is recorded once (a stale merge group is also
-cancelled, as for demand) and never approved.
+A refused actual assignment is recorded once and never approved.
 The decision (`serve_assignment` in `ci_scaler/assignment.rs`) is shared with
-the standing KVM controller ([willow-pilot.md](willow-pilot.md#standing-mode-merge-queue),
+the standing KVM controller ([willow-pilot.md](willow-pilot.md#standing-mode-main-pushes-and-owner-dispatch),
 #333); only the transport differs. The historical pilot remains bound.
 
 This is Option A for [#256](https://github.com/carrick-sh/carrick/issues/256).
@@ -291,33 +264,41 @@ at most 4096 job keys; eviction never bypasses vetting.
 
 ## Seeding baselines
 
-The merge-queue gate compares each group's receipt with the nearest published
-receipt on its base chain (`ci-receipt gate`). A superseded shallower group may
-have no receipt, so the gate follows that queue entry's base, repeating until
-it finds a published receipt. It reports the selected ancestor SHA and its
-recorded failure state; a failed ancestor receipt is compared, not silently
-skipped. Baselines are published by push-to-main, merge-group and owner
-`workflow_dispatch`-on-main runs. Before making the
-check required, and whenever a main push failed to upload its receipt, seed
-main's tip:
+`kernel-runtime.yml` runs the HVF lane and selected KVM backend once per
+landed commit on `push` to `main`. Owner `workflow_dispatch` on `main` also
+runs both lanes to seed receipts. Neither pull requests, merge groups nor
+schedules run this workflow. The optional full-conformance `hvf-closure` job
+runs only on owner dispatch with its enable variable and dedicated runner.
+`ci.yml` retains its own PR, merge-group, push, schedule and dispatch
+triggers; only `ci-ok` is a merge requirement. The director owns pre-merge
+hardware evidence; the hardware run after landing is the backstop.
+
+On push, the hosted `hvf-gate` and `kvm-gate` jobs compare the landed commit's
+receipt with its first parent main commit's receipt (`git rev-parse HEAD^1`,
+not the push event's `before`, which may span several commits). They run the
+current landed main commit's trusted xtask, so changes to the gate apply on
+the first push that contains them. A lane only produces and uploads its
+receipt and never waits on hardware for a baseline. The hosted comparison
+waits up to 90 minutes for an in-progress parent run (60-second polls;
+110-minute job timeout). It never falls back to an older ancestor.
+
+A missing or cancelled parent run without a receipt, or an in-progress run
+that exhausts that wait, fails with a **No baseline** annotation and job
+summary. This is distinct from a NEW regression, and is never a silent pass.
+An existing failed receipt is still compared. Do not cancel main-push runs:
+each receipt is the next landed commit's baseline.
+
+Owner dispatch seeds the current main tip without comparing it to a parent:
 
 ```sh
 gh workflow run kernel-runtime.yml --repo carrick-sh/carrick --ref main
 ```
 
-The comparison runs in the hosted `hvf-gate`/`kvm-gate` jobs, never on the
-trusted hardware: a lane job only produces and uploads its receipt. The gate
-uses the live merge-queue base links, not commit parents, for the chain. It
-waits up to 90 minutes only when the terminal receipt-producing ancestor's
-run is still in progress (polled every 60 s; job timeout 110 min). A missing
-queue link for an unreceipted merge-group ancestor fails immediately. A
-terminal ancestor that finished without a receipt fails closed and names this
-reseed command.
-
-Merge groups always run in full: every hardware and hosted job executes
-unconditionally with no docs-only or hardware skip. The docs-only fast path
-is restricted to `pull_request` CI runs (where only unreferenced prose changed),
-and draft PRs skip expensive jobs while keeping cheap Linux checks.
+After a gap, this supplies a baseline for subsequent pushes; it does not
+retroactively turn an earlier No baseline outcome into a comparison.
+`Trusted hardware OK` requires both hardware lanes, and on push also both
+receipt comparisons. It remains visible after landing and does not gate
+merging.
 
 ### Retiring or renaming gated tests (`.github/retired-tests.toml`)
 
@@ -327,11 +308,10 @@ receipt lane, the candidate commit may include a PR-scoped
 `test = "<bin>::<test>"`, `reason`, `pr`, and optional
 `replaced_by = "<bin>::<test>"`. The binary and every test-path segment must
 match `[A-Za-z_][A-Za-z0-9_]*`; receipt matches always include the binary.
-Hosted `hvf-gate` and `kvm-gate` check out
-`github.event.merge_group.base_sha` so the gate binary itself always runs
-trusted base code; `ci-receipt gate` fetches `--candidate-sha` from `origin`
+Hosted `hvf-gate` and `kvm-gate` check out the landed main commit
+(`github.sha`) and resolve its first parent for the baseline; `ci-receipt gate` fetches `--candidate-sha` from `origin`
 and inspects the candidate tree's `.github/retired-tests.toml` alongside the
-selected baseline ancestor's tree. A declaration drops `missing:` only when the
+parent main commit's tree. A declaration drops `missing:` only when the
 retired test did not fail in the applicable receipt lane, is absent from the
 candidate's test sources, still existed in the base's test sources, and (when
 `replaced_by` is given) the replacement test started without failing in the
@@ -356,39 +336,8 @@ Stale entries (already absent in base source) are inert: they
 excuse nothing and appear as non-blocking `WARNING` lines in the gate summary.
 Remove these entries once `main`'s baseline receipt rolls past the rename;
 delete the file when no entries remain. Empty declaration files fail the gate.
-Because the hosted gate builds `carrick-xtask` from `base_sha`, any change to
-`ci-receipt gate` rolls out as soon as it lands on `main` and becomes the
-`base_sha` of subsequent merge groups.
-
-### Cumulative merge groups (#402)
-
-Both controllers check supersession in the shared `Github::vet` path,
-for reservations. Actual assignments retain ordinary admission checks and
-serve normally regardless of queue depth: withholding approval would make
-the job-start hook fail at its deadline. A shallower merge group is skipped
-while a deeper queued group contains it, or that successor's workflow passed.
-The proof requires a complete merge-queue listing, trusted heads, a pending
-or successful latest workflow run, and a GitHub comparison whose merge base
-is exactly the shallower SHA. The extra observation uses one page of at most
-100 workflow runs and at most five comparisons per vet. Missing, partial,
-failed or ambiguous depth observations preserve ordinary group service. Main
-pushes retain their per-SHA baseline receipts; only an unreceipted base
-producer is served while a group is pending.
-
-Superseded demand does not enter the durable refusal ledger: if the successor
-fails or leaves the queue, the shallower group can be served again. If a
-Contabo reservation becomes superseded during provisioning, its pre-JIT clone
-is released through the existing owned teardown path; registered or assigned
-runners retain their normal lifecycle. Supersession never cancels a workflow
-run or records a durable refusal, including during provisioning. Superseded
-provisioning returns normally without backoff or freezing. Cancelled deeper
-runs, rebuilt queues without a qualifying successor, and partial queue
-listings preserve ordinary service.
-
-The director must qualify HEADGREEN on the first live batch after deployment:
-a skipped group must resume when its successor fails, is cancelled or leaves
-the queue, and the deepest group's gate must reach a published ancestor
-receipt through skipped shallower groups.
+The hosted gate builds `carrick-xtask` from the landed main SHA, so gate
+changes apply on the first main push containing them.
 
 ## Lifecycle and recovery
 
@@ -452,8 +401,7 @@ lock joining and exit publication still determine the lock's lifetime.
 ## Not claimed
 
 This is trusted-workflow infrastructure, not an adversarial isolation
-boundary. Admitted jobs are code on main or in the merge queue from this
-repository's branches. They run as `carrick-ci`, which cannot write the
+boundary. Admitted jobs are code landed on this repository's main branch. They run as `carrick-ci`, which cannot write the
 runner tree, the toolchain, the hook binary, the policy or the hook script;
 its home and per-run runner root are recreated before every job.
 The JIT config is passed in the runner's environment; whether the runner

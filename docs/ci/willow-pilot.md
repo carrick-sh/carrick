@@ -62,7 +62,7 @@ is performed by the controller. Dispatch exactly:
 gh workflow run willow-pilot.yml --ref work/willow-pilot
 ```
 
-## Standing mode (merge queue)
+## Standing mode (main pushes and owner dispatch)
 
 The standing controller now runs on the Contabo host
 ([contabo-kvm.md](contabo-kvm.md)); Willow's stays stopped, because only one
@@ -70,12 +70,11 @@ controller may serve the `willow-kvm` labels. GCP ([gcp-kvm.md](gcp-kvm.md),
 which also covers switching) is the fallback.
 `ci-scaler standing` reuses this controller for `kernel-runtime.yml`'s
 `kvm-tests-willow` job (selected when `CARRICK_GCP_KVM` is not `true` or
-`CARRICK_KVM_BACKEND` is `willow`): merge groups into main, pushes to main and dispatches on
+`CARRICK_KVM_BACKEND` is `willow`): pushes to main and owner dispatches on
 main (`Admission::Standing`; see the
 [security review](willow-pilot-security-review.md#standing-admission-surface)).
 Before minting each runner it re-vets the reserved run (same admission and
-attempt; for a merge group, every pull request in the group must have its
-head in `carrick-sh/carrick`) and writes the guest's root-owned
+attempt and exact SHA) and writes the guest's root-owned
 `/etc/carrick-ci/policy` as `standing run=<id> attempt=<n> sha=<sha>`. That
 reservation admits the run the clone was minted for. It admits at most
 `--max-concurrency` clones (1 by default, never more than 2). Demand lists
@@ -84,40 +83,19 @@ doubling to 10 min) and never end the loop; the 80% CPU ceiling still stops
 it. A job whose clone closed without a job is served again, at most three
 times per job key.
 
-### Cumulative merge groups (#402)
+### Receipt chain
 
-Both controllers check supersession in the shared `Github::vet` path,
-for reservations. Actual assignments retain ordinary admission checks and
-serve normally regardless of queue depth: withholding approval would make
-the job-start hook fail at its deadline. A shallower merge group is skipped
-while a deeper queued group contains it, or that successor's workflow passed.
-The proof requires a complete merge-queue listing, trusted heads, a pending
-or successful latest workflow run, and a GitHub comparison whose merge base
-is exactly the shallower SHA. The extra observation uses one page of at most
-100 workflow runs and at most five comparisons per vet. Missing, partial,
-failed or ambiguous depth observations preserve ordinary service. Main pushes
-remain eligible and retain their per-SHA baseline receipts.
-
-Superseded demand does not enter the durable refusal ledger: if the successor
-fails or leaves the queue, the shallower group can be served again. If a
-Contabo reservation becomes superseded during provisioning, its pre-JIT clone
-is released through the existing owned teardown path; registered or assigned
-runners retain their normal lifecycle. Supersession never cancels a workflow
-run or records a durable refusal, including during provisioning. Superseded
-provisioning returns normally without backoff or freezing. Cancelled deeper
-runs, rebuilt queues without a qualifying successor, and partial queue
-listings preserve ordinary service.
-
-The director must qualify HEADGREEN on the first live batch after deployment:
-a skipped group must resume when its successor fails, is cancelled or leaves
-the queue, and the deepest group's baseline receipt dependencies must still
-resolve.
+Every landed commit runs once on push to main; no merge-group, PR or schedule
+runs are admitted. The hosted receipt gate compares against the first parent
+main commit's receipt and reports missing parents as a visible **No baseline**
+failure. Owner dispatch on main seeds receipts without a comparison. See
+[events and receipts](contabo-kvm.md#events-and-receipts).
 
 ### Actual assignments are re-vetted (#333)
 
 GitHub assigns a queued job to *any* idle runner with matching labels, not to
 the run a clone was minted for: a clone minted for a main push can receive a
-merge group's KVM job. The standing hook (`standing_hook_script`) therefore
+different main push's KVM job. The standing hook (`standing_hook_script`) therefore
 tries the reservation first and otherwise runs `admit-job --controller`, the
 same credential-free rendezvous as cloudmac ([mac-jit.md](mac-jit.md)):
 
@@ -128,15 +106,13 @@ same credential-free rendezvous as cloudmac ([mac-jit.md](mac-jit.md)):
 2. A dedicated assignment worker reads that request as root through the
    scoped guest agent, with a one-second timer between passes and under the same flock. It authenticates the job by this
    clone's runner id and the exact `willow-kvm` label set, re-vets the actual
-   run through `Github::vet_assignment` (ordinary admission without supersession), and fsyncs the actual job into the
+   run through `Github::vet_assignment` (main push or owner dispatch admission), and fsyncs the actual job into the
    ledger (`assigned`, `assigned_key`).
 3. Only then does it publish the root-owned `approved-policy`, bound to the
    actual run, attempt and SHA; the hook verifies it and starts the job. An
-   inadmissible assignment (another workflow, untrusted event or fork heads,
-   a merge group that left the queue) is recorded once in the ledger's
+   inadmissible assignment (another workflow, untrusted event, ref or repository) is recorded once in the ledger's
    refusal list and gets no approval, so the hook kills the session before
-   any step. A stale merge group's run is also cancelled, best effort: the
-   standing token's Actions read-only permission makes that a logged no-op.
+   any step.
 
 A clone assigned another job neither holds its reservation nor consumes one
 of its serves, so the reserved job is served by the next clone. The decision
@@ -175,7 +151,7 @@ read -rs WILLOW_GH_TOKEN   # paste the fine-grained token
 printf '%s\n' "$WILLOW_GH_TOKEN" | ssh root@willow 'IFS= read -r GH_TOKEN; export GH_TOKEN; export PATH=/root/carrick-ci/bin:$PATH; exec /root/carrick-ci/bin/carrick-xtask ci-scaler standing --runner-group-id 1'
 ```
 
-The merge-queue comparison runs in a hosted job, so guests need no `gh`. The pilot (`ci-scaler pilot`) writes `pilot
+The parent receipt comparison runs in a hosted job, so guests need no `gh`. The pilot (`ci-scaler pilot`) writes `pilot
 <sha>` to the same file and keeps its one-clone, one-job contract. Every
 budget, ownership, recovery and hook rule below applies to both modes.
 

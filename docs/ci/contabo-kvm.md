@@ -1,6 +1,6 @@
 # Contabo self-hosted KVM lane
 
-The merge queue's KVM lane runs on a throwaway JIT clone on the dedicated
+The trusted post-landing KVM lane runs on a throwaway JIT clone on the dedicated
 Contabo host (issue #287). This replaces the per-run GCP VMs
 ([gcp-kvm.md](gcp-kvm.md)), which remain as a fallback. The design,
 admission and teardown are the Willow standing controller's, unchanged
@@ -64,6 +64,28 @@ serve those labels, so Willow's stays stopped. To select the lane, set
 back to GCP, unset `CARRICK_KVM_BACKEND`, with `CARRICK_GCP_KVM=true`.
 Flip the variables only after a green `workflow_dispatch` on main through a
 Contabo clone.
+
+## Events and receipts
+
+`kernel-runtime.yml` runs `kvm-tests-willow` on each `push` to `main` and
+owner `workflow_dispatch` on `main`, when this backend is selected. The
+standing controller and job-start hook admit exactly those events for this
+workflow; merge groups, pull requests and schedules are refused. The HVF
+lane runs on the same events on cloudmac. The optional HVF full-conformance
+closure runs only on owner dispatch when enabled, on a separate runner.
+`ci.yml` continues running its own PR, merge-group, push, schedule and
+dispatch lanes; only `ci-ok` is required for merging. Pre-merge hardware
+evidence belongs to the director; these post-landing runs are the backstop.
+
+Every landed commit produces a per-SHA KVM receipt. On push, hosted
+`kvm-gate` compares it with the first parent main commit's receipt, using the
+current landed main xtask. It waits at most 90 minutes for an in-progress
+parent run, without holding a KVM clone. A missing parent receipt fails with
+a **No baseline** annotation and job summary, separate from NEW regressions;
+there is no fallback to older receipts. Owner dispatch seeds the current
+main tip without a parent comparison. Never cancel pending main pushes or
+displace them with newer pushes: each receipt is the next commit's baseline.
+See [baseline seeding](mac-jit.md#seeding-baselines).
 
 ## Host setup (root on Contabo)
 

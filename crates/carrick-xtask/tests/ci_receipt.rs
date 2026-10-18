@@ -166,7 +166,7 @@ fn run(event: &str, branch: &str, path: &str) -> serde_json::Value {
 }
 
 #[test]
-fn push_dispatch_on_main_and_merge_queue_runs_publish_baselines() {
+fn only_push_and_owner_dispatch_on_main_publish_baselines() {
     let sha = "b".repeat(40);
     let kernel = ".github/workflows/kernel-runtime.yml";
     assert!(trusted_baseline_run(&run("push", "main", kernel), &sha));
@@ -175,11 +175,8 @@ fn push_dispatch_on_main_and_merge_queue_runs_publish_baselines() {
         &run("workflow_dispatch", "main", kernel),
         &sha
     ));
-    assert!(trusted_baseline_run(
-        &run("merge_group", "gh-readonly-queue/main/pr-1-abc", kernel),
-        &sha
-    ));
     for rejected in [
+        run("merge_group", "gh-readonly-queue/main/pr-1-abc", kernel),
         run("workflow_dispatch", "work/x", kernel),
         run("pull_request", "main", kernel),
         run("push", "work/x", kernel),
@@ -215,13 +212,12 @@ fn baseline_waits_for_an_in_progress_base_run_and_fails_closed_when_finished() {
     let sha = "b".repeat(40);
     let one = format!("receipt-hvf-{sha}-1");
     let two = format!("receipt-hvf-{sha}-2");
-    let queue = "gh-readonly-queue/main/pr-1-abc";
     // The newest attempt of the newest trusted run wins.
     let found = baseline_decision(
         &[
             (listed(5, "completed", "push", "main"), artifacts(&[&one])),
             (
-                listed(9, "completed", "merge_group", queue),
+                listed(9, "completed", "workflow_dispatch", "main"),
                 artifacts(&[&one, &two, &format!("receipt-kvm-{sha}-3")]),
             ),
         ],
@@ -233,19 +229,19 @@ fn baseline_waits_for_an_in_progress_base_run_and_fails_closed_when_finished() {
         newest_receipt(&artifacts(&[&one, &two]), Lane::Hvf, &sha),
         Some((2, two))
     );
-    // Queue depth above one: the base entry's run has not uploaded yet.
+    // The parent main push has not uploaded yet.
     let pending = baseline_decision(
-        &[(
-            listed(9, "in_progress", "merge_group", queue),
-            artifacts(&[]),
-        )],
+        &[(listed(9, "in_progress", "push", "main"), artifacts(&[]))],
         Lane::Hvf,
         &sha,
     );
     assert_eq!(pending, Baseline::Pending);
     // Finished without a receipt: fail closed, never wait.
     let missing = baseline_decision(
-        &[(listed(9, "completed", "merge_group", queue), artifacts(&[]))],
+        &[(
+            listed(9, "completed", "workflow_dispatch", "main"),
+            artifacts(&[]),
+        )],
         Lane::Hvf,
         &sha,
     );
@@ -268,7 +264,7 @@ mod serial_host {
     use super::*;
 
     #[test]
-    fn deepest_group_uses_main_receipt_when_two_ancestors_were_superseded() {
+    fn parent_receipt_is_used_and_missing_parent_is_visible_without_ancestor_fallback() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -281,31 +277,24 @@ mod serial_host {
 import json, os, pathlib, shutil, sys
 main, head, middle = (os.environ[k] for k in ('CHAIN_MAIN', 'CHAIN_HEAD', 'CHAIN_MIDDLE'))
 args = sys.argv[1:]
-if args[:2] == ['api', 'graphql']:
-    if os.environ.get('CHAIN_DENY') == 'forbidden':
-        print(json.dumps({'errors': [{'type': 'FORBIDDEN', 'message': 'Resource not accessible by integration'}]}))
-        raise SystemExit(1)
-    if os.environ.get('CHAIN_DENY') == 'resource':
-        print(json.dumps({'errors': [{'message': 'Resource not accessible by integration'}]}))
-        raise SystemExit(0)
-    nodes = [
-        {'position': 1, 'baseCommit': {'oid': main}, 'headCommit': {'oid': head}},
-        {'position': 2, 'baseCommit': {'oid': head}, 'headCommit': {'oid': middle}},
-        {'position': 3, 'baseCommit': {'oid': middle}, 'headCommit': {'oid': os.environ['CHAIN_DEEP']}},
-    ]
-    print(json.dumps({'data': {'repository': {'mergeQueue': {'entries': {'pageInfo': {'hasNextPage': False}, 'nodes': nodes}}}}}))
-elif args[0] == 'api' and '/runs?head_sha=' in args[-1]:
+if args[0] == 'api' and '/runs?head_sha=' in args[-1]:
     sha = args[-1].split('head_sha=')[1].split('&')[0]
-    event = 'push' if sha == main else 'merge_group'
-    branch = 'main' if sha == main else 'gh-readonly-queue/main/pr-chain'
-    run = {'id': {main: 1, head: 2, middle: 3}[sha], 'status': 'completed',
+    event, branch = 'push', 'main'
+    if os.environ.get('PARENT_MISSING') == 'cancelled':
+        status = 'completed'
+    elif os.environ.get('PARENT_MISSING') == 'pending':
+        status = 'in_progress'
+    else:
+        status = 'completed'
+    run = {'id': {main: 1, head: 2, middle: 3}[sha], 'status': status,
            'event': event, 'head_branch': branch, 'head_sha': sha,
+           'conclusion': 'cancelled' if os.environ.get('PARENT_MISSING') == 'cancelled' else None,
            'path': '.github/workflows/kernel-runtime.yml',
            'repository': {'full_name': 'carrick-sh/carrick'},
            'head_repository': {'full_name': 'carrick-sh/carrick'}}
-    print(json.dumps({'workflow_runs': [run]}))
+    print(json.dumps({'workflow_runs': [] if os.environ.get('PARENT_MISSING') == 'absent' else [run]}))
 elif args[0] == 'api' and '/artifacts?' in args[-1]:
-    names = [f'receipt-hvf-{main}-1'] if '/runs/1/' in args[-1] else []
+    names = [f'receipt-hvf-{main}-1'] if '/runs/1/' in args[-1] and not os.environ.get('PARENT_MISSING') else []
     print(json.dumps({'artifacts': [{'name': name, 'expired': False} for name in names]}))
 elif args[:2] == ['run', 'download']:
     dest = pathlib.Path(args[args.index('--dir') + 1])
@@ -340,7 +329,7 @@ else:
         .unwrap();
 
         let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
-            .args(["ci-receipt", "gate", "--lane", "hvf", "--base-sha", &middle])
+            .args(["ci-receipt", "gate", "--lane", "hvf", "--base-sha", &main])
             .arg("--candidate-dir")
             .arg(&candidate_dir)
             .args(["--candidate-sha", &deep, "--run-attempt", "1"])
@@ -378,38 +367,69 @@ else:
             String::from_utf8_lossy(&output.stdout)
         );
 
-        for denial in ["forbidden", "resource"] {
-            let denied = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
-                .args(["ci-receipt", "gate", "--lane", "hvf", "--base-sha", &middle])
-                .arg("--candidate-dir")
-                .arg(&candidate_dir)
-                .args(["--candidate-sha", &deep, "--run-attempt", "1"])
-                .arg("--download-dir")
-                .arg(dir.path().join("denied-download"))
-                .arg("--base-tree")
-                .arg(dir.path())
-                .arg("--candidate-tree")
-                .arg(dir.path())
-                .args(["--wait-minutes", "0"])
-                .env(
-                    "PATH",
-                    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
-                )
-                .env("CHAIN_MAIN", &main)
-                .env("CHAIN_HEAD", &head)
-                .env("CHAIN_MIDDLE", &middle)
-                .env("CHAIN_DEEP", &deep)
-                .env("CHAIN_BASE_RECEIPT", &baseline_file)
-                .env("CHAIN_DENY", denial)
-                .output()
-                .unwrap();
-            assert!(!denied.status.success());
-            assert!(
-                String::from_utf8_lossy(&denied.stderr)
-                    .contains("merge queue GraphQL lookup denied (token scope?)"),
-                "{}",
-                String::from_utf8_lossy(&denied.stderr)
-            );
+        // A missing parent never falls back to an older receipt or GraphQL.
+        // Both lanes report a distinct non-success outcome, including summary.
+        for lane in ["hvf", "kvm"] {
+            let lane_value = if lane == "hvf" { Lane::Hvf } else { Lane::Kvm };
+            let artifact = candidate_dir.join(artifact_name(lane_value, &deep, 1));
+            std::fs::create_dir_all(&artifact).unwrap();
+            std::fs::write(
+                artifact.join("receipt.json"),
+                serde_json::to_vec(&candidate).unwrap(),
+            )
+            .unwrap();
+            for missing in ["absent", "cancelled", "pending"] {
+                let summary = dir.path().join(format!("summary-{lane}-{missing}.md"));
+                let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+                    .args(["ci-receipt", "gate", "--lane", lane, "--base-sha", &main])
+                    .arg("--candidate-dir")
+                    .arg(&candidate_dir)
+                    .args(["--candidate-sha", &deep, "--run-attempt", "1"])
+                    .arg("--download-dir")
+                    .arg(dir.path().join("missing-download"))
+                    .args(["--wait-minutes", "0"])
+                    .env(
+                        "PATH",
+                        format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+                    )
+                    .env("CHAIN_MAIN", &main)
+                    .env("CHAIN_HEAD", &head)
+                    .env("CHAIN_MIDDLE", &middle)
+                    .env("CHAIN_DEEP", &deep)
+                    .env("PARENT_MISSING", missing)
+                    .env("GITHUB_STEP_SUMMARY", &summary)
+                    .output()
+                    .unwrap();
+                assert!(!output.status.success(), "{lane} {missing}");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    stdout.contains(&format!(
+                        "::error title={} receipt gate: No baseline::",
+                        lane.to_uppercase()
+                    )),
+                    "{stdout}"
+                );
+                assert!(
+                    stderr.contains("no baseline: parent main commit"),
+                    "{stderr}"
+                );
+                assert!(
+                    !stdout.contains(" NEW"),
+                    "missing baseline is not a regression: {stdout}"
+                );
+                let summary = std::fs::read_to_string(summary).unwrap();
+                assert!(summary.contains("No baseline"), "{summary}");
+                assert!(summary.contains(&main), "{summary}");
+                assert!(
+                    summary.contains("No regression comparison was made"),
+                    "{summary}"
+                );
+                assert!(
+                    summary.contains("gh workflow run kernel-runtime.yml"),
+                    "{summary}"
+                );
+            }
         }
 
         // Verify `ci-receipt gate` fetches `candidate_sha` from `origin` and reads
@@ -457,14 +477,7 @@ else:
         git(&work, &["add", "."]);
         git(&work, &["commit", "-m", "cand"]);
         let cand_sha = git(&work, &["rev-parse", "HEAD"]);
-        git(
-            &work,
-            &[
-                "push",
-                "origin",
-                "HEAD:refs/heads/gh-readonly-queue/main/pr-583",
-            ],
-        );
+        git(&work, &["push", "origin", "HEAD:refs/heads/candidate"]);
         let checkout = dir.path().join("gate-checkout");
         git(
             dir.path(),

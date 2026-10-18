@@ -590,7 +590,8 @@ Chat, worker mailboxes, scratch notes and agent memory are not.
   runners (a non-admin `ci` user on carrick-m4), forks on hosted `macos-15`.
   Merge groups run only `macos-build` and `macos-clippy` as a skew check; push
   to main reruns the full suite on hosted macOS (#650). `kernel-runtime.yml` adds
-  the self-hosted HVF lane (cloudmac, merge queue only) and the KVM lane
+  the self-hosted HVF lane (cloudmac, push to main and owner dispatch) and the
+  KVM lane
   (self-hosted JIT clones on the Contabo host, `docs/ci/contabo-kvm.md`;
   GCP nested-KVM VMs as fallback, `docs/ci/gcp-kvm.md`). The
   signed gate stays on cloudmac. Land on a failure-set diff against main

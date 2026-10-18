@@ -77,8 +77,5 @@ fn hosted_caches_keep_profiles_compiler_data_and_bootstrap_artifacts() {
                 .is_some_and(|s| s.starts_with("Swatinem/rust-cache@"))
         })
         .unwrap();
-    assert_eq!(
-        cache["with"]["save-if"].as_str(),
-        Some("${{ github.event_name != 'merge_group' }}")
-    );
+    assert!(cache["with"]["save-if"].is_badvalue());
 }

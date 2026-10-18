@@ -1173,13 +1173,6 @@ fn reconcile_one(
                     // Preserve its actual preparation state for assignment and
                     // drain checks, which may discover a job already running.
                     update(ledger, &row, path)?;
-                    if retire_superseded_reservation(pve, gh, ledger, &mut row, dir, path, &error)?
-                    {
-                        return Ok(true);
-                    }
-                    if matches!(error, ScalerError::SupersededMergeGroup { .. }) {
-                        return Ok(false);
-                    }
                     return Err(error);
                 }
                 return Ok(false);
@@ -1799,10 +1792,9 @@ fn select_demand(
     path: &Path,
     demand: Vec<JobKey>,
     vet: impl FnMut(JobKey) -> Result<JobKey, ScalerError>,
-    cancel: impl FnMut(RunId) -> Result<(), ScalerError>,
 ) -> Result<Option<JobKey>, ScalerError> {
     ledger.refresh()?;
-    assignment::admit_demand(ledger, path, demand, vet, cancel)
+    assignment::admit_demand(ledger, path, demand, vet)
 }
 
 fn reserve_admitted_clone(
@@ -1845,13 +1837,9 @@ fn admit_one(
     capacity: (Concurrency, &mut CloneLease),
 ) -> Result<(), ScalerError> {
     let (limit, clone_lease) = capacity;
-    let Some(job) = select_demand(
-        ledger,
-        path,
-        gh.demand(approval.1, &LABELS)?,
-        |job| gh.vet(approval.1, job).map(|_| job),
-        |run| gh.cancel_run(run),
-    )?
+    let Some(job) = select_demand(ledger, path, gh.demand(approval.1, &LABELS)?, |job| {
+        gh.vet(approval.1, job).map(|_| job)
+    })?
     else {
         return Ok(());
     };
@@ -1874,59 +1862,10 @@ fn admit_one(
     if let Err(error) = provision(pve, gh, ledger, &mut row, dir, path, approval) {
         row.failure = Some(error.to_string());
         update(ledger, &row, path)?;
-        if retire_superseded_reservation(pve, gh, ledger, &mut row, dir, path, &error)? {
-            clone_lease.release_if_idle(ledger);
-            return Ok(());
-        }
-        let outcome = provision_failure(ledger, job, error, path, |run| gh.cancel_run(run));
         clone_lease.release_if_idle(ledger);
-        return outcome;
+        return Err(error);
     }
     Ok(())
-}
-
-fn retire_superseded_reservation(
-    pve: &Pve,
-    gh: &Github,
-    ledger: &mut Ledger,
-    row: &mut Record,
-    dir: &Path,
-    path: &Path,
-    error: &ScalerError,
-) -> Result<bool, ScalerError> {
-    if let ScalerError::SupersededMergeGroup { successor } = error
-        && superseded_before_jit(row)
-    {
-        assignment::skip_superseded(row.key, successor);
-        // Booting precedes the write-ahead Registered state and JIT POST.
-        // No runner can hold this reservation: use the existing ownership-
-        // checked, durably licensed teardown instead of the idle timeout.
-        return cleanup(pve, gh, ledger, row, dir, path, Assignment::Unassigned);
-    }
-    Ok(false)
-}
-
-fn superseded_before_jit(row: &Record) -> bool {
-    row.state == State::Booting
-        && row.runner.is_none()
-        && row.assigned.is_none()
-        && row.assigned_key.is_none()
-}
-
-fn provision_failure(
-    ledger: &mut Ledger,
-    job: JobKey,
-    error: ScalerError,
-    path: &Path,
-    mut cancel: impl FnMut(RunId) -> Result<(), ScalerError>,
-) -> Result<(), ScalerError> {
-    if matches!(error, ScalerError::SupersededMergeGroup { .. }) {
-        Ok(())
-    } else if matches!(error, ScalerError::StaleMergeGroup) {
-        assignment::refuse(ledger, job, &error, path, &mut cancel)
-    } else {
-        Err(error)
-    }
 }
 
 #[cfg(test)]
@@ -2110,98 +2049,7 @@ mod tests {
     }
 
     #[test]
-    fn superseded_during_provision_releases_only_a_pre_jit_reservation() {
-        let mut row = row();
-        row.state = State::Booting;
-        assert!(superseded_before_jit(&row));
-        row.runner = Some(RunnerId(99));
-        assert!(!superseded_before_jit(&row));
-        row.runner = None;
-        row.assigned = Some(row.key.job);
-        assert!(!superseded_before_jit(&row));
-        row.assigned = None;
-        row.assigned_key = Some(row.key);
-        assert!(!superseded_before_jit(&row));
-        row.assigned_key = None;
-        for state in [
-            State::Reserved,
-            State::Cloning,
-            State::Registered,
-            State::Running,
-            State::Reaping,
-            State::Destroyed,
-        ] {
-            row.state = state;
-            assert!(!superseded_before_jit(&row));
-        }
-    }
-
-    #[test]
-    fn superseded_provisioning_is_ok_without_durable_refusal() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ledger.json");
-        let mut ledger = Ledger::default();
-        let job = JobKey {
-            run: RunId(1),
-            attempt: 1,
-            job: JobId(1),
-        };
-        assert!(
-            provision_failure(
-                &mut ledger,
-                job,
-                ScalerError::SupersededMergeGroup {
-                    successor: "deeper".into()
-                },
-                &path,
-                |_| panic!("supersession must never cancel")
-            )
-            .is_ok()
-        );
-        assert!(!ledger.served(job));
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn ci_scaler_standing_group_that_expires_during_provision_does_not_freeze() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ledger.json");
-        let mut ledger = Ledger::default();
-        let job = JobKey {
-            run: RunId(1),
-            attempt: 1,
-            job: JobId(1),
-        };
-        let mut cancelled = Vec::new();
-        assert!(
-            provision_failure(
-                &mut ledger,
-                job,
-                ScalerError::StaleMergeGroup,
-                &path,
-                |run| {
-                    cancelled.push(run);
-                    Ok(())
-                }
-            )
-            .is_ok()
-        );
-        assert_eq!(cancelled, vec![job.run]);
-        assert!(Ledger::load(&path).unwrap().served(job));
-        assert!(
-            provision_failure(
-                &mut ledger,
-                job,
-                ScalerError::External("PVE failure"),
-                &path,
-                |_| Ok(())
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn ci_scaler_standing_stale_demand_is_cancelled_before_reservation() {
+    fn ci_scaler_standing_inadmissible_demand_is_refused_before_reservation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.json");
         let mut ledger = Ledger::default();
@@ -2215,25 +2063,14 @@ mod tests {
             attempt: 1,
             job: JobId(2),
         };
-        let mut cancelled = Vec::new();
-        let selected = select_demand(
-            &mut ledger,
-            &path,
-            vec![stale, live],
-            |key| {
-                if key == stale {
-                    Err(ScalerError::StaleMergeGroup)
-                } else {
-                    Ok(key)
-                }
-            },
-            |run| {
-                cancelled.push(run);
-                Ok(())
-            },
-        );
+        let selected = select_demand(&mut ledger, &path, vec![stale, live], |key| {
+            if key == stale {
+                Err(ScalerError::Guard("event is not admitted"))
+            } else {
+                Ok(key)
+            }
+        });
         assert_eq!(selected.unwrap(), Some(live));
-        assert_eq!(cancelled, vec![stale.run]);
         assert!(ledger.rows.is_empty());
         assert!(Ledger::load(&path).unwrap().served(stale));
     }
@@ -2315,11 +2152,9 @@ mod tests {
         // The real hook rendezvous writes run B's request (and then waits).
         let b = JobContext {
             repository: REPOSITORY.into(),
-            event: "merge_group".into(),
-            workflow_ref: format!(
-                "{REPOSITORY}/{KERNEL_RUNTIME_WORKFLOW}@refs/heads/gh-readonly-queue/main/pr-328-x"
-            ),
-            git_ref: "refs/heads/gh-readonly-queue/main/pr-328-x".into(),
+            event: "workflow_dispatch".into(),
+            workflow_ref: format!("{REPOSITORY}/{KERNEL_RUNTIME_WORKFLOW}@refs/heads/main"),
+            git_ref: "refs/heads/main".into(),
             sha: "b".repeat(40),
             run_id: 20,
             run_attempt: 1,

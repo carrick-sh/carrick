@@ -10,6 +10,12 @@ JIT runner, now served from the Contabo host
 ([contabo-kvm.md](contabo-kvm.md), design in [willow-pilot.md](willow-pilot.md)),
 is the primary backend once selected; GCP stays as the fallback.
 
+Both backends run only on pushes to main and owner dispatches on main;
+`kernel-runtime.yml` has no merge-group, PR or schedule trigger. Push receipt
+comparisons use the first parent main commit's receipt; missing parents fail
+visibly as **No baseline**, separate from regressions. Dispatch seeds the
+current main tip without comparing. See [events and receipts](contabo-kvm.md#events-and-receipts).
+
 This is trusted-ref CI infrastructure for an experimental project, not an
 adversarial isolation boundary.
 
@@ -39,7 +45,8 @@ upload-artifact receipt-kvm-<sha>-<attempt>  (unchanged name; kvm-gate reads it)
 
 The script exits 0 whenever a receipt was collected. Test failures are
 recorded in the receipt and judged by the hosted `kvm-gate` job against the
-merge-group base, exactly as with Willow. It exits non-zero on a `FAILED`
+first parent main commit on push, exactly as with Willow. Owner dispatch
+seeds a receipt without comparison. It exits non-zero on a `FAILED`
 marker (VM setup failed before `accept` ran), a timeout (default 150 min), a
 VM that disappears before writing a marker, or `DONE` without a receipt.
 
@@ -74,8 +81,7 @@ script header lists every input.
   `[fd20:ce::254]:80`), so test code cannot mint the VM account's token; DNS
   via the metadata resolver still works. Only the root startup script
   uploads.
-- **Exact SHA.** The VM fetches `GITHUB_SHA` (merge-group SHAs are fetchable
-  by hash while the queue branch exists), checks it out detached, and
+- **Exact SHA.** The VM fetches the landed `GITHUB_SHA`, checks it out detached, and
   verifies `HEAD` before building. The toolchain comes from that commit's
   `rust-toolchain.toml`; `rustup-init` is checksum-pinned to the same hash
   as the Willow template (`scripts/ci/build-template-debian.sh`).
@@ -98,7 +104,7 @@ script header lists every input.
   `CARRICK_GCP_KVM` to anything but `true` to stop new VMs (the lane falls
   back to Willow if `CARRICK_SELF_HOSTED_KVM` is `true`).
 - The receipt bucket has a 14-day lifecycle rule.
-- Concurrent merge-queue entries each create a VM. The regional N2 vCPU
+- Concurrent main pushes each create a VM. The regional N2 vCPU
   quota bounds concurrency; a quota error fails the job rather than retrying
   other zones (quota is regional, capacity is zonal).
 
