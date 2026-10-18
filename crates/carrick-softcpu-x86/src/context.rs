@@ -279,6 +279,8 @@ impl SoftCpuContext {
             cpl: 3,
             pkru: 0,
             xcr0: 0x3,
+            // EM stays clear for SSE data operations. CPUID.FPU remains clear:
+            // x87 instructions are refused independently of this control bit.
             cr0: 0x8005_0033,
             cr2: 0,
             cr3: 0,

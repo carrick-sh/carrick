@@ -325,43 +325,18 @@ impl SoftCpu {
                 self.ctx.rip = resume;
                 Ok(SoftCpuExit::Continue { next_rip: resume })
             }
-            SensitiveOp::Rdpkru | SensitiveOp::Wrpkru | SensitiveOp::Xgetbv => {
-                let bad_rcx = (self.ctx.gpr[reg::RCX] as u32) != 0;
-                let bad_rdx =
-                    matches!(op, SensitiveOp::Wrpkru) && (self.ctx.gpr[reg::RDX] as u32) != 0;
-                if bad_rcx || bad_rdx {
-                    return self.raise(X86Exception::general_protection(va, 0));
-                }
-                match op {
-                    SensitiveOp::Rdpkru => {
-                        self.ctx.gpr[reg::RAX] = u64::from(self.ctx.pkru);
-                        self.ctx.gpr[reg::RDX] = 0;
-                    }
-                    SensitiveOp::Wrpkru => self.ctx.pkru = self.ctx.gpr[reg::RAX] as u32,
-                    _ => {
-                        self.ctx.gpr[reg::RAX] = self.ctx.xcr0 & 0xffff_ffff;
-                        self.ctx.gpr[reg::RDX] = self.ctx.xcr0 >> 32;
-                    }
-                }
-                self.ctx.rip = resume;
-                Ok(SoftCpuExit::Continue { next_rip: resume })
+            SensitiveOp::Rdpkru
+            | SensitiveOp::Wrpkru
+            | SensitiveOp::Rdtscp
+            | SensitiveOp::Xgetbv => {
+                // These extensions are absent from this layer's CPUID/CR4 view.
+                self.raise(X86Exception::invalid_opcode(va))
             }
-            SensitiveOp::Rdtsc | SensitiveOp::Rdtscp => {
-                // SAFETY: TSC and LFENCE are baseline x86_64 instructions;
-                // no host RDTSCP extension is required or exposed.
-                let tsc = unsafe {
-                    if matches!(op, SensitiveOp::Rdtscp) {
-                        core::arch::x86_64::_mm_lfence();
-                        core::arch::x86_64::_rdtsc()
-                    } else {
-                        core::arch::x86_64::_rdtsc()
-                    }
-                };
+            SensitiveOp::Rdtsc => {
+                // SAFETY: TSC is a baseline x86_64 instruction advertised by CPUID.
+                let tsc = unsafe { core::arch::x86_64::_rdtsc() };
                 self.ctx.gpr[reg::RAX] = tsc & 0xffff_ffff;
                 self.ctx.gpr[reg::RDX] = tsc >> 32;
-                if matches!(op, SensitiveOp::Rdtscp) {
-                    self.ctx.gpr[reg::RCX] = 0;
-                }
                 self.ctx.rip = resume;
                 Ok(SoftCpuExit::Continue { next_rip: resume })
             }
@@ -390,9 +365,10 @@ impl SoftCpu {
 }
 
 /// Fixed Level 0 view, independent of the host. Baseline integer/SSE2 state,
-/// no XSAVE image helpers yet; no AVX, monitor, INVPCID, XSAVES,
+/// no x87 or FXSAVE/XSAVE image helpers yet; no AVX, monitor, INVPCID, XSAVES,
 /// RDPID, CET, or other host extensions. Native admission remains a separate
 /// instruction-level allowlist: Level 0 is deliberately a partial ISA.
+/// CR0.EM=0 permits the admitted SSE subset; CPUID.FPU=0 promises no x87.
 fn emulate_pinned_cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
     match (leaf, subleaf) {
         (0, _) => (
@@ -405,7 +381,7 @@ fn emulate_pinned_cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
             0x0000_0663,
             0,
             0,
-            (1 << 4) | (1 << 8) | (1 << 15) | (1 << 24) | (1 << 25) | (1 << 26),
+            (1 << 4) | (1 << 8) | (1 << 15) | (1 << 25) | (1 << 26),
         ),
         (0x0d, 0) => (0, 0, 0, 0),
         (0x0d, 1) => (0, 0, 0, 0),

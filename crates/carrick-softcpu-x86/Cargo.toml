@@ -16,8 +16,5 @@ carrick-softmmu = { path = "../carrick-softmmu" }
 iced-x86 = { workspace = true }
 libc = { workspace = true }
 
-[dev-dependencies]
-goblin = { workspace = true }
-
 [package.metadata.carrick.test-lanes]
 softcpu_level0 = { lane = "host", reason = "x86_64-only (#![cfg(target_arch = \"x86_64\")]); runs in the VM-free host lane on x86_64" }
