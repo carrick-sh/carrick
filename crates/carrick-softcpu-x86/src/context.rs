@@ -86,6 +86,9 @@ pub const CTX_TLB_WRITE_OFF: usize = CTX_TLB_READ_OFF + SoftTlb::WRITE_PLANE_OFF
 #[repr(u8)]
 pub enum X86ExceptionVector {
     DivideError = 0,
+    Breakpoint = 3,
+    SimdFloatingPoint = 19,
+    X87FloatingPoint = 16,
     InvalidOpcode = 6,
     GeneralProtection = 13,
     PageFault = 14,
@@ -142,6 +145,9 @@ pub struct BounceWriteback {
     pub len1: usize,
 }
 
+/// Fixed architectural MXCSR mask: DAZ is optional on x86_64 and is not exposed.
+pub const GUEST_MXCSR_MASK: u32 = 0x0000_ffbf;
+
 /// Aligned 512-byte FXSAVE area (`fxsave64`/`fxrstor64` require 16-byte alignment).
 #[repr(C, align(16))]
 #[derive(Clone, Debug)]
@@ -152,6 +158,7 @@ impl Default for FxsaveArea {
         let mut bytes = [0u8; 512];
         bytes[0..2].copy_from_slice(&0x037Fu16.to_le_bytes());
         bytes[24..28].copy_from_slice(&0x1F80u32.to_le_bytes());
+        bytes[28..32].copy_from_slice(&GUEST_MXCSR_MASK.to_le_bytes());
         Self(bytes)
     }
 }
@@ -196,6 +203,9 @@ pub struct SoftCpuContext {
     pub active_mem_ptr: Option<NonNull<()>>,
     pub active_translate_fn: Option<ActiveTranslateFn>,
     pub active_block_insns: Vec<(u64, Instruction)>,
+    pub host_fxsave: FxsaveArea,
+    pub helper_resume: u64,
+    pub virt_rsp_spill: u64,
 }
 
 const _: () = {
@@ -252,7 +262,7 @@ impl SoftCpuContext {
             walker: SoftWalker::new(),
             cpl: 3,
             pkru: 0,
-            xcr0: 0x7,
+            xcr0: 0x3,
             cr0: 0x8005_0033,
             cr2: 0,
             cr3: 0,
@@ -264,6 +274,9 @@ impl SoftCpuContext {
             active_mem_ptr: None,
             active_translate_fn: None,
             active_block_insns: Vec::new(),
+            host_fxsave: FxsaveArea::default(),
+            helper_resume: 0,
+            virt_rsp_spill: 0,
         };
         ctx.sync_tlb_tag_bits();
         ctx
@@ -277,11 +290,8 @@ impl SoftCpuContext {
 
     #[inline]
     #[must_use]
-    pub const fn root_gpa(&self) -> RootGpa {
-        match RootGpa::page_aligned(FrameGpa::new(self.cr3 & SOFT_TLB_PAGE_MASK)) {
-            Some(root) => root,
-            None => unreachable!(),
-        }
+    pub const fn root_gpa(&self) -> Option<RootGpa> {
+        RootGpa::page_aligned(FrameGpa::new(self.cr3 & SOFT_TLB_PAGE_MASK))
     }
 
     #[inline]
@@ -401,7 +411,10 @@ pub extern "sysv64" fn softcpu_mem_slow_path(
     let insn_va = ctx.block_start_va.wrapping_add(u64::from(insn_offset));
     ctx.bounce_active = 0;
 
-    let size = size.clamp(1, 64);
+    if size == 0 || size > ctx.bounce_buf.len() {
+        record_exception(ctx, X86Exception::invalid_opcode(insn_va));
+        return 0;
+    }
     let last_va = guest_va.wrapping_add((size - 1) as u64);
     if !is_canonical_va(guest_va)
         || !is_canonical_va(last_va)
@@ -456,9 +469,12 @@ pub extern "sysv64" fn softcpu_mem_slow_path(
             len1,
         };
         ctx.bounce_active = 1;
+        if !needs_read {
+            read_ptrs = (w0, w1);
+        }
     }
 
-    if needs_read {
+    {
         // SAFETY: `read_ptrs.0` has `len0` valid bytes and `read_ptrs.1` has `len1` valid bytes.
         unsafe {
             std::ptr::copy_nonoverlapping(read_ptrs.0, ctx.bounce_buf.as_mut_ptr(), len0);
@@ -500,6 +516,7 @@ pub extern "sysv64" fn softcpu_step_complex(ctx: &mut SoftCpuContext, insn_idx: 
         record_exception(ctx, X86Exception::invalid_opcode(ctx.rip));
         return 0;
     };
+    ctx.fxsave.0[28..32].copy_from_slice(&GUEST_MXCSR_MASK.to_le_bytes());
     match step_complex_inner(ctx, &insn, insn_va) {
         Ok(()) => 1,
         Err(exc) => {
@@ -580,6 +597,7 @@ fn step_complex_inner(
             ctx.gpr[reg::RSP] = rsp.wrapping_sub(alloc);
             Ok(())
         }
+        Mnemonic::Maskmovq | Mnemonic::Maskmovdqu => step_maskmov(ctx, insn, insn_va),
         Mnemonic::Xlatb => {
             let addr = ctx.gpr[reg::RBX].wrapping_add(ctx.gpr[reg::RAX] & 0xff);
             let b = read_int(ctx, addr, 1, insn_va)?;
@@ -589,6 +607,58 @@ fn step_complex_inner(
         m if insn.is_string_instruction() => step_string_op(ctx, insn, m, insn_va),
         _ => Err(X86Exception::invalid_opcode(insn_va)),
     }
+}
+
+fn step_maskmov(ctx: &mut SoftCpuContext, insn: &Instruction, ip: u64) -> Result<(), X86Exception> {
+    let regs: Vec<_> = (0..insn.op_count())
+        .filter(|&i| insn.op_kind(i) == OpKind::Register)
+        .map(|i| insn.op_register(i))
+        .collect();
+    let [data_reg, mask_reg] = regs.as_slice() else {
+        return Err(X86Exception::invalid_opcode(ip));
+    };
+    let width = insn.memory_size().size();
+    let read_vector = |r: Register| {
+        if r.is_xmm() {
+            ctx.read_xmm(r.number()).to_le_bytes()
+        } else {
+            let off = 32 + r.number() * 16;
+            let mut bytes = [0; 16];
+            bytes[..8].copy_from_slice(&ctx.fxsave.0[off..off + 8]);
+            bytes
+        }
+    };
+    let (data, mask) = (read_vector(*data_reg), read_vector(*mask_reg));
+    let mut addr = if (0..insn.op_count()).any(|i| insn.op_kind(i) == OpKind::MemorySegEDI) {
+        ctx.gpr[reg::RDI] as u32 as u64
+    } else {
+        ctx.gpr[reg::RDI]
+    };
+    addr = addr.wrapping_add(match insn.segment_prefix() {
+        Register::FS => ctx.fs_base,
+        Register::GS => ctx.gs_base,
+        _ => 0,
+    });
+    let mut destinations = [std::ptr::null_mut(); 16];
+    for i in 0..width {
+        if mask[i] & 0x80 != 0 {
+            let va = addr.wrapping_add(i as u64);
+            if !is_canonical_va(va) {
+                return Err(X86Exception::general_protection(ip, 0));
+            }
+            destinations[i] = translate_active(ctx, va, SoftAccessKind::Write)
+                .map_err(|pf| X86Exception::page_fault(ip, pf.error_code, pf.cr2))?;
+        }
+    }
+    for i in 0..width {
+        if !destinations[i].is_null() {
+            // SAFETY: each selected byte was authenticated for writing above.
+            unsafe {
+                destinations[i].write(data[i]);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn walk_active_span(
@@ -926,37 +996,173 @@ struct GatewayTrampolines {
     complex_step_shim: u64,
 }
 
-const GATEWAY_TEMPLATE: &[u8; 916] = b"\
-\x55\x53\x41\x54\x41\x55\x41\x56\x41\x57\x48\x83\xEC\x08\x49\x89\xFF\x49\x89\xA7\xB0\x00\x00\x00\x49\x0F\xAE\x8F\x60\x01\x00\x00\x49\x8B\x87\x88\x00\x00\x00\x48\x25\xFF\xFE\xFB\xFF\x50\x9D\x49\x8B\x07\x49\x8B\x4F\x08\x49\x8B\x57\x10\x49\x8B\x5F\x18\x49\x8B\x67\x20\x49\x8B\x6F\x28\x49\x8B\x77\x30\x49\x8B\x7F\x38\x4D\x8B\x47\x40\x4D\x8B\x4F\x48\x4D\x8B\x57\x50\x4D\x8B\x5F\x58\x4D\x8B\
-\x67\x60\x4D\x8B\x6F\x68\x41\xFF\xA7\xB8\x00\x00\x00\x49\x89\x07\x49\x89\x4F\x08\x49\x89\x57\x10\x49\x89\x5F\x18\x49\x89\x67\x20\x49\x89\x6F\x28\x49\x89\x77\x30\x49\x89\x7F\x38\x4D\x89\x47\x40\x4D\x89\x4F\x48\x4D\x89\x57\x50\x4D\x89\x5F\x58\x4D\x89\x67\x60\x4D\x89\x6F\x68\x49\x8B\xA7\xB0\x00\x00\x00\x9C\x58\x49\x8B\x8F\x88\x00\x00\x00\x48\x81\xE1\x00\x02\x04\x00\x48\x25\xFF\xFD\xFB\
-\xFF\x48\x09\xC8\x49\x89\x87\x88\x00\x00\x00\x49\x0F\xAE\x87\x60\x01\x00\x00\x49\x8B\x87\xC0\x00\x00\x00\x48\x83\xC4\x08\x41\x5F\x41\x5E\x41\x5D\x41\x5C\x5B\x5D\xC3\x49\x89\x57\x10\x49\x89\x5F\x18\x49\x89\x67\x20\x49\x89\x6F\x28\x49\x89\x77\x30\x49\x89\x7F\x38\x4D\x89\x47\x40\x4D\x89\x4F\x48\x4D\x89\x57\x50\x4D\x89\x5F\x58\x4D\x89\x67\x60\x4D\x89\x6F\x68\x49\x8B\x97\xD0\x00\x00\x00\
-\x49\x89\x17\x49\x8B\x97\xD8\x00\x00\x00\x49\x89\x57\x08\x49\x8B\xA7\xB0\x00\x00\x00\x4C\x89\xFF\x4C\x89\xF6\x48\x89\xC2\x48\x89\xCB\x41\x8B\x87\xF0\x00\x00\x00\x04\x7F\x9E\x9C\x58\x49\x8B\x8F\x88\x00\x00\x00\x48\x81\xE1\x00\x02\x04\x00\x48\x25\xFF\xFD\xFB\xFF\x48\x09\xC8\x49\x89\x87\x88\x00\x00\x00\x49\x0F\xAE\x87\x60\x01\x00\x00\x48\xB8\x11\x11\x11\x11\x11\x11\x11\x11\xFF\xD0\x48\
-\x85\xC0\x0F\x84\x4B\xFF\xFF\xFF\x49\x89\xC6\x49\x0F\xAE\x8F\x60\x01\x00\x00\x48\x89\xD9\x49\x8B\x57\x10\x49\x8B\x5F\x18\x49\x8B\x67\x20\x49\x8B\x6F\x28\x49\x8B\x77\x30\x49\x8B\x7F\x38\x4D\x8B\x47\x40\x4D\x8B\x4F\x48\x4D\x8B\x57\x50\x4D\x8B\x5F\x58\x4D\x8B\x67\x60\x4D\x8B\x6F\x68\xFF\xE1\x49\x89\x57\x10\x49\x89\x5F\x18\x49\x89\x67\x20\x49\x89\x6F\x28\x49\x89\x77\x30\x49\x89\x7F\x38\
-\x4D\x89\x47\x40\x4D\x89\x4F\x48\x4D\x89\x57\x50\x4D\x89\x5F\x58\x4D\x89\x67\x60\x4D\x89\x6F\x68\x49\x8B\xA7\xB0\x00\x00\x00\x9C\x58\x49\x8B\x97\x88\x00\x00\x00\x48\x81\xE2\x00\x02\x04\x00\x48\x25\xFF\xFD\xFB\xFF\x48\x09\xD0\x49\x89\x87\x88\x00\x00\x00\x48\x89\xCB\x49\x0F\xAE\x87\x60\x01\x00\x00\x4C\x89\xFF\x48\xB8\x22\x22\x22\x22\x22\x22\x22\x22\xFF\xD0\x49\x0F\xAE\x8F\x60\x01\x00\
-\x00\x49\x89\x9F\xE8\x00\x00\x00\x49\x8B\x87\x88\x00\x00\x00\x48\x25\xFF\xFE\xFB\xFF\x50\x9D\x49\x8B\x87\xD0\x00\x00\x00\x49\x8B\x8F\xD8\x00\x00\x00\x49\x8B\x57\x10\x49\x8B\x5F\x18\x49\x8B\x67\x20\x49\x8B\x6F\x28\x49\x8B\x77\x30\x49\x8B\x7F\x38\x4D\x8B\x47\x40\x4D\x8B\x4F\x48\x4D\x8B\x57\x50\x4D\x8B\x5F\x58\x4D\x8B\x67\x60\x4D\x8B\x6F\x68\x41\xFF\xA7\xE8\x00\x00\x00\x49\x89\x57\x10\
-\x49\x89\x5F\x18\x49\x89\x67\x20\x49\x89\x6F\x28\x49\x89\x77\x30\x49\x89\x7F\x38\x4D\x89\x47\x40\x4D\x89\x4F\x48\x4D\x89\x57\x50\x4D\x89\x5F\x58\x4D\x89\x67\x60\x4D\x89\x6F\x68\x49\x8B\x97\xD0\x00\x00\x00\x49\x89\x17\x49\x8B\x97\xD8\x00\x00\x00\x49\x89\x57\x08\x49\x8B\xA7\xB0\x00\x00\x00\x4C\x89\xFF\x48\x89\xC6\x48\x89\xCB\x41\x8B\x87\xF0\x00\x00\x00\x04\x7F\x9E\x9C\x58\x49\x8B\x8F\
-\x88\x00\x00\x00\x48\x81\xE1\x00\x02\x04\x00\x48\x25\xFF\xFD\xFB\xFF\x48\x09\xC8\x49\x89\x87\x88\x00\x00\x00\x49\x0F\xAE\x87\x60\x01\x00\x00\x48\xB8\x33\x33\x33\x33\x33\x33\x33\x33\xFF\xD0\x48\x85\xC0\x0F\x84\x9B\xFD\xFF\xFF\x49\x0F\xAE\x8F\x60\x01\x00\x00\x49\x89\x9F\xE8\x00\x00\x00\x49\x8B\x87\x88\x00\x00\x00\x48\x25\xFF\xFE\xFB\xFF\x50\x9D\x49\x8B\x07\x49\x8B\x4F\x08\x49\x8B\x57\
-\x10\x49\x8B\x5F\x18\x49\x8B\x67\x20\x49\x8B\x6F\x28\x49\x8B\x77\x30\x49\x8B\x7F\x38\x4D\x8B\x47\x40\x4D\x8B\x4F\x48\x4D\x8B\x57\x50\x4D\x8B\x5F\x58\x4D\x8B\x67\x60\x4D\x8B\x6F\x68\x41\xFF\xA7\xE8\x00\x00\x00";
+// Gateway code is built with named context offsets and branch relocations, so
+// changing the ABI cannot silently leave stale offsets inside an opaque blob.
+// RSP always belongs to the host. Guest RSP lives only in ctx.gpr[RSP] and is
+// virtualized by the emitter; asynchronous host signals can use the host stack.
+fn gateway_image() -> (Vec<u8>, [usize; 5]) {
+    let mut code = Vec::new();
+    let mut offsets = [0; 5];
+    code.extend_from_slice(&[
+        0x55, 0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xec, 8,
+    ]);
+    code.extend_from_slice(&[0x49, 0x89, 0xff]); // r15 = ctx
+    gw_store(&mut code, 4, offset_of!(SoftCpuContext, host_rsp));
+    gw_fx(&mut code, false, offset_of!(SoftCpuContext, host_fxsave));
+    gw_restore_guest(&mut code);
+    gw_jump_ctx(&mut code, offset_of!(SoftCpuContext, entry_exec_addr));
+
+    offsets[1] = code.len();
+    gw_save_guest(&mut code, false, false);
+    gw_restore_host(&mut code);
+    let host_return = code.len();
+    gw_load(&mut code, 0, CTX_EXIT_REASON_OFF);
+    code.extend_from_slice(&[
+        0x48, 0x83, 0xc4, 8, 0x41, 0x5f, 0x41, 0x5e, 0x41, 0x5d, 0x41, 0x5c, 0x5b, 0x5d, 0xc3,
+    ]);
+
+    for (slot, helper, from_probe, from_lahf) in [
+        (
+            2,
+            softcpu_mem_slow_path as *const () as usize as u64,
+            true,
+            true,
+        ),
+        (
+            3,
+            softcpu_commit_bounce as *const () as usize as u64,
+            true,
+            false,
+        ),
+        (
+            4,
+            softcpu_step_complex as *const () as usize as u64,
+            true,
+            true,
+        ),
+    ] {
+        offsets[slot] = code.len();
+        // Resume is in RCX and the helper argument (meta or index) is in RAX.
+        gw_store(&mut code, 1, offset_of!(SoftCpuContext, helper_resume));
+        gw_store(&mut code, 3, 3 * 8);
+        code.extend_from_slice(&[0x48, 0x89, 0xc3]); // rbx = helper argument
+        gw_save_guest(&mut code, from_probe, from_lahf);
+        gw_restore_host(&mut code);
+        code.extend_from_slice(&[0x4c, 0x89, 0xff]); // rdi = ctx
+        if slot == 2 {
+            code.extend_from_slice(&[0x4c, 0x89, 0xf6, 0x48, 0x89, 0xda]); // rsi = guest EA; rdx = meta
+        } else if slot == 4 {
+            code.extend_from_slice(&[0x48, 0x89, 0xde]); // rsi = index
+        }
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&helper.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0]);
+        if slot != 3 {
+            code.extend_from_slice(&[0x48, 0x85, 0xc0, 0x0f, 0x84]);
+            let patch = code.len();
+            let rel = (host_return as isize - (patch + 4) as isize) as i32;
+            code.extend_from_slice(&rel.to_le_bytes());
+        }
+        if slot == 2 {
+            code.extend_from_slice(&[0x49, 0x89, 0xc6]);
+        } // translated pointer in r14
+        gw_restore_guest(&mut code);
+        gw_jump_ctx(&mut code, offset_of!(SoftCpuContext, helper_resume));
+    }
+    (code, offsets)
+}
+
+fn gw_store(code: &mut Vec<u8>, gpr: usize, offset: usize) {
+    code.extend_from_slice(&[
+        0x49 | if gpr >= 8 { 4 } else { 0 },
+        0x89,
+        0x87 | (((gpr as u8) & 7) << 3),
+    ]);
+    code.extend_from_slice(&(offset as i32).to_le_bytes());
+}
+
+fn gw_load(code: &mut Vec<u8>, gpr: usize, offset: usize) {
+    code.extend_from_slice(&[
+        0x49 | if gpr >= 8 { 4 } else { 0 },
+        0x8b,
+        0x87 | (((gpr as u8) & 7) << 3),
+    ]);
+    code.extend_from_slice(&(offset as i32).to_le_bytes());
+}
+
+fn gw_fx(code: &mut Vec<u8>, restore: bool, offset: usize) {
+    code.extend_from_slice(&[0x49, 0x0f, 0xae, if restore { 0x8f } else { 0x87 }]);
+    code.extend_from_slice(&(offset as i32).to_le_bytes());
+}
+
+fn gw_jump_ctx(code: &mut Vec<u8>, offset: usize) {
+    code.extend_from_slice(&[0x41, 0xff, 0xa7]);
+    code.extend_from_slice(&(offset as i32).to_le_bytes());
+}
+
+fn gw_save_guest(code: &mut Vec<u8>, from_probe: bool, from_lahf: bool) {
+    for gpr in 0..14 {
+        if gpr == reg::RSP || (from_probe && gpr < 2) {
+            continue;
+        }
+        // RBX holds the helper argument on helper transitions. Save its guest
+        // value before repurposing it (the caller does that below).
+        if from_probe && gpr == reg::RBX {
+            continue;
+        }
+        gw_store(code, gpr, gpr * 8);
+    }
+    if from_probe {
+        for (gpr, off) in [(0, CTX_PROBE_SPILL0_OFF), (1, CTX_PROBE_SPILL1_OFF)] {
+            gw_load(code, 2, off);
+            gw_store(code, 2, gpr * 8);
+        }
+    }
+    if from_lahf {
+        code.extend_from_slice(&[0x41, 0x8b, 0x87]);
+        code.extend_from_slice(&(CTX_SAVED_LAHF_OFF as i32).to_le_bytes());
+        code.extend_from_slice(&[0x04, 0x7f, 0x9e]);
+    }
+    code.extend_from_slice(&[0x9c, 0x58]); // pushfq; pop rax on the host stack
+    gw_load(code, 1, offset_of!(SoftCpuContext, rflags));
+    code.extend_from_slice(&[
+        0x48, 0x81, 0xe1, 0x00, 0x02, 0x04, 0x00, 0x48, 0x25, 0xff, 0xfd, 0xfb, 0xff, 0x48, 0x09,
+        0xc8,
+    ]);
+    gw_store(code, 0, offset_of!(SoftCpuContext, rflags));
+    gw_fx(code, false, CTX_FXSAVE_OFF);
+}
+
+fn gw_restore_host(code: &mut Vec<u8>) {
+    code.push(0xfc); // CLD before every Rust call and host return
+    gw_fx(code, true, offset_of!(SoftCpuContext, host_fxsave));
+}
+
+fn gw_restore_guest(code: &mut Vec<u8>) {
+    gw_fx(code, true, CTX_FXSAVE_OFF);
+    gw_load(code, 0, offset_of!(SoftCpuContext, rflags));
+    code.extend_from_slice(&[0x48, 0x25, 0xff, 0xfe, 0xfb, 0xff, 0x50, 0x9d]);
+    for gpr in 0..14 {
+        if gpr != reg::RSP {
+            gw_load(code, gpr, gpr * 8);
+        }
+    }
+}
 
 fn gateway_trampolines() -> Option<&'static GatewayTrampolines> {
     static GATEWAY: OnceLock<Option<GatewayTrampolines>> = OnceLock::new();
     GATEWAY
         .get_or_init(|| {
-            let mut image = *GATEWAY_TEMPLATE;
-            for (off, f) in [
-                (373usize, softcpu_mem_slow_path as *const () as usize as u64),
-                (559, softcpu_commit_bounce as *const () as usize as u64),
-                (805, softcpu_step_complex as *const () as usize as u64),
-            ] {
-                image[off..off + 8].copy_from_slice(&f.to_le_bytes());
-            }
-            let b = Box::leak(Box::new(crate::cpu::JitCodeBuffer::new(4096)?)).publish(&image)?;
+            let (image, offsets) = gateway_image();
+            let mut buffer = Box::new(crate::cpu::JitCodeBuffer::new(image.len())?);
+            let b = buffer.publish(&image)?;
+            let _ = Box::leak(buffer); // one immutable gateway for the process lifetime
             Some(GatewayTrampolines {
-                enter_translated: b,
-                exit_trampoline: b + 0x06d,
-                slow_path_shim: b + 0x0e9,
-                bounce_commit_shim: b + 0x1c8,
-                complex_step_shim: b + 0x29c,
+                enter_translated: b + offsets[0] as u64,
+                exit_trampoline: b + offsets[1] as u64,
+                slow_path_shim: b + offsets[2] as u64,
+                bounce_commit_shim: b + offsets[3] as u64,
+                complex_step_shim: b + offsets[4] as u64,
             })
         })
         .as_ref()
