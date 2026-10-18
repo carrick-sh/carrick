@@ -151,10 +151,10 @@ fn branch_directives(brief: &str) -> Vec<&str> {
         if advance_fence(trimmed, &mut fence) {
             continue;
         }
-        if fence.is_none() {
-            if let Some(branch) = line.strip_prefix("Branch: ") {
-                branches.push(branch);
-            }
+        if fence.is_none()
+            && let Some(branch) = line.strip_prefix("Branch: ")
+        {
+            branches.push(branch);
         }
     }
     branches
