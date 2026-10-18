@@ -1505,7 +1505,8 @@ fn unavailable_features_raise_ud_and_cpuid_matches_the_layer() {
     assert_eq!(
         cpu.context().gpr[reg::RCX] & ((1 << 26) | (1 << 27)),
         (1 << 26) | (1 << 27)
-    );    assert_eq!(
+    );
+    assert_eq!(
         cpu.context().cr4 & ((1 << 9) | (1 << 18)),
         (1 << 9) | (1 << 18)
     );

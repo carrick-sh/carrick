@@ -10,6 +10,7 @@ use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 
 use crate::cflow::compute_effective_va;
 use crate::decode::gpr_index;
+use crate::emit::{EmitError, JitStage};
 use crate::mmu::{
     Cpl, CpuAccessMode, FrameGpa, RootGpa, SOFT_TLB_OFFSET_MASK, SOFT_TLB_PAGE_MASK,
     SOFT_TLB_PAGE_SIZE, SoftAccessKind, SoftMmuMemory, SoftPageFault, SoftTlb, SoftWalker,
@@ -260,7 +261,7 @@ impl Default for SoftCpuContext {
 impl SoftCpuContext {
     #[must_use]
     pub fn new() -> Self {
-        let gw = gateway_trampolines();
+        let gw = gateway_trampolines().ok();
         let mut ctx = Self {
             gpr: [0; 16],
             rip: 0,
@@ -367,7 +368,7 @@ impl SoftCpuContext {
         mem: &mut M,
         entry: u64,
         planned: &crate::block::PlannedBlock,
-    ) -> u64 {
+    ) -> Result<u64, EmitError> {
         struct Guard<'a>(&'a mut SoftCpuContext);
         impl Drop for Guard<'_> {
             fn drop(&mut self) {
@@ -384,7 +385,12 @@ impl SoftCpuContext {
         self.active_translate_fn = Some(translate_for_mem::<M>);
         let guard = Guard(self);
         // SAFETY: the CPU owns entry and mem stays exclusively borrowed through return.
-        unsafe { softcpu_enter_translated((guard.0 as *mut SoftCpuContext).cast()) }
+        unsafe { softcpu_enter_translated((guard.0 as *mut SoftCpuContext).cast()) }.map_err(
+            |stage| EmitError::HostJit {
+                va: planned.start,
+                stage,
+            },
+        )
     }
 
     #[inline]
@@ -1218,16 +1224,15 @@ fn sub_flags(old_rflags: u64, a: u64, b: u64, width: usize) -> u64 {
 ///
 /// `ctx` must point to a valid, initialized [`SoftCpuContext`] whose `entry_exec_addr`
 /// points to a translated block emitted by [`crate::emit::emit_block`].
-pub(crate) unsafe fn softcpu_enter_translated(ctx: *mut u8) -> u64 {
-    let Some(gw) = gateway_trampolines() else {
-        return EXIT_REASON_EXCEPTION;
-    };
+pub(crate) unsafe fn softcpu_enter_translated(ctx: *mut u8) -> Result<u64, JitStage> {
+    let gw = gateway_trampolines()?;
     // SAFETY: `gw.enter_translated` points to the entry gateway in the executable page.
     let enter: unsafe extern "sysv64" fn(*mut u8) -> u64 =
         unsafe { std::mem::transmute(gw.enter_translated as usize) };
-    unsafe { enter(ctx) }
+    Ok(unsafe { enter(ctx) })
 }
 
+#[derive(Clone, Copy)]
 struct GatewayTrampolines {
     enter_translated: u64,
     exit_trampoline: u64,
@@ -1410,23 +1415,46 @@ fn gw_restore_guest(code: &mut Vec<u8>) {
     }
 }
 
-fn gateway_trampolines() -> Option<&'static GatewayTrampolines> {
-    static GATEWAY: OnceLock<Option<GatewayTrampolines>> = OnceLock::new();
-    GATEWAY
-        .get_or_init(|| {
-            let (image, offsets) = gateway_image();
-            let mut buffer = Box::new(crate::cpu::JitCodeBuffer::new(image.len())?);
-            let b = buffer.publish(&image)?;
-            let _ = Box::leak(buffer); // one immutable gateway for the process lifetime
-            Some(GatewayTrampolines {
-                enter_translated: b + offsets[0] as u64,
-                exit_trampoline: b + offsets[1] as u64,
-                slow_path_shim: b + offsets[2] as u64,
-                bounce_commit_shim: b + offsets[3] as u64,
-                complex_step_shim: b + offsets[4] as u64,
-            })
-        })
-        .as_ref()
+#[cfg(test)]
+thread_local! {
+    // A fresh cache exercises real gateway initialization failures without
+    // poisoning the process-wide gateway used by concurrent tests.
+    static TEST_GATEWAY: std::cell::RefCell<Option<OnceLock<Result<GatewayTrampolines, JitStage>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn prepare_gateway(va: u64) -> Result<(), EmitError> {
+    gateway_trampolines()
+        .map(|_| ())
+        .map_err(|stage| EmitError::HostJit { va, stage })
+}
+
+fn gateway_trampolines() -> Result<GatewayTrampolines, JitStage> {
+    #[cfg(test)]
+    if let Some(result) = TEST_GATEWAY.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|cache| *cache.get_or_init(build_gateway))
+    }) {
+        return result;
+    }
+    static GATEWAY: OnceLock<Result<GatewayTrampolines, JitStage>> = OnceLock::new();
+    *GATEWAY.get_or_init(build_gateway)
+}
+
+fn build_gateway() -> Result<GatewayTrampolines, JitStage> {
+    let (image, offsets) = gateway_image();
+    let mut buffer =
+        Box::new(crate::cpu::JitCodeBuffer::new(image.len()).ok_or(JitStage::Allocate)?);
+    let b = buffer.publish(&image).ok_or(JitStage::Publish)?;
+    let _ = Box::leak(buffer); // one immutable gateway for the process lifetime
+    Ok(GatewayTrampolines {
+        enter_translated: b + offsets[0] as u64,
+        exit_trampoline: b + offsets[1] as u64,
+        slow_path_shim: b + offsets[2] as u64,
+        bounce_commit_shim: b + offsets[3] as u64,
+        complex_step_shim: b + offsets[4] as u64,
+    })
 }
 
 #[cfg(test)]
@@ -1452,7 +1480,10 @@ mod tests {
             0x53, 0x48, 0x89, 0xf3, 0x0f, 0xae, 0x1b, 0xd9, 0x7b, 4, 0x48, 0xb8,
         ];
         wrapper.extend_from_slice(
-            &(softcpu_enter_translated as *const () as usize as u64).to_le_bytes(),
+            &gateway_trampolines()
+                .unwrap()
+                .enter_translated
+                .to_le_bytes(),
         );
         wrapper.extend_from_slice(&[
             0xff, 0xd0, 0x9c, 0x58, 0xfc, 0x0f, 0xae, 0x5b, 8, 0xd9, 0x7b, 12, 0x0f, 0xae, 0x13,
@@ -1628,5 +1659,45 @@ mod tests {
     #[test]
     fn fp_publication_failure_is_a_host_error() {
         fp_host_failure(true);
+    }
+    fn gateway_host_failure(publish: bool) {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_GATEWAY.with(|slot| *slot.borrow_mut() = None);
+                crate::cpu::FAIL_SMALL_JIT.with(|fault| fault.set(None));
+            }
+        }
+        TEST_GATEWAY.with(|slot| *slot.borrow_mut() = Some(OnceLock::new()));
+        let _reset = Reset;
+        crate::cpu::FAIL_SMALL_JIT.with(|fault| fault.set(Some(publish)));
+        let mut cpu = crate::SoftCpu::new().unwrap();
+        let allocations = crate::cpu::JIT_ALLOCATIONS.with(|count| count.get());
+        let planned = fp_block();
+        cpu.context_mut().rip = planned.start;
+        let expected = Err(crate::EmitError::HostJit {
+            va: planned.start,
+            stage: if publish {
+                crate::JitStage::Publish
+            } else {
+                crate::JitStage::Allocate
+            },
+        });
+        assert_eq!(cpu.execute_planned_block(&planned, &mut NoMemory), expected);
+        assert_eq!(cpu.context().pending_exception, None);
+        // The cached failure must also win before public step_block fetches.
+        assert_eq!(cpu.step_block(&mut NoMemory), expected);
+        assert_eq!(cpu.context().pending_exception, None);
+        crate::cpu::JIT_ALLOCATIONS.with(|count| assert_eq!(count.get(), allocations));
+    }
+
+    #[test]
+    fn gateway_allocation_failure_is_a_host_error() {
+        gateway_host_failure(false);
+    }
+
+    #[test]
+    fn gateway_publication_failure_is_a_host_error() {
+        gateway_host_failure(true);
     }
 }
