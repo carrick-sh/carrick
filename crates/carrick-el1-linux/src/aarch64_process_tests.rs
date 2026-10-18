@@ -3148,6 +3148,36 @@ fn arm_call(
 }
 
 #[test]
+fn arm_signal_setup_then_timed_futex_keeps_its_deadline() {
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    let mut setup = carrick_el1_abi::TrapFrame::default();
+    setup.x[8] = 134;
+    setup.x[0] = 13;
+    setup.x[3] = 8;
+    arm_call(fixture, fixture.control, &mut service, &mut setup).unwrap();
+    assert_eq!(setup.x[0], 0);
+
+    let word = core::sync::atomic::AtomicU32::new(0);
+    let timeout = [0_u64, 1_000_000];
+    let mut frame = carrick_el1_abi::TrapFrame::default();
+    frame.x[8] = 98;
+    frame.x[0] = word.as_ptr() as u64;
+    frame.x[1] = 128;
+    frame.x[3] = timeout.as_ptr() as u64;
+    let route = arm_call(fixture, fixture.control, &mut service, &mut frame).unwrap();
+    assert_eq!(
+        route,
+        carrick_personality_linux::dispatch::CompletionRoute::Served
+    );
+    assert_eq!(frame.x[0] as i64, -110);
+    assert_eq!(
+        fixture.zone.counters.el1_timeouts.load(Ordering::Acquire),
+        1
+    );
+}
+
+#[test]
 fn arm_signal_setup_uses_one_native_owner() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let mut service = fixture.process_service();
@@ -3808,7 +3838,12 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
         );
         assert_eq!(service.crossing.retirements.load(Ordering::Acquire), 0);
         if matches!(siblings, Siblings::AdoptedHostBorn) {
-            let identity = adopted_control.unwrap().host_birth_identity().unwrap();
+            let control = adopted_control.unwrap();
+            assert!(
+                control.host_exit_requested(),
+                "Closing must request host retirement even after the sibling's admission record was released"
+            );
+            let identity = control.host_birth_identity().unwrap();
             assert!(
                 (0..carrick_el1_abi::THREAD_POOL_ENTRIES)
                     .all(|index| fixture.page.host_birth_identity(index) != Some(identity))

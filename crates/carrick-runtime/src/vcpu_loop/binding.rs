@@ -4147,6 +4147,9 @@ where
                     &self.kernel.dispatcher,
                 );
             }
+            if let Some(context) = self.state.service_kernel_context.as_ref() {
+                self.kernel.wake_native_terminal_members(context)?;
+            }
             if !self.phase.is_terminal_transition() {
                 self.state.publish_external_ingress(&self.kernel)?;
             }
@@ -4926,6 +4929,14 @@ where
             Ok(None) | Err(TrapError::EL0Fault { .. }) => Some(zone::ZoneExit::El0),
             _ => None,
         };
+        // Native exit_group can park its owner waiting for host-owned members.
+        // Dispatch their control wakes before reconciling that park; otherwise
+        // the owner and an EL0 spinner wait for one another indefinitely.
+        if zone_exit.is_some()
+            && let Some(context) = self.state.service_kernel_context.as_ref()
+        {
+            self.kernel.wake_native_terminal_members(context)?;
+        }
         if let Some(zone_exit) = zone_exit
             && let Some(exit) = self.reconcile_zone_exit(engine, control, zone_exit)?
         {
@@ -7030,6 +7041,76 @@ mod tests {
         owner
             .release(IpcBacking::EventFd { object }.encode())
             .unwrap();
+    }
+
+    #[test]
+    fn native_terminal_request_kicks_loaded_member_without_zone_record_once() {
+        use carrick_kernel::kernel::{ExecutorBinding, ExecutorKick, ExecutorKickToken};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug, Default)]
+        struct Kick {
+            exact: RuntimeTestExecutorKick,
+            deliveries: AtomicUsize,
+        }
+        impl ExecutorKick for Kick {
+            fn try_bind(&self, binding: ExecutorBinding) -> bool {
+                self.exact.try_bind(binding)
+            }
+            fn unbind(&self, binding: ExecutorBinding) {
+                self.exact.unbind(binding);
+            }
+            fn rebind_exact_with(
+                &self,
+                predecessor: ExecutorBinding,
+                successor: ExecutorBinding,
+                publish: &mut dyn FnMut() -> bool,
+            ) -> bool {
+                self.exact
+                    .rebind_exact_with(predecessor, successor, publish)
+            }
+            fn deliver_exact(&self, token: ExecutorKickToken) -> bool {
+                let delivered = self.exact.deliver_exact(token);
+                if delivered {
+                    self.deliveries.fetch_add(1, Ordering::Relaxed);
+                }
+                delivered
+            }
+            fn current_binding(&self) -> Option<ExecutorBinding> {
+                self.exact.current_binding()
+            }
+        }
+
+        let (_runtime, scheduler, kernel, member, _process, _generation) =
+            test_carrier_graph_with_dispatcher!(72_432, SyscallDispatcher::new());
+        let kick = Arc::new(Kick::default());
+        let executor = scheduler.register_executor(kick.clone()).unwrap();
+        let running = scheduler.take(&executor).unwrap();
+        assert_eq!(kernel.wake_native_terminal_members(&member).unwrap(), 0);
+        assert_eq!(kick.deliveries.load(Ordering::Relaxed), 0);
+
+        // The native owner's publication is covered by the actual two-live-
+        // thread exit_group test. Exercise its host adapter with a real loaded
+        // scheduler binding, including a boundary owned by the cancelled
+        // member itself after an in-zone thread switch.
+        member.thread().control_slot().request_host_exit();
+        let page = member.lifecycle_page();
+        page.publish_exit_wait(
+            carrick_core_abi::EntryMmKey::from_raw(member.shared().mm().id().raw()),
+            0x1000,
+        );
+        assert_eq!(kernel.wake_native_terminal_members(&member).unwrap(), 1);
+        assert_eq!(kick.deliveries.load(Ordering::Relaxed), 1);
+        assert_eq!(kernel.wake_native_terminal_members(&member).unwrap(), 0);
+        assert_eq!(kick.deliveries.load(Ordering::Relaxed), 1);
+        scheduler
+            .settle_failed(
+                running,
+                carrick_kernel::kernel::objects::ExecutionFailure::AddressSpaceRetired,
+            )
+            .unwrap();
+        scheduler.unregister_executor(&executor).unwrap();
+        scheduler.close();
     }
 
     #[test]

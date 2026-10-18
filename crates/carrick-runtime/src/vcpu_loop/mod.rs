@@ -492,6 +492,10 @@ pub(crate) struct KernelState {
     /// globals, each hvpatch child owns a distinct `KernelState`, so this can
     /// stop clone admission without disturbing another process in the VM.
     process_exiting: std::sync::atomic::AtomicBool,
+    /// Retain the exact native lifecycle page whose host cancellation wakes
+    /// were dispatched. Exec can replace the page; its address cannot be reused
+    /// while this lease is held.
+    native_terminal_wakes: Mutex<Option<carrick_kernel::kernel::objects::ThreadLifecycleLease>>,
     /// Per-Linux-process fork pause for the shared-VM backend. The legacy
     /// barrier is host-process-global because it assumed one process per VM.
     process_fork_barrier: Option<Arc<crate::fork_quiesce::QuiesceBarrier>>,
@@ -545,6 +549,7 @@ impl KernelState {
             signal_arrival,
             hvpatch_process,
             process_exiting: std::sync::atomic::AtomicBool::new(false),
+            native_terminal_wakes: Mutex::new(None),
             process_fork_barrier,
             crash_capture,
             clone_admission: Arc::new(CloneAdmissionGate::default()),
