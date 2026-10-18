@@ -390,7 +390,10 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
         .current_dir(root);
     let mut isolated = Command::new("/usr/bin/sudo");
     private_environment(&mut isolated);
-    isolated.args(["-n", "-u", AGENT_USER, "--", "/usr/bin/env", "-i"]);
+    // Enter the private worktree only after sudo has switched credentials.
+    isolated
+        .args(["-n", "-u", AGENT_USER, "--", "/usr/bin/env", "-i", "-C"])
+        .arg(root);
     for (key, value) in command.get_envs() {
         if let Some(value) = value {
             let mut assignment = key.to_os_string();
@@ -402,7 +405,7 @@ fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
     isolated
         .arg(command.get_program())
         .args(command.get_args())
-        .current_dir(root)
+        .current_dir("/")
         .stdin(Stdio::null())
         .stdout(std::fs::File::create(state.join("agent.out"))?)
         .stderr(std::fs::File::create(state.join("agent.err"))?);
