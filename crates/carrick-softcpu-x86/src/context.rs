@@ -16,7 +16,7 @@ use crate::mmu::{
 };
 
 /// Monomorphized translation callback for active [`SoftMmuMemory`] during block execution.
-pub type ActiveTranslateFn =
+type ActiveTranslateFn =
     unsafe fn(&mut SoftCpuContext, u64, SoftAccessKind) -> Result<*mut u8, SoftPageFault>;
 
 /// Monomorphized [`ActiveTranslateFn`] adapter for any `M: SoftMmuMemory`.
@@ -24,7 +24,7 @@ pub type ActiveTranslateFn =
 /// # Safety
 ///
 /// `ctx.active_mem_ptr` must point to a valid, exclusively borrowed `M` for the call duration.
-pub unsafe fn translate_for_mem<M: SoftMmuMemory>(
+unsafe fn translate_for_mem<M: SoftMmuMemory>(
     ctx: &mut SoftCpuContext,
     va: u64,
     kind: SoftAccessKind,
@@ -77,6 +77,7 @@ pub const CTX_SLOW_PATH_FN_OFF: usize = 0xF8;
 pub const CTX_BOUNCE_COMMIT_FN_OFF: usize = 0x100;
 pub const CTX_COMPLEX_STEP_FN_OFF: usize = 0x108;
 pub const CTX_EXIT_TRAMPOLINE_FN_OFF: usize = 0x110;
+pub(crate) const CTX_VIRT_RSP_SPILL_OFF: usize = offset_of!(SoftCpuContext, virt_rsp_spill);
 pub const CTX_FXSAVE_OFF: usize = 0x160;
 pub const CTX_TLB_READ_OFF: usize = 0x380;
 pub const CTX_TLB_WRITE_OFF: usize = CTX_TLB_READ_OFF + SoftTlb::WRITE_PLANE_OFFSET;
@@ -138,7 +139,7 @@ impl X86Exception {
 
 /// Bounce-buffer writeback descriptors populated when a writable operand straddles two 4 KiB pages.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct BounceWriteback {
+struct BounceWriteback {
     pub host_ptr0: *mut u8,
     pub len0: usize,
     pub host_ptr1: *mut u8,
@@ -164,6 +165,21 @@ impl Default for FxsaveArea {
 }
 
 /// Per-CPU architectural and runtime context pointed to by `%r15` during block execution.
+///
+/// ```compile_fail
+/// use carrick_softcpu_x86::context::{SoftCpuContext, softcpu_mem_slow_path};
+/// softcpu_mem_slow_path(&mut SoftCpuContext::new(), 0, 0);
+/// ```
+///
+/// ```compile_fail
+/// use carrick_softcpu_x86::context::{SoftCpuContext, softcpu_commit_bounce};
+/// softcpu_commit_bounce(&mut SoftCpuContext::new());
+/// ```
+///
+/// ```compile_fail
+/// use carrick_softcpu_x86::context::{SoftCpuContext, softcpu_step_complex};
+/// softcpu_step_complex(&mut SoftCpuContext::new(), 0);
+/// ```
 #[repr(C, align(64))]
 pub struct SoftCpuContext {
     pub gpr: [u64; 16],
@@ -173,19 +189,19 @@ pub struct SoftCpuContext {
     pub gs_base: u64,
     pub kernel_gs_base: u64,
     pub tlb_tag_bits: u64,
-    pub host_rsp: u64,
-    pub entry_exec_addr: u64,
+    host_rsp: u64,
+    entry_exec_addr: u64,
     pub exit_reason: u64,
     pub exit_insn_va: u64,
-    pub probe_spill: [u64; 2],
-    pub virt_spill: [u64; 2],
-    pub saved_lahf: u64,
-    pub slow_path_fn: u64,
-    pub bounce_commit_fn: u64,
-    pub complex_step_fn: u64,
-    pub exit_trampoline_fn: u64,
-    pub bounce_active: u64,
-    pub bounce_buf: [u8; 64],
+    probe_spill: [u64; 2],
+    virt_spill: [u64; 2],
+    saved_lahf: u64,
+    slow_path_fn: u64,
+    bounce_commit_fn: u64,
+    complex_step_fn: u64,
+    exit_trampoline_fn: u64,
+    bounce_active: u64,
+    bounce_buf: [u8; 64],
     pub fxsave: FxsaveArea,
     pub tlb: SoftTlb,
     pub walker: SoftWalker,
@@ -199,13 +215,13 @@ pub struct SoftCpuContext {
     pub efer: u64,
     pub block_start_va: u64,
     pub pending_exception: Option<X86Exception>,
-    pub bounce_writeback: BounceWriteback,
-    pub active_mem_ptr: Option<NonNull<()>>,
-    pub active_translate_fn: Option<ActiveTranslateFn>,
-    pub active_block_insns: Vec<(u64, Instruction)>,
-    pub host_fxsave: FxsaveArea,
-    pub helper_resume: u64,
-    pub virt_rsp_spill: u64,
+    bounce_writeback: BounceWriteback,
+    active_mem_ptr: Option<NonNull<()>>,
+    active_translate_fn: Option<ActiveTranslateFn>,
+    active_block_insns: Vec<(u64, Instruction)>,
+    host_fxsave: FxsaveArea,
+    helper_resume: u64,
+    virt_rsp_spill: u64,
 }
 
 const _: () = {
@@ -280,6 +296,39 @@ impl SoftCpuContext {
         };
         ctx.sync_tlb_tag_bits();
         ctx
+    }
+
+    pub(crate) fn reset_bounce(&mut self) {
+        self.bounce_active = 0;
+    }
+
+    // Only the CPU's freshly published JIT entry may enter this binding.
+    pub(crate) unsafe fn execute<M: SoftMmuMemory>(
+        &mut self,
+        mem: &mut M,
+        entry: u64,
+        planned: &crate::block::PlannedBlock,
+    ) -> u64 {
+        struct Guard<'a>(&'a mut SoftCpuContext);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.active_mem_ptr = None;
+                self.0.active_translate_fn = None;
+                self.0.bounce_active = 0;
+            }
+        }
+        self.block_start_va = planned.start;
+        self.entry_exec_addr = entry;
+        self.exit_reason = 0;
+        self.pending_exception = None;
+        self.active_block_insns.clear();
+        self.active_block_insns
+            .extend(planned.insns.iter().map(|d| (d.va, d.raw)));
+        self.active_mem_ptr = Some(NonNull::from(mem).cast());
+        self.active_translate_fn = Some(translate_for_mem::<M>);
+        let guard = Guard(self);
+        // SAFETY: the CPU owns entry and mem stays exclusively borrowed through return.
+        unsafe { softcpu_enter_translated((guard.0 as *mut SoftCpuContext).cast()) }
     }
 
     #[inline]
@@ -402,7 +451,7 @@ fn translate_or_record(
 
 /// Slow-path memory translation and page-crossing bounce-buffer setup.
 #[unsafe(no_mangle)]
-pub extern "sysv64" fn softcpu_mem_slow_path(
+extern "sysv64" fn softcpu_mem_slow_path(
     ctx: &mut SoftCpuContext,
     guest_va: u64,
     meta: u64,
@@ -486,7 +535,7 @@ pub extern "sysv64" fn softcpu_mem_slow_path(
 
 /// Commit the per-CPU bounce buffer back to the two pre-validated guest pages.
 #[unsafe(no_mangle)]
-pub extern "sysv64" fn softcpu_commit_bounce(ctx: &mut SoftCpuContext) {
+extern "sysv64" fn softcpu_commit_bounce(ctx: &mut SoftCpuContext) {
     if ctx.bounce_active != 0 {
         let wb = ctx.bounce_writeback;
         // SAFETY: `wb.host_ptr0` and `wb.host_ptr1` were validated by `softcpu_mem_slow_path`.
@@ -511,7 +560,7 @@ fn record_exception(ctx: &mut SoftCpuContext, exc: X86Exception) {
 
 /// Execute a complex body instruction (`div`/`idiv`, string ops, `push`/`pop`, etc.).
 #[unsafe(no_mangle)]
-pub extern "sysv64" fn softcpu_step_complex(ctx: &mut SoftCpuContext, insn_idx: u64) -> u64 {
+extern "sysv64" fn softcpu_step_complex(ctx: &mut SoftCpuContext, insn_idx: u64) -> u64 {
     let Some(&(insn_va, insn)) = ctx.active_block_insns.get(insn_idx as usize) else {
         record_exception(ctx, X86Exception::invalid_opcode(ctx.rip));
         return 0;
@@ -1160,4 +1209,138 @@ fn gateway_trampolines() -> Option<&'static GatewayTrampolines> {
             })
         })
         .as_ref()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::JitCodeBuffer;
+    #[test]
+    fn gateway_returns_with_host_df_and_fp_controls_restored() {
+        // Capture DF in a native wrapper immediately after the translated exit,
+        // then restore host DF/FP controls before Rust even on the broken gateway.
+        use crate::cpu::JitCodeBuffer;
+        let mut ctx = SoftCpuContext::new();
+        let mut block_jit = JitCodeBuffer::new(4096).unwrap();
+        // std; jmp [r15 + exit trampoline] exercises the gateway's host return.
+        let mut code = vec![0xfd, 0x41, 0xff, 0xa7];
+        code.extend_from_slice(&(CTX_EXIT_TRAMPOLINE_FN_OFF as i32).to_le_bytes());
+        ctx.entry_exec_addr = block_jit.publish(&code).unwrap();
+        ctx.fxsave.0[..2].copy_from_slice(&0x027fu16.to_le_bytes());
+        ctx.fxsave.0[24..28].copy_from_slice(&0x5f80u32.to_le_bytes());
+        let mut snapshots = [0u8; 16];
+        let mut wrapper = vec![
+            0x53, 0x48, 0x89, 0xf3, 0x0f, 0xae, 0x1b, 0xd9, 0x7b, 4, 0x48, 0xb8,
+        ];
+        wrapper.extend_from_slice(
+            &(softcpu_enter_translated as *const () as usize as u64).to_le_bytes(),
+        );
+        wrapper.extend_from_slice(&[
+            0xff, 0xd0, 0x9c, 0x58, 0xfc, 0x0f, 0xae, 0x5b, 8, 0xd9, 0x7b, 12, 0x0f, 0xae, 0x13,
+            0xd9, 0x6b, 4, 0x5b, 0xc3,
+        ]);
+        let mut wrapper_jit = JitCodeBuffer::new(4096).unwrap();
+        let entry = wrapper_jit.publish(&wrapper).unwrap();
+        let run: unsafe extern "sysv64" fn(*mut SoftCpuContext, *mut u8) -> u64 =
+            unsafe { std::mem::transmute(entry as usize) };
+        let flags = unsafe { run(&mut ctx, snapshots.as_mut_ptr()) };
+        assert_eq!(
+            &snapshots[..6],
+            &snapshots[8..14],
+            "guest MXCSR/FCW reached host ABI"
+        );
+        assert_eq!(flags & (1 << 10), 0, "guest DF reached the host ABI");
+        assert_ne!(ctx.rflags & (1 << 10), 0, "guest DF was lost");
+        assert_eq!(&ctx.fxsave.0[..2], &0x027fu16.to_le_bytes());
+        assert_eq!(&ctx.fxsave.0[24..28], &0x5f80u32.to_le_bytes());
+    }
+
+    #[test]
+    fn crossing_conditional_write_preserves_untouched_bounce_bytes() {
+        use crate::mmu::{ExtentRecord, ExtentTable, LinearPlacement, MmioHoles, OwnerGeneration};
+        struct Memory(LinearPlacement, ExtentTable);
+        impl SoftMmuMemory for Memory {
+            fn placement(&self) -> &LinearPlacement {
+                &self.0
+            }
+            fn extents(&self) -> &ExtentTable {
+                &self.1
+            }
+            fn extents_mut(&mut self) -> &mut ExtentTable {
+                &mut self.1
+            }
+        }
+        #[repr(align(4096))]
+        struct Pages([u64; 3072]);
+        let mut pages = Box::new(Pages([0; 3072]));
+        // Four live table levels map two adjacent user pages to frames 4 and 5.
+        for (slot, frame) in [(0, 1), (512, 2), (1024, 3), (1536, 4), (1537, 5)] {
+            pages.0[slot] = (frame << 12) | 7;
+        }
+        let host_base = pages.0.as_mut_ptr().cast::<u8>();
+        let placement =
+            LinearPlacement::new(host_base as usize, 6 * 4096, MmioHoles::empty()).unwrap();
+        let mut extents = ExtentTable::new();
+        let generation = OwnerGeneration::new(1);
+        assert!(extents.install(ExtentRecord::new(FrameGpa::new(0), 6 * 4096, generation)));
+        extents.set_root_generation(RootGpa::page_aligned(FrameGpa::new(0)).unwrap(), generation);
+        let mut memory = Memory(placement, extents);
+        // SAFETY: the 16 bytes span the last eight bytes of frame 4 and the first eight of frame 5.
+        unsafe {
+            std::ptr::write_bytes(host_base.add(0x4ff8), 0x55, 16);
+        }
+        let mut ctx = SoftCpuContext::new();
+        ctx.bounce_buf.fill(0xcc);
+        ctx.active_mem_ptr = Some(NonNull::from(&mut memory).cast());
+        ctx.active_translate_fn = Some(translate_for_mem::<Memory>);
+        assert_ne!(
+            softcpu_mem_slow_path(&mut ctx, 0xff8, pack_slow_path_meta(0, 16, 1, false)),
+            0
+        );
+        ctx.bounce_buf[0] = 0xaa;
+        ctx.bounce_buf[15] = 0xaa;
+        softcpu_commit_bounce(&mut ctx);
+        // SAFETY: the same owned data pages remain live; all writes have finished.
+        let bytes = unsafe { std::slice::from_raw_parts(host_base.add(0x4ff8), 16) };
+        assert_eq!(
+            bytes,
+            [
+                0xaa, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
+                0x55, 0xaa
+            ]
+        );
+    }
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn published_blocks_and_gateways_are_rx_and_never_writable() {
+        fn permissions(addr: u64) -> String {
+            std::fs::read_to_string("/proc/self/maps")
+                .unwrap()
+                .lines()
+                .find_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    let (start, end) = fields.next()?.split_once('-')?;
+                    let start = u64::from_str_radix(start, 16).ok()?;
+                    let end = u64::from_str_radix(end, 16).ok()?;
+                    let perms = fields.next()?;
+                    (start <= addr && addr < end).then(|| perms.to_owned())
+                })
+                .unwrap()
+        }
+        let mut jit = JitCodeBuffer::new(4096).unwrap();
+        for _ in 0..2 {
+            let addr = jit.publish(&[0xc3]).unwrap();
+            assert_eq!(permissions(addr), "r-xp");
+        }
+        let ctx = SoftCpuContext::new();
+        for addr in [
+            ctx.slow_path_fn,
+            ctx.bounce_commit_fn,
+            ctx.complex_step_fn,
+            ctx.exit_trampoline_fn,
+        ] {
+            assert_eq!(permissions(addr), "r-xp");
+        }
+    }
 }
