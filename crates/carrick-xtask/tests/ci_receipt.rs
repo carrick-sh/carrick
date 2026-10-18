@@ -480,16 +480,10 @@ else:
         );
         assert!(!checkout.join(RETIRED_TESTS_PATH).exists());
 
-        let mut git_base = cpl0_receipt(
-            &["wait4_rejects_unwritable_rusage_without_writing_status"],
-            &[],
-        );
+        let mut git_base = cpl0_receipt(&[OLD_WAIT4], &[]);
         git_base.head = base_sha.clone();
         std::fs::write(&baseline_file, serde_json::to_vec(&git_base).unwrap()).unwrap();
-        let mut git_cand = cpl0_receipt(
-            &["wait4_writes_status_before_unwritable_rusage_efault"],
-            &[],
-        );
+        let mut git_cand = cpl0_receipt(&[NEW_WAIT4], &[]);
         git_cand.head = cand_sha.clone();
         let cand_art = candidate_dir.join(artifact_name(Lane::Hvf, &cand_sha, 1));
         std::fs::create_dir_all(&cand_art).unwrap();
@@ -1166,4 +1160,128 @@ fn stale_declaration_fails_when_test_already_absent_at_base() {
             .new
             .is_empty()
     );
+}
+
+fn retirement(test: &str, replacement: Option<&str>) -> carrick_xtask::ci_receipt::RetiredTest {
+    carrick_xtask::ci_receipt::RetiredTest {
+        test: test.into(),
+        reason: "review regression fixture".into(),
+        pr: 613,
+        replaced_by: replacement.map(str::to_owned),
+    }
+}
+
+fn write_source(root: &Path, path: &str, source: &str) {
+    let file = root.join(path);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(file, source).unwrap();
+}
+
+#[test]
+fn retirement_cannot_excuse_another_binary_with_a_matching_suffix() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let cand = dir.path().join("cand");
+    write_source(
+        &base,
+        "crates/example/tests/foo.rs",
+        "mod bar { #[test] fn baz() {} }",
+    );
+    let result = diff_with_retired(
+        &cpl0_receipt(&["foo::bar::baz", "bar::baz"], &[]),
+        &cpl0_receipt(&[], &[]),
+        &[retirement("foo::bar::baz", None)],
+        &base,
+        &cand,
+    )
+    .unwrap();
+    assert_eq!(result.new, ["missing:bar::baz"]);
+}
+
+#[test]
+fn replacement_must_start_in_its_declared_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let cand = dir.path().join("cand");
+    write_test_tree(
+        &base,
+        "#[test] fn wait4_rejects_unwritable_rusage_without_writing_status() {}",
+        None,
+    );
+    let result = diff_with_retired(
+        &cpl0_receipt(&[OLD_WAIT4], &[]),
+        &cpl0_receipt(&["bar::baz"], &[]),
+        &[retirement(OLD_WAIT4, Some("foo::bar::baz"))],
+        &base,
+        &cand,
+    );
+    assert!(
+        result.is_err(),
+        "wrong binary satisfied replacement: {result:?}"
+    );
+}
+
+#[test]
+fn failures_in_another_binary_do_not_poison_a_retirement_or_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let cand = dir.path().join("cand");
+    write_source(
+        &base,
+        "crates/example/tests/foo.rs",
+        "mod bar { #[test] fn baz() {} }",
+    );
+    for entry in [
+        retirement("foo::bar::baz", None),
+        retirement("foo::bar::baz", Some("foo::bar::qux")),
+    ] {
+        let result = diff_with_retired(
+            &cpl0_receipt(&["foo::bar::baz"], &["bar::baz"]),
+            &cpl0_receipt(&["foo::bar::qux"], &["bar::baz", "bar::qux"]),
+            &[entry],
+            &base,
+            &cand,
+        );
+        assert!(
+            result.is_ok(),
+            "wrong binary poisoned declaration: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn retirement_identities_require_rust_identifier_segments() {
+    for invalid in [
+        "..::gone",
+        ".::gone",
+        "9bin::gone",
+        "bin::mod::::gone",
+        "bin::mod::9gone",
+        "bin::mod::..",
+        "bin::bad-name",
+        "bin::white space",
+        "bin::é",
+    ] {
+        for entry in [
+            retirement(invalid, None),
+            retirement("bin::gone", Some(invalid)),
+        ] {
+            let result = parse_retired_tests(
+                &format!(
+                    "[[retired]]\ntest = {:?}\nreason = {:?}\npr = 613\n{}",
+                    entry.test,
+                    entry.reason,
+                    entry
+                        .replaced_by
+                        .map(|r| format!("replaced_by = {r:?}\n"))
+                        .unwrap_or_default()
+                ),
+                Path::new(RETIRED_TESTS_PATH),
+            );
+            assert!(
+                result.is_err(),
+                "accepted invalid identity {invalid}: {result:?}"
+            );
+        }
+    }
 }
