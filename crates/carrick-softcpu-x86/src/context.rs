@@ -181,6 +181,11 @@ impl Default for FxsaveArea {
 /// softcpu_step_complex(&mut SoftCpuContext::new(), 0);
 /// ```
 #[repr(C, align(64))]
+/// The raw translated entry is internal even for callers using unsafe Rust.
+/// ```compile_fail
+/// use carrick_softcpu_x86::context::softcpu_enter_translated;
+/// let _ = softcpu_enter_translated;
+/// ```
 pub struct SoftCpuContext {
     pub gpr: [u64; 16],
     pub rip: u64,
@@ -284,7 +289,7 @@ impl SoftCpuContext {
             cr0: 0x8005_0033,
             cr2: 0,
             cr3: 0,
-            cr4: 0x0034_06f0,
+            cr4: 0x0030_04f0,
             efer: 0x0d01,
             block_start_va: 0,
             pending_exception: None,
@@ -1023,7 +1028,7 @@ fn sub_flags(old_rflags: u64, a: u64, b: u64, width: usize) -> u64 {
 ///
 /// `ctx` must point to a valid, initialized [`SoftCpuContext`] whose `entry_exec_addr`
 /// points to a translated block emitted by [`crate::emit::emit_block`].
-pub unsafe fn softcpu_enter_translated(ctx: *mut u8) -> u64 {
+pub(crate) unsafe fn softcpu_enter_translated(ctx: *mut u8) -> u64 {
     let Some(gw) = gateway_trampolines() else {
         return EXIT_REASON_EXCEPTION;
     };
