@@ -144,7 +144,11 @@ impl Github {
                 if !admission.admits_run(&run) {
                     continue;
                 }
-                for job in self.jobs(&run)? {
+                let jobs = self.jobs(&run)?;
+                if !guard_ready(admission, &jobs) {
+                    continue;
+                }
+                for job in jobs {
                     let job_labels: Vec<&str> = job["labels"]
                         .as_array()
                         .ok_or(ScalerError::External("job labels"))?
@@ -244,7 +248,18 @@ impl Github {
     /// admission checks, but serve them regardless of queue depth.
     pub(super) fn vet_assignment(&self, key: JobKey) -> Result<JobPolicy, ScalerError> {
         Self::vet_inner(
-            &Admission::Standing,
+            &if self.request(
+                "GET",
+                &format!("repos/{REPOSITORY}/actions/runs/{}", key.run.0),
+                None,
+                false,
+            )?["path"]
+                == DISPATCH_WORKFLOW
+            {
+                Admission::Agent
+            } else {
+                Admission::Standing
+            },
             key,
             false,
             None,
@@ -270,6 +285,20 @@ impl Github {
             || run["run_attempt"].as_u64() != Some(u64::from(key.attempt))
         {
             return Err(ScalerError::Guard("reserved run is no longer admitted"));
+        }
+        if matches!(admission, Admission::Agent) {
+            let data = request(
+                "GET",
+                &format!(
+                    "repos/{REPOSITORY}/actions/runs/{}/attempts/{}/jobs?per_page=100",
+                    key.run.0, key.attempt
+                ),
+                None,
+                true,
+            )?;
+            if !guard_ready(admission, &pages(&data, "jobs")?) {
+                return Err(ScalerError::Guard("dispatch guard has not succeeded"));
+            }
         }
         let sha = run["head_sha"]
             .as_str()
@@ -325,6 +354,11 @@ impl Github {
         }
         Ok(match admission {
             Admission::Pilot { sha } => JobPolicy::Pilot { sha: sha.clone() },
+            Admission::Agent => JobPolicy::Agent(RunBinding {
+                run: key.run,
+                attempt: key.attempt,
+                sha,
+            }),
             Admission::Standing => JobPolicy::Bound(RunBinding {
                 run: key.run,
                 attempt: key.attempt,
@@ -639,6 +673,15 @@ fn superseded_group(
     None
 }
 
+/// A blocked `needs: guard` job must never consume a credentialed clone.
+/// Demand and the final pre-JIT/reassignment vet both check this attempt.
+fn guard_ready(admission: &Admission, jobs: &[Value]) -> bool {
+    !matches!(admission, Admission::Agent)
+        || jobs.iter().any(|job| {
+            job["name"] == "guard" && job["status"] == "completed" && job["conclusion"] == "success"
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -667,6 +710,46 @@ mod tests {
     fn ancestry(base: &str, head: &str) -> Result<Value, ScalerError> {
         Ok(json!({"status":"ahead","merge_base_commit":{"sha":base},
             "base_commit":{"sha":base},"commits":[{"sha":head}]}))
+    }
+    #[test]
+    fn dispatch_vet_requires_this_attempts_successful_hosted_guard() {
+        let run = json!({"id":42,"run_attempt":2,"head_sha":"a".repeat(40), "head_branch":"main", "event":"issues",
+            "path":DISPATCH_WORKFLOW,"repository":{"full_name":REPOSITORY}, "head_repository":{"full_name":REPOSITORY},
+            "actor":{"login":"tjfontaine"},"triggering_actor":{"login":"tjfontaine"}});
+        let key = JobKey {
+            run: RunId(42),
+            attempt: 2,
+            job: JobId(9),
+        };
+        for (status, conclusion, permitted) in [
+            ("queued", "success", false),
+            ("completed", "failure", false),
+            ("completed", "success", true),
+        ] {
+            let policy = Github::vet_inner(
+                &Admission::Agent,
+                key,
+                true,
+                None,
+                |_, endpoint, _, paginated| {
+                    if endpoint.ends_with("/42") {
+                        return Ok(run.clone());
+                    }
+                    assert_eq!(
+                        endpoint,
+                        "repos/carrick-sh/carrick/actions/runs/42/attempts/2/jobs?per_page=100"
+                    );
+                    assert!(paginated);
+                    Ok(
+                        json!([{"jobs":[{"name":"guard", "status":status,"conclusion":conclusion}]}]),
+                    )
+                },
+            );
+            assert_eq!(policy.is_ok(), permitted);
+            if permitted {
+                assert!(matches!(policy.unwrap(), JobPolicy::Agent(_)));
+            }
+        }
     }
     #[test]
     fn deepest_pending_cumulative_group_only() {

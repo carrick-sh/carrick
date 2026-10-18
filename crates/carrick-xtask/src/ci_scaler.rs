@@ -30,8 +30,10 @@ pub use mac::{
 
 pub const POOL: &str = "carrick-ci";
 pub const REPOSITORY: &str = "carrick-sh/carrick";
-/// The one KVM runner label set: Willow clones register with exactly these,
-/// and every workflow job they serve names exactly these in `runs-on`.
+/// Credentialed agent clones, served by the same Contabo controller.
+pub const AGENT_LABELS: [&str; 1] = ["carrick-agent"];
+pub const DISPATCH_WORKFLOW: &str = ".github/workflows/dispatch-worker.yml";
+/// The KVM runner label set, shared by Willow and Contabo.
 pub const LABELS: [&str; 4] = ["self-hosted", "Linux", "X64", "willow-kvm"];
 /// The one HVF runner label set for cloudmac merge-queue JIT runners.
 pub const HVF_LABELS: [&str; 4] = ["self-hosted", "macOS", "ARM64", "carrick-hvf"];
@@ -50,9 +52,7 @@ const MERGE_QUEUE_PREFIX: &str = "gh-readonly-queue/main/";
 pub enum ScalerError {
     #[error("host lease: {0}")]
     HostLease(#[from] crate::host_lease::HostLeaseError),
-    #[error(
-        "projected Willow CPU {projected:.1}% exceeds director's 80% ceiling; controller stopped"
-    )]
+    #[error("projected clone CPU {projected:.1}% exceeds the 80% admission ceiling")]
     CpuCeiling { projected: f64 },
     #[error("KVM_GET_API_VERSION returned {version}, errno={errno}; expected 12")]
     Kvm { version: i32, errno: i32 },
@@ -127,8 +127,38 @@ pub enum State {
     Destroyed,
 }
 
+/// Clone placement and durable per-lane accounting in the one controller ledger.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CloneLane {
+    #[default]
+    Kvm,
+    Agent,
+}
+impl CloneLane {
+    pub fn template(self) -> u16 {
+        match self {
+            Self::Kvm => 300,
+            Self::Agent => 9000,
+        }
+    }
+    pub fn labels(self) -> &'static [&'static str] {
+        match self {
+            Self::Kvm => &LABELS,
+            Self::Agent => &AGENT_LABELS,
+        }
+    }
+    pub fn admission(self) -> Admission {
+        match self {
+            Self::Kvm => Admission::Standing,
+            Self::Agent => Admission::Agent,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
+    #[serde(default)]
+    pub lane: CloneLane,
     pub key: JobKey,
     pub vm: CloneId,
     pub name: String,
@@ -184,6 +214,16 @@ impl Ledger {
         now: u64,
         limit: Concurrency,
     ) -> Result<Record, ScalerError> {
+        self.reserve_lane(key, inventory, now, limit, CloneLane::Kvm)
+    }
+    pub fn reserve_lane(
+        &mut self,
+        key: JobKey,
+        inventory: &[PoolMember],
+        now: u64,
+        limit: Concurrency,
+        lane: CloneLane,
+    ) -> Result<Record, ScalerError> {
         if self.served(key) {
             return Err(ScalerError::Guard("job already reserved"));
         }
@@ -196,7 +236,7 @@ impl Ledger {
         // unknown object occupies the whole budget: it is never adopted.
         let unknown = inventory.iter().any(|v| {
             v.pool == POOL
-                && !(v.template && (300..=307).contains(&v.id))
+                && !(v.template && ((300..=307).contains(&v.id) || v.id == 9000))
                 && !active.iter().any(|r| r.vm.get() == v.id)
         });
         if unknown {
@@ -204,7 +244,11 @@ impl Ledger {
                 "clone budget occupied by an unknown pool object",
             ));
         }
-        if active.len() >= usize::from(limit.get()) {
+        let lane_limit = match lane {
+            CloneLane::Kvm => usize::from(limit.get()),
+            CloneLane::Agent => 4,
+        };
+        if active.iter().filter(|r| r.lane == lane).count() >= lane_limit {
             return Err(ScalerError::Guard("clone concurrency budget occupied"));
         }
         let vm = (308..=349)
@@ -213,6 +257,7 @@ impl Ledger {
             })
             .ok_or(ScalerError::Guard("no free reserved VMID"))?;
         let row = Record {
+            lane,
             key,
             vm: CloneId::try_from(vm)?,
             name: format!(
@@ -387,6 +432,8 @@ pub enum Admission {
     /// `kernel-runtime.yml` on this repository for a merge group into main,
     /// a push to main, or a workflow_dispatch on main. Never pull_request.
     Standing,
+    /// Owner/App issue labels on main, served only by credentialed Contabo clones.
+    Agent,
 }
 fn full_sha(sha: &str) -> bool {
     sha.len() == 40 && sha.bytes().all(|c| c.is_ascii_hexdigit())
@@ -405,6 +452,7 @@ impl Admission {
         let path = match self {
             Self::Pilot { .. } => PILOT_WORKFLOW,
             Self::Standing => KERNEL_RUNTIME_WORKFLOW,
+            Self::Agent => DISPATCH_WORKFLOW,
         };
         path.rsplit('/').next().unwrap_or(path)
     }
@@ -421,6 +469,21 @@ impl Admission {
                     && run["head_sha"] == sha.as_str()
                     && branch == PILOT_BRANCH
                     && run["path"] == PILOT_WORKFLOW
+            }
+            Self::Agent => {
+                run["head_repository"]["full_name"] == REPOSITORY
+                    && run["path"] == DISPATCH_WORKFLOW
+                    && run["head_sha"].as_str().is_some_and(full_sha)
+                    && event == "issues"
+                    && branch == "main"
+                    && crate::dispatch_worker::trusted_actor(
+                        run["actor"]["login"].as_str().unwrap_or_default(),
+                    )
+                    && crate::dispatch_worker::trusted_actor(
+                        run["triggering_actor"]["login"]
+                            .as_str()
+                            .unwrap_or_default(),
+                    )
             }
             Self::Standing => {
                 run["head_repository"]["full_name"] == REPOSITORY
@@ -443,6 +506,12 @@ impl Admission {
                         && branch == PILOT_BRANCH
                         && context.workflow_ref
                             == format!("{REPOSITORY}/{PILOT_WORKFLOW}@refs/heads/{PILOT_BRANCH}")
+                }
+                Self::Agent => {
+                    context.event == "issues"
+                        && branch == "main"
+                        && context.workflow_ref
+                            == format!("{REPOSITORY}/{DISPATCH_WORKFLOW}@refs/heads/main")
                 }
                 Self::Standing => {
                     standing_event_ref(&context.event, branch)
@@ -502,12 +571,18 @@ impl RunnerRegistration for Record {
         self.assigned = Some(job);
     }
 }
-pub fn admit_resources(cpu_busy: f64, threads: u32, available: u64) -> bool {
+pub fn admit_resources(
+    cpu_busy: f64,
+    threads: u32,
+    available: u64,
+    cores: u32,
+    memory_mib: u64,
+) -> bool {
     cpu_busy.is_finite()
         && (0.0..=1.0).contains(&cpu_busy)
         && threads > 0
-        && cpu_busy + 2.0 / f64::from(threads) <= 0.80
-        && available >= 10 << 30 // 4 GiB clone + 6 GiB host reserve
+        && cpu_busy + f64::from(cores) / f64::from(threads) <= 0.80
+        && available >= (memory_mib << 20) + (6 << 30) // clone + 6 GiB host reserve
 }
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Assignment {
@@ -587,10 +662,13 @@ pub struct RunBinding {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobPolicy {
     /// The historical pilot: [`Admission::Pilot`] for one approved SHA.
-    Pilot { sha: String },
+    Pilot {
+        sha: String,
+    },
     /// [`Admission::Standing`] restricted to the one run the controller
     /// vetted (repository, workflow, event, ref, merge-group PR heads).
     Bound(RunBinding),
+    Agent(RunBinding),
 }
 impl JobPolicy {
     pub fn parse(text: &str) -> Result<Self, ScalerError> {
@@ -599,9 +677,9 @@ impl JobPolicy {
         match words.as_slice() {
             ["pilot", sha] => match Admission::pilot(sha)? {
                 Admission::Pilot { sha } => Ok(Self::Pilot { sha }),
-                Admission::Standing => Err(ScalerError::Guard("pilot policy")),
+                _ => Err(ScalerError::Guard("pilot policy")),
             },
-            ["standing", run, attempt, sha] => {
+            [kind @ ("standing" | "agent"), run, attempt, sha] => {
                 let run = field(run, "run=")
                     .and_then(|v| v.parse::<u64>().ok())
                     .ok_or(ScalerError::Guard("policy run id"))?;
@@ -613,11 +691,16 @@ impl JobPolicy {
                     .filter(|s| full_sha(s))
                     .ok_or(ScalerError::Guard("policy sha"))?
                     .to_ascii_lowercase();
-                Ok(Self::Bound(RunBinding {
+                let binding = RunBinding {
                     run: RunId(run),
                     attempt,
                     sha,
-                }))
+                };
+                Ok(if *kind == "agent" {
+                    Self::Agent(binding)
+                } else {
+                    Self::Bound(binding)
+                })
             }
             _ => Err(ScalerError::Guard("unrecognized runner job policy")),
         }
@@ -625,6 +708,7 @@ impl JobPolicy {
     pub fn render(&self) -> String {
         match self {
             Self::Pilot { sha } => format!("pilot {sha}"),
+            Self::Agent(b) => format!("agent run={} attempt={} sha={}", b.run.0, b.attempt, b.sha),
             Self::Bound(b) => format!(
                 "standing run={} attempt={} sha={}",
                 b.run.0, b.attempt, b.sha
@@ -635,8 +719,13 @@ impl JobPolicy {
     pub fn authorize(&self, context: &JobContext) -> Result<(), ScalerError> {
         match self {
             Self::Pilot { sha } => Admission::Pilot { sha: sha.clone() }.authorize(context),
-            Self::Bound(binding) => {
-                Admission::Standing.authorize(context)?;
+            Self::Bound(binding) | Self::Agent(binding) => {
+                if matches!(self, Self::Agent(_)) {
+                    Admission::Agent
+                } else {
+                    Admission::Standing
+                }
+                .authorize(context)?;
                 if context.run_id == binding.run.0
                     && context.run_attempt == binding.attempt
                     && context.sha == binding.sha
@@ -1010,7 +1099,11 @@ fn now() -> Result<u64, ScalerError> {
 
 // Capture output in memory, never in a command log or a tempfile. Bounds apply
 // to every external command (including gh and ssh), not just guest readiness.
-fn execute(command: &mut Command, input: &[u8], limit: Duration) -> Result<Vec<u8>, ScalerError> {
+pub(crate) fn execute(
+    command: &mut Command,
+    input: &[u8],
+    limit: Duration,
+) -> Result<Vec<u8>, ScalerError> {
     use std::os::unix::process::{CommandExt, ExitStatusExt};
     let program = Path::new(command.get_program())
         .file_name()

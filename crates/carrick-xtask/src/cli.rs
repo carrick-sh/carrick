@@ -37,6 +37,10 @@ pub enum Commands {
 
     #[command(about = "Owner-approved JIT ephemeral runners: Willow KVM clones and cloudmac HVF")]
     CiScaler(crate::ci_scaler::ScalerArgs),
+    #[command(about = "Run an owner/App issue-label worker on an ephemeral clone")]
+    DispatchWorker(crate::dispatch_worker::DispatchArgs),
+    #[command(about = "Bootstrap job-scoped agent tools and credentials")]
+    AgentRunner(crate::agent_runner::Args),
     #[command(about = "Compare trusted-runner accept receipts against a per-SHA baseline")]
     CiReceipt(crate::ci_receipt::ReceiptArgs),
     #[command(about = "Authorize, execute and publish the on-demand signed Actions gate")]
@@ -424,6 +428,16 @@ where
         Commands::AsmDiff(args) => {
             let info = resolve_repo_info(cli.root.as_deref())?;
             crate::asm_diff::run(&info.repository_root, args, writer)?;
+            Ok(())
+        }
+        Commands::AgentRunner(args) => {
+            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
+            crate::agent_runner::run(&root, args)?;
+            Ok(())
+        }
+        Commands::DispatchWorker(args) => {
+            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
+            crate::dispatch_worker::run(&root, args)?;
             Ok(())
         }
         Commands::CiScaler(args) => {

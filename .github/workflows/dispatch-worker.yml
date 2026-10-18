@@ -1,0 +1,103 @@
+name: Dispatch issue worker
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+# Per-issue serialization; the clone controller independently caps its pool at 4.
+concurrency:
+  group: dispatch-worker-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Validate actor, tier and brief before requesting a worker
+        run: cargo run --locked --release -p carrick-xtask -- dispatch-worker guard --event "$GITHUB_EVENT_PATH"
+
+  worker:
+    needs: guard
+    runs-on: [carrick-agent]
+    environment: agent-dispatch
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 5
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/cache@v4
+        with:
+          path: ~/.rustup/toolchains
+          key: dispatch-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: '1.96.0'
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: dispatch-worker
+      - name: Build workflow driver
+        id: driver
+        timeout-minutes: 10
+        run: cargo build --locked --release -p carrick-xtask
+      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+        id: director-token
+        with:
+          app-id: ${{ secrets.CARRICK_WORKERS_APP_ID }}
+          private-key: ${{ secrets.CARRICK_WORKERS_PRIVATE_KEY }}
+          owner: carrick-sh
+          repositories: agy-director
+          permission-contents: read
+      - name: Bootstrap pinned agent tools and private foreground launcher
+        id: bootstrap
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ steps.director-token.outputs.token }}
+        run: target/release/carrick-xtask agent-runner bootstrap
+      - name: Materialize selected provider credentials
+        id: auth
+        env:
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+          AGY_AUTH_FILES_JSON: ${{ secrets.AGY_AUTH_FILES_JSON }}
+        run: target/release/carrick-xtask agent-runner auth --event "$GITHUB_EVENT_PATH"
+      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+        id: worker-token
+        if: ${{ !cancelled() && steps.driver.outcome == 'success' }}
+        with:
+          app-id: ${{ secrets.CARRICK_WORKERS_APP_ID }}
+          private-key: ${{ secrets.CARRICK_WORKERS_PRIVATE_KEY }}
+          owner: carrick-sh
+          repositories: carrick
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+      - name: Run worker and publish draft PR and contract
+        if: ${{ !cancelled() && steps.worker-token.outcome == 'success' }}
+        timeout-minutes: 40
+        env:
+          GH_TOKEN: ${{ steps.worker-token.outputs.token }}
+        run: >-
+          target/release/carrick-xtask dispatch-worker run --event "$GITHUB_EVENT_PATH"
+          --setup-status '${{ steps.bootstrap.outcome }}/${{ steps.auth.outcome }}'
+      - name: Remove job credentials and provider state
+        if: always()
+        run: |
+          if test -x target/release/carrick-xtask; then
+            target/release/carrick-xtask agent-runner cleanup
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dispatch-${{ github.event.issue.number }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dispatch-result/
+          if-no-files-found: warn

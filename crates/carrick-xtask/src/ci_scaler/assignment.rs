@@ -168,7 +168,7 @@ pub fn admit_assigned(
     owner: u32,
     limit: Duration,
 ) -> Result<(), ScalerError> {
-    Admission::Standing.authorize(context)?;
+    authorize_context(context)?;
     if context.run_id == 0 || context.run_attempt == 0 {
         return Err(ScalerError::Guard("invalid assigned run identity"));
     }
@@ -206,7 +206,7 @@ pub(super) fn parse_request(bytes: &[u8]) -> Result<Option<JobContext>, ScalerEr
         return Err(ScalerError::Guard("assignment request too large"));
     }
     let context = serde_json::from_slice(bytes)?;
-    Admission::Standing.authorize(&context)?;
+    authorize_context(&context)?;
     Ok(Some(context))
 }
 
@@ -261,7 +261,7 @@ pub fn assigned_job_key(
     labels: &[&str],
     jobs: &[Value],
 ) -> Result<JobKey, ScalerError> {
-    Admission::Standing.authorize(context)?;
+    authorize_context(context)?;
     let jobs: Vec<_> = jobs
         .iter()
         .filter(|job| job["runner_id"].as_u64() == Some(runner.0))
@@ -440,7 +440,7 @@ pub(super) fn serve_assignment<L: Refusals>(
         return Ok(Revetted::Idle);
     };
     let context = request.context;
-    Admission::Standing.authorize(&context)?;
+    authorize_context(&context)?;
     let runner = runner.ok_or(ScalerError::Guard("assignment has no registered runner"))?;
     let jobs = api.run_jobs(RunId(context.run_id), context.run_attempt)?;
     let key = assigned_job_key(&context, runner, labels, &jobs)?;
@@ -465,6 +465,14 @@ pub(super) fn serve_assignment<L: Refusals>(
     }
     exchange.approve(&policy)?;
     Ok(Revetted::Approved(key, policy))
+}
+
+fn authorize_context(context: &JobContext) -> Result<(), ScalerError> {
+    if context.workflow_ref == format!("{REPOSITORY}/{DISPATCH_WORKFLOW}@refs/heads/main") {
+        Admission::Agent.authorize(context)
+    } else {
+        Admission::Standing.authorize(context)
+    }
 }
 
 #[cfg(test)]

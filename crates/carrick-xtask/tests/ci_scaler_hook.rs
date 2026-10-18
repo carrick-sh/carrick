@@ -213,3 +213,344 @@ fn cloudmac_launch_isolates_the_runner_session_before_it_can_receive_a_job() {
     assert!(!source.contains(".arg(\"--jitconfig\")"));
     assert!(source.contains("libc::setuid(uid)"));
 }
+
+/// The full dispatch driver runs against a real local git remote and the real
+/// lease broker over stdio. Only the agent/GitHub service and deadline duration
+/// are substituted. No credentials, network or Proxmox mutations are involved.
+#[cfg(target_os = "linux")]
+#[test]
+fn dispatch_foreground_publishes_success_failure_and_timeout() {
+    use std::os::unix::fs::PermissionsExt;
+    let xtask = env!("CARGO_BIN_EXE_carrick-xtask");
+    for case in [
+        "done",
+        "failed",
+        "timeout",
+        "update",
+        "agy",
+        "collision",
+        "push-failure",
+        "setup-failed",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let checkout = root.join("checkout");
+        let bin = root.join("bin");
+        std::fs::create_dir(&checkout).unwrap();
+        std::fs::create_dir(&bin).unwrap();
+        let run_git = |cwd: &std::path::Path, args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "Fixture")
+                .env("GIT_AUTHOR_EMAIL", "fixture@localhost")
+                .env("GIT_COMMITTER_NAME", "Fixture")
+                .env("GIT_COMMITTER_EMAIL", "fixture@localhost")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run_git(&checkout, &["init", "-b", "main"]);
+        run_git(&checkout, &["config", "core.hooksPath", "/dev/null"]);
+        std::fs::write(checkout.join("README"), "fixture base").unwrap();
+        run_git(&checkout, &["add", "README"]);
+        run_git(&checkout, &["commit", "-m", "fixture base"]);
+        let remote = root.join("origin.git");
+        run_git(root, &["init", "--bare", remote.to_str().unwrap()]);
+        run_git(&checkout, &["push", remote.to_str().unwrap(), "main"]);
+        if matches!(case, "update" | "collision") {
+            run_git(&checkout, &["checkout", "-b", "seed"]);
+            std::fs::write(checkout.join("previous"), "earlier worker change").unwrap();
+            run_git(&checkout, &["add", "previous"]);
+            run_git(&checkout, &["commit", "-m", "previous worker"]);
+            run_git(
+                &checkout,
+                &[
+                    "push",
+                    remote.to_str().unwrap(),
+                    "HEAD:refs/heads/work/fixture-634",
+                ],
+            );
+            run_git(&checkout, &["checkout", "main"]);
+        }
+        run_git(
+            &checkout,
+            &[
+                "fetch",
+                remote.to_str().unwrap(),
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+        );
+        let scripts = [
+            ("git", r#"#!/bin/sh
+if [ "$1" = push ] && [ "$TEST_CASE" = push-failure ]; then exit 77; fi
+exec /usr/bin/git "$@"
+"#.to_owned()),
+            ("gh", r#"#!/bin/sh
+case "$1 $2" in
+  'auth setup-git') exit 0 ;;
+  'pr list')
+    if [ "$TEST_CASE" = update ]; then
+      echo '[{"number":999,"url":"https://github.com/carrick-sh/carrick/pull/999","isDraft":false,"headRepositoryOwner":{"login":"carrick-sh"},"headRepository":{"name":"carrick"}}]'
+    else echo '[]'; fi ;;
+  'pr ready') printf 'draft\n' > "$TEST_ROOT/draft" ;;
+  'pr edit')
+    for arg in "$@"; do last=$arg; done
+    cp "$last" "$TEST_ROOT/pr-body.md" ;;
+  'pr create')
+    for arg in "$@"; do last=$arg; done
+    cp "$last" "$TEST_ROOT/pr-body.md"
+    echo 'https://github.com/carrick-sh/carrick/pull/999' ;;
+  'issue comment')
+    for arg in "$@"; do last=$arg; done
+    cp "$last" "$TEST_ROOT/comment.md" ;;
+  *) exit 91 ;;
+esac
+"#.to_owned()),
+            ("python3", r#"#!/bin/sh
+if [ "$TEST_CASE" = agy ]; then
+  test "$AGY_BIN" = "$TEST_ROOT/carrick-agent-42-1/bin/agy" || exit 96
+fi
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --result-file ]; then shift; result=$1; fi
+  shift
+done
+printf 'worker change\n' > payload
+mkdir -p conformance-probes
+ln -s /tmp conformance-probes/target
+case "$TEST_CASE" in
+  timeout) exit 124 ;;
+  failed) exit 7 ;;
+esac
+git add -- payload
+git commit -m 'feat(ci): fixture worker change' -m 'Why: test foreground dispatch.
+
+What: preserve worker changes.
+
+Verified: local fixture.
+
+Co-Authored-By: GPT-6.1 Sol <noreply@openai.com>' || exit $?
+if [ "$TEST_CASE" = agy ]; then
+  git commit --amend -m 'feat(ci): fixture agy worker change' -m 'Why: test dispatch.
+
+What: preserve worker changes.
+
+Verified: fixture.
+
+Co-Authored-By: Gemini 4 Argon <noreply@google.com>' || exit $?
+fi
+printf '%s\n' '{"status":"SUCCESS","transport":{"exit_code":0,"timed_out":false},"structured_output":{"status":"done","summary":"fixture complete","tests":["fixture"],"risks":[]}}' > "$result"
+"#.to_owned()),
+            ("ssh", format!("#!/bin/sh\nexec '{}' host-lease broker --lock-path \"$TEST_ROOT/host.lock\"\n", xtask)),
+        ];
+        for (name, script) in scripts {
+            let path = bin.join(name);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::File::create(root.join("host.lock")).unwrap();
+        std::fs::write(root.join("site.toml"), "broker = 'fixture@localhost'\nidentity_file = '/unused/key'\nknown_hosts_file = '/unused/known_hosts'\n").unwrap();
+        let brief = if case == "update" {
+            "## Brief\nBranch: work/fixture-634\nContinue fixture."
+        } else {
+            "## Brief\nImplement fixture."
+        };
+        let label = if case == "agy" {
+            "dispatch:argon-high"
+        } else {
+            "dispatch:sol-high"
+        };
+        let event = serde_json::json!({"repository":{"full_name":"carrick-sh/carrick"},"action":"labeled",
+            "sender":{"login":"tjfontaine","type":"User"},"label":{"name":label},
+            "issue":{"number":634,"title":"Fixture","body":brief}});
+        std::fs::write(root.join("event.json"), event.to_string()).unwrap();
+        let state = root.join("carrick-agent-42-1");
+        std::fs::create_dir_all(state.join("home")).unwrap();
+        let output = Command::new("/usr/bin/timeout")
+            .args(["30", xtask, "dispatch-worker", "run", "--event"])
+            .arg(root.join("event.json"))
+            .arg("--setup-status")
+            .arg(if case == "setup-failed" {
+                "failure/skipped"
+            } else {
+                "success/success"
+            })
+            .current_dir(&checkout)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("HOME", root)
+            .env("GH_TOKEN", "fixture-only")
+            .env("GITHUB_TRIGGERING_ACTOR", "tjfontaine")
+            .env("GITHUB_RUN_ID", "42")
+            .env("GITHUB_RUN_ATTEMPT", "1")
+            .env("RUNNER_TEMP", root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env(
+                "GIT_CONFIG_KEY_0",
+                format!("url.{}.insteadOf", remote.display()),
+            )
+            .env(
+                "GIT_CONFIG_VALUE_0",
+                "https://github.com/carrick-sh/carrick",
+            )
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@localhost")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@localhost")
+            .env("TEST_ROOT", root)
+            .env("TEST_CASE", case)
+            .env_remove("CARRICK_HOST_LEASE_SOCKET")
+            .env_remove("CARRICK_HOST_LEASE_SCOPE_FD")
+            .env_remove("CARRICK_HOST_LEASE_FD")
+            .env_remove("CARRICK_HOST_LEASE_MODE")
+            .env_remove("CARRICK_HOST_LEASE_PATH")
+            .env("CARRICK_HOST_LEASE_CONFIG", root.join("site.toml"))
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            matches!(case, "done" | "update" | "agy"),
+            "{case}: {output:?}"
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(checkout.join("dispatch-result/result.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            receipt["success"],
+            matches!(case, "done" | "update" | "agy"),
+            "{case}: {receipt}"
+        );
+        if case == "setup-failed" {
+            assert!(receipt["pr"].is_null());
+            assert!(
+                std::fs::read_to_string(root.join("comment.md"))
+                    .unwrap()
+                    .contains("no agent was started")
+            );
+            continue;
+        }
+        if case == "push-failure" {
+            assert!(receipt["pr"].is_null());
+            let bundle = checkout.join("dispatch-result/work.bundle");
+            assert!(bundle.is_file());
+            run_git(
+                &remote,
+                &[
+                    "fetch",
+                    bundle.to_str().unwrap(),
+                    "HEAD:refs/heads/recovered",
+                ],
+            );
+            assert_eq!(
+                run_git(&remote, &["rev-parse", "recovered"]).trim(),
+                receipt["sha"].as_str().unwrap()
+            );
+            assert!(run_git(&remote, &["ls-tree", "--name-only", "recovered"]).contains("payload"));
+            assert!(
+                std::fs::read_to_string(root.join("comment.md"))
+                    .unwrap()
+                    .contains("PR publication")
+            );
+            continue;
+        }
+        if case == "collision" {
+            assert!(receipt["pr"].is_null());
+            assert!(
+                std::fs::read_to_string(root.join("comment.md"))
+                    .unwrap()
+                    .contains("branch already exists")
+            );
+            let files = run_git(&remote, &["ls-tree", "--name-only", "work/fixture-634"]);
+            assert!(files.contains("previous"));
+            assert!(!files.contains("payload"));
+            continue;
+        }
+        assert_eq!(receipt["timeout"], case == "timeout");
+        assert_eq!(
+            receipt["pr"],
+            "https://github.com/carrick-sh/carrick/pull/999"
+        );
+        assert!(
+            std::fs::read_to_string(root.join("comment.md"))
+                .unwrap()
+                .contains(receipt["sha"].as_str().unwrap())
+        );
+        let message = run_git(&remote, &["log", "-1", "--format=%B", "work/fixture-634"]);
+        let trailer = if case == "agy" {
+            "Co-Authored-By: Gemini 4 Argon <noreply@google.com>"
+        } else {
+            "Co-Authored-By: GPT-6.1 Sol <noreply@openai.com>"
+        };
+        assert!(message.contains(trailer));
+        assert!(
+            std::fs::read_to_string(root.join("pr-body.md"))
+                .unwrap()
+                .contains("Closes #634")
+        );
+        let body = std::fs::read_to_string(root.join("pr-body.md")).unwrap();
+        assert!(!body.contains("NEW: none"));
+        assert!(body.contains("Not compared"));
+        if case == "update" {
+            assert!(root.join("draft").is_file());
+        }
+        if matches!(case, "failed" | "timeout") {
+            assert!(message.contains("checkpoint issue 634"));
+        }
+        let files = run_git(&remote, &["ls-tree", "--name-only", "work/fixture-634"]);
+        assert!(files.contains("payload"));
+        assert!(!files.contains("conformance-probes"));
+    }
+}
+
+#[test]
+fn agent_auth_is_job_scoped_private_and_always_cleanable() {
+    use std::os::unix::fs::PermissionsExt;
+    let xtask = env!("CARGO_BIN_EXE_carrick-xtask");
+    for backend in ["codex", "agy"] {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("carrick-agent-42-1");
+        let home = state.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let event = temp.path().join("event.json");
+        let label = if backend == "codex" {
+            "dispatch:sol-high"
+        } else {
+            "dispatch:opus"
+        };
+        std::fs::write(&event, serde_json::json!({"repository":{"full_name":"carrick-sh/carrick"},
+            "action":"labeled","sender":{"login":"tjfontaine","type":"User"},
+            "label":{"name":label},"issue":{"number":634,"title":"Fixture","body":"## Brief\nImplement fixture"}}).to_string()).unwrap();
+        let invoke = |args: &[&str]| {
+            Command::new(xtask).args(args)
+            .env("RUNNER_TEMP", temp.path()).env("GITHUB_RUN_ID", "42").env("GITHUB_RUN_ATTEMPT", "1")
+            .env("GITHUB_TRIGGERING_ACTOR", "tjfontaine")
+            .env("CODEX_AUTH_JSON", r#"{"access_token":"fixture-secret"}"#)
+            .env("AGY_AUTH_FILES_JSON", r#"{"antigravity-oauth-token":"fixture-secret","jetski_state.pbtxt":"opaque","installation_id":"fixture"}"#)
+            .output().unwrap()
+        };
+        let output = invoke(&["agent-runner", "auth", "--event", event.to_str().unwrap()]);
+        assert!(output.status.success(), "{output:?}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("fixture-secret"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture-secret"));
+        let auth = if backend == "codex" {
+            home.join(".codex/auth.json")
+        } else {
+            home.join(".gemini/antigravity-cli/antigravity-oauth-token")
+        };
+        assert_eq!(auth.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(home.join(".codex").exists(), backend == "codex");
+        assert_eq!(home.join(".gemini").exists(), backend == "agy");
+        assert!(
+            !invoke(&["agent-runner", "auth", "--event", event.to_str().unwrap()])
+                .status
+                .success()
+        );
+        assert!(invoke(&["agent-runner", "cleanup"]).status.success());
+        assert!(!state.exists());
+        assert!(invoke(&["agent-runner", "cleanup"]).status.success());
+    }
+}

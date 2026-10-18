@@ -1,0 +1,138 @@
+# Issue-label worker dispatch (#634)
+
+An owner/App issue-label event runs a foreground agent, preserves its branch,
+opens or updates a draft PR with `Closes #N`, and comments the structured
+contract on the issue. No director session is involved. Implementation lives
+in `xtask dispatch-worker` and `xtask agent-runner`; the workflow only wires
+Actions credentials, caches and lifecycle steps.
+
+## Labels and brief
+
+The checked-in [tier allowlist](../../.github/dispatch-tiers.toml) is exact:
+
+| Label | Backend | Model | Effort |
+|---|---|---|---|
+| `dispatch:sol-high` | codex | gpt-6.1-sol | high |
+| `dispatch:argon-high` | agy | argon-high | backend default |
+| `dispatch:opus` | agy | opus | backend default |
+
+Only `tjfontaine` or `carrick-workers[bot]` may label or rerun dispatches.
+The hosted guard validates repository, actor identity/type, label and brief
+before requesting a worker. The worker repeats validation. Unknown labels or
+other actors fail closed. The Contabo controller independently verifies the
+trusted main workflow, both actors and the completed successful guard job on
+the current run attempt before reserving a clone or accepting reassignment.
+
+An issue needs a nonempty `## Brief` section. It ends at the next level-one or
+level-two heading outside code fences. For example:
+
+```markdown
+## Brief
+Fix the documented scheduler contract. Include the red witness and focused tests.
+```
+
+A single explicit `Branch: work/existing-123` line in the brief resumes that
+remote branch and rebases it onto freshly fetched GitHub main. Otherwise the
+worker creates `work/<title-slug>-<issue>` from GitHub main and refuses an
+already existing remote branch. Issue text never becomes shell source.
+Each issue's labels serialize; pool capacity is enforced by the controller.
+
+## Runner-independent setup and protected credentials
+
+The job requires only the `carrick-agent` label, independent of runner provider.
+A standard Linux or macOS Actions runner needs git, gh, curl and Python 3.
+The workflow installs the pinned Rust toolchain and caches Cargo build outputs.
+`agent-runner bootstrap` installs codex, agy and just from the checked-in
+[tool manifest](../../scripts/ci/inputs/agent-tools.json). Versioned URLs and
+SHA-256/SHA-512 digests are verified before extracting only the named regular
+binary. AGY auto-update is disabled. The private `carrick-sh/agy-director`
+launcher is fetched at the manifest's exact commit, never floating main.
+Its `dispatch --foreground --result-file` path owns, waits for and reaps the
+worker using the same backend/model/SDK resolution as director dispatch.
+The foreground launcher disables mailbox instructions.
+
+Configure protected environment **`agent-dispatch`** to allow **main only**.
+It is entered only after the owner/App guard. Required environment secrets:
+
+| Secret | Purpose |
+|---|---|
+| `CARRICK_WORKERS_APP_ID` | carrick-workers App ID |
+| `CARRICK_WORKERS_PRIVATE_KEY` | App signing key, used only by token mint steps |
+| `CODEX_AUTH_JSON` | Owner's refreshed Codex cached auth JSON |
+| `AGY_AUTH_FILES_JSON` | JSON object mapping AGY auth basenames to opaque file contents |
+
+The AGY object must include `antigravity-oauth-token`, `jetski_state.pbtxt`
+and `installation_id`; `settings.json` is optional. Other filenames are refused.
+Only the selected backend's files are materialized. The job-scoped home has
+mode 0700; auth files have mode 0600 and cannot overwrite an existing file.
+Codex uses file credential storage in that home. Agent auth, provider logs,
+private checkout and writable SDK caches live under the job's `RUNNER_TEMP`
+state, outside Cargo caches and uploaded artifacts. The always-run cleanup
+removes the entire state. Runner cancellation still depends on Actions running
+cleanup; the Contabo provider also destroys its one-job VM.
+
+Two short-lived App tokens are minted separately: read-only contents access
+to `agy-director` for bootstrap, then contents/issues/PR write access to
+`carrick` for the worker and publisher. The worker receives no private-repo
+write token or App signing key. Token lifetime bounds the 30-minute agent
+turn and 40-minute worker/publication step. No token or auth file is printed,
+cached, uploaded or written back to the owner.
+
+The source of truth is the owner's Mac login state. The owner signs into
+codex/agy there; its launchd refresher refreshes locally and pushes updated
+protected secrets. Shared refresh-token collisions are an owner-accepted
+risk: refresh then push on the Mac, bound jobs, and never sync clone state
+back. This supersedes the original requirement to log into template VM 9000;
+job setup does not depend on baked template credentials. See the
+[owner decision](https://github.com/carrick-sh/carrick/issues/634#issuecomment-6252166307).
+Python launcher code stays in the private repo, not in Carrick.
+
+## Work, results and recovery
+
+The agent runs in a fresh worktree under a shared local `carrick` build lease.
+On Contabo, leases are per VM under
+[owner decision #639](https://github.com/carrick-sh/carrick/issues/639).
+The controller holds no physical-host custody. Other configured hosts retain
+their own HostLease selection; a broker is used only when configured.
+
+The JSON contract contains `status` (`done`, `blocked`, `failed`), `summary`,
+`tests` and `risks`. The issue comment also records the actual branch, SHA,
+draft PR, transport exit/timeout and publication errors. A completed work
+contract does not hide transport failure. Uncommitted changes become a WIP
+commit with the tier's vendor noreply trailer, including on timeout/failure.
+Hooks remain enabled; checkpoint failure is reported, not bypassed.
+
+Bootstrap/auth failures are reported with the same trusted driver without
+starting unverified tools. A driver-build or App-token failure is visible in
+Actions logs; it cannot publish a contract without a working driver/token.
+
+The publisher pushes with an exact expected remote tip, opens or updates a
+same-repository draft PR using the PR template, and includes `Closes #N`.
+No-change runs do not fabricate a PR. `dispatch-result` retains the contract,
+receipt, issue comment, branch bundle and binary patch, allowing recovery when
+push fails. Provider logs and credentials are excluded. Preserve this artifact
+before retrying; resume via an explicit branch directive. A dispatch whose
+result cannot be published exits nonzero rather than claiming success.
+
+## Contabo provider and retirement
+
+The existing standing ci-scaler controller services the `carrick-agent` lane;
+there is no second controller. It clones template **9000**, with **8 vCPU /
+20 GiB**, capped at **four active agent clones** independently of KVM capacity.
+It retains the existing resource/headroom checks, durable ledger, restricted
+VMID pool, JIT one-job runners, assignment checks, recovery and cleanup.
+`CARRICK_AGENT_CLONES=0` stops new agent admission while existing clones drain.
+The provider's template needs runner/SSH plumbing and these ordinary runner
+prerequisites, not provider login credentials. Install this rollout's agent-aware
+xtask at `/usr/local/bin/carrick-xtask` in VM 9000: the controller refuses old
+binaries before minting a JIT runner. This provider admission hook is separate
+from the runner-independent workflow bootstrap. The owner deploys controller,
+App/environment settings and template changes, then performs the live trial.
+
+Retire ctb-w1..w4 only after **three successful end-to-end draft PRs** from
+fresh clones. Record all three issue numbers, workflow runs, clone IDs,
+contract comments, branch SHAs, draft PRs and destruction evidence on #634.
+Exercise both backends and failure/WIP cleanup before claiming operational
+acceptance. Drain outstanding work, archive/push each old worker's branches,
+remove its runner registration and credentials, then have the owner shut down
+and destroy those VMs. Workers must not modify other VMs or the hypervisor.
