@@ -2628,6 +2628,108 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
         res_b = run_just_recipe(b0_sha, "HEAD")
         self.assertEqual(res_b.returncode, 0, msg=f"case b stdout: {res_b.stdout}\nstderr: {res_b.stderr}")
 
+    def test_new7_should_panic_and_macro_blanking_fail_when_reverted(self):
+        """NEW-7: #[should_panic] rejection (on a test that references the changed surface) and _blank_macro_defs (on an uninvoked macro_rules! inside a real #[test] fn) must fail if reverted."""
+        # (a) #[should_panic] on a test that directly calls the changed surface function
+        self.use_single_contract_surface()
+        self.guest_file.write_text("// base futex\n", encoding="utf-8")
+        self._write_futex_contract('docker = "probe:futex"\n')
+        base_sha = self._commit_all("seed base for new7", allow_empty=True)
+
+        self.guest_file.write_text(
+            "pub fn futex_target_new7() -> i32 { 1 }\n"
+            "#[cfg(test)]\nmod tests {\n"
+            "    #[test]\n"
+            "    #[should_panic]\n"
+            "    fn panic_witness() { assert_eq!(super::futex_target_new7(), 1); }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        self._write_futex_contract('vm_free = "carrick-kernel::dispatch::futex::tests::panic_witness"\n')
+        head_a = self._commit_all("add should_panic test that references changed surface")
+        res_a = self.run_check(base_sha=base_sha)
+        self.assertEqual(res_a.returncode, 1, msg=f"case a stdout: {res_a.stdout}\nstderr: {res_a.stderr}")
+
+        # Verify reverting _has_should_panic_attr would let panic_witness resolve
+        spec = importlib.util.spec_from_file_location("check_contract_change_new7a", SCRIPT_PATH)
+        checker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(checker)
+        view_a = checker.RepoView(self.repo, head_a, use_worktree=True)
+        self.assertIsNone(
+            checker.resolve_binding_at_view(view_a, "carrick-kernel::dispatch::futex::tests::panic_witness", require_leaf=True)
+        )
+        checker._has_should_panic_attr = lambda _attrs: False
+        checker._extract_top_level_test_fns.cache_clear()
+        self.assertIsNotNone(
+            checker.resolve_binding_at_view(view_a, "carrick-kernel::dispatch::futex::tests::panic_witness", require_leaf=True)
+        )
+
+        # (b) Uninvoked macro_rules! inside a real depth-0 #[test] fn that mentions the changed surface
+        self.guest_file.write_text(
+            "pub fn futex_target_new7() -> i32 { 1 }\n"
+            "#[cfg(test)]\nmod tests {\n"
+            "    #[test]\n"
+            "    fn macro_def_witness() {\n"
+            "        macro_rules! uninvoked_mention {\n"
+            "            () => {\n"
+            "                assert_eq!(super::futex_target_new7(), 1);\n"
+            "            };\n"
+            "        }\n"
+            "        assert_eq!(1, 1);\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        self._write_futex_contract('vm_free = "carrick-kernel::dispatch::futex::tests::macro_def_witness"\n')
+        head_b = self._commit_all("add uninvoked macro_rules mention inside real test fn")
+        res_b = self.run_check(base_sha=base_sha)
+        self.assertEqual(res_b.returncode, 1, msg=f"case b stdout: {res_b.stdout}\nstderr: {res_b.stderr}")
+        self.assertIn("does not reference changed surface", res_b.stderr)
+
+        # Verify reverting _blank_macro_defs would let macro_def_witness satisfy relevance
+        spec_b = importlib.util.spec_from_file_location("check_contract_change_new7b", SCRIPT_PATH)
+        checker_b = importlib.util.module_from_spec(spec_b)
+        spec_b.loader.exec_module(checker_b)
+        base_view_b = checker_b.RepoView(self.repo, base_sha)
+        head_view_b = checker_b.RepoView(self.repo, head_b, use_worktree=True)
+        resolved_b = checker_b.resolve_binding_at_view(
+            head_view_b, "carrick-kernel::dispatch::futex::tests::macro_def_witness", require_leaf=True
+        )
+        self.assertIsNotNone(resolved_b)
+        self.assertFalse(
+            checker_b.bound_test_references_surface(
+                self.repo,
+                base_view_b,
+                head_view_b,
+                base_sha,
+                head_b,
+                "crates/carrick-kernel/src/dispatch/futex.rs",
+                resolved_b[2],
+                resolved_b[3],
+                {},
+                {},
+            )
+        )
+        checker_b._blank_macro_defs = lambda s, cs: (s, cs)
+        checker_b._extract_top_level_test_fns.cache_clear()
+        resolved_b_reverted = checker_b.resolve_binding_at_view(
+            head_view_b, "carrick-kernel::dispatch::futex::tests::macro_def_witness", require_leaf=True
+        )
+        self.assertTrue(
+            checker_b.bound_test_references_surface(
+                self.repo,
+                base_view_b,
+                head_view_b,
+                base_sha,
+                head_b,
+                "crates/carrick-kernel/src/dispatch/futex.rs",
+                resolved_b_reverted[2],
+                resolved_b_reverted[3],
+                {},
+                {},
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
