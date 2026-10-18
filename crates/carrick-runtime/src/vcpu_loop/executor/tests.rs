@@ -79,6 +79,7 @@ struct DescendantPublication {
 
 #[derive(Debug)]
 struct FakeBinding {
+    drop_notification: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
     marker: u64,
     thread: parking_lot::Mutex<Option<Arc<carrick_kernel::kernel::Thread>>>,
     steps: parking_lot::Mutex<VecDeque<Step>>,
@@ -149,6 +150,7 @@ pub(crate) fn test_guest_cpu_state(marker: u64) -> GuestCpuState {
 impl FakeBinding {
     fn new(marker: u64, steps: impl IntoIterator<Item = Step>) -> Arc<Self> {
         Arc::new(Self {
+            drop_notification: parking_lot::Mutex::new(None),
             marker,
             thread: parking_lot::Mutex::new(None),
             steps: parking_lot::Mutex::new(steps.into_iter().collect()),
@@ -233,6 +235,14 @@ impl FakeBinding {
 
     fn notify_on_terminal_settlement(&self, notification: std::sync::mpsc::Sender<()>) {
         *self.terminal_settlement_notification.lock() = Some(notification);
+    }
+}
+
+impl Drop for FakeBinding {
+    fn drop(&mut self) {
+        if let Some(notification) = self.drop_notification.get_mut().take() {
+            let _ = notification.send(());
+        }
     }
 }
 
@@ -4483,6 +4493,48 @@ fn a_reaped_yield_publishes_the_process_job_it_would_have_stranded() {
         "a settlement whose target was reaped must publish the process job it owns; \
          nothing else can",
     );
+}
+
+#[test]
+fn failed_worker_releases_its_loaded_binding_before_pool_shutdown() {
+    for (offset, step) in [Step::FailRun, Step::PanicRun].into_iter().enumerate() {
+        let (kernel, context) = bootstrap(14_720 + offset as i32);
+        let scheduler = Arc::new(single_cpu_scheduler(kernel));
+        let factory = Arc::new(FakeFactory::default());
+        let binding = FakeBinding::new(720, [step]);
+        let (settled_tx, settled_rx) = std::sync::mpsc::channel();
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        binding.notify_on_terminal_settlement(settled_tx);
+        *binding.drop_notification.lock() = Some(dropped_tx);
+        factory.install(&context, binding.clone());
+        drop(binding);
+        let generation = publish(&context, 720);
+        let pool = start_pool(scheduler.clone(), factory.clone(), 1);
+        drop(enqueue_root(&scheduler, &context, generation));
+        settled_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("logical settlement");
+        factory.bindings.lock().remove(&context.thread().key());
+        let dropped = dropped_rx.recv_timeout(Duration::from_secs(1));
+        assert_eq!(
+            factory
+                .events
+                .lock()
+                .iter()
+                .filter(|event| event.kind == BackendEventKind::Destroy)
+                .count(),
+            0,
+            "a failed worker must retain its vCPU until VM teardown"
+        );
+        let report = pool
+            .shutdown()
+            .expect_err("the original worker failure remains visible");
+        assert!(report.to_string().contains(match step {
+            Step::PanicRun => "panicked",
+            _ => "injected",
+        }));
+        dropped.expect("a failed worker must release task custody before waiting for VM teardown");
+    }
 }
 
 #[test]

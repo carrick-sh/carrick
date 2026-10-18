@@ -1336,6 +1336,14 @@ production vCPU topology state machine: B's pool must be admitted on generation
 and consecutive carrier identities. This does not prove HVF destruction;
 the director's signed EL1/embed and probe batch supplies that integration gate.
 
+The VM-free binding
+`failed_worker_releases_its_loaded_binding_before_pool_shutdown` also covers
+`kernel.vcpu.vm-lifetime`: both backend error and panic release the loaded
+task before the failed worker waits for pool shutdown. Its vCPU stays alive
+until that shutdown. Logical failure publication must not retain a binding
+whose physical receipt the carrier is waiting for. This retirement gap was
+already present before native signal setup allowed these guests to progress.
+
 ## Host fork versus terminal close (`kernel.el1.thread-lifecycle`, #441)
 
 An admitted host fork either loses to terminal close before its commit gate
