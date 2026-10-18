@@ -771,11 +771,16 @@ mod tests {
             .parent()
             .and_then(|p| p.parent())
             .expect("workspace root");
+        let host_path = std::env::var_os("PATH").expect("host tool path");
+        let path_env = std::env::join_paths(
+            std::iter::once(dir.path().to_path_buf()).chain(std::env::split_paths(&host_path)),
+        )
+        .expect("prepend fixture tools to host path");
         for tool in ["codesign", "otool"] {
             let path = dir.path().join(tool);
             std::fs::write(
                 &path,
-                r#"#!/bin/bash
+                r#"#!/usr/bin/env bash
 set -euo pipefail
 case "$1" in
     -dvvv) printf 'CDHash=fixture-hash\n' >&2 ;;
@@ -803,7 +808,7 @@ exit "$DUMMY_METADATA_STATUS"
         ] {
             for producer_status in [0, 7] {
                 let done = dir.path().join(format!("{reader}-{producer_status}.done"));
-                let output = std::process::Command::new("/bin/bash")
+                let output = std::process::Command::new("bash")
                     .args([
                         "-c",
                         "set -euo pipefail; . scripts/lib/test-signed-identity.sh; \"$1\" fixture",
@@ -811,7 +816,7 @@ exit "$DUMMY_METADATA_STATUS"
                         reader,
                     ])
                     .current_dir(repo_root)
-                    .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+                    .env("PATH", &path_env)
                     .env("DUMMY_METADATA_DONE", &done)
                     .env("DUMMY_METADATA_STATUS", producer_status.to_string())
                     .output()
@@ -933,7 +938,14 @@ int main(int argc, char **argv) {
     fflush(stdout);
     pid_t pid = fork();
     if (pid == 0) {
-        execl("/bin/sh", "sh", kill_sh, run_id, (char *)NULL);
+        /* Kill b2, then force another scoped scan while b3 is alive. The
+           orphan publishes completion before b3 may report success. */
+        execl("/bin/sh", "sh", "-ec",
+              "\"$DUMMY_KILL_SH\" \"$CARRICK_RUN_ID\"; "
+              "IFS= read -r event <\"$DUMMY_NORMAL_STARTED_FIFO\"; "
+              "\"$DUMMY_KILL_SH\" \"$CARRICK_RUN_ID\"; "
+              "printf 'reaped\\n' >\"$DUMMY_REAP_DONE_FIFO\"",
+              (char *)NULL);
         _exit(127);
     }
     for (;;) pause();
@@ -953,10 +965,22 @@ int main(int argc, char **argv) {
     }
     const char *run_id = getenv("CARRICK_RUN_ID");
     const char *marker = getenv("DUMMY_NORMAL_MARKER");
-    if (!run_id || !marker) return 2;
+    const char *normal_started_fifo = getenv("DUMMY_NORMAL_STARTED_FIFO");
+    const char *reap_done_fifo = getenv("DUMMY_REAP_DONE_FIFO");
+    if (!run_id || !marker || !normal_started_fifo || !reap_done_fifo) return 2;
     stamp_proctitle(argv[0], run_id);
     printf("running 1 test\n");
     fflush(stdout);
+    FILE *started = fopen(normal_started_fifo, "w");
+    if (!started) return 4;
+    fputs("started\n", started);
+    fclose(started);
+    FILE *reaped = fopen(reap_done_fifo, "r");
+    if (!reaped) return 5;
+    char completion[32];
+    if (!fgets(completion, sizeof(completion), reaped)) return 6;
+    fclose(reaped);
+    if (strcmp(completion, "reaped\n") != 0) return 7;
     FILE *f = fopen(marker, "w");
     if (!f) return 3;
     fprintf(f, "%s\n", run_id);
@@ -1044,6 +1068,13 @@ int main(int argc, char **argv) {
             r#"#!/bin/sh
 if [ "$1" = 2 ] && [ -n "${DUMMY_DEADLINE_FIFO:-}" ]; then
     IFS= read -r event <"$DUMMY_DEADLINE_FIFO"
+elif [ "$1" = 1 ] && [ -n "${DUMMY_DIAG_DEADLINE_FIFO:-}" ]; then
+    # kill.sh's inter-pass sleep remains real. Diagnostic timers expire only
+    # after the fake lldb has published its child and is ready to be killed.
+    case "$(ps -ww -p "$PPID" -o command=)" in
+        *scripts/sudo/kill.sh*) exec /bin/sleep "$@" ;;
+        *) IFS= read -r event <"$DUMMY_DIAG_DEADLINE_FIFO" ;;
+    esac
 else
     exec /bin/sleep "$@"
 fi
@@ -1066,6 +1097,7 @@ fi
                  if [ -n \"${DUMMY_LLDB_CHILD_PID_FILE:-}\" ]; then\n\
                      printf '%s\\n' \"$child_pid\" >\"$DUMMY_LLDB_CHILD_PID_FILE\"\n\
                  fi\n\
+                 printf 'expire\\n' >\"$DUMMY_DIAG_DEADLINE_FIFO\"\n\
                  wait \"$child_pid\"\n\
              fi\n\
              echo \"thread #1: tid = 0x01, el1_dummy_block_forever\"\n\
@@ -1158,6 +1190,8 @@ fi
         //    has its diagnostics captured, is reaped via kill.sh, is reported as
         //    DEADLINE and FAIL, and subsequent binaries still execute cleanly.
         let deadline_fifo = make_fifo("deadline.fifo");
+        let normal_started_fifo = make_fifo("normal-started.fifo");
+        let reap_done_fifo = make_fifo("reap-done.fifo");
         let block_marker = dir.path().join("block_started.txt");
         let bt_marker = dir.path().join("bt_captured.txt");
         let marker = dir.path().join("normal_completed.txt");
@@ -1169,6 +1203,8 @@ fi
             .env("CARRICK_RUN_ID", &run_id)
             .env("CARRICK_TEST_SIGNED_DEADLINE_SECS", "2")
             .env("DUMMY_DEADLINE_FIFO", &deadline_fifo)
+            .env("DUMMY_NORMAL_STARTED_FIFO", &normal_started_fifo)
+            .env("DUMMY_REAP_DONE_FIFO", &reap_done_fifo)
             .env("DUMMY_KILL_SH", &kill_sh)
             .env("DUMMY_BLOCK_MARKER", &block_marker)
             .env("DUMMY_BT_MARKER", &bt_marker)
@@ -1186,8 +1222,9 @@ fi
             .expect("collect test-signed.sh output");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            !output.status.success(),
+        assert_eq!(
+            output.status.code(),
+            Some(1),
             "overall run must fail because binary 1 timed out and binary 2 self-reaped; stdout={stdout} stderr={stderr}"
         );
         assert_eq!(
@@ -1243,6 +1280,7 @@ fi
         //    diagnostic timeout kills the `lldb` process group, still reaps the
         //    binary, reports DEADLINE plus FAIL, and runs the subsequent binary.
         let hang_diag_deadline_fifo = make_fifo("deadline-diaghang.fifo");
+        let diag_deadline_fifo = make_fifo("diagnostic-deadline.fifo");
         let hang_diag_run_id = format!("{run_id}-diaghang");
         let hang_diag_block_marker = dir.path().join("block_started_diaghang.txt");
         let hang_diag_bt_marker = dir.path().join("bt_captured_diaghang.txt");
@@ -1257,6 +1295,9 @@ fi
             .env("CARRICK_TEST_SIGNED_DEADLINE_SECS", "2")
             .env("CARRICK_TEST_SIGNED_DIAG_TIMEOUT_SECS", "1")
             .env("DUMMY_DEADLINE_FIFO", &hang_diag_deadline_fifo)
+            .env("DUMMY_DIAG_DEADLINE_FIFO", &diag_deadline_fifo)
+            .env("DUMMY_NORMAL_STARTED_FIFO", &normal_started_fifo)
+            .env("DUMMY_REAP_DONE_FIFO", &reap_done_fifo)
             .env("DUMMY_SUDO_FAIL", "1")
             .env("DUMMY_LLDB_HANG", "1")
             .env("DUMMY_LLDB_CHILD_PID_FILE", &hang_diag_child_pid_file)
@@ -1274,8 +1315,9 @@ fi
             .expect("collect hanging-lldb test-signed.sh output");
         let hang_diag_stdout = String::from_utf8_lossy(&hang_diag_output.stdout);
         let hang_diag_stderr = String::from_utf8_lossy(&hang_diag_output.stderr);
-        assert!(
-            !hang_diag_output.status.success(),
+        assert_eq!(
+            hang_diag_output.status.code(),
+            Some(1),
             "overall run must still fail when binary 1 hits deadline; stdout={hang_diag_stdout} stderr={hang_diag_stderr}"
         );
         assert!(
