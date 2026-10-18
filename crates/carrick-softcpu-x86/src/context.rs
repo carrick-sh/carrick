@@ -690,7 +690,12 @@ fn step_fp(ctx: &mut SoftCpuContext, insn: &Instruction, ip: u64) -> Result<(), 
             .try_into()
             .map_err(|_| X86Exception::invalid_opcode(ip))?,
     );
-    let masked = (original | 0x1f80) & !0x3f;
+    let mut masked = (original | 0x1f80) & !0x3f;
+    // SDM Vol. 1 11.5.2.5: FTZ applies only when UM is masked. Preserve
+    // tiny results so unmasked underflow can be detected even when exact.
+    if original & (1 << 11) == 0 {
+        masked &= !(1 << 15);
+    }
     run.working.0[24..28].copy_from_slice(&masked.to_le_bytes());
     let mut native = *insn;
     if (0..insn.op_count()).any(|i| insn.op_kind(i) == OpKind::Memory) {
@@ -737,11 +742,14 @@ fn step_fp(ctx: &mut SoftCpuContext, insn: &Instruction, ip: u64) -> Result<(), 
     unsafe {
         execute(&mut run);
     }
-    let status = u32::from_le_bytes(
+    let mut status = u32::from_le_bytes(
         run.working.0[24..28]
             .try_into()
             .map_err(|_| X86Exception::invalid_opcode(ip))?,
     ) & 0x3f;
+    if original & (1 << 11) == 0 && tiny_arithmetic_result(insn, &run.working) {
+        status |= 1 << 4;
+    }
     let guest_mxcsr = original | status;
     if status & !(original >> 7) & 0x3f != 0 {
         ctx.fxsave.0[24..28].copy_from_slice(&guest_mxcsr.to_le_bytes());
@@ -757,6 +765,32 @@ fn step_fp(ctx: &mut SoftCpuContext, insn: &Instruction, ip: u64) -> Result<(), 
     ctx.fxsave.0[160..416].copy_from_slice(&run.working.0[160..416]);
     ctx.fxsave.0[24..28].copy_from_slice(&guest_mxcsr.to_le_bytes());
     Ok(())
+}
+
+// Only arithmetic instructions generate underflow. MIN/MAX select an input;
+// comparisons and unchanged scalar upper lanes cannot cause this exception.
+fn tiny_arithmetic_result(insn: &Instruction, state: &FxsaveArea) -> bool {
+    let (width, lanes) = match insn.mnemonic() {
+        Mnemonic::Addss | Mnemonic::Subss | Mnemonic::Mulss | Mnemonic::Divss => (4, 1),
+        Mnemonic::Addsd | Mnemonic::Subsd | Mnemonic::Mulsd | Mnemonic::Divsd => (8, 1),
+        Mnemonic::Addps | Mnemonic::Subps | Mnemonic::Mulps | Mnemonic::Divps => (4, 4),
+        Mnemonic::Addpd | Mnemonic::Subpd | Mnemonic::Mulpd | Mnemonic::Divpd => (8, 2),
+        _ => return false,
+    };
+    let start = 160 + insn.op0_register().number() * 16;
+    state.0[start..start + width * lanes]
+        .chunks_exact(width)
+        .any(|lane| {
+            let mut bytes = [0; 8];
+            bytes[..width].copy_from_slice(lane);
+            let bits = u64::from_le_bytes(bytes);
+            let (significand, exponent) = if width == 4 {
+                (0x007f_ffff, 0x7f80_0000)
+            } else {
+                (0x000f_ffff_ffff_ffff, 0x7ff0_0000_0000_0000)
+            };
+            bits & exponent == 0 && bits & significand != 0
+        })
 }
 
 fn step_maskmov(ctx: &mut SoftCpuContext, insn: &Instruction, ip: u64) -> Result<(), X86Exception> {

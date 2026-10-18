@@ -1514,3 +1514,81 @@ fn unavailable_features_raise_ud_and_cpuid_matches_the_layer() {
     let (mut cpu, mut mem, va) = setup_snippet(&[0xd8, 0xc1]); // x87 arithmetic remains absent
     step_ok(&mut cpu, &mut mem, ud(va));
 }
+
+#[test]
+fn exact_denormal_results_fault_when_underflow_is_unmasked() {
+    for (prefix, left, right) in [
+        (
+            &[0xf3][..],
+            f32::MIN_POSITIVE.to_bits() as u128,
+            0.5f32.to_bits() as u128,
+        ),
+        (
+            &[0xf2][..],
+            f64::MIN_POSITIVE.to_bits() as u128,
+            0.5f64.to_bits() as u128,
+        ),
+        (
+            &[][..],
+            u128::from_le_bytes(
+                f32::MIN_POSITIVE
+                    .to_bits()
+                    .to_le_bytes()
+                    .repeat(4)
+                    .try_into()
+                    .unwrap(),
+            ),
+            u128::from_le_bytes(0.5f32.to_bits().to_le_bytes().repeat(4).try_into().unwrap()),
+        ),
+        (
+            &[0x66][..],
+            u128::from_le_bytes(
+                f64::MIN_POSITIVE
+                    .to_bits()
+                    .to_le_bytes()
+                    .repeat(2)
+                    .try_into()
+                    .unwrap(),
+            ),
+            u128::from_le_bytes(0.5f64.to_bits().to_le_bytes().repeat(2).try_into().unwrap()),
+        ),
+    ] {
+        for ftz in [0, 1 << 15] {
+            let code = [prefix, &[0x0f, 0x59, 0xc1, 0x0f, 0x05]].concat(); // mulss/sd/ps/pd
+            let (mut cpu, mut mem, va) = setup_snippet(&code);
+            cpu.context_mut().write_xmm(0, left);
+            cpu.context_mut().write_xmm(1, right);
+            cpu.context_mut().fxsave.0[24..28].copy_from_slice(&(0x1780u32 | ftz).to_le_bytes());
+            step_ok(
+                &mut cpu,
+                &mut mem,
+                SoftCpuExit::Exception(X86Exception::new(
+                    X86ExceptionVector::SimdFloatingPoint,
+                    va,
+                    None,
+                    None,
+                )),
+            );
+            assert_eq!(cpu.context().read_xmm(0), left);
+            assert_eq!(
+                cpu.context().fxsave.0[24] & 0x30,
+                0x10,
+                "exact tiny result sets UE, not PE"
+            );
+        }
+    }
+    // A selected denormal input and an untouched scalar upper lane are not arithmetic underflow.
+    for bytes in [&[0xf3, 0x0f, 0x5d, 0xc1][..], &[0xf3, 0x0f, 0x59, 0xc1]] {
+        let (mut cpu, mut mem, va) = setup_snippet(&[bytes, &[0x0f, 0x05]].concat());
+        let a = if bytes[2] == 0x5d {
+            1
+        } else {
+            1.0f32.to_bits()
+        };
+        cpu.context_mut().write_xmm(0, (1u128 << 32) | a as u128);
+        cpu.context_mut().write_xmm(1, 1.0f32.to_bits() as u128);
+        cpu.context_mut().fxsave.0[24..28].copy_from_slice(&0x1780u32.to_le_bytes());
+        step_ok(&mut cpu, &mut mem, sys(va + 4, va + 6));
+        assert_eq!(cpu.context().fxsave.0[24] & 0x10, 0);
+    }
+}
