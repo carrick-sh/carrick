@@ -2,6 +2,7 @@
 # Carried forward from PR #2 without its deferred cloudmac acceptance labels.
 self-hosted-runner:
   labels:
+    - carrick-agent
     - carrick-hvf
     - carrick-signed-gate
     - carrick-hvf-closure
