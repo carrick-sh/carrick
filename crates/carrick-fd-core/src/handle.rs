@@ -485,6 +485,54 @@ impl fmt::Display for HandleError {
 
 impl core::error::Error for HandleError {}
 
+/// Failure to create or inherit a task table, preserving the original cause.
+///
+/// If rollback also failed, `into_parts` transfers the still-live, unbound
+/// table and rollback error to the caller. The caller must destroy that table
+/// through [`Authority::destroy_handle_table`] and reclaim its extent. No
+/// resource finalizer runs in `Drop`; discarding this value can leak custody.
+#[must_use = "reclaim any pending table returned by into_parts"]
+#[derive(Debug, Eq, PartialEq)]
+pub struct TaskTableError {
+    cause: HandleError,
+    pending: Option<(TableId, HandleError)>,
+}
+
+impl TaskTableError {
+    /// The original create, inherit, or attachment error, never the rollback error.
+    pub const fn cause(&self) -> HandleError {
+        self.cause
+    }
+
+    /// Consume the failure and take custody of any table awaiting cleanup.
+    pub fn into_parts(self) -> (HandleError, Option<(TableId, HandleError)>) {
+        (self.cause, self.pending)
+    }
+}
+
+impl From<HandleError> for TaskTableError {
+    fn from(cause: HandleError) -> Self {
+        Self {
+            cause,
+            pending: None,
+        }
+    }
+}
+impl fmt::Display for TaskTableError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.cause.fmt(f)?;
+        if let Some((table, cleanup)) = self.pending {
+            write!(f, "; table {table:?} awaits cleanup: {cleanup}")?;
+        }
+        Ok(())
+    }
+}
+impl core::error::Error for TaskTableError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
 /// One personality object record in shared/venue memory.
 ///
 /// Reference counting and incarnation authentication use the single
@@ -2062,17 +2110,17 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> TaskHandleHost<'a, B, W, T
     }
 
     /// Create a new handle table with `limit` over `storage` and attach it to `task`.
+    /// Rollback failure returns custody in [`TaskTableError::into_parts`].
     pub fn create_task_table(
         &self,
         task: TaskKey,
         limit: usize,
         storage: &mut Extent,
-    ) -> Result<TableId, HandleError> {
+    ) -> Result<TableId, TaskTableError> {
         let auth = self.authority();
         let table = auth.create_handle_table(limit, storage)?;
         if let Err(err) = self.attach_task_table(task, table) {
-            *storage = auth.destroy_handle_table(table, |_| {})?;
-            return Err(err);
+            return Err(self.failed_attachment(table, storage, err, |_| {}));
         }
         Ok(table)
     }
@@ -2282,18 +2330,34 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> TaskHandleHost<'a, B, W, T
         filter: impl FnMut(ObjectPin, BackingToken, HandleFlags) -> bool,
         storage: &mut Extent,
         mut release: impl FnMut(BackingToken),
-    ) -> Result<TableId, HandleError> {
+    ) -> Result<TableId, TaskTableError> {
         if parent_task == child_task {
-            return Err(HandleError::InvalidHandle);
+            return Err(HandleError::InvalidHandle.into());
         }
         let parent_table = self.table_id(parent_task)?;
         let auth = self.authority();
         let child_table = auth.inherit_handle_table(parent_table, filter, storage, &mut release)?;
         if let Err(err) = self.attach_task_table(child_task, child_table) {
-            *storage = auth.destroy_handle_table(child_table, &mut release)?;
-            return Err(err);
+            return Err(self.failed_attachment(child_table, storage, err, &mut release));
         }
         Ok(child_table)
+    }
+
+    fn failed_attachment(
+        &self,
+        table: TableId,
+        storage: &mut Extent,
+        cause: HandleError,
+        release: impl FnMut(BackingToken),
+    ) -> TaskTableError {
+        let pending = match self.authority().destroy_handle_table(table, release) {
+            Ok(extent) => {
+                *storage = extent;
+                None
+            }
+            Err(cleanup) => Some((table, cleanup)),
+        };
+        TaskTableError { cause, pending }
     }
 
     /// Destroy `task`'s handle table, remove `task` from the host's bucket
