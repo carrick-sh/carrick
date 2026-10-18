@@ -1,0 +1,45 @@
+name: Cached CI input
+description: Restore immutable inputs, fetch with recipe policy, save before tests run
+inputs:
+  recipe:
+    description: Just recipe (including trusted literal arguments)
+    required: true
+  path:
+    description: Cache paths
+    required: true
+  key:
+    description: Exact input identity (no fallback restore keys)
+    required: true
+runs:
+  using: composite
+  steps:
+    - id: begin
+      shell: bash
+      env:
+        INPUT_RECIPE: ${{ inputs.recipe }}
+      run: |
+        echo "previous=$(cat "$RUNNER_TEMP/ci-fetch-status" 2>/dev/null || true)" >> "$GITHUB_OUTPUT"
+        echo "failure=$INPUT_RECIPE" > "$RUNNER_TEMP/ci-fetch-status"
+        echo "CARRICK_CI_FETCH_FAILURE=$INPUT_RECIPE" >> "$GITHUB_ENV"
+    - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+      id: cache
+      env:
+        SEGMENT_DOWNLOAD_TIMEOUT_MINS: '2'
+      with:
+        path: ${{ inputs.path }}
+        key: ${{ inputs.key }}
+    - shell: bash
+      # Recipes verify cached bytes and install locally on a hit; the fetch
+      # itself runs only when the recipe's verified input is absent.
+      run: just ${{ inputs.recipe }}
+    - uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+      if: steps.cache.outputs.cache-hit != 'true'
+      with:
+        path: ${{ inputs.path }}
+        key: ${{ inputs.key }}
+    - shell: bash
+      env:
+        PREVIOUS_STATUS: ${{ steps.begin.outputs.previous }}
+      run: |
+        printf '%s\n' "$PREVIOUS_STATUS" > "$RUNNER_TEMP/ci-fetch-status"
+        echo "CARRICK_CI_FETCH_FAILURE=${PREVIOUS_STATUS#failure=}" >> "$GITHUB_ENV"

@@ -884,3 +884,104 @@ fn every_heavy_pr_job_skips_on_lower_stack_layers() {
         "heavy jobs without a lower_layer guard: {unguarded:?}"
     );
 }
+
+#[test]
+fn ci_results_names_fetch_failures_without_licensing_a_failed_job() {
+    let dir = tempfile::tempdir().unwrap();
+    let summary = dir.path().join("summary.md");
+    let needs = r#"{
+        "changes": {"result": "failure", "outputs": {"infrastructure": "rust-toolchain"}},
+        "lint": {"result": "skipped"}
+    }"#;
+    let (passed, stdout) = run_ci_results_with_env(
+        "merge_group",
+        None,
+        needs,
+        &[("GITHUB_STEP_SUMMARY", summary.to_str().unwrap())],
+    );
+    assert!(!passed);
+    assert!(stdout.contains("Infrastructure fetch failure"));
+    assert!(stdout.contains("changes: rust-toolchain"));
+    assert!(
+        fs::read_to_string(&summary)
+            .unwrap()
+            .contains("rust-toolchain")
+    );
+
+    // The same failed result without a fetch marker remains a code/check
+    // failure; infrastructure reporting never turns either kind green.
+    let needs = needs.replace(r#""infrastructure": "rust-toolchain""#, "");
+    let (passed, stdout) = run_ci_results_with_env("merge_group", None, &needs, &[]);
+    assert!(!passed);
+    assert!(!stdout.contains("Infrastructure fetch failure"));
+}
+
+#[test]
+fn infrastructure_download_verifies_warm_cache_and_keeps_failure_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    let cached = dir.path().join("cached");
+    let run = dir.path().join("run");
+    fs::write(&source, "abc").unwrap();
+    let url = format!("file://{}", source.display());
+    let fetch = || {
+        Command::new("just")
+            .current_dir(workspace_root())
+            .args(["ci-fetch-run", "download-witness", "ci-download", &url])
+            .arg("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+            .arg(&cached)
+            .env("RUNNER_TEMP", &run)
+            .env_remove("GITHUB_ENV")
+            .env_remove("GITHUB_STEP_SUMMARY")
+            .output()
+            .unwrap()
+    };
+    assert!(fetch().status.success());
+    assert_eq!(fs::read_to_string(&cached).unwrap(), "abc");
+    fs::remove_file(&source).unwrap();
+    assert!(
+        fetch().status.success(),
+        "warm input must need no transport"
+    );
+    fs::write(&cached, "corrupt").unwrap();
+    assert!(
+        !fetch().status.success(),
+        "cached bytes must still be verified"
+    );
+    let marker = run.join("ci-fetch-status");
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap(),
+        "failure=download-witness\n"
+    );
+    assert_eq!(fs::read_to_string(&cached).unwrap(), "corrupt");
+    fs::write(&cached, "abc").unwrap();
+    assert!(fetch().status.success());
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap(),
+        "failure=download-witness\n"
+    );
+}
+
+#[test]
+fn infrastructure_deadline_terminates_the_command_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let command = dir.path().join("command.sh");
+    // Keeping stdout open in a descendant makes output() wait for the whole
+    // group. A supervisor which kills just the parent will wait 30 seconds.
+    fs::write(
+        &command,
+        "sh -c 'trap \"\" TERM; sleep 30; echo leaked' &\nwait\n",
+    )
+    .unwrap();
+    let result = Command::new("just")
+        .current_dir(workspace_root())
+        .args(["ci-bounded", "1", "sh"])
+        .arg(command)
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(143));
+    assert!(
+        result.stdout.is_empty(),
+        "a descendant survived the deadline"
+    );
+}

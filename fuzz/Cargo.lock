@@ -203,6 +203,7 @@ dependencies = [
  "carrick-mem",
  "carrick-mmu-core",
  "carrick-observability",
+ "carrick-sched-core",
  "libc",
  "parking_lot",
  "tracing",
@@ -222,6 +223,7 @@ dependencies = [
 name = "carrick-core"
 version = "0.1.0"
 dependencies = [
+ "bitflags 2.11.1",
  "carrick-core-abi",
  "carrick-guest-arch",
  "carrick-mmu-core",
@@ -336,7 +338,9 @@ dependencies = [
  "carrick-mem",
  "carrick-mmu-core",
  "carrick-observability",
+ "carrick-personality-linux",
  "carrick-sched-core",
+ "carrick-signal-core",
  "carrick-signal-linux",
  "carrick-timer-core",
  "libc",
@@ -408,6 +412,7 @@ dependencies = [
  "carrick-personality-linux",
  "carrick-portable",
  "carrick-sched-core",
+ "carrick-signal-core",
  "carrick-signal-linux",
  "carrick-spec",
  "carrick-thread",
@@ -489,7 +494,6 @@ dependencies = [
  "carrick-core",
  "carrick-core-abi",
  "carrick-guest-arch",
- "carrick-sched-core",
 ]
 
 [[package]]
@@ -530,9 +534,11 @@ dependencies = [
  "carrick-aarch64",
  "carrick-abi",
  "carrick-core",
+ "carrick-core-abi",
  "carrick-el1",
  "carrick-el1-abi",
  "carrick-fatal",
+ "carrick-guest-arch",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",

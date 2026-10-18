@@ -24,7 +24,8 @@ env:
   SCCACHE_CACHE_SIZE: "1G"
   # Harden registry transport against intermittent network errors without retrying tests.
   CARGO_HTTP_MULTIPLEXING: "false"   # avoid HTTP/2 framing failures against the crates.io index
-  CARGO_NET_RETRY: "10"              # transport retries for registry/download fetches only
+  CARGO_HTTP_TIMEOUT: "30"
+  CARGO_NET_RETRY: "5"              # transport retries for registry/download fetches only
   RUST_BACKTRACE: 1
   CARRICK_PROBE_COVERAGE_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
   CARRICK_AUTHORITY_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
@@ -33,11 +34,12 @@ jobs:
   changes:
     name: changes
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 35
     permissions:
       contents: read
       pull-requests: read
     outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
       heavy: ${{ steps.filter.outputs.heavy }}
       macos: ${{ steps.filter.outputs.macos }}
       workflows: ${{ steps.filter.outputs.workflows }}
@@ -48,11 +50,10 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: just
-      - name: Install repository Rust toolchain
-        run: just ci-toolchain
+      - name: Restore CI inputs
+        id: setup
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 12
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
@@ -61,10 +62,6 @@ jobs:
           cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
-      - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: sccache@0.18.0
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Detect changed surfaces
@@ -82,43 +79,69 @@ jobs:
       - name: Compiler cache statistics
         if: ${{ always() }}
         run: just build-cache
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report
 
   actionlint:
     needs: changes
     if: needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 35
+    outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      # install-action's pinned manifest lacks actionlint and falls back to
-      # cargo-binstall (not a crate); fetch the official release, pinned.
-      - name: Install actionlint 1.7.12 (checksum-pinned)
-        run: |
-          set -euo pipefail
-          v=1.7.12
-          f="actionlint_${v}_linux_amd64.tar.gz"
-          curl -fsSL -o "$RUNNER_TEMP/$f" "https://github.com/rhysd/actionlint/releases/download/v${v}/$f"
-          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/$f" | sha256sum -c -
-          tar -xzf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP" actionlint
-          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Restore CI inputs
+        id: setup
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 12
+        with:
+          toolchain: 'false'
+          tools: ''
+          cargo: 'false'
+      - name: Restore actionlint input
+        uses: ./.github/actions/ci-fetch
+        timeout-minutes: 20
+        with:
+          recipe: ci-install-actionlint
+          path: ~/.cache/carrick-ci/actionlint
+          key: ci-actionlint-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('justfile') }}
       - name: Lint GitHub Actions workflows
         run: actionlint .github/workflows/*.yml
 
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report
+
   # GitHub-first rule: a non-docs PR must link an issue. Runs on every event so
   # ci-ok can require plain success; it passes trivially in the merge queue.
+
   linked-issue:
     name: linked-issue
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 35
     permissions:
       contents: read
       pull-requests: read
+    outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: Restore CI inputs
+        id: setup
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 12
+        with:
+          toolchain: 'false'
+          tools: ''
+          cargo: 'false'
       - name: Self-test the gate
         run: scripts/ci/test-require-linked-issue.sh
       - name: Require a linked issue
@@ -126,21 +149,33 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: scripts/ci/require-linked-issue.sh
 
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report
+
   # Enforce canonical Co-Authored-By trailers on all non-merge PR commits.
   # Runs on every event so ci-ok can require plain success; it passes trivially
   # outside pull_request.
+
   commit-trailers:
     name: commit-trailers
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 35
     permissions:
       contents: read
+    outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
     steps:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
           fetch-depth: 0
+      - name: Restore CI inputs
+        id: setup
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 12
       - name: Skip non-pull-request events
         if: github.event_name != 'pull_request'
         run: echo "commit-trailers (${{ github.event_name }}) is not a pull_request; passing."
@@ -160,6 +195,11 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: target/release/carrick-xtask commit-trailers check-range "$BASE_SHA..$HEAD_SHA"
 
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report
+
   # Independent checks keep reporting after an earlier check fails. No
   # continue-on-error: every failure still makes its job (and ci-ok) fail.
 
@@ -168,20 +208,23 @@ jobs:
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
           fetch-depth: 0
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - name: Restore CI inputs
+        id: setup
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 12
         with:
-          tool: just,cargo-deny
+          tools: sccache cargo-deny
       - name: Fetch and validate probe coverage base commit
         env:
           CI_EVENT: ${{ github.event_name }}
         run: just ci-probe-coverage-base
-      - name: Install repository Rust toolchain
-        run: just ci-toolchain
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
@@ -190,64 +233,69 @@ jobs:
           cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
-      - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: sccache@0.18.0
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Install Semgrep
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         timeout-minutes: 12
-        run: just ci-install-semgrep
+        uses: ./.github/actions/ci-fetch
+        with:
+          recipe: ci-install-semgrep
+          path: ~/.cache/carrick-ci/semgrep
+          key: ci-semgrep-${{ runner.os }}-${{ runner.arch }}-${{ steps.setup.outputs.python }}-${{ hashFiles('scripts/ci/inputs/semgrep.txt') }}
       - name: Exact Linux and macOS unit shard coverage
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: just check-test-shards
       - name: Xtask unit and CI gate tests
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: just test-xtask
       - name: Formatting
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: just fmt-check
       - name: Clippy (no-panic gate)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: just clippy
       - name: Dependency audit
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: just deny
       - name: Support matrix drift
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: just check-matrix
       - name: Layering and product feature closure
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: just check-layering
       - name: Conformance contract coverage (PR changed surfaces)
-        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' && github.event_name == 'pull_request' }}
         env:
           CI_BASE: ${{ github.event.pull_request.base.sha }}
         run: just check-contract-change "$CI_BASE" "$GITHUB_SHA"
       - name: Host-independent typed-domain checks and contract registry
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: just lint-domains-source
 
       - name: Compiler cache statistics
         if: ${{ always() }}
         run: just build-cache
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report
 
   portable:
     needs: changes
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: just
-      - name: Install repository Rust toolchain
-        run: just ci-toolchain
+      - name: Restore CI inputs
+        id: setup
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 12
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
@@ -258,44 +306,49 @@ jobs:
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
       - name: Compiler cache fallback without sccache
         run: cargo test -p carrick-xtask --test build_cache
-      - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: sccache@0.18.0
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Install Linux C cross toolchain
-        if: ${{ !cancelled() }}
-        timeout-minutes: 12
-        run: just ci-install-linux-cross
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
+        timeout-minutes: 8
+        uses: ./.github/actions/ci-fetch
+        with:
+          recipe: ci-install-linux-cross
+          path: ~/.cache/carrick-ci/apt
+          key: ci-apt-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS }}-${{ env.ImageVersion }}-linux-cross-${{ hashFiles('justfile') }}
       - name: Portable kernel compile (aarch64-linux lib, tests and semantics)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         env:
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
         run: just check-kernel-portable
       - name: Kernel semantics on x86_64 Linux
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: just test-kernel-semantics
 
       - name: Compiler cache statistics
         if: ${{ always() }}
         run: just build-cache
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report
 
   linux-doc:
     needs: changes
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: just
-      - name: Install repository Rust toolchain
-        run: just ci-toolchain
+      - name: Restore CI inputs
+        id: setup
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 12
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
@@ -307,42 +360,43 @@ jobs:
             . -> target
             fuzz -> target
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
-      - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: sccache@0.18.0
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Linux crate rustdoc (including Linux host and KVM modules)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: just doc
       - name: Fuzz harness compile-check
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: just check-fuzz
 
       - name: Compiler cache statistics
         if: ${{ always() }}
         run: just build-cache
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report
 
   macos-clippy:
     needs: changes
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
     runs-on: macos-15
     timeout-minutes: 60
+    outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
           fetch-depth: 0
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: just
+      - name: Restore CI inputs
+        id: setup
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 12
       - name: Fetch and validate authority debt base commit
         env:
           CI_EVENT: ${{ github.event_name }}
         run: just ci-probe-coverage-base
-      - name: Install repository Rust toolchain
-        run: just ci-toolchain
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
@@ -351,37 +405,38 @@ jobs:
           cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
-      - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: sccache@0.18.0
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Clippy (no-panic gate)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: just clippy
       - name: Live host-authority compiler census
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: cargo run --locked -p carrick-xtask -- authority-debt
 
       - name: Compiler cache statistics
         if: ${{ always() }}
         run: just build-cache
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report
 
   macos-build:
     needs: changes
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
     runs-on: macos-15
     timeout-minutes: 60
+    outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: just
-      - name: Install repository Rust toolchain
-        run: just ci-toolchain
+      - name: Restore CI inputs
+        id: setup
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 12
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
@@ -390,39 +445,40 @@ jobs:
           cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
-      - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: sccache@0.18.0
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Workspace build
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: just check --workspace
       # The live census and rustdoc retain macOS cfg/backend coverage.
       # Linux runs source-only authority checks and its own rustdoc separately.
       - name: Workspace rustdoc
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: just doc
 
       - name: Compiler cache statistics
         if: ${{ always() }}
         run: just build-cache
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report
 
   macos-unit-a:
     needs: changes
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
     runs-on: macos-15
     timeout-minutes: 60
+    outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: just
-      - name: Install repository Rust toolchain
-        run: just ci-toolchain
+      - name: Restore CI inputs
+        id: setup
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 12
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
@@ -431,34 +487,35 @@ jobs:
           cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
-      - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: sccache@0.18.0
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Unit tests shard A (host test lanes)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: just ci-macos-test test-shard-a
 
       - name: Compiler cache statistics
         if: ${{ always() }}
         run: just build-cache
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report
 
   macos-unit-b:
     needs: changes
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
     runs-on: macos-15
     timeout-minutes: 60
+    outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: just
-      - name: Install repository Rust toolchain
-        run: just ci-toolchain
+      - name: Restore CI inputs
+        id: setup
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 12
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
@@ -467,34 +524,35 @@ jobs:
           cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
-      - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: sccache@0.18.0
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Unit tests shard B (workspace + mm-owner + CLI + host + VFS + kernel + runtime + HVF + EL1)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: just ci-macos-test test-shard-b
 
       - name: Compiler cache statistics
         if: ${{ always() }}
         run: just build-cache
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report
 
   macos-integration:
     needs: changes
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
     runs-on: macos-15
     timeout-minutes: 60
+    outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: just
-      - name: Install repository Rust toolchain
-        run: just ci-toolchain
+      - name: Restore CI inputs
+        id: setup
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 12
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
@@ -503,34 +561,35 @@ jobs:
           cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
-      - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: sccache@0.18.0
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Host integration tests (no HVF)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: just ci-macos-test test-integration
 
       - name: Compiler cache statistics
         if: ${{ always() }}
         run: just build-cache
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report
 
   cross-check-linux:
     needs: changes
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: just
-      - name: Install repository Rust toolchain
-        run: just ci-toolchain
+      - name: Restore CI inputs
+        id: setup
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 12
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
@@ -539,22 +598,23 @@ jobs:
           cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
-      - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: sccache@0.18.0
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: aarch64 Linux cross-check and no-HVF closure
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: just check-linux
       - name: Native Linux host backend tests
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: just test-host-linux
 
       - name: Compiler cache statistics
         if: ${{ always() }}
         run: just build-cache
+
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report
 
   # Native Linux run of the kernel-semantics suites (crates/carrick-kernel-example):
   # scripted two-process Linux semantics against the public kernel API with no
@@ -583,15 +643,16 @@ jobs:
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
+    outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: just
-      - name: Install repository Rust toolchain
-        run: just ci-toolchain
+      - name: Restore CI inputs
+        id: setup
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 12
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
@@ -600,19 +661,19 @@ jobs:
           cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
-      - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: sccache@0.18.0
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Kernel semantics natively on ARM Linux
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: just test-kernel-semantics
 
       - name: Compiler cache statistics
         if: ${{ always() }}
         run: just build-cache
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report
 
   cross-check-freebsd:
     needs: changes
@@ -623,16 +684,17 @@ jobs:
       FBSD_VERSION: 14.3-RELEASE
       FBSD_MAJOR: "14"
       FBSD_SYSROOT: ${{ github.workspace }}/.freebsd-sysroot
+    outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: just
-      - name: Install repository Rust toolchain
-        run: just ci-toolchain
+      - name: Restore CI inputs
+        id: setup
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 12
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
@@ -641,27 +703,26 @@ jobs:
           cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
-      - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: sccache@0.18.0
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Install FreeBSD C cross toolchain
-        if: ${{ !cancelled() }}
-        timeout-minutes: 12
-        run: just ci-install-freebsd-cross
-      - name: Cache FreeBSD sysroot
-        id: fbsd-sysroot
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
+        timeout-minutes: 8
+        uses: ./.github/actions/ci-fetch
         with:
-          path: ${{ env.FBSD_SYSROOT }}
-          key: freebsd-sysroot-${{ env.FBSD_VERSION }}
-      - name: Fetch FreeBSD headers and libraries from permanent archive
-        if: ${{ !cancelled() && steps.fbsd-sysroot.outputs.cache-hit != 'true' }}
-        run: just ci-freebsd-sysroot
+          recipe: ci-install-freebsd-cross
+          path: ~/.cache/carrick-ci/apt
+          key: ci-apt-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS }}-${{ env.ImageVersion }}-bsd-cross-${{ hashFiles('justfile') }}
+      - name: Restore FreeBSD sysroot input
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
+        timeout-minutes: 8
+        uses: ./.github/actions/ci-fetch
+        with:
+          recipe: ci-freebsd-sysroot
+          path: ~/.cache/carrick-ci/freebsd
+          key: ci-freebsd-${{ env.FBSD_VERSION }}-${{ hashFiles('justfile') }}
       - name: Cross-check FreeBSD CLI and runtime (including tests)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         env:
           CC_x86_64_unknown_freebsd: clang
           CXX_x86_64_unknown_freebsd: clang++
@@ -670,12 +731,16 @@ jobs:
           CXXFLAGS_x86_64_unknown_freebsd: --target=x86_64-unknown-freebsd${{ env.FBSD_MAJOR }} --sysroot=${{ env.FBSD_SYSROOT }}
         run: just check-freebsd
       - name: Enforce live FreeBSD authority ceilings
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: just authority-check-cross x86_64-unknown-freebsd clang "--target=x86_64-unknown-freebsd${{ env.FBSD_MAJOR }} --sysroot=${{ env.FBSD_SYSROOT }}" llvm-ar
 
       - name: Compiler cache statistics
         if: ${{ always() }}
         run: just build-cache
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report
 
   cross-check-netbsd:
     needs: changes
@@ -685,16 +750,17 @@ jobs:
     env:
       NBSD_VERSION: "10.1"
       NBSD_SYSROOT: ${{ github.workspace }}/.netbsd-sysroot
+    outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: just
-      - name: Install repository Rust toolchain
-        run: just ci-toolchain
+      - name: Restore CI inputs
+        id: setup
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 12
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
@@ -703,51 +769,55 @@ jobs:
           cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
-      - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: sccache@0.18.0
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Install BSD C cross toolchain
-        if: ${{ !cancelled() }}
-        timeout-minutes: 12
-        run: just ci-install-freebsd-cross
-      - name: Cache NetBSD sysroot
-        id: nbsd-sysroot
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
+        timeout-minutes: 8
+        uses: ./.github/actions/ci-fetch
         with:
-          path: ${{ env.NBSD_SYSROOT }}
-          key: netbsd-authority-sysroot-${{ env.NBSD_VERSION }}
-      - name: Fetch NetBSD C headers from permanent archive
-        if: ${{ !cancelled() && steps.nbsd-sysroot.outputs.cache-hit != 'true' }}
-        run: just ci-netbsd-sysroot
+          recipe: ci-install-freebsd-cross
+          path: ~/.cache/carrick-ci/apt
+          key: ci-apt-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS }}-${{ env.ImageVersion }}-bsd-cross-${{ hashFiles('justfile') }}
+      - name: Restore NetBSD sysroot input
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
+        timeout-minutes: 8
+        uses: ./.github/actions/ci-fetch
+        with:
+          recipe: ci-netbsd-sysroot
+          path: ~/.cache/carrick-ci/netbsd
+          key: ci-netbsd-${{ hashFiles('scripts/ci/inputs/sysroots.json') }}
       - name: Cross-check NetBSD NVMM backend (including tests)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: just check-netbsd
       - name: Enforce live NetBSD authority ceilings
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: just authority-check-cross x86_64-unknown-netbsd clang "--target=x86_64-unknown-netbsd --sysroot=${{ env.NBSD_SYSROOT }}" llvm-ar
 
       - name: Compiler cache statistics
         if: ${{ always() }}
         run: just build-cache
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report
 
   cross-check-macos:
     needs: changes
     if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: just
-      - name: Install repository Rust toolchain
-        run: just ci-toolchain
+      - name: Restore CI inputs
+        id: setup
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 12
       - name: Configure persisted compiler cache
         run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
@@ -756,25 +826,31 @@ jobs:
           cache-directories: ${{ env.SCCACHE_DIR }}
           cache-workspace-crates: "true"
           save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
-      - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: sccache@0.18.0
       - name: Prebuild cached xtask admission helpers
         run: just ci-prebuild-xtask
       - name: Install Clang C cross toolchain
-        if: ${{ !cancelled() }}
-        timeout-minutes: 12
-        run: just ci-install-freebsd-cross
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
+        timeout-minutes: 8
+        uses: ./.github/actions/ci-fetch
+        with:
+          recipe: ci-install-freebsd-cross
+          path: ~/.cache/carrick-ci/apt
+          key: ci-apt-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS }}-${{ env.ImageVersion }}-bsd-cross-${{ hashFiles('justfile') }}
       - name: Cross-check and clippy macOS closure (including tests)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: just cross-check-macos
       - name: Compiler cache statistics
         if: ${{ always() }}
         run: just build-cache
 
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report
+
   # Single ruleset check. Only a successful docs-only PR filter permits skips;
   # a failed/cancelled filter or an unexpectedly skipped dependency is red.
+
   ci-ok:
     name: ci-ok
     if: always()
@@ -797,14 +873,19 @@ jobs:
       - cross-check-netbsd
       - cross-check-macos
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      - name: Restore CI inputs
+        id: setup
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 12
         with:
-          tool: just
+          toolchain: 'false'
+          tools: ''
+          cargo: 'false'
       - name: Require every applicable job to succeed
         env:
           CI_EVENT: ${{ github.event_name }}
@@ -813,3 +894,6 @@ jobs:
           CI_CHILD_PR: ${{ needs.changes.outputs.child_pr }}
           CI_NEEDS: ${{ toJSON(needs) }}
         run: just ci-results
+      - name: Report infrastructure fetch status
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report

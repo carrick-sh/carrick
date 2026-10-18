@@ -1,0 +1,85 @@
+name: CI input setup
+description: Cached bootstrap just, pinned Rust, binary tools, and locked Cargo inputs
+inputs:
+  toolchain:
+    description: Install writable repository toolchain (false on the read-only HVF host)
+    default: 'true'
+  tools:
+    description: Pinned binary tools needed by the job
+    default: sccache
+  cargo:
+    description: Populate committed CI Cargo lockfiles before compiling
+    default: 'true'
+outputs:
+  python:
+    description: Python wheel ABI identity
+    value: ${{ steps.paths.outputs.python }}
+runs:
+  using: composite
+  steps:
+    - name: Initialize fetch status and bounded bootstrap transport
+      id: paths
+      shell: bash
+      run: |
+        echo 'CARRICK_CI_FETCH_FAILURE=bootstrap-just' >> "$GITHUB_ENV"
+        echo 'failure=bootstrap-just' > "$RUNNER_TEMP/ci-fetch-status"
+        mkdir -p "$RUNNER_TEMP/ci-curl" "$HOME/.cache/carrick-ci/just"
+        printf 'connect-timeout = 15\nmax-time = 180\nretry-max-time = 240\n' > "$RUNNER_TEMP/ci-curl/.curlrc"
+        echo "just_version=$(jq -er '.just.version' scripts/ci/inputs/tools.json)" >> "$GITHUB_OUTPUT"
+        echo "rustup=${RUSTUP_HOME:-$HOME/.rustup}/toolchains" >> "$GITHUB_OUTPUT"
+        echo "cargo=${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_OUTPUT"
+        echo "python=$(python3 --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+    - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+      id: just
+      with:
+        path: ~/.cache/carrick-ci/just
+        key: ci-just-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci/inputs/tools.json') }}
+    # Bootstrap cannot invoke recipes before just exists. This pinned action's
+    # checked-in manifest supplies hashes; fallback installs are forbidden.
+    - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+      if: steps.just.outputs.cache-hit != 'true'
+      env:
+        CURL_HOME: ${{ runner.temp }}/ci-curl
+      with:
+        tool: just@${{ steps.paths.outputs.just_version }}
+        checksum: 'true'
+        fallback: none
+    - name: Activate bootstrap
+      shell: bash
+      env:
+        CI_JUST_VERSION: ${{ steps.paths.outputs.just_version }}
+      run: |
+        if [ ! -x "$HOME/.cache/carrick-ci/just/just" ]; then
+          cp "$(command -v just)" "$HOME/.cache/carrick-ci/just/just"
+        fi
+        test "$("$HOME/.cache/carrick-ci/just/just" --version)" = "just $CI_JUST_VERSION"
+        echo "$HOME/.cache/carrick-ci/just" >> "$GITHUB_PATH"
+    - uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+      if: steps.just.outputs.cache-hit != 'true'
+      with:
+        path: ~/.cache/carrick-ci/just
+        key: ci-just-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/ci/inputs/tools.json') }}
+    - shell: bash
+      run: |
+        echo '' > "$RUNNER_TEMP/ci-fetch-status"
+        echo 'CARRICK_CI_FETCH_FAILURE=' >> "$GITHUB_ENV"
+    - uses: ./.github/actions/ci-fetch
+      if: inputs.toolchain == 'true'
+      with:
+        recipe: ci-toolchain
+        path: ${{ steps.paths.outputs.rustup }}
+        key: ci-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}
+    - uses: ./.github/actions/ci-fetch
+      if: inputs.tools != ''
+      with:
+        recipe: ci-install-tools ${{ inputs.tools }}
+        path: ~/.cache/carrick-ci/tools
+        key: ci-tools-${{ runner.os }}-${{ runner.arch }}-${{ inputs.tools }}-${{ hashFiles('scripts/ci/inputs/tools.json') }}
+    - uses: ./.github/actions/ci-fetch
+      if: inputs.cargo == 'true'
+      with:
+        recipe: ci-cargo-fetch
+        path: |
+          ${{ steps.paths.outputs.cargo }}/registry
+          ${{ steps.paths.outputs.cargo }}/git
+        key: ci-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '.cargo/config.toml') }}

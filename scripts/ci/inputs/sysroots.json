@@ -1,0 +1,15 @@
+{
+  "netbsd": {
+    "version": "10.1",
+    "archives": [
+      {
+        "url": "https://archive.netbsd.org/pub/NetBSD-archive/NetBSD-10.1/amd64/binary/sets/comp.tar.xz",
+        "sha512": "ea90d527d1475bd64d2b4c36d9d6ae53cb353cbc8c4feaa2b2bf006710282d2f47349a8aeeb64531f9da04268ed368ff2603c1e11a30bdfc8b2539ad73fe725f"
+      },
+      {
+        "url": "https://archive.netbsd.org/pub/NetBSD-archive/NetBSD-10.1/amd64/binary/sets/base.tar.xz",
+        "sha512": "1c6b74cedd7fc92adfe51239808d41e63fc6eb9e9877c1101c1da515a38457278c7774e8fc3041d69cefc49821bad836cfdcc5147ad757f2f4a1f59f9e3862e5"
+      }
+    ]
+  }
+}

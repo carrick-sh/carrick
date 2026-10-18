@@ -15,6 +15,9 @@ jobs:
       CARGO_TERM_COLOR: never
     steps:
       - uses: actions/checkout@v4
+      - name: Restore CI inputs
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 12
       - name: Fresh guest identity and non-root KVM capability
         shell: bash
         run: |
@@ -40,3 +43,6 @@ jobs:
           name: willow-pilot-${{ github.run_id }}-${{ github.run_attempt }}
           path: pilot-logs/
           if-no-files-found: error
+      - name: Report infrastructure fetch status
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report
