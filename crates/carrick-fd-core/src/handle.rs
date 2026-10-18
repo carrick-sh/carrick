@@ -1,5 +1,5 @@
-//! Generation-keyed object pins and handle-table operations built on [`crate::Core`],
-//! [`TableStorage`], and [`OpenLifetime`].
+//! Generation-keyed object pins, handle-table operations, and per-task handle
+//! hosting built on [`Core`], [`TableStorage`], and [`OpenLifetime`].
 //!
 //! All state lives in `repr(C)` atomic records placeable in shared memory:
 //! - Slot allocation and lookup reuse [`crate::DescriptorSlot`], [`Extent`], and the
@@ -9,26 +9,38 @@
 //!   count, no `Arc` strong count as a lifetime, and no finalizer in `Drop`).
 //! - Exhausted slot generations (`Generation::MAX`) permanently retire the slot
 //!   on every path ([`Authority::close_handle`], [`Authority::close_all_handles`],
-//!   [`Authority::destroy_handle_table`], and [`Authority::inherit_handle_table`]):
-//!   the object reference is still released, the slot is never reused, and
-//!   reported table capacity decreases by one.
+//!   [`Authority::destroy_handle_table`], [`Authority::inherit_handle_table`],
+//!   [`TaskHandleHost::exit_task`], and [`TaskHandleHost::inherit_task`]): the
+//!   object reference is still released, the slot is never reused, and reported
+//!   table capacity decreases by one.
+//! - [`TaskHandleCore`] / [`TaskHandleHost`] map [`TaskKey`] to [`TableId`] via
+//!   fixed-bucket hash chains in shared-memory records with lock-free
+//!   sequence-validated lookup (no `O(max_tasks)` scans), unlinking and
+//!   reclaiming the binding record on [`TaskHandleHost::exit_task`].
 
 use core::fmt;
 use core::num::{NonZeroU32, NonZeroU64};
 
 use carrick_core_abi::{OpenLifetime, OpenReferenceKey, OpenRelease};
+use carrick_sched_core::process::TaskKey;
 
 use crate::free_list::{pop, push};
 use crate::{
-    AtomicU64, Authority, BackingToken, Error, Extent, FREE_INDEX, LockWait, Locked,
-    MAX_DESCRIPTORS, Ordering, SlotBacking, TABLE_FREE, TABLE_LIVE_HANDLES, TableId, TableRecord,
-    TableStorage,
+    AtomicU32, AtomicU64, Authority, BackingToken, Core, Error, Extent, FREE_INDEX, LockWait,
+    Locked, MAX_DESCRIPTORS, Ordering, SeqWord, SlotBacking, TABLE_BOUND_TASK, TABLE_FREE,
+    TABLE_LIVE_HANDLES, TableId, TableRecord, TableStorage,
 };
 
 #[cfg(all(test, not(feature = "loom")))]
 std::thread_local! {
     pub(crate) static AFTER_HANDLE_SLOT_STORE: core::cell::RefCell<Option<std::boxed::Box<dyn FnOnce()>>> = const { core::cell::RefCell::new(None) };
 }
+#[cfg(test)]
+std::thread_local! {
+    /// Task-bucket chain steps visited during [`TaskHandleHost::table_id`].
+    pub(crate) static TASK_LOOKUP_STEPS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+const HANDLE_TABLE_STATES: &[u32] = &[TABLE_LIVE_HANDLES, TABLE_LIVE_HANDLES | TABLE_BOUND_TASK];
 
 /// Maximum reference/pin count representable in the low 31 bits of [`OpenLifetime`].
 pub const MAX_OBJECT_PINS: u32 = (1u32 << 31) - 1;
@@ -942,9 +954,15 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
     }
 
     fn lock_handle_table(&self, id: TableId) -> Result<(Locked<'a>, HandleTable<'a>), HandleError> {
-        let (guard, table) = self
-            .lock_in_states(id, &[TABLE_LIVE_HANDLES])
-            .map_err(map_core_error)?;
+        self.lock_handle_table_in_states(id, HANDLE_TABLE_STATES)
+    }
+
+    fn lock_handle_table_in_states(
+        &self,
+        id: TableId,
+        states: &[u32],
+    ) -> Result<(Locked<'a>, HandleTable<'a>), HandleError> {
+        let (guard, table) = self.lock_in_states(id, states).map_err(map_core_error)?;
         Ok((
             guard,
             HandleTable {
@@ -954,11 +972,35 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         ))
     }
 
+    pub(crate) fn lock_unbound_handle_table(&self, id: TableId) -> Result<Locked<'a>, HandleError> {
+        let (guard, _) = self
+            .lock_in_states(
+                id,
+                &[
+                    crate::TABLE_LIVE,
+                    TABLE_LIVE_HANDLES,
+                    TABLE_LIVE_HANDLES | TABLE_BOUND_TASK,
+                ],
+            )
+            .map_err(map_core_error)?;
+        if guard.record.state.load(Ordering::Acquire) != TABLE_LIVE_HANDLES {
+            return Err(HandleError::InvalidHandle);
+        }
+        Ok(guard)
+    }
+
+    fn lock_bound_handle_table(
+        &self,
+        id: TableId,
+    ) -> Result<(Locked<'a>, HandleTable<'a>), HandleError> {
+        self.lock_handle_table_in_states(id, &[TABLE_LIVE_HANDLES | TABLE_BOUND_TASK])
+    }
+
     fn read_handle_table(
         &self,
         id: TableId,
     ) -> Result<(&'a TableRecord, u64, TableStorage<'a>, usize), HandleError> {
-        self.read_table_in_states(id, &[TABLE_LIVE_HANDLES])
+        self.read_table_in_states(id, HANDLE_TABLE_STATES)
             .map_err(map_core_error)
     }
 
@@ -996,7 +1038,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         table: TableId,
         storage: &mut Extent,
     ) -> Result<(), HandleError> {
-        self.grow_table_in_states(table, storage, &[TABLE_LIVE_HANDLES])
+        self.grow_table_in_states(table, storage, HANDLE_TABLE_STATES)
             .map_err(map_core_error)
     }
 
@@ -1544,31 +1586,46 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         Ok(())
     }
 
-    /// Destroy `table` on task exit, releasing every remaining handle's pin
+    fn destroy_locked_handle_table(
+        &self,
+        index: usize,
+        guard: Locked<'a>,
+        t: HandleTable<'a>,
+        end: usize,
+        release: impl FnMut(BackingToken),
+    ) -> Extent {
+        let extent = Self::record_extent(guard.record);
+        let head = self.collect_retired_slots(guard.record, &t.storage, end, false);
+        guard.record.begin_write();
+        guard.record.extent_token.store(0, Ordering::Relaxed);
+        guard.record.extent_capacity.store(0, Ordering::Relaxed);
+        guard.record.state.store(TABLE_FREE, Ordering::Release);
+        guard.record.end_write();
+        drop(guard);
+        self.push_table(index);
+        self.finalize_retired_objects(head, release);
+        extent
+    }
+
+    /// Destroy an unbound `table`, releasing every remaining handle's pin
     /// exactly once after `end_write` and outside the table lock, and returning
     /// the table's [`Extent`] to the venue.
+    ///
+    /// Refuses with [`HandleError::InvalidHandle`] if `table` is currently
+    /// bound to a [`TaskKey`] in a [`TaskHandleCore`] (use
+    /// [`TaskHandleHost::exit_task`] so the task binding cannot be orphaned).
     pub fn destroy_handle_table(
         &self,
         table: TableId,
         release: impl FnMut(BackingToken),
     ) -> Result<Extent, HandleError> {
-        let (extent, head) = {
-            let (guard, t) = self.lock_handle_table(table)?;
-            let end = t.limit.min(t.storage.capacity());
-            self.validate_closing_slots(&t.storage, end, false)?;
-            let extent = Self::record_extent(guard.record);
-            let head = self.collect_retired_slots(guard.record, &t.storage, end, false);
-            guard.record.begin_write();
-            guard.record.extent_token.store(0, Ordering::Relaxed);
-            guard.record.extent_capacity.store(0, Ordering::Relaxed);
-            guard.record.state.store(TABLE_FREE, Ordering::Release);
-            guard.record.end_write();
-            drop(guard);
-            self.push_table(table.index);
-            (extent, head)
-        };
-        self.finalize_retired_objects(head, release);
-        Ok(extent)
+        let (guard, t) = self.lock_handle_table(table)?;
+        if (guard.record.state.load(Ordering::Relaxed) & TABLE_BOUND_TASK) != 0 {
+            return Err(HandleError::InvalidHandle);
+        }
+        let end = t.limit.min(t.storage.capacity());
+        self.validate_closing_slots(&t.storage, end, false)?;
+        Ok(self.destroy_locked_handle_table(table.index, guard, t, end, release))
     }
 
     /// Inherit one coherent parent snapshot, retaining all eligible candidates
@@ -1716,6 +1773,602 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
     }
 }
 
+/// One hash bucket in [`TaskHandleCore`]: per-bucket spinlock (`lock`),
+/// 1-based head index into `bindings` (`head`, `0` = empty), and a shared
+/// `SeqWord` sequence counter (`seq`, odd while a writer mutates the bucket
+/// chain or a binding record) so [`TaskHandleHost::table_id`] walks the bucket
+/// chain lock-free with the same release/acquire fence discipline as
+/// [`TableRecord`].
+///
+/// Cache-line aligned and padded to 64 bytes so concurrent bucket locks and
+/// sequence words across adjacent buckets do not share a cache line.
+#[repr(C, align(64))]
+#[derive(Debug, Default)]
+pub struct TaskBucket {
+    pub(crate) lock: AtomicU32,
+    pub(crate) head: AtomicU32,
+    pub(crate) seq: SeqWord,
+    _reserved: [u64; 6],
+}
+
+impl TaskBucket {
+    #[inline]
+    pub(crate) fn begin_write(&self) {
+        self.seq.begin_write();
+    }
+
+    #[inline]
+    pub(crate) fn end_write(&self) {
+        self.seq.end_write();
+    }
+
+    #[inline]
+    pub(crate) fn unchanged_since(&self, seq: u64) -> bool {
+        self.seq.unchanged_since(seq)
+    }
+}
+
+/// One task-to-table binding record in [`TaskHandleCore`].
+#[repr(C, align(64))]
+#[derive(Debug, Default)]
+pub struct TaskBindingRecord {
+    pub(crate) task_id: AtomicU32,
+    pub(crate) hash_next: AtomicU32,
+    pub(crate) task_serial: AtomicU64,
+    pub(crate) table_authority: AtomicU64,
+    pub(crate) table_index: AtomicU64,
+    pub(crate) table_generation: AtomicU64,
+    pub(crate) next_free: AtomicU64,
+    _reserved: [u64; 2],
+}
+
+/// Shared-memory `repr(C)` core hosting per-task handle tables keyed by
+/// [`TaskKey`].
+///
+/// Combines [`Core<T>`] with an `O(1)` hash-bucketed task index and a lock-free
+/// free list of `T` [`TaskBindingRecord`]s so [`TaskHandleHost::exit_task`]
+/// removes exited tasks and reclaims slots across unbounded task churn.
+#[repr(C, align(64))]
+pub struct TaskHandleCore<const T: usize> {
+    pub(crate) core: Core<T>,
+    pub(crate) free_bindings: AtomicU64,
+    _reserved: [u64; 7],
+    pub(crate) buckets: [TaskBucket; T],
+    pub(crate) bindings: [TaskBindingRecord; T],
+}
+
+impl<const T: usize> TaskHandleCore<T> {
+    /// Create and initialize a [`TaskHandleCore`] for a single address space.
+    pub fn new() -> Result<Self, HandleError> {
+        if T == 0 {
+            return Err(HandleError::InvalidHandle);
+        }
+        let task_core = Self {
+            core: Core::new().map_err(map_core_error)?,
+            free_bindings: AtomicU64::new(0),
+            _reserved: [0; 7],
+            buckets: core::array::from_fn(|_| TaskBucket::default()),
+            bindings: core::array::from_fn(|_| TaskBindingRecord::default()),
+        };
+        for i in (0..T).rev() {
+            push(
+                &task_core.free_bindings,
+                i,
+                &task_core.bindings[i].next_free,
+            );
+        }
+        Ok(task_core)
+    }
+
+    /// Initialize a zeroed [`TaskHandleCore`] in place with `identity`.
+    pub fn initialize(&self, identity: u64) -> Result<(), HandleError> {
+        if T == 0 || (T as u64) >= FREE_INDEX || identity == 0 {
+            return Err(HandleError::InvalidHandle);
+        }
+        if self.core.identity.load(Ordering::Acquire) != 0
+            || self.free_bindings.load(Ordering::Acquire) != 0
+        {
+            return Err(HandleError::InvalidHandle);
+        }
+        self.core.initialize(identity).map_err(map_core_error)?;
+        for i in (0..T).rev() {
+            push(&self.free_bindings, i, &self.bindings[i].next_free);
+        }
+        Ok(())
+    }
+
+    /// Underlying [`Core`] reference.
+    pub const fn core(&self) -> &Core<T> {
+        &self.core
+    }
+
+    /// Bind this [`TaskHandleCore`] to a venue's [`SlotBacking`] and [`LockWait`] policy.
+    pub fn bind<'a, B: SlotBacking, W: LockWait>(
+        &'a self,
+        backing: &'a B,
+        wait: W,
+    ) -> TaskHandleHost<'a, B, W, T> {
+        TaskHandleHost {
+            task_core: self,
+            backing,
+            wait,
+        }
+    }
+}
+
+struct RefWait<'a, W>(&'a W);
+
+impl<W> Clone for RefWait<'_, W> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<W> Copy for RefWait<'_, W> {}
+
+impl<W: LockWait> LockWait for RefWait<'_, W> {
+    #[inline]
+    fn wait(&self, attempt: u32) -> bool {
+        self.0.wait(attempt)
+    }
+}
+
+struct LockedBucket<'a> {
+    bucket: &'a TaskBucket,
+}
+
+impl Drop for LockedBucket<'_> {
+    fn drop(&mut self) {
+        self.bucket.lock.store(0, Ordering::Release);
+    }
+}
+
+/// Bound venue view over a [`TaskHandleCore`]: `O(1)` task-keyed handle-table
+/// operations, inheritance attachment, and concurrent-safe task exit.
+pub struct TaskHandleHost<'a, B: SlotBacking, W: LockWait, const T: usize> {
+    task_core: &'a TaskHandleCore<T>,
+    backing: &'a B,
+    wait: W,
+}
+
+impl<'a, B: SlotBacking, W: LockWait, const T: usize> TaskHandleHost<'a, B, W, T> {
+    /// Underlying [`Authority`] view over [`Core<T>`].
+    #[inline]
+    pub fn authority(&self) -> Authority<'a, B, impl LockWait + Copy + '_, T> {
+        self.task_core.core.bind(self.backing, RefWait(&self.wait))
+    }
+
+    /// Publish `count` more [`ObjectRecord`]s in venue memory.
+    #[inline]
+    pub fn publish_objects(&self, count: usize) -> Result<(), HandleError> {
+        self.authority().publish_objects(count)
+    }
+
+    fn bucket_index(task: TaskKey) -> usize {
+        // Bijective 64-bit mix over the task's slot ID so all serial
+        // incarnations of the same TaskId map to one bucket while distinct
+        // TaskIds spread evenly across `0..T`.
+        let mut z = (task.id.raw() as u32 as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        (z as usize) % T
+    }
+
+    fn lock_bucket(&self, bucket_idx: usize) -> Result<LockedBucket<'a>, HandleError> {
+        let bucket = self
+            .task_core
+            .buckets
+            .get(bucket_idx)
+            .ok_or(HandleError::Stale)?;
+        let mut attempt: u32 = 0;
+        loop {
+            if bucket
+                .lock
+                .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Ok(LockedBucket { bucket });
+            }
+            attempt = attempt.saturating_add(1);
+            if !self.wait.wait(attempt) {
+                return Err(HandleError::Contended);
+            }
+        }
+    }
+
+    fn pop_binding(&self) -> Result<usize, HandleError> {
+        let bindings = &self.task_core.bindings;
+        pop(&self.task_core.free_bindings, |i| {
+            bindings.get(i).map(|b| b.next_free.load(Ordering::Relaxed))
+        })
+        .ok_or(HandleError::TableFull)
+    }
+
+    fn push_binding(&self, index: usize) {
+        let binding = &self.task_core.bindings[index];
+        push(&self.task_core.free_bindings, index, &binding.next_free);
+    }
+
+    /// Attach an existing, unbound live handle `table` to `task` in the `O(1)`
+    /// hash index.
+    ///
+    /// Refuses if `task` is already bound (`Err(HandleError::InvalidHandle)`),
+    /// if `table` is closed or from another authority (`Err(HandleError::Stale)`),
+    /// or if `table` is a descriptor table or already bound to a task
+    /// (`Err(HandleError::InvalidHandle)`).
+    pub fn attach_task_table(&self, task: TaskKey, table: TableId) -> Result<(), HandleError> {
+        let auth = self.authority();
+        auth.handle_identity()?;
+        if task.id.raw() <= 0 || task.serial.raw() == 0 {
+            return Err(HandleError::InvalidHandle);
+        }
+        let bucket_idx = Self::bucket_index(task);
+        let guard = self.lock_bucket(bucket_idx)?;
+        let raw_id = task.id.raw() as u32;
+        let raw_serial = task.serial.raw();
+        let mut cur = guard.bucket.head.load(Ordering::Relaxed);
+        while cur != 0 {
+            let idx = (cur - 1) as usize;
+            let existing = &self.task_core.bindings[idx];
+            if existing.task_id.load(Ordering::Relaxed) == raw_id {
+                return Err(HandleError::InvalidHandle);
+            }
+            cur = existing.hash_next.load(Ordering::Relaxed);
+        }
+        // Lock order: TaskBucket -> TableRecord.
+        let table_guard = auth.lock_unbound_handle_table(table)?;
+        let binding_idx = self.pop_binding()?;
+
+        table_guard.record.begin_write();
+        table_guard
+            .record
+            .state
+            .store(TABLE_LIVE_HANDLES | TABLE_BOUND_TASK, Ordering::Release);
+        table_guard.record.end_write();
+
+        let record = &self.task_core.bindings[binding_idx];
+        let head = guard.bucket.head.load(Ordering::Relaxed);
+        guard.bucket.begin_write();
+        record.task_id.store(raw_id, Ordering::Relaxed);
+        record.task_serial.store(raw_serial, Ordering::Relaxed);
+        record
+            .table_authority
+            .store(table.authority, Ordering::Relaxed);
+        record
+            .table_index
+            .store(table.index as u64, Ordering::Relaxed);
+        record
+            .table_generation
+            .store(table.generation, Ordering::Relaxed);
+        record.hash_next.store(head, Ordering::Relaxed);
+        guard
+            .bucket
+            .head
+            .store((binding_idx as u32) + 1, Ordering::Relaxed);
+        guard.bucket.end_write();
+        drop(table_guard);
+        drop(guard);
+        Ok(())
+    }
+
+    /// Create a new handle table with `limit` over `storage` and attach it to `task`.
+    pub fn create_task_table(
+        &self,
+        task: TaskKey,
+        limit: usize,
+        storage: &mut Extent,
+    ) -> Result<TableId, HandleError> {
+        let auth = self.authority();
+        let table = auth.create_handle_table(limit, storage)?;
+        if let Err(err) = self.attach_task_table(task, table) {
+            *storage = auth.destroy_handle_table(table, |_| {})?;
+            return Err(err);
+        }
+        Ok(table)
+    }
+
+    /// Look up `task`'s [`TableId`] in `O(1)` via its hash bucket without
+    /// taking the bucket spinlock (sequence-validated against [`TaskBucket`]).
+    ///
+    /// Rejects a stale [`TaskKey`] (including a recycled `TaskId` with an older
+    /// `TaskSerial`) with [`HandleError::Stale`].
+    pub fn table_id(&self, task: TaskKey) -> Result<TableId, HandleError> {
+        self.authority().handle_identity()?;
+        if task.id.raw() <= 0 || task.serial.raw() == 0 {
+            return Err(HandleError::Stale);
+        }
+        let bucket_idx = Self::bucket_index(task);
+        let bucket = self
+            .task_core
+            .buckets
+            .get(bucket_idx)
+            .ok_or(HandleError::Stale)?;
+        let raw_id = task.id.raw() as u32;
+        let raw_serial = task.serial.raw();
+        let mut attempt: u32 = 0;
+        loop {
+            let seq = bucket.seq.load(Ordering::Acquire);
+            if seq & 1 == 0 {
+                let mut cur = bucket.head.load(Ordering::Relaxed);
+                let mut steps = 0usize;
+                let mut found: Option<TableId> = None;
+                let mut consistent = true;
+                while cur != 0 {
+                    if steps >= T {
+                        consistent = false;
+                        break;
+                    }
+                    steps += 1;
+                    #[cfg(test)]
+                    TASK_LOOKUP_STEPS.with(|n| n.set(n.get() + 1));
+                    let idx = (cur - 1) as usize;
+                    let Some(record) = self.task_core.bindings.get(idx) else {
+                        consistent = false;
+                        break;
+                    };
+                    if record.task_id.load(Ordering::Relaxed) == raw_id
+                        && record.task_serial.load(Ordering::Relaxed) == raw_serial
+                    {
+                        found = Some(TableId {
+                            authority: record.table_authority.load(Ordering::Relaxed),
+                            index: record.table_index.load(Ordering::Relaxed) as usize,
+                            generation: record.table_generation.load(Ordering::Relaxed),
+                        });
+                        break;
+                    }
+                    cur = record.hash_next.load(Ordering::Relaxed);
+                }
+                if consistent && bucket.unchanged_since(seq) {
+                    return found.ok_or(HandleError::Stale);
+                }
+            }
+            attempt = attempt.saturating_add(1);
+            if !self.wait.wait(attempt) {
+                return Err(HandleError::Contended);
+            }
+        }
+    }
+
+    /// Reported usable slot capacity of `task`'s handle table (`limit - retired`).
+    pub fn capacity(&self, task: TaskKey) -> Result<usize, HandleError> {
+        let table = self.table_id(task)?;
+        self.authority().handle_table_capacity(table)
+    }
+
+    /// Number of currently occupied handle slots in `task`'s handle table.
+    pub fn live_count(&self, task: TaskKey) -> Result<usize, HandleError> {
+        let table = self.table_id(task)?;
+        self.authority().handle_table_live_count(table)
+    }
+
+    /// Seed the next vacant generation of `slot` in `task`'s table.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn seed_slot_generation(
+        &self,
+        task: TaskKey,
+        slot: SlotIndex,
+        generation: Generation,
+    ) -> Result<(), HandleError> {
+        let table = self.table_id(task)?;
+        self.authority()
+            .seed_handle_slot_generation(table, slot, generation)
+    }
+
+    /// Insert a new handle into `task`'s table.
+    pub fn insert(
+        &self,
+        task: TaskKey,
+        backing: BackingToken,
+        flags: HandleFlags,
+    ) -> Result<Handle, HandleError> {
+        let table = self.table_id(task)?;
+        self.authority().insert_handle(table, backing, flags)
+    }
+
+    /// Look up the table-scoped [`Handle`] currently at `slot` in `task`'s table.
+    pub fn handle_at(&self, task: TaskKey, slot: SlotIndex) -> Result<Handle, HandleError> {
+        let table = self.table_id(task)?;
+        self.authority().handle_at(table, slot)
+    }
+
+    /// Resolve `handle` in `task`'s table and return a retained [`ObjectGuard`].
+    pub fn get(&self, task: TaskKey, handle: Handle) -> Result<ObjectGuard, HandleError> {
+        let table = self.table_id(task)?;
+        self.authority().get_handle(table, handle)
+    }
+
+    /// Resolve `pin` in `task`'s table and return a retained [`ObjectGuard`].
+    pub fn get_pin(&self, task: TaskKey, pin: ObjectPin) -> Result<ObjectGuard, HandleError> {
+        let table = self.table_id(task)?;
+        self.authority().get_handle_pin(table, pin)
+    }
+
+    /// Decode `number` with `codec`, resolve it in `task`'s table, and return
+    /// both the table-scoped [`Handle`] and its retained [`ObjectGuard`].
+    pub fn get_by_number(
+        &self,
+        task: TaskKey,
+        codec: HandleNumberCodec,
+        number: HandleNumber,
+    ) -> Result<(Handle, ObjectGuard), HandleError> {
+        let table = self.table_id(task)?;
+        self.authority().get_handle_by_number(table, codec, number)
+    }
+
+    /// Acquire an additional owned [`ObjectGuard`] from an existing guard.
+    pub fn retain_pin(&self, guard: &ObjectGuard) -> Result<ObjectGuard, HandleError> {
+        self.authority().retain_handle_pin(guard)
+    }
+
+    /// Release an owned [`ObjectGuard`] (consuming it by value).
+    #[must_use = "the last-reference backing token must be finalized by the caller"]
+    pub fn release_pin(&self, guard: ObjectGuard) -> Result<Option<BackingToken>, HandleError> {
+        self.authority().release_handle_pin(guard)
+    }
+
+    /// Active reference/pin count in [`OpenLifetime`] for `guard`.
+    pub fn pin_count(&self, guard: &ObjectGuard) -> Result<u32, HandleError> {
+        self.authority().handle_pin_count(guard)
+    }
+
+    /// Duplicate `handle` in `task`'s table.
+    pub fn duplicate(&self, task: TaskKey, handle: Handle) -> Result<Handle, HandleError> {
+        let table = self.table_id(task)?;
+        self.authority().duplicate_handle(table, handle)
+    }
+
+    /// Duplicate `handle` in `task`'s table with explicit `flags`.
+    pub fn duplicate_with_flags(
+        &self,
+        task: TaskKey,
+        handle: Handle,
+        flags: HandleFlags,
+    ) -> Result<Handle, HandleError> {
+        let table = self.table_id(task)?;
+        self.authority()
+            .duplicate_handle_with_flags(table, handle, flags)
+    }
+
+    /// Read [`HandleFlags`] for `handle` in `task`'s table.
+    pub fn flags(&self, task: TaskKey, handle: Handle) -> Result<HandleFlags, HandleError> {
+        let table = self.table_id(task)?;
+        self.authority().handle_flags(table, handle)
+    }
+
+    /// Update [`HandleFlags`] for `handle` in `task`'s table.
+    pub fn set_flags(
+        &self,
+        task: TaskKey,
+        handle: Handle,
+        flags: HandleFlags,
+    ) -> Result<(), HandleError> {
+        let table = self.table_id(task)?;
+        self.authority().set_handle_flags(table, handle, flags)
+    }
+
+    /// Close `handle` in `task`'s table, returning `Ok(Some(backing))` when
+    /// this dropped the final reference in [`OpenLifetime`].
+    #[must_use = "the last-reference backing token must be finalized by the caller"]
+    pub fn close(
+        &self,
+        task: TaskKey,
+        handle: Handle,
+    ) -> Result<Option<BackingToken>, HandleError> {
+        let table = self.table_id(task)?;
+        self.authority().close_handle(table, handle)
+    }
+
+    /// Inherit handles from `parent_task` into a new table attached to
+    /// `child_task`, honouring `flags.is_inheritable()` and `filter`.
+    ///
+    /// Any [`OpenRelease::Terminal`] token produced during rollback (if
+    /// `parent_task` closes or exits while `filter` runs) or on
+    /// `attach_task_table` failure is delivered to `release` so no last
+    /// reference is dropped without finalization.
+    pub fn inherit_task(
+        &self,
+        parent_task: TaskKey,
+        child_task: TaskKey,
+        filter: impl FnMut(ObjectPin, BackingToken, HandleFlags) -> bool,
+        storage: &mut Extent,
+        mut release: impl FnMut(BackingToken),
+    ) -> Result<TableId, HandleError> {
+        if parent_task == child_task {
+            return Err(HandleError::InvalidHandle);
+        }
+        let parent_table = self.table_id(parent_task)?;
+        let auth = self.authority();
+        let child_table = auth.inherit_handle_table(parent_table, filter, storage, &mut release)?;
+        if let Err(err) = self.attach_task_table(child_task, child_table) {
+            *storage = auth.destroy_handle_table(child_table, &mut release)?;
+            return Err(err);
+        }
+        Ok(child_table)
+    }
+
+    /// Destroy `task`'s handle table, remove `task` from the host's bucket
+    /// index, reclaim its binding and table slots, and release every remaining
+    /// handle's pin exactly once after `end_write` and outside both the bucket
+    /// lock and the table lock.
+    ///
+    /// All-or-nothing under a bounded [`LockWait`]: if acquiring the bucket or
+    /// table lock returns [`HandleError::Contended`], neither the task binding
+    /// nor the table is modified ("gave up before any effect").
+    pub fn exit_task(
+        &self,
+        task: TaskKey,
+        release: impl FnMut(BackingToken),
+    ) -> Result<Extent, HandleError> {
+        let auth = self.authority();
+        auth.handle_identity()?;
+        if task.id.raw() <= 0 || task.serial.raw() == 0 {
+            return Err(HandleError::Stale);
+        }
+        let bucket_idx = Self::bucket_index(task);
+        let guard = self.lock_bucket(bucket_idx)?;
+        let raw_id = task.id.raw() as u32;
+        let raw_serial = task.serial.raw();
+        let mut prev_idx: Option<usize> = None;
+        let mut cur = guard.bucket.head.load(Ordering::Relaxed);
+        let mut found: Option<(usize, Option<usize>, u32, TableId)> = None;
+        while cur != 0 {
+            let idx = (cur - 1) as usize;
+            let record = &self.task_core.bindings[idx];
+            let next = record.hash_next.load(Ordering::Relaxed);
+            if record.task_id.load(Ordering::Relaxed) == raw_id
+                && record.task_serial.load(Ordering::Relaxed) == raw_serial
+            {
+                let id = TableId {
+                    authority: record.table_authority.load(Ordering::Relaxed),
+                    index: record.table_index.load(Ordering::Relaxed) as usize,
+                    generation: record.table_generation.load(Ordering::Relaxed),
+                };
+                found = Some((idx, prev_idx, next, id));
+                break;
+            }
+            prev_idx = Some(idx);
+            cur = next;
+        }
+        let Some((binding_idx, prev_idx, next, table_id)) = found else {
+            return Err(HandleError::Stale);
+        };
+
+        // Lock and validate the bound handle table BEFORE unlinking the binding
+        // so `Contended` leaves both the binding and the table untouched.
+        let (table_guard, t) = auth.lock_bound_handle_table(table_id)?;
+        let end = t.limit.min(t.storage.capacity());
+        auth.validate_closing_slots(&t.storage, end, false)?;
+
+        // Unlink the binding under the bucket seqlock, return the binding to
+        // `free_bindings`, and drop `guard` (`TaskBucket` spinlock) BEFORE
+        // running any finalizer.
+        let record = &self.task_core.bindings[binding_idx];
+        guard.bucket.begin_write();
+        if let Some(prev) = prev_idx {
+            self.task_core.bindings[prev]
+                .hash_next
+                .store(next, Ordering::Relaxed);
+        } else {
+            guard.bucket.head.store(next, Ordering::Relaxed);
+        }
+        record.task_id.store(0, Ordering::Relaxed);
+        record.task_serial.store(0, Ordering::Relaxed);
+        record.table_authority.store(0, Ordering::Relaxed);
+        record.table_index.store(0, Ordering::Relaxed);
+        record.table_generation.store(0, Ordering::Relaxed);
+        record.hash_next.store(0, Ordering::Relaxed);
+        guard.bucket.end_write();
+        drop(guard);
+        self.push_binding(binding_idx);
+
+        // Unpublish the table (`record.seq` even), drop the table lock, and run
+        // `release` finalizers outside both the bucket lock and the table lock.
+        Ok(auth.destroy_locked_handle_table(table_id.index, table_guard, t, end, release))
+    }
+}
+
 #[cfg(not(all(test, feature = "loom")))]
 const _: () = {
     assert!(matches!(crate::layout_fact("Core.free_objects"), Some(32)));
@@ -1725,6 +2378,7 @@ const _: () = {
         Some(56)
     ));
     assert!(matches!(crate::layout_fact("TABLE_LIVE_HANDLES"), Some(2)));
+    assert!(matches!(crate::layout_fact("TABLE_BOUND_TASK"), Some(4)));
     assert!(matches!(crate::layout_fact("ObjectRecord.size"), Some(64)));
     assert!(matches!(crate::layout_fact("ObjectRecord.align"), Some(64)));
     assert!(matches!(
@@ -1779,6 +2433,64 @@ const _: () = {
         crate::layout_fact("RawObjectGuard.flags_bits"),
         Some(36)
     ));
-    assert!(core::mem::size_of::<ObjectRecord>() == 64);
-    assert!(core::mem::align_of::<ObjectRecord>() == 64);
+    assert!(matches!(crate::layout_fact("TaskBucket.size"), Some(64)));
+    assert!(matches!(crate::layout_fact("TaskBucket.align"), Some(64)));
+    assert!(matches!(crate::layout_fact("TaskBucket.head"), Some(4)));
+    assert!(matches!(crate::layout_fact("TaskBucket.seq"), Some(8)));
+    assert!(matches!(
+        crate::layout_fact("TaskBindingRecord.size"),
+        Some(64)
+    ));
+    assert!(matches!(
+        crate::layout_fact("TaskBindingRecord.align"),
+        Some(64)
+    ));
+    assert!(matches!(
+        crate::layout_fact("TaskBindingRecord.task_id"),
+        Some(0)
+    ));
+    assert!(matches!(
+        crate::layout_fact("TaskBindingRecord.hash_next"),
+        Some(4)
+    ));
+    assert!(matches!(
+        crate::layout_fact("TaskBindingRecord.task_serial"),
+        Some(8)
+    ));
+    assert!(matches!(
+        crate::layout_fact("TaskBindingRecord.table_authority"),
+        Some(16)
+    ));
+    assert!(matches!(
+        crate::layout_fact("TaskBindingRecord.table_index"),
+        Some(24)
+    ));
+    assert!(matches!(
+        crate::layout_fact("TaskBindingRecord.table_generation"),
+        Some(32)
+    ));
+    assert!(matches!(
+        crate::layout_fact("TaskBindingRecord.next_free"),
+        Some(40)
+    ));
+    assert!(matches!(
+        crate::layout_fact("TaskHandleCore.size"),
+        Some(320)
+    ));
+    assert!(matches!(
+        crate::layout_fact("TaskHandleCore.align"),
+        Some(64)
+    ));
+    assert!(matches!(
+        crate::layout_fact("TaskHandleCore.free_bindings"),
+        Some(128)
+    ));
+    assert!(matches!(
+        crate::layout_fact("TaskHandleCore.buckets"),
+        Some(192)
+    ));
+    assert!(matches!(
+        crate::layout_fact("TaskHandleCore.bindings"),
+        Some(256)
+    ));
 };

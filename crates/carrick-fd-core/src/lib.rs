@@ -27,10 +27,10 @@ mod tests;
 mod loom_models;
 
 #[cfg(not(all(test, feature = "loom")))]
-pub(crate) static NEXT_AUTHORITY: AtomicU64 = AtomicU64::new(1);
+static NEXT_AUTHORITY: AtomicU64 = AtomicU64::new(1);
 #[cfg(all(test, feature = "loom"))]
 loom::lazy_static! {
-    pub(crate) static ref NEXT_AUTHORITY: AtomicU64 = AtomicU64::new(1);
+    static ref NEXT_AUTHORITY: AtomicU64 = AtomicU64::new(1);
 }
 
 /// Guest descriptor number, including invalid negative syscall arguments.
@@ -461,6 +461,7 @@ impl Table<'_> {
 pub(crate) const TABLE_FREE: u32 = 0;
 pub(crate) const TABLE_LIVE: u32 = 1;
 pub(crate) const TABLE_LIVE_HANDLES: u32 = 2;
+pub(crate) const TABLE_BOUND_TASK: u32 = 4;
 pub(crate) const FREE_INDEX: u64 = u32::MAX as u64;
 const REF: u64 = 1 << 32;
 const PIN: u64 = 1;
@@ -652,7 +653,7 @@ const fn str_eq(a: &str, b: &str) -> bool {
 }
 
 /// Named layout facts a shared-memory venue folds into its ABI layout hash.
-pub const NAMED_LAYOUT_FACTS: [(&str, u64); 37] = [
+pub const NAMED_LAYOUT_FACTS: [(&str, u64); 56] = [
     (
         "TableRecord.size",
         core::mem::size_of::<TableRecord>() as u64,
@@ -703,6 +704,7 @@ pub const NAMED_LAYOUT_FACTS: [(&str, u64); 37] = [
         core::mem::offset_of!(TableRecord, retired) as u64,
     ),
     ("TABLE_LIVE_HANDLES", TABLE_LIVE_HANDLES as u64),
+    ("TABLE_BOUND_TASK", TABLE_BOUND_TASK as u64),
     (
         "ObjectRecord.size",
         core::mem::size_of::<handle::ObjectRecord>() as u64,
@@ -771,6 +773,78 @@ pub const NAMED_LAYOUT_FACTS: [(&str, u64); 37] = [
         "HANDLE_SLOT_GENERATION_SHIFT",
         handle::HANDLE_SLOT_GENERATION_SHIFT,
     ),
+    (
+        "TaskBucket.size",
+        core::mem::size_of::<handle::TaskBucket>() as u64,
+    ),
+    (
+        "TaskBucket.align",
+        core::mem::align_of::<handle::TaskBucket>() as u64,
+    ),
+    (
+        "TaskBucket.head",
+        core::mem::offset_of!(handle::TaskBucket, head) as u64,
+    ),
+    (
+        "TaskBucket.seq",
+        core::mem::offset_of!(handle::TaskBucket, seq) as u64,
+    ),
+    (
+        "TaskBindingRecord.size",
+        core::mem::size_of::<handle::TaskBindingRecord>() as u64,
+    ),
+    (
+        "TaskBindingRecord.align",
+        core::mem::align_of::<handle::TaskBindingRecord>() as u64,
+    ),
+    (
+        "TaskBindingRecord.task_id",
+        core::mem::offset_of!(handle::TaskBindingRecord, task_id) as u64,
+    ),
+    (
+        "TaskBindingRecord.hash_next",
+        core::mem::offset_of!(handle::TaskBindingRecord, hash_next) as u64,
+    ),
+    (
+        "TaskBindingRecord.task_serial",
+        core::mem::offset_of!(handle::TaskBindingRecord, task_serial) as u64,
+    ),
+    (
+        "TaskBindingRecord.table_authority",
+        core::mem::offset_of!(handle::TaskBindingRecord, table_authority) as u64,
+    ),
+    (
+        "TaskBindingRecord.table_index",
+        core::mem::offset_of!(handle::TaskBindingRecord, table_index) as u64,
+    ),
+    (
+        "TaskBindingRecord.table_generation",
+        core::mem::offset_of!(handle::TaskBindingRecord, table_generation) as u64,
+    ),
+    (
+        "TaskBindingRecord.next_free",
+        core::mem::offset_of!(handle::TaskBindingRecord, next_free) as u64,
+    ),
+    (
+        "TaskHandleCore.size",
+        core::mem::size_of::<handle::TaskHandleCore<1>>() as u64,
+    ),
+    (
+        "TaskHandleCore.align",
+        core::mem::align_of::<handle::TaskHandleCore<1>>() as u64,
+    ),
+    (
+        "TaskHandleCore.free_bindings",
+        core::mem::offset_of!(handle::TaskHandleCore<1>, free_bindings) as u64,
+    ),
+    (
+        "TaskHandleCore.buckets",
+        core::mem::offset_of!(handle::TaskHandleCore<1>, buckets) as u64,
+    ),
+    (
+        "TaskHandleCore.bindings",
+        core::mem::offset_of!(handle::TaskHandleCore<1>, bindings) as u64,
+    ),
 ];
 
 /// Look up a layout fact in [`NAMED_LAYOUT_FACTS`] by name at compile time.
@@ -805,6 +879,7 @@ const _: () = {
     assert!(matches!(layout_fact("Core.object_count"), Some(40)));
     assert!(matches!(layout_fact("Core.tables"), Some(64)));
     assert!(matches!(layout_fact("TABLE_LIVE_HANDLES"), Some(2)));
+    assert!(matches!(layout_fact("TABLE_BOUND_TASK"), Some(4)));
 };
 
 /// A tagged lock-free stack of free record indices, for venue record arrays

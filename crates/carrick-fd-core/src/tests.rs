@@ -1408,6 +1408,16 @@ fn b_prep_pair_population_has_logarithmic_search_and_balanced_holds() {
 // ---- contract core.personality.handle-table (unit bindings) ----
 
 use crate::handle::*;
+use carrick_sched_core::process::TaskKey;
+
+fn test_task_key(id: i32, serial: u64) -> TaskKey {
+    use carrick_sched_core::process::{TaskId, TaskSerial};
+    use core::num::NonZeroI32;
+    TaskKey {
+        id: TaskId::from_registry_allocation(NonZeroI32::new(id).unwrap()),
+        serial: TaskSerial::from_raw_u64(serial).unwrap(),
+    }
+}
 
 #[test]
 fn handle_slot_generation_exhaustion_retires_slot_on_close_exit_and_inherit() {
@@ -1620,44 +1630,137 @@ fn handle_concurrent_guards_exceed_eight_and_churn_without_exhaustion() {
 }
 
 #[test]
-fn inherit_filter_parent_close_or_destroy_finalizes_every_object_exactly_once() {
-    let (core, arena) = core_with_objects::<4>(8);
-    let c = core.bind(arena, Spin);
-    let parent = c.create_handle_table(4, &mut storage(4)).unwrap();
-    c.insert_handle(parent, BackingToken(100), HandleFlags::INHERITABLE)
+fn task_exit_contended_preserves_binding_until_retry_finalizes_once() {
+    let arena = TestArena::with_ofds_and_objects(0, 8);
+    let task_core: &'static TaskHandleCore<2> = Box::leak(Box::new(TaskHandleCore::new().unwrap()));
+    let host_spin = task_core.bind(arena, Spin);
+    let host_bounded = task_core.bind(arena, BoundedSpin(8));
+    host_spin.publish_objects(8).unwrap();
+
+    let task = test_task_key(1, 1);
+    let table = host_spin
+        .create_task_table(task, 4, &mut storage(4))
         .unwrap();
-    c.insert_handle(parent, BackingToken(200), HandleFlags::INHERITABLE)
+    let h1 = host_spin
+        .insert(task, BackingToken(10), HandleFlags::default())
+        .unwrap();
+    let _h2 = host_spin
+        .insert(task, BackingToken(20), HandleFlags::default())
         .unwrap();
 
-    // Both candidates are retained before parent destruction in the filter.
-    let mut destroy_finalized = Vec::new();
+    // Simulate a concurrent close holding the table lock while exit_task runs under BoundedSpin.
+    task_core.core().tables[table.index]
+        .lock
+        .store(1, Ordering::Release);
+    assert_eq!(
+        host_bounded.exit_task(task, |_| panic!("must not finalize on Contended")),
+        Err(HandleError::Contended)
+    );
+    // P1-B witness: Contended must leave the task binding and table intact.
+    assert_eq!(host_spin.table_id(task), Ok(table));
+
+    // Concurrent close releases the table lock and closes h1.
+    task_core.core().tables[table.index]
+        .lock
+        .store(0, Ordering::Release);
+    assert_eq!(host_spin.close(task, h1), Ok(Some(BackingToken(10))));
+
+    // Retrying exit_task now succeeds and finalizes the remaining handle h2 once.
+    let mut finalized = Vec::new();
+    host_bounded
+        .exit_task(task, |tok| finalized.push(tok))
+        .unwrap();
+    assert_eq!(finalized, vec![BackingToken(20)]);
+    assert_eq!(host_spin.table_id(task), Err(HandleError::Stale));
+}
+
+#[test]
+fn inherit_filter_parent_close_or_exit_finalizes_every_object_exactly_once() {
+    let arena = TestArena::with_ofds_and_objects(0, 8);
+    let task_core: &'static TaskHandleCore<4> = Box::leak(Box::new(TaskHandleCore::new().unwrap()));
+    let host = task_core.bind(arena, Spin);
+    host.publish_objects(8).unwrap();
+
+    // Case 1: parent exits inside the inherit filter after all candidates were retained.
+    let parent = test_task_key(1, 1);
+    let child = test_task_key(2, 1);
+    host.create_task_table(parent, 4, &mut storage(4)).unwrap();
+    host.insert(parent, BackingToken(100), HandleFlags::INHERITABLE)
+        .unwrap();
+    host.insert(parent, BackingToken(200), HandleFlags::INHERITABLE)
+        .unwrap();
+
+    let mut exit_finalized = Vec::new();
     let mut rollback_finalized = Vec::new();
     let mut child_ext = storage(4);
-    let res = c.inherit_handle_table(
+    let res = host.inherit_task(
         parent,
+        child,
         |pin, _tok, _flags| {
             if pin.slot == SlotIndex::new(1) {
-                c.destroy_handle_table(parent, |b| destroy_finalized.push(b))
-                    .unwrap();
+                host.exit_task(parent, |b| exit_finalized.push(b)).unwrap();
             }
             pin.slot != SlotIndex(1)
         },
         &mut child_ext,
         |b| rollback_finalized.push(b),
     );
-    let child = res.unwrap();
-    assert!(destroy_finalized.is_empty());
+    let child_table = res.unwrap();
+    assert!(exit_finalized.is_empty());
     assert_eq!(rollback_finalized, vec![BackingToken(200)]);
-    assert_eq!(c.handle_at(child, SlotIndex(1)), Err(HandleError::Stale));
-    c.destroy_handle_table(child, |b| rollback_finalized.push(b))
+    assert_eq!(
+        host.authority().handle_at(child_table, SlotIndex(1)),
+        Err(HandleError::Stale)
+    );
+    host.exit_task(child, |b| rollback_finalized.push(b))
         .unwrap();
-    let mut finalized = [destroy_finalized, rollback_finalized].concat();
+    let mut finalized = [exit_finalized, rollback_finalized].concat();
     finalized.sort_by_key(|b| b.0);
     assert_eq!(
         finalized,
         vec![BackingToken(100), BackingToken(200)],
-        "parent destroy in filter must preserve every retained candidate"
+        "parent exit preserves the snapshot and rejected candidates finalize once"
     );
+
+    // Case 2: parent closes slot 0 inside the inherit filter after slot 0 was retained for child,
+    // and attach_task_table fails because `child` already has a bound table.
+    let parent2 = test_task_key(3, 1);
+    let occupied_child = test_task_key(4, 1);
+    host.create_task_table(parent2, 4, &mut storage(4)).unwrap();
+    host.create_task_table(occupied_child, 4, &mut storage(4))
+        .unwrap();
+    let h_p0 = host
+        .insert(parent2, BackingToken(300), HandleFlags::INHERITABLE)
+        .unwrap();
+    let h_p1 = host
+        .insert(parent2, BackingToken(400), HandleFlags::INHERITABLE)
+        .unwrap();
+
+    let mut finalized2 = Vec::new();
+    let mut child_ext2 = storage(4);
+    let res2 = host.inherit_task(
+        parent2,
+        occupied_child,
+        |pin, _tok, _flags| {
+            if pin.slot == SlotIndex::new(1) {
+                // Slot 0 was already retained by child; closing it in parent2 is Non-Terminal
+                // because child holds the last reference.
+                assert_eq!(host.close(parent2, h_p0), Ok(None));
+            }
+            true
+        },
+        &mut child_ext2,
+        |b| finalized2.push(b),
+    );
+    assert_eq!(res2, Err(HandleError::InvalidHandle));
+    assert_eq!(
+        finalized2,
+        vec![BackingToken(300)],
+        "P1-C witness (attach failure): destroying unattached child table must finalize slot 0's token"
+    );
+    assert_eq!(host.close(parent2, h_p1), Ok(Some(BackingToken(400))));
+    host.exit_task(parent2, |_| {}).unwrap();
+    host.exit_task(occupied_child, |_| {}).unwrap();
 }
 
 #[test]
@@ -1795,6 +1898,165 @@ fn handle_write_paths_all_or_nothing_and_finalizer_lock_free_get_under_spin() {
     })
     .unwrap();
     assert_eq!(destroy_released, vec![BackingToken(40)]);
+}
+
+#[test]
+fn task_bound_table_refuses_direct_destroy_and_exit_task_allows_reattach_and_finalizer_lock_free_lookup()
+ {
+    // 1. TaskHandleCore::initialize refuses double-initialization without corrupting free_bindings.
+    let zeroed: Box<core::mem::MaybeUninit<TaskHandleCore<4>>> = Box::new_zeroed();
+    let task_core: &'static TaskHandleCore<4> = Box::leak(unsafe { zeroed.assume_init() });
+    assert_eq!(task_core.initialize(0), Err(HandleError::InvalidHandle));
+    task_core.initialize(0xABCD).unwrap();
+    assert_eq!(
+        task_core.initialize(0xABCD),
+        Err(HandleError::InvalidHandle),
+        "re-initializing a published TaskHandleCore must fail closed"
+    );
+
+    let arena = TestArena::with_ofds_and_objects(0, 8);
+    let host = task_core.bind(arena, Spin);
+    host.publish_objects(8).unwrap();
+    let c = host.authority();
+
+    let t0 = test_task_key(1, 1);
+    let t1 = test_task_key(2, 1);
+
+    // 2. attach_task_table validates that the table is a live unbound handle table:
+    // - Linux fd table (TABLE_LIVE) -> Err(InvalidHandle)
+    let fd_table = c.create_table(4, &mut storage(4)).unwrap();
+    assert_eq!(
+        host.attach_task_table(t0, fd_table),
+        Err(HandleError::InvalidHandle)
+    );
+    c.destroy_table(fd_table, |_| {}).unwrap();
+
+    // - Destroyed handle table (TABLE_FREE) -> Err(Stale)
+    let dead_table = c.create_handle_table(4, &mut storage(4)).unwrap();
+    c.destroy_handle_table(dead_table, |_| {}).unwrap();
+    assert_eq!(
+        host.attach_task_table(t0, dead_table),
+        Err(HandleError::Stale)
+    );
+
+    // 3. Bound handle table refuses direct destroy_handle_table (preventing orphaned
+    // bindings) and refuses attaching the same table to a second task.
+    let bound_table = host.create_task_table(t0, 4, &mut storage(4)).unwrap();
+    let h = host
+        .insert(t0, BackingToken(500), HandleFlags::default())
+        .unwrap();
+    assert_eq!(
+        host.attach_task_table(t1, bound_table),
+        Err(HandleError::InvalidHandle),
+        "already-bound handle table must not be attached to a second task"
+    );
+    assert_eq!(
+        c.destroy_handle_table(bound_table, |_| panic!(
+            "must refuse direct destroy on bound table"
+        )),
+        Err(HandleError::InvalidHandle),
+        "direct destroy_handle_table on a task-bound table must be refused"
+    );
+    // Binding and handle remain intact after refused direct destroy.
+    assert_eq!(host.table_id(t0), Ok(bound_table));
+    let g = host.get(t0, h).unwrap();
+    assert_eq!(g.backing(), BackingToken(500));
+    assert_eq!(host.release_pin(g), Ok(None));
+
+    // 4. exit_task unlinks the binding, drops both the TaskBucket spinlock and
+    // the TableRecord spinlock, sets `record.seq` even, and runs the finalizer:
+    // inside the finalizer under `Spin`, lock-free `host.table_id(t0)` and
+    // `c.get_handle(bound_table, h)` observe `Stale`, locking
+    // `c.close_handle(bound_table, h)` acquires the table lock and observes
+    // `Stale`, and attaching `t0` (which hashes to the same `TaskBucket`)
+    // acquires the bucket lock and succeeds.
+    let mut exit_released = Vec::new();
+    host.exit_task(t0, |tok| {
+        assert_eq!(
+            host.table_id(t0),
+            Err(HandleError::Stale),
+            "exit_task finalizer must run after unlinking and bucket end_write"
+        );
+        assert_eq!(
+            c.get_handle(bound_table, h),
+            Err(HandleError::Stale),
+            "exit_task finalizer must run after table end_write (seq even)"
+        );
+        assert_eq!(
+            c.close_handle(bound_table, h),
+            Err(HandleError::Stale),
+            "exit_task finalizer must run outside TableRecord lock under Spin"
+        );
+        let rebound_in_finalizer = host.create_task_table(t0, 4, &mut storage(4)).unwrap();
+        assert_eq!(host.table_id(t0), Ok(rebound_in_finalizer));
+        host.exit_task(t0, |_| {}).unwrap();
+        exit_released.push(tok);
+    })
+    .unwrap();
+    assert_eq!(exit_released, vec![BackingToken(500)]);
+
+    // 5. After exit_task, the same TaskKey `t0` remains cleanly re-attachable.
+    let rebound_table = host.create_task_table(t0, 4, &mut storage(4)).unwrap();
+    assert_eq!(host.table_id(t0), Ok(rebound_table));
+    host.exit_task(t0, |_| {}).unwrap();
+}
+
+#[test]
+fn task_handle_host_constant_time_bucket_lookup_and_churn_beyond_max_tasks() {
+    let arena = TestArena::with_ofds_and_objects(0, 32);
+    let task_core: &'static TaskHandleCore<8> = Box::leak(Box::new(TaskHandleCore::new().unwrap()));
+    let host = task_core.bind(arena, Spin);
+    host.publish_objects(32).unwrap();
+
+    // Populate all 8 task slots.
+    let mut keys = Vec::new();
+    for i in 1..=8i32 {
+        let key = test_task_key(i, i as u64);
+        host.create_task_table(key, 8, &mut storage(8)).unwrap();
+        let h = host
+            .insert(key, BackingToken(100 + i as u64), HandleFlags::default())
+            .unwrap();
+        keys.push((key, h));
+    }
+
+    // Verify lookup probes only its hash bucket chain (never an O(T) scan across all 8 slots).
+    let mut total_steps = 0usize;
+    for &(key, h) in &keys {
+        TASK_LOOKUP_STEPS.with(|n| n.set(0));
+        let guard = host.get(key, h).unwrap();
+        let steps = TASK_LOOKUP_STEPS.with(|n| n.get());
+        assert!(
+            steps < 8,
+            "bucket lookup must not scan all tasks (steps = {steps})"
+        );
+        total_steps += steps;
+        assert_eq!(host.release_pin(guard), Ok(None));
+    }
+    assert!(
+        total_steps <= 16,
+        "average bucket probe across 8 tasks in 8 buckets was too high: {total_steps}"
+    );
+
+    // Exit all 8 tasks, then churn through 64 more task lifetimes on the 8-slot TaskHandleCore.
+    for (key, _) in keys {
+        let mut released = Vec::new();
+        host.exit_task(key, |tok| released.push(tok)).unwrap();
+        assert_eq!(released.len(), 1);
+    }
+
+    for round in 10..74i32 {
+        let key = test_task_key(round, round as u64);
+        host.create_task_table(key, 4, &mut storage(4)).unwrap();
+        let h = host
+            .insert(key, BackingToken(round as u64), HandleFlags::default())
+            .unwrap();
+        let guard = host.get(key, h).unwrap();
+        assert_eq!(guard.backing(), BackingToken(round as u64));
+        assert_eq!(host.release_pin(guard), Ok(None));
+        let mut released = Vec::new();
+        let _ext = host.exit_task(key, |tok| released.push(tok)).unwrap();
+        assert_eq!(released, vec![BackingToken(round as u64)]);
+    }
 }
 
 #[test]
