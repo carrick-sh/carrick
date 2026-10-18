@@ -157,6 +157,8 @@ fn receipt_json_round_trips_failed_tests_and_tolerates_older_receipts() {
 fn run(event: &str, branch: &str, path: &str) -> serde_json::Value {
     serde_json::json!({
         "event": event,
+        "actor": {"login": "tjfontaine"},
+        "triggering_actor": {"login": "tjfontaine"},
         "head_branch": branch,
         "head_sha": "b".repeat(40),
         "path": path,
@@ -195,6 +197,36 @@ fn only_push_and_owner_dispatch_on_main_publish_baselines() {
         artifact_name(Lane::Hvf, &sha, 2),
         format!("receipt-hvf-{sha}-2")
     );
+}
+
+#[test]
+fn dispatch_receipt_requires_both_owner_identities_even_with_matching_artifact() {
+    let sha = "b".repeat(40);
+    let name = artifact_name(Lane::Hvf, &sha, 1);
+    for field in ["actor", "triggering_actor"] {
+        for login in [Some("someone-else"), None] {
+            let mut candidate = listed(7, "completed", "workflow_dispatch", "main");
+            if let Some(login) = login {
+                candidate[field] = serde_json::json!({"login":login});
+            } else {
+                candidate.as_object_mut().unwrap().remove(field);
+            }
+            assert_eq!(
+                baseline_decision(&[(candidate, artifacts(&[&name]))], Lane::Hvf, &sha),
+                Baseline::Missing,
+                "must refuse {field}={login:?}"
+            );
+        }
+    }
+    let owner = listed(7, "completed", "workflow_dispatch", "main");
+    assert_eq!(
+        baseline_decision(&[(owner, artifacts(&[&name]))], Lane::Hvf, &sha),
+        Baseline::Found(7, name)
+    );
+    let mut pushed = run("push", "main", ".github/workflows/kernel-runtime.yml");
+    pushed["actor"] = serde_json::json!({"login":"a-contributor"});
+    pushed.as_object_mut().unwrap().remove("triggering_actor");
+    assert!(trusted_baseline_run(&pushed, &sha));
 }
 
 fn listed(id: u64, status: &str, event: &str, branch: &str) -> serde_json::Value {
