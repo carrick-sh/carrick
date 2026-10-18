@@ -105,6 +105,27 @@ pub use x86_context::{
     ParkedContextWords, X86_XSAVE_BYTES, signal_return_flags, valid_user_return_words,
 };
 
+/// Scalar register observation used only by an explicit scheduler census.
+pub trait CensusContext {
+    fn saved_pc(&self) -> u64;
+}
+
+impl CensusContext for ThreadCtx {
+    fn saved_pc(&self) -> u64 {
+        self.pc
+    }
+}
+impl CensusContext for Aarch64ParkedContext {
+    fn saved_pc(&self) -> u64 {
+        self.native.pc
+    }
+}
+impl CensusContext for ParkedContextWords {
+    fn saved_pc(&self) -> u64 {
+        self.frame[15]
+    }
+}
+
 pub use occupancy::{
     AddressSpaceKey, EXECUTION_SLOTS, ExecutionSlot, HOST_EXECUTION_SLOTS, Occupancy, SlotBusy,
 };
@@ -4187,11 +4208,57 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         ParkedContextRead::NotParked
     }
 
-    /// A lock-free census of every live slot and every record in use, for a
+    /// Read the first futex entry and the saved PC without claiming or waking
+    /// the record. This is bounded: a busy bucket or changed record is unavailable.
+    fn parked_wait_census(&self, reference: RecordRef) -> Option<(u64, u64, u64)>
+    where
+        C: CensusContext,
+    {
+        let record = self.record(reference.id);
+        let entry_id = record.first_entry.load(Ordering::Acquire);
+        if entry_id == NIL || entry_id as usize >= ZONE_ENTRIES {
+            return None;
+        }
+        let entry = self.entry(entry_id);
+        let bucket = entry.bucket.load(Ordering::Acquire) as usize;
+        if bucket >= ZONE_BUCKETS {
+            return None;
+        }
+        let _guard = self.lock(bucket, &BoundedSpin(1))?;
+        let Claim::Parked { seq } = record.claim() else {
+            return None;
+        };
+        if record.incarnation() != reference.incarnation
+            || record.first_entry.load(Ordering::Acquire) != entry_id
+            || entry.record.load(Ordering::Relaxed) != reference.id.raw()
+            || entry.seq.load(Ordering::Relaxed) != seq
+            || entry.bucket.load(Ordering::Relaxed) as usize != bucket
+        {
+            return None;
+        }
+        // SAFETY: the matching first entry remains linked under its bucket
+        // lock. Guest wake/requeue needs that lock; a host transfer must unlink
+        // ALL entries before publishing Host or retiring/reusing the record.
+        // Thus even a concurrent Parked -> Transferring CAS cannot permit a
+        // context writer until this guard drops. Borrow only one scalar; do
+        // not copy an ISA save area onto the EL1 stack.
+        let pc = unsafe { (&*record.ctx.get()).saved_pc() };
+        Some((
+            entry.mm.load(Ordering::Relaxed),
+            entry.uaddr.load(Ordering::Relaxed),
+            pc,
+        ))
+    }
+
+    /// A census of every live slot and every record in use, for a
     /// wedge post-mortem (a watchdog, a debug endpoint): what each vCPU slot
     /// runs and queues, and who owns each parked thread. Values may be torn
-    /// across fields; each word is read once.
-    pub fn write_census(&self, out: &mut impl core::fmt::Write) -> core::fmt::Result {
+    /// across fields. Parked context observations use a bounded bucket lock;
+    /// unavailable observations are explicit, never guessed from live memory.
+    pub fn write_census(&self, out: &mut impl core::fmt::Write) -> core::fmt::Result
+    where
+        C: CensusContext,
+    {
         for index in 0..ZONE_SLOTS {
             let s = &self.slots[index];
             let drive = s.drive.load(Ordering::Relaxed);
@@ -4272,6 +4339,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             )?;
         }
         for (index, record) in self.records.iter().enumerate().skip(1) {
+            let reference = self.record_ref(RecordId(index as u32));
             let claim = record.claim();
             if claim == Claim::Free {
                 continue;
@@ -4292,6 +4360,27 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 record.entry_count(),
                 record.deadline(),
             )?;
+            writeln!(
+                out,
+                "zone record {index} owner: incarnation={} resume={:?} lifecycle_page={:#x} control_slot={:#x}",
+                reference.incarnation,
+                record.resume_disposition(),
+                identity.lifecycle_page,
+                identity.control_slot
+            )?;
+            if matches!(claim, Claim::Parked { .. }) {
+                match self.parked_wait_census(reference) {
+                    Some((mm, address, pc)) => writeln!(
+                        out,
+                        "zone record {index} parked: first_wait_mm={mm} first_wait_address={address:#x} resume={:?} saved_pc={pc:#x}",
+                        record.resume_disposition()
+                    )?,
+                    None => writeln!(
+                        out,
+                        "zone record {index} parked: wait_key_and_pc=unavailable-busy-or-changed-or-unlinked"
+                    )?,
+                }
+            }
             if let Some(wait) = record.object_wait_census() {
                 writeln!(
                     out,
