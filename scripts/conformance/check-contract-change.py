@@ -372,7 +372,14 @@ _RUST_KEYWORDS = set(
 )
 _GENERIC_ITEM_NAMES = set(
     "new default from into try_from try_into drop fmt clone eq ne cmp partial_cmp hash deref "
-    "deref_mut index index_mut next poll run main test tests add".split()
+    "deref_mut index index_mut next poll run main test tests add sub mul div rem bitand bitor "
+    "bitxor shl shr not neg get get_mut set len is_empty read write insert remove iter iter_mut "
+    "into_iter lock try_lock as_ptr as_mut_ptr as_ref as_mut as_slice as_bytes as_str into_inner "
+    "unwrap expect map and_then or_else filter collect push pop clear contains contains_key entry "
+    "take replace swap split join wake wait notify step build parse open close flush seek stat "
+    "bind listen accept connect send recv shutdown id kind name value count size capacity reset "
+    "init finish check validate load store fetch_add fetch_sub ok err some none is_ok is_err "
+    "is_some is_none borrow borrow_mut to_owned to_string".split()
 )
 
 _VIS_MOD_PREFIX = r"(?:\bpub(?:\s*\([^)]*\))?\s+)?"
@@ -3099,9 +3106,49 @@ def _tokenize_code_line(code_line: str) -> tuple[str, ...]:
     return tuple(re.findall(r"[A-Za-z0-9_]+|[^\sA-Za-z0-9_]", code_line))
 
 
+def _extract_impl_self_type(header: str) -> str | None:
+    cleaned: list[str] = []
+    angle = 0
+    paren = 0
+    bracket = 0
+    for ch in header:
+        if ch == "<" and paren == 0 and bracket == 0:
+            angle += 1
+            cleaned.append(" ")
+        elif ch == ">" and paren == 0 and bracket == 0 and angle > 0:
+            angle -= 1
+            cleaned.append(" ")
+        elif ch == "(" and angle == 0 and bracket == 0:
+            paren += 1
+            cleaned.append(" ")
+        elif ch == ")" and angle == 0 and bracket == 0 and paren > 0:
+            paren -= 1
+            cleaned.append(" ")
+        elif ch == "[" and angle == 0 and paren == 0:
+            bracket += 1
+            cleaned.append(" ")
+        elif ch == "]" and angle == 0 and paren == 0 and bracket > 0:
+            bracket -= 1
+            cleaned.append(" ")
+        elif angle == 0 and paren == 0 and bracket == 0:
+            cleaned.append(ch)
+        else:
+            cleaned.append(" ")
+    top = re.split(r"\bwhere\b", "".join(cleaned), maxsplit=1)[0]
+    if re.search(r"\bfor\b", top):
+        top = re.split(r"\bfor\b", top)[-1]
+    idents = [
+        tok[2:] if tok.startswith("r#") else tok
+        for tok in re.findall(r"(?:r#)?[A-Za-z_][A-Za-z0-9_]*", top)
+    ]
+    idents = [i for i in idents if i not in _RUST_KEYWORDS and i not in _GENERIC_ITEM_NAMES]
+    return idents[-1] if idents else None
+
+
 def _compute_enclosing_fn_spans(stripped_src: str) -> list[tuple[int, int, str]]:
-    """Return `(start_line, end_line, fn_ident)` (1-indexed inclusive) for each function body
-    in `stripped_src` outside `macro_rules!`, excluding generic item names (`new`, `add`, etc.).
+    """Return `(start_line, end_line, fn_spec)` (1-indexed inclusive) for each function body
+    in `stripped_src` outside `macro_rules!`, excluding generic item names (`new`, `add`, `get`, etc.).
+    Methods inside `impl TypeName` are qualified as `TypeName::fn_ident`.
     """
     if not stripped_src:
         return []
@@ -3121,11 +3168,11 @@ def _compute_enclosing_fn_spans(stripped_src: str) -> list[tuple[int, int, str]]
                 hi = mid - 1
         return hi + 1
 
-    spans: list[tuple[int, int, str]] = []
+    raw_fns: list[tuple[int, int, int, str]] = []
     n = len(stripped_src)
     for m in _FN_DECL_RE.finditer(stripped_src):
         ident = m.group(1)
-        if not ident or ident in _RUST_KEYWORDS or ident in _GENERIC_ITEM_NAMES or ident.startswith("_"):
+        if not ident or ident in _RUST_KEYWORDS:
             continue
         # Advance past parameter list `( ... )` and return type / where clause to the function body `{`.
         pos = m.end()
@@ -3154,7 +3201,71 @@ def _compute_enclosing_fn_spans(stripped_src: str) -> list[tuple[int, int, str]]
         brace_close = _find_matching_brace(stripped_src, brace_open)
         if brace_close == -1:
             continue
-        spans.append((offset_to_line(m.start()), offset_to_line(brace_close), ident))
+        raw_fns.append((m.start(), brace_open, brace_close, ident))
+
+    impl_spans: list[tuple[int, int, str | None]] = []
+    for m_impl in re.finditer(r"\bimpl\b", stripped_src):
+        istart = m_impl.start()
+        if any(f_start <= istart <= f_open for f_start, f_open, _, _ in raw_fns):
+            continue
+        before = re.sub(r"\bunsafe\s*$", "", stripped_src[:istart]).rstrip()
+        if before and before[-1] in "(,:=>":
+            continue
+        pos = m_impl.end()
+        impl_open = -1
+        paren_depth = 0
+        angle_depth = 0
+        bracket_depth = 0
+        while pos < n:
+            ch = stripped_src[pos]
+            if ch == "(":
+                paren_depth += 1
+            elif ch == ")" and paren_depth > 0:
+                paren_depth -= 1
+            elif ch == "<" and paren_depth == 0 and bracket_depth == 0:
+                angle_depth += 1
+            elif ch == ">" and paren_depth == 0 and bracket_depth == 0 and angle_depth > 0:
+                angle_depth -= 1
+            elif ch == "[" and paren_depth == 0 and angle_depth == 0:
+                bracket_depth += 1
+            elif ch == "]" and paren_depth == 0 and angle_depth == 0 and bracket_depth > 0:
+                bracket_depth -= 1
+            elif ch == ";" and paren_depth == 0 and angle_depth == 0 and bracket_depth == 0:
+                break
+            elif ch == "{" and paren_depth == 0 and angle_depth == 0 and bracket_depth == 0:
+                impl_open = pos
+                break
+            pos += 1
+        if impl_open == -1:
+            continue
+        impl_close = _find_matching_brace(stripped_src, impl_open)
+        if impl_close == -1:
+            continue
+        self_type = _extract_impl_self_type(stripped_src[m_impl.end() : impl_open])
+        impl_spans.append((impl_open, impl_close, self_type))
+
+    spans: list[tuple[int, int, str]] = []
+    for f_start, f_open, f_close, ident in raw_fns:
+        if ident in _GENERIC_ITEM_NAMES or ident.startswith("_"):
+            continue
+        enclosing_impl: tuple[int, str | None] | None = None
+        for i_open, i_close, self_type in impl_spans:
+            if i_open < f_start and f_close <= i_close:
+                if any(
+                    i_open < o_open < f_start and f_close <= o_close
+                    for _, o_open, o_close, _ in raw_fns
+                ):
+                    continue
+                span_len = i_close - i_open
+                if enclosing_impl is None or span_len <= enclosing_impl[0]:
+                    enclosing_impl = (span_len, self_type)
+        if enclosing_impl is not None:
+            recv_type = enclosing_impl[1]
+            if not recv_type:
+                continue
+            spans.append((offset_to_line(f_start), offset_to_line(f_close), f"{recv_type}::{ident}"))
+        else:
+            spans.append((offset_to_line(f_start), offset_to_line(f_close), ident))
     return spans
 
 
@@ -3462,6 +3573,88 @@ def _strip_non_semantic_ident_occurrences(
     return "".join(chars)
 
 
+def _crate_pkg_for_path(view: RepoView, rel_path: str) -> str | None:
+    parts = Path(rel_path).parts
+    if len(parts) < 2 or parts[0] != "crates":
+        return None
+    crate_dir = parts[1]
+    cargo_rel = f"crates/{crate_dir}/Cargo.toml"
+    if view.is_file(cargo_rel):
+        try:
+            data = tomllib.loads(view.read_text(cargo_rel))
+            name = data.get("package", {}).get("name")
+            if isinstance(name, str) and name:
+                return name
+        except Exception:
+            pass
+    return crate_dir
+
+
+def _extract_cargo_dep_names(cargo_data: dict) -> tuple[set[str], bool]:
+    """Return `(dep_pkg_names, has_any_dep_section)` from a parsed Cargo.toml."""
+    deps: set[str] = set()
+    has_section = False
+
+    def collect_table(tbl: object) -> None:
+        nonlocal has_section
+        if not isinstance(tbl, dict):
+            return
+        has_section = True
+        for key, val in tbl.items():
+            if isinstance(val, dict) and isinstance(val.get("package"), str):
+                deps.add(val["package"])
+            else:
+                deps.add(key)
+
+    for sec in ("dependencies", "dev-dependencies", "build-dependencies"):
+        if sec in cargo_data:
+            collect_table(cargo_data.get(sec))
+    targets = cargo_data.get("target")
+    if isinstance(targets, dict):
+        for tcfg in targets.values():
+            if isinstance(tcfg, dict):
+                for sec in ("dependencies", "dev-dependencies", "build-dependencies"):
+                    if sec in tcfg:
+                        collect_table(tcfg.get(sec))
+    return deps, has_section
+
+
+def _crate_depends_on(view: RepoView, test_pkg: str, surface_pkg: str, strict: bool = False) -> bool:
+    """Return True if `test_pkg == surface_pkg` or `test_pkg` transitively depends on `surface_pkg`."""
+    if test_pkg == surface_pkg:
+        return True
+    test_cargo_rel = f"crates/{test_pkg}/Cargo.toml"
+    if not view.is_file(test_cargo_rel):
+        return False
+    try:
+        test_data = tomllib.loads(view.read_text(test_cargo_rel))
+    except Exception:
+        return False
+    direct_deps, has_dep_section = _extract_cargo_dep_names(test_data)
+    if not strict and not has_dep_section and not view.is_file("Cargo.toml"):
+        return True
+    visited: set[str] = {test_pkg}
+    queue: list[str] = list(direct_deps)
+    while queue:
+        cur = queue.pop(0)
+        if cur == surface_pkg:
+            return True
+        if cur in visited:
+            continue
+        visited.add(cur)
+        cur_cargo = f"crates/{cur}/Cargo.toml"
+        if view.is_file(cur_cargo):
+            try:
+                cur_data = tomllib.loads(view.read_text(cur_cargo))
+                more_deps, _ = _extract_cargo_dep_names(cur_data)
+                for d in more_deps:
+                    if d not in visited:
+                        queue.append(d)
+            except Exception:
+                pass
+    return False
+
+
 def bound_test_references_surface(
     root: Path,
     base_view: RepoView,
@@ -3488,6 +3681,12 @@ def bound_test_references_surface(
     items = surface_items_cache[surface_path]
     if not items or not ref_texts:
         return False
+    surface_pkg = _crate_pkg_for_path(head_view, surface_path) or _crate_pkg_for_path(
+        base_view, renamed_modified_paths.get(surface_path, surface_path)
+    )
+    test_pkg = _crate_pkg_for_path(head_view, test_file)
+    if test_pkg and surface_pkg and not _crate_depends_on(head_view, test_pkg, surface_pkg, strict=False):
+        return False
     file_macros: set[str] = set()
     if head_view.is_file(test_file):
         file_macros.update(
@@ -3499,13 +3698,29 @@ def bound_test_references_surface(
     cleaned_texts = [_strip_non_semantic_ident_occurrences(txt, file_macros) for txt in ref_texts]
     for ident in items:
         if ident.startswith("fn:"):
-            fn_ident = ident[3:]
-            # Call-shaped match (`name(` or `.name(`) required for innermost enclosing fn on body-only edits.
-            pat = re.compile(rf"\b{re.escape(fn_ident)}\s*\(")
+            if test_pkg and surface_pkg and not _crate_depends_on(head_view, test_pkg, surface_pkg, strict=True):
+                continue
+            fn_spec = ident[3:]
+            if "::" in fn_spec:
+                recv_type, fn_ident = fn_spec.split("::", 1)
+                snake_recv = re.sub(r"(?<!^)(?=[A-Z])", "_", recv_type).lower()
+                call_pat = re.compile(rf"\b{re.escape(fn_ident)}\s*\(")
+                recv_pat = re.compile(
+                    rf"\b{re.escape(recv_type)}\b|\b{re.escape(snake_recv)}\s*\("
+                )
+                if any(call_pat.search(txt) for txt in cleaned_texts) and any(
+                    recv_pat.search(txt) for txt in cleaned_texts
+                ):
+                    return True
+            else:
+                # Free function: require non-dot call (`name(` or `path::name(`, never `.name(`).
+                pat = re.compile(rf"(?<!\.)\b{re.escape(fn_spec)}\s*\(")
+                if any(pat.search(txt) for txt in cleaned_texts):
+                    return True
         else:
             pat = re.compile(rf"\b{re.escape(ident)}\b")
-        if any(pat.search(txt) for txt in cleaned_texts):
-            return True
+            if any(pat.search(txt) for txt in cleaned_texts):
+                return True
     return False
 
 
