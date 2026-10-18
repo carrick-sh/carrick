@@ -342,7 +342,9 @@ mod tests {
                 "head_sha":"a".repeat(40),"head_branch":branch,
                 "path":KERNEL_RUNTIME_WORKFLOW,
                 "repository":{"full_name":REPOSITORY},
-                "head_repository":{"full_name":REPOSITORY}});
+                "head_repository":{"full_name":REPOSITORY},
+                "actor":{"login":"tjfontaine"},
+                "triggering_actor":{"login":"tjfontaine"}});
             let result = Github::vet_inner(&Admission::Standing, key, |method, endpoint, _, _| {
                 assert_eq!(method, "GET");
                 assert!(endpoint.ends_with("/runs/1"), "{endpoint}");
@@ -354,6 +356,8 @@ mod tests {
                     policy
                         .authorize(&JobContext {
                             repository: REPOSITORY.into(),
+                            actor: "tjfontaine".into(),
+                            triggering_actor: "tjfontaine".into(),
                             event: event.into(),
                             workflow_ref: format!(
                                 "{REPOSITORY}/{KERNEL_RUNTIME_WORKFLOW}@refs/heads/{branch}"

@@ -28,7 +28,7 @@ jobs:
     if: >-
       ${{ !cancelled() &&
           vars.CARRICK_SELF_HOSTED == 'true' &&
-          (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
+          (github.event_name != 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     outputs:
@@ -274,7 +274,8 @@ jobs:
     if: >-
       ${{ vars.CARRICK_SELF_HOSTED == 'true' &&
           vars.CARRICK_SELF_HOSTED_FULL_CONFORMANCE == 'true' &&
-          github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+          github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' &&
+          github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine' }}
     needs: hvf-kernel
     # Its own label (`ci_scaler::HVF_CLOSURE_LABELS`): `mac-jit` never serves
     # it, so the 24-hour closure can never occupy the main-push runner.
@@ -340,7 +341,7 @@ jobs:
     if: >-
       ${{ !cancelled() &&
           vars.CARRICK_GCP_KVM == 'true' && vars.CARRICK_KVM_BACKEND != 'willow' &&
-          (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
+          (github.event_name != 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) }}
     runs-on: ubuntu-latest
     # The script waits up to 150 min for the VM; the VM's own backstop is
     # --max-run-duration=3h with DELETE.
@@ -423,7 +424,7 @@ jobs:
       ${{ !cancelled() &&
           vars.CARRICK_SELF_HOSTED_KVM == 'true' &&
           !(vars.CARRICK_GCP_KVM == 'true' && vars.CARRICK_KVM_BACKEND != 'willow') &&
-          (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
+          (github.event_name != 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) }}
     runs-on: [self-hosted, Linux, X64, willow-kvm]
     timeout-minutes: 90
     steps:
