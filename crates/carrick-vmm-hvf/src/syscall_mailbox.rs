@@ -1908,19 +1908,17 @@ mod tests {
 
     #[test]
     fn native_return_publishes_signal_checkpoint_action_with_result() {
-        let (mut restart_binding, mut mailbox) = binding();
-        publish_valid_request(&restart_binding, &mut mailbox);
-        restart_binding.take_request().unwrap().expect("request");
-        restart_binding
-            .publish_native_signal_return(-4, true)
-            .unwrap();
+        let (mut binding, mut mailbox) = binding();
+        publish_valid_request(&binding, &mut mailbox);
+        binding.take_request().unwrap().expect("request");
+        binding.publish_native_signal_return(-4, true).unwrap();
         assert_eq!(mailbox.return_value, (-4_i64) as u64);
         assert_eq!(
             mailbox.response_action,
             MailboxResponseAction::NativeSignalCheckpoint.raw()
         );
-        assert_eq!(restart_binding.pending_normal_return().unwrap(), Some(-4));
-        let (mut no_restart_binding, mut no_restart_mailbox) = binding();
+        assert_eq!(binding.pending_normal_return().unwrap(), Some(-4));
+        let (mut no_restart_binding, mut no_restart_mailbox) = self::binding();
         publish_valid_request(&no_restart_binding, &mut no_restart_mailbox);
         no_restart_binding
             .publish_native_signal_return(-4, false)
