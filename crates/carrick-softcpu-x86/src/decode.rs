@@ -44,6 +44,8 @@ pub enum SensitiveOp {
     Clac,
     Stac,
     Cpuid,
+    Lar,
+    Lsl,
     Rdtsc,
     Rdtscp,
     Xgetbv,
@@ -61,6 +63,8 @@ impl SensitiveOp {
             Self::Interrupt { .. }
                 | Self::Ldmxcsr
                 | Self::Stmxcsr
+                | Self::Lar
+                | Self::Lsl
                 | Self::Cpuid
                 | Self::Rdtsc
                 | Self::Rdtscp
@@ -229,6 +233,8 @@ fn classify_insn(insn: &Instruction, next_va: u64) -> InsnClass {
         Mnemonic::Hlt => Some(SensitiveOp::Hlt),
         Mnemonic::Clac => Some(SensitiveOp::Clac),
         Mnemonic::Stac => Some(SensitiveOp::Stac),
+        Mnemonic::Lar => Some(SensitiveOp::Lar),
+        Mnemonic::Lsl => Some(SensitiveOp::Lsl),
         Mnemonic::Cpuid => Some(SensitiveOp::Cpuid),
         Mnemonic::Rdtsc => Some(SensitiveOp::Rdtsc),
         Mnemonic::Rdtscp => Some(SensitiveOp::Rdtscp),

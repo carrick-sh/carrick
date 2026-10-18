@@ -541,8 +541,6 @@ fn native_admission_denies_unimplemented_host_features() {
         &[0x0f, 0x01, 0xc9],                   // mwait
         &[0x66, 0x0f, 0x38, 0x82, 0x07],       // invpcid
         &[0x0f, 0x01, 0xc1],                   // vmcall
-        &[0x0f, 0x02, 0xc0],                   // lar
-        &[0x0f, 0x03, 0xc0],                   // lsl
         &[0xf3, 0x0f, 0xc7, 0xf8],             // rdpid
         &[0xc5, 0xf9, 0xf7, 0xc1],             // vmaskmovdqu
         &[0x0f, 0x01, 0xfc],                   // clzero
@@ -681,4 +679,23 @@ fn scalar_cmpsd_never_uses_unchecked_native_copy() {
         !native_comparison,
         "scalar SSE CMPSD escaped the checked helper"
     );
+}
+
+#[test]
+fn descriptor_queries_exit_without_host_state() {
+    for bytes in [&[0x0f, 0x02, 0xc0][..], &[0x0f, 0x03, 0xc0]] {
+        let decoded = carrick_softcpu_x86::classify(bytes, 0x400000).unwrap();
+        assert!(matches!(
+            decoded.class,
+            carrick_softcpu_x86::InsnClass::Sensitive(_)
+        ));
+        let (mut cpu, mut mem, va) = setup_snippet(bytes);
+        cpu.ctx.gpr[reg::RAX] = 0x33;
+        let flags = cpu.ctx.rflags;
+        assert!(
+            matches!(cpu.step_block(&mut mem).unwrap(),SoftCpuExit::Sensitive { rip,next_rip,.. } if rip==va && next_rip==va+3)
+        );
+        assert_eq!(cpu.ctx.gpr[reg::RAX], 0x33);
+        assert_eq!(cpu.ctx.rflags, flags);
+    }
 }
