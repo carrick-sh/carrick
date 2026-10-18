@@ -15,7 +15,7 @@
 //! session before any workflow step, exactly as on Willow clones. The JIT
 //! config reaches the runner only through `ACTIONS_RUNNER_INPUT_JITCONFIG`.
 use super::assignment::admit_demand;
-use super::github::{Github, QueuedJob};
+use super::github::Github;
 use super::*;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -79,6 +79,8 @@ pub struct MacRecord {
     /// The true run/attempt/job; the reservation remains demand provenance.
     #[serde(default)]
     pub assigned_key: Option<JobKey>,
+    #[serde(default)]
+    pub approved: bool,
 }
 impl RunnerRegistration for MacRecord {
     fn key(&self) -> JobKey {
@@ -107,6 +109,8 @@ pub struct MacLedger {
     /// Refusals survive controller restarts; a new attempt has a new key.
     #[serde(default)]
     refused: Vec<JobKey>,
+    #[serde(default)]
+    superseded: Vec<assignment::SupersededPush>,
     #[serde(skip)]
     publication: Option<assignment::Publication<MacLedger>>,
 }
@@ -131,12 +135,14 @@ impl MacLedger {
             runner: None,
             assigned: None,
             assigned_key: None,
+            approved: false,
         };
         self.rows.push(row.clone());
         Ok(row)
     }
     pub fn served(&self, key: JobKey) -> bool {
-        self.refused.contains(&key)
+        assignment::run_superseded(&self.superseded, key)
+            || self.refused.contains(&key)
             || served(
                 self.rows
                     .iter()
@@ -162,6 +168,8 @@ impl MacLedger {
             |row| row.name.clone(),
             |row, other| {
                 if other.assigned_key.is_some() {
+                    row.approved =
+                        other.approved || (row.assigned_key == other.assigned_key && row.approved);
                     row.assigned = other.assigned;
                     row.assigned_key = other.assigned_key;
                 }
@@ -173,6 +181,7 @@ impl MacLedger {
             }
         }
         assignment::bound_refusals(&mut self.refused);
+        assignment::merge_superseded(&mut self.superseded, &source.superseded);
         // Runtime state must never recursively own the publication itself.
         self.publication = None;
     }
@@ -209,6 +218,37 @@ impl assignment::Refusals for MacLedger {
     }
     fn refused_mut(&mut self) -> &mut Vec<JobKey> {
         &mut self.refused
+    }
+    fn superseded(&self) -> &[assignment::SupersededPush] {
+        &self.superseded
+    }
+    fn superseded_mut(&mut self) -> &mut Vec<assignment::SupersededPush> {
+        &mut self.superseded
+    }
+    fn has_approved_run(&self, key: JobKey) -> bool {
+        self.rows.iter().any(|row| {
+            row.approved
+                && row
+                    .assigned_key
+                    .is_some_and(|actual| actual.run == key.run && actual.attempt == key.attempt)
+        })
+    }
+    fn mark_approved(&mut self, key: JobKey, path: &Path) -> Result<(), ScalerError> {
+        let row = self
+            .rows
+            .iter_mut()
+            .find(|row| row.assigned_key == Some(key))
+            .ok_or(ScalerError::Guard("approval has no durable assignment"))?;
+        row.approved = true;
+        self.save(path)
+    }
+    fn admission_lock(&self) -> Option<std::sync::Arc<std::sync::Mutex<()>>> {
+        self.publication
+            .as_ref()
+            .map(assignment::Publication::admission_lock)
+    }
+    fn refresh(&mut self) -> Result<(), ScalerError> {
+        MacLedger::refresh(self)
     }
     fn persist(&self, path: &Path) -> Result<(), ScalerError> {
         self.save(path)
@@ -430,14 +470,6 @@ type Launch = (
     std::thread::JoinHandle<Result<Vec<u8>, ScalerError>>,
 );
 
-pub(super) fn prioritize_demand(mut demand: Vec<QueuedJob>) -> Vec<JobKey> {
-    // Every landed commit needs a receipt. Serve pushes oldest first so a
-    // newer push never displaces its own parent baseline producer.
-    demand.sort_by_key(|job| (job.event != "push", job.key.run.0, job.key.job.0));
-    demand.dedup_by_key(|job| job.key.job.0);
-    demand.into_iter().map(|job| job.key).collect()
-}
-
 fn launch(
     gh: &Github,
     target: &MacTarget,
@@ -533,8 +565,15 @@ pub(super) fn controller(
             .iter()
             .find(|r| r.state != MacState::Done)
             .cloned();
+        // Coalesce queued work even while this runner is busy. Fresh GitHub
+        // checks withhold cancellation of observed running hardware in either
+        // lane; another controller can still race between GET and POST.
+        let demand = gh.coalesced_demand(&mut ledger, &path, &HVF_LABELS);
         // Transient GitHub/SSH failures back off; they never end the loop.
         let pass: Result<(), ScalerError> = if let Some(mut row) = active {
+            if let Err(error) = &demand {
+                eprintln!("queued push coalescing failed: {error}");
+            }
             let launch_done = launched
                 .as_ref()
                 .is_none_or(|(name, handle)| name != &row.name || handle.is_finished());
@@ -565,9 +604,8 @@ pub(super) fn controller(
                 Err(error) => Err(error),
             }
         } else {
-            gh.mac_demand()
-                .and_then(|demand| {
-                    let ordered = prioritize_demand(demand);
+            demand
+                .and_then(|ordered| {
                     admit_demand(&mut ledger, &path, ordered, |job| {
                         gh.vet(&Admission::Standing, job)
                             .map(|policy| (job, policy))
@@ -1411,6 +1449,8 @@ fn approve_assignment(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use super::super::assignment::prioritize_demand;
+    use super::super::github::QueuedJob;
     use super::*;
 
     fn job(id: u64) -> JobKey {
@@ -1505,7 +1545,7 @@ mod tests {
     }
 
     #[test]
-    fn ci_scaler_mac_serves_every_main_push_oldest_first_and_preserves_dispatch() {
+    fn ci_scaler_mac_serves_only_newest_queued_main_push_and_preserves_dispatch() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.json");
         let mut ledger = MacLedger::default();
@@ -1513,27 +1553,32 @@ mod tests {
             QueuedJob {
                 key: job(1),
                 event: "push".into(),
+                sha: format!("{:040x}", 1),
             },
             QueuedJob {
                 key: job(5),
                 event: "push".into(),
+                sha: format!("{:040x}", 5),
             },
             QueuedJob {
                 key: job(4),
                 event: "push".into(),
+                sha: format!("{:040x}", 4),
             },
             QueuedJob {
                 key: job(3),
                 event: "push".into(),
+                sha: format!("{:040x}", 3),
             },
             QueuedJob {
                 key: job(6),
                 event: "workflow_dispatch".into(),
+                sha: format!("{:040x}", 6),
             },
         ];
         let ordered = prioritize_demand(demand);
         let mut admitted = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..2 {
             let key = admit_demand(&mut ledger, &path, ordered.clone(), Ok)
                 .unwrap()
                 .unwrap();
@@ -1543,7 +1588,7 @@ mod tests {
             last.state = MacState::Done;
             last.assigned = Some(row.key.job);
         }
-        assert_eq!(admitted, vec![job(1), job(3), job(4), job(5), job(6)]);
+        assert_eq!(admitted, vec![job(5), job(6)]);
         assert!(ledger.refused.is_empty());
     }
 }

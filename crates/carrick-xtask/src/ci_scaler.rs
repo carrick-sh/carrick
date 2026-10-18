@@ -139,6 +139,8 @@ pub struct Record {
     /// reservation `key` remains demand provenance.
     #[serde(default)]
     pub assigned_key: Option<JobKey>,
+    #[serde(default)]
+    pub approved: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +171,8 @@ pub struct Ledger {
     /// Refused actual assignments survive restarts; a new attempt has a new key.
     #[serde(default)]
     refused: Vec<JobKey>,
+    #[serde(default)]
+    superseded: Vec<assignment::SupersededPush>,
     #[serde(skip)]
     publication: Option<assignment::Publication<Ledger>>,
 }
@@ -223,6 +227,7 @@ impl Ledger {
             ip: None,
             failure: None,
             assigned_key: None,
+            approved: false,
         };
         self.rows.push(row.clone());
         Ok(row)
@@ -233,7 +238,8 @@ impl Ledger {
     /// without a job (failed launch, drained) consumes one serve; a clone
     /// GitHub assigned another job neither holds nor consumes it.
     pub fn served(&self, key: JobKey) -> bool {
-        self.refused.contains(&key)
+        assignment::run_superseded(&self.superseded, key)
+            || self.refused.contains(&key)
             || served(
                 self.rows
                     .iter()
@@ -259,6 +265,8 @@ impl Ledger {
             |row| row.name.clone(),
             |row, other| {
                 if other.assigned_key.is_some() {
+                    row.approved =
+                        other.approved || (row.assigned_key == other.assigned_key && row.approved);
                     row.assigned = other.assigned;
                     row.assigned_key = other.assigned_key;
                 }
@@ -270,6 +278,7 @@ impl Ledger {
             }
         }
         assignment::bound_refusals(&mut self.refused);
+        assignment::merge_superseded(&mut self.superseded, &source.superseded);
         // Runtime state must never recursively own the publication itself.
         self.publication = None;
     }
@@ -297,6 +306,37 @@ impl assignment::Refusals for Ledger {
     }
     fn refused_mut(&mut self) -> &mut Vec<JobKey> {
         &mut self.refused
+    }
+    fn superseded(&self) -> &[assignment::SupersededPush] {
+        &self.superseded
+    }
+    fn superseded_mut(&mut self) -> &mut Vec<assignment::SupersededPush> {
+        &mut self.superseded
+    }
+    fn has_approved_run(&self, key: JobKey) -> bool {
+        self.rows.iter().any(|row| {
+            row.approved
+                && row
+                    .assigned_key
+                    .is_some_and(|actual| actual.run == key.run && actual.attempt == key.attempt)
+        })
+    }
+    fn mark_approved(&mut self, key: JobKey, path: &Path) -> Result<(), ScalerError> {
+        let row = self
+            .rows
+            .iter_mut()
+            .find(|row| row.assigned_key == Some(key))
+            .ok_or(ScalerError::Guard("approval has no durable assignment"))?;
+        row.approved = true;
+        self.save(path)
+    }
+    fn admission_lock(&self) -> Option<std::sync::Arc<std::sync::Mutex<()>>> {
+        self.publication
+            .as_ref()
+            .map(assignment::Publication::admission_lock)
+    }
+    fn refresh(&mut self) -> Result<(), ScalerError> {
+        Ledger::refresh(self)
     }
     fn persist(&self, path: &Path) -> Result<(), ScalerError> {
         self.save(path)
@@ -877,7 +917,14 @@ pub fn run(args: ScalerArgs) -> Result<(), ScalerError> {
             if controller {
                 admit_assigned(&state_dir, &context, 0, assignment::APPROVAL_LIMIT)?;
             } else {
-                read_policy(&policy_file, Some(0))?.authorize(&context)?;
+                match read_policy(&policy_file, Some(0))? {
+                    JobPolicy::Pilot { sha } => JobPolicy::Pilot { sha }.authorize(&context)?,
+                    JobPolicy::Bound(_) => {
+                        return Err(ScalerError::Guard(
+                            "standing assignments require controller rendezvous",
+                        ));
+                    }
+                }
             }
             mark_job_started(&state_dir)?;
             println!("admitted workflow, event and ref");

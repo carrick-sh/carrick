@@ -76,7 +76,8 @@ main (`Admission::Standing`; see the
 Before minting each runner it re-vets the reserved run (same admission and
 attempt and exact SHA) and writes the guest's root-owned
 `/etc/carrick-ci/policy` as `standing run=<id> attempt=<n> sha=<sha>`. That
-reservation admits the run the clone was minted for. It admits at most
+reservation records demand provenance; every assignment still requires
+controller approval. It admits at most
 `--max-concurrency` clones (1 by default, never more than 2). Demand lists
 only this workflow's runs. GitHub/PVE admission failures back off (30 s
 doubling to 10 min) and never end the loop; the 80% CPU ceiling still stops
@@ -85,8 +86,9 @@ times per job key.
 
 ### Receipt chain
 
-Every landed commit runs once on push to main; no merge-group, PR or schedule
-runs are admitted. The trusted pre-push selector walks back from event.before
+Pushes to main create runs; both controllers coalesce queued pushes to the
+newest run, recording older ones as `superseded by <newer sha>` before
+cancellation. No merge-group, PR or schedule runs are admitted. The trusted pre-push selector walks back from event.before
 to the nearest receipted first-parent ancestor (50 commits maximum). The
 comparison uses that ancestor's code and reports unreceipted commits as a
 range in the summary/notice. Missing baselines and walk-limit exhaustion
@@ -98,8 +100,8 @@ have distinct visible failures. Owner dispatch on main seeds receipts without a 
 GitHub assigns a queued job to *any* idle runner with matching labels, not to
 the run a clone was minted for: a clone minted for a main push can receive a
 different main push's KVM job. The standing hook (`standing_hook_script`) therefore
-tries the reservation first and otherwise runs `admit-job --controller`, the
-same credential-free rendezvous as cloudmac ([mac-jit.md](mac-jit.md)):
+runs `admit-job --controller` for every assignment, including its reservation,
+the same credential-free rendezvous as cloudmac ([mac-jit.md](mac-jit.md)):
 
 1. The hook writes its actual run id, attempt and SHA into the runner-owned
    `/run/carrick-ci/assignment.json` (created by the controller before JIT
@@ -109,7 +111,8 @@ same credential-free rendezvous as cloudmac ([mac-jit.md](mac-jit.md)):
    scoped guest agent, with a one-second timer between passes and under the same flock. It authenticates the job by this
    clone's runner id and the exact `willow-kvm` label set, re-vets the actual
    run through `Github::vet_assignment` (main push or owner dispatch admission), and fsyncs the actual job into the
-   ledger (`assigned`, `assigned_key`).
+   ledger (`assigned`, `assigned_key`, `approved`). Approval and supersession
+   use the same controller admission lock; a superseded run gets no approval.
 3. Only then does it publish the root-owned `approved-policy`, bound to the
    actual run, attempt and SHA; the hook verifies it and starts the job. An
    inadmissible assignment (another workflow, untrusted event, ref or repository) is recorded once in the ledger's
@@ -131,16 +134,16 @@ undergo full admission vetting if encountered again.
 ### GitHub credential for standing mode
 
 Use a **fine-grained personal access token** limited to this repository and
-to the single permission the controller needs to register and remove JIT
-runners. The owner creates it:
+to runner registration/removal and Actions demand, assignment and
+cancellation. The owner creates it:
 
 1. GitHub, Settings, Developer settings, Personal access tokens,
    Fine-grained tokens, Generate new token.
 2. Resource owner `carrick-sh`; Repository access "Only select
    repositories": `carrick-sh/carrick`.
 3. Repository permissions: **Administration: Read and write** (required by
-   `generate-jitconfig` and runner removal) and **Actions: Read-only** (run
-   and job status for demand and assignment). Metadata read-only is implied.
+   `generate-jitconfig` and runner removal) and **Actions: Read and write** (run
+   and job status for demand/assignment, plus superseded-run cancellation). Metadata read-only is implied.
    Grant nothing else.
 4. Set a short expiry and keep the token in the director's password manager;
    never write it on Willow. If the organization requires approval for

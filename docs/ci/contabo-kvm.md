@@ -70,12 +70,32 @@ Contabo clone.
 `kernel-runtime.yml` runs `kvm-tests-willow` on each `push` to `main` and
 owner `workflow_dispatch` on `main`, when this backend is selected. The
 standing controller and job-start hook admit exactly those events for this
-workflow; merge groups, pull requests and schedules are refused. The HVF
+workflow (dispatch requires both `actor` and `triggering_actor` to be
+`tjfontaine`); merge groups, pull requests and schedules are refused. The HVF
 lane runs on the same events on cloudmac. The optional HVF full-conformance
 closure runs only on owner dispatch when enabled, on a separate runner.
 `ci.yml` continues running its own PR, merge-group, push, schedule and
 dispatch lanes; only `ci-ok` is required for merging. Pre-merge hardware
 evidence belongs to the director; these post-landing runs are the backstop.
+
+The standing KVM controller, like cloudmac, serves only the newest queued
+main push before owner dispatches. Each poll durably records and logs older
+queued runs as `superseded by <newer sha>` before API cancellation. Superseded
+runs cannot mint another local runner or pass a hook, including reruns. Every
+standing assignment must rendezvous; the old reservation shortcut is removed.
+The approval decision is durable under the same admission lock as supersession,
+so an already approved local run cannot be superseded.
+
+Cancellation is cleanup after releasing that lock. Before POST, a fresh GET
+of all jobs in the run must show the target queued and no started hardware
+in either lane, including hosted GCP KVM. Observed started work is left alone.
+Each controller applies this rule independently, without a cross-controller
+acknowledgement protocol. **A superseded job never starts through our admission;
+a raced cancellation can only affect a superseded run.** Another lane can
+start between GET and POST; this bound does not promise never to cancel
+running work. Cleanup is scoped to the superseded run ID. Pending intents
+survive API errors and restarts, and the receipt gate reports skipped commits
+as a range. Deploying this policy requires updated controllers and hooks.
 
 On push, a selector built from trusted event.before walks back at most 50
 first-parent commits to the nearest trusted KVM receipt. Zero/non-ancestor

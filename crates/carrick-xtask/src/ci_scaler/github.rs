@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 pub(super) struct QueuedJob {
     pub key: JobKey,
     pub event: String,
+    pub sha: String,
 }
 
 pub(super) struct Github;
@@ -30,7 +31,9 @@ impl Github {
             vec![]
         };
         let output = execute(&mut cmd, &input, Duration::from_secs(60))?;
-        if method == "DELETE" {
+        if method == "DELETE"
+            || (method == "POST" && endpoint.ends_with("/cancel") && output.is_empty())
+        {
             return Ok(Value::Null);
         }
         Ok(serde_json::from_slice(&output)?)
@@ -80,53 +83,135 @@ impl Github {
         demand.dedup();
         Ok(demand)
     }
-    pub(super) fn mac_demand(&self) -> Result<Vec<QueuedJob>, ScalerError> {
-        self.queued_demand(&Admission::Standing, &HVF_LABELS)
+    pub(super) fn coalesced_demand(
+        &self,
+        ledger: &mut impl assignment::Refusals,
+        path: &Path,
+        labels: &[&str],
+    ) -> Result<Vec<JobKey>, ScalerError> {
+        let demand = self.queued_demand(&Admission::Standing, labels)?;
+        assignment::coalesce_demand(ledger, demand, path, |entry| {
+            Self::cancel_superseded_with(entry, |method, endpoint, body, paginate| {
+                self.request(method, endpoint, body, paginate)
+            })
+        })
     }
     fn queued_demand(
         &self,
         admission: &Admission,
         labels: &[&str],
     ) -> Result<Vec<QueuedJob>, ScalerError> {
-        let mut demand = Vec::new();
+        let mut runs = Vec::new();
         for status in ["queued", "in_progress"] {
-            for run in self.workflow_runs(admission, status)? {
-                if !admission.admits_run(&run) {
+            runs.extend(self.workflow_runs(admission, status)?);
+        }
+        Self::queued_jobs(admission, labels, &runs, |run| self.jobs(run))
+    }
+    fn queued_jobs(
+        admission: &Admission,
+        labels: &[&str],
+        runs: &[Value],
+        mut jobs: impl FnMut(&Value) -> Result<Vec<Value>, ScalerError>,
+    ) -> Result<Vec<QueuedJob>, ScalerError> {
+        let mut demand = Vec::new();
+        for run in runs {
+            if !admission.admits_run(run) {
+                continue;
+            }
+            for job in jobs(run)? {
+                let job_labels: Vec<&str> = job["labels"]
+                    .as_array()
+                    .ok_or(ScalerError::External("job labels"))?
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect();
+                if job["status"] != "queued" || !labels_match(labels, &job_labels) {
                     continue;
                 }
-                for job in self.jobs(&run)? {
-                    let job_labels: Vec<&str> = job["labels"]
-                        .as_array()
-                        .ok_or(ScalerError::External("job labels"))?
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect();
-                    if job["status"] == "queued" && labels_match(labels, &job_labels) {
-                        demand.push(QueuedJob {
-                            key: JobKey {
-                                run: RunId(
-                                    run["id"].as_u64().ok_or(ScalerError::External("run id"))?,
-                                ),
-                                attempt: run["run_attempt"]
-                                    .as_u64()
-                                    .and_then(|n| u32::try_from(n).ok())
-                                    .ok_or(ScalerError::External("attempt"))?,
-                                job: JobId(
-                                    job["id"].as_u64().ok_or(ScalerError::External("job id"))?,
-                                ),
-                            },
-                            event: run["event"]
-                                .as_str()
-                                .ok_or(ScalerError::External("run event"))?
-                                .to_owned(),
-                        });
-                    }
-                }
+                demand.push(QueuedJob {
+                    key: JobKey {
+                        run: RunId(run["id"].as_u64().ok_or(ScalerError::External("run id"))?),
+                        attempt: run["run_attempt"]
+                            .as_u64()
+                            .and_then(|n| u32::try_from(n).ok())
+                            .ok_or(ScalerError::External("attempt"))?,
+                        job: JobId(job["id"].as_u64().ok_or(ScalerError::External("job id"))?),
+                    },
+                    event: run["event"]
+                        .as_str()
+                        .ok_or(ScalerError::External("run event"))?
+                        .into(),
+                    sha: run["head_sha"]
+                        .as_str()
+                        .ok_or(ScalerError::External("run SHA"))?
+                        .into(),
+                });
             }
         }
         demand.sort_by_key(|job| job.key.job.0);
         demand.dedup_by_key(|job| job.key.job.0);
         Ok(demand)
+    }
+    fn cancel_superseded_with(
+        entry: &assignment::SupersededPush,
+        mut request: impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
+    ) -> Result<assignment::CancellationOutcome, ScalerError> {
+        use assignment::CancellationOutcome::{Cancelled, NotCancelled};
+        let run = request(
+            "GET",
+            &format!("repos/{REPOSITORY}/actions/runs/{}", entry.key.run.0),
+            None,
+            false,
+        )?;
+        if !Admission::Standing.admits_run(&run)
+            || run["event"] != "push"
+            || run["id"].as_u64() != Some(entry.key.run.0)
+            || run["run_attempt"].as_u64() != Some(u64::from(entry.key.attempt))
+            || run["head_sha"] != entry.sha
+            || !matches!(run["status"].as_str(), Some("queued" | "in_progress"))
+        {
+            return Ok(NotCancelled);
+        }
+        let data = request(
+            "GET",
+            &format!(
+                "repos/{REPOSITORY}/actions/runs/{}/attempts/{}/jobs?per_page=100",
+                entry.key.run.0, entry.key.attempt
+            ),
+            None,
+            true,
+        )?;
+        let jobs = pages(&data, "jobs")?;
+        if !jobs.iter().any(|job| {
+            job["id"].as_u64() == Some(entry.key.job.0)
+                && job["status"] == "queued"
+                && job.get("started_at") == Some(&Value::Null)
+        }) {
+            return Ok(NotCancelled);
+        }
+        // A queued KVM job may share a run with an already running HVF job,
+        // and vice versa. Include hosted GCP KVM, not only JIT runner labels.
+        for job in &jobs {
+            let Some(labels) = job["labels"].as_array() else {
+                return Ok(NotCancelled);
+            };
+            let hardware = labels.iter().any(|label| label == "self-hosted")
+                || job["name"] == "KVM · x86 kvm-lane tests";
+            let skipped = job["status"] == "completed" && job["conclusion"] == "skipped";
+            if hardware
+                && !skipped
+                && (job["status"] != "queued" || job.get("started_at") != Some(&Value::Null))
+            {
+                return Ok(NotCancelled);
+            }
+        }
+        request(
+            "POST",
+            &format!("repos/{REPOSITORY}/actions/runs/{}/cancel", entry.key.run.0),
+            None,
+            false,
+        )?;
+        Ok(Cancelled)
     }
     /// Mint one-use JIT material for `name`. The returned encoded config is
     /// the only GitHub-derived secret a runner host ever receives.
@@ -371,5 +456,168 @@ mod tests {
                 );
             }
         }
+    }
+    fn push_run(n: u64) -> Value {
+        json!({"id":n,"run_attempt":1,"event":"push","status":"in_progress",
+            "head_sha":format!("{n:040x}"),"head_branch":"main","path":KERNEL_RUNTIME_WORKFLOW,
+            "repository":{"full_name":REPOSITORY},"head_repository":{"full_name":REPOSITORY}})
+    }
+    fn hardware_job(n: u64, labels: &[&str], status: &str) -> Value {
+        json!({"id":n,"name":"hardware","labels":labels,"status":status,
+            "started_at":if status=="queued" {Value::Null} else {json!("2026-10-18T00:00:00Z")},
+            "conclusion":Value::Null})
+    }
+    #[test]
+    fn three_queued_pushes_cancel_two_with_durable_reason_and_running_push_is_untouched() {
+        use super::super::assignment::{CancellationOutcome, coalesce_demand};
+        for labels in [&HVF_LABELS[..], &LABELS[..]] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ledger.json");
+            let mut ledger = Ledger::default();
+            let runs: Vec<_> = (1..=4).map(push_run).collect();
+            let demand = Github::queued_jobs(&Admission::Standing, labels, &runs, |run| {
+                let n = run["id"].as_u64().unwrap();
+                Ok(vec![hardware_job(
+                    n,
+                    labels,
+                    if n == 4 { "in_progress" } else { "queued" },
+                )])
+            })
+            .unwrap();
+            let mut cancelled = Vec::new();
+            let ordered = coalesce_demand(&mut ledger, demand.clone(), &path, |entry| {
+                // Intent and its cause must reach disk before any GitHub mutation.
+                let durable: Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                assert!(
+                    durable["superseded"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|r| r["key"]["run"] == entry.key.run.0 && r["reason"] == entry.reason)
+                );
+                assert_eq!(entry.reason, format!("superseded by {:040x}", 3));
+                Github::cancel_superseded_with(entry, |method, endpoint, _, _| {
+                    if method == "GET" && endpoint.ends_with("/jobs?per_page=100") {
+                        return Ok(
+                            json!([{"jobs":[hardware_job(entry.key.run.0,labels,"queued")]}]),
+                        );
+                    }
+                    if method == "GET" {
+                        return Ok(push_run(entry.key.run.0));
+                    }
+                    assert_eq!(method, "POST");
+                    assert!(endpoint.ends_with("/cancel"));
+                    cancelled.push(entry.key.run.0);
+                    Ok(Value::Null)
+                })
+            })
+            .unwrap();
+            assert_eq!(ordered.iter().map(|k| k.run.0).collect::<Vec<_>>(), vec![3]);
+            assert_eq!(cancelled, vec![1, 2]);
+            assert!(!cancelled.contains(&4));
+            let durable = Ledger::load(&path).unwrap().superseded;
+            assert!(
+                durable
+                    .iter()
+                    .all(|entry| entry.outcome == Some(CancellationOutcome::Cancelled))
+            );
+            assert_eq!(
+                coalesce_demand(&mut ledger, demand, &path, |_| panic!(
+                    "durable cancellations must not repeat"
+                ))
+                .unwrap(),
+                ordered
+            );
+        }
+    }
+    #[test]
+    fn coalescing_rechecks_started_hardware_in_both_lanes_and_never_cancels_dispatch() {
+        use super::super::assignment::{CancellationOutcome, SupersededPush};
+        let entry = SupersededPush {
+            key: JobKey {
+                run: RunId(1),
+                attempt: 1,
+                job: JobId(1),
+            },
+            sha: format!("{:040x}", 1),
+            reason: format!("superseded by {:040x}", 3),
+            outcome: None,
+        };
+        for started in [
+            hardware_job(1, &HVF_LABELS, "in_progress"),
+            hardware_job(2, &LABELS, "in_progress"),
+            json!({"id":2,"name":"KVM · x86 kvm-lane tests","labels":["ubuntu-latest"],"status":"in_progress","started_at":"now"}),
+        ] {
+            let result = Github::cancel_superseded_with(&entry, |method, endpoint, _, _| {
+                assert_eq!(
+                    method, "GET",
+                    "running jobs must never receive cancellation"
+                );
+                if endpoint.ends_with("/jobs?per_page=100") {
+                    Ok(json!([{"jobs":[hardware_job(1,&HVF_LABELS,"queued"),started]}]))
+                } else {
+                    Ok(push_run(1))
+                }
+            })
+            .unwrap();
+            assert_eq!(result, CancellationOutcome::NotCancelled);
+        }
+        let result = Github::cancel_superseded_with(&entry, |method, _, _, _| {
+            assert_eq!(method, "GET");
+            let mut dispatch = push_run(1);
+            dispatch["event"] = "workflow_dispatch".into();
+            dispatch["actor"] = json!({"login":"tjfontaine"});
+            dispatch["triggering_actor"] = json!({"login":"tjfontaine"});
+            Ok(dispatch)
+        })
+        .unwrap();
+        assert_eq!(result, CancellationOutcome::NotCancelled);
+    }
+    #[test]
+    fn cancellation_intent_survives_api_failure_and_restart_rechecks_running_state() {
+        use super::super::assignment::{CancellationOutcome, coalesce_demand};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let mut ledger = Ledger::default();
+        let demand = (1..=3)
+            .map(|n| QueuedJob {
+                key: JobKey {
+                    run: RunId(n),
+                    attempt: 1,
+                    job: JobId(n),
+                },
+                event: "push".into(),
+                sha: format!("{n:040x}"),
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            coalesce_demand(&mut ledger, demand.clone(), &path, |_| Err(
+                ScalerError::External("Actions unavailable")
+            ))
+            .is_err()
+        );
+        let pending: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            pending["superseded"][0]["reason"],
+            format!("superseded by {:040x}", 3)
+        );
+        assert!(pending["superseded"][0]["outcome"].is_null());
+        let mut checked = Vec::new();
+        let mut ledger = Ledger::load(&path).unwrap();
+        let selected = coalesce_demand(&mut ledger, demand, &path, |entry| {
+            checked.push(entry.key.run.0);
+            Ok(if entry.key.run.0 == 1 {
+                CancellationOutcome::NotCancelled
+            } else {
+                CancellationOutcome::Cancelled
+            })
+        })
+        .unwrap();
+        assert_eq!(checked, vec![1, 2]);
+        assert_eq!(
+            selected.iter().map(|k| k.run.0).collect::<Vec<_>>(),
+            vec![3]
+        );
     }
 }

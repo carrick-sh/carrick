@@ -169,7 +169,7 @@ fn serial_host_cloudmac_hook_is_the_same_terminal_wrapper() {
 #[test]
 fn serial_host_standing_hook_admits_a_re_vetted_assignment_and_kills_a_refused_one() {
     // Issue #333: GitHub assigned the clone minted for run A a job from run B.
-    // The bound policy refuses B; only the controller's re-vet may admit it.
+    // Only the controller's re-vet may admit B, or the reserved run A.
     let hook = carrick_xtask::ci_scaler::standing_hook_script().unwrap();
     let bound = "/usr/local/bin/carrick-xtask ci-scaler admit-job";
     let revet = format!("{bound} --controller");
@@ -177,27 +177,12 @@ fn serial_host_standing_hook_admits_a_re_vetted_assignment_and_kills_a_refused_o
         hook.contains(&revet),
         "standing hook never asks for a re-vet"
     );
-    let decide = |bound_ok: bool, revet_ok: bool| {
-        let truth = |ok| {
-            if ok {
-                "/usr/bin/true"
-            } else {
-                "/usr/bin/false"
-            }
-        };
-        hook.replace(&revet, truth(revet_ok))
-            .replace(bound, truth(bound_ok))
-    };
-    // Reserved run A: the bound policy admits it, as before.
-    let (dir, status) = fixture_run(&decide(true, false));
-    assert!(status.success());
+    // Both reserved and reassigned jobs require the controller's approval.
+    let (dir, status) = fixture_run(&hook.replace(&revet, "/usr/bin/true"));
+    assert!(status.success(), "re-vetted assignment was refused");
     assert!(dir.path().join("always-ran").exists());
-    // Admissible run B: bound refuses, the controller approves B's own policy.
-    let (dir, status) = fixture_run(&decide(false, true));
-    assert!(status.success(), "re-vetted assignment B was refused");
-    assert!(dir.path().join("always-ran").exists());
-    // Inadmissible run B: both refuse, the whole session dies before any step.
-    let (dir, status) = fixture_run(&decide(false, false));
+    // Withheld approval kills the whole session before any workflow step.
+    let (dir, status) = fixture_run(&hook.replace(&revet, "/usr/bin/false"));
     assert_eq!(status.signal(), Some(libc::SIGKILL));
     assert!(!dir.path().join("always-ran").exists());
     assert!(!dir.path().join("failure-ran").exists());
@@ -212,4 +197,27 @@ fn cloudmac_launch_isolates_the_runner_session_before_it_can_receive_a_job() {
     assert!(source.contains(".env(\"ACTIONS_RUNNER_INPUT_JITCONFIG\", &jit)"));
     assert!(!source.contains(".arg(\"--jitconfig\")"));
     assert!(source.contains("libc::setuid(uid)"));
+}
+
+#[test]
+fn serial_host_reserved_standing_job_cannot_bypass_controller_rendezvous() {
+    let bin = tempfile::tempdir().unwrap();
+    let fake = bin.path().join("admit");
+    std::fs::write(&fake,"#!/bin/sh\ncase \" $* \" in\n  *' --controller '*) touch rendezvous-requested; exit 1 ;;\n  *) touch reserved-bypass; exit 0 ;;\nesac\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let hook = carrick_xtask::ci_scaler::standing_hook_script()
+        .unwrap()
+        .replace(
+            "/usr/local/bin/carrick-xtask ci-scaler admit-job",
+            fake.to_str().unwrap(),
+        );
+    let (dir, status) = fixture_run(&hook);
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGKILL),
+        "a reserved job with no controller approval must fail at the hook"
+    );
+    assert!(dir.path().join("rendezvous-requested").exists());
+    assert!(!dir.path().join("reserved-bypass").exists());
 }
