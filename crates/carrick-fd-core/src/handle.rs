@@ -1509,19 +1509,36 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             };
             let incarnation = obj.incarnation.load(Ordering::Acquire);
             retire_or_free_slot(record, storage, slot, entry.generation);
-            if matches!(obj.lifetime.release(incarnation), OpenRelease::Terminal) {
-                obj.next_free.store(0, Ordering::Relaxed);
-                let encoded = u64::from(entry.object_index) + 1;
-                if tail == 0 {
-                    head = encoded;
-                } else if let Ok(prev) = self.object((tail - 1) as u32) {
-                    prev.next_free.store(encoded, Ordering::Relaxed);
-                }
-                tail = encoded;
-            }
+            self.release_into_retired_list(
+                obj,
+                entry.object_index,
+                incarnation,
+                &mut head,
+                &mut tail,
+            );
         }
         record.end_write();
         head
+    }
+
+    fn release_into_retired_list(
+        &self,
+        obj: &ObjectRecord,
+        index: u32,
+        incarnation: u64,
+        head: &mut u64,
+        tail: &mut u64,
+    ) {
+        if matches!(obj.lifetime.release(incarnation), OpenRelease::Terminal) {
+            obj.next_free.store(0, Ordering::Relaxed);
+            let encoded = u64::from(index) + 1;
+            if *tail == 0 {
+                *head = encoded;
+            } else if let Ok(prev) = self.object((*tail - 1) as u32) {
+                prev.next_free.store(encoded, Ordering::Relaxed);
+            }
+            *tail = encoded;
+        }
     }
 
     fn finalize_retired_objects(&self, mut head: u64, mut release: impl FnMut(BackingToken)) {
@@ -1607,20 +1624,11 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         Ok(extent)
     }
 
-    /// Create a child handle table by inheriting handles from `parent` that
-    /// have `flags.is_inheritable() == true` and satisfy `filter`.
-    ///
-    /// - Evaluates `filter` outside `parent`'s lock so a concurrent
-    ///   [`Authority::close_handle`] on `parent` never deadlocks or aborts
-    ///   inheritance; a handle closed in `parent` before it is retained for the
-    ///   child is cleanly skipped.
-    /// - If `parent` is closed or exits while `filter` runs and a subsequent
-    ///   step rolls back already-retained child slots, any [`OpenRelease::Terminal`]
-    ///   token is delivered to `release` so no last reference is ever dropped
-    ///   without finalization.
-    /// - Permanently retired slots in `parent` and slots at [`Generation::MAX`]
-    ///   that are not inherited are permanently retired in the child table,
-    ///   lowering the child's capacity accordingly.
+    /// Inherit one coherent parent snapshot, retaining all eligible candidates
+    /// under one parent lock before running `filter` outside that lock.
+    /// Parent close, move, flag changes or destruction during filtering cannot
+    /// change the snapshot. Rejected candidates advance their slot generation
+    /// (or retire at MAX); terminal releases run outside both table locks.
     pub fn inherit_handle_table(
         &self,
         parent: TableId,
@@ -1628,13 +1636,12 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         storage: &mut Extent,
         mut release: impl FnMut(BackingToken),
     ) -> Result<TableId, HandleError> {
-        let (parent_capacity, parent_limit) = {
-            let (_p_guard, p) = self.lock_handle_table(parent)?;
-            (p.storage.capacity(), p.limit)
-        };
-        if (storage.capacity as usize) < parent_capacity {
+        let (parent_guard, p) = self.lock_handle_table(parent)?;
+        let parent_limit = p.limit;
+        let scan_end = parent_limit.min(p.storage.capacity());
+        if (storage.capacity as usize) < p.storage.capacity() {
             return Err(HandleError::NeedsBacking {
-                slots: parent_capacity,
+                slots: p.storage.capacity(),
             });
         }
         let child = self.storage(*storage).map_err(map_core_error)?;
@@ -1648,179 +1655,87 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         };
         child.clear();
         let mut child_retired = 0u64;
-        let scan_end = parent_limit.min(parent_capacity);
-
-        for slot in 0..scan_end {
-            // Snapshot slot `slot` under the parent lock.
-            let candidate = {
-                let (_p_guard, p) = match self.lock_handle_table(parent) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        drop(child_guard);
-                        self.push_table(child_index);
-                        self.rollback_inherited_slots(&child, slot, &mut release);
-                        return Err(err);
+        let snapshot = (|| {
+            for slot in 0..scan_end {
+                let word = p.storage.entries[slot].0.load(Ordering::Relaxed);
+                let copied = match decode_handle_slot(word) {
+                    SlotState::Occupied(entry) => {
+                        let retained = if entry.flags.is_inheritable() {
+                            let obj = self.object(entry.object_index)?;
+                            let inc = obj.incarnation.load(Ordering::Acquire);
+                            match self.retain_object(entry.object_index, inc) {
+                                Ok(()) => true,
+                                Err(HandleError::PinOverflow) => {
+                                    return Err(HandleError::PinOverflow);
+                                }
+                                Err(_) => false,
+                            }
+                        } else {
+                            false
+                        };
+                        if retained {
+                            word
+                        } else {
+                            match entry.generation.next() {
+                                Some(next) => encode_vacant_slot(next),
+                                None => {
+                                    child_retired += 1;
+                                    encode_retired_slot()
+                                }
+                            }
+                        }
                     }
+                    SlotState::Retired => {
+                        child_retired += 1;
+                        word
+                    }
+                    SlotState::Vacant { .. } => word,
                 };
-                if slot >= p.storage.capacity() {
-                    SlotState::Vacant {
-                        next_generation: Generation::INITIAL,
-                    }
-                } else {
-                    decode_handle_slot(p.storage.entries[slot].0.load(Ordering::Relaxed))
+                child.entries[slot].0.store(copied, Ordering::Relaxed);
+            }
+            Ok(())
+        })();
+        drop(parent_guard);
+        if let Err(err) = snapshot {
+            drop(child_guard);
+            self.push_table(child_index);
+            self.rollback_inherited_slots(&child, scan_end, &mut release);
+            return Err(err);
+        }
+        let (mut head, mut tail) = (0, 0);
+        for slot in 0..scan_end {
+            let SlotState::Occupied(entry) =
+                decode_handle_slot(child.entries[slot].0.load(Ordering::Relaxed))
+            else {
+                continue;
+            };
+            // The snapshot's retained reference authenticates and keeps this
+            // exact object incarnation alive even if the parent is destroyed.
+            let obj = match self.object(entry.object_index) {
+                Ok(obj) => obj,
+                Err(err) => {
+                    drop(child_guard);
+                    self.push_table(child_index);
+                    self.rollback_inherited_slots(&child, scan_end, &mut release);
+                    self.finalize_retired_objects(head, release);
+                    return Err(err);
                 }
             };
-
-            match candidate {
-                SlotState::Retired => {
-                    child.entries[slot]
-                        .0
-                        .store(encode_retired_slot(), Ordering::Relaxed);
-                    child_retired += 1;
-                }
-                SlotState::Vacant { next_generation } => {
-                    child.entries[slot]
-                        .0
-                        .store(encode_vacant_slot(next_generation), Ordering::Relaxed);
-                }
-                SlotState::Occupied(entry) => {
-                    let keep = if entry.flags.is_inheritable() {
-                        let backing = match self.object(entry.object_index) {
-                            Ok(obj) => BackingToken(obj.backing.load(Ordering::Acquire)),
-                            Err(err) => {
-                                drop(child_guard);
-                                self.push_table(child_index);
-                                self.rollback_inherited_slots(&child, slot, &mut release);
-                                return Err(err);
-                            }
-                        };
-                        let pin = ObjectPin::new(SlotIndex(slot as u32), entry.generation);
-                        // Run caller filter outside the parent lock so a racing
-                        // close on the parent table can proceed concurrently.
-                        filter(pin, backing, entry.flags)
-                    } else {
-                        false
-                    };
-
-                    if !keep {
-                        match entry.generation.next() {
-                            Some(next_gen) => {
-                                child.entries[slot]
-                                    .0
-                                    .store(encode_vacant_slot(next_gen), Ordering::Relaxed);
-                            }
-                            None => {
-                                child.entries[slot]
-                                    .0
-                                    .store(encode_retired_slot(), Ordering::Relaxed);
-                                child_retired += 1;
-                            }
-                        }
-                        continue;
+            let backing = BackingToken(obj.backing.load(Ordering::Acquire));
+            let pin = ObjectPin::new(SlotIndex(slot as u32), entry.generation);
+            if !filter(pin, backing, entry.flags) {
+                let word = match entry.generation.next() {
+                    Some(next) => encode_vacant_slot(next),
+                    None => {
+                        child_retired += 1;
+                        encode_retired_slot()
                     }
-
-                    // Re-lock parent to verify the slot was not concurrently
-                    // closed or replaced while `filter` ran, and retain under
-                    // the parent lock.
-                    let retain_outcome = {
-                        let (_p_guard, p) = match self.lock_handle_table(parent) {
-                            Ok(v) => v,
-                            Err(err) => {
-                                drop(child_guard);
-                                self.push_table(child_index);
-                                self.rollback_inherited_slots(&child, slot, &mut release);
-                                return Err(err);
-                            }
-                        };
-                        let current_state = if slot < p.storage.capacity() {
-                            decode_handle_slot(p.storage.entries[slot].0.load(Ordering::Relaxed))
-                        } else {
-                            SlotState::Vacant {
-                                next_generation: Generation::INITIAL,
-                            }
-                        };
-                        match current_state {
-                            SlotState::Occupied(now)
-                                if now.object_index == entry.object_index
-                                    && now.generation == entry.generation
-                                    && now.flags.is_inheritable() =>
-                            {
-                                match self.object(now.object_index) {
-                                    Ok(obj) => {
-                                        let inc = obj.incarnation.load(Ordering::Acquire);
-                                        match self.retain_object(now.object_index, inc) {
-                                            Ok(()) => Ok(Some(now)),
-                                            Err(HandleError::PinOverflow) => {
-                                                Err(HandleError::PinOverflow)
-                                            }
-                                            Err(_) => {
-                                                let word = match entry.generation.next() {
-                                                    Some(next) => encode_vacant_slot(next),
-                                                    None => {
-                                                        child_retired += 1;
-                                                        encode_retired_slot()
-                                                    }
-                                                };
-                                                child.entries[slot]
-                                                    .0
-                                                    .store(word, Ordering::Relaxed);
-                                                Ok(None)
-                                            }
-                                        }
-                                    }
-                                    Err(err) => Err(err),
-                                }
-                            }
-                            SlotState::Retired => {
-                                child.entries[slot]
-                                    .0
-                                    .store(encode_retired_slot(), Ordering::Relaxed);
-                                child_retired += 1;
-                                Ok(None)
-                            }
-                            SlotState::Vacant { next_generation } => {
-                                child.entries[slot]
-                                    .0
-                                    .store(encode_vacant_slot(next_generation), Ordering::Relaxed);
-                                Ok(None)
-                            }
-                            SlotState::Occupied(_) => {
-                                match entry.generation.next() {
-                                    Some(next_gen) => {
-                                        child.entries[slot]
-                                            .0
-                                            .store(encode_vacant_slot(next_gen), Ordering::Relaxed);
-                                    }
-                                    None => {
-                                        child.entries[slot]
-                                            .0
-                                            .store(encode_retired_slot(), Ordering::Relaxed);
-                                        child_retired += 1;
-                                    }
-                                }
-                                Ok(None)
-                            }
-                        }
-                    };
-
-                    match retain_outcome {
-                        Ok(Some(inherited_entry)) => {
-                            child.entries[slot]
-                                .0
-                                .store(encode_occupied_slot(inherited_entry), Ordering::Relaxed);
-                        }
-                        Ok(None) => {}
-                        Err(err) => {
-                            drop(child_guard);
-                            self.push_table(child_index);
-                            self.rollback_inherited_slots(&child, slot, &mut release);
-                            return Err(err);
-                        }
-                    }
-                }
+                };
+                child.entries[slot].0.store(word, Ordering::Relaxed);
+                let inc = obj.incarnation.load(Ordering::Acquire);
+                self.release_into_retired_list(obj, entry.object_index, inc, &mut head, &mut tail);
             }
         }
-
         child.rebuild();
         let child_id = self.publish_handle_table(
             child_index,
@@ -1829,6 +1744,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
             core::mem::take(storage),
         );
         drop(child_guard);
+        self.finalize_retired_objects(head, release);
         Ok(child_id)
     }
 
