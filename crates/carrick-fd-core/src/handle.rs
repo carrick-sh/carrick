@@ -942,54 +942,24 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
     }
 
     fn lock_handle_table(&self, id: TableId) -> Result<(Locked<'a>, HandleTable<'a>), HandleError> {
-        if id.authority != self.handle_identity()? {
-            return Err(HandleError::Stale);
-        }
-        let record = self.core.tables.get(id.index).ok_or(HandleError::Stale)?;
-        let guard = self.acquire(record).map_err(map_core_error)?;
-        if record.state.load(Ordering::Acquire) != TABLE_LIVE_HANDLES
-            || record.generation.load(Ordering::Relaxed) != id.generation
-        {
-            return Err(HandleError::Stale);
-        }
-        let table = HandleTable {
-            storage: self
-                .storage(Self::record_extent(record))
-                .map_err(map_core_error)?,
-            limit: record.limit.load(Ordering::Relaxed) as usize,
-        };
-        Ok((guard, table))
+        let (guard, table) = self
+            .lock_in_states(id, &[TABLE_LIVE_HANDLES])
+            .map_err(map_core_error)?;
+        Ok((
+            guard,
+            HandleTable {
+                storage: table.storage,
+                limit: table.limit,
+            },
+        ))
     }
 
     fn read_handle_table(
         &self,
         id: TableId,
     ) -> Result<(&'a TableRecord, u64, TableStorage<'a>, usize), HandleError> {
-        if id.authority != self.handle_identity()? {
-            return Err(HandleError::Stale);
-        }
-        let record = self.core.tables.get(id.index).ok_or(HandleError::Stale)?;
-        let mut attempt: u32 = 0;
-        loop {
-            let seq = record.seq.load(Ordering::Acquire);
-            if seq & 1 == 0 {
-                let live = record.state.load(Ordering::Relaxed) == TABLE_LIVE_HANDLES
-                    && record.generation.load(Ordering::Relaxed) == id.generation;
-                let extent = Self::record_extent(record);
-                let limit = record.limit.load(Ordering::Relaxed) as usize;
-                if record.unchanged_since(seq) {
-                    if !live {
-                        return Err(HandleError::Stale);
-                    }
-                    let storage = self.storage(extent).map_err(map_core_error)?;
-                    return Ok((record, seq, storage, limit));
-                }
-            }
-            attempt = attempt.saturating_add(1);
-            if !self.wait.wait(attempt) {
-                return Err(HandleError::Contended);
-            }
-        }
+        self.read_table_in_states(id, &[TABLE_LIVE_HANDLES])
+            .map_err(map_core_error)
     }
 
     /// Create an empty personality handle table with bounded `limit` over `storage`.
@@ -1026,31 +996,8 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         table: TableId,
         storage: &mut Extent,
     ) -> Result<(), HandleError> {
-        let (guard, t) = self.lock_handle_table(table)?;
-        if storage.capacity < t.storage.capacity() as u64 {
-            return Err(HandleError::InvalidHandle);
-        }
-        let larger = self.storage(*storage).map_err(map_core_error)?;
-        larger.clear();
-        for (slot, cell) in t.storage.entries.iter().enumerate() {
-            larger.entries[slot]
-                .0
-                .store(cell.0.load(Ordering::Relaxed), Ordering::Relaxed);
-        }
-        larger.rebuild();
-        let retired = Self::record_extent(guard.record);
-        guard.record.begin_write();
-        guard
-            .record
-            .extent_token
-            .store(storage.token, Ordering::Relaxed);
-        guard
-            .record
-            .extent_capacity
-            .store(storage.capacity, Ordering::Relaxed);
-        guard.record.end_write();
-        *storage = retired;
-        Ok(())
+        self.grow_table_in_states(table, storage, &[TABLE_LIVE_HANDLES])
+            .map_err(map_core_error)
     }
 
     /// Reported usable slot capacity of `table` (`limit - retired_slots`).
