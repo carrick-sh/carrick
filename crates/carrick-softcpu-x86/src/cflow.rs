@@ -90,6 +90,7 @@ fn read_u64_checked<M: SoftMmuMemory>(
     let mut buf = [0u8; 8];
     read_guest_bytes(ctx, mem, va, &mut buf, SoftAccessKind::Read)
         .map_err(|pf| X86Exception::page_fault(insn_va, pf.error_code, pf.cr2))?;
+    ctx.check_alignment(va, 8, insn_va)?;
     Ok(u64::from_le_bytes(buf))
 }
 
@@ -103,6 +104,7 @@ fn write_u64_checked<M: SoftMmuMemory>(
     if !is_canonical_va(va) || !is_canonical_va(va.wrapping_add(7)) {
         return Err(X86Exception::general_protection(insn_va, 0));
     }
+    crate::mmu::check_guest_alignment(ctx, mem, va, 8, 8, SoftAccessKind::Write, insn_va)?;
     write_guest_bytes(ctx, mem, va, &val.to_le_bytes())
         .map_err(|pf| X86Exception::page_fault(insn_va, pf.error_code, pf.cr2))
 }

@@ -61,6 +61,9 @@ pub const EXIT_REASON_SYSCALL: u64 = 1;
 pub const EXIT_REASON_CFLOW: u64 = 2;
 pub const EXIT_REASON_SENSITIVE: u64 = 3;
 pub const EXIT_REASON_EXCEPTION: u64 = 4;
+pub(crate) const EXIT_REASON_RESTART: u64 = 5;
+/// Maximum completed REP elements per execution window (at most 32 KiB).
+pub const REP_ITERATION_BUDGET: u64 = 4096;
 
 pub const CTX_GPR_R14_OFF: usize = 0x70;
 pub const CTX_GPR_R15_OFF: usize = 0x78;
@@ -89,6 +92,8 @@ pub const CTX_TLB_WRITE_OFF: usize = CTX_TLB_READ_OFF + SoftTlb::WRITE_PLANE_OFF
 #[repr(u8)]
 pub enum X86ExceptionVector {
     DivideError = 0,
+    Debug = 1,
+    AlignmentCheck = 17,
     Breakpoint = 3,
     SimdFloatingPoint = 19,
     X87FloatingPoint = 16,
@@ -445,6 +450,28 @@ impl SoftCpuContext {
         self.sync_tlb_tag_bits();
     }
 
+    pub(crate) fn check_alignment(
+        &self,
+        va: u64,
+        alignment: usize,
+        rip: u64,
+    ) -> Result<(), X86Exception> {
+        if self.cpl == 3
+            && self.cr0 & (1 << 18) != 0
+            && self.ac()
+            && alignment > 1
+            && !va.is_multiple_of(alignment as u64)
+        {
+            return Err(X86Exception::new(
+                X86ExceptionVector::AlignmentCheck,
+                rip,
+                Some(0),
+                None,
+            ));
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn read_xmm(&self, index: usize) -> u128 {
         let off = 160 + index.min(15) * 16;
@@ -534,6 +561,28 @@ extern "sysv64" fn softcpu_mem_slow_path(
         || ctx.active_translate_fn.is_none()
     {
         record_exception(ctx, X86Exception::general_protection(insn_va, 0));
+        return 0;
+    }
+
+    if let Err(exc) = ctx.check_alignment(guest_va, size.min(8), insn_va) {
+        let kind = if access_code == 0 {
+            SoftAccessKind::Read
+        } else {
+            SoftAccessKind::Write
+        };
+        for addr in [
+            guest_va,
+            if guest_va & SOFT_TLB_PAGE_MASK == last_va & SOFT_TLB_PAGE_MASK {
+                guest_va
+            } else {
+                last_va & SOFT_TLB_PAGE_MASK
+            },
+        ] {
+            if translate_or_record(ctx, addr, kind, insn_va).is_none() {
+                return 0;
+            }
+        }
+        record_exception(ctx, exc);
         return 0;
     }
 
@@ -628,9 +677,28 @@ extern "sysv64" fn softcpu_step_complex(ctx: &mut SoftCpuContext, insn_idx: u64)
         return 0;
     };
     ctx.fxsave.0[28..32].copy_from_slice(&GUEST_MXCSR_MASK.to_le_bytes());
+    let entry_flags = ctx.rflags;
     match step_complex_inner(ctx, &insn, insn_va, fp_leaf) {
-        Ok(()) => 1,
+        Ok(()) => u64::from(ctx.exit_reason != EXIT_REASON_RESTART),
         Err(exc) => {
+            // REP comparison faults restore the pre-instruction flags (SDM
+            // REPE/REPNE). Completed index/count progress remains restartable.
+            if insn.is_string_instruction()
+                && (insn.has_repe_prefix() || insn.has_repne_prefix())
+                && matches!(
+                    insn.mnemonic(),
+                    Mnemonic::Cmpsb
+                        | Mnemonic::Cmpsw
+                        | Mnemonic::Cmpsd
+                        | Mnemonic::Cmpsq
+                        | Mnemonic::Scasb
+                        | Mnemonic::Scasw
+                        | Mnemonic::Scasd
+                        | Mnemonic::Scasq
+                )
+            {
+                ctx.rflags = entry_flags;
+            }
             if let Some(cr2) = exc.cr2 {
                 ctx.cr2 = cr2;
             }
@@ -926,6 +994,9 @@ fn walk_active_span(
         return Err(X86Exception::general_protection(insn_va, 0));
     }
     for pass in [false, true] {
+        if pass {
+            ctx.check_alignment(va, len.min(8), insn_va)?;
+        }
         let (mut cur, mut off) = (va, 0usize);
         while off < len {
             let chunk =
@@ -1148,7 +1219,40 @@ fn step_string_op(
     };
     let has_rep = insn.has_rep_prefix() || insn.has_repe_prefix() || insn.has_repne_prefix();
 
+    let budget = if ctx.rflags & (1 << 8) != 0 {
+        1
+    } else {
+        REP_ITERATION_BUDGET
+    };
+    let mut completed = 0;
     while !has_rep || ctx.gpr[reg::RCX] != 0 {
+        if completed == budget {
+            ctx.rip = insn_va;
+            ctx.exit_insn_va = insn_va;
+            ctx.exit_reason = EXIT_REASON_RESTART;
+            break;
+        }
+        let remaining = if has_rep { ctx.gpr[reg::RCX] } else { 1 };
+        let chunk = if kind <= 1 {
+            string_copy_chunk(
+                ctx,
+                kind,
+                width,
+                delta,
+                remaining.min(budget - completed),
+                insn_va,
+            )?
+        } else {
+            0
+        };
+        if chunk != 0 {
+            completed += chunk;
+            if !has_rep {
+                break;
+            }
+            ctx.gpr[reg::RCX] -= chunk;
+            continue;
+        }
         let (rsi, rdi) = (ctx.gpr[reg::RSI], ctx.gpr[reg::RDI]);
         match kind {
             0 => {
@@ -1187,6 +1291,7 @@ fn step_string_op(
                 ctx.gpr[reg::RDI] = rdi.wrapping_add(delta);
             }
         }
+        completed += 1;
         if !has_rep {
             break;
         }
@@ -1197,6 +1302,104 @@ fn step_string_op(
         }
     }
     Ok(())
+}
+
+// Authenticate at most one source/destination page per chunk. Never preflight
+// a later page: a fault there must expose all previously completed elements.
+// Intel SDM Vol. 2 REP/MOVS/STOS: overlap follows element order, including DF.
+fn string_copy_chunk(
+    ctx: &mut SoftCpuContext,
+    kind: u8,
+    width: usize,
+    delta: u64,
+    limit: u64,
+    rip: u64,
+) -> Result<u64, X86Exception> {
+    let (src, dst) = (ctx.gpr[reg::RSI], ctx.gpr[reg::RDI]);
+    let reverse = delta >> 63 != 0;
+    let page_elements = |va: u64| {
+        let offset = va & SOFT_TLB_OFFSET_MASK;
+        if offset + width as u64 > SOFT_TLB_PAGE_SIZE {
+            return 0;
+        }
+        if reverse {
+            offset / width as u64 + 1
+        } else {
+            (SOFT_TLB_PAGE_SIZE - offset) / width as u64
+        }
+    };
+    let mut count = limit.min(page_elements(dst));
+    if kind == 0 {
+        count = count.min(page_elements(src));
+    }
+    // The scalar path preserves precise #PF/#AC priority for a split element.
+    if count == 0
+        || ctx.check_alignment(dst, width, rip).is_err()
+        || (kind == 0 && ctx.check_alignment(src, width, rip).is_err())
+    {
+        return Ok(0);
+    }
+    let bytes = count as usize * width;
+    let low = |va: u64| {
+        if reverse {
+            va.wrapping_sub((count - 1) * width as u64)
+        } else {
+            va
+        }
+    };
+    let (src_low, dst_low) = (low(src), low(dst));
+    for va in [dst_low, dst_low.wrapping_add(bytes as u64 - 1)] {
+        if !is_canonical_va(va) {
+            return Err(X86Exception::general_protection(rip, 0));
+        }
+    }
+    let source = if kind == 0 {
+        if !is_canonical_va(src_low) || !is_canonical_va(src_low.wrapping_add(bytes as u64 - 1)) {
+            return Err(X86Exception::general_protection(rip, 0));
+        }
+        Some(
+            translate_active(ctx, src, SoftAccessKind::Read)
+                .map_err(|pf| X86Exception::page_fault(rip, pf.error_code, pf.cr2))?
+                // SAFETY: src_low and src are in the same authenticated page.
+                .wrapping_sub(src.wrapping_sub(src_low) as usize),
+        )
+    } else {
+        None
+    };
+    let destination = translate_active(ctx, dst, SoftAccessKind::Write)
+        .map_err(|pf| X86Exception::page_fault(rip, pf.error_code, pf.cr2))?
+        .wrapping_sub(dst.wrapping_sub(dst_low) as usize);
+    let accumulator = ctx.gpr[reg::RAX].to_le_bytes();
+    // SAFETY: both complete spans are authenticated within their respective
+    // pages. Physical aliases require architectural element-order copying,
+    // not memcpy/memmove, which would lose overlapping REP propagation.
+    unsafe {
+        if let Some(source) = source.filter(|source| {
+            let a = *source as usize;
+            let b = destination as usize;
+            a + bytes <= b || b + bytes <= a
+        }) {
+            std::ptr::copy_nonoverlapping(source, destination, bytes);
+        } else {
+            for i in 0..count as usize {
+                let offset = if reverse {
+                    bytes - (i + 1) * width
+                } else {
+                    i * width
+                };
+                let mut element = accumulator;
+                if let Some(source) = source {
+                    std::ptr::copy_nonoverlapping(source.add(offset), element.as_mut_ptr(), width);
+                }
+                std::ptr::copy_nonoverlapping(element.as_ptr(), destination.add(offset), width);
+            }
+        }
+    }
+    if kind == 0 {
+        ctx.gpr[reg::RSI] = src.wrapping_add(delta.wrapping_mul(count));
+    }
+    ctx.gpr[reg::RDI] = dst.wrapping_add(delta.wrapping_mul(count));
+    Ok(count)
 }
 
 fn sub_flags(old_rflags: u64, a: u64, b: u64, width: usize) -> u64 {
@@ -1371,7 +1574,7 @@ fn gw_save_guest(code: &mut Vec<u8>, from_probe: bool, from_lahf: bool) {
     code.extend_from_slice(&[0x9c, 0x58]); // pushfq; pop rax on the host stack
     gw_load(code, 1, offset_of!(SoftCpuContext, rflags));
     code.extend_from_slice(&[
-        0x48, 0x81, 0xe1, 0x00, 0x02, 0x04, 0x00, 0x48, 0x25, 0xff, 0xfd, 0xfb, 0xff, 0x48, 0x09,
+        0x48, 0x81, 0xe1, 0x00, 0x03, 0x04, 0x00, 0x48, 0x25, 0xff, 0xfc, 0xfb, 0xff, 0x48, 0x09,
         0xc8,
     ]);
     gw_store(code, 0, offset_of!(SoftCpuContext, rflags));

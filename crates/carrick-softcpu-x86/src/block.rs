@@ -134,7 +134,13 @@ pub fn plan_block_from_memory<M: SoftMmuMemory>(
     ctx: &mut SoftCpuContext,
     mem: &mut M,
 ) -> Result<PlannedBlock, BlockFetchFault> {
-    let (max_insns, max_span) = (max_insns.max(1), max_span.max(MAX_INSN_BYTES));
+    // Intel SDM Vol. 3, single-step: TF is sampled before the instruction.
+    let max_insns = if ctx.rflags & (1 << 8) != 0 {
+        1
+    } else {
+        max_insns.max(1)
+    };
+    let max_span = max_span.max(MAX_INSN_BYTES);
     let (mut insns, mut insn_bytes, mut cursor) = (Vec::new(), Vec::new(), entry_va);
 
     let exit = loop {
@@ -156,6 +162,13 @@ pub fn plan_block_from_memory<M: SoftMmuMemory>(
                 insns.push(decoded);
                 insn_bytes.push(raw_bytes);
                 cursor = next_va;
+                // POPF may arm TF/AC. Publish its state before planning a successor.
+                if matches!(
+                    raw.mnemonic(),
+                    iced_x86::Mnemonic::Popf | iced_x86::Mnemonic::Popfq
+                ) {
+                    break BlockExit::Continue { target: cursor };
+                }
             }
             InsnClass::Syscall => {
                 break BlockExit::Syscall {

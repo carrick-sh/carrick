@@ -167,3 +167,29 @@ fn walk_span<M: SoftMmuMemory>(
     }
     Ok(())
 }
+
+/// Check a guest data operand's alignment without extra walks on the aligned
+/// path. If #AC is pending, authenticate every page first: #PF has priority.
+/// Callers validate canonicality and select the architectural alignment.
+pub(crate) fn check_guest_alignment<M: SoftMmuMemory>(
+    ctx: &mut SoftCpuContext,
+    mem: &mut M,
+    va: u64,
+    len: usize,
+    alignment: usize,
+    kind: SoftAccessKind,
+    rip: u64,
+) -> Result<(), crate::context::X86Exception> {
+    let Err(exc) = ctx.check_alignment(va, alignment, rip) else {
+        return Ok(());
+    };
+    let mut offset = 0;
+    while offset < len {
+        let current = va.wrapping_add(offset as u64);
+        translate_va(ctx, mem, current, kind)
+            .map_err(|pf| crate::context::X86Exception::page_fault(rip, pf.error_code, pf.cr2))?;
+        offset +=
+            (len - offset).min((SOFT_TLB_PAGE_SIZE - (current & SOFT_TLB_OFFSET_MASK)) as usize);
+    }
+    Err(exc)
+}

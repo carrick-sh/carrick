@@ -23,6 +23,21 @@ pub enum SensitiveOp {
     Ldmxcsr,
     Stmxcsr,
     Iretq,
+    Icebp,
+    Clts,
+    Invd,
+    Wbinvd,
+    Lmsw,
+    Lldt,
+    MovDr,
+    Sgdt,
+    Sidt,
+    Sldt,
+    Str,
+    Smsw,
+    Verr,
+    Verw,
+    MovSegment,
     Sysret,
     Swapgs,
     Wrmsr,
@@ -71,7 +86,17 @@ impl SensitiveOp {
     pub const fn is_privileged(self) -> bool {
         !matches!(
             self,
-            Self::Interrupt { .. }
+            Self::Iretq
+                | Self::Icebp
+                | Self::Sgdt
+                | Self::Sidt
+                | Self::Sldt
+                | Self::Str
+                | Self::Smsw
+                | Self::Verr
+                | Self::Verw
+                | Self::MovSegment
+                | Self::Interrupt { .. }
                 | Self::Ldmxcsr
                 | Self::Stmxcsr
                 | Self::Lar
@@ -232,6 +257,19 @@ pub fn classify(bytes: &[u8], va: u64) -> Option<DecodedInsn> {
 fn classify_insn(insn: &Instruction, next_va: u64) -> InsnClass {
     let simple = match insn.mnemonic() {
         Mnemonic::Syscall => return InsnClass::Syscall,
+        Mnemonic::Int1 => Some(SensitiveOp::Icebp),
+        Mnemonic::Clts => Some(SensitiveOp::Clts),
+        Mnemonic::Invd => Some(SensitiveOp::Invd),
+        Mnemonic::Wbinvd => Some(SensitiveOp::Wbinvd),
+        Mnemonic::Lmsw => Some(SensitiveOp::Lmsw),
+        Mnemonic::Lldt => Some(SensitiveOp::Lldt),
+        Mnemonic::Sgdt => Some(SensitiveOp::Sgdt),
+        Mnemonic::Sidt => Some(SensitiveOp::Sidt),
+        Mnemonic::Sldt => Some(SensitiveOp::Sldt),
+        Mnemonic::Str => Some(SensitiveOp::Str),
+        Mnemonic::Smsw => Some(SensitiveOp::Smsw),
+        Mnemonic::Verr => Some(SensitiveOp::Verr),
+        Mnemonic::Verw => Some(SensitiveOp::Verw),
         Mnemonic::Int3 => Some(SensitiveOp::Interrupt { vector: 3 }),
         Mnemonic::Int => Some(SensitiveOp::Interrupt {
             vector: insn.immediate8(),
@@ -321,32 +359,21 @@ fn classify_insn(insn: &Instruction, next_va: u64) -> InsnClass {
                 if let (Some(cr), Some(gpr)) = (cr_number(r0), gpr_index(r1)) {
                     return InsnClass::Sensitive(SensitiveOp::MovToCr { cr, gpr });
                 }
-                if r0.is_segment_register() || r1.is_segment_register() || r0.is_dr() || r1.is_dr()
-                {
-                    return InsnClass::InvalidOpcode;
+                if r0.is_dr() || r1.is_dr() {
+                    return InsnClass::Sensitive(SensitiveOp::MovDr);
+                }
+                if r0.is_segment_register() || r1.is_segment_register() {
+                    return InsnClass::Sensitive(SensitiveOp::MovSegment);
                 }
             } else if (k0 == OpKind::Register && r0.is_segment_register())
                 || (k1 == OpKind::Register && r1.is_segment_register())
             {
-                return InsnClass::InvalidOpcode;
+                return InsnClass::Sensitive(SensitiveOp::MovSegment);
             }
         }
-        Mnemonic::Rdfsbase
-        | Mnemonic::Rdgsbase
-        | Mnemonic::Wrfsbase
-        | Mnemonic::Wrgsbase
-        | Mnemonic::Sgdt
-        | Mnemonic::Sidt
-        | Mnemonic::Sldt
-        | Mnemonic::Lldt
-        | Mnemonic::Str
-        | Mnemonic::Verr
-        | Mnemonic::Verw
-        | Mnemonic::Smsw
-        | Mnemonic::Lmsw
-        | Mnemonic::Invd
-        | Mnemonic::Wbinvd
-        | Mnemonic::Clts => return InsnClass::InvalidOpcode,
+        Mnemonic::Rdfsbase | Mnemonic::Rdgsbase | Mnemonic::Wrfsbase | Mnemonic::Wrgsbase => {
+            return InsnClass::InvalidOpcode;
+        }
         _ => {}
     }
 

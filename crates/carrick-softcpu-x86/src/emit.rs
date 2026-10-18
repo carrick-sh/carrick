@@ -271,7 +271,17 @@ fn emit_mem_insn(
     emit_save_flags_into_ctx(code);
     emit_effective_address_into_r14(code, insn);
 
-    let mut branch_patches = Vec::with_capacity(3);
+    let mut branch_patches = Vec::with_capacity(4);
+    if size > 1 {
+        // Guest AC never reaches host flags. Route even a warm TLB hit to
+        // the checked helper while AC is set; it also checks CPL and CR0.AM.
+        code.extend_from_slice(&[0x41, 0xf7, 0x87]);
+        code.extend_from_slice(
+            &(std::mem::offset_of!(crate::context::SoftCpuContext, rflags) as i32).to_le_bytes(),
+        );
+        code.extend_from_slice(&(1u32 << 18).to_le_bytes());
+        branch_patches.push(emit_jcc_rel32(code, 0x85));
+    }
     if align16 {
         code.extend_from_slice(&[0x41, 0xF6, 0xC6, 0x0F]);
         branch_patches.push(emit_jcc_rel32(code, 0x85));
