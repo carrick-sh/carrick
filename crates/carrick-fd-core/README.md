@@ -182,7 +182,7 @@ Run `cargo test -p carrick-fd-core` and
 `cargo clippy -p carrick-fd-core --all-targets -- -D warnings` for this revision.
 The earlier bare-metal check is not rerun for this crate-scoped review fix.
 
-## Contract: neutral-handle-table-v1
+## Contract: core.personality.handle-table
 
 This additive seam has no routed guest calls. The neutral authority owns
 slot generations, retained object lifetimes, and coherent inheritance.
@@ -194,3 +194,10 @@ The VM-free two-thread binding
 to finish before the writer resumes, within the existing bounded wait policy.
 Creation, inheritance and growth cost O(backed capacity), with zero heap
 allocation in the core. Signed integration belongs to the consuming personality.
+
+`inherit_snapshot_survives_concurrent_move_to_already_scanned_slot` proves a
+single retained parent snapshot while another live thread duplicates a high
+slot into a low slot and closes the source during filtering. Filtering and
+terminal finalizers run outside the parent lock; parent destruction cannot
+remove a retained candidate. Every accepted or rejected reference is released
+exactly once, including rollback after partial snapshot retention.

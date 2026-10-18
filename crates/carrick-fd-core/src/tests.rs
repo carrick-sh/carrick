@@ -1629,7 +1629,7 @@ fn inherit_filter_parent_close_or_destroy_finalizes_every_object_exactly_once() 
     c.insert_handle(parent, BackingToken(200), HandleFlags::INHERITABLE)
         .unwrap();
 
-    // Parent is destroyed inside the inherit filter after slot 0 was already retained for child.
+    // Both candidates are retained before parent destruction in the filter.
     let mut destroy_finalized = Vec::new();
     let mut rollback_finalized = Vec::new();
     let mut child_ext = storage(4);
@@ -1640,18 +1640,23 @@ fn inherit_filter_parent_close_or_destroy_finalizes_every_object_exactly_once() 
                 c.destroy_handle_table(parent, |b| destroy_finalized.push(b))
                     .unwrap();
             }
-            true
+            pin.slot != SlotIndex(1)
         },
         &mut child_ext,
         |b| rollback_finalized.push(b),
     );
-    assert_eq!(res, Err(HandleError::Stale));
+    let child = res.unwrap();
+    assert!(destroy_finalized.is_empty());
+    assert_eq!(rollback_finalized, vec![BackingToken(200)]);
+    assert_eq!(c.handle_at(child, SlotIndex(1)), Err(HandleError::Stale));
+    c.destroy_handle_table(child, |b| rollback_finalized.push(b))
+        .unwrap();
     let mut finalized = [destroy_finalized, rollback_finalized].concat();
     finalized.sort_by_key(|b| b.0);
     assert_eq!(
         finalized,
         vec![BackingToken(100), BackingToken(200)],
-        "P1-C witness: parent destroy in filter must finalize slot 0's token on rollback"
+        "parent destroy in filter must preserve every retained candidate"
     );
 }
 
@@ -1881,4 +1886,67 @@ fn inherit_failed_retain_advances_or_retires_child_generation() {
         assert_eq!(c.close_handle(parent, h), Ok(Some(BackingToken(7))));
         c.destroy_handle_table(parent, |_| {}).unwrap();
     }
+}
+
+#[test]
+fn inherit_snapshot_survives_concurrent_move_to_already_scanned_slot() {
+    let (core, arena) = core_with_objects::<2>(4);
+    let c = core.bind(arena, Spin);
+    let parent = c.create_handle_table(4, &mut storage(4)).unwrap();
+    let handles: Vec<_> = (0..4)
+        .map(|i| {
+            c.insert_handle(parent, BackingToken(i), HandleFlags::INHERITABLE)
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        c.close_handle(parent, handles[0]),
+        Ok(Some(BackingToken(0)))
+    );
+    std::thread::scope(|scope| {
+        let (move_tx, move_rx) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let source = handles[3];
+        let writer = scope.spawn(move || {
+            move_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let v = core.bind(arena, Spin);
+            let moved = v.duplicate_handle(parent, source).unwrap();
+            assert_eq!(moved.slot(), SlotIndex(0));
+            assert_eq!(v.close_handle(parent, source), Ok(None));
+            done_tx.send(()).unwrap();
+        });
+        let child = c
+            .inherit_handle_table(
+                parent,
+                |pin, _, _| {
+                    if pin.slot == SlotIndex(1) {
+                        move_tx.send(()).unwrap();
+                        done_rx
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .unwrap();
+                    }
+                    true
+                },
+                &mut storage(4),
+                |_| panic!("all candidates accepted"),
+            )
+            .unwrap();
+        writer.join().unwrap();
+        let inherited = c
+            .handle_at(child, SlotIndex(3))
+            .expect("snapshot lost moved object");
+        let guard = c.get_handle(child, inherited).unwrap();
+        assert_eq!(guard.backing(), BackingToken(3));
+        assert_eq!(c.release_handle_pin(guard), Ok(None));
+        assert_eq!(c.handle_at(child, SlotIndex(0)), Err(HandleError::Stale));
+        c.destroy_handle_table(parent, |_| panic!("snapshot retains all objects"))
+            .unwrap();
+        let mut finalized = Vec::new();
+        c.destroy_handle_table(child, |b| finalized.push(b.0))
+            .unwrap();
+        finalized.sort();
+        assert_eq!(finalized, vec![1, 2, 3]);
+    });
 }
