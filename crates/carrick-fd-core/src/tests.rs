@@ -1752,7 +1752,10 @@ fn inherit_filter_parent_close_or_exit_finalizes_every_object_exactly_once() {
         &mut child_ext2,
         |b| finalized2.push(b),
     );
-    assert_eq!(res2, Err(HandleError::InvalidHandle));
+    assert_eq!(
+        res2.unwrap_err().into_parts(),
+        (HandleError::InvalidHandle, None)
+    );
     assert_eq!(
         finalized2,
         vec![BackingToken(300)],
@@ -2282,4 +2285,112 @@ fn task_exit_rejects_invalid_shared_binding_links_before_effects() {
         assert_eq!(host.table_id(task), Ok(original));
         host.exit_task(task, |_| {}).unwrap();
     }
+}
+
+struct FailResolveOnce {
+    arena: &'static TestArena,
+    calls: AtomicU64,
+    fail_at: AtomicU64,
+}
+impl SlotBacking for FailResolveOnce {
+    fn resolve(&self, extent: Extent) -> Option<(&[DescriptorSlot], &[AtomicU64])> {
+        let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+        if call == self.fail_at.load(Ordering::Relaxed) {
+            None
+        } else {
+            self.arena.resolve(extent)
+        }
+    }
+    fn ofd(&self, index: usize) -> Option<&OfdRecord> {
+        self.arena.ofd(index)
+    }
+    fn object(&self, index: usize) -> Option<&ObjectRecord> {
+        self.arena.object(index)
+    }
+}
+
+#[test]
+fn task_create_preserves_attach_error_when_cleanup_fails() {
+    let tasks = TaskHandleCore::<2>::new().unwrap();
+    let backing = FailResolveOnce {
+        arena: TestArena::with_ofds_and_objects(0, 0),
+        calls: AtomicU64::new(0),
+        fail_at: AtomicU64::new(2),
+    };
+    let host = tasks.bind(&backing, BoundedSpin(8));
+    let mut extent = storage(1);
+    let supplied = extent;
+    let failure = host
+        .create_task_table(test_task_key(-1, 1), 1, &mut extent)
+        .unwrap_err();
+    assert_eq!(failure.cause(), HandleError::InvalidHandle);
+    assert_eq!(extent, Extent::EMPTY);
+    let (cause, pending) = failure.into_parts();
+    assert_eq!(cause, HandleError::InvalidHandle);
+    let (table, cleanup) = pending.unwrap();
+    assert_eq!(cleanup, HandleError::BadBacking);
+    extent = host
+        .authority()
+        .destroy_handle_table(table, |_| {})
+        .unwrap();
+    assert_eq!(extent, supplied);
+    for id in 1..=2 {
+        host.create_task_table(test_task_key(id, 1), 1, &mut storage(1))
+            .unwrap();
+    }
+    for id in 1..=2 {
+        host.exit_task(test_task_key(id, 1), |_| {}).unwrap();
+    }
+}
+
+#[test]
+fn task_inherit_preserves_attach_error_when_cleanup_fails() {
+    let tasks = TaskHandleCore::<2>::new().unwrap();
+    let backing = FailResolveOnce {
+        arena: TestArena::with_ofds_and_objects(0, 1),
+        calls: AtomicU64::new(0),
+        fail_at: AtomicU64::new(0),
+    };
+    let host = tasks.bind(&backing, BoundedSpin(8));
+    host.publish_objects(1).unwrap();
+    let parent = test_task_key(1, 1);
+    host.create_task_table(parent, 1, &mut storage(1)).unwrap();
+    host.insert(parent, BackingToken(77), HandleFlags::INHERITABLE)
+        .unwrap();
+    backing.calls.store(0, Ordering::Relaxed);
+    backing.fail_at.store(0, Ordering::Relaxed);
+    let mut extent = storage(1);
+    let supplied = extent;
+    let failure = host
+        .inherit_task(
+            parent,
+            test_task_key(-1, 1),
+            |_, _, _| {
+                host.exit_task(parent, |_| panic!("snapshot retains object"))
+                    .unwrap();
+                // Parent exit resolves storage once, so cleanup is resolve number 4.
+                backing.fail_at.store(4, Ordering::Relaxed);
+                true
+            },
+            &mut extent,
+            |_| panic!("cleanup has not succeeded"),
+        )
+        .unwrap_err();
+    assert_eq!(failure.cause(), HandleError::InvalidHandle);
+    assert_eq!(extent, Extent::EMPTY);
+    let (_, pending) = failure.into_parts();
+    let (table, cleanup) = pending.unwrap();
+    assert_eq!(cleanup, HandleError::BadBacking);
+    let mut finalized = Vec::new();
+    extent = host
+        .authority()
+        .destroy_handle_table(table, |b| finalized.push(b))
+        .unwrap();
+    assert_eq!(extent, supplied);
+    assert_eq!(finalized, vec![BackingToken(77)]);
+    host.create_task_table(parent, 1, &mut extent).unwrap();
+    host.insert(parent, BackingToken(88), HandleFlags::default())
+        .unwrap();
+    host.exit_task(parent, |b| finalized.push(b)).unwrap();
+    assert_eq!(finalized, vec![BackingToken(77), BackingToken(88)]);
 }
