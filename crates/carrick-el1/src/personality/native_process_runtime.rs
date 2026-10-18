@@ -7056,6 +7056,12 @@ mod tests {
     use carrick_sched_core::ParkedContextWords;
     #[test]
     fn serial_host_empty_signal_checkpoint_takes_no_registry_or_graph_lock() {
+        // An ingress fixture must release its pending owner before the next
+        // empty checkpoint, independently of the test harness's run order.
+        blocked_ipc_signal_contract(0, false, true);
+        super::host_test_support::empty_signal_checkpoint_lock_witness();
+        // The checkpoint fixture itself leaves a blocked signal pending;
+        // its teardown must release that owner before another empty check.
         super::host_test_support::empty_signal_checkpoint_lock_witness();
     }
     #[test]
@@ -11618,6 +11624,23 @@ mod tests {
                 .register_root(runtime.clone(), source, &task, address)
                 .unwrap();
         }
+        // Registration retains the runtime and its pending signal owner.
+        // Release that custody before this fixture's local pages disappear,
+        // including when an assertion unwinds.
+        struct Registration<'a> {
+            registry: &'a NativeProcessRegistry<'a, AddressContext<RootGpa>, ParkedContextWords>,
+            runtime: Arc<NativeProcessRuntime<'a, AddressContext<RootGpa>, ParkedContextWords>>,
+        }
+        impl Drop for Registration<'_> {
+            fn drop(&mut self) {
+                let process = self.runtime.graph.lock().root_key;
+                self.registry.unregister_process(&self.runtime, process);
+            }
+        }
+        let _registration = external.then(|| Registration {
+            registry,
+            runtime: runtime.clone(),
+        });
         assert_eq!(page.live(), 1);
         let mut service = Physical {
             zone: &zone,
