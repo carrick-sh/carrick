@@ -1,5 +1,7 @@
 //! VM-free contract tests for `carrick-softmmu` (`softmmu.x86.tlb-walker`, #580).
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 
