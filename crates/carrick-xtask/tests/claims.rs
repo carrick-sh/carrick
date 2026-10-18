@@ -1,16 +1,19 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use serde_json::{Value, json};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{Arc, Barrier};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 struct Remote {
+    // Field order is drop order: stop serving before removing the repos.
+    server: Server,
     _dir: tempfile::TempDir,
-    daemon: Child,
-    url: String,
     clients: [PathBuf; 2],
 }
 
@@ -24,50 +27,110 @@ fn git(root: &Path, args: &[&str]) -> Output {
     out
 }
 
-impl Remote {
-    fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        git(dir.path(), &["init", "--bare", "remote.git"]);
+/// A `git://` endpoint whose listening socket the test owns from bind to drop
+/// (#659). Each accepted connection is served by `git daemon --inetd` with the
+/// socket as its stdin and stdout, so the port is never released and rebound:
+/// no other process can take it, and no readiness wait is needed because the
+/// kernel queues connections on the bound listener from the start.
+struct Server {
+    address: SocketAddr,
+    stop: Arc<AtomicBool>,
+    accept: Option<JoinHandle<()>>,
+    daemons: Arc<Mutex<Vec<Child>>>,
+}
+
+impl Server {
+    fn bind(base_path: &Path) -> (Self, TcpListener) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let daemons = Arc::new(Mutex::new(Vec::new()));
+        let accept = {
+            let listener = listener.try_clone().unwrap();
+            let stop = Arc::clone(&stop);
+            let daemons = Arc::clone(&daemons);
+            let base_path = base_path.to_owned();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let stream = stream.unwrap();
+                    let input = OwnedFd::from(stream.try_clone().unwrap());
+                    let output = OwnedFd::from(stream);
+                    let daemon = Command::new("git")
+                        .args([
+                            "daemon",
+                            "--inetd",
+                            "--export-all",
+                            "--enable=receive-pack",
+                            "--init-timeout=5",
+                            "--timeout=5",
+                        ])
+                        .arg(format!("--base-path={}", base_path.display()))
+                        .stdin(Stdio::from(input))
+                        .stdout(Stdio::from(output))
+                        .stderr(Stdio::inherit())
+                        .spawn()
+                        .unwrap();
+                    daemons.lock().unwrap().push(daemon);
+                }
+            })
+        };
+        let server = Self {
+            address,
+            stop,
+            accept: Some(accept),
+            daemons,
+        };
+        (server, listener)
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        // Wake the blocked accept; the listener is still bound, so this
+        // connection is queued even if the accept thread has not reached
+        // `accept` yet.
+        let wake = TcpStream::connect(self.address);
+        if let Some(accept) = self.accept.take() {
+            let _ = accept.join();
+        }
+        drop(wake);
+        for mut daemon in self.daemons.lock().unwrap().drain(..) {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+        }
+    }
+}
+
+impl Remote {
+    fn new() -> Self {
+        Self::with_interloper(|_| {})
+    }
+
+    fn with_interloper(interloper: impl FnOnce(SocketAddr)) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "--bare", "remote.git"]);
+        let (server, listener) = Server::bind(dir.path());
+        interloper(server.address);
+        // The accept thread holds its own handle to the listening socket.
         drop(listener);
-        let daemon = Command::new("git")
-            .args([
-                "daemon",
-                "--reuseaddr",
-                "--export-all",
-                "--enable=receive-pack",
-                "--listen=127.0.0.1",
-                "--init-timeout=5",
-                "--timeout=5",
-            ])
-            .arg(format!("--port={}", address.port()))
-            .arg(format!("--base-path={}", dir.path().display()))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
         let clients = [dir.path().join("a"), dir.path().join("b")];
         for client in &clients {
             std::fs::create_dir(client).unwrap();
             git(client, &["init"]);
         }
-        let remote = Self {
+        Self {
+            server,
             _dir: dir,
-            daemon,
-            url: format!("git://{address}/remote.git"),
             clients,
-        };
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if TcpStream::connect(address).is_ok() {
-                break;
-            }
-            assert!(Instant::now() < deadline, "git daemon did not start");
-            std::thread::sleep(Duration::from_millis(10));
         }
-        remote
+    }
+
+    fn url(&self) -> String {
+        format!("git://{}/remote.git", self.server.address)
     }
 
     fn bare_dir(&self) -> PathBuf {
@@ -80,7 +143,7 @@ impl Remote {
             .arg(&self.clients[client])
             .arg("claims")
             .arg("--remote")
-            .arg(&self.url)
+            .arg(self.url())
             .env("CARRICK_XTASK_TEST_NOW", "1");
         cmd
     }
@@ -116,13 +179,6 @@ impl Remote {
     }
 }
 
-impl Drop for Remote {
-    fn drop(&mut self) {
-        let _ = self.daemon.kill();
-        let _ = self.daemon.wait();
-    }
-}
-
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -139,6 +195,30 @@ fn sha(out: &Output) -> String {
 }
 
 const ISSUE: &str = "refs/claims/issue/carrick/572";
+
+#[test]
+fn interloper_cannot_take_the_remote_endpoint() {
+    // #659: the harness used to reserve a port, drop the listener and let
+    // `git daemon` rebind it, so any other process could take the port in
+    // between. An interloper binding the endpoint's address at the earliest
+    // point it is known must be refused, and claims must keep working while
+    // other ephemeral ports are occupied.
+    let squatters: Vec<TcpListener> = (0..64)
+        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let mut stolen = None;
+    let remote = Remote::with_interloper(|address| {
+        stolen = Some(TcpListener::bind(address));
+    });
+    let stolen = stolen.unwrap();
+    assert!(
+        matches!(&stolen, Err(e) if e.kind() == std::io::ErrorKind::AddrInUse),
+        "interloper bound the remote endpoint: {stolen:?}"
+    );
+    sha(&remote.acquire(0, now() + 300, ISSUE));
+    assert_eq!(remote.refs().as_array().unwrap().len(), 1);
+    drop(squatters);
+}
 
 #[test]
 fn concurrent_acquires_have_exactly_one_winner() {
@@ -192,7 +272,7 @@ fn stale_heartbeat_and_release_cannot_replace_a_successor() {
         "#!/usr/bin/env sh\nset -eu\nCARRICK_XTASK_TEST_NOW=1 \"{bin}\" --root \"{client1}\" claims --remote \"{url}\" --now {t0} heartbeat \"{ISSUE}\" --expected \"{old}\" --lease-until {until} > \"{winner}\"\n",
         bin = env!("CARGO_BIN_EXE_carrick-xtask"),
         client1 = remote.clients[1].display(),
-        url = remote.url,
+        url = remote.url(),
         until = t0 + 900,
         winner = winner_out.display(),
     );
@@ -345,7 +425,7 @@ fn killed_holder_is_reclaimable_only_after_ttl() {
         .arg("holder")
         .arg(env!("CARGO_BIN_EXE_carrick-xtask"))
         .arg(&remote.clients[0])
-        .arg(&remote.url)
+        .arg(remote.url())
         .arg(t0.to_string())
         .arg(ISSUE)
         .arg(lease)
@@ -468,7 +548,7 @@ fn lease_ttl_beyond_policy_cap_is_refused_and_corrupt_refs_are_skipped_by_heads_
         &remote.clients[0],
         &[
             "push",
-            &remote.url,
+            &remote.url(),
             &format!("{bad_sha}:refs/claims/unknown/corrupt"),
             &format!("{bad_sha}:refs/claims/issue/carrick/999"),
         ],
