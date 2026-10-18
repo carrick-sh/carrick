@@ -200,6 +200,15 @@ pub struct NativeSignalFixture {
     handler_signum: core::sync::atomic::AtomicI32,
 }
 
+impl Drop for NativeSignalFixture {
+    fn drop(&mut self) {
+        // The registry's member and group rows retain the signal owner even
+        // after the fixture's runtime handle is dropped.
+        let process = self.runtime.graph.lock().root_key;
+        self.registry.unregister_process(&self.runtime, process);
+    }
+}
+
 impl NativeSignalFixture {
     pub fn new(binding: ExecutionBinding, process: carrick_core_abi::EntryTaskKey) -> Self {
         let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
@@ -661,8 +670,6 @@ pub fn empty_signal_checkpoint_lock_witness() {
             .registry
             .signal_checkpoint_needed(fixture.zone, fixture.record)
     );
-    let _ = signals.take_deliverable(
-        fixture.record,
-        carrick_signal_core::policy::SigBlockMask::NONE,
-    );
+    // Leave work pending: fixture teardown must release its signal owner so
+    // the next empty checkpoint can use the process-global summary fast path.
 }
