@@ -156,7 +156,7 @@ impl Github {
         entry: &assignment::SupersededPush,
         mut request: impl FnMut(&str, &str, Option<Value>, bool) -> Result<Value, ScalerError>,
     ) -> Result<assignment::CancellationOutcome, ScalerError> {
-        use assignment::CancellationOutcome::{Cancelled, NotCancelled};
+        use assignment::CancellationOutcome::{Cancelled, Deferred, NotCancelled};
         let run = request(
             "GET",
             &format!("repos/{REPOSITORY}/actions/runs/{}", entry.key.run.0),
@@ -193,19 +193,18 @@ impl Github {
         // and vice versa. Include hosted GCP KVM, not only JIT runner labels.
         for job in &jobs {
             if job["status"] == "in_progress" {
-                return Ok(NotCancelled);
+                return Ok(Deferred);
             }
             let Some(labels) = job["labels"].as_array() else {
                 return Ok(NotCancelled);
             };
             let hardware = labels.iter().any(|label| label == "self-hosted")
                 || job["name"] == "KVM · x86 kvm-lane tests";
-            let skipped = job["status"] == "completed" && job["conclusion"] == "skipped";
             if hardware
-                && !skipped
+                && job["status"] != "completed"
                 && (job["status"] != "queued" || job.get("started_at") != Some(&Value::Null))
             {
-                return Ok(NotCancelled);
+                return Ok(Deferred);
             }
         }
         request(
@@ -565,7 +564,7 @@ mod tests {
                 }
             })
             .unwrap();
-            assert_eq!(result, CancellationOutcome::NotCancelled);
+            assert_eq!(result, CancellationOutcome::Deferred);
         }
         let result = Github::cancel_superseded_with(&entry, |method, _, _, _| {
             assert_eq!(method, "GET");
@@ -622,6 +621,91 @@ mod tests {
         assert_eq!(
             selected.iter().map(|k| k.run.0).collect::<Vec<_>>(),
             vec![3]
+        );
+    }
+    #[test]
+    fn completed_opposite_lane_does_not_strand_superseded_queued_hardware() {
+        use super::super::assignment::{CancellationOutcome, SupersededPush};
+        let entry = SupersededPush {
+            key: JobKey {
+                run: RunId(1),
+                attempt: 1,
+                job: JobId(1),
+            },
+            sha: format!("{:040x}", 1),
+            reason: format!("superseded by {:040x}", 3),
+            outcome: None,
+        };
+        for (target, other) in [
+            (&HVF_LABELS[..], &LABELS[..]),
+            (&LABELS[..], &HVF_LABELS[..]),
+        ] {
+            let mut posted = false;
+            let result = Github::cancel_superseded_with(&entry, |method, endpoint, _, _| {
+                if method == "GET" && endpoint.ends_with("/jobs?per_page=100") {
+                    let mut finished = hardware_job(2, other, "completed");
+                    finished["conclusion"] = "success".into();
+                    Ok(json!([{"jobs":[hardware_job(1,target,"queued"),finished]}]))
+                } else if method == "GET" {
+                    Ok(push_run(1))
+                } else {
+                    assert_eq!(method, "POST");
+                    posted = true;
+                    Ok(Value::Null)
+                }
+            })
+            .unwrap();
+            assert_eq!(result, CancellationOutcome::Cancelled);
+            assert!(posted);
+        }
+    }
+    #[test]
+    fn observed_running_lane_defers_cleanup_across_restart_until_it_finishes() {
+        use super::super::assignment::{CancellationOutcome, coalesce_demand};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let demand = [1, 3].map(|n| QueuedJob {
+            key: JobKey {
+                run: RunId(n),
+                attempt: 1,
+                job: JobId(n),
+            },
+            event: "push".into(),
+            sha: format!("{n:040x}"),
+        });
+        let mut checks = 0;
+        let mut posts = 0;
+        for round in 0..2 {
+            let mut ledger = Ledger::load(&path).unwrap();
+            let ordered = coalesce_demand(&mut ledger, demand.to_vec(), &path, |entry| {
+                checks += 1;
+                Github::cancel_superseded_with(entry, |method, endpoint, _, _| {
+                    if method == "GET" && endpoint.ends_with("/jobs?per_page=100") {
+                        Ok(json!([{"jobs":[hardware_job(1,&LABELS,"queued"),
+                            hardware_job(2,&HVF_LABELS,if round==0 {"in_progress"} else {"completed"})]}]))
+                    } else if method == "GET" {
+                        Ok(push_run(1))
+                    } else {
+                        assert_eq!(round,1,"never cancel observed running work");
+                        assert_eq!(method,"POST");
+                        posts += 1;
+                        Ok(Value::Null)
+                    }
+                })
+            }).unwrap();
+            assert_eq!(
+                ordered.iter().map(|key| key.run.0).collect::<Vec<_>>(),
+                vec![3]
+            );
+        }
+        assert_eq!(
+            checks, 2,
+            "deferred cleanup must survive restart and be rechecked"
+        );
+        assert_eq!(posts, 1);
+        assert_eq!(
+            Ledger::load(&path).unwrap().superseded[0].outcome,
+            Some(CancellationOutcome::Cancelled)
         );
     }
 }

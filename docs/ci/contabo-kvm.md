@@ -87,9 +87,10 @@ The approval decision is durable under the same admission lock as supersession,
 so an already approved local run cannot be superseded.
 
 Cancellation is cleanup after releasing that lock. Before POST, a fresh GET
-of all jobs in the run must show the target queued, no in-progress job and
-no started hardware in either lane, including hosted GCP KVM. Observed started
-work is left alone.
+of all jobs in the run must show the target queued and no in-progress job;
+other hardware in either lane (including GCP KVM) must be unstarted or completed.
+Observed running work defers cleanup, retaining the intent across polls and
+restarts. Completed work does not prevent cancelling a superseded queued lane.
 Each controller applies this rule independently, without a cross-controller
 acknowledgement protocol. **A superseded job never starts through our admission;
 a raced cancellation can only affect a superseded run.** Another lane can

@@ -303,6 +303,7 @@ pub fn assigned_job_key(
 pub(super) enum CancellationOutcome {
     Cancelled,
     NotCancelled,
+    Deferred,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct SupersededPush {
@@ -339,7 +340,9 @@ pub(super) fn merge_superseded(target: &mut Vec<SupersededPush>, source: &[Super
             .iter_mut()
             .find(|entry| entry.key.run == other.key.run && entry.key.attempt == other.key.attempt)
         {
-            if entry.outcome.is_none() {
+            if matches!(entry.outcome, None | Some(CancellationOutcome::Deferred))
+                && other.outcome.is_some()
+            {
                 entry.outcome.clone_from(&other.outcome);
             }
         } else {
@@ -407,7 +410,10 @@ pub(super) fn coalesce_demand(
         }
         journal
     };
-    for entry in journal.iter().filter(|entry| entry.outcome.is_none()) {
+    for entry in journal
+        .iter()
+        .filter(|entry| matches!(entry.outcome, None | Some(CancellationOutcome::Deferred)))
+    {
         let outcome = cancel(entry)?;
         let _guard = admission
             .as_ref()
