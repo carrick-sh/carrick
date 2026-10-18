@@ -1202,16 +1202,41 @@ fn host_poll_observation_defers_sigchld_without_retry() {
             );
         }
     }
-    // Install the same wait-timeout SIGCHLD handler used by mounted runs,
-    // without replacing a process-wide disposition in this witness.
-    assert!(
-        Command::new("/bin/true")
-            .timeout(Duration::from_secs(5))
-            .output()
-            .unwrap()
-            .status
-            .success()
+    // Hold the setup child alive until handler installation has completed.
+    // Keep stdin outside Child: wait_timeout otherwise closes it before
+    // initializing the handler, letting cat exit before registration.
+    let mut setup_child = ReapChild(
+        std::process::Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
     );
+    let _setup_input = setup_child.stdin.take().unwrap();
+    // Install the same wait-timeout SIGCHLD handler used by mounted runs,
+    // without replacing a process-wide disposition in this witness. The
+    // handler is initialized before wait_timeout checks child status, even
+    // for a zero duration. Child completion is not an initialization barrier:
+    // a timed assert_cmd output can kill its child and fail before ppoll.
+    // Keeping cat alive forces initialization-before-exit deterministically;
+    // requiring a successful exit here instead is red on this ordering.
+    assert_eq!(
+        setup_child.wait_timeout(Duration::ZERO).unwrap(),
+        None,
+        "handler installation must not depend on child completion"
+    );
+    // SAFETY: query only, with valid output storage. Handler installation
+    // belongs to wait-timeout, so no test replaces a shared disposition.
+    unsafe {
+        let mut action = std::mem::zeroed();
+        assert_eq!(
+            libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut action),
+            0
+        );
+        assert_ne!(action.sa_sigaction, libc::SIG_DFL);
+        assert_ne!(action.sa_sigaction, libc::SIG_IGN);
+    }
     // Give the caller an unrelated blocked signal. The observation must
     // preserve it, and must restore an initially unblocked SIGCHLD.
     // SAFETY: valid thread-local masks, no process-wide disposition change.
