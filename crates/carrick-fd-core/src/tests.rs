@@ -2212,3 +2212,74 @@ fn inherit_snapshot_survives_concurrent_move_to_already_scanned_slot() {
         assert_eq!(finalized, vec![1, 2, 3]);
     });
 }
+
+#[test]
+fn task_attach_rejects_invalid_shared_binding_links_before_effects() {
+    for corrupt_head in [true, false] {
+        let tasks = TaskHandleCore::<3>::new().unwrap();
+        let arena = TestArena::with_ofds_and_objects(0, 0);
+        let host = tasks.bind(arena, BoundedSpin(8));
+        let task = test_task_key(1, 1);
+        let original = host.create_task_table(task, 1, &mut storage(1)).unwrap();
+        let unbound = host
+            .authority()
+            .create_handle_table(1, &mut storage(1))
+            .unwrap();
+        let bucket = tasks
+            .buckets
+            .iter()
+            .find(|b| b.head.load(Ordering::Acquire) != 0)
+            .unwrap();
+        let link = if corrupt_head {
+            &bucket.head
+        } else {
+            &tasks.bindings[0].hash_next
+        };
+        let saved = link.load(Ordering::Acquire);
+        link.store(4, Ordering::Release);
+        // TaskId 5 shares task 1's bucket; it must walk past the existing row.
+        let result = host.attach_task_table(test_task_key(5, 1), unbound);
+        link.store(saved, Ordering::Release);
+        assert_eq!(result, Err(HandleError::BadBacking));
+        assert_eq!(host.table_id(task), Ok(original));
+        host.authority()
+            .destroy_handle_table(unbound, |_| {})
+            .unwrap();
+        host.exit_task(task, |_| {}).unwrap();
+    }
+}
+
+#[test]
+fn task_exit_rejects_invalid_shared_binding_links_before_effects() {
+    for corrupt_head in [true, false] {
+        let tasks = TaskHandleCore::<3>::new().unwrap();
+        let arena = TestArena::with_ofds_and_objects(0, 0);
+        let host = tasks.bind(arena, BoundedSpin(8));
+        let task = test_task_key(1, 1);
+        let original = host.create_task_table(task, 1, &mut storage(1)).unwrap();
+        let bucket = tasks
+            .buckets
+            .iter()
+            .find(|b| b.head.load(Ordering::Acquire) != 0)
+            .unwrap();
+        let link = if corrupt_head {
+            &bucket.head
+        } else {
+            &tasks.bindings[0].hash_next
+        };
+        let saved = link.load(Ordering::Acquire);
+        link.store(4, Ordering::Release);
+        let target = if corrupt_head {
+            task
+        } else {
+            test_task_key(5, 1)
+        };
+        let result = host.exit_task(target, |_| {
+            panic!("invalid link must refuse before release")
+        });
+        link.store(saved, Ordering::Release);
+        assert_eq!(result, Err(HandleError::BadBacking));
+        assert_eq!(host.table_id(task), Ok(original));
+        host.exit_task(task, |_| {}).unwrap();
+    }
+}

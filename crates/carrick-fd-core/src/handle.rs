@@ -2011,7 +2011,11 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> TaskHandleHost<'a, B, W, T
         let mut cur = guard.bucket.head.load(Ordering::Relaxed);
         while cur != 0 {
             let idx = (cur - 1) as usize;
-            let existing = &self.task_core.bindings[idx];
+            let existing = self
+                .task_core
+                .bindings
+                .get(idx)
+                .ok_or(HandleError::BadBacking)?;
             if existing.task_id.load(Ordering::Relaxed) == raw_id {
                 return Err(HandleError::InvalidHandle);
             }
@@ -2021,6 +2025,11 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> TaskHandleHost<'a, B, W, T
         let table_guard = auth.lock_unbound_handle_table(table)?;
         let binding_idx = self.pop_binding()?;
 
+        let record = self
+            .task_core
+            .bindings
+            .get(binding_idx)
+            .ok_or(HandleError::BadBacking)?;
         table_guard.record.begin_write();
         table_guard
             .record
@@ -2028,7 +2037,6 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> TaskHandleHost<'a, B, W, T
             .store(TABLE_LIVE_HANDLES | TABLE_BOUND_TASK, Ordering::Release);
         table_guard.record.end_write();
 
-        let record = &self.task_core.bindings[binding_idx];
         let head = guard.bucket.head.load(Ordering::Relaxed);
         guard.bucket.begin_write();
         record.task_id.store(raw_id, Ordering::Relaxed);
@@ -2315,7 +2323,11 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> TaskHandleHost<'a, B, W, T
         let mut found: Option<(usize, Option<usize>, u32, TableId)> = None;
         while cur != 0 {
             let idx = (cur - 1) as usize;
-            let record = &self.task_core.bindings[idx];
+            let record = self
+                .task_core
+                .bindings
+                .get(idx)
+                .ok_or(HandleError::BadBacking)?;
             let next = record.hash_next.load(Ordering::Relaxed);
             if record.task_id.load(Ordering::Relaxed) == raw_id
                 && record.task_serial.load(Ordering::Relaxed) == raw_serial
@@ -2344,12 +2356,22 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> TaskHandleHost<'a, B, W, T
         // Unlink the binding under the bucket seqlock, return the binding to
         // `free_bindings`, and drop `guard` (`TaskBucket` spinlock) BEFORE
         // running any finalizer.
-        let record = &self.task_core.bindings[binding_idx];
+        let record = self
+            .task_core
+            .bindings
+            .get(binding_idx)
+            .ok_or(HandleError::BadBacking)?;
+        let previous = prev_idx
+            .map(|idx| {
+                self.task_core
+                    .bindings
+                    .get(idx)
+                    .ok_or(HandleError::BadBacking)
+            })
+            .transpose()?;
         guard.bucket.begin_write();
-        if let Some(prev) = prev_idx {
-            self.task_core.bindings[prev]
-                .hash_next
-                .store(next, Ordering::Relaxed);
+        if let Some(prev) = previous {
+            prev.hash_next.store(next, Ordering::Relaxed);
         } else {
             guard.bucket.head.store(next, Ordering::Relaxed);
         }
