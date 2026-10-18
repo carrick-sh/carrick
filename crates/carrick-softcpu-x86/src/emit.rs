@@ -13,7 +13,7 @@ use crate::context::{
     CTX_VIRT_SPILL0_OFF, CTX_VIRT_SPILL1_OFF, EXIT_REASON_CFLOW, EXIT_REASON_CONTINUE,
     EXIT_REASON_EXCEPTION, EXIT_REASON_SENSITIVE, EXIT_REASON_SYSCALL, pack_slow_path_meta,
 };
-use crate::decode::{gpr_index, is_memory_kind, supported_body};
+use crate::decode::{gpr_index, is_fp_arithmetic, is_memory_kind, supported_body};
 
 /// Error returned if a block cannot be emitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,7 +109,8 @@ pub fn emit_block(block: &PlannedBlock) -> Result<EmittedBlock, EmitError> {
 }
 
 fn is_routed_to_complex_helper(insn: &Instruction) -> bool {
-    insn.is_string_instruction()
+    is_fp_arithmetic(insn)
+        || insn.is_string_instruction()
         || matches!(
             insn.mnemonic(),
             Mnemonic::Maskmovdqu

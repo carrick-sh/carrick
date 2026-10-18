@@ -52,6 +52,17 @@ pub enum SensitiveOp {
     Rdpkru,
     Wrpkru,
     Rdssp { reg: usize, is_64: bool },
+    Fnsave,
+    Fnstenv,
+    Fldenv,
+    Frstor,
+    Fwait,
+    Fxsave,
+    Fxrstor,
+    Xsave,
+    Xsaveopt,
+    Xsavec,
+    Xrstor,
 }
 
 impl SensitiveOp {
@@ -72,6 +83,17 @@ impl SensitiveOp {
                 | Self::Rdpkru
                 | Self::Wrpkru
                 | Self::Rdssp { .. }
+                | Self::Fnsave
+                | Self::Fnstenv
+                | Self::Fldenv
+                | Self::Frstor
+                | Self::Fwait
+                | Self::Fxsave
+                | Self::Fxrstor
+                | Self::Xsave
+                | Self::Xsaveopt
+                | Self::Xsavec
+                | Self::Xrstor
         )
     }
 }
@@ -241,6 +263,17 @@ fn classify_insn(insn: &Instruction, next_va: u64) -> InsnClass {
         Mnemonic::Xgetbv => Some(SensitiveOp::Xgetbv),
         Mnemonic::Rdpkru => Some(SensitiveOp::Rdpkru),
         Mnemonic::Wrpkru => Some(SensitiveOp::Wrpkru),
+        Mnemonic::Fnsave => Some(SensitiveOp::Fnsave),
+        Mnemonic::Fnstenv => Some(SensitiveOp::Fnstenv),
+        Mnemonic::Fldenv => Some(SensitiveOp::Fldenv),
+        Mnemonic::Frstor => Some(SensitiveOp::Frstor),
+        Mnemonic::Wait => Some(SensitiveOp::Fwait),
+        Mnemonic::Fxsave | Mnemonic::Fxsave64 => Some(SensitiveOp::Fxsave),
+        Mnemonic::Fxrstor | Mnemonic::Fxrstor64 => Some(SensitiveOp::Fxrstor),
+        Mnemonic::Xsave | Mnemonic::Xsave64 => Some(SensitiveOp::Xsave),
+        Mnemonic::Xsaveopt | Mnemonic::Xsaveopt64 => Some(SensitiveOp::Xsaveopt),
+        Mnemonic::Xsavec | Mnemonic::Xsavec64 => Some(SensitiveOp::Xsavec),
+        Mnemonic::Xrstor | Mnemonic::Xrstor64 => Some(SensitiveOp::Xrstor),
         _ => None,
     };
     if let Some(op) = simple {
@@ -374,8 +407,9 @@ pub const fn is_memory_kind(kind: OpKind) -> bool {
     )
 }
 
-/// Native admission is explicit. No VEX/EVEX/XOP, x87 arithmetic, host state,
-/// unknown-sized memory images, VSIB, or potentially trapping FP arithmetic.
+/// Body admission is explicit. Checked helpers serve FP and implicit memory
+/// before native copying. No VEX/EVEX/XOP, x87 arithmetic, host state, unknown
+/// memory images, VSIB, or unchecked FP operations reach native execution.
 /// Unsupported Level 0 instructions produce guest #UD, never a native fault.
 #[rustfmt::skip]
 pub(crate) fn supported_body(insn: &Instruction) -> bool {
@@ -415,6 +449,9 @@ pub(crate) fn supported_body(insn: &Instruction) -> bool {
     {
         return false;
     }
+    if is_fp_arithmetic(insn) {
+        return true;
+    }
     if insn.mnemonic() == Mnemonic::Cmpsd && !insn.is_string_instruction() { return false; }
     matches!(insn.mnemonic(),
         Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movsx | Mnemonic::Movsxd | Mnemonic::Lea
@@ -453,5 +490,49 @@ pub(crate) fn supported_body(insn: &Instruction) -> bool {
         | Mnemonic::Pshuflw | Mnemonic::Pshufw | Mnemonic::Maskmovdqu
         | Mnemonic::Lfence | Mnemonic::Sfence | Mnemonic::Mfence | Mnemonic::Prefetchnta
         | Mnemonic::Prefetcht0 | Mnemonic::Prefetcht1 | Mnemonic::Prefetcht2
+    )
+}
+
+/// SSE/SSE2 arithmetic whose only outputs are XMM data and MXCSR status.
+/// It executes only in the checked helper with masked native exceptions.
+pub(crate) fn is_fp_arithmetic(insn: &Instruction) -> bool {
+    if insn.is_string_instruction() {
+        return false;
+    }
+    let m = insn.mnemonic();
+    matches!(
+        m,
+        Mnemonic::Cmpsd
+            | Mnemonic::Cmpss
+            | Mnemonic::Cmpps
+            | Mnemonic::Cmppd
+            | Mnemonic::Addps
+            | Mnemonic::Addpd
+            | Mnemonic::Addss
+            | Mnemonic::Addsd
+            | Mnemonic::Subps
+            | Mnemonic::Subpd
+            | Mnemonic::Subss
+            | Mnemonic::Subsd
+            | Mnemonic::Mulps
+            | Mnemonic::Mulpd
+            | Mnemonic::Mulss
+            | Mnemonic::Mulsd
+            | Mnemonic::Divps
+            | Mnemonic::Divpd
+            | Mnemonic::Divss
+            | Mnemonic::Divsd
+            | Mnemonic::Sqrtps
+            | Mnemonic::Sqrtpd
+            | Mnemonic::Sqrtss
+            | Mnemonic::Sqrtsd
+            | Mnemonic::Minps
+            | Mnemonic::Minpd
+            | Mnemonic::Minss
+            | Mnemonic::Minsd
+            | Mnemonic::Maxps
+            | Mnemonic::Maxpd
+            | Mnemonic::Maxss
+            | Mnemonic::Maxsd
     )
 }
