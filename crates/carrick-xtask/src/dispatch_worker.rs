@@ -3,6 +3,7 @@ use crate::ci_scaler::{REPOSITORY, ScalerError};
 use crate::dispatch_redaction::{Gate, MAX_FILE_BYTES};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -25,7 +26,7 @@ pub enum DispatchAction {
         #[arg(long)]
         artifact: PathBuf,
     },
-    /// Foreground worker, bounded to 30 minutes plus publication/cleanup.
+    /// Credential-free foreground worker and artifact producer.
     Run {
         #[arg(long)]
         event: PathBuf,
@@ -740,6 +741,7 @@ fn require_owned_pr(root: &Path, dispatch: &Dispatch) -> Result<Value, ScalerErr
 // runner-owned destination. No Git command opens the candidate configuration.
 fn copy_tree(source: &Path, target: &Path, count: &mut usize) -> Result<(), ScalerError> {
     std::fs::create_dir(target)?;
+    std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o700))?;
     for entry in std::fs::read_dir(source)? {
         let entry = entry?;
         if matches!(entry.file_name().to_str(), Some("target" | ".git")) {
@@ -982,7 +984,6 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
     produce(&root, &dispatch, &setup)
 }
 fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerError> {
-    use std::os::unix::fs::PermissionsExt;
     let base =
         std::env::var("GITHUB_SHA").map_err(|_| ScalerError::Guard("missing admitted SHA"))?;
     if !sha(&base) || git(root, &["rev-parse", "HEAD"])?.trim() != base {
@@ -1026,6 +1027,7 @@ fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerEr
         std::fs::set_permissions(outer.path(), std::fs::Permissions::from_mode(0o711))?;
         let state = outer.path().join("agent");
         std::fs::create_dir(&state)?;
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))?;
         let bootstrap = crate::agent_runner::state()?;
         for name in ["home", "bin", "director"] {
             copy_tree(&bootstrap.join(name), &state.join(name), &mut 0)?;
@@ -1551,7 +1553,7 @@ Do it"
         snapshot(source.path(), &target, branch).unwrap();
         let config = std::fs::read_to_string(target.join(".git/config")).unwrap();
         assert!(!config.contains("evil") && !config.contains("fsmonitor"));
-        let gate = fixture_gate(&target);
+        let gate = Gate::capture().unwrap();
         assert!(
             checkpoint(
                 &target,
@@ -1567,9 +1569,6 @@ Do it"
         json!({"repository":{"full_name":REPOSITORY},"action":"labeled",
             "sender":{"login":"tjfontaine","type":"User"},"label":{"name":"dispatch:sol-high"},
             "issue":{"number":634,"user":{"login":"tjfontaine"},"title":"Dispatch workers!","body":"## Why\ncontext\n## Brief\nImplement it\n### Verify\nCheck it\n## Notes\nnot prompt"}})
-    }
-    fn fixture_gate(_root: &Path) -> Gate {
-        Gate::capture().unwrap()
     }
     fn fixture_repository(root: &Path) {
         git(root, &["init", "-b", "work/dispatch-634-pending"]).unwrap();
@@ -1658,7 +1657,7 @@ Do it"
         std::fs::create_dir(root.join("conformance-probes")).unwrap();
         std::os::unix::fs::symlink("/tmp", root.join("conformance-probes/target")).unwrap();
         let d = validate_event(&event(), TIERS, "tjfontaine").unwrap();
-        let gate = fixture_gate(root);
+        let gate = Gate::capture().unwrap();
         assert!(checkpoint(root, &d, &gate).unwrap());
         let message = git(root, &["log", "-1", "--format=%B"]).unwrap();
         assert!(message.contains("Co-Authored-By: GPT-6.1 Sol <noreply@openai.com>"));
