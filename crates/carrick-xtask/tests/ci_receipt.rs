@@ -4,10 +4,11 @@ use carrick_xtask::accept::{
     parse_failed_tests, parse_test_log, parse_unitemized_failures, populate_step_from_log,
 };
 use carrick_xtask::ci_receipt::{
-    Baseline, Lane, artifact_name, baseline_decision, diff, failure_keys, newest_receipt,
-    pick_candidate, trusted_baseline_run,
+    Baseline, Lane, RETIRED_TESTS_PATH, artifact_name, baseline_decision, diff, diff_trees,
+    diff_with_retired, failure_keys, load_retired_tests, newest_receipt, parse_retired_tests,
+    pick_candidate, tree_has_test, trusted_baseline_run,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn step(name: &str, passed: bool, failed: &[&str]) -> StepResult {
@@ -345,6 +346,10 @@ else:
             .args(["--candidate-sha", &deep, "--run-attempt", "1"])
             .arg("--download-dir")
             .arg(dir.path().join("download"))
+            .arg("--base-tree")
+            .arg(dir.path())
+            .arg("--candidate-tree")
+            .arg(dir.path())
             .args(["--wait-minutes", "0"])
             .env(
                 "PATH",
@@ -381,6 +386,10 @@ else:
                 .args(["--candidate-sha", &deep, "--run-attempt", "1"])
                 .arg("--download-dir")
                 .arg(dir.path().join("denied-download"))
+                .arg("--base-tree")
+                .arg(dir.path())
+                .arg("--candidate-tree")
+                .arg(dir.path())
                 .args(["--wait-minutes", "0"])
                 .env(
                     "PATH",
@@ -402,6 +411,130 @@ else:
                 String::from_utf8_lossy(&denied.stderr)
             );
         }
+
+        // Verify `ci-receipt gate` fetches `candidate_sha` from `origin` and reads
+        // `.github/retired-tests.toml` from the candidate commit when checked out at `base_sha`.
+        let origin = dir.path().join("origin.git");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |cwd: &Path, args: &[&str]| -> String {
+            let out = Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "T")
+                .env("GIT_AUTHOR_EMAIL", "t@e")
+                .env("GIT_COMMITTER_NAME", "T")
+                .env("GIT_COMMITTER_EMAIL", "t@e")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        git(dir.path(), &["init", "--bare", origin.to_str().unwrap()]);
+        git(&work, &["init"]);
+        git(
+            &work,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        write_test_tree(
+            &work,
+            "#[test]\nfn wait4_rejects_unwritable_rusage_without_writing_status() {}\n",
+            None,
+        );
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-m", "base"]);
+        let base_sha = git(&work, &["rev-parse", "HEAD"]);
+        git(&work, &["push", "origin", "HEAD:refs/heads/main"]);
+        write_test_tree(
+            &work,
+            "#[test]\nfn wait4_writes_status_before_unwritable_rusage_efault() {}\n",
+            Some(PR583_RETIRED_TOML),
+        );
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-m", "cand"]);
+        let cand_sha = git(&work, &["rev-parse", "HEAD"]);
+        git(
+            &work,
+            &[
+                "push",
+                "origin",
+                "HEAD:refs/heads/gh-readonly-queue/main/pr-583",
+            ],
+        );
+        let checkout = dir.path().join("gate-checkout");
+        git(
+            dir.path(),
+            &[
+                "clone",
+                "--no-tags",
+                "--branch",
+                "main",
+                "--single-branch",
+                origin.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+        );
+        assert!(!checkout.join(RETIRED_TESTS_PATH).exists());
+
+        let mut git_base = cpl0_receipt(
+            &["wait4_rejects_unwritable_rusage_without_writing_status"],
+            &[],
+        );
+        git_base.head = base_sha.clone();
+        std::fs::write(&baseline_file, serde_json::to_vec(&git_base).unwrap()).unwrap();
+        let mut git_cand = cpl0_receipt(
+            &["wait4_writes_status_before_unwritable_rusage_efault"],
+            &[],
+        );
+        git_cand.head = cand_sha.clone();
+        let cand_art = candidate_dir.join(artifact_name(Lane::Hvf, &cand_sha, 1));
+        std::fs::create_dir_all(&cand_art).unwrap();
+        std::fs::write(
+            cand_art.join("receipt.json"),
+            serde_json::to_vec(&git_cand).unwrap(),
+        )
+        .unwrap();
+
+        let fetched = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .current_dir(&checkout)
+            .args([
+                "ci-receipt",
+                "gate",
+                "--lane",
+                "hvf",
+                "--base-sha",
+                &base_sha,
+            ])
+            .arg("--candidate-dir")
+            .arg(&candidate_dir)
+            .args(["--candidate-sha", &cand_sha, "--run-attempt", "1"])
+            .arg("--download-dir")
+            .arg(dir.path().join("git-download"))
+            .args(["--wait-minutes", "0"])
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("CHAIN_MAIN", &base_sha)
+            .env("CHAIN_HEAD", &head)
+            .env("CHAIN_MIDDLE", &middle)
+            .env("CHAIN_DEEP", &cand_sha)
+            .env("CHAIN_BASE_RECEIPT", &baseline_file)
+            .output()
+            .unwrap();
+        assert!(
+            fetched.status.success(),
+            "stderr={}",
+            String::from_utf8_lossy(&fetched.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&fetched.stdout)
+                .contains(&format!("receipt diff against {base_sha}: 0 NEW"))
+        );
     }
 }
 
@@ -833,5 +966,204 @@ test-signed: FAIL /w/target/release/deps/el1_kick_served_loop-4bc14b20aecdb3a9
             "unfinished:el1_kick_served_loop",
             "unitemized:el1-embed:crash:el1_kick_served_loop",
         ]
+    );
+}
+
+fn write_test_tree(root: &Path, cpl0_source: &str, retired_toml: Option<&str>) {
+    let test_file = root.join("crates/carrick-vmm-kvm/tests/cpl0_fork_e2e.rs");
+    std::fs::create_dir_all(test_file.parent().unwrap()).unwrap();
+    std::fs::write(&test_file, cpl0_source).unwrap();
+    if let Some(toml_body) = retired_toml {
+        let toml_path = root.join(RETIRED_TESTS_PATH);
+        std::fs::create_dir_all(toml_path.parent().unwrap()).unwrap();
+        std::fs::write(&toml_path, toml_body).unwrap();
+    }
+}
+
+fn cpl0_receipt(started: &[&str], failed: &[&str]) -> AcceptReceipt {
+    let mut s = step("kvm-tests", failed.is_empty(), failed);
+    s.started_tests = started.iter().map(|t| (*t).to_owned()).collect();
+    s.finished_binaries = vec!["cpl0_fork_e2e".into()];
+    receipt(vec![s])
+}
+
+const OLD_WAIT4: &str = "cpl0_fork_e2e::wait4_rejects_unwritable_rusage_without_writing_status";
+const NEW_WAIT4: &str = "cpl0_fork_e2e::wait4_writes_status_before_unwritable_rusage_efault";
+const PR583_RETIRED_TOML: &str = r#"[[retired]]
+test = "cpl0_fork_e2e::wait4_rejects_unwritable_rusage_without_writing_status"
+replaced_by = "cpl0_fork_e2e::wait4_writes_status_before_unwritable_rusage_efault"
+reason = "Linux reaps and writes status before -EFAULT on an unwritable rusage"
+pr = 583
+"#;
+
+#[test]
+fn declared_rename_passes_and_undeclared_disappearance_stays_new() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base_tree, cand_tree) = (dir.path().join("base"), dir.path().join("cand"));
+    write_test_tree(
+        &base_tree,
+        "#[test]\nfn wait4_rejects_unwritable_rusage_without_writing_status() {}\n#[test]\nfn undeclared_disappearance() {}\n",
+        None,
+    );
+    write_test_tree(
+        &cand_tree,
+        "// Renamed from wait4_rejects_unwritable_rusage_without_writing_status\n#[test]\nfn wait4_writes_status_before_unwritable_rusage_efault() {}\n",
+        Some(PR583_RETIRED_TOML),
+    );
+    assert!(
+        tree_has_test(
+            &base_tree,
+            "cpl0_fork_e2e",
+            "wait4_rejects_unwritable_rusage_without_writing_status"
+        )
+        .unwrap()
+    );
+    assert!(
+        !tree_has_test(
+            &cand_tree,
+            "cpl0_fork_e2e",
+            "wait4_rejects_unwritable_rusage_without_writing_status"
+        )
+        .unwrap()
+    );
+
+    let base_receipt = cpl0_receipt(&[OLD_WAIT4, "cpl0_fork_e2e::keep_passing"], &[]);
+    let cand_receipt = cpl0_receipt(&[NEW_WAIT4, "cpl0_fork_e2e::keep_passing"], &[]);
+
+    assert_eq!(
+        diff(&base_receipt, &cand_receipt).unwrap().new,
+        vec![format!("missing:{OLD_WAIT4}")]
+    );
+    let declared = diff_trees(&base_receipt, &cand_receipt, &base_tree, &cand_tree).unwrap();
+    assert!(declared.new.is_empty(), "got: {:?}", declared.new);
+
+    let base_with_extra = cpl0_receipt(
+        &[
+            OLD_WAIT4,
+            "cpl0_fork_e2e::keep_passing",
+            "cpl0_fork_e2e::undeclared_disappearance",
+        ],
+        &[],
+    );
+    let partial = diff_trees(&base_with_extra, &cand_receipt, &base_tree, &cand_tree).unwrap();
+    assert_eq!(
+        partial.new,
+        vec!["missing:cpl0_fork_e2e::undeclared_disappearance"]
+    );
+}
+
+#[test]
+fn declared_retired_test_still_in_source_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base_tree, cand_tree) = (dir.path().join("base"), dir.path().join("cand"));
+    let both_fns = "#[test]\nfn wait4_rejects_unwritable_rusage_without_writing_status() {}\n#[test]\nfn wait4_writes_status_before_unwritable_rusage_efault() {}\n";
+    write_test_tree(&base_tree, both_fns, None);
+    write_test_tree(&cand_tree, both_fns, Some(PR583_RETIRED_TOML));
+
+    let err = diff_trees(
+        &cpl0_receipt(&[OLD_WAIT4], &[]),
+        &cpl0_receipt(&[NEW_WAIT4], &[]),
+        &base_tree,
+        &cand_tree,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("still exists in candidate source"),
+        "{err}"
+    );
+}
+
+#[test]
+fn replaced_by_that_never_started_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base_tree, cand_tree) = (dir.path().join("base"), dir.path().join("cand"));
+    write_test_tree(
+        &base_tree,
+        "#[test]\nfn wait4_rejects_unwritable_rusage_without_writing_status() {}\n",
+        None,
+    );
+    write_test_tree(
+        &cand_tree,
+        "#[test]\nfn wait4_writes_status_before_unwritable_rusage_efault() {}\n",
+        Some(PR583_RETIRED_TOML),
+    );
+
+    let err = diff_trees(
+        &cpl0_receipt(&[OLD_WAIT4], &[]),
+        &cpl0_receipt(&["cpl0_fork_e2e::unrelated_test"], &[]),
+        &base_tree,
+        &cand_tree,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("did not start in candidate receipt"),
+        "{err}"
+    );
+}
+
+#[test]
+fn failing_test_cannot_be_retired() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base_tree, cand_tree) = (dir.path().join("base"), dir.path().join("cand"));
+    write_test_tree(
+        &base_tree,
+        "#[test]\nfn wait4_rejects_unwritable_rusage_without_writing_status() {}\n",
+        None,
+    );
+    write_test_tree(
+        &cand_tree,
+        "#[test]\nfn wait4_writes_status_before_unwritable_rusage_efault() {}\n",
+        Some(PR583_RETIRED_TOML),
+    );
+
+    for (base_r, cand_r) in [
+        (
+            cpl0_receipt(&[OLD_WAIT4], &[OLD_WAIT4]),
+            cpl0_receipt(&[NEW_WAIT4], &[]),
+        ),
+        (
+            cpl0_receipt(&[OLD_WAIT4], &[]),
+            cpl0_receipt(&[OLD_WAIT4, NEW_WAIT4], &[OLD_WAIT4]),
+        ),
+    ] {
+        let err = diff_trees(&base_r, &cand_r, &base_tree, &cand_tree).unwrap_err();
+        assert!(err.to_string().contains("cannot be retired"), "{err}");
+    }
+}
+
+#[test]
+fn stale_declaration_fails_when_test_already_absent_at_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base_tree, cand_tree) = (dir.path().join("base"), dir.path().join("cand"));
+    write_test_tree(
+        &base_tree,
+        "#[test]\nfn wait4_writes_status_before_unwritable_rusage_efault() {}\n",
+        None,
+    );
+    write_test_tree(
+        &cand_tree,
+        "#[test]\nfn wait4_writes_status_before_unwritable_rusage_efault() {}\n",
+        Some(PR583_RETIRED_TOML),
+    );
+
+    let r = cpl0_receipt(&[NEW_WAIT4], &[]);
+    let err = diff_trees(&r, &r, &base_tree, &cand_tree).unwrap_err();
+    assert!(
+        err.to_string().contains("stale retired-test declaration"),
+        "{err}"
+    );
+    let empty_err =
+        parse_retired_tests("retired = []\n", Path::new(RETIRED_TESTS_PATH)).unwrap_err();
+    assert!(
+        empty_err.to_string().contains("delete the file when empty"),
+        "{empty_err}"
+    );
+    assert!(load_retired_tests(&base_tree).unwrap().is_empty());
+    assert!(
+        diff_with_retired(&r, &r, &[], &base_tree, &cand_tree)
+            .unwrap()
+            .new
+            .is_empty()
     );
 }
