@@ -671,7 +671,7 @@ fn unsupported_ymm_state_is_neither_advertised_nor_executed() {
 #[test]
 fn gateway_returns_with_host_df_and_fp_controls_restored() {
     // Capture DF in a native wrapper immediately after the translated exit,
-    // then clear it before returning to Rust even on the broken gateway.
+    // then restore host DF/FP controls before Rust even on the broken gateway.
     use carrick_softcpu_x86::{
         context::softcpu_enter_translated, emit_block, plan_block_from_memory,
     };
@@ -690,7 +690,8 @@ fn gateway_returns_with_host_df_and_fp_controls_restored() {
     wrapper
         .extend_from_slice(&(softcpu_enter_translated as *const () as usize as u64).to_le_bytes());
     wrapper.extend_from_slice(&[
-        0xff, 0xd0, 0x9c, 0x58, 0xfc, 0x0f, 0xae, 0x5b, 8, 0xd9, 0x7b, 12, 0x5b, 0xc3,
+        0xff, 0xd0, 0x9c, 0x58, 0xfc, 0x0f, 0xae, 0x5b, 8, 0xd9, 0x7b, 12, 0x0f, 0xae, 0x13, 0xd9,
+        0x6b, 4, 0x5b, 0xc3,
     ]);
     let mut wrapper_jit = JitCodeBuffer::new(4096).unwrap();
     let entry = wrapper_jit.publish(&wrapper).unwrap();
@@ -826,7 +827,7 @@ fn breakpoints_and_software_interrupts_have_typed_exits() {
 }
 
 #[test]
-fn guest_rsp_is_virtual_across_native_ops_memory_helpers_and_exits() {
+fn guest_rsp_values_survive_native_ops_memory_helpers_and_exits() {
     // mov rsp,1; mov rax,rsp; add rsp,7; mov [rsp],rax
     let (mut cpu, mut mem, va) = setup_snippet(&[
         0xbc, 1, 0, 0, 0, 0x48, 0x89, 0xe0, 0x48, 0x83, 0xc4, 7, 0x48, 0x89, 0x04, 0x24,
