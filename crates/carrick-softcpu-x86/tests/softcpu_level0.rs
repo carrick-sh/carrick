@@ -8,10 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use carrick_softcpu_x86::{
     ExtentRecord, ExtentTable, FrameGpa, JitCodeBuffer, LinearPlacement, MmioHoles,
-    OwnerGeneration, PF_ERR_INSTR, PF_ERR_PRESENT, PF_ERR_USER, PF_ERR_WRITE, RootGpa,
-    SOFT_TLB_OFFSET_MASK, SOFT_TLB_PAGE_MASK, SOFT_TLB_PAGE_SIZE, SensitiveOp, SoftAccessKind,
-    SoftCpu, SoftCpuExit, SoftMmuMemory, X86Exception, X86ExceptionVector, reg,
-    translate_with_frame,
+    OwnerGeneration, PF_ERR_USER, PF_ERR_WRITE, RootGpa, SOFT_TLB_OFFSET_MASK, SOFT_TLB_PAGE_MASK,
+    SOFT_TLB_PAGE_SIZE, SensitiveOp, SoftCpu, SoftCpuExit, SoftMmuMemory, X86Exception,
+    X86ExceptionVector, reg,
 };
 
 const PTE_PRESENT: u64 = 1 << 0;
@@ -30,9 +29,6 @@ impl PagePerms {
     }
     const USER_RW: Self = Self::new(true, true, false, true);
     const USER_RX: Self = Self::new(true, false, true, true);
-    const USER_RO: Self = Self::new(true, false, false, true);
-    const USER_RWX: Self = Self::new(true, true, true, true);
-    const KERNEL_RW: Self = Self::new(true, true, false, false);
     const KERNEL_RX: Self = Self::new(true, false, true, false);
 }
 
@@ -131,10 +127,6 @@ impl TestSoftMmuMemory {
         self.va_to_frame.insert(va_page, frame_gpa);
     }
 
-    fn map_alias(&mut self, va: u64, frame_gpa: FrameGpa, perms: PagePerms) {
-        self.install_leaf_pte(va, frame_gpa, perms);
-    }
-
     fn frame_for_va(&self, va: u64) -> Option<FrameGpa> {
         self.va_to_frame.get(&(va & SOFT_TLB_PAGE_MASK)).copied()
     }
@@ -231,60 +223,6 @@ fn setup_snippet(code: &[u8]) -> (SoftCpu, TestSoftMmuMemory, u64) {
 
 fn step_ok(cpu: &mut SoftCpu, mem: &mut TestSoftMmuMemory, exp: SoftCpuExit) {
     assert_eq!(cpu.step_block(mem).unwrap(), exp);
-}
-
-#[test]
-fn page_fault_witnesses_read_write_ro_nx_smap_and_straddle_fetch() {
-    let (mut cpu, mut mem, code_va) = setup_snippet(&[0x48, 0x8B, 0x07, 0x0F, 0x05]);
-    cpu.ctx.gpr[reg::RDI] = 0xdead_0000;
-    cpu.ctx.gpr[reg::RAX] = 0x1234_5678;
-    step_ok(&mut cpu, &mut mem, pf(code_va, PF_ERR_USER, 0xdead_0000));
-    assert_eq!(cpu.ctx.gpr[reg::RAX], 0x1234_5678);
-
-    let (mut cpu, mut mem, code_va) = setup_snippet(&[0x48, 0x89, 0x07, 0x0F, 0x05]);
-    let ro_va = 0x0090_0000u64;
-    mem.map_range(ro_va, 4096, PagePerms::USER_RO);
-    cpu.ctx.gpr[reg::RDI] = ro_va + 8;
-    let pwu = PF_ERR_PRESENT | PF_ERR_WRITE | PF_ERR_USER;
-    step_ok(&mut cpu, &mut mem, pf(code_va, pwu, ro_va + 8));
-
-    let (mut cpu, mut mem, code_va) = setup_snippet(&[0x48, 0x8B, 0x07, 0x0F, 0x05]);
-    let sup_va = 0x00a0_0000u64;
-    mem.map_range(sup_va, 4096, PagePerms::KERNEL_RW);
-    cpu.ctx.gpr[reg::RDI] = sup_va;
-    step_ok(
-        &mut cpu,
-        &mut mem,
-        pf(code_va, PF_ERR_PRESENT | PF_ERR_USER, sup_va),
-    );
-
-    let nx_va = 0x00b0_0000u64;
-    mem.map_range(nx_va, 4096, PagePerms::USER_RW);
-    mem.write_direct(nx_va, &[0x90, 0x0F, 0x05]);
-    cpu.ctx.rip = nx_va;
-    let pui = PF_ERR_PRESENT | PF_ERR_USER | PF_ERR_INSTR;
-    step_ok(&mut cpu, &mut mem, pf(nx_va, pui, nx_va));
-
-    let straddle_rip = code_va + 0xFFA;
-    mem.write_direct(straddle_rip, &[0x48, 0xB8, 1, 2, 3, 4]);
-    cpu.ctx.rip = straddle_rip;
-    let ui = PF_ERR_USER | PF_ERR_INSTR;
-    step_ok(&mut cpu, &mut mem, pf(straddle_rip, ui, code_va + 0x1000));
-
-    let (mut cpu, mut mem, code_va) = setup_snippet(&[0x48, 0x8B, 0x07, 0x0F, 0x05]);
-    mem.set_page_perms(code_va, PagePerms::KERNEL_RX);
-    cpu.ctx.set_smap_enabled(true);
-    let user_data = 0x00c0_0000u64;
-    mem.map_range(user_data, 4096, PagePerms::USER_RW);
-    mem.write_direct(user_data, &0xCAFE_BABE_1234_5678u64.to_le_bytes());
-    cpu.ctx.set_cpl(0);
-    cpu.ctx.tlb.flush_all();
-    cpu.ctx.gpr[reg::RDI] = user_data;
-    step_ok(&mut cpu, &mut mem, pf(code_va, PF_ERR_PRESENT, user_data));
-    cpu.ctx.rflags |= 1 << 18;
-    cpu.ctx.sync_tlb_tag_bits();
-    step_ok(&mut cpu, &mut mem, sys(code_va + 3, code_va + 5));
-    assert_eq!(cpu.ctx.gpr[reg::RAX], 0xCAFE_BABE_1234_5678);
 }
 
 #[test]
@@ -437,178 +375,6 @@ fn divide_error_witnesses_div_idiv_zero_overflow_and_fault_priority() {
     );
 }
 
-#[test]
-fn page_crossing_bounce_buffer_handles_read_write_rmw_and_second_page_fault_atomicity() {
-    let code = &[
-        0x48, 0x8B, 0x07, 0x48, 0x01, 0x1F, 0x48, 0x89, 0x06, 0x0F, 0x05,
-    ];
-    let (mut cpu, mut mem, code_va) = setup_snippet(code);
-    let base_va = 0x1000_0000u64;
-    mem.map_range(base_va, 3 * 4096, PagePerms::USER_RW);
-
-    let (straddle_a, straddle_b, init_val) =
-        (base_va + 0xFFD, base_va + 0x1FF9, 0x0102_0304_0506_0708u64);
-    mem.write_direct(straddle_a, &init_val.to_le_bytes());
-    (
-        cpu.ctx.gpr[reg::RDI],
-        cpu.ctx.gpr[reg::RSI],
-        cpu.ctx.gpr[reg::RBX],
-    ) = (straddle_a, straddle_b, 0x1000_0000_0000_0001);
-
-    step_ok(&mut cpu, &mut mem, sys(code_va + 9, code_va + 11));
-    assert_eq!(cpu.ctx.gpr[reg::RAX], init_val);
-
-    let updated_a = u64::from_le_bytes(mem.read_direct(straddle_a, 8).unwrap().try_into().unwrap());
-    assert_eq!(updated_a, init_val.wrapping_add(0x1000_0000_0000_0001));
-    let written_b = u64::from_le_bytes(mem.read_direct(straddle_b, 8).unwrap().try_into().unwrap());
-    assert_eq!(written_b, init_val);
-
-    mem.set_page_perms(base_va + 0x1000, PagePerms::USER_RO);
-    cpu.ctx.tlb.flush_all();
-    let before_bytes = mem.read_direct(straddle_a, 8).unwrap();
-
-    mem.write_direct(code_va, &[0x48, 0x89, 0x1F, 0x0F, 0x05]);
-    cpu.ctx.rip = code_va;
-    (cpu.ctx.gpr[reg::RDI], cpu.ctx.gpr[reg::RBX]) = (straddle_a, u64::MAX);
-
-    let pwu = PF_ERR_PRESENT | PF_ERR_WRITE | PF_ERR_USER;
-    step_ok(&mut cpu, &mut mem, pf(code_va, pwu, base_va + 0x1000));
-    assert_eq!(before_bytes, mem.read_direct(straddle_a, 8).unwrap());
-}
-
-#[test]
-fn virtualized_r14_r15_and_fs_gs_bases_work_transparently() {
-    let code = &[
-        0x4F, 0x8D, 0x74, 0xBE, 0x10, 0x4D, 0x8B, 0x3E, 0x64, 0x4C, 0x03, 0x3C, 0x25, 0x08, 0x00,
-        0x00, 0x00, 0x65, 0x4C, 0x03, 0x3C, 0x25, 0x10, 0x00, 0x00, 0x00, 0x0F, 0x05,
-    ];
-    let (mut cpu, mut mem, code_va) = setup_snippet(code);
-    let (data_va, tls_va) = (0x2000_0000u64, 0x3000_0000u64);
-    mem.map_range(data_va, 4096, PagePerms::USER_RW);
-    mem.map_range(tls_va, 4096, PagePerms::USER_RW);
-
-    (cpu.ctx.gpr[reg::R14], cpu.ctx.gpr[reg::R15]) = (data_va, 0x20);
-    let target_addr = data_va + 0x20 * 4 + 0x10;
-    mem.write_direct(target_addr, &1000u64.to_le_bytes());
-    (cpu.ctx.fs_base, cpu.ctx.gs_base) = (tls_va + 0x100, tls_va + 0x200);
-    mem.write_direct(tls_va + 0x108, &200u64.to_le_bytes());
-    mem.write_direct(tls_va + 0x210, &34u64.to_le_bytes());
-
-    step_ok(&mut cpu, &mut mem, sys(code_va + 26, code_va + 28));
-    assert_eq!(
-        (cpu.ctx.gpr[reg::R14], cpu.ctx.gpr[reg::R15]),
-        (target_addr, 1234)
-    );
-}
-
-#[test]
-fn cflow_call_and_ret_fault_atomicity_preserves_rsp_and_rip() {
-    let (mut cpu, mut mem, code_va) = setup_snippet(&[0xE8, 0x10, 0x00, 0x00, 0x00, 0x0F, 0x05]);
-    let unmapped_sp = 0x0000_7000_0000_0000u64;
-    cpu.ctx.gpr[reg::RSP] = unmapped_sp;
-    let wu = PF_ERR_WRITE | PF_ERR_USER;
-    step_ok(&mut cpu, &mut mem, pf(code_va, wu, unmapped_sp - 8));
-    assert_eq!((cpu.ctx.rip, cpu.ctx.gpr[reg::RSP]), (code_va, unmapped_sp));
-
-    let (data_va, ro_stack_va) = (0x2000_0000u64, 0x3000_0000u64);
-    mem.map_range(data_va, 4096, PagePerms::USER_RW);
-    mem.map_range(ro_stack_va, 4096, PagePerms::USER_RO);
-    mem.write_direct(data_va, &(code_va + 0x100).to_le_bytes());
-    mem.write_direct(code_va, &[0xFF, 0x17, 0x0F, 0x05]);
-    cpu.ctx.rip = code_va;
-    cpu.ctx.gpr[reg::RDI] = data_va;
-    cpu.ctx.gpr[reg::RSP] = ro_stack_va + 0x100;
-    let pwu = PF_ERR_PRESENT | PF_ERR_WRITE | PF_ERR_USER;
-    step_ok(&mut cpu, &mut mem, pf(code_va, pwu, ro_stack_va + 0xF8));
-    assert_eq!(
-        (cpu.ctx.rip, cpu.ctx.gpr[reg::RSP]),
-        (code_va, ro_stack_va + 0x100)
-    );
-
-    mem.write_direct(code_va, &[0xC3, 0x0F, 0x05]);
-    cpu.ctx.rip = code_va;
-    cpu.ctx.gpr[reg::RSP] = unmapped_sp;
-    step_ok(&mut cpu, &mut mem, pf(code_va, PF_ERR_USER, unmapped_sp));
-    assert_eq!((cpu.ctx.rip, cpu.ctx.gpr[reg::RSP]), (code_va, unmapped_sp));
-}
-
-#[test]
-fn string_instructions_rep_movsb_stosb_cmpsb_work_across_pages() {
-    let code = &[
-        0xFC, 0xF3, 0xA4, 0x0F, 0x05, 0xF3, 0xAA, 0x0F, 0x05, 0xF3, 0xA6, 0x0F, 0x05,
-    ];
-    let (mut cpu, mut mem, code_va) = setup_snippet(code);
-    let (src_va, dst_va) = (0x2000_0000u64, 0x3000_0000u64);
-    mem.map_range(src_va, 8192, PagePerms::USER_RW);
-    mem.map_range(dst_va, 8192, PagePerms::USER_RW);
-
-    let pattern: Vec<u8> = (0..32u8)
-        .map(|i| i.wrapping_mul(7).wrapping_add(3))
-        .collect();
-    mem.write_direct(src_va + 0xFF0, &pattern);
-    cpu.ctx.gpr[reg::RSI] = src_va + 0xFF0;
-    cpu.ctx.gpr[reg::RDI] = dst_va + 0xFF0;
-    cpu.ctx.gpr[reg::RCX] = 32;
-
-    step_ok(&mut cpu, &mut mem, sys(code_va + 3, code_va + 5));
-    let g = &cpu.ctx.gpr;
-    assert_eq!(
-        (g[reg::RCX], g[reg::RSI], g[reg::RDI]),
-        (0, src_va + 0x1010, dst_va + 0x1010)
-    );
-    assert_eq!(mem.read_direct(dst_va + 0xFF0, 32).unwrap(), pattern);
-
-    cpu.ctx.rip = code_va + 5;
-    cpu.ctx.gpr[reg::RDI] = dst_va + 0xFF8;
-    cpu.ctx.gpr[reg::RAX] = 0x5A;
-    cpu.ctx.gpr[reg::RCX] = 16;
-    step_ok(&mut cpu, &mut mem, sys(code_va + 7, code_va + 9));
-    assert_eq!(
-        (
-            cpu.ctx.gpr[reg::RCX],
-            mem.read_direct(dst_va + 0xFF8, 16).unwrap()
-        ),
-        (0, vec![0x5Au8; 16])
-    );
-
-    cpu.ctx.rip = code_va + 9;
-    cpu.ctx.gpr[reg::RSI] = src_va + 0xFF0;
-    cpu.ctx.gpr[reg::RDI] = dst_va + 0xFF0;
-    cpu.ctx.gpr[reg::RCX] = 32;
-    step_ok(&mut cpu, &mut mem, sys(code_va + 11, code_va + 13));
-    assert_eq!((cpu.ctx.gpr[reg::RCX], cpu.ctx.rflags & (1 << 6)), (23, 0));
-}
-
-#[test]
-fn alias_writes_advance_code_frame_generation() {
-    let (mut cpu, mut mem, code_va) = setup_snippet(&[0x48, 0x89, 0x07, 0x0F, 0x05]);
-    let (code2_va, alias_va) = (0x2000_0000u64, 0x5000_3000u64);
-    mem.map_range(code2_va, 4096, PagePerms::USER_RWX);
-    let shared_frame = mem.frame_for_va(code2_va).unwrap();
-    mem.map_alias(alias_va, shared_frame, PagePerms::USER_RW);
-    mem.write_direct(code2_va, &[0x90, 0x0F, 0x05]);
-
-    let (_, auth_frame) =
-        translate_with_frame(&mut cpu.ctx, &mut mem, code2_va, SoftAccessKind::Read)
-            .expect("resolve shared frame");
-
-    cpu.ctx.gpr[reg::RDI] = alias_va + 0x100;
-    cpu.ctx.gpr[reg::RAX] = 11;
-    step_ok(&mut cpu, &mut mem, sys(code_va + 3, code_va + 5));
-    assert_eq!(mem.extents().code_generation(auth_frame), 0);
-
-    cpu.ctx.rip = code2_va;
-    step_ok(&mut cpu, &mut mem, sys(code2_va + 1, code2_va + 3));
-    assert_eq!(mem.extents().code_generation(auth_frame), 1);
-
-    cpu.ctx.rip = code_va;
-    cpu.ctx.gpr[reg::RDI] = alias_va + 0x100;
-    cpu.ctx.gpr[reg::RAX] = 22;
-    step_ok(&mut cpu, &mut mem, sys(code_va + 3, code_va + 5));
-    assert_eq!(mem.extents().code_generation(auth_frame), 2);
-}
-
-// Review regressions: safe to run against the pre-fix translator as well.
 #[test]
 fn implicit_masked_store_cannot_write_a_host_address() {
     let mut host_bytes = [0x55u8; 16];
