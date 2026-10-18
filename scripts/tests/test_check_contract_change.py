@@ -2562,6 +2562,72 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
                 self.assertEqual(res.returncode, 1, msg=f"label={label}\nstdout: {res.stdout}\nstderr: {res.stderr}")
                 self.assertIn("does not reference changed surface", res.stderr)
 
+    def test_new6_local_merge_head_uses_merge_base_with_origin_main_not_first_parent(self):
+        """NEW-6: justfile check-contract-change must use merge-base with origin/main on a local merge HEAD, never head^1..head."""
+        justfile_text = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+        m = re.search(
+            r"^check-contract-change base head=\"HEAD\":\n((?:    .*\n)+)",
+            justfile_text,
+            re.M,
+        )
+        self.assertIsNotNone(m, "check-contract-change recipe not found in justfile")
+        recipe_body = "\n".join(line[4:] for line in m.group(1).splitlines())
+
+        def run_just_recipe(base_arg: str, head_arg: str = "HEAD", extra_env: dict[str, str] | None = None):
+            script = recipe_body.replace("{{base}}", base_arg).replace("{{head}}", head_arg)
+            script = script.replace(
+                "scripts/conformance/check-contract-change.py",
+                str(SCRIPT_PATH),
+            )
+            env = os.environ.copy()
+            env.pop("GITHUB_REF", None)
+            if extra_env:
+                env.update(extra_env)
+            return subprocess.run(
+                ["bash", "-c", script],
+                cwd=self.repo,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.use_single_contract_surface()
+        self._write_futex_contract('docker = "probe:futex"\n')
+        b0_sha = self._commit_all("seed b0 base")
+        subprocess.run(["git", "update-ref", "refs/remotes/origin/main", b0_sha], cwd=self.repo, check=True)
+
+        # Create origin/main commit M1 (doc-only change) on a side branch
+        subprocess.run(["git", "checkout", "-b", "upstream-main", b0_sha], cwd=self.repo, check=True, capture_output=True)
+        (self.repo / "README.md").write_text("upstream main doc update\n", encoding="utf-8")
+        m1_sha = self._commit_all("upstream main doc commit")
+        subprocess.run(["git", "update-ref", "refs/remotes/origin/main", m1_sha], cwd=self.repo, check=True)
+
+        # Back on main (feature branch): make an un-evidenced guest surface edit, then merge origin/main
+        subprocess.run(["git", "checkout", "main"], cwd=self.repo, check=True, capture_output=True)
+        self.guest_file.write_text("pub fn local_branch_untested_change() -> i32 { 99 }\n", encoding="utf-8")
+        self._commit_all("feature branch untested futex change")
+        subprocess.run(["git", "merge", "--no-edit", "origin/main"], cwd=self.repo, check=True, capture_output=True)
+
+        # (a) Local merge HEAD with un-evidenced branch commit MUST fail (must not diff HEAD^1..HEAD)
+        res_a = run_just_recipe(m1_sha, "HEAD")
+        self.assertEqual(res_a.returncode, 1, msg=f"case a stdout: {res_a.stdout}\nstderr: {res_a.stderr}")
+
+        # (b) If origin/main advanced with a surface commit (already landed on main) and was merged into a
+        # doc-only feature branch, passing stale b0_sha locally must diff from merge-base(origin/main, HEAD) = m2_sha
+        subprocess.run(["git", "checkout", "upstream-main"], cwd=self.repo, check=True, capture_output=True)
+        self.guest_file.write_text("pub fn landed_on_origin_main() -> i32 { 1 }\n", encoding="utf-8")
+        m2_sha = self._commit_all("origin/main landed surface commit")
+        subprocess.run(["git", "update-ref", "refs/remotes/origin/main", m2_sha], cwd=self.repo, check=True)
+
+        subprocess.run(["git", "checkout", "-b", "doc-feature", b0_sha], cwd=self.repo, check=True, capture_output=True)
+        (self.repo / "NOTES.md").write_text("feature notes\n", encoding="utf-8")
+        self._commit_all("doc feature commit")
+        subprocess.run(["git", "merge", "--no-edit", "origin/main"], cwd=self.repo, check=True, capture_output=True)
+
+        res_b = run_just_recipe(b0_sha, "HEAD")
+        self.assertEqual(res_b.returncode, 0, msg=f"case b stdout: {res_b.stdout}\nstderr: {res_b.stderr}")
+
 
 if __name__ == "__main__":
     unittest.main()
