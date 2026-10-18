@@ -721,12 +721,52 @@ jobs:
         if: ${{ !cancelled() }}
         run: just authority-check-cross x86_64-unknown-netbsd clang "--target=x86_64-unknown-netbsd --sysroot=${{ env.NBSD_SYSROOT }}" llvm-ar
 
-  # Single ruleset check. Only a successful docs-only PR filter permits skips;
-  # a failed/cancelled filter or an unexpectedly skipped dependency is red.
       - name: Compiler cache statistics
         if: ${{ always() }}
         run: just build-cache
 
+  cross-check-macos:
+    needs: changes
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.heavy == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: just
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - name: Configure persisted compiler cache
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/carrick-sccache" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: ${{ github.job }}-debug
+          cache-directories: ${{ env.SCCACHE_DIR }}
+          cache-workspace-crates: "true"
+          save-if: ${{ github.event_name == 'schedule' || (github.ref == 'refs/heads/main' && github.event_name != 'pull_request') }}
+      - name: Install per-user compiler cache
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
+      - name: Prebuild cached xtask admission helpers
+        run: just ci-prebuild-xtask
+      - name: Install Clang C cross toolchain
+        if: ${{ !cancelled() }}
+        timeout-minutes: 12
+        run: just ci-install-freebsd-cross
+      - name: Cross-check and clippy macOS closure (including tests)
+        if: ${{ !cancelled() }}
+        run: just cross-check-macos
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: just build-cache
+
+  # Single ruleset check. Only a successful docs-only PR filter permits skips;
+  # a failed/cancelled filter or an unexpectedly skipped dependency is red.
   ci-ok:
     name: ci-ok
     if: always()
@@ -747,6 +787,7 @@ jobs:
       - kernel-linux-native
       - cross-check-freebsd
       - cross-check-netbsd
+      - cross-check-macos
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

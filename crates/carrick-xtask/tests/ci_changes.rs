@@ -433,6 +433,7 @@ fn draft_pr_runs_cheap_linux_checks_and_ci_results_accepts_skipped_heavy_jobs() 
       "macos-integration": { "result": "skipped" },
       "cross-check-freebsd": { "result": "skipped" },
       "cross-check-netbsd": { "result": "skipped" },
+      "cross-check-macos": { "result": "skipped" },
       "kernel-linux-native": { "result": "skipped" }
     }"#;
     assert!(
@@ -475,6 +476,7 @@ fn merge_group_requires_full_suite_in_ci_results() {
       "cross-check-linux": { "result": "success" },
       "cross-check-freebsd": { "result": "success" },
       "cross-check-netbsd": { "result": "success" },
+      "cross-check-macos": { "result": "success" },
       "kernel-linux-native": { "result": "success" }
     }"#;
     assert!(
