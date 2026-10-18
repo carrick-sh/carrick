@@ -77,6 +77,64 @@ fn park(zone: &ZoneTables, tid: u64, uaddr: u64) -> RecordId {
     record
 }
 
+#[test]
+fn parked_census_names_wait_key_resume_owner_and_saved_pc() {
+    let zone = zone();
+    let address = 0x7000;
+    let record = zone.alloc_record(identity(41)).unwrap();
+    let guard = zone
+        .lock(ZoneTables::bucket_of(MM, address), &HostWait)
+        .unwrap();
+    // SAFETY: exclusively owned unpublished record, before park publication.
+    unsafe {
+        zone.record(record).ctx_mut().pc = 0x401000;
+        zone.record(record)
+            .publish_owner_continuation(object_wait::OwnerEntry::Syscall);
+    }
+    zone.enqueue(&guard, record, 1, MM, address, u32::MAX, 0)
+        .unwrap();
+    zone.publish_park(record, 1);
+    drop(guard);
+    let mut census = std::string::String::new();
+    zone.write_census(&mut census).unwrap();
+    assert!(
+        census.contains("first_wait_mm=7 first_wait_address=0x7000"),
+        "{census}"
+    );
+    assert!(
+        census.contains("resume=OwnerContinuation(Syscall) saved_pc=0x401000"),
+        "{census}"
+    );
+    assert!(
+        census.contains("lifecycle_page=0x0 control_slot=0x0"),
+        "{census}"
+    );
+    assert_eq!(zone.record(record).claim(), Claim::Parked { seq: 1 });
+    assert_eq!(zone.record(record).entry_count(), 1);
+}
+
+#[test]
+fn parked_census_refuses_a_busy_bucket_without_claiming_the_record() {
+    let zone = zone();
+    let record = park(&zone, 41, 0x7000);
+    let reference = zone.record_ref(record);
+    let guard = zone
+        .lock(ZoneTables::bucket_of(MM, 0x7000), &HostWait)
+        .unwrap();
+    let mut census = std::string::String::new();
+    zone.write_census(&mut census).unwrap();
+    assert!(census.contains("wait_key_and_pc=unavailable-busy-or-changed-or-unlinked"));
+    assert_eq!(zone.record_ref(record), reference);
+    assert_eq!(zone.record(record).claim(), Claim::Parked { seq: 1 });
+    drop(guard);
+    assert_eq!(zone.parked_wait_census(reference), Some((MM, 0x7000, 0)));
+    wake(&zone, 0x7000, 1, Waker::Host).unwrap();
+    zone.free_record(record);
+    let replacement = park(&zone, 42, 0x9000);
+    assert_eq!(replacement, record);
+    assert!(zone.parked_wait_census(reference).is_none());
+}
+
 fn wake(
     zone: &ZoneTables,
     uaddr: u64,

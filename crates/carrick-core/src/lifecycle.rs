@@ -2,6 +2,24 @@
 pub use carrick_core_abi::lifecycle::*;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+/// Independent diagnostic observations, never a settlement or retirement proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LifecycleCensus {
+    pub gate: GateState,
+    pub live: u32,
+    pub claimed: usize,
+}
+
+/// Keep raw membership observations with their neutral owner. Consumers may
+/// render this sample, but must retain the owned terminal protocol for decisions.
+pub fn census(page: &impl Lifecycle) -> LifecycleCensus {
+    LifecycleCensus {
+        gate: page.gate(),
+        live: page.live(),
+        claimed: page.claimed_count(),
+    }
+}
+
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,
