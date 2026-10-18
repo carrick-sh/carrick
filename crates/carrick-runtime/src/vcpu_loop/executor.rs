@@ -208,6 +208,25 @@ where
             kick: None,
         });
     }
+    // Failure settlement has retired the scheduler row and may already have
+    // published its result. Release the loaded task on this owner thread
+    // before draining other jobs or waiting for VM teardown. Only the vCPU
+    // belongs to the VM's lifetime; retaining its binding here prevents the
+    // job's physical-retirement receipt and deadlocks carrier shutdown.
+    if failure.is_some() {
+        let detached = catch_unwind(AssertUnwindSafe(|| backend.detach_loaded_task()));
+        let error = match detached {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(format!("failed executor task detach: {error}")),
+            Err(_) => Some("failed executor task detach panicked".to_owned()),
+        };
+        if let Some(error) = error
+            && let Some(failure) = &mut failure
+        {
+            failure.push_str("; ");
+            failure.push_str(&error);
+        }
+    }
     if startup_sent
         && failure.is_some()
         && control.retire_failed_worker()
