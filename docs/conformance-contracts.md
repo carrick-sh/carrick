@@ -1350,8 +1350,13 @@ The VM-free bindings
 running lease dropped before normal container retirement. Its custody passes
 to carrier teardown: join workers, retire the exact container graph, destroy
 once, then finalize the lifecycle window. The implicit owner stays reachable
-until this completes. Failure stays visible, and a subsequent carrier can
-acquire a new window. Actual HVF destruction and root-slot pool invalidation
+until this completes. The state updates its abandoned population during the
+ownership transfer and final retirement, so repeated close admission checks
+are constant work rather than rescanning all prior abandoned records.
+`mixed_owned_and_abandoned_leases_keep_terminal_custody_exclusive` covers
+1/8/32 staggered lease drops: the remaining owner prevents destruction,
+and final teardown releases the transferred population exactly once.
+Failure stays visible, and a subsequent carrier can acquire a new window. Actual HVF destruction and root-slot pool invalidation
 remain signed bindings; the production HVF custody owner invalidates that
 pool only after successful VM destruction.
 

@@ -216,6 +216,7 @@ struct CarrierState {
     failure: Option<String>,
     next_reservation: u64,
     containers: BTreeMap<ContainerId, ContainerRecord>,
+    abandoned_containers: usize,
     latest_terminal: Option<VmRunTerminalOutcome>,
     completed_lifecycle: Option<crate::vm_lifecycle::VmLifecycleSnapshot>,
 }
@@ -551,6 +552,7 @@ impl CarrierRuntime {
                 failure: None,
                 next_reservation: 1,
                 containers: BTreeMap::new(),
+                abandoned_containers: 0,
                 latest_terminal: None,
                 completed_lifecycle: None,
             }),
@@ -950,10 +952,7 @@ impl CarrierRuntime {
             loop {
                 match state.admission {
                     CarrierAdmissionState::Closing
-                        if state
-                            .containers
-                            .values()
-                            .all(|record| record.phase == ContainerPhase::Abandoned) =>
+                        if state.containers.len() == state.abandoned_containers =>
                     {
                         break;
                     }
@@ -1417,6 +1416,7 @@ impl Drop for CarrierLease {
             ContainerPhase::Running => {
                 if let Some(record) = state.containers.get_mut(&self.launch.container_id) {
                     record.phase = ContainerPhase::Abandoned;
+                    state.abandoned_containers += 1;
                 }
                 state.admission = CarrierAdmissionState::Failed;
                 state.failure = Some(format!(
@@ -1427,11 +1427,8 @@ impl Drop for CarrierLease {
             ContainerPhase::Abandoned => {}
         }
         self.carrier.changed.notify_all();
-        let failed_without_custody = state.admission == CarrierAdmissionState::Failed
-            && !state
-                .containers
-                .values()
-                .any(|record| record.phase == ContainerPhase::Abandoned);
+        let failed_without_custody =
+            state.admission == CarrierAdmissionState::Failed && state.abandoned_containers == 0;
         drop(state);
         // Keep a failed running carrier reachable by the process shutdown
         // funnel until its transferred custody has actually been drained.
@@ -1670,11 +1667,7 @@ fn shutdown_carrier_with_terminal_drained(
                 ));
             }
         }
-        if state
-            .containers
-            .values()
-            .any(|record| record.phase != ContainerPhase::Abandoned)
-        {
+        if state.containers.len() != state.abandoned_containers {
             return Err(RuntimeError::CarrierClosing);
         }
         match state.terminal_claim {
@@ -1724,7 +1717,10 @@ fn shutdown_carrier_with_terminal_drained(
                     })
             });
             if result.is_ok() {
-                carrier.inner.state.lock().containers.remove(&container);
+                let mut state = carrier.inner.state.lock();
+                if state.containers.remove(&container).is_some() {
+                    state.abandoned_containers -= 1;
+                }
             } else if retirement_result.is_ok() {
                 retirement_result = result;
             }
@@ -3160,6 +3156,37 @@ pub(crate) mod tests {
         let next = CarrierRuntime::new_for_tests().expect("next lifecycle window");
         assert_ne!(next.generation(), carrier.generation());
         shutdown_carrier_with(&next, || Ok(())).expect("close second carrier");
+    }
+
+    #[test]
+    fn mixed_owned_and_abandoned_leases_keep_terminal_custody_exclusive() {
+        let _serial = TEST_LOCK.lock();
+        for count in [1, 8, 32] {
+            let carrier = CarrierRuntime::new_for_tests().expect("carrier");
+            let mut leases = (0..count)
+                .map(|index| {
+                    let lease = carrier
+                        .reserve(launch(&format!("mixed-{index}")))
+                        .expect("reserve");
+                    lease.mark_running().expect("running");
+                    lease
+                })
+                .collect::<Vec<_>>();
+            let last = leases.pop().unwrap();
+            for lease in leases {
+                drop(lease);
+                assert!(matches!(
+                    shutdown_carrier_with(&carrier, || panic!("live lease still owns custody")),
+                    Err(RuntimeError::CarrierClosing)
+                ));
+            }
+            drop(last);
+            assert!(shutdown_carrier_with(&carrier, || Ok(())).is_err());
+            let closed = snapshot(&carrier);
+            assert_eq!(closed.state, CarrierAdmissionState::Closed);
+            assert_eq!(closed.registered_containers, 0);
+            assert_eq!(carrier.inner.state.lock().abandoned_containers, 0);
+        }
     }
 
     #[test]
