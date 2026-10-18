@@ -44,8 +44,9 @@ same trusted main admission, same attempt and exact SHA. Both controllers
 serve the **newest queued main push first**, then owner dispatches. They
 coalesce queued pushes on every poll, including while busy. Before cancelling
 an older run, each controller fsyncs a supersession entry in its own ledger
-and logs `superseded by <newer sha>`. That run is permanently ineligible for
-local JIT minting and hook approval, including reruns. Its commits remain
+and logs `superseded by <newer sha>`. That run attempt is ineligible for
+local JIT minting and hook approval. An owner re-run has a new attempt and
+undergoes normal admission. Its commits remain
 visible through the receipt gate's range report.
 
 Supersession and hook approval share the controller's admission lock. Approval
@@ -65,7 +66,7 @@ that running work can never be cancelled in that window.
 Per-job refusals are logged and recorded durably, then the controller considers
 the next job in the same pass. API failures back off and leave supersession
 intents durable for restart/retry. Refused assignment keys are attempt-specific;
-superseded runs remain refused across attempts.
+supersession is keyed by run and attempt, so a new attempt is vetted afresh.
 
 GitHub does not bind a JIT registration to the reserved job: a compatible
 job from another run may be assigned. The mac hook therefore re-vets the

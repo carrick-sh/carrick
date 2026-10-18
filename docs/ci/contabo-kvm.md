@@ -81,7 +81,8 @@ evidence belongs to the director; these post-landing runs are the backstop.
 The standing KVM controller, like cloudmac, serves only the newest queued
 main push before owner dispatches. Each poll durably records and logs older
 queued runs as `superseded by <newer sha>` before API cancellation. Superseded
-runs cannot mint another local runner or pass a hook, including reruns. Every
+run attempts cannot mint another local runner or pass a hook. An owner re-run
+has a new attempt and undergoes normal admission. Every
 standing assignment must rendezvous; the old reservation shortcut is removed.
 The approval decision is durable under the same admission lock as supersession,
 so an already approved local run cannot be superseded.
