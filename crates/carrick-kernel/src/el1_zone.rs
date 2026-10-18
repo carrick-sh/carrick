@@ -797,8 +797,19 @@ pub unsafe fn read_quiesced_parked_registers(
 /// Complete the detached wake claims EL1 transferred at its exit boundary.
 pub fn hand_back_completions() {
     if let Some(zone) = zone() {
-        zone.take_completion_handbacks(&HostLockWait, &mut publish_handback);
+        hand_back_completions_in(zone);
     }
+}
+
+/// Settle every deferred object-wait completion on `zone`'s carrier chain:
+/// each `Transferring` record becomes host-owned and goes to its thread's
+/// continuation, in the one owned `HostTransfer` publication. EL1 announces
+/// that chain only with the venue's pending-host-work doorbell, so every
+/// host boundary that consumes the doorbell settles the chain through here
+/// (`el1_delegation::deliver_boundary_wakes`), exactly like the owed IPC
+/// wakes the same doorbell stands for (#641).
+pub(crate) fn hand_back_completions_in(zone: &ZoneTables) {
+    zone.take_completion_handbacks(&HostLockWait, &mut publish_handback);
 }
 
 /// Force `slot`'s vCPU out of the guest WITHOUT host work: a host placement
@@ -1538,6 +1549,118 @@ mod tests {
             }));
             capture_handbacks(&[record]);
             assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+        }
+
+        /// #641: EL1 defers an object-wait completion it cannot place (no
+        /// slot in the guest) to the carrier boundary: the record is
+        /// `Transferring` with `Handback::Resumed` on the completion chain,
+        /// and the slot's pending-host-work doorbell is its only signal. An
+        /// idle executor consumes that doorbell through `settle_el1_boundary`
+        /// before it waits in the guest again. Consuming the doorbell must
+        /// settle the chain it announces; otherwise every vCPU idles in WFI
+        /// while the record's thread stays blocked on its host wait forever.
+        #[test]
+        fn idle_boundary_doorbell_settles_deferred_completion_handback() {
+            use carrick_sched_core::object_wait::{
+                ObjectWaitKey, OperationToken, OwnedObjectWakeEffects,
+            };
+            use std::sync::Mutex;
+            const SLOT: usize = 3;
+            struct Restore(Option<HandbackPublisher>, usize);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    *HANDBACK_PUBLISHER.write() = self.0.take();
+                    carrick_el1_abi::record_el1_region_host_ptr(self.1);
+                }
+            }
+            let _restore = Restore(
+                HANDBACK_PUBLISHER.write().take(),
+                carrick_el1_abi::get_el1_region_host_ptr(),
+            );
+            let region = carrick_test_support::TestEl1Region::zeroed();
+            carrick_el1_abi::record_el1_region_host_ptr(region.as_ptr() as usize);
+            let task = {
+                let at = region.as_ptr() as usize
+                    + carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize
+                    + SLOT * std::mem::size_of::<carrick_el1_abi::CurrentTask>();
+                // SAFETY: inside the zeroed region; all-zero is an empty task.
+                unsafe { &*(at as *const carrick_el1_abi::CurrentTask) }
+            };
+            let zone = zone_tables().unwrap();
+            let ready = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&ready);
+            register_handback_publisher(Arc::new(move |event| {
+                if let HandbackEvent::Ready(record) = event {
+                    seen.lock().unwrap().push(record);
+                }
+            }));
+            // The guest venue (`deliver_completion`): defer what could not be
+            // placed, then ring the venue slot's pending-host-work doorbell.
+            let completion =
+                |owned: OwnedObjectWakeEffects<'_, carrick_el1_abi::Aarch64ParkedContext>| {
+                    let (_, _, deferred) = owned.defer_handbacks();
+                    if deferred {
+                        task.linux.mark_pending_host_work();
+                    }
+                };
+            let key = ObjectWaitKey::new(3, 11).unwrap();
+            zone.bind_object_wait_with_completion(key, &HostLockWait, &completion)
+                .unwrap();
+            let ticket = zone
+                .admit_object_notification(key, &HostLockWait, &completion)
+                .unwrap();
+            let record = zone
+                .alloc_record(ThreadIdentity {
+                    tid: 2,
+                    serial: 43,
+                    mm: 2,
+                    file_table: 1,
+                    generation: 267,
+                    affinity: 0,
+                    lifecycle_page: 0,
+                    control_slot: 0,
+                })
+                .unwrap();
+            let reference = zone.record_ref(record);
+            {
+                let guard = zone
+                    .object_wait_with_completion(key, &HostLockWait, &completion)
+                    .unwrap();
+                guard
+                    .park(
+                        guard.snapshot(),
+                        record,
+                        OperationToken::new(403, 11).unwrap(),
+                    )
+                    .unwrap();
+            }
+            ticket.publish(Waker::Host, &completion);
+            // The captured #641 state: deferred, unplaced, doorbell rung.
+            assert!(matches!(
+                zone.record(record).claim(),
+                Claim::Transferring { .. }
+            ));
+            assert_eq!(zone.record(record).handback(), Some(Handback::Resumed));
+            assert!(task.linux.has_pending_host_work());
+            // The idle executor's boundary consumes the doorbell.
+            let (kernel, _context) = crate::kernel::continuation::test_support::bootstrap(164_100);
+            let _ = crate::el1_delegation::settle_el1_boundary(SLOT, &kernel);
+            assert!(!task.linux.has_pending_host_work());
+            assert!(
+                matches!(zone.record(record).claim(), Claim::Host { .. }),
+                "consumed doorbell left the deferred handback stranded: {:?}",
+                zone.record(record).claim()
+            );
+            assert_eq!(ready.lock().unwrap().as_slice(), &[reference]);
+            // SAFETY: the boundary published this exact Host record; the
+            // test owns its operation now and returns it.
+            assert_eq!(
+                unsafe { zone.record(record).take_object_operation() }
+                    .unwrap()
+                    .index(),
+                403
+            );
+            zone.free_record(record);
         }
     }
 
