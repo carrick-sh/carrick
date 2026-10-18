@@ -384,7 +384,6 @@ pub(crate) fn supported_body(insn: &Instruction) -> bool {
     }
     if (0..insn.op_count())
         .any(|i| insn.op_kind(i) == OpKind::Register && insn.op_register(i).is_mm())
-        && insn.mnemonic() != Mnemonic::Maskmovq
     {
         return false;
     }
@@ -396,9 +395,10 @@ pub(crate) fn supported_body(insn: &Instruction) -> bool {
         // A register bit index can address outside the nominal operand width.
         return false;
     }
+    if insn.mnemonic() == Mnemonic::Cmpsd && !insn.is_string_instruction() { return false; }
     matches!(insn.mnemonic(),
         Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movsx | Mnemonic::Movsxd | Mnemonic::Lea
-        | Mnemonic::Nop | Mnemonic::Pause | Mnemonic::Add | Mnemonic::Adc | Mnemonic::Sub
+        | Mnemonic::Nop | Mnemonic::Endbr64 | Mnemonic::Endbr32 | Mnemonic::Pause | Mnemonic::Add | Mnemonic::Adc | Mnemonic::Sub
         | Mnemonic::Sbb | Mnemonic::And | Mnemonic::Or | Mnemonic::Xor | Mnemonic::Not
         | Mnemonic::Neg | Mnemonic::Cmp | Mnemonic::Test | Mnemonic::Inc | Mnemonic::Dec
         | Mnemonic::Mul | Mnemonic::Imul | Mnemonic::Div | Mnemonic::Idiv | Mnemonic::Shl
@@ -430,7 +430,7 @@ pub(crate) fn supported_body(insn: &Instruction) -> bool {
         | Mnemonic::Psubb | Mnemonic::Psubw | Mnemonic::Psubd | Mnemonic::Psubq | Mnemonic::Pcmpeqb
         | Mnemonic::Pcmpeqw | Mnemonic::Pcmpeqd | Mnemonic::Punpcklbw | Mnemonic::Punpcklwd
         | Mnemonic::Punpckldq | Mnemonic::Punpcklqdq | Mnemonic::Pshufd | Mnemonic::Pshufhw
-        | Mnemonic::Pshuflw | Mnemonic::Pshufw | Mnemonic::Maskmovq | Mnemonic::Maskmovdqu
+        | Mnemonic::Pshuflw | Mnemonic::Pshufw | Mnemonic::Maskmovdqu
         | Mnemonic::Lfence | Mnemonic::Sfence | Mnemonic::Mfence | Mnemonic::Prefetchnta
         | Mnemonic::Prefetcht0 | Mnemonic::Prefetcht1 | Mnemonic::Prefetcht2
     )

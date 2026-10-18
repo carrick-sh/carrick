@@ -630,6 +630,26 @@ fn ignored_legacy_segment_prefixes_execute_in_long_mode() {
         let (mut cpu, mut mem, va) = setup_snippet(&[prefix, 0x66, 0x90, 0x0f, 0x05]);
         step_ok(&mut cpu, &mut mem, sys(va + 3, va + 5));
     }
+    let (mut cpu, mut mem, va) =
+        setup_snippet(&[0x66, 0x2e, 0x0f, 0x1f, 0x84, 0, 0, 0, 0, 0, 0x0f, 0x05]);
+    step_ok(&mut cpu, &mut mem, sys(va + 10, va + 12));
+    for marker in [0xfa, 0xfb] {
+        let (mut cpu, mut mem, va) = setup_snippet(&[0xf3, 0x0f, 0x1e, marker, 0x0f, 0x05]);
+        step_ok(&mut cpu, &mut mem, sys(va + 4, va + 6));
+    }
+    let (mut cpu, mut mem, va) = setup_snippet(&[0x3e, 0xff, 0xe0]);
+    cpu.ctx.gpr[reg::RAX] = va + 3;
+    step_ok(
+        &mut cpu,
+        &mut mem,
+        SoftCpuExit::Continue { next_rip: va + 3 },
+    );
+    let (mut cpu, mut mem, va) = setup_snippet(&[0x2e, 0x74, 0]);
+    step_ok(
+        &mut cpu,
+        &mut mem,
+        SoftCpuExit::Continue { next_rip: va + 3 },
+    );
 }
 
 #[test]
@@ -684,6 +704,8 @@ fn gateway_returns_with_host_df_and_fp_controls_restored() {
     );
     assert_eq!(flags & (1 << 10), 0, "guest DF reached the host ABI");
     assert_ne!(cpu.ctx.rflags & (1 << 10), 0, "guest DF was lost");
+    assert_eq!(&cpu.ctx.fxsave.0[..2], &0x027fu16.to_le_bytes());
+    assert_eq!(&cpu.ctx.fxsave.0[24..28], &0x5f80u32.to_le_bytes());
 }
 
 #[test]
@@ -876,4 +898,20 @@ fn published_blocks_and_gateways_are_rx_and_never_writable() {
     ] {
         assert_eq!(permissions(addr), "r-xp");
     }
+}
+
+#[test]
+fn scalar_cmpsd_never_uses_unchecked_native_copy() {
+    let (mut cpu, mut mem, va) = setup_snippet(&[0xf2, 0x0f, 0xc2, 0xc1, 0, 0x0f, 0x05]);
+    let planned =
+        carrick_softcpu_x86::plan_block_from_memory(va, 64, 4096, &mut cpu.ctx, &mut mem).unwrap();
+    let emitted = carrick_softcpu_x86::emit_block(&planned).unwrap();
+    let native_comparison =
+        iced_x86::Decoder::new(64, &emitted.code, iced_x86::DecoderOptions::NONE)
+            .into_iter()
+            .any(|i| i.mnemonic() == iced_x86::Mnemonic::Cmpsd && !i.is_string_instruction());
+    assert!(
+        !native_comparison,
+        "scalar SSE CMPSD escaped the checked helper"
+    );
 }
