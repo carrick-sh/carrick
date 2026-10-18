@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Validate actor, tier and brief before requesting a worker
         run: cargo run --locked --release -p carrick-xtask -- dispatch-worker guard --event "$GITHUB_EVENT_PATH"
@@ -28,6 +28,8 @@ jobs:
     needs: guard
     runs-on: [carrick-agent]
     environment: agent-dispatch
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
     timeout-minutes: 40
     steps:
       - name: Start the bounded token window
@@ -35,7 +37,7 @@ jobs:
       - uses: actions/checkout@v4
         timeout-minutes: 5
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
@@ -70,13 +72,12 @@ jobs:
           CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
           AGY_OAUTH_TOKEN: ${{ secrets.AGY_OAUTH_TOKEN }}
         run: '"$RUNNER_TEMP/carrick-dispatch-driver" agent-runner auth --event "$GITHUB_EVENT_PATH"'
-      - name: Run worker and publish draft PR and contract
+      - name: Run isolated agent and package safe outputs
         id: worker
         if: ${{ !cancelled() && steps.driver.outcome == 'success' }}
         timeout-minutes: 40
-        env:
-          GH_TOKEN: ${{ secrets.AGENT_WORKER_TOKEN }}
         run: >-
+          "$RUNNER_TEMP/carrick-dispatch-driver" host-lease --mode carrick --check-load --
           "$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker run --event "$GITHUB_EVENT_PATH"
           --setup-status '${{ steps.bootstrap.outcome }}/${{ steps.auth.outcome }}'
       - name: Remove job credentials and provider state
@@ -86,8 +87,45 @@ jobs:
             "$RUNNER_TEMP/carrick-dispatch-driver" agent-runner cleanup
           fi
       - uses: actions/upload-artifact@v4
-        if: ${{ always() && steps.worker.outputs.artifact_path != '' }}
+        id: upload
+        if: ${{ !cancelled() && steps.worker.outcome == 'success' }}
         with:
           name: dispatch-${{ github.event.issue.number }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ steps.worker.outputs.artifact_path }}
-          if-no-files-found: warn
+          path: ${{ runner.temp }}/dispatch-output
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    needs: worker
+    if: ${{ !cancelled() && needs.worker.outputs.artifact_id != '' }}
+    runs-on: ubuntu-latest
+    environment: agent-dispatch
+    timeout-minutes: 15
+    steps:
+      # Build only admitted main code, before touching any candidate data.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: '1.96.0'
+      - name: Build trusted publisher without candidate data or restored caches
+        run: |
+          cargo build --locked --release -p carrick-xtask
+          cp target/release/carrick-xtask "$RUNNER_TEMP/carrick-dispatch-publisher"
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.worker.outputs.artifact_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/dispatch-input
+      - name: Validate and publish outputs
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_WORKER_TOKEN }}
+          # Capture exact provider credentials for the publication gate too.
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+          AGY_OAUTH_TOKEN: ${{ secrets.AGY_OAUTH_TOKEN }}
+        run: >-
+          "$RUNNER_TEMP/carrick-dispatch-publisher" dispatch-worker publish
+          --event "$GITHUB_EVENT_PATH" --artifact "$RUNNER_TEMP/dispatch-input"

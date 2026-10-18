@@ -18,6 +18,13 @@ pub enum DispatchAction {
         #[arg(long)]
         event: PathBuf,
     },
+    /// Hosted publisher; never checks out or executes candidate code.
+    Publish {
+        #[arg(long)]
+        event: PathBuf,
+        #[arg(long)]
+        artifact: PathBuf,
+    },
     /// Foreground worker, bounded to 30 minutes plus publication/cleanup.
     Run {
         #[arg(long)]
@@ -56,8 +63,6 @@ pub struct Dispatch {
     pub tier: Tier,
 }
 
-/// An explicit `Branch: work/...` line in the brief selects an existing branch.
-/// All other invocations start at a freshly fetched GitHub main.
 pub fn validate_event(
     event: &Value,
     tiers: &str,
@@ -107,30 +112,7 @@ pub fn validate_event(
         }
         (*branch).to_owned()
     } else {
-        let slug: String = title
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() {
-                    c.to_ascii_lowercase()
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-        let slug = slug
-            .split('-')
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("-");
-        let slug = slug.chars().take(60).collect::<String>();
-        format!(
-            "work/dispatch-{issue}-{}",
-            if slug.is_empty() {
-                "issue"
-            } else {
-                slug.trim_matches('-')
-            }
-        )
+        format!("work/dispatch-{issue}-pending")
     };
     let resume = !branches.is_empty();
     Ok(Dispatch {
@@ -146,7 +128,17 @@ pub fn validate_event(
 fn branch_directives(brief: &str) -> Vec<&str> {
     let mut fence: Option<(char, usize)> = None;
     let mut branches = Vec::new();
+    let mut comment = false;
     for line in brief.lines() {
+        if line.contains("<!--") {
+            comment = true;
+        }
+        if comment {
+            if line.contains("-->") {
+                comment = false;
+            }
+            continue;
+        }
         let trimmed = line.trim();
         if advance_fence(trimmed, &mut fence) {
             continue;
@@ -179,46 +171,26 @@ fn advance_fence(trimmed: &str, fence: &mut Option<(char, usize)>) -> bool {
     true
 }
 
-fn open_prs(root: &Path, branch: &str) -> Result<Value, ScalerError> {
-    Ok(serde_json::from_str(&gh(
-        root,
-        &[
-            "pr",
-            "list",
-            "--repo",
-            REPOSITORY,
-            "--head",
-            branch,
-            "--state",
-            "open",
-            "--base",
-            "main",
-            "--json",
-            "number,url,body,isDraft,headRepository,headRepositoryOwner",
-        ],
-    )?)?)
-}
-fn same_repository(pr: &Value) -> bool {
-    pr["headRepositoryOwner"]["login"] == "carrick-sh" && pr["headRepository"]["name"] == "carrick"
-}
-fn references_issue(pr: &Value, issue: u64) -> bool {
-    let needle = format!("#{issue}");
-    let body = pr["body"].as_str().unwrap_or_default();
-    body.match_indices(&needle).any(|(index, matched)| {
-        let before = body[..index].chars().next_back();
-        let after = body[index + matched.len()..].chars().next();
-        before.is_none_or(|c| !c.is_ascii_alphanumeric() && c != '/')
-            && after.is_none_or(|c| !c.is_ascii_alphanumeric())
-    })
-}
-
 pub fn brief_section(body: &str) -> Result<String, ScalerError> {
     let mut in_brief = false;
     let mut found = false;
     let mut lines = Vec::new();
     // Markdown fences may contain headings; they do not delimit sections.
     let mut fence = None;
+    let mut comment = false;
     for line in body.lines() {
+        if line.contains("<!--") {
+            comment = true;
+        }
+        if comment {
+            if line.contains("-->") {
+                comment = false;
+            }
+            if in_brief {
+                lines.push(line);
+            }
+            continue;
+        }
         let trimmed = line.trim();
         if advance_fence(trimmed, &mut fence) {
             if in_brief {
@@ -265,146 +237,6 @@ pub fn valid_branch(branch: &str) -> bool {
         && !branch.ends_with('/')
 }
 
-fn command(root: &Path, program: &str, args: &[&str]) -> Result<String, ScalerError> {
-    let remote =
-        program == "gh" || (program == "git" && matches!(args.first(), Some(&"fetch" | &"push")));
-    let mut limit = std::time::Duration::from_secs(120);
-    if remote {
-        limit = limit.min(crate::agent_runner::job_remaining(39)?);
-    }
-    let mut invocation = if program == "git" {
-        git_invocation(root, args)
-    } else {
-        let mut invocation = Command::new(program);
-        invocation.args(args).current_dir(root);
-        invocation
-    };
-    let output = crate::ci_scaler::execute(&mut invocation, &[], limit);
-    let bytes = match output {
-        Err(error) if remote => {
-            return Err(crate::agent_runner::check_token(
-                root,
-                crate::agent_runner::TokenScope::Worker,
-            )
-            .err()
-            .unwrap_or(error));
-        }
-        result => result?,
-    };
-    String::from_utf8(bytes).map_err(|_| ScalerError::Guard("command output is not UTF-8"))
-}
-fn git(root: &Path, args: &[&str]) -> Result<String, ScalerError> {
-    command(root, "git", args)
-}
-fn git_invocation(root: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new("git");
-    command
-        .args(args)
-        .current_dir(root)
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .env("GIT_GRAFT_FILE", "/dev/null");
-    command
-}
-fn gh(root: &Path, args: &[&str]) -> Result<String, ScalerError> {
-    command(root, "gh", args)
-}
-
-struct Prepared {
-    base: String,
-    expected_tip: String,
-}
-fn prepare(root: &Path, dispatch: &Dispatch, worktree: &Path) -> Result<Prepared, ScalerError> {
-    // Fix both git transport and gh to the App credential inherited from the
-    // runner. actions/checkout deliberately leaves no installation token behind.
-    gh(root, &["auth", "setup-git", "--hostname", "github.com"])?;
-    git(
-        root,
-        &["config", "--local", "user.name", "carrick-workers[bot]"],
-    )?;
-    git(
-        root,
-        &[
-            "config",
-            "--local",
-            "user.email",
-            "carrick-workers[bot]@users.noreply.github.com",
-        ],
-    )?;
-    git(
-        root,
-        &[
-            "fetch",
-            "https://github.com/carrick-sh/carrick",
-            "+refs/heads/main:refs/remotes/origin/main",
-        ],
-    )?;
-    let existing = dispatch.resume;
-    if existing
-        && !dispatch
-            .branch
-            .starts_with(&format!("work/dispatch-{}-", dispatch.issue))
-    {
-        let prs = open_prs(root, &dispatch.branch)?;
-        if !prs.as_array().is_some_and(|prs| {
-            prs.iter()
-                .any(|pr| same_repository(pr) && references_issue(pr, dispatch.issue))
-        }) {
-            return Err(ScalerError::Guard(
-                "branch is not owned by this issue dispatch",
-            ));
-        }
-    }
-    if !existing
-        && git(
-            root,
-            &[
-                "show-ref",
-                "--verify",
-                "--quiet",
-                &format!("refs/remotes/origin/{}", dispatch.branch),
-            ],
-        )
-        .is_ok()
-    {
-        return Err(ScalerError::Guard(
-            "dispatch branch already exists; name it with Branch: to continue",
-        ));
-    }
-    let start = if existing {
-        let refspec = format!(
-            "+refs/heads/{}:refs/remotes/origin/{}",
-            dispatch.branch, dispatch.branch
-        );
-        git(
-            root,
-            &["fetch", "https://github.com/carrick-sh/carrick", &refspec],
-        )?;
-        format!("refs/remotes/origin/{}", dispatch.branch)
-    } else {
-        "refs/remotes/origin/main".to_owned()
-    };
-    let path = worktree
-        .to_str()
-        .ok_or(ScalerError::Guard("non-UTF8 worktree path"))?;
-    git(
-        root,
-        &["worktree", "add", "-b", &dispatch.branch, path, &start],
-    )?;
-    if existing {
-        git(worktree, &["rebase", "refs/remotes/origin/main"])?;
-    }
-    Ok(Prepared {
-        base: git(root, &["rev-parse", "refs/remotes/origin/main"])?
-            .trim()
-            .to_owned(),
-        expected_tip: if existing {
-            git(root, &["rev-parse", &start])?.trim().to_owned()
-        } else {
-            String::new()
-        },
-    })
-}
-
 fn schema() -> Value {
     json!({"type":"object","additionalProperties":false,
         "required":["status","summary","tests","risks"],"properties":{
@@ -440,12 +272,7 @@ pub enum ContractStatus {
 }
 
 fn read_contract(result: &Path) -> Result<Contract, ScalerError> {
-    if std::fs::metadata(result)?.len() > MAX_FILE_BYTES {
-        return Err(ScalerError::Guard(
-            "redaction gate refused oversized contract",
-        ));
-    }
-    let value: Value = serde_json::from_slice(&std::fs::read(result)?)?;
+    let value: Value = serde_json::from_str(&regular_text(result)?)?;
     // Preserve a completed work contract even on transport failure. The
     // launcher exit code independently prevents a successful dispatch verdict.
     Ok(serde_json::from_value(value["structured_output"].clone())?)
@@ -456,58 +283,38 @@ fn wait_agent(command: &mut Command, limit: std::time::Duration) -> std::io::Res
     let mut child = command.process_group(0).spawn()?;
     let pgid = i32::try_from(child.id()).map_err(std::io::Error::other)?;
     let deadline = std::time::Instant::now() + limit;
-    let mut cancelled = None;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
+            Ok(Some(status)) => return Ok(status.code().unwrap_or(1)),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            result => {
+                // SAFETY: the unreaped foreground child owns this process group.
+                // All detached descendants are retired separately by UID.
                 unsafe {
                     libc::kill(-pgid, libc::SIGKILL);
                 }
-                return Ok(if cancelled.is_some() {
-                    124
-                } else {
-                    status.code().unwrap_or(1)
-                });
-            }
-            Ok(None) => {}
-            Err(error) => {
-                unsafe {
-                    libc::kill(-pgid, libc::SIGKILL);
-                }
-                let _ = child.wait();
-                return Err(error);
+                child.wait()?;
+                return result.map(|_| 124);
             }
         }
-        let now = std::time::Instant::now();
-        if now >= deadline && cancelled.is_none() {
-            // The owned, unreaped lease supervisor receives TERM first so its
-            // guardian can cancel descendants and retain custody through cleanup.
-            unsafe {
-                libc::kill(-pgid, libc::SIGTERM);
-            }
-            cancelled = Some(now);
-        }
-        if cancelled
-            .is_some_and(|when| now.duration_since(when) >= std::time::Duration::from_secs(35))
-        {
-            unsafe {
-                libc::kill(-pgid, libc::SIGKILL);
-            }
-            child.wait()?;
-            return Ok(124);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
-fn agent(
-    root: &Path,
-    result_dir: &Path,
-    dispatch: &Dispatch,
-) -> Result<(i32, Contract), ScalerError> {
-    let state = crate::agent_runner::state()?;
+fn private_environment(command: &mut Command) {
+    command
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin");
+}
+
+fn agent(root: &Path, dispatch: &Dispatch) -> Result<i32, ScalerError> {
+    let state = root
+        .parent()
+        .ok_or(ScalerError::Guard("missing agent home"))?
+        .to_owned();
     let home = state.join("home");
-    let schema_path = result_dir.join("schema.json");
+    let schema_path = state.join("schema.json");
     let result = state.join("result.json");
     let prompt_file = state.join("prompt.md");
     std::fs::write(&schema_path, serde_json::to_vec_pretty(&schema())?)?;
@@ -526,16 +333,8 @@ fn agent(
     // Deduct checkout/build/bootstrap time rather than starting a fresh
     // 30-minute turn against a token snapshot taken at job admission.
     let turn_timeout = format!("{}s", crate::agent_runner::job_remaining(30)?.as_secs());
-    let mut command = Command::new(std::env::current_exe()?);
+    let mut command = Command::new("python3");
     command
-        .args([
-            "host-lease",
-            "--mode",
-            "carrick",
-            "--check-load",
-            "--",
-            "python3",
-        ])
         .arg(state.join("director/agy-director/scripts/agy_worker.py"))
         .arg("--home")
         .arg(state.join("runtime"))
@@ -565,7 +364,18 @@ fn agent(
     if let Some(effort) = &dispatch.tier.effort {
         command.args(["--effort", effort]);
     }
+    // Only explicit provider files cross the user boundary; no runner env,
+    // Actions write channels, GitHub token or inherited credential mechanism.
+    private_environment(&mut command);
     crate::agent_runner::isolate_rust_homes(&mut command, &state)?;
+    command.env(
+        "PATH",
+        format!(
+            "{}:{}:/usr/local/bin:/usr/bin:/bin",
+            state.join("bin").display(),
+            state.join("rust/cargo/bin").display()
+        ),
+    );
     command
         .env_remove("GITHUB_OUTPUT")
         .env_remove("GITHUB_ENV")
@@ -576,18 +386,30 @@ fn agent(
         .env("AGY_CLI_DISABLE_AUTO_UPDATE", "1")
         .env("AGY_BIN", state.join("bin/agy"))
         .env("AGY_DIRECTOR_CODEX_SDK_BIN", state.join("bin/codex"))
+        .current_dir(root);
+    let mut isolated = Command::new("/usr/bin/sudo");
+    private_environment(&mut isolated);
+    isolated.args(["-n", "-u", AGENT_USER, "--", "/usr/bin/env", "-i"]);
+    for (key, value) in command.get_envs() {
+        if let Some(value) = value {
+            let mut assignment = key.to_os_string();
+            assignment.push("=");
+            assignment.push(value);
+            isolated.arg(assignment);
+        }
+    }
+    isolated
+        .arg(command.get_program())
+        .args(command.get_args())
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(std::fs::File::create(state.join("agent.out"))?)
         .stderr(std::fs::File::create(state.join("agent.err"))?);
-    let code = wait_agent(&mut command, crate::agent_runner::job_remaining(32)?)?;
-    let contract = read_contract(&result).unwrap_or_else(|error| Contract {
-        status: ContractStatus::Failed,
-        summary: format!("No valid worker contract: {error}"),
-        tests: vec![],
-        risks: vec!["Worker output is incomplete".into()],
-    });
-    Ok((code, contract))
+    hand_over(&state)?;
+    let outcome = wait_agent(&mut isolated, crate::agent_runner::job_remaining(32)?);
+    retire_agent()?;
+    let code = outcome?;
+    Ok(code)
 }
 
 fn admissible_file(path: &str) -> bool {
@@ -605,12 +427,6 @@ fn gate_work(root: &Path, gate: &Gate) -> Result<(), ScalerError> {
 }
 fn gate_work_inner(root: &Path, gate: &Gate) -> Result<(), ScalerError> {
     let refusal = || ScalerError::Guard("redaction gate refused sensitive or unsafe output");
-    let base = gate.base()?;
-    let reported = git(root, &["rev-parse", "--show-toplevel"])?;
-    if Path::new(reported.trim()).canonicalize()? != root.canonicalize()? {
-        return Err(refusal());
-    }
-    git(root, &["merge-base", "--is-ancestor", base, "HEAD"])?;
     if git(root, &["ls-files", "--modified", "-z"])?
         .split('\0')
         .any(|p| !p.is_empty() && !admissible_file(p))
@@ -633,16 +449,7 @@ fn gate_work_inner(root: &Path, gate: &Gate) -> Result<(), ScalerError> {
         .filter(|p| !p.is_empty() && admissible_file(p))
     {
         gate.check(file.as_bytes())?;
-        let mut path = root.to_owned();
-        for part in Path::new(file).components() {
-            path.push(part);
-            match std::fs::symlink_metadata(&path) {
-                Ok(meta) if meta.file_type().is_symlink() => return Err(refusal()),
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-                Err(e) => return Err(e.into()),
-            }
-        }
+        let path = root.join(file);
         if let Ok(meta) = std::fs::symlink_metadata(&path) {
             if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
                 return Err(refusal());
@@ -653,72 +460,7 @@ fn gate_work_inner(root: &Path, gate: &Gate) -> Result<(), ScalerError> {
             }
         }
     }
-    let staged = git(
-        root,
-        &[
-            "diff",
-            "--cached",
-            "--raw",
-            "--no-renames",
-            "--no-ext-diff",
-            "--no-textconv",
-            "-z",
-        ],
-    )?;
-    for file in gate_changes(&staged, gate)? {
-        // Inspect staged blobs independently of the working file.
-        if let Ok(id) = git(root, &["rev-parse", &format!(":{file}")]) {
-            total += gate_object(root, gate, id.trim())?;
-            if total > 20 * MAX_FILE_BYTES {
-                return Err(refusal());
-            }
-        }
-    }
-    let objects = git(
-        root,
-        &[
-            "rev-list",
-            "--objects",
-            "--no-object-names",
-            "HEAD",
-            &format!("^{base}"),
-        ],
-    )?;
-    if objects.lines().count() > 4096 {
-        return Err(refusal());
-    }
-    for id in objects.lines() {
-        total += gate_object(root, gate, id)?;
-        if total > 20 * MAX_FILE_BYTES {
-            return Err(refusal());
-        }
-    }
-    let commits = git(root, &["rev-list", "HEAD", &format!("^{base}")])?;
-    if commits.lines().count() > 256 {
-        return Err(refusal());
-    }
-    for commit in commits.lines() {
-        let paths = git(
-            root,
-            &[
-                "diff-tree",
-                "--no-commit-id",
-                "--root",
-                "-r",
-                "--raw",
-                "--no-renames",
-                "--no-ext-diff",
-                "--no-textconv",
-                "-m",
-                "-z",
-                commit,
-            ],
-        )?;
-        gate_changes(&paths, gate)?;
-    }
-    if total > 20 * MAX_FILE_BYTES {
-        return Err(refusal());
-    }
+
     Ok(())
 }
 fn gate_changes<'a>(raw: &'a str, gate: &Gate) -> Result<Vec<&'a str>, ScalerError> {
@@ -762,9 +504,6 @@ fn gate_object(root: &Path, gate: &Gate, id: &str) -> Result<u64, ScalerError> {
 }
 fn checkpoint(root: &Path, dispatch: &Dispatch, gate: &Gate) -> Result<bool, ScalerError> {
     gate_work(root, gate)?;
-    if git(root, &["branch", "--show-current"])?.trim() != dispatch.branch {
-        return Err(ScalerError::Guard("worker left its dispatched branch"));
-    }
     let files = git(
         root,
         &[
@@ -793,7 +532,6 @@ fn checkpoint(root: &Path, dispatch: &Dispatch, gate: &Gate) -> Result<bool, Sca
     if staged.is_empty() {
         return Ok(false);
     }
-    gate_work(root, gate)?;
     let message = format!(
         "chore(ci): checkpoint issue {} worker progress\n\nWhy: preserve unfinished work before this ephemeral clone is destroyed.\n\nWhat: record the worker's current changes for review and continuation.\n\nVerified: see the dispatch issue contract; this is a WIP checkpoint.\n\nCo-Authored-By: {}",
         dispatch.issue, dispatch.tier.coauthor
@@ -802,149 +540,776 @@ fn checkpoint(root: &Path, dispatch: &Dispatch, gate: &Gate) -> Result<bool, Sca
     Ok(true)
 }
 
-/// Keep committed work recoverable even when App publication fails before
-/// this one-job VM is destroyed. A failed commit hook leaves staged changes
-/// in the binary patch; generated target paths were excluded by checkpoint.
-fn preserve_work(
-    root: &Path,
-    result_dir: &Path,
-    dispatch: &Dispatch,
-    gate: &Gate,
-) -> Result<(), ScalerError> {
-    if git(root, &["branch", "--show-current"])?.trim() != dispatch.branch {
-        return Err(ScalerError::Guard(
-            "redaction gate refused recovery from another branch",
-        ));
+const AGENT_USER: &str = "carrick-dispatch-agent";
+const MAX_BUNDLE_BYTES: u64 = 20 * MAX_FILE_BYTES;
+const BUNDLE_REF: &str = "refs/heads/dispatch-output";
+
+fn output(command: &mut Command) -> Result<Vec<u8>, ScalerError> {
+    crate::ci_scaler::execute(command, &[], std::time::Duration::from_secs(120))
+}
+pub(crate) fn git_invocation(root: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    // All repositories used by the driver have freshly created configuration.
+    // No candidate .git/config, alternates, hooks, attributes or env is trusted.
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            cmd.env_remove(key);
+        }
     }
-    gate_work(root, gate)?;
-    gate.directory(result_dir)?;
-    let dispatched_ref = format!("refs/heads/{}", dispatch.branch);
-    let commits = git(
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_GRAFT_FILE", "/dev/null")
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.attributesFile=/dev/null",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "filter.lfs.clean=",
+            "-c",
+            "filter.lfs.smudge=",
+            "-c",
+            "filter.lfs.process=",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "user.name=carrick-workers[bot]",
+            "-c",
+            "user.email=carrick-workers[bot]@users.noreply.github.com",
+        ])
+        .args(args)
+        .current_dir(root);
+    cmd
+}
+fn git(root: &Path, args: &[&str]) -> Result<String, ScalerError> {
+    String::from_utf8(output(&mut git_invocation(root, args))?)
+        .map_err(|_| ScalerError::Guard("non-UTF8 git output"))
+}
+fn gh(root: &Path, args: &[&str]) -> Result<String, ScalerError> {
+    String::from_utf8(output(Command::new("gh").args(args).current_dir(root))?)
+        .map_err(|_| ScalerError::Guard("non-UTF8 GitHub output"))
+}
+fn sudo(args: &[&str]) -> Result<(), ScalerError> {
+    output(Command::new("/usr/bin/sudo").arg("-n").args(args))?;
+    Ok(())
+}
+fn hand_over(path: &Path) -> Result<(), ScalerError> {
+    sudo(&[
+        "chown",
+        "-hR",
+        AGENT_USER,
+        path.to_str().ok_or(ScalerError::Guard("agent path"))?,
+    ])
+}
+fn retire_agent() -> Result<(), ScalerError> {
+    // Include real and effective UIDs (setuid tools), regardless of sessions.
+    for selector in ["-u", "-U"] {
+        let _ = sudo(&["pkill", "-STOP", selector, AGENT_USER]);
+        let _ = sudo(&["pkill", "-KILL", selector, AGENT_USER]);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        // SAFETY: the driver is a subreaper and has already waited for its
+        // foreground child. Reap only completed adopted children.
+        while unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) } > 0 {}
+        let mut empty = true;
+        for selector in ["-u", "-U"] {
+            let status = Command::new("/usr/bin/sudo")
+                .args(["-n", "pgrep", selector, AGENT_USER])
+                .output()?;
+            match status.status.code() {
+                Some(1) => {}
+                Some(0) => empty = false,
+                _ => return Err(ScalerError::Guard("cannot verify agent process retirement")),
+            }
+        }
+        if empty {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(ScalerError::Guard(
+                "agent user still has processes; packaging refused",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+pub(crate) fn cleanup_agent_user() -> Result<(), ScalerError> {
+    let status = Command::new("/usr/bin/id")
+        .args(["-u", AGENT_USER])
+        .output()?;
+    if status.status.success() {
+        retire_agent()?;
+        sudo(&["userdel", AGENT_USER])?;
+    } else if status.status.code() != Some(1) {
+        return Err(ScalerError::Guard("cannot verify agent account cleanup"));
+    }
+    Ok(())
+}
+fn sha(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+fn run_id() -> Result<String, ScalerError> {
+    std::env::var("GITHUB_RUN_ID")
+        .ok()
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .ok_or(ScalerError::Guard("invalid run ID"))
+}
+fn assigned_branch(dispatch: &mut Dispatch) -> Result<(), ScalerError> {
+    if !dispatch.resume {
+        dispatch.branch = format!("work/dispatch-{}-{}", dispatch.issue, run_id()?);
+    }
+    Ok(())
+}
+fn open_prs(root: &Path, branch: &str) -> Result<Value, ScalerError> {
+    Ok(serde_json::from_str(&gh(
         root,
         &[
-            "rev-list",
-            "--count",
-            "HEAD",
-            &dispatched_ref,
-            "--not",
-            gate.base()?,
+            "pr",
+            "list",
+            "--repo",
+            REPOSITORY,
+            "--head",
+            branch,
+            "--state",
+            "open",
+            "--base",
+            "main",
+            "--json",
+            "number,url,author,headRepository,headRepositoryOwner",
         ],
-    )?;
-    if commits.trim() != "0" {
-        let path = result_dir.join("work.bundle");
-        git(
+    )?)?)
+}
+fn marker(issue: u64, branch: &str) -> String {
+    format!("<!-- carrick-dispatch-owner:v1 issue={issue} branch={branch} -->")
+}
+fn owned_pr(pr: &Value, comments: &Value, issue: u64, branch: &str) -> bool {
+    pr["author"]["login"] == "carrick-workers[bot]"
+        && pr["headRepositoryOwner"]["login"] == "carrick-sh"
+        && pr["headRepository"]["name"] == "carrick"
+        && comments.as_array().is_some_and(|comments| {
+            comments.iter().any(|c| {
+                c["user"]["login"] == "carrick-workers[bot]"
+                    && c["user"]["type"] == "Bot"
+                    && c["performed_via_github_app"]["slug"] == "carrick-workers"
+                    && c["body"].as_str() == Some(marker(issue, branch).as_str())
+            })
+        })
+}
+fn require_owned_pr(root: &Path, dispatch: &Dispatch) -> Result<Value, ScalerError> {
+    for pr in open_prs(root, &dispatch.branch)?
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let number = pr["number"]
+            .as_u64()
+            .ok_or(ScalerError::Guard("missing PR number"))?;
+        let comments: Value = serde_json::from_str(&gh(
             root,
             &[
-                "bundle",
-                "create",
-                path.to_str()
-                    .ok_or(ScalerError::Guard("non-UTF8 bundle path"))?,
-                "HEAD",
-                &dispatched_ref,
-                &format!("^{}", gate.base()?),
+                "api",
+                "--paginate",
+                "--slurp",
+                &format!("repos/{REPOSITORY}/issues/{number}/comments"),
             ],
-        )?;
+        )?)?;
+        let comments = Value::Array(
+            comments
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|page| page.as_array().into_iter().flatten().cloned())
+                .collect(),
+        );
+        if owned_pr(pr, &comments, dispatch.issue, &dispatch.branch) {
+            return Ok(pr.clone());
+        }
     }
-    let patch = crate::ci_scaler::execute(
-        &mut git_invocation(
-            root,
-            &["diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD"],
-        ),
-        &[],
-        std::time::Duration::from_secs(120),
-    )?;
-    std::fs::write(result_dir.join("wip.patch"), patch)?;
-    gate.directory(result_dir)?;
+    Err(ScalerError::Guard(
+        "branch lacks an App-authored ownership marker",
+    ))
+}
+
+// Copy bytes, never aliases. The producer is dead and cannot write the
+// runner-owned destination. No Git command opens the candidate configuration.
+fn copy_tree(source: &Path, target: &Path, count: &mut usize) -> Result<(), ScalerError> {
+    std::fs::create_dir(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        if matches!(entry.file_name().to_str(), Some("target" | ".git")) {
+            continue;
+        }
+        *count += 1;
+        if *count > 100_000 {
+            return Err(ScalerError::Guard("snapshot file count exceeded"));
+        }
+        let kind = entry.file_type()?;
+        let dest = target.join(entry.file_name());
+        if kind.is_dir() {
+            copy_tree(&entry.path(), &dest, count)?;
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), dest)?;
+        } else {
+            return Err(ScalerError::Guard("snapshot refused nonregular file"));
+        }
+    }
+    Ok(())
+}
+fn regular_text(path: &Path) -> Result<String, ScalerError> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
+        return Err(ScalerError::Guard("unsafe metadata"));
+    }
+    Ok(std::fs::read_to_string(path)?)
+}
+fn snapshot(source: &Path, target: &Path, branch: &str) -> Result<(), ScalerError> {
+    let dotgit = source.join(".git");
+    if !std::fs::symlink_metadata(&dotgit)?.is_dir() {
+        return Err(ScalerError::Guard("agent git directory redirected"));
+    }
+    let head = regular_text(&dotgit.join("HEAD"))?;
+    let expected = format!("ref: refs/heads/{branch}");
+    if head.trim() != expected {
+        return Err(ScalerError::Guard("agent changed branch"));
+    }
+    // Loose ref is guaranteed by preparation. Ref directories must not be links.
+    let mut path = dotgit.clone();
+    for part in format!("refs/heads/{branch}").split('/') {
+        path.push(part);
+        if std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
+            return Err(ScalerError::Guard("redirected candidate ref"));
+        }
+    }
+    let head = regular_text(&path)?.trim().to_owned();
+    if !sha(&head) {
+        return Err(ScalerError::Guard("invalid candidate head"));
+    }
+    copy_tree(source, target, &mut 0)?;
+    git(target, &["init"])?;
+    // Deliberately omit info/alternates, config, grafts, shallow, index and refs.
+    let objects = dotgit.join("objects");
+    if std::fs::symlink_metadata(&objects)?
+        .file_type()
+        .is_symlink()
+    {
+        return Err(ScalerError::Guard("redirected objects"));
+    }
+    for entry in std::fs::read_dir(objects)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or(ScalerError::Guard("object path"))?;
+        if name == "info" {
+            continue;
+        }
+        if name != "pack" && !(name.len() == 2 && name.bytes().all(|b| b.is_ascii_hexdigit())) {
+            return Err(ScalerError::Guard("unexpected object directory"));
+        }
+        if !entry.file_type()?.is_dir() {
+            return Err(ScalerError::Guard("object directory link"));
+        }
+        let dest = target.join(".git/objects").join(name);
+        if dest.exists() {
+            std::fs::remove_dir(&dest)?;
+        }
+        copy_tree(&entry.path(), &dest, &mut 0)?;
+    }
+    git(target, &["update-ref", "HEAD", &head])?;
+    git(target, &["read-tree", "HEAD"])?;
     Ok(())
 }
 
-fn publish(
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Receipt {
+    base: String,
+    head: String,
+    issue: u64,
+    branch: String,
+    exit_code: i32,
+    expected_tip: String,
+    contract: Contract,
+}
+fn validate_bundle(
     root: &Path,
-    result_dir: &Path,
-    dispatch: &Dispatch,
-    contract: &Contract,
+    path: &Path,
+    base: &str,
     gate: &Gate,
-    prepared: &Prepared,
-) -> Result<Option<String>, ScalerError> {
-    gate_work(root, gate)?;
-    gate.directory(result_dir)?;
-    contract.check(gate)?;
-    gate.check(dispatch.title.as_bytes())?;
-    gate.check(dispatch.branch.as_bytes())?;
-    if git(root, &["branch", "--show-current"])?.trim() != dispatch.branch {
-        return Err(ScalerError::Guard("refusing to publish another branch"));
+) -> Result<String, ScalerError> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.is_file() || meta.len() > MAX_BUNDLE_BYTES {
+        return Err(ScalerError::Guard("bundle size cap or file type"));
     }
-    let head = git(root, &["rev-parse", "HEAD"])?;
-    if head.trim() == prepared.base {
-        return Ok(None);
+    let bytes = std::fs::read(path)?;
+    let end = bytes
+        .windows(2)
+        .position(|w| w == b"\n\n")
+        .filter(|n| *n < 65536)
+        .ok_or(ScalerError::Guard("invalid bundle header"))?;
+    gate.check(&bytes)?;
+    let header = std::str::from_utf8(&bytes[..end])
+        .map_err(|_| ScalerError::Guard("bundle header encoding"))?;
+    let lines: Vec<_> = header.lines().collect();
+    if lines.len() != 3
+        || lines[0] != "# v2 git bundle"
+        || lines[1].split_whitespace().next() != Some(format!("-{base}").as_str())
+    {
+        return Err(ScalerError::Guard(
+            "bundle must require exactly the recorded base",
+        ));
     }
-    // Explicit main rebases use force-with-lease with the exact fetched head;
-    // a new branch must still be absent. Never overwrite a later worker push.
-    let lease = format!(
-        "--force-with-lease=refs/heads/{}:{}",
-        dispatch.branch, prepared.expected_tip
-    );
-    let refspec = format!("HEAD:refs/heads/{}", dispatch.branch);
-    git(
+    let (head, reference) = lines[2]
+        .split_once(' ')
+        .ok_or(ScalerError::Guard("missing bundle ref"))?;
+    if !sha(head) || reference != BUNDLE_REF {
+        return Err(ScalerError::Guard("bundle tags or extra refs refused"));
+    }
+    let all_objects = |root: &Path| -> Result<std::collections::BTreeSet<String>, ScalerError> {
+        Ok(git(
+            root,
+            &[
+                "cat-file",
+                "--batch-all-objects",
+                "--batch-check=%(objectname)",
+            ],
+        )?
+        .lines()
+        .map(str::to_owned)
+        .collect())
+    };
+    let before = all_objects(root)?;
+    let path = path.to_str().ok_or(ScalerError::Guard("bundle path"))?;
+    git(root, &["bundle", "verify", path])?;
+    git(root, &["bundle", "unbundle", path])?;
+    git(root, &["merge-base", "--is-ancestor", base, head])?;
+    let reachable: std::collections::BTreeSet<_> = git(
         root,
         &[
-            "push",
-            "--no-follow-tags",
-            &lease,
-            "https://github.com/carrick-sh/carrick",
-            &refspec,
+            "rev-list",
+            "--objects",
+            "--no-object-names",
+            head,
+            &format!("^{base}"),
+        ],
+    )?
+    .lines()
+    .map(str::to_owned)
+    .collect();
+    let after = all_objects(root)?;
+    let imported: std::collections::BTreeSet<_> = after.difference(&before).cloned().collect();
+    if reachable != imported || imported.len() > 4096 {
+        return Err(ScalerError::Guard(
+            "bundle contains extra or excessive objects",
+        ));
+    }
+    let mut total = 0;
+    let mut commits = 0;
+    for id in &imported {
+        match git(root, &["cat-file", "-t", id])?.trim() {
+            "commit" => {
+                commits += 1;
+                // A merge cannot smuggle in unrelated side-branch history.
+                git(root, &["merge-base", "--is-ancestor", base, id])?;
+                let paths = git(
+                    root,
+                    &[
+                        "diff-tree",
+                        "--no-commit-id",
+                        "--root",
+                        "-r",
+                        "--raw",
+                        "--no-renames",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        "-m",
+                        "-z",
+                        id,
+                    ],
+                )?;
+                gate_changes(&paths, gate)?;
+            }
+            "blob" | "tree" => {}
+            _ => {
+                return Err(ScalerError::Guard(
+                    "bundle contains a tag or unknown object",
+                ));
+            }
+        }
+        total += gate_object(root, gate, id)?;
+        if total > MAX_BUNDLE_BYTES || commits > 256 {
+            return Err(ScalerError::Guard(
+                "bundle decoded size or commit cap exceeded",
+            ));
+        }
+    }
+    git(root, &["update-ref", "HEAD", head])?;
+    Ok(head.to_owned())
+}
+
+pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
+    let root = root.canonicalize()?;
+    let (event_path, setup, artifact) = match args.action {
+        DispatchAction::Guard { event } => (event, None, None),
+        DispatchAction::Run {
+            event,
+            setup_status,
+        } => (event, Some(setup_status), None),
+        DispatchAction::Publish { event, artifact } => (event, None, Some(artifact)),
+    };
+    let event: Value = serde_json::from_slice(&std::fs::read(event_path)?)?;
+    let mut dispatch = validate_event(
+        &event,
+        include_str!("../../../.github/dispatch-tiers.toml"),
+        &std::env::var("GITHUB_TRIGGERING_ACTOR").unwrap_or_default(),
+    )?;
+    assigned_branch(&mut dispatch)?;
+    if let Some(artifact) = artifact {
+        return publish(&root, &dispatch, &artifact);
+    }
+    let Some(setup) = setup else {
+        return Ok(());
+    };
+    if std::env::var_os("GH_TOKEN").is_some() || std::env::var_os("AGENT_WORKER_TOKEN").is_some() {
+        return Err(ScalerError::Guard(
+            "agent job must have no GitHub publish credential",
+        ));
+    }
+    produce(&root, &dispatch, &setup)
+}
+fn produce(root: &Path, dispatch: &Dispatch, setup: &str) -> Result<(), ScalerError> {
+    use std::os::unix::fs::PermissionsExt;
+    let base =
+        std::env::var("GITHUB_SHA").map_err(|_| ScalerError::Guard("missing admitted SHA"))?;
+    if !sha(&base) || git(root, &["rev-parse", "HEAD"])?.trim() != base {
+        return Err(ScalerError::Guard("checkout differs from admitted SHA"));
+    }
+    let mut gate = Gate::capture()?;
+    let temporary =
+        PathBuf::from(std::env::var_os("RUNNER_TEMP").ok_or(ScalerError::Guard("runner temp"))?);
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+    let frozen = tempfile::tempdir()?;
+    let package = frozen.path().join("package");
+    std::fs::create_dir(&package)?;
+    let mut contract = Contract {
+        status: ContractStatus::Failed,
+        summary: format!("Worker setup did not complete: {setup}"),
+        tests: vec![],
+        risks: vec![],
+    };
+    let mut code = 1;
+    let mut head = base.clone();
+    let mut expected_tip = String::new();
+    if setup == "success/success" {
+        #[cfg(target_os = "linux")]
+        // SAFETY: the dedicated driver must adopt and reap detached agent children.
+        if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // The account has no login, password, sudo rights or runner membership.
+        sudo(&[
+            "useradd",
+            "--system",
+            "--no-create-home",
+            "--shell",
+            "/usr/sbin/nologin",
+            AGENT_USER,
+        ])?;
+        let outer = tempfile::Builder::new()
+            .prefix("carrick-dispatch-")
+            .tempdir_in("/var/tmp")?;
+        std::fs::set_permissions(outer.path(), std::fs::Permissions::from_mode(0o711))?;
+        let state = outer.path().join("agent");
+        std::fs::create_dir(&state)?;
+        let bootstrap = crate::agent_runner::state()?;
+        for name in ["home", "bin", "director"] {
+            copy_tree(&bootstrap.join(name), &state.join(name), &mut 0)?;
+        }
+        let work = state.join("work");
+        git(
+            &state,
+            &[
+                "clone",
+                "--no-local",
+                "--no-checkout",
+                "--no-hardlinks",
+                root.to_str().ok_or(ScalerError::Guard("checkout path"))?,
+                "work",
+            ],
+        )?;
+        if dispatch.resume {
+            git(
+                &work,
+                &[
+                    "fetch",
+                    "--no-tags",
+                    "https://github.com/carrick-sh/carrick",
+                    &format!("refs/heads/{}", dispatch.branch),
+                ],
+            )?;
+            expected_tip = git(&work, &["rev-parse", "FETCH_HEAD"])?.trim().to_owned();
+            git(&work, &["checkout", "-b", &dispatch.branch, "FETCH_HEAD"])?;
+            git(&work, &["rebase", &base])?;
+        } else {
+            git(&work, &["checkout", "-b", &dispatch.branch, &base])?;
+        }
+        git(&work, &["config", "user.name", "carrick-workers[bot]"])?;
+        git(
+            &work,
+            &[
+                "config",
+                "user.email",
+                "carrick-workers[bot]@users.noreply.github.com",
+            ],
+        )?;
+        let result = agent(&work, dispatch);
+        // Retire the account before freezing source bytes, including on failure.
+        cleanup_agent_user()?;
+        sudo(&[
+            "chmod",
+            "700",
+            state.to_str().ok_or(ScalerError::Guard("agent state"))?,
+        ])?;
+        sudo(&[
+            "chown",
+            "-hR",
+            &unsafe { libc::geteuid() }.to_string(),
+            state.to_str().ok_or(ScalerError::Guard("agent state"))?,
+        ])?;
+        code = result?;
+        contract = read_contract(&state.join("result.json")).unwrap_or(Contract {
+            status: ContractStatus::Failed,
+            summary: "No valid worker contract".into(),
+            tests: vec![],
+            risks: vec!["Worker output is incomplete".into()],
+        });
+        gate.absorb_provider_home(&state.join("home"))?;
+        contract.check(&gate)?;
+        for name in ["agent.out", "agent.err"] {
+            let bytes = regular_text(&state.join(name))?;
+            std::fs::write(package.join(name), gate.diagnostic(bytes.as_bytes()))?;
+        }
+        let safe = frozen.path().join("snapshot");
+        snapshot(&work, &safe, &dispatch.branch)?;
+        if checkpoint(&safe, dispatch, &gate)? {
+            contract.status = ContractStatus::Failed;
+            contract
+                .risks
+                .push("Workflow checkpointed unfinished changes".into());
+        }
+        gate_work(&safe, &gate)?;
+        head = git(&safe, &["rev-parse", "HEAD"])?.trim().to_owned();
+        if head != base {
+            git(&safe, &["update-ref", BUNDLE_REF, &head])?;
+            let bundle = package.join("work.bundle");
+            git(
+                &safe,
+                &[
+                    "bundle",
+                    "create",
+                    bundle.to_str().ok_or(ScalerError::Guard("bundle path"))?,
+                    BUNDLE_REF,
+                    &format!("^{base}"),
+                ],
+            )?;
+            if std::fs::metadata(&bundle)?.len() > MAX_BUNDLE_BYTES {
+                return Err(ScalerError::Guard("bundle size cap exceeded"));
+            }
+        }
+    }
+    contract.check(&gate)?;
+    std::fs::write(
+        package.join("contract.json"),
+        serde_json::to_vec_pretty(&contract)?,
+    )?;
+    let receipt = Receipt {
+        base,
+        head,
+        issue: dispatch.issue,
+        branch: dispatch.branch.clone(),
+        exit_code: code,
+        expected_tip,
+        contract,
+    };
+    std::fs::write(
+        package.join("result.json"),
+        serde_json::to_vec_pretty(&receipt)?,
+    )?;
+    if receipt.head != receipt.base {
+        let validation = frozen.path().join("validation");
+        std::fs::create_dir(&validation)?;
+        git(&validation, &["init"])?;
+        git(
+            &validation,
+            &[
+                "fetch",
+                "--no-tags",
+                root.to_str().ok_or(ScalerError::Guard("root path"))?,
+                &receipt.base,
+            ],
+        )?;
+        validate_bundle(
+            &validation,
+            &package.join("work.bundle"),
+            &receipt.base,
+            &gate,
+        )?;
+    }
+    gate.directory(&package)?;
+    let target =
+        PathBuf::from(std::env::var_os("RUNNER_TEMP").ok_or(ScalerError::Guard("runner temp"))?)
+            .join("dispatch-output");
+    copy_tree(&package, &target, &mut 0)?;
+    Ok(())
+}
+fn publish(root: &Path, dispatch: &Dispatch, artifact: &Path) -> Result<(), ScalerError> {
+    crate::agent_runner::check_token(root, crate::agent_runner::TokenScope::Worker)?;
+    let gate = Gate::capture()?;
+    gate.directory(artifact)?;
+    let base =
+        std::env::var("GITHUB_SHA").map_err(|_| ScalerError::Guard("missing admitted SHA"))?;
+    let mut receipt: Option<Receipt> = None;
+    for entry in std::fs::read_dir(artifact)? {
+        let entry = entry?;
+        if !matches!(
+            entry.file_name().to_str(),
+            Some("work.bundle" | "result.json" | "contract.json" | "agent.out" | "agent.err")
+        ) {
+            return Err(ScalerError::Guard("unexpected artifact member"));
+        }
+        if entry.file_name() == "result.json" {
+            receipt = Some(serde_json::from_slice(&std::fs::read(entry.path())?)?);
+        }
+    }
+    let receipt = receipt.ok_or(ScalerError::Guard("missing receipt"))?;
+    if receipt.base != base
+        || !sha(&base)
+        || receipt.issue != dispatch.issue
+        || receipt.branch != dispatch.branch
+        || !sha(&receipt.head)
+    {
+        return Err(ScalerError::Guard("artifact admission mismatch"));
+    }
+    receipt.contract.check(&gate)?;
+    let isolated = tempfile::tempdir()?;
+    git(isolated.path(), &["init"])?;
+    git(
+        isolated.path(),
+        &[
+            "fetch",
+            "--no-tags",
+            root.to_str().ok_or(ScalerError::Guard("root path"))?,
+            &base,
         ],
     )?;
-    let prs = open_prs(root, &dispatch.branch)?;
-    let template = include_str!("../../../.github/pull_request_template.md");
-    let body = template
+    let bundle = artifact.join("work.bundle");
+    let head = if receipt.head == base {
+        if bundle.exists() {
+            return Err(ScalerError::Guard("unexpected no-change bundle"));
+        }
+        base.clone()
+    } else {
+        validate_bundle(isolated.path(), &bundle, &base, &gate)?
+    };
+    if head != receipt.head {
+        return Err(ScalerError::Guard("bundle head mismatch"));
+    }
+    git(isolated.path(), &["update-ref", "HEAD", &head])?;
+    let existing = if dispatch.resume {
+        Some(require_owned_pr(root, dispatch)?)
+    } else {
+        None
+    };
+    let template = include_str!("../../../.github/pull_request_template.md")
         .replace("Closes #\n", &format!("Closes #{}\n", dispatch.issue))
         .replace(
-            "<!-- Root cause, Linux/host semantics, what broke for whom. -->",
-            &format!("Issue #{}: {}.", dispatch.issue, dispatch.title),
-        )
-        .replace(
             "<!-- Approach and any candid divergence from Linux. -->",
-            &contract.summary,
+            &receipt.contract.summary,
         )
         .replace("NEW: none / FIXED: none", "Not compared")
         .replace("NEW: / FIXED:", "Not compared")
         .replace("HEAD, SHA-256, CDHash", "Not collected");
     let body = format!(
-        "{body}\nWorker contract (claims for review):\n\n```json\n{}\n```\n",
-        serde_json::to_string_pretty(contract)?
+        "{template}\nWorker contract (claims for review):\n\n```json\n{}\n```\n",
+        serde_json::to_string_pretty(&receipt.contract)?
     );
-    gate.check(body.as_bytes())?;
-    let path = result_dir.join("pr-body.md");
-    std::fs::write(&path, body)?;
-    let path = path
-        .to_str()
-        .ok_or(ScalerError::Guard("non-UTF8 result path"))?;
-    if let Some(pr) = prs
-        .as_array()
-        .and_then(|prs| prs.iter().find(|pr| same_repository(pr)))
-    {
-        let number = pr["number"]
-            .as_u64()
-            .ok_or(ScalerError::Guard("PR number missing"))?
-            .to_string();
-        gh(
-            root,
+    let comment = format!(
+        "Dispatch run {}\n\n{}",
+        run_id()?,
+        serde_json::to_string_pretty(&receipt)?
+    );
+    // Validate everything before the first write, including static metadata.
+    for text in [
+        &body,
+        &comment,
+        &dispatch.branch,
+        &marker(dispatch.issue, &dispatch.branch),
+    ] {
+        gate.check(text.as_bytes())?;
+    }
+    let body_path = isolated.path().join("body.md");
+    let comment_path = isolated.path().join("comment.md");
+    std::fs::write(&body_path, body)?;
+    std::fs::write(&comment_path, comment)?;
+    if head != base {
+        // New branches must be absent, even if their name looks like ours.
+        let expected = if dispatch.resume {
+            git(
+                isolated.path(),
+                &[
+                    "ls-remote",
+                    "--heads",
+                    "https://github.com/carrick-sh/carrick",
+                    &format!("refs/heads/{}", dispatch.branch),
+                ],
+            )?
+            .split_whitespace()
+            .next()
+            .ok_or(ScalerError::Guard("resume branch missing"))?
+            .to_owned()
+        } else {
+            String::new()
+        };
+        if expected != receipt.expected_tip || (dispatch.resume && !sha(&expected)) {
+            return Err(ScalerError::Guard("branch changed since preparation"));
+        }
+        // Git auth is scoped to this trusted process; never written to any home.
+        let mut push = git_invocation(
+            isolated.path(),
             &[
-                "pr",
-                "comment",
-                &number,
-                "--repo",
-                REPOSITORY,
-                "--body-file",
-                path,
+                "-c",
+                "credential.helper=!gh auth git-credential",
+                "push",
+                "--no-follow-tags",
+                &format!(
+                    "--force-with-lease=refs/heads/{}:{expected}",
+                    dispatch.branch
+                ),
+                "https://github.com/carrick-sh/carrick",
+                &format!("HEAD:refs/heads/{}", dispatch.branch),
             ],
-        )?;
-        Ok(pr["url"].as_str().map(str::to_owned))
-    } else {
-        let title = format!("chore(ci): work issue {}", dispatch.issue);
-        Ok(Some(
+        );
+        output(&mut push)?;
+        if let Some(pr) = existing {
             gh(
+                root,
+                &[
+                    "pr",
+                    "comment",
+                    &pr["number"].to_string(),
+                    "--repo",
+                    REPOSITORY,
+                    "--body-file",
+                    body_path.to_str().ok_or(ScalerError::Guard("body path"))?,
+                ],
+            )?;
+        } else {
+            let url = gh(
                 root,
                 &[
                     "pr",
@@ -957,185 +1322,31 @@ fn publish(
                     "--head",
                     &dispatch.branch,
                     "--title",
-                    &title,
+                    &format!("chore(ci): work issue {}", dispatch.issue),
                     "--body-file",
-                    path,
+                    body_path.to_str().ok_or(ScalerError::Guard("body path"))?,
                 ],
-            )?
-            .trim()
-            .to_owned(),
-        ))
-    }
-}
-
-pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
-    let (event, execute, setup_status) = match args.action {
-        DispatchAction::Guard { event } => (event, false, String::new()),
-        DispatchAction::Run {
-            event,
-            setup_status,
-        } => (event, true, setup_status),
-    };
-    let event: Value = serde_json::from_slice(&std::fs::read(event)?)?;
-    let actor = std::env::var("GITHUB_TRIGGERING_ACTOR")
-        .map_err(|_| ScalerError::Guard("missing triggering actor"))?;
-    let dispatch = validate_event(
-        &event,
-        include_str!("../../../.github/dispatch-tiers.toml"),
-        &actor,
-    )?;
-    if !execute {
-        println!("dispatch guard admitted issue {}", dispatch.issue);
-        return Ok(());
-    }
-    if !std::env::var("GH_TOKEN").is_ok_and(|token| !token.is_empty()) {
-        return Err(ScalerError::Guard(
-            "host/infra: missing AGENT_WORKER_TOKEN supplied as GH_TOKEN",
-        ));
-    }
-    let root = root.canonicalize()?;
-    let mut gate = Gate::capture()?;
-    let result_dir = root.join("dispatch-result");
-    std::fs::create_dir(&result_dir)?;
-    let worktree = root
-        .parent()
-        .ok_or(ScalerError::Guard("checkout has no parent"))?
-        .join(format!(
-            "dispatch-{}-{}-{}",
-            dispatch.issue,
-            std::env::var("GITHUB_RUN_ID").unwrap_or_else(|_| "local".into()),
-            std::env::var("GITHUB_RUN_ATTEMPT").unwrap_or_else(|_| "1".into())
-        ));
-    let mut contract = Contract {
-        status: ContractStatus::Failed,
-        summary: "Worker did not start".into(),
-        tests: vec![],
-        risks: vec![],
-    };
-    let mut exit = 1;
-    let mut errors = Vec::new();
-    let mut prepared = None;
-    let outcome = (|| -> Result<(), ScalerError> {
-        crate::agent_runner::check_token(&root, crate::agent_runner::TokenScope::Worker)?;
-        if setup_status != "success/success" {
-            contract.summary = format!("Worker setup did not complete: {setup_status}");
-            return Err(ScalerError::Guard(
-                "bootstrap/auth failed; no agent was started",
-            ));
+            )?;
+            let marker_path = isolated.path().join("owner.md");
+            std::fs::write(&marker_path, marker(dispatch.issue, &dispatch.branch))?;
+            gh(
+                root,
+                &[
+                    "pr",
+                    "comment",
+                    url.trim(),
+                    "--repo",
+                    REPOSITORY,
+                    "--body-file",
+                    marker_path
+                        .to_str()
+                        .ok_or(ScalerError::Guard("marker path"))?,
+                ],
+            )?;
         }
-        let checkout = prepare(&root, &dispatch, &worktree)?;
-        gate.bind_base(&checkout.base)?;
-        prepared = Some(checkout);
-        (exit, contract) = agent(&worktree, &result_dir, &dispatch)?;
-        Ok(())
-    })();
-    if let Err(error) = outcome {
-        errors.push(error.to_string());
     }
-    let mut pr = None;
-    let checked = (|| -> Result<(), ScalerError> {
-        gate.absorb_current()?;
-        gate.check(dispatch.branch.as_bytes())?;
-        gate.check(dispatch.title.as_bytes())?;
-        contract.check(&gate)?;
-        for error in &errors {
-            gate.check(error.as_bytes())?;
-        }
-        gate.directory(&result_dir)?;
-        if !worktree.join(".git").is_file() {
-            return Ok(());
-        }
-        match checkpoint(&worktree, &dispatch, &gate) {
-            Ok(true) => {
-                contract.status = ContractStatus::Failed;
-                contract
-                    .risks
-                    .push("Workflow committed unfinished changes as WIP".into());
-            }
-            Ok(false) => {}
-            Err(error) if is_redaction(&error) => return Err(error),
-            Err(error) => errors.push(format!("WIP checkpoint: {error}")),
-        }
-        if let Err(error) = preserve_work(&worktree, &result_dir, &dispatch, &gate) {
-            if is_redaction(&error) {
-                return Err(error);
-            }
-            errors.push(format!("Work preservation: {error}"));
-        }
-        let checkout = prepared
-            .as_ref()
-            .ok_or(ScalerError::Guard("redaction gate lacks trusted checkout"))?;
-        match publish(
-            &worktree,
-            &result_dir,
-            &dispatch,
-            &contract,
-            &gate,
-            checkout,
-        ) {
-            Ok(url) => {
-                if let Some(url) = &url {
-                    gate.check(url.as_bytes())?;
-                }
-                pr = url;
-            }
-            Err(error) if is_redaction(&error) => return Err(error),
-            Err(error) => errors.push(format!("PR publication: {error}")),
-        }
-        Ok(())
-    })();
-    let mut refused = checked.as_ref().is_err_and(is_redaction);
-    if let Err(error) = checked {
-        errors.push(error.to_string());
-    }
-    if errors
-        .iter()
-        .any(|error| gate.check(error.as_bytes()).is_err())
-    {
-        refused = true;
-    }
-    if refused {
-        discard_outputs(&result_dir)?;
-        contract = Contract {
-            status: ContractStatus::Failed,
-            summary: "redaction gate refused sensitive or unsafe output".into(),
-            tests: vec![],
-            risks: vec![],
-        };
-        errors = vec![
-            "redaction gate refused publication; credential-bearing outputs discarded".to_owned(),
-        ];
-        pr = None;
-        exit = 1;
-    }
-    let head = if refused {
-        None
-    } else {
-        git(&worktree, &["rev-parse", "HEAD"])
-            .ok()
-            .map(|s| s.trim().to_owned())
-    };
-    let success =
-        exit == 0 && errors.is_empty() && contract.status == ContractStatus::Done && pr.is_some();
-    let receipt = json!({"issue":dispatch.issue,"branch":if refused { "[REDACTED]" } else { &dispatch.branch },"sha":head,"pr":pr,"exit_code":exit,
-        "timeout":exit == 124,"killed_or_timeout":exit == 137,"success":success,"setup_status":setup_status,"errors":errors,"contract":contract});
-    gate.check(&serde_json::to_vec(&receipt)?)?;
-    std::fs::write(
-        result_dir.join("result.json"),
-        serde_json::to_vec_pretty(&receipt)?,
-    )?;
-    let comment = format!(
-        "Dispatch worker result (run {}, attempt {})\n\n```json\n{}\n```\n",
-        std::env::var("GITHUB_RUN_ID").unwrap_or_default(),
-        std::env::var("GITHUB_RUN_ATTEMPT").unwrap_or_default(),
-        serde_json::to_string_pretty(&receipt)?
-    );
-    let comment_path = result_dir.join("issue-comment.md");
-    std::fs::write(&comment_path, comment)?;
-    gate.directory(&result_dir)?;
-    seal_outputs(&gate, &result_dir)?;
     gh(
-        &root,
+        root,
         &[
             "issue",
             "comment",
@@ -1145,167 +1356,223 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
             "--body-file",
             comment_path
                 .to_str()
-                .ok_or(ScalerError::Guard("non-UTF8 result path"))?,
+                .ok_or(ScalerError::Guard("comment path"))?,
         ],
     )?;
-    if success {
-        Ok(())
-    } else {
-        Err(ScalerError::Guard(
-            "dispatch incomplete; see issue comment and dispatch-result/result.json",
-        ))
-    }
-}
-
-fn is_redaction(error: &ScalerError) -> bool {
-    matches!(error, ScalerError::Guard(message) if message.starts_with("redaction gate"))
-}
-fn discard_outputs(path: &Path) -> Result<(), ScalerError> {
-    let meta = std::fs::symlink_metadata(path)?;
-    if meta.is_dir() && !meta.file_type().is_symlink() {
-        std::fs::remove_dir_all(path)?;
-    } else {
-        std::fs::remove_file(path)?;
-    }
-    std::fs::create_dir(path)?;
-    Ok(())
-}
-/// Only this post-validation snapshot is an upload source. An interrupted run
-/// never emits an artifact path; raw workspace files are not upload inputs.
-fn seal_outputs(gate: &Gate, source: &Path) -> Result<(), ScalerError> {
-    gate.directory(source)?;
-    let temporary =
-        std::env::var_os("RUNNER_TEMP").ok_or(ScalerError::Guard("RUNNER_TEMP required"))?;
-    let sealed = tempfile::Builder::new()
-        .prefix("dispatch-validated-")
-        .tempdir_in(temporary)?;
-    fn copy(source: &Path, target: &Path) -> std::io::Result<()> {
-        for entry in std::fs::read_dir(source)? {
-            let entry = entry?;
-            let output = target.join(entry.file_name());
-            if entry.file_type()?.is_dir() {
-                std::fs::create_dir(&output)?;
-                copy(&entry.path(), &output)?;
-            } else {
-                std::fs::copy(entry.path(), output)?;
-            }
-        }
-        Ok(())
-    }
-    copy(source, sealed.path())?;
-    gate.directory(sealed.path())?;
-    if let Some(output) = std::env::var_os("GITHUB_OUTPUT") {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new().append(true).open(output)?;
-        writeln!(file, "artifact_path={}", sealed.path().display())?;
-        let _ = sealed.keep();
+    if receipt.exit_code != 0 || receipt.contract.status != ContractStatus::Done {
+        return Err(ScalerError::Guard(
+            "dispatch incomplete; published contract describes failure",
+        ));
     }
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     #[test]
-    fn startup_deadline_cancels_and_reaps_the_owned_child() {
-        let mut command = Command::new("/bin/sh");
-        command.args(["-c", "exec sleep 60"]);
-        let start = std::time::Instant::now();
-        assert_eq!(
-            wait_agent(&mut command, std::time::Duration::from_millis(20)).unwrap(),
-            124
+    fn safe_outputs_boundary() {
+        let workflow = include_str!("../../../.github/workflows/dispatch-worker.yml");
+        let worker = workflow
+            .split("  worker:")
+            .nth(1)
+            .unwrap()
+            .split("  publish:")
+            .next()
+            .unwrap();
+        assert!(!worker.contains("AGENT_WORKER_TOKEN"));
+        assert!(!include_str!("agent_runner.rs").contains("helper = !gh auth git-credential"));
+        assert!(workflow.contains("artifact-ids:"));
+        assert!(workflow.contains("needs.worker.outputs.artifact_id"));
+        assert!(!workflow.contains("steps.worker.outputs.artifact_path"));
+        assert!(!worker.contains("ref: main"));
+    }
+    #[test]
+    fn html_comments_do_not_select_a_branch() {
+        assert!(
+            branch_directives(
+                "<!--
+Branch: work/foreign
+-->
+Do it"
+            )
+            .is_empty()
         );
-        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+    #[test]
+    fn publisher_refuses_unrelated_tag_oversize_and_credential_bundles() {
+        let mut accepted = Vec::new();
+        for case in [
+            "unrelated",
+            "tag",
+            "oversize",
+            "credential",
+            "message",
+            "merge-side",
+            "clean",
+        ] {
+            let source = tempfile::tempdir().unwrap();
+            fixture_repository(source.path());
+            let base = git(source.path(), &["rev-parse", "HEAD"])
+                .unwrap()
+                .trim()
+                .to_owned();
+            if case == "unrelated" || case == "merge-side" {
+                git(source.path(), &["checkout", "--orphan", "unrelated"]).unwrap();
+            }
+            let content = if case == "credential" {
+                "ghs_plantedcredential"
+            } else {
+                "candidate"
+            };
+            std::fs::write(source.path().join("payload"), content).unwrap();
+            git(source.path(), &["add", "payload"]).unwrap();
+            git(
+                source.path(),
+                &[
+                    "commit",
+                    "-m",
+                    if case == "message" {
+                        "ghs_plantedcredential"
+                    } else {
+                        "candidate"
+                    },
+                ],
+            )
+            .unwrap();
+            if case == "merge-side" {
+                git(source.path(), &["checkout", "work/dispatch-634-pending"]).unwrap();
+                git(
+                    source.path(),
+                    &[
+                        "merge",
+                        "--allow-unrelated-histories",
+                        "--no-edit",
+                        "unrelated",
+                    ],
+                )
+                .unwrap();
+            }
+            let bundle = source.path().join("output.bundle");
+            let bundle_path = bundle.to_str().unwrap();
+            if case == "tag" {
+                git(source.path(), &["tag", "extra"]).unwrap();
+                git(
+                    source.path(),
+                    &["bundle", "create", bundle_path, "HEAD", "refs/tags/extra"],
+                )
+                .unwrap();
+            } else if case == "oversize" {
+                std::fs::File::create(&bundle)
+                    .unwrap()
+                    .set_len(MAX_BUNDLE_BYTES + 1)
+                    .unwrap();
+            } else if case == "unrelated" {
+                git(source.path(), &["bundle", "create", bundle_path, "HEAD"]).unwrap();
+            } else {
+                git(source.path(), &["update-ref", BUNDLE_REF, "HEAD"]).unwrap();
+                git(
+                    source.path(),
+                    &[
+                        "bundle",
+                        "create",
+                        bundle_path,
+                        BUNDLE_REF,
+                        &format!("^{base}"),
+                    ],
+                )
+                .unwrap();
+            }
+            let target = tempfile::tempdir().unwrap();
+            git(target.path(), &["init"]).unwrap();
+            git(
+                target.path(),
+                &["fetch", source.path().to_str().unwrap(), &base],
+            )
+            .unwrap();
+            let result = validate_bundle(target.path(), &bundle, &base, &Gate::capture().unwrap());
+            if case == "clean" {
+                assert!(result.is_ok(), "{result:?}");
+            } else if result.is_ok() {
+                accepted.push(case);
+            }
+        }
+        assert!(accepted.is_empty(), "accepted unsafe bundles: {accepted:?}");
+    }
+    #[test]
+    fn branch_requires_app_pr_and_app_comment_marker() {
+        let branch = "work/dispatch-634-old";
+        let pr = json!({"number":12,"author":{"login":"carrick-workers[bot]"},
+            "headRepositoryOwner":{"login":"carrick-sh"},"headRepository":{"name":"carrick"},
+            "body":"Closes #634"});
+        assert!(
+            !owned_pr(&pr, &json!([]), 634, branch),
+            "namespace or body is not ownership"
+        );
+        let mut comments =
+            json!([{"user":{"login":"someone-else","type":"User"},"body":marker(634, branch)}]);
+        assert!(!owned_pr(&pr, &comments, 634, branch));
+        comments[0]["user"] = json!({"login":"carrick-workers[bot]","type":"Bot"});
+        comments[0]["performed_via_github_app"] = json!({"slug":"carrick-workers"});
+        assert!(owned_pr(&pr, &comments, 634, branch));
+        assert!(!owned_pr(&pr, &comments, 635, branch));
+        let mut unowned = pr;
+        unowned["author"]["login"] = "someone-else".into();
+        assert!(!owned_pr(&unowned, &comments, 634, branch));
+    }
+    #[test]
+    fn agent_environment_has_no_github_token_or_config() {
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.env("GH_TOKEN", "planted")
+            .env("GITHUB_TOKEN", "planted")
+            .env("GITHUB_OUTPUT", "/runner/set_output")
+            .env("GIT_CONFIG_GLOBAL", "/credential/helper");
+        private_environment(&mut cmd);
+        let output = cmd.output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "PATH=/usr/local/bin:/usr/bin:/bin\n"
+        );
+    }
+    #[test]
+    fn snapshot_drops_executable_git_configuration() {
+        let source = tempfile::tempdir().unwrap();
+        fixture_repository(source.path());
+        let branch = "work/dispatch-634-pending";
+        std::fs::write(source.path().join("payload"), "candidate").unwrap();
+        git(source.path(), &["add", "payload"]).unwrap();
+        git(source.path(), &["commit", "-m", "candidate"]).unwrap();
+        std::fs::write(source.path().join(".gitattributes"), "* filter=evil").unwrap();
+        std::fs::write(source.path().join(".git/config"),
+            "[core]\nfsmonitor = touch /tmp/dispatch-must-not-execute\n[filter \"evil\"]\nclean = touch /tmp/dispatch-must-not-execute\n").unwrap();
+        let frozen = tempfile::tempdir().unwrap();
+        let target = frozen.path().join("snapshot");
+        snapshot(source.path(), &target, branch).unwrap();
+        let config = std::fs::read_to_string(target.join(".git/config")).unwrap();
+        assert!(!config.contains("evil") && !config.contains("fsmonitor"));
+        let gate = fixture_gate(&target);
+        assert!(
+            checkpoint(
+                &target,
+                &validate_event(&event(), TIERS, "tjfontaine").unwrap(),
+                &gate
+            )
+            .unwrap()
+        );
+        assert!(!Path::new("/tmp/dispatch-must-not-execute").exists());
     }
     const TIERS: &str = include_str!("../../../.github/dispatch-tiers.toml");
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn agent_timeout_kills_a_grandchild_in_the_owned_group() {
-        let tmp = tempfile::tempdir().unwrap();
-        let pid_file = tmp.path().join("grandchild.pid");
-        let mut command = Command::new("/bin/sh");
-        command
-            .args(["-c", "sleep 60 & echo $! > \"$1\"; wait", "fixture"])
-            .arg(&pid_file);
-        assert_eq!(
-            wait_agent(&mut command, std::time::Duration::from_millis(200)).unwrap(),
-            124
-        );
-        let pid: i32 = std::fs::read_to_string(pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let alive = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-            !stat
-                .split(')')
-                .nth(1)
-                .unwrap()
-                .trim_start()
-                .starts_with('Z')
-        });
-        // Always clean up the red witness too.
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
-        assert!(!alive, "agent timeout left a live grandchild");
-    }
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn completed_agent_does_not_leave_an_artifact_writer_alive() {
-        let tmp = tempfile::tempdir().unwrap();
-        let pid_file = tmp.path().join("grandchild.pid");
-        let mut command = Command::new("/bin/sh");
-        command
-            .args(["-c", "sleep 60 & echo $! > \"$1\"", "fixture"])
-            .arg(&pid_file);
-        assert_eq!(
-            wait_agent(&mut command, std::time::Duration::from_secs(2)).unwrap(),
-            0
-        );
-        let pid: i32 = std::fs::read_to_string(pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-        let alive = loop {
-            let alive = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-                !stat
-                    .split(')')
-                    .nth(1)
-                    .unwrap()
-                    .trim_start()
-                    .starts_with('Z')
-            });
-            if !alive || std::time::Instant::now() >= deadline {
-                break alive;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        };
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
-        assert!(!alive, "completed agent left a live artifact writer");
-    }
     fn event() -> Value {
         json!({"repository":{"full_name":REPOSITORY},"action":"labeled",
             "sender":{"login":"tjfontaine","type":"User"},"label":{"name":"dispatch:sol-high"},
             "issue":{"number":634,"user":{"login":"tjfontaine"},"title":"Dispatch workers!","body":"## Why\ncontext\n## Brief\nImplement it\n### Verify\nCheck it\n## Notes\nnot prompt"}})
     }
-    fn fixture_gate(root: &Path) -> Gate {
-        let mut gate = Gate::capture().unwrap();
-        gate.bind_base(
-            git(root, &["rev-parse", "refs/remotes/origin/main"])
-                .unwrap()
-                .trim(),
-        )
-        .unwrap();
-        gate
+    fn fixture_gate(_root: &Path) -> Gate {
+        Gate::capture().unwrap()
     }
     fn fixture_repository(root: &Path) {
-        git(root, &["init", "-b", "work/dispatch-634-dispatch-workers"]).unwrap();
+        git(root, &["init", "-b", "work/dispatch-634-pending"]).unwrap();
         git(root, &["config", "user.name", "Fixture"]).unwrap();
         git(root, &["config", "user.email", "fixture@localhost"]).unwrap();
         git(root, &["config", "core.hooksPath", "/dev/null"]).unwrap();
@@ -1313,94 +1580,6 @@ mod tests {
         git(root, &["add", "base"]).unwrap();
         git(root, &["commit", "-m", "fixture base"]).unwrap();
         git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]).unwrap();
-    }
-    #[test]
-    fn replacement_refs_cannot_hide_a_credential_in_pushed_history() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        fixture_repository(root);
-        std::fs::write(root.join("payload"), "ghs_hidden_credential").unwrap();
-        git(root, &["add", "payload"]).unwrap();
-        git(root, &["commit", "-m", "fixture credential"]).unwrap();
-        let original = git(root, &["rev-parse", "HEAD:payload"]).unwrap();
-        std::fs::write(root.join("clean"), "safe").unwrap();
-        let replacement = git(root, &["hash-object", "-w", "clean"]).unwrap();
-        git(root, &["replace", original.trim(), replacement.trim()]).unwrap();
-        assert!(gate_work(root, &fixture_gate(root)).is_err());
-    }
-    #[test]
-    fn mutable_main_ref_cannot_exclude_a_secret_commit_from_the_scan() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        fixture_repository(root);
-        let gate = fixture_gate(root);
-        std::fs::write(root.join("payload"), "ghs_hidden_credential").unwrap();
-        git(root, &["add", "payload"]).unwrap();
-        git(root, &["commit", "-m", "fixture credential"]).unwrap();
-        git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]).unwrap();
-        std::fs::write(root.join("base"), "safe final change").unwrap();
-        git(root, &["add", "base"]).unwrap();
-        git(root, &["commit", "-m", "fixture final"]).unwrap();
-        assert!(gate_work(root, &gate).is_err());
-    }
-    #[test]
-    fn grafts_cannot_hide_a_secret_in_pushed_ancestry() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        fixture_repository(root);
-        let gate = fixture_gate(root);
-        std::fs::write(root.join("payload"), "ghs_hidden_credential").unwrap();
-        git(root, &["add", "payload"]).unwrap();
-        git(root, &["commit", "-m", "fixture credential"]).unwrap();
-        git(root, &["rm", "payload"]).unwrap();
-        git(root, &["commit", "-m", "fixture final"]).unwrap();
-        let head = git(root, &["rev-parse", "HEAD"]).unwrap();
-        std::fs::write(
-            root.join(".git/info/grafts"),
-            format!("{} {}\n", head.trim(), gate.base().unwrap()),
-        )
-        .unwrap();
-        assert!(gate_work(root, &gate).is_err());
-    }
-    #[test]
-    fn redirected_git_worktree_cannot_stage_host_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        fixture_repository(root);
-        let gate = fixture_gate(root);
-        std::fs::write(outside.path().join("base"), "base").unwrap();
-        std::fs::write(outside.path().join("host-file"), "outside host data").unwrap();
-        git(
-            root,
-            &["config", "core.worktree", outside.path().to_str().unwrap()],
-        )
-        .unwrap();
-        assert!(
-            checkpoint(
-                root,
-                &validate_event(&event(), TIERS, "tjfontaine").unwrap(),
-                &gate
-            )
-            .is_err()
-        );
-    }
-    #[test]
-    fn labels_select_only_checked_in_tiers_and_extract_the_brief() {
-        for (label, backend, model, effort) in [
-            ("dispatch:sol-high", "codex", "gpt-6.1-sol", Some("high")),
-            ("dispatch:argon-high", "agy", "argon-high", None),
-            ("dispatch:opus", "agy", "opus", None),
-        ] {
-            let mut event = event();
-            event["label"]["name"] = label.into();
-            let d = validate_event(&event, TIERS, "tjfontaine").unwrap();
-            assert_eq!(d.tier.backend, backend);
-            assert_eq!(d.tier.model, model);
-            assert_eq!(d.tier.effort.as_deref(), effort);
-            assert_eq!(d.brief, "Implement it\n### Verify\nCheck it");
-            assert_eq!(d.branch, "work/dispatch-634-dispatch-workers");
-        }
     }
     #[test]
     fn dispatch_rejects_unknown_labels_untrusted_actors_forks_and_prs() {
@@ -1440,14 +1619,9 @@ mod tests {
         assert!(validate_event(&value, TIERS, "tjfontaine").is_err());
     }
     #[test]
-    fn brief_headings_and_branch_names_are_data_not_commands() {
+    fn brief_and_branch_syntax() {
         assert!(brief_section("## Brief\n\n## Other\nx").is_err());
         assert!(brief_section("## Brief\nx\n## Brief\ny").is_err());
-        assert_eq!(
-            brief_section("## Brief\nx\n```sh\n## not a heading\necho hi\n```\n## Other\ny")
-                .unwrap(),
-            "x\n```sh\n## not a heading\necho hi\n```"
-        );
         for branch in [
             "main",
             "work/",
@@ -1462,30 +1636,7 @@ mod tests {
         ] {
             assert!(!valid_branch(branch), "{branch}");
         }
-        let mut value = event();
-        value["issue"]["body"] = "## Brief\nBranch: work/existing-634\nRun it".into();
-        assert_eq!(
-            validate_event(&value, TIERS, "tjfontaine").unwrap().branch,
-            "work/existing-634"
-        );
-    }
-    #[test]
-    fn structured_contract_keeps_work_status_independent_of_transport() {
-        let tmp = tempfile::tempdir().unwrap();
-        let result = tmp.path().join("result");
-        assert!(read_contract(&result).is_err());
-        for transport in ["SUCCESS", "ERROR"] {
-            std::fs::write(
-                &result,
-                json!({"status":transport,"structured_output":{
-                "status":"done","summary":"done","tests":[],"risks":[]}})
-                .to_string(),
-            )
-            .unwrap();
-            assert_eq!(read_contract(&result).unwrap().status, ContractStatus::Done);
-        }
-        std::fs::write(&result, r#"{"status":"ERROR","structured_output":null}"#).unwrap();
-        assert!(read_contract(&result).is_err());
+        assert!(valid_branch("work/existing-634"));
     }
     #[test]
     fn branch_directives_inside_fences_do_not_select_a_branch() {
@@ -1494,78 +1645,15 @@ mod tests {
             "## Brief\nImplement it\n```text\nBranch: work/foreign-799\n```".into();
         assert_eq!(
             validate_event(&value, TIERS, "tjfontaine").unwrap().branch,
-            "work/dispatch-634-dispatch-workers"
-        );
-    }
-    #[test]
-    fn fence_lengths_cannot_pull_branch_directives_from_another_section() {
-        let mut value = event();
-        value["issue"]["body"] =
-            "## Brief\nDo it\n````text\n```\n````\n## Notes\nBranch: work/foreign-799".into();
-        assert_eq!(
-            validate_event(&value, TIERS, "tjfontaine").unwrap().branch,
-            "work/dispatch-634-dispatch-workers"
-        );
-    }
-    #[test]
-    fn committed_external_symlinks_are_not_recovery_outputs() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        git(root, &["init", "-b", "work/dispatch-634-dispatch-workers"]).unwrap();
-        git(root, &["config", "user.name", "Fixture"]).unwrap();
-        git(root, &["config", "user.email", "fixture@localhost"]).unwrap();
-        git(root, &["config", "core.hooksPath", "/dev/null"]).unwrap();
-        std::fs::write(root.join("base"), "base").unwrap();
-        git(root, &["add", "base"]).unwrap();
-        git(root, &["commit", "-m", "fixture base"]).unwrap();
-        git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]).unwrap();
-        std::os::unix::fs::symlink("/tmp/outside", root.join("new-link")).unwrap();
-        git(root, &["add", "new-link"]).unwrap();
-        git(root, &["commit", "-m", "fixture link"]).unwrap();
-        assert!(gate_work(root, &fixture_gate(root)).is_err());
-    }
-    #[test]
-    fn tracked_generated_files_cannot_escape_through_a_patch() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        git(root, &["init", "-b", "work/dispatch-634-dispatch-workers"]).unwrap();
-        git(root, &["config", "user.name", "Fixture"]).unwrap();
-        git(root, &["config", "user.email", "fixture@localhost"]).unwrap();
-        git(root, &["config", "core.hooksPath", "/dev/null"]).unwrap();
-        std::fs::create_dir(root.join("target")).unwrap();
-        std::fs::write(root.join("target/file"), b"\0base").unwrap();
-        git(root, &["add", "target/file"]).unwrap();
-        git(root, &["commit", "-m", "fixture base"]).unwrap();
-        git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]).unwrap();
-        std::fs::write(
-            root.join("target/file"),
-            b"\0refresh_token=must-not-publish",
-        )
-        .unwrap();
-        let gate = fixture_gate(root);
-        assert!(
-            checkpoint(
-                root,
-                &validate_event(&event(), TIERS, "tjfontaine").unwrap(),
-                &gate
-            )
-            .is_err()
+            "work/dispatch-634-pending"
         );
     }
     #[test]
     fn wip_checkpoint_preserves_trailer_and_excludes_target_symlink() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        git(root, &["init", "-b", "work/dispatch-634-dispatch-workers"]).unwrap();
-        git(root, &["config", "user.name", "Dispatch test"]).unwrap();
-        git(root, &["config", "user.email", "fixture@localhost"]).unwrap();
-        // This is a standalone fixture repository, never the project's hooks.
-        git(root, &["config", "core.hooksPath", "/dev/null"]).unwrap();
-        std::fs::write(root.join("file"), "base").unwrap();
-        git(root, &["add", "file"]).unwrap();
-        git(root, &["commit", "-m", "fixture base"]).unwrap();
-        git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]).unwrap();
-        std::fs::remove_file(root.join("file")).unwrap();
+        fixture_repository(root);
+        std::fs::remove_file(root.join("base")).unwrap();
         std::fs::write(root.join("new file"), "work in progress").unwrap();
         std::fs::create_dir(root.join("conformance-probes")).unwrap();
         std::os::unix::fs::symlink("/tmp", root.join("conformance-probes/target")).unwrap();

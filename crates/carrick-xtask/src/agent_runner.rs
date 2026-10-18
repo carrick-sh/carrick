@@ -42,13 +42,14 @@ struct Tool {
 }
 
 fn invoke(dir: &Path, program: &str, args: &[&str]) -> Result<(), ScalerError> {
-    let result = execute(
-        std::process::Command::new(program)
-            .args(args)
-            .current_dir(dir),
-        &[],
-        std::time::Duration::from_secs(120),
-    );
+    let mut command = if program == "git" {
+        crate::dispatch_worker::git_invocation(dir, args)
+    } else {
+        let mut command = std::process::Command::new(program);
+        command.args(args).current_dir(dir);
+        command
+    };
+    let result = execute(&mut command, &[], std::time::Duration::from_secs(120));
     if let Err(error) = result {
         if program == "git" && args.first() == Some(&"fetch") {
             return Err(check_token(dir, TokenScope::Director)
@@ -304,10 +305,6 @@ fn bootstrap(root: &Path) -> Result<(), ScalerError> {
     let bin = state.join("bin");
     private_dir(&bin)?;
     private_dir(&state.join("home"))?;
-    secret_file(
-        &state.join("home/.gitconfig"),
-        b"[credential \"https://github.com\"]\n\thelper =\n\thelper = !gh auth git-credential\n",
-    )?;
     let manifest: Manifest =
         serde_json::from_str(include_str!("../../../scripts/ci/inputs/agent-tools.json"))?;
     if manifest.director_repository != "carrick-sh/agy-director"
@@ -354,7 +351,6 @@ fn bootstrap(root: &Path) -> Result<(), ScalerError> {
     // Cargo's repository toolchain selection installs rust-toolchain.toml before
     // this driver is built. The workflow caches tools, never the isolated home.
     invoke(root, "rustup", &["show", "active-toolchain"])?;
-    invoke(root, "gh", &["auth", "setup-git"])?;
     let director = state.join("director");
     private_dir(&director)?;
     invoke(&director, "git", &["init"])?;
@@ -362,6 +358,12 @@ fn bootstrap(root: &Path) -> Result<(), ScalerError> {
         &director,
         "git",
         &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "credential.helper=!gh auth git-credential",
             "fetch",
             "--depth=1",
             "https://github.com/carrick-sh/agy-director",
@@ -420,6 +422,7 @@ pub fn run(root: &Path, args: Args) -> Result<(), ScalerError> {
         Action::Bootstrap => bootstrap(root),
         Action::Auth { event } => auth(&event),
         Action::Cleanup => {
+            crate::dispatch_worker::cleanup_agent_user()?;
             let state = state()?;
             match std::fs::symlink_metadata(&state) {
                 Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {

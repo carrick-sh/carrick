@@ -8,7 +8,6 @@ const MAX_OUTPUT_BYTES: u64 = 20 * MAX_FILE_BYTES;
 const REFUSAL: &str = "redaction gate refused sensitive or unsafe output";
 pub(crate) struct Gate {
     secrets: Vec<String>,
-    base: Option<String>,
 }
 impl Gate {
     fn add(&mut self, value: &str) {
@@ -53,10 +52,7 @@ impl Gate {
     }
     /// Capture once before agent execution, never from agent-modified state.
     pub(crate) fn capture() -> Result<Self, ScalerError> {
-        let mut gate = Self {
-            secrets: vec![],
-            base: None,
-        };
+        let mut gate = Self { secrets: vec![] };
         for key in [
             "CODEX_AUTH_JSON",
             "AGY_OAUTH_TOKEN",
@@ -110,22 +106,20 @@ impl Gate {
             Ok(())
         }
     }
-    pub(crate) fn bind_base(&mut self, base: &str) -> Result<(), ScalerError> {
-        if self.base.is_some() || base.len() != 40 || !base.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(ScalerError::Guard(REFUSAL));
-        }
-        self.base = Some(base.to_owned());
-        Ok(())
-    }
-    pub(crate) fn base(&self) -> Result<&str, ScalerError> {
-        self.base.as_deref().ok_or(ScalerError::Guard(REFUSAL))
-    }
-    pub(crate) fn absorb_current(&mut self) -> Result<(), ScalerError> {
-        for value in Self::capture()
-            .map_err(|_| ScalerError::Guard(REFUSAL))?
-            .secrets
-        {
-            self.add(&value);
+    pub(crate) fn absorb_provider_home(&mut self, home: &Path) -> Result<(), ScalerError> {
+        for relative in [
+            ".codex/auth.json",
+            ".gemini/antigravity-cli/antigravity-oauth-token",
+        ] {
+            let path = home.join(relative);
+            if !path.exists() {
+                continue;
+            }
+            let meta = std::fs::symlink_metadata(&path)?;
+            if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
+                return Err(ScalerError::Guard(REFUSAL));
+            }
+            self.add(&std::fs::read_to_string(path)?);
         }
         Ok(())
     }
@@ -138,26 +132,20 @@ impl Gate {
         Ok(meta.len())
     }
     pub(crate) fn directory(&self, path: &Path) -> Result<(), ScalerError> {
-        fn scan(gate: &Gate, path: &Path, total: &mut u64) -> Result<(), ScalerError> {
-            for entry in std::fs::read_dir(path)? {
-                let entry = entry?;
-                gate.check(entry.file_name().as_encoded_bytes())?;
-                if entry.file_type()?.is_dir() {
-                    scan(gate, &entry.path(), total)?;
-                } else {
-                    *total += gate.file(&entry.path())?;
-                }
-                if *total > MAX_OUTPUT_BYTES {
-                    return Err(ScalerError::Guard(REFUSAL));
-                }
-            }
-            Ok(())
-        }
-        let meta = std::fs::symlink_metadata(path).map_err(|_| ScalerError::Guard(REFUSAL))?;
+        let meta = std::fs::symlink_metadata(path)?;
         if !meta.is_dir() || meta.file_type().is_symlink() {
             return Err(ScalerError::Guard(REFUSAL));
         }
-        scan(self, path, &mut 0).map_err(|_| ScalerError::Guard(REFUSAL))
+        let mut total = 0;
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            self.check(entry.file_name().as_encoded_bytes())?;
+            total += self.file(&entry.path())?;
+            if total > MAX_OUTPUT_BYTES {
+                return Err(ScalerError::Guard(REFUSAL));
+            }
+        }
+        Ok(())
     }
     pub(crate) fn diagnostic(&self, bytes: &[u8]) -> String {
         let text = String::from_utf8_lossy(bytes);
