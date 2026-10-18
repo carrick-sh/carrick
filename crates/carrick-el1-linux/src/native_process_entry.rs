@@ -18,21 +18,24 @@ pub struct WaitStatusCopy<C, U> {
 }
 /// Only a successful external copy can construct this reap authorization.
 #[must_use]
-pub struct CopiedWaitStatus<C, U>(WaitStatusCopy<C, U>);
+pub struct CopiedWaitStatus<C, U>(Box<WaitStatusCopy<C, U>>);
 impl<C, U> WaitStatusCopy<C, U> {
     pub fn zombie(&self) -> &Zombie<C, U, LinuxWaitStatus> {
         &self.zombie
     }
+    // The external copy may nest a descriptor transaction; keep scan/reap
+    // scratch in its caller off that chain.
+    #[inline(never)]
     pub fn copy_with<E>(
         self,
         copy: impl FnOnce(&Zombie<C, U, LinuxWaitStatus>) -> Result<(), E>,
     ) -> Result<CopiedWaitStatus<C, U>, E> {
         copy(&self.zombie)?;
-        Ok(CopiedWaitStatus(self))
+        Ok(CopiedWaitStatus(Box::new(self)))
     }
 }
 pub enum CopiedWaitOutcome<C, U, N: NativeProcessCustody> {
-    Consumed(GuestConsumedWait<C, U, N>),
+    Consumed(Box<GuestConsumedWait<C, U, N>>),
     Rescan(WaitWork<C, U, N>),
 }
 impl<C: Copy + Ord, U: Clone> CopiedWaitStatus<C, U> {
@@ -46,7 +49,7 @@ impl<C: Copy + Ord, U: Clone> CopiedWaitStatus<C, U> {
         if matches!(consumed.selection, WaitSelection::NoChild) {
             return scan_wait(owner, self.0.caller, self.0.query).map(CopiedWaitOutcome::Rescan);
         }
-        Ok(CopiedWaitOutcome::Consumed(consumed))
+        Ok(CopiedWaitOutcome::Consumed(Box::new(consumed)))
     }
 }
 /// Preserve shared readiness and enrollment tokens for every non-zombie result.
@@ -106,7 +109,7 @@ pub type ForkPublicationResult<C, U, N, M, B> = Result<
 pub type ExitPublicationResult<N> = Result<
     (
         Option<<N as NativeProcessCustody>::Resources>,
-        GuestPublishedExit<N>,
+        Box<GuestPublishedExit<N>>,
     ),
     GuestProcessError<<N as NativeProcessCustody>::Error>,
 >;
@@ -253,7 +256,7 @@ pub fn publish_exit<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestPr
 fn finish_exit<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>(
     pending: GuestPendingExit<'_, C, U, N, F>,
 ) -> ExitPublicationResult<N> {
-    let mut published = pending.publish()?;
+    let mut published = Box::new(pending.publish()?);
     let resources = published.take_resources();
     Ok((resources, published))
 }

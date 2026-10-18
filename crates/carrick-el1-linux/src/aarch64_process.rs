@@ -141,12 +141,14 @@ pub(super) fn resume_selected<'a, X: ForkStockCrossing>(
     let address = context.address_context().unwrap_or_else(|| fatal());
     task.publish_visible_pid(visible_pid);
     task.publish_root_generation(address.generation);
-    let words = *context;
-    #[cfg(target_os = "none")]
-    drain_native_signal_ingress(owner_registry, source, service);
-    let mut entry = runtime
-        .enter_registered(owner_registry, source, task, address, words, service)
-        .unwrap_or_else(|_| fatal());
+    let mut entry = {
+        let words = Box::new(*context);
+        #[cfg(target_os = "none")]
+        drain_native_signal_ingress(owner_registry, source, service);
+        runtime
+            .enter_registered(owner_registry, source, task, address, &words, service)
+            .unwrap_or_else(|_| fatal())
+    };
     entry.resume_checkpoint().unwrap_or_else(|reason| {
         super::native_run_failure::complete_native_run_failure(
             common_entry::execution_binding(task),
@@ -214,7 +216,7 @@ pub(super) fn map_resume<X: ForkStockCrossing>(
 pub(super) fn process_record_for_call(
     source: BornInZoneSource<'_, Aarch64ParkedContext>,
     task: &CurrentTask,
-    native: carrick_sched_core::ThreadCtx,
+    native: &carrick_sched_core::ThreadCtx,
     ttbr0: u64,
     control: &ThreadControlSlot,
 ) -> Result<RecordId, NativeProcessError> {
@@ -230,7 +232,7 @@ pub(super) fn process_record_for_call(
     {
         return Ok(record);
     }
-    init_process_record(source, task, &native, ttbr0, host_record, control)
+    init_process_record(source, task, native, ttbr0, host_record, control)
 }
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
@@ -282,16 +284,16 @@ fn init_process_record(
 pub fn admit_entry(
     source: BornInZoneSource<'static, Aarch64ParkedContext>,
     task: &'static CurrentTask,
-    native: carrick_sched_core::ThreadCtx,
+    native: &carrick_sched_core::ThreadCtx,
     ttbr0: u64,
     record: RecordId,
     page: &'static ThreadLifecyclePage,
     control: &'static ThreadControlSlot,
 ) -> Result<(Arc<Runtime>, Mm, Aarch64ParkedContext), NativeProcessError> {
     let (runtime, address) =
-        admit_entry_runtime(source, task, &native, ttbr0, record, page, control)?;
+        admit_entry_runtime(source, task, native, ttbr0, record, page, control)?;
     let words = Aarch64ParkedContext::from_register(
-        native,
+        *native,
         ttbr0,
         address.mm.raw().get(),
         address.generation.raw().get(),
@@ -395,7 +397,7 @@ impl Drop for AdmissionHome {
 pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
     source: BornInZoneSource<'static, Aarch64ParkedContext>,
     task: &'static CurrentTask,
-    native: carrick_sched_core::ThreadCtx,
+    native: &carrick_sched_core::ThreadCtx,
     ttbr0: u64,
     page: &'static ThreadLifecyclePage,
     control: &'static ThreadControlSlot,
@@ -416,19 +418,20 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
         record: source.zone.record_ref(record),
     };
     let (runtime, address) =
-        admit_entry_runtime(source, task, &native, ttbr0, record, page, control)?;
+        admit_entry_runtime(source, task, native, ttbr0, record, page, control)?;
     task.publish_root_generation(address.generation);
-    let words = Aarch64ParkedContext::from_register(
-        native,
-        ttbr0,
-        address.mm.raw().get(),
-        address.generation.raw().get(),
-    );
-    #[cfg(target_os = "none")]
-    drain_native_signal_ingress(registry(), source, service);
     let (result, root_exit) = {
-        let mut process =
-            runtime.enter_registered(registry(), source, task, address, words, service)?;
+        let mut process = {
+            let words = Box::new(Aarch64ParkedContext::from_register(
+                *native,
+                ttbr0,
+                address.mm.raw().get(),
+                address.generation.raw().get(),
+            ));
+            #[cfg(target_os = "none")]
+            drain_native_signal_ingress(registry(), source, service);
+            runtime.enter_registered(registry(), source, task, address, &words, service)?
+        };
         let result = dispatch(&mut process);
         (result, process.take_root_exit())
     };
@@ -1033,7 +1036,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
     fn prepare_mm(
         &mut self,
         parent: &Self::Mm,
-        words: Aarch64ParkedContext,
+        words: &Aarch64ParkedContext,
         child_mm: MmGeneration,
     ) -> Result<Self::PreparedMm, NativeProcessError> {
         if !words.authenticates(*parent) {
@@ -1178,8 +1181,9 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             return Err(NativeProcessError::Stale);
         }
         unsafe {
-            (loan.lifecycle.page.raw() as *mut ThreadLifecyclePage)
-                .write(ThreadLifecyclePage::new());
+            ThreadLifecyclePage::initialize_at(
+                loan.lifecycle.page.raw() as *mut ThreadLifecyclePage
+            );
             let controls = loan.lifecycle.controls.raw() as *mut ThreadControlSlot;
             for index in 0..=carrick_el1_abi::THREAD_POOL_ENTRIES {
                 controls.add(index).write(ThreadControlSlot::new());

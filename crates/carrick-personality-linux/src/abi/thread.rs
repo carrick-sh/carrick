@@ -1252,6 +1252,25 @@ impl ThreadLifecyclePage {
         Self::with_hatches(LifecycleHatches::ON)
     }
 
+    /// Initialize an exclusively owned page without a page-sized temporary.
+    ///
+    /// # Safety
+    ///
+    /// `storage` must be aligned and writable for one complete page, with no
+    /// observers or live custody referring to its previous contents.
+    #[inline(never)]
+    pub unsafe fn initialize_at(storage: *mut Self) {
+        // Borrow the canonical constructor's immutable template. In particular,
+        // `storage.write(Self::new())` can put multiple 4 KiB aligned copies on
+        // a ring stack when copy elision changes between compiler drivers.
+        // No reference to the template escapes and nobody mutates its atomics.
+        static TEMPLATE: ThreadLifecyclePage = ThreadLifecyclePage::new();
+        const { assert!(!core::mem::needs_drop::<ThreadLifecyclePage>()) };
+        // SAFETY: the caller owns distinct storage; both pointers are aligned,
+        // and the template has no owning fields requiring clone/drop semantics.
+        unsafe { core::ptr::copy_nonoverlapping(&raw const TEMPLATE, storage, 1) };
+    }
+
     /// [`Self::new`] with the services `hatches` allows.
     pub const fn with_hatches(hatches: LifecycleHatches) -> Self {
         Self {
@@ -1897,6 +1916,46 @@ mod tests {
             page.closing_verdict().to_string(),
             "owner_verdict live=0 claimed=0 receipts=complete can_settle=false"
         );
+    }
+
+    #[test]
+    fn in_place_lifecycle_page_initializes_poisoned_aligned_storage() {
+        use super::{EntryIdentity, Lifecycle, ThreadLifecyclePage};
+        let mut storage = std::boxed::Box::<ThreadLifecyclePage>::new_uninit();
+        // SAFETY: typed allocation preserves the page alignment, and no page
+        // reference exists before the initializer has written its fields.
+        let page = unsafe {
+            storage
+                .as_mut_ptr()
+                .cast::<u8>()
+                .write_bytes(0xa5, core::mem::size_of::<ThreadLifecyclePage>());
+            ThreadLifecyclePage::initialize_at(storage.as_mut_ptr());
+            storage.assume_init()
+        };
+        assert_eq!(
+            std::format!("{page:?}"),
+            std::format!("{:?}", ThreadLifecyclePage::new())
+        );
+        assert_eq!(page.live(), 1);
+        assert!(page.serves_threads() && page.serves_sigmask());
+        let entry = page
+            .stock(
+                0,
+                EntryIdentity {
+                    tid: 42,
+                    visible_tid: 42,
+                    thread_serial: 2,
+                    birth: carrick_core_abi::entry::BirthSerial::of_task(
+                        carrick_sched_core::process::TaskSerial::from_raw_u64(1).unwrap(),
+                    ),
+                    uid_credit: 0,
+                },
+            )
+            .unwrap();
+        let claim = page.claim(entry).unwrap();
+        assert_eq!(page.claimed_count(), 1);
+        page.unclaim(claim).unwrap();
+        assert_eq!(page.claimed_count(), 0);
     }
 
     #[test]

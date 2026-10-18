@@ -96,16 +96,14 @@ fn validate_context(context: &LinuxSignalContext) -> Result<(), FrameError> {
 /// Encode the public context, optional admitted extension records, and FP/LR.
 /// The caller resolves restart state and selects the authoritative PSTATE.
 pub fn encode(
-    mut context: LinuxSignalContext,
-    stack: LinuxSignalStack,
-    mask: SigBlockMask,
-    siginfo: LinuxSiginfo,
-    fpsimd: Option<LinuxFpsimdContext>,
+    frame: &mut SignalFrame,
+    fpsimd: Option<&LinuxFpsimdContext>,
     esr: Option<u64>,
-) -> Result<SignalFrame, FrameError> {
-    // Fault delivery preserves the interrupted PC/SP, including a bad
-    // alignment that the handler needs to inspect or repair. Only decode
-    // admits those fields as resume authority.
+) -> Result<(), FrameError> {
+    // Work in the caller's admitted storage. A public context is over 4 KiB;
+    // taking it or returning the frame by value duplicates it on ring stacks.
+    let context = &mut frame.rt.ucontext.uc_mcontext;
+    // Fault delivery preserves the interrupted PC/SP, including bad alignment.
     validate_pstate(context.pstate)?;
     context.__reserved.fill(0);
     let mut offset = 0;
@@ -122,15 +120,8 @@ pub fn encode(
         context.__reserved[offset + 4..offset + 8].copy_from_slice(&16_u32.to_le_bytes());
         context.__reserved[offset + 8..offset + 16].copy_from_slice(&esr.to_le_bytes());
     }
-    let frame_record = [context.regs[29], context.regs[30]];
-    let mut ucontext = LinuxUcontext::empty();
-    ucontext.uc_mcontext = context;
-    ucontext.uc_stack = stack;
-    ucontext.uc_sigmask = mask.signals().bits();
-    Ok(SignalFrame {
-        rt: RtSigframe { siginfo, ucontext },
-        frame_record,
-    })
+    frame.frame_record = [context.regs[29], context.regs[30]];
+    Ok(())
 }
 
 /// Decode only the public frame from the caller's admitted extent. Trailing
@@ -246,18 +237,17 @@ mod tests {
     use super::*;
 
     fn valid() -> SignalFrame {
-        let mut context = LinuxSignalContext::empty();
-        context.pc = 0x10000;
-        context.sp = 0x20000;
-        encode(
-            context,
-            LinuxSignalStack::empty(),
-            SigBlockMask::blocking_all_of(SignalSet::EMPTY),
-            LinuxSiginfo::empty(),
-            Some(LinuxFpsimdContext::empty()),
-            None,
-        )
-        .unwrap()
+        let mut frame = SignalFrame {
+            rt: RtSigframe {
+                siginfo: LinuxSiginfo::empty(),
+                ucontext: LinuxUcontext::empty(),
+            },
+            frame_record: [0; 2],
+        };
+        frame.rt.ucontext.uc_mcontext.pc = 0x10000;
+        frame.rt.ucontext.uc_mcontext.sp = 0x20000;
+        encode(&mut frame, Some(&LinuxFpsimdContext::empty()), None).unwrap();
+        frame
     }
 
     #[test]

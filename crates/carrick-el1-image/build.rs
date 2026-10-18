@@ -1,3 +1,5 @@
+mod frame_budget;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -58,6 +60,7 @@ fn check_process_exit_frames(disassembly: &str) {
         // Runtime table construction must stay in-place on the heap, never
         // materialize the pending-fork array on a 16 KiB EL1 stack.
         ("::PendingForkStorage::initialize::", 0x100, true),
+        ("::ThreadLifecyclePage::initialize_at::", 0x100, false),
         ("::dispatch::dispatch_syscall::", 0x600, true),
         ("::aarch64_process::admit_entry_runtime::", 0x1200, true),
         ("::exit_with_status::", 0x600, true),
@@ -75,6 +78,7 @@ fn check_process_exit_frames(disassembly: &str) {
             true,
         ),
         ("::arm_signal::deliver_on_user_return::", 0x1000, true),
+        ("::arm_signal::setup_arm_signal_frame::", 0x400, true),
         ("::dispatch::arm_signal_user_return::", 0x1000, true),
         // The Linux codec wraps the neutral ARM backend (#690).
         (
@@ -83,85 +87,24 @@ fn check_process_exit_frames(disassembly: &str) {
             true,
         ),
     ];
+    let frames = frame_budget::Frames::parse(disassembly).unwrap_or_else(|error| panic!("{error}"));
+    // Charge the actual vector record as well as every retained Rust frame.
+    for line in frames
+        .check(
+            carrick_el1_abi::EL1_STACK_SIZE as usize,
+            std::mem::size_of::<carrick_el1_abi::TrapFrame>(),
+        )
+        .unwrap_or_else(|error| panic!("{error}"))
+    {
+        println!("cargo:warning={line}");
+    }
     for (symbol, ceiling, required) in budgets {
-        let mut found = false;
-        for body in disassembly.split(">:\n") {
-            if !body
-                .lines()
-                .last()
-                .is_some_and(|line| line.contains(symbol))
-            {
-                continue;
-            }
-            // The next segment begins with this function's instructions.
-            let start = disassembly.find(body).unwrap() + body.len() + 3;
-            let mut frame = 0;
-            let mut aligned = false;
-            for line in disassembly[start..].lines().take(20) {
-                // A short tail-call wrapper may end before twenty instructions.
-                // Do not charge the next symbol's frame to this function.
-                if line.ends_with(">:") {
-                    break;
-                }
-                let Some((_, instruction)) = line.split_once(':') else {
-                    continue;
-                };
-                let instruction = instruction.trim();
-                if instruction.starts_with("stp") && instruction.contains("[sp, #-0x") {
-                    let hex = instruction
-                        .split("#-0x")
-                        .nth(1)
-                        .unwrap()
-                        .split(']')
-                        .next()
-                        .unwrap();
-                    frame += usize::from_str_radix(hex, 16).unwrap();
-                }
-                // LLVM stack probing computes the final aligned SP in x9;
-                // count that target once, rather than counting the probe loop.
-                if instruction.starts_with("sub") {
-                    let operands = instruction
-                        .split_whitespace()
-                        .skip(1)
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    if operands.starts_with("x9, sp,") {
-                        aligned = true;
-                    }
-                    let counted = if aligned {
-                        operands.starts_with("x9, sp,") || operands.starts_with("x9, x9,")
-                    } else {
-                        operands.starts_with("sp, sp,")
-                    };
-                    if counted {
-                        let hex = operands
-                            .split("#0x")
-                            .nth(1)
-                            .expect("immediate frame allocation")
-                            .split([',', ' '])
-                            .next()
-                            .unwrap();
-                        let amount = usize::from_str_radix(hex, 16).unwrap();
-                        frame += if operands.contains("lsl #12") {
-                            amount << 12
-                        } else {
-                            amount
-                        };
-                    }
-                }
-            }
-            if aligned {
-                frame += 63;
-            }
-            assert!(
-                frame > 0 && frame <= ceiling,
-                "EL1 exit frame {symbol}: {frame:#x} exceeds {ceiling:#x}"
-            );
-            found = true;
-        }
-        if required {
-            assert!(found, "missing EL1 exit frame {symbol}");
-        }
+        let frame = frames.maximum(symbol);
+        assert!(!required || frame > 0, "missing EL1 exit frame {symbol}");
+        assert!(
+            frame <= ceiling,
+            "EL1 exit frame {symbol}: {frame:#x} exceeds {ceiling:#x}"
+        );
     }
 }
 
@@ -417,6 +360,7 @@ fn main() {
         "cargo:warning=EL1 image budget: {image_size} bytes loaded / {limit} bytes; {headroom} bytes headroom"
     );
 
+    println!("cargo:rerun-if-changed=frame_budget.rs");
     println!("cargo:rerun-if-changed=../carrick-el1-linux/src");
     println!("cargo:rerun-if-changed=../carrick-el1-linux/link.ld");
     println!("cargo:rerun-if-changed=../carrick-el1-linux/build.rs");
