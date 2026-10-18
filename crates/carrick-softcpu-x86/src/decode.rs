@@ -401,6 +401,20 @@ pub(crate) fn supported_body(insn: &Instruction) -> bool {
         // A register bit index can address outside the nominal operand width.
         return false;
     }
+    // Implicit address helpers currently implement only flat 64-bit addressing.
+    if (insn.is_string_instruction() || insn.mnemonic() == Mnemonic::Xlatb)
+        && (matches!(insn.segment_prefix(), Register::FS | Register::GS)
+            || insn.memory_base() == Register::EBX
+            || insn.op_kinds().any(|k| matches!(k,
+                OpKind::MemorySegESI | OpKind::MemoryESEDI)))
+    {
+        return false;
+    }
+    if matches!(insn.mnemonic(), Mnemonic::Push | Mnemonic::Pop)
+        && insn.op0_register().is_segment_register()
+    {
+        return false;
+    }
     if insn.mnemonic() == Mnemonic::Cmpsd && !insn.is_string_instruction() { return false; }
     matches!(insn.mnemonic(),
         Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movsx | Mnemonic::Movsxd | Mnemonic::Lea
