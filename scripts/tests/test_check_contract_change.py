@@ -2264,6 +2264,113 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
         res_b = self.run_check(base_sha=base_b)
         self.assertEqual(res_b.returncode, 1, msg=f"case b stdout: {res_b.stdout}\nstderr: {res_b.stderr}")
 
+    def test_new1_nested_bracket_attributes_and_unparseable_attrs_fail_closed(self):
+        """NEW-1: attributes with nested brackets (e.g. #[doc = concat![""]], #[cfg_attr(any(), allow[x])]) must not hide preceding attributes, and unparseable attributes must fail closed."""
+        self.use_single_contract_surface()
+        self._write_futex_contract('vm_free = "carrick-kernel::dispatch::futex::tests::bound_test"\n')
+        base_sha = self._commit_all("seed base for new1", allow_empty=True)
+
+        # (a) #[ignore] hidden before #[doc = concat![""]]
+        self.guest_file.write_text(
+            "pub fn futex_new1() -> i32 { 1 }\n"
+            "#[cfg(test)]\nmod tests {\n"
+            "    #[ignore]\n"
+            '    #[doc = concat![""]]\n'
+            "    #[test]\n"
+            "    fn bound_test() { assert_eq!(super::futex_new1(), 1); }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        self._commit_all("new1a: ignore before doc concat")
+        res_a = self.run_check(base_sha=base_sha)
+        self.assertEqual(res_a.returncode, 1, msg=f"case a (ignore) stdout: {res_a.stdout}\nstderr: {res_a.stderr}")
+
+        # (b) #[cfg(any())] hidden before #[cfg_attr(any(), allow[x])]
+        self.guest_file.write_text(
+            "pub fn futex_new1() -> i32 { 1 }\n"
+            "#[cfg(test)]\nmod tests {\n"
+            "    #[cfg(any())]\n"
+            "    #[cfg_attr(any(), allow[x])]\n"
+            "    #[test]\n"
+            "    fn bound_test() { assert_eq!(super::futex_new1(), 1); }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        self._commit_all("new1b: cfg(any()) before cfg_attr allow[x]")
+        res_b = self.run_check(base_sha=base_sha)
+        self.assertEqual(res_b.returncode, 1, msg=f"case b (cfg(any())) stdout: {res_b.stdout}\nstderr: {res_b.stderr}")
+
+        # (c) #[should_panic] hidden before #[doc = concat![""]]
+        self.guest_file.write_text(
+            "pub fn futex_new1() -> i32 { 1 }\n"
+            "#[cfg(test)]\nmod tests {\n"
+            "    #[should_panic]\n"
+            '    #[doc = concat![""]]\n'
+            "    #[test]\n"
+            "    fn bound_test() { assert_eq!(super::futex_new1(), 1); }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        self._commit_all("new1c: should_panic before doc concat")
+        res_c = self.run_check(base_sha=base_sha)
+        self.assertEqual(res_c.returncode, 1, msg=f"case c (should_panic) stdout: {res_c.stdout}\nstderr: {res_c.stderr}")
+
+        # (d) cfg-disabled mod (#[cfg(any())] before #[doc = concat![""]] mod tests)
+        self.guest_file.write_text(
+            "pub fn futex_new1() -> i32 { 1 }\n"
+            "#[cfg(any())]\n"
+            '#[doc = concat![""]]\n'
+            "mod tests {\n"
+            "    #[test]\n"
+            "    fn bound_test() { assert_eq!(super::futex_new1(), 1); }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        self._commit_all("new1d: cfg-disabled mod before doc concat")
+        res_d = self.run_check(base_sha=base_sha)
+        self.assertEqual(res_d.returncode, 1, msg=f"case d (cfg-disabled mod) stdout: {res_d.stdout}\nstderr: {res_d.stderr}")
+
+        # (e) unparseable attribute before #[test] fails closed
+        self.guest_file.write_text(
+            "pub fn futex_new1() -> i32 { 1 }\n"
+            "#[cfg(test)]\nmod tests {\n"
+            "    #[cfg_attr(any(), allow[x)]\n"
+            "    #[test]\n"
+            "    fn bound_test() { assert_eq!(super::futex_new1(), 1); }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        self._commit_all("new1e: unparseable attr before test")
+        res_e = self.run_check(base_sha=base_sha)
+        self.assertEqual(res_e.returncode, 1, msg=f"case e (unparseable attr) stdout: {res_e.stdout}\nstderr: {res_e.stderr}")
+
+        # (f) N3B: git mv surface into tests/support/ + #[path=...] #[doc=concat![""]] pub mod mailbox; with no binding at all
+        self.guest_file.write_text("pub fn futex_wait() -> i32 { 0 }\n", encoding="utf-8")
+        self._write_futex_contract('docker = "probe:futex"\n')
+        (self.repo / "conformance-contracts" / "surfaces.toml").write_text(
+            '[[surfaces]]\npath = "crates/carrick-kernel/src/dispatch/futex.rs"\ncontracts = ["kernel.futex.contention"]\n'
+            '[[surfaces]]\npath = "crates/carrick-kernel/src/dispatch/mod.rs"\ncontracts = []\n'
+            '[[surfaces]]\npath = "crates/carrick-kernel/tests/support/mailbox.rs"\ncontracts = ["kernel.futex.contention"]\n',
+            encoding="utf-8",
+        )
+        base_f = self._commit_all("seed base for n3b")
+        dst = self.repo / "crates" / "carrick-kernel" / "tests" / "support" / "mailbox.rs"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "mv", str(self.guest_file), str(dst)], cwd=self.repo, check=True)
+        dst.write_text("pub fn futex_wait() -> i32 { 99 }\n", encoding="utf-8")
+        (self.repo / "crates" / "carrick-kernel" / "src" / "dispatch" / "mod.rs").write_text(
+            '#[path = "../../tests/support/mailbox.rs"]\n#[doc = concat![""]]\npub mod mailbox;\n',
+            encoding="utf-8",
+        )
+        (self.repo / "conformance-contracts" / "surfaces.toml").write_text(
+            '[[surfaces]]\npath = "crates/carrick-kernel/src/dispatch/mod.rs"\ncontracts = []\n'
+            '[[surfaces]]\npath = "crates/carrick-kernel/tests/support/mailbox.rs"\ncontracts = ["kernel.futex.contention"]\n',
+            encoding="utf-8",
+        )
+        self._commit_all("n3b: git mv into tests/support/mailbox.rs with nested bracket attr after #[path]")
+        res_f = self.run_check(base_sha=base_f)
+        self.assertEqual(res_f.returncode, 1, msg=f"case f (n3b) stdout: {res_f.stdout}\nstderr: {res_f.stderr}")
+
 
 if __name__ == "__main__":
     unittest.main()

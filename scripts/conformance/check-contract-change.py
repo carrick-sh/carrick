@@ -387,8 +387,6 @@ _TYPE_MOD_DECL_RE = re.compile(
 _MACRO_DECL_RE = re.compile(r"\bmacro_rules!\s*(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\b")
 
 _TEST_ATTR_RE = re.compile(r"#\s*\[\s*(?:[\w:]+::)?(?:test|test_case|rstest)\b")
-_IGNORE_ATTR_RE = re.compile(r"#\s*\[\s*(?:ignore\b|cfg_attr\s*\([^\]]*\bignore\b)")
-_SHOULD_PANIC_ATTR_RE = re.compile(r"#\s*!?\s*\[\s*(?:should_panic\b|cfg_attr\s*\([^\]]*\bshould_panic\b)")
 _CFG_OPEN_RE = re.compile(r"#\s*!?\s*\[\s*cfg\s*\(")
 
 
@@ -575,10 +573,25 @@ def _find_matching_delim(text: str, open_idx: int, open_ch: str, close_ch: str) 
     return -1
 
 
+def _are_delims_balanced(s: str) -> bool:
+    """Return True if all `()`, `[]`, `{}` delimiters in comment/string-stripped `s` are balanced."""
+    stack: list[str] = []
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    for ch in s:
+        if ch in pairs:
+            stack.append(pairs[ch])
+        elif ch in ")]}":
+            if not stack or stack[-1] != ch:
+                return False
+            stack.pop()
+    return len(stack) == 0
+
+
 def _split_cfg_top_level_commas(inner: str) -> list[str]:
     parts: list[str] = []
     cur: list[str] = []
-    depth = 0
+    stack: list[str] = []
+    pairs = {"(": ")", "[": "]", "{": "}"}
     in_str = False
     i = 0
     n = len(inner)
@@ -596,13 +609,15 @@ def _split_cfg_top_level_commas(inner: str) -> list[str]:
             if ch == '"':
                 in_str = True
                 cur.append(ch)
-            elif ch == "(":
-                depth += 1
+            elif ch in pairs:
+                stack.append(pairs[ch])
                 cur.append(ch)
-            elif ch == ")":
-                depth = max(0, depth - 1)
+            elif ch in ")]}":
+                if not stack or stack[-1] != ch:
+                    return ["__invalid_cfg__"]
+                stack.pop()
                 cur.append(ch)
-            elif ch == "," and depth == 0:
+            elif ch == "," and not stack:
                 part = "".join(cur).strip()
                 if part:
                     parts.append(part)
@@ -610,10 +625,107 @@ def _split_cfg_top_level_commas(inner: str) -> list[str]:
             else:
                 cur.append(ch)
         i += 1
+    if in_str or stack:
+        return ["__invalid_cfg__"]
     tail = "".join(cur).strip()
     if tail:
         parts.append(tail)
     return parts
+
+
+def _iter_parsed_attributes(
+    attr_text: str, attr_stripped: str | None = None
+) -> tuple[list[tuple[bool, str]], bool]:
+    """Parse a sequence of `#[...]` / `#![...]` attributes using bracket matching (`_find_matching_delim`).
+
+    Returns `(list_of_(is_inner, attr_body), ok)`. Fails closed (`ok=False`) if any non-whitespace
+    token is not a bracket-balanced attribute.
+    """
+    s = attr_stripped if attr_stripped is not None else strip_rust_comments_and_strings(attr_text)
+    if len(s) != len(attr_text):
+        s = strip_rust_comments_and_strings(attr_text)
+    attrs: list[tuple[bool, str]] = []
+    attr_open_re = re.compile(r"^#\s*(!?)\s*\[")
+    pos = 0
+    n = len(s)
+    while pos < n:
+        while pos < n and s[pos] in " \t\r\n":
+            pos += 1
+        if pos >= n:
+            break
+        m = attr_open_re.match(s[pos:])
+        if not m:
+            return (attrs, False)
+        is_inner = m.group(1) == "!"
+        open_b = pos + m.end() - 1
+        close_b = _find_matching_delim(s, open_b, "[", "]")
+        if close_b == -1:
+            return (attrs, False)
+        inner_s = s[open_b + 1 : close_b]
+        if not _are_delims_balanced(inner_s) or re.search(r"#\s*!?\s*\[", inner_s):
+            return (attrs, False)
+        attrs.append((is_inner, attr_text[open_b + 1 : close_b].strip()))
+        pos = close_b + 1
+    return (attrs, True)
+
+
+def _iter_effective_attr_items(body: str) -> tuple[list[tuple[list[str], str]], bool]:
+    """Expand an attribute body (flattening `cfg_attr(pred, ...)` recursively) into `(cfg_preds, leaf_attr)`."""
+    body_s = strip_rust_comments_and_strings(body).strip()
+    if not _are_delims_balanced(body_s) or re.search(r"#\s*!?\s*\[", body_s):
+        return ([], False)
+    stripped_body = body.strip()
+    m_ca = re.match(r"^cfg_attr\s*\((.*)\)\s*$", stripped_body, re.S)
+    if m_ca:
+        parts = _split_cfg_top_level_commas(m_ca.group(1))
+        if len(parts) < 2 or "__invalid_cfg__" in parts:
+            return ([], False)
+        pred = parts[0].strip()
+        if not _is_cfg_expr_decidable(pred):
+            return ([], False)
+        out: list[tuple[list[str], str]] = []
+        for sub in parts[1:]:
+            sub_items, sub_ok = _iter_effective_attr_items(sub.strip())
+            if not sub_ok:
+                return ([], False)
+            for sub_preds, leaf in sub_items:
+                out.append(([pred] + sub_preds, leaf))
+        return (out, True)
+    return ([([], stripped_body)], True)
+
+
+def _has_ignore_attr(attrs_cs: str) -> bool:
+    if not attrs_cs or not attrs_cs.strip():
+        return False
+    attrs, ok = _iter_parsed_attributes(attrs_cs)
+    if not ok:
+        return True
+    for is_inner, body in attrs:
+        if is_inner:
+            continue
+        items, item_ok = _iter_effective_attr_items(body)
+        if not item_ok:
+            return True
+        for _preds, leaf in items:
+            if re.match(r"^ignore\b", leaf):
+                return True
+    return False
+
+
+def _has_should_panic_attr(attrs_cs: str) -> bool:
+    if not attrs_cs or not attrs_cs.strip():
+        return False
+    attrs, ok = _iter_parsed_attributes(attrs_cs)
+    if not ok:
+        return True
+    for _is_inner, body in attrs:
+        items, item_ok = _iter_effective_attr_items(body)
+        if not item_ok:
+            return True
+        for _preds, leaf in items:
+            if re.match(r"^should_panic\b", leaf):
+                return True
+    return False
 
 
 def _can_cfg_be_true_without_test(expr: str) -> bool:
@@ -662,13 +774,15 @@ def _cfg_is_test_only(expr: str) -> bool:
 def _is_cfg_expr_decidable(expr: str) -> bool:
     """Return True if every atom in `expr` is a supported, statically decidable CI cfg predicate."""
     expr = expr.strip()
-    if not expr:
+    if not expr or expr == "__invalid_cfg__":
+        return False
+    if not _are_delims_balanced(strip_rust_comments_and_strings(expr)):
         return False
     m = re.match(r"^(all|any|not)\s*\((.*)\)\s*$", expr, re.S)
     if m:
         op = m.group(1)
         args = _split_cfg_top_level_commas(m.group(2))
-        if not args:
+        if not args or "__invalid_cfg__" in args:
             return False
         if op == "not" and len(args) != 1:
             return False
@@ -695,6 +809,9 @@ def _extract_cfg_from_attr_body(content: str, cond_prefix: list[str]) -> tuple[l
     malformed or undecidable `cfg` / `cfg_attr` predicates.
     """
     content = content.strip()
+    content_s = strip_rust_comments_and_strings(content).strip()
+    if not _are_delims_balanced(content_s) or re.search(r"#\s*!?\s*\[", content_s):
+        return (["__invalid_cfg__"], [])
     m_cfg = re.match(r"^cfg\s*\((.*)\)\s*$", content, re.S)
     if m_cfg:
         inner = m_cfg.group(1).strip()
@@ -708,7 +825,7 @@ def _extract_cfg_from_attr_body(content: str, cond_prefix: list[str]) -> tuple[l
     m_ca = re.match(r"^cfg_attr\s*\((.*)\)\s*$", content, re.S)
     if m_ca:
         parts = _split_cfg_top_level_commas(m_ca.group(1))
-        if len(parts) < 2:
+        if len(parts) < 2 or "__invalid_cfg__" in parts:
             return (["__invalid_cfg__"], [])
         pred = parts[0].strip()
         if not _is_cfg_expr_decidable(pred):
@@ -718,6 +835,9 @@ def _extract_cfg_from_attr_body(content: str, cond_prefix: list[str]) -> tuple[l
         test_preds: list[str] = []
         for sub in parts[1:]:
             sub_s = sub.strip()
+            sub_stripped = strip_rust_comments_and_strings(sub_s).strip()
+            if not _are_delims_balanced(sub_stripped) or re.search(r"#\s*!?\s*\[", sub_stripped):
+                return (["__invalid_cfg__"], [])
             if re.match(r"^(?:[\w:]+::)?(?:test|test_case|rstest)\b", sub_s):
                 cond_all = new_prefix[0] if len(new_prefix) == 1 else f"all({', '.join(new_prefix)})"
                 test_preds.append(cond_all)
@@ -732,26 +852,16 @@ def _extract_cfg_from_attr_body(content: str, cond_prefix: list[str]) -> tuple[l
 
 def _extract_cfg_exprs(attr_text: str, inner_only: bool = False) -> list[str]:
     """Extract `expr` from `#[cfg(expr)]` / `#[cfg_attr(...)]` (or `#![...]` if `inner_only=True`)."""
+    if not attr_text or not attr_text.strip():
+        return []
+    attrs, ok = _iter_parsed_attributes(attr_text)
+    if not ok:
+        return ["__invalid_cfg__"]
     exprs: list[str] = []
-    attr_open_re = re.compile(r"#\s*(!?)\s*\[")
-    pos = 0
-    n = len(attr_text)
-    while pos < n:
-        m = attr_open_re.search(attr_text, pos)
-        if not m:
-            break
-        is_inner = m.group(1) == "!"
-        open_bracket = m.end() - 1
-        close_bracket = _find_matching_delim(attr_text, open_bracket, "[", "]")
-        if close_bracket == -1:
-            if (inner_only and is_inner) or (not inner_only and not is_inner):
-                exprs.append("__invalid_cfg__")
-            break
+    for is_inner, body in attrs:
         if (inner_only and is_inner) or (not inner_only and not is_inner):
-            body = attr_text[open_bracket + 1 : close_bracket].strip()
             cfgs, _ = _extract_cfg_from_attr_body(body, [])
             exprs.extend(cfgs)
-        pos = close_bracket + 1
     return exprs
 
 
@@ -1420,59 +1530,123 @@ def _blank_macro_defs(scope_stripped: str, scope_comments_stripped: str) -> tupl
     return ("".join(s_chars), "".join(cs_chars))
 
 
+def _scan_depth0_attributes(
+    scope_stripped: str, depths: list[int]
+) -> tuple[dict[int, tuple[int, int, bool]], bool]:
+    """Scan all `#` tokens at delimiter depth 0 of `scope_stripped` using `_find_matching_delim`.
+
+    Returns `(attr_by_end_offset, ok)` where each entry is `end_offset: (start_offset, end_offset, is_inner)`.
+    Fails closed (`ok=False`) if any depth-0 `#` (outside `r#<ident>`) is not a bracket-balanced attribute.
+    """
+    attr_by_end: dict[int, tuple[int, int, bool]] = {}
+    attr_open_re = re.compile(r"^#\s*(!?)\s*\[")
+    idx = 0
+    n = len(scope_stripped)
+    while idx < n:
+        if depths[idx] != 0 or scope_stripped[idx] != "#":
+            idx += 1
+            continue
+        if (
+            idx > 0
+            and scope_stripped[idx - 1] == "r"
+            and (idx < 2 or not (scope_stripped[idx - 2].isalnum() or scope_stripped[idx - 2] == "_"))
+            and idx + 1 < n
+            and (scope_stripped[idx + 1].isalpha() or scope_stripped[idx + 1] == "_")
+        ):
+            idx += 1
+            continue
+        m = attr_open_re.match(scope_stripped[idx:])
+        if not m:
+            return ({}, False)
+        is_inner = m.group(1) == "!"
+        open_b = idx + m.end() - 1
+        close_b = _find_matching_delim(scope_stripped, open_b, "[", "]")
+        if close_b == -1:
+            return ({}, False)
+        inner_s = scope_stripped[open_b + 1 : close_b]
+        if not _are_delims_balanced(inner_s) or re.search(r"#\s*!?\s*\[", inner_s):
+            return ({}, False)
+        attr_by_end[close_b + 1] = (idx, close_b + 1, is_inner)
+        idx = close_b + 1
+    return (attr_by_end, True)
+
+
+def _iter_depth0_attributed_items(
+    scope_stripped: str,
+    scope_comments_stripped: str,
+    item_re: re.Pattern[str],
+    require_outer_attr: bool = False,
+) -> tuple[list[tuple[re.Match[str], str]], bool]:
+    """Find all matches of `item_re` at delimiter depth 0 of `scope_stripped`, along with their
+    immediately preceding outer `#[...]` attribute block sliced from `scope_comments_stripped`.
+
+    Returns `(items, ok)` where `ok=False` if any depth-0 attribute in `scope_stripped` is unparseable.
+    """
+    depths = _compute_brace_depths(scope_stripped)
+    attr_by_end, ok = _scan_depth0_attributes(scope_stripped, depths)
+    if not ok:
+        return ([], False)
+    results: list[tuple[re.Match[str], str]] = []
+    for m in item_re.finditer(scope_stripped):
+        if depths[m.start()] != 0:
+            continue
+        attr_start = m.start()
+        has_outer = False
+        cur = m.start()
+        while True:
+            while cur > 0 and scope_stripped[cur - 1] in " \t\r\n":
+                cur -= 1
+            attr_info = attr_by_end.get(cur)
+            if attr_info is not None and not attr_info[2]:
+                attr_start = attr_info[0]
+                cur = attr_start
+                has_outer = True
+            else:
+                break
+        if cur > 0 and scope_stripped[cur - 1] not in ";}" and not (
+            cur in attr_by_end and attr_by_end[cur][2]
+        ):
+            continue
+        if require_outer_attr and not has_outer:
+            continue
+        attrs_cs = scope_comments_stripped[attr_start : m.start()]
+        results.append((m, attrs_cs))
+    return (results, True)
+
+
 def _extract_scope_inner_attrs(scope_stripped: str, scope_comments_stripped: str) -> str:
     """Return all `#![...]` attributes at delimiter depth 0 of `scope_stripped` (excluding nested modules/items)."""
     s, cs = _blank_macro_defs(scope_stripped, scope_comments_stripped)
     depths = _compute_brace_depths(s)
-    inner_re = re.compile(r"#\s*!\s*\[")
+    attr_by_end, ok = _scan_depth0_attributes(s, depths)
+    if not ok:
+        return "#![cfg(__invalid_cfg__)]"
     parts: list[str] = []
-    pos = 0
-    n = len(s)
-    while pos < n:
-        m = inner_re.search(s, pos)
-        if not m:
-            break
-        if depths[m.start()] != 0:
-            pos = m.end()
-            continue
-        open_b = m.end() - 1
-        close_b = _find_matching_delim(cs, open_b, "[", "]")
-        if close_b == -1:
-            parts.append("#![cfg(__invalid_cfg__)]")
-            break
-        parts.append(cs[m.start() : close_b + 1])
-        pos = close_b + 1
+    for start, end, is_inner in sorted(attr_by_end.values(), key=lambda x: x[0]):
+        if is_inner:
+            parts.append(cs[start:end])
     return "\n".join(parts)
 
 
 def _extract_test_and_cfg_exprs(attrs_cs: str) -> tuple[bool, list[str]]:
     """Return `(is_test_fn, cfg_exprs)` from outer `#[...]` attributes on a function."""
+    attrs, ok = _iter_parsed_attributes(attrs_cs)
+    if not ok:
+        return (False, ["__invalid_cfg__"])
     has_unconditional_test = False
     all_cfgs: list[str] = []
     all_test_preds: list[str] = []
-    attr_open_re = re.compile(r"#\s*(!?)\s*\[")
-    pos = 0
-    n = len(attrs_cs)
-    while pos < n:
-        m = attr_open_re.search(attrs_cs, pos)
-        if not m:
-            break
-        is_inner = m.group(1) == "!"
-        open_b = m.end() - 1
-        close_b = _find_matching_delim(attrs_cs, open_b, "[", "]")
-        if close_b == -1:
-            if not is_inner:
-                all_cfgs.append("__invalid_cfg__")
-            break
-        if not is_inner:
-            body = attrs_cs[open_b + 1 : close_b].strip()
-            if re.match(r"^(?:[\w:]+::)?(?:test|test_case|rstest)\b", body):
-                has_unconditional_test = True
-            else:
-                cfgs, test_preds = _extract_cfg_from_attr_body(body, [])
-                all_cfgs.extend(cfgs)
-                all_test_preds.extend(test_preds)
-        pos = close_b + 1
+    for is_inner, body in attrs:
+        if is_inner:
+            continue
+        cfgs, test_preds = _extract_cfg_from_attr_body(body, [])
+        if "__invalid_cfg__" in cfgs:
+            return (False, ["__invalid_cfg__"])
+        if re.match(r"^(?:[\w:]+::)?(?:test|test_case|rstest)\b", body):
+            has_unconditional_test = True
+        else:
+            all_cfgs.extend(cfgs)
+            all_test_preds.extend(test_preds)
 
     if not has_unconditional_test and not all_test_preds:
         return (False, all_cfgs)
@@ -1486,6 +1660,39 @@ def _extract_test_and_cfg_exprs(attrs_cs: str) -> tuple[bool, list[str]]:
     return (True, all_cfgs)
 
 
+def _find_all_inline_mods(
+    scope_stripped: str,
+    scope_comments_stripped: str,
+    mod_name: str | None = None,
+) -> tuple[list[tuple[str, str, str, str]], bool]:
+    """Find inline `mod <name> { ... }` at brace depth 0 of `scope_stripped`.
+
+    Returns `([(mod_name, attrs_cs, body_stripped, body_comments_stripped), ...], ok)`.
+    """
+    scope_stripped, scope_comments_stripped = _blank_macro_defs(
+        scope_stripped, scope_comments_stripped
+    )
+    name_pat = re.escape(mod_name) if mod_name is not None else r"[A-Za-z_][A-Za-z0-9_]*"
+    pattern = re.compile(rf"{_VIS_MOD_PREFIX}\bmod\s+(?:r#)?({name_pat})\s*\{{")
+    items, ok = _iter_depth0_attributed_items(scope_stripped, scope_comments_stripped, pattern)
+    if not ok:
+        return ([], False)
+    results: list[tuple[str, str, str, str]] = []
+    for m, attrs_cs in items:
+        open_brace = m.end() - 1
+        close_brace = _find_matching_brace(scope_stripped, open_brace)
+        if close_brace != -1:
+            results.append(
+                (
+                    m.group(1),
+                    attrs_cs,
+                    scope_stripped[open_brace + 1 : close_brace],
+                    scope_comments_stripped[open_brace + 1 : close_brace],
+                )
+            )
+    return (results, True)
+
+
 def _find_inline_mods(
     scope_stripped: str,
     scope_comments_stripped: str,
@@ -1495,30 +1702,30 @@ def _find_inline_mods(
 
     Returns list of `(attrs_from_comments_stripped, body_stripped, body_comments_stripped)`.
     """
+    items, ok = _find_all_inline_mods(scope_stripped, scope_comments_stripped, mod_name)
+    if not ok:
+        return []
+    return [(attrs_cs, body_s, body_cs) for _name, attrs_cs, body_s, body_cs in items]
+
+
+def _find_all_out_of_line_mods(
+    scope_stripped: str,
+    scope_comments_stripped: str,
+    mod_name: str | None = None,
+) -> tuple[list[tuple[str, str]], bool]:
+    """Find `mod <name>;` declarations at brace depth 0 of `scope_stripped`.
+
+    Returns `([(mod_name, attrs_cs), ...], ok)`.
+    """
     scope_stripped, scope_comments_stripped = _blank_macro_defs(
         scope_stripped, scope_comments_stripped
     )
-    pattern = re.compile(
-        rf"(?:^|[;\}}\s])((?:#\s*\[[^\]]*\]\s*)*){_VIS_MOD_PREFIX}\bmod\s+(?:r#)?{re.escape(mod_name)}\s*\{{",
-        re.M,
-    )
-    depths = _compute_brace_depths(scope_stripped)
-    results: list[tuple[str, str, str]] = []
-    for m in pattern.finditer(scope_stripped):
-        if depths[m.start(1)] != 0:
-            continue
-        open_brace = m.end() - 1
-        close_brace = _find_matching_brace(scope_stripped, open_brace)
-        if close_brace != -1:
-            attrs_cs = scope_comments_stripped[m.start(1) : m.end(1)]
-            results.append(
-                (
-                    attrs_cs,
-                    scope_stripped[open_brace + 1 : close_brace],
-                    scope_comments_stripped[open_brace + 1 : close_brace],
-                )
-            )
-    return results
+    name_pat = re.escape(mod_name) if mod_name is not None else r"[A-Za-z_][A-Za-z0-9_]*"
+    pattern = re.compile(rf"{_VIS_MOD_PREFIX}\bmod\s+(?:r#)?({name_pat})\s*;")
+    items, ok = _iter_depth0_attributed_items(scope_stripped, scope_comments_stripped, pattern)
+    if not ok:
+        return ([], False)
+    return ([(m.group(1), attrs_cs) for m, attrs_cs in items], True)
 
 
 def _find_out_of_line_mods(
@@ -1530,33 +1737,30 @@ def _find_out_of_line_mods(
 
     Returns list of `attrs_from_comments_stripped`.
     """
-    scope_stripped, scope_comments_stripped = _blank_macro_defs(
-        scope_stripped, scope_comments_stripped
-    )
-    pattern = re.compile(
-        rf"(?:^|[;\}}\s])((?:#\s*\[[^\]]*\]\s*)*){_VIS_MOD_PREFIX}\bmod\s+(?:r#)?{re.escape(mod_name)}\s*;",
-        re.M,
-    )
-    depths = _compute_brace_depths(scope_stripped)
-    results: list[str] = []
-    for m in pattern.finditer(scope_stripped):
-        if depths[m.start(1)] != 0:
-            continue
-        results.append(scope_comments_stripped[m.start(1) : m.end(1)])
-    return results
+    items, ok = _find_all_out_of_line_mods(scope_stripped, scope_comments_stripped, mod_name)
+    if not ok:
+        return []
+    return [attrs_cs for _name, attrs_cs in items]
 
 
 def _extract_path_attr(
     view: RepoView, pkg_name: str, lane: str, attrs_cs: str
 ) -> str | None:
-    for m in re.finditer(r'#\s*\[\s*path\s*=\s*"([^"]+)"\s*\]', attrs_cs):
-        return m.group(1)
-    for m in re.finditer(r"#\s*\[\s*cfg_attr\s*\((.*)\)\s*\]", attrs_cs):
-        parts = _split_cfg_top_level_commas(m.group(1))
-        if len(parts) >= 2 and _are_cfgs_active_in_ci(view, pkg_name, lane, [parts[0]]):
-            for attr_part in parts[1:]:
-                pm = re.match(r'^path\s*=\s*"([^"]+)"$', attr_part.strip())
-                if pm:
+    if not attrs_cs or not attrs_cs.strip():
+        return None
+    attrs, ok = _iter_parsed_attributes(attrs_cs)
+    if not ok:
+        return None
+    for is_inner, body in attrs:
+        if is_inner:
+            continue
+        items, item_ok = _iter_effective_attr_items(body)
+        if not item_ok:
+            return None
+        for preds, leaf in items:
+            pm = re.match(r'^path\s*=\s*"([^"]+)"\s*$', leaf)
+            if pm:
+                if not preds or _are_cfgs_active_in_ci(view, pkg_name, lane, preds):
                     return pm.group(1)
     return None
 
@@ -1570,30 +1774,31 @@ def _extract_top_level_test_fns(
 
     Rejects `#[should_panic]` tests. Returns `{fn_name: (is_ignored, fn_cfg_exprs, fn_body_only_stripped, attrs_cs)}`.
     """
-    if _SHOULD_PANIC_ATTR_RE.search(enclosing_attrs_cs):
+    if _has_should_panic_attr(enclosing_attrs_cs):
         return {}
     scope_stripped, scope_comments_stripped = _blank_macro_defs(
         scope_stripped, scope_comments_stripped
     )
-    depths = _compute_brace_depths(scope_stripped)
     fn_pattern = re.compile(
-        rf"((?:#\s*\[[^\]]*\]\s*)+){_VIS_MOD_PREFIX}"
+        rf"{_VIS_MOD_PREFIX}"
         rf"(?:\b(?:default|const|async|unsafe|extern(?:\s*\"[^\"]*\")?)\s+)*"
         rf"\bfn\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\b"
     )
+    items, ok = _iter_depth0_attributed_items(
+        scope_stripped, scope_comments_stripped, fn_pattern, require_outer_attr=True
+    )
+    if not ok:
+        return {}
     results: dict[str, tuple[bool, list[str], str, str]] = {}
-    enclosing_ignored = bool(_IGNORE_ATTR_RE.search(enclosing_attrs_cs))
-    for m in fn_pattern.finditer(scope_stripped):
-        if depths[m.start()] != 0:
+    enclosing_ignored = _has_ignore_attr(enclosing_attrs_cs)
+    for m, attrs_cs in items:
+        if _has_should_panic_attr(attrs_cs):
             continue
-        attrs_cs = scope_comments_stripped[m.start(1) : m.end(1)]
-        if _SHOULD_PANIC_ATTR_RE.search(attrs_cs):
-            continue
-        fn_name = m.group(2)
+        fn_name = m.group(1)
         is_test, fn_cfgs = _extract_test_and_cfg_exprs(attrs_cs)
         if not is_test:
             continue
-        is_ignored = enclosing_ignored or bool(_IGNORE_ATTR_RE.search(attrs_cs))
+        is_ignored = enclosing_ignored or _has_ignore_attr(attrs_cs)
         open_brace = scope_stripped.find("{", m.end())
         if open_brace == -1:
             continue
@@ -1620,24 +1825,22 @@ def _extract_non_test_fns(
     scope_stripped, scope_comments_stripped = _blank_macro_defs(
         scope_stripped, scope_comments_stripped
     )
-    depths = _compute_brace_depths(scope_stripped)
     fn_pattern = re.compile(
-        rf"(?:^|[;\}}\s])((?:#\s*\[[^\]]*\]\s*)*){_VIS_MOD_PREFIX}"
+        rf"{_VIS_MOD_PREFIX}"
         rf"(?:\b(?:default|const|async|unsafe|extern(?:\s*\"[^\"]*\")?)\s+)*"
-        rf"\bfn\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\b",
-        re.M,
+        rf"\bfn\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\b"
     )
+    items, ok = _iter_depth0_attributed_items(scope_stripped, scope_comments_stripped, fn_pattern)
+    if not ok:
+        return {}
     results: dict[str, list[tuple[list[str], str]]] = {}
-    for m in fn_pattern.finditer(scope_stripped):
-        if depths[m.start(1)] != 0:
-            continue
-        attrs_cs = scope_comments_stripped[m.start(1) : m.end(1)]
+    for m, attrs_cs in items:
         is_test, fn_cfgs = _extract_test_and_cfg_exprs(attrs_cs)
         if is_test:
             continue
         if not _are_cfgs_active_in_ci(view, pkg_name, lane, accum_cfgs + fn_cfgs):
             continue
-        fn_name = m.group(2)
+        fn_name = m.group(1)
         open_brace = scope_stripped.find("{", m.end())
         if open_brace == -1:
             continue
@@ -1697,7 +1900,7 @@ def _scope_valid_test_fn_bodies(
         scope_stripped, scope_comments_stripped
     )
     scope_inner_attrs = _extract_scope_inner_attrs(scope_stripped, scope_comments_stripped)
-    if _SHOULD_PANIC_ATTR_RE.search(scope_inner_attrs):
+    if _has_should_panic_attr(scope_inner_attrs):
         return None
     scope_inner_cfgs = _extract_cfg_exprs(scope_inner_attrs, inner_only=True)
     accum_cfgs = accum_cfgs + scope_inner_cfgs
@@ -1734,41 +1937,33 @@ def _scope_valid_test_fn_bodies(
                 f"{expanded}{_FINGERPRINT_META_SEP}{enclosing_attrs_cs}\n{scope_inner_attrs}\n{fn_attrs_cs}"
             )
 
-    depths = _compute_brace_depths(scope_stripped)
-    mod_iter = re.finditer(
-        rf"((?:#\s*\[[^\]]*\]\s*)*){_VIS_MOD_PREFIX}\bmod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*\{{",
-        scope_stripped,
-    )
-    for m in mod_iter:
-        if depths[m.start(1)] != 0:
+    inline_mods, mods_ok = _find_all_inline_mods(scope_stripped, scope_comments_stripped)
+    if not mods_ok:
+        return None
+    for _sub_name, sub_attrs_cs, sub_s, sub_cs in inline_mods:
+        sub_inner_attrs = _extract_scope_inner_attrs(sub_s, sub_cs)
+        if _has_should_panic_attr(sub_inner_attrs):
             continue
-        sub_name = m.group(2)
-        for sub_attrs_cs, sub_s, sub_cs in _find_inline_mods(
-            scope_stripped, scope_comments_stripped, sub_name
-        ):
-            sub_inner_attrs = _extract_scope_inner_attrs(sub_s, sub_cs)
-            if _SHOULD_PANIC_ATTR_RE.search(sub_inner_attrs):
+        sub_inner_cfgs = _extract_cfg_exprs(sub_inner_attrs, inner_only=True)
+        sub_cfgs = accum_cfgs + _extract_cfg_exprs(sub_attrs_cs) + sub_inner_cfgs
+        if not _are_cfgs_active_in_ci(view, pkg_name, lane, sub_cfgs):
+            continue
+        sub_enclosing_attrs = f"{enclosing_attrs_cs}\n{scope_inner_attrs}\n{sub_attrs_cs}\n{sub_inner_attrs}"
+        sub_fns = _extract_top_level_test_fns(sub_s, sub_cs, sub_enclosing_attrs)
+        sub_helpers = {
+            **local_helpers,
+            **_extract_non_test_fns(sub_s, sub_cs, view, pkg_name, lane, sub_cfgs),
+        }
+        for name, (is_ignored, fn_cfgs, fn_body, fn_attrs_cs) in sorted(sub_fns.items()):
+            if not _are_cfgs_active_in_ci(view, pkg_name, lane, sub_cfgs + fn_cfgs):
                 continue
-            sub_inner_cfgs = _extract_cfg_exprs(sub_inner_attrs, inner_only=True)
-            sub_cfgs = accum_cfgs + _extract_cfg_exprs(sub_attrs_cs) + sub_inner_cfgs
-            if not _are_cfgs_active_in_ci(view, pkg_name, lane, sub_cfgs):
-                continue
-            sub_enclosing_attrs = f"{enclosing_attrs_cs}\n{scope_inner_attrs}\n{sub_attrs_cs}\n{sub_inner_attrs}"
-            sub_fns = _extract_top_level_test_fns(sub_s, sub_cs, sub_enclosing_attrs)
-            sub_helpers = {
-                **local_helpers,
-                **_extract_non_test_fns(sub_s, sub_cs, view, pkg_name, lane, sub_cfgs),
-            }
-            for name, (is_ignored, fn_cfgs, fn_body, fn_attrs_cs) in sorted(sub_fns.items()):
-                if not _are_cfgs_active_in_ci(view, pkg_name, lane, sub_cfgs + fn_cfgs):
-                    continue
-                if not is_ignored or _is_ignored_test_allowed(view, pkg_name, name):
-                    expanded = _expand_body_with_one_level_helpers(
-                        view, pkg_name, lane, sub_cfgs + fn_cfgs, fn_body, sub_helpers
-                    )
-                    bodies.append(
-                        f"{expanded}{_FINGERPRINT_META_SEP}{sub_enclosing_attrs}\n{fn_attrs_cs}"
-                    )
+            if not is_ignored or _is_ignored_test_allowed(view, pkg_name, name):
+                expanded = _expand_body_with_one_level_helpers(
+                    view, pkg_name, lane, sub_cfgs + fn_cfgs, fn_body, sub_helpers
+                )
+                bodies.append(
+                    f"{expanded}{_FINGERPRINT_META_SEP}{sub_enclosing_attrs}\n{fn_attrs_cs}"
+                )
 
     return bodies if bodies else None
 
@@ -1936,11 +2131,13 @@ def _find_use_reexports(
         return []
     seg = rem_segments[0]
     next_rem = rem_segments[1:]
-    depths = _compute_brace_depths(scope_stripped)
-    use_re = re.compile(
-        rf"(?:^|[;\}}\s])((?:#\s*\[[^\]]*\]\s*)*)\bpub(?:\s*\([^)]*\))?\s+use\s+([^;]+);",
-        re.M,
+    scope_stripped, scope_comments_stripped = _blank_macro_defs(
+        scope_stripped, scope_comments_stripped
     )
+    use_re = re.compile(r"\bpub(?:\s*\([^)]*\))?\s+use\s+([^;]+);")
+    items, ok = _iter_depth0_attributed_items(scope_stripped, scope_comments_stripped, use_re)
+    if not ok:
+        return []
     results: list[tuple[str, bool, list[str]]] = []
 
     def normalize_prefix(raw_segs: list[str]) -> tuple[bool, list[str]] | None:
@@ -1956,11 +2153,8 @@ def _find_use_reexports(
             return None
         return (False, raw_segs)
 
-    for m in use_re.finditer(scope_stripped):
-        if depths[m.start(1)] != 0:
-            continue
-        attrs_cs = scope_comments_stripped[m.start(1) : m.end(1)]
-        tree = re.sub(r"\s+", " ", m.group(2).strip()).lstrip(":")
+    for m, attrs_cs in items:
+        tree = re.sub(r"\s+", " ", m.group(1).strip()).lstrip(":")
 
         bm = re.match(r"^([A-Za-z0-9_:]+)::\s*\{([^{}]+)\}\s*$", tree)
         if bm:
@@ -2166,15 +2360,16 @@ def _resolve_contract_helper_binding(
         rc_s = view.read_stripped_rust(root_contracts)
         rc_cs = view.read_comments_stripped_rust(root_contracts)
         rc_mod_dir = root_contracts[:-3]
-        for m in re.finditer(rf"{_VIS_MOD_PREFIX}\bmod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;", rc_s):
-            sub_name = m.group(1)
-            for sub_attrs in _find_out_of_line_mods(rc_s, rc_cs, sub_name):
-                if _are_cfgs_active_in_ci(view, pkg_name, lib_lane, _extract_cfg_exprs(sub_attrs)):
-                    for cf in _resolve_child_mod_files(
-                        view, pkg_name, lib_lane, root_contracts, rc_mod_dir, sub_name, sub_attrs
-                    ):
-                        if cf not in contract_files:
-                            contract_files.append(cf)
+        out_mods, out_ok = _find_all_out_of_line_mods(rc_s, rc_cs)
+        if not out_ok:
+            return None
+        for sub_name, sub_attrs in out_mods:
+            if _are_cfgs_active_in_ci(view, pkg_name, lib_lane, _extract_cfg_exprs(sub_attrs)):
+                for cf in _resolve_child_mod_files(
+                    view, pkg_name, lib_lane, root_contracts, rc_mod_dir, sub_name, sub_attrs
+                ):
+                    if cf not in contract_files:
+                        contract_files.append(cf)
     if not contract_files:
         return None
 
@@ -2182,21 +2377,26 @@ def _resolve_contract_helper_binding(
     contract_fn_attrs_cs: str = ""
     callee_names: set[str] = {contract_fn}
     pub_fn_re = re.compile(
-        rf"((?:#\s*\[[^\]]*\]\s*)*)\bpub(?:\s*\([^)]*\))?\s+(?:async\s+|unsafe\s+|const\s+)*fn\s+(?:r#)?{re.escape(contract_fn)}\b"
+        rf"\bpub(?:\s*\([^)]*\))?\s+(?:async\s+|unsafe\s+|const\s+)*fn\s+(?:r#)?{re.escape(contract_fn)}\b"
     )
     for cf in contract_files:
         stripped = view.read_stripped_rust(cf)
         cs = view.read_comments_stripped_rust(cf)
-        m = pub_fn_re.search(stripped)
-        if m:
-            contract_fn_attrs_cs = cs[m.start(1) : m.end(1)]
-            if _SHOULD_PANIC_ATTR_RE.search(contract_fn_attrs_cs):
+        s_clean, cs_clean = _blank_macro_defs(stripped, cs)
+        items, ok = _iter_depth0_attributed_items(s_clean, cs_clean, pub_fn_re)
+        if not ok:
+            return None
+        if items:
+            m, contract_fn_attrs_cs = items[0]
+            if _has_should_panic_attr(contract_fn_attrs_cs):
                 return None
-            open_brace = stripped.find("{", m.end())
+            if not _are_cfgs_active_in_ci(view, pkg_name, lib_lane, _extract_cfg_exprs(contract_fn_attrs_cs)):
+                return None
+            open_brace = s_clean.find("{", m.end())
             if open_brace != -1:
-                close_brace = _find_matching_brace(stripped, open_brace)
+                close_brace = _find_matching_brace(s_clean, open_brace)
                 if close_brace != -1:
-                    contract_fn_body = stripped[open_brace : close_brace + 1]
+                    contract_fn_body = s_clean[open_brace : close_brace + 1]
                     for helper_m in re.finditer(r"\b(run_[A-Za-z0-9_]*_contract)\s*\(", contract_fn_body):
                         callee_names.add(helper_m.group(1))
             break
@@ -2579,34 +2779,38 @@ def _classify_crate_rust_files(view: RepoView, pkg_name: str) -> tuple[set[str],
             if isinstance(b, dict) and isinstance(b.get("path"), str):
                 root_candidates.append(f"{crate_dir}/{b['path'].lstrip('/')}")
     visited_scopes: set[tuple[str, str, bool, str, bool]] = set()
-    inline_pat = re.compile(rf"((?:#\s*\[[^\]]*\]\s*)*){_VIS_MOD_PREFIX}\bmod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*\{{", re.M)
-    out_pat = re.compile(rf"(?:^|[;\}}\s])((?:#\s*\[[^\]]*\]\s*)*){_VIS_MOD_PREFIX}\bmod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;", re.M)
+    unparseable = False
 
     def walk_scope(cur_file: str, cur_mod_dir: str, is_file_scope: bool, scope_s: str, scope_cs: str, in_test_cfg: bool) -> None:
+        nonlocal unparseable
         s, cs = _blank_macro_defs(scope_s, scope_cs)
         state = (cur_file, cur_mod_dir, is_file_scope, cs, in_test_cfg)
         if state in visited_scopes:
             return
         visited_scopes.add(state)
-        depths = _compute_brace_depths(s)
-        for m in inline_pat.finditer(s):
-            if depths[m.start(1)] != 0:
-                continue
-            seg = m.group(2)
-            for attrs_cs, body_s, body_cs in _find_inline_mods(s, cs, seg):
-                mod_cfgs = _extract_cfg_exprs(attrs_cs) + _extract_cfg_exprs(_extract_scope_inner_attrs(body_s, body_cs), inner_only=True)
-                sub_is_test = in_test_cfg or any(_cfg_is_test_only(e) for e in mod_cfgs)
-                explicit_p = _extract_path_attr(view, pkg_name, lib_lane, attrs_cs)
-                inline_dir = os.path.normpath(f"{cur_mod_dir}/{explicit_p}").replace("\\", "/") if explicit_p is not None else (f"{cur_mod_dir}/{seg}" if cur_mod_dir else seg)
-                walk_scope(cur_file, inline_dir, False, body_s, body_cs, sub_is_test)
-        for m in out_pat.finditer(s):
-            if depths[m.start(1)] != 0:
-                continue
-            seg, attrs_cs = m.group(2), cs[m.start(1) : m.end(1)]
-            mod_is_test = in_test_cfg or any(_cfg_is_test_only(e) for e in _extract_cfg_exprs(attrs_cs))
+        inline_mods, inline_ok = _find_all_inline_mods(s, cs)
+        out_mods, out_ok = _find_all_out_of_line_mods(s, cs)
+        if not inline_ok or not out_ok:
+            unparseable = True
+            return
+        for seg, attrs_cs, body_s, body_cs in inline_mods:
+            mod_cfgs = _extract_cfg_exprs(attrs_cs) + _extract_cfg_exprs(_extract_scope_inner_attrs(body_s, body_cs), inner_only=True)
+            if "__invalid_cfg__" in mod_cfgs:
+                unparseable = True
+            sub_is_test = in_test_cfg or any(_cfg_is_test_only(e) for e in mod_cfgs)
+            explicit_p = _extract_path_attr(view, pkg_name, lib_lane, attrs_cs)
+            inline_dir = os.path.normpath(f"{cur_mod_dir}/{explicit_p}").replace("\\", "/") if explicit_p is not None else (f"{cur_mod_dir}/{seg}" if cur_mod_dir else seg)
+            walk_scope(cur_file, inline_dir, False, body_s, body_cs, sub_is_test)
+        for seg, attrs_cs in out_mods:
+            outer_cfgs = _extract_cfg_exprs(attrs_cs)
+            if "__invalid_cfg__" in outer_cfgs:
+                unparseable = True
+            mod_is_test = in_test_cfg or any(_cfg_is_test_only(e) for e in outer_cfgs)
             for child_file in _resolve_child_mod_files(view, pkg_name, lib_lane, cur_file, cur_mod_dir, seg, attrs_cs, is_file_scope):
                 child_s, child_cs = view.read_stripped_rust(child_file), view.read_comments_stripped_rust(child_file)
                 inner_cfgs = _extract_cfg_exprs(_extract_scope_inner_attrs(child_s, child_cs), inner_only=True)
+                if "__invalid_cfg__" in inner_cfgs:
+                    unparseable = True
                 child_is_test = mod_is_test or any(_cfg_is_test_only(e) for e in inner_cfgs)
                 (cfg_test_files if child_is_test else prod_files).add(child_file)
                 child_mod_dir = child_file.rsplit("/", 1)[0] if child_file.endswith("/mod.rs") else child_file[:-3]
@@ -2616,15 +2820,23 @@ def _classify_crate_rust_files(view: RepoView, pkg_name: str) -> tuple[set[str],
         if not view.is_file(rf):
             continue
         rf_s, rf_cs = view.read_stripped_rust(rf), view.read_comments_stripped_rust(rf)
-        rf_is_test = any(_cfg_is_test_only(e) for e in _extract_cfg_exprs(_extract_scope_inner_attrs(rf_s, rf_cs), inner_only=True))
+        rf_inner_cfgs = _extract_cfg_exprs(_extract_scope_inner_attrs(rf_s, rf_cs), inner_only=True)
+        if "__invalid_cfg__" in rf_inner_cfgs:
+            unparseable = True
+        rf_is_test = any(_cfg_is_test_only(e) for e in rf_inner_cfgs)
         (cfg_test_files if rf_is_test else prod_files).add(rf)
         walk_scope(rf, rf.rsplit("/", 1)[0] if "/" in rf else "", True, rf_s, rf_cs, rf_is_test)
 
-    int_targets = _discover_integration_targets(view, pkg_name)
-    if int_targets:
-        int_test_files.update(int_targets.values())
-    if (data.get("package", {}).get("autotests", True) if isinstance(data, dict) else True) is not False:
-        int_test_files.update(view.glob_files(f"{crate_dir}/tests", ".rs"))
+    if unparseable:
+        prod_files.update(view.glob_files(crate_dir, ".rs"))
+        cfg_test_files.clear()
+        int_test_files.clear()
+    else:
+        int_targets = _discover_integration_targets(view, pkg_name)
+        if int_targets:
+            int_test_files.update(int_targets.values())
+        if (data.get("package", {}).get("autotests", True) if isinstance(data, dict) else True) is not False:
+            int_test_files.update(view.glob_files(f"{crate_dir}/tests", ".rs"))
     _CRATE_FILE_CLASS_CACHE[key] = (prod_files, cfg_test_files, int_test_files)
     return prod_files, cfg_test_files, int_test_files
 
@@ -2637,6 +2849,11 @@ def is_test_only_rust_file(view: RepoView, path: str) -> bool:
     parts = path.split("/")
     if len(parts) < 3:
         return False
+    if view.is_file(path):
+        s_clean, _cs_clean = _blank_macro_defs(view.read_stripped_rust(path), view.read_comments_stripped_rust(path))
+        _attrs, ok = _scan_depth0_attributes(s_clean, _compute_brace_depths(s_clean))
+        if not ok:
+            return False
     prod_files, cfg_test_files, int_test_files = _classify_crate_rust_files(view, parts[1])
     if path in prod_files:
         return False
