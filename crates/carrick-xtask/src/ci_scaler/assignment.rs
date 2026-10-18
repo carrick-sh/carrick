@@ -301,10 +301,12 @@ pub fn assigned_job_key(
 /// the POST; another controller can still start it between GET and POST.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum CancellationOutcome {
+    /// Cancellation was accepted; retain until GitHub confirms completion.
     Cancelled,
     NotCancelled,
     Deferred,
     Gone,
+    Completed,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct SupersededPush {
@@ -312,6 +314,8 @@ pub(super) struct SupersededPush {
     pub sha: String,
     pub reason: String,
     pub outcome: Option<CancellationOutcome>,
+    #[serde(default)]
+    pub created: u64,
 }
 
 pub(super) fn prioritize_demand(mut demand: Vec<super::github::QueuedJob>) -> Vec<JobKey> {
@@ -337,26 +341,36 @@ pub(super) fn run_superseded(entries: &[SupersededPush], key: JobKey) -> bool {
         .iter()
         .any(|entry| entry.key.run == key.run && entry.key.attempt == key.attempt)
 }
-pub(super) fn merge_superseded(target: &mut Vec<SupersededPush>, source: &[SupersededPush]) {
-    for other in source {
-        if let Some(entry) = target
-            .iter_mut()
-            .find(|entry| entry.key.run == other.key.run && entry.key.attempt == other.key.attempt)
-        {
-            if matches!(entry.outcome, None | Some(CancellationOutcome::Deferred))
-                && other.outcome.is_some()
-            {
-                entry.outcome.clone_from(&other.outcome);
-            }
-        } else {
-            target.push(other.clone());
+/// Keep only records whose attempt can still be queued. Missing timestamps
+/// acquire a durable first-observed time, never a guessed expiry.
+fn prune_superseded(entries: &mut Vec<SupersededPush>, time: u64) {
+    for entry in entries.iter_mut() {
+        if entry.created == 0 {
+            entry.created = time;
         }
+    }
+    entries.retain(|entry| {
+        !matches!(
+            entry.outcome,
+            Some(CancellationOutcome::Gone | CancellationOutcome::Completed)
+        ) && time.saturating_sub(entry.created) <= SUPERSESSION_MAX_AGE
+    });
+}
+pub(super) const SUPERSESSION_LIMIT: usize = 4096;
+const SUPERSESSION_MAX_AGE: u64 = 25 * 60 * 60;
+pub(super) fn supersession_capacity(entries: &[SupersededPush]) -> Result<(), ScalerError> {
+    if entries.len() > SUPERSESSION_LIMIT {
+        Err(ScalerError::SupersessionCapacity {
+            live: entries.len(),
+            limit: SUPERSESSION_LIMIT,
+        })
+    } else {
+        Ok(())
     }
 }
 
-/// Supersession and local approval share one admission lock. Durable intent
-/// closes local admission before the API POST; network cleanup happens after
-/// releasing the lock, so it cannot starve approval of the winning push.
+/// Persist local denial before API cleanup. Cleanup errors cannot poison new
+/// demand; only lost durability or an over-cap live journal stops admission.
 pub(super) fn coalesce_demand(
     ledger: &mut impl Refusals,
     mut demand: Vec<super::github::QueuedJob>,
@@ -373,6 +387,8 @@ pub(super) fn coalesce_demand(
             })
             .transpose()?;
         ledger.refresh()?;
+        let time = now()?;
+        prune_superseded(ledger.superseded_mut(), time);
         let mut journal = ledger.superseded().to_vec();
         let mut added = Vec::new();
         if let Some(newest) = demand
@@ -384,11 +400,7 @@ pub(super) fn coalesce_demand(
                 .iter()
                 .filter(|job| job.event == "push" && job.key.run.0 < newest.key.run.0)
             {
-                if ledger.has_approved_run(job.key)
-                    || journal.iter().any(|entry| {
-                        entry.key.run == job.key.run && entry.key.attempt == job.key.attempt
-                    })
-                {
+                if ledger.has_approved_run(job.key) || run_superseded(&journal, job.key) {
                     continue;
                 }
                 let entry = SupersededPush {
@@ -396,27 +408,25 @@ pub(super) fn coalesce_demand(
                     sha: job.sha.clone(),
                     reason: format!("superseded by {}", newest.sha),
                     outcome: None,
+                    created: time,
                 };
                 added.push(entry.clone());
                 journal.push(entry);
             }
         }
-        if !added.is_empty() {
-            *ledger.superseded_mut() = journal.clone();
-            ledger.persist(path)?;
-            for entry in added {
-                eprintln!(
-                    "run={} attempt={} {}; local admission durably closed",
-                    entry.key.run.0, entry.key.attempt, entry.reason
-                );
-            }
+        *ledger.superseded_mut() = journal.clone();
+        ledger.set_supersession_error(supersession_capacity(&journal).err().map(|e| e.to_string()));
+        ledger.persist(path)?;
+        for entry in added {
+            eprintln!(
+                "run={} attempt={} {}; local admission durably closed",
+                entry.key.run.0, entry.key.attempt, entry.reason
+            );
         }
         journal
     };
-    for entry in journal
-        .iter()
-        .filter(|entry| matches!(entry.outcome, None | Some(CancellationOutcome::Deferred)))
-    {
+    let mut outcomes = std::collections::BTreeMap::new();
+    for entry in &journal {
         let outcome = match cancel(entry) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -427,6 +437,13 @@ pub(super) fn coalesce_demand(
                 CancellationOutcome::Deferred
             }
         };
+        eprintln!(
+            "run={} attempt={} {}; {outcome:?}",
+            entry.key.run.0, entry.key.attempt, entry.reason
+        );
+        outcomes.insert((entry.key.run.0, entry.key.attempt), outcome);
+    }
+    {
         let _guard = admission
             .as_ref()
             .map(|lock| {
@@ -435,23 +452,20 @@ pub(super) fn coalesce_demand(
             })
             .transpose()?;
         ledger.refresh()?;
-        let recorded = ledger
-            .superseded_mut()
-            .iter_mut()
-            .find(|recorded| {
-                recorded.key.run == entry.key.run && recorded.key.attempt == entry.key.attempt
-            })
-            .ok_or(ScalerError::Guard(
-                "unfinished supersession lost from ledger",
-            ))?;
-        recorded.outcome = Some(outcome.clone());
-        ledger.persist(path)?;
-        eprintln!(
-            "run={} attempt={} {}; {outcome:?}",
-            entry.key.run.0, entry.key.attempt, entry.reason
+        for entry in ledger.superseded_mut() {
+            if let Some(outcome) = outcomes.remove(&(entry.key.run.0, entry.key.attempt)) {
+                entry.outcome = Some(outcome);
+            }
+        }
+        prune_superseded(ledger.superseded_mut(), now()?);
+        ledger.set_supersession_error(
+            supersession_capacity(ledger.superseded())
+                .err()
+                .map(|e| e.to_string()),
         );
+        ledger.persist(path)?;
     }
-    ledger.refresh()?;
+    supersession_capacity(ledger.superseded())?;
     demand.retain(|job| !run_superseded(ledger.superseded(), job.key));
     Ok(prioritize_demand(demand))
 }
@@ -463,6 +477,7 @@ pub(super) trait Refusals {
     fn refused_mut(&mut self) -> &mut Vec<JobKey>;
     fn superseded(&self) -> &[SupersededPush];
     fn superseded_mut(&mut self) -> &mut Vec<SupersededPush>;
+    fn set_supersession_error(&mut self, error: Option<String>);
     fn has_approved_run(&self, key: JobKey) -> bool;
     fn mark_approved(&mut self, key: JobKey, path: &Path) -> Result<(), ScalerError>;
     fn admission_lock(&self) -> Option<std::sync::Arc<std::sync::Mutex<()>>>;
@@ -607,6 +622,7 @@ pub(super) fn serve_assignment<L: Refusals>(
     if request.approved || request.finished {
         return Ok(Revetted::Recorded(key));
     }
+    supersession_capacity(ledger.superseded())?;
     if ledger.refused().contains(&key) {
         return Ok(Revetted::Refused(key)); // Withhold approval.
     }
@@ -1321,5 +1337,118 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(guest.approved.len(), 1);
+    }
+    fn superseded_at(run: u64, created: u64, outcome: &str) -> SupersededPush {
+        serde_json::from_value(json!({"key":{"run":run,"attempt":1,"job":run},
+            "sha":format!("{run:040x}"),"reason":"superseded by newer main push",
+            "outcome":outcome,"created":created}))
+        .unwrap()
+    }
+    #[test]
+    fn ci_scaler_prunes_only_gone_or_expired_supersessions_in_both_ledgers() {
+        fn verify(mut ledger: impl Refusals, path: &Path) {
+            let time = now().unwrap();
+            ledger.superseded_mut().extend([
+                superseded_at(1, 1, "Deferred"),
+                superseded_at(2, time, "Gone"),
+                superseded_at(3, time, "Deferred"),
+            ]);
+            let mut checked = Vec::new();
+            coalesce_demand(&mut ledger, vec![], path, |entry| {
+                checked.push(entry.key.run.0);
+                Ok(CancellationOutcome::Deferred)
+            })
+            .unwrap();
+            assert_eq!(
+                checked,
+                vec![3],
+                "retired entries must not trigger network cleanup"
+            );
+            assert_eq!(
+                ledger
+                    .superseded()
+                    .iter()
+                    .map(|e| e.key.run.0)
+                    .collect::<Vec<_>>(),
+                vec![3]
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        verify(Ledger::default(), &dir.path().join("kvm"));
+        verify(
+            super::super::mac::MacLedger::default(),
+            &dir.path().join("mac"),
+        );
+    }
+    #[test]
+    fn ci_scaler_live_supersession_overflow_blocks_admission_without_eviction() {
+        fn verify(ledger: &mut impl Refusals, path: &Path) {
+            let time = now().unwrap();
+            ledger
+                .superseded_mut()
+                .extend((1..=4097).map(|n| superseded_at(n, time, "Cancelled")));
+            let error =
+                coalesce_demand(ledger, vec![], path, |_| Ok(CancellationOutcome::Cancelled))
+                    .unwrap_err();
+            assert!(error.to_string().contains("capacity"), "{error}");
+            assert_eq!(ledger.superseded().len(), 4097);
+            let disk: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert_eq!(disk["superseded"].as_array().unwrap().len(), 4097);
+            assert!(
+                disk["supersession_error"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("4097"))
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = JobKey {
+            run: RunId(5000),
+            attempt: 1,
+            job: JobId(5000),
+        };
+        let mut kvm = Ledger::default();
+        let path = dir.path().join("kvm");
+        verify(&mut kvm, &path);
+        assert!(kvm.reserve(fresh, &[], 100, Concurrency::ONE).is_err());
+        coalesce_demand(&mut kvm, vec![], &path, |entry| {
+            Ok(if entry.key.run.0 == 1 {
+                CancellationOutcome::Gone
+            } else {
+                CancellationOutcome::Cancelled
+            })
+        })
+        .unwrap();
+        assert_eq!(kvm.superseded.len(), 4096);
+        assert!(kvm.reserve(fresh, &[], 100, Concurrency::ONE).is_ok());
+        let mut mac = super::super::mac::MacLedger::default();
+        let path = dir.path().join("mac");
+        verify(&mut mac, &path);
+        assert!(mac.reserve(fresh, 100).is_err());
+    }
+    #[test]
+    fn ci_scaler_assignment_publication_cannot_resurrect_pruned_supersessions() {
+        let dir = tempfile::tempdir().unwrap();
+        macro_rules! verify {
+            ($ledger:expr,$name:literal) => {{
+                let path = dir.path().join($name);
+                let mut lifecycle = $ledger;
+                lifecycle
+                    .superseded
+                    .push(superseded_at(1, now().unwrap(), "Deferred"));
+                let publication = Publication::new(lifecycle.clone());
+                lifecycle.publication = Some(publication.clone());
+                let mut stale = publication.snapshot().unwrap();
+                stale.publication = Some(publication.worker());
+                coalesce_demand(&mut lifecycle, vec![], &path, |_| {
+                    Ok(CancellationOutcome::Gone)
+                })
+                .unwrap();
+                assert!(lifecycle.superseded.is_empty());
+                stale.persist(&path).unwrap();
+                let disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                assert!(disk["superseded"].as_array().unwrap().is_empty());
+            }};
+        }
+        verify!(Ledger::default(), "kvm");
     }
 }

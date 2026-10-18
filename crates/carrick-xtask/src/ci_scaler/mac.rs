@@ -111,6 +111,8 @@ pub struct MacLedger {
     refused: Vec<JobKey>,
     #[serde(default)]
     superseded: Vec<assignment::SupersededPush>,
+    #[serde(default)]
+    supersession_error: Option<String>,
     #[serde(skip)]
     publication: Option<assignment::Publication<MacLedger>>,
 }
@@ -118,6 +120,7 @@ impl MacLedger {
     /// One cloudmac runner at a time. A job key is re-served only when its
     /// earlier runners closed without running it (see [`Ledger::served`]).
     pub fn reserve(&mut self, key: JobKey, now: u64) -> Result<MacRecord, ScalerError> {
+        assignment::supersession_capacity(&self.superseded)?;
         if self.served(key) {
             return Err(ScalerError::Guard("job already reserved"));
         }
@@ -181,7 +184,8 @@ impl MacLedger {
             }
         }
         assignment::bound_refusals(&mut self.refused);
-        assignment::merge_superseded(&mut self.superseded, &source.superseded);
+        // Supersession and its status belong to the lifecycle loop. Worker
+        // publications start from the committed ledger; never union stale entries.
         // Runtime state must never recursively own the publication itself.
         self.publication = None;
     }
@@ -224,6 +228,9 @@ impl assignment::Refusals for MacLedger {
     }
     fn superseded_mut(&mut self) -> &mut Vec<assignment::SupersededPush> {
         &mut self.superseded
+    }
+    fn set_supersession_error(&mut self, error: Option<String>) {
+        self.supersession_error = error;
     }
     fn has_approved_run(&self, key: JobKey) -> bool {
         self.rows.iter().any(|row| {

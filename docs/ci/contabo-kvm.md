@@ -103,6 +103,21 @@ blocking newest-push admission; a 404 settles the entry as Gone. The receipt
 gate reports skipped commits
 as a range. Deploying this policy requires updated controllers and hooks.
 
+
+Supersession retention follows queue lifetime: remove an entry only when
+GitHub confirms completion/cancellation, the run is Gone, its attempt has
+been replaced, or 25 hours have elapsed since first observation (the 24-hour
+queue limit plus one hour). An accepted cancellation request alone is not
+completion. The lifecycle loop owns pruning; stale assignment publications
+cannot restore retired entries.
+
+The live-entry limit is 4096. If pruning leaves more, keep **every** live
+record, stop minting new runners and persist the distinct capacity error in
+`ledger.json`'s `supersession_error` status field. Cleanup continues; once the
+live set falls within the limit, the status clears and admission resumes.
+Inspect this field alongside controller logs; no live denial is evicted to
+make space.
+
 On push, a selector built from trusted event.before walks back at most 50
 first-parent commits to the nearest trusted KVM receipt. Zero/non-ancestor
 before values fail closed. The comparison runs from a clean checkout/build

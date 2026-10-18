@@ -69,6 +69,10 @@ pub enum ScalerError {
     External(&'static str),
     #[error("GitHub resource is Gone (HTTP 404)")]
     GithubGone,
+    #[error(
+        "supersession capacity exceeded ({live} live entries, limit {limit}); new runner admission stopped"
+    )]
+    SupersessionCapacity { live: usize, limit: usize },
     // Program name and exit status/signal or timeout only; never external output.
     #[error("external command failed: {0}")]
     CommandFailed(String),
@@ -175,6 +179,8 @@ pub struct Ledger {
     refused: Vec<JobKey>,
     #[serde(default)]
     superseded: Vec<assignment::SupersededPush>,
+    #[serde(default)]
+    supersession_error: Option<String>,
     #[serde(skip)]
     publication: Option<assignment::Publication<Ledger>>,
 }
@@ -186,6 +192,7 @@ impl Ledger {
         now: u64,
         limit: Concurrency,
     ) -> Result<Record, ScalerError> {
+        assignment::supersession_capacity(&self.superseded)?;
         if self.served(key) {
             return Err(ScalerError::Guard("job already reserved"));
         }
@@ -280,7 +287,8 @@ impl Ledger {
             }
         }
         assignment::bound_refusals(&mut self.refused);
-        assignment::merge_superseded(&mut self.superseded, &source.superseded);
+        // Supersession and its status belong to the lifecycle loop. Worker
+        // publications start from the committed ledger; never union stale entries.
         // Runtime state must never recursively own the publication itself.
         self.publication = None;
     }
@@ -314,6 +322,9 @@ impl assignment::Refusals for Ledger {
     }
     fn superseded_mut(&mut self) -> &mut Vec<assignment::SupersededPush> {
         &mut self.superseded
+    }
+    fn set_supersession_error(&mut self, error: Option<String>) {
+        self.supersession_error = error;
     }
     fn has_approved_run(&self, key: JobKey) -> bool {
         self.rows.iter().any(|row| {
