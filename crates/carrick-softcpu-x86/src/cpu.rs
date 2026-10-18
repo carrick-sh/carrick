@@ -9,7 +9,6 @@ use crate::cflow::{compute_effective_va, resolve_cflow};
 use crate::context::{
     EXIT_REASON_CFLOW, EXIT_REASON_CONTINUE, EXIT_REASON_SENSITIVE, EXIT_REASON_SYSCALL,
     GUEST_MXCSR_MASK, SoftCpuContext, X86Exception, X86ExceptionVector, reg,
-    softcpu_enter_translated, translate_for_mem,
 };
 use crate::decode::SensitiveOp;
 use crate::emit::{EmitError, emit_block};
@@ -125,18 +124,15 @@ impl Drop for JitCodeBuffer {
     }
 }
 
-struct ActiveMemGuard<'a>(&'a mut SoftCpuContext);
-
-impl Drop for ActiveMemGuard<'_> {
-    fn drop(&mut self) {
-        self.0.active_mem_ptr = None;
-        self.0.active_translate_fn = None;
-    }
-}
-
 /// Level 0 x86_64 soft vCPU.
+///
+/// Raw plans contain native bytes and are not an externally callable execution API.
+/// ```compile_fail
+/// use carrick_softcpu_x86::{SoftCpu, SoftMmuMemory};
+/// fn raw_entry<M: SoftMmuMemory>() { let _ = SoftCpu::execute_planned_block::<M>; }
+/// ```
 pub struct SoftCpu {
-    pub ctx: Box<SoftCpuContext>,
+    ctx: Box<SoftCpuContext>,
     jit: JitCodeBuffer,
     pub max_block_insns: usize,
     pub max_block_span: usize,
@@ -154,6 +150,16 @@ impl SoftCpu {
         })
     }
 
+    /// Borrow architectural state; gateway addresses and memory bindings stay private.
+    pub fn context(&self) -> &SoftCpuContext {
+        &self.ctx
+    }
+
+    /// Mutate architectural state between blocks.
+    pub fn context_mut(&mut self) -> &mut SoftCpuContext {
+        &mut self.ctx
+    }
+
     fn raise(&mut self, exc: X86Exception) -> Result<SoftCpuExit, EmitError> {
         if let Some(cr2) = exc.cr2 {
             self.ctx.cr2 = cr2;
@@ -166,7 +172,7 @@ impl SoftCpu {
     /// Plan, emit, and execute one basic block starting at `self.ctx.rip` over `mem`.
     pub fn step_block<M: SoftMmuMemory>(&mut self, mem: &mut M) -> Result<SoftCpuExit, EmitError> {
         self.ctx.pending_exception = None;
-        self.ctx.bounce_active = 0;
+        self.ctx.reset_bounce();
         self.ctx.sync_tlb_tag_bits();
 
         let (rip, max_i, max_s) = (self.ctx.rip, self.max_block_insns, self.max_block_span);
@@ -181,8 +187,8 @@ impl SoftCpu {
         }
     }
 
-    /// Emit and execute an already-planned [`PlannedBlock`] over `mem`.
-    pub fn execute_planned_block<M: SoftMmuMemory>(
+    /// Execute only plans produced by this crate: raw bytes must agree with decoded metadata.
+    pub(crate) fn execute_planned_block<M: SoftMmuMemory>(
         &mut self,
         planned: &PlannedBlock,
         mem: &mut M,
@@ -196,23 +202,8 @@ impl SoftCpu {
                 detail: "translated block exceeds JIT buffer capacity".to_string(),
             })?;
 
-        self.ctx.block_start_va = planned.start;
-        self.ctx.entry_exec_addr = exec_addr;
-        self.ctx.exit_reason = 0;
-        self.ctx.pending_exception = None;
-        self.ctx.active_block_insns.clear();
-        self.ctx
-            .active_block_insns
-            .extend(planned.insns.iter().map(|d| (d.va, d.raw)));
-
-        let raw_exit = {
-            self.ctx.active_mem_ptr = Some(NonNull::from(&mut *mem).cast::<()>());
-            self.ctx.active_translate_fn = Some(translate_for_mem::<M>);
-            let guard = ActiveMemGuard(&mut self.ctx);
-            let ctx_ptr: *mut SoftCpuContext = &mut *guard.0;
-            // SAFETY: `exec_addr` points to freshly emitted machine code ending in an exit stub.
-            unsafe { softcpu_enter_translated(ctx_ptr.cast::<u8>()) }
-        };
+        // SAFETY: entry belongs to this CPU's freshly published translated block.
+        let raw_exit = unsafe { self.ctx.execute(mem, exec_addr, planned) };
 
         self.ctx.fxsave.0[28..32].copy_from_slice(&GUEST_MXCSR_MASK.to_le_bytes());
         self.ctx.sync_tlb_tag_bits();

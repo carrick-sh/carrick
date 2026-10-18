@@ -13,9 +13,7 @@ pub mod mmu;
 
 pub use block::{BlockExit, BlockFetchFault, MAX_INSN_BYTES, PlannedBlock, plan_block_from_memory};
 pub use cflow::{compute_effective_va, eval_cc, resolve_cflow};
-pub use context::{
-    BounceWriteback, FxsaveArea, SoftCpuContext, X86Exception, X86ExceptionVector, reg,
-};
+pub use context::{FxsaveArea, SoftCpuContext, X86Exception, X86ExceptionVector, reg};
 pub use cpu::{JitCodeBuffer, SoftCpu, SoftCpuExit};
 pub use decode::{CflowKind, DecodedInsn, InsnClass, SensitiveOp, classify, gpr_index};
 pub use emit::{EmitError, EmittedBlock, emit_block};
