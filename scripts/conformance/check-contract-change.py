@@ -2,6 +2,7 @@
 """Check that changed guest surfaces have matching conformance contract evidence."""
 
 import argparse
+import functools
 import os
 import re
 import subprocess
@@ -926,6 +927,8 @@ class RepoView:
         self._cargo_toml_cache: dict[str, dict | None] = {}
         self._ignored_allowlist_cache: list[tuple[str, str | None]] | None = None
         self._workflow_lane_info_cache: tuple[dict[str, list[tuple[str, str, frozenset[str]]]], dict[str, set[tuple[str, str]]]] | None = None
+        self._crate_fn_files_cache: dict[str, dict[str, list[str]]] = {}
+        self._file_non_test_fns_cache: dict[tuple[str, str, str], tuple[dict[str, list[tuple[list[str], str, str]]], bool]] = {}
 
     def _ensure_tree_index(self):
         if self._files is not None:
@@ -1380,6 +1383,7 @@ def _discover_workflow_lane_info(
     }
     default_pkg_host_envs: dict[str, set[tuple[str, str]]] = {
         "carrick-host-linux": {("linux", "x86_64")},
+        "carrick-vmm-kvm": {("linux", "x86_64")},
         "carrick-kernel-example": {("macos", "aarch64"), ("linux", "x86_64"), ("linux", "aarch64")},
     }
 
@@ -1523,7 +1527,7 @@ def _discover_workflow_lane_info(
                         entry = (os_a, arch_a, excl)
                         if entry not in lane_envs["host"]:
                             lane_envs["host"].append(entry)
-                elif rname.startswith("test-"):
+                if rname.startswith("test-"):
                     for bl in body:
                         if "test" in bl and ("-p " in bl or "--package " in bl):
                             for pm in re.finditer(r"(?:-p|--package)\s+([A-Za-z0-9_-]+)", bl):
@@ -1670,6 +1674,7 @@ def _are_cfgs_active_in_ci(
     )
 
 
+@functools.lru_cache(maxsize=4096)
 def _compute_brace_depths(text: str) -> list[int]:
     depth = 0
     depths = [0] * (len(text) + 1)
@@ -1683,6 +1688,7 @@ def _compute_brace_depths(text: str) -> list[int]:
     return depths
 
 
+@functools.lru_cache(maxsize=4096)
 def _blank_macro_defs(scope_stripped: str, scope_comments_stripped: str) -> tuple[str, str]:
     """Blank out `macro_rules! <name> { ... }`, `( ... );`, and `[ ... ];` bodies so items inside
     macro definitions are never mistaken for real module or test items. Fails closed to end-of-scope
@@ -1718,20 +1724,21 @@ def _blank_macro_defs(scope_stripped: str, scope_comments_stripped: str) -> tupl
     return ("".join(s_chars), "".join(cs_chars))
 
 
-def _scan_depth0_attributes(
-    scope_stripped: str, depths: list[int]
-) -> tuple[dict[int, tuple[int, int, bool]], bool]:
-    """Scan all `#` tokens at delimiter depth 0 of `scope_stripped` using `_find_matching_delim`.
+_ATTR_OPEN_RE = re.compile(r"#\s*(!?)\s*\[")
 
-    Returns `(attr_by_end_offset, ok)` where each entry is `end_offset: (start_offset, end_offset, is_inner)`.
-    Fails closed (`ok=False`) if any depth-0 `#` (outside `r#<ident>`) is not a bracket-balanced attribute.
-    """
+
+@functools.lru_cache(maxsize=4096)
+def _scan_depth0_attributes_cached(scope_stripped: str) -> tuple[dict[int, tuple[int, int, bool]], bool]:
+    depths = _compute_brace_depths(scope_stripped)
     attr_by_end: dict[int, tuple[int, int, bool]] = {}
-    attr_open_re = re.compile(r"^#\s*(!?)\s*\[")
     idx = 0
     n = len(scope_stripped)
     while idx < n:
-        if depths[idx] != 0 or scope_stripped[idx] != "#":
+        hash_pos = scope_stripped.find("#", idx)
+        if hash_pos == -1:
+            break
+        idx = hash_pos
+        if depths[idx] != 0:
             idx += 1
             continue
         if (
@@ -1743,11 +1750,11 @@ def _scan_depth0_attributes(
         ):
             idx += 1
             continue
-        m = attr_open_re.match(scope_stripped[idx:])
+        m = _ATTR_OPEN_RE.match(scope_stripped, idx)
         if not m:
             return ({}, False)
         is_inner = m.group(1) == "!"
-        open_b = idx + m.end() - 1
+        open_b = m.end() - 1
         close_b = _find_matching_delim(scope_stripped, open_b, "[", "]")
         if close_b == -1:
             return ({}, False)
@@ -1757,6 +1764,17 @@ def _scan_depth0_attributes(
         attr_by_end[close_b + 1] = (idx, close_b + 1, is_inner)
         idx = close_b + 1
     return (attr_by_end, True)
+
+
+def _scan_depth0_attributes(
+    scope_stripped: str, _depths: list[int] | None = None
+) -> tuple[dict[int, tuple[int, int, bool]], bool]:
+    """Scan all `#` tokens at delimiter depth 0 of `scope_stripped` using `_find_matching_delim`.
+
+    Returns `(attr_by_end_offset, ok)` where each entry is `end_offset: (start_offset, end_offset, is_inner)`.
+    Fails closed (`ok=False`) if any depth-0 `#` (outside `r#<ident>`) is not a bracket-balanced attribute.
+    """
+    return _scan_depth0_attributes_cached(scope_stripped)
 
 
 def _iter_depth0_attributed_items(
@@ -1953,6 +1971,7 @@ def _extract_path_attr(
     return None
 
 
+@functools.lru_cache(maxsize=4096)
 def _extract_top_level_test_fns(
     scope_stripped: str,
     scope_comments_stripped: str,
@@ -1998,17 +2017,17 @@ def _extract_top_level_test_fns(
     return results
 
 
-def _extract_non_test_fns(
+def _extract_non_test_fns_with_attrs(
     scope_stripped: str,
     scope_comments_stripped: str,
     view: RepoView,
     pkg_name: str,
     lane: str,
     accum_cfgs: list[str],
-) -> dict[str, list[tuple[list[str], str]]]:
+) -> tuple[dict[str, list[tuple[list[str], str, str]]], bool]:
     """Find all non-`#[test]` `fn <name>` at brace depth 0 of `scope_stripped` whose `#[cfg]`s are active in CI.
 
-    Returns `{fn_name: [(cfg_context, fn_body_only_stripped), ...]}`.
+    Returns `({fn_name: [(cfg_context, fn_body_only_stripped, attrs_cs), ...]}, ok)`.
     """
     scope_stripped, scope_comments_stripped = _blank_macro_defs(
         scope_stripped, scope_comments_stripped
@@ -2020,8 +2039,8 @@ def _extract_non_test_fns(
     )
     items, ok = _iter_depth0_attributed_items(scope_stripped, scope_comments_stripped, fn_pattern)
     if not ok:
-        return {}
-    results: dict[str, list[tuple[list[str], str]]] = {}
+        return ({}, False)
+    results: dict[str, list[tuple[list[str], str, str]]] = {}
     for m, attrs_cs in items:
         is_test, fn_cfgs = _extract_test_and_cfg_exprs(attrs_cs)
         if is_test:
@@ -2036,9 +2055,32 @@ def _extract_non_test_fns(
         if close_brace == -1:
             continue
         results.setdefault(fn_name, []).append(
-            (accum_cfgs + fn_cfgs, scope_stripped[open_brace : close_brace + 1])
+            (accum_cfgs + fn_cfgs, scope_stripped[open_brace : close_brace + 1], attrs_cs)
         )
-    return results
+    return (results, True)
+
+
+def _extract_non_test_fns(
+    scope_stripped: str,
+    scope_comments_stripped: str,
+    view: RepoView,
+    pkg_name: str,
+    lane: str,
+    accum_cfgs: list[str],
+) -> dict[str, list[tuple[list[str], str]]]:
+    """Find all non-`#[test]` `fn <name>` at brace depth 0 of `scope_stripped` whose `#[cfg]`s are active in CI.
+
+    Returns `{fn_name: [(cfg_context, fn_body_only_stripped), ...]}`.
+    """
+    raw, ok = _extract_non_test_fns_with_attrs(
+        scope_stripped, scope_comments_stripped, view, pkg_name, lane, accum_cfgs
+    )
+    if not ok:
+        return {}
+    return {
+        fn_name: [(cfgs, body) for cfgs, body, _attrs in variants]
+        for fn_name, variants in raw.items()
+    }
 
 
 def _body_calls_fn(body: str, callee_name: str) -> bool:
@@ -2068,6 +2110,169 @@ def _expand_body_with_one_level_helpers(
                 if _are_cfgs_active_in_ci(view, pkg_name, lane, fn_cfgs + helper_cfgs):
                     parts.append(hbody)
     return "\n".join(parts)
+
+
+_MAX_CALL_CLOSURE_DEPTH = 12
+_CALLEE_EXTRACT_RE = re.compile(
+    r"(?:(?<![.\w:])|(?<![.\w:])(?:\b[a-z_][A-Za-z0-9_]*::)+)\b(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:::\s*<[^{};]*>\s*)?\("
+    r"|\.\s*(?:map|and_then|or_else|filter|inspect|flat_map|map_err)\s*\(\s*(?:(?:\b[a-z_][A-Za-z0-9_]*::)+)?(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*\)"
+)
+_FN_NAME_INDEX_RE = re.compile(r"\bfn\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\b")
+
+
+def _has_early_return_gutting(fn_body: str) -> bool:
+    """Return True if `fn_body` constructs `ContractObservation::default()` or contains an unconditional
+    top-level (`depth == 1`) `return ...;` statement followed by unreachable statements in the same block.
+    """
+    if "ContractObservation::default" in fn_body:
+        return True
+    depths = _compute_brace_depths(fn_body)
+    n = len(fn_body)
+    for m in re.finditer(r"\breturn\b", fn_body):
+        if depths[m.start()] != 1:
+            continue
+        k = m.start() - 1
+        while k >= 0 and fn_body[k] in " \t\r\n":
+            k -= 1
+        if k < 0 or fn_body[k] not in "{;}":
+            continue
+        pos = m.end()
+        semi = -1
+        while pos < n - 1:
+            if depths[pos] == 1 and fn_body[pos] == ";":
+                semi = pos
+                break
+            pos += 1
+        if semi != -1 and fn_body[semi + 1 : -1].strip():
+            return True
+    return False
+
+
+def _get_crate_fn_files(view: RepoView, pkg_name: str) -> dict[str, list[str]]:
+    if pkg_name not in view._crate_fn_files_cache:
+        idx: dict[str, list[str]] = {}
+        for rel_path in view.glob_files(f"crates/{pkg_name}", ".rs"):
+            raw = view.read_text(rel_path)
+            for m in _FN_NAME_INDEX_RE.finditer(raw):
+                fname = m.group(1)
+                lst = idx.setdefault(fname, [])
+                if not lst or lst[-1] != rel_path:
+                    lst.append(rel_path)
+        view._crate_fn_files_cache[pkg_name] = idx
+    return view._crate_fn_files_cache[pkg_name]
+
+
+def _extract_file_non_test_fns(
+    view: RepoView, pkg_name: str, lane: str, rel_path: str
+) -> tuple[dict[str, list[tuple[list[str], str, str]]], bool]:
+    key = (pkg_name, lane, rel_path)
+    if key in view._file_non_test_fns_cache:
+        return view._file_non_test_fns_cache[key]
+    s = view.read_stripped_rust(rel_path)
+    cs = view.read_comments_stripped_rust(rel_path)
+    inner_attrs = _extract_scope_inner_attrs(s, cs)
+    if inner_attrs == "#![cfg(__invalid_cfg__)]":
+        view._file_non_test_fns_cache[key] = ({}, False)
+        return ({}, False)
+    if _has_should_panic_attr(inner_attrs):
+        view._file_non_test_fns_cache[key] = ({}, True)
+        return ({}, True)
+    inner_cfgs = _extract_cfg_exprs(inner_attrs, inner_only=True)
+    if not _are_cfgs_active_in_ci(view, pkg_name, lane, inner_cfgs):
+        view._file_non_test_fns_cache[key] = ({}, True)
+        return ({}, True)
+    fns, ok = _extract_non_test_fns_with_attrs(s, cs, view, pkg_name, lane, inner_cfgs)
+    if not ok:
+        view._file_non_test_fns_cache[key] = ({}, False)
+        return ({}, False)
+    inline_mods, mods_ok = _find_all_inline_mods(s, cs)
+    if not mods_ok:
+        view._file_non_test_fns_cache[key] = ({}, False)
+        return ({}, False)
+    for _mname, mattrs_cs, ms, mcs in inline_mods:
+        m_inner = _extract_scope_inner_attrs(ms, mcs)
+        if m_inner == "#![cfg(__invalid_cfg__)]":
+            view._file_non_test_fns_cache[key] = ({}, False)
+            return ({}, False)
+        if _has_should_panic_attr(mattrs_cs) or _has_should_panic_attr(m_inner):
+            continue
+        m_cfgs = inner_cfgs + _extract_cfg_exprs(mattrs_cs) + _extract_cfg_exprs(m_inner, inner_only=True)
+        if not _are_cfgs_active_in_ci(view, pkg_name, lane, m_cfgs):
+            continue
+        sub_fns, sub_ok = _extract_non_test_fns_with_attrs(ms, mcs, view, pkg_name, lane, m_cfgs)
+        if not sub_ok:
+            view._file_non_test_fns_cache[key] = ({}, False)
+            return ({}, False)
+        for k, v in sub_fns.items():
+            fns.setdefault(k, []).extend(v)
+    view._file_non_test_fns_cache[key] = (fns, True)
+    return (fns, True)
+
+
+def _compute_transitive_call_closure(
+    view: RepoView,
+    pkg_name: str,
+    lane: str,
+    fn_cfgs: list[str],
+    start_bodies: list[str],
+    local_helpers: dict[str, list[tuple[list[str], str]]],
+    max_depth: int = _MAX_CALL_CLOSURE_DEPTH,
+) -> tuple[str, bool]:
+    """Compute the transitive local call closure of `start_bodies` within `pkg_name` up to `max_depth`.
+
+    Fails closed (`ok=False`) if any body in the closure contains early-return gutting, `#[should_panic]`,
+    unparseable attributes, or if the local call chain exceeds `max_depth`.
+    """
+    for b in start_bodies:
+        if _has_early_return_gutting(b):
+            return ("", False)
+    crate_fn_files = _get_crate_fn_files(view, pkg_name)
+    closure_parts: list[str] = []
+    frontier = list(start_bodies)
+    visited: set[str] = set()
+
+    for depth in range(1, max_depth + 2):
+        called_names: set[str] = set()
+        for b in frontier:
+            for cm in _CALLEE_EXTRACT_RE.finditer(b):
+                cname = cm.group(1) or cm.group(2)
+                if cname and cname not in _RUST_KEYWORDS and cname not in visited:
+                    called_names.add(cname)
+        if not called_names:
+            break
+        visited.update(called_names)
+
+        next_frontier: list[str] = []
+        for cname in sorted(called_names):
+            active_variants: list[tuple[str, str]] = []
+            if cname in local_helpers:
+                for h_cfgs, h_body in local_helpers[cname]:
+                    if _are_cfgs_active_in_ci(view, pkg_name, lane, fn_cfgs + h_cfgs):
+                        active_variants.append(("", h_body))
+            if not active_variants and cname in crate_fn_files:
+                for rel_path in crate_fn_files[cname]:
+                    file_fns, file_ok = _extract_file_non_test_fns(view, pkg_name, lane, rel_path)
+                    if not file_ok:
+                        return ("", False)
+                    for h_cfgs, h_body, h_attrs in file_fns.get(cname, []):
+                        if _are_cfgs_active_in_ci(view, pkg_name, lane, fn_cfgs + h_cfgs):
+                            if _has_should_panic_attr(h_attrs):
+                                return ("", False)
+                            active_variants.append((h_attrs, h_body))
+
+            for h_attrs, h_body in active_variants:
+                if _has_early_return_gutting(h_body):
+                    return ("", False)
+                if depth > max_depth:
+                    return ("", False)
+                closure_parts.append(f"{cname}:{h_attrs}\n{h_body}")
+                next_frontier.append(h_body)
+
+        if not next_frontier:
+            break
+        frontier = next_frontier
+
+    return ("\n".join(closure_parts), True)
 
 
 def _scope_valid_test_fn_bodies(
@@ -2111,7 +2316,12 @@ def _scope_valid_test_fn_bodies(
         expanded = _expand_body_with_one_level_helpers(
             view, pkg_name, lane, accum_cfgs + fn_cfgs, fn_body, local_helpers
         )
-        return [f"{expanded}{_FINGERPRINT_META_SEP}{enclosing_attrs_cs}\n{scope_inner_attrs}\n{fn_attrs_cs}"]
+        closure_meta, closure_ok = _compute_transitive_call_closure(
+            view, pkg_name, lane, accum_cfgs + fn_cfgs, [fn_body], local_helpers
+        )
+        if not closure_ok:
+            return None
+        return [f"{expanded}{_FINGERPRINT_META_SEP}{enclosing_attrs_cs}\n{scope_inner_attrs}\n{fn_attrs_cs}\n{closure_meta}"]
 
     bodies: list[str] = []
     for name, (is_ignored, fn_cfgs, fn_body, fn_attrs_cs) in sorted(test_fns.items()):
@@ -2121,8 +2331,13 @@ def _scope_valid_test_fn_bodies(
             expanded = _expand_body_with_one_level_helpers(
                 view, pkg_name, lane, accum_cfgs + fn_cfgs, fn_body, local_helpers
             )
+            closure_meta, closure_ok = _compute_transitive_call_closure(
+                view, pkg_name, lane, accum_cfgs + fn_cfgs, [fn_body], local_helpers
+            )
+            if not closure_ok:
+                return None
             bodies.append(
-                f"{expanded}{_FINGERPRINT_META_SEP}{enclosing_attrs_cs}\n{scope_inner_attrs}\n{fn_attrs_cs}"
+                f"{expanded}{_FINGERPRINT_META_SEP}{enclosing_attrs_cs}\n{scope_inner_attrs}\n{fn_attrs_cs}\n{closure_meta}"
             )
 
     inline_mods, mods_ok = _find_all_inline_mods(scope_stripped, scope_comments_stripped)
@@ -2149,8 +2364,13 @@ def _scope_valid_test_fn_bodies(
                 expanded = _expand_body_with_one_level_helpers(
                     view, pkg_name, lane, sub_cfgs + fn_cfgs, fn_body, sub_helpers
                 )
+                closure_meta, closure_ok = _compute_transitive_call_closure(
+                    view, pkg_name, lane, sub_cfgs + fn_cfgs, [fn_body], sub_helpers
+                )
+                if not closure_ok:
+                    return None
                 bodies.append(
-                    f"{expanded}{_FINGERPRINT_META_SEP}{sub_enclosing_attrs}\n{fn_attrs_cs}"
+                    f"{expanded}{_FINGERPRINT_META_SEP}{sub_enclosing_attrs}\n{fn_attrs_cs}\n{closure_meta}"
                 )
 
     return bodies if bodies else None
@@ -2616,7 +2836,12 @@ def _resolve_contract_helper_binding(
                 view, pkg_name, tlane, t_inner_cfgs + fn_cfgs, fn_body, t_helpers
             )
             if call_in_test_re.search(expanded_test_body):
-                meta = f"{contract_fn_attrs_cs}\n{t_cs}\n{fn_attrs_cs}\n{expanded_test_body}"
+                closure_meta, closure_ok = _compute_transitive_call_closure(
+                    view, pkg_name, tlane, t_inner_cfgs + fn_cfgs, [contract_fn_body, fn_body], t_helpers
+                )
+                if not closure_ok:
+                    return None
+                meta = f"{contract_fn_attrs_cs}\n{t_cs}\n{fn_attrs_cs}\n{expanded_test_body}\n{closure_meta}"
                 return (pkg_name, tname, tfile, [f"{contract_fn_body}{_FINGERPRINT_META_SEP}{meta}"])
 
     return None

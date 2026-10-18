@@ -2438,7 +2438,103 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
             {("macos", "aarch64"), ("linux", "x86_64"), ("linux", "aarch64")},
         )
 
+    def test_new4_indirect_gutting_in_transitive_helper_and_depth_bound_fails(self):
+        """NEW-4: indirect gutting in futex_contention_scenario / futex_requeue_scenario or any transitive crate helper must fail, and call chains past the depth bound must fail closed."""
+        # (a) Early `return Ok(ContractObservation::default())` in futex_contention_scenario / futex_requeue_scenario
+        self.seed_gated_futex_contracts()
+        contracts_rs = self.repo / "crates" / "carrick-kernel-example" / "src" / "contracts.rs"
+        contracts_rs.write_text(
+            "pub fn futex_contention_scenario(scale: usize) -> Result<ContractObservation, ExampleError> {\n"
+            "    let obs = run_real_contention(scale);\n"
+            "    Ok(obs)\n"
+            "}\n"
+            "pub fn futex_contention_contract() -> Result<ContractObservation, ExampleError> {\n"
+            "    futex_contention_scenario(8)\n"
+            "}\n"
+            "pub fn futex_requeue_scenario(scale: usize) -> Result<ContractObservation, ExampleError> {\n"
+            "    let obs = run_real_requeue(scale);\n"
+            "    Ok(obs)\n"
+            "}\n"
+            "pub fn futex_requeue_contract() -> Result<ContractObservation, ExampleError> {\n"
+            "    futex_requeue_scenario(8)\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        base_a = self._commit_all("seed scenario delegates in contracts.rs")
+
+        self.guest_file.write_text("pub fn broken_futex_dispatch() -> i32 { 0 }\n", encoding="utf-8")
+        contracts_rs.write_text(
+            "pub fn futex_contention_scenario(scale: usize) -> Result<ContractObservation, ExampleError> {\n"
+            "    return Ok(ContractObservation::default());\n"
+            "    let obs = run_real_contention(scale);\n"
+            "    Ok(obs)\n"
+            "}\n"
+            "pub fn futex_contention_contract() -> Result<ContractObservation, ExampleError> {\n"
+            "    futex_contention_scenario(8)\n"
+            "}\n"
+            "pub fn futex_requeue_scenario(scale: usize) -> Result<ContractObservation, ExampleError> {\n"
+            "    return Ok(ContractObservation::default());\n"
+            "    let obs = run_real_requeue(scale);\n"
+            "    Ok(obs)\n"
+            "}\n"
+            "pub fn futex_requeue_contract() -> Result<ContractObservation, ExampleError> {\n"
+            "    futex_requeue_scenario(8)\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        self._commit_all("gut futex_*_scenario with early return Ok(ContractObservation::default())")
+        res_a = self.run_check(base_sha=base_a)
+        self.assertEqual(res_a.returncode, 1, msg=f"case a stdout: {res_a.stdout}\nstderr: {res_a.stderr}")
+
+        # (b) Transitive helper modification across crate modules in a normal bound test (bound_test -> h1 -> h2)
+        self.use_single_contract_surface()
+        (self.repo / "crates" / "carrick-kernel" / "src" / "lib.rs").write_text(
+            "pub mod dispatch;\npub mod scenario_helpers;\n#[cfg(test)]\nmod tests;\n",
+            encoding="utf-8",
+        )
+        helpers_rs = self.repo / "crates" / "carrick-kernel" / "src" / "scenario_helpers.rs"
+        helpers_rs.write_text(
+            "pub fn verify_deep(v: i32) { assert_eq!(v, 42); }\n",
+            encoding="utf-8",
+        )
+        tests_rs = self.repo / "crates" / "carrick-kernel" / "src" / "tests.rs"
+        tests_rs.write_text(
+            "fn step_one() { crate::scenario_helpers::verify_deep(42); }\n"
+            "#[test]\nfn bound_test() { step_one(); }\n",
+            encoding="utf-8",
+        )
+        with (self.repo / "conformance-contracts" / "surfaces.toml").open("a", encoding="utf-8") as f:
+            f.write(
+                '\n[[surfaces]]\npath = "crates/carrick-kernel/src/scenario_helpers.rs"\ncontracts = []\n'
+                '[[surfaces]]\npath = "crates/carrick-kernel/src/tests.rs"\ncontracts = ["kernel.futex.contention"]\n'
+            )
+        self._write_futex_contract('vm_free = "carrick-kernel::tests::bound_test"\n')
+        base_b = self._commit_all("seed transitive cross-module helper bound test")
+
+        self.guest_file.write_text("pub fn unreferenced_futex_edit() -> i32 { 7 }\n", encoding="utf-8")
+        helpers_rs.write_text(
+            "pub fn verify_deep(_v: i32) {}\n",
+            encoding="utf-8",
+        )
+        self._commit_all("gut transitive helper verify_deep while editing surface")
+        res_b = self.run_check(base_sha=base_b)
+        self.assertEqual(res_b.returncode, 1, msg=f"case b stdout: {res_b.stdout}\nstderr: {res_b.stderr}")
+
+        # (c) Call chain exceeding transitive closure depth bound (> 12 hops) fails closed
+        chain_fns = "\n".join(f"fn hop_{i}() {{ hop_{i + 1}(); }}" for i in range(1, 14))
+        tests_rs.write_text(
+            f"{chain_fns}\n"
+            "fn hop_14() { assert_eq!(crate::dispatch::futex::deep_futex_fn(), 1); }\n"
+            "#[test]\nfn bound_test() { assert_eq!(crate::dispatch::futex::deep_futex_fn(), 1); hop_1(); }\n",
+            encoding="utf-8",
+        )
+        self.guest_file.write_text("pub fn deep_futex_fn() -> i32 { 1 }\n", encoding="utf-8")
+        self._commit_all("exceed transitive call closure depth bound")
+        res_c = self.run_check(base_sha=base_b)
+        self.assertEqual(res_c.returncode, 1, msg=f"case c stdout: {res_c.stdout}\nstderr: {res_c.stderr}")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
