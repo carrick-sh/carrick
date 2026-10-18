@@ -3,7 +3,13 @@ pub use carrick_core_abi::lifecycle::*;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 /// Independent diagnostic observations, never a settlement or retirement proof.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct LifecycleCensus {
     pub gate: GateState,
     pub live: u32,
