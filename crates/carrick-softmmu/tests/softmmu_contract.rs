@@ -742,6 +742,9 @@ impl SoftMmuMemory for CasFaultMemory {
     fn extents_mut(&mut self) -> &mut ExtentTable {
         self.inner.extents_mut()
     }
+    fn on_descriptor_load(&self) {
+        self.inner.on_descriptor_load();
+    }
     fn before_descriptor_cas(&self, pa: u64, slot: &AtomicU64, current: u64, _new: u64) {
         if pa != self.target_pa {
             return;
@@ -762,8 +765,43 @@ impl SoftMmuMemory for CasFaultMemory {
     }
 }
 
-/// Review item 7, Round 3 item 3 & Round 4 F4: Hardware `A`/`D` updates via CAS, `fetch_or` same-word retry
-/// under an ignored-bit-toggling peer, walk restart on concurrent `P`-clear, and typed `AdCasRetryExhausted`.
+#[derive(Clone)]
+struct ConcurrentImmaterialWriterMemory {
+    inner: VecGuestMemory,
+    target_pa: u64,
+    cas_attempts: Arc<AtomicU64>,
+    step_req: Arc<AtomicU64>,
+    step_ack: Arc<AtomicU64>,
+    lockstep_limit: u64,
+}
+
+impl SoftMmuMemory for ConcurrentImmaterialWriterMemory {
+    fn placement(&self) -> &LinearPlacement {
+        self.inner.placement()
+    }
+    fn extents(&self) -> &ExtentTable {
+        self.inner.extents()
+    }
+    fn extents_mut(&mut self) -> &mut ExtentTable {
+        self.inner.extents_mut()
+    }
+    fn before_descriptor_cas(&self, pa: u64, _slot: &AtomicU64, _current: u64, _new: u64) {
+        if pa != self.target_pa {
+            return;
+        }
+        let n = self.cas_attempts.fetch_add(1, Ordering::AcqRel) + 1;
+        if n <= self.lockstep_limit {
+            self.step_req.store(n, Ordering::Release);
+            while self.step_ack.load(Ordering::Acquire) < n {
+                std::hint::spin_loop();
+            }
+        }
+    }
+}
+
+/// Review item 7, Round 3 item 3, Round 4 F4 & Round 5: Hardware `A`/`D` updates via CAS, same-word retry
+/// under benign contention, walk restart on `P`-clear, and bounded termination under an adversarial
+/// concurrent writer flipping only software-available bits `9..=11`.
 #[test]
 fn hardware_accessed_and_dirty_bits_updated_via_cas() -> Result<(), PlacementError> {
     let mut rig = Rig::new()?;
@@ -796,9 +834,10 @@ fn hardware_accessed_and_dirty_bits_updated_via_cas() -> Result<(), PlacementErr
     assert!(rig.tlb.write().entry(SoftTlb::index_for(va)).is_valid());
 
     let va_race = GuestVa::new(0x0000_0065_1000);
-    let race_pte_pa = PT_A_GPA + (idx(va_race, 3) as u64) * 8;
-    rig.mem.set(PT_A_GPA, idx(va_race, 3), fresh_leaf);
-    let toggles = (MAX_AD_CAS_RETRIES as u64) + 9;
+    let pt_idx = idx(va_race, 3);
+    let race_pte_pa = PT_A_GPA + (pt_idx as u64) * 8;
+    rig.mem.set(PT_A_GPA, pt_idx, fresh_leaf);
+    let toggles = 5u64;
     let mut peer_mem = CasFaultMemory {
         inner: rig.mem.clone(),
         target_pa: race_pte_pa,
@@ -807,20 +846,22 @@ fn hardware_accessed_and_dirty_bits_updated_via_cas() -> Result<(), PlacementErr
         },
         cas_attempts: AtomicU64::new(0),
     };
-    let peer_res = rig
+    peer_mem.inner.reset_loads();
+    let WalkOutcome::Ram(peer_ram) = rig
         .walk_mem(&mut peer_mem, va_race, Access::Read, mode)
-        .unwrap();
-    assert_eq!(peer_mem.cas_attempts.load(Ordering::Relaxed), toggles + 1);
-    assert_eq!(rig.walker.stats().ad_cas_retries_exhausted, 0);
-    let WalkOutcome::Ram(peer_ram) = peer_res else {
+        .unwrap()
+    else {
         panic!("expected Ram");
     };
+    assert_eq!(peer_mem.cas_attempts.load(Ordering::Relaxed), toggles + 1);
+    assert_eq!(peer_mem.inner.loads(), 4 + toggles);
+    assert_eq!(rig.walker.stats().ad_cas_retries_exhausted, 0);
     assert_eq!(
         peer_ram.leaf.descriptor & (ACCESSED | (1u64 << 52)),
         ACCESSED | (1u64 << 52)
     );
 
-    rig.mem.set(PT_A_GPA, idx(va_race, 3), fresh_leaf);
+    rig.mem.set(PT_A_GPA, pt_idx, fresh_leaf);
     let mut p_clear_mem = CasFaultMemory {
         inner: rig.mem.clone(),
         target_pa: race_pte_pa,
@@ -836,7 +877,7 @@ fn hardware_accessed_and_dirty_bits_updated_via_cas() -> Result<(), PlacementErr
         PageFaultClass::NotPresent
     );
 
-    rig.mem.set(PT_A_GPA, idx(va_race, 3), fresh_leaf);
+    rig.mem.set(PT_A_GPA, pt_idx, fresh_leaf);
     let mut cap_mem = CasFaultMemory {
         inner: rig.mem.clone(),
         target_pa: race_pte_pa,
@@ -856,6 +897,73 @@ fn hardware_accessed_and_dirty_bits_updated_via_cas() -> Result<(), PlacementErr
         cap_mem.cas_attempts.load(Ordering::Relaxed),
         (MAX_AD_CAS_RETRIES as u64) + 1
     );
+
+    rig.mem.set(PT_A_GPA, pt_idx, fresh_leaf);
+    let lockstep_limit = (MAX_AD_CAS_RETRIES as u64) * 4;
+    let mut writer_mem = ConcurrentImmaterialWriterMemory {
+        inner: rig.mem.clone(),
+        target_pa: race_pte_pa,
+        cas_attempts: Arc::new(AtomicU64::new(0)),
+        step_req: Arc::new(AtomicU64::new(0)),
+        step_ack: Arc::new(AtomicU64::new(0)),
+        lockstep_limit,
+    };
+    let stop_writer = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        let w_mem = writer_mem.inner.clone();
+        let req = Arc::clone(&writer_mem.step_req);
+        let ack = Arc::clone(&writer_mem.step_ack);
+        let stop = &stop_writer;
+        let writer = s.spawn(move || {
+            let mut handled = 0u64;
+            while !stop.load(Ordering::Acquire) {
+                let target = req.load(Ordering::Acquire);
+                if target > handled {
+                    let cur = w_mem.get(PT_A_GPA, pt_idx);
+                    w_mem.set(PT_A_GPA, pt_idx, cur ^ (0b111u64 << 9));
+                    handled = target;
+                    ack.store(handled, Ordering::Release);
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+        });
+        let adv_res = rig.walk_mem(&mut writer_mem, va_race, Access::Read, mode);
+        assert_eq!(adv_res, Err(expected_cap));
+        assert_eq!(
+            writer_mem.cas_attempts.load(Ordering::Acquire),
+            (MAX_AD_CAS_RETRIES as u64) + 1
+        );
+        assert_eq!(rig.walker.stats().ad_cas_retries_exhausted, 2);
+
+        writer_mem.lockstep_limit = 0;
+        let free_mem = writer_mem.inner.clone();
+        let free_stop = &stop_writer;
+        let free_writer = s.spawn(move || {
+            let mut mask = 1u64 << 9;
+            while !free_stop.load(Ordering::Acquire) {
+                let cur = free_mem.get(PT_A_GPA, pt_idx);
+                free_mem.set(PT_A_GPA, pt_idx, (cur & !(0b111u64 << 9)) | mask);
+                mask = if mask == (0b111u64 << 9) {
+                    1u64 << 9
+                } else {
+                    mask + (1u64 << 9)
+                };
+            }
+        });
+        for _ in 0..16 {
+            writer_mem.inner.set(PT_A_GPA, pt_idx, fresh_leaf);
+            writer_mem.cas_attempts.store(0, Ordering::Release);
+            let res = rig.walk_mem(&mut writer_mem, va_race, Access::Read, mode);
+            assert!(matches!(res, Ok(WalkOutcome::Ram(_))) || res == Err(expected_cap));
+            assert!(
+                writer_mem.cas_attempts.load(Ordering::Acquire) <= (MAX_AD_CAS_RETRIES as u64) + 1
+            );
+        }
+        stop_writer.store(true, Ordering::Release);
+        assert!(writer.join().is_ok());
+        assert!(free_writer.join().is_ok());
+    });
     Ok(())
 }
 

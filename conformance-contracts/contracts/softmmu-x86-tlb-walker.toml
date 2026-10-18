@@ -33,13 +33,13 @@ uses the crate-owned `AuthenticatedDescriptorWords` adapter to perform atomic
 `AtomicU64` accesses directly at `LinearPlacement::host(table_frame) + (pa &
 0xfff)`. `SoftWalker` binds
 `carrick_mmu_core::x86::descriptor_txn::translate_leaf_hardware` in a single
-4-level walk (one load per walked level, `fetch_or` same-word CAS retries when
-`PRESENT`, output address, and permission bits are unchanged, walk restart only
-on a material descriptor change, and typed `AdCasRetryExhausted` counted in
-`SoftWalkerStats` if the livelock cap is reached), authenticates `[leaf_base,
-leaf_base + leaf.size)` to mint `AuthenticatedGpa`, requires TLB shootdowns on
-`ExtentTable` retirement/replacement, and invalidates write-plane entries across
-CPUs when an authenticated frame becomes a code page.
+4-level walk (one load per walked level, same-word CAS retries when `PRESENT`,
+output address, and permission bits are unchanged, walk restart on a material
+descriptor change, and every failed CAS counted against `MAX_AD_CAS_RETRIES`
+with typed `AdCasRetryExhausted` counted in `SoftWalkerStats`), authenticates
+`[leaf_base, leaf_base + leaf.size)` to mint `AuthenticatedGpa`, requires TLB
+shootdowns on `ExtentTable` retirement/replacement, and invalidates write-plane
+entries across CPUs when an authenticated frame becomes a code page.
 """
 
 [bindings]
