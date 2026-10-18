@@ -1074,9 +1074,9 @@ pub enum HardwareFaultClass {
     Smep,
     /// Supervisor data access hit an effective-user page when `CR4.SMAP == 1 && RFLAGS.AC == 0` (`#PF` with `P = 1`).
     Smap,
-    /// Atomic `ACCESSED`/`DIRTY` `compare_exchange` exceeded [`MAX_AD_CAS_RETRIES`] material-change restarts.
+    /// Atomic `ACCESSED`/`DIRTY` `compare_exchange` exceeded [`MAX_AD_CAS_RETRIES`] failed CAS attempts.
     AdCasRetryExhausted {
-        /// Number of failed material-change walk restarts (`MAX_AD_CAS_RETRIES`).
+        /// Number of failed `A`/`D` CAS attempts (`MAX_AD_CAS_RETRIES`).
         retries: usize,
     },
 }
@@ -1115,12 +1115,14 @@ enum WalkMode<'a> {
     Hardware(&'a HardwareWalkConfig),
 }
 
-/// Livelock bound on full-walk restarts triggered by material descriptor edits during `A`/`D` CAS.
+/// Total livelock/contention bound on failed `ACCESSED`/`DIRTY` `compare_exchange` attempts per walk.
 ///
-/// Same-word `fetch_or` CAS retries continue in place whenever `PRESENT`, the output address, and
-/// permission/structural bits (`WRITE | USER | HUGE | NX`) are unchanged (e.g., a peer toggling
-/// software-ignored bits or `ACCESSED`/`DIRTY`), so benign contention never consumes this cap;
-/// only a material PTE change or a broken store failing CAS on an unchanged word increments it.
+/// When a failed CAS reloads a word whose `PRESENT`, output address, and permission/structural bits
+/// (`WRITE | USER | HUGE | NX`) are unchanged (e.g., a peer toggling software-available bits `8..=11`
+/// or `52..=62`), the walker retries the CAS in place on that word without restarting the 4-level
+/// walk; when a material bit changed, it restarts from the root. Every failed CAS counts against
+/// `MAX_AD_CAS_RETRIES` so an adversarial concurrent writer flipping software-available bits cannot
+/// spin a soft-vCPU walk forever.
 pub const MAX_AD_CAS_RETRIES: usize = 64;
 
 /// Read one terminal word, including a prepared non-present leaf. This is
@@ -1274,24 +1276,16 @@ fn walk_leaf_inner<W: LiveDescriptorWords + ?Sized>(
                                     cur |= needed;
                                     break;
                                 }
+                                if retries >= MAX_AD_CAS_RETRIES {
+                                    return Err(HardwareFaultClass::AdCasRetryExhausted {
+                                        retries,
+                                    });
+                                }
+                                retries += 1;
                                 let next =
                                     words.load(pa).map_err(HardwareFaultClass::DescriptorLoad)?;
                                 if (next & MATERIAL_AD_MASK) != (cur & MATERIAL_AD_MASK) {
-                                    if retries >= MAX_AD_CAS_RETRIES {
-                                        return Err(HardwareFaultClass::AdCasRetryExhausted {
-                                            retries,
-                                        });
-                                    }
-                                    retries += 1;
                                     continue 'walk;
-                                }
-                                if next == cur {
-                                    if retries >= MAX_AD_CAS_RETRIES {
-                                        return Err(HardwareFaultClass::AdCasRetryExhausted {
-                                            retries,
-                                        });
-                                    }
-                                    retries += 1;
                                 }
                                 cur = next;
                             }
