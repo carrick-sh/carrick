@@ -67,6 +67,8 @@ pub enum ScalerError {
     // Never include external output: API/runner responses may contain secrets.
     #[error("external operation failed: {0}")]
     External(&'static str),
+    #[error("GitHub resource is Gone (HTTP 404)")]
+    GithubGone,
     // Program name and exit status/signal or timeout only; never external output.
     #[error("external command failed: {0}")]
     CommandFailed(String),

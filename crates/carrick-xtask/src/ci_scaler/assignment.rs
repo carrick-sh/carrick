@@ -304,6 +304,7 @@ pub(super) enum CancellationOutcome {
     Cancelled,
     NotCancelled,
     Deferred,
+    Gone,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct SupersededPush {
@@ -416,7 +417,16 @@ pub(super) fn coalesce_demand(
         .iter()
         .filter(|entry| matches!(entry.outcome, None | Some(CancellationOutcome::Deferred)))
     {
-        let outcome = cancel(entry)?;
+        let outcome = match cancel(entry) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                eprintln!(
+                    "run={} attempt={} {}; cleanup Deferred: {error}",
+                    entry.key.run.0, entry.key.attempt, entry.reason
+                );
+                CancellationOutcome::Deferred
+            }
+        };
         let _guard = admission
             .as_ref()
             .map(|lock| {

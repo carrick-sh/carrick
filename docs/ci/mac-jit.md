@@ -53,8 +53,8 @@ Supersession and hook approval share the controller's admission lock. Approval
 is durable before the hook is released; an already approved local run cannot
 be superseded. Every assignment, including the reserved job, must rendezvous.
 The cancellation POST is cleanup outside that lock: a fresh all-lane jobs GET
-must show the target queued and no in-progress job; other hardware must be
-unstarted or completed (HVF, standing KVM or hosted GCP KVM). Observed running
+must show the target queued or waiting and no in-progress job; other hardware
+must be queued, waiting or completed (HVF, standing KVM or hosted GCP KVM). Observed running
 work defers the POST, retaining the intent across polls and restarts. Completed
 work does not strand an older queued lane. The controllers
 have separate authorities; there is no cross-controller acknowledgement.
@@ -64,8 +64,10 @@ between GET and POST; scoped cleanup uses its run ID. This does not guarantee
 that running work can never be cancelled in that window.
 
 Per-job refusals are logged and recorded durably, then the controller considers
-the next job in the same pass. API failures back off and leave supersession
-intents durable for restart/retry. Refused assignment keys are attempt-specific;
+the next job in the same pass. Cleanup errors are logged as Deferred, leave the
+intent durable for restart/retry and do not block newest-push admission. A 404
+settles cleanup as Gone. Job status controls cancellation; queued jobs may have
+`started_at` populated. Demand-listing or provisioning failures still back off. Refused assignment keys are attempt-specific;
 supersession is keyed by run and attempt, so a new attempt is vetted afresh.
 
 GitHub does not bind a JIT registration to the reserved job: a compatible
