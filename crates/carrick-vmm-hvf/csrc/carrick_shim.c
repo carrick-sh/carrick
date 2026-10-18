@@ -14,7 +14,6 @@
  */
 
 #include <stdint.h>
-#include <string.h>
 
 typedef uint64_t hv_vcpu_t;
 typedef int32_t hv_return_t;
@@ -29,6 +28,6 @@ extern hv_return_t hv_vcpu_set_simd_fp_reg(hv_vcpu_t vcpu, hv_simd_fp_reg_t reg,
 hv_return_t carrick_set_simd_fp_reg(hv_vcpu_t vcpu, hv_simd_fp_reg_t reg,
                                     const uint8_t *bytes) {
   hv_simd_fp_uchar16_t value;
-  memcpy(&value, bytes, 16);
+  __builtin_memcpy(&value, bytes, 16);
   return hv_vcpu_set_simd_fp_reg(vcpu, reg, value);
 }
