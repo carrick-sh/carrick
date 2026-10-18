@@ -69,18 +69,21 @@ pub(super) fn region() -> MemoryRegion {
 }
 
 struct Code<'a> {
-    bytes: &'a mut [u8],
+    // Layout discovery follows this same emitter without owning a code page.
+    bytes: Option<&'a mut [u8]>,
     pc: usize,
 }
 impl Code<'_> {
     fn emit(&mut self, op: u32) {
-        assert_eq!(
-            &self.bytes[self.pc..self.pc + 4],
-            &AARCH64_NOP_OPCODE.to_le_bytes(),
-            "the clock handler overlaps emitted vector code at {:#x}",
-            self.pc
-        );
-        self.bytes[self.pc..self.pc + 4].copy_from_slice(&op.to_le_bytes());
+        if let Some(bytes) = self.bytes.as_mut() {
+            assert_eq!(
+                &bytes[self.pc..self.pc + 4],
+                &AARCH64_NOP_OPCODE.to_le_bytes(),
+                "the clock handler overlaps emitted vector code at {:#x}",
+                self.pc
+            );
+            bytes[self.pc..self.pc + 4].copy_from_slice(&op.to_le_bytes());
+        }
         self.pc += 4;
     }
     fn imm(&mut self, r: u32, v: u64) {
@@ -100,7 +103,9 @@ impl Code<'_> {
             Some(false) => enc_bne(p as u64, target as u64),
             None => enc_b(p as u64, target as u64),
         };
-        self.bytes[p..p + 4].copy_from_slice(&op.to_le_bytes());
+        if let Some(bytes) = self.bytes.as_mut() {
+            bytes[p..p + 4].copy_from_slice(&op.to_le_bytes());
+        }
     }
     fn restore_frame(&mut self) {
         for (offset, msr) in [
@@ -128,7 +133,21 @@ impl Code<'_> {
 pub(super) fn install(bytes: &mut [u8], dispatch: usize) -> ClockHandlerLayout {
     bytes[dispatch..dispatch + 4]
         .copy_from_slice(&enc_b(dispatch as u64, ENTRY as u64).to_le_bytes());
-    let mut c = Code { bytes, pc: ENTRY };
+    emit_handler(Code {
+        bytes: Some(bytes),
+        pc: ENTRY,
+    })
+}
+
+/// Pure phase calculation: no scratch page, allocation, or code publication.
+pub(super) fn layout() -> ClockHandlerLayout {
+    emit_handler(Code {
+        bytes: None,
+        pc: ENTRY,
+    })
+}
+
+fn emit_handler(mut c: Code<'_>) -> ClockHandlerLayout {
     // Temporary spills must not overwrite the active transaction's originals.
     c.emit(enc_str_xt_sp(16, TMP16));
     c.emit(enc_str_xt_sp(17, TMP17));
