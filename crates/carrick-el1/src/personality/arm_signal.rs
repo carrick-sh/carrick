@@ -242,6 +242,105 @@ pub(crate) fn build(
     Ok((sp, signal))
 }
 
+#[cfg(any(
+    test,
+    feature = "host-test",
+    all(target_os = "none", target_arch = "aarch64")
+))]
+use carrick_guest_arch::UserVa;
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+use zerocopy::FromBytes;
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+impl carrick_personality_linux::signal::SignalBackend for crate::isa::aarch64::Aarch64Backend {
+    fn setup_signal_frame<'a>(
+        &mut self,
+        frame: &mut TrapFrame,
+        params: carrick_personality_linux::signal::SignalFrameParams,
+        siginfo: Option<&'a [u8]>,
+        _fpstate: &[u8],
+        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
+    ) -> Result<UserVa, Self::Error> {
+        setup_arm_signal_frame(frame, params, siginfo, _fpstate, copy_out)
+    }
+
+    fn restore_signal_frame(
+        &mut self,
+        frame: &mut TrapFrame,
+        _fpstate: &mut [u8],
+        copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool,
+    ) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, Self::Error> {
+        let sp_val = unsafe { crate::isa::aarch64::signal_stack().raw() };
+        let sp = UserVa::new(sp_val);
+        // A public frame is over 4 KiB. Keep the admitted copy off the 16 KiB
+        // EL1 stack and borrow it throughout decode.
+        let mut bytes = frame_copy_buffer(arm::PUBLIC_FRAME_LEN)?;
+        if !copy_in(&mut bytes, sp) {
+            return Err(ArchError::InvalidFrame);
+        }
+        let Some(sigframe) = RtSigframe::ref_from_bytes(&bytes).ok() else {
+            return Err(ArchError::InvalidFrame);
+        };
+
+        let (mask, saved_sp, stack) = restore(frame, sigframe, _fpstate, sp)?;
+
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        unsafe {
+            crate::isa::aarch64::set_signal_stack(UserVa::new(saved_sp));
+        }
+
+        Ok(carrick_personality_linux::signal::RestoredSignalFrame {
+            mask: carrick_signal_core::policy::SigBlockMask::blocking_all_of(
+                carrick_signal_core::SignalSet::from_bits(mask),
+            ),
+            stack,
+        })
+    }
+}
+
+/// Shared frame publication for the native backend and its host-path witness.
+#[cfg(any(
+    test,
+    feature = "host-test",
+    all(target_os = "none", target_arch = "aarch64")
+))]
+pub(crate) fn setup_arm_signal_frame(
+    frame: &mut TrapFrame,
+    params: carrick_personality_linux::signal::SignalFrameParams,
+    siginfo: Option<&[u8]>,
+    fpstate: &[u8],
+    copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
+) -> Result<UserVa, ArchError> {
+    use zerocopy::IntoBytes;
+    let (sp, sigframe) = build(frame, params, siginfo, fpstate)?;
+    let new_sp = sp.raw();
+
+    let frame_bytes = sigframe.as_bytes();
+    if !copy_out(UserVa::new(new_sp), frame_bytes) {
+        return Err(ArchError::InvalidFrame);
+    }
+
+    let info_addr = new_sp;
+    let uc_addr = new_sp + arm::UCONTEXT_OFFSET as u64;
+
+    frame.elr = params.handler.raw();
+    frame.x[0] = params.signal.number() as u64;
+    frame.x[1] = info_addr;
+    frame.x[2] = uc_addr;
+    frame.x[29] = new_sp + arm::FRAME_RECORD_OFFSET as u64;
+    frame.x[30] = params.restorer.map_or(
+        carrick_syscall_abi::LINUX_SIGRETURN_TRAMPOLINE_BASE,
+        UserVa::raw,
+    );
+
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    unsafe {
+        crate::isa::aarch64::set_signal_stack(UserVa::new(new_sp));
+    }
+
+    Ok(UserVa::new(new_sp))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,8 +350,10 @@ mod tests {
 
     #[test]
     fn forwarded_read_restart_replays_original_arg_only_at_native_checkpoint() {
-        let mut read = TrapFrame::default();
-        read.esr = 0xfffe;
+        let mut read = TrapFrame {
+            esr: 0xfffe,
+            ..Default::default()
+        };
         read.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
         read.x[8] = 63; // ARM read
         read.far = 0x1234; // mailbox arg0, not a fault address
@@ -261,8 +362,10 @@ mod tests {
         assert_eq!(read.x[0], 0x1234);
         assert_eq!(read.elr, 0x8000);
 
-        let mut timed_recv = TrapFrame::default();
-        timed_recv.esr = 0xfffd; // host continuation with SO_RCVTIMEO
+        let mut timed_recv = TrapFrame {
+            esr: 0xfffd, // host continuation with SO_RCVTIMEO
+            ..Default::default()
+        };
         timed_recv.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
         timed_recv.x[8] = 207; // ARM recvfrom
         timed_recv.far = 0x1234;
@@ -275,8 +378,10 @@ mod tests {
         assert_eq!(timed_recv.elr, 0x8004);
 
         for nr in [202, 242, 207, 212] {
-            let mut socket = TrapFrame::default();
-            socket.esr = 0xfffe;
+            let mut socket = TrapFrame {
+                esr: 0xfffe,
+                ..Default::default()
+            };
             socket.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
             socket.x[8] = nr;
             socket.far = 0x5678;
@@ -285,8 +390,10 @@ mod tests {
             assert_eq!((socket.x[0], socket.elr), (0x5678, 0x9000));
         }
 
-        let mut ppoll = TrapFrame::default();
-        ppoll.esr = 0xfffe;
+        let mut ppoll = TrapFrame {
+            esr: 0xfffe,
+            ..Default::default()
+        };
         ppoll.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
         ppoll.x[8] = 73; // ARM ppoll always returns EINTR
         ppoll.far = 0x5678;
@@ -582,103 +689,4 @@ mod tests {
         records[532..536].copy_from_slice(&3568_u32.to_le_bytes());
         refused_without_publication(signal);
     }
-}
-
-#[cfg(any(
-    test,
-    feature = "host-test",
-    all(target_os = "none", target_arch = "aarch64")
-))]
-use carrick_guest_arch::UserVa;
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
-use zerocopy::FromBytes;
-
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
-impl carrick_personality_linux::signal::SignalBackend for crate::isa::aarch64::Aarch64Backend {
-    fn setup_signal_frame<'a>(
-        &mut self,
-        frame: &mut TrapFrame,
-        params: carrick_personality_linux::signal::SignalFrameParams,
-        siginfo: Option<&'a [u8]>,
-        _fpstate: &[u8],
-        copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
-    ) -> Result<UserVa, Self::Error> {
-        setup_arm_signal_frame(frame, params, siginfo, _fpstate, copy_out)
-    }
-
-    fn restore_signal_frame(
-        &mut self,
-        frame: &mut TrapFrame,
-        _fpstate: &mut [u8],
-        copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool,
-    ) -> Result<carrick_personality_linux::signal::RestoredSignalFrame, Self::Error> {
-        let sp_val = unsafe { crate::isa::aarch64::signal_stack().raw() };
-        let sp = UserVa::new(sp_val);
-        // A public frame is over 4 KiB. Keep the admitted copy off the 16 KiB
-        // EL1 stack and borrow it throughout decode.
-        let mut bytes = frame_copy_buffer(arm::PUBLIC_FRAME_LEN)?;
-        if !copy_in(&mut bytes, sp) {
-            return Err(ArchError::InvalidFrame);
-        }
-        let Some(sigframe) = RtSigframe::ref_from_bytes(&bytes).ok() else {
-            return Err(ArchError::InvalidFrame);
-        };
-
-        let (mask, saved_sp, stack) = restore(frame, sigframe, _fpstate, sp)?;
-
-        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-        unsafe {
-            crate::isa::aarch64::set_signal_stack(UserVa::new(saved_sp));
-        }
-
-        Ok(carrick_personality_linux::signal::RestoredSignalFrame {
-            mask: carrick_signal_core::policy::SigBlockMask::blocking_all_of(
-                carrick_signal_core::SignalSet::from_bits(mask),
-            ),
-            stack,
-        })
-    }
-}
-
-/// Shared frame publication for the native backend and its host-path witness.
-#[cfg(any(
-    test,
-    feature = "host-test",
-    all(target_os = "none", target_arch = "aarch64")
-))]
-pub(crate) fn setup_arm_signal_frame(
-    frame: &mut TrapFrame,
-    params: carrick_personality_linux::signal::SignalFrameParams,
-    siginfo: Option<&[u8]>,
-    fpstate: &[u8],
-    copy_out: &mut dyn FnMut(UserVa, &[u8]) -> bool,
-) -> Result<UserVa, ArchError> {
-    use zerocopy::IntoBytes;
-    let (sp, sigframe) = build(frame, params, siginfo, fpstate)?;
-    let new_sp = sp.raw();
-
-    let frame_bytes = sigframe.as_bytes();
-    if !copy_out(UserVa::new(new_sp), frame_bytes) {
-        return Err(ArchError::InvalidFrame);
-    }
-
-    let info_addr = new_sp;
-    let uc_addr = new_sp + arm::UCONTEXT_OFFSET as u64;
-
-    frame.elr = params.handler.raw();
-    frame.x[0] = params.signal.number() as u64;
-    frame.x[1] = info_addr;
-    frame.x[2] = uc_addr;
-    frame.x[29] = new_sp + arm::FRAME_RECORD_OFFSET as u64;
-    frame.x[30] = params.restorer.map_or(
-        carrick_syscall_abi::LINUX_SIGRETURN_TRAMPOLINE_BASE,
-        UserVa::raw,
-    );
-
-    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    unsafe {
-        crate::isa::aarch64::set_signal_stack(UserVa::new(new_sp));
-    }
-
-    Ok(UserVa::new(new_sp))
 }
