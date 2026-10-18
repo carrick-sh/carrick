@@ -19,7 +19,15 @@ impl Github {
         body: Option<Value>,
         paginate: bool,
     ) -> Result<Value, ScalerError> {
-        let mut cmd = Command::new("gh");
+        Self::request_command(Command::new("gh"), method, endpoint, body, paginate)
+    }
+    fn request_command(
+        mut cmd: Command,
+        method: &str,
+        endpoint: &str,
+        body: Option<Value>,
+        paginate: bool,
+    ) -> Result<Value, ScalerError> {
         cmd.args(["api", "--method", method, endpoint]);
         if paginate {
             cmd.args(["--paginate", "--slurp"]);
