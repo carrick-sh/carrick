@@ -1791,3 +1791,48 @@ fn handle_write_paths_all_or_nothing_and_finalizer_lock_free_get_under_spin() {
     .unwrap();
     assert_eq!(destroy_released, vec![BackingToken(40)]);
 }
+
+#[test]
+fn handle_lookup_completes_while_unrelated_slot_writer_is_parked() {
+    let (core, arena) = core_with_objects::<2>(4);
+    let c = core.bind(arena, BoundedSpin(16));
+    let table = c.create_handle_table(4, &mut storage(4)).unwrap();
+    let h = c
+        .insert_handle(table, BackingToken(10), HandleFlags::default())
+        .unwrap();
+    let seq = core.tables[table.index].seq.load(Ordering::Acquire);
+    std::thread::scope(|scope| {
+        let (parked_tx, parked_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let writer = scope.spawn(move || {
+            crate::handle::AFTER_HANDLE_SLOT_STORE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    parked_tx.send(()).unwrap();
+                    resume_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                }));
+            });
+            core.bind(arena, BoundedSpin(16)).insert_handle(
+                table,
+                BackingToken(20),
+                HandleFlags::default(),
+            )
+        });
+        parked_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let lookup = c.get_handle(table, h);
+        resume_tx.send(()).unwrap();
+        let other = writer.join().unwrap().unwrap();
+        let guard = lookup.expect("unrelated slot writer must not refuse lookup");
+        assert_eq!(guard.backing(), BackingToken(10));
+        assert_eq!(c.release_handle_pin(guard), Ok(None));
+        c.set_handle_flags(table, other, HandleFlags::INHERITABLE)
+            .unwrap();
+        let dup = c.duplicate_handle(table, other).unwrap();
+        assert_eq!(c.close_handle(table, dup), Ok(None));
+        assert_eq!(core.tables[table.index].seq.load(Ordering::Acquire), seq);
+    });
+    c.destroy_handle_table(table, |_| {}).unwrap();
+}

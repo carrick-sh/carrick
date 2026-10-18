@@ -181,3 +181,16 @@ transaction. Existing fork/CLONE_FILES/exec/pin algorithms are reused, with
 Run `cargo test -p carrick-fd-core` and
 `cargo clippy -p carrick-fd-core --all-targets -- -D warnings` for this revision.
 The earlier bare-metal check is not rerun for this crate-scoped review fix.
+
+## Contract: neutral-handle-table-v1
+
+This additive seam has no routed guest calls. The neutral authority owns
+slot generations, retained object lifetimes, and coherent inheritance.
+Single-slot publications use one release store and exact-slot acquire validation;
+they must not invalidate unrelated lookups or depend on a running lock holder.
+Only identity, extent, or multi-slot transactions change the table sequence.
+The VM-free two-thread binding
+`handle_lookup_completes_while_unrelated_slot_writer_is_parked` requires lookup
+to finish before the writer resumes, within the existing bounded wait policy.
+Creation, inheritance and growth cost O(backed capacity), with zero heap
+allocation in the core. Signed integration belongs to the consuming personality.
