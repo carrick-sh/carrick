@@ -191,6 +191,8 @@ pub fn vcpu_lifecycle_snapshot() -> Option<VcpuLifecycleSnapshot> {
 enum ContainerPhase {
     Prepared,
     Running,
+    /// Its terminal lease was dropped; carrier teardown owns its custody.
+    Abandoned,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -913,6 +915,12 @@ impl CarrierRuntime {
             CarrierAdmissionState::Open => state.admission = CarrierAdmissionState::Closing,
             CarrierAdmissionState::Closing => {}
             CarrierAdmissionState::Closed => return Err(RuntimeError::CarrierClosed),
+            CarrierAdmissionState::Failed
+                if state.completed_lifecycle.is_none()
+                    && state.terminal_claim == CarrierTerminalClaim::Unclaimed =>
+            {
+                state.admission = CarrierAdmissionState::Closing;
+            }
             CarrierAdmissionState::Failed => {
                 return Err(RuntimeError::CarrierFailed(
                     state
@@ -941,9 +949,22 @@ impl CarrierRuntime {
             let mut state = self.inner.state.lock();
             loop {
                 match state.admission {
-                    CarrierAdmissionState::Closing if state.containers.is_empty() => break,
+                    CarrierAdmissionState::Closing
+                        if state
+                            .containers
+                            .values()
+                            .all(|record| record.phase == ContainerPhase::Abandoned) =>
+                    {
+                        break;
+                    }
                     CarrierAdmissionState::Closing => self.inner.changed.wait(&mut state),
                     CarrierAdmissionState::Closed => return Ok(self.snapshot_locked(&state)),
+                    CarrierAdmissionState::Failed
+                        if state.completed_lifecycle.is_none()
+                            && state.terminal_claim == CarrierTerminalClaim::Unclaimed =>
+                    {
+                        state.admission = CarrierAdmissionState::Closing;
+                    }
                     CarrierAdmissionState::Failed => {
                         return Err(RuntimeError::CarrierFailed(
                             state
@@ -1158,7 +1179,7 @@ impl CarrierRuntime {
             live_containers: state
                 .containers
                 .values()
-                .filter(|record| record.phase == ContainerPhase::Running)
+                .filter(|record| record.phase != ContainerPhase::Prepared)
                 .count(),
             kernel_graphs: usize::from(has_kernel_runtime),
             runtime_directories: usize::from(has_kernel_runtime),
@@ -1394,17 +1415,28 @@ impl Drop for CarrierLease {
                 state.containers.remove(&self.launch.container_id);
             }
             ContainerPhase::Running => {
+                if let Some(record) = state.containers.get_mut(&self.launch.container_id) {
+                    record.phase = ContainerPhase::Abandoned;
+                }
                 state.admission = CarrierAdmissionState::Failed;
                 state.failure = Some(format!(
                     "running container {} lost its terminal lease",
                     self.launch.container_id.raw()
                 ));
             }
+            ContainerPhase::Abandoned => {}
         }
         self.carrier.changed.notify_all();
-        let failed = state.admission == CarrierAdmissionState::Failed;
+        let failed_without_custody = state.admission == CarrierAdmissionState::Failed
+            && !state
+                .containers
+                .values()
+                .any(|record| record.phase == ContainerPhase::Abandoned);
         drop(state);
-        if failed && self.carrier.owner_kind == CarrierOwnerKind::ImplicitSingleUse {
+        // Keep a failed running carrier reachable by the process shutdown
+        // funnel until its transferred custody has actually been drained.
+        if failed_without_custody && self.carrier.owner_kind == CarrierOwnerKind::ImplicitSingleUse
+        {
             let _ = self.carrier.implicit_hold.lock().take();
         }
     }
@@ -1638,7 +1670,11 @@ fn shutdown_carrier_with_terminal_drained(
                 ));
             }
         }
-        if !state.containers.is_empty() {
+        if state
+            .containers
+            .values()
+            .any(|record| record.phase != ContainerPhase::Abandoned)
+        {
             return Err(RuntimeError::CarrierClosing);
         }
         match state.terminal_claim {
@@ -1666,6 +1702,33 @@ fn shutdown_carrier_with_terminal_drained(
         // doing so leaves the topology in TearingDown and makes the next
         // container reuse generation 1's live carrier VM.
         let drain_result = drain();
+        // A dropped terminal lease cannot retire its root while executors
+        // still own it. Once the pool has joined, finish that custody here.
+        let abandoned = carrier
+            .inner
+            .state
+            .lock()
+            .containers
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut retirement_result = Ok(());
+        for container in abandoned {
+            let result = carrier.kernel_runtime().map_or(Ok(()), |runtime| {
+                runtime
+                    .kernel()
+                    .retire_container_root(container, None)
+                    .map(|_| ())
+                    .map_err(|error| {
+                        RuntimeError::CarrierFailed(format!("retire abandoned container: {error}"))
+                    })
+            });
+            if result.is_ok() {
+                carrier.inner.state.lock().containers.remove(&container);
+            } else if retirement_result.is_ok() {
+                retirement_result = result;
+            }
+        }
         // A later teardown failure must not hide the drain failure.
         let with_drain_failure = |error: RuntimeError| match &drain_result {
             Ok(()) => error,
@@ -1716,7 +1779,12 @@ fn shutdown_carrier_with_terminal_drained(
         let terminal = carrier
             .finish_claimed_close(artifact_path, publish)
             .map_err(with_drain_failure)?;
-        return drain_result.map(|()| terminal);
+        drain_result?;
+        retirement_result?;
+        if let Some(failure) = carrier.inner.state.lock().failure.clone() {
+            return Err(RuntimeError::CarrierFailed(failure));
+        }
+        return Ok(terminal);
     }
 }
 
@@ -3038,6 +3106,96 @@ pub(crate) mod tests {
             carrier.reserve(launch("after-failure")),
             Err(RuntimeError::CarrierFailed(_))
         ));
+    }
+
+    #[test]
+    fn abandoned_running_lease_drains_and_closes_its_lifecycle_window() {
+        let _serial = TEST_LOCK.lock();
+        let carrier = CarrierRuntime::new_for_tests().expect("first carrier");
+        let lease = carrier.reserve(launch("abandoned")).expect("reserve");
+        let container = Arc::new(Container::new(lease.launch().clone()));
+        let bootstrap = carrick_kernel::kernel::RootBootstrap::for_reference_model(
+            5_701,
+            carrick_hal::ThreadId::synthetic_for_tests(5_701),
+            "abandoned-init".to_owned(),
+        )
+        .expect("bootstrap")
+        .with_container(container);
+        let root = carrier
+            .boot_kernel_root(bootstrap, |_, _, _| Ok(()))
+            .expect("root");
+        activate_first_root(&carrier, &root);
+        lease.mark_running().expect("running");
+        carrier.record_vm_lifecycle_for_test(0, 7);
+        carrier.record_vm_lifecycle_for_test(1, 7);
+        drop(lease);
+
+        let drained = std::sync::atomic::AtomicBool::new(false);
+        let destroyed = std::sync::atomic::AtomicUsize::new(0);
+        let result = shutdown_carrier_with_terminal_drained(
+            &carrier,
+            || {
+                assert!(drained.load(Ordering::Acquire));
+                assert!(root.kernel().container_ids().is_empty());
+                assert_eq!(root.kernel().registry().task_count(), 0);
+                destroyed.fetch_add(1, Ordering::AcqRel);
+                carrier.record_vm_lifecycle_for_test(2, -1);
+                carrier.record_vm_lifecycle_for_test(3, -1);
+                Ok(())
+            },
+            None,
+            |_, _, _| Ok(()),
+            || {},
+            || {
+                drained.store(true, Ordering::Release);
+                Err(RuntimeError::CarrierFailed(
+                    "injected executor failure".into(),
+                ))
+            },
+        );
+        assert!(result.is_err(), "failure must remain visible");
+        assert_eq!(destroyed.load(Ordering::Acquire), 1);
+        assert_eq!(snapshot(&carrier).state, CarrierAdmissionState::Closed);
+        assert_eq!(snapshot(&carrier).registered_containers, 0);
+        let next = CarrierRuntime::new_for_tests().expect("next lifecycle window");
+        assert_ne!(next.generation(), carrier.generation());
+        shutdown_carrier_with(&next, || Ok(())).expect("close second carrier");
+    }
+
+    #[test]
+    fn abandoned_implicit_lease_stays_reachable_until_process_shutdown() {
+        let _serial = TEST_LOCK.lock();
+        let carrier = process_carrier().expect("implicit carrier");
+        let weak = Arc::downgrade(&carrier.inner);
+        let lease = carrier
+            .reserve(launch("implicit-abandon"))
+            .expect("reserve");
+        lease.mark_running().expect("running");
+        drop(carrier);
+        drop(lease);
+        let retained = weak
+            .upgrade()
+            .expect("process shutdown retains failed custody");
+        assert_eq!(
+            retained.state.lock().admission,
+            CarrierAdmissionState::Failed
+        );
+        drop(retained);
+        let destroyed = std::sync::atomic::AtomicUsize::new(0);
+        let result = shutdown_with_destroy_and_hooks(
+            || {
+                destroyed.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            },
+            |_, _, _| Ok(()),
+            || {},
+        );
+        assert!(result.is_err(), "original failure remains visible");
+        assert_eq!(destroyed.load(Ordering::Acquire), 1);
+        assert!(
+            weak.upgrade().is_none(),
+            "completed teardown releases custody"
+        );
     }
 
     #[test]
