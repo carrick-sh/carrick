@@ -1169,6 +1169,21 @@ impl Thread {
             .map(|execution| Self::format_execution(&execution))
     }
 
+    /// Independent atomic observations, not an additional coherent graph row.
+    pub(in crate::kernel) fn lifecycle_diagnostic(&self) -> String {
+        let page = self.control.lifecycle();
+        let census = carrick_core::lifecycle::census(&*page);
+        format!(
+            "lifecycle gate={:?} live={} claimed={} exit_wait={:?} control_entry={:?} host_retirement={:?}",
+            census.gate,
+            census.live,
+            census.claimed,
+            page.exit_wait(),
+            self.control.entry(),
+            self.control.host_retirement(),
+        )
+    }
+
     fn format_execution(execution: &ThreadExecutionRecord) -> String {
         format!(
             "{:?} task_state={} continuation={} control_quantum={:?}",

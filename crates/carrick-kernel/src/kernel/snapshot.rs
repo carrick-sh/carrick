@@ -396,7 +396,9 @@ impl Kernel {
                 threads
                     .iter()
                     .map(|thread| {
-                        let execution = thread.execution_diagnostic_until(deadline);
+                        let execution = thread
+                            .execution_diagnostic_until(deadline)
+                            .map(|state| format!("{state} {}", thread.lifecycle_diagnostic()));
                         if execution.is_none() {
                             unreadable.push(format!("thread {:?} execution", thread.key()));
                         }
@@ -694,7 +696,11 @@ impl Kernel {
             thread_signals.push(thread_signal_row(*key, class, revision, signal));
             thread_rows.push(ThreadSnapshotRow {
                 key: *key,
-                execution: thread.execution_diagnostic(),
+                execution: format!(
+                    "{} {}",
+                    thread.execution_diagnostic(),
+                    thread.lifecycle_diagnostic()
+                ),
                 continuation: thread.continuation_diagnostic(),
                 task: *task_key,
                 registry_id: Some(thread.registry_id()),
@@ -2200,6 +2206,36 @@ mod tests {
 
     fn deadline() -> Instant {
         Instant::now() + Duration::from_secs(1)
+    }
+
+    #[test]
+    fn snapshot_execution_includes_terminal_lifecycle_census() {
+        let (kernel, context) = bootstrap(TestBackend::new(BackendMode::Good));
+        let page = context.lifecycle_page();
+        let birth = page.reserve_host_birth().expect("publication claim");
+        page.publish_exit_wait(carrick_el1_abi::EntryMmKey::from_raw(77), 0x7000);
+        let snapshot = kernel.snapshot(deadline()).expect("snapshot");
+        let thread = snapshot
+            .threads
+            .iter()
+            .find(|row| row.key == context.thread().key())
+            .unwrap();
+        assert!(
+            thread
+                .execution
+                .contains("lifecycle gate=Open live=1 claimed=1"),
+            "{}",
+            thread.execution
+        );
+        assert!(
+            thread
+                .execution
+                .contains("exit_wait=Some((EntryMmKey(77), 28672))"),
+            "{}",
+            thread.execution
+        );
+        page.cancel_host_birth_claim(birth);
+        page.clear_exit_wait();
     }
 
     #[test]
