@@ -1068,6 +1068,32 @@ check-freebsd:
 check-netbsd:
     {{_admit}} {{_cargo}} check --target x86_64-unknown-netbsd --all-targets -p carrick-vmm-nvmm
 
+# Cross-check and clippy-gate the FULL platform-macos closure for
+# aarch64-apple-darwin (`carrick-cli --no-default-features --features platform-macos`,
+# plus `carrick-vmm-hvf`, `carrick-runtime`, `carrick-embed`, and every workspace
+# crate in their dependency closure, including `--all-targets` test targets) so
+# Linux PR CI catches macOS-only compile and clippy breakage before the merge
+# queue. Off-macOS, Clang compiles C sources (`carrick-vmm-hvf` and `ring`) in
+# sysroot-less mode (`-nostdlibinc -DRING_CORE_NOSTDLIBINC=1`) against the
+# documented `TargetConditionals.h` shim in `scripts/ci/darwin-check-include`.
+cross-check-macos *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "{{os()}}" != "macos" ]; then
+        llvm_ar="$(command -v llvm-ar || printf '%s/lib/rustlib/%s/bin/llvm-ar' "$(rustc --print sysroot)" "$(rustc -vV | sed -n 's/host: //p')")"
+        export CC_aarch64_apple_darwin="${CC_aarch64_apple_darwin:-clang}"
+        export AR_aarch64_apple_darwin="${AR_aarch64_apple_darwin:-$llvm_ar}"
+        export CFLAGS_aarch64_apple_darwin="${CFLAGS_aarch64_apple_darwin:--nostdlibinc -DRING_CORE_NOSTDLIBINC=1 -isystem {{justfile_directory()}}/scripts/ci/darwin-check-include}"
+    fi
+    macos_features="carrick-cli/platform-macos,carrick-runtime/platform-macos,carrick-embed/platform-macos"
+    macos_crates="$({{_admit}} {{_cargo}} tree --target aarch64-apple-darwin -p carrick-cli -p carrick-vmm-hvf -p carrick-runtime -p carrick-embed --no-default-features --features "$macos_features" --prefix none | grep -oE '^carrick-[a-z0-9-]+' | sort -u | sed 's/^/-p /' | tr '\n' ' ')"
+    if [ -z "$macos_crates" ]; then
+        echo "cross-check-macos: failed to resolve platform-macos crate closure" >&2
+        exit 1
+    fi
+    {{_admit}} {{_cargo}} check --target aarch64-apple-darwin --no-default-features --features "$macos_features" --all-targets $macos_crates {{ARGS}}
+    exec {{_admit}} {{_cargo}} clippy --target aarch64-apple-darwin --no-default-features --features "$macos_features" --all-targets --keep-going $macos_crates {{ARGS}} -- -D warnings
+
 # Verify that no macOS/HVF dependencies exist in the platform-linux closure (L1 closure assertion).
 closure-linux:
     ./scripts/closure-assert-no-hvf.sh
