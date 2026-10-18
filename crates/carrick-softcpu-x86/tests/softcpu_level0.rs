@@ -903,3 +903,125 @@ fn differential_property_tests_match_native_host_x86_64_cpu() {
         assert_eq!(mem.read_direct(stack_va, 8192).unwrap(), host_stack_mut);
     }
 }
+
+// Review regressions: safe to run against the pre-fix translator as well.
+#[test]
+fn implicit_masked_store_cannot_write_a_host_address() {
+    let mut host_bytes = [0x55u8; 16];
+    let (mut cpu, mut mem, va) = setup_snippet(&[0x66, 0x0f, 0xf7, 0xc1, 0x0f, 0x05]);
+    cpu.ctx.gpr[reg::RDI] = host_bytes.as_mut_ptr() as u64;
+    cpu.ctx.write_xmm(0, u128::MAX);
+    cpu.ctx.write_xmm(1, u128::MAX);
+    let result = cpu.step_block(&mut mem).unwrap();
+    assert_eq!(host_bytes, [0x55; 16], "guest store escaped soft memory");
+    assert_eq!(
+        result,
+        pf(va, PF_ERR_WRITE | PF_ERR_USER, cpu.ctx.gpr[reg::RDI])
+    );
+}
+
+#[test]
+fn ignored_legacy_segment_prefixes_execute_in_long_mode() {
+    for prefix in [0x26, 0x2e, 0x36, 0x3e] {
+        let (mut cpu, mut mem, va) = setup_snippet(&[prefix, 0x66, 0x90, 0x0f, 0x05]);
+        step_ok(&mut cpu, &mut mem, sys(va + 3, va + 5));
+    }
+}
+
+#[test]
+fn unsupported_ymm_state_is_neither_advertised_nor_executed() {
+    let (mut cpu, mut mem, va) = setup_snippet(&[0x0f, 0xa2]);
+    cpu.ctx.gpr[reg::RAX] = 1;
+    cpu.step_block(&mut mem).unwrap();
+    assert_eq!(
+        cpu.ctx.gpr[reg::RCX] & ((1 << 28) | (1 << 12) | (1 << 29)),
+        0
+    );
+    assert_eq!(cpu.ctx.xcr0, 3);
+    // A block end must never make unpreserved YMM upper halves observable.
+    mem.write_direct(va, &[0xc5, 0xfc, 0x57, 0xc0, 0xeb, 0]); // vxorps ymm0,ymm0,ymm0
+    cpu.ctx.rip = va;
+    assert_eq!(cpu.step_block(&mut mem).unwrap(), ud(va));
+}
+
+#[test]
+fn gateway_returns_with_host_df_and_fp_controls_restored() {
+    // Capture DF in a native wrapper immediately after the translated exit,
+    // then clear it before returning to Rust even on the broken gateway.
+    use carrick_softcpu_x86::{
+        context::softcpu_enter_translated, emit_block, plan_block_from_memory,
+    };
+    let (mut cpu, mut mem, va) = setup_snippet(&[0xfd, 0x0f, 0x05]); // std
+    let planned = plan_block_from_memory(va, 64, 4096, &mut cpu.ctx, &mut mem).unwrap();
+    let mut block_jit = JitCodeBuffer::new(4096).unwrap();
+    cpu.ctx.entry_exec_addr = block_jit
+        .publish(&emit_block(&planned).unwrap().code)
+        .unwrap();
+    let mut wrapper = vec![0x53, 0x48, 0xb8];
+    wrapper
+        .extend_from_slice(&(softcpu_enter_translated as *const () as usize as u64).to_le_bytes());
+    wrapper.extend_from_slice(&[0xff, 0xd0, 0x9c, 0x58, 0xfc, 0x5b, 0xc3]);
+    let mut wrapper_jit = JitCodeBuffer::new(4096).unwrap();
+    let entry = wrapper_jit.publish(&wrapper).unwrap();
+    let run: unsafe extern "sysv64" fn(*mut carrick_softcpu_x86::SoftCpuContext) -> u64 =
+        unsafe { std::mem::transmute(entry as usize) };
+    let flags = unsafe { run(&mut *cpu.ctx) };
+    assert_eq!(flags & (1 << 10), 0, "guest DF reached the host ABI");
+    assert_ne!(cpu.ctx.rflags & (1 << 10), 0, "guest DF was lost");
+}
+
+#[test]
+fn complete_f3_instruction_at_page_end_does_not_fetch_next_page() {
+    for bytes in [&[0xf3, 0x90][..], &[0xf3, 0xc3], &[0xf3, 0xa4]] {
+        let (mut cpu, mut mem, va) = setup_snippet(&[]);
+        let ip = va + 4096 - bytes.len() as u64;
+        mem.write_direct(ip, bytes);
+        let planned =
+            carrick_softcpu_x86::plan_block_from_memory(ip, 1, 4096, &mut cpu.ctx, &mut mem);
+        assert!(
+            planned.is_ok(),
+            "complete F3 encoding spuriously fetched: {bytes:x?}: {planned:?}"
+        );
+    }
+}
+
+#[test]
+fn oversized_and_unknown_memory_images_never_enter_native_memory_path() {
+    for bytes in [&[0xdd, 0x37][..], &[0xdd, 0x27], &[0xd9, 0x27]] {
+        // fnsave/frstor/fldenv
+        let decoded = carrick_softcpu_x86::classify(bytes, 0x400000).unwrap();
+        assert_ne!(
+            decoded.class,
+            carrick_softcpu_x86::InsnClass::Body,
+            "unbounded legacy state image admitted"
+        );
+        let (mut cpu, mut mem, va) = setup_snippet(bytes);
+        step_ok(&mut cpu, &mut mem, ud(va));
+    }
+}
+
+#[test]
+fn crossing_conditional_write_preserves_untouched_bounce_bytes() {
+    use carrick_softcpu_x86::context::{
+        pack_slow_path_meta, softcpu_commit_bounce, softcpu_mem_slow_path, translate_for_mem,
+    };
+    let (mut cpu, mut mem, _) = setup_snippet(&[]);
+    let addr = 0x2000_0ff8;
+    mem.map_range(0x2000_0000, 8192, PagePerms::USER_RW);
+    mem.write_direct(addr, &[0x55; 16]);
+    cpu.ctx.bounce_buf.fill(0xcc);
+    cpu.ctx.active_mem_ptr = Some(std::ptr::NonNull::from(&mut mem).cast());
+    cpu.ctx.active_translate_fn = Some(translate_for_mem::<TestSoftMmuMemory>);
+    let ptr = softcpu_mem_slow_path(&mut cpu.ctx, addr, pack_slow_path_meta(0, 16, 1, false));
+    assert_ne!(ptr, 0);
+    // Model a CondWrite instruction updating only selected lanes.
+    cpu.ctx.bounce_buf[0] = 0xaa;
+    cpu.ctx.bounce_buf[15] = 0xaa;
+    softcpu_commit_bounce(&mut cpu.ctx);
+    let mut expected = [0x55; 16];
+    expected[0] = 0xaa;
+    expected[15] = 0xaa;
+    assert_eq!(mem.read_direct(addr, 16).unwrap(), expected);
+    cpu.ctx.active_mem_ptr = None;
+    cpu.ctx.active_translate_fn = None;
+}
