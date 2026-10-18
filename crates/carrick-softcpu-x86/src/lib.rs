@@ -16,7 +16,7 @@ pub use cflow::{compute_effective_va, eval_cc, resolve_cflow};
 pub use context::{FxsaveArea, SoftCpuContext, X86Exception, X86ExceptionVector, reg};
 pub use cpu::{JitCodeBuffer, SoftCpu, SoftCpuExit};
 pub use decode::{CflowKind, DecodedInsn, InsnClass, SensitiveOp, classify, gpr_index};
-pub use emit::{EmitError, EmittedBlock, emit_block};
+pub use emit::{EmitError, EmittedBlock, JitStage, emit_block};
 pub use mmu::{
     Access, AuthenticatedDescriptorWords, AuthenticatedGpa, Cpl, CpuAccessMode, DescriptorRefusal,
     ExtentRecord, ExtentTable, FrameGpa, GuestVa, HostVa, LinearPlacement, LiveDescriptorWords,

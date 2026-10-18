@@ -15,10 +15,18 @@ use crate::context::{
 };
 use crate::decode::{gpr_index, is_fp_arithmetic, is_memory_kind, supported_body};
 
+/// Failed host JIT operation, distinct from a guest architectural exception.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JitStage {
+    Allocate,
+    Publish,
+}
+
 /// Error returned if a block cannot be emitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EmitError {
     EncodeFailed { va: u64, detail: String },
+    HostJit { va: u64, stage: JitStage },
 }
 
 /// Output of [`emit_block`].

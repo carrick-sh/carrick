@@ -16,6 +16,25 @@ use crate::mmu::{
     SoftAccessKind, SoftMmuMemory, is_canonical_va, read_guest_bytes, write_guest_bytes,
 };
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static JIT_ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static FAIL_SMALL_JIT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn inject_small_jit_failure(capacity: usize, publish: bool) -> bool {
+    capacity == 4096
+        && FAIL_SMALL_JIT.with(|fault| {
+            if fault.get() == Some(publish) {
+                fault.set(None);
+                true
+            } else {
+                false
+            }
+        })
+}
+
 const DEFAULT_JIT_CAPACITY: usize = 256 * 1024;
 
 /// Outcome of executing one basic block on [`SoftCpu`].
@@ -56,6 +75,13 @@ impl JitCodeBuffer {
     /// Allocate a host executable scratch buffer of `capacity` bytes.
     pub fn new(capacity: usize) -> Option<Self> {
         let cap = capacity.max(4096).checked_add(4095)? & !4095;
+        #[cfg(test)]
+        {
+            JIT_ALLOCATIONS.with(|count| count.set(count.get() + 1));
+            if inject_small_jit_failure(cap, false) {
+                return None;
+            }
+        }
         let prot = libc::PROT_READ | libc::PROT_WRITE;
         let flags = libc::MAP_PRIVATE | libc::MAP_ANON;
         // SAFETY: anonymous private host allocation for translated block bytes only.
@@ -75,6 +101,10 @@ impl JitCodeBuffer {
     /// The owner must ensure no previously published code is executing while
     /// this exclusive publication changes the mapping back to RW.
     pub fn publish(&mut self, bytes: &[u8]) -> Option<u64> {
+        #[cfg(test)]
+        if inject_small_jit_failure(self.capacity, true) {
+            return None;
+        }
         if bytes.is_empty() || bytes.len() > self.capacity {
             return None;
         }
@@ -198,6 +228,8 @@ impl SoftCpu {
         planned: &PlannedBlock,
         mem: &mut M,
     ) -> Result<SoftCpuExit, EmitError> {
+        // Secure all host executable resources before any guest instruction runs.
+        self.ctx.prepare_block(planned)?;
         let emitted = emit_block(planned)?;
         let exec_addr = self
             .jit
