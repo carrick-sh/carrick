@@ -5,8 +5,10 @@ use std::io::Read;
 use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 
 pub const LOCK_PATH: &str = "/run/carrick/host-lease.lock";
+#[cfg(not(test))]
 const CONFIG_PATH: &str = "/etc/carrick/host-lease.toml";
-pub(super) const CONFIG_ENV: &str = "CARRICK_HOST_LEASE_CONFIG";
+#[cfg(not(test))]
+const CONFIG_ENV: &str = "CARRICK_HOST_LEASE_CONFIG";
 
 #[derive(clap::Args, Clone, Debug)]
 pub struct BrokerArgs {
@@ -23,21 +25,53 @@ pub(super) struct Config {
     known_hosts_file: PathBuf,
 }
 
-impl Config {
-    pub(super) fn load() -> io::Result<Option<Self>> {
-        let explicit = std::env::var_os(CONFIG_ENV);
-        let path = explicit
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| CONFIG_PATH.into());
-        let text = match std::fs::read_to_string(&path) {
+/// Authority to consult exactly one configuration source. Unit-test executables,
+/// including spawned fixtures, have no ambient host configuration authority.
+#[derive(Debug)]
+pub(super) enum ConfigSource {
+    OptionalFile(PathBuf),
+    RequiredFile(PathBuf),
+    #[cfg(test)]
+    NoBroker,
+}
+
+impl ConfigSource {
+    #[cfg(not(test))]
+    pub(super) fn entry_point() -> Self {
+        match std::env::var_os(CONFIG_ENV) {
+            Some(path) => Self::RequiredFile(path.into()),
+            None => Self::OptionalFile(CONFIG_PATH.into()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn entry_point() -> Self {
+        Self::NoBroker
+    }
+
+    pub(super) fn load(&self) -> io::Result<Option<Config>> {
+        let path = match self {
+            Self::OptionalFile(path) | Self::RequiredFile(path) => path,
+            #[cfg(test)]
+            Self::NoBroker => return Ok(None),
+        };
+        let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
-            Err(error) if error.kind() == io::ErrorKind::NotFound && explicit.is_none() => {
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    && matches!(self, Self::OptionalFile(_)) =>
+            {
                 return Ok(None);
             }
             Err(error) => return Err(error),
         };
-        let config: Self = toml::from_str(&text)
+        Config::parse(&text).map(Some)
+    }
+}
+
+impl Config {
+    fn parse(text: &str) -> io::Result<Self> {
+        let config: Self = toml::from_str(text)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         if config.broker.starts_with('-')
             || !config.broker.contains('@')
@@ -53,7 +87,7 @@ impl Config {
                 "broker must be user@host; key and known_hosts paths must be absolute",
             ));
         }
-        Ok(Some(config))
+        Ok(config)
     }
 
     fn command(&self) -> Command {
@@ -379,5 +413,60 @@ impl Drop for Session {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn missing_config_is_local_only_for_optional_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("missing.toml");
+        assert!(
+            ConfigSource::OptionalFile(path.clone())
+                .load()
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            ConfigSource::RequiredFile(path).load().unwrap_err().kind(),
+            io::ErrorKind::NotFound,
+        );
+    }
+
+    #[test]
+    fn invalid_optional_config_fails_closed() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "invalid configuration").unwrap();
+        assert_eq!(
+            ConfigSource::OptionalFile(file.path().into())
+                .load()
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+    }
+
+    #[test]
+    fn inherited_local_lease_rejects_injected_broker() {
+        let lock = tempfile::NamedTempFile::new().unwrap();
+        let lease = HostLease::acquire_path(lock.path(), HostLeaseMode::Gate).unwrap();
+        let config = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            config.path(),
+            "broker = 'lease@127.0.0.1'\nidentity_file = '/fixture/key'\nknown_hosts_file = '/fixture/known_hosts'\n",
+        ).unwrap();
+        let result = HostLease::inherit(
+            &ConfigSource::RequiredFile(config.path().into()),
+            lock.path(),
+            HostLeaseMode::Carrick,
+            &lease.socket,
+        );
+        assert!(matches!(
+            result,
+            Err(HostLeaseError::Inherited(message)) if message == "holder leases a different broker"
+        ));
     }
 }

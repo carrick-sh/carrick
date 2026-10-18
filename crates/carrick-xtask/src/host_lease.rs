@@ -241,9 +241,14 @@ fn read_validation_identity_until(
 impl HostLease {
     /// Claim an idle host directly, without waiting or inherited admission.
     pub fn try_exclusive(path: &Path) -> Result<Option<Self>, HostLeaseError> {
-        match Self::acquire_configured(path, HostLeaseMode::Gate, Duration::ZERO, None, |_| {
-            Ok(false)
-        }) {
+        match Self::acquire_configured(
+            &broker::ConfigSource::entry_point(),
+            path,
+            HostLeaseMode::Gate,
+            Duration::ZERO,
+            None,
+            |_| Ok(false),
+        ) {
             Ok(lease) => Ok(Some(lease)),
             Err(HostLeaseError::Timeout { .. }) => Ok(None),
             Err(error) => Err(error),
@@ -251,21 +256,19 @@ impl HostLease {
     }
 
     pub fn acquire(mode: HostLeaseMode) -> Result<Self, HostLeaseError> {
+        let source = broker::ConfigSource::entry_point();
         let path = std::env::var_os("CARRICK_HOST_LEASE_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_LOCK_PATH));
         if let Some(socket) = std::env::var_os(INHERITED_SOCKET) {
-            return Self::inherit(&path, mode, Path::new(&socket));
+            return Self::inherit(&source, &path, mode, Path::new(&socket));
         }
         if std::env::var_os("CARRICK_HOST_LEASE_FD").is_some() {
             return Err(HostLeaseError::Inherited(
                 "obsolete fd handoff; restart the outer lease runner".into(),
             ));
         }
-        if broker::Config::load()
-            .map_err(HostLeaseError::ChildWait)?
-            .is_some()
-        {
+        if source.load().map_err(HostLeaseError::ChildWait)?.is_some() {
             return Err(HostLeaseError::Inherited(
                 "configured broker lease requires lease-supervisor custody".into(),
             ));
@@ -317,28 +320,36 @@ impl HostLease {
         let path = std::env::var_os("CARRICK_HOST_LEASE_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_LOCK_PATH));
-        Self::acquire_configured(&path, mode, HOST_LEASE_WAIT_LIMIT, Some(scope), wait)
+        Self::acquire_configured(
+            &broker::ConfigSource::entry_point(),
+            &path,
+            mode,
+            HOST_LEASE_WAIT_LIMIT,
+            Some(scope),
+            wait,
+        )
     }
 
     fn acquire_configured(
+        source: &broker::ConfigSource,
         path: &Path,
         mode: HostLeaseMode,
         limit: Duration,
         scope: Option<ScopeIdentity>,
         wait: impl FnMut(Duration) -> io::Result<bool>,
     ) -> Result<Self, HostLeaseError> {
-        let config = broker::Config::load().map_err(HostLeaseError::ChildWait)?;
+        let config = source.load().map_err(HostLeaseError::ChildWait)?;
         let Some(config) = config else {
             return Self::acquire_path_with_wait(path, mode, limit, scope, wait);
         };
-        if !cfg!(target_os = "linux") {
-            return Err(HostLeaseError::Inherited(
-                "remote broker custody is only supported on Linux".into(),
-            ));
-        }
         if std::env::var_os("CARRICK_HOST_LEASE_PATH").is_some() {
             return Err(HostLeaseError::Inherited(
                 "CARRICK_HOST_LEASE_PATH cannot override a configured broker".into(),
+            ));
+        }
+        if !cfg!(target_os = "linux") {
+            return Err(HostLeaseError::Inherited(
+                "remote broker custody is only supported on Linux".into(),
             ));
         }
         let session = broker::Session::connect(&config, mode, limit, wait)?;
@@ -596,6 +607,7 @@ impl HostLease {
     }
 
     fn inherit(
+        source: &broker::ConfigSource,
         path: &Path,
         requested: HostLeaseMode,
         socket: &Path,
@@ -611,8 +623,9 @@ impl HostLease {
                 identity.mode
             )));
         }
-        let configured =
-            broker::Config::load().map_err(|e| HostLeaseError::Inherited(e.to_string()))?;
+        let configured = source
+            .load()
+            .map_err(|e| HostLeaseError::Inherited(e.to_string()))?;
         if identity.broker != configured {
             return Err(HostLeaseError::Inherited(
                 "holder leases a different broker".into(),
@@ -960,10 +973,64 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "isolated environment fixture invoked by configured-broker regression"]
+    fn configured_broker_override_fixture() {
+        let source = broker::ConfigSource::RequiredFile(
+            std::env::var_os("BROKER_OVERRIDE_FIXTURE_CONFIG")
+                .unwrap()
+                .into(),
+        );
+        let path = PathBuf::from(std::env::var_os("CARRICK_HOST_LEASE_PATH").unwrap());
+        let result = HostLease::acquire_configured(
+            &source,
+            &path,
+            HostLeaseMode::Gate,
+            Duration::ZERO,
+            None,
+            |_| panic!("an override must be rejected before broker admission"),
+        );
+        assert!(matches!(
+            result,
+            Err(HostLeaseError::Inherited(message))
+                if message == "CARRICK_HOST_LEASE_PATH cannot override a configured broker"
+        ));
+        assert!(!path.exists(), "refusal must not create a local lock");
+    }
+
+    #[test]
+    fn configured_broker_refuses_local_path_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("broker.toml");
+        std::fs::write(
+            &config,
+            "broker = 'lease@127.0.0.1'\nidentity_file = '/fixture/key'\nknown_hosts_file = '/fixture/known_hosts'\n",
+        ).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "host_lease::tests::configured_broker_override_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("BROKER_OVERRIDE_FIXTURE_CONFIG", config)
+            .env("PATH", "/nonexistent")
+            .env("CARRICK_HOST_LEASE_PATH", temp.path().join("local.lock"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    #[test]
     fn nested_validation_never_owns_or_downgrades_gate() {
         let temp = NamedTempFile::new().unwrap();
         let gate = HostLease::acquire_path(temp.path(), HostLeaseMode::Gate).unwrap();
-        let nested = HostLease::inherit(temp.path(), HostLeaseMode::Carrick, &gate.socket).unwrap();
+        let nested = HostLease::inherit(
+            &broker::ConfigSource::NoBroker,
+            temp.path(),
+            HostLeaseMode::Carrick,
+            &gate.socket,
+        )
+        .unwrap();
         assert_eq!(nested.mode(), HostLeaseMode::Gate);
         assert!(nested._holder.is_none());
         assert!(matches!(
@@ -974,7 +1041,13 @@ mod tests {
         HostLease::acquire_path_with_limit(temp.path(), HostLeaseMode::Gate, Duration::ZERO)
             .unwrap();
         assert!(
-            HostLease::inherit(temp.path(), HostLeaseMode::Carrick, &nested.socket).is_err(),
+            HostLease::inherit(
+                &broker::ConfigSource::NoBroker,
+                temp.path(),
+                HostLeaseMode::Carrick,
+                &nested.socket
+            )
+            .is_err(),
             "stale capability must fail closed"
         );
     }
@@ -984,9 +1057,33 @@ mod tests {
         let temp = NamedTempFile::new().unwrap();
         let other = NamedTempFile::new().unwrap();
         let shared = HostLease::acquire_path(temp.path(), HostLeaseMode::Carrick).unwrap();
-        assert!(HostLease::inherit(temp.path(), HostLeaseMode::Gate, &shared.socket).is_err());
-        assert!(HostLease::inherit(other.path(), HostLeaseMode::Carrick, &shared.socket).is_err());
-        assert!(HostLease::inherit(temp.path(), HostLeaseMode::Carrick, other.path()).is_err());
+        assert!(
+            HostLease::inherit(
+                &broker::ConfigSource::NoBroker,
+                temp.path(),
+                HostLeaseMode::Gate,
+                &shared.socket
+            )
+            .is_err()
+        );
+        assert!(
+            HostLease::inherit(
+                &broker::ConfigSource::NoBroker,
+                other.path(),
+                HostLeaseMode::Carrick,
+                &shared.socket
+            )
+            .is_err()
+        );
+        assert!(
+            HostLease::inherit(
+                &broker::ConfigSource::NoBroker,
+                temp.path(),
+                HostLeaseMode::Carrick,
+                other.path()
+            )
+            .is_err()
+        );
     }
 
     #[test]
