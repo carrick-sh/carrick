@@ -362,6 +362,8 @@ _FINGERPRINT_META_SEP = "\n/*__CONTRACT_FINGERPRINT_META__*/\n"
 
 GATED_TEST_LANES = {"host", "kvm", "integration", "signed-cli", "signed-hvf"}
 KNOWN_TEST_LANES = GATED_TEST_LANES | {"manual"}
+BINDING_CLAUSE_PREFIXES = ("carrick-",)
+NON_RUST_BINDING_PREFIXES = ("probe:", "ltp:", "go:", "cpython:", "node:")
 
 _RUST_KEYWORDS = set(
     "as async await break const continue crate dyn else enum extern false fn for gen if impl in "
@@ -370,7 +372,7 @@ _RUST_KEYWORDS = set(
 )
 _GENERIC_ITEM_NAMES = set(
     "new default from into try_from try_into drop fmt clone eq ne cmp partial_cmp hash deref "
-    "deref_mut index index_mut next poll run main test tests".split()
+    "deref_mut index index_mut next poll run main test tests add".split()
 )
 
 _VIS_MOD_PREFIX = r"(?:\bpub(?:\s*\([^)]*\))?\s+)?"
@@ -789,7 +791,7 @@ def _is_cfg_expr_decidable(expr: str) -> bool:
         if op == "not" and len(args) != 1:
             return False
         return all(_is_cfg_expr_decidable(a) for a in args)
-    if expr in ("test", "unix", "windows", "debug_assertions"):
+    if expr in ("test", "doctest", "unix", "windows", "debug_assertions"):
         return True
     kv = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([^"]*)"$', expr)
     if kv:
@@ -1083,7 +1085,7 @@ def _split_top_level_semicolons(raw: str) -> list[str]:
             depth += 1
         elif ch in ")}":
             depth = max(0, depth - 1)
-        if ch == ";" and depth == 0:
+        if ch in ";," and depth == 0:
             parts.append("".join(cur).strip())
             cur = []
         else:
@@ -1095,13 +1097,16 @@ def _split_top_level_semicolons(raw: str) -> list[str]:
 
 def _expand_single_binding_clause(clause: str) -> list[str]:
     clause = clause.strip()
-    if not clause or clause.startswith(("probe:", "ltp:", "go:", "cpython:", "node:")):
+    if not clause or clause.startswith(NON_RUST_BINDING_PREFIXES):
         return []
 
-    idx = clause.find("carrick-")
+    idxs = [clause.find(p) for p in BINDING_CLAUSE_PREFIXES if clause.find(p) >= 0]
+    if not idxs:
+        return []
+    idx = min(idxs)
     if idx > 0:
         clause = clause[idx:].strip()
-    if not clause.startswith("carrick-") or "::" not in clause:
+    if not clause.startswith(BINDING_CLAUSE_PREFIXES) or "::" not in clause:
         return []
 
     # Check trailing `(...)`: either a list of Rust test identifiers or a prose annotation
@@ -1130,7 +1135,7 @@ def _expand_single_binding_clause(clause: str) -> list[str]:
             expanded.extend(_expand_single_binding_clause(f"{prefix}{item}{suffix}"))
         return expanded
 
-    # Strip trailing prose after `(something)` if followed by `, plus ...`
+    # Strip trailing prose after `(something)` if followed by `including ...`
     if "(" in clause:
         prefix, annotation = clause.split("(", 1)
         expanded = _expand_single_binding_clause(prefix.strip().rstrip(":"))
@@ -1142,7 +1147,8 @@ def _expand_single_binding_clause(clause: str) -> list[str]:
         return expanded
 
     cleaned = re.sub(r"\s+", "", clause)
-    if re.match(r"^carrick-[A-Za-z0-9_-]+(?:::[A-Za-z0-9_]+)+$", cleaned):
+    prefix_alt = "|".join(re.escape(p) for p in BINDING_CLAUSE_PREFIXES)
+    if re.match(rf"^(?:{prefix_alt})[A-Za-z0-9_-]+(?:::[A-Za-z0-9_]+)+$", cleaned):
         return [cleaned]
     return []
 
@@ -1160,9 +1166,17 @@ def expand_binding_spec(raw: str) -> list[str]:
             and "tests" in last_module.split("::")
             and "conformance-metrics" not in clause
         ):
-            control = re.match(r"^([a-z][a-z0-9_]*_[a-z0-9_]+)\b", clause)
-            if control:
-                out.append(f"{last_module}::{control.group(1)}")
+            inc_controls = [
+                c for c in re.findall(r"\bincluding\s+([A-Za-z_][A-Za-z0-9_]*)\b", clause)
+                if "_" in c
+            ]
+            if inc_controls:
+                for c in inc_controls:
+                    out.append(f"{last_module}::{c}")
+            else:
+                control = re.match(r"^([a-z][a-z0-9_]*_[a-z0-9_]+)\b", clause)
+                if control:
+                    out.append(f"{last_module}::{control.group(1)}")
     return out
 
 
@@ -1635,6 +1649,8 @@ def _eval_cfg_expr(
             )
     if expr == "test":
         return test_flag
+    if expr == "doctest":
+        return False
     if expr == "unix":
         return target_os in ("macos", "linux", "freebsd", "netbsd")
     if expr == "windows":
@@ -3083,22 +3099,97 @@ def _tokenize_code_line(code_line: str) -> tuple[str, ...]:
     return tuple(re.findall(r"[A-Za-z0-9_]+|[^\sA-Za-z0-9_]", code_line))
 
 
+def _compute_enclosing_fn_spans(stripped_src: str) -> list[tuple[int, int, str]]:
+    """Return `(start_line, end_line, fn_ident)` (1-indexed inclusive) for each function body
+    in `stripped_src` outside `macro_rules!`, excluding generic item names (`new`, `add`, etc.).
+    """
+    if not stripped_src:
+        return []
+    stripped_src = _blank_macro_defs(stripped_src, stripped_src)[0]
+    line_starts = [0]
+    for idx, ch in enumerate(stripped_src):
+        if ch == "\n":
+            line_starts.append(idx + 1)
+
+    def offset_to_line(offset: int) -> int:
+        lo, hi = 0, len(line_starts) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if line_starts[mid] <= offset:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return hi + 1
+
+    spans: list[tuple[int, int, str]] = []
+    n = len(stripped_src)
+    for m in _FN_DECL_RE.finditer(stripped_src):
+        ident = m.group(1)
+        if not ident or ident in _RUST_KEYWORDS or ident in _GENERIC_ITEM_NAMES or ident.startswith("_"):
+            continue
+        # Advance past parameter list `( ... )` and return type / where clause to the function body `{`.
+        pos = m.end()
+        brace_open = -1
+        paren_depth = 0
+        angle_depth = 0
+        while pos < n:
+            ch = stripped_src[pos]
+            if ch == "(":
+                paren_depth += 1
+            elif ch == ")":
+                if paren_depth > 0:
+                    paren_depth -= 1
+            elif ch == "<" and paren_depth == 0:
+                angle_depth += 1
+            elif ch == ">" and paren_depth == 0 and angle_depth > 0:
+                angle_depth -= 1
+            elif ch == ";" and paren_depth == 0 and angle_depth == 0:
+                break
+            elif ch == "{" and paren_depth == 0 and angle_depth == 0:
+                brace_open = pos
+                break
+            pos += 1
+        if brace_open == -1:
+            continue
+        brace_close = _find_matching_brace(stripped_src, brace_open)
+        if brace_close == -1:
+            continue
+        spans.append((offset_to_line(m.start()), offset_to_line(brace_close), ident))
+    return spans
+
+
+def _innermost_fn_at_line(spans: list[tuple[int, int, str]], line_no: int) -> str | None:
+    best: tuple[int, str] | None = None
+    for start_line, end_line, ident in spans:
+        if start_line <= line_no <= end_line:
+            length = end_line - start_line
+            if best is None or length <= best[0]:
+                best = (length, ident)
+    return best[1] if best is not None else None
+
+
 def extract_changed_surface_items(
     root: Path, base_view: RepoView, head_view: RepoView, base_sha: str, head_sha: str,
     surface_path: str, old_surface_path: str | None = None,
 ) -> set[str]:
     """Extract item identifiers defined or modified by actual CODE token changes in `surface_path`'s diff."""
     base_path = old_surface_path or surface_path
+    base_stripped_src = ""
     base_stripped_lines: list[str] = []
     if base_view.is_file(base_path):
-        base_stripped_lines = strip_cfg_test_blocks(
+        base_stripped_src = strip_cfg_test_blocks(
             base_view.read_stripped_rust(base_path), base_view.read_comments_stripped_rust(base_path),
-        ).splitlines()
+        )
+        base_stripped_lines = base_stripped_src.splitlines()
+    head_stripped_src = ""
     head_stripped_lines: list[str] = []
     if head_view.is_file(surface_path):
-        head_stripped_lines = strip_cfg_test_blocks(
+        head_stripped_src = strip_cfg_test_blocks(
             head_view.read_stripped_rust(surface_path), head_view.read_comments_stripped_rust(surface_path),
-        ).splitlines()
+        )
+        head_stripped_lines = head_stripped_src.splitlines()
+    base_fn_spans = _compute_enclosing_fn_spans(base_stripped_src)
+    head_fn_spans = _compute_enclosing_fn_spans(head_stripped_src)
 
     if old_surface_path and old_surface_path != surface_path and base_view.is_file(old_surface_path):
         diff_cmd = [
@@ -3118,8 +3209,8 @@ def extract_changed_surface_items(
     old_line_no = 0
     new_line_no = 0
     in_hunk = False
-    hunk_old_lines: list[str] = []
-    hunk_new_lines: list[str] = []
+    hunk_old_lines: list[tuple[int, str]] = []
+    hunk_new_lines: list[tuple[int, str]] = []
 
     def flush_hunk():
         nonlocal hunk_old_lines, hunk_new_lines
@@ -3127,43 +3218,53 @@ def extract_changed_surface_items(
             return
         old_toks_flat: list[str] = []
         new_toks_flat: list[str] = []
-        old_by_norm: list[tuple[tuple[str, ...], str]] = []
-        new_by_norm: list[tuple[tuple[str, ...], str]] = []
-        for oline in hunk_old_lines:
+        old_by_norm: list[tuple[tuple[str, ...], int, str]] = []
+        new_by_norm: list[tuple[tuple[str, ...], int, str]] = []
+        for lno, oline in hunk_old_lines:
             toks = _tokenize_code_line(oline)
             old_toks_flat.extend(toks)
-            old_by_norm.append((toks, oline))
-        for nline in hunk_new_lines:
+            old_by_norm.append((toks, lno, oline))
+        for lno, nline in hunk_new_lines:
             toks = _tokenize_code_line(nline)
             new_toks_flat.extend(toks)
-            new_by_norm.append((toks, nline))
+            new_by_norm.append((toks, lno, nline))
 
         hunk_old_lines = []
         hunk_new_lines = []
         if old_toks_flat == new_toks_flat:
             return
 
-        old_counts = Counter(toks for toks, _ in old_by_norm if toks)
-        new_counts = Counter(toks for toks, _ in new_by_norm if toks)
+        old_counts = Counter(toks for toks, _, _ in old_by_norm if toks)
+        new_counts = Counter(toks for toks, _, _ in new_by_norm if toks)
         common = old_counts & new_counts
 
         rem_skip = Counter(common)
-        for toks, oline in old_by_norm:
+        for toks, lno, oline in old_by_norm:
             if not toks:
                 continue
             if rem_skip[toks] > 0:
                 rem_skip[toks] -= 1
                 continue
-            items.update(_extract_code_decl_identifiers(oline))
+            decls = _extract_code_decl_identifiers(oline)
+            items.update(decls)
+            if not decls:
+                fn_name = _innermost_fn_at_line(base_fn_spans, lno)
+                if fn_name:
+                    items.add(f"fn:{fn_name}")
 
         add_skip = Counter(common)
-        for toks, nline in new_by_norm:
+        for toks, lno, nline in new_by_norm:
             if not toks:
                 continue
             if add_skip[toks] > 0:
                 add_skip[toks] -= 1
                 continue
-            items.update(_extract_code_decl_identifiers(nline))
+            decls = _extract_code_decl_identifiers(nline)
+            items.update(decls)
+            if not decls:
+                fn_name = _innermost_fn_at_line(head_fn_spans, lno)
+                if fn_name:
+                    items.add(f"fn:{fn_name}")
 
     for raw_line in res.stdout.splitlines():
         if raw_line.startswith("@@ "):
@@ -3178,15 +3279,15 @@ def extract_changed_surface_items(
             continue
         if raw_line.startswith("-"):
             if 1 <= old_line_no <= len(base_stripped_lines):
-                hunk_old_lines.append(base_stripped_lines[old_line_no - 1])
+                hunk_old_lines.append((old_line_no, base_stripped_lines[old_line_no - 1]))
             else:
-                hunk_old_lines.append(strip_rust_comments_and_strings(raw_line[1:]))
+                hunk_old_lines.append((old_line_no, strip_rust_comments_and_strings(raw_line[1:])))
             old_line_no += 1
         elif raw_line.startswith("+"):
             if 1 <= new_line_no <= len(head_stripped_lines):
-                hunk_new_lines.append(head_stripped_lines[new_line_no - 1])
+                hunk_new_lines.append((new_line_no, head_stripped_lines[new_line_no - 1]))
             else:
-                hunk_new_lines.append(strip_rust_comments_and_strings(raw_line[1:]))
+                hunk_new_lines.append((new_line_no, strip_rust_comments_and_strings(raw_line[1:])))
             new_line_no += 1
 
     flush_hunk()
@@ -3397,7 +3498,12 @@ def bound_test_references_surface(
         )
     cleaned_texts = [_strip_non_semantic_ident_occurrences(txt, file_macros) for txt in ref_texts]
     for ident in items:
-        pat = re.compile(rf"\b{re.escape(ident)}\b")
+        if ident.startswith("fn:"):
+            fn_ident = ident[3:]
+            # Call-shaped match (`name(` or `.name(`) required for innermost enclosing fn on body-only edits.
+            pat = re.compile(rf"\b{re.escape(fn_ident)}\s*\(")
+        else:
+            pat = re.compile(rf"\b{re.escape(ident)}\b")
         if any(pat.search(txt) for txt in cleaned_texts):
             return True
     return False

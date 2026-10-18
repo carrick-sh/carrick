@@ -9,7 +9,7 @@ structural_budgets = []
 rationale = "The EL1 IPC namespace and kernel dispatcher consume one shared permission decision over typed IpcMode bitflags and domain-specific UID/GID types. A task's effective credentials and supplementary groups (including launch-time /etc/group fallback) decide its class exactly once, and CAP_IPC_OWNER (not raw euid 0) grants the privilege bypass."
 
 [bindings]
-vm_free = "carrick-core::ipc_permissions::tests::owner_group_and_other_are_exclusive_classes, carrick-personality-linux::ipc::namespace::tests::ipc_perm_accepts_creator_and_supplementary_group_but_not_other, carrick-kernel::dispatch::sysv::ipc_set_tests::{shm_permission_uses_creator_group_and_supplementary_membership,shm_permission_falls_back_to_etc_group_membership_when_override_absent,shm_permission_honors_cap_ipc_owner_rather_than_raw_euid_root}"
+vm_free = "carrick-core::ipc_permissions::tests::owner_group_and_other_are_exclusive_classes, carrick-personality-linux::ipc::namespace::tests::ipc_perm_accepts_creator_and_supplementary_group_but_not_other, carrick-kernel::dispatch::sysv::ipc_set_tests::{shm_permission_uses_creator_group_and_supplementary_membership,shm_permission_falls_back_to_etc_group_membership_when_override_absent,shm_permission_honors_cap_ipc_owner_rather_than_raw_euid_root}, carrick-kernel::dispatch::fs::tests::fs_view_current_groups_falls_back_to_etc_group_membership_when_override_absent"
 
 [bindings.unresolved]
 embed_structural = "Signed two-task IPC binding belongs to the director gate."

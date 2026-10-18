@@ -13753,3 +13753,45 @@ fn owner_copyin_writev_bounded_gather_resume_fault_writes_readable_prefix() {
     assert_eq!(n, 6);
     assert_eq!(&read_buf, b"prefix");
 }
+
+#[test]
+fn fs_view_current_groups_falls_back_to_etc_group_membership_when_override_absent() {
+    let dispatcher = SyscallDispatcher::new();
+    dispatcher
+        .fs
+        .rootfs_vfs
+        .overlay
+        .set_file_contents(
+            "/etc/passwd",
+            b"app:x:1003:2003::/home/app:/bin/sh\n".to_vec(),
+        )
+        .expect("write /etc/passwd");
+    dispatcher
+        .fs
+        .rootfs_vfs
+        .overlay
+        .set_file_contents("/etc/group", b"fsgrp:x:2002:app\n".to_vec())
+        .expect("write /etc/group");
+
+    let root = dispatcher.capture_one_task_context().unwrap();
+    let member = root
+        .kernel()
+        .update_credentials(&root, |creds| {
+            creds.seed_identity(carrick_abi::NsUid::new(1003), carrick_abi::NsGid::new(2003));
+        })
+        .unwrap();
+    assert!(
+        member
+            .resources()
+            .credentials()
+            .supplementary_groups_override()
+            .is_none(),
+        "launch-time identity leaves supplementary_groups_override unset"
+    );
+
+    let groups = dispatcher.fs_view().current_groups();
+    assert_eq!(
+        groups,
+        vec![carrick_abi::NsGid::new(2003), carrick_abi::NsGid::new(2002),]
+    );
+}

@@ -2949,6 +2949,108 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
         self.assertEqual(result.returncode, 1, msg=result.stdout + result.stderr)
         self.assertIn("does not reference changed surface", result.stderr)
 
+    def test_n1_body_only_edit_uses_only_innermost_fn_call_shape_and_rejects_workscope_add_and_impl_iterator(self):
+        """N1: body-only edits use only the innermost enclosing non-generic fn name with a call-shaped match; WorkScope/.add and impl Iterator must not satisfy relevance."""
+        self.use_single_contract_surface()
+        self.guest_file.write_text(
+            "pub struct WorkScope;\n"
+            "impl WorkScope {\n"
+            "    pub fn add(&mut self, n: u64) -> u64 {\n"
+            "        n + 1\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        self._write_futex_contract('docker = "probe:futex"\n')
+        base_a = self._commit_all("seed WorkScope::add surface")
+        self.guest_file.write_text(
+            "pub struct WorkScope;\n"
+            "impl WorkScope {\n"
+            "    pub fn add(&mut self, n: u64) -> u64 {\n"
+            "        n + 2\n"
+            "    }\n"
+            "}\n"
+            "#[cfg(test)]\nmod tests {\n"
+            "    #[test]\n"
+            "    fn unrelated_alloc_test() { let _ = super::WorkScope; let mut x = 0u64; x = x.wrapping_add(1); let _ = x; }\n"
+            "    #[test]\n"
+            "    fn calls_dot_add() { let mut w = super::WorkScope; let _ = w.add(1); }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        self._write_futex_contract('vm_free = "carrick-kernel::dispatch::futex::tests::calls_dot_add"\n')
+        self._commit_all("edit WorkScope::add body and bind test calling .add(1)")
+        res_a = self.run_check(base_sha=base_a)
+        self.assertEqual(res_a.returncode, 1, msg=f"WorkScope/.add stdout: {res_a.stdout}\nstderr: {res_a.stderr}")
+        self.assertIn("does not reference changed surface", res_a.stderr)
+
+        # (b) impl Iterator argument shape in enclosing fn signature must not make Iterator relevant, and non-call mention of walk must fail
+        self.guest_file.write_text(
+            "pub fn walk(xs: impl Iterator<Item = u32>) -> u32 {\n"
+            "    xs.sum()\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        self._write_futex_contract('docker = "probe:futex"\n')
+        base_b = self._commit_all("seed fn walk(xs: impl Iterator)")
+        self.guest_file.write_text(
+            "pub fn walk(xs: impl Iterator<Item = u32>) -> u32 {\n"
+            "    xs.count() as u32\n"
+            "}\n"
+            "#[cfg(test)]\nmod tests {\n"
+            "    fn helper<I: Iterator<Item = u32>>(it: I) -> usize { it.count() }\n"
+            "    #[test]\n"
+            "    fn mentions_iterator_and_non_call_walk() {\n"
+            "        let _ = helper(core::iter::empty());\n"
+            "        let _fn_item = super::walk;\n"
+            "    }\n"
+            "    #[test]\n"
+            "    fn calls_walk() {\n"
+            "        assert_eq!(super::walk(core::iter::empty()), 0);\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        self._write_futex_contract('vm_free = "carrick-kernel::dispatch::futex::tests::mentions_iterator_and_non_call_walk"\n')
+        self._commit_all("edit walk body and bind test mentioning Iterator and non-call walk")
+        res_b = self.run_check(base_sha=base_b)
+        self.assertEqual(res_b.returncode, 1, msg=f"impl Iterator stdout: {res_b.stdout}\nstderr: {res_b.stderr}")
+        self.assertIn("does not reference changed surface", res_b.stderr)
+
+        self._write_futex_contract('vm_free = "carrick-kernel::dispatch::futex::tests::calls_walk"\n')
+        self._commit_all("bind test calling walk(...)")
+        res_c = self.run_check(base_sha=base_b)
+        self.assertEqual(res_c.returncode, 0, msg=f"call walk stdout: {res_c.stdout}\nstderr: {res_c.stderr}")
+
+    def test_n5_comma_separated_bindings_and_cfg_not_doctest_and_data_driven_prefixes(self):
+        """N5: comma-separated bindings, cfg(not(doctest)), and data-driven prefix constants."""
+        spec = importlib.util.spec_from_file_location("check_contract_change", SCRIPT_PATH)
+        checker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(checker)
+        self.assertTrue(isinstance(getattr(checker, "BINDING_CLAUSE_PREFIXES", None), tuple))
+        self.assertTrue(isinstance(getattr(checker, "NON_RUST_BINDING_PREFIXES", None), tuple))
+
+        self.use_single_contract_surface()
+        self._write_futex_contract('docker = "probe:futex"\n')
+        base_sha = self._commit_all("seed base for n5", allow_empty=True)
+        self.guest_file.write_text(
+            "pub fn futex_n5_item() -> i32 { 3 }\n"
+            "#[cfg(all(test, not(doctest)))]\n"
+            "mod tests {\n"
+            "    #[test]\n"
+            "    fn first_test() { assert_eq!(super::futex_n5_item(), 3); }\n"
+            "    #[test]\n"
+            "    fn second_test() { assert_eq!(super::futex_n5_item(), 3); }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        self._write_futex_contract(
+            'vm_free = "carrick-kernel::dispatch::futex::tests::first_test, carrick-kernel::dispatch::futex::tests::second_test"\n'
+        )
+        self._commit_all("add comma-separated bindings in cfg(all(test, not(doctest))) module")
+        res = self.run_check(base_sha=base_sha)
+        self.assertEqual(res.returncode, 0, msg=f"stdout: {res.stdout}\nstderr: {res.stderr}")
+
 
 if __name__ == "__main__":
     unittest.main()

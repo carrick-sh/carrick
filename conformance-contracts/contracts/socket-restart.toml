@@ -9,7 +9,7 @@ structural_budgets = []
 rationale = "The syscall continuation and number-only fallback share one RestartClass policy in carrick-signal-core::wait, and sendmmsg returns partial progress once sent > 0 instead of re-entering WaitOnFds from entry 0."
 
 [bindings]
-vm_free = "carrick-signal-core::wait::tests::socket_calls_restart_only_when_proven_untimed, carrick-kernel::kernel::continuation::tests::{socket_waits_restart_with_sa_restart_except_timed_calls,socket_timeout_forces_eintr_even_with_restart_action}, carrick-kernel::dispatch::net::send_recv::inet_in_memory_socket_tests::{sendmmsg_returns_partial_count_when_later_entry_blocks,recvmmsg_with_timeout_pointer_fails_eintr_under_sa_restart}"
+vm_free = "carrick-signal-core::wait::tests::socket_calls_restart_only_when_proven_untimed, carrick-kernel::kernel::continuation::tests::{socket_waits_restart_with_sa_restart_except_timed_calls,socket_timeout_forces_eintr_even_with_restart_action}, carrick-kernel::dispatch::net::send_recv::inet_in_memory_socket_tests::{sendmmsg_returns_partial_count_when_later_entry_blocks,recvmmsg_with_timeout_pointer_fails_eintr_under_sa_restart}, carrick-kernel::dispatch::net::lifecycle::connect_tests::timed_connect_and_accept_propagate_socket_timeouts_and_einprogress"
 
 [bindings.unresolved]
 embed_structural = "Signed HVF binding belongs to the director gate."
