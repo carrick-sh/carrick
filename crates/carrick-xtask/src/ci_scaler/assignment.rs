@@ -332,7 +332,9 @@ pub(super) fn prioritize_demand(mut demand: Vec<super::github::QueuedJob>) -> Ve
 }
 
 pub(super) fn run_superseded(entries: &[SupersededPush], key: JobKey) -> bool {
-    entries.iter().any(|entry| entry.key.run == key.run)
+    entries
+        .iter()
+        .any(|entry| entry.key.run == key.run && entry.key.attempt == key.attempt)
 }
 pub(super) fn merge_superseded(target: &mut Vec<SupersededPush>, source: &[SupersededPush]) {
     for other in source {
@@ -1098,7 +1100,7 @@ mod tests {
         }
     }
     #[test]
-    fn ci_scaler_superseded_runs_are_never_reserved_in_either_ledger() {
+    fn ci_scaler_supersession_refuses_only_its_attempt_in_both_ledgers() {
         let dir = tempfile::tempdir().unwrap();
         let older = context(10, "push", "refs/heads/main", &"a".repeat(40));
         let newer = context(30, "push", "refs/heads/main", &"c".repeat(40));
@@ -1127,7 +1129,7 @@ mod tests {
                     100,
                     Concurrency::ONE
                 )
-                .is_err()
+                .is_ok()
         );
         let mut mac = super::super::mac::MacLedger::default();
         let path = dir.path().join("mac.json");
@@ -1143,7 +1145,21 @@ mod tests {
                 .reserve(key(&older, 11), 100)
                 .is_err()
         );
+        assert!(
+            super::super::mac::MacLedger::load(&path)
+                .unwrap()
+                .reserve(
+                    JobKey {
+                        attempt: 2,
+                        job: JobId(12),
+                        ..key(&older, 11)
+                    },
+                    100
+                )
+                .is_ok()
+        );
     }
+
     #[test]
     fn ci_scaler_superseded_assignment_is_refused_even_from_a_stale_worker_snapshot() {
         let dir = tempfile::tempdir().unwrap();
@@ -1240,5 +1256,60 @@ mod tests {
         .unwrap();
         assert!(Ledger::load(&path).unwrap().superseded.is_empty());
         assert_eq!(guest.inner.approved.len(), 1);
+    }
+    #[test]
+    fn ci_scaler_owner_rerun_of_superseded_attempt_can_receive_hook_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, mut row, path) = minted_for_a(dir.path());
+        let old = context(20, "push", "refs/heads/main", &"b".repeat(40));
+        let newer = context(30, "push", "refs/heads/main", &"c".repeat(40));
+        coalesce_demand(
+            &mut ledger,
+            vec![push_demand(&old, 21), push_demand(&newer, 31)],
+            &path,
+            |_| Ok(CancellationOutcome::Deferred),
+        )
+        .unwrap();
+        let mut rerun = old;
+        rerun.run_attempt = 2;
+        struct RerunApi(JobContext);
+        impl AssignmentApi for RerunApi {
+            fn run_jobs(&self, run: RunId, attempt: u32) -> Result<Vec<Value>, ScalerError> {
+                assert_eq!((run, attempt), (RunId(20), 2));
+                Ok(vec![json!({"id":25,"runner_id":RUNNER.0,"labels":LABELS})])
+            }
+            fn revet(&self, actual: JobKey) -> Result<JobPolicy, ScalerError> {
+                assert_eq!(
+                    actual,
+                    JobKey {
+                        run: RunId(20),
+                        attempt: 2,
+                        job: JobId(25)
+                    }
+                );
+                Ok(bound(&self.0))
+            }
+        }
+        let mut guest = guest_asking(rerun.clone());
+        let result = serve_assignment(
+            &RerunApi(rerun),
+            &mut guest,
+            &LABELS,
+            row.runner,
+            &mut ledger,
+            &path,
+            |ledger, key| {
+                row.assigned = Some(key.job);
+                row.assigned_key = Some(key);
+                ledger.rows[0] = row.clone();
+                ledger.save(&path)
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(result, Revetted::Approved(JobKey { attempt: 2, .. }, _)),
+            "{result:?}"
+        );
+        assert_eq!(guest.approved.len(), 1);
     }
 }
