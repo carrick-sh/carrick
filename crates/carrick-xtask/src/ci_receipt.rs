@@ -1,15 +1,16 @@
 //! Per-SHA trusted-runner baselines over the one `AcceptReceipt` format.
 //!
 //! `kernel-runtime.yml` uploads each signed-HVF and KVM receipt as the
-//! artifact `receipt-<lane>-<sha>-<attempt>`. Each main push compares its
-//! receipt with its first parent main commit and fails on any NEW failure.
-//! A missing parent baseline is a distinct failure, never a regression.
+//! artifact `receipt-<lane>-<sha>-<attempt>`. Trusted pre-push code selects
+//! the nearest receipted first-parent ancestor from event.before. The selected
+//! baseline's own xtask grades candidate receipt data and fails on NEW.
+//! Missing baselines and history/walk errors remain distinct from regressions.
 
 use crate::accept::AcceptReceipt;
 use crate::ci_scaler::{KERNEL_RUNTIME_WORKFLOW, REPOSITORY};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -60,6 +61,10 @@ pub enum ReceiptError {
     Baseline(String),
     #[error("no baseline: {0}")]
     NoBaseline(String),
+    #[error("invalid push history: {0}")]
+    InvalidPushHistory(String),
+    #[error("baseline walk limit: {0}")]
+    BaselineWalkLimit(String),
     #[error("{0}")]
     Retired(String),
     #[error("{count} NEW failure(s) against base {base}")]
@@ -67,7 +72,8 @@ pub enum ReceiptError {
 }
 
 /// The trusted-runner lanes that publish a per-SHA receipt.
-#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Lane {
     Hvf,
     Kvm,
@@ -1004,6 +1010,155 @@ fn query_baseline(lane: Lane, sha: &str) -> Result<Baseline, ReceiptError> {
     Ok(baseline_decision(&pairs, lane, sha))
 }
 
+/// The exact receipted ancestor and observed gaps covered by its comparison.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BaselineSelection {
+    pub lane: Lane,
+    pub baseline_sha: String,
+    pub before_sha: String,
+    pub pushed_sha: String,
+    /// Oldest first; excludes both the baseline and the candidate receipt.
+    pub covered_as_range: Vec<String>,
+}
+impl BaselineSelection {
+    pub fn notice(&self) -> String {
+        format!(
+            "{} baseline {}; covered as a range, not individually: {}",
+            self.lane.name(),
+            self.baseline_sha,
+            if self.covered_as_range.is_empty() {
+                "none".into()
+            } else {
+                self.covered_as_range.join(", ")
+            }
+        )
+    }
+    pub fn markdown(&self) -> String {
+        format!(
+            "## {} receipt comparison\n\nSelected baseline SHA: `{}`\n\nLanded commits without their own receipt — **covered as a range, not individually**:\n\n{}\n",
+            self.lane.name().to_uppercase(),
+            self.baseline_sha,
+            if self.covered_as_range.is_empty() {
+                "None.".into()
+            } else {
+                self.covered_as_range
+                    .iter()
+                    .map(|sha| format!("- `{sha}`"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        )
+    }
+}
+
+/// Resolve from the push event's old tip, never from HEAD^1. Receipt lookup
+/// uses the existing trusted run predicate; absence/pending means no receipt
+/// at this observation. The search inspects at most 50 first-parent commits.
+pub fn select_baseline(
+    root: &Path,
+    lane: Lane,
+    before: &str,
+    pushed: &str,
+    mut lookup: impl FnMut(Lane, &str) -> Result<Baseline, ReceiptError>,
+) -> Result<BaselineSelection, ReceiptError> {
+    for sha in [before, pushed] {
+        validate_sha(sha).map_err(|e| ReceiptError::InvalidPushHistory(e.to_string()))?;
+    }
+    if before.bytes().all(|b| b == b'0') || before == pushed {
+        return Err(ReceiptError::InvalidPushHistory("before must be a nonzero proper first-parent ancestor of the pushed SHA; force pushes are refused".into()));
+    }
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(["rev-list", "--first-parent", pushed])
+        .output()
+        .map_err(|source| ReceiptError::Io {
+            path: root.to_path_buf(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(ReceiptError::InvalidPushHistory(
+            "cannot read the pushed commit's first-parent history".into(),
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let history: Vec<&str> = text.lines().collect();
+    let before_index = history.iter().position(|sha| *sha == before).filter(|n| *n > 0)
+        .ok_or_else(|| ReceiptError::InvalidPushHistory(format!("before {before} is not a first-parent ancestor of {pushed}; force pushes are refused")))?;
+    let mut observed = BTreeMap::new();
+    let mut has_receipt = |sha: &str| -> Result<bool, ReceiptError> {
+        if let Some(found) = observed.get(sha) {
+            return Ok(*found);
+        }
+        let found = matches!(lookup(lane, sha)?, Baseline::Found(_, _));
+        observed.insert(sha.to_owned(), found);
+        Ok(found)
+    };
+    let candidates = &history[before_index..];
+    let mut chosen = None;
+    for (offset, sha) in candidates.iter().take(50).enumerate() {
+        if has_receipt(sha)? {
+            chosen = Some(before_index + offset);
+            break;
+        }
+    }
+    let index = match chosen {
+        Some(index) => index,
+        None if candidates.len() > 50 => {
+            return Err(ReceiptError::BaselineWalkLimit(format!(
+                "no trusted {} receipt in the first 50 commits from {before}; refusing to search farther",
+                lane.name()
+            )));
+        }
+        None => {
+            return Err(ReceiptError::NoBaseline(format!(
+                "no trusted {} receipt from {before} to the first-parent root. No regression comparison was made. Seed the current main tip with an owner dispatch for subsequent pushes",
+                lane.name()
+            )));
+        }
+    };
+    let mut covered_as_range = Vec::new();
+    for sha in history[1..index].iter().rev() {
+        if !has_receipt(sha)? {
+            covered_as_range.push((*sha).to_owned());
+        }
+    }
+    Ok(BaselineSelection {
+        lane,
+        baseline_sha: history[index].to_owned(),
+        before_sha: before.to_owned(),
+        pushed_sha: pushed.to_owned(),
+        covered_as_range,
+    })
+}
+
+fn append_github_file(variable: &str, body: &str) -> Result<(), ReceiptError> {
+    use std::io::Write;
+    if let Some(path) = std::env::var_os(variable) {
+        let path = PathBuf::from(path);
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|source| ReceiptError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        writeln!(file, "{body}").map_err(|source| ReceiptError::Io { path, source })?;
+    }
+    Ok(())
+}
+
+fn report_selection_error(error: &ReceiptError) -> Result<(), ReceiptError> {
+    let title = match error {
+        ReceiptError::NoBaseline(_) => "No baseline",
+        ReceiptError::InvalidPushHistory(_) => "Invalid push history",
+        ReceiptError::BaselineWalkLimit(_) => "Baseline walk limit",
+        _ => "Baseline selection error",
+    };
+    println!("::error title={title}::{error}");
+    append_github_file("GITHUB_STEP_SUMMARY", &format!("## {title}\n\n{error}\n"))
+}
+
 fn download_baseline(
     lane: Lane,
     sha: &str,
@@ -1016,7 +1171,7 @@ fn download_baseline(
         match query_baseline(lane, sha)? {
             Baseline::Found(run, name) => break (run, name),
             Baseline::Pending if Instant::now() + poll <= deadline => {
-                println!("parent {sha} run in progress; waiting for its receipt");
+                println!("selected baseline {sha} run in progress; waiting for its receipt");
                 std::thread::sleep(poll);
             }
             decision => {
@@ -1026,7 +1181,7 @@ fn download_baseline(
                     "has no trusted receipt".into()
                 };
                 return Err(ReceiptError::NoBaseline(format!(
-                    "parent main commit {sha} {reason} for {}. No regression comparison was made. \
+                    "selected baseline commit {sha} {reason} for {}. No regression comparison was made. \
                      Seed the current main tip with an owner dispatch: \
                      `gh workflow run kernel-runtime.yml --repo {REPOSITORY} --ref main`; \
                      subsequent pushes compare against that receipt.",
@@ -1188,8 +1343,20 @@ pub enum ReceiptAction {
         #[arg(long)]
         fail_on_new: bool,
     },
-    /// Fetch the parent main commit BASE-SHA receipt, compare CANDIDATE and
-    /// fail on NEW. A missing parent receipt fails with a No baseline summary.
+    /// Select the nearest receipted first-parent ancestor from push event.before.
+    /// Emits a notice and job summary; writes sha/reuse to GITHUB_OUTPUT.
+    SelectBaseline {
+        #[arg(long, value_enum)]
+        lane: Lane,
+        #[arg(long)]
+        before_sha: String,
+        #[arg(long)]
+        candidate_sha: String,
+        #[arg(long, default_value = ".")]
+        history_dir: PathBuf,
+    },
+    /// Fetch the selected BASE-SHA receipt, compare CANDIDATE and fail on NEW.
+    /// The workflow runs this command from that baseline's clean checkout.
     Gate {
         #[arg(long, value_enum)]
         lane: Lane,
@@ -1269,6 +1436,39 @@ pub fn run(args: ReceiptArgs) -> Result<(), ReceiptError> {
                 });
             }
             Ok(())
+        }
+        ReceiptAction::SelectBaseline {
+            lane,
+            before_sha,
+            candidate_sha,
+            history_dir,
+        } => {
+            let selected = select_baseline(
+                &history_dir,
+                lane,
+                &before_sha,
+                &candidate_sha,
+                query_baseline,
+            );
+            match selected {
+                Ok(selected) => {
+                    println!("::notice title=Receipt baseline::{}", selected.notice());
+                    append_github_file("GITHUB_STEP_SUMMARY", &selected.markdown())?;
+                    append_github_file(
+                        "GITHUB_OUTPUT",
+                        &format!(
+                            "sha={}\nreuse={}",
+                            selected.baseline_sha,
+                            selected.baseline_sha == before_sha
+                        ),
+                    )?;
+                    Ok(())
+                }
+                Err(error) => {
+                    report_selection_error(&error)?;
+                    Err(error)
+                }
+            }
         }
         ReceiptAction::Gate {
             lane,

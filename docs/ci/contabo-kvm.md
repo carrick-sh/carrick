@@ -77,15 +77,18 @@ closure runs only on owner dispatch when enabled, on a separate runner.
 dispatch lanes; only `ci-ok` is required for merging. Pre-merge hardware
 evidence belongs to the director; these post-landing runs are the backstop.
 
-Every landed commit produces a per-SHA KVM receipt. On push, hosted
-`kvm-gate` compares it with the first parent main commit's receipt, using the
-current landed main xtask. It waits at most 90 minutes for an in-progress
-parent run, without holding a KVM clone. A missing parent receipt fails with
-a **No baseline** annotation and job summary, separate from NEW regressions;
-there is no fallback to older receipts. Owner dispatch seeds the current
-main tip without a parent comparison. Never cancel pending main pushes or
-displace them with newer pushes: each receipt is the next commit's baseline.
-See [baseline seeding](mac-jit.md#seeding-baselines).
+On push, a selector built from trusted event.before walks back at most 50
+first-parent commits to the nearest trusted KVM receipt. Zero/non-ancestor
+before values fail closed. The comparison runs from a clean checkout/build
+of the chosen receipted commit, reusing the selector build if it is the same
+commit. It grades the candidate receipt without building candidate Rust.
+The summary and notice name that baseline and list intervening commits
+without their own receipts as **covered as a range, not individually**.
+Missing ancestry-root baselines and exhausted walks fail distinctly as
+**No baseline** and **Baseline walk limit**, without claiming a regression.
+Owner dispatch seeds the current main tip without a baseline comparison.
+See [baseline selection and seeding](mac-jit.md#seeding-baselines), including
+the first-rollout selector bootstrap requirement.
 
 ## Host setup (root on Contabo)
 

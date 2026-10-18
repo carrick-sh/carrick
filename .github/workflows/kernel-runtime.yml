@@ -491,12 +491,12 @@ jobs:
           path: target/el1-gate/
           if-no-files-found: ignore
 
-  # Hosted post-landing comparisons against the landed commit's first parent.
-  # Run the current trusted main code so the first push after this change also
-  # reports a missing parent baseline explicitly. Waiting never holds hardware.
-  # Owner dispatch seeds receipts without requiring a baseline.
+  # The selector is built from trusted event.before, then the comparison is
+  # built from the selected receipted ancestor in its own clean checkout.
+  # Reuse the selector build when before itself supplies the baseline.
+  # Owner dispatch seeds receipts without requiring any baseline.
   hvf-gate:
-    name: HVF · receipt gate vs parent main commit
+    name: HVF · receipt gate vs receipted main ancestor
     permissions:
       contents: read
       actions: read
@@ -505,33 +505,76 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 110
     steps:
-      - name: Check out the landed commit
+      - name: Reject an invalid push before checkout
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          if [[ ! "$BEFORE_SHA" =~ ^[0-9a-f]{40}$ || "$BEFORE_SHA" =~ ^0{40}$ ]]; then
+            echo "::error title=Invalid push history::Missing, zero or malformed event.before; refusing to execute repository code"
+            printf '## Invalid push history\n\nMissing, zero or malformed event.before; no comparison was made.\n' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+      - name: Check out the trusted pre-push commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
-          fetch-depth: 2
+          ref: ${{ github.event.before }}
+          path: selector
+          fetch-depth: 0
           persist-credentials: false
-      # Every attempt's receipt; the gate takes the newest attempt <= its own
-      # (a "re-run failed jobs" may re-run only this gate).
-      - name: Download the candidate receipts
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: gate-xtask-release
+          workspaces: selector -> target
+          cache-workspace-crates: "true"
+          save-if: false
+      - name: Build the trusted selector (owner seeding required at rollout)
+        working-directory: selector
+        run: |
+          cargo build --locked --release -p carrick-xtask
+          target/release/carrick-xtask ci-receipt --help > "$RUNNER_TEMP/receipt-help"
+          if ! grep -q select-baseline "$RUNNER_TEMP/receipt-help"; then
+            echo "::error title=Baseline selector unavailable::The trusted pre-push commit predates the selector. Seed current main with an owner dispatch; subsequent pushes can compare."
+            printf '## Baseline selector unavailable\n\nTrusted event.before predates select-baseline. Seed current main with an owner dispatch for subsequent pushes. No comparison was made.\n' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+      - name: Select the nearest trusted receipt baseline
+        id: baseline
+        working-directory: selector
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: >-
+          target/release/carrick-xtask ci-receipt select-baseline --lane hvf
+          --before-sha "$BEFORE_SHA" --candidate-sha "$GITHUB_SHA"
+      - name: Check out the selected baseline cleanly
+        if: ${{ steps.baseline.outputs.reuse != 'true' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.baseline.outputs.sha }}
+          path: baseline
+          clean: true
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        if: ${{ steps.baseline.outputs.reuse != 'true' }}
+        with:
+          shared-key: gate-xtask-release
+          workspaces: baseline -> target
+          cache-workspace-crates: "true"
+          save-if: false
+      - name: Build the selected baseline xtask with its own lockfile
+        if: ${{ steps.baseline.outputs.reuse != 'true' }}
+        working-directory: baseline
+        run: cargo build --locked --release -p carrick-xtask
+      - name: Download candidate receipt data
         uses: actions/download-artifact@v4
         with:
           pattern: receipt-hvf-${{ github.sha }}-*
           path: ${{ runner.temp }}/candidate
-      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
-        with:
-          shared-key: gate-xtask-release
-          cache-workspace-crates: "true"
-          save-if: false
-      - name: Build the trusted xtask
-        run: cargo build --locked --release -p carrick-xtask
-      - name: Resolve the parent main commit
-        id: parent
-        run: echo "sha=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT"
-      - name: Compare with parent receipt (fails explicitly on No baseline)
+      - name: Compare using the selected baseline's code
+        working-directory: ${{ steps.baseline.outputs.reuse == 'true' && 'selector' || 'baseline' }}
         env:
           GH_TOKEN: ${{ github.token }}
-          BASE_SHA: ${{ steps.parent.outputs.sha }}
+          BASE_SHA: ${{ steps.baseline.outputs.sha }}
         run: >-
           target/release/carrick-xtask ci-receipt gate --lane hvf
           --base-sha "$BASE_SHA" --candidate-dir "$RUNNER_TEMP/candidate"
@@ -539,7 +582,7 @@ jobs:
           --download-dir "$RUNNER_TEMP/baseline" --wait-minutes 90 --poll-seconds 60
 
   kvm-gate:
-    name: KVM · receipt gate vs parent main commit
+    name: KVM · receipt gate vs receipted main ancestor
     permissions:
       contents: read
       actions: read
@@ -551,33 +594,76 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 110
     steps:
-      - name: Check out the landed commit
+      - name: Reject an invalid push before checkout
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          if [[ ! "$BEFORE_SHA" =~ ^[0-9a-f]{40}$ || "$BEFORE_SHA" =~ ^0{40}$ ]]; then
+            echo "::error title=Invalid push history::Missing, zero or malformed event.before; refusing to execute repository code"
+            printf '## Invalid push history\n\nMissing, zero or malformed event.before; no comparison was made.\n' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+      - name: Check out the trusted pre-push commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
-          fetch-depth: 2
+          ref: ${{ github.event.before }}
+          path: selector
+          fetch-depth: 0
           persist-credentials: false
-      # Every attempt's receipt; the gate takes the newest attempt <= its own
-      # (a "re-run failed jobs" may re-run only this gate).
-      - name: Download the candidate receipts
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: gate-xtask-release
+          workspaces: selector -> target
+          cache-workspace-crates: "true"
+          save-if: false
+      - name: Build the trusted selector (owner seeding required at rollout)
+        working-directory: selector
+        run: |
+          cargo build --locked --release -p carrick-xtask
+          target/release/carrick-xtask ci-receipt --help > "$RUNNER_TEMP/receipt-help"
+          if ! grep -q select-baseline "$RUNNER_TEMP/receipt-help"; then
+            echo "::error title=Baseline selector unavailable::The trusted pre-push commit predates the selector. Seed current main with an owner dispatch; subsequent pushes can compare."
+            printf '## Baseline selector unavailable\n\nTrusted event.before predates select-baseline. Seed current main with an owner dispatch for subsequent pushes. No comparison was made.\n' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+      - name: Select the nearest trusted receipt baseline
+        id: baseline
+        working-directory: selector
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: >-
+          target/release/carrick-xtask ci-receipt select-baseline --lane kvm
+          --before-sha "$BEFORE_SHA" --candidate-sha "$GITHUB_SHA"
+      - name: Check out the selected baseline cleanly
+        if: ${{ steps.baseline.outputs.reuse != 'true' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.baseline.outputs.sha }}
+          path: baseline
+          clean: true
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        if: ${{ steps.baseline.outputs.reuse != 'true' }}
+        with:
+          shared-key: gate-xtask-release
+          workspaces: baseline -> target
+          cache-workspace-crates: "true"
+          save-if: false
+      - name: Build the selected baseline xtask with its own lockfile
+        if: ${{ steps.baseline.outputs.reuse != 'true' }}
+        working-directory: baseline
+        run: cargo build --locked --release -p carrick-xtask
+      - name: Download candidate receipt data
         uses: actions/download-artifact@v4
         with:
           pattern: receipt-kvm-${{ github.sha }}-*
           path: ${{ runner.temp }}/candidate
-      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
-        with:
-          shared-key: gate-xtask-release
-          cache-workspace-crates: "true"
-          save-if: false
-      - name: Build the trusted xtask
-        run: cargo build --locked --release -p carrick-xtask
-      - name: Resolve the parent main commit
-        id: parent
-        run: echo "sha=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT"
-      - name: Compare with parent receipt (fails explicitly on No baseline)
+      - name: Compare using the selected baseline's code
+        working-directory: ${{ steps.baseline.outputs.reuse == 'true' && 'selector' || 'baseline' }}
         env:
           GH_TOKEN: ${{ github.token }}
-          BASE_SHA: ${{ steps.parent.outputs.sha }}
+          BASE_SHA: ${{ steps.baseline.outputs.sha }}
         run: >-
           target/release/carrick-xtask ci-receipt gate --lane kvm
           --base-sha "$BASE_SHA" --candidate-dir "$RUNNER_TEMP/candidate"
@@ -602,7 +688,7 @@ jobs:
         run: cargo build --locked --release -p carrick-xtask
 
   # Post-landing aggregate (not a merge requirement). Skipped or cancelled
-  # lanes fail visibly; pushes also require both parent receipt comparisons.
+  # lanes fail visibly; pushes also require both ancestor receipt comparisons.
   trusted-hardware-ok:
     name: Trusted hardware OK
     if: ${{ always() }}

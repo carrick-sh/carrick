@@ -86,9 +86,11 @@ times per job key.
 ### Receipt chain
 
 Every landed commit runs once on push to main; no merge-group, PR or schedule
-runs are admitted. The hosted receipt gate compares against the first parent
-main commit's receipt and reports missing parents as a visible **No baseline**
-failure. Owner dispatch on main seeds receipts without a comparison. See
+runs are admitted. The trusted pre-push selector walks back from event.before
+to the nearest receipted first-parent ancestor (50 commits maximum). The
+comparison uses that ancestor's code and reports unreceipted commits as a
+range in the summary/notice. Missing baselines and walk-limit exhaustion
+have distinct visible failures. Owner dispatch on main seeds receipts without a comparison. See
 [events and receipts](contabo-kvm.md#events-and-receipts).
 
 ### Actual assignments are re-vetted (#333)
