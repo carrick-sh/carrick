@@ -67,13 +67,18 @@ pub fn settle_host_work_boundary(kernel: &crate::kernel::Kernel, served: bool, p
 /// Publish wakes after the stopped carrier has consumed its exact task's
 /// completed-work and pending-work flags. Both ARM mailboxes and x86 CPL0
 /// work doorbells use this host side of the in-zone completion boundary.
-pub fn deliver_boundary_wakes(kernel: &crate::kernel::Kernel, served: bool, pending: bool) {
+fn deliver_boundary_wakes(kernel: &crate::kernel::Kernel, served: bool, pending: bool) {
     if served {
         crate::el1_inotify::deliver_owed_wakes();
     }
     if served || pending {
         kernel.deliver_ipc_host_wakes();
         if let Some(zone) = zone_tables() {
+            // EL1 defers an object-wait completion it could not place to the
+            // carrier chain and rings only this doorbell: consuming the
+            // doorbell without settling the chain strands the record
+            // `Transferring` while every vCPU idles (#641).
+            crate::el1_zone::hand_back_completions_in(zone);
             owned_recall::notify(zone, carrick_sched_core::Waker::Host);
         }
     }
