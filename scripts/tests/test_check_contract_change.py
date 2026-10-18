@@ -1198,6 +1198,7 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
 
     def test_conditional_inline_modules_are_distinct_resolution_scopes(self):
         for first_cfg in ('all(test, target_os = "macos")',
+                          'all(test, target_os = "linux")',
                           'all(test, feature = "never_enabled")'):
             with self.subTest(first_cfg=first_cfg):
                 self.seed_resolution_case(
@@ -1205,7 +1206,7 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
                         "src/lib.rs": "mod dispatch;\n"
                                       f"#[cfg({first_cfg})] mod tests {{\n"
                                       "#[test] fn other_witness() {} }\n"
-                                      '#[cfg(all(test, target_os = "linux"))] mod tests {\n'
+                                      '#[cfg(all(test, target_os = "macos"))] mod tests {\n'
                                       "#[test] fn bound_test() {} }\n",
                     },
                     "carrick-kernel::tests::bound_test",
@@ -2370,6 +2371,72 @@ rationale = "Byte-preserving ownership move; contract behavior and work units ar
         self._commit_all("n3b: git mv into tests/support/mailbox.rs with nested bracket attr after #[path]")
         res_f = self.run_check(base_sha=base_f)
         self.assertEqual(res_f.returncode, 1, msg=f"case f (n3b) stdout: {res_f.stdout}\nstderr: {res_f.stderr}")
+
+    def test_new3_linux_only_cfg_witness_in_macos_only_host_lane_fails(self):
+        """NEW-3: host and integration lanes run only on macos-15 in CI (except test-host-linux and kernel-semantics); a #[cfg(target_os = "linux")] witness in carrick-aarch64 or carrick-kernel must fail."""
+        self.use_single_contract_surface()
+        aarch64_dir = self.repo / "crates" / "carrick-aarch64"
+        (aarch64_dir / "src").mkdir(parents=True, exist_ok=True)
+        (aarch64_dir / "Cargo.toml").write_text(
+            '[package]\nname = "carrick-aarch64"\nversion = "0.1.0"\nedition = "2024"\n',
+            encoding="utf-8",
+        )
+        (aarch64_dir / "src" / "lib.rs").write_text(
+            "pub fn decode_insn() -> u32 { 0 }\n",
+            encoding="utf-8",
+        )
+        (self.repo / "conformance-contracts" / "surfaces.toml").write_text(
+            '[[surfaces]]\npath = "crates/carrick-aarch64/src/lib.rs"\ncontracts = ["kernel.futex.contention"]\n',
+            encoding="utf-8",
+        )
+        self._write_futex_contract('vm_free = "carrick-aarch64::tests::linux_only_witness"\n')
+        base_sha = self._commit_all("seed carrick-aarch64 surface")
+
+        (aarch64_dir / "src" / "lib.rs").write_text(
+            "pub fn decode_insn() -> u32 { 1 }\n"
+            "#[cfg(test)]\nmod tests {\n"
+            '    #[cfg(target_os = "linux")]\n'
+            "    #[test]\n"
+            "    fn linux_only_witness() { assert_eq!(super::decode_insn(), 1); }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        self._commit_all("add #[cfg(target_os = linux)] witness in carrick-aarch64")
+        res = self.run_check(base_sha=base_sha)
+        self.assertEqual(res.returncode, 1, msg=f"stdout: {res.stdout}\nstderr: {res.stderr}")
+
+        # Integration lane also runs only on macos-15 in CI: a #[cfg(target_os = "linux")] witness must fail
+        (aarch64_dir / "Cargo.toml").write_text(
+            '[package]\nname = "carrick-aarch64"\nversion = "0.1.0"\nedition = "2024"\n\n'
+            '[package.metadata.carrick.test-lanes]\nint_suite = "integration"\n',
+            encoding="utf-8",
+        )
+        (aarch64_dir / "tests").mkdir(parents=True, exist_ok=True)
+        (aarch64_dir / "tests" / "int_suite.rs").write_text(
+            '#[cfg(target_os = "linux")]\n#[test]\nfn linux_int_witness() { assert_eq!(carrick_aarch64::decode_insn(), 1); }\n',
+            encoding="utf-8",
+        )
+        self._write_futex_contract('vm_free = "carrick-aarch64::int_suite::linux_int_witness"\n')
+        self._commit_all("add #[cfg(target_os = linux)] integration witness")
+        res_int = self.run_check(base_sha=base_sha)
+        self.assertEqual(res_int.returncode, 1, msg=f"int stdout: {res_int.stdout}\nstderr: {res_int.stderr}")
+
+        # Real workflow + justfile derivation: verify _ci_environments_for_target on real repo view
+        spec = importlib.util.spec_from_file_location("check_contract_change", SCRIPT_PATH)
+        checker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(checker)
+        real_view = checker.RepoView(REPO_ROOT, "HEAD", use_worktree=True)
+        aarch64_envs = checker._ci_environments_for_target(real_view, "carrick-aarch64", "host")
+        self.assertEqual([(o, a) for o, a, _ in aarch64_envs], [("macos", "aarch64")])
+        int_envs = checker._ci_environments_for_target(real_view, "carrick-runtime", "integration")
+        self.assertEqual([(o, a) for o, a, _ in int_envs], [("macos", "aarch64")])
+        host_linux_envs = checker._ci_environments_for_target(real_view, "carrick-host-linux", "host")
+        self.assertIn(("linux", "x86_64"), [(o, a) for o, a, _ in host_linux_envs])
+        ksem_envs = checker._ci_environments_for_target(real_view, "carrick-kernel-example", "host")
+        self.assertEqual(
+            {(o, a) for o, a, _ in ksem_envs},
+            {("macos", "aarch64"), ("linux", "x86_64"), ("linux", "aarch64")},
+        )
 
 
 if __name__ == "__main__":

@@ -925,6 +925,7 @@ class RepoView:
         self._comments_stripped_cache: dict[str, str] = {}
         self._cargo_toml_cache: dict[str, dict | None] = {}
         self._ignored_allowlist_cache: list[tuple[str, str | None]] | None = None
+        self._workflow_lane_info_cache: tuple[dict[str, list[tuple[str, str, frozenset[str]]]], dict[str, set[tuple[str, str]]]] | None = None
 
     def _ensure_tree_index(self):
         if self._files is not None:
@@ -1361,6 +1362,183 @@ def _expand_crate_features(features_table: dict, seed: set[str]) -> set[str]:
     return enabled
 
 
+def _discover_workflow_lane_info(
+    view: RepoView,
+) -> tuple[dict[str, list[tuple[str, str, frozenset[str]]]], dict[str, set[tuple[str, str]]]]:
+    """Derive `(lane_envs, pkg_host_envs)` from `.github/workflows/*.yml` and `justfile` when present,
+    falling back to Carrick's workflow lane layout when workflow files are absent in synthetic test repos.
+    """
+    if view._workflow_lane_info_cache is not None:
+        return view._workflow_lane_info_cache
+
+    default_lane_envs: dict[str, list[tuple[str, str, frozenset[str]]]] = {
+        "host": [("macos", "aarch64", frozenset({"carrick-host-linux"}))],
+        "integration": [("macos", "aarch64", frozenset())],
+        "kvm": [("linux", "x86_64", frozenset())],
+        "signed-cli": [("macos", "aarch64", frozenset())],
+        "signed-hvf": [("macos", "aarch64", frozenset())],
+    }
+    default_pkg_host_envs: dict[str, set[tuple[str, str]]] = {
+        "carrick-host-linux": {("linux", "x86_64")},
+        "carrick-kernel-example": {("macos", "aarch64"), ("linux", "x86_64"), ("linux", "aarch64")},
+    }
+
+    workflow_files = view.glob_files(".github/workflows", ".yml") + view.glob_files(
+        ".github/workflows", ".yaml"
+    )
+    if not view.is_file("justfile") or not workflow_files:
+        view._workflow_lane_info_cache = (default_lane_envs, default_pkg_host_envs)
+        return view._workflow_lane_info_cache
+
+    justfile_text = view.read_text("justfile")
+    recipes: dict[str, tuple[list[str], list[str]]] = {}
+    cur_recipe: str | None = None
+    cur_deps: list[str] = []
+    cur_body: list[str] = []
+    header_re = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*)(?:\s+[^:]*)?:(?!=)(.*)$")
+    for raw_line in justfile_text.splitlines():
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        if raw_line[0].isspace():
+            if cur_recipe is not None:
+                cur_body.append(raw_line.strip())
+            continue
+        if cur_recipe is not None:
+            recipes[cur_recipe] = (cur_deps, cur_body)
+            cur_recipe, cur_deps, cur_body = None, [], []
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_-]*\s*:=", raw_line) or raw_line.startswith(
+            ("set ", "mod ", "import ", "export ", "[")
+        ):
+            continue
+        hm = header_re.match(raw_line)
+        if hm:
+            cur_recipe = hm.group(1)
+            dep_part = hm.group(2).split("#", 1)[0]
+            cur_deps = re.findall(r"\b([A-Za-z_][A-Za-z0-9_-]*)\b", dep_part)
+            cur_body = []
+    if cur_recipe is not None:
+        recipes[cur_recipe] = (cur_deps, cur_body)
+
+    def extract_just_calls(line: str) -> list[str]:
+        s = line.strip().lstrip("@-")
+        if not s or s.startswith("#") or re.match(r"^(?:echo|printf)\b", s):
+            return []
+        found: list[str] = []
+        for m in re.finditer(
+            r"(?:^|[;&|()\s])\b(?:just|j)\s+(?:--[A-Za-z0-9_-]+(?:\s+\S+)?\s+)*([A-Za-z_][A-Za-z0-9_-]*)(?:\s+([A-Za-z_][A-Za-z0-9_-]*))?",
+            s,
+        ):
+            r1, r2 = m.group(1), m.group(2)
+            if r1 == "lease":
+                for sub_m in re.finditer(r"\b(?:just|j)\s+([A-Za-z_][A-Za-z0-9_-]*)", s[m.start() :]):
+                    if sub_m.group(1) != "lease":
+                        found.append(sub_m.group(1))
+            elif r1 == "ci-macos-test" and r2:
+                found.extend([r1, r2])
+            elif r1 == "accept" and "--profile kvm" in s:
+                found.extend(["accept", "test-kvm"])
+            else:
+                found.append(r1)
+        return found
+
+    def recipe_closure(seed: set[str]) -> set[str]:
+        reach: set[str] = set()
+        q = list(seed)
+        while q:
+            r = q.pop()
+            if r in reach or r not in recipes:
+                continue
+            reach.add(r)
+            deps, body = recipes[r]
+            for d in deps:
+                if d in recipes and d not in reach:
+                    q.append(d)
+            for bl in body:
+                for sub in extract_just_calls(bl):
+                    if sub in recipes and sub not in reach:
+                        q.append(sub)
+        return reach
+
+    def map_runner_label(label: str) -> tuple[str, str] | None:
+        lbl = label.strip().strip("'\"").lower()
+        if "macos" in lbl:
+            return ("macos", "aarch64")
+        if "ubuntu" in lbl or "linux" in lbl or "carrick-kvm" in lbl:
+            if "arm" in lbl or "aarch64" in lbl:
+                return ("linux", "aarch64")
+            return ("linux", "x86_64")
+        return None
+
+    lane_envs: dict[str, list[tuple[str, str, frozenset[str]]]] = {
+        "host": [],
+        "integration": [],
+        "kvm": [("linux", "x86_64", frozenset())],
+        "signed-cli": [("macos", "aarch64", frozenset())],
+        "signed-hvf": [("macos", "aarch64", frozenset())],
+    }
+    pkg_host_envs: dict[str, set[tuple[str, str]]] = {}
+
+    for wf in workflow_files:
+        wtxt = view.read_text(wf)
+        job_blocks = re.split(r"\n(?=  [A-Za-z0-9_-]+:\s*\n)", wtxt)
+        for jb in job_blocks:
+            runners: list[tuple[str, str]] = []
+            for rm in re.finditer(r"^\s*runs-on:\s*([^\n#]+)", jb, re.M):
+                raw_ro = rm.group(1).strip()
+                if "matrix." in raw_ro:
+                    for mm in re.finditer(r"^\s*os:\s*\[([^\]]+)\]", jb, re.M):
+                        for item in mm.group(1).split(","):
+                            mapped = map_runner_label(item)
+                            if mapped and mapped not in runners:
+                                runners.append(mapped)
+                else:
+                    mapped = map_runner_label(raw_ro)
+                    if mapped and mapped not in runners:
+                        runners.append(mapped)
+            if not runners:
+                continue
+            job_seeds: set[str] = set()
+            for line in jb.splitlines():
+                for rname in extract_just_calls(line):
+                    if rname in recipes:
+                        job_seeds.add(rname)
+            for rname in recipe_closure(job_seeds):
+                _deps, body = recipes[rname]
+                body_joined = "\n".join(body)
+                if rname == "test-integration" or "--lane integration" in body_joined:
+                    for os_a, arch_a in runners:
+                        entry = (os_a, arch_a, frozenset())
+                        if entry not in lane_envs["integration"]:
+                            lane_envs["integration"].append(entry)
+                elif rname == "test-kvm" or "--lane kvm" in body_joined:
+                    for os_a, arch_a in runners:
+                        entry = (os_a, arch_a, frozenset())
+                        if entry not in lane_envs["kvm"]:
+                            lane_envs["kvm"].append(entry)
+                elif rname in ("test", "test-shard-a", "test-shard-b") or "--lane host" in body_joined:
+                    excl = frozenset(
+                        re.findall(r"--exclude(?:-package)?\s+([A-Za-z0-9_-]+)", body_joined)
+                    )
+                    for os_a, arch_a in runners:
+                        entry = (os_a, arch_a, excl)
+                        if entry not in lane_envs["host"]:
+                            lane_envs["host"].append(entry)
+                elif rname.startswith("test-"):
+                    for bl in body:
+                        if "test" in bl and ("-p " in bl or "--package " in bl):
+                            for pm in re.finditer(r"(?:-p|--package)\s+([A-Za-z0-9_-]+)", bl):
+                                pkg = pm.group(1)
+                                for os_a, arch_a in runners:
+                                    pkg_host_envs.setdefault(pkg, set()).add((os_a, arch_a))
+
+    if not lane_envs["host"] and not pkg_host_envs:
+        lane_envs = default_lane_envs
+        pkg_host_envs = default_pkg_host_envs
+
+    view._workflow_lane_info_cache = (lane_envs, pkg_host_envs)
+    return view._workflow_lane_info_cache
+
+
 def _ci_environments_for_target(
     view: RepoView, pkg_name: str, lane: str
 ) -> list[tuple[str, str, set[str]]]:
@@ -1398,15 +1576,25 @@ def _ci_environments_for_target(
         linux_seed |= default_seed
     linux_feats = _expand_crate_features(features_table, linux_seed)
 
-    if lane in ("signed-cli", "signed-hvf"):
-        return [("macos", "aarch64", macos_feats)]
-    if lane == "kvm":
-        return [("linux", "x86_64", linux_feats)]
-    return [
-        ("macos", "aarch64", macos_feats),
-        ("linux", "x86_64", linux_feats),
-        ("linux", "aarch64", linux_feats),
-    ]
+    lane_envs, pkg_host_envs = _discover_workflow_lane_info(view)
+    os_arch_pairs: list[tuple[str, str]] = []
+    if lane == "host":
+        for os_a, arch_a, excl in lane_envs.get("host", []):
+            if pkg_name not in excl and (os_a, arch_a) not in os_arch_pairs:
+                os_arch_pairs.append((os_a, arch_a))
+        for os_a, arch_a in sorted(pkg_host_envs.get(pkg_name, set())):
+            if (os_a, arch_a) not in os_arch_pairs:
+                os_arch_pairs.append((os_a, arch_a))
+    else:
+        for os_a, arch_a, _excl in lane_envs.get(lane, []):
+            if (os_a, arch_a) not in os_arch_pairs:
+                os_arch_pairs.append((os_a, arch_a))
+
+    out: list[tuple[str, str, set[str]]] = []
+    for os_a, arch_a in os_arch_pairs:
+        feats = macos_feats if os_a == "macos" else linux_feats
+        out.append((os_a, arch_a, feats))
+    return out
 
 
 def _eval_cfg_expr(
