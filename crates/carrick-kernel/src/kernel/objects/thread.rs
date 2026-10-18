@@ -1173,7 +1173,7 @@ impl Thread {
     pub(in crate::kernel) fn lifecycle_diagnostic(&self) -> String {
         let page = self.control.lifecycle();
         let census = carrick_core::lifecycle::census(&*page);
-        format!(
+        ::std::format!(
             "lifecycle gate={:?} live={} claimed={} exit_wait={:?} control_entry={:?} host_retirement={:?}",
             census.gate,
             census.live,
