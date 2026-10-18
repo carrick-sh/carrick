@@ -207,6 +207,7 @@ impl SoftCpu {
     /// Plan, emit, and execute one basic block starting at `self.ctx.rip` over `mem`.
     pub fn step_block<M: SoftMmuMemory>(&mut self, mem: &mut M) -> Result<SoftCpuExit, EmitError> {
         self.ctx.pending_exception = None;
+        crate::context::prepare_gateway(self.ctx.rip)?;
         self.ctx.reset_bounce();
         self.ctx.sync_tlb_tag_bits();
 
@@ -229,6 +230,7 @@ impl SoftCpu {
         mem: &mut M,
     ) -> Result<SoftCpuExit, EmitError> {
         // Secure all host executable resources before any guest instruction runs.
+        crate::context::prepare_gateway(planned.start)?;
         self.ctx.prepare_block(planned)?;
         let emitted = emit_block(planned)?;
         let exec_addr = self
@@ -240,7 +242,7 @@ impl SoftCpu {
             })?;
 
         // SAFETY: entry belongs to this CPU's freshly published translated block.
-        let raw_exit = unsafe { self.ctx.execute(mem, exec_addr, planned) };
+        let raw_exit = unsafe { self.ctx.execute(mem, exec_addr, planned) }?;
 
         self.ctx.fxsave.0[28..32].copy_from_slice(&GUEST_MXCSR_MASK.to_le_bytes());
         self.ctx.sync_tlb_tag_bits();
