@@ -41,7 +41,9 @@ impl Build {
         symlink(env!("CARGO"), root.path().join("bin/cargo")).unwrap();
         // Link individual utilities instead of admitting their system/cache
         // directories to PATH. Only the exact Rust toolchain bins are shared.
-        for name in ["sh", "sed", "rustup"] {
+        for name in [
+            "sh", "bash", "sed", "rustup", "just", "mkdir", "dirname", "cat", "sleep",
+        ] {
             symlink(find(name), root.path().join("bin").join(name)).unwrap();
         }
         let rustc = Command::new(find("rustup"))

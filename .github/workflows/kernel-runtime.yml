@@ -21,7 +21,8 @@ env:
   CARGO_TERM_COLOR: always
   # Harden registry transport against intermittent network errors without retrying tests.
   CARGO_HTTP_MULTIPLEXING: "false"   # avoid HTTP/2 framing failures against the crates.io index
-  CARGO_NET_RETRY: "10"              # transport retries for registry/download fetches only
+  CARGO_HTTP_TIMEOUT: "30"
+  CARGO_NET_RETRY: "5"              # transport retries for registry/download fetches only
   RUST_BACKTRACE: 1
 
 jobs:
@@ -75,11 +76,17 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
       bundle-name: ${{ steps.bundle.outputs.name }}
       bundle-sha256: ${{ steps.bundle.outputs.sha256 }}
       bundle-parts: ${{ steps.bundle.outputs.parts }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Restore CI inputs
+        id: setup
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 12
 
       - name: Verify native ARM Linux publisher
         run: |
@@ -88,19 +95,6 @@ jobs:
 
       - name: Test fixture relay transport and fallback
         run: scripts/ci/test-fixture-relay.sh
-
-      - name: Install pinned Rust toolchain and guest targets
-        run: rustup show active-toolchain
-
-      - name: Install just
-        uses: taiki-e/install-action@v2
-        with:
-          tool: just
-
-      - name: Install per-user compiler cache
-        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
-        with:
-          tool: sccache@0.18.0
 
       - name: Publish exact-SHA fixture bundle
         run: just fixtures-publish "$GITHUB_SHA"
@@ -142,6 +136,11 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report
+
   # Focused signed execution on physical Apple Silicon (cloudmac, one JIT
   # ephemeral runner per job from `ci-scaler mac-jit`). This is deliberately
   # separate from public pull-request CI: hosted macOS Arm64 does not support
@@ -149,14 +148,25 @@ jobs:
   # group: a pending job in a group is replaced by a newer one, which would
   # cancel queued merge-group checks. The controller runs one cloudmac runner
   # at a time, so jobs wait in GitHub's queue instead.
+
   hvf-kernel:
     name: HVF · signed embed + cached probes
     if: ${{ !cancelled() && needs.signed-fixtures.result == 'success' }}
     needs: [signed-fixtures]
     runs-on: [self-hosted, macOS, ARM64, carrick-hvf]
     timeout-minutes: 180
+    outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Restore CI inputs
+        id: setup
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 12
+        with:
+          toolchain: 'false'
+          tools: cargo-deny
 
       - name: Verify Apple Silicon host
         run: |
@@ -202,11 +212,6 @@ jobs:
           BUNDLE_SHA256: ${{ needs.signed-fixtures.outputs.bundle-sha256 }}
         run: scripts/ci/download-fixture-bundle.sh verify
 
-      - name: Install just and cargo-deny
-        uses: taiki-e/install-action@v2
-        with:
-          tool: just,cargo-deny
-
       # The job's CARGO_HOME is fresh per run. Restore verifies fixture
       # input identity offline, so populate the cache from every fixture
       # lockfile first; this is the job's only network step for fixtures.
@@ -226,7 +231,12 @@ jobs:
         if: ${{ github.event_name != 'merge_group' }}
         # A venv, never the system interpreter (PEP 668 refuses a system-wide pip
         # install on cloudmac's Homebrew Python).
-        run: just ci-install-semgrep
+        timeout-minutes: 15
+        uses: ./.github/actions/ci-fetch
+        with:
+          recipe: ci-install-semgrep
+          path: ~/.cache/carrick-ci/semgrep
+          key: ci-semgrep-${{ runner.os }}-${{ runner.arch }}-${{ steps.setup.outputs.python }}-${{ hashFiles('scripts/ci/inputs/semgrep.txt') }}
 
       - name: Host-only source gate
         if: ${{ github.event_name != 'merge_group' }}
@@ -236,7 +246,7 @@ jobs:
         # Must run even when `Host-only source gate` fails (`!cancelled()`), so
         # `Signed acceptance receipt` below starts with a clean worktree and can
         # still publish main's per-SHA baseline receipt without hitting the disk floor.
-        if: ${{ !cancelled() && github.event_name != 'merge_group' }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' && github.event_name != 'merge_group' }}
         run: |
           rm -rf \
             target/debug \
@@ -251,11 +261,11 @@ jobs:
       # record; a FAIL receipt is still a receipt. Main is not green under
       # the strict signed gate, so this lane gates on NEW failures against
       # the base SHA's receipt (hosted hvf-gate job), not on the absolute verdict.
-      # `if: ${{ !cancelled() }}` ensures a red `Host-only source gate` on a
+      # Continuing after code failures ensures a red `Host-only source gate` on a
       # main push cannot prevent the per-SHA baseline receipt from being
       # produced and uploaded for `hvf-gate` (while the job itself still ends red).
       - name: Signed acceptance receipt
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && env.CARRICK_CI_FETCH_FAILURE == '' }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -319,9 +329,15 @@ jobs:
             RUST_TEST_THREADS=1 CARRICK_PROBE_WORKERS=1 just conformance-probes
           ' signed-fixtures "${bundles[0]}"
 
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report
+
   # The focused job above is not suite closure. This separate baseline-free
   # gate is intentionally expensive, trusted-event-only, and dormant until the
   # canonical image/oracle host is explicitly enabled.
+
   hvf-closure:
     name: HVF · strict 2,127-suite closure
     if: >-
@@ -333,8 +349,17 @@ jobs:
     # it, so the 24-hour closure can never occupy the merge-queue runner.
     runs-on: [self-hosted, macOS, ARM64, carrick-hvf-closure]
     timeout-minutes: 1440
+    outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Restore CI inputs
+        id: setup
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 12
+        with:
+          toolchain: 'false'
 
       - name: Verify canonical closure host
         run: |
@@ -345,17 +370,7 @@ jobs:
           command -v docker
           docker version
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
       - uses: Swatinem/rust-cache@v2
-
-      - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
-      - name: Install just
-        uses: taiki-e/install-action@v2
-        with:
-          tool: just
 
       - name: Build and verify frozen closure scope
         run: |
@@ -368,6 +383,11 @@ jobs:
           # `just conformance` re-signs its build dependency. Re-check scope on
           # the exact post-gate artifact rather than relying only on preflight.
           just conformance-closure-scope
+
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report
 
   # A real KVM device is the contract. An incidental or software-emulated
   # hosted environment is not accepted as this lane. Every `kvm`-lane test
@@ -388,6 +408,7 @@ jobs:
   # expression (a skipped selected lane still fails the aggregate). Pull
   # requests are not run here: the WIF provider admits only main and merge
   # queue refs, and fork PR code must not reach Willow either.
+
   kvm-tests:
     name: KVM · x86 kvm-lane tests
     needs: [check-merge-group]
@@ -403,19 +424,34 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+
+      - name: Restore bootstrap tool
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 15
+        with:
+          toolchain: 'false'
+          tools: ''
+          cargo: 'false'
+
+      - name: Restore pinned gcloud SDK
+        uses: ./.github/actions/ci-fetch
+        timeout-minutes: 20
+        with:
+          recipe: ci-install-gcloud
+          path: ~/.cache/carrick-ci/gcloud
+          key: ci-gcloud-linux-x64-${{ hashFiles('scripts/ci/inputs/gcloud.json') }}
 
       - name: Authenticate to GCP (workload identity federation)
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:
           workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
           service_account: ${{ vars.GCP_CI_SA }}
-
-      - name: Set up gcloud
-        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
 
       # Creates the VM, waits for its DONE/FAILED marker in the receipt
       # bucket while tailing the serial console, downloads the receipt and
@@ -470,6 +506,11 @@ jobs:
           path: target/ci-logs/gcp-kvm
           if-no-files-found: ignore
 
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report
+
   # The Willow fallback backend (see `kvm-tests` above). Its labels are
   # `ci_scaler::LABELS`; a test keeps them identical.
   kvm-tests-willow:
@@ -483,8 +524,15 @@ jobs:
           (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
     runs-on: [self-hosted, Linux, X64, willow-kvm]
     timeout-minutes: 90
+    outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Restore CI inputs
+        id: setup
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 12
 
       - name: Verify KVM host
         run: |
@@ -494,21 +542,7 @@ jobs:
           test -r /dev/kvm
           test -w /dev/kvm
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
       - uses: Swatinem/rust-cache@v2
-
-      - name: Install just
-        uses: taiki-e/install-action@v2
-        with:
-          tool: just
-
-      - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
-
-      - name: Install x86 image and fixture targets
-        run: rustup target add x86_64-unknown-none x86_64-unknown-linux-musl
 
       # `xtask accept --profile kvm` runs `just test-kvm` and records every
       # failing `<test-binary>::<test>` in the receipt (one format with the
@@ -547,12 +581,18 @@ jobs:
           path: target/el1-gate/
           if-no-files-found: ignore
 
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report
+
   # Hosted merge-queue gates. They run the BASE commit's xtask in a clean
   # checkout of the base (its own .cargo config, working directory and
   # lockfile), download only the candidate's receipt artifact, and execute no
   # candidate code. The bounded wait for an in-progress base run happens
   # here, on a hosted runner, never on the trusted hardware. The job timeout
   # exceeds the wait bound so the actionable message always prints.
+
   hvf-gate:
     name: HVF · receipt gate vs merge-group base
     permissions:
@@ -563,6 +603,8 @@ jobs:
     if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.hvf-kernel.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 110
+    outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
     steps:
       - name: Check out the base commit
         uses: actions/checkout@v4
@@ -581,6 +623,36 @@ jobs:
           shared-key: gate-xtask-release
           cache-workspace-crates: "true"
           save-if: false
+      # Base-only trust boundary: no candidate bootstrap action or recipe.
+      - name: Begin base input preparation
+        run: echo 'failure=base-input-cache' > "$RUNNER_TEMP/ci-fetch-status"
+      - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        id: inputs
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ci-base-inputs-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+      - name: Prepare base toolchain and locked dependencies
+        timeout-minutes: 15
+        env:
+          RUSTUP_MAX_RETRIES: '5'
+        run: |
+          echo 'failure=base-toolchain-and-cargo' > "$RUNNER_TEMP/ci-fetch-status"
+          rustup show active-toolchain
+          cargo fetch --locked
+          echo CARGO_NET_OFFLINE=true >> "$GITHUB_ENV"
+      - uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        if: steps.inputs.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ci-base-inputs-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+      - name: Finish base input preparation
+        run: echo '' > "$RUNNER_TEMP/ci-fetch-status"
       - name: Build the base xtask
         run: cargo build --locked --release -p carrick-xtask
       - name: Gate on NEW failures (waits up to 90 min for the base receipt)
@@ -592,6 +664,14 @@ jobs:
           --base-sha "$BASE_SHA" --candidate-dir "$RUNNER_TEMP/candidate"
           --candidate-sha "$GITHUB_SHA" --run-attempt "$GITHUB_RUN_ATTEMPT"
           --download-dir "$RUNNER_TEMP/baseline" --wait-minutes 90 --poll-seconds 60
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        run: |
+          if [ -s "$RUNNER_TEMP/ci-fetch-status" ]; then
+            cat "$RUNNER_TEMP/ci-fetch-status" >> "$GITHUB_OUTPUT"
+            cat "$RUNNER_TEMP/ci-fetch-status" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   kvm-gate:
     name: KVM · receipt gate vs merge-group base
@@ -606,6 +686,8 @@ jobs:
           ((vars.CARRICK_GCP_KVM == 'true' && vars.CARRICK_KVM_BACKEND != 'willow') && needs.kvm-tests.result || needs.kvm-tests-willow.result) == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 110
+    outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
     steps:
       - name: Check out the base commit
         uses: actions/checkout@v4
@@ -624,6 +706,36 @@ jobs:
           shared-key: gate-xtask-release
           cache-workspace-crates: "true"
           save-if: false
+      # Base-only trust boundary: no candidate bootstrap action or recipe.
+      - name: Begin base input preparation
+        run: echo 'failure=base-input-cache' > "$RUNNER_TEMP/ci-fetch-status"
+      - uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        id: inputs
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ci-base-inputs-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+      - name: Prepare base toolchain and locked dependencies
+        timeout-minutes: 15
+        env:
+          RUSTUP_MAX_RETRIES: '5'
+        run: |
+          echo 'failure=base-toolchain-and-cargo' > "$RUNNER_TEMP/ci-fetch-status"
+          rustup show active-toolchain
+          cargo fetch --locked
+          echo CARGO_NET_OFFLINE=true >> "$GITHUB_ENV"
+      - uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        if: steps.inputs.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ci-base-inputs-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+      - name: Finish base input preparation
+        run: echo '' > "$RUNNER_TEMP/ci-fetch-status"
       - name: Build the base xtask
         run: cargo build --locked --release -p carrick-xtask
       - name: Gate on NEW failures (waits up to 90 min for the base receipt)
@@ -635,16 +747,31 @@ jobs:
           --base-sha "$BASE_SHA" --candidate-dir "$RUNNER_TEMP/candidate"
           --candidate-sha "$GITHUB_SHA" --run-attempt "$GITHUB_RUN_ATTEMPT"
           --download-dir "$RUNNER_TEMP/baseline" --wait-minutes 90 --poll-seconds 60
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        run: |
+          if [ -s "$RUNNER_TEMP/ci-fetch-status" ]; then
+            cat "$RUNNER_TEMP/ci-fetch-status" >> "$GITHUB_OUTPUT"
+            cat "$RUNNER_TEMP/ci-fetch-status" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   gate-xtask-cache:
     name: Warm the receipt-gate xtask cache
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      infrastructure: ${{ steps.infrastructure.outputs.failure }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+
+      - name: Restore CI inputs
+        id: setup
+        uses: ./.github/actions/ci-setup
+        timeout-minutes: 12
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: gate-xtask-release
@@ -653,9 +780,15 @@ jobs:
       - name: Build the base xtask
         run: cargo build --locked --release -p carrick-xtask
 
+      - name: Report infrastructure fetch status
+        id: infrastructure
+        if: ${{ always() }}
+        uses: ./.github/actions/ci-fetch-report
+
   # The single required check. `if: always()` so a skipped or cancelled lane
   # reports a failure here instead of letting a required check pass by
   # being skipped.
+
   trusted-hardware-ok:
     name: Trusted hardware OK
     if: ${{ always() }}
@@ -676,6 +809,7 @@ jobs:
             ${{ (vars.CARRICK_GCP_KVM == 'true' && vars.CARRICK_KVM_BACKEND != 'willow') && 'gcp' || 'willow' }}
           HVF_GATE: ${{ needs.hvf-gate.result }}
           KVM_GATE: ${{ needs.kvm-gate.result }}
+          FETCH_RESULTS: ${{ toJSON(needs) }}
           EVENT: ${{ github.event_name }}
         run: |
           if [ "$SKIPPED_BY_MERGE_GROUP" = "true" ]; then
@@ -683,6 +817,7 @@ jobs:
             echo "Skipped duplicate hardware run: merge_group run $MERGE_GROUP_RUN_ID passed for $GITHUB_SHA"
             exit 0
           fi
+          jq -r 'to_entries[] | select((.value.outputs.infrastructure // "") != "") | "Infrastructure fetch failure: \(.key): \(.value.outputs.infrastructure)"' <<< "$FETCH_RESULTS" | tee -a "$GITHUB_STEP_SUMMARY"
           echo "hvf-kernel=$HVF kvm($KVM_BACKEND)=$KVM hvf-gate=$HVF_GATE kvm-gate=$KVM_GATE"
           test "$HVF" = success
           test "$KVM" = success

@@ -1169,7 +1169,7 @@ ci-probe-coverage-base:
         exit 1
       fi
       echo "Fetching push base commit $BEFORE"
-      git fetch --no-tags origin "$BEFORE"
+      just ci-fetch-run git-base ci-git-fetch "$BEFORE"
     elif [ "${CI_EVENT:?}" = "pull_request" ]; then
       BASE="${CARRICK_PROBE_COVERAGE_BASE:-}"
       if [ -z "$BASE" ]; then
@@ -1177,7 +1177,7 @@ ci-probe-coverage-base:
         exit 1
       fi
       echo "Fetching PR base commit $BASE"
-      git fetch --no-tags origin "$BASE"
+      just ci-fetch-run git-base ci-git-fetch "$BASE"
     elif [ "${CI_EVENT:?}" = "merge_group" ]; then
       BASE="${CARRICK_PROBE_COVERAGE_BASE:-}"
       if [ -z "$BASE" ]; then
@@ -1185,36 +1185,239 @@ ci-probe-coverage-base:
         exit 1
       fi
       echo "Fetching merge group base commit $BASE"
-      git fetch --no-tags origin "$BASE"
+      just ci-fetch-run git-base ci-git-fetch "$BASE"
     fi
+
+[private]
+ci-git-fetch revision:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if git cat-file -e '{{revision}}^{commit}' 2>/dev/null; then exit 0; fi
+    for attempt in 1 2 3 4 5 6; do
+      if just ci-bounded 30 git -c http.lowSpeedLimit=1 -c http.lowSpeedTime=15 fetch --no-tags origin {{revision}}; then exit 0; fi
+      if [ "$attempt" -lt 6 ]; then sleep 2; fi
+    done
+    exit 1
 
 # Bootstrap before foreground recipes need the admission helper. Cargo checks
 # source freshness even when the workspace artifacts came from a CI cache.
 ci-prebuild-xtask:
     {{_cargo}} build --locked -p carrick-xtask
 
+# Bounds apply only to infrastructure commands, never test verdicts. Job control
+# gives the command its own process group, so a timeout also reaps descendants.
+[private]
+ci-bounded seconds +CMD:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    set -m
+    {{CMD}} &
+    command_pid=$!
+    (sleep {{seconds}}; kill -TERM -- "-$command_pid" 2>/dev/null; sleep 5; kill -KILL -- "-$command_pid" 2>/dev/null) &
+    watchdog=$!
+    cleanup() {
+      # Also reap descendants if the parent exits before TERM-resistant children.
+      kill -KILL -- "-$command_pid" 2>/dev/null || true
+      kill -TERM -- "-$watchdog" 2>/dev/null || true
+      wait "$watchdog" 2>/dev/null || true
+    }
+    trap cleanup EXIT
+    trap 'exit 143' TERM
+    trap 'exit 130' INT
+    status=0
+    wait "$command_pid" || status=$?
+    exit "$status"
+
+# Write BEFORE fetching: a killed/timed-out step still leaves evidence. A later
+# successful fetch must not erase an earlier failure from an independent step.
+[private]
+ci-fetch-run label recipe *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    status_file="${RUNNER_TEMP:-target/ci-inputs}/ci-fetch-status"
+    mkdir -p "$(dirname "$status_file")"
+    previous=$(cat "$status_file" 2>/dev/null || true)
+    echo 'failure={{label}}' > "$status_file"
+    if [ -n "${GITHUB_ENV:-}" ]; then echo 'CARRICK_CI_FETCH_FAILURE={{label}}' >> "$GITHUB_ENV"; fi
+    if just --justfile {{justfile()}} {{recipe}} {{ARGS}}; then
+      printf '%s\n' "$previous" > "$status_file"
+      if [ -n "${GITHUB_ENV:-}" ]; then echo "CARRICK_CI_FETCH_FAILURE=${previous#failure=}" >> "$GITHUB_ENV"; fi
+    else
+      status=$?
+      echo '::error title=Infrastructure fetch failure::{{label}} (exit '"$status"')'
+      if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+        echo 'Infrastructure fetch failure: {{label}}' >> "$GITHUB_STEP_SUMMARY"
+      fi
+      exit "$status"
+    fi
+
+# Atomic, digest-verified downloads. Cached bytes are checked on every use;
+# partial downloads and checksum failures never become cache entries.
+[private]
+ci-download url digest destination bits="256":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    destination={{quote(destination)}}
+    mkdir -p "$(dirname "$destination")"
+    verify() { echo '{{digest}}  '"$1" | shasum -a {{bits}} -c -; }
+    if [ -f "$destination" ]; then
+      verify "$destination"
+      echo "ci-input cache hit: $destination"
+      exit 0
+    fi
+    partial=$(mktemp "$destination.XXXXXX")
+    trap 'rm -f "$partial"' EXIT
+    curl --fail --location --silent --show-error --connect-timeout 15 \
+      --max-time 180 --retry 5 --retry-all-errors --retry-delay 2 \
+      --retry-max-time 1100 {{quote(url)}} -o "$partial"
+    verify "$partial"
+    mv "$partial" "$destination"
+
 ci-toolchain:
-    rustup show active-toolchain
+    just ci-fetch-run rust-toolchain ci-toolchain-fetch
+
+[private]
+ci-toolchain-fetch:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export RUSTUP_MAX_RETRIES=5
+    # rustup verifies distribution manifest/component checksums. Bound the
+    # entire install as well, including any stalled individual transfer.
+    just ci-bounded 600 rustup show active-toolchain
+
+# Tool versions, archive URLs and hashes come from install-action's pinned
+# manifest; bootstrap just uses the same pin before recipes can be invoked.
+ci-install-tools *TOOLS="sccache":
+    just ci-fetch-run tools ci-tools-fetch {{TOOLS}}
+
+[private]
+ci-tools-fetch +TOOLS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cache="${CARRICK_CI_CACHE:-$HOME/.cache/carrick-ci}"
+    mkdir -p "$cache/tools/bin"
+    arch=$(uname -m)
+    case "$arch" in arm64) arch=aarch64;; esac
+    case "$(uname -s)" in Linux) platform="${arch}_linux_musl";; Darwin) platform="${arch}_macos";; *) exit 1;; esac
+    for tool in {{TOOLS}}; do
+      url=$(jq -er --arg tool "$tool" --arg platform "$platform" '.[$tool].platforms[$platform].url' scripts/ci/inputs/tools.json)
+      digest=$(jq -er --arg tool "$tool" --arg platform "$platform" '.[$tool].platforms[$platform].sha256' scripts/ci/inputs/tools.json)
+      archive="$cache/tools/$digest.tar.gz"
+      just ci-download "$url" "$digest" "$archive"
+      staging=$(mktemp -d)
+      tar -xzf "$archive" -C "$staging"
+      binary=$(find "$staging" -type f -name "$tool" -print -quit)
+      test -n "$binary"
+      install -m 755 "$binary" "$cache/tools/bin/$tool"
+      rm -rf "$staging"
+    done
+    if [ -n "${GITHUB_PATH:-}" ]; then echo "$cache/tools/bin" >> "$GITHUB_PATH"; fi
+
+ci-install-actionlint:
+    just ci-fetch-run actionlint ci-actionlint-fetch
+
+[private]
+ci-actionlint-fetch:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cache="${CARRICK_CI_CACHE:-$HOME/.cache/carrick-ci}/actionlint"
+    just ci-download https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+      8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 "$cache/archive.tar.gz"
+    tar -xzf "$cache/archive.tar.gz" -C "$cache" actionlint
+    if [ -n "${GITHUB_PATH:-}" ]; then echo "$cache" >> "$GITHUB_PATH"; fi
+
+ci-install-gcloud:
+    just ci-fetch-run gcloud ci-gcloud-fetch
+
+[private]
+ci-gcloud-fetch:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cache="${CARRICK_CI_CACHE:-$HOME/.cache/carrick-ci}/gcloud"
+    url=$(jq -er '.url' scripts/ci/inputs/gcloud.json)
+    digest=$(jq -er '.sha256' scripts/ci/inputs/gcloud.json)
+    just ci-download "$url" "$digest" "$cache/archive.tar.gz"
+    tar -xzf "$cache/archive.tar.gz" -C "$cache"
+    if [ -n "${GITHUB_PATH:-}" ]; then echo "$cache/google-cloud-sdk/bin" >> "$GITHUB_PATH"; fi
 
 ci-install-semgrep:
+    just ci-fetch-run semgrep ci-semgrep-fetch
+
+[private]
+ci-semgrep-fetch:
     #!/usr/bin/env bash
     set -euo pipefail
+    cache="${CARRICK_CI_CACHE:-$HOME/.cache/carrick-ci}/semgrep"
     python3 -m venv "${RUNNER_TEMP:?}/semgrep"
-    "$RUNNER_TEMP/semgrep/bin/pip" install semgrep
-    echo "$RUNNER_TEMP/semgrep/bin" >> "${GITHUB_PATH:?}"
+    export PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1
+    pip="$RUNNER_TEMP/semgrep/bin/pip"
+    mkdir -p "$cache"
+    # Never cache a relocatable venv: cache verified wheels, install offline.
+    if [ ! -f "$cache/complete" ]; then
+      just ci-bounded 600 "$pip" download --only-binary=:all: --require-hashes \
+        --retries 5 --timeout 30 --dest "$cache" -r scripts/ci/inputs/semgrep.txt
+      touch "$cache/complete"
+    fi
+    "$pip" install --no-index --find-links "$cache" --only-binary=:all: \
+      --require-hashes -r scripts/ci/inputs/semgrep.txt
+    if [ -n "${GITHUB_PATH:-}" ]; then echo "$RUNNER_TEMP/semgrep/bin" >> "$GITHUB_PATH"; fi
+
+# Fetch every committed lockfile before compilation. Cargo verifies crate
+# checksums against the lockfile; registry/git sources persist via actions/cache.
+ci-cargo-fetch:
+    just ci-fetch-run cargo-dependencies ci-cargo-fetch-locks
+
+[private]
+ci-cargo-fetch-locks:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export CARGO_NET_RETRY=5 CARGO_HTTP_TIMEOUT=30 CARGO_HTTP_MULTIPLEXING=false
+    while IFS= read -r lock; do
+      manifest="${lock%Cargo.lock}Cargo.toml"
+      # Historical evidence may retain a lockfile without a buildable crate.
+      if [ ! -f "$manifest" ]; then continue; fi
+      if cargo fetch --locked --offline --manifest-path "$manifest" >/dev/null 2>&1; then continue; fi
+      just ci-bounded 600 cargo fetch --locked --manifest-path "$manifest"
+    done < <(git ls-files Cargo.lock conformance-probes/Cargo.lock 'fixtures/**/Cargo.lock' 'crates/**/Cargo.lock' fuzz/Cargo.lock 'scripts/tools/**/Cargo.lock')
+    if [ -n "${GITHUB_ENV:-}" ]; then echo CARGO_NET_OFFLINE=true >> "$GITHUB_ENV"; fi
 
 ci-install-linux-cross:
-    timeout 600 sh -c 'sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30 update && sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30 install -y gcc-aarch64-linux-gnu'
+    just ci-fetch-run apt-linux-cross ci-apt-fetch gcc-aarch64-linux-gnu
 
 ci-install-freebsd-cross:
-    timeout 600 sh -c 'sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30 update && sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::ftp::Timeout=30 install -y clang llvm'
+    just ci-fetch-run apt-bsd-cross ci-apt-fetch clang llvm
 
-# Keep the permanent archive: release mirrors eventually remove old sysroots.
-ci-freebsd-sysroot:
+# Cache the authenticated apt indexes AND version-named debs together under
+# the runner image identity. apt verifies package hashes against signed indexes;
+# a warm install is --no-download and never contacts a repository.
+[private]
+ci-apt-fetch +PACKAGES:
     #!/usr/bin/env bash
     set -euo pipefail
-    archive="$(mktemp)"
-    trap 'rm -f "$archive"' EXIT
+    package_key=$(printf '%s\n' {{PACKAGES}} | shasum -a 256 | cut -d' ' -f1)
+    cache="${CARRICK_CI_CACHE:-$HOME/.cache/carrick-ci}/apt/$package_key"
+    mkdir -p "$cache/archives/partial" "$cache/lists/partial"
+    if [ ! -f "$cache/complete" ]; then
+      just ci-bounded 600 sudo apt-get -o APT::Keep-Downloaded-Packages=true -o Acquire::Retries=5 -o Acquire::http::Timeout=30 \
+        -o Acquire::https::Timeout=30 -o Dir::State::lists="$cache/lists" update
+      just ci-bounded 600 sudo apt-get -o APT::Keep-Downloaded-Packages=true -o Acquire::Retries=5 -o Acquire::http::Timeout=30 \
+        -o Acquire::https::Timeout=30 -o Dir::State::lists="$cache/lists" \
+        -o Dir::Cache::archives="$cache/archives" --download-only install -y {{PACKAGES}}
+      sudo chown -R "$(id -u):$(id -g)" "$cache"
+      touch "$cache/complete"
+    fi
+    just ci-bounded 600 sudo apt-get -o APT::Keep-Downloaded-Packages=true -o Dir::State::lists="$cache/lists" \
+      -o Dir::Cache::archives="$cache/archives" --no-download install -y {{PACKAGES}}
+
+# Keep the #637 mirror policy and digest; add only verified archive caching and
+# the shared infrastructure failure marker around that recipe.
+ci-freebsd-sysroot:
+    just ci-fetch-run freebsd-sysroot ci-freebsd-sysroot-fetch
+
+[private]
+ci-freebsd-sysroot-fetch:
+    #!/usr/bin/env bash
+    set -euo pipefail
     mkdir -p "${FBSD_SYSROOT:?}"
     # archive.freebsd.org was unreachable from every network on 2026-10-18 and
     # failed every merge group; the pinned digest (from the release MANIFEST)
@@ -1225,38 +1428,56 @@ ci-freebsd-sysroot:
         14.3-RELEASE) want=e38b5cf756d60086a6c2f736eff19cc7685f7e2313e31d14342fc8df57200a92 ;;
         *) echo "::error::no pinned base.txz sha256 for FreeBSD ${FBSD_VERSION}" >&2; exit 1 ;;
     esac
-    ok=
-    for url in \
-        "https://archive.freebsd.org/old-releases/amd64/${FBSD_VERSION}/base.txz" \
-        "https://github.com/carrick-sh/carrick/releases/download/ci-sysroot-freebsd-${FBSD_VERSION}/base.txz" \
-        "https://download.freebsd.org/releases/amd64/${FBSD_VERSION}/base.txz" \
-        "https://mirror.math.princeton.edu/pub/FreeBSD/releases/amd64/${FBSD_VERSION}/base.txz" \
-        "https://ftp.jaist.ac.jp/pub/FreeBSD/releases/amd64/${FBSD_VERSION}/base.txz"; do
-        if curl -fSL --connect-timeout 20 --max-time 600 --retry 2 --retry-all-errors "$url" -o "$archive" \
-            && echo "$want  $archive" | sha256sum -c --quiet -; then
-            ok=1
-            break
+    cache="${CARRICK_CI_CACHE:-$HOME/.cache/carrick-ci}/freebsd"
+    mkdir -p "$cache"
+    archive="$cache/$want"
+    if [ -f "$archive" ]; then
+        echo "$want  $archive" | sha256sum -c --quiet -
+        echo "ci-input cache hit: $archive"
+    else
+        partial=$(mktemp "$archive.XXXXXX")
+        trap 'rm -f "$partial"' EXIT
+        ok=
+        for url in \
+            "https://archive.freebsd.org/old-releases/amd64/${FBSD_VERSION}/base.txz" \
+            "https://github.com/carrick-sh/carrick/releases/download/ci-sysroot-freebsd-${FBSD_VERSION}/base.txz" \
+            "https://download.freebsd.org/releases/amd64/${FBSD_VERSION}/base.txz" \
+            "https://mirror.math.princeton.edu/pub/FreeBSD/releases/amd64/${FBSD_VERSION}/base.txz" \
+            "https://ftp.jaist.ac.jp/pub/FreeBSD/releases/amd64/${FBSD_VERSION}/base.txz"; do
+            if curl -fSL --connect-timeout 20 --max-time 600 --retry 2 --retry-all-errors "$url" -o "$partial" \
+                && echo "$want  $partial" | sha256sum -c --quiet -; then
+                ok=1
+                break
+            fi
+            echo "FreeBSD base.txz unavailable or mismatched at $url" >&2
+        done
+        if [ -z "$ok" ]; then
+            echo "::error::infrastructure: no FreeBSD ${FBSD_VERSION} base.txz source matched the pinned digest" >&2
+            exit 1
         fi
-        echo "FreeBSD base.txz unavailable or mismatched at $url" >&2
-    done
-    if [ -z "$ok" ]; then
-        echo "::error::infrastructure: no FreeBSD ${FBSD_VERSION} base.txz source matched the pinned digest" >&2
-        exit 1
+        mv "$partial" "$archive"
     fi
     tar -xf "$archive" -C "$FBSD_SYSROOT" ./usr/include ./usr/lib ./lib
 
 # NetBSD's comp set has architecture headers; base supplies the machine link.
 ci-netbsd-sysroot:
+    just ci-fetch-run netbsd-sysroot ci-netbsd-sysroot-fetch
+
+[private]
+ci-netbsd-sysroot-fetch:
     #!/usr/bin/env bash
     set -euo pipefail
-    archive="$(mktemp -d)"
-    trap 'rm -rf "$archive"' EXIT
-    mkdir -p "${NBSD_SYSROOT:?}"
-    release="https://archive.netbsd.org/pub/NetBSD-archive/NetBSD-${NBSD_VERSION:?}/amd64/binary/sets"
-    curl -fSL "$release/comp.tar.xz" -o "$archive/comp.tar.xz"
-    curl -fSL "$release/base.tar.xz" -o "$archive/base.tar.xz"
-    tar -xJf "$archive/comp.tar.xz" -C "$NBSD_SYSROOT" ./usr/include
-    tar -xJf "$archive/base.tar.xz" -C "$NBSD_SYSROOT" ./usr/include/machine
+    cache="${CARRICK_CI_CACHE:-$HOME/.cache/carrick-ci}/netbsd"
+    test "${NBSD_VERSION:?}" = "$(jq -er '.netbsd.version' scripts/ci/inputs/sysroots.json)"
+    mkdir -p "$cache" "${NBSD_SYSROOT:?}"
+    while IFS=$'\t' read -r url digest; do
+      archive="$cache/$digest"
+      just ci-download "$url" "$digest" "$archive" 512
+      case "${url##*/}" in
+        comp*) tar -xJf "$archive" -C "$NBSD_SYSROOT" ./usr/include;;
+        base*) tar -xJf "$archive" -C "$NBSD_SYSROOT" ./usr/include/machine;;
+      esac
+    done < <(jq -r '.netbsd.archives[] | [.url, .sha512] | @tsv' scripts/ci/inputs/sysroots.json)
 
 # These tests use the real host epoll backend but no KVM device or guest.
 test-host-linux:
@@ -1281,6 +1502,7 @@ ci-changes:
     #!/usr/bin/env bash
     set -euo pipefail
     : "${GITHUB_OUTPUT:?}"
+    just ci-probe-coverage-base
     if [[ -n "${CARRICK_XTASK_BIN:-}" ]]; then
         exec "$CARRICK_XTASK_BIN" --root . ci-changes
     elif [[ -x target/debug/carrick-xtask ]]; then
@@ -1294,6 +1516,14 @@ ci-changes:
 ci-results:
     #!/usr/bin/env bash
     set -euo pipefail
+    infrastructure=$(jq -r 'to_entries[] | select((.value.outputs.infrastructure // "") != "") | "\(.key): \(.value.outputs.infrastructure)"' <<< "${CI_NEEDS:?}")
+    if [ -n "$infrastructure" ]; then
+      echo "::error title=Infrastructure fetch failure::$infrastructure"
+      if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+        printf 'Infrastructure fetch failure(s):\n\n%s\n' "$infrastructure" >> "$GITHUB_STEP_SUMMARY"
+      fi
+      exit 1
+    fi
     jq -e --arg event "${CI_EVENT:?}" --arg draft "${CI_DRAFT:-false}" --arg lower "${CI_LOWER_LAYER:-false}" '
       .changes.result == "success" and
       (length > 1) and

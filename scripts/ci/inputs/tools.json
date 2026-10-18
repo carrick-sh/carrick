@@ -1,0 +1,65 @@
+{
+  "just": {
+    "version": "1.58.0",
+    "platforms": {
+      "x86_64_linux_musl": {
+        "url": "https://github.com/casey/just/releases/download/1.58.0/just-1.58.0-x86_64-unknown-linux-musl.tar.gz",
+        "sha256": "4a5cc2f53e6f0f8c59092a6cc38291eb729d46a7dd95d3ae582008881b84931d"
+      },
+      "aarch64_linux_musl": {
+        "url": "https://github.com/casey/just/releases/download/1.58.0/just-1.58.0-aarch64-unknown-linux-musl.tar.gz",
+        "sha256": "748237128c4c40cbdabc65e841d05ceba13cc23a91eaba395495894c1d9764df"
+      },
+      "x86_64_macos": {
+        "url": "https://github.com/casey/just/releases/download/1.58.0/just-1.58.0-x86_64-apple-darwin.tar.gz",
+        "sha256": "9a09cfef66aaa79da58203970103a0684307716caaabd3e9844cacc4dc0f4023"
+      },
+      "aarch64_macos": {
+        "url": "https://github.com/casey/just/releases/download/1.58.0/just-1.58.0-aarch64-apple-darwin.tar.gz",
+        "sha256": "50ae3e996c974a0bf32ea7d10f495070df33f1b43e0616b2769e3d4821ed8f48"
+      }
+    }
+  },
+  "sccache": {
+    "version": "0.18.0",
+    "platforms": {
+      "x86_64_linux_musl": {
+        "url": "https://github.com/mozilla/sccache/releases/download/v0.18.0/sccache-v0.18.0-x86_64-unknown-linux-musl.tar.gz",
+        "sha256": "45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89"
+      },
+      "aarch64_linux_musl": {
+        "url": "https://github.com/mozilla/sccache/releases/download/v0.18.0/sccache-v0.18.0-aarch64-unknown-linux-musl.tar.gz",
+        "sha256": "2b3284d5da3b46a47dc4229e75bb7b88ac4aa99c8d754fb7d2f84997e5a4354a"
+      },
+      "x86_64_macos": {
+        "url": "https://github.com/mozilla/sccache/releases/download/v0.18.0/sccache-v0.18.0-x86_64-apple-darwin.tar.gz",
+        "sha256": "1dade83cc49eeb42337565eccd534b05982820a8e44b851bd7937467a18c7aef"
+      },
+      "aarch64_macos": {
+        "url": "https://github.com/mozilla/sccache/releases/download/v0.18.0/sccache-v0.18.0-aarch64-apple-darwin.tar.gz",
+        "sha256": "308184519b646f5125289e8515b36f6ca65a13a041923994aebe702348674e8e"
+      }
+    }
+  },
+  "cargo-deny": {
+    "version": "0.20.2",
+    "platforms": {
+      "x86_64_linux_musl": {
+        "url": "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz",
+        "sha256": "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
+      },
+      "aarch64_linux_musl": {
+        "url": "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-aarch64-unknown-linux-musl.tar.gz",
+        "sha256": "995c82be0defc7a025cae49a2aa2644ce8245c9a3318fc4103907c6a285e8c7d"
+      },
+      "x86_64_macos": {
+        "url": "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-apple-darwin.tar.gz",
+        "sha256": "248da7f581724e470071990c088ffc55c811981715f4cbdb258621fb79f8b7a6"
+      },
+      "aarch64_macos": {
+        "url": "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-aarch64-apple-darwin.tar.gz",
+        "sha256": "fe67d82a10d8597a3549364cb733a3f9cc1bfff9031b7ae46384a9f2a72090c3"
+      }
+    }
+  }
+}

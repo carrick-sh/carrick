@@ -1,0 +1,20 @@
+name: CI fetch status
+description: Expose infrastructure status even after a failed or timed-out fetch
+outputs:
+  failure:
+    description: Infrastructure input that failed, empty on success
+    value: ${{ steps.report.outputs.failure }}
+runs:
+  using: composite
+  steps:
+    - id: report
+      shell: bash
+      run: |
+        if [ -f "$RUNNER_TEMP/ci-fetch-status" ]; then
+          cat "$RUNNER_TEMP/ci-fetch-status" >> "$GITHUB_OUTPUT"
+          failure=$(sed -n 's/^failure=//p' "$RUNNER_TEMP/ci-fetch-status")
+          if [ -n "$failure" ]; then
+            echo "::error title=Infrastructure fetch failure::$failure"
+            echo "Infrastructure fetch failure: $failure" >> "$GITHUB_STEP_SUMMARY"
+          fi
+        fi
