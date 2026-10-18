@@ -14,7 +14,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const WORKFLOW: &str = ".github/workflows/signed-gate.yml";
-const BOT: &str = "carrick-workers[bot]";
+// Only the owner may request a signed gate. The carrick-workers App is held
+// by agents and worker VMs; admitting it would let agent-written code run on a
+// gate runner at the agent's own request (#654).
+const OWNER: &str = "tjfontaine";
 const STEPS: &[&str] = &[
     "fixtures",
     "build",
@@ -123,7 +126,7 @@ fn post(endpoint: &str, body: Value) -> Result<(), ReceiptError> {
 }
 
 pub fn allowed(actor: &str) -> bool {
-    actor == "tjfontaine" || actor == BOT
+    actor == OWNER
 }
 fn sha(value: &str) -> Result<String, ReceiptError> {
     if value.len() != 40
@@ -155,7 +158,7 @@ fn prepare(event_path: &Path, output: &Path) -> Result<(), ReceiptError> {
     let triggering = std::env::var("GITHUB_TRIGGERING_ACTOR").unwrap_or_else(|_| actor.clone());
     if !allowed(&actor) || !allowed(&triggering) || event["repository"]["full_name"] != REPOSITORY {
         return Err(fail(
-            "only tjfontaine or carrick-workers[bot] may start or rerun signed gates",
+            "only the owner (tjfontaine) may start or rerun signed gates",
         ));
     }
     let event_name = std::env::var("GITHUB_EVENT_NAME").map_err(|e| fail(e.to_string()))?;
