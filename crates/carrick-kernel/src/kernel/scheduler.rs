@@ -834,7 +834,7 @@ impl Drop for DrainObligation {
     fn drop(&mut self) {
         if let Some(queue) = self.queue.upgrade() {
             match self.phase {
-                DrainPhase::Authority => queue.release_authority(),
+                DrainPhase::Authority => queue.retire_authority(),
                 DrainPhase::Queued => queue.release_queued(),
                 DrainPhase::Claimed => queue.finish_claim(),
             }
@@ -1056,15 +1056,7 @@ impl DrainWork {
     }
 
     fn release(&self) {
-        if self
-            .0
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-                count.checked_sub(1)
-            })
-            .is_err()
-        {
-            carrick_fatal!("kernel::run_queue", "drain work count underflow");
-        }
+        RunQueueInner::release_authority(&self.0, "drain work count underflow");
     }
 
     fn is_empty(&self) -> bool {
@@ -2048,25 +2040,29 @@ impl RunQueueInner {
         Some(self.finish_removal(&mut local, victim, row))
     }
 
-    fn finish_claim(&self) {
-        if self.claimed.fetch_sub(1, Ordering::SeqCst) == 0 {
-            carrick_fatal!(
-                "kernel::run_queue",
-                "claimed count underflow in finish_claim"
-            );
+    fn release_authority(count: &AtomicUsize, underflow: &'static str) {
+        if count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_sub(1)
+            })
+            .is_err()
+        {
+            carrick_fatal!("kernel::run_queue", "{underflow}");
         }
+    }
+
+    fn finish_claim(&self) {
+        Self::release_authority(&self.claimed, "claimed count underflow in finish_claim");
         self.claim_boundaries.fetch_add(1, Ordering::SeqCst);
         self.drain_work.release();
         self.settle_close_if_closing();
     }
 
-    fn release_authority(&self) {
-        if self.active_authorities.fetch_sub(1, Ordering::SeqCst) == 0 {
-            carrick_fatal!(
-                "kernel::run_queue",
-                "active authorities count underflow in release_authority"
-            );
-        }
+    fn retire_authority(&self) {
+        Self::release_authority(
+            &self.active_authorities,
+            "active authorities count underflow in release_authority",
+        );
         self.drain_work.release();
         #[cfg(test)]
         tests::after_authority_release();
