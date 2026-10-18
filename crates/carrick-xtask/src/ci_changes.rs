@@ -601,7 +601,7 @@ pub fn evaluate_changes(
     let Some(paths) = changed_paths else {
         return CiChangesOutputs {
             heavy: true,
-            macos: false,
+            macos: true,
             workflows: true,
             hardware: true,
             lower_layer: false,
@@ -611,7 +611,7 @@ pub fn evaluate_changes(
     if paths.is_empty() {
         return CiChangesOutputs {
             heavy: true,
-            macos: false,
+            macos: true,
             workflows: true,
             hardware: true,
             lower_layer: false,
@@ -635,9 +635,12 @@ pub fn evaluate_changes(
     }
 
     let _ = pr_draft;
+    // Pull requests run the full macOS suite whenever they run heavy jobs; the
+    // same-repo ones land on the self-hosted carrick-macos-ci runners (#650).
+    // Merge groups keep only macos-build and macos-clippy as a skew check.
     CiChangesOutputs {
         heavy,
-        macos: false,
+        macos: heavy,
         workflows,
         hardware: heavy,
         lower_layer: has_child_layer,
@@ -840,7 +843,9 @@ pub fn run<W: Write>(
         &referenced_docs,
     );
     if lookup_failed {
+        // Fail closed: a heavy PR also runs the macOS suite (#650).
         outputs.heavy = true;
+        outputs.macos = true;
         outputs.hardware = true;
         outputs.lower_layer = false;
     }
