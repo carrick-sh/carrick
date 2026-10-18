@@ -307,7 +307,21 @@ impl ExtentTable {
 }
 
 /// Trait representing the guest-physical memory and extent inventory seen by [`SoftWalker`].
-pub trait SoftMmuMemory {
+///
+/// # Safety
+///
+/// Implementors must uphold [`LinearPlacement::new`]'s host-memory contract for
+/// every host range admitted by placement bounds and extent authentication;
+/// extent metadata may describe ranges that placement rejects. Admitted
+/// page-table words must support aligned `AtomicU64` accesses. Backing storage
+/// must remain initialized, readable, writable and at a stable address while
+/// borrowed for walks and native/JIT accesses, including callbacks. Consumers
+/// of cached host addresses must retain the originating memory for every access
+/// and discard stale translations before using a different placement. Shared
+/// access must not introduce conflicting Rust references or data races; in
+/// particular, page-table atomics must not race with non-atomic guest accesses.
+/// A borrowed placement alone does not keep its backing alive.
+pub unsafe trait SoftMmuMemory {
     fn placement(&self) -> &LinearPlacement;
     fn extents(&self) -> &ExtentTable;
     fn extents_mut(&mut self) -> &mut ExtentTable;
@@ -356,6 +370,9 @@ impl<'a, M: SoftMmuMemory + ?Sized> AuthenticatedDescriptorWords<'a, M> {
             .host(table_frame)
             .map_err(|_| DescriptorRefusal::MissingTable)?;
         let word_addr = host_page.page_base() + ((pa & PAGE_OFFSET_MASK_4K) as usize);
+        // SAFETY: SoftMmuMemory guarantees live, initialized backing and atomic
+        // access compatibility. Authentication and placement bounds cover this
+        // table page, and the checked 8-byte offset keeps the word aligned and in-page.
         Ok(unsafe { &*(word_addr as *const AtomicU64) })
     }
 }

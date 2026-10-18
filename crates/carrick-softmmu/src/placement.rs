@@ -200,7 +200,27 @@ pub struct LinearPlacement {
 }
 
 impl LinearPlacement {
-    pub fn new(
+    /// Construct a placement over caller-managed host memory.
+    ///
+    /// Safe code cannot supply an arbitrary host address:
+    ///
+    /// ```compile_fail,E0133
+    /// use carrick_softmmu::{LinearPlacement, MmioHoles};
+    /// let _ = LinearPlacement::new(0x1000, 4096, MmioHoles::empty());
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// If construction succeeds, `base_host_addr` must identify a 4096-byte-aligned
+    /// host allocation covering `span_bytes`. Every byte outside `holes` must be
+    /// initialized and valid for reads and writes, including atomic `AtomicU64`
+    /// accesses to aligned page-table words. The backing must stay at the same
+    /// address and outlive every access through this placement, its copies, and
+    /// cached translations derived from it. Copies and cached addresses do not own
+    /// the backing or extend its lifetime. The caller must prevent conflicting
+    /// Rust references and data races (including concurrent atomic and non-atomic accesses).
+    /// Alignment, size and overflow checks alone do not establish memory validity.
+    pub unsafe fn new(
         base_host_addr: usize,
         span_bytes: u64,
         holes: MmioHoles,
@@ -225,11 +245,23 @@ impl LinearPlacement {
             holes,
         })
     }
-    pub fn with_x86_defaults(
+    /// Construct a placement with the default x86 MMIO holes.
+    ///
+    /// ```compile_fail,E0133
+    /// use carrick_softmmu::LinearPlacement;
+    /// let _ = LinearPlacement::with_x86_defaults(0x1000, 4096);
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// The validity, alignment, lifetime and aliasing requirements of [`Self::new`]
+    /// apply, with [`MmioHoles::x86_default`] excluded from the backing accesses.
+    pub unsafe fn with_x86_defaults(
         base_host_addr: usize,
         span_bytes: u64,
     ) -> Result<Self, PlacementError> {
-        Self::new(base_host_addr, span_bytes, MmioHoles::x86_default())
+        // SAFETY: the caller guarantees `new`'s backing contract for these default holes.
+        unsafe { Self::new(base_host_addr, span_bytes, MmioHoles::x86_default()) }
     }
     pub const fn base_host_addr(&self) -> usize {
         self.base_host_addr

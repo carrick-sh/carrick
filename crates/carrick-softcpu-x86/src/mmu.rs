@@ -2,6 +2,29 @@
 //!
 //! `carrick-softcpu-x86` consumes [`carrick_softmmu::SoftMmuMemory`], [`carrick_softmmu::SoftWalker`],
 //! and [`carrick_softmmu::SoftTlb`] directly (one memory trait, one TLB, no test double in the lib).
+//!
+//! Host memory requires an explicit unsafe commitment, including through these re-exports.
+//! These witnesses run in the softcpu CI doctest gate.
+//!
+//! ```compile_fail,E0133
+//! use carrick_softcpu_x86::{LinearPlacement, MmioHoles};
+//! let _ = LinearPlacement::new(0x1000, 4096, MmioHoles::empty());
+//! ```
+//!
+//! ```compile_fail,E0133
+//! use carrick_softcpu_x86::LinearPlacement;
+//! let _ = LinearPlacement::with_x86_defaults(0x1000, 4096);
+//! ```
+//!
+//! ```compile_fail,E0200
+//! use carrick_softcpu_x86::{ExtentTable, LinearPlacement, SoftMmuMemory};
+//! struct ArbitraryMemory;
+//! impl SoftMmuMemory for ArbitraryMemory {
+//!     fn placement(&self) -> &LinearPlacement { unimplemented!() }
+//!     fn extents(&self) -> &ExtentTable { unimplemented!() }
+//!     fn extents_mut(&mut self) -> &mut ExtentTable { unimplemented!() }
+//! }
+//! ```
 
 pub use carrick_softmmu::{
     Access as SoftAccessKind, Access, AuthenticatedDescriptorWords, AuthenticatedGpa, Cpl,
