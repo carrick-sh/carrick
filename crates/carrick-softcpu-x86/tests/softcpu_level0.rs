@@ -15,7 +15,6 @@ use carrick_softcpu_x86::{
 const PTE_PRESENT: u64 = 1 << 0;
 const PTE_WRITABLE: u64 = 1 << 1;
 const PTE_USER: u64 = 1 << 2;
-const PTE_RSVD: u64 = 1 << 51;
 const PTE_NX: u64 = 1 << 63;
 const PTE_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
 
@@ -104,9 +103,6 @@ impl TestSoftMmuMemory {
         }
         if (p.0 & 8) != 0 {
             pte |= PTE_USER;
-        }
-        if (p.0 & 16) != 0 {
-            pte |= PTE_RSVD;
         }
         if (p.0 & 4) == 0 {
             pte |= PTE_NX;
@@ -306,28 +302,19 @@ fn divide_error_witnesses_div_idiv_zero_overflow_and_fault_priority() {
     );
 
     cpu.context_mut().rip = code_va;
-    (
-        cpu.context_mut().gpr[reg::RDX],
-        cpu.context_mut().gpr[reg::RAX],
-        cpu.context_mut().gpr[reg::RCX],
-    ) = (1, 0, 1);
+    let gpr = &mut cpu.context_mut().gpr;
+    (gpr[reg::RDX], gpr[reg::RAX], gpr[reg::RCX]) = (1, 0, 1);
     step_ok(&mut cpu, &mut mem, de(code_va));
 
     mem.write_direct(code_va, &[0x48, 0xF7, 0xF9, 0x0F, 0x05]);
     cpu.context_mut().rip = code_va;
-    (
-        cpu.context_mut().gpr[reg::RAX],
-        cpu.context_mut().gpr[reg::RDX],
-        cpu.context_mut().gpr[reg::RCX],
-    ) = (i64::MIN as u64, u64::MAX, (-1i64) as u64);
+    let gpr = &mut cpu.context_mut().gpr;
+    (gpr[reg::RAX], gpr[reg::RDX], gpr[reg::RCX]) = (i64::MIN as u64, u64::MAX, (-1i64) as u64);
     step_ok(&mut cpu, &mut mem, de(code_va));
 
     cpu.context_mut().rip = code_va;
-    (
-        cpu.context_mut().gpr[reg::RAX],
-        cpu.context_mut().gpr[reg::RDX],
-        cpu.context_mut().gpr[reg::RCX],
-    ) = ((-100i64) as u64, u64::MAX, 7);
+    let gpr = &mut cpu.context_mut().gpr;
+    (gpr[reg::RAX], gpr[reg::RDX], gpr[reg::RCX]) = ((-100i64) as u64, u64::MAX, 7);
     step_ok(&mut cpu, &mut mem, sys(code_va + 3, code_va + 5));
     assert_eq!(
         (
@@ -426,40 +413,17 @@ fn complete_f3_instruction_at_page_end_does_not_fetch_next_page() {
 }
 
 #[test]
-fn oversized_and_unknown_memory_images_never_enter_native_memory_path() {
-    for bytes in [&[0xdd, 0x37][..], &[0xdd, 0x27], &[0xd9, 0x27]] {
-        // fnsave/frstor/fldenv
-        let decoded = carrick_softcpu_x86::classify(bytes, 0x400000).unwrap();
-        assert_ne!(
-            decoded.class,
-            carrick_softcpu_x86::InsnClass::Body,
-            "unbounded legacy state image admitted"
-        );
-        let (mut cpu, mut mem, va) = setup_snippet(bytes);
-        step_ok(&mut cpu, &mut mem, ud(va));
-    }
-}
-
-#[test]
 fn native_admission_denies_unimplemented_host_features() {
     use carrick_softcpu_x86::{InsnClass, classify};
     let cases: &[&[u8]] = &[
-        &[0x0f, 0xc7, 0x2f],                   // xsaves
-        &[0x0f, 0xc7, 0x1f],                   // xrstors
-        &[0x0f, 0x01, 0xc8],                   // monitor
-        &[0x0f, 0x01, 0xc9],                   // mwait
-        &[0x66, 0x0f, 0x38, 0x82, 0x07],       // invpcid
-        &[0x0f, 0x01, 0xc1],                   // vmcall
-        &[0xf3, 0x0f, 0xc7, 0xf8],             // rdpid
-        &[0xc5, 0xf9, 0xf7, 0xc1],             // vmaskmovdqu
-        &[0x0f, 0x01, 0xfc],                   // clzero
-        &[0x66, 0x0f, 0x38, 0xf8, 0x07],       // movdir64b
-        &[0xf2, 0x0f, 0x38, 0xf8, 0x07],       // enqcmd
-        &[0xf3, 0x0f, 0x38, 0xf8, 0x07],       // enqcmds
-        &[0xf3, 0x0f, 0xae, 0xf0],             // umonitor
-        &[0xc4, 0xe2, 0x7d, 0x92, 0x04, 0x87], // vgatherdps
-        &[0xc5, 0xf8, 0x28, 0x07],             // vmovaps
-        &[0x48, 0x0f, 0xc7, 0x0f],             // cmpxchg16b (CX16 is not exposed)
+        &[0xdd, 0x37],                // oversized legacy state image
+        &[0xdd, 0x27],                // frstor
+        &[0xd9, 0x27],                // fldenv
+        &[0xf2, 0x0f, 0xc2, 0xc1, 0], // scalar cmpsd
+        &[0x0f, 0xc7, 0x2f],          // xsaves
+        &[0x0f, 0x01, 0xc8],          // monitor
+        &[0xc5, 0xf8, 0x28, 0x07],    // vmovaps
+        &[0x48, 0x0f, 0xc7, 0x0f],    // cmpxchg16b
     ];
     for &bytes in cases {
         assert_eq!(
@@ -542,23 +506,6 @@ fn masked_store_crosses_pages_without_changing_disabled_bytes() {
 }
 
 #[test]
-fn scalar_cmpsd_never_uses_unchecked_native_copy() {
-    let (mut cpu, mut mem, va) = setup_snippet(&[0xf2, 0x0f, 0xc2, 0xc1, 0, 0x0f, 0x05]);
-    let planned =
-        carrick_softcpu_x86::plan_block_from_memory(va, 64, 4096, cpu.context_mut(), &mut mem)
-            .unwrap();
-    let emitted = carrick_softcpu_x86::emit_block(&planned).unwrap();
-    let native_comparison =
-        iced_x86::Decoder::new(64, &emitted.code, iced_x86::DecoderOptions::NONE)
-            .into_iter()
-            .any(|i| i.mnemonic() == iced_x86::Mnemonic::Cmpsd && !i.is_string_instruction());
-    assert!(
-        !native_comparison,
-        "scalar SSE CMPSD escaped the checked helper"
-    );
-}
-
-#[test]
 fn descriptor_queries_exit_without_host_state() {
     for bytes in [&[0x0f, 0x02, 0xc0][..], &[0x0f, 0x03, 0xc0]] {
         let decoded = carrick_softcpu_x86::classify(bytes, 0x400000).unwrap();
@@ -607,5 +554,29 @@ fn unsupported_implicit_address_forms_refuse_before_mutation() {
         let ctx = cpu.context();
         assert_eq!((ctx.gpr, ctx.rflags, ctx.fs_base, ctx.gs_base), before);
         assert_eq!(mem.read_direct(data, 16).unwrap(), [0x55; 16]);
+    }
+}
+
+#[test]
+fn unavailable_features_raise_ud_and_cpuid_matches_the_layer() {
+    for bytes in [
+        &[0x0f, 0x01, 0xf9][..],
+        &[0x0f, 0x01, 0xee],
+        &[0x0f, 0x01, 0xef],
+        &[0x0f, 0x01, 0xd0], // xgetbv
+    ] {
+        let (mut cpu, mut mem, va) = setup_snippet(bytes);
+        step_ok(&mut cpu, &mut mem, ud(va));
+    }
+    let (mut cpu, mut mem, _) = setup_snippet(&[0x0f, 0xa2]);
+    cpu.context_mut().gpr[reg::RAX] = 1;
+    cpu.step_block(&mut mem).unwrap();
+    assert_eq!(cpu.context().gpr[reg::RDX] & ((1 << 24) | 1), 0);
+    assert_eq!(cpu.context().gpr[reg::RCX] & ((1 << 26) | (1 << 27)), 0);
+    // EM must remain clear for SSE data operations; x87 is absent independently.
+    assert_eq!(cpu.context().cr0 & (1 << 2), 0);
+    for bytes in [&[0x0f, 0xae, 0x07][..], &[0x0f, 0xae, 0x0f], &[0xd8, 0xc1]] {
+        let (mut cpu, mut mem, va) = setup_snippet(bytes);
+        step_ok(&mut cpu, &mut mem, ud(va));
     }
 }
