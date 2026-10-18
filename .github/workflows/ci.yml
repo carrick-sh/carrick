@@ -417,7 +417,7 @@ jobs:
 
   macos-unit-a:
     needs: changes
-    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true' && github.event_name != 'merge_group'
     runs-on: ${{ fromJSON(needs.changes.outputs.macos_runner) }}
     timeout-minutes: 60
     steps:
@@ -453,7 +453,7 @@ jobs:
 
   macos-unit-b:
     needs: changes
-    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true' && github.event_name != 'merge_group'
     runs-on: ${{ fromJSON(needs.changes.outputs.macos_runner) }}
     timeout-minutes: 60
     steps:
@@ -489,7 +489,7 @@ jobs:
 
   macos-integration:
     needs: changes
-    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true' && github.event_name != 'merge_group'
     runs-on: ${{ fromJSON(needs.changes.outputs.macos_runner) }}
     timeout-minutes: 60
     steps:

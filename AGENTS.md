@@ -585,10 +585,11 @@ Chat, worker mailboxes, scratch notes and agent memory are not.
   takes one HVF gate. Ejecting a layer ejects everything above it, so
   independent work stays in separate PRs. Stacks have no auto-merge.
   Workflow: [`.agents/skills/carrick-stacked-prs`](.agents/skills/carrick-stacked-prs/SKILL.md).
-- **Lanes:** hosted Linux/macOS jobs in `ci.yml` (same-repo pull_request
-  macOS jobs run on the self-hosted `carrick-macos-ci` runner, a non-admin
-  `ci` user on carrick-m4; forks, merge groups and cache-saving push/schedule
-  stay on hosted `macos-15`, #650); `kernel-runtime.yml` adds
+- **Lanes:** hosted Linux/macOS jobs in `ci.yml`. Heavy pull requests run the
+  full macOS suite; same-repo PRs run it on the self-hosted `carrick-macos-ci`
+  runners (a non-admin `ci` user on carrick-m4), forks on hosted `macos-15`.
+  Merge groups run only `macos-build` and `macos-clippy` as a skew check; push
+  to main reruns the full suite on hosted macOS (#650). `kernel-runtime.yml` adds
   the self-hosted HVF lane (cloudmac, merge queue only) and the KVM lane
   (self-hosted JIT clones on the Contabo host, `docs/ci/contabo-kvm.md`;
   GCP nested-KVM VMs as fallback, `docs/ci/gcp-kvm.md`). The

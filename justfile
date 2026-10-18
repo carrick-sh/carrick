@@ -1300,8 +1300,9 @@ ci-results:
       (. as $root |
        (($root.changes.outputs.lower_layer // $lower) == "true") as $is_lower |
        if $event == "pull_request" then
-         ($root.changes.outputs.macos // "true") == "false" and
-         (del(.changes) | with_entries(select(.key | startswith("macos-"))) | all(.[]; .result == "skipped")) and
+         (del(.changes) | with_entries(select(.key | startswith("macos-")))
+           | if ($root.changes.outputs.heavy // "true") == "true" and ($root.changes.outputs.macos // "true") == "true" and $draft != "true" and ($is_lower | not) then all(.[]; .result == "success")
+             else all(.[]; .result == "skipped") end) and
          (del(.changes).lint
            | if ($root.changes.outputs.heavy // "true") == "true" then .result == "success"
              else .result == "skipped" end) and
@@ -1314,7 +1315,12 @@ ci-results:
            | if ($root.changes.outputs.workflows // "false") == "true" then .result == "success"
              else .result == "skipped" end)
        elif $root.changes.outputs.heavy == "true" and $root.changes.outputs.macos == "true" and ($is_lower | not) then
-         del(.changes) | all(.[]; .result == "success")
+         # Merge groups run macos-build and macos-clippy only (a skew check);
+         # the unit and integration suites ran on the PR and run again on push.
+         ["macos-unit-a", "macos-unit-b", "macos-integration"] as $pr_only |
+         (del(.changes) | with_entries(select(.key as $k | $pr_only | index($k) | not)) | all(.[]; .result == "success")) and
+         (del(.changes) | with_entries(select(.key as $k | $pr_only | index($k)))
+           | if $event == "merge_group" then all(.[]; .result == "skipped") else all(.[]; .result == "success") end)
        else false end)
     ' <<< "${CI_NEEDS:?}"
     child_pr=$(jq -r '.changes.outputs.child_pr // empty' <<< "${CI_NEEDS}" 2>/dev/null || true)

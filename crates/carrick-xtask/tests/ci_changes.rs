@@ -192,7 +192,7 @@ fn referenced_docs_and_census_files_in_workspace_flip_to_heavy() {
             pr_out,
             CiChangesOutputs {
                 heavy: true,
-                macos: false,
+                macos: true,
                 workflows: false,
                 hardware: true,
                 lower_layer: false,
@@ -329,7 +329,7 @@ fn scripts_justfile_and_xtask_classify_as_full_heavy_macos_and_hardware() {
             pr_out,
             CiChangesOutputs {
                 heavy: true,
-                macos: false,
+                macos: true,
                 workflows: false,
                 hardware: true,
                 lower_layer: false,
@@ -381,7 +381,7 @@ fn workflows_run_full_heavy_macos_hardware_plus_actionlint() {
     let ci_yml_repo = TempRepo::new(&[(".github/workflows/ci.yml", "name: CI\n")]);
     assert_eq!(
         ci_yml_repo.run_ci_changes("pull_request", Some("false"), None),
-        "heavy=true\nmacos=false\nworkflows=true\nhardware=true\nlower_layer=false\n"
+        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
     );
     assert_eq!(
         ci_yml_repo.run_ci_changes("merge_group", None, None),
@@ -394,7 +394,7 @@ fn workflows_run_full_heavy_macos_hardware_plus_actionlint() {
     )]);
     assert_eq!(
         kr_yml_repo.run_ci_changes("pull_request", Some("false"), None),
-        "heavy=true\nmacos=false\nworkflows=true\nhardware=true\nlower_layer=false\n"
+        "heavy=true\nmacos=true\nworkflows=true\nhardware=true\nlower_layer=false\n"
     );
     assert_eq!(
         kr_yml_repo.run_ci_changes("merge_group", None, None),
@@ -407,7 +407,7 @@ fn unknown_or_rust_product_path_fails_safe_and_runs_everything() {
     let rust_repo = TempRepo::new(&[("crates/carrick-kernel/src/lib.rs", "pub fn f() {}\n")]);
     assert_eq!(
         rust_repo.run_ci_changes("pull_request", Some("false"), None),
-        "heavy=true\nmacos=false\nworkflows=false\nhardware=true\nlower_layer=false\n"
+        "heavy=true\nmacos=true\nworkflows=false\nhardware=true\nlower_layer=false\n"
     );
     assert_eq!(
         rust_repo.run_ci_changes("merge_group", None, None),
@@ -476,7 +476,7 @@ fn draft_pr_runs_cheap_linux_checks_and_ci_results_accepts_skipped_heavy_jobs() 
 
     assert_eq!(
         repo.run_ci_changes("pull_request", Some("true"), None),
-        "heavy=true\nmacos=false\nworkflows=false\nhardware=true\nlower_layer=false\n"
+        "heavy=true\nmacos=true\nworkflows=false\nhardware=true\nlower_layer=false\n"
     );
 
     let draft_needs = r#"{
@@ -543,7 +543,7 @@ fn stack_layer_detection_and_ci_results_gating() {
         evaluate_changes("pull_request", false, true, Some(&code_paths), &refs),
         CiChangesOutputs {
             heavy: true,
-            macos: false,
+            macos: true,
             workflows: false,
             hardware: true,
             lower_layer: true,
@@ -554,7 +554,7 @@ fn stack_layer_detection_and_ci_results_gating() {
         evaluate_changes("pull_request", false, false, Some(&code_paths), &refs),
         CiChangesOutputs {
             heavy: true,
-            macos: false,
+            macos: true,
             workflows: false,
             hardware: true,
             lower_layer: false,
@@ -599,7 +599,7 @@ fn stack_layer_detection_and_ci_results_gating() {
     );
     assert_eq!(
         out_lower,
-        "heavy=true\nmacos=false\nworkflows=false\nhardware=true\nlower_layer=true\nchild_pr=610\n"
+        "heavy=true\nmacos=true\nworkflows=false\nhardware=true\nlower_layer=true\nchild_pr=610\n"
     );
     let summary_text = fs::read_to_string(&summary_file).expect("step summary written");
     assert!(
@@ -623,7 +623,7 @@ fn stack_layer_detection_and_ci_results_gating() {
     );
     assert_eq!(
         out_top,
-        "heavy=true\nmacos=false\nworkflows=false\nhardware=true\nlower_layer=false\n"
+        "heavy=true\nmacos=true\nworkflows=false\nhardware=true\nlower_layer=false\n"
     );
     assert!(
         !summary_file.exists(),
@@ -647,7 +647,7 @@ fn stack_layer_detection_and_ci_results_gating() {
     );
     assert_eq!(
         out_err,
-        "heavy=true\nmacos=false\nworkflows=false\nhardware=true\nlower_layer=false\n"
+        "heavy=true\nmacos=true\nworkflows=false\nhardware=true\nlower_layer=false\n"
     );
     let prose_repo = TempRepo::new(&[("docs/unreferenced-note.md", "prose only\n")]);
     let out_prose_err = prose_repo.run_ci_changes_with_env(
@@ -662,7 +662,7 @@ fn stack_layer_detection_and_ci_results_gating() {
     );
     assert_eq!(
         out_prose_err,
-        "heavy=true\nmacos=false\nworkflows=false\nhardware=true\nlower_layer=false\n",
+        "heavy=true\nmacos=true\nworkflows=false\nhardware=true\nlower_layer=false\n",
         "child lookup error on prose PR must fail closed to heavy=true, hardware=true, lower_layer=false"
     );
 
@@ -743,8 +743,8 @@ fn stack_layer_detection_and_ci_results_gating() {
 }
 
 #[test]
-fn merge_group_requires_full_suite_in_ci_results() {
-    let full_mg_needs = r#"{
+fn merge_group_runs_macos_skew_check_and_push_runs_full_macos_suite() {
+    let full_needs = r#"{
       "changes": {
         "result": "success",
         "outputs": { "heavy": "true", "macos": "true", "workflows": "true", "hardware": "true", "lower_layer": "false" }
@@ -766,37 +766,114 @@ fn merge_group_requires_full_suite_in_ci_results() {
       "cross-check-macos": { "result": "success" },
       "kernel-linux-native": { "result": "success" }
     }"#;
+    // Push to main (and schedule) runs the full macOS suite.
     assert!(
-        run_ci_results("merge_group", None, full_mg_needs),
-        "full merge_group must pass ci-results"
+        run_ci_results("push", None, full_needs),
+        "full push must pass ci-results"
     );
 
-    // Any skipped job on merge_group must be rejected by ci-results.
-    let skipped_macos_mg_needs = full_mg_needs.replace(
-        r#""macos-integration": { "result": "success" }"#,
-        r#""macos-integration": { "result": "skipped" }"#,
+    // Merge groups run macos-build and macos-clippy only: the unit and
+    // integration suites ran on the PR and run again on push (#650).
+    let mg_needs = full_needs
+        .replace(
+            r#""macos-unit-a": { "result": "success" }"#,
+            r#""macos-unit-a": { "result": "skipped" }"#,
+        )
+        .replace(
+            r#""macos-unit-b": { "result": "success" }"#,
+            r#""macos-unit-b": { "result": "skipped" }"#,
+        )
+        .replace(
+            r#""macos-integration": { "result": "success" }"#,
+            r#""macos-integration": { "result": "skipped" }"#,
+        );
+    assert!(
+        run_ci_results("merge_group", None, &mg_needs),
+        "merge_group with only the macOS skew check must pass ci-results"
     );
     assert!(
-        !run_ci_results("merge_group", None, &skipped_macos_mg_needs),
-        "skipped macos job on merge_group must fail ci-results"
+        !run_ci_results("push", None, &mg_needs),
+        "push with skipped macOS unit/integration suites must fail ci-results"
+    );
+    let skipped_skew_mg_needs = mg_needs.replace(
+        r#""macos-build": { "result": "success" }"#,
+        r#""macos-build": { "result": "skipped" }"#,
+    );
+    assert!(
+        !run_ci_results("merge_group", None, &skipped_skew_mg_needs),
+        "merge_group without macos-build must fail ci-results"
     );
 
-    let skipped_heavy_mg_needs = full_mg_needs.replace(
+    let skipped_heavy_mg_needs = full_needs.replace(
         r#""portable": { "result": "success" }"#,
         r#""portable": { "result": "skipped" }"#,
     );
     assert!(
-        !run_ci_results("merge_group", None, &skipped_heavy_mg_needs),
+        !run_ci_results(
+            "merge_group",
+            None,
+            &skipped_heavy_mg_needs
+                .replace(
+                    r#""macos-unit-a": { "result": "success" }"#,
+                    r#""macos-unit-a": { "result": "skipped" }"#
+                )
+                .replace(
+                    r#""macos-unit-b": { "result": "success" }"#,
+                    r#""macos-unit-b": { "result": "skipped" }"#
+                )
+                .replace(
+                    r#""macos-integration": { "result": "success" }"#,
+                    r#""macos-integration": { "result": "skipped" }"#
+                )
+        ),
         "skipped heavy job on merge_group must fail ci-results"
     );
 
-    let docs_mg_needs = full_mg_needs.replace(
+    let docs_mg_needs = full_needs.replace(
         r#""heavy": "true", "macos": "true""#,
         r#""heavy": "false", "macos": "false""#,
     );
     assert!(
         !run_ci_results("merge_group", None, &docs_mg_needs),
         "docs-only merge_group must fail ci-results"
+    );
+}
+
+#[test]
+fn heavy_same_repo_pr_requires_the_full_macos_suite() {
+    let pr_needs = r#"{
+      "changes": {
+        "result": "success",
+        "outputs": { "heavy": "true", "macos": "true", "workflows": "false", "hardware": "true", "lower_layer": "false" }
+      },
+      "actionlint": { "result": "skipped" },
+      "linked-issue": { "result": "success" },
+      "commit-trailers": { "result": "success" },
+      "lint": { "result": "success" },
+      "portable": { "result": "success" },
+      "linux-doc": { "result": "success" },
+      "macos-clippy": { "result": "success" },
+      "macos-build": { "result": "success" },
+      "macos-unit-a": { "result": "success" },
+      "macos-unit-b": { "result": "success" },
+      "macos-integration": { "result": "success" },
+      "cross-check-linux": { "result": "success" },
+      "cross-check-freebsd": { "result": "success" },
+      "cross-check-netbsd": { "result": "success" },
+      "cross-check-macos": { "result": "success" },
+      "kernel-linux-native": { "result": "success" }
+    }"#;
+    assert!(
+        run_ci_results("pull_request", Some("false"), pr_needs),
+        "heavy PR with the full macOS suite must pass ci-results"
+    );
+    let skipped_unit = pr_needs.replace(
+        r#""macos-unit-b": { "result": "success" }"#,
+        r#""macos-unit-b": { "result": "skipped" }"#,
+    );
+    assert!(
+        !run_ci_results("pull_request", Some("false"), &skipped_unit),
+        "heavy PR with a skipped macOS suite job must fail ci-results"
     );
 }
 
