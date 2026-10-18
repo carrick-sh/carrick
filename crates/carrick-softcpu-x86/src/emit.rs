@@ -165,10 +165,18 @@ fn emit_lea(
                 code.push(0xB8 + (reg_idx & 7));
                 code.extend_from_slice(&(target as u32).to_le_bytes());
             }
+            2 => {
+                code.push(0x66);
+                if reg_idx >= 8 {
+                    code.push(0x41);
+                }
+                code.push(0xB8 + (reg_idx & 7));
+                code.extend_from_slice(&(target as u16).to_le_bytes());
+            }
             _ => {
                 return Err(EmitError::EncodeFailed {
                     va,
-                    detail: "16-bit RIP-relative LEA unsupported".to_string(),
+                    detail: "invalid LEA destination".to_string(),
                 });
             }
         }
