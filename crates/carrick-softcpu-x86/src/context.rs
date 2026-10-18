@@ -1509,7 +1509,10 @@ mod tests {
     fn crossing_conditional_write_preserves_untouched_bounce_bytes() {
         use crate::mmu::{ExtentRecord, ExtentTable, LinearPlacement, MmioHoles, OwnerGeneration};
         struct Memory(LinearPlacement, ExtentTable);
-        impl SoftMmuMemory for Memory {
+        // SAFETY: this private fixture is used only while the aligned Pages box
+        // below is live. Calls are synchronous, with no concurrent backing access,
+        // and the context and translations are discarded before pages is dropped.
+        unsafe impl SoftMmuMemory for Memory {
             fn placement(&self) -> &LinearPlacement {
                 &self.0
             }
@@ -1528,8 +1531,12 @@ mod tests {
             pages.0[slot] = (frame << 12) | 7;
         }
         let host_base = pages.0.as_mut_ptr().cast::<u8>();
-        let placement =
-            LinearPlacement::new(host_base as usize, 6 * 4096, MmioHoles::empty()).unwrap();
+        // SAFETY: Pages is 4096-byte aligned and owns six initialized, writable
+        // pages. The box stays live and stable through all memory/context uses;
+        // no Rust reference into it overlaps the synchronous walker/native writes.
+        let placement = unsafe {
+            LinearPlacement::new(host_base as usize, 6 * 4096, MmioHoles::empty()).unwrap()
+        };
         let mut extents = ExtentTable::new();
         let generation = OwnerGeneration::new(1);
         assert!(extents.install(ExtentRecord::new(FrameGpa::new(0), 6 * 4096, generation)));
@@ -1593,7 +1600,9 @@ mod tests {
         }
     }
     struct NoMemory;
-    impl SoftMmuMemory for NoMemory {
+    // SAFETY: no placement or host pointer is ever returned; every memory method
+    // panics. Register-only execution cannot obtain a dangling translation.
+    unsafe impl SoftMmuMemory for NoMemory {
         fn placement(&self) -> &crate::mmu::LinearPlacement {
             panic!("register-only fixture touched memory")
         }

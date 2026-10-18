@@ -65,8 +65,12 @@ impl TestSoftMmuMemory {
         backing.resize_with(words, || AtomicU64::new(0));
         let aligned = (backing.as_ptr() as usize + (SOFT_TLB_OFFSET_MASK as usize))
             & !(SOFT_TLB_OFFSET_MASK as usize);
-        let placement = LinearPlacement::new(aligned, Self::POOL_BYTES, MmioHoles::empty())
-            .expect("valid placement");
+        // SAFETY: the initialized AtomicU64 pool includes a page of alignment
+        // padding and covers POOL_BYTES from aligned. _backing owns it without
+        // resizing for every walk and JIT access; tests run each CPU serially.
+        let placement =
+            unsafe { LinearPlacement::new(aligned, Self::POOL_BYTES, MmioHoles::empty()) }
+                .expect("valid placement");
         let mut extents = ExtentTable::new();
         let rec = ExtentRecord::new(FrameGpa::new(0), Self::POOL_BYTES, Self::GEN);
         assert!(extents.install(rec));
@@ -195,7 +199,10 @@ impl TestSoftMmuMemory {
     }
 }
 
-impl SoftMmuMemory for TestSoftMmuMemory {
+// SAFETY: _backing owns the aligned, initialized full placement for the memory
+// lifetime. It never moves or resizes; table accesses are atomic, native guest
+// accesses run synchronously, and no concurrent host references access the pool.
+unsafe impl SoftMmuMemory for TestSoftMmuMemory {
     fn placement(&self) -> &LinearPlacement {
         &self.placement
     }

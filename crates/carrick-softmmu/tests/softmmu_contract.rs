@@ -85,7 +85,7 @@ impl VecGuestMemory {
         placement_span_bytes: u64,
         holes: MmioHoles,
     ) -> Result<Self, PlacementError> {
-        let word_len = usize::try_from(backing_bytes).unwrap() / 8;
+        let word_len = usize::try_from(backing_bytes.max(placement_span_bytes)).unwrap() / 8;
         let total_words = word_len + (PAGE_SIZE_4K as usize) / 8;
         let mut backing = Vec::with_capacity(total_words);
         backing.resize_with(total_words, || AtomicU64::new(0));
@@ -93,7 +93,10 @@ impl VecGuestMemory {
         let mask = PAGE_OFFSET_MASK_4K as usize;
         let aligned_base = (raw_base + mask) & !mask;
         let aligned_word_offset = (aligned_base - raw_base) / 8;
-        let placement = LinearPlacement::new(aligned_base, placement_span_bytes, holes)?;
+        // SAFETY: the initialized AtomicU64 allocation covers the entire placement
+        // plus alignment padding. Its Arc keeps the stable allocation alive across
+        // clones and all walker/TLB uses; shared descriptor accesses are atomic.
+        let placement = unsafe { LinearPlacement::new(aligned_base, placement_span_bytes, holes)? };
         Ok(Self {
             backing: Arc::new(backing),
             aligned_word_offset,
@@ -162,7 +165,9 @@ impl VecGuestMemory {
     }
 }
 
-impl SoftMmuMemory for VecGuestMemory {
+// SAFETY: Owns the full aligned, initialized backing via Arc; it never resizes
+// or relocates, and clones share only AtomicU64 descriptor accesses.
+unsafe impl SoftMmuMemory for VecGuestMemory {
     fn placement(&self) -> &LinearPlacement {
         &self.placement
     }
@@ -320,28 +325,36 @@ fn linear_placement_enforces_alignment_bounds_and_mmio_holes() -> Result<(), Pla
         (Err(1), Err(2))
     );
 
-    let base_k = 0x7000_0000_0000usize;
-    let span = 0x1_0000_0000u64;
+    let backing = VecGuestMemory::with_holes(TEST_SPAN_BYTES, MmioHoles::empty())?;
+    let base_k = backing.placement().base_host_addr();
+    let span = TEST_SPAN_BYTES;
     let err_unaligned = PlacementError::UnalignedPlacement {
         base_host_addr: base_k + 1,
         span_bytes: span,
     };
     assert_eq!(
-        LinearPlacement::with_x86_defaults(base_k + 1, span),
+        // SAFETY: unaligned input is rejected before a placement is constructed.
+        unsafe { LinearPlacement::with_x86_defaults(base_k + 1, span) },
         Err(err_unaligned)
     );
     let err_zero = PlacementError::UnalignedPlacement {
         base_host_addr: base_k,
         span_bytes: 0,
     };
-    assert_eq!(LinearPlacement::with_x86_defaults(base_k, 0), Err(err_zero));
+    // SAFETY: a zero span is rejected before a placement is constructed.
+    assert_eq!(
+        unsafe { LinearPlacement::with_x86_defaults(base_k, 0) },
+        Err(err_zero)
+    );
     let err_hole = PlacementError::UnalignedHole {
         base_gpa: 0x1001,
         size_bytes: PAGE_SIZE_4K,
     };
     assert_eq!(MmioHole::new(0x1001, PAGE_SIZE_4K), Err(err_hole));
 
-    let placement = LinearPlacement::with_x86_defaults(base_k, span)?;
+    // SAFETY: backing owns this aligned, initialized full span for all uses of
+    // placement below; these checks only calculate addresses and do not write.
+    let placement = unsafe { LinearPlacement::with_x86_defaults(base_k, span)? };
     assert_eq!(
         (placement.base_host_addr(), placement.span_bytes()),
         (base_k, span)
@@ -732,7 +745,9 @@ struct CasFaultMemory {
     cas_attempts: AtomicU64,
 }
 
-impl SoftMmuMemory for CasFaultMemory {
+// SAFETY: Delegates placement and extents to the owned VecGuestMemory; the
+// fault hook modifies live descriptor words only through AtomicU64.
+unsafe impl SoftMmuMemory for CasFaultMemory {
     fn placement(&self) -> &LinearPlacement {
         self.inner.placement()
     }
@@ -775,7 +790,9 @@ struct ConcurrentImmaterialWriterMemory {
     lockstep_limit: u64,
 }
 
-impl SoftMmuMemory for ConcurrentImmaterialWriterMemory {
+// SAFETY: Retains the inner Arc-backed placement and extents; the peer writer
+// uses AtomicU64 operations on the same live descriptor backing.
+unsafe impl SoftMmuMemory for ConcurrentImmaterialWriterMemory {
     fn placement(&self) -> &LinearPlacement {
         self.inner.placement()
     }
@@ -996,7 +1013,9 @@ impl LiveDescriptorWords for DisagreeingRawPaMemory {
     fn invalidate_range(&self, _va: u64, _len: u64) {}
 }
 
-impl SoftMmuMemory for DisagreeingRawPaMemory {
+// SAFETY: Delegates placement and extents to the owned VecGuestMemory. The
+// separate raw-PA adapter never changes the backing used by SoftMmuMemory.
+unsafe impl SoftMmuMemory for DisagreeingRawPaMemory {
     fn placement(&self) -> &LinearPlacement {
         self.inner.placement()
     }
