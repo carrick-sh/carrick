@@ -8,6 +8,7 @@ const MAX_OUTPUT_BYTES: u64 = 20 * MAX_FILE_BYTES;
 const REFUSAL: &str = "redaction gate refused sensitive or unsafe output";
 pub(crate) struct Gate {
     secrets: Vec<String>,
+    base: Option<String>,
 }
 impl Gate {
     fn add(&mut self, value: &str) {
@@ -52,7 +53,10 @@ impl Gate {
     }
     /// Capture once before agent execution, never from agent-modified state.
     pub(crate) fn capture() -> Result<Self, ScalerError> {
-        let mut gate = Self { secrets: vec![] };
+        let mut gate = Self {
+            secrets: vec![],
+            base: None,
+        };
         for key in [
             "CODEX_AUTH_JSON",
             "AGY_OAUTH_TOKEN",
@@ -93,22 +97,28 @@ impl Gate {
     pub(crate) fn check(&self, bytes: &[u8]) -> Result<(), ScalerError> {
         let lower = bytes.to_ascii_lowercase();
         let sensitive = self.secrets.iter().any(|s| contains(bytes, s.as_bytes()))
-            || contains(bytes, b"eyJ")
-            || [
-                "ghs_",
-                "ghp_",
-                "github_pat_",
-                "refresh_token",
-                "authorization: bearer",
-                "pveapitoken=",
-            ]
-            .iter()
-            .any(|s| contains(&lower, s.as_bytes()));
+            || token_shape(bytes, b"eyJ", true)
+            || [b"ghs_".as_slice(), b"ghp_", b"github_pat_"]
+                .iter()
+                .any(|prefix| token_shape(bytes, prefix, false))
+            || ["refresh_token", "authorization: bearer", "pveapitoken="]
+                .iter()
+                .any(|s| contains(&lower, s.as_bytes()));
         if sensitive {
             Err(ScalerError::Guard(REFUSAL))
         } else {
             Ok(())
         }
+    }
+    pub(crate) fn bind_base(&mut self, base: &str) -> Result<(), ScalerError> {
+        if self.base.is_some() || base.len() != 40 || !base.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(ScalerError::Guard(REFUSAL));
+        }
+        self.base = Some(base.to_owned());
+        Ok(())
+    }
+    pub(crate) fn base(&self) -> Result<&str, ScalerError> {
+        self.base.as_deref().ok_or(ScalerError::Guard(REFUSAL))
     }
     pub(crate) fn absorb_current(&mut self) -> Result<(), ScalerError> {
         for value in Self::capture()
@@ -169,6 +179,22 @@ impl Gate {
 fn contains(bytes: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && bytes.windows(needle.len()).any(|s| s == needle)
 }
+fn token_shape(bytes: &[u8], prefix: &[u8], jwt: bool) -> bool {
+    bytes
+        .windows(prefix.len())
+        .enumerate()
+        .any(|(offset, window)| {
+            if window != prefix {
+                return false;
+            }
+            let suffix = &bytes[offset + prefix.len()..];
+            let length = suffix
+                .iter()
+                .take_while(|b| b.is_ascii_alphanumeric() || b"_-".contains(b))
+                .count();
+            length >= 8 && (!jwt || suffix.get(length) == Some(&b'.'))
+        })
+}
 /// Persist earlier-step secrets outside artifacts; the run captures them once.
 pub(crate) fn remember() -> Result<(), ScalerError> {
     let gate = Gate::capture()?;
@@ -190,6 +216,16 @@ pub(crate) fn redact(bytes: &[u8]) -> String {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn incomplete_prefixes_in_binary_objects_are_not_credentials()
+    -> Result<(), crate::ci_scaler::ScalerError> {
+        assert!(
+            super::Gate::capture()?
+                .check(b"\0eyJ\0ghs_\0ghp_\0github_pat_\0")
+                .is_ok()
+        );
+        Ok(())
+    }
     #[test]
     fn credential_shapes_are_removed_from_diagnostics() {
         for value in [

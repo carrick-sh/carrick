@@ -130,11 +130,12 @@ draft PR, transport exit/timeout and publication errors. A completed work
 contract does not hide transport failure. Uncommitted changes become a WIP
 commit with the tier's vendor noreply trailer, including on timeout/failure.
 Hooks remain enabled; checkpoint failure is reported, not bypassed. The agent
-runs in an owned process group; timeout cancellation kills the whole group.
+runs in an owned process group; timeout cancellation and normal completion
+kill any group members left behind before output validation begins.
 
 Every workflow publication passes one redaction gate: WIP staging/commit,
 push, commit history, staged and working files, binary patch/bundle, contract
-fields, PR bodies, comments, and every result artifact. Before the agent runs,
+fields (before JSON escaping), PR bodies, comments, and every result artifact. Before the agent runs,
 the driver captures credential values from the job, materialized provider files
 and previous credentialed steps; refreshed provider credentials are added after
 the run. Exact credential values and generic GitHub token, JWT and
@@ -142,7 +143,10 @@ the run. Exact credential values and generic GitHub token, JWT and
 a redacted failure and the unsafe artifacts are discarded. The gate rejects
 symlinks and paths outside the admitted repository shape, generated tracked
 paths, files/objects over 1 MiB, more than 256 commits or 4,096 new objects,
-and more than 20 MiB of source/recovery output. Unknown or unreadable outputs
+and more than 20 MiB of source objects or result artifacts. The fetched base
+SHA and expected push tip are captured before execution; mutable refs,
+replacement objects, grafts and a redirected Git worktree cannot change the
+validation view. Unknown or unreadable outputs
 fail closed. These checks can also refuse legitimate token examples.
 
 Actions uploads only a fresh snapshot created after validation, with its path

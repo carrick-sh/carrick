@@ -246,6 +246,16 @@ fn dispatch_refuses_credentials_in_contract_summary() {
 }
 #[cfg(target_os = "linux")]
 #[test]
+fn dispatch_refuses_json_escaped_credentials_before_pushing() {
+    foreground_cases(&["leak-escaped-summary"]);
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn dispatch_refuses_credentials_before_wip_staging() {
+    foreground_cases(&["leak-checkpoint"]);
+}
+#[cfg(target_os = "linux")]
+#[test]
 fn dispatch_refuses_credentials_in_result_artifacts() {
     foreground_cases(&["leak-artifact"]);
 }
@@ -371,6 +381,7 @@ case "$1 $2" in
 esac
 "#.to_owned()),
             ("python3", r#"#!/bin/sh
+test -z "${GITHUB_OUTPUT:-}${GITHUB_ENV:-}${GITHUB_PATH:-}${GITHUB_STEP_SUMMARY:-}" || exit 98
 if [ "$TEST_CASE" = agy ]; then
   test "$AGY_BIN" = "$TEST_ROOT/carrick-agent-42-1/bin/agy" || exit 96
 fi
@@ -381,6 +392,7 @@ while [ "$#" -gt 0 ]; do
 done
 printf 'worker change\n' > payload
 if [ "$TEST_CASE" = leak-file ]; then cat "$HOME/.codex/auth.json" > payload; fi
+if [ "$TEST_CASE" = leak-checkpoint ]; then cat "$HOME/.codex/auth.json" > payload; exit 7; fi
 if [ "$TEST_CASE" = leak-artifact ]; then cat "$HOME/.codex/auth.json" > "$TEST_ROOT/checkout/dispatch-result/evil.txt"; fi
 if [ "$TEST_CASE" = leak-oversize ]; then head -c 1048577 /dev/zero > payload; fi
 mkdir -p conformance-probes
@@ -410,6 +422,9 @@ printf '%s\n' '{"status":"SUCCESS","transport":{"exit_code":0,"timed_out":false}
 if [ "$TEST_CASE" = leak-summary ]; then
   printf '%s\n' '{"structured_output":{"status":"done","summary":"codex-fake-access-634","tests":[],"risks":[]}}' > "$result"
 fi
+if [ "$TEST_CASE" = leak-escaped-summary ]; then
+  printf '%s\n' '{"structured_output":{"status":"done","summary":"opaque-A\"B\nC","tests":[],"risks":[]}}' > "$result"
+fi
 "#.to_owned()),
             ("ssh", format!("#!/bin/sh\nexec '{}' host-lease broker --lock-path \"$TEST_ROOT/host.lock\"\n", xtask)),
         ];
@@ -434,10 +449,20 @@ fi
             "sender":{"login":"tjfontaine","type":"User"},"label":{"name":label},
             "issue":{"number":634,"user":{"login":"tjfontaine"},"title":"Fixture","body":brief}});
         std::fs::write(root.join("event.json"), event.to_string()).unwrap();
+        for name in ["step-outputs", "step-env", "step-path", "step-summary"] {
+            std::fs::write(root.join(name), "").unwrap();
+        }
         let state = root.join("carrick-agent-42-1");
         std::fs::create_dir_all(state.join("home")).unwrap();
         std::fs::create_dir(state.join("home/.codex")).unwrap();
         std::fs::write(state.join("home/.codex/auth.json"), r#"{"tokens":{"access_token":"codex-fake-access-634","refresh_token":"codex-fake-refresh-634"}}"#).unwrap();
+        if case == "leak-escaped-summary" {
+            std::fs::write(
+                state.join("home/.codex/auth.json"),
+                r#"{"tokens":{"access_token":"opaque-A\"B\nC"}}"#,
+            )
+            .unwrap();
+        }
         let output = Command::new("/usr/bin/timeout")
             .args(["30", xtask, "dispatch-worker", "run", "--event"])
             .arg(root.join("event.json"))
@@ -454,6 +479,10 @@ fi
             .env("RUSTUP_HOME", root.join("rustup"))
             .env("GH_TOKEN", "fixture-only")
             .env("GITHUB_TRIGGERING_ACTOR", "tjfontaine")
+            .env("GITHUB_OUTPUT", root.join("step-outputs"))
+            .env("GITHUB_ENV", root.join("step-env"))
+            .env("GITHUB_PATH", root.join("step-path"))
+            .env("GITHUB_STEP_SUMMARY", root.join("step-summary"))
             .env(
                 "CARRICK_AGENT_JOB_STARTED_AT",
                 (std::time::SystemTime::now()
@@ -500,6 +529,22 @@ fi
             &std::fs::read(checkout.join("dispatch-result/result.json")).unwrap(),
         )
         .unwrap();
+        let output_spec = std::fs::read_to_string(root.join("step-outputs")).unwrap();
+        let sealed =
+            std::path::PathBuf::from(output_spec.trim().strip_prefix("artifact_path=").unwrap());
+        assert_ne!(sealed, checkout.join("dispatch-result"));
+        assert!(
+            sealed
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("dispatch-validated-")
+        );
+        for entry in std::fs::read_dir(&sealed).unwrap() {
+            let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains("codex-fake-"));
+        }
         if case == "foreign-branch" {
             assert!(receipt["pr"].is_null());
             assert!(
@@ -509,6 +554,24 @@ fi
             continue;
         }
         if case.starts_with("leak-") {
+            assert!(
+                run_git(
+                    &remote,
+                    &[
+                        "for-each-ref",
+                        &format!("refs/heads/{branch}"),
+                        "--format=%(refname)"
+                    ]
+                )
+                .is_empty(),
+                "published before validating all outputs"
+            );
+            if case == "leak-checkpoint" {
+                assert!(
+                    run_git(&checkout, &["diff", "--cached", "--name-only"]).is_empty(),
+                    "staged credentials before validation"
+                );
+            }
             assert_eq!(receipt["success"], false);
             assert!(receipt["pr"].is_null());
             assert_eq!(receipt["contract"]["status"], "failed");
@@ -523,6 +586,7 @@ fi
                     "leaked through {}",
                     path.display()
                 );
+                assert!(!contents.contains("opaque-A"), "leaked escaped credential");
                 assert!(
                     !contents.contains("refresh_token"),
                     "leaked credential JSON"

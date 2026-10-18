@@ -148,22 +148,8 @@ fn branch_directives(brief: &str) -> Vec<&str> {
     let mut branches = Vec::new();
     for line in brief.lines() {
         let trimmed = line.trim();
-        if let Some(marker @ ('`' | '~')) = trimmed.chars().next() {
-            let count = trimmed.chars().take_while(|c| *c == marker).count();
-            if count >= 3 {
-                match fence {
-                    None => fence = Some((marker, count)),
-                    Some((open, length))
-                        if open == marker
-                            && count >= length
-                            && trimmed[count..].trim().is_empty() =>
-                    {
-                        fence = None
-                    }
-                    _ => {}
-                }
-                continue;
-            }
+        if advance_fence(trimmed, &mut fence) {
+            continue;
         }
         if fence.is_none() {
             if let Some(branch) = line.strip_prefix("Branch: ") {
@@ -172,6 +158,25 @@ fn branch_directives(brief: &str) -> Vec<&str> {
         }
     }
     branches
+}
+fn advance_fence(trimmed: &str, fence: &mut Option<(char, usize)>) -> bool {
+    let Some(marker @ ('`' | '~')) = trimmed.chars().next() else {
+        return false;
+    };
+    let count = trimmed.chars().take_while(|c| *c == marker).count();
+    if count < 3 {
+        return false;
+    }
+    match *fence {
+        None => *fence = Some((marker, count)),
+        Some((open, length))
+            if open == marker && count >= length && trimmed[count..].trim().is_empty() =>
+        {
+            *fence = None
+        }
+        _ => {}
+    }
+    true
 }
 
 fn open_prs(root: &Path, branch: &str) -> Result<Value, ScalerError> {
@@ -212,16 +217,14 @@ pub fn brief_section(body: &str) -> Result<String, ScalerError> {
     let mut found = false;
     let mut lines = Vec::new();
     // Markdown fences may contain headings; they do not delimit sections.
-    let mut fence: Option<char> = None;
+    let mut fence = None;
     for line in body.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            let marker = trimmed.chars().next();
-            if fence == marker {
-                fence = None;
-            } else if fence.is_none() {
-                fence = marker;
+        if advance_fence(trimmed, &mut fence) {
+            if in_brief {
+                lines.push(line);
             }
+            continue;
         }
         if fence.is_none() && trimmed == "## Brief" {
             if found {
@@ -269,11 +272,14 @@ fn command(root: &Path, program: &str, args: &[&str]) -> Result<String, ScalerEr
     if remote {
         limit = limit.min(crate::agent_runner::job_remaining(39)?);
     }
-    let output = crate::ci_scaler::execute(
-        Command::new(program).args(args).current_dir(root),
-        &[],
-        limit,
-    );
+    let mut invocation = if program == "git" {
+        git_invocation(root, args)
+    } else {
+        let mut invocation = Command::new(program);
+        invocation.args(args).current_dir(root);
+        invocation
+    };
+    let output = crate::ci_scaler::execute(&mut invocation, &[], limit);
     let bytes = match output {
         Err(error) if remote => {
             return Err(crate::agent_runner::check_token(
@@ -290,11 +296,24 @@ fn command(root: &Path, program: &str, args: &[&str]) -> Result<String, ScalerEr
 fn git(root: &Path, args: &[&str]) -> Result<String, ScalerError> {
     command(root, "git", args)
 }
+fn git_invocation(root: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(root)
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_GRAFT_FILE", "/dev/null");
+    command
+}
 fn gh(root: &Path, args: &[&str]) -> Result<String, ScalerError> {
     command(root, "gh", args)
 }
 
-fn prepare(root: &Path, dispatch: &Dispatch, worktree: &Path) -> Result<(), ScalerError> {
+struct Prepared {
+    base: String,
+    expected_tip: String,
+}
+fn prepare(root: &Path, dispatch: &Dispatch, worktree: &Path) -> Result<Prepared, ScalerError> {
     // Fix both git transport and gh to the App credential inherited from the
     // runner. actions/checkout deliberately leaves no installation token behind.
     gh(root, &["auth", "setup-git", "--hostname", "github.com"])?;
@@ -374,7 +393,16 @@ fn prepare(root: &Path, dispatch: &Dispatch, worktree: &Path) -> Result<(), Scal
     if existing {
         git(worktree, &["rebase", "refs/remotes/origin/main"])?;
     }
-    Ok(())
+    Ok(Prepared {
+        base: git(root, &["rev-parse", "refs/remotes/origin/main"])?
+            .trim()
+            .to_owned(),
+        expected_tip: if existing {
+            git(root, &["rev-parse", &start])?.trim().to_owned()
+        } else {
+            String::new()
+        },
+    })
 }
 
 fn schema() -> Value {
@@ -391,6 +419,17 @@ pub struct Contract {
     pub summary: String,
     pub tests: Vec<String>,
     pub risks: Vec<String>,
+}
+impl Contract {
+    fn check(&self, gate: &Gate) -> Result<(), ScalerError> {
+        for text in std::iter::once(&self.summary)
+            .chain(&self.tests)
+            .chain(&self.risks)
+        {
+            gate.check(text.as_bytes())?;
+        }
+        Ok(())
+    }
 }
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -421,10 +460,8 @@ fn wait_agent(command: &mut Command, limit: std::time::Duration) -> std::io::Res
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                if cancelled.is_some() {
-                    unsafe {
-                        libc::kill(-pgid, libc::SIGKILL);
-                    }
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
                 }
                 return Ok(if cancelled.is_some() {
                     124
@@ -568,6 +605,12 @@ fn gate_work(root: &Path, gate: &Gate) -> Result<(), ScalerError> {
 }
 fn gate_work_inner(root: &Path, gate: &Gate) -> Result<(), ScalerError> {
     let refusal = || ScalerError::Guard("redaction gate refused sensitive or unsafe output");
+    let base = gate.base()?;
+    let reported = git(root, &["rev-parse", "--show-toplevel"])?;
+    if Path::new(reported.trim()).canonicalize()? != root.canonicalize()? {
+        return Err(refusal());
+    }
+    git(root, &["merge-base", "--is-ancestor", base, "HEAD"])?;
     if git(root, &["ls-files", "--modified", "-z"])?
         .split('\0')
         .any(|p| !p.is_empty() && !admissible_file(p))
@@ -605,17 +648,30 @@ fn gate_work_inner(root: &Path, gate: &Gate) -> Result<(), ScalerError> {
                 return Err(refusal());
             }
             total += gate.file(&path)?;
+            if total > 20 * MAX_FILE_BYTES {
+                return Err(refusal());
+            }
         }
     }
-    let staged = git(root, &["diff", "--cached", "--name-only", "-z"])?;
-    for file in staged.split('\0').filter(|s| !s.is_empty()) {
-        if !admissible_file(file) {
-            return Err(refusal());
-        }
-        gate.check(file.as_bytes())?;
+    let staged = git(
+        root,
+        &[
+            "diff",
+            "--cached",
+            "--raw",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "-z",
+        ],
+    )?;
+    for file in gate_changes(&staged, gate)? {
         // Inspect staged blobs independently of the working file.
         if let Ok(id) = git(root, &["rev-parse", &format!(":{file}")]) {
             total += gate_object(root, gate, id.trim())?;
+            if total > 20 * MAX_FILE_BYTES {
+                return Err(refusal());
+            }
         }
     }
     let objects = git(
@@ -625,7 +681,7 @@ fn gate_work_inner(root: &Path, gate: &Gate) -> Result<(), ScalerError> {
             "--objects",
             "--no-object-names",
             "HEAD",
-            "^refs/remotes/origin/main",
+            &format!("^{base}"),
         ],
     )?;
     if objects.lines().count() > 4096 {
@@ -633,8 +689,11 @@ fn gate_work_inner(root: &Path, gate: &Gate) -> Result<(), ScalerError> {
     }
     for id in objects.lines() {
         total += gate_object(root, gate, id)?;
+        if total > 20 * MAX_FILE_BYTES {
+            return Err(refusal());
+        }
     }
-    let commits = git(root, &["rev-list", "HEAD", "^refs/remotes/origin/main"])?;
+    let commits = git(root, &["rev-list", "HEAD", &format!("^{base}")])?;
     if commits.lines().count() > 256 {
         return Err(refusal());
     }
@@ -646,22 +705,42 @@ fn gate_work_inner(root: &Path, gate: &Gate) -> Result<(), ScalerError> {
                 "--no-commit-id",
                 "--root",
                 "-r",
-                "--name-only",
+                "--raw",
+                "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+                "-m",
                 "-z",
                 commit,
             ],
         )?;
-        for path in paths.split('\0').filter(|s| !s.is_empty()) {
-            if !admissible_file(path) {
-                return Err(refusal());
-            }
-            gate.check(path.as_bytes())?;
-        }
+        gate_changes(&paths, gate)?;
     }
     if total > 20 * MAX_FILE_BYTES {
         return Err(refusal());
     }
     Ok(())
+}
+fn gate_changes<'a>(raw: &'a str, gate: &Gate) -> Result<Vec<&'a str>, ScalerError> {
+    let refusal = || ScalerError::Guard("redaction gate refused repository tree shape");
+    let mut parts = raw.split('\0');
+    let mut paths = Vec::new();
+    while let Some(header) = parts.next().filter(|s| !s.is_empty()) {
+        let mode = header
+            .strip_prefix(':')
+            .and_then(|s| s.split_whitespace().nth(1))
+            .ok_or_else(refusal)?;
+        if !matches!(mode, "100644" | "100755" | "000000") {
+            return Err(refusal());
+        }
+        let path = parts.next().ok_or_else(refusal)?;
+        if !admissible_file(path) {
+            return Err(refusal());
+        }
+        gate.check(path.as_bytes())?;
+        paths.push(path);
+    }
+    Ok(paths)
 }
 fn gate_object(root: &Path, gate: &Gate, id: &str) -> Result<u64, ScalerError> {
     let size: u64 = git(root, &["cat-file", "-s", id])?
@@ -674,9 +753,7 @@ fn gate_object(root: &Path, gate: &Gate, id: &str) -> Result<u64, ScalerError> {
         ));
     }
     let bytes = crate::ci_scaler::execute(
-        Command::new("git")
-            .args(["cat-file", "-p", id])
-            .current_dir(root),
+        &mut git_invocation(root, &["cat-file", "-p", id]),
         &[],
         std::time::Duration::from_secs(30),
     )?;
@@ -716,6 +793,7 @@ fn checkpoint(root: &Path, dispatch: &Dispatch, gate: &Gate) -> Result<bool, Sca
     if staged.is_empty() {
         return Ok(false);
     }
+    gate_work(root, gate)?;
     let message = format!(
         "chore(ci): checkpoint issue {} worker progress\n\nWhy: preserve unfinished work before this ephemeral clone is destroyed.\n\nWhat: record the worker's current changes for review and continuation.\n\nVerified: see the dispatch issue contract; this is a WIP checkpoint.\n\nCo-Authored-By: {}",
         dispatch.issue, dispatch.tier.coauthor
@@ -744,7 +822,7 @@ fn preserve_work(
             "HEAD",
             &dispatched_ref,
             "--not",
-            "refs/remotes/origin/main",
+            gate.base()?,
         ],
     )?;
     if commits.trim() != "0" {
@@ -758,14 +836,15 @@ fn preserve_work(
                     .ok_or(ScalerError::Guard("non-UTF8 bundle path"))?,
                 "HEAD",
                 &dispatched_ref,
-                "^refs/remotes/origin/main",
+                &format!("^{}", gate.base()?),
             ],
         )?;
     }
     let patch = crate::ci_scaler::execute(
-        Command::new("git")
-            .args(["diff", "--binary", "HEAD"])
-            .current_dir(root),
+        &mut git_invocation(
+            root,
+            &["diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD"],
+        ),
         &[],
         std::time::Duration::from_secs(120),
     )?;
@@ -780,37 +859,25 @@ fn publish(
     dispatch: &Dispatch,
     contract: &Contract,
     gate: &Gate,
+    prepared: &Prepared,
 ) -> Result<Option<String>, ScalerError> {
     gate_work(root, gate)?;
     gate.directory(result_dir)?;
-    gate.check(&serde_json::to_vec(contract)?)?;
+    contract.check(gate)?;
     gate.check(dispatch.title.as_bytes())?;
     gate.check(dispatch.branch.as_bytes())?;
     if git(root, &["branch", "--show-current"])?.trim() != dispatch.branch {
         return Err(ScalerError::Guard("refusing to publish another branch"));
     }
     let head = git(root, &["rev-parse", "HEAD"])?;
-    let base = git(root, &["rev-parse", "refs/remotes/origin/main"])?;
-    if head == base {
+    if head.trim() == prepared.base {
         return Ok(None);
     }
     // Explicit main rebases use force-with-lease with the exact fetched head;
     // a new branch must still be absent. Never overwrite a later worker push.
-    let expected = if dispatch.resume {
-        git(
-            root,
-            &[
-                "rev-parse",
-                &format!("refs/remotes/origin/{}", dispatch.branch),
-            ],
-        )?
-    } else {
-        String::new()
-    };
     let lease = format!(
         "--force-with-lease=refs/heads/{}:{}",
-        dispatch.branch,
-        expected.trim()
+        dispatch.branch, prepared.expected_tip
     );
     let refspec = format!("HEAD:refs/heads/{}", dispatch.branch);
     git(
@@ -941,6 +1008,7 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
     };
     let mut exit = 1;
     let mut errors = Vec::new();
+    let mut prepared = None;
     let outcome = (|| -> Result<(), ScalerError> {
         crate::agent_runner::check_token(&root, crate::agent_runner::TokenScope::Worker)?;
         if setup_status != "success/success" {
@@ -949,7 +1017,9 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
                 "bootstrap/auth failed; no agent was started",
             ));
         }
-        prepare(&root, &dispatch, &worktree)?;
+        let checkout = prepare(&root, &dispatch, &worktree)?;
+        gate.bind_base(&checkout.base)?;
+        prepared = Some(checkout);
         (exit, contract) = agent(&worktree, &result_dir, &dispatch)?;
         Ok(())
     })();
@@ -961,8 +1031,10 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
         gate.absorb_current()?;
         gate.check(dispatch.branch.as_bytes())?;
         gate.check(dispatch.title.as_bytes())?;
-        gate.check(&serde_json::to_vec(&contract)?)?;
-        gate.check(&serde_json::to_vec(&errors)?)?;
+        contract.check(&gate)?;
+        for error in &errors {
+            gate.check(error.as_bytes())?;
+        }
         gate.directory(&result_dir)?;
         if !worktree.join(".git").is_file() {
             return Ok(());
@@ -984,8 +1056,23 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
             }
             errors.push(format!("Work preservation: {error}"));
         }
-        match publish(&worktree, &result_dir, &dispatch, &contract, &gate) {
-            Ok(url) => pr = url,
+        let checkout = prepared
+            .as_ref()
+            .ok_or(ScalerError::Guard("redaction gate lacks trusted checkout"))?;
+        match publish(
+            &worktree,
+            &result_dir,
+            &dispatch,
+            &contract,
+            &gate,
+            checkout,
+        ) {
+            Ok(url) => {
+                if let Some(url) = &url {
+                    gate.check(url.as_bytes())?;
+                }
+                pr = url;
+            }
             Err(error) if is_redaction(&error) => return Err(error),
             Err(error) => errors.push(format!("PR publication: {error}")),
         }
@@ -995,7 +1082,10 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
     if let Err(error) = checked {
         errors.push(error.to_string());
     }
-    if gate.check(&serde_json::to_vec(&errors)?).is_err() {
+    if errors
+        .iter()
+        .any(|error| gate.check(error.as_bytes()).is_err())
+    {
         refused = true;
     }
     if refused {
@@ -1155,10 +1245,139 @@ mod tests {
         }
         assert!(!alive, "agent timeout left a live grandchild");
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn completed_agent_does_not_leave_an_artifact_writer_alive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("grandchild.pid");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 60 & echo $! > \"$1\"", "fixture"])
+            .arg(&pid_file);
+        assert_eq!(
+            wait_agent(&mut command, std::time::Duration::from_secs(2)).unwrap(),
+            0
+        );
+        let pid: i32 = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let alive = loop {
+            let alive = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                !stat
+                    .split(')')
+                    .nth(1)
+                    .unwrap()
+                    .trim_start()
+                    .starts_with('Z')
+            });
+            if !alive || std::time::Instant::now() >= deadline {
+                break alive;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        assert!(!alive, "completed agent left a live artifact writer");
+    }
     fn event() -> Value {
         json!({"repository":{"full_name":REPOSITORY},"action":"labeled",
             "sender":{"login":"tjfontaine","type":"User"},"label":{"name":"dispatch:sol-high"},
             "issue":{"number":634,"user":{"login":"tjfontaine"},"title":"Dispatch workers!","body":"## Why\ncontext\n## Brief\nImplement it\n### Verify\nCheck it\n## Notes\nnot prompt"}})
+    }
+    fn fixture_gate(root: &Path) -> Gate {
+        let mut gate = Gate::capture().unwrap();
+        gate.bind_base(
+            git(root, &["rev-parse", "refs/remotes/origin/main"])
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        gate
+    }
+    fn fixture_repository(root: &Path) {
+        git(root, &["init", "-b", "work/dispatch-634-dispatch-workers"]).unwrap();
+        git(root, &["config", "user.name", "Fixture"]).unwrap();
+        git(root, &["config", "user.email", "fixture@localhost"]).unwrap();
+        git(root, &["config", "core.hooksPath", "/dev/null"]).unwrap();
+        std::fs::write(root.join("base"), "base").unwrap();
+        git(root, &["add", "base"]).unwrap();
+        git(root, &["commit", "-m", "fixture base"]).unwrap();
+        git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]).unwrap();
+    }
+    #[test]
+    fn replacement_refs_cannot_hide_a_credential_in_pushed_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fixture_repository(root);
+        std::fs::write(root.join("payload"), "ghs_hidden_credential").unwrap();
+        git(root, &["add", "payload"]).unwrap();
+        git(root, &["commit", "-m", "fixture credential"]).unwrap();
+        let original = git(root, &["rev-parse", "HEAD:payload"]).unwrap();
+        std::fs::write(root.join("clean"), "safe").unwrap();
+        let replacement = git(root, &["hash-object", "-w", "clean"]).unwrap();
+        git(root, &["replace", original.trim(), replacement.trim()]).unwrap();
+        assert!(gate_work(root, &fixture_gate(root)).is_err());
+    }
+    #[test]
+    fn mutable_main_ref_cannot_exclude_a_secret_commit_from_the_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fixture_repository(root);
+        let gate = fixture_gate(root);
+        std::fs::write(root.join("payload"), "ghs_hidden_credential").unwrap();
+        git(root, &["add", "payload"]).unwrap();
+        git(root, &["commit", "-m", "fixture credential"]).unwrap();
+        git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]).unwrap();
+        std::fs::write(root.join("base"), "safe final change").unwrap();
+        git(root, &["add", "base"]).unwrap();
+        git(root, &["commit", "-m", "fixture final"]).unwrap();
+        assert!(gate_work(root, &gate).is_err());
+    }
+    #[test]
+    fn grafts_cannot_hide_a_secret_in_pushed_ancestry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fixture_repository(root);
+        let gate = fixture_gate(root);
+        std::fs::write(root.join("payload"), "ghs_hidden_credential").unwrap();
+        git(root, &["add", "payload"]).unwrap();
+        git(root, &["commit", "-m", "fixture credential"]).unwrap();
+        git(root, &["rm", "payload"]).unwrap();
+        git(root, &["commit", "-m", "fixture final"]).unwrap();
+        let head = git(root, &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(
+            root.join(".git/info/grafts"),
+            format!("{} {}\n", head.trim(), gate.base().unwrap()),
+        )
+        .unwrap();
+        assert!(gate_work(root, &gate).is_err());
+    }
+    #[test]
+    fn redirected_git_worktree_cannot_stage_host_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fixture_repository(root);
+        let gate = fixture_gate(root);
+        std::fs::write(outside.path().join("base"), "base").unwrap();
+        std::fs::write(outside.path().join("host-file"), "outside host data").unwrap();
+        git(
+            root,
+            &["config", "core.worktree", outside.path().to_str().unwrap()],
+        )
+        .unwrap();
+        assert!(
+            checkpoint(
+                root,
+                &validate_event(&event(), TIERS, "tjfontaine").unwrap(),
+                &gate
+            )
+            .is_err()
+        );
     }
     #[test]
     fn labels_select_only_checked_in_tiers_and_extract_the_brief() {
@@ -1273,6 +1492,33 @@ mod tests {
         );
     }
     #[test]
+    fn fence_lengths_cannot_pull_branch_directives_from_another_section() {
+        let mut value = event();
+        value["issue"]["body"] =
+            "## Brief\nDo it\n````text\n```\n````\n## Notes\nBranch: work/foreign-799".into();
+        assert_eq!(
+            validate_event(&value, TIERS, "tjfontaine").unwrap().branch,
+            "work/dispatch-634-dispatch-workers"
+        );
+    }
+    #[test]
+    fn committed_external_symlinks_are_not_recovery_outputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-b", "work/dispatch-634-dispatch-workers"]).unwrap();
+        git(root, &["config", "user.name", "Fixture"]).unwrap();
+        git(root, &["config", "user.email", "fixture@localhost"]).unwrap();
+        git(root, &["config", "core.hooksPath", "/dev/null"]).unwrap();
+        std::fs::write(root.join("base"), "base").unwrap();
+        git(root, &["add", "base"]).unwrap();
+        git(root, &["commit", "-m", "fixture base"]).unwrap();
+        git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]).unwrap();
+        std::os::unix::fs::symlink("/tmp/outside", root.join("new-link")).unwrap();
+        git(root, &["add", "new-link"]).unwrap();
+        git(root, &["commit", "-m", "fixture link"]).unwrap();
+        assert!(gate_work(root, &fixture_gate(root)).is_err());
+    }
+    #[test]
     fn tracked_generated_files_cannot_escape_through_a_patch() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -1290,7 +1536,7 @@ mod tests {
             b"\0refresh_token=must-not-publish",
         )
         .unwrap();
-        let gate = Gate::capture().unwrap();
+        let gate = fixture_gate(root);
         assert!(
             checkpoint(
                 root,
@@ -1318,7 +1564,7 @@ mod tests {
         std::fs::create_dir(root.join("conformance-probes")).unwrap();
         std::os::unix::fs::symlink("/tmp", root.join("conformance-probes/target")).unwrap();
         let d = validate_event(&event(), TIERS, "tjfontaine").unwrap();
-        let gate = Gate::capture().unwrap();
+        let gate = fixture_gate(root);
         assert!(checkpoint(root, &d, &gate).unwrap());
         let message = git(root, &["log", "-1", "--format=%B"]).unwrap();
         assert!(message.contains("Co-Authored-By: GPT-6.1 Sol <noreply@openai.com>"));
