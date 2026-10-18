@@ -131,6 +131,11 @@ impl Drop for JitCodeBuffer {
 /// use carrick_softcpu_x86::{SoftCpu, SoftMmuMemory};
 /// fn raw_entry<M: SoftMmuMemory>() { let _ = SoftCpu::execute_planned_block::<M>; }
 /// ```
+/// The owned context cannot be replaced by a caller; use the typed borrows.
+/// ```compile_fail
+/// use carrick_softcpu_x86::SoftCpu;
+/// fn replace_context(cpu: &mut SoftCpu) { cpu.ctx = Default::default(); }
+/// ```
 pub struct SoftCpu {
     ctx: Box<SoftCpuContext>,
     jit: JitCodeBuffer,
