@@ -273,20 +273,35 @@ runs only on owner dispatch with its enable variable and dedicated runner.
 triggers; only `ci-ok` is a merge requirement. The director owns pre-merge
 hardware evidence; the hardware run after landing is the backstop.
 
-On push, the hosted `hvf-gate` and `kvm-gate` jobs compare the landed commit's
-receipt with its first parent main commit's receipt (`git rev-parse HEAD^1`,
-not the push event's `before`, which may span several commits). They run the
-current landed main commit's trusted xtask, so changes to the gate apply on
-the first push that contains them. A lane only produces and uploads its
-receipt and never waits on hardware for a baseline. The hosted comparison
-waits up to 90 minutes for an in-progress parent run (60-second polls;
-110-minute job timeout). It never falls back to an older ancestor.
+On push, hosted `hvf-gate` and `kvm-gate` build the selector xtask from the
+trusted `github.event.before` commit, using its own checkout and lockfile.
+`ci-receipt select-baseline` rejects zero/malformed `before` values and any
+`before` outside the pushed SHA's first-parent ancestry (force pushes).
+Starting at `before`, it checks at most 50 first-parent commits and selects
+the nearest one with a trusted receipt for that lane. Pending or cancelled
+runs without a receipt do not prevent using an older receipted ancestor.
 
-A missing or cancelled parent run without a receipt, or an in-progress run
-that exhausts that wait, fails with a **No baseline** annotation and job
-summary. This is distinct from a NEW regression, and is never a silent pass.
-An existing failed receipt is still compared. Do not cancel main-push runs:
-each receipt is the next landed commit's baseline.
+The selector writes the exact baseline SHA and every intervening landed
+commit without its own receipt to the step summary and a notice annotation:
+**covered as a range, not individually**. This covers multi-commit PRs,
+stack landings and gaps in the hardware backlog. The pushed SHA has its own
+candidate receipt and is excluded from the uncovered list. Trust remains
+exact SHA, kernel-runtime workflow path, repository/head repository,
+push/dispatch event and main branch. Failed receipts remain usable baselines.
+
+The comparison builds the selected baseline's xtask in a separate clean
+checkout with that commit's lockfile; only candidate receipt data is graded.
+When `before` supplies the receipt, reuse its existing checkout/build. The
+candidate's Rust code is never built to grade itself. Hardware jobs never
+wait for a baseline. A missing baseline before the first-parent root fails
+as **No baseline**; exhausting 50 commits while older ancestry remains fails
+as **Baseline walk limit**. Both have explicit error annotations and summaries
+and neither is reported as a NEW regression.
+
+At initial rollout the trusted `before` may predate `select-baseline`. That
+push fails visibly as **Baseline selector unavailable**; seed current main
+with an owner dispatch. Subsequent pushes can use the new selector. The
+workflow never falls back to executing the candidate's selector code.
 
 Owner dispatch seeds the current main tip without comparing it to a parent:
 
@@ -308,8 +323,8 @@ receipt lane, the candidate commit may include a PR-scoped
 `test = "<bin>::<test>"`, `reason`, `pr`, and optional
 `replaced_by = "<bin>::<test>"`. The binary and every test-path segment must
 match `[A-Za-z_][A-Za-z0-9_]*`; receipt matches always include the binary.
-Hosted `hvf-gate` and `kvm-gate` check out the landed main commit
-(`github.sha`) and resolve its first parent for the baseline; `ci-receipt gate` fetches `--candidate-sha` from `origin`
+Hosted `hvf-gate` and `kvm-gate` build the comparison xtask from the
+selected receipted ancestor; `ci-receipt gate` fetches `--candidate-sha` from `origin`
 and inspects the candidate tree's `.github/retired-tests.toml` alongside the
 parent main commit's tree. A declaration drops `missing:` only when the
 retired test did not fail in the applicable receipt lane, is absent from the
@@ -336,8 +351,8 @@ Stale entries (already absent in base source) are inert: they
 excuse nothing and appear as non-blocking `WARNING` lines in the gate summary.
 Remove these entries once `main`'s baseline receipt rolls past the rename;
 delete the file when no entries remain. Empty declaration files fail the gate.
-The hosted gate builds `carrick-xtask` from the landed main SHA, so gate
-changes apply on the first main push containing them.
+Selector changes take effect when they reach trusted event.before.
+Comparison changes take effect when that commit supplies the chosen receipt.
 
 ## Lifecycle and recovery
 

@@ -754,7 +754,7 @@ fn durable_ledger_round_trip_rejects_corruption_without_resetting_budget() {
 }
 
 #[test]
-fn hardware_lanes_never_wait_and_hosted_gates_compare_parent_main() {
+fn hardware_lanes_never_wait_and_hosted_gates_grade_with_receipted_baseline_code() {
     let kernel = include_str!("../../../.github/workflows/kernel-runtime.yml");
     let docs = yaml_rust2::YamlLoader::load_from_str(kernel).unwrap();
     let jobs = &docs[0]["jobs"];
@@ -784,31 +784,50 @@ fn hardware_lanes_never_wait_and_hosted_gates_compare_parent_main() {
         // Above the 90-minute wait bound, with margin.
         assert!(job["timeout-minutes"].as_i64().unwrap() >= 100);
         let steps = job["steps"].as_vec().unwrap();
-        let checkout = steps
+        let selector = steps
             .iter()
-            .find(|s| s["uses"].as_str() == Some("actions/checkout@v4"))
+            .find(|s| s["with"]["path"].as_str() == Some("selector"))
             .unwrap();
         assert_eq!(
-            checkout["with"]["ref"].as_str(),
-            Some("${{ github.sha }}"),
-            "{gate} runs the current trusted landed commit"
+            selector["with"]["ref"].as_str(),
+            Some("${{ github.event.before }}")
         );
-        assert_eq!(checkout["with"]["fetch-depth"].as_i64(), Some(2));
+        assert_eq!(selector["with"]["fetch-depth"].as_i64(), Some(0));
+        let select_index = steps
+            .iter()
+            .position(|s| s["id"].as_str() == Some("baseline"))
+            .unwrap();
+        let select = &steps[select_index];
+        assert_eq!(select["working-directory"].as_str(), Some("selector"));
+        assert_eq!(
+            select["env"]["BEFORE_SHA"].as_str(),
+            Some("${{ github.event.before }}")
+        );
+        assert!(
+            select["run"]
+                .as_str()
+                .unwrap()
+                .contains("ci-receipt select-baseline")
+        );
+        let checkout_index = steps
+            .iter()
+            .position(|s| s["with"]["path"].as_str() == Some("baseline"))
+            .unwrap();
+        assert!(select_index < checkout_index);
+        assert_eq!(
+            steps[checkout_index]["with"]["ref"].as_str(),
+            Some("${{ steps.baseline.outputs.sha }}")
+        );
+        assert_eq!(steps[checkout_index]["with"]["clean"].as_bool(), Some(true));
+        assert_eq!(
+            steps[checkout_index]["if"].as_str(),
+            Some("${{ steps.baseline.outputs.reuse != 'true' }}")
+        );
         assert!(
             job["if"]
                 .as_str()
                 .unwrap()
                 .contains("github.event_name == 'push'")
-        );
-        let parent = steps
-            .iter()
-            .find(|s| s["id"].as_str() == Some("parent"))
-            .unwrap();
-        assert!(
-            parent["run"]
-                .as_str()
-                .unwrap()
-                .contains("git rev-parse HEAD^1")
         );
         let comparison = steps
             .iter()
@@ -820,17 +839,21 @@ fn hardware_lanes_never_wait_and_hosted_gates_compare_parent_main() {
             .unwrap();
         assert_eq!(
             comparison["env"]["BASE_SHA"].as_str(),
-            Some("${{ steps.parent.outputs.sha }}")
+            Some("${{ steps.baseline.outputs.sha }}")
         );
-        let checkouts = steps
+        assert_eq!(
+            comparison["working-directory"].as_str(),
+            Some("${{ steps.baseline.outputs.reuse == 'true' && 'selector' || 'baseline' }}")
+        );
+        for step in steps
             .iter()
-            .filter(|s| {
-                s["uses"]
-                    .as_str()
-                    .is_some_and(|u| u.starts_with("actions/checkout"))
-            })
-            .count();
-        assert_eq!(checkouts, 1);
+            .filter(|s| s["run"].as_str().is_some_and(|r| r.contains("cargo build")))
+        {
+            assert!(matches!(
+                step["working-directory"].as_str(),
+                Some("selector" | "baseline")
+            ));
+        }
         let download = steps
             .iter()
             .find(|s| s["uses"].as_str() == Some("actions/download-artifact@v4"))

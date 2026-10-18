@@ -411,7 +411,7 @@ else:
                     "{stdout}"
                 );
                 assert!(
-                    stderr.contains("no baseline: parent main commit"),
+                    stderr.contains("no baseline: selected baseline commit"),
                     "{stderr}"
                 );
                 assert!(
@@ -1600,5 +1600,302 @@ fn retirement_refuses_opaque_item_macros_and_unscanned_target_paths() {
                 "[package]\nname = 'example'\n{header}\nname = 'foo'\npath = '{path}'\n"
             )),
         );
+    }
+}
+
+mod ancestor_selection {
+    use super::*;
+    use carrick_xtask::ci_receipt::{ReceiptError, select_baseline};
+    use std::collections::BTreeSet;
+
+    struct History {
+        dir: tempfile::TempDir,
+        commits: Vec<String>,
+    }
+    impl History {
+        fn new(count: usize) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            git(dir.path(), &["init", "-q"]);
+            let commits = (0..count)
+                .map(|n| {
+                    git(
+                        dir.path(),
+                        &[
+                            "commit",
+                            "--allow-empty",
+                            "-q",
+                            "-m",
+                            &format!("landed {n}"),
+                        ],
+                    );
+                    git(dir.path(), &["rev-parse", "HEAD"])
+                })
+                .collect();
+            Self { dir, commits }
+        }
+        fn select(
+            &self,
+            before: &str,
+            receipted: &[usize],
+        ) -> Result<carrick_xtask::ci_receipt::BaselineSelection, ReceiptError> {
+            let receipts: BTreeSet<_> = receipted
+                .iter()
+                .map(|n| self.commits[*n].as_str())
+                .collect();
+            select_baseline(
+                self.dir.path(),
+                Lane::Hvf,
+                before,
+                self.commits.last().unwrap(),
+                |_, sha| {
+                    Ok(if receipts.contains(sha) {
+                        Baseline::Found(1, format!("receipt-hvf-{sha}-1"))
+                    } else {
+                        Baseline::Missing
+                    })
+                },
+            )
+        }
+    }
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+    #[test]
+    fn serial_host_multi_commit_push_uses_before_receipt_and_reports_only_unreceipted_members() {
+        let h = History::new(7);
+        let selected = h.select(&h.commits[3], &[0, 3, 4]).unwrap();
+        assert_eq!(selected.baseline_sha, h.commits[3]);
+        assert_eq!(selected.covered_as_range, vec![h.commits[5].clone()]);
+        assert!(selected.markdown().contains(&h.commits[3]));
+        assert!(selected.markdown().contains(&h.commits[5]));
+        assert!(!selected.markdown().contains(&h.commits[4]));
+        assert!(
+            selected
+                .notice()
+                .contains("covered as a range, not individually")
+        );
+        assert!(selected.notice().contains(&h.commits[5]));
+    }
+    #[test]
+    fn serial_host_coalesced_backlog_uses_nearest_receipted_first_parent() {
+        let h = History::new(8);
+        let selected = h.select(&h.commits[6], &[1, 3]).unwrap();
+        assert_eq!(selected.baseline_sha, h.commits[3]);
+        assert_eq!(selected.covered_as_range, h.commits[4..7]);
+        // In-progress runs without a receipt do not block an older usable baseline.
+        let selected = select_baseline(
+            h.dir.path(),
+            Lane::Kvm,
+            &h.commits[6],
+            &h.commits[7],
+            |_, sha| {
+                Ok(if sha == h.commits[3] {
+                    Baseline::Found(3, "receipt".into())
+                } else {
+                    Baseline::Pending
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(selected.baseline_sha, h.commits[3]);
+    }
+    #[test]
+    fn serial_host_zero_and_force_push_before_fail_before_receipt_lookup() {
+        let h = History::new(4);
+        git(h.dir.path(), &["checkout", "-q", &h.commits[0]]);
+        git(
+            h.dir.path(),
+            &["commit", "--allow-empty", "-q", "-m", "old main tip"],
+        );
+        let old = git(h.dir.path(), &["rev-parse", "HEAD"]);
+        for before in ["0".repeat(40), old, h.commits[3].clone()] {
+            let result =
+                select_baseline(h.dir.path(), Lane::Hvf, &before, &h.commits[3], |_, _| {
+                    panic!("invalid history must not query receipts")
+                });
+            assert!(
+                matches!(result, Err(ReceiptError::InvalidPushHistory(_))),
+                "{result:?}"
+            );
+        }
+    }
+    #[test]
+    fn serial_host_fifty_ancestor_bound_is_distinct_from_no_baseline_at_root() {
+        let h = History::new(53);
+        assert_eq!(
+            h.select(&h.commits[51], &[2]).unwrap().baseline_sha,
+            h.commits[2]
+        );
+        let mut queried = Vec::new();
+        let past = select_baseline(
+            h.dir.path(),
+            Lane::Hvf,
+            &h.commits[51],
+            &h.commits[52],
+            |_, sha| {
+                queried.push(sha.to_owned());
+                Ok(if sha == h.commits[1] {
+                    Baseline::Found(1, "receipt".into())
+                } else {
+                    Baseline::Missing
+                })
+            },
+        );
+        assert!(
+            matches!(past, Err(ReceiptError::BaselineWalkLimit(_))),
+            "{past:?}"
+        );
+        assert_eq!(queried.len(), 50);
+        assert!(!queried.contains(&h.commits[1]));
+        let short = History::new(4);
+        let missing = short.select(&short.commits[2], &[]);
+        assert!(
+            matches!(missing, Err(ReceiptError::NoBaseline(_))),
+            "{missing:?}"
+        );
+    }
+    fn invoke_selector(
+        h: &History,
+        lane: &str,
+        before: &str,
+        records: &[serde_json::Value],
+    ) -> (std::process::Output, String, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = h.dir.path().join("api.json");
+        std::fs::write(&fixture, serde_json::to_vec(records).unwrap()).unwrap();
+        let bin = h.dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let gh = bin.join("gh");
+        std::fs::write(
+            &gh,
+            r#"#!/usr/bin/env python3
+import json, os, sys
+rows=json.load(open(os.environ['RECEIPT_API_FIXTURE']))
+endpoint=sys.argv[-1]
+if '/runs?head_sha=' in endpoint:
+    sha=endpoint.split('head_sha=')[1].split('&')[0]
+    print(json.dumps({'workflow_runs':[r for r in rows if r['head_sha']==sha]}))
+elif '/artifacts?' in endpoint:
+    rid=int(endpoint.split('/runs/')[1].split('/')[0])
+    print(json.dumps({'artifacts':next(r['artifacts'] for r in rows if r['id']==rid)}))
+else:
+    raise SystemExit('unexpected gh request')
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let summary = h.dir.path().join("summary.md");
+        let output_file = h.dir.path().join("outputs.txt");
+        std::fs::write(&summary, "").unwrap();
+        std::fs::write(&output_file, "").unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .args([
+                "ci-receipt",
+                "select-baseline",
+                "--lane",
+                lane,
+                "--before-sha",
+                before,
+                "--candidate-sha",
+                h.commits.last().unwrap(),
+            ])
+            .arg("--history-dir")
+            .arg(h.dir.path())
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("RECEIPT_API_FIXTURE", &fixture)
+            .env("GITHUB_STEP_SUMMARY", &summary)
+            .env("GITHUB_OUTPUT", &output_file)
+            .output()
+            .unwrap();
+        (
+            output,
+            std::fs::read_to_string(summary).unwrap(),
+            std::fs::read_to_string(output_file).unwrap(),
+        )
+    }
+    fn recorded(h: &History, index: usize) -> serde_json::Value {
+        let mut r = run("push", "main", ".github/workflows/kernel-runtime.yml");
+        r["id"] = (index + 1).into();
+        r["head_sha"] = h.commits[index].clone().into();
+        r["status"] = "completed".into();
+        r["artifacts"] = serde_json::json!([
+            {"name":format!("receipt-hvf-{}-1",h.commits[index]),"expired":false},
+            {"name":format!("receipt-kvm-{}-1",h.commits[index]),"expired":false},
+        ]);
+        r
+    }
+    #[test]
+    fn serial_host_selector_cli_reports_the_actual_baseline_and_covered_range_in_both_channels() {
+        let h = History::new(7);
+        let mut untrusted = recorded(&h, 4);
+        untrusted["head_branch"] = "work/x".into();
+        let records = [recorded(&h, 2), untrusted, recorded(&h, 5)];
+        for lane in ["hvf", "kvm"] {
+            let (out, summary, outputs) = invoke_selector(&h, lane, &h.commits[4], &records);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                outputs.contains(&format!("sha={}\nreuse=false", h.commits[2])),
+                "{outputs}"
+            );
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                stdout.contains("::notice title=Receipt baseline::"),
+                "{stdout}"
+            );
+            for sha in [&h.commits[2], &h.commits[3], &h.commits[4]] {
+                assert!(summary.contains(sha), "{summary}");
+                assert!(stdout.contains(sha), "{stdout}");
+            }
+            assert!(
+                !summary.contains(&h.commits[5]),
+                "already receipted: {summary}"
+            );
+            assert!(summary.contains("covered as a range, not individually"));
+        }
+        let (out, _, outputs) = invoke_selector(&h, "hvf", &h.commits[2], &records);
+        assert!(out.status.success());
+        assert!(outputs.contains("reuse=true"), "{outputs}");
+    }
+    #[test]
+    fn serial_host_selector_cli_labels_no_baseline_history_and_walk_limit_failures() {
+        let small = History::new(4);
+        let large = History::new(53);
+        for (h, before, title) in [
+            (&small, "0".repeat(40), "Invalid push history"),
+            (&small, small.commits[2].clone(), "No baseline"),
+            (&large, large.commits[51].clone(), "Baseline walk limit"),
+        ] {
+            let (out, summary, outputs) = invoke_selector(h, "hvf", &before, &[]);
+            assert!(!out.status.success());
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                stdout.contains(&format!("::error title={title}::")),
+                "{stdout}"
+            );
+            assert!(summary.contains(&format!("## {title}")), "{summary}");
+            assert!(outputs.is_empty(), "{outputs}");
+            assert!(!stdout.contains("NEW"), "{stdout}");
+        }
     }
 }

@@ -153,11 +153,16 @@ controller before every launch; jobs run as the unprivileged `carrick-ci`
 account, which cannot write the tree, the binary, the policy or the hook;
 reaping needs no sudo target a job could write.
 
-Post-landing receipt comparison: hosted `hvf-gate` and `kvm-gate` check out
-the landed main commit and run its `carrick-xtask`, comparing the candidate
-receipt to its first parent main commit's receipt. Missing parents fail as
-**No baseline** with a job summary. Hardware lanes only produce receipts and
-never wait for a baseline while holding a runner.
+Post-landing receipt comparison: a selector built from trusted event.before
+validates first-parent history and finds the nearest receipted ancestor
+within 50 commits. Hosted `hvf-gate` and `kvm-gate` then build that selected
+baseline's xtask in a clean checkout with its own lockfile to grade candidate
+receipt data. If before supplies the receipt, the build is reused. Candidate
+Rust never grades itself. The summary and notice list the baseline and any
+unreceipted range; history, missing-baseline and walk-limit failures stay
+visible and distinct from NEW regressions. Hardware lanes never wait for a
+baseline while holding a runner. Initial rollout without a trusted selector
+fails closed and requires owner seeding of current main.
 
 **Write access to this repository means trusted.** A main push runs the
 landed commit's own workflow file and `xtask accept`, which

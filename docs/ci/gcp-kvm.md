@@ -12,8 +12,9 @@ is the primary backend once selected; GCP stays as the fallback.
 
 Both backends run only on pushes to main and owner dispatches on main;
 `kernel-runtime.yml` has no merge-group, PR or schedule trigger. Push receipt
-comparisons use the first parent main commit's receipt; missing parents fail
-visibly as **No baseline**, separate from regressions. Dispatch seeds the
+comparisons use the nearest trusted receipted first-parent ancestor starting
+at event.before (at most 50 commits). Missing baselines and walk-limit
+exhaustion fail visibly and separately from regressions. Dispatch seeds the
 current main tip without comparing. See [events and receipts](contabo-kvm.md#events-and-receipts).
 
 This is trusted-ref CI infrastructure for an experimental project, not an
@@ -45,7 +46,8 @@ upload-artifact receipt-kvm-<sha>-<attempt>  (unchanged name; kvm-gate reads it)
 
 The script exits 0 whenever a receipt was collected. Test failures are
 recorded in the receipt and judged by the hosted `kvm-gate` job against the
-first parent main commit on push, exactly as with Willow. Owner dispatch
+nearest receipted first-parent ancestor on push, exactly as with Willow,
+using a comparison xtask built from that chosen baseline. Owner dispatch
 seeds a receipt without comparison. It exits non-zero on a `FAILED`
 marker (VM setup failed before `accept` ran), a timeout (default 150 min), a
 VM that disappears before writing a marker, or `DONE` without a receipt.
