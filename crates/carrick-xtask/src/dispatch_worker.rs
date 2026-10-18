@@ -811,6 +811,11 @@ fn preserve_work(
     dispatch: &Dispatch,
     gate: &Gate,
 ) -> Result<(), ScalerError> {
+    if git(root, &["branch", "--show-current"])?.trim() != dispatch.branch {
+        return Err(ScalerError::Guard(
+            "redaction gate refused recovery from another branch",
+        ));
+    }
     gate_work(root, gate)?;
     gate.directory(result_dir)?;
     let dispatched_ref = format!("refs/heads/{}", dispatch.branch);
@@ -884,6 +889,7 @@ fn publish(
         root,
         &[
             "push",
+            "--no-follow-tags",
             &lease,
             "https://github.com/carrick-sh/carrick",
             &refspec,

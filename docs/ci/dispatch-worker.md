@@ -146,7 +146,8 @@ paths, files/objects over 1 MiB, more than 256 commits or 4,096 new objects,
 and more than 20 MiB of source objects or result artifacts. The fetched base
 SHA and expected push tip are captured before execution; mutable refs,
 replacement objects, grafts and a redirected Git worktree cannot change the
-validation view. Unknown or unreadable outputs
+validation view. Recovery refuses a different current branch, and push disables
+implicit annotated-tag publication. Unknown or unreadable outputs
 fail closed. These checks can also refuse legitimate token examples.
 
 Actions uploads only a fresh snapshot created after validation, with its path

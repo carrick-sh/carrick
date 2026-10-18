@@ -251,6 +251,16 @@ fn dispatch_refuses_json_escaped_credentials_before_pushing() {
 }
 #[cfg(target_os = "linux")]
 #[test]
+fn dispatch_push_does_not_follow_credential_bearing_tags() {
+    foreground_cases(&["follow-tags"]);
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn dispatch_refuses_a_bundle_from_another_branch() {
+    foreground_cases(&["leak-bundle-ref"]);
+}
+#[cfg(target_os = "linux")]
+#[test]
 fn dispatch_refuses_credentials_before_wip_staging() {
     foreground_cases(&["leak-checkpoint"]);
 }
@@ -409,6 +419,17 @@ What: preserve worker changes.
 Verified: local fixture.
 
 Co-Authored-By: GPT-6.1 Sol <noreply@openai.com>' || exit $?
+if [ "$TEST_CASE" = follow-tags ]; then
+  git config push.followTags true
+  git tag -a secret-tag -m "$GH_TOKEN" HEAD || exit $?
+fi
+if [ "$TEST_CASE" = leak-bundle-ref ]; then
+  git branch clean-output HEAD || exit $?
+  cat "$HOME/.codex/auth.json" > payload
+  git add -- payload
+  git commit -m 'fixture hidden credentials' || exit $?
+  git checkout clean-output || exit $?
+fi
 if [ "$TEST_CASE" = agy ]; then
   git commit --amend -m 'feat(ci): fixture agy worker change' -m 'Why: test dispatch.
 
@@ -522,7 +543,7 @@ fi
             .unwrap();
         assert_eq!(
             output.status.success(),
-            matches!(case, "done" | "update" | "agy" | "aged-job"),
+            matches!(case, "done" | "update" | "agy" | "aged-job" | "follow-tags"),
             "{case}: {output:?}"
         );
         let receipt: serde_json::Value = serde_json::from_slice(
@@ -598,9 +619,19 @@ fi
         }
         assert_eq!(
             receipt["success"],
-            matches!(case, "done" | "update" | "agy" | "aged-job"),
+            matches!(case, "done" | "update" | "agy" | "aged-job" | "follow-tags"),
             "{case}: {receipt}"
         );
+        if case == "follow-tags" {
+            assert!(
+                run_git(
+                    &remote,
+                    &["for-each-ref", "refs/tags", "--format=%(refname)"]
+                )
+                .is_empty(),
+                "pushed an unscanned annotated tag"
+            );
+        }
         if matches!(case, "token-rejected" | "token-expired-on-push") {
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(stderr.contains("host/infra"), "{stderr}");
