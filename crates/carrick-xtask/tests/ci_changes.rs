@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use carrick_xtask::ci_changes::{
-    CiChangesOutputs, PathClass, ReferencedDocs, classify_path, evaluate_changes,
-    scan_script_or_workflow,
+    CiChangesOutputs, PathClass, ReferencedDocs, child_lookup_allowed, classify_path,
+    evaluate_changes, scan_script_or_workflow,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -592,6 +592,7 @@ fn stack_layer_detection_and_ci_results_gating() {
         None,
         &[
             ("CI_HEAD_REF", "work/layer-1"),
+            ("CI_HEAD_REPO", "carrick-sh/carrick"),
             ("PATH", &path_with_child),
             ("GITHUB_STEP_SUMMARY", summary_file.to_str().unwrap()),
         ],
@@ -615,6 +616,7 @@ fn stack_layer_detection_and_ci_results_gating() {
         None,
         &[
             ("CI_HEAD_REF", "work/layer-top"),
+            ("CI_HEAD_REPO", "carrick-sh/carrick"),
             ("PATH", &path_top),
             ("GITHUB_STEP_SUMMARY", summary_file.to_str().unwrap()),
         ],
@@ -637,7 +639,11 @@ fn stack_layer_detection_and_ci_results_gating() {
         "pull_request",
         Some("false"),
         None,
-        &[("CI_HEAD_REF", "work/layer-1"), ("PATH", &path_err)],
+        &[
+            ("CI_HEAD_REF", "work/layer-1"),
+            ("CI_HEAD_REPO", "carrick-sh/carrick"),
+            ("PATH", &path_err),
+        ],
     );
     assert_eq!(
         out_err,
@@ -648,7 +654,11 @@ fn stack_layer_detection_and_ci_results_gating() {
         "pull_request",
         Some("false"),
         None,
-        &[("CI_HEAD_REF", "work/layer-prose"), ("PATH", &path_err)],
+        &[
+            ("CI_HEAD_REF", "work/layer-prose"),
+            ("CI_HEAD_REPO", "carrick-sh/carrick"),
+            ("PATH", &path_err),
+        ],
     );
     assert_eq!(
         out_prose_err,
@@ -661,7 +671,11 @@ fn stack_layer_detection_and_ci_results_gating() {
         "merge_group",
         None,
         None,
-        &[("CI_HEAD_REF", "work/layer-1"), ("PATH", &path_with_child)],
+        &[
+            ("CI_HEAD_REF", "work/layer-1"),
+            ("CI_HEAD_REPO", "carrick-sh/carrick"),
+            ("PATH", &path_with_child),
+        ],
     );
     assert_eq!(
         out_mg_with_child,
@@ -784,4 +798,42 @@ fn merge_group_requires_full_suite_in_ci_results() {
         !run_ci_results("merge_group", None, &docs_mg_needs),
         "docs-only merge_group must fail ci-results"
     );
+}
+
+#[test]
+fn fork_prs_never_look_up_child_layers() {
+    let repo = "carrick-sh/carrick";
+    // Same-repository PR with a head branch: lookup allowed.
+    assert!(child_lookup_allowed(
+        "pull_request",
+        "work/x-1",
+        "carrick-sh/carrick",
+        repo
+    ));
+    assert!(child_lookup_allowed(
+        "pull_request",
+        "work/x-1",
+        "Carrick-sh/Carrick",
+        repo
+    ));
+    // A fork whose branch is named like one of our base branches must never match.
+    assert!(!child_lookup_allowed(
+        "pull_request",
+        "main",
+        "someone/carrick",
+        repo
+    ));
+    assert!(!child_lookup_allowed(
+        "pull_request",
+        "work/x-1",
+        "someone/carrick",
+        repo
+    ));
+    // Unknown head repo or empty head ref fails closed to the full suite.
+    assert!(!child_lookup_allowed("pull_request", "work/x-1", "", repo));
+    assert!(!child_lookup_allowed("pull_request", "", repo, repo));
+    // Non-PR events never take the lower-layer path.
+    for event in ["merge_group", "push", "schedule", "workflow_dispatch"] {
+        assert!(!child_lookup_allowed(event, "work/x-1", repo, repo));
+    }
 }
