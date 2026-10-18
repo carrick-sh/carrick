@@ -333,9 +333,11 @@ selected baseline ancestor's tree. A declaration drops `missing:` only when the
 retired test did not fail in base or candidate, is absent from the candidate's
 test sources, still existed in the base's test sources, and (when `replaced_by`
 is given) the replacement test started without failing in the candidate
-receipt. Stale entries (already absent in base source) and empty
-`.github/retired-tests.toml` files fail the gate so the file stays
-delete-at-zero once `main`'s baseline receipt rolls past the rename. Because
+receipt. Stale entries (already absent in base source) are inert: they
+excuse nothing and appear as non-blocking `WARNING` lines in the gate summary.
+Remove these entries once `main`'s baseline receipt rolls past the rename;
+delete the file when no entries remain. Empty declaration files fail the gate.
+Because
 the hosted gate builds `carrick-xtask` from `base_sha`, any change to
 `ci-receipt gate` rolls out as soon as it lands on `main` and becomes the
 `base_sha` of subsequent merge groups.
