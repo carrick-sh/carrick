@@ -178,14 +178,30 @@ impl Github {
             if !Admission::Standing.admits_run(&run)
                 || run["event"] != "push"
                 || run["id"].as_u64() != Some(entry.key.run.0)
-                || run["run_attempt"].as_u64() != Some(u64::from(entry.key.attempt))
                 || run["head_sha"] != entry.sha
-                || !matches!(
-                    run["status"].as_str(),
-                    Some("queued" | "waiting" | "in_progress")
-                )
             {
                 return Ok(NotCancelled);
+            }
+            if run["status"] == "completed" {
+                return Ok(assignment::CancellationOutcome::Completed);
+            }
+            let attempt = run["run_attempt"]
+                .as_u64()
+                .ok_or(ScalerError::External("run attempt"))?;
+            if attempt > u64::from(entry.key.attempt) {
+                return Ok(assignment::CancellationOutcome::Completed);
+            }
+            if attempt < u64::from(entry.key.attempt) {
+                return Ok(Deferred);
+            }
+            if !matches!(
+                run["status"].as_str(),
+                Some("queued" | "waiting" | "in_progress")
+            ) {
+                return Ok(Deferred);
+            }
+            if entry.outcome == Some(Cancelled) {
+                return Ok(Cancelled);
             }
             let data = request(
                 "GET",
@@ -544,9 +560,12 @@ mod tests {
                     .all(|entry| entry.outcome == Some(CancellationOutcome::Cancelled))
             );
             assert_eq!(
-                coalesce_demand(&mut ledger, demand, &path, |_| panic!(
-                    "durable cancellations must not repeat"
-                ))
+                coalesce_demand(&mut ledger, demand, &path, |entry| {
+                    Github::cancel_superseded_with(entry, |method, _, _, _| {
+                        assert_eq!(method, "GET", "do not repeat an accepted cancellation POST");
+                        Ok(push_run(entry.key.run.0))
+                    })
+                })
                 .unwrap(),
                 ordered
             );
@@ -564,6 +583,7 @@ mod tests {
             sha: format!("{:040x}", 1),
             reason: format!("superseded by {:040x}", 3),
             outcome: None,
+            created: now().unwrap(),
         };
         for started in [
             hardware_job(1, &HVF_LABELS, "in_progress"),
@@ -663,6 +683,7 @@ mod tests {
             sha: format!("{:040x}", 1),
             reason: format!("superseded by {:040x}", 3),
             outcome: None,
+            created: now().unwrap(),
         };
         for (target, other) in [
             (&HVF_LABELS[..], &LABELS[..]),
@@ -746,6 +767,7 @@ mod tests {
             sha: format!("{:040x}", 1),
             reason: format!("superseded by {:040x}", 3),
             outcome: None,
+            created: now().unwrap(),
         }
     }
     #[test]
@@ -795,6 +817,48 @@ mod tests {
                 let error = decision.unwrap_err().to_string();
                 assert!(!error.contains("sensitive-body"), "{error}");
             }
+        }
+    }
+    #[test]
+    fn completed_or_cancelled_run_is_pruned_after_an_accepted_cancel_request() {
+        for conclusion in ["success", "cancelled"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ledger");
+            let mut entry = cleanup_entry();
+            entry.outcome = Some(assignment::CancellationOutcome::Cancelled);
+            let mut ledger = Ledger {
+                superseded: vec![entry],
+                ..Ledger::default()
+            };
+            let mut queries = 0;
+            assignment::coalesce_demand(&mut ledger, vec![], &path, |entry| {
+                Github::cancel_superseded_with(entry, |method, _, _, _| {
+                    assert_eq!(method, "GET");
+                    queries += 1;
+                    let mut run = push_run(1);
+                    run["status"] = "completed".into();
+                    run["conclusion"] = conclusion.into();
+                    Ok(run)
+                })
+            })
+            .unwrap();
+            assert_eq!(queries, 1);
+            assert!(ledger.superseded.is_empty());
+        }
+    }
+    #[test]
+    fn unknown_or_older_attempt_metadata_cannot_retire_live_supersession() {
+        for attempt in [Value::Null, json!(0)] {
+            let outcome = Github::cancel_superseded_with(&cleanup_entry(), |method, _, _, _| {
+                assert_eq!(method, "GET");
+                let mut run = push_run(1);
+                run["run_attempt"] = attempt.clone();
+                Ok(run)
+            });
+            assert!(
+                !matches!(outcome, Ok(assignment::CancellationOutcome::Completed)),
+                "{outcome:?}"
+            );
         }
     }
 }

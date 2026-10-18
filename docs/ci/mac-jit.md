@@ -70,6 +70,21 @@ settles cleanup as Gone. Job status controls cancellation; queued jobs may have
 `started_at` populated. Demand-listing or provisioning failures still back off. Refused assignment keys are attempt-specific;
 supersession is keyed by run and attempt, so a new attempt is vetted afresh.
 
+
+Supersession retention follows queue lifetime: remove an entry only when
+GitHub confirms completion/cancellation, the run is Gone, its attempt has
+been replaced, or 25 hours have elapsed since first observation (the 24-hour
+queue limit plus one hour). An accepted cancellation request alone is not
+completion. The lifecycle loop owns pruning; stale assignment publications
+cannot restore retired entries.
+
+The live-entry limit is 4096. If pruning leaves more, keep **every** live
+record, stop minting new runners and persist the distinct capacity error in
+`ledger.json`'s `supersession_error` status field. Cleanup continues; once the
+live set falls within the limit, the status clears and admission resumes.
+Inspect this field alongside controller logs; no live denial is evicted to
+make space.
+
 GitHub does not bind a JIT registration to the reserved job: a compatible
 job from another run may be assigned. The mac hook therefore re-vets the
 **actual assignment** through a credential-free rendezvous with the controller:
