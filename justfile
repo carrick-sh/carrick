@@ -1264,14 +1264,15 @@ ci-changes:
     fi
 
 # Fail closed: GitHub considers skipped required jobs successful on their own.
-# ci-ok depends on every job; only the filter or draft-PR gating can license skips.
+# ci-ok depends on every job; only the filter, draft-PR, or lower-layer gating can license skips.
 ci-results:
     #!/usr/bin/env bash
     set -euo pipefail
-    jq -e --arg event "${CI_EVENT:?}" --arg draft "${CI_DRAFT:-false}" '
+    jq -e --arg event "${CI_EVENT:?}" --arg draft "${CI_DRAFT:-false}" --arg lower "${CI_LOWER_LAYER:-false}" '
       .changes.result == "success" and
       (length > 1) and
       (. as $root |
+       (($root.changes.outputs.lower_layer // $lower) == "true") as $is_lower |
        if $event == "pull_request" then
          ($root.changes.outputs.macos // "true") == "false" and
          (del(.changes) | with_entries(select(.key | startswith("macos-"))) | all(.[]; .result == "skipped")) and
@@ -1279,14 +1280,26 @@ ci-results:
            | if ($root.changes.outputs.heavy // "true") == "true" then .result == "success"
              else .result == "skipped" end) and
          (del(.changes) | with_entries(select((.key | startswith("macos-") | not) and .key != "actionlint" and .key != "linked-issue" and .key != "commit-trailers" and .key != "lint"))
-           | if ($root.changes.outputs.heavy // "true") == "true" and $draft != "true" then all(.[]; .result == "success")
+           | if ($root.changes.outputs.heavy // "true") == "true" and $draft != "true" and ($is_lower | not) then all(.[]; .result == "success")
              else all(.[]; .result == "skipped") end) and
          (.["linked-issue"].result == "success") and
          (.["commit-trailers"].result == "success") and
          (del(.changes).actionlint
            | if ($root.changes.outputs.workflows // "false") == "true" then .result == "success"
              else .result == "skipped" end)
-       elif $root.changes.outputs.heavy == "true" and $root.changes.outputs.macos == "true" then
+       elif $root.changes.outputs.heavy == "true" and $root.changes.outputs.macos == "true" and ($is_lower | not) then
          del(.changes) | all(.[]; .result == "success")
        else false end)
     ' <<< "${CI_NEEDS:?}"
+    child_pr=$(jq -r '.changes.outputs.child_pr // empty' <<< "${CI_NEEDS}" 2>/dev/null || true)
+    if [[ -z "${child_pr}" ]]; then
+        child_pr="${CI_CHILD_PR:-}"
+    fi
+    is_lower=$(jq -r '.changes.outputs.lower_layer // empty' <<< "${CI_NEEDS}" 2>/dev/null || true)
+    if [[ "${is_lower}" == "true" || "${CI_LOWER_LAYER:-false}" == "true" ]]; then
+        msg="lower stack layer: child PR #${child_pr:-unknown}"
+        echo "${msg}"
+        if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            echo "${msg}" >> "${GITHUB_STEP_SUMMARY}"
+        fi
+    fi

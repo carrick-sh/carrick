@@ -34,10 +34,15 @@ jobs:
     name: changes
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       heavy: ${{ steps.filter.outputs.heavy }}
       macos: ${{ steps.filter.outputs.macos }}
       workflows: ${{ steps.filter.outputs.workflows }}
+      lower_layer: ${{ steps.filter.outputs.lower_layer }}
+      child_pr: ${{ steps.filter.outputs.child_pr }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -69,6 +74,9 @@ jobs:
           CI_DRAFT: ${{ github.event.pull_request.draft }}
           CI_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           CI_BASE_REF: ${{ github.event.merge_group.base_ref }}
+          CI_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          CI_REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: just ci-changes
       - name: Compiler cache statistics
         if: ${{ always() }}
@@ -197,7 +205,6 @@ jobs:
       - name: Xtask unit and CI gate tests
         if: ${{ !cancelled() }}
         run: just test-xtask
-
       - name: Formatting
         if: ${{ !cancelled() }}
         run: just fmt-check
@@ -228,7 +235,7 @@ jobs:
 
   portable:
     needs: changes
-    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.heavy == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -276,7 +283,7 @@ jobs:
 
   linux-doc:
     needs: changes
-    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.heavy == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -318,7 +325,7 @@ jobs:
 
   macos-clippy:
     needs: changes
-    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -362,7 +369,7 @@ jobs:
 
   macos-build:
     needs: changes
-    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -403,7 +410,7 @@ jobs:
 
   macos-unit-a:
     needs: changes
-    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -439,7 +446,7 @@ jobs:
 
   macos-unit-b:
     needs: changes
-    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -475,7 +482,7 @@ jobs:
 
   macos-integration:
     needs: changes
-    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true' && needs.changes.outputs.macos == 'true'
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -511,7 +518,7 @@ jobs:
 
   cross-check-linux:
     needs: changes
-    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.heavy == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -572,7 +579,7 @@ jobs:
 
   kernel-linux-native:
     needs: changes
-    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.heavy == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
@@ -608,7 +615,7 @@ jobs:
 
   cross-check-freebsd:
     needs: changes
-    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.heavy == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -671,7 +678,7 @@ jobs:
 
   cross-check-netbsd:
     needs: changes
-    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.heavy == 'true'
+    if: (github.event_name != 'pull_request' || github.event.pull_request.draft == false) && needs.changes.outputs.lower_layer != 'true' && needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -801,5 +808,7 @@ jobs:
         env:
           CI_EVENT: ${{ github.event_name }}
           CI_DRAFT: ${{ github.event.pull_request.draft }}
+          CI_LOWER_LAYER: ${{ needs.changes.outputs.lower_layer }}
+          CI_CHILD_PR: ${{ needs.changes.outputs.child_pr }}
           CI_NEEDS: ${{ toJSON(needs) }}
         run: just ci-results
