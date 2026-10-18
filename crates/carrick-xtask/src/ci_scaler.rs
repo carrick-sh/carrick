@@ -48,8 +48,6 @@ const MERGE_QUEUE_PREFIX: &str = "gh-readonly-queue/main/";
 
 #[derive(Debug, Error)]
 pub enum ScalerError {
-    #[error("host lease: {0}")]
-    HostLease(#[from] crate::host_lease::HostLeaseError),
     #[error(
         "projected Willow CPU {projected:.1}% exceeds director's 80% ceiling; controller stopped"
     )]

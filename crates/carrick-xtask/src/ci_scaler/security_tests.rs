@@ -534,3 +534,70 @@ fn serial_host_execute_surfaces_exit_status_without_external_output_and_strips_l
         "execute must strip ambient LD/DYLD library paths for external binaries"
     );
 }
+
+#[test]
+fn kvm_clone_and_destroy_do_not_touch_host_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock = dir.path().join("host-lease.lock");
+    let path = dir.path().join("ledger.json");
+    let mut ledger = Ledger::default();
+    let mut row = reserve_admitted_clone(
+        &mut ledger,
+        &path,
+        JobKey {
+            run: RunId(1),
+            attempt: 1,
+            job: JobId(2),
+        },
+        Concurrency::ONE,
+        || Ok(true),
+        || Ok(vec![]),
+    )
+    .unwrap()
+    .unwrap();
+    let mut api = MockTeardown {
+        vm: None,
+        stopped: false,
+        registered: false,
+        name: row.name.clone(),
+        interruption: None,
+        events: vec![],
+    };
+    clone_reserved(
+        &mut ledger,
+        &mut row,
+        &path,
+        &super::site::CONTABO,
+        |call, endpoint| {
+            assert_eq!(endpoint, "/nodes/carrick-ctb/qemu/300/clone");
+            let PveCall::Post(body) = call else {
+                panic!("clone must POST")
+            };
+            assert_eq!(body["newid"], 308);
+            assert_eq!(body["pool"], POOL);
+            assert_eq!(body["full"], false);
+            let saved = Ledger::load(&path).unwrap();
+            assert_eq!(saved.rows[0].state, State::Cloning);
+            api.vm = Some(Vm {
+                id: body["newid"].as_u64().unwrap() as u16,
+                name: body["name"].as_str().unwrap().into(),
+                pool: POOL.into(),
+                template: false,
+            });
+            api.events.push("clone");
+            Ok(json!("UPID:clone"))
+        },
+    )
+    .unwrap();
+    assert_eq!(row.task.as_deref(), Some("UPID:clone"));
+    row.state = State::Reaping;
+    row.task = None;
+    update(&mut ledger, &row, &path).unwrap();
+    assert!(continue_teardown(&mut api, &mut ledger, &mut row, dir.path(), &path).unwrap());
+    assert_eq!(api.events, ["clone", "stop", "destroy"]);
+    assert_eq!(Ledger::load(&path).unwrap().rows[0].state, State::Destroyed);
+    assert!(
+        !lock.exists(),
+        "controller touched the physical-host lease file"
+    );
+}

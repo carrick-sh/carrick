@@ -1043,3 +1043,28 @@ fn zombie_process_is_reported_dead_by_liveness_helper() {
         "reaped process must return ESRCH from kill(pid, 0)"
     );
 }
+
+#[test]
+fn retired_broker_config_cannot_redirect_local_vm_custody() {
+    let temp = tempfile::tempdir().unwrap();
+    let lock = temp.path().join("vm.lock");
+    let config = temp.path().join("retired.toml");
+    std::fs::write(&config, "broker = 42\n").unwrap();
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .args(["host-lease", "--mode", "gate", "--"])
+        .arg(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .args(["host-lease", "--mode", "carrick", "--", "true"])
+        .env_remove("CARRICK_HOST_LEASE_SOCKET")
+        .env_remove("CARRICK_HOST_LEASE_FD")
+        .env_remove("CARRICK_HOST_LEASE_SCOPE_FD")
+        .env("CARRICK_HOST_LEASE_PATH", &lock)
+        .env("CARRICK_HOST_LEASE_CONFIG", &config)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "retired broker config affected local nested admission"
+    );
+    assert!(lock.is_file());
+    HostLease::try_exclusive(&lock).unwrap().unwrap();
+}
