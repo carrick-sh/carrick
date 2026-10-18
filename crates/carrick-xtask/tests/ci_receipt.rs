@@ -1127,7 +1127,7 @@ fn failing_test_cannot_be_retired() {
 }
 
 #[test]
-fn stale_declaration_fails_when_test_already_absent_at_base() {
+fn stale_declaration_is_inert_after_the_retirement_lands() {
     let dir = tempfile::tempdir().unwrap();
     let (base_tree, cand_tree) = (dir.path().join("base"), dir.path().join("cand"));
     write_test_tree(
@@ -1142,10 +1142,30 @@ fn stale_declaration_fails_when_test_already_absent_at_base() {
     );
 
     let r = cpl0_receipt(&[NEW_WAIT4], &[]);
-    let err = diff_trees(&r, &r, &base_tree, &cand_tree).unwrap_err();
+    let result = diff_trees(&r, &r, &base_tree, &cand_tree).unwrap();
+    assert!(result.new.is_empty(), "{result:?}");
+
+    let baseline_file = dir.path().join("baseline.json");
+    let candidate_file = dir.path().join("candidate.json");
+    std::fs::write(&baseline_file, serde_json::to_vec(&r).unwrap()).unwrap();
+    std::fs::write(&candidate_file, serde_json::to_vec(&r).unwrap()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .args(["ci-receipt", "diff", "--baseline"])
+        .arg(&baseline_file)
+        .arg("--candidate")
+        .arg(&candidate_file)
+        .arg("--base-tree")
+        .arg(&base_tree)
+        .arg("--candidate-tree")
+        .arg(&cand_tree)
+        .arg("--fail-on-new")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let summary = String::from_utf8_lossy(&output.stdout);
     assert!(
-        err.to_string().contains("stale retired-test declaration"),
-        "{err}"
+        summary.contains("WARNING") && summary.contains(OLD_WAIT4),
+        "{summary}"
     );
     let empty_err =
         parse_retired_tests("retired = []\n", Path::new(RETIRED_TESTS_PATH)).unwrap_err();
@@ -1284,4 +1304,32 @@ fn retirement_identities_require_rust_identifier_segments() {
             );
         }
     }
+}
+
+#[test]
+fn stale_declaration_neither_validates_candidate_nor_excuses_missing_tests() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let cand = dir.path().join("cand");
+    write_test_tree(&base, "", None);
+    write_test_tree(
+        &cand,
+        "#[test] fn wait4_rejects_unwritable_rusage_without_writing_status() {}",
+        Some(PR583_RETIRED_TOML),
+    );
+    let result = diff_trees(
+        &cpl0_receipt(&[OLD_WAIT4], &[]),
+        &cpl0_receipt(&[], &[OLD_WAIT4]),
+        &base,
+        &cand,
+    )
+    .unwrap();
+    assert!(
+        result.new.contains(&format!("missing:{OLD_WAIT4}")),
+        "{result:?}"
+    );
+    assert!(
+        result.new.contains(&format!("test:kvm-tests:{OLD_WAIT4}")),
+        "{result:?}"
+    );
 }

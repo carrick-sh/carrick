@@ -312,6 +312,8 @@ pub fn failure_keys(receipt: &AcceptReceipt) -> BTreeSet<String> {
 pub struct ReceiptDiff {
     pub new: Vec<String>,
     pub fixed: Vec<String>,
+    /// Inert declarations left over after their retirement landed.
+    pub warnings: Vec<String>,
 }
 
 /// Parse `.github/retired-tests.toml` content and validate entry syntax.
@@ -626,8 +628,16 @@ pub fn diff_with_retired(
         })
     };
     let mut verified_retired: Vec<(&str, &str)> = Vec::with_capacity(retired.len());
+    let mut warnings = Vec::new();
     for entry in retired {
         let (bin, test_path) = split_qualified_test(&entry.test, "test")?;
+        if !tree_has_test(base_tree, bin, test_path)? {
+            warnings.push(format!(
+                "stale retired-test declaration '{}': test is already absent in base source (PR #{}); remove the entry",
+                entry.test, entry.pr
+            ));
+            continue;
+        }
         if has_failed(baseline, bin, test_path) || has_failed(candidate, bin, test_path) {
             return Err(ReceiptError::Retired(format!(
                 "failing test '{}' cannot be retired (PR #{})",
@@ -637,12 +647,6 @@ pub fn diff_with_retired(
         if tree_has_test(candidate_tree, bin, test_path)? {
             return Err(ReceiptError::Retired(format!(
                 "retired test '{}' still exists in candidate source (PR #{})",
-                entry.test, entry.pr
-            )));
-        }
-        if !tree_has_test(base_tree, bin, test_path)? {
-            return Err(ReceiptError::Retired(format!(
-                "stale retired-test declaration '{}': test is already absent in base source (PR #{})",
                 entry.test, entry.pr
             )));
         }
@@ -711,6 +715,7 @@ pub fn diff_with_retired(
     Ok(ReceiptDiff {
         new: next.difference(&base).cloned().collect(),
         fixed: base.difference(&next).cloned().collect(),
+        warnings,
     })
 }
 
@@ -731,6 +736,9 @@ fn print_diff(base: &str, diff: &ReceiptDiff) {
         diff.new.len(),
         diff.fixed.len()
     );
+    for warning in &diff.warnings {
+        println!("WARNING {warning}");
+    }
     for key in &diff.new {
         println!("NEW   {key}");
     }
