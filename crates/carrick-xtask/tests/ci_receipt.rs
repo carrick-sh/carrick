@@ -1333,3 +1333,259 @@ fn stale_declaration_neither_validates_candidate_nor_excuses_missing_tests() {
         "{result:?}"
     );
 }
+
+fn assert_candidate_scan_refuses(extra_path: &str, extra_source: &str, manifest: Option<&str>) {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let cand = dir.path().join("cand");
+    write_source(&base, "crates/example/tests/foo.rs", "#[test] fn gone() {}");
+    write_source(&cand, "crates/example/tests/foo.rs", "");
+    write_source(
+        &cand,
+        "crates/example/kept.rs",
+        "#[test] #[ignore] fn gone() {}",
+    );
+    write_source(&cand, extra_path, extra_source);
+    if let Some(manifest) = manifest {
+        write_source(&cand, "crates/example/Cargo.toml", manifest);
+    }
+    let result = diff_with_retired(
+        &cpl0_receipt(&["foo::gone"], &[]),
+        &cpl0_receipt(&[], &[]),
+        &[retirement("foo::gone", None)],
+        &base,
+        &cand,
+    );
+    let error = result
+        .expect_err("unresolved source excused missing:foo::gone")
+        .to_string();
+    assert!(
+        error.contains("cannot resolve") || error.contains("cannot parse"),
+        "{error}"
+    );
+}
+
+#[test]
+fn retirement_refuses_macro_generated_tests_anywhere_in_candidate_crate() {
+    assert_candidate_scan_refuses(
+        "crates/example/src/lib.rs",
+        "macro_rules! binding { ($name:ident) => { #[test] #[ignore] fn $name() {} }; } binding!(gone);",
+        None,
+    );
+}
+
+#[test]
+fn retirement_refuses_path_modules_anywhere_in_candidate_crate() {
+    assert_candidate_scan_refuses(
+        "crates/example/src/lib.rs",
+        "#[path = \"../kept.rs\"] mod kept;",
+        None,
+    );
+}
+
+#[test]
+fn retirement_refuses_include_anywhere_in_candidate_crate() {
+    assert_candidate_scan_refuses(
+        "crates/example/src/lib.rs",
+        "include!(\"../kept.rs\");",
+        None,
+    );
+}
+
+#[test]
+fn retirement_refuses_unparseable_files_anywhere_in_candidate_crate() {
+    // Balanced tokens parse as a TokenStream but not as a Rust file.
+    assert_candidate_scan_refuses("crates/example/src/unrelated.rs", "fn broken(,) {}", None);
+}
+
+#[test]
+fn retirement_refuses_explicit_test_paths_outside_tests() {
+    for path in ["kept.rs", "tests/../kept.rs", "../elsewhere.rs"] {
+        assert_candidate_scan_refuses(
+            "crates/example/kept.rs",
+            "#[test] #[ignore] fn gone() {}",
+            Some(&format!(
+                "[package]\nname = 'example'\n[[test]]\nname = 'foo'\npath = '{path}'\n"
+            )),
+        );
+    }
+}
+
+#[test]
+fn ordinary_functions_cannot_establish_base_test_presence() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    let cand = dir.path().join("cand");
+    write_source(&base, "crates/example/tests/foo.rs", "fn gone() {}");
+    let result = diff_with_retired(
+        &cpl0_receipt(&["foo::gone"], &[]),
+        &cpl0_receipt(&[], &[]),
+        &[retirement("foo::gone", None)],
+        &base,
+        &cand,
+    )
+    .unwrap();
+    assert_eq!(result.new, ["missing:foo::gone"]);
+}
+
+#[test]
+fn retirement_scans_auto_and_explicit_binary_test_sources() {
+    for (path, manifest, bin) in [
+        ("src/bin/tool.rs", "[package]\nname = 'example'\n", "tool"),
+        (
+            "src/bin/tool/main.rs",
+            "[package]\nname = 'example'\n",
+            "tool",
+        ),
+        (
+            "src/main.rs",
+            "[package]\nname = 'carrick-cli'\n[[bin]]\nname = 'carrick'\npath = 'src/main.rs'\n",
+            "carrick",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let cand = dir.path().join("cand");
+        for root in [&base, &cand] {
+            write_source(root, "crates/example/Cargo.toml", manifest);
+            write_source(
+                root,
+                &format!("crates/example/{path}"),
+                "#[tokio::test] #[ignore] async fn gone() {}",
+            );
+        }
+        let qualified = format!("{bin}::gone");
+        let result = diff_with_retired(
+            &cpl0_receipt(&[&qualified], &[]),
+            &cpl0_receipt(&[], &[]),
+            &[retirement(&qualified, None)],
+            &base,
+            &cand,
+        );
+        let error = result
+            .expect_err("retained binary test was retired")
+            .to_string();
+        assert!(
+            error.contains("still exists in candidate source"),
+            "{bin}: {error}"
+        );
+    }
+}
+
+#[test]
+fn replacement_in_another_lane_does_not_need_to_start() {
+    for lane_metadata in [
+        "",
+        "[package.metadata.carrick.test-lanes]\nfoo = { lane = 'manual', reason = 'hardware' }\n",
+        "[package.metadata.carrick.test-lanes]\n'*' = { lane = 'kvm' }\n",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let cand = dir.path().join("cand");
+        write_source(&base, "crates/example/tests/foo.rs", "#[test] fn gone() {}");
+        write_source(
+            &cand,
+            "crates/example/tests/foo.rs",
+            "#[test] fn replacement() {}",
+        );
+        write_source(
+            &cand,
+            "crates/example/Cargo.toml",
+            &format!("[package]\nname = 'example'\n{lane_metadata}"),
+        );
+        let result = diff_with_retired(
+            &cpl0_receipt(&[], &[]),
+            &cpl0_receipt(&[], &[]),
+            &[retirement("foo::gone", Some("foo::replacement"))],
+            &base,
+            &cand,
+        );
+        assert!(
+            result.is_ok(),
+            "off-lane replacement was required: {lane_metadata}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn failures_from_another_lane_do_not_refuse_retirement() {
+    for lane_metadata in [
+        "",
+        "[package.metadata.carrick.test-lanes]\nfoo = { lane = 'manual', reason = 'hardware' }\n",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base");
+        let cand = dir.path().join("cand");
+        write_source(&base, "crates/example/tests/foo.rs", "#[test] fn gone() {}");
+        write_source(
+            &base,
+            "crates/example/Cargo.toml",
+            &format!("[package]\nname = 'example'\n{lane_metadata}"),
+        );
+        let result = diff_with_retired(
+            &cpl0_receipt(&[], &["foo::gone"]),
+            &cpl0_receipt(&[], &[]),
+            &[retirement("foo::gone", None)],
+            &base,
+            &cand,
+        );
+        assert!(
+            result.is_ok(),
+            "off-lane failure refused retirement: {result:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn source_scan_skips_symlink_files_and_directories() {
+    use std::os::unix::fs::symlink;
+    for link_dir in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("tree");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        write_source(&outside, "foo.rs", "#[test] fn gone() {}");
+        let tests = root.join("crates/example/tests");
+        std::fs::create_dir_all(&tests).unwrap();
+        if link_dir {
+            symlink(&outside, tests.join("foo")).unwrap();
+        } else {
+            symlink(outside.join("foo.rs"), tests.join("foo.rs")).unwrap();
+        }
+        assert!(
+            !tree_has_test(&root, "foo", "gone").unwrap(),
+            "followed symlink (directory={link_dir})"
+        );
+    }
+}
+
+#[test]
+fn retirement_refuses_opaque_item_macros_and_unscanned_target_paths() {
+    for source in [
+        "use generators::binding; binding!(gone);",
+        "#[cfg_attr(test, path = \"../kept.rs\")] mod kept;",
+    ] {
+        assert_candidate_scan_refuses("crates/example/src/lib.rs", source, None);
+    }
+    for (section, path) in [
+        ("test", "tests/kept"),
+        ("bin", "../kept.rs"),
+        ("lib", "../kept.rs"),
+    ] {
+        let header = if section == "lib" {
+            "[lib]"
+        } else if section == "bin" {
+            "[[bin]]"
+        } else {
+            "[[test]]"
+        };
+        assert_candidate_scan_refuses(
+            "crates/example/kept.rs",
+            "#[test] #[ignore] fn gone() {}",
+            Some(&format!(
+                "[package]\nname = 'example'\n{header}\nname = 'foo'\npath = '{path}'\n"
+            )),
+        );
+    }
+}

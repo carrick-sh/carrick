@@ -334,7 +334,7 @@ pub fn parse_retired_tests(raw: &str, path: &Path) -> Result<Vec<RetiredTest>, R
 /// when the file is absent.
 pub fn load_retired_tests(tree_root: &Path) -> Result<Vec<RetiredTest>, ReceiptError> {
     let path = tree_root.join(RETIRED_TESTS_PATH);
-    if !path.exists() {
+    if !regular_path(tree_root, Path::new(RETIRED_TESTS_PATH), false)? {
         return Ok(Vec::new());
     }
     let raw = std::fs::read_to_string(&path).map_err(|source| ReceiptError::Io {
@@ -404,21 +404,49 @@ fn receipt_test_matches(receipt_entry: &str, bin: &str, test_path: &str) -> bool
         == Some(test_path)
 }
 
-fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), ReceiptError> {
-    if !dir.is_dir() {
-        return Ok(());
+fn source_io(path: &Path, source: std::io::Error) -> ReceiptError {
+    ReceiptError::Io {
+        path: path.to_path_buf(),
+        source,
     }
-    for entry in std::fs::read_dir(dir)
-        .map_err(|source| ReceiptError::Io {
-            path: dir.to_path_buf(),
-            source,
-        })?
-        .filter_map(Result::ok)
-    {
+}
+
+// Inspect each component without following links, including directory links.
+fn regular_path(root: &Path, relative: &Path, directory: bool) -> Result<bool, ReceiptError> {
+    let mut path = root.to_path_buf();
+    for component in relative.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Ok(false);
+        }
+        path.push(component);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(source_io(&path, error)),
+        };
+        if metadata.file_type().is_symlink() {
+            return Ok(false);
+        }
+    }
+    let metadata = std::fs::symlink_metadata(&path).map_err(|e| source_io(&path, e))?;
+    Ok(if directory {
+        metadata.is_dir()
+    } else {
+        metadata.is_file()
+    })
+}
+
+fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), ReceiptError> {
+    for entry in std::fs::read_dir(dir).map_err(|e| source_io(dir, e))? {
+        let entry = entry.map_err(|e| source_io(dir, e))?;
         let path = entry.path();
-        if path.is_dir() {
-            collect_rs_files(&path, out)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+        let metadata = std::fs::symlink_metadata(&path).map_err(|e| source_io(&path, e))?;
+        if metadata.is_dir() {
+            // Git internals cannot be part of an archived source tree.
+            if entry.file_name() != ".git" {
+                collect_rs_files(&path, out)?;
+            }
+        } else if metadata.is_file() && path.extension().is_some_and(|e| e == "rs") {
             out.push(path);
         }
     }
@@ -428,154 +456,270 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), ReceiptErr
 fn candidate_crate_dirs(tree_root: &Path) -> Result<Vec<PathBuf>, ReceiptError> {
     let mut dirs = Vec::new();
     let crates_dir = tree_root.join("crates");
-    if crates_dir.is_dir() {
-        for entry in std::fs::read_dir(&crates_dir)
-            .map_err(|source| ReceiptError::Io {
-                path: crates_dir,
-                source,
-            })?
-            .filter_map(Result::ok)
-        {
-            if entry.path().is_dir() {
-                dirs.push(entry.path());
+    if regular_path(tree_root, Path::new("crates"), true)? {
+        for entry in std::fs::read_dir(&crates_dir).map_err(|e| source_io(&crates_dir, e))? {
+            let entry = entry.map_err(|e| source_io(&crates_dir, e))?;
+            let path = entry.path();
+            if std::fs::symlink_metadata(&path)
+                .map_err(|e| source_io(&path, e))?
+                .is_dir()
+            {
+                dirs.push(path);
             }
         }
     }
-    for extra in [
-        tree_root.join("conformance-probes"),
-        tree_root.to_path_buf(),
-    ] {
-        if extra.join("tests").is_dir() || extra.join("src").is_dir() {
-            dirs.push(extra);
-        }
+    if regular_path(tree_root, Path::new("conformance-probes"), true)? {
+        dirs.push(tree_root.join("conformance-probes"));
+    }
+    if regular_path(tree_root, Path::new("tests"), true)?
+        || regular_path(tree_root, Path::new("src"), true)?
+    {
+        dirs.push(tree_root.to_path_buf());
     }
     Ok(dirs)
 }
 
-fn crate_matches_bin(crate_dir: &Path, bin: &str) -> bool {
+fn crate_manifest(crate_dir: &Path) -> Result<toml::Value, ReceiptError> {
+    if !regular_path(crate_dir, Path::new("Cargo.toml"), false)? {
+        return Ok(toml::Value::Table(Default::default()));
+    }
+    let path = crate_dir.join("Cargo.toml");
+    let raw = std::fs::read_to_string(&path).map_err(|e| source_io(&path, e))?;
+    toml::from_str(&raw)
+        .map_err(|e| ReceiptError::Retired(format!("cannot resolve '{}': {e}", path.display())))
+}
+
+fn crate_matches_bin(
+    crate_dir: &Path,
+    manifest: &toml::Value,
+    bin: &str,
+) -> Result<bool, ReceiptError> {
+    let named = |name: &str| name.replace('-', "_") == bin;
     if crate_dir
         .file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|name| name.replace('-', "_") == bin)
-    {
-        return true;
-    }
-    let Ok(raw) = std::fs::read_to_string(crate_dir.join("Cargo.toml")) else {
-        return false;
-    };
-    let Ok(manifest) = toml::from_str::<toml::Value>(&raw) else {
-        return false;
-    };
-    manifest
-        .get("package")
-        .and_then(|p| p.get("name"))
-        .and_then(toml::Value::as_str)
-        .is_some_and(|name| name.replace('-', "_") == bin)
+        .is_some_and(named)
         || manifest
-            .get("test")
-            .and_then(toml::Value::as_array)
-            .is_some_and(|tests| {
-                tests
-                    .iter()
-                    .any(|t| t.get("name").and_then(toml::Value::as_str) == Some(bin))
-            })
-}
-
-fn test_target_sources_for_bin(tree_root: &Path, bin: &str) -> Result<Vec<PathBuf>, ReceiptError> {
-    let mut files = Vec::new();
-    for crate_dir in candidate_crate_dirs(tree_root)? {
-        let tests_dir = crate_dir.join("tests");
-        let direct_test = tests_dir.join(format!("{bin}.rs"));
-        if direct_test.is_file() {
-            files.push(direct_test);
-        }
-        collect_rs_files(&tests_dir.join(bin), &mut files)?;
-        if crate_matches_bin(&crate_dir, bin) {
-            collect_rs_files(&crate_dir.join("src"), &mut files)?;
-            collect_rs_files(&tests_dir, &mut files)?;
-        }
+            .get("package")
+            .and_then(|p| p.get("name"))
+            .and_then(toml::Value::as_str)
+            .is_some_and(named)
+        || manifest
+            .get("lib")
+            .and_then(|p| p.get("name"))
+            .and_then(toml::Value::as_str)
+            .is_some_and(named)
+        || ["test", "bin"].iter().any(|kind| {
+            manifest
+                .get(kind)
+                .and_then(toml::Value::as_array)
+                .is_some_and(|targets| {
+                    targets.iter().any(|t| {
+                        t.get("name")
+                            .and_then(toml::Value::as_str)
+                            .is_some_and(named)
+                    })
+                })
+        })
+    {
+        return Ok(true);
     }
-    files.sort();
-    files.dedup();
-    Ok(files)
-}
-
-fn token_stream_declares_fn(stream: proc_macro2::TokenStream, fn_name: &str) -> bool {
-    let mut prev_was_fn = false;
-    for tt in stream {
-        match tt {
-            proc_macro2::TokenTree::Ident(ident) => {
-                if prev_was_fn && ident == fn_name {
-                    return true;
-                }
-                prev_was_fn = ident == "fn";
-            }
-            proc_macro2::TokenTree::Group(group) => {
-                prev_was_fn = false;
-                if token_stream_declares_fn(group.stream(), fn_name) {
-                    return true;
-                }
-            }
-            _ => prev_was_fn = false,
-        }
-    }
-    false
-}
-
-/// Whether `tree_root` declares the test function for `<bin>::<test_path>` in
-/// `<bin>`'s crate test targets.
-pub fn tree_has_test(tree_root: &Path, bin: &str, test_path: &str) -> Result<bool, ReceiptError> {
-    let fn_name = test_path.rsplit("::").next().unwrap_or(test_path);
-    for file in test_target_sources_for_bin(tree_root, bin)? {
-        let source = std::fs::read_to_string(&file)
-            .map_err(|source| ReceiptError::Io { path: file, source })?;
-        if source.contains(fn_name)
-            && source
-                .parse::<proc_macro2::TokenStream>()
-                .is_ok_and(|stream| token_stream_declares_fn(stream, fn_name))
-        {
+    for (path, directory) in [
+        (format!("tests/{bin}.rs"), false),
+        (format!("tests/{bin}"), true),
+        (format!("src/bin/{bin}.rs"), false),
+        (format!("src/bin/{bin}/main.rs"), false),
+    ] {
+        if regular_path(crate_dir, Path::new(&path), directory)? {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-fn binary_runs_in_receipt_lane(tree_root: &Path, bin: &str, receipt: &AcceptReceipt) -> bool {
-    let Ok(crate_dirs) = candidate_crate_dirs(tree_root) else {
+fn check_target_paths(crate_dir: &Path, manifest: &toml::Value) -> Result<(), ReceiptError> {
+    let targets = ["test", "bin"]
+        .into_iter()
+        .flat_map(|kind| {
+            manifest
+                .get(kind)
+                .and_then(toml::Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(move |target| (kind, target))
+        })
+        .chain(manifest.get("lib").map(|target| ("lib", target)));
+    for (kind, target) in targets {
+        if let Some(path) = target.get("path").and_then(toml::Value::as_str) {
+            let path = Path::new(path);
+            let contained = path
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)));
+            if !contained
+                || path.extension().is_none_or(|e| e != "rs")
+                || (kind == "test" && !path.starts_with("tests"))
+            {
+                return Err(ReceiptError::Retired(format!(
+                    "cannot resolve {kind} source path '{}' in '{}'; require Rust sources inside the crate and test targets inside tests/",
+                    path.display(),
+                    crate_dir.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct TestSourceScan {
+    tests: BTreeSet<String>,
+    unresolved: Option<&'static str>,
+}
+
+fn meta_has_path(meta: &syn::Meta) -> bool {
+    if meta.path().is_ident("path") {
         return true;
-    };
-    for crate_dir in crate_dirs {
-        if !crate_dir.join("tests").join(format!("{bin}.rs")).is_file()
-            && !crate_dir.join("tests").join(bin).is_dir()
-            && !crate_matches_bin(&crate_dir, bin)
-        {
+    }
+    if let syn::Meta::List(list) = meta
+        && list.path.is_ident("cfg_attr")
+    {
+        use syn::parse::Parser;
+        return syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+            .parse2(list.tokens.clone())
+            .map_or(true, |nested| nested.iter().any(meta_has_path));
+    }
+    false
+}
+
+fn meta_is_test(meta: &syn::Meta) -> bool {
+    if meta
+        .path()
+        .segments
+        .last()
+        .is_some_and(|s| s.ident == "test")
+    {
+        return true;
+    }
+    if let syn::Meta::List(list) = meta
+        && list.path.is_ident("cfg_attr")
+    {
+        use syn::parse::Parser;
+        return syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+            .parse2(list.tokens.clone())
+            .is_ok_and(|nested| nested.iter().skip(1).any(meta_is_test));
+    }
+    false
+}
+
+impl<'ast> syn::visit::Visit<'ast> for TestSourceScan {
+    fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+        // An imported generator can emit tests without a local macro_rules!.
+        self.unresolved = Some("item macro generator");
+        syn::visit::visit_item_macro(self, item);
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        if item.attrs.iter().any(|a| meta_is_test(&a.meta)) {
+            self.tests.insert(item.sig.ident.to_string());
+        }
+        syn::visit::visit_item_fn(self, item);
+    }
+
+    fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
+        if meta_has_path(&attr.meta) {
+            self.unresolved = Some("#[path] module");
+        }
+        syn::visit::visit_attribute(self, attr);
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        if let Some(name) = mac.path.segments.last() {
+            if name.ident == "macro_rules" {
+                self.unresolved = Some("macro_rules! generator");
+            } else if name.ident == "include" {
+                self.unresolved = Some("include! source");
+            }
+        }
+        syn::visit::visit_macro(self, mac);
+    }
+}
+
+/// Whether the owning crate contains an attributed test function with this
+/// name. Absence is authoritative only if every Rust source file parses and
+/// there are no unresolved source generators or out-of-tree test targets.
+/// Module paths are conservatively over-approximated: a same-named test in
+/// another module prevents retirement rather than excusing a missing test.
+pub fn tree_has_test(tree_root: &Path, bin: &str, test_path: &str) -> Result<bool, ReceiptError> {
+    use syn::visit::Visit;
+    let fn_name = test_path.rsplit("::").next().unwrap_or(test_path);
+    let mut scan = TestSourceScan::default();
+    for crate_dir in candidate_crate_dirs(tree_root)? {
+        let manifest = crate_manifest(&crate_dir)?;
+        if !crate_matches_bin(&crate_dir, &manifest, bin)? {
             continue;
         }
-        let Some(lanes) = std::fs::read_to_string(crate_dir.join("Cargo.toml"))
-            .ok()
-            .and_then(|raw| toml::from_str::<toml::Value>(&raw).ok())
-            .and_then(|m| {
-                m.get("package")?
-                    .get("metadata")?
-                    .get("carrick")?
-                    .get("test-lanes")?
-                    .as_table()
-                    .cloned()
-            })
-        else {
-            return true;
-        };
-        return match lanes
-            .get(bin)
-            .or_else(|| lanes.get("*"))
-            .and_then(toml::Value::as_str)
-        {
-            Some("kvm") => receipt.profile == "kvm",
-            Some("signed-hvf") => receipt.phase == "signed",
-            _ => true,
-        };
+        check_target_paths(&crate_dir, &manifest)?;
+        let mut files = Vec::new();
+        collect_rs_files(&crate_dir, &mut files)?;
+        for file in files {
+            let source = std::fs::read_to_string(&file).map_err(|e| source_io(&file, e))?;
+            let syntax = syn::parse_file(&source).map_err(|e| {
+                ReceiptError::Retired(format!("cannot parse '{}': {e}", file.display()))
+            })?;
+            scan.visit_file(&syntax);
+            if let Some(reason) = scan.unresolved {
+                return Err(ReceiptError::Retired(format!(
+                    "cannot resolve {reason} in '{}'; retirement of {bin}::{test_path} refused",
+                    file.display()
+                )));
+            }
+        }
     }
-    true
+    Ok(scan.tests.contains(fn_name))
+}
+
+fn binary_runs_in_receipt_lane(
+    tree_root: &Path,
+    bin: &str,
+    receipt: &AcceptReceipt,
+) -> Result<bool, ReceiptError> {
+    let mut found = false;
+    for crate_dir in candidate_crate_dirs(tree_root)? {
+        let manifest = crate_manifest(&crate_dir)?;
+        if !crate_matches_bin(&crate_dir, &manifest, bin)? {
+            continue;
+        }
+        found = true;
+        let declared = manifest
+            .get("package")
+            .and_then(|p| p.get("metadata"))
+            .and_then(|m| m.get("carrick"))
+            .and_then(|c| c.get("test-lanes"));
+        let lane = declared.and_then(|lanes| lanes.get(bin).or_else(|| lanes.get("*")));
+        let lane = lane
+            .and_then(|value| {
+                value
+                    .as_str()
+                    .or_else(|| value.get("lane").and_then(toml::Value::as_str))
+            })
+            .unwrap_or(crate::test_lanes::DEFAULT_LANE);
+        let runs = match lane {
+            "kvm" => receipt.profile == "kvm",
+            "signed-hvf" | "signed-cli" => receipt.phase == "signed",
+            "host" | "integration" => receipt.phase == "host" && receipt.profile != "kvm",
+            "manual" => false,
+            unknown => {
+                return Err(ReceiptError::Retired(format!(
+                    "unknown test lane '{unknown}' for {bin}"
+                )));
+            }
+        };
+        if runs {
+            return Ok(true);
+        }
+    }
+    // Unknown ownership cannot prove that a replacement belongs to another lane.
+    Ok(!found)
 }
 
 /// Compare two receipts of the same gate without retired-test declarations.
@@ -638,7 +782,13 @@ pub fn diff_with_retired(
             ));
             continue;
         }
-        if has_failed(baseline, bin, test_path) || has_failed(candidate, bin, test_path) {
+        if ((has_started(baseline, bin, test_path)
+            || binary_runs_in_receipt_lane(base_tree, bin, baseline)?)
+            && has_failed(baseline, bin, test_path))
+            || ((has_started(candidate, bin, test_path)
+                || binary_runs_in_receipt_lane(candidate_tree, bin, candidate)?)
+                && has_failed(candidate, bin, test_path))
+        {
             return Err(ReceiptError::Retired(format!(
                 "failing test '{}' cannot be retired (PR #{})",
                 entry.test, entry.pr
@@ -659,7 +809,7 @@ pub fn diff_with_retired(
                 )));
             }
             if (has_started(baseline, bin, test_path)
-                || binary_runs_in_receipt_lane(candidate_tree, repl_bin, candidate))
+                || binary_runs_in_receipt_lane(candidate_tree, repl_bin, candidate)?)
                 && !has_started(candidate, repl_bin, repl_test)
             {
                 return Err(ReceiptError::Retired(format!(

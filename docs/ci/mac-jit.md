@@ -325,20 +325,38 @@ When a PR legitimately renames or retires a passing test in an HVF or KVM
 receipt lane, the candidate commit may include a PR-scoped
 `.github/retired-tests.toml` with `[[retired]]` entries naming
 `test = "<bin>::<test>"`, `reason`, `pr`, and optional
-`replaced_by = "<bin>::<test>"`. Hosted `hvf-gate` and `kvm-gate` check out
+`replaced_by = "<bin>::<test>"`. The binary and every test-path segment must
+match `[A-Za-z_][A-Za-z0-9_]*`; receipt matches always include the binary.
+Hosted `hvf-gate` and `kvm-gate` check out
 `github.event.merge_group.base_sha` so the gate binary itself always runs
 trusted base code; `ci-receipt gate` fetches `--candidate-sha` from `origin`
 and inspects the candidate tree's `.github/retired-tests.toml` alongside the
 selected baseline ancestor's tree. A declaration drops `missing:` only when the
-retired test did not fail in base or candidate, is absent from the candidate's
-test sources, still existed in the base's test sources, and (when `replaced_by`
-is given) the replacement test started without failing in the candidate
-receipt. Stale entries (already absent in base source) are inert: they
+retired test did not fail in the applicable receipt lane, is absent from the
+candidate's test sources, still existed in the base's test sources, and (when
+`replaced_by` is given) the replacement test started without failing in the
+candidate receipt. A replacement on another lane need not start unless the
+retired test actually started in this baseline receipt. Lane declarations
+accept strings and `{ lane = "..." }` tables, including wildcards; missing
+metadata means the `host` lane, and `manual` targets have no automated lane.
+An observed start remains authoritative even if metadata says another lane.
+
+The source check parses every Rust source file in each owning crate, including
+integration targets, `src/bin/` and explicit binary targets such as `carrick`.
+Only functions with test attributes (`#[test]`, `#[tokio::test]`, etc.) establish
+test presence; an ignored test still exists. Retirement is refused if a file
+cannot parse or the crate contains unresolved item macros (including
+`macro_rules!` generators), `#[path]` modules, `include!`, or explicit
+`[[test]] path` targets outside `tests/`. Explicit test, binary and library
+source paths must be Rust files inside the crate. Same-named tests in other
+modules conservatively prevent retirement.
+Symlink files and directories are skipped, including manifests and declarations.
+
+Stale entries (already absent in base source) are inert: they
 excuse nothing and appear as non-blocking `WARNING` lines in the gate summary.
 Remove these entries once `main`'s baseline receipt rolls past the rename;
 delete the file when no entries remain. Empty declaration files fail the gate.
-Because
-the hosted gate builds `carrick-xtask` from `base_sha`, any change to
+Because the hosted gate builds `carrick-xtask` from `base_sha`, any change to
 `ci-receipt gate` rolls out as soon as it lands on `main` and becomes the
 `base_sha` of subsequent merge groups.
 
