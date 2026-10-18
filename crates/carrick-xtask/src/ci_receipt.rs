@@ -7,12 +7,38 @@
 
 use crate::accept::AcceptReceipt;
 use crate::ci_scaler::{KERNEL_RUNTIME_WORKFLOW, REPOSITORY};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+
+/// Relative path to the PR-scoped retired-tests declaration file.
+pub const RETIRED_TESTS_PATH: &str = ".github/retired-tests.toml";
+
+/// One PR-scoped retired or renamed test declaration in `.github/retired-tests.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetiredTest {
+    /// Qualified `<bin>::<test>` identity of the retired test.
+    pub test: String,
+    /// Why the test was retired or renamed.
+    pub reason: String,
+    /// Replacement `<bin>::<test>` that must start in the candidate receipt.
+    #[serde(default)]
+    pub replaced_by: Option<String>,
+    /// PR number that retires or renames this test.
+    pub pr: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetiredTestsDoc {
+    #[serde(default, rename = "retired")]
+    retired: Vec<RetiredTest>,
+}
 
 #[derive(Debug, Error)]
 pub enum ReceiptError {
@@ -32,6 +58,8 @@ pub enum ReceiptError {
     Mismatch(String),
     #[error("{0}")]
     Baseline(String),
+    #[error("{0}")]
+    Retired(String),
     #[error("{count} NEW failure(s) against base {base}")]
     New { count: usize, base: String },
 }
@@ -286,15 +314,296 @@ pub struct ReceiptDiff {
     pub fixed: Vec<String>,
 }
 
-/// Compare two receipts of the same gate. Different phases or profiles are
-/// different gates; comparing them would invent NEW/FIXED entries. Any test
-/// the baseline passed (started and not failed) that the candidate did not
-/// start (`missing:<bin>::<test>`) or binary the baseline finished (without
-/// all its base tests failing) that the candidate did not finish
-/// (`unfinished:<bin>`) is added as a NEW failure key.
+/// Parse `.github/retired-tests.toml` content and validate entry syntax.
+pub fn parse_retired_tests(raw: &str, path: &Path) -> Result<Vec<RetiredTest>, ReceiptError> {
+    let doc: RetiredTestsDoc = toml::from_str(raw)
+        .map_err(|err| ReceiptError::Retired(format!("invalid '{}': {err}", path.display())))?;
+    if doc.retired.is_empty() {
+        return Err(ReceiptError::Retired(format!(
+            "'{}' has no [[retired]] entries; delete the file when empty",
+            path.display()
+        )));
+    }
+    validate_retired_entries(&doc.retired)?;
+    Ok(doc.retired)
+}
+
+/// Load `.github/retired-tests.toml` from `tree_root`, returning an empty list
+/// when the file is absent.
+pub fn load_retired_tests(tree_root: &Path) -> Result<Vec<RetiredTest>, ReceiptError> {
+    let path = tree_root.join(RETIRED_TESTS_PATH);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = std::fs::read_to_string(&path).map_err(|source| ReceiptError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    parse_retired_tests(&raw, &path)
+}
+
+fn validate_retired_entries(retired: &[RetiredTest]) -> Result<(), ReceiptError> {
+    let mut seen = BTreeSet::new();
+    for entry in retired {
+        let (bin, test_path) = split_qualified_test(&entry.test, "test")?;
+        if !seen.insert(entry.test.as_str()) {
+            return Err(ReceiptError::Retired(format!(
+                "duplicate retired test declaration '{}'",
+                entry.test
+            )));
+        }
+        if entry.reason.trim().is_empty() || entry.pr == 0 {
+            return Err(ReceiptError::Retired(format!(
+                "retired test '{}' requires a non-empty reason and positive PR number",
+                entry.test
+            )));
+        }
+        if let Some(replaced_by) = &entry.replaced_by {
+            let (repl_bin, repl_test) = split_qualified_test(replaced_by, "replaced_by")?;
+            if repl_bin == bin && repl_test == test_path {
+                return Err(ReceiptError::Retired(format!(
+                    "retired test '{}' cannot name itself as replaced_by",
+                    entry.test
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn split_qualified_test<'a>(
+    qualified: &'a str,
+    field: &str,
+) -> Result<(&'a str, &'a str), ReceiptError> {
+    let Some((bin, test_path)) = qualified.split_once("::") else {
+        return Err(ReceiptError::Retired(format!(
+            "retired-tests {field} '{qualified}' must be '<bin>::<test>'"
+        )));
+    };
+    let fn_name = test_path.rsplit("::").next().unwrap_or(test_path);
+    if bin.trim().is_empty()
+        || test_path.trim().is_empty()
+        || fn_name.trim().is_empty()
+        || bin.contains(['/', ':'])
+    {
+        return Err(ReceiptError::Retired(format!(
+            "retired-tests {field} '{qualified}' must be '<bin>::<test>'"
+        )));
+    }
+    Ok((bin, test_path))
+}
+
+fn receipt_test_matches(receipt_entry: &str, bin: &str, test_path: &str) -> bool {
+    receipt_entry == test_path
+        || receipt_entry
+            .strip_prefix(bin)
+            .and_then(|rest| rest.strip_prefix("::"))
+            == Some(test_path)
+}
+
+fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), ReceiptError> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir)
+        .map_err(|source| ReceiptError::Io {
+            path: dir.to_path_buf(),
+            source,
+        })?
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, out)?;
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn candidate_crate_dirs(tree_root: &Path) -> Result<Vec<PathBuf>, ReceiptError> {
+    let mut dirs = Vec::new();
+    let crates_dir = tree_root.join("crates");
+    if crates_dir.is_dir() {
+        for entry in std::fs::read_dir(&crates_dir)
+            .map_err(|source| ReceiptError::Io {
+                path: crates_dir,
+                source,
+            })?
+            .filter_map(Result::ok)
+        {
+            if entry.path().is_dir() {
+                dirs.push(entry.path());
+            }
+        }
+    }
+    for extra in [
+        tree_root.join("conformance-probes"),
+        tree_root.to_path_buf(),
+    ] {
+        if extra.join("tests").is_dir() || extra.join("src").is_dir() {
+            dirs.push(extra);
+        }
+    }
+    Ok(dirs)
+}
+
+fn crate_matches_bin(crate_dir: &Path, bin: &str) -> bool {
+    if crate_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.replace('-', "_") == bin)
+    {
+        return true;
+    }
+    let Ok(raw) = std::fs::read_to_string(crate_dir.join("Cargo.toml")) else {
+        return false;
+    };
+    let Ok(manifest) = toml::from_str::<toml::Value>(&raw) else {
+        return false;
+    };
+    manifest
+        .get("package")
+        .and_then(|p| p.get("name"))
+        .and_then(toml::Value::as_str)
+        .is_some_and(|name| name.replace('-', "_") == bin)
+        || manifest
+            .get("test")
+            .and_then(toml::Value::as_array)
+            .is_some_and(|tests| {
+                tests
+                    .iter()
+                    .any(|t| t.get("name").and_then(toml::Value::as_str) == Some(bin))
+            })
+}
+
+fn test_target_sources_for_bin(tree_root: &Path, bin: &str) -> Result<Vec<PathBuf>, ReceiptError> {
+    let mut files = Vec::new();
+    for crate_dir in candidate_crate_dirs(tree_root)? {
+        let tests_dir = crate_dir.join("tests");
+        let direct_test = tests_dir.join(format!("{bin}.rs"));
+        if direct_test.is_file() {
+            files.push(direct_test);
+        }
+        collect_rs_files(&tests_dir.join(bin), &mut files)?;
+        if crate_matches_bin(&crate_dir, bin) {
+            collect_rs_files(&crate_dir.join("src"), &mut files)?;
+            collect_rs_files(&tests_dir, &mut files)?;
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+fn token_stream_declares_fn(stream: proc_macro2::TokenStream, fn_name: &str) -> bool {
+    let mut prev_was_fn = false;
+    for tt in stream {
+        match tt {
+            proc_macro2::TokenTree::Ident(ident) => {
+                if prev_was_fn && ident == fn_name {
+                    return true;
+                }
+                prev_was_fn = ident == "fn";
+            }
+            proc_macro2::TokenTree::Group(group) => {
+                prev_was_fn = false;
+                if token_stream_declares_fn(group.stream(), fn_name) {
+                    return true;
+                }
+            }
+            _ => prev_was_fn = false,
+        }
+    }
+    false
+}
+
+/// Whether `tree_root` declares the test function for `<bin>::<test_path>` in
+/// `<bin>`'s crate test targets.
+pub fn tree_has_test(tree_root: &Path, bin: &str, test_path: &str) -> Result<bool, ReceiptError> {
+    let fn_name = test_path.rsplit("::").next().unwrap_or(test_path);
+    for file in test_target_sources_for_bin(tree_root, bin)? {
+        let source = std::fs::read_to_string(&file)
+            .map_err(|source| ReceiptError::Io { path: file, source })?;
+        if source.contains(fn_name)
+            && source
+                .parse::<proc_macro2::TokenStream>()
+                .is_ok_and(|stream| token_stream_declares_fn(stream, fn_name))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn binary_runs_in_receipt_lane(tree_root: &Path, bin: &str, receipt: &AcceptReceipt) -> bool {
+    let Ok(crate_dirs) = candidate_crate_dirs(tree_root) else {
+        return true;
+    };
+    for crate_dir in crate_dirs {
+        if !crate_dir.join("tests").join(format!("{bin}.rs")).is_file()
+            && !crate_dir.join("tests").join(bin).is_dir()
+            && !crate_matches_bin(&crate_dir, bin)
+        {
+            continue;
+        }
+        let Some(lanes) = std::fs::read_to_string(crate_dir.join("Cargo.toml"))
+            .ok()
+            .and_then(|raw| toml::from_str::<toml::Value>(&raw).ok())
+            .and_then(|m| {
+                m.get("package")?
+                    .get("metadata")?
+                    .get("carrick")?
+                    .get("test-lanes")?
+                    .as_table()
+                    .cloned()
+            })
+        else {
+            return true;
+        };
+        return match lanes
+            .get(bin)
+            .or_else(|| lanes.get("*"))
+            .and_then(toml::Value::as_str)
+        {
+            Some("kvm") => receipt.profile == "kvm",
+            Some("signed-hvf") => receipt.phase == "signed",
+            _ => true,
+        };
+    }
+    true
+}
+
+/// Compare two receipts of the same gate without retired-test declarations.
 pub fn diff(
     baseline: &AcceptReceipt,
     candidate: &AcceptReceipt,
+) -> Result<ReceiptDiff, ReceiptError> {
+    let empty = Path::new("");
+    diff_with_retired(baseline, candidate, &[], empty, empty)
+}
+
+/// Compare two receipts while validating `.github/retired-tests.toml` loaded
+/// from `candidate_tree` against `base_tree` and `candidate_tree` sources.
+pub fn diff_trees(
+    baseline: &AcceptReceipt,
+    candidate: &AcceptReceipt,
+    base_tree: &Path,
+    candidate_tree: &Path,
+) -> Result<ReceiptDiff, ReceiptError> {
+    let retired = load_retired_tests(candidate_tree)?;
+    diff_with_retired(baseline, candidate, &retired, base_tree, candidate_tree)
+}
+
+/// Compare two receipts with explicit retired-test declarations verified
+/// against `base_tree` and `candidate_tree`.
+pub fn diff_with_retired(
+    baseline: &AcceptReceipt,
+    candidate: &AcceptReceipt,
+    retired: &[RetiredTest],
+    base_tree: &Path,
+    candidate_tree: &Path,
 ) -> Result<ReceiptDiff, ReceiptError> {
     if baseline.phase != candidate.phase || baseline.profile != candidate.profile {
         return Err(ReceiptError::Mismatch(format!(
@@ -302,6 +611,61 @@ pub fn diff(
             baseline.phase, baseline.profile, candidate.phase, candidate.profile
         )));
     }
+    validate_retired_entries(retired)?;
+    let has_failed = |r: &AcceptReceipt, b: &str, t: &str| {
+        r.steps
+            .iter()
+            .any(|s| s.failed_tests.iter().any(|e| receipt_test_matches(e, b, t)))
+    };
+    let has_started = |r: &AcceptReceipt, b: &str, t: &str| {
+        r.steps.iter().any(|s| {
+            s.started_tests
+                .iter()
+                .any(|e| receipt_test_matches(e, b, t))
+        })
+    };
+    let mut verified_retired: Vec<(&str, &str)> = Vec::with_capacity(retired.len());
+    for entry in retired {
+        let (bin, test_path) = split_qualified_test(&entry.test, "test")?;
+        if has_failed(baseline, bin, test_path) || has_failed(candidate, bin, test_path) {
+            return Err(ReceiptError::Retired(format!(
+                "failing test '{}' cannot be retired (PR #{})",
+                entry.test, entry.pr
+            )));
+        }
+        if tree_has_test(candidate_tree, bin, test_path)? {
+            return Err(ReceiptError::Retired(format!(
+                "retired test '{}' still exists in candidate source (PR #{})",
+                entry.test, entry.pr
+            )));
+        }
+        if !tree_has_test(base_tree, bin, test_path)? {
+            return Err(ReceiptError::Retired(format!(
+                "stale retired-test declaration '{}': test is already absent in base source (PR #{})",
+                entry.test, entry.pr
+            )));
+        }
+        if let Some(replaced_by) = &entry.replaced_by {
+            let (repl_bin, repl_test) = split_qualified_test(replaced_by, "replaced_by")?;
+            if has_failed(candidate, repl_bin, repl_test) {
+                return Err(ReceiptError::Retired(format!(
+                    "replacement test '{replaced_by}' for retired test '{}' failed in candidate receipt (PR #{})",
+                    entry.test, entry.pr
+                )));
+            }
+            if (has_started(baseline, bin, test_path)
+                || binary_runs_in_receipt_lane(candidate_tree, repl_bin, candidate))
+                && !has_started(candidate, repl_bin, repl_test)
+            {
+                return Err(ReceiptError::Retired(format!(
+                    "replacement test '{replaced_by}' for retired test '{}' did not start in candidate receipt (PR #{})",
+                    entry.test, entry.pr
+                )));
+            }
+        }
+        verified_retired.push((bin, test_path));
+    }
+
     let base = failure_keys(baseline);
     let mut next = receipt_failure_keys(candidate, Some(baseline));
     for base_step in &baseline.steps {
@@ -314,7 +678,13 @@ pub fn diff(
             .flat_map(|s| s.started_tests.iter().map(String::as_str))
             .collect();
         for test in &base_step.started_tests {
-            if !base_failed.contains(test.as_str()) && !cand_started.contains(test.as_str()) {
+            let is_retired = verified_retired
+                .iter()
+                .any(|(bin, test_path)| receipt_test_matches(test, bin, test_path));
+            if !base_failed.contains(test.as_str())
+                && !cand_started.contains(test.as_str())
+                && !is_retired
+            {
                 next.insert(format!("missing:{test}"));
             }
         }
@@ -666,6 +1036,83 @@ fn download_baseline(
     Ok((receipt, ancestor))
 }
 
+fn git_object_exists(spec: &str) -> Result<bool, ReceiptError> {
+    let status = Command::new("git")
+        .args(["cat-file", "-e", spec])
+        .status()
+        .map_err(|source| ReceiptError::Io {
+            path: PathBuf::from("git"),
+            source,
+        })?;
+    Ok(status.success())
+}
+
+fn ensure_git_commit(sha: &str) -> Result<(), ReceiptError> {
+    let commit_spec = format!("{sha}^{{commit}}");
+    if git_object_exists(&commit_spec)? {
+        return Ok(());
+    }
+    let fetch = Command::new("git")
+        .args(["fetch", "--no-tags", "--depth=1", "origin", sha])
+        .output()
+        .map_err(|source| ReceiptError::Io {
+            path: PathBuf::from("git"),
+            source,
+        })?;
+    if !fetch.status.success() || !git_object_exists(&commit_spec)? {
+        return Err(ReceiptError::Baseline(format!(
+            "git fetch origin {sha} failed ({}): {}",
+            fetch.status,
+            String::from_utf8_lossy(&fetch.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+fn archive_git_tree(sha: &str) -> Result<tempfile::TempDir, ReceiptError> {
+    let temp = tempfile::tempdir().map_err(|source| ReceiptError::Io {
+        path: PathBuf::from("tempdir"),
+        source,
+    })?;
+    let output = Command::new("git")
+        .args(["archive", "--format=tar", sha])
+        .output()
+        .map_err(|source| ReceiptError::Io {
+            path: PathBuf::from("git"),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(ReceiptError::Baseline(format!(
+            "git archive {sha} failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    tar::Archive::new(std::io::Cursor::new(output.stdout))
+        .unpack(temp.path())
+        .map_err(|source| ReceiptError::Io {
+            path: temp.path().to_path_buf(),
+            source,
+        })?;
+    Ok(temp)
+}
+
+fn diff_for_gate_commits(
+    base: &AcceptReceipt,
+    candidate: &AcceptReceipt,
+    base_sha: &str,
+    candidate_sha: &str,
+) -> Result<ReceiptDiff, ReceiptError> {
+    ensure_git_commit(candidate_sha)?;
+    if !git_object_exists(&format!("{candidate_sha}:{RETIRED_TESTS_PATH}"))? {
+        return diff(base, candidate);
+    }
+    ensure_git_commit(base_sha)?;
+    let base_tree = archive_git_tree(base_sha)?;
+    let candidate_tree = archive_git_tree(candidate_sha)?;
+    diff_trees(base, candidate, base_tree.path(), candidate_tree.path())
+}
+
 #[derive(clap::Args, Debug)]
 pub struct ReceiptArgs {
     #[command(subcommand)]
@@ -680,6 +1127,12 @@ pub enum ReceiptAction {
         baseline: PathBuf,
         #[arg(long)]
         candidate: PathBuf,
+        /// Optional base source tree for verifying `.github/retired-tests.toml`.
+        #[arg(long)]
+        base_tree: Option<PathBuf>,
+        /// Optional candidate source tree for loading `.github/retired-tests.toml`.
+        #[arg(long)]
+        candidate_tree: Option<PathBuf>,
         /// Exit non-zero when NEW is non-empty.
         #[arg(long)]
         fail_on_new: bool,
@@ -708,6 +1161,12 @@ pub enum ReceiptAction {
         wait_minutes: u64,
         #[arg(long, default_value_t = 60)]
         poll_seconds: u64,
+        /// Optional base source tree override (otherwise unpacked from the selected ancestor SHA).
+        #[arg(long)]
+        base_tree: Option<PathBuf>,
+        /// Optional candidate source tree override (otherwise unpacked from `--candidate-sha`).
+        #[arg(long)]
+        candidate_tree: Option<PathBuf>,
     },
 }
 
@@ -716,10 +1175,19 @@ pub fn run(args: ReceiptArgs) -> Result<(), ReceiptError> {
         ReceiptAction::Diff {
             baseline,
             candidate,
+            base_tree,
+            candidate_tree,
             fail_on_new,
         } => {
             let base = load(&baseline)?;
-            let result = diff(&base, &load(&candidate)?)?;
+            let cand = load(&candidate)?;
+            let result = if base_tree.is_some() || candidate_tree.is_some() {
+                let base_dir = base_tree.as_deref().unwrap_or_else(|| Path::new("."));
+                let cand_dir = candidate_tree.as_deref().unwrap_or_else(|| Path::new("."));
+                diff_trees(&base, &cand, base_dir, cand_dir)?
+            } else {
+                diff(&base, &cand)?
+            };
             print_diff(&base.head, &result);
             if fail_on_new && !result.new.is_empty() {
                 return Err(ReceiptError::New {
@@ -738,6 +1206,8 @@ pub fn run(args: ReceiptArgs) -> Result<(), ReceiptError> {
             download_dir,
             wait_minutes,
             poll_seconds,
+            base_tree,
+            candidate_tree,
         } => {
             validate_sha(&candidate_sha)?;
             let candidate = load(&candidate_receipt(
@@ -765,7 +1235,13 @@ pub fn run(args: ReceiptArgs) -> Result<(), ReceiptError> {
                 base.overall,
                 failure_keys(&base).len()
             );
-            let result = diff(&base, &candidate)?;
+            let result = if base_tree.is_some() || candidate_tree.is_some() {
+                let base_dir = base_tree.as_deref().unwrap_or_else(|| Path::new("."));
+                let cand_dir = candidate_tree.as_deref().unwrap_or_else(|| Path::new("."));
+                diff_trees(&base, &candidate, base_dir, cand_dir)?
+            } else {
+                diff_for_gate_commits(&base, &candidate, &selected_ancestor, &candidate_sha)?
+            };
             print_diff(&selected_ancestor, &result);
             if result.new.is_empty() {
                 Ok(())

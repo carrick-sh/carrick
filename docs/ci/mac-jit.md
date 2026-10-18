@@ -319,6 +319,27 @@ unconditionally with no docs-only or hardware skip. The docs-only fast path
 is restricted to `pull_request` CI runs (where only unreferenced prose changed),
 and draft PRs skip expensive jobs while keeping cheap Linux checks.
 
+### Retiring or renaming gated tests (`.github/retired-tests.toml`)
+
+When a PR legitimately renames or retires a passing test in an HVF or KVM
+receipt lane, the candidate commit may include a PR-scoped
+`.github/retired-tests.toml` with `[[retired]]` entries naming
+`test = "<bin>::<test>"`, `reason`, `pr`, and optional
+`replaced_by = "<bin>::<test>"`. Hosted `hvf-gate` and `kvm-gate` check out
+`github.event.merge_group.base_sha` so the gate binary itself always runs
+trusted base code; `ci-receipt gate` fetches `--candidate-sha` from `origin`
+and inspects the candidate tree's `.github/retired-tests.toml` alongside the
+selected baseline ancestor's tree. A declaration drops `missing:` only when the
+retired test did not fail in base or candidate, is absent from the candidate's
+test sources, still existed in the base's test sources, and (when `replaced_by`
+is given) the replacement test started without failing in the candidate
+receipt. Stale entries (already absent in base source) and empty
+`.github/retired-tests.toml` files fail the gate so the file stays
+delete-at-zero once `main`'s baseline receipt rolls past the rename. Because
+the hosted gate builds `carrick-xtask` from `base_sha`, any change to
+`ci-receipt gate` rolls out as soon as it lands on `main` and becomes the
+`base_sha` of subsequent merge groups.
+
 ### Cumulative merge groups (#402)
 
 Both controllers check supersession in the shared `Github::vet` path,
