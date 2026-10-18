@@ -38,49 +38,56 @@ jobs:
           ref: main
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/cache@v4
-        with:
-          path: ~/.rustup/toolchains
-          key: dispatch-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
           toolchain: '1.96.0'
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
-        with:
-          shared-key: dispatch-worker
+      # Credentialed driver code must never be compiled from restored objects or
+      # toolchains. Keep the resulting executable outside the restored target.
       - name: Build workflow driver
         id: driver
         timeout-minutes: 10
-        run: cargo build --locked --release -p carrick-xtask
+        run: |
+          cargo build --locked --release -p carrick-xtask
+          cp target/release/carrick-xtask "$RUNNER_TEMP/carrick-dispatch-driver"
+      - uses: actions/cache/restore@v4
+        with:
+          path: ~/.rustup/toolchains
+          key: dispatch-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          shared-key: dispatch-worker
+          cache-bin: 'false'
+          save-if: 'false'
       - name: Bootstrap pinned agent tools and private foreground launcher
         id: bootstrap
         timeout-minutes: 10
         env:
           GH_TOKEN: ${{ secrets.AGENT_DIRECTOR_TOKEN }}
-        run: target/release/carrick-xtask agent-runner bootstrap
+        run: '"$RUNNER_TEMP/carrick-dispatch-driver" agent-runner bootstrap'
       - name: Materialize selected provider credentials
         id: auth
         env:
           CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
           AGY_OAUTH_TOKEN: ${{ secrets.AGY_OAUTH_TOKEN }}
-        run: target/release/carrick-xtask agent-runner auth --event "$GITHUB_EVENT_PATH"
+        run: '"$RUNNER_TEMP/carrick-dispatch-driver" agent-runner auth --event "$GITHUB_EVENT_PATH"'
       - name: Run worker and publish draft PR and contract
+        id: worker
         if: ${{ !cancelled() && steps.driver.outcome == 'success' }}
         timeout-minutes: 40
         env:
           GH_TOKEN: ${{ secrets.AGENT_WORKER_TOKEN }}
         run: >-
-          target/release/carrick-xtask dispatch-worker run --event "$GITHUB_EVENT_PATH"
+          "$RUNNER_TEMP/carrick-dispatch-driver" dispatch-worker run --event "$GITHUB_EVENT_PATH"
           --setup-status '${{ steps.bootstrap.outcome }}/${{ steps.auth.outcome }}'
       - name: Remove job credentials and provider state
         if: always()
         run: |
-          if test -x target/release/carrick-xtask; then
-            target/release/carrick-xtask agent-runner cleanup
+          if test -x "$RUNNER_TEMP/carrick-dispatch-driver"; then
+            "$RUNNER_TEMP/carrick-dispatch-driver" agent-runner cleanup
           fi
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: ${{ always() && steps.worker.outputs.artifact_path != '' }}
         with:
           name: dispatch-${{ github.event.issue.number }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: dispatch-result/
+          path: ${{ steps.worker.outputs.artifact_path }}
           if-no-files-found: warn

@@ -4,6 +4,87 @@ use super::*;
 
 const SYNTHETIC_SECRET: &str = "synthetic-never-a-real-credential";
 
+#[test]
+fn template_9000_destructive_permissions_are_rejected_in_every_site_profile() {
+    for lane in [CloneLane::Kvm, CloneLane::Agent] {
+        let site = site::CONTABO.for_lane(lane).unwrap();
+        let result = verify_protected_vms(site, |vm| {
+            Ok(if vm == 9000 {
+                serde_json::json!({"/vms/9000": {"VM.PowerMgmt": 1}})
+            } else {
+                serde_json::json!({})
+            })
+        });
+        assert!(
+            result.is_err(),
+            "destructive template rights admitted for {lane:?}"
+        );
+    }
+}
+
+#[test]
+fn template_9000_clone_rights_never_license_other_protected_workers() {
+    for lane in [CloneLane::Kvm, CloneLane::Agent] {
+        let site = site::CONTABO.for_lane(lane).unwrap();
+        assert!(
+            verify_protected_vms(site, |vm| {
+                Ok(if vm == 9000 {
+                    serde_json::json!({"/vms/9000": {"VM.Audit": 1, "VM.Clone": 1}})
+                } else {
+                    serde_json::json!({})
+                })
+            })
+            .is_ok()
+        );
+        assert!(
+            verify_protected_vms(site, |vm| {
+                Ok(serde_json::json!({format!("/vms/{vm}"): {"VM.Clone": 1}}))
+            })
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn serial_host_execute_truncation_never_retains_partial_opaque_credential() {
+    const CHILD: &str = "CARRICK_TEST_OPAQUE_STDERR_CHILD";
+    const SECRET: &str = "opaque-fixture-secret-unknown-format";
+    if std::env::var(CHILD).as_deref() != Ok("1") {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ci_scaler::live::security_tests::serial_host_execute_truncation_never_retains_partial_opaque_credential",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("GH_TOKEN", SECRET)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "opaque credential fixture failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let err = execute(
+        Command::new("/bin/sh").args([
+            "-c",
+            "printf 'useful diagnostic\\n' >&2; head -c 16358 /dev/zero | tr '\\000' x >&2; printf '%s' \"$GH_TOKEN\" >&2; exit 42",
+        ]),
+        &[],
+        Duration::from_secs(5),
+    )
+    .unwrap_err();
+    let rendered = format!("{err} {err:?}");
+    assert!(rendered.contains("useful diagnostic"));
+    assert!(
+        !rendered.contains("opaque-f"),
+        "stderr exposed an opaque credential fragment"
+    );
+}
+
 fn request_complete(request: &[u8]) -> Option<usize> {
     let header_end = request.windows(4).position(|part| part == b"\r\n\r\n")? + 4;
     let headers = std::str::from_utf8(&request[..header_end]).ok()?;
@@ -447,7 +528,7 @@ fn http_fixture_drains_split_post_body_before_closing_connection() {
 }
 
 #[test]
-fn serial_host_execute_surfaces_exit_status_without_external_output_and_strips_library_paths() {
+fn serial_host_execute_retains_bounded_redacted_stderr_and_strips_library_paths() {
     let token = Token {
         id: "synthetic-id".into(),
         secret: SYNTHETIC_SECRET.into(),
@@ -455,7 +536,7 @@ fn serial_host_execute_surfaces_exit_status_without_external_output_and_strips_l
     let config = request_config(&token, &PveCall::Get).unwrap();
     let absent_secret = "absent-from-input-secret";
     let script = format!(
-        "printf 'Authorization: Bearer {absent_secret} PVEAPIToken=synthetic-id={SYNTHETIC_SECRET}\\n'; printf 'curl: (22) Authorization: Bearer {absent_secret} {SYNTHETIC_SECRET}\\n' >&2; exit 22"
+        "printf 'Authorization: Bearer {absent_secret}\\n'; printf 'curl: (22) permission denied\\nAuthorization: Bearer {absent_secret}\\nPVEAPIToken=synthetic-id={SYNTHETIC_SECRET}\\n' >&2; exit 22"
     );
     let err = execute(
         Command::new("/bin/sh").args(["-c", &script]),
@@ -464,45 +545,52 @@ fn serial_host_execute_surfaces_exit_status_without_external_output_and_strips_l
     )
     .unwrap_err();
     let rendered = format!("{err} | {err:?}");
-    assert_eq!(
-        err.to_string(),
-        "external command failed: sh exited with code 22"
-    );
+    assert!(err.to_string().contains("sh exited with code 22"));
+    assert!(err.to_string().contains("curl: (22) permission denied"));
     assert!(
-        !rendered.contains(SYNTHETIC_SECRET)
-            && !rendered.contains(absent_secret)
-            && !rendered.contains("Authorization")
-            && !rendered.contains("curl:"),
-        "error included external output: {rendered}"
+        !rendered.contains(SYNTHETIC_SECRET) && !rendered.contains(absent_secret),
+        "error included credentials: {rendered}"
     );
 
     let sig_err = execute(
         Command::new("/bin/sh").args([
             "-c",
-            &format!("printf '{SYNTHETIC_SECRET} {absent_secret}\\n' >&2; kill -9 $$"),
+            &format!(
+                "printf 'runner stopped\\nAuthorization: Bearer {absent_secret}\\n' >&2; kill -9 $$"
+            ),
         ]),
         &[],
         Duration::from_secs(60),
     )
     .unwrap_err();
-    assert_eq!(
-        sig_err.to_string(),
-        "external command failed: sh killed by signal 9"
-    );
+    assert!(sig_err.to_string().contains("sh killed by signal 9"));
+    assert!(sig_err.to_string().contains("runner stopped"));
+    assert!(!format!("{sig_err:?}").contains(absent_secret));
 
     let timeout_err = execute(
         Command::new("/bin/sh").args([
             "-c",
-            &format!("printf '{SYNTHETIC_SECRET} {absent_secret}\\n' >&2; exec sleep 5"),
+            &format!("printf 'waiting for runner\\nAuthorization: Bearer {absent_secret}\\n' >&2; exec sleep 5"),
         ]),
         &[],
         Duration::from_millis(50),
     )
     .unwrap_err();
-    assert_eq!(
-        timeout_err.to_string(),
-        "external command failed: sh timed out after 50ms"
-    );
+    assert!(timeout_err.to_string().contains("sh timed out after 50ms"));
+    assert!(timeout_err.to_string().contains("waiting for runner"));
+    assert!(!format!("{timeout_err:?}").contains(absent_secret));
+
+    let bounded_err = execute(
+        Command::new("/bin/sh").args([
+            "-c",
+            "printf 'runner diagnostic\\n' >&2; head -c 131072 /dev/zero >&2; exit 23",
+        ]),
+        &[],
+        Duration::from_secs(60),
+    )
+    .unwrap_err();
+    assert!(bounded_err.to_string().contains("runner diagnostic"));
+    assert!(bounded_err.to_string().len() <= 17 * 1024);
 
     // Writing > 64 KiB to stderr must not SIGPIPE the child.
     let large_stderr = execute(

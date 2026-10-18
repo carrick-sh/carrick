@@ -135,6 +135,104 @@ fn private_dir(path: &Path) -> Result<(), ScalerError> {
     Ok(())
 }
 
+/// Give the agent writable Rust state without modifying the runner's cache homes.
+pub(crate) fn isolate_rust_homes(
+    command: &mut std::process::Command,
+    state: &Path,
+) -> Result<(), ScalerError> {
+    let private = state.canonicalize()?.join("rust");
+    private_dir(&private)?;
+    let mut homes = Vec::new();
+    for (key, directory) in [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")] {
+        let configured = command
+            .get_envs()
+            .find(|(name, _)| *name == key)
+            .and_then(|(_, value)| value.map(PathBuf::from));
+        let source = configured
+            .or_else(|| std::env::var_os(key).map(PathBuf::from))
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(directory)))
+            .ok_or(ScalerError::Guard("Rust home is unavailable"))?
+            .canonicalize()?;
+        let destination = private.join(directory.trim_start_matches('.'));
+        copy_rust_home(&source, &destination, &mut Vec::new())?;
+        command.env(key, &destination);
+        homes.push((source, destination));
+    }
+    let configured_path = command
+        .get_envs()
+        .find(|(key, _)| *key == "PATH")
+        .and_then(|(_, value)| value.map(std::ffi::OsString::from));
+    let original_path = configured_path
+        .or_else(|| std::env::var_os("PATH"))
+        .ok_or(ScalerError::Guard("runner PATH is unavailable"))?;
+    let mut paths = vec![private.join("cargo/bin")];
+    for path in std::env::split_paths(&original_path) {
+        let mapped = homes
+            .iter()
+            .find_map(|(source, destination)| {
+                path.strip_prefix(source)
+                    .ok()
+                    .map(|suffix| destination.join(suffix))
+            })
+            .unwrap_or(path);
+        if !paths.contains(&mapped) {
+            paths.push(mapped);
+        }
+    }
+    command.env(
+        "PATH",
+        std::env::join_paths(paths).map_err(|_| ScalerError::Guard("invalid private Rust PATH"))?,
+    );
+    Ok(())
+}
+
+// Rustup proxies can be symlinks or hardlinks. Materialize each entry as a
+// distinct writable file so neither the source home nor another proxy aliases
+// writes from the agent. Directory links are traversed with cycle detection.
+fn copy_rust_home(
+    source: &Path,
+    destination: &Path,
+    ancestors: &mut Vec<PathBuf>,
+) -> Result<(), ScalerError> {
+    let source = source.canonicalize()?;
+    if destination.starts_with(&source) {
+        return Err(ScalerError::Guard("private Rust home is inside its source"));
+    }
+    let metadata = source.metadata()?;
+    if metadata.is_dir() {
+        if ancestors.contains(&source) {
+            return Err(ScalerError::Guard("cyclic link in Rust home"));
+        }
+        private_dir(destination)?;
+        ancestors.push(source.clone());
+        for entry in std::fs::read_dir(&source)? {
+            let entry = entry?;
+            copy_rust_home(
+                &entry.path(),
+                &destination.join(entry.file_name()),
+                ancestors,
+            )?;
+        }
+        ancestors.pop();
+    } else if metadata.is_file() {
+        let mode = if metadata.permissions().mode() & 0o111 == 0 {
+            0o600
+        } else {
+            0o700
+        };
+        let mut input = std::fs::File::open(source)?;
+        let mut output = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(mode)
+            .open(destination)?;
+        std::io::copy(&mut input, &mut output)?;
+    } else {
+        return Err(ScalerError::Guard("unsupported entry in Rust home"));
+    }
+    Ok(())
+}
+
 fn secret_file(path: &Path, bytes: &[u8]) -> Result<(), ScalerError> {
     let mut file = std::fs::OpenOptions::new()
         .create_new(true)
@@ -202,6 +300,7 @@ fn bootstrap(root: &Path) -> Result<(), ScalerError> {
     check_token(root, TokenScope::Director)?;
     let state = state()?;
     private_dir(&state)?;
+    crate::dispatch_redaction::remember()?;
     let bin = state.join("bin");
     private_dir(&bin)?;
     private_dir(&state.join("home"))?;
@@ -312,6 +411,7 @@ fn auth(event: &Path) -> Result<(), ScalerError> {
         private_dir(&agy)?;
         secret_file(&agy.join("antigravity-oauth-token"), raw.as_bytes())?;
     }
+    crate::dispatch_redaction::remember()?;
     Ok(())
 }
 
@@ -338,6 +438,103 @@ pub fn run(root: &Path, args: Args) -> Result<(), ScalerError> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    #[test]
+    fn rust_home_child_mutations_leave_original_caches_and_proxies_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let cargo = temp.path().join("cargo");
+        let rustup = temp.path().join("rustup");
+        let toolchain = temp.path().join("linked-toolchain");
+        let state = temp.path().join("state");
+        std::fs::create_dir_all(cargo.join("bin")).unwrap();
+        std::fs::create_dir_all(cargo.join("registry/cache")).unwrap();
+        std::fs::create_dir_all(rustup.join("toolchains")).unwrap();
+        std::fs::create_dir_all(toolchain.join("bin")).unwrap();
+        std::os::unix::fs::symlink(&toolchain, rustup.join("toolchains/stable")).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        let state = state.canonicalize().unwrap();
+        let proxy = b"#!/bin/sh\nprintf 'private proxy:%s\\n' \"$0\"\n";
+        std::fs::write(cargo.join("bin/rustup"), proxy).unwrap();
+        std::fs::set_permissions(
+            cargo.join("bin/rustup"),
+            std::fs::Permissions::from_mode(0o500),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("rustup", cargo.join("bin/cargo")).unwrap();
+        std::fs::write(cargo.join("registry/cache/sample"), "original crate").unwrap();
+        std::fs::write(
+            rustup.join("toolchains/stable/bin/rustc"),
+            "original compiler",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            cargo.join("registry/cache/sample"),
+            std::fs::Permissions::from_mode(0o400),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            toolchain.join("bin/rustc"),
+            std::fs::Permissions::from_mode(0o500),
+        )
+        .unwrap();
+        let mut child = std::process::Command::new("/bin/sh");
+        child
+            .args([
+                "-eu",
+                "-c",
+                r#"cargo
+printf poisoned > "$CARGO_HOME/registry/cache/sample"
+printf poisoned > "$RUSTUP_HOME/toolchains/stable/bin/rustc"
+printf poisoned > "$CARGO_HOME/bin/cargo"
+printf '%s\n%s\n' "$CARGO_HOME" "$RUSTUP_HOME"
+"#,
+            ])
+            .env("CARGO_HOME", &cargo)
+            .env("RUSTUP_HOME", &rustup)
+            .env("PATH", cargo.join("bin"));
+        isolate_rust_homes(&mut child, &state).unwrap();
+        let output = child.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            std::fs::read_to_string(cargo.join("registry/cache/sample")).unwrap(),
+            "original crate",
+            "the child poisoned the shared Cargo cache"
+        );
+        assert_eq!(
+            std::fs::read_to_string(rustup.join("toolchains/stable/bin/rustc")).unwrap(),
+            "original compiler"
+        );
+        assert_eq!(std::fs::read(cargo.join("bin/rustup")).unwrap(), proxy);
+        assert_eq!(
+            std::fs::read(state.join("rust/cargo/bin/rustup")).unwrap(),
+            proxy,
+            "copied symlinks must not alias another proxy"
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!(
+                "private proxy:{}\n{}\n{}\n",
+                state.join("rust/cargo/bin/cargo").display(),
+                state.join("rust/cargo").display(),
+                state.join("rust/rustup").display()
+            )
+        );
+        assert_eq!(
+            state.join("rust").metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(!state.join("rust/cargo/bin/cargo").is_symlink());
+        assert!(!state.join("rust/rustup/toolchains/stable").is_symlink());
+        assert_eq!(
+            state
+                .join("rust/rustup/toolchains/stable/bin/rustc")
+                .metadata()
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
     #[test]
     fn tool_digest_is_verified_before_extracting_the_named_binary() {
         let temp = tempfile::tempdir().unwrap();

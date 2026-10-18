@@ -1,5 +1,6 @@
 //! Issue-label dispatch driver. Workflow input never becomes shell source.
 use crate::ci_scaler::{REPOSITORY, ScalerError};
+use crate::dispatch_redaction::{Gate, MAX_FILE_BYTES};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -42,7 +43,7 @@ struct Tiers {
 }
 
 pub fn trusted_actor(actor: &str) -> bool {
-    matches!(actor, "tjfontaine" | "carrick-workers[bot]")
+    actor == "tjfontaine"
 }
 
 #[derive(Debug)]
@@ -51,6 +52,7 @@ pub struct Dispatch {
     pub title: String,
     pub brief: String,
     pub branch: String,
+    pub resume: bool,
     pub tier: Tier,
 }
 
@@ -68,11 +70,11 @@ pub fn validate_event(
         || event["issue"].get("pull_request").is_some()
         || !trusted_actor(sender)
         || !trusted_actor(triggering_actor)
-        || (sender == "carrick-workers[bot]" && kind != "Bot")
-        || (sender == "tjfontaine" && kind != "User")
+        || kind != "User"
+        || event["issue"]["user"]["login"] != "tjfontaine"
     {
         return Err(ScalerError::Guard(
-            "dispatch requires an owner/App issue-label event",
+            "dispatch requires the owner labeling an owner-authored issue",
         ));
     }
     let tiers: Tiers =
@@ -95,10 +97,7 @@ pub fn validate_event(
         .to_owned();
     let body = event["issue"]["body"].as_str().unwrap_or_default();
     let brief = brief_section(body)?;
-    let branches: Vec<_> = brief
-        .lines()
-        .filter_map(|line| line.strip_prefix("Branch: "))
-        .collect();
+    let branches = branch_directives(&brief);
     if branches.len() > 1 {
         return Err(ScalerError::Guard("multiple branch directives"));
     }
@@ -125,7 +124,7 @@ pub fn validate_event(
             .join("-");
         let slug = slug.chars().take(60).collect::<String>();
         format!(
-            "work/{}-{issue}",
+            "work/dispatch-{issue}-{}",
             if slug.is_empty() {
                 "issue"
             } else {
@@ -133,12 +132,78 @@ pub fn validate_event(
             }
         )
     };
+    let resume = !branches.is_empty();
     Ok(Dispatch {
         issue,
         title,
         brief,
         branch,
+        resume,
         tier,
+    })
+}
+
+fn branch_directives(brief: &str) -> Vec<&str> {
+    let mut fence: Option<(char, usize)> = None;
+    let mut branches = Vec::new();
+    for line in brief.lines() {
+        let trimmed = line.trim();
+        if let Some(marker @ ('`' | '~')) = trimmed.chars().next() {
+            let count = trimmed.chars().take_while(|c| *c == marker).count();
+            if count >= 3 {
+                match fence {
+                    None => fence = Some((marker, count)),
+                    Some((open, length))
+                        if open == marker
+                            && count >= length
+                            && trimmed[count..].trim().is_empty() =>
+                    {
+                        fence = None
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+        }
+        if fence.is_none() {
+            if let Some(branch) = line.strip_prefix("Branch: ") {
+                branches.push(branch);
+            }
+        }
+    }
+    branches
+}
+
+fn open_prs(root: &Path, branch: &str) -> Result<Value, ScalerError> {
+    Ok(serde_json::from_str(&gh(
+        root,
+        &[
+            "pr",
+            "list",
+            "--repo",
+            REPOSITORY,
+            "--head",
+            branch,
+            "--state",
+            "open",
+            "--base",
+            "main",
+            "--json",
+            "number,url,body,isDraft,headRepository,headRepositoryOwner",
+        ],
+    )?)?)
+}
+fn same_repository(pr: &Value) -> bool {
+    pr["headRepositoryOwner"]["login"] == "carrick-sh" && pr["headRepository"]["name"] == "carrick"
+}
+fn references_issue(pr: &Value, issue: u64) -> bool {
+    let needle = format!("#{issue}");
+    let body = pr["body"].as_str().unwrap_or_default();
+    body.match_indices(&needle).any(|(index, matched)| {
+        let before = body[..index].chars().next_back();
+        let after = body[index + matched.len()..].chars().next();
+        before.is_none_or(|c| !c.is_ascii_alphanumeric() && c != '/')
+            && after.is_none_or(|c| !c.is_ascii_alphanumeric())
     })
 }
 
@@ -254,10 +319,22 @@ fn prepare(root: &Path, dispatch: &Dispatch, worktree: &Path) -> Result<(), Scal
             "+refs/heads/main:refs/remotes/origin/main",
         ],
     )?;
-    let existing = dispatch
-        .brief
-        .lines()
-        .any(|line| line.starts_with("Branch: "));
+    let existing = dispatch.resume;
+    if existing
+        && !dispatch
+            .branch
+            .starts_with(&format!("work/dispatch-{}-", dispatch.issue))
+    {
+        let prs = open_prs(root, &dispatch.branch)?;
+        if !prs.as_array().is_some_and(|prs| {
+            prs.iter()
+                .any(|pr| same_repository(pr) && references_issue(pr, dispatch.issue))
+        }) {
+            return Err(ScalerError::Guard(
+                "branch is not owned by this issue dispatch",
+            ));
+        }
+    }
     if !existing
         && git(
             root,
@@ -324,6 +401,11 @@ pub enum ContractStatus {
 }
 
 fn read_contract(result: &Path) -> Result<Contract, ScalerError> {
+    if std::fs::metadata(result)?.len() > MAX_FILE_BYTES {
+        return Err(ScalerError::Guard(
+            "redaction gate refused oversized contract",
+        ));
+    }
     let value: Value = serde_json::from_slice(&std::fs::read(result)?)?;
     // Preserve a completed work contract even on transport failure. The
     // launcher exit code independently prevents a successful dispatch verdict.
@@ -331,12 +413,19 @@ fn read_contract(result: &Path) -> Result<Contract, ScalerError> {
 }
 
 fn wait_agent(command: &mut Command, limit: std::time::Duration) -> std::io::Result<i32> {
-    let mut child = command.spawn()?;
+    use std::os::unix::process::CommandExt;
+    let mut child = command.process_group(0).spawn()?;
+    let pgid = i32::try_from(child.id()).map_err(std::io::Error::other)?;
     let deadline = std::time::Instant::now() + limit;
     let mut cancelled = None;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                if cancelled.is_some() {
+                    unsafe {
+                        libc::kill(-pgid, libc::SIGKILL);
+                    }
+                }
                 return Ok(if cancelled.is_some() {
                     124
                 } else {
@@ -345,7 +434,9 @@ fn wait_agent(command: &mut Command, limit: std::time::Duration) -> std::io::Res
             }
             Ok(None) => {}
             Err(error) => {
-                let _ = child.kill();
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
                 let _ = child.wait();
                 return Err(error);
             }
@@ -355,14 +446,16 @@ fn wait_agent(command: &mut Command, limit: std::time::Duration) -> std::io::Res
             // The owned, unreaped lease supervisor receives TERM first so its
             // guardian can cancel descendants and retain custody through cleanup.
             unsafe {
-                libc::kill(child.id() as i32, libc::SIGTERM);
+                libc::kill(-pgid, libc::SIGTERM);
             }
             cancelled = Some(now);
         }
         if cancelled
             .is_some_and(|when| now.duration_since(when) >= std::time::Duration::from_secs(35))
         {
-            child.kill()?;
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
             child.wait()?;
             return Ok(124);
         }
@@ -435,23 +528,12 @@ fn agent(
     if let Some(effort) = &dispatch.tier.effort {
         command.args(["--effort", effort]);
     }
-    // Child HOME isolates both providers' writable auth and caches. Preserve
-    // Rust's toolchain cache explicitly rather than putting credentials in it.
-    for variable in ["CARGO_HOME", "RUSTUP_HOME"] {
-        let value = std::env::var_os(variable).map(PathBuf::from).or_else(|| {
-            std::env::var_os("HOME").map(|original| {
-                PathBuf::from(original).join(if variable == "CARGO_HOME" {
-                    ".cargo"
-                } else {
-                    ".rustup"
-                })
-            })
-        });
-        if let Some(value) = value {
-            command.env(variable, value);
-        }
-    }
+    crate::agent_runner::isolate_rust_homes(&mut command, &state)?;
     command
+        .env_remove("GITHUB_OUTPUT")
+        .env_remove("GITHUB_ENV")
+        .env_remove("GITHUB_PATH")
+        .env_remove("GITHUB_STEP_SUMMARY")
         .env("HOME", &home)
         .env("CODEX_HOME", home.join(".codex"))
         .env("AGY_CLI_DISABLE_AUTO_UPDATE", "1")
@@ -472,11 +554,137 @@ fn agent(
 }
 
 fn admissible_file(path: &str) -> bool {
-    !path
-        .split('/')
-        .any(|part| matches!(part, "target" | ".git"))
+    !path.is_empty()
+        && Path::new(path)
+            .components()
+            .all(|p| matches!(p, std::path::Component::Normal(_)))
+        && !path
+            .split('/')
+            .any(|part| matches!(part, "target" | ".git"))
 }
-fn checkpoint(root: &Path, dispatch: &Dispatch) -> Result<bool, ScalerError> {
+fn gate_work(root: &Path, gate: &Gate) -> Result<(), ScalerError> {
+    gate_work_inner(root, gate)
+        .map_err(|_| ScalerError::Guard("redaction gate refused sensitive or unsafe output"))
+}
+fn gate_work_inner(root: &Path, gate: &Gate) -> Result<(), ScalerError> {
+    let refusal = || ScalerError::Guard("redaction gate refused sensitive or unsafe output");
+    if git(root, &["ls-files", "--modified", "-z"])?
+        .split('\0')
+        .any(|p| !p.is_empty() && !admissible_file(p))
+    {
+        return Err(refusal());
+    }
+    let files = git(
+        root,
+        &[
+            "ls-files",
+            "--modified",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ],
+    )?;
+    let mut total = 0;
+    for file in files
+        .split('\0')
+        .filter(|p| !p.is_empty() && admissible_file(p))
+    {
+        gate.check(file.as_bytes())?;
+        let mut path = root.to_owned();
+        for part in Path::new(file).components() {
+            path.push(part);
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_symlink() => return Err(refusal()),
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+            if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
+                return Err(refusal());
+            }
+            total += gate.file(&path)?;
+        }
+    }
+    let staged = git(root, &["diff", "--cached", "--name-only", "-z"])?;
+    for file in staged.split('\0').filter(|s| !s.is_empty()) {
+        if !admissible_file(file) {
+            return Err(refusal());
+        }
+        gate.check(file.as_bytes())?;
+        // Inspect staged blobs independently of the working file.
+        if let Ok(id) = git(root, &["rev-parse", &format!(":{file}")]) {
+            total += gate_object(root, gate, id.trim())?;
+        }
+    }
+    let objects = git(
+        root,
+        &[
+            "rev-list",
+            "--objects",
+            "--no-object-names",
+            "HEAD",
+            "^refs/remotes/origin/main",
+        ],
+    )?;
+    if objects.lines().count() > 4096 {
+        return Err(refusal());
+    }
+    for id in objects.lines() {
+        total += gate_object(root, gate, id)?;
+    }
+    let commits = git(root, &["rev-list", "HEAD", "^refs/remotes/origin/main"])?;
+    if commits.lines().count() > 256 {
+        return Err(refusal());
+    }
+    for commit in commits.lines() {
+        let paths = git(
+            root,
+            &[
+                "diff-tree",
+                "--no-commit-id",
+                "--root",
+                "-r",
+                "--name-only",
+                "-z",
+                commit,
+            ],
+        )?;
+        for path in paths.split('\0').filter(|s| !s.is_empty()) {
+            if !admissible_file(path) {
+                return Err(refusal());
+            }
+            gate.check(path.as_bytes())?;
+        }
+    }
+    if total > 20 * MAX_FILE_BYTES {
+        return Err(refusal());
+    }
+    Ok(())
+}
+fn gate_object(root: &Path, gate: &Gate, id: &str) -> Result<u64, ScalerError> {
+    let size: u64 = git(root, &["cat-file", "-s", id])?
+        .trim()
+        .parse()
+        .map_err(|_| ScalerError::Guard("redaction gate refused object size"))?;
+    if size > MAX_FILE_BYTES {
+        return Err(ScalerError::Guard(
+            "redaction gate refused oversized object",
+        ));
+    }
+    let bytes = crate::ci_scaler::execute(
+        Command::new("git")
+            .args(["cat-file", "-p", id])
+            .current_dir(root),
+        &[],
+        std::time::Duration::from_secs(30),
+    )?;
+    gate.check(&bytes)?;
+    Ok(size)
+}
+fn checkpoint(root: &Path, dispatch: &Dispatch, gate: &Gate) -> Result<bool, ScalerError> {
+    gate_work(root, gate)?;
     if git(root, &["branch", "--show-current"])?.trim() != dispatch.branch {
         return Err(ScalerError::Guard("worker left its dispatched branch"));
     }
@@ -519,7 +727,14 @@ fn checkpoint(root: &Path, dispatch: &Dispatch) -> Result<bool, ScalerError> {
 /// Keep committed work recoverable even when App publication fails before
 /// this one-job VM is destroyed. A failed commit hook leaves staged changes
 /// in the binary patch; generated target paths were excluded by checkpoint.
-fn preserve_work(root: &Path, result_dir: &Path, dispatch: &Dispatch) -> Result<(), ScalerError> {
+fn preserve_work(
+    root: &Path,
+    result_dir: &Path,
+    dispatch: &Dispatch,
+    gate: &Gate,
+) -> Result<(), ScalerError> {
+    gate_work(root, gate)?;
+    gate.directory(result_dir)?;
     let dispatched_ref = format!("refs/heads/{}", dispatch.branch);
     let commits = git(
         root,
@@ -555,6 +770,7 @@ fn preserve_work(root: &Path, result_dir: &Path, dispatch: &Dispatch) -> Result<
         std::time::Duration::from_secs(120),
     )?;
     std::fs::write(result_dir.join("wip.patch"), patch)?;
+    gate.directory(result_dir)?;
     Ok(())
 }
 
@@ -563,7 +779,13 @@ fn publish(
     result_dir: &Path,
     dispatch: &Dispatch,
     contract: &Contract,
+    gate: &Gate,
 ) -> Result<Option<String>, ScalerError> {
+    gate_work(root, gate)?;
+    gate.directory(result_dir)?;
+    gate.check(&serde_json::to_vec(contract)?)?;
+    gate.check(dispatch.title.as_bytes())?;
+    gate.check(dispatch.branch.as_bytes())?;
     if git(root, &["branch", "--show-current"])?.trim() != dispatch.branch {
         return Err(ScalerError::Guard("refusing to publish another branch"));
     }
@@ -574,11 +796,7 @@ fn publish(
     }
     // Explicit main rebases use force-with-lease with the exact fetched head;
     // a new branch must still be absent. Never overwrite a later worker push.
-    let expected = if dispatch
-        .brief
-        .lines()
-        .any(|line| line.starts_with("Branch: "))
-    {
+    let expected = if dispatch.resume {
         git(
             root,
             &[
@@ -604,23 +822,7 @@ fn publish(
             &refspec,
         ],
     )?;
-    let prs: Value = serde_json::from_str(&gh(
-        root,
-        &[
-            "pr",
-            "list",
-            "--repo",
-            REPOSITORY,
-            "--head",
-            &dispatch.branch,
-            "--state",
-            "open",
-            "--base",
-            "main",
-            "--json",
-            "number,url,isDraft,headRepository,headRepositoryOwner",
-        ],
-    )?)?;
+    let prs = open_prs(root, &dispatch.branch)?;
     let template = include_str!("../../../.github/pull_request_template.md");
     let body = template
         .replace("Closes #\n", &format!("Closes #{}\n", dispatch.issue))
@@ -639,32 +841,25 @@ fn publish(
         "{body}\nWorker contract (claims for review):\n\n```json\n{}\n```\n",
         serde_json::to_string_pretty(contract)?
     );
+    gate.check(body.as_bytes())?;
     let path = result_dir.join("pr-body.md");
     std::fs::write(&path, body)?;
     let path = path
         .to_str()
         .ok_or(ScalerError::Guard("non-UTF8 result path"))?;
-    if let Some(pr) = prs.as_array().and_then(|prs| {
-        prs.iter().find(|pr| {
-            pr["headRepositoryOwner"]["login"] == "carrick-sh"
-                && pr["headRepository"]["name"] == "carrick"
-        })
-    }) {
+    if let Some(pr) = prs
+        .as_array()
+        .and_then(|prs| prs.iter().find(|pr| same_repository(pr)))
+    {
         let number = pr["number"]
             .as_u64()
             .ok_or(ScalerError::Guard("PR number missing"))?
             .to_string();
-        if pr["isDraft"] != true {
-            gh(
-                root,
-                &["pr", "ready", &number, "--repo", REPOSITORY, "--undo"],
-            )?;
-        }
         gh(
             root,
             &[
                 "pr",
-                "edit",
+                "comment",
                 &number,
                 "--repo",
                 REPOSITORY,
@@ -726,6 +921,7 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
         ));
     }
     let root = root.canonicalize()?;
+    let mut gate = Gate::capture()?;
     let result_dir = root.join("dispatch-result");
     std::fs::create_dir(&result_dir)?;
     let worktree = root
@@ -761,8 +957,17 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
         errors.push(error.to_string());
     }
     let mut pr = None;
-    if worktree.join(".git").is_file() {
-        match checkpoint(&worktree, &dispatch) {
+    let checked = (|| -> Result<(), ScalerError> {
+        gate.absorb_current()?;
+        gate.check(dispatch.branch.as_bytes())?;
+        gate.check(dispatch.title.as_bytes())?;
+        gate.check(&serde_json::to_vec(&contract)?)?;
+        gate.check(&serde_json::to_vec(&errors)?)?;
+        gate.directory(&result_dir)?;
+        if !worktree.join(".git").is_file() {
+            return Ok(());
+        }
+        match checkpoint(&worktree, &dispatch, &gate) {
             Ok(true) => {
                 contract.status = ContractStatus::Failed;
                 contract
@@ -770,23 +975,55 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
                     .push("Workflow committed unfinished changes as WIP".into());
             }
             Ok(false) => {}
+            Err(error) if is_redaction(&error) => return Err(error),
             Err(error) => errors.push(format!("WIP checkpoint: {error}")),
         }
-        if let Err(error) = preserve_work(&worktree, &result_dir, &dispatch) {
+        if let Err(error) = preserve_work(&worktree, &result_dir, &dispatch, &gate) {
+            if is_redaction(&error) {
+                return Err(error);
+            }
             errors.push(format!("Work preservation: {error}"));
         }
-        match publish(&worktree, &result_dir, &dispatch, &contract) {
+        match publish(&worktree, &result_dir, &dispatch, &contract, &gate) {
             Ok(url) => pr = url,
+            Err(error) if is_redaction(&error) => return Err(error),
             Err(error) => errors.push(format!("PR publication: {error}")),
         }
+        Ok(())
+    })();
+    let mut refused = checked.as_ref().is_err_and(is_redaction);
+    if let Err(error) = checked {
+        errors.push(error.to_string());
     }
-    let head = git(&worktree, &["rev-parse", "HEAD"])
-        .ok()
-        .map(|s| s.trim().to_owned());
+    if gate.check(&serde_json::to_vec(&errors)?).is_err() {
+        refused = true;
+    }
+    if refused {
+        discard_outputs(&result_dir)?;
+        contract = Contract {
+            status: ContractStatus::Failed,
+            summary: "redaction gate refused sensitive or unsafe output".into(),
+            tests: vec![],
+            risks: vec![],
+        };
+        errors = vec![
+            "redaction gate refused publication; credential-bearing outputs discarded".to_owned(),
+        ];
+        pr = None;
+        exit = 1;
+    }
+    let head = if refused {
+        None
+    } else {
+        git(&worktree, &["rev-parse", "HEAD"])
+            .ok()
+            .map(|s| s.trim().to_owned())
+    };
     let success =
         exit == 0 && errors.is_empty() && contract.status == ContractStatus::Done && pr.is_some();
-    let receipt = json!({"issue":dispatch.issue,"branch":dispatch.branch,"sha":head,"pr":pr,"exit_code":exit,
+    let receipt = json!({"issue":dispatch.issue,"branch":if refused { "[REDACTED]" } else { &dispatch.branch },"sha":head,"pr":pr,"exit_code":exit,
         "timeout":exit == 124,"killed_or_timeout":exit == 137,"success":success,"setup_status":setup_status,"errors":errors,"contract":contract});
+    gate.check(&serde_json::to_vec(&receipt)?)?;
     std::fs::write(
         result_dir.join("result.json"),
         serde_json::to_vec_pretty(&receipt)?,
@@ -799,6 +1036,8 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
     );
     let comment_path = result_dir.join("issue-comment.md");
     std::fs::write(&comment_path, comment)?;
+    gate.directory(&result_dir)?;
+    seal_outputs(&gate, &result_dir)?;
     gh(
         &root,
         &[
@@ -822,6 +1061,52 @@ pub fn run(root: &Path, args: DispatchArgs) -> Result<(), ScalerError> {
     }
 }
 
+fn is_redaction(error: &ScalerError) -> bool {
+    matches!(error, ScalerError::Guard(message) if message.starts_with("redaction gate"))
+}
+fn discard_outputs(path: &Path) -> Result<(), ScalerError> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.is_dir() && !meta.file_type().is_symlink() {
+        std::fs::remove_dir_all(path)?;
+    } else {
+        std::fs::remove_file(path)?;
+    }
+    std::fs::create_dir(path)?;
+    Ok(())
+}
+/// Only this post-validation snapshot is an upload source. An interrupted run
+/// never emits an artifact path; raw workspace files are not upload inputs.
+fn seal_outputs(gate: &Gate, source: &Path) -> Result<(), ScalerError> {
+    gate.directory(source)?;
+    let temporary =
+        std::env::var_os("RUNNER_TEMP").ok_or(ScalerError::Guard("RUNNER_TEMP required"))?;
+    let sealed = tempfile::Builder::new()
+        .prefix("dispatch-validated-")
+        .tempdir_in(temporary)?;
+    fn copy(source: &Path, target: &Path) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let output = target.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                std::fs::create_dir(&output)?;
+                copy(&entry.path(), &output)?;
+            } else {
+                std::fs::copy(entry.path(), output)?;
+            }
+        }
+        Ok(())
+    }
+    copy(source, sealed.path())?;
+    gate.directory(sealed.path())?;
+    if let Some(output) = std::env::var_os("GITHUB_OUTPUT") {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(output)?;
+        writeln!(file, "artifact_path={}", sealed.path().display())?;
+        let _ = sealed.keep();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -838,10 +1123,42 @@ mod tests {
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
     const TIERS: &str = include_str!("../../../.github/dispatch-tiers.toml");
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn agent_timeout_kills_a_grandchild_in_the_owned_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("grandchild.pid");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 60 & echo $! > \"$1\"; wait", "fixture"])
+            .arg(&pid_file);
+        assert_eq!(
+            wait_agent(&mut command, std::time::Duration::from_millis(200)).unwrap(),
+            124
+        );
+        let pid: i32 = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let alive = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            !stat
+                .split(')')
+                .nth(1)
+                .unwrap()
+                .trim_start()
+                .starts_with('Z')
+        });
+        // Always clean up the red witness too.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        assert!(!alive, "agent timeout left a live grandchild");
+    }
     fn event() -> Value {
         json!({"repository":{"full_name":REPOSITORY},"action":"labeled",
             "sender":{"login":"tjfontaine","type":"User"},"label":{"name":"dispatch:sol-high"},
-            "issue":{"number":634,"title":"Dispatch workers!","body":"## Why\ncontext\n## Brief\nImplement it\n### Verify\nCheck it\n## Notes\nnot prompt"}})
+            "issue":{"number":634,"user":{"login":"tjfontaine"},"title":"Dispatch workers!","body":"## Why\ncontext\n## Brief\nImplement it\n### Verify\nCheck it\n## Notes\nnot prompt"}})
     }
     #[test]
     fn labels_select_only_checked_in_tiers_and_extract_the_brief() {
@@ -857,7 +1174,7 @@ mod tests {
             assert_eq!(d.tier.model, model);
             assert_eq!(d.tier.effort.as_deref(), effort);
             assert_eq!(d.brief, "Implement it\n### Verify\nCheck it");
-            assert_eq!(d.branch, "work/dispatch-workers-634");
+            assert_eq!(d.branch, "work/dispatch-634-dispatch-workers");
         }
     }
     #[test]
@@ -885,9 +1202,17 @@ mod tests {
         assert!(validate_event(&pr, TIERS, "tjfontaine").is_err());
         let mut bot = base;
         bot["sender"] = json!({"login":"carrick-workers[bot]","type":"Bot"});
-        assert!(validate_event(&bot, TIERS, "carrick-workers[bot]").is_ok());
+        assert!(validate_event(&bot, TIERS, "carrick-workers[bot]").is_err());
         bot["sender"]["type"] = "User".into();
         assert!(validate_event(&bot, TIERS, "carrick-workers[bot]").is_err());
+    }
+    #[test]
+    fn owner_label_does_not_admit_an_issue_owned_by_another_author() {
+        let mut value = event();
+        value["issue"]["user"]["login"] = "someone-else".into();
+        assert!(validate_event(&value, TIERS, "tjfontaine").is_err());
+        value["issue"].as_object_mut().unwrap().remove("user");
+        assert!(validate_event(&value, TIERS, "tjfontaine").is_err());
     }
     #[test]
     fn brief_headings_and_branch_names_are_data_not_commands() {
@@ -938,10 +1263,48 @@ mod tests {
         assert!(read_contract(&result).is_err());
     }
     #[test]
+    fn branch_directives_inside_fences_do_not_select_a_branch() {
+        let mut value = event();
+        value["issue"]["body"] =
+            "## Brief\nImplement it\n```text\nBranch: work/foreign-799\n```".into();
+        assert_eq!(
+            validate_event(&value, TIERS, "tjfontaine").unwrap().branch,
+            "work/dispatch-634-dispatch-workers"
+        );
+    }
+    #[test]
+    fn tracked_generated_files_cannot_escape_through_a_patch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git(root, &["init", "-b", "work/dispatch-634-dispatch-workers"]).unwrap();
+        git(root, &["config", "user.name", "Fixture"]).unwrap();
+        git(root, &["config", "user.email", "fixture@localhost"]).unwrap();
+        git(root, &["config", "core.hooksPath", "/dev/null"]).unwrap();
+        std::fs::create_dir(root.join("target")).unwrap();
+        std::fs::write(root.join("target/file"), b"\0base").unwrap();
+        git(root, &["add", "target/file"]).unwrap();
+        git(root, &["commit", "-m", "fixture base"]).unwrap();
+        git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]).unwrap();
+        std::fs::write(
+            root.join("target/file"),
+            b"\0refresh_token=must-not-publish",
+        )
+        .unwrap();
+        let gate = Gate::capture().unwrap();
+        assert!(
+            checkpoint(
+                root,
+                &validate_event(&event(), TIERS, "tjfontaine").unwrap(),
+                &gate
+            )
+            .is_err()
+        );
+    }
+    #[test]
     fn wip_checkpoint_preserves_trailer_and_excludes_target_symlink() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        git(root, &["init", "-b", "work/dispatch-workers-634"]).unwrap();
+        git(root, &["init", "-b", "work/dispatch-634-dispatch-workers"]).unwrap();
         git(root, &["config", "user.name", "Dispatch test"]).unwrap();
         git(root, &["config", "user.email", "fixture@localhost"]).unwrap();
         // This is a standalone fixture repository, never the project's hooks.
@@ -949,12 +1312,14 @@ mod tests {
         std::fs::write(root.join("file"), "base").unwrap();
         git(root, &["add", "file"]).unwrap();
         git(root, &["commit", "-m", "fixture base"]).unwrap();
+        git(root, &["update-ref", "refs/remotes/origin/main", "HEAD"]).unwrap();
         std::fs::remove_file(root.join("file")).unwrap();
         std::fs::write(root.join("new file"), "work in progress").unwrap();
         std::fs::create_dir(root.join("conformance-probes")).unwrap();
         std::os::unix::fs::symlink("/tmp", root.join("conformance-probes/target")).unwrap();
         let d = validate_event(&event(), TIERS, "tjfontaine").unwrap();
-        assert!(checkpoint(root, &d).unwrap());
+        let gate = Gate::capture().unwrap();
+        assert!(checkpoint(root, &d, &gate).unwrap());
         let message = git(root, &["log", "-1", "--format=%B"]).unwrap();
         assert!(message.contains("Co-Authored-By: GPT-6.1 Sol <noreply@openai.com>"));
         assert_eq!(
@@ -963,6 +1328,6 @@ mod tests {
                 .trim(),
             "new file"
         );
-        assert!(!checkpoint(root, &d).unwrap());
+        assert!(!checkpoint(root, &d, &gate).unwrap());
     }
 }

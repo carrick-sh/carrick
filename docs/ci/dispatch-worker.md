@@ -1,7 +1,7 @@
 # Issue-label worker dispatch (#634)
 
-An owner/App issue-label event runs a foreground agent, preserves its branch,
-opens or updates a draft PR with `Closes #N`, and comments the structured
+An owner issue-label event runs a foreground agent, preserves its branch,
+opens a draft PR with `Closes #N` or comments on an existing PR, and posts the structured
 contract on the issue. No director session is involved. Implementation lives
 in `xtask dispatch-worker` and `xtask agent-runner`; the workflow only wires
 Actions credentials, caches and lifecycle steps.
@@ -16,8 +16,10 @@ The checked-in [tier allowlist](../../.github/dispatch-tiers.toml) is exact:
 | `dispatch:argon-high` | agy | argon-high | backend default |
 | `dispatch:opus` | agy | opus | backend default |
 
-Only `tjfontaine` or `carrick-workers[bot]` may label or rerun dispatches.
-The hosted guard validates repository, actor identity/type, label and brief
+Only `tjfontaine`, with account type `User`, may label or rerun dispatches.
+The issue author must also be `tjfontaine`. The worker App and every other
+identity are refused, so a token held by an agent cannot admit another run.
+The hosted guard validates repository, owner identity/type, issue author, label and brief
 before requesting a worker. The worker repeats validation. Unknown labels or
 other actors fail closed. The Contabo controller independently verifies the
 trusted main workflow, both actors and the completed successful guard job on
@@ -31,9 +33,11 @@ level-two heading outside code fences. For example:
 Fix the documented scheduler contract. Include the red witness and focused tests.
 ```
 
-A single explicit `Branch: work/existing-123` line in the brief resumes that
-remote branch and rebases it onto freshly fetched GitHub main. Otherwise the
-worker creates `work/<title-slug>-<issue>` from GitHub main and refuses an
+A single explicit `Branch: work/dispatch-123-fix` line outside code fences
+resumes a remote branch and rebases it onto freshly fetched GitHub main.
+It may select only `work/dispatch-<issue>-*`, or a same-repository branch whose
+open PR references this issue. Other branches are refused before agent execution.
+Otherwise the worker creates `work/dispatch-<issue>-<title-slug>` and refuses an
 already existing remote branch. Issue text never becomes shell source.
 Each issue's labels serialize; pool capacity is enforced by the controller.
 
@@ -41,7 +45,12 @@ Each issue's labels serialize; pool capacity is enforced by the controller.
 
 The job requires only the `carrick-agent` label, independent of runner provider.
 A standard Linux or macOS Actions runner needs git, gh, curl and Python 3.
-The workflow installs the pinned Rust toolchain and caches Cargo build outputs.
+The workflow installs the pinned Rust toolchain and builds its trusted driver
+before any cache restore. It copies that driver outside the restored target.
+Toolchain and Cargo caches are restore-only: no post-agent cache save runs,
+and cached Cargo executables are not restored. The agent receives physical,
+writable copies of Cargo/Rustup homes and a private PATH; changes to those
+copies are never reused by credentialed steps or saved as caches.
 `agent-runner bootstrap` installs codex, agy and just from the checked-in
 [tool manifest](../../scripts/ci/inputs/agent-tools.json). Versioned URLs and
 SHA-256/SHA-512 digests are verified before extracting only the named regular
@@ -52,7 +61,7 @@ worker using the same backend/model/SDK resolution as director dispatch.
 The foreground launcher disables mailbox instructions.
 
 Configure protected environment **`agent-dispatch`** to allow **main only**.
-It is entered only after the owner/App guard. Required environment secrets:
+It is entered only after the owner-only guard. Required environment secrets:
 
 | Secret | Purpose |
 |---|---|
@@ -94,8 +103,9 @@ Rejected/expired tokens and unavailable GitHub access fail with a **host/infra**
 message naming the affected secret and the Mac refresher. Remote command
 failures recheck token access for the same diagnosis. A rejected worker token
 cannot publish its own issue comment; the local result and recovery artifacts
-remain available. Tokens and auth files are never printed, cached, uploaded
-or written back to the owner.
+remain available when validation succeeds. Credential-bearing outputs are
+refused by the publication gate below; clone credentials are not synced back
+to the owner.
 
 The source of truth is the owner's Mac login state. The owner signs into
 codex/agy there; its launchd refresher refreshes locally and pushes updated
@@ -119,15 +129,37 @@ The JSON contract contains `status` (`done`, `blocked`, `failed`), `summary`,
 draft PR, transport exit/timeout and publication errors. A completed work
 contract does not hide transport failure. Uncommitted changes become a WIP
 commit with the tier's vendor noreply trailer, including on timeout/failure.
-Hooks remain enabled; checkpoint failure is reported, not bypassed.
+Hooks remain enabled; checkpoint failure is reported, not bypassed. The agent
+runs in an owned process group; timeout cancellation kills the whole group.
+
+Every workflow publication passes one redaction gate: WIP staging/commit,
+push, commit history, staged and working files, binary patch/bundle, contract
+fields, PR bodies, comments, and every result artifact. Before the agent runs,
+the driver captures credential values from the job, materialized provider files
+and previous credentialed steps; refreshed provider credentials are added after
+the run. Exact credential values and generic GitHub token, JWT and
+`refresh_token` markers cause publication to be refused. The contract becomes
+a redacted failure and the unsafe artifacts are discarded. The gate rejects
+symlinks and paths outside the admitted repository shape, generated tracked
+paths, files/objects over 1 MiB, more than 256 commits or 4,096 new objects,
+and more than 20 MiB of source/recovery output. Unknown or unreadable outputs
+fail closed. These checks can also refuse legitimate token examples.
+
+Actions uploads only a fresh snapshot created after validation, with its path
+emitted by the trusted driver. An interrupted validation emits no artifact
+path, so the always-run upload cannot sweep raw workspace outputs. Agent
+children do not inherit Actions output/env/path/summary write channels.
+Failed external commands retain at most 16 KiB of redacted stderr in receipts;
+a truncated trailing line is discarded so a partial credential cannot escape.
 
 Bootstrap/auth failures are reported with the same trusted driver without
 starting unverified tools. A driver-build or App-token failure is visible in
 Actions logs; it cannot publish a contract without a working driver/token.
 
-The publisher pushes with an exact expected remote tip, opens or updates a
-same-repository draft PR using the PR template, and includes `Closes #N`.
-No-change runs do not fabricate a PR. `dispatch-result` retains the contract,
+The publisher pushes with an exact expected remote tip and creates a new
+same-repository draft PR using the PR template and `Closes #N`. An existing PR
+receives a contract comment; its body and draft/ready state are preserved.
+No-change runs do not fabricate a PR. Validated `dispatch-result` output retains the contract,
 receipt, issue comment, branch bundle and binary patch, allowing recovery when
 push fails. Provider logs and credentials are excluded. Preserve this artifact
 before retrying; resume via an explicit branch directive. A dispatch whose
@@ -141,6 +173,9 @@ there is no second controller. It clones template **9000**, with **8 vCPU /
 It retains the existing resource/headroom checks, durable ledger, restricted
 VMID pool, JIT one-job runners, assignment checks, recovery and cleanup.
 `CARRICK_AGENT_CLONES=0` stops new agent admission while existing clones drain.
+VM 9000 remains protected in every controller mode, including with agent clones
+disabled. Only source-template `VM.Audit`/`VM.Clone` privileges are allowed;
+power, configuration, deletion and other mutating privileges are refused.
 The provider's template needs runner/SSH plumbing and these ordinary runner
 prerequisites, not provider login credentials. Install this rollout's agent-aware
 xtask at `/usr/local/bin/carrick-xtask` in VM 9000: the controller refuses old

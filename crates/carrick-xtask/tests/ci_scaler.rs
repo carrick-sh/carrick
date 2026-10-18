@@ -935,11 +935,11 @@ fn four_agent_clones_and_one_kvm_have_separate_durable_budgets() {
 }
 
 #[test]
-fn dispatch_demand_and_hook_are_bound_to_owner_app_main_workflow_run() {
+fn dispatch_demand_and_hook_are_bound_to_owner_main_workflow_run() {
     let mut run = standing_run("issues", "main");
     run["path"] = DISPATCH_WORKFLOW.into();
-    run["actor"] = serde_json::json!({"login":"tjfontaine"});
-    run["triggering_actor"] = serde_json::json!({"login":"tjfontaine"});
+    run["actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
+    run["triggering_actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
     assert!(Admission::Agent.admits_run(&run));
     assert!(!Admission::Standing.admits_run(&run));
     for field in ["actor", "triggering_actor"] {
@@ -962,6 +962,46 @@ fn dispatch_demand_and_hook_are_bound_to_owner_app_main_workflow_run() {
     assert!(policy.authorize(&context).is_err());
     let workflow = include_str!("../../../.github/workflows/dispatch-worker.yml");
     assert_eq!(runs_on(workflow, "worker"), AGENT_LABELS);
+}
+
+#[test]
+fn dispatch_demand_refuses_worker_app_actor_and_triggering_actor() {
+    let mut run = standing_run("issues", "main");
+    run["path"] = DISPATCH_WORKFLOW.into();
+    run["actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
+    run["triggering_actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
+    for field in ["actor", "triggering_actor"] {
+        let mut app_run = run.clone();
+        app_run[field]["login"] = "carrick-workers[bot]".into();
+        assert!(
+            !Admission::Agent.admits_run(&app_run),
+            "worker App in {field} admitted a credentialed agent clone"
+        );
+    }
+}
+
+#[test]
+fn dispatch_demand_refuses_nonuser_or_missing_actor_types() {
+    let mut run = standing_run("issues", "main");
+    run["path"] = DISPATCH_WORKFLOW.into();
+    run["actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
+    run["triggering_actor"] = serde_json::json!({"login":"tjfontaine","type":"User"});
+    assert!(Admission::Agent.admits_run(&run));
+    for field in ["actor", "triggering_actor"] {
+        for account_type in [Some("Bot"), Some("Organization"), None] {
+            let mut spoofed = run.clone();
+            match account_type {
+                Some(value) => spoofed[field]["type"] = value.into(),
+                None => {
+                    spoofed[field].as_object_mut().unwrap().remove("type");
+                }
+            }
+            assert!(
+                !Admission::Agent.admits_run(&spoofed),
+                "{field} with type {account_type:?} admitted an owner-spoofed run"
+            );
+        }
+    }
 }
 
 #[test]

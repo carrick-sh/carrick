@@ -715,7 +715,7 @@ mod tests {
     fn dispatch_vet_requires_this_attempts_successful_hosted_guard() {
         let run = json!({"id":42,"run_attempt":2,"head_sha":"a".repeat(40), "head_branch":"main", "event":"issues",
             "path":DISPATCH_WORKFLOW,"repository":{"full_name":REPOSITORY}, "head_repository":{"full_name":REPOSITORY},
-            "actor":{"login":"tjfontaine"},"triggering_actor":{"login":"tjfontaine"}});
+            "actor":{"login":"tjfontaine","type":"User"},"triggering_actor":{"login":"tjfontaine","type":"User"}});
         let key = JobKey {
             run: RunId(42),
             attempt: 2,

@@ -14,6 +14,7 @@ pub mod claims;
 pub mod cli;
 pub mod command;
 pub mod commit_trailers;
+mod dispatch_redaction;
 pub mod dispatch_worker;
 pub mod fixtures;
 pub mod guest_image;

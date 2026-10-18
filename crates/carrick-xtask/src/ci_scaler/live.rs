@@ -1669,6 +1669,35 @@ impl CloneLease {
     }
 }
 
+fn verify_protected_vms(
+    site: site::Site,
+    mut permissions: impl FnMut(u16) -> Result<Value, ScalerError>,
+) -> Result<(), ScalerError> {
+    // Protection follows the site, independently of controller mode or
+    // whether agent clone demand is enabled. Only the source template may
+    // carry the non-mutating rights needed to inspect and clone it.
+    for vm in site.protected {
+        let source_template = site.node == site::CONTABO.node && *vm == 9000;
+        let protected = permissions(*vm)?;
+        if protected.as_object().is_none_or(|map| {
+            map.values().any(|v| {
+                v.as_object().is_none_or(|rights| {
+                    rights.iter().any(|(name, value)| {
+                        !source_template
+                            || !matches!(name.as_str(), "VM.Audit" | "VM.Clone")
+                            || value.as_u64() != Some(1)
+                    })
+                })
+            })
+        }) {
+            return Err(ScalerError::Guard(
+                "token has unexpected protected-VM rights",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Foreground Willow controller. The pilot admission always runs with one
 /// clone; standing mode is bounded by `limit` (at most two clones).
 pub(super) fn controller(
@@ -1727,25 +1756,9 @@ pub(super) fn controller(
         }
         pve.verify_vm_firewall(template)?;
     }
-    // Template 9000 is explicitly licensed for cloning on Contabo. The
-    // original workers remain protected, including throughout cutover.
-    let protected_site = if contabo_standing {
-        pve.site.for_lane(CloneLane::Agent)?
-    } else {
-        pve.site
-    };
-    for vm in protected_site.protected {
-        let protected =
-            pve.request(PveCall::Get, &format!("/access/permissions?path=/vms/{vm}"))?;
-        if protected.as_object().is_none_or(|map| {
-            map.values()
-                .any(|v| v.as_object().is_none_or(|m| !m.is_empty()))
-        }) {
-            return Err(ScalerError::Guard(
-                "token has unexpected protected-VM rights",
-            ));
-        }
-    }
+    verify_protected_vms(pve.site, |vm| {
+        pve.request(PveCall::Get, &format!("/access/permissions?path=/vms/{vm}"))
+    })?;
     let gh = Github;
     let path = dir.join("ledger.json");
     let mut ledger = Ledger::load(&path)?;

@@ -110,7 +110,6 @@ impl Site {
             }
             site.cores = 8;
             site.memory_mib = 20480;
-            site.protected = &[101, 102, 103, 104];
         }
         site.lane = lane;
         Ok(site)
@@ -464,7 +463,7 @@ OUT ACCEPT -dest 0.0.0.0/0 -log nolog # remaining IPv4 through the NAT gateway\n
         assert_eq!(site.cores, 8);
         assert_eq!(site.memory_mib, 20480);
         assert_eq!(site.lane.template(), 9000);
-        assert_eq!(site.protected, &[101, 102, 103, 104]);
+        assert_eq!(site.protected, &[101, 102, 103, 104, 9000]);
         assert_eq!(site.static_address(9000).unwrap().unwrap(), "10.77.0.150");
         assert!(
             site.vm_firewall_file(9000)

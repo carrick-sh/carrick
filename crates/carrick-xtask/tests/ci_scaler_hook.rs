@@ -220,9 +220,7 @@ fn cloudmac_launch_isolates_the_runner_session_before_it_can_receive_a_job() {
 #[cfg(target_os = "linux")]
 #[test]
 fn dispatch_foreground_publishes_success_failure_and_timeout() {
-    use std::os::unix::fs::PermissionsExt;
-    let xtask = env!("CARGO_BIN_EXE_carrick-xtask");
-    for case in [
+    foreground_cases(&[
         "done",
         "failed",
         "timeout",
@@ -234,13 +232,59 @@ fn dispatch_foreground_publishes_success_failure_and_timeout() {
         "aged-job",
         "token-rejected",
         "token-expired-on-push",
-    ] {
+    ]);
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn dispatch_refuses_credentials_in_a_committed_file() {
+    foreground_cases(&["leak-file"]);
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn dispatch_refuses_credentials_in_contract_summary() {
+    foreground_cases(&["leak-summary"]);
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn dispatch_refuses_credentials_in_result_artifacts() {
+    foreground_cases(&["leak-artifact"]);
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn dispatch_refuses_oversized_files() {
+    foreground_cases(&["leak-oversize"]);
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn dispatch_refuses_a_branch_linked_to_another_issue() {
+    foreground_cases(&["foreign-branch"]);
+}
+#[cfg(target_os = "linux")]
+#[test]
+fn dispatch_preserves_existing_pr_body_and_ready_state() {
+    foreground_cases(&["update"]);
+}
+
+#[cfg(target_os = "linux")]
+fn foreground_cases(cases: &[&str]) {
+    use std::os::unix::fs::PermissionsExt;
+    let xtask = env!("CARGO_BIN_EXE_carrick-xtask");
+    for &case in cases {
+        let branch = if case == "foreign-branch" {
+            "work/foreign-799"
+        } else if case == "update" {
+            "work/related-634"
+        } else {
+            "work/dispatch-634-fixture"
+        };
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let checkout = root.join("checkout");
         let bin = root.join("bin");
         std::fs::create_dir(&checkout).unwrap();
         std::fs::create_dir(&bin).unwrap();
+        std::fs::create_dir(root.join("cargo")).unwrap();
+        std::fs::create_dir(root.join("rustup")).unwrap();
         let run_git = |cwd: &std::path::Path, args: &[&str]| {
             let output = Command::new("git")
                 .args(args)
@@ -263,7 +307,7 @@ fn dispatch_foreground_publishes_success_failure_and_timeout() {
         let remote = root.join("origin.git");
         run_git(root, &["init", "--bare", remote.to_str().unwrap()]);
         run_git(&checkout, &["push", remote.to_str().unwrap(), "main"]);
-        if matches!(case, "update" | "collision") {
+        if matches!(case, "update" | "collision" | "foreign-branch") {
             run_git(&checkout, &["checkout", "-b", "seed"]);
             std::fs::write(checkout.join("previous"), "earlier worker change").unwrap();
             run_git(&checkout, &["add", "previous"]);
@@ -273,7 +317,7 @@ fn dispatch_foreground_publishes_success_failure_and_timeout() {
                 &[
                     "push",
                     remote.to_str().unwrap(),
-                    "HEAD:refs/heads/work/fixture-634",
+                    &format!("HEAD:refs/heads/{branch}"),
                 ],
             );
             run_git(&checkout, &["checkout", "main"]);
@@ -303,11 +347,16 @@ case "$1 $2" in
     echo '{"full_name":"carrick-sh/carrick"}' ;;
   'auth setup-git') exit 0 ;;
   'pr list')
-    if [ "$TEST_CASE" = update ]; then
-      echo '[{"number":999,"url":"https://github.com/carrick-sh/carrick/pull/999","isDraft":false,"headRepositoryOwner":{"login":"carrick-sh"},"headRepository":{"name":"carrick"}}]'
+    if [ "$TEST_CASE" = update ] || [ "$TEST_CASE" = foreign-branch ]; then
+      if [ "$TEST_CASE" = update ]; then body='References #634'; else body='Closes #799'; fi
+      printf '[{"number":999,"url":"https://github.com/carrick-sh/carrick/pull/999","body":"%s","isDraft":false,"author":{"login":"someone-else"},"headRepositoryOwner":{"login":"carrick-sh"},"headRepository":{"name":"carrick"}}]\n' "$body"
     else echo '[]'; fi ;;
   'pr ready') printf 'draft\n' > "$TEST_ROOT/draft" ;;
   'pr edit')
+    touch "$TEST_ROOT/edited"
+    for arg in "$@"; do last=$arg; done
+    cp "$last" "$TEST_ROOT/pr-body.md" ;;
+  'pr comment')
     for arg in "$@"; do last=$arg; done
     cp "$last" "$TEST_ROOT/pr-body.md" ;;
   'pr create')
@@ -331,6 +380,9 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 printf 'worker change\n' > payload
+if [ "$TEST_CASE" = leak-file ]; then cat "$HOME/.codex/auth.json" > payload; fi
+if [ "$TEST_CASE" = leak-artifact ]; then cat "$HOME/.codex/auth.json" > "$TEST_ROOT/checkout/dispatch-result/evil.txt"; fi
+if [ "$TEST_CASE" = leak-oversize ]; then head -c 1048577 /dev/zero > payload; fi
 mkdir -p conformance-probes
 ln -s /tmp conformance-probes/target
 case "$TEST_CASE" in
@@ -355,6 +407,9 @@ Verified: fixture.
 Co-Authored-By: Gemini 4 Argon <noreply@google.com>' || exit $?
 fi
 printf '%s\n' '{"status":"SUCCESS","transport":{"exit_code":0,"timed_out":false},"structured_output":{"status":"done","summary":"fixture complete","tests":["fixture"],"risks":[]}}' > "$result"
+if [ "$TEST_CASE" = leak-summary ]; then
+  printf '%s\n' '{"structured_output":{"status":"done","summary":"codex-fake-access-634","tests":[],"risks":[]}}' > "$result"
+fi
 "#.to_owned()),
             ("ssh", format!("#!/bin/sh\nexec '{}' host-lease broker --lock-path \"$TEST_ROOT/host.lock\"\n", xtask)),
         ];
@@ -365,10 +420,10 @@ printf '%s\n' '{"status":"SUCCESS","transport":{"exit_code":0,"timed_out":false}
         }
         std::fs::File::create(root.join("host.lock")).unwrap();
         std::fs::write(root.join("site.toml"), "broker = 'fixture@localhost'\nidentity_file = '/unused/key'\nknown_hosts_file = '/unused/known_hosts'\n").unwrap();
-        let brief = if case == "update" {
-            "## Brief\nBranch: work/fixture-634\nContinue fixture."
+        let brief = if matches!(case, "update" | "foreign-branch") {
+            format!("## Brief\nBranch: {branch}\nContinue fixture.")
         } else {
-            "## Brief\nImplement fixture."
+            "## Brief\nImplement fixture.".to_owned()
         };
         let label = if case == "agy" {
             "dispatch:argon-high"
@@ -377,10 +432,12 @@ printf '%s\n' '{"status":"SUCCESS","transport":{"exit_code":0,"timed_out":false}
         };
         let event = serde_json::json!({"repository":{"full_name":"carrick-sh/carrick"},"action":"labeled",
             "sender":{"login":"tjfontaine","type":"User"},"label":{"name":label},
-            "issue":{"number":634,"title":"Fixture","body":brief}});
+            "issue":{"number":634,"user":{"login":"tjfontaine"},"title":"Fixture","body":brief}});
         std::fs::write(root.join("event.json"), event.to_string()).unwrap();
         let state = root.join("carrick-agent-42-1");
         std::fs::create_dir_all(state.join("home")).unwrap();
+        std::fs::create_dir(state.join("home/.codex")).unwrap();
+        std::fs::write(state.join("home/.codex/auth.json"), r#"{"tokens":{"access_token":"codex-fake-access-634","refresh_token":"codex-fake-refresh-634"}}"#).unwrap();
         let output = Command::new("/usr/bin/timeout")
             .args(["30", xtask, "dispatch-worker", "run", "--event"])
             .arg(root.join("event.json"))
@@ -393,6 +450,8 @@ printf '%s\n' '{"status":"SUCCESS","transport":{"exit_code":0,"timed_out":false}
             .current_dir(&checkout)
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .env("HOME", root)
+            .env("CARGO_HOME", root.join("cargo"))
+            .env("RUSTUP_HOME", root.join("rustup"))
             .env("GH_TOKEN", "fixture-only")
             .env("GITHUB_TRIGGERING_ACTOR", "tjfontaine")
             .env(
@@ -441,6 +500,38 @@ printf '%s\n' '{"status":"SUCCESS","transport":{"exit_code":0,"timed_out":false}
             &std::fs::read(checkout.join("dispatch-result/result.json")).unwrap(),
         )
         .unwrap();
+        if case == "foreign-branch" {
+            assert!(receipt["pr"].is_null());
+            assert!(
+                !root.join("turn-timeout").exists(),
+                "agent ran on a foreign branch"
+            );
+            continue;
+        }
+        if case.starts_with("leak-") {
+            assert_eq!(receipt["success"], false);
+            assert!(receipt["pr"].is_null());
+            assert_eq!(receipt["contract"]["status"], "failed");
+            assert!(receipt.to_string().contains("redaction gate"));
+            assert!(!root.join("pr-body.md").exists());
+            for entry in std::fs::read_dir(checkout.join("dispatch-result")).unwrap() {
+                let path = entry.unwrap().path();
+                let bytes = std::fs::read(&path).unwrap();
+                let contents = String::from_utf8_lossy(&bytes);
+                assert!(
+                    !contents.contains("codex-fake-"),
+                    "leaked through {}",
+                    path.display()
+                );
+                assert!(
+                    !contents.contains("refresh_token"),
+                    "leaked credential JSON"
+                );
+            }
+            assert!(!checkout.join("dispatch-result/work.bundle").exists());
+            assert!(!checkout.join("dispatch-result/wip.patch").exists());
+            continue;
+        }
         assert_eq!(
             receipt["success"],
             matches!(case, "done" | "update" | "agy" | "aged-job"),
@@ -507,7 +598,7 @@ printf '%s\n' '{"status":"SUCCESS","transport":{"exit_code":0,"timed_out":false}
                     .unwrap()
                     .contains("branch already exists")
             );
-            let files = run_git(&remote, &["ls-tree", "--name-only", "work/fixture-634"]);
+            let files = run_git(&remote, &["ls-tree", "--name-only", branch]);
             assert!(files.contains("previous"));
             assert!(!files.contains("payload"));
             continue;
@@ -522,7 +613,7 @@ printf '%s\n' '{"status":"SUCCESS","transport":{"exit_code":0,"timed_out":false}
                 .unwrap()
                 .contains(receipt["sha"].as_str().unwrap())
         );
-        let message = run_git(&remote, &["log", "-1", "--format=%B", "work/fixture-634"]);
+        let message = run_git(&remote, &["log", "-1", "--format=%B", branch]);
         let trailer = if case == "agy" {
             "Co-Authored-By: Gemini 4 Argon <noreply@google.com>"
         } else {
@@ -538,12 +629,13 @@ printf '%s\n' '{"status":"SUCCESS","transport":{"exit_code":0,"timed_out":false}
         assert!(!body.contains("NEW: none"));
         assert!(body.contains("Not compared"));
         if case == "update" {
-            assert!(root.join("draft").is_file());
+            assert!(!root.join("draft").exists(), "changed PR ready state");
+            assert!(!root.join("edited").exists(), "overwrote a foreign PR body");
         }
         if matches!(case, "failed" | "timeout") {
             assert!(message.contains("checkpoint issue 634"));
         }
-        let files = run_git(&remote, &["ls-tree", "--name-only", "work/fixture-634"]);
+        let files = run_git(&remote, &["ls-tree", "--name-only", branch]);
         assert!(files.contains("payload"));
         assert!(!files.contains("conformance-probes"));
     }
@@ -566,7 +658,7 @@ fn agent_auth_is_job_scoped_private_and_always_cleanable() {
         };
         std::fs::write(&event, serde_json::json!({"repository":{"full_name":"carrick-sh/carrick"},
             "action":"labeled","sender":{"login":"tjfontaine","type":"User"},
-            "label":{"name":label},"issue":{"number":634,"title":"Fixture","body":"## Brief\nImplement fixture"}}).to_string()).unwrap();
+            "label":{"name":label},"issue":{"number":634,"user":{"login":"tjfontaine"},"title":"Fixture","body":"## Brief\nImplement fixture"}}).to_string()).unwrap();
         let invoke = |args: &[&str]| {
             Command::new(xtask)
                 .args(args)
