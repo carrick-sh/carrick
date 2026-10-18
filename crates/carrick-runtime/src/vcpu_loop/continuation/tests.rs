@@ -697,10 +697,12 @@ fn serial_host_native_forwarded_read_keeps_bridge_signal_for_ingress() {
                 .unwrap(),
             super::super::signal_ingress_producer::HostIngressStep::Published
         );
-        let mut frame = carrick_el1_abi::TrapFrame::default();
-        frame.esr = if eligible { 0xfffe } else { 0xfffd };
-        frame.elr = 0x400004;
-        frame.far = 0x1234;
+        let mut frame = carrick_el1_abi::TrapFrame {
+            esr: if eligible { 0xfffe } else { 0xfffd },
+            elr: 0x400004,
+            far: 0x1234,
+            ..Default::default()
+        };
         frame.x[0] = carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64;
         frame.x[8] = nr;
         let (drained, route) = fixture.drain_and_deliver(&queue, &mut frame);
