@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "timestamp": "fixture",
+  "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "clean_tree": true,
+  "phase": "signed",
+  "profile": "no-docker",
+  "overall": "FAIL",
+  "steps": [
+    {
+      "name": "el1-embed",
+      "command": "test fixture",
+      "exit_code": 1,
+      "log_path": "el1.log",
+      "duration_s": 1.0,
+      "passed": false,
+      "failed_tests": [],
+      "started_tests": [
+        "embed::red_a"
+      ],
+      "finished_binaries": [],
+      "unfinished_binaries": [
+        "embed"
+      ],
+      "unitemized_failures": [
+        "crash:embed"
+      ]
+    }
+  ],
+  "el1": {
+    "failed_tests": [],
+    "unexpected_failures": [],
+    "allowlist": [],
+    "now_passing": []
+  },
+  "failures": [
+    "arbitrary human text: never a key"
+  ]
+}
