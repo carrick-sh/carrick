@@ -2234,7 +2234,7 @@ mod tests {
             "{}",
             thread.execution
         );
-        page.cancel_host_birth_claim(birth);
+        assert!(page.cancel_host_birth_claim(birth).is_some());
         page.clear_exit_wait();
     }
 

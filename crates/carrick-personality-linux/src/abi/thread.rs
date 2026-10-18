@@ -710,6 +710,24 @@ impl Default for ThreadControlSlot {
     }
 }
 
+/// A host-birth claim Closing could observe in `claimed_count` was put back.
+/// The closing owner may have parked on that claim, and the rollback can make
+/// its readiness true: the host venue owes its exit-channel wake and delivers
+/// it after releasing its own locks. Only a rollback can mint one.
+#[must_use = "a rolled-back host-birth claim owes the closing owner its exit wake"]
+#[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
+pub struct OwedExitWake(());
+
+/// Why [`ThreadLifecyclePage::reserve_host_birth`] refused.
+#[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
+pub enum HostBirthRefusal {
+    /// Every host-birth slot is in use; no claim was ever visible.
+    Full,
+    /// A slot was claimed, then the gate was found closed and the claim put
+    /// back: the closing owner's exit wake is owed.
+    Closed(OwedExitWake),
+}
+
 /// One per process; kernel-only.
 #[repr(C, align(4096))]
 #[derive(::core::fmt::Debug)]
@@ -881,8 +899,10 @@ impl ThreadLifecyclePage {
     }
 
     /// Reserve one host-born member before its irreversible task publication.
-    /// State one is an unpublished claim. Closing waits for every claim.
-    pub fn reserve_host_birth(&self) -> Option<usize> {
+    /// State one is an unpublished claim. Closing waits for every claim, so a
+    /// claim backed out after the gate check is owed to the closing owner's
+    /// exit channel ([`HostBirthRefusal::Closed`]).
+    pub fn reserve_host_birth(&self) -> Result<usize, HostBirthRefusal> {
         for (index, slot) in self.host_born.iter().enumerate() {
             if slot
                 .state
@@ -890,13 +910,13 @@ impl ThreadLifecyclePage {
                 .is_ok()
             {
                 if self.gate() == GateState::Open {
-                    return Some(index);
+                    return Ok(index);
                 }
                 slot.state.store(0, Ordering::SeqCst);
-                return None;
+                return Err(HostBirthRefusal::Closed(OwedExitWake(())));
             }
         }
-        None
+        Err(HostBirthRefusal::Full)
     }
 
     pub fn publish_host_birth(
@@ -920,12 +940,17 @@ impl ThreadLifecyclePage {
             .is_ok()
     }
 
-    pub fn cancel_host_birth_claim(&self, index: usize) -> bool {
-        self.host_born.get(index).is_some_and(|slot| {
-            slot.state
-                .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-        })
+    /// Back out an unpublished host-birth claim. Closing may have parked on
+    /// it, so a successful rollback returns the exit wake it owes.
+    pub fn cancel_host_birth_claim(&self, index: usize) -> Option<OwedExitWake> {
+        self.host_born
+            .get(index)
+            .is_some_and(|slot| {
+                slot.state
+                    .compare_exchange(1, 0, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            })
+            .then_some(OwedExitWake(()))
     }
 
     pub fn host_birth_identity(
@@ -1482,10 +1507,13 @@ mod tests {
         for slot in &mut slots {
             *slot = page.reserve_host_birth().expect("capacity available");
         }
-        assert_eq!(page.reserve_host_birth(), None);
+        assert_eq!(
+            page.reserve_host_birth(),
+            Err(super::HostBirthRefusal::Full)
+        );
         assert_eq!(page.host_birth_claimed_count(), super::THREAD_POOL_ENTRIES);
-        assert!(page.cancel_host_birth_claim(slots[0]));
-        assert_eq!(page.reserve_host_birth(), Some(slots[0]));
+        assert!(page.cancel_host_birth_claim(slots[0]).is_some());
+        assert_eq!(page.reserve_host_birth(), Ok(slots[0]));
         assert_eq!(page.host_birth_claimed_count(), super::THREAD_POOL_ENTRIES);
     }
 

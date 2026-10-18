@@ -156,12 +156,28 @@ impl HostForkPublication {
 impl Drop for HostForkPublication {
     fn drop(&mut self) {
         drop(self.claim.take());
-        if let Some((mm, address)) = self.page.exit_wait()
-            && let Some(zone) = crate::el1_zone::zone()
-        {
-            let wake = crate::el1_zone::wake(zone, mm.raw(), address, u32::MAX, u32::MAX);
-            crate::el1_zone::hand_back(&wake.handed);
-        }
+        wake_exit_channel(&self.page);
+    }
+}
+
+/// Deliver the exit-channel wake a rolled-back host-birth claim owes. Call
+/// with no registry or bucket lock held; the token proves the claim that
+/// Closing may have parked on is gone.
+pub(super) fn deliver_owed_exit_wake(
+    page: &carrick_el1_abi::ThreadLifecyclePage,
+    _owed: carrick_el1_abi::OwedExitWake,
+) {
+    wake_exit_channel(page);
+}
+
+/// Wake a closing owner parked on its published exit channel, if any. Its
+/// readiness check authenticates every receipt; a wake only offers a recheck.
+fn wake_exit_channel(page: &carrick_el1_abi::ThreadLifecyclePage) {
+    if let Some((mm, address)) = page.exit_wait()
+        && let Some(zone) = crate::el1_zone::zone()
+    {
+        let wake = crate::el1_zone::wake(zone, mm.raw(), address, u32::MAX, u32::MAX);
+        crate::el1_zone::hand_back(&wake.handed);
     }
 }
 
