@@ -912,7 +912,10 @@ pub fn trusted_baseline_run(run: &Value, sha: &str) -> bool {
         && run["path"] == KERNEL_RUNTIME_WORKFLOW
         && run["repository"]["full_name"] == REPOSITORY
         && run["head_repository"]["full_name"] == REPOSITORY
-        && (run["event"] == "push" || run["event"] == "workflow_dispatch")
+        && (run["event"] == "push"
+            || (run["event"] == "workflow_dispatch"
+                && run["actor"]["login"] == "tjfontaine"
+                && run["triggering_actor"]["login"] == "tjfontaine"))
         && branch == "main"
 }
 
