@@ -425,11 +425,7 @@ fn begin_virt_r14_r15(
     let r14_host = need_r14.then(&mut pick_free);
     let r15_host = need_r15.then(&mut pick_free);
     if let Some(h) = rsp_host {
-        emit_mov_r15_disp32_from_gpr(
-            out,
-            std::mem::offset_of!(crate::context::SoftCpuContext, virt_rsp_spill) as i32,
-            h,
-        );
+        emit_mov_r15_disp32_from_gpr(out, crate::context::CTX_VIRT_RSP_SPILL_OFF as i32, h);
         emit_mov_gpr_from_r15_disp32(out, h, 4 * 8);
     }
     if let Some(h) = r14_host {
@@ -474,11 +470,7 @@ fn begin_virt_r14_r15(
 fn end_virt_r14_r15(out: &mut Vec<u8>, state: &VirtSpillState) {
     if let Some(h) = state.rsp_host {
         emit_mov_r15_disp32_from_gpr(out, 4 * 8, h);
-        emit_mov_gpr_from_r15_disp32(
-            out,
-            h,
-            std::mem::offset_of!(crate::context::SoftCpuContext, virt_rsp_spill) as i32,
-        );
+        emit_mov_gpr_from_r15_disp32(out, h, crate::context::CTX_VIRT_RSP_SPILL_OFF as i32);
     }
     if let Some(h) = state.r14_host {
         emit_mov_r15_disp32_from_gpr(out, CTX_GPR_R14_OFF as i32, h);
