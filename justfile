@@ -1216,7 +1216,29 @@ ci-freebsd-sysroot:
     archive="$(mktemp)"
     trap 'rm -f "$archive"' EXIT
     mkdir -p "${FBSD_SYSROOT:?}"
-    curl -fSL "https://archive.freebsd.org/old-releases/amd64/${FBSD_VERSION:?}/base.txz" -o "$archive"
+    # archive.freebsd.org was unreachable from every network on 2026-10-18 and
+    # failed every merge group; the pinned digest (from the release MANIFEST)
+    # makes any mirror acceptable. A new FBSD_VERSION needs a new digest.
+    case "${FBSD_VERSION:?}" in
+        14.3-RELEASE) want=e38b5cf756d60086a6c2f736eff19cc7685f7e2313e31d14342fc8df57200a92 ;;
+        *) echo "::error::no pinned base.txz sha256 for FreeBSD ${FBSD_VERSION}" >&2; exit 1 ;;
+    esac
+    ok=
+    for url in \
+        "https://archive.freebsd.org/old-releases/amd64/${FBSD_VERSION}/base.txz" \
+        "https://download.freebsd.org/releases/amd64/${FBSD_VERSION}/base.txz" \
+        "https://mirror.math.princeton.edu/pub/FreeBSD/releases/amd64/${FBSD_VERSION}/base.txz"; do
+        if curl -fSL --connect-timeout 20 --max-time 600 --retry 2 --retry-all-errors "$url" -o "$archive" \
+            && echo "$want  $archive" | sha256sum -c --quiet -; then
+            ok=1
+            break
+        fi
+        echo "FreeBSD base.txz unavailable or mismatched at $url" >&2
+    done
+    if [ -z "$ok" ]; then
+        echo "::error::infrastructure: no FreeBSD ${FBSD_VERSION} base.txz source matched the pinned digest" >&2
+        exit 1
+    fi
     tar -xf "$archive" -C "$FBSD_SYSROOT" ./usr/include ./usr/lib ./lib
 
 # NetBSD's comp set has architecture headers; base supplies the machine link.
