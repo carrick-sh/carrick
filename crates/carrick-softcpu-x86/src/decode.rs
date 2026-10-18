@@ -18,6 +18,10 @@ pub enum CflowKind {
 /// Privileged and sensitive instructions classified as block exits (§3.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SensitiveOp {
+    Interrupt { vector: u8 },
+    Rdpmc,
+    Ldmxcsr,
+    Stmxcsr,
     Iretq,
     Sysret,
     Swapgs,
@@ -46,12 +50,6 @@ pub enum SensitiveOp {
     Rdpkru,
     Wrpkru,
     Rdssp { reg: usize, is_64: bool },
-    Fxsave,
-    Fxrstor,
-    Xsave,
-    Xsaveopt,
-    Xsavec,
-    Xrstor,
 }
 
 impl SensitiveOp {
@@ -60,19 +58,16 @@ impl SensitiveOp {
     pub const fn is_privileged(self) -> bool {
         !matches!(
             self,
-            Self::Cpuid
+            Self::Interrupt { .. }
+                | Self::Ldmxcsr
+                | Self::Stmxcsr
+                | Self::Cpuid
                 | Self::Rdtsc
                 | Self::Rdtscp
                 | Self::Xgetbv
                 | Self::Rdpkru
                 | Self::Wrpkru
                 | Self::Rdssp { .. }
-                | Self::Fxsave
-                | Self::Fxrstor
-                | Self::Xsave
-                | Self::Xsaveopt
-                | Self::Xsavec
-                | Self::Xrstor
         )
     }
 }
@@ -211,6 +206,13 @@ pub fn classify(bytes: &[u8], va: u64) -> Option<DecodedInsn> {
 fn classify_insn(insn: &Instruction, next_va: u64) -> InsnClass {
     let simple = match insn.mnemonic() {
         Mnemonic::Syscall => return InsnClass::Syscall,
+        Mnemonic::Int3 => Some(SensitiveOp::Interrupt { vector: 3 }),
+        Mnemonic::Int => Some(SensitiveOp::Interrupt {
+            vector: insn.immediate8(),
+        }),
+        Mnemonic::Rdpmc => Some(SensitiveOp::Rdpmc),
+        Mnemonic::Ldmxcsr => Some(SensitiveOp::Ldmxcsr),
+        Mnemonic::Stmxcsr => Some(SensitiveOp::Stmxcsr),
         Mnemonic::Ud0 | Mnemonic::Ud1 | Mnemonic::Ud2 => return InsnClass::InvalidOpcode,
         Mnemonic::Iretq | Mnemonic::Iretd | Mnemonic::Iret => Some(SensitiveOp::Iretq),
         Mnemonic::Sysretq | Mnemonic::Sysret => Some(SensitiveOp::Sysret),
@@ -233,12 +235,6 @@ fn classify_insn(insn: &Instruction, next_va: u64) -> InsnClass {
         Mnemonic::Xgetbv => Some(SensitiveOp::Xgetbv),
         Mnemonic::Rdpkru => Some(SensitiveOp::Rdpkru),
         Mnemonic::Wrpkru => Some(SensitiveOp::Wrpkru),
-        Mnemonic::Fxsave | Mnemonic::Fxsave64 => Some(SensitiveOp::Fxsave),
-        Mnemonic::Fxrstor | Mnemonic::Fxrstor64 => Some(SensitiveOp::Fxrstor),
-        Mnemonic::Xsave | Mnemonic::Xsave64 => Some(SensitiveOp::Xsave),
-        Mnemonic::Xsaveopt | Mnemonic::Xsaveopt64 => Some(SensitiveOp::Xsaveopt),
-        Mnemonic::Xsavec | Mnemonic::Xsavec64 => Some(SensitiveOp::Xsavec),
-        Mnemonic::Xrstor | Mnemonic::Xrstor64 => Some(SensitiveOp::Xrstor),
         _ => None,
     };
     if let Some(op) = simple {
@@ -317,7 +313,8 @@ fn classify_insn(insn: &Instruction, next_va: u64) -> InsnClass {
 
     let target = insn.near_branch_target();
     match insn.flow_control() {
-        FlowControl::Next => InsnClass::Body,
+        FlowControl::Next if supported_body(insn) => InsnClass::Body,
+        FlowControl::Next => InsnClass::InvalidOpcode,
         FlowControl::UnconditionalBranch if insn.is_jmp_short_or_near() => {
             InsnClass::ControlFlow(CflowKind::DirectJump { target })
         }
@@ -351,4 +348,90 @@ fn classify_insn(insn: &Instruction, next_va: u64) -> InsnClass {
         },
         _ => InsnClass::InvalidOpcode,
     }
+}
+
+/// All iced memory operand kinds, including the implicit string/MASKMOV forms.
+#[must_use]
+pub const fn is_memory_kind(kind: OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Memory
+            | OpKind::MemorySegSI
+            | OpKind::MemorySegESI
+            | OpKind::MemorySegRSI
+            | OpKind::MemorySegDI
+            | OpKind::MemorySegEDI
+            | OpKind::MemorySegRDI
+            | OpKind::MemoryESDI
+            | OpKind::MemoryESEDI
+            | OpKind::MemoryESRDI
+    )
+}
+
+/// Native admission is explicit. No VEX/EVEX/XOP, x87 arithmetic, host state,
+/// unknown-sized memory images, VSIB, or potentially trapping FP arithmetic.
+/// Unsupported Level 0 instructions produce guest #UD, never a native fault.
+#[rustfmt::skip]
+pub(crate) fn supported_body(insn: &Instruction) -> bool {
+    if insn.encoding() != iced_x86::EncodingKind::Legacy || insn.is_vsib() {
+        return false;
+    }
+    if (0..insn.op_count()).any(|i| is_memory_kind(insn.op_kind(i)))
+        && insn.mnemonic() != Mnemonic::Lea
+        && !(1..=64).contains(&insn.memory_size().size())
+    {
+        return false;
+    }
+    if (0..insn.op_count())
+        .any(|i| insn.op_kind(i) == OpKind::Register && insn.op_register(i).is_mm())
+        && insn.mnemonic() != Mnemonic::Maskmovq
+    {
+        return false;
+    }
+    if matches!(
+        insn.mnemonic(),
+        Mnemonic::Bt | Mnemonic::Btc | Mnemonic::Btr | Mnemonic::Bts
+    ) && insn.op0_kind() == OpKind::Memory
+    {
+        // A register bit index can address outside the nominal operand width.
+        return false;
+    }
+    matches!(insn.mnemonic(),
+        Mnemonic::Mov | Mnemonic::Movzx | Mnemonic::Movsx | Mnemonic::Movsxd | Mnemonic::Lea
+        | Mnemonic::Nop | Mnemonic::Pause | Mnemonic::Add | Mnemonic::Adc | Mnemonic::Sub
+        | Mnemonic::Sbb | Mnemonic::And | Mnemonic::Or | Mnemonic::Xor | Mnemonic::Not
+        | Mnemonic::Neg | Mnemonic::Cmp | Mnemonic::Test | Mnemonic::Inc | Mnemonic::Dec
+        | Mnemonic::Mul | Mnemonic::Imul | Mnemonic::Div | Mnemonic::Idiv | Mnemonic::Shl
+        | Mnemonic::Shr | Mnemonic::Sal | Mnemonic::Sar | Mnemonic::Rol | Mnemonic::Ror
+        | Mnemonic::Rcl | Mnemonic::Rcr | Mnemonic::Shld | Mnemonic::Shrd | Mnemonic::Bswap
+        | Mnemonic::Xchg | Mnemonic::Xadd | Mnemonic::Cmpxchg | Mnemonic::Cmpxchg8b | Mnemonic::Bt
+        | Mnemonic::Btc | Mnemonic::Btr | Mnemonic::Bts | Mnemonic::Bsf | Mnemonic::Bsr
+        | Mnemonic::Cbw | Mnemonic::Cwde | Mnemonic::Cdqe | Mnemonic::Cwd | Mnemonic::Cdq
+        | Mnemonic::Cqo | Mnemonic::Clc | Mnemonic::Stc | Mnemonic::Cmc | Mnemonic::Cld
+        | Mnemonic::Std | Mnemonic::Lahf | Mnemonic::Sahf | Mnemonic::Cmova | Mnemonic::Cmovae
+        | Mnemonic::Cmovb | Mnemonic::Cmovbe | Mnemonic::Cmove | Mnemonic::Cmovg | Mnemonic::Cmovge
+        | Mnemonic::Cmovl | Mnemonic::Cmovle | Mnemonic::Cmovne | Mnemonic::Cmovno
+        | Mnemonic::Cmovnp | Mnemonic::Cmovns | Mnemonic::Cmovo | Mnemonic::Cmovp | Mnemonic::Cmovs
+        | Mnemonic::Seta | Mnemonic::Setae | Mnemonic::Setb | Mnemonic::Setbe | Mnemonic::Sete
+        | Mnemonic::Setg | Mnemonic::Setge | Mnemonic::Setl | Mnemonic::Setle | Mnemonic::Setne
+        | Mnemonic::Setno | Mnemonic::Setnp | Mnemonic::Setns | Mnemonic::Seto | Mnemonic::Setp
+        | Mnemonic::Sets | Mnemonic::Push | Mnemonic::Pop | Mnemonic::Pushfq | Mnemonic::Popfq
+        | Mnemonic::Pushf | Mnemonic::Popf | Mnemonic::Enter | Mnemonic::Leave | Mnemonic::Xlatb
+        | Mnemonic::Movsb | Mnemonic::Movsw | Mnemonic::Movsd | Mnemonic::Movsq | Mnemonic::Stosb
+        | Mnemonic::Stosw | Mnemonic::Stosd | Mnemonic::Stosq | Mnemonic::Lodsb | Mnemonic::Lodsw
+        | Mnemonic::Lodsd | Mnemonic::Lodsq | Mnemonic::Cmpsb | Mnemonic::Cmpsw | Mnemonic::Cmpsd
+        | Mnemonic::Cmpsq | Mnemonic::Scasb | Mnemonic::Scasw | Mnemonic::Scasd | Mnemonic::Scasq
+        | Mnemonic::Movaps | Mnemonic::Movapd | Mnemonic::Movups | Mnemonic::Movupd
+        | Mnemonic::Movdqa | Mnemonic::Movdqu | Mnemonic::Movd | Mnemonic::Movq | Mnemonic::Movss
+        | Mnemonic::Movlps | Mnemonic::Movhps | Mnemonic::Movlpd | Mnemonic::Movhpd | Mnemonic::Pand
+        | Mnemonic::Pandn | Mnemonic::Por | Mnemonic::Pxor | Mnemonic::Andps | Mnemonic::Andpd
+        | Mnemonic::Andnps | Mnemonic::Andnpd | Mnemonic::Orps | Mnemonic::Orpd | Mnemonic::Xorps
+        | Mnemonic::Xorpd | Mnemonic::Paddb | Mnemonic::Paddw | Mnemonic::Paddd | Mnemonic::Paddq
+        | Mnemonic::Psubb | Mnemonic::Psubw | Mnemonic::Psubd | Mnemonic::Psubq | Mnemonic::Pcmpeqb
+        | Mnemonic::Pcmpeqw | Mnemonic::Pcmpeqd | Mnemonic::Punpcklbw | Mnemonic::Punpcklwd
+        | Mnemonic::Punpckldq | Mnemonic::Punpcklqdq | Mnemonic::Pshufd | Mnemonic::Pshufhw
+        | Mnemonic::Pshuflw | Mnemonic::Pshufw | Mnemonic::Maskmovq | Mnemonic::Maskmovdqu
+        | Mnemonic::Lfence | Mnemonic::Sfence | Mnemonic::Mfence | Mnemonic::Prefetchnta
+        | Mnemonic::Prefetcht0 | Mnemonic::Prefetcht1 | Mnemonic::Prefetcht2
+    )
 }
