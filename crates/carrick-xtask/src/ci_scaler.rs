@@ -33,10 +33,10 @@ pub const REPOSITORY: &str = "carrick-sh/carrick";
 /// The one KVM runner label set: Willow clones register with exactly these,
 /// and every workflow job they serve names exactly these in `runs-on`.
 pub const LABELS: [&str; 4] = ["self-hosted", "Linux", "X64", "willow-kvm"];
-/// The one HVF runner label set for cloudmac merge-queue JIT runners.
+/// The one HVF runner label set for cloudmac main-push JIT runners.
 pub const HVF_LABELS: [&str; 4] = ["self-hosted", "macOS", "ARM64", "carrick-hvf"];
 /// The 24-hour closure job's labels: never served by `mac-jit`, so it can
-/// never occupy the merge-queue runner.
+/// never occupy the main-push runner.
 pub const HVF_CLOSURE_LABELS: [&str; 4] = ["self-hosted", "macOS", "ARM64", "carrick-hvf-closure"];
 /// A job key whose runners repeatedly closed without running it is not
 /// re-served beyond this many reservations; a re-run is a new attempt.
@@ -44,7 +44,6 @@ pub const MAX_SERVES_PER_JOB: usize = 3;
 pub const KERNEL_RUNTIME_WORKFLOW: &str = ".github/workflows/kernel-runtime.yml";
 pub const PILOT_WORKFLOW: &str = ".github/workflows/willow-pilot.yml";
 const PILOT_BRANCH: &str = "work/willow-pilot";
-const MERGE_QUEUE_PREFIX: &str = "gh-readonly-queue/main/";
 
 #[derive(Debug, Error)]
 pub enum ScalerError {
@@ -58,10 +57,6 @@ pub enum ScalerError {
     Kvm { version: i32, errno: i32 },
     #[error("{0}")]
     Guard(&'static str),
-    #[error("merge group is no longer queued")]
-    StaleMergeGroup,
-    #[error("merge group superseded by queued descendant {successor}")]
-    SupersededMergeGroup { successor: String },
     #[error("{0}")]
     Usage(String),
     #[error("I/O: {0}")]
@@ -384,8 +379,8 @@ pub enum Admission {
     /// The historical one-job pilot: `willow-pilot.yml`, dispatched from
     /// `work/willow-pilot` at one approved SHA.
     Pilot { sha: String },
-    /// `kernel-runtime.yml` on this repository for a merge group into main,
-    /// a push to main, or a workflow_dispatch on main. Never pull_request.
+    /// `kernel-runtime.yml` on this repository for a push to main
+    /// or an owner workflow_dispatch on main. Never pull_request.
     Standing,
 }
 fn full_sha(sha: &str) -> bool {
@@ -461,12 +456,6 @@ impl Admission {
 }
 fn standing_event_ref(event: &str, branch: &str) -> bool {
     match event {
-        "merge_group" => branch.strip_prefix(MERGE_QUEUE_PREFIX).is_some_and(|rest| {
-            !rest.is_empty()
-                && rest
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
-        }),
         "push" | "workflow_dispatch" => branch == "main",
         _ => false,
     }
@@ -652,26 +641,6 @@ impl JobPolicy {
     }
 }
 
-/// Merge-queue trust: every pull request in the group ending at `sha`
-/// (its own queue entry and every entry ahead of it) must have its head in
-/// this repository. `response` is the GraphQL mergeQueue entries listing.
-pub fn merge_group_heads_trusted(response: &serde_json::Value, sha: &str) -> bool {
-    let Some(nodes) = response["data"]["repository"]["mergeQueue"]["entries"]["nodes"].as_array()
-    else {
-        return false;
-    };
-    let Some(position) = nodes
-        .iter()
-        .find(|n| n["headCommit"]["oid"] == sha)
-        .and_then(|n| n["position"].as_u64())
-    else {
-        return false;
-    };
-    nodes
-        .iter()
-        .filter(|n| n["position"].as_u64().is_some_and(|p| p <= position))
-        .all(|n| n["pullRequest"]["headRepository"]["nameWithOwner"] == REPOSITORY)
-}
 fn admission_lock(dir: &Path) -> Result<File, ScalerError> {
     use std::os::fd::AsRawFd;
     let file = OpenOptions::new()

@@ -430,34 +430,10 @@ type Launch = (
     std::thread::JoinHandle<Result<Vec<u8>, ScalerError>>,
 );
 
-pub(super) fn prioritize_demand(
-    mut demand: Vec<QueuedJob>,
-    required_pushes: &[JobKey],
-) -> Vec<JobKey> {
-    let pending_group = demand.iter().any(|job| job.event == "merge_group");
-    let newest_push = demand
-        .iter()
-        .filter(|job| job.event == "push")
-        .map(|job| job.key.run.0)
-        .max();
-    // A group's base receipt is a dependency of its hosted gate. Its pending
-    // producer stays eligible even while other main pushes are deferred.
-    demand.retain(|job| match job.event.as_str() {
-        "push" => {
-            required_pushes.contains(&job.key)
-                || (!pending_group && Some(job.key.run.0) == newest_push)
-        }
-        _ => true,
-    });
-    demand.sort_by_key(|job| {
-        let priority = match job.event.as_str() {
-            "push" if required_pushes.contains(&job.key) => 0,
-            "merge_group" => 1,
-            "push" => 2,
-            _ => 3, // Admitted owner workflow_dispatch on main.
-        };
-        (priority, job.key.job.0)
-    });
+pub(super) fn prioritize_demand(mut demand: Vec<QueuedJob>) -> Vec<JobKey> {
+    // Every landed commit needs a receipt. Serve pushes oldest first so a
+    // newer push never displaces its own parent baseline producer.
+    demand.sort_by_key(|job| (job.event != "push", job.key.run.0, job.key.job.0));
     demand.dedup_by_key(|job| job.key.job.0);
     demand.into_iter().map(|job| job.key).collect()
 }
@@ -591,17 +567,11 @@ pub(super) fn controller(
         } else {
             gh.mac_demand()
                 .and_then(|demand| {
-                    let ordered = prioritize_demand(demand.jobs, &demand.required_pushes);
-                    admit_demand(
-                        &mut ledger,
-                        &path,
-                        ordered,
-                        |job| {
-                            gh.vet_mac(job, demand.queue.as_ref())
-                                .map(|policy| (job, policy))
-                        },
-                        |run| gh.cancel_run(run),
-                    )
+                    let ordered = prioritize_demand(demand);
+                    admit_demand(&mut ledger, &path, ordered, |job| {
+                        gh.vet(&Admission::Standing, job)
+                            .map(|policy| (job, policy))
+                    })
                 })
                 .and_then(|vetted| match vetted {
                     Some(job) => launch(&gh, target, &mut ledger, &path, group, job)
@@ -1452,29 +1422,19 @@ mod tests {
     }
 
     #[test]
-    fn ci_scaler_mac_stale_group_does_not_back_off_or_starve_live_group() {
+    fn ci_scaler_mac_inadmissible_demand_does_not_back_off_or_starve_main_push() {
         let stale = job(1);
         let live = job(2);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.json");
         let mut ledger = MacLedger::default();
         let mut assigned = None;
-        let mut cancelled = Vec::new();
-        let pass = admit_demand(
-            &mut ledger,
-            &path,
-            vec![stale, live],
-            |key| {
-                if key == stale {
-                    return Err(ScalerError::StaleMergeGroup);
-                }
-                Ok(key)
-            },
-            |run| {
-                cancelled.push(run);
-                Ok(())
-            },
-        )
+        let pass = admit_demand(&mut ledger, &path, vec![stale, live], |key| {
+            if key == stale {
+                return Err(ScalerError::Guard("event is not admitted"));
+            }
+            Ok(key)
+        })
         .and_then(|key| {
             if let Some(key) = key {
                 assigned = Some(ledger.reserve(key, 100)?.key);
@@ -1494,51 +1454,35 @@ mod tests {
         );
         assert_eq!(backoff.delay(), Duration::from_secs(30));
         assert!(pass.is_ok());
-        assert_eq!(cancelled, vec![stale.run]);
         assert_eq!(ledger.rows.len(), 1, "no stale reservation created");
     }
 
     #[test]
-    fn ci_scaler_mac_refusals_and_failed_cancellation_are_durable_and_once_only() {
+    fn ci_scaler_mac_refusals_are_durable_and_once_only() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.json");
         let mut ledger = MacLedger::default();
-        let mut cancelled = Vec::new();
         let mut vetted = Vec::new();
         assert!(
-            admit_demand::<()>(
-                &mut ledger,
-                &path,
-                vec![job(1), job(2)],
-                |key| {
-                    vetted.push(key);
-                    if key == job(1) {
-                        Err(ScalerError::StaleMergeGroup)
-                    } else {
-                        Err(ScalerError::Guard("untrusted merge-group heads"))
-                    }
-                },
-                |run| {
-                    cancelled.push(run);
-                    Err(ScalerError::External("cancel denied"))
+            admit_demand::<()>(&mut ledger, &path, vec![job(1), job(2)], |key| {
+                vetted.push(key);
+                if key == job(1) {
+                    Err(ScalerError::Guard("event is not admitted"))
+                } else {
+                    Err(ScalerError::Guard("untrusted repository"))
                 }
-            )
+            },)
             .unwrap()
             .is_none()
         );
         let mut ledger = MacLedger::load(&path).unwrap();
         assert!(
-            admit_demand::<()>(
-                &mut ledger,
-                &path,
-                vec![job(1), job(2)],
-                |_| { panic!("a refused key must not be re-vetted") },
-                |_| panic!("cancellation must not repeat")
-            )
+            admit_demand::<()>(&mut ledger, &path, vec![job(1), job(2)], |_| {
+                panic!("a refused key must not be re-vetted")
+            },)
             .unwrap()
             .is_none()
         );
-        assert_eq!(cancelled, vec![job(1).run]);
         assert_eq!(vetted, vec![job(1), job(2)]);
         assert!(!ledger.served(JobKey {
             attempt: 2,
@@ -1551,23 +1495,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.json");
         let mut ledger = MacLedger::default();
-        let result = admit_demand::<()>(
-            &mut ledger,
-            &path,
-            vec![job(1), job(2)],
-            |key| {
-                assert_eq!(key, job(1));
-                Err(ScalerError::External("GitHub unavailable"))
-            },
-            |_| panic!("API failure is not grounds for cancellation"),
-        );
+        let result = admit_demand::<()>(&mut ledger, &path, vec![job(1), job(2)], |key| {
+            assert_eq!(key, job(1));
+            Err(ScalerError::External("GitHub unavailable"))
+        });
         assert!(result.is_err());
         assert!(!ledger.served(job(1)));
         assert!(!path.exists());
     }
 
     #[test]
-    fn ci_scaler_mac_prioritizes_groups_then_newest_push_and_preserves_dispatch() {
+    fn ci_scaler_mac_serves_every_main_push_oldest_first_and_preserves_dispatch() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ledger.json");
         let mut ledger = MacLedger::default();
@@ -1575,33 +1513,28 @@ mod tests {
             QueuedJob {
                 key: job(1),
                 event: "push".into(),
-                sha: "1".repeat(40),
             },
             QueuedJob {
                 key: job(5),
                 event: "push".into(),
-                sha: "5".repeat(40),
             },
             QueuedJob {
                 key: job(4),
-                event: "merge_group".into(),
-                sha: "4".repeat(40),
+                event: "push".into(),
             },
             QueuedJob {
                 key: job(3),
-                event: "merge_group".into(),
-                sha: "3".repeat(40),
+                event: "push".into(),
             },
             QueuedJob {
                 key: job(6),
                 event: "workflow_dispatch".into(),
-                sha: "6".repeat(40),
             },
         ];
-        let ordered = prioritize_demand(demand, &[]);
+        let ordered = prioritize_demand(demand);
         let mut admitted = Vec::new();
-        for _ in 0..3 {
-            let key = admit_demand(&mut ledger, &path, ordered.clone(), Ok, |_| Ok(()))
+        for _ in 0..5 {
+            let key = admit_demand(&mut ledger, &path, ordered.clone(), Ok)
                 .unwrap()
                 .unwrap();
             admitted.push(key);
@@ -1610,7 +1543,7 @@ mod tests {
             last.state = MacState::Done;
             last.assigned = Some(row.key.job);
         }
-        assert_eq!(admitted, vec![job(3), job(4), job(6)]);
+        assert_eq!(admitted, vec![job(1), job(3), job(4), job(5), job(6)]);
         assert!(ledger.refused.is_empty());
     }
 }

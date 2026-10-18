@@ -99,7 +99,7 @@ are in `/tmp/willow-pilot-review/`.
 ## Standing admission surface
 
 The pilot admitted one workflow (`willow-pilot.yml`, `workflow_dispatch`,
-`work/willow-pilot`, one approved SHA). The merge-queue gate adds a bounded
+`work/willow-pilot`, one approved SHA). The main-push hardware workflow uses a bounded
 standing policy for Willow (`ci-scaler standing`) and cloudmac
 (`ci-scaler mac-jit`). Demand uses `Admission::Standing`; each runner is then
 bound by `JobPolicy::Bound` to the one run the controller re-vetted. Both are
@@ -109,17 +109,15 @@ in `crates/carrick-xtask/src/ci_scaler.rs`; there is no second copy.
 |---|---|---|
 | Repository (run and head repository) | `carrick-sh/carrick` | `carrick-sh/carrick` |
 | Workflow file | `willow-pilot.yml` | `kernel-runtime.yml`, at the ref being run |
-| Events and refs | `workflow_dispatch` on `work/willow-pilot` | `merge_group` on `gh-readonly-queue/main/*`; `push` or `workflow_dispatch` on `main` |
-| Merge group content | n/a | every PR in the group has its head in `carrick-sh/carrick` (GraphQL `mergeQueue`, vetted before minting) |
+| Events and refs | `workflow_dispatch` on `work/willow-pilot` | `push` or owner `workflow_dispatch` on `main`; merge groups refused |
 | Hook binding | one approved SHA | the vetted run id, attempt and SHA |
 | Labels | `ci_scaler::LABELS` | `LABELS` (Willow), `HVF_LABELS` (cloudmac); closure uses `HVF_CLOSURE_LABELS`, never served |
 | Concurrency | one clone | Willow 1 by default, `--max-concurrency 2` at most; cloudmac 1 |
 
 Not admitted, by test (`tests/ci_scaler.rs`): `pull_request` (including one
 claiming `refs/heads/main`), `pull_request_target`, `schedule`, other branches
-and tags, an empty or foreign merge-queue prefix, a foreign workflow file, a
-workflow file read at another ref, a fork repository, a short SHA, a merge
-group containing (or queued behind) a fork pull request, and, for a bound
+and tags, every merge group, a foreign workflow file, a workflow file read
+at another ref, a fork repository, a short SHA, and, for a bound
 runner, any other run id, attempt or SHA. `kernel-runtime.yml` has no
 `pull_request` trigger; a test fails if one is added.
 
@@ -155,16 +153,14 @@ controller before every launch; jobs run as the unprivileged `carrick-ci`
 account, which cannot write the tree, the binary, the policy or the hook;
 reaping needs no sudo target a job could write.
 
-Merge-queue gate integrity: the comparison runs in hosted `hvf-gate` and
-`kvm-gate` jobs. Each checks out the merge group's **base** commit cleanly,
-builds and runs the base's `carrick-xtask` in that checkout (its own
-`.cargo` config, lockfile and working directory) and downloads only the
-candidate's receipt artifact; no candidate code executes there. The hardware
-lane jobs only produce receipts and never wait, so a deep queue cannot
-deadlock on the single runner.
+Post-landing receipt comparison: hosted `hvf-gate` and `kvm-gate` check out
+the landed main commit and run its `carrick-xtask`, comparing the candidate
+receipt to its first parent main commit's receipt. Missing parents fail as
+**No baseline** with a job summary. Hardware lanes only produce receipts and
+never wait for a baseline while holding a runner.
 
-**Write access to this repository means trusted.** A merge group runs the
-candidate's own workflow file and the candidate's `xtask accept`, which
+**Write access to this repository means trusted.** A main push runs the
+landed commit's own workflow file and `xtask accept`, which
 writes the receipt the gate judges. A pull request that rewrote either could
 skip or falsify its receipt. The gate protects against accidental
 regressions, not against a malicious writer; review of `.github/` and
@@ -179,7 +175,7 @@ and the toolchain is root-owned and read-only with a per-job `CARGO_HOME`.
 Processes are killed again after the job.
 
 Residual risk, stated plainly: standing mode admits commits from this
-repository's branches that reach main or the merge queue, i.e. trusted code.
+repository's main branch, i.e. trusted code.
 Within one job, a job can still use whatever `carrick-ci` and the network
 allow; a killed process cannot persist, but a cloudmac kernel or setuid
 vulnerability is out of scope. No live

@@ -1,15 +1,13 @@
 name: Kernel runtime · trusted hardware
 
-# Self-hosted jobs here run only trusted refs: a merge group into main, a
-# push to main, or an owner-triggered dispatch on main. There is no
+# Self-hosted jobs here run once per landed commit on push to main, or
+# on an owner-triggered dispatch on main. There is no
 # pull_request trigger, and the JIT controllers (`carrick-xtask ci-scaler
 # standing|mac-jit`) plus each runner's job-start hook admit exactly these
 # events for this workflow file (docs/ci/mac-jit.md, docs/ci/willow-pilot.md).
 on:
   push:
     branches: [main]
-  merge_group:
-    types: [checks_requested]
   workflow_dispatch:
 
 permissions:
@@ -25,51 +23,10 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Check if a prior merge_group run for this exact commit already passed.
-  # Every merge-queue landing rebase-merges onto main at the exact SHA its
-  # merge group verified. If that run succeeded, skip the duplicate hardware run.
-  check-merge-group:
-    name: Check for prior merge-group pass
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      actions: read
-    outputs:
-      skip: ${{ steps.check.outputs.skip }}
-      run-id: ${{ steps.check.outputs.run-id }}
-    steps:
-      - name: Query prior successful merge_group run
-        id: check
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          if ! res=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/kernel-runtime.yml/runs?event=merge_group&head_sha=$GITHUB_SHA&status=success" \
-              --jq '{count: .total_count, run_id: (.workflow_runs[0].id // "")}' 2>/dev/null); then
-            echo "GitHub API query failed; continuing with full run"
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "run-id=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          count=$(jq -r '.count // 0' <<< "$res" 2>/dev/null || echo 0)
-          run_id=$(jq -r '.run_id // ""' <<< "$res" 2>/dev/null || echo "")
-          if [ "$count" -gt 0 ] 2>/dev/null && [ -n "$run_id" ]; then
-            echo "Found successful merge_group run $run_id for $GITHUB_SHA; skipping duplicate hardware run"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
-          else
-            echo "No prior successful merge_group run found for $GITHUB_SHA; running trusted hardware jobs"
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "run-id=" >> "$GITHUB_OUTPUT"
-          fi
-
   signed-fixtures:
     name: Linux ARM64 · exact-SHA signed fixtures
-    needs: [check-merge-group]
     if: >-
       ${{ !cancelled() &&
-          needs.check-merge-group.outputs.skip != 'true' &&
           vars.CARRICK_SELF_HOSTED == 'true' &&
           (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-24.04-arm
@@ -123,8 +80,7 @@ jobs:
       - name: Upload fixture parts to R2
         if: >-
           ${{ github.repository == 'carrick-sh/carrick' &&
-              ((github.event_name == 'merge_group' && startsWith(github.ref, 'refs/heads/gh-readonly-queue/main/')) ||
-               ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main')) }}
+              (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
         # R2 is an accelerator; GitHub remains available if publication fails.
         continue-on-error: true
         env:
@@ -147,7 +103,7 @@ jobs:
   # separate from public pull-request CI: hosted macOS Arm64 does not support
   # the nested virtualization HVPatch requires. No workflow-level concurrency
   # group: a pending job in a group is replaced by a newer one, which would
-  # cancel queued merge-group checks. The controller runs one cloudmac runner
+  # cancel queued main-push runs. The controller runs one cloudmac runner
   # at a time, so jobs wait in GitHub's queue instead.
   hvf-kernel:
     name: HVF · signed embed + cached probes
@@ -178,7 +134,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: hvf-arm64-release
-          save-if: ${{ github.event_name != 'merge_group' }}
 
       - name: Download exact-SHA fixture bundle
         id: relay
@@ -213,8 +168,8 @@ jobs:
       - name: Fetch fixture lockfile dependencies
         run: just xtask fixtures fetch
 
-      # Run the host-only source gate before the signed release steps on
-      # non-merge_group runs and prune its build tree immediately afterward.
+      # Run the host-only source gate before the signed release steps and
+      # prune its build tree immediately afterward.
       # `just ci` populates ~28.27 GiB (`target/debug` ~24.82 GiB,
       # `target/host-authority-census` ~2.28 GiB, `target/aarch64-unknown-linux-gnu`
       # ~0.55 GiB, `target/doc` ~0.55 GiB, `target/host-authority-escape-syntax`
@@ -223,20 +178,18 @@ jobs:
       # crash post-mortem and `carrick-lldb`). Reordering and pruning keeps peak
       # `target/` at ~31.34 GiB instead of ~55.63 GiB without trimming debuginfo.
       - name: Install Semgrep
-        if: ${{ github.event_name != 'merge_group' }}
         # A venv, never the system interpreter (PEP 668 refuses a system-wide pip
         # install on cloudmac's Homebrew Python).
         run: just ci-install-semgrep
 
       - name: Host-only source gate
-        if: ${{ github.event_name != 'merge_group' }}
         run: RUST_TEST_THREADS=1 just lease gate just ci
 
       - name: Prune host-only gate build artifacts
         # Must run even when `Host-only source gate` fails (`!cancelled()`), so
         # `Signed acceptance receipt` below starts with a clean worktree and can
         # still publish main's per-SHA baseline receipt without hitting the disk floor.
-        if: ${{ !cancelled() && github.event_name != 'merge_group' }}
+        if: ${{ !cancelled() }}
         run: |
           rm -rf \
             target/debug \
@@ -283,15 +236,9 @@ jobs:
           path: target/ci-receipts/receipt.json
           if-no-files-found: error
 
-      # After the receipt is published, so a red absolute signed gate cannot
-      # prevent the per-SHA baseline from existing. Not on the merge queue:
-      # main is not green under these absolute verdicts, so the queue gates on
-      # the receipt (NEW failures) above; push and dispatch keep the full
-      # signed coverage (skipped via implicit `success()` if `Host-only source
-      # gate` failed), reusing `target/release` (with `.dSYM` bundles intact)
-      # from `Signed acceptance receipt`.
+      # After publishing the receipt, run the full signed coverage, reusing
+      # target/release (including .dSYM bundles) from signed acceptance.
       - name: Signed embedded guest tests
-        if: ${{ github.event_name != 'merge_group' }}
         run: |
           shopt -s nullglob
           bundles=(target/fixtures/incoming/*.tar.gz)
@@ -330,7 +277,7 @@ jobs:
           github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     needs: hvf-kernel
     # Its own label (`ci_scaler::HVF_CLOSURE_LABELS`): `mac-jit` never serves
-    # it, so the 24-hour closure can never occupy the merge-queue runner.
+    # it, so the 24-hour closure can never occupy the main-push runner.
     runs-on: [self-hosted, macOS, ARM64, carrick-hvf-closure]
     timeout-minutes: 1440
     steps:
@@ -372,7 +319,7 @@ jobs:
   # A real KVM device is the contract. An incidental or software-emulated
   # hosted environment is not accepted as this lane. Every `kvm`-lane test
   # target runs (`just test-kvm`, derived from Cargo metadata) on a real
-  # /dev/kvm, merge queue included, on exactly one of two backends:
+  # /dev/kvm, on push to main or owner dispatch, on exactly one of two backends:
   #
   #   gcp     `kvm-tests`: an ephemeral GCP nested-KVM VM per run, driven
   #           keylessly from this hosted job through Workload Identity
@@ -386,14 +333,12 @@ jobs:
   # conditions over the same expression, and `kvm-gate` and
   # `trusted-hardware-ok` read the selected job's result with that same
   # expression (a skipped selected lane still fails the aggregate). Pull
-  # requests are not run here: the WIF provider admits only main and merge
-  # queue refs, and fork PR code must not reach Willow either.
+  # requests and merge groups are not run here; only main pushes and
+  # owner dispatches may reach the hardware.
   kvm-tests:
     name: KVM · x86 kvm-lane tests
-    needs: [check-merge-group]
     if: >-
       ${{ !cancelled() &&
-          needs.check-merge-group.outputs.skip != 'true' &&
           vars.CARRICK_GCP_KVM == 'true' && vars.CARRICK_KVM_BACKEND != 'willow' &&
           (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-latest
@@ -474,10 +419,8 @@ jobs:
   # `ci_scaler::LABELS`; a test keeps them identical.
   kvm-tests-willow:
     name: KVM · x86 kvm-lane tests (Willow)
-    needs: [check-merge-group]
     if: >-
       ${{ !cancelled() &&
-          needs.check-merge-group.outputs.skip != 'true' &&
           vars.CARRICK_SELF_HOSTED_KVM == 'true' &&
           !(vars.CARRICK_GCP_KVM == 'true' && vars.CARRICK_KVM_BACKEND != 'willow') &&
           (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') }}
@@ -547,27 +490,25 @@ jobs:
           path: target/el1-gate/
           if-no-files-found: ignore
 
-  # Hosted merge-queue gates. They run the BASE commit's xtask in a clean
-  # checkout of the base (its own .cargo config, working directory and
-  # lockfile), download only the candidate's receipt artifact, and execute no
-  # candidate code. The bounded wait for an in-progress base run happens
-  # here, on a hosted runner, never on the trusted hardware. The job timeout
-  # exceeds the wait bound so the actionable message always prints.
+  # Hosted post-landing comparisons against the landed commit's first parent.
+  # Run the current trusted main code so the first push after this change also
+  # reports a missing parent baseline explicitly. Waiting never holds hardware.
+  # Owner dispatch seeds receipts without requiring a baseline.
   hvf-gate:
-    name: HVF · receipt gate vs merge-group base
+    name: HVF · receipt gate vs parent main commit
     permissions:
       contents: read
       actions: read
-      pull-requests: read
     needs: [hvf-kernel]
-    if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.hvf-kernel.result == 'success' }}
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.hvf-kernel.result != 'skipped' }}
     runs-on: ubuntu-latest
     timeout-minutes: 110
     steps:
-      - name: Check out the base commit
+      - name: Check out the landed commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.merge_group.base_sha }}
+          ref: ${{ github.sha }}
+          fetch-depth: 2
           persist-credentials: false
       # Every attempt's receipt; the gate takes the newest attempt <= its own
       # (a "re-run failed jobs" may re-run only this gate).
@@ -581,12 +522,15 @@ jobs:
           shared-key: gate-xtask-release
           cache-workspace-crates: "true"
           save-if: false
-      - name: Build the base xtask
+      - name: Build the trusted xtask
         run: cargo build --locked --release -p carrick-xtask
-      - name: Gate on NEW failures (waits up to 90 min for the base receipt)
+      - name: Resolve the parent main commit
+        id: parent
+        run: echo "sha=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT"
+      - name: Compare with parent receipt (fails explicitly on No baseline)
         env:
           GH_TOKEN: ${{ github.token }}
-          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          BASE_SHA: ${{ steps.parent.outputs.sha }}
         run: >-
           target/release/carrick-xtask ci-receipt gate --lane hvf
           --base-sha "$BASE_SHA" --candidate-dir "$RUNNER_TEMP/candidate"
@@ -594,23 +538,23 @@ jobs:
           --download-dir "$RUNNER_TEMP/baseline" --wait-minutes 90 --poll-seconds 60
 
   kvm-gate:
-    name: KVM · receipt gate vs merge-group base
+    name: KVM · receipt gate vs parent main commit
     permissions:
       contents: read
       actions: read
-      pull-requests: read
     # Whichever backend `kvm-tests`' selection expression chose.
     needs: [kvm-tests, kvm-tests-willow]
     if: >-
-      ${{ !cancelled() && github.event_name == 'merge_group' &&
-          ((vars.CARRICK_GCP_KVM == 'true' && vars.CARRICK_KVM_BACKEND != 'willow') && needs.kvm-tests.result || needs.kvm-tests-willow.result) == 'success' }}
+      ${{ !cancelled() && github.event_name == 'push' &&
+          ((vars.CARRICK_GCP_KVM == 'true' && vars.CARRICK_KVM_BACKEND != 'willow') && needs.kvm-tests.result || needs.kvm-tests-willow.result) != 'skipped' }}
     runs-on: ubuntu-latest
     timeout-minutes: 110
     steps:
-      - name: Check out the base commit
+      - name: Check out the landed commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.merge_group.base_sha }}
+          ref: ${{ github.sha }}
+          fetch-depth: 2
           persist-credentials: false
       # Every attempt's receipt; the gate takes the newest attempt <= its own
       # (a "re-run failed jobs" may re-run only this gate).
@@ -624,12 +568,15 @@ jobs:
           shared-key: gate-xtask-release
           cache-workspace-crates: "true"
           save-if: false
-      - name: Build the base xtask
+      - name: Build the trusted xtask
         run: cargo build --locked --release -p carrick-xtask
-      - name: Gate on NEW failures (waits up to 90 min for the base receipt)
+      - name: Resolve the parent main commit
+        id: parent
+        run: echo "sha=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT"
+      - name: Compare with parent receipt (fails explicitly on No baseline)
         env:
           GH_TOKEN: ${{ github.token }}
-          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          BASE_SHA: ${{ steps.parent.outputs.sha }}
         run: >-
           target/release/carrick-xtask ci-receipt gate --lane kvm
           --base-sha "$BASE_SHA" --candidate-dir "$RUNNER_TEMP/candidate"
@@ -650,23 +597,20 @@ jobs:
           shared-key: gate-xtask-release
           cache-workspace-crates: "true"
           save-if: true
-      - name: Build the base xtask
+      - name: Build the trusted xtask
         run: cargo build --locked --release -p carrick-xtask
 
-  # The single required check. `if: always()` so a skipped or cancelled lane
-  # reports a failure here instead of letting a required check pass by
-  # being skipped.
+  # Post-landing aggregate (not a merge requirement). Skipped or cancelled
+  # lanes fail visibly; pushes also require both parent receipt comparisons.
   trusted-hardware-ok:
     name: Trusted hardware OK
     if: ${{ always() }}
-    needs: [check-merge-group, signed-fixtures, hvf-kernel, kvm-tests, kvm-tests-willow, hvf-gate, kvm-gate]
+    needs: [signed-fixtures, hvf-kernel, kvm-tests, kvm-tests-willow, hvf-gate, kvm-gate]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Require both trusted-hardware lanes (and their gates in the queue)
+      - name: Require both trusted-hardware lanes (and their gates on push)
         env:
-          SKIPPED_BY_MERGE_GROUP: ${{ needs.check-merge-group.outputs.skip }}
-          MERGE_GROUP_RUN_ID: ${{ needs.check-merge-group.outputs.run-id }}
           HVF: ${{ needs.hvf-kernel.result }}
           # The selected KVM backend's result (same expression as the lanes'
           # `if:`); the other backend's job is skipped by construction.
@@ -678,15 +622,10 @@ jobs:
           KVM_GATE: ${{ needs.kvm-gate.result }}
           EVENT: ${{ github.event_name }}
         run: |
-          if [ "$SKIPPED_BY_MERGE_GROUP" = "true" ]; then
-            echo "::notice title=Trusted hardware skipped::Commit $GITHUB_SHA was already verified by merge_group run $MERGE_GROUP_RUN_ID"
-            echo "Skipped duplicate hardware run: merge_group run $MERGE_GROUP_RUN_ID passed for $GITHUB_SHA"
-            exit 0
-          fi
           echo "hvf-kernel=$HVF kvm($KVM_BACKEND)=$KVM hvf-gate=$HVF_GATE kvm-gate=$KVM_GATE"
           test "$HVF" = success
           test "$KVM" = success
-          if [ "$EVENT" = merge_group ]; then
+          if [ "$EVENT" = push ]; then
             test "$HVF_GATE" = success
             test "$KVM_GATE" = success
           fi

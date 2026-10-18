@@ -426,46 +426,10 @@ fn bound_hook_admits_only_the_vetted_run_attempt_and_sha() {
     assert!(bound().authorize(&foreign).is_err());
 }
 
-fn queue(entries: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({"data":{"repository":{"mergeQueue":{"entries":{"nodes": entries}}}}})
-}
-fn entry(position: u64, oid: &str, head: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({"position": position, "headCommit": {"oid": oid},
-        "pullRequest": {"number": position, "headRepository": head}})
-}
-
 #[test]
-fn merge_group_with_a_fork_pull_request_is_refused() {
-    let ours = serde_json::json!({"nameWithOwner": REPOSITORY});
-    let fork = serde_json::json!({"nameWithOwner": "fork/carrick"});
-    let (a, b, c) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
-    let trusted = queue(serde_json::json!([
-        entry(1, &a, ours.clone()),
-        entry(2, &b, ours.clone()),
-        entry(3, &c, fork.clone()),
-    ]));
-    assert!(merge_group_heads_trusted(&trusted, &a));
-    assert!(merge_group_heads_trusted(&trusted, &b));
-    // The group ending at c contains the fork PR.
-    assert!(!merge_group_heads_trusted(&trusted, &c));
-    // A fork entry ahead taints every later group.
-    let ahead = queue(serde_json::json!([
-        entry(1, &a, fork),
-        entry(2, &b, ours.clone())
-    ]));
-    assert!(!merge_group_heads_trusted(&ahead, &b));
-    // A deleted head repository is not trusted; an unqueued SHA is refused.
-    let deleted = queue(serde_json::json!([entry(1, &a, serde_json::Value::Null)]));
-    assert!(!merge_group_heads_trusted(&deleted, &a));
-    assert!(!merge_group_heads_trusted(&trusted, &"d".repeat(40)));
-    assert!(!merge_group_heads_trusted(&serde_json::json!({}), &a));
-}
-
-#[test]
-fn standing_job_start_admits_merge_queue_push_and_dispatch_on_main_only() {
+fn standing_job_start_admits_push_and_dispatch_on_main_only() {
     let queue = "refs/heads/gh-readonly-queue/main/pr-42-0123456789abcdef0123456789abcdef01234567";
     for (event, git_ref) in [
-        ("merge_group", queue),
         ("push", "refs/heads/main"),
         ("workflow_dispatch", "refs/heads/main"),
     ] {
@@ -477,6 +441,7 @@ fn standing_job_start_admits_merge_queue_push_and_dispatch_on_main_only() {
         );
     }
     for (event, git_ref) in [
+        ("merge_group", queue),
         // Untrusted pull-request code never reaches a self-hosted runner.
         ("pull_request", "refs/pull/42/merge"),
         ("pull_request", "refs/heads/main"),
@@ -532,20 +497,17 @@ fn standing_run(event: &str, branch: &str) -> serde_json::Value {
 
 #[test]
 fn standing_demand_serves_only_trusted_kernel_runtime_runs() {
-    for (event, branch) in [
-        (
-            "merge_group",
-            "gh-readonly-queue/main/pr-7-0123456789abcdef",
-        ),
-        ("push", "main"),
-        ("workflow_dispatch", "main"),
-    ] {
+    for (event, branch) in [("push", "main"), ("workflow_dispatch", "main")] {
         assert!(Admission::Standing.admits_run(&standing_run(event, branch)));
     }
     for (event, branch) in [
         ("pull_request", "main"),
         ("pull_request", "work/x"),
         ("schedule", "main"),
+        (
+            "merge_group",
+            "gh-readonly-queue/main/pr-7-0123456789abcdef",
+        ),
         ("push", "work/x"),
     ] {
         assert!(!Admission::Standing.admits_run(&standing_run(event, branch)));
@@ -714,10 +676,13 @@ fn self_hosted_jobs_never_run_on_pull_request_events() {
     for event in on.keys() {
         let event = event.as_str().unwrap();
         assert!(
-            ["push", "merge_group", "workflow_dispatch"].contains(&event),
+            ["push", "workflow_dispatch"].contains(&event),
             "kernel-runtime.yml must not trigger on {event}"
         );
     }
+    assert_eq!(on.len(), 2);
+    assert!(!kernel.contains("merge_group"));
+    assert!(!kernel.contains("check-merge-group"));
     assert_eq!(docs[0]["on"]["push"]["branches"][0].as_str(), Some("main"));
 }
 
@@ -783,7 +748,7 @@ fn durable_ledger_round_trip_rejects_corruption_without_resetting_budget() {
 }
 
 #[test]
-fn hardware_lanes_never_wait_and_hosted_gates_run_only_base_code() {
+fn hardware_lanes_never_wait_and_hosted_gates_compare_parent_main() {
     let kernel = include_str!("../../../.github/workflows/kernel-runtime.yml");
     let docs = yaml_rust2::YamlLoader::load_from_str(kernel).unwrap();
     let jobs = &docs[0]["jobs"];
@@ -819,8 +784,37 @@ fn hardware_lanes_never_wait_and_hosted_gates_run_only_base_code() {
             .unwrap();
         assert_eq!(
             checkout["with"]["ref"].as_str(),
-            Some("${{ github.event.merge_group.base_sha }}"),
-            "{gate} checks out the base, never the candidate"
+            Some("${{ github.sha }}"),
+            "{gate} runs the current trusted landed commit"
+        );
+        assert_eq!(checkout["with"]["fetch-depth"].as_i64(), Some(2));
+        assert!(
+            job["if"]
+                .as_str()
+                .unwrap()
+                .contains("github.event_name == 'push'")
+        );
+        let parent = steps
+            .iter()
+            .find(|s| s["id"].as_str() == Some("parent"))
+            .unwrap();
+        assert!(
+            parent["run"]
+                .as_str()
+                .unwrap()
+                .contains("git rev-parse HEAD^1")
+        );
+        let comparison = steps
+            .iter()
+            .find(|s| {
+                s["run"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("ci-receipt gate"))
+            })
+            .unwrap();
+        assert_eq!(
+            comparison["env"]["BASE_SHA"].as_str(),
+            Some("${{ steps.parent.outputs.sha }}")
         );
         let checkouts = steps
             .iter()
@@ -880,4 +874,53 @@ fn template_sets_and_verifies_disk_boot_order_after_attaching_the_disk() {
         .position(|l| l.starts_with("qm create 300"))
         .unwrap();
     assert!(guard < create);
+}
+
+#[test]
+fn serial_host_aggregate_requires_push_gates_and_allows_owner_seeding() {
+    let kernel = include_str!("../../../.github/workflows/kernel-runtime.yml");
+    let docs = yaml_rust2::YamlLoader::load_from_str(kernel).unwrap();
+    let script = docs[0]["jobs"]["trusted-hardware-ok"]["steps"][0]["run"]
+        .as_str()
+        .unwrap();
+    for (event, hvf, kvm, hvf_gate, kvm_gate, expected) in [
+        ("push", "success", "success", "success", "success", true),
+        ("push", "success", "success", "failure", "success", false),
+        ("push", "success", "success", "success", "failure", false),
+        ("push", "success", "success", "skipped", "skipped", false),
+        ("push", "skipped", "success", "success", "success", false),
+        ("push", "success", "cancelled", "success", "success", false),
+        (
+            "workflow_dispatch",
+            "success",
+            "success",
+            "skipped",
+            "skipped",
+            true,
+        ),
+        (
+            "workflow_dispatch",
+            "failure",
+            "success",
+            "skipped",
+            "skipped",
+            false,
+        ),
+    ] {
+        let output = std::process::Command::new("bash")
+            .args(["-e", "-c", script])
+            .env("EVENT", event)
+            .env("HVF", hvf)
+            .env("KVM", kvm)
+            .env("HVF_GATE", hvf_gate)
+            .env("KVM_GATE", kvm_gate)
+            .env("KVM_BACKEND", "willow")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            expected,
+            "{event}: hvf={hvf} kvm={kvm} hvf-gate={hvf_gate} kvm-gate={kvm_gate}"
+        );
+    }
 }
