@@ -77,7 +77,8 @@ pub fn translate_with_frame<M: SoftMmuMemory>(
     va: u64,
     kind: SoftAccessKind,
 ) -> Result<(*mut u8, AuthenticatedGpa), SoftPageFault> {
-    let (root, mode) = (ctx.root_gpa(), ctx.access_mode());
+    let root = ctx.root_gpa().ok_or(SoftPageFault::new(va, 0))?;
+    let mode = ctx.access_mode();
     match ctx
         .walker
         .walk_and_fill(mem, &mut ctx.tlb, root, GuestVa::new(va), kind, mode)

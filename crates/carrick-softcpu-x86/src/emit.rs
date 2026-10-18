@@ -13,7 +13,7 @@ use crate::context::{
     CTX_VIRT_SPILL0_OFF, CTX_VIRT_SPILL1_OFF, EXIT_REASON_CFLOW, EXIT_REASON_CONTINUE,
     EXIT_REASON_EXCEPTION, EXIT_REASON_SENSITIVE, EXIT_REASON_SYSCALL, pack_slow_path_meta,
 };
-use crate::decode::gpr_index;
+use crate::decode::{gpr_index, is_memory_kind, supported_body};
 
 /// Error returned if a block cannot be emitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +42,10 @@ pub fn emit_block(block: &PlannedBlock) -> Result<EmittedBlock, EmitError> {
 
     for (idx, decoded) in block.insns.iter().enumerate() {
         let insn = &decoded.raw;
+        if !supported_body(insn) {
+            emit_exit_stub(&mut code, decoded.va, decoded.va, EXIT_REASON_EXCEPTION);
+            break;
+        }
         let raw_bytes = &block.insn_bytes[idx][..decoded.len];
         if is_routed_to_complex_helper(insn) {
             emit_complex_call(&mut code, idx as u32);
@@ -49,7 +53,9 @@ pub fn emit_block(block: &PlannedBlock) -> Result<EmittedBlock, EmitError> {
             code.push(0x90);
         } else if insn.mnemonic() == Mnemonic::Lea {
             emit_lea(&mut code, insn, decoded.va, &mut info_factory)?;
-        } else if !(0..insn.op_count()).any(|i| insn.op_kind(i) == OpKind::Memory) {
+        } else if !(0..insn.op_count()).any(|i| is_memory_kind(insn.op_kind(i)))
+            && info_factory.info(insn).used_memory().is_empty()
+        {
             emit_reg_only_insn(&mut code, insn, raw_bytes, decoded.va, &mut info_factory)?;
         } else {
             emit_mem_insn(
@@ -102,7 +108,9 @@ fn is_routed_to_complex_helper(insn: &Instruction) -> bool {
     insn.is_string_instruction()
         || matches!(
             insn.mnemonic(),
-            Mnemonic::Div
+            Mnemonic::Maskmovq
+                | Mnemonic::Maskmovdqu
+                | Mnemonic::Div
                 | Mnemonic::Idiv
                 | Mnemonic::Push
                 | Mnemonic::Pop
@@ -216,6 +224,10 @@ fn emit_mem_insn(
     info_factory: &mut InstructionInfoFactory,
     cold_paths: &mut Vec<ColdSlowPath>,
 ) -> Result<(), EmitError> {
+    if !(0..insn.op_count()).any(|i| insn.op_kind(i) == OpKind::Memory) {
+        emit_exit_stub(code, va, va, EXIT_REASON_EXCEPTION);
+        return Ok(());
+    }
     let used_mem = info_factory.info(insn).used_memory();
     if used_mem.is_empty() {
         code.push(0x90);
@@ -223,7 +235,12 @@ fn emit_mem_insn(
     }
 
     let mem_info = used_mem[0];
-    let size = mem_info.memory_size().size().clamp(1, 64) as u8;
+    let operand_size = mem_info.memory_size().size();
+    if !(1..=64).contains(&operand_size) {
+        emit_exit_stub(code, va, va, EXIT_REASON_EXCEPTION);
+        return Ok(());
+    }
+    let size = operand_size as u8;
     let access_code: u8 = match mem_info.access() {
         OpAccess::Write | OpAccess::CondWrite => 1,
         OpAccess::ReadWrite | OpAccess::ReadCondWrite => 2,
@@ -339,6 +356,7 @@ fn encode_one(out: &mut Vec<u8>, insn: &Instruction, va: u64) -> Result<(), Emit
 }
 
 struct VirtSpillState {
+    rsp_host: Option<usize>,
     r14_host: Option<usize>,
     r15_host: Option<usize>,
 }
@@ -346,10 +364,10 @@ struct VirtSpillState {
 fn mentions_r14_or_r15(insn: &Instruction, include_mem: bool) -> bool {
     (0..insn.op_count()).any(|i| {
         insn.op_kind(i) == OpKind::Register
-            && matches!(gpr_index(insn.op_register(i)), Some(14 | 15))
+            && matches!(gpr_index(insn.op_register(i)), Some(4 | 14 | 15))
     }) || (include_mem
-        && (matches!(gpr_index(insn.memory_base()), Some(14 | 15))
-            || matches!(gpr_index(insn.memory_index()), Some(14 | 15))))
+        && (matches!(gpr_index(insn.memory_base()), Some(4 | 14 | 15))
+            || matches!(gpr_index(insn.memory_index()), Some(4 | 14 | 15))))
 }
 
 fn begin_virt_r14_r15(
@@ -360,6 +378,7 @@ fn begin_virt_r14_r15(
 ) -> VirtSpillState {
     if !mentions_r14_or_r15(insn, rewrite_mem) {
         return VirtSpillState {
+            rsp_host: None,
             r14_host: None,
             r15_host: None,
         };
@@ -383,22 +402,33 @@ fn begin_virt_r14_r15(
         8
     };
 
-    let (mut need_r14, mut need_r15) = (false, false);
+    let (mut need_rsp, mut need_r14, mut need_r15) = (false, false, false);
     for i in 0..insn.op_count() {
         if insn.op_kind(i) == OpKind::Register {
+            need_rsp |= gpr_index(insn.op_register(i)) == Some(4);
             need_r14 |= gpr_index(insn.op_register(i)) == Some(14);
             need_r15 |= gpr_index(insn.op_register(i)) == Some(15);
         }
     }
     if rewrite_mem {
         for r in [insn.memory_base(), insn.memory_index()] {
+            need_rsp |= gpr_index(r) == Some(4);
             need_r14 |= gpr_index(r) == Some(14);
             need_r15 |= gpr_index(r) == Some(15);
         }
     }
 
+    let rsp_host = need_rsp.then(&mut pick_free);
     let r14_host = need_r14.then(&mut pick_free);
     let r15_host = need_r15.then(&mut pick_free);
+    if let Some(h) = rsp_host {
+        emit_mov_r15_disp32_from_gpr(
+            out,
+            std::mem::offset_of!(crate::context::SoftCpuContext, virt_rsp_spill) as i32,
+            h,
+        );
+        emit_mov_gpr_from_r15_disp32(out, h, 4 * 8);
+    }
     if let Some(h) = r14_host {
         emit_mov_r15_disp32_from_gpr(out, CTX_VIRT_SPILL0_OFF as i32, h);
         emit_mov_gpr_from_r15_disp32(out, h, CTX_GPR_R14_OFF as i32);
@@ -409,6 +439,7 @@ fn begin_virt_r14_r15(
     }
 
     let remap = |r: Register| match gpr_index(r) {
+        Some(4) => rsp_host.map(|h| map_reg_width(r, h)),
         Some(14) => r14_host.map(|h| map_reg_width(r, h)),
         Some(15) => r15_host.map(|h| map_reg_width(r, h)),
         _ => None,
@@ -430,10 +461,22 @@ fn begin_virt_r14_r15(
         }
     }
 
-    VirtSpillState { r14_host, r15_host }
+    VirtSpillState {
+        rsp_host,
+        r14_host,
+        r15_host,
+    }
 }
 
 fn end_virt_r14_r15(out: &mut Vec<u8>, state: &VirtSpillState) {
+    if let Some(h) = state.rsp_host {
+        emit_mov_r15_disp32_from_gpr(out, 4 * 8, h);
+        emit_mov_gpr_from_r15_disp32(
+            out,
+            h,
+            std::mem::offset_of!(crate::context::SoftCpuContext, virt_rsp_spill) as i32,
+        );
+    }
     if let Some(h) = state.r14_host {
         emit_mov_r15_disp32_from_gpr(out, CTX_GPR_R14_OFF as i32, h);
         emit_mov_gpr_from_r15_disp32(out, h, CTX_VIRT_SPILL0_OFF as i32);
@@ -444,46 +487,18 @@ fn end_virt_r14_r15(out: &mut Vec<u8>, state: &VirtSpillState) {
     }
 }
 
-const fn map_reg_width(orig: Register, new_gpr: usize) -> Register {
-    if matches!(
-        orig,
-        Register::R14W | Register::R15W | Register::R14L | Register::R15L
-    ) {
-        let (r16, r8) = match new_gpr {
-            3 => (Register::BX, Register::BL),
-            5 => (Register::BP, Register::BPL),
-            6 => (Register::SI, Register::SIL),
-            7 => (Register::DI, Register::DIL),
-            8 => (Register::R8W, Register::R8L),
-            9 => (Register::R9W, Register::R9L),
-            10 => (Register::R10W, Register::R10L),
-            11 => (Register::R11W, Register::R11L),
-            12 => (Register::R12W, Register::R12L),
-            _ => (Register::R13W, Register::R13L),
-        };
-        if matches!(orig, Register::R14L | Register::R15L) {
-            r8
-        } else {
-            r16
-        }
-    } else {
-        let (r64, r32) = match new_gpr {
-            3 => (Register::RBX, Register::EBX),
-            5 => (Register::RBP, Register::EBP),
-            6 => (Register::RSI, Register::ESI),
-            7 => (Register::RDI, Register::EDI),
-            8 => (Register::R8, Register::R8D),
-            9 => (Register::R9, Register::R9D),
-            10 => (Register::R10, Register::R10D),
-            11 => (Register::R11, Register::R11D),
-            12 => (Register::R12, Register::R12D),
-            _ => (Register::R13, Register::R13D),
-        };
-        if matches!(orig, Register::R14D | Register::R15D) {
-            r32
-        } else {
-            r64
-        }
+fn map_reg_width(orig: Register, new_gpr: usize) -> Register {
+    let number = match orig.size() {
+        1 if new_gpr < 4 => Register::AL as usize + new_gpr,
+        1 => Register::SPL as usize + new_gpr - 4,
+        2 => Register::AX as usize + new_gpr,
+        4 => Register::EAX as usize + new_gpr,
+        8 => Register::RAX as usize + new_gpr,
+        _ => return Register::None,
+    };
+    match Register::try_from(number) {
+        Ok(r) => r,
+        Err(_) => Register::None,
     }
 }
 
@@ -530,6 +545,7 @@ fn emit_load_addr_reg_into_rax(code: &mut Vec<u8>, r: Register) {
     match gpr_index(r).unwrap_or(0) {
         0 => emit_mov_gpr_from_r15_disp32(code, 0, CTX_PROBE_SPILL0_OFF as i32),
         1 => emit_mov_gpr_from_r15_disp32(code, 0, CTX_PROBE_SPILL1_OFF as i32),
+        4 => emit_mov_gpr_from_r15_disp32(code, 0, 4 * 8),
         14 => emit_mov_gpr_from_r15_disp32(code, 0, CTX_GPR_R14_OFF as i32),
         15 => emit_mov_gpr_from_r15_disp32(code, 0, CTX_GPR_R15_OFF as i32),
         other => {

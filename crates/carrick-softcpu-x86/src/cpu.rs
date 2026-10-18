@@ -8,7 +8,8 @@ use crate::block::{BlockExit, BlockFetchFault, PlannedBlock, plan_block_from_mem
 use crate::cflow::{compute_effective_va, resolve_cflow};
 use crate::context::{
     EXIT_REASON_CFLOW, EXIT_REASON_CONTINUE, EXIT_REASON_SENSITIVE, EXIT_REASON_SYSCALL,
-    SoftCpuContext, X86Exception, reg, softcpu_enter_translated, translate_for_mem,
+    GUEST_MXCSR_MASK, SoftCpuContext, X86Exception, X86ExceptionVector, reg,
+    softcpu_enter_translated, translate_for_mem,
 };
 use crate::decode::SensitiveOp;
 use crate::emit::{EmitError, emit_block};
@@ -34,6 +35,11 @@ pub enum SoftCpuExit {
         op: SensitiveOp,
     },
     Exception(X86Exception),
+    SoftwareInterrupt {
+        vector: u8,
+        rip: u64,
+        next_rip: u64,
+    },
 }
 
 /// Host executable scratch buffer for translated blocks (never maps guest VAs).
@@ -41,6 +47,7 @@ pub struct JitCodeBuffer {
     ptr: NonNull<u8>,
     capacity: usize,
     cursor: usize,
+    executable: bool,
 }
 
 // SAFETY: `JitCodeBuffer` owns a private `mmap` allocation not shared across threads without sync.
@@ -49,8 +56,8 @@ unsafe impl Send for JitCodeBuffer {}
 impl JitCodeBuffer {
     /// Allocate a host executable scratch buffer of `capacity` bytes.
     pub fn new(capacity: usize) -> Option<Self> {
-        let cap = capacity.max(4096);
-        let prot = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
+        let cap = capacity.max(4096).checked_add(4095)? & !4095;
+        let prot = libc::PROT_READ | libc::PROT_WRITE;
         let flags = libc::MAP_PRIVATE | libc::MAP_ANON;
         // SAFETY: anonymous private host allocation for translated block bytes only.
         let raw = unsafe { libc::mmap(std::ptr::null_mut(), cap, prot, flags, -1, 0) };
@@ -61,21 +68,50 @@ impl JitCodeBuffer {
             ptr: NonNull::new(raw.cast::<u8>())?,
             capacity: cap,
             cursor: 0,
+            executable: false,
         })
     }
 
-    /// Write `bytes` into the executable buffer and return the host execution address.
+    /// Publish under W^X, returning an RX address only after mprotect succeeds.
+    /// The owner must ensure no previously published code is executing while
+    /// this exclusive publication changes the mapping back to RW.
     pub fn publish(&mut self, bytes: &[u8]) -> Option<u64> {
         if bytes.is_empty() || bytes.len() > self.capacity {
             return None;
         }
-        if self.cursor + bytes.len() > self.capacity {
+        if self.executable {
+            // SAFETY: the exclusive owner holds the entire live mmap allocation.
+            if unsafe {
+                libc::mprotect(
+                    self.ptr.as_ptr().cast(),
+                    self.capacity,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                )
+            } != 0
+            {
+                return None;
+            }
+            self.executable = false;
+        }
+        if self.cursor.checked_add(bytes.len())? > self.capacity {
             self.cursor = 0;
         }
         // SAFETY: `self.cursor + bytes.len() <= self.capacity`.
         let dst = unsafe { self.ptr.as_ptr().add(self.cursor) };
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
         self.cursor += (bytes.len() + 15) & !15;
+        // SAFETY: publication is complete and no mutable pointer escapes this owner.
+        if unsafe {
+            libc::mprotect(
+                self.ptr.as_ptr().cast(),
+                self.capacity,
+                libc::PROT_READ | libc::PROT_EXEC,
+            )
+        } != 0
+        {
+            return None;
+        }
+        self.executable = true;
         Some(dst as u64)
     }
 }
@@ -178,6 +214,7 @@ impl SoftCpu {
             unsafe { softcpu_enter_translated(ctx_ptr.cast::<u8>()) }
         };
 
+        self.ctx.fxsave.0[28..32].copy_from_slice(&GUEST_MXCSR_MASK.to_le_bytes());
         self.ctx.sync_tlb_tag_bits();
         if let Some(exc) = self.ctx.pending_exception.take() {
             return Ok(SoftCpuExit::Exception(exc));
@@ -253,6 +290,46 @@ impl SoftCpu {
         }
 
         match op {
+            SensitiveOp::Interrupt { vector } => {
+                self.ctx.rip = resume;
+                if raw.mnemonic() == iced_x86::Mnemonic::Int3 {
+                    return self.raise(X86Exception::new(
+                        X86ExceptionVector::Breakpoint,
+                        resume,
+                        None,
+                        None,
+                    ));
+                }
+                Ok(SoftCpuExit::SoftwareInterrupt {
+                    vector,
+                    rip: va,
+                    next_rip: resume,
+                })
+            }
+            SensitiveOp::Ldmxcsr | SensitiveOp::Stmxcsr => {
+                let ea = compute_effective_va(raw, &self.ctx);
+                if !is_canonical_va(ea) || !is_canonical_va(ea.wrapping_add(3)) {
+                    return self.raise(X86Exception::general_protection(va, 0));
+                }
+                let mut bytes = [0; 4];
+                let result = if op == SensitiveOp::Stmxcsr {
+                    bytes.copy_from_slice(&self.ctx.fxsave.0[24..28]);
+                    write_guest_bytes(&mut self.ctx, mem, ea, &bytes)
+                } else {
+                    read_guest_bytes(&mut self.ctx, mem, ea, &mut bytes, SoftAccessKind::Read)
+                };
+                if let Err(pf) = result {
+                    return self.raise(X86Exception::page_fault(va, pf.error_code, pf.cr2));
+                }
+                if op == SensitiveOp::Ldmxcsr {
+                    if u32::from_le_bytes(bytes) & !GUEST_MXCSR_MASK != 0 {
+                        return self.raise(X86Exception::general_protection(va, 0));
+                    }
+                    self.ctx.fxsave.0[24..28].copy_from_slice(&bytes);
+                }
+                self.ctx.rip = resume;
+                Ok(SoftCpuExit::Continue { next_rip: resume })
+            }
             SensitiveOp::Rdssp { .. } => {
                 self.ctx.rip = resume;
                 Ok(SoftCpuExit::Continue { next_rip: resume })
@@ -279,11 +356,12 @@ impl SoftCpu {
                 Ok(SoftCpuExit::Continue { next_rip: resume })
             }
             SensitiveOp::Rdtsc | SensitiveOp::Rdtscp => {
-                let mut aux = 0u32;
-                // SAFETY: `_rdtsc`/`__rdtscp` are available on x86_64 hosts.
+                // SAFETY: TSC and LFENCE are baseline x86_64 instructions;
+                // no host RDTSCP extension is required or exposed.
                 let tsc = unsafe {
                     if matches!(op, SensitiveOp::Rdtscp) {
-                        core::arch::x86_64::__rdtscp(&mut aux)
+                        core::arch::x86_64::_mm_lfence();
+                        core::arch::x86_64::_rdtsc()
                     } else {
                         core::arch::x86_64::_rdtsc()
                     }
@@ -308,56 +386,6 @@ impl SoftCpu {
                 self.ctx.rip = resume;
                 Ok(SoftCpuExit::Continue { next_rip: resume })
             }
-            SensitiveOp::Fxsave
-            | SensitiveOp::Xsave
-            | SensitiveOp::Xsaveopt
-            | SensitiveOp::Xsavec
-            | SensitiveOp::Fxrstor
-            | SensitiveOp::Xrstor => {
-                let is_save = !matches!(op, SensitiveOp::Fxrstor | SensitiveOp::Xrstor);
-                let is_ext = !matches!(op, SensitiveOp::Fxsave | SensitiveOp::Fxrstor);
-                let (align_mask, total_len) = if is_ext {
-                    (0x3fu64, 576)
-                } else {
-                    (0xfu64, 512)
-                };
-                let ea = compute_effective_va(raw, &self.ctx);
-                if (ea & align_mask) != 0
-                    || !is_canonical_va(ea)
-                    || !is_canonical_va(ea.wrapping_add((total_len - 1) as u64))
-                {
-                    return self.raise(X86Exception::general_protection(va, 0));
-                }
-                let mut area = [0u8; 576];
-                let io_res = if is_save {
-                    area[..512].copy_from_slice(&self.ctx.fxsave.0);
-                    if is_ext {
-                        area[512..520].copy_from_slice(&0x3u64.to_le_bytes());
-                    }
-                    write_guest_bytes(&mut self.ctx, mem, ea, &area[..total_len])
-                } else {
-                    read_guest_bytes(
-                        &mut self.ctx,
-                        mem,
-                        ea,
-                        &mut area[..total_len],
-                        SoftAccessKind::Read,
-                    )
-                };
-                if let Err(pf) = io_res {
-                    return self.raise(X86Exception::page_fault(va, pf.error_code, pf.cr2));
-                }
-                if !is_save {
-                    if (u32::from_le_bytes([area[24], area[25], area[26], area[27]]) & 0xffff_0000)
-                        != 0
-                    {
-                        return self.raise(X86Exception::general_protection(va, 0));
-                    }
-                    self.ctx.fxsave.0.copy_from_slice(&area[..512]);
-                }
-                self.ctx.rip = resume;
-                Ok(SoftCpuExit::Continue { next_rip: resume })
-            }
             _ => {
                 self.ctx.rip = va;
                 Ok(SoftCpuExit::Sensitive {
@@ -370,13 +398,29 @@ impl SoftCpu {
     }
 }
 
-/// Pinned x86-64-v3 guest CPUID view (§4.3.5: SSE4.2, AVX2, BMI1/2, FMA, F16C, MOVBE, POPCNT;
-/// no AVX-512, no AMX, no CET, hypervisor bit clear).
+/// Fixed Level 0 view, independent of the host. Baseline integer/SSE2 state,
+/// no XSAVE image helpers yet; no AVX, monitor, INVPCID, XSAVES,
+/// RDPID, CET, or other host extensions. Native admission remains a separate
+/// instruction-level allowlist: Level 0 is deliberately a partial ISA.
 fn emulate_pinned_cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
-    let host = core::arch::x86_64::__cpuid_count(leaf, subleaf);
     match (leaf, subleaf) {
-        (1, _) => (host.eax, host.ebx, host.ecx & !(1 << 31), host.edx),
-        (7, 0) => (host.eax, host.ebx & !0xdc23_0000, host.ecx & !(1 << 7), 0),
-        _ => (host.eax, host.ebx, host.ecx, host.edx),
+        (0, _) => (
+            0x0d,
+            u32::from_le_bytes(*b"Genu"),
+            u32::from_le_bytes(*b"ntel"),
+            u32::from_le_bytes(*b"ineI"),
+        ),
+        (1, _) => (
+            0x0000_0663,
+            0,
+            0,
+            (1 << 4) | (1 << 8) | (1 << 15) | (1 << 24) | (1 << 25) | (1 << 26),
+        ),
+        (0x0d, 0) => (0, 0, 0, 0),
+        (0x0d, 1) => (0, 0, 0, 0),
+        (0x8000_0000, _) => (0x8000_0008, 0, 0, 0),
+        (0x8000_0001, _) => (0, 0, 1, (1 << 11) | (1 << 20) | (1 << 29)),
+        (0x8000_0008, _) => (48 | (48 << 8), 0, 0, 0),
+        _ => (0, 0, 0, 0),
     }
 }
