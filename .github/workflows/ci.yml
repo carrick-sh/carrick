@@ -551,6 +551,11 @@ jobs:
       - name: Native Linux host backend tests
         if: ${{ !cancelled() }}
         run: just test-host-linux
+      - name: Native x86_64 soft CPU tests and API witnesses
+        if: ${{ !cancelled() }}
+        run: |
+          cargo test --locked -p carrick-softcpu-x86 --lib --tests
+          cargo test --locked -p carrick-softcpu-x86 --doc
 
       - name: Compiler cache statistics
         if: ${{ always() }}
