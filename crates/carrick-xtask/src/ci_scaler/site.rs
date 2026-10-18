@@ -36,9 +36,6 @@ pub(super) enum Network {
 /// in pool `carrick-ci` are the same on every site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Site {
-    /// Physical-host clone admission, held in-process from reservation through
-    /// destruction. Guests do not recursively acquire this exclusive lease.
-    pub host_lease: Option<&'static str>,
     /// `/etc/hostname`, which is also the PVE node name.
     pub node: &'static str,
     /// Name on the node's PVE certificate; resolved to 127.0.0.1.
@@ -60,7 +57,6 @@ pub(super) struct Site {
 }
 
 pub(super) const WILLOW: Site = Site {
-    host_lease: None,
     node: "willow",
     api_host: "willow.atxconsulting.com",
     api_ca: None,
@@ -77,7 +73,6 @@ pub(super) const WILLOW: Site = Site {
 /// The dedicated Contabo host (issue #287): NAT bridge `vmbr1` (no DHCP),
 /// directory storage, and the agent-worker VMs/template protected.
 pub(super) const CONTABO: Site = Site {
-    host_lease: Some(crate::host_lease::broker::LOCK_PATH),
     node: "carrick-ctb",
     api_host: "carrick-ctb.turkey-moth.ts.net",
     api_ca: Some("/etc/pve/pve-root-ca.pem"),
@@ -353,7 +348,6 @@ mod tests {
         assert_eq!(
             WILLOW,
             Site {
-                host_lease: None,
                 node: "willow",
                 api_host: "willow.atxconsulting.com",
                 api_ca: None,
@@ -385,7 +379,6 @@ mod tests {
         assert_eq!(
             CONTABO,
             Site {
-                host_lease: Some(crate::host_lease::broker::LOCK_PATH),
                 node: "carrick-ctb",
                 api_host: "carrick-ctb.turkey-moth.ts.net",
                 api_ca: Some("/etc/pve/pve-root-ca.pem"),

@@ -14,8 +14,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
-pub mod broker;
-
 pub const DEFAULT_LOCK_PATH: &str = "/tmp/carrick-host-lease.lock";
 /// A contended machine may be running a full acceptance gate. Failure, never skip.
 pub const HOST_LEASE_WAIT_LIMIT: Duration = Duration::from_secs(60 * 60);
@@ -95,8 +93,6 @@ struct LeaseIdentity {
     ino: u64,
     mode: HostLeaseMode,
     scope: Option<ScopeIdentity>,
-    #[serde(default)]
-    broker: Option<broker::Config>,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -131,15 +127,10 @@ impl ScopeIdentity {
 }
 
 struct LeaseHolder {
-    custody: LeaseCustody,
+    _custody: OwnedFileLock,
     directory: tempfile::TempDir,
     stopping: Arc<AtomicBool>,
     server: Option<std::thread::JoinHandle<()>>,
-}
-
-enum LeaseCustody {
-    Local(OwnedFileLock),
-    Broker(broker::Session),
 }
 
 impl Drop for LeaseHolder {
@@ -241,7 +232,7 @@ fn read_validation_identity_until(
 impl HostLease {
     /// Claim an idle host directly, without waiting or inherited admission.
     pub fn try_exclusive(path: &Path) -> Result<Option<Self>, HostLeaseError> {
-        match Self::acquire_configured(path, HostLeaseMode::Gate, Duration::ZERO, None, |_| {
+        match Self::acquire_path_with_wait(path, HostLeaseMode::Gate, Duration::ZERO, None, |_| {
             Ok(false)
         }) {
             Ok(lease) => Ok(Some(lease)),
@@ -260,14 +251,6 @@ impl HostLease {
         if std::env::var_os("CARRICK_HOST_LEASE_FD").is_some() {
             return Err(HostLeaseError::Inherited(
                 "obsolete fd handoff; restart the outer lease runner".into(),
-            ));
-        }
-        if broker::Config::load()
-            .map_err(HostLeaseError::ChildWait)?
-            .is_some()
-        {
-            return Err(HostLeaseError::Inherited(
-                "configured broker lease requires lease-supervisor custody".into(),
             ));
         }
         Self::acquire_path_with_wait(&path, mode, HOST_LEASE_WAIT_LIMIT, None, |duration| {
@@ -297,11 +280,7 @@ impl HostLease {
             ._holder
             .as_mut()
             .ok_or_else(|| io::Error::other("supervisor must own lease"))?;
-        let LeaseCustody::Local(fd) = &mut holder.custody else {
-            return Err(io::Error::other(
-                "remote broker custody is only supported on Linux",
-            ));
-        };
+        let fd = &mut holder._custody;
         let duplicate = fd.try_clone()?;
         // Neither cooperating holder may explicitly unlock the shared file
         // description: release is the last close after workload cleanup.
@@ -317,39 +296,7 @@ impl HostLease {
         let path = std::env::var_os("CARRICK_HOST_LEASE_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_LOCK_PATH));
-        Self::acquire_configured(&path, mode, HOST_LEASE_WAIT_LIMIT, Some(scope), wait)
-    }
-
-    fn acquire_configured(
-        path: &Path,
-        mode: HostLeaseMode,
-        limit: Duration,
-        scope: Option<ScopeIdentity>,
-        wait: impl FnMut(Duration) -> io::Result<bool>,
-    ) -> Result<Self, HostLeaseError> {
-        let config = broker::Config::load().map_err(HostLeaseError::ChildWait)?;
-        let Some(config) = config else {
-            return Self::acquire_path_with_wait(path, mode, limit, scope, wait);
-        };
-        if !cfg!(target_os = "linux") {
-            return Err(HostLeaseError::Inherited(
-                "remote broker custody is only supported on Linux".into(),
-            ));
-        }
-        if std::env::var_os("CARRICK_HOST_LEASE_PATH").is_some() {
-            return Err(HostLeaseError::Inherited(
-                "CARRICK_HOST_LEASE_PATH cannot override a configured broker".into(),
-            ));
-        }
-        let session = broker::Session::connect(&config, mode, limit, wait)?;
-        Self::serve_custody(
-            Path::new(broker::LOCK_PATH),
-            mode,
-            LeaseCustody::Broker(session),
-            scope,
-            Some(config),
-        )
-        .map_err(HostLeaseError::ChildWait)
+        Self::acquire_path_with_wait(&path, mode, HOST_LEASE_WAIT_LIMIT, Some(scope), wait)
     }
 
     fn acquire_path_with_wait(
@@ -393,38 +340,6 @@ impl HostLease {
         // SAFETY: uniquely owned CLOEXEC descriptor, including error paths.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         Self::acquire_fd_with_wait(path, mode, limit, scope, wait, fd)
-    }
-
-    pub(crate) fn acquire_broker_path(
-        path: &Path,
-        mode: HostLeaseMode,
-        limit: Duration,
-        wait: impl FnMut(Duration) -> io::Result<bool>,
-    ) -> Result<Self, HostLeaseError> {
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)
-            .map_err(|source| HostLeaseError::Io {
-                path: path.into(),
-                source,
-            })?;
-        if !file
-            .metadata()
-            .map_err(|source| HostLeaseError::Io {
-                path: path.into(),
-                source,
-            })?
-            .is_file()
-        {
-            return Err(HostLeaseError::Io {
-                path: path.into(),
-                source: io::Error::other("broker lock must be a regular file"),
-            });
-        }
-        Self::acquire_fd_with_wait(path, mode, limit, None, wait, file.into())
     }
 
     fn acquire_fd_with_wait(
@@ -501,16 +416,6 @@ impl HostLease {
         fd: OwnedFileLock,
         scope: Option<ScopeIdentity>,
     ) -> io::Result<Self> {
-        Self::serve_custody(path, mode, LeaseCustody::Local(fd), scope, None)
-    }
-
-    fn serve_custody(
-        path: &Path,
-        mode: HostLeaseMode,
-        custody: LeaseCustody,
-        scope: Option<ScopeIdentity>,
-        broker: Option<broker::Config>,
-    ) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
         // Keep AF_UNIX names short even when the checkout/TMPDIR is long.
         // TempDir creates a private 0700 directory; its random path is the
@@ -520,19 +425,13 @@ impl HostLease {
             .tempdir_in("/tmp")?;
         let socket = directory.path().join("lease.sock");
         let listener = UnixListener::bind(&socket)?;
-        let (dev, ino) = match &custody {
-            LeaseCustody::Local(fd) => {
-                let metadata = fd.metadata()?;
-                (metadata.dev(), metadata.ino())
-            }
-            LeaseCustody::Broker(_) => (0, 0),
-        };
+        let metadata = fd.metadata()?;
+        let (dev, ino) = (metadata.dev(), metadata.ino());
         let identity = serde_json::to_vec(&LeaseIdentity {
             dev,
             ino,
             mode,
             scope,
-            broker,
         })?;
         let stopping = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&stopping);
@@ -556,7 +455,7 @@ impl HostLease {
             })?;
         Ok(Self {
             _holder: Some(LeaseHolder {
-                custody,
+                _custody: fd,
                 directory,
                 stopping,
                 server: Some(server),
@@ -571,12 +470,11 @@ impl HostLease {
     /// Nested commands stay inside the supervisor's workload lifetime. The
     /// scope pipe (never a lock description) also covers fork without exec.
     pub fn configure_command(&self, command: &mut Command) -> io::Result<()> {
-        self.check_connection()?;
         command
             .env_remove("CARRICK_HOST_LEASE_FD")
             .env_remove("CARRICK_HOST_LEASE_MODE")
             .env(INHERITED_SOCKET, &self.socket);
-        if self.connection_fd().is_none() && self._holder.is_some() {
+        if self._holder.is_some() {
             command.env("CARRICK_HOST_LEASE_PATH", &self.path);
         }
         if let Some(scope) = &self._scope {
@@ -611,21 +509,12 @@ impl HostLease {
                 identity.mode
             )));
         }
-        let configured =
-            broker::Config::load().map_err(|e| HostLeaseError::Inherited(e.to_string()))?;
-        if identity.broker != configured {
+        let expected =
+            std::fs::metadata(path).map_err(|e| HostLeaseError::Inherited(e.to_string()))?;
+        if identity.dev != expected.dev() || identity.ino != expected.ino() {
             return Err(HostLeaseError::Inherited(
-                "holder leases a different broker".into(),
+                "holder does not lease the configured lock file".into(),
             ));
-        }
-        if identity.broker.is_none() {
-            let expected =
-                std::fs::metadata(path).map_err(|e| HostLeaseError::Inherited(e.to_string()))?;
-            if identity.dev != expected.dev() || identity.ino != expected.ino() {
-                return Err(HostLeaseError::Inherited(
-                    "holder does not lease the configured lock file".into(),
-                ));
-            }
         }
         let scope = if let Some(expected_scope) = identity.scope {
             let duplicate_scope = || -> io::Result<OwnedFd> {
@@ -664,30 +553,6 @@ impl HostLease {
 
     pub fn mode(&self) -> HostLeaseMode {
         self.mode
-    }
-
-    pub(crate) fn connection_fd(&self) -> Option<libc::c_int> {
-        match &self._holder.as_ref()?.custody {
-            LeaseCustody::Local(_) => None,
-            LeaseCustody::Broker(session) => Some(session.fd()),
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    pub(crate) fn connection_custody(&self) -> Option<(libc::pid_t, &AtomicBool)> {
-        match &self._holder.as_ref()?.custody {
-            LeaseCustody::Local(_) => None,
-            LeaseCustody::Broker(session) => Some(session.custody()),
-        }
-    }
-
-    pub(crate) fn check_connection(&self) -> io::Result<()> {
-        if let Some(holder) = &self._holder
-            && let LeaseCustody::Broker(session) = &holder.custody
-        {
-            session.check()?;
-        }
-        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -800,7 +665,6 @@ mod tests {
             ino: 2,
             mode: HostLeaseMode::Gate,
             scope: None,
-            broker: None,
         };
         server
             .write_all(&serde_json::to_vec(&reply).unwrap())

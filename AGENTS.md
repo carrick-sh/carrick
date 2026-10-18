@@ -92,7 +92,7 @@ with **`HV_DENIED` (`0xfae94007`)**.
 | `just accept [ARGS]` | Run host and/or signed landing gate (no Docker). |
 | `just accept --profile linux-portable` | Linux host gate + receipt; signed phase rejected. |
 | `just remote-accept --ref COMMIT --phase host` | Worker gate on cloudmac + fetched receipt; also run signed for macOS/ARM changes. |
-| `just lease MODE +CMD` | Run command under host flock lease (carrick shared, gate/docker exclusive). |
+| `just lease MODE +CMD` | Run command under the local machine/VM flock lease (carrick shared, gate/docker exclusive). |
 
 **Toolchain:** pin, edition, members, `deny`ed lints: [`rust-toolchain.toml`](rust-toolchain.toml) and
 [`Cargo.toml`](Cargo.toml). CI uses moving `@stable`, which can flag lints
@@ -135,8 +135,9 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
 [`docs/conformance-testing.md`](docs/conformance-testing.md).
 
 **Running**
-- **Never run carrick and Docker concurrently** (VMs starve → wrong verdicts).
-  Two-phase gate; `carrick‖carrick`/`docker‖docker` OK.
+- **Never run carrick and Docker concurrently within one VM or test machine**
+  (VMs starve → wrong verdicts). Two-phase gate;
+  `carrick‖carrick`/`docker‖docker` OK. Separate Contabo VMs may overlap (#639).
 - **Machine quietness:** `just accept` holds the host lease in exclusive `gate`
   mode for its entire host/signed run; `scripts/test-signed.sh` holds shared
   `carrick` mode through build, signing, execution and scoped cleanup. Host
@@ -145,22 +146,20 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
   `CARRICK_ALLOW_LOAD=1`; logs record detected load and acceptance receipts
   include it. Contention fails explicitly after `HOST_LEASE_WAIT_LIMIT` (one
   hour), never skips. `CARRICK_HOST_LEASE_PATH` changes the lock file for tests;
-  every participant on a gate host must use the same path. Never unlink a live
-  lock file.
-- **Contabo is one physical lease domain** (#565), not one per VM.
-  Workers and oracle use `/etc/carrick/host-lease.toml` to reach the restricted
-  SSH broker on `10.77.0.1`; the standing controller holds the same
-  `/run/carrick/host-lease.lock` in-process before cloning through destruction,
-  releasing when idle. CI clones keep their inner local lease (no recursive
-  remote exclusive acquisition). Configured broker failure never falls back to
-  a VM-local lock. Connection loss cancels supervised work and fails the run.
-  Host/user/key/tmpfiles installation is **owner-applied only**:
-  [Contabo setup](docs/ci/contabo-kvm.md#physical-host-lease-owner-applied-565).
-- **Lock order:** remote-accept checkout lock → host lease → build/test work.
-  No host-lease holder may acquire a remote checkout lock; never upgrade a
-  shared lease into a gate/Docker lease; nested signed runs reuse the gate's
-  lease and never downgrade or reacquire it. Supervisor custody, cleanup
-  deadlines and known escape limits:
+  every participant within that VM or test machine must use the same path.
+  Never unlink a live lock file.
+- **Leases are per VM, never the whole hypervisor** (#639, owner reversal
+  of #565). Worker VMs, agent clones, KVM CI clones and the oracle each use
+  their own local lease. The standing controller takes no physical-host lease
+  around clone creation, execution or destruction. No lane holds Contabo
+  exclusively. The SSH lease broker and `/etc/carrick/host-lease.toml` are
+  retired; installation cleanup is owner-applied only:
+  [Contabo setup](docs/ci/contabo-kvm.md#per-vm-leases-639).
+- **Lock order within each VM:** remote-accept checkout lock → local VM lease
+  → build/test work. No lease holder may acquire a remote checkout lock;
+  never upgrade a shared lease into a gate/Docker lease; nested signed runs
+  reuse the gate's lease and never downgrade or reacquire it. Supervisor
+  custody, cleanup deadlines and known escape limits:
   [`docs/host-lease-containment-follow-up.md`](docs/host-lease-containment-follow-up.md).
 - **Never pipe a gate through `tail`/`grep`/`head`** — the pipeline's status
   is the last stage's. Redirect or `tee` to a durable file with absolute
