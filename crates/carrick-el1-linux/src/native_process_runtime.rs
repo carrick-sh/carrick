@@ -1941,6 +1941,9 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRegistry<'a, M, C> {
             .commit_native_signal_owner();
         drop(state);
         if closing {
+            if binding.issued() {
+                control.request_host_exit();
+            }
             let wait = NativeBucketWait {
                 lifetime: core::marker::PhantomData,
                 #[cfg(test)]
@@ -4395,8 +4398,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         OutstandingExitReceipt::Pool { control, .. }
                         | OutstandingExitReceipt::Adopted { control, .. } => {
                             control.commit_registration();
+                            // A loaded host member can be computing with no
+                            // live zone record. Publish every exact request
+                            // before exit_wait makes the host wake batch visible.
+                            control.control().request_host_exit();
                         }
-                        OutstandingExitReceipt::HostBorn { .. } => {}
+                        OutstandingExitReceipt::HostBorn { index, .. } => {
+                            page.request_host_birth_cancel(*index);
+                        }
                     }
                 }
                 page.publish_exit_wait(self.binding.mm, WaitChannel::address(&channel));
