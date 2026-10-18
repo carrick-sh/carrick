@@ -597,7 +597,7 @@ fn step_complex_inner(
             ctx.gpr[reg::RSP] = rsp.wrapping_sub(alloc);
             Ok(())
         }
-        Mnemonic::Maskmovq | Mnemonic::Maskmovdqu => step_maskmov(ctx, insn, insn_va),
+        Mnemonic::Maskmovdqu => step_maskmov(ctx, insn, insn_va),
         Mnemonic::Xlatb => {
             let addr = ctx.gpr[reg::RBX].wrapping_add(ctx.gpr[reg::RAX] & 0xff);
             let b = read_int(ctx, addr, 1, insn_va)?;
@@ -617,17 +617,11 @@ fn step_maskmov(ctx: &mut SoftCpuContext, insn: &Instruction, ip: u64) -> Result
     let [data_reg, mask_reg] = regs.as_slice() else {
         return Err(X86Exception::invalid_opcode(ip));
     };
-    let width = insn.memory_size().size();
-    let read_vector = |r: Register| {
-        if r.is_xmm() {
-            ctx.read_xmm(r.number()).to_le_bytes()
-        } else {
-            let off = 32 + r.number() * 16;
-            let mut bytes = [0; 16];
-            bytes[..8].copy_from_slice(&ctx.fxsave.0[off..off + 8]);
-            bytes
-        }
-    };
+    if !data_reg.is_xmm() || !mask_reg.is_xmm() {
+        return Err(X86Exception::invalid_opcode(ip));
+    }
+    let width = 16;
+    let read_vector = |r: Register| ctx.read_xmm(r.number()).to_le_bytes();
     let (data, mask) = (read_vector(*data_reg), read_vector(*mask_reg));
     let mut addr = if (0..insn.op_count()).any(|i| insn.op_kind(i) == OpKind::MemorySegEDI) {
         ctx.gpr[reg::RDI] as u32 as u64
