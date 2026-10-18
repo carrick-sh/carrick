@@ -49,7 +49,11 @@ pub fn emit_block(block: &PlannedBlock) -> Result<EmittedBlock, EmitError> {
         let raw_bytes = &block.insn_bytes[idx][..decoded.len];
         if is_routed_to_complex_helper(insn) {
             emit_complex_call(&mut code, idx as u32);
-        } else if insn.mnemonic() == Mnemonic::Nop || is_prefetch_mnemonic(insn.mnemonic()) {
+        } else if matches!(
+            insn.mnemonic(),
+            Mnemonic::Nop | Mnemonic::Endbr64 | Mnemonic::Endbr32
+        ) || is_prefetch_mnemonic(insn.mnemonic())
+        {
             code.push(0x90);
         } else if insn.mnemonic() == Mnemonic::Lea {
             emit_lea(&mut code, insn, decoded.va, &mut info_factory)?;
@@ -108,8 +112,7 @@ fn is_routed_to_complex_helper(insn: &Instruction) -> bool {
     insn.is_string_instruction()
         || matches!(
             insn.mnemonic(),
-            Mnemonic::Maskmovq
-                | Mnemonic::Maskmovdqu
+            Mnemonic::Maskmovdqu
                 | Mnemonic::Div
                 | Mnemonic::Idiv
                 | Mnemonic::Push
