@@ -1040,6 +1040,15 @@ fn now() -> Result<u64, ScalerError> {
 // Capture output in memory, never in a command log or a tempfile. Bounds apply
 // to every external command (including gh and ssh), not just guest readiness.
 fn execute(command: &mut Command, input: &[u8], limit: Duration) -> Result<Vec<u8>, ScalerError> {
+    execute_with_failure(command, input, limit, |_| None)
+}
+
+fn execute_with_failure(
+    command: &mut Command,
+    input: &[u8],
+    limit: Duration,
+    classify: impl FnOnce(&[u8]) -> Option<ScalerError>,
+) -> Result<Vec<u8>, ScalerError> {
     use std::os::unix::process::{CommandExt, ExitStatusExt};
     let program = Path::new(command.get_program())
         .file_name()
@@ -1114,6 +1123,11 @@ fn execute(command: &mut Command, input: &[u8], limit: Duration) -> Result<Vec<u
     match &status {
         Ok(Ok(s)) if s.success() => {}
         Ok(Ok(s)) => {
+            if let Ok(Ok(bytes)) = &output
+                && let Some(error) = classify(bytes)
+            {
+                return Err(error);
+            }
             let reason = if let Some(code) = s.code() {
                 format!("{program} exited with code {code}")
             } else if let Some(sig) = s.signal() {
