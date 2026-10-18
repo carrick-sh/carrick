@@ -35,8 +35,9 @@ jobs:
           ACTOR: ${{ github.actor }}
           TRIGGERING_ACTOR: ${{ github.triggering_actor }}
         run: |
-          case "$ACTOR" in tjfontaine|'carrick-workers[bot]') ;; *) exit 1 ;; esac
-          case "$TRIGGERING_ACTOR" in tjfontaine|'carrick-workers[bot]') ;; *) exit 1 ;; esac
+          # Owner only: the carrick-workers App is agent-held (#654).
+          case "$ACTOR" in tjfontaine) ;; *) exit 1 ;; esac
+          case "$TRIGGERING_ACTOR" in tjfontaine) ;; *) exit 1 ;; esac
       - uses: actions/checkout@v4
         with:
           ref: main

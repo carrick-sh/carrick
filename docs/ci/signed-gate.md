@@ -6,8 +6,10 @@ receipts and logs. It survives the director session. This is step 1 of
 [#634](https://github.com/carrick-sh/carrick/issues/634); it does not enqueue or
 merge the PR.
 
-Only `tjfontaine` and `carrick-workers[bot]` may trigger or rerun it. Other
-actors fail authorization on Ubuntu before reaching a self-hosted runner.
+Only `tjfontaine` may trigger or rerun it. The `carrick-workers` App is held
+by agents and worker VMs, so admitting it would let agent-written code run on
+a gate runner at the agent's own request (#654). Other actors fail
+authorization on Ubuntu before reaching a self-hosted runner.
 For `gate:signed`, authorization also checks the latest label transition's
 actor through the GitHub API. A label left over from a previous head does not
 authorize a changed head.

@@ -140,9 +140,10 @@ fn cli_prints_and_persists_diff_before_returning_failure() {
 }
 
 #[test]
-fn owner_and_exact_app_login_only_and_latest_label_transition_is_authority() {
+fn owner_only_and_latest_label_transition_is_authority() {
     assert!(allowed("tjfontaine"));
-    assert!(allowed("carrick-workers[bot]"));
+    // The workers App is agent-held; it must never request a gate (#654).
+    assert!(!allowed("carrick-workers[bot]"));
     assert!(!allowed("carrick-workers"));
     assert!(!allowed("someone-else"));
     let owner = json!({"id":1,"event":"labeled","label":{"name":"gate:signed"},"actor":{"login":"tjfontaine"}});
@@ -152,14 +153,22 @@ fn owner_and_exact_app_login_only_and_latest_label_transition_is_authority() {
         &[owner.clone(), unauthorized],
         "tjfontaine"
     ));
+    let bot = json!({"id":4,"event":"labeled","label":{"name":"gate:signed"},"actor":{"login":"carrick-workers[bot]"}});
+    assert!(!label_authorized(
+        std::slice::from_ref(&bot),
+        "carrick-workers[bot]"
+    ));
     let removed = json!({"id":3,"event":"unlabeled","label":{"name":"gate:signed"},"actor":{"login":"tjfontaine"}});
     assert!(!label_authorized(&[owner, removed], "tjfontaine"));
 }
 
 #[test]
 fn baseline_workflow_provenance_and_receipt_admission_fail_closed() {
-    let run = json!({"path":".github/workflows/signed-gate.yml","head_branch":"main","event":"workflow_dispatch","status":"completed","repository":{"full_name":"carrick-sh/carrick"},"head_repository":{"full_name":"carrick-sh/carrick"},"actor":{"login":"tjfontaine"},"triggering_actor":{"login":"carrick-workers[bot]"}});
+    let run = json!({"path":".github/workflows/signed-gate.yml","head_branch":"main","event":"workflow_dispatch","status":"completed","repository":{"full_name":"carrick-sh/carrick"},"head_repository":{"full_name":"carrick-sh/carrick"},"actor":{"login":"tjfontaine"},"triggering_actor":{"login":"tjfontaine"}});
     assert!(trusted_run(&run));
+    let mut bot = run.clone();
+    bot["triggering_actor"]["login"] = json!("carrick-workers[bot]");
+    assert!(!trusted_run(&bot));
     let mut wrong = run.clone();
     wrong["head_branch"] = json!("feature");
     assert!(!trusted_run(&wrong));
