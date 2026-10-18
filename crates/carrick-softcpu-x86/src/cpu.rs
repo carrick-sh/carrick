@@ -7,8 +7,8 @@ use iced_x86::{Instruction, Mnemonic};
 use crate::block::{BlockExit, BlockFetchFault, PlannedBlock, plan_block_from_memory};
 use crate::cflow::{compute_effective_va, resolve_cflow};
 use crate::context::{
-    EXIT_REASON_CFLOW, EXIT_REASON_CONTINUE, EXIT_REASON_SENSITIVE, EXIT_REASON_SYSCALL,
-    GUEST_MXCSR_MASK, SoftCpuContext, X86Exception, X86ExceptionVector, reg,
+    EXIT_REASON_CFLOW, EXIT_REASON_CONTINUE, EXIT_REASON_RESTART, EXIT_REASON_SENSITIVE,
+    EXIT_REASON_SYSCALL, GUEST_MXCSR_MASK, SoftCpuContext, X86Exception, X86ExceptionVector, reg,
 };
 use crate::decode::SensitiveOp;
 use crate::emit::{EmitError, emit_block};
@@ -213,7 +213,19 @@ impl SoftCpu {
 
         let (rip, max_i, max_s) = (self.ctx.rip, self.max_block_insns, self.max_block_span);
         match plan_block_from_memory(rip, max_i, max_s, &mut self.ctx, mem) {
-            Ok(b) => self.execute_planned_block(&b, mem),
+            Ok(b) => {
+                let single_step = self.ctx.rflags & (1 << 8) != 0;
+                let result = self.execute_planned_block(&b, mem)?;
+                if single_step && matches!(result, SoftCpuExit::Continue { .. }) {
+                    return self.raise(X86Exception::new(
+                        X86ExceptionVector::Debug,
+                        self.ctx.rip,
+                        None,
+                        None,
+                    ));
+                }
+                Ok(result)
+            }
             Err(BlockFetchFault::GeneralProtection { rip, error_code }) => {
                 self.raise(X86Exception::general_protection(rip, error_code))
             }
@@ -251,6 +263,9 @@ impl SoftCpu {
         }
 
         match raw_exit {
+            EXIT_REASON_RESTART => Ok(SoftCpuExit::Continue {
+                next_rip: self.ctx.rip,
+            }),
             EXIT_REASON_CONTINUE => {
                 if let BlockExit::Continue { target } = planned.exit {
                     self.ctx.rip = target;
@@ -307,6 +322,23 @@ impl SoftCpu {
         raw: &Instruction,
         mem: &mut M,
     ) -> Result<SoftCpuExit, EmitError> {
+        // SDM CLAC/STAC specify #UD at CPL>0, unlike ordinary privileged ops.
+        if self.ctx.cpl != 0 && matches!(op, SensitiveOp::Clac | SensitiveOp::Stac) {
+            return self.raise(X86Exception::invalid_opcode(va));
+        }
+        if self.ctx.cpl != 0
+            && self.ctx.cr4 & (1 << 11) != 0
+            && matches!(
+                op,
+                SensitiveOp::Sgdt
+                    | SensitiveOp::Sidt
+                    | SensitiveOp::Sldt
+                    | SensitiveOp::Str
+                    | SensitiveOp::Smsw
+            )
+        {
+            return self.raise(X86Exception::general_protection(va, 0));
+        }
         if op.is_privileged() {
             if self.ctx.cpl != 0 {
                 return self.raise(X86Exception::general_protection(va, 0));
@@ -320,6 +352,12 @@ impl SoftCpu {
         }
 
         match op {
+            SensitiveOp::Icebp => self.raise(X86Exception::new(
+                X86ExceptionVector::Debug,
+                resume,
+                None,
+                None,
+            )),
             SensitiveOp::Interrupt { vector } => {
                 self.ctx.rip = resume;
                 if raw.mnemonic() == iced_x86::Mnemonic::Int3 {
@@ -340,6 +378,21 @@ impl SoftCpu {
                 let ea = compute_effective_va(raw, &self.ctx);
                 if !is_canonical_va(ea) || !is_canonical_va(ea.wrapping_add(3)) {
                     return self.raise(X86Exception::general_protection(va, 0));
+                }
+                if let Err(exc) = crate::mmu::check_guest_alignment(
+                    &mut self.ctx,
+                    mem,
+                    ea,
+                    4,
+                    4,
+                    if op == SensitiveOp::Stmxcsr {
+                        SoftAccessKind::Write
+                    } else {
+                        SoftAccessKind::Read
+                    },
+                    va,
+                ) {
+                    return self.raise(exc);
                 }
                 let mut bytes = [0; 4];
                 let result = if op == SensitiveOp::Stmxcsr {
@@ -686,6 +739,19 @@ fn emulate_legacy_x87<M: SoftMmuMemory>(
         return Err(X86Exception::general_protection(ip, 0));
     }
     let save = matches!(op, SensitiveOp::Fnsave | SensitiveOp::Fnstenv);
+    crate::mmu::check_guest_alignment(
+        ctx,
+        mem,
+        ea,
+        size,
+        if env_len == 28 { 4 } else { 2 },
+        if save {
+            SoftAccessKind::Write
+        } else {
+            SoftAccessKind::Read
+        },
+        ip,
+    )?;
     let mut image = [0u8; 108];
     let fault = |pf: crate::mmu::SoftPageFault| X86Exception::page_fault(ip, pf.error_code, pf.cr2);
     let (cw, sw, tag, fip, fcs, fdp, fds) = if env_len == 28 {

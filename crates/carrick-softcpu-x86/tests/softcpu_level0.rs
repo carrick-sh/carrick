@@ -480,7 +480,16 @@ fn general_protection_witnesses_privileged_at_cpl3_and_sensitive_at_cpl0() {
 
     for &(bytes, op) in cases {
         let (mut cpu, mut mem, code_va) = setup_snippet(bytes);
-        step_ok(&mut cpu, &mut mem, gp(code_va));
+        let expected = match op {
+            SensitiveOp::Iretq => SoftCpuExit::Sensitive {
+                rip: code_va,
+                next_rip: code_va + bytes.len() as u64,
+                op,
+            },
+            SensitiveOp::Clac | SensitiveOp::Stac => ud(code_va),
+            _ => gp(code_va),
+        };
+        step_ok(&mut cpu, &mut mem, expected);
         mem.set_page_perms(code_va, PagePerms::KERNEL_RX);
         cpu.context_mut().set_cpl(0);
         cpu.context_mut().tlb.flush_all();
@@ -1648,5 +1657,605 @@ fn xsave_header_faults_are_write_faults() {
                 ),
             );
         }
+    }
+}
+
+// Intel SDM Vol. 2 REP; Vol. 3 debug/alignment exceptions. These are
+// architectural state/work assertions, independent of host timing.
+#[test]
+fn rep_budget_is_restartable_at_three_scales() {
+    for count in [4097u64, 8193, 32769] {
+        let (mut cpu, mut mem, va) = setup_snippet(&[0xf3, 0xa4, 0x48, 0xff, 0xc3, 0x0f, 0x05]);
+        let (src, dst) = (0x2000_0000, 0x3000_0000);
+        mem.map_range(src, count as usize, PagePerms::USER_RW);
+        mem.map_range(dst, count as usize, PagePerms::USER_RW);
+        mem.write_direct(src, &vec![0x5a; count as usize]);
+        cpu.context_mut().gpr[reg::RSI] = src;
+        cpu.context_mut().gpr[reg::RDI] = dst;
+        cpu.context_mut().gpr[reg::RCX] = count;
+        step_ok(&mut cpu, &mut mem, SoftCpuExit::Continue { next_rip: va });
+        assert_eq!(
+            cpu.context().gpr[reg::RCX],
+            count - 4096,
+            "REP iteration budget"
+        );
+        assert_eq!(cpu.context().gpr[reg::RSI], src + 4096);
+        assert_eq!(cpu.context().gpr[reg::RDI], dst + 4096);
+        assert_eq!(
+            cpu.context().gpr[reg::RBX],
+            0,
+            "following instruction ran before yield"
+        );
+        assert_eq!(
+            mem.read_direct(dst, 4097).unwrap(),
+            [&vec![0x5a; 4096][..], &[0]].concat()
+        );
+    }
+}
+
+#[test]
+fn popf_tf_traps_after_exactly_the_following_instruction() {
+    let (mut cpu, mut mem, va) =
+        setup_snippet(&[0x9d, 0x48, 0xff, 0xc0, 0x48, 0xff, 0xc3, 0x0f, 0x05]);
+    let rsp = cpu.context().gpr[reg::RSP];
+    mem.write_direct(rsp, &0x302u64.to_le_bytes());
+    step_ok(
+        &mut cpu,
+        &mut mem,
+        SoftCpuExit::Continue { next_rip: va + 1 },
+    );
+    assert_ne!(cpu.context().rflags & 0x100, 0, "guest TF was lost");
+    let result = cpu.step_block(&mut mem).unwrap();
+    assert!(
+        matches!(result, SoftCpuExit::Exception(e) if e.vector as u8 == 1 && e.rip == va + 4 && e.error_code.is_none()),
+        "TF vector: {result:?}"
+    );
+    assert_eq!(cpu.context().gpr[reg::RAX], 1);
+    assert_eq!(cpu.context().gpr[reg::RBX], 0);
+}
+
+#[test]
+fn alignment_check_covers_cold_and_warm_memory_paths() {
+    for bytes in [
+        &[0x48, 0x8b, 0x07][..],
+        &[0x48, 0x89, 0x07],
+        &[0x48, 0xff, 0x07],
+        &[0x50],
+        &[0xc3],
+    ] {
+        for warm in [false, true] {
+            let (mut cpu, mut mem, va) = setup_snippet(bytes);
+            cpu.max_block_insns = 1;
+            let addr = 0x2000_0001;
+            mem.map_range(addr, 4096, PagePerms::USER_RW);
+            cpu.context_mut().gpr[reg::RDI] = addr;
+            cpu.context_mut().gpr[reg::RSP] = addr + 16;
+            cpu.context_mut().rflags |= 1 << 18;
+            if warm {
+                for kind in [SoftAccessKind::Read, SoftAccessKind::Write] {
+                    translate_with_frame(cpu.context_mut(), &mut mem, addr, kind).unwrap();
+                }
+            }
+            let result = cpu.step_block(&mut mem).unwrap();
+            assert!(
+                matches!(result, SoftCpuExit::Exception(e) if e.vector as u8 == 17 && e.rip == va && e.error_code == Some(0)),
+                "AC vector for {bytes:x?}, warm={warm}: {result:?}"
+            );
+            assert_eq!(mem.read_direct(addr, 8).unwrap(), [0; 8]);
+        }
+    }
+}
+
+#[test]
+fn cpl3_sensitive_vector_table_matches_sdm() {
+    // Legal system-state instructions leave via Sensitive for the machine
+    // owner to service, just like the existing LAR/LSL contract. Host state
+    // must never be read by a copy-through instruction.
+    let cases: &[(&str, &[u8], Option<u8>)] = &[
+        ("clac", &[0x0f, 0x01, 0xca], Some(6)),
+        ("stac", &[0x0f, 0x01, 0xcb], Some(6)),
+        ("iretq", &[0x48, 0xcf], None),
+        ("clts", &[0x0f, 0x06], Some(13)),
+        ("invd", &[0x0f, 0x08], Some(13)),
+        ("wbinvd", &[0x0f, 0x09], Some(13)),
+        ("lmsw", &[0x0f, 0x01, 0xf0], Some(13)),
+        ("lldt", &[0x0f, 0x00, 0xd0], Some(13)),
+        ("mov from dr", &[0x0f, 0x21, 0xc0], Some(13)),
+        ("mov to dr", &[0x0f, 0x23, 0xc0], Some(13)),
+        ("sgdt", &[0x0f, 0x01, 0x07], None),
+        ("sidt", &[0x0f, 0x01, 0x0f], None),
+        ("sldt", &[0x0f, 0x00, 0xc0], None),
+        ("str", &[0x0f, 0x00, 0xc8], None),
+        ("smsw", &[0x0f, 0x01, 0xe0], None),
+        ("verr", &[0x0f, 0x00, 0xe0], None),
+        ("verw", &[0x0f, 0x00, 0xe8], None),
+        ("mov from ds", &[0x8c, 0xd8], None),
+        ("mov to ds", &[0x8e, 0xd8], None),
+        ("mov memory from ds", &[0x8c, 0x1f], None),
+        ("mov ds from memory", &[0x8e, 0x1f], None),
+        ("icebp", &[0xf1], Some(1)),
+    ];
+    let mut failures = Vec::new();
+    for &(name, bytes, vector) in cases {
+        let (mut cpu, mut mem, va) = setup_snippet(bytes);
+        cpu.context_mut().cr4 &= !(1 << 11); // UMIP off
+        let before = cpu.context().gpr;
+        let result = cpu.step_block(&mut mem).unwrap();
+        let correct = match (vector, result) {
+            (Some(v), SoftCpuExit::Exception(e)) => {
+                e.vector as u8 == v
+                    && e.rip == va + if v == 1 { bytes.len() as u64 } else { 0 }
+                    && e.error_code == if v == 13 { Some(0) } else { None }
+            }
+            (None, SoftCpuExit::Sensitive { rip, next_rip, .. }) => {
+                rip == va && next_rip == va + bytes.len() as u64
+            }
+            _ => false,
+        };
+        if !correct {
+            failures.push(format!("{name}: {result:?}"));
+        }
+        assert_eq!(cpu.context().gpr, before, "{name} leaked host state");
+    }
+    assert!(
+        failures.is_empty(),
+        "CPL3 vector table: {}",
+        failures.join("; ")
+    );
+}
+
+#[test]
+fn rep_copy_translation_work_is_page_chunked() {
+    for count in [64usize, 512, 4096] {
+        let (mut cpu, mut mem, _) = setup_snippet(&[0xf3, 0xa4]);
+        cpu.max_block_insns = 1;
+        let (src, dst) = (0x2000_0000, 0x3000_0000);
+        mem.map_range(src, count, PagePerms::USER_RW);
+        mem.map_range(dst, count, PagePerms::USER_RW);
+        cpu.context_mut().gpr[reg::RSI] = src;
+        cpu.context_mut().gpr[reg::RDI] = dst;
+        cpu.context_mut().gpr[reg::RCX] = count as u64;
+        cpu.context_mut().tlb.reset_stats();
+        cpu.step_block(&mut mem).unwrap();
+        let stats = cpu.context().tlb.stats();
+        assert!(
+            stats.hits + stats.misses <= 4,
+            "page-chunk translation budget: n={count}, {stats:?}"
+        );
+    }
+}
+
+#[test]
+fn rep_all_string_widths_obey_the_iteration_budget() {
+    for (prefix, width) in [
+        (&[][..], 1),
+        (&[0x66][..], 2),
+        (&[][..], 4),
+        (&[0x48][..], 8),
+    ] {
+        for (byte, source, destination) in [
+            (0xa4, true, true),
+            (0xaa, false, true),
+            (0xac, true, false),
+            (0xa6, true, true),
+            (0xae, false, true),
+        ] {
+            let opcode = byte + u8::from(width != 1);
+            let code = [&[0xf3][..], prefix, &[opcode]].concat();
+            let (mut cpu, mut mem, va) = setup_snippet(&code);
+            cpu.max_block_insns = 1;
+            let (src, dst) = (0x2000_0000, 0x3000_0000);
+            let len = 4097 * width;
+            mem.map_range(src, len, PagePerms::USER_RW);
+            mem.map_range(dst, len, PagePerms::USER_RW);
+            cpu.context_mut().gpr[reg::RSI] = src;
+            cpu.context_mut().gpr[reg::RDI] = dst;
+            cpu.context_mut().gpr[reg::RCX] = 4097;
+            // All-zero CMPS/SCAS continue while equal.
+            step_ok(&mut cpu, &mut mem, SoftCpuExit::Continue { next_rip: va });
+            assert_eq!(cpu.context().gpr[reg::RCX], 1, "{code:x?}");
+            assert_eq!(
+                cpu.context().gpr[reg::RSI],
+                src + if source { 4096 * width as u64 } else { 0 }
+            );
+            assert_eq!(
+                cpu.context().gpr[reg::RDI],
+                dst + if destination { 4096 * width as u64 } else { 0 }
+            );
+            step_ok(
+                &mut cpu,
+                &mut mem,
+                SoftCpuExit::Continue {
+                    next_rip: va + code.len() as u64,
+                },
+            );
+            assert_eq!(cpu.context().gpr[reg::RCX], 0);
+        }
+    }
+}
+
+#[test]
+fn rep_copy_preserves_direction_overlap_and_fault_progress() {
+    for reverse in [false, true] {
+        for width in [1usize, 2, 4, 8] {
+            for alias in [false, true] {
+                let mut code = vec![0xf3];
+                if width == 2 {
+                    code.push(0x66);
+                }
+                if width == 8 {
+                    code.push(0x48);
+                }
+                code.push(if width == 1 { 0xa4 } else { 0xa5 });
+                let (mut cpu, mut mem, va) = setup_snippet(&code);
+                cpu.max_block_insns = 1;
+                let base = 0x2000_0000;
+                mem.map_range(base, 4096, PagePerms::USER_RW);
+                let other = if alias {
+                    mem.map_alias(
+                        0x3000_0000,
+                        mem.frame_for_va(base).unwrap(),
+                        PagePerms::USER_RW,
+                    );
+                    0x3000_0000
+                } else {
+                    base
+                };
+                let initial: Vec<u8> = (0..128).collect();
+                mem.write_direct(base, &initial);
+                // Overlap by one byte, including within a multi-byte element.
+                let (s, d) = if reverse { (64 + width, 64) } else { (16, 17) };
+                let mut expected = initial;
+                for i in 0..8 {
+                    let off = if reverse {
+                        -(i as isize * width as isize)
+                    } else {
+                        i as isize * width as isize
+                    };
+                    let (s, d) = ((s as isize + off) as usize, (d as isize + off) as usize);
+                    let value = expected[s..s + width].to_vec();
+                    expected[d..d + width].copy_from_slice(&value);
+                }
+                cpu.context_mut().gpr[reg::RSI] = base + s as u64;
+                cpu.context_mut().gpr[reg::RDI] = other + d as u64;
+                cpu.context_mut().gpr[reg::RCX] = 8;
+                if reverse {
+                    cpu.context_mut().rflags |= 1 << 10;
+                }
+                step_ok(
+                    &mut cpu,
+                    &mut mem,
+                    SoftCpuExit::Continue {
+                        next_rip: va + code.len() as u64,
+                    },
+                );
+                assert_eq!(
+                    mem.read_direct(base, 128).unwrap(),
+                    expected,
+                    "width={width}, DF={reverse}, alias={alias}"
+                );
+            }
+        }
+    }
+    // First page commits, second page faults without consuming its element.
+    for destination_fault in [false, true] {
+        let (mut cpu, mut mem, va) = setup_snippet(&[0xf3, 0xa4]);
+        let (src, dst) = (0x2000_0000, 0x3000_0000);
+        mem.map_range(
+            src,
+            if destination_fault { 8192 } else { 4096 },
+            PagePerms::USER_RW,
+        );
+        mem.map_range(
+            dst,
+            if destination_fault { 4096 } else { 8192 },
+            PagePerms::USER_RW,
+        );
+        mem.write_direct(src + 4080, &[0x5a; 16]);
+        cpu.context_mut().gpr[reg::RSI] = src + 4080;
+        cpu.context_mut().gpr[reg::RDI] = dst + 4080;
+        cpu.context_mut().gpr[reg::RCX] = 32;
+        step_ok(
+            &mut cpu,
+            &mut mem,
+            pf(
+                va,
+                PF_ERR_USER | if destination_fault { PF_ERR_WRITE } else { 0 },
+                if destination_fault {
+                    dst + 4096
+                } else {
+                    src + 4096
+                },
+            ),
+        );
+        assert_eq!(cpu.context().gpr[reg::RCX], 16);
+        assert_eq!(cpu.context().gpr[reg::RSI], src + 4096);
+        assert_eq!(cpu.context().gpr[reg::RDI], dst + 4096);
+        assert_eq!(mem.read_direct(dst + 4080, 16).unwrap(), [0x5a; 16]);
+        let missing = if destination_fault {
+            dst + 4096
+        } else {
+            src + 4096
+        };
+        mem.map_range(missing, 4096, PagePerms::USER_RW);
+        cpu.max_block_insns = 1;
+        step_ok(
+            &mut cpu,
+            &mut mem,
+            SoftCpuExit::Continue { next_rip: va + 2 },
+        );
+        assert_eq!(cpu.context().gpr[reg::RCX], 0);
+    }
+}
+
+#[test]
+fn rep_comparisons_terminate_and_restore_flags_on_fault() {
+    for (prefix, value, count, zf) in [(0xf3, 1, 1, false), (0xf2, 0, 1, true)] {
+        let (mut cpu, mut mem, va) = setup_snippet(&[prefix, 0xae]);
+        cpu.max_block_insns = 1;
+        let addr = 0x2000_0000;
+        mem.map_range(addr, 4096, PagePerms::USER_RW);
+        mem.write_direct(addr, &[value]);
+        cpu.context_mut().gpr[reg::RDI] = addr;
+        cpu.context_mut().gpr[reg::RCX] = 5000;
+        step_ok(
+            &mut cpu,
+            &mut mem,
+            SoftCpuExit::Continue { next_rip: va + 2 },
+        );
+        assert_eq!(cpu.context().gpr[reg::RCX], 5000 - count);
+        assert_eq!(cpu.context().rflags & (1 << 6) != 0, zf);
+    }
+    for (prefix, value) in [(0xf3, 0), (0xf2, 1)] {
+        let (mut cpu, mut mem, va) = setup_snippet(&[prefix, 0xae]);
+        let addr = 0x2000_0000;
+        mem.map_range(addr, 4096, PagePerms::USER_RW);
+        mem.write_direct(addr + 4095, &[value]);
+        cpu.context_mut().gpr[reg::RDI] = addr + 4095;
+        cpu.context_mut().gpr[reg::RCX] = 2;
+        let before = cpu.context().rflags;
+        step_ok(&mut cpu, &mut mem, pf(va, PF_ERR_USER, addr + 4096));
+        assert_eq!(cpu.context().rflags, before);
+        assert_eq!(cpu.context().gpr[reg::RCX], 1);
+    }
+}
+
+#[test]
+fn tf_observes_control_flow_rep_and_fault_priority() {
+    for bytes in [&[0xeb, 0x02][..], &[0x0f, 0xa2]] {
+        let (mut cpu, mut mem, va) = setup_snippet(bytes);
+        cpu.context_mut().rflags |= 0x100;
+        let next = va + if bytes[0] == 0xeb { 4 } else { 2 };
+        step_ok(
+            &mut cpu,
+            &mut mem,
+            SoftCpuExit::Exception(X86Exception::new(
+                X86ExceptionVector::Debug,
+                next,
+                None,
+                None,
+            )),
+        );
+    }
+    let (mut cpu, mut mem, va) = setup_snippet(&[0xf3, 0xaa]);
+    let dst = 0x2000_0000;
+    mem.map_range(dst, 4096, PagePerms::USER_RW);
+    cpu.context_mut().rflags |= 0x100;
+    cpu.context_mut().gpr[reg::RDI] = dst;
+    cpu.context_mut().gpr[reg::RCX] = 2;
+    step_ok(
+        &mut cpu,
+        &mut mem,
+        SoftCpuExit::Exception(X86Exception::new(X86ExceptionVector::Debug, va, None, None)),
+    );
+    assert_eq!(cpu.context().gpr[reg::RCX], 1);
+    step_ok(
+        &mut cpu,
+        &mut mem,
+        SoftCpuExit::Exception(X86Exception::new(
+            X86ExceptionVector::Debug,
+            va + 2,
+            None,
+            None,
+        )),
+    );
+    for (bytes, fault) in [
+        (&[0x0f, 0x0b][..], ud(va)),
+        (&[0x48, 0x8b, 0x07][..], pf(va, PF_ERR_USER, 0)),
+    ] {
+        let (mut cpu, mut mem, _) = setup_snippet(bytes);
+        cpu.context_mut().rflags |= 0x100;
+        step_ok(&mut cpu, &mut mem, fault);
+    }
+    // POPF clearing TF is itself single-stepped when TF was set on entry.
+    let (mut cpu, mut mem, va) = setup_snippet(&[0x9d]);
+    let rsp = cpu.context().gpr[reg::RSP];
+    mem.write_direct(rsp, &0x202u64.to_le_bytes());
+    cpu.context_mut().rflags |= 0x100;
+    step_ok(
+        &mut cpu,
+        &mut mem,
+        SoftCpuExit::Exception(X86Exception::new(
+            X86ExceptionVector::Debug,
+            va + 1,
+            None,
+            None,
+        )),
+    );
+    assert_eq!(cpu.context().rflags & 0x100, 0);
+}
+
+#[test]
+fn alignment_check_enable_conditions_and_fault_priority() {
+    for (cpl, am, ac) in [(3, true, false), (3, false, true), (0, true, true)] {
+        let (mut cpu, mut mem, va) = setup_snippet(&[0x48, 0x8b, 0x07]);
+        cpu.max_block_insns = 1;
+        mem.map_range(0x2000_0000, 4096, PagePerms::USER_RW);
+        cpu.context_mut().gpr[reg::RDI] = 0x2000_0001;
+        if ac {
+            cpu.context_mut().rflags |= 1 << 18;
+        }
+        if !am {
+            cpu.context_mut().cr0 &= !(1 << 18);
+        }
+        if cpl == 0 {
+            mem.set_page_perms(va, PagePerms::KERNEL_RX);
+            cpu.context_mut().set_cpl(0);
+        }
+        step_ok(
+            &mut cpu,
+            &mut mem,
+            SoftCpuExit::Continue { next_rip: va + 3 },
+        );
+    }
+    for bytes in [&[0x48, 0x8b, 0x07][..], &[0x48, 0x89, 0x07]] {
+        for present in [false, true] {
+            let (mut cpu, mut mem, va) = setup_snippet(bytes);
+            mem.map_range(0x2000_0000, 4096, PagePerms::USER_RW);
+            if present {
+                mem.map_range(0x2000_1000, 4096, PagePerms::USER_RO);
+            }
+            cpu.context_mut().gpr[reg::RDI] = 0x2000_0fff;
+            cpu.context_mut().rflags |= 1 << 18;
+            let write = bytes[1] == 0x89;
+            let expected = if !present || write {
+                pf(
+                    va,
+                    PF_ERR_USER
+                        | if write { PF_ERR_WRITE } else { 0 }
+                        | if present { PF_ERR_PRESENT } else { 0 },
+                    0x2000_1000,
+                )
+            } else {
+                SoftCpuExit::Exception(X86Exception::new(
+                    X86ExceptionVector::AlignmentCheck,
+                    va,
+                    Some(0),
+                    None,
+                ))
+            };
+            step_ok(&mut cpu, &mut mem, expected);
+            assert_eq!(mem.read_direct(0x2000_0fff, 1).unwrap(), [0]);
+        }
+    }
+    // POPF enables AC without letting it reach host flags or executing a
+    // misaligned successor through the TLB fast path in the same block.
+    let (mut cpu, mut mem, va) = setup_snippet(&[0x9d, 0x48, 0x8b, 0x07]);
+    let rsp = cpu.context().gpr[reg::RSP];
+    mem.write_direct(rsp, &0x40202u64.to_le_bytes());
+    cpu.context_mut().gpr[reg::RDI] = rsp + 1;
+    step_ok(
+        &mut cpu,
+        &mut mem,
+        SoftCpuExit::Continue { next_rip: va + 1 },
+    );
+    step_ok(
+        &mut cpu,
+        &mut mem,
+        SoftCpuExit::Exception(X86Exception::new(
+            X86ExceptionVector::AlignmentCheck,
+            va + 1,
+            Some(0),
+            None,
+        )),
+    );
+}
+
+#[test]
+fn umip_only_restricts_the_five_system_queries() {
+    for bytes in [
+        &[0x0f, 0x01, 0x07][..],
+        &[0x0f, 0x01, 0x0f],
+        &[0x0f, 0x00, 0xc0],
+        &[0x0f, 0x00, 0xc8],
+        &[0x0f, 0x01, 0xe0],
+        &[0x0f, 0x00, 0xe0],
+        &[0x0f, 0x00, 0xe8],
+        &[0x8c, 0xd8],
+        &[0x8e, 0xd8],
+    ] {
+        let (mut cpu, mut mem, va) = setup_snippet(bytes);
+        cpu.context_mut().cr4 |= 1 << 11;
+        let restricted = matches!(
+            carrick_softcpu_x86::classify(bytes, va).unwrap().class,
+            carrick_softcpu_x86::InsnClass::Sensitive(
+                SensitiveOp::Sgdt
+                    | SensitiveOp::Sidt
+                    | SensitiveOp::Sldt
+                    | SensitiveOp::Str
+                    | SensitiveOp::Smsw
+            )
+        );
+        if restricted {
+            step_ok(&mut cpu, &mut mem, gp(va));
+        } else {
+            assert!(matches!(
+                cpu.step_block(&mut mem).unwrap(),
+                SoftCpuExit::Sensitive { .. }
+            ));
+        }
+    }
+}
+
+#[test]
+fn reverse_rep_fault_cr2_names_the_current_element() {
+    for destination_fault in [false, true] {
+        let (mut cpu, mut mem, va) = setup_snippet(&[0xf3, 0xa4]);
+        let (src, dst) = (0x2000_0ff0, 0x3000_0ff0);
+        mem.map_range(
+            if destination_fault { src } else { dst },
+            4096,
+            PagePerms::USER_RW,
+        );
+        cpu.context_mut().gpr[reg::RSI] = src;
+        cpu.context_mut().gpr[reg::RDI] = dst;
+        cpu.context_mut().gpr[reg::RCX] = 32;
+        cpu.context_mut().rflags |= 1 << 10;
+        step_ok(
+            &mut cpu,
+            &mut mem,
+            pf(
+                va,
+                PF_ERR_USER | if destination_fault { PF_ERR_WRITE } else { 0 },
+                if destination_fault { dst } else { src },
+            ),
+        );
+        assert_eq!(cpu.context().gpr[reg::RCX], 32);
+        assert_eq!(cpu.context().gpr[reg::RSI], src);
+        assert_eq!(cpu.context().gpr[reg::RDI], dst);
+    }
+}
+
+#[test]
+fn alignment_check_applies_to_checked_image_and_string_helpers() {
+    for bytes in [
+        &[0x0f, 0xae, 0x17][..],
+        &[0x0f, 0xae, 0x1f],
+        &[0xdd, 0x37],
+        &[0xd9, 0x37],
+        &[0xf3, 0x48, 0xa5],
+        &[0xf3, 0x48, 0xab],
+        &[0xf3, 0x48, 0xad],
+    ] {
+        let (mut cpu, mut mem, va) = setup_snippet(bytes);
+        cpu.max_block_insns = 1;
+        let data = 0x2000_0000;
+        mem.map_range(data, 8192, PagePerms::USER_RW);
+        cpu.context_mut().rflags |= 1 << 18;
+        cpu.context_mut().gpr[reg::RDI] = data + 1;
+        cpu.context_mut().gpr[reg::RSI] = data + 4097;
+        cpu.context_mut().gpr[reg::RCX] = 1;
+        step_ok(
+            &mut cpu,
+            &mut mem,
+            SoftCpuExit::Exception(X86Exception::new(
+                X86ExceptionVector::AlignmentCheck,
+                va,
+                Some(0),
+                None,
+            )),
+        );
+        assert_eq!(mem.read_direct(data, 128).unwrap(), [0; 128]);
+        assert_eq!(cpu.context().gpr[reg::RCX], 1);
     }
 }
