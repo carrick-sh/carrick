@@ -148,10 +148,7 @@ pub struct ClockHandlerLayout {
 
 pub fn clock_handler_layout() -> &'static ClockHandlerLayout {
     static LAYOUT: std::sync::OnceLock<ClockHandlerLayout> = std::sync::OnceLock::new();
-    LAYOUT.get_or_init(|| {
-        let mut bytes = vec![0; LINUX_EL1_VECTORS_SIZE as usize];
-        el1_clock::install(&mut bytes, 0)
-    })
+    LAYOUT.get_or_init(el1_clock::layout)
 }
 
 pub fn is_carrick_el1_clock_handler_va(va: u64) -> bool {
@@ -7988,6 +7985,30 @@ mod stage1_tests {
 #[cfg(test)]
 mod syscall_mailbox_tests {
     use super::*;
+
+    #[test]
+    fn mailbox_clock_layout_matches_every_emitted_variant() {
+        // Kick normalization queries phases before deciding whether this PC
+        // belongs to a clock transaction, including on ordinary syscalls.
+        let phases = clock_handler_layout();
+        for fd_ceiling in [false, true] {
+            for el1 in [false, true] {
+                for irq in [El1IrqMode::Masked, El1IrqMode::Gic] {
+                    let mut bytes = el1_vectors_bytes_mailbox_irq(true, fd_ceiling, el1, irq);
+                    let dispatch = AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET
+                        + 6 * 4
+                        + (IDENTITY_SYSCALLS.len() + if fd_ceiling { 2 } else { 0 }) * 8;
+                    let installed = el1_clock::install(&mut bytes, dispatch);
+                    assert_eq!(installed.start, phases.start);
+                    assert_eq!(installed.completion, phases.completion);
+                    assert_eq!(installed.end, phases.end);
+                    assert!(is_carrick_el1_clock_handler_va(installed.start));
+                    assert!(is_carrick_el1_clock_handler_va(installed.end - 4));
+                    assert!(!is_carrick_el1_clock_handler_va(installed.end));
+                }
+            }
+        }
+    }
 
     fn rd_u32(bytes: &[u8], offset: usize) -> u32 {
         u32::from_le_bytes(
