@@ -380,25 +380,26 @@ fn split_qualified_test<'a>(
             "retired-tests {field} '{qualified}' must be '<bin>::<test>'"
         )));
     };
-    let fn_name = test_path.rsplit("::").next().unwrap_or(test_path);
-    if bin.trim().is_empty()
-        || test_path.trim().is_empty()
-        || fn_name.trim().is_empty()
-        || bin.contains(['/', ':'])
-    {
+    let identifier = |segment: &str| {
+        let mut bytes = segment.bytes();
+        bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+            && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    };
+    if !identifier(bin) || !test_path.split("::").all(identifier) {
         return Err(ReceiptError::Retired(format!(
-            "retired-tests {field} '{qualified}' must be '<bin>::<test>'"
+            "retired-tests {field} '{qualified}' must be '<bin>::<test>' with identifier segments"
         )));
     }
     Ok((bin, test_path))
 }
 
 fn receipt_test_matches(receipt_entry: &str, bin: &str, test_path: &str) -> bool {
-    receipt_entry == test_path
-        || receipt_entry
-            .strip_prefix(bin)
-            .and_then(|rest| rest.strip_prefix("::"))
-            == Some(test_path)
+    receipt_entry
+        .strip_prefix(bin)
+        .and_then(|rest| rest.strip_prefix("::"))
+        == Some(test_path)
 }
 
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), ReceiptError> {
