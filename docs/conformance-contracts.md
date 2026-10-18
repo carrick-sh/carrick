@@ -1312,6 +1312,30 @@ acquire a new window. Actual HVF destruction and root-slot pool invalidation
 remain signed bindings; the production HVF custody owner invalidates that
 pool only after successful VM destruction.
 
+## Native close with a host-loaded member (`kernel.el1.thread-lifecycle`)
+
+A native process close publishes cancellation for every exact outstanding
+member before publishing its exit wait. A host-loaded member can have no live
+zone record after its admission home was released; record cancellation alone
+cannot reach an EL0 compute loop. The host applies the owner's requests with
+scheduler control wakes before settling the exit owner's zone wait. It scans
+the process members once per exact retained lifecycle page and delivers at
+most one control wake per member, including a loaded member whose own boundary
+observes the close. Late host adoption retains the cancellation request.
+
+`arm_two_live_threads_exit_group_ends_group_with_status` exercises the ARM
+native owner with two live threads and requires a host cancellation request
+after the adopted sibling's zone record is released. It was red before this
+fix. `native_terminal_request_kicks_loaded_member_without_zone_record_once`
+separately exercises the production host adapter and exact scheduler binding:
+no close means no wake, close delivers one kick, repeated observation delivers
+none. It does not claim to execute the HVF kick or the whole exit receipt path.
+`arm_signal_setup_then_timed_futex_keeps_its_deadline` is a passing timer
+control on the signal stack, requiring an in-guest timeout after native signal
+setup. The signed `el1_files_kick_delivery_spin_loop` census's untimed park
+was the native exit receipt wait, not the preceding 50 ms sleep. Signed
+`el1_sched_timed_wait_times_out_in_guest` remains required alongside it.
+
 ## Host fork versus terminal close (`kernel.el1.thread-lifecycle`, #441)
 
 An admitted host fork either loses to terminal close before its commit gate

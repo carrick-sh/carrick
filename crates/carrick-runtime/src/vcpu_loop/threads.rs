@@ -1253,6 +1253,64 @@ pub(super) fn wake_removed_persistent_sibling_threads(
     Ok(())
 }
 
+impl KernelState {
+    /// Apply the native owner's exact cancellation requests at the first host
+    /// boundary of Closing. A control wake reaches both a loaded EL0 spinner
+    /// and a parked continuation without inventing a Linux signal.
+    pub(super) fn wake_native_terminal_members(
+        &self,
+        context: &carrick_kernel::kernel::KernelContext,
+    ) -> Result<usize, RuntimeError> {
+        let page = context.lifecycle_page();
+        if page.exit_wait().is_none() {
+            return Ok(0);
+        }
+        {
+            let mut dispatched = self.native_terminal_wakes.lock();
+            if dispatched
+                .as_ref()
+                .is_some_and(|owned| owned.page_address() == page.page_address())
+            {
+                return Ok(0);
+            }
+            *dispatched = Some(page.clone());
+        }
+        // An EL1 birth already committed before Closing may still owe its
+        // host graph publication. Resolve those exact members before waking.
+        context.kernel().settle_thread_ledger();
+        let directory = self.hvpatch_runtime.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration("native terminal wake lost its scheduler".into())
+        })?;
+        let scheduler = directory.continuation_services(context.kernel()).0;
+        let mut woken = 0;
+        for thread in context.task().threads() {
+            let control = thread.control_slot();
+            if thread.execution_state().generation().is_none()
+                || !(control.host_exit_requested()
+                    || control
+                        .host_birth_identity()
+                        .is_some_and(|identity| page.host_birth_requested(identity)))
+            {
+                continue;
+            }
+            if let Err(error) = scheduler.wake_control(thread.key())
+                && !matches!(error, carrick_kernel::kernel::SchedulerError::UnknownThread)
+                && !matches!(
+                    thread.execution_state(),
+                    carrick_kernel::kernel::objects::ThreadExecutionState::Exited { .. }
+                        | carrick_kernel::kernel::objects::ThreadExecutionState::Failed { .. }
+                )
+            {
+                return Err(RuntimeError::Configuration(format!(
+                    "wake native terminal member: {error}"
+                )));
+            }
+            woken += 1;
+        }
+        Ok(woken)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod child_tid_owner_tests {
