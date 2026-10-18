@@ -1251,6 +1251,7 @@ name = "carrick-xtask"
 version = "0.1.0"
 dependencies = [
  "carrick-conformance",
+ "carrick-el1-abi",
  "carrick-guest-arch",
  "carrick-portable",
  "clap",

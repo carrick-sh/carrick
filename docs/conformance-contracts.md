@@ -424,6 +424,17 @@ equivalent or stronger failure detection.
 
 ## Fork stage-1 image example
 
+The pending owner-fork table is runtime metadata, initialized once in place on
+the EL1 metadata heap before ARM entry routing. Its publication state alone
+must fit in one page of the code image
+(`pending_fork_image_storage_fits_one_page`);
+`concurrent_initialization_retains_one_table_and_slot_locks` proves concurrent
+bring-up retains one empty table and does not reset or share slot locks.
+Initialization visits each CPU slot once; later entries load one pointer.
+The image build reports CEL1's loaded footprint (including `.bss`) and headroom
+under the unchanged 1 MiB ABI limit. These VM-free structural witnesses do not
+replace the signed ARM fork binding.
+
 The fork image's identity/control publication uses a named kernel window,
 not Linux user-copy authority. VM-free witnesses exercise copied-child identity,
 shared-MM gate closure and parent handback, exact live MM translation, retained

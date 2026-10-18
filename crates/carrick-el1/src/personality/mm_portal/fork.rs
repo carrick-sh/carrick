@@ -410,10 +410,123 @@ pub use carrick_core::mm::fork::{
     ForkCensus, Policy, census_entry, census_table, copy_entry, copy_table, policy, rollback,
 };
 
+// Only publication words live in the code image; the per-slot locks and
+// unpublished children belong to the existing mapped metadata heap.
+#[cfg(any(test, target_os = "none"))]
+mod runtime_storage {
+    use super::UnpublishedEl1Child;
+    use crate::lock::SpinLock;
+    #[cfg(target_os = "none")]
+    use crate::rust_alloc::boxed::Box;
+    use core::sync::atomic::{AtomicPtr, Ordering};
+    #[cfg(not(target_os = "none"))]
+    use std::boxed::Box;
+
+    type PendingForkSlot = SpinLock<Option<UnpublishedEl1Child>>;
+    type PendingForkTable = [PendingForkSlot; carrick_el1_abi::EL1_STACK_SLOTS as usize];
+
+    struct PendingForkStorage {
+        table: AtomicPtr<PendingForkTable>,
+        init_lock: SpinLock<()>,
+    }
+
+    impl PendingForkStorage {
+        const fn new() -> Self {
+            Self {
+                table: AtomicPtr::new(core::ptr::null_mut()),
+                init_lock: SpinLock::new(()),
+            }
+        }
+
+        fn get(&'static self) -> &'static PendingForkTable {
+            let mut table = self.table.load(Ordering::Acquire);
+            if table.is_null() {
+                table = self.initialize();
+            }
+            // SAFETY: initialize publishes only a fully initialized, leaked
+            // table. Acquire pairs with publication; slot locks own mutations.
+            unsafe { &*table }
+        }
+
+        #[inline(never)]
+        fn initialize(&'static self) -> *mut PendingForkTable {
+            // A same-CPU interrupt must not wait on its own initializer.
+            let irq = crate::alloc::disable_irq_save();
+            let guard = self.init_lock.lock();
+            let mut table = self.table.load(Ordering::Acquire);
+            if table.is_null() {
+                let mut storage = Box::<PendingForkTable>::new_uninit();
+                let slots = storage.as_mut_ptr().cast::<PendingForkSlot>();
+                for slot in 0..carrick_el1_abi::EL1_STACK_SLOTS as usize {
+                    // SAFETY: write each aligned slot directly in its final
+                    // heap allocation, never materializing the array on stack.
+                    unsafe { slots.add(slot).write(SpinLock::new(None)) };
+                }
+                // SAFETY: every element was initialized above. The table is
+                // retained for the image lifetime, just like the old static.
+                table = Box::into_raw(unsafe { storage.assume_init() });
+                self.table.store(table, Ordering::Release);
+            }
+            drop(guard);
+            crate::alloc::restore_irq(irq);
+            table
+        }
+    }
+
+    static PENDING_FORKS: PendingForkStorage = PendingForkStorage::new();
+
+    #[cfg(target_os = "none")]
+    pub(super) fn pending_forks() -> &'static PendingForkTable {
+        PENDING_FORKS.get()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn pending_fork_image_storage_fits_one_page() {
+            assert!(core::mem::size_of_val(&PENDING_FORKS) <= 4096);
+        }
+
+        #[test]
+        fn concurrent_initialization_retains_one_table_and_slot_locks() {
+            let storage = Box::leak(Box::new(PendingForkStorage::new()));
+            let storage: &'static PendingForkStorage = storage;
+            let tables = std::thread::scope(|scope| {
+                let peers: Vec<_> = (0..8).map(|_| scope.spawn(|| storage.get())).collect();
+                peers
+                    .into_iter()
+                    .map(|peer| peer.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let table = tables[0];
+            assert_eq!(table.len(), carrick_el1_abi::EL1_STACK_SLOTS as usize);
+            for peer in tables {
+                assert!(core::ptr::eq(table, peer));
+            }
+            for slot in table {
+                assert!(slot.try_lock().unwrap().is_none());
+            }
+            let held = table[0].lock();
+            assert!(core::ptr::eq(table, storage.get()));
+            assert!(storage.get()[0].try_lock().is_none());
+            assert!(storage.get()[1].try_lock().is_some());
+            drop(held);
+            assert!(storage.get()[0].try_lock().is_some());
+        }
+    }
+}
+
 #[cfg(target_os = "none")]
-static PENDING_FORKS: [crate::lock::SpinLock<Option<UnpublishedEl1Child>>;
-    carrick_el1_abi::EL1_STACK_SLOTS as usize] =
-    [const { crate::lock::SpinLock::new(None) }; carrick_el1_abi::EL1_STACK_SLOTS as usize];
+use runtime_storage::pending_forks;
+
+/// Complete runtime-table bring-up before routing any ARM EL1 entry. Repeated
+/// entries perform only an acquire load, retaining live unpublished children.
+#[cfg(target_os = "none")]
+pub fn initialize_pending_forks() {
+    let _ = pending_forks();
+}
 
 /// Production service runs on the carrier maintenance root. The owner drops
 /// both root/editor guards before requesting physical custody. Its unpublished
@@ -424,7 +537,7 @@ pub(crate) fn authenticate_pending_parent_write(
     handle: El1MmHandle,
     sequence: NonZeroU64,
 ) -> Result<(), MmError> {
-    let pending = PENDING_FORKS.get(slot).ok_or(MmError::Invalid)?.lock();
+    let pending = pending_forks().get(slot).ok_or(MmError::Invalid)?.lock();
     let child = pending.as_ref().ok_or(MmError::Stale)?;
     let operation = child.completion.request.operation;
     if operation.carrier != handle.carrier()
@@ -445,7 +558,7 @@ pub(crate) fn reconcile_pending_parent_write<W: LiveDescriptorWords + ?Sized>(
     words: &W,
 ) -> Result<(), MmError> {
     authenticate_pending_parent_write(slot, handle, sequence)?;
-    let mut pending = PENDING_FORKS.get(slot).ok_or(MmError::Invalid)?.lock();
+    let mut pending = pending_forks().get(slot).ok_or(MmError::Invalid)?.lock();
     let child = pending.as_mut().ok_or(MmError::Stale)?;
     #[cfg(all(target_os = "none", target_arch = "x86_64"))]
     let _ = words;
@@ -494,7 +607,7 @@ pub fn serve_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         if slots.has_outstanding_transfer(request.operation.mm) {
             return Err(MmError::Busy);
         }
-        let pending = PENDING_FORKS
+        let pending = pending_forks()
             .get(frame.slot as usize)
             .ok_or(MmError::Invalid)?;
         if pending.lock().is_some() {
@@ -604,7 +717,7 @@ pub fn finish_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         if slots.carrier() != Some(request.operation.carrier) {
             return Err(MmError::Stale);
         }
-        let pending = PENDING_FORKS
+        let pending = pending_forks()
             .get(frame.slot as usize)
             .ok_or(MmError::Invalid)?;
         let mut child = pending.lock().take().ok_or(MmError::Stale)?;

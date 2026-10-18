@@ -12,6 +12,18 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
+#[test]
+fn loaded_image_budget_includes_trailing_bss_and_alignment() {
+    let symbols = "\
+00001000 g       .header 00000000 _image_start\n\
+00001800 g       .data   00000000 last_file_byte\n\
+00001c08 g       .bss    00000000 bss_end\n\
+00001c10 g       .bss    00000000 _image_end\n";
+    assert_eq!(image_build::loaded_image_size(symbols).unwrap(), 0xc10);
+    assert!(image_build::loaded_image_size("00001000 _image_start").is_err());
+    assert!(image_build::loaded_image_size("00002000 _image_start\n00001000 _image_end").is_err());
+}
+
 fn executable(path: &Path, script: &str) {
     std::fs::write(path, script).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();

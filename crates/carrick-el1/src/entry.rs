@@ -38,6 +38,7 @@ pub unsafe extern "C" fn carrick_el1_syscall(frame: *mut carrick_el1_abi::TrapFr
     if frame.is_null() {
         return carrick_el1_abi::Action::Forward as u64;
     }
+    carrick_el1::personality::mm_portal::initialize_pending_forks();
     let frame_ref = unsafe { &mut *frame };
     if frame_ref.esr == carrick_el1_abi::MM_PORTAL_MAINTENANCE_ESR {
         carrick_el1::personality::mm_portal::serve_backing_maintenance_hw(frame_ref);
