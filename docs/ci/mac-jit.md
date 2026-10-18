@@ -52,8 +52,10 @@ Supersession and hook approval share the controller's admission lock. Approval
 is durable before the hook is released; an already approved local run cannot
 be superseded. Every assignment, including the reserved job, must rendezvous.
 The cancellation POST is cleanup outside that lock: a fresh all-lane jobs GET
-must show the target queued, no in-progress job and no started hardware job
-(HVF, standing KVM or hosted GCP KVM). Observed started work prevents the POST. The controllers
+must show the target queued and no in-progress job; other hardware must be
+unstarted or completed (HVF, standing KVM or hosted GCP KVM). Observed running
+work defers the POST, retaining the intent across polls and restarts. Completed
+work does not strand an older queued lane. The controllers
 have separate authorities; there is no cross-controller acknowledgement.
 **A superseded job never starts through our admission; a raced cancellation
 can only affect a superseded run.** Another controller can start that run
