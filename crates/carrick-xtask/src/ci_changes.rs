@@ -27,6 +27,12 @@ pub struct CiChangesArgs {
     #[arg(long, env = "CI_REPO", default_value = "carrick-sh/carrick")]
     pub repo: String,
 
+    /// `owner/name` of the PR's head repository. Only a same-repository PR can be a
+    /// lower stack layer: a fork's branch name is outsider-chosen and must never
+    /// match this repository's base branches.
+    #[arg(long, env = "CI_HEAD_REPO", default_value = "")]
+    pub head_repo: String,
+
     #[arg(long, default_value = "HEAD")]
     pub head: String,
 
@@ -638,6 +644,15 @@ pub fn evaluate_changes(
     }
 }
 
+/// Only a same-repository `pull_request` with a head branch may look for child
+/// layers. A fork PR (head repo differs, or unknown) always runs the full suite.
+pub fn child_lookup_allowed(event: &str, head_ref: &str, head_repo: &str, repo: &str) -> bool {
+    event == "pull_request"
+        && !head_ref.trim().is_empty()
+        && !head_repo.trim().is_empty()
+        && head_repo.trim().eq_ignore_ascii_case(repo.trim())
+}
+
 pub fn lookup_child_pr(repo: &str, head_ref: &str) -> Result<Option<u64>, CiChangesError> {
     let head_ref = head_ref.trim();
     if head_ref.is_empty() {
@@ -797,7 +812,7 @@ pub fn run<W: Write>(
     let changed_paths =
         collect_changed_paths(repo_root, event, &args.base, &args.base_ref, &args.head)?;
     let mut lookup_failed = false;
-    let child_pr = if event == "pull_request" && !args.head_ref.trim().is_empty() {
+    let child_pr = if child_lookup_allowed(event, &args.head_ref, &args.head_repo, &args.repo) {
         match lookup_child_pr(&args.repo, &args.head_ref) {
             Ok(pr) => pr,
             Err(err) => {
