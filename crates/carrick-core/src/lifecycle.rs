@@ -239,6 +239,84 @@ pub fn recorded_member_exit_kind(
     }
 }
 
+/// The first pool member a Closing owner would still wait for, observed for a
+/// census. Independent atomic reads; never a settlement proof.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub struct PoolReadinessBlocker {
+    pub index: usize,
+    pub generation: u64,
+    pub state: EntryState,
+    /// `None` when the caller reached no control for this entry.
+    pub kind: Option<MemberExitKind>,
+    pub host_retirement: Option<crate::terminal::HostThreadRetirementReceipt>,
+    pub expected_host: Option<crate::terminal::HostThreadRetirementReceipt>,
+}
+
+/// Pool half of a Closing readiness census: entries in `claimed_count`
+/// (Claimed or Exiting) and the first unreturned member receipt, with the
+/// same returned rule as `TerminalCustody::observe_members`. Bounded by the
+/// pool; never waits or mutates.
+pub fn pool_readiness_census<'a>(
+    page: &impl Lifecycle,
+    controls: impl Fn(EntryRef) -> Option<&'a dyn MemberControl>,
+    expected_host: impl Fn(EntryRef) -> Option<crate::terminal::HostThreadRetirementReceipt>,
+) -> (usize, Option<PoolReadinessBlocker>) {
+    let mut exiting = 0;
+    let mut first = None;
+    for index in 0..page.entry_count() {
+        let Some((generation, state)) = page.state(index) else {
+            continue;
+        };
+        if matches!(
+            state,
+            EntryState::Claimed | EntryState::ExitingBorn | EntryState::ExitingPublished
+        ) {
+            exiting += 1;
+        }
+        if first.is_some()
+            || !matches!(
+                state,
+                EntryState::Claimed
+                    | EntryState::Born
+                    | EntryState::Published
+                    | EntryState::ExitingBorn
+                    | EntryState::ExitingPublished
+            )
+        {
+            continue;
+        }
+        let entry = EntryRef::new(index as u32, generation);
+        let control = controls(entry);
+        let kind = control.map(|control| recorded_member_exit_kind(control, Some(entry)));
+        let host_retirement = control.and_then(|control| control.host_retirement());
+        let expected = expected_host(entry);
+        let returned = match kind {
+            Some(MemberExitKind::InZone) => true,
+            Some(MemberExitKind::HostRetiring) => {
+                host_retirement.is_some() && host_retirement == expected
+            }
+            _ => false,
+        };
+        if !returned {
+            first = Some(PoolReadinessBlocker {
+                index,
+                generation,
+                state,
+                kind,
+                host_retirement,
+                expected_host: expected,
+            });
+        }
+    }
+    (exiting, first)
+}
+
 /// A revoked, never-published birth has no ring graph reference to retire.
 /// Publish its release receipt at the successful revocation, not a later scan.
 pub fn revoke_unborn_control(

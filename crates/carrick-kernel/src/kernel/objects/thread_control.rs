@@ -456,6 +456,20 @@ impl ThreadControlLease {
             .collect()
     }
 
+    /// Every pinned pool-birth control, for a census only: one bounded lock
+    /// attempt, `None` when the pin table is busy. Never waits.
+    pub fn birth_controls_observed(&self) -> Option<Vec<(carrick_el1_abi::EntryRef, Self)>> {
+        let arena = self.0.arena.upgrade()?;
+        let births = arena.births.try_lock()?;
+        Some(
+            births
+                .iter()
+                .flatten()
+                .filter_map(|(entry, control)| Some((*entry, Self(control.upgrade()?))))
+                .collect(),
+        )
+    }
+
     fn allocation(&self) -> &FreeSlot {
         self.0.allocation.as_ref().unwrap_or_else(|| {
             carrick_fatal::carrick_fatal!("thread::control", "live lease lost its allocation")

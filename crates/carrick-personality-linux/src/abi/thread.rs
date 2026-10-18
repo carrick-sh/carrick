@@ -728,6 +728,82 @@ pub enum HostBirthRefusal {
     Closed(OwedExitWake),
 }
 
+/// Census view of a Closing owner's readiness inputs
+/// ([`ThreadLifecyclePage::closing_readiness`]).
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
+pub struct ClosingReadiness {
+    pub live: u32,
+    pub claimed: usize,
+    /// Host-birth claims and in-flight mutations within `claimed`.
+    pub host_claimed: usize,
+    /// Pool entries Claimed or Exiting within `claimed`.
+    pub exiting: usize,
+    /// The first member observation that is not a returned receipt.
+    pub first: Option<ReadinessBlocker>,
+}
+
+impl ClosingReadiness {
+    /// `TerminalCustody::can_settle`'s page inputs.
+    pub fn can_settle(&self) -> bool {
+        self.live == 0 && self.claimed == 0
+    }
+}
+
+impl ::core::fmt::Display for ClosingReadiness {
+    fn fmt(&self, out: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        ::core::write!(
+            out,
+            "readiness can_settle={} live={} claimed={} (host={} exiting={} fork={}) members=",
+            self.can_settle(),
+            self.live,
+            self.claimed,
+            self.host_claimed,
+            self.exiting,
+            self.claimed
+                .saturating_sub(self.host_claimed)
+                .saturating_sub(self.exiting),
+        )?;
+        match self.first {
+            None => ::core::write!(out, "complete"),
+            Some(ReadinessBlocker::Pool(blocker)) => ::core::write!(
+                out,
+                "blocked first=Pool index={} generation={} state={:?} exit_kind={:?} \
+                 host_retirement={:?} expected_host={:?}",
+                blocker.index,
+                blocker.generation,
+                blocker.state,
+                blocker.kind,
+                blocker.host_retirement,
+                blocker.expected_host,
+            ),
+            Some(ReadinessBlocker::HostBorn {
+                index,
+                state,
+                identity,
+                returned_exact,
+            }) => ::core::write!(
+                out,
+                "blocked first=HostBorn index={index} state={state} identity={identity:?} \
+                 returned_exact={returned_exact}"
+            ),
+        }
+    }
+}
+
+/// The first unreturned member receipt a Closing owner would wait for.
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
+pub enum ReadinessBlocker {
+    /// A pool entry (`carrick_core::lifecycle::pool_readiness_census`).
+    Pool(carrick_core::lifecycle::PoolReadinessBlocker),
+    /// A host-born slot: 1 claimed, 2 live, 3 cancel requested.
+    HostBorn {
+        index: usize,
+        state: u32,
+        identity: Option<carrick_core::terminal::HostThreadRetirementReceipt>,
+        returned_exact: bool,
+    },
+}
+
 /// One per process; kernel-only.
 #[repr(C, align(4096))]
 #[derive(::core::fmt::Debug)]
@@ -1033,6 +1109,61 @@ impl ThreadLifecyclePage {
         membership: carrick_core::lifecycle::NonfinalExitMembership<'_>,
     ) -> Result<(), TransitionError> {
         carrick_core::lifecycle::retire_host_member(self, entry, control, membership)
+    }
+
+    /// What a Closing owner's readiness check would see, from page state and
+    /// the member control slots the caller can reach (`pool`). Independent
+    /// atomic observations for a census, not a coherent settlement proof:
+    /// the owner's own outstanding set lives in its ring graph. Bounded by
+    /// the pool and host-birth capacities; it never waits or mutates.
+    pub fn closing_readiness(&self, pool: &[(EntryRef, &ThreadControlSlot)]) -> ClosingReadiness {
+        let census = carrick_core::lifecycle::census(self);
+        let host_claimed = self.host_birth_claimed_count();
+        let (exiting, pool_blocker) = carrick_core::lifecycle::pool_readiness_census(
+            self,
+            |entry| {
+                pool.iter()
+                    .find(|(candidate, _)| *candidate == entry)
+                    .map(|(_, control)| *control as &dyn carrick_core::lifecycle::MemberControl)
+            },
+            |entry| {
+                self.identity(entry).and_then(|identity| {
+                    carrick_core::terminal::HostThreadRetirementReceipt::from_parts(
+                        carrick_core_abi::entry::EntryTaskKey::from_raw(u64::from(identity.tid)),
+                        identity.execution,
+                        carrick_core_abi::entry::EntryThreadGeneration::from_raw(
+                            identity.thread_serial,
+                        ),
+                    )
+                })
+            },
+        );
+        let mut first = pool_blocker.map(ReadinessBlocker::Pool);
+        if first.is_none() {
+            for (index, slot) in self.host_born.iter().enumerate() {
+                let state = slot.state.load(Ordering::Acquire);
+                if matches!(state, 0 | 4) {
+                    continue;
+                }
+                let identity = slot.identity();
+                first = Some(ReadinessBlocker::HostBorn {
+                    index,
+                    state,
+                    identity,
+                    returned_exact: identity.is_some_and(|identity| {
+                        self.host_birth_receipt_returned_exact(index, identity)
+                    }),
+                });
+                break;
+            }
+        }
+        ClosingReadiness {
+            live: census.live,
+            claimed: census.claimed,
+            host_claimed,
+            exiting,
+            first,
+        }
     }
 
     pub fn host_birth_receipt_returned(&self, index: usize) -> bool {
