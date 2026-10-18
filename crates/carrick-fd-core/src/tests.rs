@@ -1836,3 +1836,49 @@ fn handle_lookup_completes_while_unrelated_slot_writer_is_parked() {
     });
     c.destroy_handle_table(table, |_| {}).unwrap();
 }
+
+#[test]
+fn inherit_failed_retain_advances_or_retires_child_generation() {
+    for generation in [Generation::new(7).unwrap(), Generation::MAX] {
+        let (core, arena) = core_with_objects::<2>(2);
+        let c = core.bind(arena, Spin);
+        let parent = c.create_handle_table(1, &mut storage(1)).unwrap();
+        c.seed_handle_slot_generation(parent, SlotIndex(0), generation)
+            .unwrap();
+        let h = c
+            .insert_handle(parent, BackingToken(7), HandleFlags::INHERITABLE)
+            .unwrap();
+        let saved = arena.objects[0]
+            .lifetime_word_for_test()
+            .load(Ordering::Acquire);
+        arena.objects[0]
+            .lifetime_word_for_test()
+            .store(0, Ordering::Release);
+        let child = c
+            .inherit_handle_table(
+                parent,
+                |_, _, _| true,
+                &mut storage(1),
+                |_| panic!("no retained reference"),
+            )
+            .unwrap();
+        arena.objects[0]
+            .lifetime_word_for_test()
+            .store(saved, Ordering::Release);
+        if let Some(next) = generation.next() {
+            let replacement = c
+                .insert_handle(child, BackingToken(8), HandleFlags::default())
+                .unwrap();
+            assert_eq!(replacement.pin().generation, next);
+        } else {
+            assert_eq!(c.handle_table_capacity(child), Ok(0));
+            assert_eq!(
+                c.insert_handle(child, BackingToken(8), HandleFlags::default()),
+                Err(HandleError::TableFull)
+            );
+        }
+        c.destroy_handle_table(child, |_| {}).unwrap();
+        assert_eq!(c.close_handle(parent, h), Ok(Some(BackingToken(7))));
+        c.destroy_handle_table(parent, |_| {}).unwrap();
+    }
+}
