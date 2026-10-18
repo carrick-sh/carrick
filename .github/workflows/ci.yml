@@ -43,10 +43,12 @@ jobs:
       workflows: ${{ steps.filter.outputs.workflows }}
       lower_layer: ${{ steps.filter.outputs.lower_layer }}
       child_pr: ${{ steps.filter.outputs.child_pr }}
-      # Same-repository events run macOS jobs on the self-hosted carrick-m4
-      # ci runner (dedicated non-admin user, no sudo; #650). Fork PRs keep
-      # hosted macOS so untrusted fork code never reaches a self-hosted host.
-      macos_runner: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","macOS","ARM64","carrick-macos-ci"]' || '"macos-15"' }}
+      # Only same-repository pull_request jobs run on the self-hosted
+      # carrick-m4 ci runner (dedicated non-admin user, no sudo; #650).
+      # Fork PRs, merge groups (which may queue fork code) and the
+      # cache-saving push/schedule events stay hosted, so no trusted or
+      # cache-publishing job shares that persistent host with PR code.
+      macos_runner: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && '["self-hosted","macOS","ARM64","carrick-macos-ci"]' || '"macos-15"' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:

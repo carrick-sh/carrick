@@ -97,13 +97,15 @@ fn every_shard_is_required_in_hosted_ci_and_union_check_runs_on_linux() {
             .count(),
         shards.len()
     );
-    // Fork PRs must never reach a self-hosted macOS runner (#650).
+    // Only same-repo pull_request jobs may reach the self-hosted macOS
+    // runner; forks, merge groups and cache-saving push/schedule stay hosted
+    // (#650).
     let runner = jobs["changes"]["outputs"]["macos_runner"].as_str().unwrap();
     assert!(
-        runner.contains("github.event.pull_request.head.repo.full_name == github.repository")
+        runner.starts_with("${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && ")
             && runner.contains("carrick-macos-ci")
             && runner.ends_with("|| '\"macos-15\"' }}"),
-        "changes.outputs.macos_runner must keep fork PRs on hosted macos-15: {runner}"
+        "changes.outputs.macos_runner must route only same-repo PRs to carrick-macos-ci: {runner}"
     );
     let job = "lint";
     assert!(
