@@ -48,6 +48,8 @@ set -euo pipefail
 . scripts/lib/post-link-sign.sh
 # shellcheck disable=SC1091
 . scripts/lib/test-signed-args.sh
+# shellcheck disable=SC1091
+. scripts/lib/test-signed-identity.sh
 
 # Bootstrap once into the Rust lease supervisor, which owns the lock through
 # build, signing, tests and EXIT cleanup. Descendants get only its validation
@@ -455,7 +457,7 @@ fi
 for exe in "${exes[@]}"; do
     scratch+=("$exe.raw.$$" "$exe.tmp.$$")
     carrick_post_link_sign "$exe" "$exe" "$entitlements"
-    if ! codesign -d --entitlements - "$exe" 2>&1 | grep -q 'com.apple.security.hypervisor'; then
+    if ! test_signed_has_entitlement "$exe"; then
         echo "test-signed: $exe does not carry com.apple.security.hypervisor after signing" >&2
         exit 1
     fi
@@ -552,8 +554,8 @@ record_executable() {
     exe_base="$(basename "$exe")"
     canonical_path="$(cd "$exe_dir" && pwd -P)/$exe_base"
     sha256="$(shasum -a 256 "$exe" | awk '{print $1}')"
-    cdhash="$(codesign -dvvv "$exe" 2>&1 | awk -F= '$1 == "CDHash" { print $2; exit }')"
-    lc_uuid="$(otool -l "$exe" | awk '$1 == "cmd" && $2 == "LC_UUID" { seen=1; next } seen && $1 == "uuid" { print $2; exit }')"
+    cdhash="$(test_signed_cdhash "$exe")"
+    lc_uuid="$(test_signed_lc_uuid "$exe")"
     entitlements_dump="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-entitlements.XXXXXX")"
     scratch+=("$entitlements_dump")
     codesign -d --entitlements :- "$exe" >"$entitlements_dump" 2>/dev/null
@@ -562,7 +564,7 @@ record_executable() {
         exit 1
     fi
     entitlement_digest="$(shasum -a 256 "$entitlements_dump" | awk '{print $1}')"
-    if ! otool -l "$exe" | grep -q '__dof_carrick'; then
+    if ! test_signed_has_dof "$exe"; then
         echo "test-signed: executable identity lacks __dof_carrick: $exe" >&2
         exit 1
     fi
@@ -691,7 +693,7 @@ noent="$carrier.noent.$$"
 scratch+=("$noent")
 cp -f "$carrier" "$noent"
 codesign --force --sign - "$noent"
-if codesign -d --entitlements - "$noent" 2>&1 | grep -q 'com.apple.security.hypervisor'; then
+if test_signed_has_entitlement "$noent"; then
     echo "test-signed: $noent still carries the hypervisor entitlement; the negative control would prove nothing" >&2
     exit 1
 fi
@@ -721,8 +723,8 @@ else
     noent_base="$(basename "$noent")"
     noent_canonical="$(cd "$noent_dir" && pwd -P)/$noent_base"
     noent_sha="$(shasum -a 256 "$noent" | awk '{print $1}')"
-    noent_cdhash="$(codesign -dvvv "$noent" 2>&1 | awk -F= '$1 == "CDHash" { print $2; exit }')"
-    noent_uuid="$(otool -l "$noent" | awk '$1 == "cmd" && $2 == "LC_UUID" { seen=1; next } seen && $1 == "uuid" { print $2; exit }')"
+    noent_cdhash="$(test_signed_cdhash "$noent")"
+    noent_uuid="$(test_signed_lc_uuid "$noent")"
     noent_entitlements="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-noent-entitlements.XXXXXX")"
     scratch+=("$noent_entitlements")
     codesign -d --entitlements :- "$noent" >"$noent_entitlements" 2>/dev/null || true
@@ -730,7 +732,7 @@ else
     if grep -q 'com.apple.security.hypervisor' "$noent_entitlements"; then
         echo "test-signed: negative identity unexpectedly carries entitlement" >&2
         failed=1
-    elif ! otool -l "$noent" | grep -q '__dof_carrick'; then
+    elif ! test_signed_has_dof "$noent"; then
         echo "test-signed: negative identity lacks __dof_carrick" >&2
         failed=1
     else

@@ -758,6 +758,85 @@ mod tests {
         assert_eq!(installed_kinds(&armed_then_disabled), STRUCTURAL.to_vec());
     }
 
+    /// A metadata consumer that exits after its match can SIGPIPE the producer.
+    /// With pipefail this aborts the signed gate between reaping one executable
+    /// and starting the next (#627). Fill beyond pipe capacity after the match
+    /// to force that ordering without sleeps, load, or a scheduling deadline.
+    #[test]
+    fn signed_identity_waits_for_metadata_producers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root");
+        for tool in ["codesign", "otool"] {
+            let path = dir.path().join(tool);
+            std::fs::write(
+                &path,
+                r#"#!/bin/bash
+set -euo pipefail
+case "$1" in
+    -dvvv) printf 'CDHash=fixture-hash\n' >&2 ;;
+    -d) printf '<key>com.apple.security.hypervisor</key>\n' >&2 ;;
+    -l) printf 'cmd LC_UUID\nuuid fixture-uuid\nsectname __dof_carrick\n' ;;
+    *) exit 99 ;;
+esac
+# A single buffered write could finish before the reader exits. More than the
+# pipe can hold forces trailing writes after any early-exiting consumer closes.
+awk 'BEGIN { for (i = 0; i < 65536; i++) print "trailing metadata" }'
+printf 'producer completed\n' >"$DUMMY_METADATA_DONE"
+exit "$DUMMY_METADATA_STATUS"
+"#,
+            )
+            .expect("write metadata producer");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod metadata producer");
+        }
+        let mut failures = Vec::new();
+        for (reader, expected) in [
+            ("test_signed_cdhash", "fixture-hash\n"),
+            ("test_signed_lc_uuid", "fixture-uuid\n"),
+            ("test_signed_has_entitlement", ""),
+            ("test_signed_has_dof", ""),
+        ] {
+            for producer_status in [0, 7] {
+                let done = dir.path().join(format!("{reader}-{producer_status}.done"));
+                let output = std::process::Command::new("/bin/bash")
+                    .args([
+                        "-c",
+                        "set -euo pipefail; . scripts/lib/test-signed-identity.sh; \"$1\" fixture",
+                        "identity-witness",
+                        reader,
+                    ])
+                    .current_dir(repo_root)
+                    .env("PATH", format!("{}:/usr/bin:/bin", dir.path().display()))
+                    .env("DUMMY_METADATA_DONE", &done)
+                    .env("DUMMY_METADATA_STATUS", producer_status.to_string())
+                    .output()
+                    .expect("run metadata reader");
+                if output.status.code() != Some(producer_status)
+                    || !done.exists()
+                    || (producer_status == 0 && output.stdout != expected.as_bytes())
+                {
+                    failures.push(format!(
+                        "{reader}: expected status={producer_status}, got {}; producer_completed={}; stdout={:?}; stderr={:?}",
+                        output.status,
+                        done.exists(),
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr),
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "identity collection must wait for producer completion and preserve producer errors:\n{}",
+            failures.join("\n")
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn watchdog_reap_does_not_kill_subsequent_test_binaries() {
@@ -828,9 +907,16 @@ int main(int argc, char **argv) {
     if (!f) return 3;
     fprintf(f, "%s\n", run_id);
     fclose(f);
-    for (;;) {
-        usleep(100000);
+    /* Expire only this binary, after startup, through the fake sleep's FIFO.
+       The production watchdog/reap path still runs unchanged. */
+    const char *deadline_fifo = getenv("DUMMY_DEADLINE_FIFO");
+    if (deadline_fifo) {
+        f = fopen(deadline_fifo, "w");
+        if (!f) return 4;
+        fputs("expire\n", f);
+        fclose(f);
     }
+    for (;;) pause();
 #elif defined(HANG_BINARY)
     if (list && ignored) {
         return 0;
@@ -850,9 +936,7 @@ int main(int argc, char **argv) {
         execl("/bin/sh", "sh", kill_sh, run_id, (char *)NULL);
         _exit(127);
     }
-    for (;;) {
-        usleep(100000);
-    }
+    for (;;) pause();
 #else
     if (list && ignored) {
         printf("unsigned_executable_maps_hv_denied_to_entitlement: test\n");
@@ -873,8 +957,6 @@ int main(int argc, char **argv) {
     stamp_proctitle(argv[0], run_id);
     printf("running 1 test\n");
     fflush(stdout);
-    /* Sleep across pass 2 of the previous binary's orphaned kill.sh reaper. */
-    usleep(1500000);
     FILE *f = fopen(marker, "w");
     if (!f) return 3;
     fprintf(f, "%s\n", run_id);
@@ -953,6 +1035,24 @@ int main(int argc, char **argv) {
         std::fs::set_permissions(&fake_cargo, std::fs::Permissions::from_mode(0o755))
             .expect("chmod fake cargo");
 
+        // Drive binary expiry from startup, not two seconds of runner load.
+        // Only b1 writes the FIFO. Watchers for b2/b3 remain asleep until the
+        // runner cancels/reaps them on process exit, just like a real timer.
+        let fake_sleep = dir.path().join("sleep");
+        std::fs::write(
+            &fake_sleep,
+            r#"#!/bin/sh
+if [ "$1" = 2 ] && [ -n "${DUMMY_DEADLINE_FIFO:-}" ]; then
+    IFS= read -r event <"$DUMMY_DEADLINE_FIFO"
+else
+    exec /bin/sleep "$@"
+fi
+"#,
+        )
+        .expect("write controlled deadline timer");
+        std::fs::set_permissions(&fake_sleep, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod controlled deadline timer");
+
         let fake_lldb = dir.path().join("lldb");
         std::fs::write(
             &fake_lldb,
@@ -966,9 +1066,7 @@ int main(int argc, char **argv) {
                  if [ -n \"${DUMMY_LLDB_CHILD_PID_FILE:-}\" ]; then\n\
                      printf '%s\\n' \"$child_pid\" >\"$DUMMY_LLDB_CHILD_PID_FILE\"\n\
                  fi\n\
-                 while :; do\n\
-                     sleep 1\n\
-                 done\n\
+                 wait \"$child_pid\"\n\
              fi\n\
              echo \"thread #1: tid = 0x01, el1_dummy_block_forever\"\n\
              exit 0\n",
@@ -1002,10 +1100,20 @@ int main(int argc, char **argv) {
             dir.path().display()
         );
 
+        let make_fifo = |name| {
+            let path = dir.path().join(name);
+            let status = std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .expect("create synchronization FIFO");
+            assert!(status.success(), "mkfifo failed");
+            path
+        };
+
         // 1. With the per-binary deadline disabled (`=0` hatch), the forever-blocking
         //    binary hangs indefinitely.
         let disabled_run_id = format!("{run_id}-disabled");
-        let disabled_block_marker = dir.path().join("block_started_disabled.txt");
+        let disabled_block_marker = make_fifo("block_started_disabled.fifo");
         let disabled_marker = dir.path().join("normal_completed_disabled.txt");
         let mut disabled_child =
             std::process::Command::new(repo_root.join("scripts/test-signed.sh"))
@@ -1023,19 +1131,10 @@ int main(int argc, char **argv) {
                 .spawn()
                 .expect("spawn test-signed.sh with deadline disabled");
 
-        let wait_start = std::time::Instant::now();
-        while std::fs::read_to_string(&disabled_block_marker)
-            .unwrap_or_default()
-            .trim()
-            .is_empty()
-        {
-            assert!(
-                wait_start.elapsed() < Duration::from_secs(10),
-                "forever-blocking binary did not start within 10s"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        std::thread::sleep(Duration::from_millis(1200));
+        // Opening the FIFO waits for the dummy's startup publication, rather
+        // than guessing whether a loaded host has scheduled it yet.
+        let disabled_started = std::fs::read_to_string(&disabled_block_marker)
+            .expect("read disabled binary startup signal");
         let still_running = disabled_child
             .try_wait()
             .expect("poll disabled-deadline child")
@@ -1049,6 +1148,7 @@ int main(int argc, char **argv) {
                 .stderr(std::process::Stdio::null())
                 .status();
         }
+        assert_eq!(disabled_started.trim(), format!("{disabled_run_id}-b1"));
         assert!(
             still_running,
             "forever-blocking binary must remain blocked when CARRICK_TEST_SIGNED_DEADLINE_SECS=0"
@@ -1057,16 +1157,18 @@ int main(int argc, char **argv) {
         // 2. With a short per-binary deadline override, the forever-blocking binary
         //    has its diagnostics captured, is reaped via kill.sh, is reported as
         //    DEADLINE and FAIL, and subsequent binaries still execute cleanly.
+        let deadline_fifo = make_fifo("deadline.fifo");
         let block_marker = dir.path().join("block_started.txt");
         let bt_marker = dir.path().join("bt_captured.txt");
         let marker = dir.path().join("normal_completed.txt");
-        let mut child = std::process::Command::new(repo_root.join("scripts/test-signed.sh"))
+        let child = std::process::Command::new(repo_root.join("scripts/test-signed.sh"))
             .current_dir(repo_root)
             .args(["dummy-watchdog-cascade-pkg", "el1_", "--nocapture"])
             .env("PATH", &path_env)
             .env("CARRICK_HOST_LEASE_SOCKET", "dummy-lease-socket")
             .env("CARRICK_RUN_ID", &run_id)
             .env("CARRICK_TEST_SIGNED_DEADLINE_SECS", "2")
+            .env("DUMMY_DEADLINE_FIFO", &deadline_fifo)
             .env("DUMMY_KILL_SH", &kill_sh)
             .env("DUMMY_BLOCK_MARKER", &block_marker)
             .env("DUMMY_BT_MARKER", &bt_marker)
@@ -1076,37 +1178,17 @@ int main(int argc, char **argv) {
             .spawn()
             .expect("spawn test-signed.sh with short deadline");
 
-        let bound = std::time::Instant::now();
-        let timed_out = loop {
-            if child.try_wait().expect("poll child").is_some() {
-                break false;
-            }
-            if bound.elapsed() >= Duration::from_secs(15) {
-                let _ = child.kill();
-                for suffix in ["-b1", "-b2", "-b3", ""] {
-                    let _ = std::process::Command::new(&kill_sh)
-                        .arg(format!("{run_id}{suffix}"))
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status();
-                }
-                break true;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
+        // wait_with_output drains both pipes while waiting for process exit.
+        // A whole-run stopwatch used to compete with diagnostics/reaping and
+        // could prevent the next binary from ever getting scheduled.
         let output = child
             .wait_with_output()
             .expect("collect test-signed.sh output");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            !timed_out,
-            "test-signed.sh hung past per-binary deadline override; stdout={stdout} stderr={stderr}"
-        );
-
-        assert!(
             !output.status.success(),
-            "overall run must fail because binaries 1 and 2 timed out; stdout={stdout} stderr={stderr}"
+            "overall run must fail because binary 1 timed out and binary 2 self-reaped; stdout={stdout} stderr={stderr}"
         );
         assert_eq!(
             std::fs::read_to_string(&block_marker)
@@ -1160,63 +1242,38 @@ int main(int argc, char **argv) {
         //    host where `sudo -n` fails and `lldb -p` stalls on task_for_pid), the
         //    diagnostic timeout kills the `lldb` process group, still reaps the
         //    binary, reports DEADLINE plus FAIL, and runs the subsequent binary.
+        let hang_diag_deadline_fifo = make_fifo("deadline-diaghang.fifo");
         let hang_diag_run_id = format!("{run_id}-diaghang");
         let hang_diag_block_marker = dir.path().join("block_started_diaghang.txt");
         let hang_diag_bt_marker = dir.path().join("bt_captured_diaghang.txt");
         let hang_diag_child_pid_file = dir.path().join("lldb_child_pid.txt");
         let hang_diag_normal_marker = dir.path().join("normal_completed_diaghang.txt");
-        let mut hang_diag_child =
-            std::process::Command::new(repo_root.join("scripts/test-signed.sh"))
-                .current_dir(repo_root)
-                .args(["dummy-watchdog-cascade-pkg", "el1_", "--nocapture"])
-                .env("PATH", &path_env)
-                .env("CARRICK_HOST_LEASE_SOCKET", "dummy-lease-socket")
-                .env("CARRICK_RUN_ID", &hang_diag_run_id)
-                .env("CARRICK_TEST_SIGNED_DEADLINE_SECS", "2")
-                .env("CARRICK_TEST_SIGNED_DIAG_TIMEOUT_SECS", "1")
-                .env("DUMMY_SUDO_FAIL", "1")
-                .env("DUMMY_LLDB_HANG", "1")
-                .env("DUMMY_LLDB_CHILD_PID_FILE", &hang_diag_child_pid_file)
-                .env("DUMMY_KILL_SH", &kill_sh)
-                .env("DUMMY_BLOCK_MARKER", &hang_diag_block_marker)
-                .env("DUMMY_BT_MARKER", &hang_diag_bt_marker)
-                .env("DUMMY_NORMAL_MARKER", &hang_diag_normal_marker)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .expect("spawn test-signed.sh with hanging lldb");
+        let hang_diag_child = std::process::Command::new(repo_root.join("scripts/test-signed.sh"))
+            .current_dir(repo_root)
+            .args(["dummy-watchdog-cascade-pkg", "el1_", "--nocapture"])
+            .env("PATH", &path_env)
+            .env("CARRICK_HOST_LEASE_SOCKET", "dummy-lease-socket")
+            .env("CARRICK_RUN_ID", &hang_diag_run_id)
+            .env("CARRICK_TEST_SIGNED_DEADLINE_SECS", "2")
+            .env("CARRICK_TEST_SIGNED_DIAG_TIMEOUT_SECS", "1")
+            .env("DUMMY_DEADLINE_FIFO", &hang_diag_deadline_fifo)
+            .env("DUMMY_SUDO_FAIL", "1")
+            .env("DUMMY_LLDB_HANG", "1")
+            .env("DUMMY_LLDB_CHILD_PID_FILE", &hang_diag_child_pid_file)
+            .env("DUMMY_KILL_SH", &kill_sh)
+            .env("DUMMY_BLOCK_MARKER", &hang_diag_block_marker)
+            .env("DUMMY_BT_MARKER", &hang_diag_bt_marker)
+            .env("DUMMY_NORMAL_MARKER", &hang_diag_normal_marker)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn test-signed.sh with hanging lldb");
 
-        let hang_diag_bound = std::time::Instant::now();
-        let hang_diag_timed_out = loop {
-            if hang_diag_child
-                .try_wait()
-                .expect("poll hang_diag_child")
-                .is_some()
-            {
-                break false;
-            }
-            if hang_diag_bound.elapsed() >= Duration::from_secs(15) {
-                let _ = hang_diag_child.kill();
-                for suffix in ["-b1", "-b2", "-b3", ""] {
-                    let _ = std::process::Command::new(&kill_sh)
-                        .arg(format!("{hang_diag_run_id}{suffix}"))
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status();
-                }
-                break true;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
         let hang_diag_output = hang_diag_child
             .wait_with_output()
             .expect("collect hanging-lldb test-signed.sh output");
         let hang_diag_stdout = String::from_utf8_lossy(&hang_diag_output.stdout);
         let hang_diag_stderr = String::from_utf8_lossy(&hang_diag_output.stderr);
-        assert!(
-            !hang_diag_timed_out,
-            "stalled lldb diagnostic must be bounded and not hang test-signed.sh; stdout={hang_diag_stdout} stderr={hang_diag_stderr}"
-        );
         assert!(
             !hang_diag_output.status.success(),
             "overall run must still fail when binary 1 hits deadline; stdout={hang_diag_stdout} stderr={hang_diag_stderr}"
