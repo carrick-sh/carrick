@@ -95,9 +95,7 @@ fn fetch_one_insn<M: SoftMmuMemory>(
     if first_chunk < MAX_INSN_BYTES {
         let mut probe_dec = Decoder::with_ip(64, &buf[..first_chunk], va, DecoderOptions::NONE);
         let _ = probe_dec.decode();
-        if probe_dec.last_error() == DecoderError::NoMoreBytes
-            || (buf[0] == 0xF3 && first_chunk < 5)
-        {
+        if probe_dec.last_error() == DecoderError::NoMoreBytes {
             let next_page_va = (va & SOFT_TLB_PAGE_MASK).wrapping_add(SOFT_TLB_PAGE_SIZE);
             if !is_canonical_va(next_page_va) {
                 return Err(BlockFetchFault::GeneralProtection {
