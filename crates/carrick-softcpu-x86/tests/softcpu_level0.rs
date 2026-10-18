@@ -461,7 +461,7 @@ fn native_admission_denies_unimplemented_host_features() {
         &[0xc5, 0xf8, 0x28, 0x07],             // vmovaps
         &[0x48, 0x0f, 0xc7, 0x0f],             // cmpxchg16b (CX16 is not exposed)
     ];
-    for bytes in cases {
+    for &bytes in cases {
         assert_eq!(
             classify(bytes, 0x400000).unwrap().class,
             InsnClass::InvalidOpcode,
@@ -574,5 +574,38 @@ fn descriptor_queries_exit_without_host_state() {
         );
         assert_eq!(cpu.context_mut().gpr[reg::RAX], 0x33);
         assert_eq!(cpu.context_mut().rflags, flags);
+    }
+}
+
+#[test]
+fn unsupported_implicit_address_forms_refuse_before_mutation() {
+    let cases: &[&[u8]] = &[
+        &[0x67, 0xf3, 0xa4], // address-size MOVSB
+        &[0x64, 0xa4],
+        &[0x65, 0xac], // FS MOVSB, GS LODSB
+        &[0x67, 0xd7],
+        &[0x64, 0xd7],
+        &[0x65, 0xd7], // XLAT
+        &[0x0f, 0xa0],
+        &[0x0f, 0xa8], // PUSH FS/GS
+        &[0x0f, 0xa1],
+        &[0x0f, 0xa9], // POP FS/GS
+    ];
+    for &bytes in cases {
+        let (mut cpu, mut mem, va) = setup_snippet(&[bytes, &[0x0f, 0x05]].concat());
+        let data = cpu.context().gpr[reg::RSP];
+        mem.write_direct(data, &[0x55; 16]);
+        let ctx = cpu.context_mut();
+        ctx.gpr[reg::RCX] = 1;
+        ctx.gpr[reg::RSI] = data;
+        ctx.gpr[reg::RDI] = data + 8;
+        ctx.gpr[reg::RBX] = data;
+        ctx.fs_base = 4096;
+        ctx.gs_base = 8192;
+        let before = (ctx.gpr, ctx.rflags, ctx.fs_base, ctx.gs_base);
+        step_ok(&mut cpu, &mut mem, ud(va));
+        let ctx = cpu.context();
+        assert_eq!((ctx.gpr, ctx.rflags, ctx.fs_base, ctx.gs_base), before);
+        assert_eq!(mem.read_direct(data, 16).unwrap(), [0x55; 16]);
     }
 }
