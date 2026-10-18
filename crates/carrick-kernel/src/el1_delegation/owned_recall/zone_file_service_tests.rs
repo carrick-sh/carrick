@@ -288,7 +288,6 @@ mod serial_host {
         assert_eq!(ready(svc.write_at(&pb, WriteAt::End, b"?")), Ok(1));
         assert_eq!(ready(svc.release(pb)), Ok(()));
         assert_eq!(venue.terminal.get(), 2);
-        drop(svc);
         assert_eq!(pins.close(), Ok(()));
         retire(&[&b]);
         assert_eq!(root.host_bytes("data"), b"help!?");
@@ -321,7 +320,6 @@ mod serial_host {
         assert_eq!(b.record().offset.load(Ordering::Acquire), cursor_b);
         assert_eq!(ready(svc.release(pa)), Ok(()));
         assert_eq!(ready(svc.release(pb)), Ok(()));
-        drop(svc);
         assert_eq!(pins.close(), Ok(()));
         retire(&[&a, &b]);
         assert_eq!(root.host_bytes("log"), b"aabbccdd");
@@ -358,7 +356,6 @@ mod serial_host {
             .fetch_and(!DELEGATED_FLAG_APPEND, Ordering::AcqRel);
         assert_eq!(read(&mut svc, &pin, 0, 16), b"aabb");
         assert_eq!(ready(svc.release(pin)), Ok(()));
-        drop(svc);
         assert_eq!(pins.close(), Ok(()));
         retire(&[&a]);
         assert_eq!(root.host_bytes("log"), b"aabb");
@@ -413,7 +410,6 @@ mod serial_host {
         assert_eq!(ready(svc.release(p2)), Ok(()));
         assert_eq!(venue.terminal.get(), 1);
         assert_eq!(venue.last.get(), Some(a.key()));
-        drop((svc, other));
         assert_eq!(pins.close(), Ok(()));
         assert_eq!(other_pins.close(), Ok(()));
         retire(&[&a]);
@@ -470,7 +466,6 @@ mod serial_host {
         assert_eq!(read(&mut svc, &pin, 0, 8), b"");
         assert_eq!(ready(svc.release(pin)), Ok(()));
         assert_eq!(venue.terminal.get(), 1);
-        drop(svc);
         assert_eq!(pins.close(), Ok(()));
         drop(next);
         drop(region);
@@ -582,7 +577,6 @@ mod serial_host {
                 assert_eq!(svc.last_work().records_visited, 1);
                 assert_eq!(svc.last_work().slots_visited, 1);
             }
-            drop(svc);
             assert_eq!(table.close(), Ok(()));
         }
         assert_eq!(slots.slots_observed(), 2 * N as u64 + 4);
@@ -636,7 +630,6 @@ mod serial_host {
             expected[PAGE..PAGE + span].copy_from_slice(&bytes);
             assert_eq!(read(&mut svc, &pin, 0, expected.len()), expected);
             assert_eq!(ready(svc.release(pin)), Ok(()));
-            drop(svc);
             assert_eq!(pins.close(), Ok(()));
             retire(&[&a]);
             assert_eq!(root.host_bytes("data"), expected);
@@ -704,7 +697,6 @@ mod serial_host {
         assert_eq!(read(&mut svc, &pin, 0, 5), b"hello");
         assert_eq!(inotify.drain_into(&mut raw), Ok(16));
         assert_eq!(ready(svc.release(pin)), Ok(()));
-        drop(svc);
         assert_eq!(pins.close(), Ok(()));
         retire(&[&a]);
         assert_eq!(root.host_bytes("watched"), b"hello");
@@ -722,9 +714,9 @@ mod serial_host {
         let mut slots = ZonePinSlots::<2>::new();
         let pa = {
             let mut pins = ZonePinTable::new(&mut slots).unwrap();
-            let mut svc = service(&region, &venue, &mut pins);
-            let pa = svc.pin_admitted(a.admitted()).unwrap();
-            drop(svc);
+            let pa = service(&region, &venue, &mut pins)
+                .pin_admitted(a.admitted())
+                .unwrap();
             // Closing the table while `pa` is live is refused without losing `pa`.
             assert_eq!(pins.close(), Err(IoError::Stale));
             pa
@@ -752,7 +744,6 @@ mod serial_host {
         assert_eq!(ready(svc.release(pa)), Ok(()));
         assert_eq!(ready(svc.release(pb)), Ok(()));
         assert_eq!(venue.terminal.get(), 2);
-        drop(svc);
         assert_eq!(pins.live_pins(), 0);
         assert_eq!(pins.close(), Ok(()));
         retire(&[&a, &b]);
@@ -798,7 +789,6 @@ mod serial_host {
             a.open.description.el1_identity().unwrap()
         ));
         assert_eq!(root.host_bytes("non_global"), b"region");
-        drop(svc);
         assert_eq!(pins.close(), Ok(()));
         drop(region);
     }
@@ -839,7 +829,6 @@ mod serial_host {
         assert_eq!(stale_attr, Err(IoError::Stale));
         assert_eq!(ready(svc.release(pa)), Ok(()));
         assert_eq!(ready(svc.release(pb)), Ok(()));
-        drop(svc);
         assert_eq!(pins.close(), Ok(()));
         retire(&[&b]);
         drop(region);
