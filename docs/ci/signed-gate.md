@@ -63,14 +63,15 @@ and the same scoped sudo/cleanup configuration as the existing signed lane.
 Keep Apple ld64 and debuginfo. The workflow neither installs runner software
 nor changes host permissions. The runner pool serves whichever Mac is free.
 
-Provision an immutable signed-fixture archive locally on both Macs. Set the
-repository Actions variable `CARRICK_SIGNED_FIXTURE_BUNDLE` to its absolute
-path (the same path on both runners). Build/publish the archive on Linux with
-`just fixtures-publish <sha>`, then transfer it through the existing fixture
-transport. Its fixture **input identity** must match the requested checkout;
-its producing commit need not match. A fixture-input change needs a newly
-published archive. The job fetches fixture lockfile dependencies and restores
-and verifies the archive in its fresh worktree; it never uses Docker.
+Fixtures are built per run. The `fixtures` job runs `just fixtures-publish
+<sha>` for the authorized SHA on a hosted, ephemeral `ubuntu-24.04-arm` runner
+with no secrets, and uploads the archive as `signed-fixtures-<sha>-<attempt>`.
+The Mac gate job downloads it, checks its transport digest
+(`scripts/ci/download-fixture-bundle.sh verify`) and passes its path as
+`CARRICK_SIGNED_FIXTURE_BUNDLE`. Restore then re-verifies the archive's
+fixture **input identity** against the candidate tree in a fresh worktree; it
+never uses Docker. No static per-Mac bundle is needed, so fixture-input
+changes no longer require manual provisioning.
 
 GitHub assigns one job at a time to a runner. The Rust executor also holds
 the physical host's exclusive `gate` lease across fixture restore, `just
