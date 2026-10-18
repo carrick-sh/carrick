@@ -1075,12 +1075,20 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
     /// Lock `id`'s table and resolve its storage; authenticates authority,
     /// index, liveness and generation after the lock is held.
     fn lock(&self, id: TableId) -> Result<(Locked<'a>, Table<'a>), Error> {
+        self.lock_in_states(id, &[TABLE_LIVE])
+    }
+
+    fn lock_in_states(
+        &self,
+        id: TableId,
+        states: &[u32],
+    ) -> Result<(Locked<'a>, Table<'a>), Error> {
         if id.authority != self.identity()? {
             return Err(Error::StaleTable);
         }
         let record = self.core.tables.get(id.index).ok_or(Error::StaleTable)?;
         let guard = self.acquire(record)?;
-        if record.state.load(Ordering::Acquire) != TABLE_LIVE
+        if !states.contains(&record.state.load(Ordering::Acquire))
             || record.generation.load(Ordering::Relaxed) != id.generation
         {
             return Err(Error::StaleTable);
@@ -1382,6 +1390,15 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
     /// at, and its slots. Every use validates with `unchanged_since(seq)`;
     /// a retired extent's bytes are never trusted past that check.
     fn read_table(&self, id: TableId) -> Result<(&'a TableRecord, u64, TableStorage<'a>), Error> {
+        self.read_table_in_states(id, &[TABLE_LIVE])
+            .map(|(record, seq, storage, _)| (record, seq, storage))
+    }
+
+    fn read_table_in_states(
+        &self,
+        id: TableId,
+        states: &[u32],
+    ) -> Result<(&'a TableRecord, u64, TableStorage<'a>, usize), Error> {
         if id.authority != self.identity()? {
             return Err(Error::StaleTable);
         }
@@ -1390,14 +1407,15 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         loop {
             let seq = record.seq.load(Ordering::Acquire);
             if seq & 1 == 0 {
-                let live = record.state.load(Ordering::Relaxed) == TABLE_LIVE
+                let live = states.contains(&record.state.load(Ordering::Relaxed))
                     && record.generation.load(Ordering::Relaxed) == id.generation;
                 let extent = Self::record_extent(record);
+                let limit = record.limit.load(Ordering::Relaxed) as usize;
                 if record.unchanged_since(seq) {
                     if !live {
                         return Err(Error::StaleTable);
                     }
-                    return Ok((record, seq, self.storage(extent)?));
+                    return Ok((record, seq, self.storage(extent)?, limit));
                 }
             }
             attempt = attempt.saturating_add(1);
@@ -1618,7 +1636,16 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
     /// `storage` receives the retired extent, reusable or reclaimable after
     /// this call. Failure changes neither input nor installed storage.
     pub fn grow_table(&self, table: TableId, storage: &mut Extent) -> Result<(), Error> {
-        let (guard, t) = self.lock(table)?;
+        self.grow_table_in_states(table, storage, &[TABLE_LIVE])
+    }
+
+    fn grow_table_in_states(
+        &self,
+        table: TableId,
+        storage: &mut Extent,
+        states: &[u32],
+    ) -> Result<(), Error> {
+        let (guard, t) = self.lock_in_states(table, states)?;
         if storage.capacity < t.storage.capacity() as u64 {
             return Err(Error::InvalidArgument);
         }
