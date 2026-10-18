@@ -180,12 +180,7 @@ pub fn classify(bytes: &[u8], va: u64) -> Option<DecodedInsn> {
 
     let insn = Decoder::with_ip(64, bytes, va, DecoderOptions::NONE).decode();
     let (len, seg) = (insn.len().max(1), insn.segment_prefix());
-    if insn.is_invalid()
-        || matches!(
-            seg,
-            Register::ES | Register::CS | Register::SS | Register::DS
-        )
-    {
+    if insn.is_invalid() {
         return Some(DecodedInsn {
             va,
             len,
