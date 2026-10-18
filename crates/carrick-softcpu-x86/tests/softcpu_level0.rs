@@ -573,6 +573,7 @@ fn unavailable_features_raise_ud_and_cpuid_matches_the_layer() {
     cpu.step_block(&mut mem).unwrap();
     assert_eq!(cpu.context().gpr[reg::RDX] & ((1 << 24) | 1), 0);
     assert_eq!(cpu.context().gpr[reg::RCX] & ((1 << 26) | (1 << 27)), 0);
+    assert_eq!(cpu.context().cr4 & ((1 << 9) | (1 << 18)), 0);
     // EM must remain clear for SSE data operations; x87 is absent independently.
     assert_eq!(cpu.context().cr0 & (1 << 2), 0);
     for bytes in [&[0x0f, 0xae, 0x07][..], &[0x0f, 0xae, 0x0f], &[0xd8, 0xc1]] {
