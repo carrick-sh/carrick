@@ -1667,3 +1667,8 @@ contracts = ["kernel.el1.signal-delivery-owner"]
 [[surfaces]]
 path = "crates/carrick-vmm-hvf/src/host_signal.rs"
 contracts = ["kernel.el1.signal-delivery-owner"]
+
+# The host build inspects the actual release ARM image's retained entry frames.
+[[surfaces]]
+path = "crates/carrick-el1-image/frame_budget.rs"
+contracts = ["kernel.el1.signal-delivery-owner", "kernel.el1.thread-lifecycle"]

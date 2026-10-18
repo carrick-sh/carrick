@@ -257,13 +257,13 @@ mod tests {
                 diagnostic_name: alloc::string::String::new(),
             },
             parent,
-            ParkedContextWords::from_parts(
+            alloc::boxed::Box::new(ParkedContextWords::from_parts(
                 [0; 20],
                 address,
                 0,
                 0,
                 [0; carrick_sched_core::X86_XSAVE_BYTES],
-            ),
+            )),
             RetainedProcessCustody::new(Handles { task }),
             (),
         )

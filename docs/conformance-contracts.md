@@ -1485,3 +1485,14 @@ NOP-only overwrite guard. The VM-free binding compares start, completion and
 end across both fd-ceiling settings, EL1 settings and IRQ modes, and checks
 handler classification boundaries. Emission and guest instruction placement
 are unchanged. The signed EL1 suite remains the integration acceptance gate.
+
+## ARM entry stack composition
+
+`kernel.el1.signal-delivery-owner` and `kernel.el1.thread-lifecycle` also bind
+compiled ARM entry-chain stack envelopes. The image build includes the vector
+record and nested descriptor, copy, notification and allocator frames in a
+12 KiB budget on the unchanged 16 KiB per-CPU stack. Signal encoding borrows
+and fills admitted storage; native contexts and retained aggregate results use
+heap custody. See [the stack contract](el1-stack-budget.md) for the exact scope
+and remaining #369 work. The existing anonymous mapping retirement signed
+witness remains the macOS integration binding.

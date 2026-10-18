@@ -416,7 +416,7 @@ pub fn signal_user_return(
                 source,
                 task,
                 address,
-                words,
+                &words,
                 &mut service,
             )
             .unwrap_or_else(|_| fatal_boot());
@@ -506,7 +506,7 @@ pub fn signal_irq_return(
                 source,
                 task,
                 runtime_address,
-                context::context_words::from_native(&native),
+                &context::context_words::from_native(&native),
                 &mut service,
             )
             .unwrap_or_else(|_| fatal_boot());
@@ -941,7 +941,7 @@ impl Personality for LinuxPersonality {
                     source,
                     task,
                     address,
-                    words,
+                    &words,
                     &mut service,
                 )
                 .unwrap_or_else(|_| fatal_boot());
@@ -972,7 +972,7 @@ impl Personality for LinuxPersonality {
                 >,
                 None,
                 Some(&GuestLifecycleVenue),
-                Some(&mut process),
+                Some(&mut *process),
                 Some(source),
                 Some(&mut anonymous),
                 cache_lookup,

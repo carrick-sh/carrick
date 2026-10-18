@@ -250,7 +250,7 @@ impl<C, U, N: NativeProcessCustody> GuestTaskState<C, U, N> {
     fn new(
         metadata: GuestTaskMetadata<C, U>,
         parent: Option<TaskKey>,
-        context: N::Context,
+        context: Box<N::Context>,
         native: N,
         claim: N::Claim,
     ) -> Self {
@@ -283,7 +283,7 @@ impl<C, U, N: NativeProcessCustody> GuestTask<C, U, N> {
     pub fn new(
         metadata: GuestTaskMetadata<C, U>,
         parent: Option<TaskKey>,
-        context: N::Context,
+        context: Box<N::Context>,
         native: N,
         claim: N::Claim,
     ) -> Self {
@@ -550,7 +550,7 @@ pub struct GuestRetiring<N: NativeProcessCustody> {
 }
 /// Terminal custody remains owned while the registry publishes its receipt.
 pub struct GuestRetiringState<N: NativeProcessCustody> {
-    pub context: N::Context,
+    pub context: Box<N::Context>,
     pub native: N,
 }
 impl<N: NativeProcessCustody> core::ops::Deref for GuestRetiring<N> {

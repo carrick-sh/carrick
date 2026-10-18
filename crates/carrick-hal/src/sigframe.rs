@@ -176,12 +176,23 @@ pub fn build_sigframe<E: RegAccess + CurrentMmMemory>(
         },
         None => carrick_abi::LinuxSignalStack::empty(),
     };
-    let frame = arm::encode(
-        mcontext,
-        stack,
-        SigBlockMask::blocking_all_of(SignalSet::from_bits(p.saved_sigmask)),
-        siginfo,
-        fpsimd,
+    let mut frame = arm::SignalFrame {
+        rt: arm::RtSigframe {
+            siginfo,
+            ucontext: carrick_abi::LinuxUcontext {
+                uc_mcontext: mcontext,
+                uc_stack: stack,
+                uc_sigmask: SigBlockMask::blocking_all_of(SignalSet::from_bits(p.saved_sigmask))
+                    .signals()
+                    .bits(),
+                ..carrick_abi::LinuxUcontext::empty()
+            },
+        },
+        frame_record: [0; 2],
+    };
+    arm::encode(
+        &mut frame,
+        fpsimd.as_ref(),
         p.fault_siginfo.map(|_| p.fault_esr),
     )
     .map_err(|_| TrapError::SignalDeliveryFault)?;

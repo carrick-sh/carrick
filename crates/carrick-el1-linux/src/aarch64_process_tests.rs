@@ -636,7 +636,7 @@ impl Fixture {
                 slot: service.slot,
             },
             &self.task,
-            ThreadCtx::ZERO,
+            &ThreadCtx::ZERO,
             ttbr0,
             self.page,
             control,
@@ -706,7 +706,7 @@ fn first_process_call_acquires_a_root_authenticated_home_record() {
     let record = process_record_for_call(
         source,
         &fixture.task,
-        ThreadCtx::ZERO,
+        &ThreadCtx::ZERO,
         ttbr0,
         fixture.control,
     )
@@ -732,7 +732,7 @@ fn host_home_process_call_seeds_an_unpublished_root_context() {
     let retained = process_record_for_call(
         source,
         &fixture.task,
-        ThreadCtx::ZERO,
+        &ThreadCtx::ZERO,
         ttbr0,
         fixture.control,
     )
@@ -1312,7 +1312,7 @@ fn arm_child_wait_wake(in_ring: bool, sibling: bool) {
                 source,
                 &fixture.task,
                 fixture.address,
-                parked,
+                &parked,
                 &mut service,
             )
             .unwrap();
@@ -1481,7 +1481,7 @@ fn arm_child_wait_wake(in_ring: bool, sibling: bool) {
             source,
             &fixture.task,
             fixture.address,
-            parked,
+            &parked,
             &mut service,
         )
         .unwrap();
@@ -1568,7 +1568,7 @@ fn test_abort_after_stock_loan_returns_every_page_once() {
     let parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
 
     let prepared = service
-        .prepare_mm(&fixture.address, parked, child_mm)
+        .prepare_mm(&fixture.address, &parked, child_mm)
         .expect("prepare_mm should succeed");
 
     assert_eq!(crossing.loans_requested.load(Ordering::Acquire), 1);
@@ -1723,7 +1723,7 @@ fn fork_reserve_refusal_retains_diagnostic_stage_and_retryable_errno() {
     let error = service
         .prepare_mm(
             &fixture.address,
-            parked,
+            &parked,
             MmGeneration::new(NonZeroU64::new(2).unwrap()),
         )
         .expect_err("reservation refusal must stop preparation");
@@ -1779,7 +1779,7 @@ fn assert_commit_fault_keeps_child_closed(fault: CommitFault) {
 
     let child_mm = MmGeneration::new(NonZeroU64::new(2).unwrap());
     let prepared = service
-        .prepare_mm(&fixture.address, parked, child_mm)
+        .prepare_mm(&fixture.address, &parked, child_mm)
         .unwrap();
     let born = service.commit_mm(prepared).unwrap();
     let (error, born) = service
@@ -2299,7 +2299,7 @@ fn arm_root_setup_enters_production_process_venue() {
                 Some(&*fixture),
                 fixture.page,
                 fixture.control,
-                ThreadCtx::ZERO,
+                &ThreadCtx::ZERO,
                 ttbr0,
                 &mut service,
                 |_| core::ptr::null_mut(),
@@ -2389,7 +2389,7 @@ fn arm_signal_setup_then_plain_fork_returns_one_child() {
                 Some(&*fixture),
                 fixture.page,
                 fixture.control,
-                ThreadCtx::ZERO,
+                &ThreadCtx::ZERO,
                 ttbr0,
                 &mut service,
                 |_| core::ptr::null_mut(),
@@ -2805,7 +2805,7 @@ fn arm_root_entry_refuses_wrong_binding_and_root_incarnation() {
     let record = process_record_for_call(
         source,
         &fixture.task,
-        ThreadCtx::ZERO,
+        &ThreadCtx::ZERO,
         ttbr0,
         fixture.control,
     )
@@ -2813,7 +2813,7 @@ fn arm_root_entry_refuses_wrong_binding_and_root_incarnation() {
     admit_entry(
         source,
         &fixture.task,
-        ThreadCtx::ZERO,
+        &ThreadCtx::ZERO,
         ttbr0,
         record,
         fixture.page,
@@ -2950,8 +2950,8 @@ fn arm_born_thread_uses_native_owner_without_an_execution_generation() {
         None,
         Some(&*fixture),
         fixture.page,
-        control,
-        ThreadCtx::ZERO,
+        &control,
+        &ThreadCtx::ZERO,
         ttbr0,
         &mut service,
         |_| core::ptr::null_mut(),
@@ -3065,7 +3065,7 @@ fn arm_owned_raw_exit_retires_only_one_of_two_live_threads() {
         Some(&*fixture),
         fixture.page,
         control,
-        ThreadCtx::ZERO,
+        &ThreadCtx::ZERO,
         ttbr0,
         &mut service,
         |_| core::ptr::null_mut(),
@@ -3140,7 +3140,7 @@ fn arm_call(
         Some(fixture),
         fixture.page,
         control,
-        ThreadCtx::ZERO,
+        &ThreadCtx::ZERO,
         fixture_ttbr0(fixture),
         service,
         |_| core::ptr::null_mut(),
@@ -3579,7 +3579,7 @@ fn arm_host_born_sibling_refuses_stale_or_foreign_binding() {
                 slot: service.slot,
             },
             &fixture.task,
-            ThreadCtx::ZERO,
+            &ThreadCtx::ZERO,
             ttbr0,
             page,
             entered,

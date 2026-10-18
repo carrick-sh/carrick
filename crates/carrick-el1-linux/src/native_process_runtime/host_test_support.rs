@@ -33,7 +33,7 @@ impl<'a> NativeProcessService<'a, ParkedContextWords> for Physical<'a> {
     fn prepare_mm(
         &mut self,
         parent: &Self::Mm,
-        _: ParkedContextWords,
+        _: &ParkedContextWords,
         child: MmGeneration,
     ) -> Result<Self::PreparedMm, NativeProcessError> {
         let address = AddressContext {
@@ -339,7 +339,7 @@ impl NativeSignalFixture {
                 },
                 self.task,
                 self.address,
-                words(self.address),
+                &words(self.address),
                 &mut service,
             )
             .unwrap();
@@ -385,7 +385,7 @@ impl NativeSignalFixture {
                 },
                 self.task,
                 self.address,
-                words(self.address),
+                &words(self.address),
                 &mut service,
             )
             .unwrap();
@@ -399,7 +399,7 @@ impl NativeSignalFixture {
         );
         assert!(matches!(
             carrick_personality_linux::signal::ProcessSignals::rt_sigaction(
-                &mut entry,
+                &mut *entry,
                 carrick_signal_core::policy::Signal::from_number(2).unwrap(),
                 None,
             )

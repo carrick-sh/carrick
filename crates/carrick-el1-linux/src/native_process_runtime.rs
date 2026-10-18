@@ -299,7 +299,7 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     fn prepare_mm(
         &mut self,
         parent: &Self::Mm,
-        words: C,
+        words: &C,
         child: MmGeneration,
     ) -> Result<Self::PreparedMm, NativeProcessError>;
     fn prepared_mm(&self, prepared: &Self::PreparedMm) -> Self::Mm;
@@ -307,8 +307,9 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
     fn fork_child_context(&self, parent: C, prepared: &Self::PreparedMm) -> C {
         parent.fork_child(self.prepared_context(prepared))
     }
-    fn fork_child_context_boxed(&self, parent: C, prepared: &Self::PreparedMm) -> Box<C> {
-        Box::new(self.fork_child_context(parent, prepared))
+    #[inline(never)]
+    fn fork_child_context_boxed(&self, parent: &C, prepared: &Self::PreparedMm) -> Box<C> {
+        Box::new(self.fork_child_context(*parent, prepared))
     }
     fn child_lifecycle(&self, prepared: &Self::PreparedMm) -> NativeLifecycleResources<'a>;
     fn commit_mm(
@@ -2473,7 +2474,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 diagnostic_name: String::from("native-root"),
             },
             None,
-            words,
+            Box::new(words),
             custody(resources),
             task_claim,
         );
@@ -2617,7 +2618,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             ),
             key,
             caller_address,
-            words,
+            words: Box::new(words),
             service,
             handoff: None,
             root_exit: None,
@@ -2635,19 +2636,19 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
     /// Enter through the exact process registry. A non-leader thread retains
     /// its own execution binding and context, while process operations name
     /// the graph row of its authenticated thread group.
-    #[inline(always)]
+    #[inline(never)]
     pub fn enter_registered<'r, S: NativeProcessService<'a, C, Mm = M>>(
         &'r self,
         registry: &NativeProcessRegistry<'a, M, C>,
         source: BornInZoneSource<'a, C>,
         current: &'a CurrentTask,
         address: AddressContext<RootGpa>,
-        words: C,
+        words: &C,
         service: &'r mut S,
-    ) -> Result<NativeProcessEntry<'r, 'a, M, C, S>, NativeProcessError> {
+    ) -> Result<Box<NativeProcessEntry<'r, 'a, M, C, S>>, NativeProcessError> {
         let (binding, record, member_control, process, calling_tid, owner_continuation) =
-            self.authenticate_registered(registry, source, current, address, &words)?;
-        Ok(NativeProcessEntry {
+            self.authenticate_registered(registry, source, current, address, words)?;
+        Ok(Box::new(NativeProcessEntry {
             runtime: self,
             source,
             current,
@@ -2660,7 +2661,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             ),
             key: process,
             caller_address: address,
-            words,
+            words: Box::new(*words),
             service,
             handoff: None,
             root_exit: None,
@@ -2673,7 +2674,7 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
             slot: Some(member_control),
             interrupted_child_wait: None,
             owner_continuation,
-        })
+        }))
     }
 
     #[inline(never)]
@@ -2888,7 +2889,7 @@ pub struct NativeProcessEntry<
     _control_custody: Option<carrick_core::lifecycle::MemberControlCustody<'a, ThreadControlSlot>>,
     key: TaskKey,
     caller_address: AddressContext<RootGpa>,
-    words: C,
+    words: Box<C>,
     service: &'r mut S,
     handoff: Option<EntryHandoffReceipt<C>>,
     root_exit: Option<LinuxWaitStatus>,
@@ -3368,7 +3369,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 NativeProcessError::Exhausted
             })?;
         // SAFETY: this exact record is still authenticated OnCpu under its bucket guard.
-        unsafe { *zone.record(record).ctx_mut() = self.words };
+        unsafe { *zone.record(record).ctx_mut() = *self.words };
         self.runtime.graph.lock().signal_waits.insert(
             self.record,
             PendingSignalWait {
@@ -3485,6 +3486,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             PendingContinuation::Ipc(pending) => Some(self.resume_ipc(pending)),
         }
     }
+    // Keep parking scratch out of the status-copy branch of wait_query.
+    #[inline(never)]
     fn park_continuation(
         &mut self,
         channel: &Arc<WaitChannel>,
@@ -3519,13 +3522,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }
         }
         if self.signal_interrupts_current() {
-            self.interrupted_child_wait = Some(Box::new(self.words));
+            self.interrupted_child_wait = Some(Box::new(*self.words));
             return Ok(ContinuationPark::Interrupted);
         }
         let sequence = zone.next_seq(record);
         zone.enqueue(&guard, record, sequence, channel.mm, address, u32::MAX, 0)
             .map_err(|_| NativeProcessError::Exhausted)?;
-        unsafe { *zone.record(record).ctx_mut() = self.words };
+        unsafe { *zone.record(record).ctx_mut() = *self.words };
         self.runtime
             .graph
             .lock()
@@ -3705,7 +3708,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 zone.cancel_timer_admission(self.record);
                 NativeProcessError::Exhausted.errno()
             })?;
-        unsafe { *zone.record(record).ctx_mut() = self.words };
+        unsafe { *zone.record(record).ctx_mut() = *self.words };
         graph.pending.insert(
             self.key,
             PendingContinuation::Ipc(PendingIpc {
@@ -4071,7 +4074,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .map_err(|_| NativeProcessError::Quarantined)?;
         // SAFETY: the current record remains owned until its guarded park CAS.
         unsafe {
-            *zone.record(record).ctx_mut() = self.words;
+            *zone.record(record).ctx_mut() = *self.words;
             zone.record(record).publish_owner_continuation(entry);
         }
         let Some(receipt) = carrick_core::entry::publish_handoff_park(
@@ -4808,7 +4811,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let prepared =
             match self
                 .service
-                .prepare_mm(&reservation.parent_mm, self.words, reservation.child_mm)
+                .prepare_mm(&reservation.parent_mm, &self.words, reservation.child_mm)
             {
                 Ok(p) => p,
                 Err(error) => {
@@ -5213,9 +5216,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             };
             return Err(error);
         }
-        let child_words = self.service.fork_child_context(self.words, &prepared);
+        let child_words = self
+            .service
+            .fork_child_context_boxed(&self.words, &prepared);
         // SAFETY: this exact newly allocated record remains Free and unpublished.
-        unsafe { *self.source.zone.record(record).ctx_mut() = child_words };
+        unsafe { *self.source.zone.record(record).ctx_mut() = *child_words };
         let member_registration = member_custody.clone();
         let resources = NativeResources {
             _control_custody: leader_custody,
@@ -7685,7 +7690,7 @@ mod tests {
                     source,
                     task,
                     addresses[index],
-                    words(addresses[index]),
+                    &words(addresses[index]),
                     &mut services[index],
                 )
                 .unwrap();
@@ -7709,7 +7714,7 @@ mod tests {
                     source,
                     task,
                     addresses[index],
-                    words(addresses[index]),
+                    &words(addresses[index]),
                     &mut services[index],
                 )
                 .unwrap();
@@ -7915,7 +7920,7 @@ mod tests {
                 source,
                 &thread,
                 address,
-                words(address),
+                &words(address),
                 &mut service,
             )
             .unwrap();
@@ -11918,14 +11923,16 @@ mod tests {
                     source,
                     &task,
                     address,
-                    words(address),
+                    &words(address),
                     &mut service,
                 )
                 .unwrap()
         } else {
-            runtime
-                .enter(source, &task, words(address), &mut service)
-                .unwrap()
+            Box::new(
+                runtime
+                    .enter(source, &task, words(address), &mut service)
+                    .unwrap(),
+            )
         };
         let queue = entry.msgget(0, 0o600).unwrap();
         let sem = entry.semget(0, 1, 0o600).unwrap();
@@ -12135,7 +12142,7 @@ mod tests {
         fn prepare_mm(
             &mut self,
             _: &Self::Mm,
-            _: ParkedContextWords,
+            _: &ParkedContextWords,
             child: MmGeneration,
         ) -> Result<Self::PreparedMm, NativeProcessError> {
             assert!(
