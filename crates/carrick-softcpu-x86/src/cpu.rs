@@ -505,7 +505,12 @@ fn emulate_xstate<M: SoftMmuMemory>(
                 mem,
                 ea.wrapping_add(512),
                 &mut area[512..576],
-                SoftAccessKind::Read,
+                // XSAVE/XSAVEOPT update XSTATE_BV as part of a write access.
+                if save {
+                    SoftAccessKind::Write
+                } else {
+                    SoftAccessKind::Read
+                },
             )
             .map_err(fault)?;
         }
@@ -525,7 +530,9 @@ fn emulate_xstate<M: SoftMmuMemory>(
                     && (xcomp & (1 << 63) == 0
                         || xcomp & !((1 << 63) | 3) != 0
                         || header & !xcomp != 0))
-                || area[528..576].iter().any(|&b| b != 0)
+                // SDM Vol. 1 13.8.1 checks header bytes 8..24 for the
+                // standard form; 13.8.2 checks bytes 16..64 when compacted.
+                || area[528..if xcomp == 0 { 536 } else { 576 }].iter().any(|&b| b != 0)
             {
                 return Err(X86Exception::general_protection(ip, 0));
             }

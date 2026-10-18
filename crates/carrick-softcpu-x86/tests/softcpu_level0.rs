@@ -1592,3 +1592,60 @@ fn exact_denormal_results_fault_when_underflow_is_unmasked() {
         assert_eq!(cpu.context().fxsave.0[24] & 0x10, 0);
     }
 }
+
+#[test]
+fn xrstor_standard_and_compacted_reserved_ranges_follow_the_sdm() {
+    for rex in [&[][..], &[0x48][..]] {
+        for compact in [false, true] {
+            for byte in [528, 535, 536, 575] {
+                let code = [rex, &[0x0f, 0xae, 0x2f]].concat(); // xrstor/64 [rdi]
+                let (mut cpu, mut mem, va) = setup_snippet(&code);
+                let addr = 0x2000_0000;
+                mem.map_range(addr, 4096, PagePerms::USER_RW);
+                let mut image = [0u8; 576];
+                if compact {
+                    image[520..528].copy_from_slice(&(1u64 << 63).to_le_bytes());
+                }
+                image[byte] = 1;
+                mem.write_direct(addr, &image);
+                cpu.context_mut().gpr[reg::RDI] = addr;
+                let expected = if compact || byte < 536 {
+                    gp(va)
+                } else {
+                    SoftCpuExit::Continue {
+                        next_rip: va + code.len() as u64,
+                    }
+                };
+                step_ok(&mut cpu, &mut mem, expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn xsave_header_faults_are_write_faults() {
+    for bytes in [
+        &[0x0f, 0xae, 0x27][..],
+        &[0x0f, 0xae, 0x37],
+        &[0x0f, 0xc7, 0x27],
+    ] {
+        for present in [false, true] {
+            let (mut cpu, mut mem, va) = setup_snippet(bytes); // xsave/opt/c [rdi]
+            let base = 0x2000_0000;
+            mem.map_range(base, 4096, PagePerms::USER_RW);
+            if present {
+                mem.map_range(base + 4096, 4096, PagePerms::USER_RO);
+            }
+            cpu.context_mut().gpr[reg::RDI] = base + 4096 - 512;
+            step_ok(
+                &mut cpu,
+                &mut mem,
+                pf(
+                    va,
+                    PF_ERR_USER | PF_ERR_WRITE | if present { PF_ERR_PRESENT } else { 0 },
+                    base + 4096,
+                ),
+            );
+        }
+    }
+}
