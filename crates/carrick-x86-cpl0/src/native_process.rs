@@ -244,8 +244,9 @@ impl Service {
         // SAFETY: the physical owner loaned zero exclusive cold metadata.
         // Guest shared records alone initialize census and issue identities.
         unsafe {
-            (loan.lifecycle.page.raw() as *mut ThreadLifecyclePage)
-                .write(ThreadLifecyclePage::new());
+            ThreadLifecyclePage::initialize_at(
+                loan.lifecycle.page.raw() as *mut ThreadLifecyclePage
+            );
             let controls = loan.lifecycle.controls.raw() as *mut ThreadControlSlot;
             for index in 0..=carrick_el1_abi::THREAD_POOL_ENTRIES {
                 controls.add(index).write(ThreadControlSlot::new());
@@ -404,7 +405,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
     fn prepare_mm(
         &mut self,
         parent: &Mm,
-        words: ParkedContextWords,
+        words: &ParkedContextWords,
         child_mm: MmGeneration,
     ) -> Result<Prepared, NativeProcessError> {
         if !words.authenticates(*parent) {

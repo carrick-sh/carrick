@@ -317,7 +317,7 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         fn prepare_mm(
             &mut self,
             _: &Self::Mm,
-            _: ParkedContextWords,
+            _: &ParkedContextWords,
             child: MmGeneration,
         ) -> Result<Self::PreparedMm, NativeProcessError> {
             let address = AddressContext {
@@ -507,7 +507,7 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
                 source,
                 &task,
                 address,
-                context_words(address),
+                &context_words(address),
                 &mut service,
             )
             .unwrap();
@@ -562,7 +562,7 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
                 peer_source,
                 &peer_task,
                 state.address,
-                state.words,
+                &state.words,
                 &mut service,
             )
             .unwrap();

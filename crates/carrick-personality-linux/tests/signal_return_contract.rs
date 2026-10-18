@@ -101,16 +101,20 @@ fn sigreturn_restores_saved_autodisarm_stack_after_handler() {
         _pad0: 0,
         ss_size: 8192,
     };
-    let frame = arm::encode(
-        context,
-        stack,
-        SigBlockMask::NONE,
-        LinuxSiginfo::empty(),
-        Some(LinuxFpsimdContext::empty()),
-        None,
-    )
-    .unwrap()
-    .rt;
+    let mut frame = arm::SignalFrame {
+        rt: arm::RtSigframe {
+            siginfo: LinuxSiginfo::empty(),
+            ucontext: carrick_syscall_abi::LinuxUcontext {
+                uc_mcontext: context,
+                uc_stack: stack,
+                uc_sigmask: SigBlockMask::NONE.signals().bits(),
+                ..carrick_syscall_abi::LinuxUcontext::empty()
+            },
+        },
+        frame_record: [0; 2],
+    };
+    arm::encode(&mut frame, Some(&LinuxFpsimdContext::empty()), None).unwrap();
+    let frame = frame.rt;
     let mut native = Native {
         accumulator: 139,
         invalid: false,
@@ -257,16 +261,20 @@ fn public_arm_frame_preserves_same_entry_completion() {
     context.pc = 0x10000;
     context.sp = 0x20000;
     let mask = SigBlockMask::blocking_all_of(SignalSet::from_bits(1 << 9));
-    let frame = arm::encode(
-        context,
-        LinuxSignalStack::empty(),
-        mask,
-        LinuxSiginfo::empty(),
-        Some(LinuxFpsimdContext::empty()),
-        None,
-    )
-    .unwrap()
-    .rt;
+    let mut frame = arm::SignalFrame {
+        rt: arm::RtSigframe {
+            siginfo: LinuxSiginfo::empty(),
+            ucontext: carrick_syscall_abi::LinuxUcontext {
+                uc_mcontext: context,
+                uc_stack: LinuxSignalStack::empty(),
+                uc_sigmask: mask.signals().bits(),
+                ..carrick_syscall_abi::LinuxUcontext::empty()
+            },
+        },
+        frame_record: [0; 2],
+    };
+    arm::encode(&mut frame, Some(&LinuxFpsimdContext::empty()), None).unwrap();
+    let frame = frame.rt;
     for malformed in [false, true] {
         let mut public = frame;
         if malformed {

@@ -244,7 +244,7 @@ fn task(
             diagnostic_name: "native".into(),
         },
         parent,
-        context,
+        Box::new(context),
         native,
         Claim(releases),
     )
@@ -1443,7 +1443,7 @@ fn owner_instantiated_with_aarch64_context_checks_fork_child_and_syscall_return(
             diagnostic_name: "native_arm".into(),
         },
         None,
-        returned_ctx,
+        Box::new(returned_ctx),
         native,
         Claim(releases),
     );

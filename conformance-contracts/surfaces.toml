@@ -1531,3 +1531,8 @@ contracts = ["softmmu.x86.tlb-walker"]
 [[surfaces]]
 path = "crates/carrick-mmu-core/src/x86/descriptor_txn/tests.rs"
 contracts = ["softmmu.x86.tlb-walker"]
+
+# The host build inspects the actual release ARM image's retained entry frames.
+[[surfaces]]
+path = "crates/carrick-el1-image/frame_budget.rs"
+contracts = ["kernel.el1.signal-delivery-owner", "kernel.el1.thread-lifecycle"]

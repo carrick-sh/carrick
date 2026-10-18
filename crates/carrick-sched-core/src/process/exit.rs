@@ -260,7 +260,9 @@ impl<
             .copied()
             .filter(|key| *key == task_key || exact_live(*key).is_some());
         let mut children: Vec<_> = task.exit_children().into_iter().collect();
-        children.sort_by_key(|child| child.serial);
+        // Equal serials retain the original BTreeSet order. Use a total key
+        // without stable sort's 4 KiB inline scratch buffer on the ring stack.
+        children.sort_unstable_by_key(|child| (child.serial, *child));
         let adopter = adopter.filter(|_| !children.is_empty());
         let mut reserved_ids = BTreeSet::from([task_key.id]);
         let mut affected_revisions = BTreeMap::new();
