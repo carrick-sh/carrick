@@ -2,7 +2,7 @@
 
 use std::ptr::NonNull;
 
-use iced_x86::Instruction;
+use iced_x86::{Instruction, Mnemonic};
 
 use crate::block::{BlockExit, BlockFetchFault, PlannedBlock, plan_block_from_memory};
 use crate::cflow::{compute_effective_va, resolve_cflow};
@@ -330,12 +330,18 @@ impl SoftCpu {
                 self.ctx.rip = resume;
                 Ok(SoftCpuExit::Continue { next_rip: resume })
             }
-            SensitiveOp::Rdpkru
-            | SensitiveOp::Wrpkru
-            | SensitiveOp::Rdtscp
-            | SensitiveOp::Xgetbv => {
+            SensitiveOp::Rdpkru | SensitiveOp::Wrpkru | SensitiveOp::Rdtscp => {
                 // These extensions are absent from this layer's CPUID/CR4 view.
                 self.raise(X86Exception::invalid_opcode(va))
+            }
+            SensitiveOp::Xgetbv => {
+                if self.ctx.gpr[reg::RCX] as u32 != 0 {
+                    return self.raise(X86Exception::general_protection(va, 0));
+                }
+                self.ctx.gpr[reg::RAX] = self.ctx.xcr0 & 0xffff_ffff;
+                self.ctx.gpr[reg::RDX] = self.ctx.xcr0 >> 32;
+                self.ctx.rip = resume;
+                Ok(SoftCpuExit::Continue { next_rip: resume })
             }
             SensitiveOp::Rdtsc => {
                 // SAFETY: TSC is a baseline x86_64 instruction advertised by CPUID.
@@ -357,6 +363,29 @@ impl SoftCpu {
                 self.ctx.rip = resume;
                 Ok(SoftCpuExit::Continue { next_rip: resume })
             }
+            SensitiveOp::Fnsave
+            | SensitiveOp::Fnstenv
+            | SensitiveOp::Fldenv
+            | SensitiveOp::Frstor
+            | SensitiveOp::Fwait => {
+                if let Err(exc) = emulate_legacy_x87(&mut self.ctx, mem, raw, op, va) {
+                    return self.raise(exc);
+                }
+                self.ctx.rip = resume;
+                Ok(SoftCpuExit::Continue { next_rip: resume })
+            }
+            SensitiveOp::Fxsave
+            | SensitiveOp::Xsave
+            | SensitiveOp::Xsaveopt
+            | SensitiveOp::Xsavec
+            | SensitiveOp::Fxrstor
+            | SensitiveOp::Xrstor => {
+                if let Err(exc) = emulate_xstate(&mut self.ctx, mem, raw, op, va) {
+                    return self.raise(exc);
+                }
+                self.ctx.rip = resume;
+                Ok(SoftCpuExit::Continue { next_rip: resume })
+            }
             _ => {
                 self.ctx.rip = va;
                 Ok(SoftCpuExit::Sensitive {
@@ -370,7 +399,7 @@ impl SoftCpu {
 }
 
 /// Fixed Level 0 view, independent of the host. Baseline integer/SSE2 state,
-/// no x87 or FXSAVE/XSAVE image helpers yet; no AVX, monitor, INVPCID, XSAVES,
+/// emulated XSAVE legacy components only; no AVX, monitor, INVPCID, XSAVES,
 /// RDPID, CET, or other host extensions. Native admission remains a separate
 /// instruction-level allowlist: Level 0 is deliberately a partial ISA.
 /// CR0.EM=0 permits the admitted SSE subset; CPUID.FPU=0 promises no x87.
@@ -385,14 +414,326 @@ fn emulate_pinned_cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
         (1, _) => (
             0x0000_0663,
             0,
-            0,
-            (1 << 4) | (1 << 8) | (1 << 15) | (1 << 25) | (1 << 26),
+            (1 << 26) | (1 << 27),
+            (1 << 4) | (1 << 8) | (1 << 15) | (1 << 24) | (1 << 25) | (1 << 26),
         ),
-        (0x0d, 0) => (0, 0, 0, 0),
-        (0x0d, 1) => (0, 0, 0, 0),
+        (0x0d, 0) => (3, 576, 576, 0),
+        (0x0d, 1) => (3, 576, 0, 0), // XSAVEOPT and XSAVEC, no supervisor state
         (0x8000_0000, _) => (0x8000_0008, 0, 0, 0),
         (0x8000_0001, _) => (0, 0, 1, (1 << 11) | (1 << 20) | (1 << 29)),
         (0x8000_0008, _) => (48 | (48 << 8), 0, 0, 0),
         _ => (0, 0, 0, 0),
     }
+}
+
+// Intel SDM Vol. 1, chapter 13: only requested legacy components participate.
+// No YMM/supervisor component is enabled or exposed by this CPU.
+fn emulate_xstate<M: SoftMmuMemory>(
+    ctx: &mut SoftCpuContext,
+    mem: &mut M,
+    insn: &Instruction,
+    op: SensitiveOp,
+    ip: u64,
+) -> Result<(), X86Exception> {
+    let format64 = matches!(
+        insn.mnemonic(),
+        Mnemonic::Fxsave64
+            | Mnemonic::Fxrstor64
+            | Mnemonic::Xsave64
+            | Mnemonic::Xsaveopt64
+            | Mnemonic::Xsavec64
+            | Mnemonic::Xrstor64
+    );
+    let ext = !matches!(op, SensitiveOp::Fxsave | SensitiveOp::Fxrstor);
+    let save = !matches!(op, SensitiveOp::Fxrstor | SensitiveOp::Xrstor);
+    let compact = op == SensitiveOp::Xsavec;
+    let ea = compute_effective_va(insn, ctx);
+    if ea & (if ext { 63 } else { 15 }) != 0
+        || !is_canonical_va(ea)
+        || !is_canonical_va(ea.wrapping_add(if ext { 575 } else { 511 }))
+    {
+        return Err(X86Exception::general_protection(ip, 0));
+    }
+    let request = if ext {
+        ((ctx.gpr[reg::RAX] as u32 as u64) | ((ctx.gpr[reg::RDX] as u32 as u64) << 32))
+            & ctx.xcr0
+            & 3
+    } else {
+        3
+    };
+    let mut area = [0u8; 576];
+    let mut ranges = Vec::new();
+    let fault = |pf: crate::mmu::SoftPageFault| X86Exception::page_fault(ip, pf.error_code, pf.cr2);
+    let mut state = request;
+    let mut xcomp = 0;
+    if ext {
+        if !save || !compact {
+            read_guest_bytes(
+                ctx,
+                mem,
+                ea.wrapping_add(512),
+                &mut area[512..576],
+                SoftAccessKind::Read,
+            )
+            .map_err(fault)?;
+        }
+        let header = u64::from_le_bytes(
+            area[512..520]
+                .try_into()
+                .map_err(|_| X86Exception::invalid_opcode(ip))?,
+        );
+        xcomp = u64::from_le_bytes(
+            area[520..528]
+                .try_into()
+                .map_err(|_| X86Exception::invalid_opcode(ip))?,
+        );
+        if !save {
+            if header & !3 != 0
+                || (xcomp != 0
+                    && (xcomp & (1 << 63) == 0
+                        || xcomp & !((1 << 63) | 3) != 0
+                        || header & !xcomp != 0))
+                || area[528..576].iter().any(|&b| b != 0)
+            {
+                return Err(X86Exception::general_protection(ip, 0));
+            }
+            state = header;
+        } else {
+            let bits = if compact {
+                request
+            } else {
+                (header & !request) | request
+            };
+            area[512..520].copy_from_slice(&bits.to_le_bytes());
+            if compact {
+                area[520..528].copy_from_slice(&((1u64 << 63) | request).to_le_bytes());
+                ranges.push((512, 576));
+            } else {
+                ranges.push((512, 520));
+            }
+        }
+    }
+    if !ext {
+        ranges.push((0, if save { 464 } else { 512 }));
+    } else {
+        if request & 1 != 0 && (save || state & 1 != 0) {
+            ranges.extend_from_slice(&[(0, 24), (32, 160)]);
+        }
+        if request & 2 != 0 {
+            // Standard XRSTOR loads MXCSR even when SSE is in initial state.
+            if save || xcomp == 0 || state & 2 != 0 {
+                ranges.push((24, 32));
+            }
+            if save || state & 2 != 0 {
+                ranges.push((160, 416));
+            }
+        }
+    }
+    if save {
+        let mut legacy = ctx.fxsave.clone();
+        if !format64 {
+            legacy.0[12..16].fill(0);
+            legacy.0[12..14].copy_from_slice(&ctx.x87_code_selector.to_le_bytes());
+            legacy.0[20..24].fill(0);
+            legacy.0[20..22].copy_from_slice(&ctx.x87_data_selector.to_le_bytes());
+        }
+        if !ext {
+            // Validate the nominal operand, but never overwrite software bytes
+            // 464..512 (Intel SDM, FXSAVE layout).
+            for off in [0, 511] {
+                crate::mmu::translate_va(ctx, mem, ea.wrapping_add(off), SoftAccessKind::Write)
+                    .map_err(fault)?;
+            }
+        }
+        for &(start, end) in &ranges {
+            if start < 512 {
+                area[start..end].copy_from_slice(&legacy.0[start..end]);
+            }
+            // Validate every touched page before publishing any component.
+            for off in [start, end - 1] {
+                let va = ea.wrapping_add(off as u64);
+                if !is_canonical_va(va) {
+                    return Err(X86Exception::general_protection(ip, 0));
+                }
+                crate::mmu::translate_va(ctx, mem, va, SoftAccessKind::Write).map_err(fault)?;
+            }
+        }
+        for (start, end) in ranges {
+            write_guest_bytes(ctx, mem, ea.wrapping_add(start as u64), &area[start..end])
+                .map_err(fault)?;
+        }
+    } else {
+        for &(start, end) in &ranges {
+            let va = ea.wrapping_add(start as u64);
+            if !is_canonical_va(va) || !is_canonical_va(ea.wrapping_add((end - 1) as u64)) {
+                return Err(X86Exception::general_protection(ip, 0));
+            }
+            read_guest_bytes(ctx, mem, va, &mut area[start..end], SoftAccessKind::Read)
+                .map_err(fault)?;
+        }
+        if request & 2 != 0
+            && u32::from_le_bytes([area[24], area[25], area[26], area[27]]) & !GUEST_MXCSR_MASK != 0
+        {
+            return Err(X86Exception::general_protection(ip, 0));
+        }
+        let mut restored = ctx.fxsave.clone();
+        if ext {
+            let init = crate::context::FxsaveArea::default();
+            if request & 1 != 0 && state & 1 == 0 {
+                restored.0[..24].copy_from_slice(&init.0[..24]);
+                restored.0[32..160].copy_from_slice(&init.0[32..160]);
+            }
+            if request & 2 != 0 && state & 2 == 0 {
+                restored.0[160..416].fill(0);
+                if xcomp != 0 {
+                    restored.0[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+                }
+            }
+        }
+        for (start, end) in ranges {
+            restored.0[start..end].copy_from_slice(&area[start..end]);
+        }
+        if request & 1 != 0 {
+            if ext && state & 1 == 0 {
+                ctx.x87_code_selector = 0;
+                ctx.x87_data_selector = 0;
+            } else if !format64 {
+                ctx.x87_code_selector = u16::from_le_bytes([area[12], area[13]]);
+                ctx.x87_data_selector = u16::from_le_bytes([area[20], area[21]]);
+                restored.0[12..16].fill(0);
+                restored.0[20..24].fill(0);
+            }
+        }
+        restored.0[28..32].copy_from_slice(&GUEST_MXCSR_MASK.to_le_bytes());
+        ctx.fxsave = restored;
+    }
+    Ok(())
+}
+
+/// Intel SDM Vol. 1, x87 environment and FSAVE/FXSAVE formats. The largest
+/// legacy image is 108 bytes; no legacy state instruction executes on host RAM.
+fn emulate_legacy_x87<M: SoftMmuMemory>(
+    ctx: &mut SoftCpuContext,
+    mem: &mut M,
+    insn: &Instruction,
+    op: SensitiveOp,
+    ip: u64,
+) -> Result<(), X86Exception> {
+    if op == SensitiveOp::Fwait {
+        let cw = u16::from_le_bytes([ctx.fxsave.0[0], ctx.fxsave.0[1]]);
+        let sw = u16::from_le_bytes([ctx.fxsave.0[2], ctx.fxsave.0[3]]);
+        return if sw & !cw & 0x3f != 0 {
+            Err(X86Exception::new(
+                X86ExceptionVector::X87FloatingPoint,
+                ip,
+                None,
+                None,
+            ))
+        } else {
+            Ok(())
+        };
+    }
+    let size = insn.memory_size().size();
+    let full = matches!(op, SensitiveOp::Fnsave | SensitiveOp::Frstor);
+    let env_len = match (size, full) {
+        (108, true) | (28, false) => 28,
+        (94, true) | (14, false) => 14,
+        _ => return Err(X86Exception::invalid_opcode(ip)),
+    };
+    let ea = compute_effective_va(insn, ctx);
+    if !is_canonical_va(ea) || !is_canonical_va(ea.wrapping_add((size - 1) as u64)) {
+        return Err(X86Exception::general_protection(ip, 0));
+    }
+    let save = matches!(op, SensitiveOp::Fnsave | SensitiveOp::Fnstenv);
+    let mut image = [0u8; 108];
+    let fault = |pf: crate::mmu::SoftPageFault| X86Exception::page_fault(ip, pf.error_code, pf.cr2);
+    let (cw, sw, tag, fip, fcs, fdp, fds) = if env_len == 28 {
+        (0, 4, 8, 12, 16, 20, 24)
+    } else {
+        (0, 2, 4, 6, 8, 10, 12)
+    };
+    if save {
+        image[cw..cw + 2].copy_from_slice(&ctx.fxsave.0[..2]);
+        image[sw..sw + 2].copy_from_slice(&ctx.fxsave.0[2..4]);
+        let top = (u16::from_le_bytes([ctx.fxsave.0[2], ctx.fxsave.0[3]]) >> 11) as usize & 7;
+        let mut tags = 0u16;
+        for physical in 0..8 {
+            let logical = (physical + 8 - top) & 7;
+            let off = 32 + logical * 16;
+            let significand = u64::from_le_bytes(
+                ctx.fxsave.0[off..off + 8]
+                    .try_into()
+                    .map_err(|_| X86Exception::invalid_opcode(ip))?,
+            );
+            let exp = u16::from_le_bytes([ctx.fxsave.0[off + 8], ctx.fxsave.0[off + 9]]) & 0x7fff;
+            let kind = if ctx.fxsave.0[4] & (1 << physical) == 0 {
+                3
+            } else if exp == 0 && significand == 0 {
+                1
+            } else if exp == 0 || exp == 0x7fff || significand >> 63 == 0 {
+                2
+            } else {
+                0
+            };
+            tags |= kind << (physical * 2);
+            if full {
+                image[env_len + logical * 10..env_len + logical * 10 + 10]
+                    .copy_from_slice(&ctx.fxsave.0[off..off + 10]);
+            }
+        }
+        image[tag..tag + 2].copy_from_slice(&tags.to_le_bytes());
+        let ptr_width = if env_len == 28 { 4 } else { 2 };
+        image[fip..fip + ptr_width].copy_from_slice(&ctx.fxsave.0[8..8 + ptr_width]);
+        image[fdp..fdp + ptr_width].copy_from_slice(&ctx.fxsave.0[16..16 + ptr_width]);
+        image[fcs..fcs + 2].copy_from_slice(&ctx.x87_code_selector.to_le_bytes());
+        image[fds..fds + 2].copy_from_slice(&ctx.x87_data_selector.to_le_bytes());
+        if env_len == 28 {
+            image[18..20].copy_from_slice(&ctx.fxsave.0[6..8]);
+            for off in [2, 6, 10, 26] {
+                image[off..off + 2].fill(0xff);
+            }
+        }
+        write_guest_bytes(ctx, mem, ea, &image[..size]).map_err(fault)?;
+        if full {
+            // FNSAVE initializes x87 only; SSE state is unaffected.
+            let initial = crate::context::FxsaveArea::default();
+            ctx.fxsave.0[..24].copy_from_slice(&initial.0[..24]);
+            ctx.fxsave.0[32..160].copy_from_slice(&initial.0[32..160]);
+            ctx.x87_code_selector = 0;
+            ctx.x87_data_selector = 0;
+        } else {
+            ctx.fxsave.0[0] |= 0x3f;
+        }
+    } else {
+        read_guest_bytes(ctx, mem, ea, &mut image[..size], SoftAccessKind::Read).map_err(fault)?;
+        let mut restored = ctx.fxsave.clone();
+        restored.0[..2].copy_from_slice(&image[cw..cw + 2]);
+        restored.0[2..4].copy_from_slice(&image[sw..sw + 2]);
+        let tags = u16::from_le_bytes([image[tag], image[tag + 1]]);
+        restored.0[4] = (0..8).fold(0u8, |v, i| {
+            v | if (tags >> (i * 2)) & 3 != 3 {
+                1 << i
+            } else {
+                0
+            }
+        });
+        let ptr_width = if env_len == 28 { 4 } else { 2 };
+        restored.0[8..24].fill(0);
+        restored.0[8..8 + ptr_width].copy_from_slice(&image[fip..fip + ptr_width]);
+        restored.0[16..16 + ptr_width].copy_from_slice(&image[fdp..fdp + ptr_width]);
+        if env_len == 28 {
+            restored.0[6..8].copy_from_slice(&image[18..20]);
+        }
+        if full {
+            for i in 0..8 {
+                restored.0[32 + i * 16..42 + i * 16]
+                    .copy_from_slice(&image[env_len + i * 10..env_len + i * 10 + 10]);
+            }
+        }
+        ctx.x87_code_selector = u16::from_le_bytes([image[fcs], image[fcs + 1]]);
+        ctx.x87_data_selector = u16::from_le_bytes([image[fds], image[fds + 1]]);
+        restored.0[28..32].copy_from_slice(&GUEST_MXCSR_MASK.to_le_bytes());
+        ctx.fxsave = restored;
+    }
+    Ok(())
 }

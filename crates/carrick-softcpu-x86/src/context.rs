@@ -227,6 +227,8 @@ pub struct SoftCpuContext {
     host_fxsave: FxsaveArea,
     helper_resume: u64,
     virt_rsp_spill: u64,
+    pub x87_code_selector: u16,
+    pub x87_data_selector: u16,
 }
 
 const _: () = {
@@ -289,7 +291,7 @@ impl SoftCpuContext {
             cr0: 0x8005_0033,
             cr2: 0,
             cr3: 0,
-            cr4: 0x0030_04f0,
+            cr4: 0x0034_06f0,
             efer: 0x0d01,
             block_start_va: 0,
             pending_exception: None,
@@ -300,6 +302,8 @@ impl SoftCpuContext {
             host_fxsave: FxsaveArea::default(),
             helper_resume: 0,
             virt_rsp_spill: 0,
+            x87_code_selector: 0,
+            x87_data_selector: 0,
         };
         ctx.sync_tlb_tag_bits();
         ctx
@@ -591,6 +595,7 @@ fn step_complex_inner(
     insn_va: u64,
 ) -> Result<(), X86Exception> {
     match insn.mnemonic() {
+        _ if crate::decode::is_fp_arithmetic(insn) => step_fp(ctx, insn, insn_va),
         Mnemonic::Div => step_div(ctx, insn, insn_va, false),
         Mnemonic::Idiv => step_div(ctx, insn, insn_va, true),
         Mnemonic::Push => step_push(ctx, insn, insn_va),
@@ -663,6 +668,95 @@ fn step_complex_inner(
         m if insn.is_string_instruction() => step_string_op(ctx, insn, m, insn_va),
         _ => Err(X86Exception::invalid_opcode(insn_va)),
     }
+}
+
+// An SSE instruction cannot fault natively: all memory is copied into aligned
+// host-owned storage first, and every MXCSR exception is masked during execution.
+// Guest status and destination commit only after checking the guest mask bits.
+fn step_fp(ctx: &mut SoftCpuContext, insn: &Instruction, ip: u64) -> Result<(), X86Exception> {
+    #[repr(C, align(16))]
+    struct FpRun {
+        working: FxsaveArea,
+        host: FxsaveArea,
+        operand: [u8; 16],
+    }
+    let mut run = FpRun {
+        working: ctx.fxsave.clone(),
+        host: FxsaveArea::default(),
+        operand: [0; 16],
+    };
+    let original = u32::from_le_bytes(
+        ctx.fxsave.0[24..28]
+            .try_into()
+            .map_err(|_| X86Exception::invalid_opcode(ip))?,
+    );
+    let masked = (original | 0x1f80) & !0x3f;
+    run.working.0[24..28].copy_from_slice(&masked.to_le_bytes());
+    let mut native = *insn;
+    if (0..insn.op_count()).any(|i| insn.op_kind(i) == OpKind::Memory) {
+        let va = compute_effective_va(insn, ctx);
+        let size = insn.memory_size().size();
+        if size == 16 && va & 15 != 0 {
+            return Err(X86Exception::general_protection(ip, 0));
+        }
+        walk_active_span(ctx, va, size, SoftAccessKind::Read, ip, |off, ptr, n| {
+            // SAFETY: the walker authenticated this readable span; operand fits 16 bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(ptr, run.operand[off..].as_mut_ptr(), n);
+            }
+        })?;
+        native.set_segment_prefix(Register::None);
+        native.set_memory_base(Register::RAX);
+        native.set_memory_index(Register::None);
+        native.set_memory_index_scale(1);
+        native.set_memory_displacement64(0);
+        native.set_memory_displ_size(0);
+    }
+    let mut encoder = iced_x86::Encoder::new(64);
+    encoder
+        .encode(&native, 0)
+        .map_err(|_| X86Exception::invalid_opcode(ip))?;
+    // fxsave64 [rdi+512]; fxrstor64 [rdi]; lea rax,[rdi+1024]
+    let mut code = vec![
+        0x48, 0x0f, 0xae, 0x87, 0, 2, 0, 0, 0x48, 0x0f, 0xae, 0x0f, 0x48, 0x8d, 0x87, 0, 4, 0, 0,
+    ];
+    code.extend_from_slice(&encoder.take_buffer());
+    // fxsave64 [rdi]; fxrstor64 [rdi+512]; ret
+    code.extend_from_slice(&[
+        0x48, 0x0f, 0xae, 0x07, 0x48, 0x0f, 0xae, 0x8f, 0, 2, 0, 0, 0xc3,
+    ]);
+    let mut jit = crate::cpu::JitCodeBuffer::new(code.len())
+        .ok_or_else(|| X86Exception::invalid_opcode(ip))?;
+    let entry = jit
+        .publish(&code)
+        .ok_or_else(|| X86Exception::invalid_opcode(ip))?;
+    // SAFETY: the generated leaf touches only aligned FpRun storage, runs one
+    // admitted SSE instruction with masked exceptions, and restores host FP state.
+    let execute: unsafe extern "sysv64" fn(*mut FpRun) =
+        unsafe { std::mem::transmute(entry as usize) };
+    unsafe {
+        execute(&mut run);
+    }
+    let status = u32::from_le_bytes(
+        run.working.0[24..28]
+            .try_into()
+            .map_err(|_| X86Exception::invalid_opcode(ip))?,
+    ) & 0x3f;
+    let guest_mxcsr = original | status;
+    if status & !(original >> 7) & 0x3f != 0 {
+        ctx.fxsave.0[24..28].copy_from_slice(&guest_mxcsr.to_le_bytes());
+        return Err(if ctx.cr4 & (1 << 10) != 0 {
+            X86Exception::new(X86ExceptionVector::SimdFloatingPoint, ip, None, None)
+        } else {
+            X86Exception::invalid_opcode(ip)
+        });
+    }
+    run.working.0[24..28].copy_from_slice(&guest_mxcsr.to_le_bytes());
+    // x87 state belongs to the virtual context. No admitted native instruction
+    // modifies it; hardware FXSAVE may discard its pointer metadata.
+    ctx.fxsave.0[160..416].copy_from_slice(&run.working.0[160..416]);
+    ctx.fxsave.0[24..28].copy_from_slice(&guest_mxcsr.to_le_bytes());
+    Ok(())
 }
 
 fn step_maskmov(ctx: &mut SoftCpuContext, insn: &Instruction, ip: u64) -> Result<(), X86Exception> {
@@ -1180,7 +1274,28 @@ fn gw_save_guest(code: &mut Vec<u8>, from_probe: bool, from_lahf: bool) {
         0xc8,
     ]);
     gw_store(code, 0, offset_of!(SoftCpuContext, rflags));
-    gw_fx(code, false, CTX_FXSAVE_OFF);
+    gw_save_guest_simd(code);
+}
+
+fn gw_save_guest_simd(code: &mut Vec<u8>) {
+    // Native bodies can modify XMM/MXCSR only. Keep the emulated x87 image,
+    // including FIP/FDP, under context ownership across every block/helper.
+    // STMXCSR [r15+fxsave+24]
+    code.extend_from_slice(&[0x41, 0x0f, 0xae, 0x9f]);
+    code.extend_from_slice(&((CTX_FXSAVE_OFF + 24) as i32).to_le_bytes());
+    for xmm in 0..16u8 {
+        // MOVDQU [r15+fxsave+160+xmm*16],xmm
+        code.extend_from_slice(&[
+            0xf3,
+            0x41 | if xmm >= 8 { 4 } else { 0 },
+            0x0f,
+            0x7f,
+            0x87 | ((xmm & 7) << 3),
+        ]);
+        code.extend_from_slice(
+            &((CTX_FXSAVE_OFF + 160 + usize::from(xmm) * 16) as i32).to_le_bytes(),
+        );
+    }
 }
 
 fn gw_restore_host(code: &mut Vec<u8>) {

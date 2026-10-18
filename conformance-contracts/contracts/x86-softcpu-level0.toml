@@ -1,7 +1,7 @@
 schema_version = 1
 id = "x86.softcpu.level0"
 title = "Level 0 x86_64 copy-through binary translation executes user code and surfaces typed architectural faults over SoftMmuMemory without host signals"
-guest_surfaces = ["fault:breakpoint", "exit:software-interrupt", "isa:x86_64", "vmm:soft", "fault:page-fault", "fault:invalid-opcode", "fault:general-protection", "fault:divide-error"]
+guest_surfaces = ["fault:breakpoint", "fault:simd-floating-point", "exit:software-interrupt", "isa:x86_64", "vmm:soft", "fault:page-fault", "fault:invalid-opcode", "fault:general-protection", "fault:divide-error"]
 semantic_authority = [
   "Intel SDM Vol. 3A Ch. 6: Interrupt and Exception Handling (#DE vector 0, #UD vector 6, #GP vector 13, #PF vector 14 error-code bits P/W/U/RSVD/I/PK)",
   "AMD64 Architecture Programmer's Manual Vol. 2: canonical 48-bit virtual addresses and page-translation fault ordering",
@@ -10,25 +10,24 @@ semantic_authority = [
   "native x86_64 host CPU differential execution of randomized ALU, memory, and stack basic blocks",
 ]
 fixture = "carrick-softcpu-x86::softcpu_level0"
-scale_points = [1]
+scale_points = [1, 200]
 structural_budgets = []
 rationale = "Level 0 same-ISA copy-through binary translation in carrick-softcpu-x86 translates guest virtual addresses exclusively through the per-CPU SoftTlb, SoftWalker, and SoftMmuMemory without mapping guest virtual addresses into the host address space or installing host signal handlers (SIGSEGV/SIGFPE/SIGILL/SIGBUS). Every memory access, page-straddling bounce-buffer access, instruction fetch, and division surfaces exact architectural #PF (with CR2 and P/W/U/I/PK error code), #UD, #GP(0), or #DE exits while preserving guest GPRs, RFLAGS, and uncommitted page bytes on fault."
 
 # Level 0 has an explicit native-instruction allowlist and a fixed CPUID view.
 # VEX/EVEX, gathers and unimplemented instruction classes raise guest #UD.
-# FPU/FXSR/XSAVE/RDTSCP/PKU are absent. CR0.EM stays clear for SSE data
-# operations, independently of absent x87 capability. XGETBV is refused.
-# XCR0 is 3: no YMM state is exposed. Legacy x87/XSAVE image helpers and
-# SIMD arithmetic are refused with guest #UD until the helper layer. Guest RSP stays virtual;
+# FPU=0: image helpers provide no x87 arithmetic; CR0.EM=0 permits SSE.
+# FXSR/XSAVE are enabled here; RDTSCP/PKU remain absent and raise #UD.
+# Address-size/FS/GS string and XLAT forms and FS/GS stack ops remain refused.
+# XCR0 is 3: no YMM state is exposed. Checked SSE arithmetic raises guest #XM;
+# legacy x87 state images validate the full span. Guest RSP stays virtual;
 # every gateway restores host DF/MXCSR/FCW before Rust, and JIT pages use W^X.
-# Aggregate ELF/native-oracle and extended memory/complex-op cases are in
-# the helper layer; all seven required review witnesses remain in this core.
-# Address-size/FS/GS string and XLAT forms and FS/GS stack operations are
-# refused before mutation until their architectural semantics are implemented.
+# Virtual x87 metadata survives block ends; native execution publishes only
+# XMM/MXCSR. FXSAVE preserves software bytes and honors REX.W pointer widths.
 # Translation caching and structural execution budgets remain follow-up #616.
 
 [bindings]
-vm_free = "carrick-softcpu-x86::softcpu_level0::{invalid_opcode_witnesses_ud2_and_bad_encodings,general_protection_witnesses_privileged_at_cpl3_and_sensitive_at_cpl0,general_protection_witnesses_non_canonical_and_unaligned_sse,divide_error_witnesses_div_idiv_zero_overflow_and_fault_priority,implicit_masked_store_cannot_write_a_host_address,ignored_legacy_segment_prefixes_execute_in_long_mode,unsupported_ymm_state_is_neither_advertised_nor_executed,complete_f3_instruction_at_page_end_does_not_fetch_next_page,native_admission_denies_unimplemented_host_features,breakpoints_and_software_interrupts_have_typed_exits,guest_rsp_values_survive_native_ops_memory_helpers_and_exits,rip_relative_word_lea_preserves_upper_destination_bits,masked_store_crosses_pages_without_changing_disabled_bytes,descriptor_queries_exit_without_host_state,unsupported_implicit_address_forms_refuse_before_mutation,unavailable_features_raise_ud_and_cpuid_matches_the_layer}; context::tests::{gateway_returns_with_host_df_and_fp_controls_restored,crossing_conditional_write_preserves_untouched_bounce_bytes,published_blocks_and_gateways_are_rx_and_never_writable}; context::SoftCpuContext compile-fail gateway API witnesses"
+vm_free = "carrick-softcpu-x86::softcpu_level0::{retired_fixtures_run_over_soft_memory,page_fault_witnesses_read_write_ro_nx_smap_and_straddle_fetch,invalid_opcode_witnesses_ud2_and_bad_encodings,general_protection_witnesses_privileged_at_cpl3_and_sensitive_at_cpl0,general_protection_witnesses_non_canonical_and_unaligned_sse,divide_error_witnesses_div_idiv_zero_overflow_and_fault_priority,page_crossing_bounce_buffer_handles_read_write_rmw_and_second_page_fault_atomicity,virtualized_r14_r15_and_fs_gs_bases_work_transparently,cflow_call_and_ret_fault_atomicity_preserves_rsp_and_rip,string_instructions_rep_movsb_stosb_cmpsb_work_across_pages,alias_writes_advance_code_frame_generation,differential_property_tests_match_native_host_x86_64_cpu,implicit_masked_store_cannot_write_a_host_address,ignored_legacy_segment_prefixes_execute_in_long_mode,unsupported_ymm_state_is_neither_advertised_nor_executed,complete_f3_instruction_at_page_end_does_not_fetch_next_page,oversized_and_unknown_memory_images_never_enter_native_memory_path,native_admission_denies_unimplemented_host_features,breakpoints_and_software_interrupts_have_typed_exits,guest_rsp_values_survive_native_ops_memory_helpers_and_exits,rip_relative_word_lea_preserves_upper_destination_bits,masked_store_crosses_pages_without_changing_disabled_bytes,sse_exceptions_and_reserved_mxcsr_bits_are_guest_faults,xsave_masks_and_compacted_headers_control_restore,legacy_x87_images_cross_pages_with_full_span_and_atomic_faults,legacy_save_image_matches_native_x87_formats,scalar_cmpsd_never_uses_unchecked_native_copy,scalar_cmpsd_reports_guest_invalid_operation,fxsave_preserves_software_tail,fxsave_pointer_width_follows_rex_w,sse_helper_validates_memory_before_arithmetic,descriptor_queries_exit_without_host_state,unsupported_implicit_address_forms_refuse_before_mutation,unavailable_features_raise_ud_and_cpuid_matches_the_layer}; context::tests::{gateway_returns_with_host_df_and_fp_controls_restored,crossing_conditional_write_preserves_untouched_bounce_bytes,published_blocks_and_gateways_are_rx_and_never_writable}; context::SoftCpuContext compile-fail gateway API witnesses"
 
 [bindings.unresolved]
 embed_structural = "Soft-CPU CPL0 ring, carrier, and CLI integration land in slices #582-#584; slice #581 validates Level 0 DBT VM-free over SoftMmuMemory and differentially against the host x86_64 CPU."

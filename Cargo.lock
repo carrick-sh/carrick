@@ -993,6 +993,7 @@ name = "carrick-softcpu-x86"
 version = "0.1.0"
 dependencies = [
  "carrick-softmmu",
+ "goblin",
  "iced-x86",
  "libc",
 ]
