@@ -963,6 +963,26 @@ struct RunQueueState {
     closed_waiter_observations: usize,
 }
 
+/// One conserved census of admitted authorities and queued-or-claimed rows.
+/// Publication retains row custody before releasing submission custody;
+/// taking a row transfers its custody to the claim without changing this count.
+#[derive(Debug, Default)]
+struct DrainWork(AtomicUsize);
+
+impl DrainWork {
+    fn retain(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn release(&self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == 0
+    }
+}
+
 /// Parked executors right now, or the reason the census could not be taken.
 ///
 /// A non-blocking reader that cannot get a run-queue lock must say so. An
@@ -1080,6 +1100,7 @@ pub(crate) struct RunQueueInner {
     #[cfg(test)]
     steal_scan_visits: AtomicUsize,
     active_authorities: AtomicUsize,
+    drain_work: DrainWork,
     close_epoch: AtomicU64,
     /// Carrier-wide exact-key dedup, sharded so a wake never contends with an
     /// unrelated wake. A key may be queued on only one CPU at a time; work
@@ -1408,10 +1429,17 @@ impl RunQueueInner {
     }
 
     fn drain_ready(&self) -> bool {
-        self.total_queued.load(Ordering::SeqCst) == 0
-            && self.active_authorities.load(Ordering::SeqCst) == 0
-            && self.claimed.load(Ordering::SeqCst) == 0
-            && self.active_wake_admissions() == 0
+        // Close excludes new wake admissions. An existing wake must publish
+        // its work before releasing admission, so sample that gate first.
+        let drained = self.active_wake_admissions() == 0 && self.drain_work.is_empty();
+        #[cfg(test)]
+        tests::during_drain_observation();
+        drained
+    }
+
+    fn retain_queued_work(&self) {
+        self.drain_work.retain();
+        self.total_queued.fetch_add(1, Ordering::SeqCst);
     }
 
     fn maybe_finish_close(&self, state: &mut RunQueueState) {
@@ -1476,7 +1504,7 @@ impl RunQueueInner {
             local.rows.push_back(row);
             cpu.depth.store(local.rows.len(), Ordering::Release);
             self.host_queued.fetch_add(1, Ordering::SeqCst);
-            self.total_queued.fetch_add(1, Ordering::SeqCst);
+            self.retain_queued_work();
             local.wake_ticket = local.wake_ticket.wrapping_add(1);
             local.waiters > 0
         };
@@ -1545,7 +1573,7 @@ impl RunQueueInner {
             local.rows.push_back(publishable);
             cpu.depth.store(local.rows.len(), Ordering::Release);
             self.host_queued.fetch_add(1, Ordering::SeqCst);
-            self.total_queued.fetch_add(1, Ordering::SeqCst);
+            self.retain_queued_work();
             local.wake_ticket = local.wake_ticket.wrapping_add(1);
             local.waiters > 0
         };
@@ -1582,7 +1610,7 @@ impl RunQueueInner {
                 return EnqueueOutcome::Deferred;
             }
             shard.zone_held.insert(key, row);
-            self.total_queued.fetch_add(1, Ordering::SeqCst);
+            self.retain_queued_work();
         }
         self.place_zone_row(&thread, key);
         self.note_zone_runnable(&thread);
@@ -1616,7 +1644,7 @@ impl RunQueueInner {
                 row
             };
             shard.zone_held.insert(key, publishable);
-            self.total_queued.fetch_add(1, Ordering::SeqCst);
+            self.retain_queued_work();
         }
         self.place_zone_row(&thread, key);
         self.note_zone_runnable(&thread);
@@ -1813,9 +1841,8 @@ impl RunQueueInner {
         Some(row)
     }
 
-    /// Common bookkeeping for taking a row out of a CPU queue: the claim is
-    /// accounted BEFORE the queue depth drops, so a concurrent `drain_ready`
-    /// can never observe a moment where the row is in neither count.
+    /// Taking a row transfers its drain obligation to the claim. The separate
+    /// diagnostic counts may overlap, but never decide whether close drained.
     fn finish_removal(&self, local: &mut GuestCpuLocalState, cpu: &GuestCpu, key: QueueKey) {
         crate::el1_zone::count_host_queue_claim();
         self.claimed.fetch_add(1, Ordering::SeqCst);
@@ -1939,6 +1966,7 @@ impl RunQueueInner {
             );
         }
         self.claim_boundaries.fetch_add(1, Ordering::SeqCst);
+        self.drain_work.release();
         self.settle_close_if_closing();
     }
 
@@ -1953,6 +1981,9 @@ impl RunQueueInner {
                 "active authorities count underflow in release_authority"
             );
         }
+        self.drain_work.release();
+        #[cfg(test)]
+        tests::after_authority_release();
         self.settle_close_if_closing();
     }
 
@@ -1973,6 +2004,7 @@ impl RunQueueInner {
         {
             return Err(RunQueueError::SubmissionRejected);
         }
+        self.drain_work.retain();
         drop(state);
         Ok(())
     }
@@ -2509,6 +2541,7 @@ impl RunQueue {
                 #[cfg(test)]
                 steal_scan_visits: AtomicUsize::new(0),
                 active_authorities: AtomicUsize::new(0),
+                drain_work: DrainWork::default(),
                 close_epoch: AtomicU64::new(0),
                 keys,
                 online: (0..ncpu).map(|_| AtomicUsize::new(0)).collect(),
@@ -2558,6 +2591,7 @@ impl RunQueue {
             cpu.depth.store(local.rows.len(), Ordering::Release);
             self.inner.host_queued.fetch_sub(1, Ordering::SeqCst);
             self.inner.total_queued.fetch_sub(1, Ordering::SeqCst);
+            self.inner.drain_work.release();
             drop(local);
             self.inner.settle_close_if_closing();
             return true;
@@ -2571,6 +2605,7 @@ impl RunQueue {
                 RunQueueInner::retire_gates(&mut shard, key);
                 drop(shard);
                 self.inner.total_queued.fetch_sub(1, Ordering::SeqCst);
+                self.inner.drain_work.release();
                 self.inner.settle_close_if_closing();
                 return true;
             }
@@ -2615,6 +2650,7 @@ impl RunQueue {
                 count.checked_add(1)
             })
             .map_err(|_| RunQueueError::SubmissionRejected)?;
+        self.inner.drain_work.retain();
         drop(state);
         self.inner.mark_unpublished(key);
         Ok(SubmissionAuthority {
@@ -3578,8 +3614,7 @@ impl Scheduler {
                     // successor is published, no executor runs that
                     // generation, and no exit or exec path names it. The
                     // `SubmissionAuthority` inside that record keeps
-                    // `active_authorities` non-zero, which is one of
-                    // `drain_ready`'s four terms — so the container's close
+                    // a drain obligation alive, so the container's close
                     // never finishes. Liveness is this side's fact, so the
                     // retirement has to be ordered from here.
                     observer.retire_reaped(thread, predecessor);
@@ -5710,6 +5745,40 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration;
+
+    struct DrainObservationGate {
+        skip: usize,
+        arrived: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    }
+
+    thread_local! {
+        static DRAIN_OBSERVATION_GATE: std::cell::RefCell<Option<DrainObservationGate>> = const { std::cell::RefCell::new(None) };
+        static AUTHORITY_RELEASED: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn during_drain_observation() {
+        let gate = DRAIN_OBSERVATION_GATE.with_borrow_mut(|configured| {
+            let gate = configured.as_mut()?;
+            if gate.skip > 0 {
+                gate.skip -= 1;
+                return None;
+            }
+            configured.take()
+        });
+        if let Some(gate) = gate {
+            gate.arrived.send(()).unwrap();
+            gate.resume.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+    }
+
+    pub(super) fn after_authority_release() {
+        AUTHORITY_RELEASED.with_borrow_mut(|configured| {
+            if let Some(released) = configured.take() {
+                released.send(()).unwrap();
+            }
+        });
+    }
 
     use carrick_abi::LinuxCloneFlags;
     /// Pin every placement to guest CPU 0.
@@ -8170,7 +8239,7 @@ mod tests {
                     },
                 );
             }
-            inner.total_queued.fetch_add(1, Ordering::SeqCst);
+            inner.retain_queued_work();
             for _ in 0..16 {
                 assert!(inner.try_steal(GuestCpuId::new(0)).is_none());
             }
@@ -8221,7 +8290,7 @@ mod tests {
                 },
             );
         }
-        inner.total_queued.fetch_add(1, Ordering::SeqCst);
+        inner.retain_queued_work();
         inner.place_zone_row(root.thread(), key);
         // The wedge census names the row, its owner and its state.
         let summary = scheduler.scheduler_summary();
@@ -9027,8 +9096,7 @@ mod tests {
     /// That re-insert is correct for a live target — the next attempt resolves
     /// it — and a leak for a reaped one: no successor is ever published, no
     /// executor ever runs that generation, so no exit or exec path retires the
-    /// record. The authority it holds keeps `active_authorities` above zero,
-    /// which is one of `drain_ready`'s four terms, so container teardown never
+    /// record. The authority it holds retains a drain obligation, so teardown never
     /// finishes closing.
     #[derive(Debug)]
     struct AuthorityHoldingReapingObserver {
@@ -9549,12 +9617,23 @@ mod tests {
         let registration = scheduler
             .register_executor(Arc::clone(&kick) as Arc<dyn ExecutorKick>)
             .unwrap();
-        let (worker_ready_tx, worker_ready_rx) = std::sync::mpsc::channel();
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        *scheduler.queue.inner.host_park_gate.lock() = Some(parked_tx);
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
         let (worker_tx, worker_rx) = std::sync::mpsc::channel();
         let worker_scheduler = Arc::clone(&scheduler);
         let worker_registration = registration.clone();
         let worker = thread::spawn(move || {
-            worker_ready_tx.send(()).expect("worker ready");
+            DRAIN_OBSERVATION_GATE.with_borrow_mut(|gate| {
+                *gate = Some(DrainObservationGate {
+                    // maybe_finish_close checks first; force the subsequent
+                    // check that decides whether take returns Closed.
+                    skip: 1,
+                    arrived: observed_tx,
+                    resume: resume_rx,
+                });
+            });
             let running = match worker_scheduler.take(&worker_registration) {
                 Ok(running) => running,
                 Err(error) => panic!("take row failed: {error:?}"),
@@ -9572,24 +9651,27 @@ mod tests {
             worker_tx.send(()).expect("worker finished");
         });
 
-        worker_ready_rx
+        parked_rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("worker started");
-
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while scheduler.waiter_count() != 1 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for executor to park"
-            );
-            thread::yield_now();
-        }
+            .expect("worker parked before close");
 
         scheduler.close();
+        observed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("close woke the worker and it rechecked the empty queue");
         root_authority
             .publish(&scheduler, Arc::clone(root.thread()))
             .unwrap();
-        drop(root_authority);
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
+        let publisher = thread::spawn(move || {
+            AUTHORITY_RELEASED.with_borrow_mut(|gate| *gate = Some(released_tx));
+            drop(root_authority);
+        });
+        released_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("publication replaced the last authority with queued work");
+        resume_tx.send(()).unwrap();
+        publisher.join().unwrap();
 
         worker_rx
             .recv_timeout(Duration::from_secs(5))
