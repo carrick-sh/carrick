@@ -27,7 +27,7 @@ jobs:
   worker:
     needs: guard
     runs-on: [carrick-agent]
-    environment: agent-dispatch
+    environment: agent-execution
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
     timeout-minutes: 40

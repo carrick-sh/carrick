@@ -690,7 +690,8 @@ fn marker(issue: u64, branch: &str) -> String {
     format!("<!-- carrick-dispatch-owner:v1 issue={issue} branch={branch} -->")
 }
 fn owned_pr(pr: &Value, comments: &Value, issue: u64, branch: &str) -> bool {
-    pr["author"]["login"] == "carrick-workers[bot]"
+    pr["author"]["login"] == "app/carrick-workers"
+        && pr["author"]["is_bot"] == true
         && pr["headRepositoryOwner"]["login"] == "carrick-sh"
         && pr["headRepository"]["name"] == "carrick"
         && comments.as_array().is_some_and(|comments| {
@@ -1383,6 +1384,14 @@ mod tests {
             .next()
             .unwrap();
         assert!(!worker.contains("AGENT_WORKER_TOKEN"));
+        assert!(worker.contains("environment: agent-execution"));
+        assert!(
+            workflow
+                .split("  publish:")
+                .nth(1)
+                .unwrap()
+                .contains("environment: agent-dispatch")
+        );
         assert!(!include_str!("agent_runner.rs").contains("helper = !gh auth git-credential"));
         assert!(workflow.contains("artifact-ids:"));
         assert!(workflow.contains("needs.worker.outputs.artifact_id"));
@@ -1504,7 +1513,7 @@ Do it"
     #[test]
     fn branch_requires_app_pr_and_app_comment_marker() {
         let branch = "work/dispatch-634-old";
-        let pr = json!({"number":12,"author":{"login":"carrick-workers[bot]"},
+        let pr = json!({"number":12,"author":{"login":"app/carrick-workers","is_bot":true},
             "headRepositoryOwner":{"login":"carrick-sh"},"headRepository":{"name":"carrick"},
             "body":"Closes #634"});
         assert!(
@@ -1572,9 +1581,6 @@ Do it"
     }
     fn fixture_repository(root: &Path) {
         git(root, &["init", "-b", "work/dispatch-634-pending"]).unwrap();
-        git(root, &["config", "user.name", "Fixture"]).unwrap();
-        git(root, &["config", "user.email", "fixture@localhost"]).unwrap();
-        git(root, &["config", "core.hooksPath", "/dev/null"]).unwrap();
         std::fs::write(root.join("base"), "base").unwrap();
         git(root, &["add", "base"]).unwrap();
         git(root, &["commit", "-m", "fixture base"]).unwrap();
