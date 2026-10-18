@@ -627,7 +627,7 @@ fn retire_agent() -> Result<(), ScalerError> {
                 .args(["-n", "pgrep", selector, AGENT_USER])
                 .output()?;
             match status.status.code() {
-                Some(1) => {}
+                Some(1) if status.stdout.is_empty() && status.stderr.is_empty() => {}
                 Some(0) => empty = false,
                 _ => return Err(ScalerError::Guard("cannot verify agent process retirement")),
             }
@@ -648,6 +648,16 @@ pub(crate) fn cleanup_agent_user() -> Result<(), ScalerError> {
         .args(["-u", AGENT_USER])
         .output()?;
     if status.status.success() {
+        let uid = String::from_utf8_lossy(&status.stdout)
+            .trim()
+            .parse::<libc::uid_t>()
+            .map_err(|_| ScalerError::Guard("invalid agent account identity"))?;
+        // Auth fixtures also run inside the worker. Only its separate runner
+        // retires the account; a worker may clean its own credential state.
+        // SAFETY: geteuid has no preconditions.
+        if uid == unsafe { libc::geteuid() } {
+            return Ok(());
+        }
         retire_agent()?;
         sudo(&["userdel", AGENT_USER])?;
     } else if status.status.code() != Some(1) {
