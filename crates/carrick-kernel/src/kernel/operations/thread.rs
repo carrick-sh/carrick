@@ -1234,6 +1234,48 @@ mod tests {
         );
     }
 
+    /// #641 census: a Closing owner whose member set is incomplete reports
+    /// what its readiness check sees, naming the first unreturned receipt.
+    #[test]
+    fn closing_owner_census_names_first_unreturned_receipt() {
+        let (kernel, root) = bootstrap(192);
+        let plan = ClonePlan::from_flags(
+            LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+        )
+        .expect("thread plan");
+        let child = kernel
+            .reserve_thread_clone(&root, plan, None)
+            .and_then(|reserved| reserved.prepare(ThreadId::synthetic_for_tests(8_960)))
+            .and_then(|prepared| prepared.commit_for_el1())
+            .and_then(|published| published.into_context())
+            .expect("host-born member");
+        let page = root.lifecycle_page();
+        let before = root.thread().lifecycle_diagnostic();
+        assert!(!before.contains("readiness"), "{before}");
+        page.close();
+        page.publish_exit_wait(carrick_el1_abi::EntryMmKey::from_raw(0x77), 0x7000);
+        let census = root.thread().lifecycle_diagnostic();
+        assert!(
+            census.contains("readiness can_settle=false live=2 claimed=0"),
+            "{census}"
+        );
+        assert!(
+            census.contains("blocked first=HostBorn index=0 state=2"),
+            "{census}"
+        );
+        assert!(census.contains("returned_exact=false"), "{census}");
+        let identity = child
+            .thread()
+            .control_slot()
+            .host_birth_identity()
+            .expect("published host birth identity");
+        assert!(
+            census.contains(&format!("identity=Some({identity:?})")),
+            "{census}"
+        );
+        page.clear_exit_wait();
+    }
+
     #[test]
     fn thread_clone_reservation_keeps_tid_private_until_commit() {
         let (kernel, root) = bootstrap(190);

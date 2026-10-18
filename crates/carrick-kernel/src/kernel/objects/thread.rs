@@ -1173,7 +1173,7 @@ impl Thread {
     pub(in crate::kernel) fn lifecycle_diagnostic(&self) -> String {
         let page = self.control.lifecycle();
         let census = carrick_core::lifecycle::census(&*page);
-        ::std::format!(
+        let mut line = ::std::format!(
             "lifecycle gate={:?} live={} claimed={} exit_wait={:?} control_entry={:?} host_retirement={:?}",
             census.gate,
             census.live,
@@ -1181,7 +1181,34 @@ impl Thread {
             page.exit_wait(),
             self.control.entry(),
             self.control.host_retirement(),
-        )
+        );
+        // A published exit channel names a Closing owner: report what its
+        // readiness check sees. The pin table gets one bounded attempt.
+        if page.exit_wait().is_some() {
+            line.push(' ');
+            line.push_str(&Self::closing_readiness_diagnostic(&self.control));
+        }
+        line
+    }
+
+    /// The Closing readiness census of `control`'s process page.
+    pub(in crate::kernel) fn closing_readiness_diagnostic(
+        control: &super::ThreadControlLease,
+    ) -> String {
+        let page = control.lifecycle();
+        match control.birth_controls_observed() {
+            Some(pins) => {
+                let pool: Vec<_> = pins
+                    .iter()
+                    .map(|(entry, control)| (*entry, &**control))
+                    .collect();
+                page.closing_readiness(&pool).to_string()
+            }
+            None => ::std::format!(
+                "{} (pool controls unavailable: pin table busy)",
+                page.closing_readiness(&[])
+            ),
+        }
     }
 
     fn format_execution(execution: &ThreadExecutionRecord) -> String {
