@@ -73,7 +73,10 @@ fn every_shard_is_required_in_hosted_ci_and_union_check_runs_on_linux() {
             needs.iter().any(|v| v.as_str() == Some(&job)),
             "ci-ok must require {job}"
         );
-        assert_eq!(jobs[job.as_str()]["runs-on"].as_str(), Some("macos-15"));
+        assert_eq!(
+            jobs[job.as_str()]["runs-on"].as_str(),
+            Some("${{ fromJSON(needs.changes.outputs.macos_runner) }}")
+        );
         let steps = jobs[job.as_str()]["steps"].as_vec().unwrap();
         assert!(
             steps
@@ -93,6 +96,14 @@ fn every_shard_is_required_in_hosted_ci_and_union_check_runs_on_linux() {
             .filter(|k| k.as_str().is_some_and(|s| s.starts_with("macos-unit")))
             .count(),
         shards.len()
+    );
+    // Fork PRs must never reach a self-hosted macOS runner (#650).
+    let runner = jobs["changes"]["outputs"]["macos_runner"].as_str().unwrap();
+    assert!(
+        runner.contains("github.event.pull_request.head.repo.full_name == github.repository")
+            && runner.contains("carrick-macos-ci")
+            && runner.ends_with("|| '\"macos-15\"' }}"),
+        "changes.outputs.macos_runner must keep fork PRs on hosted macos-15: {runner}"
     );
     let job = "lint";
     assert!(
