@@ -336,6 +336,10 @@ pub struct PostMortem {
     /// Backend-owned physical scheduler and vCPU state, when installed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub physical: Option<PhysicalCapture>,
+    /// Non-coherent terminal scheduler census, including bounded parked-PC
+    /// observations. Available on HVF even without a physical capture provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone_census: Option<String>,
     /// Host executor queues when the MM authority prevents a full graph.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler_aux: Option<SchedulerAuxCapture>,
@@ -493,6 +497,16 @@ impl PostMortem {
             None
         };
 
+        let zone_census = crate::el1_zone::zone().map(|zone| {
+            let mut census = String::new();
+            if zone.write_census(&mut census).is_err() {
+                truncated.push(Truncated {
+                    section: "zone_census".to_owned(),
+                    reason: "scheduler census formatting failed".to_owned(),
+                });
+            }
+            census
+        });
         Self {
             schema: POST_MORTEM_SCHEMA.to_owned(),
             run_id,
@@ -504,6 +518,7 @@ impl PostMortem {
             kernel: kernel_snapshot,
             degraded_kernel,
             physical: None,
+            zone_census,
             scheduler_aux,
             findings,
             event_ring,
