@@ -1,6 +1,7 @@
 //! Per-vCPU execution context (`SoftCpuContext`), gateway machine-code trampolines,
 //! slow-path soft-TLB/bounce helpers, and checked complex instruction helpers.
 
+use std::collections::HashMap;
 use std::mem::offset_of;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
@@ -223,7 +224,8 @@ pub struct SoftCpuContext {
     bounce_writeback: BounceWriteback,
     active_mem_ptr: Option<NonNull<()>>,
     active_translate_fn: Option<ActiveTranslateFn>,
-    active_block_insns: Vec<(u64, Instruction)>,
+    active_block_insns: Vec<(u64, Instruction, Option<FpLeafFn>)>,
+    fp_leaves: HashMap<Vec<u8>, FpLeaf>,
     host_fxsave: FxsaveArea,
     helper_resume: u64,
     virt_rsp_spill: u64,
@@ -299,6 +301,7 @@ impl SoftCpuContext {
             active_mem_ptr: None,
             active_translate_fn: None,
             active_block_insns: Vec::new(),
+            fp_leaves: HashMap::new(),
             host_fxsave: FxsaveArea::default(),
             helper_resume: 0,
             virt_rsp_spill: 0,
@@ -307,6 +310,51 @@ impl SoftCpuContext {
         };
         ctx.sync_tlb_tag_bits();
         ctx
+    }
+
+    pub(crate) fn prepare_block(
+        &mut self,
+        planned: &crate::block::PlannedBlock,
+    ) -> Result<(), crate::emit::EmitError> {
+        use crate::emit::{EmitError, JitStage};
+        self.active_block_insns.clear();
+        for d in &planned.insns {
+            let leaf = if crate::decode::supported_body(&d.raw)
+                && crate::decode::is_fp_arithmetic(&d.raw)
+            {
+                let bytes = native_fp_bytes(&d.raw)
+                    .map_err(|detail| EmitError::EncodeFailed { va: d.va, detail })?;
+                let entry = self.fp_leaves.entry(bytes);
+                let leaf = match entry {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let code = fp_leaf_image(entry.key());
+                        let mut buffer = crate::cpu::JitCodeBuffer::new(code.len()).ok_or(
+                            EmitError::HostJit {
+                                va: d.va,
+                                stage: JitStage::Allocate,
+                            },
+                        )?;
+                        let addr = buffer.publish(&code).ok_or(EmitError::HostJit {
+                            va: d.va,
+                            stage: JitStage::Publish,
+                        })?;
+                        // SAFETY: this RX leaf has the FpRun ABI and buffer owns it until CPU drop.
+                        let execute =
+                            unsafe { std::mem::transmute::<usize, FpLeafFn>(addr as usize) };
+                        entry.insert(FpLeaf {
+                            _buffer: buffer,
+                            execute,
+                        })
+                    }
+                };
+                Some(leaf.execute)
+            } else {
+                None
+            };
+            self.active_block_insns.push((d.va, d.raw, leaf));
+        }
+        Ok(())
     }
 
     pub(crate) fn reset_bounce(&mut self) {
@@ -332,9 +380,6 @@ impl SoftCpuContext {
         self.entry_exec_addr = entry;
         self.exit_reason = 0;
         self.pending_exception = None;
-        self.active_block_insns.clear();
-        self.active_block_insns
-            .extend(planned.insns.iter().map(|d| (d.va, d.raw)));
         self.active_mem_ptr = Some(NonNull::from(mem).cast());
         self.active_translate_fn = Some(translate_for_mem::<M>);
         let guard = Guard(self);
@@ -572,12 +617,12 @@ fn record_exception(ctx: &mut SoftCpuContext, exc: X86Exception) {
 /// Execute a complex body instruction (`div`/`idiv`, string ops, `push`/`pop`, etc.).
 #[unsafe(no_mangle)]
 extern "sysv64" fn softcpu_step_complex(ctx: &mut SoftCpuContext, insn_idx: u64) -> u64 {
-    let Some(&(insn_va, insn)) = ctx.active_block_insns.get(insn_idx as usize) else {
+    let Some(&(insn_va, insn, fp_leaf)) = ctx.active_block_insns.get(insn_idx as usize) else {
         record_exception(ctx, X86Exception::invalid_opcode(ctx.rip));
         return 0;
     };
     ctx.fxsave.0[28..32].copy_from_slice(&GUEST_MXCSR_MASK.to_le_bytes());
-    match step_complex_inner(ctx, &insn, insn_va) {
+    match step_complex_inner(ctx, &insn, insn_va, fp_leaf) {
         Ok(()) => 1,
         Err(exc) => {
             if let Some(cr2) = exc.cr2 {
@@ -593,9 +638,13 @@ fn step_complex_inner(
     ctx: &mut SoftCpuContext,
     insn: &Instruction,
     insn_va: u64,
+    fp_leaf: Option<FpLeafFn>,
 ) -> Result<(), X86Exception> {
     match insn.mnemonic() {
-        _ if crate::decode::is_fp_arithmetic(insn) => step_fp(ctx, insn, insn_va),
+        _ if crate::decode::is_fp_arithmetic(insn) => {
+            let entry = fp_leaf.ok_or_else(|| X86Exception::invalid_opcode(insn_va))?;
+            step_fp(ctx, insn, insn_va, entry)
+        }
         Mnemonic::Div => step_div(ctx, insn, insn_va, false),
         Mnemonic::Idiv => step_div(ctx, insn, insn_va, true),
         Mnemonic::Push => step_push(ctx, insn, insn_va),
@@ -673,13 +722,53 @@ fn step_complex_inner(
 // An SSE instruction cannot fault natively: all memory is copied into aligned
 // host-owned storage first, and every MXCSR exception is masked during execution.
 // Guest status and destination commit only after checking the guest mask bits.
-fn step_fp(ctx: &mut SoftCpuContext, insn: &Instruction, ip: u64) -> Result<(), X86Exception> {
-    #[repr(C, align(16))]
-    struct FpRun {
-        working: FxsaveArea,
-        host: FxsaveArea,
-        operand: [u8; 16],
+#[repr(C, align(16))]
+struct FpRun {
+    working: FxsaveArea,
+    host: FxsaveArea,
+    operand: [u8; 16],
+}
+
+type FpLeafFn = unsafe extern "sysv64" fn(*mut FpRun);
+struct FpLeaf {
+    _buffer: crate::cpu::JitCodeBuffer,
+    execute: FpLeafFn,
+}
+
+fn native_fp_bytes(insn: &Instruction) -> Result<Vec<u8>, String> {
+    let mut native = *insn;
+    if insn.op_kinds().any(|kind| kind == OpKind::Memory) {
+        native.set_segment_prefix(Register::None);
+        native.set_memory_base(Register::RAX);
+        native.set_memory_index(Register::None);
+        native.set_memory_index_scale(1);
+        native.set_memory_displacement64(0);
+        native.set_memory_displ_size(0);
     }
+    let mut encoder = iced_x86::Encoder::new(64);
+    encoder.encode(&native, 0).map_err(|e| e.to_string())?;
+    Ok(encoder.take_buffer())
+}
+
+fn fp_leaf_image(native: &[u8]) -> Vec<u8> {
+    // fxsave64 [rdi+512]; fxrstor64 [rdi]; lea rax,[rdi+1024]
+    let mut code = vec![
+        0x48, 0x0f, 0xae, 0x87, 0, 2, 0, 0, 0x48, 0x0f, 0xae, 0x0f, 0x48, 0x8d, 0x87, 0, 4, 0, 0,
+    ];
+    code.extend_from_slice(native);
+    // fxsave64 [rdi]; fxrstor64 [rdi+512]; ret
+    code.extend_from_slice(&[
+        0x48, 0x0f, 0xae, 0x07, 0x48, 0x0f, 0xae, 0x8f, 0, 2, 0, 0, 0xc3,
+    ]);
+    code
+}
+
+fn step_fp(
+    ctx: &mut SoftCpuContext,
+    insn: &Instruction,
+    ip: u64,
+    execute: FpLeafFn,
+) -> Result<(), X86Exception> {
     let mut run = FpRun {
         working: ctx.fxsave.clone(),
         host: FxsaveArea::default(),
@@ -697,7 +786,6 @@ fn step_fp(ctx: &mut SoftCpuContext, insn: &Instruction, ip: u64) -> Result<(), 
         masked &= !(1 << 15);
     }
     run.working.0[24..28].copy_from_slice(&masked.to_le_bytes());
-    let mut native = *insn;
     if (0..insn.op_count()).any(|i| insn.op_kind(i) == OpKind::Memory) {
         let va = compute_effective_va(insn, ctx);
         let size = insn.memory_size().size();
@@ -710,35 +798,9 @@ fn step_fp(ctx: &mut SoftCpuContext, insn: &Instruction, ip: u64) -> Result<(), 
                 std::ptr::copy_nonoverlapping(ptr, run.operand[off..].as_mut_ptr(), n);
             }
         })?;
-        native.set_segment_prefix(Register::None);
-        native.set_memory_base(Register::RAX);
-        native.set_memory_index(Register::None);
-        native.set_memory_index_scale(1);
-        native.set_memory_displacement64(0);
-        native.set_memory_displ_size(0);
     }
-    let mut encoder = iced_x86::Encoder::new(64);
-    encoder
-        .encode(&native, 0)
-        .map_err(|_| X86Exception::invalid_opcode(ip))?;
-    // fxsave64 [rdi+512]; fxrstor64 [rdi]; lea rax,[rdi+1024]
-    let mut code = vec![
-        0x48, 0x0f, 0xae, 0x87, 0, 2, 0, 0, 0x48, 0x0f, 0xae, 0x0f, 0x48, 0x8d, 0x87, 0, 4, 0, 0,
-    ];
-    code.extend_from_slice(&encoder.take_buffer());
-    // fxsave64 [rdi]; fxrstor64 [rdi+512]; ret
-    code.extend_from_slice(&[
-        0x48, 0x0f, 0xae, 0x07, 0x48, 0x0f, 0xae, 0x8f, 0, 2, 0, 0, 0xc3,
-    ]);
-    let mut jit = crate::cpu::JitCodeBuffer::new(code.len())
-        .ok_or_else(|| X86Exception::invalid_opcode(ip))?;
-    let entry = jit
-        .publish(&code)
-        .ok_or_else(|| X86Exception::invalid_opcode(ip))?;
-    // SAFETY: the generated leaf touches only aligned FpRun storage, runs one
-    // admitted SSE instruction with masked exceptions, and restores host FP state.
-    let execute: unsafe extern "sysv64" fn(*mut FpRun) =
-        unsafe { std::mem::transmute(entry as usize) };
+    // SAFETY: prepare_block admitted and published this immutable leaf for this
+    // exact instruction; it touches only aligned FpRun storage and restores host FP state.
     unsafe {
         execute(&mut run);
     }
@@ -1498,5 +1560,73 @@ mod tests {
         ] {
             assert_eq!(permissions(addr), "r-xp");
         }
+    }
+    struct NoMemory;
+    impl SoftMmuMemory for NoMemory {
+        fn placement(&self) -> &crate::mmu::LinearPlacement {
+            panic!("register-only fixture touched memory")
+        }
+        fn extents(&self) -> &crate::mmu::ExtentTable {
+            panic!("register-only fixture touched memory")
+        }
+        fn extents_mut(&mut self) -> &mut crate::mmu::ExtentTable {
+            panic!("register-only fixture touched memory")
+        }
+    }
+
+    fn fp_block() -> crate::block::PlannedBlock {
+        let ip = 0x400000;
+        let mut bytes = [0; 15];
+        bytes[..4].copy_from_slice(&[0xf3, 0x0f, 0x59, 0xc1]); // mulss xmm0,xmm1
+        crate::block::PlannedBlock {
+            start: ip,
+            end: ip + 4,
+            insns: vec![crate::decode::classify(&bytes[..4], ip).unwrap()],
+            insn_bytes: vec![bytes],
+            exit: crate::block::BlockExit::Syscall {
+                va: ip + 4,
+                resume: ip + 6,
+            },
+        }
+    }
+
+    #[test]
+    fn fp_leaf_allocation_is_once_across_repeated_blocks() {
+        let mut cpu = crate::SoftCpu::new().unwrap();
+        let planned = fp_block();
+        crate::cpu::JIT_ALLOCATIONS.with(|count| count.set(0));
+        for _ in 0..3 {
+            cpu.execute_planned_block(&planned, &mut NoMemory).unwrap();
+        }
+        crate::cpu::JIT_ALLOCATIONS.with(|count| assert_eq!(count.get(), 1));
+    }
+
+    fn fp_host_failure(publish: bool) {
+        let mut cpu = crate::SoftCpu::new().unwrap();
+        let planned = fp_block();
+        crate::cpu::FAIL_SMALL_JIT.with(|fault| fault.set(Some(publish)));
+        let result = cpu.execute_planned_block(&planned, &mut NoMemory);
+        assert_eq!(
+            result,
+            Err(crate::EmitError::HostJit {
+                va: planned.start,
+                stage: if publish {
+                    crate::JitStage::Publish
+                } else {
+                    crate::JitStage::Allocate
+                },
+            })
+        );
+        assert_eq!(cpu.context().pending_exception, None);
+    }
+
+    #[test]
+    fn fp_allocation_failure_is_a_host_error() {
+        fp_host_failure(false);
+    }
+
+    #[test]
+    fn fp_publication_failure_is_a_host_error() {
+        fp_host_failure(true);
     }
 }
