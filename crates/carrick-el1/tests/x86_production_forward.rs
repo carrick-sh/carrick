@@ -146,7 +146,9 @@ fn production_x86_family_absences_obey_eight_crossings_without_user_memory() {
             if work {
                 tasks[0].linux.mark_pending_host_work();
             } else {
-                tasks[0].linux.clear_pending_host_work();
+                if let Some(doorbell) = tasks[0].linux.take_host_work_doorbell() {
+                    doorbell.settled();
+                }
             }
             let call = decode_x86_64(native, args, 0x7fff_0000);
             assert_ne!(call.canonical.raw(), u64::MAX, "{family} must decode");
@@ -594,7 +596,11 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
     );
     // The exiting child still owns the work boundary here. The host must
     // consume its pending wake before the peer can inherit this CPU slot.
-    let delivered = peer_task.linux.pending_host_work.swap(0, Ordering::AcqRel) != 0;
+    let delivered = peer_task
+        .linux
+        .take_host_work_doorbell()
+        .map(|doorbell| doorbell.settled())
+        .is_some();
     assert!(
         delivered,
         "terminal fd release must reach the host work boundary"

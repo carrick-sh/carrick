@@ -732,9 +732,9 @@ impl PersistentExecutor for KvmPersistentExecutor {
                     let status = self.physical.service_physical_doorbell(
                         task,
                         &stopped.exit,
-                        |served, pending| {
+                        |served, doorbell| {
                             carrick_kernel::el1_delegation::settle_host_work_boundary(
-                                kernel, served, pending,
+                                kernel, served, doorbell,
                             );
                         },
                     )?;
@@ -1139,9 +1139,9 @@ impl PersistentExecutor for KvmPersistentExecutor {
                 let kernel = self.scheduler.kernel();
                 if let Some(status) =
                     self.physical
-                        .service_idle_peer_doorbell(&exit, |served, pending| {
+                        .service_idle_peer_doorbell(&exit, |served, doorbell| {
                             carrick_kernel::el1_delegation::settle_host_work_boundary(
-                                kernel, served, pending,
+                                kernel, served, doorbell,
                             );
                         })?
                 {

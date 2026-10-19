@@ -210,7 +210,9 @@ fn signal_delivery_waits_for_the_owned_completion_ledger() {
         CompletionRoute::Served,
         &state
     ));
-    state.clear_pending_host_work();
+    if let Some(doorbell) = state.take_host_work_doorbell() {
+        doorbell.settled();
+    }
     assert!(signal_delivery_before_work(CompletionRoute::Served, &state));
     assert!(!signal_delivery_before_work(
         CompletionRoute::Forward,

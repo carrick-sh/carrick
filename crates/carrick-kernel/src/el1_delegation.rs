@@ -51,23 +51,34 @@ pub fn settle_el1_boundary(
     kernel.settle_thread_ledger();
     let boundary = carrick_el1_abi::take_served_boundary(slot);
     let served = boundary.is_some();
-    let pending = carrick_el1_abi::take_pending_host_work(slot);
-    deliver_boundary_wakes(kernel, served, pending);
+    let doorbell = carrick_el1_abi::take_host_work_doorbell(slot);
+    deliver_boundary_wakes(kernel, served, doorbell);
     boundary
 }
 
 /// Service host work after the source boundary consumes its task's flags.
 /// Ledger publication precedes IPC, recall and inotify wake delivery. An
 /// owner that publishes more work while this runs marks a later boundary.
-pub fn settle_host_work_boundary(kernel: &crate::kernel::Kernel, served: bool, pending: bool) {
+pub fn settle_host_work_boundary(
+    kernel: &crate::kernel::Kernel,
+    served: bool,
+    doorbell: Option<carrick_el1_abi::HostWorkDoorbell>,
+) {
     kernel.settle_thread_ledger();
-    deliver_boundary_wakes(kernel, served, pending);
+    deliver_boundary_wakes(kernel, served, doorbell);
 }
 
 /// Publish wakes after the stopped carrier has consumed its exact task's
 /// completed-work and pending-work flags. Both ARM mailboxes and x86 CPL0
 /// work doorbells use this host side of the in-zone completion boundary.
-fn deliver_boundary_wakes(kernel: &crate::kernel::Kernel, served: bool, pending: bool) {
+/// The only consumer of a [`carrick_el1_abi::HostWorkDoorbell`]: the work
+/// it announces is settled here before the token is.
+fn deliver_boundary_wakes(
+    kernel: &crate::kernel::Kernel,
+    served: bool,
+    doorbell: Option<carrick_el1_abi::HostWorkDoorbell>,
+) {
+    let pending = doorbell.is_some();
     if served {
         crate::el1_inotify::deliver_owed_wakes();
     }
@@ -81,6 +92,9 @@ fn deliver_boundary_wakes(kernel: &crate::kernel::Kernel, served: bool, pending:
             crate::el1_zone::hand_back_completions_in(zone);
             owned_recall::notify(zone, carrick_sched_core::Waker::Host);
         }
+    }
+    if let Some(doorbell) = doorbell {
+        doorbell.settled();
     }
 }
 
@@ -98,8 +112,8 @@ pub fn settle_el1_boundary_for(
 /// receipt to distinguish a completed EL1 call from a host commit owed.
 pub fn settle_pending_host_work_for(slot: usize, dispatcher: &crate::dispatch::SyscallDispatcher) {
     let kernel = std::sync::Arc::clone(dispatcher.kernel_binding.read().kernel());
-    if carrick_el1_abi::take_pending_host_work(slot) {
-        settle_host_work_boundary(&kernel, false, true);
+    if let Some(doorbell) = carrick_el1_abi::take_host_work_doorbell(slot) {
+        settle_host_work_boundary(&kernel, false, Some(doorbell));
     }
 }
 
@@ -127,10 +141,9 @@ pub fn publish_current_task(
     }
     let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
     let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-    current_task
-        .linux
-        .pending_host_work
-        .store(0, Ordering::Relaxed);
+    // Binding never erases the host-work doorbell: it may announce a
+    // deferred zone completion or owed wake that only a settling boundary
+    // drains; the new task's next boundary settles it (#641).
     current_task
         .linux
         .served_with_work

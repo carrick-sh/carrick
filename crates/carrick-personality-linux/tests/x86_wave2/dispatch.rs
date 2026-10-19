@@ -241,7 +241,9 @@ fn test_dispatch_syscall_with_regions_exit_pending_work() {
     assert_eq!(action, Action::ServedWithWork);
 
     // Now test exit check: pending_host_work starts clear, then gets set during operation
-    tasks[0].linux.clear_pending_host_work();
+    if let Some(doorbell) = tasks[0].linux.take_host_work_doorbell() {
+        doorbell.settled();
+    }
     let mut frame2 = TrapFrame::default();
     frame2.x[0] = 3;
     frame2.x[1] = 50;
@@ -264,7 +266,9 @@ fn test_dispatch_syscall_with_regions_exit_pending_work() {
     assert_eq!(frame2.x[0], 50);
 
     // Exit check test: operation succeeds, but host marked pending work during the operation.
-    tasks[0].linux.clear_pending_host_work();
+    if let Some(doorbell) = tasks[0].linux.take_host_work_doorbell() {
+        doorbell.settled();
+    }
     tasks[0].linux.served_with_work.store(0, Ordering::Relaxed);
     let mut buf = [0u8; 16];
     let mut cache_mem = [0u8; 4096];

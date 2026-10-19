@@ -1404,6 +1404,27 @@ mod tests {
         /// while the record's thread stays blocked on its host wait forever.
         #[test]
         fn idle_boundary_doorbell_settles_deferred_completion_handback() {
+            deferred_completion_reaches_idle_boundary(|_| {});
+        }
+
+        /// #641 (second signed capture): binding a task to the slot between
+        /// the deferral and the idle boundary must not erase the doorbell
+        /// that announces the stranded completion.
+        #[test]
+        fn task_binding_keeps_deferred_completion_doorbell() {
+            deferred_completion_reaches_idle_boundary(|slot| {
+                crate::el1_delegation::publish_current_task(
+                    slot,
+                    carrick_el1_abi::El1TaskId::from_linux_tid(2),
+                    2_658,
+                    1,
+                    2,
+                    carrick_el1_abi::ContextGeneration::new(std::num::NonZeroU64::MIN),
+                );
+            });
+        }
+
+        fn deferred_completion_reaches_idle_boundary(between: impl FnOnce(usize)) {
             use carrick_sched_core::object_wait::{
                 ObjectWaitKey, OperationToken, OwnedObjectWakeEffects,
             };
@@ -1485,6 +1506,7 @@ mod tests {
             ));
             assert_eq!(zone.record(record).handback(), Some(Handback::Resumed));
             assert!(task.linux.has_pending_host_work());
+            between(SLOT);
             // The idle executor's boundary consumes the doorbell.
             let (kernel, _context) = crate::kernel::continuation::test_support::bootstrap(164_100);
             let _ = crate::el1_delegation::settle_el1_boundary(SLOT, &kernel);
