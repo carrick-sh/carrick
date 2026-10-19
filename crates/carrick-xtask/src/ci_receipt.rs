@@ -1054,15 +1054,75 @@ impl BaselineSelection {
     }
 }
 
+/// One monotonic budget for every ancestor and covered-range lookup.
+#[derive(Clone, Copy)]
+struct ReceiptWait {
+    deadline: Instant,
+    poll: Duration,
+    limit: Duration,
+}
+impl ReceiptWait {
+    fn new(limit: Duration, poll: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + limit,
+            poll: poll.max(Duration::from_secs(1)),
+            limit,
+        }
+    }
+    fn resolve(
+        &self,
+        lane: Lane,
+        sha: &str,
+        lookup: &mut impl FnMut(Lane, &str) -> Result<Baseline, ReceiptError>,
+    ) -> Result<Baseline, ReceiptError> {
+        loop {
+            match lookup(lane, sha)? {
+                Baseline::Pending if Instant::now() + self.poll <= self.deadline => {
+                    println!(
+                        "baseline candidate {sha} is in progress; waiting for its {} receipt",
+                        lane.name()
+                    );
+                    std::thread::sleep(self.poll);
+                }
+                Baseline::Pending => {
+                    return Err(ReceiptError::NoBaseline(format!(
+                        "baseline commit {sha} remains in progress after the {}-minute wait budget for {}. No regression comparison was made. Seed the current main tip with an owner dispatch: `gh workflow run kernel-runtime.yml --repo {REPOSITORY} --ref main` for subsequent pushes",
+                        self.limit.as_secs() / 60,
+                        lane.name()
+                    )));
+                }
+                terminal => return Ok(terminal),
+            }
+        }
+    }
+}
+
 /// Resolve from the push event's old tip, never from HEAD^1. Receipt lookup
-/// uses the existing trusted run predicate; absence/pending means no receipt
-/// at this observation. The search inspects at most 50 first-parent commits.
+/// waits for Pending runs before deciding absence. The search inspects at most
+/// 50 first-parent commits and shares one bounded wait across all lookups.
 pub fn select_baseline(
     root: &Path,
     lane: Lane,
     before: &str,
     pushed: &str,
+    lookup: impl FnMut(Lane, &str) -> Result<Baseline, ReceiptError>,
+) -> Result<BaselineSelection, ReceiptError> {
+    select_baseline_waiting(
+        root,
+        lane,
+        before,
+        pushed,
+        lookup,
+        ReceiptWait::new(Duration::from_secs(90 * 60), Duration::from_secs(60)),
+    )
+}
+fn select_baseline_waiting(
+    root: &Path,
+    lane: Lane,
+    before: &str,
+    pushed: &str,
     mut lookup: impl FnMut(Lane, &str) -> Result<Baseline, ReceiptError>,
+    wait: ReceiptWait,
 ) -> Result<BaselineSelection, ReceiptError> {
     for sha in [before, pushed] {
         validate_sha(sha).map_err(|e| ReceiptError::InvalidPushHistory(e.to_string()))?;
@@ -1092,7 +1152,7 @@ pub fn select_baseline(
         if let Some(found) = observed.get(sha) {
             return Ok(*found);
         }
-        let found = matches!(lookup(lane, sha)?, Baseline::Found(_, _));
+        let found = matches!(wait.resolve(lane, sha, &mut lookup)?, Baseline::Found(_, _));
         observed.insert(sha.to_owned(), found);
         Ok(found)
     };
@@ -1169,28 +1229,17 @@ fn download_baseline(
     wait: Duration,
     poll: Duration,
 ) -> Result<(PathBuf, String), ReceiptError> {
-    let deadline = Instant::now() + wait;
-    let (run_id, name) = loop {
-        match query_baseline(lane, sha)? {
-            Baseline::Found(run, name) => break (run, name),
-            Baseline::Pending if Instant::now() + poll <= deadline => {
-                println!("selected baseline {sha} run in progress; waiting for its receipt");
-                std::thread::sleep(poll);
-            }
-            decision => {
-                let reason = if decision == Baseline::Pending {
-                    format!("did not publish within {} minutes", wait.as_secs() / 60)
-                } else {
-                    "has no trusted receipt".into()
-                };
-                return Err(ReceiptError::NoBaseline(format!(
-                    "selected baseline commit {sha} {reason} for {}. No regression comparison was made. \
-                     Seed the current main tip with an owner dispatch: \
-                     `gh workflow run kernel-runtime.yml --repo {REPOSITORY} --ref main`; \
-                     subsequent pushes compare against that receipt.",
-                    lane.name()
-                )));
-            }
+    let (run_id, name) = match ReceiptWait::new(wait, poll).resolve(
+        lane,
+        sha,
+        &mut query_baseline,
+    )? {
+        Baseline::Found(run, name) => (run, name),
+        _ => {
+            return Err(ReceiptError::NoBaseline(format!(
+                "selected baseline commit {sha} has no trusted {} receipt. No regression comparison was made. Seed the current main tip with an owner dispatch: `gh workflow run kernel-runtime.yml --repo {REPOSITORY} --ref main`; subsequent pushes compare against that receipt.",
+                lane.name()
+            )));
         }
     };
     // Persistent runner workspaces: never read a previous job's download.
@@ -1357,6 +1406,11 @@ pub enum ReceiptAction {
         candidate_sha: String,
         #[arg(long, default_value = ".")]
         history_dir: PathBuf,
+        /// One shared upper bound for all pending ancestor receipts.
+        #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u64).range(0..=90))]
+        wait_minutes: u64,
+        #[arg(long, default_value_t = 60)]
+        poll_seconds: u64,
     },
     /// Fetch the selected BASE-SHA receipt, compare CANDIDATE and fail on NEW.
     /// The workflow runs this command from that baseline's clean checkout.
@@ -1445,13 +1499,19 @@ pub fn run(args: ReceiptArgs) -> Result<(), ReceiptError> {
             before_sha,
             candidate_sha,
             history_dir,
+            wait_minutes,
+            poll_seconds,
         } => {
-            let selected = select_baseline(
+            let selected = select_baseline_waiting(
                 &history_dir,
                 lane,
                 &before_sha,
                 &candidate_sha,
                 query_baseline,
+                ReceiptWait::new(
+                    Duration::from_secs(wait_minutes * 60),
+                    Duration::from_secs(poll_seconds),
+                ),
             );
             match selected {
                 Ok(selected) => {

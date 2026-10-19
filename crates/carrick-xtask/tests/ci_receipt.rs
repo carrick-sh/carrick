@@ -443,7 +443,7 @@ else:
                     "{stdout}"
                 );
                 assert!(
-                    stderr.contains("no baseline: selected baseline commit"),
+                    stderr.contains("no baseline:") && stderr.contains(&main),
                     "{stderr}"
                 );
                 assert!(
@@ -1728,22 +1728,6 @@ mod ancestor_selection {
         let selected = h.select(&h.commits[6], &[1, 3]).unwrap();
         assert_eq!(selected.baseline_sha, h.commits[3]);
         assert_eq!(selected.covered_as_range, h.commits[4..7]);
-        // In-progress runs without a receipt do not block an older usable baseline.
-        let selected = select_baseline(
-            h.dir.path(),
-            Lane::Kvm,
-            &h.commits[6],
-            &h.commits[7],
-            |_, sha| {
-                Ok(if sha == h.commits[3] {
-                    Baseline::Found(3, "receipt".into())
-                } else {
-                    Baseline::Pending
-                })
-            },
-        )
-        .unwrap();
-        assert_eq!(selected.baseline_sha, h.commits[3]);
     }
     #[test]
     fn serial_host_zero_and_force_push_before_fail_before_receipt_lookup() {
@@ -1806,24 +1790,45 @@ mod ancestor_selection {
         before: &str,
         records: &[serde_json::Value],
     ) -> (std::process::Output, String, String) {
+        invoke_selector_wait(h, lane, before, records, 90)
+    }
+    fn invoke_selector_wait(
+        h: &History,
+        lane: &str,
+        before: &str,
+        records: &[serde_json::Value],
+        wait_minutes: u64,
+    ) -> (std::process::Output, String, String) {
         use std::os::unix::fs::PermissionsExt;
         let fixture = h.dir.path().join("api.json");
         std::fs::write(&fixture, serde_json::to_vec(records).unwrap()).unwrap();
+        std::fs::write(fixture.with_extension("state"), "{}").unwrap();
         let bin = h.dir.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let gh = bin.join("gh");
         std::fs::write(
             &gh,
             r#"#!/usr/bin/env python3
-import json, os, sys
-rows=json.load(open(os.environ['RECEIPT_API_FIXTURE']))
+import json, os, pathlib, sys
+fixture=pathlib.Path(os.environ['RECEIPT_API_FIXTURE'])
+rows=json.loads(fixture.read_text())
+statefile=fixture.with_suffix('.state')
+state=json.loads(statefile.read_text()) if statefile.exists() else {}
+def observed(row, index):
+    sequence=row.get('observations')
+    return dict(row, **sequence[min(index,len(sequence)-1)]) if sequence else row
 endpoint=sys.argv[-1]
 if '/runs?head_sha=' in endpoint:
     sha=endpoint.split('head_sha=')[1].split('&')[0]
-    print(json.dumps({'workflow_runs':[r for r in rows if r['head_sha']==sha]}))
+    index=state.get(sha,0)
+    state[sha]=index+1
+    statefile.write_text(json.dumps(state))
+    print(json.dumps({'workflow_runs':[observed(r,index) for r in rows if r['head_sha']==sha]}))
 elif '/artifacts?' in endpoint:
     rid=int(endpoint.split('/runs/')[1].split('/')[0])
-    print(json.dumps({'artifacts':next(r['artifacts'] for r in rows if r['id']==rid)}))
+    row=next(r for r in rows if r['id']==rid)
+    row=observed(row,max(0,state.get(row['head_sha'],1)-1))
+    print(json.dumps({'artifacts':row['artifacts']}))
 else:
     raise SystemExit('unexpected gh request')
 "#,
@@ -1844,6 +1849,12 @@ else:
                 before,
                 "--candidate-sha",
                 h.commits.last().unwrap(),
+            ])
+            .args([
+                "--wait-minutes",
+                &wait_minutes.to_string(),
+                "--poll-seconds",
+                "0",
             ])
             .arg("--history-dir")
             .arg(h.dir.path())
@@ -1929,5 +1940,91 @@ else:
             assert!(outputs.is_empty(), "{outputs}");
             assert!(!stdout.contains("NEW"), "{stdout}");
         }
+    }
+    fn pending_then(h: &History, index: usize, publish: bool) -> serde_json::Value {
+        let mut row = recorded(h, index);
+        let final_artifacts = if publish {
+            row["artifacts"].clone()
+        } else {
+            serde_json::json!([])
+        };
+        row["observations"] = serde_json::json!([
+            {"status":"in_progress","artifacts":[]},
+            {"status":"completed","artifacts":final_artifacts}]);
+        row
+    }
+    #[test]
+    fn serial_host_pending_nearest_ancestor_is_awaited_and_used_when_it_publishes() {
+        let h = History::new(5);
+        let (out, summary, outputs) = invoke_selector(
+            &h,
+            "hvf",
+            &h.commits[3],
+            &[recorded(&h, 1), pending_then(&h, 3, true)],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            outputs.contains(&format!("sha={}\nreuse=true", h.commits[3])),
+            "{outputs}"
+        );
+        assert!(
+            !summary.contains(&format!("- `{}`", h.commits[3])),
+            "{summary}"
+        );
+        let state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(h.dir.path().join("api.state")).unwrap())
+                .unwrap();
+        assert_eq!(state[&h.commits[3]], 2);
+        assert!(
+            state.get(&h.commits[1]).is_none(),
+            "do not skip the pending ancestor"
+        );
+    }
+    #[test]
+    fn serial_host_pending_ancestor_is_uncovered_only_after_finishing_without_receipt() {
+        let h = History::new(5);
+        let (out, summary, outputs) = invoke_selector(
+            &h,
+            "kvm",
+            &h.commits[3],
+            &[recorded(&h, 1), pending_then(&h, 3, false)],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(h.dir.path().join("api.state")).unwrap())
+                .unwrap();
+        assert_eq!(
+            state[&h.commits[3]], 2,
+            "must observe completion before declaring a gap"
+        );
+        assert!(outputs.contains(&format!("sha={}", h.commits[1])));
+        assert!(summary.contains(&format!("- `{}`", h.commits[3])));
+    }
+    #[test]
+    fn serial_host_pending_ancestor_timeout_fails_without_falling_back_or_claiming_coverage() {
+        let h = History::new(5);
+        let mut pending = recorded(&h, 3);
+        pending["status"] = "in_progress".into();
+        pending["artifacts"] = serde_json::json!([]);
+        let (out, summary, outputs) =
+            invoke_selector_wait(&h, "hvf", &h.commits[3], &[recorded(&h, 1), pending], 0);
+        assert!(!out.status.success());
+        assert!(summary.contains("## No baseline"), "{summary}");
+        assert!(summary.contains(&h.commits[3]));
+        assert!(!summary.contains("covered as a range"));
+        assert!(outputs.is_empty());
+        let state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(h.dir.path().join("api.state")).unwrap())
+                .unwrap();
+        assert_eq!(state[&h.commits[3]], 1);
+        assert!(state.get(&h.commits[1]).is_none());
     }
 }
