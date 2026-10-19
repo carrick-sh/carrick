@@ -424,3 +424,69 @@ fn time_and_resource_records_wait_for_an_owner_refused_copyout() {
         );
     }
 }
+
+/// A guest-sized getdents64 `count` (u32::MAX) over a listing larger than one
+/// owner permit must return a batch on both venues, never reach the permit
+/// bound's fatal: the legacy venue has no permit bound, and the owner venue
+/// returns a short batch.
+fn getdents_with_huge_count<M: carrick_guest_mem::CurrentMmMemory>(memory: &mut M) -> usize {
+    let mut dispatcher = SyscallDispatcher::new();
+    let reporter = CompatReporter::default();
+    let mut call = |dispatcher: &mut SyscallDispatcher, memory: &mut M, number: u64, args| {
+        let context = dispatcher.capture_one_task_context().unwrap();
+        match dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(number, SyscallArgs::from(args)),
+                memory,
+                &reporter,
+            )
+            .expect("dispatch")
+        {
+            DispatchOutcome::Returned { value } => value,
+            other => panic!("syscall {number}: {other:?}"),
+        }
+    };
+    // 400 pipes list 800+ `/proc/self/fd` entries: well over one 4 KiB permit.
+    for _ in 0..400 {
+        assert_eq!(
+            call(
+                &mut dispatcher,
+                memory,
+                nr::PIPE2.raw(),
+                [OUT2, 0, 0, 0, 0, 0]
+            ),
+            0
+        );
+    }
+    memory.write_bytes(PATH, b"/proc/self/fd\0").unwrap();
+    let dir = call(
+        &mut dispatcher,
+        memory,
+        nr::OPENAT.raw(),
+        [LINUX_AT_FDCWD, PATH, LINUX_O_DIRECTORY, 0, 0, 0],
+    );
+    let returned = call(
+        &mut dispatcher,
+        memory,
+        nr::GETDENTS64.raw(),
+        [dir as u64, BASE, u64::from(u32::MAX), 0, 0, 0],
+    );
+    usize::try_from(returned).unwrap()
+}
+
+#[test]
+fn getdents64_with_a_guest_sized_count_never_reaches_the_permit_fatal() {
+    let mut legacy = LinearMemory::new(BASE, vec![0; 0x10_0000]);
+    let legacy_batch = getdents_with_huge_count(&mut legacy);
+    assert!(
+        legacy_batch > super::copyout::COPYOUT_MAX_BYTES,
+        "legacy keeps the caller's length: {legacy_batch}"
+    );
+    let mut owner = OwnerRefusingMemory::new(BASE, 0x10_0000, 0);
+    let owner_batch = getdents_with_huge_count(&mut owner);
+    assert!(
+        owner_batch > 0 && owner_batch <= super::copyout::COPYOUT_MAX_BYTES,
+        "owner returns a short batch: {owner_batch}"
+    );
+}

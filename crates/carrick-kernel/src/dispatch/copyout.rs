@@ -141,23 +141,28 @@ pub(crate) fn prepare<M: CurrentMmMemory, const N: usize>(
     slots: [Option<UserSlot>; N],
 ) -> Result<PreparedCopyout<'_, M, N>, CopyoutRefusal> {
     let slots = slots.map(|slot| slot.filter(|slot| slot.capacity > 0));
-    let total = slots
-        .iter()
-        .flatten()
-        .try_fold(0usize, |total, slot| total.checked_add(slot.capacity));
-    if total.is_none_or(|total| total > COPYOUT_MAX_BYTES) {
-        // Capacities come from fixed records or `bounded_capacity`; a larger
-        // permit would be refused as a Limit after the source was chosen.
-        carrick_fatal!(
-            "dispatch::copyout",
-            "copyout exceeds one prepared permit: {total:?} bytes"
-        );
-    }
+    // The legacy venue has no permit and prepares nothing: a guest-sized
+    // output (a getdents64 batch under a huge `count`) commits exactly as
+    // the direct write it replaces and never meets the owner bound below.
     if memory.user_memory_venue() == UserMemoryVenue::Legacy {
         return Ok(PreparedCopyout {
             slots,
             venue: Venue::Legacy(memory),
         });
+    }
+    let total = slots
+        .iter()
+        .flatten()
+        .try_fold(0usize, |total, slot| total.checked_add(slot.capacity));
+    if total.is_none_or(|total| total > COPYOUT_MAX_BYTES) {
+        // Owner capacities are fixed records (checked at compile time),
+        // carrick-sized values, or `bounded_capacity` results, so no guest
+        // length reaches this; a larger permit would be refused as a Limit
+        // after the source was chosen.
+        carrick_fatal!(
+            "dispatch::copyout",
+            "owner copyout exceeds one prepared permit: {total:?} bytes"
+        );
     }
     let mut ranges = [GuestWriteRange::new(GuestVa::new(0), 0).unwrap_or_else(|| {
         carrick_fatal!("dispatch::copyout", "empty write range is unrepresentable")
