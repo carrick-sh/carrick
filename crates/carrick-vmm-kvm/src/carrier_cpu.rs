@@ -174,7 +174,6 @@ impl KvmCarrierCpu {
         vm: crate::KvmVm,
         layout: BringupLayout,
         production_run: crate::cpl0_boot::ProductionRunContext,
-        root_binding: carrick_hal::guest_arch_binding::GuestArchBinding,
         child_bindings: CarrierChildBindings,
     ) -> Result<CarrierCpu<KvmCpuIo>, TrapError> {
         let static_state = ProductionCpuStatic {
@@ -203,7 +202,6 @@ impl KvmCarrierCpu {
                 production_run: Some(production_run),
                 production_static: Some(static_state),
             }),
-            root_binding,
             child_bindings,
             Some(maintenance_root),
         )

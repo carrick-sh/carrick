@@ -780,7 +780,6 @@ impl Cpl0Carrier {
             crate::KvmVm::from_shared_vm(shared_vm.clone()),
             LAYOUT,
             runs[0].clone(),
-            binding,
             children.clone(),
         )?;
         let second = KvmCarrierCpu::from_production(
@@ -788,7 +787,6 @@ impl Cpl0Carrier {
             crate::KvmVm::from_shared_vm(shared_vm),
             LAYOUT,
             runs[1].clone(),
-            binding,
             children,
         )?;
         Ok(ProductionWorkerParts::new(

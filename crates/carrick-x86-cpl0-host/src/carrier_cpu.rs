@@ -292,18 +292,23 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
         })
     }
 
-    /// A production worker CPU. `root_binding` is the issued root task, which
-    /// the idle peer may find stopped in a forward without a loaded lease.
     pub fn new_with_maintenance(
         io: I,
-        root_binding: GuestArchBinding,
         child_bindings: CarrierChildBindings,
         maintenance_root: Option<RootGpa>,
     ) -> Result<Self, TrapError> {
         let mut cpu = Self::new_with_children(io, child_bindings)?;
-        cpu.root_binding = Some(root_binding);
         cpu.maintenance_root = maintenance_root;
         Ok(cpu)
+    }
+
+    /// Record the issued root task, which the idle peer may find stopped in a
+    /// forward without a loaded lease. Only `ProductionWorkerParts::new`
+    /// calls this, with its own root state's binding, so the binding that
+    /// authenticates forwards cannot diverge from the root task handed to the
+    /// executor.
+    pub(crate) fn bind_root(&mut self, binding: GuestArchBinding) {
+        self.root_binding = Some(binding);
     }
 
     pub fn physical_slot(&self) -> Option<carrick_guest_arch::CpuId> {
@@ -1153,6 +1158,25 @@ mod tests {
             "unexpected error: {err:?}"
         );
         assert!(matches!(cpu.custody, Custody::Poisoned));
+    }
+    #[test]
+    fn idle_root_binding_resolves_only_after_the_worker_binds_it() {
+        let root = context(2);
+        let root_gpa = root.binding().context().root;
+        let mut cpu = CarrierCpu::new(TestIo {
+            image: context(1).hardware_image(),
+        })
+        .unwrap();
+        let err = cpu.registered_task_binding(root_gpa).unwrap_err();
+        assert!(
+            err.to_string().contains("unregistered forward CR3"),
+            "{err:?}"
+        );
+        cpu.bind_root(root.binding());
+        assert_eq!(
+            cpu.registered_task_binding(root_gpa).unwrap(),
+            root.binding()
+        );
     }
     #[test]
     fn unregistered_forward_cr3_refuses_with_typed_error() {
