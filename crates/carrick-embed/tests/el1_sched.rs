@@ -4300,6 +4300,11 @@ fn el1_sched_deferred_handback_capture_observes_guest_records() {
     assert!(result.success(), "{}", result.stdout_utf8());
     assert!(result.stdout_utf8().contains("sock-pingpong iters=2000"));
     assert!(result.stdout_utf8().contains("stepper ok"));
+    for line in result.stdout_utf8().lines() {
+        if line.contains("sched_setaffinity") {
+            println!("{line}");
+        }
+    }
     let batches = capture.batches.lock().unwrap();
     println!("deferred handback capture: outcome={outcome:?} batches={batches:?}");
     let HoldOutcome::ReleasedAtStepAway { record, .. } = outcome else {
