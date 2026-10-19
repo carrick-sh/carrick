@@ -3663,6 +3663,148 @@ mod tests {
         );
     }
 
+    /// #695 control at 4559f21b0: 3 of 20 signed runs of
+    /// `sock-pingpong-stepper` got `socketpair` EFAULT on the main thread's
+    /// valid stack array while a sibling thread of the same MM ran
+    /// host-served socket operations. An admitted EL1 owner may refuse a host
+    /// copyout transiently: its editor is busy with a sibling's edit
+    /// (`PortalWaitCause::Editor`), or the page needs physical supply. Such a
+    /// refusal asks the runtime to park on the owner's wait and retry the
+    /// saved syscall. `socketpair` wrote its result with `write_bytes` after
+    /// creating and installing both ends, so every such refusal became a
+    /// guest-visible EFAULT. It must prepare its output before creating
+    /// anything, report the wait, and install nothing until the retry.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn socketpair_waits_for_an_owner_refused_copyout_instead_of_efault() {
+        use crate::dispatch::{SyscallArgs, SyscallRequest};
+        use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+        use carrick_guest_mem::{
+            CurrentMmMemory, GuestMemory, GuestWriteRange, MemoryError, MemoryPrepareError,
+            PreparedGuestWrite, UserMemoryVenue,
+        };
+        use std::num::NonZeroU64;
+        use std::sync::{Arc, Mutex};
+
+        const SYS_SOCKETPAIR: u64 = 199;
+        const BASE: u64 = 0x1_0000;
+
+        /// An admitted owner as `Aarch64EngineCore` presents it: every user
+        /// write goes through one prepared permit, and a refused permit is
+        /// a retryable `MemoryError`, never a fault.
+        struct OwnerMemory {
+            bytes: Arc<Mutex<Vec<u8>>>,
+            refuse: Option<PortalOwnerWait>,
+        }
+        struct Permit {
+            bytes: Arc<Mutex<Vec<u8>>>,
+            offset: usize,
+            capacity: usize,
+        }
+        impl PreparedGuestWrite for Permit {
+            fn commit(self: Box<Self>, outputs: &[&[u8]]) {
+                assert_eq!(outputs.len(), 1);
+                assert!(outputs[0].len() <= self.capacity);
+                self.bytes.lock().unwrap()[self.offset..self.offset + outputs[0].len()]
+                    .copy_from_slice(outputs[0]);
+            }
+        }
+        impl GuestMemory for OwnerMemory {
+            fn user_memory_venue(&self) -> UserMemoryVenue {
+                UserMemoryVenue::Owner
+            }
+            fn prepare_write(
+                &mut self,
+                ranges: &[GuestWriteRange],
+            ) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
+                assert_eq!(ranges.len(), 1);
+                if let Some(wait) = self.refuse.take() {
+                    return Err(MemoryPrepareError::OwnerWait(wait));
+                }
+                Ok(Box::new(Permit {
+                    bytes: Arc::clone(&self.bytes),
+                    offset: (ranges[0].address().raw() - BASE) as usize,
+                    capacity: ranges[0].len(),
+                }))
+            }
+            fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+                let offset = (address - BASE) as usize;
+                Ok(self.bytes.lock().unwrap()[offset..offset + length].to_vec())
+            }
+            fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+                let range = GuestWriteRange::new(carrick_guest_mem::GuestVa(address), bytes.len())
+                    .ok_or(MemoryError::OutOfBounds {
+                        address,
+                        length: bytes.len(),
+                    })?;
+                match self.prepare_write(&[range]) {
+                    Ok(permit) => {
+                        permit.commit(&[bytes]);
+                        Ok(())
+                    }
+                    Err(MemoryPrepareError::OwnerWait(wait)) => Err(MemoryError::OwnerWait(wait)),
+                    Err(_) => Err(MemoryError::OutOfBounds {
+                        address,
+                        length: bytes.len(),
+                    }),
+                }
+            }
+        }
+        impl CurrentMmMemory for OwnerMemory {}
+
+        // SAFETY: the mock models the exact admitted owner whose editor a
+        // sibling's edit holds at this revision.
+        let wait = unsafe {
+            PortalOwnerWait::from_owner(
+                El1MmHandle::from_admitted_owner(
+                    NonZeroU64::new(1).unwrap(),
+                    ReservationMm::new(2).unwrap(),
+                    NonZeroU64::new(3).unwrap(),
+                ),
+                PortalWaitCause::Editor,
+                7,
+            )
+        };
+        let reporter = CompatReporter::default();
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = OwnerMemory {
+            bytes: Arc::new(Mutex::new(vec![0xa5; 0x1000])),
+            refuse: Some(wait),
+        };
+        let sv = BASE + 0x100;
+        let request = || {
+            SyscallRequest::new(
+                SYS_SOCKETPAIR,
+                SyscallArgs::from([LINUX_AF_UNIX as u64, LINUX_SOCK_STREAM as u64, 0, sv, 0, 0]),
+            )
+        };
+        let context = dispatcher.capture_one_task_context().unwrap();
+        let refused = dispatcher
+            .dispatch(&context, request(), &mut memory, &reporter)
+            .expect("socketpair dispatch");
+        assert_eq!(
+            refused,
+            DispatchOutcome::OwnerMemoryWait { wait, committed: 0 },
+            "a transient owner refusal is a wait, not EFAULT",
+        );
+        assert!(
+            dispatcher.host_fd_for_poll(3).is_none() && dispatcher.host_fd_for_poll(4).is_none(),
+            "nothing is installed before the output is prepared",
+        );
+        assert_eq!(memory.read_bytes(sv, 8).unwrap(), [0xa5; 8]);
+
+        // The runtime retries the saved syscall once the owner's wait wakes.
+        let retried = dispatcher
+            .dispatch(&context, request(), &mut memory, &reporter)
+            .expect("socketpair retry");
+        assert_eq!(retried, DispatchOutcome::Returned { value: 0 });
+        let pair = memory.read_bytes(sv, 8).unwrap();
+        for chunk in pair.chunks_exact(4) {
+            let guest_fd = i32::from_ne_bytes(chunk.try_into().unwrap());
+            assert!(dispatcher.host_fd_for_poll(guest_fd).is_some());
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn host_socket_install_forces_host_nonblocking_even_for_blocking_guest_fd() {
