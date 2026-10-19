@@ -1537,7 +1537,7 @@ path = "crates/carrick-softmmu/src/retirement.rs"
 contracts = ["softmmu.x86.physical-retirement"]
 
 [[surfaces]]
-path = "crates/carrick-softmmu/src/retirement/tests.rs"
+path = "crates/carrick-softmmu/test-support/retirement_unit.rs"
 contracts = ["softmmu.x86.physical-retirement"]
 
 [[surfaces]]

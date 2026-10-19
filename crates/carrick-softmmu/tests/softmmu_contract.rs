@@ -82,13 +82,26 @@ fn root_gpa(raw: u64) -> RootGpa {
     RootGpa::page_aligned(FrameGpa::new(raw)).expect("4 KiB-aligned root GPA")
 }
 
-#[derive(Clone)]
 struct VecGuestMemory {
     backing: Arc<Vec<AtomicU64>>,
     aligned_word_offset: usize,
     placement: LinearPlacement,
     extents: ExtentTable,
     descriptor_loads: Arc<AtomicU64>,
+}
+
+/// Copies share the backing; each gets an independent record copy in its
+/// own invalidation domain (`ExtentTable` has no `Clone`).
+impl Clone for VecGuestMemory {
+    fn clone(&self) -> Self {
+        Self {
+            backing: Arc::clone(&self.backing),
+            aligned_word_offset: self.aligned_word_offset,
+            placement: self.placement.clone(),
+            extents: self.extents.try_clone().expect("no retirement pending"),
+            descriptor_loads: Arc::clone(&self.descriptor_loads),
+        }
+    }
 }
 
 impl VecGuestMemory {

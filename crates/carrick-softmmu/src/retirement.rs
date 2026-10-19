@@ -442,4 +442,5 @@ pub(crate) enum CommitRefused {
 }
 
 #[cfg(test)]
+#[path = "../test-support/retirement_unit.rs"]
 mod tests;

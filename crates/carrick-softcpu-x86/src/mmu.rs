@@ -92,7 +92,18 @@ impl SoftPageFault {
     }
 }
 
-use crate::context::SoftCpuContext;
+use crate::context::{HostAccess, SoftCpuContext};
+
+/// Admit `ctx` for a host-side access through `mem`, failing closed (a
+/// fault with no TLB use) when the CPU is not seated in `mem`'s inventory.
+fn admit<M: SoftMmuMemory>(
+    ctx: &mut SoftCpuContext,
+    mem: &M,
+    va: u64,
+) -> Result<HostAccess, SoftPageFault> {
+    ctx.admit_host_access(mem.extents())
+        .map_err(|_| SoftPageFault::new(va, 0))
+}
 
 /// Walk `va` through `ctx.walker` and `mem`, filling `ctx.tlb` and returning the host byte pointer
 /// and authenticated [`AuthenticatedGpa`] of the resolved 4 KiB frame.
@@ -106,15 +117,16 @@ pub fn translate_with_frame<M: SoftMmuMemory>(
     va: u64,
     kind: SoftAccessKind,
 ) -> Result<(*mut u8, AuthenticatedGpa), SoftPageFault> {
-    let admission = ctx.admit_host_access();
-    let result = walk_with_frame(ctx, mem, va, kind);
-    ctx.release_host_access(admission);
+    let access = admit(ctx, mem, va)?;
+    let result = walk_with_frame(ctx, mem, &access, va, kind);
+    ctx.release_host_access(access);
     result
 }
 
 fn walk_with_frame<M: SoftMmuMemory>(
     ctx: &mut SoftCpuContext,
     mem: &mut M,
+    _admitted: &HostAccess,
     va: u64,
     kind: SoftAccessKind,
 ) -> Result<(*mut u8, AuthenticatedGpa), SoftPageFault> {
@@ -155,22 +167,23 @@ pub fn translate_va<M: SoftMmuMemory>(
     va: u64,
     kind: SoftAccessKind,
 ) -> Result<*mut u8, SoftPageFault> {
-    let admission = ctx.admit_host_access();
-    let result = probe_or_walk(ctx, mem, va, kind);
-    ctx.release_host_access(admission);
+    let access = admit(ctx, mem, va)?;
+    let result = probe_or_walk(ctx, mem, &access, va, kind);
+    ctx.release_host_access(access);
     result
 }
 
 fn probe_or_walk<M: SoftMmuMemory>(
     ctx: &mut SoftCpuContext,
     mem: &mut M,
+    admitted: &HostAccess,
     va: u64,
     kind: SoftAccessKind,
 ) -> Result<*mut u8, SoftPageFault> {
     if let Some(host_addr) = ctx.tlb.probe(GuestVa::new(va), 1, kind, ctx.access_mode()) {
         return Ok(host_addr as *mut u8);
     }
-    walk_with_frame(ctx, mem, va, kind).map(|(ptr, _)| ptr)
+    walk_with_frame(ctx, mem, admitted, va, kind).map(|(ptr, _)| ptr)
 }
 
 /// Read `dst.len()` bytes starting at guest `va`, pre-validating all spanned pages.
@@ -211,15 +224,16 @@ fn walk_span<M: SoftMmuMemory>(
     kind: SoftAccessKind,
     commit: impl FnMut(usize, *mut u8, usize),
 ) -> Result<(), SoftPageFault> {
-    let admission = ctx.admit_host_access();
-    let result = walk_span_admitted(ctx, mem, va, len, kind, commit);
-    ctx.release_host_access(admission);
+    let access = admit(ctx, mem, va)?;
+    let result = walk_span_admitted(ctx, mem, &access, va, len, kind, commit);
+    ctx.release_host_access(access);
     result
 }
 
 fn walk_span_admitted<M: SoftMmuMemory>(
     ctx: &mut SoftCpuContext,
     mem: &mut M,
+    admitted: &HostAccess,
     va: u64,
     len: usize,
     kind: SoftAccessKind,
@@ -230,7 +244,7 @@ fn walk_span_admitted<M: SoftMmuMemory>(
         while off < len {
             let chunk =
                 (len - off).min((SOFT_TLB_PAGE_SIZE - (cur & SOFT_TLB_OFFSET_MASK)) as usize);
-            let ptr = probe_or_walk(ctx, mem, cur, kind)?;
+            let ptr = probe_or_walk(ctx, mem, admitted, cur, kind)?;
             if pass {
                 commit(off, ptr, chunk);
             }

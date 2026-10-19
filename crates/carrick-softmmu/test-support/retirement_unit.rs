@@ -580,3 +580,22 @@ fn retirement_is_linear_in_peers_and_block_entry_is_rmw_free() {
     )
     .expect("structural budgets hold");
 }
+
+#[test]
+fn a_copy_cannot_reuse_an_identity_whose_retirement_is_pending() {
+    let mut table = table_with_extent();
+    let Retirement { pending, .. } = table.remove(FrameGpa::new(EXTENT), None).unwrap().unwrap();
+    // A copy would forget the pending identities: refused outright.
+    assert_eq!(
+        table.try_clone().map(|_| ()),
+        Err(crate::walker::ExtentCloneError::Pending)
+    );
+    let completion = pending.try_complete().expect("no CPU seated");
+    table.reclaim(&completion);
+    let copy = table.try_clone().expect("nothing pending");
+    // The copy is its own domain: a CPU seated here is not its member.
+    let mut tlb = SoftTlb::new();
+    let seat = table.register_vcpu(&mut tlb).unwrap();
+    assert!(table.is_member(&seat));
+    assert!(!copy.is_member(&seat));
+}

@@ -11,7 +11,7 @@ use carrick_softcpu_x86::{
     OwnerGeneration, PF_ERR_INSTR, PF_ERR_PRESENT, PF_ERR_USER, PF_ERR_WRITE, RootGpa,
     SOFT_TLB_OFFSET_MASK, SOFT_TLB_PAGE_MASK, SOFT_TLB_PAGE_SIZE, SensitiveOp, SoftAccessKind,
     SoftCpu, SoftCpuExit, SoftMmuMemory, X86Exception, X86ExceptionVector, read_guest_bytes, reg,
-    translate_va, translate_with_frame,
+    translate_va, translate_with_frame, write_guest_bytes,
 };
 use goblin::elf::Elf;
 use goblin::elf::program_header::{PF_W, PF_X, PT_LOAD};
@@ -549,6 +549,59 @@ fn host_translate_va_after_completion_misses_on_a_parked_cpu() {
             SoftAccessKind::Read,
         )
         .is_err()
+    );
+}
+
+/// A CPU seated in inventory A, holding cached translations, gets nothing
+/// through a memory of inventory B on any TLB-using path: B's retirements
+/// would never reach its TLB, so every path fails closed before probing.
+#[test]
+fn a_cpu_of_another_inventory_gets_no_cached_translation_on_any_path() {
+    let (mut mem_a, code_va, _) = setup_retirable_data();
+    let (mut mem_b, _, _) = setup_retirable_data();
+    let mut cpu = retirable_cpu(&mem_a, code_va);
+    let mut bytes = [0u8; 8];
+    for _ in 0..2 {
+        read_guest_bytes(
+            cpu.context_mut(),
+            &mut mem_a,
+            RETIRE_DATA_VA,
+            &mut bytes,
+            SoftAccessKind::Read,
+        )
+        .unwrap();
+    }
+    assert!(
+        cpu.context().tlb_stats().hits > 0,
+        "the TLB holds the entry"
+    );
+    let ctx = cpu.context_mut();
+    assert!(translate_va(ctx, &mut mem_b, RETIRE_DATA_VA, SoftAccessKind::Read).is_err());
+    assert!(translate_with_frame(ctx, &mut mem_b, RETIRE_DATA_VA, SoftAccessKind::Read).is_err());
+    assert!(
+        read_guest_bytes(
+            ctx,
+            &mut mem_b,
+            RETIRE_DATA_VA,
+            &mut bytes,
+            SoftAccessKind::Read
+        )
+        .is_err()
+    );
+    assert!(write_guest_bytes(ctx, &mut mem_b, RETIRE_DATA_VA, &bytes).is_err());
+    assert_eq!(
+        cpu.step_block(&mut mem_b),
+        Err(carrick_softcpu_x86::EmitError::ForeignInventory { va: code_va })
+    );
+    // The gate, not a missing entry, refused: inventory A still hits.
+    assert!(
+        translate_va(
+            cpu.context_mut(),
+            &mut mem_a,
+            RETIRE_DATA_VA,
+            SoftAccessKind::Read
+        )
+        .is_ok()
     );
 }
 

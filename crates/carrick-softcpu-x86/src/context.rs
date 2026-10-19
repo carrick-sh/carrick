@@ -261,6 +261,18 @@ const _: () = {
     assert!(offset_of!(SoftCpuContext, tlb) == CTX_TLB_READ_OFF);
 };
 
+/// Proof that a host-side guest access was admitted for this CPU through
+/// a memory whose inventory it is seated in. Not cloneable; constructed only
+/// by [`SoftCpuContext::admit_host_access`], consumed by
+/// [`SoftCpuContext::release_host_access`].
+#[must_use = "release the admission after the last use of its translations"]
+#[derive(Debug)]
+pub struct HostAccess(crate::mmu::LookupAdmission);
+
+/// The memory's physical inventory is not the one this CPU is seated in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForeignSeat;
+
 impl SoftCpuContext {
     /// A context seated in `extents`' invalidation domain. Its TLB starts
     /// empty and the CPU starts parked.
@@ -339,14 +351,22 @@ impl SoftCpuContext {
         &self.seat
     }
 
-    /// Admit a host-side guest access (see [`SoftVcpuSeat::admit`]).
-    pub fn admit_host_access(&mut self) -> crate::mmu::LookupAdmission {
-        self.seat.admit(&mut self.tlb)
+    /// Admit a host-side guest access through `extents` (see
+    /// [`SoftVcpuSeat::admit`]). Refused, before the TLB is touched, when
+    /// this CPU is not seated in `extents`' invalidation domain: that
+    /// inventory's retirements never reach this TLB. The returned proof is
+    /// what every TLB-using helper in [`crate::mmu`] requires.
+    pub fn admit_host_access(&mut self, extents: &ExtentTable) -> Result<HostAccess, ForeignSeat> {
+        if !extents.is_member(&self.seat) {
+            return Err(ForeignSeat);
+        }
+        Ok(HostAccess(self.seat.admit(&mut self.tlb)))
     }
 
-    /// End a host-side guest access admitted by [`Self::admit_host_access`].
-    pub fn release_host_access(&mut self, admission: crate::mmu::LookupAdmission) {
-        self.seat.release(admission);
+    /// End a host-side guest access admitted by [`Self::admit_host_access`],
+    /// after the last use of the translations it produced.
+    pub fn release_host_access(&mut self, access: HostAccess) {
+        self.seat.release(access.0);
     }
 
     /// This CPU as the requester of a retirement it issues itself: served
