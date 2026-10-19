@@ -1,6 +1,6 @@
 //! Shared process identity and exit receipts. These are the same domains
 //! used by host kernel graph consumers and guest lifecycle owners.
-use core::num::{NonZeroI32, NonZeroU64};
+use core::num::NonZeroI32;
 use core::time::Duration;
 
 pub mod birth;
@@ -40,14 +40,17 @@ macro_rules! linux_i32_id {
     };
 }
 
+/// The one definition of a registry serial domain: a non-zero u64 minted by a
+/// registry allocator. Shared by the scheduler core and the host kernel.
+#[macro_export]
 macro_rules! serial_id {
     ($name:ident) => {
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
         #[repr(transparent)]
-        pub struct $name(NonZeroU64);
+        pub struct $name(::core::num::NonZeroU64);
 
         impl $name {
-            pub const fn from_registry_allocation(raw: NonZeroU64) -> Self {
+            pub const fn from_registry_allocation(raw: ::core::num::NonZeroU64) -> Self {
                 Self(raw)
             }
 
@@ -55,13 +58,13 @@ macro_rules! serial_id {
                 self.0.get()
             }
 
-            pub const fn nonzero(self) -> NonZeroU64 {
+            pub const fn nonzero(self) -> ::core::num::NonZeroU64 {
                 self.0
             }
 
             #[allow(dead_code)]
             pub const fn from_raw_u64(raw: u64) -> Option<Self> {
-                match NonZeroU64::new(raw) {
+                match ::core::num::NonZeroU64::new(raw) {
                     Some(nz) => Some(Self(nz)),
                     None => None,
                 }
@@ -82,7 +85,7 @@ impl TaskId {
 }
 linux_i32_id!(ProcessGroupId);
 linux_i32_id!(SessionId);
-serial_id!(TaskSerial);
+crate::serial_id!(TaskSerial);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(transparent)]
