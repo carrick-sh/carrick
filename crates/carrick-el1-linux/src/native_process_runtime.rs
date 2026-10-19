@@ -549,8 +549,14 @@ impl PendingExit<'_> {
         &self,
         page: &ThreadLifecyclePage,
     ) -> Option<carrick_core::terminal::CompletedMemberReceipts> {
-        let mut pool = Vec::new();
-        let mut host = Vec::new();
+        self.readiness(page)?.ok()
+    }
+
+    fn observations<'s>(
+        &'s self,
+        pool: &mut Vec<carrick_core::terminal::PoolMemberObservation<'s>>,
+        host: &mut Vec<carrick_core::terminal::HostMemberObservation<'s>>,
+    ) {
         for receipt in &self.outstanding {
             match receipt {
                 OutstandingExitReceipt::Pool {
@@ -578,9 +584,46 @@ impl PendingExit<'_> {
                 }
             }
         }
-        self.custody
-            .as_ref()?
-            .observe_members(page, &self.members, &pool, &host)
+    }
+
+    /// Whether the owner may settle now. When it may not, the owner records
+    /// why on its page for the census (park path only). Out of line: the
+    /// verdict must not grow the bounded EL1 exit frame.
+    #[inline(never)]
+    fn ready_or_record(&self, page: &ThreadLifecyclePage, is_owner: bool) -> bool {
+        let Some(custody) = self.custody.as_ref() else {
+            return false;
+        };
+        let verdict = self.readiness(page);
+        let ready = matches!(&verdict, Some(Ok(receipts)) if custody.can_settle(page, receipts));
+        if !ready
+            && is_owner
+            && let Some(verdict) = verdict
+        {
+            page.record_closing_verdict(verdict.err());
+        }
+        ready
+    }
+
+    /// The owner's readiness verdict: the exact member receipts, or the
+    /// first observation that is not one. `None` without Closing custody.
+    fn readiness(
+        &self,
+        page: &ThreadLifecyclePage,
+    ) -> Option<
+        Result<
+            carrick_core::terminal::CompletedMemberReceipts,
+            carrick_core::terminal::ReadinessFailure,
+        >,
+    > {
+        let mut pool = Vec::new();
+        let mut host = Vec::new();
+        self.observations(&mut pool, &mut host);
+        Some(
+            self.custody
+                .as_ref()?
+                .observe_members_verdict(page, &self.members, &pool, &host),
+        )
     }
 }
 
@@ -3584,13 +3627,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             let pending = graph.pending_exit.get(&self.key);
             let is_owner = pending
                 .is_some_and(|pending| core::ptr::eq(pending.caller.control(), self.control));
-            let ready = pending.is_some_and(|pending| {
-                pending.custody.as_ref().is_some_and(|custody| {
-                    pending
-                        .completed_receipts(page)
-                        .is_some_and(|receipts| custody.can_settle(page, &receipts))
-                })
-            });
+            let ready = pending.is_some_and(|pending| pending.ready_or_record(page, is_owner));
             (is_owner, ready)
         };
         if ready {

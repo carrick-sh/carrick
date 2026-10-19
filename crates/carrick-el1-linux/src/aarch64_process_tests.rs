@@ -4766,6 +4766,12 @@ fn arm_host_exit_reserved_live_count_does_not_settle_group_before_receipt() {
     assert_eq!(fixture.page.live(), 0);
     let identity = sibling.host_birth_identity().unwrap();
     assert!(fixture.page.host_birth_requested(identity));
+    // #641 census: the parked owner recorded why it is not ready.
+    let verdict = fixture.page.closing_verdict().to_string();
+    assert!(
+        verdict.starts_with("owner_verdict live=0 claimed=0 first=HostBorn"),
+        "{verdict}"
+    );
     assert!(matches!(
         wake_closing_root(fixture, &mut service),
         crate::sched::ResumeAction::Left
