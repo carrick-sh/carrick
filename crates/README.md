@@ -1,6 +1,6 @@
 # Carrick Crate Map
 
-Carrick is a 54-crate Cargo workspace. The product path is:
+Carrick is a 55-crate Cargo workspace. The product path is:
 
 ```text
 carrick-cli   -> carrick-engine -> { carrick-image, carrick-runtime -> carrick-kernel -> carrick-vfs } -> carrick-spec
@@ -97,6 +97,7 @@ lifecycle semantics.
 | `carrick-vmm-nvmm` | NetBSD/NVMM backend; x86_64 lane through the shared x86 engine plus NVMM-specific host/VMM glue. |
 | `carrick-x86` | Shared x86_64 engine: long-mode bring-up, register/snapshot model, fault tables, VDSO helpers, generic `X86EngineCore<V>`. |
 | `carrick-x86-cpl0` | Bare-metal x86_64 CPL0 image and fixture runner. |
+| `carrick-x86-cpl0-host` | Machine-neutral host coordinator and custody for the x86 CPL0 production carrier: `CarrierCpuIo`, `CarrierMemoryIo`, `CarrierCpu<I>`, `CarrierMemory<M>`, `ProductionWorkerParts<M>`, and `GuestRam`. |
 
 ## Test and Harness Support
 

@@ -131,12 +131,7 @@ impl MemoryWitness {
             system.initialize(idt as usize + 8 * 16 + 4, &[1])?;
             for vector in 0..256_u64 {
                 let gate_pa = idt + vector * 16;
-                let ptr = system
-                    .ptr(gate_pa, 16)
-                    .ok_or_else(|| error("IDT backing"))?;
-                // SAFETY: the unpublished system extent exclusively owns the
-                // initialized IDT bytes until all gates are rebased.
-                let gate = unsafe { core::slice::from_raw_parts(ptr, 16) };
+                let gate = system.read_unpublished(gate_pa, 16)?;
                 if gate[5] & 0x80 == 0 {
                     continue;
                 }
@@ -155,7 +150,8 @@ impl MemoryWitness {
             }
             system.initialize(CODE_VA as usize + i * 4096, program)?;
         }
-        let mut memory = CarrierMemory::create()?;
+        let vm = KvmVm::create_empty().map_err(|e| error(e.to_string()))?;
+        let mut memory = CarrierMemory::new(vm)?;
         let backing = PreparedBacking {
             extent: Arc::new(system),
             identity: identity(1)?,
@@ -233,8 +229,14 @@ impl MemoryWitness {
                 )?;
             }
         }
-        let mut a = memory.vm.add_vcpu().map_err(|e| error(e.to_string()))?;
-        let mut b = memory.vm.add_vcpu().map_err(|e| error(e.to_string()))?;
+        let mut a = memory
+            .with_unique_vm_mut(|vm| vm.add_vcpu())
+            .ok_or_else(|| error("carrier vm already shared"))?
+            .map_err(|e| error(e.to_string()))?;
+        let mut b = memory
+            .with_unique_vm_mut(|vm| vm.add_vcpu())
+            .ok_or_else(|| error("carrier vm already shared"))?
+            .map_err(|e| error(e.to_string()))?;
         for (i, cpu) in [&mut a, &mut b].into_iter().enumerate() {
             let mut layout = LAYOUT;
             layout.pml4_base = contexts[i].root.address().raw();
@@ -283,10 +285,10 @@ impl MemoryWitness {
         handle: BackingHandle,
         resident: bool,
     ) -> Result<(), MemoryError> {
-        let record = self.memory.record(handle)?;
+        let backing = self.memory.backing(handle)?;
         let op = DescriptorOp::Map {
             span: PageSpan::new(va, PAGE),
-            output: record.backing.extent.base,
+            output: backing.extent.base,
             permissions: Permissions {
                 writable: true,
                 executable: false,
@@ -294,7 +296,7 @@ impl MemoryWitness {
             },
             size: LeafSize::Page,
             resident,
-            backing: record.backing.identity,
+            backing: backing.identity,
         };
         self.edit(index, op)
     }
@@ -306,20 +308,20 @@ impl MemoryWitness {
         va: u64,
         handle: BackingHandle,
     ) -> Result<(), MemoryError> {
-        let record = self.memory.record(handle)?;
+        let backing = self.memory.backing(handle)?;
         let span = PageSpan::new(va, PAGE);
         self.edit(
             index,
             DescriptorOp::Prepare {
                 span,
-                output: record.backing.extent.base,
+                output: backing.extent.base,
                 permissions: Permissions {
                     writable: true,
                     executable: false,
                     user: true,
                 },
                 resident: span,
-                backing: record.backing.identity,
+                backing: backing.identity,
             },
         )
     }
@@ -339,7 +341,7 @@ impl MemoryWitness {
         self.drain_context(context)
     }
     pub fn first_touch(&mut self, index: usize, handle: BackingHandle) -> Result<(), MemoryError> {
-        let output = self.memory.record(handle)?.backing.extent.base;
+        let output = self.memory.backing(handle)?.extent.base;
         self.edit(
             index,
             DescriptorOp::Publish {
@@ -355,10 +357,10 @@ impl MemoryWitness {
         old: BackingHandle,
         new: BackingHandle,
     ) -> Result<(), MemoryError> {
-        let old_base = self.memory.record(old)?.backing.extent.base;
-        let new_slot = self.memory.record(new)?;
-        let new_base = new_slot.backing.extent.base;
-        let backing = new_slot.backing.identity;
+        let old_base = self.memory.backing(old)?.extent.base;
+        let new_backing = self.memory.backing(new)?;
+        let new_base = new_backing.extent.base;
+        let backing = new_backing.identity;
         let bytes = self.memory.read(old_base, PAGE as usize)?;
         self.memory.write(new_base, &bytes)?;
         self.edit(
@@ -383,7 +385,7 @@ impl MemoryWitness {
         });
         self.drain_count += drain.count;
         if result.is_err() {
-            self.memory.quarantined = true;
+            self.memory.quarantine();
         }
         result
     }
@@ -405,10 +407,10 @@ impl MemoryWitness {
     pub fn backing_byte(&self, handle: BackingHandle) -> Result<u8, MemoryError> {
         Ok(self
             .memory
-            .read(self.memory.record(handle)?.backing.extent.base, 1)?[0])
+            .read(self.memory.backing(handle)?.extent.base, 1)?[0])
     }
     pub fn observe(&mut self, index: usize) -> Result<Observation, MemoryError> {
-        self.memory.admit()?;
+        self.memory.ensure_available()?;
         let cpu = self
             .cpus
             .get_mut(index)

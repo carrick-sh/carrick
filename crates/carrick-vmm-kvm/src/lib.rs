@@ -81,6 +81,3 @@ pub mod guest_setup_x86;
 pub mod kvm_x86_engine;
 #[cfg(target_arch = "x86_64")]
 pub mod run_elf_x86;
-
-#[cfg(target_arch = "x86_64")]
-mod cpl0_private_witness;

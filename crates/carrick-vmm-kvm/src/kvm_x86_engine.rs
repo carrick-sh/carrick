@@ -29,7 +29,7 @@
 //! the sigframe carries). `KERNEL_GS_BASE` (the SWAPGS shadow) is not used by
 //! the ring-3-only guest, so `get/set_gs_base` operate on `sregs.gs.base`.
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use carrick_abi::LinuxProtFlags;
 use carrick_guest_mem::{Gpa, GuestVa, HostVa, MemoryError, RepointPrivateError};
@@ -45,8 +45,8 @@ use carrick_x86::{
 };
 use kvm_bindings::{Msrs, kvm_dtable, kvm_msr_entry, kvm_segment};
 
-use crate::guest_setup::{GuestRam, WindowDesc};
-use crate::guest_setup_x86::{X86_GDT_BASE, X86_PML4_BASE, X86_TRAMPOLINE_BASE};
+use crate::guest_setup::{GuestRam, GuestRamKvmExt};
+use crate::guest_setup_x86::{GuestRamX86Ext, X86_GDT_BASE, X86_PML4_BASE, X86_TRAMPOLINE_BASE};
 use crate::kvm::{KvmVcpu, KvmVm, SharedVmHandle, VcpuLiveTicket};
 use crate::kvm_kicker::{KvmKickHandle, KvmKicker};
 
@@ -121,7 +121,7 @@ impl KvmVmm {
     /// `clone(CLONE_THREAD)` sibling shares every slot — no re-registration).
     fn from_sibling(
         handle: SharedVmHandle,
-        windows: Arc<RwLock<Vec<WindowDesc>>>,
+        windows: carrick_x86_cpl0_host::guest_ram::SharedWindows,
         protections: Arc<carrick_mem::protections::MemoryProtections>,
         page_tables: Arc<Mutex<Pml4Manager>>,
     ) -> Self {
@@ -167,7 +167,7 @@ impl KvmVmm {
 /// the seeded snapshot in `X86SiblingSpec`).
 pub struct KvmSiblingBuilder {
     vm: SharedVmHandle,
-    windows: Arc<RwLock<Vec<WindowDesc>>>,
+    windows: carrick_x86_cpl0_host::guest_ram::SharedWindows,
     protections: Arc<carrick_mem::protections::MemoryProtections>,
     page_tables: Arc<Mutex<Pml4Manager>>,
     ticket: VcpuLiveTicket,
@@ -588,7 +588,7 @@ impl X86Vmm for KvmVmm {
     fn build_sibling_builder(&self) -> Result<Self::SiblingBuilder, TrapError> {
         Ok(KvmSiblingBuilder {
             vm: self.vm.vm_handle(),
-            windows: self.ram.window_descriptors(),
+            windows: self.ram.shared_windows(),
             protections: self.ram.shared_protections(),
             page_tables: Arc::clone(&self.page_tables),
             // Reserve the sibling's VCPU_LIVE slot now (closes the execve-drain
@@ -1439,7 +1439,7 @@ fn build_kvm_x86_guest(image: &AddressSpace) -> Result<BuiltKvmX86Guest, TrapErr
 
     // 2. Create the VM + register every window as a KVM slot.
     let mut vm = KvmVm::create_empty().map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-    for (gpa, host, len) in ram.windows_for_kvm() {
+    for (gpa, host, len) in ram.slot_windows() {
         vm.map_memory(gpa, host, len, carrick_hal::MemPerms::ReadWriteExec)
             .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
     }

@@ -453,6 +453,15 @@ same-VA isolation. Lookup work follows the physical extent index and selected
 records, without scanning other MM populations. Signed fork acceptance remains
 required.
 
+The KVM vfork VM rebuild also publishes each selected shadow pointer to the
+host-side window descriptor under its write lock. The real-KVM binding
+`vfork_rebuild_host_reads_shadow_bytes` reads distinct child bytes through
+`GuestRam` after rebuilding, while a shared window retains its original bytes.
+The pre-fix host read returned the parent's private bytes. This publication
+visits each window once and adds no backing copy; the retained shadow remains
+the source for both host reads and guest memslots. Full vfork/exec and signed
+acceptance remain the existing higher-layer bindings.
+
 Native fork stock reserves that same physical custody before child publication.
 `native_stock_reserve_refuses_retiring_stage2_record_and_rolls_back_earlier_pin`
 drives the HVF stock crossing and the stage-2 retirement owner without booting a

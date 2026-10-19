@@ -19,9 +19,9 @@ use carrick_mmu_core::x86::owner_mmu::X86Mmu;
 /// Every I/O port this CPL0 carrier decodes from one VM; each must be
 /// distinct. `carrick_x86::FP_STUB_DOORBELL_PORT` (0xc6) is deliberately
 /// absent: only the legacy no-FP-getter x86 engine in a bhyve VM decodes
-/// it (`run_fp_stub`), never a KVM CPL0 VM, so its number is shared with
+/// it (`run_fp_stub`), never a hardware CPL0 VM, so its number is shared with
 /// [`carrick_core_abi::X86_INITIAL_BOOT_PORT`] without aliasing.
-pub(super) const CPL0_CARRIER_PORTS: [u16; 19] = [
+pub const CPL0_CARRIER_PORTS: [u16; 19] = [
     FAULT_DOORBELL_PORT,
     FORWARD_PORT,
     CONTROL_PORT,
@@ -61,7 +61,7 @@ const _: () = {
 
 /// Immutable physical storage licensed by the supervisor image's ELF loads.
 /// This qualifies transport bytes without importing process or MM policy.
-pub(super) struct KernelPodStorage {
+pub struct KernelPodStorage {
     start: carrick_guest_arch::KernelVa,
     len: u64,
     physical: FrameGpa,
@@ -96,7 +96,7 @@ impl KernelPodStorage {
     }
 }
 
-pub(super) fn retained_kernel_pod_storage(
+pub fn retained_kernel_pod_storage(
     segments: &[carrick_mem::elf::LoadSegment],
 ) -> Vec<KernelPodStorage> {
     let mut storage: Vec<_> = segments
@@ -133,17 +133,14 @@ fn kernel_pod_physical(
     ))
 }
 
-pub(super) type PrepareTableSpan = carrick_core_abi::X86PrepareTableSpan;
+pub type PrepareTableSpan = carrick_core_abi::X86PrepareTableSpan;
 
-pub(super) fn prepare_table_working_bytes() -> Option<usize> {
+pub fn prepare_table_working_bytes() -> Option<usize> {
     let lanes = core::num::NonZeroUsize::new(carrick_x86::cpl0_entry::CPL0_CPU_COUNT)?;
     usize::try_from(PrepareTableSpan::working_bytes(lanes)?.raw()).ok()
 }
 
-pub(super) fn prepare_table_suffix(
-    extent_bytes: usize,
-    occupied_end: usize,
-) -> Option<PrepareTableSpan> {
+pub fn prepare_table_suffix(extent_bytes: usize, occupied_end: usize) -> Option<PrepareTableSpan> {
     PrepareTableSpan::derive(
         carrick_guest_arch::GuestLen::new(u64::try_from(extent_bytes).ok()?),
         FrameGpa::new(INITIAL_EXTENT_GPA.checked_add(u64::try_from(occupied_end).ok()?)?),
@@ -162,7 +159,7 @@ struct PrepareTableLoan {
     pages: Vec<RootGpa>,
 }
 impl PrepareTableStock {
-    pub(super) fn seed(span: PrepareTableSpan, bytes: &[u8]) -> Option<Self> {
+    pub fn seed(span: PrepareTableSpan, bytes: &[u8]) -> Option<Self> {
         if usize::try_from(span.len().raw()).ok()? != prepare_table_working_bytes()?
             || bytes.len() != usize::try_from(span.len().raw()).ok()?
             || bytes.iter().any(|byte| *byte != 0)
@@ -268,13 +265,13 @@ fn retained_cow_zone(ram: &GuestRam) -> Result<&X86Cpl0Zone, TrapError> {
     Ok(unsafe { &*ptr.cast::<X86Cpl0Zone>() })
 }
 
-struct HostCowWake<'a> {
+struct HostCowWake<'a, M: CarrierMemoryIo> {
     routes: &'a PublishedApicIds,
-    vm: Arc<VmFd>,
+    vm: Arc<M>,
     error: std::cell::RefCell<Option<TrapError>>,
 }
-impl<'a> HostCowWake<'a> {
-    fn new(ram: &'a GuestRam, vm: Arc<VmFd>) -> Result<Self, TrapError> {
+impl<'a, M: CarrierMemoryIo> HostCowWake<'a, M> {
+    fn new(ram: &'a GuestRam, vm: Arc<M>) -> Result<Self, TrapError> {
         let pointer = ram
             .host_ptr(META_GPA + ROUTES_OFFSET, size_of::<PublishedApicIds>())
             .ok_or_else(|| fail("owner COW retained APIC routes"))?;
@@ -311,20 +308,11 @@ impl<'a> HostCowWake<'a> {
                 .destination(carrick_guest_arch::CpuId::new(u32::from(slot.raw())))
                 .ok_or_else(|| fail("owner COW wake APIC route absent"))
                 .and_then(|apic| {
+                    let address_lo = 0xfee0_0000 | (u32::from(apic.0) << 12);
+                    let data = u32::from(carrick_x86::interrupts::RESCHED_VECTOR);
                     self.vm
-                        .signal_msi(kvm_msi {
-                            address_lo: 0xfee0_0000 | (u32::from(apic.0) << 12),
-                            data: u32::from(carrick_x86::interrupts::RESCHED_VECTOR),
-                            ..Default::default()
-                        })
+                        .signal_msi(address_lo, data)
                         .map_err(|error| fail(format!("owner COW wake MSI: {error}")))
-                })
-                .and_then(|sent| {
-                    if sent > 0 {
-                        Ok(())
-                    } else {
-                        Err(fail("owner COW wake MSI blocked"))
-                    }
                 });
             if let Err(error) = result {
                 self.error.borrow_mut().get_or_insert(error);
@@ -361,8 +349,8 @@ impl<'a> CowPause<'a> {
 /// Release a reclaimed child's carrier-wide state: its frame-inventory rows
 /// and COW residency (shared composition), then its CR3/alias registrations
 /// and the memslots admitted only for it.
-fn release_retired_child(
-    memory: &mut CarrierMemory,
+fn release_retired_child<M: CarrierMemoryIo>(
+    memory: &mut CarrierMemory<M>,
     inventory: &dyn carrick_hal::PhysicalFrameInventory,
     absence: &SlotAbsence,
 ) -> Result<crate::carrier_memory::RetiredChild, TrapError> {
@@ -393,20 +381,20 @@ fn rollback_fork_parent_residency(
     Ok(())
 }
 
-/// The fork stock exactly as KVM boot stocks it.
-pub(super) struct BootForkStock {
+/// The fork stock exactly as carrier boot stocks it.
+struct BootForkStock {
     /// The dedicated maintenance-root grant (`MAINTENANCE_ROOT_TABLE_CREDITS`).
-    pub(super) maintenance: RootGpa,
+    maintenance: RootGpa,
     /// The remaining unused initial table grants.
-    pub(super) tables: Vec<RootGpa>,
+    tables: Vec<RootGpa>,
     /// `FORK_LIFECYCLE_SLOTS` records in the metadata window.
-    pub(super) lifecycles: Vec<carrick_el1_abi::ForkLifecycleLoan>,
+    lifecycles: Vec<carrick_el1_abi::ForkLifecycleLoan>,
 }
 
 /// Split the unused initial table grants into the maintenance root (the
 /// first, which boot counted as its own credit) and the fork table stock,
 /// and lay out the lifecycle records.
-pub(super) fn boot_fork_stock(mut unused: Vec<RootGpa>) -> Result<BootForkStock, TrapError> {
+fn boot_fork_stock(mut unused: Vec<RootGpa>) -> Result<BootForkStock, TrapError> {
     if unused.len() <= super::MAINTENANCE_ROOT_TABLE_CREDITS {
         return Err(fail(
             "no initial table grant left after the maintenance root",
@@ -466,13 +454,13 @@ fn maintenance_root_page(initial: &[u8]) -> Option<Vec<u8>> {
         .then_some(root)
 }
 
-fn tables_resolve(memory: &CarrierMemory, pages: &[RootGpa]) -> bool {
+fn tables_resolve<M: CarrierMemoryIo>(memory: &CarrierMemory<M>, pages: &[RootGpa]) -> bool {
     pages
         .iter()
         .all(|page| memory.read(page.address(), 4096).is_ok())
 }
 
-fn tables_are_zero(memory: &CarrierMemory, pages: &[RootGpa]) -> bool {
+fn tables_are_zero<M: CarrierMemoryIo>(memory: &CarrierMemory<M>, pages: &[RootGpa]) -> bool {
     pages.iter().all(|page| {
         memory
             .read(page.address(), 4096)
@@ -480,8 +468,11 @@ fn tables_are_zero(memory: &CarrierMemory, pages: &[RootGpa]) -> bool {
     })
 }
 
-impl Cpl0HostCustody {
-    fn physical_execution(&self, lease: &StoppedCpuLease<'_>) -> Result<GrantExecution, TrapError> {
+impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
+    fn physical_execution<I: CarrierCpuIo>(
+        &self,
+        lease: &StoppedCpuLease<'_, I>,
+    ) -> Result<GrantExecution, TrapError> {
         let task = self.task(lease.cpu);
         let binding = carrick_core::entry::binding(&task.execution, &task.mm);
         let mm = NonZeroU64::new(binding.mm.raw()).ok_or_else(|| fail("physical loan MM"))?;
@@ -490,7 +481,7 @@ impl Cpl0HostCustody {
             .root(mm)
             .ok_or_else(|| fail("physical loan root"))?;
         let native = self.binding(lease.cpu);
-        let live_root = RootGpa::page_aligned(FrameGpa::new(lease.vcpu.get_gpr(X86Reg::Cr3)?))
+        let live_root = RootGpa::page_aligned(FrameGpa::new(lease.io.get_gpr(X86Reg::Cr3)?))
             .ok_or_else(|| fail("physical loan root alignment"))?;
         let generation = ContextGeneration::new(
             NonZeroU64::new(native.mm_owner_generation.load(Ordering::Acquire))
@@ -511,9 +502,9 @@ impl Cpl0HostCustody {
         })
     }
 
-    fn stack_record_physical<T>(
+    fn stack_record_physical<T, I: CarrierCpuIo>(
         &self,
-        lease: &StoppedCpuLease<'_>,
+        lease: &StoppedCpuLease<'_, I>,
         context: AddressContext<RootGpa>,
         address: u64,
     ) -> Result<FrameGpa, TrapError> {
@@ -534,7 +525,7 @@ impl Cpl0HostCustody {
                 lease.cpu.raw(),
                 size_of::<T>(),
                 align_of::<T>(),
-                lease.vcpu.get_gpr(X86Reg::Rsp)?
+                lease.io.get_gpr(X86Reg::Rsp)?
             )));
         }
         let mut page = address & !4095;
@@ -560,13 +551,13 @@ impl Cpl0HostCustody {
     }
 
     /// T must be a fully initialized, padding-free POD physical ABI record.
-    unsafe fn read_stack_record<T>(
+    unsafe fn read_stack_record<T, I: CarrierCpuIo>(
         &self,
-        lease: &StoppedCpuLease<'_>,
+        lease: &StoppedCpuLease<'_, I>,
         context: AddressContext<RootGpa>,
         address: u64,
     ) -> Result<(FrameGpa, T), TrapError> {
-        let physical = self.stack_record_physical::<T>(lease, context, address)?;
+        let physical = self.stack_record_physical::<T, I>(lease, context, address)?;
         let bytes = self
             ._vm
             .read(physical, size_of::<T>())
@@ -641,17 +632,17 @@ impl Cpl0HostCustody {
         Ok(bytes)
     }
 
-    pub(super) fn service_run_failure(
+    pub fn service_run_failure<I: CarrierCpuIo>(
         &self,
-        lease: &StoppedCpuLease<'_>,
+        lease: &StoppedCpuLease<'_, I>,
     ) -> Result<carrick_core_abi::NativeRunFailureReason, TrapError> {
         let execution = self.physical_execution(lease)?;
         // SAFETY: the record consists of eight initialized u64s, valid for all bit patterns.
         let (_, record) = unsafe {
-            self.read_stack_record::<carrick_core_abi::NativeRunFailure>(
+            self.read_stack_record::<carrick_core_abi::NativeRunFailure, I>(
                 lease,
                 execution.context,
-                lease.vcpu.get_gpr(X86Reg::Rax)?,
+                lease.io.get_gpr(X86Reg::Rax)?,
             )
         }?;
         record
@@ -659,17 +650,17 @@ impl Cpl0HostCustody {
             .ok_or_else(|| fail("native run failure execution/reason"))
     }
 
-    pub(super) fn service_root_exit(
+    pub fn service_root_exit<I: CarrierCpuIo>(
         &self,
-        lease: &StoppedCpuLease<'_>,
+        lease: &StoppedCpuLease<'_, I>,
     ) -> Result<carrick_sched_core::process::TerminationStatus, TrapError> {
         let execution = self.physical_execution(lease)?;
         // SAFETY: the root exit record consists of eight fully initialized u64s.
         let (_, record) = unsafe {
-            self.read_stack_record::<carrick_core_abi::NativeRootExit>(
+            self.read_stack_record::<carrick_core_abi::NativeRootExit, I>(
                 lease,
                 execution.context,
-                lease.vcpu.get_gpr(X86Reg::Rax)?,
+                lease.io.get_gpr(X86Reg::Rax)?,
             )
         }?;
         let status = record
@@ -683,7 +674,7 @@ impl Cpl0HostCustody {
     /// only the initial root's shared supervisor branches, published as the
     /// zone's idle root so a CPU can leave every process root before its
     /// slot reports no installed MM. The rest become fork table stock.
-    pub(super) fn install_fork_stock(
+    pub fn install_fork_stock(
         &mut self,
         initial_root: RootGpa,
         unused: Vec<RootGpa>,
@@ -801,11 +792,11 @@ impl Cpl0HostCustody {
     /// record must name this stopped CPU's live binding and child root. A
     /// refusal is a typed reply in the record (the guest fails only that
     /// process's stock return); only an unreadable record stops the carrier.
-    pub(super) fn service_child_retire(
+    pub fn service_child_retire<I: CarrierCpuIo>(
         &mut self,
-        lease: &StoppedCpuLease<'_>,
+        lease: &StoppedCpuLease<'_, I>,
     ) -> Result<(), TrapError> {
-        let live_root = RootGpa::page_aligned(FrameGpa::new(lease.vcpu.get_gpr(X86Reg::Cr3)?))
+        let live_root = RootGpa::page_aligned(FrameGpa::new(lease.io.get_gpr(X86Reg::Cr3)?))
             .ok_or_else(|| fail("physical child retire root alignment"))?;
         let context = self
             ._vm
@@ -813,10 +804,10 @@ impl Cpl0HostCustody {
             .ok_or_else(|| fail("physical child retire unbacked root"))?;
         // SAFETY: the retire record consists of eight fully initialized u64s.
         let (physical, mut record) = unsafe {
-            self.read_stack_record::<carrick_el1_abi::NativeChildRetire>(
+            self.read_stack_record::<carrick_el1_abi::NativeChildRetire, I>(
                 lease,
                 context,
-                lease.vcpu.get_gpr(X86Reg::Rax)?,
+                lease.io.get_gpr(X86Reg::Rax)?,
             )
         }?;
         if record.words[0] != carrick_el1_abi::NativeChildRetire::MAGIC
@@ -848,19 +839,20 @@ impl Cpl0HostCustody {
     }
 
     /// Counters of the shared fork stock (loans, counted refusals, returns).
-    pub(super) fn fork_stock_counters(&self) -> carrick_hal::fork_stock::ForkStockCounters {
+    pub fn fork_stock_counters(&self) -> carrick_hal::fork_stock::ForkStockCounters {
         self.fork_stock.counters()
     }
 
-    pub(super) fn service_fork_stock(
+    pub fn service_fork_stock<I: CarrierCpuIo>(
         &mut self,
-        lease: &StoppedCpuLease<'_>,
+        lease: &StoppedCpuLease<'_, I>,
     ) -> Result<Option<GuestArchBinding>, TrapError> {
         use carrick_el1_abi::ForkStockExchange;
         let execution = self.physical_execution(lease)?;
         self.drain_fork_quarantine(execution)?;
-        let address = lease.vcpu.get_gpr(X86Reg::Rax)?;
-        let (_, tag) = unsafe { self.read_stack_record::<u64>(lease, execution.context, address) }?;
+        let address = lease.io.get_gpr(X86Reg::Rax)?;
+        let (_, tag) =
+            unsafe { self.read_stack_record::<u64, I>(lease, execution.context, address) }?;
         match carrick_el1_abi::ForkStockKind::decode(tag) {
             Some(carrick_el1_abi::ForkStockKind::Loan) => {}
             Some(carrick_el1_abi::ForkStockKind::Reserve) => {
@@ -877,7 +869,7 @@ impl Cpl0HostCustody {
             }
         }
         let physical =
-            self.stack_record_physical::<ForkStockExchange>(lease, execution.context, address)?;
+            self.stack_record_physical::<ForkStockExchange, I>(lease, execution.context, address)?;
         let bytes = self
             ._vm
             .read(physical, size_of::<ForkStockExchange>())
@@ -919,9 +911,9 @@ impl Cpl0HostCustody {
         Ok(None)
     }
 
-    fn reserve_fork_stock(
+    fn reserve_fork_stock<I: CarrierCpuIo>(
         &mut self,
-        lease: &StoppedCpuLease<'_>,
+        lease: &StoppedCpuLease<'_, I>,
         execution: GrantExecution,
         address: u64,
     ) -> Result<(), TrapError> {
@@ -931,7 +923,7 @@ impl Cpl0HostCustody {
             .settlement_loan(execution)
             .map_err(|e| fail(format!("physical fork reservation: {e:?}")))?;
         let (physical, mut record) = unsafe {
-            self.read_stack_record::<ForkStockSettlement>(lease, execution.context, address)
+            self.read_stack_record::<ForkStockSettlement, I>(lease, execution.context, address)
         }?;
         let (completion, custody, count) = record
             .reservation(loan)
@@ -1241,9 +1233,9 @@ impl Cpl0HostCustody {
             .map_err(|e| fail(e.to_string()))
     }
 
-    fn settle_fork_stock(
+    fn settle_fork_stock<I: CarrierCpuIo>(
         &mut self,
-        lease: &StoppedCpuLease<'_>,
+        lease: &StoppedCpuLease<'_, I>,
         execution: GrantExecution,
         address: u64,
     ) -> Result<Option<GuestArchBinding>, TrapError> {
@@ -1253,7 +1245,7 @@ impl Cpl0HostCustody {
             .settlement_loan(execution)
             .map_err(|e| fail(format!("physical fork settlement: {e:?}")))?;
         let (physical, mut record) = unsafe {
-            self.read_stack_record::<ForkStockSettlement>(lease, execution.context, address)
+            self.read_stack_record::<ForkStockSettlement, I>(lease, execution.context, address)
         }?;
         let had_admitted = self
             .fork_stock
@@ -1363,7 +1355,7 @@ impl Cpl0HostCustody {
         }
         let ram = Arc::clone(&self.ram);
         let zone = retained_cow_zone(&ram)?;
-        let wake = HostCowWake::new(&self.ram, Arc::clone(&self._vm.vm().vm))?;
+        let wake = HostCowWake::new(&self.ram, self._vm.clone_vm())?;
         let delivery = |zone: &X86Cpl0Zone,
                         waker: Waker,
                         owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
@@ -1499,7 +1491,7 @@ impl Cpl0HostCustody {
     ) -> Result<(), TrapError> {
         let ram = Arc::clone(&self.ram);
         let zone = retained_cow_zone(&ram)?;
-        let wake = HostCowWake::new(&self.ram, Arc::clone(&self._vm.vm().vm))?;
+        let wake = HostCowWake::new(&self.ram, self._vm.clone_vm())?;
         let delivery = |zone: &X86Cpl0Zone,
                         waker: Waker,
                         owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
@@ -1600,7 +1592,7 @@ impl Cpl0HostCustody {
         .map_err(|error| fail(error.to_string()))
     }
 
-    pub(super) fn bind_grant_portal(&self) -> Result<(), TrapError> {
+    pub fn bind_grant_portal(&self) -> Result<(), TrapError> {
         let carrier = self._vm.identity().nonzero();
         if !self.grant_portal()?.bind_carrier(carrier) {
             return Err(fail("carrier portal already bound"));
@@ -1608,13 +1600,13 @@ impl Cpl0HostCustody {
         Ok(())
     }
 
-    pub(super) fn service_anonymous_grant(
+    pub fn service_anonymous_grant<I: CarrierCpuIo>(
         &mut self,
-        lease: &StoppedCpuLease<'_>,
+        lease: &StoppedCpuLease<'_, I>,
     ) -> Result<(), TrapError> {
         let cpu = lease.cpu;
         let index = cpu.raw() as usize;
-        let lane = &*lease.vcpu;
+        let lane = &*lease.io;
         if lane.get_gpr(X86Reg::Rax)? != u64::from(cpu.raw()) {
             return Err(fail("owner grant CPU identity"));
         }
@@ -1701,7 +1693,7 @@ impl Cpl0HostCustody {
         }
         // Hardware faults and kernel-owned user copies share this crossing.
         // Its selected address is explicit; CR2 may name an unrelated fault.
-        let far = lease.vcpu.get_gpr(X86Reg::Rdi)?;
+        let far = lease.io.get_gpr(X86Reg::Rdi)?;
         if let Some((_, window)) = self
             .grant_portal()?
             .grant(index)
@@ -1796,7 +1788,7 @@ impl Cpl0HostCustody {
         };
         let demand = (|| -> Result<usize, TrapError> {
             let zone = retained_cow_zone(&self.ram)?;
-            let wake = HostCowWake::new(&self.ram, Arc::clone(&self._vm.vm().vm))?;
+            let wake = HostCowWake::new(&self.ram, self._vm.clone_vm())?;
             let delivery = |zone: &X86Cpl0Zone,
                             waker: Waker,
                             owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
@@ -1899,6 +1891,7 @@ mod custody_tests {
     use carrick_el1_abi::{
         EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
     };
+    use carrick_mmu_core::x86::descriptor_txn::Permissions;
     fn execution() -> GrantExecution {
         GrantExecution {
             cpu: carrick_guest_arch::CpuId::new(1),
@@ -2030,7 +2023,7 @@ mod custody_tests {
         );
     }
 
-    /// The real KVM boot stock, in the worst case the credits are sized for
+    /// The real carrier boot stock, in the worst case the credits are sized for
     /// (the initial MM used its whole worst-case tables and its own COW
     /// branch), still serves the first fork's COW branch after the
     /// maintenance root is taken. Without the dedicated credit this loan

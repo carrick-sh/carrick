@@ -177,7 +177,11 @@ pub const DATA_SEG_TYPE: u8 = 3; // 0x3 = Data + Writable + Accessed
 // The x86-specific window-layout method `build_for_image_x86` is gated to this
 // module; `kvm_x86_engine::bring_up` consumes it.
 
-impl GuestRam {
+pub(crate) trait GuestRamX86Ext {
+    fn build_for_image_x86(image: &AddressSpace) -> Result<GuestRam, OsError>;
+}
+
+impl GuestRamX86Ext for GuestRam {
     /// Build a `GuestRam` for an x86_64 image under KVM.
     ///
     /// Parallel to the aarch64 `build_for_image`, but:
@@ -202,7 +206,7 @@ impl GuestRam {
     ///
     /// KVM slots for high GPAs (> 64 GiB) work fine — only CR3 must be below the
     /// host's physical-address ceiling (36 bits on the reference LXC host).
-    pub(crate) fn build_for_image_x86(image: &AddressSpace) -> Result<Self, OsError> {
+    fn build_for_image_x86(image: &AddressSpace) -> Result<Self, OsError> {
         let mut ram = GuestRam::new();
 
         // Low window: covers the ELF load segments AND the x86 kernel window

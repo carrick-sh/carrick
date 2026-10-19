@@ -64,15 +64,17 @@ use carrick_kernel::kernel::continuation::{
     ContinuationResumeEffects, RestartDecision, fold_continuation_completion, resume_continuation,
 };
 use carrick_kernel::kernel::objects::ThreadExecutionLease;
-use carrick_vmm_kvm::carrier_cpu::CarrierRunExit;
-use carrick_vmm_kvm::cpl0_boot::{
-    GuestExitStatus, InitialProcessExit, InitialSyscallDisposition, ProductionCpuFactory,
-    ProductionCpuLease, ProductionForwardFrame,
-};
+use carrick_vmm_kvm::cpl0_boot::InitialProcessExit;
 use carrick_x86::arch_context::X86ArchContext;
+use carrick_x86_cpl0_host::carrier_cpu::{CarrierCpuIo, CarrierRunExit};
+use carrick_x86_cpl0_host::carrier_memory::CarrierMemoryIo;
+use carrick_x86_cpl0_host::cpl0_boot::{
+    ForwardVenue, GuestExitStatus, InitialSyscallDisposition, KernelStackSnapshot,
+    ProductionCpuFactory, ProductionCpuLease, ProductionForwardFrame,
+};
 
-pub(crate) struct KvmPersistentExecutorFactory {
-    physical: Arc<ProductionCpuFactory>,
+pub(crate) struct Cpl0PersistentExecutorFactory<M: CarrierCpuIo, Mem: CarrierMemoryIo = M> {
+    physical: Arc<ProductionCpuFactory<M, Mem>>,
     dispatcher: Arc<Mutex<SyscallDispatcher>>,
     reporter: Arc<CompatReporter>,
     completed: mpsc::Sender<Result<InitialProcessExit, String>>,
@@ -81,13 +83,13 @@ pub(crate) struct KvmPersistentExecutorFactory {
     total_exits: Arc<AtomicUsize>,
     max_loaded_exits: usize,
     max_idle_exits: usize,
-    stats: Arc<KvmForwardStats>,
+    stats: Arc<Cpl0ForwardStats>,
     scheduler: Arc<Scheduler>,
-    root_binding: Arc<KvmTaskBinding>,
+    root_binding: Arc<Cpl0TaskBinding>,
     host_objects: Arc<Mutex<[u32; 3]>>,
     bound_host_fds: Arc<BoundHostFds>,
     #[cfg(feature = "kvm-pool-test-control")]
-    loaded_pre_entry_hook: Option<LoadedPreEntryHook>,
+    loaded_pre_entry_hook: Option<LoadedPreEntryHook<M::KickHandle>>,
 }
 
 enum BoundReadiness {
@@ -141,19 +143,19 @@ impl BoundHostFds {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum KvmResumeEffect {
+enum Cpl0ResumeEffect {
     Continue(Option<RestartDecision>),
     Refuse(carrick_abi::LinuxErrno),
 }
 
-fn route_kvm_resume_effects(effects: ContinuationResumeEffects) -> KvmResumeEffect {
+fn route_cpl0_resume_effects(effects: ContinuationResumeEffects) -> Cpl0ResumeEffect {
     // The reservation's Drop requeues the exact signal. Until x86 signal
     // frames land, return an interrupt refusal to this guest call rather than
     // losing the signal or aborting the carrier.
     if effects.reserved_signal.is_some() {
-        KvmResumeEffect::Refuse(carrick_abi::LINUX_EINTR)
+        Cpl0ResumeEffect::Refuse(carrick_abi::LINUX_EINTR)
     } else {
-        KvmResumeEffect::Continue(effects.restart)
+        Cpl0ResumeEffect::Continue(effects.restart)
     }
 }
 
@@ -186,8 +188,8 @@ mod resume_effect_tests {
             reserved_signal: Some(reserved),
         };
         assert_eq!(
-            route_kvm_resume_effects(effects),
-            KvmResumeEffect::Refuse(carrick_abi::LINUX_EINTR)
+            route_cpl0_resume_effects(effects),
+            Cpl0ResumeEffect::Refuse(carrick_abi::LINUX_EINTR)
         );
         assert!(authority.take_lowest_in(SigSet::EMPTY.with(10)).is_some());
     }
@@ -199,22 +201,22 @@ mod resume_effect_tests {
             reserved_signal: None,
         };
         assert_eq!(
-            route_kvm_resume_effects(effects),
-            KvmResumeEffect::Continue(Some(RestartDecision::Restart))
+            route_cpl0_resume_effects(effects),
+            Cpl0ResumeEffect::Continue(Some(RestartDecision::Restart))
         );
     }
 }
 
-type KvmForwardCounts = BTreeMap<&'static str, u64>;
+type Cpl0ForwardCounts = BTreeMap<&'static str, u64>;
 
 #[derive(Default)]
-pub(crate) struct KvmForwardStats {
-    host: Mutex<KvmForwardCounts>,
-    refusal: Mutex<KvmForwardCounts>,
+pub(crate) struct Cpl0ForwardStats {
+    host: Mutex<Cpl0ForwardCounts>,
+    refusal: Mutex<Cpl0ForwardCounts>,
     authority_refusals: Mutex<Vec<ForwardAuthorityRefusal>>,
 }
 
-impl KvmForwardStats {
+impl Cpl0ForwardStats {
     fn record(&self, class: crate::prepare::InitialForwardClass) -> Result<(), TrapError> {
         let map = match class {
             crate::prepare::InitialForwardClass::Host(_) => &self.host,
@@ -228,32 +230,32 @@ impl KvmForwardStats {
     fn record_authority_refusal(&self, refusal: ForwardAuthorityRefusal) -> Result<(), TrapError> {
         self.authority_refusals
             .lock()
-            .map_err(|_| TrapError::Hypervisor("KVM forward counters poisoned".into()))?
+            .map_err(|_| TrapError::Hypervisor("CPL0 forward counters poisoned".into()))?
             .push(refusal);
         Self::count(&self.refusal, refusal.family())
     }
 
-    fn count(map: &Mutex<KvmForwardCounts>, family: &'static str) -> Result<(), TrapError> {
+    fn count(map: &Mutex<Cpl0ForwardCounts>, family: &'static str) -> Result<(), TrapError> {
         let mut map = map
             .lock()
-            .map_err(|_| TrapError::Hypervisor("KVM forward counters poisoned".into()))?;
+            .map_err(|_| TrapError::Hypervisor("CPL0 forward counters poisoned".into()))?;
         let count = map.entry(family).or_default();
         *count = count
             .checked_add(1)
-            .ok_or_else(|| TrapError::Hypervisor("KVM forward counter overflow".into()))?;
+            .ok_or_else(|| TrapError::Hypervisor("CPL0 forward counter overflow".into()))?;
         Ok(())
     }
 
-    pub(crate) fn snapshot(&self) -> Result<(KvmForwardCounts, KvmForwardCounts), TrapError> {
+    pub(crate) fn snapshot(&self) -> Result<(Cpl0ForwardCounts, Cpl0ForwardCounts), TrapError> {
         let host = self
             .host
             .lock()
-            .map_err(|_| TrapError::Hypervisor("KVM forward counters poisoned".into()))?
+            .map_err(|_| TrapError::Hypervisor("CPL0 forward counters poisoned".into()))?
             .clone();
         let refusal = self
             .refusal
             .lock()
-            .map_err(|_| TrapError::Hypervisor("KVM forward counters poisoned".into()))?
+            .map_err(|_| TrapError::Hypervisor("CPL0 forward counters poisoned".into()))?
             .clone();
         Ok((host, refusal))
     }
@@ -262,35 +264,38 @@ impl KvmForwardStats {
         Ok(self
             .authority_refusals
             .lock()
-            .map_err(|_| TrapError::Hypervisor("KVM forward counters poisoned".into()))?
+            .map_err(|_| TrapError::Hypervisor("CPL0 forward counters poisoned".into()))?
             .clone())
     }
 }
 
-pub(crate) struct KvmPersistentExecutorConfig {
-    pub(crate) physical: Arc<ProductionCpuFactory>,
+pub(crate) struct Cpl0PersistentExecutorConfig<M: CarrierCpuIo, Mem: CarrierMemoryIo = M> {
+    pub(crate) physical: Arc<ProductionCpuFactory<M, Mem>>,
     pub(crate) dispatcher: Arc<Mutex<SyscallDispatcher>>,
     pub(crate) reporter: Arc<CompatReporter>,
     pub(crate) completed: mpsc::Sender<Result<InitialProcessExit, String>>,
     pub(crate) max_loaded_exits: usize,
     pub(crate) max_idle_exits: usize,
-    pub(crate) stats: Arc<KvmForwardStats>,
+    pub(crate) stats: Arc<Cpl0ForwardStats>,
     pub(crate) scheduler: Arc<Scheduler>,
-    pub(crate) root_binding: Arc<KvmTaskBinding>,
+    pub(crate) root_binding: Arc<Cpl0TaskBinding>,
     #[cfg(feature = "kvm-pool-test-control")]
-    pub(crate) loaded_pre_entry_hook: Option<LoadedPreEntryHook>,
+    pub(crate) loaded_pre_entry_hook: Option<LoadedPreEntryHook<M::KickHandle>>,
 }
 
+/// Loaded-lane pre-entry hook for test control; it receives the backend kick
+/// handle armed for the loaded task's next guest entry.
 #[cfg(feature = "kvm-pool-test-control")]
-pub(crate) type LoadedPreEntryHook = crate::prepare::KvmLoadedPreEntryHook;
+pub(crate) type LoadedPreEntryHook<K> =
+    Arc<dyn Fn(&std::sync::atomic::AtomicBool, &K) + Send + Sync + 'static>;
 
-impl KvmPersistentExecutorFactory {
-    pub(crate) fn new(config: KvmPersistentExecutorConfig) -> Result<Self, TrapError> {
+impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutorFactory<M, Mem> {
+    pub(crate) fn new(config: Cpl0PersistentExecutorConfig<M, Mem>) -> Result<Self, TrapError> {
         let bound_host_fds = {
             let dispatcher = config
                 .dispatcher
                 .lock()
-                .map_err(|_| TrapError::Hypervisor("KVM dispatcher poisoned".into()))?;
+                .map_err(|_| TrapError::Hypervisor("CPL0 dispatcher poisoned".into()))?;
             Arc::new(BoundHostFds::from_readiness([
                 dispatcher.stdio_readiness(0),
                 dispatcher.stdio_readiness(1),
@@ -318,15 +323,17 @@ impl KvmPersistentExecutorFactory {
     }
 }
 
-impl PersistentExecutorFactory for KvmPersistentExecutorFactory {
-    type Executor = KvmPersistentExecutor;
+impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> PersistentExecutorFactory
+    for Cpl0PersistentExecutorFactory<M, Mem>
+{
+    type Executor = Cpl0PersistentExecutor<M, Mem>;
 
     fn create(
         &self,
         registration: &carrick_kernel::kernel::ExecutorRegistration,
     ) -> Result<Self::Executor, TrapError> {
         let guest_cpu = registration.bound_cpu().ok_or_else(|| {
-            TrapError::Hypervisor("KVM physical executor has no registered guest CPU".into())
+            TrapError::Hypervisor("CPL0 physical executor has no registered guest CPU".into())
         })?;
         let physical = self.physical.claim(guest_cpu.as_usize())?;
         if physical.physical_slot()
@@ -335,10 +342,10 @@ impl PersistentExecutorFactory for KvmPersistentExecutorFactory {
             ))
         {
             return Err(TrapError::Hypervisor(
-                "claimed KVM physical slot differs from registered guest CPU".into(),
+                "claimed CPL0 physical slot differs from registered guest CPU".into(),
             ));
         }
-        Ok(KvmPersistentExecutor {
+        Ok(Cpl0PersistentExecutor {
             physical,
             dispatcher: Arc::clone(&self.dispatcher),
             reporter: Arc::clone(&self.reporter),
@@ -357,16 +364,16 @@ impl PersistentExecutorFactory for KvmPersistentExecutorFactory {
             completion_sent: false,
             host_objects: Arc::clone(&self.host_objects),
             bound_host_fds: Arc::clone(&self.bound_host_fds),
-            idle_kick: carrick_vmm_kvm::KvmKickHandle::for_current_thread(),
+            idle_kick: M::for_current_thread_kick(),
             #[cfg(feature = "kvm-pool-test-control")]
             loaded_pre_entry_hook: self.loaded_pre_entry_hook.clone(),
         })
     }
 }
 
-pub(crate) struct KvmPersistentExecutor {
-    physical: ProductionCpuLease,
-    idle_kick: carrick_vmm_kvm::KvmKickHandle,
+pub(crate) struct Cpl0PersistentExecutor<M: CarrierCpuIo, Mem: CarrierMemoryIo = M> {
+    physical: ProductionCpuLease<M, Mem>,
+    idle_kick: M::KickHandle,
     dispatcher: Arc<Mutex<SyscallDispatcher>>,
     reporter: Arc<CompatReporter>,
     completed: mpsc::Sender<Result<InitialProcessExit, String>>,
@@ -375,17 +382,17 @@ pub(crate) struct KvmPersistentExecutor {
     total_exits: Arc<AtomicUsize>,
     max_loaded_exits: usize,
     max_idle_exits: usize,
-    stats: Arc<KvmForwardStats>,
+    stats: Arc<Cpl0ForwardStats>,
     scheduler: Arc<Scheduler>,
-    root_binding: Arc<KvmTaskBinding>,
-    binding: Option<Arc<KvmTaskBinding>>,
+    root_binding: Arc<Cpl0TaskBinding>,
+    binding: Option<Arc<Cpl0TaskBinding>>,
     task: Option<TaskIdentity>,
     loaded_generation: Option<ExecutionGeneration>,
     completion_sent: bool,
     host_objects: Arc<Mutex<[u32; 3]>>,
     bound_host_fds: Arc<BoundHostFds>,
     #[cfg(feature = "kvm-pool-test-control")]
-    loaded_pre_entry_hook: Option<LoadedPreEntryHook>,
+    loaded_pre_entry_hook: Option<LoadedPreEntryHook<M::KickHandle>>,
 }
 
 struct RetainedForward {
@@ -437,7 +444,7 @@ enum ForwardDecision {
 
 /// Whose authority a stopped forward runs under, from the CR3-authenticated
 /// task identity the carrier resolved for the stopping CPU. Only the task
-/// whose [`KvmTaskBinding`] this executor holds has a host `KernelContext`
+/// whose [`Cpl0TaskBinding`] this executor holds has a host `KernelContext`
 /// and (on a loaded lane) a host execution lease. A CPL0-forked child has
 /// neither: its fd table, credentials and waits live in the ring, and the
 /// root's context or lease must never stand in for them.
@@ -448,7 +455,7 @@ enum ForwardAuthority {
 }
 
 impl ForwardAuthority {
-    fn of(task: TaskIdentity, binding: &KvmTaskBinding) -> Self {
+    fn of(task: TaskIdentity, binding: &Cpl0TaskBinding) -> Self {
         if task == binding.arch().task() {
             Self::Task
         } else {
@@ -498,9 +505,9 @@ impl std::fmt::Display for ForwardAuthorityRefusal {
     }
 }
 
-impl KvmPersistentExecutor {
+impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Cpl0PersistentExecutor<M, Mem> {
     fn sample_host_readiness(
-        venue: &mut carrick_vmm_kvm::cpl0_boot::ForwardVenue<'_>,
+        venue: &mut ForwardVenue<'_, M, Mem>,
         request: HostReadinessRequest,
         bound_host_fds: &BoundHostFds,
     ) -> Result<HostReadinessStep, TrapError> {
@@ -580,7 +587,7 @@ impl KvmPersistentExecutor {
     }
 
     fn block_forward(
-        binding: &Arc<KvmTaskBinding>,
+        binding: &Arc<Cpl0TaskBinding>,
         submission: &mut ExecutorSubmissionContext<'_>,
         request: ForwardRequest,
         outcome: DispatchOutcome,
@@ -599,9 +606,11 @@ impl KvmPersistentExecutor {
             let mut retained = binding
                 .retained
                 .lock()
-                .map_err(|_| TrapError::Hypervisor("KVM retained frame poisoned".into()))?;
+                .map_err(|_| TrapError::Hypervisor("CPL0 retained frame poisoned".into()))?;
             if retained.is_some() {
-                return Err(TrapError::Hypervisor("KVM forward already retained".into()));
+                return Err(TrapError::Hypervisor(
+                    "CPL0 forward already retained".into(),
+                ));
             }
             *retained = Some(RetainedForward { frame, request });
         }
@@ -613,13 +622,13 @@ impl KvmPersistentExecutor {
 
     fn task(&self) -> Result<TaskIdentity, TrapError> {
         self.task
-            .ok_or_else(|| TrapError::Hypervisor("KVM executor has no loaded task".into()))
+            .ok_or_else(|| TrapError::Hypervisor("CPL0 executor has no loaded task".into()))
     }
 
     fn publish_exit(&mut self, result: InitialProcessExit) -> Result<(), TrapError> {
         self.completed
             .send(Ok(result))
-            .map_err(|_| TrapError::Hypervisor("KVM completion receiver closed".into()))?;
+            .map_err(|_| TrapError::Hypervisor("CPL0 completion receiver closed".into()))?;
         self.completion_sent = true;
         Ok(())
     }
@@ -996,9 +1005,9 @@ impl KvmPersistentExecutor {
             let mut result =
                 resume_continuation(submission.execution_lease_mut()?, event, &context)
                     .map_err(|error| TrapError::Hypervisor(format!("KVM resume: {error:?}")))?;
-            let restart = match route_kvm_resume_effects(result.take_resume_effects()) {
-                KvmResumeEffect::Continue(restart) => restart,
-                KvmResumeEffect::Refuse(errno) => {
+            let restart = match route_cpl0_resume_effects(result.take_resume_effects()) {
+                Cpl0ResumeEffect::Continue(restart) => restart,
+                Cpl0ResumeEffect::Refuse(errno) => {
                     self.physical
                         .complete_forward(task, retained.frame, errno.guest_retval())?;
                     return Ok(ExecutorExit::Syscall);
@@ -1105,11 +1114,11 @@ impl KvmPersistentExecutor {
             hook(need_resched, &self.idle_kick);
         }
         if need_resched.load(Ordering::Acquire) {
-            self.idle_kick.disarm_run();
+            M::disarm_run_kick(&self.idle_kick);
             return Ok(ExecutorExit::Preempted);
         }
         let stopped = self.physical.cpu_mut().run_loaded(task);
-        self.idle_kick.disarm_run();
+        M::disarm_run_kick(&self.idle_kick);
         let stopped = stopped
             .map_err(|error| TrapError::Hypervisor(format!("KVM stopped run boundary: {error}")))?;
         match &stopped.exit {
@@ -1129,7 +1138,9 @@ impl KvmPersistentExecutor {
                 )?;
                 self.scheduler.poke_executor_control();
                 if let Some(status) = status {
-                    self.publish_exit(status.into_initial_process_exit(exited))?;
+                    self.publish_exit(carrick_vmm_kvm::cpl0_boot::initial_process_exit(
+                        status, exited,
+                    ))?;
                     Ok(ExecutorExit::Exited)
                 } else {
                     Ok(ExecutorExit::ResumeEl1)
@@ -1175,7 +1186,9 @@ impl KvmPersistentExecutor {
                         })?
                 {
                     let exits = self.total_exits.load(Ordering::Acquire);
-                    self.publish_exit(status.into_initial_process_exit(exits))?;
+                    self.publish_exit(carrick_vmm_kvm::cpl0_boot::initial_process_exit(
+                        status, exits,
+                    ))?;
                 }
                 Ok(GuestIdleExit::Idle)
             }
@@ -1202,24 +1215,24 @@ impl KvmPersistentExecutor {
             CarrierRunExit::Halt => Ok(GuestIdleExit::Unsupported),
             CarrierRunExit::Kick => Ok(GuestIdleExit::Idle),
             other => Err(TrapError::Hypervisor(format!(
-                "idle KVM peer needs a host task handback: {other:?}"
+                "idle CPL0 peer needs a host task handback: {other:?}"
             ))),
         }
     }
 }
 
-impl Drop for KvmPersistentExecutor {
+impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> Drop for Cpl0PersistentExecutor<M, Mem> {
     fn drop(&mut self) {
         if !self.completion_sent {
             let _ = self
                 .completed
-                .send(Err("KVM worker stopped before terminal guest exit".into()));
+                .send(Err("CPL0 worker stopped before terminal guest exit".into()));
         }
     }
 }
 
-impl PersistentExecutor for KvmPersistentExecutor {
-    type TaskBinding = KvmTaskBinding;
+impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> PersistentExecutor for Cpl0PersistentExecutor<M, Mem> {
+    type TaskBinding = Cpl0TaskBinding;
 
     fn load(&mut self, task: &RunnableTask<'_, Self::TaskBinding>) -> Result<(), TrapError> {
         let state = task.validate_for_load()?;
@@ -1369,7 +1382,7 @@ impl PersistentExecutor for KvmPersistentExecutor {
     }
 
     fn disarm_guest_idle(&mut self) {
-        self.idle_kick.disarm_run();
+        M::disarm_run_kick(&self.idle_kick);
     }
 
     fn wait_in_guest(&mut self) -> Result<GuestIdleExit, TrapError> {
@@ -1378,13 +1391,13 @@ impl PersistentExecutor for KvmPersistentExecutor {
     }
 }
 
-pub(crate) struct KvmTaskBinding {
+pub(crate) struct Cpl0TaskBinding {
     identity: TaskLoadIdentity,
     arch: GuestArchBinding,
     thread: ThreadKey,
     kernel_binding: KernelTaskBinding,
     retained: Mutex<Option<RetainedForward>>,
-    kernel_stack: Mutex<Option<carrick_vmm_kvm::cpl0_boot::KernelStackSnapshot>>,
+    kernel_stack: Mutex<Option<KernelStackSnapshot>>,
     futex: Arc<carrick_thread::thread::FutexTable>,
 }
 
@@ -1413,7 +1426,7 @@ impl ForwardOwner {
     ) -> Result<(), TrapError> {
         if thread != self.thread || generation != self.generation || loaded != Some(self.task) {
             return Err(TrapError::Hypervisor(
-                "KVM forward requires the exact running task lease".into(),
+                "CPL0 forward requires the exact running task lease".into(),
             ));
         }
         Ok(())
@@ -1477,7 +1490,7 @@ mod forward_owner_tests {
     }
 }
 
-impl KvmTaskBinding {
+impl Cpl0TaskBinding {
     pub(crate) fn new(
         context: &KernelContext,
         state: &MigratableTaskState,
@@ -1497,7 +1510,7 @@ impl KvmTaskBinding {
             || arch.task().execution.raw().get() != generation.raw()
         {
             return Err(TrapError::Hypervisor(
-                "KVM task binding differs from the issued kernel root".to_owned(),
+                "CPL0 task binding differs from the issued kernel root".to_owned(),
             ));
         }
         let binding = Self {
@@ -1525,12 +1538,12 @@ impl KvmTaskBinding {
         self.kernel_binding
             .capture(self.thread.tid)
             .map_err(|error| {
-                TrapError::Hypervisor(format!("KVM task binding became stale: {error}"))
+                TrapError::Hypervisor(format!("CPL0 task binding became stale: {error}"))
             })
     }
 }
 
-impl PersistentTaskBinding for KvmTaskBinding {
+impl PersistentTaskBinding for Cpl0TaskBinding {
     fn load_identity(&self) -> TaskLoadIdentity {
         self.identity
     }
@@ -1538,7 +1551,7 @@ impl PersistentTaskBinding for KvmTaskBinding {
     fn validate_task_state(&self, state: &MigratableTaskState) -> Result<(), TrapError> {
         let GuestCpuState::X86_64V1(cpu) = &state.cpu else {
             return Err(TrapError::Hypervisor(
-                "KVM binding received a non-x86 saved CPU".to_owned(),
+                "CPL0 binding received a non-x86 saved CPU".to_owned(),
             ));
         };
         if state.mm != self.identity.mm
@@ -1547,16 +1560,16 @@ impl PersistentTaskBinding for KvmTaskBinding {
             || cpu.asid_generation() != state.asid_generation
         {
             return Err(TrapError::Hypervisor(
-                "KVM binding rejected saved MM or generation".to_owned(),
+                "CPL0 binding rejected saved MM or generation".to_owned(),
             ));
         }
         self.arch.validate_x86(cpu)
     }
 }
 
-pub(crate) type KvmTaskBindingDirectory = TaskBindingDirectory<KvmTaskBinding>;
+pub(crate) type Cpl0TaskBindingDirectory = TaskBindingDirectory<Cpl0TaskBinding>;
 
-impl TaskBindingResolver<KvmTaskBinding> for KvmTaskBindingDirectory {
+impl TaskBindingResolver<Cpl0TaskBinding> for Cpl0TaskBindingDirectory {
     fn install_scheduler(self: &Arc<Self>, scheduler: &Arc<Scheduler>) -> Result<(), TrapError> {
         TaskBindingDirectory::install_scheduler(self, scheduler)
     }
@@ -1565,7 +1578,7 @@ impl TaskBindingResolver<KvmTaskBinding> for KvmTaskBindingDirectory {
         &self,
         thread: ThreadKey,
         generation: ExecutionGeneration,
-    ) -> Result<Arc<KvmTaskBinding>, TrapError> {
+    ) -> Result<Arc<Cpl0TaskBinding>, TrapError> {
         self.resolve_active(thread, generation)
     }
 
@@ -1664,7 +1677,7 @@ mod tests {
     fn make_x86_binding(
         context: &KernelContext,
         state: &MigratableTaskState,
-    ) -> Arc<KvmTaskBinding> {
+    ) -> Arc<Cpl0TaskBinding> {
         let nonzero = |raw| std::num::NonZeroU64::new(raw).expect("nonzero identity");
         let root = RootGpa::page_aligned(FrameGpa::new(0x7000)).expect("aligned root");
         let arch = GuestArchBinding::x86(
@@ -1679,7 +1692,7 @@ mod tests {
                 generation: ContextGeneration::new(nonzero(1)),
             },
         );
-        let binding = KvmTaskBinding::new(context, state, arch, ExecutionGeneration::INITIAL)
+        let binding = Cpl0TaskBinding::new(context, state, arch, ExecutionGeneration::INITIAL)
             .expect("issued KVM root binding");
         Arc::new(binding)
     }
@@ -1736,9 +1749,11 @@ mod tests {
         };
         let request = ForwardRequest::Syscall(SyscallRequest::new(72, SyscallArgs::new([0; 6])));
 
-        let exit =
-            KvmPersistentExecutor::block_forward(&binding, &mut submission, request, outcome, None)
-                .expect("block_forward");
+        let exit = Cpl0PersistentExecutor::<
+            carrick_vmm_kvm::carrier_cpu::KvmCpuIo,
+            carrick_vmm_kvm::KvmVm,
+        >::block_forward(&binding, &mut submission, request, outcome, None)
+        .expect("block_forward");
 
         let ExecutorExit::BlockedContinuation { continuation, .. } = exit else {
             panic!("expected BlockedContinuation exit");
@@ -1831,9 +1846,11 @@ mod tests {
             sig_mask: WaitSigMask::Replace(sigmask),
         });
 
-        let exit =
-            KvmPersistentExecutor::block_forward(&binding, &mut submission, request, outcome, None)
-                .expect("block_forward");
+        let exit = Cpl0PersistentExecutor::<
+            carrick_vmm_kvm::carrier_cpu::KvmCpuIo,
+            carrick_vmm_kvm::KvmVm,
+        >::block_forward(&binding, &mut submission, request, outcome, None)
+        .expect("block_forward");
 
         let ExecutorExit::BlockedContinuation { continuation, .. } = exit else {
             panic!("expected BlockedContinuation exit");

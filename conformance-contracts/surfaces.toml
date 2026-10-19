@@ -579,7 +579,7 @@ path = "crates/carrick-runtime/src/vcpu_loop/executor/pool.rs"
 contracts = ["kernel.vcpu.vm-lifetime", "kernel.el1.guest-run-queue", "kernel.mm.address-space-occupancy", "kernel.scheduler.runnable-progress"]
 
 [[surfaces]]
-path = "crates/carrick-runtime/src/vcpu_loop/executor/kvm.rs"
+path = "crates/carrick-runtime/src/vcpu_loop/executor/cpl0.rs"
 contracts = ["kernel.el1.guest-run-queue", "kernel.scheduler.host-wait-handoff", "kernel.signal.temporary-wait-mask"]
 
 [[surfaces]]
@@ -1191,11 +1191,11 @@ path = "crates/carrick-x86-cpl0/src/anonymous.rs"
 contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents", "kernel.el1.anonymous-reservations"]
 
 [[surfaces]]
-path = "crates/carrick-vmm-kvm/src/cpl0_anonymous.rs"
+path = "crates/carrick-x86-cpl0-host/src/cpl0_anonymous.rs"
 contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents", "kernel.el1.anonymous-reservations"]
 
 [[surfaces]]
-path = "crates/carrick-vmm-kvm/src/cpl0_private_witness.rs"
+path = "crates/carrick-x86-cpl0-host/src/cpl0_private_witness.rs"
 contracts = ["kernel.el1.mm-exclusive-owner"]
 
 [[surfaces]]
@@ -1215,8 +1215,28 @@ path = "crates/carrick-vmm-kvm/tests/cpl0_fork_e2e.rs"
 contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.el1.thread-lifecycle"]
 
 [[surfaces]]
-path = "crates/carrick-vmm-kvm/src/carrier_memory/tests.rs"
+path = "crates/carrick-x86-cpl0-host/src/carrier_memory/tests.rs"
 contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents"]
+
+[[surfaces]]
+path = "crates/carrick-x86-cpl0-host/src/carrier_cpu.rs"
+contracts = ["kernel.mm.address-space-occupancy"]
+
+[[surfaces]]
+path = "crates/carrick-x86-cpl0-host/src/carrier_memory.rs"
+contracts = ["kernel.x86.file-region"]
+
+[[surfaces]]
+path = "crates/carrick-x86-cpl0-host/src/cpl0_boot.rs"
+contracts = ["kernel.x86.file-region"]
+
+[[surfaces]]
+path = "crates/carrick-x86-cpl0-host/src/guest_ram.rs"
+contracts = ["kernel.mm.address-space-occupancy"]
+
+[[surfaces]]
+path = "crates/carrick-x86-cpl0-host/src/lib.rs"
+contracts = ["kernel.x86.file-region"]
 
 [[surfaces]]
 path = "crates/carrick-personality-linux/src/crossing.rs"
@@ -1599,3 +1619,15 @@ contracts = ["kernel.mm.invalidation-domain"]
 [[surfaces]]
 path = "crates/carrick-core/src/mm/retirement/invalidation/loom_models.rs"
 contracts = ["kernel.mm.invalidation-domain"]
+
+[[surfaces]]
+path = "crates/carrick-x86-cpl0-host/src/carrier_memory/test_support.rs"
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents", "kernel.x86.file-region"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-kvm/src/carrier_memory/tests.rs"
+contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents", "kernel.x86.file-region"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-kvm/src/guest_setup.rs"
+contracts = ["kernel.fork.stage1-image"]

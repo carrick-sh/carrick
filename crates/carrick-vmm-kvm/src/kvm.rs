@@ -655,6 +655,10 @@ pub(crate) struct KvmX86RestoreState {
 }
 
 impl KvmVcpu {
+    pub(crate) fn enroll_carrier_census(&mut self) {
+        self._guard = Some(vcpu_census().created());
+    }
+
     pub(crate) fn arm_run_kick(&mut self, kick: &crate::KvmKickHandle) {
         kick.arm_run(&mut self.fd_mut().get_kvm_run().immediate_exit);
     }
@@ -1208,7 +1212,7 @@ impl KvmVm {
     /// `KVM_CREATE_VCPU` + preferred-target init on the shared `VmFd` (`&self`
     /// — no `next_slot` mutation, unlike [`HvVm::add_vcpu`]). Factored so both
     /// the owning and sibling paths share one vCPU-init sequence.
-    fn create_vcpu_on_shared_vm(&self) -> Result<KvmVcpu, OsError> {
+    pub(crate) fn create_vcpu_on_shared_vm(&self) -> Result<KvmVcpu, OsError> {
         // REUSE a parked vcpu of an exited sibling when one is available: vcpu
         // ids are a finite per-VM resource (KVM_CAP_MAX_VCPUS) that KVM never
         // frees, so a thread-churny guest exhausts KVM_CREATE_VCPU (EINVAL once
@@ -1943,5 +1947,16 @@ pub(crate) unsafe fn invalidate_icache_host_range(host: *mut u8, len: usize) {
             address += line;
         }
         core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod carrier_census_tests {
+    #[test]
+    fn every_carrier_cpu_retains_a_live_census_guard() {
+        let mut machine = crate::carrier_memory::CarrierMachine::create_stopped(3).unwrap();
+        for slot in 0..machine.vcpu_count() {
+            assert!(machine.cpu_mut(slot).unwrap()._guard.is_some());
+        }
     }
 }
