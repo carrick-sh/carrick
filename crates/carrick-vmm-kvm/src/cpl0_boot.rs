@@ -1652,6 +1652,13 @@ impl ProductionCpuLease {
     pub fn arm_idle_kick(&mut self, kick: &KvmKickHandle) -> Result<(), TrapError> {
         self.cpu.arm_idle_kick(kick)
     }
+    pub fn arm_loaded_kick(
+        &mut self,
+        task: carrick_guest_arch::TaskIdentity,
+        kick: &KvmKickHandle,
+    ) -> Result<(), TrapError> {
+        self.cpu.arm_loaded_kick(task, kick)
+    }
     pub fn capture_fault_record(
         &mut self,
         task: carrick_guest_arch::TaskIdentity,

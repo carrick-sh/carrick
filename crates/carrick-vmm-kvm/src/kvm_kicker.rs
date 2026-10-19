@@ -47,16 +47,19 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn idle_kick_survives_signal_before_kvm_run() {
+    fn armed_run_kick_survives_signal_before_kvm_run() {
         let handle = KvmKickHandle::for_current_thread();
         let mut immediate_exit = 0_u8;
-        handle.arm_idle_run(&mut immediate_exit);
+        handle.arm_run(&mut immediate_exit);
         std::thread::scope(|scope| {
             scope.spawn(|| handle.kick()).join().expect("kick thread");
         });
         assert_eq!(immediate_exit, 1, "KVM_RUN must see the pre-entry kick");
-        handle.disarm_idle_run();
-        assert_eq!(immediate_exit, 0, "task entry must not inherit idle kick");
+        handle.disarm_run();
+        assert_eq!(
+            immediate_exit, 0,
+            "the next run must not inherit the prior kick"
+        );
     }
 
     /// A pure-data stand-in for a real `KvmKickHandle`: it records nothing and

@@ -12,11 +12,11 @@ use std::sync::{
 };
 
 #[derive(Clone, Copy)]
-struct IdleRunExitByte(*mut u8);
+struct RunExitByte(*mut u8);
 
-// SAFETY: the mapped KVM byte is installed and removed under the idle-kick
+// SAFETY: the mapped KVM byte is installed and removed under the run-kick
 // mutex. Its owner does not recycle the vCPU until after removal.
-unsafe impl Send for IdleRunExitByte {}
+unsafe impl Send for RunExitByte {}
 
 /// Resolves the signal number to use for `SIG`.
 /// When `SIG == 0`, dynamically resolves `libc::SIGRTMIN()` on Linux.
@@ -66,7 +66,7 @@ pub fn install_posix_kick_handler<const SIG: i32>() {
 #[derive(Clone)]
 pub struct PosixSignalKick<const SIG: i32> {
     tid: libc::pthread_t,
-    idle_exit: Arc<Mutex<Option<IdleRunExitByte>>>,
+    run_exit: Arc<Mutex<Option<RunExitByte>>>,
     kick_pending: Option<Arc<AtomicBool>>,
 }
 
@@ -77,7 +77,7 @@ impl<const SIG: i32> PosixSignalKick<SIG> {
         let tid = unsafe { libc::pthread_self() };
         Self {
             tid,
-            idle_exit: Arc::new(Mutex::new(None)),
+            run_exit: Arc::new(Mutex::new(None)),
             kick_pending: None,
         }
     }
@@ -88,7 +88,7 @@ impl<const SIG: i32> PosixSignalKick<SIG> {
         let tid = unsafe { libc::pthread_self() };
         Self {
             tid,
-            idle_exit: Arc::new(Mutex::new(None)),
+            run_exit: Arc::new(Mutex::new(None)),
             kick_pending: Some(kick_pending),
         }
     }
@@ -101,19 +101,19 @@ impl<const SIG: i32> PosixSignalKick<SIG> {
 
     /// Publish the KVM_RUN byte before the scheduler's last runnable check.
     /// A kick after this point survives even if its signal precedes KVM_RUN.
-    pub fn arm_idle_run(&self, immediate_exit: &mut u8) {
+    pub fn arm_run(&self, immediate_exit: &mut u8) {
         let mut armed = self
-            .idle_exit
+            .run_exit
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         *immediate_exit = 0;
-        *armed = Some(IdleRunExitByte(immediate_exit as *mut u8));
+        *armed = Some(RunExitByte(immediate_exit as *mut u8));
     }
 
-    /// Revoke the mapped-byte publication after KVM_RUN returns or idle is cancelled.
-    pub fn disarm_idle_run(&self) {
+    /// Revoke the mapped-byte publication after KVM_RUN returns or entry is cancelled.
+    pub fn disarm_run(&self) {
         let mut armed = self
-            .idle_exit
+            .run_exit
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         if let Some(byte) = armed.take() {
@@ -121,6 +121,20 @@ impl<const SIG: i32> PosixSignalKick<SIG> {
             // the owner disarms it before that mapping can be recycled.
             unsafe { AtomicU8::from_ptr(byte.0).store(0, Ordering::SeqCst) };
         }
+    }
+
+    /// Observe the armed KVM byte from a deterministic pre-entry fixture.
+    #[doc(hidden)]
+    pub fn fixture_run_exit_byte(&self) -> Option<u8> {
+        let armed = self
+            .run_exit
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        armed.map(|byte| {
+            // SAFETY: the arm keeps this mapping alive while the mutex guard
+            // prevents concurrent disarm.
+            unsafe { AtomicU8::from_ptr(byte.0).load(Ordering::SeqCst) }
+        })
     }
 }
 
@@ -130,7 +144,7 @@ impl<const SIG: i32> crate::VcpuKick for PosixSignalKick<SIG> {
             pending.store(true, Ordering::SeqCst);
         }
         let armed = self
-            .idle_exit
+            .run_exit
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         if let Some(byte) = *armed {

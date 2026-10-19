@@ -282,7 +282,21 @@ impl KvmCarrierCpu<KvmCpuIo> {
 
     pub(crate) fn arm_idle_kick(&mut self, kick: &crate::KvmKickHandle) -> Result<(), TrapError> {
         self.audit_unloaded_peer()?;
-        self.io.vcpu.arm_idle_kick(kick);
+        self.io.vcpu.arm_run_kick(kick);
+        Ok(())
+    }
+
+    pub(crate) fn arm_loaded_kick(
+        &mut self,
+        task: TaskIdentity,
+        kick: &crate::KvmKickHandle,
+    ) -> Result<(), TrapError> {
+        if !matches!(self.custody, Custody::Loaded { binding, .. } if binding.task() == task) {
+            return Err(boundary_error(
+                "loaded kick requires its exact task generation",
+            ));
+        }
+        self.io.vcpu.arm_run_kick(kick);
         Ok(())
     }
     /// Run the carrier's physical peer while no host task lease is claimed.

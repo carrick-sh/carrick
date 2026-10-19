@@ -1345,8 +1345,9 @@ fn loaded_lane_child_syscall_trap_hands_task_back_to_host_and_delivers_stdout() 
 }
 
 /// Ruling 3 on #542: every idle-lane early return completes the run. With a
-/// three-exit budget the loaded root lane exhausts it while the child is
-/// serviced by the idle peer; before the single `settle_lane` path an idle
+/// zero-exit budget is independent per lane, so the child's first forwarded
+/// call exhausts the idle budget while the loaded root is parked in `wait4`;
+/// before the single `settle_lane` path an idle
 /// lane error skipped the `Err` completion and the run hung, and before the
 /// shutdown kick the root vCPU stayed in `KVM_RUN` under the halted parent.
 #[test]
@@ -1354,9 +1355,10 @@ fn idle_lane_exit_budget_failure_completes_the_run() {
     let elf = native_exit_fixture("../../../carrick-cli/tests/fixtures/x86_forked_child_stdout.S");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let result = kvm_pool_fixture::try_run_pool_fixture_with_root_affinity(
+        let result = kvm_pool_fixture::try_run_pool_fixture_with_lane_exit_budgets(
             &elf,
-            3,
+            64,
+            0,
             kvm_pool_fixture::ROOT_AFFINITY_IDLE_PEER,
         );
         let _ = tx.send(result);
@@ -1366,16 +1368,58 @@ fn idle_lane_exit_budget_failure_completes_the_run() {
     );
     match result {
         Ok(outcome) => panic!(
-            "a three-exit budget cannot finish the forked run, got exit {}",
+            "a zero-exit idle budget cannot finish the forked run, got exit {}",
             outcome.run.exit_code
         ),
         Err(error) => assert!(
             error
                 .to_string()
-                .contains("loaded KVM lane guest exit budget exceeded"),
+                .contains("idle KVM lane guest exit budget exceeded"),
             "expected the exit budget failure, got {error}"
         ),
     }
+}
+
+/// A shutdown arriving after the loaded lane's first reschedule check must be
+/// retained by KVM's `immediate_exit` byte until the impending `KVM_RUN`.
+#[test]
+fn loaded_lane_shutdown_kick_between_check_and_entry_is_sticky() {
+    use carrick_hal::VcpuKick;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let elf = native_exit_fixture("../../../carrick-cli/tests/fixtures/x86_forked_child_stdout.S");
+    let injected = std::sync::Arc::new(AtomicBool::new(false));
+    let observed = std::sync::Arc::clone(&injected);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = kvm_pool_fixture::try_run_pool_fixture_with_loaded_pre_entry_hook(
+            &elf,
+            64,
+            64,
+            kvm_pool_fixture::ROOT_AFFINITY_IDLE_PEER,
+            move |need_resched, kick| {
+                if !injected.swap(true, Ordering::AcqRel) {
+                    need_resched.store(true, Ordering::Release);
+                    kick.kick();
+                    assert_eq!(
+                        kick.fixture_run_exit_byte(),
+                        Some(1),
+                        "loaded entry must publish immediate_exit before the shutdown kick"
+                    );
+                }
+            },
+        );
+        let _ = tx.send(result);
+    });
+    let outcome = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("loaded pre-entry shutdown kick must complete the run")
+        .expect("loaded pre-entry shutdown kick run");
+    assert!(
+        observed.load(Ordering::Acquire),
+        "hook did not inject the kick"
+    );
+    assert_eq!(outcome.run.exit_code, 7);
 }
 
 fn forward_authority_fixture(variant: &str) -> Vec<u8> {
@@ -1472,11 +1516,12 @@ fn in_zone_child_stdout_write_resolves_through_childs_own_table() {
     assert_eq!(outcome.run.stderr, b"P");
 }
 
-/// Un-workarounded witness for #599: in-guest `pipe2` (currently `-ENOSYS`) and
+/// Un-workarounded witness for #599/#586: in-guest `pipe2` (currently
+/// `-ENOSYS`) and
 /// parent `read(pipefd[0], buffer, 1)` into an unfaulted post-`fork` COW `.data`
 /// page (currently `-EFAULT` in `ForwardVenue::write_bytes_raw`).
 #[test]
-#[ignore = "#599"]
+#[ignore = "#599/#586"]
 fn in_zone_child_pipe2_and_unfaulted_cow_read_matches_native_oracle() {
     let elf = native_exit_fixture_with_flags(
         "../../../carrick-cli/tests/fixtures/x86_forked_child_forward_authority.S",
