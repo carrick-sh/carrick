@@ -50,7 +50,7 @@ pub const PF_ERR_INSTR: u32 = PageFaultErrorCode::INSTRUCTION_FETCH;
 #[inline]
 #[must_use]
 pub const fn is_canonical_va(va: u64) -> bool {
-    GuestVa::new(va).is_canonical_48bit()
+    ((va as i64) << 16 >> 16) as u64 == va
 }
 
 /// Convert `(cpl, ac)` into [`carrick_softmmu::CpuAccessMode`].

@@ -14,6 +14,24 @@ pub const MAX_MMIO_HOLES: usize = 8;
 
 pub use carrick_guest_arch::HostVa;
 
+/// x86 4 KiB page base for [`HostVa`].
+#[inline]
+pub const fn host_page_base_4k(host_va: HostVa) -> usize {
+    host_va.raw() & (crate::domains::PAGE_BASE_MASK_4K as usize)
+}
+
+/// x86 4 KiB page geometry helper for [`HostVa`].
+pub trait X86HostPage4K {
+    fn page_base(self) -> usize;
+}
+
+impl X86HostPage4K for HostVa {
+    #[inline]
+    fn page_base(self) -> usize {
+        host_page_base_4k(self)
+    }
+}
+
 
 mod sealed {
     use crate::domains::AuthenticatedGpa;

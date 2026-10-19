@@ -6,8 +6,9 @@ use core::mem::size_of;
 
 use crate::domains::{
     Access, Cpl, CpuAccessMode, GuestVa, PAGE_BASE_MASK_4K, PAGE_SHIFT_4K, PAGE_SIZE_4K,
+    X86Page4K, crosses_page_4k, page_base_4k,
 };
-use crate::placement::HostVa;
+use crate::placement::{HostVa, X86HostPage4K, host_page_base_4k};
 
 pub const SOFT_TLB_BITS: u32 = 10;
 pub const SOFT_TLB_ENTRIES: usize = 1 << SOFT_TLB_BITS;
@@ -202,10 +203,10 @@ impl SoftTlb {
         bits
     }
     pub const fn tag_for(va: GuestVa, mode: CpuAccessMode) -> u64 {
-        va.page_base() | Self::mode_tag_bits(mode)
+        page_base_4k(va) | Self::mode_tag_bits(mode)
     }
     pub const fn addend_for(va: GuestVa, host_page: HostVa) -> u64 {
-        (host_page.page_base() as u64).wrapping_sub(va.page_base())
+        (host_page_base_4k(host_page) as u64).wrapping_sub(page_base_4k(va))
     }
     pub const fn read(&self) -> &SoftTlbPlane {
         &self.read
@@ -228,7 +229,7 @@ impl SoftTlb {
         access: Access,
         mode: CpuAccessMode,
     ) -> Option<usize> {
-        if va.crosses_page(len) {
+        if crosses_page_4k(va, len) {
             return None;
         }
         let entry = self.plane(access).entries[Self::index_for(va)];

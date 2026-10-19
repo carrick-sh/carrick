@@ -12,9 +12,9 @@ use carrick_mmu_core::x86::descriptor_txn::{
 use crate::domains::{
     Access, AuthenticatedGpa, CpuAccessMode, FrameGpa, GuestVa, OwnerGeneration, PAGE_BASE_MASK_4K,
     PAGE_OFFSET_MASK_4K, PAGE_SIZE_4K, PageFaultClass, PageFaultInfo, RootGpa, SoftCpuException,
-    SoftTranslationError, Stage1Gpa, TranslatedLeaf,
+    SoftTranslationError, Stage1Gpa, TranslatedLeaf, X86Page4K,
 };
-use crate::placement::{HostVa, LinearPlacement, PlacementError};
+use crate::placement::{HostVa, LinearPlacement, PlacementError, X86HostPage4K};
 use crate::tlb::SoftTlb;
 
 /// Committed physical extent record used to authenticate `(Stage1Gpa, len, OwnerGeneration) -> AuthenticatedGpa`.
