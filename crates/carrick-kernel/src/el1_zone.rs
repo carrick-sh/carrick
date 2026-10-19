@@ -2054,6 +2054,77 @@ mod tests {
             assert_eq!(batches, [vec![record]]);
         }
 
+        /// #695 signed 20x at 81de5b7c0: 4 runs resumed the held thread and
+        /// it faulted on its own stack. The hold must not change what the
+        /// record says or where production places it: released at a
+        /// step-away, the captured record is placed by `settle_vacated`
+        /// exactly as an unheld record queued on that slot is, with its
+        /// identity (thread, generation, mm, affinity) unchanged, and the
+        /// live slot's executor takes exactly that record.
+        #[test]
+        fn held_record_is_placed_like_a_production_record() {
+            let generation = crate::kernel::objects::ExecutionGeneration::from_raw(9);
+            let expected = carrick_el1_abi::ThreadIdentity {
+                tid: carrick_el1_abi::El1TaskId::from_linux_tid(thread().tid.raw()).raw(),
+                serial: thread().serial.raw(),
+                mm: 0,
+                file_table: 0,
+                generation: generation.raw(),
+                affinity: 0b11,
+                lifecycle_page: 0,
+                control_slot: 0,
+            };
+            // Where one vacated record ends up, and what it says there.
+            let run = |held: bool| {
+                let zone: &'static ZoneTables = Box::leak(heap_zone());
+                let (away, live) = (SlotId::new(0), SlotId::new(1));
+                zone.drive(away, 7);
+                zone.drive(live, 8);
+                zone.publish_slot(away, 0, Some(0), 0);
+                zone.publish_slot(live, 0, Some(1), 0);
+                let mut record = None;
+                let batches = captures(|| {
+                    with_test_zone(zone, || {
+                        if held {
+                            let hold = arm(Duration::from_secs(10));
+                            step_away_from_slot(live, 8);
+                            zone.step_back(live, 8);
+                            assert!(place_service(thread(), generation, 0b11));
+                            assert_eq!(zone.slot(away).queued() + zone.slot(live).queued(), 0);
+                            step_away_from_slot(away, 7);
+                            let HoldOutcome::ReleasedAtStepAway { record: held, slot } =
+                                hold.finish()
+                            else {
+                                panic!("hold was not released at the step-away");
+                            };
+                            assert_eq!(slot, away);
+                            record = Some(held);
+                        } else {
+                            // Production: the record is already queued on the
+                            // slot whose driver steps away.
+                            let id = zone.alloc_host_runnable(expected).unwrap();
+                            assert!(zone.requeue_on(away, id));
+                            record = Some(zone.record_ref(id));
+                            step_away_from_slot(away, 7);
+                        }
+                    });
+                });
+                let record = record.unwrap();
+                assert_eq!(batches, [vec![record]]);
+                assert_eq!(zone.slot(away).queued(), 0);
+                assert_eq!(zone.slot(live).queued(), 1);
+                let rec = zone.live(record).expect("placed record is live");
+                assert_eq!(rec.identity(), expected);
+                assert_eq!(rec.handback(), Some(Handback::Service));
+                // The live slot's executor takes exactly this record; its
+                // identity names the thread's exact runnable generation.
+                assert_eq!(zone.take_service_head(live), Some(record));
+                assert_eq!(zone.live(record).map(|rec| rec.identity()), Some(expected));
+            };
+            run(false);
+            run(true);
+        }
+
         #[test]
         fn unreleased_hold_expires_to_the_host_queue() {
             let zone: &'static ZoneTables = Box::leak(heap_zone());
