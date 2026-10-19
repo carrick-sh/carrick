@@ -20,8 +20,11 @@ pub use crate::native_execution::read_msr;
 core::arch::global_asm!(
     ".global CARRICK_X86_CPL0_IMAGE_END",
     ".set CARRICK_X86_CPL0_IMAGE_END, {end}",
+    ".global CARRICK_X86_CPL0_IRQ_HEADER_VA",
+    ".set CARRICK_X86_CPL0_IRQ_HEADER_VA, {irq_header_va}",
     end = const carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_BASE
         + carrick_el1_abi::X86_CPL0_SUPERVISOR_IMAGE_SIZE,
+    irq_header_va = const carrick_el1_abi::X86_CPL0_IRQ_HEADER_VA,
 );
 
 const _: () = assert!(core::mem::offset_of!(CpuBinding, task_address) == 24);
