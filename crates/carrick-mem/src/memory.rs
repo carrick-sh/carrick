@@ -349,8 +349,17 @@ const _: () = assert!(
 );
 const _: () = assert!(LINUX_SYSCALL_MAILBOX_SLOT_SIZE == 256);
 const _: () = assert!(carrick_el1_abi::EL1_STACK_SIZE == 16 * 1024);
+// The EL1 stack guard covers whole host pages, so the usable stacks and
+// guards stay host-page aligned (#369).
+const _: () =
+    assert!(carrick_el1_abi::EL1_STACK_GUARD_SIZE >= carrick_guest_mem::HOST_PAGE_GRANULE);
 const _: () = assert!(
-    (LINUX_SYSCALL_MAILBOX_SLOTS as u64) * carrick_el1_abi::EL1_STACK_SIZE
+    carrick_el1_abi::EL1_STACK_GUARD_SIZE.is_multiple_of(carrick_guest_mem::HOST_PAGE_GRANULE)
+);
+const _: () =
+    assert!(carrick_el1_abi::EL1_STACK_GUARD_TABLES_OFFSET >= carrick_el1_abi::EL1_IMAGE_SIZE);
+const _: () = assert!(
+    (LINUX_SYSCALL_MAILBOX_SLOTS as u64) * carrick_el1_abi::EL1_STACK_STRIDE
         <= carrick_el1_abi::EL1_STACKS_SIZE
 );
 const _: () = assert!(
@@ -546,6 +555,7 @@ const AARCH64_UBFX_X16_X16_26_6_OPCODE: u32 = 0xd35a_7e10;
 const AARCH64_CMP_X16_SVC64_OPCODE: u32 = 0xf100_561f;
 const AARCH64_CMP_X16_DATA_ABORT_OPCODE: u32 = 0xf100_921f;
 const AARCH64_MRS_FAR_EL1_X17_OPCODE: u32 = 0xd538_6011;
+const AARCH64_MRS_FAR_EL1_X16_OPCODE: u32 = 0xd538_6010;
 const AARCH64_MSR_FAR_EL1_X17_OPCODE: u32 = 0xd518_6011;
 const AARCH64_MRS_ELR_EL1_X16_OPCODE: u32 = 0xd538_4030;
 const AARCH64_MRS_SPSR_EL1_X16_OPCODE: u32 = 0xd538_4010;
@@ -2172,6 +2182,12 @@ impl AddressSpace {
         let end = start
             .checked_add(size)
             .ok_or(AddressSpaceError::RegionOverflow { start, size })?;
+        // The image, then the maintenance root's stack-arena tables in the
+        // counters area (the rest of the region starts zeroed).
+        let tables = carrick_el1_abi::EL1_STACK_GUARD_TABLES_OFFSET as usize;
+        let mut bytes = carrick_el1_image::IMAGE.to_vec();
+        bytes.resize(tables, 0);
+        bytes.extend_from_slice(&el1_stack_guard_tables());
         let region = MemoryRegion {
             start,
             end,
@@ -2181,7 +2197,7 @@ impl AddressSpace {
                 execute: true,
             },
             shared: true,
-            bytes: carrick_el1_image::IMAGE.to_vec().into(),
+            bytes: bytes.into(),
         };
         let AddressSpace {
             arm_ring_first,
@@ -3581,10 +3597,14 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
         AARCH64_LINUX_PAGE_TABLE_LAYOUT,
     );
     mgr.set_multi_vcpu(true);
-    if let Err(error) = seal_fresh_image_windows(&mut mgr) {
+    // The carrier windows no fresh image owns, and every EL1 stack guard
+    // (#369), leave this template without a translation.
+    if let Err(error) = seal_fresh_image_windows(&mut mgr)
+        .and_then(|()| provision_el1_stack_guards(&mut mgr, None).map(drop))
+    {
         carrick_fatal!(
             "mem::stage1_tables",
-            "failed to apply PROT_NONE to the carrier windows in initial stage-1 page tables: {error:?}"
+            "failed to unmap the carrier windows and EL1 stack guards in initial stage-1 page tables: {error:?}"
         );
     }
     match mgr.into_bytes() {
@@ -3753,6 +3773,46 @@ pub fn seal_fresh_image_windows(
         mgr.set_prot_none(base, len, None)?;
     }
     Ok(())
+}
+
+/// Leave every EL1 stack guard of an MM image without a translation
+/// (#369). Each constructor of a live HVPatch MM image (boot, exec rebuild,
+/// fork child) calls this beside `provision_cow_copy_window`, so a ring
+/// stack overflow faults on its own guard in every address space.
+pub fn provision_el1_stack_guards(
+    mgr: &mut carrick_mmu_core::aarch64::PageTableManager,
+    source: Option<&mut dyn carrick_mmu_core::aarch64::TableArenaSource>,
+) -> Result<bool, carrick_mmu_core::aarch64::PageTableError> {
+    mgr.provision_guard_pages(carrick_el1_abi::el1_stack_guards(), source)
+}
+
+/// The stage-1 descriptor for the stack-arena page at `va` in a level-3
+/// table: none for a guard, else the kernel-only page the arena's 2 MiB
+/// block would have mapped (`flags` carry the block's attributes). The one
+/// leaf rule for the carrier maintenance root's shared stack tables;
+/// [`provision_el1_stack_guards`] applies the same rule to MM images.
+pub fn el1_stack_page_descriptor(va: u64, flags: u64) -> u64 {
+    const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000;
+    if carrick_el1_abi::is_el1_stack_guard(va) {
+        0
+    } else {
+        (va & PA_MASK_4KIB) | flags | 0b10
+    }
+}
+
+/// The carrier maintenance root's level-3 tables for the stack arena,
+/// placed at [`carrick_el1_abi::EL1_STACK_GUARD_TABLES_BASE`]: page by page
+/// kernel-only, every guard without a translation.
+pub fn el1_stack_guard_tables() -> Vec<u8> {
+    const NON_GLOBAL: u64 = 1 << 11;
+    const KERNEL_BLOCK_FLAGS: u64 = ((1u64 << 54) | (1 << 10) | (0b11 << 8)) | 0b01;
+    let mut bytes = vec![0_u8; carrick_el1_abi::EL1_STACK_GUARD_TABLES_SIZE as usize];
+    for (index, word) in bytes.chunks_exact_mut(8).enumerate() {
+        let va = carrick_el1_abi::EL1_STACKS_BASE + ((index as u64) << 12);
+        let descriptor = el1_stack_page_descriptor(va, KERNEL_BLOCK_FLAGS | NON_GLOBAL);
+        word.copy_from_slice(&descriptor.to_le_bytes());
+    }
+    bytes
 }
 
 /// Make every EL0 address of a rebuilt image that none of its `owned`
@@ -3943,11 +4003,23 @@ pub fn stage1_carrier_maintenance_page_tables() -> Vec<u8> {
     // mapped kernel-only: a vCPU with no thread runs the EL1 scheduler on
     // this root (EL1 plan 1d), so no process's tables need outlive its own
     // threads to keep an idle vCPU's translations valid.
+    // The stack arena's blocks are translated page by page through the
+    // shared tables in the EL1 region, so each slot's guard is unmapped
+    // here too (#369): an idle vCPU's scheduler runs on this root.
     let el1_first = ((LINUX_EL1_KERNEL_BASE - LINUX_KERNEL_REGION_BASE) >> 21) as usize;
     let el1_blocks = (LINUX_EL1_KERNEL_SIZE >> 21) as usize;
     for index in el1_first..el1_first + el1_blocks {
         let pa = LINUX_KERNEL_REGION_BASE + ((index as u64) << 21);
-        let desc = (pa & PA_MASK_2MIB) | KERNEL_BLOCK_FLAGS | NON_GLOBAL;
+        let stack_table = pa
+            .checked_sub(carrick_el1_abi::EL1_STACKS_BASE)
+            .map(|offset| offset / carrick_el1_abi::EL1_STACK_TABLE_SPAN)
+            .filter(|table| *table < carrick_el1_abi::EL1_STACK_TABLE_PAGES as u64);
+        let desc = match stack_table {
+            Some(table) => {
+                table_descriptor(carrick_el1_abi::EL1_STACK_GUARD_TABLES_BASE + table * 0x1000)
+            }
+            None => (pa & PA_MASK_2MIB) | KERNEL_BLOCK_FLAGS | NON_GLOBAL,
+        };
         let off = l2_off + index * 8;
         bytes[off..off + 8].copy_from_slice(&desc.to_le_bytes());
     }
@@ -4149,8 +4221,7 @@ pub fn el1_vectors_bytes() -> Vec<u8> {
             bytes[cursor..cursor + hvc_fault.len()].copy_from_slice(&hvc_fault);
             cursor += hvc_fault.len();
         } else if slot_offset == AARCH64_VECTOR_CUR_EL_SPX_SYNC_OFFSET {
-            write_el1_cur_el_sync_slot(&mut bytes, slot_offset);
-            cursor += AARCH64_VECTOR_SLOT_SIZE;
+            // Written below, after the handler area is filled.
         } else {
             bytes[cursor..cursor + eret.len()].copy_from_slice(&eret);
             cursor += eret.len();
@@ -4170,6 +4241,7 @@ pub fn el1_vectors_bytes() -> Vec<u8> {
         bytes[offset..offset + nop.len()].copy_from_slice(&nop);
         offset += nop.len();
     }
+    write_el1_cur_el_sync_slot(&mut bytes, AARCH64_VECTOR_CUR_EL_SPX_SYNC_OFFSET);
     bytes
 }
 
@@ -4297,6 +4369,23 @@ fn enc_ldr_wt_sp(rt: u32, off: u64) -> u32 {
     0xB940_03E0 | (((off as u32 / 4) & 0xFFF) << 10) | (rt & 0x1F)
 }
 
+/// `tbz xt, #bit, target`.
+fn enc_tbz(rt: u32, bit: u32, pc: u64, target: u64) -> u32 {
+    let imm14 = (((target as i64 - pc as i64) / 4) as u32) & 0x3FFF;
+    0x3600_0000 | ((bit >> 5) << 31) | ((bit & 31) << 19) | (imm14 << 5) | rt
+}
+/// `add sp, sp, xm` (extended register, UXTX).
+const fn enc_add_sp_sp_xm(rm: u32) -> u32 {
+    0x8B20_63FF | (rm << 16)
+}
+/// `sub xd, sp, xm` (extended register, UXTX).
+const fn enc_sub_xd_sp_xm(rd: u32, rm: u32) -> u32 {
+    0xCB20_63E0 | (rm << 16) | rd
+}
+/// `sub sp, sp, xm` (extended register, UXTX).
+const fn enc_sub_sp_sp_xm(rm: u32) -> u32 {
+    0xCB20_63FF | (rm << 16)
+}
 fn enc_add_xd_sp(rd: u32, imm: u16) -> u32 {
     0x9100_03E0 | ((u32::from(imm) & 0xFFF) << 10) | (rd & 0x1F)
 }
@@ -4355,18 +4444,74 @@ fn write_x16_address(bytes: &mut [u8], cursor: &mut usize, base: u64) {
 /// When ELR_EL1 is inside the EL1 image and `fixup_pc` is armed in CurrentTask, redirects
 /// ELR_EL1 to `fixup_pc` and erets. Otherwise, traps loud via `hvc #3`.
 fn write_el1_cur_el_sync_slot(bytes: &mut [u8], slot_offset: usize) {
-    let mut cursor = slot_offset;
     let put = |bytes: &mut [u8], off: usize, op: u32| {
         bytes[off..off + 4].copy_from_slice(&op.to_le_bytes());
     };
+    // The handler outgrew the slot's 32 instructions when it gained the
+    // stack-guard check, so the slot branches to it in the free tail of the
+    // handler area (after the mailbox handler, before the EL1 hook).
+    put(
+        bytes,
+        slot_offset,
+        enc_b(slot_offset as u64, EL1_CUR_EL_SYNC_HANDLER_OFFSET as u64),
+    );
+    let mut cursor = EL1_CUR_EL_SYNC_HANDLER_OFFSET;
     let emit = |bytes: &mut [u8], cursor: &mut usize, opcode: u32| {
         put(bytes, *cursor, opcode);
         *cursor += 4;
     };
 
-    // 1. Alloc scratch space and save x16, x17
+    // 1. Alloc scratch space and save x16, x17 -- unless the scratch would
+    //    land in an EL1 stack guard (#369). An overflow faulted on its guard
+    //    with SP at or below the slot's usable base; storing scratch there
+    //    would fault again and walk SP down into the neighbour slot's stack.
+    //    With no register free, swap x0 and SP arithmetically, test the
+    //    usable-half address bit of the new SP, and swap back. A clear bit
+    //    (a guard, or an SP outside the arena, which fails loud anyway)
+    //    reports the original fault through `hvc #3` without a store.
     emit(bytes, &mut cursor, 0xD100_83FF); // sub sp, sp, #32
+    emit(bytes, &mut cursor, enc_add_sp_sp_xm(0)); // add sp, sp, x0
+    emit(bytes, &mut cursor, enc_sub_xd_sp_xm(0, 0)); // sub x0, sp, x0 (x0 = new sp)
+    let tbz_guard = cursor;
+    emit(bytes, &mut cursor, 0); // tbz x0, #USABLE_BIT, guard_hit
+    emit(bytes, &mut cursor, enc_sub_xd_sp_xm(0, 0)); // sub x0, sp, x0 (x0 restored)
+    emit(bytes, &mut cursor, enc_sub_sp_sp_xm(0)); // sub sp, sp, x0 (sp = new sp)
     emit(bytes, &mut cursor, 0xA900_47F0); // stp x16, x17, [sp]
+    // 1b. A fault whose address is an EL1 stack guard is a stack overflow,
+    //     never a user access an armed fixup may absorb: fail loud.
+    emit(bytes, &mut cursor, AARCH64_MRS_FAR_EL1_X16_OPCODE); // mrs x16, far_el1
+    let guard_base = carrick_el1_abi::EL1_STACKS_BASE;
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movz_xn(17, ((guard_base >> 16) & 0xFFFF) as u16, 1),
+    );
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movk_xn(17, ((guard_base >> 32) & 0xFFFF) as u16, 2),
+    );
+    emit(bytes, &mut cursor, 0xCB11_0210); // sub x16, x16, x17
+    emit(
+        bytes,
+        &mut cursor,
+        enc_movz_xn(
+            17,
+            ((carrick_el1_abi::EL1_STACKS_SIZE >> 16) & 0xFFFF) as u16,
+            1,
+        ),
+    );
+    emit(bytes, &mut cursor, 0xEB11_021F); // cmp x16, x17
+    let bhs_not_guard = cursor;
+    emit(bytes, &mut cursor, 0); // b.hs not_guard
+    let tbz_far_guard = cursor;
+    emit(bytes, &mut cursor, 0); // tbz x16, #USABLE_BIT, fail_loud
+    let not_guard = cursor;
+    put(
+        bytes,
+        bhs_not_guard,
+        enc_bhs(bhs_not_guard as u64, not_guard as u64),
+    );
     // 2. Read faulting PC
     emit(bytes, &mut cursor, AARCH64_MRS_ELR_EL1_X16_OPCODE); // mrs x16, elr_el1
 
@@ -4397,7 +4542,7 @@ fn write_el1_cur_el_sync_slot(bytes: &mut [u8], slot_offset: usize) {
     emit(bytes, &mut cursor, 0); // bhs fail_loud
 
     // 4. Compute slot index from SP_EL1 before the exception:
-    //    original_sp = sp + 32; slot = (original_sp - EL1_STACKS_BASE) >> 14
+    //    original_sp = sp + 32; slot = (original_sp - EL1_STACKS_BASE) >> 15
     emit(bytes, &mut cursor, enc_add_xd_sp(16, 32));
     let stacks_base = carrick_el1_abi::EL1_STACKS_BASE;
     emit(
@@ -4420,7 +4565,12 @@ fn write_el1_cur_el_sync_slot(bytes: &mut [u8], slot_offset: usize) {
     emit(bytes, &mut cursor, 0xEB11_021F); // cmp x16, x17
     let bhs_fail2 = cursor;
     emit(bytes, &mut cursor, 0); // bhs fail_loud
-    emit(bytes, &mut cursor, 0xD34E_FE10); // lsr x16, x16, #14 (slot index 0..255)
+    // lsr x16, x16, #EL1_STACK_STRIDE_SHIFT (slot index 0..255)
+    emit(
+        bytes,
+        &mut cursor,
+        0xD340_FC00 | (carrick_el1_abi::EL1_STACK_STRIDE_SHIFT << 16) | (16 << 5) | 16,
+    );
 
     // 5. Load fixup_pc from CurrentTask[slot]:
     //    task_addr = EL1_CURRENT_TASKS_BASE + (slot << CURRENT_TASK_STRIDE_SHIFT)
@@ -4459,6 +4609,23 @@ fn write_el1_cur_el_sync_slot(bytes: &mut [u8], slot_offset: usize) {
     emit(bytes, &mut cursor, 0x9100_83FF); // add sp, sp, #32
     emit(bytes, &mut cursor, AARCH64_HVC_FAULT_OPCODE);
 
+    // 9. Guard hit: restore x0 and SP (nothing was stored) and fail loud.
+    let guard_hit = cursor;
+    emit(bytes, &mut cursor, enc_sub_xd_sp_xm(0, 0)); // sub x0, sp, x0 (x0 restored)
+    emit(bytes, &mut cursor, enc_sub_sp_sp_xm(0)); // sub sp, sp, x0 (sp = new sp)
+    emit(bytes, &mut cursor, 0x9100_83FF); // add sp, sp, #32
+    emit(bytes, &mut cursor, AARCH64_HVC_FAULT_OPCODE);
+    put(
+        bytes,
+        tbz_guard,
+        enc_tbz(
+            0,
+            carrick_el1_abi::EL1_STACK_USABLE_BIT,
+            tbz_guard as u64,
+            guard_hit as u64,
+        ),
+    );
+
     // Patch forward branches to fail_loud
     put(
         bytes,
@@ -4475,13 +4642,21 @@ fn write_el1_cur_el_sync_slot(bytes: &mut [u8], slot_offset: usize) {
         cbz_fail,
         enc_cbz_xn(16, cbz_fail as u64, fail_loud as u64),
     );
+    put(
+        bytes,
+        tbz_far_guard,
+        enc_tbz(
+            16,
+            carrick_el1_abi::EL1_STACK_USABLE_BIT,
+            tbz_far_guard as u64,
+            fail_loud as u64,
+        ),
+    );
 
-    // Pad remaining instructions with nop
-    let nop = AARCH64_NOP_OPCODE.to_le_bytes();
-    while cursor + 4 <= slot_offset + AARCH64_VECTOR_SLOT_SIZE {
-        bytes[cursor..cursor + 4].copy_from_slice(&nop);
-        cursor += 4;
-    }
+    assert!(
+        cursor <= EL1_CUR_EL_SYNC_HANDLER_OFFSET + EL1_CUR_EL_SYNC_HANDLER_SIZE,
+        "current-EL synchronous handler overruns its area"
+    );
 }
 
 /// Emit the argument-preserving AArch64 fstat(80) fast return.  It returns
@@ -4793,6 +4968,13 @@ pub fn el1_vectors_bytes_shim_fd_ceiling() -> Vec<u8> {
 
 const MAILBOX_HANDLER_OFFSET: usize = 0xA00;
 const MAILBOX_HANDLER_SIZE: usize = 0x200;
+/// The current-EL synchronous handler (exception fixups, stack-guard check,
+/// fail-loud report): every vector image's 0x200 slot branches here.
+const EL1_CUR_EL_SYNC_HANDLER_OFFSET: usize = MAILBOX_HANDLER_OFFSET + MAILBOX_HANDLER_SIZE;
+const EL1_CUR_EL_SYNC_HANDLER_SIZE: usize = 0x100;
+const _: () = assert!(
+    EL1_CUR_EL_SYNC_HANDLER_OFFSET + EL1_CUR_EL_SYNC_HANDLER_SIZE <= EL1_VECTOR_HOOK_OFFSET
+);
 /// The ordinary request capture: the same offset in every mailbox image (the
 /// optional fstat guard and EL1 hook branch are NOP-padded when absent).
 const MAILBOX_CAPTURE_OFFSET: usize = MAILBOX_HANDLER_OFFSET + 44;
@@ -4904,9 +5086,9 @@ fn write_el1_hook(
     emit(bytes, &mut cursor, 0xD348_FE31); // lsr x17, x17, #8  (x17 = slot)
 
     // 3. Compute per-vCPU stack top and TrapFrame pointer in x16:
-    //    stack_top = EL1_STACKS_BASE + 0x4000 + (slot << 14)
+    //    stack_top = EL1_STACKS_BASE + 0x8000 + (slot << 15)
     //    frame_ptr = stack_top - 0x120 (size_of::<TrapFrame>() = 280, aligned to 288 = 0x120)
-    let stack_first_top = carrick_el1_abi::EL1_STACKS_BASE + carrick_el1_abi::EL1_STACK_SIZE;
+    let stack_first_top = carrick_el1_abi::EL1_STACKS_BASE + carrick_el1_abi::EL1_STACK_STRIDE;
     emit(
         bytes,
         &mut cursor,
@@ -4922,7 +5104,12 @@ fn write_el1_hook(
         &mut cursor,
         enc_movk_xn(16, ((stack_first_top >> 32) & 0xFFFF) as u16, 2),
     );
-    emit(bytes, &mut cursor, 0x8B11_3A10); // add x16, x16, x17, lsl #14
+    // add x16, x16, x17, lsl #EL1_STACK_STRIDE_SHIFT
+    emit(
+        bytes,
+        &mut cursor,
+        0x8B11_0210 | (carrick_el1_abi::EL1_STACK_STRIDE_SHIFT << 10),
+    );
     emit(bytes, &mut cursor, 0xD104_8210); // sub x16, x16, #0x120 (TrapFrame pointer)
 
     // 4. Save x0..x15, x18..x30 to TrapFrame [x16, #(r * 8)]
@@ -7516,8 +7703,22 @@ mod stage1_tests {
             dynamic_first + (carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE >> 21) as usize;
         let ipc_first = ((carrick_el1_abi::EL1_IPC_BASE - LINUX_KERNEL_REGION_BASE) >> 21) as usize;
         let ipc_end = ipc_first + (carrick_el1_abi::EL1_IPC_SIZE >> 21) as usize;
+        let stack_first =
+            ((carrick_el1_abi::EL1_STACKS_BASE - LINUX_KERNEL_REGION_BASE) >> 21) as usize;
+        let stack_end = stack_first + carrick_el1_abi::EL1_STACK_TABLE_PAGES;
         for index in 1..512usize {
             let d = read_u64_le(&bytes, 0x4000 + index * 8);
+            if (stack_first..stack_end).contains(&index) {
+                // The stack arena is translated page by page so each guard
+                // stays unmapped (#369); `el1_stack_guards_are_unmapped_*`
+                // checks the leaves.
+                assert!(
+                    valid_table(d),
+                    "L2_B[{}] stack block must be a table",
+                    index
+                );
+                continue;
+            }
             assert!(valid_block(d), "L2_B[{}] must be a block", index);
             if (el1_first..el1_end).contains(&index)
                 || (dynamic_first..dynamic_end).contains(&index)
@@ -7822,14 +8023,22 @@ mod stage1_tests {
         let bytes = stage1_identity_page_tables();
         assert_eq!(bytes.len() as u64, LINUX_PAGE_TABLES_SIZE);
         // Ten boot tables (0..0xA000: six identity + two Rosetta alias + the heap
-        // L2 + the Rosetta IPA window L2); the rest is a spare pool of >=7 pages.
-        let spare_pages = (LINUX_PAGE_TABLES_SIZE - 0xA000) / 0x1000;
+        // L2 + the Rosetta IPA window L2), then the EL1 stack arena's level-3
+        // tables (#369); the rest is a spare pool of >=7 pages.
+        let stack_tables = carrick_el1_abi::EL1_STACK_TABLE_PAGES;
+        let spare_pages = (LINUX_PAGE_TABLES_SIZE - 0xA000) / 0x1000 - stack_tables as u64;
         assert!(
             spare_pages >= 7,
             "need a spare-table pool, got {spare_pages}"
         );
-        // Spare tail is zero-filled (invalid descriptors).
-        assert!(bytes[0xA000..].iter().all(|&b| b == 0));
+        // Spare tail past the stack tables is zero-filled (invalid descriptors).
+        let used = 0xA000 + stack_tables * 0x1000;
+        assert!(
+            bytes[0xA000..used]
+                .chunks_exact(0x1000)
+                .all(|page| page.iter().any(|&b| b != 0))
+        );
+        assert!(bytes[used..].iter().all(|&b| b == 0));
         // Whole table region stays inside the kernel hole's first 2 MiB block,
         // so it remains kernel-only (EL1) after the size bump.
         let region_end_off =
@@ -7837,6 +8046,101 @@ mod stage1_tests {
         assert!(
             region_end_off <= 0x200000,
             "page tables overflow kernel block"
+        );
+    }
+
+    /// #369: every EL1 stack guard is unmapped in each stage-1 root the
+    /// ring can run on, while every usable stack page keeps its kernel-only
+    /// identity translation: the identity and HVPatch MM images and the
+    /// carrier maintenance root, whose stack tables live in the EL1 region.
+    #[test]
+    fn el1_stack_guards_are_unmapped_in_every_stage1_root() {
+        use carrick_mmu_core::aarch64::PageTableManager;
+        let stack_pages = |manager: &PageTableManager| {
+            assert!(manager.guard_pages_are_unmapped(carrick_el1_abi::el1_stack_guards()));
+            for slot in 0..carrick_el1_abi::EL1_STACK_SLOTS as usize {
+                let guard = carrick_el1_abi::stack_slot_guard_base(slot);
+                let base = carrick_el1_abi::stack_slot_usable_base(slot);
+                let top = carrick_el1_abi::stack_slot_top(slot);
+                for va in (guard..base).step_by(0x1000) {
+                    assert_eq!(manager.translate(va), None, "slot {slot}: guard {va:#x}");
+                }
+                for va in (base..top).step_by(0x1000) {
+                    assert_eq!(
+                        manager.translate(va),
+                        Some(va),
+                        "slot {slot}: stack {va:#x}"
+                    );
+                    let leaf = manager.debug_walk(va)[3];
+                    assert_eq!(ap(leaf), 0b00, "EL0 must never reach an EL1 stack");
+                    assert_eq!(uxn(leaf), 1);
+                }
+            }
+            // The neighbours of the arena are untouched.
+            let before = carrick_el1_abi::EL1_STACKS_BASE - 0x1000;
+            let after = carrick_el1_abi::EL1_STACKS_BASE + carrick_el1_abi::EL1_STACKS_SIZE;
+            assert_eq!(manager.translate(before), Some(before));
+            assert_eq!(manager.translate(after), Some(after));
+        };
+        for bytes in [stage1_identity_page_tables(), stage1_hvpatch_page_tables()] {
+            stack_pages(&PageTableManager::new(
+                bytes,
+                LINUX_PAGE_TABLES_BASE,
+                AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+            ));
+        }
+
+        // Maintenance root: the stack blocks name the shared tables, and the
+        // tables apply the same leaf rule.
+        let root = stage1_carrier_maintenance_page_tables();
+        let tables = el1_stack_guard_tables();
+        for table in 0..carrick_el1_abi::EL1_STACK_TABLE_PAGES {
+            let va = carrick_el1_abi::EL1_STACKS_BASE
+                + table as u64 * carrick_el1_abi::EL1_STACK_TABLE_SPAN;
+            let l2 = read_u64_le(&root, 0x2000 + ((va >> 21) & 511) as usize * 8);
+            assert!(valid_table(l2));
+            assert_eq!(
+                l2 & 0x0000_FFFF_FFFF_F000,
+                carrick_el1_abi::EL1_STACK_GUARD_TABLES_BASE + table as u64 * 0x1000
+            );
+        }
+        for (index, word) in tables.chunks_exact(8).enumerate() {
+            let va = carrick_el1_abi::EL1_STACKS_BASE + ((index as u64) << 12);
+            let leaf = u64::from_le_bytes(word.try_into().unwrap());
+            if carrick_el1_abi::is_el1_stack_guard(va) {
+                assert_eq!(leaf, 0, "maintenance root maps guard {va:#x}");
+            } else {
+                assert_eq!(leaf & 0b11, 0b11, "maintenance root lost stack {va:#x}");
+                assert_eq!(leaf & 0x0000_FFFF_FFFF_F000, va);
+                assert_eq!(ap(leaf), 0b00);
+            }
+        }
+        // The EL1 region installs those tables where the root points.
+        let image = AddressSpace::from_segments(
+            0x1000,
+            [(
+                0x1000,
+                SegmentPerms {
+                    read: true,
+                    write: false,
+                    execute: true,
+                },
+                vec![0xd4, 0x20, 0x00, 0x00],
+                4,
+            )],
+        )
+        .expect("minimal image")
+        .with_el1_region()
+        .expect("EL1 region");
+        let region = image
+            .regions()
+            .iter()
+            .find(|region| region.start == LINUX_EL1_KERNEL_BASE)
+            .expect("EL1 region present");
+        let offset = carrick_el1_abi::EL1_STACK_GUARD_TABLES_OFFSET as usize;
+        assert_eq!(
+            &region.bytes()[offset..offset + tables.len()],
+            tables.as_slice()
         );
     }
 
@@ -8636,6 +8940,108 @@ mod el1_shim_tests {
         assert!(pc + 8 <= slot_end, "dispatcher overruns its 0x80 slot");
     }
 
+    /// #369: the current-EL synchronous handler stores nothing when the
+    /// scratch it would push lands in an EL1 stack guard. The x0/SP swap,
+    /// one-bit test and swap back are exact; the guard path restores both
+    /// and reports through `hvc #3`. The check takes the guard path for
+    /// every SP within 32 bytes of a usable base (or inside a guard) and the
+    /// store path everywhere else on the stack, in every vector image.
+    #[test]
+    fn current_el_sync_handler_refuses_to_push_into_a_stack_guard() {
+        let page = el1_vectors_bytes();
+        let at = |index: usize| rd_u32(&page, EL1_CUR_EL_SYNC_HANDLER_OFFSET + index * 4);
+        assert_eq!(at(0), 0xD100_83FF, "sub sp, sp, #32");
+        assert_eq!(at(1), 0x8B20_63FF, "add sp, sp, x0");
+        assert_eq!(at(2), 0xCB20_63E0, "sub x0, sp, x0");
+        let tbz = at(3);
+        assert_eq!(tbz & 0x7F00_001F, 0x3600_0000, "tbz x0");
+        let bit = ((tbz >> 19) & 31) | ((tbz >> 31) << 5);
+        assert_eq!(bit, carrick_el1_abi::EL1_STACK_USABLE_BIT);
+        assert_eq!(at(4), 0xCB20_63E0, "sub x0, sp, x0");
+        assert_eq!(at(5), 0xCB20_63FF, "sub sp, sp, x0");
+        assert_eq!(at(6), 0xA900_47F0, "the first store follows the check");
+        let offset = (((tbz >> 5) & 0x3FFF) as i32) << 18 >> 16;
+        let guard_hit = (EL1_CUR_EL_SYNC_HANDLER_OFFSET as i64 + 12 + offset as i64) as usize;
+        let guard_path: Vec<u32> = (0..4).map(|i| rd_u32(&page, guard_hit + i * 4)).collect();
+        assert_eq!(guard_path, [0xCB20_63E0, 0xCB20_63FF, 0x9100_83FF, HVC3]);
+
+        // Model the three-instruction swap on concrete registers: it must
+        // leave x0 and SP exact on the store path, and the tested bit must
+        // separate guards from usable stack.
+        let takes_guard_path = |sp: u64, x0: u64| {
+            let new_sp = sp.wrapping_sub(32);
+            let swapped_sp = new_sp.wrapping_add(x0);
+            let tested = swapped_sp.wrapping_sub(x0);
+            let restored_x0 = swapped_sp.wrapping_sub(tested);
+            let restored_sp = swapped_sp.wrapping_sub(restored_x0);
+            assert_eq!((restored_x0, restored_sp), (x0, new_sp));
+            tested >> bit & 1 == 0
+        };
+        for slot in [0, 1, 127, carrick_el1_abi::EL1_STACK_SLOTS as usize - 1] {
+            let base = carrick_el1_abi::stack_slot_usable_base(slot);
+            let top = carrick_el1_abi::stack_slot_top(slot);
+            for x0 in [0, 0xdead_beef, u64::MAX] {
+                assert!(takes_guard_path(base, x0), "full stack");
+                assert!(
+                    takes_guard_path(base + 16, x0),
+                    "scratch straddles the guard"
+                );
+                assert!(
+                    takes_guard_path(base - 0x100, x0),
+                    "SP already in the guard"
+                );
+                assert!(!takes_guard_path(base + 32, x0), "exactly enough room");
+                assert!(!takes_guard_path(
+                    top - carrick_el1_abi::TRAP_FRAME_ALLOCATION,
+                    x0
+                ));
+            }
+        }
+
+        // A fault on a guard address never reaches an armed fixup: after the
+        // scratch store, FAR in the arena with the usable bit clear branches
+        // to the fail-loud tail (`ldp`, `add sp`, `hvc #3`).
+        let far = (0..EL1_CUR_EL_SYNC_HANDLER_SIZE / 4)
+            .position(|index| at(index) == AARCH64_MRS_FAR_EL1_X16_OPCODE)
+            .expect("handler reads FAR_EL1");
+        assert!(far > 6, "FAR is checked after the scratch store");
+        let far_tbz = (far..EL1_CUR_EL_SYNC_HANDLER_SIZE / 4)
+            .find(|index| at(*index) & 0x7F00_001F == 0x3600_0010)
+            .expect("tbz x16 on the FAR offset");
+        assert_eq!(
+            (at(far_tbz) >> 19) & 31,
+            carrick_el1_abi::EL1_STACK_USABLE_BIT
+        );
+        let far_offset = (((at(far_tbz) >> 5) & 0x3FFF) as i32) << 18 >> 16;
+        let fail_loud = (EL1_CUR_EL_SYNC_HANDLER_OFFSET as i64
+            + far_tbz as i64 * 4
+            + far_offset as i64) as usize;
+        let tail: Vec<u32> = (0..3).map(|i| rd_u32(&page, fail_loud + i * 4)).collect();
+        assert_eq!(tail, [0xA940_47F0, 0x9100_83FF, HVC3]);
+
+        let handler = |page: &[u8]| {
+            page[EL1_CUR_EL_SYNC_HANDLER_OFFSET
+                ..EL1_CUR_EL_SYNC_HANDLER_OFFSET + EL1_CUR_EL_SYNC_HANDLER_SIZE]
+                .to_vec()
+        };
+        let expected = handler(&page);
+        for variant in [
+            el1_vectors_bytes_fd_ceiling(),
+            el1_vectors_bytes_shim(),
+            el1_vectors_bytes_shim_fd_ceiling(),
+            el1_vectors_bytes_mailbox(false),
+            el1_vectors_bytes_mailbox_fd_ceiling(true),
+            el1_vectors_bytes_mailbox_irq(true, true, true, El1IrqMode::Masked),
+            el1_vectors_bytes_mailbox_irq(true, true, true, El1IrqMode::Gic),
+        ] {
+            assert_eq!(handler(&variant), expected);
+            assert_eq!(
+                rd_u32(&variant, AARCH64_VECTOR_CUR_EL_SPX_SYNC_OFFSET),
+                rd_u32(&page, AARCH64_VECTOR_CUR_EL_SPX_SYNC_OFFSET)
+            );
+        }
+    }
+
     /// Current-EL SYNCHRONOUS slots (0x000 SP_EL0, 0x200 SP_ELx) fail loud via
     /// `hvc #3`: a synchronous exception at EL1 is always carrick corruption
     /// (e.g. a signal handler entered at EL1h → PXN instruction abort), and must
@@ -8653,16 +9059,24 @@ mod el1_shim_tests {
             );
             assert_eq!(
                 rd_u32(&page, AARCH64_VECTOR_CUR_EL_SPX_SYNC_OFFSET),
-                0xD100_83FF,
-                "current-EL SP_ELx sync slot (0x200) must begin with fixup check"
+                enc_b(
+                    AARCH64_VECTOR_CUR_EL_SPX_SYNC_OFFSET as u64,
+                    EL1_CUR_EL_SYNC_HANDLER_OFFSET as u64
+                ),
+                "current-EL SP_ELx sync slot (0x200) must branch to its handler"
             );
-            let slot_bytes = &page[AARCH64_VECTOR_CUR_EL_SPX_SYNC_OFFSET
-                ..AARCH64_VECTOR_CUR_EL_SPX_SYNC_OFFSET + AARCH64_VECTOR_SLOT_SIZE];
+            assert_eq!(
+                rd_u32(&page, EL1_CUR_EL_SYNC_HANDLER_OFFSET),
+                0xD100_83FF,
+                "current-EL SP_ELx handler must begin with the fixup check"
+            );
+            let handler_bytes = &page[EL1_CUR_EL_SYNC_HANDLER_OFFSET
+                ..EL1_CUR_EL_SYNC_HANDLER_OFFSET + EL1_CUR_EL_SYNC_HANDLER_SIZE];
             assert!(
-                slot_bytes
+                handler_bytes
                     .chunks_exact(4)
                     .any(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()) == HVC3),
-                "current-EL SP_ELx sync slot (0x200) must contain HVC3 fail-loud trap"
+                "current-EL SP_ELx handler must contain the HVC3 fail-loud trap"
             );
             // A non-sync spurious slot (0x080 = current-EL SP_EL0 IRQ) is still a
             // bare eret — harmless interrupts are ignored, not aborted.

@@ -752,6 +752,10 @@ pub(crate) fn prepare_global_exec_plan_with_root_backing(
                 "provision hvpatch exec EL1 COW copy window: {error:?}"
             ))
         })?;
+    // Likewise its EL1 stack guards (#369).
+    carrick_mem::memory::provision_el1_stack_guards(&mut page_tables, None).map_err(|error| {
+        TrapError::Hypervisor(format!("unmap hvpatch exec EL1 stack guards: {error:?}"))
+    })?;
     // Only the occupied tables: the slot's tail is zero (fresh, or zeroed
     // through its recorded prefix on recycle), and every reader rebuilds a
     // manager with the slot's full capacity.

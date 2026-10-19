@@ -6511,6 +6511,14 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             .map_err(|error| {
                 TrapError::Hypervisor(format!("provision child EL1 COW copy window: {error:?}"))
             })?;
+        // And its EL1 stack guards (#369), with the same one writer.
+        carrick_mem::memory::provision_el1_stack_guards(
+            &mut page_tables,
+            child_source.as_deref_mut(),
+        )
+        .map_err(|error| {
+            TrapError::Hypervisor(format!("unmap child EL1 stack guards: {error:?}"))
+        })?;
         let child_authority = self.page_tables.child_with_manager(page_tables);
         if let Some(source) = child_source {
             child_authority.install_source(source).map_err(|error| {

@@ -28,9 +28,9 @@ use carrick_el1::memory::reservations::{
 use carrick_el1_abi::GuestMmuPublication;
 use carrick_el1_abi::Lifecycle;
 use carrick_el1_abi::{
-    BlockedMask, Counters, CurrentTask, EL1_BOOTSTRAP_METADATA_SIZE, El1TaskId, ReservationMm,
-    ReservationRange, ThreadControlSlot, ThreadLifecyclePage, X86_CPL0_BOOTSTRAP_METADATA_BASE,
-    X86_CPL0_REGION_BASE,
+    BlockedMask, Counters, CurrentTask, El1TaskId, ReservationMm, ReservationRange,
+    ThreadControlSlot, ThreadLifecyclePage, X86_CPL0_BOOTSTRAP_METADATA_BASE,
+    X86_CPL0_BOOTSTRAP_METADATA_SIZE, X86_CPL0_REGION_BASE,
 };
 use carrick_guest_arch::FrameGpa;
 use carrick_guest_arch::{AddressContext, ContextGeneration, MmGeneration, RootGpa, UserVa};
@@ -1663,7 +1663,7 @@ impl Cpl0Carrier {
         }
         ram.add_window(
             ALLOCATOR_GPA,
-            EL1_BOOTSTRAP_METADATA_SIZE as usize,
+            X86_CPL0_BOOTSTRAP_METADATA_SIZE as usize,
             WindowKind::Private,
         )
         .map_err(|e| fail(e.to_string()))?;
@@ -1755,7 +1755,7 @@ impl Cpl0Carrier {
         maps.push(Pml4MapSpec {
             va: X86_CPL0_BOOTSTRAP_METADATA_BASE,
             gpa: ALLOCATOR_GPA,
-            len: EL1_BOOTSTRAP_METADATA_SIZE,
+            len: X86_CPL0_BOOTSTRAP_METADATA_SIZE,
             user: false,
             write: true,
             exec: false,
@@ -1833,15 +1833,22 @@ impl Cpl0Carrier {
                 0
             })
             .ok_or_else(|| fail("fixture private copy table capacity"))?;
-        let tables = pml4_tables(&maps, LAYOUT.pml4_base, table_capacity)
-            .map_err(|e| fail(format!("CPL0 tables: {e:?}")))?;
+        // Every CPU's kernel stack guard stays unmapped in the direct window
+        // the stacks run on (#369), whatever bootstrap map would cover it.
+        let guards: Vec<(u64, u64)> = carrick_el1_abi::x86_cpl0_kernel_stack_guards().collect();
+        let tables = pml4_tables(
+            &carrick_mem::pml4::punch_holes(&maps, &guards),
+            LAYOUT.pml4_base,
+            table_capacity,
+        )
+        .map_err(|e| fail(format!("CPL0 tables: {e:?}")))?;
         ram.write_gpa(LAYOUT.pml4_base, &tables)
             .map_err(|e| fail(e.to_string()))?;
         if interrupts {
             let last = maps.last_mut().ok_or_else(|| fail("progress data map"))?;
             *last = crate::carrier_interrupts::data_map(1);
             let second = pml4_tables(
-                &maps,
+                &carrick_mem::pml4::punch_holes(&maps, &guards),
                 crate::carrier_interrupts::SECOND_ROOT,
                 table_capacity,
             )
@@ -2013,7 +2020,8 @@ impl Cpl0Carrier {
                     .ok_or_else(|| fail("CPU binding backing"))?
                     .cast::<CpuBinding>();
                 binding.write(CpuBinding {
-                    kernel_stack: DIRECT_VA + 0xe1_0000 + index as u64 * 0x1_0000 - 16,
+                    kernel_stack: DIRECT_VA + carrick_el1_abi::x86_cpl0_kernel_stack_end_gpa(index)
+                        - carrick_el1_abi::X86_CPL0_KERNEL_STACK_TOP_RESERVE,
                     user_stack: 0,
                     self_address: METADATA_VA + BINDING_OFFSET + offset,
                     task_address: METADATA_VA + TASK_OFFSET + offset,

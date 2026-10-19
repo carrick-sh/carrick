@@ -1055,7 +1055,7 @@ impl Personality for FixturePersonality {
                     && (ptr as u64)
                         .checked_sub(carrick_el1_abi::X86_CPL0_BOOTSTRAP_METADATA_BASE)
                         .is_some_and(|offset| {
-                            offset < carrick_el1_abi::EL1_BOOTSTRAP_METADATA_SIZE
+                            offset < carrick_el1_abi::X86_CPL0_BOOTSTRAP_METADATA_SIZE
                         })
                     // SAFETY: the same byte remains allocated until dealloc below.
                     && unsafe { core::ptr::read_volatile(ptr.add(127)) } == 0xa5;

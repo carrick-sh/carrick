@@ -72,7 +72,7 @@ impl KernelPodStorage {
     pub(super) fn for_bootstrap() -> Self {
         Self {
             start: carrick_guest_arch::KernelVa::new(X86_CPL0_BOOTSTRAP_METADATA_BASE),
-            len: EL1_BOOTSTRAP_METADATA_SIZE,
+            len: X86_CPL0_BOOTSTRAP_METADATA_SIZE,
             physical: FrameGpa::new(ALLOCATOR_GPA),
         }
     }
@@ -1921,7 +1921,7 @@ mod custody_tests {
         assert!(
             kernel_pod_physical(
                 &storage,
-                KernelVa::new(start + EL1_BOOTSTRAP_METADATA_SIZE - 32),
+                KernelVa::new(start + X86_CPL0_BOOTSTRAP_METADATA_SIZE - 32),
                 64,
                 8
             )
