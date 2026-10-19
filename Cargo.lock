@@ -492,7 +492,6 @@ dependencies = [
  "carrick-core",
  "carrick-core-abi",
  "carrick-el1-abi",
- "carrick-el1-linux",
  "carrick-guest-arch",
  "carrick-mem",
  "carrick-mmu-core",

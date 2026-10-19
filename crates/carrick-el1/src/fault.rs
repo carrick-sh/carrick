@@ -121,7 +121,7 @@ pub use carrick_core::mm::transfer::resolver::{
 /// The hardware fault path and VM-free arena witnesses share this settlement.
 /// A failed rollback is fatal: the caller cannot resume or forward a fault with
 /// indeterminate live translations.
-#[cfg(any(target_os = "none", test))]
+#[cfg(any(target_os = "none", test, feature = "host-test"))]
 pub fn handle_cow_outcome(
     outcome: Result<crate::cow::GuestCowOutcome, crate::cow::CowError>,
     completion: &mut Option<carrick_el1_abi::CowGrantCompletion>,
@@ -2537,11 +2537,12 @@ mod tests {
 
     #[test]
     fn owner_cow_fault_preserves_validated_empty_pool_supply() {
+        use crate::cow::test_support::{Arena, OLD, ROOT, VA};
         use carrick_el1_abi::FrameGrantResidencyTable;
-        use carrick_el1_linux::mm_portal::test_support::{IPA, ROOT, RW, Tables, VA};
-        use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
+        /// The armed leaf's base permissions: valid page, EL0 access, AF, UXN.
+        const RW: u64 = 3 | (1 << 6) | (1 << 10) | (1 << 54);
         struct EmptyCow<'a>(
-            &'a Tables,
+            &'a Arena,
             &'a carrick_el1_abi::CowGrantPool,
             &'a FrameGrantResidencyTable,
         );
@@ -2550,7 +2551,7 @@ mod tests {
                 panic!("typed COW outcome must survive fault dispatch")
             }
             fn resolve_cow_outcome(&mut self, ttbr: u64, mm: u64, va: u64) -> CowResolution {
-                let live = self.0.live(&CallerInvalidatesAsid);
+                let live = self.0.words();
                 let result = crate::cow::resolve_guest_cow(
                     &crate::cow::GuestCowVenue {
                         words: &live,
@@ -2580,11 +2581,8 @@ mod tests {
         let mm = 77;
         let spaces = published_space(mm, ROOT);
         let roots = admitted_root(&spaces, mm, &[(VA, 4096, 3)]);
-        let tables = Tables::new(ROOT, IPA, 1);
-        tables.words[1536].store(
-            IPA | RW | (3 << 6) | (1 << 55) | (1 << 56) | (1 << 57),
-            Ordering::Release,
-        );
+        let tables = Arena::new(false);
+        tables.set_leaf(VA, OLD | RW | (3 << 6) | (1 << 55) | (1 << 56) | (1 << 57));
         let pool = carrick_el1_abi::CowGrantPool::new();
         let resident_ptr = unsafe {
             std::alloc::alloc_zeroed(std::alloc::Layout::new::<FrameGrantResidencyTable>())
