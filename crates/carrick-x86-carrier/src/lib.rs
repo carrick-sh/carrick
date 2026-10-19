@@ -29,8 +29,7 @@ pub fn settle_owed_before_switch(
     mut pending: impl FnMut() -> bool,
     ring: impl FnOnce(),
 ) {
-    use core::sync::atomic::Ordering;
-    if pending() || task.linux.served_with_work.load(Ordering::Acquire) != 0 {
+    if pending() || task.linux.served_boundary_pending() {
         ring();
     }
 }

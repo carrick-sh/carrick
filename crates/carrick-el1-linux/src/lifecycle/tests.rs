@@ -774,7 +774,7 @@ fn sigprocmask_unblocking_a_pending_signal_serves_with_work() {
     assert_eq!(frame.x[0], 0);
     assert_eq!(*old, SIGUSR1_BIT | 1);
     assert_eq!(w.venue.leader_slot().blocked(), BlockedMask(1));
-    assert_eq!(w.task().linux.served_with_work.load(Ordering::Relaxed), 1);
+    assert_eq!(w.task().linux.served_word(), 1);
     assert_eq!(w.served(SYS_RT_SIGPROCMASK), 1);
 }
 
@@ -800,7 +800,7 @@ fn sigprocmask_unblocking_a_process_pending_signal_serves_with_work() {
     assert_eq!(frame.x[0], 0);
     assert_eq!(*old, SIGUSR1_BIT | 1);
     assert_eq!(w.venue.leader_slot().blocked(), BlockedMask(1));
-    assert_eq!(w.task().linux.served_with_work.load(Ordering::Relaxed), 1);
+    assert_eq!(w.task().linux.served_word(), 1);
     assert_eq!(w.served(SYS_RT_SIGPROCMASK), 1);
 }
 
