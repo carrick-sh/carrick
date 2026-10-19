@@ -1,8 +1,8 @@
 //! Linux syscall dispatch and completion mapping.
 extern crate alloc;
 
+use super::cow_resolver::dispatch_fault;
 use super::{file, inotify, ipc, lifecycle, sched};
-use crate::fault::dispatch_fault;
 use crate::file::UserCopy;
 use crate::memory;
 use carrick_el1_abi::{

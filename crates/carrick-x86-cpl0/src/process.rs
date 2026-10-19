@@ -483,7 +483,8 @@ fn prepare_parent_output(
     size: usize,
 ) -> Option<PreparedParentOutput> {
     use carrick_core::mm::transfer::resolver::NoopPreparedResolver;
-    use carrick_el1::fault::{GrantMailboxes, X86CowResolver, dispatch_x86_fault_with_prepared};
+    use carrick_el1::fault::{GrantMailboxes, dispatch_x86_fault_with_prepared};
+    use carrick_el1::personality::cow_resolver::X86CowResolver;
     use carrick_el1_abi::Action;
     use carrick_guest_arch::{Access as FaultAccess, FaultInfo};
     if address.raw() < STACK_TOP - 4096

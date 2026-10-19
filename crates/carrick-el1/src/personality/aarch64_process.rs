@@ -870,13 +870,13 @@ struct NativeWriteVenue<'a, X> {
     crossing: &'a X,
     slots: &'a carrick_el1_abi::MmPortalSlots,
     prepared: crate::fault::HardwarePreparedResolver,
-    cow: crate::fault::HardwareCowResolver,
+    cow: crate::personality::cow_resolver::HardwareCowResolver,
 }
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl<X: ForkStockCrossing> UserWriteVenue<Aarch64ParkedContext> for NativeWriteVenue<'_, X> {
     type Prepared = crate::fault::HardwarePreparedResolver;
-    type Cow = crate::fault::HardwareCowResolver;
+    type Cow = crate::personality::cow_resolver::HardwareCowResolver;
     type Error = NativeProcessError;
 
     fn selection_venues(&mut self) -> SelectionVenues<'_, Self::Prepared, Self::Cow> {
@@ -1532,7 +1532,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 crossing: &self.crossing,
                 slots,
                 prepared: crate::fault::HardwarePreparedResolver,
-                cow: crate::fault::HardwareCowResolver {
+                cow: crate::personality::cow_resolver::HardwareCowResolver {
                     service_slot: Some(carrick_el1_abi::SlotId::new(self.slot.raw())),
                     completion: None,
                     publication: None,
