@@ -117,6 +117,17 @@ core::arch::global_asm!(
     "carrick_x86_page_fault_fixup:",
     "push rax",
     "push rdx",
+    // A fault on a CPL0 kernel stack guard (#369) is an overflow, never a
+    // user access an armed fixup may absorb.
+    "mov rax, cr2",
+    "movabs rdx, {stacks}",
+    "sub rax, rdx",
+    "cmp rax, {span}",
+    "jae 1f",
+    "and eax, {stride_mask}",
+    "cmp eax, {guard}",
+    "jb 9f",
+    "1:",
     "cmp qword ptr [rsp + 32], 8",
     "jne 9f",
     "mov rax, qword ptr gs:[24]", // CpuBinding.task_address
@@ -132,6 +143,10 @@ core::arch::global_asm!(
     "iretq",
     "9:",
     "ud2",
+    stacks = const carrick_el1_abi::X86_CPL0_DIRECT_VA + carrick_el1_abi::X86_CPL0_KERNEL_STACKS_GPA,
+    span = const carrick_el1_abi::X86_CPL0_KERNEL_STACK_SLOTS * carrick_el1_abi::X86_CPL0_KERNEL_STACK_STRIDE,
+    stride_mask = const carrick_el1_abi::X86_CPL0_KERNEL_STACK_STRIDE - 1,
+    guard = const carrick_el1_abi::X86_CPL0_KERNEL_STACK_GUARD_SIZE,
 );
 
 #[cfg(target_os = "none")]
