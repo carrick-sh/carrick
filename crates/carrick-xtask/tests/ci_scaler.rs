@@ -626,7 +626,7 @@ fn runs_on(workflow: &str, job: &str) -> Vec<String> {
 fn workflow_runner_labels_are_the_controller_label_constants() {
     let kernel = include_str!("../../../.github/workflows/kernel-runtime.yml");
     let pilot = include_str!("../../../.github/workflows/willow-pilot.yml");
-    // `kvm-tests` is the hosted GCP backend; Willow serves the fallback job.
+    // Willow serves the post-landing KVM lane.
     assert_eq!(runs_on(kernel, "kvm-tests-willow"), LABELS);
     assert_eq!(runs_on(pilot, "kvm"), LABELS);
     assert_eq!(runs_on(kernel, "hvf-kernel"), HVF_LABELS);
@@ -635,43 +635,41 @@ fn workflow_runner_labels_are_the_controller_label_constants() {
     assert_ne!(HVF_CLOSURE_LABELS, HVF_LABELS);
 }
 
-/// Exactly one KVM backend runs: the two lane jobs' conditions are complements
-/// over one selection expression, and the gate and the aggregate read the
-/// selected job's result through that same expression.
+/// The Willow KVM backend is the sole KVM lane: kvm-tests-willow runs when
+/// CARRICK_SELF_HOSTED_KVM == 'true', publishes the receipt, and kvm-gate
+/// and trusted-hardware-ok read its result directly.
 #[test]
-fn kvm_backends_are_mutually_exclusive_and_read_through_one_selection() {
+fn kvm_willow_lane_is_sole_kvm_backend_and_read_directly() {
     let kernel = include_str!("../../../.github/workflows/kernel-runtime.yml");
     let docs = yaml_rust2::YamlLoader::load_from_str(kernel).unwrap();
     let jobs = &docs[0]["jobs"];
-    let select = "(vars.CARRICK_GCP_KVM == 'true' && vars.CARRICK_KVM_BACKEND != 'willow')";
     let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let gcp = squash(jobs["kvm-tests"]["if"].as_str().unwrap());
     let willow = squash(jobs["kvm-tests-willow"]["if"].as_str().unwrap());
-    assert!(gcp.contains(&select[1..select.len() - 1]), "{gcp}");
-    assert!(willow.contains(&format!("!{select}")), "{willow}");
     assert!(willow.contains("vars.CARRICK_SELF_HOSTED_KVM == 'true'"));
-    assert_eq!(jobs["kvm-tests"]["runs-on"].as_str(), Some("ubuntu-latest"));
+    assert!(!willow.contains("vars.CARRICK_GCP_KVM"));
+    assert!(!willow.contains("vars.CARRICK_KVM_BACKEND"));
     assert_eq!(
-        jobs["kvm-tests"]["permissions"]["id-token"].as_str(),
-        Some("write")
+        jobs["kvm-gate"]["needs"][0].as_str(),
+        Some("kvm-tests-willow")
     );
-    let pick = format!("{select} && needs.kvm-tests.result || needs.kvm-tests-willow.result");
-    assert!(squash(jobs["kvm-gate"]["if"].as_str().unwrap()).contains(&pick));
+    let gate_if = squash(jobs["kvm-gate"]["if"].as_str().unwrap());
+    assert!(gate_if.contains("needs.kvm-tests-willow.result != 'skipped'"));
     let ok_env = &jobs["trusted-hardware-ok"]["steps"][0]["env"];
-    assert!(squash(ok_env["KVM"].as_str().unwrap()).contains(&pick));
-    // Both backends publish the one artifact name the gate downloads.
-    for lane in ["kvm-tests", "kvm-tests-willow"] {
-        let names: Vec<_> = jobs[lane]["steps"]
-            .as_vec()
-            .unwrap()
-            .iter()
-            .filter_map(|s| s["with"]["name"].as_str())
-            .collect();
-        assert!(
-            names.contains(&"receipt-kvm-${{ github.sha }}-${{ github.run_attempt }}"),
-            "{lane}: {names:?}"
-        );
-    }
+    assert_eq!(
+        ok_env["KVM"].as_str(),
+        Some("${{ needs.kvm-tests-willow.result }}")
+    );
+    // The Willow backend publishes the one artifact name the gate downloads.
+    let names: Vec<_> = jobs["kvm-tests-willow"]["steps"]
+        .as_vec()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["with"]["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"receipt-kvm-${{ github.sha }}-${{ github.run_attempt }}"),
+        "kvm-tests-willow: {names:?}"
+    );
 }
 
 #[test]
@@ -704,13 +702,7 @@ fn one_always_job_requires_both_trusted_hardware_lanes() {
         .iter()
         .map(|n| n.as_str().unwrap())
         .collect();
-    for job in [
-        "hvf-kernel",
-        "kvm-tests",
-        "kvm-tests-willow",
-        "hvf-gate",
-        "kvm-gate",
-    ] {
+    for job in ["hvf-kernel", "kvm-tests-willow", "hvf-gate", "kvm-gate"] {
         assert!(needs.contains(&job), "{job}");
     }
     let script = ok["steps"][0]["run"].as_str().unwrap();
@@ -768,7 +760,7 @@ fn hardware_lanes_never_wait_and_hosted_gates_grade_with_receipted_baseline_code
     };
     // A lane job waiting on a base receipt would hold the single runner the
     // base entry's job needs (queue deadlock).
-    for lane in ["hvf-kernel", "kvm-tests", "kvm-tests-willow"] {
+    for lane in ["hvf-kernel", "kvm-tests-willow"] {
         assert!(
             runs(lane).iter().all(|r| !r.contains("ci-receipt gate")),
             "{lane} must only produce and upload its receipt"
@@ -776,7 +768,7 @@ fn hardware_lanes_never_wait_and_hosted_gates_grade_with_receipted_baseline_code
     }
     for (gate, lane, name) in [
         ("hvf-gate", "hvf-kernel", "receipt-hvf-"),
-        ("kvm-gate", "kvm-tests", "receipt-kvm-"),
+        ("kvm-gate", "kvm-tests-willow", "receipt-kvm-"),
     ] {
         let job = &jobs[gate];
         assert_eq!(job["runs-on"].as_str(), Some("ubuntu-latest"));

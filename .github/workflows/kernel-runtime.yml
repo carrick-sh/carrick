@@ -320,110 +320,16 @@ jobs:
   # A real KVM device is the contract. An incidental or software-emulated
   # hosted environment is not accepted as this lane. Every `kvm`-lane test
   # target runs (`just test-kvm`, derived from Cargo metadata) on a real
-  # /dev/kvm, on push to main or owner dispatch, on exactly one of two backends:
-  #
-  #   gcp     `kvm-tests`: an ephemeral GCP nested-KVM VM per run, driven
-  #           keylessly from this hosted job through Workload Identity
-  #           Federation (docs/ci/gcp-kvm.md). Selected when
-  #           CARRICK_GCP_KVM == 'true' and CARRICK_KVM_BACKEND != 'willow'.
-  #   willow  `kvm-tests-willow`: Willow JIT clones (`ci-scaler standing`,
-  #           docs/ci/willow-pilot.md). Selected otherwise, when
-  #           CARRICK_SELF_HOSTED_KVM == 'true'.
-  #
-  # Job ids cannot be shared, so the two jobs have mutually exclusive `if:`
-  # conditions over the same expression, and `kvm-gate` and
-  # `trusted-hardware-ok` read the selected job's result with that same
-  # expression (a skipped selected lane still fails the aggregate). Pull
-  # requests and merge groups are not run here; only main pushes and
+  # /dev/kvm, on push to main or owner dispatch, on Willow JIT clones
+  # (`ci-scaler standing`, docs/ci/willow-pilot.md, docs/ci/contabo-kvm.md).
+  # Its labels are `ci_scaler::LABELS`; a test keeps them identical.
+  # Pull requests and merge groups are not run here; only main pushes and
   # owner dispatches may reach the hardware.
-  kvm-tests:
-    name: KVM · x86 kvm-lane tests
-    if: >-
-      ${{ !cancelled() &&
-          vars.CARRICK_GCP_KVM == 'true' && vars.CARRICK_KVM_BACKEND != 'willow' &&
-          (github.event_name != 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) }}
-    runs-on: ubuntu-latest
-    # The script waits up to 150 min for the VM; the VM's own backstop is
-    # --max-run-duration=3h with DELETE.
-    timeout-minutes: 175
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Authenticate to GCP (workload identity federation)
-        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
-        with:
-          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
-          service_account: ${{ vars.GCP_CI_SA }}
-
-      - name: Set up gcloud
-        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
-
-      # Creates the VM, waits for its DONE/FAILED marker in the receipt
-      # bucket while tailing the serial console, downloads the receipt and
-      # deletes the VM. Exit 0 iff a receipt exists: test failures live in
-      # the receipt (`xtask accept --profile kvm`), like the Willow lane.
-      - name: KVM-lane receipt on an ephemeral GCP VM (CARRICK_REQUIRE_KVM=1)
-        env:
-          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
-          GCP_RUNNER_VM_SA: ${{ vars.GCP_RUNNER_VM_SA }}
-          GCP_RECEIPT_BUCKET: ${{ vars.GCP_RECEIPT_BUCKET }}
-          GCP_KVM_MACHINE_TYPE: ${{ vars.CARRICK_GCP_KVM_MACHINE_TYPE }}
-          GCP_KVM_ZONES: ${{ vars.CARRICK_GCP_KVM_ZONES }}
-        run: |
-          set -euo pipefail
-          # The script defaults apply when the optional vars are unset.
-          [ -n "$GCP_KVM_MACHINE_TYPE" ] || unset GCP_KVM_MACHINE_TYPE
-          [ -n "$GCP_KVM_ZONES" ] || unset GCP_KVM_ZONES
-          rm -rf target/ci-receipts
-          mkdir -p target/ci-receipts
-          scripts/ci/gcp-kvm-run.sh run
-          test -s target/ci-receipts/receipt.json
-
-      # The script's EXIT trap deletes the VM; this covers a cancelled or
-      # timed-out job whose trap never ran.
-      - name: Delete the run's VM
-        if: ${{ always() }}
-        env:
-          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
-          GCP_RUNNER_VM_SA: ${{ vars.GCP_RUNNER_VM_SA }}
-          GCP_RECEIPT_BUCKET: ${{ vars.GCP_RECEIPT_BUCKET }}
-        run: scripts/ci/gcp-kvm-run.sh cleanup
-
-      # Lane jobs only produce and upload receipts; they never wait for a
-      # base receipt, so a queued entry can never hold the runner its base
-      # entry needs. The hosted `*-gate` jobs compare.
-      - name: Upload per-SHA receipt
-        if: ${{ !cancelled() && hashFiles('target/ci-receipts/receipt.json') != '' }}
-        uses: actions/upload-artifact@v4
-        with:
-          # The attempt keeps a re-run from colliding with an earlier upload;
-          # the gate picks the newest attempt.
-          name: receipt-kvm-${{ github.sha }}-${{ github.run_attempt }}
-          path: target/ci-receipts/receipt.json
-          if-no-files-found: error
-
-      # Status, VM setup log and `xtask accept` step logs (target/el1-gate).
-      - name: Upload VM logs
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: gcp-kvm-logs-${{ github.sha }}-${{ github.run_attempt }}
-          path: target/ci-logs/gcp-kvm
-          if-no-files-found: ignore
-
-  # The Willow fallback backend (see `kvm-tests` above). Its labels are
-  # `ci_scaler::LABELS`; a test keeps them identical.
   kvm-tests-willow:
     name: KVM · x86 kvm-lane tests (Willow)
     if: >-
       ${{ !cancelled() &&
           vars.CARRICK_SELF_HOSTED_KVM == 'true' &&
-          !(vars.CARRICK_GCP_KVM == 'true' && vars.CARRICK_KVM_BACKEND != 'willow') &&
           (github.event_name != 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.actor == 'tjfontaine' && github.triggering_actor == 'tjfontaine')) }}
     runs-on: [self-hosted, Linux, X64, willow-kvm]
     timeout-minutes: 90
@@ -587,11 +493,8 @@ jobs:
     permissions:
       contents: read
       actions: read
-    # Whichever backend `kvm-tests`' selection expression chose.
-    needs: [kvm-tests, kvm-tests-willow]
-    if: >-
-      ${{ !cancelled() && github.event_name == 'push' &&
-          ((vars.CARRICK_GCP_KVM == 'true' && vars.CARRICK_KVM_BACKEND != 'willow') && needs.kvm-tests.result || needs.kvm-tests-willow.result) != 'skipped' }}
+    needs: [kvm-tests-willow]
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.kvm-tests-willow.result != 'skipped' }}
     runs-on: ubuntu-latest
     timeout-minutes: 110
     steps:
@@ -694,24 +597,19 @@ jobs:
   trusted-hardware-ok:
     name: Trusted hardware OK
     if: ${{ always() }}
-    needs: [signed-fixtures, hvf-kernel, kvm-tests, kvm-tests-willow, hvf-gate, kvm-gate]
+    needs: [signed-fixtures, hvf-kernel, kvm-tests-willow, hvf-gate, kvm-gate]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Require both trusted-hardware lanes (and their gates on push)
         env:
           HVF: ${{ needs.hvf-kernel.result }}
-          # The selected KVM backend's result (same expression as the lanes'
-          # `if:`); the other backend's job is skipped by construction.
-          KVM: >-
-            ${{ (vars.CARRICK_GCP_KVM == 'true' && vars.CARRICK_KVM_BACKEND != 'willow') && needs.kvm-tests.result || needs.kvm-tests-willow.result }}
-          KVM_BACKEND: >-
-            ${{ (vars.CARRICK_GCP_KVM == 'true' && vars.CARRICK_KVM_BACKEND != 'willow') && 'gcp' || 'willow' }}
+          KVM: ${{ needs.kvm-tests-willow.result }}
           HVF_GATE: ${{ needs.hvf-gate.result }}
           KVM_GATE: ${{ needs.kvm-gate.result }}
           EVENT: ${{ github.event_name }}
         run: |
-          echo "hvf-kernel=$HVF kvm($KVM_BACKEND)=$KVM hvf-gate=$HVF_GATE kvm-gate=$KVM_GATE"
+          echo "hvf-kernel=$HVF kvm=$KVM hvf-gate=$HVF_GATE kvm-gate=$KVM_GATE"
           test "$HVF" = success
           test "$KVM" = success
           if [ "$EVENT" = push ]; then

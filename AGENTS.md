@@ -592,8 +592,7 @@ Chat, worker mailboxes, scratch notes and agent memory are not.
   to main reruns the full suite on hosted macOS (#650). `kernel-runtime.yml` adds
   the self-hosted HVF lane (cloudmac, push to main and owner dispatch) and the
   KVM lane
-  (self-hosted JIT clones on the Contabo host, `docs/ci/contabo-kvm.md`;
-  GCP nested-KVM VMs as fallback, `docs/ci/gcp-kvm.md`). The
+  (self-hosted JIT clones on the Contabo host, `docs/ci/contabo-kvm.md`). The
   signed gate stays on cloudmac. Land on a failure-set diff against main
   (`NEW=[]`), not an absolute zero; `NEW=[]` is evidence only when every step
   is itemized and every binary finished (#352/#353, fix #377).

@@ -220,7 +220,7 @@ impl Github {
                 return Ok(NotCancelled);
             }
             // A queued KVM job may share a run with an already running HVF job,
-            // and vice versa. Include hosted GCP KVM, not only JIT runner labels.
+            // and vice versa.
             for job in &jobs {
                 if job["status"] == "in_progress" {
                     return Ok(Deferred);
@@ -228,8 +228,7 @@ impl Github {
                 let Some(labels) = job["labels"].as_array() else {
                     return Ok(NotCancelled);
                 };
-                let hardware = labels.iter().any(|label| label == "self-hosted")
-                    || job["name"] == "KVM · x86 kvm-lane tests";
+                let hardware = labels.iter().any(|label| label == "self-hosted");
                 if hardware
                     && job["status"] != "completed"
                     && !matches!(job["status"].as_str(), Some("queued" | "waiting"))
@@ -588,7 +587,6 @@ mod tests {
         for started in [
             hardware_job(1, &HVF_LABELS, "in_progress"),
             hardware_job(2, &LABELS, "in_progress"),
-            json!({"id":2,"name":"KVM · x86 kvm-lane tests","labels":["ubuntu-latest"],"status":"in_progress","started_at":"now"}),
             json!({"id":3,"name":"Signed fixtures","labels":["ubuntu-latest"],"status":"in_progress","started_at":"now"}),
         ] {
             let result = Github::cancel_superseded_with(&entry, |method, endpoint, _, _| {

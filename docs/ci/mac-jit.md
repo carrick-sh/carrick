@@ -54,7 +54,7 @@ is durable before the hook is released; an already approved local run cannot
 be superseded. Every assignment, including the reserved job, must rendezvous.
 The cancellation POST is cleanup outside that lock: a fresh all-lane jobs GET
 must show the target queued or waiting and no in-progress job; other hardware
-must be queued, waiting or completed (HVF, standing KVM or hosted GCP KVM). Observed running
+must be queued, waiting or completed (HVF or standing KVM). Observed running
 work defers the POST, retaining the intent across polls and restarts. Completed
 work does not strand an older queued lane. The controllers
 have separate authorities; there is no cross-controller acknowledgement.

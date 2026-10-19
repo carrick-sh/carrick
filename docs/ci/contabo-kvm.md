@@ -1,8 +1,7 @@
 # Contabo self-hosted KVM lane
 
 The trusted post-landing KVM lane runs on a throwaway JIT clone on the dedicated
-Contabo host (issue #287). This replaces the per-run GCP VMs
-([gcp-kvm.md](gcp-kvm.md)), which remain as a fallback. The design,
+Contabo host (issue #287). The design,
 admission and teardown are the Willow standing controller's, unchanged
 ([willow-pilot.md](willow-pilot.md)). Only the clone placement differs, and
 it comes from the typed site table in `crates/carrick-xtask/src/ci_scaler/site.rs`.
@@ -55,15 +54,12 @@ subnet:
 
 DNS to the public resolver and NAT to the internet still work.
 
-## Backend selection
+## Runner lane
 
 The `kvm-tests-willow` job and its `willow-kvm` runner labels are served from
 Contabo; there is no separate workflow arm. Only one standing controller may
-serve those labels, so Willow's stays stopped. To select the lane, set
-`CARRICK_KVM_BACKEND=willow` and `CARRICK_SELF_HOSTED_KVM=true`. To fall
-back to GCP, unset `CARRICK_KVM_BACKEND`, with `CARRICK_GCP_KVM=true`.
-Flip the variables only after a green `workflow_dispatch` on main through a
-Contabo clone.
+serve those labels, so Willow's stays stopped. The lane runs when
+`CARRICK_SELF_HOSTED_KVM=true`.
 
 ## Events and receipts
 
@@ -89,7 +85,7 @@ so an already approved local run cannot be superseded.
 
 Cancellation is cleanup after releasing that lock. Before POST, a fresh GET
 of all jobs in the run must show the target queued or waiting and no in-progress
-job; other hardware (including GCP KVM) must be queued, waiting or completed.
+job; other hardware (HVF) must be queued, waiting or completed.
 A populated `started_at` on a queued job does not mean it is running.
 Observed running work defers cleanup, retaining the intent across polls and
 restarts. Completed work does not prevent cancelling a superseded queued lane.
