@@ -2019,6 +2019,27 @@ mod overlay_dispatch_tests {
         }
     }
 
+    fn listener_host_ipv4_addr(h: &Harness, listener: i32) -> libc::sockaddr_in {
+        let host_fd = h
+            .dispatcher
+            .host_fd_for_poll(listener)
+            .expect("listener host fd");
+        let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of_val(&addr) as libc::socklen_t;
+        assert_eq!(
+            unsafe {
+                libc::getsockname(
+                    host_fd.get(),
+                    &mut addr as *mut _ as *mut libc::sockaddr,
+                    &mut len,
+                )
+            },
+            0,
+            "listener host getsockname"
+        );
+        addr
+    }
+
     #[test]
     fn epoll_et_delivers_listener_edge_without_read_byte_growth() {
         let mut h = Harness::new();
@@ -2067,22 +2088,7 @@ mod overlay_dispatch_tests {
             0
         );
 
-        let mut host_addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-        #[cfg(any(
-            target_os = "macos",
-            target_os = "freebsd",
-            target_os = "netbsd",
-            target_os = "openbsd",
-            target_os = "dragonfly"
-        ))]
-        {
-            host_addr.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
-        }
-        host_addr.sin_family = libc::AF_INET as libc::sa_family_t;
-        host_addr.sin_port = port.to_be();
-        host_addr.sin_addr = libc::in_addr {
-            s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
-        };
+        let host_addr = listener_host_ipv4_addr(&h, listener);
         let connect_client = || {
             let client = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
             assert!(client >= 0, "host client socket");
@@ -2285,7 +2291,11 @@ mod overlay_dispatch_tests {
         };
 
         let out_addr = h.reserve(16);
-        let host_addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let host_backing = listener_host_ipv4_addr(&h, listener);
+        let host_addr = std::net::SocketAddr::from((
+            std::net::Ipv4Addr::from(host_backing.sin_addr.s_addr.to_ne_bytes()),
+            u16::from_be(host_backing.sin_port),
+        ));
         let connect_host = || {
             std::net::TcpStream::connect_timeout(&host_addr, Duration::from_secs(1))
                 .expect("host TCP connection completes")
@@ -2415,22 +2425,7 @@ mod overlay_dispatch_tests {
             .expect("listener host fd")
             .get();
 
-        let mut host_addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-        #[cfg(any(
-            target_os = "macos",
-            target_os = "freebsd",
-            target_os = "netbsd",
-            target_os = "openbsd",
-            target_os = "dragonfly"
-        ))]
-        {
-            host_addr.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
-        }
-        host_addr.sin_family = libc::AF_INET as libc::sa_family_t;
-        host_addr.sin_port = port.to_be();
-        host_addr.sin_addr = libc::in_addr {
-            s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
-        };
+        let host_addr = listener_host_ipv4_addr(&h, listener);
         // The TCP handshake is asynchronous relative to the client's connect()
         // returning, so BLOCK (bounded) on the listener's host readability
         // instead of sleeping: once poll(2) reports POLLIN the connection is in

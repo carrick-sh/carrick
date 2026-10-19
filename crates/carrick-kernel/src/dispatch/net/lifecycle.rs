@@ -1829,20 +1829,10 @@ mod icmp_ping_tests {
     }
 
     #[test]
-    fn bind_zero_skips_host_occupied_ephemeral_candidate_without_leaking_lease() {
-        // The "occupied candidate" must be a port this process can prove is
-        // exclusively its own on the real host, not a hardcoded literal like
-        // the old `32768`: that value is also `EPHEMERAL_PORT_START`, the
-        // deterministic first candidate a fresh registry always tries, so
-        // any other test in this binary (including a concurrently run copy
-        // of this very test) racing its own ephemeral bind(0) for the same
-        // literal first pick can win the real host bind before this one --
-        // reproduced at ~58% under concurrent self-invocation. Let the OS
-        // assign the port instead (bind to 0, read back via getsockname; the
-        // kernel guarantees no other bind(0) can be handed the same port
-        // while this socket holds it), then seed the allocator via the
-        // test-only seam so the dispatcher's first candidate deterministically
-        // lands on that exact, genuinely-occupied port.
+    fn inzone_bind_zero_ignores_host_occupied_ephemeral_candidate() {
+        // Acquire a genuinely occupied host port, then force Carrick's logical
+        // allocator to choose that same number. A loopback bind is in-zone, so
+        // unrelated host ownership must not change its selected guest port.
         let blocker = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
         assert!(blocker >= 0);
         let blocker_addr = libc::sockaddr_in {
@@ -1918,14 +1908,6 @@ mod icmp_ping_tests {
                 .unwrap(),
             DispatchOutcome::Returned { value: 0 }
         );
-        assert!(
-            !dispatcher
-                .network
-                .provider
-                .inzone()
-                .port_in_use(&scope, blocker_port),
-            "failed candidate lease leaked"
-        );
         memory.write_bytes(0x4020, &16u32.to_ne_bytes()).unwrap();
         assert_eq!(
             dispatcher
@@ -1942,7 +1924,7 @@ mod icmp_ping_tests {
             DispatchOutcome::Returned { value: 0 }
         );
         let bound = memory.read_bytes(0x4010, 16).unwrap();
-        assert_ne!(u16::from_be_bytes([bound[2], bound[3]]), blocker_port);
+        assert_eq!(u16::from_be_bytes([bound[2], bound[3]]), blocker_port);
 
         let explicit_fd = match dispatcher
             .dispatch(
@@ -2377,6 +2359,7 @@ impl<'a> NetView<'a> {
                 let reuseaddr = bind_authority.reuseaddr;
                 let reuseport = bind_authority.reuseport;
                 let ipv6_v6only = bind_authority.ipv6_v6only;
+                let carrick_owned_loopback = requested.ip().is_loopback();
                 // Linux accepts the pre-bind IPV6_V6ONLY option but rejects a
                 // subsequent bind of an IPv4-mapped IPv6 address (EINVAL).
                 // Decide before reserving a lease or touching the host carrier.
@@ -2386,13 +2369,15 @@ impl<'a> NetView<'a> {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
                 let (guest_bound, lease) = if requested.port() == 0 {
-                    ephemeral_retry = Some((
-                        scope.clone(),
-                        requested.ip(),
-                        reuseaddr,
-                        reuseport,
-                        ipv6_v6only,
-                    ));
+                    if !carrick_owned_loopback {
+                        ephemeral_retry = Some((
+                            scope.clone(),
+                            requested.ip(),
+                            reuseaddr,
+                            reuseport,
+                            ipv6_v6only,
+                        ));
+                    }
                     let Some(lease) = this.network.provider.inzone().allocate_ephemeral_for_bind(
                         &scope,
                         requested.ip(),
@@ -2412,10 +2397,18 @@ impl<'a> NetView<'a> {
                     };
                     (requested, lease)
                 };
-                // Bind the host socket to the same selected guest endpoint.
+                // Loopback TCP is Carrick-owned: its guest endpoint must not
+                // collide with an unrelated process using the same host port.
+                // Retain a private host carrier for readiness integration;
+                // externally reachable binds still use their real endpoint.
+                let host_bound = if carrick_owned_loopback {
+                    std::net::SocketAddr::new(guest_bound.ip(), 0)
+                } else {
+                    guest_bound
+                };
                 // The lease remains the authority until the exact description
                 // either receives it after a successful bind or drops on error.
-                let Some(selected_host_addr) = socket_addr_to_host_sockaddr(guest_bound) else {
+                let Some(selected_host_addr) = socket_addr_to_host_sockaddr(host_bound) else {
                     return Ok(DispatchOutcome::errno(carrick_abi::LINUX_EADDRNOTAVAIL));
                 };
                 host_addr = selected_host_addr;
