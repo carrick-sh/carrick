@@ -655,10 +655,14 @@ pub(crate) struct KvmX86RestoreState {
 }
 
 impl KvmVcpu {
+    /// Only the x86_64 CPL0 carrier (`carrier_memory`) enrolls its vCPUs.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn enroll_carrier_census(&mut self) {
         self._guard = Some(vcpu_census().created());
     }
 
+    /// Only the x86_64 CPL0 carrier (`carrier_cpu`) arms a run kick.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn arm_run_kick(&mut self, kick: &crate::KvmKickHandle) {
         kick.arm_run(&mut self.fd_mut().get_kvm_run().immediate_exit);
     }

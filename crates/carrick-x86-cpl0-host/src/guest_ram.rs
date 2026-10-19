@@ -290,6 +290,7 @@ impl GuestRam {
             .collect()
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub fn replace_private_windows_with_vfork_shadows(&self, shadows: &VforkShadows) {
         let mut windows = self.windows.write().unwrap_or_else(|e| e.into_inner());
         for window in windows

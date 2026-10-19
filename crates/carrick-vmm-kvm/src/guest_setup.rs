@@ -16,8 +16,7 @@ use carrick_mem::memory::LINUX_EL1_VECTORS_SIZE;
 #[cfg(target_arch = "aarch64")]
 use carrick_mem::memory::{
     AddressSpace, LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_MAINT_BASE, LINUX_EL1_VECTORS_BASE,
-    LINUX_NULL_GUARD_END, LINUX_PAGE_TABLES_BASE, stage1_identity_page_tables,
-    va_in_shared_aperture,
+    LINUX_PAGE_TABLES_BASE, stage1_identity_page_tables, va_in_shared_aperture,
 };
 
 use crate::kvm::{KvmVcpu, KvmVm};
@@ -465,6 +464,22 @@ pub(crate) fn alias_leaf_writable(backing: &HostAliasBacking) -> bool {
         | HostAliasBacking::Anonymous { .. } => true,
     }
 }
+
+/// Result of the aarch64 KVM bring-up: a VM + a vCPU initialised to the EL1
+/// trampoline, ready for the trap engine to drive. `ram` is kept alive (its
+/// mmap backs KVM). The x86_64 analogue is `BroughtUpX86`.
+#[cfg(target_arch = "aarch64")]
+pub struct BroughtUp {
+    pub vm: KvmVm,
+    pub vcpu: KvmVcpu,
+    pub ram: GuestRam,
+    pub entry: u64,
+}
+
+/// The low window covers the user image's low segments AND the kernel region
+/// (EL0 trampoline / EL1 vectors / stage-1 page tables) at 180 GiB.
+#[cfg(target_arch = "aarch64")]
+const KERNEL_HOLE_END: u64 = 0x2D_0020_0000; // LINUX_KERNEL_REGION_BASE + 2 MiB
 
 /// Load `image` (a freestanding aarch64 ELF), build the stage-1 identity map +
 /// trampoline + sentinel vector, program the vCPU, and return it parked at the
