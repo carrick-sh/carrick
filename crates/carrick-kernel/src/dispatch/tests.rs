@@ -9682,6 +9682,76 @@ mod inzone_tcp {
             b"hello in-zone"
         );
 
+        g.mem.write_bytes(DATA_SCRATCH, b"reply in-zone").unwrap();
+        assert_eq!(
+            g.ok(
+                SYS_WRITE,
+                [accepted_fd as u64, DATA_SCRATCH, 13, 0, 0, 0]
+            ),
+            13
+        );
+        assert_eq!(
+            g.ok(
+                SYS_READ,
+                [client_fd as u64, read_scratch, 64, 0, 0, 0]
+            ),
+            13
+        );
+        assert_eq!(
+            &g.mem.read_bytes(read_scratch, 13).unwrap(),
+            b"reply in-zone"
+        );
+
+        // Both connected halves must expose the Carrick-owned listener port,
+        // never the private host readiness carrier's port.
+        let addr_client_peer = ADDR_SCRATCH;
+        let len_client_peer = ADDRLEN_SCRATCH;
+        g.mem
+            .write_bytes(len_client_peer, &16u32.to_ne_bytes())
+            .unwrap();
+        assert_eq!(
+            g.ok(
+                SYS_GETPEERNAME,
+                [
+                    client_fd as u64,
+                    addr_client_peer,
+                    len_client_peer,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+        assert_eq!(
+            g.read_sockaddr_in(addr_client_peer),
+            (port, [127, 0, 0, 1])
+        );
+
+        let addr_accepted_local = ADDR_SCRATCH + 0x20;
+        let len_accepted_local = ADDRLEN_SCRATCH + 0x10;
+        g.mem
+            .write_bytes(len_accepted_local, &16u32.to_ne_bytes())
+            .unwrap();
+        assert_eq!(
+            g.ok(
+                SYS_GETSOCKNAME,
+                [
+                    accepted_fd as u64,
+                    addr_accepted_local,
+                    len_accepted_local,
+                    0,
+                    0,
+                    0,
+                ],
+            ),
+            0
+        );
+        assert_eq!(
+            g.read_sockaddr_in(addr_accepted_local),
+            (port, [127, 0, 0, 1])
+        );
+
         // getpeername(accepted) == getsockname(client)
         let addr_accepted_peer = ADDR_SCRATCH;
         let len_accepted_peer = ADDRLEN_SCRATCH;
