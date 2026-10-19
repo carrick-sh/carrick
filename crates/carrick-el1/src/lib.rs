@@ -12,7 +12,6 @@ pub mod lock;
 pub mod memory;
 pub mod personality;
 pub mod substrate;
-pub use fault::dispatch_fault;
 pub use personality::dispatch::*;
 pub use personality::{file, inotify, sched};
 

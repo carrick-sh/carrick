@@ -353,8 +353,8 @@ impl AnonymousPermissionEditor for HardwareAnonymousPermissionEditor {
                 edit,
             )?;
         }
-        let mut cpu = crate::sched::HardwareCpu;
-        crate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
+        let mut cpu = crate::substrate::sched::HardwareCpu;
+        crate::substrate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
         Ok(())
     }
 }
@@ -388,8 +388,8 @@ impl AnonymousRetirementEditor for HardwareAnonymousRetirementEditor {
                 len,
             )?;
         }
-        let mut cpu = crate::sched::HardwareCpu;
-        crate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
+        let mut cpu = crate::substrate::sched::HardwareCpu;
+        crate::substrate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
         Ok(())
     }
 }

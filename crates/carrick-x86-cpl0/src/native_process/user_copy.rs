@@ -13,11 +13,11 @@ struct NativeWriteVenue<'a> {
     pool: &'a carrick_el1_abi::CowGrantPool,
     slots: &'a MmPortalSlots,
     prepared: carrick_el1::fault::X86PreparedResolver<'a, InitialWords>,
-    cow: carrick_el1::fault::X86CowResolver<'a, InitialWords>,
+    cow: carrick_el1::personality::cow_resolver::X86CowResolver<'a, InitialWords>,
 }
 impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
     type Prepared = carrick_el1::fault::X86PreparedResolver<'a, InitialWords>;
-    type Cow = carrick_el1::fault::X86CowResolver<'a, InitialWords>;
+    type Cow = carrick_el1::personality::cow_resolver::X86CowResolver<'a, InitialWords>;
     type Error = NativeProcessError;
 
     fn selection_venues(&mut self) -> SelectionVenues<'_, Self::Prepared, Self::Cow> {
@@ -116,7 +116,7 @@ impl Service {
             pool,
             slots,
             prepared,
-            cow: carrick_el1::fault::X86CowResolver {
+            cow: carrick_el1::personality::cow_resolver::X86CowResolver {
                 words: &words,
                 pool,
                 residency,

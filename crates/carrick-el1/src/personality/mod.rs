@@ -6,6 +6,7 @@ pub mod aarch64_process;
 #[cfg(any(test, feature = "host-test"))]
 pub mod aarch64_process_tests;
 pub mod common_entry;
+pub mod cow_resolver;
 pub mod dispatch;
 pub mod file;
 pub mod file_table;

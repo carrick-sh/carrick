@@ -599,7 +599,7 @@ pub fn handle_user_page_fault_prepared(
     // every prepared commit; InitialWords retains its mapped window.
     let mut prepared =
         unsafe { carrick_el1::fault::X86PreparedResolver::under_editor(prepared_mm, &words) };
-    let mut cow = carrick_el1::fault::X86CowResolver {
+    let mut cow = carrick_el1::personality::cow_resolver::X86CowResolver {
         words: &words,
         pool: cow_pool,
         residency,
@@ -694,7 +694,7 @@ pub fn handle_user_page_fault_prepared(
                 fault.address,
             );
             let supply = carrick_el1::fault::OwnerFaultSupply::new(portal);
-            let mut cow = carrick_el1::fault::X86CowResolver {
+            let mut cow = carrick_el1::personality::cow_resolver::X86CowResolver {
                 words: &words,
                 pool: cow_pool,
                 residency,

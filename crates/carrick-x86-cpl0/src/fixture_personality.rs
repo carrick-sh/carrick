@@ -891,9 +891,8 @@ impl Personality for FixturePersonality {
             }
             FixtureCall::ObserveSharedCowFault => {
                 use carrick_core::mm::transfer::resolver::NoopPreparedResolver;
-                use carrick_el1::fault::{
-                    GrantMailboxes, X86CowResolver, dispatch_x86_fault_with_prepared,
-                };
+                use carrick_el1::fault::{GrantMailboxes, dispatch_x86_fault_with_prepared};
+                use carrick_el1::personality::cow_resolver::X86CowResolver;
                 use carrick_el1_abi::{Action, FrameGrantResidencyIdentity};
                 use carrick_guest_arch::{
                     Access, EditBacking, EditOperation, EditPermissions, FaultInfo, FrameGpa,
@@ -1244,9 +1243,8 @@ impl Personality for FixturePersonality {
 
     fn handle_page_fault(frame: &mut PageFaultStack, fpstate: &XsaveArea) -> u64 {
         use carrick_core::mm::transfer::resolver::NoopPreparedResolver;
-        use carrick_el1::fault::{
-            GrantMailboxes, X86CowResolver, dispatch_x86_fault_with_prepared,
-        };
+        use carrick_el1::fault::{GrantMailboxes, dispatch_x86_fault_with_prepared};
+        use carrick_el1::personality::cow_resolver::X86CowResolver;
         use carrick_el1_abi::Action;
 
         let prep = match prepare_user_page_fault(frame) {

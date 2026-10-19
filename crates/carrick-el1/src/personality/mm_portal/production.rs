@@ -310,7 +310,7 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         // CPL0 COW is unavailable until its sole descriptor authority is bound.
         let mut cow = carrick_core::mm::transfer::resolver::NoopCowResolver;
         #[cfg(target_arch = "aarch64")]
-        let mut cow = crate::fault::HardwareCowResolver {
+        let mut cow = crate::personality::cow_resolver::HardwareCowResolver {
             publication: slots.executable(frame.slot as usize),
             completion: None,
             service_slot: Some(executor_slot),
