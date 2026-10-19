@@ -1688,3 +1688,12 @@ contracts = ["kernel.el1.thread-lifecycle"]
 [[surfaces]]
 path = "crates/carrick-el1-linux/src/aarch64_process_tests/exit_group_hang_tests.rs"
 contracts = ["kernel.el1.thread-lifecycle"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/copyout.rs"
+contracts = ["kernel.copyout.owner-refusal"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/copyout_tests.rs"
+contracts = ["kernel.copyout.owner-refusal"]
+

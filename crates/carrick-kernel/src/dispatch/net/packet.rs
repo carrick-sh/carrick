@@ -500,11 +500,7 @@ impl PacketSocket {
             sll.sll_protocol = self.protocol;
         }
         let sll_bytes = sll.as_bytes();
-        if super::support::write_linux_sockaddr(memory, addr_addr, addrlen_addr, sll_bytes).is_err()
-        {
-            return DispatchOutcome::errno(LINUX_EFAULT);
-        }
-        DispatchOutcome::Returned { value: 0 }
+        super::support::copyout_linux_sockaddr(memory, addr_addr, addrlen_addr, sll_bytes)
     }
 }
 
