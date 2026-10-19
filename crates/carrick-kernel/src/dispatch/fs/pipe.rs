@@ -950,6 +950,16 @@ impl<'a> FsView<'a> {
             let nonblock = flags & LINUX_O_NONBLOCK;
             let fd_flags = linux_fd_flags_from_open_flags(flags);
 
+            // Prepare the `pipefd` output before creating anything: an owner
+            // refusal parks and retries this syscall, which is only clean
+            // while no pipe or descriptor exists yet (#711).
+            let out = match crate::dispatch::copyout::UserOut::<LinuxFdPair>::new(address)
+                .prepare(memory)
+            {
+                Ok(out) => out,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
+
             let pipe_id = next_pipe_id();
             // Only the authority's own host memory is ENOMEM; creation
             // refusals are typed Linux limits (ENFILE), never a table size.
@@ -985,7 +995,7 @@ impl<'a> FsView<'a> {
                 return Ok(DispatchOutcome::errno(linux_errno::EMFILE));
             };
             let pair = LinuxFdPair { read_fd, write_fd };
-            if write_kernel_struct_raw(memory, address, &pair).is_err() {
+            if out.commit(&pair).is_err() {
                 let removed = {
                     let files = this.captured_file_table();
                     let mut table = files.write_open_files();

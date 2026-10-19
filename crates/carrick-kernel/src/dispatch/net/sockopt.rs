@@ -332,6 +332,27 @@ fn setsockopt_in_memory(
     }
 }
 
+/// Write a 4-byte option value and a 4-byte length without the guest-length
+/// clamp, ignoring an invalid pointer as these answers always have. Only a
+/// retryable owner wait is reported.
+fn copyout_fixed_sockopt<M: CurrentMmMemory>(
+    memory: &mut M,
+    optval_addr: u64,
+    optlen_addr: u64,
+    value: &i32,
+) -> Result<(), crate::dispatch::copyout::CopyoutRefusal> {
+    use crate::dispatch::copyout::{UserSlot, prepare};
+    let out = prepare(
+        memory,
+        [
+            UserSlot::optional(optval_addr, 4),
+            UserSlot::optional(optlen_addr, 4),
+        ],
+    )?;
+    let _ = out.commit([&value.to_ne_bytes(), &4u32.to_ne_bytes()]);
+    Ok(())
+}
+
 fn getsockopt_in_memory<M: CurrentMmMemory>(
     socket: &std::sync::Arc<crate::dispatch::net::unix_pure::PureSocketInner>,
     memory: &mut M,
@@ -919,8 +940,10 @@ impl<'a> NetView<'a> {
                 } else {
                     0
                 };
-                let _ = memory.write_bytes(optval_addr, &val.to_ne_bytes());
-                let _ = memory.write_bytes(optlen_addr, &4u32.to_ne_bytes());
+                // Faults stay ignored here, as before; a wait still retries.
+                if let Err(refusal) = copyout_fixed_sockopt(memory, optval_addr, optlen_addr, &val) {
+                    return Ok(refusal.into_outcome());
+                }
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             // LTP getsockopt01: closed fd -> EBADF, non-socket fd -> ENOTSOCK,
@@ -965,8 +988,9 @@ impl<'a> NetView<'a> {
             // STREAM answer would mislabel the socket.
             if level == LINUX_SOL_SOCKET && optname == LINUX_SO_TYPE
                 && let Some(t) = this.socket_guest_type(fd) {
-                    let _ = memory.write_bytes(optval_addr, &t.to_ne_bytes());
-                    let _ = memory.write_bytes(optlen_addr, &4u32.to_ne_bytes());
+                    if let Err(refusal) = copyout_fixed_sockopt(memory, optval_addr, optlen_addr, &t) {
+                        return Ok(refusal.into_outcome());
+                    }
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
             // SO_DOMAIN / SO_PROTOCOL are Linux-only getsockopt options with no

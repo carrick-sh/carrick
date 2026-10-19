@@ -1599,3 +1599,11 @@ contracts = ["kernel.mm.invalidation-domain"]
 [[surfaces]]
 path = "crates/carrick-core/src/mm/retirement/invalidation/loom_models.rs"
 contracts = ["kernel.mm.invalidation-domain"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/copyout.rs"
+contracts = ["kernel.copyout.owner-refusal"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/copyout_tests.rs"
+contracts = ["kernel.copyout.owner-refusal"]

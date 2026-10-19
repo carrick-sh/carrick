@@ -580,20 +580,35 @@ impl<'a> FsView<'a> {
                 entries.insert(0, dot_entry(".", dir_path));
             }
 
-            let mut out = Vec::with_capacity(length.min(65536));
-            while *offset < entries.len() {
-                let rec_len = dirent64_record_len(&entries[*offset]);
+            // Build the batch at a private cursor, prepare exactly its bytes,
+            // and advance the directory offset only after the commit: an owner
+            // refusal parks and retries with every entry still unread (#711).
+            // One owner permit bounds the batch; Linux may return fewer
+            // entries than fit the caller's buffer.
+            let batch_limit = crate::dispatch::copyout::bounded_capacity(memory, length);
+            let mut out = Vec::with_capacity(batch_limit.min(65536));
+            let mut cursor = *offset;
+            while cursor < entries.len() {
+                let rec_len = dirent64_record_len(&entries[cursor]);
                 if rec_len > length {
                     return Ok(DispatchOutcome::errno(LINUX_EINVAL));
                 }
-                if out.len() + rec_len > length {
+                if out.len() + rec_len > batch_limit {
                     break;
                 }
-                append_dirent64_record(&entries[*offset], *offset + 1, &mut out);
-                *offset += 1;
+                append_dirent64_record(&entries[cursor], cursor + 1, &mut out);
+                cursor += 1;
             }
 
-            memory.write_bytes(address, &out)?;
+            let prepared = match crate::dispatch::copyout::prepare(
+                memory,
+                [Some(crate::dispatch::copyout::UserSlot::new(address, out.len()))],
+            ) {
+                Ok(prepared) => prepared,
+                Err(refusal) => return Ok(refusal.into_outcome()),
+            };
+            prepared.commit([&out])?;
+            *offset = cursor;
 
             Ok(DispatchOutcome::returned_len_or_errno(out.len()))
         }
