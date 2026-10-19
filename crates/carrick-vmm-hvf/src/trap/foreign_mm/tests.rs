@@ -4617,7 +4617,7 @@ fn production_manager_bound_through_runtime_task_state_grows_extension_arenas() 
     let returned = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let source = TestArenaSource {
         id: carrick_mmu_core::aarch64::TableArenaSourceId(carrick_mmu_core::aarch64::SubstrateGpa(
-            stage1_root.0,
+            stage1_root.raw(),
         )),
         available: std::sync::Arc::clone(&available),
         returned: std::sync::Arc::clone(&returned),
@@ -4776,7 +4776,7 @@ fn production_resolver_under_manager_lock_does_not_deadlock_on_multi_arena_sync(
     let returned = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let source = TestArenaSource {
         id: carrick_mmu_core::aarch64::TableArenaSourceId(carrick_mmu_core::aarch64::SubstrateGpa(
-            stage1_root.0,
+            stage1_root.raw(),
         )),
         available: std::sync::Arc::clone(&available),
         returned: std::sync::Arc::clone(&returned),
@@ -4798,9 +4798,9 @@ fn production_resolver_under_manager_lock_does_not_deadlock_on_multi_arena_sync(
     let mut primary_host = vec![0u8; carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize];
     let mut ext_host = vec![0u8; carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize];
     let mut ext_region = crate::trap::thread_sibling_tests::mapped_region(
-        ext_base.0,
-        ext_base.0 + carrick_mem::memory::LINUX_PAGE_TABLES_SIZE,
-        ext_base.0,
+        ext_base.raw(),
+        ext_base.raw() + carrick_mem::memory::LINUX_PAGE_TABLES_SIZE,
+        ext_base.raw(),
     );
     ext_region.host_addr = ext_host.as_mut_ptr();
     runtime.mappings.insert(ext_region);
@@ -4972,7 +4972,7 @@ fn child_fork_replicates_multi_arena_stage1_page_tables() {
     let returned = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let source = TestArenaSource {
         id: carrick_mmu_core::aarch64::TableArenaSourceId(carrick_mmu_core::aarch64::SubstrateGpa(
-            stage1_root.0,
+            stage1_root.raw(),
         )),
         available: std::sync::Arc::clone(&available),
         returned: std::sync::Arc::clone(&returned),
@@ -5022,9 +5022,9 @@ fn child_fork_replicates_multi_arena_stage1_page_tables() {
     // Extension arena mapping in parent
     let mut ext_host = vec![0u8; TWO_MIB as usize];
     let mut ext_region = crate::trap::thread_sibling_tests::mapped_region(
-        ext_base.0,
-        ext_base.0 + TWO_MIB,
-        ext_base.0,
+        ext_base.raw(),
+        ext_base.raw() + TWO_MIB,
+        ext_base.raw(),
     );
     ext_region.host_addr = ext_host.as_mut_ptr();
     parent_runtime.mappings.insert(ext_region);
@@ -5085,7 +5085,7 @@ fn child_fork_replicates_multi_arena_stage1_page_tables() {
     let child_ext_mapping = plan
         .mappings
         .iter()
-        .find(|m| m.ipa == child_ext_base.0)
+        .find(|m| m.ipa == child_ext_base.raw())
         .expect("child has extension arena mapping");
     assert_eq!(child_ext_mapping.size, TWO_MIB as usize);
     assert!(!child_ext_mapping.physical_host_addr.is_null());
@@ -13760,7 +13760,7 @@ fn transfer_pending_grant_refusal_and_unmap_preserve_exact_successor() {
         };
         let target = carrick_aarch64::user_transfer::TransferTarget::from_handle(
             handle,
-            (u64::from(installed.snapshot.asid.get()) << 48) | installed.snapshot.stage1_root.0,
+            (u64::from(installed.snapshot.asid.get()) << 48) | installed.snapshot.stage1_root.raw(),
         );
         let start = TEST_VA + 0x10_0000;
         let window = carrick_el1_abi::PortalGrantWindow {
@@ -14225,7 +14225,7 @@ fn transfer_cow_refill_uses_exact_target_physical_inventory_once() {
     };
     let target = carrick_aarch64::user_transfer::TransferTarget::from_handle(
         handle,
-        (u64::from(installed.snapshot.asid.get()) << 48) | installed.snapshot.stage1_root.0,
+        (u64::from(installed.snapshot.asid.get()) << 48) | installed.snapshot.stage1_root.raw(),
     );
     let start = TEST_VA + 0x10_0000;
     let window = carrick_el1_abi::PortalGrantWindow {
@@ -14661,7 +14661,7 @@ fn exercise_retained_import(journal_case: u8) {
         &region,
         &zone.spaces,
         guard.mm.get(),
-        installed.snapshot.stage1_root.0,
+        installed.snapshot.stage1_root.raw(),
         1,
         0,
     );
@@ -14714,7 +14714,7 @@ fn exercise_retained_import(journal_case: u8) {
     let words = unsafe {
         carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords::new(
             root_host as *mut _,
-            installed.snapshot.stage1_root.0,
+            installed.snapshot.stage1_root.raw(),
             installed.owners.0[0].1 as usize,
             &maintenance,
         )
@@ -14773,7 +14773,7 @@ fn concurrent_transfer_waits_for_exact_uncommitted_physical_grant() {
     };
     let target = carrick_aarch64::user_transfer::TransferTarget::from_handle(
         handle,
-        (u64::from(installed.snapshot.asid.get()) << 48) | installed.snapshot.stage1_root.0,
+        (u64::from(installed.snapshot.asid.get()) << 48) | installed.snapshot.stage1_root.raw(),
     );
     let start = TEST_VA + 0x10_0000;
     let window = carrick_el1_abi::PortalGrantWindow {

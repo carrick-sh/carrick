@@ -49,7 +49,7 @@ impl GuestMemory for CarrierCopyMemory<'_> {
                 .current_mm(self.execution)
                 .and_then(|mm| {
                     mm.access_token()
-                        .read_range(GuestVa(address), length)
+                        .read_range(GuestVa::new(address), length)
                         .map(|_| ())
                 })
                 .map_err(|_| MemoryError::OutOfBounds { address, length })?;
@@ -62,13 +62,13 @@ impl GuestMemory for CarrierCopyMemory<'_> {
         let result = if let Some(cache) = self.read_cache {
             self.context.copy_current_into_cached(
                 self.execution,
-                GuestVa(address),
+                GuestVa::new(address),
                 dst,
                 &mut cache.borrow_mut(),
             )
         } else {
             self.context
-                .copy_current_into(self.execution, GuestVa(address), dst)
+                .copy_current_into(self.execution, GuestVa::new(address), dst)
         };
         result.map_err(|_| MemoryError::OutOfBounds {
             address,
@@ -77,7 +77,7 @@ impl GuestMemory for CarrierCopyMemory<'_> {
     }
     fn write_bytes_raw(&mut self, address: u64, src: &[u8]) -> Result<(), MemoryError> {
         self.context
-            .copy_current_from(self.execution, GuestVa(address), src)
+            .copy_current_from(self.execution, GuestVa::new(address), src)
             .map_err(|_| MemoryError::OutOfBounds {
                 address,
                 length: src.len(),
@@ -86,7 +86,7 @@ impl GuestMemory for CarrierCopyMemory<'_> {
     fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
         self.context
             .current_mm(self.execution)
-            .and_then(|mm| mm.write_range(GuestVa(address), length).map(|_| ()))
+            .and_then(|mm| mm.write_range(GuestVa::new(address), length).map(|_| ()))
             .is_ok()
     }
     fn protect_range(&mut self, _: u64, _: usize, _: u64) -> Result<(), MemoryError> {
