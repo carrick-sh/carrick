@@ -12,7 +12,7 @@ scale_points = [1]
 rationale = "A short-lock holder can be host-descheduled. Its elapsed descheduling cannot decide Linux semantics. Native enrollment and committed publication acquire one guard without a contention refusal; the retained operation enrolls once, and lock waiting never redispatches a syscall. Interrupts remain masked through the sections; explicitly deferred IRQ expiry retains its timer ticket."
 
 [bindings]
-vm_free = "carrick-el1::personality::native_process_runtime::tests::bucket_contention_msgrcv"
+vm_free = "carrick-el1-linux::native_process_runtime::tests::bucket_contention_msgrcv"
 # Supplemental bindings in the same gated lib target:
 # bucket_contention_semtimedop
 # pending_default_stop_does_not_interrupt_wait4

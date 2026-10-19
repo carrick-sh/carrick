@@ -1,11 +1,11 @@
 //! Conflicting edits retain their original syscall arguments in the existing
 //! EL1 scheduler context. They have performed no effect before this park.
 
-use crate::memory::reservations::SharedReservations;
-use crate::substrate::sched::{Sched, Served, ThreadCpu, UserWord};
 use carrick_core::wait::{
     EditWaitOutcome, EditWaitTarget, OperationResumePc, coordinate_prepared_edit_wait,
 };
+use carrick_el1::memory::reservations::SharedReservations;
+use carrick_el1::substrate::sched::{Sched, Served, ThreadCpu, UserWord};
 use carrick_el1_abi::{ReservationMm, ReservationRange, TrapFrame};
 use core::sync::atomic::Ordering;
 
@@ -32,9 +32,9 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
         ReservationRange::new(start & !4095, end)
     };
     let slot = sched.slot;
-    let space_acc = crate::substrate::sched::object_wait::space_access(sched.zone, slot);
+    let space_acc = carrick_el1::substrate::sched::object_wait::space_access(sched.zone, slot);
 
-    let check_conflict = |root: &mut crate::memory::reservations::Reservations<'_>| {
+    let check_conflict = |root: &mut carrick_el1::memory::reservations::Reservations<'_>| {
         let first = match nr {
             215 | 216 | 226 => rounded(frame.x[0], frame.x[1]),
             222 if frame.x[3] & (0x10 | 0x100000) != 0 => rounded(frame.x[0], frame.x[1]),
@@ -60,7 +60,7 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
             '_,
             carrick_el1_abi::Aarch64ParkedContext,
         >| {
-            crate::substrate::sched::object_wait::deliver_completion(zone, slot, effects);
+            carrick_el1::substrate::sched::object_wait::deliver_completion(zone, slot, effects);
         };
         carrick_core::wait::observe_object(zone, slot, key, &completion)
     };

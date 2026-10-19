@@ -1,8 +1,8 @@
 //! Pending heap retirement owns its scrub independently of ordinary user copy.
 use super::{MmError, MmPortal};
-use crate::cow::GuestCowVenue;
-use crate::memory::reservations::Reservations;
 use carrick_core::mm::cow::CowRepointOutcome;
+use carrick_el1::cow::GuestCowVenue;
+use carrick_el1::memory::reservations::Reservations;
 use carrick_el1_abi::{CowGrantCompletion, PinnedMetadataExtent, PortalBackingMaintenance};
 use carrick_mmu_core::aarch64::SubstrateGpa;
 use carrick_mmu_core::aarch64::descriptor_txn::{
@@ -187,10 +187,12 @@ impl BackingMaintenance<'_> {
     #[cfg(all(target_os = "none", target_arch = "x86_64"))]
     pub fn scrub_x86<W: LiveDescriptorWords + ?Sized>(
         self,
-        venue: &carrick_core::mm::cow::GuestCowVenue<'_, crate::cow::X86CowMmu, W>,
+        venue: &carrick_core::mm::cow::GuestCowVenue<'_, carrick_el1::cow::X86CowMmu, W>,
         zero_page: impl FnMut(u64, u64),
     ) -> Result<BackingMaintenanceProgress, MmError> {
-        self.scrub_retired_x86(venue, zero_page, || crate::isa::x86::fatal_entry_binding())
+        self.scrub_retired_x86(venue, zero_page, || {
+            carrick_el1::isa::x86::fatal_entry_binding()
+        })
     }
 
     /// The same admitted request and physical settlement with an injected
@@ -354,7 +356,7 @@ fn with_x86_backing_venue<R>(
     run: impl for<'a> FnOnce(
         &carrick_core::mm::cow::GuestCowVenue<
             'a,
-            crate::cow::X86CowMmu,
+            carrick_el1::cow::X86CowMmu,
             dyn LiveDescriptorWords + 'a,
         >,
     ) -> R,
@@ -369,7 +371,7 @@ fn with_x86_backing_venue<R>(
 pub fn serve_backing_maintenance_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     let run = |frame: &carrick_el1_abi::TrapFrame| -> Result<BackingMaintenanceProgress, MmError> {
         let slot = carrick_el1_abi::service_slot_from_stack(
-            crate::substrate::sched::hw::read_current_sp(),
+            carrick_el1::substrate::sched::hw::read_current_sp(),
             frame.slot,
         )
         .ok_or(MmError::Stale)?;
@@ -390,22 +392,26 @@ pub fn serve_backing_maintenance_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         let portal = MmPortal::<super::production::GuestMetadataPin> {
             backend: core::marker::PhantomData,
             carrier: request.handle().carrier(),
-            roots: crate::memory::reservations::shared_guest(),
+            roots: carrick_el1::memory::reservations::shared_guest(),
             spaces: &zone.spaces,
             nodes: None,
             zone: Some(zone),
         };
         let operation = portal.begin_backing_maintenance(request, frame.slot as u32)?;
         #[cfg(target_arch = "aarch64")]
-        let progress =
-            crate::fault::with_hardware_cow_venue(operation.ttbr0(), Some(slot), None, |venue| {
+        let progress = carrick_el1::fault::with_hardware_cow_venue(
+            operation.ttbr0(),
+            Some(slot),
+            None,
+            |venue| {
                 operation.scrub(venue, |_, destination| {
                     // SAFETY: the existing copy window maps one retained private
                     // grant page RW; the owner authenticated the invalid predecessor.
                     unsafe { core::ptr::write_bytes(destination as *mut u8, 0, 4096) };
                 })
-            })
-            .map_err(|_| MmError::Core)?;
+            },
+        )
+        .map_err(|_| MmError::Core)?;
         #[cfg(target_arch = "x86_64")]
         let progress = with_x86_backing_venue(operation.ttbr0(), |venue| {
             operation.scrub_x86(venue, |_, destination| {

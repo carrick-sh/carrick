@@ -96,7 +96,3 @@ pub fn shared_host() -> Option<&'static SharedReservations> {
 pub fn shared_guest() -> &'static SharedReservations {
     unsafe { &*((EL1_REGION_BASE as usize + RESERVATIONS_OFFSET) as *const SharedReservations) }
 }
-
-#[cfg(test)]
-#[path = "reservation_decoder_tests.rs"]
-mod decoder_tests;

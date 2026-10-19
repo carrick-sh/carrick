@@ -66,6 +66,6 @@ pub use mmu::{
     execute_native_edit_intent, hardware_live_root, portal_root_is_live, resident_leaf_matches,
 };
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub(crate) use mmu::{portal_descriptor_words, portal_invalidate_root};
+pub use mmu::{portal_descriptor_words, portal_invalidate_root};
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub use transport::{complete_native_run_failure, fatal_entry_binding, yield_host_effect};

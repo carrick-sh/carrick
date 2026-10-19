@@ -466,6 +466,7 @@ dependencies = [
  "carrick-core-abi",
  "carrick-el1",
  "carrick-el1-abi",
+ "carrick-el1-linux",
  "carrick-guest-arch",
  "carrick-mmu-core",
  "carrick-personality-linux",
@@ -488,22 +489,15 @@ dependencies = [
 name = "carrick-el1"
 version = "0.1.0"
 dependencies = [
- "carrick-aarch64",
- "carrick-abi",
  "carrick-core",
  "carrick-core-abi",
  "carrick-el1-abi",
- "carrick-fatal",
+ "carrick-el1-linux",
  "carrick-guest-arch",
- "carrick-guest-mem",
- "carrick-hal",
- "carrick-inotify-core",
- "carrick-kernel",
  "carrick-mem",
  "carrick-mmu-core",
  "carrick-personality-linux",
  "carrick-sched-core",
- "carrick-signal-core",
  "carrick-syscall-abi",
  "carrick-test-support",
  "libc",
@@ -530,6 +524,33 @@ name = "carrick-el1-image"
 version = "0.1.0"
 dependencies = [
  "carrick-el1-abi",
+]
+
+[[package]]
+name = "carrick-el1-linux"
+version = "0.1.0"
+dependencies = [
+ "carrick-aarch64",
+ "carrick-abi",
+ "carrick-core",
+ "carrick-core-abi",
+ "carrick-el1",
+ "carrick-el1-abi",
+ "carrick-fatal",
+ "carrick-guest-arch",
+ "carrick-guest-mem",
+ "carrick-hal",
+ "carrick-inotify-core",
+ "carrick-kernel",
+ "carrick-mem",
+ "carrick-mmu-core",
+ "carrick-personality-linux",
+ "carrick-sched-core",
+ "carrick-signal-core",
+ "carrick-syscall-abi",
+ "carrick-test-support",
+ "libc",
+ "zerocopy",
 ]
 
 [[package]]
@@ -730,6 +751,7 @@ dependencies = [
  "carrick-core-abi",
  "carrick-el1",
  "carrick-el1-abi",
+ "carrick-el1-linux",
  "carrick-fatal",
  "carrick-guest-arch",
  "carrick-guest-mem",
@@ -873,6 +895,7 @@ dependencies = [
  "carrick-core-abi",
  "carrick-el1",
  "carrick-el1-abi",
+ "carrick-el1-linux",
  "carrick-guest-arch",
  "carrick-personality-api",
  "carrick-sched-core",
@@ -911,6 +934,7 @@ dependencies = [
  "carrick-core-abi",
  "carrick-el1",
  "carrick-el1-abi",
+ "carrick-el1-linux",
  "carrick-fatal",
  "carrick-guest-arch",
  "carrick-guest-mem",
@@ -1120,6 +1144,7 @@ dependencies = [
  "carrick-core-abi",
  "carrick-el1",
  "carrick-el1-abi",
+ "carrick-el1-linux",
  "carrick-fatal",
  "carrick-guest-arch",
  "carrick-guest-mem",
@@ -1160,6 +1185,7 @@ dependencies = [
  "carrick-core-abi",
  "carrick-el1",
  "carrick-el1-abi",
+ "carrick-el1-linux",
  "carrick-fatal",
  "carrick-guest-arch",
  "carrick-guest-mem",
@@ -1249,6 +1275,7 @@ dependencies = [
  "carrick-core-abi",
  "carrick-el1",
  "carrick-el1-abi",
+ "carrick-el1-linux",
  "carrick-guest-arch",
  "carrick-mmu-core",
  "carrick-personality-linux",

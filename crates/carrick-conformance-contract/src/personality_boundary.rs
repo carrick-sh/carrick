@@ -101,6 +101,7 @@ pub const DEFAULT_SUBSTRATE_ALLOWLIST: &[&str] = &[
 /// Designated Linux personality or ABI crates forbidden in substrate dependency closures.
 pub const FORBIDDEN_PERSONALITY_CRATES: &[&str] = &[
     "carrick-personality-linux",
+    "carrick-el1-linux",
     "carrick-abi",
     "carrick-el1-abi",
     "carrick-signal-linux",
@@ -912,10 +913,12 @@ fn has_test_attr(attrs: &[syn::Attribute]) -> bool {
 // Source Code & Module Tree Traversal
 // ---------------------------------------------------------------------------
 
-/// The EL1 image is mixed: Linux adapters and the untouched fault/memory
-/// migration are not substrate. Everything else (including orphan files) is
-/// checked, and every required neutral root must exist. The shared-record ABI
-/// is permitted here; this does not certify that crate as neutral substrate.
+/// The EL1 runtime is still mixed: the untouched fault/memory migration
+/// (`fault.rs`, `memory.rs` and its `memory/` children) is not substrate. The
+/// Linux client and image binary live in `carrick-el1-linux`, which no neutral
+/// module may name. Everything else (including orphan files) is checked, and
+/// every required neutral root must exist. The shared-record ABI is permitted
+/// here; this does not certify that crate as neutral substrate.
 fn audit_el1_modules(
     crate_dir: &Path,
     forbidden_symbols: &BTreeSet<String>,
@@ -934,6 +937,7 @@ fn audit_el1_modules(
             "serve_futex",
             "carrick_inotify_core",
             "carrick_personality_linux",
+            "carrick_el1_linux",
         ]
         .map(str::to_string),
     );
@@ -951,10 +955,10 @@ fn audit_el1_modules(
     collect_rs_files(&src, &mut files)?;
     for path in files {
         let relative = path.strip_prefix(&src).unwrap_or(&path);
-        if relative.starts_with("personality")
+        if relative.starts_with("memory")
             || relative
                 .to_str()
-                .is_some_and(|name| ["lib.rs", "entry.rs", "fault.rs", "memory.rs"].contains(&name))
+                .is_some_and(|name| ["lib.rs", "fault.rs", "memory.rs"].contains(&name))
         {
             continue;
         }
@@ -1905,10 +1909,9 @@ mod tests {
                 "ARM transport must not retain displaced {name}"
             );
         }
-        let old_owner = fs::read_to_string(
-            repo.join("crates/carrick-el1/src/personality/mm_portal/production.rs"),
-        )
-        .unwrap();
+        let old_owner =
+            fs::read_to_string(repo.join("crates/carrick-el1-linux/src/mm_portal/production.rs"))
+                .unwrap();
         assert!(
             !old_owner.contains("pub struct TransferContinuation"),
             "the old portal must not retain a displaced transfer cursor"
@@ -1930,8 +1933,7 @@ mod tests {
             "prepared-copy claim custody must move out of the ARM personality"
         );
         let old =
-            fs::read_to_string(repo.join("crates/carrick-el1/src/personality/reservations.rs"))
-                .unwrap();
+            fs::read_to_string(repo.join("crates/carrick-el1/src/memory/reservations.rs")).unwrap();
         assert!(
             !old.contains("struct Node {"),
             "the original node store must use neutral records"
@@ -2024,8 +2026,7 @@ mod tests {
     fn mm_reservation_root_storage_and_admission_have_one_owner() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let old =
-            fs::read_to_string(repo.join("crates/carrick-el1/src/personality/reservations.rs"))
-                .unwrap();
+            fs::read_to_string(repo.join("crates/carrick-el1/src/memory/reservations.rs")).unwrap();
         assert!(
             !old.contains("pub struct SharedReservations"),
             "the physical owner table must move, not be wrapped"
@@ -2045,10 +2046,9 @@ mod tests {
     #[test]
     fn mm_selection_and_service_transaction_have_one_neutral_owner() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let old = fs::read_to_string(
-            repo.join("crates/carrick-el1/src/personality/mm_portal/production.rs"),
-        )
-        .unwrap();
+        let old =
+            fs::read_to_string(repo.join("crates/carrick-el1-linux/src/mm_portal/production.rs"))
+                .unwrap();
         for body in [
             "pub struct MmPortal",
             "pub fn select<",
@@ -2075,7 +2075,7 @@ mod tests {
             fs::read_to_string(repo.join("crates/carrick-el1-abi/src/lib.rs")).unwrap();
         assert!(!old_records.contains("pub struct FrameGrantResidencyTable"));
         let old_tests =
-            fs::read_to_string(repo.join("crates/carrick-el1/src/personality/mm_portal/tests.rs"))
+            fs::read_to_string(repo.join("crates/carrick-el1-linux/src/mm_portal/tests.rs"))
                 .unwrap();
         for witness in [
             "transfer_revalidates_exact_mm_before_copy",
@@ -2738,10 +2738,9 @@ mod tests {
     #[test]
     fn grant_publication_and_wire_have_one_neutral_owner() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let old = fs::read_to_string(
-            repo.join("crates/carrick-el1/src/personality/mm_portal/production.rs"),
-        )
-        .unwrap();
+        let old =
+            fs::read_to_string(repo.join("crates/carrick-el1-linux/src/mm_portal/production.rs"))
+                .unwrap();
         assert!(
             !old.contains("fn apply_grant<"),
             "grant owner must move, not be wrapped"
@@ -2915,10 +2914,9 @@ mod tests {
         assert!(neutral_core.contains("pub fn take_object_operation"));
         assert!(!neutral_core.contains("carrick_el1"));
 
-        let old_edit_wait = fs::read_to_string(
-            repo.join("crates/carrick-el1/src/personality/mm_portal/edit_wait.rs"),
-        )
-        .unwrap();
+        let old_edit_wait =
+            fs::read_to_string(repo.join("crates/carrick-el1-linux/src/mm_portal/edit_wait.rs"))
+                .unwrap();
         assert!(
             old_edit_wait.contains("coordinate_prepared_edit_wait"),
             "EL1 edit_wait must delegate to carrick-core"
@@ -2959,8 +2957,8 @@ mod tests {
             !abi.contains("pub struct ThreadControlSlot {"),
             "Linux sidecars must leave ARM ABI"
         );
-        let arm = fs::read_to_string(repo.join("crates/carrick-el1/src/personality/lifecycle.rs"))
-            .unwrap();
+        let arm =
+            fs::read_to_string(repo.join("crates/carrick-el1-linux/src/lifecycle.rs")).unwrap();
         for body in [
             "fn serve_clone",
             "fn serve_exit",
@@ -2984,9 +2982,8 @@ mod tests {
         shared.contains("process.take_deliverable_after_suspend(")
             && shared.contains("policy::handler_block_mask(")
             && shared.contains("process.force_sigsegv(")
-            && wrapper.contains(
-                "carrick_el1::personality::signal_delivery::deliver_signal_on_syscall_return(",
-            )
+            && wrapper
+                .contains("carrick_el1_linux::signal_delivery::deliver_signal_on_syscall_return(")
             && [
                 "take_deliverable_after_suspend(",
                 "policy::handler_block_mask(",
@@ -3000,7 +2997,7 @@ mod tests {
     fn x86_signal_delivery_selects_through_one_shared_owner() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let shared =
-            fs::read_to_string(repo.join("crates/carrick-el1/src/personality/signal_delivery.rs"))
+            fs::read_to_string(repo.join("crates/carrick-el1-linux/src/signal_delivery.rs"))
                 .unwrap();
         let x86 = fs::read_to_string(repo.join("crates/carrick-x86-cpl0/src/linux_personality.rs"))
             .unwrap();
@@ -3015,7 +3012,7 @@ mod tests {
         assert!(!signal_delivery_owner_is_unique(
             &shared,
             &x86.replace(
-                "carrick_el1::personality::signal_delivery::deliver_signal_on_syscall_return(",
+                "carrick_el1_linux::signal_delivery::deliver_signal_on_syscall_return(",
                 "bypass_shared_signal_delivery(",
             ),
         ));

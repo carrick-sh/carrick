@@ -1,4 +1,6 @@
-use crate::memory::reservations::*;
+use carrick_el1::memory::reservations::Layout;
+use carrick_el1::memory::reservations::*;
+use carrick_el1_abi::*;
 use core::sync::atomic::Ordering;
 use std::boxed::Box;
 fn table() -> Box<SharedReservations> {
@@ -26,7 +28,7 @@ fn admitted(table: &SharedReservations, index: usize, raw: u64) -> Reservations<
 }
 
 fn decide(model: &mut Reservations<'_>, nr: u64, args: [u64; 6]) -> AnonymousRouteKind {
-    use crate::{AnonymousReservationRoute, dispatch_anonymous_with_reservations};
+    use crate::dispatch::{AnonymousReservationRoute, dispatch_anonymous_with_reservations};
     let current = CurrentTask::new();
     current.execution.task.store(1, Ordering::Relaxed);
     current.mm.thread_generation.store(11, Ordering::Relaxed);
@@ -56,7 +58,7 @@ enum AnonymousRouteKind {
 }
 #[test]
 fn reservation_decoder_counts_completion_only_and_keeps_two_mm_origins() {
-    use crate::{AnonymousReservationRoute, dispatch_anonymous_with_reservations};
+    use crate::dispatch::{AnonymousReservationRoute, dispatch_anonymous_with_reservations};
     for rounds in [1, 8, 64] {
         let table = table();
         let counters = Counters::default();
@@ -131,7 +133,7 @@ fn reservation_decoder_counts_completion_only_and_keeps_two_mm_origins() {
 }
 #[test]
 fn reservation_mmap_overflow_preserves_linux_errno() {
-    use crate::{AnonymousReservationRoute, dispatch_anonymous_with_reservations};
+    use crate::dispatch::{AnonymousReservationRoute, dispatch_anonymous_with_reservations};
     let table = table();
     let mm = ReservationMm::new(17).unwrap();
     table.publish(0, mm, layout()).unwrap();
@@ -163,7 +165,7 @@ fn reservation_mmap_overflow_preserves_linux_errno() {
 }
 #[test]
 fn reservation_unadmitted_root_never_serves_a_syscall() {
-    use crate::{AnonymousReservationRoute, dispatch_anonymous_with_reservations};
+    use crate::dispatch::{AnonymousReservationRoute, dispatch_anonymous_with_reservations};
     let table = table();
     let mm = ReservationMm::new(17).unwrap();
     table.publish(0, mm, layout()).unwrap();
@@ -184,7 +186,7 @@ fn reservation_unadmitted_root_never_serves_a_syscall() {
 }
 #[test]
 fn reservation_continuation_rejects_rebound_task_without_losing_owner() {
-    use crate::{AnonymousReservationRoute, dispatch_anonymous_with_reservations};
+    use crate::dispatch::{AnonymousReservationRoute, dispatch_anonymous_with_reservations};
     let table = table();
     let mm = ReservationMm::new(17).unwrap();
     table.publish(0, mm, layout()).unwrap();

@@ -6,7 +6,7 @@ use carrick_el1_abi::{
 
 extern crate std;
 
-use crate::personality::sched::*;
+use crate::sched::*;
 use carrick_el1_abi::TrapFrame;
 use carrick_el1_abi::{
     Claim, Counters, DelegatedFile, DelegatedInotify, DelegatedOpenFile, El1TaskId, FdMapSlot,
@@ -871,7 +871,7 @@ fn queued_threads_do_not_send_other_syscalls_to_the_host() {
     let names = InotifyNameCache::new();
     let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAKE_PRIVATE, 1);
     let run = |frame: &mut TrapFrame, cpu: &mut FakeCpu| {
-        crate::dispatch_syscall_with_regions(
+        crate::dispatch::dispatch_syscall_with_regions(
             frame,
             &counters,
             &tasks,
@@ -880,7 +880,7 @@ fn queued_threads_do_not_send_other_syscalls_to_the_host() {
             &opens,
             &inotify,
             &names,
-            Some(crate::Zone {
+            Some(crate::dispatch::Zone {
                 tables: zone,
                 cpu,
                 user: &HardwareUserWord,

@@ -12,6 +12,7 @@ use thiserror::Error;
 
 const CRATES: &[&str] = &[
     "carrick-el1",
+    "carrick-el1-linux",
     "carrick-el1-abi",
     "carrick-x86-cpl0",
     "carrick-x86",

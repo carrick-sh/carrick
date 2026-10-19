@@ -261,10 +261,10 @@ mod signal_resume_tests {
 
 /// The native monotonic timer projection used by owned signal continuations.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub(crate) fn signal_clock() -> x86::X86Backend {
+pub fn signal_clock() -> x86::X86Backend {
     x86::X86Backend
 }
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-pub(crate) fn signal_clock() -> aarch64::Aarch64Backend {
+pub fn signal_clock() -> aarch64::Aarch64Backend {
     aarch64::Aarch64Backend
 }

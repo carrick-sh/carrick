@@ -13,30 +13,30 @@ use carrick_sched_core::object_wait::{
 use carrick_sched_core::{RecordId, WakeEffects};
 use core::sync::atomic::Ordering;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "host-test"))]
 std::thread_local! {
     static NATIVE_WAKE_TRACE: std::cell::RefCell<std::vec::Vec<(SlotId, u64)>> =
         const { std::cell::RefCell::new(std::vec::Vec::new()) };
 }
 
-#[cfg(test)]
-pub(crate) fn clear_test_wake_trace() {
+#[cfg(any(test, feature = "host-test"))]
+pub fn clear_test_wake_trace() {
     NATIVE_WAKE_TRACE.with(|trace| trace.borrow_mut().clear());
 }
 
-#[cfg(test)]
-pub(crate) fn test_wake_trace() -> std::vec::Vec<(SlotId, u64)> {
+#[cfg(any(test, feature = "host-test"))]
+pub fn test_wake_trace() -> std::vec::Vec<(SlotId, u64)> {
     NATIVE_WAKE_TRACE.with(|trace| trace.borrow().clone())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "host-test"))]
 fn record_test_wake(slot: SlotId, target: u64) {
     NATIVE_WAKE_TRACE.with(|trace| trace.borrow_mut().push((slot, target)));
 }
 
 /// Required completion venue for EL1-held queues. Detached handbacks use
 /// the carrier boundary; SGIs and pending work are delivered after unlock.
-pub(crate) fn deliver_completion<C: carrick_el1_abi::EntryContext>(
+pub fn deliver_completion<C: carrick_el1_abi::EntryContext>(
     zone: &carrick_sched_core::ZoneTables<C>,
     venue: SlotId,
     owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>,
@@ -69,7 +69,7 @@ pub(crate) fn deliver_completion<C: carrick_el1_abi::EntryContext>(
 
 /// A host release has no owning EL1 slot. Its deferred handbacks must be
 /// visible at the carrier boundary even when another vCPU is running.
-pub(crate) fn deliver_host_completion<C: carrick_el1_abi::EntryContext>(
+pub fn deliver_host_completion<C: carrick_el1_abi::EntryContext>(
     zone: &carrick_sched_core::ZoneTables<C>,
     owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>,
 ) {
@@ -101,7 +101,7 @@ pub(crate) fn deliver_host_completion<C: carrick_el1_abi::EntryContext>(
 
 /// Deliver a native owner's plain wake through the same SGI and host-work
 /// authority used by object-wait completion.
-pub(crate) fn deliver_wake_effects<C: carrick_el1_abi::EntryContext>(
+pub fn deliver_wake_effects<C: carrick_el1_abi::EntryContext>(
     zone: &carrick_sched_core::ZoneTables<C>,
     venue: SlotId,
     effects: WakeEffects,
@@ -127,7 +127,7 @@ pub(crate) fn deliver_wake_effects<C: carrick_el1_abi::EntryContext>(
             ),
         );
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "host-test"))]
     deliver_effects_with(
         zone,
         Some(venue),
@@ -137,12 +137,12 @@ pub(crate) fn deliver_wake_effects<C: carrick_el1_abi::EntryContext>(
         record_test_wake,
         (|_slot| {}, || {}),
     );
-    #[cfg(all(not(test), not(target_os = "none")))]
+    #[cfg(all(not(any(test, feature = "host-test")), not(target_os = "none")))]
     let _ = (zone, venue, effects);
 }
 
-#[cfg(any(test, target_os = "none"))]
-pub(super) fn deliver_effects_with<C: carrick_el1_abi::EntryContext>(
+#[cfg(any(test, feature = "host-test", target_os = "none"))]
+pub fn deliver_effects_with<C: carrick_el1_abi::EntryContext>(
     zone: &carrick_sched_core::ZoneTables<C>,
     venue: Option<SlotId>,
     waker: carrick_sched_core::Waker,

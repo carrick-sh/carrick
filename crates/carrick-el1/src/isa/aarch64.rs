@@ -19,7 +19,7 @@ pub struct Aarch64Backend;
 /// Check the actual publication frame against this execution lane's stack.
 /// Deriving the slot from SP would silently accept an adjacent CPU's stack.
 #[inline(always)]
-pub(crate) fn check_process_stack(slot: carrick_el1_abi::SlotId) {
+pub fn check_process_stack(slot: carrick_el1_abi::SlotId) {
     let sp: u64;
     // SAFETY: EL1 reads its own current stack pointer.
     unsafe {
@@ -40,7 +40,7 @@ pub const fn kernel_arch() -> impl carrick_guest_arch::KernelArch {
     carrick_guest_arch::Arch::new(Aarch64Backend)
 }
 
-pub(crate) fn hardware_live_ttbr() -> u64 {
+pub fn hardware_live_ttbr() -> u64 {
     let ttbr: u64;
     // SAFETY: EL1 reads the live TTBR0 register without changing execution.
     unsafe {
@@ -49,7 +49,7 @@ pub(crate) fn hardware_live_ttbr() -> u64 {
     ttbr
 }
 
-pub(crate) fn yield_host_effect() {
+pub fn yield_host_effect() {
     // SAFETY: the carrier resumes this exact EL1 stack after the HVC service.
     unsafe {
         core::arch::asm!("hvc #1", clobber_abi("C"));
@@ -58,7 +58,7 @@ pub(crate) fn yield_host_effect() {
 
 /// A failure-only diagnostic; its reply never changes the original verdict.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-pub(crate) fn cross_hvc_fork_refusal(record: &carrick_el1_abi::NativeForkDiagnostic) {
+pub fn cross_hvc_fork_refusal(record: &carrick_el1_abi::NativeForkDiagnostic) {
     // SAFETY: the synchronous crossing retains this aligned, bounded record.
     unsafe {
         core::arch::asm!("hvc #6",
@@ -69,7 +69,7 @@ pub(crate) fn cross_hvc_fork_refusal(record: &carrick_el1_abi::NativeForkDiagnos
     }
 }
 
-pub(crate) fn cross_hvc_fork_stock(record_gpa: u64, cpu: u64) -> Result<(), u64> {
+pub fn cross_hvc_fork_stock(record_gpa: u64, cpu: u64) -> Result<(), u64> {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
         let mut status: u64 = carrick_el1_abi::GRANT_OP_FORK_STOCK;
@@ -95,7 +95,9 @@ pub(crate) fn cross_hvc_fork_stock(record_gpa: u64, cpu: u64) -> Result<(), u64>
     }
 }
 
-pub(crate) fn cross_hvc_root_exit(record_gpa: u64, cpu: u64) -> Result<(), ()> {
+// `Err(())` is the carrier's single refusal; callers own its meaning.
+#[allow(clippy::result_unit_err)]
+pub fn cross_hvc_root_exit(record_gpa: u64, cpu: u64) -> Result<(), ()> {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
         let mut status: u64 = carrick_el1_abi::GRANT_OP_ROOT_EXIT;
@@ -121,7 +123,9 @@ pub(crate) fn cross_hvc_root_exit(record_gpa: u64, cpu: u64) -> Result<(), ()> {
     }
 }
 
-pub(crate) fn cross_hvc_child_retire(record_gpa: u64, cpu: u64) -> Result<(), ()> {
+// `Err(())` is the carrier's single refusal; callers own its meaning.
+#[allow(clippy::result_unit_err)]
+pub fn cross_hvc_child_retire(record_gpa: u64, cpu: u64) -> Result<(), ()> {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
         let mut status: u64 = carrick_el1_abi::GRANT_OP_CHILD_RETIRE;
@@ -147,7 +151,9 @@ pub(crate) fn cross_hvc_child_retire(record_gpa: u64, cpu: u64) -> Result<(), ()
     }
 }
 
-pub(crate) fn cross_hvc_wait_channel_wake(mm: u64, address: u64, cpu: u64) -> Result<(), ()> {
+// `Err(())` is the carrier's single refusal; callers own its meaning.
+#[allow(clippy::result_unit_err)]
+pub fn cross_hvc_wait_channel_wake(mm: u64, address: u64, cpu: u64) -> Result<(), ()> {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
         let mut status = carrick_el1_abi::GRANT_OP_WAIT_CHANNEL_WAKE;
@@ -169,7 +175,9 @@ pub(crate) fn cross_hvc_wait_channel_wake(mm: u64, address: u64, cpu: u64) -> Re
 
 /// Ask the stopped carrier to supply the COW page selected in this slot's
 /// portal record. The host authenticates that record against the live root.
-pub(crate) fn cross_hvc_cow_supply(address: u64, cpu: u64) -> Result<(), ()> {
+// `Err(())` is the carrier's single refusal; callers own its meaning.
+#[allow(clippy::result_unit_err)]
+pub fn cross_hvc_cow_supply(address: u64, cpu: u64) -> Result<(), ()> {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
         let mut status = carrick_el1_abi::GRANT_OP_COW_SUPPLY;
@@ -517,8 +525,11 @@ pub fn complete_native_run_failure(
 }
 
 /// Read the EL0 stack register at the native trap boundary.
+///
+/// # Safety
+/// The caller is on the native trap path of the thread whose EL0 stack it reads.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-pub(crate) unsafe fn signal_stack() -> carrick_guest_arch::UserVa {
+pub unsafe fn signal_stack() -> carrick_guest_arch::UserVa {
     let sp: u64;
     unsafe {
         core::arch::asm!("mrs {}, sp_el0", out(reg) sp, options(nomem, nostack));
@@ -527,8 +538,12 @@ pub(crate) unsafe fn signal_stack() -> carrick_guest_arch::UserVa {
 }
 
 /// Publish a validated EL0 stack register at the native trap boundary.
+///
+/// # Safety
+/// The caller is on the native trap path of the resuming thread and `sp` was
+/// validated for that thread's EL0 address space.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-pub(crate) unsafe fn set_signal_stack(sp: carrick_guest_arch::UserVa) {
+pub unsafe fn set_signal_stack(sp: carrick_guest_arch::UserVa) {
     unsafe {
         core::arch::asm!("msr sp_el0, {}", in(reg) sp.raw(), options(nomem, nostack));
     }

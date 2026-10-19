@@ -13,7 +13,7 @@ structural_budgets = []
 rationale = "Exactly one process owner admits the fork; the child receives a private MM after COW. The child TID is written only after the split and before its first user instruction. Terminal ownership clears and wakes only that child's ctid. The work is one child-local set, one child-local clear, and one futex wake independent of the number of live processes."
 
 [bindings]
-vm_free = "carrick-personality-linux::common_entry::common_linux_entry_calls_native_process_custody; carrick-el1::personality::native_process_runtime::tests::process_clone_child_tid_lives_in_child_mm_and_clears_on_exit"
+vm_free = "carrick-personality-linux::common_entry::common_linux_entry_calls_native_process_custody; carrick-el1-linux::native_process_runtime::tests::process_clone_child_tid_lives_in_child_mm_and_clears_on_exit"
 embed = "carrick-embed::el1_files_inode_exclusivity_two_processes"
 
 [bindings.unresolved]

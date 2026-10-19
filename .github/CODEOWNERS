@@ -2,9 +2,9 @@
 # Two lanes touching one of these files stack on the owner's lane rather than
 # carrying parallel copies. Later lines take precedence.
 
-/crates/carrick-el1/src/personality/native_process_runtime.rs @tjfontaine
-/crates/carrick-el1/src/personality/process_owner.rs          @tjfontaine
-/crates/carrick-el1/src/personality/dispatch.rs               @tjfontaine
+/crates/carrick-el1-linux/src/native_process_runtime.rs @tjfontaine
+/crates/carrick-el1-linux/src/process_owner.rs          @tjfontaine
+/crates/carrick-el1-linux/src/dispatch.rs               @tjfontaine
 /crates/carrick-personality-linux/src/dispatch.rs             @tjfontaine
 /crates/carrick-el1-abi/src/lib.rs                            @tjfontaine
 **/fork_stock.rs                                              @tjfontaine

@@ -1,7 +1,7 @@
 //! Pure ARM frame publication used by the native backend and VM-free tests.
-use crate::isa::ArchError;
 #[cfg(target_os = "none")]
 use crate::rust_alloc::vec::Vec;
+use carrick_el1::isa::ArchError;
 use carrick_el1_abi::TrapFrame;
 use carrick_personality_linux::signal::arm::{self, RtSigframe};
 #[cfg(not(target_os = "none"))]
@@ -316,8 +316,36 @@ use carrick_guest_arch::UserVa;
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 use zerocopy::{FromBytes, IntoBytes};
 
+/// The Linux signal-frame codec over the neutral ARM backend's types.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-impl carrick_personality_linux::signal::SignalBackend for crate::isa::aarch64::Aarch64Backend {
+pub struct LinuxAarch64Backend;
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+impl carrick_guest_arch::ArchTypes for LinuxAarch64Backend {
+    type Error =
+        <carrick_el1::isa::aarch64::Aarch64Backend as carrick_guest_arch::ArchTypes>::Error;
+    type NativeFrame =
+        <carrick_el1::isa::aarch64::Aarch64Backend as carrick_guest_arch::ArchTypes>::NativeFrame;
+    type SavedContext =
+        <carrick_el1::isa::aarch64::Aarch64Backend as carrick_guest_arch::ArchTypes>::SavedContext;
+    type Context =
+        <carrick_el1::isa::aarch64::Aarch64Backend as carrick_guest_arch::ArchTypes>::Context;
+    type Root = <carrick_el1::isa::aarch64::Aarch64Backend as carrick_guest_arch::ArchTypes>::Root;
+    type MmOwner =
+        <carrick_el1::isa::aarch64::Aarch64Backend as carrick_guest_arch::ArchTypes>::MmOwner;
+    type DrainTicket =
+        <carrick_el1::isa::aarch64::Aarch64Backend as carrick_guest_arch::ArchTypes>::DrainTicket;
+    type DrainReceipt =
+        <carrick_el1::isa::aarch64::Aarch64Backend as carrick_guest_arch::ArchTypes>::DrainReceipt;
+    type UserTransfer =
+        <carrick_el1::isa::aarch64::Aarch64Backend as carrick_guest_arch::ArchTypes>::UserTransfer;
+    type HardwareInterrupt = <carrick_el1::isa::aarch64::Aarch64Backend as carrick_guest_arch::ArchTypes>::HardwareInterrupt;
+    type InterruptMask =
+        <carrick_el1::isa::aarch64::Aarch64Backend as carrick_guest_arch::ArchTypes>::InterruptMask;
+}
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+impl carrick_personality_linux::signal::SignalBackend for LinuxAarch64Backend {
     fn setup_signal_frame<'a>(
         &mut self,
         frame: &mut TrapFrame,
@@ -346,7 +374,7 @@ impl carrick_personality_linux::signal::SignalBackend for crate::isa::aarch64::A
 
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         unsafe {
-            crate::isa::aarch64::set_signal_stack(UserVa::new(new_sp));
+            carrick_el1::isa::aarch64::set_signal_stack(UserVa::new(new_sp));
         }
 
         Ok(UserVa::new(new_sp))
@@ -359,7 +387,7 @@ impl carrick_personality_linux::signal::SignalBackend for crate::isa::aarch64::A
         copy_in: &mut dyn FnMut(&mut [u8], UserVa) -> bool,
     ) -> Result<carrick_signal_core::policy::SigBlockMask, Self::Error> {
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-        let sp_val = { unsafe { crate::isa::aarch64::signal_stack().raw() } };
+        let sp_val = { unsafe { carrick_el1::isa::aarch64::signal_stack().raw() } };
         #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
         let sp_val = 0u64;
 
@@ -378,7 +406,7 @@ impl carrick_personality_linux::signal::SignalBackend for crate::isa::aarch64::A
 
         #[cfg(all(target_os = "none", target_arch = "aarch64"))]
         unsafe {
-            crate::isa::aarch64::set_signal_stack(UserVa::new(saved_sp));
+            carrick_el1::isa::aarch64::set_signal_stack(UserVa::new(saved_sp));
         }
 
         Ok(carrick_signal_core::policy::SigBlockMask::blocking_all_of(

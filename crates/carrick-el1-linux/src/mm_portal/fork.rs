@@ -415,9 +415,9 @@ pub use carrick_core::mm::fork::{
 #[cfg(any(test, target_os = "none"))]
 mod runtime_storage {
     use super::UnpublishedEl1Child;
-    use crate::lock::SpinLock;
     #[cfg(target_os = "none")]
     use crate::rust_alloc::boxed::Box;
+    use carrick_el1::lock::SpinLock;
     use core::sync::atomic::{AtomicPtr, Ordering};
     #[cfg(not(target_os = "none"))]
     use std::boxed::Box;
@@ -451,7 +451,7 @@ mod runtime_storage {
         #[inline(never)]
         fn initialize(&'static self) -> *mut PendingForkTable {
             // A same-CPU interrupt must not wait on its own initializer.
-            let irq = crate::alloc::disable_irq_save();
+            let irq = carrick_el1::alloc::disable_irq_save();
             let guard = self.init_lock.lock();
             let mut table = self.table.load(Ordering::Acquire);
             if table.is_null() {
@@ -468,7 +468,7 @@ mod runtime_storage {
                 self.table.store(table, Ordering::Release);
             }
             drop(guard);
-            crate::alloc::restore_irq(irq);
+            carrick_el1::alloc::restore_irq(irq);
             table
         }
     }
@@ -568,7 +568,7 @@ pub(crate) fn reconcile_pending_parent_write<W: LiveDescriptorWords + ?Sized>(
         // SAFETY: this COW completion still owns the exact parent editor;
         // the detached fork retains both physical table arenas through FINISH.
         unsafe {
-            crate::isa::x86::ForkDescriptorWords::checked(
+            carrick_el1::isa::x86::ForkDescriptorWords::checked(
                 child.parent_root,
                 request.child_tables,
                 request.parent_tables,
@@ -618,7 +618,7 @@ pub fn serve_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         let portal = MmPortal::<super::production::GuestMetadataPin> {
             backend: core::marker::PhantomData,
             carrier: request.operation.carrier,
-            roots: crate::memory::reservations::shared_guest(),
+            roots: carrick_el1::memory::reservations::shared_guest(),
             spaces: &zone.spaces,
             nodes: None,
             zone: Some(zone),
@@ -659,7 +659,7 @@ pub fn serve_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             // SAFETY: the carrier retains the single upper direct window and
             // both granted arenas through the exact owner fork settlement.
             unsafe {
-                crate::isa::x86::ForkDescriptorWords::checked(
+                carrick_el1::isa::x86::ForkDescriptorWords::checked(
                     grant.ttbr0,
                     request.child_tables,
                     request.parent_tables,
@@ -682,9 +682,10 @@ pub fn serve_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         #[cfg(target_arch = "aarch64")]
         crate::sched::ThreadCpu::invalidate_asid(&mut crate::sched::HardwareCpu, grant.ttbr0);
         #[cfg(target_arch = "x86_64")]
-        if !words.drain_succeeded() || crate::isa::x86::portal_invalidate_root(grant.ttbr0).is_err()
+        if !words.drain_succeeded()
+            || carrick_el1::isa::x86::portal_invalidate_root(grant.ttbr0).is_err()
         {
-            crate::isa::x86::fatal_entry_binding();
+            carrick_el1::isa::x86::fatal_entry_binding();
         }
         let completion = child.completion();
         *pending.lock() = Some(child);
@@ -730,7 +731,7 @@ pub fn finish_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         let portal = MmPortal::<super::production::GuestMetadataPin> {
             backend: core::marker::PhantomData,
             carrier: request.operation.carrier,
-            roots: crate::memory::reservations::shared_guest(),
+            roots: carrick_el1::memory::reservations::shared_guest(),
             spaces: &zone.spaces,
             nodes: None,
             zone: Some(zone),
@@ -757,7 +758,7 @@ pub fn finish_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
                 // SAFETY: the detached child retains both granted table
                 // arenas, while FINISH owns the exact parent/child editors.
                 unsafe {
-                    crate::isa::x86::ForkDescriptorWords::checked(
+                    carrick_el1::isa::x86::ForkDescriptorWords::checked(
                         base,
                         request.child_tables,
                         request.parent_tables,
@@ -769,7 +770,7 @@ pub fn finish_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
                 child.abort(&portal, &words, frame.slot as u32)?;
                 #[cfg(target_arch = "x86_64")]
                 if !words.drain_succeeded() {
-                    crate::isa::x86::fatal_entry_binding();
+                    carrick_el1::isa::x86::fatal_entry_binding();
                 }
                 Ok(())
             })
@@ -785,8 +786,8 @@ pub fn finish_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             #[cfg(target_arch = "aarch64")]
             crate::sched::ThreadCpu::invalidate_asid(&mut crate::sched::HardwareCpu, grant.ttbr0);
             #[cfg(target_arch = "x86_64")]
-            if crate::isa::x86::portal_invalidate_root(grant.ttbr0).is_err() {
-                crate::isa::x86::fatal_entry_binding();
+            if carrick_el1::isa::x86::portal_invalidate_root(grant.ttbr0).is_err() {
+                carrick_el1::isa::x86::fatal_entry_binding();
             }
         }
         if !slot.complete_finish_receipt(child.completion()) {

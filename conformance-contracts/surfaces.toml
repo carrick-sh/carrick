@@ -607,7 +607,7 @@ path = "crates/carrick-el1-abi/src/lib.rs"
 contracts = ["kernel.el1.gic", "kernel.el1.guest-run-queue", "kernel.el1.fault-entry", "kernel.el1.metadata-allocation", "kernel.el1.stage1-publication", "process.native.terminal-child", "kernel.el1.open-lifetime", "kernel.x86.file-region"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/entry.rs"
+path = "crates/carrick-el1-linux/src/entry.rs"
 contracts = ["kernel.el1.fault-entry", "kernel.el1.stage1-publication"]
 
 [[surfaces]]
@@ -647,7 +647,7 @@ path = "crates/carrick-el1/src/sched/hw.rs"
 contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/sched/tests.rs"
+path = "crates/carrick-el1-linux/src/sched/tests.rs"
 contracts = ["kernel.el1.futex-handoff", "kernel.el1.guest-scheduler"]
 
 [[surfaces]]
@@ -751,7 +751,7 @@ path = "crates/carrick-kernel/src/kernel/objects/ipc.rs"
 contracts = ["kernel.el1.fd-single-owner", "kernel.el1.ipc-fd-authority"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/personality/file_table.rs"
+path = "crates/carrick-el1-linux/src/file_table.rs"
 contracts = ["kernel.x86.file-region", "kernel.el1.files", "kernel.el1.fd-single-owner", "kernel.el1.open-lifetime"]
 
 [[surfaces]]
@@ -836,15 +836,15 @@ path = "crates/carrick-hal/src/posix_signal_kick.rs"
 contracts = ["kernel.timer.delivery-gate"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/personality/native_ownership_tests.rs"
+path = "crates/carrick-el1-linux/src/native_ownership_tests.rs"
 contracts = ["kernel.el1.mm-exclusive-owner"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/personality/mm_portal/mod.rs"
+path = "crates/carrick-el1-linux/src/mm_portal/mod.rs"
 contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/personality/mm_portal/tests.rs"
+path = "crates/carrick-el1-linux/src/mm_portal/tests.rs"
 contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.elastic-frame-extents", "kernel.fork.stage1-image", "kernel.mm.carrier-window-isolation"]
 
 # Order 5 moves entry ownership once; pending family hooks retain their existing
@@ -934,7 +934,7 @@ path = "crates/carrick-vmm-kvm/tests/cpl0_shared_entry.rs"
 contracts = ["core.entry.completion", "kernel.el1.thread-lifecycle", "kernel.el1.signal-delivery-owner", "kernel.x86.file-region"]
 
 [[surfaces]]
-path = "crates/carrick-el1/tests/x86_production_forward.rs"
+path = "crates/carrick-el1-linux/tests/x86_production_forward.rs"
 contracts = ["core.entry.completion", "kernel.el1.files", "kernel.el1.inotify", "kernel.el1.anonymous-reservations", "kernel.el1.futex-handoff"]
 
 [[surfaces]]
@@ -1009,35 +1009,35 @@ path = "crates/carrick-kernel/src/kernel/boot_launch.rs"
 contracts = ["kernel.el1.thread-lifecycle"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/personality/native_process_signals.rs"
+path = "crates/carrick-el1-linux/src/native_process_signals.rs"
 contracts = ["kernel.el1.thread-lifecycle", "kernel.el1.signal-delivery-owner"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/personality/native_process_entry.rs"
+path = "crates/carrick-el1-linux/src/native_process_entry.rs"
 contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.wait.process-group", "kernel.wait.child-rusage"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/personality/native_process_runtime.rs"
+path = "crates/carrick-el1-linux/src/native_process_runtime.rs"
 contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.short-lock", "process.native.terminal-child", "process.native.arm-admission"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/personality/fork_loan.rs"
+path = "crates/carrick-el1-linux/src/fork_loan.rs"
 contracts = ["kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/personality/retired_spaces.rs"
+path = "crates/carrick-el1-linux/src/retired_spaces.rs"
 contracts = ["kernel.el1.thread-lifecycle"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/personality/native_process_custody.rs"
+path = "crates/carrick-el1-linux/src/native_process_custody.rs"
 contracts = ["kernel.el1.thread-lifecycle"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/personality/process_owner.rs"
+path = "crates/carrick-el1-linux/src/process_owner.rs"
 contracts = ["kernel.el1.thread-lifecycle", "kernel.wait.process-group", "kernel.wait.child-rusage"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/personality/process_owner_tests.rs"
+path = "crates/carrick-el1-linux/src/process_owner_tests.rs"
 contracts = ["kernel.el1.thread-lifecycle", "kernel.wait.process-group", "kernel.wait.child-rusage"]
 
 [[surfaces]]
@@ -1089,19 +1089,19 @@ path = "crates/carrick-x86-cpl0/src/native_process.rs"
 contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage", "kernel.x86.file-region"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/personality/aarch64_process.rs"
+path = "crates/carrick-el1-linux/src/aarch64_process.rs"
 contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.terminal-child", "process.native.arm-admission"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/personality/native_fork_refusal.rs"
+path = "crates/carrick-el1-linux/src/native_fork_refusal.rs"
 contracts = ["process.native.arm-admission"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/personality/aarch64_process_tests/native_child_handoff_tests.rs"
+path = "crates/carrick-el1-linux/src/aarch64_process_tests/native_child_handoff_tests.rs"
 contracts = ["kernel.el1.guest-scheduler", "kernel.el1.guest-run-queue", "process.native.arm-admission"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/personality/aarch64_process_tests.rs"
+path = "crates/carrick-el1-linux/src/aarch64_process_tests.rs"
 contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.mm-exclusive-owner", "kernel.el1.fork-cow", "kernel.wait.process-group", "kernel.wait.child-rusage", "process.native.terminal-child", "process.native.arm-admission"]
 
 [[surfaces]]
@@ -1219,7 +1219,7 @@ path = "crates/carrick-vmm-hvf/src/hatch.rs"
 contracts = ["kernel.el1.arm-ring-first-crossing"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/personality/native_run_failure.rs"
+path = "crates/carrick-el1-linux/src/native_run_failure.rs"
 contracts = ["kernel.el1.thread-lifecycle", "core.entry.completion", "kernel.el1.arm-ring-first-crossing"]
 
 [[surfaces]]
@@ -1276,7 +1276,7 @@ path = "crates/carrick-personality-linux/src/abi/signal.rs"
 contracts = ["kernel.el1.signal-delivery-owner"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/personality/arm_signal.rs"
+path = "crates/carrick-el1-linux/src/arm_signal.rs"
 contracts = ["kernel.el1.signal-delivery-owner"]
 
 [[surfaces]]
@@ -1284,11 +1284,11 @@ path = "crates/carrick-personality-linux/src/signal/arm.rs"
 contracts = ["kernel.el1.signal-delivery-owner"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/personality/x86_signal.rs"
+path = "crates/carrick-el1-linux/src/x86_signal.rs"
 contracts = ["kernel.el1.signal-delivery-owner"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/personality/signal_delivery.rs"
+path = "crates/carrick-el1-linux/src/signal_delivery.rs"
 contracts = ["kernel.el1.signal-delivery-owner"]
 
 # Concurrent owned deadlines belong to the shared guest scheduler.
@@ -1325,7 +1325,7 @@ path = "crates/carrick-core/src/wait.rs"
 contracts = ["process.native.short-lock"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/personality/ipc.rs"
+path = "crates/carrick-el1-linux/src/ipc.rs"
 contracts = ["process.native.short-lock"]
 
 [[surfaces]]
@@ -1421,7 +1421,7 @@ path = "crates/carrick-el1/src/file.rs"
 contracts = ["core.personality.files", "kernel.el1.files", "kernel.el1.inotify"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/personality/file.rs"
+path = "crates/carrick-el1-linux/src/file.rs"
 contracts = ["core.personality.files", "kernel.el1.files", "kernel.el1.inotify"]
 
 [[surfaces]]
@@ -1445,7 +1445,7 @@ path = "crates/carrick-kernel-example/tests/root_exit_full_width.rs"
 contracts = ["core.entry.completion"]
 
 [[surfaces]]
-path = "crates/carrick-el1/src/personality/dispatch.rs"
+path = "crates/carrick-el1-linux/src/dispatch.rs"
 contracts = ["process.native.arm-admission", "core.entry.completion", "core.personality.files"]
 
 [[surfaces]]

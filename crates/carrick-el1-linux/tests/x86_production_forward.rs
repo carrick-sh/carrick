@@ -2,8 +2,8 @@
 //! the production CPL0 image. Keep the x86 no-venue routing out of cfg(test).
 #![allow(clippy::panic)]
 
-use carrick_el1::personality::{dispatch, sched};
 use carrick_el1_abi::{Action, Counters, CurrentTask, El1TaskId, InotifyNameCache, TrapFrame};
+use carrick_el1_linux::{dispatch, sched};
 use carrick_guest_arch::{NativeReturnWord, SlotId, UserVa};
 use carrick_personality_linux::dispatch::SyscallFrame;
 use carrick_personality_linux::entry::decode_x86_64;
@@ -279,13 +279,13 @@ fn x86_unported_refusal_counts_native_ordinal_not_canonical_ordinal() {
 #[test]
 fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
     use carrick_core::lifecycle::MemberControlCustody;
-    use carrick_el1::personality::native_process_runtime::{
-        NativeForkPreparation, NativeLifecycleResources, NativeProcessError, NativeProcessRegistry,
-        NativeProcessRuntime, NativeProcessService,
-    };
     use carrick_el1_abi::{
         BornInZoneSource, DelegatedOpenFile, FD_MAP_CAPACITY, FdMapSlot, ThreadControlSlot,
         ThreadIdentity, ThreadLifecyclePage,
+    };
+    use carrick_el1_linux::native_process_runtime::{
+        NativeForkPreparation, NativeLifecycleResources, NativeProcessError, NativeProcessRegistry,
+        NativeProcessRuntime, NativeProcessService,
     };
     use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
     use carrick_mmu_core::x86::owner_mmu::X86Mmu;
@@ -414,7 +414,7 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         }
 
         fn retire_fd_table(&mut self, table: u64) {
-            carrick_el1::personality::file_table::retire_fd_map(&self.fd_map, &self.opens, table);
+            carrick_el1_linux::file_table::retire_fd_map(&self.fd_map, &self.opens, table);
             self.task.linux.mark_pending_host_work();
             self.retired_fd_tables.push(table);
         }

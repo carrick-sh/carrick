@@ -343,12 +343,13 @@ fn main() {
 
     let el1_target_dir = Path::new(&out_dir).join("el1-target");
 
-    // Build carrick-el1 for aarch64-unknown-none-softfloat --release
+    // Build the carrick-el1 image binary (owned by carrick-el1-linux) for
+    // aarch64-unknown-none-softfloat --release
     let mut build_cmd = Command::new(&cargo);
     build_cmd
         .arg("build")
         .arg("-p")
-        .arg("carrick-el1")
+        .arg("carrick-el1-linux")
         .arg("--target")
         .arg("aarch64-unknown-none-softfloat")
         .arg("--release")
@@ -402,9 +403,11 @@ fn main() {
         "cargo:warning=EL1 image budget: {image_size} bytes loaded / {limit} bytes; {headroom} bytes headroom"
     );
 
+    println!("cargo:rerun-if-changed=../carrick-el1-linux/src");
+    println!("cargo:rerun-if-changed=../carrick-el1-linux/link.ld");
+    println!("cargo:rerun-if-changed=../carrick-el1-linux/build.rs");
+    println!("cargo:rerun-if-changed=../carrick-el1-linux/Cargo.toml");
     println!("cargo:rerun-if-changed=../carrick-el1/src");
-    println!("cargo:rerun-if-changed=../carrick-el1/link.ld");
-    println!("cargo:rerun-if-changed=../carrick-el1/build.rs");
     println!("cargo:rerun-if-changed=../carrick-el1/Cargo.toml");
     println!("cargo:rerun-if-changed=../carrick-el1-abi/src");
     println!("cargo:rerun-if-changed=../carrick-el1-abi/Cargo.toml");

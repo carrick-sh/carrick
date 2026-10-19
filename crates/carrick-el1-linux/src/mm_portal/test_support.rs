@@ -1,7 +1,7 @@
 //! VM-free fixtures of the real reservation, descriptor, scheduler and transfer owners.
 use super::*;
-use crate::fault::{NoopCowResolver, NoopPreparedResolver};
-use crate::memory::reservations::{Layout, ResolvedReservationNodes, SharedReservations};
+use carrick_el1::fault::{NoopCowResolver, NoopPreparedResolver};
+use carrick_el1::memory::reservations::{Layout, ResolvedReservationNodes, SharedReservations};
 use carrick_el1_abi::{
     FrameGrantResidencyTable, MetadataExtent, MetadataExtentResolver, MetadataResolutionError,
     PinnedMetadataExtent, ReservationProtection, ReservationRange,
@@ -278,7 +278,7 @@ fn admit_access(
         .unwrap();
     let view = nodes(region);
     let mut owner = if let Some(venue) = spaces.venue() {
-        crate::memory::reservations::RootReleaseVenue::new(table, venue)
+        carrick_el1::memory::reservations::RootReleaseVenue::new(table, venue)
             .unwrap()
             .lock_el1_resolved(index.index(), mm, &view, 0)
             .unwrap()
@@ -596,7 +596,7 @@ pub fn change_policy(
     tables: &Tables,
     protection: Option<ReservationProtection>,
 ) {
-    use crate::memory::reservations::Decision;
+    use carrick_el1::memory::reservations::Decision;
     use carrick_mmu_core::aarch64::descriptor_txn::{
         DescriptorOp, DescriptorOutcome, InlineJournal, PageSpan, TableGrants, TerminalEdit,
         execute_descriptor_op,
@@ -610,7 +610,7 @@ pub fn change_policy(
     let request = {
         let mut root = match spaces.venue() {
             Some(venue) => {
-                crate::memory::reservations::RootReleaseVenue::new(region.table(), venue)
+                carrick_el1::memory::reservations::RootReleaseVenue::new(region.table(), venue)
                     .unwrap()
                     .lock_el1_resolved(index.index(), mm, &view, 0)
                     .unwrap()
@@ -676,10 +676,12 @@ pub fn change_policy(
     }
     .unwrap();
     (match spaces.venue() {
-        Some(venue) => crate::memory::reservations::RootReleaseVenue::new(region.table(), venue)
-            .unwrap()
-            .lock_el1_resolved(index.index(), mm, &view, 0)
-            .unwrap(),
+        Some(venue) => {
+            carrick_el1::memory::reservations::RootReleaseVenue::new(region.table(), venue)
+                .unwrap()
+                .lock_el1_resolved(index.index(), mm, &view, 0)
+                .unwrap()
+        }
         None => region
             .table()
             .lock_el1_resolved_with_context(index.index(), mm, &view, 0)

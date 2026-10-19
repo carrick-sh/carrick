@@ -1,8 +1,8 @@
 //! N0 red reduction of the *production* reservation admission path.
 //! No replacement portal is simulated here: these receipts deliberately retain
 //! the host proposal venue and identify it as a violation of exclusive ownership.
-use crate::memory::reservations::{Layout, SharedReservations};
-use crate::memory::{
+use carrick_el1::memory::reservations::{Layout, SharedReservations};
+use carrick_el1::memory::{
     AnonymousBackingProbe, AnonymousPermissionEditor, AnonymousRetirementEditor,
     DelegatedAnonymous, Stage1Backing, classify_stage1_range, serve_delegated_anonymous,
 };
@@ -300,5 +300,5 @@ fn production_admitted_fork_uses_exclusive_owner_without_host_semantic_venue() {
     // The production fork API accepts exact root identity and physical table
     // supply only. Exercise its live graph COW publication and complete undo;
     // no host VMA/protection proposal can enter this operation.
-    crate::personality::mm_portal::tests::owner_fork_child_has_live_private_cow_and_parent_stays_unchanged_on_abort();
+    crate::mm_portal::tests::owner_fork_child_has_live_private_cow_and_parent_stays_unchanged_on_abort();
 }

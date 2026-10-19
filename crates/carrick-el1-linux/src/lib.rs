@@ -1,7 +1,11 @@
-//! Linux ABI decoding and result mapping; depends on neutral substrate.
+//! Linux personality client of the neutral `carrick-el1` runtime: Linux ABI
+//! decoding and result mapping, and the EL1 image binary (`entry.rs`).
 //!
 //! The same modules compile into both guest images; native operations are
 //! supplied by the selected architecture backend.
+#![cfg_attr(target_os = "none", no_std)]
+#[cfg(target_os = "none")]
+extern crate alloc as rust_alloc;
 pub mod aarch64_process;
 #[cfg(any(test, feature = "host-test"))]
 pub mod aarch64_process_tests;
@@ -28,6 +32,12 @@ pub mod signal_delivery;
 pub mod thread_setup;
 
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
-mod arm_signal;
+pub mod arm_signal;
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-mod x86_signal;
+pub mod x86_signal;
+
+#[cfg(test)]
+#[path = "reservation_decoder_tests.rs"]
+mod decoder_tests;
+#[cfg(test)]
+mod native_ownership_tests;

@@ -1,6 +1,6 @@
 use super::test_support::*;
 use super::*;
-use crate::fault::{NoopCowResolver, NoopPreparedResolver};
+use carrick_el1::fault::{NoopCowResolver, NoopPreparedResolver};
 use carrick_el1_abi::{
     FrameGrantMailbox, FrameGrantResidencyTable, ReservationNodeFlags, ReservationProtection,
     ReservationRange,
@@ -127,7 +127,7 @@ fn owner_lazy_selection_keeps_supply_owned_when_fault_mailbox_is_occupied() {
         )
         .unwrap();
     let mailbox = FrameGrantMailbox::new();
-    assert!(crate::fault::request_lazy_frames(
+    assert!(carrick_el1::fault::request_lazy_frames(
         &mailbox,
         99,
         VA,
@@ -158,7 +158,7 @@ fn owner_lazy_selection_keeps_supply_owned_when_fault_mailbox_is_occupied() {
 /// through the owner instead of requesting overlapping physical inventory.
 #[test]
 fn prepared_bulk_leaf_and_live_residency_select_existing_owner_page() {
-    use crate::fault::PreparedPageResolver;
+    use carrick_el1::fault::PreparedPageResolver;
     use carrick_el1_abi::FrameGrantResidencyIdentity;
     use carrick_mmu_core::aarch64::descriptor_txn::{
         BackingIdentity, DescriptorOp, DescriptorOutcome, InlineJournal, PageSpan, TableGrants,
@@ -292,7 +292,7 @@ fn prepared_bulk_leaf_and_live_residency_select_existing_owner_page() {
 
 #[test]
 fn owner_grant_rejects_recycled_range_after_host_reconciliation() {
-    use crate::memory::reservations::{Decision, Placement, ReservationFaultPlan};
+    use carrick_el1::memory::reservations::{Decision, Placement, ReservationFaultPlan};
 
     let region = Region::new();
     let spaces = AddressSpaces::new();
@@ -1109,7 +1109,7 @@ fn partial_retired_compound_replacement_preserves_live_neighbor() {
     );
     assert!(matches!(retired.outcome, DescriptorOutcome::Applied(_)));
     {
-        use crate::memory::reservations::{Decision, Placement};
+        use carrick_el1::memory::reservations::{Decision, Placement};
         let mut owner = region
             .table()
             .lock_el1_resolved(spaces.find(mm.raw()).unwrap().index(), mm, &view, 0)
@@ -1289,7 +1289,7 @@ fn kernel_only_write_denial_is_a_fault_without_supply() {
 
 #[test]
 fn untouched_private_file_selects_only_owner_retained_source() {
-    use crate::memory::reservations::Layout;
+    use carrick_el1::memory::reservations::Layout;
     let region = Region::new();
     let spaces = AddressSpaces::new();
     let mm = ReservationMm::new(77).unwrap();
@@ -1353,7 +1353,7 @@ fn untouched_private_file_selects_only_owner_retained_source() {
         .table()
         .lock_el1_resolved(index.index(), mm, &view, 0)
         .unwrap();
-    let plan = crate::memory::reservations::ReservationFaultPlan {
+    let plan = carrick_el1::memory::reservations::ReservationFaultPlan {
         mm,
         generation: window.generation,
         range: window.range,
@@ -1372,7 +1372,7 @@ fn untouched_private_file_selects_only_owner_retained_source() {
 
 #[test]
 fn cow_without_publication_capability_refuses_exec_and_instruction_reads_work() {
-    use crate::memory::reservations::Decision;
+    use carrick_el1::memory::reservations::Decision;
     let region = Region::new();
     let spaces = AddressSpaces::new();
     let mm = admit(&region, &spaces, 77, ROOT, 1, 0);
@@ -1485,7 +1485,7 @@ fn imported_private_empty_cow_pool_returns_owned_exact_target_supply() {
         &'a carrick_el1_abi::CowGrantPool,
         &'a FrameGrantResidencyTable,
     );
-    impl crate::fault::CowResolver for EmptyCow<'_> {
+    impl carrick_el1::fault::CowResolver for EmptyCow<'_> {
         fn resolve_cow(&mut self, _: u64, _: u64, _: u64) -> bool {
             panic!("typed outcome required")
         }
@@ -1494,14 +1494,14 @@ fn imported_private_empty_cow_pool_returns_owned_exact_target_supply() {
             ttbr: u64,
             mm: u64,
             va: u64,
-        ) -> crate::fault::CowResolution {
-            let result = crate::cow::resolve_guest_cow(
-                &crate::cow::GuestCowVenue {
+        ) -> carrick_el1::fault::CowResolution {
+            let result = carrick_el1::cow::resolve_guest_cow(
+                &carrick_el1::cow::GuestCowVenue {
                     words: &self.0.live(&CallerInvalidatesAsid),
                     root: carrick_mmu_core::aarch64::SubstrateGpa(ttbr),
                     pool: self.1,
                     residency: self.2,
-                    copy_window: crate::cow::CowCopyWindow::target(
+                    copy_window: carrick_el1::cow::CowCopyWindow::target(
                         &self.0.live(&CallerInvalidatesAsid),
                         carrick_mmu_core::aarch64::SubstrateGpa(ttbr),
                     ),
@@ -1514,11 +1514,11 @@ fn imported_private_empty_cow_pool_returns_owned_exact_target_supply() {
             );
             assert_eq!(
                 result,
-                Ok(crate::cow::GuestCowOutcome::Declined(
+                Ok(carrick_el1::cow::GuestCowOutcome::Declined(
                     carrick_el1_abi::CowDecline::PoolEmpty
                 ))
             );
-            crate::fault::CowResolution::NeedsSupply
+            carrick_el1::fault::CowResolution::NeedsSupply
         }
     }
     let region = Region::new();
@@ -1747,7 +1747,7 @@ fn fork_request(
 // parent's certificate and optional child's reserve live so each case reaches
 // the intended publication allocation, rather than a setup refusal.
 fn fork_publication_metadata_pressure(reserve_child: bool, copy_nodes_available: u64) {
-    use crate::memory::reservations::{HOST_RESERVE, Refusal};
+    use carrick_el1::memory::reservations::{HOST_RESERVE, Refusal};
     let region = Region::new();
     let spaces = AddressSpaces::new();
     let parent = admit(&region, &spaces, 77, ROOT, 2, 1);
@@ -2326,7 +2326,7 @@ fn owner_fork_untouched_private_file_reads_source_and_child_write_stays_private(
     assert!(fault_slots.bind_carrier(NonZeroU64::new(1).unwrap()));
     let fault_mailbox = FrameGrantMailbox::new();
     assert!(
-        (crate::fault::FileFaultVenue {
+        (carrick_el1::fault::FileFaultVenue {
             roots: region.table(),
             spaces: carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
             slots: &fault_slots,
@@ -2561,13 +2561,13 @@ fn owner_fork_resident_child_cow_copies_with_production_classifier() {
     let _editor = spaces
         .try_begin_edit(spaces.find(78).unwrap(), 78, nz(2))
         .unwrap();
-    let outcome = crate::cow::resolve_guest_cow(
-        &crate::cow::GuestCowVenue {
+    let outcome = carrick_el1::cow::resolve_guest_cow(
+        &carrick_el1::cow::GuestCowVenue {
             words: &words,
             root: carrick_mmu_core::aarch64::SubstrateGpa(child.base),
             pool: &pool,
             residency: &residency,
-            copy_window: crate::cow::CowCopyWindow::target(
+            copy_window: carrick_el1::cow::CowCopyWindow::target(
                 &words,
                 carrick_mmu_core::aarch64::SubstrateGpa(child.base),
             ),
@@ -2584,7 +2584,7 @@ fn owner_fork_resident_child_cow_copies_with_production_classifier() {
         || {},
     );
     assert!(
-        matches!(outcome, Ok(crate::cow::GuestCowOutcome::Resolved(_))),
+        matches!(outcome, Ok(carrick_el1::cow::GuestCowOutcome::Resolved(_))),
         "{outcome:?}"
     );
     replacement.borrow_mut()[..4].copy_from_slice(b"fork");
@@ -2787,13 +2787,13 @@ fn owner_parent_copyout_rollback(mixed_block: bool) {
     let _editor = spaces
         .try_begin_edit(spaces.find(77).unwrap(), 77, nz(2))
         .unwrap();
-    let outcome = crate::cow::resolve_guest_cow(
-        &crate::cow::GuestCowVenue {
+    let outcome = carrick_el1::cow::resolve_guest_cow(
+        &carrick_el1::cow::GuestCowVenue {
             words: &words,
             root: carrick_mmu_core::aarch64::SubstrateGpa(ROOT),
             pool: &pool,
             residency: &residency,
-            copy_window: crate::cow::CowCopyWindow::target(
+            copy_window: carrick_el1::cow::CowCopyWindow::target(
                 &words,
                 carrick_mmu_core::aarch64::SubstrateGpa(ROOT),
             ),
@@ -2810,11 +2810,11 @@ fn owner_parent_copyout_rollback(mixed_block: bool) {
         || {},
     );
     assert!(
-        matches!(outcome, Ok(crate::cow::GuestCowOutcome::Resolved(_))),
+        matches!(outcome, Ok(carrick_el1::cow::GuestCowOutcome::Resolved(_))),
         "{outcome:?}"
     );
     drop(_editor);
-    let Ok(crate::cow::GuestCowOutcome::Resolved(completion)) = outcome else {
+    let Ok(carrick_el1::cow::GuestCowOutcome::Resolved(completion)) = outcome else {
         panic!("owner COW receipt missing")
     };
     pending.reconcile_parent_write(&words, completion).unwrap();
@@ -2845,7 +2845,7 @@ fn owner_fork_dontfork_omits_and_wipeonfork_retains_zero_reservation() {
                 spaces.find(77).unwrap().index(),
                 parent,
                 &view,
-                &crate::memory::reservations::NoRootWait,
+                &carrick_el1::memory::reservations::NoRootWait,
             )
             .unwrap();
         root.set_flags(
@@ -2925,7 +2925,7 @@ fn owner_fork_preserves_parent_owed_return_and_omits_retired_child_leaf() {
             .table()
             .lock_el1_resolved(spaces.find(77).unwrap().index(), parent, &view, 0)
             .unwrap();
-        let crate::memory::reservations::Decision::Work(request) =
+        let carrick_el1::memory::reservations::Decision::Work(request) =
             root.munmap(retired_range).unwrap()
         else {
             panic!()
@@ -3118,7 +3118,7 @@ fn prepared_copy_overlapping_munmap_waits_before_any_mutation() {
     assert!(
         matches!(
             root.munmap(ReservationRange::new(VA, VA + 4096).unwrap()),
-            Err(crate::memory::reservations::Refusal::PreparedConflict)
+            Err(carrick_el1::memory::reservations::Refusal::PreparedConflict)
         ),
         "overlapping munmap must wait before proposing mutation"
     );
@@ -3172,7 +3172,7 @@ fn prepared_copy_releases_editor_for_unrelated_edit() {
 
 #[test]
 fn prepared_copy_el1_edit_parks_then_commit_or_cancel_wakes_exact_saved_syscall() {
-    use crate::substrate::sched::{FakeCpu, HardwareUserWord, Sched, Served, ThreadCpu};
+    use carrick_el1::substrate::sched::{FakeCpu, HardwareUserWord, Sched, Served, ThreadCpu};
     use carrick_el1_abi::{Counters, CurrentTask, El1TaskId, SlotId, TrapFrame};
     for cancel in [false, true] {
         for nr in [215, 226, 216] {
@@ -3312,11 +3312,11 @@ fn prepared_copy_el1_edit_parks_then_commit_or_cancel_wakes_exact_saved_syscall(
                 _ => root.mremap(
                     ReservationRange::new(VA, VA + 8192).unwrap(),
                     4096,
-                    crate::memory::reservations::MoveTarget::InPlace,
+                    carrick_el1::memory::reservations::MoveTarget::InPlace,
                 ),
             }
             .unwrap();
-            let crate::memory::reservations::Decision::Work(edit) = decision else {
+            let carrick_el1::memory::reservations::Decision::Work(edit) = decision else {
                 panic!("resumed edit must apply");
             };
             root.complete(unsafe {
@@ -3459,7 +3459,7 @@ fn prepared_copy_rejected_tuple_cannot_overwrite_concurrent_claim() {
 }
 
 fn schedulerless_settlement_preserves_prepared_permit(cancel: bool) {
-    use crate::substrate::sched::{FakeCpu, HardwareUserWord, Sched, Served};
+    use carrick_el1::substrate::sched::{FakeCpu, HardwareUserWord, Sched, Served};
     use carrick_el1_abi::{Counters, CurrentTask, El1TaskId, SlotId, TrapFrame};
     let region = Region::new();
     let zone = region.zone();
@@ -3612,7 +3612,7 @@ fn prepared_copy_metadata_capacity_suspends_before_source_and_recovers_after_can
         loop {
             match unsafe { root.prepare_copy_for_fixture(request, None) } {
                 Ok(permit) => permits.push(permit),
-                Err(crate::memory::reservations::Refusal::MetadataRequired) => break,
+                Err(carrick_el1::memory::reservations::Refusal::MetadataRequired) => break,
                 other => panic!("unexpected admission {other:?}"),
             }
         }
@@ -3813,7 +3813,7 @@ fn owner_wait_enrollment_follows_only_its_real_release(
     }
     let pending = if cause == PortalWaitCause::PendingEdit {
         let mut root = portal.root(mm, 1).unwrap();
-        let crate::memory::reservations::Decision::Work(request) = root
+        let carrick_el1::memory::reservations::Decision::Work(request) = root
             .mprotect(
                 ReservationRange::new(VA, VA + 4096).unwrap(),
                 ReservationProtection::from_bits(1).unwrap(),
@@ -4175,7 +4175,7 @@ fn grant_gate_closed_after_selection_preserves_exact_owner_wait() {
 
 #[test]
 fn grant_resume_reselects_generation_range_protection_and_source_changed_while_parked() {
-    use crate::memory::reservations::{Decision, Placement};
+    use carrick_el1::memory::reservations::{Decision, Placement};
     for change in ["generation", "range", "protection", "source"] {
         let region = Region::new();
         let zone = region.zone();
@@ -4303,7 +4303,7 @@ fn grant_resume_reselects_generation_range_protection_and_source_changed_while_p
 
 #[test]
 fn pending_brk_scrub_must_not_wait_for_its_own_gate() {
-    use crate::memory::reservations::Decision;
+    use carrick_el1::memory::reservations::Decision;
     use carrick_el1_abi::{ReservationBackingReceipt, ReservationCompletion};
     let region = Region::new();
     let zone = region.zone();
@@ -4361,7 +4361,7 @@ fn pending_brk_scrub_must_not_wait_for_its_own_gate() {
     let access = portal.space_access(1).unwrap();
     access.raise(index);
     let pending = {
-        let venue = crate::memory::reservations::RootReleaseVenue::new(
+        let venue = carrick_el1::memory::reservations::RootReleaseVenue::new(
             region.table(),
             access.venue().unwrap(),
         )
@@ -4371,7 +4371,7 @@ fn pending_brk_scrub_must_not_wait_for_its_own_gate() {
                 index.index(),
                 mm,
                 &view,
-                &crate::memory::reservations::NoRootWait,
+                &carrick_el1::memory::reservations::NoRootWait,
             )
             .unwrap();
         root.begin_host_proposal().unwrap();
@@ -4445,12 +4445,12 @@ fn pending_brk_scrub_must_not_wait_for_its_own_gate() {
         arenas: &arenas,
         loads: core::cell::Cell::new(0),
     };
-    let venue = crate::cow::GuestCowVenue {
+    let venue = carrick_el1::cow::GuestCowVenue {
         words: &words,
         root: carrick_mmu_core::aarch64::SubstrateGpa(ROOT),
         pool: &pool,
         residency: &resident,
-        copy_window: crate::cow::CowCopyWindow::target(
+        copy_window: carrick_el1::cow::CowCopyWindow::target(
             &words,
             carrick_mmu_core::aarch64::SubstrateGpa(ROOT),
         ),

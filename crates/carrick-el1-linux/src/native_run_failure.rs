@@ -12,9 +12,9 @@ pub struct NativeRunFailurePanic {
 /// A failed native operation cannot become an errno, forwarded call or return.
 pub fn complete_native_run_failure(binding: ExecutionBinding, reason: NativeRunFailureReason) -> ! {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    crate::isa::aarch64::complete_native_run_failure(binding, reason);
+    carrick_el1::isa::aarch64::complete_native_run_failure(binding, reason);
     #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-    crate::isa::x86::complete_native_run_failure(binding, reason);
+    carrick_el1::isa::x86::complete_native_run_failure(binding, reason);
     #[cfg(all(not(target_os = "none"), test))]
     {
         test_terminal_failure(binding, reason)
@@ -22,9 +22,9 @@ pub fn complete_native_run_failure(binding: ExecutionBinding, reason: NativeRunF
     #[cfg(all(not(target_os = "none"), not(test)))]
     {
         let _ = binding;
-        crate::personality::dispatch::invalid_completion(
-            crate::personality::dispatch::NativeInvariant::PhysicalCustody(reason.as_str()),
-        )
+        crate::dispatch::invalid_completion(crate::dispatch::NativeInvariant::PhysicalCustody(
+            reason.as_str(),
+        ))
     }
 }
 
