@@ -386,6 +386,29 @@ impl GuestRam {
             }
         }
     }
+
+    /// # Safety
+    /// `host` must name a live mapping of at least `len` bytes whose ownership
+    /// is transferred to this `GuestRam`.
+    pub unsafe fn push_window(
+        &mut self,
+        base: u64,
+        host: *mut u8,
+        len: usize,
+        kind: WindowKind,
+        slot_gpa: Option<u64>,
+    ) {
+        self.windows
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(WindowDesc {
+                base,
+                host: host as usize,
+                len,
+                kind,
+                slot_gpa,
+            });
+    }
 }
 
 impl Default for GuestRam {
@@ -490,30 +513,5 @@ mod tests {
             sibling.host_ptr(0x9000, 1).is_some(),
             "sibling views must observe high-VA aliases added after clone"
         );
-    }
-}
-
-impl GuestRam {
-    /// # Safety
-    /// `host` must name a live mapping of at least `len` bytes whose ownership
-    /// is transferred to this `GuestRam`.
-    pub unsafe fn push_window(
-        &mut self,
-        base: u64,
-        host: *mut u8,
-        len: usize,
-        kind: WindowKind,
-        slot_gpa: Option<u64>,
-    ) {
-        self.windows
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(WindowDesc {
-                base,
-                host: host as usize,
-                len,
-                kind,
-                slot_gpa,
-            });
     }
 }

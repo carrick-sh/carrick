@@ -1355,9 +1355,12 @@ pub fn refused_retire_child_mutates_nothing_and_its_retry_completes(_make: fn() 
     fixture.assert_admitted_exact();
 }
 
+/// Returns the first carrier refusal instead of panicking: this harness is
+/// compiled into the library under `test-support`, where the no-panic gate
+/// applies; the `#[test]` callers unwrap the result.
 pub fn inherited_inventory_edge_survives_protect_advancing_mapping_generation(
     _make: fn() -> MemoryTestIo,
-) {
+) -> Result<(), String> {
     use carrick_hal::{
         FrameEventCapacity, FrameId, FrameInventoryEvent, FrameLength, MappingGeneration,
         MappingId, MemPerms,
@@ -1561,7 +1564,7 @@ pub fn inherited_inventory_edge_survives_protect_advancing_mapping_generation(
             selection,
             &*authority.physical_projection(Arc::clone(&ids)),
         )
-        .expect("protected page must remain live for fork inheritance");
+        .map_err(|e| format!("protected page must remain live for fork inheritance: {e:?}"))?;
     assert_eq!(edges.len(), 1);
     let edge = edges.remove(0);
 
@@ -1602,5 +1605,8 @@ pub fn inherited_inventory_edge_survives_protect_advancing_mapping_generation(
             &child_receipt,
             &*authority.physical_projection(Arc::clone(&ids)),
         )
-        .expect("attach_inherited_frame must succeed for protected inherited page");
+        .map_err(|e| {
+            format!("attach_inherited_frame must succeed for protected inherited page: {e:?}")
+        })?;
+    Ok(())
 }
