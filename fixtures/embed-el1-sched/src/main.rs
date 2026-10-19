@@ -937,27 +937,116 @@ fn pipe_pingpong(iters: usize) -> i32 {
 fn socket_pair() -> (i32, i32) {
     let mut fds = [0i32; 2];
     let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
-    assert_eq!(rc, 0, "socketpair");
+    if rc != 0 {
+        let errno = last_errno();
+        panic!("socketpair rc={rc} errno={errno}");
+    }
     (fds[0], fds[1])
 }
 
+/// The calling thread's `errno`, read immediately after the failed call.
+fn last_errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+/// One failed byte transfer: which thread, which call on which descriptor,
+/// at which iteration, and the raw return with its errno (0 = EOF for a
+/// read, never an errno).
+#[derive(Clone, Copy, Debug)]
+struct ByteFailure {
+    call: &'static str,
+    fd: i32,
+    iter: usize,
+    rc: i64,
+    errno: i32,
+}
+
+impl std::fmt::Display for ByteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}(fd={}) iter={} rc={} errno={}",
+            self.call, self.fd, self.iter, self.rc, self.errno
+        )
+    }
+}
+
+/// `read_byte`/`write_byte` that keep the exact failure (the errno is read
+/// before anything else can overwrite it).
+fn checked_byte(call: &'static str, fd: i32, iter: usize) -> Result<(), ByteFailure> {
+    let rc = match call {
+        "read" => read_byte(fd),
+        _ => write_byte(fd),
+    };
+    if rc == 1 {
+        return Ok(());
+    }
+    let errno = if rc < 0 { last_errno() } else { 0 };
+    Err(ByteFailure {
+        call,
+        fd,
+        iter,
+        rc,
+        errno,
+    })
+}
+
+/// Spawn a named fixture thread, reporting a refused `clone` (its errno) on
+/// stderr and exiting with `code`, instead of `std::thread::spawn`'s
+/// anonymous panic.
+fn spawn_or_exit<T: Send + 'static>(
+    name: &str,
+    code: i32,
+    body: impl FnOnce() -> T + Send + 'static,
+) -> std::thread::JoinHandle<T> {
+    match std::thread::Builder::new().name(name.into()).spawn(body) {
+        Ok(handle) => handle,
+        Err(error) => {
+            eprintln!(
+                "{name}: thread spawn failed errno={:?} ({error})",
+                error.raw_os_error()
+            );
+            std::process::exit(code);
+        }
+    }
+}
+
+/// Exit codes `sock-pingpong` and `sock-pingpong-stepper` use for each
+/// failure, so a run whose stderr is lost still names the failing step.
+mod sock_exit {
+    pub const MAIN_TRANSFER: i32 = 1;
+    pub const PARTNER_SPAWN: i32 = 20;
+    pub const PARTNER_TRANSFER: i32 = 21;
+    pub const PARTNER_PANIC: i32 = 22;
+    pub const ACTOR_SPAWN: i32 = 30;
+    pub const ACTOR_HANDSHAKE: i32 = 31;
+    pub const ACTOR_TRANSFER: i32 = 32;
+    pub const ACTOR_PANIC: i32 = 33;
+    pub const READY_READ: i32 = 34;
+}
+
 /// `pipe_pingpong` over `AF_UNIX` socketpairs (host-served descriptors).
+/// Every failure is reported on stderr with its call, descriptor, iteration,
+/// raw return and errno, by the thread that saw it, as it happens.
 fn sock_pingpong(iters: usize, pinned: bool) -> i32 {
     const WARMUP: usize = 200;
     // Each pair: `.0` is the end A uses, `.1` the end B uses.
     let to_b = socket_pair();
     let to_a = socket_pair();
     let total = WARMUP + iters;
-    let b = std::thread::spawn(move || {
+    let b = spawn_or_exit("sock-pingpong-b", sock_exit::PARTNER_SPAWN, move || {
         if pinned {
             pin(0);
         }
-        for _ in 0..total {
-            if read_byte(to_b.1) != 1 || write_byte(to_a.1) != 1 {
-                return false;
+        for i in 0..total {
+            let turn =
+                checked_byte("read", to_b.1, i).and_then(|()| checked_byte("write", to_a.1, i));
+            if let Err(failure) = turn {
+                eprintln!("sock-pingpong partner failed: {failure}");
+                return Err(failure);
             }
         }
-        true
+        Ok(())
     });
     if pinned {
         pin(0);
@@ -965,17 +1054,26 @@ fn sock_pingpong(iters: usize, pinned: bool) -> i32 {
     let mut samples = Vec::with_capacity(iters);
     for i in 0..total {
         let t0 = cntvct();
-        if write_byte(to_b.0) != 1 || read_byte(to_a.0) != 1 {
+        let turn = checked_byte("write", to_b.0, i).and_then(|()| checked_byte("read", to_a.0, i));
+        if let Err(failure) = turn {
+            eprintln!("sock-pingpong main failed: {failure}");
             println!("sock-pingpong failed at {i}");
-            return 1;
+            return sock_exit::MAIN_TRANSFER;
         }
         if i >= WARMUP {
             samples.push(cntvct() - t0);
         }
     }
-    if !b.join().expect("sock partner exits") {
-        println!("sock-pingpong partner failed");
-        return 1;
+    match b.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            println!("sock-pingpong partner failed");
+            return sock_exit::PARTNER_TRANSFER;
+        }
+        Err(_) => {
+            eprintln!("sock-pingpong partner panicked");
+            return sock_exit::PARTNER_PANIC;
+        }
     }
     let ns = ns_per_tick();
     samples.sort_unstable();
@@ -990,6 +1088,9 @@ fn sock_pingpong(iters: usize, pinned: bool) -> i32 {
 /// `sock_pingpong` beside an independent host-served actor on guest CPU 0
 /// (the deferred-capture witness, #695): every actor operation steps its
 /// executor away from CPU 0's slot, independent of the pingpong threads.
+/// Each step reports its own failure on stderr and exits with its own code
+/// ([`sock_exit`]); the actor reports a failed transfer when it happens, not
+/// only at the join.
 fn sock_pingpong_stepper(iters: usize) -> i32 {
     // Pinning only narrows where a held record may run; the actor's step-aways
     // release it either way. Report the raw result (0, or -errno) instead of
@@ -1001,22 +1102,29 @@ fn sock_pingpong_stepper(iters: usize) -> i32 {
     let stopped = std::sync::Arc::clone(&stop);
     let actor_pin = std::sync::Arc::new(AtomicI64::new(i64::MIN));
     let actor_pinned = std::sync::Arc::clone(&actor_pin);
-    let stepper = std::thread::spawn(move || {
+    let stepper = spawn_or_exit("sock-stepper", sock_exit::ACTOR_SPAWN, move || {
         actor_pinned.store(pin(0), Ordering::Release);
-        if write_byte(ready.1) != 1 {
-            return false;
+        if let Err(failure) = checked_byte("write", ready.1, 0) {
+            eprintln!("sock-pingpong-stepper actor handshake failed: {failure}");
+            return Err(sock_exit::ACTOR_HANDSHAKE);
         }
+        let mut i = 0usize;
         while !stopped.load(Ordering::Acquire) {
-            if write_byte(loopback.0) != 1 || read_byte(loopback.1) != 1 {
-                return false;
+            let turn = checked_byte("write", loopback.0, i)
+                .and_then(|()| checked_byte("read", loopback.1, i));
+            if let Err(failure) = turn {
+                eprintln!("sock-pingpong-stepper actor failed: {failure}");
+                return Err(sock_exit::ACTOR_TRANSFER);
             }
+            i += 1;
         }
-        true
+        Ok(i)
     });
     // A host-served read: the actor is running once it returns.
-    if read_byte(ready.0) != 1 {
+    if let Err(failure) = checked_byte("read", ready.0, 0) {
+        eprintln!("sock-pingpong-stepper ready read failed: {failure}");
         println!("sock-pingpong-stepper actor never started");
-        return 1;
+        return sock_exit::READY_READ;
     }
     println!(
         "sock-pingpong-stepper sched_setaffinity main={main_pin} actor={}",
@@ -1024,11 +1132,17 @@ fn sock_pingpong_stepper(iters: usize) -> i32 {
     );
     let status = sock_pingpong(iters, true);
     stop.store(true, Ordering::Release);
-    if !stepper.join().expect("stepper exits") {
-        println!("sock-pingpong-stepper actor failed");
-        return 1;
+    match stepper.join() {
+        Ok(Ok(turns)) => println!("stepper ok turns={turns}"),
+        Ok(Err(code)) => {
+            println!("sock-pingpong-stepper actor failed");
+            return code;
+        }
+        Err(_) => {
+            eprintln!("sock-pingpong-stepper actor panicked");
+            return sock_exit::ACTOR_PANIC;
+        }
     }
-    println!("stepper ok");
     status
 }
 

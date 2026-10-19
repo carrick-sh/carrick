@@ -4297,16 +4297,25 @@ fn el1_sched_deferred_handback_capture_observes_guest_records() {
             .run_blocking(),
     );
     let outcome = hold.finish();
-    assert!(result.success(), "{}", result.stdout_utf8());
-    assert!(result.stdout_utf8().contains("sock-pingpong iters=2000"));
-    assert!(result.stdout_utf8().contains("stepper ok"));
-    for line in result.stdout_utf8().lines() {
-        if line.contains("sched_setaffinity") {
-            println!("{line}");
-        }
-    }
     let batches = capture.batches.lock().unwrap();
-    println!("deferred handback capture: outcome={outcome:?} batches={batches:?}");
+    // Everything a signed failure needs, before any assertion: the guest's
+    // exit status and signal, both streams (the fixture reports each failing
+    // call with its errno on stderr and exits with a per-step code), and how
+    // the hold ended, so a failing run says whether the hold engaged.
+    let verdict = format!(
+        "exit {} signal {:?} outcome {outcome:?} batches {batches:?} stdout {:?} stderr {:?}",
+        result.exit_code,
+        result.signal,
+        result.stdout_utf8(),
+        result.stderr_utf8()
+    );
+    println!("deferred handback capture: {verdict}");
+    assert!(result.success(), "{verdict}");
+    assert!(
+        result.stdout_utf8().contains("sock-pingpong iters=2000"),
+        "{verdict}"
+    );
+    assert!(result.stdout_utf8().contains("stepper ok"), "{verdict}");
     let HoldOutcome::ReleasedAtStepAway { record, .. } = outcome else {
         panic!("held service placement was not released at a step-away: {outcome:?}");
     };
