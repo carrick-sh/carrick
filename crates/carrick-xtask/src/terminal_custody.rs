@@ -1,5 +1,6 @@
 //! Ratchet for retirement decisions outside the neutral owner.
 
+use crate::debt_moves::MoveMap;
 use quote::ToTokens;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -359,11 +360,25 @@ fn crate_sites(sites: &BTreeSet<String>) -> BTreeMap<String, Vec<&str>> {
     crates
 }
 
+/// Per-crate ceilings may only fall. Crates listed in `moves` are compared
+/// under their destination on both sides, so a reviewed crate split keeps
+/// its combined total; an unmapped new crate is still an increase.
 fn ratchet(
     current: &BTreeMap<String, usize>,
     base: &BTreeMap<String, usize>,
+    moves: &MoveMap,
 ) -> Result<(), String> {
-    for (name, count) in current {
+    let transfer = |counts: &BTreeMap<String, usize>| {
+        moves.transfer(
+            counts
+                .iter()
+                .map(|(name, count)| (name.clone(), *count as u64)),
+            |_, name| name.to_owned(),
+            |name| name.as_str(),
+        )
+    };
+    let (current, base) = (transfer(current), transfer(base));
+    for (name, count) in &current {
         let previous = base.get(name).copied().unwrap_or(0);
         if *count > previous {
             return Err(format!(
@@ -415,7 +430,8 @@ fn check_policy(root: &Path, base: Option<&str>) -> Result<(), String> {
     let sites = discover(root)?;
     validate(&sites, &allowed)?;
     if let Some(base) = base {
-        ratchet(&allowed, &base_counts(root, base)?)
+        let moves = crate::debt_moves::DebtMoves::load(root)?.terminal_custody()?;
+        ratchet(&allowed, &base_counts(root, base)?, &moves)
             .map_err(|error| format!("{error}; current sites: {sites:?}"))?;
         println!("terminal custody PR-base ratchet passed ({base})");
     } else {
@@ -692,12 +708,61 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_crate_moves_transfer_the_cohort_total() {
+        use crate::debt_moves::DebtMove;
+        let moves = MoveMap::new(&[DebtMove {
+            from: "lane".into(),
+            to: "lane-linux".into(),
+            issue: 673,
+        }])
+        .unwrap();
+        let base = BTreeMap::from([("lane".to_owned(), 28)]);
+        let split = BTreeMap::from([("lane".to_owned(), 6), ("lane-linux".to_owned(), 22)]);
+        assert!(
+            ratchet(&split, &base, &moves).is_ok(),
+            "a mapped move passes"
+        );
+        let grown = BTreeMap::from([("lane".to_owned(), 7), ("lane-linux".to_owned(), 22)]);
+        assert!(
+            ratchet(&grown, &base, &moves).is_err(),
+            "a move that increases the total fails"
+        );
+        assert!(
+            ratchet(&split, &base, &MoveMap::default()).is_err(),
+            "an unmapped new crate fails"
+        );
+        let unrelated = BTreeMap::from([("lane".to_owned(), 6), ("other".to_owned(), 22)]);
+        assert!(ratchet(&unrelated, &base, &moves).is_err());
+    }
+
+    #[test]
     fn monotone_counts_allow_relocation_and_deletion_but_not_growth() {
         let base = BTreeMap::from([("lane".to_owned(), 2)]);
-        assert!(ratchet(&BTreeMap::from([("lane".to_owned(), 1)]), &base).is_ok());
-        assert!(ratchet(&BTreeMap::new(), &base).is_ok());
-        assert!(ratchet(&BTreeMap::from([("lane".to_owned(), 3)]), &base).is_err());
-        assert!(ratchet(&BTreeMap::from([("new-lane".to_owned(), 1)]), &base).is_err());
+        assert!(
+            ratchet(
+                &BTreeMap::from([("lane".to_owned(), 1)]),
+                &base,
+                &MoveMap::default()
+            )
+            .is_ok()
+        );
+        assert!(ratchet(&BTreeMap::new(), &base, &MoveMap::default()).is_ok());
+        assert!(
+            ratchet(
+                &BTreeMap::from([("lane".to_owned(), 3)]),
+                &base,
+                &MoveMap::default()
+            )
+            .is_err()
+        );
+        assert!(
+            ratchet(
+                &BTreeMap::from([("new-lane".to_owned(), 1)]),
+                &base,
+                &MoveMap::default()
+            )
+            .is_err()
+        );
         let relocated = BTreeSet::from(["crates/lane/src/renamed.rs|new_name|live".to_owned()]);
         assert!(validate(&relocated, &BTreeMap::from([("lane".to_owned(), 1)])).is_ok());
     }

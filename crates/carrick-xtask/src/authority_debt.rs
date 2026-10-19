@@ -2,6 +2,7 @@
 //! accepted identities are closed operation/owner/lane cohorts and ceilings.
 use crate::authority_source::SourceCensus;
 use crate::command;
+use crate::debt_moves::{DebtMoves, MoveMap};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -197,11 +198,24 @@ impl AuthorityDebtCeilings {
         }
         Ok(())
     }
-    pub fn ratchet(&self, base: &Self) -> Result<(), DebtError> {
+    /// Compare against the PR base. Cohorts listed in `moves` are compared
+    /// under their destination owner on both sides, so a reviewed move keeps
+    /// its total; unmapped removals and new cohorts stay errors.
+    pub fn ratchet(&self, base: &Self, moves: &MoveMap) -> Result<(), DebtError> {
         self.validate()?;
         base.validate()?;
-        let old: BTreeMap<_, _> = base.counters.iter().map(|c| (c.key(), c.ceiling)).collect();
-        let new: BTreeMap<_, _> = self.counters.iter().map(|c| (c.key(), c.ceiling)).collect();
+        let transfer = |policy: &Self| {
+            moves.transfer(
+                policy.counters.iter().map(|c| (c.key(), c.ceiling)),
+                |key, owner| Key {
+                    owner: owner.to_owned(),
+                    ..key.clone()
+                },
+                |key| key.owner.as_str(),
+            )
+        };
+        let old = transfer(base);
+        let new = transfer(self);
         for (key, ceiling) in &old {
             if *ceiling != 0 && !new.contains_key(key) {
                 return fail(format!("removed nonzero counter: {key:?} = {ceiling}"));
@@ -665,7 +679,10 @@ pub fn run(root: &Path, args: &AuthorityDebtArgs) -> Result<(), DebtError> {
         serde_json::from_slice(&std::fs::read(root.join(CEILINGS_PATH))?)?;
     policy.validate()?;
     if let Some(base) = &base {
-        policy.ratchet(&base_policy(&root, base)?)?;
+        let moves = DebtMoves::load(&root)
+            .and_then(|moves| moves.authority_debt())
+            .map_err(DebtError::Policy)?;
+        policy.ratchet(&base_policy(&root, base)?, &moves)?;
     } else {
         println!(
             "authority debt delta: no change range (no base provided); delta ratchet not applicable"
