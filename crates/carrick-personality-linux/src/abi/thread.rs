@@ -50,7 +50,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 /// Protocol revision, folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 14;
+pub const THREAD_LIFECYCLE_PROTOCOL_VERSION: u64 = 15;
 
 pub use carrick_core::lifecycle::{ClaimedEntry, ExitAdmission, Lifecycle, MemberControlCustody};
 pub use carrick_core_abi::lifecycle::*;
@@ -728,6 +728,231 @@ pub enum HostBirthRefusal {
     Closed(OwedExitWake),
 }
 
+const CLOSING_VERDICT_WORDS: usize = 10;
+
+/// Single-writer seqlock holding the Closing owner's last not-ready verdict.
+#[repr(C)]
+#[derive(::core::fmt::Debug)]
+struct ClosingVerdictRecord {
+    /// 0: never written; odd: a write is in progress.
+    seq: AtomicU64,
+    words: [AtomicU64; CLOSING_VERDICT_WORDS],
+}
+
+impl ClosingVerdictRecord {
+    const fn new() -> Self {
+        Self {
+            seq: AtomicU64::new(0),
+            words: [const { AtomicU64::new(0) }; CLOSING_VERDICT_WORDS],
+        }
+    }
+
+    fn write(&self, verdict: &ClosingVerdict) {
+        let start = self.seq.load(Ordering::Relaxed).wrapping_add(1) | 1;
+        self.seq.store(start, Ordering::Relaxed);
+        fence(Ordering::Release);
+        for (word, value) in self.words.iter().zip(verdict.words) {
+            word.store(value, Ordering::Relaxed);
+        }
+        self.seq.store(start.wrapping_add(1), Ordering::Release);
+    }
+
+    fn read(&self) -> ClosingVerdictRead {
+        // Bounded: a census never waits on the owner.
+        for _ in 0..4 {
+            let before = self.seq.load(Ordering::Acquire);
+            if before == 0 {
+                return ClosingVerdictRead::Never;
+            }
+            if before & 1 != 0 {
+                continue;
+            }
+            let mut words = [0; CLOSING_VERDICT_WORDS];
+            for (value, word) in words.iter_mut().zip(&self.words) {
+                *value = word.load(Ordering::Relaxed);
+            }
+            fence(Ordering::Acquire);
+            if self.seq.load(Ordering::Relaxed) == before {
+                return ClosingVerdictRead::Verdict(ClosingVerdict { words });
+            }
+        }
+        ClosingVerdictRead::Torn
+    }
+}
+
+/// A consistent copy of the owner's last verdict.
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
+pub struct ClosingVerdict {
+    words: [u64; CLOSING_VERDICT_WORDS],
+}
+
+const VERDICT_SETTLE_BLOCKED: u64 = 0;
+const VERDICT_POOL: u64 = 1;
+const VERDICT_ADOPTED: u64 = 2;
+const VERDICT_HOST_BORN: u64 = 3;
+const VERDICT_MEMBER_SET: u64 = 4;
+
+impl ClosingVerdict {
+    fn encode(
+        live: u32,
+        claimed: usize,
+        failure: Option<carrick_core::terminal::ReadinessFailure>,
+    ) -> Self {
+        use carrick_core::lifecycle::MemberExitKind;
+        use carrick_core::terminal::ReadinessFailure;
+        let kind_code = |kind: MemberExitKind| match kind {
+            MemberExitKind::Active => 1,
+            MemberExitKind::InZone => 2,
+            MemberExitKind::HostRetiring => 3,
+            MemberExitKind::Stale => 4,
+        };
+        let receipt = |receipt: Option<carrick_core::terminal::HostThreadRetirementReceipt>| {
+            receipt.map_or([0; 3], |receipt| {
+                [
+                    receipt.task().raw(),
+                    receipt.execution().raw(),
+                    receipt.thread().raw(),
+                ]
+            })
+        };
+        let mut words = [0; CLOSING_VERDICT_WORDS];
+        words[0] = u64::from(live) | (u64::try_from(claimed).unwrap_or(u64::MAX) << 32);
+        let (code, member_kind, index, observed, expected, extra) = match failure {
+            None => (VERDICT_SETTLE_BLOCKED, 0, 0, None, None, 0),
+            Some(ReadinessFailure::Pool {
+                entry,
+                kind,
+                observed,
+                expected,
+            }) => (
+                VERDICT_POOL,
+                kind_code(kind),
+                u64::from(entry.index() as u32),
+                observed,
+                Some(expected),
+                entry.generation(),
+            ),
+            Some(ReadinessFailure::Adopted {
+                position,
+                kind,
+                observed,
+                expected,
+            }) => (
+                VERDICT_ADOPTED,
+                kind_code(kind),
+                position as u64,
+                observed,
+                Some(expected),
+                0,
+            ),
+            Some(ReadinessFailure::HostBorn { index, expected }) => {
+                (VERDICT_HOST_BORN, 0, index as u64, None, Some(expected), 0)
+            }
+            Some(ReadinessFailure::MemberSet {
+                observed_pool,
+                observed_host,
+                expected_pool,
+                expected_host,
+            }) => {
+                let pack = |value: usize| (value as u64) & 0xffff;
+                (
+                    VERDICT_MEMBER_SET,
+                    0,
+                    0,
+                    None,
+                    None,
+                    pack(observed_pool)
+                        | (pack(observed_host) << 16)
+                        | (pack(expected_pool) << 32)
+                        | (pack(expected_host) << 48),
+                )
+            }
+        };
+        words[1] = code
+            | (member_kind << 8)
+            | ((index & 0xffff_ffff) << 16)
+            | (u64::from(observed.is_some()) << 48);
+        words[2..5].copy_from_slice(&receipt(observed));
+        words[5..8].copy_from_slice(&receipt(expected));
+        words[8] = extra;
+        Self { words }
+    }
+}
+
+impl ::core::fmt::Display for ClosingVerdict {
+    fn fmt(&self, out: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        let w = &self.words;
+        let receipt = |base: usize| (w[base], w[base + 1], w[base + 2]);
+        let kind = match (w[1] >> 8) & 0xff {
+            1 => "Active",
+            2 => "InZone",
+            3 => "HostRetiring",
+            4 => "Stale",
+            _ => "-",
+        };
+        let index = (w[1] >> 16) & 0xffff_ffff;
+        let observed = if (w[1] >> 48) & 1 != 0 {
+            let (task, execution, thread) = receipt(2);
+            ::alloc::format!("({task},{execution},{thread})")
+        } else {
+            ::alloc::string::String::from("None")
+        };
+        let (task, execution, thread) = receipt(5);
+        ::core::write!(
+            out,
+            "owner_verdict live={} claimed={} ",
+            w[0] & 0xffff_ffff,
+            w[0] >> 32
+        )?;
+        match w[1] & 0xff {
+            VERDICT_POOL => ::core::write!(
+                out,
+                "first=Pool index={index} generation={} exit_kind={kind} observed={observed} \
+                 expected=({task},{execution},{thread})",
+                w[8]
+            ),
+            VERDICT_ADOPTED => ::core::write!(
+                out,
+                "first=Adopted position={index} exit_kind={kind} observed={observed} \
+                 expected=({task},{execution},{thread})"
+            ),
+            VERDICT_HOST_BORN => ::core::write!(
+                out,
+                "first=HostBorn index={index} expected=({task},{execution},{thread})"
+            ),
+            VERDICT_MEMBER_SET => ::core::write!(
+                out,
+                "first=MemberSet observed_pool={} observed_host={} expected_pool={} \
+                 expected_host={}",
+                w[8] & 0xffff,
+                (w[8] >> 16) & 0xffff,
+                (w[8] >> 32) & 0xffff,
+                w[8] >> 48
+            ),
+            _ => ::core::write!(out, "receipts=complete can_settle=false"),
+        }
+    }
+}
+
+/// What a census read of the owner's verdict found.
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
+pub enum ClosingVerdictRead {
+    Never,
+    /// The owner rewrote it during every bounded attempt.
+    Torn,
+    Verdict(ClosingVerdict),
+}
+
+impl ::core::fmt::Display for ClosingVerdictRead {
+    fn fmt(&self, out: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        match self {
+            Self::Never => out.write_str("owner_verdict=none"),
+            Self::Torn => out.write_str("owner_verdict=torn"),
+            Self::Verdict(verdict) => verdict.fmt(out),
+        }
+    }
+}
+
 /// Census view of a Closing owner's readiness inputs
 /// ([`ThreadLifecyclePage::closing_readiness`]).
 #[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
@@ -822,6 +1047,8 @@ pub struct ThreadLifecyclePage {
     host_born: [HostBornMember; THREAD_POOL_ENTRIES],
     host_birth_mutations: AtomicU32,
     terminal: carrick_core::terminal::ProcessExitCustody,
+    /// The Closing owner's last not-ready readiness verdict (census only).
+    closing_verdict: ClosingVerdictRecord,
 }
 
 const _: () = assert!(core::mem::size_of::<ThreadLifecyclePage>() == THREAD_LIFECYCLE_PAGE_SIZE);
@@ -971,6 +1198,7 @@ impl ThreadLifecyclePage {
             host_born: [const { HostBornMember::new() }; THREAD_POOL_ENTRIES],
             host_birth_mutations: AtomicU32::new(0),
             terminal: carrick_core::terminal::ProcessExitCustody::new(),
+            closing_verdict: ClosingVerdictRecord::new(),
         }
     }
 
@@ -1164,6 +1392,28 @@ impl ThreadLifecyclePage {
             exiting,
             first,
         }
+    }
+
+    /// Record why the Closing owner is about to park instead of settling:
+    /// the page inputs it saw and its first unreturned member observation
+    /// (`None`: every receipt returned but `can_settle` was false). Written
+    /// only on the owner's park path, under its process graph lock (the
+    /// single writer), as a seqlock the census reads without waiting.
+    pub fn record_closing_verdict(
+        &self,
+        failure: Option<carrick_core::terminal::ReadinessFailure>,
+    ) {
+        let census = carrick_core::lifecycle::census(self);
+        self.closing_verdict.write(&ClosingVerdict::encode(
+            census.live,
+            census.claimed,
+            failure,
+        ));
+    }
+
+    /// The owner's last recorded verdict, if a consistent one is readable.
+    pub fn closing_verdict(&self) -> ClosingVerdictRead {
+        self.closing_verdict.read()
     }
 
     pub fn host_birth_receipt_returned(&self, index: usize) -> bool {
@@ -1490,7 +1740,7 @@ impl Default for ThreadLifecyclePage {
 }
 
 /// Layout facts folded into the image ABI layout hash.
-pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 35] = [
+pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 37] = [
     THREAD_LIFECYCLE_PROTOCOL_VERSION,
     core::mem::offset_of!(PoolEntry, execution) as u64,
     core::mem::offset_of!(ThreadLifecyclePage, terminal) as u64,
@@ -1526,6 +1776,8 @@ pub const THREAD_LIFECYCLE_LAYOUT_FACTS: [u64; 35] = [
     ::core::mem::offset_of!(ThreadLifecyclePage, host_born) as u64,
     ::core::mem::offset_of!(ThreadLifecyclePage, host_birth_mutations) as u64,
     ::core::mem::size_of::<HostBornMember>() as u64,
+    ::core::mem::offset_of!(ThreadLifecyclePage, closing_verdict) as u64,
+    ::core::mem::size_of::<ClosingVerdictRecord>() as u64,
 ];
 
 #[cfg(test)]
@@ -1567,6 +1819,52 @@ mod tests {
         assert_eq!(page.claimed_count(), 1);
         page.unclaim(claim).unwrap();
         assert_eq!(page.claimed_count(), 0);
+    }
+
+    #[test]
+    fn closing_verdict_renders_the_owners_last_not_ready_observation() {
+        use carrick_core::lifecycle::MemberExitKind;
+        use carrick_core::terminal::{HostThreadRetirementReceipt, ReadinessFailure};
+        use carrick_core_abi::entry::{EntryGeneration, EntryTaskKey, EntryThreadGeneration};
+        use std::string::ToString;
+        let page = super::ThreadLifecyclePage::new();
+        assert_eq!(page.closing_verdict().to_string(), "owner_verdict=none");
+        let receipt = |execution| {
+            HostThreadRetirementReceipt::from_parts(
+                EntryTaskKey::from_raw(2),
+                EntryGeneration::from_raw(execution),
+                EntryThreadGeneration::from_raw(43),
+            )
+            .unwrap()
+        };
+        page.record_closing_verdict(Some(ReadinessFailure::Adopted {
+            position: 0,
+            kind: MemberExitKind::HostRetiring,
+            observed: Some(receipt(5)),
+            expected: receipt(4263),
+        }));
+        assert_eq!(
+            page.closing_verdict().to_string(),
+            "owner_verdict live=1 claimed=0 first=Adopted position=0 exit_kind=HostRetiring \
+             observed=(2,5,43) expected=(2,4263,43)"
+        );
+        assert!(page.release_live(0).is_ok());
+        page.record_closing_verdict(Some(ReadinessFailure::MemberSet {
+            observed_pool: 0,
+            observed_host: 2,
+            expected_pool: 0,
+            expected_host: 1,
+        }));
+        assert_eq!(
+            page.closing_verdict().to_string(),
+            "owner_verdict live=0 claimed=0 first=MemberSet observed_pool=0 observed_host=2 \
+             expected_pool=0 expected_host=1"
+        );
+        page.record_closing_verdict(None);
+        assert_eq!(
+            page.closing_verdict().to_string(),
+            "owner_verdict live=0 claimed=0 receipts=complete can_settle=false"
+        );
     }
 
     #[test]
@@ -2416,6 +2714,7 @@ mod layout_manifest {
                      host_born: _,
                      host_birth_mutations: _,
                      terminal: _,
+                     closing_verdict: _,
                  }: ThreadLifecyclePage| {};
         field!(ThreadLifecyclePage, gate, AtomicU32, 0, 4, 4);
         field!(ThreadLifecyclePage, live, AtomicU32, 4, 4, 4);
@@ -2464,6 +2763,14 @@ mod layout_manifest {
             1020,
             8,
             4
+        );
+        field!(
+            ThreadLifecyclePage,
+            closing_verdict,
+            ClosingVerdictRecord,
+            1032,
+            88,
+            8
         );
     }
 }
