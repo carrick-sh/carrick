@@ -1479,7 +1479,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
     pub fn service_idle_peer_doorbell(
         &mut self,
         exit: &CarrierRunExit,
-        on_work: impl FnOnce(bool, bool),
+        on_work: impl FnOnce(bool, Option<carrick_el1_abi::HostWorkDoorbell>),
     ) -> Result<Option<PhysicalProcessExit>, TrapError> {
         let CarrierRunExit::PhysicalDoorbell { port, .. } = exit else {
             return Err(fail("idle peer service requires physical doorbell"));
@@ -1557,8 +1557,8 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             self.cpu.clear_child_bindings()?;
         }
         drop(custody);
-        if let Some((served, pending)) = work_flags {
-            on_work(served, pending);
+        if let Some((served, doorbell)) = work_flags {
+            on_work(served, doorbell);
         }
         Ok(exit)
     }
@@ -1702,7 +1702,7 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
         &mut self,
         task: carrick_guest_arch::TaskIdentity,
         exit: &CarrierRunExit,
-        on_work: impl FnOnce(bool, bool),
+        on_work: impl FnOnce(bool, Option<carrick_el1_abi::HostWorkDoorbell>),
     ) -> Result<Option<PhysicalProcessExit>, TrapError> {
         let CarrierRunExit::PhysicalDoorbell { port, .. } = exit else {
             return Err(fail("physical service requires a doorbell exit"));
@@ -1787,8 +1787,8 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuLease<M, Mem> {
             self.cpu.clear_child_bindings()?;
         }
         drop(custody);
-        if let Some((served, pending)) = work_flags {
-            on_work(served, pending);
+        if let Some((served, doorbell)) = work_flags {
+            on_work(served, doorbell);
         }
         Ok(exit)
     }
@@ -1815,7 +1815,9 @@ fn production_port(port: u16) -> Option<ProductionPort> {
     }
 }
 
-fn take_production_work_boundary(task: &CurrentTask) -> Result<(bool, bool), TrapError> {
+fn take_production_work_boundary(
+    task: &CurrentTask,
+) -> Result<(bool, Option<carrick_el1_abi::HostWorkDoorbell>), TrapError> {
     let state = &task.linux;
     let boundary = state.take_served_boundary();
     if matches!(
@@ -1824,11 +1826,11 @@ fn take_production_work_boundary(task: &CurrentTask) -> Result<(bool, bool), Tra
     ) {
         return Err(fail("x86 work boundary cannot replay a completed syscall"));
     }
-    let pending = state.pending_host_work.swap(0, Ordering::AcqRel) != 0;
-    if boundary.is_none() && !pending {
+    let doorbell = state.take_host_work_doorbell();
+    if boundary.is_none() && doorbell.is_none() {
         return Err(fail("x86 work port without owed boundary work"));
     }
-    Ok((boundary.is_some(), pending))
+    Ok((boundary.is_some(), doorbell))
 }
 
 #[cfg(test)]
@@ -1854,13 +1856,14 @@ mod production_work_port_tests {
         peer.linux.record_completed_with_work();
         peer.linux.mark_pending_host_work();
 
-        assert_eq!(
-            take_production_work_boundary(&stopped).unwrap(),
-            (true, true)
-        );
+        let (served, doorbell) = take_production_work_boundary(&stopped).unwrap();
+        assert!(served);
+        doorbell.expect("stopped task doorbell").settled();
         assert!(take_production_work_boundary(&stopped).is_err());
         assert!(peer.linux.has_pending_host_work());
-        assert_eq!(take_production_work_boundary(&peer).unwrap(), (true, true));
+        let (served, doorbell) = take_production_work_boundary(&peer).unwrap();
+        assert!(served);
+        doorbell.expect("peer doorbell").settled();
     }
 }
 

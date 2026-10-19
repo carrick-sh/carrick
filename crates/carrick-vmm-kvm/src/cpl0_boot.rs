@@ -3363,10 +3363,11 @@ impl Cpl0Carrier {
                     {
                         return Err(fail("work exit without completed syscall"));
                     }
-                    self.task(index)
-                        .linux
-                        .pending_host_work
-                        .store(0, Ordering::Release);
+                    // This standalone carrier has no zone or host wake
+                    // owner: its work exit is the whole settlement.
+                    if let Some(doorbell) = self.task(index).linux.take_host_work_doorbell() {
+                        doorbell.settled();
+                    }
                     self.custody.record_work_exit();
                 }
                 _ => return Err(fail(format!("unexpected CPL0 doorbell {port:#x}"))),
