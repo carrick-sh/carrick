@@ -5196,9 +5196,12 @@ mod translated_range_probe_abi {
             Range<HostVa>,
         ) -> Result<TranslatedSharedRange, TranslatedRangeError> = TranslatedSharedRange::shared;
 
-        let private =
-            TranslatedPrivateRange::private(epoch(2), sequence(3), HostVa::new(0x1000)..HostVa::new(0x2000))
-                .unwrap_or_else(|error| unreachable!("valid private range: {error}"));
+        let private = TranslatedPrivateRange::private(
+            epoch(2),
+            sequence(3),
+            HostVa::new(0x1000)..HostVa::new(0x2000),
+        )
+        .unwrap_or_else(|error| unreachable!("valid private range: {error}"));
         let shared = TranslatedSharedRange::shared(
             epoch(2),
             sequence(4),
@@ -5335,8 +5338,13 @@ mod native_owned_range_probe_abi {
             assert!(NativeOwnedRange::new(epoch, sequence, range, 0x4000).is_err());
         }
 
-        let range = NativeOwnedRange::new(epoch, sequence, HostVa::new(0x4000)..HostVa::new(0xc000), 0x4000)
-            .expect("aligned nonempty range");
+        let range = NativeOwnedRange::new(
+            epoch,
+            sequence,
+            HostVa::new(0x4000)..HostVa::new(0xc000),
+            0x4000,
+        )
+        .expect("aligned nonempty range");
         assert_eq!(range.epoch().get(), 7);
         assert_eq!(range.sequence().get(), 2);
         assert_eq!(range.range(), &(HostVa::new(0x4000)..HostVa::new(0xc000)));

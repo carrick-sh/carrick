@@ -183,9 +183,10 @@ fn read_host_pipe_into_owner(
             return Ok(DispatchOutcome::returned_len_or_errno(delivered));
         };
         let page_left = (4096 - (address as usize & 4095)).min(buf.len() - delivered);
-        let Some(range) =
-            carrick_guest_mem::GuestWriteRange::new(carrick_guest_mem::GuestVa::new(address), page_left)
-        else {
+        let Some(range) = carrick_guest_mem::GuestWriteRange::new(
+            carrick_guest_mem::GuestVa::new(address),
+            page_left,
+        ) else {
             return Ok(if delivered > 0 {
                 DispatchOutcome::returned_len_or_errno(delivered)
             } else {

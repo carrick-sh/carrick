@@ -296,9 +296,11 @@ impl TaskMappingIndex {
         let mut prev: Option<(u64, u64)> = None;
         for (va, region) in &self.live {
             debug_assert_eq!(
-                va.raw(), region.start,
+                va.raw(),
+                region.start,
                 "TaskMappingIndex key must be the row start: key=0x{:x} start=0x{:x}",
-                va.raw(), region.start
+                va.raw(),
+                region.start
             );
             debug_assert!(
                 region.start < region.end,
@@ -331,9 +333,11 @@ impl TaskMappingIndex {
         let next = self.live.range(key..).next();
         if let Some((prev_va, prev_row)) = prev {
             debug_assert_eq!(
-                prev_va.raw(), prev_row.start,
+                prev_va.raw(),
+                prev_row.start,
                 "TaskMappingIndex key must be the row start: key=0x{:x} start=0x{:x}",
-                prev_va.raw(), prev_row.start
+                prev_va.raw(),
+                prev_row.start
             );
             debug_assert!(
                 prev_row.start < prev_row.end,
@@ -343,9 +347,11 @@ impl TaskMappingIndex {
             );
             if let Some((next_va, next_row)) = next {
                 debug_assert_eq!(
-                    next_va.raw(), next_row.start,
+                    next_va.raw(),
+                    next_row.start,
                     "TaskMappingIndex key must be the row start: key=0x{:x} start=0x{:x}",
-                    next_va.raw(), next_row.start
+                    next_va.raw(),
+                    next_row.start
                 );
                 debug_assert!(
                     next_row.start < next_row.end,
@@ -365,9 +371,11 @@ impl TaskMappingIndex {
             }
         } else if let Some((next_va, next_row)) = next {
             debug_assert_eq!(
-                next_va.raw(), next_row.start,
+                next_va.raw(),
+                next_row.start,
                 "TaskMappingIndex key must be the row start: key=0x{:x} start=0x{:x}",
-                next_va.raw(), next_row.start
+                next_va.raw(),
+                next_row.start
             );
             debug_assert!(
                 next_row.start < next_row.end,
@@ -1533,7 +1541,9 @@ mod task_mapping_index_tests {
         assert_eq!(index.len(), 2_000);
         let probe = 0x6000_0000 + 1_999 * 0x20_0000;
         assert_eq!(
-            index.candidates_for_range(GuestVa::new(probe), 0x1000).count(),
+            index
+                .candidates_for_range(GuestVa::new(probe), 0x1000)
+                .count(),
             1,
             "an ordered probe must offer only the rows that overlap the query",
         );
@@ -1819,6 +1829,9 @@ mod task_mapping_index_tests {
         let mut candidates = Vec::new();
         index.candidate_starts_overlapping(target_ipa, 0x1000, &mut candidates);
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0], GuestVa::new(0x6000_0000_0000 + 1024 * 0x20_0000));
+        assert_eq!(
+            candidates[0],
+            GuestVa::new(0x6000_0000_0000 + 1024 * 0x20_0000)
+        );
     }
 }

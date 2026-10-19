@@ -9,7 +9,6 @@ pub enum TransferError {
 }
 pub use carrick_guest_arch::GuestVa;
 
-
 /// Owned request position. Suspension never discards already copied bytes.
 pub struct TransferContinuation {
     pub handle: El1MmHandle,

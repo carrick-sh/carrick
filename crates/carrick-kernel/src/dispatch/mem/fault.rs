@@ -190,12 +190,12 @@ impl FirstTouchArming {
     #[cfg(test)]
     pub(crate) fn iter(&self) -> impl Iterator<Item = ResidentFaultRange> + '_ {
         self.extents.iter().filter_map(|(&start, arm)| {
-            carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(arm.end)).map(|range| {
-                ResidentFaultRange {
+            carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(arm.end)).map(
+                |range| ResidentFaultRange {
                     range,
                     prot: arm.prot,
-                }
-            })
+                },
+            )
         })
     }
 }
@@ -322,7 +322,9 @@ impl ResidentFacts {
         let kept = self.within(range.start().raw(), range.end().raw(), live);
         self.remove(range);
         for (start, end) in kept {
-            if let Some(piece) = carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end)) {
+            if let Some(piece) =
+                carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end))
+            {
                 self.insert(piece, owner);
             }
         }
@@ -333,7 +335,9 @@ impl ResidentFacts {
     pub(crate) fn ranges(&self) -> Vec<carrick_vfs::GuestMemoryRange> {
         let mut ranges = Vec::new();
         for (&start, &(end, _)) in &self.facts {
-            if let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end)) {
+            if let Some(range) =
+                carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end))
+            {
                 locked_ranges_insert(&mut ranges, range);
             }
         }
@@ -461,7 +465,9 @@ impl MemState {
             self.resident.insert(piece.range, piece.owner());
             cursor = piece.range.end().raw();
         }
-        if let Some(host) = carrick_vfs::GuestMemoryRange::new(GuestVa::new(cursor), GuestVa::new(end)) {
+        if let Some(host) =
+            carrick_vfs::GuestMemoryRange::new(GuestVa::new(cursor), GuestVa::new(end))
+        {
             self.resident.insert(host, ResidencyOwner::Host);
         }
     }
@@ -701,7 +707,9 @@ impl MemState {
                 end = end.min(blocked_start);
             }
         }
-        let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end)) else {
+        let Some(range) =
+            carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end))
+        else {
             return Ok(None);
         };
         Ok(Some(ResidentFaultRange { range, prot }))
@@ -712,7 +720,8 @@ impl MemState {
     /// (they name retired incarnations); this only reclaims them.
     pub(in crate::dispatch) fn retire_stale_first_touch(&mut self, holes: &[(u64, u64)]) {
         for &(start, end) in holes {
-            let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end))
+            let Some(range) =
+                carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end))
             else {
                 continue;
             };
@@ -753,7 +762,8 @@ impl MemState {
             self.resident
                 .within(range.start().raw(), range.end().raw(), ResidencyOwner::Host)
         {
-            if let Some(resident) = carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end))
+            if let Some(resident) =
+                carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end))
             {
                 locked_ranges_remove(&mut untouched, resident);
             }
@@ -764,7 +774,9 @@ impl MemState {
         for sub in &untouched {
             let (start, end) = (sub.start().raw(), sub.end().raw());
             if let Ok(len) = usize::try_from(end - start) {
-                let _ = self.deferred_anonymous.adopt_pristine(GuestVa::new(start), len);
+                let _ = self
+                    .deferred_anonymous
+                    .adopt_pristine(GuestVa::new(start), len);
             }
         }
         let prot = LinuxProtFlags::from_bits_truncate(piece.protection.bits());
@@ -799,7 +811,8 @@ pub(crate) fn tracked_nonresident_subranges(
         }
         let start = tracked.start().raw().max(range_start);
         let end = tracked.end().raw().min(range_end);
-        let Some(sub) = carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end)) else {
+        let Some(sub) = carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end))
+        else {
             continue;
         };
         // Host tracking answers only for host-owned pages.
@@ -809,9 +822,10 @@ pub(crate) fn tracked_nonresident_subranges(
         }
         for (resident_start, resident_end) in mem.resident.within(start, end, ResidencyOwner::Host)
         {
-            if let Some(resident) =
-                carrick_vfs::GuestMemoryRange::new(GuestVa::new(resident_start), GuestVa::new(resident_end))
-            {
+            if let Some(resident) = carrick_vfs::GuestMemoryRange::new(
+                GuestVa::new(resident_start),
+                GuestVa::new(resident_end),
+            ) {
                 locked_ranges_remove(&mut host, resident);
             }
         }
@@ -826,9 +840,10 @@ pub(crate) fn tracked_nonresident_subranges(
             piece.range.end().raw(),
             piece.owner(),
         ) {
-            if let Some(resident) =
-                carrick_vfs::GuestMemoryRange::new(GuestVa::new(resident_start), GuestVa::new(resident_end))
-            {
+            if let Some(resident) = carrick_vfs::GuestMemoryRange::new(
+                GuestVa::new(resident_start),
+                GuestVa::new(resident_end),
+            ) {
                 locked_ranges_remove(&mut untouched, resident);
             }
         }
@@ -1279,17 +1294,19 @@ impl<'a> MemView<'a> {
     }
 
     pub(in crate::dispatch::mem) fn mark_range_resident(&self, start: u64, len: u64) {
-        if let Some(range) =
-            carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(start.saturating_add(len)))
-        {
+        if let Some(range) = carrick_vfs::GuestMemoryRange::new(
+            GuestVa::new(start),
+            GuestVa::new(start.saturating_add(len)),
+        ) {
             self.mem().lock().record_resident(range);
         }
     }
 
     pub(in crate::dispatch::mem) fn mark_range_nonresident(&self, start: u64, len: u64) {
-        let Some(range) =
-            carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(start.saturating_add(len)))
-        else {
+        let Some(range) = carrick_vfs::GuestMemoryRange::new(
+            GuestVa::new(start),
+            GuestVa::new(start.saturating_add(len)),
+        ) else {
             return;
         };
         let authority = self.mem();
@@ -1641,7 +1658,8 @@ impl<'a> MemView<'a> {
         let Some(end) = plan.page.checked_add(self.linux_page_size()) else {
             return;
         };
-        let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa::new(plan.page), GuestVa::new(end))
+        let Some(range) =
+            carrick_vfs::GuestMemoryRange::new(GuestVa::new(plan.page), GuestVa::new(end))
         else {
             return;
         };

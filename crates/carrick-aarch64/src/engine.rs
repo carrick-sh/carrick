@@ -3123,12 +3123,12 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             })?;
         let page_left = (0x1000 - (va & 0xfff)) as usize;
         let len = (total_len - offset).min(page_left);
-        let ipa = self
-            .syscall_buffer_ipa(GuestVa::new(va), len)
-            .ok_or(MemoryError::OutOfBounds {
-                address,
-                length: total_len,
-            })?;
+        let ipa =
+            self.syscall_buffer_ipa(GuestVa::new(va), len)
+                .ok_or(MemoryError::OutOfBounds {
+                    address,
+                    length: total_len,
+                })?;
         Ok((va, ipa, len))
     }
 }
@@ -3493,12 +3493,11 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         bytes: &[u8],
         intent: carrick_el1_abi::PortalTransferIntent,
     ) -> Result<(), MemoryError> {
-        let range = carrick_guest_mem::GuestWriteRange::new(GuestVa::new(address), bytes.len()).ok_or(
-            MemoryError::OutOfBounds {
+        let range = carrick_guest_mem::GuestWriteRange::new(GuestVa::new(address), bytes.len())
+            .ok_or(MemoryError::OutOfBounds {
                 address,
                 length: bytes.len(),
-            },
-        )?;
+            })?;
         let prepared = self
             .prepare_owner_write(&[range], intent)
             .map_err(|error| match error {
@@ -3807,7 +3806,10 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
                 Err(error) => {
                     let deferred = match self.vm.deferred_anonymous_state() {
                         Some(state) => state
-                            .copy_pristine_file(GuestVa::new(va), &mut out[copied..copied + chunk_len])
+                            .copy_pristine_file(
+                                GuestVa::new(va),
+                                &mut out[copied..copied + chunk_len],
+                            )
                             .map_err(|error| {
                                 MemoryError::HostMap(format!(
                                     "read deferred private file backing: {error}"

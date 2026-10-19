@@ -96,8 +96,9 @@ mod tests {
             &self,
             _deadline: std::time::Instant,
         ) -> Result<crate::kernel::MmBackendSnapshot, crate::kernel::SnapshotError> {
-            let root = crate::kernel::Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa::new(0x1000))
-                .expect("aligned stage-1 root");
+            let root =
+                crate::kernel::Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa::new(0x1000))
+                    .expect("aligned stage-1 root");
             let asid = crate::kernel::Asid::from_registry_allocation(
                 std::num::NonZeroU16::new(1).expect("nonzero test ASID"),
             );

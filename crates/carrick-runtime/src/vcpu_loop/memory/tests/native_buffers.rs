@@ -53,7 +53,10 @@ fn syscall_copyout_updates_carrier_not_private_elf_data() {
         .unwrap();
     assert!(matches!(outcome, DispatchOutcome::Returned { value: 0 }));
     let foreign = foreign_mm(&kernel, &root, &root_lease, fixture.child.task().key());
-    let read = foreign.read_range(GuestVa::new(TEST_VA), 16).unwrap().unwrap();
+    let read = foreign
+        .read_range(GuestVa::new(TEST_VA), 16)
+        .unwrap()
+        .unwrap();
     let mut actual = [0; 16];
     carrick_kernel::kernel::MmAccessAuthority::new()
         .read_foreign(&foreign, read, &mut actual)
@@ -532,9 +535,13 @@ fn current_copyout_rechecks_live_leaf_and_protection_tracker() {
 fn current_copies_cross_compounds_and_preserve_source() {
     use carrick_vmm_hvf::trap::foreign_cow_test_support::FixtureShape;
     let (kernel, root) = bootstrap(38_800);
-    let shape =
-        FixtureShape::with_data(Gpa::new(0x9a01_4000_0000), Gpa::new(0x9b01_4000_0000), TEST_VA, 32768)
-            .unwrap();
+    let shape = FixtureShape::with_data(
+        Gpa::new(0x9a01_4000_0000),
+        Gpa::new(0x9b01_4000_0000),
+        TEST_VA,
+        32768,
+    )
+    .unwrap();
     let fixture = production_cow_fixture_with_shape(
         &kernel,
         &root,
@@ -833,7 +840,12 @@ fn current_read_window_rechecks_live_carrier_authorities() {
             })
             .unwrap();
         let mut bytes = [0; 4];
-        let result = window.copy_into(&fixture.child, &execution, GuestVa::new(TEST_VA), &mut bytes);
+        let result = window.copy_into(
+            &fixture.child,
+            &execution,
+            GuestVa::new(TEST_VA),
+            &mut bytes,
+        );
         // Read-only leaves and write-only denial preserve readable input. A
         // distinct page-table authority with readable leaves is also valid.
         assert_eq!(
@@ -881,7 +893,12 @@ fn current_read_window_observes_changed_bytes_and_rejects_other_ranges_and_lease
         .unwrap();
     let mut bytes = [0; 4];
     window
-        .copy_into(&fixture.child, &execution, GuestVa::new(TEST_VA), &mut bytes)
+        .copy_into(
+            &fixture.child,
+            &execution,
+            GuestVa::new(TEST_VA),
+            &mut bytes,
+        )
         .unwrap();
     assert_eq!(bytes, *b"next", "window must never cache bytes");
     for va in [TEST_VA - 1, TEST_VA + 253, u64::MAX - 1] {
@@ -959,10 +976,16 @@ fn current_read_window_uses_live_leaf_after_guest_publication() {
         })
         .unwrap();
     let mut bytes = [0; 4];
-    let cached = window.copy_into(&fixture.child, &execution, GuestVa::new(TEST_VA), &mut bytes);
-    let prepared = fixture
-        .child
-        .prepare_current_read_window(&execution, GuestVa::new(TEST_VA), 256);
+    let cached = window.copy_into(
+        &fixture.child,
+        &execution,
+        GuestVa::new(TEST_VA),
+        &mut bytes,
+    );
+    let prepared =
+        fixture
+            .child
+            .prepare_current_read_window(&execution, GuestVa::new(TEST_VA), 256);
     drop(current);
     fixture
         .child
@@ -1053,8 +1076,13 @@ fn current_read_window_rejects_vma_revocation_and_cow_replacement() {
         .unwrap();
     let mut bytes = [0; 4];
     assert!(
-        old.copy_into(&fixture.child, &execution, GuestVa::new(TEST_VA), &mut bytes)
-            .is_err()
+        old.copy_into(
+            &fixture.child,
+            &execution,
+            GuestVa::new(TEST_VA),
+            &mut bytes
+        )
+        .is_err()
     );
     let window = fixture
         .child
@@ -1077,7 +1105,12 @@ fn current_read_window_rejects_vma_revocation_and_cow_replacement() {
             });
         assert!(
             window
-                .copy_into(&fixture.child, &execution, GuestVa::new(TEST_VA), &mut bytes)
+                .copy_into(
+                    &fixture.child,
+                    &execution,
+                    GuestVa::new(TEST_VA),
+                    &mut bytes
+                )
                 .is_err()
         );
         let result = fixture.child.copy_current_into_cached(

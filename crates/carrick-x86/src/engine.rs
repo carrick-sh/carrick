@@ -344,12 +344,12 @@ impl<V: X86Vmm> X86EngineCore<V> {
             })?;
         let page_left = (0x1000 - (va & 0xfff)) as usize;
         let len = (total_len - offset).min(page_left);
-        let gpa = self
-            .syscall_buffer_gpa(GuestVa::new(va), len)
-            .ok_or(MemoryError::OutOfBounds {
-                address,
-                length: total_len,
-            })?;
+        let gpa =
+            self.syscall_buffer_gpa(GuestVa::new(va), len)
+                .ok_or(MemoryError::OutOfBounds {
+                    address,
+                    length: total_len,
+                })?;
         Ok((va, gpa, len))
     }
 

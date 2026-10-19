@@ -2062,7 +2062,10 @@ mod tests {
         let (child, _backend, _owner, child_bytes, _counters) =
             cow_fixture(&kernel, &root, 31_081, MockCowFault::None);
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
-        let range = foreign.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
+        let range = foreign
+            .write_range(GuestVa::new(0x3000), 4)
+            .unwrap()
+            .unwrap();
 
         with_foreign_mutation(&foreign, |mutation| {
             let mut cow = super::MmAccessAuthority::new()
@@ -2101,7 +2104,10 @@ mod tests {
         let (child, _backend, _owner, _bytes, counters) =
             cow_fixture(&kernel, &root, 31_401, MockCowFault::None);
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
-        let range = foreign.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
+        let range = foreign
+            .write_range(GuestVa::new(0x3000), 4)
+            .unwrap()
+            .unwrap();
         with_foreign_mutation(&foreign, |mutation| {
             let _ = super::MmAccessAuthority::new().break_foreign_cow(mutation, &foreign, range);
         });
@@ -2143,7 +2149,10 @@ mod tests {
             let (target, _backend, _owner, _bytes, _counters) =
                 cow_fixture(&kernel, &root, 31_087 + index as i32, fault);
             let target = foreign_mm(&kernel, &root, &execution, target.task().key());
-            let range = target.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
+            let range = target
+                .write_range(GuestVa::new(0x3000), 4)
+                .unwrap()
+                .unwrap();
             with_foreign_mutation(&target, |mutation| {
                 assert!(matches!(
                     super::MmAccessAuthority::new().break_foreign_cow(mutation, &target, range,),
@@ -2169,7 +2178,10 @@ mod tests {
             let (target, _backend, _owner, _bytes, _counters) =
                 cow_fixture(&kernel, &root, 31_097 + index as i32, fault);
             let target = foreign_mm(&kernel, &root, &execution, target.task().key());
-            let range = target.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
+            let range = target
+                .write_range(GuestVa::new(0x3000), 4)
+                .unwrap()
+                .unwrap();
             with_foreign_mutation(&target, |mutation| {
                 assert!(matches!(
                     super::MmAccessAuthority::new().break_foreign_cow(mutation, &target, range,),
@@ -2186,7 +2198,10 @@ mod tests {
         let (child, _backend, _owner, bytes, counters) =
             cow_fixture(&kernel, &root, 31_131, MockCowFault::InflatedSemanticSpan);
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
-        let range = foreign.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
+        let range = foreign
+            .write_range(GuestVa::new(0x3000), 4)
+            .unwrap()
+            .unwrap();
 
         with_foreign_mutation(&foreign, |mutation| {
             assert!(matches!(
@@ -2215,7 +2230,10 @@ mod tests {
             let (child, _backend, _owner, _bytes, _counters) =
                 cow_fixture(&kernel, &root, 31_091 + index as i32, fault);
             let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
-            let range = foreign.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
+            let range = foreign
+                .write_range(GuestVa::new(0x3000), 4)
+                .unwrap()
+                .unwrap();
             with_foreign_mutation(&foreign, |mutation| {
                 assert!(matches!(
                     super::MmAccessAuthority::new().break_foreign_cow(mutation, &foreign, range,),
@@ -2237,7 +2255,10 @@ mod tests {
                 MockCowFault::None,
             );
             let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
-            let range = foreign.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
+            let range = foreign
+                .write_range(GuestVa::new(0x3000), 4)
+                .unwrap()
+                .unwrap();
             with_foreign_mutation(&foreign, |mutation| {
                 let mut cow = super::MmAccessAuthority::new()
                     .break_foreign_cow(mutation, &foreign, range)
@@ -2256,7 +2277,10 @@ mod tests {
         let (child, _backend, owner, bytes, _counters) =
             cow_fixture(&kernel, &root, 31_141, MockCowFault::None);
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
-        let range = foreign.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
+        let range = foreign
+            .write_range(GuestVa::new(0x3000), 4)
+            .unwrap()
+            .unwrap();
         with_foreign_mutation(&foreign, |mutation| {
             let mut cow = super::MmAccessAuthority::new()
                 .break_foreign_cow(mutation, &foreign, range)
@@ -2285,7 +2309,10 @@ mod tests {
             );
             let child_execution = execution_lease(&child, 200 + domain as u64);
             let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
-            let range = foreign.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
+            let range = foreign
+                .write_range(GuestVa::new(0x3000), 4)
+                .unwrap()
+                .unwrap();
             with_foreign_mutation(&foreign, |mutation| {
                 let mut cow = super::MmAccessAuthority::new()
                     .break_foreign_cow(mutation, &foreign, range)
@@ -2333,7 +2360,10 @@ mod tests {
         let (child, _backend, _owner, bytes, counters) =
             cow_fixture(&kernel, &root, 31_146, MockCowFault::None);
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
-        let range = foreign.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
+        let range = foreign
+            .write_range(GuestVa::new(0x3000), 4)
+            .unwrap()
+            .unwrap();
 
         let receipt = with_foreign_mutation(&foreign, |mutation| {
             let mut cow = super::MmAccessAuthority::new()
@@ -2358,7 +2388,10 @@ mod tests {
         let (child, _backend, _owner, bytes, counters) =
             cow_fixture(&kernel, &root, 31_151, MockCowFault::PostCopyError);
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
-        let range = foreign.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
+        let range = foreign
+            .write_range(GuestVa::new(0x3000), 4)
+            .unwrap()
+            .unwrap();
 
         let result: Result<super::ForeignWriteReceipt, super::MmAccessError> =
             with_foreign_mutation(&foreign, |mutation| {
@@ -2395,7 +2428,10 @@ mod tests {
         let (child, _backend, _owner, bytes, counters) =
             cow_fixture(&kernel, &root, 31_161, MockCowFault::WrongWriteReceipt);
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
-        let range = foreign.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
+        let range = foreign
+            .write_range(GuestVa::new(0x3000), 4)
+            .unwrap()
+            .unwrap();
 
         let result: Result<super::ForeignWriteReceipt, super::MmAccessError> =
             with_foreign_mutation(&foreign, |mutation| {
@@ -2431,7 +2467,10 @@ mod tests {
             MockCowFault::AdvancedBackendAfterWrite,
         );
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
-        let range = foreign.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
+        let range = foreign
+            .write_range(GuestVa::new(0x3000), 4)
+            .unwrap()
+            .unwrap();
 
         let result: Result<super::ForeignWriteReceipt, super::MmAccessError> =
             with_foreign_mutation(&foreign, |mutation| {
@@ -2465,9 +2504,18 @@ mod tests {
             cow_fixture(&kernel, &root, 31_181, MockCowFault::None);
         *child_bytes.lock() = parent_bytes.clone();
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
-        let compound_range = foreign.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
-        let first_range = foreign.write_range(GuestVa::new(0x3000), 4).unwrap().unwrap();
-        let second_range = foreign.write_range(GuestVa::new(0x3004), 4).unwrap().unwrap();
+        let compound_range = foreign
+            .write_range(GuestVa::new(0x3000), 4)
+            .unwrap()
+            .unwrap();
+        let first_range = foreign
+            .write_range(GuestVa::new(0x3000), 4)
+            .unwrap()
+            .unwrap();
+        let second_range = foreign
+            .write_range(GuestVa::new(0x3004), 4)
+            .unwrap()
+            .unwrap();
 
         with_foreign_mutation(&foreign, |mutation| {
             let mut cow = super::MmAccessAuthority::new()
@@ -2915,8 +2963,14 @@ mod tests {
         assert!(token.read_range(GuestVa::new(0x4ff0), 0x20).is_err());
         assert!(token.read_range(GuestVa::new(u64::MAX - 7), 16).is_err());
         assert!(token.read_range(GuestVa::new(0x5000), 16).is_err());
-        assert!(matches!(token.read_range(GuestVa::new(0x5000), 0), Ok(None)));
-        assert!(matches!(token.write_range(GuestVa::new(u64::MAX), 0), Ok(None)));
+        assert!(matches!(
+            token.read_range(GuestVa::new(0x5000), 0),
+            Ok(None)
+        ));
+        assert!(matches!(
+            token.write_range(GuestVa::new(u64::MAX), 0),
+            Ok(None)
+        ));
     }
 
     #[test]
@@ -3016,7 +3070,10 @@ mod tests {
             transport,
         );
         let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
-        let range = foreign.read_range(GuestVa::new(0x1000), 4).unwrap().unwrap();
+        let range = foreign
+            .read_range(GuestVa::new(0x1000), 4)
+            .unwrap()
+            .unwrap();
         let mut bytes = [0_u8; 4];
 
         assert!(matches!(
@@ -3045,7 +3102,10 @@ mod tests {
                 transport,
             );
             let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
-            let range = foreign.read_range(GuestVa::new(0x1000), 4).unwrap().unwrap();
+            let range = foreign
+                .read_range(GuestVa::new(0x1000), 4)
+                .unwrap()
+                .unwrap();
             let mut bytes = [0_u8; 4];
             let start = Instant::now();
             let ticks = std::cell::Cell::new(0_u32);

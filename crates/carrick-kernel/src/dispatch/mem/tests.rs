@@ -21,7 +21,8 @@ use std::cell::{Cell, RefCell};
 #[test]
 fn locked_ranges_insert_keeps_the_set_sorted_and_merged() {
     fn range(start: u64, end: u64) -> carrick_vfs::GuestMemoryRange {
-        carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end)).expect("valid range")
+        carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(end))
+            .expect("valid range")
     }
     fn pairs(ranges: &[carrick_vfs::GuestMemoryRange]) -> Vec<(u64, u64)> {
         ranges

@@ -791,7 +791,11 @@ mod tests {
         assert_eq!(bytes, [7; 4]);
         state.reserve_fresh(GuestVa::new(0x1000), 0x1000).unwrap();
         assert!(state.snapshot().zero_read_resident.is_empty());
-        assert!(state.reserve_fresh(GuestVa::new(u64::MAX - 4095), 4096).is_err());
+        assert!(
+            state
+                .reserve_fresh(GuestVa::new(u64::MAX - 4095), 4096)
+                .is_err()
+        );
         assert!(state.retire(GuestVa::new(1), 4096).is_err());
         assert!(state.retire(GuestVa::new(0), 0).is_err());
     }
@@ -801,7 +805,11 @@ mod tests {
         state.reserve_fresh(GuestVa::new(0x1000), 0x3000).unwrap();
         let child = state.fork_private();
         let before = state.snapshot();
-        drop(state.begin_materialization(GuestVa::new(0x2000), 4096).unwrap());
+        drop(
+            state
+                .begin_materialization(GuestVa::new(0x2000), 4096)
+                .unwrap(),
+        );
         assert_eq!(state.snapshot(), before);
         state
             .begin_materialization(GuestVa::new(0x2000), 4096)
@@ -855,7 +863,9 @@ mod tests {
     fn rolled_back_materializer_orders_before_zero_reader() {
         let state = std::sync::Arc::new(DeferredAnonymousState::new());
         state.reserve_fresh(GuestVa::new(0x1000), 4096).unwrap();
-        let guard = state.begin_materialization(GuestVa::new(0x1000), 4096).unwrap();
+        let guard = state
+            .begin_materialization(GuestVa::new(0x1000), 4096)
+            .unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let child = state.clone();
         let reader = std::thread::spawn(move || {
@@ -878,7 +888,9 @@ mod tests {
     fn committed_materializer_orders_before_reader() {
         let state = std::sync::Arc::new(DeferredAnonymousState::new());
         state.reserve_fresh(GuestVa::new(0x1000), 4096).unwrap();
-        let guard = state.begin_materialization(GuestVa::new(0x1000), 4096).unwrap();
+        let guard = state
+            .begin_materialization(GuestVa::new(0x1000), 4096)
+            .unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let child = state.clone();
         let reader = std::thread::spawn(move || {

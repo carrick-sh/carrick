@@ -2157,7 +2157,10 @@ impl HvfTaskState {
         if carrier_initial_arena_retired().swap(true, std::sync::atomic::Ordering::AcqRel) {
             return Ok(());
         }
-        let Some(mapping) = self.mappings.get(&GuestVa::new(crate::memory::LINUX_MMAP_BASE)) else {
+        let Some(mapping) = self
+            .mappings
+            .get(&GuestVa::new(crate::memory::LINUX_MMAP_BASE))
+        else {
             return Ok(());
         };
         if mapping.end

@@ -1419,7 +1419,8 @@ fn replacement_commit_trims_every_predecessor_classification_to_prefix_and_suffi
         vec![(start, page), (middle + page, page)]
     );
     let expected_ranges = vec![
-        carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(middle)).expect("prefix"),
+        carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(middle))
+            .expect("prefix"),
         carrick_vfs::GuestMemoryRange::new(GuestVa::new(middle + page), GuestVa::new(start + len))
             .expect("suffix"),
     ];
@@ -1612,8 +1613,9 @@ fn host_alias_abort_preserves_replaced_vma_lock_residency_bus_and_seal_metadata(
     let dispatcher = SyscallDispatcher::new();
     let start = crate::memory::LINUX_HIGH_VA_THRESHOLD;
     let len = LINUX_PAGE_SIZE * 2;
-    let replacement = carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(start + len))
-        .expect("replacement range");
+    let replacement =
+        carrick_vfs::GuestMemoryRange::new(GuestVa::new(start), GuestVa::new(start + len))
+            .expect("replacement range");
     dispatcher.record_dynamic_mapping(
         start,
         len,

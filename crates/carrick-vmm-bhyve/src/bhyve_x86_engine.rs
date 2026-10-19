@@ -1173,13 +1173,19 @@ impl BhyveVmm {
         // SAFETY: map_gpa proved the live PML4 window is mapped.
         unsafe { std::ptr::copy_nonoverlapping(host, tables.as_mut_ptr(), tables.len()) };
         let mut mgr = Pml4Manager::new(tables, X86_PML4_GPA);
-        mgr.map_aliased(GuestVa::new(va & !0xFFF), Gpa::new(gpa), span as u64, true, true)
-            .map_err(|_| {
-                RepointPrivateError::clean(MemoryError::OutOfBounds {
-                    address: va,
-                    length: span,
-                })
-            })?;
+        mgr.map_aliased(
+            GuestVa::new(va & !0xFFF),
+            Gpa::new(gpa),
+            span as u64,
+            true,
+            true,
+        )
+        .map_err(|_| {
+            RepointPrivateError::clean(MemoryError::OutOfBounds {
+                address: va,
+                length: span,
+            })
+        })?;
         // SAFETY: both windows are X86_PML4_CAPACITY bytes. This is the
         // guest-visible publication point.
         unsafe { std::ptr::copy_nonoverlapping(mgr.bytes().as_ptr(), host, X86_PML4_CAPACITY) };
@@ -2047,11 +2053,17 @@ impl X86Vmm for BhyveVmm {
         self.with_live_pml4(|mgr| {
             // exec=true: the caller's `protect_range`/`set_rw` re-applies the prot
             // (incl. NX); the leaf itself stays executable here.
-            mgr.map_aliased(GuestVa::new(base), Gpa::new(gpa), span as u64, writable, true)
-                .map_err(|_| MemoryError::OutOfBounds {
-                    address: base,
-                    length: span,
-                })?;
+            mgr.map_aliased(
+                GuestVa::new(base),
+                Gpa::new(gpa),
+                span as u64,
+                writable,
+                true,
+            )
+            .map_err(|_| MemoryError::OutOfBounds {
+                address: base,
+                length: span,
+            })?;
             Ok(true)
         })
     }

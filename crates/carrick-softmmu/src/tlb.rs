@@ -5,10 +5,10 @@
 use core::mem::size_of;
 
 use crate::domains::{
-    Access, Cpl, CpuAccessMode, GuestVa, PAGE_BASE_MASK_4K, PAGE_SHIFT_4K, PAGE_SIZE_4K,
-    X86Page4K, crosses_page_4k, page_base_4k,
+    Access, Cpl, CpuAccessMode, GuestVa, PAGE_BASE_MASK_4K, PAGE_SHIFT_4K, PAGE_SIZE_4K, X86Page4K,
+    crosses_page_4k, page_base_4k,
 };
-use crate::placement::{HostVa, X86HostPage4K, host_page_base_4k};
+use crate::placement::{HostVa, host_page_base_4k};
 
 pub const SOFT_TLB_BITS: u32 = 10;
 pub const SOFT_TLB_ENTRIES: usize = 1 << SOFT_TLB_BITS;
