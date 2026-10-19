@@ -76,13 +76,17 @@ pub(crate) struct KvmPersistentExecutorFactory {
     dispatcher: Arc<Mutex<SyscallDispatcher>>,
     reporter: Arc<CompatReporter>,
     completed: mpsc::Sender<Result<InitialProcessExit, String>>,
-    exits: Arc<AtomicUsize>,
-    max_exits: usize,
+    loaded_exits: Arc<AtomicUsize>,
+    idle_exits: Arc<AtomicUsize>,
+    total_exits: Arc<AtomicUsize>,
+    max_loaded_exits: usize,
+    max_idle_exits: usize,
     stats: Arc<KvmForwardStats>,
     scheduler: Arc<Scheduler>,
     root_binding: Arc<KvmTaskBinding>,
     host_objects: Arc<Mutex<[u32; 3]>>,
     bound_host_fds: Arc<BoundHostFds>,
+    loaded_pre_entry_hook: Option<LoadedPreEntryHook>,
 }
 
 enum BoundReadiness {
@@ -267,11 +271,15 @@ pub(crate) struct KvmPersistentExecutorConfig {
     pub(crate) dispatcher: Arc<Mutex<SyscallDispatcher>>,
     pub(crate) reporter: Arc<CompatReporter>,
     pub(crate) completed: mpsc::Sender<Result<InitialProcessExit, String>>,
-    pub(crate) max_exits: usize,
+    pub(crate) max_loaded_exits: usize,
+    pub(crate) max_idle_exits: usize,
     pub(crate) stats: Arc<KvmForwardStats>,
     pub(crate) scheduler: Arc<Scheduler>,
     pub(crate) root_binding: Arc<KvmTaskBinding>,
+    pub(crate) loaded_pre_entry_hook: Option<LoadedPreEntryHook>,
 }
+
+pub(crate) type LoadedPreEntryHook = crate::prepare::KvmLoadedPreEntryHook;
 
 impl KvmPersistentExecutorFactory {
     pub(crate) fn new(config: KvmPersistentExecutorConfig) -> Result<Self, TrapError> {
@@ -291,13 +299,17 @@ impl KvmPersistentExecutorFactory {
             dispatcher: config.dispatcher,
             reporter: config.reporter,
             completed: config.completed,
-            exits: Arc::new(AtomicUsize::new(0)),
-            max_exits: config.max_exits,
+            loaded_exits: Arc::new(AtomicUsize::new(0)),
+            idle_exits: Arc::new(AtomicUsize::new(0)),
+            total_exits: Arc::new(AtomicUsize::new(0)),
+            max_loaded_exits: config.max_loaded_exits,
+            max_idle_exits: config.max_idle_exits,
             stats: config.stats,
             scheduler: config.scheduler,
             root_binding: config.root_binding,
             host_objects: Arc::new(Mutex::new([1; 3])),
             bound_host_fds,
+            loaded_pre_entry_hook: config.loaded_pre_entry_hook,
         })
     }
 }
@@ -327,8 +339,11 @@ impl PersistentExecutorFactory for KvmPersistentExecutorFactory {
             dispatcher: Arc::clone(&self.dispatcher),
             reporter: Arc::clone(&self.reporter),
             completed: self.completed.clone(),
-            exits: Arc::clone(&self.exits),
-            max_exits: self.max_exits,
+            loaded_exits: Arc::clone(&self.loaded_exits),
+            idle_exits: Arc::clone(&self.idle_exits),
+            total_exits: Arc::clone(&self.total_exits),
+            max_loaded_exits: self.max_loaded_exits,
+            max_idle_exits: self.max_idle_exits,
             stats: Arc::clone(&self.stats),
             scheduler: Arc::clone(&self.scheduler),
             root_binding: Arc::clone(&self.root_binding),
@@ -339,6 +354,7 @@ impl PersistentExecutorFactory for KvmPersistentExecutorFactory {
             host_objects: Arc::clone(&self.host_objects),
             bound_host_fds: Arc::clone(&self.bound_host_fds),
             idle_kick: carrick_vmm_kvm::KvmKickHandle::for_current_thread(),
+            loaded_pre_entry_hook: self.loaded_pre_entry_hook.clone(),
         })
     }
 }
@@ -349,8 +365,11 @@ pub(crate) struct KvmPersistentExecutor {
     dispatcher: Arc<Mutex<SyscallDispatcher>>,
     reporter: Arc<CompatReporter>,
     completed: mpsc::Sender<Result<InitialProcessExit, String>>,
-    exits: Arc<AtomicUsize>,
-    max_exits: usize,
+    loaded_exits: Arc<AtomicUsize>,
+    idle_exits: Arc<AtomicUsize>,
+    total_exits: Arc<AtomicUsize>,
+    max_loaded_exits: usize,
+    max_idle_exits: usize,
     stats: Arc<KvmForwardStats>,
     scheduler: Arc<Scheduler>,
     root_binding: Arc<KvmTaskBinding>,
@@ -360,6 +379,7 @@ pub(crate) struct KvmPersistentExecutor {
     completion_sent: bool,
     host_objects: Arc<Mutex<[u32; 3]>>,
     bound_host_fds: Arc<BoundHostFds>,
+    loaded_pre_entry_hook: Option<LoadedPreEntryHook>,
 }
 
 struct RetainedForward {
@@ -672,13 +692,9 @@ impl KvmPersistentExecutor {
                     ));
                 }
                 if let Some(host_fd) = object.host_fd() {
-                    if !authority.may_use_host_task_context() {
-                        return refuse(ForwardAuthorityRefusal::HostTaskContext { native: 1 });
-                    }
                     let fd_arg = u64::try_from(host_fd.raw()).map_err(|_| {
                         TrapError::Hypervisor("negative host object write fd".into())
                     })?;
-                    let kernel = binding.fresh_context()?;
                     let SyscallNorm::Plain(raw) =
                         X8664GuestArch::normalize_syscall(&carrick_guest_mem::X8664SyscallFrame {
                             rax: 1,
@@ -694,6 +710,12 @@ impl KvmPersistentExecutor {
                             "unexpected arch_prctl normalizing x86 write".into(),
                         ));
                     };
+                    if !authority.may_use_host_task_context() {
+                        return refuse(ForwardAuthorityRefusal::HostTaskContext {
+                            native: raw.native_number.0,
+                        });
+                    }
+                    let kernel = binding.fresh_context()?;
                     let request =
                         SyscallRequest::from_raw(raw).with_current_guest_sp(Some(frame.rsp));
                     let outcome = dispatcher
@@ -1056,20 +1078,33 @@ impl KvmPersistentExecutor {
                 }
             }
         }
-        let exited = self
-            .exits
+        let lane_exited = self
+            .loaded_exits
             .fetch_add(1, Ordering::AcqRel)
             .checked_add(1)
             .ok_or_else(|| TrapError::Hypervisor("KVM exit count overflow".into()))?;
-        if exited > self.max_exits {
+        if lane_exited > self.max_loaded_exits {
             return Err(TrapError::Hypervisor(
                 "loaded KVM lane guest exit budget exceeded".into(),
             ));
         }
-        let stopped =
-            self.physical.cpu_mut().run_loaded(task).map_err(|error| {
-                TrapError::Hypervisor(format!("KVM stopped run boundary: {error}"))
-            })?;
+        let exited = self
+            .total_exits
+            .fetch_add(1, Ordering::AcqRel)
+            .checked_add(1)
+            .ok_or_else(|| TrapError::Hypervisor("KVM total exit count overflow".into()))?;
+        self.physical.arm_loaded_kick(task, &self.idle_kick)?;
+        if let Some(hook) = self.loaded_pre_entry_hook.take() {
+            hook(need_resched, &self.idle_kick);
+        }
+        if need_resched.load(Ordering::Acquire) {
+            self.idle_kick.disarm_run();
+            return Ok(ExecutorExit::Preempted);
+        }
+        let stopped = self.physical.cpu_mut().run_loaded(task);
+        self.idle_kick.disarm_run();
+        let stopped = stopped
+            .map_err(|error| TrapError::Hypervisor(format!("KVM stopped run boundary: {error}")))?;
         match &stopped.exit {
             CarrierRunExit::PhysicalDoorbell { .. } => {
                 let binding = self.binding.as_ref().ok_or_else(|| {
@@ -1132,22 +1167,27 @@ impl KvmPersistentExecutor {
                             );
                         })?
                 {
-                    let exits = self.exits.load(Ordering::Acquire);
+                    let exits = self.total_exits.load(Ordering::Acquire);
                     self.publish_exit(status.into_initial_process_exit(exits))?;
                 }
                 Ok(GuestIdleExit::Idle)
             }
             CarrierRunExit::SyscallTrap => {
-                let exited = self
-                    .exits
+                let lane_exited = self
+                    .idle_exits
                     .fetch_add(1, Ordering::AcqRel)
                     .checked_add(1)
                     .ok_or_else(|| TrapError::Hypervisor("KVM exit count overflow".into()))?;
-                if exited > self.max_exits {
+                if lane_exited > self.max_idle_exits {
                     return Err(TrapError::Hypervisor(
                         "idle KVM lane guest exit budget exceeded".into(),
                     ));
                 }
+                let exited = self
+                    .total_exits
+                    .fetch_add(1, Ordering::AcqRel)
+                    .checked_add(1)
+                    .ok_or_else(|| TrapError::Hypervisor("KVM total exit count overflow".into()))?;
                 let task = self.physical.idle_peer_task()?;
                 self.service_syscall_trap(task, exited, None)?;
                 Ok(GuestIdleExit::Idle)
@@ -1322,7 +1362,7 @@ impl PersistentExecutor for KvmPersistentExecutor {
     }
 
     fn disarm_guest_idle(&mut self) {
-        self.idle_kick.disarm_idle_run();
+        self.idle_kick.disarm_run();
     }
 
     fn wait_in_guest(&mut self) -> Result<GuestIdleExit, TrapError> {
@@ -1566,8 +1606,10 @@ mod tests {
     use carrick_kernel::kernel::{Kernel, KernelContext, LinuxSignal, RootBootstrap, Scheduler};
     use std::sync::Arc;
 
+    /// Predicate witness only: a behavioural host-fd refusal needs an
+    /// in-zone child that can own a host fd, tracked by #599 and #586.
     #[test]
-    fn in_zone_child_host_fd_write_cannot_use_root_task_context() {
+    fn in_zone_child_host_fd_write_predicate_refuses_root_task_context() {
         assert!(ForwardAuthority::Task.may_use_host_task_context());
         assert!(!ForwardAuthority::InZoneChild.may_use_host_task_context());
     }

@@ -655,8 +655,8 @@ pub(crate) struct KvmX86RestoreState {
 }
 
 impl KvmVcpu {
-    pub(crate) fn arm_idle_kick(&mut self, kick: &crate::KvmKickHandle) {
-        kick.arm_idle_run(&mut self.fd_mut().get_kvm_run().immediate_exit);
+    pub(crate) fn arm_run_kick(&mut self, kick: &crate::KvmKickHandle) {
+        kick.arm_run(&mut self.fd_mut().get_kvm_run().immediate_exit);
     }
     /// The live vcpu fd. Present from construction to drop (the `Option` only
     /// exists so `Drop` can move the fd into the recycle pool); the None arm

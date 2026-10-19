@@ -236,8 +236,16 @@ pub fn run_prepared_kvm_pool(
     max_traps: usize,
 ) -> Result<PreparedKvmPoolOutcome, RuntimeError> {
     let debug_server = install_kvm_debug_server(&dispatcher);
-    run_prepared_kvm_pool_with_debug(machine, root_context, dispatcher, max_traps, debug_server)
-        .map_err(|failure| failure.error)
+    run_prepared_kvm_pool_with_debug(
+        machine,
+        root_context,
+        dispatcher,
+        max_traps,
+        debug_server,
+        None,
+        None,
+    )
+    .map_err(|failure| failure.error)
 }
 
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
@@ -247,8 +255,45 @@ pub fn try_run_prepared_kvm_pool(
     dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
     max_traps: usize,
 ) -> Result<PreparedKvmPoolOutcome, PreparedKvmPoolFailure> {
-    run_prepared_kvm_pool_with_debug(machine, root_context, dispatcher, max_traps, None)
+    run_prepared_kvm_pool_with_debug(
+        machine,
+        root_context,
+        dispatcher,
+        max_traps,
+        None,
+        None,
+        None,
+    )
 }
+
+/// Run the production KVM pool with one fixture callback at the loaded
+/// lane's armed pre-entry boundary.
+#[doc(hidden)]
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+pub fn try_run_prepared_kvm_pool_with_loaded_pre_entry_hook(
+    machine: carrick_vmm_kvm::cpl0_boot::Cpl0Carrier,
+    root_context: carrick_kernel::kernel::KernelContext,
+    dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
+    loaded_exits: usize,
+    idle_exits: usize,
+    hook: KvmLoadedPreEntryHook,
+) -> Result<PreparedKvmPoolOutcome, PreparedKvmPoolFailure> {
+    run_prepared_kvm_pool_with_debug(
+        machine,
+        root_context,
+        dispatcher,
+        loaded_exits.max(idle_exits),
+        None,
+        Some(hook),
+        Some((loaded_exits, idle_exits)),
+    )
+}
+
+#[doc(hidden)]
+#[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+pub type KvmLoadedPreEntryHook = Arc<
+    dyn Fn(&std::sync::atomic::AtomicBool, &carrick_vmm_kvm::KvmKickHandle) + Send + Sync + 'static,
+>;
 
 #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
 fn run_prepared_kvm_pool_with_debug(
@@ -257,6 +302,8 @@ fn run_prepared_kvm_pool_with_debug(
     dispatcher: carrick_kernel::dispatch::SyscallDispatcher,
     max_traps: usize,
     debug_server: Option<PreparedKvmDebugServer>,
+    loaded_pre_entry_hook: Option<KvmLoadedPreEntryHook>,
+    lane_exit_budgets: Option<(usize, usize)>,
 ) -> Result<PreparedKvmPoolOutcome, PreparedKvmPoolFailure> {
     use crate::vcpu_loop::executor::{self, PersistentTaskBinding};
     use carrick_hal::threaded::GuestCpuState;
@@ -303,16 +350,19 @@ fn run_prepared_kvm_pool_with_debug(
         Arc::clone(&binding),
     )?;
     let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    let (max_loaded_exits, max_idle_exits) = lane_exit_budgets.unwrap_or((max_traps, max_traps));
     let factory = Arc::new(executor::kvm::KvmPersistentExecutorFactory::new(
         executor::kvm::KvmPersistentExecutorConfig {
             physical: Arc::clone(&physical),
             dispatcher: Arc::clone(&dispatcher),
             reporter: Arc::clone(&reporter),
             completed: completed_tx,
-            max_exits: max_traps,
+            max_loaded_exits,
+            max_idle_exits,
             stats: Arc::clone(&stats),
             scheduler: Arc::clone(&scheduler),
             root_binding: Arc::clone(&binding),
+            loaded_pre_entry_hook,
         },
     )?);
     let pool = executor::ExecutorPool::start(
@@ -1436,6 +1486,8 @@ impl PreparedRun {
                 dispatcher,
                 max_traps,
                 kvm_debug,
+                None,
+                None,
             )
             .map_err(|failure| failure.error)
             .map(|outcome| outcome.run)
