@@ -10,8 +10,24 @@ pub struct LinuxTaskState {
     pub file_table: AtomicU64,
     pub fixup_pc: AtomicU64,
     pub orig_arg0: AtomicU64,
-    pub pending_host_work: AtomicU32,
+    /// The pending-host-work doorbell. Private: only
+    /// [`Self::take_host_work_doorbell`] clears it, and its token must reach
+    /// the host boundary that settles the owed work the doorbell announces.
+    pending_host_work: AtomicU32,
     pub served_with_work: AtomicU32,
+}
+
+/// Consumed pending-host-work doorbell. EL1 rings the doorbell for owed work
+/// that lives elsewhere (owed IPC wakes, deferred zone completions): taking
+/// it is the one way to clear it, and this token is the one input of the
+/// host step that settles that work. Nothing else can clear the doorbell.
+#[must_use = "a consumed host-work doorbell must reach the boundary that settles its work"]
+#[derive(Debug, Eq, PartialEq)]
+pub struct HostWorkDoorbell(());
+
+impl HostWorkDoorbell {
+    /// The settling boundary has delivered the owed work.
+    pub fn settled(self) {}
 }
 impl LinuxTaskState {
     pub const fn new() -> Self {
@@ -23,14 +39,22 @@ impl LinuxTaskState {
             served_with_work: AtomicU32::new(0),
         }
     }
+    /// Byte offset of the doorbell word, for ABI layout checks and the EL1
+    /// image's direct store.
+    pub const PENDING_HOST_WORK_OFFSET: usize =
+        core::mem::offset_of!(LinuxTaskState, pending_host_work);
+
+    /// Consume the doorbell. The token must be passed to the boundary that
+    /// settles what it announces.
+    pub fn take_host_work_doorbell(&self) -> Option<HostWorkDoorbell> {
+        (self.pending_host_work.swap(0, Ordering::AcqRel) != 0).then_some(HostWorkDoorbell(()))
+    }
+
     pub fn has_pending_host_work(&self) -> bool {
         self.pending_host_work.load(Ordering::Acquire) != 0
     }
     pub fn mark_pending_host_work(&self) {
         self.pending_host_work.store(1, Ordering::Release);
-    }
-    pub fn clear_pending_host_work(&self) {
-        self.pending_host_work.store(0, Ordering::Release);
     }
     pub fn take_served_boundary(&self) -> Option<ServedBoundary> {
         match self.served_with_work.swap(0, Ordering::AcqRel) {

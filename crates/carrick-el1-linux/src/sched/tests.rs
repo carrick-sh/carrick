@@ -569,7 +569,9 @@ fn a_wake_hands_a_thread_to_the_idle_vcpu_it_belongs_to() {
         serve_on(OTHER, &mut frame_b, &task_b, &zone, &mut cpu_b, counters),
         Some(Served::Idle)
     );
-    task_b.linux.clear_pending_host_work();
+    if let Some(doorbell) = task_b.linux.take_host_work_doorbell() {
+        doorbell.settled();
+    }
     // Pretend the kick never happened: OTHER is parked in WFI.
     assert!(!zone.enter_idle(OTHER, false));
     assert!(zone.enter_idle(OTHER, true));

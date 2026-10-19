@@ -44,7 +44,8 @@ pub use carrick_core_abi::{
 };
 pub use carrick_core_abi::{entry::*, lifecycle::*, mm::*, wait::*};
 pub use carrick_personality_linux::abi::entry::{
-    LinuxTaskMetadata, LinuxTaskState, SERVED_COMMIT_OWED, SERVED_WAKES_OWED, ServedBoundary,
+    HostWorkDoorbell, LinuxTaskMetadata, LinuxTaskState, SERVED_COMMIT_OWED, SERVED_WAKES_OWED,
+    ServedBoundary,
 };
 pub use mm_portal::*;
 pub use mm_portal_fork::*;
@@ -760,7 +761,8 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(Counters, refused) as u64,
         core::mem::size_of::<CurrentTask>() as u64,
         core::mem::offset_of!(CurrentTask, linux.file_table) as u64,
-        core::mem::offset_of!(CurrentTask, linux.pending_host_work) as u64,
+        (core::mem::offset_of!(CurrentTask, linux) + LinuxTaskState::PENDING_HOST_WORK_OFFSET)
+            as u64,
         core::mem::offset_of!(CurrentTask, linux.served_with_work) as u64,
         core::mem::offset_of!(CurrentTask, mm.key) as u64,
         core::mem::offset_of!(CurrentTask, mm.thread_generation) as u64,
@@ -1161,7 +1163,9 @@ const _: () = {
     assert!(core::mem::offset_of!(CurrentTask, linux.file_table) == 16);
     assert!(core::mem::offset_of!(CurrentTask, linux.fixup_pc) == 24);
     assert!(core::mem::offset_of!(CurrentTask, linux.orig_arg0) == 32);
-    assert!(core::mem::offset_of!(CurrentTask, linux.pending_host_work) == 40);
+    assert!(
+        core::mem::offset_of!(CurrentTask, linux) + LinuxTaskState::PENDING_HOST_WORK_OFFSET == 40
+    );
     assert!(core::mem::offset_of!(CurrentTask, linux.served_with_work) == 44);
     assert!(core::mem::offset_of!(CurrentTask, mm.key) == 48);
     assert!(core::mem::offset_of!(CurrentTask, mm.thread_generation) == 56);
@@ -1260,7 +1264,7 @@ impl CurrentTask {
         self.execution.task.store(0, Ordering::Release);
         self.linux.fixup_pc.store(0, Ordering::Relaxed);
         self.linux.orig_arg0.store(0, Ordering::Relaxed);
-        self.linux.pending_host_work.store(0, Ordering::Release);
+        // The host-work doorbell survives: only a settling boundary takes it.
         self.linux.served_with_work.store(0, Ordering::Release);
         self.mm.key.store(0, Ordering::Release);
         self.mm.thread_generation.store(0, Ordering::Release);
@@ -1276,8 +1280,9 @@ impl CurrentTask {
             .generation
             .store(generation, Ordering::Release);
         self.linux.file_table.store(file_table, Ordering::Release);
-        // The previous task must settle owed host work before rebinding.
-        self.linux.pending_host_work.store(0, Ordering::Release);
+        // The host-work doorbell survives rebinding: it announces owed work
+        // that is not this task's (owed wakes, deferred completions), and
+        // only a settling boundary may take it (#641).
         self.linux.served_with_work.store(0, Ordering::Release);
     }
 }
@@ -3158,41 +3163,21 @@ pub fn mark_pending_host_work(slot: usize) {
     }
     let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
     let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-    current_task
-        .linux
-        .pending_host_work
-        .store(1, Ordering::Release);
+    current_task.linux.mark_pending_host_work();
     HOST_WORK_PUBLICATIONS[HostWorkPublishReason::DirectSlot as usize]
         .fetch_add(1, Ordering::Relaxed);
 }
 
-/// Clear return-to-user work for the vCPU at `slot`.
-pub fn clear_pending_host_work(slot: usize) {
+/// Consume the host-work doorbell of the vCPU at `slot`. The token must be
+/// passed to the boundary that settles the work it announces.
+pub fn take_host_work_doorbell(slot: usize) -> Option<HostWorkDoorbell> {
     let ptr = get_el1_region_host_ptr();
     if ptr == 0 || slot >= EL1_STACK_SLOTS as usize {
-        return;
+        return None;
     }
     let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
     let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-    current_task
-        .linux
-        .pending_host_work
-        .store(0, Ordering::Release);
-}
-
-/// Check and atomically clear return-to-user work for the vCPU at `slot`.
-pub fn take_pending_host_work(slot: usize) -> bool {
-    let ptr = get_el1_region_host_ptr();
-    if ptr == 0 || slot >= EL1_STACK_SLOTS as usize {
-        return false;
-    }
-    let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
-    let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-    current_task
-        .linux
-        .pending_host_work
-        .swap(0, Ordering::AcqRel)
-        != 0
+    current_task.linux.take_host_work_doorbell()
 }
 
 /// Mark return-to-user work pending for all vCPU slots.
@@ -3206,10 +3191,7 @@ pub fn mark_pending_host_work_all() {
     for slot in 0..EL1_STACK_SLOTS as usize {
         let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
         let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-        current_task
-            .linux
-            .pending_host_work
-            .store(1, Ordering::Release);
+        current_task.linux.mark_pending_host_work();
     }
 }
 
@@ -3223,10 +3205,7 @@ pub fn mark_pending_host_work_for_task(tid: El1TaskId) {
         let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
         let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
         if current_task.execution.task.load(Ordering::Relaxed) == tid.raw() {
-            current_task
-                .linux
-                .pending_host_work
-                .store(1, Ordering::Release);
+            current_task.linux.mark_pending_host_work();
             HOST_WORK_PUBLICATIONS[HostWorkPublishReason::ExactTask as usize]
                 .fetch_add(1, Ordering::Relaxed);
         }
@@ -3256,10 +3235,7 @@ pub fn mark_pending_host_work_for_file_tables(tables: &[u64]) {
         }
         let ft = current_task.linux.file_table.load(Ordering::Relaxed);
         if tables.contains(&ft) {
-            current_task
-                .linux
-                .pending_host_work
-                .store(1, Ordering::Release);
+            current_task.linux.mark_pending_host_work();
             HOST_WORK_PUBLICATIONS[HostWorkPublishReason::FileTable as usize]
                 .fetch_add(1, Ordering::Relaxed);
         }
@@ -3330,7 +3306,7 @@ pub fn write_current_task_census(out: &mut impl core::fmt::Write) -> core::fmt::
         // SAFETY: the record lives in the EL1 region; only atomics are touched.
         let task = unsafe { &*((ptr + offset) as *const CurrentTask) };
         let tid = task.execution.task.load(Ordering::Acquire);
-        let pending = task.linux.pending_host_work.load(Ordering::Acquire);
+        let pending = u32::from(task.linux.has_pending_host_work());
         let served = task.linux.served_with_work.load(Ordering::Acquire);
         if tid == 0 && pending == 0 && served == 0 {
             continue;
@@ -4229,7 +4205,7 @@ mod tests {
         assert_eq!(core::mem::offset_of!(CurrentTask, linux.fixup_pc), 24);
         assert_eq!(core::mem::offset_of!(CurrentTask, linux.orig_arg0), 32);
         assert_eq!(
-            core::mem::offset_of!(CurrentTask, linux.pending_host_work),
+            core::mem::offset_of!(CurrentTask, linux) + LinuxTaskState::PENDING_HOST_WORK_OFFSET,
             40
         );
         assert_eq!(
@@ -4300,7 +4276,7 @@ mod tests {
     }
 
     #[test]
-    fn current_task_set_clears_per_cpu_pending_and_served_work_across_switch() {
+    fn current_task_set_keeps_doorbell_and_clears_served_work_across_switch() {
         let task = CurrentTask::new();
         task.set(El1TaskId::from_linux_tid(42), 11, 200);
         task.linux.fixup_pc.store(0x401000, Ordering::Relaxed);
@@ -4309,16 +4285,23 @@ mod tests {
         task.linux.record_completed_with_work();
         assert!(task.linux.has_pending_host_work());
 
-        // The carrier must service owed work before switching; rebinding
-        // removes any stale per-CPU flags from the next task.
+        // Rebinding drops the previous task's served-syscall boundary, but
+        // never the host-work doorbell: it announces owed work (wakes,
+        // deferred zone completions) that only a settling boundary may take
+        // (#641).
         task.set(El1TaskId::from_linux_tid(41), 12, 100);
         assert_eq!(task.execution.task.load(Ordering::Relaxed), 41);
         assert_eq!(task.execution.generation.load(Ordering::Relaxed), 12);
         assert_eq!(task.linux.file_table.load(Ordering::Relaxed), 100);
         assert_eq!(task.linux.fixup_pc.load(Ordering::Relaxed), 0x401000);
         assert_eq!(task.linux.orig_arg0.load(Ordering::Relaxed), 0xdead_beef);
-        assert!(!task.linux.has_pending_host_work());
+        assert!(task.linux.has_pending_host_work());
         assert_eq!(task.linux.take_served_boundary(), None);
+        task.linux
+            .take_host_work_doorbell()
+            .expect("doorbell survives rebinding")
+            .settled();
+        assert!(!task.linux.has_pending_host_work());
     }
 
     #[test]
@@ -4382,7 +4365,9 @@ mod tests {
         };
         assert!(task_5.linux.has_pending_host_work());
 
-        clear_pending_host_work(5);
+        if let Some(doorbell) = take_host_work_doorbell(5) {
+            doorbell.settled();
+        }
         assert!(!task_5.linux.has_pending_host_work());
 
         let task_6 = unsafe {
@@ -4405,8 +4390,12 @@ mod tests {
         assert!(take_served_with_work(5));
         assert!(!take_served_with_work(5));
 
-        task_5.linux.clear_pending_host_work();
-        task_6.linux.clear_pending_host_work();
+        if let Some(doorbell) = task_5.linux.take_host_work_doorbell() {
+            doorbell.settled();
+        }
+        if let Some(doorbell) = task_6.linux.take_host_work_doorbell() {
+            doorbell.settled();
+        }
         let task_7 = unsafe {
             &*((ptr + EL1_CURRENT_TASKS_OFFSET as usize + 7 * core::mem::size_of::<CurrentTask>())
                 as *const CurrentTask)
