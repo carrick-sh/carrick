@@ -4330,6 +4330,44 @@ fn el1_sched_deferred_handback_capture_observes_guest_records() {
     );
 }
 
+/// Control for the deferred-capture witness (#695): the same
+/// `sock-pingpong-stepper` workload with no hold armed. At 81de5b7c0, 4 of
+/// 20 armed runs resumed the held thread, which then faulted on its own
+/// stack (`socketpair` EFAULT, then SIGSEGV). The zone places a held
+/// record exactly as production does
+/// (`held_record_is_placed_like_a_production_record`), so the hold differs
+/// from production only in when the record is placed. A crash here means
+/// the defect is in production scheduling; none here, against crashes
+/// armed, points at the delayed placement.
+#[test]
+fn el1_sched_sock_pingpong_stepper_without_hold() {
+    let _guard = common::guest_lock();
+    let _watchdog = common::Watchdog::start(Duration::from_secs(30));
+    let carrier = carrier_or_fail();
+    let result = common::run_or_fail(
+        carrier
+            .container(common::SMOKE_IMAGE)
+            .pull_policy(PullPolicy::Missing)
+            .command([FIXTURE, "sock-pingpong-stepper", "2000"])
+            .vfs_mount("/opt/carrick", Box::new(el1_sched_vfs()))
+            .run_blocking(),
+    );
+    let verdict = format!(
+        "exit {} signal {:?} stdout {:?} stderr {:?}",
+        result.exit_code,
+        result.signal,
+        result.stdout_utf8(),
+        result.stderr_utf8()
+    );
+    println!("sock-pingpong-stepper without hold: {verdict}");
+    assert!(result.success(), "{verdict}");
+    assert!(
+        result.stdout_utf8().contains("sock-pingpong iters=2000"),
+        "{verdict}"
+    );
+    assert!(result.stdout_utf8().contains("stepper ok"), "{verdict}");
+}
+
 // ---------------------------------------------------------------------------
 // Contract `kernel.el1.thread-lifecycle` (stage L0 witnesses).
 //
