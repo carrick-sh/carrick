@@ -157,10 +157,9 @@ impl Drop for HostForkPublication {
     fn drop(&mut self) {
         drop(self.claim.take());
         if let Some((mm, address)) = self.page.exit_wait()
-            && let Some(zone) = crate::el1_zone::zone()
+            && let Some(address) = std::num::NonZeroU64::new(address)
         {
-            let wake = crate::el1_zone::wake(zone, mm.raw(), address, u32::MAX, u32::MAX);
-            crate::el1_zone::hand_back(&wake.handed);
+            let _ = crate::el1_zone::wake_exit_wait_channel(mm, address);
         }
     }
 }

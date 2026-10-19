@@ -1703,6 +1703,17 @@ mod futex_queue_authority {
             }
         }
 
+        /// A third live thread of the same task and mm.
+        pub(super) fn third_thread(&self, tid: i32) -> super::super::KernelContext {
+            let plan = ClonePlan::from_flags(
+                LinuxCloneFlags::THREAD | LinuxCloneFlags::SIGHAND | LinuxCloneFlags::VM,
+            )
+            .expect("thread plan");
+            self._kernel
+                .clone_thread(&self.root, plan, ThreadId::synthetic_for_tests(tid), None)
+                .expect("third thread")
+        }
+
         /// Both threads are live members of one task and one mm.
         pub(super) fn assert_two_live_threads(&self) {
             let task = self.root.task();
@@ -2026,16 +2037,21 @@ impl FutexQueueAuthorityHostLane {
     }
 }
 
-/// A CLEARTID exit delivers exactly one wake to the mm's queue, whichever
-/// lane retires the thread: two joiners park on the word (one host-parked,
-/// one EL1-parked) and the wake count is 1, so a double wake (both lanes)
-/// would wake both and a suppressed only wake would wake neither.
+/// Queue-level half of the CLEARTID single-wake contract: whichever venue
+/// delivers it (EL1's `wake_placed`, or the host's
+/// `FutexQueueAuthority::wake_child_tid`), the one wake lands in the mm's
+/// queue and reaches exactly one of two parked joiners, and the host table
+/// holds none of them. The runtime tests
+/// `serial_host_zone_joiner_woken_by_unkeyed_*` and
+/// `serial_host_zone_cleared_child_tid_is_not_cleared_or_woken_again` drive
+/// the real host retirement paths; `x5_exit_requeued_after_wake_wakes_once`
+/// drives the in-zone decline-after-wake path.
 #[test]
-fn futex_queue_authority_cleartid_exit_wakes_exactly_once() {
+fn futex_queue_authority_cleartid_wake_reaches_one_joiner_in_mm_queue() {
     use carrick_abi::LINUX_FUTEX_WAIT;
     use futex_queue_authority::Fixture;
 
-    // In-zone lane: EL1 clears and wakes; the host lane sees the receipt.
+    // In-zone venue wakes; the receipt keeps the host venue out.
     let mut f = Fixture::new(9321);
     crate::el1_zone::with_test_zone(f.zone, || {
         let root = f.root.retain_exact();
@@ -2046,7 +2062,9 @@ fn futex_queue_authority_cleartid_exit_wakes_exactly_once() {
             .set_clear_child_tid(f.sibling_tid, futex_queue_authority::WORD);
         let outcome = f.futex(&root, f.root_tid, LINUX_FUTEX_WAIT, u64::from(tid));
         let host_joiner = f.host_park(&root, outcome);
-        let el1_joiner = f.el1_park(&root, u32::MAX);
+        let other = f.third_thread(tid as i32 + 100);
+        assert_eq!(other.shared().mm_id(), root.shared().mm_id());
+        let el1_joiner = f.el1_park(&other, u32::MAX);
         f.write_word(0);
         let in_zone = f.el1_wake(
             &sibling,
@@ -2069,8 +2087,7 @@ fn futex_queue_authority_cleartid_exit_wakes_exactly_once() {
         assert_eq!((in_zone, host, still_parked), (1, 0, 1));
     });
 
-    // Host lane: the in-zone exit declined before waking (EL1's wake is all
-    // or nothing), so no receipt; the host retirement's wake is the only one.
+    // Host venue wakes alone (no in-zone wake, no receipt).
     let mut f = Fixture::new(9331);
     crate::el1_zone::with_test_zone(f.zone, || {
         let root = f.root.retain_exact();
@@ -2081,7 +2098,9 @@ fn futex_queue_authority_cleartid_exit_wakes_exactly_once() {
             .set_clear_child_tid(f.sibling_tid, futex_queue_authority::WORD);
         let outcome = f.futex(&root, f.root_tid, LINUX_FUTEX_WAIT, u64::from(tid));
         let host_joiner = f.host_park(&root, outcome);
-        let el1_joiner = f.el1_park(&root, u32::MAX);
+        let other = f.third_thread(tid as i32 + 100);
+        assert_eq!(other.shared().mm_id(), root.shared().mm_id());
+        let el1_joiner = f.el1_park(&other, u32::MAX);
         f.write_word(0);
         assert!(!sibling.thread().child_tid_cleared_in_zone());
         let host = FutexQueueAuthorityHostLane::wake(&sibling, &f.futex).count;

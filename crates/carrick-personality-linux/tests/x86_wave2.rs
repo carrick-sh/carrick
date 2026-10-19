@@ -125,3 +125,8 @@ mod lifecycle;
 fn x5_linux_clone_exit() {
     lifecycle::x5_linux_clone_exit();
 }
+
+#[test]
+fn x5_exit_requeued_after_wake_wakes_once() {
+    lifecycle::x5_exit_requeued_after_wake_wakes_once();
+}

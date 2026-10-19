@@ -2371,24 +2371,6 @@ impl<'a> ProcView<'a> {
                 ));
             }
 
-            let Some(thread) = thread else {
-                return Ok(match command {
-                    LINUX_FUTEX_WAKE => DispatchOutcome::Returned { value: 0 },
-                    LINUX_FUTEX_WAIT => {
-                        if word != value || timeout_address.0 == 0 {
-                            return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
-                        }
-                        let timespec = read_timespec(memory, timeout_address.0)?;
-                        let timeout = duration_from_linux_timespec(timespec)?;
-                        if let Some(timeout) = timeout {
-                            std::thread::sleep(timeout);
-                        }
-                        DispatchOutcome::errno(LINUX_ETIMEDOUT)
-                    }
-                    _ => DispatchOutcome::errno(LINUX_ENOSYS),
-                });
-            };
-
             // A futex word that lives in a genuine MAP_SHARED file mapping is
             // a CROSS-PROCESS rendezvous (e.g. LTP `tst_checkpoint` between
             // a parent and a forked child sharing `/dev/shm/ltp_*`). The
@@ -2410,7 +2392,7 @@ impl<'a> ProcView<'a> {
             // descriptor word never resolved to a mirror anyway. This is the one
             // non-PRIVATE word whose waker is the host, not the guest.
             let shared_location = if futex_flags.contains(LinuxFutexFlags::PRIVATE)
-                || thread.registry.is_clear_child_tid_addr(address.0)
+                || thread.is_some_and(|thread| thread.registry.is_clear_child_tid_addr(address.0))
             {
                 None
             } else {
@@ -2426,8 +2408,9 @@ impl<'a> ProcView<'a> {
             );
 
             // The address space's one queue venue decides here exactly as in
-            // `dispatch_threaded_futex` (#685): a zone mm's private futexes
-            // never fall back to the host table.
+            // `dispatch_threaded_futex` (#685), with or without a thread
+            // context: a zone mm's futexes never fall back to the host table
+            // or to the context-less no-op below.
             if shared_location.is_none()
                 && let Some(queue) =
                     crate::el1_zone::FutexQueueAuthority::of_context(cx.kernel).zone()
@@ -2444,6 +2427,24 @@ impl<'a> ProcView<'a> {
                     queue,
                 ));
             }
+
+            let Some(thread) = thread else {
+                return Ok(match command {
+                    LINUX_FUTEX_WAKE => DispatchOutcome::Returned { value: 0 },
+                    LINUX_FUTEX_WAIT => {
+                        if word != value || timeout_address.0 == 0 {
+                            return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                        }
+                        let timespec = read_timespec(memory, timeout_address.0)?;
+                        let timeout = duration_from_linux_timespec(timespec)?;
+                        if let Some(timeout) = timeout {
+                            std::thread::sleep(timeout);
+                        }
+                        DispatchOutcome::errno(LINUX_ETIMEDOUT)
+                    }
+                    _ => DispatchOutcome::errno(LINUX_ENOSYS),
+                });
+            };
 
             Ok(match command {
                 LINUX_FUTEX_WAKE => {
