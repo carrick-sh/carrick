@@ -386,6 +386,9 @@ pub unsafe fn resolve_x86_guest_cow<
     carrick_core::mm::cow::resolve_guest_cow(venue, mm_key, far, copy_page, invalidate)
 }
 
+#[cfg(any(test, feature = "host-test"))]
+pub mod test_support;
+
 #[cfg(test)]
 mod tests {
     //! The real descriptor executor and copy window over host memory: a
@@ -393,7 +396,7 @@ mod tests {
     //! and a page-granular model of guest-physical memory that the copy
     //! window's live alias leaves select from.
     use super::*;
-    use carrick_el1_abi::{CowDecline, CowGrantCompletion, CowGrantPool, FrameGrantResidencyTable};
+    use carrick_el1_abi::{CowDecline, CowGrantCompletion, CowGrantPool};
     use carrick_mmu_core::aarch64::SubstrateGpa;
     use carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords;
 
@@ -407,179 +410,13 @@ mod tests {
         Action, COW_GRANT_SIZE, Counters, CurrentTask, EL1_COW_COPY_BASE, FrameGrantMailbox,
         TrapFrame,
     };
-    use carrick_mmu_core::aarch64::descriptor_txn::{
-        BackingIdentity, PrimaryTableWords, TableMaintenance,
-    };
+    use carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords;
     use carrick_mmu_core::aarch64::indices;
     use carrick_sched_core::AddressSpaces;
-    use core::cell::{Cell, RefCell};
-    use core::num::NonZeroU64;
+    use core::cell::Cell;
     use core::sync::atomic::{AtomicU64, Ordering};
-    use std::collections::BTreeMap;
 
-    const ROOT: u64 = 0x8800_0000_0000;
-    const ASID: u64 = 5 << 48;
-    const MM: u64 = 77;
-    const VA: u64 = 0x4000_0000;
-    const OLD: u64 = 0x009b_4000_0000;
-    const GRANT: u64 = 0x009d_0000_4000;
-    const PA: u64 = 0x0000_FFFF_FFFF_F000;
-    const AF: u64 = 1 << 10;
-    const SH: u64 = 0b11 << 8;
-    const AP_RO_EL0: u64 = 0b11 << 6;
-    const AP_RW_EL0: u64 = 0b01 << 6;
-    const NG: u64 = 1 << 11;
-    const XN: u64 = (1 << 53) | (1 << 54);
-    const COW: u64 = 1 << 55;
-    const PRIVATE: u64 = 1 << 56;
-    const MAY_WRITE: u64 = 1 << 57;
-
-    struct Arena {
-        words: Vec<AtomicU64>,
-    }
-
-    impl Arena {
-        /// Tables for `VA` (L3 at +0x3000) and for the EL1 copy window
-        /// (L2 at +0x4000, L3 at +0x5000) with its two idle leaves.
-        fn new(window: bool) -> Self {
-            let arena = Self {
-                words: (0..8 * 512).map(|_| AtomicU64::new(0)).collect(),
-            };
-            let va = indices(VA);
-            arena.set(ROOT + va[0] as u64 * 8, (ROOT + 0x1000) | 3);
-            arena.set(ROOT + 0x1000 + va[1] as u64 * 8, (ROOT + 0x2000) | 3);
-            arena.set(ROOT + 0x2000 + va[2] as u64 * 8, (ROOT + 0x3000) | 3);
-            if window {
-                let win = indices(EL1_COW_COPY_BASE);
-                assert_eq!(win[0], va[0], "one L0 entry covers both");
-                arena.set(ROOT + 0x1000 + win[1] as u64 * 8, (ROOT + 0x4000) | 3);
-                arena.set(ROOT + 0x4000 + win[2] as u64 * 8, (ROOT + 0x5000) | 3);
-                for page in 0..2 {
-                    let alias = EL1_COW_COPY_BASE + page * 4096;
-                    arena.set(ROOT + 0x5000 + indices(alias)[3] as u64 * 8, alias);
-                }
-            }
-            arena
-        }
-        fn set(&self, pa: u64, value: u64) {
-            self.words[((pa - ROOT) / 8) as usize].store(value, Ordering::Relaxed);
-        }
-        fn get(&self, pa: u64) -> u64 {
-            self.words[((pa - ROOT) / 8) as usize].load(Ordering::Relaxed)
-        }
-        fn leaf_pa(va: u64) -> u64 {
-            let l3 = if va >> 30 == EL1_COW_COPY_BASE >> 30 {
-                ROOT + 0x5000
-            } else {
-                ROOT + 0x3000
-            };
-            l3 + indices(va)[3] as u64 * 8
-        }
-        fn leaf(&self, va: u64) -> u64 {
-            self.get(Self::leaf_pa(va))
-        }
-        fn set_leaf(&self, va: u64, value: u64) {
-            self.set(Self::leaf_pa(va), value);
-        }
-        fn words(&self) -> PrimaryTableWords<'_, Maintenance> {
-            unsafe {
-                PrimaryTableWords::new(
-                    self.words.as_ptr().cast_mut(),
-                    ROOT,
-                    self.words.len() * 8,
-                    &MAINTENANCE,
-                )
-            }
-            .unwrap()
-        }
-        fn image(&self) -> Vec<u64> {
-            self.words
-                .iter()
-                .map(|w| w.load(Ordering::Relaxed))
-                .collect()
-        }
-    }
-
-    struct Maintenance;
-    static MAINTENANCE: Maintenance = Maintenance;
-    impl TableMaintenance for Maintenance {
-        fn publish_barrier(&self) {}
-        fn invalidate_range(&self, _va: u64, _len: u64) {}
-    }
-
-    /// Guest-physical pages. Copies read the copy window's live leaves, so
-    /// a copy through an unmapped or wrong alias fails the test.
-    struct Memory(RefCell<BTreeMap<u64, Vec<u8>>>);
-
-    impl Memory {
-        fn page(&self, ipa: u64) -> Vec<u8> {
-            self.0.borrow().get(&ipa).cloned().unwrap_or(vec![0; 4096])
-        }
-        fn copy_through(&self, arena: &Arena, source: u64, destination: u64) {
-            let (from, to) = (arena.leaf(source), arena.leaf(destination));
-            assert_ne!(from & 1, 0, "source alias not mapped during the copy");
-            assert_ne!(to & 1, 0, "destination alias not mapped during the copy");
-            assert_eq!(
-                from & (0b11 << 6),
-                0b10 << 6,
-                "source alias is EL1 read-only"
-            );
-            assert_eq!(to & (0b11 << 6), 0, "destination alias is EL1 read-write");
-            let bytes = self.page(from & PA);
-            self.0.borrow_mut().insert(to & PA, bytes);
-        }
-    }
-
-    fn nz(value: u64) -> NonZeroU64 {
-        NonZeroU64::new(value).unwrap()
-    }
-
-    fn backing() -> BackingIdentity {
-        BackingIdentity {
-            frame_id: nz(11),
-            mapping_id: nz(12),
-            owner_generation: nz(13),
-            inventory_revision: nz(14),
-        }
-    }
-
-    fn armed(ipa: u64, may_write: bool) -> u64 {
-        ipa | 3
-            | AF
-            | SH
-            | AP_RO_EL0
-            | NG
-            | XN
-            | COW
-            | PRIVATE
-            | if may_write { MAY_WRITE } else { 0 }
-    }
-
-    fn residency_table() -> std::boxed::Box<FrameGrantResidencyTable> {
-        let layout = std::alloc::Layout::new::<FrameGrantResidencyTable>();
-        // SAFETY: the production shared index supports zero initialization;
-        // the allocation has its exact size/alignment and one Box owner.
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<FrameGrantResidencyTable>();
-        if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-        unsafe { std::boxed::Box::from_raw(ptr) }
-    }
-
-    /// A forked private compound: four armed pages, lane 3 read-only in
-    /// Linux, each page holding distinct bytes.
-    fn forked(window: bool) -> (Arena, Memory) {
-        let arena = Arena::new(window);
-        let memory = Memory(RefCell::new(BTreeMap::new()));
-        for lane in 0..4 {
-            arena.set_leaf(VA + lane * 4096, armed(OLD + lane * 4096, lane != 3));
-            memory.0.borrow_mut().insert(
-                OLD + lane * 4096,
-                (0..4096).map(|i| (i as u64 * 7 + lane) as u8).collect(),
-            );
-        }
-        (arena, memory)
-    }
+    use super::test_support::*;
 
     fn resolve(
         arena: &Arena,
@@ -603,178 +440,6 @@ mod tests {
             || invalidations.set(invalidations.get() + 1),
         )
         .unwrap()
-    }
-
-    #[test]
-    fn native_child_tid_copy_supplies_its_empty_cow_pool_before_writing() {
-        use carrick_core::mm::transaction::{
-            SelectionVenues, UserWriteError, UserWriteRequest, UserWriteVenue,
-        };
-        use carrick_core::mm::transfer::ValidatedChunk;
-        use carrick_el1_abi::{Aarch64ParkedContext, PortalGrantWindow};
-        use carrick_el1_linux::mm_portal::test_support::{Region, admit_kind, nodes};
-
-        struct TypedCow<'a> {
-            arena: &'a Arena,
-            memory: &'a Memory,
-            pool: &'a CowGrantPool,
-            residency: &'a FrameGrantResidencyTable,
-        }
-        impl CowResolver for TypedCow<'_> {
-            fn resolve_cow(&mut self, _: u64, _: u64, _: u64) -> bool {
-                panic!("the owner must retain the typed supply outcome")
-            }
-            fn resolve_cow_outcome(
-                &mut self,
-                root: u64,
-                mm: u64,
-                far: u64,
-            ) -> crate::fault::CowResolution {
-                let words = self.arena.words();
-                let outcome = resolve_guest_cow(
-                    &GuestCowVenue {
-                        publish_executable: None,
-                        words: &words,
-                        root: SubstrateGpa(root & PA),
-                        pool: self.pool,
-                        residency: self.residency,
-                        copy_window: CowCopyWindow::target(&words, SubstrateGpa(root & PA)),
-                    },
-                    mm,
-                    far,
-                    |from, to| self.memory.copy_through(self.arena, from, to),
-                    || {},
-                );
-                crate::fault::handle_cow_outcome(outcome, &mut None)
-            }
-        }
-        struct CopyVenue<'a> {
-            cow: TypedCow<'a>,
-            prepared: NoopPreparedResolver,
-            spaces: &'a AddressSpaces,
-            refuse: bool,
-            no_progress: bool,
-            supplied: usize,
-            copied: usize,
-            settled: usize,
-        }
-        impl<'a> UserWriteVenue<Aarch64ParkedContext> for CopyVenue<'a> {
-            type Prepared = NoopPreparedResolver;
-            type Cow = TypedCow<'a>;
-            type Error = ();
-            fn selection_venues(&mut self) -> SelectionVenues<'_, Self::Prepared, Self::Cow> {
-                let residency = self.cow.residency;
-                SelectionVenues {
-                    prepared: &mut self.prepared,
-                    cow: &mut self.cow,
-                    residency,
-                    slot: 0,
-                }
-            }
-            fn settle_completions(&mut self, request: &UserWriteRequest<'_>) -> Result<(), ()> {
-                assert_eq!(request.handle.mm().raw(), MM);
-                self.settled += 1;
-                Ok(())
-            }
-            fn supply_cow(&mut self, window: PortalGrantWindow) -> Result<(), ()> {
-                self.supplied += 1;
-                assert_eq!(window.operation.mm.raw(), MM);
-                assert_eq!(window.fault_page, VA);
-                assert_eq!(window.range.len(), 4096);
-                // Physical supply cannot run while the selection retains an editor.
-                let index = self.spaces.find(MM).unwrap();
-                let editor = self.spaces.try_begin_edit(index, MM, nz(2)).unwrap();
-                drop(editor);
-                if self.refuse {
-                    return Err(());
-                }
-                if self.no_progress {
-                    return if self.supplied <= 2 { Ok(()) } else { Err(()) };
-                }
-                self.cow.pool.publish(MM, GRANT, backing()).unwrap();
-                Ok(())
-            }
-            fn copy(
-                &mut self,
-                fence: &ValidatedChunk<'_, Aarch64ParkedContext>,
-                bytes: &[u8],
-            ) -> bool {
-                let selected = fence.selected();
-                assert_eq!(selected.handle().mm().raw(), MM);
-                assert_eq!(selected.va.raw(), VA);
-                assert_eq!(selected.ipa, GRANT);
-                assert_eq!(bytes.len(), 4);
-                let index = self.spaces.find(MM).unwrap();
-                assert!(self.spaces.try_begin_edit(index, MM, nz(2)).is_none());
-                self.cow.memory.0.borrow_mut().get_mut(&GRANT).unwrap()[..bytes.len()]
-                    .copy_from_slice(bytes);
-                self.copied += 1;
-                true
-            }
-        }
-        for (refuse, no_progress) in [(true, false), (false, true), (false, false)] {
-            let (arena, memory) = forked(true);
-            let parent = memory.page(OLD);
-            let pool = CowGrantPool::new();
-            // A parent grant cannot satisfy the selected child's demand.
-            pool.publish(MM + 1, GRANT + COW_GRANT_SIZE, backing())
-                .unwrap();
-            let region = Region::new();
-            let spaces = AddressSpaces::new();
-            let mm = admit_kind(&region, &spaces, MM, ROOT | ASID, 4, 0, false);
-            let view = nodes(&region);
-            let portal =
-                carrick_el1_linux::mm_portal::MmPortal::new(nz(1), region.table(), &spaces, &view);
-            let residency = residency_table();
-            let mut venue = CopyVenue {
-                cow: TypedCow {
-                    arena: &arena,
-                    memory: &memory,
-                    pool: &pool,
-                    residency: &residency,
-                },
-                prepared: NoopPreparedResolver,
-                spaces: &spaces,
-                refuse,
-                no_progress,
-                supplied: 0,
-                copied: 0,
-                settled: 0,
-            };
-            let tid = 2_u32.to_ne_bytes();
-            let result = portal.write_user_bytes(
-                UserWriteRequest {
-                    handle: portal.admitted_handle(mm, 0).unwrap(),
-                    address: carrick_guest_arch::UserVa::new(VA),
-                    bytes: &tid,
-                    slot: carrick_guest_arch::SlotId::new(0),
-                },
-                &arena.words(),
-                &mut venue,
-            );
-            assert_eq!(
-                result,
-                if refuse {
-                    Err(UserWriteError::Mechanics(()))
-                } else if no_progress {
-                    Err(UserWriteError::Busy)
-                } else {
-                    Ok(())
-                }
-            );
-            assert_eq!(venue.supplied, 1);
-            assert_eq!(venue.copied, usize::from(!refuse && !no_progress));
-            assert_eq!(venue.settled, if refuse { 1 } else { 2 });
-            assert_eq!(
-                pool.declined()[CowDecline::PoolEmpty as usize],
-                if no_progress { 2 } else { 1 }
-            );
-            assert_eq!(pool.ready(MM + 1).count(), 1);
-            assert_eq!(memory.page(OLD), parent, "the parent bytes remain private");
-            if !refuse && !no_progress {
-                assert_eq!(&memory.page(GRANT)[..4], &tid);
-            }
-        }
     }
 
     #[test]

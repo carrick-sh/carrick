@@ -25,7 +25,6 @@ allocator-test-control = []
 path = "src/lib.rs"
 
 [dev-dependencies]
-carrick-el1-linux = { path = "../carrick-el1-linux", features = ["host-test"] }
 carrick-test-support = { path = "../carrick-test-support" }
 carrick-core = { path = "../carrick-core", features = ["host-test"] }
 carrick-sched-core = { path = "../carrick-sched-core", features = ["host-test"] }
