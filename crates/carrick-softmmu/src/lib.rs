@@ -27,9 +27,11 @@
 
 #![no_std]
 extern crate alloc;
+extern crate std;
 
 pub mod domains;
 pub mod placement;
+pub mod shootdown;
 pub mod tlb;
 pub mod walker;
 
@@ -46,6 +48,10 @@ pub use domains::{
 pub use placement::{
     HostVa, LAPIC_MMIO_BASE_GPA, LAPIC_MMIO_SIZE_BYTES, LinearPlacement, MAX_MMIO_HOLES, MmioHole,
     MmioHoles, PlacementError, PlacementGpa,
+};
+pub use shootdown::{
+    PendingShootdown, ShootdownAuthority, ShootdownEpoch, ShootdownKick, ShootdownStamp,
+    ShootdownStats, VcpuShootdown, VcpuShootdownState,
 };
 pub use tlb::{
     SOFT_TLB_BITS, SOFT_TLB_ENTRIES, SOFT_TLB_INDEX_MASK, SoftTlb, SoftTlbEntry, SoftTlbPlane,

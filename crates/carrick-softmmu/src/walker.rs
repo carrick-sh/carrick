@@ -15,7 +15,11 @@ use crate::domains::{
     SoftTranslationError, Stage1Gpa, TranslatedLeaf,
 };
 use crate::placement::{HostVa, LinearPlacement, PlacementError};
+use crate::shootdown::{
+    PendingShootdown, ShootdownCoordinator, ShootdownKick, ShootdownStats, VcpuShootdown,
+};
 use crate::tlb::SoftTlb;
+use alloc::sync::Arc;
 
 /// Committed physical extent record used to authenticate `(Stage1Gpa, len, OwnerGeneration) -> AuthenticatedGpa`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +64,7 @@ pub struct ExtentTable {
     root_generations: BTreeMap<u64, OwnerGeneration>,
     code_pages: BTreeMap<u64, (bool, u64)>,
     extents_visited: AtomicU64,
+    shootdown: Arc<ShootdownCoordinator>,
 }
 
 impl Clone for ExtentTable {
@@ -69,6 +74,7 @@ impl Clone for ExtentTable {
             root_generations: self.root_generations.clone(),
             code_pages: self.code_pages.clone(),
             extents_visited: AtomicU64::new(self.extents_visited.load(Ordering::Relaxed)),
+            shootdown: ShootdownCoordinator::new(),
         }
     }
 }
@@ -81,13 +87,20 @@ impl Default for ExtentTable {
 
 impl ExtentTable {
     /// Create an empty extent table with no registered roots.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             by_base: BTreeMap::new(),
             root_generations: BTreeMap::new(),
             code_pages: BTreeMap::new(),
             extents_visited: AtomicU64::new(0),
+            shootdown: ShootdownCoordinator::new(),
         }
+    }
+    pub fn register_vcpu(&self, kick: Arc<dyn ShootdownKick>) -> VcpuShootdown {
+        self.shootdown.register(kick)
+    }
+    pub fn shootdown_stats(&self) -> ShootdownStats {
+        self.shootdown.stats()
     }
     /// Register the expected [`OwnerGeneration`] for walks under an unregistered `root` (`false` if already registered).
     pub fn set_root_generation(&mut self, root: RootGpa, generation: OwnerGeneration) -> bool {
@@ -98,32 +111,24 @@ impl ExtentTable {
             .insert(root.address().raw(), generation);
         true
     }
-    /// Replace (or set) `root`'s [`OwnerGeneration`] and flush all supplied [`SoftTlb`]s.
+    /// Replace (or set) `root`'s generation and return its mandatory shootdown barrier.
     pub fn replace_root_generation(
         &mut self,
         root: RootGpa,
         generation: OwnerGeneration,
-        tlbs: &mut [&mut SoftTlb],
-    ) -> Option<OwnerGeneration> {
+    ) -> PendingShootdown<Option<OwnerGeneration>> {
         let prev = self
             .root_generations
             .insert(root.address().raw(), generation);
-        for tlb in tlbs {
-            tlb.flush_all();
-        }
-        prev
+        self.shootdown.begin(prev)
     }
-    /// Remove `root`'s generation registration and flush all supplied [`SoftTlb`]s.
+    /// Remove `root`'s generation registration and return its mandatory shootdown barrier.
     pub fn remove_root_generation(
         &mut self,
         root: RootGpa,
-        tlbs: &mut [&mut SoftTlb],
-    ) -> Option<OwnerGeneration> {
+    ) -> PendingShootdown<Option<OwnerGeneration>> {
         let removed = self.root_generations.remove(&root.address().raw());
-        for tlb in tlbs {
-            tlb.flush_all();
-        }
-        removed
+        self.shootdown.begin(removed)
     }
     /// Return the registered [`OwnerGeneration`] for `root` (`None` if `root` is unregistered).
     pub fn expected_generation(&self, root: RootGpa) -> Option<OwnerGeneration> {
@@ -182,30 +187,28 @@ impl ExtentTable {
         self.by_base.insert(record.base.raw(), record);
         true
     }
-    /// Replace (or install) an extent at `record.base` and flush all supplied [`SoftTlb`]s.
-    pub fn replace(&mut self, record: ExtentRecord, tlbs: &mut [&mut SoftTlb]) -> bool {
+    /// Replace (or install) an extent and return its mandatory shootdown barrier.
+    pub fn replace(
+        &mut self,
+        record: ExtentRecord,
+    ) -> Result<PendingShootdown<Option<ExtentRecord>>, ExtentRecord> {
         if !self.validate_non_overlapping(record, true) {
-            return false;
+            return Err(record);
         }
         let base = record.base.raw();
-        if let Some(old) = self.by_base.insert(base, record) {
+        let old = self.by_base.insert(base, record);
+        if let Some(old) = old {
             self.clear_code_pages_in_span(old.base.raw(), old.end_gpa());
         }
-        for tlb in tlbs {
-            tlb.flush_all();
-        }
-        true
+        Ok(self.shootdown.begin(old))
     }
-    /// Retire the extent starting at `base` and flush all supplied [`SoftTlb`]s.
-    pub fn remove(&mut self, base: FrameGpa, tlbs: &mut [&mut SoftTlb]) -> Option<ExtentRecord> {
+    /// Retire the extent starting at `base` and return its mandatory shootdown barrier.
+    pub fn remove(&mut self, base: FrameGpa) -> Option<PendingShootdown<ExtentRecord>> {
         let removed = self.by_base.remove(&base.raw());
         if let Some(old) = removed {
             self.clear_code_pages_in_span(old.base.raw(), old.end_gpa());
         }
-        for tlb in tlbs {
-            tlb.flush_all();
-        }
-        removed
+        removed.map(|record| self.shootdown.begin(record))
     }
     /// Look up the single predecessor extent covering `[gpa, gpa + len_bytes)`.
     pub fn lookup_span(&self, gpa: u64, len_bytes: u64) -> Option<ExtentRecord> {

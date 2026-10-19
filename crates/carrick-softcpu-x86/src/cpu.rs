@@ -2,6 +2,7 @@
 
 use std::ptr::NonNull;
 
+use carrick_softmmu::VcpuShootdown;
 use iced_x86::{Instruction, Mnemonic};
 
 use crate::block::{BlockExit, BlockFetchFault, PlannedBlock, plan_block_from_memory};
@@ -171,6 +172,7 @@ pub struct SoftCpu {
     jit: JitCodeBuffer,
     pub max_block_insns: usize,
     pub max_block_span: usize,
+    shootdown: Option<VcpuShootdown>,
 }
 
 impl SoftCpu {
@@ -182,6 +184,7 @@ impl SoftCpu {
             jit: JitCodeBuffer::new(DEFAULT_JIT_CAPACITY)?,
             max_block_insns: 64,
             max_block_span: 4096,
+            shootdown: None,
         })
     }
 
@@ -195,6 +198,18 @@ impl SoftCpu {
         &mut self.ctx
     }
 
+    /// Bind this CPU's local TLB to its extent-table retirement authority.
+    pub fn bind_shootdown(&mut self, registration: VcpuShootdown) {
+        self.shootdown = Some(registration);
+    }
+
+    /// Publish that this CPU is parked and cannot look up a translation until resumed.
+    pub fn leave_parked(&self) {
+        if let Some(registration) = &self.shootdown {
+            registration.leave_parked();
+        }
+    }
+
     fn raise(&mut self, exc: X86Exception) -> Result<SoftCpuExit, EmitError> {
         if let Some(cr2) = exc.cr2 {
             self.ctx.cr2 = cr2;
@@ -206,6 +221,21 @@ impl SoftCpu {
 
     /// Plan, emit, and execute one basic block starting at `self.ctx.rip` over `mem`.
     pub fn step_block<M: SoftMmuMemory>(&mut self, mem: &mut M) -> Result<SoftCpuExit, EmitError> {
+        if let Some(registration) = &self.shootdown {
+            registration.enter_running(&mut self.ctx.tlb);
+        }
+        let result = self.step_block_running(mem);
+        if let Some(registration) = &self.shootdown {
+            registration.synchronize(&mut self.ctx.tlb);
+            registration.leave_idle();
+        }
+        result
+    }
+
+    fn step_block_running<M: SoftMmuMemory>(
+        &mut self,
+        mem: &mut M,
+    ) -> Result<SoftCpuExit, EmitError> {
         self.ctx.pending_exception = None;
         crate::context::prepare_gateway(self.ctx.rip)?;
         self.ctx.reset_bounce();

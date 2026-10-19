@@ -444,7 +444,8 @@ fn huge_page_authentication_2m_and_1g_at_zero_page_and_tail_offsets() -> Result<
     let _ = rig
         .mem
         .extents_mut()
-        .remove(FrameGpa::new(HUGE_2M_BASE_GPA), &mut [&mut rig.tlb]);
+        .remove(FrameGpa::new(HUGE_2M_BASE_GPA))
+        .map(carrick_softmmu::PendingShootdown::complete);
     let short_2m = HUGE_2M_SIZE - PAGE_SIZE_4K;
     assert!(
         rig.mem
@@ -1034,6 +1035,8 @@ fn frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal()
 -> Result<(), PlacementError> {
     let mut rig = Rig::new()?;
     let mut tlb_cpu1 = SoftTlb::new();
+    let shootdown_cpu0 = rig.mem.extents().register_vcpu(Arc::new(|| {}));
+    let shootdown_cpu1 = rig.mem.extents().register_vcpu(Arc::new(|| {}));
     let mode = CpuAccessMode::ring3();
 
     let va_rw = GuestVa::new(0x0000_0080_0000);
@@ -1134,9 +1137,14 @@ fn frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal()
     assert!(
         rig.mem
             .extents_mut()
-            .remove(FrameGpa::new(F4_GPA), &mut [&mut rig.tlb, &mut tlb_cpu1])
+            .remove(FrameGpa::new(F4_GPA))
+            .map(carrick_softmmu::PendingShootdown::complete)
             .is_some()
     );
+    shootdown_cpu0.enter_running(&mut rig.tlb);
+    shootdown_cpu1.enter_running(&mut tlb_cpu1);
+    shootdown_cpu0.leave_idle();
+    shootdown_cpu1.leave_idle();
     assert_eq!(rig.tlb.probe(va_rw, 8, Access::Read, mode), None);
     assert_eq!(tlb_cpu1.probe(va_rw, 8, Access::Read, mode), None);
 
@@ -1151,8 +1159,14 @@ fn frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal()
     assert!(
         rig.mem
             .extents_mut()
-            .replace(retired_pt, &mut [&mut rig.tlb, &mut tlb_cpu1])
+            .replace(retired_pt)
+            .map(carrick_softmmu::PendingShootdown::complete)
+            .is_ok()
     );
+    shootdown_cpu0.enter_running(&mut rig.tlb);
+    shootdown_cpu1.enter_running(&mut tlb_cpu1);
+    shootdown_cpu0.leave_idle();
+    shootdown_cpu1.leave_idle();
     assert_eq!(rig.tlb.probe(va_rw, 8, Access::Read, mode), None);
     assert_eq!(tlb_cpu1.probe(va_rw, 8, Access::Read, mode), None);
     assert_ne!(rig.mem.get(PT_A_GPA, idx(va_rw, 3)), 0);
@@ -1166,16 +1180,27 @@ fn frame_keyed_code_page_alias_invalidation_and_retired_table_frame_refusal()
     assert!(
         rig.mem
             .extents_mut()
-            .replace(restored_pt, &mut [&mut rig.tlb, &mut tlb_cpu1])
+            .replace(restored_pt)
+            .map(carrick_softmmu::PendingShootdown::complete)
+            .is_ok()
     );
+    shootdown_cpu0.enter_running(&mut rig.tlb);
+    shootdown_cpu1.enter_running(&mut tlb_cpu1);
+    shootdown_cpu0.leave_idle();
+    shootdown_cpu1.leave_idle();
     let _ = rig.probe_ram(va_rw, Access::Read, mode);
     rig.probe_tlb(&mut tlb_cpu1, va_rw, Access::Read, mode);
     assert_eq!(
         rig.mem
             .extents_mut()
-            .remove_root_generation(rig.root, &mut [&mut rig.tlb, &mut tlb_cpu1]),
+            .remove_root_generation(rig.root)
+            .complete(),
         Some(OwnerGeneration::new(1))
     );
+    shootdown_cpu0.enter_running(&mut rig.tlb);
+    shootdown_cpu1.enter_running(&mut tlb_cpu1);
+    shootdown_cpu0.leave_idle();
+    shootdown_cpu1.leave_idle();
     assert_eq!(rig.tlb.probe(va_rw, 8, Access::Read, mode), None);
     assert_eq!(tlb_cpu1.probe(va_rw, 8, Access::Read, mode), None);
     assert_eq!(rig.walk(va_rw, Access::Read, mode), Err(missing_tbl));

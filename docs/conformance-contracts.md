@@ -262,6 +262,30 @@ steal attempt, even when a zone-held row contributes to lifecycle drain.
 Host-runnable rows must remain stealable. Signed execution, same-image Docker
 timing, and full promotion remain open for the integration director.
 
+## Software-MMU retirement shootdown
+
+`softmmu.x86.tlb-walker` covers extent replacement/removal and root
+generation replacement/removal. Intel's invalidation model and AMD's TLB
+control model are the semantic authority: a processor may cache a translated
+linear address, but software must invalidate every participating processor
+before reusing the retired physical ownership generation. Carrick uses a
+placement-owned retirement epoch. A running vCPU acknowledges an epoch only
+after flushing its local `SoftTlb`; an idle or parked vCPU may acknowledge the
+barrier without flushing because its transition back to running synchronizes
+the epoch before the first lookup.
+
+The VM-free bindings are
+`running_peer_cannot_use_stale_addend_after_retirement_completes`,
+`idle_peer_resynchronizes_before_resume_lookup`, and
+`parked_peer_does_not_hold_retirement_barrier`. The deterministic structural
+binding `retirement_work_is_linear_in_peers_and_hits_do_not_scan_entries` uses
+1, 8, and 32 peers. Its budgets are exactly one peer visit and at most one kick
+per registered running peer per retirement, with zero full flushes attributable
+to steady-state TLB hits. Thus retirement is O(peers), while hits remain O(1)
+and perform no epoch-dependent entry scan. Signed execution and full promotion
+remain integration-owner work because the software CPU is currently proved by
+the VM-free x86 lane.
+
 ## Delegated anonymous root contracts
 
 `kernel.mm.delegated-metadata-capacity` covers shared reservation metadata

@@ -1505,6 +1505,14 @@ path = "crates/carrick-softmmu/src/walker.rs"
 contracts = ["softmmu.x86.tlb-walker"]
 
 [[surfaces]]
+path = "crates/carrick-softmmu/src/shootdown.rs"
+contracts = ["softmmu.x86.tlb-walker"]
+
+[[surfaces]]
+path = "crates/carrick-softmmu/test-support/shootdown_unit.rs"
+contracts = ["softmmu.x86.tlb-walker"]
+
+[[surfaces]]
 path = "crates/carrick-softmmu/tests/softmmu_contract.rs"
 contracts = ["softmmu.x86.tlb-walker"]
 

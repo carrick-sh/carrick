@@ -8,6 +8,7 @@ use crate::domains::{
     Access, Cpl, CpuAccessMode, GuestVa, PAGE_BASE_MASK_4K, PAGE_SHIFT_4K, PAGE_SIZE_4K,
 };
 use crate::placement::HostVa;
+use crate::shootdown::ShootdownStamp;
 
 pub const SOFT_TLB_BITS: u32 = 10;
 pub const SOFT_TLB_ENTRIES: usize = 1 << SOFT_TLB_BITS;
@@ -110,6 +111,7 @@ pub struct SoftTlb {
     leaf_shifts: [[u8; SOFT_TLB_ENTRIES]; 3],
     large_page_entries: u32,
     stats: SoftTlbStats,
+    synchronized_stamp: ShootdownStamp,
 }
 
 const _: () = {
@@ -139,6 +141,7 @@ impl SoftTlb {
                 va_evictions: 0,
                 write_evictions: 0,
             },
+            synchronized_stamp: ShootdownStamp::UNBOUND,
         }
     }
     const fn plane_index(access: Access) -> usize {
@@ -406,6 +409,14 @@ impl SoftTlb {
     /// Reset structural counters to zero without altering cached entries.
     pub fn reset_stats(&mut self) {
         self.stats = SoftTlbStats::default();
+    }
+
+    pub(crate) const fn synchronized_stamp(&self) -> ShootdownStamp {
+        self.synchronized_stamp
+    }
+
+    pub(crate) fn set_synchronized_stamp(&mut self, stamp: ShootdownStamp) {
+        self.synchronized_stamp = stamp;
     }
 }
 
