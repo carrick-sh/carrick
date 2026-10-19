@@ -97,7 +97,7 @@ impl Clone for VecGuestMemory {
         Self {
             backing: Arc::clone(&self.backing),
             aligned_word_offset: self.aligned_word_offset,
-            placement: self.placement.clone(),
+            placement: self.placement,
             extents: self.extents.try_clone().expect("no retirement pending"),
             descriptor_loads: Arc::clone(&self.descriptor_loads),
         }
