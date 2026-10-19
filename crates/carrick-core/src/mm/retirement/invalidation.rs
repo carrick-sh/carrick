@@ -526,6 +526,7 @@ where
             generation,
             kind: self.kind,
             counted,
+            domain_wide: matches!(self.target, RequestTarget::Domain),
             word: PhantomData,
         };
         if let Some(seat) = requester
@@ -567,6 +568,8 @@ where
     generation: InvalidationGeneration,
     kind: InvalidationKind,
     counted: u64,
+    /// Whether the request counted every seated member (`stage_domain`).
+    domain_wide: bool,
     word: PhantomData<fn() -> W>,
 }
 
@@ -598,6 +601,7 @@ where
         ReclaimTag {
             generation: self.generation,
             kind: self.kind,
+            domain_wide: self.domain_wide,
         }
     }
 
@@ -621,6 +625,7 @@ where
         Ok(DomainCompletion {
             generation: self.generation,
             kind: self.kind,
+            domain_wide: self.domain_wide,
         })
     }
 
@@ -658,6 +663,7 @@ where
 pub struct DomainCompletion {
     generation: InvalidationGeneration,
     kind: InvalidationKind,
+    domain_wide: bool,
 }
 
 impl DomainCompletion {
@@ -681,14 +687,35 @@ unsafe impl InvalidationProof<InvalidationGeneration> for DomainCompletion {
 pub struct ReclaimTag {
     generation: InvalidationGeneration,
     kind: InvalidationKind,
+    domain_wide: bool,
 }
 
 impl ReclaimTag {
     pub fn generation(&self) -> InvalidationGeneration {
         self.generation
     }
+    /// Exact release, or coverage by a later domain-wide completion.
+    ///
+    /// A domain-wide request counts every member seated at its commit. A
+    /// member counted by an earlier domain-wide request of the same kind
+    /// that is still seated at the later commit is counted again, so the
+    /// later completion means it served at or past the later generation
+    /// (`served` is a watermark), or is stopped owing it and serves before
+    /// any translation use. A member that released its seat in between left
+    /// no cache behind: a cache re-enters only through a claim, which
+    /// flushes. So the later completion also completes the earlier request.
+    /// Context-keyed requests count by context and get no such coverage.
     fn released_by(&self, completion: &DomainCompletion) -> bool {
-        self.generation == completion.generation && self.kind == completion.kind
+        if self.kind != completion.kind {
+            return false;
+        }
+        if self.generation == completion.generation {
+            return true;
+        }
+        self.domain_wide
+            && completion.domain_wide
+            && self.generation.raw_domain() == completion.generation.raw_domain()
+            && self.generation.value() <= completion.generation.value()
     }
 }
 
@@ -726,7 +753,11 @@ impl<T> ReclaimQueue<T> {
     }
     /// Release every object tagged with exactly this completion's domain,
     /// generation and kind. A completion for one context's generation says
-    /// nothing about another context's, so release is exact, not a watermark.
+    /// nothing about another context's, so release is exact, not a
+    /// watermark; the one exception is a domain-wide completion, which also
+    /// covers every earlier domain-wide request of its domain and kind (see
+    /// `ReclaimTag::released_by`). That is what lets an owner recover the
+    /// entries of a retirement whose pending request was dropped.
     pub fn drain_ready(&mut self, completion: &DomainCompletion) -> alloc::vec::Vec<T> {
         let mut ready = alloc::vec::Vec::new();
         let mut index = 0;

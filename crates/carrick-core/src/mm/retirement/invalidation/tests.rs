@@ -987,3 +987,42 @@ fn reclaim_iter_lists_outstanding_objects_until_their_exact_release() {
     assert_eq!(queue.iter().copied().collect::<Vec<_>>(), Vec::from([9]));
     let _ = second;
 }
+
+#[test]
+fn a_later_domain_wide_completion_covers_earlier_domain_wide_reclaim_only() {
+    let table = table3();
+    let mut venue = RecordingVenue::new();
+    let mut member = seat(&table, 1, &mut venue);
+    member.enter(&mut venue).expect("enter");
+    let mut queue = ReclaimQueue::new();
+    let domain_stage = || stage_domain::<_, 3, AtomicU64, Tag>(&table, InvalidationKind::Unmap);
+    // An earlier domain-wide retirement whose pending request is dropped.
+    let abandoned = domain_stage()
+        .commit(None, &mut venue)
+        .map_err(|_| ())
+        .expect("commit");
+    queue.push(abandoned.reclaim_tag(), "abandoned");
+    drop(abandoned);
+    // A context-keyed request is never covered by a domain-wide one.
+    let context = commit(&table, A, InvalidationKind::Unmap, None, &mut venue);
+    queue.push(context.reclaim_tag(), "context");
+    // The member still owes the abandoned generation.
+    assert!(member.has_debt());
+    let later = domain_stage()
+        .commit(None, &mut venue)
+        .map_err(|_| ())
+        .expect("commit");
+    let later = later.try_complete().expect_err("member running, unserved");
+    member.serve(&mut venue).expect("serve");
+    let completion = later.try_complete().expect("served");
+    assert_eq!(queue.drain_ready(&completion), Vec::from(["abandoned"]));
+    assert_eq!(queue.len(), 1, "the context-keyed entry stays");
+    // Another kind never covers.
+    let revoke = stage_domain::<_, 3, AtomicU64, Tag>(&table, InvalidationKind::RevokeWrite)
+        .commit(None, &mut venue)
+        .map_err(|_| ())
+        .expect("commit");
+    member.serve(&mut venue).expect("serve");
+    let revoke = revoke.try_complete().expect("served");
+    assert!(queue.drain_ready(&revoke).is_empty());
+}
