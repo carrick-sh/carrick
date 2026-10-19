@@ -138,10 +138,14 @@ pub enum WorkMetric {
     LifecycleEntryVisits,
     /// Stage-1 paging descriptor words loaded on an uncontended software TLB miss.
     DescriptorLoadsPerMiss,
+    /// Shared-word read-modify-writes performed by one invalidation-domain
+    /// member's steady-state safe-point check while it owes nothing. The
+    /// check runs on every trap and syscall return, so it must stay zero.
+    InvalidationSteadyStateRmws,
 }
 
 impl WorkMetric {
-    pub const COUNT: usize = 55;
+    pub const COUNT: usize = 56;
     pub const ALL: [WorkMetric; Self::COUNT] = [
         Self::KernelDispatches,
         Self::KernelRedispatches,
@@ -198,6 +202,7 @@ impl WorkMetric {
         Self::ChildExitNotificationWakeDeliveries,
         Self::LifecycleEntryVisits,
         Self::DescriptorLoadsPerMiss,
+        Self::InvalidationSteadyStateRmws,
     ];
 }
 
