@@ -1088,6 +1088,10 @@ impl Personality for FixturePersonality {
             }
             FixtureCall::ObserveContextWitness => {
                 frame.rax = carrick_el1::isa::x86::context::witness(frame.rdi);
+                #[cfg(feature = "frame-budget-red-fixture")]
+                {
+                    frame.rax ^= frame_budget_red_fixture(frame.rdi);
+                }
                 ControlFlow::Return(())
             }
             FixtureCall::ObserveInterruptWitness => {
@@ -1305,4 +1309,20 @@ impl Personality for FixturePersonality {
         // SAFETY: calling extern witness function to retain in linked fixture image.
         let _ = unsafe { carrick_x86_fixture_dispatch_witness() };
     }
+}
+
+/// The ring stack audit's red fixture (#369): a deliberately oversized
+/// by-value record on a CPL0 entry chain. Built only by
+/// `cargo xtask frame-budget --red-fixture`, which requires the audit to
+/// reject this image for this frame.
+#[cfg(feature = "frame-budget-red-fixture")]
+#[inline(never)]
+fn frame_budget_red_fixture(seed: u64) -> u64 {
+    let mut record = [0_u64; 8192];
+    for (index, word) in record.iter_mut().enumerate() {
+        *word = core::hint::black_box(seed ^ index as u64);
+    }
+    core::hint::black_box(&record)
+        .iter()
+        .fold(0, |folded, word| folded ^ word)
 }

@@ -146,6 +146,12 @@ pub enum Commands {
         )]
         base: Option<String>,
     },
+
+    #[command(
+        name = "frame-budget",
+        about = "Audit the ring images' worst-case stack depth per entry chain"
+    )]
+    FrameBudget(crate::frame_budget::FrameBudgetArgs),
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -265,6 +271,8 @@ pub enum CliError {
     GuestImage(#[from] crate::guest_image::GuestImageError),
     #[error(transparent)]
     CommitTrailers(#[from] crate::commit_trailers::CommitTrailersError),
+    #[error("frame budget: {0}")]
+    FrameBudget(#[from] crate::frame_budget::FrameBudgetError),
 }
 
 pub fn resolve_repo_info(root: Option<&Path>) -> Result<RepoInfo, CliError> {
@@ -633,6 +641,11 @@ where
         Commands::CommitTrailers(args) => {
             let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
             crate::commit_trailers::run(&root, args, writer)?;
+            Ok(())
+        }
+        Commands::FrameBudget(args) => {
+            let info = resolve_repo_info(cli.root.as_deref())?;
+            crate::frame_budget::run(&info.repository_root, &args, writer)?;
             Ok(())
         }
     }
